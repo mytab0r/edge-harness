@@ -20,6 +20,18 @@ export const LIMITS = {
   tasksListMax: 100,
 } as const;
 
+export const HEARTBEAT = {
+  /** Пульс оркестрации: DO сам дёргает workflow_dispatch оркестратора через alarm.
+   * GitHub'овский cron на репо не тикает (0 schedule-запусков за 4 часа — измерено),
+   * поэтому пульс живёт в мозге, а не снаружи. Alarm будит DO из гибернации
+   * и стоит 1 request — комфортный режим Free. */
+  selfOrchestrationMs: 15 * 60_000,
+  /** Задержка первого пульса после холодного старта объекта. */
+  selfOrchestrationFirstMs: 15_000,
+  /** Имя workflow оркестратора для workflow_dispatch. */
+  orchestraWorkflow: "orchestra.yml",
+} as const;
+
 export const GITHUB = {
   apiBase: "https://api.github.com",
   apiVersion: "2022-11-28",
