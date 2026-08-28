@@ -32,6 +32,7 @@ SECRET_PATTERNS = [
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "приватный ключ"),
     (r"(?:TOKEN|SECRET|KEY|PASSWORD|PASSWD)\s*[=:]\s*['\"][A-Za-z0-9+/_-]{20,}['\"]", "литерал секрета в присваивании"),
 ]
+CONFLICT_MARKER = re.compile(r"^(<{7}|={7}|>{7})($| )")
 FORBIDDEN_FILES = (".dev.vars", ".env")
 REVIEW_OK = "review:ok"
 REVIEW_CHANGES = "review:changes-requested"
@@ -82,6 +83,8 @@ def main() -> int:
             if re.search(pattern, line):
                 findings.append(f"Похоже на {kind} в добавленной строке {i + 1}: «{line.strip()[:60]}…»")
                 break
+        if CONFLICT_MARKER.match(line):
+            findings.append(f"Неразрешённый конфликт-маркер уехал в коммит (строка {i + 1}).")
 
     files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
     for f in files:

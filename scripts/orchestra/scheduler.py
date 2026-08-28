@@ -129,7 +129,8 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         if pull.get("draft"):
             skipped.append(f"#{pull['number']} — черновик")
             continue
-        # См. mark_conflicts: состояние берём одиночным запросом.
+        # mergeable_state живёт только на endpoint'е одиночного PR: в списке он
+        # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
         state = single.get("mergeable_state")
         if state not in ("clean", "unstable", "has_hooks"):
@@ -150,6 +151,10 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
             skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
 =======
 >>>>>>> origin/main
+            continue
+        labels = {label["name"] for label in pull["labels"]}
+        if "review:ok" not in labels:
+            skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
             continue
         gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
@@ -185,6 +190,7 @@ def after_merge(repo: str, pull: dict) -> list[str]:
 =======
         if skipped:
             lines += [f"   (отложены: {item})" for item in skipped]
+        lines += after_merge(repo, pull)
         return lines  # один за запуск: сериализация слияний
     if skipped:
         lines += [f"⏸️ {item}" for item in skipped]
@@ -192,36 +198,24 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     return lines
 
 
-def main() -> int:
-    repo = os.environ["GITHUB_REPOSITORY"]
-    now = datetime.now(timezone.utc)
-    lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
-
-    pulls = open_pulls(repo)
-    lines.append(f"Открытых PR: {len(pulls)}")
-
-    stale_lines = reap_stale(repo, now, pulls)
-    pulls = open_pulls(repo)  # состояние могло измениться
-    conflict_lines = mark_conflicts(repo, pulls)
-    merge_lines = merge_queue(repo, pulls)
-
-    pool = open_task_issues(repo)
-    free = sum(1 for issue in pool if not issue["assignees"])
-    taken = len(pool) - free
-    lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
-
-    if stale_lines or conflict_lines or merge_lines:
-        lines += ["", "### Действия", *stale_lines, *conflict_lines, *merge_lines]
-    else:
-        lines += ["", "Действий не требуется."]
-
-    summary(lines)
-    return 0
+def after_merge(repo: str, pull: dict) -> list[str]:
+    """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
+    (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно."""
+    lines = []
+    number = pull["number"]
+    files = gh(f"repos/{repo}/pulls/{number}/files?per_page=100")
+    if any((f["filename"] or "").startswith("cf-worker/") for f in files):
+        subprocess.run(
+            ["gh", "workflow", "run", "deploy-worker.yml", "--ref", "main"],
+            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+            check=True,
+        )
+        lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
+    for token_ref in (pull.get("body") or "").replace("-", " ").split("#")[1:]:
+        digits = "".join(ch for ch in token_ref.strip().split()[0] if ch.isdigit()) if token_ref.strip() else ""
+        if digits:
+            gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
+            lines.append(f"📌 задача #{digits} закрыта")
+    return lines
 
 
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except RuntimeError as error:
-        print(f"::error::orchestra: {error}")
-        sys.exit(1)
