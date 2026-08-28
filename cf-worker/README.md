@@ -1,5 +1,7 @@
 # cf-worker: морда и мозг
 
+<!-- heartbeat push: cf-worker/** -->
+
 Воркер Cloudflare: статика морды (Workers Assets) + один Durable Object `Harness`
 (SQLite) с журналом, очередью задач и heartbeat'ом рук. Схема и лимиты — в
 [`docs/research/20-cloudflare-free.md`](../docs/research/20-cloudflare-free.md),
