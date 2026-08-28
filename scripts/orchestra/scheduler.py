@@ -129,7 +129,8 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         if pull.get("draft"):
             skipped.append(f"#{pull['number']} — черновик")
             continue
-        # См. mark_conflicts: состояние берём одиночным запросом.
+        # mergeable_state живёт только на endpoint'е одиночного PR: в списке он
+        # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
         state = single.get("mergeable_state")
         if state not in ("clean", "unstable", "has_hooks"):
@@ -143,20 +144,18 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
         if bad:
             skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
-<<<<<<< HEAD
             continue
         labels = {label["name"] for label in pull["labels"]}
         if "review:ok" not in labels:
             skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
-=======
->>>>>>> origin/main
             continue
         gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
             "-f", f"merge_method={MERGE_METHOD}",
         )
         lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
-<<<<<<< HEAD
+        if skipped:
+            lines += [f"   (отложены: {item})" for item in skipped]
         lines += after_merge(repo, pull)
         return lines  # один за запуск: сериализация слияний
     if skipped:
@@ -182,46 +181,6 @@ def after_merge(repo: str, pull: dict) -> list[str]:
         if digits:
             gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
             lines.append(f"📌 задача #{digits} закрыта")
-=======
-        if skipped:
-            lines += [f"   (отложены: {item})" for item in skipped]
-        return lines  # один за запуск: сериализация слияний
-    if skipped:
-        lines += [f"⏸️ {item}" for item in skipped]
->>>>>>> origin/main
     return lines
 
 
-def main() -> int:
-    repo = os.environ["GITHUB_REPOSITORY"]
-    now = datetime.now(timezone.utc)
-    lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
-
-    pulls = open_pulls(repo)
-    lines.append(f"Открытых PR: {len(pulls)}")
-
-    stale_lines = reap_stale(repo, now, pulls)
-    pulls = open_pulls(repo)  # состояние могло измениться
-    conflict_lines = mark_conflicts(repo, pulls)
-    merge_lines = merge_queue(repo, pulls)
-
-    pool = open_task_issues(repo)
-    free = sum(1 for issue in pool if not issue["assignees"])
-    taken = len(pool) - free
-    lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
-
-    if stale_lines or conflict_lines or merge_lines:
-        lines += ["", "### Действия", *stale_lines, *conflict_lines, *merge_lines]
-    else:
-        lines += ["", "Действий не требуется."]
-
-    summary(lines)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except RuntimeError as error:
-        print(f"::error::orchestra: {error}")
-        sys.exit(1)
