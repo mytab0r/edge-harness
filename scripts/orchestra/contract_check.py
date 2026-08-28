@@ -22,6 +22,13 @@ SKIP_LABEL = "orchestra:skip"
 TASK_LABEL = "task"
 
 
+def run_gh(*args: str) -> None:
+    result = subprocess.run(["gh", *args], capture_output=True, text=True,
+                            env={**os.environ, "NO_COLOR": "1"})
+    if result.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])}: {result.stderr.strip()}")
+
+
 def gh(*args: str) -> dict | list:
     result = subprocess.run(
         ["gh", "api", *args],
@@ -33,7 +40,15 @@ def gh(*args: str) -> dict | list:
     return json.loads(result.stdout)
 
 
-def fail(messages: list[str]) -> None:
+def fail(messages: list[str], repo: str, pr_number: int) -> None:
+    # Провал громкий на самом PR: метка + комментарий, а не только строка в логах CI.
+    try:
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels",
+               "-f", "labels[]=contract:failed")
+        body = "Контракт PR ↔ задача нарушен:" + "".join(f"\n- {m}" for m in messages)
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "-f", f"body={body}")
+    except RuntimeError as error:
+        print(f"contract: не смог оставить комментарий на PR: {error}")
     for message in messages:
         print(f"::error::{message}")
     print(f"contract: FAIL ({len(messages)} нарушений)")
@@ -84,10 +99,18 @@ def main() -> int:
             if TASK_LABEL not in labels_issue:
                 problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
             assignees = [a["login"] for a in issue["assignees"]]
-            if len(assignees) != 1:
+            author = pull["user"]["login"]
+            if not assignees:
+                # Забыли назначиться — назначаем автора PR автоматически: первый PR
+                # по свободной задаче её занимает. Не на памяти, а в контракте.
+                gh("-X", "POST", f"repos/{repo}/issues/{issue_number}/assignees",
+                   "-f", f"assignees[]={author}")
+                print(f"contract: авто-назначение {author} на #{issue_number}")
+                assignees = [author]
+            if assignees != [author]:
                 problems.append(
-                    f"Задачу #{issue_number} должно брать ровно одно назначение "
-                    f"(сейчас: {', '.join(assignees) or 'никто'}). Назначь себя через API, не через силу."
+                    f"Задача #{issue_number} занята не тобой "
+                    f"(назначено: {', '.join(assignees)}). Бери свободную из пула."
                 )
             # Чужие открытые PR на ту же задачу — гонка веток; она разрешается здесь.
             others = []
@@ -105,7 +128,12 @@ def main() -> int:
                 )
 
     if problems:
-        fail(problems)
+        fail(problems, repo, args.pr)
+    # Прошёл — снимаем метку провала, если была.
+    try:
+        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/contract:failed")
+    except Exception:
+        pass
     print("contract: OK")
     return 0
 
