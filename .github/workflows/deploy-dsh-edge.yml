@@ -1,7 +1,5 @@
-# Деплой DSH Edge на Cloudflare Workers.
-# Скачивает последнюю версию dsh-edge из npm, извлекает воркер и морду,
-# деплоит через wrangler. Секреты (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) сохраняются
-# между деплоями автоматически.
+# Сборка и деплой DSH Edge из исходников с плагинами владельца.
+# Клонирует pawaca/dsh-edge, добавляет кастомные плагины, собирает и деплоит на CF.
 
 name: deploy-dsh-edge
 
@@ -14,33 +12,77 @@ on:
         type: string
 
 jobs:
-  deploy:
+  build-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Деплой DSH Edge
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DSH_VERSION: ${{ inputs.version }}
+      - name: Клонировать dsh-edge
         run: |
           VERSION_ARG=""
-          if [ -n "$DSH_VERSION" ]; then
-            VERSION_ARG="@$DSH_VERSION"
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION_ARG="v${{ inputs.version }}"
           fi
-          mkdir -p /tmp/dsh-deploy
-          cd /tmp/dsh-deploy
+          git clone --depth 1 --branch ${VERSION_ARG:-main} https://github.com/pawaca/dsh-edge.git /tmp/dsh-edge-src
 
-          echo "=== Скачиваю dsh-edge${VERSION_ARG}..."
-          npm pack "dsh-edge${VERSION_ARG}" 2>&1 | tail -1
-          TARBALL=$(ls dsh-edge-*.tgz | head -1)
-          tar -xzf "$TARBALL"
+      - name: Установить pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
-          echo "=== Готовлю воркер и морду..."
-          mkdir -p deploy
-          cp package/worker/direct/index.js deploy/worker.js
-          cp -r package/dist deploy/dist
+      - run: npm install -g pnpm@latest
 
-          cat > deploy/wrangler.jsonc <<'WRANGLER'
+      - name: Установить зависимости dsh-edge
+        run: |
+          cd /tmp/dsh-edge-src
+          pnpm install --frozen-lockfile
+
+      - name: Скачать плагины владельца
+        env:
+          COMBO_TGZ: ${{ vars.COMBO_ROUTER_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-combo-router-0.1.0.tgz' }}
+          OAUTH_TGZ: ${{ vars.OAUTH_POOL_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-anthropic-oauth-pool-0.1.0.tgz' }}
+        run: |
+          mkdir -p /tmp/plugins
+          curl -sL "$COMBO_TGZ" -o /tmp/plugins/combo-router.tgz
+          curl -sL "$OAUTH_TGZ" -o /tmp/plugins/oauth-pool.tgz
+          echo "Плагины скачаны"
+
+      - name: Добавить плагины в DSH standalone
+        run: |
+          STANDALONE=/tmp/dsh-edge-src/apps/dsh-edge/standalone
+          if [ -d "$STANDALONE" ]; then
+            cd "$STANDALONE"
+            # Устанавливаем плагины как зависимости
+            npm install /tmp/plugins/combo-router.tgz --save
+            npm install /tmp/plugins/oauth-pool.tgz --save
+            echo "Плагины добавлены в standalone"
+          else
+            echo "standalone не найден, пропускаю установку плагинов"
+          fi
+
+      - name: Собрать dsh-edge
+        run: |
+          cd /tmp/dsh-edge-src
+          pnpm build 2>&1 | tail -5
+
+      - name: Подготовить деплой
+        run: |
+          DEPLOY=/tmp/dsh-deploy
+          mkdir -p $DEPLOY
+
+          # Воркер и морда из собранного dsh-edge
+          if [ -d /tmp/dsh-edge-src/apps/dsh-edge/standalone/worker ]; then
+            cp -r /tmp/dsh-edge-src/apps/dsh-edge/standalone/worker/* $DEPLOY/
+          elif [ -d /tmp/dsh-edge-src/apps/dsh-edge/worker ]; then
+            cp -r /tmp/dsh-edge-src/apps/dsh-edge/worker/* $DEPLOY/
+          fi
+
+          if [ -d /tmp/dsh-edge-src/apps/dsh-edge/standalone/dist ]; then
+            cp -r /tmp/dsh-edge-src/apps/dsh-edge/standalone/dist $DEPLOY/dist
+          elif [ -d /tmp/dsh-edge-src/apps/dsh-edge/dist ]; then
+            cp -r /tmp/dsh-edge-src/apps/dsh-edge/dist $DEPLOY/dist
+          fi
+
+          # Wrangler конфиг
+          cat > $DEPLOY/wrangler.jsonc <<'WRANGLER'
           {
             "name": "dsh-edge",
             "main": "worker.js",
@@ -65,8 +107,17 @@ jobs:
           }
           WRANGLER
 
-          echo "=== Деплою на Cloudflare..."
-          cd deploy
-          npx wrangler deploy 2>&1 | tail -8
+          echo "Деплой готов"
 
-          echo "=== Готово"
+      - name: Деплой на Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          cd /tmp/dsh-deploy
+          npx wrangler deploy 2>&1 | tail -10
+
+      - name: Итог
+        run: |
+          echo "✅ DSH Edge задеплоен: https://dsh-edge.mytab0r.workers.dev"
+          echo "Версия: ${{ inputs.version || 'latest' }}"
