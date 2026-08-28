@@ -1,6 +1,8 @@
 # Деплой морды в Cloudflare. Требует секретов репозитория CLOUDFLARE_API_TOKEN и
 # CLOUDFLARE_ACCOUNT_ID; без них job падает с явной ошибкой — молча пропущенного
 # деплоя быть не должно.
+# npm ci идёт ДО всех шагов с npx: иначе wrangler types берёт свежий wrangler из сети,
+# генерирует другой контент и гвардия типов ложно падает.
 name: deploy-worker
 
 on:
@@ -22,6 +24,9 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: cf-worker/package-lock.json
+
+      - run: npm ci
+        working-directory: cf-worker
 
       - name: Проверка секретов
         env:
@@ -56,7 +61,6 @@ jobs:
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде
         run: |
-          npm ci
           npx playwright install --with-deps chromium
           node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
         working-directory: cf-worker
