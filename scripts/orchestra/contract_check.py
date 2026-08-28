@@ -23,7 +23,7 @@ TASK_LABEL = "task"
 
 
 def run_gh(*args: str) -> None:
-    result = subprocess.run(args, capture_output=True, text=True,
+    result = subprocess.run(["gh", *args], capture_output=True, text=True,
                             env={**os.environ, "NO_COLOR": "1"})
     if result.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:3])}: {result.stderr.strip()}")
@@ -132,7 +132,7 @@ def main() -> int:
     # Прошёл — снимаем метку провала, если была.
     try:
         run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/contract:failed")
-    except RuntimeError:
+    except Exception:
         pass
     print("contract: OK")
     return 0
