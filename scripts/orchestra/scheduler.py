@@ -183,3 +183,38 @@ def after_merge(repo: str, pull: dict) -> list[str]:
             gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
             lines.append(f"📌 задача #{digits} закрыта")
     return lines
+
+
+def main() -> int:
+    repo = os.environ["GITHUB_REPOSITORY"]
+    now = datetime.now(timezone.utc)
+    lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
+
+    pulls = open_pulls(repo)
+    lines.append(f"Открытых PR: {len(pulls)}")
+
+    stale_lines = reap_stale(repo, now, pulls)
+    pulls = open_pulls(repo)  # состояние могло измениться
+    conflict_lines = mark_conflicts(repo, pulls)
+    merge_lines = merge_queue(repo, pulls)
+
+    pool = open_task_issues(repo)
+    free = sum(1 for issue in pool if not issue["assignees"])
+    taken = len(pool) - free
+    lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
+
+    if stale_lines or conflict_lines or merge_lines:
+        lines += ["", "### Действия", *stale_lines, *conflict_lines, *merge_lines]
+    else:
+        lines += ["", "Действий не требуется."]
+
+    summary(lines)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as error:
+        print(f"::error::orchestra: {error}")
+        sys.exit(1)
