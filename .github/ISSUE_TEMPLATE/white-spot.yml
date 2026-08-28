@@ -1,0 +1,43 @@
+name: 🕳️ Белое пятно / противоречие
+description: Нашёл противоречие в доке/спеке/коде или утверждение, выданное за факт без улики. Сообщи сразу — это канал для всех агентов.
+labels: [white-spot]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Тип
+      options:
+        - Противоречие (док ↔ код, спека ↔ поведение, два места правды)
+        - Белое пятно (факт не подтверждён, но на него опираются)
+        - Молча неверное поведение (silent-wrong)
+        - Устаревший факт (нашёл свежее)
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Где
+      description: Файл/строка/раздел или URL. Конкретно.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: В чём суть
+      description: «A утверждает X, B делает Y». Обе стороны противоречия, не одну.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Чем опасно
+      description: Что ломается или куда опираются, пока это не закрыто.
+    validations:
+      required: true
+  - type: checkboxes
+    attributes:
+      label: Действия
+      options:
+        - label: Я не молча исправил спорное место, а завёл запись — решать будут открыто
+          required: true
+        - label: Если факт устарел и это проверяемо — я обновил research-файл по правилам репозитория

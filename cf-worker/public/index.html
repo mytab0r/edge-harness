@@ -4,265 +4,50 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>edge-harness</title>
-<style>
-  :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
-    --muted: #8b949e; --accent: #2f81f7; --ok: #3fb950; --bad: #f85149; --warn: #d29922;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
-  }
-  header {
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
-    position: sticky; top: 0;
-  }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
-  .badge { padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); }
-  .badge.ok { color: var(--ok); border-color: var(--ok); }
-  .badge.bad { color: var(--bad); border-color: var(--bad); }
-  .badge.warn { color: var(--warn); border-color: var(--warn); }
-  #conn { font-size: 12px; color: var(--muted); }
-  main { max-width: 960px; margin: 0 auto; padding: 16px; }
-  section { margin-bottom: 20px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; }
-  .row { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
-  button {
-    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
-    padding: 8px 16px; font: inherit; cursor: pointer;
-  }
-  button:disabled { opacity: .5; cursor: wait; }
-  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
-  textarea {
-    flex: 1; min-width: 260px; min-height: 44px; resize: vertical;
-    background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
-    font: inherit; padding: 8px;
-  }
-  #tasks { font-size: 13px; color: var(--muted); margin-top: 6px; }
-  #journal { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  #journal li {
-    display: flex; gap: 10px; padding: 6px 10px; border-bottom: 1px solid var(--border);
-    background: var(--panel); font-size: 13px; align-items: baseline;
-  }
-  #journal li:last-child { border-bottom: 0; }
-  #journal .ts { color: var(--muted); flex: none; }
-  #journal .kind { flex: none; color: var(--accent); }
-  #journal .kind.system { color: var(--warn); }
-  #journal .kind.job_end { color: var(--muted); }
-  #journal .data { color: var(--fg); word-break: break-all; white-space: pre-wrap; }
-  #journal .data .muted { color: var(--muted); }
-  #gate {
-    position: fixed; inset: 0; background: rgba(13,17,23,.95); display: flex;
-    align-items: center; justify-content: center; z-index: 10;
-  }
-  #gate .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; width: 420px; }
-  #gate h1 { margin: 0 0 8px; font-size: 16px; }
-  #gate p { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
-  #gate input {
-    width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 8px; font: inherit; margin-bottom: 12px;
-  }
-  #gate .error { color: var(--bad); font-size: 13px; margin: 0 0 12px; min-height: 1em; }
-</style>
+<link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
 
 <div id="gate" hidden>
   <div class="card">
-    <h1>edge-harness</h1>
-    <p>Доступ закрыт разделяемым секретом. Введи <code>HANDS_TOKEN</code> — он сохранится
-       только в этом браузере.</p>
-    <input id="gate-token" type="password" placeholder="HANDS_TOKEN" autocomplete="off">
-    <div class="error" id="gate-error"></div>
-    <button id="gate-enter">Войти</button>
+    <h1 data-i18n="gate.title">edge-harness</h1>
+    <p data-i18n="gate.hint">Доступ закрыт разделяемым секретом.</p>
+    <div class="row">
+      <input id="gate-token" type="password" autocomplete="off" data-i18n-attr="placeholder:gate.token_placeholder">
+      <label class="show"><input type="checkbox" id="gate-show"> <span data-i18n="gate.show">показать</span></label>
+    </div>
+    <div class="error" id="gate-error" role="alert"></div>
+    <button id="gate-enter" data-i18n="gate.enter">Войти</button>
   </div>
 </div>
 
 <header>
   <h1>edge-harness</h1>
-  <span class="badge bad" id="hands">руки: ?</span>
-  <span class="badge" id="queue">задачи: ?</span>
-  <span id="conn">соединение…</span>
+  <span class="badge bad" id="hands">…</span>
+  <span class="badge" id="queue">…</span>
+  <span id="conn">…</span>
   <span style="flex:1"></span>
-  <button class="ghost" id="forget" title="Забыть токен в этом браузере">выйти</button>
+  <button class="ghost" id="forget" data-i18n="gate.forget" title="Забыть токен в этом браузере">выйти</button>
 </header>
 
 <main>
   <section>
-    <h2>Новая задача</h2>
+    <h2 data-i18n="section.new_task">Новая задача</h2>
     <div class="row">
-      <textarea id="payload" placeholder="payload (необязательно, JSON)"></textarea>
-      <button id="submit">Поставить задачу</button>
+      <textarea id="payload" data-i18n-attr="placeholder:payload.placeholder"></textarea>
+      <button id="submit" data-i18n="submit">Поставить задачу</button>
     </div>
     <div id="tasks"></div>
   </section>
 
   <section>
-    <h2>Журнал</h2>
+    <h2 data-i18n="section.journal">Журнал</h2>
     <ol id="journal"></ol>
   </section>
 </main>
 
-<script>
-"use strict";
-
-const $ = (id) => document.getElementById(id);
-const TOKEN_KEY = "edge-harness-token";
-const MAX_JOURNAL_ROWS = 500;
-
-let token = localStorage.getItem(TOKEN_KEY) || "";
-let lastEventId = 0;      // курсор журнала: и для replay, и для after у WebSocket
-let socket = null;
-let reconnectDelay = 1000;
-
-// ── HTTP ──────────────────────────────────────────────────────────────────────────
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    ...options,
-    headers: {
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      Authorization: `Bearer ${token}`,
-      ...options.headers,
-    },
-  });
-  if (res.status === 401) { showGate("Секрет не подошёл."); throw new Error("unauthorized"); }
-  return res;
-}
-
-async function apiJson(path, options) {
-  const res = await api(path, options);
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    const message = body?.error?.message || `HTTP ${res.status}`;
-    $("tasks").textContent = `Ошибка: ${message}`;
-    throw new Error(message);
-  }
-  return body;
-}
-
-// ── Журнал ────────────────────────────────────────────────────────────────────────
-function renderEvent(event) {
-  const li = document.createElement("li");
-  const ts = new Date(event.ts).toLocaleTimeString();
-  const data = event.data === null || event.data === undefined ? "" : JSON.stringify(event.data);
-  li.innerHTML =
-    `<span class="ts">${ts}</span>` +
-    `<span class="kind ${event.source}"></span>` +
-    `<span class="data"></span>`;
-  li.querySelector(".kind").textContent = `${event.kind} #${event.seq}`;
-  li.querySelector(".data").textContent = data;
-  const journal = $("journal");
-  journal.prepend(li);
-  while (journal.children.length > MAX_JOURNAL_ROWS) journal.lastChild.remove();
-}
-
-async function replay() {
-  // Догоняем журнал страницами до последнего известного события.
-  for (;;) {
-    const body = await apiJson(`/api/events?after=${lastEventId}&limit=200`);
-    for (const event of body.events) { renderEvent(event); lastEventId = Math.max(lastEventId, event.id); }
-    if (!body.has_more) return;
-  }
-}
-
-// ── Живой поток ───────────────────────────────────────────────────────────────────
-function renderStatus(status) {
-  const hands = $("hands");
-  if (status.hands_alive) {
-    const age = Math.round((status.now - status.last_heartbeat.ts) / 1000);
-    hands.textContent = `руки: живы (${age} с назад, job ${status.last_heartbeat.job_id})`;
-    hands.className = "badge ok";
-  } else {
-    hands.textContent = "руки: нет";
-    hands.className = "badge bad";
-  }
-  const t = status.tasks;
-  $("queue").textContent = `задачи: ${t.queued} в очереди, ${t.running} в работе, ${t.done} готово, ${t.failed} упало`;
-  $("queue").className = "badge" + (t.failed ? " warn" : "");
-}
-
-function connectWebSocket() {
-  if (socket) { socket.onclose = null; socket.close(); }
-  $("conn").textContent = "соединение…";
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/api/events.live?after=${lastEventId}&token=${encodeURIComponent(token)}`);
-  socket = ws;
-
-  ws.onopen = () => { reconnectDelay = 1000; $("conn").textContent = "живой поток: подключено"; };
-  ws.onmessage = (message) => {
-    const data = JSON.parse(message.data);
-    if (data.type === "hello") { renderStatus(data.status); return; }
-    if (data.type === "status") { renderStatus(data.status); return; }
-    if (data.type === "event") {
-      if (data.event.id > lastEventId) { lastEventId = data.event.id; renderEvent(data.event); }
-    }
-  };
-  ws.onclose = (event) => {
-    if (event.code === 1008) { showGate("Секрет не подошёл (сокет закрыт 1008)."); return; }
-    $("conn").textContent = `живой поток: обрыв, переподключение через ${reconnectDelay / 1000} с`;
-    setTimeout(connectWebSocket, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-  };
-  ws.onerror = () => ws.close();
-}
-
-// ── Действия ──────────────────────────────────────────────────────────────────────
-async function submitTask() {
-  const button = $("submit");
-  button.disabled = true;
-  $("tasks").textContent = "";
-  try {
-    let payload = null;
-    const raw = $("payload").value.trim();
-    if (raw) payload = JSON.parse(raw); // кривой JSON — громкое исключение, не тихая постановка
-    const body = await apiJson("/api/tasks", { method: "POST", body: JSON.stringify({ payload }) });
-    $("tasks").textContent = body.dispatched
-      ? `Задача ${body.task_id}: поставлена, job дёрнут. Ждём первый heartbeat…`
-      : `Задача ${body.task_id}: в очереди, но dispatch не настроен (${body.detail})`;
-    $("payload").value = "";
-  } catch (error) {
-    if (error instanceof SyntaxError) $("tasks").textContent = `Ошибка: payload — некорректный JSON`;
-  } finally {
-    button.disabled = false;
-  }
-}
-
-// ── Токен ─────────────────────────────────────────────────────────────────────────
-function showGate(message) {
-  if (socket) { socket.onclose = null; socket.close(); socket = null; }
-  $("gate").hidden = false;
-  $("gate-error").textContent = message || "";
-  $("gate-token").focus();
-}
-
-async function start() {
-  $("gate").hidden = true;
-  localStorage.setItem(TOKEN_KEY, token);
-  try {
-    const status = await apiJson("/api/status");
-    renderStatus(status);
-    await replay();
-    connectWebSocket();
-  } catch {
-    /* showGate уже показан api() при 401; остальные ошибки видны в статус-строке */
-  }
-}
-
-$("gate-enter").addEventListener("click", () => {
-  token = $("gate-token").value.trim();
-  if (!token) { $("gate-error").textContent = "Пустой токен."; return; }
-  start();
-});
-$("gate-token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("gate-enter").click(); });
-$("submit").addEventListener("click", submitTask);
-$("forget").addEventListener("click", () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
-
-// Держать соединение живым: CF рвёт WS по idle-таймауту, значение недокументировано.
-setInterval(() => { if (socket?.readyState === WebSocket.OPEN) socket.send(""); }, 30_000);
-
-if (!token) showGate(""); else start();
-</script>
+<script src="/assets/config.js"></script>
+<script src="/assets/i18n/ru.js"></script>
+<script src="/assets/app.js"></script>
 </body>
 </html>

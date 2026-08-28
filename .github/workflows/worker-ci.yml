@@ -1,4 +1,6 @@
 # Тесты и typecheck воркера: на настоящем workerd через @cloudflare/vitest-plugin.
+# На PR запускается без фильтра путей: проверка "test" обязательна защитой ветки main,
+# а обязательная проверка, которой нет на PR, навсегда блокирует слияние.
 name: worker-ci
 
 on:
@@ -8,9 +10,6 @@ on:
       - "cf-worker/**"
       - ".github/workflows/worker-ci.yml"
   pull_request:
-    paths:
-      - "cf-worker/**"
-      - ".github/workflows/worker-ci.yml"
 
 jobs:
   test:
@@ -25,6 +24,10 @@ jobs:
           cache-dependency-path: cf-worker/package-lock.json
 
       - run: npm ci
+        working-directory: cf-worker
+
+      - name: Контракт фронтенда (пути и локализация)
+        run: npm run check
         working-directory: cf-worker
 
       - run: npm run typecheck

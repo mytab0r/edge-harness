@@ -1,0 +1,52 @@
+# Оркестратор мультиагентной работы: следит за пулом задач и сериализует слияния.
+#
+# Два режима:
+#   contract  — на каждый PR: проверка контракта «PR ↔ задача из пула» (обязательная
+#               проверка защиты ветки main);
+#   orchestra — по расписанию и вручную: просроченные назначения, метки конфликтов,
+#               очередь слияний (ровно один PR за запуск).
+#
+# Concurrency-группа сериализует сами запуски orchestra: два слияния никогда
+# не идут параллельно. Это архитектурный замок, а не договорённость.
+#
+# ⚠️ Расписание в публичном репозитории само отключается после 60 дней без активности
+#    (docs/research/21-github-actions.md) — деградация громкая: отчёты перестанут
+#    появляться в Actions. Поднимать активность или дёргать workflow_dispatch вручную.
+name: orchestra
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: orchestra
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Контракт PR ↔ задача
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/contract_check.py --pr ${{ github.event.pull_request.number }}
+
+  orchestra:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Обход пула и очередь слияний
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/scheduler.py

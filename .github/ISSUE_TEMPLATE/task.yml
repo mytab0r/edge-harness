@@ -1,0 +1,43 @@
+name: 📋 Задача в пул
+description: Единица работы для любого агента. Берётся через assign + ветку agent/<номер>.
+labels: [task]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Цель
+      description: Что должно стать верным и наблюдаемым. Одна фраза.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Критерий готовности
+      description: Видимый результат, а не «шаг прошёл». Что именно проверяем.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Площадь
+      options:
+        - area:worker
+        - area:hands
+        - area:docs
+        - area:orchestra
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Контекст и ссылки
+      description: Ссылки на research/ADR/спеку. Чего НЕ трогать (границы задачи).
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Правила
+      options:
+        - label: Я прочитал docs/research/30-rejected-alternatives.md и задача не из отвергнутых
+          required: true
+        - label: Критерий готовности проверяем по видимому результату
+          required: true

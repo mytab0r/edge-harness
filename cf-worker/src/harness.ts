@@ -1,20 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-
-// ── Константы — каждое значение объявлено здесь один раз и читается отсюда ──────────
-
-/** «Руки живы» = последняя отметка свежее этого порога. Единственное место правды. */
-export const HEARTBEAT_FRESH_MS = 60_000;
-/** Сколько событий отдавать на страницу replay'ем, если лимит не назван. */
-export const DEFAULT_REPLAY_LIMIT = 100;
-/** Потолок одной страницы replay. */
-export const MAX_REPLAY_LIMIT = 500;
-/** Потолок батча в POST /api/events. Ограничен лимитом плейсхолдеров DO SQLite
- *  (100 на statement): предчтение дублей тратит 1 + размер батча. */
-export const MAX_BATCH_EVENTS = 50;
-/** event_type для repository_dispatch. */
-export const DISPATCH_EVENT_TYPE = "harness-task";
-/** Имя единственного объекта. Мультитенантности нет, владелец один. */
-export const OWNER_OBJECT_NAME = "owner";
+import { GITHUB, LIMITS, OWNER_OBJECT_NAME, ROUTES } from "./config";
+import { msg } from "./messages";
 
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
@@ -80,14 +66,14 @@ export interface Status {
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
 export function handsAreAlive(now: number, lastHeartbeatTs: number | null): boolean {
-  return lastHeartbeatTs !== null && now - lastHeartbeatTs < HEARTBEAT_FRESH_MS;
+  return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
 }
 
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
-  constructor(status: number, code: string, message: string) {
-    super(JSON.stringify({ error: { code, message } }), {
+  constructor(status: number, code: Parameters<typeof msg>[0], params: Record<string, string | number> = {}) {
+    super(JSON.stringify({ error: { code, message: msg(code, params) } }), {
       status,
       headers: { "content-type": "application/json" },
     });
@@ -112,8 +98,8 @@ export class Harness extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof ApiError) return error;
       // Неизвестная ошибка — громко, с текстом в ответе: silent-wrong дороже падения.
-      const message = error instanceof Error ? error.message : String(error);
-      return new ApiError(500, "internal", message);
+      const detail = error instanceof Error ? error.message : String(error);
+      return new ApiError(500, "internal", { detail });
     }
   }
 
@@ -123,37 +109,37 @@ export class Harness extends DurableObject<Env> {
 
   async #route(request: Request, url: URL): Promise<Response> {
     if (!this.#authorized(request, url)) {
-      throw new ApiError(401, "unauthorized", "Неверный или отсутствующий HANDS_TOKEN");
+      throw new ApiError(401, "unauthorized");
     }
 
-    if (request.method === "GET" && url.pathname === "/api/status") {
+    if (request.method === "GET" && url.pathname === ROUTES.status) {
       return this.#json(this.#status());
     }
-    if (request.method === "POST" && url.pathname === "/api/events") {
+    if (request.method === "POST" && url.pathname === ROUTES.events) {
       return this.#postEvents(request);
     }
-    if (request.method === "GET" && url.pathname === "/api/events") {
+    if (request.method === "GET" && url.pathname === ROUTES.events) {
       return this.#getEvents(url);
     }
-    if (request.method === "GET" && url.pathname === "/api/events.live") {
+    if (request.method === "GET" && url.pathname === ROUTES.eventsLive) {
       return this.#openLiveSocket(url);
     }
-    if (request.method === "POST" && url.pathname === "/api/tasks") {
+    if (request.method === "POST" && url.pathname === ROUTES.tasks) {
       return this.#postTask(request);
     }
-    if (request.method === "GET" && url.pathname === "/api/tasks") {
+    if (request.method === "GET" && url.pathname === ROUTES.tasks) {
       return this.#json({ tasks: this.#recentTasks() });
     }
-    if (request.method === "GET" && url.pathname.startsWith("/api/tasks/")) {
-      const id = decodeURIComponent(url.pathname.slice("/api/tasks/".length));
+    if (request.method === "GET" && url.pathname.startsWith(ROUTES.task)) {
+      const id = decodeURIComponent(url.pathname.slice(ROUTES.task.length));
       const task = this.#task(id);
-      if (!task) throw new ApiError(404, "not_found", `Задача ${id} не найдена`);
+      if (!task) throw new ApiError(404, "task_not_found", { task_id: id });
       return this.#json({ task });
     }
-    if (request.method === "POST" && url.pathname === "/api/heartbeat") {
+    if (request.method === "POST" && url.pathname === ROUTES.heartbeat) {
       return this.#postHeartbeat(request);
     }
-    throw new ApiError(404, "not_found", `Нет маршрута ${request.method} ${url.pathname}`);
+    throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
   // ── Аутентификация ────────────────────────────────────────────────────────────────
@@ -176,17 +162,18 @@ export class Harness extends DurableObject<Env> {
 
   async #readJson(request: Request): Promise<Record<string, unknown>> {
     const text = await request.text();
-    if (text.length > 1_048_576) {
-      throw new ApiError(413, "too_large", "Тело больше 1 MiB");
+    if (text.length > LIMITS.bodyMaxBytes) {
+      throw new ApiError(413, "too_large", { limit: LIMITS.bodyMaxBytes });
     }
     try {
       const parsed: unknown = JSON.parse(text);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        throw new Error("тело должно быть JSON-объектом");
+        throw new Error(msg("body_not_object"));
       }
       return parsed as Record<string, unknown>;
     } catch (error) {
-      throw new ApiError(400, "bad_json", `Некорректный JSON: ${error instanceof Error ? error.message : error}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ApiError(400, "bad_json", { detail });
     }
   }
 
@@ -209,7 +196,7 @@ export class Harness extends DurableObject<Env> {
     const hbTs = hb ? Number(hb.ts) : null;
     return {
       now,
-      heartbeat_fresh_ms: HEARTBEAT_FRESH_MS,
+      heartbeat_fresh_ms: LIMITS.heartbeatFreshMs,
       hands_alive: handsAreAlive(now, hbTs),
       last_heartbeat: hb ? { ts: hbTs as number, job_id: String(hb.job_id) } : null,
       tasks: counts,
@@ -251,15 +238,15 @@ export class Harness extends DurableObject<Env> {
     const body = await this.#readJson(request);
     const taskId = body.task_id;
     if (typeof taskId !== "string" || !taskId) {
-      throw new ApiError(400, "bad_request", "Нужно поле task_id");
+      throw new ApiError(400, "need_task_id");
     }
     const source = typeof body.source === "string" && body.source ? body.source : "job";
     const rawEvents = body.events;
     if (!Array.isArray(rawEvents) || rawEvents.length === 0) {
-      throw new ApiError(400, "bad_request", "Нужно непустое поле events — массив");
+      throw new ApiError(400, "need_events_array");
     }
-    if (rawEvents.length > MAX_BATCH_EVENTS) {
-      throw new ApiError(413, "too_many", `Батч больше MAX_BATCH_EVENTS=${MAX_BATCH_EVENTS}`);
+    if (rawEvents.length > LIMITS.batchMax) {
+      throw new ApiError(413, "batch_too_many", { limit: LIMITS.batchMax });
     }
 
     const now = Date.now();
@@ -268,11 +255,11 @@ export class Harness extends DurableObject<Env> {
       const event = raw as Record<string, unknown>;
       const seq = event.seq;
       if (typeof seq !== "number" || !Number.isInteger(seq) || seq <= 0) {
-        throw new ApiError(400, "bad_request", "Каждое событие требует целого seq > 0");
+        throw new ApiError(400, "need_positive_int_seq");
       }
       const kind = event.kind;
       if (typeof kind !== "string" || !kind) {
-        throw new ApiError(400, "bad_request", "Каждое событие требует непустой kind");
+        throw new ApiError(400, "need_nonempty_kind");
       }
       incoming.push({
         seq,
@@ -312,7 +299,15 @@ export class Harness extends DurableObject<Env> {
       const id = Number(
         this.#rows(this.#sql.exec("SELECT id FROM events WHERE task_id = ? AND seq = ?", taskId, event.seq))[0].id,
       );
-      accepted.push({ id, task_id: taskId, seq: event.seq, ts: event.ts, source, kind: event.kind, data: event.data === null ? null : JSON.parse(event.data) });
+      accepted.push({
+        id,
+        task_id: taskId,
+        seq: event.seq,
+        ts: event.ts,
+        source,
+        kind: event.kind,
+        data: event.data === null ? null : JSON.parse(event.data),
+      });
     }
     const duplicates = incoming.length - accepted.length;
 
@@ -345,7 +340,7 @@ export class Harness extends DurableObject<Env> {
 
   #getEvents(url: URL): Response {
     const after = this.#intParam(url, "after", 0);
-    const limit = Math.min(this.#intParam(url, "limit", DEFAULT_REPLAY_LIMIT), MAX_REPLAY_LIMIT);
+    const limit = Math.min(this.#intParam(url, "limit", LIMITS.replayDefault), LIMITS.replayMax);
     // Фильтр по задаче нужен replay'ем конкретной задачи (клиент рук засевает seq
     // с максимума); без него — весь журнал подряд.
     const taskId = url.searchParams.get("task_id");
@@ -385,7 +380,7 @@ export class Harness extends DurableObject<Env> {
     if (raw === null) return fallback;
     const value = Number(raw);
     if (!Number.isInteger(value) || value < 0) {
-      throw new ApiError(400, "bad_request", `Параметр ${name} должен быть целым >= 0`);
+      throw new ApiError(400, "bad_int_param", { name });
     }
     return value;
   }
@@ -414,8 +409,8 @@ export class Harness extends DurableObject<Env> {
   async #postTask(request: Request): Promise<Response> {
     const body = await this.#readJson(request);
     const payload = body.payload === undefined ? null : body.payload;
-    if (JSON.stringify(payload)?.length > 8192) {
-      throw new ApiError(413, "too_large", "payload больше 8 KiB");
+    if (JSON.stringify(payload)?.length > LIMITS.payloadMaxChars) {
+      throw new ApiError(413, "payload_too_large", { limit: LIMITS.payloadMaxChars });
     }
 
     const id = crypto.randomUUID();
@@ -433,7 +428,7 @@ export class Harness extends DurableObject<Env> {
           task_id: id,
           dispatched: false,
           dispatch: "not_configured",
-          detail: "GH_DISPATCH_TOKEN или GH_REPO не заданы; задача лежит в очереди",
+          detail: msg("dispatch_not_configured"),
         },
         { status: 201 },
       );
@@ -441,24 +436,25 @@ export class Harness extends DurableObject<Env> {
 
     let response: Response;
     try {
-      response = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+      response = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
           "Content-Type": "application/json",
-          "User-Agent": "edge-harness-do",
-          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
         body: JSON.stringify({
-          event_type: DISPATCH_EVENT_TYPE,
+          event_type: GITHUB.dispatchEventType,
           client_payload: { task_id: id },
         }),
       });
     } catch (error) {
       this.#emitSystemEvent(id, "dispatch_failed", { detail: String(error) });
       this.#broadcastStatus();
-      throw new ApiError(502, "dispatch_failed", `GitHub API недоступен: ${error instanceof Error ? error.message : error}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ApiError(502, "dispatch_network_failed", { detail });
     }
 
     if (response.status !== 204) {
@@ -467,7 +463,7 @@ export class Harness extends DurableObject<Env> {
       // docs/research/21-github-actions.md. Здесь доказываем только приём события API.
       this.#emitSystemEvent(id, "dispatch_failed", { github_status: response.status });
       this.#broadcastStatus();
-      throw new ApiError(502, "dispatch_failed", `GitHub ответил ${response.status} на dispatch (ожидался 204)`);
+      throw new ApiError(502, "dispatch_rejected", { status: response.status });
     }
 
     this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
@@ -478,7 +474,7 @@ export class Harness extends DurableObject<Env> {
 
   #recentTasks(): TaskRow[] {
     return this.#rows(
-      this.#sql.exec("SELECT id, created_ts, dispatch_ts, latency_ms, status FROM tasks ORDER BY created_ts DESC LIMIT 100"),
+      this.#sql.exec("SELECT id, created_ts, dispatch_ts, latency_ms, status FROM tasks ORDER BY created_ts DESC LIMIT ?", LIMITS.tasksListMax),
     ).map((row) => this.#taskRow(row));
   }
 
@@ -530,7 +526,7 @@ export class Harness extends DurableObject<Env> {
     const body = await this.#readJson(request);
     const jobId = body.job_id;
     if (typeof jobId !== "string" || !jobId) {
-      throw new ApiError(400, "bad_request", "Нужно поле job_id");
+      throw new ApiError(400, "need_job_id");
     }
     const taskId = typeof body.task_id === "string" && body.task_id ? body.task_id : null;
     const now = Date.now();

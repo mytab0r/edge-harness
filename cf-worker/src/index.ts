@@ -1,11 +1,11 @@
-import { OWNER_OBJECT_NAME } from "./harness";
+import { OWNER_OBJECT_NAME, ROUTES } from "./config";
 
 // Один Durable Object с фиксированным именем: мультитенантности нет, владелец один.
-// Вся /api/* уходит в него; остальное — статика Workers Assets.
+// Всё с префикса /api уходит в него; остальное — статика Workers Assets.
 export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith(`${ROUTES.apiPrefix}/`)) {
       const id = env.HARNESS.idFromName(OWNER_OBJECT_NAME);
       return env.HARNESS.get(id).fetch(request);
     }

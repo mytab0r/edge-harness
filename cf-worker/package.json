@@ -7,7 +7,8 @@
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "check": "node scripts/check-frontend-contract.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.1.1",
