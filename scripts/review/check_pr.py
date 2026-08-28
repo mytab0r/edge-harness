@@ -97,6 +97,17 @@ def main() -> int:
     if is_large:
         findings.append(f"Дифф крупный ({added} строк > {LARGE_DIFF_LINES}): авто-слияние запрещено, нужен взгляд человека.")
 
+    # Каждый изменённый .py обязан компилироваться: ловит обрезанные файлы и
+    # неразрешённые конфликты, которые ломают скрипты молча (случалось с scheduler.py).
+    import py_compile
+    for f in files:
+        name = f["filename"]
+        if name.endswith(".py") and name.startswith("scripts/"):
+            try:
+                py_compile.compile(name, doraise=True)
+            except py_compile.PyCompileError as error:
+                findings.append(f"{name} не компилируется: {error.msg}")
+
     # Вердикт-метка: старые вердикты снимаются, вешается актуальный.
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     current = {label["name"] for label in pull["labels"]}
