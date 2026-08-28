@@ -19,6 +19,7 @@ window.EDGE_I18N = {
     "queue.unknown": "задачи: ?",
     "queue.line": "задачи: {queued} в очереди, {running} в работе, {done} готово, {failed} упало",
     "queue.warn": "задачи: {failed} упало",
+    "watchdog.stale": "⚠️ задача висит в dispatched без рук: {count} шт, старше {minutes} мин",
     "conn.connecting": "соединение…",
     "conn.ok": "живой поток: подключено",
     "conn.reconnect": "живой поток: обрыв, переподключение через {seconds} с",

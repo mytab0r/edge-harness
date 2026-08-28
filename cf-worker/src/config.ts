@@ -18,6 +18,10 @@ export const LIMITS = {
   payloadMaxChars: 8192,
   /** Сколько последних задач отдаёт список. */
   tasksListMax: 100,
+  /** Watchdog (issue #7): задача в статусе dispatched дольше этого порога без
+   *  heartbeat — ненормальное состояние, морда показывает предупреждение.
+   *  Медиана старта 8.3 с (ADR 0003), хвост ничем не ограничен — порог щедрый. */
+  staleDispatchMs: 30 * 60_000,
 } as const;
 
 export const HEARTBEAT = {
