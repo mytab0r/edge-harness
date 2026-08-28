@@ -102,8 +102,12 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
 
 def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
     lines = []
-    conflicted = [pull for pull in pulls if pull.get("mergeable_state") == "dirty"]
-    for pull in conflicted:
+    for pull in pulls:
+        # mergeable_state живёт только на endpoint'е одиночного PR: в списке он
+        # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
+        single = gh(f"repos/{repo}/pulls/{pull['number']}")
+        if single.get("mergeable_state") != "dirty":
+            continue
         labels = {label["name"] for label in pull["labels"]}
         if CONFLICT_LABEL in labels:
             continue
@@ -120,22 +124,36 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
 
 def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
     lines = []
+    skipped = []
     for pull in pulls:
         if pull.get("draft"):
+            skipped.append(f"#{pull['number']} — черновик")
             continue
-        state = pull.get("mergeable_state")
+        # См. mark_conflicts: состояние берём одиночным запросом.
+        single = gh(f"repos/{repo}/pulls/{pull['number']}")
+        state = single.get("mergeable_state")
         if state not in ("clean", "unstable", "has_hooks"):
+            skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
             continue
         checks = gh(f"repos/{repo}/commits/{pull['head']['sha']}/check-runs?per_page=100")
         runs = checks.get("check_runs", [])
-        if not runs or any(run["conclusion"] not in ("success", "skipped", "neutral") for run in runs):
+        if not runs:
+            skipped.append(f"#{pull['number']} — проверки ещё не заведены")
+            continue
+        bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+        if bad:
+            skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
             continue
         gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
             "-f", f"merge_method={MERGE_METHOD}",
         )
         lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
+        if skipped:
+            lines += [f"   (отложены: {item})" for item in skipped]
         return lines  # один за запуск: сериализация слияний
+    if skipped:
+        lines += [f"⏸️ {item}" for item in skipped]
     return lines
 
 
