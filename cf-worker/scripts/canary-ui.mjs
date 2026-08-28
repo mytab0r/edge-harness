@@ -28,31 +28,51 @@ try {
   // Токен адресной строкой — как задаётся для владельца; из истории он сразу стирается.
   await page.goto(`${base}/?token=${encodeURIComponent(token)}`, { waitUntil: "domcontentloaded" });
 
-  // 1. Гейт должен быть скрыт (токен принят HTTP-вызовом /api/status).
-  await page.waitForSelector("#gate", { state: "hidden", timeout: 15000 })
-    .catch(() => fails.push("гейт не скрылся — вход не прошёл (см. gate-error на странице)"));
+  // 1. Главный признак успешного входа: живой поток подключён (до этого момента
+  //    должны пройти и /api/status, и replay, и upgrade WebSocket).
+  const connOk = await page.evaluate(() => window.EDGE_I18N[window.EDGE_CONFIG.locale]["conn.ok"]);
+  let connFailed = await page
+    .waitForFunction(
+      (expected) => document.getElementById("conn")?.textContent === expected,
+      connOk,
+      { timeout: 20000 },
+    )
+    .then(() => null)
+    .catch(() => "живой поток не подключился");
+  if (connFailed) {
+    // Диагностика на месте: что написал гейт и какой статус у бейджа рук.
+    const state = await page.evaluate(() => ({
+      gateHidden: document.getElementById("gate")?.hidden,
+      gateError: document.getElementById("gate-error")?.textContent,
+      hands: document.getElementById("hands")?.textContent,
+      conn: document.getElementById("conn")?.textContent,
+    }));
+    console.error(`  ✗ ${connFailed}; состояние страницы: ${JSON.stringify(state)}`);
+  }
+  if (connFailed) fails.push(connFailed);
 
   // 2. Статус рук отрисован реальным текстом локализации (а не «…»).
   const ok = await page.evaluate(() => ({
     gone: window.EDGE_I18N[window.EDGE_CONFIG.locale]["hands.gone"],
     alive: window.EDGE_I18N[window.EDGE_CONFIG.locale]["hands.alive"],
   }));
-  await page.waitForFunction(
+  const badgeOk = await page.waitForFunction(
     ([gone, alivePrefix]) => {
       const text = document.getElementById("hands")?.textContent ?? "";
       return text === gone || text.startsWith(alivePrefix.split("{")[0]);
     },
     [ok.gone, ok.alive],
-    { timeout: 15000 },
-  ).catch(() => fails.push("бейдж статуса рук не отрисован"));
+    { timeout: 5000 },
+  ).then(() => true).catch(() => false);
+  if (!badgeOk) fails.push("бейдж статуса рук не отрисован");
 
-  // 3. Живой поток подключён (текст берём из локализации страницы же).
-  const connOk = await page.evaluate(() => window.EDGE_I18N[window.EDGE_CONFIG.locale]["conn.ok"]);
-  await page.waitForFunction(
-    (expected) => document.getElementById("conn")?.textContent === expected,
-    connOk,
-    { timeout: 20000 },
-  ).catch(() => fails.push("живой поток не подключился"));
+  // 3. Гейт остался скрытым после полного цикла (порядок важен: сразу после клика
+  //    он скрыт всегда, а вот после неудачного входа появляется снова).
+  const gateHidden = await page.evaluate(() => document.getElementById("gate")?.hidden === true);
+  if (!gateHidden) {
+    const gateError = await page.evaluate(() => document.getElementById("gate-error")?.textContent);
+    fails.push(`гейт виден: ${gateError}`);
+  }
 
   // 4. Никаких обращений к несуществующим маршрутам (класс «/api/api/*»).
   const badRequests = [];

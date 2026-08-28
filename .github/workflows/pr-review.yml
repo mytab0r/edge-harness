@@ -1,0 +1,24 @@
+# Звено ревью конвейера: срабатывает на каждый PR, вешает вердикт-метку
+# review:ok / review:changes-requested (+ review:large для крупных диффов).
+# Оркестратор сливает только PR с меткой review:ok — метка и есть триггер
+# следующего шага (см. docs/agents/PROTOCOL.md).
+name: pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Детерминированное ревью диффа
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/review/check_pr.py --pr ${{ github.event.pull_request.number }}
