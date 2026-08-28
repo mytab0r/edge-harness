@@ -43,6 +43,11 @@ jobs:
           fi
 
       - name: Типы актуальны?
+        # Токен нужен: wrangler types включает в Env имена секретов аккаунта.
+        # Без него генерат молча теряет секреты и гвардия ложно падает.
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           npx wrangler types
           if ! git diff --exit-code -- worker-configuration.d.ts; then
