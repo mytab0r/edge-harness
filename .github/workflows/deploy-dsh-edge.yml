@@ -1,0 +1,72 @@
+# Деплой DSH Edge на Cloudflare Workers.
+# Скачивает последнюю версию dsh-edge из npm, извлекает воркер и морду,
+# деплоит через wrangler. Секреты (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) сохраняются
+# между деплоями автоматически.
+
+name: deploy-dsh-edge
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия dsh-edge (пусто = последняя)"
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Деплой DSH Edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DSH_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION_ARG=""
+          if [ -n "$DSH_VERSION" ]; then
+            VERSION_ARG="@$DSH_VERSION"
+          fi
+          mkdir -p /tmp/dsh-deploy
+          cd /tmp/dsh-deploy
+
+          echo "=== Скачиваю dsh-edge${VERSION_ARG}..."
+          npm pack "dsh-edge${VERSION_ARG}" 2>&1 | tail -1
+          TARBALL=$(ls dsh-edge-*.tgz | head -1)
+          tar -xzf "$TARBALL"
+
+          echo "=== Готовлю воркер и морду..."
+          mkdir -p deploy
+          cp package/worker/direct/index.js deploy/worker.js
+          cp -r package/dist deploy/dist
+
+          cat > deploy/wrangler.jsonc <<'WRANGLER'
+          {
+            "name": "dsh-edge",
+            "main": "worker.js",
+            "compatibility_date": "2026-08-14",
+            "compatibility_flags": ["nodejs_compat"],
+            "no_bundle": true,
+            "assets": {
+              "binding": "ASSETS",
+              "directory": "./dist",
+              "not_found_handling": "single-page-application",
+              "run_worker_first": ["/api/*", "/", "/login"]
+            },
+            "durable_objects": {
+              "bindings": [
+                { "name": "DSH_EDGE_INSTANCE", "class_name": "DshEdgeInstance" }
+              ]
+            },
+            "migrations": [
+              { "tag": "v1", "new_sqlite_classes": ["DshEdgeInstance"] }
+            ],
+            "observability": { "enabled": true }
+          }
+          WRANGLER
+
+          echo "=== Деплою на Cloudflare..."
+          cd deploy
+          npx wrangler deploy 2>&1 | tail -8
+
+          echo "=== Готово"
