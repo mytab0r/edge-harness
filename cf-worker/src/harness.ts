@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { GITHUB, LIMITS } from "./config";
+import { GITHUB, HEARTBEAT, LIMITS } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 
@@ -90,6 +90,24 @@ export class Harness extends DurableObject<Env> {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
+    void this.#ensureHeartbeat();
+  }
+
+  /**
+   * Пульс оркестрации: если будильника нет — закладываем ближайший. Обработчик
+   * alarm() сначала перезакладывает следующий тик, потом дёргает workflow_dispatch:
+   * падение dispatch не может убить цепочку. Alarm переживает гибернацию
+   * и стоит 1 request — комфортный режим Free (docs/research/20).
+   */
+  #ensureHeartbeat(): void {
+    this.ctx.storage
+      .getAlarm()
+      .then((scheduled) => {
+        if (scheduled === null) {
+          return this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
+        }
+      })
+      .catch(() => {});
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -415,6 +433,29 @@ export class Harness extends DurableObject<Env> {
   }
 
   override webSocketClose(): void {}
+
+  /** Пульс: следующим тиком гарантируем цепочку, потом дёргаем оркестратора. */
+  override async alarm(): Promise<void> {
+    await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) return; // «возможности нет» — не поломка, тихо ждём конфигурации
+    try {
+      await fetch(`${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/dispatches`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({ ref: "main" }),
+      });
+    } catch (error) {
+      // Пульс не роняет объект: ошибка уйдёт в observability, цепочка уже перезаложена.
+      console.log(`heartbeat dispatch failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
 
   // ── Очередь задач ─────────────────────────────────────────────────────────────────
 
