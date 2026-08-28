@@ -143,16 +143,20 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
         if bad:
             skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
+<<<<<<< HEAD
             continue
         labels = {label["name"] for label in pull["labels"]}
         if "review:ok" not in labels:
             skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
+=======
+>>>>>>> origin/main
             continue
         gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
             "-f", f"merge_method={MERGE_METHOD}",
         )
         lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
+<<<<<<< HEAD
         lines += after_merge(repo, pull)
         return lines  # один за запуск: сериализация слияний
     if skipped:
@@ -178,6 +182,13 @@ def after_merge(repo: str, pull: dict) -> list[str]:
         if digits:
             gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
             lines.append(f"📌 задача #{digits} закрыта")
+=======
+        if skipped:
+            lines += [f"   (отложены: {item})" for item in skipped]
+        return lines  # один за запуск: сериализация слияний
+    if skipped:
+        lines += [f"⏸️ {item}" for item in skipped]
+>>>>>>> origin/main
     return lines
 
 
