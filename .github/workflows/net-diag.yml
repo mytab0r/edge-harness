@@ -1,0 +1,28 @@
+# Временная диагностика: как GitHub-раннер видит workers.dev (ожидаем от воркера 401,
+# а не 403 от Cloudflare). Удалить после разбора.
+name: net-diag
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Статусы и заголовки ответа воркера
+        run: |
+          echo "=== curl по умолчанию (curl/8.x) ==="
+          curl -sS -o /dev/null -D - https://edge-harness.mytab0r.workers.dev/api/status || true
+          echo "=== python urllib (как hands_client) ==="
+          python3 - <<'PY'
+          import urllib.request
+          req = urllib.request.Request("https://edge-harness.mytab0r.workers.dev/api/status")
+          try:
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  print("status:", r.status)
+                  print(dict(r.headers))
+          except Exception as e:
+              print("ERR:", e)
+              print(getattr(e, "headers", None))
+          PY
+          echo "=== с явным User-Agent ==="
+          curl -sS -o /dev/null -D - -A "edge-harness-hands/0.1 (+https://github.com/mytab0r/edge-harness)" https://edge-harness.mytab0r.workers.dev/api/status || true
