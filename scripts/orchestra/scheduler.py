@@ -144,6 +144,13 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
         if bad:
             skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
+<<<<<<< HEAD
+            continue
+        labels = {label["name"] for label in pull["labels"]}
+        if "review:ok" not in labels:
+            skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
+=======
+>>>>>>> origin/main
             continue
         labels = {label["name"] for label in pull["labels"]}
         if "review:ok" not in labels:
@@ -154,12 +161,40 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
             "-f", f"merge_method={MERGE_METHOD}",
         )
         lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
+<<<<<<< HEAD
+        lines += after_merge(repo, pull)
+        return lines  # один за запуск: сериализация слияний
+    if skipped:
+        lines += [f"⏸️ {item}" for item in skipped]
+    return lines
+
+
+def after_merge(repo: str, pull: dict) -> list[str]:
+    """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
+    (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно."""
+    lines = []
+    number = pull["number"]
+    files = gh(f"repos/{repo}/pulls/{number}/files?per_page=100")
+    if any((f["filename"] or "").startswith("cf-worker/") for f in files):
+        subprocess.run(
+            ["gh", "workflow", "run", "deploy-worker.yml", "--ref", "main"],
+            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+            check=True,
+        )
+        lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
+    for token_ref in (pull.get("body") or "").replace("-", " ").split("#")[1:]:
+        digits = "".join(ch for ch in token_ref.strip().split()[0] if ch.isdigit()) if token_ref.strip() else ""
+        if digits:
+            gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
+            lines.append(f"📌 задача #{digits} закрыта")
+=======
         if skipped:
             lines += [f"   (отложены: {item})" for item in skipped]
         lines += after_merge(repo, pull)
         return lines  # один за запуск: сериализация слияний
     if skipped:
         lines += [f"⏸️ {item}" for item in skipped]
+>>>>>>> origin/main
     return lines
 
 

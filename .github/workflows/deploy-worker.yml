@@ -67,6 +67,7 @@ jobs:
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде
         run: |
+          npm ci
           npx playwright install --with-deps chromium
           node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
         working-directory: cf-worker
