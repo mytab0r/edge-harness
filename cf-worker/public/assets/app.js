@@ -1,5 +1,7 @@
 /* edge-harness: клиент морды. Живёт на статике Workers Assets, говорит с Durable Object
-   через /api (пути — window.EDGE_CONFIG, тексты — window.EDGE_I18N). */
+   через /api. Пути берутся ТОЛЬКО ключами из window.EDGE_CONFIG.routes (таблица хранит
+   полные пути, ничего не склеивается — класс ошибки «двойной префикс» невозможен):
+   неизвестный ключ — громкое исключение, а не тихий запрос в никуда. */
 
 "use strict";
 
@@ -8,6 +10,18 @@ const t = (key, params) => {
   let text = (window.EDGE_I18N[CONFIG.locale] || {})[key] || key;
   if (params) text = text.replace(/\{(\w+)\}/g, (_, k) => (k in params ? String(params[k]) : `{${k}}`));
   return text;
+};
+
+const route = (name) => {
+  const path = CONFIG.routes[name];
+  if (!path) throw new Error(`Неизвестный маршрут: ${name}`);
+  return path;
+};
+
+// Путь — только из таблицы; параметры — отдельным query. Склеивать префиксы негде.
+const routeQ = (name, params = {}) => {
+  const query = new URLSearchParams(params).toString();
+  return query ? `${route(name)}?${query}` : route(name);
 };
 
 const $ = (id) => document.getElementById(id);
@@ -19,9 +33,8 @@ let socket = null;
 let socketRecycleTimer = null;
 let reconnectDelay = CONFIG.reconnectBaseMs;
 
-const api = (path, options = {}) => {
-  const url = `${CONFIG.routes.apiPrefix}${path}`;
-  return fetch(url, {
+const api = (path, options = {}) =>
+  fetch(path, {
     ...options,
     headers: {
       ...(options.body ? { "content-type": "application/json" } : {}),
@@ -29,7 +42,6 @@ const api = (path, options = {}) => {
       ...options.headers,
     },
   });
-};
 
 async function apiJson(path, options) {
   const res = await api(path, options);
@@ -63,7 +75,8 @@ function renderEvent(event) {
 async function replay() {
   // Догоняем журнал страницами до последнего известного события.
   for (;;) {
-    const body = await apiJson(`${CONFIG.routes.events}?after=${lastEventId}&limit=${CONFIG.replayPageSize}`);
+    const body = await apiJson(routeQ("events", { after: lastEventId, limit: CONFIG.replayPageSize })).catch(() => null);
+    if (!body) return; // сеть мигнула: живой поток догонит, иначе — перезагрузка
     for (const event of body.events) {
       renderEvent(event);
       lastEventId = Math.max(lastEventId, event.id);
@@ -108,8 +121,7 @@ function connectWebSocket() {
   $("conn").textContent = t("conn.connecting");
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const route = `${CONFIG.routes.eventsLive}?after=${lastEventId}&token=${encodeURIComponent(token)}`;
-  const ws = new WebSocket(`${proto}//${location.host}${route}`);
+  const ws = new WebSocket(`${proto}//${location.host}${routeQ("eventsLive", { after: lastEventId, token })}`);
   socket = ws;
 
   ws.onopen = () => {
@@ -151,7 +163,7 @@ async function submitTask() {
     let payload = null;
     const raw = $("payload").value.trim();
     if (raw) payload = JSON.parse(raw); // кривой JSON — громкое исключение, не тихая постановка
-    const body = await apiJson(CONFIG.routes.tasks, { method: "POST", body: JSON.stringify({ payload }) });
+    const body = await apiJson(routeQ("tasks"), { method: "POST", body: JSON.stringify({ payload }) });
     $("tasks").textContent = body.dispatched
       ? t("task.dispatched", { task_id: body.task_id })
       : t("task.not_configured", { task_id: body.task_id, detail: body.detail });
@@ -183,18 +195,20 @@ async function start() {
   $("gate").hidden = true;
   localStorage.setItem(TOKEN_KEY, token);
   try {
-    const status = await apiJson(CONFIG.routes.status);
+    const status = await apiJson(routeQ("status"));
     renderStatus(status);
     await replay();
     connectWebSocket();
   } catch (error) {
+    // Любая неудача входа — громко и на гейте: тихая пустая страница хуже падения.
     if (error.status === 401) {
-      showGate(t("gate.error_http", { status: 401 }));
       localStorage.removeItem(TOKEN_KEY);
-    } else if (!error.status) {
+      showGate(t("gate.error_http", { status: 401 }));
+    } else if (error.status) {
+      showGate(t("gate.error_http", { status: error.status }));
+    } else {
       showGate(t("gate.error_network", { detail: error.message }));
     }
-    // ошибки с кодом, отличным от 401, уже показаны в строке задач
   }
 }
 

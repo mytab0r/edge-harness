@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { GITHUB, LIMITS, OWNER_OBJECT_NAME, ROUTES } from "./config";
+import { GITHUB, LIMITS } from "./config";
 import { msg } from "./messages";
+import { matchRoute } from "./api-spec";
 
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
@@ -112,31 +113,42 @@ export class Harness extends DurableObject<Env> {
       throw new ApiError(401, "unauthorized");
     }
 
-    if (request.method === "GET" && url.pathname === ROUTES.status) {
+    // Роутинг табличный: метод+путь ищутся в api-spec.json. Добавить маршрут можно
+    // только через спеку — «объявлен в спеке, но не подключён» и наоборот невозможны.
+    const matched = matchRoute(request.method, url.pathname);
+    if (!matched) {
+      throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
+    }
+    const { route } = matched;
+
+    if (route.name === "status") {
       return this.#json(this.#status());
     }
-    if (request.method === "POST" && url.pathname === ROUTES.events) {
+    if (route.name === "events" && request.method === "POST") {
       return this.#postEvents(request);
     }
-    if (request.method === "GET" && url.pathname === ROUTES.events) {
+    if (route.name === "events" && request.method === "GET") {
       return this.#getEvents(url);
     }
-    if (request.method === "GET" && url.pathname === ROUTES.eventsLive) {
+    if (route.name === "eventsLive") {
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+        throw new ApiError(400, "need_websocket_upgrade");
+      }
       return this.#openLiveSocket(url);
     }
-    if (request.method === "POST" && url.pathname === ROUTES.tasks) {
+    if (route.name === "tasks" && request.method === "POST") {
       return this.#postTask(request);
     }
-    if (request.method === "GET" && url.pathname === ROUTES.tasks) {
+    if (route.name === "tasks" && request.method === "GET") {
       return this.#json({ tasks: this.#recentTasks() });
     }
-    if (request.method === "GET" && url.pathname.startsWith(ROUTES.task)) {
-      const id = decodeURIComponent(url.pathname.slice(ROUTES.task.length));
-      const task = this.#task(id);
+    if (route.name === "task") {
+      const id = matched.rest;
+      const task = id ? this.#task(id) : null;
       if (!task) throw new ApiError(404, "task_not_found", { task_id: id });
       return this.#json({ task });
     }
-    if (request.method === "POST" && url.pathname === ROUTES.heartbeat) {
+    if (route.name === "heartbeat") {
       return this.#postHeartbeat(request);
     }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });

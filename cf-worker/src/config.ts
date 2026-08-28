@@ -1,16 +1,6 @@
-// Единственное место правды для маршрутов, лимитов и имён.
-// Клиентская копия путей живёт в public/assets/config.js — паритет двух файлов
-// охраняет scripts/check-frontend-contract.mjs (npm run check).
-
-export const ROUTES = {
-  apiPrefix: "/api", // общий префикс: всё, что с него начинается, уходит в Durable Object
-  status: "/api/status",
-  events: "/api/events",
-  eventsLive: "/api/events.live",
-  tasks: "/api/tasks",
-  task: "/api/tasks/", // + <id>
-  heartbeat: "/api/heartbeat",
-} as const;
+// Единственное место правды для лимитов и внешних констант.
+// Маршруты API — в api-spec.json (обёртка src/api-spec.ts), оттуда же — серверный
+// роутинг, клиентская таблица (public/assets/config.js) и документация (docs/api.md).
 
 export const LIMITS = {
   /** «Руки живы» = последняя отметка свежее этого порога. */

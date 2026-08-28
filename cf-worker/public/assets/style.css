@@ -50,6 +50,8 @@ textarea { min-height: 44px; resize: vertical; }
   position: fixed; inset: 0; background: rgba(13,17,23,.95); display: flex;
   align-items: center; justify-content: center; z-index: 10;
 }
+/* Атрибут hidden обязан побеждать display:flex выше — иначе гейт не скрывается никогда. */
+#gate[hidden] { display: none; }
 #gate .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; width: 460px; max-width: 94vw; }
 #gate h1 { margin: 0 0 8px; font-size: 16px; }
 #gate p { color: var(--muted); margin: 0 0 12px; font-size: 13px; }

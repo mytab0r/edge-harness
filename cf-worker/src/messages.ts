@@ -6,6 +6,7 @@ import { LOCALE } from "./config";
 const MESSAGES = {
   ru: {
     unauthorized: "Неверный или отсутствующий HANDS_TOKEN",
+    need_websocket_upgrade: "Этот маршрут — WebSocket: нужен заголовок Upgrade: websocket",
     not_found: "Нет маршрута {method} {path}",
     bad_json: "Некорректный JSON: {detail}",
     body_not_object: "тело должно быть JSON-объектом",

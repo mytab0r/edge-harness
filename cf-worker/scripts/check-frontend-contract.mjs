@@ -1,12 +1,19 @@
 #!/usr/bin/env node
-// Гвардия контракта фронтенда: пути и локализационные ключи не должны разъезжаться
-// между сервером (src/config.ts) и клиентом (public/assets/*). Запуск: npm run check.
-// Нарушение паритета — тот же silent-wrong: страница молча начинает звать несуществующий
-// маршрут или показывать сырые ключи вместо текста.
+// Гвардия контракта API и фронтенда. Запуск: npm run check. Нарушение — красный CI.
+// Закрывает класс ошибки «двойной /api/api/*»: путь как строка имеет право жить
+// ровно в api-spec.json (источник) и public/assets/config.js (клиентская таблица);
+// код страницы обращается к маршрутам только ключами route("name").
+//   1. Клиентская таблица ≡ спеке API (имя → путь, без лишних и без пропавших).
+//   2. В app.js нет ни одного литерала, начинающегося с /api — путь строится
+//      только таблицей; склеивать префиксы физически не с чем.
+//   3. Каждый route("ключ") в app.js существует в таблице.
+//   4. Каждый ключ локализации t("…") и data-i18n из разметки есть в словарях i18n/*.
+//   5. docs/api.md сгенерирован из текущей спеки (не устарел).
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { execSync } from "node:child_process";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -15,53 +22,63 @@ const fail = (message) => {
   process.exit(1);
 };
 
-// 1. Пути: ROUTES из config.ts против window.EDGE_CONFIG.routes из assets/config.js
-const configTs = readFileSync(join(root, "src/config.ts"), "utf8");
-const clientConfig = readFileSync(join(root, "public/assets/config.js"), "utf8");
+const spec = JSON.parse(readFileSync(join(root, "api-spec.json"), "utf8"));
+const specTable = Object.fromEntries(spec.routes.map((route) => [route.name, route.path]));
+if (!Object.keys(specTable).length) fail("api-spec.json не содержит маршрутов");
 
-const serverRoutes = {};
-for (const match of configTs.matchAll(/(\w+):\s*"(\/api[^"]*)"/g)) {
-  serverRoutes[match[1]] = match[2];
-}
-const clientRoutes = {};
+// 1. Клиентская таблица ≡ спеке
+const clientConfig = readFileSync(join(root, "public/assets/config.js"), "utf8");
 const routesBlock = clientConfig.match(/routes:\s*\{([^}]*)\}/s);
 if (!routesBlock) fail("в public/assets/config.js не найден блок routes");
-for (const match of routesBlock[1].matchAll(/(\w+):\s*"(\/api[^"]*)"/g)) {
+const clientRoutes = {};
+for (const match of routesBlock[1].matchAll(/(\w+):\s*"([^"]+)"/g)) {
   clientRoutes[match[1]] = match[2];
 }
-
-for (const [key, value] of Object.entries(serverRoutes)) {
-  if (!(key in clientRoutes)) fail(`путь ${key} (${value}) есть в config.ts, но отсутствует в assets/config.js`);
-  if (clientRoutes[key] !== value) {
-    fail(`путь ${key} разошёлся: сервер "${value}", клиент "${clientRoutes[key]}"`);
+for (const [name, path] of Object.entries(specTable)) {
+  if (clientRoutes[name] !== path) {
+    fail(`маршрут ${name}: в спеке "${path}", в assets/config.js "${clientRoutes[name] ?? "нет"}"`);
   }
 }
-for (const key of Object.keys(clientRoutes)) {
-  if (!(key in serverRoutes)) fail(`путь ${key} есть в assets/config.js, но отсутствует в config.ts`);
+for (const name of Object.keys(clientRoutes)) {
+  if (!(name in specTable)) fail(`маршрут ${name} есть в assets/config.js, но отсутствует в api-spec.json`);
 }
-if (!Object.keys(serverRoutes).length) fail("в config.ts не найдено ни одного маршрута — изменился формат?");
 
-// 2. Локализация: каждый t("key") из app.js и каждый data-i18n из index.html
-//    должны быть в каждом словаре i18n/*.js
+// 2. В коде страницы нет path-литералов — путь существует только в таблице
 const appJs = readFileSync(join(root, "public/assets/app.js"), "utf8");
-const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-const usedKeys = [
-  ...appJs.matchAll(/\bt\("([\w.]+)"/g)].map((m) => m[1]);
-usedKeys.push(...[...indexHtml.matchAll(/data-i18n(?:-attr)?="(?:[\w-]+:)?([\w.]+)"/g)].map((m) => m[1]));
-const usedKeysUnique = [...new Set(usedKeys)];
-if (!usedKeysUnique.length) fail("не найдено ни одного ключа локализации (t(\"...\") или data-i18n) — изменился формат?");
+const pathLiterals = [...appJs.matchAll(/["'`](\/api[^"'`]*)["'`]/g)].map((m) => m[1]);
+if (pathLiterals.length) {
+  fail(`в app.js найдены литералы путей (${[...new Set(pathLiterals)].join(", ")}) — используй route("имя")`);
+}
 
-const { readdirSync } = await import("node:fs");
+// 3. Ключи маршрутов из app.js существуют в таблице
+const usedRouteKeys = [...appJs.matchAll(/\broute(?:Q)?\("(\w+)"/g)].map((m) => m[1]);
+if (!usedRouteKeys.length) fail("в app.js не найдено обращений route(\"...\") — изменился формат?");
+for (const key of usedRouteKeys) {
+  if (!(key in specTable)) fail(`route("${key}") в app.js, но такого маршрута нет в спеке`);
+}
+
+// 4. Локализация: t("key") из app.js и data-i18n из index.html есть в каждом словаре
+const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
+const jsKeys = [...appJs.matchAll(/\bt\("([\w.]+)"/g)].map((m) => m[1]);
+const htmlKeys = [...indexHtml.matchAll(/data-i18n(?:-attr)?="(?:[\w-]+:)?([\w.]+)"/g)].map((m) => m[1]);
+const usedKeys = [...new Set([...jsKeys, ...htmlKeys])];
+if (!usedKeys.length) fail("не найдено ни одного ключа локализации");
+
 const i18nDir = join(root, "public/assets/i18n");
 for (const file of readdirSync(i18nDir).filter((name) => name.endsWith(".js"))) {
   const dict = readFileSync(join(i18nDir, file), "utf8");
   const defined = new Set([...dict.matchAll(/"([\w.]+)":\s*"/g)].map((m) => m[1]));
   for (const key of usedKeys) {
-    if (!defined.has(key)) fail(`ключ "${key}" используется в app.js, но отсутствует в i18n/${file}`);
+    if (!defined.has(key)) fail(`ключ "${key}" используется, но отсутствует в i18n/${file}`);
   }
   for (const key of defined) {
-    if (!usedKeysUnique.includes(key)) console.warn(`warn: ключ "${key}" определён в i18n/${file}, но не используется`);
+    if (!usedKeys.includes(key)) console.warn(`warn: ключ "${key}" определён в i18n/${file}, но не используется`);
   }
 }
 
-console.log(`check-frontend-contract: OK (${Object.keys(serverRoutes).length} маршрутов, ${usedKeysUnique.length} ключей локализации)`);
+// 5. Документация API не устарела
+execSync("node scripts/generate-api-docs.mjs", { cwd: root, stdio: "pipe" });
+const gitDiff = execSync("git diff --stat -- docs/api.md", { cwd: root }).toString().trim();
+if (gitDiff) fail("docs/api.md устарел — запусти npm run docs и закоммить");
+
+console.log(`check-frontend-contract: OK (${Object.keys(specTable).length} маршрутов, ${usedKeys.length} ключей локализации)`);
