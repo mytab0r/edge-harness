@@ -134,9 +134,19 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
         state = single.get("mergeable_state")
         if state == "behind":
-            # Ветка отстала от main — обновляем серверно (GitHub сам вмержит main),
-            # проверки перезапустятся событием synchronize.
-            gh("-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/update-branch")
+            # Ветка отстала от main — обновляем серверно. ВАЖНО: обновление через
+            # GITHUB_TOKEN не зажигает проверки (защита от рекурсии) — бот-PR навсегда
+            # зависает в blocked. Поэтому PAT, если задан.
+            pat = os.environ.get("ORCHESTRA_PAT")
+            if pat:
+                subprocess.run(
+                    ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/update-branch",
+                     "-H", f"Authorization: Bearer {pat}"],
+                    capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+                    check=True,
+                )
+            else:
+                gh("-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/update-branch")
             skipped.append(f"#{pull['number']} — обновлена из main, проверки пойдут заново")
             continue
         if state not in ("clean", "unstable", "has_hooks"):
