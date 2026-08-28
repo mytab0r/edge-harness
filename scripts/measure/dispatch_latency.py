@@ -28,11 +28,13 @@ POLL_INTERVAL_S = 1.0
 
 BASE = os.environ["HARNESS_URL"].rstrip("/")
 TOKEN = os.environ["HANDS_TOKEN"]
+# Cloudflare на workers.dev блокирует UA "Python-urllib/*" (403 от edge, до кода не доходит).
+UA = "edge-harness/0.1 (GitHub Actions; +https://github.com/mytab0r/edge-harness)"
 
 
 def request(method: str, path: str, body: dict | None = None) -> dict:
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    headers = {"Authorization": f"Bearer {TOKEN}"}
+    headers = {"Authorization": f"Bearer {TOKEN}", "User-Agent": UA}
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)

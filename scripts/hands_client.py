@@ -33,6 +33,8 @@ REPLAY_PAGE = 500
 
 BASE = os.environ["HARNESS_URL"].rstrip("/")
 TOKEN = os.environ["HANDS_TOKEN"]
+# Cloudflare на workers.dev блокирует UA "Python-urllib/*" (403 от edge, до кода не доходит).
+UA = "edge-harness/0.1 (GitHub Actions; +https://github.com/mytab0r/edge-harness)"
 TASK_ID = os.environ["TASK_ID"]
 JOB_ID = os.environ.get("GITHUB_RUN_ID", "local")
 STATE_FILE = os.path.join(tempfile.gettempdir(), f"edge-harness-hands-{TASK_ID}.json")
@@ -42,7 +44,7 @@ _seq_lock = threading.Lock()
 
 
 def _request(path: str, body: dict | None = None) -> dict:
-    headers = {"Authorization": f"Bearer {TOKEN}"}
+    headers = {"Authorization": f"Bearer {TOKEN}", "User-Agent": UA}
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
