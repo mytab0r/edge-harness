@@ -17,6 +17,7 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -193,11 +194,14 @@ def after_merge(repo: str, pull: dict) -> list[str]:
             check=True,
         )
         lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
-    for token_ref in (pull.get("body") or "").replace("-", " ").split("#")[1:]:
-        digits = "".join(ch for ch in token_ref.strip().split()[0] if ch.isdigit()) if token_ref.strip() else ""
-        if digits:
-            gh("-X", "PATCH", f"repos/{repo}/issues/{digits}", "-f", "state=closed")
-            lines.append(f"📌 задача #{digits} закрыта")
+    for match in re.finditer(r"(?:[Cc]loses|[Ff]ixes|[Rr]esolves)\s+#(\d+)", pull.get("body") or ""):
+        issue_number = match.group(1)
+        try:
+            gh("-X", "PATCH", f"repos/{repo}/issues/{issue_number}", "-f", "state=closed")
+            lines.append(f"📌 задача #{issue_number} закрыта")
+        except RuntimeError as error:
+            # одна кривая ссылка не должна ронять остальные действия after_merge
+            lines.append(f"⚠️ не закрыл #{issue_number}: {error}")
     return lines
 
 
