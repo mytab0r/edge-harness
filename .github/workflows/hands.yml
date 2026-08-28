@@ -30,7 +30,7 @@ jobs:
       HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
       TASK_ID: ${{ github.event.client_payload.task_id }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
