@@ -49,4 +49,6 @@ jobs:
       - name: Обход пула и очередь слияний
         env:
           GH_TOKEN: ${{ github.token }}
+          # PAT для update-branch: GITHUB_TOKEN-обновления не зажигают проверки
+          ORCHESTRA_PAT: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: python scripts/orchestra/scheduler.py
