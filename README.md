@@ -26,8 +26,10 @@ Containers, Dynamic Workers и WebSocket-туннеля.
 
 ## Состояние
 
-Ранняя стадия: исследование закрыто, документация собрана, код ещё не написан.
-Активные изменения — в [`openspec/changes/`](openspec/changes/).
+Walking-skeleton в работе: код морды и мозга ([`cf-worker/`](cf-worker/README.md)) написан,
+тесты и локальный smoke зелёные; за ним — замеры задержки старта job'а и расхода CPU.
+Чек-лист с живым статусом — в
+[`openspec/changes/walking-skeleton/tasks.md`](openspec/changes/walking-skeleton/tasks.md).
 
 ## Правила
 

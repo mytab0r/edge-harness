@@ -1,0 +1,34 @@
+# Тесты и typecheck воркера: на настоящем workerd через @cloudflare/vitest-plugin.
+name: worker-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cf-worker/**"
+      - ".github/workflows/worker-ci.yml"
+  pull_request:
+    paths:
+      - "cf-worker/**"
+      - ".github/workflows/worker-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - run: npm ci
+        working-directory: cf-worker
+
+      - run: npm run typecheck
+        working-directory: cf-worker
+
+      - run: npm test
+        working-directory: cf-worker
