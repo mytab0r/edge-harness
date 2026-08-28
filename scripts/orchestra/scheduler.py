@@ -133,6 +133,12 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
         state = single.get("mergeable_state")
+        if state == "behind":
+            # Ветка отстала от main — обновляем серверно (GitHub сам вмержит main),
+            # проверки перезапустятся событием synchronize.
+            gh("-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/update-branch")
+            skipped.append(f"#{pull['number']} — обновлена из main, проверки пойдут заново")
+            continue
         if state not in ("clean", "unstable", "has_hooks"):
             skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
             continue
