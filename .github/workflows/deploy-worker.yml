@@ -51,6 +51,7 @@ jobs:
         run: |
           npx wrangler types
           if ! git diff --exit-code -- worker-configuration.d.ts; then
+            git diff -- worker-configuration.d.ts | head -40
             echo "::error::worker-configuration.d.ts устарел: запусти 'npm run types' и закоммить."
             exit 1
           fi
