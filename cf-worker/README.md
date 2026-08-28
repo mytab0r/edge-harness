@@ -7,18 +7,18 @@
 
 ## API
 
+Спека — [`api-spec.json`](api-spec.json): единственное объявление маршрутов. Из неё
+строятся серверный роутинг, клиентская таблица (`public/assets/config.js`), документация
+([`docs/api.md`](../docs/api.md), генерация `npm run docs`) и проверки-канарейки
+(`test/api-contract.spec.ts`, `scripts/canary-ui.mjs`). Правила контракта —
+[ADR 0004](../docs/decisions/0004-api-contract.md).
+
 Все `/api/*` требуют `Authorization: Bearer <HANDS_TOKEN>` (WebSocket — `?token=` в query,
 потому что браузерный WS заголовки ставить не может).
 
 | Маршрут | Что делает |
 |---|---|
-| `GET /api/status` | руки живы/нет (порог `HEARTBEAT_FRESH_MS`), счётчики задач |
-| `POST /api/events` | батч событий `{task_id, events:[{seq, kind, data}]}`; идемпотентность по `UNIQUE(task_id, seq)` |
-| `GET /api/events?after=&limit=&task_id=` | replay журнала, заголовки `x-has-more` / `x-next-after` |
-| `GET /api/events.live?after=` | WebSocket downlink-only (гибернация); клиент, пишущий в сокет, получает `1008` |
-| `POST /api/tasks` | задача в очередь + `repository_dispatch`; без `GH_DISPATCH_TOKEN` честно отвечает `not_configured` |
-| `GET /api/tasks`, `GET /api/tasks/:id` | очередь и задача; в задаче — замер `latency_ms` «dispatch → первый heartbeat» |
-| `POST /api/heartbeat` | отметка живости рук; первая отметка задачи фиксирует `latency_ms` |
+| вся таблица | сгенерирована в [`docs/api.md`](../docs/api.md) из `api-spec.json` — руками не править |
 
 ## Локальная разработка
 

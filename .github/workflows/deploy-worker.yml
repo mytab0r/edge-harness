@@ -52,3 +52,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
+      - name: Канарейка UI на проде
+        run: |
+          npx playwright install --with-deps chromium
+          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+        working-directory: cf-worker
+        env:
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}

@@ -40,6 +40,13 @@
 
 - [0001. Push-модель вместо туннеля](decisions/0001-push-model-not-tunnel.md)
 - [0002. Агент-цикл в раннере, не в Durable Object](decisions/0002-loop-in-runner-not-do.md)
+- [0003. Задержка старта job'а: вердикт по замерам](decisions/0003-dispatch-latency-verdict.md)
+
+## Мультиагентная работа
+
+- [Протокол совместной работы агентов](agents/PROTOCOL.md) — пул задач в Issues,
+  ветки `agent/N-*`, оркестратор слияний, канал белых пятен. Enforced защитой ветки
+  и workflow'ом `orchestra`, не договорённостью.
 
 ## Быстрые ответы на частые вопросы
 

@@ -1,9 +1,9 @@
-/* Клиентская копия маршрутов и порогов. Единственное место правды на сервере —
-   cf-worker/src/config.ts; паритет двух файлов охраняет scripts/check-frontend-contract.mjs. */
+/* Клиентская таблица маршрутов — ключ → полный путь. Источник правды: cf-worker/api-spec.json
+   (паритет охраняет scripts/check-frontend-contract.mjs). В коде страницы пути не
+   склеиваются и литералов "/api…" нет: только route("ключ") из app.js. */
 window.EDGE_CONFIG = {
   locale: "ru",
   routes: {
-    apiPrefix: "/api",
     status: "/api/status",
     events: "/api/events",
     eventsLive: "/api/events.live",

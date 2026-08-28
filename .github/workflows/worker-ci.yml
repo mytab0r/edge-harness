@@ -1,6 +1,8 @@
 # Тесты и typecheck воркера: на настоящем workerd через @cloudflare/vitest-plugin.
 # На PR запускается без фильтра путей: проверка "test" обязательна защитой ветки main,
 # а обязательная проверка, которой нет на PR, навсегда блокирует слияние.
+# Job canary — UI-канарейка реальным браузером против wrangler dev: сломанная страница
+# не доезжает до прода (ADR 0004).
 name: worker-ci
 
 on:
@@ -35,3 +37,35 @@ jobs:
 
       - run: npm test
         working-directory: cf-worker
+
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - run: npm ci
+        working-directory: cf-worker
+
+      - name: Браузер для канарейки
+        run: npx playwright install --with-deps chromium
+        working-directory: cf-worker
+
+      - name: Канарейка UI против wrangler dev
+        working-directory: cf-worker
+        env:
+          HANDS_TOKEN: dev-token
+        run: |
+          cp .dev.vars.example .dev.vars
+          sed -i 's/^HANDS_TOKEN=.*/HANDS_TOKEN=dev-token/' .dev.vars
+          npx wrangler dev --port 8808 > /tmp/wrangler-dev.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8808/assets/app.js > /dev/null && break
+            sleep 1
+          done
+          node scripts/canary-ui.mjs --url http://127.0.0.1:8808 --token dev-token

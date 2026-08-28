@@ -8,10 +8,13 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types",
-    "check": "node scripts/check-frontend-contract.mjs"
+    "check": "node scripts/check-frontend-contract.mjs",
+    "docs": "node scripts/generate-api-docs.mjs",
+    "canary": "node scripts/canary-ui.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.1.1",
+    "playwright": "^1.62.1",
     "typescript": "^5.9.2",
     "vitest": "^4.1.0",
     "wrangler": "^4.127.0"

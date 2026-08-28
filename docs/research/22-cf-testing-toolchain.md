@@ -27,6 +27,16 @@
   `exports.default.fetch(input, init)`.
 - Чтение attachment'а гибернирующего сокета — `deserializeAttachment()`; `serializeAttachment(x)`
   только пишет.
+- **JSON-модуль с CRLF роняет workerd в crash-loop.** `import spec from "../api-spec.json"`,
+  файл с `\r\n` (git на Windows без `.gitattributes`) → «Ready» и падение рантайма на
+  каждый запрос без внятной ошибки в логе. LF — работает. Воспроизведено минимальным
+  пробником; лечится `.gitattributes` (`* text=auto eol=lf`) в корне репозитория —
+  источник закрывается, а не симптом.
+- `Date.now()`/`performance.now()` **замирают во время синхронного кода** — цикл
+  «до такого-то времени» в воркере бесконечен (1102). Циклить только по счётчику,
+  время мерить до/после.
+- API контракта воркера — `cf-worker/api-spec.json`: спека = роутер = доки = проверки
+  ([ADR 0004](../decisions/0004-api-contract.md)).
 
 ## Как проверялось
 
