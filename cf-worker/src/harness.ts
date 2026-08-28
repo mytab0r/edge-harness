@@ -63,6 +63,8 @@ export interface Status {
   last_heartbeat: { ts: number; job_id: string } | null;
   tasks: Record<TaskRow["status"], number>;
   last_event_id: number;
+  /** Watchdog (#7): задачи, висящие в dispatched дольше порога без рук. */
+  stale_dispatch: { count: number; oldest_age_ms: number | null };
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -223,6 +225,13 @@ export class Harness extends DurableObject<Env> {
       counts[String(row.status) as TaskRow["status"]] = Number(row.n);
     }
     const lastEventId = Number(this.#rows(this.#sql.exec("SELECT COALESCE(MAX(id), 0) AS m FROM events"))[0].m);
+    const stale = this.#rows(
+      this.#sql.exec(
+        `SELECT COUNT(*) AS n, MIN(dispatch_ts) AS oldest FROM tasks
+         WHERE status = 'dispatched' AND dispatch_ts IS NOT NULL AND dispatch_ts < ?`,
+        now - LIMITS.staleDispatchMs,
+      ),
+    )[0];
     const hbTs = hb ? Number(hb.ts) : null;
     return {
       now,
@@ -231,6 +240,10 @@ export class Harness extends DurableObject<Env> {
       last_heartbeat: hb ? { ts: hbTs as number, job_id: String(hb.job_id) } : null,
       tasks: counts,
       last_event_id: lastEventId,
+      stale_dispatch: {
+        count: Number(stale.n),
+        oldest_age_ms: stale.oldest === null || stale.oldest === undefined ? null : now - Number(stale.oldest),
+      },
     };
   }
 

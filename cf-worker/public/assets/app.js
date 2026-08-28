@@ -100,6 +100,15 @@ function renderStatus(status) {
   const s = status.tasks;
   $("queue").textContent = t("queue.line", { queued: s.queued, running: s.running, done: s.done, failed: s.failed });
   $("queue").className = "badge" + (s.failed ? " warn" : "");
+  // Watchdog (#7): dispatched дольше порога без признаков рук — громко, но не паника.
+  const stale = status.stale_dispatch;
+  if (stale?.count > 0) {
+    const minutes = Math.round(stale.oldest_age_ms / 60000);
+    $("watchdog").textContent = t("watchdog.stale", { count: stale.count, minutes });
+    $("watchdog").hidden = false;
+  } else {
+    $("watchdog").hidden = true;
+  }
 }
 
 // ── Живой поток ───────────────────────────────────────────────────────────────────

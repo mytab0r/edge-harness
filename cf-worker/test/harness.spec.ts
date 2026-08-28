@@ -1,4 +1,5 @@
-import { exports } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { handsAreAlive } from "../src/harness";
 
@@ -224,6 +225,31 @@ describe("очередь задач", () => {
     const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
     const list = await getJson<{ tasks: { id: string }[] }>("/api/tasks");
     expect(list.tasks.map((task) => task.id)).toContain(created.task_id);
+  });
+});
+
+describe("watchdog зависших задач", () => {
+  it("dispatched-задача старше порога видна в stale_dispatch; свежая — нет", async () => {
+    const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const taskId = created.task_id;
+    // Имитируем dispatch час назад — напрямую в SQL DO (runInDurableObject).
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?",
+        Date.now() - 31 * 60_000, taskId,
+      );
+    });
+    const status = await getJson<{ stale_dispatch: { count: number } }>("/api/status");
+    expect(status.stale_dispatch.count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("свежая queued-задача в stale_dispatch не попадает", async () => {
+    const before = await getJson<{ stale_dispatch: { count: number } }>("/api/status");
+    await postJson("/api/tasks", {});
+    const after = await getJson<{ stale_dispatch: { count: number } }>("/api/status");
+    expect(after.stale_dispatch.count).toBe(before.stale_dispatch.count);
   });
 });
 
