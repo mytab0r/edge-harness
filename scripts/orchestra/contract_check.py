@@ -53,6 +53,12 @@ def main() -> int:
         print(f"contract: SKIP (метка {SKIP_LABEL})")
         return 0
 
+    # Dependabot и другие боты-поставщики зависимостей — вне пула задач по природе:
+    # их судят проверки (test/canary/review), а не контракт «PR ↔ задача».
+    if pull["user"]["login"] in ("dependabot[bot]",):
+        print("contract: SKIP (dependabot)")
+        return 0
+
     problems: list[str] = []
     body = pull["body"] or ""
     refs = [line for line in body.splitlines() if "#" in line]
