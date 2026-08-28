@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+*.log
+
+# Секреты не живут в репозитории — только имена в документации.
+.env
+.env.*
+!.env.example
