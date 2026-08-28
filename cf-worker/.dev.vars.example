@@ -1,0 +1,4 @@
+# Скопируй в .dev.vars (не коммитится) для локального `wrangler dev`.
+HANDS_TOKEN=dev-token
+# Пусто — POST /api/tasks честно ответит «dispatch не настроен»:
+GH_DISPATCH_TOKEN=

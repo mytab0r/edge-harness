@@ -1,0 +1,54 @@
+# Деплой морды в Cloudflare. Требует секретов репозитория CLOUDFLARE_API_TOKEN и
+# CLOUDFLARE_ACCOUNT_ID; без них job падает с явной ошибкой — молча пропущенного
+# деплоя быть не должно.
+name: deploy-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cf-worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - name: Проверка секретов
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::error::Секрет CLOUDFLARE_API_TOKEN не задан. Деплой невозможен: задай его в Settings → Secrets → Actions."
+            exit 1
+          fi
+          if [ -z "$CF_ACCOUNT" ]; then
+            echo "::error::Секрет CLOUDFLARE_ACCOUNT_ID не задан. Деплой невозможен: задай его в Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Типы актуальны?
+        run: |
+          npx wrangler types
+          if ! git diff --exit-code -- worker-configuration.d.ts; then
+            echo "::error::worker-configuration.d.ts устарел: запусти 'npm run types' и закоммить."
+            exit 1
+          fi
+        working-directory: cf-worker
+
+      - name: Деплой
+        run: npx wrangler deploy
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -1,0 +1,72 @@
+# Руки харнеса: поднимаются по repository_dispatch из Durable Object, живут минуты
+# и умирают. Работа — над ЭТИМ репозиторием (см. docs/research/21-github-actions.md
+# про границы ToS). Файл обязан лежать на default branch, иначе dispatch молча
+# возвращает 204 и ничего не запускает — самая частая потеря времени при отладке.
+name: hands
+
+on:
+  repository_dispatch:
+    types: [harness-task]
+
+permissions:
+  contents: read
+
+# Одна задача — один запуск; перезапуск той же задачи не плодит параллельные job'ы.
+concurrency:
+  group: hands-${{ github.event.client_payload.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # HARNESS_URL задаётся в Variables репозитория (публичный URL воркера, не секрет).
+      HARNESS_URL: ${{ vars.HARNESS_URL }}
+      # Секрет из Actions secrets; клиент никогда не печатает его в логи.
+      HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+      TASK_ID: ${{ github.event.client_payload.task_id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Проверка конфигурации
+        run: |
+          if [ -z "$HARNESS_URL" ]; then
+            echo "::error::vars.HARNESS_URL не задан — hands не знает, куда слать события."
+            exit 1
+          fi
+          if [ -z "$HANDS_TOKEN" ]; then
+            echo "::error::secret HANDS_TOKEN не задан — Durable Object отклонит события."
+            exit 1
+          fi
+
+      # Первый heartbeat посылается в этой команде немедленно: это якорь замера
+      # задержки «repository_dispatch → первый heartbeat» (tasks.md, задача 5).
+      - name: Старт: heartbeat + job_start
+        run: python scripts/hands_client.py start
+
+      - name: Тривиальная работа: git log
+        run: python scripts/hands_client.py step git_log -- git log -1 --stat
+
+      - name: Тривиальная работа: pytest --collect-only
+        run: |
+          pip install -q pytest
+          set +e
+          python scripts/hands_client.py step pytest_collect -- pytest --collect-only -q
+          code=$?
+          set -e
+          # Код 5 у pytest — «тестов не собрано»: для скелета это результат, а не поломка.
+          if [ "$code" -eq 5 ]; then
+            echo "pytest: тестов не найдено (код 5) — для скелета это норма"
+            exit 0
+          fi
+          exit "$code"
+
+      # job_end уводит статус «руки живы» на странице сразу, без порога свежести.
+      - name: Финал
+        if: always()
+        run: python scripts/hands_client.py finish "$( [ "${{ job.status }}" = "success" ] && echo ok || echo fail )"
