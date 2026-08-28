@@ -54,6 +54,8 @@ jobs:
           fi
 
       - name: Добавить плагины в DSH standalone
+        # Падает громко, пока не закрыто белое пятно #43: npm install в pnpm-дерево
+        # standalone рвёт pnpm-патчи, а в бандл плагин без правки композиции не попадает.
         run: |
           STANDALONE=/tmp/dsh-edge-src/apps/dsh-edge/standalone
           if [ ! -d "$STANDALONE" ]; then
