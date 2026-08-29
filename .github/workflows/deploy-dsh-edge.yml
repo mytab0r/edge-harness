@@ -35,28 +35,39 @@ jobs:
           cd /tmp/dsh-edge-src
           pnpm install --frozen-lockfile
 
+      # В релизе plugins-v1 нет отдельного ассета dsh-combo-router-*.tgz —
+      # оба плагина лежат внутри комплекта dsh-combo-suite-*.tgz вложенными tarball'ами.
       - name: Скачать плагины владельца
         env:
-          COMBO_TGZ: ${{ vars.COMBO_ROUTER_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-combo-router-0.1.0.tgz' }}
-          OAUTH_TGZ: ${{ vars.OAUTH_POOL_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-anthropic-oauth-pool-0.1.0.tgz' }}
+          SUITE_TGZ: ${{ vars.PLUGINS_SUITE_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-combo-suite-0.1.0.tgz' }}
         run: |
-          mkdir -p /tmp/plugins
-          curl -sL "$COMBO_TGZ" -o /tmp/plugins/combo-router.tgz
-          curl -sL "$OAUTH_TGZ" -o /tmp/plugins/oauth-pool.tgz
-          echo "Плагины скачаны"
+          mkdir -p /tmp/suite /tmp/plugins
+          # -f обязателен: без него 404-HTML сохраняется в .tgz и npm падает TAR_BAD_ARCHIVE
+          curl -fsSL "$SUITE_TGZ" -o /tmp/suite/suite.tgz
+          tar xzf /tmp/suite/suite.tgz -C /tmp/plugins
+          find /tmp/plugins -name '*.tgz' | sort > /tmp/plugins.list
+          cat /tmp/plugins.list
+          COUNT=$(wc -l < /tmp/plugins.list)
+          if [ "$COUNT" -lt 2 ]; then
+            echo "В комплекте найдено $COUNT tarball'ов, ожидалось минимум 2 — релиз сменил состав"
+            exit 1
+          fi
 
       - name: Добавить плагины в DSH standalone
+        # Падает громко, пока не закрыто белое пятно #43: npm install в pnpm-дерево
+        # standalone рвёт pnpm-патчи, а в бандл плагин без правки композиции не попадает.
         run: |
           STANDALONE=/tmp/dsh-edge-src/apps/dsh-edge/standalone
-          if [ -d "$STANDALONE" ]; then
-            cd "$STANDALONE"
-            # Устанавливаем плагины как зависимости
-            npm install /tmp/plugins/combo-router.tgz --save
-            npm install /tmp/plugins/oauth-pool.tgz --save
-            echo "Плагины добавлены в standalone"
-          else
-            echo "standalone не найден, пропускаю установку плагинов"
+          if [ ! -d "$STANDALONE" ]; then
+            echo "standalone не найден: деплой вышел бы без плагинов владельца"
+            exit 1
           fi
+          cd "$STANDALONE"
+          # Устанавливаем плагины как зависимости
+          while IFS= read -r tgz; do
+            npm install "$tgz" --save
+          done < /tmp/plugins.list
+          echo "Плагины добавлены в standalone"
 
       - name: Собрать dsh-edge
         run: |
