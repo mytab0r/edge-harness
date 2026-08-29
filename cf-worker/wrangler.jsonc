@@ -33,7 +33,8 @@
     // Чей репозиторий дёргать repository_dispatch'ем. Не секрет: репозиторий публичный.
     "GH_REPO": "mytab0r/edge-harness"
   }
-  // Секреты (задаются один раз через `wrangler secret put`, в конфиге не живут):
+  // Секреты (в конфиге не живут; переустанавливаются при каждом деплое
+  // workflow'ом deploy-worker из секретов репозитория):
   //   HANDS_TOKEN        — разделяемый секрет: браузер и job → POST/GET /api/*
   //   GH_DISPATCH_TOKEN  — GitHub PAT с Contents:write, DO дёргает repository_dispatch
 }
