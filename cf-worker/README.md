@@ -42,14 +42,11 @@ Smoke — то, что vitest-петля проверить не может: д�
 Автоматический — `.github/workflows/deploy-worker.yml` при изменениях в `cf-worker/**`
 на main. Требует секретов репозитория `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`.
 
-Разовые настройки после первого деплоя (секреты воркера переживают деплои):
+Секреты воркера (`HANDS_TOKEN`, `GH_DISPATCH_TOKEN`) деплой-воркфлоу переустанавливает
+сам при каждом деплое из одноимённых секретов репозитория — вручную после деплоя их
+ставить не нужно (воркер мог быть удалён из CF вместе с секретами, шаг идемпотентен).
 
-```bash
-npx wrangler secret put HANDS_TOKEN         # тот же токен, что в GitHub secret HANDS_TOKEN
-npx wrangler secret put GH_DISPATCH_TOKEN   # GitHub PAT с Contents:write на этот репозиторий
-```
-
-И переменную репозитория `vars.HARNESS_URL` = публичный URL воркера (для `hands.yml`).
+Плюс переменная репозитория `vars.HARNESS_URL` = публичный URL воркера (для `hands.yml`).
 
 Без `HANDS_TOKEN` API отвечает 401 на всё. Без `GH_DISPATCH_TOKEN` постановка задач
 честно отвечает `dispatch: "not_configured"` — «возможности нет» должно отличаться
