@@ -1,0 +1,44 @@
+# Обязательная проверка test из защиты main. Предыдущий поставщик — job `test`
+# в worker-ci.yml — удалён cleanup-коммитом 09ef969 вместе с каркасом, после чего
+# каждый PR блокировался вечным ожиданием несуществующей проверки (задача #44).
+# Job id обязан быть ровно `test` и без `name:` — иначе контекст проверки не
+# совпадёт с требованием защиты ветки.
+
+name: repo-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python-скрипты компилируются
+        run: python -m compileall -q scripts
+
+      - name: Все workflows — валидный YAML
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          bad = []
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              try:
+                  yaml.safe_load(open(path, encoding='utf-8'))
+              except Exception as error:
+                  bad.append(f'{path}: {error}')
+          if bad:
+              sys.exit('\n'.join(bad))
+          print(f'workflows ok: {len(glob.glob(".github/workflows/*.yml"))} files')
+          PY
