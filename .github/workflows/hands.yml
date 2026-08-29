@@ -1,0 +1,45 @@
+# Руки слайса 1 (dsh-in-job): поднимаются по repository_dispatch из морды,
+# исполняют задачу полноценным DSH headless и стримят журнал в Durable Object.
+# Дизайн — openspec/changes/dsh-in-job/, контракт — openspec/specs/journal-tasks-hands.md.
+# Ручной прогон (workflow_dispatch) идёт под task_id manual-<run_id> и НЕ ходит в
+# POST /api/tasks: задача из воркфлоу дёрнула бы новый dispatch — бесконечный цикл.
+name: hands
+
+on:
+  repository_dispatch:
+    types: [harness-task]
+  workflow_dispatch:
+    inputs:
+      task_text:
+        description: "Текст задачи для DSH headless"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hands-${{ github.event.client_payload.task_id || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  dsh-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Прогон задачи через DSH headless
+        env:
+          HANDS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          TASK_ID: ${{ github.event.client_payload.task_id || format('manual-{0}', github.run_id) }}
+          TASK_TEXT: ${{ inputs.task_text }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://integrate.api.nvidia.com/v1' }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'nvidia/nemotron-3-super-120b-a12b' }}
+        run: bash scripts/hands/dsh_task.sh
