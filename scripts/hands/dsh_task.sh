@@ -268,6 +268,9 @@ if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
   echo "::error::DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель" >&2
   exit 1
 fi
+# Профиль headless — pnpm-workspace: `pnpm add` внутри требует явного
+# подтверждения root (иначе ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30).
+export npm_config_ignore_workspace_root_check=true
 export DEEPSEEK_API_KEY
 export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
