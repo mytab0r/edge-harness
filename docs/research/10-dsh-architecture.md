@@ -507,21 +507,86 @@ export function apply(ctx: Context) {
 - Вход владельца: `POST /api/auth/login` — строго form-encoded
   (`accessKey=...`, same-origin), иначе «Login requires a form-encoded request».
 
-### Каталог моделей в морде dsh-edge — подтверждено на проде 2026-08-30
+### Шов подписки на события сессии — tarball-исследование 0.1.1-rc.2, 2026-08-30
 
-- Селектор моделей UI строится из серверного каталога: `llm` → `listProviders()`
-  → `listModels(provider.id)` → группы, отдаётся клиенту методами
-  `llm.providers` / `llm.models` / `session.models` (RPC-конверт
-  `{type:"client-request", rpcId, method, payload}`, авторизация кукой владельца).
-- Каталог по умолчанию — три зашитых DeepSeek-модели. Адаптер поддерживает
-  кастомный `models` в конфиге, но dsh-edge его не прокидывает
-  (`EdgeDeploymentConfigSource` несёт только один `DEEPSEEK_MODEL`).
-- Решение edge-harness: каталог и имя группы (`providerInfo`, `displayName`)
-  патчатся в `worker.js` на деплое из `vars.DSH_EDGE_MODEL_CATALOG` /
-  `vars.DSH_EDGE_PROVIDER_NAME`; патч скобочно-сбалансированный, после него
-  обязателен `node --check`, смена формы upstream = громкое падение деплоя.
-- Секреты воркера `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` синхронизируются деплоем
-  из `vars` — морда и руки (hands-job) читают провайдера из одного места правды
-  (GLM coding-эндпоинт + glm-5; NIM — запасной `NVIDIA_API_KEY`).
-- Вход владельца: `POST /api/auth/login` — строго form-encoded
-  (`accessKey=...`, same-origin), иначе «Login requires a form-encoded request».
+Tarball'ы `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-headless`,
+`@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session-persistence`,
+`@deepseek-ai/dsh-session-persistence-jsonl`, `@deepseek-ai/dsh` (все
+0.1.1-rc.2) скачаны `npm pack` и прочитаны (`lib/*.js`, `lib/types/*.d.ts`).
+
+**Словарь durable-событий сессии** — `SessionEventMap` в
+`dsh-session/lib/types/types.d.ts` (merge-extensible; `dsh-agent` добавляет
+`agent/inbox/spliced` декларацией в своём `lib/types/types.d.ts`):
+`turn/start {turn}`, `turn/end {turn, reason}`, `step/start {turn, step}`,
+`step/end {turn, step}`, `user/message`, `assistant/chunk {turn, step, chunk}`,
+`assistant/message {turn, step, message, usage?, interrupted?}`,
+`tool/call {turn, step, callId, name, arguments}` (arguments — сырая JSON-строка
+как её выдала модель), `tool/result {turn, step, message, error?, meta?}`,
+`todo/write`, `request/header`, `request/context`, `session/end-seed`.
+Конверт события: `{type, seq, time, data, ignorable?}`; `seq` непрерывен с 0
+(`seq = log.length` в `Session.append`, `dsh-session/lib/index.js:1457-1459`),
+`time` — epoch ms. Полный реестр типов сборки — `KNOWN_SESSION_EVENT_TYPES`
+(`dsh-session/lib/index.js:1054`, сгенерирован; включает также `llm/retry`,
+`approval/*`, `compaction/*`, `session/title`, `subagent/descriptor`).
+
+**Канонический паттерн подписки** — сам upstream-плагин персистенции,
+`PersistenceCoordinator.installWritePath()`
+(`dsh-session-persistence/lib/index.js:1132-1163`):
+
+```js
+ctx.on("session/created", (session) => { ... });
+ctx.on("session/event",  (session, event) => { this.initFor(session).writes.enqueue(event); });
+ctx.on("session/flush",  (session) => this.flush(session));
+ctx.on("session/disposed", (session) => { ... });
+```
+
+Свойства шва, подтверждённые кодом:
+
+- `session/event` — observe-only firehose (emit): «the hot path never blocks
+  on I/O — persistence plugins buffer asynchronously»; сбои листенера
+  изолированы per-listener и гасятся в `ctx.logger.warn`, на append не влияют
+  (`dsh-session/lib/index.js:1411-1415, 1287-1296`).
+- Конструкторные сиды (resume/fork/replay) на firehose **не выходят**:
+  «constructor seeds do not emit»; потребитель живых событий начинает с
+  `firstLiveSeq` (`dsh-session/lib/index.js:1329-1350`). Для fresh-сессии
+  dsh-headless вся сессия живая — ограничение не стреляет.
+- `SessionStore.flush(session)` — единственная точка барьера долговечности
+  (`dsh-session/lib/index.js:1791-1808`): ждёт всех `session/flush`-листенеров,
+  возвращает факт участия, бросает первую ошибку после завершения остальных.
+  `dsh-headless` зовёт `sessions.flush()` перед выходом
+  (`dsh-headless/lib/index.js:94`) — leafener стримера попадает в этот барьер,
+  поэтому бросать из него сетевые ошибки нельзя (уронит завершённый прогон).
+- Leafener `session/flush` может возвращать промис и ждать I/O — так работает
+  персистенция (`dsh-session-persistence/lib/index.js:1158`).
+
+**Контракт dsh-headless по коду** (`dsh-headless/lib/index.js:63-99`):
+`agents.create({sessionId: SessionId(\`session-${randomUUID()}\`), meta:
+{cwd}, agentOptions: {provider, model}, setup})` → `agent.whenIdle()` →
+`firstSeq = agent.session.seq` → `agent.followup(createUserMessage(...))` →
+`await agent.whenIdle()` → `await sessions.flush(agent.session)` →
+`summarize(agent.session.events, firstSeq)` → stdout последнего непустого
+текста ассистента → `io.exit(reason.kind === "completed" ? 0 : 1)`.
+Плагин-раннер монтируется строкой `headless-runner` бандл-патча
+(`dsh-headless/cordis.patch.yml`, синтаксис `- insert:`).
+
+**Живые agent-события** (не durable; `dsh-agent/lib/types/runtime-types.d.ts`,
+Cordis `Events`): `agent/created`, `agent/disposed`, `agent/status
+(idle|running)`, `agent/inbox/inserted|claimed|discarded`,
+`agent/session-start {source: startup|resume|clear|compact}` — emit;
+`agent/pre-step`, `agent/request`, `agent/request-error` — waterfall;
+`agent/turn-stopping` — serial; `agent/error` — emit.
+
+**Монтаж плагина в профиль headless** (CLI `@deepseek-ai/dsh` 0.1.1-rc.2,
+`lib/bin.js`, `lib/plugin-9h8shc4d.js`):
+
+- `dsh plugin --profile <name> add <spec>` — форвардер в `pnpm add` внутри
+  каталога профиля; spec может быть path/tarball/git; после установки
+  зависимости, чей манифест объявляет `dsh.bundle`, добавляются в слой стека
+  `dsh.profile.bundles` (reconcile по факту установки, не по диффу зависимостей).
+- Объявление бандла в манифесте плагина:
+  `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`.
+- `dsh --profile headless --patch <path>` (repeatable) — оверлей поверх слоя
+  профиля; `dsh --profile headless --dump-config` печатает собранное дерево —
+  факт монтажа проверяется командой, не догадкой.
+- Живой прогон установки плагина в профиль не делался — см. «не подтверждено»
+  в [design слайса 2](../../openspec/changes/dsh-streaming/design.md).
