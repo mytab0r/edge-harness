@@ -62,12 +62,10 @@ if [ "$seeded" != "1" ]; then
 fi
 seq=$((max_seq + 1))
 
-detail_arg="null"
-if [ -n "${DETAIL:-}" ]; then
-  detail_arg=$(jq -rn --arg d "$DETAIL" '$d')
-fi
-data=$(jq -n --arg p "$PLUGIN_ID" --arg s "$STATE" --argjson d "$detail_arg" \
-  '{plugin: $p, state: $s} + (if $d == null then {} else {detail: $d} end)')
+# DETAIL — свободный текст (не JSON): передаём строкой через --arg,
+# пустая строка = поля detail в событии нет.
+data=$(jq -n --arg p "$PLUGIN_ID" --arg s "$STATE" --arg d "${DETAIL:-}" \
+  '{plugin: $p, state: $s} + (if $d == "" then {} else {detail: $d} end)')
 body=$(jq -n --arg t "$TASK_ID" --arg src "$SOURCE" --argjson seq "$seq" --argjson data "$data" --argjson ts "$(date -u +%s000)" \
   '{task_id: $t, source: $src, events: [{seq: $seq, ts: $ts, kind: "plugin_status", data: $data}]}')
 
