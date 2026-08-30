@@ -24,12 +24,12 @@
 ```bash
 cd plugins-src/hello-world
 node --check server/index.js && node --check client/client.js   # синтаксис
-npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.0.tgz
-sha256sum edge-harness-dsh-plugin-hello-0.1.0.tgz
+npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.1.tgz
+sha256sum edge-harness-dsh-plugin-hello-0.1.1.tgz
 ```
 
-Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.0` и
-asset'ом `hello-world-0.1.0.tgz` (то же содержимое, имя asset'а фиксирует
+Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.1` и
+asset'ом `hello-world-0.1.1.tgz` (то же содержимое, имя asset'а фиксирует
 манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
 merge = аппрув владельца.
 
