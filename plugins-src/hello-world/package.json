@@ -1,0 +1,25 @@
+{
+  "name": "@edge-harness/dsh-plugin-hello",
+  "version": "0.1.0",
+  "description": "PoC edge plugin: hello-world proving the manifest -> bundle -> deploy -> web roster channel for dsh-edge",
+  "type": "module",
+  "main": "server/index.js",
+  "exports": {
+    ".": "./server/index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
+  },
+  "files": [
+    "server/index.js",
+    "client/client.js"
+  ],
+  "license": "MIT"
+}
