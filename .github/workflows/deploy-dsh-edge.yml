@@ -145,6 +145,14 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
 
+      # Рантайм-дым до дорогой сборки: каждый серверный плагин инсталлируется
+      # в настоящий cordis с ToolRuntime. Ловит класс #100 (плагин объявил
+      # inject: [] и читает ctx.tools — в проде «failed» в рантайме и тулов
+      # нет, а сборка зелёная) на деплое, а не по жалобе чата.
+      - name: Дым инсталла плагинов (cordis + ToolRuntime)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/smoke-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+
       - name: Сборка морды из исходников
         if: steps.route.outputs.plugins != '0'
         run: pnpm --dir clone/apps/dsh-edge/standalone run build

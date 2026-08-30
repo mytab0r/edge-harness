@@ -5,9 +5,9 @@
       "id": "hello",
       "package": "@edge-harness/dsh-plugin-hello",
       "source": {
-        "release": "plugins-hello-v0.1.0",
-        "asset": "hello-world-0.1.0.tgz",
-        "sha256": "0dae042b58e2702e5b0f31c552f76df26f53f72019703aa98f20f6a5f431d7f3"
+        "release": "plugins-hello-v0.1.1",
+        "asset": "hello-world-0.1.1.tgz",
+        "sha256": "f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"
       },
       "server": true,
       "client": true
@@ -16,9 +16,9 @@
       "id": "runner-bridge",
       "package": "@edge-harness/dsh-plugin-runner-bridge",
       "source": {
-        "release": "plugins-runner-v0.1.0",
-        "asset": "runner-bridge-0.1.0.tgz",
-        "sha256": "84f4a779c73ec25331ba6f2a0eab7c075da89b6afe31ace93de8a11f1eaf1328"
+        "release": "plugins-runner-v0.1.1",
+        "asset": "runner-bridge-0.1.1.tgz",
+        "sha256": "8ed9b451ffa731f1427f3425e818325dc198425d7197d003bc26d4c092b01733"
       },
       "server": true,
       "client": false
