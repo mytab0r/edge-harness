@@ -1,99 +1,64 @@
-# Сборка и деплой DSH Edge из исходников с плагинами владельца.
-# Клонирует pawaca/dsh-edge, добавляет кастомные плагины, собирает и деплоит на CF.
-
+# Авто-актуализация морды dsh-edge: ежедневно деплоит свежий стабильный префаб
+# из npm. Официальный `npx dsh-edge upgrade` интерактивен (переспрашивает режим и
+# секреты) и для CI не годится; префаб-деплой ниже делает то же самое без вопросов:
+# данные Durable Object переживают деплой (класс и миграция v1 не меняются),
+# секреты воркера (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) wrangler не трогает.
+#
+# Префаб, а не сборка из исходников с плагинами: подключение плагинов в dsh-edge
+# заблокировано белым пятном #43 и морде не нужно — плагины владельца живут в
+# раннере (эпик #17). Морда — всегда свежий апстрим.
 name: deploy-dsh-edge
 
 on:
+  schedule:
+    # Ежедневно вне топ-часа; расписание действует только на default branch.
+    - cron: "37 4 * * *"
   workflow_dispatch:
     inputs:
       version:
-        description: "Версия dsh-edge (пусто = последняя)"
+        description: "Версия dsh-edge (пусто = последняя стабильная из npm)"
         required: false
         type: string
 
+concurrency:
+  group: deploy-dsh-edge
+  cancel-in-progress: false
+
 jobs:
-  build-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Клонировать dsh-edge
-        run: |
-          VERSION_ARG=""
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION_ARG="v${{ inputs.version }}"
-          fi
-          git clone --depth 1 --branch ${VERSION_ARG:-main} https://github.com/pawaca/dsh-edge.git /tmp/dsh-edge-src
-
-      - name: Установить pnpm
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - run: npm install -g pnpm@latest
-
-      - name: Установить зависимости dsh-edge
-        run: |
-          cd /tmp/dsh-edge-src
-          pnpm install --frozen-lockfile
-
-      # В релизе plugins-v1 нет отдельного ассета dsh-combo-router-*.tgz —
-      # оба плагина лежат внутри комплекта dsh-combo-suite-*.tgz вложенными tarball'ами.
-      - name: Скачать плагины владельца
+      - name: Секреты на месте?
         env:
-          SUITE_TGZ: ${{ vars.PLUGINS_SUITE_URL || 'https://github.com/mytab0r/edge-harness/releases/download/plugins-v1/dsh-combo-suite-0.1.0.tgz' }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          mkdir -p /tmp/suite /tmp/plugins
-          # -f обязателен: без него 404-HTML сохраняется в .tgz и npm падает TAR_BAD_ARCHIVE
-          curl -fsSL "$SUITE_TGZ" -o /tmp/suite/suite.tgz
-          tar xzf /tmp/suite/suite.tgz -C /tmp/plugins
-          find /tmp/plugins -name '*.tgz' | sort > /tmp/plugins.list
-          cat /tmp/plugins.list
-          COUNT=$(wc -l < /tmp/plugins.list)
-          if [ "$COUNT" -lt 2 ]; then
-            echo "В комплекте найдено $COUNT tarball'ов, ожидалось минимум 2 — релиз сменил состав"
-            exit 1
-          fi
+          [ -n "$CF_TOKEN" ] || { echo "::error::CLOUDFLARE_API_TOKEN не задан"; exit 1; }
+          [ -n "$CF_ACCOUNT" ] || { echo "::error::CLOUDFLARE_ACCOUNT_ID не задан"; exit 1; }
 
-      - name: Добавить плагины в DSH standalone
-        # Падает громко, пока не закрыто белое пятно #43: npm install в pnpm-дерево
-        # standalone рвёт pnpm-патчи, а в бандл плагин без правки композиции не попадает.
+      - name: Скачать префаб и собрать деплой
+        env:
+          DSH_VERSION: ${{ inputs.version }}
         run: |
-          STANDALONE=/tmp/dsh-edge-src/apps/dsh-edge/standalone
-          if [ ! -d "$STANDALONE" ]; then
-            echo "standalone не найден: деплой вышел бы без плагинов владельца"
-            exit 1
-          fi
-          cd "$STANDALONE"
-          # Устанавливаем плагины как зависимости
-          while IFS= read -r tgz; do
-            npm install "$tgz" --save
-          done < /tmp/plugins.list
-          echo "Плагины добавлены в standalone"
+          SPEC="dsh-edge${DSH_VERSION:+@$DSH_VERSION}"
+          mkdir -p /tmp/dsh-deploy && cd /tmp/dsh-deploy
+          npm pack "$SPEC" 2>&1 | tail -1
+          TARBALL=$(ls dsh-edge-*.tgz | head -1)
+          VERSION_DEPLOYED=${TARBALL#dsh-edge-}
+          VERSION_DEPLOYED=${VERSION_DEPLOYED%.tgz}
+          tar -xzf "$TARBALL"
+          # Маркер версии обязан быть в артефакте: деплоим ровно то, что назвали.
+          grep -q "$VERSION_DEPLOYED" package/worker/direct/index.js \
+            || { echo "::error::В маркере артефакта нет версии $VERSION_DEPLOYED"; exit 1; }
+          mkdir -p deploy
+          cp package/worker/direct/index.js deploy/worker.js
+          cp -r package/dist deploy/dist
+          echo "VERSION_DEPLOYED=$VERSION_DEPLOYED" >> "$GITHUB_ENV"
+          echo "Готов деплой dsh-edge $VERSION_DEPLOYED"
 
-      - name: Собрать dsh-edge
+      - name: Конфиг воркера
         run: |
-          cd /tmp/dsh-edge-src
-          pnpm build 2>&1 | tail -5
-
-      - name: Подготовить деплой
-        run: |
-          DEPLOY=/tmp/dsh-deploy
-          mkdir -p $DEPLOY
-
-          # Воркер и морда из собранного dsh-edge
-          if [ -d /tmp/dsh-edge-src/apps/dsh-edge/standalone/worker ]; then
-            cp -r /tmp/dsh-edge-src/apps/dsh-edge/standalone/worker/* $DEPLOY/
-          elif [ -d /tmp/dsh-edge-src/apps/dsh-edge/worker ]; then
-            cp -r /tmp/dsh-edge-src/apps/dsh-edge/worker/* $DEPLOY/
-          fi
-
-          if [ -d /tmp/dsh-edge-src/apps/dsh-edge/standalone/dist ]; then
-            cp -r /tmp/dsh-edge-src/apps/dsh-edge/standalone/dist $DEPLOY/dist
-          elif [ -d /tmp/dsh-edge-src/apps/dsh-edge/dist ]; then
-            cp -r /tmp/dsh-edge-src/apps/dsh-edge/dist $DEPLOY/dist
-          fi
-
-          # Wrangler конфиг
-          cat > $DEPLOY/wrangler.jsonc <<'WRANGLER'
+          cat > /tmp/dsh-deploy/deploy/wrangler.jsonc <<'WRANGLER'
           {
             "name": "dsh-edge",
             "main": "worker.js",
@@ -118,17 +83,23 @@ jobs:
           }
           WRANGLER
 
-          echo "Деплой готов"
-
-      - name: Деплой на Cloudflare
+      - name: Деплой
+        working-directory: /tmp/dsh-deploy/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy 2>&1 | tail -8
+
+      # Деплой, не оставивший живую морду, — не деплой, а поломка. Проверяем код,
+      # а не шаг: 200 на корень обязателен.
+      - name: Канарейка прода
         run: |
-          cd /tmp/dsh-deploy
-          npx wrangler deploy 2>&1 | tail -10
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          if [ "$code" != "200" ]; then
+            echo "::error::Морда отвечает $code после деплоя $VERSION_DEPLOYED"
+            exit 1
+          fi
+          echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
 
       - name: Итог
-        run: |
-          echo "✅ DSH Edge задеплоен: https://dsh-edge.mytab0r.workers.dev"
-          echo "Версия: ${{ inputs.version || 'latest' }}"
+        run: echo "Прод обновлён до dsh-edge $VERSION_DEPLOYED"
