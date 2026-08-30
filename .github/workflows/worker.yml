@@ -1,0 +1,70 @@
+# Автономный воркер (задача #89): берёт свободную задачу из пула (или конкретную
+# через input), выполняет её полноценным DSH headless по
+# docs/agents/WORKER-PLAYBOOK.md и открывает PR по протоколу. Диспетчится пульсом
+# оркестратора (scripts/orchestra/scheduler.py), когда в пуле есть свободная
+# задача и активного worker-рана нет, либо вручную. Транспорт —
+# scripts/worker/task.sh; работу над задачей делает DSH, не этот workflow.
+name: worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Номер задачи из пула (пусто = воркер выберет свободную сам)"
+        required: false
+        type: string
+
+permissions:
+  # actions:write — playbook-операции агента (rerun orchestra, workflow run);
+  # contents:read — git push ветки идёт под PAT (GH_DISPATCH_TOKEN), не под этим токеном;
+  # issues/pull-requests:write — назначение задачи, комментарии, PR.
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Один воркер на репозиторий: два прогона соперничали бы за одни свободные задачи.
+concurrency:
+  group: worker
+  cancel-in-progress: false
+
+jobs:
+  task:
+    runs-on: ubuntu-latest
+    # 240 = 150 мин таймаут DSH + запас на установку, git и пост-обработку.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Полная история: воркер создаёт ветку от свежего origin/main, может
+          # ребейзить и пушить — на shallow-клоне это ломается.
+          fetch-depth: 0
+          # Учетные данные GITHUB_TOKEN (contents:read) не годятся для push:
+          # git-авторизацию выдаёт `gh auth setup-git` под PAT ниже.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Git-авторизация под PAT владельца
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          gh auth setup-git
+          gh auth status 2>&1 | grep -E 'Logged in|account' || true
+
+      - name: Задача через DSH headless
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          WORKER_LOGIN: mytab0r
+          WORKER_TASK: ${{ inputs.task }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # GLM Coding Plan: только coding-эндпоинт покрыт подпиской владельца,
+          # стандартный paas/v4 отвечает QUOTA на те же модели (проверено живым
+          # прогоном, см. hands.yml).
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.z.ai/api/coding/paas/v4' }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'glm-5' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/worker/task.sh
