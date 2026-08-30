@@ -420,6 +420,32 @@ export function apply(ctx: Context) {
   Boot вне `dsh`-лаунчера падает громко (`ctx.headlessIo` — хук лаунчера).
 - Профили (web/headless/tui) авто-инициализируются из шаблонов лаунчера.
 
+### Запуск headless с внешним OpenAI-compat провайдером — подтверждено живым прогоном 2026-08-30
+
+- Адаптер `dsh-llm-deepseek` читает из env **только** `DEEPSEEK_BASE_URL` и
+  `DEEPSEEK_API_KEY` (плюс `DEEPSEEK_REASONING`); переменная `DEEPSEEK_MODEL`
+  в Node-лаунчере **не читается** — это механика dsh-edge, не dsh.
+- Выбор модели — settings namespace `agent-default-model`
+  (`{provider, model, reasoningEffort}`), дефолт `deepseek-official` +
+  `deepseek-v4-flash`. Переопределяется патчем профиля
+  `~/.dsh/profiles/headless/cordis.patch.yml`:
+
+  ```yaml
+  - id: agent-default-model
+    config:
+      provider: deepseek-official
+      model: <модель провайдера>
+  ```
+
+- `maxTokens` адаптера по умолчанию **256 000**; провайдеры с меньшим потолком
+  (GLM: 131 072) отвечают `INVALID_REQUEST` на параметр max_tokens. Лечится тем
+  же патчем: `- id: llm-deepseek / config: { maxTokens: 131072 }`.
+- GLM (Z.AI): у ключа Coding Plan квота есть **только** на
+  `https://api.z.ai/api/coding/paas/v4`; стандартный `api/paas/v4` на те же
+  модели отвечает `QUOTA: Insufficient balance` даже для flash-моделей.
+  Рабочая связка: coding-эндпоинт + `glm-5` + maxTokens 131072 — агент ответил
+  корректно. Список моделей: `GET <base>/models` (glm-4.5…glm-5.3-flash).
+
 ## Что не подтверждено
 
 - **Детали протокола E2B за пределами README.** Формат запросов к песочнице, семантика таймаутов, поведение при обрыве — читались только по README пакетов. Перед реализацией собственного удалённого провайдера по этому образцу надо читать `packages/e2b/*/src`.

@@ -11,8 +11,11 @@ set -euo pipefail
 # скачанным tarball'ом — несовпадение это громкий отказ, а не warning.
 DSH_VERSION="0.1.1-rc.2"
 DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-DSH_HEADLESS_VERSION="0.0.1-rc.1"
-DSH_HEADLESS_INTEGRITY="sha512-+yIpIT2RbigHd/n3XUg+JxJVkv3LFSQtD9K56IX5DbTnsntEwmI9rw/IC2Myf/FkqgUoeyphrU6+tF04Iv188g=="
+# 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
+# который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
+# dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
+DSH_HEADLESS_VERSION="0.1.1-rc.2"
+DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 
@@ -154,10 +157,30 @@ verify_integrity "$HL_TGZ" "$DSH_HEADLESS_INTEGRITY"
 npm install -g ./*.tgz
 command -v dsh >/dev/null
 dsh --version || true
+
+# Выбор модели и лимит ответа — через родной settings-слой профиля:
+# адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
+# модель живёт в settings namespace agent-default-model (проверено живым прогоном:
+# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
+# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
+DSH_MODEL="${DEEPSEEK_MODEL:-glm-5}"
+DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
+DSH_PATCH="$HOME/.dsh/profiles/headless/cordis.patch.yml"
+mkdir -p "$(dirname "$DSH_PATCH")"
+cat >"$DSH_PATCH" <<PATCH
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: $DSH_MODEL
+- id: llm-deepseek
+  config:
+    maxTokens: $DSH_MAX_TOKENS
+PATCH
 add_event "bootstrap" "$(jq -n \
   --arg dsh "$DSH_VERSION" --arg hl "$DSH_HEADLESS_VERSION" \
-  --arg node "$(node --version)" \
-  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified"}')"
+  --arg node "$(node --version)" --arg model "$DSH_MODEL" \
+  --argjson mt "$DSH_MAX_TOKENS" \
+  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified", model: $model, max_tokens: $mt}')"
 flush_events
 
 # ── 4. Прогон: one-shot dsh-headless над этим репозиторием ────────────────────────
@@ -177,8 +200,9 @@ add_event "agent_answer" \
   "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
 
 # Отладочная хвостовая улика профиля: НЕ доказательство сессии (durable-улики —
-# слайс 2, родным плагином DSH). Читается только после смерти писателя.
-SESSION_FILE=$(find "$HOME/.dsh" "$HOME/.config/dsh" -type f -newer "$START_MARK" 2>/dev/null | sort | tail -1 || true)
+# слайс 2, родным плагином DSH). Читается только после смерти писателя; бинарные
+# кодировки (.zstd) в журнал не тащим.
+SESSION_FILE=$(find "$HOME/.dsh" "$HOME/.config/dsh" -type f -newer "$START_MARK" ! -name '*.zstd' 2>/dev/null | sort | tail -1 || true)
 if [ -n "$SESSION_FILE" ]; then
   EXCERPT=$(tail -c 16000 "$SESSION_FILE" | redact)
   add_event "session_note" "$(jq -n --arg f "$SESSION_FILE" --arg x "$EXCERPT" \
