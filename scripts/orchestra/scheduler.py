@@ -194,14 +194,31 @@ def after_merge(repo: str, pull: dict) -> list[str]:
             check=True,
         )
         lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
-    for match in re.finditer(r"(?:[Cc]loses|[Ff]ixes|[Rr]esolves)\s+#(\d+)", pull.get("body") or ""):
-        issue_number = match.group(1)
+    # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
+    # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
+    # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами
+    # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
+    task_refs = sorted({m.group(1) for m in re.finditer(r"#(\d+)", pull.get("body") or "")}, key=int)
+    for task_number in task_refs:
         try:
-            gh("-X", "PATCH", f"repos/{repo}/issues/{issue_number}", "-f", "state=closed")
-            lines.append(f"📌 задача #{issue_number} закрыта")
+            issue = gh(f"repos/{repo}/issues/{task_number}")
+            if "pull_request" in issue or issue["state"] != "open":
+                continue
+            if "task" not in {label["name"] for label in issue["labels"]}:
+                continue
+            gh(
+                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
+                "-f",
+                "body=" + (
+                    f"🔁 PR #{number} слит в main. Мерж — ещё не готовность: проведи "
+                    "пост-мерж проверку (деплой/канарейка/E2E), приложи улики "
+                    "и закрой задачу."
+                ),
+            )
+            lines.append(f"🔁 #{task_number}: напоминание — закрыть после пост-мерж проверки")
         except RuntimeError as error:
-            # одна кривая ссылка не должна ронять остальные действия after_merge
-            lines.append(f"⚠️ не закрыл #{issue_number}: {error}")
+            # один кривой реф не должен ронять остальные действия after_merge
+            lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
     return lines
 
 
