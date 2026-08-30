@@ -62,9 +62,59 @@ async function apiJson(path, options) {
 
 // ── Журнал ────────────────────────────────────────────────────────────────────────
 
+// Проекция session_event (слайс 2, design dsh-streaming): строка читаемого вида
+// `turn 3 / step 2 · tool:bash · ok` с усечённым текстом; дерево сессий — вне
+// слайса. Рендер строится из данных события, новых маршрутов нет (ADR 0004).
+const SESSION_TEXT_LIMIT = 160;
+
+function blockText(blocks) {
+  return (Array.isArray(blocks) ? blocks : [])
+    .filter((b) => b && (b.type === "text" || b.type === "reasoning") && typeof b.text === "string")
+    .map((b) => b.text)
+    .join(" ");
+}
+
+function clip(text, limit = SESSION_TEXT_LIMIT) {
+  const oneLine = String(text).replace(/\s+/g, " ").trim();
+  return oneLine.length > limit ? `${oneLine.slice(0, limit)}…` : oneLine;
+}
+
+function sessionEventSummary(data) {
+  if (!data || typeof data !== "object") return "";
+  const p = data.payload;
+  const place = data.turn !== undefined ? `turn ${data.turn}` : "";
+  const placeStep = data.step !== undefined ? `${place} / step ${data.step}` : place;
+  switch (data.type) {
+    case "turn/start":
+      return `${place} — старт`;
+    case "turn/end": {
+      const kind = p?.reason?.kind ?? "?";
+      const detail = p?.reason?.error?.message ? ` · ${clip(p.reason.error.message, 120)}` : "";
+      return `${place} — конец: ${kind}${detail}`;
+    }
+    case "step/start":
+      return `${placeStep} — старт`;
+    case "step/end":
+      return `${placeStep} — конец`;
+    case "user/message":
+      return `вход · ${clip(blockText(p?.content))}`;
+    case "assistant/message":
+      return `ответ · ${clip(blockText(p?.message?.content))}${p?.interrupted ? " (прервано)" : ""}`;
+    case "tool/call":
+      return `${placeStep} · tool:${p?.name ?? "?"} · ${clip(p?.arguments ?? "", 80)}`;
+    case "tool/result":
+      return `${placeStep} · tool-result · ${p?.error ? "error" : "ok"} · ${clip(blockText(p?.message?.content?.[0]?.content))}`;
+    default:
+      // Незнакомый тип не прячем: усечённый JSON остаётся читаемым.
+      return `${data.type ?? "?"} · ${clip(JSON.stringify(p ?? data))}`;
+  }
+}
+
 function renderEvent(event) {
   const li = document.createElement("li");
-  const data = event.data === null || event.data === undefined ? "" : JSON.stringify(event.data);
+  const data = event.data === null || event.data === undefined ? ""
+    : event.kind === "session_event" ? sessionEventSummary(event.data)
+    : JSON.stringify(event.data);
   li.innerHTML =
     `<span class="ts"></span><span class="kind"></span><span class="data"></span>`;
   li.querySelector(".ts").textContent = new Date(event.ts).toLocaleTimeString(CONFIG.locale);

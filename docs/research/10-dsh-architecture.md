@@ -589,5 +589,18 @@ Cordis `Events`): `agent/created`, `agent/disposed`, `agent/status
 - `dsh --profile headless --patch <path>` (repeatable) — оверлей поверх слоя
   профиля; `dsh --profile headless --dump-config` печатает собранное дерево —
   факт монтажа проверяется командой, не догадкой.
-- Живой прогон установки плагина в профиль не делался — см. «не подтверждено»
-  в [design слайса 2](../../openspec/changes/dsh-streaming/design.md).
+
+**Живой монтаж плагина — подтверждено прогоном 2026-08-30** (dsh 0.1.1-rc.2,
+Node 24, pnpm 10.34.5): tarball плагина без зависимостей (`dsh.bundle.patch`
+в манифесте, ESM `lib/index.js` с экспортами `name`/`apply`) поставлен
+`dsh plugin --profile headless add <tgz>` — pnpm-форвардер создал профиль
+(`initProfile` пишет `package.json`/`cordis.patch.yml`/`pnpm-workspace.yaml`
+только при отсутствии, ничего не перезаписывает), reconcile добавил бандл в
+`dsh.profile.bundles`; `--dump-config` показывает слой `# == dsh-hands-streamer`.
+Живой прогон headless с плагином: root-level подписки на `session/created` /
+`session/event` / `session/flush` / `session/disposed` получают события сессии,
+созданной `headless-runner` (другой слой дерева) — scope-фильтрация не мешает;
+конверт `{type, seq, time, data}` доходит дословно, `session/event` — firehose
+с дырками seq по отброшенным типам. Установка через реестр (`npm install
+@deepseek-ai/dsh-session@версия`) при этом работает — 404 из замера выше
+касается только пакета `dsh`/`dsh-headless`; peers резолвятся из реестра.
