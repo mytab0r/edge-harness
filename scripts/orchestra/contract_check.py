@@ -77,12 +77,26 @@ def main() -> int:
     problems: list[str] = []
     body = pull["body"] or ""
     refs = [line for line in body.splitlines() if "#" in line]
+    # Закрытие задачи — действие исполнителя ПОСЛЕ пост-мерж проверки, с уликами:
+    # мерж доказывает PR, а не готовность задачи (кейс #56/#57: Closes закрыл
+    # задачу до зелёной канарейки). GitHub сам авто-закрывает issue по ключевым
+    # словам при слиянии, поэтому единственная преграда — контракт на входе.
+    close_lines = [
+        line for line in refs
+        if line.lstrip().lower().startswith(("closes", "fixes", "resolves"))
+    ]
+    if close_lines:
+        problems.append(
+            "Не пиши Closes/Fixes/Resolves: задачу закрывает исполнитель ПОСЛЕ "
+            "пост-мерж проверки (деплой/канарейка/E2E), приложив улики. "
+            "Ссылайся на задачу просто #N."
+        )
     issue_numbers = []
     for line in refs:
         for token in line.split("#")[1:]:
             head = token.strip().split()[0] if token.strip() else ""
             digits = "".join(ch for ch in head if ch.isdigit())
-            if digits and line.lstrip().lower().startswith(("closes", "fixes", "resolves", "#")):
+            if digits and line.lstrip().startswith("#"):
                 issue_numbers.append(int(digits))
     if not issue_numbers:
         problems.append("В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула.")
