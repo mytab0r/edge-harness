@@ -6,16 +6,12 @@
 # а не прогресса DSH (durable-улика сессии — слайс 2).
 set -euo pipefail
 
-# Пины версий и целостности — единственное место правды по DSH в руках.
-# integrity = dist.integrity из metadata реестра; сверяется с фактически
-# скачанным tarball'ом — несовпадение это громкий отказ, а не warning.
-DSH_VERSION="0.1.1-rc.2"
-DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-# 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
-# который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
-# dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
-DSH_HEADLESS_VERSION="0.1.1-rc.2"
-DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Пины версий/целостности, установка и redact — единственное место правды:
+# scripts/lib/dsh-ci.sh (общее с автономным воркером).
+# shellcheck source=scripts/lib/dsh-ci.sh
+source "$SCRIPT_DIR/../lib/dsh-ci.sh"
+
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 
@@ -36,13 +32,6 @@ api_post() {
   local path=$1 body=$2
   curl -fsS -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
-}
-
-# GH маскирует секреты только в своих логах; наш журнал — DO SQLite, туда уходит
-# то, что мы постим. Затираем узнаваемые префиксы ключей до любой отправки.
-redact() {
-  sed -E -e 's/nvapi-[A-Za-z0-9_-]{4,}/nvapi-[REDACTED]/g' \
-         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g'
 }
 
 SEQ=0
@@ -137,45 +126,11 @@ export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
 
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
-mkdir -p "$PKGS"
-cd "$PKGS"
-npm pack "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
-verify_integrity() { # file expected-integrity
-  local actual
-  actual="sha512-$(openssl dgst -sha512 -binary "$1" | openssl base64 -A)"
-  if [ "$actual" != "$2" ]; then
-    echo "::error::Integrity mismatch: $1 (ожидался $2, получен $actual)" >&2
-    return 1
-  fi
-}
-DSH_TGZ="deepseek-ai-dsh-$DSH_VERSION.tgz"
-HL_TGZ="deepseek-ai-dsh-headless-$DSH_HEADLESS_VERSION.tgz"
-[ -f "$DSH_TGZ" ] || DSH_TGZ=$(ls *dsh-$DSH_VERSION.tgz | head -1)
-[ -f "$HL_TGZ" ] || HL_TGZ=$(ls *dsh-headless-$DSH_HEADLESS_VERSION.tgz | head -1)
-verify_integrity "$DSH_TGZ" "$DSH_INTEGRITY"
-verify_integrity "$HL_TGZ" "$DSH_HEADLESS_INTEGRITY"
-npm install -g ./*.tgz
-command -v dsh >/dev/null
+dsh_install "$PKGS"
 dsh --version || true
 
-# Выбор модели и лимит ответа — через родной settings-слой профиля:
-# адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
-# модель живёт в settings namespace agent-default-model (проверено живым прогоном:
-# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
-# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
-DSH_MODEL="${DEEPSEEK_MODEL:-glm-5}"
-DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
-DSH_PATCH="$HOME/.dsh/profiles/headless/cordis.patch.yml"
-mkdir -p "$(dirname "$DSH_PATCH")"
-cat >"$DSH_PATCH" <<PATCH
-- id: agent-default-model
-  config:
-    provider: deepseek-official
-    model: $DSH_MODEL
-- id: llm-deepseek
-  config:
-    maxTokens: $DSH_MAX_TOKENS
-PATCH
+# Модель для GLM и лимит токенов — патчем профиля из lib (почему не env — там).
+dsh_patch_profile headless
 add_event "bootstrap" "$(jq -n \
   --arg dsh "$DSH_VERSION" --arg hl "$DSH_HEADLESS_VERSION" \
   --arg node "$(node --version)" --arg model "$DSH_MODEL" \

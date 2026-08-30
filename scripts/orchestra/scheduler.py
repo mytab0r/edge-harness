@@ -13,6 +13,10 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
   3. Очередь слияний: PR с зелёными проверками и чистым контрактом сливается.
      За один запуск — ровно один PR: после каждого слияния очередь пересчитывается
      следующим запуском, так конфликтующие слияния никогда не проходят одновременно.
+  4. Пульс конвейера: если в пуле есть свободная задача и активного worker-рана
+     нет — ровно один `workflow_dispatch` воркера (scripts/worker/task.sh,
+     docs/agents/WORKER-PLAYBOOK.md). Best-effort: сбой диспатча не роняет
+     планировщик.
 """
 
 import json
@@ -29,7 +33,7 @@ CONFLICT_LABEL = "conflict"
 MERGE_METHOD = "squash"
 
 
-def gh(*args: str) -> dict | list:
+def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
         capture_output=True, text=True,
@@ -37,7 +41,9 @@ def gh(*args: str) -> dict | list:
     )
     if result.returncode != 0:
         raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
-    return json.loads(result.stdout)
+    # Часть успешных вызовов (например, POST .../dispatches) отвечает 204 без
+    # тела — отсутствие JSON это успех, а не ошибка разбора.
+    return json.loads(result.stdout) if result.stdout.strip() else None
 
 
 def summary(lines: list[str]) -> None:
@@ -222,6 +228,47 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     return lines
 
 
+def worker_runs_active(repo: str) -> bool:
+    """Активный воркер = есть worker-ран в статусе in_progress или queued.
+    Завершённые (в т.ч. упавшие) не считаются: упавший воркер при свободных
+    задачах получит новый запуск — но пока задача назначена, пул свободных пуст
+    и штурма не будет (возврат в пул только через stale-окно reap_stale)."""
+    for status in ("in_progress", "queued"):
+        payload = gh(
+            f"repos/{repo}/actions/workflows/worker.yml/runs?status={status}&per_page=1"
+        ) or {}
+        if payload.get("workflow_runs"):
+            return True
+    return False
+
+
+def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
+    """Пульс конвейера: свободная задача есть, воркер простаивает → ровно один
+    dispatch worker.yml за запуск оркестратора. Best-effort по построению:
+    workflow ещё не на main (до мержа PR #89), права, сеть — любой сбой
+    диспатча не роняет оркестратор, слияния важнее подряда воркеру."""
+    lines = []
+    free = [issue for issue in pool if not issue["assignees"]]
+    if not free:
+        return lines
+    try:
+        if worker_runs_active(repo):
+            lines.append("👷 воркер уже работает — dispatch не нужен")
+            return lines
+        gh(
+            "-X", "POST",
+            f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+            "-f", "ref=main",
+        )
+        lines.append(
+            f"👷 свободная задача #{free[0]['number']} — worker.yml запущен "
+            "(воркер сам назначится и откроет PR)"
+        )
+    except RuntimeError as error:
+        lines.append(f"⚠️ dispatch воркера не удался (не критично): {error}")
+    return lines
+
+
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
@@ -239,9 +286,11 @@ def main() -> int:
     free = sum(1 for issue in pool if not issue["assignees"])
     taken = len(pool) - free
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
+    worker_lines = dispatch_worker(repo, pool)
 
-    if stale_lines or conflict_lines or merge_lines:
-        lines += ["", "### Действия", *stale_lines, *conflict_lines, *merge_lines]
+    if stale_lines or conflict_lines or merge_lines or worker_lines:
+        lines += ["", "### Действия",
+                  *stale_lines, *conflict_lines, *merge_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
 
