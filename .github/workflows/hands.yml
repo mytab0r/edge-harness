@@ -33,6 +33,11 @@ jobs:
         with:
           node-version: 24
 
+      # pnpm нужен dsh plugin add (монтаж стрим-плагина в профиль headless)
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Прогон задачи через DSH headless
         env:
           HANDS_URL: ${{ vars.HARNESS_URL }}
