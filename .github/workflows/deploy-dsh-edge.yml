@@ -56,6 +56,67 @@ jobs:
           echo "VERSION_DEPLOYED=$VERSION_DEPLOYED" >> "$GITHUB_ENV"
           echo "Готов деплой dsh-edge $VERSION_DEPLOYED"
 
+      # Селектор моделей в морде строится из каталога, зашитого в адаптере
+      # (три DeepSeek-модели). Адаптер поддерживает кастомный каталог `models`,
+      # но dsh-edge его не прокидывает — поэтому каталог патчится здесь, на
+      # деплое, из vars (один источник правды с руками). Если upstream сменит
+      # форму каталога — замена не найдётся и деплой упадёт громко, а не
+      # соберёт молчу-неверную морду.
+      - name: Патч каталога моделей под реального провайдера
+        env:
+          DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
+          DSH_EDGE_PROVIDER_NAME: ${{ vars.DSH_EDGE_PROVIDER_NAME }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          catalog = json.loads(os.environ["DSH_EDGE_MODEL_CATALOG"])
+          provider_name = os.environ.get("DSH_EDGE_PROVIDER_NAME", "GLM")
+          if not catalog:
+              sys.exit("::error::DSH_EDGE_MODEL_CATALOG пуст — не из чего собрать каталог")
+          # бандл минифицирован: строковые литералы в нём с двойными кавычками
+          entries = ",".join(
+              '{{id:"{id}",name:"{name}",contextWindow:{cw}}}'.format(
+                  id=m["id"], name=m.get("name", m["id"]),
+                  cw=int(m.get("contextWindow", 131072)))
+              for m in catalog
+          )
+          new_array = "[" + entries + "]"
+          src = open("deploy/worker.js", encoding="utf-8").read()
+          # скобочно-сбалансированный матч: массив может содержать вложенные
+          # скобки (inputModalities:["text","image"]) — наивный [^\]]* рвёт бандл
+          pattern = re.compile(r'\[\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])*\]')
+          patched, n = pattern.subn(lambda _: new_array, src, count=1)
+          if n != 1:
+              sys.exit("::error::Каталог моделей в бандле не найден — upstream сменил форму; патч применять некуда")
+          old = 'displayName:"DeepSeek"'
+          if old in patched:
+              patched = patched.replace(old, f'displayName:"{provider_name}"', 1)
+          open("deploy/worker.js", "w", encoding="utf-8").write(patched)
+          first_id = catalog[0]["id"]
+          if f'id:"{first_id}"' not in patched:
+              sys.exit("::error::После патча в бандле нет первой модели каталога")
+          print(f"Каталог моделей пропатчен: {provider_name} " +
+                ", ".join(m["id"] for m in catalog))
+          PY
+          # пропатченный бандл обязан остаться валидным JS — иначе воркер не поднимется
+          node --check deploy/worker.js
+
+      # Морда и руки читают провайдера из ОДНОГО места правды — vars репозитория
+      # (DEEPSEEK_* — унаследованное имя, значение любой OpenAI-compat endpoint).
+      # Секреты воркера переживают деплой, put идемпотентен.
+      - name: Секреты провайдера морды
+        working-directory: /tmp/dsh-deploy/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: |
+          [ -n "$DEEPSEEK_BASE_URL" ] || { echo "::error::vars.DEEPSEEK_BASE_URL не задан"; exit 1; }
+          [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
+          printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
+          printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
+
       - name: Конфиг воркера
         run: |
           cat > /tmp/dsh-deploy/deploy/wrangler.jsonc <<'WRANGLER'
