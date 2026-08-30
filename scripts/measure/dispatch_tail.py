@@ -15,8 +15,8 @@
   2. Подъём workflow → job `probe` → `record`: замеряет себя сам по серверным
      таймстампам GitHub (run_created_at, run_started_at) и пишет строку.
   3. `dispatch` ждёт строку своего probe_id в CSV до TIMEOUT_S; не дождался —
-     пишет строку timeout (тяжёлый хвост сам по себе результат; семантика как у
-     базового scripts/measure/dispatch_latency.py образца 2026-08-28).
+     пишет строку timeout (тяжёлый хвост сам по себе результат; семантика
+     базового замера 2026-08-28 — его скрипт удалён cleanup'ом 09ef969).
 
 Метрики в строке:
   latency_ms = run_started_at − sent_at        — «диспатч отправлен → job начал
@@ -349,6 +349,10 @@ def append_and_push(workdir: str, row: dict, commit_message: str) -> bool:
     TIMEOUT_S уже зафиксирован, тихое задвоение хуже).
     """
     csv_file = Path(workdir) / CSV_PATH
+    # Граница формата: перенос строки внутри поля ломает read_rows при разборе.
+    # Чистится здесь, у писателя, а не в call site'ах.
+    row = {key: str(value).replace("\r", " ").replace("\n", " ")
+           for key, value in row.items()}
     for _ in range(5):
         rows = read_rows(csv_file.read_text(encoding="utf-8")) if csv_file.exists() else []
         if any(r.get("probe_id") == row["probe_id"] for r in rows):
@@ -357,7 +361,9 @@ def append_and_push(workdir: str, row: dict, commit_message: str) -> bool:
         csv_file.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_file.exists()
         with open(csv_file, "a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+            # lineterminator — общее место правды с rows_to_csv: иначе append-строки
+            # получаются CRLF, а файл с main — LF.
+            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, lineterminator="\n")
             if new_file:
                 writer.writeheader()
             writer.writerow(row)
@@ -391,9 +397,12 @@ def cmd_dispatch(_args: argparse.Namespace) -> int:
 
     cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""))
     print(coverage_markdown(cov))
-    if cov["met"]:
-        print("Покрытие достигнуто — новых замеров не нужно (самозапирание кампании).")
-        return 0
+    if cov["met"] or cov["overdue"]:
+        # Предохранитель обязан работать с обеих сторон: если record-путь мёртв
+        # (PAT истёк, инцидент Actions), тик всё равно финализирует по лимиту дней —
+        # иначе кампания жжёт раны до 60-дневной смерти cron.
+        print("Покрытие достигнуто или истёк лимит дней — финализирую (самозапирание).")
+        return cmd_finalize(argparse.Namespace())
 
     probe_id = str(uuid.uuid4())
     sent_at = int(time.time() * 1000)
@@ -404,7 +413,7 @@ def cmd_dispatch(_args: argparse.Namespace) -> int:
         })
     except RuntimeError as error:
         # Транспорт сломан (права, лимит, сеть) — это не молчание: красный тик + строка.
-        note = str(error).replace("\n", " ")[:200]
+        note = str(error)[:200]
         clone_data_branch(workdir)
         append_and_push(workdir, dispatch_failed_row(probe_id, sent_at, note),
                         f"probe {probe_id}: dispatch_failed")

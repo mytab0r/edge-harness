@@ -54,8 +54,7 @@ RUN = {
 
 
 def test_compute_row_prod_form():
-    sent = dt.epoch_ms(utc(2026, 8, 31, 13, 4, ) + timedelta(seconds=50)) \
-        if False else dt.epoch_ms(utc(2026, 8, 31, 13, 4) + timedelta(seconds=50))
+    sent = dt.epoch_ms(utc(2026, 8, 31, 13, 4) + timedelta(seconds=50))
     row = dt.compute_row("probe-1", sent, RUN)
     # отправили 13:04:50.000, run создан 13:04:52.000, стартовал 13:05:01.123
     assert row["latency_ms"] == "11123"
@@ -235,19 +234,26 @@ def test_status_cli(tmp_path):
 
 
 def git_writer_fixture(tmp_path, name):
-    """Клон data-ветки из локального bare (как clone_data_branch в CI)."""
+    """Клон data-ветки из локального bare (как clone_data_branch в CI).
+
+    Bare сеется один раз на тест: оба писателя гонки обязаны делить один
+    remote — это и есть сценарий append_and_push. --initial-branch обязателен:
+    без него bare начинается с master (или чего потребует локальный
+    init.defaultBranch), и поведение фикстуры зависит от машины."""
     bare = tmp_path / "bare.git"
-    subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True)
-    seed = tmp_path / f"seed-{name}"
-    subprocess.run(["git", "clone", "--quiet", str(bare), str(seed)], check=True)
-    subprocess.run(["git", "-C", str(seed), "checkout", "--quiet", "-B", "main"],
-                   check=True)
-    (seed / "README.md").write_text("x", encoding="utf-8")
-    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(seed), "-c", "user.name=t", "-c", "user.email=t@t",
-                    "commit", "--quiet", "-m", "seed"], check=True)
-    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"],
-                   check=True)
+    if not bare.exists():
+        subprocess.run(["git", "init", "--quiet", "--bare", "--initial-branch=main",
+                        str(bare)], check=True)
+        seed = tmp_path / "seed"
+        subprocess.run(["git", "clone", "--quiet", str(bare), str(seed)], check=True)
+        subprocess.run(["git", "-C", str(seed), "checkout", "--quiet", "-B", "main"],
+                       check=True)
+        (seed / "README.md").write_text("x", encoding="utf-8")
+        subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(seed), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "--quiet", "-m", "seed"], check=True)
+        subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"],
+                       check=True)
     work = tmp_path / name
     subprocess.run(["git", "clone", "--quiet", str(bare), str(work)], check=True)
     subprocess.run(["git", "-C", str(work), "checkout", "--quiet", "-B",
@@ -273,8 +279,45 @@ def test_append_and_push_writes_row_and_survives_race(tmp_path):
 
     subprocess.run(["git", "clone", "--quiet", "--branch", dt.DATA_BRANCH,
                     str(bare), str(tmp_path / "check")], check=True)
-    final = dt.read_rows((tmp_path / "check" / dt.CSV_PATH).read_text(encoding="utf-8"))
+    final_text = (tmp_path / "check" / dt.CSV_PATH).read_text(encoding="utf-8")
+    final = dt.read_rows(final_text)
     assert [r["probe_id"] for r in final] == ["probe-x", "probe-y", "probe-z"]
+    # Один терминатор строк на весь формат: append-путь не имеет права писать CRLF
+    assert "\r" not in final_text
+
+
+def test_append_and_push_sanitizes_newlines_at_writer_boundary(tmp_path):
+    """Перенос строки в поле (note из чужой ошибки API) не должен доезжать до CSV:
+    read_rows разбирает построчно — сломанная строка = потерянные замеры."""
+    _, work = git_writer_fixture(tmp_path, "s")
+    row = dt.dispatch_failed_row("probe-nl", dt.epoch_ms(utc(2026, 8, 31, 15, 0)),
+                                 "HTTP 403:\nлимит\r\nисчерпан")
+    assert dt.append_and_push(str(work), row, "probe probe-nl: dispatch_failed")
+    text = (work / dt.CSV_PATH).read_text(encoding="utf-8")
+    assert len(text.strip().splitlines()) == 2  # заголовок + одна строка замера
+    back = dt.read_rows(text)
+    assert back[0]["probe_id"] == "probe-nl"
+    assert "\n" not in back[0]["note"] and "\r" not in back[0]["note"]
+    assert "лимит" in back[0]["note"] and "исчерпан" in back[0]["note"]
+
+
+def test_every_dispatch_tail_step_has_gh_token():
+    """Класс-гвардия «шаг пушит в git без GH_TOKEN»: credential helper gh берёт
+    токен из env GH_TOKEN (или hosts.yml) — GH_DISPATCH_TOKEN он не читает.
+    Шаг без GH_TOKEN роняет только не-ok пути, и кампания молча деградирует
+    до «только ok», теряя ровно хвост, ради которого существует."""
+    import yaml  # в repo-ci ставится рядом с pytest
+    workflow = (Path(__file__).parents[2]
+                / ".github" / "workflows" / "dispatch-latency-probe.yml")
+    data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    steps = [step for job in data["jobs"].values() for step in job.get("steps", [])
+             if "dispatch_tail.py" in (step.get("run") or "")]
+    assert steps, "шаги кампании исчезли из workflow — гвардия ослепла"
+    for step in steps:
+        env = step.get("env") or {}
+        assert "GH_TOKEN" in env, (f"шаг «{step.get('name')}» зовёт dispatch_tail.py "
+                                   "без GH_TOKEN — его записи (timeout/dispatch_failed) "
+                                   "никогда не попадут в CSV")
 
 
 def test_append_and_push_dedupes_probe_id(tmp_path):

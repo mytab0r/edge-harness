@@ -56,7 +56,8 @@ jobs:
           # *SECRET* (проверено живым прогоном 2026-08-30: без этого gh/git push
           # внутри агента не авторизуются, хотя транспорт task.sh обещает обратное).
           # hosts.yml не env — scrub его не касается, gh и git-хелпер читают оттуда.
-          gh auth login --with-token < <(printf '%s' "$GH_TOKEN")
+          # pipe, а не process substitution: токен не попадает в argv.
+          printf '%s' "$GH_TOKEN" | gh auth login --with-token
           gh auth setup-git
           gh auth status 2>&1 | grep -E 'Logged in|account' || true
 

@@ -52,6 +52,10 @@ jobs:
       - name: Тик кампании
         env:
           GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          # Без GH_TOKEN в env credential helper gh не авторизует push из
+          # dispatch-пути: timeout/dispatch_failed строки не записывались бы
+          # никогда, и кампания молча деградировала бы до «только ok».
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: python scripts/measure/dispatch_tail.py dispatch
 
   probe:
@@ -62,8 +66,10 @@ jobs:
       # Первый шаг намеренно тривиален и без checkout: run_started_at уже зафиксирован
       # GitHub'ом к моменту его начала — содержимое шагов на метрику не влияет.
       - name: Маркер старта
-        run: |
-          echo "probe ${{ github.event.client_payload.probe_id }} dispatched at ${{ github.event.client_payload.sent_at }}"
+        env:
+          PROBE_ID: ${{ github.event.client_payload.probe_id }}
+          SENT_AT_MS: ${{ github.event.client_payload.sent_at }}
+        run: echo "probe $PROBE_ID dispatched at $SENT_AT_MS"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
