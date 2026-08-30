@@ -37,6 +37,7 @@ FORBIDDEN_FILES = (".dev.vars", ".env")
 REVIEW_OK = "review:ok"
 REVIEW_CHANGES = "review:changes-requested"
 REVIEW_LARGE = "review:large"
+LARGE_OK = "review:large-ok"
 
 
 def gh(*args: str) -> dict | list:

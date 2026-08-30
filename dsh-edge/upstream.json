@@ -1,0 +1,5 @@
+{
+  "repo": "pawaca/dsh-edge",
+  "sha": "113a96913c51881993122afbf42e776882c4beb7",
+  "note": "Пин апстрима для source-build морды. Обновление — ручной PR с полным прогоном деплоя (design.md, «Манифест»). sha — main на момент пина, commit 113a969 = release dsh-edge 0.7.1."
+}

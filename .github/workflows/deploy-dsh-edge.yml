@@ -1,12 +1,16 @@
-# Авто-актуализация морды dsh-edge: ежедневно деплоит свежий стабильный префаб
-# из npm. Официальный `npx dsh-edge upgrade` интерактивен (переспрашивает режим и
-# секреты) и для CI не годится; префаб-деплой ниже делает то же самое без вопросов:
-# данные Durable Object переживают деплой (класс и миграция v1 не меняются),
-# секреты воркера (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) wrangler не трогает.
+# Деплой морды dsh-edge. Основной путь — сборка из исходников апстрима с
+# плагинами по манифесту (задача #80, design — openspec/changes/dsh-edge-plugin-system/):
+# клон pawaca/dsh-edge на пине из dsh-edge/upstream.json → патч-серия
+# dsh-edge/patches/ → плагиновые tgz из релизов ЭТОГО репо (sha256 из
+# dsh-edge/plugins.json) → кодогенерация композиции → бандл → гвардия состава →
+# verify → деплой → канарейка. Всё падает громко: не сошёлся sha256, не
+# применился патч, гвардия, node --check.
 #
-# Префаб, а не сборка из исходников с плагинами: подключение плагинов в dsh-edge
-# заблокировано белым пятном #43 и морде не нужно — плагины владельца живут в
-# раннере (эпик #17). Морда — всегда свежий апстрим.
+# Fallback — npm-префаб (как до #80) и используется ТОЛЬКО при пустом
+# манифесте. Официальный `npx dsh-edge upgrade` интерактивен и для CI не
+# годится; префаб-деплой делает то же без вопросов. Данные Durable Object
+# переживают деплой (класс и миграция v1 не меняются), секреты воркера
+# (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) wrangler не трогает.
 name: deploy-dsh-edge
 
 on:
@@ -16,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Версия dsh-edge (пусто = последняя стабильная из npm)"
+        description: "Версия dsh-edge для префаб-fallback (пусто = последняя стабильная из npm)"
         required: false
         type: string
 
@@ -27,7 +31,42 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/setup@v2
+        with:
+          version: 11
+          install: false
+
+      # Маршрут: непустой манифест = source-build с плагинами (основной путь),
+      # пустой = префаб-fallback. Одно место правды — dsh-edge/plugins.json;
+      # валидация формы манифеста и пина — CLI manifest.mjs (первый шаг,
+      # до любых дорогих действий; ошибка формы — красный job здесь, а не
+      # на кодогенерации). Сырые поля манифеста в bash не интерполируются —
+      # только проверенные значения из CLI-вывода.
+      - name: Маршрут по манифесту (валидация CLI)
+        id: route
+        run: |
+          manifest=$(node dsh-edge/manifest.mjs)
+          echo "$manifest"
+          count=$(jq -r '.count' <<<"$manifest")
+          ids=$(jq -r '.ids | join(" ")' <<<"$manifest")
+          sha=$(jq -r '.upstream.sha' <<<"$manifest")
+          repo=$(jq -r '.upstream.repo' <<<"$manifest")
+          echo "plugins=$count" >> "$GITHUB_OUTPUT"
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "Манифест валиден: $count плагин(ов) [$ids]; апстрим $repo@$sha"
+
       - name: Секреты на месте?
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -36,12 +75,112 @@ jobs:
           [ -n "$CF_TOKEN" ] || { echo "::error::CLOUDFLARE_API_TOKEN не задан"; exit 1; }
           [ -n "$CF_ACCOUNT" ] || { echo "::error::CLOUDFLARE_ACCOUNT_ID не задан"; exit 1; }
 
+      # ── Основной путь: сборка из исходников с плагинами ────────────────────────
+
+      - name: Клон апстрима на пине
+        if: steps.route.outputs.plugins != '0'
+        run: |
+          mkdir clone && cd clone
+          git init -q
+          git remote add origin "https://github.com/${{ steps.route.outputs.repo }}.git"
+          git fetch -q --depth 1 origin "${{ steps.route.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "${{ steps.route.outputs.sha }}" ] || { echo "::error::Клон не на пине: $actual != ${{ steps.route.outputs.sha }}"; exit 1; }
+          echo "Клон на пине $actual"
+
+      - name: Патч-серия
+        if: steps.route.outputs.plugins != '0'
+        working-directory: clone
+        run: |
+          shopt -s nullglob
+          patches=(../dsh-edge/patches/*.patch)
+          [ ${#patches[@]} -gt 0 ] || { echo "::error::Патч-серия пуста, а манифест требует source-build"; exit 1; }
+          for p in "${patches[@]}"; do
+            git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p — апстрим уехал от пина"; exit 1; }
+            echo "применён: $p"
+          done
+
+      - name: Скачать плагины и сверить sha256
+        if: steps.route.outputs.plugins != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p plugins-tgz
+          # Имена релизов, assets и ожидаемые sha256 — из валидированного
+          # манифеста (CLI manifest.mjs), не из сырого JSON и не из логов.
+          # Скачиваем ТОЛЬКО названные assets (--pattern), а не весь релиз:
+          # лишний tgz не имеет права проехать в pnpm add. Цикл — из файла,
+          # не из pipeline: exit внутри subshell пайпа не ронял бы шаг.
+          manifest=$(node dsh-edge/manifest.mjs)
+          jq -r '.plugins[] | [.id, .release, .asset, .sha256] | @tsv' <<<"$manifest" > plugins.tsv
+          : > checksums.txt
+          : > plugins-tgz/downloaded.txt
+          while IFS=$'\t' read -r id release asset sha; do
+            echo "плагин $id: релиз $release, asset $asset"
+            gh release download "$release" --repo "$GITHUB_REPOSITORY" \
+              --dir plugins-tgz --pattern "$asset" --clobber \
+              || { echo "::error::Релиз $release недоступен — манифест ссылается на несуществующий источник"; exit 1; }
+            [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
+            echo "$sha  plugins-tgz/$asset" >> checksums.txt
+            echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
+          done < plugins.tsv
+          sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
+
+      - name: Установить плагины в standalone (pnpm, не npm)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: clone/apps/dsh-edge/standalone
+        run: |
+          # Ставим ровно то, что назвал манифест (список собран на скачивании
+          # после сверки sha256), — не глобальный *.tgz.
+          args=()
+          while IFS= read -r f; do args+=("$GITHUB_WORKSPACE/$f"); done < "$GITHUB_WORKSPACE/plugins-tgz/downloaded.txt"
+          [ ${#args[@]} -gt 0 ] || { echo "::error::Ни одного tgz из манифеста не скачано — рассинхрон с манифестом"; exit 1; }
+          pnpm add --save-exact "${args[@]}"
+          # pnpm-патчи Workers обязательны; add обязан сохранить patchedDependencies
+          # (класс silent-wrong #43). Дальнейшую сверку делает verify и гвардия.
+          grep -q "patchedDependencies" pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
+
+      - name: Кодогенерация плагинной композиции
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+
+      - name: Сборка морды из исходников
+        if: steps.route.outputs.plugins != '0'
+        run: pnpm --dir clone/apps/dsh-edge/standalone run build
+
+      - name: Гвардия состава (манифест ↔ артефакт)
+        if: steps.route.outputs.plugins != '0'
+        run: |
+          node dsh-edge/verify-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+          VERSION=$(node -p "require('./clone/apps/dsh-edge/package.json').version")
+          echo "VERSION_DEPLOYED=$VERSION" >> "$GITHUB_ENV"
+          echo "Собрана dsh-edge $VERSION с плагинами: ${{ steps.route.outputs.ids }}"
+
+      - name: Контракт и детерминизм артефактов
+        if: steps.route.outputs.plugins != '0'
+        run: pnpm --dir clone/apps/dsh-edge/standalone run verify
+
+      - name: Деплой-каталог (source-build)
+        if: steps.route.outputs.plugins != '0'
+        run: |
+          mkdir -p deploy
+          cp clone/apps/dsh-edge/standalone/worker/direct/index.js deploy/worker.js
+          cp -r clone/apps/dsh-edge/standalone/dist deploy/dist
+          # Итоговый артефакт обязан быть валидным JS — иначе воркер не поднимется.
+          node --check deploy/worker.js
+          grep -q "$VERSION_DEPLOYED" deploy/worker.js || { echo "::error::В артефакте нет маркера версии $VERSION_DEPLOYED"; exit 1; }
+
+      # ── Fallback: npm-префаб, только при пустом манифесте ──────────────────────
+
       - name: Скачать префаб и собрать деплой
+        if: steps.route.outputs.plugins == '0'
         env:
           DSH_VERSION: ${{ inputs.version }}
         run: |
           SPEC="dsh-edge${DSH_VERSION:+@$DSH_VERSION}"
           mkdir -p /tmp/dsh-deploy && cd /tmp/dsh-deploy
+          set -o pipefail
           npm pack "$SPEC" 2>&1 | tail -1
           TARBALL=$(ls dsh-edge-*.tgz | head -1)
           VERSION_DEPLOYED=${TARBALL#dsh-edge-}
@@ -50,20 +189,25 @@ jobs:
           # Маркер версии обязан быть в артефакте: деплоим ровно то, что назвали.
           grep -q "$VERSION_DEPLOYED" package/worker/direct/index.js \
             || { echo "::error::В маркере артефакта нет версии $VERSION_DEPLOYED"; exit 1; }
-          mkdir -p deploy
-          cp package/worker/direct/index.js deploy/worker.js
-          cp -r package/dist deploy/dist
+          mkdir -p "$GITHUB_WORKSPACE/deploy"
+          cp package/worker/direct/index.js "$GITHUB_WORKSPACE/deploy/worker.js"
+          cp -r package/dist "$GITHUB_WORKSPACE/deploy/dist"
           echo "VERSION_DEPLOYED=$VERSION_DEPLOYED" >> "$GITHUB_ENV"
-          echo "Готов деплой dsh-edge $VERSION_DEPLOYED"
+          echo "Готов деплой префаба dsh-edge $VERSION_DEPLOYED (манифест пуст)"
 
       # Селектор моделей в морде строится из каталога, зашитого в адаптере
       # (три DeepSeek-модели). Адаптер поддерживает кастомный каталог `models`,
       # но dsh-edge его не прокидывает — поэтому каталог патчится здесь, на
-      # деплое, из vars (один источник правды с руками). Если upstream сменит
+      # деплое, из vars (один источник правды с руками). Шаг идёт ПОСЛЕ любого
+      # пути сборки (source-build и префаб собирают deploy/worker.js выше):
+      # без него первый же source-build деплой ТИХО вернул бы селектор к
+      # DeepSeek (W1). Форма литералов одинакова на обоих путях — минифицированный
+      # вывод esbuild (проверено на source-built артефакте). Если upstream сменит
       # форму каталога — замена не найдётся и деплой упадёт громко, а не
-      # соберёт молчу-неверную морду.
-      - name: Патч каталога моделей под реального провайдера
-        working-directory: /tmp/dsh-deploy
+      # соберёт молчу-неверную морду. Постоянное решение — патч 0004 из design
+      # (каталог из build-time константы), отложен за PoC.
+      - name: Патч каталога моделей под реального провайдера (оба пути)
+        working-directory: ${{ github.workspace }}/deploy
         env:
           DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
           DSH_EDGE_PROVIDER_NAME: ${{ vars.DSH_EDGE_PROVIDER_NAME }}
@@ -82,7 +226,7 @@ jobs:
               for m in catalog
           )
           new_array = "[" + entries + "]"
-          src = open("deploy/worker.js", encoding="utf-8").read()
+          src = open("worker.js", encoding="utf-8").read()
           # скобочно-сбалансированный матч: массив может содержать вложенные
           # скобки (inputModalities:["text","image"]) — наивный [^\]]* рвёт бандл
           pattern = re.compile(r'\[\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])*\]')
@@ -97,19 +241,21 @@ jobs:
           patched, n2 = group_pat.subn(lambda m: '{id:' + m.group(1) + f',name:"{provider_name}"}}', patched, count=1)
           if n2 != 1:
               sys.exit("::error::Имя группы провайдера (providerInfo) не найдено — upstream сменил форму")
-          open("deploy/worker.js", "w", encoding="utf-8").write(patched)
+          open("worker.js", "w", encoding="utf-8").write(patched)
           first_id = catalog[0]["id"]
           if f'id:"{first_id}"' not in patched:
               sys.exit("::error::После патча в бандле нет первой модели каталога")
           print(f"Каталог моделей пропатчен: {provider_name} " +
                 ", ".join(m["id"] for m in catalog))
           PY
-          # пропатченный бандл обязан остаться валидным JS — иначе воркер не поднимется
-          node --check deploy/worker.js
+          # пропатченный бандл обязан остаться валидным JS
+          node --check worker.js
+
+      # ── Общая часть: конфиг, секреты провайдера, деплой, канарейка ─────────────
 
       - name: Конфиг воркера
         run: |
-          cat > /tmp/dsh-deploy/deploy/wrangler.jsonc <<'WRANGLER'
+          cat > deploy/wrangler.jsonc <<'WRANGLER'
           {
             "name": "dsh-edge",
             "main": "worker.js",
@@ -138,7 +284,7 @@ jobs:
       # (DEEPSEEK_* — унаследованное имя, значение любой OpenAI-compat endpoint).
       # Секреты воркера переживают деплой, put идемпотентен.
       - name: Секреты провайдера морды
-        working-directory: /tmp/dsh-deploy/deploy
+        working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -150,14 +296,34 @@ jobs:
           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
 
+      - name: plugin_status → deploying
+        if: steps.route.outputs.plugins != '0'
+        # Промежуточный статус — best-effort: лежащий журнал не имеет права
+        # блокировать деплой морды (скрипт для non-final ретраит и не красит
+        # job; continue-on-error страхует от неожиданных ошибок самого шага).
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: deploying
+        run: |
+          for id in ${{ steps.route.outputs.ids }}; do
+            PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
+          done
+
       - name: Деплой
-        working-directory: /tmp/dsh-deploy/deploy
+        working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy 2>&1 | tail -8
+        run: |
+          # pipefail обязателен: pipeline | tail маскирует код wrangler,
+          # и упавший деплой дошёл бы до канарейки старого воркера и
+          # ложного ready в журнале.
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tail -8
 
-      # Деплой, не оставивший живую морду, — не деплой, а поломка. Проверяем код,
       # Деплой, не оставивший живую морду, — не деплой, а поломка. Корень для
       # неавторизованных отвечает 302 на /login (проверено на проде), поэтому
       # идём за редиректом и требуем 200 конечной страницы.
@@ -170,5 +336,40 @@ jobs:
           fi
           echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
 
+      - name: plugin_status → ready
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: ready
+          FINAL: "1"
+          DETAIL: ${{ env.VERSION_DEPLOYED }}
+        run: |
+          for id in ${{ steps.route.outputs.ids }}; do
+            PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
+          done
+
+      # Финальный статус обязан доехать: деплой без ready/failed события в
+      # журнале — silent-wrong. Job уже красный; событие нужно для журнала.
+      - name: plugin_status → failed
+        if: failure() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: failed
+          DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
+        run: |
+          for id in ${{ steps.route.outputs.ids }}; do
+            PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh || true
+          done
+
       - name: Итог
-        run: echo "Прод обновлён до dsh-edge $VERSION_DEPLOYED"
+        run: |
+          echo "Прод обновлён: dsh-edge $VERSION_DEPLOYED"
+          if [ "${{ steps.route.outputs.plugins }}" != "0" ]; then
+            echo "Плагины по манифесту: ${{ steps.route.outputs.ids }} (source-build, пин ${{ steps.route.outputs.sha }})"
+          else
+            echo "Манифест пуст — деплоился npm-префаб"
+          fi

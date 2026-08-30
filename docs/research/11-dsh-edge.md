@@ -49,10 +49,14 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
 
 ## Патчи upstream — готовый список несовместимостей Harness с Workers
 
-Пять пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
+Семь пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
+
+Уточнение при реализации #80 (пин `113a969` = release 0.7.1): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
 
 | Пакет | Что чинит |
 |---|---|
+| `dsh-api-gateway` | отложить конструкцию AbortController из глобального скоупа (Workers запрещают) — новый с момента списка из пяти |
+| `dsh-sandbox` | убрать `node:fs` realpathSync и `node:os` tmpdir (Workers не переживут) — новый с момента списка из пяти |
 | `dsh-llm` | версия пакета читалась через `node:module` path discovery — недоступно в бандле воркера |
 | `dsh-llm-deepseek` | пробросить слот `resolveFiles` в конструктор адаптера (DO-backed file store для Files API) |
 | `dsh-session-persistence` | bounded validated reads + отмена нематериализованной сессии при провале первой записи |
@@ -120,7 +124,7 @@ const backend = this.env.LOADER === undefined
 - **Клиентская часть**: только через декларацию в upstream-патчах (см. выше).
 - Апстрим сам это знает: issue `pawaca/dsh-edge#43` «cordis-plugin-loader» — открытый спайк, то есть динамической загрузки плагинов в Edge пока нет в принципе.
 
-Значит, «npm install плагина в standalone» не подключает плагин ни к воркеру, ни к UI — это лишь кладёт файлы в node_modules. Реальное подключение требует правки исходников Edge (импорт в композиции + строка в deployment-патче), то есть форка или патч-серии поверх апстрима. Вторая ловушка того же места: standalone живёт на `pnpm install --frozen-lockfile` с пятью `pnpm patch`-патчами, обязательными для Workers (`patches/audit.json`); `npm install` поверх этого дерева переопределяет `node_modules` и патчи теряются — сборка может пройти, но с бепатчными пакетами, то есть тихо неверным результатом.
+Значит, «npm install плагина в standalone» не подключает плагин ни к воркеру, ни к UI — это лишь кладёт файлы в node_modules. Реальное подключение требует правки исходников Edge (импорт в композиции + строка в deployment-патче), то есть форка или патч-серии поверх апстрима. Вторая ловушка того же места: standalone живёт на `pnpm install --frozen-lockfile` с семью `pnpm patch`-патчами, обязательными для Workers (`patches/audit.json`); `npm install` поверх этого дерева переопределяет `node_modules` и патчи теряются — сборка может пройти, но с бепатчными пакетами, то есть тихо неверным результатом.
 
 ## Протокол UI↔бэк: гибрид из трёх механизмов
 
@@ -223,7 +227,7 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 ## Что не подтверждено
 
 - **Доступность самих `@deepseek-ai/dsh-*` в публичном npm и их лицензия.** Вывод косвенный — из того, что `npx dsh-edge install` работает у сторонних пользователей. Но именно эта установка ничего не доказывает: она ставит предсобранный воркер и upstream-пакеты не резолвит вовсе (см. раздел про дистрибуцию). Прямой проверки `npm view @deepseek-ai/dsh-agent` не делалось.
-- Точное содержимое пяти `.patch`-файлов не читалось — читался только `audit.json` с причинами и условиями снятия.
+- Точное содержимое `.patch`-файлов (сейчас семь) не читалось — читался только `audit.json` с причинами и условиями снятия.
 - Заявления README о поведении (лимиты, отказ вместо усечения, 30-дневная кука) сверялись с текстом README и с константами в коде, но не прогоном живого деплоя.
 
 ### Расхождения, найденные при перепроверке 2026-08-28
@@ -247,7 +251,7 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 - `apps/dsh-edge/README.md` — 345 строк; матрица совместимости 107-127, лимиты ~305-317, режимы 199-212
 - `apps/dsh-edge/package.json`, `apps/dsh-edge/standalone/package.json`, `packages/client/ui-edge/package.json`, корневой `package.json`
 - `apps/dsh-edge/wrangler.jsonc`
-- `apps/dsh-edge/standalone/patches/audit.json` (+ пять `.patch`-файлов рядом)
+- `apps/dsh-edge/standalone/patches/audit.json` (+ семь `.patch`-файлов рядом)
 - `apps/dsh-edge/src/`: `instance.ts`, `direct-shell.ts`, `do-session-persistence.ts`, `session-store.ts`, `agent.ts`, `sse.ts`, `do-storage-backend.ts`, `edge-credentials.ts`, `do-settings-provider.ts`, `edge-attachment-store.ts`, `index.ts`, `edge-api.ts`
 - `apps/dsh-edge/scripts/wrangler-config-core.mjs`, `apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs`
 - `.github/workflows/edge-ci.yml`
