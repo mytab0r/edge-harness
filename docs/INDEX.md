@@ -41,6 +41,8 @@
 - [0001. Push-модель вместо туннеля](decisions/0001-push-model-not-tunnel.md)
 - [0002. Агент-цикл в раннере, не в Durable Object](decisions/0002-loop-in-runner-not-do.md)
 - [0003. Задержка старта job'а: вердикт по замерам](decisions/0003-dispatch-latency-verdict.md)
+- [0004. API-контракт](decisions/0004-api-contract.md)
+- [0005. Замер хвоста задержки: кампания, а не сеанс](decisions/0005-dispatch-tail-campaign.md)
 
 ## Мультиагентная работа
 
