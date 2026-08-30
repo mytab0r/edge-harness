@@ -27,6 +27,25 @@ jobs:
       - name: Python-скрипты компилируются
         run: python -m compileall -q scripts
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Юнит-контракт спула (tasks.md dsh-streaming §1): фикстура — настоящий
+      # Session.append над @deepseek-ai/dsh-session (tarball ставится с пином
+      # целостности прямо в тесте), обрыв строки читается как torn tail.
+      - name: Юнит-тесты плагина dsh-hands-streamer
+        run: node --test scripts/dsh-hands-streamer/test/streamer.test.mjs
+
+      # Синтаксис клиента рук: bash -n ловит поломку до ревью.
+      - name: Bash-скрипты валидны
+        run: |
+          shopt -s nullglob
+          for f in scripts/hands/*.sh scripts/git/*; do
+            bash -n "$f"
+          done
+          echo "bash ok"
+
       - name: Все workflows — валидный YAML
         run: |
           pip install --quiet pyyaml
