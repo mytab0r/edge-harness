@@ -11,7 +11,7 @@
 <div id="gate" hidden>
   <div class="card">
     <h1 data-i18n="gate.title">edge-harness</h1>
-    <p data-i18n="gate.hint">Доступ закрыт разделяемым секретом.</p>
+    <p data-i18n="gate.hint">Доступ закрыт разделяемым секретом. Введи HANDS_TOKEN — сервер обменяет его на сессионную куку; сам токен не сохраняется.</p>
     <div class="row">
       <input id="gate-token" type="password" autocomplete="off" data-i18n-attr="placeholder:gate.token_placeholder">
       <label class="show"><input type="checkbox" id="gate-show"> <span data-i18n="gate.show">показать</span></label>
@@ -28,7 +28,7 @@
   <span class="badge warn" id="watchdog" hidden></span>
   <span id="conn">…</span>
   <span style="flex:1"></span>
-  <button class="ghost" id="forget" data-i18n="gate.forget" title="Забыть токен в этом браузере">выйти</button>
+  <button class="ghost" id="forget" data-i18n="gate.forget" title="Завершить сессию (сервер сбросит куку)">выйти</button>
 </header>
 
 <main>

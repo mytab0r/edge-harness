@@ -2,7 +2,7 @@
 
 <!-- СГЕНЕРИРОВАНО из cf-worker/api-spec.json командой `npm run docs`. Руками не править. -->
 
-Все маршруты требуют `Authorization: Bearer <HANDS_TOKEN>` (WebSocket — `?token=` в query).
+Все маршруты требуют сессионную куку (браузер, выдаётся `POST /api/session` в обмен на Bearer) или `Authorization: Bearer <HANDS_TOKEN>` (job). Токен в query (`?token=`) отклоняется кодом 400 `query_token_removed`.
 Ошибки — JSON `{"error": {"code", "message"}}`, коды стабильны и проверяются тестами.
 
 ## `GET /api/status`
@@ -30,3 +30,7 @@ POST — задача в очередь + repository_dispatch (без GH_DISPATC
 ## `POST /api/heartbeat`
 
 Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms.
+
+## `POST/DELETE /api/session`
+
+Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed.

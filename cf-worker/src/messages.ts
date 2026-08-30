@@ -5,7 +5,9 @@ import { LOCALE } from "./config";
 
 const MESSAGES = {
   ru: {
-    unauthorized: "Неверный или отсутствующий HANDS_TOKEN",
+    unauthorized: "Нужна авторизация: сессионная кука истекла или отсутствует, либо заголовок Authorization: Bearer <HANDS_TOKEN>",
+    query_token_removed: "Токен в query (?token=) больше не принимается: браузер входит через POST /api/session (обмен на куку), job — через заголовок Authorization: Bearer",
+    session_secret_missing: "SESSION_SECRET не задан: обмен токена на сессионную куку невозможен",
     need_websocket_upgrade: "Этот маршрут — WebSocket: нужен заголовок Upgrade: websocket",
     not_found: "Нет маршрута {method} {path}",
     bad_json: "Некорректный JSON: {detail}",

@@ -34,10 +34,11 @@ jobs:
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           HANDS: ${{ secrets.HANDS_TOKEN }}
           DISPATCH: ${{ secrets.GH_DISPATCH_TOKEN }}
+          SESSION: ${{ secrets.SESSION_SECRET }}
         run: |
           missing=0
           for pair in "CLOUDFLARE_API_TOKEN:$CF_TOKEN" "CLOUDFLARE_ACCOUNT_ID:$CF_ACCOUNT" \
-                      "HANDS_TOKEN:$HANDS" "GH_DISPATCH_TOKEN:$DISPATCH"; do
+                      "HANDS_TOKEN:$HANDS" "GH_DISPATCH_TOKEN:$DISPATCH" "SESSION_SECRET:$SESSION"; do
             name=${pair%%:*}
             if [ -z "${pair#*:}" ]; then
               echo "::error::Секрет ${name} не задан. Деплой невозможен: задай его в Settings → Secrets → Actions."
@@ -79,9 +80,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
           GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
         run: |
           printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
           printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GH_DISPATCH_TOKEN
+          printf '%s' "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
 
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде

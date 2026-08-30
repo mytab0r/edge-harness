@@ -44,6 +44,13 @@
       "methods": ["POST"],
       "auth": true,
       "summary": "Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms."
+    },
+    {
+      "name": "session",
+      "path": "/api/session",
+      "methods": ["POST", "DELETE"],
+      "auth": true,
+      "summary": "Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed."
     }
   ]
 }

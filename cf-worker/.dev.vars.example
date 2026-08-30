@@ -1,4 +1,6 @@
 # Скопируй в .dev.vars (не коммитится) для локального `wrangler dev`.
 HANDS_TOKEN=dev-token
+# Ключ подписи сессионной куки браузера (POST /api/session). Любая строка локально.
+SESSION_SECRET=dev-session-secret
 # Пусто — POST /api/tasks честно ответит «dispatch не настроен»:
 GH_DISPATCH_TOKEN=

@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { GITHUB, HEARTBEAT, LIMITS } from "./config";
+import { GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 
@@ -72,6 +72,15 @@ export function handsAreAlive(now: number, lastHeartbeatTs: number | null): bool
   return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
 }
 
+/** Сравнение подписей без утечки длины совпадения по времени. */
+export function constantTimeEqual(a: string, b: string): boolean {
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
@@ -129,7 +138,13 @@ export class Harness extends DurableObject<Env> {
   }
 
   async #route(request: Request, url: URL): Promise<Response> {
-    if (!this.#authorized(request, url)) {
+    // Токен в query больше не существует как механизм: он попадает в логи CF и
+    // историю браузера. Отклоняем громко и отдельным кодом — не путать с 401
+    // («куки нет») и не принимать молча даже совпадающий по значению токен.
+    if (url.searchParams.has("token")) {
+      throw new ApiError(400, "query_token_removed");
+    }
+    if (!(await this.#authorized(request))) {
       throw new ApiError(401, "unauthorized");
     }
 
@@ -171,18 +186,92 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "heartbeat") {
       return this.#postHeartbeat(request);
     }
+    if (route.name === "session" && request.method === "POST") {
+      return this.#issueSession();
+    }
+    if (route.name === "session" && request.method === "DELETE") {
+      return this.#dropSession();
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
   // ── Аутентификация ────────────────────────────────────────────────────────────────
 
-  #authorized(request: Request, url: URL): boolean {
+  // Два равноправных способа, ни одного токена в URL:
+  //   job (scripts/hands)     — Authorization: Bearer <HANDS_TOKEN>;
+  //   браузер                 — сессионная кука: подпись HMAC(SESSION_SECRET)
+  //                             над сроком жизни; сам HANDS_TOKEN в браузер не
+  //                             возвращается и там не хранится (issue #5).
+  async #authorized(request: Request): Promise<boolean> {
     const expected = this.env.HANDS_TOKEN;
     if (!expected) return false; // секрет не задан: «возможности нет», см. ответ /api/status
     const header = request.headers.get("Authorization");
     if (header === `Bearer ${expected}`) return true;
-    // WebSocket из браузера заголовки поставить не может — разрешаем токен в query.
-    return url.searchParams.get("token") === expected;
+    return this.#sessionValid(request);
+  }
+
+  async #hmac(payload: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(this.env.SESSION_SECRET),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
+    return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  #cookieValue(request: Request): string | null {
+    const header = request.headers.get("Cookie");
+    if (!header) return null;
+    for (const pair of header.split(";")) {
+      const [name, ...rest] = pair.trim().split("=");
+      if (name === SESSION.cookieName && rest.length) return rest.join("=");
+    }
+    return null;
+  }
+
+  async #sessionValid(request: Request): Promise<boolean> {
+    if (!this.env.SESSION_SECRET) return false;
+    const value = this.#cookieValue(request);
+    if (!value) return false;
+    const dot = value.lastIndexOf(".");
+    if (dot <= 0) return false;
+    const payload = value.slice(0, dot);
+    const signature = value.slice(dot + 1);
+    if (!constantTimeEqual(signature, await this.#hmac(payload))) return false;
+    const [, rawExpires] = payload.split(":");
+    const expires = Number(rawExpires);
+    return payload.startsWith("v1:") && Number.isFinite(expires) && Date.now() / 1000 < expires;
+  }
+
+  #setCookieHeader(value: string, maxAgeSeconds: number): string {
+    return `${SESSION.cookieName}=${value}; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age=${maxAgeSeconds}`;
+  }
+
+  async #issueSession(): Promise<Response> {
+    if (!this.env.SESSION_SECRET) {
+      // «Возможности нет» — конфигурация, а не поломка запроса; браузерный вход
+      // при этом невозможен, молча отдавать 200 без куки нельзя.
+      throw new ApiError(500, "session_secret_missing");
+    }
+    const expiresAtSeconds = Math.floor((Date.now() + SESSION.ttlMs) / 1000);
+    const payload = `v1:${expiresAtSeconds}`;
+    const value = `${payload}.${await this.#hmac(payload)}`;
+    return this.#json(
+      { ok: true, expires_at: expiresAtSeconds * 1000 },
+      { headers: { "set-cookie": this.#setCookieHeader(value, Math.floor(SESSION.ttlMs / 1000)) } },
+    );
+  }
+
+  #dropSession(): Response {
+    // Кука HttpOnly — убрать её может только сервер.
+    return this.#json(
+      { ok: true },
+      { headers: { "set-cookie": this.#setCookieHeader("", 0) } },
+    );
   }
 
   #json(body: unknown, init?: ResponseInit): Response {
