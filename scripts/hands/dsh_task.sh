@@ -11,8 +11,11 @@ set -euo pipefail
 # скачанным tarball'ом — несовпадение это громкий отказ, а не warning.
 DSH_VERSION="0.1.1-rc.2"
 DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-DSH_HEADLESS_VERSION="0.0.1-rc.1"
-DSH_HEADLESS_INTEGRITY="sha512-+yIpIT2RbigHd/n3XUg+JxJVkv3LFSQtD9K56IX5DbTnsntEwmI9rw/IC2Myf/FkqgUoeyphrU6+tF04Iv188g=="
+# 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
+# который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
+# dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
+DSH_HEADLESS_VERSION="0.1.1-rc.2"
+DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 
