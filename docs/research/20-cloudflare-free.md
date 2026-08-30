@@ -253,6 +253,22 @@ Sandbox SDK: *«Available on Workers Paid plan»*, *«Built on Containers»*; DO
 
 Отсюда прямое следствие: любая работа, требующая процессов и настоящего диска (git, сборки, тесты), физически невозможна внутри Worker/DO — только Containers (Paid) или внешний раннер.
 
+### process.env воркера: секреты и vars доступны из бандла (проверено по докам 2026-08-29)
+
+При включённом `nodejs_compat` воркер заполняет `process.env` всеми
+переменными окружения, секретами и version metadata; флаг
+`nodejs_compat_populate_process_env` включён **по умолчанию** для
+compatibility date ≥ 2025-04-01 (у морды dsh-edge — 2026-08-14, то есть
+включён без дополнительных флагов). `process.env` — изолят-глобал: читается
+из любого места бандла, включая Durable Object; это канал, по которому
+плагин морды (runner-bridge, #95) получает токен GitHub без прокидывания
+env через инсталл-цикл. Нюансы: значения коэрцируются в строки;
+`process.env.NODE_ENV` wrangler статически заменяет на этапе сборки (не
+рантайм-значение); альтернатива — `import { env } from 'cloudflare:workers'`.
+Источник: developers.cloudflare.com/workers/runtime-apis/nodejs/process/.
+На живом деплое #95 подтверждается тем, что инструмент отвечает не
+«токена нет», а осмысленным ответом GitHub.
+
 ---
 
 ## Workflows (для справки)
