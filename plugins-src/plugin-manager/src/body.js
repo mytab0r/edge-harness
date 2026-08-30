@@ -28,20 +28,26 @@ const { useState, useEffect, useCallback, createElement: h } = require("react");
 const { Button, StateDot } = require("@deepseek-ai/dsh-client-ui-primitives");
 
 // ── Журнал ────────────────────────────────────────────────────────────────────
-// Контракт: GET /api/events?task_id=plugin:<id>&limit=10, ответ
+// Контракт: GET /api/events?task_id=plugin:<id>&limit=&after=, ответ
 // { events: [{id, seq, ts, source, kind, data}, …], has_more, next_after }
 // (openspec/specs/journal-tasks-hands.md, реализация cf-worker/src/harness.ts).
-// События идут по возрасту id, значит последний элемент выборки — свежайший.
+// События идут по возрасту id, а страницы отдаются от старейших: свежайший
+// статус может лежать за пределами первой страницы (каждый деплой пишет 2+
+// plugin_status, журнал растёт), поэтому идём до конца выборки по next_after,
+// пока has_more. Одна страница = протухший статус навсегда.
 // Браузер ходит сессионной кукой (после POST /api/session обмена кука едет
 // сама) — Bearer у браузера нет и быть не должно.
 //
 // Ответ, не совпавший по форме контракта, — НЕ «статусов нет», а ошибка: тот
 // же путь на чужом origin отвечает другим API, и тихо показать «установлен»
 // по чужому ответу — silent-wrong. Форма проверяется явно.
-const JOURNAL_QUERY = "/api/events?limit=10&task_id=";
+const JOURNAL_PAGE_SIZE = 10;
+const JOURNAL_QUERY = "/api/events?task_id=";
 
-async function fetchPluginStatus(id) {
-  const response = await fetch(JOURNAL_QUERY + encodeURIComponent("plugin:" + id), {
+async function fetchStatusPage(id, after) {
+  const url = JOURNAL_QUERY + encodeURIComponent("plugin:" + id)
+    + "&limit=" + JOURNAL_PAGE_SIZE + "&after=" + after;
+  const response = await fetch(url, {
     credentials: "include",
     headers: { accept: "application/json" },
   });
@@ -54,7 +60,22 @@ async function fetchPluginStatus(id) {
   if (body === null || typeof body !== "object" || !Array.isArray(body.events)) {
     throw new Error("ответ без массива events — не по контракту журнала");
   }
-  const statusEvents = body.events.filter((event) => event !== null && event.kind === "plugin_status");
+  return body;
+}
+
+async function fetchPluginStatus(id) {
+  const events = [];
+  let after = 0;
+  for (;;) {
+    const page = await fetchStatusPage(id, after);
+    events.push(...page.events);
+    if (page.has_more !== true) break;
+    if (typeof page.next_after !== "number") {
+      throw new Error("has_more без числового next_after — не по контракту журнала");
+    }
+    after = page.next_after;
+  }
+  const statusEvents = events.filter((event) => event !== null && event.kind === "plugin_status");
   return statusEvents.length > 0 ? statusEvents[statusEvents.length - 1].data : null;
 }
 
@@ -62,20 +83,23 @@ async function fetchPluginStatus(id) {
 // ({plugin, state: building|built|deploying|ready|failed, detail?}).
 // note — detail события или пояснение ячейки (уходит в tooltip и строку).
 // Неизвестное состояние журнала показывается как есть — не выдумываем.
-// Нет событий — «установлен»: факт из манифеста, а не догадка о состоянии.
+// Событие БЕЗ state — не «установлен», а warning с сырыми данными: событие
+// было, и молча притворяться, что его не было, — silent-wrong.
+// Нет событий вовсе — «установлен»: факт из манифеста, а не догадка.
 function statusView(t, data) {
-  const state = data !== null && typeof data === "object" && typeof data.state === "string"
-    ? data.state
-    : null;
-  const detail = data !== null && typeof data === "object" && typeof data.detail === "string"
-    ? data.detail
-    : null;
+  const isObject = data !== null && typeof data === "object";
+  const state = isObject && typeof data.state === "string" ? data.state : null;
+  const detail = isObject && typeof data.detail === "string" ? data.detail : null;
   if (state === null) {
+    if (isObject) {
+      return { dot: "warning", text: t("statusUnknown"), note: JSON.stringify(data) };
+    }
     return { dot: null, text: t("statusInstalled"), note: t("statusInstalledHint") };
   }
   if (state === "ready") return { dot: "done", text: t("statusReady"), note: detail };
-  if (state === "deploying" || state === "building" || state === "built") {
-    return { dot: "ongoing", text: t("statusDeploying"), note: detail };
+  if (state === "deploying") return { dot: "ongoing", text: t("statusDeploying"), note: detail };
+  if (state === "building" || state === "built") {
+    return { dot: "ongoing", text: t("statusOngoing"), note: detail };
   }
   if (state === "failed") return { dot: "failed", text: t("statusFailed"), note: detail };
   return { dot: "warning", text: state, note: detail ?? t("statusUnknown") };
@@ -95,6 +119,7 @@ const dictionaries = {
     statusLoading: "…",
     statusReady: "ready",
     statusDeploying: "deploying",
+    statusOngoing: "in progress",
     statusFailed: "failed",
     statusInstalled: "installed",
     statusInstalledHint: "no plugin_status events in the journal yet",
@@ -113,6 +138,7 @@ const dictionaries = {
     statusLoading: "…",
     statusReady: "就绪",
     statusDeploying: "部署中",
+    statusOngoing: "进行中",
     statusFailed: "失败",
     statusInstalled: "已安装",
     statusInstalledHint: "日志中还没有 plugin_status 事件",
@@ -131,6 +157,7 @@ const dictionaries = {
     statusLoading: "…",
     statusReady: "готов",
     statusDeploying: "деплоится",
+    statusOngoing: "в процессе",
     statusFailed: "ошибка",
     statusInstalled: "установлен",
     statusInstalledHint: "событий plugin_status в журнале ещё нет",

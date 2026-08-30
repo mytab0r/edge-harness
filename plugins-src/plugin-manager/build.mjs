@@ -43,6 +43,11 @@ failUnless(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length 
 const manifestPath = join(repoRoot, 'dsh-edge', 'plugins.json')
 const manifestSource = await readFile(manifestPath, 'utf8')
 const manifest = parseManifest(manifestSource)
+// Пакет обязан быть объявлен в том каталоге, из которого собирается: sha256
+// в каталоге доказывает целостность артефакта, но не его свежесть — сборка
+// из устаревшего среза каталога молча уехала бы в релиз с чужим составом.
+failUnless(manifest.plugins.some((plugin) => plugin.package === pkg.name),
+  `dsh-edge/plugins.json: пакет ${pkg.name} не объявлен в каталоге — релиз нельзя собирать из несвежего среза`)
 // Клиенту нужен только состав: id и где он живёт. release/sha256 — канал
 // поставки, воркеру и журналу они в браузере ничего не говорят.
 const roster = manifest.plugins.map(({ id, server, client }) => ({ id, server, client }))
@@ -71,6 +76,11 @@ failUnless(unseeded.length === 0,
   'добавь пакет в dsh.client.inject package.json и сверь, что он в ростере апстрима')
 
 // Имена, которые тело не имеет права объявлять: их приносит обёртка.
+// Регэкс ловит только ОБЪЯВЛЕНИЯ (var/let/const/function/class), не
+// присваивания (`require = …` проскочит) — регэкс-гвард по определению
+// неполон; достаточно, потому что присваивание свободной переменной обёртки
+// затирало бы её только внутри фабрики и ловится синтаксической проверкой
+// бандла при использовании.
 for (const reserved of ['module', 'exports', 'require', 'MANIFEST']) {
   failUnless(!new RegExp(`(?:var|let|const|function|class)\\s+${reserved}\\b`).test(body),
     `src/body.js: тело объявляет "${reserved}" — это свободная переменная обёртки, коллизия`)

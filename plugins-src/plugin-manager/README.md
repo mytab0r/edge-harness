@@ -12,9 +12,13 @@
   [`dsh-edge/manifest.mjs`](../../dsh-edge/manifest.mjs), одно место правды
   формы), кладёт байт-в-байт копию в пакет как `manifest.json` и вшивает
   срез `[id, server, client]` в бандл константой `MANIFEST`.
-- **Статусы из журнала** — по каждому плагину `GET /api/events?task_id=plugin:<id>&limit=10`
-  (контракт [`openspec/specs/journal-tasks-hands.md`](../../openspec/specs/journal-tasks-hands.md)),
-  берётся последнее событие `plugin_status` (`state: ready|deploying|failed`,
+- **Статусы из журнала** — по каждому плагину
+  `GET /api/events?task_id=plugin:<id>&limit=10&after=<next_after>` с проходом
+  до конца выборки (`has_more`/`next_after`): страницы отдаются от старейших,
+  и свежайший статус может лежать за пределами первой страницы — каждый деплой
+  пишет 2+ события `plugin_status`
+  (контракт [`openspec/specs/journal-tasks-hands.md`](../../openspec/specs/journal-tasks-hands.md)).
+  Берётся последнее событие `plugin_status` (`state: ready|deploying|failed`,
   плюс `building|built`; detail — в tooltip). Браузер ходит сессионной кукой
   (`credentials: include`), Bearer у браузера нет. Ответ, не совпавший по
   форме контракта, — ошибка секции, а не «статусов нет»: чужой origin может
@@ -23,11 +27,13 @@
 - **Подсказка** — «Новые плагины: попроси агента в чате (умный принцип) —
   раннер соберёт и установит».
 
-Известное ограничение (белое пятно): журнал (`edge-harness`) и морда
-(`dsh-edge`) — разные workers.dev-origin, а сессионная кука журнала
-`SameSite=Strict` и CORS на журнале нет, поэтому из страницы морды журнал
-сегодня недосягаем — секция покажет громкую ошибку статусов, список при этом
-работает. Разбор и варианты закрытия — issue «белое пятно» от #102.
+Известное ограничение (белое пятно): журнал живёт в воркере `edge-harness`,
+морда — в воркере `dsh-edge`; секция ходит по относительному пути `/api/events`
+того же origin, где стоит страница, — а этот путь в морде не проксирован к
+журналу. Страница получает 404/HTML не-журнальной формы, и content-type-гвардия
+превращает это в громкую ошибку статусов; список при этом работает. Разбор и
+варианты закрытия (проксирование журнала в origin морды) — issue «белое
+пятно» от #102.
 
 ## Как устроен бандл
 
@@ -50,21 +56,26 @@
 ```bash
 cd plugins-src/plugin-manager
 node build.mjs          # сгенерирует client/client.js + manifest.json, прогонит гвардии
-npm pack                # edge-harness-dsh-plugin-manager-0.1.0.tgz
+npm pack                # edge-harness-dsh-plugin-manager-0.1.1.tgz
 ```
 
 Публикация (конвейер #80, по образцу hello-world): релиз **этого**
-репозитория с тегом `plugins-manager-v0.1.0`, asset
-`plugin-manager-0.1.0.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
+репозитория с тегом `plugins-manager-v0.1.1`, asset
+`plugin-manager-0.1.1.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
 фиксирует манифест), затем sha256 — PR'ом в `dsh-edge/plugins.json`:
 
 ```bash
-cp edge-harness-dsh-plugin-manager-0.1.0.tgz plugin-manager-0.1.0.tgz
-sha256sum plugin-manager-0.1.0.tgz
-gh release create plugins-manager-v0.1.0 plugin-manager-0.1.0.tgz \
-  --title "plugins-manager-v0.1.0 — plugin-manager: раздел «Плагины» в морде" \
+cp edge-harness-dsh-plugin-manager-0.1.1.tgz plugin-manager-0.1.1.tgz
+sha256sum plugin-manager-0.1.1.tgz
+gh release create plugins-manager-v0.1.1 plugin-manager-0.1.1.tgz \
+  --title "plugins-manager-v0.1.1 — plugin-manager: раздел «Плагины» в морде" \
   --notes "Клиентский плагин #102: список плагинов из манифеста, статусы из журнала, подсказка о заказе новых."
 ```
+
+Цикличность sha (принято, по образцу hello/runner): вшитая `manifest.json`
+в пакете содержит каталог с sha256 **этого же** пакета — финальной своей sha
+там быть не может. Проверяется всегда sha артефакта против каталога репо;
+вшитая копия нужна ради ростера `[id, server, client]`, который циклы не имеет.
 
 Сгенерированное (`client/`, `manifest.json`) в git не хранится: манифест
 меняется — пересборка перед каждым `npm pack` обязательна, иначе в бандл

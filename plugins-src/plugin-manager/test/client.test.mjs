@@ -160,7 +160,17 @@ test('обёртка бандла: id = имя пакета, на экспорт
 test('вшитый манифест = байт-в-байт копии манифеста в пакете (id/server/client)', () => {
   const baked = extractBakedManifest()
   assert.deepEqual(baked, manifestCopy.plugins.map(({ id, server, client }) => ({ id, server, client })))
-  assert.ok(baked.length >= 2, 'манифест должен нести hello и runner-bridge (критерий #102)')
+})
+
+test('manifest.json пакета = текущему каталогу репозитория (срез не устарел)', async () => {
+  // sha256 в каталоге доказывает целостность артефакта, но не свежесть:
+  // пакет, собранный из старого среза, закрепил бы в релизе чужой состав.
+  const catalog = JSON.parse(
+    await readFile(join(packageDir, '..', '..', 'dsh-edge', 'plugins.json'), 'utf8'))
+  assert.deepEqual(
+    manifestCopy.plugins.map(({ id, server, client }) => ({ id, server, client })),
+    catalog.plugins.map(({ id, server, client }) => ({ id, server, client })),
+    'пакет собран из устаревшего среза каталога — прогони build.mjs перед npm pack')
 })
 
 test('монтаж: декларация settings.section с id plugin-manager; словари в одном наборе ключей', () => {
@@ -220,7 +230,8 @@ test('статусы: последнее plugin_status побеждает; бе�
   const calls = []
   const { sandbox } = loadBundle(async (url, init) => {
     calls.push({ url, init })
-    const id = decodeURIComponent(String(url).split('task_id=')[1]).replace(/^plugin:/, '')
+    const taskId = String(url).match(/[?&]task_id=([^&]+)/)
+    const id = decodeURIComponent(taskId ? taskId[1] : '').replace(/^plugin:/, '')
     const response = responses.get(id)
     if (!response) throw new Error('неожиданный запрос журнала: ' + url)
     return responseStub(response)
@@ -242,10 +253,96 @@ test('статусы: последнее plugin_status побеждает; бе�
   assert.ok(!strings.includes('journalError'), 'живой журнал показан как ошибка')
   assert.equal(calls.length, baked.length, 'запрос статуса не на каждый плагин')
   for (const call of calls) {
-    assert.ok(call.url.startsWith('/api/events?limit=10&task_id=plugin%3A'),
+    assert.ok(call.url.startsWith('/api/events?task_id=plugin%3A'),
       'URL журнала не по контракту: ' + call.url)
+    assert.ok(call.url.includes('&limit=10&after=0'),
+      'первая страница журнала обязана быть after=0: ' + call.url)
     assert.equal(call.init.credentials, 'include', 'браузер обязан идти сессионной кукой')
   }
+})
+
+test('пагинация: свежайший статус за пределами первой страницы добирается по next_after', async () => {
+  const baked = extractBakedManifest()
+  const target = baked[0].id
+  const taskParam = encodeURIComponent('plugin:' + target)
+  const pages = new Map([
+    ['after=0', {
+      ok: true, status: 200, contentType: 'application/json',
+      // Полная первая страница протухших событий — как после нескольких деплоев:
+      // свежайшее состояние в неё уже не помещается.
+      body: {
+        events: Array.from({ length: 10 }, (_, i) => ({
+          id: i + 1, task_id: 'plugin:' + target, seq: i + 1, ts: i + 1, source: 'deploy',
+          kind: 'plugin_status', data: { plugin: target, state: 'deploying' },
+        })),
+        has_more: true, next_after: 10,
+      },
+    }],
+    ['after=10', {
+      ok: true, status: 200, contentType: 'application/json',
+      body: {
+        events: [
+          { id: 11, task_id: 'plugin:' + target, seq: 11, ts: 11, source: 'deploy',
+            kind: 'plugin_status', data: { plugin: target, state: 'ready', detail: 'свежий' } },
+        ],
+        has_more: false, next_after: 11,
+      },
+    }],
+  ])
+  const targetCalls = []
+  const { sandbox } = loadBundle(async (url, init) => {
+    const address = String(url)
+    if (!address.includes('task_id=' + taskParam)) {
+      // остальные плагины: пустой журнал, одна страница
+      return responseStub({ ok: true, status: 200, contentType: 'application/json',
+        body: { events: [], has_more: false, next_after: 0 } })
+    }
+    targetCalls.push({ url: address, init })
+    const after = address.split('after=')[1] ?? '0'
+    const response = pages.get('after=' + after)
+    if (!response) throw new Error('неожиданная страница журнала: ' + address)
+    return responseStub(response)
+  })
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.equal(targetCalls.length, 2, 'свежайшая страница не добрана: ' + JSON.stringify(targetCalls.map((call) => call.url)))
+  assert.ok(strings.includes('statusReady'), 'статус за пределами первой страницы не показан')
+  assert.ok(strings.includes('свежий'), 'detail события со второй страницы не показан')
+  assert.ok(!strings.includes('statusDeploying'), 'показан протухший статус с первой страницы')
+  assert.ok(!strings.includes('journalError'), 'живой журнал показан как ошибка')
+})
+
+test('событие без state: warning с сырыми данными, а не притворный «установлен»', async () => {
+  const baked = extractBakedManifest()
+  const target = baked[0].id
+  const taskParam = encodeURIComponent('plugin:' + target)
+  const { sandbox } = loadBundle(async (url) => {
+    if (!String(url).includes('task_id=' + taskParam)) {
+      return responseStub({ ok: true, status: 200, contentType: 'application/json',
+        body: { events: [], has_more: false, next_after: 0 } })
+    }
+    return responseStub({
+      ok: true, status: 200, contentType: 'application/json',
+      body: {
+        events: [
+          { id: 5, task_id: 'plugin:' + target, seq: 1, ts: 1, source: 'deploy',
+            kind: 'plugin_status', data: { plugin: target, detail: 'кривое событие' } },
+        ],
+        has_more: false, next_after: 5,
+      },
+    })
+  })
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(strings.includes('statusUnknown'), 'кривое событие не показано как неизвестное состояние')
+  assert.ok(strings.some((s) => s.includes('кривое событие')),
+    'сырые данные кривого события потеряны (показываются как JSON в note)')
+  // statusInstalled при этом вправе показать другой плагин с пустым журналом,
+  // поэтому целевой признак — именно связка statusUnknown + сырые данные выше.
 })
 
 test('отказ журнала (401): громкая ошибка, а не притворный «установлен»', async () => {
