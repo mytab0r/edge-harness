@@ -63,6 +63,7 @@ jobs:
       # форму каталога — замена не найдётся и деплой упадёт громко, а не
       # соберёт молчу-неверную морду.
       - name: Патч каталога моделей под реального провайдера
+        working-directory: /tmp/dsh-deploy
         env:
           DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
           DSH_EDGE_PROVIDER_NAME: ${{ vars.DSH_EDGE_PROVIDER_NAME }}
