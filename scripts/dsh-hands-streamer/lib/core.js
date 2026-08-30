@@ -57,25 +57,33 @@ function cutText(text, budget) {
 /**
  * Применяет потолок к массиву контент-блоков: бюджет расходуется жадно по
  * блокам с полем text (text и reasoning); неизвестные блоки не трогаются.
- * Возвращает суммарный исходный размер текстов — для объявления усечения.
+ * Возвращает суммарный исходный размер текстов и факт РЕАЛЬНОЙ обрезки:
+ * флаг truncated ставится только когда хотя бы один блок действительно
+ * укорочен (или опустошён). Заявлять усечение, которого не было, — тот же
+ * silent-wrong: журнал не должен врать ни про одно поле.
  */
 function capContentBlocks(blocks, budget) {
-  if (!Array.isArray(blocks)) return 0;
-  let original = 0;
+  if (!Array.isArray(blocks)) return { originalSize: 0, cut: false };
+  let originalSize = 0;
+  let cut = false;
   let remaining = budget;
   for (const block of blocks) {
     if (block === null || typeof block !== 'object') continue;
     if (typeof block.text !== 'string') continue;
-    original += block.text.length;
+    originalSize += block.text.length;
     if (remaining > 0) {
-      const cut = cutText(block.text, remaining);
-      if (cut !== block.text) block.text = cut;
+      const trimmed = cutText(block.text, remaining);
+      if (trimmed !== block.text) {
+        block.text = trimmed;
+        cut = true;
+      }
       remaining -= block.text.length;
     } else {
       block.text = '';
+      cut = true;
     }
   }
-  return original;
+  return { originalSize, cut };
 }
 
 /**
@@ -83,34 +91,38 @@ function capContentBlocks(blocks, budget) {
  * сначала клонируется (structuredClone), мутируется только клон; форма data
  * остаётся формой DSH — добавляются только объявляющие усечение поля
  * truncated/original_size (коллизий со словарём SessionEventMap нет: там нет
- * ни truncated, ни original_size).
+ * ни truncated, ни original_size). Поля появляются только при фактической
+ * обрезке: неурезанное событие уходит в спул без них.
  */
 export function projectEventData(type, data) {
   if (data === null || typeof data !== 'object') return { data, truncated: false, originalSize: 0 };
   const out = structuredClone(data);
   let originalSize = 0;
+  let cut = false;
   if (type === 'assistant/message') {
     const content = out.message?.content;
-    originalSize = capContentBlocks(content, CAPS.assistantText);
+    ({ originalSize, cut } = capContentBlocks(content, CAPS.assistantText));
   } else if (type === 'tool/call') {
     const before = out.arguments;
     if (typeof before === 'string') {
       out.arguments = cutText(before, CAPS.toolArguments);
-      if (out.arguments !== before) originalSize = before.length;
+      if (out.arguments !== before) {
+        cut = true;
+        originalSize = before.length;
+      }
     }
   } else if (type === 'tool/result') {
     // message.content — ровно один ToolResultBlock, текст живёт в его content.
     const block = Array.isArray(out.message?.content) ? out.message.content[0] : undefined;
     if (block !== null && typeof block === 'object') {
-      originalSize = capContentBlocks(block.content, CAPS.toolResultText);
+      ({ originalSize, cut } = capContentBlocks(block.content, CAPS.toolResultText));
     }
   }
-  const truncated = originalSize > 0;
-  if (truncated) {
+  if (cut) {
     out.truncated = true;
     out.original_size = originalSize;
   }
-  return { data: out, truncated, originalSize };
+  return { data: out, truncated: cut, originalSize };
 }
 
 /** Строка спула: конверт события DSH плюс наши session_id/v; data уже с caps. */

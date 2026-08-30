@@ -201,6 +201,13 @@ describe('allowlist и форма спула', () => {
     assert.equal(records[3].data.arguments, '{"cmd":"ls"}');
     assert.equal(records[5].data.message.content[0].text, 'готово');
     assert.equal(records[7].data.reason.kind, 'completed');
+    // Гвардия ложного усечения: короткие события НЕ помечаются truncated —
+    // флаг в журнале обязан означать реальную обрезку, а не наличие текста.
+    assert.equal(records[3].data.truncated, undefined);
+    assert.equal(records[4].data.truncated, undefined, 'tool/result без обрезки не помечается');
+    assert.equal(records[5].data.truncated, undefined, 'assistant/message без обрезки не помечается');
+    assert.equal(records[4].data.original_size, undefined);
+    assert.equal(records[5].data.original_size, undefined);
     // Статистика рядом со спулом: 8 принято, потоковое и todo — отброшенное по типам.
     const stats = readStats(spool);
     assert.equal(stats.accepted, 8);
@@ -266,6 +273,33 @@ describe('caps payload', () => {
     assert.equal(text.length, CAPS.toolResultText);
     assert.equal(records[0].data.truncated, true);
     assert.equal(records[0].data.original_size, CAPS.toolResultText + 10);
+  });
+
+  it('короткие assistant/message и tool/result не помечаются усечёнными', () => {
+    // Регрессия ложного truncated:true: флаг ставился по наличию текста
+    // (originalSize > 0), а не по факту обрезки — журнал молча врал про
+    // усечение на каждом коротком сообщении.
+    const shortAssistant = projectEventData(
+      'assistant/message',
+      structuredClone({ message: { content: [{ type: 'text', text: 'готово' }] } }),
+    );
+    assert.equal(shortAssistant.data.truncated, undefined);
+    assert.equal(shortAssistant.data.original_size, undefined);
+    assert.equal(shortAssistant.data.message.content[0].text, 'готово');
+    const shortResult = projectEventData(
+      'tool/result',
+      structuredClone({ message: { content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] } }),
+    );
+    assert.equal(shortResult.data.truncated, undefined);
+    assert.equal(shortResult.data.original_size, undefined);
+    assert.equal(shortResult.data.message.content[0].content[0].text, 'ok');
+    // Граница: ровно в потолок — ещё не усечение.
+    const exact = projectEventData(
+      'tool/call',
+      structuredClone({ name: 'x', arguments: 'a'.repeat(CAPS.toolArguments) }),
+    );
+    assert.equal(exact.data.truncated, undefined);
+    assert.equal(exact.data.arguments.length, CAPS.toolArguments);
   });
 
   it('deep-frozen событие не мутируется caps — клон пишется в спул, оригинал нетронут', () => {
