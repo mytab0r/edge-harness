@@ -50,6 +50,12 @@ jobs:
       - name: Юнит-тесты плагина plugin-manager
         run: node --test plugins-src/plugin-manager/test/client.test.mjs
 
+      # Преграда бренд-замены морды (#109): замещающий бандл brand-official
+      # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
+      # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
+      - name: Бренд-бандл морды валиден
+        run: node --check dsh-edge/brand-official.client.js
+
       # Синтаксис клиента рук: bash -n ловит поломку до ревью.
       - name: Bash-скрипты валидны
         run: |

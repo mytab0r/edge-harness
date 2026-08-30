@@ -203,6 +203,36 @@ jobs:
           echo "VERSION_DEPLOYED=$VERSION_DEPLOYED" >> "$GITHUB_ENV"
           echo "Готов деплой префаба dsh-edge $VERSION_DEPLOYED (манифест пуст)"
 
+      # SVG-носители бренда (#109): строковый ребренд (шаг «Бренд морды» ниже)
+      # не достаёт до векторных носителей — вордмарк «deepseek» нарисован путями
+      # внутри BrandWordmark, кит — FishLogo и favicon.svg. Все три слота бренда
+      # (sidebar.brand.mark, sidebar.brand.name, conversation.hero.brand.mark)
+      # заполняет клиентский пакет dsh-client-ui-brand-official, чей client.js
+      # лежит в dist статикой: query ?rev= статикой игнорируется (проверено
+      # живьём), так что замена = перезапись собранного файла нашим
+      # dsh-edge/brand-official.client.js — форма слотов и обёртки сохранена,
+      # меняется только отрисовка (текст «mytab0r» вместо кита и вордмарка).
+      # Гвардии: файл апстрима обязан существовать и содержать маркеры формы —
+      # иначе деплой падает громко, а не выкатывает молчу-чужой бренд.
+      - name: Бренд-плагин и favicon морды (SVG-носители)
+        working-directory: ${{ github.workspace }}/deploy
+        run: |
+          BRAND_DIR="dist/plugins/@deepseek-ai/dsh-client-ui-brand-official"
+          test -f "$BRAND_DIR/client.js" \
+            || { echo "::error::$BRAND_DIR/client.js не найден — upstream сменил состав ростера или путь сборки; патчить некуда"; exit 1; }
+          for marker in "dsh-client-ui-brand-official" "OfficialBrandName" "BrandWordmark"; do
+            grep -q "$marker" "$BRAND_DIR/client.js" \
+              || { echo "::error::В client.js brand-official нет маркера «$marker» — upstream сменил форму пакета, слепая замена опасна"; exit 1; }
+          done
+          cp "$GITHUB_WORKSPACE/dsh-edge/brand-official.client.js" "$BRAND_DIR/client.js"
+          node --check "$BRAND_DIR/client.js" \
+            || { echo "::error::Замещающий brand-official.client.js не валиден"; exit 1; }
+          grep -q "mytab0r" "$BRAND_DIR/client.js" \
+            || { echo "::error::В заменённом brand-official нет маркера mytab0r"; exit 1; }
+          test -f dist/favicon.svg || { echo "::error::dist/favicon.svg не найден — upstream убрал favicon, некуда класть замену"; exit 1; }
+          cp "$GITHUB_WORKSPACE/dsh-edge/brand-favicon.svg" dist/favicon.svg
+          echo "Бренд-плагин: brand.mark/name/hero → mytab0r (кит и вордмарк deepseek убраны), favicon заменён"
+
       # Селектор моделей в морде строится из каталога, зашитого в адаптере
       # (три DeepSeek-модели). Адаптер поддерживает кастомный каталог `models`,
       # но dsh-edge его не прокидывает — поэтому каталог патчится здесь, на
