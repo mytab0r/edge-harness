@@ -92,6 +92,11 @@ jobs:
           old = 'displayName:"DeepSeek"'
           if old in patched:
               patched = patched.replace(old, f'displayName:"{provider_name}"', 1)
+          # имя группы моделей в каталоге (providerInfo) — второй литерал
+          group_pat = re.compile(r'\{id:([A-Za-z_$][\w$]*),name:"DeepSeek"\}')
+          patched, n2 = group_pat.subn(lambda m: '{id:' + m.group(1) + f',name:"{provider_name}"}}', patched, count=1)
+          if n2 != 1:
+              sys.exit("::error::Имя группы провайдера (providerInfo) не найдено — upstream сменил форму")
           open("deploy/worker.js", "w", encoding="utf-8").write(patched)
           first_id = catalog[0]["id"]
           if f'id:"{first_id}"' not in patched:
