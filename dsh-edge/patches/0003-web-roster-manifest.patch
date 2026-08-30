@@ -1,0 +1,129 @@
+diff --git a/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs b/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
+index 7664fd5..4dc5923 100644
+--- a/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
++++ b/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
+@@ -34,6 +34,36 @@ const edgeClientPackages = new Map([
+     bundlePath: edgeClientBundlePath,
+   }],
+ ])
++const edgePluginsManifestPath = join(standaloneRoot, 'edge-plugins.json')
++
++/**
++ * Client roster entries contributed by the edge-harness plugin manifest
++ * (standalone/edge-plugins.json, generated from dsh-edge/plugins.json).
++ * The file is optional: without it (or with an empty list) the roster is
++ * exactly the upstream one. A present manifest entry is LOUD: unlike the
++ * upstream declared-package loop below, a manifest plugin that is missing
++ * from node_modules or lacks a web dsh.client declaration must fail the
++ * build, not silently skip the roster row.
++ */
++async function manifestClientEntries() {
++  let raw
++  try {
++    raw = await readFile(edgePluginsManifestPath, 'utf8')
++  } catch (error) {
++    if (error?.code === 'ENOENT') return []
++    throw error
++  }
++  const parsed = JSON.parse(raw)
++  if (!Array.isArray(parsed)) {
++    throw new Error('standalone/edge-plugins.json must be an array of { id, package } entries.')
++  }
++  for (const entry of parsed) {
++    if (typeof entry?.id !== 'string' || entry.id === '' || typeof entry?.package !== 'string' || entry.package === '') {
++      throw new Error(`standalone/edge-plugins.json entry must carry non-empty id and package strings: ${JSON.stringify(entry)}`)
++    }
++  }
++  return parsed
++}
+ 
+ const edgeExcludedPackages = new Set([
+   '@deepseek-ai/dsh-client-hmr',
+@@ -169,15 +199,29 @@ async function main() {
+     declared.push(...deploymentPackageNames(await readFile(patchPath, 'utf8')))
+   }
+   declared.push(...edgeClientPackages.keys())
++  const manifestEntries = await manifestClientEntries()
++  const manifestPackages = new Set(manifestEntries.map(entry => entry.package))
++  declared.push(...manifestPackages)
+ 
+   const roster = []
+   const records = new Map()
+   for (const name of declared) {
+     if (records.has(name)) continue
++    const manifestRequired = manifestPackages.has(name)
+     const record = edgeClientPackages.get(name) ?? resolvePublishedPackage(name)
+-    if (record === undefined) continue
++    if (record === undefined) {
++      if (manifestRequired) {
++        throw new Error(`Manifest client plugin ${name} is not installed in the standalone node_modules.`)
++      }
++      continue
++    }
+     const pkg = JSON.parse(await readFile(record.packagePath, 'utf8'))
+-    if (pkg.dsh?.client?.platform !== 'web') continue
++    if (pkg.dsh?.client?.platform !== 'web') {
++      if (manifestRequired) {
++        throw new Error(`Manifest client plugin ${name} has no web dsh.client declaration.`)
++      }
++      continue
++    }
+     records.set(name, { ...record, pkg })
+     roster.push(name)
+   }
+diff --git a/apps/dsh-edge/standalone/scripts/verify-standalone.mjs b/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
+index e73501d..112f1c9 100644
+--- a/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
++++ b/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
+@@ -112,9 +112,19 @@ if (!index.includes('window.__ModuleLoader__=')) {
+ const bootMatch = index.match(/globalThis\["__DSH_BOOT__"\] = (\{.*?\})<\/script>/s)
+ if (bootMatch === null) throw new Error('Standalone Web shell has no boot manifest.')
+ const boot = JSON.parse(bootMatch[1])
+-if (!Array.isArray(boot.entries) || boot.entries.length !== expectedBootShape.length) {
++// Manifest client plugins (standalone/edge-plugins.json, generated from the
++// edge-harness plugin manifest) join the roster on top of the reviewed
++// upstream set; only the upstream part must match the reviewed boot graph.
++const edgePluginsManifestEntries = await readEdgePluginsManifestEntries()
++const manifestClientIds = new Set(edgePluginsManifestEntries.map(entry => entry.package))
++const upstreamBootEntries = boot.entries?.filter(entry => !manifestClientIds.has(entry.id)) ?? []
++const manifestBootEntries = boot.entries?.filter(entry => manifestClientIds.has(entry.id)) ?? []
++if (manifestBootEntries.length !== manifestClientIds.size) {
++  throw new Error('Standalone Web boot graph is missing manifest client plugins.')
++}
++if (!Array.isArray(boot.entries) || upstreamBootEntries.length !== expectedBootShape.length) {
+   throw new Error(
+-    `Expected ${String(expectedBootShape.length)} reviewed ${targetVersion} client plugins, found ${String(boot.entries?.length)}.`,
++    `Expected ${String(expectedBootShape.length)} reviewed ${targetVersion} client plugins, found ${String(upstreamBootEntries.length)}.`,
+   )
+ }
+ const clientIds = new Set(boot.entries.map(entry => entry.id))
+@@ -133,7 +143,7 @@ for (const name of excludedClientPackages) {
+ for (const entry of boot.entries) {
+   await access(join(webRoot, 'plugins', entry.id, 'client.js'))
+ }
+-if (JSON.stringify(bootShape(boot)) !== JSON.stringify(expectedBootShape)) {
++if (JSON.stringify(bootShape({ entries: upstreamBootEntries })) !== JSON.stringify(expectedBootShape)) {
+   throw new Error(`Standalone Web boot graph differs from the reviewed ${targetVersion} contract.`)
+ }
+ const edgeClientBundle = await readFile(join(webRoot, 'plugins', 'dsh-edge-client-ui', 'client.js'), 'utf8')
+@@ -155,6 +165,20 @@ console.log(
+   `Verified standalone Harness ${targetVersion}: ${patchAudit.length} patches, ${boot.entries.length} client plugins, and both Worker modes.`,
+ )
+ 
++/** Read the generated manifest client roster; absent file means no manifest plugins. */
++async function readEdgePluginsManifestEntries() {
++  try {
++    const parsed = JSON.parse(await readFile(join(standaloneRoot, 'edge-plugins.json'), 'utf8'))
++    if (!Array.isArray(parsed)) {
++      throw new Error('standalone/edge-plugins.json must be an array of { id, package } entries.')
++    }
++    return parsed
++  } catch (error) {
++    if (error?.code === 'ENOENT') return []
++    throw error
++  }
++}
++
+ async function filesUnder(root) {
+   const files = []
+   for (const entry of await readdir(root, { withFileTypes: true })) {
