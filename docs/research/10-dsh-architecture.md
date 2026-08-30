@@ -487,3 +487,22 @@ export function apply(ctx: Context) {
 **Прочитано, но не перепроверено построчно:** `docs/capability-seams.md`, `packages/README.md`, README пакетов `shell`, `subprocess`, `fs`, `storage`, `session-persistence`, `llm`, `llm-pi-ai`, `webworker-runtime`, документация по профилям и `dsh plugin`.
 
 **Внешнее:** [Cordis](https://github.com/cordiverse/cordis), [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai), GitHub topic [`dsh-plugin`](https://github.com/topics/dsh-plugin), community-списки `awesome-dsh-plugin`, `dsh-market`.
+
+### Каталог моделей в морде dsh-edge — подтверждено на проде 2026-08-30
+
+- Селектор моделей UI строится из серверного каталога: `llm` → `listProviders()`
+  → `listModels(provider.id)` → группы, отдаётся клиенту методами
+  `llm.providers` / `llm.models` / `session.models` (RPC-конверт
+  `{type:"client-request", rpcId, method, payload}`, авторизация кукой владельца).
+- Каталог по умолчанию — три зашитых DeepSeek-модели. Адаптер поддерживает
+  кастомный `models` в конфиге, но dsh-edge его не прокидывает
+  (`EdgeDeploymentConfigSource` несёт только один `DEEPSEEK_MODEL`).
+- Решение edge-harness: каталог и имя группы (`providerInfo`, `displayName`)
+  патчатся в `worker.js` на деплое из `vars.DSH_EDGE_MODEL_CATALOG` /
+  `vars.DSH_EDGE_PROVIDER_NAME`; патч скобочно-сбалансированный, после него
+  обязателен `node --check`, смена формы upstream = громкое падение деплоя.
+- Секреты воркера `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` синхронизируются деплоем
+  из `vars` — морда и руки (hands-job) читают провайдера из одного места правды
+  (GLM coding-эндпоинт + glm-5; NIM — запасной `NVIDIA_API_KEY`).
+- Вход владельца: `POST /api/auth/login` — строго form-encoded
+  (`accessKey=...`, same-origin), иначе «Login requires a form-encoded request».
