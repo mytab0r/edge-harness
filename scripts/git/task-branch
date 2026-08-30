@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Канонический вход в задачу — единственный способ создать agent-ветку.
+#
+# Почему: оркестратор сливает PR на сервере, и локальный origin/main протухает
+# молча. Ветка, созданная «по памяти» от старого base, превращается в потерянные
+# часы (реальный случай: старый workflow воскрес в рабочем дереве, 2026-08-30).
+# Здесь свежесть базы доказывается, а не предполагается:
+#   1) fetch + авторитетная сверка ls-remote — тихо упавший fetch base не выдаёт;
+#   2) самовосстановление core.hooksPath — гвардия свежести обязательна всегда.
+#
+# Использование: scripts/git/task-branch <номер>-<slug>
+set -euo pipefail
+
+task="${1:-}"
+if [ -z "$task" ] || printf '%s' "$task" | grep -qE '[^A-Za-z0-9._-]'; then
+  echo "Использование: $0 <номер>-<slug>   (например: $0 61-my-feature)" >&2
+  exit 1
+fi
+
+git fetch origin --prune
+
+# ls-remote идёт мимо локальных ссылок: если после fetch локальный origin/main
+# не равен серверному — сеть/прокси врут, работать на таком base нельзя.
+remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
+local_head=$(git rev-parse refs/remotes/origin/main)
+if [ "$remote_head" != "$local_head" ]; then
+  echo "ОШИБКА: origin/main протух даже после fetch (локально $local_head, на сервере $remote_head)." >&2
+  echo "Разберись с сетью/прокси — протухший base не выдаю." >&2
+  exit 1
+fi
+
+git switch -c "agent/$task" refs/remotes/origin/main
+
+# Гвардия свежести ставится каждым запуском: пересозданный клон защищён сразу.
+git config core.hooksPath .githooks
+
+echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"

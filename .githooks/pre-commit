@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Гвардия свежего base. main двигается на сервере (оркестратор сливает PR),
+# локальная копия протухает молча — поэтому сверяемся ПЕРЕД каждым коммитом.
+# Протух — коммит запрещён с инструкцией; тихо-устаревших коммитов не бывает.
+#
+# Активируется через core.hooksPath=.githooks (ставит scripts/git/task-branch;
+# руками: git config core.hooksPath .githooks).
+set -euo pipefail
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$branch" = "main" ]; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: коммит прямо в main — в этом репо main меняется только через PR (docs/agents/PROTOCOL.md)." >&2
+fi
+
+if ! git rev-parse --verify -q refs/remotes/origin/main >/dev/null; then
+  echo "ОШИБКА: нет refs/remotes/origin/main — сделай 'git fetch origin' и повтори." >&2
+  exit 1
+fi
+
+git fetch origin main --quiet || {
+  echo "ОШИБКА: не смог свериться с сервером (git fetch упал) — коммит заблокирован." >&2
+  echo "Проверь сеть и повтори; коммит в обход проверки не оставляем." >&2
+  exit 1
+}
+
+if ! git merge-base --is-ancestor refs/remotes/origin/main HEAD; then
+  echo "ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух." >&2
+  echo "Обнови базу и повтори коммит:  git rebase origin/main" >&2
+  echo "(или пересоздай ветку: scripts/git/task-branch <номер>-<slug>)" >&2
+  exit 1
+fi
