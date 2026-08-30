@@ -262,6 +262,9 @@ jobs:
             "compatibility_date": "2026-08-14",
             "compatibility_flags": ["nodejs_compat"],
             "no_bundle": true,
+            "vars": {
+              "GH_RUNNER_REPO": "mytab0r/edge-harness"
+            },
             "assets": {
               "binding": "ASSETS",
               "directory": "./dist",
@@ -295,6 +298,21 @@ jobs:
           [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
+
+      # runner-bridge (#95) диспетчит воркера из чата морды: тот же PAT, что у
+      # рук и оркестратора — права на issues + workflow dispatch у него уже
+      # доказаны (scheduler.py диспетчит worker.yml этим токеном). Секрет
+      # воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда не знала
+      # слов рук; put идемпотентен, значение в лог не печатается.
+      - name: Секрет раннера морды (GH_RUNNER_TOKEN)
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GH_RUNNER_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_DISPATCH_TOKEN не задан — runner_task не сможет диспетчить воркера"; exit 1; }
+          printf '%s' "$GH_RUNNER_TOKEN" | npx wrangler secret put GH_RUNNER_TOKEN
 
       - name: plugin_status → deploying
         if: steps.route.outputs.plugins != '0'
