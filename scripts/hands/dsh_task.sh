@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Клиент рук слайса 1 (dsh-in-job): задача из морды → DSH headless → журнал.
 # Контракт журнала — openspec/specs/journal-tasks-hands.md, дизайн —
-# openspec/changes/dsh-in-job/design.md. Правила: fail loud, без silent-wrong.
+# openspec/changes/dsh-in-job/design.md, критерии готовности — proposal/tasks там же.
+# Правила: fail loud, без silent-wrong; heartbeat — доказательство живости процесса,
+# а не прогресса DSH (durable-улика сессии — слайс 2).
 set -euo pipefail
 
-# Пины версий — единственное место правды по версиям DSH в руках.
-DSH_VERSION="${DSH_VERSION:-0.1.1-rc.2}"
-DSH_HEADLESS_VERSION="${DSH_HEADLESS_VERSION:-0.0.1-rc.1}"
+# Пины версий и целостности — единственное место правды по DSH в руках.
+# integrity = dist.integrity из metadata реестра; сверяется с фактически
+# скачанным tarball'ом — несовпадение это громкий отказ, а не warning.
+DSH_VERSION="0.1.1-rc.2"
+DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
+DSH_HEADLESS_VERSION="0.0.1-rc.1"
+DSH_HEADLESS_INTEGRITY="sha512-+yIpIT2RbigHd/n3XUg+JxJVkv3LFSQtD9K56IX5DbTnsntEwmI9rw/IC2Myf/FkqgUoeyphrU6+tF04Iv188g=="
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 
@@ -29,6 +35,13 @@ api_post() {
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }
 
+# GH маскирует секреты только в своих логах; наш журнал — DO SQLite, туда уходит
+# то, что мы постим. Затираем узнаваемые префиксы ключей до любой отправки.
+redact() {
+  sed -E -e 's/nvapi-[A-Za-z0-9_-]{4,}/nvapi-[REDACTED]/g' \
+         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g'
+}
+
 SEQ=0
 add_event() { # kind json_data
   SEQ=$((SEQ + 1))
@@ -38,18 +51,25 @@ add_event() { # kind json_data
 
 flush_events() {
   if [ ! -s "$EVENTS_FILE" ]; then return 0; fi
-  local body
+  local body attempt
   body=$(jq -s --arg t "$TASK_ID" '{task_id: $t, source: "job", events: .}' "$EVENTS_FILE")
-  api_post /api/events "$body" >/dev/null
-  : >"$EVENTS_FILE"
+  for attempt in 1 2 3 4 5; do
+    if api_post /api/events "$body" >/dev/null; then
+      : >"$EVENTS_FILE"
+      return 0
+    fi
+    sleep $((attempt * 2))
+  done
+  echo "::error::Журнал не принял батч из 5 попыток — задача не может считаться завершённой" >&2
+  return 1
 }
 
 JOB_ENDED=0
-# Единственная точка, где задача получает финальный статус; trap доводит дело до
-# конца при любом выходе, повторная доставка не двоит журнал (UNIQUE task_id+seq).
+# Единственная точка финального статуса. job_end уходит ТОЛЬКО после того, как
+# батч принят журналом: зелёный job с непринятым job_end — тот же silent-wrong.
 post_job_end() { # result
   add_event "job_end" "{\"result\":\"$1\"}"
-  flush_events || true
+  flush_events
   JOB_ENDED=1
 }
 
@@ -62,9 +82,14 @@ start_heartbeat() {
 }
 cleanup() {
   if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
-  if [ "$JOB_ENDED" -eq 0 ]; then post_job_end "fail"; fi
+  if [ "$JOB_ENDED" -eq 0 ]; then
+    add_event "agent_error" '{"stderr":"job завершён до финала (отмена/ошибка среды)"}'
+    post_job_end "fail" || true
+  fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT   # graceful-семантика dsh: SIGINT → 130
+trap 'exit 143' TERM
 
 # ── 1. Текст задачи и посев seq — из журнала, не из догадок (спека п.2) ───────────
 TASK_TEXT="${TASK_TEXT:-}"
@@ -107,18 +132,36 @@ export DEEPSEEK_API_KEY
 export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
 
-# ── 3. Установка DSH tarball'ами (npm install этих пакетов даёт 404) ──────────────
+# ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
 mkdir -p "$PKGS"
 cd "$PKGS"
 npm pack "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
+verify_integrity() { # file expected-integrity
+  local actual
+  actual="sha512-$(openssl dgst -sha512 -binary "$1" | openssl base64 -A)"
+  if [ "$actual" != "$2" ]; then
+    echo "::error::Integrity mismatch: $1 (ожидался $2, получен $actual)" >&2
+    return 1
+  fi
+}
+DSH_TGZ="deepseek-ai-dsh-$DSH_VERSION.tgz"
+HL_TGZ="deepseek-ai-dsh-headless-$DSH_HEADLESS_VERSION.tgz"
+[ -f "$DSH_TGZ" ] || DSH_TGZ=$(ls *dsh-$DSH_VERSION.tgz | head -1)
+[ -f "$HL_TGZ" ] || HL_TGZ=$(ls *dsh-headless-$DSH_HEADLESS_VERSION.tgz | head -1)
+verify_integrity "$DSH_TGZ" "$DSH_INTEGRITY"
+verify_integrity "$HL_TGZ" "$DSH_HEADLESS_INTEGRITY"
 npm install -g ./*.tgz
 command -v dsh >/dev/null
 dsh --version || true
-add_event "note" "{\"text\":\"DSH $DSH_VERSION установлен\"}"
+add_event "bootstrap" "$(jq -n \
+  --arg dsh "$DSH_VERSION" --arg hl "$DSH_HEADLESS_VERSION" \
+  --arg node "$(node --version)" \
+  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified"}')"
 flush_events
 
 # ── 4. Прогон: one-shot dsh-headless над этим репозиторием ────────────────────────
+# cwd ДО старта становится корнем воркспейса и после не меняется (контракт dsh).
 cd "${GITHUB_WORKSPACE:-$WORK}"
 touch "$START_MARK"
 DSH_START_TS=$(date -u +%s)
@@ -128,26 +171,28 @@ rc=$?
 set -e
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
 
-# ── 5. Журнал: ответ и ход сессии ──────────────────────────────────────────────────
-ANSWER=$(tail -c 60000 "$ANSWER_FILE")
+# ── 5. Журнал: ответ и улики ───────────────────────────────────────────────────────
+ANSWER=$(tail -c 60000 "$ANSWER_FILE" | redact)
 add_event "agent_answer" \
   "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
 
-# Ход сессии: dsh-headless персистит и флашит сессию на диск; раскладка профиля
-# до первого прогона не подтверждена — берём самый свежий файл, изменившийся
-# во время прогона, и честно пишем, если не нашли.
+# Отладочная хвостовая улика профиля: НЕ доказательство сессии (durable-улики —
+# слайс 2, родным плагином DSH). Читается только после смерти писателя.
 SESSION_FILE=$(find "$HOME/.dsh" "$HOME/.config/dsh" -type f -newer "$START_MARK" 2>/dev/null | sort | tail -1 || true)
 if [ -n "$SESSION_FILE" ]; then
-  EXCERPT=$(tail -c 16000 "$SESSION_FILE")
-  add_event "session_note" "$(jq -n --arg f "$SESSION_FILE" --arg x "$EXCERPT" '{file: $f, tail: $x}')"
+  EXCERPT=$(tail -c 16000 "$SESSION_FILE" | redact)
+  add_event "session_note" "$(jq -n --arg f "$SESSION_FILE" --arg x "$EXCERPT" \
+    '{level: "debug", note: "хвост файла — не durable-улика, слайс 2 заменит", file: $f, tail: $x}')"
 else
-  add_event "session_note" '{"text":"session-файл не найден — раскладку профиля уточнить по логам job"}'
+  add_event "session_note" '{level: "debug", note: "session-файл не найден — раскладку профиля уточнить по логам job"}'
 fi
 
 if [ "$rc" -eq 0 ]; then
+  # Ответ обязан дойти до журнала ДО ok: флаш под set -e — падение красит job.
+  flush_events
   post_job_end "ok"
 else
-  ERRTEXT=$(tail -c 8000 "$ERR_FILE")
+  ERRTEXT=$(tail -c 8000 "$ERR_FILE" | redact)
   add_event "agent_error" \
     "$(jq -n --arg t "$ERRTEXT" --argjson code "$rc" '{stderr: $t, exit_code: $code}')"
   flush_events
