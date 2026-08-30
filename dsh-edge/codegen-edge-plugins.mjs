@@ -49,7 +49,9 @@ function renderServerModule(plugins) {
   const lines = [MODULE_HEADER]
   const entries = []
   for (const plugin of plugins.filter(p => p.server)) {
-    const identifier = plugin.id.replace(/-/g, '_')
+    // p_-префикс: id формально легален как зарезервированное слово JS
+    // (class, default) — импорт с ним был бы SyntaxError на сборке.
+    const identifier = `p_${plugin.id.replace(/-/g, '_')}`
     lines.push(`import ${identifier} from '${plugin.package}'`)
     entries.push(`  { id: '${plugin.id}', plugin: ${identifier} },`)
   }

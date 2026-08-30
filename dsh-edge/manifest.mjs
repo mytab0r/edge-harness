@@ -11,7 +11,7 @@
 
 import { readFile } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const MANIFEST_VERSION = 1
 export const PLUGIN_SCOPE = '@edge-harness'
@@ -68,10 +68,50 @@ export function manifestDirectory() {
   return dirname(fileURLToPath(import.meta.url))
 }
 
+/** Пин апстрима из upstream.json — { repo, sha }. */
+export async function loadUpstream(repoDir) {
+  const upstream = JSON.parse(await readFile(join(repoDir, 'upstream.json'), 'utf8'))
+  if (typeof upstream?.repo !== 'string' || upstream.repo === '') {
+    throw new Error('dsh-edge/upstream.json: repo обязателен.')
+  }
+  if (!/^[0-9a-f]{40}$/.test(upstream.sha ?? '')) {
+    throw new Error('dsh-edge/upstream.json: sha обязан быть 40 hex-символами (полный SHA коммита).')
+  }
+  return upstream
+}
+
 function objectShape(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function failUnless(condition, message) {
   if (!condition) throw new Error(`dsh-edge/plugins.json: ${message}`)
+}
+
+// CLI-режим: единственная точка валидации для workflow до любых дорогих шагов.
+// Печатает проверенный состав манифеста и пин апстрима в stdout как JSON;
+// любая ошибка формы — ненулевой exit БЕЗ частичного вывода.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    const repoDir = manifestDirectory()
+    const manifest = await loadManifest(repoDir)
+    const upstream = await loadUpstream(repoDir)
+    process.stdout.write(`${JSON.stringify({
+      upstream,
+      count: manifest.plugins.length,
+      ids: manifest.plugins.map(p => p.id),
+      plugins: manifest.plugins.map(p => ({
+        id: p.id,
+        package: p.package,
+        release: p.source.release,
+        asset: p.source.asset,
+        sha256: p.source.sha256,
+        server: p.server,
+        client: p.client,
+      })),
+    }, null, 2)}\n`)
+  } catch (error) {
+    process.stderr.write(`::error::${error.message}\n`)
+    process.exit(1)
+  }
 }

@@ -51,12 +51,12 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
 
 Семь пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
 
-Уточнение 2026-08-30 (при реализации #80, пин `113a969`): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
+Уточнение при реализации #80 (пин `113a969` = release 0.7.1): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
 
 | Пакет | Что чинит |
 |---|---|
-| `dsh-api-gateway` | отложить конструкцию AbortController из глобального скоупа (Workers запрещают) — добавлен к списку 2026-08-30 |
-| `dsh-sandbox` | убрать `node:fs` realpathSync и `node:os` tmpdir (Workers не переживут) — добавлен к списку 2026-08-30 |
+| `dsh-api-gateway` | отложить конструкцию AbortController из глобального скоупа (Workers запрещают) — новый с момента списка из пяти |
+| `dsh-sandbox` | убрать `node:fs` realpathSync и `node:os` tmpdir (Workers не переживут) — новый с момента списка из пяти |
 | `dsh-llm` | версия пакета читалась через `node:module` path discovery — недоступно в бандле воркера |
 | `dsh-llm-deepseek` | пробросить слот `resolveFiles` в конструктор адаптера (DO-backed file store для Files API) |
 | `dsh-session-persistence` | bounded validated reads + отмена нематериализованной сессии при провале первой записи |
