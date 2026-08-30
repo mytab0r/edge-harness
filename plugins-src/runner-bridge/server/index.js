@@ -39,7 +39,7 @@ export default {
   apply(ctx) {
     ctx.effect(() => ctx.tools.register(defineRunnerTaskTool()), 'edge-plugins:runner-bridge runner_task tool')
     ctx.effect(() => ctx.tools.register(defineRunnerStatusTool()), 'edge-plugins:runner-bridge runner_status tool')
-    console.info('edge-plugin:runner-bridge installed (runner_task, runner_status tools registered)')
+    console.info(`edge-plugin:runner-bridge installed v${PLUGIN_VERSION} (runner_task, runner_status tools registered)`)
   },
 }
 
@@ -198,7 +198,7 @@ function defineRunnerTaskTool() {
             dispatched: true,
             issue: number,
             url,
-            message: `Задача #${number} создана: ${url}. Раннер поднялся — результат (PR или комментарий) `
+            message: `Задача #${number} создана: ${url}. Раннер запущен — результат (PR или комментарий) `
               + 'придёт в задачу. Скажи пользователю номер, ссылку и что работа идёт на раннере.',
           }
         }
