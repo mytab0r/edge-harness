@@ -259,14 +259,13 @@ jobs:
           {
             "name": "dsh-edge",
             "main": "worker.js",
-            "vars": {
-              // Потолок GLM: дефолт адаптера 256000 отвергается (max 131072)
-              "DEEPSEEK_MAX_OUTPUT_TOKENS": "131072"
-            },
+
             "compatibility_date": "2026-08-14",
             "compatibility_flags": ["nodejs_compat"],
             "no_bundle": true,
             "vars": {
+              // Потолок GLM: дефолт адаптера 256000 отвергается (max 131072)
+              "DEEPSEEK_MAX_OUTPUT_TOKENS": "131072",
               "GH_RUNNER_REPO": "mytab0r/edge-harness"
             },
             "assets": {
