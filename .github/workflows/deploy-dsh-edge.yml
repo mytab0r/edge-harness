@@ -102,22 +102,6 @@ jobs:
           # пропатченный бандл обязан остаться валидным JS — иначе воркер не поднимется
           node --check deploy/worker.js
 
-      # Морда и руки читают провайдера из ОДНОГО места правды — vars репозитория
-      # (DEEPSEEK_* — унаследованное имя, значение любой OpenAI-compat endpoint).
-      # Секреты воркера переживают деплой, put идемпотентен.
-      - name: Секреты провайдера морды
-        working-directory: /tmp/dsh-deploy/deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
-        run: |
-          [ -n "$DEEPSEEK_BASE_URL" ] || { echo "::error::vars.DEEPSEEK_BASE_URL не задан"; exit 1; }
-          [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
-          printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
-          printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
-
       - name: Конфиг воркера
         run: |
           cat > /tmp/dsh-deploy/deploy/wrangler.jsonc <<'WRANGLER'
@@ -144,6 +128,22 @@ jobs:
             "observability": { "enabled": true }
           }
           WRANGLER
+
+      # Морда и руки читают провайдера из ОДНОГО места правды — vars репозитория
+      # (DEEPSEEK_* — унаследованное имя, значение любой OpenAI-compat endpoint).
+      # Секреты воркера переживают деплой, put идемпотентен.
+      - name: Секреты провайдера морды
+        working-directory: /tmp/dsh-deploy/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: |
+          [ -n "$DEEPSEEK_BASE_URL" ] || { echo "::error::vars.DEEPSEEK_BASE_URL не задан"; exit 1; }
+          [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
+          printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
+          printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
 
       - name: Деплой
         working-directory: /tmp/dsh-deploy/deploy
