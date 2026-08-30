@@ -1,0 +1,89 @@
+# Кампания замера хвоста задержки «repository_dispatch → старт job'а» (задача #4).
+#
+# Два job'а, один файл:
+#   tick  (schedule/workflow_dispatch) — отправляет repository_dispatch с PAT и
+#         сторожит таймаут замера; PAT один на весь пишущий путь (диспатч, push
+#         CSV, PR): события от GITHUB_TOKEN проверки не зажигают — см.
+#         docs/research/21-github-actions.md;
+#   probe (repository_dispatch)       — сам измеряемый job'а: стартует максимально
+#         простым шагом (метрика фиксируется GitHub'ом в run_started_at ДО любого
+#         шага) и записывает свою строку в CSV на ветке данных.
+#
+# Файл обязан лежать на default branch — dispatch с ветки молча возвращает 204
+# без запуска; гвардия в scripts/measure/dispatch_tail.py это проверяет.
+# После финализации кампания отключает этот workflow сама (gh workflow enable —
+# вернуть). Расписание на публичном репозитории умирает после 60 дней тишины
+# (docs/research/21-github-actions.md) — кампания короче на порядки.
+#
+# Дизайн и метрика: docs/decisions/0005-dispatch-tail-campaign.md.
+name: dispatch-latency-probe
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  repository_dispatch:
+    types: [dispatch-latency-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read  # checkout; все записи (CSV, PR, комментарии) идут под PAT
+
+jobs:
+  tick:
+    if: github.event_name != 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Сериализуем только тики: измеряемый probe никогда не должен ждать за
+    # диспетчером — иначе измеряем очередь самого диспетчера, а не GitHub.
+    concurrency:
+      group: dispatch-latency-probe-tick
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Git-авторизация под PAT (push строк CSV)
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: gh auth setup-git
+      - name: Тик кампании
+        env:
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          # Без GH_TOKEN в env credential helper gh не авторизует push из
+          # dispatch-пути: timeout/dispatch_failed строки не записывались бы
+          # никогда, и кампания молча деградировала бы до «только ok».
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: python scripts/measure/dispatch_tail.py dispatch
+
+  probe:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Первый шаг намеренно тривиален и без checkout: run_started_at уже зафиксирован
+      # GitHub'ом к моменту его начала — содержимое шагов на метрику не влияет.
+      - name: Маркер старта
+        env:
+          PROBE_ID: ${{ github.event.client_payload.probe_id }}
+          SENT_AT_MS: ${{ github.event.client_payload.sent_at }}
+        run: echo "probe $PROBE_ID dispatched at $SENT_AT_MS"
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Git-авторизация под PAT (push строки CSV)
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: gh auth setup-git
+      - name: Запись замера
+        env:
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          PROBE_ID: ${{ github.event.client_payload.probe_id }}
+          SENT_AT_MS: ${{ github.event.client_payload.sent_at }}
+        run: python scripts/measure/dispatch_tail.py record

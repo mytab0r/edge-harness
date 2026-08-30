@@ -121,6 +121,16 @@ Job не получает graceful-сигнала «доработай»: он t
 
 Это самая частая потеря времени при отладке: workflow написан в feature-ветке, dispatch отправляется, API отвечает **204 No Content** — и ничего не происходит. Успешный HTTP-код здесь не является доказательством запуска (ровно тот случай, когда «шаг success» врёт). Проверять надо появление run'а, а не код ответа.
 
+### 🔴 События от `GITHUB_TOKEN`: что запускается, а что нет
+
+Дословно:
+
+> "When you use the repository's GITHUB_TOKEN to perform tasks, events triggered by the GITHUB_TOKEN, with the exception of `workflow_dispatch` and `repository_dispatch`, will not create a new workflow run."
+
+То есть push/PR/issue-события от `GITHUB_TOKEN` новых run'ов не создают (защита от рекурсии), а `workflow_dispatch` и `repository_dispatch` — исключение: диспатч сквозь `GITHUB_TOKEN` run запускает. Исключение для `workflow_dispatch` подтверждено живьём: оркестратор диспатчит `worker.yml` через `github.token` (scripts/orchestra/scheduler.py), и воркер-раны происходят. Для `repository_dispatch` через REST из job'а — **не подтверждено** живым прогоном.
+
+Практическое следствие всё равно одно: всё, что должно зажечь проверки (push ветки PR, создание PR, synchronize), делается под PAT (`GH_DISPATCH_TOKEN`) — иначе CI тихо не просыпается. Кампания замера задержки ([ADR 0005](../decisions/0005-dispatch-tail-campaign.md)) использует PAT на всём пути — и для диспатча в том числе, чтобы не зависеть от непроверенного исключения. В связке с ловушкой default-branch выше: «диспатч ушёл, run'а нет» — проверять обе причины: файл на main и токен-источник события.
+
 ### Задержка старта — не документирована
 
 **SLA или типичной latency между dispatch и стартом job'а в документации нет вообще.** Ни целевого значения, ни «обычно N секунд». Косвенный сигнал того, что задержки бывают заметные, — признание про расписание:
