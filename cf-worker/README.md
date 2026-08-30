@@ -15,8 +15,17 @@
 (`test/api-contract.spec.ts`, `scripts/canary-ui.mjs`). Правила контракта —
 [ADR 0004](../docs/decisions/0004-api-contract.md).
 
-Все `/api/*` требуют `Authorization: Bearer <HANDS_TOKEN>` (WebSocket — `?token=` в query,
-потому что браузерный WS заголовки ставить не может).
+Авторизация `/api/*` — двумя равноправными способами, токен в URL не ходит:
+
+- **браузер**: `POST /api/session` обменивает `Authorization: Bearer <HANDS_TOKEN>` на
+  подписанную сессионную куку `harness_session` (HMAC от `SESSION_SECRET`, HttpOnly,
+  SameSite=Strict, Secure, TTL — `SESSION.ttlMs` в `src/config.ts`); дальше все запросы,
+  включая WebSocket, авторизуются кукой автоматически. `DELETE /api/session` — выход;
+- **job** (`scripts/hands`): `Authorization: Bearer <HANDS_TOKEN>` как раньше.
+
+Запрос с `?token=` отклоняется кодом 400 `query_token_removed` (по образцу dsh-edge,
+[`docs/research/11-dsh-edge.md`](../docs/research/11-dsh-edge.md): обмен секрета на
+подписанную куку — токен не должен попадать в логи CF и историю браузера).
 
 | Маршрут | Что делает |
 |---|---|
@@ -27,7 +36,7 @@
 ```bash
 cd cf-worker
 npm ci
-cp .dev.vars.example .dev.vars   # HANDS_TOKEN=dev-token
+cp .dev.vars.example .dev.vars   # HANDS_TOKEN=dev-token, SESSION_SECRET=dev-session-secret
 npm run types                    # после изменений в wrangler.jsonc
 npm test                         # vitest на настоящем workerd
 npm run dev -- --port 8808       # 8787 бывает в запрещённом диапазоне Windows
@@ -42,9 +51,11 @@ Smoke — то, что vitest-петля проверить не может: д�
 Автоматический — `.github/workflows/deploy-worker.yml` при изменениях в `cf-worker/**`
 на main. Требует секретов репозитория `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`.
 
-Секреты воркера (`HANDS_TOKEN`, `GH_DISPATCH_TOKEN`) деплой-воркфлоу переустанавливает
-сам при каждом деплое из одноимённых секретов репозитория — вручную после деплоя их
-ставить не нужно (воркер мог быть удалён из CF вместе с секретами, шаг идемпотентен).
+Секреты воркера (`HANDS_TOKEN`, `GH_DISPATCH_TOKEN`, `SESSION_SECRET`) деплой-воркфлоу
+переустанавливает сам при каждом деплое из одноимённых секретов репозитория — вручную
+после деплоя их ставить не нужно (воркер мог быть удалён из CF вместе с секретами, шаг
+идемпотентен). `SESSION_SECRET` — ключ подписи сессионной куки: вращение разлогинивает
+все открытые сессии браузеров.
 
 Плюс переменная репозитория `vars.HARNESS_URL` = публичный URL воркера (для `hands.yml`).
 

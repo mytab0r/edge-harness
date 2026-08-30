@@ -76,9 +76,9 @@ for (const file of readdirSync(i18nDir).filter((name) => name.endsWith(".js"))) 
   }
 }
 
-// 5. Документация API не устарела
+// 5. Производные спеки не устарели (docs/api.md и серверный снимок src/api-spec.ts)
 execSync("node scripts/generate-api-docs.mjs", { cwd: root, stdio: "pipe" });
-const gitDiff = execSync("git diff --stat -- docs/api.md", { cwd: root }).toString().trim();
-if (gitDiff) fail("docs/api.md устарел — запусти npm run docs и закоммить");
+const generatedDiff = execSync("git diff --stat -- docs/api.md src/api-spec.ts", { cwd: root }).toString().trim();
+if (generatedDiff) fail("docs/api.md или src/api-spec.ts устарел — запусти npm run docs и закоммить");
 
 console.log(`check-frontend-contract: OK (${Object.keys(specTable).length} маршрутов, ${usedKeys.length} ключей локализации)`);

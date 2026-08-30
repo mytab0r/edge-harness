@@ -24,6 +24,16 @@ export const LIMITS = {
   staleDispatchMs: 30 * 60_000,
 } as const;
 
+/** Сессия браузера: подписанная кука вместо долгоживущего HANDS_TOKEN в query/JS
+ *  (по образцу dsh-edge, docs/research/11: обмен секрета на подписанную куку). */
+export const SESSION = {
+  /** Имя куки. HttpOnly — JS её не читает, Secure — только по https (localhost
+   *  браузеры считают trustworthy и принимают Secure-куку по http). */
+  cookieName: "harness_session",
+  /** TTL сессии браузера. dsh-edge держит 30 дней — тот же порядок. */
+  ttlMs: 30 * 24 * 60 * 60 * 1000,
+} as const;
+
 export const HEARTBEAT = {
   /** Пульс оркестрации: DO сам дёргает workflow_dispatch оркестратора через alarm.
    * GitHub'овский cron на репо не тикает (0 schedule-запусков за 4 часа — измерено),

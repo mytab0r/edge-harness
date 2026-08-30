@@ -1,3 +1,5 @@
+// СГЕНЕРИРОВАНО из api-spec.json командой `npm run docs`. Руками не править:
+// источник правды по маршрутам — api-spec.json, этот файл — его типизированный снимок.
 const spec = {
   "$comment": "Единственное место правды по API: роутинг сервера, клиентская таблица, документация и проверки строятся отсюда. Путь как строка живёт только здесь и в public/assets/config.js (паритет охраняет scripts/check-frontend-contract.mjs). name — ключ, по которому клиент и тесты ссылаются на маршрут.",
   "prefix": "/api",
@@ -58,6 +60,16 @@ const spec = {
       ],
       "auth": true,
       "summary": "Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms."
+    },
+    {
+      "name": "session",
+      "path": "/api/session",
+      "methods": [
+        "POST",
+        "DELETE"
+      ],
+      "auth": true,
+      "summary": "Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed."
     }
   ]
 };
@@ -69,7 +81,7 @@ const spec = {
 export interface ApiRoute {
   name: string;
   path: string;
-  methods: ("GET" | "POST")[];
+  methods: ("GET" | "POST" | "DELETE")[];
   auth: boolean;
   /** path — префикс маршрута; остаток пути — параметр (например, id задачи). */
   rest?: boolean;
@@ -89,13 +101,13 @@ export const ROUTES: Record<string, string> = Object.fromEntries(
 export function matchRoute(method: string, pathname: string): { route: ApiRoute; rest: string } | null {
   for (const route of API_SPEC) {
     if (route.rest) continue;
-    if (route.methods.includes(method as "GET" | "POST") && route.path === pathname) {
+    if (route.methods.includes(method as "GET" | "POST" | "DELETE") && route.path === pathname) {
       return { route, rest: "" };
     }
   }
   for (const route of API_SPEC) {
     if (!route.rest) continue;
-    if (route.methods.includes(method as "GET" | "POST") && pathname.startsWith(route.path)) {
+    if (route.methods.includes(method as "GET" | "POST" | "DELETE") && pathname.startsWith(route.path)) {
       return { route, rest: decodeURIComponent(pathname.slice(route.path.length)) };
     }
   }

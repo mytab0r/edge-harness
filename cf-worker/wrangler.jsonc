@@ -35,6 +35,9 @@
   }
   // Секреты (в конфиге не живут; переустанавливаются при каждом деплое
   // workflow'ом deploy-worker из секретов репозитория):
-  //   HANDS_TOKEN        — разделяемый секрет: браузер и job → POST/GET /api/*
+  //   HANDS_TOKEN        — разделяемый секрет: job ходит Bearer'ом, браузер обменивает
+  //                        его на сессионную куку (POST /api/session); в URL не ходит
   //   GH_DISPATCH_TOKEN  — GitHub PAT с Contents:write, DO дёргает repository_dispatch
+  //   SESSION_SECRET     — HMAC-ключ подписи сессионной куки браузера (issue #5);
+  //                        вращение мгновенно разлогинивает все открытые сессии
 }

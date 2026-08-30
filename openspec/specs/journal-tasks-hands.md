@@ -53,6 +53,25 @@
 14.3. Порог объявлен один раз в `src/config.ts`; требование протестировано
 состариванием задачи через SQL DO (`runInDurableObject`).
 
+## Аутентификация
+
+19. Браузер входит обменом: `POST /api/session` с `Authorization: Bearer <HANDS_TOKEN>`
+    отвечает подписанной сессионной кукой `harness_session` (HMAC-SHA256 от
+    `SESSION_SECRET` над сроком жизни; HttpOnly, SameSite=Strict, Secure; TTL —
+    `SESSION.ttlMs` в `src/config.ts`, единственное место правды). Сам HANDS_TOKEN
+    в браузере не хранится и повторно не передаётся (образец — dsh-edge,
+    `docs/research/11-dsh-edge.md`). `DELETE /api/session` сбрасывает куку
+    (Max-Age=0); у HttpOnly-куки это умеет делать только сервер.
+20. Запросы к `/api/*` авторизуются либо сессионной кукой (браузер, включая
+    WebSocket — кука уходит с апгрейдом сама), либо `Authorization: Bearer`
+    (job, `scripts/hands`). Ни один запрос к `/api/*` не несёт токен в URL.
+21. Запрос с `?token=` отклоняется громко: 400 `query_token_removed`, даже если
+    значение совпадает с HANDS_TOKEN — класс «токен в URL → логи CF и история
+    браузера» закрыт целиком, а не только для WS.
+22. Отсутствующая, протухшая или подделанная кука без валидного Bearer — 401
+    `unauthorized`. Без `SESSION_SECRET` обмен отвечает 500
+    `session_secret_missing` («возможности нет» отличается от «сломана»).
+
 ## Конвейер (оркестратор)
 
 15. PR сливается только при: зелёные обязательные проверки, метка

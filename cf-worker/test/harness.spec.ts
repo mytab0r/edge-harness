@@ -64,6 +64,105 @@ describe("аутентификация", () => {
     const body = await res.json<{ error: { code: string } }>();
     expect(body.error.code).toBe("not_found");
   });
+
+  it("токен в query отклоняется громко (400 query_token_removed), даже совпадающий по значению", async () => {
+    const res = await WORKER.fetch("https://example.com/api/status?token=test-token", { headers: AUTH });
+    expect(res.status).toBe(400);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("query_token_removed");
+    // И у WebSocket — класс «токен в URL/логах/истории браузера» закрыт везде.
+    const wsRes = await WORKER.fetch("https://example.com/api/events.live?token=test-token", {
+      headers: { ...AUTH, Upgrade: "websocket" },
+    });
+    expect(wsRes.status).toBe(400);
+    expect((await wsRes.json<{ error: { code: string } }>()).error.code).toBe("query_token_removed");
+  });
+});
+
+describe("сессия браузера: обмен токена на куку", () => {
+  // Секрет — тот же, что вшит в vitest.config.ts (bindings.miniflare).
+  const SECRET = "test-session-secret";
+  const encoder = new TextEncoder();
+
+  async function hmac(payload: string): Promise<string> {
+    const key = await crypto.subtle.importKey("raw", encoder.encode(SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
+    return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function login(): Promise<Response> {
+    return WORKER.fetch("https://example.com/api/session", { method: "POST", headers: AUTH });
+  }
+
+  function cookiePairOf(res: Response): string {
+    return (res.headers.get("set-cookie") ?? "").split(";")[0];
+  }
+
+  it("обмен Bearer-токена на куку: HttpOnly, SameSite=Strict, Secure, TTL около 30 дней", async () => {
+    const res = await login();
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(cookiePairOf(res).startsWith("harness_session=")).toBe(true);
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Strict");
+    expect(setCookie).toContain("Secure");
+    const maxAge = Number(setCookie.match(/Max-Age=(\d+)/)?.[1]);
+    expect(maxAge).toBeGreaterThan(29 * 24 * 3600);
+    const body = await res.json<{ ok: boolean; expires_at: number }>();
+    expect(body.ok).toBe(true);
+    expect(body.expires_at).toBeGreaterThan(Date.now());
+  });
+
+  it("обмен с чужим токеном — 401", async () => {
+    const res = await WORKER.fetch("https://example.com/api/session", {
+      method: "POST",
+      headers: { Authorization: "Bearer wrong" },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("кукой можно ходить в API и открывать WebSocket без Bearer и без токена в URL", async () => {
+    const cookie = cookiePairOf(await login());
+    const status = await WORKER.fetch("https://example.com/api/status", { headers: { Cookie: cookie } });
+    expect(status.status).toBe(200);
+
+    const wsRes = await WORKER.fetch("https://example.com/api/events.live?after=0", {
+      headers: { Cookie: cookie, Upgrade: "websocket" },
+    });
+    expect(wsRes.status).toBe(101);
+    wsRes.webSocket!.accept();
+    wsRes.webSocket!.close();
+  });
+
+  it("поддельная подпись — 401", async () => {
+    const payload = `v1:${Math.floor(Date.now() / 1000) + 3600}`;
+    const value = `${payload}.${"0".repeat(64)}`;
+    const res = await WORKER.fetch("https://example.com/api/status", {
+      headers: { Cookie: `harness_session=${value}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("протухшая, но честно подписанная кука — 401", async () => {
+    const payload = `v1:${Math.floor(Date.now() / 1000) - 10}`;
+    const value = `${payload}.${await hmac(payload)}`;
+    const res = await WORKER.fetch("https://example.com/api/status", {
+      headers: { Cookie: `harness_session=${value}` },
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+  });
+
+  it("DELETE /api/session отвечает кукой с Max-Age=0 — браузер её выбрасывает", async () => {
+    const cookie = cookiePairOf(await login());
+    const del = await WORKER.fetch("https://example.com/api/session", { method: "DELETE", headers: { Cookie: cookie } });
+    expect(del.status).toBe(200);
+    const setCookie = (del.headers.get("set-cookie") ?? "").split(";").map((part) => part.trim().toLowerCase());
+    expect(setCookie).toContain("max-age=0");
+    // Кука stateless (подпись без серверного списка сессий — принятая плата,
+    // openspec/changes/session-cookie-auth): отзыв на сервере = вращение
+    // SESSION_SECRET. Выбрасывает куку именно браузер, получив Max-Age=0.
+  });
 });
 
 describe("журнал: приём батчей", () => {
