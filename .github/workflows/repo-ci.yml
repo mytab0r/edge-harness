@@ -27,6 +27,13 @@ jobs:
       - name: Python-скрипты компилируются
         run: python -m compileall -q scripts
 
+      # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
+      # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
+      - name: Тесты кампании dispatch-tail
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_dispatch_tail.py -q
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24

@@ -63,10 +63,16 @@ Smoke — то, что vitest-петля проверить не может: д�
 честно отвечает `dispatch: "not_configured"` — «возможности нет» должно отличаться
 от «возможность сломана».
 
-## Замеры (задача 5 walking-skeleton)
+## Замеры
 
-```bash
-HARNESS_URL=https://… HANDS_TOKEN=… python scripts/measure/dispatch_latency.py --n 20
-```
-
-Результаты идут в `docs/research/99-open-questions.md`.
+Скрипт разового замера «dispatch → первый heartbeat» (задача 5 walking-skeleton)
+удалён cleanup'ом 09ef969 вместе с каркасом: метрика считалась по часам DO, а
+текущие «руки» слайса dsh-in-job шлют первый heartbeat после минутного
+бутстрапа — она перестала измерять очередь GitHub. Хвост распределения снимает
+автономная кампания `repository_dispatch → старт job'а` по серверным таймстампам
+GitHub: [.github/workflows/dispatch-latency-probe.yml](../.github/workflows/dispatch-latency-probe.yml)
++ [scripts/measure/dispatch_tail.py](../scripts/measure/dispatch_tail.py),
+обоснование — [ADR 0005](../docs/decisions/0005-dispatch-tail-campaign.md).
+Результаты идут в `docs/research/99-open-questions.md`, сырые данные —
+`docs/research/data/dispatch-latency-tail.csv` (ветка `data/dispatch-latency-tail`
+до финального мержа).
