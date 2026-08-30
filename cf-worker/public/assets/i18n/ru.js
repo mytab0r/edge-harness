@@ -4,7 +4,7 @@ window.EDGE_I18N = {
   ru: {
     "app.title": "edge-harness",
     "gate.title": "edge-harness",
-    "gate.hint": "Доступ закрыт разделяемым секретом. Введи HANDS_TOKEN — он сохранится только в этом браузере.",
+    "gate.hint": "Доступ закрыт разделяемым секретом. Введи HANDS_TOKEN — сервер обменяет его на сессионную куку (30 дней); сам токен нигде не сохраняется.",
     "gate.token_placeholder": "HANDS_TOKEN",
     "gate.show": "показать",
     "gate.enter": "Войти",

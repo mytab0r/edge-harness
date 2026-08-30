@@ -1,7 +1,10 @@
 /* edge-harness: клиент морды. Живёт на статике Workers Assets, говорит с Durable Object
    через /api. Пути берутся ТОЛЬКО ключами из window.EDGE_CONFIG.routes (таблица хранит
    полные пути, ничего не склеивается — класс ошибки «двойной префикс» невозможен):
-   неизвестный ключ — громкое исключение, а не тихий запрос в никуда. */
+   неизвестный ключ — громкое исключение, а не тихий запрос в никуда.
+   Вход: HANDS_TOKEN вводится один раз в гейте, сервер обменяет его на подписанную
+   HttpOnly-куку (POST /api/session). Токен не хранится нигде в браузере и не ходит
+   в URL — все запросы, включая WebSocket, авторизуются кукой автоматически. */
 
 "use strict";
 
@@ -25,9 +28,7 @@ const routeQ = (name, params = {}) => {
 };
 
 const $ = (id) => document.getElementById(id);
-const TOKEN_KEY = "edge-harness-token";
 
-let token = localStorage.getItem(TOKEN_KEY) || "";
 let lastEventId = 0; // курсор журнала: и для replay, и для after у WebSocket
 let socket = null;
 let socketRecycleTimer = null;
@@ -38,7 +39,6 @@ const api = (path, options = {}) =>
     ...options,
     headers: {
       ...(options.body ? { "content-type": "application/json" } : {}),
-      Authorization: `Bearer ${token}`,
       ...options.headers,
     },
   });
@@ -49,6 +49,10 @@ async function apiJson(path, options) {
   if (!res.ok) {
     const message = body?.error?.message || `HTTP ${res.status}`;
     $("tasks").textContent = t("task.error", { detail: message });
+    if (res.status === 401) {
+      // Сессия кончилась (или её не было): сокет молча переподключаться не должен.
+      showGate(t("gate.error_http", { status: 401 }));
+    }
     const error = new Error(message);
     error.status = res.status;
     throw error;
@@ -129,8 +133,9 @@ function connectWebSocket() {
   stopSocketTimers();
   $("conn").textContent = t("conn.connecting");
 
+  // Кука уходит с апгрейдом сама (same-origin), заголовки браузерному WS не нужны.
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}${routeQ("eventsLive", { after: lastEventId, token })}`);
+  const ws = new WebSocket(`${proto}//${location.host}${routeQ("eventsLive", { after: lastEventId })}`);
   socket = ws;
 
   ws.onopen = () => {
@@ -153,7 +158,7 @@ function connectWebSocket() {
     stopSocketTimers();
     if (event.code === 1008) {
       // Единственный смысл 1008 на этом сокете — попытка ПИСАТЬ в downlink-only канал.
-      // Как признак плохого токена он не трактуется: токен проверяет HTTP-вход.
+      // Как признак плохого входа он не трактуется: вход проверяет HTTP-запрос.
       showGate(t("gate.error_socket_write"));
       return;
     }
@@ -179,13 +184,13 @@ async function submitTask() {
     $("payload").value = "";
   } catch (error) {
     if (error instanceof SyntaxError) $("tasks").textContent = t("task.error_bad_json");
-    else if (error.status) $("tasks").textContent = t("task.error_http", { status: error.status });
+    else if (error.status && error.status !== 401) $("tasks").textContent = t("task.error_http", { status: error.status });
   } finally {
     button.disabled = false;
   }
 }
 
-// ── Токен ─────────────────────────────────────────────────────────────────────────
+// ── Вход и сессия ─────────────────────────────────────────────────────────────────
 
 // Вставленный из терминала токен часто несёт невидимые символы — срезаем их все.
 function cleanToken(raw) {
@@ -200,45 +205,62 @@ function showGate(message) {
   $("gate-token").focus();
 }
 
+// Обмен HANDS_TOKEN на сессионную куку. Токен живёт ровно один запрос —
+// ни localStorage, ни переменная, ни URL его не хранят.
+async function login() {
+  const raw = cleanToken($("gate-token").value);
+  if (!raw) { $("gate-error").textContent = t("gate.error_empty"); return; }
+  $("gate").hidden = true;
+  $("gate-error").textContent = "";
+  $("gate-token").value = "";
+  try {
+    const res = await api(route("session"), { method: "POST", headers: { Authorization: `Bearer ${raw}` } });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const error = new Error(body?.error?.message || `HTTP ${res.status}`);
+      error.status = res.status;
+      throw error;
+    }
+  } catch (error) {
+    // Любая неудача входа — громко и на гейте: тихая пустая страница хуже падения.
+    if (error.status) showGate(t("gate.error_http", { status: error.status }));
+    else showGate(t("gate.error_network", { detail: error.message }));
+    return;
+  }
+  await start();
+}
+
 async function start() {
   $("gate").hidden = true;
-  localStorage.setItem(TOKEN_KEY, token);
   try {
     const status = await apiJson(routeQ("status"));
     renderStatus(status);
     await replay();
     connectWebSocket();
   } catch (error) {
-    // Любая неудача входа — громко и на гейте: тихая пустая страница хуже падения.
-    if (error.status === 401) {
-      localStorage.removeItem(TOKEN_KEY);
-      showGate(t("gate.error_http", { status: 401 }));
-    } else if (error.status) {
-      showGate(t("gate.error_http", { status: error.status }));
-    } else {
-      showGate(t("gate.error_network", { detail: error.message }));
-    }
+    if (!error.status) showGate(t("gate.error_network", { detail: error.message }));
+    // 401 уже показал гейт apiJson; прочие HTTP-коды видны в панели задач.
   }
 }
 
-$("gate-enter").addEventListener("click", () => {
-  token = cleanToken($("gate-token").value);
-  if (!token) { $("gate-error").textContent = t("gate.error_empty"); return; }
-  start();
-});
+$("gate-enter").addEventListener("click", login);
 $("gate-token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("gate-enter").click(); });
 $("gate-show").addEventListener("change", (e) => {
   $("gate-token").type = e.target.checked ? "text" : "password";
 });
 $("submit").addEventListener("click", submitTask);
-$("forget").addEventListener("click", () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
+$("forget").addEventListener("click", async () => {
+  try {
+    await apiJson(route("session"), { method: "DELETE" }); // куку снимает только сервер
+  } catch (error) {
+    if (error.status !== 401) {
+      // Громко: сброс не прошёл — сессия, возможно, ещё жива, перезагрузка солгала бы выход.
+      $("tasks").textContent = t("task.error", { detail: error.message });
+      return;
+    }
+  }
+  location.reload();
+});
 
-// Токен можно передать адресной строкой (?token=…): для владельца, со страницы логов.
-// Из истории браузера параметр сразу убирается.
-const urlToken = new URLSearchParams(location.search).get("token");
-if (urlToken) {
-  history.replaceState(null, "", location.pathname);
-  token = cleanToken(urlToken);
-}
-
-if (!token) showGate(""); else start();
+// Стартуем всегда: живая кука открывает морду, её отсутствие даёт 401 и гейт.
+start();
