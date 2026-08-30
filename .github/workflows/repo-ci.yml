@@ -44,6 +44,12 @@ jobs:
       - name: Юнит-тесты плагина dsh-hands-streamer
         run: node --test scripts/dsh-hands-streamer/test/streamer.test.mjs
 
+      # Сборка и поведение клиентского плагина plugin-manager (#102):
+      # build.mjs (валидация манифеста, seed-require, обёртка бандла) + рендер
+      # секции на прод-форме ответа журнала.
+      - name: Юнит-тесты плагина plugin-manager
+        run: node --test plugins-src/plugin-manager/test/client.test.mjs
+
       # Синтаксис клиента рук: bash -n ловит поломку до ревью.
       - name: Bash-скрипты валидны
         run: |

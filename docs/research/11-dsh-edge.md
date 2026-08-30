@@ -116,6 +116,20 @@ const backend = this.env.LOADER === undefined
 
 Уточнение 2026-08-29 (перепроверка при [белом пятне #43](https://github.com/mytab0r/edge-harness/issues/43)): ростер клиентских плагинов строится не из скана манифестов, а из **явного списка имён** в upstream-патчах — `assemble-standalone-web.mjs` читает `cordis.patch.yml` из опубликованных `@deepseek-ai/dsh-base` и `@deepseek-ai/dsh-web-app` (`deploymentPatches`, строки 25-28) и берёт оттуда строки `name:`. Пакет с `dsh.client`-декларацией, просто установленный в `standalone/node_modules`, в ростер не попадает.
 
+## Клиентская модульная система: boot, ModuleLoader, seed
+
+Снято с артефактов 0.7.1 (npm-префаб `dsh-edge-0.7.1.tgz` + продовый бандл `dsh-edge-client-ui`) 2026-08-30 при #102 — это контракт, на котором держится рукописный клиентский плагин (`plugins-src/plugin-manager`):
+
+- **Boot-граф** — `globalThis["__DSH_BOOT__"] = {rev, entries}` прямо в `index.html`. Запись: `{id: "<имя пакета>", url: "/plugins/<имя пакета>/client.js?rev=<sha1-12>", rev, inject?: string[], immediately?: bool}`. Каталог в `dist/plugins/` — имя пакета ЦЕЛИКОМ, со скоупом (`@edge-harness/...` — валидный путь).
+- **Бандл копируется дословно**: assemble берёт файл из `exports['./client']` (строка или `.default`) и кладёт в dist без пересборки. Значит, клиентский бандл обязан быть самодостаточным: всё, что не из перечисленного ниже, — throw при материализации.
+- **Ленивый CJS**: исполнение скрипта только регистрирует фабрику — `window.__ModuleLoader__.load({id: "<имя пакета>", factory: (require) => {…; return module.exports}})`; тело выполняется при первом require (материализация memoized). `require("<pkg>/client")` и `require("<pkg>")` — один модуль (`stripClientSuffix`).
+- **Seed-карта шелла** (`staticModules` в boot-скрипте `dsh-web-frontend`): `react`, `react/jsx-runtime`, `react-dom`, `react-dom/client`, `@deepseek-ai/cordis`, `@deepseek-ai/dsh-client-ui-slots`, `@deepseek-ai/dsh-client-ui-primitives` — доступны ЛЮБОМУ бандлу ростера без деклараций. Из примитивов экспортируются `Button`, `StateDot`, `Pill`, иконки, `writeClipboard` и пр.
+- **Разрешение require**: seed → memoized → строка графа (загрузить фабрики зависимостей, потом свою) → зарегистрированная фабрика → иначе throw. Порядок графа строит `orderByModuleGraph` по `inject`-записям, а assemble валидирует: inject из boot-записи обязан быть в ростере или в `shellStaticPackages` (только `dsh-client-ui-primitives`) — иначе сборка красная.
+- **Два разных `inject`**: `dsh.client.inject` в package.json — модули, загружаемые ДО пакета (сервисы готовы к `apply`); `exports.inject` из бандла — имена СЕРВИСОВ ctx (кордис-сервисы). Сервис `slots` ставит клиентский плагин `dsh-client-runtime`, `locale` — `dsh-client-locale`.
+- **Слот `settings.section`** — списочный, объявлен клиентским плагином `dsh-client-ui-settings-general`; навигация настроек читает `ctx.slots.entries("settings.section")` (нужны `id`, `order`, `label`), рендерит только активную секцию и передаёт ей `{close}` + `t` (переводчик ns из поля `locale` декларации) + inject-face. Образец монтажа — `ui-edge`: `ctx.slots.inject("settings.section", () => ctx.slots.register({name, id, order, label, locale}, Component))`.
+- **StateDot**: состояния `done`/`failed`/`error`/`warning` (CSS по `data-state`) и особый `ongoing` (анимированная матрица).
+- **`locale.register(ns, {<locale>: dict})`** не валидирует имена локалей — ключ словаря любой; каталог Language row ограничен en/zh.
+
 ## Подключение сторонних плагинов: механизма нет
 
 Следствие из устройства сборки (проверено по исходникам 2026-08-29):
