@@ -251,6 +251,67 @@ jobs:
           # пропатченный бандл обязан остаться валидным JS
           node --check worker.js
 
+      # Бренд морды (#101): видимый бренд «DeepSeek Harness» заменяется на
+      # «mytab0r Harness» везде, где его видит человек. Носители: worker.js
+      # (баннер агента «…running in a Cloudflare Durable Object.», системный
+      # промпт, description пакета) и текстовые файлы dist (index.html <title>,
+      # manifest.webmanifest name, видимые строки плагинов). Заменяется ТОЛЬКО
+      # точная строка с пробелом: в JS-идентификаторах она встречаться не может,
+      # поэтому deepseek-official, @deepseek-ai/*, deepseek-v4, /api/* и имена
+      # файлов гарантированно не задеты. Гвардии: до замены — суммарное число
+      # вхождений обязано быть > 0, иначе upstream сменил брендовые строки
+      # (громкое падение, а не молча-нераспознанная морда); после — ни одного
+      # вхождения «DeepSeek Harness» в worker.js и dist (побайтовый grep, включая
+      # файлы, не декодировавшиеся как UTF-8), а число «mytab0r Harness» обязано
+      # сойтись с числом замен. Шаг стоит на общей части обоих путей сборки,
+      # после патча каталога (тот брендовых строк не трогает). Форма проверена
+      # на артефакте dsh-edge 0.7.1 (пин из dsh-edge/upstream.json) и на живом
+      # проде: 16 вхождений, все — внутри человекочитаемых литералов.
+      - name: Бренд морды (DeepSeek Harness → mytab0r Harness)
+        working-directory: ${{ github.workspace }}/deploy
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          OLD, NEW = "DeepSeek Harness", "mytab0r Harness"
+          paths = ["worker.js"]
+          for root, _dirs, files in os.walk("dist"):
+              for name in files:
+                  paths.append(os.path.join(root, name))
+          per_file = {}
+          total = 0
+          for path in paths:
+              data = open(path, "rb").read()
+              try:
+                  src = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue  # бинарный ассет (шрифты) — текстовых замен там нет
+              n = src.count(OLD)
+              if not n:
+                  continue
+              # побайтовая запись: BOM и CRLF сохраняются, меняется только литерал
+              open(path, "wb").write(src.replace(OLD, NEW).encode("utf-8"))
+              per_file[path] = n
+              total += n
+          if total == 0:
+              sys.exit("::error::«DeepSeek Harness» не найден ни в worker.js, ни в dist — upstream сменил брендовые строки, патчить нечего")
+          for path, n in sorted(per_file.items()):
+              print(f"  {path}: {n}")
+          # каждый заменённый литерал обязан встать на место
+          rebranded = sum(open(p, "rb").read().count(NEW.encode()) for p in paths)
+          if rebranded != total:
+              sys.exit(f"::error::Замена не сошлась: заменено {total}, «{NEW}» в дереве {rebranded}")
+          print(f"Бренд морды: {total} вхождений «{OLD}» → «{NEW}»")
+          PY
+          # Гвардия: ни одного вхождения не осталось — побайтово, по всему
+          # deploy-дереву (worker.js + dist), включая бинарные файлы.
+          if grep -rqF "DeepSeek Harness" worker.js dist; then
+            echo "::error::После бренд-патча остались вхождения «DeepSeek Harness»:"
+            grep -rlF "DeepSeek Harness" worker.js dist
+            exit 1
+          fi
+          # пропатченный бандл обязан остаться валидным JS
+          node --check worker.js
+
       # ── Общая часть: конфиг, секреты провайдера, деплой, канарейка ─────────────
 
       - name: Конфиг воркера
