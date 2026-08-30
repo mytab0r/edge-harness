@@ -24,15 +24,20 @@
 ```bash
 cd plugins-src/hello-world
 node --check server/index.js && node --check client/client.js   # синтаксис
-npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.0.tgz
-sha256sum edge-harness-dsh-plugin-hello-0.1.0.tgz
+npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.1.tgz
+sha256sum edge-harness-dsh-plugin-hello-0.1.1.tgz
 ```
 
-Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.0` и
-asset'ом `hello-world-0.1.0.tgz` (то же содержимое, имя asset'а фиксирует
+Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.1` и
+asset'ом `hello-world-0.1.1.tgz` (то же содержимое, имя asset'а фиксирует
 манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
 merge = аппрув владельца.
 
 Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
 (инструмент объявляется апстримным `defineTool`); пин версии peer-зависимости
 переставляет `.pnpmfile.cjs` апстрима под свой `dshEdge.upstreamVersion`.
+
+Серверная половина объявляет `inject: ['tools']` — контракт cordis 4: чтение
+`ctx.<service>` в apply без объявления в `inject` бросает
+`cannot get property … without inject` (класс ошибки #100; ловит дым инсталла
+[`dsh-edge/smoke-edge-plugins.mjs`](../../dsh-edge/smoke-edge-plugins.mjs)).

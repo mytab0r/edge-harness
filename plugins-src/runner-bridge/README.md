@@ -37,14 +37,25 @@
 ```bash
 cd plugins-src/runner-bridge
 node --check server/index.js            # синтаксис
-npm pack                                # edge-harness-dsh-plugin-runner-bridge-0.1.0.tgz
-sha256sum edge-harness-dsh-plugin-runner-bridge-0.1.0.tgz
+npm pack                                # edge-harness-dsh-plugin-runner-bridge-0.1.1.tgz
+sha256sum edge-harness-dsh-plugin-runner-bridge-0.1.1.tgz
 ```
 
-Публикация: релиз **этого** репозитория с тегом `plugins-runner-v0.1.0` и
-asset'ом `runner-bridge-0.1.0.tgz` (то же содержимое, имя asset'а фиксирует
+Публикация: релиз **этого** репозитория с тегом `plugins-runner-v0.1.1` и
+asset'ом `runner-bridge-0.1.1.tgz` (то же содержимое, имя asset'а фиксирует
 манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
 merge = аппрув владельца.
 
 Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
 (инструменты объявляются апстримным `defineTool`).
+
+## Контракт cordis: inject
+
+Плагин объявляет `inject: ['tools']`: чтение `ctx.<service>` в apply без
+объявления сервиса в `inject` cordis 4 пресекает —
+`cannot get property "tools" without inject` (уплывало в #100: инсталл-цикл
+изолировал отказ в статус `failed`, сборка оставалась зелёной, тулов нет).
+Форма — как у апстримных плагинов (`dsh-tool-web` объявляет
+`['tools', 'web', 'systemPrompt']`). Нарушение контракта ловит дым инсталла
+[`dsh-edge/smoke-edge-plugins.mjs`](../../dsh-edge/smoke-edge-plugins.mjs) на
+каждой сборке морды.

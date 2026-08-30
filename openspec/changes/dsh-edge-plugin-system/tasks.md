@@ -139,6 +139,37 @@
       `runner_task`, задача создаётся, воркер поднимается; лёгкий запрос —
       без инструмента.
 
+## 6. #100: плагинные тулов нет в тулсете агента (фикс класса)
+
+- [x] Исследование первоисточника: точка композиции тулсета найдена — снапшота
+      нет, `ToolRuntime` регистрирует у `SystemPrompt` живой провайдер, тулсет
+      читается из реестра на каждой сборке хода; гипотеза тайминга опровергнута
+      (факты — design «Девиации» п.9).
+- [x] Настоящая причина: плагины объявляли `inject: []` и читали `ctx.tools` —
+      cordis 4 бросает `cannot get property "tools" without inject` в apply,
+      инсталл-цикл изолировал отказ в статус `failed` (зелёная сборка, пустой
+      тулсет). Фикс — в плагинах, там где контракт: `inject: ['tools']`
+      (plugins-src hello-world и runner-bridge, версия 0.1.1), не в патче 0002.
+- [x] Релизы `plugins-hello-v0.1.1` / `plugins-runner-v0.1.1` с asset'ами
+      `hello-world-0.1.1.tgz` / `runner-bridge-0.1.1.tgz`; sha256 скачанных с
+      релизов asset'ов сверены с локальными и перепинованы в
+      `dsh-edge/plugins.json`.
+- [x] Тест-гвардия класса: `dsh-edge/smoke-edge-plugins.mjs` — инсталл каждого
+      серверного плагина в настоящий cordis + ToolRuntime на сборке; шаг в
+      `deploy-dsh-edge.yml` после кодогенерации. Мутационное доказательство:
+      против 0.1.0 дым красный с той самой ошибкой apply, против 0.1.1 —
+      зелёный («hello» +1 тул, «runner-bridge» +2; тулсет:
+      plugin_hello, runner_status, runner_task).
+- [x] Полная репетиция CI-пути на свежем клоне: патчи → pnpm install →
+      pnpm add tgz (patchedDependencies целы) → кодоген → дым → build →
+      гвардия состава → verify-standalone/детерминизм. Все зелёные; в обоих
+      воркер-бандлах литералы `runner_task`, `runner_status`, `plugin_hello`,
+      состава и `inject:["tools"]` ×2; `node --check` бандлов зелёный.
+- [ ] Пост-мерж: деплой прошёл, в свежей сессии «перечисли инструменты»
+      содержит `runner_task` и `plugin_hello` (критерий #100), в DO storage
+      ключи `dsh-edge-plugins:*` в статусе `ready`; живой чат-тест
+      runner_task → issue + dispatch.
+
 ## Границы
 
 - Транспорт «исходник из чата в форж» и UI-поверхность статусов в dsh-edge —
