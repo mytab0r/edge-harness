@@ -91,10 +91,12 @@ jobs:
         run: npx wrangler deploy 2>&1 | tail -8
 
       # Деплой, не оставивший живую морду, — не деплой, а поломка. Проверяем код,
-      # а не шаг: 200 на корень обязателен.
+      # Деплой, не оставивший живую морду, — не деплой, а поломка. Корень для
+      # неавторизованных отвечает 302 на /login (проверено на проде), поэтому
+      # идём за редиректом и требуем 200 конечной страницы.
       - name: Канарейка прода
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
           if [ "$code" != "200" ]; then
             echo "::error::Морда отвечает $code после деплоя $VERSION_DEPLOYED"
             exit 1
