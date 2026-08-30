@@ -9,11 +9,14 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-const GREETING = 'Hello from the dsh-edge plugin system (hello-world v0.1.0, @edge-harness/dsh-plugin-hello).'
+const GREETING = 'Hello from the dsh-edge plugin system (hello-world v0.1.1, @edge-harness/dsh-plugin-hello).'
 
 export default {
   name: 'edge-plugins:hello',
-  inject: [],
+  // cordis 4: сервис можно читать через ctx.<service> только если плагин
+  // объявил его в inject (иначе apply падает «cannot get property … without
+  // inject»). Контракт тех же апстримных плагинов (dsh-tool-web и др.).
+  inject: ['tools'],
   apply(ctx) {
     ctx.effect(() => ctx.tools.register(defineHelloTool()), 'edge-plugins:hello tool')
     console.info('edge-plugin:hello installed (plugin_hello tool registered)')

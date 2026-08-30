@@ -48,3 +48,14 @@ merge = аппрув владельца.
 
 Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
 (инструменты объявляются апстримным `defineTool`).
+
+## Контракт cordis: inject
+
+Плагин объявляет `inject: ['tools']`: чтение `ctx.<service>` в apply без
+объявления сервиса в `inject` cordis 4 пресекает —
+`cannot get property "tools" without inject` (уплывало в #100: инсталл-цикл
+изолировал отказ в статус `failed`, сборка оставалась зелёной, тулов нет).
+Форма — как у апстримных плагинов (`dsh-tool-web` объявляет
+`['tools', 'web', 'systemPrompt']`). Нарушение контракта ловит дым инсталла
+[`dsh-edge/smoke-edge-plugins.mjs`](../../dsh-edge/smoke-edge-plugins.mjs) на
+каждой сборке морды.

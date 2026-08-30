@@ -1,6 +1,6 @@
 {
   "name": "@edge-harness/dsh-plugin-hello",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "PoC edge plugin: hello-world proving the manifest -> bundle -> deploy -> web roster channel for dsh-edge",
   "type": "module",
   "main": "server/index.js",

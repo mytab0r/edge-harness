@@ -36,3 +36,8 @@ merge = аппрув владельца.
 Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
 (инструмент объявляется апстримным `defineTool`); пин версии peer-зависимости
 переставляет `.pnpmfile.cjs` апстрима под свой `dshEdge.upstreamVersion`.
+
+Серверная половина объявляет `inject: ['tools']` — контракт cordis 4: чтение
+`ctx.<service>` в apply без объявления в `inject` бросает
+`cannot get property … without inject` (класс ошибки #100; ловит дым инсталла
+[`dsh-edge/smoke-edge-plugins.mjs`](../../dsh-edge/smoke-edge-plugins.mjs)).

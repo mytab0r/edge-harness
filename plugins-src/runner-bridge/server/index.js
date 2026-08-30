@@ -19,7 +19,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '0.1.1'
 const GITHUB_API = 'https://api.github.com'
 const GITHUB_TIMEOUT_MS = 15_000
 const GITHUB_API_VERSION = '2022-11-28'
@@ -35,7 +35,10 @@ const REPO_PATTERN = /^[^/\s]+\/[^/\s]+$/
 
 export default {
   name: 'edge-plugins:runner-bridge',
-  inject: [],
+  // cordis 4: сервис можно читать через ctx.<service> только если плагин
+  // объявил его в inject (иначе apply падает «cannot get property … without
+  // inject»). Контракт тех же апстримных плагинов (dsh-tool-web и др.).
+  inject: ['tools'],
   apply(ctx) {
     ctx.effect(() => ctx.tools.register(defineRunnerTaskTool()), 'edge-plugins:runner-bridge runner_task tool')
     ctx.effect(() => ctx.tools.register(defineRunnerStatusTool()), 'edge-plugins:runner-bridge runner_status tool')
