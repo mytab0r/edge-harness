@@ -20,10 +20,15 @@ DSH_HEADLESS_VERSION="0.1.1-rc.2"
 DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 
 # GH маскирует секреты только в своих логах; всё, что уходит наружу (журнал DO,
-# комментарии в задачах, Telegram), надо затирать до отправки.
+# комментарии в задачах, Telegram), надо затирать до отправки. GitHub PAT
+# (#95: токен теперь живёт и в морде — GH_RUNNER_TOKEN) маскируется
+# производным паттерном формы токена: точное совпадение секрета GH покрывает
+# только внутри своих логов.
 redact() {
   sed -E -e 's/nvapi-[A-Za-z0-9_-]{4,}/nvapi-[REDACTED]/g' \
-         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g'
+         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g' \
+         -e 's/(^|[^A-Za-z0-9_])ghp_[A-Za-z0-9]{20,}/\1ghp_[REDACTED]/g' \
+         -e 's/(^|[^A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}/\1github_pat_[REDACTED]/g'
 }
 
 dsh_verify_integrity() { # file expected-integrity
