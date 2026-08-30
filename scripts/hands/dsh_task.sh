@@ -157,10 +157,30 @@ verify_integrity "$HL_TGZ" "$DSH_HEADLESS_INTEGRITY"
 npm install -g ./*.tgz
 command -v dsh >/dev/null
 dsh --version || true
+
+# Выбор модели и лимит ответа — через родной settings-слой профиля:
+# адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
+# модель живёт в settings namespace agent-default-model (проверено живым прогоном:
+# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
+# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
+DSH_MODEL="${DEEPSEEK_MODEL:-glm-5}"
+DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
+DSH_PATCH="$HOME/.dsh/profiles/headless/cordis.patch.yml"
+mkdir -p "$(dirname "$DSH_PATCH")"
+cat >"$DSH_PATCH" <<PATCH
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: $DSH_MODEL
+- id: llm-deepseek
+  config:
+    maxTokens: $DSH_MAX_TOKENS
+PATCH
 add_event "bootstrap" "$(jq -n \
   --arg dsh "$DSH_VERSION" --arg hl "$DSH_HEADLESS_VERSION" \
-  --arg node "$(node --version)" \
-  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified"}')"
+  --arg node "$(node --version)" --arg model "$DSH_MODEL" \
+  --argjson mt "$DSH_MAX_TOKENS" \
+  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified", model: $model, max_tokens: $mt}')"
 flush_events
 
 # ── 4. Прогон: one-shot dsh-headless над этим репозиторием ────────────────────────
@@ -180,8 +200,9 @@ add_event "agent_answer" \
   "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
 
 # Отладочная хвостовая улика профиля: НЕ доказательство сессии (durable-улики —
-# слайс 2, родным плагином DSH). Читается только после смерти писателя.
-SESSION_FILE=$(find "$HOME/.dsh" "$HOME/.config/dsh" -type f -newer "$START_MARK" 2>/dev/null | sort | tail -1 || true)
+# слайс 2, родным плагином DSH). Читается только после смерти писателя; бинарные
+# кодировки (.zstd) в журнал не тащим.
+SESSION_FILE=$(find "$HOME/.dsh" "$HOME/.config/dsh" -type f -newer "$START_MARK" ! -name '*.zstd' 2>/dev/null | sort | tail -1 || true)
 if [ -n "$SESSION_FILE" ]; then
   EXCERPT=$(tail -c 16000 "$SESSION_FILE" | redact)
   add_event "session_note" "$(jq -n --arg f "$SESSION_FILE" --arg x "$EXCERPT" \
