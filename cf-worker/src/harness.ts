@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
+import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 
@@ -68,6 +68,20 @@ export interface Status {
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
+/** Чистое решение самообновления морды (#73): проводка (fetch/storage/dispatch)
+ *  остаётся тонкой в #checkDshEdgeUpdate, а все ветки логики крутятся тестами. */
+export function dshEdgeUpdateDecision(
+  deployed: string,
+  latest: string,
+  lastAttemptTs: number | undefined,
+  now: number,
+): "dispatch" | "throttled" | "quiet" {
+  if (lastAttemptTs !== undefined && now - lastAttemptTs < DSH_EDGE_UPDATE.throttleMs) {
+    return "throttled";
+  }
+  return deployed === latest ? "quiet" : "dispatch";
+}
+
 export function handsAreAlive(now: number, lastHeartbeatTs: number | null): boolean {
   return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
 }
@@ -536,7 +550,9 @@ export class Harness extends DurableObject<Env> {
 
   override webSocketClose(): void {}
 
-  /** Пульс: следующим тиком гарантируем цепочку, потом дёргаем оркестратора. */
+  /** Пульс: следующим тиком гарантируем цепочку, потом дёргаем оркестратора
+   *  и проверяем, не отстала ли морда dsh-edge от npm. */
+
   override async alarm(): Promise<void> {
     await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
     const token = this.env.GH_DISPATCH_TOKEN;
@@ -557,6 +573,53 @@ export class Harness extends DurableObject<Env> {
       // Пульс не роняет объект: ошибка уйдёт в observability, цепочка уже перезаложена.
       console.log(`heartbeat dispatch failed: ${error instanceof Error ? error.message : error}`);
     }
+    try {
+      await this.#checkDshEdgeUpdate(token, repo);
+    } catch (error) {
+      console.log(`dsh-edge update check failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  /** #73: морда dsh-edge должна быть последней версии. Сверяем версию, которую
+   *  отдаёт её публичный /api/health, с latest в npm; расхождение при истёкшем
+   *  троттле → workflow_dispatch деплой-воркфлоу. GitHub'овский cron не тикает,
+   *  поэтому живём на пульсе. Любой сбой здесь не роняет пульс: тик уже
+   *  перезаложен, ошибка уходит в observability. */
+  async #checkDshEdgeUpdate(token: string, repo: string): Promise<void> {
+    const now = Date.now();
+    const last = await this.ctx.storage.get<number>(DSH_EDGE_UPDATE.lastAttemptKey);
+    const [healthRes, registryRes] = await Promise.all([
+      fetch(DSH_EDGE_UPDATE.healthUrl),
+      fetch(DSH_EDGE_UPDATE.registryUrl),
+    ]);
+    if (!healthRes.ok || !registryRes.ok) {
+      throw new Error(`health=${healthRes.status} registry=${registryRes.status}`);
+    }
+    const health = (await healthRes.json<Record<string, unknown>>()) as { version?: unknown };
+    const release = (await registryRes.json<Record<string, unknown>>()) as { version?: unknown };
+    if (typeof health.version !== "string" || typeof release.version !== "string") {
+      throw new Error("неожиданный формат версий: health/registry не отдали строку version");
+    }
+    const decision = dshEdgeUpdateDecision(health.version, release.version, last, now);
+    if (decision !== "dispatch") return;
+    // Пометку попытки ставим ДО диспетча: упавший деплой не должен превратить
+    // пульс в штурм упавшего деплоя каждые 15 минут.
+    await this.ctx.storage.put(DSH_EDGE_UPDATE.lastAttemptKey, now);
+    console.log(`dsh-edge update: deployed ${health.version} != npm ${release.version} — dispatch`);
+    const res = await fetch(
+      `${GITHUB.apiBase}/repos/${repo}/actions/workflows/${DSH_EDGE_UPDATE.workflow}/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({ ref: "main" }),
+      },
+    );
+    if (!res.ok) throw new Error(`dispatch отклонён: ${res.status}`);
   }
 
   // ── Очередь задач ─────────────────────────────────────────────────────────────────

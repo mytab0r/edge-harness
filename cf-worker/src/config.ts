@@ -46,6 +46,26 @@ export const HEARTBEAT = {
   orchestraWorkflow: "orchestra.yml",
 } as const;
 
+/** Самообновление морды dsh-edge (#73): пульс сверяет версию, которую отдаёт
+ *  публичный /api/health морды, с последней стабильной в npm. Расхождение при
+ *  истёкшем троттле → workflow_dispatch деплой-воркфлоу. GitHub'овский cron на
+ *  репо не тикает вовсе, поэтому проверка живёт в том же DO-пульсе, что и
+ *  оркестрация. Ожидание сети в CPU-лимит не считается — fetch+compare+dispatch
+ *  укладывается в 10 ms. */
+export const DSH_EDGE_UPDATE = {
+  /** Публичный health морды: отдаёт deployed version без авторизации. */
+  healthUrl: "https://dsh-edge.mytab0r.workers.dev/api/health",
+  /** latest стабильная версия пакета в npm. */
+  registryUrl: "https://registry.npmjs.org/dsh-edge/latest",
+  /** workflow_dispatch этого воркфлоу при расхождении версий. */
+  workflow: "deploy-dsh-edge.yml",
+  /** Минимальная пауза между попытками диспетча: npm релизится несколько раз в
+   *  сутки, а деплой может падать по внешним причинам — штурмовать нельзя. */
+  throttleMs: 4 * 60 * 60 * 1000,
+  /** Ключ записи storage с временем последней попытки диспетча. */
+  lastAttemptKey: "dsh-edge-update:last-dispatch-ts",
+} as const;
+
 export const GITHUB = {
   apiBase: "https://api.github.com",
   apiVersion: "2022-11-28",
