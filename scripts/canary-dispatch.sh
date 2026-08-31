@@ -31,7 +31,7 @@ echo "== POST $HARNESS_URL/api/tasks (отправка от $since UTC)"
 response=$(curl -sS -w '\n%{http_code}' -X POST "$HARNESS_URL/api/tasks" \
   -H "Authorization: Bearer $HANDS_TOKEN" \
   -H 'Content-Type: application/json' \
-  --data '{"payload":{"canary":"dispatch-token","note":"канарейка задачи #6: подтверждение dispatch-пути"}}')
+  --data '{"payload":{"task":"канарейка dispatch-пути #6: подтверди получение одной строкой и заверши сессию, изменений не делай","canary":"dispatch-token","note":"канарейка задачи #6: подтверждение dispatch-пути"}}')
 
 http_code=$(tail -n1 <<<"$response")
 body=$(sed '$d' <<<"$response")
