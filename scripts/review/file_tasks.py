@@ -41,7 +41,10 @@ def _pages(url_head: str):
     не находился; >100 задач — рушилась идемпотентность)."""
     page = 1
     while True:
-        chunk = gh(f"{url_head}&per_page=100&page={page}")
+        # separator зависит от того, есть ли уже запрос в URL (замер:
+        # голый путь с «&» даёт тихий 404)
+        sep = "&" if "?" in url_head else "?"
+        chunk = gh(f"{url_head}{sep}per_page=100&page={page}")
         if not isinstance(chunk, list) or not chunk:
             return
         yield from chunk
@@ -52,14 +55,16 @@ def _pages(url_head: str):
 
 def latest_review_comment(repo: str, pr: int) -> dict | None:
     """Последний комментарий AI-ревью: шапка-факты с решающим reviewer:.
-    Чужие комментарии (автора, оркестратора) фактов не имеют. Идём от новых
-    к старым (direction=desc) и останавливаемся на первом — полные 100+
-    комментариев не обязательно листать."""
-    for comment in _pages(f"repos/{repo}/issues/{pr}/comments?sort=created&direction=desc"):
+    Чужие комментарии (автора, оркестратора) фактов не имеют. Endpoint
+    комментариев НЕ поддерживает sort/direction (всегда по созданию,
+    asc — замер на PR #138: desc-параметры молча игнорируются) — листаем
+    все страницы и берём ПОСЛЕДНЕЕ совпадение."""
+    latest = None
+    for comment in _pages(f"repos/{repo}/issues/{pr}/comments"):
         facts = ai_review.header_facts(comment.get("body") or "")
         if facts.get("reviewer") in ("approve", "rework", "error"):
-            return comment
-    return None
+            latest = comment
+    return latest
 
 
 def open_task_titles(repo: str) -> set[str]:
