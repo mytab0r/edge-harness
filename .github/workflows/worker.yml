@@ -57,7 +57,13 @@ jobs:
           # внутри агента не авторизуются, хотя транспорт task.sh обещает обратное).
           # hosts.yml не env — scrub его не касается, gh и git-хелпер читают оттуда.
           # pipe, а не process substitution: токен не попадает в argv.
-          printf '%s' "$GH_TOKEN" | gh auth login --with-token
+          # GH_TOKEN обязан быть вынут из env ДО login: gh отказывается от
+          # `auth login --with-token`, пока видит GH_TOKEN в окружении
+          # (#117, живой прогон 2026-08-31) — «ambiguous auth source».
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
           gh auth setup-git
           gh auth status 2>&1 | grep -E 'Logged in|account' || true
 
