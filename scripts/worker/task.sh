@@ -28,6 +28,11 @@ source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
+# Профиль headless — pnpm-workspace: инициализация делает pnpm add в корень
+# профиля. Без этого флага — ERR_PNPM_ADDING_TO_ROOT (#93/#94); фикс обязан
+# быть в ОБЕИХ транспортных обёртках (worker task.sh и hands dsh_task.sh):
+# выпадение из одной возвращает класс — прогон 2026-08-31 15:57 на #131.
+export npm_config_ignore_workspace_root_check=true
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY не задан}"
 export GH_REPO="${GH_REPO:-$GITHUB_REPOSITORY}"
 
@@ -106,7 +111,10 @@ free_task() {
   taken=$(gh pr list --state open --limit 100 --json body \
     | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') || return 2
   candidates=$(gh issue list --label task --state open --limit 100 --json number,assignees,title \
-    | jq -r '.[] | select((.assignees | length) == 0) | [.number, .title] | @tsv') || return 2
+    | jq -r '.[] | select((.assignees | length) == 0) | [.number, .title] | @tsv' \
+    | sort -n) || return 2
+  # sort -n обязателен:/issues API отдаёт по убыванию новизны, и без сортировки
+  # воркер брал СВЕЖАЙШУЮ задачу (косметику), а не старейшую в пуле.
   while IFS=$'\t' read -r number title; do
     [ -n "$number" ] || continue
     case " $taken " in *" $number "*) continue ;; esac
