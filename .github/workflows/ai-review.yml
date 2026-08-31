@@ -6,17 +6,24 @@
 # ai:changes-requested / ai:failed. Оркестратор сливает только при
 # review:ok И ai:ok (scripts/lib/review_labels.py — одно место правды).
 #
-# Trust-zone (#18): содержательное ревью делает DSH-агент БЕЗ GitHub-токена —
-# шаг «Ревью агентом» не получает ни GH_TOKEN, ни git-креденшелов (checkout с
-# persist-credentials: false), постить в интернет агент не может физически:
-# его единственный выход — файл ответа. Публикацией занимаются доверенные
-# шаги gather/verdict (python scripts/review/ai_review.py) под github.token.
-# DEEPSEEK_API_KEY нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET*
-# из model-shell вызовов — агент и его не видит (живой прогон 2026-08-30,
-# см. worker.yml).
+# Trust-зона (#18): граница доверия — МЕЖДУ JOB'ами, а не только между env.
+# Job `review`: недоверенный DSH-шаг не получает GitHub-токенов вовсе; всё,
+# что он может испортить (файлы воркспейса, $GITHUB_ENV, $GITHUB_PATH, PATH),
+# умирает вместе с виртуалкой job'а. Права job'а — только чтение (contents/
+# pull-requests/issues): даже временные креды чекаута физически не могут
+# постить от имени владельца. DEEPSEEK_API_KEY нужен вызову модели; DSH
+# вырезает env *TOKEN*/*KEY*/*SECRET* из model-shell вызовов (живой прогон
+# 2026-08-30, см. worker.yml).
+# Job `verdict`: СВЕЖАЯ машина, чистый чекаут скриптов из GitHub (переписать
+# их из недоверенного job'а нельзя), свой GH_TOKEN с pull-requests:write.
+# Ответ ревью переезжает между job'ами ВЫВОДОМ доверенного шага (данные, не
+# код); head для сверки — из meta.json, написанного доверенным gather.
 #
-# Concurrency: один прогон на PR; новый пуш (новое ревью) отменяет летящий —
-# его вердикт всё равно устарел бы (verdict-шаг дополнительно сверяет head).
+# Concurrency: один прогон на PR. cancel-in-progress НАМЕРЕННО выключен:
+# labeled-событие ЛЮБОЙ метки (conflict, orchestra:skip, сами ai:*) создаёт
+# run группы даже со скипнутым job — отмена таким run'ом убила бы летящее
+# ревью без автоперезапуска (review:ok уже стоит, нового события не будет).
+# Протухший вердикт всё равно не применяется: verdict сверяет head.
 name: ai-review
 
 on:
@@ -31,22 +38,31 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
+  issues: read
 
 concurrency:
   group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'review:ok'
     runs-on: ubuntu-latest
-    # 60 мин — таймаут DSH (ai_dsh.sh) + установка и оба доверенных шага.
-    timeout-minutes: 75
+    # 60 мин — таймаут DSH (ai_dsh.sh) + установка и доверенный gather.
+    timeout-minutes: 70
     env:
       AI_WORK: ${{ runner.temp }}/ai-review
+    outputs:
+      answer: ${{ steps.answer.outputs.text }}
+      head: ${{ steps.answer.outputs.head }}
     steps:
+      # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
+      # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
+      # Step-outputs читаются из СВОЕГО временного файла на момент закрытия
+      # шага — поздние записи в него игнорируются.
       - name: Факты PR (номер и head)
+        id: facts
         env:
           GH_TOKEN: ${{ github.token }}
           PR_INPUT: ${{ github.event.pull_request.number || github.event.inputs.pr }}
@@ -54,16 +70,19 @@ jobs:
           case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
           head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_INPUT" --jq .head.sha)
           [ -n "$head" ] || { echo "::error::у PR #$PR_INPUT нет head-sha"; exit 1; }
-          echo "PR_NUMBER=$PR_INPUT" >> "$GITHUB_ENV"
-          echo "PR_HEAD=$head" >> "$GITHUB_ENV"
+          {
+            echo "pr=$PR_INPUT"
+            echo "head=$head"
+          } >> "$GITHUB_OUTPUT"
           echo "PR #$PR_INPUT, head $head"
 
       - uses: actions/checkout@v7
         with:
           # Чекаут head PR: агент ревьюит репозиторий в состоянии ветки.
-          ref: ${{ env.PR_HEAD }}
+          ref: ${{ steps.facts.outputs.head }}
           fetch-depth: 0
-          # Креденшелы не переживают шаг: DSH-шаг ниже не наследует git-токен.
+          # Креденшелы не переживают шаг. Даже если временный файл токена
+          # живёт в RUNNER_TEMP до post-job — права job'а только на чтение.
           persist-credentials: false
 
       - uses: actions/setup-node@v7
@@ -73,6 +92,7 @@ jobs:
       - name: Сбор фактов и промпт (доверенный шаг)
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.facts.outputs.pr }}
         run: |
           mkdir -p "$AI_WORK"
           python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
@@ -88,9 +108,64 @@ jobs:
           DSH_TIMEOUT_SECS: "3600"
         run: bash scripts/review/ai_dsh.sh
 
-      - name: "Вердикт: комментарий + метка (доверенный шаг)"
+      # Доверенный мост в job verdict: ответ — это ДАННЫЕ (текст модели),
+      # не код; verdict исполняет СВОЙ чистый чекаут, а не эти файлы.
+      # Ограничение канала — ~1 МБ на выводы job'а; ответ ревью — килобайты
+      # (контракт: ≤5 находок + блоки задач). ДелIMITER не встретится в
+      # ответе; даже если встретится — вывод исковеркается и verdict уйдёт
+      # в error → ai:failed (fail-closed).
+      - name: Ответ ревью — в выводы job'а
+        id: answer
+        run: |
+          {
+            echo "head=$(jq -r .head "$AI_WORK/meta.json")"
+            printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
+            cat "$AI_WORK/answer.txt"
+            printf 'AI_REVIEW_ANSWER_EOF_7f3a\n'
+          } >> "$GITHUB_OUTPUT"
+
+  # ── Доверенный job: свежая VM, чистый чекаут из GitHub, токен на запись ────
+  verdict:
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Факты PR (номер и текущий head)
+        id: facts
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_INPUT: ${{ github.event.pull_request.number || github.event.inputs.pr }}
         run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_INPUT" --jq .head.sha)
+          [ -n "$head" ] || { echo "::error::у PR #$PR_INPUT нет head-sha"; exit 1; }
+          {
+            echo "pr=$PR_INPUT"
+            echo "head=$head"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          # Скрипты — только из GitHub по ref: недоверенный job физически на
+          # другой машине и не мог переписать то, что исполняется здесь.
+          ref: ${{ steps.facts.outputs.head }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Вердикт: комментарий + метка"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Номер PR — из контекста события (не подделывается из job'а review);
+          # head — момент gather (сверка ловит уехавший за время ревью PR).
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          HEAD_REVIEWED: ${{ needs.review.outputs.head }}
+          ANSWER: ${{ needs.review.outputs.answer }}
+        run: |
+          printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
-            --pr "$PR_NUMBER" --answer "$AI_WORK/answer.txt" --head "$PR_HEAD"
+            --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED"

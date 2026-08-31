@@ -4,7 +4,7 @@
     python scripts/review/file_tasks.py --pr 140 [--dry-run]
 
 Читает ПОСЛЕДНЕЕ ревью-комментарий в PR (шапка-факты pr/head/reviewer до
-первого пустой строки), достаёт канонические блоки ```задача и создаёт issue
+первого пустой строки), достаёт канонические блоки ````задача и создаёт issue
 с меткой task на каждый. Идемпотентен по заголовку: задача с таким же
 заголовком уже открыта — пропускается (повтор команды не дублирует пул).
 
@@ -34,11 +34,27 @@ def gh(*args: str):
     return ai_review.gh(*args)
 
 
+def _pages(url_head: str):
+    """Листает список GitHub API до короткой страницы. per_page=100 без
+    листания молча терял хвосты (>100 комментариев — «последний» ревью
+    не находился; >100 задач — рушилась идемпотентность)."""
+    page = 1
+    while True:
+        chunk = gh(f"{url_head}&per_page=100&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            return
+        yield from chunk
+        if len(chunk) < 100:
+            return
+        page += 1
+
+
 def latest_review_comment(repo: str, pr: int) -> dict | None:
     """Последний комментарий AI-ревью: шапка-факты с решающим reviewer:.
-    Чужие комментарии (автора, оркестратора) фактов не имеют."""
-    comments = gh(f"repos/{repo}/issues/{pr}/comments?per_page=100")
-    for comment in reversed(comments if isinstance(comments, list) else []):
+    Чужие комментарии (автора, оркестратора) фактов не имеют. Идём от новых
+    к старым (direction=desc) и останавливаемся на первом — полные 100+
+    комментариев не обязательно листать."""
+    for comment in _pages(f"repos/{repo}/issues/{pr}/comments?sort=created&direction=desc"):
         facts = ai_review.header_facts(comment.get("body") or "")
         if facts.get("reviewer") in ("approve", "rework", "error"):
             return comment
@@ -46,9 +62,8 @@ def latest_review_comment(repo: str, pr: int) -> dict | None:
 
 
 def open_task_titles(repo: str) -> set[str]:
-    issues = gh(f"repos/{repo}/issues?state=open&labels=task&per_page=100")
     return {
-        issue["title"] for issue in issues
+        issue["title"] for issue in _pages(f"repos/{repo}/issues?state=open&labels=task")
         if "pull_request" not in issue
     }
 

@@ -114,7 +114,7 @@ def test_header_facts_ignores_fenced_and_prose_lines():
         "pr: 140\nhead: abc\nreviewer: approve\n\n"
         "🤖 AI-ревью — второй гейт конвейера (#18).\n\n"
         "Проза. pr: 999 не факт.\n\n"
-        "```задача\nЗадача\npr: 777\n```\n"
+        "````задача\nЗадача\npr: 777\n````\n"
     )
     assert ai.header_facts(body) == {"pr": "140", "head": "abc", "reviewer": "approve"}
 
@@ -128,8 +128,16 @@ def test_tasks_from_comment_roundtrip():
     assert ai.tasks_from_comment(body) == tasks
 
 
+def test_tasks_roundtrip_keeps_inner_code_fence():
+    # тело задачи с ```-фенсом (пример команды) не должно обрезаться:
+    # внешний забор — 4 бэктика, внутренний тройной остаётся телом
+    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий."}]
+    body = ai.build_comment(140, "abc", "approve", "Ок.", tasks)
+    assert ai.tasks_from_comment(body) == tasks
+
+
 def test_tasks_from_comment_unclosed_fence_dropped():
-    body = "pr: 1\nhead: a\nreviewer: approve\n\n```задача\nОборванная задача"
+    body = "pr: 1\nhead: a\nreviewer: approve\n\n````задача\nОборванная задача"
     assert ai.tasks_from_comment(body) == []
 
 

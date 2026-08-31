@@ -15,8 +15,10 @@ DSH-агента в trust-зоне без GitHub-токена — и делае�
    из общей `scripts/lib/dsh-ci.sh`).
 2. `.github/workflows/ai-review.yml` — триггер `labeled: review:ok` (первый
    гейт прошёл) и `workflow_dispatch` (input `pr` — повтор после сбоя).
-   Trust-зона по шагам: gather (GH_TOKEN) → DSH (НИ GitHub-токена, ни
-   git-креденшелов; выход — только файл ответа) → verdict (GH_TOKEN).
+   Trust-зона — граница между job'ами: job `review` (права только чтение;
+   DSH-шаг без GitHub-токена, его порча умирает с ВМ) → ответ и head
+   переезжают outputs'ами доверенного шага → job `verdict` (свежая ВМ,
+   чистый чекаут из GitHub, pull-requests:write).
 3. Контракт вердикта — паттерн живого решения владельца в Harness
    (pr_loop.py): последняя непустая строка ответа ровно `ВЕРДИКТ: approve`
    или `ВЕРДИКТ: rework`; отсутствие/неоднозначность — `error`, никогда не

@@ -23,7 +23,7 @@ error, неоднозначность никогда не одобряет.
 
 Состояние для «завести задачи в беклог одной командой» живёт в комментарии:
 шапка-факты (pr/head/reviewer) до первого пустой строки + канонические
-блоки-заборы ```задача — парсит scripts/review/file_tasks.py.
+блоки-заборы ````задача — парсит scripts/review/file_tasks.py.
 
 Среда: runner с gh, GH_TOKEN с правами pull-requests: write (gather/verdict).
 """
@@ -59,9 +59,10 @@ VERDICT_RE = re.compile(r"^ВЕРДИКТ:\s*(approve|rework)\s*$")
 TASK_OPEN_RE = re.compile(r"^ЗАДАЧА:\s*(\S.*)$")
 TASK_CLOSE = "КОНЕЦ ЗАДАЧИ"
 # Блок-забор задачи в комментарии: строится только транспортом, парсится
-# file_tasks. Фенс не может притвориться строкой фактов шапки.
-TASK_FENCE = "```задача"
-TASK_FENCE_CLOSE = "```"
+# file_tasks. ЧЕТЫРЕ бэктика: внутренний ```-фенс в теле задачи (пример
+# кода) не закрывает блок — иначе roundtrip молча обрезал бы тело.
+TASK_FENCE = "````задача"
+FENCE_CLOSE_RE = re.compile(r"^`{4,}\s*$")
 # Шапка-факты комментария: разбираются только до первого пустой строки,
 # чтобы проза/фенсы ниже не притворялись фактами.
 FACT_RE = re.compile(r"^(pr|head|reviewer):\s*(.+)$")
@@ -169,7 +170,7 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     body = findings.strip()
     if tasks:
         blocks = "\n\n".join(
-            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{TASK_FENCE_CLOSE}" for t in tasks
+            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{'```' * 4}" for t in tasks
         )
         body += (
             f"\n\nЗадачи в беклог из этого ревью — завести одной командой:\n"
@@ -192,7 +193,8 @@ def header_facts(comment_body: str) -> dict[str, str]:
 
 def tasks_from_comment(comment_body: str) -> list[dict]:
     """Канонические фенсы задач из комментария ревью (не из сырого ответа):
-    комментарий — долговременное место правды для file_tasks.py."""
+    комментарий — долговременное место правды для file_tasks.py. Закрывается
+    строкой из ≥4 бэктиков: внутренний ```-фенс остаётся телом задачи."""
     tasks: list[dict] = []
     lines = (comment_body or "").splitlines()
     i = 0
@@ -200,7 +202,7 @@ def tasks_from_comment(comment_body: str) -> list[dict]:
         if lines[i].strip() == TASK_FENCE:
             block: list[str] = []
             i += 1
-            while i < len(lines) and not lines[i].strip().startswith("```"):
+            while i < len(lines) and not FENCE_CLOSE_RE.match(lines[i].strip()):
                 block.append(lines[i].rstrip())
                 i += 1
             if block and i < len(lines):  # забор закрыт
@@ -217,12 +219,17 @@ def tasks_from_comment(comment_body: str) -> list[dict]:
 def task_section(pull_body: str, repo: str) -> str:
     """Задача пула, которую закрывает PR: первая открытая issue с меткой task
     из #N-ссылок тела. Нет задачи (orchestra:skip, dependabot) — так и пишем:
-    «нет задачи» и «задача не найдена» — разные состояния."""
+    «нет задачи» и «задача не дочиталась» — разные состояния: 404 значит
+    «не задача, ищем дальше», любой другой отказ (права, сеть, 5xx) роняет
+    шаг громко — молча ревьюить без контекста задачи нельзя (silent-wrong).
+    """
     for number in sorted({int(m.group(1)) for m in re.finditer(r"#(\d+)", pull_body or "")}):
         try:
             issue = gh(f"repos/{repo}/issues/{number}")
-        except RuntimeError:
-            continue
+        except RuntimeError as error:
+            if "404" in str(error):
+                continue
+            raise
         if "pull_request" in issue or issue.get("state") != "open":
             continue
         if "task" not in {label["name"] for label in issue["labels"]}:
