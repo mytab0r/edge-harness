@@ -121,21 +121,35 @@ dsh_edge_session_begin() { # SESSION_ID TITLE — создать/переисп�
 }
 
 dsh_edge_ingest() { # SESSION_ID SPOOL_LINES_FILE — батч строк спула → события морды
-  local session_id=$1 lines_file=$2 batch_file body
+  local session_id=$1 lines_file=$2 batch_file resp_file appended
   dsh_edge_init || return 1
   [ -s "$lines_file" ] || return 0   # пустой батч — не ошибка
   batch_file="$WORK/dsh-edge.ingest.json"
   # redact — единственное место обезвреживания секретов на пути спула в морду.
   redact <"$lines_file" | jq -s '{events: [.[] | {type: .type, data: .data}]}' >"$batch_file" \
     || { echo "::error::Не собрали ingest-батч (jq по строкам спула)" >&2; return 1; }
-  if ! body=$($DSH_EDGE_CURL -b "$DSH_EDGE_CJAR" -H 'content-type: application/json' \
-      -X POST "$DSH_EDGE_URL/api/sessions/$session_id/ingest" \
-      --data-binary "@$batch_file" 2>&1); then
-    echo "::error::Ingest отклонён мордой: $body" >&2
+  # БЕЗ curl -f: отказ морды (404/409/413/500) должен доехать до лога job телом,
+  # а не «curl: (22) The requested URL returned error» без причины.
+  local http_code out appended resp_file="$WORK/dsh-edge.ingest.resp"
+  http_code=$(curl -sS --connect-timeout 5 --max-time 30 -o "$resp_file" -w '%{http_code}' \
+    -b "$DSH_EDGE_CJAR" -H 'content-type: application/json' \
+    -X POST "$DSH_EDGE_URL/api/sessions/$session_id/ingest" \
+    --data-binary "@$batch_file" 2>"$WORK/dsh-edge.ingest.err") \
+    || { echo "::error::Ingest не дошёл до морды (curl): $(cat "$WORK/dsh-edge.ingest.err")" >&2; return 1; }
+  case "$http_code" in
+    2*) : ;;
+    *)
+      echo "::error::Ingest отклонён мордой (HTTP $http_code): $(cat "$resp_file" 2>/dev/null || echo "<нет тела>")" >&2
+      return 1 ;;
+  esac
+  appended=$(jq -r '.appended // empty' "$resp_file" 2>/dev/null) \
+    || appended=""
+  if [ -z "$appended" ]; then
+    echo "::error::Ingest: морда ответила 2xx без appended: $(cat "$resp_file" 2>/dev/null || echo "<нет тела>")" >&2
     return 1
   fi
-  jq -e --argjson min 1 '.appended >= $min' <<<"$body" >/dev/null \
-    || { echo "::error::Ingest ответил без принятых событий: $body" >&2; return 1; }
+  [ "$appended" -ge 1 ] \
+    || { echo "::error::Ingest: морда не приняла ни одного события (appended=$appended)" >&2; return 1; }
 }
 
 dsh_edge_drain_batch() { # MODE LINES_FILE — один батч в морду; soft: одна попытка
@@ -154,6 +168,9 @@ dsh_edge_drain_batch() { # MODE LINES_FILE — один батч в морду; 
 }
 
 dsh_edge_drain_spool() { # MODE — дочитывает СПОЛ (SPOOL_FILE) до курсора; 0: чисто, 1: сбой поста
+  # cleanup зовёт drain и при смерти клиента ДО start_drain: без инициализации
+  # (unset-курсор под set -u) дрен обязан тихо пропустить, а не уронить уборку.
+  dsh_edge_init || return 0
   local mode=$1 drained lo end bl batch_lines
   local spool="${SPOOL_FILE:?SPOOL_FILE не задан}"
   drained=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null)

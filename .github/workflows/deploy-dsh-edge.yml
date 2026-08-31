@@ -169,6 +169,17 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         run: pnpm --dir clone/apps/dsh-edge/standalone run verify
 
+      # Шов раннеров (#119) обязан работать на СОБРАННОМ артефакте до деплоя:
+      # unstable_dev поднимает direct-воркер с настоящим DO SQLite и прогоняет
+      # путь раннера (батчи, перенумерация turn, 400 на чужой тип, «принято =
+      # сохранено», архив). Красный шаг — деплой не начинается: сломанный шов
+      # невыгодно ловить на живой морде. Ревью #128 (М2): драйвер закоммичен,
+      # проверка воспроизводима.
+      - name: Интеграция ingest-шва на собранном артефакте (#119)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge
+
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
         run: |

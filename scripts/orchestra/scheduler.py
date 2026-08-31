@@ -285,6 +285,7 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами
     # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
     task_refs = sorted({m.group(1) for m in re.finditer(r"#(\d+)", pull.get("body") or "")}, key=int)
+    task_numbers: list[int] = []
     for task_number in task_refs:
         # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
         # Идемпотентно: замка может не быть (канал без аренды) — это не ошибка.
@@ -298,6 +299,7 @@ def after_merge(repo: str, pull: dict) -> list[str]:
                 continue
             if "task" not in {label["name"] for label in issue["labels"]}:
                 continue
+            task_numbers.append(int(task_number))
             gh(
                 "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
                 "-f",
@@ -311,8 +313,11 @@ def after_merge(repo: str, pull: dict) -> list[str]:
         except RuntimeError as error:
             # один кривой реф не должен ронять остальные действия after_merge
             lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
-    if task_refs:
-        lines += archive_runner_sessions(task_refs)
+    # Архив сессий раннеров (#119) — только для ЗАДАЧ пула (метка task): номер из
+    # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
+    # его нельзя — утащим чужую живую сессию в архив.
+    if task_numbers:
+        lines += archive_runner_sessions(task_numbers)
     return lines
 
 

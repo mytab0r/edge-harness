@@ -52,6 +52,38 @@ api_post() {
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }
 
+# ── Журнал-seq: один писатель — bash (клиент рук). ────────────────────────────────
+# Жизненный цикл job (job_start/bootstrap/agent_answer/stream_note/agent_error/
+# job_end) — зона ЭТОГО файла: события с уникальным journal-seq уходят в журнал
+# edge-harness. Транскрипт сессии (drain спула) сюда не ходит — он в морду через
+# scripts/lib/dsh-edge-session.sh и на SEQ не влияет. seq_load — передача
+# нумерации, если какой-то цикл временно заберёт писательство (точка возврата).
+SEQ=0
+seq_persist() { printf '%s\n' "$SEQ" >"$SEQ_FILE"; }
+seq_load() { SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo "$SEQ"); }
+
+add_event() { # kind json_data
+  SEQ=$((SEQ + 1))
+  seq_persist
+  printf '{"seq":%s,"kind":"%s","ts":%s,"data":%s}\n' \
+    "$SEQ" "$1" "$(date -u +%s000)" "${2:-null}" >>"$EVENTS_FILE"
+}
+
+flush_events() {
+  if [ ! -s "$EVENTS_FILE" ]; then return 0; fi
+  local body attempt
+  body=$(jq -s --arg t "$TASK_ID" '{task_id: $t, source: "job", events: .}' "$EVENTS_FILE")
+  for attempt in 1 2 3 4 5; do
+    if api_post /api/events "$body" >/dev/null; then
+      : >"$EVENTS_FILE"
+      return 0
+    fi
+    sleep $((attempt * 2))
+  done
+  echo "::error::Журнал не принял батч из 5 попыток — задача не может считаться завершённой" >&2
+  return 1
+}
+
 # ── Транскрипт сессии: дрен спула в морду (#119) ──────────────────────────────────
 # Спул плагина — единственный источник; дрен живёт в scripts/lib/dsh-edge-session.sh
 # и постит батчи строк спула в DSH-сессию (POST /api/sessions/:id/ingest).
