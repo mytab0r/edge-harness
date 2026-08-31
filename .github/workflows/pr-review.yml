@@ -1,7 +1,12 @@
 # Звено ревью конвейера: срабатывает на каждый PR, вешает вердикт-метку
 # review:ok / review:changes-requested (+ review:large для крупных диффов).
-# Оркестратор сливает только PR с меткой review:ok — метка и есть триггер
-# следующего шага (см. docs/agents/PROTOCOL.md).
+# Оркестратор сливает только PR с метками review:ok И ai:ok — метки и есть
+# триггер следующих шагов (см. docs/agents/PROTOCOL.md и ADR 0007).
+#
+# Trust-зона (класс «PR подсунул код под write-токен», закрыт по ревью PR #138):
+# чекаут по умолчанию — ref: main, ИЗ НЕГО исполняется check_pr.py с
+# pull-requests:write. Дерево PR — отдельным чекаутом в pr-tree и только как
+# ДАННЫЕ: check_pr компилирует из него изменённые .py (парс, не исполнение).
 name: pr-review
 
 on:
@@ -16,9 +21,24 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
+      # Доверенный код — из main: ревьюимый PR не может подсунуть скрипт,
+      # который сам поставит себе review:ok или не снимет протухший ai:*.
       - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Дерево PR — данные для компиляционной проверки (файлы из диффа).
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-tree
+          persist-credentials: false
 
       - name: Детерминированное ревью диффа
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python scripts/review/check_pr.py --pr ${{ github.event.pull_request.number }}
+        run: >
+          python scripts/review/check_pr.py
+          --pr ${{ github.event.pull_request.number }}
+          --tree pr-tree

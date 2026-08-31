@@ -18,7 +18,7 @@ job review (права: только чтение; ВМ умирает вмес�
         ├─ 3. checkout head PR → pr-head: дерево-ДАННЫЕ для агента
         ├─ 4. gather (GH_TOKEN, скрипты из main): дифф-пак, задача пула, промпт
         ├─ 5. DSH headless (БЕЗ токенов, cwd=pr-head): ответ → answer.txt
-        └─ 6. Доверенный мост: answer + head (meta.json) → outputs job'а
+        └─ 6. Доверенный мост: answer + head (step-output фактов) → outputs
                         │
                         ▼
 job verdict (свежая ВМ, права: pull-requests:write, чекаут main)

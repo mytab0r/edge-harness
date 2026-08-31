@@ -25,8 +25,8 @@
 # вызовов (живой прогон 2026-08-30, см. worker.yml).
 # Job `verdict`: СВЕЖАЯ машина, свой чекаут main, свой GH_TOKEN с
 # pull-requests:write. Ответ ревью переезжает между job'ами ВЫВОДОМ
-# доверенного шага (данные, не код); head для сверки — из meta.json,
-# написанного доверенным gather.
+# доверенного шага (данные, не код); head для сверки — step-output фактов,
+# закрытый до недоверенного шага: файлы $AI_WORK агенту принадлежат.
 #
 # Concurrency: группа = породивший pr-review-ран (workflow_run.id) или номер
 # PR из dispatch. Новый пуш того же PR = НОВЫЙ pr-review-ран = своя группа —
@@ -206,10 +206,15 @@ jobs:
       - if: steps.facts.outputs.go == 'true'
         name: Ответ ревью — в выводы job'а
         id: answer
+        env:
+          # head — из step-output фактов (закрыт ДО недоверенного шага):
+          # meta.json лежит в $AI_WORK, куда агент пишет по контракту, и
+          # подменой head вердикт применился бы к неревьюенному head.
+          HEAD_FACT: ${{ steps.facts.outputs.head }}
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
           {
-            echo "head=$(jq -r .head "$AI_WORK/meta.json")"
+            echo "head=$HEAD_FACT"
             # Код возврата dsh — сигнал «транспорт упал» для verdict (иначе
             # ошибка провайдера уходит как «модель нарушила контракт»,
             # silent-wrong). Файла может не быть при экзотическом обрыве шага
