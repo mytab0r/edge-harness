@@ -12,16 +12,28 @@
   2. В PR не добавлены файлы секретов (.dev.vars, .env).
   3. Крупный дифф (> LARGE_DIFF_LINES) помечается меткой review:large — авто-слияние
      для него запрещено, нужен взгляд человека.
+  4. Каждый запуск снимает ai:*-метки второго гейта (AI-ревью, #18): вердикт AI
+     действителен только для head, на котором сделан, а этот скрипт выполняется
+     на каждый пуш. Свежую метку поставит новое AI-ревью (workflow ai-review).
 
 Среда: runner с `gh`, GH_TOKEN с правами pull-requests: write.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+# Метки-вердикты обоих гейтов — одно место правды в scripts/lib
+# (общее для check_pr, ai_review и scheduler: имена и гейт слияния).
+_LIB = Path(__file__).resolve().parents[1] / "lib" / "review_labels.py"
+_spec = importlib.util.spec_from_file_location("review_labels", _LIB)
+review_labels = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(review_labels)
 
 LARGE_DIFF_LINES = 800
 SECRET_PATTERNS = [
@@ -34,10 +46,10 @@ SECRET_PATTERNS = [
 ]
 CONFLICT_MARKER = re.compile(r"^(<{7}|={7}|>{7})($| )")
 FORBIDDEN_FILES = (".dev.vars", ".env")
-REVIEW_OK = "review:ok"
-REVIEW_CHANGES = "review:changes-requested"
-REVIEW_LARGE = "review:large"
-LARGE_OK = "review:large-ok"
+REVIEW_OK = review_labels.REVIEW_OK
+REVIEW_CHANGES = review_labels.REVIEW_CHANGES
+REVIEW_LARGE = review_labels.REVIEW_LARGE
+LARGE_OK = review_labels.LARGE_OK
 
 
 def gh(*args: str) -> dict | list:
@@ -121,6 +133,12 @@ def main() -> int:
     for old in (REVIEW_OK, REVIEW_CHANGES):
         if old in current:
             run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+    # Вердикт AI-ревью (второй гейт, #18) привязан к head, который ревьюили:
+    # этот скрипт выполняется на каждый пуш, и обязан снять протухший ai:*
+    # ДО нового AI-ревью — иначе оркестратор может слить PR по метке от
+    # старого head. Новое ревью поставит свежую метку на новый head.
+    for old in review_labels.ai_verdicts_to_drop(current):
+        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     verdict = REVIEW_LARGE if is_large else (REVIEW_OK if not findings else REVIEW_CHANGES)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
 

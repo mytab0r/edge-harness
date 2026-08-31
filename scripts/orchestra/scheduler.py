@@ -52,6 +52,14 @@ _claim_spec = importlib.util.spec_from_file_location("claim_task", _LIB)
 claim_task = importlib.util.module_from_spec(_claim_spec)
 _claim_spec.loader.exec_module(claim_task)
 
+# Метки-вердикты ревью (review:*, ai:*) и формулировка гейта слияния —
+# одно место правды в scripts/lib/review_labels.py (общее для check_pr,
+# ai_review и scheduler).
+_rl_spec = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_rl_spec)
+_rl_spec.loader.exec_module(review_labels)
+
 STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
 TASK_LABEL = "task"
@@ -181,10 +189,14 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         if bad:
             skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
             continue
-            continue
         labels = {label["name"] for label in pull["labels"]}
-        if "review:ok" not in labels:
-            skipped.append(f"#{pull['number']} — нет вердикта review:ok (ждёт ревью или доработку)")
+        # Гейт слияния по меткам-вердиктам — формулировка в review_labels
+        # (одно место правды): оба гейта ревью, детерминированный (review:ok,
+        # ставит scripts/review/check_pr.py) и AI (ai:ok, ставит
+        # scripts/review/ai_review.py, #18), обязаны быть зелёными.
+        gate_reason = review_labels.merge_label_gate(labels)
+        if gate_reason:
+            skipped.append(f"#{pull['number']} — {gate_reason}")
             continue
         gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
