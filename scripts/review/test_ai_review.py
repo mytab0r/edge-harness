@@ -183,3 +183,16 @@ def test_redact_masks_model_provider_keys():
 
 def test_redact_plain_text_untouched():
     assert ai.redact("обычный текст ревью без секретов") == "обычный текст ревью без секретов"
+
+
+# ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
+
+def test_is_not_found_exact_form_only():
+    # прод-форма gh: «gh api repos/o/r/issues/404: Not Found (HTTP 404)»
+    assert ai.is_not_found(RuntimeError(
+        "gh api repos/mytab0r/edge-harness/issues/404: Not Found (HTTP 404)")) is True
+    # отказ сети/права по задаче с «404» в номере — НЕ «не найдено», крик:
+    assert ai.is_not_found(RuntimeError(
+        "gh api repos/mytab0r/edge-harness/issues/1404: Forbidden (HTTP 403)")) is False
+    assert ai.is_not_found(RuntimeError(
+        "gh api repos/mytab0r/edge-harness/issues/4040: Bad gateway (HTTP 502)")) is False

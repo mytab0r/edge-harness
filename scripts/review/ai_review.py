@@ -216,6 +216,13 @@ def tasks_from_comment(comment_body: str) -> list[dict]:
 
 # ── gather: факты, дифф-пак, промпт ──────────────────────────────────────────
 
+def is_not_found(error: RuntimeError) -> bool:
+    """«Запрошенной issue нет» — по ТОЧНОЙ форме gh «Not Found (HTTP 404)»,
+    не по подстроке «404»: она ловит и URL (issues/404), из-за чего отказ
+    сети/права по задаче с «404» в номере молчно считался бы «не задача»."""
+    return "HTTP 404" in str(error)
+
+
 def task_section(pull_body: str, repo: str) -> str:
     """Задача пула, которую закрывает PR: первая открытая issue с меткой task
     из #N-ссылок тела. Нет задачи (orchestra:skip, dependabot) — так и пишем:
@@ -227,7 +234,7 @@ def task_section(pull_body: str, repo: str) -> str:
         try:
             issue = gh(f"repos/{repo}/issues/{number}")
         except RuntimeError as error:
-            if "404" in str(error):
+            if is_not_found(error):
                 continue
             raise
         if "pull_request" in issue or issue.get("state") != "open":
