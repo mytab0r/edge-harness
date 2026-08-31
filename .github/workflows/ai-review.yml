@@ -86,20 +86,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_INPUT: ${{ github.event.inputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
-          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
+          # pipefail обязателен: пайпы ниже (labels) при отказе gh обязаны
+          # ронять шаг, а не отдавать пустоту как «гонку закрытия PR».
+          set -o pipefail
           pr=""
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
             pr=$PR_INPUT
           else
-            # workflow_run не знает номера PR: ищем открытый PR по head-sha
-            # завершившегося pr-review-рана.
-            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
-              --jq ".[] | select(.head.sha == \"$RUN_HEAD\") | .number" | head -1)
+            # workflow_run не знает номера PR, но знает ветку (head_branch):
+            # pulls?head= — точный запрос без листания списков (класс
+            # «per_page=100 молча теряет хвосты» закрыт по построению).
+            # Отказ gh роняет шаг (красный): «временный 5xx» ≠ «PR закрыт».
+            # head_branch уже без префикса владельца; слэши внутри имени
+            # ветки (agent/18-…) — часть имени, не префикс.
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$RUN_BRANCH&state=open" \
+              --jq '.[0].number // empty') \
+              || { echo "::error::не смог найти PR по ветке $RUN_BRANCH (сеть/права) — молчаливый no-op тут закрыл бы гейт"; exit 1; }
             if [ -z "$pr" ]; then
               echo "go=false" >> "$GITHUB_OUTPUT"
-              echo "Открытого PR с head $RUN_HEAD нет (закрыт/слит за время события) — ревьюить нечего."
+              echo "Открытого PR на ветке $RUN_BRANCH нет (закрыт/слит за время события) — ревьюить нечего."
               exit 0
             fi
           fi

@@ -100,12 +100,15 @@ def filed_marker(body: str) -> list[int]:
     список issues имеет eventual-consistency окно в секунды — свежесозданные
     задачи не видны повторному запуску, и матч по заголовку плодил дубли
     (поймано живым прогоном #18: #141/#142 дублями #139/#140)."""
-    numbers = []
-    for line in (body or "").splitlines():
-        match = re.match(r"^filed:\s*((?:#\d+\s*)+)$", line.strip())
-        if match:
-            numbers = [int(n) for n in re.findall(r"#(\d+)", match.group(1))]
-    return numbers
+    lines = [line.strip() for line in (body or "").splitlines() if line.strip()]
+    if not lines:
+        return []
+    # ТОЛЬКО последняя непустая строка: строка «filed: #N» внутри фенса задачи
+    # (контент модели) маркером не является — проверено ревью PR #138.
+    match = re.match(r"^filed:\s*((?:#\d+\s*)+)$", lines[-1])
+    if not match:
+        return []
+    return [int(n) for n in re.findall(r"#(\d+)", match.group(1))]
 
 
 def mark_filed(repo: str, comment: dict, numbers: list[int]) -> None:
