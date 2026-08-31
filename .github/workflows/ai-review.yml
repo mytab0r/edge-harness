@@ -50,9 +50,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'review:ok'
     runs-on: ubuntu-latest
     # 60 мин — таймаут DSH (ai_dsh.sh) + установка и доверенный gather.
+    # Рабочий каталог — $RUNNER_TEMP/ai-review (шаги берут его из шелл-env
+    # раннера; job-level env не знает контекста runner — GitHub такой файл
+    # отклоняет целиком, поймано живым прогоном).
     timeout-minutes: 70
-    env:
-      AI_WORK: ${{ runner.temp }}/ai-review
     outputs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
@@ -94,6 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
         run: |
+          AI_WORK="$RUNNER_TEMP/ai-review"
           mkdir -p "$AI_WORK"
           python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
 
@@ -106,7 +108,10 @@ jobs:
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.z.ai/api/coding/paas/v4' }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'glm-5' }}
           DSH_TIMEOUT_SECS: "3600"
-        run: bash scripts/review/ai_dsh.sh
+        run: |
+          AI_WORK="$RUNNER_TEMP/ai-review"
+          export AI_WORK
+          bash scripts/review/ai_dsh.sh
 
       # Доверенный мост в job verdict: ответ — это ДАННЫЕ (текст модели),
       # не код; verdict исполняет СВОЙ чистый чекаут, а не эти файлы.
@@ -117,6 +122,7 @@ jobs:
       - name: Ответ ревью — в выводы job'а
         id: answer
         run: |
+          AI_WORK="$RUNNER_TEMP/ai-review"
           {
             echo "head=$(jq -r .head "$AI_WORK/meta.json")"
             printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
