@@ -56,4 +56,9 @@ jobs:
           # scripts/orchestra/pulse_guard.py): та же пара секретов, что у воркера
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Архив сессий раннеров после слияния (#119): сессия harness-<N> уходит
+          # в архив морды, в активных остаются живые задачи. Не заданы — шаг
+          # пропускается с ⚠️ в отчёте, слияния это не блокирует.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: python scripts/orchestra/scheduler.py

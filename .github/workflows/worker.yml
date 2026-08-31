@@ -47,6 +47,12 @@ jobs:
         with:
           node-version: 24
 
+      # pnpm нужен dsh plugin add (монтаж стрим-плагина в профиль headless,
+      # #119 — транскрипт сессии в морде; тот же шаг есть у hands).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Git-авторизация под PAT владельца
         env:
           GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
@@ -78,6 +84,12 @@ jobs:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
           HARNESS_URL: ${{ vars.HARNESS_URL }}
           HEARTBEAT_SECS: "60"
+          # Сессия раннера в морде (#119): транскрипт хода работы виден в
+          # нативном DSH UI, воркспейс edge-harness, имя = «#N: задача». Без
+          # конфигурации job падает громко: молча-невидимая сессия дороже
+          # красного прогона.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           # GLM Coding Plan: только coding-эндпоинт покрыт подпиской владельца,
           # стандартный paas/v4 отвечает QUOTA на те же модели (проверено живым
           # прогоном, см. hands.yml).

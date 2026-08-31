@@ -24,6 +24,9 @@
   agent loop, события, профили, что требует Node. **Главный документ про ядро.**
 - [11. dsh-edge](research/11-dsh-edge.md) — как DSH уже портировали на Cloudflare Workers:
   что заменили, что не работает, что забрать себе.
+- [12. dsh-edge session API](research/12-dsh-edge-session-api.md) — auth кукой владельца,
+  RPC-конверт и список методов, форма канонических событий, шов импорта транскрипта
+  раннера (патч 0004, #119).
 - [20. Cloudflare Free](research/20-cloudflare-free.md) — что реально доступно бесплатно.
   **Читать до любого решения об архитектуре на CF**: там лимит 10 ms CPU, который меняет всё.
 - [21. GitHub Actions](research/21-github-actions.md) — лимиты, бесплатность на публичных

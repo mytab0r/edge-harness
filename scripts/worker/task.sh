@@ -22,6 +22,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Пины DSH, integrity, GLM-патч профиля, redact — единственное место правды в lib.
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$SCRIPT_DIR/../lib/dsh-ci.sh"
+# Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest.
+# shellcheck source=scripts/lib/dsh-edge-session.sh
+source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
@@ -243,6 +246,17 @@ gh_user_id=$(gh api "users/$WORKER_LOGIN" --jq .id)
 git config user.name "$WORKER_LOGIN"
 git config user.email "${gh_user_id}+${WORKER_LOGIN}@users.noreply.github.com"
 
+# ── 5b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ────────
+# Имя сессии = «#N: название задачи», воркспейс edge-harness. Отказ громкий:
+# без сессии ход работы владельцу не виден — job красный (критерий #119).
+HARNESS_SID="harness-$number"
+HARNESS_TITLE="#$number: $title"
+dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
+dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
+  || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
+export DSH_EDGE_SESSION_ID="$HARNESS_SID"
+echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
+
 # ── 6. DSH: провайдер, установка (lib), GLM-патч профиля ─────────────────────────
 [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель"
 export DEEPSEEK_API_KEY
@@ -252,13 +266,45 @@ dsh_install "$WORK/pkgs"
 dsh --version || true
 dsh_patch_profile headless
 
+# ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
+# Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
+# дрен в DSH-сессию морды ведёт scripts/lib/dsh-edge-session.sh. Сеть в плагине
+# отсутствует по построению; факт монтажа доказывает --dump-config (гвардия рук).
+if ! command -v pnpm >/dev/null; then
+  echo "::error::pnpm не найден — dsh plugin add без него не работает, транскрипт морды невозможен (#119)" >&2
+  exit 1
+fi
+PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
+npm pack "$SCRIPT_DIR/../../scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
+mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
+dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+  || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
+grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
+  || { echo "::error::плагин hands-streamer не смонтировался — транскрипт морды невозможен (#119)" >&2; exit 1; }
+
 # ── 7. Прогон: cwd до старта = корень воркспейса и после не меняется (контракт dsh)
+SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
+rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
+export HANDS_SPOOL="$SPOOL_FILE"
+dsh_edge_start_drain
 set +e
 timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$PROMPT_FILE")" \
   >"$ANSWER_FILE" 2>"$ERR_FILE"
 rc=$?
 set -e
 echo "dsh завершился с кодом $rc"
+
+# Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
+dsh_edge_stop_drain
+dsh_edge_drain_spool hard \
+  || { echo "::error::Транскрипт не принят мордой — ход работы останется невидимым (#119)" >&2; exit 1; }
+drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
+echo "Событий транскрипта в морде: $drained_lines"
+if [ "$rc" -eq 0 ]; then
+  [ -f "$SPOOL_FILE" ] || { echo "::error::Спул стрима не создан при успешном прогоне — плагин не работал" >&2; exit 1; }
+  [ "$drained_lines" -gt 0 ] || { echo "::error::Ноль событий в сессии морды при успешном прогоне (#119)" >&2; exit 1; }
+fi
 
 ANSWER_TAIL=$(tail -c 4000 "$ANSWER_FILE" | redact)
 ERR_TAIL=$(tail -c 4000 "$ERR_FILE" | redact)

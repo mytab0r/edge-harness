@@ -28,11 +28,16 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      замки упомянутых в его теле задач освобождаются.
 """
 
+import http.cookiejar
 import importlib.util
+import json
 import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -195,6 +200,73 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
     return lines
 
 
+# ── Сессии раннеров в морде dsh-edge (#119) ───────────────────────────────────────
+# После слияния PR задача закончена: сессия раннера harness-<N> уходит в архив
+# морды, в списке активных остаются только живые задачи. Архив не удаляется —
+# история читаема. Сессии может не быть (PR без раннера) — это норма, не ошибка.
+
+DSH_EDGE_URL = os.environ.get("DSH_EDGE_URL", "")
+DSH_EDGE_ACCESS_KEY = os.environ.get("DSH_EDGE_ACCESS_KEY", "")
+
+
+def _morde_opener() -> urllib.request.OpenerDirector:
+    """Opener с cookie-jar: логин обменивает access-ключ на куку владельца."""
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+
+def _morde_login(opener: urllib.request.OpenerDirector) -> None:
+    data = urllib.parse.urlencode({"accessKey": DSH_EDGE_ACCESS_KEY}).encode()
+    req = urllib.request.Request(
+        DSH_EDGE_URL.rstrip("/") + "/api/auth/login", data=data, method="POST")
+    with opener.open(req, timeout=30) as resp:
+        resp.read()
+
+
+def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict) -> dict:
+    body = json.dumps({
+        "type": "client-request",
+        "rpcId": "orchestra",
+        "method": method,
+        "payload": payload,
+    }).encode()
+    req = urllib.request.Request(
+        DSH_EDGE_URL.rstrip("/") + "/api/" + method,
+        data=body, method="POST",
+        headers={"content-type": "application/json"})
+    with opener.open(req, timeout=30) as resp:
+        result = json.load(resp)
+    inner = result.get("result", {})
+    if not inner.get("ok"):
+        error = inner.get("error", {})
+        raise RuntimeError(f'{error.get("code", "unknown")}: {error.get("message", "")}')
+    return inner.get("value", {})
+
+
+def archive_runner_sessions(task_numbers: list[int]) -> list[str]:
+    """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR."""
+    if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
+        return ["⚠️ DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY не заданы — архив сессий раннеров пропущен (#119)"]
+    try:
+        opener = _morde_opener()
+        _morde_login(opener)
+    except (OSError, urllib.error.URLError, ValueError) as error:
+        return [f"⚠️ морда dsh-edge недоступна для архива сессий: {error}"]
+    lines = []
+    for number in task_numbers:
+        session_id = f"harness-{number}"
+        try:
+            _morde_rpc(opener, "workspace.archiveSession", {"sessionId": session_id})
+            lines.append(f"🗄️ #{number}: сессия {session_id} заархивирована в морде")
+        except RuntimeError as error:
+            if "session-not-found" in str(error):
+                lines.append(f"🗄️ #{number}: сессии раннера в морде нет — архивировать нечего")
+            else:
+                lines.append(f"⚠️ #{number}: сессия {session_id} не заархивирована: {error}")
+        except (OSError, ValueError) as error:
+            lines.append(f"⚠️ #{number}: архив сессии не удался: {error}")
+    return lines
+
+
 def after_merge(repo: str, pull: dict) -> list[str]:
     """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
     (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно."""
@@ -239,6 +311,8 @@ def after_merge(repo: str, pull: dict) -> list[str]:
         except RuntimeError as error:
             # один кривой реф не должен ронять остальные действия after_merge
             lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
+    if task_refs:
+        lines += archive_runner_sessions(task_refs)
     return lines
 
 
