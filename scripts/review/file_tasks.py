@@ -17,6 +17,7 @@
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -93,6 +94,26 @@ def current_repo() -> str:
     return result.stdout.strip()
 
 
+def filed_marker(body: str) -> list[int]:
+    """Маркер заведённого в последней строке комментария: «filed: #139 #140».
+    Состояние живёт в самом ревью-комментарии (паттерн Harness pr_loop):
+    список issues имеет eventual-consistency окно в секунды — свежесозданные
+    задачи не видны повторному запуску, и матч по заголовку плодил дубли
+    (поймано живым прогоном #18: #141/#142 дублями #139/#140)."""
+    numbers = []
+    for line in (body or "").splitlines():
+        match = re.match(r"^filed:\s*((?:#\d+\s*)+)$", line.strip())
+        if match:
+            numbers = [int(n) for n in re.findall(r"#(\d+)", match.group(1))]
+    return numbers
+
+
+def mark_filed(repo: str, comment: dict, numbers: list[int]) -> None:
+    body = (comment.get("body") or "").rstrip("\n")
+    gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment['id']}",
+       "-f", "body=" + body + "\n\nfiled: " + " ".join(f"#{n}" for n in numbers))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Завести задачи из AI-ревью PR в пул")
     parser.add_argument("--pr", type=int, required=True)
@@ -111,10 +132,16 @@ def main() -> int:
               f"не предложило задач — пул не тронут")
         return 0
 
+    already = filed_marker(comment.get("body") or "")
+    if already:
+        print(f"Ревью {facts.get('reviewer')} при head {facts.get('head', '?')[:12]}: "
+              f"задачи уже заведены ({' '.join(f'#{n}' for n in already)}) — идемпотентность по маркеру")
+        return 0
+
     existing = open_task_titles(repo)
     print(f"Ревью {facts.get('reviewer')} при head {facts.get('head', '?')[:12]}: "
           f"{len(tasks)} предложенных задач, открытых с меткой task: {len(existing)}")
-    filed = 0
+    filed: list[int] = []
     for task in tasks:
         if task["title"] in existing:
             print(f"  = «{task['title']}» — уже открыта, пропущено (идемпотентность)")
@@ -123,10 +150,16 @@ def main() -> int:
             print(f"  [dry-run] завёл бы: «{task['title']}»")
             continue
         number = file_task(repo, task)
+        filed.append(number)
         print(f"  + #{number} «{task['title']}»")
-        filed += 1
-    if not args.dry_run:
-        print(f"Готово: заведено {filed}, пропущено {len(tasks) - filed}")
+    if args.dry_run:
+        return 0
+    if filed:
+        # Маркер — ПОСЛЕ создания (атомарности нет, но окно дублей сужено до
+        # параллельных запусков команды, чего человек не делает).
+        mark_filed(repo, comment, filed)
+        print(f"filed: {' '.join(f'#{n}' for n in filed)} — маркер в ревью-комментарии")
+    print(f"Готово: заведено {len(filed)}, пропущено {len(tasks) - len(filed)}")
     return 0
 
 
