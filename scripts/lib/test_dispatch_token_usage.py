@@ -9,9 +9,10 @@ runner-bridge — сузили токен, сломали конвейер. Ра
 молча возвращает широкий PAT туда, откуда его вывели.
 
 Правила:
-  1. `secrets.GH_DISPATCH_TOKEN` в .github/workflows/ упоминает ТОЛЬКО
-     deploy-worker.yml (единственный потребитель узкого токена: синхронизация
-     значения в секрет воркера).
+  1. `secrets.GH_DISPATCH_TOKEN` в .github/workflows/ (в любой форме записи —
+     dot и bracket; файлы .yml И .yaml) упоминает ТОЛЬКО deploy-worker.yml
+     (единственный потребитель узкого токена: синхронизация значения в секрет
+     воркера).
   2. deploy-worker.yml обязан сохранять саму синхронизацию
      (`wrangler secret put GH_DISPATCH_TOKEN`) — иначе узкий токен не доедет
      до воркера, и морда молча останется на старом значении.
@@ -22,12 +23,15 @@ runner-bridge — сузили токен, сломали конвейер. Ра
 Запуск: python -m pytest scripts/lib/test_dispatch_token_usage.py -q
 """
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-DISPATCH_SECRET = "secrets.GH_DISPATCH_TOKEN"
+# GitHub Actions грузит workflows из .yml И .yaml — гвардия обязана видеть оба
+# (находка AI-ревью #146: файл evil.yaml со скваттером проходил все тесты зелёно).
+DISPATCH_SECRET_RE = r"secrets[.\[]\s*['\"]?GH_DISPATCH_TOKEN\b"
 PIPELINE_SECRET = "secrets.GH_PIPELINE_PAT"
 
 # Единственный законный потребитель узкого dispatch-токена.
@@ -57,7 +61,10 @@ EXPECTED_WORKFLOWS = frozenset({
     "worker.yml",
 })
 
-ALL_WORKFLOWS = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
+ALL_WORKFLOWS = sorted(
+    path.name for path in WORKFLOWS.iterdir()
+    if path.suffix in {".yml", ".yaml"}
+)
 
 
 def workflow_text(name: str) -> str:
@@ -76,24 +83,28 @@ def test_workflow_set_is_pinned():
 
 
 def test_dispatch_token_secret_used_only_by_deploy_worker():
-    """Узкий токен живёт только в deploy-пути морды (правило 1)."""
+    """Узкий токен живёт только в deploy-пути морды (правило 1).
+
+    Матчинг — regex: `secrets.GH_DISPATCH_TOKEN` и bracket-формы
+    `secrets['GH_DISPATCH_TOKEN']` — один класс, оба — скваттерство
+    (обходы из ревью #146 / задачи #151)."""
     squatters = [
         name
         for name in ALL_WORKFLOWS
-        if name != DISPATCH_CONSUMER and DISPATCH_SECRET in workflow_text(name)
+        if name != DISPATCH_CONSUMER and re.search(DISPATCH_SECRET_RE, workflow_text(name))
     ]
     assert not squatters, (
-        f"secrets.GH_DISPATCH_TOKEN вне {DISPATCH_CONSUMER}: {squatters} — "
-        "это узкий fine-grained PAT морды (задача #6, ADR 0008); широким "
-        "потребителям нужен secrets.GH_PIPELINE_PAT"
+        f"secrets.GH_DISPATCH_TOKEN (в любой форме записи) вне {DISPATCH_CONSUMER}: "
+        f"{squatters} — это узкий fine-grained PAT морды (задача #6, ADR 0008); "
+        "широким потребителям нужен secrets.GH_PIPELINE_PAT"
     )
 
 
 def test_deploy_worker_still_syncs_dispatch_token():
     """Деплой обязан доставлять узкий токен в секрет воркера (правило 2)."""
     text = workflow_text(DISPATCH_CONSUMER)
-    assert DISPATCH_SECRET in text, (
-        f"{DISPATCH_CONSUMER} больше не читает {DISPATCH_SECRET} — синхронизация "
+    assert re.search(DISPATCH_SECRET_RE, text), (
+        f"{DISPATCH_CONSUMER} больше не читает secrets.GH_DISPATCH_TOKEN — синхронизация "
         "секрета воркера потеряна, морда застрянет на старом значении"
     )
     assert "wrangler secret put GH_DISPATCH_TOKEN" in text, (

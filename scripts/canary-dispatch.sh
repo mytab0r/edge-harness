@@ -25,7 +25,10 @@ HANDS_TOKEN=${HANDS_TOKEN:?нужен HANDS_TOKEN (секрет репозито
 TIMEOUT_SECS=${TIMEOUT_SECS:-300}
 
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
-since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Запас −30с: since сравнивается с createdAt run'а ПО ЧАСАМ СЕРВЕРА GitHub —
+# расхождение локальных часов вперёд даже на секунду выкинет свежий run из
+# фильтра, и канарейка соврёт «run не появился» (находка AI-ревью #146).
+since=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
 
 echo "== POST $HARNESS_URL/api/tasks (отправка от $since UTC)"
 response=$(curl -sS -w '\n%{http_code}' -X POST "$HARNESS_URL/api/tasks" \
