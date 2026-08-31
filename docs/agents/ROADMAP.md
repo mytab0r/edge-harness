@@ -11,7 +11,7 @@ gantt
   section Транспорт (walking-skeleton)
     Морда+мозг+руки, канарейки, замеры :done, t1, 2026-08-28, 1d
   section Ядро (DSH на CF+GH)
-    Эпик: интеграция DSH в третий бэкенд     :active, d1, after t1, 14d
+    Эпик: интеграция DSH в третий бэкенд     :done, d1, after t1, 14d
     Ротация учёток (ProviderChain-порт)      :d2, after d1, 7d
   section Инфраструктура
     Security baseline (SECURITY/CodeQL/Dependabot) :active, s1, 2026-08-28, 2d
@@ -35,3 +35,13 @@ gantt
 - **Цель — DSH на Cloudflare + GitHub**, а не собственный харнес с нуля. Скелет —
   только транспорт и лимиты (openspec/changes/walking-skeleton/proposal.md);
   ядро агента, сессии, провайдеры — портируются из DSH в объявленные им швы.
+
+## Состояние потока «Ядро» (эпик #17, приёмка 2026-08-31)
+
+Фаза 2 принята по живому прогону: агентский цикл DSH исполняется в job раннера
+(ADR 0002 — воркер и руки), транскрипт сессий виден в морде dsh-edge
+(ingest-шов #119), транспорт скелета (api-spec, hands) остаётся. Делегирование
+«задача из морды» через чат dsh-edge (runner-bridge, #95) упёрлось в блок
+GitHub API из egress CF — измерено и вынесено в
+[задачу #133](https://github.com/mytab0r/edge-harness/issues/133); до её решения
+вход в конвейер — скелетная морда и пул Issues.
