@@ -23,17 +23,29 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
   6. «Кто следит за следящим» (#120): каждый запуск сначала проверяет возраст
      последнего успешного пульса orchestra — пропавшие пульсы кричат в Telegram,
      пока этот запуск сам жив.
+  7. Замки задач (#121): протухшие аренды (refs/locks/task-*, TTL в
+     scripts/lib/claim_task.py) снимаются со следом в задаче; после слияния PR
+     замки упомянутых в его теле задач освобождаются.
 """
 
+import importlib.util
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # gh()/parse_time() и логика предохранителя — одно место правды в pulse_guard
 # (пороги WORKER_FAILURE_PAUSE_AFTER / HEARTBEAT_MAX_AGE_MINUTES живут там же).
 from pulse_guard import conveyor_gate, gh, heartbeat_check, parse_time
+
+# claim_task живёт в scripts/lib (общее место для всех каналов): TTL замка —
+# одна константа LOCK_TTL_HOURS там, сюда не дублируется.
+_LIB = Path(__file__).resolve().parents[1] / "lib" / "claim_task.py"
+_claim_spec = importlib.util.spec_from_file_location("claim_task", _LIB)
+claim_task = importlib.util.module_from_spec(_claim_spec)
+_claim_spec.loader.exec_module(claim_task)
 
 STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
@@ -202,6 +214,12 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
     task_refs = sorted({m.group(1) for m in re.finditer(r"#(\d+)", pull.get("body") or "")}, key=int)
     for task_number in task_refs:
+        # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
+        # Идемпотентно: замка может не быть (канал без аренды) — это не ошибка.
+        try:
+            lines.append(f"🔓 {claim_task.release(repo, int(task_number))}")
+        except RuntimeError as error:
+            lines.append(f"⚠️ замок task-{task_number} не снят: {error}")
         try:
             issue = gh(f"repos/{repo}/issues/{task_number}")
             if "pull_request" in issue or issue["state"] != "open":
@@ -279,6 +297,11 @@ def main() -> int:
     lines.append(f"Открытых PR: {len(pulls)}")
 
     stale_lines = reap_stale(repo, now, pulls)
+    try:
+        lease_lines = claim_task.collect_stale(repo, now)
+    except RuntimeError as error:
+        # сборщик замков не должен блокировать слияния, но и не молчит (#124-класс)
+        lease_lines = [f"⚠️ обход замков задач не удался: {error}"]
     pulls = open_pulls(repo)  # состояние могло измениться
     conflict_lines = mark_conflicts(repo, pulls)
     merge_lines = merge_queue(repo, pulls)
@@ -292,9 +315,9 @@ def main() -> int:
     conveyor_lines, dispatch_allowed = conveyor_gate(repo, now)
     worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
 
-    if stale_lines or conflict_lines or merge_lines or conveyor_lines or worker_lines:
+    if stale_lines or conflict_lines or merge_lines or lease_lines or conveyor_lines or worker_lines:
         lines += ["", "### Действия",
-                  *stale_lines, *conflict_lines, *merge_lines, *conveyor_lines, *worker_lines]
+                  *stale_lines, *lease_lines, *conflict_lines, *merge_lines, *conveyor_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
 
