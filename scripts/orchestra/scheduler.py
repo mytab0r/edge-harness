@@ -98,7 +98,9 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
         )
         gh(
             "-X", "POST", f"repos/{repo}/issues/{number}/comments",
-            "-f", body=(
+            # body уходит ЗНАЧЕНИЕМ аргумента "-f body=…" (форма gh api):
+            # keyword-аргумент gh() не принимает и роняет весь прогон (#124).
+            "-f", "body=" + (
                 f"Назначение снято оркестратором: за {STALE_HOURS} часов не появился PR, "
                 f"а задача назначена {who}. Задача возвращена в пул — бери через assign."
             ),
@@ -122,8 +124,10 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
         rivals = ", ".join(f"#{other['number']}" for other in pulls if other["number"] != pull["number"]) or "нет"
         gh(
             "-X", "POST", f"repos/{repo}/issues/{pull['number']}/comments",
-            "-f", body=f"PR конфликтует с main (открытые конкуренты: {rivals}). "
-                       "Перебазируй на свежий main и продолжай — оркестратор подхватит.",
+            "-f", "body=" + (
+                f"PR конфликтует с main (открытые конкуренты: {rivals}). "
+                "Перебазируй на свежий main и продолжай — оркестратор подхватит."
+            ),
         )
         lines.append(f"⚠️ PR #{pull['number']} помечен `conflict`")
     return lines
