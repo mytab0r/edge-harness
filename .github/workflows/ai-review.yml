@@ -1,7 +1,12 @@
 # AI-ревьюер диффа — второй гейт конвейера после детерминированного ревью (#18).
 #
-# Триггер: метка review:ok на PR (её ставит workflow pr-review, когда первый
-# гейт прошёл) или workflow_dispatch (input pr — повтор после сбоя модели).
+# Триггер: завершение workflow pr-review (workflow_run) — единственный
+# событийный вход, который РАБОТАЕТ: метки, поставленные GITHUB_TOKEN, не
+# создают событий (антирекурсия GitHub), и on: pull_request[labeled] молчал
+# бы вечно; workflow_run — документированный обход этого ограничения
+# (research/21). Фильтр: pr-review завершился успехом = review:ok поставлен.
+# Повтор/миграция — workflow_dispatch (input pr): события отгоревших PR
+# не восстановить.
 # Итог: содержательный ревью-комментарий в PR + вердикт-метка ai:ok /
 # ai:changes-requested / ai:failed. Оркестратор сливает только при
 # review:ok И ai:ok (scripts/lib/review_labels.py — одно место правды).
@@ -30,8 +35,9 @@
 name: ai-review
 
 on:
-  pull_request:
-    types: [labeled]
+  workflow_run:
+    workflows: [pr-review]
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr:
@@ -45,12 +51,18 @@ permissions:
   issues: read
 
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  # Группа = породивший run pr-review (уникален) либо номер PR из dispatch:
+  # ревью разных PR не сериализуются, у одного PR новый пуш = новый pr-review
+  # run = своя группа; протухший вердикт всё равно не применяется (head-check).
+  group: ai-review-${{ github.event.workflow_run.id || github.event.inputs.pr }}
   cancel-in-progress: false
 
 jobs:
   review:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'review:ok'
+    # pr-review завершился успехом (= review:ok поставлен) либо ручной dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     # 60 мин — таймаут DSH (ai_dsh.sh) + установка и доверенный gather.
     # Рабочий каталог — $RUNNER_TEMP/ai-review (шаги берут его из шелл-env
@@ -61,29 +73,60 @@ jobs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
+      pr: ${{ steps.facts.outputs.pr }}
+      go: ${{ steps.facts.outputs.go }}
     steps:
       # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
       # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
       # Step-outputs читаются из СВОЕГО временного файла на момент закрытия
       # шага — поздние записи в него игнорируются.
-      - name: Факты PR (номер и head)
+      - name: Факты PR (номер, head, решение «ревьюим?»)
         id: facts
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_INPUT: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          PR_INPUT: ${{ github.event.inputs.pr }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
         run: |
-          case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
-          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_INPUT" --jq .head.sha)
-          [ -n "$head" ] || { echo "::error::у PR #$PR_INPUT нет head-sha"; exit 1; }
+          pr=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
+            pr=$PR_INPUT
+          else
+            # workflow_run не знает номера PR: ищем открытый PR по head-sha
+            # завершившегося pr-review-рана.
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+              --jq ".[] | select(.head.sha == \"$RUN_HEAD\") | .number" | head -1)
+            if [ -z "$pr" ]; then
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              echo "Открытого PR с head $RUN_HEAD нет (закрыт/слит за время события) — ревьюить нечего."
+              exit 0
+            fi
+          fi
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)
+          [ -n "$head" ] || { echo "::error::у PR #$pr нет head-sha"; exit 1; }
+          # Источник правды — метка, а не вывод из conclusion: pr-review мог
+          # завершиться успехом с review:large (не ок) — тогда гейт не открыт.
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels" --jq '[.[].name] | join(" ")')
+          case " $labels " in
+            *" review:ok "*) go=true ;;
+            *)
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              echo "PR #$pr: review:ok не стоит ($labels) — гейт первого ревью не открыт, выходим без ревью."
+              exit 0
+              ;;
+          esac
           {
-            echo "pr=$PR_INPUT"
+            echo "pr=$pr"
             echo "head=$head"
+            echo "go=$go"
           } >> "$GITHUB_OUTPUT"
-          echo "PR #$PR_INPUT, head $head"
+          echo "PR #$pr, head $head — ревьюим"
 
       # Доверенный инструментарий — из main: эти скрипты исполняются с
       # GH_TOKEN в шагах ниже и обязаны быть вне досягания ревьюимого PR.
-      - uses: actions/checkout@v7
+      - if: steps.facts.outputs.go == 'true'
+        uses: actions/checkout@v7
         with:
           ref: main
           persist-credentials: false
@@ -91,18 +134,21 @@ jobs:
       # Дерево PR — только ДАННЫЕ для агента: агент читает репозиторий в
       # состоянии ветки (docs/спеки/код), но ни один доверенный шаг отсюда
       # не исполняется.
-      - uses: actions/checkout@v7
+      - if: steps.facts.outputs.go == 'true'
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.facts.outputs.head }}
           path: pr-head
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - if: steps.facts.outputs.go == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
-      - name: Сбор фактов и промпт (доверенный шаг)
+      - if: steps.facts.outputs.go == 'true'
+        name: Сбор фактов и промпт (доверенный шаг)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
@@ -113,7 +159,8 @@ jobs:
 
       # ── НЕдоверенный шаг: НИКАКОГО GitHub-токена в env ────────────────────
       # cwd = дерево PR (данные агента), сам транспорт — из main-чекаута.
-      - name: Ревью агентом (DSH headless, без GitHub-токена)
+      - if: steps.facts.outputs.go == 'true'
+        name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
@@ -134,7 +181,8 @@ jobs:
       # (контракт: ≤5 находок + блоки задач). ДелIMITER не встретится в
       # ответе; даже если встретится — вывод исковеркается и verdict уйдёт
       # в error → ai:failed (fail-closed).
-      - name: Ответ ревью — в выводы job'а
+      - if: steps.facts.outputs.go == 'true'
+        name: Ответ ревью — в выводы job'а
         id: answer
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
@@ -153,6 +201,7 @@ jobs:
   # ── Доверенный job: свежая VM, чекаут main, токен на запись ────────────────
   verdict:
     needs: review
+    if: needs.review.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -173,9 +222,10 @@ jobs:
       - name: "Вердикт: комментарий + метка"
         env:
           GH_TOKEN: ${{ github.token }}
-          # Номер PR — из контекста события (не подделывается из job'а review);
-          # head — момент gather (сверка ловит уехавший за время ревью PR).
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          # Номер PR — из outputs доверенного facts-шага job'а review: у
+          # workflow_run-события pull_request-контекста нет, а сырой event
+          # недоверенной стороной не редактируется. head — момент gather.
+          PR_NUMBER: ${{ needs.review.outputs.pr }}
           HEAD_REVIEWED: ${{ needs.review.outputs.head }}
           ANSWER: ${{ needs.review.outputs.answer }}
           DSH_RC: ${{ needs.review.outputs.dsh_rc }}

@@ -8,7 +8,8 @@
 
 ```
 PR получает review:ok (check_pr.py, первый гейт)
-        │ labeled: review:ok
+        │ pr-review завершается (GITHUB_TOKEN-метки событий не создают —
+        │ research/21; событийный вход — workflow_run)
         ▼
 job review (права: только чтение; ВМ умирает вместе с недоверенным шагом)
         ├─ 1. Факты PR (GH_TOKEN): номер + head-sha → step-outputs
@@ -73,6 +74,18 @@ job'а делят workspace, `$GITHUB_ENV` и PATH — непрямая prompt-�
 5. **Модель ушла в бесконечность.** `timeout` в ai_dsh.sh (60 мин) +
    `timeout-minutes` job (70); пустой ответ = `error` → `ai:failed`, гейт
    закрыт, job красный.
+
+## Триггер: workflow_run, а не labeled (замер)
+
+Метки, поставленные GITHUB_TOKEN (так ставит review:ok сам check_pr), не
+создают workflow-событий — антирекурсия GitHub. Поэтому событийный триггер
+ai-review — завершение pr-review (`workflow_run`): conclusion=success плюс
+проверка МЕТКИ review:ok в доверенном facts-шаге (успешный pr-review может
+ставить и review:large). Номер PR в событии workflow_run отсутствует —
+разрешается по head_sha завершившегося рана; раны без открытого PR или без
+review:ok завершаются зелёным no-op (это нормальные гонки, не ошибки).
+Отгоревшие события (миграция открытых PR) не восстановить — только
+workflow_dispatch.
 
 ## Ограничение платформы: новый workflow не самоприменяется (замер)
 
