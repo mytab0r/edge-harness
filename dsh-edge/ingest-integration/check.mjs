@@ -95,6 +95,18 @@ async function rpc(method, payload) {
 }
 
 try {
+  // unstable_dev отвечает до полной готовности воркера: первый прогон в CI
+  // словил 503 на логине (деплой #128). Ждём /api/health (публичный) до 30 с.
+  {
+    const deadline = Date.now() + 30_000
+    for (;;) {
+      try {
+        if ((await fetch(`http://${worker.address}:${worker.port}/api/health`)).ok) break
+      } catch {}
+      if (Date.now() > deadline) throw new Error('unstable_dev не поднялся за 30 с: /api/health недоступен')
+      await new Promise((r) => setTimeout(r, 500))
+    }
+  }
   const login = await fetch(`http://${worker.address}:${worker.port}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
