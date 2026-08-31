@@ -1,0 +1,97 @@
+# dsh-edge: session API и шов импорта транскрипта
+
+> Исследовано 2026-08-30/31 в рамках #119; нативные вызовы выверены на живом
+> проде (dsh-edge.mytab0r.workers.dev, release 0.7.1 = пин 113a969). Смежное:
+> [архитектура dsh-edge](11-dsh-edge.md).
+
+## Auth: кука владельца, не Bearer
+
+- Единственная аутентификация API — подписанная HttpOnly-кука
+  `__Host-dsh_edge_owner` (или `dsh_edge_owner` на http). Bearer-токены и
+  заголовок `Authorization` API не принимает: `index.ts` вырезает
+  `authorization` перед передачей в DO (`requestForInstance`).
+- Логин: `POST /api/auth/login`, form-urlencoded `accessKey=<ключ воркера
+  DSH_EDGE_ACCESS_KEY>` → `303` + `set-cookie` (TTL 30 дней). Проверка:
+  `GET /api/auth/session` → `{"authenticated":true}`.
+- Кросс-доменные запросы с кукой отклоняются (403) по заголовку `Origin`;
+  curl/серверные клиенты без `Origin` проходят.
+
+## RPC: конверт и полный список методов
+
+- `POST /api/<method>` (например `/api/session.create`) с телом
+  `{type:"client-request", rpcId:"<непустая строка>", method:"<тот же method>",
+  payload:{…}}`. Ответ: `{type:"server-response", rpcId, result:{ok:true,value}|{ok:false,error}}`.
+- `method` в теле обязан совпадать с путём; content-type — `application/json`.
+- Методы (из UNARY_ROUTES `@deepseek-ai/dsh-host-apiproxy` 0.1.1-rc.2):
+  `session.list/search/create/history/models/selectModel/rename/fork/prompt/
+  attachment/updateQueue/cancel`, `subagent.*`, `host.describe/pickDirectory/
+  listDirectory/createDirectory/openPath`, `workspace.list/create/rename/delete/
+  insertBefore/insertSessionBefore/archiveSession`, `skill.list`, `goal.*`,
+  `settings.*`, `credentials.*`, `llm.*`.
+- Полезные payload'ы (все проверены живьём):
+  - `workspace.create {path}` → `{workspace:{workspaceId,…}, created}`.
+    Идемпотентен по каноническому пути: повтор даёт `created:false` и тот же id.
+    Проверку «каталог существует» в Edge снял upstream-патч dsh-workspace, так
+    что `/workspace/edge-harness` создаётся без файлов в VFS.
+  - `session.create {workspaceId XOR cwd, sessionId?, agentPreset?}` →
+    `{sessionId, agentPreset}`. `sessionId` можно задать САМОМУ (любая непустая
+    строка ≤ MAX_SESSION_ID_LENGTH) — это даёт идемпотентный «create-or-reuse».
+  - `session.rename {sessionId, title}` → `{title, seq}`. Заголовок хранится
+    как `session/title` с `source:{kind:"user"}` — а такой заголовок
+    ПИННИТСЯ: `SessionTitleService.onUserMessage` не планирует авторексайр
+    (проверено по `@deepseek-ai/dsh-session-title` 0.1.1-rc.2), то есть
+    FirstPromptTitle не перезапишет «#N: задача» после первого сообщения.
+  - `workspace.archiveSession {sessionId}` → `{archivedSessionIds:[…]}` —
+    архив глобальный; архивированная сессия исчезает из активных, история
+    читаема. Неизвестная сессия → `result.ok:false`, `error.code:"session-not-found"`.
+  - `session.list {}` → `items[].projections.values.title` — поиск сессии
+    по заголовку клиентом (оркестратором) возможен без patch.
+- Replay-чтение: `GET /api/sessions/:id/events` — SSE-кадры (`data: {JSON}`).
+
+## Форма канонических событий (то, что можно дописать в сессию)
+
+Словарь — `SessionEventMap` (`@deepseek-ai/dsh-session` 0.1.1-rc.2,
+`lib/types/types.d.ts`). Поверхностные (влияют на derived history и чат):
+`user/message` (data = само сообщение), `assistant/message` `{turn, step,
+message, usage?, interrupted?}`, `tool/result` `{turn, step, message, error?, meta?}`.
+Журнальные: `turn/start {turn}`, `turn/end {turn, reason:{kind}}`,
+`step/start`, `step/end` `{turn, step}`, `tool/call {turn, step, callId, name,
+arguments}`. Поверхностное событие при `Session.append` ОБЯЗАНО нести
+`surfaceOp` (для дописывания — `'append'`); `sourceEventSeqs` опционален.
+Контент-блоки (`@deepseek-ai/dsh-llm`): `text`, `reasoning` (think),
+`tool-call`, `tool-result`.
+
+Спул плагина dsh-hands-streamer уже несёт эту форму (`{v, session_id, seq,
+time, type, data}`) с allowlist из 8 типов — то есть раннерский транскрипт
+пересаживается в DO-сессию почти дословно; морда назначает свои seq.
+
+## Чего в dsh-edge НЕТ и что дал патч 0004
+
+- Апстрим не имеет API дописать события в чужую сессию: поверхностные события
+  пишет только агент-цикл. Импорт транскрипта раннера закрыт нашим патчем
+  `dsh-edge/patches/0004-harness-ingest.patch`: `POST /api/sessions/:id/ingest`
+  (батч `{events:[{type,data}]}`, allowlist = allowlist спула, перенумерация
+  turn поверх хранимого лога, `surfaceOp:'append'`, flush до ответа,
+  публикация живым подписчикам через штатный late-event путь стора).
+- Двойная публикация не возникает: стор сам публикует события не-turn'овых
+  агентов (конфиг `onLateSessionEvent`), поэтому маршруту достаточно append+flush.
+- Бренд-нейтрально: `session.rename` живого прода корректно хранит UTF-8
+  заголовки (кириллица проверена round-trip'ом).
+
+## Не подтверждено
+
+- Поведение UI при `tool/call` без предшествующего `assistant/message` с
+  tool-call-блоком не проверялось глазами (replay API отдал события; визуально
+  канарейка деплоя проверяет только факт 200/ingest). Если владелец увидит
+  кривую отрисовку — беда не в данных, а в рендере, чинится формой батча.
+- Гонка «ingest против живого нативного хода» в той же сессии даёт BUSY (409)
+  из `openAgentForTurn`; поведение UI при повторе после BUSY не изучалось.
+
+## Источники
+
+- Живой прод (RPC-пробы 2026-08-31): workspace/session/rename/archive/list,
+  кодировки заголовков, идемпотентность workspace.create.
+- npm-пакеты `@deepseek-ai/dsh-session`, `dsh-llm`, `dsh-workspace`,
+  `dsh-host-apiproxy`, `dsh-session-title*` 0.1.1-rc.2 (types и lib).
+- `apps/dsh-edge/src/{index,instance,session-store,http,auth,edge-api}.ts`
+  на пине 113a969; `standalone/patches/audit.json`.

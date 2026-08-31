@@ -1,0 +1,259 @@
+diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
+index 7e64c79..64566fa 100644
+--- a/apps/dsh-edge/src/http.ts
++++ b/apps/dsh-edge/src/http.ts
+@@ -10,6 +10,10 @@ export const MAX_SESSION_CREATE_BODY_BYTES = 8_192
+ // Four projected image uploads fit after base64 expansion plus the RPC envelope.
+ export const MAX_TURN_BODY_BYTES = 10 * 1_024 * 1_024
+ export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
++// Harness ingest (#119): one runner drain batch (spool lines, 700 KB budget) fits
++// with envelope headroom; the ceiling caps per-admission memory in the DO.
++export const MAX_HARNESS_INGEST_BODY_BYTES = 1_048_576
++export const MAX_HARNESS_INGEST_EVENTS = 256
+ 
+ /** Invalid caller input with an explicit HTTP response status. */
+ export class EdgeHttpError extends Error {
+diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
+index 4a23ef9..51bfc93 100644
+--- a/apps/dsh-edge/src/index.ts
++++ b/apps/dsh-edge/src/index.ts
+@@ -10,6 +10,7 @@ import {
+ } from './auth.ts'
+ import {
+   EdgeHttpError,
++  MAX_HARNESS_INGEST_BODY_BYTES,
+   MAX_SESSION_CREATE_BODY_BYTES,
+   MAX_TURN_BODY_BYTES,
+   MAX_WORKSPACE_EXEC_BODY_BYTES,
+@@ -166,11 +167,13 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
+   headers.set(OWNER_SESSION_EXPIRY_HEADER, String(ownerSessionExpiresAt))
+   if (request.body === null) return new Request(request, { headers })
+   const url = new URL(request.url)
+-  const maxBytes = url.pathname.endsWith('/turn')
+-    || url.pathname === '/api/session.prompt'
+-    || url.pathname === '/api/session.updateQueue'
+-    ? MAX_TURN_BODY_BYTES
+-    : MAX_SESSION_CREATE_BODY_BYTES
++  const maxBytes = url.pathname.endsWith('/ingest')
++    ? MAX_HARNESS_INGEST_BODY_BYTES
++    : url.pathname.endsWith('/turn')
++      || url.pathname === '/api/session.prompt'
++      || url.pathname === '/api/session.updateQueue'
++      ? MAX_TURN_BODY_BYTES
++      : MAX_SESSION_CREATE_BODY_BYTES
+   const body = await readBoundedBody(
+     request,
+     maxBytes,
+diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
+index 9b15245..43f172f 100644
+--- a/apps/dsh-edge/src/instance.ts
++++ b/apps/dsh-edge/src/instance.ts
+@@ -39,6 +39,8 @@ import {
+ } from './deployment.ts'
+ import {
+   EdgeHttpError,
++  MAX_HARNESS_INGEST_BODY_BYTES,
++  MAX_HARNESS_INGEST_EVENTS,
+   MAX_SESSION_CREATE_BODY_BYTES,
+   MAX_TURN_BODY_BYTES,
+   corsHeaders,
+@@ -332,6 +334,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+         return await this.startTurn(request, route.sessionId)
+       } else if (route.action === 'cancel' && request.method === 'POST') {
+         return this.cancelTurn(route.sessionId)
++      } else if (route.action === 'ingest' && request.method === 'POST') {
++        return await this.ingestHarnessEvents(request, route.sessionId)
+       }
+ 
+       throw new EdgeHttpError(404, 'Session route not found.')
+@@ -734,6 +738,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+     })
+   }
+ 
++  /**
++   * Ingest one harness runner transcript batch (#119). The runner drives its own
++   * DSH process outside this deployment; the batch mirrors the canonical events
++   * it produced into a viewer session so the owner reads the run in the native
++   * UI. Mapping and durability live in the session store; this route only binds
++   * the body limits.
++   */
++  private async ingestHarnessEvents(request: Request, sessionId: SessionId): Promise<Response> {
++    const body = await readJsonObject(request, MAX_HARNESS_INGEST_BODY_BYTES)
++    const events = body.events
++    if (!Array.isArray(events) || events.length === 0) {
++      throw new EdgeHttpError(400, 'The request body must be {"events":[...]} with at least one event.')
++    }
++    if (events.length > MAX_HARNESS_INGEST_EVENTS) {
++      throw new EdgeHttpError(413, `Harness ingest accepts at most ${MAX_HARNESS_INGEST_EVENTS} events per batch.`)
++    }
++    try {
++      const result = await this.sessions.appendHarnessEvents(sessionId, events)
++      return jsonResponse(result)
++    } catch (error) {
++      // Caller-input failures are HTTP client errors, not internal faults.
++      if (error instanceof EdgeSessionStoreError
++        && (error.code === 'INVALID_DATA' || error.code === 'NOT_FOUND')) {
++        throw new EdgeHttpError(error.code === 'NOT_FOUND' ? 404 : 400, error.message)
++      }
++      throw error
++    }
++  }
++
+   private async startTurn(request: Request, sessionId: SessionId): Promise<Response> {
+     const body = await readJsonObject(request, MAX_TURN_BODY_BYTES)
+     const message = requireBoundedUtf8String(body.message, 'message', MAX_MESSAGE_TEXT_BYTES)
+@@ -1090,7 +1123,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
+ 
+ interface ParsedSessionRoute {
+   sessionId?: SessionId
+-  action?: 'events' | 'turn' | 'cancel'
++  action?: 'events' | 'turn' | 'cancel' | 'ingest'
+ }
+ 
+ function parseSessionRoute(pathname: string): ParsedSessionRoute {
+@@ -1111,7 +1144,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
+   const id = SessionId(sessionId)
+   if (parts.length === 3) return { sessionId: id }
+   const action = parts[3]
+-  if (action !== 'events' && action !== 'turn' && action !== 'cancel') {
++  if (action !== 'events' && action !== 'turn' && action !== 'cancel' && action !== 'ingest') {
+     throw new EdgeHttpError(404, 'Session route not found.')
+   }
+   return { sessionId: id, action }
+diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
+index e5e0f88..e4e80e5 100644
+--- a/apps/dsh-edge/src/session-store.ts
++++ b/apps/dsh-edge/src/session-store.ts
+@@ -1084,6 +1084,59 @@ export class EdgeSessionStore {
+     }
+   }
+ 
++  /**
++   * Ingest one harness runner transcript batch into an existing session (#119).
++   * Runner jobs drive their own DSH process outside this deployment and mirror
++   * the canonical events they produced into a viewer session, so the owner reads
++   * the run in the native UI. Ingest never runs the agent. The mapping is the
++   * minimum that keeps the stored log canonical — turn numbers continue the
++   * stored log (a reused session never rewinds), surface events join at the
++   * tail — and the whole batch flushes before this returns, so a batch reported
++   * as stored is stored. Publication reuses the store's late-event path: live
++   * downlinks see ingested events exactly like native ones.
++   */
++  async appendHarnessEvents(
++    id: SessionId,
++    events: readonly unknown[],
++  ): Promise<{ appended: number; lastSeq: number }> {
++    const { persistence, sessions } = await this.services()
++    if (!(persistence instanceof DurableObjectSessionPersistence)) {
++      throw new EdgeSessionStoreError('INVALID_DATA', 'Edge persistence backend is unavailable.')
++    }
++    if (!persistence.hasSession(id) && persistence.readBlankSession(id) === undefined) {
++      throw new EdgeSessionStoreError('NOT_FOUND', 'Session not found.')
++    }
++    const handle = await this.openAgentForTurn(id, DEFAULT_EDGE_MODEL)
++    try {
++      const session = handle.agent.session
++      let baseTurn = 0
++      for (const event of session.events) {
++        const turn = (event.data as { turn?: unknown }).turn
++        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
++      }
++      let appended = 0
++      for (const raw of events) {
++        const normalized = normalizeHarnessIngestEvent(raw, baseTurn)
++        // Runtime-dynamic event type: the generic append overload cannot express
++        // it, so the call site carries the narrow cast (opts only for surface).
++        // bind() обязателен: append читает приватное состояние сессии через this.
++        const append = session.append.bind(session) as unknown as (
++          type: string,
++          data: unknown,
++          opts?: { surfaceOp: 'append' },
++        ) => SessionEvent
++        append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
++        appended += 1
++      }
++      await sessions.flush(session)
++      return { appended, lastSeq: session.seq - 1 }
++    } finally {
++      await handle.dispose().catch((disposeError: unknown) => {
++        console.error('dsh-edge failed to release the ingested session.', disposeError)
++      })
++    }
++  }
++
+   /** Count live Agent owners for host.describe. */
+   async attachedSessionCount(): Promise<number> {
+     const { agents } = await this.services()
+@@ -1287,6 +1340,72 @@ export class EdgeSessionStore {
+   }
+ }
+ 
++/** Canonical event types harness ingest accepts — the runner spool allowlist. */
++const HARNESS_INGEST_EVENT_TYPES = new Set([
++  'turn/start', 'turn/end', 'step/start', 'step/end',
++  'user/message', 'assistant/message', 'tool/call', 'tool/result',
++])
++/** Ingest events carrying a turn number, renumbered onto the stored log. */
++const HARNESS_TURNED_EVENT_TYPES = new Set([
++  'turn/start', 'turn/end', 'step/start', 'step/end',
++  'assistant/message', 'tool/call', 'tool/result',
++])
++/** Ingest events on the model-visible surface: they join the surface at the tail. */
++const HARNESS_SURFACE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
++
++/**
++ * Validate one runner-side canonical event and renumber its turn. An unknown
++ * type or malformed payload is a loud 400, never a silent skip: a runner upgrade
++ * must not write an unreviewed event vocabulary into the owner's log.
++ */
++function normalizeHarnessIngestEvent(
++  raw: unknown,
++  baseTurn: number,
++): { type: string; data: Record<string, unknown>; surface: boolean } {
++  const fail = (message: string): EdgeSessionStoreError =>
++    new EdgeSessionStoreError('INVALID_DATA', `Harness ingest rejected: ${message}`)
++  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw fail('event must be an object')
++  const { type, data: source } = raw as { type?: unknown; data?: unknown }
++  if (typeof type !== 'string' || !HARNESS_INGEST_EVENT_TYPES.has(type)) {
++    throw fail(`unknown event type ${JSON.stringify(type ?? null)}`)
++  }
++  if (source === null || typeof source !== 'object' || Array.isArray(source)) {
++    throw fail(`"${type}" data must be an object`)
++  }
++  const data: Record<string, unknown> = { ...(source as Record<string, unknown>) }
++  const isInt = (value: unknown): value is number =>
++    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
++  if (HARNESS_TURNED_EVENT_TYPES.has(type)) {
++    if (!isInt(data.turn)) throw fail(`"${type}" requires a non-negative integer turn`)
++    data.turn = (data.turn as number) + baseTurn
++    if (type !== 'turn/start' && type !== 'turn/end' && !isInt(data.step)) {
++      throw fail(`"${type}" requires a non-negative integer step`)
++    }
++  }
++  if (type === 'turn/end') {
++    const reason = data.reason
++    if (reason === null || typeof reason !== 'object' || Array.isArray(reason)
++      || typeof (reason as { kind?: unknown }).kind !== 'string') {
++      throw fail('"turn/end" requires a reason object with a kind')
++    }
++  }
++  if (type === 'user/message') {
++    const sourceField = data.source
++    if (data.role !== 'user' || !Array.isArray(data.content) || sourceField === null
++      || typeof sourceField !== 'object' || typeof (sourceField as { kind?: unknown }).kind !== 'string') {
++      throw fail('"user/message" requires role "user", content blocks, and a source')
++    }
++  }
++  if (type === 'assistant/message' || type === 'tool/result') {
++    const message = data.message
++    if (message === null || typeof message !== 'object' || Array.isArray(message)
++      || !Array.isArray((message as { content?: unknown }).content)) {
++      throw fail(`"${type}" requires a message object with content blocks`)
++    }
++  }
++  return { type, data, surface: HARNESS_SURFACE_EVENT_TYPES.has(type) }
++}
++
+ function appendUserTitle(agent: Agent, title: string): SessionEvent<'session/title'> {
+   return agent.session.append('session/title', {
+     title,

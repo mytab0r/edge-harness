@@ -88,10 +88,24 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/hands/*.sh scripts/git/*; do
+          for f in scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
+      # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на
+      # заглушках (curl/gh/dsh/pnpm/timeout — функции, git/npm/openssl — PATH):
+      # журнал получил job_start/job_end, морда — begin и ingest, воркер
+      # доложил в задачу. Сломанный клиент = красный smoke.
+      - name: Smoke bash-клиентов на заглушках (класс Б1 #119)
+        run: bash scripts/lib/test/dsh-clients.smoke.sh
+
+      # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
+      # #128, М3): два списка без единого места правды — расхождение красит CI,
+      # а не живой job 400-м или мёртвой поверхностью.
+      - name: Allowlist ингеста ↔ спул стримера
+        run: node dsh-edge/verify-ingest-allowlist.mjs
 
       - name: Все workflows — валидный YAML
         run: |

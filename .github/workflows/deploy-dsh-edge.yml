@@ -169,6 +169,17 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         run: pnpm --dir clone/apps/dsh-edge/standalone run verify
 
+      # Шов раннеров (#119) обязан работать на СОБРАННОМ артефакте до деплоя:
+      # unstable_dev поднимает direct-воркер с настоящим DO SQLite и прогоняет
+      # путь раннера (батчи, перенумерация turn, 400 на чужой тип, «принято =
+      # сохранено», архив). Красный шаг — деплой не начинается: сломанный шов
+      # невыгодно ловить на живой морде. Ревью #128 (М2): драйвер закоммичен,
+      # проверка воспроизводима.
+      - name: Интеграция ingest-шва на собранном артефакте (#119)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
         run: |
@@ -460,6 +471,48 @@ jobs:
             exit 1
           fi
           echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
+
+      # Шов «сессия раннера в морде» (#119): деплой обязан не просто поднять
+      # морду, а оставить работающим маршрут ingest транскрипта — им живут все
+      # раннеры (worker, hands). Прогон на живом проде: логин → сессия-канарейка
+      # в воркспейсе edge-harness → батч событий → архив. Неудача — красный
+      # деплой: сломанный шов невидим владельцу иначе, чем по красному job'у.
+      - name: Канарейка ingest-шва (#119)
+        if: success()
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/dsh-edge-canary.cookies"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин канарейки #119 не удался (HTTP $code)"; exit 1; }
+          rpc() {
+            local method=$1 payload=$2
+            curl -fsS -b "$jar" -H 'content-type: application/json' \
+              -X POST "$base/api/$method" -d "$payload" \
+              || { echo "::error::RPC $method канарейки #119 отклонён"; exit 1; }
+          }
+          ws=$(rpc workspace.create '{"type":"client-request","rpcId":"canary","method":"workspace.create","payload":{"path":"/workspace/edge-harness"}}' \
+            | jq -r '.result.value.workspace.workspaceId')
+          [ -n "$ws" ] && [ "$ws" != "null" ] \
+            || { echo "::error::Воркспейс edge-harness недоступен (#119)"; exit 1; }
+          sid="deploy-canary-$(date -u +%Y%m%dT%H%M%S)"
+          rpc session.create '{"type":"client-request","rpcId":"canary","method":"session.create","payload":{"workspaceId":"'"$ws"'","sessionId":"'"$sid"'"}}' >/dev/null
+          rpc session.rename '{"type":"client-request","rpcId":"canary","method":"session.rename","payload":{"sessionId":"'"$sid"'","title":"деплой-канарейка #119"}}' >/dev/null
+          printf '%s\n' \
+            '{"type":"turn/start","data":{"turn":1}}' \
+            '{"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' \
+            | jq -s '{events: .}' > "$RUNNER_TEMP/dsh-edge-canary-batch.json"
+          appended=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+            -X POST "$base/api/sessions/$sid/ingest" \
+            --data-binary "@$RUNNER_TEMP/dsh-edge-canary-batch.json" | jq ".appended") \
+            || { echo "::error::Ingest канарейки #119 упал"; exit 1; }
+          [ "$appended" -ge 2 ] \
+            || { echo "::error::Ingest канарейки #119 не принял батч (appended=$appended)"; exit 1; }
+          rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
+          echo "✅ ingest-шов #119 жив: сессия $sid создана, наполнена, заархивирована"
 
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
