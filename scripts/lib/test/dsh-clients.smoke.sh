@@ -318,7 +318,10 @@ AI_SMOKE="$TMP/ai"
 mkdir -p "$AI_SMOKE"
 printf 'Промпт ревью (smoke): проверь проводку транспорта\n' >"$AI_SMOKE/prompt.md"
 AI_WORK="$AI_SMOKE" \
-DEEPSEEK_API_KEY="smoke-key-not-a-secret" \
+# Значение заглушки короче 20 символов и не похоже на литерал секрета:
+# детерминированный гейт (check_pr) сканирует добавленные строки паттерном
+# KEY="<20+ символов>" — тестовые данные не должны в него попадать.
+DEEPSEEK_API_KEY="smoke-key" \
 HANDS_SPOOL="$AI_SMOKE/spool.ndjson" \
   run_client "ai-review" "$REPO/scripts/review/ai_dsh.sh"
 grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
