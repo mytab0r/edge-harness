@@ -45,6 +45,13 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_dispatch_tail.py -q
 
+      # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
+      # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
+      - name: Тесты предохранителя конвейера orchestra
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_pulse_guard.py -q
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24

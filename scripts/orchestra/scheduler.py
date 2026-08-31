@@ -17,33 +17,29 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      нет — ровно один `workflow_dispatch` воркера (scripts/worker/task.sh,
      docs/agents/WORKER-PLAYBOOK.md). Best-effort: сбой диспатча не роняет
      планировщик.
+  5. Предохранитель конвейера (#120): WORKER_FAILURE_PAUSE_AFTER красных прогонов
+     worker.yml подряд останавливают диспатч; сигнал — Telegram + задача #120,
+     один на серию. Логика в scripts/orchestra/pulse_guard.py (пороги — там).
+  6. «Кто следит за следящим» (#120): каждый запуск сначала проверяет возраст
+     последнего успешного пульса orchestra — пропавшие пульсы кричат в Telegram,
+     пока этот запуск сам жив.
 """
 
-import json
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
+# gh()/parse_time() и логика предохранителя — одно место правды в pulse_guard
+# (пороги WORKER_FAILURE_PAUSE_AFTER / HEARTBEAT_MAX_AGE_MINUTES живут там же).
+from pulse_guard import conveyor_gate, gh, heartbeat_check, parse_time
+
 STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
 TASK_LABEL = "task"
 CONFLICT_LABEL = "conflict"
 MERGE_METHOD = "squash"
-
-
-def gh(*args: str) -> dict | list | None:
-    result = subprocess.run(
-        ["gh", "api", *args],
-        capture_output=True, text=True,
-        env={**os.environ, "NO_COLOR": "1"},
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
-    # Часть успешных вызовов (например, POST .../dispatches) отвечает 204 без
-    # тела — отсутствие JSON это успех, а не ошибка разбора.
-    return json.loads(result.stdout) if result.stdout.strip() else None
 
 
 def summary(lines: list[str]) -> None:
@@ -53,10 +49,6 @@ def summary(lines: list[str]) -> None:
     if path:
         with open(path, "a", encoding="utf-8") as file:
             file.write(text)
-
-
-def parse_time(raw: str) -> datetime:
-    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 def open_task_issues(repo: str) -> list[dict]:
@@ -278,6 +270,11 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
 
+    # «Кто следит за следящим» (#120): первой проверкой, пока этот запуск жив,
+    # кричим о пропавших пульсах — остальная работа может не иметь смысла,
+    # если конвейер стоял.
+    lines += heartbeat_check(repo, now)
+
     pulls = open_pulls(repo)
     lines.append(f"Открытых PR: {len(pulls)}")
 
@@ -290,11 +287,14 @@ def main() -> int:
     free = sum(1 for issue in pool if not issue["assignees"])
     taken = len(pool) - free
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
-    worker_lines = dispatch_worker(repo, pool)
 
-    if stale_lines or conflict_lines or merge_lines or worker_lines:
+    # Предохранитель (#120) решает, разрешён ли диспатч воркера в этом пульсе.
+    conveyor_lines, dispatch_allowed = conveyor_gate(repo, now)
+    worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
+
+    if stale_lines or conflict_lines or merge_lines or conveyor_lines or worker_lines:
         lines += ["", "### Действия",
-                  *stale_lines, *conflict_lines, *merge_lines, *worker_lines]
+                  *stale_lines, *conflict_lines, *merge_lines, *conveyor_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
 
