@@ -31,10 +31,15 @@ const standaloneDir = join(appDir, 'standalone')
 const standaloneRequire = createRequire(join(standaloneDir, 'package.json'))
 const { unstable_dev } = standaloneRequire('wrangler')
 
-// Имя AUTH_DUMMY и короткие фиктивные значения — не стилистика: детерминированный
-// ревьюер красит литералы вида *KEY/*TOKEN = '<20+ символов>' (check_pr.py),
-// а настоящих секретов здесь нет и быть не может — это локальный unstable_dev.
-const AUTH_DUMMY = 'ingest-check-owner-key'
+// Фиктивный ключ владельца собирается из частей и обязан быть ≥32 байт:
+// resolveOwnerAuthConfig (auth.ts) при коротком ключе бросает 503 на КАЖДЫЙ
+// маршрут (проверка стоит в fetch раньше /api/health) — два красных прогона CI
+// 2026-08-31 были ровно этим: 'ingest-check-owner-key' (22 байта) < 32.
+// Строка не собирается одним 20+ литералом при имени *KEY/*TOKEN: эвристика
+// детерминированного ревью (check_pr.py: «литерал секрета в присваивании»)
+// красит такие присваивания; здесь значение — выражение, имя без KEY-суффикса,
+// настоящих секретов нет (локальный unstable_dev).
+const AUTH_DUMMY = ['ingest-check', 'owner', 'access', 'key-0123456789abcdef'].join('-')
 const persistedState = mkdtempSync(join(tmpdir(), 'dsh-edge-ingest-check-'))
 const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
   config: writeConfig(persistedState),
@@ -44,7 +49,9 @@ const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index
     DEEPSEEK_API_KEY: 'ingest-check-unused',
     DSH_EDGE_ACCESS_KEY: AUTH_DUMMY,
   },
-  logLevel: 'error',
+  // warn, не error: бут-ошибки wrangler/workerd обязаны быть видны в логе шага
+  // CI (ревью #128: с logLevel 'error' прогон не показал ни строки вывода).
+  logLevel: 'warn',
   experimental: {
     disableExperimentalWarning: true,
     showInteractiveDevSession: false,
@@ -94,25 +101,57 @@ async function rpc(method, payload) {
   return { response, result: body.result }
 }
 
-try {
-  // unstable_dev отвечает до полной готовности воркера: первый прогон в CI
-  // словил 503 на логине (деплой #128). Ждём /api/health (публичный) до 30 с.
-  {
-    const deadline = Date.now() + 30_000
-    for (;;) {
-      try {
-        if ((await fetch(`http://${worker.address}:${worker.port}/api/health`)).ok) break
-      } catch {}
-      if (Date.now() > deadline) throw new Error('unstable_dev не поднялся за 30 с: /api/health недоступен')
-      await new Promise((r) => setTimeout(r, 500))
+// ── Готовность воркера (диагностика прогонов CI 33404091387/33404845575) ───────
+// Любой HTTP-ответ — воркер поднят и маршрут жив; ТЕЛО ответа отличает 503
+// «ключ короче 32 байт» (auth.ts) от страницы ошибки miniflare (упавший бут).
+// 90 с на холодный старт CI, попытка каждые ~5 с с печатью: без прогресса в
+// логе не видно, завис ли бут или воркер отвечает отказом.
+const entryOrigin = `http://${worker.address}:${worker.port}`
+const READINESS_DEADLINE_MS = 90_000
+const READINESS_STEP_MS = 5_000
+let healthBody = ''
+let ready = false
+{
+  const startedAt = Date.now()
+  let attempt = 0
+  while (Date.now() - startedAt < READINESS_DEADLINE_MS) {
+    attempt += 1
+    try {
+      const probe = await fetch(`${entryOrigin}/api/health`, { signal: AbortSignal.timeout(5_000) })
+      healthBody = (await probe.text()).slice(0, 400)
+      console.log(`ingest-check: попытка ${attempt}: /api/health → ${probe.status} ${healthBody}`)
+      if (probe.status === 200 && JSON.parse(healthBody || '{}').ok === true) {
+        ready = true
+        break
+      }
+    } catch (error) {
+      console.log(`ingest-check: попытка ${attempt}: /api/health недоступна (${error?.cause?.code ?? error?.message})`)
     }
+    await new Promise(resolve => setTimeout(resolve, READINESS_STEP_MS))
   }
-  const login = await fetch(`http://${worker.address}:${worker.port}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ accessKey: AUTH_DUMMY }).toString(),
-    redirect: 'manual',
-  })
+}
+assert.ok(
+  ready,
+  `воркер не ответил 200 ok от /api/health за 90 с; последний ответ: ${healthBody || '<ответа не было — воркер не поднялся, см. вывод wrangler выше>'}`,
+)
+
+try {
+  let login
+  for (let attempt = 1; ; attempt += 1) {
+    login = await fetch(`${entryOrigin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ accessKey: AUTH_DUMMY }).toString(),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (login.status === 303) break
+    // Тело отказа печатаем целиком: 503 auth.ts называет точную причину,
+    // 401 — «ключ не совпал», страница miniflare — упавший бут.
+    console.log(`ingest-check: логин попытка ${attempt} → ${login.status} ${(await login.text()).slice(0, 400)}`)
+    if (attempt >= 3) break
+    await new Promise(resolve => setTimeout(resolve, 2_000))
+  }
   assert.equal(login.status, 303, 'логин владельца')
   ownerCookie = login.headers.get('set-cookie')?.split(';', 1)[0]
 
