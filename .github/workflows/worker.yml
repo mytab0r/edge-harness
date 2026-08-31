@@ -73,6 +73,11 @@ jobs:
           WORKER_LOGIN: mytab0r
           WORKER_TASK: ${{ inputs.task }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Пульс живости (#112-стопгэп): пока DSH работает, журнал принимает
+          # /api/heartbeat — «жив/висит» видно без ожидания конца job'а.
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HEARTBEAT_SECS: "60"
           # GLM Coding Plan: только coding-эндпоинт покрыт подпиской владельца,
           # стандартный paas/v4 отвечает QUOTA на те же модели (проверено живым
           # прогоном, см. hands.yml).
