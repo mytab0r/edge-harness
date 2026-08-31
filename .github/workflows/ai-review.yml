@@ -4,7 +4,8 @@
 # событийный вход, который РАБОТАЕТ: метки, поставленные GITHUB_TOKEN, не
 # создают событий (антирекурсия GitHub), и on: pull_request[labeled] молчал
 # бы вечно; workflow_run — документированный обход этого ограничения
-# (research/21). Фильтр: pr-review завершился успехом = review:ok поставлен.
+# (research/21). Фильтр: pr-review завершился успехом И на PR стоит метка
+# review:ok (проверяет facts-шаг: успех бывает и с review:large).
 # Повтор/миграция — workflow_dispatch (input pr): события отгоревших PR
 # не восстановить.
 # Итог: содержательный ревью-комментарий в PR + вердикт-метка ai:ok /
@@ -87,6 +88,13 @@ jobs:
           PR_INPUT: ${{ github.event.inputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          # Владелец головы — из события: у PR из форка head живёт в чужом
+          # репо, префикс базового владельца искал бы не там (молчаливый
+          # зелёный no-op на живом PR).
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          # Sha головы завершившегося рана: сверка отсекает «рано» — ветка
+          # уже уехала, её ревью придёт новым workflow_run-событием.
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
         run: |
           # pipefail обязателен: пайпы ниже (labels) при отказе gh обязаны
           # ронять шаг, а не отдавать пустоту как «гонку закрытия PR».
@@ -96,18 +104,24 @@ jobs:
             case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
             pr=$PR_INPUT
           else
-            # workflow_run не знает номера PR, но знает ветку (head_branch):
-            # pulls?head= — точный запрос без листания списков (класс
-            # «per_page=100 молча теряет хвосты» закрыт по построению).
-            # Отказ gh роняет шаг (красный): «временный 5xx» ≠ «PR закрыт».
-            # head_branch уже без префикса владельца; слэши внутри имени
-            # ветки (agent/18-…) — часть имени, не префикс.
-            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$RUN_BRANCH&state=open" \
-              --jq '.[0].number // empty') \
+            # workflow_run не знает номера PR, но знает ветку и владельца
+            # головы: pulls?head=<owner>:<branch> — точный запрос без листания
+            # списков (класс «per_page=100 молча теряет хвосты» закрыт по
+            # построению). Отказ gh роняет шаг (красный): «временный 5xx» ≠
+            # «PR закрыт». Слэши внутри имени ветки — часть имени.
+            found=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=$HEAD_OWNER:$RUN_BRANCH&state=open" \
+              --jq 'if .[0] then ((.[0].number | tostring) + " " + .[0].head.sha) else "" end') \
               || { echo "::error::не смог найти PR по ветке $RUN_BRANCH (сеть/права) — молчаливый no-op тут закрыл бы гейт"; exit 1; }
+            pr=${found%% *}
+            branch_head=${found#* }
             if [ -z "$pr" ]; then
               echo "go=false" >> "$GITHUB_OUTPUT"
-              echo "Открытого PR на ветке $RUN_BRANCH нет (закрыт/слит за время события) — ревьюить нечего."
+              echo "Открытого PR на ветке $RUN_BRANCH ($HEAD_OWNER) нет (закрыт/слит за время события) — ревьюить нечего."
+              exit 0
+            fi
+            if [ "$branch_head" != "$RUN_HEAD" ]; then
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              echo "Ветка $RUN_BRANCH уже уехала ($branch_head != $RUN_HEAD) — её ревью придёт новым событием."
               exit 0
             fi
           fi

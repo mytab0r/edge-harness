@@ -347,7 +347,10 @@ GITHUB_TOKEN … will not create a new workflow run» — метки входя�
 ai-review срабатывает по ЗАВЕРШЕНИЮ workflow pr-review (`workflow_run:
 workflows: [pr-review], types: [completed]`) — завершение рана событием
 считается независимо от того, что внутри рана ставил GITHUB_TOKEN. Номер PR
-в этом событии отсутствует — разрешается по `workflow_run.head_sha` через API.
+в этом событии отсутствует — разрешается по паре `workflow_run.head_branch` +
+`head_repository.owner.login` (у форка head в чужом репо) запросом
+`pulls?head=<owner>:<branch>` с кросс-чеком `head_sha` рана (уехавшая ветка
+пропускается — её ревью придёт новым событием).
 Паттерн «метка-триггер» сохраняется для ОРКЕСТРАТОРА (scheduler читает метки
 polling'ом по cron — ему события не нужны), но событийный триггер второго
 гейта обязан быть workflow_run, не labeled.
