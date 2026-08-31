@@ -1,6 +1,6 @@
 # GitHub Actions как «руки»: лимиты, бесплатность и границы правил
 
-> Исследовано 2026-08-28. Смежное: [Cloudflare Free](20-cloudflare-free.md), [отвергнутое](30-rejected-alternatives.md)
+> Исследовано 2026-08-28; дополнено 2026-08-31 (блок GitHub API из egress CF, живой замер). Смежное: [Cloudflare Free](20-cloudflare-free.md), [отвергнутое](30-rejected-alternatives.md)
 
 ## TL;DR
 
@@ -130,6 +130,29 @@ Job не получает graceful-сигнала «доработай»: он t
 То есть push/PR/issue-события от `GITHUB_TOKEN` новых run'ов не создают (защита от рекурсии), а `workflow_dispatch` и `repository_dispatch` — исключение: диспатч сквозь `GITHUB_TOKEN` run запускает. Исключение для `workflow_dispatch` подтверждено живьём: оркестратор диспатчит `worker.yml` через `github.token` (scripts/orchestra/scheduler.py), и воркер-раны происходят. Для `repository_dispatch` через REST из job'а — **не подтверждено** живым прогоном.
 
 Практическое следствие всё равно одно: всё, что должно зажечь проверки (push ветки PR, создание PR, synchronize), делается под PAT (`GH_DISPATCH_TOKEN`) — иначе CI тихо не просыпается. Кампания замера задержки ([ADR 0005](../decisions/0005-dispatch-tail-campaign.md)) использует PAT на всём пути — и для диспатча в том числе, чтобы не зависеть от непроверенного исключения. В связке с ловушкой default-branch выше: «диспатч ушёл, run'а нет» — проверять обе причины: файл на main и токен-источник события.
+
+### 🔴 GitHub API из egress Cloudflare Workers: измеренный блок 403
+
+Замерено живым прогоном 2026-08-31 (приёмка эпика #17, первый живой тест
+runner-bridge; задача #133): из воркера dsh-edge **все** вызовы
+`api.github.com` получают **403** с телом, в котором нет JSON-поля `message`
+(похоже на страницу блокировки edge-уровня, а не на ответ REST API — иначе
+инструмент показал бы текст причины). Измерение:
+
+- POST `/repos/mytab0r/edge-harness/issues` (создание задачи, валидный
+  classic PAT из секрета воркера) → 403, повтор тем же ходом → 403 (не transient);
+- GET `/repos/mytab0r/edge-harness/issues/17` → тот же 403 — блок не специфичен
+  записи, недоступен весь `api.github.com` из этого egress;
+- контроль: тот же PAT из job'а GitHub Actions → POST `/issues/17/labels`
+  отвечает 200 — токен и права ни при чём.
+
+Гипотеза (не подтверждена): GitHub отклоняет запросы с общих egress-IP
+Cloudflare Workers (datacenter-абьюз-фильтр). Важная оговорка: skeleton-воркер
+edge-harness успешно делал `repository_dispatch` из CF 2026-08-30 (прогоны
+33301581080, 33296416354, form-task_id из морды) — блок либо IP/colo-зависим
+и мигрирует, либо egress двух воркеров различается. Проектное следствие: любой
+план «Cloudflare → GitHub API» обязан иметь контроль живости egress и честный
+отказ; рабочим маршрутом сегодня остаётся «GitHub-раннер → CF» (наш push-контур).
 
 ### Задержка старта — не документирована
 
@@ -322,6 +345,7 @@ Actions запрещено использовать для (дословно):
 | «GITHUB_TOKEN read-only в PR из форка» | на странице use-secrets не найдено; относится к документации по permissions `GITHUB_TOKEN` |
 | 24 часа в очереди для GitHub-hosted | ⚠️ **опровергнуто**: лимит стоит в разделе self-hosted. Для GitHub-hosted аналога нет — только 35 дней на весь run |
 | `client_payload` «< 64KB» | ⚠️ **уточнено**: доки говорят 65 535 **символов**, не байт |
+| Причина 403 GitHub API из egress CF Workers (замер 2026-08-31, см. раздел выше) | тело ответа не прочитано (нужен observability воркера); масштаб блока — IP/colo/аккаунт — не определён; влияет ли на skeleton-диспетч сегодня — не проверено |
 
 ---
 
