@@ -12,7 +12,7 @@ PR получает review:ok (check_pr.py, первый гейт)
         │ research/21; событийный вход — workflow_run)
         ▼
 job review (права: только чтение; ВМ умирает вместе с недоверенным шагом)
-        ├─ 1. Факты PR (GH_TOKEN): номер (по head_sha рана для workflow_run)
+        ├─ 1. Факты PR (GH_TOKEN): номер (head_branch+владелец из события)
         │      + head-sha + решение «ревьюим?» (метка review:ok) → step-outputs
         ├─ 2. checkout main — доверенный инструментарь для шагов с токеном
         ├─ 3. checkout head PR → pr-head: дерево-ДАННЫЕ для агента
