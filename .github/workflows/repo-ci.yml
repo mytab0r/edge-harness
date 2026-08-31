@@ -32,13 +32,14 @@ jobs:
       # пока краш не заметил человек. Правильная форма: значение "-f", "body=…".
       # scripts/lib включён с появления claim_task (#121): там свой gh-обёрточный
       # скрипт — класс закрывается во всех точках входа, а не только в orchestra.
+      # scripts/review — с появления gh-обёрток ai_review/file_tasks (#18).
       - name: Оркестрация без keyword-аргументов gh()
         run: |
-          if grep -rnE ',\s*body=' scripts/orchestra/ scripts/lib/; then
+          if grep -rnE ',\s*body=' scripts/orchestra/ scripts/lib/ scripts/review/; then
             echo "::error::keyword body= в вызове gh() — роняет прогон оркестратора (класс #124)"
             exit 1
           fi
-          echo "orchestra+lib: keyword-аргументов нет"
+          echo "orchestra+lib+review: keyword-аргументов нет"
 
       # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
       # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
@@ -61,6 +62,15 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_claim_task.py -q
+
+      # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
+      # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
+      # канонический комментарий (шапка-факты + фенсы) и гейт слияния по
+      # меткам review:ok И ai:ok. Чистая логика, без сети.
+      - name: Тесты AI-ревью (второй гейт)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_ai_review.py -q
 
       - uses: actions/setup-node@v7
         with:
@@ -88,7 +98,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/git/*; do
+          for f in scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/review/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"

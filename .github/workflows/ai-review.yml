@@ -1,0 +1,96 @@
+# AI-ревьюер диффа — второй гейт конвейера после детерминированного ревью (#18).
+#
+# Триггер: метка review:ok на PR (её ставит workflow pr-review, когда первый
+# гейт прошёл) или workflow_dispatch (input pr — повтор после сбоя модели).
+# Итог: содержательный ревью-комментарий в PR + вердикт-метка ai:ok /
+# ai:changes-requested / ai:failed. Оркестратор сливает только при
+# review:ok И ai:ok (scripts/lib/review_labels.py — одно место правды).
+#
+# Trust-zone (#18): содержательное ревью делает DSH-агент БЕЗ GitHub-токена —
+# шаг «Ревью агентом» не получает ни GH_TOKEN, ни git-креденшелов (checkout с
+# persist-credentials: false), постить в интернет агент не может физически:
+# его единственный выход — файл ответа. Публикацией занимаются доверенные
+# шаги gather/verdict (python scripts/review/ai_review.py) под github.token.
+# DEEPSEEK_API_KEY нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET*
+# из model-shell вызовов — агент и его не видит (живой прогон 2026-08-30,
+# см. worker.yml).
+#
+# Concurrency: один прогон на PR; новый пуш (новое ревью) отменяет летящий —
+# его вердикт всё равно устарел бы (verdict-шаг дополнительно сверяет head).
+name: ai-review
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Номер PR (повтор ревью, например после ai:failed)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'review:ok'
+    runs-on: ubuntu-latest
+    # 60 мин — таймаут DSH (ai_dsh.sh) + установка и оба доверенных шага.
+    timeout-minutes: 75
+    env:
+      AI_WORK: ${{ runner.temp }}/ai-review
+    steps:
+      - name: Факты PR (номер и head)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_INPUT: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          case "$PR_INPUT" in ''|*[!0-9]*) echo "::error::номер PR не число: '$PR_INPUT'"; exit 1 ;; esac
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_INPUT" --jq .head.sha)
+          [ -n "$head" ] || { echo "::error::у PR #$PR_INPUT нет head-sha"; exit 1; }
+          echo "PR_NUMBER=$PR_INPUT" >> "$GITHUB_ENV"
+          echo "PR_HEAD=$head" >> "$GITHUB_ENV"
+          echo "PR #$PR_INPUT, head $head"
+
+      - uses: actions/checkout@v7
+        with:
+          # Чекаут head PR: агент ревьюит репозиторий в состоянии ветки.
+          ref: ${{ env.PR_HEAD }}
+          fetch-depth: 0
+          # Креденшелы не переживают шаг: DSH-шаг ниже не наследует git-токен.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Сбор фактов и промпт (доверенный шаг)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$AI_WORK"
+          python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
+
+      # ── НЕдоверенный шаг: НИКАКОГО GitHub-токена в env ────────────────────
+      - name: Ревью агентом (DSH headless, без GitHub-токена)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # GLM Coding Plan: только coding-эндпоинт покрыт подпиской владельца
+          # (стандартный paas/v4 отвечает QUOTA, см. hands.yml/worker.yml).
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.z.ai/api/coding/paas/v4' }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'glm-5' }}
+          DSH_TIMEOUT_SECS: "3600"
+        run: bash scripts/review/ai_dsh.sh
+
+      - name: "Вердикт: комментарий + метка (доверенный шаг)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/review/ai_review.py verdict \
+            --pr "$PR_NUMBER" --answer "$AI_WORK/answer.txt" --head "$PR_HEAD"
