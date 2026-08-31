@@ -16,7 +16,7 @@ on:
 
 permissions:
   # actions:write — playbook-операции агента (rerun orchestra, workflow run);
-  # contents:read — git push ветки идёт под PAT (GH_DISPATCH_TOKEN), не под этим токеном;
+  # contents:read — git push ветки идёт под PAT (GH_PIPELINE_PAT), не под этим токеном;
   # issues/pull-requests:write — назначение задачи, комментарии, PR.
   actions: write
   contents: read
@@ -55,7 +55,7 @@ jobs:
 
       - name: Git-авторизация под PAT владельца
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
           # Токен обязан лечь В ФАЙЛ (hosts.yml), а не только в env этого шага:
           # DSH вырезает из model-shell вызовов все env с именами *TOKEN*/*KEY*/
@@ -75,7 +75,7 @@ jobs:
 
       - name: Задача через DSH headless
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
           WORKER_LOGIN: mytab0r
           WORKER_TASK: ${{ inputs.task }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

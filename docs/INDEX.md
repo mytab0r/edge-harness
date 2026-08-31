@@ -48,6 +48,7 @@
 - [0005. Замер хвоста задержки: кампания, а не сеанс](decisions/0005-dispatch-tail-campaign.md)
 - [0006. Аренда задачи: git-ref замок](decisions/0006-task-lease-git-ref-lock.md)
 - [0007. AI-ревью как второй гейт: своя метка ai:*, двойное условие слияния](decisions/0007-ai-review-gate.md)
+- [0008. Узкий GH_DISPATCH_TOKEN: dispatch-токен морды отделён от PAT конвейера](decisions/0008-narrow-dispatch-token.md)
 
 ## Мультиагентная работа
 

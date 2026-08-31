@@ -417,19 +417,20 @@ jobs:
           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
 
-      # runner-bridge (#95) диспетчит воркера из чата морды: тот же PAT, что у
-      # рук и оркестратора — права на issues + workflow dispatch у него уже
-      # доказаны (scheduler.py диспетчит worker.yml этим токеном). Секрет
-      # воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда не знала
-      # слов рук; put идемпотентен, значение в лог не печатается.
+      # runner-bridge (#95) диспетчит воркера из чата морды: тот же широкий PAT
+      # (GH_PIPELINE_PAT), что у рук и оркестратора — права на issues + workflow
+      # dispatch у него уже доказаны (scheduler.py диспетчит worker.yml этим
+      # токеном). Узкий GH_DISPATCH_TOKEN сюда не годится: runner-bridgeу нужны
+      # issues. Секрет воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда
+      # не знала слов рук; put идемпотентен, значение в лог не печатается.
       - name: Секрет раннера морды (GH_RUNNER_TOKEN)
         working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          GH_RUNNER_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_RUNNER_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
-          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_DISPATCH_TOKEN не задан — runner_task не сможет диспетчить воркера"; exit 1; }
+          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_PIPELINE_PAT не задан — runner_task не сможет диспетчить воркера"; exit 1; }
           printf '%s' "$GH_RUNNER_TOKEN" | npx wrangler secret put GH_RUNNER_TOKEN
 
       - name: plugin_status → deploying
