@@ -41,6 +41,22 @@ PIPELINE_CONSUMERS = [
     "worker.yml",
 ]
 
+# Фиксированный список workflows: появление/переименование файла — сознательная
+# правка этого списка, а не тихий обход гвардии (находка AI-ревью #146: glob сам
+# по себе ничего не фиксирует). Содержимое сканируется динамически в правилах ниже.
+EXPECTED_WORKFLOWS = frozenset({
+    "ai-review.yml",
+    "codeql.yml",
+    "deploy-dsh-edge.yml",
+    "deploy-worker.yml",
+    "dispatch-latency-probe.yml",
+    "hands.yml",
+    "orchestra.yml",
+    "pr-review.yml",
+    "repo-ci.yml",
+    "worker.yml",
+})
+
 ALL_WORKFLOWS = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
 
 
@@ -48,12 +64,15 @@ def workflow_text(name: str) -> str:
     return (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
-def test_every_workflow_file_is_known_to_the_guard():
-    """Список workflows зафиксирован: новый файл с секретами не проскочит мимо гвардии."""
-    for name in ALL_WORKFLOWS:
-        assert (WORKFLOWS / name).is_file(), name
-    assert DISPATCH_CONSUMER in ALL_WORKFLOWS
-    assert set(PIPELINE_CONSUMERS) <= set(ALL_WORKFLOWS)
+def test_workflow_set_is_pinned():
+    """Новый/переименованный workflow требует правки EXPECTED_WORKFLOWS — и осознания,
+    что файлы с секретами попадают под правила ниже (список зафиксирован, не glob)."""
+    assert set(ALL_WORKFLOWS) == EXPECTED_WORKFLOWS, (
+        f"набор workflows изменился: {set(EXPECTED_WORKFLOWS) ^ set(ALL_WORKFLOWS)} — "
+        "внеси файл в EXPECTED_WORKFLOWS сознательно (или обнови список)"
+    )
+    assert DISPATCH_CONSUMER in EXPECTED_WORKFLOWS
+    assert set(PIPELINE_CONSUMERS) <= EXPECTED_WORKFLOWS
 
 
 def test_dispatch_token_secret_used_only_by_deploy_worker():

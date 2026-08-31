@@ -63,31 +63,6 @@ jobs:
           fi
         working-directory: cf-worker
 
-      - name: Деплой
-        run: npx wrangler deploy
-        working-directory: cf-worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      # Воркер удалялся из CF вместе с его секретами. Переустанавливаем их при каждом
-      # деплое идемпотентно: wrangler secret put обновляет существующее значение.
-      # Значения — те же секреты репозитория, что использует канарейка и hands-job.
-      # GH_DISPATCH_TOKEN — узкий fine-grained PAT (Contents+Actions на этот
-      # репозиторий, задача #6): морда больше не держит широкий PAT владельца.
-      - name: Секреты воркера
-        working-directory: cf-worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
-          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
-        run: |
-          printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
-          printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GH_DISPATCH_TOKEN
-          printf '%s' "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
-
       # Гвардия узости GH_DISPATCH_TOKEN (задача #6): морда — поверхность,
       # смотрящая в интернет, и её dispatch-токен обязан быть fine-grained.
       # Классический PAT GitHub помечает свои скоупы заголовком X-OAuth-Scopes
@@ -97,6 +72,9 @@ jobs:
       # Включается переменной vars.GH_DISPATCH_TOKEN_KIND=fine-grained ВМЕСТЕ
       # с установкой узкого токена (до свапа в секрете лежит широкий PAT, и
       # гвардия честно предупреждает, а не красит каждый деплой).
+      # Шаг обязан стоять ДО wrangler deploy и secret put: красный деплой
+      # обязан ОСТАНОВИТЬ установку широкого токена в секрет морды, а не
+      # констатировать её задним числом (находка AI-ревью #146).
       - name: Гвардия узости GH_DISPATCH_TOKEN (напоминание о миграции)
         if: vars.GH_DISPATCH_TOKEN_KIND != 'fine-grained'
         run: |
@@ -126,6 +104,31 @@ jobs:
           fi
           rm -f "$headers"
           echo "GH_DISPATCH_TOKEN: fine-grained (X-OAuth-Scopes отсутствует), репозиторий читается — гвардия пройдена"
+
+      - name: Деплой
+        run: npx wrangler deploy
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # Воркер удалялся из CF вместе с его секретами. Переустанавливаем их при каждом
+      # деплое идемпотентно: wrangler secret put обновляет существующее значение.
+      # Значения — те же секреты репозитория, что использует канарейка и hands-job.
+      # GH_DISPATCH_TOKEN — узкий fine-grained PAT (Contents+Actions на этот
+      # репозиторий, задача #6): морда больше не держит широкий PAT владельца.
+      - name: Секреты воркера
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+        run: |
+          printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
+          printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GH_DISPATCH_TOKEN
+          printf '%s' "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
 
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде

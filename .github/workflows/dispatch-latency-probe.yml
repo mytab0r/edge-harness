@@ -52,7 +52,7 @@ jobs:
         run: gh auth setup-git
       - name: Тик кампании
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           # Без GH_TOKEN в env credential helper gh не авторизует push из
           # dispatch-пути: timeout/dispatch_failed строки не записывались бы
           # никогда, и кампания молча деградировала бы до «только ok».
@@ -83,7 +83,7 @@ jobs:
         run: gh auth setup-git
       - name: Запись замера
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
           PROBE_ID: ${{ github.event.client_payload.probe_id }}
           SENT_AT_MS: ${{ github.event.client_payload.sent_at }}
