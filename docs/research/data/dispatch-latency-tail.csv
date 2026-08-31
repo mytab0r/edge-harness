@@ -2,3 +2,4 @@ probe_id,sent_at,run_id,run_url,run_created_at,run_started_at,queue_ms,latency_m
 a21e2fea-5f22-4b0e-b71e-d62b01738bfc,1788128970188,33339284538,https://github.com/mytab0r/edge-harness/actions/runs/33339284538,2026-08-30T22:29:31Z,2026-08-30T22:29:31Z,0,812,ok,,
 a9220c77-8ac2-4159-b02e-4e483cfea3f6,1788136748610,33345207075,https://github.com/mytab0r/edge-harness/actions/runs/33345207075,2026-08-31T00:39:10Z,2026-08-31T00:39:10Z,0,1390,ok,,
 78448b69-6b5a-4282-94d5-10fd2e0ad2b3,1788156878882,33363404842,https://github.com/mytab0r/edge-harness/actions/runs/33363404842,2026-08-31T06:14:40Z,2026-08-31T06:14:40Z,0,1118,ok,,
+705c5205-acd5-4742-9275-a4fb3d8ec045,1788185068393,33400505403,https://github.com/mytab0r/edge-harness/actions/runs/33400505403,2026-08-31T14:04:30Z,2026-08-31T14:04:30Z,0,1607,ok,,
