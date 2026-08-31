@@ -339,6 +339,12 @@ def cmd_gather(args: argparse.Namespace) -> int:
         task_section=task_section(pull.get("body") or "", repo),
     )
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
+    # Переходная совместимость: bridge на main (до мержа этого PR) берёт head
+    # для сверки из meta.json; НОВЫЙ bridge берёт step-output фактов, а файл
+    # остаётся диагностическим артефактом gather. Удалить вместе со старым
+    # bridge после мержа (задача в беклоге).
+    (out / "meta.json").write_text(
+        json.dumps({"pr": args.pr, "head": pull["head"]["sha"]}), encoding="utf-8")
     print(f"gather: PR #{args.pr} head {pull['head']['sha'][:12]}, "
           f"+{added} строк, промпт {len(prompt)} байт, пак {pack}")
     return 0
