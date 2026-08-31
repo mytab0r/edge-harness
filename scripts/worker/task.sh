@@ -53,6 +53,30 @@ if [ -n "$TASK_INPUT" ]; then
   case "$TASK_INPUT" in *[!0-9]*) die "номер задачи должен быть числом: '$TASK_INPUT'" ;; esac
 fi
 
+# Гвардия дублей (стопгэп к аренде задач #121): если живёт ДРУГОЙ прогон
+# воркера — активный или ожидающий в очереди concurrency-группы — выходим
+# зелёным no-op. Очередь запускает прогоны последовательно, и второму
+# прогону на той же задаче делать нечего; раньше он сжигал установку и мог
+# столкнуться с первым на выборе задачи. Кросс-канальную атомарную аренду
+# (worker/manual/hands) закрывает #121 — здесь защита от дубля самих прогонов.
+if [ "$DRY_RUN" != "1" ] && [ -z "${WORKER_SKIP_DUPGUARD:-}" ]; then
+  others=""
+  for state in "in_progress" "queued"; do
+    others="$others$(gh run list --workflow=worker.yml --status "$state" \
+      --json databaseId -q '[.[].databaseId] | join(" ")' 2>/dev/null || true)"
+  done
+  mine="${GITHUB_RUN_ID:-0}"
+  dup=""
+  for id in $others; do
+    [ "$id" = "$mine" ] && continue
+    dup="$dup$id "
+  done
+  if [ -n "$dup" ]; then
+    echo "Живёт другой прогон воркера (id: $dup) — выхожу no-op, чтобы не делать ту же работу дважды (#121)."
+    exit 0
+  fi
+fi
+
 # Отчёт в Telegram — best-effort: место правды всегда комментарий в задаче,
 # но промах кричит warning'ом в лог job'а, не молчит.
 telegram_report() { # $1 — текст
