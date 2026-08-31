@@ -46,6 +46,8 @@
 - [0003. Задержка старта job'а: вердикт по замерам](decisions/0003-dispatch-latency-verdict.md)
 - [0004. API-контракт](decisions/0004-api-contract.md)
 - [0005. Замер хвоста задержки: кампания, а не сеанс](decisions/0005-dispatch-tail-campaign.md)
+- [0006. Аренда задачи: git-ref замок](decisions/0006-task-lease-git-ref-lock.md)
+- [0007. AI-ревью как второй гейт: своя метка ai:*, двойное условие слияния](decisions/0007-ai-review-gate.md)
 
 ## Мультиагентная работа
 
