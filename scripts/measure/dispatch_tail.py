@@ -34,7 +34,7 @@ CSV живёт на ветке DATA_BRANCH и попадает в main фина�
     python scripts/measure/dispatch_tail.py status     # покрытие + сводка (без записи)
     python scripts/measure/dispatch_tail.py finalize   # завершить кампанию руками
 
-Среда: GH_DISPATCH_TOKEN (PAT: contents/actions/issues/pull-requests write),
+Среда: GH_PIPELINE_PAT (широкий PAT конвейера: contents/actions/issues/pull-requests write; до задачи #6 имя было GH_DISPATCH_TOKEN),
 GITHUB_REPOSITORY; для record — PROBE_ID, SENT_AT_MS, GITHUB_RUN_ID.
 """
 
@@ -274,7 +274,7 @@ def splice_summary(doc: str, block: str) -> str:
 class Github:
     def __init__(self, token: str, repo: str):
         if not token:
-            raise RuntimeError("GH_DISPATCH_TOKEN не задан — кампании нечем авторизоваться")
+            raise RuntimeError("GH_PIPELINE_PAT не задан — кампании нечем авторизоваться")
         self.token = token
         self.repo = repo
 
@@ -385,7 +385,7 @@ def append_and_push(workdir: str, row: dict, commit_message: str) -> bool:
 
 
 def cmd_dispatch(_args: argparse.Namespace) -> int:
-    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail")
 
     # Гвардия «204 — не доказательство запуска»: workflow-файл обязан быть на main
@@ -441,7 +441,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     probe_id = required_env("PROBE_ID")
     sent_at = int(required_env("SENT_AT_MS"))
     run_id = required_env("GITHUB_RUN_ID")
-    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail-data")
 
     run = gh.run(run_id)
@@ -488,7 +488,7 @@ def ensure_draft_pr(gh: Github) -> None:
 def cmd_finalize(_args: argparse.Namespace) -> int:
     """Финал кампании: сводка в доку, PR в готовность, комментарий в задачу,
     workflow выключен. Вызывается автоматически при покрытии или по лимиту дней."""
-    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail-final")
     clone_data_branch(workdir)
 

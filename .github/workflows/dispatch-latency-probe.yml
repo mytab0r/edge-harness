@@ -3,8 +3,9 @@
 # Два job'а, один файл:
 #   tick  (schedule/workflow_dispatch) — отправляет repository_dispatch с PAT и
 #         сторожит таймаут замера; PAT один на весь пишущий путь (диспатч, push
-#         CSV, PR): события от GITHUB_TOKEN проверки не зажигают — см.
-#         docs/research/21-github-actions.md;
+#         CSV, PR) — это широкий GH_PIPELINE_PAT, не узкий GH_DISPATCH_TOKEN
+#         (кампании нужны issues/PR): события от GITHUB_TOKEN проверки не
+#         зажигают — см. docs/research/21-github-actions.md;
 #   probe (repository_dispatch)       — сам измеряемый job'а: стартует максимально
 #         простым шагом (метрика фиксируется GitHub'ом в run_started_at ДО любого
 #         шага) и записывает свою строку в CSV на ветке данных.
@@ -47,15 +48,15 @@ jobs:
           python-version: "3.12"
       - name: Git-авторизация под PAT (push строк CSV)
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: gh auth setup-git
       - name: Тик кампании
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           # Без GH_TOKEN в env credential helper gh не авторизует push из
           # dispatch-пути: timeout/dispatch_failed строки не записывались бы
           # никогда, и кампания молча деградировала бы до «только ok».
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py dispatch
 
   probe:
@@ -78,12 +79,12 @@ jobs:
           python-version: "3.12"
       - name: Git-авторизация под PAT (push строки CSV)
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: gh auth setup-git
       - name: Запись замера
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
           PROBE_ID: ${{ github.event.client_payload.probe_id }}
           SENT_AT_MS: ${{ github.event.client_payload.sent_at }}
         run: python scripts/measure/dispatch_tail.py record

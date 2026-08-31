@@ -63,6 +63,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_claim_task.py -q
 
+      # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
+      # (fine-grained, морда) упоминает только deploy-worker.yml и синх
+      # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)
+      # — на GH_PIPELINE_PAT. Регресс «подсел на dispatch-токен» красит CI,
+      # а не молча ломает конвейер следующим сужением. Доказана мутацией:
+      # каждое из трёх правил красится своей правкой.
+      - name: Гвардия разделения GitHub-токенов
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dispatch_token_usage.py -q
+
       # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
       # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
       # канонический комментарий (шапка-факты + фенсы) и гейт слияния по
@@ -98,7 +109,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/review/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"

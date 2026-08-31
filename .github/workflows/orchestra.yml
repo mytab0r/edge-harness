@@ -51,7 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # PAT для update-branch: GITHUB_TOKEN-обновления не зажигают проверки
-          ORCHESTRA_PAT: ${{ secrets.GH_DISPATCH_TOKEN }}
+          ORCHESTRA_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           # Активный канал предохранителя конвейера и пульса (#120,
           # scripts/orchestra/pulse_guard.py): та же пара секретов, что у воркера
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

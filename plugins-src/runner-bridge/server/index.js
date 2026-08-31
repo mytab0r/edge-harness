@@ -10,8 +10,9 @@
  *     `blocked` label and the PRs referencing it (open / merged / closed).
  *
  * The GitHub token is read from the worker env (`process.env.GH_RUNNER_TOKEN`,
- * synced by deploy-dsh-edge.yml from the repository secret GH_DISPATCH_TOKEN —
- * the same PAT the hands and the orchestrator already use). The token value
+ * synced by deploy-dsh-edge.yml from the repository secret GH_PIPELINE_PAT —
+ * the same broad pipeline PAT the hands and the orchestrator already use; the
+ * narrow GH_DISPATCH_TOKEN of the edge-harness morde lacks issues rights). The token value
  * never appears in tool output: errors carry only HTTP status and GitHub's
  * own message. Every fetch is time-boxed (AbortSignal.timeout), so a hung
  * GitHub call cannot hold the agent turn.
@@ -104,7 +105,7 @@ function configError(tool, what) {
     ok: false,
     message: `${tool} не настроен в воркере: ${what}. `
       + 'Починить может только владелец: секрет GH_RUNNER_TOKEN (в deploy-dsh-edge.yml '
-      + 'он синхронизируется из секрета репозитория GH_DISPATCH_TOKEN) и переменная '
+      + 'он синхронизируется из секрета репозитория GH_PIPELINE_PAT) и переменная '
       + 'воркера GH_RUNNER_REPO (owner/repo). Задачу создать не удалось.',
   }
 }

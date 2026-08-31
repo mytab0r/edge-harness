@@ -63,6 +63,48 @@ jobs:
           fi
         working-directory: cf-worker
 
+      # Гвардия узости GH_DISPATCH_TOKEN (задача #6): морда — поверхность,
+      # смотрящая в интернет, и её dispatch-токен обязан быть fine-grained.
+      # Классический PAT GitHub помечает свои скоупы заголовком X-OAuth-Scopes
+      # (проверено живым запросом 2026-08-31), у fine-grained его нет — по
+      # отсутствию заголовка и отличаем. Набор пермишенов fine-grained токена
+      # API не интроспектирует — это ограничение гвардии, а не её ошибка.
+      # Включается переменной vars.GH_DISPATCH_TOKEN_KIND=fine-grained ВМЕСТЕ
+      # с установкой узкого токена (до свапа в секрете лежит широкий PAT, и
+      # гвардия честно предупреждает, а не красит каждый деплой).
+      # Шаг обязан стоять ДО wrangler deploy и secret put: красный деплой
+      # обязан ОСТАНОВИТЬ установку широкого токена в секрет морды, а не
+      # констатировать её задним числом (находка AI-ревью #146).
+      - name: Гвардия узости GH_DISPATCH_TOKEN (напоминание о миграции)
+        if: vars.GH_DISPATCH_TOKEN_KIND != 'fine-grained'
+        run: |
+          echo '::warning::GH_DISPATCH_TOKEN не проверен: vars.GH_DISPATCH_TOKEN_KIND != fine-grained. Миграция #6 не завершена — в секрете может лежать широкий PAT.'
+      - name: Гвардия узости GH_DISPATCH_TOKEN
+        if: vars.GH_DISPATCH_TOKEN_KIND == 'fine-grained'
+        env:
+          TOKEN_VALUE: ${{ secrets.GH_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          headers=$(mktemp)
+          code=$(curl -sS -o /dev/null -D "$headers" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN_VALUE" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: edge-harness-deploy" \
+            "https://api.github.com/repos/$REPO")
+          if [ "$code" != "200" ]; then
+            rm -f "$headers"
+            echo "::error::GH_DISPATCH_TOKEN не читает этот репозиторий: GET /repos/$REPO → $code"
+            exit 1
+          fi
+          if grep -qi '^x-oauth-scopes:' "$headers"; then
+            scopes=$(grep -i '^x-oauth-scopes:' "$headers" | tail -1 | cut -d' ' -f2-)
+            rm -f "$headers"
+            echo "::error::GH_DISPATCH_TOKEN — классический PAT (X-OAuth-Scopes: $scopes), ожидается fine-grained с Contents+Actions только на этот репозиторий (ADR 0008, задача #6)"
+            exit 1
+          fi
+          rm -f "$headers"
+          echo "GH_DISPATCH_TOKEN: fine-grained (X-OAuth-Scopes отсутствует), репозиторий читается — гвардия пройдена"
+
       - name: Деплой
         run: npx wrangler deploy
         working-directory: cf-worker
@@ -73,6 +115,8 @@ jobs:
       # Воркер удалялся из CF вместе с его секретами. Переустанавливаем их при каждом
       # деплое идемпотентно: wrangler secret put обновляет существующее значение.
       # Значения — те же секреты репозитория, что использует канарейка и hands-job.
+      # GH_DISPATCH_TOKEN — узкий fine-grained PAT (Contents+Actions на этот
+      # репозиторий, задача #6): морда больше не держит широкий PAT владельца.
       - name: Секреты воркера
         working-directory: cf-worker
         env:

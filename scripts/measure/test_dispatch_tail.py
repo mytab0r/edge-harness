@@ -303,7 +303,7 @@ def test_append_and_push_sanitizes_newlines_at_writer_boundary(tmp_path):
 
 def test_every_dispatch_tail_step_has_gh_token():
     """Класс-гвардия «шаг пушит в git без GH_TOKEN»: credential helper gh берёт
-    токен из env GH_TOKEN (или hosts.yml) — GH_DISPATCH_TOKEN он не читает.
+    токен из env GH_TOKEN (или hosts.yml) — GH_PIPELINE_PAT он не читает.
     Шаг без GH_TOKEN роняет только не-ok пути, и кампания молча деградирует
     до «только ok», теряя ровно хвост, ради которого существует."""
     import yaml  # в repo-ci ставится рядом с pytest
