@@ -52,8 +52,16 @@ AI_FAILED = review_labels.AI_FAILED
 AI_VERDICTS = review_labels.AI_VERDICTS
 
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
-# единственной — двусмысленность это error, а не одобрение.
-VERDICT_RE = re.compile(r"^ВЕРДИКТ:\s*(approve|rework)\s*$")
+# единственной — двусмысленность это error, а не одобрение. Модель периодически
+# оборачивает машиночитаемую строку в markdown-выделение (**…**/__…__) вопреки
+# промпту — это тот же сигнал, что и голая строка, парсер обязан его снять.
+# Группа 1 — необязательный маркер, пустая альтернатива в её же группе
+# (а не «?» снаружи) нужна, чтобы backreference \1 совпал с пустой строкой,
+# когда обрамления нет вовсе. Открывающий и закрывающий маркер должны
+# совпадать — «*ВЕРДИКТ: approve__» не становится валидной формой. Упоминание
+# approve/rework ВНУТРИ строки прозы сюда не попадает — якоря ^…$ и жёсткая
+# форма это исключают.
+VERDICT_RE = re.compile(r"^(\*\*|__|)ВЕРДИКТ:\s*(approve|rework)\s*\.?\1$")
 # Блок задачи в беклог: ЗАДАЧА: <заголовок> … КОНЕЦ ЗАДАЧИ. Незакрытый блок
 # не принимается — тихо взять половину хуже, чем не взять совсем.
 TASK_OPEN_RE = re.compile(r"^ЗАДАЧА:\s*(\S.*)$")
@@ -108,10 +116,20 @@ def parse_verdict(answer: str) -> str:
     """approve | rework | error. Единственный сигнал — машиночитаемая
     ПОСЛЕДНЯЯ строка; маркера нет, два или не последний — error."""
     lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
-    marks = [m.group(1) for line in lines for m in [VERDICT_RE.match(line)] if m]
+    marks = [m.group(2) for line in lines for m in [VERDICT_RE.match(line)] if m]
     if len(marks) == 1 and lines and VERDICT_RE.match(lines[-1]):
         return marks[0]
     return "error"
+
+
+def verdict_line_present(answer: str) -> bool:
+    """Есть ли в ответе хоть одна строка, похожая на строку вердикта (в любом
+    количестве и с любым обрамлением) — используется только для диагностики:
+    различить «модель не написала вердикт вовсе» от «написала, но неоднозначно»
+    в сообщении об ошибке. На сам вердикт не влияет — граница контракта не
+    меняется, это чисто текст для человека."""
+    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
+    return any(VERDICT_RE.match(line) for line in lines)
 
 
 def parse_tasks(answer: str) -> list[dict]:
@@ -324,8 +342,15 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
-        print("::error::ответ не соответствует контракту вердикта "
-              "(нет/неоднозначна строка «ВЕРДИКТ: …») — ai:failed, ревью повторится")
+        if verdict_line_present(answer):
+            # строка есть хотя бы одна, но не прошла как единственная и
+            # последняя — двусмысленность, а не молчание модели.
+            reason = "строка «ВЕРДИКТ: …» есть, но не единственная и/или не последняя"
+        else:
+            # модель не написала строку вердикта содержательно вовсе.
+            reason = "строки «ВЕРДИКТ: …» нет вообще"
+        print(f"::error::ответ не соответствует контракту вердикта ({reason}) "
+              f"— ai:failed, ревью повторится")
         print(f"хвост ответа:\n{tail}")
         return 1
     print(f"verdict: {verdict} — {label}")
