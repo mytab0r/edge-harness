@@ -44,9 +44,64 @@ rl_spec.loader.exec_module(rl)  # type: ignore[union-attr]
     ("ВЕРДИКТ: approve  \r\n\r\n", "approve"),
     # маркер ВНУТРИ прозаического пересказа не считается
     ("«ВЕРДИКТ: approve» должно быть последней строкой\nВЕРДИКТ: rework", "rework"),
+    # прод-форма: PR #138, прогон 33567380398 — модель оборачивает строку в
+    # markdown-выделение (**…**), регэксп без починки эту форму не узнаёт
+    (
+        "The implementation is solid. All logic tests pass, the trust zone "
+        "architecture correctly implements the ADR 0007 spec, and the workflow "
+        "trigger change is properly justified by the documented GitHub "
+        "anti-recursion behavior (research/21).\n\n**ВЕРДИКТ: approve**",
+        "approve",
+    ),
+    # та же форма с __…__ и с rework
+    ("Есть находки, чинить до мержа.\n__ВЕРДИКТ: rework__", "rework"),
+    # обрамление разных маркеров с двух сторон — не валидная форма
+    ("**ВЕРДИКТ: approve__", "error"),
+    # markdown-обрамление не спасает от двусмысленности (два маркера)
+    ("**ВЕРДИКТ: approve**\nВЕРДИКТ: rework", "error"),
+    # approve упомянут в середине рассуждения БЕЗ обрамления строки вердикта —
+    # не считается, даже если это последняя строка целиком не совпадает с
+    # контрактом (нет отдельной строки «ВЕРДИКТ: …»)
+    ("Похоже, здесь подошёл бы approve, но не уверен.", "error"),
+    # прод-форма: PR #159, прогон 33513671645 — ответ обрывается на прозе,
+    # строки «ВЕРДИКТ: …» нет вообще ни в каком виде — законный error
+    (
+        "- Экспорт для раннеров (вариант 2) — верный выбор архитектурно (нет "
+        "новой сетевой зависимости на критическом пути), нужно только честно "
+        "зафиксировать конфликт с #155.\n\n---\n\n"
+        "#### Некритичные правки (из pass2 ревью, уже учтены в `design.md`):\n"
+        "- Имя класса: `DeepSeekUploadIndex`, не `LocalUploadIndex`.\n\n---\n\n"
+        "**Действие:** Вернуть PR на доработку спеки. Все пять пунктов выше — "
+        "правки в markdown-файлах `openspec/changes/dsh-edge-provider-registry/` "
+        "(никакого кода). После правок — повторный проход analyze-gate, затем "
+        "реализация.",
+        "error",
+    ),
 ])
 def test_parse_verdict(answer, expected):
     assert ai.parse_verdict(answer) == expected
+
+
+# ── Диагностика error: «нет строки вовсе» vs «есть, но не разобрана» ─────────
+
+@pytest.mark.parametrize("answer,expected", [
+    # прод-форма PR #159 (33513671645): вердикта нет вообще
+    (
+        "**Действие:** Вернуть PR на доработку спеки. Все пять пунктов выше — "
+        "правки в markdown-файлах, реализация позже.",
+        False,
+    ),
+    ("Замечаний не имею.", False),
+    ("", False),
+    # строка есть, но не последняя — неоднозначность, не молчание
+    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", True),
+    # два маркера — тоже «есть, но не разобрана»
+    ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", True),
+    # markdown-обрамлённый маркер тоже считается «строка есть»
+    ("**ВЕРДИКТ: approve**\nВЕРДИКТ: rework", True),
+])
+def test_verdict_line_present_distinguishes_absent_from_ambiguous(answer, expected):
+    assert ai.verdict_line_present(answer) is expected
 
 
 # ── Блоки задач в беклог ───────────────────────────────────────────────────────
