@@ -181,7 +181,8 @@ jobs:
               if conc is None or len(jobs) < 2:
                   continue
               group = str(conc.get('group', '')) if isinstance(conc, dict) else str(conc)
-              is_static = '${{' not in group
+              expr_marker = '$' + '{{'
+              is_static = expr_marker not in group
               if is_static:
                   bad.append(
                       f'{path}: concurrency.group="{group}" статична и объявлена на '
