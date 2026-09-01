@@ -74,17 +74,19 @@
 
 ## Механика DSH (всё проверено прогонами)
 
+Источники: [архитектура DSH](../research/10-dsh-architecture.md#дистрибуция-в-npm-подтверждено-замером-2026-08-2829), [runbook смены провайдера](../runbooks/switch-llm-provider.md), [dsh-edge](../research/11-dsh-edge.md).
+
 - Пакеты `@deepseek-ai/dsh-*` ставятся ТОЛЬКО tarball'ами: `npm pack <pkg>@<ver>`
-  → установка из локальных tgz (`npm install` даёт 404).
+  → установка из локальных tgz (`npm install` даёт 404). [подтверждено замером](../research/10-dsh-architecture.md#дистрибуция-в-npm-подтверждено-замером-2026-08-2829)
 - Провайдер и модель приезжают в env раннера из `vars`/`secrets` репозитория
   (`DEEPSEEK_BASE_URL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`) — единственное
   место правды (#153). Локально не угадывай конкретный эндпоинт/модель;
   процедура смены — `docs/runbooks/switch-llm-provider.md`. Модель — НЕ env
   для самого DSH, а патч профиля `~/.dsh/profiles/<профиль>/cordis.patch.yml`:
   `agent-default-model` → `{provider: deepseek-official, model: <DEEPSEEK_MODEL>}` +
-  `llm-deepseek` → `{maxTokens: <лимит модели>}` (иначе modelCode/maxTokens-ошибки).
+  `llm-deepseek` → `{maxTokens: <лимит модели>}` (иначе modelCode/maxTokens-ошибки). [подтверждено живым прогоном](../research/10-dsh-architecture.md#запуск-headless-с-внешним-openai-compat-провайдером--подтверждено-живым-прогоном-2026-08-30)
 - headless: one-shot, exit 0 только при `turn/end completed`; аппрувы
-  fail-closed — не формулируй задачи, требующие апрува; cwd до старта = корень
-  воркспейса, после не менять.
+  fail-closed — не формулируй задачи, требующие аппрува; cwd до старта = корень
+  воркспейса, после не менять. [контракт headless](../research/10-dsh-architecture.md#дистрибуция-в-npm-подтверждено-замером-2026-08-2829)
 - Установка плагинов в headless-профиль: `dsh plugin --profile headless add <tgz>`
-  + проверка `--dump-config` до прогона.
+  + проверка `--dump-config` до прогона. [подтверждено](../research/10-dsh-architecture.md#как-подменить-провайдера-без-форка)
