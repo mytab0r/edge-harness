@@ -190,6 +190,33 @@ def test_release_missing_lock_is_ok(monkeypatch):
     assert "отсутствовал" in ct.release("o/r", 7)
 
 
+def test_release_missing_lock_prod_form_422_is_ok(monkeypatch):
+    # Прод-форма (прогон orchestra 33562818220, задачи #18/#138/#147): GitHub
+    # на DELETE несуществующего ref отвечает НЕ 404, а 422 "Reference does not
+    # exist" — это тот же класс «рефа нет», а не поломка.
+    class RefDoesNotExistServer(FakeServer):
+        def run(self, args, **kw):
+            if "-X" in args and "DELETE" in args:
+                return fail(422, "Reference does not exist")
+            return super().run(args, **kw)
+    install(monkeypatch, RefDoesNotExistServer(FakeServer({}).routes))
+    assert "отсутствовал" in ct.release("o/r", 7)
+
+
+def test_release_422_reference_already_exists_is_not_missing(monkeypatch):
+    # 422 — не универсальный «рефа нет»: тот же код у claim() при гонке
+    # ("Reference already exists"). release() обязан различать по сообщению,
+    # а не по одному статусу — иначе настоящая поломка на DELETE замаскируется.
+    class WeirdServer(FakeServer):
+        def run(self, args, **kw):
+            if "-X" in args and "DELETE" in args:
+                return fail(422, "Reference already exists")
+            return super().run(args, **kw)
+    install(monkeypatch, WeirdServer(FakeServer({}).routes))
+    with pytest.raises(RuntimeError):
+        ct.release("o/r", 7)
+
+
 def test_release_real_failure_is_loud(monkeypatch):
     class BrokenServer(FakeServer):
         def run(self, args, **kw):
