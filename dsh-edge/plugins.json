@@ -18,7 +18,7 @@
       "source": {
         "release": "plugins-runner-v0.1.1",
         "asset": "runner-bridge-0.1.1.tgz",
-        "sha256": "8ed9b451ffa731f1427f3425e818325dc198425d7197d003bc26d4c092b01733"
+        "sha256": "d20b5a2dda3bcda188664f5dcad35ca38a406807bc9517220bbb2d082794158f"
       },
       "server": true,
       "client": false
