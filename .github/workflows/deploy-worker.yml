@@ -60,7 +60,8 @@ jobs:
           [ -f .dev.vars ] || cp .dev.vars.example .dev.vars
           npx wrangler types
           # Фильтруем известные безвредные отличия: строка хеша и комментарий про секреты.
-          if ! git diff -- worker-configuration.d.ts | grep -vE '^(.*hash: |.*Secrets \(HANDS_TOKEN|.*they are set via)' | grep -q '^[+-]'; then
+          # В diff строки начинаются с -/+; паттерны учитывают это.
+          if ! git diff -- worker-configuration.d.ts | grep -vE '^[-+].*hash: |^[-+].*Secrets \(HANDS_TOKEN|^[-+].*they are set via' | grep -q '^[+-]'; then
             exit 0
           fi
           git diff -- worker-configuration.d.ts | head -40
