@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:docker": "DOCKER_BUILDKIT=0 docker build -t edge-harness-worker-dev . && docker run --rm -p 8808:8808 edge-harness-worker-dev",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
