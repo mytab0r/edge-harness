@@ -300,9 +300,88 @@ Python-SDK **есть в самом репозитории**: `python/sdk-runtim
 - Протоколы: `openai-completions`, `openai-responses`, `anthropic-messages`.
 - Свой gateway = строчка конфига, кода писать не нужно.
 
+**Полная схема конфигурации — проверено по tarball `@deepseek-ai/dsh-llm-pi-ai@0.1.2-alpha.3` (lib/types/config.d.ts, lib/types/provider.d.ts, lib/types/catalog.d.ts).**
+
+Путь в конфиге: `llm-pi-ai.providers.<route-id>` (где `<route-id>` — уникальный идентификатор провайдера). Поля объекта провайдера:
+- `displayName` — видимое имя в UI (обязательно)
+- `api` — wire-протокол провайдера (обязательно); для OpenAI-совместимых = `"openai-completions"`
+- `baseURL` — API endpoint (заглавные буквы: `baseURL`, а не `base_url`) (обязательно)
+- `apiKeyEnv` — **название env-переменной**, где хранится ключ (не сам ключ). Резолвится per-request через `ctx.credentials` (обязательно)
+- `models[]` — массив поддерживаемых моделей; каждый элемент содержит:
+  - `id` — идентификатор модели (обязательно)
+  - `name?` — опциональное видимое имя в UI
+  - `contextWindow?` — размер окна контекста
+  - `maxTokens?` — максимум выходных токенов
+
+**Пример валидного конфига** (поля отвечают структуре `config.d.ts:54-65`):
+
+```yaml
+llm-pi-ai:
+  providers:
+    custom-openai:
+      displayName: My OpenAI Gateway
+      api: openai-completions
+      baseURL: https://api.example.com/v1
+      apiKeyEnv: CUSTOM_OPENAI_KEY
+      models:
+        - id: gpt-4o
+          name: GPT-4 Omni
+          contextWindow: 128000
+          maxTokens: 4096
+```
+
+**Контраст с `dsh-llm-deepseek`.** В адаптере `dsh-llm-deepseek` (единственный, смонтированный в морде dsh-edge, см. [research/11](11-dsh-edge.md)) выбор модели пинится ОДНОЙ константой в cordis-патче (`agent-default-model`), а base URL и ключ идут из env. В `llm-pi-ai` провайдер и модель объявляются в settings namespace `llm-pi-ai.providers`, то есть переконфигурируются без пересборки. Это две разные архитектуры: single-provider по переменным окружения против multi-provider через settings. Не путать их схемы полей: у `llm-pi-ai` это `api`/`baseURL`/`apiKeyEnv`, у `llm-deepseek` — env `DEEPSEEK_BASE_URL`/`DEEPSEEK_API_KEY` плюс патч профиля.
+
+**Связь с `agent-default-model`.** Глобальный выбор модели живёт в `agent-default-model` namespace (`$DSH_HOME/settings.yaml`):
+
+```yaml
+agent-default-model:
+  provider: <route-id>  # идентификатор провайдера из llm-pi-ai (например, "custom-openai")
+  model: <model-id>     # одно из значений llm-pi-ai.providers.<route-id>.models[].id
+  reasoningEffort: low
+```
+
 Пакет смонтирован **дремлющим**: комментарий в `packages/bundle/base/cordis.patch.yml` (проверено дословно) описывает это как «zero routes (and no extra models in the picker) until a `llm-pi-ai:` settings section supplies provider profiles» — маршруты регистрируются, когда появились профили, и снимаются, когда секция опустела. Ровно это делает страница Models в веб-морде.
 
 > **КРИТИЧНАЯ ПОПРАВКА.** Это пул **ВЫБОРА** — все модели сваливаются в один picker, пользователь выбирает. Это **НЕ роутер**. Автоматического fallback при ошибке, балансировки нагрузки и ротации нескольких учёток одного провайдера в документации **нет**. Если нужна отказоустойчивость или размазывание по ключам — это наша работа (свой `LlmAdapter` либо gateway снаружи), и планировать её надо явно. Единственный намёк на устойчивость в дереве — отдельный пакет `llm-retry`, то есть ретраи, а не маршрутизация.
+
+### 10.2 Каталоги моделей конкретных провайдеров
+
+**Z.AI: семейство GLM — подтверждено по официальным докам.**
+
+| модель | context window | max output | API-id |
+| --- | --- | --- | --- |
+| glm-5 | 200K (200 000) | 128K (131 072) | `glm-5` |
+| glm-5.3 | 1M (1 000 000) | 128K (131 072) | `glm-5.3` |
+| glm-5.3-flash | 1M (1 000 000) | 128K (131 072) | `glm-5.3-flash` |
+| glm-4.7 | 200K (200 000) | 128K (131 072) | `glm-4.7` |
+
+**Источник:** [docs.z.ai/guides/llm/glm-5](https://docs.z.ai/guides/llm/glm-5), [docs.z.ai/guides/llm/glm-5.3](https://docs.z.ai/guides/llm/glm-5.3), [docs.z.ai/guides/vlm/glm-5.3-flash](https://docs.z.ai/guides/vlm/glm-5.3-flash), [docs.z.ai/guides/llm/glm-4.7](https://docs.z.ai/guides/llm/glm-4.7), [docs.z.ai/api-reference/llm/chat-completion](https://docs.z.ai/api-reference/llm/chat-completion).
+
+**OpenAI-compatible endpoint:** `https://api.z.ai/api/coding/paas/v4`
+
+**Практическое значение:** `docs.z.ai/api-reference/llm/chat-completion` задаёт для параметра `max_tokens` диапазон 1…131072. Это прямое подтверждение констант `DEEPSEEK_MAX_OUTPUT_TOKENS=131072` (деплой морды) и `DSH_MAX_TOKENS=131072` (раннер), и объясняет, почему дефолтный `maxTokens` адаптера 256 000 отвергается с `INVALID_REQUEST` — API не принимает значения свыше лимита провайдера.
+
+**Рантайм-источник этих чисел** в репозитории — переменная `vars.DSH_EDGE_MODEL_CATALOG` (актуальны на 2026-09-01). Документация объясняет ПОЧЕМУ такие числа, конфиг содержит ЧТО их использует. При обновлении параметров одного провайдера правятся оба места одновременно: документация и конфиг не должны расходиться.
+
+---
+
+**NVIDIA Nemotron-3: семейство MoE-моделей, managed API.**
+
+| вариант | параметры | context | API-id |
+| --- | --- | --- | --- |
+| Nano | 30B общ. / 3B активных (MoE) | не подтверждено | не подтверждено |
+| Super | 120B общ. / 12B активных (MoE) | не подтверждено | `nvidia/nemotron-3-super-120b-a12b` |
+| Ultra | 550B общ. / 55B активных (MoE) | 1M (Long Context Ruler @1M) | `nvidia/nemotron-3-ultra-550b-a55b` (экстраполяция) |
+
+**Источник:** блоги developer.nvidia.com про Nemotron-3 Ultra и Nemotron-3 Nano; архитектура Ultra описана как Hybrid Mamba-Attention (LatentMoE: Mamba-2 + MoE + Attention, Multi-Token Prediction).
+
+**OpenAI-compatible endpoint:** `https://integrate.api.nvidia.com/v1`
+
+**Важные замечания:**
+- Архитектура Ultra не чистый transformer (Mamba-2 + MoE-гибрид), поэтому лимиты, адаптированные для GLM, переносить на этот провайдер нельзя — нужна независимая проверка.
+- **Llama-3.1-Nemotron-Ultra-253B** — другая, более старая линейка моделей. Не путать с Nemotron-3-Ultra-550B: это разные модели с разными характеристиками.
+- API-id Super подтверждён (зашит в репозитории с #51); API-id Ultra образован по образцу и требует проверки при наличии ключа доступа.
 
 ## 11. Что требует Node-рантайма
 
@@ -451,6 +530,9 @@ export function apply(ctx: Context) {
 - **Детали протокола E2B за пределами README.** Формат запросов к песочнице, семантика таймаутов, поведение при обрыве — читались только по README пакетов. Перед реализацией собственного удалённого провайдера по этому образцу надо читать `packages/e2b/*/src`.
 - **Глубокая часть документации недоступна на сайте.** `docs/cordis-api/*`, `docs/subsystems/*`, `docs/capability-seams.md` на [deepseek-harness.github.io](https://deepseek-harness.github.io/deepseek-harness/) отдают 404 и живут **только в репозитории**. Ссылаться на сайт для этих разделов нельзя — только на `raw.githubusercontent.com`. (Из-за этого же реестр швов и часть цитат в этом документе взяты из репозитория, а не с сайта.)
 - **Точные звёзды сторонних плагинов** — снимок на 2026-08-28, метрика подвижная; отсутствие плагина в списке значит «не нашли», а не «не существует».
+- **Публичный листинг моделей Z.AI:** `GET https://api.z.ai/api/coding/paas/v4/models` без ключа отдаёт 401 — доки z.ai остаются единственным источником окон контекста и лимитов вывода.
+- **Публичный листинг моделей NVIDIA NIM:** `GET https://integrate.api.nvidia.com/v1/models` без ключа отдаёт 451, `build.nvidia.com` — 403. Соответствие HuggingFace-slug → managed API id проверяется только авторизованным запросом; точный API-id Nemotron-3 Ultra до такой проверки считается неподтверждённым.
+- **Максимум output-токенов для Nemotron-3 Ultra** публично не задокументирован нигде.
 
 ### Снято с этого списка
 
@@ -485,7 +567,13 @@ export function apply(ctx: Context) {
 - [`packages/core/agent/src/index.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/core/agent/src/index.ts) — `node:async_hooks`, `node:util/types`
 - обход всех 45 `.ts` в `packages/core/*/src/` на предмет `node:*`
 
-**Прочитано, но не перепроверено построчно:** `docs/capability-seams.md`, `packages/README.md`, README пакетов `shell`, `subprocess`, `fs`, `storage`, `session-persistence`, `llm`, `llm-pi-ai`, `webworker-runtime`, документация по профилям и `dsh plugin`.
+**Тарбол-исследование tarball `@deepseek-ai/dsh-llm-pi-ai@0.1.2-alpha.3` — 2026-08 :**
+- `lib/types/config.d.ts` — структура `LlmPiAiConfig`, ключи `providers.<id>`, поля провайдера
+- `lib/types/provider.d.ts` — интерфейс провайдера с `api`, `baseURL`, `apiKeyEnv`, `models`
+- `lib/types/catalog.d.ts` — структура каталога моделей с полями `id`, `name`, `contextWindow`, `maxTokens`
+- `README.md` (строка 113) — требование непустого `models` для кастомных route'ов
+
+**Прочитано, но не перепроверено построчно:** `docs/capability-seams.md`, `packages/README.md`, README пакетов `shell`, `subprocess`, `fs`, `storage`, `session-persistence`, `llm`, `webworker-runtime`, документация по профилям и `dsh plugin`.
 
 **Внешнее:** [Cordis](https://github.com/cordiverse/cordis), [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai), GitHub topic [`dsh-plugin`](https://github.com/topics/dsh-plugin), community-списки `awesome-dsh-plugin`, `dsh-market`.
 

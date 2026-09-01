@@ -178,6 +178,7 @@ const MAX_REPLAY_RESPONSE_BYTES = 1_048_576
 - Нет регистрации, базы пользователей, ролей, мультитенантного роутинга (README:127) — жёстко один DO с именем `owner`, вход по одному высокоэнтропийному секрету воркера, обмениваемому на подписанную 30-дневную HttpOnly `SameSite=Strict` куку.
 - **Удаление сессии не выставлено** (README:295) — потому что upstream-сервис персистенции не определяет деструктивное удаление.
 - В direct-бэкенде **sync отключён полностью** — методы кидают `ENOSYS` (`direct-shell.ts:324`, `:336`); `getExec` всегда `ENOENT` (`direct-shell.ts:114-115`), то есть **переподключиться к запущенной команде нельзя**.
+- **Кнопки добавления/редактирования провайдера в Settings → Models неактивны.** UI-компоненты `CustomProviderCard` и `ProviderEditor` из upstream пакета `@deepseek-ai/dsh-client-ui-settings-models` исправны и управляются флагом `readOnly` из `ModelsSettingsState.writable`. Дело **не** в запрете записи: морда объявляет себя пишущим провайдером настроек явно — `do-settings-provider.ts:19`, `override readonly writable = true`. Корневая причина: `session-store.ts:192-303` строит cordis-композицию с нуля и монтирует **только** адаптер `dshLlmDeepseek` (строка 243), без пакета `dsh-llm-pi-ai` (мультипровайдерный пул). Provider ID адаптера захардкожен как `deepseek-official`; settings namespace `llm-pi-ai` не существует, поэтому directory `llm.providers` содержит **ровно один** route — не пустой список, а список без выбора, и кнопке «добавить провайдера» физически некуда писать. Это осознанное решение апстрима: согласно заметке `.agents/notes/implemented/architecture/2026-08-22-dsh-edge-v0.4-multi-provider-vision.md` (раздел Excluded), пакет `dsh-llm-pi-ai` зависит от Node.js-only SDK'ов и превышал бы gzip-бюджет Worker'а. Смена провайдера — это ЗАМЕНА единственного слота через `vars` деплоя или Settings → baseURL, а не добавление второго параллельного. Пин апстрима: `dsh-edge/upstream.json` → `pawaca/dsh-edge@113a96913c51881993122afbf42e776882c4beb7` (release 0.7.1).
 
 Лимиты (README, раздел «Limits and request admission», строки ~305-317):
 
@@ -240,6 +241,7 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 
 ## Что не подтверждено
 
+- **Кнопки добавления/редактирования провайдера** — живой ответ `llm.providers`/`llm.models` на проде не снят (нужна кука владельца). Собственного замера прироста gzip-бандла при добавлении `llm-pi-ai` в этом репозитории нет; цифра 900 KiB и вывод о превышении бюджета взяты из апстримной заметки.
 - **Доступность самих `@deepseek-ai/dsh-*` в публичном npm и их лицензия.** Вывод косвенный — из того, что `npx dsh-edge install` работает у сторонних пользователей. Но именно эта установка ничего не доказывает: она ставит предсобранный воркер и upstream-пакеты не резолвит вовсе (см. раздел про дистрибуцию). Прямой проверки `npm view @deepseek-ai/dsh-agent` не делалось.
 - Точное содержимое `.patch`-файлов (сейчас семь) не читалось — читался только `audit.json` с причинами и условиями снятия.
 - Заявления README о поведении (лимиты, отказ вместо усечения, 30-дневная кука) сверялись с текстом README и с константами в коде, но не прогоном живого деплоя.
@@ -268,5 +270,6 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 - `apps/dsh-edge/standalone/patches/audit.json` (+ семь `.patch`-файлов рядом)
 - `apps/dsh-edge/src/`: `instance.ts`, `direct-shell.ts`, `do-session-persistence.ts`, `session-store.ts`, `agent.ts`, `sse.ts`, `do-storage-backend.ts`, `edge-credentials.ts`, `do-settings-provider.ts`, `edge-attachment-store.ts`, `index.ts`, `edge-api.ts`
 - `apps/dsh-edge/scripts/wrangler-config-core.mjs`, `apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs`
+- `.agents/notes/implemented/architecture/2026-08-22-dsh-edge-v0.4-multi-provider-vision.md`
 - `.github/workflows/edge-ci.yml`
 - Issues #42, #43; PR #63
