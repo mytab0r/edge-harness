@@ -42,32 +42,12 @@ jobs:
           echo "orchestra+lib+review: keyword-аргументов нет"
 
       # Гвардия класса #153: провайдер/модель LLM — ровно одно место правды
-      # (vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория). Зашитый фолбэк на
-      # конкретный эндпоинт/модель в workflow ("|| 'https://api.z.ai/...'") или
-      # в скрипте (":-glm-5") молча перекрывает vars и воспроизводит класс —
-      # проверка ловит появление такого паттерна где угодно в workflow/scripts.
-      # Allowlist — ровно два легитимных места вне нашего дефолта провайдера:
-      #   - scripts/lib/test/dsh-clients.smoke.sh — фикстура смоука (значение
-      #     нужно как непустая строка для dsh_require_provider_env, не как
-      #     дефолт прода);
-      #   - .github/workflows/deploy-dsh-edge.yml — патчит upstream-каталог
-      #     моделей МОРДЫ (бандл dsh-edge), "deepseek-v4-flash" там — маркер
-      #     чужого upstream-литерала для замены, а не наш CI-дефолт вызова LLM.
-      # Сам этот шаг исключён из поиска: иначе grep находит собственные паттерны.
+      # (vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория). Вынесена в
+      # scripts/lib/test/provider-default.guard.sh (находка 9): два паттерна
+      # (свойство + литерал), исключение только файла гвардии — теперь и
+      # repo-ci.yml сам под проверкой.
       - name: Провайдер/модель LLM — одно место правды (vars), без зашитых дефолтов
-        run: |
-          hits=$(grep -rnE 'api\.z\.ai|integrate\.api\.nvidia\.com|glm-[0-9]|nemotron|deepseek-v[0-9]' \
-            --include='*.yml' --include='*.sh' \
-            .github/workflows scripts \
-            | grep -v '^scripts/lib/test/dsh-clients\.smoke\.sh:' \
-            | grep -v '^\.github/workflows/deploy-dsh-edge\.yml:' \
-            | grep -v '^\.github/workflows/repo-ci\.yml:' || true)
-          if [ -n "$hits" ]; then
-            echo "::error::Зашитый дефолт провайдера/модели вне allowlist — единственное место правды vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL нарушено (класс #153)"
-            echo "$hits"
-            exit 1
-          fi
-          echo "провайдер/модель: зашитых дефолтов вне allowlist нет"
+        run: bash scripts/lib/test/provider-default.guard.sh
 
       # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
       # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
@@ -137,7 +117,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/review/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"

@@ -76,11 +76,13 @@
 
 - Пакеты `@deepseek-ai/dsh-*` ставятся ТОЛЬКО tarball'ами: `npm pack <pkg>@<ver>`
   → установка из локальных tgz (`npm install` даёт 404).
-- Провайдер: env `DEEPSEEK_BASE_URL=https://api.z.ai/api/coding/paas/v4`,
-  `DEEPSEEK_API_KEY`, модель — НЕ env, а патч профиля
-  `~/.dsh/profiles/<профиль>/cordis.patch.yml`:
-  `agent-default-model` → `{provider: deepseek-official, model: glm-5}` +
-  `llm-deepseek` → `{maxTokens: 131072}` (иначе modelCode/maxTokens-ошибки).
+- Провайдер и модель приезжают в env раннера из `vars`/`secrets` репозитория
+  (`DEEPSEEK_BASE_URL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`) — единственное
+  место правды (#153). Локально не угадывай конкретный эндпоинт/модель;
+  процедура смены — `docs/runbooks/switch-llm-provider.md`. Модель — НЕ env
+  для самого DSH, а патч профиля `~/.dsh/profiles/<профиль>/cordis.patch.yml`:
+  `agent-default-model` → `{provider: deepseek-official, model: <DEEPSEEK_MODEL>}` +
+  `llm-deepseek` → `{maxTokens: <лимит модели>}` (иначе modelCode/maxTokens-ошибки).
 - headless: one-shot, exit 0 только при `turn/end completed`; аппрувы
   fail-closed — не формулируй задачи, требующие апрува; cwd до старта = корень
   воркспейса, после не менять.

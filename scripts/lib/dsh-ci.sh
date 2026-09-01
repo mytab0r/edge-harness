@@ -82,9 +82,8 @@ dsh_install() { # $1 — рабочий каталог для tarball'ов (со
 # Выбор модели и лимит ответа — через родной settings-слой профиля, НЕ env:
 # адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
-# без патча уходит чужой встроенный дефолт адаптера, целевой провайдер отвечает
-# «modelCode does not exist»; maxTokens-дефолт адаптера 256000 выше потолка
-# целевой модели 131072 → INVALID_REQUEST).
+# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
+# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
 dsh_patch_profile() { # $1 — имя профиля (обычно headless); выставляет DSH_MODEL/DSH_MAX_TOKENS
   local profile=$1
   # Модель обязана прийти из окружения (vars.DEEPSEEK_MODEL, #153) — здесь

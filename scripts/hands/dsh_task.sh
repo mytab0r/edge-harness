@@ -30,6 +30,12 @@ CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле веш
 : "${HANDS_URL:?HANDS_URL не задан}"
 : "${HANDS_TOKEN:?HANDS_TOKEN не задан}"
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или manual-<run_id>)}"
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
+# в блоке обязательных переменных — ДО heartbeat, dsh_edge_login и создания
+# сессии в морде: иначе конфиг-ошибка даёт пустую сессию в UI морды и задачу,
+# помеченную провалом, вместо честного «не сконфигурировано».
+dsh_require_provider_env || exit 1
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
 WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"
@@ -169,10 +175,7 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 2. Провайдер: без окружения работа невозможна — падаем сразу, не через 10 минут ──
-# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
-# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет.
-dsh_require_provider_env || exit 1
+# ── 2. Провайдер: проверка выше (блок обязательных переменных) — здесь только export ──
 # Профиль headless — pnpm-workspace: `pnpm add` внутри требует явного
 # подтверждения root (иначе ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30).
 export npm_config_ignore_workspace_root_check=true
@@ -189,9 +192,8 @@ dsh --version || true
 # а не промежуточной.
 # Адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
-# без патча уходит чужой встроенный дефолт адаптера, целевой провайдер отвечает
-# «modelCode does not exist»; maxTokens-дефолт адаптера 256000 выше потолка
-# целевой модели 131072 → INVALID_REQUEST).
+# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
+# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
 dsh_patch_profile headless
 
 # ── 3b. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
