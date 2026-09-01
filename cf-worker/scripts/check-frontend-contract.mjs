@@ -85,7 +85,7 @@ for (const file of readdirSync(i18nDir).filter((name) => name.endsWith(".js"))) 
 
 // 5. Производные спеки не устарели (docs/api.md и серверный снимок src/api-spec.ts)
 execSync("node scripts/generate-api-docs.mjs", { cwd: root, stdio: "pipe" });
-const generatedDiff = execSync("git diff --stat -- docs/api.md src/api-spec.ts", { cwd: root }).toString().trim();
+const generatedDiff = execSync("git diff --stat -- ../docs/api.md src/api-spec.ts", { cwd: root }).toString().trim();
 if (generatedDiff) fail("docs/api.md или src/api-spec.ts устарел — запусти npm run docs и закоммить");
 
 // 6. Шаблоны обеих веток бейджа пульса, скопированные в test/pulse.spec.ts, совпадают

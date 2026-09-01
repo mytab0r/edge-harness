@@ -11,6 +11,10 @@ window.EDGE_CONFIG = {
     task: "/api/tasks/",
     heartbeat: "/api/heartbeat",
     session: "/api/session",
+    messagesWebhook: "/api/messages/webhook",
+    messages: "/api/messages",
+    message: "/api/messages/",
+    messagesProcess: "/api/messages/process",
   },
   replayPageSize: 200,
   /* Сокет переподключается проактивно: точное значение idle-timeout Cloudflare

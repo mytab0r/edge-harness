@@ -70,6 +70,44 @@ const spec = {
       ],
       "auth": true,
       "summary": "Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed."
+    },
+    {
+      "name": "messagesWebhook",
+      "path": "/api/messages/webhook",
+      "methods": [
+        "POST"
+      ],
+      "auth": false,
+      "summary": "Вебхук для входящих сообщений (Telegram, и др.). Принимает JSON с полями source, source_msg_id, chat_id, sender_id, sender_name, text. Идемпотентен по source+source_msg_id. Возвращает {message_id, status}."
+    },
+    {
+      "name": "messages",
+      "path": "/api/messages",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "auth": true,
+      "summary": "GET — список сообщений с фильтрами (status, kind, limit, after). POST — ручное создание сообщения (для тестов/админа)."
+    },
+    {
+      "name": "message",
+      "path": "/api/messages/",
+      "methods": [
+        "GET"
+      ],
+      "auth": true,
+      "rest": true,
+      "summary": "Одна сообщение по id."
+    },
+    {
+      "name": "messagesProcess",
+      "path": "/api/messages/process",
+      "methods": [
+        "POST"
+      ],
+      "auth": true,
+      "summary": "Запустить обработку новых сообщений: классификация, группировка, создание задач для директив. Возвращает {processed, created_issues, errors}."
     }
   ]
 };

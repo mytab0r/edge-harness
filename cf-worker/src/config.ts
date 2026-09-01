@@ -22,6 +22,12 @@ export const LIMITS = {
    *  heartbeat — ненормальное состояние, морда показывает предупреждение.
    *  Медиана старта 8.3 с (ADR 0003), хвост ничем не ограничен — порог щедрый. */
   staleDispatchMs: 30 * 60_000,
+  /** Inbox: макс. длина текста сообщения. */
+  messageMaxChars: 16384,
+  /** Inbox: макс. сообщений за один вызов process. */
+  messageProcessMax: 100,
+  /** Inbox: окно группировки сообщений (мс). */
+  messageGroupWindowMs: 5 * 60 * 1000,
 } as const;
 
 /** Сессия браузера: подписанная кука вместо долгоживущего HANDS_TOKEN в query/JS

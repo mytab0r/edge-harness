@@ -523,5 +523,204 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     const afterEnd = await getJson<{ tasks: Record<string, number> }>("/api/status");
     expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
     expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
+describe("inbox: сообщения владельца", () => {
+  it("вебхук принимает сообщение и возвращает id", async () => {
+    const res = await postJson("/api/messages/webhook", {
+      source: "telegram",
+      source_msg_id: "msg-123",
+      chat_id: "chat-456",
+      sender_id: "user-789",
+      sender_name: "Owner",
+      text: "Привет, это тестовое сообщение",
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ message_id: number; status: string }>();
+    expect(body.message_id).toBeGreaterThan(0);
+    expect(body.status).toBe("accepted");
+  });
+
+  it("вебхук идемпотентен по source+source_msg_id", async () => {
+    const payload = {
+      source: "telegram",
+      source_msg_id: "msg-456",
+      chat_id: "chat-456",
+      sender_id: "user-789",
+      sender_name: "Owner",
+      text: "Второе сообщение",
+    };
+    const first = await (await postJson("/api/messages/webhook", payload)).json<{ message_id: number }>();
+    const second = await (await postJson("/api/messages/webhook", payload)).json<{ message_id: number }>();
+    expect(first.message_id).toBe(second.message_id);
+
+    // Проверяем, что в БД только одно сообщение
+    const list = await getJson<{ messages: { id: number }[] }>("/api/messages?source=telegram&sender_id=user-789");
+    const mine = list.messages.filter((m) => m.source_msg_id === "msg-456");
+    expect(mine).toHaveLength(1);
+  });
+
+  it("вебхук отклоняет пустой text", async () => {
+    const res = await postJson("/api/messages/webhook", {
+      source: "telegram",
+      source_msg_id: "msg-empty",
+      text: "",
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("need_text");
+  });
+
+  it("вебхук отклоняет слишком длинное сообщение", async () => {
+    const longText = "а".repeat(20000);
+    const res = await postJson("/api/messages/webhook", {
+      source: "telegram",
+      source_msg_id: "msg-long",
+      text: longText,
+    });
+    expect(res.status).toBe(413);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("message_too_large");
+  });
+
+  it("GET /api/messages возвращает список с пагинацией", async () => {
+    // Создаём несколько сообщений
+    for (let i = 0; i < 5; i++) {
+      await postJson("/api/messages/webhook", {
+        source: "api",
+        source_msg_id: `list-${i}`,
+        text: `Сообщение ${i}`,
+      });
+    }
+    const res = await getJson<{ messages: { id: number; text: string }[]; has_more: boolean }>(
+      "/api/messages?limit=2"
+    );
+    expect(res.messages).toHaveLength(2);
+    expect(res.has_more).toBe(true);
+    expect(res.messages[0].text).toBe("Сообщение 4"); // DESC по ts
+  });
+
+  it("фильтр по status работает", async () => {
+    await postJson("/api/messages/webhook", {
+      source: "api",
+      source_msg_id: "filter-new",
+      text: "Новое сообщение",
+    });
+    const res = await getJson<{ messages: { status: string }[] }>("/api/messages?status=new");
+    for (const m of res.messages) {
+      expect(m.status).toBe("new");
+    }
+  });
+
+  it("фильтр по kind работает", async () => {
+    await postJson("/api/messages/webhook", {
+      source: "api",
+      source_msg_id: "filter-kind",
+      text: "Просто чат",
+    });
+    const res = await getJson<{ messages: { kind: string }[] }>("/api/messages?kind=raw");
+    for (const m of res.messages) {
+      expect(m.kind).toBe("raw");
+    }
+  });
+
+  it("GET /api/messages/:id возвращает одно сообщение", async () => {
+    const created = await (await postJson("/api/messages/webhook", {
+      source: "api",
+      source_msg_id: "single-msg",
+      text: "Единочное сообщение",
+    })).json<{ message_id: number }>();
+
+    const res = await getJson<{ message: { id: number; text: string } }>(
+      `/api/messages/${created.message_id}`
+    );
+    expect(res.message.id).toBe(created.message_id);
+    expect(res.message.text).toBe("Единочное сообщение");
+  });
+
+  it("POST /api/messages создаёт сообщение вручную", async () => {
+    const res = await postJson("/api/messages", {
+      source: "manual",
+      source_msg_id: "manual-1",
+      text: "Ручное сообщение",
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ message_id: number; status: string }>();
+    expect(body.message_id).toBeGreaterThan(0);
+    expect(body.status).toBe("created");
+  });
+
+  it("классификация: директива с /task создаёт kind=directive", async () => {
+    const created = await (await postJson("/api/messages", {
+      source: "test-classify",
+      source_msg_id: `classify-directive-${Date.now()}`,
+      text: "/task Сделай новую фичу",
+    })).json<{ message_id: number }>();
+
+    await postJson("/api/messages/process", { limit: 100 });
+    const msg = await getJson<{ message: { kind: string; priority: number } }>(
+      `/api/messages/${created.message_id}`
+    );
+    expect(msg.message.kind).toBe("directive");
+    expect(msg.message.priority).toBe(10);
+  });
+
+  it("классификация: вопрос создаёт kind=chat", async () => {
+    const created = await (await postJson("/api/messages", {
+      source: "test-classify",
+      source_msg_id: `classify-chat-${Date.now()}`,
+      text: "Как думаешь, что лучше?",
+    })).json<{ message_id: number }>();
+
+    await postJson("/api/messages/process", { limit: 100 });
+    const msg = await getJson<{ message: { kind: string; priority: number } }>(
+      `/api/messages/${created.message_id}`
+    );
+    expect(msg.message.kind).toBe("chat");
+    expect(msg.message.priority).toBe(1);
+  });
+
+  it("классификация: упоминание docs/ создаёт kind=doc_edit", async () => {
+    const created = await (await postJson("/api/messages", {
+      source: "test-classify",
+      source_msg_id: `classify-doc-${Date.now()}`,
+      text: "Обнови docs/INDEX.md с новой инфой",
+    })).json<{ message_id: number }>();
+
+    await postJson("/api/messages/process", { limit: 100 });
+    const msg = await getJson<{ message: { kind: string; priority: number } }>(
+      `/api/messages/${created.message_id}`
+    );
+    expect(msg.message.kind).toBe("doc_edit");
+    expect(msg.message.priority).toBe(5);
+  });
+
+  it("process без GH токена помечает directive как failed", async () => {
+    const created = await (await postJson("/api/messages", {
+      source: "test-process",
+      source_msg_id: `process-no-token-${Date.now()}`,
+      text: "/task Сделай что-то без токена",
+    })).json<{ message_id: number }>();
+
+    const res = await postJson("/api/messages/process", { limit: 100 });
+    const body = await res.json<{ processed: number; results: { action: string }[] }>();
+    // Находим наш результат среди обработанных
+    const ourResult = body.results.find((r) => r.message_id === created.message_id);
+    expect(ourResult).toBeDefined();
+    expect(ourResult!.action).toBe("issue_failed");
+
+    const msg = await getJson<{ message: { status: string } }>(
+      `/api/messages/${created.message_id}`
+    );
+    expect(msg.message.status).toBe("failed");
+  });
+
+  it("статус включает счетчики сообщений", async () => {
+    const before = await getJson<{ messages: Record<string, number> }>("/api/status");
+    await postJson("/api/messages/webhook", {
+      source: "telegram",
+      source_msg_id: "status-count",
+      text: "Тест счетчика",
+    });
+    const after = await getJson<{ messages: Record<string, number> }>("/api/status");
+    expect(after.messages.new).toBe((before.messages.new || 0) + 1);
   });
 });

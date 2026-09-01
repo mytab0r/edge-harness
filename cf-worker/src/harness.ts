@@ -3,6 +3,11 @@ import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 
+// ── Inbox constants (from config) ──────────────────────────────────────────────────────
+const MESSAGE_MAX_CHARS = LIMITS.messageMaxChars;
+const MESSAGE_PROCESS_MAX = LIMITS.messageProcessMax;
+const MESSAGE_GROUP_WINDOW_MS = LIMITS.messageGroupWindowMs;
+
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
 // events    — журнал. Идемпотентность по UNIQUE(task_id, seq): повторная доставка батча
@@ -60,6 +65,27 @@ const SCHEMA = [
      last_run_id   INTEGER,
      run_confirmed INTEGER
    )`,
+  `CREATE TABLE IF NOT EXISTS messages (
+     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+     ts           INTEGER NOT NULL,
+     source       TEXT NOT NULL,           -- 'telegram', 'api', etc.
+     source_msg_id TEXT,                   -- original message ID from source
+     chat_id      TEXT,                    -- chat/channel identifier
+     sender_id    TEXT,                    -- sender identifier
+     sender_name  TEXT,                    -- sender display name
+     text         TEXT NOT NULL,           -- message text
+     kind         TEXT NOT NULL DEFAULT 'raw',  -- 'raw', 'directive', 'chat', 'doc_edit', 'system'
+     priority     INTEGER NOT NULL DEFAULT 0,   -- higher = more urgent
+     status       TEXT NOT NULL DEFAULT 'new',  -- 'new', 'processing', 'done', 'failed', 'ignored'
+     result       TEXT,                    -- JSON: {issue_number, issue_url, error, ...}
+     grouped_with INTEGER,                 -- message id this was grouped with
+     processed_ts INTEGER,
+     UNIQUE(source, source_msg_id)        -- idempotency per source
+   )`,
+  `CREATE INDEX IF NOT EXISTS messages_by_ts ON messages(ts DESC)`,
+  `CREATE INDEX IF NOT EXISTS messages_by_status ON messages(status)`,
+  `CREATE INDEX IF NOT EXISTS messages_by_kind ON messages(kind)`,
+  `CREATE INDEX IF NOT EXISTS messages_by_group ON messages(grouped_with)`,
 ];
 
 export interface EventRow {
@@ -100,6 +126,23 @@ interface StoredPulse extends PulseStatus {
   last_run_id: number | null;
 }
 
+export interface MessageRow {
+  id: number;
+  ts: number;
+  source: string;
+  source_msg_id: string | null;
+  chat_id: string | null;
+  sender_id: string | null;
+  sender_name: string | null;
+  text: string;
+  kind: string;
+  priority: number;
+  status: string;
+  result: string | null;
+  grouped_with: number | null;
+  processed_ts: number | null;
+}
+
 export interface Status {
   now: number;
   heartbeat_fresh_ms: number;
@@ -125,6 +168,8 @@ export interface Status {
    *  pulse_not_configured выше, просто вторая ветка того же if/else. См.
    *  pulseStale. */
   pulse_stale: boolean;
+  /** Inbox: сообщения по статусам. */
+  messages: Record<string, number>;
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -481,6 +526,24 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "session" && request.method === "DELETE") {
       return this.#dropSession();
     }
+    if (route.name === "messagesWebhook") {
+      return this.#postMessageWebhook(request);
+    }
+    if (route.name === "messages" && request.method === "GET") {
+      return this.#getMessages(url);
+    }
+    if (route.name === "messages" && request.method === "POST") {
+      return this.#postMessage(request);
+    }
+    if (route.name === "message") {
+      const id = matched.rest;
+      const message = id ? this.#message(id) : null;
+      if (!message) throw new ApiError(404, "message_not_found", { message_id: id });
+      return this.#json({ message });
+    }
+    if (route.name === "messagesProcess") {
+      return this.#processMessages(request);
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
@@ -621,6 +684,10 @@ export class Harness extends DurableObject<Env> {
         now - LIMITS.staleDispatchMs,
       ),
     )[0];
+    const msgCounts: Record<string, number> = {};
+    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
+      msgCounts[String(row.status)] = Number(row.n);
+    }
     const hbTs = hb ? Number(hb.ts) : null;
     const lastPulse = this.#getPulse();
     return {
@@ -638,6 +705,7 @@ export class Harness extends DurableObject<Env> {
       pulse_healthy: pulseHealthy(now, lastPulse),
       pulse_not_configured: pulseNotConfigured(lastPulse),
       pulse_stale: pulseStale(now, lastPulse),
+      messages: msgCounts,
     };
   }
 
@@ -1152,5 +1220,343 @@ export class Harness extends DurableObject<Env> {
     const status = this.#status();
     this.#broadcast({ type: "status", status });
     return this.#json({ hands_alive: status.hands_alive, ts: now });
+  }
+
+  // ── Inbox: сообщения владельца ──────────────────────────────────────────────────────
+
+  /** Классификация сообщения: директива, чат, правка доков, системное. */
+  #classifyMessage(text: string): { kind: string; priority: number; directiveMatch: RegExpMatchArray | null } {
+    const trimmed = text.trim();
+    // Директивы: начинаются с / или !, или содержат ключевые слова действия
+    const directivePatterns = [
+      /^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\b/i,
+      /^(создай|добавь|исправь|проверь|проанализируй|исследуй|напиши|обнови)\b/i,
+      /^\[TASK\]/i,
+      /^#\d+\s/,
+    ];
+    for (const pattern of directivePatterns) {
+      const match = trimmed.match(pattern);
+      if (match) return { kind: "directive", priority: 10, directiveMatch: match };
+    }
+    // Правки доков: явные ссылки на файлы docs/ или openspec/
+    if (/(docs\/|openspec\/|\.md\s|в\sдоке|в\sспеке|обнови\sдок)/i.test(trimmed)) {
+      return { kind: "doc_edit", priority: 5, directiveMatch: null };
+    }
+    // Чат/обсуждение: вопросы, комментарии без явного действия
+    // Используем (^|\s) и (\s|[?,.!]|$) вместо \b для поддержки кириллицы
+    if (/^[\?\¿]|(^|\s)(как|почему|что\sдумаешь|мнение|вопрос)(\s|[?,.!]|$)/i.test(trimmed)) {
+      return { kind: "chat", priority: 1, directiveMatch: null };
+    }
+    // По умолчанию — raw, будет обработан повторно или проигнорирован
+    return { kind: "raw", priority: 0, directiveMatch: null };
+  }
+
+  /** Группировка сообщений: собирает близкие по времени/теме сообщения в цепочки. */
+  #groupMessages(messageId: number): number | null {
+    // Ищем сообщения за последние MESSAGE_GROUP_WINDOW_MS от того же отправителя в том же чате
+    const msg = this.#rows(this.#sql.exec("SELECT sender_id, chat_id, ts FROM messages WHERE id = ?", messageId))[0];
+    if (!msg) return null;
+    const senderId = msg.sender_id;
+    const chatId = msg.chat_id;
+    const ts = Number(msg.ts);
+    const windowAgo = ts - MESSAGE_GROUP_WINDOW_MS;
+    const recent = this.#rows(this.#sql.exec(
+      `SELECT id FROM messages
+       WHERE sender_id = ? AND chat_id = ? AND ts > ? AND id != ? AND status != 'ignored'
+       ORDER BY ts DESC LIMIT 1`,
+      senderId, chatId, windowAgo, messageId
+    ));
+    if (recent.length > 0) {
+      const groupWith = Number(recent[0].id);
+      // Обновляем текущее сообщение
+      this.#sql.exec("UPDATE messages SET grouped_with = ? WHERE id = ?", groupWith, messageId);
+      return groupWith;
+    }
+    return null;
+  }
+
+  /** Создаёт GitHub Issue для директивы. Возвращает {number, url} или null при ошибке. */
+  async #createIssueForDirective(messageId: number, text: string): Promise<{ number: number; url: string } | null> {
+    const token = this.env.GH_PIPELINE_PAT || this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) {
+      console.log(`createIssueForDirective: GH_PIPELINE_PAT/GH_DISPATCH_TOKEN или GH_REPO не заданы`);
+      return null;
+    }
+
+    // Извлекаем заголовок из первой строки или первых 80 символов
+    const lines = text.trim().split(/\r?\n/);
+    let title = lines[0].replace(/^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\s*/i, "").trim();
+    if (!title || title.length > 80) {
+      title = text.trim().slice(0, 80);
+    }
+    if (title.length > 80) title = title.slice(0, 77) + "...";
+
+    const body = `## Сообщение владельца (inbox)\n\n**ID сообщения:** ${messageId}\n**Текст:**\n\`\`\`\n${text}\n\`\`\`\n\n---\n*Создано автоматически из inbox владельца. Обработай по playbook.*`;
+
+    try {
+      const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/issues`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({
+          title,
+          body,
+          labels: ["task", "source:inbox"],
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        console.log(`createIssueForDirective: GitHub API ${res.status}: ${err}`);
+        return null;
+      }
+      const issue = await res.json<{ number: number; html_url: string }>();
+      return { number: issue.number, url: issue.html_url };
+    } catch (error) {
+      console.log(`createIssueForDirective: ошибка сети: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
+  }
+
+  /** Обработка одного сообщения: классификация, группировка, действие. */
+  async #processSingleMessage(messageId: number): Promise<{ action: string; issue?: { number: number; url: string }; error?: string }> {
+    const msg = this.#rows(this.#sql.exec("SELECT * FROM messages WHERE id = ?", messageId))[0];
+    if (!msg) return { action: "not_found", error: "Message not found" };
+
+    const text = String(msg.text);
+    const { kind, priority, directiveMatch } = this.#classifyMessage(text);
+
+    // Обновляем классификацию
+    this.#sql.exec("UPDATE messages SET kind = ?, priority = ?, status = 'processing' WHERE id = ?", kind, priority, messageId);
+
+    // Группировка
+    this.#groupMessages(messageId);
+
+    let result: { issue?: { number: number; url: string }; error?: string } = {};
+
+    if (kind === "directive") {
+      // Создаём Issue
+      const issue = await this.#createIssueForDirective(messageId, text);
+      if (issue) {
+        result.issue = issue;
+        this.#sql.exec(
+          "UPDATE messages SET status = 'done', result = ?, processed_ts = ? WHERE id = ?",
+          JSON.stringify({ issue_number: issue.number, issue_url: issue.url }),
+          Date.now(),
+          messageId
+        );
+        return { action: "issue_created", issue };
+      } else {
+        this.#sql.exec(
+          "UPDATE messages SET status = 'failed', result = ?, processed_ts = ? WHERE id = ?",
+          JSON.stringify({ error: "Failed to create GitHub issue" }),
+          Date.now(),
+          messageId
+        );
+        return { action: "issue_failed", error: "Failed to create GitHub issue" };
+      }
+    } else if (kind === "doc_edit" || kind === "chat") {
+      // Помечаем как обработанное (требует ручного рассмотрения или ответа)
+      this.#sql.exec(
+        "UPDATE messages SET status = 'done', result = ?, processed_ts = ? WHERE id = ?",
+        JSON.stringify({ kind, note: "Requires manual review" }),
+        Date.now(),
+        messageId
+      );
+      return { action: "classified", issue: undefined };
+    } else {
+      // raw — оставляем для повторной обработки
+      this.#sql.exec("UPDATE messages SET status = 'new' WHERE id = ?", messageId);
+      return { action: "deferred", issue: undefined };
+    }
+  }
+
+  /** Вебхук для входящих сообщений (Telegram и др.). auth=false — верификация через секрет в теле. */
+  async #postMessageWebhook(request: Request): Promise<Response> {
+    const body = await this.#readJson(request);
+
+    // Поддержка формата Telegram webhook
+    let source = typeof body.source === "string" ? body.source : "telegram";
+    let sourceMsgId = typeof body.source_msg_id === "string" ? body.source_msg_id : 
+                      typeof body.message_id === "string" ? body.message_id :
+                      typeof body.update_id === "string" ? body.update_id :
+                      String(Date.now() + Math.random());
+    let chatId = typeof body.chat_id === "string" ? body.chat_id :
+                 typeof body.chat?.id === "string" ? String(body.chat.id) :
+                 typeof body.chat?.id === "number" ? String(body.chat.id) : null;
+    let senderId = typeof body.sender_id === "string" ? body.sender_id :
+                   typeof body.from?.id === "string" ? body.from.id :
+                   typeof body.from?.id === "number" ? String(body.from.id) : null;
+    let senderName = typeof body.sender_name === "string" ? body.sender_name :
+                     typeof body.from?.username === "string" ? body.from.username :
+                     typeof body.from?.first_name === "string" ? body.from.first_name : null;
+    let text = typeof body.text === "string" ? body.text :
+               typeof body.message?.text === "string" ? body.message.text : "";
+
+    if (!text || !text.trim()) {
+      throw new ApiError(400, "need_text");
+    }
+    if (text.length > MESSAGE_MAX_CHARS) {
+      throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
+    }
+
+    const now = Date.now();
+    // Идемпотентность: UNIQUE(source, source_msg_id)
+    const cursor = this.#sql.exec(
+      `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
+       ON CONFLICT(source, source_msg_id) DO NOTHING`,
+      now, source, sourceMsgId, chatId, senderId, senderName, text
+    );
+
+    let messageId: number;
+    if (cursor.rowsWritten === 0) {
+      // Уже есть — получаем id
+      const existing = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
+      messageId = Number(existing.id);
+    } else {
+      const row = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
+      messageId = Number(row.id);
+    }
+
+    this.#broadcastStatus();
+    return this.#json({ message_id: messageId, status: "accepted" }, { status: 201 });
+  }
+
+  /** Ручное создание сообщения (для тестов/админа). */
+  async #postMessage(request: Request): Promise<Response> {
+    const body = await this.#readJson(request);
+    const text = typeof body.text === "string" ? body.text : "";
+    if (!text || !text.trim()) {
+      throw new ApiError(400, "need_text");
+    }
+    if (text.length > MESSAGE_MAX_CHARS) {
+      throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
+    }
+    const source = typeof body.source === "string" ? body.source : "api";
+    const sourceMsgId = typeof body.source_msg_id === "string" ? body.source_msg_id : `manual-${Date.now()}`;
+    const chatId = typeof body.chat_id === "string" ? body.chat_id : null;
+    const senderId = typeof body.sender_id === "string" ? body.sender_id : null;
+    const senderName = typeof body.sender_name === "string" ? body.sender_name : null;
+
+    const now = Date.now();
+    this.#sql.exec(
+      `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')`,
+      now, source, sourceMsgId, chatId, senderId, senderName, text
+    );
+    const row = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
+    const messageId = Number(row.id);
+    this.#broadcastStatus();
+    return this.#json({ message_id: messageId, status: "created" }, { status: 201 });
+  }
+
+  /** Список сообщений с фильтрами. */
+  #getMessages(url: URL): Response {
+    const status = url.searchParams.get("status");
+    const kind = url.searchParams.get("kind");
+    const limit = Math.min(this.#intParam(url, "limit", 50), 200);
+    const after = this.#intParam(url, "after", 0);
+    const senderId = url.searchParams.get("sender_id");
+
+    let where = "WHERE id > ?";
+    const params: (string | number)[] = [after];
+    if (status) {
+      where += " AND status = ?";
+      params.push(status);
+    }
+    if (kind) {
+      where += " AND kind = ?";
+      params.push(kind);
+    }
+    if (senderId) {
+      where += " AND sender_id = ?";
+      params.push(senderId);
+    }
+
+    const rows = this.#rows(
+      this.#sql.exec(
+        `SELECT id, ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status, result, grouped_with, processed_ts
+         FROM messages ${where} ORDER BY ts DESC LIMIT ?`,
+        ...params, limit + 1
+      )
+    );
+
+    const hasMore = rows.length > limit;
+    const messages: MessageRow[] = rows.slice(0, limit).map((row) => ({
+      id: Number(row.id),
+      ts: Number(row.ts),
+      source: String(row.source),
+      source_msg_id: row.source_msg_id === null ? null : String(row.source_msg_id),
+      chat_id: row.chat_id === null ? null : String(row.chat_id),
+      sender_id: row.sender_id === null ? null : String(row.sender_id),
+      sender_name: row.sender_name === null ? null : String(row.sender_name),
+      text: String(row.text),
+      kind: String(row.kind),
+      priority: Number(row.priority),
+      status: String(row.status),
+      result: row.result === null ? null : String(row.result),
+      grouped_with: row.grouped_with === null ? null : Number(row.grouped_with),
+      processed_ts: row.processed_ts === null ? null : Number(row.processed_ts),
+    }));
+
+    return this.#json(
+      { messages, has_more: hasMore, next_after: messages.length ? messages[messages.length - 1].id : after },
+      { headers: { "x-has-more": hasMore ? "true" : "false", "x-next-after": String(messages.length ? messages[messages.length - 1].id : after) } }
+    );
+  }
+
+  /** Одна сообщение по id. */
+  #message(id: string): MessageRow | null {
+    const row = this.#rows(this.#sql.exec("SELECT * FROM messages WHERE id = ?", id))[0];
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      ts: Number(row.ts),
+      source: String(row.source),
+      source_msg_id: row.source_msg_id === null ? null : String(row.source_msg_id),
+      chat_id: row.chat_id === null ? null : String(row.chat_id),
+      sender_id: row.sender_id === null ? null : String(row.sender_id),
+      sender_name: row.sender_name === null ? null : String(row.sender_name),
+      text: String(row.text),
+      kind: String(row.kind),
+      priority: Number(row.priority),
+      status: String(row.status),
+      result: row.result === null ? null : String(row.result),
+      grouped_with: row.grouped_with === null ? null : Number(row.grouped_with),
+      processed_ts: row.processed_ts === null ? null : Number(row.processed_ts),
+    };
+  }
+
+  /** Запуск обработки новых сообщений. */
+  async #processMessages(request: Request): Promise<Response> {
+    const body = await this.#readJson(request).catch(() => ({}));
+    const limit = typeof body.limit === "number" ? Math.min(body.limit, MESSAGE_PROCESS_MAX) : 50;
+
+    const messages = this.#rows(
+      this.#sql.exec(
+        `SELECT id FROM messages WHERE status = 'new' ORDER BY priority DESC, ts ASC LIMIT ?`,
+        limit
+      )
+    );
+
+    const results = [];
+    for (const row of messages) {
+      const result = await this.#processSingleMessage(Number(row.id));
+      results.push({ message_id: row.id, ...result });
+    }
+
+    this.#broadcastStatus();
+    return this.#json({ processed: results.length, results });
+  }
+
+  // ── Тестовый хелпер: сброс inbox (только для тестов)
+  async #resetInboxForTest(): Promise<void> {
+    this.#sql.exec("DELETE FROM messages");
   }
 }

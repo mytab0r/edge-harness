@@ -34,3 +34,21 @@ POST — задача в очередь + repository_dispatch (без GH_DISPATC
 ## `POST/DELETE /api/session`
 
 Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed.
+
+## `POST /api/messages/webhook`
+
+Вебхук для входящих сообщений (Telegram, и др.). Принимает JSON с полями source, source_msg_id, chat_id, sender_id, sender_name, text. Идемпотентен по source+source_msg_id. Возвращает {message_id, status}.
+
+## `GET/POST /api/messages`
+
+GET — список сообщений с фильтрами (status, kind, limit, after). POST — ручное создание сообщения (для тестов/админа).
+
+## `GET /api/messages/`
+
+Одна сообщение по id.
+
+Остаток пути после `/api/messages/` — параметр.
+
+## `POST /api/messages/process`
+
+Запустить обработку новых сообщений: классификация, группировка, создание задач для директив. Возвращает {processed, created_issues, errors}.
