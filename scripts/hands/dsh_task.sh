@@ -169,17 +169,14 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 2. Провайдер: без ключа работа невозможна — падаем сразу, не через 10 минут ───
-if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-  echo "::error::DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель" >&2
-  exit 1
-fi
+# ── 2. Провайдер: без окружения работа невозможна — падаем сразу, не через 10 минут ──
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет.
+dsh_require_provider_env || exit 1
 # Профиль headless — pnpm-workspace: `pnpm add` внутри требует явного
 # подтверждения root (иначе ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30).
 export npm_config_ignore_workspace_root_check=true
-export DEEPSEEK_API_KEY
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://integrate.api.nvidia.com/v1}"
-export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
+export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
@@ -192,8 +189,9 @@ dsh --version || true
 # а не промежуточной.
 # Адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
-# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
-# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
+# без патча уходит чужой встроенный дефолт адаптера, целевой провайдер отвечает
+# «modelCode does not exist»; maxTokens-дефолт адаптера 256000 выше потолка
+# целевой модели 131072 → INVALID_REQUEST).
 dsh_patch_profile headless
 
 # ── 3b. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───

@@ -26,6 +26,12 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
 
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
+# первым делом, до выбора задачи/назначения/ветки/сессии морды — падать
+# сразу, а не после дорогой подготовительной работы.
+dsh_require_provider_env || die "провайдер не сконфигурирован (см. ::error:: выше)"
+
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
 # Профиль headless — pnpm-workspace: инициализация делает pnpm add в корень
@@ -265,10 +271,8 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 6. DSH: провайдер, установка (lib), GLM-патч профиля ─────────────────────────
-[ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель"
-export DEEPSEEK_API_KEY
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
+# ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
+export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 dsh_install "$WORK/pkgs"
 dsh --version || true
