@@ -206,6 +206,12 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "session" && request.method === "DELETE") {
       return this.#dropSession();
     }
+    if (route.name === "config" && request.method === "GET") {
+      return this.#getConfig();
+    }
+    if (route.name === "config" && request.method === "PUT") {
+      return this.#putConfig(request);
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
@@ -768,5 +774,36 @@ export class Harness extends DurableObject<Env> {
     const status = this.#status();
     this.#broadcast({ type: "status", status });
     return this.#json({ hands_alive: status.hands_alive, ts: now });
+  }
+
+  #getConfig(): Response {
+    // ponytail: конфиг моделей в DO storage (одно место правды);
+    // каталог из env-переменной, дефолтная модель — из storage или env-дефолт.
+    const storedModel = this.ctx.storage.getSync("defaultModel") as string | undefined;
+    const model = storedModel || this.env.DEEPSEEK_MODEL || "glm-5.3-flash";
+    const modelCatalog = JSON.parse(
+      this.env.DSH_EDGE_MODEL_CATALOG ||
+        '[{"id":"glm-5.3-flash","name":"GLM-5.3-Flash","contextWindow":131072}]',
+    );
+    return this.#json({
+      defaultModel: model,
+      models: modelCatalog,
+      maxOutputTokens: 131072,
+    });
+  }
+
+  async #putConfig(request: Request): Promise<Response> {
+    const body = await this.#readJson(request);
+    const model = body.model;
+    if (typeof model !== "string" || !model) {
+      throw new ApiError(400, "need_model_id");
+    }
+    // ponytail: обновление модели в DO storage; раннер и веб подхватят
+    // при следующем запросе через GET /api/config.
+    // На продакшн: нужно запростить модель в каталоге и обновить secret
+    // DEEPSEEK_MODEL в CF воркере, чтобы новая сессия подхватила.
+    this.ctx.storage.put("defaultModel", model);
+    this.#broadcast({ type: "config", model });
+    return this.#json({ model });
   }
 }

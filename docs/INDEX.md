@@ -49,6 +49,7 @@
 - [0006. Аренда задачи: git-ref замок](decisions/0006-task-lease-git-ref-lock.md)
 - [0007. AI-ревью как второй гейт: своя метка ai:*, двойное условие слияния](decisions/0007-ai-review-gate.md)
 - [0008. Узкий GH_DISPATCH_TOKEN: dispatch-токен морды отделён от PAT конвейера](decisions/0008-narrow-dispatch-token.md)
+- [0009. Единое место правды для конфига моделей](decisions/0009-unified-model-config.md)
 
 ## Мультиагентная работа
 

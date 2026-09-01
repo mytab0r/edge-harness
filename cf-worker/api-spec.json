@@ -51,6 +51,13 @@
       "methods": ["POST", "DELETE"],
       "auth": true,
       "summary": "Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed."
+    },
+    {
+      "name": "config",
+      "path": "/api/config",
+      "methods": ["GET", "PUT"],
+      "auth": true,
+      "summary": "Конфиг системы: GET — текущий конфиг (дефолтная модель, каталог, maxTokens); PUT — обновить дефолтную модель {model: string}. Единое место правды для всех компонентов (веб, раннер, морда)."
     }
   ]
 }
