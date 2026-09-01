@@ -80,6 +80,11 @@ def added_lines(diff: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", type=int, required=True)
+    parser.add_argument("--tree", default=".",
+                        help="каталог дерева PR для компиляционной проверки "
+                             "(workflow pr-review кладёт его в pr-tree; сам "
+                             "скрипт исполняется из чекаута main — дерево "
+                             "данные, не код)")
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
 
@@ -120,12 +125,15 @@ def main() -> int:
 
     # Каждый изменённый .py обязан компилироваться: ловит обрезанные файлы и
     # неразрешённые конфликты, которые ломают скрипты молча (случалось с scheduler.py).
+    # Компиляция — парс, не исполнение: дерево PR остаётся данными. Файла может
+    # не быть в чекауте дерева (удалён в PR) — это не ошибка компиляции.
     import py_compile
     for f in files:
         name = f["filename"]
-        if name.endswith(".py") and name.startswith("scripts/"):
+        local = os.path.join(args.tree, name)
+        if name.endswith(".py") and name.startswith("scripts/") and os.path.exists(local):
             try:
-                py_compile.compile(name, doraise=True)
+                py_compile.compile(local, doraise=True)
             except py_compile.PyCompileError as error:
                 findings.append(f"{name} не компилируется: {error.msg}")
 
