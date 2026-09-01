@@ -91,6 +91,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/review/test_ai_review.py -q
 
+      # Гвардия аргумента --tree (bootstrap PR #138): check_pr.py исполняется
+      # доверенным чекаутом main, а не деревом проверяемого PR (см. комментарий
+      # в pr-review.yml). Регресс сигнатуры вернёт bootstrap-тупик
+      # «unrecognized arguments: --tree» на первом же PR, который его зовёт.
+      - name: Гвардия аргумента --tree в check_pr.py
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/review/test_check_pr.py -q
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24
