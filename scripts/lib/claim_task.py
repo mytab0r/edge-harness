@@ -156,14 +156,29 @@ def _visibility(repo: str, task: int, actor: str, text: str) -> None:
 
 
 def release(repo: str, task: int) -> str:
-    """Снять замок. Идемпотентно: отсутствующий замок — не ошибка."""
+    """Снять замок. Идемпотентно: отсутствующий замок — не ошибка.
+
+    GitHub REST на DELETE несуществующего ref отвечает НЕ одним кодом:
+    исторически документирован 404, но реально (проверено прогоном orchestra
+    33562818220) отдаёт 422 с телом "Reference does not exist". Оба кода —
+    один и тот же класс «рефа нет»; различать их нужно по семантике сообщения,
+    а не по одному зашитому статусу, иначе withstand real-world ответа не будет.
+    403/500 и прочие статусы — настоящая поломка, пробрасываются дальше."""
     try:
         gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{task}")
     except GhError as error:
-        if error.status == 404:
+        if _ref_missing(error):
             return f"замок task-{task} отсутствовал (уже свободна)"
         raise
     return f"замок refs/locks/task-{task} снят"
+
+
+def _ref_missing(error: "GhError") -> bool:
+    """Рефа нет: GitHub видели и с 404, и с 422 (Reference does not exist) —
+    оба варианта отвечают за «рефа нет», не за поломку инструмента."""
+    if error.status == 404:
+        return True
+    return error.status == 422 and "does not exist" in str(error).lower()
 
 
 # ── Сборщик протухших замков (вызывает scheduler) ────────────────────────────────
