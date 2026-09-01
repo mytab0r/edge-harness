@@ -260,13 +260,27 @@ jobs:
         env:
           DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
           DSH_EDGE_PROVIDER_NAME: ${{ vars.DSH_EDGE_PROVIDER_NAME }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: |
           python3 - <<'PY'
           import json, os, re, sys
           catalog = json.loads(os.environ["DSH_EDGE_MODEL_CATALOG"])
-          provider_name = os.environ.get("DSH_EDGE_PROVIDER_NAME", "GLM")
+          provider_name = os.environ.get("DSH_EDGE_PROVIDER_NAME") or sys.exit(
+              "::error::vars.DSH_EDGE_PROVIDER_NAME не задан — имя провайдера объявляется только в vars репозитория, зашитого дефолта больше нет")
           if not catalog:
               sys.exit("::error::DSH_EDGE_MODEL_CATALOG пуст — не из чего собрать каталог")
+          # Инвариант присутствия (#153, находка 2): модель раннеров (vars.DEEPSEEK_MODEL)
+          # обязана быть объявлена в каталоге морды — иначе пикер и раннеры разойдутся
+          # молча (морда предложит модель, которой раннер не вызывает, или наоборот).
+          # Порядок каталога не переставляем и «первый = дефолтный» не додумываем —
+          # только факт присутствия.
+          runner_model = os.environ.get("DEEPSEEK_MODEL")
+          catalog_ids = [m["id"] for m in catalog]
+          if not runner_model:
+              sys.exit("::error::vars.DEEPSEEK_MODEL не задан — модель раннеров объявляется только в vars репозитория")
+          if runner_model not in catalog_ids:
+              sys.exit(f"::error::модель раннеров {runner_model!r} не объявлена в vars.DSH_EDGE_MODEL_CATALOG "
+                        f"({catalog_ids!r}) — пикер морды и раннеры разойдутся")
           # бандл минифицирован: строковые литералы в нём с двойными кавычками
           entries = ",".join(
               '{{id:"{id}",name:"{name}",contextWindow:{cw}}}'.format(
@@ -401,6 +415,9 @@ jobs:
       # Секреты воркера переживают деплой, put идемпотентен. ВСЕ ТРИ провайдерных
       # секрета синхронизируются вместе: частичная синхронизация (URL без ключа)
       # даёт 401 на каждом ходе морды — silent-wrong (случай #80).
+      # Проверка не дублирует dsh_require_provider_env своим текстом (#153,
+      # находка 7) — репозиторий уже чекаутнут в github.workspace, зовём ту же
+      # функцию, что и раннеры.
       - name: Секреты провайдера морды
         working-directory: ${{ github.workspace }}/deploy
         env:
@@ -410,9 +427,7 @@ jobs:
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: |
-          [ -n "$DEEPSEEK_API_KEY" ] || { echo "::error::секрет DEEPSEEK_API_KEY не задан"; exit 1; }
-          [ -n "$DEEPSEEK_BASE_URL" ] || { echo "::error::vars.DEEPSEEK_BASE_URL не задан"; exit 1; }
-          [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
+          bash -c 'source "$GITHUB_WORKSPACE/scripts/lib/dsh-ci.sh"; dsh_require_provider_env'
           printf '%s' "$DEEPSEEK_API_KEY" | npx wrangler secret put DEEPSEEK_API_KEY
           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
