@@ -238,6 +238,9 @@ export HANDS_URL="https://journal.test"
 export HARNESS_URL="https://journal.test"
 export HANDS_TOKEN="smoke-hands-token"
 export DEEPSEEK_API_KEY="smoke-deepseek-key"
+# ФИКСТУРА теста, не дефолт прода (#153): dsh_require_provider_env требует
+# непустых значений, значение здесь произвольно и не читается как источник
+# правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
 export DRAIN_INTERVAL_SECS="1"

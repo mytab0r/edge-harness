@@ -23,9 +23,10 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 AI_WORK="${AI_WORK:?AI_WORK не задан (каталог с prompt.md и answer.txt)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-3600}"   # 60 минут на ревью диффа
 [ -f "$AI_WORK/prompt.md" ] || { echo "::error::нет $AI_WORK/prompt.md — шаг gather не отработал" >&2; exit 1; }
-[ -n "${DEEPSEEK_API_KEY:-}" ] || { echo "::error::DEEPSEEK_API_KEY не задан — модель не будет вызвана" >&2; exit 1; }
-export DEEPSEEK_API_KEY
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет.
+dsh_require_provider_env || exit 1
+export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"
 

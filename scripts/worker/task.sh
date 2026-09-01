@@ -61,6 +61,15 @@ if [ -n "$TASK_INPUT" ]; then
   case "$TASK_INPUT" in *[!0-9]*) die "номер задачи должен быть числом: '$TASK_INPUT'" ;; esac
 fi
 
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
+# раньше дупгарда/назначения/ветки/сессии морды — падать сразу, а не после
+# дорогой подготовительной работы. Пропускаем при --dry-run: самотест печатает
+# выбор и промпт без реального вызова модели, требовать ключ здесь незачем.
+if [ "$DRY_RUN" != "1" ]; then
+  dsh_require_provider_env || die "провайдер не сконфигурирован (см. ::error:: выше)"
+fi
+
 # Гвардия дублей (стопгэп к аренде задач #121): если живёт ДРУГОЙ прогон
 # воркера — активный или ожидающий в очереди concurrency-группы — выходим
 # зелёным no-op. Очередь запускает прогоны последовательно, и второму
@@ -265,10 +274,8 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 6. DSH: провайдер, установка (lib), GLM-патч профиля ─────────────────────────
-[ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель"
-export DEEPSEEK_API_KEY
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
+# ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
+export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 dsh_install "$WORK/pkgs"
 dsh --version || true
