@@ -650,6 +650,10 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         # conveyor_gate читает историю worker.yml без фильтра status — отдельный
         # маршрут от worker_runs_active (?status=in_progress/queued выше).
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
+        # conveyor_gate (#205) читает маркеры активной серии из #120 даже при
+        # failures=0 — иначе не отличить «серии не было» от «проба ещё бежит».
+        # Пустая история worker.yml => маркеров нет, но запрос всё равно уходит.
+        "issues/120/comments?per_page=100": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
