@@ -130,6 +130,34 @@ def parse_verdict(answer: str) -> str:
     return "error"
 
 
+def transport_failed(dsh_rc: str) -> bool:
+    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
+
+    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
+    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
+    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
+    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
+    точный «модель ответила не по контракту» в редком крайнем случае.
+    """
+    try:
+        return int(dsh_rc) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def error_reason(answer: str, dsh_rc: str) -> str:
+    """Причина verdict=error — три состояния, не смешиваемые в одно (класс
+    silent-wrong прогона 33572445063: ошибка провайдера читалась как «модель
+    нарушила контракт»). Порядок проверки важен: транспорт — раньше формата,
+    потому что при упавшем транспорте answer пуст и verdict_line_present
+    всё равно вернёт False — не значит «модель промолчала»."""
+    if transport_failed(dsh_rc):
+        return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
+    if verdict_line_present(answer):
+        return "модель ответила, но строка «ВЕРДИКТ: …» есть, а не единственная и/или не последняя"
+    return "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
+
+
 def verdict_line_present(answer: str) -> bool:
     """Есть ли в ответе хоть одна строка, похожая на строку вердикта (в любом
     количестве и с любым обрамлением) — используется только для диагностики:
@@ -329,6 +357,13 @@ def cmd_verdict(args: argparse.Namespace) -> int:
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
 
+    # Причина «error» — вычисляется ДО комментария: три разных состояния не
+    # смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
+    # ошибка провайдера не должна выглядеть как «модель ответила криво»).
+    reason = error_reason(answer, args.dsh_rc) if verdict == "error" else None
+    if reason and not findings.strip():
+        findings = reason
+
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     if pull["head"]["sha"] != args.head:
         print(f"::warning::head PR #{args.pr} сменился ({args.head[:12]} → "
@@ -350,13 +385,6 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
-        if verdict_line_present(answer):
-            # строка есть хотя бы одна, но не прошла как единственная и
-            # последняя — двусмысленность, а не молчание модели.
-            reason = "строка «ВЕРДИКТ: …» есть, но не единственная и/или не последняя"
-        else:
-            # модель не написала строку вердикта содержательно вовсе.
-            reason = "строки «ВЕРДИКТ: …» нет вообще"
         print(f"::error::ответ не соответствует контракту вердикта ({reason}) "
               f"— ai:failed, ревью повторится")
         print(f"хвост ответа:\n{tail}")
@@ -378,6 +406,11 @@ def main() -> int:
     verdict.add_argument("--pr", type=int, required=True)
     verdict.add_argument("--answer", required=True)
     verdict.add_argument("--head", required=True)
+    # Код возврата dsh (ai_dsh.sh::dsh_rc.txt) — различает «транспорт упал»
+    # от «дсш вернул текст не по контракту». Необязателен (default=""):
+    # ручной запуск verdict без этого аргумента не должен падать — просто
+    # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
+    verdict.add_argument("--dsh-rc", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()

@@ -57,6 +57,7 @@ jobs:
     outputs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
+      dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
     steps:
       # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
       # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
@@ -126,6 +127,11 @@ jobs:
           AI_WORK="$RUNNER_TEMP/ai-review"
           {
             echo "head=$(jq -r .head "$AI_WORK/meta.json")"
+            # Код возврата dsh — сигнал «транспорт упал» для verdict (иначе
+            # ошибка провайдера уходит как «модель нарушила контракт»,
+            # silent-wrong). Файла может не быть при экзотическом обрыве шага
+            # (например SIGKILL раннера) — тогда пусто читается как «неизвестно».
+            echo "dsh_rc=$(cat "$AI_WORK/dsh_rc.txt" 2>/dev/null || echo '')"
             printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
             cat "$AI_WORK/answer.txt"
             printf 'AI_REVIEW_ANSWER_EOF_7f3a\n'
@@ -172,7 +178,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
           HEAD_REVIEWED: ${{ needs.review.outputs.head }}
           ANSWER: ${{ needs.review.outputs.answer }}
+          DSH_RC: ${{ needs.review.outputs.dsh_rc }}
         run: |
           printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
-            --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED"
+            --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED" \
+            --dsh-rc "$DSH_RC"
