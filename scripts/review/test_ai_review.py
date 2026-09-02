@@ -334,6 +334,56 @@ def test_filed_marker_absent_and_partial():
     assert ft.filed_marker("filed: #139 и #140") == []
 
 
+# ── Газ к тормозу review:large: автоподтверждение размера (#204) ─────────────
+# Прод-форма: настоящие поля additions/deletions API (замер PR #167 +876,
+# #173 +787, #159 +1127) и реальные имена меток из review_labels/check_pr —
+# без своих литералов.
+
+def test_large_ok_granted_when_ai_approved_prod_form_pr167():
+    # (а) крупный дифф с ai:ok получает решение "ok" — газ срабатывает.
+    added = 876  # прод-форма PR #167
+    labels = [{"name": "review:large"}, {"name": "ai:ok"}]
+    assert ai.large_ok_decision(added, labels, "approve") == "ok"
+
+
+def test_large_ok_withheld_without_ai_verdict():
+    # (б) крупный дифф БЕЗ вердикта (verdict != "approve") газ не получает —
+    # тормоз снимается только состоявшимся разбором, не фактом запуска.
+    added = 787  # прод-форма PR #173
+    labels = [{"name": "review:large"}]
+    assert ai.large_ok_decision(added, labels, "rework") == "skip"
+    assert ai.large_ok_decision(added, labels, "error") == "skip"
+
+
+def test_large_ok_skipped_when_diff_not_flagged_large():
+    # Дифф без review:large — размерного вопроса нет вовсе, метка не нужна.
+    assert ai.large_ok_decision(50, [{"name": "ai:ok"}], "approve") == "skip"
+
+
+def test_large_ok_escalates_over_second_threshold():
+    # (в) дифф сверх LARGE_DIFF_HUGE_LINES не получает автоподтверждения —
+    # решение "escalate", даже если AI одобрил.
+    added = ai.check_pr.LARGE_DIFF_HUGE_LINES + 1
+    labels = [{"name": "review:large"}, {"name": "ai:ok"}]
+    assert ai.large_ok_decision(added, labels, "approve") == "escalate"
+
+
+def test_large_ok_at_exact_huge_threshold_still_ok():
+    # Порог включительно: ровно LARGE_DIFF_HUGE_LINES — ещё автоматика, не эскалация.
+    added = ai.check_pr.LARGE_DIFF_HUGE_LINES
+    labels = [{"name": "review:large"}, {"name": "ai:ok"}]
+    assert ai.large_ok_decision(added, labels, "approve") == "ok"
+
+
+def test_huge_diff_escalation_text_ends_with_next_steps_section():
+    # Требование владельца от 2026-09-02 (#170): эскалация обязана
+    # заканчиваться разделом «что дальше» — констатация без плана не принимается.
+    text = ai.huge_diff_escalation_text(999, 2500)
+    assert "Что дальше:" in text
+    assert text.rstrip().split("Что дальше:")[-1].strip()
+    assert "владелец" in text.lower()
+
+
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
 
 def test_is_not_found_exact_form_only():
