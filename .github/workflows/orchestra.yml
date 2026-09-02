@@ -9,6 +9,11 @@
 # Concurrency-группа сериализует сами запуски orchestra: два слияния никогда
 # не идут параллельно. Это архитектурный замок, а не договорённость.
 #
+# Группа объявлена на уровне КАЖДОГО джоба, а не файла: на уровне workflow она
+# делила бы одну очередь между обязательной проверкой contract (обязана идти
+# по каждому PR независимо) и длинной серийной работой orchestra — так все PR
+# массово теряли статус contract, вытесненные чужими прогонами и кроном (#189).
+#
 # ⚠️ Расписание в публичном репозитории само отключается после 60 дней без активности
 #    (docs/research/21-github-actions.md) — деградация громкая: отчёты перестанут
 #    появляться в Actions. Поднимать активность или дёргать workflow_dispatch вручную.
@@ -27,14 +32,16 @@ permissions:
   pull-requests: write
   actions: write
 
-concurrency:
-  group: orchestra
-  cancel-in-progress: false
-
 jobs:
   contract:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Группа уникальна для PR: чужой PR никогда не отменяет и не откладывает эту
+    # проверку. cancel-in-progress: true — можно отменять свой же устаревший
+    # прогон: новый push в тот же PR делает старую проверку контракта неактуальной.
+    concurrency:
+      group: orchestra-contract-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
       - name: Контракт PR ↔ задача
@@ -45,6 +52,11 @@ jobs:
   orchestra:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Глобальная группа — архитектурный замок из шапки файла: два слияния
+    # никогда не идут параллельно.
+    concurrency:
+      group: orchestra
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
       - name: Обход пула и очередь слияний
