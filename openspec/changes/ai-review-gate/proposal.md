@@ -13,12 +13,14 @@ DSH-агента в trust-зоне без GitHub-токена — и делае�
    и `verdict` (разбор ответа, маскирование, канонический комментарий,
    метка). `scripts/review/ai_dsh.sh` — прогон DSH headless (пины и GLM-патч
    из общей `scripts/lib/dsh-ci.sh`).
-2. `.github/workflows/ai-review.yml` — триггер `labeled: review:ok` (первый
-   гейт прошёл) и `workflow_dispatch` (input `pr` — повтор после сбоя).
-   Trust-зона — граница между job'ами: job `review` (права только чтение;
-   DSH-шаг без GitHub-токена, его порча умирает с ВМ) → ответ и head
-   переезжают outputs'ами доверенного шага → job `verdict` (свежая ВМ,
-   чистый чекаут из GitHub, pull-requests:write).
+2. `.github/workflows/ai-review.yml` — триггер `workflow_run` по завершению
+   pr-review (метки GITHUB_TOKEN событий не создают — research/21) и
+   `workflow_dispatch` (input `pr` — повтор/миграция). Trust-зона — граница
+   между job'ами И «доверенный код только из main»: job `review` (права
+   только чтение; DSH-шаг без GitHub-токена, его порча умирает с ВМ; скрипты
+   шагов с токеном — из чекаута main, дерево PR в pr-head — данные агента) →
+   ответ и head переезжают outputs'ами доверенного шага → job `verdict`
+   (свежая ВМ, чекаут main, pull-requests:write).
 3. Контракт вердикта — паттерн живого решения владельца в Harness
    (pr_loop.py): последняя непустая строка ответа ровно `ВЕРДИКТ: approve`
    или `ВЕРДИКТ: rework`; отсутствие/неоднозначность — `error`, никогда не
