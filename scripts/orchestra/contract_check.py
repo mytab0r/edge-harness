@@ -101,13 +101,10 @@ def main() -> int:
             "Ссылайся на задачу просто #N."
         )
     # Номер задачи признаётся только на строке, которая НАЧИНАЕТСЯ с `#N`
-    # (не любое упоминание issue в тексте PR) — так и было до #187, сама
-    # экстракция числа сведена в task_ref.extract_task_refs.
-    issue_numbers = []
-    for line in refs:
-        if not line.lstrip().startswith("#"):
-            continue
-        issue_numbers.extend(task_ref.extract_task_refs(line.lstrip()))
+    # (не любое упоминание issue в тексте PR) — декларация, не упоминание.
+    # Одно место правды — task_ref.declared_tasks (#195): то же правило
+    # применяется и к чужим PR ниже, симметрично.
+    issue_numbers = task_ref.declared_tasks(body)
     if not issue_numbers:
         problems.append("В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула.")
 
@@ -137,13 +134,17 @@ def main() -> int:
                     f"(назначено: {', '.join(assignees)}). Бери свободную из пула."
                 )
             # Чужие открытые PR на ту же задачу — гонка веток; она разрешается здесь.
+            # Симметрично своему PR: конфликт только если чужой PR ОБЪЯВЛЯЕТ эту
+            # задачу (строка тела, начинающаяся с #N), а не просто упоминает её
+            # номер в прозе описания (#195 — второй экземпляр асимметрии #187:
+            # своя декларация уже была узкой, чужая гонялась по всему тексту).
             others = []
             pulls = gh(f"repos/{repo}/pulls?state=open&per_page=100")
             for other in pulls:
                 if other["number"] == args.pr:
                     continue
                 other_body = other["body"] or ""
-                if task_ref.references_task(other_body, issue_number):
+                if task_ref.declares_task(other_body, issue_number):
                     others.append(other["number"])
             if others:
                 problems.append(
