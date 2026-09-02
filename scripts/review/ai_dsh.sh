@@ -36,7 +36,8 @@ dsh_install "$AI_WORK/pkgs"
 dsh --version || true
 dsh_patch_profile headless
 
-# cwd = корень воркспейса (чекаут head PR) и не меняется — контракт dsh.
+# cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
+# воркспейса) и не меняется до конца прогона — контракт dsh.
 set +e
 timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$AI_WORK/prompt.md")" \
   >"$AI_WORK/answer.txt" 2>"$AI_WORK/stderr.txt"
