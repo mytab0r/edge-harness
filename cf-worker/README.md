@@ -33,15 +33,34 @@
 
 ## Локальная разработка
 
+**Правило: `wrangler dev` и UI-канарейка — только в Docker.** Хост-машина (Windows)
+копит осиротевшие процессы `workerd`/`node` и отличается кодировками/EOL/диапазоном
+портов. На хосте — только `vitest`/`check`/`deploy` через CI.
+
+### Docker (рекомендуемый путь)
+
 ```bash
 cd cf-worker
-npm ci
-cp .dev.vars.example .dev.vars   # HANDS_TOKEN=dev-token, SESSION_SECRET=dev-session-secret
-npm run types                    # после изменений в wrangler.jsonc
-npm test                         # vitest на настоящем workerd
-npm run dev -- --port 8808       # 8787 бывает в запрещённом диапазоне Windows
+npm run dev:docker          # собирает образ и запускает wrangler dev на 0.0.0.0:8808
+# в другом терминале:
 node scripts/smoke-local.mjs http://127.0.0.1:8808
 ```
+
+Образ строится из `Dockerfile` — та же среда, что CI и прод (Node 24, Linux),
+без платформенной специфики. Порт 8808 проброшен на хост.
+
+### Хост (запрещено для dev/канарейки)
+
+```bash
+# НЕ ДЕЛАТЬ на хосте:
+npm run dev                 # wrangler dev напрямую — оставляет осиротевшие процессы
+node scripts/canary-ui.mjs  # Playwright + браузер — другой движок, другие шрифты/EOL
+```
+
+На хосте допустимы только:
+- `npm test` — vitest на настоящем workerd (изолированная петля)
+- `npm run typecheck` / `npm run check` / `npm run docs` — статические проверки
+- `npm run deploy` — деплой через CI (воркфлоу `.github/workflows/deploy-worker.yml`)
 
 Smoke — то, что vitest-петля проверить не может: доставку broadcast'а живому сокету
 (см. [`docs/research/22-cf-testing-toolchain.md`](../docs/research/22-cf-testing-toolchain.md)).
