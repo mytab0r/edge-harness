@@ -304,6 +304,36 @@ def test_error_reason_transport_failure_wins_over_line_check():
     assert "ошибка провайдера" in reason
 
 
+# ── Идемпотентность file_tasks: маркер filed: в ПОСЛЕДНЕЙ строке ───────────────
+
+FT = importlib.util.spec_from_file_location(
+    "file_tasks", Path(__file__).with_name("file_tasks.py"))
+ft = importlib.util.module_from_spec(FT)
+FT.loader.exec_module(ft)  # type: ignore[union-attr]
+
+
+def test_filed_marker_last_line_only():
+    body = "pr: 1\nhead: a\nreviewer: rework\n\nпроза\n\nfiled: #139 #140\n"
+    assert ft.filed_marker(body) == [139, 140]
+
+
+def test_filed_marker_ignores_fenced_impostor():
+    # строка «filed: #999» внутри фенса задачи — контент модели, не маркер:
+    # живой класс с ревью PR #138 (иначе «задачи уже заведены» навсегда)
+    body = (
+        "pr: 1\nhead: a\nreviewer: rework\n\n"
+        "````задача\nЗаголовок\nfiled: #999\n````\n"
+    )
+    assert ft.filed_marker(body) == []
+
+
+def test_filed_marker_absent_and_partial():
+    assert ft.filed_marker("просто текст") == []
+    assert ft.filed_marker("") == []
+    # частичная строка (не только #N) маркером не является
+    assert ft.filed_marker("filed: #139 и #140") == []
+
+
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
 
 def test_is_not_found_exact_form_only():
