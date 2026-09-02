@@ -63,6 +63,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_pulse_guard.py -q
 
+      # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
+      # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
+      # ловил 403 на автослежении), сбой архивации — жёсткий и эскалируется
+      # тем же каналом, что предохранитель, а не тонет тихим warning'ом.
+      - name: Тесты планировщика orchestra (логин в морду, архив сессий)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_scheduler.py -q
+
       # Атомарная аренда задачи (#121): гонка двух claim (замок существует →
       # второй отказ), TTL по дате коммита замка, release. Без сети — gh на
       # уровне subprocess-мока с прод-формой ответов.
