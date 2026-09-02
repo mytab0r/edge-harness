@@ -334,6 +334,31 @@ ai-review -f pr=<N>`).
 default branch); замер покрывает `pull_request` + свой файл, случай форка не
 проверялся.
 
+## Метка, поставленная GITHUB_TOKEN, не создаёт событий (замер 2026-08-31, #18)
+
+`check_pr.py` ставит `review:ok` токеном job'а — и `on: pull_request:
+types: [labeled]` у workflow ai-review НЕ срабатывает: воркфлоу лежит на main
+(мерж b8a320c), событие `labeled:review:ok` на PR #138 доставлено в 17:58:45Z,
+run не создан. Это документированная антирекурсия: «When you use the
+repository's GITHUB_TOKEN to perform tasks, events triggered by the
+GITHUB_TOKEN … will not create a new workflow run» — метки входят в список.
+
+**Рабочий обход — `workflow_run`** (он же документирован для этого класса):
+ai-review срабатывает по ЗАВЕРШЕНИЮ workflow pr-review (`workflow_run:
+workflows: [pr-review], types: [completed]`) — завершение рана событием
+считается независимо от того, что внутри рана ставил GITHUB_TOKEN. Номер PR
+в этом событии отсутствует — разрешается по паре `workflow_run.head_branch` +
+`head_repository.owner.login` (у форка head в чужом репо) запросом
+`pulls?head=<owner>:<branch>` с кросс-чеком `head_sha` рана (уехавшая ветка
+пропускается — её ревью придёт новым событием).
+Паттерн «метка-триггер» сохраняется для ОРКЕСТРАТОРА (scheduler читает метки
+polling'ом по cron — ему события не нужны), но событийный триггер второго
+гейта обязан быть workflow_run, не labeled.
+
+**Альтернатива, не выбранная:** ставить метки PAT (события тогда firing) —
+второй токен в канале первого гейта ради события; workflow_run дешевле и уже
+по построению сериализует «pr-review завершился → ai-review начался».
+
 ---
 
 ## Вердикт по схеме «6-часовой job держит WS к Cloudflare DO»
