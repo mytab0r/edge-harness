@@ -71,6 +71,14 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_claim_task.py -q
 
+      # Номер задачи из текста PR/issue — одно место правды (#187): границы
+      # числа с обеих сторон, не подстрока (#18 не должен матчить #180/#5180;
+      # регресс живого прогона orchestra 33570081734).
+      - name: Тесты извлечения номера задачи task_ref
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_ref.py -q
+
       # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
       # (fine-grained, морда) упоминает только deploy-worker.yml и синх
       # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)
