@@ -231,6 +231,23 @@ def send_telegram(text: str) -> bool:
     return True
 
 
+def escalate(repo: str, issue_number: int, text: str) -> str:
+    """Канал эскалации поломок — общий с предохранителем конвейера: комментарий
+    в задачу-статус + Telegram, best-effort по каждому (см. send_telegram).
+    Переиспользуется вне пары «предохранитель/пульс» (scheduler.archive_runner_sessions,
+    #119/#174) — нельзя заводить второй канал для того же класса «поломка после
+    мержа», один канал решения уже есть."""
+    try:
+        post_issue_comment(repo, issue_number, text)
+        posted = True
+    except RuntimeError as error:
+        print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
+        posted = False
+    delivered = send_telegram(text)
+    return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
+            f"след в #{issue_number}: {'оставлен' if posted else 'НЕ оставлен'}")
+
+
 # ── Сценарии, вызываемые scheduler.py ────────────────────────────────────────────
 
 

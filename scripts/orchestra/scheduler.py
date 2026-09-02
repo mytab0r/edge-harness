@@ -26,6 +26,11 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
   7. Замки задач (#121): протухшие аренды (refs/locks/task-*, TTL в
      scripts/lib/claim_task.py) снимаются со следом в задаче; после слияния PR
      замки упомянутых в его теле задач освобождаются.
+  8. Архив сессий раннера после мержа (#119): сбой (морда недоступна для логина,
+     RPC отклонил архив не по «сессии нет») — возможность ЕСТЬ, но сломана
+     (#174): fail loud — мерж уже состоялся и не откатывается, но прогон
+     окрашивается красным ПОСЛЕ того, как отчёт сохранён, а сигнал уходит
+     тем же каналом, что предохранитель конвейера (issue #120 + Telegram).
 """
 
 import http.cookiejar
@@ -41,8 +46,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # gh()/parse_time() и логика предохранителя — одно место правды в pulse_guard
-# (пороги WORKER_FAILURE_PAUSE_AFTER / HEARTBEAT_MAX_AGE_MINUTES живут там же).
-from pulse_guard import conveyor_gate, gh, heartbeat_check, parse_time
+# (пороги WORKER_FAILURE_PAUSE_AFTER / HEARTBEAT_MAX_AGE_MINUTES живут там же;
+# escalate — общий канал «поломка → задача-статус + Telegram», #120/#174).
+from pulse_guard import WATCHDOG_ISSUE, conveyor_gate, escalate, gh, heartbeat_check, parse_time
 
 # claim_task живёт в scripts/lib (общее место для всех каналов): TTL замка —
 # одна константа LOCK_TTL_HOURS там, сюда не дублируется.
@@ -156,7 +162,8 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
     return lines
 
 
-def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
+def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
+    """Возвращает (строки отчёта, был_ли_жёсткий_сбой_after_merge) — см. after_merge."""
     lines = []
     skipped = []
     for pull in pulls:
@@ -211,11 +218,12 @@ def merge_queue(repo: str, pulls: list[dict]) -> list[str]:
         lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
         if skipped:
             lines += [f"   (отложены: {item})" for item in skipped]
-        lines += after_merge(repo, pull)
-        return lines  # один за запуск: сериализация слияний
+        after_lines, hard_failure = after_merge(repo, pull)
+        lines += after_lines
+        return lines, hard_failure  # один за запуск: сериализация слияний
     if skipped:
         lines += [f"⏸️ {item}" for item in skipped]
-    return lines
+    return lines, False
 
 
 # ── Сессии раннеров в морде dsh-edge (#119) ───────────────────────────────────────
@@ -227,17 +235,47 @@ DSH_EDGE_URL = os.environ.get("DSH_EDGE_URL", "")
 DSH_EDGE_ACCESS_KEY = os.environ.get("DSH_EDGE_ACCESS_KEY", "")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Контракт логина морды (docs/research/12-dsh-edge-session-api.md:13-14):
+    POST /api/auth/login отвечает 303 + Set-Cookie — это УСПЕХ, не «иди по
+    Location». HTTPRedirectHandler по умолчанию молча делает второй GET по
+    Location без куки/тела и получает 403 (Origin/куки не те) — тот 403
+    раньше всплывал как ошибка логина, хотя логин прошёл. Рабочие реализации
+    (scripts/lib/dsh-edge-session.sh, канарейка deploy-dsh-edge.yml) читают
+    303 без -L по той же причине — здесь то же самое место правды."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def _morde_opener() -> urllib.request.OpenerDirector:
-    """Opener с cookie-jar: логин обменивает access-ключ на куку владельца."""
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    """Opener с cookie-jar и БЕЗ автослежения за редиректом (см. _NoRedirect):
+    логин обменивает access-ключ на куку владельца через 303, а не через
+    переход по Location."""
+    return urllib.request.build_opener(
+        _NoRedirect, urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def _morde_login(opener: urllib.request.OpenerDirector) -> None:
+    """303 — единственный успешный код логина (кука уже осела в cookie-jar
+    опенера к моменту исключения — HTTPCookieProcessor читает Set-Cookie до
+    того, как _NoRedirect решает не идти по Location). Любой другой код —
+    громкая ошибка: раньше resp.read() без проверки статуса делал успех и
+    неуспех неотличимыми, а автослежение urllib за редиректом превращало
+    303-успех в 403 вторым GET без куки/тела (см. _NoRedirect)."""
     data = urllib.parse.urlencode({"accessKey": DSH_EDGE_ACCESS_KEY}).encode()
     req = urllib.request.Request(
         DSH_EDGE_URL.rstrip("/") + "/api/auth/login", data=data, method="POST")
-    with opener.open(req, timeout=30) as resp:
-        resp.read()
+    try:
+        with opener.open(req, timeout=30) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+        if status != 303:
+            raise RuntimeError(f"логин в морду не удался: HTTP {status}") from error
+        return
+    if status != 303:
+        raise RuntimeError(f"логин в морду не удался: ожидали HTTP 303, получили {status}")
 
 
 def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict) -> dict:
@@ -260,16 +298,27 @@ def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict
     return inner.get("value", {})
 
 
-def archive_runner_sessions(task_numbers: list[int]) -> list[str]:
-    """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR."""
+def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
+    """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR.
+
+    Возвращает (строки отчёта, был_ли_жёсткий_сбой). «Жёсткий сбой» —
+    инфраструктурная поломка (логин в морду не прошёл, сеть, RPC вернул НЕ
+    session-not-found): возможность архивировать ЕСТЬ, но она сломана — по
+    правилу fail loud такой сбой не может быть неотличим от «сессии нет» или
+    «конфигурации нет» (оба — норма, не поломка). Мерж уже состоялся и не
+    откатывается: жёсткий сбой не прерывает обход остальных номеров, только
+    помечает результат — эскалацию и красный код делает вызывающий main()."""
     if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
-        return ["⚠️ DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY не заданы — архив сессий раннеров пропущен (#119)"]
+        return (["⚠️ DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY не заданы — архив сессий раннеров пропущен (#119)"],
+                False)
     try:
         opener = _morde_opener()
         _morde_login(opener)
-    except (OSError, urllib.error.URLError, ValueError) as error:
-        return [f"⚠️ морда dsh-edge недоступна для архива сессий: {error}"]
+    except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
+        return ([f"🚨 морда dsh-edge недоступна для архива сессий (возможность сломана, не отсутствует): {error}"],
+                True)
     lines = []
+    hard_failure = False
     for number in task_numbers:
         session_id = f"harness-{number}"
         try:
@@ -279,16 +328,23 @@ def archive_runner_sessions(task_numbers: list[int]) -> list[str]:
             if "session-not-found" in str(error):
                 lines.append(f"🗄️ #{number}: сессии раннера в морде нет — архивировать нечего")
             else:
-                lines.append(f"⚠️ #{number}: сессия {session_id} не заархивирована: {error}")
+                lines.append(f"🚨 #{number}: сессия {session_id} не заархивирована (возможность сломана): {error}")
+                hard_failure = True
         except (OSError, ValueError) as error:
-            lines.append(f"⚠️ #{number}: архив сессии не удался: {error}")
-    return lines
+            lines.append(f"🚨 #{number}: архив сессии не удался (возможность сломана): {error}")
+            hard_failure = True
+    return lines, hard_failure
 
 
-def after_merge(repo: str, pull: dict) -> list[str]:
+def after_merge(repo: str, pull: dict) -> tuple[list[str], bool]:
     """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
-    (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно."""
+    (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно.
+
+    Возвращает (строки отчёта, был_ли_жёсткий_сбой_архивации). Мерж уже
+    состоялся — жёсткий сбой не откатывает и не блокирует эту функцию, только
+    поднимается наверх для эскалации (main() красит прогон ПОСЛЕ мержа)."""
     lines = []
+    hard_failure = False
     number = pull["number"]
     files = gh(f"repos/{repo}/pulls/{number}/files?per_page=100")
     if any((f["filename"] or "").startswith("cf-worker/") for f in files):
@@ -335,8 +391,9 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
     # его нельзя — утащим чужую живую сессию в архив.
     if task_numbers:
-        lines += archive_runner_sessions(task_numbers)
-    return lines
+        archive_lines, hard_failure = archive_runner_sessions(task_numbers)
+        lines += archive_lines
+    return lines, hard_failure
 
 
 def worker_runs_active(repo: str) -> bool:
@@ -401,7 +458,7 @@ def main() -> int:
         lease_lines = [f"⚠️ обход замков задач не удался: {error}"]
     pulls = open_pulls(repo)  # состояние могло измениться
     conflict_lines = mark_conflicts(repo, pulls)
-    merge_lines = merge_queue(repo, pulls)
+    merge_lines, archive_hard_failure = merge_queue(repo, pulls)
 
     pool = open_task_issues(repo)
     free = sum(1 for issue in pool if not issue["assignees"])
@@ -417,6 +474,24 @@ def main() -> int:
                   *stale_lines, *lease_lines, *conflict_lines, *merge_lines, *conveyor_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
+
+    # Архив сессий раннера после мержа (#119) сломан «возможность есть, но не
+    # работает» (#174) — мерж уже состоялся, откатывать нельзя и остальную
+    # очередь эта поломка не блокирует. Но fail loud: прогон обязан покраситься
+    # ПОСЛЕ того, как отчёт уже сохранён, и эскалация уходит тем же каналом,
+    # что предохранитель конвейера (#120), — не заводим третий канал сигнала.
+    if archive_hard_failure:
+        escalation = escalate(
+            repo, WATCHDOG_ISSUE,
+            "🚨 edge-harness: [статус: архив сессии раннера сломан]\n"
+            "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
+            "(возможность есть, но сломана — см. отчёт этого прогона orchestra выше). "
+            "Мерж не откатывается; сессия останется в списке активных до ручного "
+            "разбора или следующего успешного мержа той же задачи.",
+        )
+        lines.append(f"🚨 архив сессии раннера сломан — прогон окрашен красным ({escalation})")
+        summary(lines)
+        return 1
 
     summary(lines)
     return 0
