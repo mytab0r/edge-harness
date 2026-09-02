@@ -43,6 +43,15 @@ FAILURE_CONCLUSIONS = ("failure", "cancelled")
 # Подряд красных прогонов worker.yml, после которых авто-диспетч останавливается.
 WORKER_FAILURE_PAUSE_AFTER = 3
 
+# Полуоткрытое состояние (#205): разомкнутый предохранитель сам не снимается —
+# зелёного прогона неоткуда взяться без диспатча. Поэтому по истечении выдержки
+# разрешается РОВНО ОДИН пробный диспатч. Выдержка растёт экспоненциально с
+# каждой красной пробой (2^(N-1) * база) и упирается в потолок; оркестратор
+# бежит каждые 15 минут (cron orchestra.yml), поэтому база кратна интервалу —
+# первая проба не раньше следующего пульса после начала паузы.
+PROBE_BACKOFF_BASE_MINUTES = 15
+PROBE_BACKOFF_MAX_MINUTES = 240
+
 # Пульс orchestra идёт каждые 15 минут (cron orchestra.yml); три пропущенных
 # интервала — пульсы пропали. Пока опоздавший запуск жив, он обязан крикнуть.
 HEARTBEAT_MAX_AGE_MINUTES = 45
@@ -52,6 +61,10 @@ WATCHDOG_ISSUE = 120
 
 PAUSE_MARKER = "[статус конвейера: пауза]"
 HEARTBEAT_MARKER = "[статус пульса: пропадал]"
+# Номер пробы дописывается через пробел: "[статус конвейера: проба N]" — маркер
+# ищется подстрокой без номера (issue_marker_times), номер разбирается отдельно
+# (probe_marker_attempts) там, где нужна выдержка, а не просто факт «была проба».
+PROBE_MARKER = "[статус конвейера: проба"
 
 
 def gh(*args: str) -> dict | list | None:
@@ -99,6 +112,71 @@ def decide_dispatch(failures: int, pause_after: int = WORKER_FAILURE_PAUSE_AFTER
     return failures < pause_after
 
 
+# ── Полуоткрытое состояние (#205): проба после выдержки ──────────────────────────
+
+
+def probe_backoff_minutes(
+    attempt: int,
+    base: float = PROBE_BACKOFF_BASE_MINUTES,
+    cap: float = PROBE_BACKOFF_MAX_MINUTES,
+) -> float:
+    """Выдержка перед пробой N (attempt считается от 1 — ещё не было ни одной
+    красной пробы в этой серии). Растёт экспоненциально, упирается в потолок:
+    предохранитель не должен пробовать чаще и чаще, если причина не уходит."""
+    if attempt < 1:
+        attempt = 1
+    return min(base * (2 ** (attempt - 1)), cap)
+
+
+def decide_gate_state(
+    failures: int,
+    probe_attempts: int,
+    last_marker_at: datetime | None,
+    now: datetime,
+    pause_after: int = WORKER_FAILURE_PAUSE_AFTER,
+) -> str:
+    """Четыре исхода решения (три состояния предохранителя + первый вход):
+    'closed' — failures < порога, диспатч обычный;
+    'first'  — серия только что стала красной, маркера ещё нет — ставим
+               PAUSE_MARKER, диспатч НЕ даём (выдержка отсчитывается от этого
+               момента, проба идёт не раньше следующего пульса);
+    'probe'  — серия красная, маркер есть, выдержка с последнего маркера
+               (пауза или предыдущая красная проба) истекла — разрешена
+               РОВНО ОДНА проба;
+    'open'   — серия красная, выдержка ещё не истекла — диспатч запрещён.
+
+    probe_attempts — сколько проб в этой серии УЖЕ было красными (0 для самой
+    первой паузы)."""
+    if decide_dispatch(failures, pause_after):
+        return "closed"
+    if last_marker_at is None:
+        return "first"
+    backoff = probe_backoff_minutes(probe_attempts + 1)
+    return "probe" if minutes_between(last_marker_at, now) >= backoff else "open"
+
+
+def probe_marker_attempts(markers: list[tuple[datetime, str]]) -> int:
+    """Сколько красных проб уже было в открытой серии: наибольший номер,
+    разобранный из тела маркеров '[статус конвейера: проба N]'. Без маркеров —
+    0 (следующая проба будет первой)."""
+    attempts = 0
+    for _, body in markers:
+        text = body.strip()
+        idx = text.find(PROBE_MARKER)
+        if idx == -1:
+            continue
+        rest = text[idx + len(PROBE_MARKER):].lstrip()
+        digits = ""
+        for ch in rest:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            attempts = max(attempts, int(digits))
+    return attempts
+
+
 def pause_notification_pending(marker_times: list[datetime], last_success_at: datetime | None) -> bool:
     """Оповещать о серии нужно, только если с последнего успеха маркера ещё не было:
     маркер новее последнего success — серия та же, повтор не шлём. Успехов нет вовсе —
@@ -139,8 +217,26 @@ def pause_alert_text(failures: int, run: dict | None, error: str) -> str:
         f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — авто-диспетч воркера остановлен."
         f"{run_line}\n"
         f"Ошибка последнего прогона: {error}\n"
-        f"Возобновление: любой зелёный прогон {WORKER_WORKFLOW} сбрасывает счётчик "
-        "(например, ручной `gh workflow run worker`) — пауза снимется автоматически."
+        f"Возобновление: полуоткрытое состояние (#205) само пробует диспатч по "
+        f"истечении выдержки (от {PROBE_BACKOFF_BASE_MINUTES} мин, экспоненциально, "
+        f"потолок {PROBE_BACKOFF_MAX_MINUTES} мин) — либо ручной "
+        "`gh workflow run worker`, который сбрасывает счётчик сразу."
+    )
+
+
+def probe_alert_text(attempt: int, backoff_minutes: float, run: dict | None, error: str) -> str:
+    run_line = ""
+    if run:
+        run_line = f"\nПоследний красный: {run.get('display_title') or run.get('name') or 'run'} — {run.get('html_url', 'без ссылки')}"
+    return (
+        f"🔎 edge-harness: {PAUSE_MARKER}\n"
+        f"{PROBE_MARKER} {attempt}]\n"
+        f"Пробный диспатч после паузы {int(backoff_minutes)} мин — проверяем, "
+        f"жива ли причина серии красных {WORKER_WORKFLOW}."
+        f"{run_line}\n"
+        f"Ошибка последнего прогона: {error}\n"
+        "Зелёная проба замкнёт предохранитель; красная — выдержка вырастет "
+        "экспоненциально и уйдёт следующая проба."
     )
 
 
@@ -199,6 +295,19 @@ def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[dateti
         for comment in payload
         if marker in (comment.get("body") or "")
     ]
+
+
+def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) -> list[tuple[datetime, str]]:
+    """Как issue_marker_times, но для нескольких маркеров сразу и с телом
+    комментария — нужно там, где решение зависит не только от факта маркера,
+    но и от его содержимого (номер попытки пробы, #205)."""
+    payload = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100") or []
+    result = []
+    for comment in payload:
+        body = comment.get("body") or ""
+        if any(marker in body for marker in markers):
+            result.append((parse_time(comment["created_at"]), body))
+    return result
 
 
 def post_issue_comment(repo: str, issue_number: int, text: str) -> None:
@@ -281,27 +390,69 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
 
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     """Предохранитель: перед dispatch воркера. Возвращает (строки отчёта,
-    разрешён_ли_диспетч). Серия красных worker.yml от WORKER_FAILURE_PAUSE_AFTER
-    останавливает диспатч; сигнал — один на серию (маркер в #120 живёт до
-    следующего success)."""
+    разрешён_ли_диспетч). Три состояния (#205):
+
+    closed — failures < порога, диспатч обычный, тихо;
+    probe  — серия красная, выдержка с последнего маркера серии истекла —
+             РОВНО ОДИН пробный диспатч в этом пульсе, маркер пробы ставится
+             сразу (следующий пульс уже видит его и не пробует повторно, даже
+             если этот прогон worker.yml ещё не успеет завершиться);
+    open   — серия красная, выдержка не истекла — диспатч заблокирован, тихо
+             (маркер уже стоит, второй раз не оповещаем).
+
+    Носитель состояния — комментарии-маркеры в #120 (тот же приём, что уже
+    даёт issue_marker_times для пульса и что #196 использует для счётчика
+    попыток ai-review): переживают перезапуск оркестратора, читаются заново
+    каждым прогоном планировщика."""
     runs = recent_runs(repo, WORKER_WORKFLOW, per_page=10)
     failures = count_consecutive_failures([r.get("conclusion") for r in runs])
     if decide_dispatch(failures):
         return ([f"🟢 серия красных worker.yml: {failures} "
                  f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
                 True)
+
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = parse_time(last_ok["created_at"]) if last_ok else None
     try:
-        markers = issue_marker_times(repo, WATCHDOG_ISSUE, PAUSE_MARKER)
-        already = not pause_notification_pending(markers, last_ok_at)
-    except RuntimeError:
-        already = False  # не смогли прочитать маркеры — считаем серию свежей (fail loud ниже)
-    if already:
+        all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER,))
+    except RuntimeError as error:
+        # не смогли прочитать маркеры — не гадаем о выдержке, диспатч не даём
+        # (fail loud: серия красная, значит по умолчанию заперто)
+        print(f"::warning::маркеры #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
+        return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
+                 f"подряд — диспатч остановлен (маркеры #{WATCHDOG_ISSUE} недоступны)"],
+                False)
+    # Маркеры прошлой серии (старше последнего success) не в счёт — иначе новая
+    # серия унаследует чужой номер попытки и выдержку с первого же пульса.
+    markers = [(t, b) for t, b in all_markers if last_ok_at is None or t > last_ok_at]
+    marker_times = [t for t, _ in markers]
+    last_marker_at = max(marker_times) if marker_times else None
+    probe_attempts = probe_marker_attempts(markers)
+    state = decide_gate_state(failures, probe_attempts, last_marker_at, now)
+
+    if state == "open":
         return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
                  f"подряд — диспатч остановлен (уже оповещено, см. #{WATCHDOG_ISSUE})"],
                 False)
+
     error = last_failure_error(repo, runs[0]) if runs else "прогонов не найдено"
+    if state == "probe":
+        attempt = probe_attempts + 1
+        backoff = probe_backoff_minutes(attempt)
+        text = probe_alert_text(attempt, backoff, runs[0] if runs else None, error)
+        try:
+            post_issue_comment(repo, WATCHDOG_ISSUE, text)
+        except RuntimeError as err:
+            print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
+        delivered = send_telegram(text)
+        return ([f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
+                 f"{failures} красных {WORKER_WORKFLOW} подряд (Telegram: "
+                 f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
+                True)
+
+    # state == "first": серия только что стала красной, маркера ещё нет —
+    # ставим PAUSE_MARKER, диспатч не даём (выдержка отсчитается от этого
+    # маркера, проба — не раньше следующего пульса).
     text = pause_alert_text(failures, runs[0] if runs else None, error)
     try:
         post_issue_comment(repo, WATCHDOG_ISSUE, text)
