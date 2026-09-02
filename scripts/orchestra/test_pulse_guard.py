@@ -241,6 +241,81 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     assert any("разрешён" in line for line in lines)
 
 
+# ── Полуоткрытое состояние (#205): чистые решения ─────────────────────────────────
+
+
+@pytest.mark.parametrize("attempt,expected", [
+    (1, 15), (2, 30), (3, 60), (4, 120), (5, 240), (6, 240), (100, 240),
+])
+def test_probe_backoff_grows_exponentially_and_caps(attempt, expected):
+    # мутация-гвардия: если убрать min(..., cap) — на большом attempt выдержка
+    # улетит за потолок, тест обязан покраснеть (see test_probe_backoff_cap_is_enforced)
+    assert pg.probe_backoff_minutes(attempt) == expected
+
+
+def test_probe_backoff_cap_is_enforced():
+    # доказательство мутацией: без потолка probe_backoff_minutes(10) была бы
+    # 15 * 2**9 = 7680 мин — гвардия обязана держать 240
+    uncapped = pg.PROBE_BACKOFF_BASE_MINUTES * (2 ** 9)
+    assert uncapped > pg.PROBE_BACKOFF_MAX_MINUTES
+    assert pg.probe_backoff_minutes(10) == pg.PROBE_BACKOFF_MAX_MINUTES
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("прочий текст без маркера", 0),
+    (f"{pg.PROBE_MARKER} 1]", 1),
+    (f"🔎 edge-harness: {pg.PAUSE_MARKER}\n{pg.PROBE_MARKER} 3]\nостальное", 3),
+])
+def test_probe_marker_attempts_parses_number(body, expected):
+    assert pg.probe_marker_attempts([(utc(2026, 8, 31, 10), body)]) == expected
+
+
+def test_probe_marker_attempts_takes_max_across_series():
+    markers = [
+        (utc(2026, 8, 31, 10), f"{pg.PROBE_MARKER} 1]"),
+        (utc(2026, 8, 31, 11), f"{pg.PROBE_MARKER} 2]"),
+    ]
+    assert pg.probe_marker_attempts(markers) == 2
+
+
+def test_decide_gate_state_closed_when_below_threshold():
+    assert pg.decide_gate_state(0, 0, None, NOW) == "closed"
+    assert pg.decide_gate_state(2, 0, None, NOW) == "closed"
+
+
+def test_decide_gate_state_first_entry_has_no_marker_yet():
+    # серия только что стала красной — маркера ещё нет, ставим первый (не пробуем)
+    assert pg.decide_gate_state(3, 0, None, NOW) == "first"
+
+
+def test_decide_gate_state_open_before_backoff_elapses():
+    marker_at = utc(2026, 8, 31, 11, 50)  # 10 минут назад, выдержка попытки 1 = 15
+    assert pg.decide_gate_state(3, 0, marker_at, NOW) == "open"
+
+
+def test_decide_gate_state_probe_after_backoff_elapses():
+    marker_at = utc(2026, 8, 31, 11, 45)  # ровно 15 минут назад — выдержка истекла
+    assert pg.decide_gate_state(3, 0, marker_at, NOW) == "probe"
+
+
+def test_decide_gate_state_open_backoff_grows_with_attempts():
+    # после одной красной пробы (probe_attempts=1) выдержка следующей — 30 мин;
+    # 15 минут с последнего маркера уже недостаточно
+    marker_at = utc(2026, 8, 31, 11, 45)
+    assert pg.decide_gate_state(3, 1, marker_at, NOW) == "open"
+    assert pg.decide_gate_state(3, 1, utc(2026, 8, 31, 11, 30), NOW) == "probe"
+
+
+def test_decide_gate_state_mutation_guard_no_backoff_growth():
+    # доказательство мутацией: если бы выдержка не росла с attempts (баг —
+    # всегда брать первую попытку), 15 минут хватило бы и после красной пробы —
+    # это и есть дефект «предохранитель превращается в генератор запусков»
+    marker_at = utc(2026, 8, 31, 11, 45)
+    broken_backoff = pg.probe_backoff_minutes(1)  # как будто attempts не растут
+    assert pg.minutes_between(marker_at, NOW) >= broken_backoff  # баг разрешил бы пробу
+    assert pg.decide_gate_state(3, 1, marker_at, NOW) == "open"   # гвардия — не разрешает
+
+
 def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     ok_runs = {"workflow_runs": [run("success", "2026-08-31T11:50:00Z", 5)]}
     fake = FakeGh({"workflows/orchestra.yml/runs": ok_runs, "issues/120/comments": []})
@@ -258,3 +333,181 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 1))
     assert len(sent) == 1 and "пропадал" in sent[0]
     assert any("пропадал" in line for line in lines)
+
+
+# ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
+
+
+def test_gate_first_entry_posts_pause_marker_and_blocks(monkeypatch):
+    # серия только что стала красной — маркера ещё нет: ставим PAUSE_MARKER,
+    # диспатч НЕ даём в этом же пульсе (первая проба — не раньше следующего)
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [],
+    })
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert len(posted) == 1
+    assert pg.PAUSE_MARKER in posted[0] and pg.PROBE_MARKER not in posted[0]
+    assert any("паузе" in line for line in lines)
+
+
+def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
+    # маркер паузы стоит 10 минут (выдержка первой попытки — 15): открыт, тихо
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert any("паузе" in line for line in lines)
+
+    # ровно 15 минут прошло — выдержка истекла: ровно одна проба, диспатч разрешён
+    fake.routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER}]
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert len(posted) == 1 and f"{pg.PROBE_MARKER} 1]" in posted[0]
+    # проба отличима отдельной строкой в отчёте — иначе её не отладить
+    assert any("пробный диспатч после паузы" in line for line in lines)
+
+
+def probe_body(attempt: int) -> str:
+    """Прод-форма тела маркера пробы: probe_alert_text содержит и PAUSE_MARKER
+    (чтобы issue_markers_any находил его как часть той же серии), и PROBE_MARKER
+    с номером попытки — фикстуры собираются функцией кода, а не пересказом."""
+    return pg.probe_alert_text(attempt, pg.probe_backoff_minutes(attempt), None, "err")
+
+
+def test_gate_probe_success_closes_breaker_via_reset_streak(monkeypatch):
+    # проба зелёная => следующий прогон worker.yml — success => серия сброшена,
+    # count_consecutive_failures вернёт 0 => decide_dispatch снова True
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_OK,  # самый новый прогон — success
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:00:00Z", "body": probe_body(1)}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert any("разрешён" in line for line in lines)
+
+
+def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
+    # проба #1 была красной (маркер "проба 1]" новее последнего success) —
+    # следующая выдержка теперь 30 минут, не 15
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert any("паузе" in line for line in lines)
+
+    # доказательство мутацией: без роста выдержки (attempt всегда 1) те же
+    # 20 минут с последней пробы были бы >= 15 и пропустили бы вторую пробу —
+    # exp-выдержка (30 мин после первой красной пробы) обязана держать закрытым
+    fake.routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+        {"created_at": "2026-08-31T11:40:00Z", "body": probe_body(1)}]
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
+    assert allowed is False  # exp-выдержка (30 мин) ещё не истекла
+    broken_backoff_would_allow = pg.minutes_between(
+        utc(2026, 8, 31, 11, 40), NOW) >= pg.probe_backoff_minutes(1)
+    assert broken_backoff_would_allow is True  # без роста выдержки проба бы прошла
+
+
+def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
+    """Регрессия на реальный баг (#206, ревью): проба ушла (маркер проба 1
+    стоит), но её workflow_run ещё in_progress (conclusion=None) — самый
+    свежий прогон в списке. count_consecutive_failures останавливается на
+    None и вернёт 0, но это НЕ значит «серия закрылась»: маркер активной
+    серии обязан удержать gate закрытым, пока выдержка следующей попытки не
+    истекла — иначе оркестратор на следующем пульсе решит, что диспатч снова
+    разрешён, пока прошлая проба ещё выполняется."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run(None, "2026-08-31T11:46:00Z", 4),          # проба ещё бежит
+            run("failure", "2026-08-31T11:35:00Z", 2),
+            run("failure", "2026-08-31T11:20:00Z", 1),
+        ]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+
+    # доказательство мутацией: без фикса (не читая маркеры до decide_dispatch)
+    # count_consecutive_failures([None, "failure", "failure"]) == 0 и
+    # decide_dispatch(0) вернёт True — gate бы соврал "разрешён".
+    assert pg.count_consecutive_failures([None, "failure", "failure"]) == 0
+    assert pg.decide_dispatch(0) is True
+
+    # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert any("паузе" in line for line in lines)
+
+
+def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
+    """Обратная проверка из критерия приёмки: за час пауза не должна породить
+    больше проб, чем предусмотрено выдержкой. Симулируем час пульсов оркестратора
+    каждые 15 минут (как в проде, cron orchestra.yml) при неизменно красной серии
+    и считаем реальное число проб — оно обязано совпасть с числом проб, которое
+    даёт экспоненциальный ряд выдержек, а не с числом пульсов (4 за час)."""
+    comments = []
+
+    def fake_issue_comments(repo, n, text):
+        comments.append({"created_at": current_now[0].isoformat().replace("+00:00", "Z"), "body": text})
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", fake_issue_comments)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+
+    start = utc(2026, 8, 31, 12, 0)
+    current_now = [start]
+    probes = 0
+    # час пульсов каждые 15 минут — ровно как cron orchestra.yml в проде
+    for minute_offset in range(0, 61, 15):
+        current_now[0] = utc(2026, 8, 31, 12, 0)
+        from datetime import timedelta
+        current_now[0] = start + timedelta(minutes=minute_offset)
+        fake.routes["issues/120/comments"] = list(comments)
+        _, allowed = pg.conveyor_gate("mytab0r/edge-harness", current_now[0])
+        if allowed:
+            probes += 1
+
+    # выдержки: 15 (первая проба) -> красная -> 30 -> красная -> ждём до 240;
+    # за 60 минут с начала серии укладываются только пробы на 15 и 45 минутах
+    # (30-минутная выдержка после первой красной пробы на 15-й минуте истекает
+    # на 45-й) — итого РОВНО 2 пробы, не 5 (столько дал бы пульс без выдержки)
+    assert probes == 2, f"гвардия частоты нарушена: проб за час {probes}, ожидалось 2"
