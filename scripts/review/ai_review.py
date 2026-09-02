@@ -25,6 +25,12 @@ error, неоднозначность никогда не одобряет.
 шапка-факты (pr/head/reviewer) до первого пустой строки + канонические
 блоки-заборы ````задача — парсит scripts/review/file_tasks.py.
 
+Тормоз/газ размерного гейта (#204): approve на том же head, что и review:large,
+автоматически ставит review:large-ok (см. apply_large_ok/large_ok_decision) —
+взгляд человека делегирован состоявшемуся вердикту AI, а не факту запуска.
+Диффы длиннее check_pr.LARGE_DIFF_HUGE_LINES автоматика не подтверждает —
+эскалирует владельцу через pulse_guard.escalate.
+
 Среда: runner с gh, GH_TOKEN с правами pull-requests: write (gather/verdict).
 """
 
@@ -58,6 +64,23 @@ _tr_spec = importlib.util.spec_from_file_location(
     "task_ref", SCRIPT_DIR.parent / "lib" / "task_ref.py")
 task_ref = importlib.util.module_from_spec(_tr_spec)
 _tr_spec.loader.exec_module(task_ref)
+
+# Пороги размерного гейта (LARGE_DIFF_LINES/LARGE_DIFF_HUGE_LINES) — одно
+# место правды в check_pr.py, рядом друг с другом (#204). Импорт по файлу
+# (не как пакет) — тот же паттерн, что у review_labels/task_ref выше.
+_cp_spec = importlib.util.spec_from_file_location(
+    "check_pr", SCRIPT_DIR / "check_pr.py")
+check_pr = importlib.util.module_from_spec(_cp_spec)
+_cp_spec.loader.exec_module(check_pr)
+
+# Канал эскалации владельцу (диффы сверх LARGE_DIFF_HUGE_LINES, #204) — тот же,
+# что у предохранителя конвейера: комментарий в задачу-статус + Telegram
+# (pulse_guard.escalate). Второго канала для класса «нужно решение владельца»
+# не заводим (см. docstring escalate).
+_pg_spec = importlib.util.spec_from_file_location(
+    "pulse_guard", SCRIPT_DIR.parent / "orchestra" / "pulse_guard.py")
+pulse_guard = importlib.util.module_from_spec(_pg_spec)
+_pg_spec.loader.exec_module(pulse_guard)
 
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
 # единственной — двусмысленность это error, а не одобрение. Модель периодически
@@ -166,6 +189,48 @@ def verdict_line_present(answer: str) -> bool:
     меняется, это чисто текст для человека."""
     lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
     return any(VERDICT_RE.match(line) for line in lines)
+
+
+# ── Размерный гейт: газ к тормозу review:large (#204) ─────────────────────────
+
+def large_ok_decision(added: int, current_labels, verdict: str) -> str:
+    """«ok» — можно автоматически поставить review:large-ok; «escalate» —
+    дифф крупнее LARGE_DIFF_HUGE_LINES, решение за владельцем; «skip» —
+    ничего не менять (дифф не review:large или AI не одобрил).
+
+    Требует одобренного AI-вердикта на том же head (verdict == "approve"):
+    подтверждение размера обязано опираться на состоявшийся разбор диффа,
+    а не на факт запуска ревью (условие из #204, п.1) — иначе rework/error
+    молча открывал бы газ тормозу, для которого он не предназначен.
+    """
+    names = review_labels._names(current_labels)
+    if check_pr.REVIEW_LARGE not in names:
+        return "skip"
+    if verdict != "approve":
+        return "skip"
+    if added > check_pr.LARGE_DIFF_HUGE_LINES:
+        return "escalate"
+    return "ok"
+
+
+def huge_diff_escalation_text(pr: int, added: int) -> str:
+    """Текст эскалации гигантского диффа. Обязан заканчиваться разделом
+    «что дальше» (требование владельца от 2026-09-02, #170) — констатация
+    без плана не принимается."""
+    return (
+        f"🚨 edge-harness: PR #{pr} — дифф +{added} строк превышает второй "
+        f"порог review:large-ok ({check_pr.LARGE_DIFF_HUGE_LINES}) — жду решения "
+        "владельца по объёму.\n\n"
+        "Автоматика AI-ревью одобрила дифф (ai:ok), но не подтверждает размер "
+        f"сама: {check_pr.LARGE_DIFF_HUGE_LINES}+ строк — за пределами диапазона, "
+        "который проверен на реальных PR этого репозитория (#204).\n\n"
+        "Что дальше:\n"
+        f"- Исполнитель: владелец репозитория.\n"
+        "- Само по себе ничего не произойдёт — PR останется с review:large "
+        "без review:large-ok, авто-слияние заблокировано.\n"
+        f"- Нужно явное решение: поставить review:large-ok вручную, если объём "
+        "оправдан, либо запросить разбивку PR на части."
+    )
 
 
 def parse_tasks(answer: str) -> list[dict]:
@@ -352,6 +417,25 @@ def cmd_gather(args: argparse.Namespace) -> int:
 
 # ── verdict: разбор ответа, комментарий, метка ────────────────────────────────
 
+def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str) -> None:
+    """Проводка чистого large_ok_decision: ставит review:large-ok сама, либо
+    эскалирует владельцу по каналу pulse_guard.escalate (#204, п.3). Молчит
+    на «skip» — дифф не review:large или AI не одобрил, ничего не меняется."""
+    decision = large_ok_decision(added, current_labels, verdict)
+    if decision == "skip":
+        return
+    if decision == "ok":
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
+               "-f", f"labels[]={review_labels.LARGE_OK}")
+        print(f"large-ok: +{added} строк ≤ {check_pr.LARGE_DIFF_HUGE_LINES} — "
+              f"{review_labels.LARGE_OK} поставлена автоматически")
+        return
+    text = huge_diff_escalation_text(pr, added)
+    result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+    print(f"::warning::large-ok: +{added} строк > {check_pr.LARGE_DIFF_HUGE_LINES} — "
+          f"эскалация владельцу ({result})")
+
+
 def cmd_verdict(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
@@ -383,6 +467,13 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
            "-f", f"labels[]={label}")
+
+    # Газ к тормозу review:large (#204): подтверждение размера опирается на
+    # состоявшийся вердикт AI, а не на факт запуска — считается ПОСЛЕ того,
+    # как ai:*-метка на месте, чтобы large_ok_decision видел актуальный verdict.
+    files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
+    added = sum(f["additions"] for f in files)
+    apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
     body = build_comment(args.pr, args.head, verdict, findings, tasks)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
