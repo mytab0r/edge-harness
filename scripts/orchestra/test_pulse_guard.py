@@ -440,6 +440,40 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     assert broken_backoff_would_allow is True  # без роста выдержки проба бы прошла
 
 
+def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
+    """Регрессия на реальный баг (#206, ревью): проба ушла (маркер проба 1
+    стоит), но её workflow_run ещё in_progress (conclusion=None) — самый
+    свежий прогон в списке. count_consecutive_failures останавливается на
+    None и вернёт 0, но это НЕ значит «серия закрылась»: маркер активной
+    серии обязан удержать gate закрытым, пока выдержка следующей попытки не
+    истекла — иначе оркестратор на следующем пульсе решит, что диспатч снова
+    разрешён, пока прошлая проба ещё выполняется."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run(None, "2026-08-31T11:46:00Z", 4),          # проба ещё бежит
+            run("failure", "2026-08-31T11:35:00Z", 2),
+            run("failure", "2026-08-31T11:20:00Z", 1),
+        ]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+
+    # доказательство мутацией: без фикса (не читая маркеры до decide_dispatch)
+    # count_consecutive_failures([None, "failure", "failure"]) == 0 и
+    # decide_dispatch(0) вернёт True — gate бы соврал "разрешён".
+    assert pg.count_consecutive_failures([None, "failure", "failure"]) == 0
+    assert pg.decide_dispatch(0) is True
+
+    # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
+    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert any("паузе" in line for line in lines)
+
+
 def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     """Обратная проверка из критерия приёмки: за час пауза не должна породить
     больше проб, чем предусмотрено выдержкой. Симулируем час пульсов оркестратора

@@ -403,19 +403,26 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     Носитель состояния — комментарии-маркеры в #120 (тот же приём, что уже
     даёт issue_marker_times для пульса и что #196 использует для счётчика
     попыток ai-review): переживают перезапуск оркестратора, читаются заново
-    каждым прогоном планировщика."""
+    каждым прогоном планировщика.
+
+    count_consecutive_failures останавливается на первом незавершённом прогоне
+    (conclusion=None) и возвращает 0 — это верно для «серии ещё не было», но
+    ломается, если 0 означает «идёт проба текущей красной серии»: диспатч
+    воркера на предыдущем пульсе ещё выполняется. Поэтому маркеры активной
+    серии читаются ДО решения по failures — если маркер есть, failures=0 не
+    может означать «closed», решение отдаётся decide_gate_state."""
     runs = recent_runs(repo, WORKER_WORKFLOW, per_page=10)
     failures = count_consecutive_failures([r.get("conclusion") for r in runs])
-    if decide_dispatch(failures):
-        return ([f"🟢 серия красных worker.yml: {failures} "
-                 f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
-                True)
 
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = parse_time(last_ok["created_at"]) if last_ok else None
     try:
         all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER,))
     except RuntimeError as error:
+        if decide_dispatch(failures):
+            return ([f"🟢 серия красных worker.yml: {failures} "
+                     f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
+                    True)
         # не смогли прочитать маркеры — не гадаем о выдержке, диспатч не даём
         # (fail loud: серия красная, значит по умолчанию заперто)
         print(f"::warning::маркеры #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
@@ -425,10 +432,19 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     # Маркеры прошлой серии (старше последнего success) не в счёт — иначе новая
     # серия унаследует чужой номер попытки и выдержку с первого же пульса.
     markers = [(t, b) for t, b in all_markers if last_ok_at is None or t > last_ok_at]
+    if not markers and decide_dispatch(failures):
+        return ([f"🟢 серия красных worker.yml: {failures} "
+                 f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
+                True)
     marker_times = [t for t, _ in markers]
     last_marker_at = max(marker_times) if marker_times else None
     probe_attempts = probe_marker_attempts(markers)
-    state = decide_gate_state(failures, probe_attempts, last_marker_at, now)
+    # Маркер активной серии уже доказывает, что порог был достигнут раньше —
+    # даже если сейчас failures=0 из-за незавершённой пробы (conclusion=None
+    # останавливает count_consecutive_failures на 0, но это не значит «серия
+    # закрылась»). Не даём decide_gate_state спутать это с closed.
+    effective_failures = max(failures, WORKER_FAILURE_PAUSE_AFTER) if markers else failures
+    state = decide_gate_state(effective_failures, probe_attempts, last_marker_at, now)
 
     if state == "open":
         return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
