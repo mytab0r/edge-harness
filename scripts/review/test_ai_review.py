@@ -256,6 +256,54 @@ def test_task_section_dedupes_and_sorts_numbers():
     assert sorted(set(ai.task_ref.extract_task_refs(body))) == [18, 182]
 
 
+# ── Ошибка провайдера/транспорта vs нарушение контракта моделью ──────────────
+# (класс silent-wrong прогона 33572445063, PR #190: dsh упал с HTTP_404,
+# answer.txt остался пустым, verdict написал «строки ВЕРДИКТ нет вообще» —
+# диагноз читался как «модель ошиблась», хотя вызова модели не было вовсе).
+
+@pytest.mark.parametrize("dsh_rc,expected", [
+    ("1", True),
+    ("2", True),
+    ("0", False),
+    ("", False),      # неизвестен (rc не долетел) — не считается транспортом
+    (None, False),
+    ("не-число", False),
+])
+def test_transport_failed(dsh_rc, expected):
+    assert ai.transport_failed(dsh_rc) is expected
+
+
+def test_error_reason_transport_failure_prod_form():
+    # прод-форма прогона 33572445063: dsh завершился с кодом 1 (HTTP_404),
+    # answer.txt пуст — stderr в комментарий не попадает (redact/канал
+    # другой), но dsh_rc обязан переквалифицировать причину.
+    reason = ai.error_reason("", "1")
+    assert "ошибка провайдера" in reason or "транспорта" in reason
+    assert "контракт" not in reason  # не должно звучать как вина модели
+
+
+def test_error_reason_empty_answer_without_transport_error():
+    # rc=0, ответ пуст или без вердикта — это уже про модель/контракт, не про
+    # транспорт (прод-форма прогонов с rc=0 из тех же суток, например 33566547051).
+    reason = ai.error_reason("", "0")
+    assert "строки «ВЕРДИКТ" in reason
+    assert "модель ответила" in reason
+    assert "провайдера" not in reason and "транспорта" not in reason
+
+
+def test_error_reason_ambiguous_verdict_line_not_transport():
+    reason = ai.error_reason("ВЕРДИКТ: approve\nещё мысль", "0")
+    assert "не единственная" in reason or "не последняя" in reason
+    assert "провайдера" not in reason
+
+
+def test_error_reason_transport_failure_wins_over_line_check():
+    # rc≠0 обязан побеждать даже если в пустом/мусорном ответе случайно есть
+    # что-то похожее на строку вердикта — транспорт упал раньше любого текста.
+    reason = ai.error_reason("ВЕРДИКТ: approve", "1")
+    assert "ошибка провайдера" in reason
+
+
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
 
 def test_is_not_found_exact_form_only():
