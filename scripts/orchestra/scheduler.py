@@ -127,6 +127,12 @@ def open_pulls(repo: str) -> list[dict]:
 
 
 def pr_references_issue(pull: dict, issue_number: int) -> bool:
+    # Намеренно широкая семантика — ЛЮБОЕ упоминание, не только декларация
+    # (в отличие от contract_check.py, #195): используется в reap_stale ниже,
+    # чтобы не собрать замок с задачи, у которой открытый PR существует, но
+    # ссылается на неё не первой строкой. Ошибиться в сторону «не трогать» тут
+    # дешевле, чем в сторону «занята». Симметричная узкая проверка декларации —
+    # task_ref.declares_task, для решений вида «эта задача уже занята PR».
     return task_ref.references_task(pull.get("body") or "", issue_number)
 
 
@@ -407,6 +413,9 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами
     # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
+    # Намеренно любое упоминание, не только декларация (см. pr_references_issue
+    # выше, #195): слитый PR мог упомянуть смежную задачу не первой строкой —
+    # снять её замок и напомнить про закрытие безопаснее, чем оставить висеть.
     task_refs = sorted(set(task_ref.extract_task_refs(pull.get("body") or "")))
     task_numbers: list[int] = []
     for task_number in task_refs:
