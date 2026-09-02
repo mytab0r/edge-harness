@@ -32,7 +32,6 @@ import http.cookiejar
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 import urllib.error
@@ -60,6 +59,14 @@ _rl_spec = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_rl_spec)
 _rl_spec.loader.exec_module(review_labels)
 
+# Номер задачи из текста PR/issue — одно место правды (#187): границы числа
+# с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
+# 33570081734).
+_tr_spec = importlib.util.spec_from_file_location(
+    "task_ref", Path(__file__).resolve().parents[1] / "lib" / "task_ref.py")
+task_ref = importlib.util.module_from_spec(_tr_spec)
+_tr_spec.loader.exec_module(task_ref)
+
 STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
 TASK_LABEL = "task"
@@ -86,8 +93,7 @@ def open_pulls(repo: str) -> list[dict]:
 
 
 def pr_references_issue(pull: dict, issue_number: int) -> bool:
-    body = pull.get("body") or ""
-    return f"#{issue_number}" in body
+    return task_ref.references_task(pull.get("body") or "", issue_number)
 
 
 def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
@@ -296,7 +302,7 @@ def after_merge(repo: str, pull: dict) -> list[str]:
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами
     # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
-    task_refs = sorted({m.group(1) for m in re.finditer(r"#(\d+)", pull.get("body") or "")}, key=int)
+    task_refs = sorted(set(task_ref.extract_task_refs(pull.get("body") or "")))
     task_numbers: list[int] = []
     for task_number in task_refs:
         # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
