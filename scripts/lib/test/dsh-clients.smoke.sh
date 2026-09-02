@@ -332,6 +332,13 @@ HANDS_SPOOL="$AI_SMOKE/spool.ndjson" \
   run_client "ai-review" "$REPO/scripts/review/ai_dsh.sh"
 grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
   || { echo "::error::SMOKE: ai-review: ответ DSH не записан в answer.txt" >&2; exit 1; }
+# Гвардия класса «ошибка провайдера читается как нарушение контракта моделью»
+# (прогон 33572445063, PR #190): dsh_rc.txt обязан появиться на успешном пути
+# с кодом 0 — verdict (ai_review.py) отличает его от rc≠0 транспортной ошибки.
+[ -f "$AI_SMOKE/dsh_rc.txt" ] \
+  || { echo "::error::SMOKE: ai-review: dsh_rc.txt не записан — verdict не сможет отличить ошибку провайдера от плохого формата ответа" >&2; exit 1; }
+grep -qx "0" "$AI_SMOKE/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review: dsh_rc.txt ожидал '0' на успешном прогоне, получено: $(cat "$AI_SMOKE/dsh_rc.txt")" >&2; exit 1; }
 echo "SMOKE: ai-review — ок"
 
 echo "SMOKE: все клиенты целы — гвардия класса зелёная"
