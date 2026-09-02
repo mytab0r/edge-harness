@@ -223,8 +223,9 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     )
     body = findings.strip()
     if tasks:
+        close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
         blocks = "\n\n".join(
-            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{'```' * 4}" for t in tasks
+            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{close}" for t in tasks
         )
         body += (
             f"\n\nЗадачи в беклог из этого ревью — завести одной командой:\n"
@@ -338,6 +339,10 @@ def cmd_gather(args: argparse.Namespace) -> int:
         task_section=task_section(pull.get("body") or "", repo),
     )
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
+    # Переходная совместимость: bridge на main (до мержа этого PR) берёт head
+    # для сверки из meta.json; НОВЫЙ bridge берёт step-output фактов, а файл
+    # остаётся диагностическим артефактом gather. Удалить вместе со старым
+    # bridge после мержа (задача в беклоге).
     (out / "meta.json").write_text(
         json.dumps({"pr": args.pr, "head": pull["head"]["sha"]}), encoding="utf-8")
     print(f"gather: PR #{args.pr} head {pull['head']['sha'][:12]}, "
