@@ -51,6 +51,14 @@ AI_CHANGES = review_labels.AI_CHANGES
 AI_FAILED = review_labels.AI_FAILED
 AI_VERDICTS = review_labels.AI_VERDICTS
 
+# Номер задачи из текста PR/issue — одно место правды (#187): границы числа
+# с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
+# 33570081734).
+_tr_spec = importlib.util.spec_from_file_location(
+    "task_ref", SCRIPT_DIR.parent / "lib" / "task_ref.py")
+task_ref = importlib.util.module_from_spec(_tr_spec)
+_tr_spec.loader.exec_module(task_ref)
+
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
 # единственной — двусмысленность это error, а не одобрение. Модель периодически
 # оборачивает машиночитаемую строку в markdown-выделение (**…**/__…__) вопреки
@@ -248,7 +256,7 @@ def task_section(pull_body: str, repo: str) -> str:
     «не задача, ищем дальше», любой другой отказ (права, сеть, 5xx) роняет
     шаг громко — молча ревьюить без контекста задачи нельзя (silent-wrong).
     """
-    for number in sorted({int(m.group(1)) for m in re.finditer(r"#(\d+)", pull_body or "")}):
+    for number in sorted(set(task_ref.extract_task_refs(pull_body or ""))):
         try:
             issue = gh(f"repos/{repo}/issues/{number}")
         except RuntimeError as error:
