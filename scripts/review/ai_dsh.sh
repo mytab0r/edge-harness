@@ -12,7 +12,9 @@
 # (проверено живым прогоном 2026-08-30, см. worker.yml).
 #
 # Использование: AI_WORK=<каталог с prompt.md> bash scripts/review/ai_dsh.sh
-# Результат: $AI_WORK/answer.txt (ответ агента), $AI_WORK/stderr.txt.
+# Результат: $AI_WORK/answer.txt (ответ агента), $AI_WORK/stderr.txt,
+# $AI_WORK/dsh_rc.txt (код возврата dsh — единственный сигнал, различающий
+# «транспорт упал» от «дсш вернул текст»; смотри verdict в ai_review.py).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,12 +43,15 @@ timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$AI_WORK/prompt.md")"
 rc=$?
 set -e
 echo "dsh завершился с кодом $rc"
+printf '%s' "$rc" >"$AI_WORK/dsh_rc.txt"
 
-# rc≠0 НЕ роняет шаг: судьбу решает доверенный verdict-шаг по содержимому
-# ответа (пусто/битый контракт → ai:failed + красный job там). Хвост stderr —
-# для диагностики в логе, ОБЯЗАТЕЛЬНО через redact: ошибки клиента модели —
-# самое вероятное место, куда в публичный лог мог бы уехать производный
-# DEEPSEEK_API_KEY (GitHub маскирует только точное совпадение секрета).
+# rc≠0 НЕ роняет ЭТОТ шаг: судьбу решает доверенный verdict-шаг. Но rc едет
+# дальше НЕзамаскированным сигналом (dsh_rc.txt) — verdict обязан отличить
+# «транспорт упал (rc≠0)» от «дсш вернул текст не по контракту (rc=0)»,
+# иначе ошибка провайдера превращается в ложное обвинение модели (silent-wrong).
+# Хвост stderr — для диагностики в логе, ОБЯЗАТЕЛЬНО через redact: ошибки
+# клиента модели — самое вероятное место, куда в публичный лог мог бы уехать
+# производный DEEPSEEK_API_KEY (GitHub маскирует только точное совпадение секрета).
 echo "--- хвост stderr DSH ---"
 tail -c 2000 "$AI_WORK/stderr.txt" | redact || true
 exit 0
