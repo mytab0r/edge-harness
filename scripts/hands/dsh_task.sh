@@ -58,6 +58,19 @@ api_post() {
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }
 
+# Аренда задачи (#121, ADR 0006) — единственный вход в работу над issue-N:
+# scripts/lib/claim_task.py. gh-токен выдаётся ТОЛЬКО вызову аренды
+# (GH_RUN_TOKEN из workflow, contents:write нужен на refs/locks/*): он не
+# должен жить в окружении прогона DSH — класс скраба *TOKEN* (см. worker.yml),
+# поэтому после блока аренды переменная снимается, до старта агента.
+lease_cli() {
+  if [ -n "${GH_RUN_TOKEN:-}" ]; then
+    GH_TOKEN="$GH_RUN_TOKEN" python3 "$SCRIPT_DIR/../lib/claim_task.py" "$@"
+  else
+    python3 "$SCRIPT_DIR/../lib/claim_task.py" "$@"
+  fi
+}
+
 # ── Журнал-seq: один писатель — bash (клиент рук). ────────────────────────────────
 # Жизненный цикл job (job_start/bootstrap/agent_answer/stream_note/agent_error/
 # job_end) — зона ЭТОГО файла: события с уникальным journal-seq уходят в журнал
@@ -151,6 +164,38 @@ if [ -z "$TASK_TEXT" ]; then
 fi
 seq_persist
 echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
+
+# Токен аренды больше не нужен никому ниже, включая DSH: снимается до любого
+# выхода из скрипта (в окружении прогона агенту делать с ним нечего).
+unset GH_RUN_TOKEN
+
+# ── 1a. Аренда задачи (#121): заказ «поработай над issue-N» берётся только ────────
+# через атомарный claim. Без замка морда-агент мог заказать работу по задаче,
+# которую уже делает воркер, — два исполнителя на одной работе. Отказ —
+# зелёный no-op job'а (контракт #121), но журнал получает честный финал
+# task_busy + job_end: задача не должна висеть «dispatched» вечно, а «done»
+# означал бы ложь «работа сделана». Задачи без issue (manual-*) — вне пула,
+# аренды не имеют. Поломка утилиты — громкий красный job: «инструмент сломан»
+# и «задача занята» — разные состояния.
+if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
+  # CLAIM_ACTOR обязан быть валидным логином (назначение идёт им): не
+  # переопределяем — current_actor() возьмёт GITHUB_ACTOR (аккаунт,
+  # инициировавший dispatch). Канал для следа в задаче — CLAIM_VIA.
+  export CLAIM_VIA="hands $TASK_ID (run ${GITHUB_RUN_ID:-local})"
+  claim_out="$(lease_cli claim "${BASH_REMATCH[1]}" 2>&1)" && claim_rc=0 || claim_rc=$?
+  if [ "$claim_rc" -eq 1 ]; then
+    echo "Задача #${BASH_REMATCH[1]} занята другим исполнителем — зелёный no-op: $claim_out"
+    add_event "agent_error" \
+      "$(jq -n --arg t "$claim_out" '{error: "task_busy", stderr: $t}')"
+    post_job_end "fail"
+    exit 0
+  fi
+  if [ "$claim_rc" -ne 0 ]; then
+    echo "::error::claim_task сломался (rc=$claim_rc): $claim_out" >&2
+    exit 1
+  fi
+  echo "Аренда взята: $claim_out"
+fi
 
 add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
 flush_events

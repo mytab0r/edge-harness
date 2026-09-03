@@ -9,7 +9,9 @@ JSON как у GitHub API). Гонка двух claim воспроизводит
 Запуск: python -m pytest scripts/lib/test_claim_task.py -q
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -151,6 +153,16 @@ def test_claim_success_visibility_after_lock(monkeypatch):
     assert any("issues/5/comments" in c and "worker-a" in c for c in joined_calls)
 
 
+def test_claim_via_labels_channel_in_comment(monkeypatch):
+    # Все агенты — один логин: «кто держит» различается каналом (worker/hands),
+    # он обязан попасть в след в задаче, а не только в лог job'а.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    result = ct.claim("o/r", 5, "mytab0r", now=utc(12, 0), via="hands issue-5 (run 1)")
+    assert result.claimed is True
+    comment = next(c for c in server.calls if "issues/5/comments" in c)
+    assert "hands issue-5 (run 1)" in comment
+
+
 def test_claim_visibility_failure_does_not_break_ownership(monkeypatch):
     routes = dict(BASE)
     routes["issues/5/assignees"] = fail(403, "Forbidden")
@@ -277,6 +289,35 @@ def test_collect_stale_delete_failure_is_loud_not_fatal(monkeypatch):
 
 
 # ── CLI: контракт для каналов worker/hands ───────────────────────────────────────
+
+
+def test_cli_locks_prints_machine_readable_task_numbers(monkeypatch):
+    # free_task (task.sh) пропускает занятые арендой: список номеров в одну
+    # строку через пробел — без рефов и sha, чужие рефы под locks/ отфильтрованы.
+    routes = {
+        "git/matching-refs/locks/": [
+            {"ref": "refs/locks/task-5", "object": {"sha": "s5"}},
+            {"ref": "refs/locks/task-125", "object": {"sha": "s125"}},
+            {"ref": "refs/locks/weird", "object": {"sha": "x"}},  # не задача
+        ],
+        "commits/s5": {"commit": {"committer": {"date": "2026-08-31T11:00:00Z"}}},
+        "commits/s125": {"commit": {"committer": {"date": "2026-08-31T11:00:00Z"}}},
+    }
+    install(monkeypatch, FakeServer(routes))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert ct.main(["x", "locks"]) == ct.EXIT_OK
+    assert out.getvalue().split() == ["5", "125"]
+
+
+def test_cli_locks_empty_pool_prints_empty_line(monkeypatch):
+    install(monkeypatch, FakeServer({"git/matching-refs/locks/": []}))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert ct.main(["x", "locks"]) == ct.EXIT_OK
+    assert out.getvalue().strip() == ""
 
 
 def test_cli_exit_codes_contract(monkeypatch):

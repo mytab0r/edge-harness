@@ -16,7 +16,12 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # contents:write — аренда задачи (#121, ADR 0006): замок refs/locks/task-N
+  # создаётся и снимается Git-дата-API. Токен (GH_RUN_TOKEN ниже) живёт только
+  # внутри вызова аренды в dsh_task.sh и снимается до старта DSH — прав на пуш
+  # веток у агента нет. Прочее в джобе коммитов не делает, но contents:write —
+  # минимальный уровень, при котором замок вообще достижим.
+  contents: write
 
 concurrency:
   group: hands-${{ github.event.client_payload.task_id || 'manual' }}
@@ -56,4 +61,7 @@ jobs:
           # в dsh_task.sh падает громко до какой-либо дорогой работы.
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          # Аренда задачи (#121): claim_task.py создаёт refs/locks/task-N под
+          # этим токеном; dsh_task.sh снимает переменную до старта DSH.
+          GH_RUN_TOKEN: ${{ github.token }}
         run: bash scripts/hands/dsh_task.sh

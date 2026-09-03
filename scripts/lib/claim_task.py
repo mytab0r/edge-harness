@@ -15,9 +15,11 @@ ref отклоняется кодом 422 (гонка двух claim'ов выи
 наоборот, громкий RuntimeError: «инструмент сломан» и «задача занята» лечатся
 по-разному (fail loud).
 
-Каналы, которым здесь жить после #119 (worker task.sh free_task/manual,
-hands/runner-bridge): один вызов CLI — `claim_task.py claim <N>`; контракт
-вызова и точки врезки зафиксированы в #121. До #119 эти файлы не трогаются.
+Каналы (врезаны #121): worker task.sh (free_task пропускает занятые арендой
+через CLI `locks`; захват — только `claim_task.py claim <N>`, отказ — зелёный
+no-op), hands/runner-bridge (dsh_task.sh, TASK_ID=issue-N; отказ — зелёный
+no-op с честным task_busy в журнале). Другого пути начать работу над задачей
+нет: новый пайплайн зовёт тот же CLI.
 
 Обёртка gh() дублирует таковую в scripts/orchestra (pulse_guard.py, и там же
 обоснование): каждый скрипт — самостоятельная точка входа без пакетной
@@ -109,12 +111,18 @@ def is_stale(commit_date: str | datetime, now: datetime,
 # ── Claim / release ──────────────────────────────────────────────────────────────
 
 
-def claim(repo: str, task: int, actor: str, now: datetime | None = None) -> ClaimResult:
+def claim(repo: str, task: int, actor: str, now: datetime | None = None,
+          via: str = "") -> ClaimResult:
     """Атомарный захват задачи. Успех у ровно одного претендента; проигравший
     получает ClaimResult(claimed=False) и обязан закончиться зелёным no-op.
     Проигравший оставляет осиротевший коммит (ref на него не создан) — мусор
     без ссылки, безвреден; атомарность живёт в создании ref'а, раньше её
-    получить из git нечем."""
+    получить из git нечем.
+
+    actor — назначаемый следом аккаунт, ОБЯЗАН быть валидным GitHub-логином
+    (иначе назначение отклоняется и задача остаётся без исполнителя, а
+    контракт PR требует назначение). via — свободная метка канала для следа
+    в задаче (логин у всех агентов один — различает каналы именно она)."""
     now = now or datetime.now(timezone.utc)
     ref = lock_ref(task)
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
@@ -138,7 +146,8 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None) -> Clai
     # Сбой видимости замок не отменяет (откат хуже отсутствия комментария),
     # но и не глотается: warning уходит в лог job'а.
     _visibility(repo, task, actor, f"🔒 Аренда задачи: `{actor}` держит замок `{ref}` "
-                                  f"(TTL {LOCK_TTL_HOURS} ч по коммиту замка).")
+                                  f"(TTL {LOCK_TTL_HOURS} ч по коммиту замка)."
+                                  + (f" Канал: {via}." if via else ""))
     return ClaimResult(claimed=True, task=task, detail=f"замок {ref} установлен")
 
 
@@ -182,6 +191,12 @@ def _ref_missing(error: "GhError") -> bool:
 
 
 # ── Сборщик протухших замков (вызывает scheduler) ────────────────────────────────
+
+
+def locked_tasks(repo: str) -> list[int]:
+    """Номера задач под живым замком — машинный список для выбора пула
+    (free_task пропускает занятые арендой; гарантией остаётся claim)."""
+    return [lock["task"] for lock in list_locks(repo)]
 
 
 def list_locks(repo: str) -> list[dict]:
@@ -248,7 +263,8 @@ def current_actor() -> str:
 
 
 def main(argv: list[str]) -> int:
-    usage = "использование: claim_task.py claim <N> | release <N> | status"
+    usage = ("использование: claim_task.py claim <N> | release <N> | status | locks "
+             "(locks — номера задач под замком через пробел, для выбора пула)")
     if len(argv) < 2:
         print(f"::error::{usage}", file=sys.stderr)
         return EXIT_ERROR
@@ -261,10 +277,14 @@ def main(argv: list[str]) -> int:
         if command in ("claim", "release") and len(argv) == 3 and argv[2].isdigit():
             task = int(argv[2])
             if command == "claim":
-                result = claim(repo, task, current_actor())
+                result = claim(repo, task, current_actor(),
+                               via=os.environ.get("CLAIM_VIA", ""))
                 print(result.detail)
                 return EXIT_OK if result.claimed else EXIT_BUSY
             print(release(repo, task))
+            return EXIT_OK
+        if command == "locks":
+            print(" ".join(str(task) for task in locked_tasks(repo)))
             return EXIT_OK
         if command == "status":
             now = datetime.now(timezone.utc)
