@@ -31,6 +31,11 @@ AI_CHANGES = "ai:changes-requested"
 AI_FAILED = "ai:failed"
 AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 
+# ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
+# Единственное определение (было задублировано локальной константой в
+# scheduler.py) — should_update_branch ниже читает её же.
+CONFLICT_LABEL = "conflict"
+
 
 def _names(labels) -> set[str]:
     """Имена меток из любой прод-формы: список dict'ов API или множество имён."""
@@ -55,6 +60,46 @@ def merge_label_gate(labels) -> str | None:
     if AI_OK not in names:
         return f"нет вердикта {AI_OK} (ждёт AI-ревью, доработку или повтор после сбоя)"
     return None
+
+
+def should_update_branch(labels) -> bool:
+    """Газ выборочного подтягивания веток (#252): true — обновлять ветку из
+    main стоит, false — нет.
+
+    Раньше scheduler.update_remaining_pulls дёргал gh pr update-branch для
+    ВСЕХ открытых недрафт PR после каждого слияния (до 96 запусков оркестратора
+    в сутки, cron */15) — тот же вызов и для PR, отставшего в merge_queue.
+    Каждый update-branch — это push в чужую ветку → GitHub шлёт
+    pull_request:synchronize → pr-review.yml перезапускается → снимает все
+    ai:*-метки (ai_verdicts_to_drop выше) → при review:ok стартует дорогое
+    ai-review.yml. PR, которому рано сливаться (нет вердиктов, в доработке,
+    ai:changes-requested), от этого не выигрывает ничего — только теряет
+    валидный вердикт и жжёт AI-квоту вхолостую (замер #252: 142 прогона
+    ai-review.yml за 14.5 ч, из них подавляющее большинство — merge-коммиты
+    от update-branch, а не новый пуш автора).
+
+    Обновлять стоит только два случая:
+      1. оба вердикта уже зелёные (merge_label_gate(labels) is None) —
+         PR реально близок к слиянию, следующий обход merge_queue его сольёт,
+         и свежий head ему нужен;
+      2. PR уже помечен CONFLICT_LABEL — подтягивание из main может расшить
+         конфликт (только оно и способно).
+    Во всех остальных случаях (нет вердиктов, review:changes-requested,
+    ai:changes-requested, ai:failed без обоих ok) — подтягивание пропускается.
+
+    ГАЗ (обязателен, автоматический, см. AGENTS.md «тормоз без газа не
+    принимается»): предикат не хранит собственного состояния — он на лету
+    читает текущие labels PR. Как только детерминированное и AI-ревью
+    проставят оба вердикта (или mark_conflicts повесит CONFLICT_LABEL),
+    САМЫЙ СЛЕДУЮЩИЙ прогон оркестратора (update_remaining_pulls после
+    следующего слияния или behind-ветка merge_queue) увидит новые labels и
+    снова начнёт подтягивать этот PR — без ручного вмешательства. Тормоз и
+    газ — одно и то же чтение labels, разнесённое по времени.
+    """
+    names = _names(labels)
+    if CONFLICT_LABEL in names:
+        return True
+    return merge_label_gate(names) is None
 
 
 def ai_verdicts_to_drop(labels) -> list[str]:
