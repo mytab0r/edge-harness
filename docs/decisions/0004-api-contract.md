@@ -6,8 +6,9 @@
   ([спека](../../openspec/specs/journal-tasks-hands.md)), источник — сессия
   конвейера, а не DO воркера. Текст ниже — история решения, не текущее поведение.
 - **Смежное:** [ADR 0003](0003-dispatch-latency-verdict.md),
-  [тестовый стек CF](../research/22-cf-testing-toolchain.md),
-  [`scripts/check-frontend-contract.mjs`](../../cf-worker/scripts/check-frontend-contract.mjs)
+  [тестовый стек CF](../research/22-cf-testing-toolchain.md)
+  (гвардии контракта фронта жили в `cf-worker/scripts/check-frontend-contract.mjs`
+  — списано вместе с воркером, история в git)
 
 ## Инцидент, из которого выросло решение
 

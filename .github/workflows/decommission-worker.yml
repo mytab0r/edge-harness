@@ -56,12 +56,35 @@ jobs:
           [ "$(jq -r '.ok // false' /tmp/dsh-health.json)" = "true" ] || { echo "::error::Неожиданный ответ /api/health: $(cat /tmp/dsh-health.json)"; exit 1; }
           echo "Морда жива: $(jq -r '.version // "неизвестная версия"' /tmp/dsh-health.json)"
 
-      - name: Предпосылка 3 — канарейка канала конвейера (write+read)
+      # Предпосылка между мордой и каналом: замена пульса обязана ЖИТЬ до
+      # списания старого воркера. Иначе зелёный deploy-dsh-edge (ежедневный
+      # cron) удалит edge-harness, диспетчить orchestra.yml станет некому,
+      # и конвейер встанет при всех зелёных деплоях. Проверяем не HTTP 200,
+      # а взведённый будильник (next_alarm_at) — тот же критерий, что у
+      # канарейки deploy-pulse.
+      - name: Предпосылка 2b — пульс-воркер жив и взведён
+        run: |
+          curl -sS -o /tmp/pulse-health.json https://harness-pulse.mytab0r.workers.dev/api/health || true
+          deadline=$(( $(date +%s) + 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ "$(jq -r '.ok // false' /tmp/pulse-health.json 2>/dev/null)" = "true" ] \
+               && [ "$(jq -r '.next_alarm_at // "null"' /tmp/pulse-health.json 2>/dev/null)" != "null" ]; then
+              echo "Пульс жив и взведён: next_alarm_at=$(jq -r '.next_alarm_at' /tmp/pulse-health.json)"
+              exit 0
+            fi
+            sleep 3
+            curl -sS -o /tmp/pulse-health.json https://harness-pulse.mytab0r.workers.dev/api/health || true
+          done
+          echo "::error::Пульс-воркер не отвечает или будильник не взведён — списание старого воркера остановит конвейер. Отменено."
+          exit 1
+
+      - name: Предпосылка 3 — канарейка канала конвейера (write+read свежего статуса)
         env:
-          DSH_EDGE_URL: https://dsh-edge.mytab0r.workers.dev
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          : "${DSH_EDGE_URL:?vars.DSH_EDGE_URL не задан — канарейке канала некуда ходить, списание отменено}"
           : "${DSH_EDGE_ACCESS_KEY:?DSH_EDGE_ACCESS_KEY не задан — канарейка канала невозможна, списание отменено}"
           base="$DSH_EDGE_URL"
           jar="$RUNNER_TEMP/decommission.cookies"
@@ -92,14 +115,20 @@ jobs:
             --data-binary "@$RUNNER_TEMP/canary-batch.json" | jq '.appended') \
             || { echo "::error::Ingest канарейки не принят мордой"; exit 1; }
           [ "$appended" -ge 1 ] || { echo "::error::Ingest канарейки принял 0 событий"; exit 1; }
+          # Читаем ХВОСТ и ассертим СВЕЖЕСТЬ (data.run == этот прогон):
+          # страницы идут от старейших, limit=1 вернул бы самое первое
+          # событие canary из истории — со второго прогона гейт зелёный,
+          # даже если свежая запись спроецировалась сломанно.
           row=$(curl -fsS -b "$jar" \
-            "$base/api/harness/events?task_id=decommission%3Acanary&limit=1")
-          echo "Канал прочитан назад: $row"
+            "$base/api/harness/events?task_id=decommission%3Acanary&limit=50")
+          echo "Канал прочитан назад: $(jq -c '{n: (.events|length), last: .events[-1]}' <<<"$row")"
           [ "$(jq -r '.events | length' <<<"$row")" -ge 1 ] \
             || { echo "::error::Канарейка не доехала до чтения /api/harness/events — канал конвейера сломан, списание отменено"; exit 1; }
-          [ "$(jq -r '.events[0].kind' <<<"$row")" = "decommission_check" ] \
-            || { echo "::error::Прочитано не то, что писали: $(jq -c '.events[0]' <<<"$row")"; exit 1; }
-          echo "✅ Канал конвейера доказан: статус записан и прочитан через /api/harness/events без edge-harness воркера"
+          [ "$(jq -r '.events[-1].kind' <<<"$row")" = "decommission_check" ] \
+            || { echo "::error::Прочитано не то, что писали: $(jq -c '.events[-1]' <<<"$row")"; exit 1; }
+          [ "$(jq -r '.events[-1].data.run' <<<"$row")" = "${GITHUB_RUN_ID:-}" ] \
+            || { echo "::error::Хвост канала не содержит СВЕЖЕГО статуса этого прогона (${GITHUB_RUN_ID:-?}) — проекция сломана, списание отменено: $(jq -c '.events[-1]' <<<"$row")"; exit 1; }
+          echo "✅ Канал конвейера доказан: свежий статус этого прогона записан и прочитан через /api/harness/events без edge-harness воркера"
 
       - name: Удаление воркера edge-harness из CF
         env:
