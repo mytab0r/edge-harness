@@ -29,6 +29,8 @@ import importlib.util
 import sys
 import threading
 import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,6 +55,17 @@ class _LoginHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
+        # Гвардия класса #225: воспроизводим фильтр Cloudflare по подписи
+        # клиента, а не наш пересказ — библиотечный User-Agent (то, что
+        # молча подставляет urllib.request без явного addheaders) режется
+        # 403' им ДО того, как запрос доходит до логики приложения ниже.
+        user_agent = self.headers.get("User-Agent", "")
+        if user_agent.startswith("Python-urllib"):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"error code: 1010")
+            return
         if self.path == "/api/auth/login":
             self.send_response(self.status)
             if self.status == 303:
@@ -91,6 +104,37 @@ def test_login_303_succeeds_without_following_redirect(login_server, monkeypatch
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     opener = sch._morde_opener()
     sch._morde_login(opener)  # не должен бросить: 303 — это успех, не 403
+
+
+def test_morde_opener_sets_explicit_user_agent_past_cf_filter(login_server, monkeypatch):
+    # Гвардия класса #225: без явного addheaders в _morde_opener urllib.request
+    # шлёт дефолтный `Python-urllib/3.x`, который _LoginHandler режет 403'м
+    # (тем же кодом, что живая Cloudflare перед мордой) — этот тест красный,
+    # если кто-то уберёт addheaders или сотрёт MORDE_USER_AGENT.
+    _LoginHandler.status = 303
+    port = login_server.server_address[1]
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    opener = sch._morde_opener()
+    assert ("User-Agent", sch.MORDE_USER_AGENT) in opener.addheaders
+    assert not sch.MORDE_USER_AGENT.startswith("Python-urllib")
+    sch._morde_login(opener)  # не должен бросить: наш UA проходит CF-фильтр
+
+
+def test_morde_opener_without_explicit_user_agent_is_blocked_by_cf_filter(login_server):
+    # Контрольный эксперимент наоборот: голый opener БЕЗ addheaders (то есть
+    # без фикса #225) получает дефолтный Python-urllib UA и режется тем же
+    # хендлером — доказывает, что фикс не косметика, а необходимое условие.
+    _LoginHandler.status = 303
+    port = login_server.server_address[1]
+    bare_opener = urllib.request.build_opener(
+        sch._NoRedirect, urllib.request.HTTPCookieProcessor())
+    data = urllib.parse.urlencode({"accessKey": "key"}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/auth/login", data=data, method="POST")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        bare_opener.open(req, timeout=5)
+    assert excinfo.value.code == 403
 
 
 def test_login_non_303_is_loud_runtime_error(login_server, monkeypatch):
