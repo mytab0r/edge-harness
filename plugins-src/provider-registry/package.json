@@ -17,7 +17,8 @@
     "@deepseek-ai/schemastery": "3.18.1"
   },
   "files": [
-    "server/index.js"
+    "server/index.js",
+    "directory.json"
   ],
   "license": "MIT"
 }

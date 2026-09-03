@@ -42,19 +42,12 @@ const EDGE_PROVIDER = 'deepseek-official'
 const DEFAULT_MAX_TOKENS_FALLBACK = 131072
 const DEFAULT_CONTEXT_WINDOW = 262144
 
-/**
- * Directory-каталог реестра: готовые OpenAI-compat маршруты, которые кнопка
- * «Add» предлагает добавить, не набирая адрес руками. Канонические публичные
- * эндпоинты; каждый остаётся редактируемым в карточке провайдера. Состав —
- * провайдеры, названные в документах этого репозитория (runbook
- * switch-llm-provider, research/30), расширяется PR'ом.
- */
-const DIRECTORY = [
-  { route: 'zhipu', displayName: 'Z.ai (GLM)', baseURL: 'https://open.bigmodel.cn/api/paas/v4' },
-  { route: 'nvidia-nim', displayName: 'NVIDIA NIM', baseURL: 'https://integrate.api.nvidia.com/v1' },
-  { route: 'openrouter', displayName: 'OpenRouter', baseURL: 'https://openrouter.ai/api/v1' },
-  { route: 'deepseek', displayName: 'DeepSeek API', baseURL: 'https://api.deepseek.com' },
-]
+/** Directory-каталог реестра — единственное место правды: directory.json.
+ * Готовые OpenAI-compat маршруты, которые кнопка «Add» предлагает добавить,
+ * не набирая адрес руками; канонические публичные эндпоинты, каждый
+ * остаётся редактируемым в карточке. Тот же файл читают юнит-тесты,
+ * интеграционная проверка и канарейка деплоя (не дублируют список). */
+import DIRECTORY from '../directory.json' with { type: 'json' }
 
 /** Единственный протокол, который реально говорит переиспользуемый транспорт. */
 const PROTOCOLS = ['openai-completions']
@@ -216,6 +209,11 @@ export default {
       const adapter = new RegistryAdapter({
         options,
         resolveApiKey: async (connection) => {
+          // ctx.get() — ленивый доступ к опциональному сервису, в отличие от
+          // свойства ctx.<service>, которому нужен inject (гейт apply-time).
+          // Тот же паттерн у апстримного dsh-llm-deepseek (inject: ['llm'],
+          // ctx.get('credentials') внутри resolveApiKey) — он обслуживает
+          // ключи штатного провайдера этой морды с деплоя.
           const credentials = ctx.get('credentials')
           if (credentials !== undefined) {
             const hit = await credentials.resolve(connection.apiKeyEnv)

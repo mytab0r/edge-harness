@@ -221,7 +221,7 @@ jobs:
       - name: Интеграция реестра провайдеров на собранном артефакте (#114)
         if: steps.route.outputs.plugins != '0'
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
-        run: node "$GITHUB_WORKSPACE/dsh-edge/registry-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+        run: node "$GITHUB_WORKSPACE/dsh-edge/registry-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge" "$GITHUB_WORKSPACE/plugins-src/provider-registry/directory.json"
 
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
@@ -674,9 +674,10 @@ jobs:
       # готовых маршрутов — без них кнопки Settings → Models мертвы, и это
       # видно только живым RPC. Мутаций в проде канарейка не делает
       # (добавление/удаление доказано интеграцией на собранном артефакте).
-      # Список маршрутов ниже — зеркало константы DIRECTORY в
-      # plugins-src/provider-registry/server/index.js (единственное место
-      # правды о составе): меняя DIRECTORY, правь список здесь же.
+      # Состав directory-маршрутов ниже генерируется из
+      # plugins-src/provider-registry/directory.json — единственного места
+      # правды о каталоге (плюс штатный deepseek-official); списки руками
+      # не ведутся.
       - name: Канарейка реестра провайдеров (#114)
         if: success() && steps.route.outputs.plugins != '0'
         env:
@@ -698,7 +699,8 @@ jobs:
             || { echo "::error::Namespace llm-pi-ai не смонтирован на проде — кнопки Settings → Models мертвы (#114)"; exit 1; }
           rpc llm.providers '{"type":"client-request","rpcId":"canary114","method":"llm.providers","payload":{}}' \
             > "$RUNNER_TEMP/registry-providers.json"
-          for route in deepseek-official zhipu nvidia-nim openrouter deepseek; do
+          routes="deepseek-official $(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).map((x) => x.route).join(" "))' plugins-src/provider-registry/directory.json)"
+          for route in $routes; do
             jq -e --arg route "$route" '.result.value.providers[] | select(.provider == $route)' \
               "$RUNNER_TEMP/registry-providers.json" >/dev/null \
               || { echo "::error::Маршрута $route нет в llm.providers на проде (#114)"; exit 1; }

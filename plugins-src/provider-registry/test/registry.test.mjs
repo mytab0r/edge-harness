@@ -80,6 +80,7 @@ const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
 const { default: SettingsProvider } = await import('@deepseek-ai/dsh-settings');
 const { default: z } = await import('@deepseek-ai/schemastery');
 const plugin = (await import('../server/index.js')).default;
+const DIRECTORY = (await import('../directory.json', { with: { type: 'json' } })).default;
 
 // In-memory провайдер настроек: persist — no-op, write() сам кладёт раздел
 // в this.document после persist; load() возвращает текущий документ.
@@ -135,7 +136,8 @@ describe('provider-registry: монтирование', () => {
   it('directory содержит готовые маршруты, ни один не активен', async () => {
     const ctx = await mountMordre();
     const routes = directoryRoutes(ctx);
-    for (const expected of ['zhipu', 'nvidia-nim', 'openrouter', 'deepseek']) {
+    // Состав каталога — из directory.json (одно место правды), не пересказ.
+    for (const { route: expected } of DIRECTORY) {
       assert.ok(routes.includes(expected), `в directory нет ${expected}`);
     }
     assert.deepEqual(activeRoutes(ctx), [], 'ненастроенные маршруты не имеют права быть активными');
@@ -252,6 +254,31 @@ describe('provider-registry: негатив — мусор не проходит
     ], undefined);
     assert.deepEqual((await ctx.llm.listModels('zhipu')).map((m) => m.id), ['glm-4.7'],
       'клив живого чтения раздела: список моделей не обновился');
+  });
+
+  it('ключ, записанный в credential-хранилище, разрешается (ветка ctx.credentials)', async () => {
+    // Морда с credentials-сервисом (в проде — EdgeCredentialProvider: DO KV,
+    // env-фолбэк). Ход к маршруту на закрытом порту: отказ ТРАНСПОРТА, не
+    // MISSING_CREDENTIAL — значит ключ из хранилища разрешился до fetch.
+    const ctx = new Context();
+    await ctx.plugin(LlmRuntime);
+    await ctx.plugin(MemorySettingsProvider);
+    await ctx.effect(() => ctx.provide('credentials', {
+      resolve: async () => ({ value: 'stored-dummy-key-1234567890' }),
+    }), 'fixture credentials');
+    await ctx.plugin(plugin);
+    await ctx.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'zhipu'], value: { apiKeyEnv: 'ZHIPU_API_KEY', api: 'openai-completions', baseURL: 'https://127.0.0.1:9/v1', models: [{ id: 'glm-4.6' }] } },
+    ], undefined);
+    let terminal;
+    for await (const chunk of ctx.llm.stream({ provider: 'zhipu', model: 'glm-4.6', messages: [] })) {
+      terminal = chunk;
+      break;
+    }
+    assert.equal(terminal.type, 'finish');
+    assert.equal(terminal.reason.kind, 'error');
+    assert.notEqual(terminal.reason.failure.code, 'MISSING_CREDENTIAL');
+    assert.doesNotMatch(terminal.reason.failure.message, /нет API-ключа/);
   });
 
   it('ход без ключа падает громко MISSING_CREDENTIAL, не молча (сеть не вызывается)', async () => {
