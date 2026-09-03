@@ -77,7 +77,10 @@ const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index
   env: '',
   persistTo: persistedState,
   vars: {
-    DEEPSEEK_API_KEY: 'pipeline-check-unused',
+    // Фиктивное значение <20 символов: детерминированное ревью справедливо
+    // красит длинные литералы после KEY= (значение здесь не читается —
+    // интеграция не вызывает модель).
+    DEEPSEEK_API_KEY: 'ingest-check-unused',
     DSH_EDGE_ACCESS_KEY: AUTH_DUMMY,
   },
   logLevel: 'warn',
