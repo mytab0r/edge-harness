@@ -87,9 +87,10 @@ async function fetchPluginStatus(id) {
 // морды session.prompt: same-origin, владелец уже залогинен кукой воркера.
 // Заказ попадает выделенную сессию plugin-orders как обычное сообщение чата —
 // агент ведёт его по конвейеру. Задача в пул журнала (POST /api/tasks) из
-// браузера морды недостижима в принципе: журнал — другой origin (белое пятно
-// #105), кука SameSite=Strict, CORS журнал не отдаёт; путь через RPC морды —
-// единственный работающий сегодня без новых патчей и секретов.
+// браузера морды недостижима без нового патча-прокси и секретов (белое
+// пятно #105, кука SameSite=Strict, CORS журнал не отдаёт); путь через RPC
+// морды — работающий сегодня без новых патчей и секретов, перенос на задачу
+// в пул — после write-прокси (ADR 0009).
 //
 // Контракты RPC (сняты с типов @deepseek-ai/dsh-host-apiproxy 0.1.1-rc.2,
 // docs/research/12-dsh-edge-session-api.md):
@@ -106,10 +107,12 @@ async function fetchPluginStatus(id) {
 const ORDERS_SESSION_ID = "plugin-orders";
 const ORDERS_SESSION_TITLE = "Заказ плагинов";
 const ORDERS_WORKSPACE_PATH = "/workspace/edge-harness";
-// Окно дедупликации: сколько последних сообщений-заказов сессии смотреть.
-// Заказ, ушедший за окно (сессия активно переписывается), повторно отсекать
-// нельзя молча и бессмысленно запирать навсегда: окно — объявленный газ,
-// после установки плагин уходит из каталога сам (вычитание манифеста).
+// Окно дедупликации: сколько последних сообщений сессии смотреть (включая
+// ответы агента — session.history режет по всем сообщениям, не только по
+// заказам, так что заказов в окно помещается меньше 20). Заказ, ушедший за
+// окно, повторно отсекать нельзя молча и бессмысленно запирать навсегда:
+// окно — объявленный газ, после установки плагин уходит из каталога сам
+// (вычитание манифеста).
 const DEDUP_WINDOW_MESSAGES = 20;
 const ORDER_MARKER = /\[plugin-order:([a-z0-9-]+)\]/;
 
@@ -474,6 +477,11 @@ function CatalogRow({ entry, outcome, orderState, t, onOrder }) {
 // каталог объявляет «что можно заказать», манифест — «что установлено», ни
 // одна из правд не дублирует другую. Плагин из заказа попадает в манифест
 // (PR конвейера) и сам исчезает из этого списка после деплоя.
+// Гвардии сборки — ЗДЕСЬ, до первого использования констант: модульный код
+// исполняется раньше apply(), гвардия внутри apply() была бы мёртвой
+// (ревью PR #232, находка 1).
+if (!Array.isArray(MANIFEST)) throw new Error("plugin-manager: MANIFEST не массив — сборка битая");
+if (!Array.isArray(CATALOG)) throw new Error("plugin-manager: CATALOG не массив — сборка битая");
 const AVAILABLE = CATALOG.filter((entry) => !MANIFEST.some((plugin) => plugin.id === entry.id));
 
 function PluginsSection(props) {
@@ -520,16 +528,26 @@ function PluginsSection(props) {
     }
   }, []);
   useEffect(() => { void loadOrders(); }, [loadOrders]);
-  // Заказ: отказ не оставляет кнопку в «отправляется» и не притворяется
-  // успехом — ошибка секции, кнопка возвращается в «можно заказывать».
-  // Обновления функциональные: заказ с двух строк одновременно не должен
-  // затирать чужой busy/ordered состоянием из протухшего замыкания.
+  // Заказ: перед отправкой дедупликация перепроверяется (секция могла быть
+  // открыта давно, вторая вкладка могла заказать раньше): заказ уже в истории
+  // → «заказано» без повторного prompt; перепроверку выполнить не удалось →
+  // заказ НЕ отправляется вслепую (fail-closed), отказ громкий. Остаточный
+  // газ — гонка двух вкладок внутри окна перепроверки: серверной
+  // уникальности заказов нет, дубликат в этой щели возможен и виден в
+  // сессии заказов (объявлено в README/ADR). Отказ не оставляет кнопку в
+  // «отправляется» и не притворяется успехом. Обновления функциональные:
+  // заказ с двух строк одновременно не должен затирать чужой busy/ordered.
   const order = async (entry) => {
     const index = AVAILABLE.findIndex((candidate) => candidate.id === entry.id);
     if (index < 0) return;
     setOrderError(null);
     setOrderStates((states) => states.map((state, i) => (i === index ? { kind: "busy" } : state)));
     try {
+      const stillOpen = await fetchOrderedIds();
+      if (stillOpen.has(entry.id)) {
+        setOrderStates((states) => states.map((state, i) => (i === index ? { kind: "ordered" } : state)));
+        return;
+      }
       await sendOrder(entry);
       setOrderStates((states) => states.map((state, i) => (i === index ? { kind: "ordered" } : state)));
     } catch (error) {
@@ -581,8 +599,6 @@ function PluginsSection(props) {
 const inject = ["slots", "locale"];
 
 function apply(ctx) {
-  if (!Array.isArray(MANIFEST)) throw new Error("plugin-manager: MANIFEST не массив — сборка битая");
-  if (!Array.isArray(CATALOG)) throw new Error("plugin-manager: CATALOG не массив — сборка битая");
   ctx.effect(
     () => ctx.locale.register("settings.plugins", dictionaries),
     "plugin-manager: settings.plugins dictionaries",

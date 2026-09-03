@@ -247,7 +247,6 @@ const EMPTY_JOURNAL = {
   body: { events: [], has_more: false, next_after: 0 },
 }
 
-const NO_ORDERS_HISTORY = rpcStub({ value: { events: [], hasMore: false } })
 const NO_SESSION_HISTORY = rpcStub({ ok: false, code: 'session-not-found' })
 
 // ── Проверки ──────────────────────────────────────────────────────────────────
@@ -708,4 +707,113 @@ test('заказ не отправлен (prompt ok:false): громкая ош�
   const button = collectButtons(catalogListNode(sandbox.tree))[0]
   assert.equal(button.disabled, false, 'после отказа кнопка не вернулась в «можно заказывать»')
   assert.ok(!strings.includes('orderOrdered'), 'несостоявшийся заказ показан как «заказано»')
+})
+
+test('перепроверка дедупликации перед отправкой: заказ из второй вкладки отсечён', async () => {
+  const available = computeAvailable()
+  const target = available[0]
+  const rpcCalls = []
+  // При загрузке — заказов нет (кнопка активна); к моменту клика заказ уже
+  // в истории (его сделал другая вкладка/устройство).
+  let historyResponse = NO_SESSION_HISTORY
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub(EMPTY_JOURNAL),
+    rpc: async ({ method }) => {
+      rpcCalls.push(method)
+      if (method === 'session.history') return historyResponse
+      if (method === 'workspace.create') return rpcStub({ value: { workspace: { workspaceId: 'ws-1' } } })
+      return rpcStub({ value: { accepted: true } })
+    },
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  // Заказ «успел» появиться в истории, пока секция была открыта.
+  historyResponse = rpcStub({
+    value: {
+      events: [
+        { event: { type: 'user/message', seq: 2, time: 2, data: { id: 'm1', role: 'user',
+          content: [{ type: 'text', text: '[plugin-order:' + target.id + '] Заказ.' }] } } },
+      ],
+      hasMore: false,
+    },
+  })
+  collectButtons(catalogListNode(sandbox.tree))[0].onClick()
+  await flush()
+  sandbox.render()
+  const methods = rpcCalls.filter((m) => m !== 'session.history')
+  assert.deepEqual(methods, [],
+    'перепроверка пропустила заказ, уже существующий в истории — дубликат')
+  const strings = collectStrings(catalogListNode(sandbox.tree))
+  assert.ok(strings.includes('orderOrdered'), 'отсечённый заказ не показан как «заказано»')
+  assert.ok(!collectStrings(sandbox.tree).includes('orderError:'), 'отсечением назвали ошибкой')
+})
+
+test('перепроверка не удалась: заказ вслепую не отправляется (fail-closed), отказ громкий', async () => {
+  const rpcCalls = []
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub(EMPTY_JOURNAL),
+    rpc: async ({ method }) => {
+      rpcCalls.push(method)
+      if (method === 'session.history') {
+        // Первый вызов (при монтировании) успешен и пуст, второй (перепроверка) — отказ.
+        return rpcCalls.filter((m) => m === 'session.history').length === 1
+          ? NO_SESSION_HISTORY
+          : rpcStub({ ok: false, code: 'forbidden' })
+      }
+      return rpcStub({ value: { accepted: true } })
+    },
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  collectButtons(catalogListNode(sandbox.tree))[0].onClick()
+  await flush()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(!rpcCalls.includes('workspace.create'),
+    'при упавшей перепроверке заказ ушёл вслепую — silent-wrong')
+  assert.ok(strings.includes('orderError:'), 'отказ перепроверки не показан')
+  assert.ok(strings.some((text) => text.includes('forbidden')), 'код отказа не виден владельцу')
+})
+
+test('RPC не-2xx (HTTP-слой): громкая ошибка с кодом, а не тихая попытка продолжить', async () => {
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub(EMPTY_JOURNAL),
+    rpc: async ({ method }) => (method === 'session.history'
+      ? responseStub({ ok: false, status: 503, contentType: 'application/json', body: {} })
+      : rpcStub()),
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(strings.includes('dedupError:'), 'не-2xx RPC не показан как ошибка дедупликации')
+  assert.ok(strings.some((text) => text.includes('HTTP 503')), 'код HTTP не виден владельцу')
+  assert.equal(collectButtons(catalogListNode(sandbox.tree))[0].disabled, true,
+    'не-2xx RPC открыл кнопки — дедупликация не доказана')
+})
+
+test('workspace.create без workspaceId: заказ падает громко, prompt не вызывается', async () => {
+  const rpcCalls = []
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub(EMPTY_JOURNAL),
+    rpc: async ({ method }) => {
+      rpcCalls.push(method)
+      if (method === 'session.history') return NO_SESSION_HISTORY
+      return rpcStub({ value: {} })
+    },
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  collectButtons(catalogListNode(sandbox.tree))[0].onClick()
+  await flush()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(!rpcCalls.includes('session.prompt'),
+    'prompt вызван без сессии — заказ ушёл в неизвестность')
+  assert.ok(strings.includes('orderError:'), 'кривой ответ workspace.create не показан')
+  assert.ok(strings.some((text) => text.includes('без workspaceId')),
+    'причина (без workspaceId) не видна владельцу')
 })
