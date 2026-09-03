@@ -51,6 +51,7 @@
 - [0007. AI-ревью как второй гейт: своя метка ai:*, двойное условие слияния](decisions/0007-ai-review-gate.md)
 - [0008. Узкий GH_DISPATCH_TOKEN: dispatch-токен морды отделён от PAT конвейера](decisions/0008-narrow-dispatch-token.md)
 - [0009. Заказ установки плагина: RPC морды (session.prompt), не POST /api/tasks](decisions/0009-plugin-order-via-morde-rpc.md)
+- [0010. Интеграции внешних систем: REST-инструменты своим edge-плагином, не MCP-серверы](decisions/0010-integrations-edge-plugin-rest-tools.md)
 
 ## Операционные процедуры
 

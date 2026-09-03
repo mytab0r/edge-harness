@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "integrations": [
+    {
+      "id": "jira",
+      "title": "Jira",
+      "summary": "Чтение задачи из Jira Cloud: статус и комментарии (REST v3). Инструмент агента: jira_issue.",
+      "tools": ["jira_issue"],
+      "credentials": {
+        "secrets": {
+          "JIRA_BASE_URL": "адрес сайта Jira, https://<site>.atlassian.net (без /wiki и слэша на конце)",
+          "JIRA_EMAIL": "email аккаунта Atlassian, чей API token",
+          "JIRA_API_TOKEN": "API token из id.atlassian.com (Basic auth email:token)"
+        }
+      },
+      "docs": "https://developer.atlassian.com/cloud/jira/platform/rest/v3/"
+    },
+    {
+      "id": "confluence",
+      "title": "Confluence",
+      "summary": "Чтение страниц Confluence Cloud: поиск CQL и содержимое страницы. Инструмент агента: confluence_page.",
+      "tools": ["confluence_page"],
+      "credentials": {
+        "secrets": {
+          "CONFLUENCE_BASE_URL": "адрес сайта Confluence, https://<site>.atlassian.net/wiki",
+          "CONFLUENCE_EMAIL": "email аккаунта Atlassian, чей API token",
+          "CONFLUENCE_API_TOKEN": "API token из id.atlassian.com (Basic auth email:token)"
+        }
+      },
+      "docs": "https://developer.atlassian.com/cloud/confluence/rest/v1/"
+    },
+    {
+      "id": "bitbucket",
+      "title": "Bitbucket",
+      "summary": "Создание pull request в Bitbucket Cloud (REST 2.0). Инструмент агента: bitbucket_pr.",
+      "tools": ["bitbucket_pr"],
+      "credentials": {
+        "secrets": {
+          "BITBUCKET_USER": "логин Bitbucket, чей app password",
+          "BITBUCKET_APP_PASSWORD": "app password с правом pullrequest:write (Basic auth user:password)"
+        }
+      },
+      "docs": "https://developer.atlassian.com/cloud/bitbucket/rest/"
+    },
+    {
+      "id": "slack",
+      "title": "Slack",
+      "summary": "Отчёт в канал Slack (Web API chat.postMessage). Инструмент агента: slack_post.",
+      "tools": ["slack_post"],
+      "credentials": {
+        "secrets": {
+          "SLACK_BOT_TOKEN": "bot token (xoxb-…) с scope chat:write и ботом, приглашённым в канал"
+        }
+      },
+      "docs": "https://api.slack.com/methods/chat.postMessage"
+    },
+    {
+      "id": "telegram",
+      "title": "Telegram",
+      "summary": "Эскалации и отчёты раннеров владельцу (задача #91, уже работает): scripts/worker/task.sh и scripts/hands — секреты читают job'ы, морде они не нужны.",
+      "tools": [],
+      "wired": "jobs",
+      "credentials": {
+        "secrets": {
+          "TELEGRAM_BOT_TOKEN": "токен бота (уже в секретах репозитория)",
+          "TELEGRAM_CHAT_ID": "id чата владельца (уже в секретах репозитория)"
+        }
+      },
+      "docs": "https://core.telegram.org/bots/api#sendmessage"
+    }
+  ]
+}
