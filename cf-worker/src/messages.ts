@@ -25,6 +25,13 @@ const MESSAGES = {
     dispatch_not_configured: "GH_DISPATCH_TOKEN или GH_REPO не заданы; задача лежит в очереди",
     dispatch_network_failed: "GitHub API недоступен: {detail}",
     dispatch_rejected: "GitHub ответил {status} на dispatch (ожидался 204)",
+    automation_id_invalid: "id автоматизации обязан быть [a-z0-9][a-z0-9-]{0,47}",
+    automation_not_found: "Автоматизация {automation_id} не найдена",
+    automation_disabled: "Автоматизация {automation_id} выключена — webhook не порождает прогон",
+    automation_limit: "Достигнут потолок автоматизаций ({limit}) — удали лишнюю",
+    automation_config_invalid: "Конфиг автоматизации не по форме: {detail}",
+    webhook_secret_missing: "AUTOMATION_WEBHOOK_SECRET не задан: подпись webhook'ов проверить нечем, приём невозможен",
+    webhook_signature_invalid: "Подпись webhook отсутствует или неверна: нужен заголовок X-Harness-Signature: sha256=<hex HMAC-SHA256 от тела>",
     internal: "{detail}",
     // #320: тот же 500, что и internal, но с именем причины — квота DO SQLite
     // (rows_read/rows_written) на бесплатном тарифе, а не безымянная поломка.
