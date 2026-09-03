@@ -36,24 +36,35 @@ journal_post_event() {
   }
 
   # seq сеется с сервера, не с потолка: берём максимум по задаче (spec п.2).
-  # Посев — под теми же ретраями, что и пост: лежащий журнал не должен убивать
-  # вызов до постинга (под set -e первый упавший GET делал именно это).
-  # Пауза ретрая — только при сбое запроса: успешные страницы с has_more=true
-  # едут подряд без ожидания.
-  local after=0 max_seq=0 seeded=0 resp ms has_more attempt
-  for attempt in 1 2 3 4 5; do
+  # Две НЕзависимые границы (находка AI-ревью #239 — не смешивать разные
+  # отказы): УПАВШИЙ запрос расходует ретрай (до 5) с паузой; УСПЕШНАЯ
+  # страница с has_more=true просто продолжается — страниц не больше 16
+  # (история задачи растёт к хвосту, для seq надо дойти до конца).
+  # Исчерпание страниц — это НЕ «журнал недоступен», а «история длиннее
+  # потолка посева»: финальный статус красит с честной причиной, промежуточный
+  # уходит с warning'ом.
+  local after=0 max_seq=0 seeded=0 resp ms has_more attempt=0 pages=0
+  while [ "$pages" -lt 16 ]; do
     if resp=$(api "$HARNESS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256"); then
+      pages=$((pages + 1))
       ms=$(jq '[.events[].seq] | max // 0' <<<"$resp")
       if [ "$ms" -gt "$max_seq" ]; then max_seq=$ms; fi
       has_more=$(jq -r '.has_more' <<<"$resp")
       after=$(jq -r '.next_after' <<<"$resp")
       if [ "$has_more" != "true" ]; then seeded=1; break; fi
     else
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge 5 ]; then break; fi
       sleep $((attempt * 2))
     fi
   done
   if [ "$seeded" != "1" ]; then
-    local message="Журнал недоступен: не удалось засеять seq для $TASK_ID из 5 попыток"
+    local message
+    if [ "$attempt" -ge 5 ]; then
+      message="Журнал недоступен: не удалось засеять seq для $TASK_ID из 5 попыток"
+    else
+      message="История задачи $TASK_ID длиннее потолка посева (16 страниц по 256) — хвост не достигнут, seq не засеять"
+    fi
     if [ "$final" = "1" ]; then
       echo "::error::$message — финальный статус обязан доехать (fail loud)" >&2
       return 1

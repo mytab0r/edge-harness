@@ -124,6 +124,25 @@ jobs:
             [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
             echo "$sha  plugins-tgz/$asset" >> checksums.txt
             echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
+            # Срезы правды, вшитые в релизный пакет, сверяются с репо (#115):
+            # иначе правка dsh-edge/integrations.json или plugins.json без
+            # пересборки и релиза даёт зелёный деплой, который синкует секреты
+            # и пишет статусы по новому реестру, а секция UI молча показывает
+            # старый состав. integrations.json — байт-в-байт; у manifest.json
+            # plugin-manager сверяется ростер id/server/client (sha самой
+            # записи в копии пакета отстаёт по принятой самореференции).
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/integrations.json$'; then
+              tar -xOf "plugins-tgz/$asset" package/integrations.json \
+                | diff -q - "$GITHUB_WORKSPACE/dsh-edge/integrations.json" >/dev/null \
+                || { echo "::error::Реестр интеграций в релизе $asset разошёлся с dsh-edge/integrations.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1; }
+            fi
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/manifest.json$'; then
+              if ! diff \
+                <(tar -xOf "plugins-tgz/$asset" package/manifest.json | jq -S '[.plugins[] | {id, server, client}]') \
+                <(jq -S '[.plugins[] | {id, server, client}]' "$GITHUB_WORKSPACE/dsh-edge/plugins.json") >/dev/null; then
+                echo "::error::Ростер манифеста в релизе $asset разошёлся с dsh-edge/plugins.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1
+              fi
+            fi
           done < plugins.tsv
           sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
 

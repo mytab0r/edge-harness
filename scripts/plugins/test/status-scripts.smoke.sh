@@ -110,6 +110,35 @@ if ! grep -q -- '"seq": 10' "$CALLLOG"; then
   exit 1
 fi
 
+# ── История длиннее потолка посева — честная причина, а не «журнал недоступен» ─
+# Журнал отвечает ВСЕГДА has_more=true: потолок 16 страниц, ретраи не расходуются.
+: >"$CALLLOG"
+curl() {
+  local url="" method="GET" i prev=""
+  for i in "$@"; do
+    case "$i" in http*) url=$i ;; -X) method="PENDING" ;; esac
+    case "$prev" in -X) method=$i ;; esac
+    prev=$i
+  done
+  printf '%s\n' "$method $url -" >>"$CALLLOG"
+  if [ "$method" = "POST" ]; then echo '{}'; fi
+  echo '{"events":[{"id":1,"seq":5,"kind":"plugin_status","data":{}}],"has_more":true,"next_after":1}'
+}
+export -f curl
+if run_wrapper plugin_status.sh PLUGIN_ID=hello STATE=ready FINAL=1 >/dev/null 2>/tmp/seed-msg.txt; then
+  echo "::error::история длиннее потолка посева: финальный статус обязан красить (fail loud)" >&2
+  exit 1
+fi
+if ! grep -q "длиннее потолка посева" /tmp/seed-msg.txt; then
+  echo "::error::исчерпание страниц должно называться «длиннее потолка посева», а не недоступностью" >&2
+  exit 1
+fi
+if grep -q "Журнал недоступен" /tmp/seed-msg.txt; then
+  echo "::error::исчерпание страниц неверно классифицировано как «журнал недоступен»" >&2
+  exit 1
+fi
+rm -f /tmp/seed-msg.txt
+
 # ── Финальный статус при лежащем журнале красит, промежуточный — нет ──────────
 curl() { return 7; } # журнал лежит
 export -f curl
