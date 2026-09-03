@@ -26,6 +26,8 @@ runner-bridge — сузили токен, сломали конвейер. Ра
 import re
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
@@ -125,3 +127,42 @@ def test_pipeline_consumers_read_pipeline_pat():
         f"workflows без источника {PIPELINE_SECRET}: {missing} — широкий PAT "
         "потерян, пуш веток/PR/метки/диспетч воркера упадут на первом же вызове"
     )
+
+
+# ── Права токена аренды (#121, находки AI-ревью #246) ────────────────────────────
+# Класс: smoke не моделирует модель прав GitHub, поэтому дыры в правах hands.yml
+# зелёные в тестах и видны только в проде. Гвардия по тексту workflow:
+#   1. issues: write — claim() после замка назначает исполнителя и ставит след
+#      в задаче (_visibility): без этого оба вызова 403, аренда невидима
+#      человеку («кто держит» — требование #121), при зелёном job'е.
+#   2. persist-credentials: false — checkout по умолчанию пишет github.token в
+#      .git/config воркспейса, а DSH работает именно в корне чекаута: без этого
+#      агент получает токен с contents:write (инвариант «прав на пуш у агента
+#      нет» из ADR 0006 становится ложью; та же гвардия, что в worker.yml).
+
+
+def test_hands_lease_visibility_needs_issues_write():
+    text = workflow_text("hands.yml")
+    assert re.search(r"^\s*issues:\s*write\s*$", text, re.M), (
+        "hands.yml: нет issues: write — назначение и след аренды (#121) получат "
+        "403, аренда станет невидимой в задаче при зелёном job'е"
+    )
+
+
+def test_hands_checkout_does_not_persist_token():
+    # Проверка ПО СТРУКТУРЕ YAML, не подстрокой: упоминание в комментарии
+    # («persist-credentials: false ниже») не должно закрывать гвардию —
+    # поймано мутацией этой же гвардии (#246).
+    doc = yaml.safe_load(workflow_text("hands.yml"))
+    checkouts = [
+        step
+        for job in (doc.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+        if str(step.get("uses") or "").startswith("actions/checkout")
+    ]
+    assert checkouts, "hands.yml: не найден ни один checkout — структура workflow изменилась, обнови гвардию"
+    for step in checkouts:
+        assert step.get("with", {}).get("persist-credentials") is False, (
+            "hands.yml: checkout оставляет github.token в .git/config воркспейса — "
+            "DSH прочитает токен с contents:write и получит пуш (ADR 0006 «Права»)"
+        )
