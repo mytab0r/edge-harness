@@ -55,6 +55,17 @@
       },
       "server": true,
       "client": false
+    },
+    {
+      "id": "agents-tasks",
+      "package": "@edge-harness/dsh-agents-tasks",
+      "source": {
+        "release": "plugins-agents-tasks-v0.1.1",
+        "asset": "edge-harness-dsh-agents-tasks-0.1.1.tgz",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "server": false,
+      "client": true
     }
   ]
 }
