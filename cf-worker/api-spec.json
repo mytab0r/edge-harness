@@ -5,35 +5,47 @@
     {
       "name": "status",
       "path": "/api/status",
-      "methods": ["GET"],
+      "methods": [
+        "GET"
+      ],
       "auth": true,
       "summary": "Статус рук и счётчики задач. Руки живы, если heartbeat свежее порога."
     },
     {
       "name": "events",
       "path": "/api/events",
-      "methods": ["GET", "POST"],
+      "methods": [
+        "GET",
+        "POST"
+      ],
       "auth": true,
       "summary": "Журнал: POST — батч событий (идемпотентность по task_id+seq); GET — replay с пагинацией (after, limit, ?task_id=), заголовки x-has-more / x-next-after."
     },
     {
       "name": "eventsLive",
       "path": "/api/events.live",
-      "methods": ["GET"],
+      "methods": [
+        "GET"
+      ],
       "auth": true,
       "summary": "WebSocket, только на приём (гибернация). ?after=<event id> — не присылать старое. Клиентская запись закрывается кодом 1008. Требует Upgrade: websocket, иначе 400."
     },
     {
       "name": "tasks",
       "path": "/api/tasks",
-      "methods": ["GET", "POST"],
+      "methods": [
+        "GET",
+        "POST"
+      ],
       "auth": true,
       "summary": "POST — задача в очередь + repository_dispatch (без GH_DISPATCH_TOKEN — честный dispatch=not_configured); GET — последние задачи."
     },
     {
       "name": "task",
       "path": "/api/tasks/",
-      "methods": ["GET"],
+      "methods": [
+        "GET"
+      ],
       "auth": true,
       "rest": true,
       "summary": "Одна задача по id; содержит latency_ms — замер «dispatch → первый heartbeat»."
@@ -41,14 +53,19 @@
     {
       "name": "heartbeat",
       "path": "/api/heartbeat",
-      "methods": ["POST"],
+      "methods": [
+        "POST"
+      ],
       "auth": true,
       "summary": "Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms."
     },
     {
       "name": "session",
       "path": "/api/session",
-      "methods": ["POST", "DELETE"],
+      "methods": [
+        "POST",
+        "DELETE"
+      ],
       "auth": true,
       "summary": "Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed."
     },
@@ -84,14 +101,19 @@
     {
       "name": "automations",
       "path": "/api/automations",
-      "methods": ["GET"],
+      "methods": [
+        "GET"
+      ],
       "auth": true,
       "summary": "Список автоматизаций (#116) с конфигом, last_fired_ts и последним прогоном (задача со статусом из очереди). Форму конфига валидирует src/automations.ts; секция «Автоматизации» морды читает это через прокси /api/harness/*."
     },
     {
       "name": "automation",
       "path": "/api/automations/",
-      "methods": ["PUT", "DELETE"],
+      "methods": [
+        "PUT",
+        "DELETE"
+      ],
       "auth": true,
       "rest": true,
       "summary": "PUT — создать/заменить автоматизацию {automation_id} (тело {config}, жёсткая валидация, потолок LIMITS.automationsMax); DELETE — удалить. Запись конфига не запускает прогон — прогон порождают только триггеры."
@@ -99,10 +121,12 @@
     {
       "name": "webhook",
       "path": "/api/webhooks/",
-      "methods": ["POST"],
+      "methods": [
+        "POST"
+      ],
       "auth": false,
       "rest": true,
-      "summary": "Внешний webhook автоматизации (#116). Аутентификация — не кука/Bearer, а подпись X-Harness-Signature: sha256=<hex HMAC-SHA256(raw body, AUTOMATION_WEBHOOK_SECRET)>. Без подписи или с неверной — 401 и событие automation_webhook_rejected в журнале (громко). Валидная подпись + включённая автоматизация → repository_dispatch harness-automation, 202 {task_id}; секрет не задан — 500, автоматизация выключена — 409."
+      "summary": "Внешний webhook автоматизации (#116). Аутентификация — не кука/Bearer, а подпись X-Harness-Signature: sha256=<hex HMAC-SHA256(raw body, AUTOMATION_WEBHOOK_SECRET)>. Без подписи или с неверной — 401 и событие automation_webhook_rejected в журнале (громко). Валидная подпись + включённая автоматизация с trigger.type=webhook → repository_dispatch harness-automation, 202 {task_id}; секрет не задан — 500, выключена — 409 automation_disabled, не webhook-триггерная — 409 automation_not_webhook (вход не сдвигает фазу расписания). Повторная доставка отправителя — новый прогон (at-least-once)."
     }
   ]
 }

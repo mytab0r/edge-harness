@@ -137,7 +137,7 @@ const spec = {
       ],
       "auth": false,
       "rest": true,
-      "summary": "Внешний webhook автоматизации (#116). Аутентификация — не кука/Bearer, а подпись X-Harness-Signature: sha256=<hex HMAC-SHA256(raw body, AUTOMATION_WEBHOOK_SECRET)>. Без подписи или с неверной — 401 и событие automation_webhook_rejected в журнале (громко). Валидная подпись + включённая автоматизация → repository_dispatch harness-automation, 202 {task_id}; секрет не задан — 500, автоматизация выключена — 409."
+      "summary": "Внешний webhook автоматизации (#116). Аутентификация — не кука/Bearer, а подпись X-Harness-Signature: sha256=<hex HMAC-SHA256(raw body, AUTOMATION_WEBHOOK_SECRET)>. Без подписи или с неверной — 401 и событие automation_webhook_rejected в журнале (громко). Валидная подпись + включённая автоматизация с trigger.type=webhook → repository_dispatch harness-automation, 202 {task_id}; секрет не задан — 500, выключена — 409 automation_disabled, не webhook-триггерная — 409 automation_not_webhook (вход не сдвигает фазу расписания). Повторная доставка отправителя — новый прогон (at-least-once)."
     }
   ]
 };

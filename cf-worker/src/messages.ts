@@ -28,6 +28,7 @@ const MESSAGES = {
     automation_id_invalid: "id автоматизации обязан быть [a-z0-9][a-z0-9-]{0,47}",
     automation_not_found: "Автоматизация {automation_id} не найдена",
     automation_disabled: "Автоматизация {automation_id} выключена — webhook не порождает прогон",
+    automation_not_webhook: "Автоматизация {automation_id} не webhook-триггерная — вход /api/webhooks для неё закрыт",
     automation_limit: "Достигнут потолок автоматизаций ({limit}) — удали лишнюю",
     automation_config_invalid: "Конфиг автоматизации не по форме: {detail}",
     webhook_secret_missing: "AUTOMATION_WEBHOOK_SECRET не задан: подпись webhook'ов проверить нечем, приём невозможен",

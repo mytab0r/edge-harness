@@ -209,7 +209,14 @@ describe("automations: webhook", () => {
 
   it("верная подпись + включённая автоматизация — 202, задача и события прогона в журнале, last_fired проставлен", async () => {
     const id = uniqueId("hooked");
-    expect((await putAutomation(id, digestConfig())).status).toBe(201);
+    expect((
+      await putAutomation(id, {
+        enabled: true,
+        trigger: { type: "webhook" },
+        task: { kind: "digest" },
+        report: { channels: [{ type: "slack", target: "#harness" }, { type: "telegram" }] },
+      })
+    ).status).toBe(201);
     const res = await signedWebhook(id, "sha256=" + (await hmacHex(WEBHOOK_SECRET, BODY)));
     expect(res.status).toBe(202);
     const answer = await res.json<{ ok: boolean; task_id: string; dispatched: boolean }>();
@@ -230,6 +237,19 @@ describe("automations: webhook", () => {
     const row = list.automations.find((a) => a.id === id);
     expect(row?.last_fired_ts).not.toBeNull();
     expect(row?.last_run?.task_id).toBe(taskId);
+  });
+
+  it("не webhook-триггерная автоматизация — 409 automation_not_webhook: вход не сдвигает фазу расписания", async () => {
+    const id = uniqueId("sched-hook");
+    expect((await putAutomation(id, digestConfig())).status).toBe(201); // trigger: schedule
+    const before = await getJson<{ automations: { id: string; last_fired_ts: number | null }[] }>("/api/automations");
+    const res = await signedWebhook(id, "sha256=" + (await hmacHex(WEBHOOK_SECRET, BODY)));
+    expect(res.status).toBe(409);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe("automation_not_webhook");
+    const after = await getJson<{ automations: { id: string; last_fired_ts: number | null }[] }>("/api/automations");
+    expect(after.automations.find((a) => a.id === id)?.last_fired_ts).toBe(
+      before.automations.find((a) => a.id === id)?.last_fired_ts,
+    );
   });
 
   it("выключенная автоматизация — 409 automation_disabled, прогона нет", async () => {
