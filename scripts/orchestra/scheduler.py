@@ -178,14 +178,23 @@ def pr_references_issue(pull: dict, issue_number: int) -> bool:
     return task_ref.references_task(pull.get("body") or "", issue_number)
 
 
-def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
+def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, dict] | None = None) -> list[str]:
     lines = []
+    merged = merged or {}
     for issue in open_task_issues(repo):
         if not issue["assignees"]:
             continue
         if _issue_is_blocked(issue):
             continue
         number = issue["number"]
+        if number in merged:
+            # Работа уже слита — приёмку (#227, accept_merged_tasks ниже) ведёт
+            # проверяемая улика, а не «PR не появился»: без этой проверки
+            # reap_stale красноречиво врал именно так — часть задач из замера
+            # #227 (#192, #189, #187…) оказались БЕЗ исполнителя ровно потому,
+            # что их слитый PR закрылся и стал невидим для open_pulls, а через
+            # STALE_HOURS reap_stale снял назначение с неверной причиной.
+            continue
         if any(pr_references_issue(pull, number) for pull in pulls):
             continue
         timeline = gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")
@@ -1041,6 +1050,245 @@ def upstream_drift_lines(repo: str) -> list[str]:
         return [f"⚠️ сверка пина с релизами апстрима не удалась — дрейф сейчас невидим: {error}"]
 
 
+# ── Приёмка (#227): задача закрывается только по проверяемой улике ──────────────
+# Мерж доказывает PR, не готовность задачи (кейс #56/#57) — но напоминание
+# «закрой после пост-мерж проверки» (after_merge выше) адресовано исполнителю,
+# которого уже нет: разовый job воркера завершился. Здесь — исполнитель,
+# который реально вызывается: сам оркестратор, детерминированно, без диспатча
+# нового LLM-воркера. Выбор обоснован дважды: 1) большинство переходов из #243
+# («мерж есть», «проверки зелёные», «файл существует в main») — вычислимые
+# факты, не решения — заводить ради них воркер с DSH (минуты раннера + токены
+# провайдера на каждую из 33+ задач в очереди) значит платить за суждение там,
+# где хватает правила; 2) worker/task.sh занят другим агентом (PR #247) — им
+# и не место: это НЕ «взять задачу из пула», а служебный проход планировщика.
+#
+# Виды улики — по составу файлов слитого PR (classify_acceptance):
+#   deploy  — задет cf-worker/: deploy-worker.yml (не PUSH-триггер под
+#             GITHUB_TOKEN — after_merge зовёт его сам) содержит канарейку UI
+#             последним шагом (deploy-worker.yml, «Канарейка UI на проде»),
+#             так что зелёный прогон = зелёная канарейка; вторая улика —
+#             {DSH_EDGE_URL}/api/health отвечает 200 (это публичный health
+#             самой этой морды, cf-worker/src/config.ts:healthUrl).
+#   script  — обычный код/скрипты/workflow: зелёные check-runs PR — это и есть
+#             прогон с выводом, тот же критерий «красного обязательного чека»,
+#             что уже использует merge_queue/pr_bad_checks.
+#   docs    — только docs/**, openspec/**, *.md: наблюдаемого результата в
+#             рантайме по природе нет (правка не исполняется) — законный
+#             третий исход, не молчаливое закрытие: закрывается с явным
+#             обоснованием и проверкой, что заявленные файлы физически на
+#             месте в main (единственная проверяемая форма «источник правды»).
+#
+# Три исхода, ни один не тихий (см. ACCEPTANCE_*_MARKER ниже):
+#   ok/docs — комментарий с уликой (или обоснованием для docs) → issue закрыт.
+#   fail    — комментарий с причиной провала → issue НЕ закрыт, снят assignee
+#             (задача возвращается в пул на доработку), замок снят.
+#   hard failure (возможность сломана: сеть/секрет/API, не «улики нет») —
+#             задача не трогается, эскалация в WATCHDOG_ISSUE + Telegram
+#             (тот же канал, что #120/#174) — к владельцу, не по умолчанию.
+#
+# Идемпотентность провала: комментарий-маркер с номером PR ищется ПЕРЕД
+# повторной проверкой той же пары (задача, PR) — иначе красная улика спамила
+# бы тот же комментарий каждые 15 минут, пока никто не пришлёт новую работу.
+# ok/docs идемпотентны по построению: закрытый issue выходит из open_task_issues
+# и вторым проходом уже не встретится.
+
+ACCEPT_DEPLOY = "deploy"
+ACCEPT_SCRIPT = "script"
+ACCEPT_DOCS = "docs"
+
+CF_WORKER_PREFIX = "cf-worker/"
+DOC_PATH_PREFIXES = ("docs/", "openspec/")
+DOC_PATH_NAMES = {"AGENTS.md", "CLAUDE.md"}
+
+ACCEPTANCE_OK_MARKER = "[приёмка: улика]"
+ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
+ACCEPTANCE_DOCS_MARKER = "[приёмка: без наблюдаемого результата]"
+
+DSH_EDGE_HEALTH_TIMEOUT = 15
+
+
+def _is_doc_path(path: str) -> bool:
+    return path.endswith(".md") or path.startswith(DOC_PATH_PREFIXES) or path in DOC_PATH_NAMES
+
+
+def classify_acceptance(filenames: list[str]) -> str:
+    """Вид улики по составу изменённых файлов слитого PR — см. блок выше."""
+    if any(name.startswith(CF_WORKER_PREFIX) for name in filenames):
+        return ACCEPT_DEPLOY
+    if filenames and all(_is_doc_path(name) for name in filenames):
+        return ACCEPT_DOCS
+    return ACCEPT_SCRIPT
+
+
+def all_merged_pulls(repo: str, per_page: int = 100, max_pages: int = 5) -> list[dict]:
+    """Слитые PR (до max_pages*per_page штук — сейчас в репозитории порядка
+    сотни слитых, одной-двух страниц хватает с запасом на рост). Один общий
+    обход на весь прогон приёмки — дешевле, чем поиск на каждую задачу пула."""
+    pulls: list[dict] = []
+    page = 1
+    while page <= max_pages:
+        batch = gh(f"repos/{repo}/pulls?state=closed&per_page={per_page}&page={page}") or []
+        if not batch:
+            break
+        pulls.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    return [pull for pull in pulls if pull.get("merged_at")]
+
+
+def merged_pr_map(pulls: list[dict]) -> dict[int, dict]:
+    """Task#N → самый свежий слитый PR, ОБЪЯВЛЯЮЩИЙ эту задачу (task_ref.declared_tasks
+    — первая строка тела, то же соглашение, что уже применяет contract_check при
+    авто-назначении). Узкая семантика намеренно: широкая (references_task, как в
+    after_merge/reap_stale) годится для «не потерять живой PR», но не для «эта
+    работа закрывает эту задачу» — там любое упоминание в прозе ложно закрыло бы
+    чужую задачу."""
+    best: dict[int, dict] = {}
+    for pull in pulls:
+        for number in task_ref.declared_tasks(pull.get("body") or ""):
+            current = best.get(number)
+            if current is None or pull["merged_at"] > current["merged_at"]:
+                best[number] = pull
+    return best
+
+
+def deploy_evidence(repo: str, merged_at: datetime) -> tuple[str, str]:
+    """('ok'|'fail'|'pending', детали). Поднимает RuntimeError только на
+    инфраструктурный сбой (DSH_EDGE_URL не задан, /api/health недоступен) —
+    это отличается от 'fail' (улика получена и она красная)."""
+    payload = gh(f"repos/{repo}/actions/workflows/deploy-worker.yml/runs?per_page=10") or {}
+    runs = payload.get("workflow_runs", [])
+    candidate = next((r for r in runs if parse_time(r["created_at"]) >= merged_at), None)
+    if candidate is None:
+        return "pending", "deploy-worker.yml после мержа ещё не запускался"
+    if candidate.get("conclusion") is None:
+        return "pending", f"deploy-worker.yml ещё выполняется — {candidate['html_url']}"
+    if candidate["conclusion"] != "success":
+        return "fail", (f"deploy-worker.yml={candidate['conclusion']} "
+                         f"(канарейка UI — последний шаг этого джоба) — {candidate['html_url']}")
+    if not DSH_EDGE_URL:
+        raise RuntimeError("DSH_EDGE_URL не задан — /api/health не проверить")
+    req = urllib.request.Request(DSH_EDGE_URL.rstrip("/") + "/api/health")
+    try:
+        with urllib.request.urlopen(req, timeout=DSH_EDGE_HEALTH_TIMEOUT) as resp:
+            status = resp.status
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"/api/health недоступен: {error}") from error
+    if status != 200:
+        return "fail", f"деплой зелёный ({candidate['html_url']}), но /api/health вернул {status}"
+    return "ok", f"deploy-worker.yml зелёный ({candidate['html_url']}), /api/health=200"
+
+
+def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
+    """('ok'|'fail'|'pending', детали) — тот же критерий красного обязательного
+    чека, что уже применяет pr_bad_checks/merge_queue."""
+    payload = gh(f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100") or {}
+    runs = payload.get("check_runs", [])
+    if not runs:
+        return "pending", "проверки PR на head sha ещё не найдены"
+    bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+    if bad:
+        return "fail", f"красные проверки: {', '.join(bad)}"
+    return "ok", f"{len(runs)} проверок PR зелёные (прогон с выводом)"
+
+
+def docs_missing(repo: str, filenames: list[str]) -> list[str]:
+    """Файлы из тела PR, которых нет в main — редкий случай (переименовали/
+    удалили ПОСЛЕ мержа): единственная проверяемая форма критерия «источник
+    правды на месте» для правки, не имеющей наблюдаемого результата в рантайме."""
+    missing = []
+    for name in filenames:
+        try:
+            gh(f"repos/{repo}/contents/{name}?ref=main")
+        except RuntimeError:
+            missing.append(name)
+    return missing
+
+
+def accept_merged_tasks(repo: str, pool: list[dict], merged: dict[int, dict]) -> tuple[list[str], bool]:
+    """Стадия приёмки (#227) — см. блок комментариев выше. merged — карта
+    Task#N → слитый PR (merged_pr_map(all_merged_pulls(repo)), один общий
+    обход на весь прогон оркестратора, тот же, что использует reap_stale).
+    Возвращает (строки отчёта, был_ли_жёсткий_сбой): жёсткий сбой эскалируется
+    тут же на каждую затронутую задачу отдельно, но не прерывает обход
+    остальных (мерж уже состоялся, задачи независимы)."""
+    lines: list[str] = []
+    hard_failure = False
+    for issue in pool:
+        number = issue["number"]
+        pull = merged.get(number)
+        if pull is None:
+            continue
+        fail_marker = f"{ACCEPTANCE_FAIL_MARKER} PR #{pull['number']}"
+        try:
+            if issue_marker_times(repo, number, fail_marker):
+                continue  # эта пара (задача, PR) уже провалила приёмку — не спамим
+        except RuntimeError as error:
+            lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+            continue
+
+        category = None
+        try:
+            files_payload = gh(f"repos/{repo}/pulls/{pull['number']}/files?per_page=100") or []
+            filenames = [f["filename"] for f in files_payload]
+            category = classify_acceptance(filenames)
+            if category == ACCEPT_DOCS:
+                missing = docs_missing(repo, filenames)
+                if missing:
+                    state, detail = "fail", f"файлы отсутствуют в main: {', '.join(missing)}"
+                else:
+                    state, detail = "docs", f"файлы на месте в main: {', '.join(filenames)}"
+            elif category == ACCEPT_DEPLOY:
+                merged_at = parse_time(pull["merged_at"])
+                state, detail = deploy_evidence(repo, merged_at)
+            else:
+                state, detail = script_evidence(repo, pull["head"]["sha"])
+        except RuntimeError as error:
+            text = (f"🚨 #{number}: приёмка PR #{pull['number']} "
+                    f"({category or '?'}) не смогла проверить улику — возможность сломана: {error}")
+            escalation = escalate(repo, WATCHDOG_ISSUE, text)
+            lines.append(f"{text} ({escalation})")
+            hard_failure = True
+            continue
+
+        if state == "pending":
+            lines.append(f"⏳ #{number}: улика ({category}) ещё не готова — {detail}")
+            continue
+
+        if state in ("ok", "docs"):
+            marker = ACCEPTANCE_DOCS_MARKER if state == "docs" else ACCEPTANCE_OK_MARKER
+            reasoning = ("документационная правка, наблюдаемого результата по природе нет — "
+                         "закрываю с этим обоснованием"
+                         if state == "docs" else "улика получена — закрываю задачу")
+            post_issue_comment(
+                repo, number,
+                f"✅ {marker} PR #{pull['number']} ({category}): {reasoning}. {detail}.")
+            gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
+            try:
+                claim_task.release(repo, int(number))
+            except RuntimeError:
+                pass  # замка может не быть — не ошибка (см. claim_task)
+            lines.append(f"✅ #{number}: закрыта приёмкой ({category}) — {detail}")
+            continue
+
+        # state == "fail"
+        post_issue_comment(
+            repo, number,
+            f"♻️ {fail_marker} — улика ({category}) показала, что результат не достигнут: "
+            f"{detail}. Задача НЕ закрыта: нужна доработка (новый PR или правка "
+            f"существующей работы), не тихое закрытие.")
+        if issue["assignees"]:
+            who = ", ".join(a["login"] for a in issue["assignees"])
+            gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+        try:
+            claim_task.release(repo, int(number))
+        except RuntimeError:
+            pass
+        lines.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
+    return lines, hard_failure
+
+
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
@@ -1063,7 +1311,12 @@ def main() -> int:
     pulls = open_pulls(repo)
     lines.append(f"Открытых PR: {len(pulls)}")
 
-    stale_lines = reap_stale(repo, now, pulls)
+    # Одна карта Task#N → слитый PR на весь прогон (#227) — reap_stale
+    # (не путать слитый-но-непринятый PR с «PR не появился») и accept_merged_tasks
+    # ниже читают её из одного источника, без второго обхода закрытых PR.
+    merged = merged_pr_map(all_merged_pulls(repo))
+
+    stale_lines = reap_stale(repo, now, pulls, merged)
     try:
         lease_lines = claim_task.collect_stale(repo, now)
     except RuntimeError as error:
@@ -1085,7 +1338,12 @@ def main() -> int:
     # свежая выборка, что уже понадобилась trigger_ai_review выше.
     stale_ready_lines = stale_ready_pulls(repo, now, open_pulls(repo))
 
+    # Приёмка (#227): задачи, чей PR уже слит, разбираются по улике ДО подсчёта
+    # пула — свободно/в работе должно отражать уже закрытые этим же прогоном.
     pool = open_task_issues(repo)
+    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged)
+    if accept_lines:
+        pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])
     taken = len(pool) - free
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
@@ -1095,12 +1353,18 @@ def main() -> int:
     worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
 
     if (stale_lines or conflict_lines or unhealthy_lines or merge_lines or ai_retry_lines
-            or stale_ready_lines or lease_lines or conveyor_lines or worker_lines):
+            or stale_ready_lines or accept_lines or lease_lines or conveyor_lines or worker_lines):
         lines += ["", "### Действия",
                   *stale_lines, *lease_lines, *conflict_lines, *unhealthy_lines, *merge_lines,
-                  *ai_retry_lines, *stale_ready_lines, *conveyor_lines, *worker_lines]
+                  *ai_retry_lines, *stale_ready_lines, *accept_lines, *conveyor_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
+
+    # Приёмка (#227): жёсткий сбой уже эскалирован по каждой затронутой задаче
+    # внутри accept_merged_tasks — здесь только красим прогон, второй сигнал
+    # не заводим (тот же принцип, что у archive_hard_failure ниже).
+    if accept_hard_failure:
+        lines.append("🚨 приёмка: минимум одна улика не проверена из-за поломки — прогон окрашен красным")
 
     # Архив сессий раннера после мержа (#119) сломан «возможность есть, но не
     # работает» (#174) — мерж уже состоялся, откатывать нельзя и остальную
@@ -1121,7 +1385,7 @@ def main() -> int:
         return 1
 
     summary(lines)
-    return 0
+    return 1 if accept_hard_failure else 0
 
 
 if __name__ == "__main__":

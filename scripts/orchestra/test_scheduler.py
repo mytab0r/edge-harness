@@ -218,11 +218,13 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
-    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], True))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -239,16 +241,40 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
-    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать — сбоя не было"))
     assert sch.main() == 0
+
+
+def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
+    """#227: жёсткий сбой приёмки (не архива сессий) тоже красит прогон — своя
+    ветка, независимая от archive_hard_failure."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: ([], False))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(
+        sch, "accept_merged_tasks",
+        lambda repo, pool, merged: (["🚨 #227: улика не проверена"], True))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+    monkeypatch.setattr(sch, "escalate", lambda *a: "ок")
+    assert sch.main() == 1
 
 
 # pulse_guard живёт как отдельный модуль (sys.modules["pulse_guard"], тот же
@@ -319,8 +345,10 @@ class FakeGh:
         raise AssertionError(f"нет маршрута для: {joined}")
 
     def mutating_calls(self):
-        """Вызовы, меняющие состояние (POST/PUT/DELETE) — не GET."""
-        return [c for c in self.calls if c.startswith(("-X POST", "-X PUT", "-X DELETE"))]
+        """Вызовы, меняющие состояние (POST/PUT/DELETE/PATCH) — не GET. PATCH
+        добавлен приёмкой (#227): закрытие issue идёт через
+        `-X PATCH .../issues/N -f state=closed`."""
+        return [c for c in self.calls if c.startswith(("-X POST", "-X PUT", "-X DELETE", "-X PATCH"))]
 
 
 REPO = "mytab0r/edge-harness"
@@ -1403,6 +1431,9 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
              "html_url": "https://x", "display_title": "x"}]},
         "issues?state=open&labels=task": [],
         "pulls?state=open": [],
+        # Приёмка (#227): merged_pr_map(all_merged_pulls(repo)) обходит слитые
+        # PR ДО подсчёта пула — пустой пул слитых означает пустую страницу.
+        "pulls?state=closed&per_page=100&page=1": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # conveyor_gate читает историю worker.yml без фильтра status — отдельный
@@ -1432,3 +1463,359 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
 
     assert code == 0
     assert fake.mutating_calls() == [], f"холостой ход дёрнул состояние: {fake.mutating_calls()}"
+
+
+# ── Приёмка (#227): задача закрывается только по проверяемой улике ──────────────
+#
+# Фикстуры ниже — реальные ответы `gh api` по этому репозиторию (снято
+# 2026-09-03): PR #138 (задача #18, "#18\n\n…" — тело объявляет задачу первой
+# строкой, как требует task_ref.declared_tasks), PR #177 (#21), PR #163 (#78).
+# На момент инцидента #227 все три были слиты, а задачи оставались открытыми
+# без исполнителя (reap_stale успел снять assignee по неверной причине «PR не
+# появился») — сейчас #18/#21/#78 уже закрыты вручную, но тела PR и списки
+# файлов ниже — то, что реально видел бы этот код в момент инцидента.
+
+PR_138_BODY = "#18\n\nПост-мерж фиксы AI-ревьюера, вскрытые первыми живыми прогонами."
+PR_138_FILES = [
+    ".github/workflows/ai-review.yml", ".github/workflows/pr-review.yml",
+    "docs/decisions/0007-ai-review-gate.md", "docs/research/21-github-actions.md",
+    "openspec/changes/ai-review-gate/design.md", "openspec/changes/ai-review-gate/proposal.md",
+    "openspec/changes/ai-review-gate/specs/journal-tasks-hands/spec.md",
+    "openspec/changes/ai-review-gate/tasks.md", "scripts/review/ai_dsh.sh",
+    "scripts/review/ai_review.py", "scripts/review/file_tasks.py", "scripts/review/test_ai_review.py",
+]
+# Реальные check-runs головы PR #138 (aaebecbb6adf816be99ab76ab30c3de796e3ff89).
+PR_138_CHECK_RUNS = {"check_runs": [
+    {"name": "CodeQL", "conclusion": "success"},
+    {"name": "orchestra", "conclusion": "skipped"},
+    {"name": "contract", "conclusion": "success"},
+    {"name": "analyze", "conclusion": "success"},
+    {"name": "test", "conclusion": "success"},
+    {"name": "review", "conclusion": "success"},
+]}
+
+PR_177_BODY = "#21\n\n## Что сделано\n1. Добавлен npm-скрипт `dev:docker` в `cf-worker/package.json`…"
+PR_177_FILES = ["cf-worker/README.md", "cf-worker/package.json", "docs/agents/PROTOCOL.md"]
+
+PR_163_BODY = "#78\n\n## Что сделано\n\nСоздан полный дизайн плагинного механизма dsh-edge…"
+PR_163_FILES = [
+    "openspec/changes/dsh-edge-plugin-system/design.md",
+    "openspec/changes/dsh-edge-plugin-system/proposal.md",
+    "openspec/changes/dsh-edge-plugin-system/tasks.md",
+]
+
+
+def merged_pull(number, body, head_sha, merged_at):
+    return {"number": number, "state": "closed", "merged_at": merged_at,
+            "body": body, "head": {"sha": head_sha}, "labels": []}
+
+
+def files_payload(names):
+    return [{"filename": name} for name in names]
+
+
+PR138 = merged_pull(138, PR_138_BODY, "aaebecbb6adf816be99ab76ab30c3de796e3ff89", "2026-09-02T21:31:47Z")
+PR177 = merged_pull(177, PR_177_BODY, "67b23c9fb1bd43984c3a734bed569f0ae01a8d3c", "2026-09-02T17:01:28Z")
+PR163 = merged_pull(163, PR_163_BODY, "fc3e8b2ba2422e81ab23a7ebc2948d84d1f71650", "2026-09-02T20:46:31Z")
+
+
+def test_classify_acceptance_deploy_when_cf_worker_touched():
+    assert sch.classify_acceptance(PR_177_FILES) == sch.ACCEPT_DEPLOY
+
+
+def test_classify_acceptance_script_for_workflow_and_scripts():
+    assert sch.classify_acceptance(PR_138_FILES) == sch.ACCEPT_SCRIPT
+
+
+def test_classify_acceptance_docs_when_only_openspec_md():
+    assert sch.classify_acceptance(PR_163_FILES) == sch.ACCEPT_DOCS
+
+
+def test_merged_pr_map_uses_declared_task_not_prose_mention():
+    # Тело PR #138 объявляет #18 первой строкой ("#18\n\n…") — узкая семантика
+    # declared_tasks, симметричная contract_check при авто-назначении.
+    mapping = sch.merged_pr_map([PR138, PR177, PR163])
+    assert mapping[18]["number"] == 138
+    assert mapping[21]["number"] == 177
+    assert mapping[78]["number"] == 163
+    assert 999 not in mapping
+
+
+def test_merged_pr_map_keeps_most_recent_merge_for_same_task():
+    older = merged_pull(1, "#5\n\nстарая работа", "sha1", "2026-01-01T00:00:00Z")
+    newer = merged_pull(2, "#5\n\nновая работа поверх старой", "sha2", "2026-02-01T00:00:00Z")
+    mapping = sch.merged_pr_map([older, newer])
+    assert mapping[5]["number"] == 2
+
+
+class _FakeHealthResponse:
+    def __init__(self, status):
+        self.status = status
+
+    def read(self, n=-1):
+        return b'{"version":"0.8.0"}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _fake_urlopen(status):
+    def _open(req, timeout=None):
+        return _FakeHealthResponse(status)
+    return _open
+
+
+def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
+    """Деплой-класс (#21/PR #177 трогает cf-worker/): зелёный deploy-worker.yml
+    (канарейка UI — его последний шаг) + /api/health=200 → задача закрыта."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "issues/21 -f state=closed": None,
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z",
+             "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/33695471222"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
+    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой" in line and "#21" in line for line in lines)
+    assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/21") for call in fake.calls)
+    assert posted and "улика получена" in posted[0][1]
+
+
+def test_accept_merged_tasks_does_not_close_on_red_deploy(monkeypatch):
+    """Красный deploy-worker.yml (реальный прогон 17:01:31Z этого репозитория,
+    conclusion=failure) — задача НЕ закрыта, снят assignee, PATCH не вызван."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "issues/21/assignees": None,
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "failure", "created_at": "2026-09-02T17:01:31Z",
+             "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/33658508814"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+
+    assert hard_failure is False
+    assert any("не закрыта" in line and "#21" in line for line in lines)
+    assert not any(call.startswith("-X PATCH") for call in fake.calls)
+    assert any(call.startswith(f"-X DELETE repos/{REPO}/issues/21/assignees") for call in fake.calls)
+    assert posted and sch.ACCEPTANCE_FAIL_MARKER in posted[0][1]
+
+
+def test_accept_merged_tasks_closes_on_green_check_runs(monkeypatch):
+    """Скрипт-класс (#18/PR #138 — workflow+scripts, без cf-worker/): зелёные
+    check-runs головы PR — тот же критерий, что pr_bad_checks/merge_queue."""
+    fake = FakeGh({
+        "pulls/138/files": files_payload(PR_138_FILES),
+        "issues/18/comments": [],
+        "issues/18 -f state=closed": None,
+        f"commits/{PR138['head']['sha']}/check-runs?per_page=100": PR_138_CHECK_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    pool = [issue(18, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой" in line and "#18" in line for line in lines)
+    assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/18") for call in fake.calls)
+
+
+def test_accept_merged_tasks_does_not_close_on_red_check_run(monkeypatch):
+    red_runs = {"check_runs": [
+        {"name": "CodeQL", "conclusion": "success"},
+        {"name": "test", "conclusion": "failure"},
+    ]}
+    fake = FakeGh({
+        "pulls/138/files": files_payload(PR_138_FILES),
+        "issues/18/comments": [],
+        "issues/18/assignees": None,
+        f"commits/{PR138['head']['sha']}/check-runs?per_page=100": red_runs,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(18, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+
+    assert hard_failure is False
+    assert any("провалена" in line and "#18" in line for line in lines)
+    assert not any(call.startswith("-X PATCH") for call in fake.calls)
+    assert posted and "test" in posted[0][1]
+
+
+def test_accept_merged_tasks_closes_docs_only_with_no_observable_result(monkeypatch):
+    """Докс-класс (#78/PR #163 — только openspec/**/*.md): третий, законный
+    исход из требований #227 — закрыт с явным обоснованием «улики по природе
+    нет», не спутан с deploy/script веткой (свой маркер, своя причина)."""
+    fake = FakeGh({
+        "pulls/163/files": files_payload(PR_163_FILES),
+        "issues/78/comments": [],
+        "issues/78 -f state=closed": None,
+        **{f"contents/{name}?ref=main": {"name": name.rsplit('/', 1)[-1]} for name in PR_163_FILES},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(78, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой" in line and "#78" in line for line in lines)
+    assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/78") for call in fake.calls)
+    assert posted and sch.ACCEPTANCE_DOCS_MARKER in posted[0][1]
+
+
+def test_accept_merged_tasks_does_not_close_docs_when_file_missing_from_main(monkeypatch):
+    """Заявленный файл пропал из main (переименован/удалён после мержа) —
+    улика (пусть и «улики по природе нет») получить не удалось: провал, не
+    тихое закрытие."""
+    fake = FakeGh({
+        "pulls/163/files": files_payload(PR_163_FILES),
+        "issues/78/comments": [],
+        "issues/78/assignees": None,
+        f"contents/{PR_163_FILES[0]}?ref=main": {"name": "design.md"},
+        f"contents/{PR_163_FILES[1]}?ref=main": {"name": "proposal.md"},
+        f"contents/{PR_163_FILES[2]}?ref=main": RuntimeError("gh api contents: 404 Not Found"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(78, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+
+    assert hard_failure is False
+    assert not any(call.startswith("-X PATCH") for call in fake.calls)
+    assert any("провалена" in line and "#78" in line for line in lines)
+
+
+def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkeypatch):
+    """Возможность ЕСТЬ, но сломана (DSH_EDGE_URL не задан) — не путать с
+    «улики нет»: эскалация к владельцу, задача не тронута (не закрыта и не
+    возвращена в пул молча под видом провала)."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z", "html_url": "https://x"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "")  # не задан — деплой-джоб есть, health не проверить
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
+
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+
+    assert hard_failure is True
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+
+
+def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch):
+    """Провал уже сообщён этой же паре (задача, PR) — второй прогон не должен
+    снова дёргать files/check-runs/комментарий: иначе конвейер спамил бы тот
+    же результат каждые 15 минут, пока не придёт новая работа."""
+    fail_marker = f"{sch.ACCEPTANCE_FAIL_MARKER} PR #138"
+    fake = FakeGh({
+        "issues/18/comments": [{"created_at": "2026-09-02T22:00:00Z", "body": f"♻️ {fail_marker} — было плохо"}],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
+
+    pool = [issue(18, assignees=())]  # уже без исполнителя — как после первого провала
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+
+    assert hard_failure is False
+    assert lines == []
+    assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100"]  # только чтение маркера
+
+
+def test_accept_merged_tasks_zero_calls_when_no_task_has_merged_pr(monkeypatch):
+    """Холостой ход стадии приёмки отдельно от main(): пул непуст, но ни одна
+    задача не упомянута ни в одном слитом PR — ни одного вызова gh вовсе
+    (не только мутирующего)."""
+    fake = FakeGh({})  # любой вызов — AssertionError, доказывает нулевой обход
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать"))
+
+    pool = [issue(999, assignees=("mytab0r",)), issue(1000, assignees=())]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})  # #18 не в пуле
+
+    assert lines == []
+    assert hard_failure is False
+    assert fake.calls == []
+
+
+# ── reap_stale (#227): слитая-но-непринятая задача — не «PR не появился» ────────
+
+
+def test_reap_stale_skips_task_covered_by_merged_pr(monkeypatch):
+    """Мутация видна прямым сравнением с тестом ниже: без параметра merged
+    reap_stale снял бы assignee с #21, хотя PR #177 давно слит — именно этот
+    класс дал часть замера #227 (assigned=False у #192/#189/#187…)."""
+    old_assigned = [{"event": "assigned", "created_at": "2026-08-01T00:00:00Z"}]
+    fake = FakeGh({
+        "issues?state=open&labels=task": [issue(21, assignees=("mytab0r",))],
+        "issues/21/timeline?per_page=100": old_assigned,
+    })
+    patch_gh(monkeypatch, fake)
+    now = datetime.now(timezone.utc)
+
+    lines = sch.reap_stale(REPO, now, [], merged={21: PR177})
+
+    assert lines == []
+    assert fake.mutating_calls() == []
+
+
+def test_reap_stale_still_reaps_when_not_covered_by_merged_pr(monkeypatch):
+    """Контроль к тесту выше (доказательство мутацией без правки прод-кода):
+    то же самое назначение, но #21 отсутствует в merged — старое поведение
+    (снять assignee, «PR не появился») обязано сработать. Если бы guard в
+    reap_stale был снят/сломан, этот тест остался бы зелёным, а тест выше —
+    покраснел бы: пара тестов вместе и есть доказательство мутацией."""
+    old_assigned = [{"event": "assigned", "created_at": "2026-08-01T00:00:00Z"}]
+    fake = FakeGh({
+        "issues?state=open&labels=task": [issue(21, assignees=("mytab0r",))],
+        "issues/21/timeline?per_page=100": old_assigned,
+        "issues/21/assignees": None,
+        "issues/21/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    now = datetime.now(timezone.utc)
+
+    lines = sch.reap_stale(REPO, now, [], merged={})
+
+    assert len(lines) == 1 and "просрочена" in lines[0]
+    assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/21/assignees") for c in fake.calls)
