@@ -373,7 +373,8 @@ test('статусы: последнее plugin_status побеждает; бе�
       journalCalls.push({ url: String(url), init })
       const taskId = String(url).match(/[?&]task_id=([^&]+)/)
       const id = decodeURIComponent(taskId ? taskId[1] : '').replace(/^plugin:/, '')
-      // Записи каталога в этом тесте — пустой журнал (их статусы проверяются ниже).
+      // Записи каталога и плагины сверх явно заданных выше (агенты-задачи и
+      // далее) в этом тесте — пустой журнал (их статусы проверяются ниже).
       const response = responses.get(id) ?? EMPTY_JOURNAL
       return responseStub(response)
     },
