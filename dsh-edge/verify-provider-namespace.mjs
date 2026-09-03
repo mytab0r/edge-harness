@@ -40,7 +40,14 @@ function walkFiles(dir) {
   return out
 }
 
-const files = walkFiles(distDir)
+let files
+try {
+  files = walkFiles(distDir)
+} catch (error) {
+  // Нет каталога/нет доступа — громкий отказ в формате деплоя, не сырой стек.
+  process.stderr.write(`::error::Не удалось обойти ${distDir}: ${error instanceof Error ? error.message : String(error)}. Деплой остановлен.\n`)
+  process.exit(1)
+}
 let hits = []
 for (const path of files) {
   // Только UTF-8-декодируемые файлы: бандлы и HTML текстовые, шрифты — нет.

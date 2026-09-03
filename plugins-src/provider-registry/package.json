@@ -1,6 +1,6 @@
 {
   "name": "@edge-harness/dsh-plugin-provider-registry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "dsh-edge edge plugin: the provider registry of the morde served through the native Settings -> Models UI (settings namespace llm-pi-ai, directory of ready OpenAI-compatible routes, one reused DeepSeekAdapter per configured route)",
   "type": "module",
   "main": "server/index.js",
