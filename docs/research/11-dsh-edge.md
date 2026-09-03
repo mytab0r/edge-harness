@@ -51,7 +51,7 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
 
 Семь пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
 
-Уточнение при реализации #80 (пин `113a969` = release 0.7.1): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
+Уточнение при реализации #80 (пин `113a969` = release 0.7.1, поднят задачей #134 до `b9a8ddd` = release 0.8.0): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
 
 | Пакет | Что чинит |
 |---|---|
@@ -172,7 +172,7 @@ const MAX_REPLAY_RESPONSE_BYTES = 1_048_576
 
 - **Нативные бинари, фоновые процессы, PTY, произвольное Linux-поведение — недоступны** (README:117). Это же заявлено модели в системном промпте: `agent.ts:8-12` — "The shell is just-bash, not Linux".
 - **Сеть из команд** — "no network command" в direct-режиме (README:201).
-- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184). Портирован только Web Search с 30-секундным таймаутом tool-call.
+- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184), верно на пине 0.7.1. Release 0.8.0 (бамп #134) добавил ограниченный `web_fetch` (bounded public fetching: запрет встроенных credentials, IP-литералов и local-скоупов, лимиты на длину URL/байты ответа/редиректы/время) — не проверялось живьём после бампа, факт из release notes апстрима. Портирован также Web Search с 30-секундным таймаутом tool-call — тот же лимит теперь общий для обоих инструментов.
 - **Не портированы**: filesystem editor tools, MCP, skills, workflows, jobs, **subagents** (README:125).
 - Нет HMR и локального boot-профиля (README:121); нет session-log export и локальных host-плагинов (README:26).
 - Нет регистрации, базы пользователей, ролей, мультитенантного роутинга (README:127) — жёстко один DO с именем `owner`, вход по одному высокоэнтропийному секрету воркера, обмениваемому на подписанную 30-дневную HttpOnly `SameSite=Strict` куку.
