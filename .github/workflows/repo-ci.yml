@@ -93,6 +93,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_task_ref.py -q
 
+      # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
+      # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
+      # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает
+      # ТОЛЬКО declared_tasks (первая строка тела), не любое упоминание номера
+      # в прозе PR (класс #187/#195). Кормится реальным телом PR #181.
+      - name: Тесты выбора свободной задачи free_task
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_free_task.py -q
+
       # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
       # (fine-grained, морда) упоминает только deploy-worker.yml и синх
       # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)

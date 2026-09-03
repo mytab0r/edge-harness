@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Автономный воркер (задача #89): воплощение docs/agents/WORKER-PLAYBOOK.md.
 # Здесь ТОЛЬКО транспорт и отчётность: выбрать свободную задачу из пула, взять
-# её в атомарную аренду (claim_task, #121), создать ветку agent/N-slug,
-# накормить DSH headless промптом (тело задачи + playbook + критерий),
-# проверить результат (открытый PR) и отчитаться (комментарий в задачу +
-# Telegram). Работу над задачей делает DSH — этот скрипт за него ничего
-# не решает и не пишет.
+# её в атомарную аренду (claim_task, #121), создать ветку agent/N-slug (либо,
+# если на задачу уже открыт PR без исполнителя — #245, довести его: чекаут
+# существующей ветки, без второй ветки/PR), накормить DSH headless промптом
+# (тело задачи + playbook + критерий), проверить результат (открытый PR) и
+# отчитаться (комментарий в задачу + Telegram). Работу над задачей делает
+# DSH — этот скрипт за него ничего не решает и не пишет.
 #
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
@@ -114,34 +115,35 @@ telegram_report() { # $1 — текст
   fi
 }
 
-# Свободная задача: открыта, метка task, без assignee И без открытого PR,
-# ссылающегося на неё (playbook «Конвейер задачи» п.1: PR появляется раньше,
-# чем контракт успеет авто-назначить автора), И без живой аренды (#121).
-# Печатает «номер<TAB>заголовок».
-# Коды: 0 — нашла; 1 — пул пуст; 2 — сломался инструмент (gh/jq/сеть):
+# Свободная задача: открыта, метка task, без assignee и без живой аренды
+# (#121). Открытый PR сам по себе больше НЕ исключает задачу (класс #245,
+# ранее совпадал с классом #187/#195 — скан любого упоминания номера в прозе
+# PR вместо декларации): единственное место правды на критерий свободы —
+# python scripts/lib/free_task.py, чтобы bash не заводил третью расходящуюся
+# копию regex рядом с task_ref.py и contract_check.py. Печатает
+# «номер<TAB>заголовок» старейшей свободной задачи.
+# Коды: 0 — нашла; 1 — пул пуст; 2 — сломался инструмент (gh/python/сеть):
 # «пусто» и «сломано» — разные состояния, смешивать запрещено (fail loud).
 free_task() {
-  local taken candidates number title locked
-  taken=$(gh pr list --state open --limit 100 --json body \
-    | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') || return 2
+  local issues_file locked line rc
+  issues_file="$WORK/pool-issues.json"
+  gh issue list --label task --state open --limit 100 --json number,assignees,title \
+    >"$issues_file" || return 2
   # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
   # канал (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
   # остаётся атомарный claim ниже. Сломался список замков — сломан инструмент
   # (2), а не «пул пуст» (1).
   locked=$(lease_cli locks) || return 2
-  candidates=$(gh issue list --label task --state open --limit 100 --json number,assignees,title \
-    | jq -r '.[] | select((.assignees | length) == 0) | [.number, .title] | @tsv' \
-    | sort -n) || return 2
-  # sort -n обязателен:/issues API отдаёт по убыванию новизны, и без сортировки
-  # воркер брал СВЕЖАЙШУЮ задачу (косметику), а не старейшую в пуле.
-  while IFS=$'\t' read -r number title; do
-    [ -n "$number" ] || continue
-    case " $taken " in *" $number "*) continue ;; esac
-    case " $locked " in *" $number "*) continue ;; esac
-    printf '%s\t%s\n' "$number" "$title"
-    return 0
-  done <<<"$candidates"
-  return 1
+  # oldest-free сам сортирует по номеру (issues API отдаёт по убыванию
+  # новизны — без сортировки воркер брал бы свежайшую задачу, не старейшую)
+  # и фильтрует замки из locked.
+  set +e
+  line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" oldest-free "$issues_file" "$locked")
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then printf '%s\n' "$line"; return 0; fi
+  if [ "$rc" -eq 1 ]; then return 1; fi
+  return 2
 }
 
 # ── 1. Выбор задачи ────────────────────────────────────────────────────────────────
@@ -154,14 +156,8 @@ if [ -n "$TASK_INPUT" ]; then
     || die "На задаче #$number нет метки task — это не задача пула"
   # Проверка «занята не воркером по assignee» удалена (#121): все агенты — один
   # логин, она не могла сработать никогда. Занятость видит атомарный claim.
-  # Открытый PR на задачу — она уже делается: второй PR контракт не пропустит,
-  # а одноимённая ветка на remote сделает пуш невыполнимым.
-  taken=$(gh pr list --state open --limit 100 --json body \
-    | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') \
-    || die "не смог прочитать открытые PR (gh/jq/сеть)"
-  case " $taken " in *" $number "*)
-    die "На задачу #$number уже есть открытый PR — доводить его, а не открывать второй" ;;
-  esac
+  # Открытый PR на задачу больше не отклоняется здесь (#245) — символично с
+  # авто-выбором, см. шаг 1b: декларирующий PR без исполнителя ведёт к доводке.
 else
   free_rc=0
   ISSUE_LINE=$(free_task) || free_rc=$?
@@ -169,7 +165,7 @@ else
     echo "Свободных задач нет — воркеру нечего делать, job зелёный"
     exit 0
   fi
-  [ "$free_rc" -eq 0 ] || die "выбор свободной задачи сломался (gh/jq/сеть), rc=$free_rc"
+  [ "$free_rc" -eq 0 ] || die "выбор свободной задачи сломался (gh/python/сеть), rc=$free_rc"
   number=${ISSUE_LINE%%$'\t'*}
   ISSUE_JSON=$(gh issue view "$number" --json number,title,body,state,assignees,labels) \
     || die "Задача #$number исчезла между выбором и чтением"
@@ -177,6 +173,34 @@ fi
 title=$(jq -r '.title' <<<"$ISSUE_JSON")
 body=$(jq -r '.body // ""' <<<"$ISSUE_JSON")
 echo "Задача #$number: $title"
+
+# ── 1b. Режим: новая ветка или доводка существующего PR (#245) ────────────────────
+# Открытый PR больше не блокирует выбор задачи и не отказывает молча: задача
+# без исполнителя, но с уже открытым PR — сигнал «довести» (сценарий
+# scheduler.py::unhealthy_pulls, снявшего исполнителя с нездорового PR), не
+# «пропустить». Одно место правды на объявление PR задачи —
+# scripts/lib/task_ref.py::declared_tasks через scripts/lib/free_task.py,
+# то же самое, что использует contract_check.py — симметрично для явного
+# входа --task и для авто-выбора free_task(). Атомарная защита от гонки
+# каналов на этот же PR — claim ниже (шаг 4), не эта проверка.
+gh pr list --state open --limit 100 --json number,body,headRefName \
+  >"$WORK/pool-prs.json" || die "не смог прочитать открытые PR (gh/jq/сеть)"
+set +e
+pr_line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" declared-pr "$number" "$WORK/pool-prs.json")
+pr_rc=$?
+set -e
+if [ "$pr_rc" -ne 0 ] && [ "$pr_rc" -ne 1 ]; then
+  die "проверка открытого PR задачи #$number сломалась (gh/python/сеть)"
+fi
+CONTINUE_PR_NUMBER=""
+CONTINUE_HEAD_REF=""
+if [ "$pr_rc" -eq 0 ]; then
+  CONTINUE_PR_NUMBER=${pr_line%%$'\t'*}
+  CONTINUE_HEAD_REF=${pr_line#*$'\t'}
+  [ -n "$CONTINUE_HEAD_REF" ] \
+    || die "PR #$CONTINUE_PR_NUMBER объявляет задачу #$number, но headRefName пуст — доводить нечего"
+  echo "На задачу #$number уже открыт PR #$CONTINUE_PR_NUMBER (ветка $CONTINUE_HEAD_REF) — довожу его, новый не открываю"
+fi
 
 # ── 2. Промпт: тело задачи + критерий + playbook + маршрут протокола ──────────────
 PLAYBOOK_FILE="$SCRIPT_DIR/../../docs/agents/WORKER-PLAYBOOK.md"
@@ -191,13 +215,24 @@ criterion=$(awk '
 slug=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' | tr -cs 'A-Za-z0-9' '-' \
   | sed -e 's/-\{2,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-30)
 [ -n "$slug" ] || slug=worker
-BRANCH="agent/$number-$slug"
+
+# Ветка и текст маршрута зависят от режима (1b): доводка существующего PR
+# получает свою ветку и запрет на второй PR, новая задача — прежний текст.
+if [ -n "$CONTINUE_PR_NUMBER" ]; then
+  BRANCH="$CONTINUE_HEAD_REF"
+  route_intro="Текущий каталог — корень клона репозитория. На задачу #$number уже открыт PR #$CONTINUE_PR_NUMBER на ветке $BRANCH — шаг ниже уже сделал checkout именно на неё, новую ветку НЕ создавай и не переключайся с неё. git и gh авторизованы под учёткой владельца ($WORKER_LOGIN): git push, комментарии в задачах и работа с PR работают. Прямой пуш в main отклоняется молча — пушь именно $BRANCH и проверяй результат push без -q."
+  route_pr_step="PR #$CONTINUE_PR_NUMBER уже открыт на эту задачу — НЕ открывай второй, контракт его отклонит. Прочитай gh pr view $CONTINUE_PR_NUMBER --comments и последний вердикт (метка ai:changes-requested / красный обязательный чек), исправь по нему и запушь в ту же ветку $BRANCH (git push — ветка уже отслеживает origin, -u не нужен)."
+else
+  BRANCH="agent/$number-$slug"
+  route_intro="Текущий каталог — корень клона репозитория. Ты уже на ветке $BRANCH, созданной от свежего origin/main; НЕ переключай и не пересоздавай ветку. git и gh авторизованы под учёткой владельца ($WORKER_LOGIN): git push, комментарии в задачах и создание PR работают. Прямой пуш в main отклоняется молча — пушь ветку и проверяй результат push без -q."
+  route_pr_step="Открой PR в main: gh pr create --base main --head $BRANCH --title \"…\" --body-file <файл>. Первая строка тела PR — ровно \"#$number\". Разделы: Что сделано / Чем доказано (видимый результат, а не «шаг success») / Пост-мерж проверка / Чек-лист. Closes/Fixes/Resolves ЗАПРЕЩЕНЫ — контракт отклонит такой PR."
+fi
 
 {
   cat <<PROMPT
 Ты — автономный воркер-агент репозитория edge-harness на одноразовом раннере GitHub Actions (Ubuntu, неинтерактивная среда). Владелец делегировал все решения: вопросов задавать некому — решай сам по правилам ниже.
 
-Текущий каталог — корень клона репозитория. Ты уже на ветке $BRANCH, созданной от свежего origin/main; НЕ переключай и не пересоздавай ветку. git и gh авторизованы под учёткой владельца ($WORKER_LOGIN): git push, комментарии в задачах и создание PR работают. Прямой пуш в main отклоняется молча — пушь ветку и проверяй результат push без -q.
+$route_intro
 
 # Задача #$number: $title
 
@@ -211,7 +246,7 @@ $criterion
 1. Прочитай docs/INDEX.md и относящиеся к задаче спеки/research. Архитектурное предложение — только после docs/research/30-rejected-alternatives.md.
 2. Сделай задачу: минимальный правильный дифф, тесты, саморевью (секреты, мёртвый код, расхождение доков с кодом, вызовы переименованных функций по всему репо).
 3. Закоммить осмысленными коммитами (git add -A; git commit) и запушь: git push -u origin $BRANCH — проверь вывод пуша. При «main уехал» — git fetch и git rebase origin/main.
-4. Открой PR в main: gh pr create --base main --head $BRANCH --title "…" --body-file <файл>. Первая строка тела PR — ровно "#$number". Разделы: Что сделано / Чем доказано (видимый результат, а не «шаг success») / Пост-мерж проверка / Чек-лист. Closes/Fixes/Resolves ЗАПРЕЩЕНЫ — контракт отклонит такой PR.
+4. $route_pr_step
 5. Упёрся в то, что есть только у владельца (секрет вне хранилища, доступ, деньги, необратимое внешнее действие), — единственная эскалация: комментарий в задачу #$number (что нужно и почему не сам) + метка blocked (gh issue edit $number --add-label blocked), PR не открывай, работу останови. Это законный исход запуска.
 6. Финальный ответ в stdout — краткий отчёт: ссылка на PR или причина отказа/эскалации.
 
@@ -278,8 +313,19 @@ else
   echo "::warning::HANDS_TOKEN/HARNESS_URL не заданы — пульс живости выключен, зависание видно только по таймауту"
 fi
 
-# ── 5. Ветка от свежего origin/main: канонический вход scripts/git/task-branch ───
-"$SCRIPT_DIR/../git/task-branch" "$number-$slug"
+# ── 5. Ветка: новая от свежего origin/main, либо чекаут существующего PR (#245) ──
+if [ -n "$CONTINUE_PR_NUMBER" ]; then
+  git fetch origin "$BRANCH"
+  git checkout -B "$BRANCH" "origin/$BRANCH"
+  git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
+  # Та же гвардия свежести, что ставит task-branch: следующий коммит на этой
+  # ветке обязан быть впереди актуального origin/main, иначе pre-commit велит
+  # git rebase origin/main — свежесть базы не предполагается, а доказывается.
+  git config core.hooksPath .githooks
+  echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) чекаутнута для доводки: $(git rev-parse --short HEAD)"
+else
+  "$SCRIPT_DIR/../git/task-branch" "$number-$slug"
+fi
 
 # Коммиты агента атрибутируются владельцу: noreply-адрес привязан к аккаунту.
 gh_user_id=$(gh api "users/$WORKER_LOGIN" --jq .id)

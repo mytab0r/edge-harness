@@ -105,7 +105,19 @@ STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
 TASK_LABEL = "task"
 CONFLICT_LABEL = "conflict"
+# Эскалация playbook (task.sh: `gh issue edit $number --add-label blocked`) —
+# «нужен владелец», назначение при этом намеренно остаётся. reap_stale и
+# unhealthy_pulls обязаны пропускать такую задачу: иначе снятие исполнителя
+# по таймеру возвращает задачу в пул, oldest_free/scheduler снова выбирают её
+# как старейшую, пульс диспатчит воркера на то же самое блокирующее условие —
+# вечный цикл без газа (замер AI-ревью PR #247, 2026-09-03). Газ — тот же, что
+# у самой метки (docs/agents/LABELS.md): владелец снимает `blocked` вручную.
+BLOCKED_LABEL = "blocked"
 MERGE_METHOD = "squash"
+
+
+def _issue_is_blocked(issue: dict) -> bool:
+    return BLOCKED_LABEL in {label["name"] for label in issue.get("labels") or []}
 
 
 def summary(lines: list[str]) -> None:
@@ -140,6 +152,8 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     lines = []
     for issue in open_task_issues(repo):
         if not issue["assignees"]:
+            continue
+        if _issue_is_blocked(issue):
             continue
         number = issue["number"]
         if any(pr_references_issue(pull, number) for pull in pulls):
@@ -636,6 +650,8 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     lines = []
     for issue in open_task_issues(repo):
         if not issue["assignees"]:
+            continue
+        if _issue_is_blocked(issue):
             continue
         number = issue["number"]
         referencing = [pull for pull in pulls if pr_references_issue(pull, number)]
