@@ -2,8 +2,10 @@
 
 Агентский харнес, у которого **морда живёт всегда, а руки поднимаются по требованию**.
 
-- **Морда** — SPA на Cloudflare Workers Assets. Работает круглосуточно, стоит ноль.
-- **Мозг** — Durable Object с SQLite: журнал сессий, очередь задач, heartbeat рук.
+- **Морда** — dsh-edge на Cloudflare (нативный DSH UI): чат с агентом, сессии
+  раннеров и канал статусов конвейера в хранилище Durable Object.
+- **Пульс** — минимальный инфра-воркер [`cf-pulse/`](cf-pulse/README.md): диспетч
+  оркестратора и самообновление морды (#73).
 - **Руки** — job в GitHub Actions, поднимается по `repository_dispatch`, живёт минуты,
   делает работу над этим репозиторием и умирает.
 
@@ -33,12 +35,13 @@ Containers, Dynamic Workers и WebSocket-туннеля.
 - сессии агентов видны в морде **dsh-edge** — живом DSH UI на Cloudflare
   (сборка из исходников с плагинами, [`dsh-edge/`](dsh-edge/PATCHES.md)): транскрипт
   хода работы дописывается туда из раннера ([#119](https://github.com/mytab0r/edge-harness/issues/119));
-- скелетный транспорт (морда+журнал [`cf-worker/`](cf-worker/README.md), `hands`) остаётся
-  входом в конвейер; из чата dsh-edge делегирование в раннер — плагин runner-bridge
-  (упирается в блок GitHub API из egress CF, [задача #133](https://github.com/mytab0r/edge-harness/issues/133)).
+- делегирование в раннер из чата dsh-edge — плагин runner-bridge; статусы конвейера
+  (деплой, жизненный цикл job) пишутся в сессию-конвейер морды и читаются через
+  `/api/harness/events` ([#86](https://github.com/mytab0r/edge-harness/issues/86)):
+  прежний воркер edge-harness списан, его функции переехали в морду и пульс-воркер.
 
 Карта потоков и зависимостей — [`docs/agents/ROADMAP.md`](docs/agents/ROADMAP.md);
-дальше — ротация учёток (порт ProviderChain) и миграция функций воркера в плагин dsh-edge.
+дальше — ротация учёток (порт ProviderChain, #158) и форж плагинов в раннере (#268).
 
 ## Правила
 

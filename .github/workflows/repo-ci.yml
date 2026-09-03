@@ -104,7 +104,7 @@ jobs:
           python -m pytest scripts/lib/test_free_task.py -q
 
       # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
-      # (fine-grained, морда) упоминает только deploy-worker.yml и синх
+      # (пульс-воркер, cf-pulse) упоминает только deploy-pulse.yml и синк
       # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)
       # — на GH_PIPELINE_PAT. Регресс «подсел на dispatch-токен» красит CI,
       # а не молча ломает конвейер следующим сужением. Доказана мутацией:
@@ -148,6 +148,11 @@ jobs:
         with:
           node-version: 24
 
+      # Решение самообновления морды (#73) и константы пульс-воркера (#86):
+      # чистая логика без сети (node --test со штатным type stripping).
+      - name: Тесты пульс-воркера cf-pulse
+        run: node --test cf-pulse/test/*.test.ts
+
       # Юнит-контракт спула (tasks.md dsh-streaming §1): фикстура — настоящий
       # Session.append над @deepseek-ai/dsh-session (tarball ставится с пином
       # целостности прямо в тесте), обрыв строки читается как torn tail.
@@ -187,11 +192,25 @@ jobs:
           done
           echo "bash ok"
 
-      # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
-      # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
-      # проводка scripts/lib/journal_status.sh — тихий пропуск статуса на деплое.
-      - name: Smoke обёрток статусов журнала
+      # Обёртки статусов канала конвейера (#86, бывший журнал) исполняются целиком
+      # на заглушках: bash -n не ловит «удалил определение при живом вызове»
+      # (класс Б1 #119), а сломанная проводка scripts/lib/dsh-edge-pipeline.sh —
+      # тихий пропуск статуса на деплое.
+      - name: Smoke обёрток статусов канала конвейера
         run: bash scripts/plugins/test/status-scripts.smoke.sh
+
+      # Гвардия списания журнала (#86): edge-harness воркер удалён из CF — его
+      # канал (HARNESS_URL + HANDS_TOKEN) не имеет права вернуться в активный
+      # код тихо. Исключения — сами гвардии (repo-ci и decommission: они
+      # упоминают имена, чтобы ловить возврат). Захотел вернуть журнал —
+      # правь гвардию сознательно, вместе с местом правды канала.
+      - name: Гвардия списания журнала — HARNESS_URL/HANDS_TOKEN вне активного кода
+        run: |
+          if grep -rn --exclude=repo-ci.yml --exclude=decommission-worker.yml "HARNESS_URL\|HANDS_TOKEN" .github/workflows scripts cf-pulse plugins-src dsh-edge 2>/dev/null; then
+            echo "::error::Ссылки на HARNESS_URL/HANDS_TOKEN в активном коде: журнал edge-harness списан (#86), потребители обязаны ходить в канал конвейера морды (DSH_EDGE_URL + /api/harness/events)"
+            exit 1
+          fi
+          echo "Гвардия списания журнала: активный код чист"
 
       # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
       # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на

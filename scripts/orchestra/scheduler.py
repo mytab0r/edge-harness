@@ -434,13 +434,21 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     hard_failure = False
     number = pull["number"]
     files = gh(f"repos/{repo}/pulls/{number}/files?per_page=100")
-    if any((f["filename"] or "").startswith("cf-worker/") for f in files):
-        subprocess.run(
-            ["gh", "workflow", "run", "deploy-worker.yml", "--ref", "main"],
-            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
-            check=True,
-        )
-        lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
+    # Деплой-диспетчи после мержа (#86): push от GITHUB_TOKEN триггеры не создаёт,
+    # поэтому деплои после слияния дёргаются здесь явно. Список (пути → workflow)
+    # — единое место правды проводки «что изменилось → что деплоить».
+    deploy_targets = (
+        (("dsh-edge/", "plugins-src/"), "deploy-dsh-edge.yml", "морда dsh-edge"),
+        (("cf-pulse/",), "deploy-pulse.yml", "пульс-воркер"),
+    )
+    for prefixes, workflow, what in deploy_targets:
+        if any((f["filename"] or "").startswith(prefixes) for f in files):
+            subprocess.run(
+                ["gh", "workflow", "run", workflow, "--ref", "main"],
+                capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+                check=True,
+            )
+            lines.append(f"🚀 {workflow} запущен ({what}; push от GITHUB_TOKEN триггеры не создаёт)")
     # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами

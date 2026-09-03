@@ -24,7 +24,8 @@ REPO="$(cd "$SMOKE_DIR/../../.." && pwd)"
 TMP="$(mktemp -d)"
 CALLLOG="$TMP/calls.log"
 : >"$CALLLOG"
-JOURNAL_CAPT="$TMP/journal-events.ndjson"   # каптурка POST /api/events curl-заглушки
+PIPELINE_CAPT="$TMP/pipeline-events.ndjson"  # каптурка ingest'ов сессии конвейера (#86)
+export PIPELINE_CAPT
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -67,22 +68,17 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
     */api/auth/session)
       body='{"authenticated":true}' ;;
     */ingest)
-      local count
-      count=$(command jq -s 'length' <"$data_file" 2>/dev/null || echo 0)
-      log_call "MORDE-INGEST $url events=$count"
-      body="{\"appended\":$count,\"lastSeq\":$count}" ;;
-    *journal.test/api/events*)
-      if [ "$have_post" -eq 1 ]; then
-        log_call "JOURNAL-POST /api/events"
-        # Тело батча каптурируется: events.jsonl клиент очищает после флаша,
-        # состав job_start/job_end проверяется по каптурке, не по файлу клиента.
-        printf '%s\n' "${data_str:-}" >>"${CALLLOG%/*}/journal-events.ndjson"
-        body='{"ok":true}'
-      else
-        body='{"events":[],"has_more":false,"next_after":0}'
+      local count session
+      session="${url##*/api/sessions/}"; session="${session%/ingest}"
+      count=$(command jq '.events | length' <"$data_file" 2>/dev/null || echo 0)
+      log_call "MORDE-INGEST $session events=$count"
+      body="{\"appended\":$count,\"lastSeq\":$count}"
+      # Сессия конвейера (#86): батчи каптурируются целиком — состав
+      # job_start/job_end/task_busy проверяется по каптурке.
+      if [ "$session" = "harness-pipeline" ]; then
+        command cat "$data_file" >>"${PIPELINE_CAPT:?PIPELINE_CAPT не задан}" 2>/dev/null || true
+        printf '\n' >>"$PIPELINE_CAPT"
       fi ;;
-    */api/heartbeat*)
-      body='{"ok":true}' ;;
     *morde.test/api/*)
       local m="${url##*morde.test/api/}"
       log_call "MORDE-RPC $m"
@@ -314,9 +310,6 @@ chmod +x "$TMP/bin/gh"
 # ── Окружение клиентов ────────────────────────────────────────────────────────────
 export DSH_EDGE_URL="https://morde.test"
 export DSH_EDGE_ACCESS_KEY="smoke-access-key-at-least-32-bytes-long!!"
-export HANDS_URL="https://journal.test"
-export HARNESS_URL="https://journal.test"
-export HANDS_TOKEN="smoke-hands-token"
 export DEEPSEEK_API_KEY="smoke-deepseek-key"
 # ФИКСТУРА теста, не дефолт прода (#153): dsh_require_provider_env требует
 # непустых значений, значение здесь произвольно и не читается как источник
@@ -324,7 +317,6 @@ export DEEPSEEK_API_KEY="smoke-deepseek-key"
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
 export DRAIN_INTERVAL_SECS="1"
-export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
 export PATH="$TMP/bin:$PATH"
 export -f curl gh dsh pnpm timeout log_call
@@ -352,7 +344,7 @@ assert_not_log() { # SUBSTR MESSAGE — отрицательный ассерт 
 # вызова» и «замок ещё не взят» честны только на пустом состоянии.
 scenario_start() { # [SEED_REF...] — замки, живые ДО запуска клиента
   : >"$CALLLOG"
-  rm -f "$JOURNAL_CAPT"
+  rm -f "$PIPELINE_CAPT"
   : >"$SMOKE_STATE/locks"
   for ref in "$@"; do printf '%s\n' "$ref" >>"$SMOKE_STATE/locks"; done
 }
@@ -385,19 +377,19 @@ GH_RUN_TOKEN="smoke-run-token" \
 
 assert_log "MORDE-RPC session.create" "hands: сессия морды не создана"
 assert_log "MORDE-RPC session.rename" "hands: сессия морды не названа"
-assert_log "MORDE-INGEST" "hands: транскрипт не уехал в морду"
-assert_log "JOURNAL-POST /api/events" "hands: журнал не получил жизненный цикл job"
+assert_log "MORDE-INGEST harness-123" "hands: транскрипт не уехал в сессию раннера"
+assert_log "MORDE-INGEST harness-pipeline" "hands: жизненный цикл job не уехал в канал конвейера (#86)"
 # Аренда взята до работы (#121): замок создан, назначение и след — после него.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "hands: аренда issue-123 не взята"
 assert_log "GH-API-ASSIGN issue-123" "hands: задача не назначена при claim"
-# Состав батчей — по каптурке curl-заглушки: events.jsonl клиент очищает после
-# каждого принятого флаша (flush_events), к моменту ассертов он пуст.
-grep -qE '"kind": *"job_start"' "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands: в журнале нет job_start" >&2
-       echo "--- каптурка журнала ---" >&2; cat "$JOURNAL_CAPT" 2>&1 >&2; exit 1; }
-grep -qE '"kind": *"job_end"' "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands: в журнале нет job_end" >&2; exit 1; }
-grep -qE '"result": *"ok"' "$JOURNAL_CAPT" \
+# Состав канала конвейера — по каптурке curl-заглушки: батчи job_start/job_end
+# обязаны доехать в сессию harness-pipeline (текст рекорда — JSON-экранирован).
+grep -qF '\"kind\":\"job_start\"' "$PIPELINE_CAPT" \
+  || { echo "::error::SMOKE: hands: в канале конвейера нет job_start" >&2
+       echo "--- каптурка канала ---" >&2; cat "$PIPELINE_CAPT" >&2; exit 1; }
+grep -qF '\"kind\":\"job_end\"' "$PIPELINE_CAPT" \
+  || { echo "::error::SMOKE: hands: в канале конвейера нет job_end" >&2; exit 1; }
+grep -qF '\"result\":\"ok\"' "$PIPELINE_CAPT" \
   || { echo "::error::SMOKE: hands: job_end не ok" >&2; exit 1; }
 echo "SMOKE: hands — ок"
 
@@ -431,16 +423,19 @@ GH_RUN_TOKEN="smoke-run-token" \
   run_client "hands-busy" "$REPO/scripts/hands/dsh_task.sh"
 assert_not_log "GH-API-LOCK-CREATE" "hands-busy: замок создан поверх чужого — атомарности нет"
 assert_not_log "GH-API-ASSIGN" "hands-busy: назначение при отказе аренды"
-assert_not_log "MORDE-RPC" "hands-busy: сессия в морде создана при отказе аренды"
-grep -q 'task_busy' "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands-busy: в журнале нет task_busy — отказ не виден" >&2
-       cat "$JOURNAL_CAPT" >&2; exit 1; }
-grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands-busy: job_end не fail — задача повиснет dispatched" >&2
-       cat "$JOURNAL_CAPT" >&2; exit 1; }
-if grep -qE '"kind": *"job_start"' "$JOURNAL_CAPT"; then
+# Отказ аренды — честный финал в канале конвейера (#86): task_busy + job_end
+# видны на таймлайне, работа при этом НЕ начиналась (нет job_start и нет
+# сессии транскрипта harness-123).
+assert_not_log "MORDE-INGEST harness-123" "hands-busy: транскрипт пишется при отказе аренды"
+grep -qF 'task_busy' "$PIPELINE_CAPT" \
+  || { echo "::error::SMOKE: hands-busy: в канале конвейера нет task_busy — отказ не виден" >&2
+       cat "$PIPELINE_CAPT" >&2; exit 1; }
+grep -qF '\"result\":\"fail\"' "$PIPELINE_CAPT" \
+  || { echo "::error::SMOKE: hands-busy: job_end не fail — отказ невиден на таймлайне" >&2
+       cat "$PIPELINE_CAPT" >&2; exit 1; }
+if grep -qF '\"kind\":\"job_start\"' "$PIPELINE_CAPT" 2>/dev/null; then
   echo "::error::SMOKE: hands-busy: job_start при отказе аренды — работа начата" >&2
-  cat "$JOURNAL_CAPT" >&2
+  cat "$PIPELINE_CAPT" >&2
   exit 1
 fi
 echo "SMOKE: hands-busy — ок"

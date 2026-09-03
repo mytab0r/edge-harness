@@ -112,8 +112,9 @@ Job не получает graceful-сигнала «доработай»: он t
 
 Секрет `GH_DISPATCH_TOKEN` (репо и воркер) — **fine-grained PAT только на этот
 репозиторий: Contents RW + Actions RW**. Actions нужен не для
-repository_dispatch, а потому, что пульс морды тем же токеном зовёт
-**workflow_dispatch** оркестратора и деплоя dsh-edge (см. ниже). Всё, чему
+repository_dispatch, а потому, что пульс-воркер (`cf-pulse`, #86) тем же
+токеном зовёт **workflow_dispatch** оркестратора и деплоя dsh-edge
+(см. ниже). Всё, чему
 нужно шире (пуш веток, PR, метки, issues, update-branch), читает отдельный
 широкий `GH_PIPELINE_PAT` — разделение гвардится тестом
 `scripts/lib/test_dispatch_token_usage.py` в CI.
@@ -121,7 +122,9 @@ repository_dispatch, а потому, что пульс морды тем же �
 Отличие классического PAT от fine-grained по проводку: REST-ответ под classic
 PAT несёт заголовок `X-OAuth-Scopes` со списком скоупов (проверено живым
 запросом 2026-08-31), под fine-grained заголовка нет. На этом построена гвардия
-узости в `deploy-worker.yml`. **Не подтверждено:** появится ли какой-нибудь
+узости — с #86 в `deploy-pulse.yml` (до того — в списанном deploy-worker.yml,
+причём безусловной, без армирующей переменной). **Не подтверждено:** появится ли
+какой-нибудь
 `X-OAuth-Scopes` у fine-grained при будущих изменениях GitHub — гвардия
 проверяет ровно отсутствие заголовка и красит деплой при его наличии.
 

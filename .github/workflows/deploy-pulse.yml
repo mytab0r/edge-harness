@@ -1,0 +1,114 @@
+# Деплой пульс-воркера harness-pulse (#86): alarm-диспетч orchestra.yml и
+# самообновление морды (#73) переехали сюда из списываемого воркера
+# edge-harness. Дизайн — openspec/changes/edge-harness-decommission/design.md,
+# код — cf-pulse/. Требует секретов CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+# и GH_DISPATCH_TOKEN; без них job падает с явной ошибкой.
+name: deploy-pulse
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cf-pulse/**"
+      - ".github/workflows/deploy-pulse.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Проверка секретов
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DISPATCH: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          missing=0
+          for pair in "CLOUDFLARE_API_TOKEN:$CF_TOKEN" "CLOUDFLARE_ACCOUNT_ID:$CF_ACCOUNT" "GH_DISPATCH_TOKEN:$DISPATCH"; do
+            name=${pair%%:*}
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::Секрет ${name} не задан. Деплой невозможен: задай его в Settings → Secrets → Actions."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      # Гвардия узости GH_DISPATCH_TOKEN (задача #6, ADR 0008) — из
+      # списываемого deploy-worker.yml переехала БЕЗ двухфазности: здесь она
+      # безусловная (жёсткая), армирующая переменная GH_DISPATCH_TOKEN_KIND не
+      # читается — узкий токен в секрете уже давно, и деплой пульса обязан
+      # останавливаться при возврате широкого PAT, а не предупреждать.
+      # Классический PAT помечает свои скоупы заголовком X-OAuth-Scopes
+      # (проверено живым запросом 2026-08-31), у fine-grained его нет — по
+      # отсутствию заголовка и отличаем.
+      - name: Гвардия узости GH_DISPATCH_TOKEN
+        env:
+          TOKEN_VALUE: ${{ secrets.GH_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          headers=$(mktemp)
+          code=$(curl -sS -o /dev/null -D "$headers" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN_VALUE" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: edge-harness-deploy" \
+            "https://api.github.com/repos/$REPO")
+          if [ "$code" != "200" ]; then
+            rm -f "$headers"
+            echo "::error::GH_DISPATCH_TOKEN не читает этот репозиторий: GET /repos/$REPO → $code"
+            exit 1
+          fi
+          if grep -qi '^x-oauth-scopes:' "$headers"; then
+            scopes=$(grep -i '^x-oauth-scopes:' "$headers" | tail -1 | cut -d' ' -f2-)
+            rm -f "$headers"
+            echo "::error::GH_DISPATCH_TOKEN — классический PAT (X-OAuth-Scopes: $scopes), ожидается fine-grained с Contents+Actions только на этот репозиторий (ADR 0008, задача #6)"
+            exit 1
+          fi
+          rm -f "$headers"
+          echo "GH_DISPATCH_TOKEN: fine-grained (X-OAuth-Scopes отсутствует), репозиторий читается — гвардия пройдена"
+
+      # GH_REPO — var воркера из github.repository: имя репозитория диспетча
+      # живёт в конфигурации, не в коде (тест cf-pulse гвардит отсутствие зашитого).
+      - name: Деплой
+        working-directory: cf-pulse
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          npx --yes wrangler@4 deploy --var "GH_REPO:${{ github.repository }}" 2>&1 | tail -8
+
+      # Секрет воркера: тот же узкий токен (put идемпотентен, значение в лог не печатается).
+      - name: Секрет диспетча воркера (GH_DISPATCH_TOKEN)
+        working-directory: cf-pulse
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          printf '%s' "$GH_DISPATCH_TOKEN" | npx --yes wrangler@4 secret put GH_DISPATCH_TOKEN
+
+      # Канарейка: деплой обязан оставить ЖИВОЙ пульс, а не просто 200.
+      # GET /api/health прокидывается в DO; первый запрос создаёт объект, и
+      # конструктор закладывает первый тик асинхронно — поэтому ждём момент,
+      # когда health ОТДАСТ взведённый будильник (next_alarm_at), а не мгновенно.
+      # Будильник не взведён за 60 с — деплой красный: конвейер остался бы без
+      # пульса оркестрации (silent-wrong).
+      - name: Канарейка «пульс взведён»
+        run: |
+          # curl в цикле — с || true: одиночный сетевой промах обязан тратить
+          # попытку, а не ронять шаг мимо 60-с дедлайна, под который цикл писался.
+          curl -sS -o /tmp/pulse-health.json https://harness-pulse.mytab0r.workers.dev/api/health || true
+          deadline=$(( $(date +%s) + 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ "$(jq -r '.ok // false' /tmp/pulse-health.json 2>/dev/null)" = "true" ] \
+               && [ "$(jq -r '.next_alarm_at // "null"' /tmp/pulse-health.json 2>/dev/null)" != "null" ]; then
+              echo "✅ harness-pulse жив, пульс взведён: next_alarm_at=$(jq -r '.next_alarm_at' /tmp/pulse-health.json)"
+              exit 0
+            fi
+            sleep 3
+            curl -sS -o /tmp/pulse-health.json https://harness-pulse.mytab0r.workers.dev/api/health || true
+          done
+          echo "::error::Будильник пульса не взведён за 60 с: $(cat /tmp/pulse-health.json 2>/dev/null || echo "<ответа нет>")"
+          exit 1

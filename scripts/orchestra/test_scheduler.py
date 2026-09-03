@@ -671,6 +671,46 @@ def test_after_merge_wires_update_remaining_pulls(monkeypatch):
     assert calls == [(1, [other])]
 
 
+def test_after_merge_dispatches_deploys_by_touched_paths(monkeypatch):
+    # Деплой-диспетчи (#86): push от GITHUB_TOKEN триггеры не создаёт, поэтому
+    # after_merge обязан сам дёргать деплой морды (dsh-edge/**, plugins-src/**)
+    # и пульс-воркера (cf-pulse/**) по тронутым путям. Регресс «правка манифеста
+    # смержена, а морда не задеплоена» красится здесь, а не ждёт владельца.
+    merged = pull(1)
+    monkeypatch.setattr(sch, "gh", FakeGh({"pulls/1/files": []}))
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: [])
+    runs = []
+    monkeypatch.setattr(sch.subprocess, "run",
+                         lambda cmd, **k: runs.append(cmd[3]) or _Completed())
+    monkeypatch.setattr(sch, "gh", FakeGh({"pulls/1/files": [
+        {"filename": "dsh-edge/plugins.json"}, {"filename": "scripts/lib/x.sh"},
+    ]}))
+    sch.after_merge(REPO, merged, [])
+    assert runs == ["deploy-dsh-edge.yml"]
+
+    runs.clear()
+    monkeypatch.setattr(sch, "gh", FakeGh({"pulls/1/files": [
+        {"filename": "cf-pulse/src/index.ts"},
+    ]}))
+    sch.after_merge(REPO, merged, [])
+    assert runs == ["deploy-pulse.yml"]
+
+    runs.clear()
+    monkeypatch.setattr(sch, "gh", FakeGh({"pulls/1/files": [
+        {"filename": "docs/INDEX.md"},
+    ]}))
+    sch.after_merge(REPO, merged, [])
+    assert runs == []  # docs-only мерж деплоев не зажигает
+
+
+def _Completed():
+    # Заглушка результата subprocess.run: check=True требует returncode == 0.
+    import types
+    done = types.SimpleNamespace()
+    done.returncode = 0
+    return done
+
+
 # ── Гвардия холостого хода (критерий приёмки, пункт 4) ───────────────────────────
 # Пустая очередь (нет PR, нет задач) — ни одного мутирующего вызова gh ни от
 # одного из трёх поведений и от main() целиком. Это САМАЯ важная гвардия:

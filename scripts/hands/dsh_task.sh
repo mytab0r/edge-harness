@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Клиент рук (dsh-in-job слайс 1 + dsh-streaming слайс 2): задача из журнала →
-# DSH headless → сессия в морде dsh-edge (#119). Контракт журнала —
-# openspec/specs/journal-tasks-hands.md, дизайн стрима —
-# openspec/changes/dsh-streaming/design.md, шов морды — openspec/changes/runner-sessions-in-dsh-morde/.
-# Правила: fail loud, без silent-wrong; heartbeat — доказательство живости процесса,
-# а не прогресса DSH; улика прогресса — транскрипт сессии в морде (плагин
-# dsh-hands-streamer пишет NDJSON-спул, этот клиент дренирует его в DSH-сессию
-# через scripts/lib/dsh-edge-session.sh). МЕХАНИЗМ ОДИН: журнал транскрипт
-# больше не получает — только жизненный цикл job (замещает стрим #112).
+# Клиент рук (dsh-in-job слайс 1 + runner-sessions #119 + канал конвейера #86):
+# текст задачи из payload диспетча → DSH headless → сессия в морде dsh-edge.
+# Два канала морды, оба через scripts/lib/dsh-edge-session.sh (ingest, патч 0004):
+#   - сессия раннера harness-<id>: полный транскрипт хода работы (спул стримера);
+#   - сессия конвейера harness-pipeline: жизненный цикл job (job_start/bootstrap/
+#     agent_answer/agent_error/job_end) — заменяет журнал edge-harness (#86),
+#     читается назад через /api/harness/events (патч 0005).
+# Правила: fail loud, без silent-wrong; улика прогресса — транскрипт сессии в
+# морде; ноль событий транскрипта при успешном прогоне — красный job (#119).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,25 +18,24 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest, архив.
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Канал конвейера (#86): жизненный цикл job → сессию harness-pipeline.
+# shellcheck source=scripts/lib/dsh-edge-pipeline.sh
+source "$SCRIPT_DIR/../lib/dsh-edge-pipeline.sh"
 # Аренда задачи (#121): claim/release/locks — единственный вход в работу.
 # shellcheck source=scripts/lib/lease.sh
 source "$SCRIPT_DIR/../lib/lease.sh"
 
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 DRAIN_INTERVAL_SECS="${DRAIN_INTERVAL_SECS:-1}"
-CURL_CONNECT_TIMEOUT=5
-CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле вешал бы клиент до конца job
 
-: "${HANDS_URL:?HANDS_URL не задан}"
-: "${HANDS_TOKEN:?HANDS_TOKEN не задан}"
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или manual-<run_id>)}"
+: "${TASK_TEXT:?TASK_TEXT не задан (client_payload.task_text диспетча или inputs.task_text ручного прогона)}"
 # Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
 # зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
-# в блоке обязательных переменных — ДО heartbeat, dsh_edge_login и создания
-# сессии в морде: иначе конфиг-ошибка даёт пустую сессию в UI морды и задачу,
+# в блоке обязательных переменных — ДО dsh_edge_login и создания сессий в морде:
+# иначе конфиг-ошибка даёт пустые сессии в UI морды и задачу,
 # помеченную провалом, вместо честного «не сконфигурировано».
 dsh_require_provider_env || exit 1
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
@@ -44,82 +43,45 @@ WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"
 ANSWER_FILE="$WORK/answer.txt"
 ERR_FILE="$WORK/stderr.txt"
-EVENTS_FILE="$WORK/events.jsonl"
-START_MARK="$WORK/.start-mark"
 SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина dsh-hands-streamer
-SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
-: >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
+: >"$ANSWER_FILE"; : >"$ERR_FILE"
 
-api() {
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
-    -H "Authorization: Bearer $HANDS_TOKEN" "$@"
-}
-api_post() {
-  local path=$1 body=$2
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
-    -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
-    -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
-}
-
-# ── Журнал-seq: один писатель — bash (клиент рук). ────────────────────────────────
-# Жизненный цикл job (job_start/bootstrap/agent_answer/stream_note/agent_error/
-# job_end) — зона ЭТОГО файла: события с уникальным journal-seq уходят в журнал
-# edge-harness. Транскрипт сессии (drain спула) сюда не ходит — он в морду через
-# scripts/lib/dsh-edge-session.sh и на SEQ не влияет. seq_load — передача
-# нумерации, если какой-то цикл временно заберёт писательство (точка возврата).
-SEQ=0
-seq_persist() { printf '%s\n' "$SEQ" >"$SEQ_FILE"; }
-seq_load() { SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo "$SEQ"); }
-
+# ── Жизненный цикл job → канал конвейера (#86) ────────────────────────────────────
+# Журнал edge-harness списан: события жизненного цикла уходят в сессию
+# harness-pipeline морды (статусы видны в чате). dsh_edge_ingest применяет redact
+# на пути в морду; джобный канал, как и транскрипт, требует живой морды.
 add_event() { # kind json_data
-  SEQ=$((SEQ + 1))
-  seq_persist
-  printf '{"seq":%s,"kind":"%s","ts":%s,"data":%s}\n' \
-    "$SEQ" "$1" "$(date -u +%s000)" "${2:-null}" >>"$EVENTS_FILE"
-}
-
-flush_events() {
-  if [ ! -s "$EVENTS_FILE" ]; then return 0; fi
-  local body attempt
-  body=$(jq -s --arg t "$TASK_ID" '{task_id: $t, source: "job", events: .}' "$EVENTS_FILE")
-  for attempt in 1 2 3 4 5; do
-    if api_post /api/events "$body" >/dev/null; then
-      : >"$EVENTS_FILE"
-      return 0
-    fi
-    sleep $((attempt * 2))
-  done
-  echo "::error::Журнал не принял батч из 5 попыток — задача не может считаться завершённой" >&2
-  return 1
+  # БЕЗ подshell: env-префикс виден внутри функции и не течёт после (проверено),
+  # а PIPELINE_LOGGED_IN/PIPELINE_SESSION_READY библиотеки живут в этом шелле —
+  # логин и создание сессии конвейера идут ОДИН раз на job, не на каждое событие.
+  if ! PIPELINE_HARD=1 FINAL="${FINAL:-0}" TASK_ID="$TASK_ID" KIND="$1" \
+      DATA_JSON="${2:-null}" SOURCE="job" pipeline_post_event; then
+    echo "::error::Событие $1 не доехало до канала конвейера — улики прогона потеряны (#86)" >&2
+    return 1
+  fi
 }
 
 # ── Транскрипт сессии: дрен спула в морду (#119) ──────────────────────────────────
 # Спул плагина — единственный источник; дрен живёт в scripts/lib/dsh-edge-session.sh
 # и постит батчи строк спула в DSH-сессию (POST /api/sessions/:id/ingest).
-# Журнал-seq остаётся за жизненным циклом job; дрен морды на SEQ не влияет.
 
 JOB_ENDED=0
 # Единственная точка финального статуса. job_end уходит ТОЛЬКО после того, как
-# батч принят журналом: зелёный job с непринятым job_end — тот же silent-wrong.
+# канал принял его: зелёный job с непринятым job_end — тот же silent-wrong.
+# FINAL=1 (градация fail loud библиотеки канала) временно, на время вызова:
+# `VAR=x fn` виден и вложенному pipeline_post_event, но не течёт дальше.
 post_job_end() { # result
-  add_event "job_end" "{\"result\":\"$1\"}"
-  flush_events
+  FINAL=1 add_event "job_end" "{\"result\":\"$1\", \"job_id\":\"$JOB_ID\"}"
   JOB_ENDED=1
 }
 
-HB_PID=""
-start_heartbeat() {
-  while :; do
-    sleep "$HEARTBEAT_SECS"
-    api_post /api/heartbeat "{\"job_id\":\"$JOB_ID\",\"task_id\":\"$TASK_ID\"}" >/dev/null || true
-  done
-}
 cleanup() {
   dsh_edge_stop_drain
-  if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
   if [ "$JOB_ENDED" -eq 0 ]; then
     dsh_edge_drain_spool hard || true   # улики — до job_end; упавший дрен не отменяет финальный статус
-    add_event "agent_error" '{"stderr":"job завершён до финала (отмена/ошибка среды)"}'
+    # В трапе отказ канала не должен маскировать код выхода: каждый пост — с || true,
+    # честность обеспечивает post_job_end (FINAL=1) на штатном пути, а не здесь.
+    add_event "agent_error" '{"stderr":"job завершён до финала (отмена/ошибка среды)"}' || true
     post_job_end "fail" || true
   fi
 }
@@ -127,39 +89,13 @@ trap cleanup EXIT
 trap 'exit 130' INT   # graceful-семантика dsh: SIGINT → 130
 trap 'exit 143' TERM
 
-# ── 1. Текст задачи и посев seq — из журнала, не из догадок (спека п.2) ───────────
-TASK_TEXT="${TASK_TEXT:-}"
-after=0
-while :; do
-  resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256")
-  n=$(jq '.events | length' <<<"$resp")
-  if [ "$n" -eq 0 ]; then break; fi
-  ms=$(jq '[.events[] | select(.source == "job") | .seq] | max // 0' <<<"$resp")
-  if [ "$ms" -gt "$SEQ" ]; then SEQ=$ms; fi
-  if [ -z "$TASK_TEXT" ]; then
-    extracted=$(jq -r '
-      ([.events[] | select(.kind == "task_queued")][0].data.payload // empty)
-      | if type == "object" and has("task") and (.task | type == "string") then .task
-        elif type == "string" then .
-        else tostring end' <<<"$resp" 2>/dev/null || true)
-    if [ -n "$extracted" ]; then TASK_TEXT=$extracted; fi
-  fi
-  has_more=$(jq -r '.has_more' <<<"$resp")
-  after=$(jq -r '.next_after' <<<"$resp")
-  if [ "$has_more" != "true" ]; then break; fi
-done
-if [ -z "$TASK_TEXT" ]; then
-  echo "::error::Текст задачи не найден: в журнале $TASK_ID нет task_queued с payload.task" >&2
-  exit 1
-fi
-seq_persist
-echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
+echo "Задача $TASK_ID: текст из payload диспетча ($(wc -c <<<"$TASK_TEXT") байт)"
 
 # ── 1a. Аренда задачи (#121): заказ «поработай над issue-N» берётся только ────────
 # через атомарный claim. Без замка морда-агент мог заказать работу по задаче,
 # которую уже делает воркер, — два исполнителя на одной работе. Отказ —
-# зелёный no-op job'а (контракт #121), но журнал получает честный финал
-# task_busy + job_end: задача не должна висеть «dispatched» вечно, а «done»
+# зелёный no-op job'а (контракт #121), но канал конвейера получает честный финал
+# task_busy + job_end: задача не должна висеть вечно, а «done»
 # означал бы ложь «работа сделана». Задачи без issue (manual-*) — вне пула,
 # аренды не имеют. Поломка утилиты — громкий красный job: «инструмент сломан»
 # и «задача занята» — разные состояния.
@@ -188,14 +124,11 @@ fi
 # claim в проде авторизуется именно GH_RUN_TOKEN.
 unset GH_RUN_TOKEN
 
-add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
-flush_events
-start_heartbeat &
-HB_PID=$!
-
-# ── 1b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ─────────
-# Отказ громкий: без сессии ход работы владельцу не виден, job красный.
-# «Не настроено» и «сломано» — разные сообщения (dsh_edge_require_config).
+# ── 1b. Канал конвейера и сессия раннера в морде ──────────────────────────────────
+# Первый вызов pipeline_post_event (job_start ниже) логинится в морду и создаёт
+# сессию конвейера harness-pipeline. Затем — сессия раннера (#119): создать/
+# переиспользовать и назвать. Отказ громкий: без сессии ход работы владельцу
+# не виден, job красный. «Не настроено» и «сломано» — разные сообщения.
 if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
   HARNESS_SID="harness-${BASH_REMATCH[1]}"
   HARNESS_TITLE="#${BASH_REMATCH[1]}: $(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
@@ -205,7 +138,8 @@ else
   HARNESS_SID="harness-${slug:-manual}"
   HARNESS_TITLE="$(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
 fi
-dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
+add_event "job_start" "{\"job_id\":\"$JOB_ID\"}" \
+  || { echo "::error::Нет доступа к каналу конвейера морды dsh-edge — job красный (#86)" >&2; exit 1; }
 dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
   || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
@@ -256,12 +190,10 @@ add_event "bootstrap" "$(jq -n \
   --arg node "$(node --version)" --arg model "$DSH_MODEL" \
   --argjson mt "$DSH_MAX_TOKENS" \
   '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified", model: $model, max_tokens: $mt, stream_plugin: "hands-streamer"}')"
-flush_events
 
 # ── 4. Прогон: one-shot dsh-headless над этим репозиторием ────────────────────────
 # cwd ДО старта становится корнем воркспейса и после не меняется (контракт dsh).
 cd "${GITHUB_WORKSPACE:-$WORK}"
-touch "$START_MARK"
 
 # Спул стрима: путь задаётся плагину через env до старта dsh; чистый прогон не
 # должен дочитывать старьё от предыдущей попытки. Курсор дрена — единственный
@@ -277,13 +209,13 @@ rc=$?
 set -e
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
 
-# Финальный drain — жёсткий и ДО ответа: транскрипт сессии в морде обязан
-# обгонять финальный статус job в журнале.
+# Финальный drain — жёсткий и ДО финального статуса: транскрипт сессии в морде
+# обязан обгонять job_end в канале конвейера.
 dsh_edge_stop_drain
 dsh_edge_drain_spool hard || { echo "::error::Хвост транскрипта не принят мордой" >&2; exit 1; }
 drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
 
-# ── 5. Журнал: ответ и улики ───────────────────────────────────────────────────────
+# ── 5. Канал конвейера: ответ и улики ─────────────────────────────────────────────
 ANSWER=$(tail -c 60000 "$ANSWER_FILE" | redact)
 add_event "agent_answer" \
   "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
@@ -294,14 +226,12 @@ add_event "agent_answer" \
 if [ "$rc" -eq 0 ]; then
   if [ ! -f "$SPOOL_FILE" ]; then
     add_event "agent_error" '{"error":"stream_plugin_not_mounted","stderr":"прогон успешен, а спул стрима не создан — плагин hands-streamer не писал, хотя dump-config его смонтировал"}'
-    flush_events
     post_job_end "fail"
     echo "::error::Спул стрима не создан при успешном прогоне — плагин не работал" >&2
     exit 1
   fi
   if [ "$drained_lines" -eq 0 ]; then
     add_event "agent_error" '{"error":"stream_no_events","stderr":"прогон успешен, а в сессию морды не доставлено ни одного события — транскрипт пуст (#119)"}'
-    flush_events
     post_job_end "fail"
     echo "::error::Ноль событий в сессии морды при успешном прогоне — стрим не доставил событий" >&2
     exit 1
@@ -321,14 +251,11 @@ if [ -f "$SPOOL_FILE.stats.json" ]; then
 fi
 
 if [ "$rc" -eq 0 ]; then
-  # Ответ обязан дойти до журнала ДО ok: флаш под set -e — падение красит job.
-  flush_events
   post_job_end "ok"
 else
   ERRTEXT=$(tail -c 8000 "$ERR_FILE" | redact)
   add_event "agent_error" \
     "$(jq -n --arg t "$ERRTEXT" --argjson code "$rc" '{stderr: $t, exit_code: $code}')"
-  flush_events
   post_job_end "fail"
   echo "::error::dsh завершился с кодом $rc" >&2
   exit 1

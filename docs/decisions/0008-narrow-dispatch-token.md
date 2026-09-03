@@ -79,14 +79,18 @@
    только в UI): fine-grained PAT «только этот репозиторий, Contents RW +
    Actions RW» → `gh secret set GH_DISPATCH_TOKEN` (значение не должно
    транзитом проходить через публичные поверхности — issue, PR, логи).
-3. **Деплой** (workflow_dispatch deploy-worker или следующий пуш в
-   `cf-worker/**`): синхронизирует узкое значение в секрет воркера.
-4. **Владелец**: `gh variable set GH_DISPATCH_TOKEN_KIND --body fine-grained` —
-   армирует гвардию узости; с этого момента возврат классического PAT в секрет
-   красит деплой.
-5. **Проверка видимым результатом**: `scripts/canary-dispatch.sh` — POST
+3. **Деплой** (с #86 — `deploy-pulse.yml`, до #86 — deploy-worker): синхронизирует
+   узкое значение в секрет воркера пульса.
+4. ~~**Владелец**: `gh variable set GH_DISPATCH_TOKEN_KIND --body fine-grained` —
+   армирует гвардию узости~~ (с #86 устарело: гвардия в `deploy-pulse.yml`
+   БЕЗУСЛОВНАЯ — двухфазность «warning до армирования / жёсткий гейт после» не
+   переезжала, переменная `GH_DISPATCH_TOKEN_KIND` больше нигде не читается;
+   возврат широкого PAT красит деплой пульса сразу).
+5. **Проверка видимым результатом** (до #86): `scripts/canary-dispatch.sh` — POST
    /api/tasks → `dispatched:true` → появился run `hands` (repository_dispatch).
    Критерий готовности задачи #6 — прогон этой канарейки после шагов 2–3.
+   С списанием воркера (#86) канарейка и её канал ушли вместе с ним: токен
+   остался, поверхность диспетча — теперь workflow_dispatch из `cf-pulse`.
 
 ## Последствия
 

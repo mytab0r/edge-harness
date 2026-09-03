@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "harness-pulse",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "PULSE", "class_name": "Pulse" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Pulse"] }
+  ]
+}

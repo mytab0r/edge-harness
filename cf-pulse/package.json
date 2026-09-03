@@ -1,0 +1,15 @@
+{
+  "name": "harness-pulse",
+  "private": true,
+  "type": "module",
+  "description": "Минимальный инфра-воркер пульса конвейера (#86): alarm-диспетч orchestra.yml + самообновление морды dsh-edge (#73)",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250823.0",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.123.0"
+  }
+}

@@ -31,13 +31,14 @@ const { Button, StateDot } = require("@deepseek-ai/dsh-client-ui-primitives");
 // ── Журнал ────────────────────────────────────────────────────────────────────
 // Контракт: GET /api/harness/events?task_id=plugin:<id>&limit=&after=, ответ
 // { events: [{id, seq, ts, source, kind, data}, …], has_more, next_after }
-// (openspec/specs/journal-tasks-hands.md, реализация cf-worker/src/harness.ts).
-// Путь — ПРОКСИ СТОРОНЫ МОРДЫ (/api/harness/* → журнал edge-harness), которым
-// владелец закрыл белое пятно #105 вариантом 1 (релиз-ноты plugins-manager-
-// v0.1.2: «журнал читается через /api/harness/* (патч 0004)»): журнал —
-// другой origin, кука морды SameSite=Strict, CORS журнал не отдаёт, а
-// same-origin /api/events попадает в чужой API морды (401/HTML). Форма
-// запроса и ответа — контракт журнала, прокси прозрачен.
+// (openspec/specs/journal-tasks-hands.md; с #86 — сессия конвейера морды,
+// чтение — патч 0005, dsh-edge/patches/0005-harness-pipeline-view.patch).
+// Путь — маршрут на стороне морды (с #86 это патч 0005: /api/harness/events
+// проецирует сессию-конвейер harness-pipeline в форму ответа прежнего журнала;
+// до #86 владельческий прокси ходил в журнал edge-harness — релиз-ноты
+// plugins-manager-v0.1.2): same-origin, ходит сессионной кукой владельца
+// морды. Форма запроса и ответа — прежний журнальный контракт, маршрут
+// прозрачен для читателя.
 // События идут по возрасту id, а страницы отдаются от старейших: свежайший
 // статус может лежать за пределами первой страницы (каждый деплой пишет 2+
 // plugin_status, журнал растёт), поэтому идём до конца выборки по next_after,
@@ -184,7 +185,7 @@ function orderText(entry) {
     "",
     "Конвейер установки: tarball → релиз этого репозитория + sha256 → PR в dsh-edge/plugins.json → "
       + "деплой морды (рантайм-установки кода на Cloudflare Free нет). "
-      + "Прогресс конвейера — журнал edge-harness, задача plugin:" + entry.id + " (события plugin_status).",
+      + "Прогресс конвейера — сессия «Конвейер edge-harness» в чате, задача plugin:" + entry.id + " (события plugin_status).",
   );
   return lines.join("\n");
 }

@@ -14,6 +14,16 @@
 name: deploy-dsh-edge
 
 on:
+  push:
+    branches: [main]
+    paths:
+      # Морда собирается из апстрим-клона + патчей + плагинов по манифесту —
+      # любое из этих мест правды обязано доводить сборку до прода без ручного
+      # диспетча. До #86 пуш-триггера не было: правки манифеста ждали пульса
+      # версии (#73) или рук владельца.
+      - "dsh-edge/**"
+      - "plugins-src/**"
+      - ".github/workflows/deploy-dsh-edge.yml"
   schedule:
     # Ежедневно вне топ-часа; расписание действует только на default branch.
     - cron: "37 4 * * *"
@@ -198,6 +208,16 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
         run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+
+      # Канал конвейера (#86) обязан работать на СОБРАННОМ артефакте до деплоя:
+      # ingest статуса в сессию harness-pipeline → чтение назад через
+      # /api/harness/events в форме журнала (это тот контракт, по которому
+      # plugin-manager и integrations читают статусы). Красный шаг — деплой
+      # не начинается: сломанный канал красил бы статусы на живой морде.
+      - name: Интеграция канала конвейера на собранном артефакте (#86)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/pipeline-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
@@ -533,8 +553,9 @@ jobs:
         # job; continue-on-error страхует от неожиданных ошибок самого шага).
         continue-on-error: true
         env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канал статусов (#86): сессия-конвейер морды вместо журнала edge-harness.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           SOURCE: deploy
           STATE: deploying
         run: |
@@ -611,8 +632,9 @@ jobs:
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
         env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канал статусов (#86): сессия-конвейер морды вместо журнала edge-harness.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           SOURCE: deploy
           STATE: ready
           FINAL: "1"
@@ -629,8 +651,9 @@ jobs:
       - name: Статусы интеграций → журнал (#115)
         if: success() && steps.route.outputs.plugins != '0'
         env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канал статусов (#86): сессия-конвейер морды вместо журнала edge-harness.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           SOURCE: deploy
           FINAL: "1"
         run: |
@@ -649,8 +672,9 @@ jobs:
       - name: plugin_status → failed
         if: failure() && steps.route.outputs.plugins != '0'
         env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канал статусов (#86): сессия-конвейер морды вместо журнала edge-harness.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           SOURCE: deploy
           STATE: failed
           DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
@@ -659,15 +683,16 @@ jobs:
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh || true
           done
 
-      # Симметрично plugin_status → failed: если деплой упал, в журнале не
+      # Симметрично plugin_status → failed: если деплой упал, в канале не
       # должно остаться предыдущее «подключено» как безмолвно живущее. Снимок
       # наличия секретов мог не дожить до этого шага — тогда честно «нет
       # событий», виден только если деплой падал ДО синка секретов.
       - name: Статусы интеграций → failed (#115)
         if: failure() && steps.route.outputs.plugins != '0'
         env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канал статусов (#86): сессия-конвейер морды вместо журнала edge-harness.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           SOURCE: deploy
           STATE: failed
           DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
