@@ -1,8 +1,8 @@
 diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
-index 7e64c79..64566fa 100644
+index 30c8dda..edbf612 100644
 --- a/apps/dsh-edge/src/http.ts
 +++ b/apps/dsh-edge/src/http.ts
-@@ -10,6 +10,10 @@ export const MAX_SESSION_CREATE_BODY_BYTES = 8_192
+@@ -12,6 +12,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
  // Four projected image uploads fit after base64 expansion plus the RPC envelope.
  export const MAX_TURN_BODY_BYTES = 10 * 1_024 * 1_024
  export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
@@ -14,7 +14,7 @@ index 7e64c79..64566fa 100644
  /** Invalid caller input with an explicit HTTP response status. */
  export class EdgeHttpError extends Error {
 diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
-index 4a23ef9..51bfc93 100644
+index a7749d5..bf1b380 100644
 --- a/apps/dsh-edge/src/index.ts
 +++ b/apps/dsh-edge/src/index.ts
 @@ -10,6 +10,7 @@ import {
@@ -22,25 +22,29 @@ index 4a23ef9..51bfc93 100644
  import {
    EdgeHttpError,
 +  MAX_HARNESS_INGEST_BODY_BYTES,
+   MAX_MESSAGE_FEEDBACK_BODY_BYTES,
    MAX_SESSION_CREATE_BODY_BYTES,
    MAX_TURN_BODY_BYTES,
-   MAX_WORKSPACE_EXEC_BODY_BYTES,
-@@ -166,11 +167,13 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
+@@ -167,13 +168,15 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
    headers.set(OWNER_SESSION_EXPIRY_HEADER, String(ownerSessionExpiresAt))
    if (request.body === null) return new Request(request, { headers })
    const url = new URL(request.url)
--  const maxBytes = url.pathname.endsWith('/turn')
--    || url.pathname === '/api/session.prompt'
--    || url.pathname === '/api/session.updateQueue'
--    ? MAX_TURN_BODY_BYTES
--    : MAX_SESSION_CREATE_BODY_BYTES
+-  const maxBytes = url.pathname === '/api/messageFeedback/put'
+-    ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
+-    : url.pathname.endsWith('/turn')
+-      || url.pathname === '/api/session.prompt'
+-      || url.pathname === '/api/session.updateQueue'
+-      ? MAX_TURN_BODY_BYTES
+-      : MAX_SESSION_CREATE_BODY_BYTES
 +  const maxBytes = url.pathname.endsWith('/ingest')
 +    ? MAX_HARNESS_INGEST_BODY_BYTES
-+    : url.pathname.endsWith('/turn')
-+      || url.pathname === '/api/session.prompt'
-+      || url.pathname === '/api/session.updateQueue'
-+      ? MAX_TURN_BODY_BYTES
-+      : MAX_SESSION_CREATE_BODY_BYTES
++    : url.pathname === '/api/messageFeedback/put'
++      ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
++      : url.pathname.endsWith('/turn')
++        || url.pathname === '/api/session.prompt'
++        || url.pathname === '/api/session.updateQueue'
++        ? MAX_TURN_BODY_BYTES
++        : MAX_SESSION_CREATE_BODY_BYTES
    const body = await readBoundedBody(
      request,
      maxBytes,
@@ -121,10 +125,10 @@ index 9b15245..43f172f 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index e5e0f88..e4e80e5 100644
+index d408d3f..02fb4f0 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -1084,6 +1084,59 @@ export class EdgeSessionStore {
+@@ -1096,6 +1096,59 @@ export class EdgeSessionStore {
      }
    }
  
@@ -184,7 +188,7 @@ index e5e0f88..e4e80e5 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1287,6 +1340,72 @@ export class EdgeSessionStore {
+@@ -1299,6 +1352,72 @@ export class EdgeSessionStore {
    }
  }
  
