@@ -138,6 +138,12 @@ export const AUTOMATIONS = {
   webhookSecretEnv: "AUTOMATION_WEBHOOK_SECRET",
   /** Заголовок подписи webhook: `sha256=<hex HMAC-SHA256(raw body, secret)>`. */
   webhookSignatureHeader: "X-Harness-Signature",
+  /** Минимальная пауза между запусками journal-триггера одной автоматизации.
+   *  Работа прогона может сама порождать события журнала с чужими task_id
+   *  (kind=pool → job_end воркера под issue-N): без кулдауна такая связка
+   *  зацикливалась бы по одному агент-прогону за цикл (ревью #116). Каденс —
+   *  как у пульса, которым тикают и расписания. */
+  journalCooldownMs: 30 * 60_000,
 } as const;
 
 /** Локаль сообщений API. Словари — в messages.ts. */

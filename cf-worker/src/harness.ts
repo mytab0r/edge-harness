@@ -7,6 +7,7 @@ import {
   type AutomationConfig,
   digestPeriod,
   isValidAutomationId,
+  journalTriggerDue,
   parseAutomationConfig,
   runTaskId,
   scheduleDue,
@@ -1459,7 +1460,10 @@ export class Harness extends DurableObject<Env> {
     trigger: "schedule" | "webhook" | "journal",
     now: number,
   ): Promise<{ taskId: string; dispatched: boolean }> {
-    const taskId = runTaskId(automationId, now);
+    // nonce: два запуска в одну миллисекунду (параллельные webhook-выстрелы)
+    // иначе столкнулись бы на PRIMARY KEY tasks (ревью #116, minor 6).
+    const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const taskId = runTaskId(automationId, now, nonce);
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", taskId, now);
     this.#emitSystemEvent(taskId, "automation_triggered", { automation: automationId, trigger });
     const period = config.trigger.type === "schedule"
@@ -1520,6 +1524,7 @@ export class Harness extends DurableObject<Env> {
     const rows = this.#rows(
       this.#sql.exec("SELECT id, config, last_fired_ts FROM automations WHERE enabled = 1 ORDER BY id"),
     );
+    const now = Date.now();
     for (const row of rows) {
       const id = String(row.id);
       try {
@@ -1529,7 +1534,11 @@ export class Harness extends DurableObject<Env> {
         // trigger — локальная константа: сужение типа в замыкании живёт,
         // у свойства config.trigger оно сбрасывается.
         if (!candidates.some((event) => event.kind === trigger.kind)) continue;
-        await this.#fireAutomation(id, row.last_fired_ts, config, "journal", Date.now());
+        // Кулдаун: работа прогона может порождать события с чужими task_id
+        // (kind=pool → job_end воркера) — рвём цикл каденсом пульса.
+        const last = row.last_fired_ts === null || row.last_fired_ts === undefined ? null : Number(row.last_fired_ts);
+        if (!journalTriggerDue(last, now, AUTOMATIONS.journalCooldownMs)) continue;
+        await this.#fireAutomation(id, row.last_fired_ts, config, "journal", now);
       } catch (error) {
         console.log(`automation ${id} journal trigger failed: ${error instanceof Error ? error.message : error}`);
       }

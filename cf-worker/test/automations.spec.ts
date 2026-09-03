@@ -1,8 +1,10 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { AUTOMATIONS } from "../src/config";
 import {
   AUTOMATION_ID_PATTERN,
   digestPeriod,
+  journalTriggerDue,
   parseAutomationConfig,
   runTaskId,
   scheduleDue,
@@ -113,8 +115,15 @@ describe("automations: решение расписания и период", () 
     expect(digestPeriod(NOW - WEEK, 168, NOW)).toEqual({ since_ts: NOW - WEEK, until_ts: NOW });
     expect(digestPeriod(null, 1, NOW)).toEqual({ since_ts: NOW - 3_600_000, until_ts: NOW });
   });
-  it("task_id прогона живёт под префиксом-гвардией петли", () => {
-    expect(runTaskId("weekly-digest", 123)).toMatch(/^automation:weekly-digest:[0-9a-z]+$/);
+  it("task_id прогона живёт под префиксом-гвардией петли; nonce разводит одну миллисекунду", () => {
+    expect(runTaskId("weekly-digest", 123, "abcd1234")).toMatch(/^automation:weekly-digest:[0-9a-z]+-abcd1234$/);
+    expect(runTaskId("weekly-digest", 123, "abcd1234")).not.toBe(runTaskId("weekly-digest", 123, "deadbeef"));
+    expect(() => runTaskId("weekly-digest", 123, "!!")).toThrow(/nonce/);
+  });
+  it("journal-триггер: кулдаун рвёт цикл через чужие события", () => {
+    expect(journalTriggerDue(null, NOW, AUTOMATIONS.journalCooldownMs)).toBe(true);
+    expect(journalTriggerDue(NOW - AUTOMATIONS.journalCooldownMs + 1, NOW, AUTOMATIONS.journalCooldownMs)).toBe(false);
+    expect(journalTriggerDue(NOW - AUTOMATIONS.journalCooldownMs, NOW, AUTOMATIONS.journalCooldownMs)).toBe(true);
   });
   it("шаблон id: без «:», % и «_» — id едет в путях webhook'а и LIKE-паттернах", () => {
     expect("weekly-digest".match(new RegExp(AUTOMATION_ID_PATTERN))).not.toBeNull();

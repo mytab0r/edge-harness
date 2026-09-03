@@ -304,6 +304,15 @@ jobs:
       - name: Smoke клиента автоматизаций на заглушках
         run: bash scripts/automations/test/run_smoke.sh
 
+      # DO-тесты журнала (vitest на workerd: journal, очередь, автоматизации
+      # #116) раньше гонялись только локально — класс «suite есть, CI не знает».
+      - name: Тесты DO журнала (vitest + typecheck)
+        working-directory: cf-worker
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit
+          npx vitest run
+
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
