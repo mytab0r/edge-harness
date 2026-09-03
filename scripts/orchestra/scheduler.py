@@ -165,7 +165,9 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             # keyword-аргумент gh() не принимает и роняет весь прогон (#124).
             "-f", "body=" + (
                 f"Назначение снято оркестратором: за {STALE_HOURS} часов не появился PR, "
-                f"а задача назначена {who}. Задача возвращена в пул — бери через assign."
+                f"а задача назначена {who}. Задача возвращена в пул — бери через "
+                "атомарную аренду: python3 scripts/lib/claim_task.py claim "
+                f"{number} (#121, ADR 0006)."
             ),
         )
         lines.append(f"♻️ #{number} просрочена ({who}), возвращена в пул")
