@@ -32,7 +32,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -224,7 +224,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], True))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged: ([], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -247,7 +247,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged: ([], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -269,7 +269,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
-        lambda repo, pool, merged: (["🚨 #227: улика не проверена"], True))
+        lambda repo, pool, merged, now=None: (["🚨 #227: улика не проверена"], True))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -1696,14 +1696,16 @@ def test_accept_merged_tasks_closes_docs_only_with_no_observable_result(monkeypa
 def test_accept_merged_tasks_does_not_close_docs_when_file_missing_from_main(monkeypatch):
     """Заявленный файл пропал из main (переименован/удалён после мержа) —
     улика (пусть и «улики по природе нет») получить не удалось: провал, не
-    тихое закрытие."""
+    тихое закрытие. Форма ошибки — реальная `gh api` на 404 (проверено живым
+    вызовом 2026-09-03: `gh: Not Found (HTTP 404)` в stderr)."""
     fake = FakeGh({
         "pulls/163/files": files_payload(PR_163_FILES),
         "issues/78/comments": [],
         "issues/78/assignees": None,
         f"contents/{PR_163_FILES[0]}?ref=main": {"name": "design.md"},
         f"contents/{PR_163_FILES[1]}?ref=main": {"name": "proposal.md"},
-        f"contents/{PR_163_FILES[2]}?ref=main": RuntimeError("gh api contents: 404 Not Found"),
+        f"contents/{PR_163_FILES[2]}?ref=main": RuntimeError(
+            "gh api repos/o/r/contents/x: gh: Not Found (HTTP 404)"),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
@@ -1716,6 +1718,32 @@ def test_accept_merged_tasks_does_not_close_docs_when_file_missing_from_main(mon
     assert hard_failure is False
     assert not any(call.startswith("-X PATCH") for call in fake.calls)
     assert any("провалена" in line and "#78" in line for line in lines)
+
+
+def test_accept_merged_tasks_docs_missing_escalates_on_non_404_error(monkeypatch):
+    """docs_missing не путает «файла нет» (HTTP 404) со «сбой инструмента»
+    (ратлимит/сеть/5xx): любой другой отказ gh — не провал улики, а эскалация
+    (найдено в разборе AI-ревью PR #253)."""
+    fake = FakeGh({
+        "pulls/163/files": files_payload(PR_163_FILES),
+        "issues/78/comments": [],
+        f"contents/{PR_163_FILES[0]}?ref=main": {"name": "design.md"},
+        f"contents/{PR_163_FILES[1]}?ref=main": {"name": "proposal.md"},
+        f"contents/{PR_163_FILES[2]}?ref=main": RuntimeError(
+            "gh api repos/o/r/contents/x: HTTP 502 (Bad Gateway)"),
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("сбой инструмента не пишет обычный комментарий"))
+
+    pool = [issue(78, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+
+    assert hard_failure is True
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+    assert not any("провалена" in line for line in lines)
 
 
 def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkeypatch):
@@ -1743,6 +1771,83 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
 
 
+def test_accept_merged_tasks_stays_quiet_when_pending_within_threshold(monkeypatch):
+    """Деплой ещё не прогнан — это норма сразу после мержа, не сбой: тихая
+    строка «⏳», без эскалации и без единого мутирующего вызова, пока не
+    прошёл ACCEPTANCE_PENDING_HOURS."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("рано эскалировать — порог не прошёл"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано писать — порог не прошёл"))
+
+    merged_at = datetime(2026, 9, 3, 10, 0, 0, tzinfo=timezone.utc)
+    now = merged_at + timedelta(hours=1)  # меньше ACCEPTANCE_PENDING_HOURS
+    pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
+    pool = [issue(21, assignees=("mytab0r",))]
+
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+
+    assert hard_failure is False
+    assert any("ещё не готова" in line and "#21" in line for line in lines)
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+
+
+def test_accept_merged_tasks_escalates_when_pending_past_threshold(monkeypatch):
+    """Улика не появилась дольше ACCEPTANCE_PENDING_HOURS после мержа — путь
+    назад для merged-задач (reap_stale их больше не трогает), эскалация тем
+    же каналом, что жёсткий сбой (найдено в разборе AI-ревью PR #253)."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    merged_at = datetime(2026, 9, 3, 10, 0, 0, tzinfo=timezone.utc)
+    now = merged_at + timedelta(hours=sch.ACCEPTANCE_PENDING_HOURS, minutes=1)
+    pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
+    pool = [issue(21, assignees=("mytab0r",))]
+
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+
+    assert hard_failure is True
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert posted and posted[0][0] == 21 and sch.ACCEPTANCE_PENDING_MARKER in posted[0][1]
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+
+
+def test_accept_merged_tasks_pending_escalation_is_idempotent(monkeypatch):
+    """Эскалация зависшего pending уже отправлена этой паре (задача, PR) —
+    второй прогон не должен снова слать Telegram/писать комментарий."""
+    pending_marker = f"{sch.ACCEPTANCE_PENDING_MARKER} PR #177"
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [{"created_at": "2026-09-03T18:00:00Z", "body": f"🚨 {pending_marker} — уже сказано"}],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("уже эскалировано — не должен писать снова"))
+
+    merged_at = datetime(2026, 9, 3, 10, 0, 0, tzinfo=timezone.utc)
+    now = merged_at + timedelta(hours=sch.ACCEPTANCE_PENDING_HOURS, minutes=1)
+    pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
+    pool = [issue(21, assignees=("mytab0r",))]
+
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+
+    assert hard_failure is False
+    assert any("уже эскалировано" in line and "#21" in line for line in lines)
+
+
 def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch):
     """Провал уже сообщён этой же паре (задача, PR) — второй прогон не должен
     снова дёргать files/check-runs/комментарий: иначе конвейер спамил бы тот
@@ -1760,6 +1865,28 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
     assert hard_failure is False
     assert lines == []
     assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100"]  # только чтение маркера
+
+
+def test_accept_merged_tasks_never_closes_watchdog_issue(monkeypatch):
+    """#120 (WATCHDOG_ISSUE) — постоянный канал эскалации pulse_guard, не
+    разовая задача: PR #126 объявил #120 первой строкой и давно слит с
+    зелёными проверками, поэтому merged_pr_map всегда найдёт его. Приёмка
+    обязана пропустить #120 без единого вызова gh — иначе первый же прогон
+    после мержа PR #253 закрывает канал, в который pulse_guard пишет маркеры
+    пауз (найдено в разборе AI-ревью PR #253)."""
+    pr126 = merged_pull(126, "#120\n\nПредохранитель конвейера.", "d4676d5", "2026-08-31T12:01:08Z")
+    fake = FakeGh({})  # любой вызов gh — провал теста
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(sch.WATCHDOG_ISSUE, assignees=())]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {sch.WATCHDOG_ISSUE: pr126})
+
+    assert hard_failure is False
+    assert lines == []
+    assert fake.calls == []
+    assert posted == []
 
 
 def test_accept_merged_tasks_zero_calls_when_no_task_has_merged_pr(monkeypatch):

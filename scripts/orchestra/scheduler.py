@@ -1091,6 +1091,16 @@ def upstream_drift_lines(repo: str) -> list[str]:
 # бы тот же комментарий каждые 15 минут, пока никто не пришлёт новую работу.
 # ok/docs идемпотентны по построению: закрытый issue выходит из open_task_issues
 # и вторым проходом уже не встретится.
+#
+# Четвёртый исход — pending дольше ACCEPTANCE_PENDING_HOURS (найдено в разборе
+# AI-ревью PR #253): reap_stale больше не трогает задачи из merged (см. выше) —
+# единственный путь назад для них теперь эта функция. Улика, которая не
+# появляется (например, deploy-worker.yml не запустился и не запустится —
+# gh workflow run упал где-то ещё), раньше самовосстанавливалась через
+# STALE_HOURS reap, теперь не восстанавливалась бы никак и висела строкой
+# «⏳» в каждом пульсе бесконечно. Порог — эскалация тем же каналом, что
+# жёсткий сбой (WATCHDOG_ISSUE + Telegram), идемпотентно через тот же
+# маркер-паттерн.
 
 ACCEPT_DEPLOY = "deploy"
 ACCEPT_SCRIPT = "script"
@@ -1103,6 +1113,12 @@ DOC_PATH_NAMES = {"AGENTS.md", "CLAUDE.md"}
 ACCEPTANCE_OK_MARKER = "[приёмка: улика]"
 ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
 ACCEPTANCE_DOCS_MARKER = "[приёмка: без наблюдаемого результата]"
+ACCEPTANCE_PENDING_MARKER = "[приёмка: зависла]"
+
+# Рядом со STALE_HOURS (то же назначение — «сколько ждать, прежде чем бить
+# тревогу», но для другого канала: STALE_HOURS про назначение без PR,
+# ACCEPTANCE_PENDING_HOURS — про PR, который слит, но улика не появляется).
+ACCEPTANCE_PENDING_HOURS = 6
 
 DSH_EDGE_HEALTH_TIMEOUT = 15
 
@@ -1196,27 +1212,48 @@ def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
 def docs_missing(repo: str, filenames: list[str]) -> list[str]:
     """Файлы из тела PR, которых нет в main — редкий случай (переименовали/
     удалили ПОСЛЕ мержа): единственная проверяемая форма критерия «источник
-    правды на месте» для правки, не имеющей наблюдаемого результата в рантайме."""
+    правды на месте» для правки, не имеющей наблюдаемого результата в рантайме.
+    «Файла нет» отличается по точной форме gh «HTTP 404» (тот же приём, что
+    is_not_found в scripts/review/ai_review.py) — любой другой отказ (ратлимит,
+    сеть, 5xx) не «файла нет», а «возможность сломана»: поднимаем наверх, там
+    его ловит общий except в accept_merged_tasks и эскалирует, а не тихо
+    засчитывает как провал улики (найдено в разборе AI-ревью PR #253)."""
     missing = []
     for name in filenames:
         try:
             gh(f"repos/{repo}/contents/{name}?ref=main")
-        except RuntimeError:
+        except RuntimeError as error:
+            if "HTTP 404" not in str(error):
+                raise
             missing.append(name)
     return missing
 
 
-def accept_merged_tasks(repo: str, pool: list[dict], merged: dict[int, dict]) -> tuple[list[str], bool]:
+def accept_merged_tasks(
+    repo: str, pool: list[dict], merged: dict[int, dict], now: datetime | None = None,
+) -> tuple[list[str], bool]:
     """Стадия приёмки (#227) — см. блок комментариев выше. merged — карта
     Task#N → слитый PR (merged_pr_map(all_merged_pulls(repo)), один общий
     обход на весь прогон оркестратора, тот же, что использует reap_stale).
+    now — момент прогона (по умолчанию текущее время), нужен только для
+    порога ACCEPTANCE_PENDING_HOURS.
     Возвращает (строки отчёта, был_ли_жёсткий_сбой): жёсткий сбой эскалируется
     тут же на каждую затронутую задачу отдельно, но не прерывает обход
     остальных (мерж уже состоялся, задачи независимы)."""
+    now = now or datetime.now(timezone.utc)
     lines: list[str] = []
     hard_failure = False
     for issue in pool:
         number = issue["number"]
+        if number == WATCHDOG_ISSUE:
+            # #120 — постоянный канал эскалации pulse_guard (heartbeat/pause
+            # маркеры), не разовая задача: PR #126, реализовавший предохранитель,
+            # объявляет #120 первой строкой и давно слит с зелёными проверками —
+            # merged_pr_map найдёт его для ЛЮБОГО прогона, а #120 намеренно
+            # остаётся открытым навсегда. Закрыть его приёмкой — не «не та
+            # задача провалилась», а тихая порча канала эскалации молчаливым
+            # побочным эффектом, обнаружено при разборе AI-ревью PR #253.
+            continue
         pull = merged.get(number)
         if pull is None:
             continue
@@ -1229,6 +1266,7 @@ def accept_merged_tasks(repo: str, pool: list[dict], merged: dict[int, dict]) ->
             continue
 
         category = None
+        merged_at = parse_time(pull["merged_at"])
         try:
             files_payload = gh(f"repos/{repo}/pulls/{pull['number']}/files?per_page=100") or []
             filenames = [f["filename"] for f in files_payload]
@@ -1240,7 +1278,6 @@ def accept_merged_tasks(repo: str, pool: list[dict], merged: dict[int, dict]) ->
                 else:
                     state, detail = "docs", f"файлы на месте в main: {', '.join(filenames)}"
             elif category == ACCEPT_DEPLOY:
-                merged_at = parse_time(pull["merged_at"])
                 state, detail = deploy_evidence(repo, merged_at)
             else:
                 state, detail = script_evidence(repo, pull["head"]["sha"])
@@ -1253,6 +1290,29 @@ def accept_merged_tasks(repo: str, pool: list[dict], merged: dict[int, dict]) ->
             continue
 
         if state == "pending":
+            # Единственный путь назад для merged-задач теперь эта функция
+            # (reap_stale их больше не трогает) — улика, которая не
+            # появляется, раньше самовосстанавливалась через STALE_HOURS
+            # reap, а без этого порога зависла бы в pending навсегда молча.
+            if now - merged_at > timedelta(hours=ACCEPTANCE_PENDING_HOURS):
+                pending_marker = f"{ACCEPTANCE_PENDING_MARKER} PR #{pull['number']}"
+                try:
+                    already_escalated = issue_marker_times(repo, number, pending_marker)
+                except RuntimeError as error:
+                    lines.append(f"⚠️ #{number}: маркер зависшей приёмки не прочитан: {error}")
+                    continue
+                if already_escalated:
+                    lines.append(
+                        f"⏳ #{number}: улика ({category}) не готова дольше "
+                        f"{ACCEPTANCE_PENDING_HOURS} ч — уже эскалировано, жду новую работу")
+                    continue
+                text = (f"🚨 #{number}: приёмка PR #{pull['number']} ({category}) висит в "
+                        f"pending дольше {ACCEPTANCE_PENDING_HOURS} ч после мержа — {detail}")
+                escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                post_issue_comment(repo, number, f"{pending_marker} {detail} ({escalation}).")
+                lines.append(text)
+                hard_failure = True
+                continue
             lines.append(f"⏳ #{number}: улика ({category}) ещё не готова — {detail}")
             continue
 
@@ -1341,7 +1401,7 @@ def main() -> int:
     # Приёмка (#227): задачи, чей PR уже слит, разбираются по улике ДО подсчёта
     # пула — свободно/в работе должно отражать уже закрытые этим же прогоном.
     pool = open_task_issues(repo)
-    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged)
+    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged, now)
     if accept_lines:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])
