@@ -43,8 +43,8 @@ import {
 // Фикстуры — ЗАВЕДОМО ненастоящие строки без форматов реальных токенов
 // (без префиксов xoxb-/ATATT и подобной длины), чтобы гвардить маскирование
 // и не цеплять GitHub secret scanning: маскированию форма не важна.
-const TOKEN = 'slack-fixture-token-115-not-real'
-const APP_PASSWORD = 'atlassian-fixture-app-password-115-not-real'
+const BOT_CREDENTIAL = 'slack-fixture-token-115-not-real'
+const SITE_CREDENTIAL = 'atlassian-fixture-app-password-115-not-real'
 // Email с длиной, НЕ кратной 3: base64('user:secret') не равен склейке
 // base64('user:')+base64('secret') — именно этот случай ловит тест (ревью #115:
 // выровненная фикстура маскировала дыру, где полный Basic-заголовок выживал).
@@ -54,7 +54,7 @@ const USER = 'owner@atlassian.com'
 
 test('readConfig: полный конфиг читается, половинчатый — громкий список имён', () => {
   const names = ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN']
-  const full = readConfig({ JIRA_BASE_URL: ' https://team.atlassian.net/ ', JIRA_EMAIL: 'owner@example.com', JIRA_API_TOKEN: APP_PASSWORD }, names)
+  const full = readConfig({ JIRA_BASE_URL: ' https://team.atlassian.net/ ', JIRA_EMAIL: 'owner@example.com', JIRA_API_TOKEN: SITE_CREDENTIAL }, names)
   assert.deepEqual(full.missing, [])
   assert.equal(full.values.JIRA_BASE_URL, 'https://team.atlassian.net/', 'пробелы обрезаются; слэш остаётся — его снимает normalizeBaseUrl')
 
@@ -75,24 +75,24 @@ test('normalizeBaseUrl: слэш срезается, путь (/wiki) сохра
 
 // ── Маскирование ──────────────────────────────────────────────────────────────
 
-const BASIC_DERIVED = basicAuthMask(USER, APP_PASSWORD)
+const BASIC_DERIVED = basicAuthMask(USER, SITE_CREDENTIAL)
 
 test('basicAuthMask: производная — это base64 ФАКТИЧЕСКОЙ пары, не склейка частей', () => {
-  const full = Buffer.from(`${USER}:${APP_PASSWORD}`, 'utf8').toString('base64')
+  const full = Buffer.from(`${USER}:${SITE_CREDENTIAL}`, 'utf8').toString('base64')
   assert.equal(BASIC_DERIVED, full)
   const glued = Buffer.from(`${USER}:`, 'utf8').toString('base64')
-    + Buffer.from(APP_PASSWORD, 'utf8').toString('base64')
+    + Buffer.from(SITE_CREDENTIAL, 'utf8').toString('base64')
   assert.notEqual(BASIC_DERIVED, glued, 'на невыровненной длине склейка ≠ производной — иначе тест ничего не ловит')
 })
 
 test('scrub: значение секрета, его base64 и полный Basic-заголовок не выживают', () => {
-  const masks = masksFor([TOKEN, APP_PASSWORD], [BASIC_DERIVED])
-  const text = `ошибка у значения ${TOKEN}, у basic ${BASIC_DERIVED} и у base64 значения `
-    + `${Buffer.from(APP_PASSWORD, 'utf8').toString('base64')}, дальше чисто`
+  const masks = masksFor([BOT_CREDENTIAL, SITE_CREDENTIAL], [BASIC_DERIVED])
+  const text = `ошибка у значения ${BOT_CREDENTIAL}, у basic ${BASIC_DERIVED} и у base64 значения `
+    + `${Buffer.from(SITE_CREDENTIAL, 'utf8').toString('base64')}, дальше чисто`
   const clean = scrub(text, masks)
-  assert.ok(!clean.includes(TOKEN), 'значение секрета осталось в тексте')
+  assert.ok(!clean.includes(BOT_CREDENTIAL), 'значение секрета осталось в тексте')
   assert.ok(!clean.includes(BASIC_DERIVED), 'фактическая производная Basic осталась в тексте')
-  assert.ok(!clean.includes(Buffer.from(APP_PASSWORD, 'utf8').toString('base64')), 'base64 значения остался в тексте')
+  assert.ok(!clean.includes(Buffer.from(SITE_CREDENTIAL, 'utf8').toString('base64')), 'base64 значения остался в тексте')
   assert.ok(clean.includes('***'))
   assert.ok(clean.includes('дальше чисто'), 'обычный текст не пострадал')
 })
@@ -101,8 +101,8 @@ test('scrub: производная для выровненного случая
   // Граница выравнивания: user с длиной, кратной 3, — здесь склейка совпадает
   // с производной, но честная маска снимает её независимо от арифметики.
   const alignedUser = 'abc'
-  const derived = basicAuthMask(alignedUser, APP_PASSWORD)
-  const clean = scrub(`Bearer ${derived} — утечка`, masksFor([APP_PASSWORD], [derived]))
+  const derived = basicAuthMask(alignedUser, SITE_CREDENTIAL)
+  const clean = scrub(`Bearer ${derived} — утечка`, masksFor([SITE_CREDENTIAL], [derived]))
   assert.ok(!clean.includes(derived))
 })
 
@@ -132,15 +132,15 @@ function stubResponse({ status = 400, body }) {
 test('describeFailure: формы ошибок Jira/Bitbucket/Slack читаются, секрет скрабится', async () => {
   const jira = await describeFailure(
     stubResponse({ status: 403, body: { errorMessages: ['You do not have permission'], errors: {} } }),
-    [APP_PASSWORD],
+    [SITE_CREDENTIAL],
   )
   assert.equal(jira, 'HTTP 403: You do not have permission')
 
   const bitbucket = await describeFailure(
-    stubResponse({ status: 400, body: { type: 'error', error: { message: `Bad request near ${APP_PASSWORD}, header ${BASIC_DERIVED}` } } }),
-    masksFor([APP_PASSWORD], [BASIC_DERIVED]),
+    stubResponse({ status: 400, body: { type: 'error', error: { message: `Bad request near ${SITE_CREDENTIAL}, header ${BASIC_DERIVED}` } } }),
+    masksFor([SITE_CREDENTIAL], [BASIC_DERIVED]),
   )
-  assert.ok(!bitbucket.includes(APP_PASSWORD), 'секрет из сообщения чужого API дошёл до агента')
+  assert.ok(!bitbucket.includes(SITE_CREDENTIAL), 'секрет из сообщения чужого API дошёл до агента')
   assert.ok(!bitbucket.includes(BASIC_DERIVED), 'производная Basic из сообщения чужого API дошёл до агента')
   assert.ok(bitbucket.includes('***'))
   assert.ok(bitbucket.startsWith('HTTP 400:'))
@@ -156,7 +156,7 @@ test('configError: только имена секретов и название 
   const message = configError('jira_issue', ['JIRA_EMAIL', 'JIRA_API_TOKEN'], 'Jira').message
   assert.ok(message.includes('JIRA_EMAIL') && message.includes('JIRA_API_TOKEN'))
   assert.ok(message.includes('Jira'))
-  assert.ok(!message.includes(APP_PASSWORD))
+  assert.ok(!message.includes(SITE_CREDENTIAL))
   assert.equal(configError('jira_issue', ['X'], 'Jira').ok, false)
 })
 
