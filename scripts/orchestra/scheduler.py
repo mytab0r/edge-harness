@@ -526,10 +526,18 @@ def worker_runs_active(repo: str) -> bool:
 def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
     """Пульс конвейера: свободная задача есть, воркер простаивает → ровно один
     dispatch worker.yml за запуск оркестратора. Best-effort по построению:
-    workflow ещё не на main (до мержа PR #89), права, сеть — любой сбой
-    диспатча не роняет оркестратор, слияния важнее подряда воркеру."""
+    прав на dispatch нет, workflow нет на main, сеть — любой сбой диспатча
+    не роняет оркестратор, слияния важнее подряда воркеру."""
     lines = []
-    free = [issue for issue in pool if not issue["assignees"]]
+    # Старейшая свободная — та же, которую воркер выберет oldest_free
+    # (scripts/lib/free_task.py, #245): issues API отдаёт пул по убыванию
+    # новизны, и без сортировки строка отчёта называла бы свежайшую задачу,
+    # а не ту, которую воркер фактически возьмёт. Замки здесь не фильтруются —
+    # это делает сам воркер на claim'е (#121).
+    free = sorted(
+        (issue for issue in pool if not issue["assignees"]),
+        key=lambda issue: issue["number"],
+    )
     if not free:
         return lines
     try:

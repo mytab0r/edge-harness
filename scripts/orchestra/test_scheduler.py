@@ -705,6 +705,135 @@ def test_update_remaining_pulls_noop_on_empty_queue(monkeypatch):
     assert fake.calls == []
 
 
+# ── Пульс воркера (#89, состав п.3): свободная задача + простаивающий воркер →
+# ровно один workflow_dispatch за прогон; занятый воркер и пул без свободных —
+# ноль мутирующих вызовов; сбой диспатча — ⚠️ в отчёте, планировщик не роняется.
+# Маршруты кормятся прод-формой ответов GitHub API (list workflow runs).
+
+
+def workflow_run(run_id, status):
+    """Прод-форма элемента workflow_runs (GitHub API, снята с прогонов
+    worker.yml этого репозитория: id/status/conclusion/event/created_at)."""
+    return {
+        "id": run_id,
+        "name": "worker",
+        "node_id": "WFR_kwDOUHBaqc8AAAACyoZFEQ",
+        "head_branch": "main",
+        "head_sha": "035d8b6000000000000000000000000000000000",
+        "run_number": 42,
+        "event": "workflow_dispatch",
+        "status": status,
+        "conclusion": None,
+        "created_at": "2026-09-03T22:42:31Z",
+        "html_url": f"https://github.com/{REPO}/actions/runs/{run_id}",
+        "display_title": "worker",
+    }
+
+
+def test_dispatch_worker_fires_once_for_idle_worker_and_free_pool(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # POST .../dispatches отвечает 204 без тела — прод-форма «успех» есть None.
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pool = [issue(95), issue(89, assignees=())]
+    lines = sch.dispatch_worker(REPO, pool)
+    assert lines == [
+        "👷 свободная задача #89 — worker.yml запущен "
+        "(воркер сам назначится и откроет PR)"
+    ]
+    assert fake.mutating_calls() == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main"
+    ]
+
+
+def test_dispatch_worker_names_oldest_free_task_like_worker_will_pick(monkeypatch):
+    # Пул приходит от issues API по убыванию новизны: без сортировки отчёт
+    # назвал бы #101, а воркер выберет старейшую свободную (oldest_free,
+    # #245) — строка отчёта обязана называть ту задачу, которую реально возьмут.
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pool = [issue(101, assignees=()), issue(95), issue(89, assignees=())]
+    lines = sch.dispatch_worker(REPO, pool)
+    assert lines[0].startswith("👷 свободная задача #89 ")
+    assert not any("#101" in line for line in lines)
+
+
+def test_dispatch_worker_silent_when_pool_has_no_free_task(monkeypatch):
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    assert sch.dispatch_worker(REPO, [issue(89)]) == []
+    assert fake.calls == []  # ноль вызовов вовсе: на занятый пул даже статусы не смотрим
+
+
+def test_dispatch_worker_silent_while_worker_run_in_progress(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+    })
+    patch_gh(monkeypatch, fake)
+    lines = sch.dispatch_worker(REPO, [issue(89, assignees=())])
+    assert lines == ["👷 воркер уже работает — dispatch не нужен"]
+    assert fake.mutating_calls() == []
+
+
+def test_dispatch_worker_silent_while_worker_queued(monkeypatch):
+    # queued считается активным так же, как in_progress: concurrency worker
+    # поставит второй прогон в очередь, и он выгорит только после текущего.
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {
+            "workflow_runs": [workflow_run(33814313390, "queued")]},
+    })
+    patch_gh(monkeypatch, fake)
+    lines = sch.dispatch_worker(REPO, [issue(89, assignees=())])
+    assert lines == ["👷 воркер уже работает — dispatch не нужен"]
+    assert fake.mutating_calls() == []
+
+
+def test_dispatch_worker_survives_dispatch_failure(monkeypatch):
+    # Best-effort по построению: 403/сеть на диспатче не роняют планировщик —
+    # слияния важнее подряда воркеру. Доведение функции до возврата и есть
+    # проверка: исключение ушло бы дальше этого assert.
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": RuntimeError(
+            "gh api repos/o/r/actions/workflows/worker.yml/dispatches: HTTP 403"),
+    })
+    patch_gh(monkeypatch, fake)
+    lines = sch.dispatch_worker(REPO, [issue(89, assignees=())])
+    assert len(lines) == 1 and lines[0].startswith("⚠️ dispatch воркера не удался")
+
+
+def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
+    """Предохранитель конвейера (#120) в паузе → dispatch_worker не вызывается
+    вовсе (проводка в main, не внутри dispatch_worker)."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: ([], False))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
+    dispatched = []
+    monkeypatch.setattr(
+        sch, "dispatch_worker",
+        lambda repo, pool: dispatched.append((repo, pool)) or [],
+    )
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+    assert sch.main() == 0
+    assert dispatched == []
+
+
 def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
     """Сквозная гвардия холостого хода: main() целиком, пустая очередь PR и
     задач — GITHUB_STEP_SUMMARY не пишем на диск, gh() не делает ни одного
