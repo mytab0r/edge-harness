@@ -57,6 +57,7 @@ PIPELINE_CONSUMERS = [
 # по себе ничего не фиксирует). Содержимое сканируется динамически в правилах ниже.
 EXPECTED_WORKFLOWS = frozenset({
     "ai-review.yml",
+    "automation.yml",  # руки автоматизаций (#116): repository_dispatch harness-automation; секреты — HANDS_TOKEN/каналы, GH_DISPATCH_TOKEN не трогает
     # #370/#341: событие branch_protection_rule, только github.token (issues:
     # write) + секреты TELEGRAM_* — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
