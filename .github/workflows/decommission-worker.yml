@@ -1,0 +1,129 @@
+# Списание воркера edge-harness (#86): последний шаг миграции функций в морду
+# dsh-edge. Дизайн и предпосылки — openspec/changes/edge-harness-decommission/design.md.
+#
+# Триггеры:
+#   - workflow_run после УСПЕШНОГО deploy-dsh-edge: деплой собрал морду с патчем
+#     0005 и прошёл канарейки — только после этого списание имеет право думать;
+#   - workflow_dispatch — ручной прогон (владелец/воркер).
+#
+# Воркер удаляется только если ВСЕ предпосылки зелёные, каждая проверяется явно:
+#   1. в активном коде репо не осталось ссылок на HARNESS_URL/HANDS_TOKEN —
+#      иначе кто-то ещё пишет в журнал, который мы удаляем;
+#   2. морда жива (/api/health);
+#   3. канал конвейера доказан живьём: канарейка пишет статус в сессию
+#      harness-pipeline и читает его назад через /api/harness/events — это и
+#      есть улика «цикл работает без edge-harness воркера». На морде без
+#      патча 0005 маршрут 404 → списание не случится (порядок гарантируется
+#      самой проверкой).
+# Повторный прогон после удаления — зелёный no-op («уже списан»), чтобы
+# ежедневные деплои морды не красились вечно.
+name: decommission-worker
+
+on:
+  workflow_run:
+    workflows: [deploy-dsh-edge]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decommission-worker
+  cancel-in-progress: false
+
+jobs:
+  decommission:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Предпосылка 1 — в активном коде нет ссылок на журнал
+        run: |
+          # Оба гварда-файла исключены: repo-ci.yml и этот workflow сами упоминают
+          # имена, чтобы ловить возврат журнала, — grep не должен матчить сторожа.
+          if grep -rn --exclude=decommission-worker.yml --exclude=repo-ci.yml "HARNESS_URL\|HANDS_TOKEN" .github/workflows scripts cf-pulse plugins-src dsh-edge 2>/dev/null; then
+            echo "::error::Найдены ссылки на HARNESS_URL/HANDS_TOKEN в активном коде — кто-то ещё зависит от журнала. Списание отменено, сначала переведи потребителя."
+            exit 1
+          fi
+          echo "Активный код чист: потребителей журнала нет"
+
+      - name: Предпосылка 2 — морда жива
+        run: |
+          code=$(curl -sS -o /tmp/dsh-health.json -w '%{http_code}' https://dsh-edge.mytab0r.workers.dev/api/health)
+          [ "$code" = "200" ] || { echo "::error::Морда отвечает $code — списание при мёртвой морде запрещено"; exit 1; }
+          [ "$(jq -r '.ok // false' /tmp/dsh-health.json)" = "true" ] || { echo "::error::Неожиданный ответ /api/health: $(cat /tmp/dsh-health.json)"; exit 1; }
+          echo "Морда жива: $(jq -r '.version // "неизвестная версия"' /tmp/dsh-health.json)"
+
+      - name: Предпосылка 3 — канарейка канала конвейера (write+read)
+        env:
+          DSH_EDGE_URL: https://dsh-edge.mytab0r.workers.dev
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          : "${DSH_EDGE_ACCESS_KEY:?DSH_EDGE_ACCESS_KEY не задан — канарейка канала невозможна, списание отменено}"
+          base="$DSH_EDGE_URL"
+          jar="$RUNNER_TEMP/decommission.cookies"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -c "$jar" -X POST "$base/api/auth/login" \
+            --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин в морду не удался (HTTP $code)"; exit 1; }
+          rpc() { # METHOD PAYLOAD → .result.value; отказ контракта — громкий
+            local method=$1 payload=$2 resp
+            resp=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+              -X POST "$base/api/$method" \
+              -d "{\"type\":\"client-request\",\"rpcId\":\"decommission\",\"method\":\"$method\",\"payload\":$payload}") \
+              || { echo "::error::RPC $method не доехал"; exit 1; }
+            jq -e '.result.ok == true' <<<"$resp" >/dev/null \
+              || { echo "::error::Морда отклонила $method: $(jq -c '.result.error' <<<"$resp")"; exit 1; }
+            jq '.result.value' <<<"$resp"
+          }
+          ws=$(rpc workspace.create '{"path":"/workspace/edge-harness"}' | jq -r '.workspace.workspaceId')
+          [ -n "$ws" ] && [ "$ws" != "null" ] || { echo "::error::Воркспейс edge-harness недоступен"; exit 1; }
+          rpc session.create "{\"workspaceId\":\"$ws\",\"sessionId\":\"harness-pipeline\"}" >/dev/null
+          rpc session.rename '{"sessionId":"harness-pipeline","title":"Конвейер edge-harness"}' >/dev/null
+          record=$(jq -nc --argjson ts "$(date -u +%s000)" \
+            '{task_id:"decommission:canary",kind:"decommission_check",data:{ok:true,run:"'"${GITHUB_RUN_ID:-local}"'"},source:"decommission",ts:$ts}')
+          event=$(jq -nc --argjson record "$record" \
+            '{type:"user/message",data:{id:("decommission-" + ($record.ts|tostring)),role:"user",content:[{type:"text",text:($record|tojson)}],source:{kind:"harness-pipeline-status"}}}')
+          jq -nc --argjson event "$event" '{events:[$event]}' > "$RUNNER_TEMP/canary-batch.json"
+          appended=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+            -X POST "$base/api/sessions/harness-pipeline/ingest" \
+            --data-binary "@$RUNNER_TEMP/canary-batch.json" | jq '.appended') \
+            || { echo "::error::Ingest канарейки не принят мордой"; exit 1; }
+          [ "$appended" -ge 1 ] || { echo "::error::Ingest канарейки принял 0 событий"; exit 1; }
+          row=$(curl -fsS -b "$jar" \
+            "$base/api/harness/events?task_id=decommission%3Acanary&limit=1")
+          echo "Канал прочитан назад: $row"
+          [ "$(jq -r '.events | length' <<<"$row")" -ge 1 ] \
+            || { echo "::error::Канарейка не доехала до чтения /api/harness/events — канал конвейера сломан, списание отменено"; exit 1; }
+          [ "$(jq -r '.events[0].kind' <<<"$row")" = "decommission_check" ] \
+            || { echo "::error::Прочитано не то, что писали: $(jq -c '.events[0]' <<<"$row")"; exit 1; }
+          echo "✅ Канал конвейера доказан: статус записан и прочитан через /api/harness/events без edge-harness воркера"
+
+      - name: Удаление воркера edge-harness из CF
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts"
+          listing=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api")
+          # .success обязателен: отказ API (токен/сеть) не имеет права выглядеть
+          # как «воркера нет» — иначе списание тихо пропустится с зелёным job'ом.
+          [ "$(jq -r '.success // "false"' <<<"$listing")" = "true" ] \
+            || { echo "::error::CF API не отдал список воркеров: $(echo "$listing" | head -c 300)"; exit 1; }
+          exists=$(jq '[.result[]? | select(.id == "edge-harness")] | length' <<<"$listing")
+          if [ "$exists" = "0" ]; then
+            echo "Воркер edge-harness уже списан — зелёный no-op (повторные прогоны не красятся)"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/delete.json -w '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/edge-harness")
+          [ "$code" = "200" ] || { echo "::error::CF отклонил удаление (HTTP $code): $(cat /tmp/delete.json)"; exit 1; }
+          [ "$(jq -r '.success // false' /tmp/delete.json)" = "true" ] \
+            || { echo "::error::CF ответил success=false: $(cat /tmp/delete.json)"; exit 1; }
+          after=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/edge-harness")
+          [ "$after" = "404" ] || { echo "::error::После удаления скрипт отвечает $after, ожидался 404"; exit 1; }
+          echo "✅ Воркер edge-harness удалён из CF (GET после удаления → 404)"

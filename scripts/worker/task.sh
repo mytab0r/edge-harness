@@ -286,32 +286,11 @@ fi
 [ "$claim_rc" -eq 0 ] || die "claim_task сломался (rc=$claim_rc): $claim_out"
 echo "Аренда взята: $claim_out"
 
-# ── 4b. Пульс живости: пока идёт работа, журнал знает, что воркер жив ────────────
-# Стопгэп наблюдаемости (#112): свежий /api/heartbeat — доказательство «агент
-# работает, не висит» (тот же контракт, что у hands); после #105 это видно и в
-# морде. Best-effort: промах не роняет job, но кричит warning'ом — молча-мертвый
-# пульс хуже шума. Полное решение (транскрипт сессии в морде) — #119.
-HB_PID=""
-stop_worker_heartbeat() {
-  if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
-}
-trap stop_worker_heartbeat EXIT
-if [ -n "${HANDS_TOKEN:-}" ] && [ -n "${HARNESS_URL:-}" ]; then
-  (
-    while :; do
-      sleep "${HEARTBEAT_SECS:-60}"
-      curl -fsS --max-time 20 -X POST "$HARNESS_URL/api/heartbeat" \
-        -H "Authorization: Bearer $HANDS_TOKEN" \
-        -H "content-type: application/json" \
-        -d "{\"job_id\":\"worker-${GITHUB_RUN_ID:-local}\",\"task_id\":\"issue-$number\"}" \
-        >/dev/null 2>&1 || echo "::warning::heartbeat не принят журналом"
-    done
-  ) &
-  HB_PID=$!
-  echo "Пульс живости: $HARNESS_URL/api/heartbeat каждые ${HEARTBEAT_SECS:-60} с (worker-${GITHUB_RUN_ID:-local} / issue-$number)"
-else
-  echo "::warning::HANDS_TOKEN/HARNESS_URL не заданы — пульс живости выключен, зависание видно только по таймауту"
-fi
+# ── 4b. Наблюдаемость — транскрипт сессии в морде (#119) ──────────────────────────
+# Стопгэп heartbeat (#112) списан вместе с журналом edge-harness (#86): его
+# читатели («руки живы», замер dispatch→heartbeat) жили в списываемом UI.
+# Живость агента теперь доказывает сессия раннера в морде, которую ниже
+# создаёт task.sh — «работает, не висит» видно по событиям транскрипта.
 
 # ── 5. Ветка: новая от свежего origin/main, либо чекаут существующего PR (#245) ──
 if [ -n "$CONTINUE_PR_NUMBER" ]; then

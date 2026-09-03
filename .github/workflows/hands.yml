@@ -1,8 +1,8 @@
-# Руки слайса 1 (dsh-in-job): поднимаются по repository_dispatch из морды,
-# исполняют задачу полноценным DSH headless и стримят журнал в Durable Object.
+# Руки (dsh-in-job): поднимаются по dispatch, исполняют задачу полноценным
+# DSH headless и показывают ход работы в морде dsh-edge (транскрипт — сессия
+# раннера, жизненный цикл job — канал конвейера, #86).
 # Дизайн — openspec/changes/dsh-in-job/, контракт — openspec/specs/journal-tasks-hands.md.
-# Ручной прогон (workflow_dispatch) идёт под task_id manual-<run_id> и НЕ ходит в
-# POST /api/tasks: задача из воркфлоу дёрнула бы новый dispatch — бесконечный цикл.
+# Ручной прогон (workflow_dispatch) идёт под task_id manual-<run_id>.
 name: hands
 
 on:
@@ -52,10 +52,11 @@ jobs:
 
       - name: Прогон задачи через DSH headless
         env:
-          HANDS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Текст задачи (#86): больше не лежит в журнале edge-harness —
+          # едет в payload диспетча (repository_dispatch) или в inputs
+          # ручного прогона. Нет текста — громкий отказ клиента рук.
           TASK_ID: ${{ github.event.client_payload.task_id || format('manual-{0}', github.run_id) }}
-          TASK_TEXT: ${{ inputs.task_text }}
+          TASK_TEXT: ${{ inputs.task_text || github.event.client_payload.task_text }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # Сессия раннера в морде (#119): транскрипт хода работы виден в
           # нативном DSH UI, воркспейс edge-harness, имя = задача. Без

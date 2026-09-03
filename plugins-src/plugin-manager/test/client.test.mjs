@@ -4,7 +4,7 @@
  * Проверяется форма обёртки бандла (что собрал build.mjs), монтаж в слот
  * settings.section, паритет ключей словарей, поведение ячеек статусов на
  * ПРОДА-форме данных журнала: { events: [{id, kind, data}], has_more,
- * next_after } (контракт cf-worker/src/harness.ts), а также конвейер заказа
+ * next_after } (контракт канала конвейера, патч 0005), а также конвейер заказа
  * (#113) на ПРОДА-форме RPC морды (контракт @deepseek-ai/dsh-host-apiproxy
  * 0.1.1-rc.2, docs/research/12-dsh-edge-session-api.md):
  * {type:"server-response", result:{ok,value}|{ok:false,error:{code,message}}}.

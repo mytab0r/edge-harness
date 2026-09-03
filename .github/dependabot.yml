@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: npm
-    directory: /cf-worker
+    directory: /cf-pulse
     schedule:
       interval: weekly
   - package-ecosystem: github-actions

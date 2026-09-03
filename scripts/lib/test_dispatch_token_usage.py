@@ -10,12 +10,12 @@ runner-bridge — сузили токен, сломали конвейер. Ра
 
 Правила:
   1. `secrets.GH_DISPATCH_TOKEN` в .github/workflows/ (в любой форме записи —
-     dot и bracket; файлы .yml И .yaml) упоминает ТОЛЬКО deploy-worker.yml
-     (единственный потребитель узкого токена: синхронизация значения в секрет
-     воркера).
-  2. deploy-worker.yml обязан сохранять саму синхронизацию
+     dot и bracket; файлы .yml И .yaml) упоминает ТОЛЬКО deploy-pulse.yml
+     (единственный потребитель узкого токена: с #86 пульс живёт в
+     cf-pulse, а deploy-worker.yml списан — #86).
+  2. deploy-pulse.yml обязан сохранять саму синхронизацию
      (`wrangler secret put GH_DISPATCH_TOKEN`) — иначе узкий токен не доедет
-     до воркера, и морда молча останется на старом значении.
+     до воркера пульса, и конвейер молча останется без диспетчей.
   3. Бывшие широкие потребители (worker, orchestra, deploy-dsh-edge,
      dispatch-latency-probe) обязаны читать `secrets.GH_PIPELINE_PAT` —
      исчезновение источника PAT замечается здесь, а не 401 на первом пуше.
@@ -36,8 +36,9 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 DISPATCH_SECRET_RE = r"secrets[.\[]\s*['\"]?GH_DISPATCH_TOKEN\b"
 PIPELINE_SECRET = "secrets.GH_PIPELINE_PAT"
 
-# Единственный законный потребитель узкого dispatch-токена.
-DISPATCH_CONSUMER = "deploy-worker.yml"
+# Единственный законный потребитель узкого dispatch-токена: деплой пульс-воркера
+# (cf-pulse, #86) — туда переехала и синк-секрета, и гвардия узости.
+DISPATCH_CONSUMER = "deploy-pulse.yml"
 
 # Бывшие скваттеры широкого PAT: их миграция на GH_PIPELINE_PAT — часть задачи #6.
 PIPELINE_CONSUMERS = [
@@ -53,8 +54,9 @@ PIPELINE_CONSUMERS = [
 EXPECTED_WORKFLOWS = frozenset({
     "ai-review.yml",
     "codeql.yml",
+    "decommission-worker.yml",
     "deploy-dsh-edge.yml",
-    "deploy-worker.yml",
+    "deploy-pulse.yml",
     "dispatch-latency-probe.yml",
     "hands.yml",
     "orchestra.yml",
@@ -103,13 +105,16 @@ def test_dispatch_token_secret_used_only_by_deploy_worker():
 
 
 def test_deploy_worker_still_syncs_dispatch_token():
-    """Деплой обязан доставлять узкий токен в секрет воркера (правило 2)."""
+    """Деплой обязан доставлять узкий токен в секрет воркера (правило 2).
+
+    Форма вызова — regex с опциональным пином версии (`wrangler@4`):
+    правило — «синк происходит», а не конкретная запись бинаря."""
     text = workflow_text(DISPATCH_CONSUMER)
     assert re.search(DISPATCH_SECRET_RE, text), (
         f"{DISPATCH_CONSUMER} больше не читает secrets.GH_DISPATCH_TOKEN — синхронизация "
-        "секрета воркера потеряна, морда застрянет на старом значении"
+        "секрета воркера потеряна, конвейер застрянет на старом значении"
     )
-    assert "wrangler secret put GH_DISPATCH_TOKEN" in text, (
+    assert re.search(r"wrangler(@\S+)? secret put GH_DISPATCH_TOKEN", text), (
         f"{DISPATCH_CONSUMER} не делает wrangler secret put GH_DISPATCH_TOKEN — "
         "переустановка секрета воркера при деплое потеряна (воркер мог быть "
         "удалён из CF вместе с секретами)"

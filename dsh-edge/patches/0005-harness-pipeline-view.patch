@@ -1,0 +1,270 @@
+diff --git a/apps/dsh-edge/src/harness-pipeline.ts b/apps/dsh-edge/src/harness-pipeline.ts
+new file mode 100644
+index 0000000..393ad1a
+--- /dev/null
++++ b/apps/dsh-edge/src/harness-pipeline.ts
+@@ -0,0 +1,240 @@
++/**
++ * Harness pipeline view (#86): the conveyor statuses of the edge-harness
++ * pipeline (deploy statuses, job lifecycle) are user/message events of one
++ * viewer session, ingested by the runner-side writers (patch 0004 route).
++ * This module serves them to the pre-existing journal readers
++ * (plugin-manager, integrations sections) in the exact response shape of the
++ * decommissioned edge-harness journal (openspec/specs/journal-tasks-hands.md
++ * before #86), so no reader had to be re-released:
++ *
++ *   GET /api/harness/events?task_id=<id>&after=<id>&limit=<n>
++ *     → { events: [{ id, task_id, seq, ts, source, kind, data }, …],
++ *         has_more, next_after }
++ *
++ * Identification of a status event is `data.source.kind`, never text
++ * sniffing: patch 0004 obliges every ingested user/message to carry a source,
++ * and the writers stamp theirs. The message text itself is a strict one-line
++ * JSON record ({task_id, kind, data, source, ts, emitted}) — the writer is
++ * scripts/lib/dsh-edge-pipeline.sh in the edge-harness repo. Records that
++ * fail to parse are skipped, not errors: humans may type into the same session.
++ */
++import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
++import { EdgeHttpError } from './http.ts'
++import { EdgeSessionStoreError, type EdgeSessionStore } from './session-store.ts'
++
++/** The one conveyor session; writers create-or-reuse it by this id. */
++export const HARNESS_PIPELINE_SESSION_ID = 'harness-pipeline'
++/** The source stamp that marks an ingested user/message as a pipeline record. */
++export const HARNESS_PIPELINE_SOURCE = 'harness-pipeline-status'
++
++const DEFAULT_PAGE_LIMIT = 100
++const MAX_PAGE_LIMIT = 500
++const MAX_TASK_ID_LENGTH = 200
++/** Bound of one request: canonical events scanned (the session grows ~10
++ *  events per deploy; the ceiling keeps CPU bounded no matter what). */
++const MAX_SCAN_EVENTS = 20_000
++/** Per-readEventPage byte budget, one replay window (matches replay route). */
++const PAGE_MAX_BYTES = 1_048_576
++const PAGE_SIZE = 256
++
++interface JournalRow {
++  id: number
++  task_id: string
++  seq: number
++  ts: number
++  source: string
++  kind: string
++  data: unknown
++}
++
++export async function readHarnessPipelineEvents(
++  sessions: EdgeSessionStore,
++  request: Request,
++  url: URL,
++): Promise<Response> {
++  if (request.method !== 'GET') {
++    throw new EdgeHttpError(405, 'Harness pipeline events are read-only.')
++  }
++  const taskId = url.searchParams.get('task_id') ?? ''
++  if (taskId.length === 0 || taskId.length > MAX_TASK_ID_LENGTH) {
++    throw new EdgeHttpError(400, 'task_id is required (journal contract: pseudo-task id).')
++  }
++  const after = resolveJournalAfter(url)
++  const limit = resolveJournalLimit(url)
++
++  const page = await collectRows(sessions, taskId, after, limit)
++  const body = JSON.stringify({
++    events: page.rows,
++    has_more: page.hasMore,
++    next_after: page.nextAfter,
++  })
++  const headers: Record<string, string> = {
++    'content-type': 'application/json',
++    'x-has-more': String(page.hasMore),
++    'x-next-after': String(page.nextAfter),
++  }
++  return new Response(body, { headers })
++}
++
++interface JournalPage {
++  rows: JournalRow[]
++  hasMore: boolean
++  nextAfter: number
++}
++
++/** Scan the pipeline session from `after`, projecting status records to journal rows. */
++async function collectRows(
++  sessions: EdgeSessionStore,
++  taskId: string,
++  after: number,
++  limit: number,
++): Promise<JournalPage> {
++  const rows: JournalRow[] = []
++  let cursor = after + 1
++  let scanned = 0
++  let more = false
++  try {
++    while (rows.length < limit && scanned < MAX_SCAN_EVENTS) {
++      const page = await sessions.readEventPage(
++        SessionId(HARNESS_PIPELINE_SESSION_ID),
++        cursor,
++        PAGE_SIZE,
++        PAGE_MAX_BYTES,
++      )
++      let scannedInPage = 0
++      for (const event of page.events) {
++        cursor = event.seq + 1
++        scanned += 1
++        scannedInPage += 1
++        const row = journalRowOf(event)
++        if (row === undefined || row.task_id !== taskId) continue
++        rows.push(row)
++        if (rows.length >= limit) break
++      }
++      if (rows.length >= limit) {
++        // The page ended because the journal page is full: whether MORE MATCHING
++        // rows exist is not implied by raw events remaining — the journal
++        // contract counts filtered rows (a false has_more makes every reader
++        // walk an extra page; a false negative loses the tail). Look ahead
++        // without collecting until the next match or the end of the log.
++        more = await hasMatchingAhead(sessions, taskId, cursor, scanned)
++        break
++      }
++      more = page.hasMore
++      if (!page.hasMore || page.events.length === 0) break
++    }
++  } catch (error) {
++    // No conveyor session yet = no statuses yet: an honest empty page, the way
++    // the journal answered an unknown pseudo-task. Any other store failure is loud.
++    if (error instanceof EdgeSessionStoreError && error.code === 'NOT_FOUND') {
++      return { rows: [], hasMore: false, nextAfter: after }
++    }
++    throw error
++  }
++  const last = rows[rows.length - 1]
++  const nextAfter = last !== undefined ? last.id : after
++  return { rows, hasMore: more, nextAfter }
++}
++
++/**
++ * Whether at least one row for `taskId` exists at or after `cursor`. Scans
++ * without collecting; the session budget is shared with the collecting scan so
++ * one request can never scan unboundedly.
++ */
++async function hasMatchingAhead(
++  sessions: EdgeSessionStore,
++  taskId: string,
++  cursor: number,
++  scannedSoFar: number,
++): Promise<boolean> {
++  let cursorAt = cursor
++  let scanned = scannedSoFar
++  try {
++    while (scanned < MAX_SCAN_EVENTS) {
++      const page = await sessions.readEventPage(
++        SessionId(HARNESS_PIPELINE_SESSION_ID),
++        cursorAt,
++        PAGE_SIZE,
++        PAGE_MAX_BYTES,
++      )
++      for (const event of page.events) {
++        cursorAt = event.seq + 1
++        scanned += 1
++        const row = journalRowOf(event)
++        if (row !== undefined && row.task_id === taskId) return true
++      }
++      if (!page.hasMore || page.events.length === 0) return false
++    }
++  } catch (error) {
++    if (error instanceof EdgeSessionStoreError && error.code === 'NOT_FOUND') return false
++    throw error
++  }
++  // Budget exhausted mid-scan: claim more conservatively rather than lose a tail.
++  return true
++}
++
++/** Project one canonical event to a journal row; non-records are skipped. */
++function journalRowOf(event: SessionEvent): JournalRow | undefined {
++  if (event.type !== 'user/message') return undefined
++  const data = event.data as { source?: unknown; content?: unknown } | undefined
++  if (data === null || typeof data !== 'object') return undefined
++  const source = data.source as { kind?: unknown } | undefined
++  if (source === null || typeof source !== 'object' || source.kind !== HARNESS_PIPELINE_SOURCE) {
++    return undefined
++  }
++  if (!Array.isArray(data.content)) return undefined
++  const text = data.content
++    .map((block) =>
++      block !== null && typeof block === 'object' && (block as { type?: unknown }).type === 'text'
++      && typeof (block as { text?: unknown }).text === 'string'
++        ? (block as { text: string }).text
++        : '',
++    )
++    .join('')
++  let record: unknown
++  try {
++    record = JSON.parse(text)
++  } catch {
++    return undefined
++  }
++  if (record === null || typeof record !== 'object' || Array.isArray(record)) return undefined
++  const fields = record as Record<string, unknown>
++  const { task_id: taskId, kind } = fields
++  if (typeof taskId !== 'string' || taskId.length === 0 || typeof kind !== 'string' || kind.length === 0) {
++    return undefined
++  }
++  const payload = fields.data
++  if (payload !== null && payload !== undefined && (typeof payload !== 'object' || Array.isArray(payload))) {
++    return undefined
++  }
++  return {
++    id: event.seq,
++    task_id: taskId,
++    seq: event.seq,
++    ts: typeof fields.ts === 'number' && Number.isFinite(fields.ts) ? fields.ts : event.time,
++    source: typeof fields.source === 'string' ? fields.source : 'system',
++    kind,
++    data: payload ?? null,
++  }
++}
++
++function resolveJournalAfter(url: URL): number {
++  const value = url.searchParams.get('after') ?? '0'
++  if (!/^\d+$/.test(value)) throw new EdgeHttpError(400, 'after must be a non-negative integer.')
++  const sequence = Number(value)
++  if (!Number.isSafeInteger(sequence) || sequence >= Number.MAX_SAFE_INTEGER) {
++    throw new EdgeHttpError(400, 'after exceeds the supported integer range.')
++  }
++  return sequence
++}
++
++function resolveJournalLimit(url: URL): number {
++  const raw = url.searchParams.get('limit')
++  if (raw === null) return DEFAULT_PAGE_LIMIT
++  if (!/^\d+$/.test(raw)) throw new EdgeHttpError(400, 'limit must be a positive integer.')
++  const limit = Number(raw)
++  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_PAGE_LIMIT) {
++    throw new EdgeHttpError(400, `limit must be between 1 and ${MAX_PAGE_LIMIT}.`)
++  }
++  return limit
++}
+diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
+index 43f172f..0d11cec 100644
+--- a/apps/dsh-edge/src/instance.ts
++++ b/apps/dsh-edge/src/instance.ts
+@@ -30,6 +30,7 @@ import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title'
+ import { DurableObject } from 'cloudflare:workers'
+ import { OWNER_SESSION_EXPIRY_HEADER } from './auth.ts'
+ import { DirectShellBackend } from './direct-shell.ts'
++import { readHarnessPipelineEvents } from './harness-pipeline.ts'
+ import {
+   resolveEdgeModel,
+ } from './deepseek.ts'
+@@ -304,6 +305,11 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+       if (url.pathname === '/api/events.mux' || url.pathname === '/api/events.host') {
+         return await this.openDownlink(request, url.pathname === '/api/events.mux' ? 'mux' : 'host')
+       }
++      if (url.pathname === '/api/harness/events') {
++        // Harness pipeline view (#86): conveyor statuses of the edge-harness
++        // pipeline in the journal response shape, served from the viewer session.
++        return await readHarnessPipelineEvents(this.sessions, request, url)
++      }
+       if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/sessions')) {
+         return await this.apiFetch(request)
+       }

@@ -1,7 +1,10 @@
 # ADR 0004. Контракт API: один источник, ключевой доступ, канарейки на двух воротах
 
 - **Дата:** 2026-08-28
-- **Статус:** принято
+- **Статус:** принят; воркер, чей контракт описан здесь, списан в #86 — форма
+  ответа журнала живёт как `GET /api/harness/events` на морде dsh-edge
+  ([спека](../../openspec/specs/journal-tasks-hands.md)), источник — сессия
+  конвейера, а не DO воркера. Текст ниже — история решения, не текущее поведение.
 - **Смежное:** [ADR 0003](0003-dispatch-latency-verdict.md),
   [тестовый стек CF](../research/22-cf-testing-toolchain.md),
   [`scripts/check-frontend-contract.mjs`](../../cf-worker/scripts/check-frontend-contract.mjs)

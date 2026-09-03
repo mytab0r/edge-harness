@@ -5,7 +5,7 @@
  * settings.section, паритет ключей словарей, вшитый реестр (= dsh-edge/
  * integrations.json), и поведение ячеек статусов на ПРОДА-форме ответа
  * журнала {events:[{id, kind, data}], has_more, next_after} с проходом
- * страниц до конца выборки — по контракту cf-worker/src/harness.ts.
+ * страниц до конца выборки — по контракту канала конвейера (патч 0005).
  *
  * Запуск: node --test plugins-src/integrations/test/client.test.mjs
  * (тест сам прогоняет build.mjs — продукт генерируется перед проверкой).
@@ -175,7 +175,7 @@ function responseStub({ ok, status, contentType, body }) {
 }
 
 /**
- * Прод-форма журнала (контракт cf-worker/src/harness.ts): события по возрасту
+ * Прод-форма журнала (контракт канала конвейера, патч 0005): события по возрасту
  * id, страницы от старейших, has_more/next_after. statuses — карта id → массив
  * data событий integration_status, разложенная по страницам по 1 событию, чтобы
  * проход по next_after был настоящим, а не декорацией.
