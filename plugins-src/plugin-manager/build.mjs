@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseManifest, loadCatalog } from '../../dsh-edge/manifest.mjs'
+import { parseManifest, loadCatalog, ID_PATTERN_SOURCE } from '../../dsh-edge/manifest.mjs'
 
 const pluginDir = dirname(fileURLToPath(import.meta.url))
 const repoRoot = join(pluginDir, '..', '..')
@@ -58,6 +58,19 @@ const roster = manifest.plugins.map(({ id, server, client }) => ({ id, server, c
 // обновлении манифеста, каталог не надо синхронизировать с ним в данных).
 const catalog = await loadCatalog(join(repoRoot, 'dsh-edge'))
 
+// Маркер заказа выводится из шаблона id (одно место правды), а не копируется
+// в теле бандла: расширят шаблон id — маркер расширится вместе с ним, иначе
+// дедупликация молча перестанет узнавать новые id (ревью PR #232, находка 2).
+// Здесь же гвардия: захват маркера обязан быть равен id ЦЕЛИКОМ — если
+// шаблон id когда-нибудь станет шире маркерного, захват обрежется и
+// покраснеет сборка здесь, а не дедупликация продакшена.
+const orderMarkerPattern = `\\[plugin-order:(${ID_PATTERN_SOURCE})\\]`
+for (const id of [...manifest.plugins.map((p) => p.id), ...catalog.plugins.map((p) => p.id)]) {
+  const captured = new RegExp(orderMarkerPattern).exec(`[plugin-order:${id}]`)
+  failUnless(captured !== null && captured[1] === id,
+    `id "${id}" не матчится маркером заказа — дедупликация заказов для него молча не работает`)
+}
+
 // ── 3. Тело бандла и его гвардии ──────────────────────────────────────────────
 const body = await readFile(join(pluginDir, 'src', 'body.js'), 'utf8')
 
@@ -87,7 +100,7 @@ failUnless(unseeded.length === 0,
 // неполон; достаточно, потому что присваивание свободной переменной обёртки
 // затирало бы её только внутри фабрики и ловится синтаксической проверкой
 // бандла при использовании.
-for (const reserved of ['module', 'exports', 'require', 'MANIFEST', 'CATALOG']) {
+for (const reserved of ['module', 'exports', 'require', 'MANIFEST', 'CATALOG', 'ORDER_MARKER_SOURCE']) {
   failUnless(!new RegExp(`(?:var|let|const|function|class)\\s+${reserved}\\b`).test(body),
     `src/body.js: тело объявляет "${reserved}" — это свободная переменная обёртки, коллизия`)
 }
@@ -102,6 +115,8 @@ const bundle = [
   `const MANIFEST = ${JSON.stringify(roster, null, 2)};`,
   ``,
   `const CATALOG = ${JSON.stringify(catalog.plugins, null, 2)};`,
+  ``,
+  `const ORDER_MARKER_SOURCE = ${JSON.stringify(orderMarkerPattern)};`,
   ``,
   body,
   ``,

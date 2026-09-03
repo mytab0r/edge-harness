@@ -270,6 +270,17 @@ test('вшитый каталог = dsh-edge/plugins-catalog.json (срез не
   assert.deepEqual(extractBakedCatalog(), catalogFile.plugins)
 })
 
+test('маркер заказа выведен из шаблона id и матчится каждым id каталога и манифеста', () => {
+  const match = bundle.match(/const ORDER_MARKER_SOURCE = ("(?:[^"\\]|\\.)*");/)
+  assert.ok(match, 'в бандле нет константы ORDER_MARKER_SOURCE (маркер обязан выводиться сборкой из шаблона id)')
+  const marker = new RegExp(JSON.parse(match[1]))
+  for (const id of [...extractBakedManifest(), ...extractBakedCatalog()].map((x) => x.id)) {
+    const captured = marker.exec('[plugin-order:' + id + ']')
+    assert.ok(captured && captured[1] === id,
+      `маркер заказа не узнаёт id "${id}" целиком — дедупликация молча пропустит дубликат`)
+  }
+})
+
 test('manifest.json пакета = текущему каталогу репозитория (срез не устарел)', async () => {
   // sha256 в каталоге доказывает целостность артефакта, но не свежесть:
   // пакет, собранный из старого среза, закрепил бы в релизе чужой состав.

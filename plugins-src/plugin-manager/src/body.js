@@ -114,7 +114,10 @@ const ORDERS_WORKSPACE_PATH = "/workspace/edge-harness";
 // окно — объявленный газ, после установки плагин уходит из каталога сам
 // (вычитание манифеста).
 const DEDUP_WINDOW_MESSAGES = 20;
-const ORDER_MARKER = /\[plugin-order:([a-z0-9-]+)\]/;
+// Свободная переменная обёртки: маркер заказа ВЫВЕДЕН сборкой из шаблона id
+// (ID_PATTERN в dsh-edge/manifest.mjs — одно место правды; см. build.mjs —
+// там же гвардия, что каждый id каталога и манифеста матчится маркером).
+const ORDER_MARKER = new RegExp(ORDER_MARKER_SOURCE);
 
 class RpcError extends Error {
   constructor(code, message) {

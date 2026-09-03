@@ -22,7 +22,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const MANIFEST_VERSION = 1
 export const PLUGIN_SCOPE = '@edge-harness'
-const ID_PATTERN = /^[a-z][a-z0-9-]*$/
+// Тело шаблона id БЕЗ якорей — единственное место правды: сам ID_PATTERN
+// получает якоря здесь, а производные регэкспы (маркер заказа
+// `[plugin-order:<id>]` в plugin-manager) вкладывают тело в себя. Если бы
+// якоря жили в одном месте с телом, вложение молча ломалось (ревью PR #232,
+// находка 2). Смена тела = пересмотр всех производных.
+const ID_BODY_SOURCE = '[a-z][a-z0-9-]*'
+const ID_PATTERN = new RegExp('^(?:' + ID_BODY_SOURCE + ')$')
+/** Источник тела шаблона id (без якорей) — для производных регэкспов сборки. */
+export const ID_PATTERN_SOURCE = ID_BODY_SOURCE
 const PACKAGE_PATTERN = /^@edge-harness\/[a-z0-9][a-z0-9.-]*$/
 const RELEASE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
