@@ -51,7 +51,7 @@
       "source": {
         "release": "plugins-registry-v0.1.1",
         "asset": "provider-registry-0.1.1.tgz",
-        "sha256": "99bc8be8f621d5998568fda7b3023ae7166d4187364156b489fdc179d4a9c521"
+        "sha256": "2ad628c62b61168783d288c4d7cc74b0aefb4a1601344f51d6263fd73059d5a9"
       },
       "server": true,
       "client": false

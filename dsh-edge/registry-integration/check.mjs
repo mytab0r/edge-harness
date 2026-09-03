@@ -28,11 +28,13 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 
 const appDir = process.argv[2]
-if (!appDir) {
-  console.error('Использование: node check.mjs <APP_DIR (apps/dsh-edge клона)>')
+const directoryJson = process.argv[3]
+if (!appDir || !directoryJson) {
+  console.error('Использование: node check.mjs <APP_DIR> <plugins-src/provider-registry/directory.json>')
   process.exit(1)
 }
 const standaloneDir = join(appDir, 'standalone')
@@ -152,6 +154,11 @@ function protocolChoices(schemaJson) {
   return []
 }
 
+// Состав directory-каталога читается из directory.json плагина — единственного
+// места правды (не дублируется списком здесь).
+const DIRECTORY_ROUTES = (await import(pathToFileURL(directoryJson).href, { with: { type: 'json' } })).default
+  .map((item) => item.route)
+
 const ZHIPU_PROFILE = {
   displayName: 'Z.ai (GLM)',
   api: 'openai-completions',
@@ -181,7 +188,7 @@ const ZHIPU_PROFILE = {
     const official = rows.find((row) => row.provider === 'deepseek-official')
     assert.ok(official !== undefined, 'штатный провайдер морды на месте')
     assert.equal(official.active, true, 'штатный провайдер активен — селектор моделей жив')
-    for (const route of ['zhipu', 'nvidia-nim', 'openrouter', 'deepseek']) {
+    for (const route of DIRECTORY_ROUTES) {
       const row = rows.find((candidate) => candidate.provider === route)
       assert.ok(row !== undefined, `directory содержит ${route} (кнопка Add)`)
       assert.equal(row.active, false, `${route} пока не настроен — не активен`)
