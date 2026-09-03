@@ -54,13 +54,17 @@ GitHub заново и не трогает scheduler.py дальше одной 
      первое наблюдение только оставляет след-маркер в WATCHDOG_ISSUE
      (переиспользуем канал pulse_guard, тот же приём, что PAUSE_MARKER),
      задача заводится только когда маркер того же отпечатка уже старше
-     порога. Разовый блип не плодит задачу.
+     порога. Разовый блип не плодит задачу. Маркер живёт в WATCHDOG_ISSUE
+     вечно, поэтому счётчик обязан сбрасываться по факту закрытия прошлой
+     автозадачи с тем же отпечатком (`_closed_task_reset_times`) — иначе
+     блип того же отпечатка после решения находит старый маркер и заводит
+     вторую задачу мгновенно, без устойчивости в новом эпизоде (находка
+     AI-ревью PR #248).
   3. Суточный потолок — STALL_DAILY_CAP новых автозадач; превышение не
      тонет молча, а кричит строкой отчёта («потолок исчерпан»).
   4. Метка `auto-detected` — на каждой заведённой задаче (плюс обычная
-     `task`, чтобы воркер мог её взять). Реестр меток docs/agents/LABELS.md
-     этим модулем не правится (другой агент, #207) — см. предупреждение в
-     теле PR.
+     `task`, чтобы воркер мог её взять). Строка реестра — docs/agents/LABELS.md
+     (#207).
   5. Эскалация владельцу (escalate_stale_auto_tasks) — автозадача не
      закрытая дольше ESCALATE_AFTER_HOURS уходит тем же каналом, что
      pulse_guard.escalate (issue-комментарий + Telegram), текст обязан
@@ -117,8 +121,7 @@ STALL_DAILY_CAP = 5
 ESCALATE_AFTER_HOURS = 48
 
 TASK_LABEL = "task"
-# Метка происхождения — реестр docs/agents/LABELS.md правит другой агент
-# (#207); строка для реестра называется в теле PR, сюда файл не трогаем.
+# Метка происхождения — строка реестра docs/agents/LABELS.md (#207).
 AUTO_LABEL = "auto-detected"
 
 SIGNAL_MARKER_PREFIX = "[симптом:"
@@ -287,6 +290,36 @@ def _sighting_marker(fingerprint: str) -> str:
     return f"{SIGNAL_MARKER_PREFIX} {fingerprint}]"
 
 
+_FINGERPRINT_BODY_RE = re.compile(r"Отпечаток: `([^`]+)`")
+
+
+def _closed_task_reset_times(repo: str) -> dict[str, datetime]:
+    """Отпечаток → время закрытия последней автозадачи с этим отпечатком.
+
+    Точка сброса счётчика устойчивости (находка AI-ревью PR #248, обход
+    предохранителя). Маркер первого наблюдения в WATCHDOG_ISSUE никогда не
+    удаляется — живёт там вечно. Без точки сброса один блип того же
+    отпечатка ПОСЛЕ того, как предыдущая автозадача по нему уже закрыта,
+    находит тот старый маркер: `min(seen)` возвращает многодневную давность,
+    `age >= STALL_PERSIST_MINUTES` истинно немедленно, и задача заводится по
+    одному блипу, не продержавшись ни минуты в ЭТОМ эпизоде. Сайтинги
+    старше момента закрытия своей задачи не считаются в счёт нового эпизода
+    — `detect_and_act` отфильтровывает их до вычисления возраста."""
+    issues = gh(f"repos/{repo}/issues?state=closed&labels={AUTO_LABEL}&per_page=100") or []
+    resets: dict[str, datetime] = {}
+    for issue in issues:
+        if "pull_request" in issue or not issue.get("closed_at"):
+            continue
+        match = _FINGERPRINT_BODY_RE.search(issue.get("body") or "")
+        if not match:
+            continue
+        fp = match.group(1)
+        closed_at = parse_time(issue["closed_at"])
+        if fp not in resets or closed_at > resets[fp]:
+            resets[fp] = closed_at
+    return resets
+
+
 def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | None = None) -> list[str]:
     """Вызывается КАЖДЫМ пульсом оркестратора с уже готовым отчётом (тем же
     списком строк, что печатается в GITHUB_STEP_SUMMARY). Пустой вход
@@ -300,6 +333,7 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
     grouped = group_by_fingerprint(signals)
     open_auto = open_auto_tasks(repo)
     created_today: int | None = None  # считаем лениво — только если понадобится создание
+    reset_times: dict[str, datetime] | None = None  # тоже лениво — только если есть что фильтровать
 
     for fingerprint, evidence in grouped.items():
         existing = find_open_task(repo, fingerprint, open_auto)
@@ -314,6 +348,14 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
 
         marker = _sighting_marker(fingerprint)
         seen = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+        if seen:
+            if reset_times is None:
+                reset_times = _closed_task_reset_times(repo)
+            boundary = reset_times.get(fingerprint)
+            if boundary:
+                # Сайтинги до закрытия своей же прошлой задачи — эпизод уже
+                # решён, в счёт устойчивости НОВОГО эпизода не идут.
+                seen = [t for t in seen if t > boundary]
         if not seen:
             post_issue_comment(
                 repo, WATCHDOG_ISSUE,
