@@ -287,11 +287,11 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
     }
 
 
-def issue(number, *, assignees=("someone",)):
+def issue(number, *, assignees=("someone",), labels=("task",)):
     return {
         "number": number,
         "assignees": [{"login": a} for a in assignees],
-        "labels": [{"name": "task"}],
+        "labels": [{"name": n} for n in labels],
     }
 
 
@@ -319,6 +319,22 @@ class FakeGh:
 
 
 REPO = "mytab0r/edge-harness"
+
+
+# ── reap_stale (#61): просрочённое назначение без PR возвращается в пул ──────────
+
+
+def test_reap_stale_skips_blocked_labeled_issue(monkeypatch):
+    # Тот же класс, что unhealthy_pulls (находка AI-ревью PR #247, 2026-09-03):
+    # эскалация playbook (метка blocked) держит назначение намеренно — reap_stale
+    # не имеет права снять его по истечении STALE_HOURS, иначе задача вернётся
+    # в пул и снова достанется воркеру без того, что есть только у владельца.
+    task = issue(260, labels=["task", "blocked"])
+    fake = FakeGh({"issues?state=open&labels=task": [task]})
+    patch_gh(monkeypatch, fake)
+    lines = sch.reap_stale(REPO, utc(2026, 9, 2, 12, 0), [])
+    assert lines == []
+    assert not any("timeline" in c for c in fake.calls)
 
 
 # ── Поведение 1: готовый PR без вердикта — дёрнуть гейт самому ───────────────────
@@ -542,6 +558,23 @@ def test_unhealthy_pulls_skips_conflict_labeled_pr(monkeypatch):
     fake = FakeGh({"issues?state=open&labels=task": [task]})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("conflict — не наш класс"))
+    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert lines == []
+    assert not any("check-runs" in c for c in fake.calls)
+
+
+def test_unhealthy_pulls_skips_blocked_labeled_issue(monkeypatch):
+    # Находка AI-ревью PR #247 (2026-09-03): воркер эскалировал (метка blocked,
+    # playbook), назначение осталось. Без этого пропуска unhealthy_pulls снял бы
+    # исполнителя с нездорового PR по таймеру, oldest_free выбрал бы ту же задачу
+    # как старейшую свободную — вечный цикл без газа, PR не в силах владельца
+    # починить чинит агент раз за разом.
+    task = issue(270, labels=["task", "blocked"])
+    p = pull(271, labels=["review:ok", "ai:changes-requested"],
+              updated_at="2026-09-02T08:00:00Z", pr_body="#270")
+    fake = FakeGh({"issues?state=open&labels=task": [task]})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("blocked — газ только у владельца"))
     lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
