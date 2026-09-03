@@ -189,6 +189,7 @@ def test_marker_younger_than_threshold_still_waits(monkeypatch):
     first_seen = NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES - 5)
     fake = FakeGh({
         "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],  # прежних решённых задач по отпечатку нет
         "issues/120/comments": [
             {"created_at": first_seen.isoformat().replace("+00:00", "Z"),
              "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
@@ -209,6 +210,7 @@ def test_marker_older_than_threshold_creates_task_with_evidence(monkeypatch):
     first_seen = NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)
     fake = FakeGh({
         "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],  # прежних решённых задач по отпечатку нет
         "issues/120/comments": [
             {"created_at": first_seen.isoformat().replace("+00:00", "Z"),
              "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
@@ -227,6 +229,77 @@ def test_marker_older_than_threshold_creates_task_with_evidence(monkeypatch):
     assert REAL_PIPELINE_PAUSED in create_call
 
 
+# ── Сброс устойчивости после закрытия прошлой автозадачи ───────────────────
+
+def test_blip_after_task_closed_does_not_bypass_persistence(monkeypatch):
+    """Мутационная гвардия находки AI-ревью PR #248 (обход предохранителя
+    устойчивости, воспроизведён прогоном): маркер первого наблюдения в
+    WATCHDOG_ISSUE многодневной давности, но задача по этому отпечатку УЖЕ
+    закрыта 5 минут назад — старая улика не в счёт нового эпизода. Один
+    блип отпечатка ПОСЛЕ закрытия обязан считаться первым наблюдением
+    нового эпизода (жди STALL_PERSIST_MINUTES заново), а не мгновенно
+    заводить вторую задачу. Снятие фильтра по `_closed_task_reset_times` в
+    detect_and_act красит этот тест — `create_task` вызывается."""
+    old_marker_time = NOW - timedelta(days=8)
+    task_closed_at = (NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    closed_task = {
+        "number": 300,
+        "body": "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное",
+        "closed_at": task_closed_at,
+        "labels": [{"name": "task"}, {"name": "auto-detected"}],
+    }
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],  # старая задача уже закрыта
+        "issues?state=closed&labels=auto-detected": [closed_task],
+        "issues/120/comments": [
+            {"created_at": old_marker_time.isoformat().replace("+00:00", "Z"),
+             "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    def fail_create(*a, **k):
+        pytest.fail("старый маркер до закрытия предыдущей задачи не считается устойчивостью нового эпизода")
+    monkeypatch.setattr(sd, "create_task", fail_create)
+
+    result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    assert len(posted) == 1  # новый маркер первого наблюдения нового эпизода
+    assert posted[0][0] == sd.WATCHDOG_ISSUE
+    assert sd._sighting_marker("gate:pipeline-paused") in posted[0][1]
+    assert any("замечен впервые" in line for line in result)
+
+
+def test_marker_after_reset_boundary_creates_task_once_persisted(monkeypatch):
+    """Зеркало предыдущего теста: сайтинг ПОСЛЕ закрытия прошлой задачи,
+    сам по себе продержавшийся дольше порога, обязан завести задачу как
+    обычно — фильтр по границе сброса не глушит новый эпизод целиком."""
+    task_closed_at = (NOW - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    new_episode_seen = NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)
+    closed_task = {
+        "number": 300,
+        "body": "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное",
+        "closed_at": task_closed_at,
+        "labels": [{"name": "task"}, {"name": "auto-detected"}],
+    }
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [closed_task],
+        "issues/120/comments": [
+            {"created_at": new_episode_seen.isoformat().replace("+00:00", "Z"),
+             "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": [],
+        "POST repos/mytab0r/edge-harness/issues": {"number": 999},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("сайтинг новее границы сброса — не первое наблюдение"))
+
+    result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    assert any("#999" in line and "заведена автодетектором" in line for line in result)
+
+
 # ── Суточный потолок ────────────────────────────────────────────────────────
 
 def test_daily_cap_blocks_creation_loudly_once_exhausted(monkeypatch):
@@ -238,6 +311,7 @@ def test_daily_cap_blocks_creation_loudly_once_exhausted(monkeypatch):
     ]
     fake = FakeGh({
         "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],  # прежних решённых задач по отпечатку нет
         "issues/120/comments": [
             {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
         ],
