@@ -29,7 +29,7 @@ import { LlmError, assertUsableApiKey } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '0.1.1'
 const NS = settingsNamespace('llm-pi-ai')
 /** Маршрут штатного провайдера морды (session-store.ts): в реестре запрещён. */
 const EDGE_PROVIDER = 'deepseek-official'
@@ -101,8 +101,11 @@ function assertServiceable(config) {
     if (!ROUTE_PATTERN.test(route)) {
       throw new Error(`provider-registry: имя маршрута "${route}" должно быть lowercase kebab-case (буквы/цифры, дефис-разделители)`)
     }
-    if (source.baseURL !== undefined && !/^https?:\/\/\S+/.test(source.baseURL)) {
-      throw new Error(`provider-registry: у провайдера "${route}" baseURL должен быть http(s)-адресом`)
+    // baseURL обязателен: без него resolveAdapterOptions молча подставляет
+    // https://api.deepseek.com — маршрут унёс бы ключ пользователя на чужой
+    // эндпоинт (silent-wrong).
+    if (source.baseURL === undefined || !/^https?:\/\/\S+/.test(source.baseURL)) {
+      throw new Error(`provider-registry: у провайдера "${route}" должен быть baseURL — http(s)-адрес эндпоинта`)
     }
     if (source.displayName !== undefined && source.displayName.length === 0) {
       throw new Error(`provider-registry: у провайдера "${route}" displayName не может быть пустым`)
@@ -176,6 +179,7 @@ export default {
     const routeOptions = (route) => {
       let lastGood
       let lastRaw
+      let loggedRaw
       return () => {
         const raw = section().providers?.[route]
         if (raw === lastRaw && lastGood !== undefined) return lastGood
@@ -185,7 +189,11 @@ export default {
           return lastGood
         } catch (error) {
           if (lastGood === undefined) throw error
-          console.error(`edge-plugin:provider-registry: раздел маршрута "${route}" стал невалидным, работает последняя удачная конфигурация`, error)
+          // Один громкий лог на версию невалидного раздела, не на каждый ход.
+          if (raw !== loggedRaw) {
+            console.error(`edge-plugin:provider-registry: раздел маршрута "${route}" стал невалидным, работает последняя удачная конфигурация`, error)
+            loggedRaw = raw
+          }
           return lastGood
         }
       }

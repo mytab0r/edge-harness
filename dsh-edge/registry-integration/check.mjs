@@ -90,20 +90,17 @@ function writeConfig(dir) {
 
 let ownerCookie
 function makeClient(worker) {
-  const request = (path, init) => {
-    const headers = new Headers(init?.headers)
-    if (ownerCookie !== undefined) headers.set('cookie', ownerCookie)
-    return worker.fetch(`http://dsh-edge.test${path}`, { ...init, headers })
-  }
   const rpc = async (method, payload) => {
-    const response = await request(`/api/${method}`, {
+    const headers = new Headers({ 'content-type': 'application/json' })
+    if (ownerCookie !== undefined) headers.set('cookie', ownerCookie)
+    const response = await worker.fetch(`http://dsh-edge.test/api/${method}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method, payload }),
     })
     return { response, result: (await response.json()).result }
   }
-  return { request, rpc }
+  return { rpc }
 }
 
 /** Дождаться /api/health 200 ok (диагностика: печатает каждую попытку). */

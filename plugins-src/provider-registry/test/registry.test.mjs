@@ -233,6 +233,27 @@ describe('provider-registry: негатив — мусор не проходит
     await rejected('Bad_Route', { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] });
   });
 
+  it('профиль без baseURL отказан (иначе транспорт молча унёс бы ключ на api.deepseek.com)', async () => {
+    const ctx = await rejected('no-url', { models: [{ id: 'm' }] });
+    // Маршрут не зарегистрирован: отказ записи не оставил живого маршрута.
+    assert.ok(!activeRoutes(ctx).includes('no-url'));
+  });
+
+  it('правка настроенного маршрута доходит до запроса без перерегистрации', async () => {
+    const ctx = await mountMordre();
+    await ctx.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'zhipu'], value: { displayName: 'Z.ai (GLM)', api: 'openai-completions', baseURL: 'https://old.example/v1', models: [{ id: 'glm-4.6' }] } },
+    ], undefined);
+    assert.deepEqual((await ctx.llm.listModels('zhipu')).map((m) => m.id), ['glm-4.6']);
+    // Владелец правит каталог маршрута (та же карточка, тот же route-id):
+    // перерегистрации нет, живой options() перечитывает раздел.
+    await ctx.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'zhipu', 'models'], value: [{ id: 'glm-4.7' }] },
+    ], undefined);
+    assert.deepEqual((await ctx.llm.listModels('zhipu')).map((m) => m.id), ['glm-4.7'],
+      'клив живого чтения раздела: список моделей не обновился');
+  });
+
   it('ход без ключа падает громко MISSING_CREDENTIAL, не молча (сеть не вызывается)', async () => {
     const ctx = await mountMordre();
     await ctx.settings.mutate('llm-pi-ai', [

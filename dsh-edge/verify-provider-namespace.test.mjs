@@ -61,8 +61,9 @@ describe('verify-provider-namespace (гвардия литерала llm-pi-ai)'
     }
   });
 
-  it('красная: каталога нет (ошибка использования — не тихий зелёный)', () => {
+  it('красная: каталога нет — громкий отказ в формате деплоя, не сырой стек', () => {
     const run = runGuard('/nonexistent-provider-ns-guard-dir');
     assert.equal(run.status, 1);
+    assert.match(run.stderr, /::error::Не удалось обойти/);
   });
 });
