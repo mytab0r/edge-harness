@@ -18,6 +18,9 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest, архив.
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Аренда задачи (#121): claim/release/locks — единственный вход в работу.
+# shellcheck source=scripts/lib/lease.sh
+source "$SCRIPT_DIR/../lib/lease.sh"
 
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -56,19 +59,6 @@ api_post() {
   curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
     -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
-}
-
-# Аренда задачи (#121, ADR 0006) — единственный вход в работу над issue-N:
-# scripts/lib/claim_task.py. gh-токен выдаётся ТОЛЬКО вызову аренды
-# (GH_RUN_TOKEN из workflow, contents:write нужен на refs/locks/*): он не
-# должен жить в окружении прогона DSH — класс скраба *TOKEN* (см. worker.yml),
-# поэтому после блока аренды переменная снимается, до старта агента.
-lease_cli() {
-  if [ -n "${GH_RUN_TOKEN:-}" ]; then
-    GH_TOKEN="$GH_RUN_TOKEN" python3 "$SCRIPT_DIR/../lib/claim_task.py" "$@"
-  else
-    python3 "$SCRIPT_DIR/../lib/claim_task.py" "$@"
-  fi
 }
 
 # ── Журнал-seq: один писатель — bash (клиент рук). ────────────────────────────────
@@ -165,10 +155,6 @@ fi
 seq_persist
 echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
 
-# Токен аренды больше не нужен никому ниже, включая DSH: снимается до любого
-# выхода из скрипта (в окружении прогона агенту делать с ним нечего).
-unset GH_RUN_TOKEN
-
 # ── 1a. Аренда задачи (#121): заказ «поработай над issue-N» берётся только ────────
 # через атомарный claim. Без замка морда-агент мог заказать работу по задаче,
 # которую уже делает воркер, — два исполнителя на одной работе. Отказ —
@@ -186,7 +172,7 @@ if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
   if [ "$claim_rc" -eq 1 ]; then
     echo "Задача #${BASH_REMATCH[1]} занята другим исполнителем — зелёный no-op: $claim_out"
     add_event "agent_error" \
-      "$(jq -n --arg t "$claim_out" '{error: "task_busy", stderr: $t}')"
+      "$(jq -n --arg t "$claim_out" '{error: "task_busy", detail: $t}')"
     post_job_end "fail"
     exit 0
   fi
@@ -196,6 +182,11 @@ if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
   fi
   echo "Аренда взята: $claim_out"
 fi
+
+# Токен аренды больше не нужен никому ниже, включая DSH: снимается сразу после
+# блока аренды и до любого выхода из скрипта. Раньше блока снимать нельзя —
+# claim в проде авторизуется именно GH_RUN_TOKEN.
+unset GH_RUN_TOKEN
 
 add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
 flush_events

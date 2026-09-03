@@ -181,6 +181,31 @@ def test_claim_infra_failure_is_loud_not_busy(monkeypatch):
         ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
 
 
+def test_claim_unexpected_422_is_loud_not_busy(monkeypatch):
+    # 422 у GitHub отвечает за разные состояния: «Reference already exists» —
+    # отказ аренды (зелёный), прочие validation-ошибки — поломка (громко).
+    # Различение по тексту, симметрично _ref_missing() у release.
+    class ValidationServer(FakeServer):
+        def run(self, args, capture_output=True, text=True, env=None):
+            if "-X" in args and "POST" in args and "git/refs" in " ".join(args):
+                return fail(422, "Validation Failed: tree sha wasn't found")
+            return super().run(args, capture_output=capture_output, text=text, env=env)
+    install(monkeypatch, ValidationServer(dict(BASE)))
+    with pytest.raises(RuntimeError):
+        ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+
+
+def test_cli_unexpected_exception_is_error_not_busy(monkeypatch):
+    # Чужой класс исключения (смена формы ответа API → KeyError) обязан дать
+    # EXIT_ERROR (2) «инструмент сломан»: дефолтный exit CPython — 1, который
+    # каналы трактуют как зелёный no-op «занято» (контракт кодов 0/1/2).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    def broken(*a, **kw):
+        raise KeyError("commit")
+    monkeypatch.setattr(ct, "claim", broken)
+    assert ct.main(["x", "claim", "5"]) == ct.EXIT_ERROR
+
+
 # ── Release: идемпотентный, 404 — не ошибка ──────────────────────────────────────
 
 

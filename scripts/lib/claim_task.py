@@ -138,7 +138,11 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
         gh("-X", "POST", f"repos/{repo}/git/refs",
            "-f", f"ref={ref}", "-f", f"sha={commit['sha']}")
     except GhError as error:
-        if error.status == 422:  # «Reference already exists» — замок уже стоит
+        # «Reference already exists» — замок уже стоит, отказ аренды. Прочие 422
+        # (validation_failed и т.п.) — поломка, а не «занято»: различаем по
+        # тексту, симметрично _ref_missing() у release (класс #124-соседний:
+        # один HTTP-код у GitHub отвечает за разные состояния).
+        if error.status == 422 and "already exists" in str(error).lower():
             return ClaimResult(claimed=False, task=task,
                                detail=f"задача #{task} уже занята (замок {ref})")
         raise
@@ -194,8 +198,10 @@ def _ref_missing(error: "GhError") -> bool:
 
 
 def locked_tasks(repo: str) -> list[int]:
-    """Номера задач под живым замком — машинный список для выбора пула
-    (free_task пропускает занятые арендой; гарантией остаётся claim)."""
+    """Номера задач под замком — машинный список для выбора пула (free_task
+    пропускает занятые арендой; гарантией остаётся claim). Замок здесь может
+    быть и протухшим, ещё не собранным: окно закрывает ближайший такт
+    collect_stale, а до него задачу всё равно не взять — claim отклонит."""
     return [lock["task"] for lock in list_locks(repo)]
 
 
@@ -296,6 +302,12 @@ def main(argv: list[str]) -> int:
             return EXIT_OK
     except RuntimeError as error:
         print(f"::error::claim_task: {error}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as error:  # непредвиденное — тоже «инструмент сломан» (2), не «занято» (1):
+        # дефолтный exit CPython (1) вызывающие трактуют как зелёный no-op,
+        # поэтому любой чужой класс исключения обязан уйти громким EXIT_ERROR.
+        print(f"::error::claim_task: непредвиденный сбой ({type(error).__name__}): {error}",
+              file=sys.stderr)
         return EXIT_ERROR
     print(f"::error::{usage}", file=sys.stderr)
     return EXIT_ERROR

@@ -244,6 +244,11 @@ chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/openssl"
 # по коду возврата.
 cat >"$TMP/bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
+# Прод-форма gh (#121-ревью): без токена реальный gh неавторизован — заглушка
+# обязана падать так же (rc 4 + ::error::), иначе безтокенная ветка канала
+# (например «unset GH_RUN_TOKEN до вызова аренды») зелёная в тесте и красная
+# в проде.
+[ -n "${GH_TOKEN:-}" ] || { echo "gh: SMOKE: нет GH_TOKEN — реальный gh был бы неавторизован" >&2; exit 4; }
 sig=" $* "
 state="${SMOKE_STATE:?SMOKE_STATE не задан}/locks"
 touch "$state"
@@ -375,6 +380,7 @@ run_client() { # LABEL SCRIPT — прогон в дочернем bash; exit к
 RUNNER_TEMP="$TMP/rt" \
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke задача: проверить гвардию класса" \
+GH_RUN_TOKEN="smoke-run-token" \
   run_client "hands" "$REPO/scripts/hands/dsh_task.sh"
 
 assert_log "MORDE-RPC session.create" "hands: сессия морды не создана"
@@ -400,6 +406,7 @@ scenario_start   # чистое состояние аренды: замок из
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
 RUNNER_TEMP="$TMP/rtw" \
+GH_TOKEN="smoke-pat-token" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke задача для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker" "$REPO/scripts/worker/task.sh"
 
@@ -420,6 +427,7 @@ scenario_start "refs/locks/task-123"
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke задача: отказ аренды" \
 RUNNER_TEMP="$TMP/rt-hands-busy" \
+GH_RUN_TOKEN="smoke-run-token" \
   run_client "hands-busy" "$REPO/scripts/hands/dsh_task.sh"
 assert_not_log "GH-API-LOCK-CREATE" "hands-busy: замок создан поверх чужого — атомарности нет"
 assert_not_log "GH-API-ASSIGN" "hands-busy: назначение при отказе аренды"
@@ -442,6 +450,7 @@ scenario_start "refs/locks/task-123"
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
 RUNNER_TEMP="$TMP/rt-w-busy" \
+GH_TOKEN="smoke-pat-token" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke задача занята","body":"## Цель\nгонка","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker-busy" "$REPO/scripts/worker/task.sh"
 assert_not_log "GH-API-LOCK-CREATE" "worker-busy: замок создан поверх чужого — атомарности нет"
@@ -455,6 +464,7 @@ scenario_start "refs/locks/task-200"
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="" \
 RUNNER_TEMP="$TMP/rt-w-auto" \
+GH_TOKEN="smoke-pat-token" \
 GH_ISSUE_LIST_JSON='[{"number":200,"assignees":[],"title":"Занята арендой"},{"number":201,"assignees":[],"title":"Свободна для воркера"}]' \
 GH_ISSUE_JSON='{"number":201,"title":"Свободна для воркера","body":"## Цель\nauto\n\n## Критерий готовности\nпул","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker-auto" "$REPO/scripts/worker/task.sh"

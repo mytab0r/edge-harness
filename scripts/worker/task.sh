@@ -26,6 +26,9 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest.
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Аренда задачи (#121): claim/release/locks — единственный вход в работу.
+# shellcheck source=scripts/lib/lease.sh
+source "$SCRIPT_DIR/../lib/lease.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
@@ -121,8 +124,8 @@ free_task() {
   local taken candidates number title locked
   taken=$(gh pr list --state open --limit 100 --json body \
     | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') || return 2
-  # Живой замок = задачу уже делает другой канал, даже если assignee ещё не
-  # виден (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
+  # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
+  # канал (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
   # остаётся атомарный claim ниже. Сломался список замков — сломан инструмент
   # (2), а не «пул пуст» (1).
   locked=$(lease_cli locks) || return 2
@@ -139,13 +142,6 @@ free_task() {
     return 0
   done <<<"$candidates"
   return 1
-}
-
-# Аренда задачи (#121, ADR 0006) — единственный вход в работу над ней для всех
-# каналов: scripts/lib/claim_task.py. Токен для refs/locks/* у воркера уже
-# в окружении (GH_PIPELINE_PAT), отдельной выдачи не нужно.
-lease_cli() {
-  python3 "$SCRIPT_DIR/../lib/claim_task.py" "$@"
 }
 
 # ── 1. Выбор задачи ────────────────────────────────────────────────────────────────
