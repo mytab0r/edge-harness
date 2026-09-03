@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseManifest } from '../../dsh-edge/manifest.mjs'
+import { parseManifest, loadCatalog } from '../../dsh-edge/manifest.mjs'
 
 const pluginDir = dirname(fileURLToPath(import.meta.url))
 const repoRoot = join(pluginDir, '..', '..')
@@ -51,6 +51,12 @@ failUnless(manifest.plugins.some((plugin) => plugin.package === pkg.name),
 // Клиенту нужен только состав: id и где он живёт. release/sha256 — канал
 // поставки, воркеру и журналу они в браузере ничего не говорят.
 const roster = manifest.plugins.map(({ id, server, client }) => ({ id, server, client }))
+
+// ── 2b. Каталог заказа (#113): форма — loadCatalog (одно место правды) ────────
+// Вшивается целиком: «доступные для заказа» = каталог минус установленные,
+// вычитание делает клиент (переход «заказано → установлено» автоматичен при
+// обновлении манифеста, каталог не надо синхронизировать с ним в данных).
+const catalog = await loadCatalog(join(repoRoot, 'dsh-edge'))
 
 // ── 3. Тело бандла и его гвардии ──────────────────────────────────────────────
 const body = await readFile(join(pluginDir, 'src', 'body.js'), 'utf8')
@@ -81,7 +87,7 @@ failUnless(unseeded.length === 0,
 // неполон; достаточно, потому что присваивание свободной переменной обёртки
 // затирало бы её только внутри фабрики и ловится синтаксической проверкой
 // бандла при использовании.
-for (const reserved of ['module', 'exports', 'require', 'MANIFEST']) {
+for (const reserved of ['module', 'exports', 'require', 'MANIFEST', 'CATALOG']) {
   failUnless(!new RegExp(`(?:var|let|const|function|class)\\s+${reserved}\\b`).test(body),
     `src/body.js: тело объявляет "${reserved}" — это свободная переменная обёртки, коллизия`)
 }
@@ -94,6 +100,8 @@ const bundle = [
   `\tvar module = { exports: {} }; var exports = module.exports;`,
   ``,
   `const MANIFEST = ${JSON.stringify(roster, null, 2)};`,
+  ``,
+  `const CATALOG = ${JSON.stringify(catalog.plugins, null, 2)};`,
   ``,
   body,
   ``,
@@ -117,9 +125,11 @@ checkSyntax(join(pluginDir, 'src', 'body.js'))
 checkSyntax(bundlePath)
 
 const clientIds = manifest.plugins.filter((plugin) => plugin.client).map((plugin) => plugin.id)
+const available = catalog.plugins.filter((entry) => !manifest.plugins.some((plugin) => plugin.id === entry.id))
 process.stdout.write(
   `plugin-manager: бандл собран (${required.length} seed-require), манифест ${manifest.plugins.length} плагин(ов) ` +
   `[${manifest.plugins.map((plugin) => plugin.id).join(', ')}], клиентских в ростере: [${clientIds.join(', ') || 'нет'}]\n` +
+  `  каталог заказа: ${catalog.plugins.length} записей, доступно к заказу: [${available.map((entry) => entry.id).join(', ') || 'нет'}]\n` +
   `  ${relative(repoRoot, bundlePath)}\n` +
   `  ${relative(repoRoot, join(pluginDir, 'manifest.json'))}\n` +
   'Дальше (конвейер #80): npm pack → asset в релиз → sha256 в dsh-edge/plugins.json (PR)\n',

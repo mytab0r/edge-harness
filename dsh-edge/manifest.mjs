@@ -1,12 +1,19 @@
 /**
- * Единственное место правды о форме dsh-edge/plugins.json.
+ * Единственное место правды о форме двух файлов dsh-edge:
  *
- * Читается кодогенератором (codegen-edge-plugins.mjs) и гвардией состава
- * (verify-edge-plugins.mjs). Валидация громкая: любая ошибка формы — throw
- * до любых дорогих шагов сборки. Существование релиза и совпадение sha256
- * здесь не проверяются (скрипт офлайн) — их громко доказывает шаг
- * скачивания релизного asset'а в deploy-dsh-edge.yml, который обязан
- * пройти до кодогенерации.
+ *  - plugins.json        — установленные плагины (манифест морды);
+ *  - plugins-catalog.json — доступные к ЗАКАЗУ (задача #113): что ещё можно
+ *    заказать конвейеру #80. Каталог НЕ дублирует манифест: в нём нет
+ *    package/source/sha256/flags — состав установленных читается только из
+ *    манифеста, а «доступные» получаются вычитанием манифеста из каталога
+ *    на клиенте (plugin-manager), не в данных.
+ *
+ * Читается кодогенератором (codegen-edge-plugins.mjs), гвардией состава
+ * (verify-edge-plugins.mjs) и сборкой plugin-manager (build.mjs). Валидация
+ * громкая: любая ошибка формы — throw до любых дорогих шагов сборки.
+ * Существование релиза и совпадение sha256 здесь не проверяются (скрипт
+ * офлайн) — их громко доказывает шаг скачивания релизного asset'а в
+ * deploy-dsh-edge.yml, который обязан пройти до кодогенерации.
  */
 
 import { readFile } from 'node:fs/promises'
@@ -63,6 +70,58 @@ export async function loadManifest(repoRoot) {
   return parseManifest(await readFile(join(repoRoot, 'plugins.json'), 'utf8'))
 }
 
+const CATALOG_VERSION = 1
+const REPO_PATH_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9/._-]*$/
+
+/**
+ * Форма каталога доступных к заказу плагинов (dsh-edge/plugins-catalog.json).
+ * id — тот же слаг, что в манифесте (по нему вычитание и заказ в журнал);
+ * title/summary/brief — обязательные человекочитаемые поля (brief — готовая
+ * формулировка заказа агенту); spec/sources — необязательные пути ВНУТРИ
+ * репозитория: URL и абсолютные пути в каталоге не легальны по той же
+ * причине, что и URL в манифесте (источник — только этот репозиторий).
+ */
+export function parseCatalog(source) {
+  let catalog
+  try {
+    catalog = JSON.parse(source)
+  } catch (error) {
+    throw new Error(`dsh-edge/plugins-catalog.json is not valid JSON: ${error.message}`)
+  }
+  if (catalog === null || typeof catalog !== 'object' || Array.isArray(catalog)) {
+    throw new Error('dsh-edge/plugins-catalog.json must be a JSON object.')
+  }
+  if (catalog.version !== CATALOG_VERSION) {
+    throw new Error(`dsh-edge/plugins-catalog.json version must be ${CATALOG_VERSION}, found ${JSON.stringify(catalog.version)}.`)
+  }
+  if (!Array.isArray(catalog.plugins)) {
+    throw new Error('dsh-edge/plugins-catalog.json must carry a plugins array.')
+  }
+  const seen = new Set()
+  for (const entry of catalog.plugins) {
+    const where = `plugin ${JSON.stringify(entry?.id ?? entry)}`
+    failCatalogUnless(objectShape(entry), `${where} must be an object.`)
+    failCatalogUnless(ID_PATTERN.test(entry.id), `${where}: id must match ${ID_PATTERN}.`)
+    failCatalogUnless(!seen.has(entry.id), `duplicate catalog id "${entry.id}".`)
+    seen.add(entry.id)
+    for (const field of ['title', 'summary', 'brief']) {
+      failCatalogUnless(typeof entry[field] === 'string' && entry[field].trim() !== '',
+        `${where}: ${field} must be a non-empty string (it is shown in the morde and feeds the order text).`)
+    }
+    for (const field of ['spec', 'sources']) {
+      if (entry[field] === undefined) continue
+      failCatalogUnless(typeof entry[field] === 'string' && REPO_PATH_PATTERN.test(entry[field]) && !entry[field].includes('..'),
+        `${where}: ${field} must be a repo-relative path without "..", not a URL or absolute path.`)
+    }
+  }
+  return catalog
+}
+
+/** Читает и валидирует каталог заказа из каталога dsh-edge (рядом с манифестом). */
+export async function loadCatalog(repoDir) {
+  return parseCatalog(await readFile(join(repoDir, 'plugins-catalog.json'), 'utf8'))
+}
+
 /** Каталог dsh-edge/, в котором лежит этот модуль. */
 export function manifestDirectory() {
   return dirname(fileURLToPath(import.meta.url))
@@ -86,6 +145,10 @@ function objectShape(value) {
 
 function failUnless(condition, message) {
   if (!condition) throw new Error(`dsh-edge/plugins.json: ${message}`)
+}
+
+function failCatalogUnless(condition, message) {
+  if (!condition) throw new Error(`dsh-edge/plugins-catalog.json: ${message}`)
 }
 
 // CLI-режим: единственная точка валидации для workflow до любых дорогих шагов.
