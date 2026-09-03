@@ -225,7 +225,7 @@ function rpcStub({ ok = true, value = null, code = null, message = null } = {}) 
 }
 
 /**
- * Роутер fetch: журнал (/api/events?task_id=…) и RPC (/api/<method>).
+ * Роутер fetch: журнал (/api/harness/events?task_id=…) и RPC (/api/<method>).
  * journal(url, init) — только запросы журнала; rpc({method, payload, init}) —
  * только POST-конверты. Неожиданный запрос — throw: тест не должен молча
  * отвечать на то, чего не ожидал.
@@ -233,7 +233,7 @@ function rpcStub({ ok = true, value = null, code = null, message = null } = {}) 
 function routeFetch({ journal, rpc }) {
   return async (url, init) => {
     const address = String(url)
-    if (address.startsWith('/api/events')) return journal(url, init)
+    if (address.startsWith('/api/harness/events')) return journal(url, init)
     if (address.startsWith('/api/') && init?.method === 'POST') {
       const body = JSON.parse(init.body)
       return rpc({ method: body.method, payload: body.payload, envelope: body, init })
@@ -398,7 +398,7 @@ test('статусы: последнее plugin_status побеждает; бе�
   assert.equal(journalCalls.length, baked.length + available.length,
     'запрос статуса не на каждый плагин (манифест + каталог)')
   for (const call of journalCalls) {
-    assert.ok(call.url.startsWith('/api/events?task_id=plugin%3A'),
+    assert.ok(call.url.startsWith('/api/harness/events?task_id=plugin%3A'),
       'URL журнала не по контракту: ' + call.url)
     assert.ok(call.url.includes('&limit=10&after=0'),
       'первая страница журнала обязана быть after=0: ' + call.url)
