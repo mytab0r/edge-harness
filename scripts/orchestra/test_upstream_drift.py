@@ -158,6 +158,17 @@ def test_decide_pin_not_tag_is_loud_state():
     assert decision["pinned_tag"] is None
 
 
+def test_decide_pin_on_non_release_tag_classifies_not_crashes():
+    # Регресс ревью #134: sha пина стоит на теге с НЕрелизным именем (алиас
+    # `stable` — апстрим уже вешал два тега на один коммит). Сравнение
+    # None-ключа с ключом релиза поднимало TypeError, обходяло except
+    # RuntimeError обёртки планировщика и ронило ВЕСЬ пульс.
+    tags = TAGS + [tag("stable", "d" * 40)]
+    decision = ud.decide_drift(pin("d" * 40), tags)
+    assert decision["state"] == "pin-not-tag"
+    assert decision["pinned_tag"] == "stable"
+
+
 def test_decide_pin_on_prerelease_with_higher_core_is_ok():
     tags = TAGS + [tag("dsh-edge-v0.9.0-alpha.1", "b" * 40)]
     assert ud.decide_drift(pin("b" * 40), tags)["state"] == "ok"
@@ -353,6 +364,15 @@ def test_check_failure_is_loud_runtime_error(monkeypatch, offline_telegram):
     fake.routes["repos/pawaca/dsh-edge/tags?per_page=100"] = RuntimeError("API 502")
     patch_module_gh(monkeypatch, fake)
     with pytest.raises(RuntimeError):
+        ud.upstream_drift_check("mytab0r/edge-harness")
+
+
+def test_check_full_tags_page_is_loud_not_false_ok(monkeypatch, offline_telegram):
+    # Гвардия усечения (ревью #134): страница /tags полна — новейший релиз мог
+    # остаться за кадром, и «ok» было бы тихо спрятанным дрейфом. Громко падаем.
+    fake = wired_fake(tags=[tag(f"dsh-edge-v0.{i}.0", f"{i:040x}") for i in range(100)])
+    patch_module_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="полную страницу"):
         ud.upstream_drift_check("mytab0r/edge-harness")
 
 
