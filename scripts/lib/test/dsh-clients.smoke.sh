@@ -24,6 +24,7 @@ REPO="$(cd "$SMOKE_DIR/../../.." && pwd)"
 TMP="$(mktemp -d)"
 CALLLOG="$TMP/calls.log"
 : >"$CALLLOG"
+JOURNAL_CAPT="$TMP/journal-events.ndjson"   # каптурка POST /api/events curl-заглушки
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -118,6 +119,9 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   elif [[ "$sig" == *"issue view"* ]]; then
     payload="$GH_ISSUE_JSON"
     [ -n "$payload" ] || payload='{"number":0}'
+  elif [[ "$sig" == *"issue list"* ]]; then
+    # Пул свободных задач для auto-сценария воркера (free_task).
+    payload="${GH_ISSUE_LIST_JSON:-[]}"
   elif [[ "$sig" == *"pr list"* && "$sig" == *"--json url"* ]]; then
     payload='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
   elif [[ "$sig" == *"pr list"* ]]; then
@@ -231,6 +235,82 @@ OPENSSLSTUB
 
 chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/openssl"
 
+# gh уровня ПРОЦЕССА: claim_task.py (#121) зовёт бинарник `gh` через
+# subprocess.run — export -f на дочерний процесс python не действует. Заглушка
+# — мини-сервер аренды на файле состояния: POST существующего ref → 422
+# (серверная атомарность GitHub), DELETE идемпотентен (404 на отсутствии),
+# matching-refs отдаёт живые замки. Мутирующие вызовы пишутся в CALLLOG —
+# ассерты сценариев доказывают «замок взят»/«замка не было» по журналу, а не
+# по коду возврата.
+cat >"$TMP/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# Прод-форма gh (#121-ревью): без токена реальный gh неавторизован — заглушка
+# обязана падать так же (rc 4 + ::error::), иначе безтокенная ветка канала
+# (например «unset GH_RUN_TOKEN до вызова аренды») зелёная в тесте и красная
+# в проде.
+[ -n "${GH_TOKEN:-}" ] || { echo "gh: SMOKE: нет GH_TOKEN — реальный gh был бы неавторизован" >&2; exit 4; }
+sig=" $* "
+state="${SMOKE_STATE:?SMOKE_STATE не задан}/locks"
+touch "$state"
+log() { printf '%s\n' "$*" >>"${CALLLOG:?CALLLOG не задан}"; }
+resp() { printf '%s\n' "$1"; exit 0; }
+case "$sig" in
+  *"matching-refs/locks/"*)
+    out="[]"
+    if [ -s "$state" ]; then
+      items=""
+      while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        items="${items:+$items,}{\"ref\":\"$ref\",\"object\":{\"sha\":\"sha-$ref\"}}"
+      done <"$state"
+      out="[$items]"
+    fi
+    resp "$out" ;;
+  *"commits/main "*|*"commits/"*)
+    resp '{"sha":"basesha","commit":{"tree":{"sha":"treesha"}}}' ;;
+  *"git/commits "*)
+    resp '{"sha":"locksha"}' ;;
+  *"git/refs"*)
+    ref=""
+    for a in "$@"; do case "$a" in ref=*) ref="${a#ref=}" ;; esac; done
+    if [[ "$sig" == *"-X POST"* ]]; then
+      if grep -qxF -- "$ref" "$state"; then
+        echo "gh: HTTP 422: Reference already exists [$ref]" >&2
+        exit 1
+      fi
+      printf '%s\n' "$ref" >>"$state"
+      log "GH-API-LOCK-CREATE $ref"
+      exit 0
+    fi
+    if [[ "$sig" == *"-X DELETE"* ]]; then
+      # путь repos/o/r/git/refs/locks/task-N → ref-имя refs/locks/task-N
+      pathref="refs/${sig##*git/refs/}"
+      pathref="${pathref%% }"
+      if grep -qxF -- "$pathref" "$state"; then
+        printf '%s\n' "$(grep -vxF -- "$pathref" "$state")" >"$state"
+        log "GH-API-LOCK-DELETE $pathref"
+        exit 0
+      fi
+      echo "gh: HTTP 404: Not Found [$pathref]" >&2
+      exit 1
+    fi
+    echo "gh: SMOKE: неизвестный метод для git/refs: $sig" >&2
+    exit 99 ;;
+  *"issues/"*"assignees "*)
+    issue="${sig##*issues/}"; issue="${issue%%/*}"
+    log "GH-API-ASSIGN issue-$issue"
+    resp '{}' ;;
+  *"issues/"*"comments "*)
+    issue="${sig##*issues/}"; issue="${issue%%/*}"
+    log "GH-API-COMMENT issue-$issue"
+    resp '{}' ;;
+  *)
+    echo "gh: SMOKE: заглушка не знает вызов: $sig" >&2
+    exit 99 ;;
+esac
+GHSTUB
+chmod +x "$TMP/bin/gh"
+
 # ── Окружение клиентов ────────────────────────────────────────────────────────────
 export DSH_EDGE_URL="https://morde.test"
 export DSH_EDGE_ACCESS_KEY="smoke-access-key-at-least-32-bytes-long!!"
@@ -259,6 +339,24 @@ assert_log() { # SUBSTR MESSAGE
   fi
 }
 
+assert_not_log() { # SUBSTR MESSAGE — отрицательный ассерт честен на чистом журнале
+  if grep -qF -- "$1" "$CALLLOG"; then
+    echo "::error::SMOKE: нежданный вызов «$1» — $2" >&2
+    echo "--- журнал вызовов ---" >&2
+    cat "$CALLLOG" >&2
+    exit 1
+  fi
+}
+
+# Начало сценария: чистые журналы и состояние замков. Ассерты «не было
+# вызова» и «замок ещё не взят» честны только на пустом состоянии.
+scenario_start() { # [SEED_REF...] — замки, живые ДО запуска клиента
+  : >"$CALLLOG"
+  rm -f "$JOURNAL_CAPT"
+  : >"$SMOKE_STATE/locks"
+  for ref in "$@"; do printf '%s\n' "$ref" >>"$SMOKE_STATE/locks"; done
+}
+
 run_client() { # LABEL SCRIPT — прогон в дочернем bash; exit клиента не убивает smoke
   local label=$1 script=$2 rc=0
   # Счётчик openssl-заглушки — на клиента: у каждого своя пара сверок целостности
@@ -282,15 +380,18 @@ run_client() { # LABEL SCRIPT — прогон в дочернем bash; exit к
 RUNNER_TEMP="$TMP/rt" \
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke задача: проверить гвардию класса" \
+GH_RUN_TOKEN="smoke-run-token" \
   run_client "hands" "$REPO/scripts/hands/dsh_task.sh"
 
 assert_log "MORDE-RPC session.create" "hands: сессия морды не создана"
 assert_log "MORDE-RPC session.rename" "hands: сессия морды не названа"
 assert_log "MORDE-INGEST" "hands: транскрипт не уехал в морду"
 assert_log "JOURNAL-POST /api/events" "hands: журнал не получил жизненный цикл job"
+# Аренда взята до работы (#121): замок создан, назначение и след — после него.
+assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "hands: аренда issue-123 не взята"
+assert_log "GH-API-ASSIGN issue-123" "hands: задача не назначена при claim"
 # Состав батчей — по каптурке curl-заглушки: events.jsonl клиент очищает после
 # каждого принятого флаша (flush_events), к моменту ассертов он пуст.
-JOURNAL_CAPT="$TMP/journal-events.ndjson"
 grep -qE '"kind": *"job_start"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands: в журнале нет job_start" >&2
        echo "--- каптурка журнала ---" >&2; cat "$JOURNAL_CAPT" 2>&1 >&2; exit 1; }
@@ -301,9 +402,11 @@ grep -qE '"result": *"ok"' "$JOURNAL_CAPT" \
 echo "SMOKE: hands — ок"
 
 # ── Клиент автономного воркера ────────────────────────────────────────────────────
+scenario_start   # чистое состояние аренды: замок из hands-сценария не должен мешать
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
 RUNNER_TEMP="$TMP/rtw" \
+GH_TOKEN="smoke-pat-token" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke задача для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker" "$REPO/scripts/worker/task.sh"
 
@@ -311,7 +414,65 @@ assert_log "MORDE-RPC session.create" "worker: сессия морды не со
 assert_log "MORDE-RPC session.rename" "worker: сессия морды не названа"
 assert_log "MORDE-INGEST" "worker: транскрипт не уехал в морду"
 assert_log "GH-COMMENT" "worker: нет отчёта в задачу"
+# Захват через аренду (#121): замок создан ДО сессии и работы.
+assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "worker: аренда задачи 123 не взята"
 echo "SMOKE: worker — ок"
+
+# ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
+# Отказ claim = зелёный no-op: job завершается 0, работы НЕТ (нет сессии в
+# морде, нет отчёта в задачу), журнал получает честный финал.
+
+# hands при живом замке: отказ, зелёный no-op, task_busy в журнале, без морды.
+scenario_start "refs/locks/task-123"
+TASK_ID="issue-123" \
+TASK_TEXT="Smoke задача: отказ аренды" \
+RUNNER_TEMP="$TMP/rt-hands-busy" \
+GH_RUN_TOKEN="smoke-run-token" \
+  run_client "hands-busy" "$REPO/scripts/hands/dsh_task.sh"
+assert_not_log "GH-API-LOCK-CREATE" "hands-busy: замок создан поверх чужого — атомарности нет"
+assert_not_log "GH-API-ASSIGN" "hands-busy: назначение при отказе аренды"
+assert_not_log "MORDE-RPC" "hands-busy: сессия в морде создана при отказе аренды"
+grep -q 'task_busy' "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-busy: в журнале нет task_busy — отказ не виден" >&2
+       cat "$JOURNAL_CAPT" >&2; exit 1; }
+grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-busy: job_end не fail — задача повиснет dispatched" >&2
+       cat "$JOURNAL_CAPT" >&2; exit 1; }
+if grep -qE '"kind": *"job_start"' "$JOURNAL_CAPT"; then
+  echo "::error::SMOKE: hands-busy: job_start при отказе аренды — работа начата" >&2
+  cat "$JOURNAL_CAPT" >&2
+  exit 1
+fi
+echo "SMOKE: hands-busy — ок"
+
+# worker (manual) при живом замке: отказ, зелёный no-op, без сессии и отчёта.
+scenario_start "refs/locks/task-123"
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-busy" \
+GH_TOKEN="smoke-pat-token" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke задача занята","body":"## Цель\nгонка","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-busy" "$REPO/scripts/worker/task.sh"
+assert_not_log "GH-API-LOCK-CREATE" "worker-busy: замок создан поверх чужого — атомарности нет"
+assert_not_log "GH-API-ASSIGN" "worker-busy: назначение при отказе аренды"
+assert_not_log "MORDE-RPC" "worker-busy: сессия в морде создана при отказе аренды"
+assert_not_log "GH-COMMENT" "worker-busy: отчёт «не справился» при штатном отказе аренды"
+echo "SMOKE: worker-busy — ок"
+
+# worker (auto) при частично занятом пуле: замок 200 пропускается, берётся 201.
+scenario_start "refs/locks/task-200"
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="" \
+RUNNER_TEMP="$TMP/rt-w-auto" \
+GH_TOKEN="smoke-pat-token" \
+GH_ISSUE_LIST_JSON='[{"number":200,"assignees":[],"title":"Занята арендой"},{"number":201,"assignees":[],"title":"Свободна для воркера"}]' \
+GH_ISSUE_JSON='{"number":201,"title":"Свободна для воркера","body":"## Цель\nauto\n\n## Критерий готовности\nпул","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-auto" "$REPO/scripts/worker/task.sh"
+assert_log "GH-API-LOCK-CREATE refs/locks/task-201" "worker-auto: свободная 201 не взята в аренду"
+assert_not_log "refs/locks/task-200" "worker-auto: задача под живым замком попала в работу"
+assert_log "MORDE-RPC session.create" "worker-auto: сессия морды не создана"
+assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
+echo "SMOKE: worker-auto — ок"
 
 # ── Клиент AI-ревью (второй гейт #18) ────────────────────────────────────────
 # Транспорт ревьюера: без GitHub-токена по построению, поэтому smoke проверяет

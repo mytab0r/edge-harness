@@ -18,6 +18,9 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest, архив.
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Аренда задачи (#121): claim/release/locks — единственный вход в работу.
+# shellcheck source=scripts/lib/lease.sh
+source "$SCRIPT_DIR/../lib/lease.sh"
 
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -151,6 +154,39 @@ if [ -z "$TASK_TEXT" ]; then
 fi
 seq_persist
 echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
+
+# ── 1a. Аренда задачи (#121): заказ «поработай над issue-N» берётся только ────────
+# через атомарный claim. Без замка морда-агент мог заказать работу по задаче,
+# которую уже делает воркер, — два исполнителя на одной работе. Отказ —
+# зелёный no-op job'а (контракт #121), но журнал получает честный финал
+# task_busy + job_end: задача не должна висеть «dispatched» вечно, а «done»
+# означал бы ложь «работа сделана». Задачи без issue (manual-*) — вне пула,
+# аренды не имеют. Поломка утилиты — громкий красный job: «инструмент сломан»
+# и «задача занята» — разные состояния.
+if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
+  # CLAIM_ACTOR обязан быть валидным логином (назначение идёт им): не
+  # переопределяем — current_actor() возьмёт GITHUB_ACTOR (аккаунт,
+  # инициировавший dispatch). Канал для следа в задаче — CLAIM_VIA.
+  export CLAIM_VIA="hands $TASK_ID (run ${GITHUB_RUN_ID:-local})"
+  claim_out="$(lease_cli claim "${BASH_REMATCH[1]}" 2>&1)" && claim_rc=0 || claim_rc=$?
+  if [ "$claim_rc" -eq 1 ]; then
+    echo "Задача #${BASH_REMATCH[1]} занята другим исполнителем — зелёный no-op: $claim_out"
+    add_event "agent_error" \
+      "$(jq -n --arg t "$claim_out" '{error: "task_busy", detail: $t}')"
+    post_job_end "fail"
+    exit 0
+  fi
+  if [ "$claim_rc" -ne 0 ]; then
+    echo "::error::claim_task сломался (rc=$claim_rc): $claim_out" >&2
+    exit 1
+  fi
+  echo "Аренда взята: $claim_out"
+fi
+
+# Токен аренды больше не нужен никому ниже, включая DSH: снимается сразу после
+# блока аренды и до любого выхода из скрипта. Раньше блока снимать нельзя —
+# claim в проде авторизуется именно GH_RUN_TOKEN.
+unset GH_RUN_TOKEN
 
 add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
 flush_events

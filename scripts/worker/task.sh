@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Автономный воркер (задача #89): воплощение docs/agents/WORKER-PLAYBOOK.md.
-# Здесь ТОЛЬКО транспорт и отчётность: выбрать свободную задачу из пула, назначить,
-# создать ветку agent/N-slug, накормить DSH headless промптом (тело задачи +
-# playbook + критерий), проверить результат (открытый PR) и отчитаться
-# (комментарий в задачу + Telegram). Работу над задачей делает DSH — этот скрипт
-# за него ничего не решает и не пишет.
+# Здесь ТОЛЬКО транспорт и отчётность: выбрать свободную задачу из пула, взять
+# её в атомарную аренду (claim_task, #121), создать ветку agent/N-slug,
+# накормить DSH headless промптом (тело задачи + playbook + критерий),
+# проверить результат (открытый PR) и отчитаться (комментарий в задачу +
+# Telegram). Работу над задачей делает DSH — этот скрипт за него ничего
+# не решает и не пишет.
 #
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
@@ -25,6 +26,9 @@ source "$SCRIPT_DIR/../lib/dsh-ci.sh"
 # Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest.
 # shellcheck source=scripts/lib/dsh-edge-session.sh
 source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Аренда задачи (#121): claim/release/locks — единственный вход в работу.
+# shellcheck source=scripts/lib/lease.sh
+source "$SCRIPT_DIR/../lib/lease.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
@@ -70,12 +74,12 @@ if [ "$DRY_RUN" != "1" ]; then
   dsh_require_provider_env || die "провайдер не сконфигурирован (см. ::error:: выше)"
 fi
 
-# Гвардия дублей (стопгэп к аренде задач #121): если живёт ДРУГОЙ прогон
-# воркера — активный или ожидающий в очереди concurrency-группы — выходим
-# зелёным no-op. Очередь запускает прогоны последовательно, и второму
-# прогону на той же задаче делать нечего; раньше он сжигал установку и мог
-# столкнуться с первым на выборе задачи. Кросс-канальную атомарную аренду
-# (worker/manual/hands) закрывает #121 — здесь защита от дубля самих прогонов.
+# Гвардия дублей прогонов: если живёт ДРУГОЙ прогон воркера — активный или
+# ожидающий в очереди concurrency-группы — выходим зелёным no-op. Очередь
+# запускает прогоны последовательно, и второму прогону делать нечего; раньше
+# он сжигал установку и мог столкнуться с первым на выборе задачи. Дубль
+# РАБОТЫ над одной задачей (в отличие от дубля прогонов) закрывает атомарная
+# аренда #121 — claim ниже; эта гвардия — про бессмысленный второй прогон.
 if [ "$DRY_RUN" != "1" ] && [ -z "${WORKER_SKIP_DUPGUARD:-}" ]; then
   others=""
   for state in "in_progress" "queued"; do
@@ -112,13 +116,19 @@ telegram_report() { # $1 — текст
 
 # Свободная задача: открыта, метка task, без assignee И без открытого PR,
 # ссылающегося на неё (playbook «Конвейер задачи» п.1: PR появляется раньше,
-# чем контракт успеет авто-назначить автора). Печатает «номер<TAB>заголовок».
+# чем контракт успеет авто-назначить автора), И без живой аренды (#121).
+# Печатает «номер<TAB>заголовок».
 # Коды: 0 — нашла; 1 — пул пуст; 2 — сломался инструмент (gh/jq/сеть):
 # «пусто» и «сломано» — разные состояния, смешивать запрещено (fail loud).
 free_task() {
-  local taken candidates number title
+  local taken candidates number title locked
   taken=$(gh pr list --state open --limit 100 --json body \
     | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') || return 2
+  # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
+  # канал (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
+  # остаётся атомарный claim ниже. Сломался список замков — сломан инструмент
+  # (2), а не «пул пуст» (1).
+  locked=$(lease_cli locks) || return 2
   candidates=$(gh issue list --label task --state open --limit 100 --json number,assignees,title \
     | jq -r '.[] | select((.assignees | length) == 0) | [.number, .title] | @tsv' \
     | sort -n) || return 2
@@ -127,6 +137,7 @@ free_task() {
   while IFS=$'\t' read -r number title; do
     [ -n "$number" ] || continue
     case " $taken " in *" $number "*) continue ;; esac
+    case " $locked " in *" $number "*) continue ;; esac
     printf '%s\t%s\n' "$number" "$title"
     return 0
   done <<<"$candidates"
@@ -141,10 +152,8 @@ if [ -n "$TASK_INPUT" ]; then
   [ "$(jq -r '.state' <<<"$ISSUE_JSON")" = "OPEN" ] || die "Задача #$number закрыта"
   jq -e '.labels[]? | select(.name == "task")' <<<"$ISSUE_JSON" >/dev/null \
     || die "На задаче #$number нет метки task — это не задача пула"
-  assignees=$(jq -r '[.assignees[].login] | join(" ")' <<<"$ISSUE_JSON")
-  if [ -n "$assignees" ] && [ "$assignees" != "$WORKER_LOGIN" ]; then
-    die "Задача #$number занята не воркером (назначено: $assignees)"
-  fi
+  # Проверка «занята не воркером по assignee» удалена (#121): все агенты — один
+  # логин, она не могла сработать никогда. Занятость видит атомарный claim.
   # Открытый PR на задачу — она уже делается: второй PR контракт не пропустит,
   # а одноимённая ветка на remote сделает пуш невыполнимым.
   taken=$(gh pr list --state open --limit 100 --json body \
@@ -222,11 +231,25 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-# ── 4. Захват задачи: назначение с проверкой результата ──────────────────────────
-gh issue edit "$number" --add-assignee "$WORKER_LOGIN" >/dev/null
-now_assigned=$(gh issue view "$number" --json assignees --jq '[.assignees[].login] | join(" ")')
-[ "$now_assigned" = "$WORKER_LOGIN" ] \
-  || die "Назначение не подтвердилось: сейчас назначено '$now_assigned'"
+# ── 4. Захват задачи: атомарная аренда через claim_task (#121, ADR 0006) ─────────
+# Единственный вход в работу: замок refs/locks/task-N создаётся серверно
+# атомарно, проигравший гонку каналов (worker auto/manual, hands) получает
+# отказ. Назначение и след в задаче делает сам claim — это видимость, НЕ
+# защита: логин у всех агентов один. Отказ (rc=1) — зелёный no-op «занята»,
+# поломка утилиты (rc=2) — громкая.
+# CLAIM_ACTOR — назначаемый аккаунт, ОБЯЗАН быть валидным логином (иначе
+# назначение отклоняется, а контракт PR требует назначенного исполнителя);
+# различие каналов для следа в задаче — отдельная CLAIM_VIA.
+CLAIM_ACTOR="${CLAIM_ACTOR:-$WORKER_LOGIN}"
+CLAIM_VIA="worker run ${GITHUB_RUN_ID:-local}${TASK_INPUT:+, task=$TASK_INPUT}"
+export CLAIM_ACTOR CLAIM_VIA
+claim_out="$(lease_cli claim "$number" 2>&1)" && claim_rc=0 || claim_rc=$?
+if [ "$claim_rc" -eq 1 ]; then
+  echo "Задача #$number занята другим исполнителем — зелёный no-op: $claim_out"
+  exit 0
+fi
+[ "$claim_rc" -eq 0 ] || die "claim_task сломался (rc=$claim_rc): $claim_out"
+echo "Аренда взята: $claim_out"
 
 # ── 4b. Пульс живости: пока идёт работа, журнал знает, что воркер жив ────────────
 # Стопгэп наблюдаемости (#112): свежий /api/heartbeat — доказательство «агент
@@ -352,8 +375,18 @@ fi
 # конвейер не сломан, job зелёный.
 if jq -e '.labels[]? | select(.name == "blocked")' \
     <(gh issue view "$number" --json labels) >/dev/null; then
+  # Явный drop аренды при blocked-эскалации (#121): работу никто не ведёт,
+  # держать замок — зря блокировать задачу остальным на TTL. Сбой снятия не
+  # роняет отчёт: газ — TTL-сборщик оркестратора (24 ч).
+  drop_out="$(lease_cli release "$number" 2>&1)" && drop_rc=0 || drop_rc=$?
+  if [ "$drop_rc" -eq 0 ]; then
+    echo "Аренда снята (blocked): $drop_out"
+  else
+    echo "::warning::замок задачи #$number не снят при эскалации (rc=$drop_rc): $drop_out — снимет TTL-сборщик"
+  fi
   comment=$(cat <<COMMENT
 🤖 Автономный воркер эскалировал: то, что нужно для задачи, есть только у владельца.
+Аренда задачи снята (замок убран, назначение осталось — задача ждёт владельца).
 Детали — в комментариях выше и в хвосте ответа DSH ниже (секреты замаскированы).
 
 ~~~~
@@ -371,8 +404,10 @@ reason="dsh завершился с кодом $rc без открытого PR"
 [ "$rc" = "124" ] && reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR не открыт"
 comment=$(cat <<COMMENT
 🤖 Автономный воркер не справился: $reason.
-Задача остаётся назначенной: оркестратор вернёт её в пул через 24 ч без PR,
-либо сними назначение вручную. Хвосты логов ниже (секреты замаскированы).
+Задача остаётся под арендой: оркестратор вернёт её в пул через 24 ч без PR
+(снимет и протухший замок, и назначение), либо сними их вручную
+(python3 scripts/lib/claim_task.py release $number). Хвосты логов ниже
+(секреты замаскированы).
 
 Хвост stderr DSH:
 
