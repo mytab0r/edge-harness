@@ -1,6 +1,6 @@
 {
   "name": "@edge-harness/dsh-plugin-manager",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Client plugin: Plugins settings section for the dsh-edge web roster — manifest inventory, journal statuses, orderable catalog and plugin ordering (#102, #113)",
   "type": "module",
   "exports": {
