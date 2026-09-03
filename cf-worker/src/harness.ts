@@ -1,8 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
-import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
+import { AUTOMATIONS, DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 import { redact } from "./redact";
+import {
+  type AutomationConfig,
+  digestPeriod,
+  isValidAutomationId,
+  parseAutomationConfig,
+  runTaskId,
+  scheduleDue,
+} from "./automations";
 
 // ── Inbox constants (from config) ──────────────────────────────────────────────────────
 const MESSAGE_MAX_CHARS = LIMITS.messageMaxChars;
@@ -101,6 +109,18 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS messages_by_status ON messages(status)`,
   `CREATE INDEX IF NOT EXISTS messages_by_kind ON messages(kind)`,
   `CREATE INDEX IF NOT EXISTS messages_by_group ON messages(grouped_with)`,
+  // Автоматизации (#116): конфиг — единственное место правды, правится из морды
+  // (секция «Автоматизации» через прокси /api/harness/*). last_fired_ts — троттл
+  // триггеров-расписаний: обновляется при любом исходе запуска, чтобы упавший
+  // dispatch не штурмовался каждым 15-минутным пульсом.
+  `CREATE TABLE IF NOT EXISTS automations (
+     id            TEXT PRIMARY KEY,
+     enabled       INTEGER NOT NULL,
+     config        TEXT NOT NULL,
+     created_ts    INTEGER NOT NULL,
+     updated_ts    INTEGER NOT NULL,
+     last_fired_ts INTEGER
+   )`,
 ];
 
 export interface EventRow {
@@ -530,13 +550,21 @@ export class Harness extends DurableObject<Env> {
     if (url.searchParams.has("token")) {
       throw new ApiError(400, "query_token_removed");
     }
-    if (!(await this.#authorized(request))) {
-      throw new ApiError(401, "unauthorized");
-    }
 
     // Роутинг табличный: метод+путь ищутся в api-spec.json. Добавить маршрут можно
     // только через спеку — «объявлен в спеке, но не подключён» и наоборот невозможны.
     const matched = matchRoute(request.method, url.pathname);
+    // Webhook автоматизации (#116) аутентифицируется подписью, а не кукой/Bearer —
+    // у внешнего отправителя их нет и быть не должно. Спека помечает маршрут
+    // auth: false, и он обслуживается ДО общей аутентификации. Остальное поведение
+    // прежнее: без авторизации — 401 и на неизвестный путь тоже (не раскрываем
+    // маршруты непрошеным).
+    if (matched?.route.name === "webhook") {
+      return this.#handleWebhook(request, matched.rest);
+    }
+    if (!(await this.#authorized(request))) {
+      throw new ApiError(401, "unauthorized");
+    }
     if (!matched) {
       throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
     }
@@ -596,6 +624,15 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "messagesProcess") {
       return this.#processMessages(request);
     }
+    if (route.name === "automations") {
+      return this.#json({ automations: this.#listAutomations() });
+    }
+    if (route.name === "automation" && request.method === "PUT") {
+      return this.#putAutomation(request, matched.rest);
+    }
+    if (route.name === "automation" && request.method === "DELETE") {
+      return this.#deleteAutomation(matched.rest);
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
@@ -614,17 +651,23 @@ export class Harness extends DurableObject<Env> {
     return this.#sessionValid(request);
   }
 
-  async #hmac(payload: string): Promise<string> {
+  /** hex HMAC-SHA256 — подпись сессионной куки (SESSION_SECRET) и подпись
+   *  webhook'ов автоматизаций (AUTOMATION_WEBHOOK_SECRET, #116): одна механика. */
+  async #hmacHex(secret: string, payload: string): Promise<string> {
     const encoder = new TextEncoder();
     const key = await crypto.subtle.importKey(
       "raw",
-      encoder.encode(this.env.SESSION_SECRET),
+      encoder.encode(secret),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"],
     );
     const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
     return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async #hmac(payload: string): Promise<string> {
+    return this.#hmacHex(this.env.SESSION_SECRET, payload);
   }
 
   #cookieValue(request: Request): string | null {
@@ -884,6 +927,9 @@ export class Harness extends DurableObject<Env> {
     for (const row of accepted) this.#applySideEffects(row);
     for (const row of accepted) this.#broadcastEvent(row);
     if (accepted.length) this.#broadcastStatus();
+    // Триггер «событие журнала» (#116) — после записи: событие, которого нет в
+    // журнале, триггерить не может; отказ триггера не отменяет приём батча.
+    await this.#fireJournalTriggers(accepted);
 
     return this.#json({ accepted: accepted.length, duplicates, task_id: taskId });
   }
@@ -1067,6 +1113,13 @@ export class Harness extends DurableObject<Env> {
       const detail = error instanceof Error ? error.message : String(error);
       console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
     }
+    // Триггеры-расписания автоматизаций (#116): тот же пульс, что гоняет
+    // orchestra — отдельного cron в Actions нет (research/21: не тикает).
+    try {
+      await this.#fireDueSchedules(Date.now());
+    } catch (error) {
+      console.log(`automation schedules failed: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   /** Текущая строка пульса (issue #269), полное внутреннее представление —
@@ -1168,9 +1221,8 @@ export class Harness extends DurableObject<Env> {
     this.#emitSystemEvent(id, "task_queued", { payload });
     this.#broadcastStatus();
 
-    const token = this.env.GH_DISPATCH_TOKEN;
-    const repo = this.env.GH_REPO;
-    if (!token || !repo) {
+    const result = await this.#dispatchToGitHub(GITHUB.dispatchEventType, { task_id: id });
+    if (result.status === 0) {
       // «Возможности нет» — это не поломка: конфигурации нет, задача лежит в очереди.
       return this.#json(
         {
@@ -1182,10 +1234,43 @@ export class Harness extends DurableObject<Env> {
         { status: 201 },
       );
     }
+    if (result.status === -1) {
+      this.#emitSystemEvent(id, "dispatch_failed", { detail: result.error });
+      this.#broadcastStatus();
+      throw new ApiError(502, "dispatch_network_failed", { detail: result.error ?? "" });
+    }
 
-    let response: Response;
+    if (result.status !== 204) {
+      // 204 от dispatch — не доказательство запуска job'а (и 204 при отсутствии
+      // workflow-файла на default branch тоже). Ловится отсутствием job_start, см.
+      // docs/research/21-github-actions.md. Здесь доказываем только приём события API.
+      this.#emitSystemEvent(id, "dispatch_failed", { github_status: result.status });
+      this.#broadcastStatus();
+      throw new ApiError(502, "dispatch_rejected", { status: result.status });
+    }
+
+    this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
+    this.#emitSystemEvent(id, "task_dispatched", {});
+    this.#broadcastStatus();
+    return this.#json({ task_id: id, dispatched: true }, { status: 201 });
+  }
+
+  /**
+   * repository_dispatch в репозиторий — единственная точка механики dispatch
+   * (ADR 0008: узкий GH_DISPATCH_TOKEN). Два вызывающих: очередь задач
+   * (event_type harness-task) и триггеры автоматизаций (harness-automation, #116).
+   * status: 0 — не сконфигурировано («возможности нет»), -1 — сеть, иначе —
+   * HTTP-код ответа GitHub (204 = принято).
+   */
+  async #dispatchToGitHub(
+    eventType: string,
+    payload: Record<string, unknown>,
+  ): Promise<{ status: number; error?: string }> {
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) return { status: 0 };
     try {
-      response = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
+      const response = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -1194,32 +1279,12 @@ export class Harness extends DurableObject<Env> {
           "User-Agent": GITHUB.userAgent,
           "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
-        body: JSON.stringify({
-          event_type: GITHUB.dispatchEventType,
-          client_payload: { task_id: id },
-        }),
+        body: JSON.stringify({ event_type: eventType, client_payload: payload }),
       });
+      return { status: response.status };
     } catch (error) {
-      this.#emitSystemEvent(id, "dispatch_failed", { detail: String(error) });
-      this.#broadcastStatus();
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new ApiError(502, "dispatch_network_failed", { detail });
+      return { status: -1, error: error instanceof Error ? error.message : String(error) };
     }
-
-    if (response.status !== 204) {
-      // 204 от dispatch — не доказательство запуска job'а (и 204 при отсутствии
-      // workflow-файла на default branch тоже). Ловится отсутствием job_start, см.
-      // docs/research/21-github-actions.md. Здесь доказываем только приём события API.
-      this.#emitSystemEvent(id, "dispatch_failed", { github_status: response.status });
-      this.#broadcastStatus();
-      throw new ApiError(502, "dispatch_rejected", { status: response.status });
-    }
-
-    this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
-    this.#taskCountsCache = null;
-    this.#emitSystemEvent(id, "task_dispatched", {});
-    this.#broadcastStatus();
-    return this.#json({ task_id: id, dispatched: true }, { status: 201 });
   }
 
   #recentTasks(): TaskRow[] {
@@ -1244,6 +1309,233 @@ export class Harness extends DurableObject<Env> {
       status: String(row.status) as TaskRow["status"],
     };
   }
+
+  // ── Автоматизации (#116): конфиг, триггеры, webhook ───────────────────────────────
+
+  #automationRow(id: string): Record<string, SqlStorageValue> | null {
+    return this.#rows(
+      this.#sql.exec(
+        "SELECT enabled, config, created_ts, updated_ts, last_fired_ts FROM automations WHERE id = ?",
+        id,
+      ),
+    )[0] ?? null;
+  }
+
+  /** Вид для UI: конфиг распарсен (писался только через валидацию), последний
+   *  прогон — по префиксу task_id прогона; разделитель «:» в id запрещён, так
+   *  что префикс `automation:<id>:` не пересекается с чужими автоматизациями. */
+  #automationView(id: string, row: Record<string, SqlStorageValue>): Record<string, unknown> {
+    const lastRun = this.#rows(
+      this.#sql.exec(
+        "SELECT id, status, created_ts FROM tasks WHERE id LIKE ? ORDER BY created_ts DESC LIMIT 1",
+        `${AUTOMATIONS.runTaskPrefix}${id}:%`,
+      ),
+    )[0];
+    return {
+      id,
+      enabled: Number(row.enabled) === 1,
+      config: JSON.parse(String(row.config)) as AutomationConfig,
+      created_ts: Number(row.created_ts),
+      updated_ts: Number(row.updated_ts),
+      last_fired_ts: row.last_fired_ts === null || row.last_fired_ts === undefined ? null : Number(row.last_fired_ts),
+      last_run: lastRun
+        ? { task_id: String(lastRun.id), status: String(lastRun.status), created_ts: Number(lastRun.created_ts) }
+        : null,
+    };
+  }
+
+  #listAutomations(): Record<string, unknown>[] {
+    return this.#rows(
+      this.#sql.exec("SELECT id, enabled, config, created_ts, updated_ts, last_fired_ts FROM automations ORDER BY id"),
+    ).map((row) => this.#automationView(String(row.id), row));
+  }
+
+  async #putAutomation(request: Request, restId: string): Promise<Response> {
+    if (!isValidAutomationId(restId)) {
+      throw new ApiError(400, "automation_id_invalid");
+    }
+    const body = await this.#readJson(request);
+    const parsed = parseAutomationConfig(body.config);
+    if (!parsed.ok) {
+      throw new ApiError(400, "automation_config_invalid", { detail: parsed.error });
+    }
+    const now = Date.now();
+    const existing = this.#automationRow(restId);
+    if (!existing) {
+      const count = Number(
+        this.#rows(this.#sql.exec("SELECT COUNT(*) AS n FROM automations"))[0].n,
+      );
+      if (count >= LIMITS.automationsMax) {
+        throw new ApiError(400, "automation_limit", { limit: LIMITS.automationsMax });
+      }
+    }
+    this.#sql.exec(
+      `INSERT INTO automations (id, enabled, config, created_ts, updated_ts) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, config = excluded.config, updated_ts = excluded.updated_ts`,
+      restId,
+      parsed.config.enabled ? 1 : 0,
+      JSON.stringify(parsed.config),
+      existing ? Number(existing.created_ts) : now,
+      now,
+    );
+    // След конфигурации в журнале — виден с дашборда (#111); прогон это событие
+    // НЕ запускает: прогон порождают только триггеры.
+    this.#emitSystemEvent(`automation:${restId}`, "automation_updated", {
+      created: !existing,
+      enabled: parsed.config.enabled,
+      trigger: parsed.config.trigger.type,
+      task: parsed.config.task.kind,
+    });
+    const row = this.#automationRow(restId);
+    return this.#json({ automation: this.#automationView(restId, row!) }, { status: existing ? 200 : 201 });
+  }
+
+  #deleteAutomation(restId: string): Response {
+    if (!isValidAutomationId(restId)) {
+      throw new ApiError(400, "automation_id_invalid");
+    }
+    const cursor = this.#sql.exec("DELETE FROM automations WHERE id = ?", restId);
+    if (cursor.rowsWritten === 0) {
+      throw new ApiError(404, "automation_not_found", { automation_id: restId });
+    }
+    return this.#json({ ok: true });
+  }
+
+  /** Вход внешних webhook'ов. Подпись — HMAC-SHA256 от сырого тела с
+   *  AUTOMATION_WEBHOOK_SECRET; без подписи/с неверной — 401 и событие в журнале:
+   *  отказ обязан быть виден, а не только угадан по коду ответа. */
+  async #handleWebhook(request: Request, automationId: string): Promise<Response> {
+    const secret = this.env[AUTOMATIONS.webhookSecretEnv];
+    if (!secret) {
+      // Конфигурации нет — это не «отклонено», а «приём невозможен»: другой ответ,
+      // чтобы владелец отличал незавершённую настройку от атаки.
+      throw new ApiError(500, "webhook_secret_missing");
+    }
+    const rawBody = await request.text();
+    if (rawBody.length > LIMITS.bodyMaxBytes) {
+      throw new ApiError(413, "too_large", { limit: LIMITS.bodyMaxBytes });
+    }
+    const provided = request.headers.get(AUTOMATIONS.webhookSignatureHeader) ?? "";
+    const expected = `sha256=${await this.#hmacHex(secret, rawBody)}`;
+    if (!provided || !constantTimeEqual(provided, expected)) {
+      this.#emitSystemEvent(AUTOMATIONS.webhookRejectedTaskId, "automation_webhook_rejected", {
+        automation: String(automationId).slice(0, 64),
+        reason: provided ? "bad_signature" : "signature_missing",
+      });
+      throw new ApiError(401, "webhook_signature_invalid");
+    }
+    if (!isValidAutomationId(automationId)) {
+      throw new ApiError(400, "automation_id_invalid");
+    }
+    const row = this.#automationRow(automationId);
+    if (!row) {
+      throw new ApiError(404, "automation_not_found", { automation_id: automationId });
+    }
+    const config = JSON.parse(String(row.config)) as AutomationConfig;
+    if (!config.enabled) {
+      this.#emitSystemEvent(`automation:${automationId}`, "automation_webhook_rejected", { reason: "disabled" });
+      throw new ApiError(409, "automation_disabled", { automation_id: automationId });
+    }
+    const fired = await this.#fireAutomation(automationId, row.last_fired_ts, config, "webhook", Date.now());
+    return this.#json(
+      { ok: true, task_id: fired.taskId, dispatched: fired.dispatched },
+      { status: 202 },
+    );
+  }
+
+  /**
+   * Поднять прогон автоматизации: задача в очереди + события журнала +
+   * repository_dispatch. Отказ dispatch не выбрасывает исключение наружу —
+   * он честно помечает прогон и остаётся в журнале; «не сконфигурировано»
+   * оставляет прогон в очереди, как у POST /api/tasks.
+   * last_fired_ts обновляется при ЛЮБОМ исходе: упавший/ненастроенный dispatch
+   * не должен штурмоваться каждым 15-минутным пульсом — повтор по расписанию
+   * только в следующем интервале.
+   */
+  async #fireAutomation(
+    automationId: string,
+    lastFiredTs: SqlStorageValue,
+    config: AutomationConfig,
+    trigger: "schedule" | "webhook" | "journal",
+    now: number,
+  ): Promise<{ taskId: string; dispatched: boolean }> {
+    const taskId = runTaskId(automationId, now);
+    this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", taskId, now);
+    this.#emitSystemEvent(taskId, "automation_triggered", { automation: automationId, trigger });
+    const period = config.trigger.type === "schedule"
+      ? digestPeriod(lastFiredTs === null || lastFiredTs === undefined ? null : Number(lastFiredTs), config.trigger.intervalHours, now)
+      : null;
+    const result = await this.#dispatchToGitHub(AUTOMATIONS.dispatchEventType, {
+      automation_id: automationId,
+      task_id: taskId,
+      trigger,
+      period,
+    });
+    let dispatched = false;
+    if (result.status === 204) {
+      dispatched = true;
+      this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, taskId);
+      this.#emitSystemEvent(taskId, "automation_dispatched", {});
+    } else if (result.status === 0) {
+      // «Возможности нет» (GH_DISPATCH_TOKEN не задан): прогон ждёт конфигурации
+      // в очереди — как обычная задача, ответ честно называет not_configured.
+    } else {
+      this.#sql.exec("UPDATE tasks SET status = 'failed' WHERE id = ?", taskId);
+      this.#emitSystemEvent(taskId, "dispatch_failed", { github_status: result.status, detail: result.error });
+    }
+    this.#sql.exec("UPDATE automations SET last_fired_ts = ? WHERE id = ?", now, automationId);
+    this.#broadcastStatus();
+    return { taskId, dispatched };
+  }
+
+  /** Тик расписаний: включённые schedule-автоматизации, у которых интервал истёк.
+   *  Отказ одного запуска изолирован — выключение/поломка автоматизации не
+   *  убивает остальные (критерий #116). */
+  async #fireDueSchedules(now: number): Promise<void> {
+    const rows = this.#rows(
+      this.#sql.exec("SELECT id, config, last_fired_ts FROM automations WHERE enabled = 1 ORDER BY id"),
+    );
+    for (const row of rows) {
+      const id = String(row.id);
+      try {
+        const config = JSON.parse(String(row.config)) as AutomationConfig;
+        if (config.trigger.type !== "schedule") continue;
+        const last = row.last_fired_ts === null || row.last_fired_ts === undefined ? null : Number(row.last_fired_ts);
+        if (!scheduleDue(config.trigger.intervalHours, last, now)) continue;
+        await this.#fireAutomation(id, row.last_fired_ts, config, "schedule", now);
+      } catch (error) {
+        console.log(`automation ${id} schedule fire failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  /** Триггер «событие журнала»: включённые journal-автоматизации, чей kind
+   *  совпал с только что принятым событием. События самих автоматизаций
+   *  (префикс task_id) ретриггерить не могут — гвардия петли. */
+  async #fireJournalTriggers(accepted: EventRow[]): Promise<void> {
+    const candidates = accepted.filter(
+      (row) => !String(row.task_id).startsWith(AUTOMATIONS.runTaskPrefix),
+    );
+    if (!candidates.length) return;
+    const rows = this.#rows(
+      this.#sql.exec("SELECT id, config, last_fired_ts FROM automations WHERE enabled = 1 ORDER BY id"),
+    );
+    for (const row of rows) {
+      const id = String(row.id);
+      try {
+        const config = JSON.parse(String(row.config)) as AutomationConfig;
+        const trigger = config.trigger;
+        if (trigger.type !== "journal") continue;
+        // trigger — локальная константа: сужение типа в замыкании живёт,
+        // у свойства config.trigger оно сбрасывается.
+        if (!candidates.some((event) => event.kind === trigger.kind)) continue;
+        await this.#fireAutomation(id, row.last_fired_ts, config, "journal", Date.now());
+      } catch (error) {
+        console.log(`automation ${id} journal trigger failed: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
 
   /**
    * Системное событие. seq у системных событий отрицательные (−1, −2…): job нумерует

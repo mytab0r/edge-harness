@@ -8,3 +8,6 @@ GH_DISPATCH_TOKEN=
 # инбокс создаёт issue для директивы владельца. Пусто — директива повторяется
 # с честной ошибкой issues_not_configured, пока секрет не задан.
 GH_ISSUES_TOKEN=
+# Ключ подписи webhook'ов автоматизаций (#116). Пусто — POST /api/webhooks/*
+# отвечает 500 webhook_secret_missing (приём невозможен, а не «отклонён»).
+AUTOMATION_WEBHOOK_SECRET=dev-webhook-secret

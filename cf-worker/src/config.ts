@@ -18,6 +18,11 @@ export const LIMITS = {
   payloadMaxChars: 8192,
   /** Сколько последних задач отдаёт список. */
   tasksListMax: 100,
+  /** Потолок числа автоматизаций (#116). Пул владельца один — десятки правил
+   *  это уже аномалия; потолок страхует таблицу и список от неограниченного роста. */
+  automationsMax: 50,
+  /** Конфиг автоматизации больше этого числа символов отклоняется. */
+  automationConfigMaxChars: 8192,
   /** Watchdog (issue #7): задача в статусе dispatched дольше этого порога без
    *  heartbeat — ненормальное состояние, морда показывает предупреждение.
    *  Медиана старта 8.3 с (ADR 0003), хвост ничем не ограничен — порог щедрый. */
@@ -112,6 +117,28 @@ export const GITHUB = {
 
 /** Имя единственного объекта. Мультитенантности нет, владелец один. */
 export const OWNER_OBJECT_NAME = "owner";
+
+/** Автоматизации (#116): «триггер → задача агенту → отчёт». Модель и валидация
+ *  формы — в src/automations.ts (чистые функции), здесь — проводочные константы. */
+export const AUTOMATIONS = {
+  /** event_type repository_dispatch, поднимающий job автоматизации
+   *  (.github/workflows/automation.yml). Тот же механизм dispatch, что у задач
+   *  (GITHUB.dispatchEventType), отдельный тип — у job'а другой контракт. */
+  dispatchEventType: "harness-automation",
+  /** Префикс task_id прогонов автоматизации в очереди/журнале:
+   *  `automation:<id>:<ts>`. По этому же префиксу событие журнала считается
+   *  «событием самой автоматизации» и не может ретриггерить journal-триггеры
+   *  (гвардия петли). */
+  runTaskPrefix: "automation:",
+  /** Псевдо-задача журнала для отклонённых webhook-вызовов: попытки без
+   *  подписи/с неверной подписью видны в журнале и дашборде, а не только 401'ем. */
+  webhookRejectedTaskId: "automation:webhook:rejected",
+  /** Имя секрета воркера с HMAC-ключом подписи webhook'ов. Значение живёт
+   *  только в секретах (репозиторий публичный), здесь — имя. */
+  webhookSecretEnv: "AUTOMATION_WEBHOOK_SECRET",
+  /** Заголовок подписи webhook: `sha256=<hex HMAC-SHA256(raw body, secret)>`. */
+  webhookSignatureHeader: "X-Harness-Signature",
+} as const;
 
 /** Локаль сообщений API. Словари — в messages.ts. */
 export const LOCALE = "ru" as const;
