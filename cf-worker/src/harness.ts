@@ -1437,6 +1437,13 @@ export class Harness extends DurableObject<Env> {
       this.#emitSystemEvent(`automation:${automationId}`, "automation_webhook_rejected", { reason: "disabled" });
       throw new ApiError(409, "automation_disabled", { automation_id: automationId });
     }
+    if (config.trigger.type !== "webhook") {
+      // Вход должен стрелять только webhook-триггерной автоматизацией: иначе
+      // schedule/journal прогон сработал бы мимо своего триггера, а last_fired_ts
+      // молча сдвинул бы фазу расписания (нашёл AI-ревью PR #241).
+      this.#emitSystemEvent(`automation:${automationId}`, "automation_webhook_rejected", { reason: "not_webhook_trigger" });
+      throw new ApiError(409, "automation_not_webhook", { automation_id: automationId });
+    }
     const fired = await this.#fireAutomation(automationId, row.last_fired_ts, config, "webhook", Date.now());
     return this.#json(
       { ok: true, task_id: fired.taskId, dispatched: fired.dispatched },
