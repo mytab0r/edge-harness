@@ -298,9 +298,14 @@ test('renderConfluenceResults: прод-форма content/search — загол
       },
     },
   ])
-  assert.ok(rendered.includes('Runbook деплоя'))
-  assert.ok(rendered.includes('id 123456'))
-  assert.ok(rendered.includes('https://team.atlassian.net/wiki/spaces/OPS/pages/123456/Runbook'))
+  // Рендер ссылки сверяется ТОЧНЫМ равенством всей строки (не подстрокой по
+  // URL): подстрочная проверка URL — паттерн js/incomplete-url-substring-
+  // sanitization, а точное равенство и сильнее как тест.
+  assert.equal(
+    rendered,
+    'Найденные страницы:\n'
+    + '- Runbook деплоя (id 123456) — https://team.atlassian.net/wiki/spaces/OPS/pages/123456/Runbook',
+  )
   assert.ok(renderConfluenceResults([]).includes('не нашлось'))
   assert.ok(renderConfluenceResults(undefined).includes('не нашлось'))
 })
@@ -369,7 +374,7 @@ test('bitbucketPrPath и body: ветки и опциональное описа
   assert.ok(!('description' in body), 'пустое описание не уезжает в API')
 })
 
-test('renderBitbucketPr: прод-форма 201 — номер, заголовок, ссылка', () => {
+test('renderBitbucketPr: прод-форма 201 — точное равенство всего рендера', () => {
   const rendered = renderBitbucketPr({
     id: 42,
     title: 'Интеграции: первый шаг',
@@ -378,7 +383,12 @@ test('renderBitbucketPr: прод-форма 201 — номер, заголов�
     source: { branch: { name: 'feature' } },
     destination: { branch: { name: 'main' } },
   })
-  assert.ok(rendered.includes('#42'))
-  assert.ok(rendered.includes('https://bitbucket.org/myteam/service/pull-requests/42'))
+  // Точное равенство: и сильнее подстрочной проверки, и чисто для
+  // js/incomplete-url-substring-sanitization (URL не сверяется подстрокой).
+  assert.equal(
+    rendered,
+    'PR #42 «Интеграции: первый шаг» создан: '
+    + 'https://bitbucket.org/myteam/service/pull-requests/42. Скажи пользователю ссылку.',
+  )
   assert.equal(renderBitbucketPr({ title: 'нет id' }), null)
 })
