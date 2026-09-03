@@ -66,6 +66,33 @@
     по заголовку клиентом (оркестратором) возможен без patch.
 - Replay-чтение: `GET /api/sessions/:id/events` — SSE-кадры (`data: {JSON}`).
 
+## session.prompt / session.history: контракт для клиентских плагинов (#113)
+
+Снято с типов `@deepseek-ai/dsh-host-apiproxy` 0.1.1-rc.2 (`lib/types/api/
+sessions.d.ts`) и `@deepseek-ai/dsh-session` 0.1.1-rc.2 (`SessionEventMap`,
+`SessionEvent`); читано 2026-09-03 для заказа плагинов из plugin-manager.
+Живым прогоном на проде НЕ проверялось — отмечено в «Не подтверждено».
+
+- `session.prompt {sessionId, mode:'queue'|'steer', content:[{type:'text',
+  text}|{type:'image',…}], clientTimeZone?}` → `{accepted:true, command?}`.
+  `accepted` = сообщение принято к ходу (поставлено в очередь или отправлено),
+  НЕ «агент справился». Сообщение из одного текст-блока, начинающееся с `/`,
+  хост исполняет как slash-команду, а модели НЕ отправляет. Режим `queue`
+  при активном ходе ставит сообщение в очередь (FIFO), `steer` вмешивается
+  в текущий ход — для автоматических заказов корректен `queue`.
+- `session.history {sessionId, beforeSeq?, maxMessages?}` → `{events:[{event,
+  view?}], hasMore, projections?}`. Страницы режутся по границам
+  «append-origin» сообщений (одна страница = целое число сообщений со всеми
+  их chunk/tool-событиями); первый запрос без `beforeSeq` возвращает ХВОСТ
+  (новейшие `maxMessages` сообщений), вглубь — по `beforeSeq`. Сырое событие:
+  `{type, seq, time, data, ignorable?, surfaceOp?}`; для `user/message`
+  `data` — UserMessage `{id, role:'user', content:[ContentBlock], source}`,
+  текстовые блоки — `{type:'text', text}`.
+- Неизвестная сессия в сессионных методах → `result.ok:false`,
+  `error.code:"session-not-found"` — клиентский код обязан отличать это от
+  сетевого отказа (для заказов плагинов это штатное «заказов ещё нет», не
+  ошибка).
+
 ## Форма канонических событий (то, что можно дописать в сессию)
 
 Словарь — `SessionEventMap` (`@deepseek-ai/dsh-session` 0.1.1-rc.2,
@@ -104,6 +131,12 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   кривую отрисовку — беда не в данных, а в рендере, чинится формой батча.
 - Гонка «ingest против живого нативного хода» в той же сессии даёт BUSY (409)
   из `openAgentForTurn`; поведение UI при повторе после BUSY не изучалось.
+- Контракт `session.prompt`/`session.history` (#113, раздел выше) снят с
+  типов пакетов 0.1.1-rc.2, но живым RPC-прогоном на проде не проверялся:
+  фактическая семантика `accepted`, коды ошибок помимо `session-not-found`
+  и поведение UI при `mode:'queue'` для заказа плагина — до первого живого
+  заказа. Плагин при несоответствии громко покажет ошибку секции (форма
+  конверта проверяется).
 
 ## Источники
 
