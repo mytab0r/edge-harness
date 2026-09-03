@@ -1,0 +1,419 @@
+# Форж плагинов dsh-edge: исходники плагина → релиз + PR в plugins.json
+#
+# Вход: workflow_dispatch с путём к исходникам плагина (относительно корня репо).
+# Выход: релиз plugins-<name>-v<version> с tarball и checksums, PR с обновлённым
+# dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
+# (design.md «Workers-совместимость») и интеграционном дыме.
+#
+# Форж не деплоит морду — деплой делает deploy-dsh-edge.yml после мержа PR.
+name: plugin-forge
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_path:
+        description: "Путь к исходникам плагина (относительно корня репо, напр. plugins-src/my-plugin)"
+        required: true
+        type: string
+      plugin_id:
+        description: "ID плагина для манифеста (по умолчанию — имя каталога)"
+        required: false
+        type: string
+
+permissions:
+  contents: write  # для создания релиза и PR
+  issues: write    # для постинга статусов в журнал (если нужно)
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.plugin_path }}
+  cancel-in-progress: false
+
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/setup@v2
+        with:
+          version: 11
+          install: false
+
+      - name: Валидация входа
+        id: validate
+        env:
+          PLUGIN_PATH: ${{ inputs.plugin_path }}
+        run: |
+          PLUGIN_PATH="${PLUGIN_PATH}"
+          [ -d "$PLUGIN_PATH" ] || { echo "::error::Каталог плагина не найден: $PLUGIN_PATH"; exit 1; }
+          [ -f "$PLUGIN_PATH/package.json" ] || { echo "::error::package.json не найден в $PLUGIN_PATH"; exit 1; }
+
+          PLUGIN_NAME=$(jq -r '.name' "$PLUGIN_PATH/package.json")
+          PLUGIN_VERSION=$(jq -r '.version' "$PLUGIN_PATH/package.json")
+          [ "$PLUGIN_NAME" != "null" ] && [ -n "$PLUGIN_NAME" ] || { echo "::error::package.json: name обязателен"; exit 1; }
+          [ "$PLUGIN_VERSION" != "null" ] && [ -n "$PLUGIN_VERSION" ] || { echo "::error::package.json: version обязателен"; exit 1; }
+
+          # ID плагина: из ввода или из имени каталога
+          if [ -n "${{ inputs.plugin_id }}" ]; then
+            PLUGIN_ID="${{ inputs.plugin_id }}"
+          else
+            PLUGIN_ID=$(basename "$PLUGIN_PATH")
+          fi
+          # Проверка формата ID (как в manifest.mjs)
+          [[ "$PLUGIN_ID" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^[a-z][a-z0-9-]*$"; exit 1; }
+
+          # Определяем, есть ли клиентская часть
+          CLIENT=$(jq -r '.dsh.client.platform // ""' "$PLUGIN_PATH/package.json")
+          [ "$CLIENT" = "web" ] && HAS_CLIENT=true || HAS_CLIENT=false
+
+          echo "plugin_name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=$PLUGIN_VERSION" >> "$GITHUB_OUTPUT"
+          echo "plugin_id=$PLUGIN_ID" >> "$GITHUB_OUTPUT"
+          echo "has_client=$HAS_CLIENT" >> "$GITHUB_OUTPUT"
+          echo "plugin_path=$PLUGIN_PATH" >> "$GITHUB_OUTPUT"
+
+          echo "Плагин: $PLUGIN_NAME v$PLUGIN_VERSION (id: $PLUGIN_ID, client: $HAS_CLIENT)"
+
+      - name: plugin_status → building
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: building
+          SOURCE: forge
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=building SOURCE=forge bash scripts/plugins/plugin_status.sh
+
+      # ── 1. Чеклист совместимости (design.md «Workers-совместимость») ──────────────
+      - name: Проверка совместимости с Workers Free
+        id: compat
+        run: |
+          node dsh-edge/check-plugin-compat.mjs "${{ steps.validate.outputs.plugin_path }}" \
+            ${{ steps.validate.outputs.has_client == 'true' && '--client' || '' }}
+
+      # ── 2. Сборка tarball ────────────────────────────────────────────────────────
+      - name: Собрать клиентский бандл (если есть build.mjs)
+        id: build-client
+        working-directory: ${{ steps.validate.outputs.plugin_path }}
+        run: |
+          if [ -f "build.mjs" ]; then
+            echo "Обнаружен build.mjs — собираем клиентский бандл"
+            node build.mjs
+          else
+            echo "build.mjs не найден — пропускаем сборку клиента"
+          fi
+
+      - name: Собрать tarball (npm pack)
+        id: pack
+        working-directory: ${{ steps.validate.outputs.plugin_path }}
+        env:
+          NPM_CONFIG_CACHE: /tmp/npm-cache
+        run: |
+          npm pack --cache /tmp/npm-cache --pack-destination "$GITHUB_WORKSPACE/artifacts" --loglevel=error >/dev/null
+          TARBALL=$(ls "$GITHUB_WORKSPACE/artifacts"/*.tgz | head -1)
+          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          ASSET_NAME=$(basename "$TARBALL")
+          # Имя asset'а для релиза: <basename>-<version>.tgz (как в hello-world/runner-bridge)
+          RELEASE_ASSET="${{ steps.validate.outputs.plugin_id }}-${{ steps.validate.outputs.plugin_version }}.tgz"
+          cp "$TARBALL" "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET"
+          SHA256_RELEASE=$(sha256sum "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET" | cut -d' ' -f1)
+          [ "$SHA256" = "$SHA256_RELEASE" ] || { echo "::error::sha256 не сошёлся после копирования"; exit 1; }
+
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "asset=$RELEASE_ASSET" >> "$GITHUB_OUTPUT"
+          echo "Тарболл: $ASSET_NAME → $RELEASE_ASSET (sha256: $SHA256)"
+
+      - name: plugin_status → built
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: built
+          SOURCE: forge
+          DETAIL: "tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=built SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh
+
+      # ── 3. Интеграционный дым: локальная сборка клона с плагином ─────────────────
+      - name: Интеграционный дым (локальная сборка с плагином)
+        id: smoke
+        env:
+          PLUGIN_TARBALL: ${{ steps.pack.outputs.tarball }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          PLUGIN_PACKAGE: ${{ steps.validate.outputs.plugin_name }}
+          # dsh-edge/plugins.json на этом шаге ещё не обновлён (PR с манифестом
+          # создаётся позже, см. шаг «Подготовить PR с обновлением манифеста») —
+          # без FORGE_EXTRA_PLUGIN кодогенерация и гвардия состава проверяли бы
+          # только старый состав, а новый плагин нигде бы не верифицировался.
+          # server:true зеркалит продовый путь генерации манифеста (шаг
+          # «Подготовить PR с обновлением манифеста» ниже ставит server:true
+          # безусловно) — форж целиком (design.md) не поддерживает client-only
+          # плагины, это pre-existing ограничение всего форжа, а не этого шага.
+          FORGE_EXTRA_PLUGIN: >-
+            {"id":"${{ steps.validate.outputs.plugin_id }}",
+            "package":"${{ steps.validate.outputs.plugin_name }}",
+            "server":true,
+            "client":${{ steps.validate.outputs.has_client }}}
+        run: |
+          # Клонируем апстрим на пине, применяем патчи, ставим плагин, кодогеним,
+          # билдим, прогоняем smoke-edge-plugins и verify — полный конвейер сборки.
+          # Читаем манифест АБСОЛЮТНЫМ путём и без подавления stderr: без
+          # фоллбэков — если manifest.mjs упадёт (битый манифест, нет
+          # upstream.json) или вернёт пустые upstream.repo/sha, job обязан
+          # провалиться здесь и громко, а не молча подставить дефолт и
+          # собрать плагин против не того апстрима (silent-wrong — находка
+          # AI-ревью PR #162). Заодно чинит соседний баг: относительный путь
+          # "dsh-edge/manifest.mjs" резолвился от $GITHUB_WORKSPACE/forge-clone
+          # (мы туда уже cd'нулись) — файла там нет, вызов падал всегда, и
+          # 2>/dev/null маскировал именно это, а не что-то редкое.
+          MANIFEST_JSON=$(node "$GITHUB_WORKSPACE/dsh-edge/manifest.mjs") \
+            || { echo "::error::dsh-edge/manifest.mjs не прочитался — не удалось получить upstream.json"; exit 1; }
+          UPSTREAM=$(jq -r '.upstream.repo' <<<"$MANIFEST_JSON")
+          SHA=$(jq -r '.upstream.sha' <<<"$MANIFEST_JSON")
+          [ -n "$UPSTREAM" ] && [ "$UPSTREAM" != "null" ] || { echo "::error::upstream.repo пуст в манифесте"; exit 1; }
+          [ -n "$SHA" ] && [ "$SHA" != "null" ] || { echo "::error::upstream.sha пуст в манифесте"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/forge-clone" && cd "$GITHUB_WORKSPACE/forge-clone"
+          git init -q
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+
+          # Патчи
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE/dsh-edge/patches"/*.patch; do
+            git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p"; exit 1; }
+          done
+
+          # Зависимости standalone
+          pnpm --dir apps/dsh-edge/standalone install --frozen-lockfile
+
+          # Добавляем плагин
+          pnpm --dir apps/dsh-edge/standalone add --save-exact "$PLUGIN_TARBALL"
+
+          # Кодогенерация
+          node "$GITHUB_WORKSPACE/dsh-edge/codegen-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Дым инсталла (cordis + ToolRuntime)
+          node "$GITHUB_WORKSPACE/dsh-edge/smoke-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Сборка
+          pnpm --dir apps/dsh-edge/standalone run build
+
+          # Гвардия состава
+          node "$GITHUB_WORKSPACE/dsh-edge/verify-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Контракт и детерминизм
+          pnpm --dir apps/dsh-edge/standalone run verify
+
+          echo "smoke=passed" >> "$GITHUB_OUTPUT"
+
+      - name: plugin_status → deploying
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: deploying
+          SOURCE: forge
+          DETAIL: "интеграционный дым пройден"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=deploying SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh
+
+      # ── 4. Релиз ─────────────────────────────────────────────────────────────────
+      - name: Создать/обновить релиз plugins-<name>-v<version>
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGIN_NAME: ${{ steps.validate.outputs.plugin_name }}
+          PLUGIN_VERSION: ${{ steps.validate.outputs.plugin_version }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          RELEASE_TAG="plugins-${PLUGIN_ID}-v${PLUGIN_VERSION}"
+          RELEASE_TITLE="${PLUGIN_NAME}: ${PLUGIN_ID} v${PLUGIN_VERSION}"
+
+          # Проверяем, существует ли релиз
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Релиз $RELEASE_TAG уже существует — обновляем asset"
+            gh release delete-asset "$RELEASE_TAG" "$ASSET" --yes || true
+            gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/$ASSET" --clobber
+          else
+            echo "Создаём релиз $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/$ASSET" \
+              --title "$RELEASE_TITLE" --notes "Автоматический релиз из plugin-forge (${GITHUB_RUN_ID})"
+          fi
+
+          # Публикуем checksums как отдельный asset
+          echo "$SHA256  $ASSET" > "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256"
+          gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256" --clobber || true
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: plugin_status → ready (forge done)
+        # Финальный ready — БЕЗ continue-on-error (симметрично deploy-dsh-edge.yml:
+        # там на финальном ready его тоже нет, только на промежуточных статусах).
+        # plugin_status.sh при FINAL=1 сам делает exit 1, если журнал недоступен
+        # или не принял событие — это должно красить job (fail loud: деплой без
+        # ready/failed события в журнале = silent-wrong, design.md). Находка
+        # AI-ревью PR #162.
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: ready
+          SOURCE: forge
+          DETAIL: "релиз ${{ steps.release.outputs.release_tag }}, tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}"
+          FINAL: "1"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=ready SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh
+
+      # ── 5. PR с обновлением plugins.json ────────────────────────────────────────
+      - name: Подготовить PR с обновлением манифеста
+        id: pr
+        env:
+          # GITHUB_TOKEN-пуши/PR не зажигают другие workflows (защита GitHub от
+          # рекурсии) — этот PR должен пройти test/CodeQL/review/contract, как
+          # любой другой, поэтому широкий PAT конвейера (тот же класс операций,
+          # что в orchestra.yml/deploy-dsh-edge.yml), а не github.token.
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          PLUGIN_PACKAGE: ${{ steps.validate.outputs.plugin_name }}
+          PLUGIN_VERSION: ${{ steps.validate.outputs.plugin_version }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          HAS_CLIENT: ${{ steps.validate.outputs.has_client }}
+        run: |
+          # GH_TOKEN авторизует только `gh`-вызовы; голому `git push` нужен
+          # credential helper — `gh auth setup-git` (тот же паттерн, что в
+          # worker.yml: без него push идёт анонимно и падает 403).
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
+          gh auth setup-git
+
+          BRANCH="forge/${PLUGIN_ID}-v${PLUGIN_VERSION}-$(date -u +%Y%m%dT%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH" origin/main
+
+          # Читаем текущий манифест
+          MANIFEST=$(cat dsh-edge/plugins.json)
+
+          # Проверяем, есть ли уже плагин с таким id
+          EXISTS=$(jq --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id)' <<<"$MANIFEST")
+          if [ -n "$EXISTS" ]; then
+            # Обновляем существующую запись
+            MANIFEST=$(jq --arg id "$PLUGIN_ID" \
+              --arg pkg "$PLUGIN_PACKAGE" \
+              --arg release "$RELEASE_TAG" \
+              --arg asset "$ASSET" \
+              --arg sha "$SHA256" \
+              --argjson server true \
+              --argjson client "$HAS_CLIENT" \
+              '(.plugins[] | select(.id == $id)) |= {
+                id: $id,
+                package: $pkg,
+                source: { release: $release, asset: $asset, sha256: $sha },
+                server: $server,
+                client: $client
+              }' <<<"$MANIFEST")
+            PR_TITLE="chore(plugins): обновить $PLUGIN_ID до v$PLUGIN_VERSION"
+          else
+            # Добавляем новую запись
+            MANIFEST=$(jq --arg id "$PLUGIN_ID" \
+              --arg pkg "$PLUGIN_PACKAGE" \
+              --arg release "$RELEASE_TAG" \
+              --arg asset "$ASSET" \
+              --arg sha "$SHA256" \
+              --argjson server true \
+              --argjson client "$HAS_CLIENT" \
+              '.plugins += [{
+                id: $id,
+                package: $pkg,
+                source: { release: $release, asset: $asset, sha256: $sha },
+                server: $server,
+                client: $client
+              }]' <<<"$MANIFEST")
+            PR_TITLE="feat(plugins): добавить плагин $PLUGIN_ID v$PLUGIN_VERSION"
+          fi
+
+          echo "$MANIFEST" > dsh-edge/plugins.json
+
+          # Валидируем манифест
+          node dsh-edge/manifest.mjs >/dev/null || { echo "::error::Обновлённый манифест невалиден"; exit 1; }
+
+          git add dsh-edge/plugins.json
+          # Многострочные тексты — через printf с явными \n, а не heredoc:
+          # heredoc-тело без YAML-отступа обрывает блочный литерал run: | раньше
+          # времени (PyYAML: "while scanning a simple key" — гвардия «все workflows
+          # валидный YAML» в repo-ci красит именно на этом). printf-формат —
+          # одна физическая строка YAML, аргументы подставляются как обычно.
+          COMMIT_MSG=$(printf '%s\n\nАвтоматический PR из plugin-forge (run %s).\nПлагин: %s (%s) v%s\nРелиз: %s\nAsset: %s\nSHA256: %s' \
+            "$PR_TITLE" "${{ github.run_id }}" "$PLUGIN_PACKAGE" "$PLUGIN_ID" "$PLUGIN_VERSION" "$RELEASE_TAG" "$ASSET" "$SHA256")
+          git commit -m "$COMMIT_MSG"
+
+          git push -u origin "$BRANCH"
+
+          PLUGIN_ISSUE="${{ github.event.inputs.plugin_id }}"
+          [ -n "$PLUGIN_ISSUE" ] || PLUGIN_ISSUE="$PLUGIN_ID"
+          # Ранее тело утверждало «после мержа PR автоматически запустится
+          # deploy-dsh-edge.yml (push-триггер)» — неверно: этот workflow
+          # триггерится только schedule/workflow_dispatch, push в main его не
+          # запускает (находка AI-ревью PR #162). Текст ниже описывает
+          # реальный путь.
+          PR_BODY=$(printf '#%s\n\n## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import, размер) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. Постит `plugin_status: ready` в журнал\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
+            "$PLUGIN_ISSUE" "${{ steps.release.outputs.release_tag }}")
+          PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Итог
+        run: |
+          echo "✅ Форж завершён для плагина ${{ steps.validate.outputs.plugin_id }}"
+          echo "Релиз: ${{ steps.release.outputs.release_tag }}"
+          echo "Тарболл: ${{ steps.pack.outputs.asset }} (sha256: ${{ steps.pack.outputs.sha256 }})"
+          echo "PR: ${{ steps.pr.outputs.pr_url }}"
+          echo ""
+          echo "Следующий шаг: ревью и мёрж PR. После мержа deploy-dsh-edge.yml соберёт и задеплоит морду с плагином."
+
+  # Если форж упал — постим failed статус
+  forge-failed:
+    needs: forge
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: plugin_status → failed
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # inputs.plugin_path может содержать "/" (напр. plugins-src/my-plugin) —
+          # невалидный id для plugin_status.sh; basename хотя бы убирает путь,
+          # если провалидированный plugin_id ещё не вычислен.
+          PLUGIN_ID: ${{ inputs.plugin_id || 'unknown' }}
+          STATE: failed
+          SOURCE: forge
+          DETAIL: "форж упал: см. лог job ${{ github.run_id }}"
+          FINAL: "1"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=failed SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh || true
