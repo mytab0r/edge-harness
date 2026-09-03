@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "provider-registry",
+      "title": "provider-registry — реестр LLM-провайдеров в морде",
+      "summary": "Владелец добавляет провайдеров и ключи через Settings морды, без файлов хоста и без правки секретов воркера при каждой смене квоты.",
+      "brief": "Напиши серверный DSH-плагин provider-registry: пул выбора провайдеров в UI морды. Источник правды — change openspec/changes/dsh-edge-provider-registry (proposal, design, дельта-спека, задачи): носитель — серверный плагин по образцу runner-bridge (release + sha256 в dsh-edge/plugins.json, server: true), адаптеры через ctx.llm.registerAdapter(), settings-namespace llm-pi-ai. Детали и приёмка — там; этот заказ не заменяет спеку.",
+      "spec": "openspec/changes/dsh-edge-provider-registry"
+    },
+    {
+      "id": "combo-auto",
+      "title": "combo-auto — виртуальная модель combo/auto",
+      "summary": "Автоматическая маршрутизация поверх подключённых провайдеров: failover по исчерпанной квоте, cooldown, заранее объявленный приоритет моделей.",
+      "brief": "Напиши серверный DSH-плагин combo-auto — виртуальную модель combo/auto поверх провайдеров, подключённых в реестре (плагин provider-registry). Поведение маршрутизации: failover по квотам, cooldown, объявленный приоритет моделей (решение владельца 2026-09-01: внешний роутер в цепочке не используется, поведение воспроизводится своим плагином — docs/research/30-rejected-alternatives.md п.8). Зависит от установленного provider-registry; если его ещё нет — согласуй порядок (сначала реестр). Дизайна маршрутизации в openspec/changes пока НЕТ — не считай источником правды change dsh-edge-provider-registry: тот прямо исключает маршрутизацию из своей рамки (роль 2 в proposal.md)."
+    }
+  ]
+}
