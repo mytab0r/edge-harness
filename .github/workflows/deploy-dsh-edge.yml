@@ -124,6 +124,25 @@ jobs:
             [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
             echo "$sha  plugins-tgz/$asset" >> checksums.txt
             echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
+            # Срезы правды, вшитые в релизный пакет, сверяются с репо (#115):
+            # иначе правка dsh-edge/integrations.json или plugins.json без
+            # пересборки и релиза даёт зелёный деплой, который синкует секреты
+            # и пишет статусы по новому реестру, а секция UI молча показывает
+            # старый состав. integrations.json — байт-в-байт; у manifest.json
+            # plugin-manager сверяется ростер id/server/client (sha самой
+            # записи в копии пакета отстаёт по принятой самореференции).
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/integrations.json$'; then
+              tar -xOf "plugins-tgz/$asset" package/integrations.json \
+                | diff -q - "$GITHUB_WORKSPACE/dsh-edge/integrations.json" >/dev/null \
+                || { echo "::error::Реестр интеграций в релизе $asset разошёлся с dsh-edge/integrations.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1; }
+            fi
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/manifest.json$'; then
+              if ! diff \
+                <(tar -xOf "plugins-tgz/$asset" package/manifest.json | jq -S '[.plugins[] | {id, server, client}]') \
+                <(jq -S '[.plugins[] | {id, server, client}]' "$GITHUB_WORKSPACE/dsh-edge/plugins.json") >/dev/null; then
+                echo "::error::Ростер манифеста в релизе $asset разошёлся с dsh-edge/plugins.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1
+              fi
+            fi
           done < plugins.tsv
           sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
 
@@ -450,6 +469,63 @@ jobs:
           [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_PIPELINE_PAT не задан — runner_task не сможет диспетчить воркера"; exit 1; }
           printf '%s' "$GH_RUNNER_TOKEN" | npx wrangler secret put GH_RUNNER_TOKEN
 
+      # Интеграции внешних систем (#115): реестр dsh-edge/integrations.json —
+      # единственное место правды о том, какие системы подключены и какие
+      # ИМЕНА секретов им нужны (значений в реестре нет и быть не может).
+      # Здесь три дела: (1) гвардия проводки — форма реестра + каждый его
+      # секрет обязан быть упомянут в env ЭТОГО шага, иначе расхождение
+      # красит деплой громко, а не оставляет интеграцию вечно not_configured
+      # при существующем секрете; (2) синк секретов morde-интеграций в воркер
+      # (put идемпотентен; telegram — wired jobs: его ключи читают job'ы
+      # раннеров, морде они не нужны); (3) снимок наличия секретов по каждой
+      # интеграции — его после канарейки пишет в журнал шаг «Статусы
+      # интеграций». Отсутствующий секрет НЕ красит деплой: интеграция без
+      # секрета — не поломка морды, а незавершённая настройка; её видимость —
+      # журнал и раздел «Интеграции» (state not_configured с именами).
+      # Гейт по манифесту: на префаб-маршруте (манифест пуст — аварийный
+      # fallback) плагина integrations в воркере нет, и «подключено» для
+      # тулов, которых в деплое нет, — ложь (тот же принцип, что у
+      # plugin_status ниже).
+      - name: Секреты интеграций морды (#115)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          BITBUCKET_USER: ${{ secrets.BITBUCKET_USER }}
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          registry=$(node "$GITHUB_WORKSPACE/dsh-edge/integrations.mjs")
+          echo "Реестр интеграций: $(jq -r '[.integrations[] | .id] | join(", ")' <<<"$registry")"
+          missing='{}'
+          synced=0
+          while IFS=$'\t' read -r id wired secret; do
+            if [ -z "${!secret:-}" ]; then
+              missing=$(jq --arg id "$id" --arg s "$secret" '.[$id].missing = ((.[$id].missing // []) + [$s])' <<<"$missing")
+              echo "::notice::интеграция $id: секрет $secret в репозитории не задан — статус будет not_configured"
+              continue
+            fi
+            if [ "$wired" = "morde" ]; then
+              printf '%s' "${!secret}" | npx wrangler secret put "$secret"
+              synced=$((synced + 1))
+            fi
+          done < <(jq -r '.integrations[] | .id as $id | .wired as $w | .secrets[] | [$id, $w, .] | @tsv' <<<"$registry")
+          # Снимок для шага статусов: {id, missing:[имена]} по каждой интеграции.
+          echo "$registry" | jq -c --argjson missing "$missing" \
+            '.integrations[] | {id: .id, missing: ($missing[.id].missing // [])}' \
+            > "$GITHUB_WORKSPACE/integration-states.ndjson"
+          echo "Секретов интеграций синхронизировано в воркер: $synced"
+
       - name: plugin_status → deploying
         if: steps.route.outputs.plugins != '0'
         # Промежуточный статус — best-effort: лежащий журнал не имеет права
@@ -546,6 +622,28 @@ jobs:
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
           done
 
+      # Живой статус интеграций (#115) — то, что читает раздел «Интеграции»
+      # морды: ready (все секреты на месте, морда задеплоена и канарейкой
+      # доказана) или not_configured (каких секретов нет — имена в detail).
+      # Морда здесь уже доказанно жива, поэтому FINAL=1: статус обязан доехать.
+      - name: Статусы интеграций → журнал (#115)
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          FINAL: "1"
+        run: |
+          while IFS=$'\t' read -r id missing; do
+            detail=""
+            state=ready
+            if [ "$missing" != "[]" ]; then
+              state=not_configured
+              detail="нет секретов репозитория: $(jq -r 'join(", ")' <<<"$missing")"
+            fi
+            INTEGRATION_ID="$id" STATE="$state" DETAIL="$detail" bash scripts/plugins/integration_status.sh
+          done < <(jq -r '[.id, (.missing | tojson)] | @tsv' "$GITHUB_WORKSPACE/integration-states.ndjson")
+
       # Финальный статус обязан доехать: деплой без ready/failed события в
       # журнале — silent-wrong. Job уже красный; событие нужно для журнала.
       - name: plugin_status → failed
@@ -560,6 +658,24 @@ jobs:
           for id in ${{ steps.route.outputs.ids }}; do
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh || true
           done
+
+      # Симметрично plugin_status → failed: если деплой упал, в журнале не
+      # должно остаться предыдущее «подключено» как безмолвно живущее. Снимок
+      # наличия секретов мог не дожить до этого шага — тогда честно «нет
+      # событий», виден только если деплой падал ДО синка секретов.
+      - name: Статусы интеграций → failed (#115)
+        if: failure() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: failed
+          DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
+        run: |
+          [ -f "$GITHUB_WORKSPACE/integration-states.ndjson" ] || exit 0
+          while IFS=$'\t' read -r id _missing; do
+            INTEGRATION_ID="$id" bash scripts/plugins/integration_status.sh || true
+          done < <(jq -r '.id' "$GITHUB_WORKSPACE/integration-states.ndjson")
 
       - name: Итог
         run: |
