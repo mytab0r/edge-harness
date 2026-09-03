@@ -1,0 +1,63 @@
+# Руки автоматизаций (#116): repository_dispatch harness-automation от триггеров
+# морды (расписание — пульс DO; webhook — подписанный вход /api/webhooks/<id>).
+# Исполнение — раннер, не DO (10 ms CPU — docs/research/30-rejected п.6);
+# конфиг автоматизации job читает из журнала по AUTOMATION_ID (одно место правды),
+# payload несёт только адреса прогона. Ручной прогон — workflow_dispatch
+# (automation_id обязателен: конфиг живёт в журнале, не в inputs).
+name: automation
+
+on:
+  repository_dispatch:
+    types: [harness-automation]
+  workflow_dispatch:
+    inputs:
+      automation_id:
+        description: "id автоматизации из журнала (конфиг читается оттуда)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write # kind=pool: создание задачи пула с меткой task
+
+concurrency:
+  # Прогоны одной автоматизации не соревновались бы за journal-seq и каналы;
+  # разные автоматизации друг другу не мешают (критерий #116).
+  group: automation-${{ github.event.client_payload.task_id || inputs.automation_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Прогнать автоматизацию
+        env:
+          # Адреса прогона: payload от триггеров морды; руками — из inputs.
+          TASK_ID: ${{ github.event.client_payload.task_id || format('automation:{0}:manual-{1}', inputs.automation_id, github.run_id) }}
+          AUTOMATION_ID: ${{ github.event.client_payload.automation_id || inputs.automation_id }}
+          TRIGGER: ${{ github.event.client_payload.trigger || 'manual' }}
+          # Период дайджеста/шаблона: от прошлого запуска автоматизации (считает
+          # морда). Пусто (ручной прогон) — дайджест берёт последние 7 дней.
+          PERIOD_SINCE_TS: ${{ github.event.client_payload.period.since_ts }}
+          PERIOD_UNTIL_TS: ${{ github.event.client_payload.period.until_ts }}
+          # Журнал: жизненный цикл и результат прогона видны в дашборде (#111).
+          HANDS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Каналы отчёта — секреты репозитория; значений в конфиге нет (#116).
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # kind=hands: прямая работа раннера через DSH headless (dsh_task.sh) —
+          # тот же набор провайдера, что у hands.yml (одно место правды — vars).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/automations/run.sh

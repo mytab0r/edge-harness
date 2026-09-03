@@ -293,6 +293,17 @@ jobs:
             node dsh-edge/check-plugin-compat.mjs "$dir"
           done
 
+      # Автоматизации (#116): сборщик дайджеста на прод-форме GitHub/Slack/
+      # Telegram (изоляция каналов — отказ одного доставляет остальные и виден)
+      # и smoke клиента прогонов run.sh на заглушках внешнего мира (жизненный
+      # цикл job в журнале; kind=pool/digest/выключена).
+      - name: Тесты сборщика дайджеста автоматизаций
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/automations/test_digest.py -q
+      - name: Smoke клиента автоматизаций на заглушках
+        run: bash scripts/automations/test/run_smoke.sh
+
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
@@ -303,7 +314,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/automations/*.sh scripts/automations/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
