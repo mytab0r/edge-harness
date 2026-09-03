@@ -43,6 +43,12 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      Пороги — AI_REVIEW_RETRY_AFTER_MINUTES / AI_REVIEW_MAX_ATTEMPTS /
      UNHEALTHY_PR_AFTER_MINUTES в pulse_guard.py, рядом с остальными порогами
      предохранителя (одно место правды).
+  10. Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
+      source-build морды (dsh-edge/upstream.json) кричит в задачу #134
+      + метка update-available + Telegram, один раз на релиз. Логика в
+      scripts/orchestra/upstream_drift.py; сбой сверки не роняет планировщик,
+      но и не молчит — ⚠️ в отчёте (сломанная сверка прячет дрейф так же
+      надёжно, как её отсутствие).
 """
 
 import http.cookiejar
@@ -77,6 +83,9 @@ from pulse_guard import (
     parse_time,
     post_issue_comment,
 )
+# Сигнал дрейфа пина апстрима (#134): вся логика — upstream_drift.py, здесь
+# только вызов и честный сбой сверки (см. upstream_drift_lines ниже).
+from upstream_drift import upstream_drift_check
 
 # claim_task живёт в scripts/lib (общее место для всех каналов): TTL замка —
 # одна константа LOCK_TTL_HOURS там, сюда не дублируется.
@@ -687,6 +696,17 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     return lines
 
 
+def upstream_drift_lines(repo: str) -> list[str]:
+    """Сигнал дрейфа пина апстрима (#134) — обёртка для main(): сверка не должна
+    ронять планировщик (слияния важнее), но и не имеет права молчать: сломанная
+    сверка прячет дрейф ровно так же, как её отсутствие до #134. Видимость — ⚠️
+    в отчёте пульса; тот же приём, что у collect_stale (#124-класс)."""
+    try:
+        return upstream_drift_check(repo)
+    except RuntimeError as error:
+        return [f"⚠️ сверка пина с релизами апстрима не удалась — дрейф сейчас невидим: {error}"]
+
+
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
@@ -696,6 +716,10 @@ def main() -> int:
     # кричим о пропавших пульсах — остальная работа может не иметь смысла,
     # если конвейер стоял.
     lines += heartbeat_check(repo, now)
+
+    # Дрейф пина апстрима (#134): релиз новее пина source-build морды кричит
+    # в задачу #134 + метка + Telegram, один раз на релиз.
+    lines += upstream_drift_lines(repo)
 
     pulls = open_pulls(repo)
     lines.append(f"Открытых PR: {len(pulls)}")
