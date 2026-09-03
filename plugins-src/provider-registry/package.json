@@ -1,0 +1,23 @@
+{
+  "name": "@edge-harness/dsh-plugin-provider-registry",
+  "version": "0.1.0",
+  "description": "dsh-edge edge plugin: the provider registry of the morde served through the native Settings -> Models UI (settings namespace llm-pi-ai, directory of ready OpenAI-compatible routes, one reused DeepSeekAdapter per configured route)",
+  "type": "module",
+  "main": "server/index.js",
+  "exports": {
+    ".": "./server/index.js",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-anonymous-user-id": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm-deepseek": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-settings": "0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "files": [
+    "server/index.js"
+  ],
+  "license": "MIT"
+}
