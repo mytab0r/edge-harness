@@ -29,21 +29,27 @@ const { useState, useEffect, useCallback, createElement: h } = require("react");
 const { Button, StateDot } = require("@deepseek-ai/dsh-client-ui-primitives");
 
 // ── Журнал ────────────────────────────────────────────────────────────────────
-// Контракт: GET /api/events?task_id=plugin:<id>&limit=&after=, ответ
+// Контракт: GET /api/harness/events?task_id=plugin:<id>&limit=&after=, ответ
 // { events: [{id, seq, ts, source, kind, data}, …], has_more, next_after }
 // (openspec/specs/journal-tasks-hands.md, реализация cf-worker/src/harness.ts).
+// Путь — ПРОКСИ СТОРОНЫ МОРДЫ (/api/harness/* → журнал edge-harness), которым
+// владелец закрыл белое пятно #105 вариантом 1 (релиз-ноты plugins-manager-
+// v0.1.2: «журнал читается через /api/harness/* (патч 0004)»): журнал —
+// другой origin, кука морды SameSite=Strict, CORS журнал не отдаёт, а
+// same-origin /api/events попадает в чужой API морды (401/HTML). Форма
+// запроса и ответа — контракт журнала, прокси прозрачен.
 // События идут по возрасту id, а страницы отдаются от старейших: свежайший
 // статус может лежать за пределами первой страницы (каждый деплой пишет 2+
 // plugin_status, журнал растёт), поэтому идём до конца выборки по next_after,
 // пока has_more. Одна страница = протухший статус навсегда.
-// Браузер ходит сессионной кукой (после POST /api/session обмена кука едет
-// сама) — Bearer у браузера нет и быть не должно.
+// Браузер ходит сессионной кукой владельца морды (credentials: include) —
+// Bearer у браузера нет и быть не должно.
 //
 // Ответ, не совпавший по форме контракта, — НЕ «статусов нет», а ошибка: тот
 // же путь на чужом origin отвечает другим API, и тихо показать «установлен»
 // по чужому ответу — silent-wrong. Форма проверяется явно.
 const JOURNAL_PAGE_SIZE = 10;
-const JOURNAL_QUERY = "/api/events?task_id=";
+const JOURNAL_QUERY = "/api/harness/events?task_id=";
 
 async function fetchStatusPage(id, after) {
   const url = JOURNAL_QUERY + encodeURIComponent("plugin:" + id)

@@ -22,7 +22,8 @@
   PR'ом конвейера, сам исчезает из «доступных» после деплоя).
 - **Статусы из журнала** — по каждому плагину (и установленному, и из
   каталога — конвейер заказа виден до установки)
-  `GET /api/events?task_id=plugin:<id>&limit=10&after=<next_after>` с проходом
+  `GET /api/harness/events?task_id=plugin:<id>&limit=10&after=<next_after>`
+  (прокси морды — см. абзац ниже) с проходом
   до конца выборки (`has_more`/`next_after`): страницы отдаются от старейших,
   и свежайший статус может лежать за пределами первой страницы — каждый деплой
   пишет 2+ события `plugin_status`
@@ -39,14 +40,16 @@
   установка = деплой морды). Подробности транспорта — ниже.
 - **Подсказка** — как работает заказ и где живёт каталог.
 
-Известное ограничение (белое пятно
-[#105](https://github.com/mytab0r/edge-harness/issues/105)): журнал живёт в
-воркере `edge-harness`, морда — в воркере `dsh-edge`; статусы из журнала
-достижимы только через прокси на стороне морды (PR #230 добавляет
-`GET /api/plugins/status`). Пока прокси не задеплоен, страницы морды
-получают 404/HTML не-журнальной формы, и content-type-гвардия превращает
-это в громкую ошибку статусов; список и заказ при этом работают (заказ ходит
-RPC морды, не журнала). Заказ — same-origin RPC морды, от журнала не зависит.
+Статусы читаются через `/api/harness/events` — прокси на стороне морды
+(`/api/harness/*` → журнал edge-harness), которым владелец закрыл белое
+пятно [#105](https://github.com/mytab0r/edge-harness/issues/105) вариантом 1
+(релиз-ноты его `plugins-manager-v0.1.2`: «журнал читается через
+`/api/harness/*` (патч 0004)»; белый пятенный PR #230 с
+`/api/plugins/status` остался не слит). Форма запроса/ответа — контракт
+журнала, прокси прозрачен; отказ прокси — громкая ошибка секции. Заказ от
+журнала не зависит (RPC морды). Сам источник прокси в репо не живёт (патч
+владельца в его деплое): пересборка морды без него сделает статусы громко
+ошибающимися — видимая поломка, не тихая.
 
 ## Заказ установки: транспорт и дедупликация (#113)
 
@@ -115,19 +118,19 @@ PR в `dsh-edge/plugins.json` → деплой; прогресс — `plugin_sta
 ```bash
 cd plugins-src/plugin-manager
 node build.mjs          # сгенерирует client/client.js + manifest.json, прогонит гвардии
-npm pack                # edge-harness-dsh-plugin-manager-0.1.2.tgz
+npm pack                # edge-harness-dsh-plugin-manager-0.1.3.tgz
 ```
 
 Публикация (конвейер #80, по образцу hello-world): релиз **этого**
-репозитория с тегом `plugins-manager-v0.1.2`, asset
-`plugin-manager-0.1.2.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
+репозитория с тегом `plugins-manager-v0.1.3`, asset
+`plugin-manager-0.1.3.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
 фиксирует манифест), затем sha256 — PR'ом в `dsh-edge/plugins.json`:
 
 ```bash
-cp edge-harness-dsh-plugin-manager-0.1.2.tgz plugin-manager-0.1.2.tgz
-sha256sum plugin-manager-0.1.2.tgz
-gh release create plugins-manager-v0.1.2 plugin-manager-0.1.2.tgz \
-  --title "plugins-manager-v0.1.2 — plugin-manager: каталог заказа и кнопка «Заказать»" \
+cp edge-harness-dsh-plugin-manager-0.1.3.tgz plugin-manager-0.1.3.tgz
+sha256sum plugin-manager-0.1.3.tgz
+gh release create plugins-manager-v0.1.3 plugin-manager-0.1.3.tgz \
+  --title "plugins-manager-v0.1.3 — plugin-manager: каталог заказа и кнопка «Заказать»" \
   --notes "Клиентский плагин #102/#113: список плагинов из манифеста, статусы из журнала, каталог доступных к заказу и заказ установки через RPC морды."
 ```
 
