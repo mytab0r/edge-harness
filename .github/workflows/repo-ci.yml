@@ -15,7 +15,10 @@ on:
 
 permissions:
   contents: read
+  # Инварианты состояния репозитория (#244, scripts/orchestra/repo_invariants.py)
+  # читают открытые issues/PR живым gh api — read достаточно, шаг ниже не пишет.
   issues: read
+  pull-requests: read
 
 jobs:
   test:
@@ -87,6 +90,20 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_pulse_guard.py -q
+
+      # Инварианты состояния репозитория (#244): «такого состояния быть не
+      # должно» — открытая задача с уже слитым PR, расхождение числа свободных
+      # задач между двумя независимыми методами, застрявший review:ok без
+      # ai:*, полностью отмеченный незаархивированный openspec/changes, две
+      # открытые задачи с пересекающейся уликой file:line. Пять чистых
+      # decide_*/check_* функций, каждая доказана мутацией на прод-форме
+      # фикстур (реальные тела issue #202/#213/#204/#217, фрагмент
+      # scripts/worker/task.sh). Мета-течь, которую это закрывает: 2026-09-02/03
+      # из ~15 найденных дефектов конвейера НИ ОДИН не нашла система.
+      - name: Тесты инвариантов состояния репозитория
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_repo_invariants.py -q
 
       # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
       # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
@@ -393,3 +410,17 @@ jobs:
               sys.exit("\n".join(missing))
           print(f"docs: все {total} ссылок на .github/workflows/ существуют")
           PY
+
+      # Живой снимок инвариантов состояния репозитория (#244) — на каждый
+      # push/PR, раньше следующего пульса orchestra (см. также periodic-шаг
+      # в orchestra.yml с эскалацией). НЕ роняет обязательную проверку `test`:
+      # все пять инвариантов проверяют СОСТОЯНИЕ репозитория (issues/PR/
+      # openspec), а не дифф текущего PR — обвал состояния, накопленный за
+      # месяцы (замер 2026-09-03: инварианты 1/2/5 уже находят реальный
+      # бэклог), не вина автора конкретного пуша. Владелец может включить
+      # required-гейт для конкретного инварианта правкой CI_GATING в
+      # scripts/orchestra/repo_invariants.py после разбора бэклога.
+      - name: Инварианты состояния репозитория — живой снимок (не блокирует)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/repo_invariants.py
