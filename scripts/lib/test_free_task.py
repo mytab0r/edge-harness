@@ -178,3 +178,35 @@ def test_cli_declared_pr_contract(tmp_path):
 def test_cli_unknown_arguments_are_rejected():
     result = run_cli(["bogus"])
     assert result.returncode == 2
+
+
+# ── «пусто» vs «сломано»: rc 1 (пул пуст) и rc 2 (инструмент сломался) ─────────────
+# не смешиваются (находка AI-ревью PR #247, 2026-09-03): битый JSON пула раньше
+# ронял python необработанным исключением с rc=1 — той же, что у пустого пула,
+# и task.sh трактовал крах как «свободных задач нет» (declared-pr — как «PR нет»,
+# что вело ко второму PR на ту же задачу).
+
+
+def test_cli_oldest_free_broken_pool_file_is_rc2_not_rc1(tmp_path):
+    broken_file = tmp_path / "broken.json"
+    broken_file.write_text("not json", encoding="utf-8")
+    result = run_cli(["oldest-free", str(broken_file)])
+    assert result.returncode == 2  # НЕ 1 — «сломано», не «пусто»
+    assert result.stdout == ""
+    assert "free_task.py" in result.stderr
+
+
+def test_cli_declared_pr_broken_prs_file_is_rc2_not_rc1(tmp_path):
+    broken_file = tmp_path / "broken.json"
+    broken_file.write_text("not json", encoding="utf-8")
+    result = run_cli(["declared-pr", "179", str(broken_file)])
+    assert result.returncode == 2  # НЕ 1 — иначе воркер решит «PR нет» и откроет второй
+    assert result.stdout == ""
+    assert "free_task.py" in result.stderr
+
+
+def test_cli_oldest_free_missing_file_is_rc2(tmp_path):
+    missing_file = tmp_path / "does-not-exist.json"
+    result = run_cli(["oldest-free", str(missing_file)])
+    assert result.returncode == 2
+    assert result.stdout == ""

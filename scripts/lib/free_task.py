@@ -29,6 +29,15 @@
 
 Импорт task_ref — importlib по файлу (тот же приём, что в contract_check.py):
 скрипты запускаются как файлы, не как пакет.
+
+«Пусто» и «сломано» — разные состояния CLI (rc 1 против rc 2), и это различие
+обязано доходить до вызывающего task.sh: незаловленное исключение здесь
+(битый JSON пула, не загрузившийся task_ref.py) молча превращалось бы в
+«свободных задач нет»/«PR нет» — воркер либо тихо простаивал при живом пуле,
+либо открывал второй PR на задачу, у которой первый уже есть (находка
+AI-ревью PR #247, 2026-09-03). Загрузка task_ref и разбор JSON поэтому
+обёрнуты явно: любой сбой — код 2 и причина в stderr, fail loud вместо
+silent-wrong.
 """
 
 from __future__ import annotations
@@ -39,10 +48,28 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_SPEC = importlib.util.spec_from_file_location(
-    "task_ref", Path(__file__).resolve().with_name("task_ref.py"))
-task_ref = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
+
+def _load_task_ref():
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "task_ref", Path(__file__).resolve().with_name("task_ref.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        return module
+    except Exception as exc:  # noqa: BLE001 — любой сбой загрузки инструмента = код 2
+        print(f"free_task.py: не смог загрузить task_ref.py: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+task_ref = _load_task_ref()
+
+
+def _load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — «сломано», не «пусто» (fail loud)
+        print(f"free_task.py: не смог прочитать/разобрать {path}: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def free_candidates(
@@ -93,7 +120,7 @@ def _parse_locked(text: str) -> set[int]:
 
 def main(argv: list[str]) -> int:
     if len(argv) in (2, 3) and argv[0] == "oldest-free":
-        issues = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+        issues = _load_json(Path(argv[1]))
         locked = _parse_locked(argv[2]) if len(argv) == 3 else None
         issue = oldest_free(issues, locked)
         if issue is None:
@@ -102,7 +129,7 @@ def main(argv: list[str]) -> int:
         return 0
     if len(argv) == 3 and argv[0] == "declared-pr":
         task_number = int(argv[1])
-        prs = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        prs = _load_json(Path(argv[2]))
         pull = declared_pr_for_task(prs, task_number)
         if pull is None:
             return 1
