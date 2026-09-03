@@ -286,6 +286,15 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
 DSH_EDGE_URL = os.environ.get("DSH_EDGE_URL", "")
 DSH_EDGE_ACCESS_KEY = os.environ.get("DSH_EDGE_ACCESS_KEY", "")
 
+# Одно место правды (#225): Cloudflare перед мордой режет запросы без явного
+# User-Agent библиотечным клиентом — urllib.request шлёт дефолтный
+# `Python-urllib/3.x`, и CF отвечает 403 `error code: 1010` ДО приложения
+# (доказано прямым экспериментом на живой морде, docs/research/12-…md).
+# Значение проверено фактически (POST /api/auth/login с заведомо неверным
+# accessKey): собственное имя проходит фильтр (ответ приложения 401), значит
+# маскироваться под браузер/curl не пришлось.
+MORDE_USER_AGENT = "edge-harness-orchestra/1.0 (+https://github.com/mytab0r/edge-harness)"
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Контракт логина морды (docs/research/12-dsh-edge-session-api.md:13-14):
@@ -303,9 +312,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _morde_opener() -> urllib.request.OpenerDirector:
     """Opener с cookie-jar и БЕЗ автослежения за редиректом (см. _NoRedirect):
     логин обменивает access-ключ на куку владельца через 303, а не через
-    переход по Location."""
-    return urllib.request.build_opener(
+    переход по Location.
+
+    addheaders задаёт User-Agent (#225, MORDE_USER_AGENT) на уровне opener'а —
+    он летит в КАЖДЫЙ запрос через этот opener (и логин, и RPC), так что
+    заголовок объявлен и применён в одном месте, а не в каждом Request по
+    отдельности."""
+    opener = urllib.request.build_opener(
         _NoRedirect, urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    opener.addheaders = [("User-Agent", MORDE_USER_AGENT)]
+    return opener
 
 
 def _morde_login(opener: urllib.request.OpenerDirector) -> None:
