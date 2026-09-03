@@ -69,12 +69,19 @@ def post_json(url: str, headers: dict, payload: dict) -> tuple[int, dict]:
 # ── Сбор: GitHub search API и журнал ────────────────────────────────────────────────
 
 
-def search_github(repo: str, qualifier: str, date_from: dt.date, date_to: dt.date) -> list[dict]:
+def search_github(repo: str, base: str, date_qualifier: str,
+                  date_from: dt.date, date_to: dt.date) -> list[dict]:
     """Поиск по датам (search API: closed:/merged: принимают диапазон d1..d2).
+    base и квалификатор даты — РАЗНЫЕ слова запроса: склейка «is:closed:d1..d2»
+    для GitHub не ошибка синтаксиса, а пустая выборка (поймано ревью живым
+    запросом: 0 результатов при 45 реальных) — отсюда гвардия формы ниже.
     Пагинация по page до исчерпания выборки, потолок DIGEST_PAGES_MAX страниц
     по 100 — дайджесту еженедельного репозитория хватает с избытком."""
-    query = urllib.parse.quote(
-        f"repo:{repo} {qualifier}:{date_from.isoformat()}..{date_to.isoformat()}")
+    text = f"repo:{repo} {base} {date_qualifier}:{date_from.isoformat()}..{date_to.isoformat()}"
+    if f" {date_qualifier}:" not in text or f"is:{date_qualifier}:" in text:
+        raise RuntimeError(
+            f"квалификатор даты склеился с base: {text!r} — GitHub молча вернёт пустую выборку")
+    query = urllib.parse.quote(text)
     items: list[dict] = []
     for page in range(1, DIGEST_PAGES_MAX + 1):
         payload = gh_api(f"search/issues?q={query}&per_page=100&page={page}")
@@ -88,12 +95,12 @@ def search_github(repo: str, qualifier: str, date_from: dt.date, date_to: dt.dat
 
 def collect_issues_and_prs(repo: str, date_from: dt.date, date_to: dt.date) -> tuple[list[dict], list[dict]]:
     """Закрытые issue (без pull_request — он есть только у PR) и слитые PR."""
-    raw = search_github(repo, "is:issue is:closed", date_from, date_to)
+    raw = search_github(repo, "is:issue is:closed", "closed", date_from, date_to)
     issues = [
         {"number": item["number"], "title": item["title"], "url": item["html_url"]}
         for item in raw if "pull_request" not in item
     ]
-    raw = search_github(repo, "is:pr is:merged", date_from, date_to)
+    raw = search_github(repo, "is:pr is:merged", "merged", date_from, date_to)
     pulls = [
         {"number": item["number"], "title": item["title"], "url": item["html_url"]}
         for item in raw if "pull_request" in item

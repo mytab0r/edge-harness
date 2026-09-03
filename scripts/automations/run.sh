@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Клиент job'а автоматизации (#116): repository_dispatch harness-automation →
-# работа по kind из конфига → результат в журнал. Контракт —
-# openspec/changes/automations-hub/. Конфиг читается ИЗ ЖУРНАЛА по AUTOMATION_ID
+# работа по kind из конфига → результат в журнал. Контракт — задача #116,
+# дельта-спека openspec/changes/automations-hub/ (PR части 2 эпика).
+# Конфиг читается ИЗ ЖУРНАЛА по AUTOMATION_ID
 # (одно место правды), а не из payload: payload несёт только адреса прогона.
 #
 # Правила: fail loud; жизненный цикл job (job_start/job_end) этот файл ведёт для
@@ -115,10 +116,12 @@ if [ "$ENABLED" != "true" ]; then
   exit 0
 fi
 
+# kind=hands: lifecycle (job_start/job_end/heartbeat) ведёт dsh_task.sh — наш
+# job_start дал бы второй job_start и коллизию journal-seq (ревью #116, major 2).
 if [ "$KIND" = "hands" ]; then LIFECYCLE_OURS=0; fi
-add_event "job_start" "{\"job_id\":\"$JOB_ID\",\"automation\":\"$AUTOMATION_ID\",\"trigger\":\"$TRIGGER\",\"kind\":\"$KIND\"}"
-flush_events
 if [ "$LIFECYCLE_OURS" -eq 1 ]; then
+  add_event "job_start" "{\"job_id\":\"$JOB_ID\",\"automation\":\"$AUTOMATION_ID\",\"trigger\":\"$TRIGGER\",\"kind\":\"$KIND\"}"
+  flush_events
   start_heartbeat &
   HB_PID=$!
 fi

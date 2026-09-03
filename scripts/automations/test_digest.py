@@ -65,18 +65,34 @@ DATE_TO = dt.datetime.fromtimestamp(UNTIL_TS / 1000, dt.timezone.utc).date()
 
 
 def test_collect_separates_issues_and_prs(monkeypatch):
+    """Гвардия формы запроса (ревью #116, major 1): диапазон дат — ОТДЕЛЬНОЕ
+    слово запроса. Склейка «is:closed:d1..d2» синтаксически валидна, но GitHub
+    молча отдаёт пустую выборку — точная форма запроса и есть тест."""
+    seen = []
+
     def fake_gh(query):
         decoded = urllib.parse.unquote(query)
+        seen.append(decoded)
         if "is:issue" in decoded:
-            assert "repo:o/r" in decoded, "репозиторий обязан быть в квалификаторе"
-            assert f"closed:{DATE_FROM.isoformat()}..{DATE_TO.isoformat()}" in decoded
             return SEARCH_ISSUES
-        assert "is:pr" in decoded and "is:merged" in decoded
         return SEARCH_PRS
+
     monkeypatch.setattr(digest, "gh_api", fake_gh)
     issues, pulls = digest.collect_issues_and_prs("o/r", DATE_FROM, DATE_TO)
     assert [i["number"] for i in issues] == [115, 102]
     assert [p["number"] for p in pulls] == [239]
+    assert seen == [
+        f"search/issues?q=repo:o/r is:issue is:closed closed:{DATE_FROM.isoformat()}..{DATE_TO.isoformat()}&per_page=100&page=1",
+        f"search/issues?q=repo:o/r is:pr is:merged merged:{DATE_FROM.isoformat()}..{DATE_TO.isoformat()}&per_page=100&page=1",
+    ]
+
+
+def test_search_guard_rejects_glued_date_qualifier():
+    """Мутация гвардии: клей даты к is:closed обязан ронять сбор, а не давать
+    зелёный дайджест с нулями."""
+    import pytest
+    with pytest.raises(RuntimeError, match="склеился"):
+        digest.search_github("o/r", "is:issue is:closed:", "closed", DATE_FROM, DATE_TO)
 
 
 def test_collect_journal_counts_by_status_and_marks_automation_runs():

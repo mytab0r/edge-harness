@@ -37,6 +37,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # kind=hands передаёт работу scripts/hands/dsh_task.sh — тому нужны node
+      # и pnpm (dsh plugin add), ровно как в hands.yml; digest/pool их не трогают.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Прогнать автоматизацию
         env:
           # Адреса прогона: payload от триггеров морды; руками — из inputs.

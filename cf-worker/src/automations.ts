@@ -180,6 +180,16 @@ export function scheduleDue(intervalHours: number, lastFiredTs: number | null, n
   return now - lastFiredTs >= intervalHours * 3_600_000;
 }
 
+/** Решение «пора ли journal-триггеру» — кулдаун от прошлого запуска
+ *  (AUTOMATIONS.journalCooldownMs). Работа прогона может порождать события
+ *  журнала с чужими task_id (kind=pool → job_end воркера под issue-N):
+ *  префикс-гвардия их не отличает, кулдаун рвёт цикл, сводя частоту к каденсу
+ *  пульса (ревью #116, minor 3). */
+export function journalTriggerDue(lastFiredTs: number | null, now: number, cooldownMs: number): boolean {
+  if (lastFiredTs === null) return true;
+  return now - lastFiredTs >= cooldownMs;
+}
+
 /** Период для сборщика дайджеста: от прошлого запуска (или интервала назад при
  *  первом) до сейчас. Раннер получает его в payload диспатча — дайджест собирает
  *  ровно прошедший интервал, а не «последние N дней» от догадок. */
@@ -191,8 +201,14 @@ export function digestPeriod(
   return { since_ts: lastFiredTs ?? now - intervalHours * 3_600_000, until_ts: now };
 }
 
-/** task_id прогона в очереди/журнале: `automation:<id>:<ts>` (префикс — гвардия
- *  петли journal-триггеров). ts в base36 — короче, читаемость не нужна. */
-export function runTaskId(automationId: string, now: number): string {
-  return `${AUTOMATIONS.runTaskPrefix}${automationId}:${now.toString(36)}`;
+/** task_id прогона в очереди/журнале: `automation:<id>:<ts>-<nonce>`
+ *  (префикс — гвардия петли journal-триггеров). ts в base36, nonce добирает
+ *  уникальность внутри миллисекунды: два почти одновременных webhook-выстрела
+ *  иначе столкнулись бы на PRIMARY KEY tasks (ревью #116, minor 6). Повторная
+ *  доставка webhook'а — новый прогон: семантика at-least-once. */
+export function runTaskId(automationId: string, now: number, nonce: string): string {
+  if (!/^[0-9a-f]{4,32}$/.test(nonce)) {
+    throw new Error("runTaskId: nonce — hex-строка 4..32 символов");
+  }
+  return `${AUTOMATIONS.runTaskPrefix}${automationId}:${now.toString(36)}-${nonce}`;
 }
