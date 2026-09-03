@@ -115,20 +115,20 @@ PR в `dsh-edge/plugins.json` → деплой; прогресс — `plugin_sta
 ```bash
 cd plugins-src/plugin-manager
 node build.mjs          # сгенерирует client/client.js + manifest.json, прогонит гвардии
-npm pack                # edge-harness-dsh-plugin-manager-0.1.1.tgz
+npm pack                # edge-harness-dsh-plugin-manager-0.1.2.tgz
 ```
 
 Публикация (конвейер #80, по образцу hello-world): релиз **этого**
-репозитория с тегом `plugins-manager-v0.1.1`, asset
-`plugin-manager-0.1.1.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
+репозитория с тегом `plugins-manager-v0.1.2`, asset
+`plugin-manager-0.1.2.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
 фиксирует манифест), затем sha256 — PR'ом в `dsh-edge/plugins.json`:
 
 ```bash
-cp edge-harness-dsh-plugin-manager-0.1.1.tgz plugin-manager-0.1.1.tgz
-sha256sum plugin-manager-0.1.1.tgz
-gh release create plugins-manager-v0.1.1 plugin-manager-0.1.1.tgz \
-  --title "plugins-manager-v0.1.1 — plugin-manager: раздел «Плагины» в морде" \
-  --notes "Клиентский плагин #102: список плагинов из манифеста, статусы из журнала, подсказка о заказе новых."
+cp edge-harness-dsh-plugin-manager-0.1.2.tgz plugin-manager-0.1.2.tgz
+sha256sum plugin-manager-0.1.2.tgz
+gh release create plugins-manager-v0.1.2 plugin-manager-0.1.2.tgz \
+  --title "plugins-manager-v0.1.2 — plugin-manager: каталог заказа и кнопка «Заказать»" \
+  --notes "Клиентский плагин #102/#113: список плагинов из манифеста, статусы из журнала, каталог доступных к заказу и заказ установки через RPC морды."
 ```
 
 Цикличность sha (принято, по образцу hello/runner): вшитая `manifest.json`
