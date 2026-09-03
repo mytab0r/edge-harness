@@ -150,6 +150,18 @@ jobs:
       - name: Юнит-тесты плагина plugin-manager
         run: node --test plugins-src/plugin-manager/test/client.test.mjs
 
+      # Интеграции внешних систем (#115): форма реестра + гвардия проводки
+      # (каждый секрет реестра обязан быть упомянут в workflow'е своей
+      # проводки — иначе интеграция молча вечно not_configured), чистая логика
+      # инструментов на прод-форме ответов API (маскирование секретов и их
+      # base64-производных) и клиентский бандл раздела «Интеграции».
+      - name: Реестр интеграций — форма и проводка секретов
+        run: node dsh-edge/integrations.mjs
+      - name: Юнит-тесты логики инструментов интеграций
+        run: node --test plugins-src/integrations/test/core.test.mjs
+      - name: Юнит-тесты клиентского бандла интеграций
+        run: node --test plugins-src/integrations/test/client.test.mjs
+
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
@@ -160,10 +172,16 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
+      # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
+      # проводка scripts/lib/journal_status.sh — тихий пропуск статуса на деплое.
+      - name: Smoke обёрток статусов журнала
+        run: bash scripts/plugins/test/status-scripts.smoke.sh
 
       # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
       # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на
