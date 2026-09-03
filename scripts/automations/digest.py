@@ -192,10 +192,11 @@ def deliver_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str]:
 
 
 def deliver_all(channels: list[dict], text: str) -> list[dict]:
-    """Каждый канал — отдельно: отказ одного не мешает остальным (критерий #116)."""
+    """Каждый канал — отдельно: отказ одного не мешает остальным (критерий #116).
+    Кривая запись канала (не объект) — отказ этого канала, а не падение доставки."""
     results = []
     for channel in channels:
-        kind = channel.get("type")
+        kind = channel.get("type") if isinstance(channel, dict) else None
         try:
             if kind == "slack":
                 ok, detail = deliver_slack(os.environ.get("SLACK_BOT_TOKEN", ""),
@@ -207,7 +208,13 @@ def deliver_all(channels: list[dict], text: str) -> list[dict]:
                 ok, detail = False, f"неизвестный канал {kind}"
         except RuntimeError as error:
             ok, detail = False, str(error)
-        results.append({"type": kind, "target": channel.get("target", ""), "ok": ok, "detail": detail})
+        except Exception as error:  # изоляция: кривой канал не убивает остальные
+            ok, detail = False, f"{type(error).__name__}: {error}"
+        results.append({
+            "type": kind,
+            "target": channel.get("target", "") if isinstance(channel, dict) else "",
+            "ok": ok, "detail": detail,
+        })
     return results
 
 
