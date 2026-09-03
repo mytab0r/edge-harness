@@ -4,8 +4,13 @@
 
 fixtures_open_pulls_252.json — прод-форма, не пересказ: реальный ответ
 `gh api "repos/mytab0r/edge-harness/pulls?state=open&per_page=100"` этого же
-репозитория, снятый 2026-09-03. Тест разбирает то, что система реально
-отдаёт, а не наше представление о формате.
+репозитория, снятый 2026-09-03 (после удаления собственного PR #252, чтобы
+не засорять снимок). Поля сужены до number/draft/labels через `--jq`
+(значения — те же самые, что вернул API, без пересказа) — полные объекты
+несут в title/body случайные упоминания моделей из соседних задач, которые
+ложно бьют guard'а #153 (стейл-провайдер/модель), а тесту здесь нужны только
+labels. Тест разбирает то, что система реально отдаёт, а не наше
+представление о формате.
 
 Запуск: python -m pytest scripts/lib/test_review_labels.py -q
 """
@@ -29,12 +34,14 @@ def _load_pulls() -> list[dict]:
 
 
 # ── Гвардия #252 на прод-форме: только близкие к слиянию или в конфликте ─────────
-# Снимок содержал (2026-09-03): #162/#237/#230/#231 — conflict (подтягивать,
-# может расшить); #246 — оба вердикта review:ok+ai:ok зелёные (близок к
-# слиянию, подтягивать); #246/#247/#248/#253/#241/#181/#173 и другие —
-# ai:changes-requested/ai:failed/review:large без обоих вердиктов или вовсе
-# без review:ok (не подтягивать — дорогое AI-ревью и сброс вердикта без пользы).
-EXPECTED_SHOULD_UPDATE = {162, 230, 231, 237, 246}
+# Снимок содержал (2026-09-03): #162/#230/#231/#237 — метка conflict
+# (подтягивать, может расшить); ни у одного открытого PR на момент снимка не
+# было ОБОИХ вердиктов review:ok+ai:ok разом (см. отдельный синтетический
+# тест ниже для этой ветки предиката) — #247/#248/#249/#253/#241/#181/#173 и
+# другие стоят с review:large/ai:failed/ai:changes-requested/contract:failed
+# без обоих зелёных (не подтягивать — дорогое AI-ревью и сброс вердикта без
+# пользы для PR, которому рано сливаться).
+EXPECTED_SHOULD_UPDATE = {162, 230, 231, 237}
 
 
 def test_should_update_branch_matches_expected_on_real_open_pulls():
@@ -43,7 +50,7 @@ def test_should_update_branch_matches_expected_on_real_open_pulls():
     # Гвардия свежести самого теста: если состав открытых PR в фикстуре
     # изменится (новый снимок), список ожиданий не должен молча протухнуть.
     assert numbers == {
-        263, 262, 261, 260, 253, 249, 248, 247, 246, 241, 237, 231, 230, 181, 173, 167, 162, 108,
+        263, 262, 261, 260, 253, 249, 248, 247, 241, 237, 231, 230, 181, 173, 167, 162, 108,
     }
 
     should_update = {
@@ -62,6 +69,13 @@ def test_should_update_branch_true_only_for_conflict_or_both_verdicts():
         )
         actual = review_labels.should_update_branch(pull["labels"])
         assert actual == expected, f"#{pull['number']}: labels={sorted(names)}"
+
+
+def test_should_update_branch_true_when_both_verdicts_green_without_conflict():
+    # На снимке фикстуры такого PR нет (см. комментарий у EXPECTED_SHOULD_UPDATE) —
+    # ветка предиката «близок к слиянию» проверяется синтетически, не прод-формой.
+    labels = [{"name": "review:ok"}, {"name": "ai:ok"}]
+    assert review_labels.should_update_branch(labels) is True
 
 
 def test_should_update_branch_accepts_label_name_set_and_dict_list():
