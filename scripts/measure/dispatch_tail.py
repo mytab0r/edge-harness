@@ -8,10 +8,15 @@
 метрики и схемы — docs/decisions/0005-dispatch-tail-campaign.md.
 
 Схема (dual-writer, один замер = ровно одна строка CSV):
-  1. cron */15 → `dispatch`: POST /dispatches (event_type dispatch-latency-probe)
+  1. тик → `dispatch`: POST /dispatches (event_type dispatch-latency-probe)
      под PAT. GITHUB_TOKEN для диспатча — документированное исключение из
      запрета рекурсии, но живьём не проверено, а push/PR от него не зажигают
      проверок точно: один PAT на весь пишущий путь (docs/research/21-github-actions.md).
+     Каденция — самоподдержка: тик в конце диспатчит следующий workflow_dispatch
+     (`chain`), cron — страховка смерти цепочки. Замер 2026-09-04: cron `*/15` на
+     этом репозитории доставил ~7% тиков (31 из ~449 за 112 ч), dispatch-события —
+     32 из 32; долгие кампании на schedule не строятся
+     (docs/research/21-github-actions.md, «Замер schedule на этом репозитории»).
   2. Подъём workflow → job `probe` → `record`: замеряет себя сам по серверным
      таймстампам GitHub (run_created_at, run_started_at) и пишет строку.
   3. `dispatch` ждёт строку своего probe_id в CSV до TIMEOUT_S; не дождался —
@@ -29,10 +34,12 @@ CSV живёт на ветке DATA_BRANCH и попадает в main фина�
 Критерий покрытия и лимиты — константы ниже, одно место правды.
 
 Использование (в CI, из .github/workflows/dispatch-latency-probe.yml):
-    python scripts/measure/dispatch_tail.py dispatch   # тик кампании (cron)
-    python scripts/measure/dispatch_tail.py record     # сторона измеряемого job'а
-    python scripts/measure/dispatch_tail.py status     # покрытие + сводка (без записи)
-    python scripts/measure/dispatch_tail.py finalize   # завершить кампанию руками
+    python scripts/measure/dispatch_tail.py dispatch     # тик кампании: замер + сторож
+    python scripts/measure/dispatch_tail.py record       # сторона измеряемого job'а
+    python scripts/measure/dispatch_tail.py chain        # следующая ступень цепочки тиков
+    python scripts/measure/dispatch_tail.py tick_failed  # след тика, умершего до диспатча
+    python scripts/measure/dispatch_tail.py status       # покрытие + сводка (без записи)
+    python scripts/measure/dispatch_tail.py finalize     # завершить кампанию руками
 
 Среда: GH_PIPELINE_PAT (широкий PAT конвейера: contents/actions/issues/pull-requests write; до задачи #6 имя было GH_DISPATCH_TOKEN),
 GITHUB_REPOSITORY; для record — PROBE_ID, SENT_AT_MS, GITHUB_RUN_ID.
@@ -68,9 +75,17 @@ MIN_ROWS = 100
 MIN_BUSINESS_ROWS = 20
 MIN_SPAN_HOURS = 24
 MAX_CAMPAIGN_DAYS = 7  # предохранитель: дольше — финализация с громким «не достигнут»
+# Сознательное продление кампании — снаружи кода (env в workflow), а не правкой
+# константы: иначе после unmet-финализации первый же тик снова финализирует
+# (overdue считается от первой строки CSV) и кампания запирается намертво.
+CAMPAIGN_MAX_DAYS_ENV = "CAMPAIGN_MAX_DAYS"
 
 TIMEOUT_S = 600  # как у базового замера 2026-08-28: нет старта за 600 с = таймаут
 POLL_INTERVAL_S = 15
+# Пауза перед диспатчем следующей ступени цепочки: вместе с временем тика даёт
+# ~7–16 мин на цикл и ограничивает повтор при сбое (худший ретрай — раз в 5 мин,
+# а не цикл красных запусков вплотную).
+CHAIN_DELAY_S = 300
 
 MARK_BEGIN = "<!-- dispatch-tail:begin -->"
 MARK_END = "<!-- dispatch-tail:end -->"
@@ -156,12 +171,20 @@ def read_rows(text: str) -> list[dict]:
     return list(csv.DictReader(text.splitlines()))
 
 
+def campaign_max_days() -> int:
+    """Лимит дней кампании. CAMPAIGN_MAX_DAYS в env — сознательное продление
+    снаружи кода (владелец правит env в workflow и включает workflow заново)."""
+    raw = os.environ.get(CAMPAIGN_MAX_DAYS_ENV, "")
+    return int(raw) if raw.strip() else MAX_CAMPAIGN_DAYS
+
+
 def is_us_business(moment: datetime) -> bool:
     """Американский рабочий день: пн–пт 13:00–24:00 UTC (см. константы выше)."""
     return moment.weekday() < 5 and 13 <= moment.hour < 24
 
 
-def coverage(rows: list[dict], now: datetime | None = None) -> dict:
+def coverage(rows: list[dict], now: datetime | None = None,
+             max_days: int = MAX_CAMPAIGN_DAYS) -> dict:
     """Критерий задачи #4 по накопленным строкам. Чистая функция."""
     now = now or datetime.now(timezone.utc)
     ok = [r for r in rows if r.get("status") == "ok"]
@@ -171,12 +194,49 @@ def coverage(rows: list[dict], now: datetime | None = None) -> dict:
         span_h = (max(starts) - min(starts)).total_seconds() / 3600
     business = sum(1 for s in starts if is_us_business(s))
     first = min(starts) if starts else None
-    overdue = first is not None and (now - first) > timedelta(days=MAX_CAMPAIGN_DAYS)
+    overdue = first is not None and (now - first) > timedelta(days=max_days)
     return {
         "ok_rows": len(ok), "total_rows": len(rows), "business_rows": business,
         "span_h": round(span_h, 1),
         "met": len(ok) >= MIN_ROWS and business >= MIN_BUSINESS_ROWS and span_h >= MIN_SPAN_HOURS,
         "overdue": overdue,
+    }
+
+
+def should_chain(cov: dict, workflow_on_main: bool) -> str:
+    """Диспатчить ли следующую ступень цепочки тиков. Пустая строка — да; иначе
+    человекочитаемая причина остановки (одна на все «нет», одно место правды)."""
+    if not workflow_on_main:
+        return (f"{WORKFLOW_FILE} отсутствует на main — кампания неактивна, "
+                "цепочку не продолжаю (иначе красная цепочка зациклится)")
+    if cov["met"]:
+        return "покрытие достигнуто — финализация без новой ступени цепочки"
+    if cov["overdue"]:
+        return "лимит дней исчерпан — цепочка остановлена, дальше финализация"
+    return ""
+
+
+def finalize_outcome(cov: dict) -> dict:
+    """Что финализация говорит наружу при данном покрытии — одно место правды.
+
+    ready: переводить ли PR из черновика. Unmet-финализация обязана отличаться
+    от успешной снаружи (ревью #108, находка 2): готовым PR с «не достигнут»
+    оркестратор сольёт как поставку задачи, и провал кампании станет неотличим
+    от успеха."""
+    if cov["met"]:
+        return {
+            "ready": True,
+            "verdict": "",
+            "closing": "После мержа критерий задачи выполнен на main; закрой задачу "
+                       "с уликами (ссылки на CSV и этот PR).",
+        }
+    return {
+        "ready": False,
+        "verdict": "Финализация по лимиту дней: критерий НЕ достигнут, кампания остановлена.",
+        "closing": "Критерий задачи НЕ выполнен — задачу НЕ закрывать, PR остаётся "
+                   "черновиком. Продолжить сбор: задай CAMPAIGN_MAX_DAYS в env шага "
+                   "«Тик кампании» (сознательное продление) и "
+                   "`gh workflow enable dispatch-latency-probe.yml`.",
     }
 
 
@@ -204,7 +264,7 @@ def summarize(rows: list[dict]) -> str:
                 f"таймаутов {len(timeouts)}, сбоев диспатча {len(failed)}.")
 
     vals = [int(r["latency_ms"]) for r in ok]
-    starts = [sent_at_datetime(int(r["sent_at"])) for r in ok]
+    starts = sorted(sent_at_datetime(int(r["sent_at"])) for r in ok)
     qvals = [int(r["queue_ms"]) for r in ok if r.get("queue_ms")]
     business = [int(r["latency_ms"]) for r in ok
                 if is_us_business(sent_at_datetime(int(r["sent_at"])))]
@@ -223,7 +283,19 @@ def summarize(rows: list[dict]) -> str:
         f"p90 {fmt(percentile(vals, 0.9))} · p99 {fmt(percentile(vals, 0.99))} · "
         f"max {fmt(max(vals))} — метрика «диспатч отправлен → job начал выполняться»",
     ]
-    if qvals:
+    gaps = [(b - a).total_seconds() / 60 for a, b in zip(starts, starts[1:])]
+    if gaps:
+        lines.append(
+            f"- интервалы между замерами: медиана {statistics.median(gaps):.0f} мин, "
+            f"max {max(gaps) / 60:.1f} ч — сбор неравномерен по построению (каденция "
+            "и её история — ADR 0005); плотные серии смещают доли времени суток, "
+            "бакеты ниже показывают разброс по окнам")
+    if qvals and max(qvals) == 0:
+        lines.append(
+            "- queue_ms = 0 во всех строках: этой схемой чистое ожидание раннера не "
+            "измеряется — GitHub создаёт run в момент его старта (created == started "
+            "до секунды); колонка оставлена схеме, где run существует до выдачи раннера")
+    if qvals and max(qvals) > 0:
         lines.append(
             f"- чистое ожидание раннера (часы GitHub, без сетевого пути до API): "
             f"медиана {fmt(statistics.median(qvals))}, p99 {fmt(percentile(qvals, 0.99))}, "
@@ -395,7 +467,8 @@ def cmd_dispatch(_args: argparse.Namespace) -> int:
               "без запуска. Кампания неактивна до мержа.")
         return 1
 
-    cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""))
+    cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""),
+                   max_days=campaign_max_days())
     print(coverage_markdown(cov))
     if cov["met"] or cov["overdue"]:
         # Предохранитель обязан работать с обеих сторон: если record-путь мёртв
@@ -456,10 +529,50 @@ def cmd_record(args: argparse.Namespace) -> int:
     wrote = append_and_push(workdir, row, f"probe {probe_id}: {row['latency_ms']} ms")
     ensure_draft_pr(gh)
 
-    cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""))
+    cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""),
+                   max_days=campaign_max_days())
     print(coverage_markdown(cov))
     if wrote and (cov["met"] or cov["overdue"]) and not args.no_finalize:
         return cmd_finalize(argparse.Namespace())
+    return 0
+
+
+def cmd_chain(_args: argparse.Namespace) -> int:
+    """Следующая ступень цепочки тиков. Всегда()-шаг тика: живёт и после сбоя
+    тика (один сбой не должен ронять кампанию до ближайшего cron-страхового),
+    но не зацикливает красное: при неактивной кампании громко отказывается и
+    выходит 0. Ограничитель темпа — CHAIN_DELAY_S и сериализация тиков."""
+    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    workflow_on_main = gh.contents(WORKFLOW_FILE, "main") is not None
+    cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""),
+                   max_days=campaign_max_days())
+    reason = should_chain(cov, workflow_on_main)
+    if reason:
+        print(reason)
+        return 0
+    time.sleep(CHAIN_DELAY_S)
+    gh.request("POST", f"/repos/{gh.repo}/actions/workflows/"
+                       f"{WORKFLOW_FILE.split('/')[-1]}/dispatches", {"ref": "main"})
+    print(f"следующая ступень цепочки задиспатчена (пауза {CHAIN_DELAY_S} с)")
+    return 0
+
+
+def cmd_tick_failed(_args: argparse.Namespace) -> int:
+    """След тика, умершего до POST /dispatches: строка dispatch_failed с note.
+    Доставку schedule это не ловит (ран не создан — ловить нечем, см. замер
+    schedule в 21-github-actions.md), ловит смерть начавшегося тика. Лучшее
+    усилие: без токена строка не запишется — останется красный job (класс
+    «молча деградировало до только ok» держит гвардия-тест на GH_TOKEN)."""
+    run_id = required_env("GITHUB_RUN_ID")
+    sent_at = int(time.time() * 1000)
+    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail-tickfail")
+    note = (f"тик умер до диспатча: run {run_id}, "
+            f"{os.environ.get('TICK_NOTE', 'шаг тика завершился ошибкой')}")
+    clone_data_branch(workdir)
+    wrote = append_and_push(workdir, dispatch_failed_row(f"tick-{run_id}", sent_at, note),
+                            f"tick {run_id}: dispatch_failed (умер до POST /dispatches)")
+    print(f"след тика {run_id} записан: {wrote}")
     return 0
 
 
@@ -493,17 +606,24 @@ def cmd_finalize(_args: argparse.Namespace) -> int:
     clone_data_branch(workdir)
 
     rows = read_rows((Path(workdir) / CSV_PATH).read_text(encoding="utf-8"))
-    cov = coverage(rows)
+    cov = coverage(rows, max_days=campaign_max_days())
+    outcome = finalize_outcome(cov)
     block = (summarize(rows) + "\n\n" + coverage_markdown(cov)
-             + (". ⚠️ Финализация по лимиту дней: критерий НЕ достигнут."
-                if cov["overdue"] and not cov["met"] else ""))
+             + (f". ⚠️ {outcome['verdict']}" if outcome["verdict"] else ""))
 
     doc_path = Path(workdir) / "docs/research/99-open-questions.md"
     doc_path.write_text(splice_summary(doc_path.read_text(encoding="utf-8"), block),
                         encoding="utf-8")
     git(*COMMIT_IDENTITY, "add", "docs/research/99-open-questions.md", cwd=workdir)
-    git(*COMMIT_IDENTITY, "commit", "--quiet", "-m",
-        f"dispatch-tail: сводка кампании ({cov['ok_rows']} замеров, задача #4)", cwd=workdir)
+    # Идемпотентность: гонка двух финализаций (record-путь и тик) даёт одинаковый
+    # блок — пустой коммит не ошибка, а признак «сводка уже записана». Остальной
+    # отказ git'а — громкий сбой, не тишина.
+    committed = git(*COMMIT_IDENTITY, "commit", "--quiet", "-m",
+                    f"dispatch-tail: сводка кампании ({cov['ok_rows']} замеров, задача #4)",
+                    cwd=workdir, check=False)
+    if committed.returncode != 0 and "nothing to commit" not in (
+            committed.stdout + committed.stderr).lower():
+        raise RuntimeError(f"git commit сводки: {committed.stderr.strip()[:300]}")
     git("fetch", "--quiet", "origin", "main", DATA_BRANCH, cwd=workdir)
     git("rebase", "--autostash", "origin/main", cwd=workdir)
     # Редкая гонка двух финализаций: чужой коммит на ветке данных не должен
@@ -518,16 +638,18 @@ def cmd_finalize(_args: argparse.Namespace) -> int:
         raise RuntimeError("push финального коммита на ветку данных не прошёл за 3 попытки")
 
     for pull in gh.open_pulls_on_branch():
-        if pull.get("draft"):
+        if pull.get("draft") and outcome["ready"]:
             ready = subprocess.run(["gh", "pr", "ready", str(pull["number"])],
                                    capture_output=True, text=True)
             if ready.returncode != 0:
                 print(f"::warning::gh pr ready упал: {ready.stderr.strip()[:200]} — "
                       "переведи PR в готовность руками")
+        elif not outcome["ready"]:
+            print(f"::warning::PR {pull['number']} остаётся черновиком: "
+                  f"{outcome['verdict']}")
         comment = (f"🤖 Кампания замера хвоста завершена: {coverage_markdown(cov)}\n\n"
                    f"{summarize(rows)}\n\nДанные: `{CSV_PATH}` на ветке `{DATA_BRANCH}` "
-                   f"(PR {pull['html_url']}). После мержа критерий задачи выполнен на "
-                   f"main; закрой задачу с уликами (ссылки на CSV и этот PR).")
+                   f"(PR {pull['html_url']}). {outcome['closing']}")
         gh.request("POST", f"/repos/{gh.repo}/issues/{ISSUE_NUMBER}/comments",
                    {"body": comment})
         break
@@ -574,13 +696,15 @@ def main() -> int:
     rec = sub.add_parser("record", help="записать строку своего run'а (сторона probe job'а)")
     rec.add_argument("--no-finalize", action="store_true",
                      help="не финализировать кампанию при достижении покрытия")
+    sub.add_parser("chain", help="диспатчнуть следующую ступень цепочки тиков (всегда()-шаг)")
+    sub.add_parser("tick_failed", help="записать след тика, умершего до диспатча (failure()-шаг)")
     sub.add_parser("finalize", help="завершить кампанию: сводка, PR, комментарий")
     sta = sub.add_parser("status", help="покрытие и сводка по локальному CSV")
     sta.add_argument("--csv", default=CSV_PATH, help="путь до CSV (по умолчанию — кампания)")
     args = parser.parse_args()
     return {
-        "dispatch": cmd_dispatch, "record": cmd_record,
-        "finalize": cmd_finalize, "status": cmd_status,
+        "dispatch": cmd_dispatch, "record": cmd_record, "chain": cmd_chain,
+        "tick_failed": cmd_tick_failed, "finalize": cmd_finalize, "status": cmd_status,
     }[args.command](args)
 
 

@@ -329,3 +329,131 @@ def test_append_and_push_dedupes_probe_id(tmp_path):
     assert dt.append_and_push(str(work), again, "probe probe-dup: late") is False
     rows = dt.read_rows((work / dt.CSV_PATH).read_text(encoding="utf-8"))
     assert len(rows) == 1 and rows[0]["status"] == "timeout"
+
+
+# ── Цепочка тиков: решение о следующей ступени ───────────────────────────────────
+
+
+def active_cov():
+    return dt.coverage(make_rows(10, utc(2026, 8, 31, 13, 0), timedelta(minutes=20)),
+                       now=utc(2026, 9, 1, 0))
+
+
+def test_should_chain_continues_active_campaign():
+    assert dt.should_chain(active_cov(), workflow_on_main=True) == ""
+
+
+def test_should_chain_stops_on_success_limit_and_inactive_workflow():
+    met = dt.coverage(make_rows(100, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                      now=utc(2026, 9, 2, 0))
+    assert "покрытие достигнуто" in dt.should_chain(met, workflow_on_main=True)
+    overdue = dt.coverage(make_rows(3, utc(2026, 8, 31, 13, 0), timedelta(minutes=20)),
+                          now=utc(2026, 9, 10, 0))
+    assert "лимит дней" in dt.should_chain(overdue, workflow_on_main=True)
+    # неактивная кампания: отказ без новой ступени — иначе красная цепочка зациклится
+    assert "неактивна" in dt.should_chain(active_cov(), workflow_on_main=False)
+
+
+# ── Финализация: успех и недобор обязаны отличаться снаружи ──────────────────────
+
+
+def test_finalize_outcome_met_marks_pr_ready():
+    met = dt.coverage(make_rows(100, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                      now=utc(2026, 9, 2, 0))
+    outcome = dt.finalize_outcome(met)
+    assert outcome["ready"] is True
+    assert outcome["verdict"] == ""
+    assert "закрой задачу" in outcome["closing"]
+
+
+def test_finalize_outcome_unmet_keeps_draft_and_forbids_closing():
+    # предохранитель: строк много, но критерий не набран — ровно путь из ревью #108
+    unmet = dt.coverage(make_rows(45, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                        now=utc(2026, 9, 10, 0))
+    assert unmet["overdue"] and not unmet["met"]
+    outcome = dt.finalize_outcome(unmet)
+    assert outcome["ready"] is False
+    assert "НЕ достигнут" in outcome["verdict"]
+    assert "НЕ закрывать" in outcome["closing"]
+    assert "закрой задачу" not in outcome["closing"]
+    assert "CAMPAIGN_MAX_DAYS" in outcome["closing"]  # путь продления назван явно
+
+
+# ── Продление кампании — env снаружи кода, а не правка константы ─────────────────
+
+
+def test_campaign_max_days_env_override(monkeypatch):
+    monkeypatch.delenv(dt.CAMPAIGN_MAX_DAYS_ENV, raising=False)
+    assert dt.campaign_max_days() == 7
+    monkeypatch.setenv(dt.CAMPAIGN_MAX_DAYS_ENV, "30")
+    assert dt.campaign_max_days() == 30
+
+
+def test_coverage_overdue_follows_max_days_argument():
+    rows = make_rows(3, utc(2026, 8, 31, 13, 0), timedelta(minutes=20))
+    assert dt.coverage(rows, now=utc(2026, 9, 4, 0), max_days=3)["overdue"]
+    assert not dt.coverage(rows, now=utc(2026, 9, 4, 0), max_days=10)["overdue"]
+
+
+# ── Сводка: неравномерность сбора и вырожденная очередь видны ────────────────────
+
+
+def test_summarize_reports_cadence():
+    text = dt.summarize(summary_fixture())
+    assert "интервалы между замерами: медиана 10 мин" in text
+    # самая длинная щель: 13:10 вс 2026-08-30 → 13:00 пн 2026-08-31
+    assert "max 23.8 ч" in text
+
+
+def test_summarize_marks_zero_queue_as_not_measured():
+    rows = summary_fixture()
+    for row in rows:
+        if row["status"] == "ok":
+            row["queue_ms"] = "0"
+    text = dt.summarize(rows)
+    assert "queue_ms = 0 во всех строках" in text
+    assert "не измеряется" in text
+    # вырожденная колонка не дублируется статистикой «медиана 0.0 с»
+    assert "чистое ожидание раннера (часы GitHub" not in text
+
+
+def test_summarize_keeps_silent_on_informative_queue():
+    assert "queue_ms = 0 во всех строках" not in dt.summarize(summary_fixture())
+
+
+# ── Гвардии workflow: цепочка, след тика, страховочный cron ──────────────────────
+
+
+def load_workflow():
+    import yaml
+    path = (Path(__file__).parents[2] / ".github" / "workflows"
+            / "dispatch-latency-probe.yml")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_tick_job_chains_and_traces_failed_ticks():
+    steps = {s.get("name"): s for s in load_workflow()["jobs"]["tick"]["steps"]}
+    chain = steps.get("Цепочка — следующая ступень тика")
+    assert chain and chain["if"] == "always()", (
+        "цепочка перестала быть always(): один сбой тика роняет каденцию "
+        "до страховочного cron")
+    assert "dispatch_tail.py chain" in (chain.get("run") or "")
+    trace = steps.get("След тика, умершего до диспатча")
+    assert trace and trace["if"] == "failure()", (
+        "след умершего тика перестал быть failure(): класс «тик умер молча» открыт")
+    assert "dispatch_tail.py tick_failed" in (trace.get("run") or "")
+    for step in (chain, trace):
+        assert "GH_TOKEN" in (step.get("env") or {}), (
+            f"шаг «{step.get('name')}» без GH_TOKEN: его запись никогда не попадёт в CSV")
+
+
+def test_schedule_cron_is_backup_only_and_off_quarter_hours():
+    data = load_workflow()
+    on = data.get(True) or data.get("on")  # PyYAML читает ключ `on` как булев True
+    crons = [trigger["cron"] for trigger in on["schedule"]]
+    assert crons, "страховочный cron исчез — смерть цепочки оставит кампанию без страховки"
+    for expr in crons:
+        minute = int(expr.split()[0])
+        assert minute % 15 != 0, (
+            f"cron «{expr}» стоит на четверти часа — задокументированный пик "
+            "нагрузки schedule (21-github-actions.md)")

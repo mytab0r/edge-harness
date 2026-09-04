@@ -10,6 +10,13 @@
 #         простым шагом (метрика фиксируется GitHub'ом в run_started_at ДО любого
 #         шага) и записывает свою строку в CSV на ветке данных.
 #
+# Каденция — самоподдержка, не schedule: шаг «Цепочка» из always()-шага тика
+# диспатчит следующий workflow_dispatch; cron — только страховка смерти цепочки.
+# Замер 2026-09-04: cron `*/15` на этом репозитории доставил ~7% тиков (31 из
+# ~449 за 112 ч), dispatch-события — 32 из 32 (docs/research/21-github-actions.md,
+# «Замер schedule на этом репозитории»). Минуты страховочного cron сдвинуты с
+# четвертей часа — рекомендация GitHub на случай пиков нагрузки в начале часа.
+#
 # Файл обязан лежать на default branch — dispatch с ветки молча возвращает 204
 # без запуска; гвардия в scripts/measure/dispatch_tail.py это проверяет.
 # После финализации кампания отключает этот workflow сама (gh workflow enable —
@@ -21,7 +28,8 @@ name: dispatch-latency-probe
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "37 4,16 * * *"
+    - cron: "11 10,22 * * *"
   repository_dispatch:
     types: [dispatch-latency-probe]
   workflow_dispatch:
@@ -58,6 +66,26 @@ jobs:
           # никогда, и кампания молча деградировала бы до «только ok».
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py dispatch
+      - name: След тика, умершего до диспатча
+        # Класс «молча деградировало и никто не заметил»: тик, умерший до
+        # POST /dispatches, обязан оставить строку dispatch_failed, а не только
+        # красный job. Доставку schedule это не ловит (ран не создан — ловить
+        # нечем): она видна сверкой истории runs, см. замер schedule в доке.
+        if: failure()
+        env:
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: python scripts/measure/dispatch_tail.py tick_failed
+      - name: Цепочка — следующая ступень тика
+        # Основной механизм каденции. always(): один сбой тика не роняет
+        # кампанию до страховочного cron; ограничитель повтора — CHAIN_DELAY_S
+        # и сериализация тиков (concurrency ниже). Останавливается сам:
+        # покрытие достигнуто, лимит дней или workflow не на main.
+        if: always()
+        env:
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: python scripts/measure/dispatch_tail.py chain
 
   probe:
     if: github.event_name == 'repository_dispatch'
