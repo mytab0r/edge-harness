@@ -5,9 +5,12 @@
 > теперь закрывает задачи сам, но только по проверяемой улике (деплой/
 > check-runs/файлы в main), не по факту мержа — тот же критерий «проверяй
 > видимый результат», доведённый до автомата вместо ручного шага. Актуальное
-> поведение — `openspec/specs/journal-tasks-hands.md`, «Конвейер», п.18;
-> код — `scripts/orchestra/scheduler.py:accept_merged_tasks`. Документ ниже —
-> исторический контекст класса ошибки #56/#57, актуальны только он.
+> поведение — дельта-спека
+> [specs/journal-tasks-hands/spec.md](specs/journal-tasks-hands/spec.md)
+> (вливается в `openspec/specs/journal-tasks-hands.md`, «Конвейер», п.18, при
+> архивации); код — `scripts/orchestra/scheduler.py:accept_merged_tasks`.
+> Документ ниже — исторический контекст класса ошибки #56/#57, актуален
+> только он.
 
 Задача: #61. Дельта-спека: `openspec/specs/journal-tasks-hands.md`, «Конвейер», п.18.
 
