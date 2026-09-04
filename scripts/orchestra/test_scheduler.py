@@ -26,6 +26,7 @@ issues/comments), снятые живым запросом `gh api` по это�
 
 import http.server
 import importlib.util
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -664,13 +665,20 @@ def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
     assert not any("pulls/3/update-branch" in c for c in fake.calls)  # слот уже занят #2
     updated_lines = [line for line in lines if "обновлён из main" in line]
     not_close_lines = [line for line in lines if "не подтянут" in line]
-    slot_taken_lines = [line for line in lines if "уже обновлён этим запуском" in line]
+    # Находка AI-ревью PR #288: строка обязана называть ПРИЧИНУ (слот занят
+    # другим PR), а не приписывать #3 несостоявшееся обновление — #3 сам не
+    # обновлён, слот занял #2.
+    slot_taken_lines = [
+        line for line in lines
+        if "слот update_branch" in line and "занят другим PR" in line
+    ]
     assert len(updated_lines) == 1 and "#2" in updated_lines[0]
-    assert len(not_close_lines) == 2  # #4, #5 — не близки к слиянию
+    assert len(not_close_lines) == 3  # #3 (слот занят), #4, #5 — не близки к слиянию
     assert any("#4" in line for line in not_close_lines)
     assert any("#5" in line for line in not_close_lines)
     assert len(slot_taken_lines) == 1 and "#3" in slot_taken_lines[0]  # не молчит, назван следующий прогон
     assert "следующий прогон" in slot_taken_lines[0]
+    assert not any("уже обновлён" in line for line in lines)  # #3 сам не обновлён
 
 
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
@@ -744,6 +752,66 @@ def test_update_remaining_pulls_excludes_just_merged_and_empty_is_noop(monkeypat
     lines = sch.update_remaining_pulls(REPO, 1, [pull(1)])  # единственный "other" == merged
     assert lines == []
     assert fake.calls == []
+
+
+# ── Прод-форма сбоя update_branch: subprocess.CalledProcessError при ORCHESTRA_PAT ──
+# Находка AI-ревью PR #288 (вторая): в проде ORCHESTRA_PAT задан
+# (.github/workflows/orchestra.yml), значит update_branch падает через
+# subprocess.run(check=True) → subprocess.CalledProcessError, а не через
+# gh()/RuntimeError. Все тесты выше делают monkeypatch.delenv("ORCHESTRA_PAT")
+# или подменяют gh()/update_branch напрямую — ветка except
+# subprocess.CalledProcessError в update_branch_or_report не была накрыта
+# вовсе. Прод-форма ошибки: gh api пишет причину в stderr процесса, код
+# возврата ненулевой — ровно то, что кидает subprocess.run(check=True).
+
+
+def test_update_branch_or_report_pat_set_called_process_error_includes_stderr(monkeypatch):
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1, cmd=cmd, output="",
+            stderr="gh: Update is not a fast forward (HTTP 422)\n",
+        )
+
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+
+    line = sch.update_branch_or_report(
+        REPO, 2,
+        on_success="успех — быть не должно",
+        on_budget_exhausted="слот — быть не должно",
+        on_error="#2 — update_branch не удался: {error}",
+    )
+
+    assert "Update is not a fast forward" in line
+    assert "HTTP 422" in line
+
+
+def test_update_branch_or_report_pat_set_success_uses_subprocess(monkeypatch):
+    # Контроль: PAT задан — успех тоже обязан идти через subprocess.run
+    # (не gh()), иначе тест выше проверял бы ветку, которая в проде не
+    # используется вовсе.
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+
+        class _Result:
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+
+    line = sch.update_branch_or_report(
+        REPO, 2, on_success="✅", on_budget_exhausted="budget", on_error="{error}",
+    )
+
+    assert line == "✅"
+    assert len(calls) == 1
+    assert any("update-branch" in str(part) for part in calls[0])
+    assert any("Bearer test-pat-token" in str(part) for part in calls[0])
 
 
 # ── Тот же предикат — behind-ветка merge_queue (#252, пункт 3 задачи) ────────────

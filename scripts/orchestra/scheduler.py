@@ -344,12 +344,23 @@ def update_branch_or_report(
     без значений по умолчанию, поэтому новая (третья) точка вызова, забывшая
     текст на сетевой сбой, падает TypeError'ом сразу при вызове, а не тонет в
     проде необработанным исключением. on_error форматируется через
-    .format(error=...)."""
+    .format(error=...).
+
+    subprocess.CalledProcessError разбирается отдельно от RuntimeError
+    (находка AI-ревью PR #288): в проде ORCHESTRA_PAT задан
+    (.github/workflows/orchestra.yml), значит update_branch падает не через
+    gh()/RuntimeError, а через subprocess.run(check=True) — исключение несёт
+    stderr `gh api`, а str(CalledProcessError) его не включает (только код
+    возврата). Без разбора отдельно строка отчёта теряет причину сбоя —
+    остаётся голое "returned non-zero exit status 1"."""
     try:
         update_branch(repo, pr_number)
     except UpdateBranchBudgetExhausted:
         return on_budget_exhausted
-    except (RuntimeError, subprocess.CalledProcessError) as error:
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or str(error)).strip()
+        return on_error.format(error=detail)
+    except RuntimeError as error:
         return on_error.format(error=error)
     return on_success
 
@@ -683,8 +694,9 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
             repo, other["number"],
             on_success=f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}",
             on_budget_exhausted=(
-                f"⏭️ PR #{other['number']} уже обновлён этим запуском — за раз подтягивается "
-                f"только один кандидат (#252); подтянет следующий прогон оркестратора"
+                f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
+                "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
+                "оркестратора (#252)"
             ),
             on_error=(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "
