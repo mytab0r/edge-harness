@@ -88,6 +88,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_upstream_drift.py -q
 
+      # Гейт слияния и выборочное подтягивание веток (#252): одно место
+      # правды review_labels.should_update_branch — подтягивать только PR с
+      # обоими зелёными вердиктами или уже в конфликте, не всех открытых
+      # подряд (иначе синхронизация pr-review.yml/ai-review.yml на каждое
+      # слияние). Прод-форма: фикстура — реальный снимок открытых PR этого
+      # репозитория.
+      - name: Тесты меток-вердиктов ревью и выборочного подтягивания веток
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_review_labels.py -q
+
       # Атомарная аренда задачи (#121): гонка двух claim (замок существует →
       # второй отказ), TTL по дате коммита замка, release. Без сети — gh на
       # уровне subprocess-мока с прод-формой ответов.
