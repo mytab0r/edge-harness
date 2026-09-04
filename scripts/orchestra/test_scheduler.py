@@ -26,6 +26,7 @@ issues/comments), снятые живым запросом `gh api` по это�
 
 import http.server
 import importlib.util
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -323,6 +324,17 @@ class FakeGh:
 
 
 REPO = "mytab0r/edge-harness"
+
+
+@pytest.fixture(autouse=True)
+def _reset_update_branch_budget():
+    """Слот update_branch (#252, третий заход) — module-level и общий на
+    прогон планировщика; без явного сброса перед каждым тестом состояние
+    "слот уже занят" утекало бы из одного теста в следующий в том же
+    процессе pytest."""
+    sch.reset_update_branch_budget()
+    yield
+    sch.reset_update_branch_budget()
 
 
 # ── reap_stale (#61): просрочённое назначение без PR возвращается в пул ──────────
@@ -626,10 +638,15 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
 # может его расшить).
 
 
-def test_update_remaining_pulls_updates_only_close_to_merge_or_conflict(monkeypatch):
+def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
+    # Второй заход #252: даже среди прошедших предикат кандидатов подтягиваем
+    # РОВНО одного за вызов — подтягивание первого (push, меняет head) само
+    # способно сбросить ai:ok второго тем же циклом, который эта задача и
+    # закрывает. Порядок и предикат не меняются: #2 и #3 оба проходят
+    # should_update_branch, подтянут только первый по порядку — #2.
     others = [
-        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть
-        pull(3, labels=["conflict"]),                     # конфликт — подтянуть
+        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть первым
+        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат, но не в этом запуске
         pull(4, labels=["review:ok"]),                     # нет ai:ok — не трогать
         pull(5, labels=["review:ok", "ai:changes-requested"]),  # доработка — не трогать
     ]
@@ -643,15 +660,25 @@ def test_update_remaining_pulls_updates_only_close_to_merge_or_conflict(monkeypa
     lines = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 2
+    assert len(update_calls) == 1
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert any("pulls/3/update-branch" in c for c in update_calls)
+    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # слот уже занят #2
     updated_lines = [line for line in lines if "обновлён из main" in line]
-    skipped_lines = [line for line in lines if "не подтянут" in line]
-    assert len(updated_lines) == 2
-    assert len(skipped_lines) == 2
-    assert any("#4" in line for line in skipped_lines)
-    assert any("#5" in line for line in skipped_lines)
+    not_close_lines = [line for line in lines if "не подтянут" in line]
+    # Находка AI-ревью PR #288: строка обязана называть ПРИЧИНУ (слот занят
+    # другим PR), а не приписывать #3 несостоявшееся обновление — #3 сам не
+    # обновлён, слот занял #2.
+    slot_taken_lines = [
+        line for line in lines
+        if "слот update_branch" in line and "занят другим PR" in line
+    ]
+    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
+    assert len(not_close_lines) == 3  # #3 (слот занят), #4, #5 — не близки к слиянию
+    assert any("#4" in line for line in not_close_lines)
+    assert any("#5" in line for line in not_close_lines)
+    assert len(slot_taken_lines) == 1 and "#3" in slot_taken_lines[0]  # не молчит, назван следующий прогон
+    assert "следующий прогон" in slot_taken_lines[0]
+    assert not any("уже обновлён" in line for line in lines)  # #3 сам не обновлён
 
 
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
@@ -675,6 +702,37 @@ def test_update_remaining_pulls_skip_is_not_silent(monkeypatch):
     assert "#4" in lines[0] and "не подтянут" in lines[0]
 
 
+def test_update_remaining_pulls_failed_attempt_does_not_consume_slot(monkeypatch):
+    # Находка AI-ревью PR #288: докстринг update_branch обещает "слот
+    # занимается только УСПЕХОМ" — это держится на честном слове, если слот
+    # можно пометить занятым ДО вызова gh (мутация: `pulled = True`/
+    # `_update_branch_used_this_run = True` раньше настоящего push'а). Первый
+    # кандидат падает (не найдя настоящей ошибки — используем боевой
+    # update_branch, не заглушку), второй ОБЯЗАН получить попытку тем же
+    # прогоном: неудача не должна расходовать общий слот.
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),  # упадёт при update-branch
+        pull(3, labels=["conflict"]),             # обязан получить попытку следом
+    ]
+    fake = FakeGh({
+        "pulls/2/update-branch": RuntimeError("422 Merge conflict"),
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "обе попытки обязаны произойти — неудача не занимает слот"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+    failed_lines = [line for line in lines if "не обновлён" in line]
+    updated_lines = [line for line in lines if line.startswith("🔄")]
+    assert len(failed_lines) == 1 and "#2" in failed_lines[0]
+    assert len(updated_lines) == 1 and "#3" in updated_lines[0]
+
+
 def test_update_remaining_pulls_reports_conflict_loudly_not_silently(monkeypatch):
     others = [pull(2, labels=["conflict"])]  # конфликт проходит предикат — попытка будет
 
@@ -694,6 +752,66 @@ def test_update_remaining_pulls_excludes_just_merged_and_empty_is_noop(monkeypat
     lines = sch.update_remaining_pulls(REPO, 1, [pull(1)])  # единственный "other" == merged
     assert lines == []
     assert fake.calls == []
+
+
+# ── Прод-форма сбоя update_branch: subprocess.CalledProcessError при ORCHESTRA_PAT ──
+# Находка AI-ревью PR #288 (вторая): в проде ORCHESTRA_PAT задан
+# (.github/workflows/orchestra.yml), значит update_branch падает через
+# subprocess.run(check=True) → subprocess.CalledProcessError, а не через
+# gh()/RuntimeError. Все тесты выше делают monkeypatch.delenv("ORCHESTRA_PAT")
+# или подменяют gh()/update_branch напрямую — ветка except
+# subprocess.CalledProcessError в update_branch_or_report не была накрыта
+# вовсе. Прод-форма ошибки: gh api пишет причину в stderr процесса, код
+# возврата ненулевой — ровно то, что кидает subprocess.run(check=True).
+
+
+def test_update_branch_or_report_pat_set_called_process_error_includes_stderr(monkeypatch):
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1, cmd=cmd, output="",
+            stderr="gh: Update is not a fast forward (HTTP 422)\n",
+        )
+
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+
+    line = sch.update_branch_or_report(
+        REPO, 2,
+        on_success="успех — быть не должно",
+        on_budget_exhausted="слот — быть не должно",
+        on_error="#2 — update_branch не удался: {error}",
+    )
+
+    assert "Update is not a fast forward" in line
+    assert "HTTP 422" in line
+
+
+def test_update_branch_or_report_pat_set_success_uses_subprocess(monkeypatch):
+    # Контроль: PAT задан — успех тоже обязан идти через subprocess.run
+    # (не gh()), иначе тест выше проверял бы ветку, которая в проде не
+    # используется вовсе.
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+
+        class _Result:
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+
+    line = sch.update_branch_or_report(
+        REPO, 2, on_success="✅", on_budget_exhausted="budget", on_error="{error}",
+    )
+
+    assert line == "✅"
+    assert len(calls) == 1
+    assert any("update-branch" in str(part) for part in calls[0])
+    assert any("Bearer test-pat-token" in str(part) for part in calls[0])
 
 
 # ── Тот же предикат — behind-ветка merge_queue (#252, пункт 3 задачи) ────────────
@@ -736,6 +854,74 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     assert any("pulls/2/update-branch" in c for c in fake.calls)
 
 
+def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
+    # Находка AI-ревью PR #288 (главная): раньше дисциплина "максимум один
+    # успешно подтянутый за прогон" жила только внутри update_remaining_pulls
+    # — сама behind-ветка merge_queue могла подтянуть НЕСКОЛЬКО behind-PR за
+    # один свой проход по списку `pulls`, ничем не ограниченная. Два behind-PR
+    # с обоими зелёными вердиктами в одном вызове merge_queue обязаны дать
+    # РОВНО один update-branch, второй — отдельную строку "слот занят".
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "два behind-PR за один прогон не должны дать два update-branch"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("слот update_branch" in line and "#3" in line for line in lines)
+
+
+def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
+    # #288 (класс: разная обработка ошибок update_branch в разных точках
+    # вызова, тот же класс, что уже чинили точечно в #248 находка 3 и #253
+    # находка 4). До фикса behind-ветка merge_queue ловила только
+    # UpdateBranchBudgetExhausted — сетевой сбой (RuntimeError/
+    # CalledProcessError) пробрасывался наружу и ронял merge_queue и main()
+    # целиком: без summary, без отчёта, без очереди слияний. Два behind-PR:
+    # первый падает по сети, второй обязан получить попытку тем же обходом —
+    # неудача не потребляет общий слот update_branch (см. update_branch).
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),  # обновление упадёт по сети
+        pull(3, labels=["review:ok", "ai:ok"]),  # обязан получить попытку следом
+    ]
+    fake = FakeGh({
+        # Более специфичные маршруты (.../update-branch) обязаны идти ПЕРЕД
+        # короткими (.../pulls/N) — FakeGh матчит по первой подходящей
+        # подстроке, и короткий фрагмент иначе перехватит PUT-запрос раньше,
+        # чем до него дойдёт исключение (см. соседние тесты behind-ветки).
+        "pulls/2/update-branch": RuntimeError("dial tcp: connection refused"),
+        "pulls/3/update-branch": None,
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
+
+    assert not hard_failure
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "сбой на #2 не должен остановить обход — #3 обязан получить попытку"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+    failed_lines = [line for line in lines if "не удался" in line]
+    updated_lines = [line for line in lines if "обновлена из main" in line]
+    assert len(failed_lines) == 1 and "#2" in failed_lines[0] and "dial tcp" in failed_lines[0]
+    assert len(updated_lines) == 1 and "#3" in updated_lines[0]
+
+
 # Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
 def test_mark_conflicts_clears_label_on_explicit_non_conflict_state(monkeypatch):
     pulls = [pull(2, labels=["conflict"])]
@@ -760,6 +946,38 @@ def test_mark_conflicts_posts_label_and_comment_on_dirty_state(monkeypatch):
     fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None}); patch_gh(monkeypatch, fake)
     lines = sch.mark_conflicts(REPO, [pull(2, labels=[])])
     assert any("issues/2/labels" in c and "conflict" in c for c in fake.mutating_calls()) and any("issues/2/comments" in c for c in fake.mutating_calls()) and any("помечен" in line and "conflict" in line for line in lines)
+
+
+# ── Класс «устаревшая метка в памяти» (#252, второй заход) ───────────────────────
+# mark_conflicts снимала/ставила метку conflict через gh, но НЕ обновляла
+# pull["labels"] в переданном объекте — а main() передаёт тот же список pulls
+# дальше в merge_queue/update_remaining_pulls. should_update_branch там видел
+# метку, которую API уже удалил секундами раньше (лог 33904096031: слияние
+# #284 подтянуло #253/#248 без ai:ok только из-за протухшей `conflict`).
+# Мутация: закомментируй в _set_conflict_label обновление pull["labels"]
+# (оставь только gh-вызов) — оба теста ниже краснеют.
+
+
+def test_mark_conflicts_clear_syncs_pull_object_so_predicate_sees_it_now(monkeypatch):
+    p = pull(2, labels=["conflict"])
+    pulls = [p]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "clean"}, "labels/conflict": None})
+    patch_gh(monkeypatch, fake)
+    sch.mark_conflicts(REPO, pulls)
+    # Тот же объект p из того же списка pulls — как main() передаёт его дальше.
+    assert sch.review_labels.should_update_branch(p["labels"]) is False
+    assert not any(label["name"] == sch.CONFLICT_LABEL for label in p["labels"])
+
+
+def test_mark_conflicts_post_syncs_pull_object_so_predicate_sees_it_now(monkeypatch):
+    p = pull(2, labels=[])
+    pulls = [p]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None})
+    patch_gh(monkeypatch, fake)
+    sch.mark_conflicts(REPO, pulls)
+    # should_update_branch должен теперь видеть свежепоставленную conflict —
+    # без синхронизации объект p её бы не содержал до следующего fetch.
+    assert sch.review_labels.should_update_branch(p["labels"]) is True
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
