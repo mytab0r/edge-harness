@@ -77,6 +77,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
 
+      # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
+      # source-build морды кричит в задачу #134 + метка update-available +
+      # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
+      # пине. Семвер по прод-форме тегов repos/tags (настоящие sha апстрима),
+      # проводка на моке pulse_guard.gh: свежий пин и повторный эпизод —
+      # ноль мутирующих вызовов.
+      - name: Тесты сигнала дрейфа пина апстрима (#134)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_upstream_drift.py -q
+
       # Атомарная аренда задачи (#121): гонка двух claim (замок существует →
       # второй отказ), TTL по дате коммита замка, release. Без сети — gh на
       # уровне subprocess-мока с прод-формой ответов.
