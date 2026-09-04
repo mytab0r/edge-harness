@@ -187,14 +187,6 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, di
         if _issue_is_blocked(issue):
             continue
         number = issue["number"]
-        if number in merged:
-            # Работа уже слита — приёмку (#227, accept_merged_tasks ниже) ведёт
-            # проверяемая улика, а не «PR не появился»: без этой проверки
-            # reap_stale красноречиво врал именно так — часть задач из замера
-            # #227 (#192, #189, #187…) оказались БЕЗ исполнителя ровно потому,
-            # что их слитый PR закрылся и стал невидим для open_pulls, а через
-            # STALE_HOURS reap_stale снял назначение с неверной причиной.
-            continue
         if any(pr_references_issue(pull, number) for pull in pulls):
             continue
         timeline = gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")
@@ -205,6 +197,21 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, di
         if not assigned_at:
             continue
         last = parse_time(max(assigned_at))
+        merged_pull = merged.get(number)
+        if merged_pull is not None and last <= parse_time(merged_pull["merged_at"]):
+            # Работа уже слита — приёмку (#227, accept_merged_tasks ниже) ведёт
+            # проверяемая улика, а не «PR не появился»: без этой проверки
+            # reap_stale красноречиво врал именно так — часть задач из замера
+            # #227 (#192, #189, #187…) оказались БЕЗ исполнителя ровно потому,
+            # что их слитый PR закрылся и стал невидим для open_pulls, а через
+            # STALE_HOURS reap_stale снял назначение с неверной причиной.
+            # Гвард НЕ постоянный: сравниваем с временем ТЕКУЩЕГО назначения,
+            # не с фактом «номер когда-либо встречался в слитом PR» — иначе
+            # после провала приёмки и новой аренды та же задача была бы
+            # невидима для reap навсегда (замечание AI-ревью, PR #253):
+            # старый merged-PR остаётся в карте, а новое назначение (после
+            # `last > merged_at`) обязано подчиняться обычному таймеру ниже.
+            continue
         if now - last < timedelta(hours=STALE_HOURS):
             continue
         who = ", ".join(a["login"] for a in issue["assignees"])
@@ -643,11 +650,17 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
         lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
     # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
-    # канарейка, E2E). Напоминаем исполнителю; закрытие — за ним, с уликами
-    # (кейс #56/#57: Closes закрыл задачу до зелёной канарейки).
+    # канарейка, E2E). Напоминаем исполнителю про реальный пост-мерж прогон,
+    # если критерий его требует; закрытие делает стадия приёмки ниже
+    # (accept_merged_tasks, #227) по проверяемой улике — НЕ воркер и НЕ по
+    # ключевым словам (кейс #56/#57: Closes закрыл задачу до зелёной
+    # канарейки). Текст комментария не зовёт закрывать задачу вручную —
+    # WORKER-PLAYBOOK прямо запрещает `gh issue close` после #227, и
+    # напоминание, говорящее обратное, было бы тем же обходом проверки.
     # Намеренно любое упоминание, не только декларация (см. pr_references_issue
     # выше, #195): слитый PR мог упомянуть смежную задачу не первой строкой —
-    # снять её замок и напомнить про закрытие безопаснее, чем оставить висеть.
+    # снять её замок и напомнить про пост-мерж проверку безопаснее, чем
+    # оставить висеть.
     task_refs = sorted(set(task_ref.extract_task_refs(pull.get("body") or "")))
     task_numbers: list[int] = []
     for task_number in task_refs:
@@ -668,12 +681,14 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
                 "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
                 "-f",
                 "body=" + (
-                    f"🔁 PR #{number} слит в main. Мерж — ещё не готовность: проведи "
-                    "пост-мерж проверку (деплой/канарейка/E2E), приложи улики "
-                    "и закрой задачу."
+                    f"🔁 PR #{number} слит в main. Мерж — ещё не готовность: если критерий "
+                    "требует реального пост-мерж прогона (канарейка/E2E), проведи его и "
+                    "оставь улику. Задачу закрывать не нужно и нельзя (`gh issue close` — "
+                    "обход проверки, класс #56/#57) — стадия приёмки закроет её сама по "
+                    "проверяемой улике (деплой/check-runs/файлы в main)."
                 ),
             )
-            lines.append(f"🔁 #{task_number}: напоминание — закрыть после пост-мерж проверки")
+            lines.append(f"🔁 #{task_number}: напоминание про пост-мерж проверку — закрывает приёмка (#227)")
         except RuntimeError as error:
             # один кривой реф не должен ронять остальные действия after_merge
             lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
@@ -1326,9 +1341,14 @@ def accept_merged_tasks(
                 f"✅ {marker} PR #{pull['number']} ({category}): {reasoning}. {detail}.")
             gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
             try:
-                claim_task.release(repo, int(number))
-            except RuntimeError:
-                pass  # замка может не быть — не ошибка (см. claim_task)
+                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+            except RuntimeError as error:
+                # claim_task.release сам возвращает строку (не исключение) для
+                # «замка не было» (см. _ref_missing) — RuntimeError сюда долетает
+                # только на настоящей поломке (сеть/права/5xx), и её нельзя
+                # глотать молча (тот же приём, что уже используют after_merge/
+                # unhealthy_pulls).
+                lines.append(f"⚠️ замок task-{number} не снят: {error}")
             lines.append(f"✅ #{number}: закрыта приёмкой ({category}) — {detail}")
             continue
 
@@ -1342,9 +1362,9 @@ def accept_merged_tasks(
             who = ", ".join(a["login"] for a in issue["assignees"])
             gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
         try:
-            claim_task.release(repo, int(number))
-        except RuntimeError:
-            pass
+            lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+        except RuntimeError as error:
+            lines.append(f"⚠️ замок task-{number} не снят: {error}")
         lines.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
     return lines, hard_failure
 

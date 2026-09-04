@@ -1397,12 +1397,16 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     вовсе (проводка в main, не внутри dispatch_worker)."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
-    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: ([], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
     dispatched = []
     monkeypatch.setattr(
@@ -1943,6 +1947,31 @@ def test_reap_stale_still_reaps_when_not_covered_by_merged_pr(monkeypatch):
     now = datetime.now(timezone.utc)
 
     lines = sch.reap_stale(REPO, now, [], merged={})
+
+    assert len(lines) == 1 and "просрочена" in lines[0]
+    assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/21/assignees") for c in fake.calls)
+
+
+def test_reap_stale_reaps_reassignment_after_failed_acceptance(monkeypatch):
+    """Гвард из теста выше сравнивает время НАЗНАЧЕНИЯ со временем мержа, не
+    сам факт «номер когда-то встречался в merged» (замечание AI-ревью, PR
+    #253): PR #177 слит и приёмка его провалила, задачу отдали новому
+    исполнителю ПОСЛЕ мержа — если этот воркер умер, не открыв PR, reap
+    обязан снять просроченное назначение как обычно. merged всё ещё содержит
+    старый PR #177 (он не перестаёт быть слитым), но новое assigned позже
+    merged_at — старый гвард (`if number in merged: continue`) держал бы
+    задачу «в работе» навечно без диспетча и без сигнала."""
+    new_assigned = [{"event": "assigned", "created_at": "2026-09-10T00:00:00Z"}]
+    fake = FakeGh({
+        "issues?state=open&labels=task": [issue(21, assignees=("mytab0r",))],
+        "issues/21/timeline?per_page=100": new_assigned,
+        "issues/21/assignees": None,
+        "issues/21/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    now = datetime.fromisoformat("2026-09-10T00:00:00+00:00") + timedelta(hours=sch.STALE_HOURS, minutes=1)
+
+    lines = sch.reap_stale(REPO, now, [], merged={21: PR177})
 
     assert len(lines) == 1 and "просрочена" in lines[0]
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/21/assignees") for c in fake.calls)
