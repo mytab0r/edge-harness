@@ -359,31 +359,44 @@ def is_not_found(error: RuntimeError) -> bool:
     return "HTTP 404" in str(error)
 
 
-def task_section(pull_body: str, repo: str) -> str:
-    """Задача пула, которую закрывает PR: первая открытая issue с меткой task
-    из #N-ссылок тела. Нет задачи (orchestra:skip, dependabot) — так и пишем:
-    «нет задачи» и «задача не дочиталась» — разные состояния: 404 значит
-    «не задача, ищем дальше», любой другой отказ (права, сеть, 5xx) роняет
-    шаг громко — молча ревьюить без контекста задачи нельзя (silent-wrong).
+NO_TASK_MESSAGE = (
+    "Задача из пула: у PR нет открытой задачи с меткой task (orchestra:skip или "
+    "сопровождение) — ревьюй по документации репозитория и здравому смыслу."
+)
+
+
+def task_section(pull: dict, repo: str) -> str:
+    """Задача пула, которую закрывает PR — резолвится ОДНИМ источником
+    правды `task_ref.resolve_pr_task` (#259): имя agent-ветки, затем
+    декларация первой строкой тела. Любое упоминание номера в прозе
+    (`task_ref.extract_task_refs`) сюда не годится — этим классом бага
+    ai_review.py путал задачу PR с первым попавшимся числом в описании
+    (живой замер #259: #253 судили по #120 из прозы вместо объявленного
+    #227, #248 — по #119 вместо #201, #247 — по #43 вместо своей задачи,
+    #263 — по #4 вместо #255).
+
+    Нет задачи (orchestra:skip, dependabot, ручной PR без декларации) — так
+    и пишем: «нет задачи». Резолвнутый номер не читается (404) — тоже
+    «нет задачи»: сослаться на несуществующую issue равносильно её
+    отсутствию. Любой другой отказ (права, сеть, 5xx) роняет шаг громко —
+    молча ревьюить без контекста задачи нельзя (silent-wrong).
     """
-    for number in sorted(set(task_ref.extract_task_refs(pull_body or ""))):
-        try:
-            issue = gh(f"repos/{repo}/issues/{number}")
-        except RuntimeError as error:
-            if is_not_found(error):
-                continue
-            raise
-        if "pull_request" in issue or issue.get("state") != "open":
-            continue
-        if "task" not in {label["name"] for label in issue["labels"]}:
-            continue
-        return (
-            f"Задача из пула, которую закрывает этот PR: #{number} «{issue['title']}»\n\n"
-            f"{issue.get('body') or ''}"
-        )
+    number = task_ref.resolve_pr_task(pull)
+    if number is None:
+        return NO_TASK_MESSAGE
+    try:
+        issue = gh(f"repos/{repo}/issues/{number}")
+    except RuntimeError as error:
+        if is_not_found(error):
+            return NO_TASK_MESSAGE
+        raise
+    if "pull_request" in issue or issue.get("state") != "open":
+        return NO_TASK_MESSAGE
+    if "task" not in {label["name"] for label in issue["labels"]}:
+        return NO_TASK_MESSAGE
     return (
-        "Задача из пула: у PR нет открытой задачи с меткой task (orchestra:skip или "
-        "сопровождение) — ревьюй по документации репозитория и здравому смыслу."
+        f"Задача из пула, которую закрывает этот PR: #{number} «{issue['title']}»\n\n"
+        f"{issue.get('body') or ''}"
     )
 
 
@@ -420,7 +433,7 @@ def cmd_gather(args: argparse.Namespace) -> int:
         branch=pull["head"]["ref"],
         author=(pull.get("user") or {}).get("login", ""),
         context_pack=pack,
-        task_section=task_section(pull.get("body") or "", repo),
+        task_section=task_section(pull, repo),
     )
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
     # Переходная совместимость: bridge на main (до мержа этого PR) берёт head
