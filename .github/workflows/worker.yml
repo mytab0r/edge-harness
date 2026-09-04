@@ -49,7 +49,7 @@ jobs:
 
       # pnpm нужен dsh plugin add (монтаж стрим-плагина в профиль headless,
       # #119 — транскрипт сессии в морде; тот же шаг есть у hands).
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
