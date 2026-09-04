@@ -240,6 +240,46 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     assert escalated and escalated[0][0] == "o/r" and escalated[0][1] == sch.WATCHDOG_ISSUE
 
 
+def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
+    """Находка ревью PR #248: до фикса RuntimeError из detect_and_act/
+    escalate_stale_auto_tasks (сеть, gh без авторизации) выходил из main()
+    НЕПОЙМАННЫМ — отчёт пульса (уже посчитанные строки: мержи, heartbeat)
+    терялся целиком, summary(lines) не вызывался вовсе. Гвардия: сбой
+    детектора красит прогон, но summary всё равно получает строки отчёта,
+    включая уже сделанное слияние — тот же приём, что у archive_hard_failure."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], False))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
+
+    def boom(repo, now, lines, run_url=None):
+        raise RuntimeError("gh api issues?labels=auto-detected: authentication required")
+
+    monkeypatch.setattr(sch, "detect_and_act", boom)
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: pytest.fail(
+        "не должен вызываться — detect_and_act уже упал"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    saved = []
+    monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
+
+    code = sch.main()
+
+    assert code == 1  # детектор сломан — прогон окрашен красным
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert saved, "summary(lines) обязан быть вызван — отчёт не теряется на сбое детектора"
+    assert any("✅ PR #1 слит" in line for line in saved[0]), (
+        "отчёт о слиянии, посчитанном ДО сбоя детектора, потерян"
+    )
+
+
 def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
@@ -1692,6 +1732,13 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    # Без заглушки эти два вызова main() бьют настоящим `gh api` (#201) —
+    # в CI без GH_TOKEN это гарантированный красный прогон (находка ревью PR #248):
+    # gh отказывает без авторизации ДО сетевого запроса, а не молча читает
+    # публичный эндпоинт анонимно.
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",

@@ -1865,8 +1865,19 @@ def main() -> int:
     if run_id:
         server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
         run_url = f"{server_url}/{repo}/actions/runs/{run_id}"
-    stall_lines = detect_and_act(repo, now, lines, run_url)
-    stall_lines += escalate_stale_auto_tasks(repo, now)
+    # Сбой детектора (сеть/gh, авторизация) не должен утащить с собой уже
+    # посчитанные строки выше (мержи, диспатч, дрейф пина) — тот же приём,
+    # что у archive_hard_failure ниже: отчёт сохраняется, прогон красится
+    # ПОСЛЕ summary(lines), не вместо него (находка ревью PR #248: без этого
+    # RuntimeError внутри детектора терял отчёт целиком до записи в
+    # GITHUB_STEP_SUMMARY).
+    stall_hard_failure = False
+    try:
+        stall_lines = detect_and_act(repo, now, lines, run_url)
+        stall_lines += escalate_stale_auto_tasks(repo, now)
+    except RuntimeError as error:
+        stall_lines = [f"🚨 детектор простоя (#201) не отработал (возможность сломана, не отсутствует): {error}"]
+        stall_hard_failure = True
     if stall_lines:
         lines += ["", "### Детектор простоя (#201)", *stall_lines]
 
@@ -1875,16 +1886,30 @@ def main() -> int:
     # очередь эта поломка не блокирует. Но fail loud: прогон обязан покраситься
     # ПОСЛЕ того, как отчёт уже сохранён, и эскалация уходит тем же каналом,
     # что предохранитель конвейера (#120), — не заводим третий канал сигнала.
-    if archive_hard_failure:
+    if archive_hard_failure or stall_hard_failure:
+        broken = []
+        if archive_hard_failure:
+            broken.append(
+                "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
+                "(возможность есть, но сломана — см. отчёт этого прогона orchestra выше). "
+                "Мерж не откатывается; сессия останется в списке активных до ручного "
+                "разбора или следующего успешного мержа той же задачи."
+            )
+        if stall_hard_failure:
+            broken.append(
+                "Детектор устойчивого простоя (#201) не отработал этот пульс "
+                "(см. отчёт выше) — заведение автозадачи по свежему отпечатку могло "
+                "не случиться, а известные автозадачи не получили новую улику."
+            )
         escalation = escalate(
             repo, WATCHDOG_ISSUE,
-            "🚨 edge-harness: [статус: архив сессии раннера сломан]\n"
-            "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
-            "(возможность есть, но сломана — см. отчёт этого прогона orchestra выше). "
-            "Мерж не откатывается; сессия останется в списке активных до ручного "
-            "разбора или следующего успешного мержа той же задачи.",
+            "🚨 edge-harness: [статус: " + (
+                "архив сессии раннера сломан" if archive_hard_failure and not stall_hard_failure else
+                "детектор простоя сломан" if stall_hard_failure and not archive_hard_failure else
+                "архив сессии раннера и детектор простоя сломаны"
+            ) + "]\n" + "\n".join(broken),
         )
-        lines.append(f"🚨 архив сессии раннера сломан — прогон окрашен красным ({escalation})")
+        lines.append(f"🚨 прогон окрашен красным ({escalation})")
         summary(lines)
         return 1
 
