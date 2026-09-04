@@ -756,6 +756,11 @@ def test_mark_conflicts_keeps_label_on_unknown_state_not_silent_wrong(monkeypatc
     assert not any(c.startswith(("-X POST", "-X PUT", "-X DELETE")) for c in fake.calls)
 
 
+def test_mark_conflicts_posts_label_and_comment_on_dirty_state(monkeypatch):
+    fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None}); patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, [pull(2, labels=[])])
+    assert any("issues/2/labels" in c and "conflict" in c for c in fake.mutating_calls()) and any("issues/2/comments" in c for c in fake.mutating_calls()) and any("помечен" in line and "conflict" in line for line in lines)
+
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 
