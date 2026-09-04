@@ -186,5 +186,14 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   `dsh-host-apiproxy`, `dsh-session-title*` 0.1.1-rc.2 (types и lib).
 - `apps/dsh-edge/src/{index,instance,session-store,http,auth,edge-api}.ts`
   на пине 113a969; `standalone/patches/audit.json`.
-- Дизайн `openspec/changes/task-rework-loop/design.md` раздел 3 (Развилка),
-  п. (а) и (б) о памяти раннера vs облака.
+- Память раннера vs облака — два разных, не смёрженных на момент написания
+  change (проверить актуальность ссылок при их archive): `openspec/changes/
+  task-rework-loop/design.md` раздел 3 (Развилка), п. (а) — почему
+  резюме DSH-агента недоступно (сериализуется только сессионный лог на
+  диске раннера, раннер эфемерный, ветка `agent/256-task-rework-loop`, PR
+  #260, не смёржено на момент написания); `openspec/changes/
+  cloud-orchestrator-convergence/design.md` раздел "Развилка 1", условие
+  пересмотра A→C — почему память НЕ требует денег (dsh-edge хранит историю
+  сессий в Durable Object с SQLite уже сегодня, бесплатно, ветка
+  `agent/258-cloud-orchestrator-convergence`, PR #262, не смёржено на
+  момент написания).
