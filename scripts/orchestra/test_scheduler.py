@@ -325,6 +325,17 @@ class FakeGh:
 REPO = "mytab0r/edge-harness"
 
 
+@pytest.fixture(autouse=True)
+def _reset_update_branch_budget():
+    """Слот update_branch (#252, третий заход) — module-level и общий на
+    прогон планировщика; без явного сброса перед каждым тестом состояние
+    "слот уже занят" утекало бы из одного теста в следующий в том же
+    процессе pytest."""
+    sch.reset_update_branch_budget()
+    yield
+    sch.reset_update_branch_budget()
+
+
 # ── reap_stale (#61): просрочённое назначение без PR возвращается в пул ──────────
 
 
@@ -683,6 +694,37 @@ def test_update_remaining_pulls_skip_is_not_silent(monkeypatch):
     assert "#4" in lines[0] and "не подтянут" in lines[0]
 
 
+def test_update_remaining_pulls_failed_attempt_does_not_consume_slot(monkeypatch):
+    # Находка AI-ревью PR #288: докстринг update_branch обещает "слот
+    # занимается только УСПЕХОМ" — это держится на честном слове, если слот
+    # можно пометить занятым ДО вызова gh (мутация: `pulled = True`/
+    # `_update_branch_used_this_run = True` раньше настоящего push'а). Первый
+    # кандидат падает (не найдя настоящей ошибки — используем боевой
+    # update_branch, не заглушку), второй ОБЯЗАН получить попытку тем же
+    # прогоном: неудача не должна расходовать общий слот.
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),  # упадёт при update-branch
+        pull(3, labels=["conflict"]),             # обязан получить попытку следом
+    ]
+    fake = FakeGh({
+        "pulls/2/update-branch": RuntimeError("422 Merge conflict"),
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "обе попытки обязаны произойти — неудача не занимает слот"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+    failed_lines = [line for line in lines if "не обновлён" in line]
+    updated_lines = [line for line in lines if line.startswith("🔄")]
+    assert len(failed_lines) == 1 and "#2" in failed_lines[0]
+    assert len(updated_lines) == 1 and "#3" in updated_lines[0]
+
+
 def test_update_remaining_pulls_reports_conflict_loudly_not_silently(monkeypatch):
     others = [pull(2, labels=["conflict"])]  # конфликт проходит предикат — попытка будет
 
@@ -742,6 +784,35 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
 
     assert not hard_failure
     assert any("pulls/2/update-branch" in c for c in fake.calls)
+
+
+def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
+    # Находка AI-ревью PR #288 (главная): раньше дисциплина "максимум один
+    # успешно подтянутый за прогон" жила только внутри update_remaining_pulls
+    # — сама behind-ветка merge_queue могла подтянуть НЕСКОЛЬКО behind-PR за
+    # один свой проход по списку `pulls`, ничем не ограниченная. Два behind-PR
+    # с обоими зелёными вердиктами в одном вызове merge_queue обязаны дать
+    # РОВНО один update-branch, второй — отдельную строку "слот занят".
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "два behind-PR за один прогон не должны дать два update-branch"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("слот update_branch" in line and "#3" in line for line in lines)
 
 
 # Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
