@@ -400,15 +400,18 @@ def pr_check_runs(repo: str, pull: dict) -> list[dict]:
 
 
 def bad_check_names(runs: list[dict]) -> list[str]:
-    """Имена красных (не success/skipped/neutral) среди уже полученных
-    check-run'ов. Пустой список runs даёт пустой список здесь — это НЕ
-    «красных нет», а «проверки ещё не заведены»; вызывающий код обязан
-    проверять пустоту runs отдельно (см. pr_is_merge_ready)."""
+    """Одно место правды (находка AI-ревью PR #253) для критерия «красного
+    обязательного чека»: раньше `conclusion not in (success, skipped, neutral)`
+    было продублировано трижды (pr_bad_checks, merge_queue, script_evidence) —
+    расхождение критерия в одной из копий при правке двух других осталось бы
+    незамеченным. Все три места зовут эту функцию. Пустой список runs даёт
+    пустой список здесь — это НЕ «красных нет», а «проверки ещё не заведены»;
+    вызывающий код обязан проверять пустоту runs отдельно (см. pr_is_merge_ready)."""
     return [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
 
 
 def pr_bad_checks(repo: str, pull: dict) -> list[str]:
-    """Имена красных (не success/skipped/neutral) check-run'ов текущего head.
+    """Имена красных check-run'ов текущего head (см. bad_check_names).
     Один и тот же критерий «красного обязательного чека», что и внутри
     merge_queue (гейт слияния) — но отдельный вызов: unhealthy_pulls (#196,
     поведение 2) читает состояние ДО очереди слияния и по другому набору PR
@@ -468,7 +471,7 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
         if not runs:
             skipped.append(f"#{pull['number']} — проверки ещё не заведены")
             continue
-        bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+        bad = bad_check_names(runs)
         if bad:
             skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad)}")
             continue
@@ -1123,7 +1126,6 @@ ACCEPT_DOCS = "docs"
 
 CF_WORKER_PREFIX = "cf-worker/"
 DOC_PATH_PREFIXES = ("docs/", "openspec/")
-DOC_PATH_NAMES = {"AGENTS.md", "CLAUDE.md"}
 
 ACCEPTANCE_OK_MARKER = "[приёмка: улика]"
 ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
@@ -1139,7 +1141,10 @@ DSH_EDGE_HEALTH_TIMEOUT = 15
 
 
 def _is_doc_path(path: str) -> bool:
-    return path.endswith(".md") or path.startswith(DOC_PATH_PREFIXES) or path in DOC_PATH_NAMES
+    # AGENTS.md/CLAUDE.md отдельно не перечисляются: любое имя на .md уже
+    # ловится первым условием (находка AI-ревью PR #253 — было мёртвое
+    # множество DOC_PATH_NAMES, недостижимое по той же причине).
+    return path.endswith(".md") or path.startswith(DOC_PATH_PREFIXES)
 
 
 def classify_acceptance(filenames: list[str]) -> str:
@@ -1215,11 +1220,22 @@ def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None
                          f"(канарейка UI — последний шаг этого джоба) — {candidate['html_url']}")
     if not DSH_EDGE_URL:
         raise RuntimeError("DSH_EDGE_URL не задан — /api/health не проверить")
+    # Класс #225 (найдено повторно в разборе AI-ревью PR #253): /api/health
+    # публичный (не нужен логин), но всё равно идёт ЧЕРЕЗ МОРДУ Cloudflare —
+    # запрос обязан нести явный User-Agent тем же _morde_opener(), которым
+    # ходят _morde_login/_morde_rpc, иначе дефолтный `Python-urllib/3.x`
+    # получает 403 error code:1010 ДО приложения (доказано живым запросом),
+    # и deploy-класс приёмки не закрывается НИКОГДА.
     req = urllib.request.Request(DSH_EDGE_URL.rstrip("/") + "/api/health")
     try:
-        with urllib.request.urlopen(req, timeout=DSH_EDGE_HEALTH_TIMEOUT) as resp:
+        opener = _morde_opener()
+        with opener.open(req, timeout=DSH_EDGE_HEALTH_TIMEOUT) as resp:
             status = resp.status
-    except urllib.error.URLError as error:
+    except (urllib.error.URLError, OSError) as error:
+        # OSError — не только сетевые ошибки: socket.timeout (= TimeoutError с
+        # 3.10) при чтении ответа НЕ оборачивается urllib в URLError и раньше
+        # пробивал бы голый except RuntimeError вызывающего accept_merged_tasks
+        # (находка AI-ревью PR #253, тот же приём, что уже в archive_runner_sessions).
         raise RuntimeError(f"/api/health недоступен: {error}") from error
     if status != 200:
         return "fail", f"деплой зелёный ({candidate['html_url']}), но /api/health вернул {status}"
@@ -1228,12 +1244,12 @@ def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None
 
 def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
     """('ok'|'fail'|'pending', детали) — тот же критерий красного обязательного
-    чека, что уже применяет pr_bad_checks/merge_queue."""
+    чека, что уже применяет pr_bad_checks/merge_queue (см. bad_check_names)."""
     payload = gh(f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100") or {}
     runs = payload.get("check_runs", [])
     if not runs:
         return "pending", "проверки PR на head sha ещё не найдены"
-    bad = [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+    bad = bad_check_names(runs)
     if bad:
         return "fail", f"красные проверки: {', '.join(bad)}"
     return "ok", f"{len(runs)} проверок PR зелёные (прогон с выводом)"

@@ -26,6 +26,7 @@ issues/comments), снятые живым запросом `gh api` по это�
 
 import http.server
 import importlib.util
+import socket
 import subprocess
 import sys
 import threading
@@ -1642,6 +1643,146 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
     assert any("закрыта приёмкой" in line and "#21" in line for line in lines)
     assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/21") for call in fake.calls)
     assert posted and "улика получена" in posted[0][1]
+
+
+# ── /api/health: находки AI-ревью PR #253 (403 без явного UA, таймаут не громкий) ─
+
+
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    """Тот же приём, что и _LoginHandler (класс #225): воспроизводим фильтр
+    Cloudflare перед мордой по подписи клиента на настоящем сокете, а не наш
+    пересказ — библиотечный User-Agent режется 403'м ДО логики приложения."""
+
+    def do_GET(self):
+        user_agent = self.headers.get("User-Agent", "")
+        if user_agent.startswith("Python-urllib"):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"error code: 1010")
+            return
+        if self.path == "/api/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"version":"0.8.0"}')
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *a):  # тише pytest-вывод
+        pass
+
+
+@pytest.fixture()
+def health_server():
+    server = http.server.HTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+def _green_deploy_gh():
+    return FakeGh({
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z",
+             "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/1"},
+        ]},
+    })
+
+
+def test_deploy_evidence_health_request_carries_explicit_user_agent_past_cf_filter(
+    health_server, monkeypatch,
+):
+    """Находка 1 AI-ревью PR #253: /api/health ходил голым urllib.request без
+    UA и получал 403 error code:1010 на живой морде РАНЬШЕ приложения — этот
+    тест бьёт по настоящему сокету (не по моку urlopen, который слеп к
+    заголовкам) тем же хендлером, что режет Cloudflare. До фикса (запрос без
+    _morde_opener) он красный: deploy_evidence вместо 'ok' поднимает
+    RuntimeError, потому что 403 конвертируется в него же."""
+    port = health_server.server_address[1]
+    monkeypatch.setattr(sch, "gh", _green_deploy_gh())
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
+
+    state, detail = sch.deploy_evidence(REPO, utc(2026, 9, 2, 23, 30, 0), None)
+
+    assert state == "ok"
+    assert "/api/health=200" in detail
+
+
+@pytest.fixture()
+def hanging_health_server():
+    """Настоящий сокет, который принимает TCP-соединение и молчит — читающая
+    сторона получает не connection-refused (это urllib оборачивает в URLError
+    сам, до чтения ответа), а socket.timeout ИМЕННО на чтении ответа, тот же
+    момент, где сидит находка 2 AI-ревью PR #253."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_loop():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+                conn  # соединение принято и намеренно не закрыто/не отвечено
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    thread = threading.Thread(target=accept_loop, daemon=True)
+    thread.start()
+    yield port
+    stop.set()
+    srv.close()
+    thread.join(timeout=2)
+
+
+def test_deploy_evidence_health_timeout_is_wrapped_into_runtime_error(hanging_health_server, monkeypatch):
+    """Находка 2 AI-ревью PR #253: socket.timeout (= TimeoutError, не подкласс
+    URLError) при чтении /api/health раньше пробивал `except urllib.error.URLError`
+    и улетал как есть — тогда per-item `except RuntimeError` в
+    accept_merged_tasks его не ловил и ронял весь прогон приёмки (без summary,
+    без остальных задач, без очереди слияний). Докстринг deploy_evidence
+    обещает RuntimeError на инфраструктурный сбой — таймаут обязан стать им же.
+    До фикса (только `except urllib.error.URLError`) этот тест красный: наружу
+    улетает голый socket.timeout, а не RuntimeError."""
+    monkeypatch.setattr(sch, "gh", _green_deploy_gh())
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{hanging_health_server}")
+    monkeypatch.setattr(sch, "DSH_EDGE_HEALTH_TIMEOUT", 0.5)
+
+    with pytest.raises(RuntimeError, match="/api/health недоступен"):
+        sch.deploy_evidence(REPO, utc(2026, 9, 2, 23, 30, 0), None)
+
+
+def test_accept_merged_tasks_health_timeout_is_hard_failure_not_a_crash(hanging_health_server, monkeypatch):
+    """Тот же таймаут на уровне интеграции: приёмка не должна уронить весь
+    прогон (что случилось бы, утеки socket.timeout из deploy_evidence как
+    есть) — она обязана превратить его в жёсткий сбой с эскалацией, как и
+    любую другую сломанную возможность, и продолжить обход остальных задач."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        **_green_deploy_gh().routes,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{hanging_health_server}")
+    monkeypatch.setattr(sch, "DSH_EDGE_HEALTH_TIMEOUT", 0.5)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
+
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+
+    assert hard_failure is True
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
 
 
 def test_accept_merged_tasks_does_not_close_on_red_deploy(monkeypatch):
