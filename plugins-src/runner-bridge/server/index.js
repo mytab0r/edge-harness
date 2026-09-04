@@ -310,7 +310,9 @@ function defineRunnerStatusTool() {
   })
 }
 
-/** Ссылки на задачу в открытых PR (первая строка тела — `#N`) и их состояния. */
+/** Ссылки на задачу в открытых PR (timeline cross-references — любое
+ * упоминание `#N`, украшение статуса, не декларация; узкое правило
+ * объявлений — `scripts/lib/task_ref.py::declared_tasks`) и их состояния. */
 async function collectPullRequests(repo, token, exec, issueNumber) {
   let refs
   try {
