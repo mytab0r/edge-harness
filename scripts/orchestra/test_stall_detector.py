@@ -147,7 +147,10 @@ def _issue(number, body, created_at="2026-09-01T00:00:00Z", labels=("task", "aut
 
 def test_detect_and_act_comments_existing_task_instead_of_creating_second(monkeypatch):
     existing = _issue(300, "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное")
-    fake = FakeGh({"issues?state=open&labels=auto-detected": [existing]})
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [existing],
+        "issues/300/comments": [],  # эта улика ещё не комментировалась
+    })
     patch_gh(monkeypatch, fake)
     commented = []
     monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
@@ -161,6 +164,65 @@ def test_detect_and_act_comments_existing_task_instead_of_creating_second(monkey
     assert commented[0][0] == 300
     assert "gate:pipeline-paused" in commented[0][1]
     assert any("#300" in line for line in result)
+
+
+def test_detect_and_act_same_evidence_twice_posts_one_comment(monkeypatch):
+    """Находка AI-ревью PR #248: хронический простой (та же улика на каждом
+    пульсе) не должен плодить комментарий-дубликат — до 96/сутки при
+    интервале 15 мин, и настоящая новая улика тонет в потоке повторов.
+    Первый вызов detect_and_act пишет комментарий с маркером улики; второй
+    вызов с ТОЙ ЖЕ уликой находит свой же маркер в списке комментариев
+    (эмулируется добавлением его в фикстуру между вызовами) и молчит."""
+    existing = _issue(300, "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное")
+    comments: list[dict] = []
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [existing],
+        "issues/300/comments": comments,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+
+    def record(repo, n, text):
+        posted.append((n, text))
+        comments.append({"created_at": "2026-09-03T11:00:00Z", "body": text})
+    monkeypatch.setattr(sd, "post_issue_comment", record)
+    monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("дубликат по отпечатку"))
+
+    result_1 = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    result_2 = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])  # та же улика опять
+
+    assert len(posted) == 1  # ровно один комментарий на два подряд одинаковых пульса
+    assert any("новая улика" in line for line in result_1)
+    assert any("не изменилась" in line for line in result_2)
+
+
+def test_detect_and_act_changed_evidence_posts_second_comment(monkeypatch):
+    """Зеркало предыдущего теста: улика ИЗМЕНИЛАСЬ (другой run_url в строке
+    отчёта того же отпечатка) — второй комментарий обязан уйти, дедупликация
+    не должна глушить настоящую новую информацию."""
+    existing = _issue(300, "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное")
+    comments: list[dict] = []
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [existing],
+        "issues/300/comments": comments,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+
+    def record(repo, n, text):
+        posted.append((n, text))
+        comments.append({"created_at": "2026-09-03T11:00:00Z", "body": text})
+    monkeypatch.setattr(sd, "post_issue_comment", record)
+    monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("дубликат по отпечатку"))
+
+    other_pause_line = (
+        "🚨 конвейер на паузе: 4 красных прогонов worker.yml подряд — "
+        "диспатч остановлен (уже оповещено, см. #120)"
+    )
+    sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    sd.detect_and_act(REPO, NOW, [other_pause_line])  # тот же отпечаток, другая улика
+
+    assert len(posted) == 2
 
 
 # ── Устойчивость: задача заводится не раньше порога ────────────────────────

@@ -50,6 +50,11 @@ GitHub заново и не трогает scheduler.py дальше одной 
      `find_open_task` ищет среди ОТКРЫТЫХ задач с меткой `auto-detected`
      машиночитаемую строку `Отпечаток: `<fp>`` в теле. Нашли — комментарий с
      новой уликой, новая задача не создаётся НИКОГДА при живом дубликате.
+     Комментарий пишется, только если улика ИЗМЕНИЛАСЬ: тот же приём, что
+     ESCALATION_MARKER (issue_marker_times по маркеру с хэшем улики) — иначе
+     хронический простой того же отпечатка пишет одинаковый комментарий
+     каждый пульс (до 96 в сутки при интервале 15 мин), и новая улика тонет
+     в потоке повторов (находка AI-ревью PR #248).
   2. Устойчивость — отпечаток обязан продержаться STALL_PERSIST_MINUTES:
      первое наблюдение только оставляет след-маркер в WATCHDOG_ISSUE
      (переиспользуем канал pulse_guard, тот же приём, что PAUSE_MARKER),
@@ -89,6 +94,7 @@ pulse_guard.py, как и были, — сюда не дублируются, а
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import NamedTuple
@@ -207,6 +213,16 @@ def group_by_fingerprint(signals: list[Signal]) -> dict[str, list[str]]:
 
 def _fingerprint_line(fingerprint: str) -> str:
     return f"Отпечаток: `{fingerprint}`"
+
+
+def _evidence_marker(fingerprint: str, evidence_text: str) -> str:
+    """Маркер конкретной улики для уже открытой задачи — тот же приём, что
+    ESCALATION_MARKER (issue_marker_times по маркеру в теле комментария).
+    Хэш улики (не сама улика: маркер должен остаться коротким и стабильным)
+    отличает «та же улика опять» от «улика изменилась» — комментарий с
+    новой уликой пишется только во втором случае (см. предохранитель 1)."""
+    digest = hashlib.sha256(evidence_text.encode("utf-8")).hexdigest()[:12]
+    return f"[симптом-улика: {fingerprint}:{digest}]"
 
 
 def open_auto_tasks(repo: str) -> list[dict]:
@@ -338,9 +354,16 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
     for fingerprint, evidence in grouped.items():
         existing = find_open_task(repo, fingerprint, open_auto)
         if existing:
+            evidence_text = evidence[-1]
+            marker = _evidence_marker(fingerprint, evidence_text)
+            if issue_marker_times(repo, existing["number"], marker):
+                # Та же улика уже прокомментирована — повтор не пишем (класс
+                # находки AI-ревью PR #248: хронический простой не спамит).
+                report.append(f"📎 #{existing['number']}: улика по {fingerprint} не изменилась — молчу")
+                continue
             post_issue_comment(
                 repo, existing["number"],
-                f"Новая улика по тому же отпечатку `{fingerprint}`:\n\n`{evidence[-1]}`"
+                f"{marker}\nНовая улика по тому же отпечатку `{fingerprint}`:\n\n`{evidence_text}`"
                 + (f"\n\nПрогон: {run_url}" if run_url else ""),
             )
             report.append(f"📎 #{existing['number']}: новая улика по {fingerprint} (задача уже открыта)")
