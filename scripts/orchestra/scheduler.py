@@ -38,8 +38,12 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
           (счётчик — маркер в комментариях PR, переживает перезапуск).
        b. Красный обязательный чек или ai:changes-requested дольше порога —
           назначение снимается, задача возвращается в пул, PR не закрывается.
-       c. После слияния — gh pr update-branch для остальных открытых PR;
-          конфликт (DIRTY) не молчит: строка в отчёте + метка conflict.
+       c. После слияния — gh pr update-branch для остальных открытых PR,
+          но выборочно (#252, review_labels.should_update_branch): только
+          близкие к слиянию (оба вердикта зелёные) или уже в конфликте —
+          подтягивание синхронизирует pr-review.yml/ai-review.yml и снимает
+          валидный ai:*-вердикт без пользы для PR, которому рано сливаться.
+          Конфликт (DIRTY) не молчит: строка в отчёте + метка conflict.
      Пороги — AI_REVIEW_RETRY_AFTER_MINUTES / AI_REVIEW_MAX_ATTEMPTS /
      UNHEALTHY_PR_AFTER_MINUTES в pulse_guard.py, рядом с остальными порогами
      предохранителя (одно место правды).
@@ -113,7 +117,9 @@ _tr_spec.loader.exec_module(task_ref)
 STALE_HOURS = 24
 ONE_MERGE_PER_RUN = True
 TASK_LABEL = "task"
-CONFLICT_LABEL = "conflict"
+# Одно место правды — review_labels.py (см. should_update_branch там же,
+# #252): раньше здесь была вторая локальная константа "conflict".
+CONFLICT_LABEL = review_labels.CONFLICT_LABEL
 # Эскалация playbook (task.sh: `gh issue edit $number --add-label blocked`) —
 # «нужен владелец», назначение при этом намеренно остаётся. reap_stale и
 # unhealthy_pulls обязаны пропускать такую задачу: иначе снятие исполнителя
@@ -203,9 +209,16 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
         # mergeable_state живёт только на endpoint'е одиночного PR: в списке он
         # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
-        if single.get("mergeable_state") != "dirty":
-            continue
+        state = single.get("mergeable_state")
         labels = {label["name"] for label in pull["labels"]}
+        if state != "dirty":
+            # Газ (#270): раньше метка не снималась никогда. Снимаем только по
+            # явно неконфликтным состояниям (review_labels.CONFLICT_CLEAR_STATES);
+            # None/"unknown" не в счёт — «не знаю» не значит «нет конфликта».
+            if CONFLICT_LABEL in labels and state in review_labels.CONFLICT_CLEAR_STATES:
+                gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+                lines.append(f"✅ PR #{pull['number']}: метка `conflict` снята (mergeable_state={state})")
+            continue
         if CONFLICT_LABEL in labels:
             continue
         gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
@@ -262,7 +275,16 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
         state = single.get("mergeable_state")
         if state == "behind":
-            # Ветка отстала от main — обновляем серверно (см. update_branch).
+            # Ветка отстала от main — обновляем серверно (см. update_branch),
+            # но только выборочно (#252, review_labels.should_update_branch):
+            # PR без обоих вердиктов/в доработке подтягивать невыгодно — см.
+            # докстринг предиката, он же газ к этому тормозу.
+            if not review_labels.should_update_branch(pull["labels"]):
+                skipped.append(
+                    f"#{pull['number']} — behind main, но не близок к слиянию и не в конфликте, "
+                    "подтягивание пропущено (#252)"
+                )
+                continue
             update_branch(repo, pull["number"])
             skipped.append(f"#{pull['number']} — обновлена из main, проверки пойдут заново")
             continue
@@ -502,10 +524,23 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     остаток BEHIND main. gh pr update-branch для остальных открытых PR;
     конфликт (DIRTY после обновления не поможет — GitHub решит это при
     следующем пересчёте mergeable_state) не молчит: строка в отчёте, а
-    mark_conflicts следующего прохода подхватит метку conflict."""
+    mark_conflicts следующего прохода подхватит метку conflict.
+
+    Выборочно, не для всех (#252, review_labels.should_update_branch — одно
+    место правды): подтягивание — это push в чужую ветку, синхронизирует
+    pr-review.yml и снимает валидные ai:*-метки без всякой пользы для PR,
+    которому рано сливаться. Кандидат подтягивается, только если он реально
+    близок к слиянию (оба вердикта зелёные) или уже в конфликте (подтягивание
+    может его расшить)."""
     lines = []
     for other in other_pulls:
         if other["number"] == merged_number or other.get("draft"):
+            continue
+        if not review_labels.should_update_branch(other["labels"]):
+            lines.append(
+                f"⏸️ PR #{other['number']} не подтянут из main после слияния #{merged_number} "
+                "— не близок к слиянию и не в конфликте (#252)"
+            )
             continue
         try:
             update_branch(repo, other["number"])

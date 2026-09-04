@@ -617,11 +617,22 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
         sch.gh = orig_gh
 
 
-# ── Поведение 3: после слияния — подтянуть остальных ─────────────────────────────
+# ── Поведение 3: после слияния — подтянуть остальных, но выборочно (#252) ────────
+# Раньше update_remaining_pulls дёргал update-branch для ВСЕХ открытых недрафт
+# PR — каждый такой push синхронизирует pr-review.yml и снимает валидные
+# ai:*-метки (замер #252: 142 прогона ai-review.yml за 14.5 ч). Предикат
+# review_labels.should_update_branch — одно место правды, что подтягивать
+# стоит: оба вердикта зелёные (близок к слиянию) или конфликт (подтягивание
+# может его расшить).
 
 
-def test_update_remaining_pulls_updates_all_open_others(monkeypatch):
-    others = [pull(2), pull(3), pull(4, draft=True)]
+def test_update_remaining_pulls_updates_only_close_to_merge_or_conflict(monkeypatch):
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть
+        pull(3, labels=["conflict"]),                     # конфликт — подтянуть
+        pull(4, labels=["review:ok"]),                     # нет ai:ok — не трогать
+        pull(5, labels=["review:ok", "ai:changes-requested"]),  # доработка — не трогать
+    ]
     fake = FakeGh({
         "pulls/2/update-branch": None,
         "pulls/3/update-branch": None,
@@ -632,14 +643,40 @@ def test_update_remaining_pulls_updates_all_open_others(monkeypatch):
     lines = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 2  # #4 — draft, пропущен; #1 — сам слитый, не в others
-    assert any("2" in c for c in update_calls) and any("3" in c for c in update_calls)
-    assert len(lines) == 2
-    assert all("обновлён из main" in line for line in lines)
+    assert len(update_calls) == 2
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+    updated_lines = [line for line in lines if "обновлён из main" in line]
+    skipped_lines = [line for line in lines if "не подтянут" in line]
+    assert len(updated_lines) == 2
+    assert len(skipped_lines) == 2
+    assert any("#4" in line for line in skipped_lines)
+    assert any("#5" in line for line in skipped_lines)
+
+
+def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
+    # Драфт отсеивается раньше should_update_branch — даже с зелёными
+    # вердиктами его не трогаем (см. merge_queue: драфт не сливается никогда).
+    others = [pull(4, draft=True, labels=["review:ok", "ai:ok"])]
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    lines = sch.update_remaining_pulls(REPO, 1, others)
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_update_remaining_pulls_skip_is_not_silent(monkeypatch):
+    others = [pull(4, labels=["review:ok"])]  # нет ai:ok — не близок к слиянию
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    lines = sch.update_remaining_pulls(REPO, 1, others)
+    assert fake.calls == []  # update-branch не вызван вовсе — газ не тратим впустую
+    assert len(lines) == 1
+    assert "#4" in lines[0] and "не подтянут" in lines[0]
 
 
 def test_update_remaining_pulls_reports_conflict_loudly_not_silently(monkeypatch):
-    others = [pull(2)]
+    others = [pull(2, labels=["conflict"])]  # конфликт проходит предикат — попытка будет
 
     def broken(repo, n):
         raise RuntimeError("422 Merge conflict")
@@ -658,6 +695,71 @@ def test_update_remaining_pulls_excludes_just_merged_and_empty_is_noop(monkeypat
     assert lines == []
     assert fake.calls == []
 
+
+# ── Тот же предикат — behind-ветка merge_queue (#252, пункт 3 задачи) ────────────
+
+
+def test_merge_queue_behind_not_close_to_merge_skips_without_update(monkeypatch):
+    pulls = [pull(2, labels=["review:ok"])]  # нет ai:ok — не близок к слиянию
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
+    patch_gh(monkeypatch, fake)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert not any("update-branch" in c for c in fake.calls)
+    assert any("не близок к слиянию" in line for line in lines)
+
+
+def test_merge_queue_behind_close_to_merge_updates(monkeypatch):
+    pulls = [pull(2, labels=["review:ok", "ai:ok"])]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert any("pulls/2/update-branch" in c for c in fake.calls)
+    assert any("обновлена из main" in line for line in lines)
+
+
+def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
+    pulls = [pull(2, labels=["conflict"])]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert any("pulls/2/update-branch" in c for c in fake.calls)
+
+
+# Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
+def test_mark_conflicts_clears_label_on_explicit_non_conflict_state(monkeypatch):
+    pulls = [pull(2, labels=["conflict"])]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "clean"}, "labels/conflict": None})
+    patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, pulls)
+    assert any(c.startswith("-X DELETE") and "labels/conflict" in c for c in fake.calls)
+    assert any("снята" in line for line in lines)
+    assert sch.review_labels.should_update_branch(set()) is False  # больше не газ
+
+
+def test_mark_conflicts_keeps_label_on_unknown_state_not_silent_wrong(monkeypatch):
+    pulls = [pull(2, labels=["conflict"])]  # mergeable_state ещё не вычислен (null)
+    fake = FakeGh({"pulls/2": {"mergeable_state": None}})
+    patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, pulls)
+    assert lines == []
+    assert not any(c.startswith(("-X POST", "-X PUT", "-X DELETE")) for c in fake.calls)
+
+
+def test_mark_conflicts_posts_label_and_comment_on_dirty_state(monkeypatch):
+    fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None}); patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, [pull(2, labels=[])])
+    assert any("issues/2/labels" in c and "conflict" in c for c in fake.mutating_calls()) and any("issues/2/comments" in c for c in fake.mutating_calls()) and any("помечен" in line and "conflict" in line for line in lines)
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 

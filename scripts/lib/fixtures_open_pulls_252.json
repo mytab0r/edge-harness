@@ -1,0 +1,332 @@
+[
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "B60205",
+        "description": "AI-ревью сломалось на инфраструктуре (модель/контракт ответа) — повтор workflow_dispatch",
+        "id": 12018193040,
+        "name": "ai:failed"
+      }
+    ],
+    "number": 263
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "B60205",
+        "description": "AI-ревью сломалось на инфраструктуре (модель/контракт ответа) — повтор workflow_dispatch",
+        "id": 12018193040,
+        "name": "ai:failed"
+      }
+    ],
+    "number": 262
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "B60205",
+        "description": "AI-ревью сломалось на инфраструктуре (модель/контракт ответа) — повтор workflow_dispatch",
+        "id": 12018193040,
+        "name": "ai:failed"
+      }
+    ],
+    "number": 261
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "B60205",
+        "description": "AI-ревью сломалось на инфраструктуре (модель/контракт ответа) — повтор workflow_dispatch",
+        "id": 12018193040,
+        "name": "ai:failed"
+      }
+    ],
+    "number": 260
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "B60205",
+        "description": "AI-ревью сломалось на инфраструктуре (модель/контракт ответа) — повтор workflow_dispatch",
+        "id": 12018193040,
+        "name": "ai:failed"
+      }
+    ],
+    "number": 253
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Размерный гейт принят после реального ревью",
+        "id": 12005776111,
+        "name": "review:large-ok"
+      }
+    ],
+    "number": 249
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "1D76DB",
+        "description": "Задача из пула",
+        "id": 11987726417,
+        "name": "task"
+      },
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      }
+    ],
+    "number": 248
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      }
+    ],
+    "number": 247
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Размерный гейт принят после реального ревью",
+        "id": 12005776111,
+        "name": "review:large-ok"
+      }
+    ],
+    "number": 241
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "D93F0B",
+        "description": "PR конфликтует с main",
+        "id": 11987726605,
+        "name": "conflict"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Размерный гейт принят после реального ревью",
+        "id": 12005776111,
+        "name": "review:large-ok"
+      },
+      {
+        "color": "D93F0B",
+        "description": "AI-ревью: есть находки, чинить до мержа (см. ревью-комментарий)",
+        "id": 12018192993,
+        "name": "ai:changes-requested"
+      }
+    ],
+    "number": 237
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "D93F0B",
+        "description": "PR конфликтует с main",
+        "id": 11987726605,
+        "name": "conflict"
+      },
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      }
+    ],
+    "number": 231
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "D93F0B",
+        "description": "PR конфликтует с main",
+        "id": 11987726605,
+        "name": "conflict"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "D93F0B",
+        "description": "AI-ревью: есть находки, чинить до мержа (см. ревью-комментарий)",
+        "id": 12018192993,
+        "name": "ai:changes-requested"
+      }
+    ],
+    "number": 230
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "ededed",
+        "description": null,
+        "id": 11993140047,
+        "name": "contract:failed"
+      }
+    ],
+    "number": 181
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      }
+    ],
+    "number": 173
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "F9D0C4",
+        "description": "Крупный дифф: нужен взгляд человека",
+        "id": 11988618306,
+        "name": "review:large"
+      }
+    ],
+    "number": 167
+  },
+  {
+    "draft": false,
+    "labels": [
+      {
+        "color": "D93F0B",
+        "description": "PR конфликтует с main",
+        "id": 11987726605,
+        "name": "conflict"
+      },
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "D93F0B",
+        "description": "AI-ревью: есть находки, чинить до мержа (см. ревью-комментарий)",
+        "id": 12018192993,
+        "name": "ai:changes-requested"
+      }
+    ],
+    "number": 162
+  },
+  {
+    "draft": true,
+    "labels": [
+      {
+        "color": "0E8A16",
+        "description": "Ревью пройдено, можно сливать",
+        "id": 11988618057,
+        "name": "review:ok"
+      },
+      {
+        "color": "D93F0B",
+        "description": "AI-ревью: есть находки, чинить до мержа (см. ревью-комментарий)",
+        "id": 12018192993,
+        "name": "ai:changes-requested"
+      }
+    ],
+    "number": 108
+  }
+]
