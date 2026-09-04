@@ -73,8 +73,8 @@ jobs:
         # нечем): она видна сверкой истории runs, см. замер schedule в доке.
         if: failure()
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py tick_failed
       - name: Цепочка — следующая ступень тика
         # Основной механизм каденции. always(): один сбой тика не роняет
@@ -83,8 +83,8 @@ jobs:
         # покрытие достигнуто, лимит дней или workflow не на main.
         if: always()
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py chain
 
   probe:
