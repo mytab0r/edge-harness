@@ -44,6 +44,10 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
           подтягивание синхронизирует pr-review.yml/ai-review.yml и снимает
           валидный ai:*-вердикт без пользы для PR, которому рано сливаться.
           Конфликт (DIRTY) не молчит: строка в отчёте + метка conflict.
+          И даже среди подходящих — не все разом (#252, второй заход):
+          максимум один УСПЕШНО подтянутый кандидат за вызов, остальные
+          получают строку и ждут следующего прогона — иначе подтягивание
+          первого кандидата может сбросить ai:ok второго тем же циклом.
      Пороги — AI_REVIEW_RETRY_AFTER_MINUTES / AI_REVIEW_MAX_ATTEMPTS /
      UNHEALTHY_PR_AFTER_MINUTES в pulse_guard.py, рядом с остальными порогами
      предохранителя (одно место правды).
@@ -203,6 +207,25 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     return lines
 
 
+def _set_conflict_label(repo: str, pull: dict, *, present: bool) -> None:
+    """Единственное место, которое меняет метку CONFLICT_LABEL сразу и на
+    сервере, и в переданном объекте `pull` — одним действием, а не двумя
+    независимыми (класс «устаревшая метка в памяти», найден 2026-09-04:
+    mark_conflicts снимала/ставила метку через gh, но `pull["labels"]`
+    оставался прежним, и тот же объект уходил дальше в merge_queue/
+    update_remaining_pulls, где review_labels.should_update_branch читал уже
+    неактуальное состояние). Вызывающий код не может забыть обновить
+    `pull["labels"]` отдельно — этой возможности здесь просто нет."""
+    labels = pull["labels"]
+    has = any(label["name"] == CONFLICT_LABEL for label in labels)
+    if present and not has:
+        gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
+        labels.append({"name": CONFLICT_LABEL})
+    elif not present and has:
+        gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+        pull["labels"] = [label for label in labels if label["name"] != CONFLICT_LABEL]
+
+
 def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
     lines = []
     for pull in pulls:
@@ -216,12 +239,12 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
             # явно неконфликтным состояниям (review_labels.CONFLICT_CLEAR_STATES);
             # None/"unknown" не в счёт — «не знаю» не значит «нет конфликта».
             if CONFLICT_LABEL in labels and state in review_labels.CONFLICT_CLEAR_STATES:
-                gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+                _set_conflict_label(repo, pull, present=False)
                 lines.append(f"✅ PR #{pull['number']}: метка `conflict` снята (mergeable_state={state})")
             continue
         if CONFLICT_LABEL in labels:
             continue
-        gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
+        _set_conflict_label(repo, pull, present=True)
         rivals = ", ".join(f"#{other['number']}" for other in pulls if other["number"] != pull["number"]) or "нет"
         gh(
             "-X", "POST", f"repos/{repo}/issues/{pull['number']}/comments",
@@ -531,8 +554,23 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     pr-review.yml и снимает валидные ai:*-метки без всякой пользы для PR,
     которому рано сливаться. Кандидат подтягивается, только если он реально
     близок к слиянию (оба вердикта зелёные) или уже в конфликте (подтягивание
-    может его расшить)."""
+    может его расшить).
+
+    Максимум один УСПЕШНО подтянутый кандидат за вызов (#252, второй заход):
+    подтягивание близких к слиянию PR меняет их head — и само может сбросить
+    их же `ai:ok` (pr-review.yml перезапускается на пуш и снимает ai:*-метки),
+    то есть тот кандидат, который секунду назад проходил предикат, после
+    первого же подтягивания может из него выпасть. Подтягивать сразу
+    нескольких — значит гонять этот цикл несколько раз за один прогон.
+    Та же дисциплина, что уже у merge_queue («ровно один PR за запуск»,
+    сериализация через возврат после первого действия). Слот считается
+    занятым только УСПЕХОМ: неудачная попытка (вероятный конфликт) не
+    трогает head, значит следующий кандидат в этом же вызове ничем не рискует.
+    Пропущенные из-за уже занятого слота кандидаты не молчат — они получают
+    отдельную строку с указанием, что подтянет их следующий прогон
+    оркестратора (тот же газ без состояния, что и у should_update_branch)."""
     lines = []
+    pulled = False
     for other in other_pulls:
         if other["number"] == merged_number or other.get("draft"):
             continue
@@ -542,9 +580,16 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
                 "— не близок к слиянию и не в конфликте (#252)"
             )
             continue
+        if pulled:
+            lines.append(
+                f"⏭️ PR #{other['number']} уже обновлён этим запуском — за раз подтягивается "
+                f"только один кандидат (#252); подтянет следующий прогон оркестратора"
+            )
+            continue
         try:
             update_branch(repo, other["number"])
             lines.append(f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}")
+            pulled = True
         except (RuntimeError, subprocess.CalledProcessError) as error:
             lines.append(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "

@@ -626,10 +626,15 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
 # может его расшить).
 
 
-def test_update_remaining_pulls_updates_only_close_to_merge_or_conflict(monkeypatch):
+def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
+    # Второй заход #252: даже среди прошедших предикат кандидатов подтягиваем
+    # РОВНО одного за вызов — подтягивание первого (push, меняет head) само
+    # способно сбросить ai:ok второго тем же циклом, который эта задача и
+    # закрывает. Порядок и предикат не меняются: #2 и #3 оба проходят
+    # should_update_branch, подтянут только первый по порядку — #2.
     others = [
-        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть
-        pull(3, labels=["conflict"]),                     # конфликт — подтянуть
+        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть первым
+        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат, но не в этом запуске
         pull(4, labels=["review:ok"]),                     # нет ai:ok — не трогать
         pull(5, labels=["review:ok", "ai:changes-requested"]),  # доработка — не трогать
     ]
@@ -643,15 +648,18 @@ def test_update_remaining_pulls_updates_only_close_to_merge_or_conflict(monkeypa
     lines = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 2
+    assert len(update_calls) == 1
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert any("pulls/3/update-branch" in c for c in update_calls)
+    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # слот уже занят #2
     updated_lines = [line for line in lines if "обновлён из main" in line]
-    skipped_lines = [line for line in lines if "не подтянут" in line]
-    assert len(updated_lines) == 2
-    assert len(skipped_lines) == 2
-    assert any("#4" in line for line in skipped_lines)
-    assert any("#5" in line for line in skipped_lines)
+    not_close_lines = [line for line in lines if "не подтянут" in line]
+    slot_taken_lines = [line for line in lines if "уже обновлён этим запуском" in line]
+    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
+    assert len(not_close_lines) == 2  # #4, #5 — не близки к слиянию
+    assert any("#4" in line for line in not_close_lines)
+    assert any("#5" in line for line in not_close_lines)
+    assert len(slot_taken_lines) == 1 and "#3" in slot_taken_lines[0]  # не молчит, назван следующий прогон
+    assert "следующий прогон" in slot_taken_lines[0]
 
 
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
@@ -760,6 +768,38 @@ def test_mark_conflicts_posts_label_and_comment_on_dirty_state(monkeypatch):
     fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None}); patch_gh(monkeypatch, fake)
     lines = sch.mark_conflicts(REPO, [pull(2, labels=[])])
     assert any("issues/2/labels" in c and "conflict" in c for c in fake.mutating_calls()) and any("issues/2/comments" in c for c in fake.mutating_calls()) and any("помечен" in line and "conflict" in line for line in lines)
+
+
+# ── Класс «устаревшая метка в памяти» (#252, второй заход) ───────────────────────
+# mark_conflicts снимала/ставила метку conflict через gh, но НЕ обновляла
+# pull["labels"] в переданном объекте — а main() передаёт тот же список pulls
+# дальше в merge_queue/update_remaining_pulls. should_update_branch там видел
+# метку, которую API уже удалил секундами раньше (лог 33904096031: слияние
+# #284 подтянуло #253/#248 без ai:ok только из-за протухшей `conflict`).
+# Мутация: закомментируй в _set_conflict_label обновление pull["labels"]
+# (оставь только gh-вызов) — оба теста ниже краснеют.
+
+
+def test_mark_conflicts_clear_syncs_pull_object_so_predicate_sees_it_now(monkeypatch):
+    p = pull(2, labels=["conflict"])
+    pulls = [p]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "clean"}, "labels/conflict": None})
+    patch_gh(monkeypatch, fake)
+    sch.mark_conflicts(REPO, pulls)
+    # Тот же объект p из того же списка pulls — как main() передаёт его дальше.
+    assert sch.review_labels.should_update_branch(p["labels"]) is False
+    assert not any(label["name"] == sch.CONFLICT_LABEL for label in p["labels"])
+
+
+def test_mark_conflicts_post_syncs_pull_object_so_predicate_sees_it_now(monkeypatch):
+    p = pull(2, labels=[])
+    pulls = [p]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "dirty"}, "issues/2/labels": None, "issues/2/comments": None})
+    patch_gh(monkeypatch, fake)
+    sch.mark_conflicts(REPO, pulls)
+    # should_update_branch должен теперь видеть свежепоставленную conflict —
+    # без синхронизации объект p её бы не содержал до следующего fetch.
+    assert sch.review_labels.should_update_branch(p["labels"]) is True
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
