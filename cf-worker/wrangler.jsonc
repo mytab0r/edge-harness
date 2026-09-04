@@ -37,7 +37,9 @@
   // workflow'ом deploy-worker из секретов репозитория):
   //   HANDS_TOKEN        — разделяемый секрет: job ходит Bearer'ом, браузер обменивает
   //                        его на сессионную куку (POST /api/session); в URL не ходит
-  //   GH_DISPATCH_TOKEN  — GitHub PAT с Contents:write, DO дёргает repository_dispatch
+  //   GH_DISPATCH_TOKEN  — узкий fine-grained GitHub PAT (Contents+Actions RW только
+  //                        на этот репозиторий, задача #6/ADR 0008): DO дёргает
+  //                        repository_dispatch задач и workflow_dispatch пульса
   //   SESSION_SECRET     — HMAC-ключ подписи сессионной куки браузера (issue #5);
   //                        вращение мгновенно разлогинивает все открытые сессии
 }

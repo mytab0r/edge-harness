@@ -51,7 +51,7 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
 
 Семь пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
 
-Уточнение при реализации #80 (пин `113a969` = release 0.7.1): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
+Уточнение при реализации #80 (пин `113a969` = release 0.7.1, поднят задачей #134 до `b9a8ddd` = release 0.8.0): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
 
 | Пакет | Что чинит |
 |---|---|
@@ -116,6 +116,20 @@ const backend = this.env.LOADER === undefined
 
 Уточнение 2026-08-29 (перепроверка при [белом пятне #43](https://github.com/mytab0r/edge-harness/issues/43)): ростер клиентских плагинов строится не из скана манифестов, а из **явного списка имён** в upstream-патчах — `assemble-standalone-web.mjs` читает `cordis.patch.yml` из опубликованных `@deepseek-ai/dsh-base` и `@deepseek-ai/dsh-web-app` (`deploymentPatches`, строки 25-28) и берёт оттуда строки `name:`. Пакет с `dsh.client`-декларацией, просто установленный в `standalone/node_modules`, в ростер не попадает.
 
+## Клиентская модульная система: boot, ModuleLoader, seed
+
+Снято с артефактов 0.7.1 (npm-префаб `dsh-edge-0.7.1.tgz` + продовый бандл `dsh-edge-client-ui`) 2026-08-30 при #102 — это контракт, на котором держится рукописный клиентский плагин (`plugins-src/plugin-manager`):
+
+- **Boot-граф** — `globalThis["__DSH_BOOT__"] = {rev, entries}` прямо в `index.html`. Запись: `{id: "<имя пакета>", url: "/plugins/<имя пакета>/client.js?rev=<sha1-12>", rev, inject?: string[], immediately?: bool}`. Каталог в `dist/plugins/` — имя пакета ЦЕЛИКОМ, со скоупом (`@edge-harness/...` — валидный путь).
+- **Бандл копируется дословно**: assemble берёт файл из `exports['./client']` (строка или `.default`) и кладёт в dist без пересборки. Значит, клиентский бандл обязан быть самодостаточным: всё, что не из перечисленного ниже, — throw при материализации.
+- **Ленивый CJS**: исполнение скрипта только регистрирует фабрику — `window.__ModuleLoader__.load({id: "<имя пакета>", factory: (require) => {…; return module.exports}})`; тело выполняется при первом require (материализация memoized). `require("<pkg>/client")` и `require("<pkg>")` — один модуль (`stripClientSuffix`).
+- **Seed-карта шелла** (`staticModules` в boot-скрипте `dsh-web-frontend`): `react`, `react/jsx-runtime`, `react-dom`, `react-dom/client`, `@deepseek-ai/cordis`, `@deepseek-ai/dsh-client-ui-slots`, `@deepseek-ai/dsh-client-ui-primitives` — доступны ЛЮБОМУ бандлу ростера без деклараций. Из примитивов экспортируются `Button`, `StateDot`, `Pill`, иконки, `writeClipboard` и пр.
+- **Разрешение require**: seed → memoized → строка графа (загрузить фабрики зависимостей, потом свою) → зарегистрированная фабрика → иначе throw. Порядок графа строит `orderByModuleGraph` по `inject`-записям, а assemble валидирует: inject из boot-записи обязан быть в ростере или в `shellStaticPackages` (только `dsh-client-ui-primitives`) — иначе сборка красная.
+- **Два разных `inject`**: `dsh.client.inject` в package.json — модули, загружаемые ДО пакета (сервисы готовы к `apply`); `exports.inject` из бандла — имена СЕРВИСОВ ctx (кордис-сервисы). Сервис `slots` ставит клиентский плагин `dsh-client-runtime`, `locale` — `dsh-client-locale`.
+- **Слот `settings.section`** — списочный, объявлен клиентским плагином `dsh-client-ui-settings-general`; навигация настроек читает `ctx.slots.entries("settings.section")` (нужны `id`, `order`, `label`), рендерит только активную секцию и передаёт ей `{close}` + `t` (переводчик ns из поля `locale` декларации) + inject-face. Образец монтажа — `ui-edge`: `ctx.slots.inject("settings.section", () => ctx.slots.register({name, id, order, label, locale}, Component))`.
+- **StateDot**: состояния `done`/`failed`/`error`/`warning` (CSS по `data-state`) и особый `ongoing` (анимированная матрица).
+- **`locale.register(ns, {<locale>: dict})`** не валидирует имена локалей — ключ словаря любой; каталог Language row ограничен en/zh.
+
 ## Подключение сторонних плагинов: механизма нет
 
 Следствие из устройства сборки (проверено по исходникам 2026-08-29):
@@ -158,12 +172,13 @@ const MAX_REPLAY_RESPONSE_BYTES = 1_048_576
 
 - **Нативные бинари, фоновые процессы, PTY, произвольное Linux-поведение — недоступны** (README:117). Это же заявлено модели в системном промпте: `agent.ts:8-12` — "The shell is just-bash, not Linux".
 - **Сеть из команд** — "no network command" в direct-режиме (README:201).
-- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184). Портирован только Web Search с 30-секундным таймаутом tool-call.
+- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184), верно на пине 0.7.1. Release 0.8.0 (бамп #134) добавил ограниченный `web_fetch` (bounded public fetching: запрет встроенных credentials, IP-литералов и local-скоупов, лимиты на длину URL/байты ответа/редиректы/время) — не проверялось живьём после бампа, факт из release notes апстрима. Портирован также Web Search с 30-секундным таймаутом tool-call — тот же лимит теперь общий для обоих инструментов.
 - **Не портированы**: filesystem editor tools, MCP, skills, workflows, jobs, **subagents** (README:125).
 - Нет HMR и локального boot-профиля (README:121); нет session-log export и локальных host-плагинов (README:26).
 - Нет регистрации, базы пользователей, ролей, мультитенантного роутинга (README:127) — жёстко один DO с именем `owner`, вход по одному высокоэнтропийному секрету воркера, обмениваемому на подписанную 30-дневную HttpOnly `SameSite=Strict` куку.
 - **Удаление сессии не выставлено** (README:295) — потому что upstream-сервис персистенции не определяет деструктивное удаление.
 - В direct-бэкенде **sync отключён полностью** — методы кидают `ENOSYS` (`direct-shell.ts:324`, `:336`); `getExec` всегда `ENOENT` (`direct-shell.ts:114-115`), то есть **переподключиться к запущенной команде нельзя**.
+- **Кнопки добавления/редактирования провайдера в Settings → Models неактивны.** UI-компоненты `CustomProviderCard` и `ProviderEditor` из upstream пакета `@deepseek-ai/dsh-client-ui-settings-models` исправны. Дело **не** в запрете записи: морда объявляет себя пишущим провайдером настроек явно — `do-settings-provider.ts:21`, `override readonly writable = true`. Корневая причина раздвоена и различается по типам кнопок. (1) **"Add"** (добавить провайдера из directory) отключена условием `disabled: addable.length === 0 || !state.writable` (`@deepseek-ai/dsh-client-ui-settings-models@0.0.1-rc.3`, `lib/client.js:2015`), где `addable = rows.filter(r => !r.configured && r.entry.settingsNs !== "")` (строка 1844). Единственный провайдер морды (`deepseek-official`) уже отмечен `configured=true`, поэтому список `addable` всегда пуст. (2) **"Add custom provider"** (`CustomProviderCard`) отключена условием `disabled: protocols.length === 0 || !state.writable` (строка 2029), где `protocols = protocolChoices(state.namespaces.get("llm-pi-ai"))` (строка 1847). Namespace `llm-pi-ai` не смонтирован в морде → `protocolChoices(undefined)` возвращает `[]` (`lib/client.js:488`) → кнопка недоступна независимо от `writable`. Практический вывод: `writable = true` — необходимое, но не достаточное условие для ни одной из двух кнопок. Когда компоненты всё же активны, пути записи разделяются: правка существующего провайдера (`ProviderEditor`) берёт settings-namespace **динамически** из ответа сервера (`const ns = namespace.ns` → `api.settings.mutate({ ns, ops })`, строки 1424, 1442-1446), namespace приходит из поля `settingsNs` directory-записи. Создание нового провайдера (`CustomProviderCard`) пишет в **жёстко зашитый** литерал `"llm-pi-ai"` (строка 1054). Практическое следствие: собственный settings-namespace работает с UI для правки существующего провайдера; чтобы ожила кнопка создания, серверу нужно смонтировать namespace ровно с именем `llm-pi-ai`, который можно реализовать без пакета `dsh-llm-pi-ai`. Фундаментальная причина: `session-store.ts:192-303` строит cordis-композицию с нуля и монтирует **только** адаптер `dshLlmDeepseek` (строка 243), без пакета `dsh-llm-pi-ai` (мультипровайдерный пул). Provider ID адаптера захардкожен как `deepseek-official`; settings namespace `llm-pi-ai` не существует, поэтому directory `llm.providers` содержит **ровно один** route — не пустой список, а список без выбора. Это осознанное решение апстрима: согласно заметке `.agents/notes/implemented/architecture/2026-08-22-dsh-edge-v0.4-multi-provider-vision.md` (раздел Excluded), пакет `dsh-llm-pi-ai` зависит от Node.js-only SDK'ов и превышал бы gzip-бюджет Worker'а. Смена провайдера — это ЗАМЕНА единственного слота через `vars` деплоя или Settings → baseURL, а не добавление второго параллельного. Решение по этому знанию ведётся в задаче #158. Пин апстрима: `dsh-edge/upstream.json` → `pawaca/dsh-edge@113a96913c51881993122afbf42e776882c4beb7` (release 0.7.1).
 
 Лимиты (README, раздел «Limits and request admission», строки ~305-317):
 
@@ -226,6 +241,11 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 
 ## Что не подтверждено
 
+- **поведение `layoutOf()` для namespace с именем, отличным от `llm-deepseek`/`llm-pi-ai`** (ветка `unknown`) — не проверено.
+- **точная схема Config, которую ожидают `protocolChoices`/`ModelListEditor`** побайтово — сверялась по типам, не по `lib/index.js` пакета `dsh-llm-pi-ai`.
+- **поведение дефолтных (не-abstract) методов `LlmAdapter`** (`providerInfo`/`listModels`/`resolveModel`) без переопределения — смотрелись только `.d.ts`.
+- **`node:`-импорты в `dsh-llm-deepseek`**: не измерено прогоном, полифиллятся ли они `nodejs_compat` при реальном вызове, или путь действительно мёртв благодаря `resolveFiles`.
+- **Кнопки добавления/редактирования провайдера** — живой ответ `llm.providers`/`llm.models` на проде не снят (нужна кука владельца). Собственного замера прироста gzip-бандла при добавлении `llm-pi-ai` в этом репозитории нет; цифра 900 KiB и вывод о превышении бюджета взяты из апстримной заметки.
 - **Доступность самих `@deepseek-ai/dsh-*` в публичном npm и их лицензия.** Вывод косвенный — из того, что `npx dsh-edge install` работает у сторонних пользователей. Но именно эта установка ничего не доказывает: она ставит предсобранный воркер и upstream-пакеты не резолвит вовсе (см. раздел про дистрибуцию). Прямой проверки `npm view @deepseek-ai/dsh-agent` не делалось.
 - Точное содержимое `.patch`-файлов (сейчас семь) не читалось — читался только `audit.json` с причинами и условиями снятия.
 - Заявления README о поведении (лимиты, отказ вместо усечения, 30-дневная кука) сверялись с текстом README и с константами в коде, но не прогоном живого деплоя.
@@ -254,5 +274,12 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 - `apps/dsh-edge/standalone/patches/audit.json` (+ семь `.patch`-файлов рядом)
 - `apps/dsh-edge/src/`: `instance.ts`, `direct-shell.ts`, `do-session-persistence.ts`, `session-store.ts`, `agent.ts`, `sse.ts`, `do-storage-backend.ts`, `edge-credentials.ts`, `do-settings-provider.ts`, `edge-attachment-store.ts`, `index.ts`, `edge-api.ts`
 - `apps/dsh-edge/scripts/wrangler-config-core.mjs`, `apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs`
+- `.agents/notes/implemented/architecture/2026-08-22-dsh-edge-v0.4-multi-provider-vision.md`
 - `.github/workflows/edge-ci.yml`
 - Issues #42, #43; PR #63
+- `@deepseek-ai/dsh-client-ui-settings-models@0.0.1-rc.3`, `lib/client.js`: строки 1844, 2015 (Add button), 1847, 2029 (Custom provider button), 488 (protocolChoices), 1424, 1442-1446 (ProviderEditor namespace), 1054 (CustomProviderCard namespace)
+- `@deepseek-ai/dsh-llm@0.1.1-rc.2`, `lib/types/index.d.ts`: регистрация адаптеров (строки 227-234), интерфейс LlmAdapter (строка 168), методы адаптера (174-192), providers (253)
+- `dsh-llm-deepseek`: DeepSeekAdapter (public export), provider ID (const уровня модуля), node-only импорты (node:crypto, node:fs/promises, node:path)
+- `edge-credentials.ts`: KV и env-fallback (строки 64-69, 107-109)
+- `client.js`: deriveKeyRef (строка 477), credentials API (1121-1124)
+- `session-store.ts`: cordis-композиция (192-303), dshLlmDeepseek монтирование (243), `resolveFiles` (session-store.ts:242)

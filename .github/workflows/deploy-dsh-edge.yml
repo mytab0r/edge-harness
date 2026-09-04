@@ -124,6 +124,25 @@ jobs:
             [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
             echo "$sha  plugins-tgz/$asset" >> checksums.txt
             echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
+            # Срезы правды, вшитые в релизный пакет, сверяются с репо (#115):
+            # иначе правка dsh-edge/integrations.json или plugins.json без
+            # пересборки и релиза даёт зелёный деплой, который синкует секреты
+            # и пишет статусы по новому реестру, а секция UI молча показывает
+            # старый состав. integrations.json — байт-в-байт; у manifest.json
+            # plugin-manager сверяется ростер id/server/client (sha самой
+            # записи в копии пакета отстаёт по принятой самореференции).
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/integrations.json$'; then
+              tar -xOf "plugins-tgz/$asset" package/integrations.json \
+                | diff -q - "$GITHUB_WORKSPACE/dsh-edge/integrations.json" >/dev/null \
+                || { echo "::error::Реестр интеграций в релизе $asset разошёлся с dsh-edge/integrations.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1; }
+            fi
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/manifest.json$'; then
+              if ! diff \
+                <(tar -xOf "plugins-tgz/$asset" package/manifest.json | jq -S '[.plugins[] | {id, server, client}]') \
+                <(jq -S '[.plugins[] | {id, server, client}]' "$GITHUB_WORKSPACE/dsh-edge/plugins.json") >/dev/null; then
+                echo "::error::Ростер манифеста в релизе $asset разошёлся с dsh-edge/plugins.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1
+              fi
+            fi
           done < plugins.tsv
           sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
 
@@ -169,6 +188,17 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         run: pnpm --dir clone/apps/dsh-edge/standalone run verify
 
+      # Шов раннеров (#119) обязан работать на СОБРАННОМ артефакте до деплоя:
+      # unstable_dev поднимает direct-воркер с настоящим DO SQLite и прогоняет
+      # путь раннера (батчи, перенумерация turn, 400 на чужой тип, «принято =
+      # сохранено», архив). Красный шаг — деплой не начинается: сломанный шов
+      # невыгодно ловить на живой морде. Ревью #128 (М2): драйвер закоммичен,
+      # проверка воспроизводима.
+      - name: Интеграция ingest-шва на собранном артефакте (#119)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
         run: |
@@ -203,6 +233,36 @@ jobs:
           echo "VERSION_DEPLOYED=$VERSION_DEPLOYED" >> "$GITHUB_ENV"
           echo "Готов деплой префаба dsh-edge $VERSION_DEPLOYED (манифест пуст)"
 
+      # SVG-носители бренда (#109): строковый ребренд (шаг «Бренд морды» ниже)
+      # не достаёт до векторных носителей — вордмарк «deepseek» нарисован путями
+      # внутри BrandWordmark, кит — FishLogo и favicon.svg. Все три слота бренда
+      # (sidebar.brand.mark, sidebar.brand.name, conversation.hero.brand.mark)
+      # заполняет клиентский пакет dsh-client-ui-brand-official, чей client.js
+      # лежит в dist статикой: query ?rev= статикой игнорируется (проверено
+      # живьём), так что замена = перезапись собранного файла нашим
+      # dsh-edge/brand-official.client.js — форма слотов и обёртки сохранена,
+      # меняется только отрисовка (текст «mytab0r» вместо кита и вордмарка).
+      # Гвардии: файл апстрима обязан существовать и содержать маркеры формы —
+      # иначе деплой падает громко, а не выкатывает молчу-чужой бренд.
+      - name: Бренд-плагин и favicon морды (SVG-носители)
+        working-directory: ${{ github.workspace }}/deploy
+        run: |
+          BRAND_DIR="dist/plugins/@deepseek-ai/dsh-client-ui-brand-official"
+          test -f "$BRAND_DIR/client.js" \
+            || { echo "::error::$BRAND_DIR/client.js не найден — upstream сменил состав ростера или путь сборки; патчить некуда"; exit 1; }
+          for marker in "dsh-client-ui-brand-official" "OfficialBrandName" "BrandWordmark"; do
+            grep -q "$marker" "$BRAND_DIR/client.js" \
+              || { echo "::error::В client.js brand-official нет маркера «$marker» — upstream сменил форму пакета, слепая замена опасна"; exit 1; }
+          done
+          cp "$GITHUB_WORKSPACE/dsh-edge/brand-official.client.js" "$BRAND_DIR/client.js"
+          node --check "$BRAND_DIR/client.js" \
+            || { echo "::error::Замещающий brand-official.client.js не валиден"; exit 1; }
+          grep -q "mytab0r" "$BRAND_DIR/client.js" \
+            || { echo "::error::В заменённом brand-official нет маркера mytab0r"; exit 1; }
+          test -f dist/favicon.svg || { echo "::error::dist/favicon.svg не найден — upstream убрал favicon, некуда класть замену"; exit 1; }
+          cp "$GITHUB_WORKSPACE/dsh-edge/brand-favicon.svg" dist/favicon.svg
+          echo "Бренд-плагин: brand.mark/name/hero → mytab0r (кит и вордмарк deepseek убраны), favicon заменён"
+
       # Селектор моделей в морде строится из каталога, зашитого в адаптере
       # (три DeepSeek-модели). Адаптер поддерживает кастомный каталог `models`,
       # но dsh-edge его не прокидывает — поэтому каталог патчится здесь, на
@@ -219,13 +279,27 @@ jobs:
         env:
           DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
           DSH_EDGE_PROVIDER_NAME: ${{ vars.DSH_EDGE_PROVIDER_NAME }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: |
           python3 - <<'PY'
           import json, os, re, sys
           catalog = json.loads(os.environ["DSH_EDGE_MODEL_CATALOG"])
-          provider_name = os.environ.get("DSH_EDGE_PROVIDER_NAME", "GLM")
+          provider_name = os.environ.get("DSH_EDGE_PROVIDER_NAME") or sys.exit(
+              "::error::vars.DSH_EDGE_PROVIDER_NAME не задан — имя провайдера объявляется только в vars репозитория, зашитого дефолта больше нет")
           if not catalog:
               sys.exit("::error::DSH_EDGE_MODEL_CATALOG пуст — не из чего собрать каталог")
+          # Инвариант присутствия (#153, находка 2): модель раннеров (vars.DEEPSEEK_MODEL)
+          # обязана быть объявлена в каталоге морды — иначе пикер и раннеры разойдутся
+          # молча (морда предложит модель, которой раннер не вызывает, или наоборот).
+          # Порядок каталога не переставляем и «первый = дефолтный» не додумываем —
+          # только факт присутствия.
+          runner_model = os.environ.get("DEEPSEEK_MODEL")
+          catalog_ids = [m["id"] for m in catalog]
+          if not runner_model:
+              sys.exit("::error::vars.DEEPSEEK_MODEL не задан — модель раннеров объявляется только в vars репозитория")
+          if runner_model not in catalog_ids:
+              sys.exit(f"::error::модель раннеров {runner_model!r} не объявлена в vars.DSH_EDGE_MODEL_CATALOG "
+                        f"({catalog_ids!r}) — пикер морды и раннеры разойдутся")
           # бандл минифицирован: строковые литералы в нём с двойными кавычками
           entries = ",".join(
               '{{id:"{id}",name:"{name}",contextWindow:{cw}}}'.format(
@@ -273,8 +347,10 @@ jobs:
       # файлы, не декодировавшиеся как UTF-8), а число «mytab0r Harness» обязано
       # сойтись с числом замен. Шаг стоит на общей части обоих путей сборки,
       # после патча каталога (тот брендовых строк не трогает). Форма проверена
-      # на артефакте dsh-edge 0.7.1 (пин из dsh-edge/upstream.json) и на живом
-      # проде: 16 вхождений, все — внутри человекочитаемых литералов.
+      # на артефакте dsh-edge 0.7.1 (пин из dsh-edge/upstream.json на момент
+      # проверки; #134 подняла пин до 0.8.0) и на живом проде: 16 вхождений,
+      # все — внутри человекочитаемых литералов. Гвардия ниже (>0 до замены,
+      # 0 после) перепроверяет форму на каждом деплое, а не полагается на число.
       - name: Бренд морды (DeepSeek Harness → mytab0r Harness)
         working-directory: ${{ github.workspace }}/deploy
         run: |
@@ -360,6 +436,9 @@ jobs:
       # Секреты воркера переживают деплой, put идемпотентен. ВСЕ ТРИ провайдерных
       # секрета синхронизируются вместе: частичная синхронизация (URL без ключа)
       # даёт 401 на каждом ходе морды — silent-wrong (случай #80).
+      # Проверка не дублирует dsh_require_provider_env своим текстом (#153,
+      # находка 7) — репозиторий уже чекаутнут в github.workspace, зовём ту же
+      # функцию, что и раннеры.
       - name: Секреты провайдера морды
         working-directory: ${{ github.workspace }}/deploy
         env:
@@ -369,27 +448,83 @@ jobs:
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: |
-          [ -n "$DEEPSEEK_API_KEY" ] || { echo "::error::секрет DEEPSEEK_API_KEY не задан"; exit 1; }
-          [ -n "$DEEPSEEK_BASE_URL" ] || { echo "::error::vars.DEEPSEEK_BASE_URL не задан"; exit 1; }
-          [ -n "$DEEPSEEK_MODEL" ] || { echo "::error::vars.DEEPSEEK_MODEL не задан"; exit 1; }
+          bash -c 'source "$GITHUB_WORKSPACE/scripts/lib/dsh-ci.sh"; dsh_require_provider_env'
           printf '%s' "$DEEPSEEK_API_KEY" | npx wrangler secret put DEEPSEEK_API_KEY
           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
 
-      # runner-bridge (#95) диспетчит воркера из чата морды: тот же PAT, что у
-      # рук и оркестратора — права на issues + workflow dispatch у него уже
-      # доказаны (scheduler.py диспетчит worker.yml этим токеном). Секрет
-      # воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда не знала
-      # слов рук; put идемпотентен, значение в лог не печатается.
+      # runner-bridge (#95) диспетчит воркера из чата морды: тот же широкий PAT
+      # (GH_PIPELINE_PAT), что у рук и оркестратора — права на issues + workflow
+      # dispatch у него уже доказаны (scheduler.py диспетчит worker.yml этим
+      # токеном). Узкий GH_DISPATCH_TOKEN сюда не годится: runner-bridgeу нужны
+      # issues. Секрет воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда
+      # не знала слов рук; put идемпотентен, значение в лог не печатается.
       - name: Секрет раннера морды (GH_RUNNER_TOKEN)
         working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          GH_RUNNER_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_RUNNER_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
-          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_DISPATCH_TOKEN не задан — runner_task не сможет диспетчить воркера"; exit 1; }
+          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_PIPELINE_PAT не задан — runner_task не сможет диспетчить воркера"; exit 1; }
           printf '%s' "$GH_RUNNER_TOKEN" | npx wrangler secret put GH_RUNNER_TOKEN
+
+      # Интеграции внешних систем (#115): реестр dsh-edge/integrations.json —
+      # единственное место правды о том, какие системы подключены и какие
+      # ИМЕНА секретов им нужны (значений в реестре нет и быть не может).
+      # Здесь три дела: (1) гвардия проводки — форма реестра + каждый его
+      # секрет обязан быть упомянут в env ЭТОГО шага, иначе расхождение
+      # красит деплой громко, а не оставляет интеграцию вечно not_configured
+      # при существующем секрете; (2) синк секретов morde-интеграций в воркер
+      # (put идемпотентен; telegram — wired jobs: его ключи читают job'ы
+      # раннеров, морде они не нужны); (3) снимок наличия секретов по каждой
+      # интеграции — его после канарейки пишет в журнал шаг «Статусы
+      # интеграций». Отсутствующий секрет НЕ красит деплой: интеграция без
+      # секрета — не поломка морды, а незавершённая настройка; её видимость —
+      # журнал и раздел «Интеграции» (state not_configured с именами).
+      # Гейт по манифесту: на префаб-маршруте (манифест пуст — аварийный
+      # fallback) плагина integrations в воркере нет, и «подключено» для
+      # тулов, которых в деплое нет, — ложь (тот же принцип, что у
+      # plugin_status ниже).
+      - name: Секреты интеграций морды (#115)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          BITBUCKET_USER: ${{ secrets.BITBUCKET_USER }}
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          registry=$(node "$GITHUB_WORKSPACE/dsh-edge/integrations.mjs")
+          echo "Реестр интеграций: $(jq -r '[.integrations[] | .id] | join(", ")' <<<"$registry")"
+          missing='{}'
+          synced=0
+          while IFS=$'\t' read -r id wired secret; do
+            if [ -z "${!secret:-}" ]; then
+              missing=$(jq --arg id "$id" --arg s "$secret" '.[$id].missing = ((.[$id].missing // []) + [$s])' <<<"$missing")
+              echo "::notice::интеграция $id: секрет $secret в репозитории не задан — статус будет not_configured"
+              continue
+            fi
+            if [ "$wired" = "morde" ]; then
+              printf '%s' "${!secret}" | npx wrangler secret put "$secret"
+              synced=$((synced + 1))
+            fi
+          done < <(jq -r '.integrations[] | .id as $id | .wired as $w | .secrets[] | [$id, $w, .] | @tsv' <<<"$registry")
+          # Снимок для шага статусов: {id, missing:[имена]} по каждой интеграции.
+          echo "$registry" | jq -c --argjson missing "$missing" \
+            '.integrations[] | {id: .id, missing: ($missing[.id].missing // [])}' \
+            > "$GITHUB_WORKSPACE/integration-states.ndjson"
+          echo "Секретов интеграций синхронизировано в воркер: $synced"
 
       - name: plugin_status → deploying
         if: steps.route.outputs.plugins != '0'
@@ -431,6 +566,48 @@ jobs:
           fi
           echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
 
+      # Шов «сессия раннера в морде» (#119): деплой обязан не просто поднять
+      # морду, а оставить работающим маршрут ingest транскрипта — им живут все
+      # раннеры (worker, hands). Прогон на живом проде: логин → сессия-канарейка
+      # в воркспейсе edge-harness → батч событий → архив. Неудача — красный
+      # деплой: сломанный шов невидим владельцу иначе, чем по красному job'у.
+      - name: Канарейка ingest-шва (#119)
+        if: success()
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/dsh-edge-canary.cookies"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин канарейки #119 не удался (HTTP $code)"; exit 1; }
+          rpc() {
+            local method=$1 payload=$2
+            curl -fsS -b "$jar" -H 'content-type: application/json' \
+              -X POST "$base/api/$method" -d "$payload" \
+              || { echo "::error::RPC $method канарейки #119 отклонён"; exit 1; }
+          }
+          ws=$(rpc workspace.create '{"type":"client-request","rpcId":"canary","method":"workspace.create","payload":{"path":"/workspace/edge-harness"}}' \
+            | jq -r '.result.value.workspace.workspaceId')
+          [ -n "$ws" ] && [ "$ws" != "null" ] \
+            || { echo "::error::Воркспейс edge-harness недоступен (#119)"; exit 1; }
+          sid="deploy-canary-$(date -u +%Y%m%dT%H%M%S)"
+          rpc session.create '{"type":"client-request","rpcId":"canary","method":"session.create","payload":{"workspaceId":"'"$ws"'","sessionId":"'"$sid"'"}}' >/dev/null
+          rpc session.rename '{"type":"client-request","rpcId":"canary","method":"session.rename","payload":{"sessionId":"'"$sid"'","title":"деплой-канарейка #119"}}' >/dev/null
+          printf '%s\n' \
+            '{"type":"turn/start","data":{"turn":1}}' \
+            '{"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' \
+            | jq -s '{events: .}' > "$RUNNER_TEMP/dsh-edge-canary-batch.json"
+          appended=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+            -X POST "$base/api/sessions/$sid/ingest" \
+            --data-binary "@$RUNNER_TEMP/dsh-edge-canary-batch.json" | jq ".appended") \
+            || { echo "::error::Ingest канарейки #119 упал"; exit 1; }
+          [ "$appended" -ge 2 ] \
+            || { echo "::error::Ingest канарейки #119 не принял батч (appended=$appended)"; exit 1; }
+          rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
+          echo "✅ ingest-шов #119 жив: сессия $sid создана, наполнена, заархивирована"
+
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
         env:
@@ -444,6 +621,28 @@ jobs:
           for id in ${{ steps.route.outputs.ids }}; do
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
           done
+
+      # Живой статус интеграций (#115) — то, что читает раздел «Интеграции»
+      # морды: ready (все секреты на месте, морда задеплоена и канарейкой
+      # доказана) или not_configured (каких секретов нет — имена в detail).
+      # Морда здесь уже доказанно жива, поэтому FINAL=1: статус обязан доехать.
+      - name: Статусы интеграций → журнал (#115)
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          FINAL: "1"
+        run: |
+          while IFS=$'\t' read -r id missing; do
+            detail=""
+            state=ready
+            if [ "$missing" != "[]" ]; then
+              state=not_configured
+              detail="нет секретов репозитория: $(jq -r 'join(", ")' <<<"$missing")"
+            fi
+            INTEGRATION_ID="$id" STATE="$state" DETAIL="$detail" bash scripts/plugins/integration_status.sh
+          done < <(jq -r '[.id, (.missing | tojson)] | @tsv' "$GITHUB_WORKSPACE/integration-states.ndjson")
 
       # Финальный статус обязан доехать: деплой без ready/failed события в
       # журнале — silent-wrong. Job уже красный; событие нужно для журнала.
@@ -459,6 +658,24 @@ jobs:
           for id in ${{ steps.route.outputs.ids }}; do
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh || true
           done
+
+      # Симметрично plugin_status → failed: если деплой упал, в журнале не
+      # должно остаться предыдущее «подключено» как безмолвно живущее. Снимок
+      # наличия секретов мог не дожить до этого шага — тогда честно «нет
+      # событий», виден только если деплой падал ДО синка секретов.
+      - name: Статусы интеграций → failed (#115)
+        if: failure() && steps.route.outputs.plugins != '0'
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: failed
+          DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
+        run: |
+          [ -f "$GITHUB_WORKSPACE/integration-states.ndjson" ] || exit 0
+          while IFS=$'\t' read -r id _missing; do
+            INTEGRATION_ID="$id" bash scripts/plugins/integration_status.sh || true
+          done < <(jq -r '.id' "$GITHUB_WORKSPACE/integration-states.ndjson")
 
       - name: Итог
         run: |

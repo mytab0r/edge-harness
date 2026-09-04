@@ -26,10 +26,19 @@ Containers, Dynamic Workers и WebSocket-туннеля.
 
 ## Состояние
 
-Walking-skeleton в работе: код морды и мозга ([`cf-worker/`](cf-worker/README.md)) написан,
-тесты и локальный smoke зелёные; за ним — замеры задержки старта job'а и расхода CPU.
-Чек-лист с живым статусом — в
-[`openspec/changes/walking-skeleton/tasks.md`](openspec/changes/walking-skeleton/tasks.md).
+**Фаза 2 (ядро агента) принята живым прогоном** — «DSH на Cloudflare + GitHub» работает:
+
+- агентский цикл DSH исполняется в job раннера ([ADR 0002](docs/decisions/0002-loop-in-runner-not-do.md)):
+  воркер задач и «руки» поднимают `dsh --profile headless` и работают над этим репозиторием;
+- сессии агентов видны в морде **dsh-edge** — живом DSH UI на Cloudflare
+  (сборка из исходников с плагинами, [`dsh-edge/`](dsh-edge/PATCHES.md)): транскрипт
+  хода работы дописывается туда из раннера ([#119](https://github.com/mytab0r/edge-harness/issues/119));
+- скелетный транспорт (морда+журнал [`cf-worker/`](cf-worker/README.md), `hands`) остаётся
+  входом в конвейер; из чата dsh-edge делегирование в раннер — плагин runner-bridge
+  (упирается в блок GitHub API из egress CF, [задача #133](https://github.com/mytab0r/edge-harness/issues/133)).
+
+Карта потоков и зависимостей — [`docs/agents/ROADMAP.md`](docs/agents/ROADMAP.md);
+дальше — ротация учёток (порт ProviderChain) и миграция функций воркера в плагин dsh-edge.
 
 ## Правила
 

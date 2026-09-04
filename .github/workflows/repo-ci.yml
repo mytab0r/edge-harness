@@ -20,12 +20,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Python-скрипты компилируются
         run: python -m compileall -q scripts
+
+      # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
+      # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
+      # пока краш не заметил человек. Правильная форма: значение "-f", "body=…".
+      # scripts/lib включён с появления claim_task (#121): там свой gh-обёрточный
+      # скрипт — класс закрывается во всех точках входа, а не только в orchestra.
+      # scripts/review — с появления gh-обёрток ai_review/file_tasks (#18).
+      - name: Оркестрация без keyword-аргументов gh()
+        run: |
+          if grep -rnE ',\s*body=' scripts/orchestra/ scripts/lib/ scripts/review/; then
+            echo "::error::keyword body= в вызове gh() — роняет прогон оркестратора (класс #124)"
+            exit 1
+          fi
+          echo "orchestra+lib+review: keyword-аргументов нет"
+
+      # Гвардия класса #153: провайдер/модель LLM — ровно одно место правды
+      # (vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория). Вынесена в
+      # scripts/lib/test/provider-default.guard.sh (находка 9): два паттерна
+      # (свойство + литерал), исключение только файла гвардии — теперь и
+      # repo-ci.yml сам под проверкой.
+      - name: Провайдер/модель LLM — одно место правды (vars), без зашитых дефолтов
+        run: bash scripts/lib/test/provider-default.guard.sh
 
       # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
       # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
@@ -33,6 +55,120 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_dispatch_tail.py -q
+
+      # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
+      # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
+      - name: Тесты предохранителя конвейера orchestra
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_pulse_guard.py -q
+
+      # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
+      # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
+      # ловил 403 на автослежении), сбой архивации — жёсткий и эскалируется
+      # тем же каналом, что предохранитель, а не тонет тихим warning'ом.
+      # Петля состояния открытого PR (#196): review:ok без вердикта AI дольше
+      # порога → авто-повтор ai-review.yml с ограничением попыток; нездоровый
+      # PR (красный чек/ai:changes-requested) дольше порога → задача в пул;
+      # после слияния — update-branch остальным открытым PR. Отдельная гвардия
+      # холостого хода: пустая очередь не делает ни одного мутирующего вызова.
+      - name: Тесты планировщика orchestra (логин в морду, архив сессий, петля состояния PR)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_scheduler.py -q
+
+      # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
+      # source-build морды кричит в задачу #134 + метка update-available +
+      # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
+      # пине. Семвер по прод-форме тегов repos/tags (настоящие sha апстрима),
+      # проводка на моке pulse_guard.gh: свежий пин и повторный эпизод —
+      # ноль мутирующих вызовов.
+      - name: Тесты сигнала дрейфа пина апстрима (#134)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_upstream_drift.py -q
+
+      # Гейт слияния и выборочное подтягивание веток (#252): одно место
+      # правды review_labels.should_update_branch — подтягивать только PR с
+      # обоими зелёными вердиктами или уже в конфликте, не всех открытых
+      # подряд (иначе синхронизация pr-review.yml/ai-review.yml на каждое
+      # слияние). Прод-форма: фикстура — реальный снимок открытых PR этого
+      # репозитория.
+      - name: Тесты меток-вердиктов ревью и выборочного подтягивания веток
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_review_labels.py -q
+
+      # Атомарная аренда задачи (#121): гонка двух claim (замок существует →
+      # второй отказ), TTL по дате коммита замка, release. Без сети — gh на
+      # уровне subprocess-мока с прод-формой ответов.
+      - name: Тесты аренды задачи claim_task
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_claim_task.py -q
+
+      # Номер задачи из текста PR/issue — одно место правды (#187): границы
+      # числа с обеих сторон, не подстрока (#18 не должен матчить #180/#5180;
+      # регресс живого прогона orchestra 33570081734).
+      - name: Тесты извлечения номера задачи task_ref
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_ref.py -q
+
+      # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
+      # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
+      # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает
+      # ТОЛЬКО declared_tasks (первая строка тела), не любое упоминание номера
+      # в прозе PR (класс #187/#195). Кормится реальным телом PR #181.
+      - name: Тесты выбора свободной задачи free_task
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_free_task.py -q
+
+      # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
+      # (fine-grained, морда) упоминает только deploy-worker.yml и синх
+      # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)
+      # — на GH_PIPELINE_PAT. Регресс «подсел на dispatch-токен» красит CI,
+      # а не молча ломает конвейер следующим сужением. Доказана мутацией:
+      # каждое из трёх правил красится своей правкой.
+      - name: Гвардия разделения GitHub-токенов
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dispatch_token_usage.py -q
+
+      # Реестр меток «тормоз → газ» (задача #207): docs/agents/LABELS.md не
+      # хардкодит список меток — scripts/lib/collect_labels.py собирает их
+      # сканированием scripts/, .github/workflows/, .github/ISSUE_TEMPLATE/.
+      # Три мутации краснят гвардию по отдельности: новая метка без строки в
+      # реестре, пустая колонка «Газ», мёртвая строка на метку, которой в
+      # коде больше нет (сплошной прочёс 2026-09-02 нашёл пять тормозов из
+      # шести без объявленного газа — #205, #204, #196).
+      - name: Гвардия реестра меток — у каждого тормоза-метки объявлен газ
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_label_registry.py -q
+
+      # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
+      # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
+      # канонический комментарий (шапка-факты + фенсы) и гейт слияния по
+      # меткам review:ok И ai:ok. Чистая логика, без сети.
+      - name: Тесты AI-ревью (второй гейт)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_ai_review.py -q
+
+      # Гвардии check_pr.py. Одна — аргумент --tree (bootstrap PR #138):
+      # check_pr.py исполняется доверенным чекаутом main, а не деревом
+      # проверяемого PR (см. комментарий в pr-review.yml); регресс сигнатуры
+      # вернёт bootstrap-тупик «unrecognized arguments: --tree» на первом же
+      # PR, который его зовёт. Вторая — размерный гейт (#90): условие жило
+      # инлайном в main() без тестов, и там стоял NameError (задача #90,
+      # дошёл с #85) — обязательная проверка review молча падала только на
+      # диффах > LARGE_DIFF_LINES, где её нельзя не заметить.
+      - name: Гвардии check_pr.py — аргумент --tree и размерный гейт (#90)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/review/test_check_pr.py -q
 
       - uses: actions/setup-node@v7
         with:
@@ -44,14 +180,58 @@ jobs:
       - name: Юнит-тесты плагина dsh-hands-streamer
         run: node --test scripts/dsh-hands-streamer/test/streamer.test.mjs
 
+      # Сборка и поведение клиентского плагина plugin-manager (#102):
+      # build.mjs (валидация манифеста, seed-require, обёртка бандла) + рендер
+      # секции на прод-форме ответа журнала.
+      - name: Юнит-тесты плагина plugin-manager
+        run: node --test plugins-src/plugin-manager/test/client.test.mjs
+
+      # Интеграции внешних систем (#115): форма реестра + гвардия проводки
+      # (каждый секрет реестра обязан быть упомянут в workflow'е своей
+      # проводки — иначе интеграция молча вечно not_configured), чистая логика
+      # инструментов на прод-форме ответов API (маскирование секретов и их
+      # base64-производных) и клиентский бандл раздела «Интеграции».
+      - name: Реестр интеграций — форма и проводка секретов
+        run: node dsh-edge/integrations.mjs
+      - name: Юнит-тесты логики инструментов интеграций
+        run: node --test plugins-src/integrations/test/core.test.mjs
+      - name: Юнит-тесты клиентского бандла интеграций
+        run: node --test plugins-src/integrations/test/client.test.mjs
+
+      # Преграда бренд-замены морды (#109): замещающий бандл brand-official
+      # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
+      # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
+      - name: Бренд-бандл морды валиден
+        run: node --check dsh-edge/brand-official.client.js
+
       # Синтаксис клиента рук: bash -n ловит поломку до ревью.
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/hands/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
+      # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
+      # проводка scripts/lib/journal_status.sh — тихий пропуск статуса на деплое.
+      - name: Smoke обёрток статусов журнала
+        run: bash scripts/plugins/test/status-scripts.smoke.sh
+
+      # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
+      # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на
+      # заглушках (curl/gh/dsh/pnpm/timeout — функции, git/npm/openssl — PATH):
+      # журнал получил job_start/job_end, морда — begin и ingest, воркер
+      # доложил в задачу. Сломанный клиент = красный smoke.
+      - name: Smoke bash-клиентов на заглушках (класс Б1 #119)
+        run: bash scripts/lib/test/dsh-clients.smoke.sh
+
+      # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
+      # #128, М3): два списка без единого места правды — расхождение красит CI,
+      # а не живой job 400-м или мёртвой поверхностью.
+      - name: Allowlist ингеста ↔ спул стримера
+        run: node dsh-edge/verify-ingest-allowlist.mjs
 
       - name: Все workflows — валидный YAML
         run: |
@@ -67,4 +247,37 @@ jobs:
           if bad:
               sys.exit('\n'.join(bad))
           print(f'workflows ok: {len(glob.glob(".github/workflows/*.yml"))} files')
+          PY
+
+      # Гвардия класса #189: concurrency-группа на уровне ФАЙЛА, если она не
+      # параметризована по PR/ref/task (статическая строка), сериализует ВСЕ
+      # джобы файла между собой. При двух и более джобах с разной семантикой
+      # (например обязательная PR-проверка + периодическая очередь) это
+      # вытесняет проверку чужими прогонами — все PR молча теряют статус
+      # (было в orchestra.yml: contract пропадал у каждого PR). Concurrency в
+      # таком файле обязана быть объявлена на уровне каждого джоба отдельно.
+      - name: Гвардия concurrency — не сериализовать разные джобы одной статической группой
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          bad = []
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              doc = yaml.safe_load(open(path, encoding='utf-8'))
+              conc = doc.get('concurrency')
+              jobs = doc.get('jobs', {}) or {}
+              if conc is None or len(jobs) < 2:
+                  continue
+              group = str(conc.get('group', '')) if isinstance(conc, dict) else str(conc)
+              expr_marker = '$' + '{{'
+              is_static = expr_marker not in group
+              if is_static:
+                  bad.append(
+                      f'{path}: concurrency.group="{group}" статична и объявлена на '
+                      f'уровне файла с {len(jobs)} джобами ({", ".join(jobs)}) — '
+                      'перенеси concurrency на уровень каждого джоба (класс #189)'
+                  )
+          if bad:
+              sys.exit('\n'.join(bad))
+          print('concurrency: ни один многоджобовый workflow не сериализован статической файловой группой')
           PY

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50">
+	<!-- Нейтральный знак морды (issue #109): скруглённый квадрат + «m».
+	     Заменяет кита deepseek; цвет текста — currentColor недоступен в
+	     favicon, поэтому тёмная/светлая тема решается через media query. -->
+	<style>
+		rect { fill: #1f2937; }
+		text { fill: #e5e7eb; }
+		@media (prefers-color-scheme: light) {
+			rect { fill: #e5e7eb; }
+			text { fill: #1f2937; }
+		}
+	</style>
+	<rect x="2" y="2" width="46" height="46" rx="12" />
+	<text x="25" y="35" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="700">m</text>
+</svg>

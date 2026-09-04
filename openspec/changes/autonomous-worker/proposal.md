@@ -17,7 +17,8 @@
    комментарий с хвостом лога + Telegram + красный job.
 2. `.github/workflows/worker.yml` — `workflow_dispatch` (input `task` —
    конкретная задача, пусто = свободная), concurrency `worker` (один воркер),
-   timeout 240. Git/gh агента — под PAT владельца (`GH_DISPATCH_TOKEN`) через
+   timeout 240. Git/gh агента — под PAT владельца (широкий репо-секрет
+   `GH_PIPELINE_PAT`; до задачи #6 — `GH_DISPATCH_TOKEN`) через
    `gh auth setup-git`; `GITHUB_TOKEN` воркфера намеренно без contents:write.
 3. `scripts/orchestra/scheduler.py` — пульс: свободная задача + нет активного
    worker-рана → ровно один dispatch `worker.yml` за запуск; best-effort,

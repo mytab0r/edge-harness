@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
-  "sha": "113a96913c51881993122afbf42e776882c4beb7",
-  "note": "Пин апстрима для source-build морды. Обновление — ручной PR с полным прогоном деплоя (design.md, «Манифест»). sha — main на момент пина, commit 113a969 = release dsh-edge 0.7.1."
+  "sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1",
+  "note": "Пин апстрима для source-build морды. Обновление — ручной PR с полным прогоном деплоя (design.md, «Манифест»). sha — тег dsh-edge-v0.8.0 (git rev-parse refs/tags/dsh-edge-v0.8.0), commit b9a8ddd = release dsh-edge 0.8.0. Бамп #134: предыдущий пин 113a969 = release 0.7.1 (тег dsh-edge-v0.7.1), тот же способ выбора. Сигнал «апстрим выпустил релиз новее пина» ставит пульс оркестратора (scripts/orchestra/upstream_drift.py, #134): комментарий + метка update-available + Telegram в задачу #134, один раз на релиз; бамп остаётся ручным."
 }

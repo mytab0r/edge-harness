@@ -16,7 +16,7 @@ on:
 
 permissions:
   # actions:write — playbook-операции агента (rerun orchestra, workflow run);
-  # contents:read — git push ветки идёт под PAT (GH_DISPATCH_TOKEN), не под этим токеном;
+  # contents:read — git push ветки идёт под PAT (GH_PIPELINE_PAT), не под этим токеном;
   # issues/pull-requests:write — назначение задачи, комментарии, PR.
   actions: write
   contents: read
@@ -47,9 +47,15 @@ jobs:
         with:
           node-version: 24
 
+      # pnpm нужен dsh plugin add (монтаж стрим-плагина в профиль headless,
+      # #119 — транскрипт сессии в морде; тот же шаг есть у hands).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Git-авторизация под PAT владельца
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
           # Токен обязан лечь В ФАЙЛ (hosts.yml), а не только в env этого шага:
           # DSH вырезает из model-shell вызовов все env с именами *TOKEN*/*KEY*/
@@ -57,21 +63,38 @@ jobs:
           # внутри агента не авторизуются, хотя транспорт task.sh обещает обратное).
           # hosts.yml не env — scrub его не касается, gh и git-хелпер читают оттуда.
           # pipe, а не process substitution: токен не попадает в argv.
-          printf '%s' "$GH_TOKEN" | gh auth login --with-token
+          # GH_TOKEN обязан быть вынут из env ДО login: gh отказывается от
+          # `auth login --with-token`, пока видит GH_TOKEN в окружении
+          # (#117, живой прогон 2026-08-31) — «ambiguous auth source».
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
           gh auth setup-git
           gh auth status 2>&1 | grep -E 'Logged in|account' || true
 
       - name: Задача через DSH headless
         env:
-          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
           WORKER_LOGIN: mytab0r
           WORKER_TASK: ${{ inputs.task }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # GLM Coding Plan: только coding-эндпоинт покрыт подпиской владельца,
-          # стандартный paas/v4 отвечает QUOTA на те же модели (проверено живым
-          # прогоном, см. hands.yml).
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.z.ai/api/coding/paas/v4' }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'glm-5' }}
+          # Пульс живости (#112-стопгэп): пока DSH работает, журнал принимает
+          # /api/heartbeat — «жив/висит» видно без ожидания конца job'а.
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HEARTBEAT_SECS: "60"
+          # Сессия раннера в морде (#119): транскрипт хода работы виден в
+          # нативном DSH UI, воркспейс edge-harness, имя = «#N: задача». Без
+          # конфигурации job падает громко: молча-невидимая сессия дороже
+          # красного прогона.
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
+          # Зашитого фолбэка здесь больше нет; пусто → dsh_require_provider_env
+          # в worker/task.sh падает громко до какой-либо дорогой работы.
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: bash scripts/worker/task.sh

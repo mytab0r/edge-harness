@@ -19,6 +19,28 @@ DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXm
 DSH_HEADLESS_VERSION="0.1.1-rc.2"
 DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 
+# Провайдер и модель — ровно одно место правды: vars.DEEPSEEK_BASE_URL /
+# vars.DEEPSEEK_MODEL репозитория (#153). Зашитых фолбэков на конкретный
+# эндпоинт/модель в коде больше нет нигде — их отсутствие обязано падать
+# громко здесь, до любой дорогой работы (установка DSH, клоны, сессия морды),
+# а не молча подставлять чужого провайдера. Разные причины — разные сообщения.
+dsh_require_provider_env() {
+  local missing=0
+  if [ -z "${DEEPSEEK_BASE_URL:-}" ]; then
+    echo "::error::не задан vars.DEEPSEEK_BASE_URL — эндпоинт провайдера объявляется только в vars репозитория, зашитых дефолтов больше нет" >&2
+    missing=1
+  fi
+  if [ -z "${DEEPSEEK_MODEL:-}" ]; then
+    echo "::error::не задан vars.DEEPSEEK_MODEL — модель объявляется только в vars репозитория, зашитых дефолтов больше нет" >&2
+    missing=1
+  fi
+  if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+    echo "::error::DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель" >&2
+    missing=1
+  fi
+  [ "$missing" = 0 ]
+}
+
 # GH маскирует секреты только в своих логах; всё, что уходит наружу (журнал DO,
 # комментарии в задачах, Telegram), надо затирать до отправки. GitHub PAT
 # (#95: токен теперь живёт и в морде — GH_RUNNER_TOKEN) маскируется
@@ -64,7 +86,11 @@ dsh_install() { # $1 — рабочий каталог для tarball'ов (со
 # maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
 dsh_patch_profile() { # $1 — имя профиля (обычно headless); выставляет DSH_MODEL/DSH_MAX_TOKENS
   local profile=$1
-  DSH_MODEL="${DEEPSEEK_MODEL:-glm-5}"
+  # Модель обязана прийти из окружения (vars.DEEPSEEK_MODEL, #153) — здесь
+  # больше нет зашитого дефолта. Вызывающий обязан вызвать
+  # dsh_require_provider_env раньше и упасть громко, если модель не задана.
+  : "${DEEPSEEK_MODEL:?DEEPSEEK_MODEL не задан — dsh_require_provider_env должен был отказать раньше}"
+  DSH_MODEL="$DEEPSEEK_MODEL"
   DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
   local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
   mkdir -p "$(dirname "$patch")"

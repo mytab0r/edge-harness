@@ -13,10 +13,19 @@
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+# Номер задачи из текста PR/issue — одно место правды (#187): границы числа
+# с обеих сторон, не подстрока (`#18` не должен матчить `#180`/`#5180`).
+_TR_SPEC = importlib.util.spec_from_file_location(
+    "task_ref", Path(__file__).resolve().parents[1] / "lib" / "task_ref.py")
+task_ref = importlib.util.module_from_spec(_TR_SPEC)
+_TR_SPEC.loader.exec_module(task_ref)
 
 SKIP_LABEL = "orchestra:skip"
 TASK_LABEL = "task"
@@ -91,13 +100,11 @@ def main() -> int:
             "пост-мерж проверки (деплой/канарейка/E2E), приложив улики. "
             "Ссылайся на задачу просто #N."
         )
-    issue_numbers = []
-    for line in refs:
-        for token in line.split("#")[1:]:
-            head = token.strip().split()[0] if token.strip() else ""
-            digits = "".join(ch for ch in head if ch.isdigit())
-            if digits and line.lstrip().startswith("#"):
-                issue_numbers.append(int(digits))
+    # Номер задачи признаётся только на строке, которая НАЧИНАЕТСЯ с `#N`
+    # (не любое упоминание issue в тексте PR) — декларация, не упоминание.
+    # Одно место правды — task_ref.declared_tasks (#195): то же правило
+    # применяется и к чужим PR ниже, симметрично.
+    issue_numbers = task_ref.declared_tasks(body)
     if not issue_numbers:
         problems.append("В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула.")
 
@@ -127,13 +134,17 @@ def main() -> int:
                     f"(назначено: {', '.join(assignees)}). Бери свободную из пула."
                 )
             # Чужие открытые PR на ту же задачу — гонка веток; она разрешается здесь.
+            # Симметрично своему PR: конфликт только если чужой PR ОБЪЯВЛЯЕТ эту
+            # задачу (строка тела, начинающаяся с #N), а не просто упоминает её
+            # номер в прозе описания (#195 — второй экземпляр асимметрии #187:
+            # своя декларация уже была узкой, чужая гонялась по всему тексту).
             others = []
             pulls = gh(f"repos/{repo}/pulls?state=open&per_page=100")
             for other in pulls:
                 if other["number"] == args.pr:
                     continue
                 other_body = other["body"] or ""
-                if f"#{issue_number}" in other_body:
+                if task_ref.declares_task(other_body, issue_number):
                     others.append(other["number"])
             if others:
                 problems.append(

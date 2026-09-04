@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Клиент рук (dsh-in-job слайс 1 + dsh-streaming слайс 2): задача из морды →
-# DSH headless → журнал. Контракт журнала — openspec/specs/journal-tasks-hands.md,
-# дизайн живого стрима — openspec/changes/dsh-streaming/design.md.
+# Клиент рук (dsh-in-job слайс 1 + dsh-streaming слайс 2): задача из журнала →
+# DSH headless → сессия в морде dsh-edge (#119). Контракт журнала —
+# openspec/specs/journal-tasks-hands.md, дизайн стрима —
+# openspec/changes/dsh-streaming/design.md, шов морды — openspec/changes/runner-sessions-in-dsh-morde/.
 # Правила: fail loud, без silent-wrong; heartbeat — доказательство живости процесса,
-# а не прогресса DSH; улика прогресса — события session_event (плагин
-# dsh-hands-streamer пишет NDJSON-спул, этот клиент дренирует его в журнал).
+# а не прогресса DSH; улика прогресса — транскрипт сессии в морде (плагин
+# dsh-hands-streamer пишет NDJSON-спул, этот клиент дренирует его в DSH-сессию
+# через scripts/lib/dsh-edge-session.sh). МЕХАНИЗМ ОДИН: журнал транскрипт
+# больше не получает — только жизненный цикл job (замещает стрим #112).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,21 +15,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # scripts/lib/dsh-ci.sh (общее с автономным воркером).
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$SCRIPT_DIR/../lib/dsh-ci.sh"
+# Шов сессии раннера в морду (#119): логин, begin, дрен спула в ingest, архив.
+# shellcheck source=scripts/lib/dsh-edge-session.sh
+source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
+# Аренда задачи (#121): claim/release/locks — единственный вход в работу.
+# shellcheck source=scripts/lib/lease.sh
+source "$SCRIPT_DIR/../lib/lease.sh"
 
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 DRAIN_INTERVAL_SECS="${DRAIN_INTERVAL_SECS:-1}"
-DRAIN_BATCH=50            # потолок батча сервера по СТРОКАМ (LIMITS.batchMax, cf-worker/src/config.ts)
-DRAIN_BATCH_BYTES=700000  # потолок батча по БАЙТАМ: тело сервера 1 MiB (LIMITS.bodyMaxBytes)
-                          # с запасом ~300 KB на конверт события журнала (seq/kind/ts/обёртка)
 CURL_CONNECT_TIMEOUT=5
-CURL_MAX_TIMEOUT=30       # зависший curl в drain-подшеллe вешал бы стрим до конца job
+CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле вешал бы клиент до конца job
 
 : "${HANDS_URL:?HANDS_URL не задан}"
 : "${HANDS_TOKEN:?HANDS_TOKEN не задан}"
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или manual-<run_id>)}"
+# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
+# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
+# в блоке обязательных переменных — ДО heartbeat, dsh_edge_login и создания
+# сессии в морде: иначе конфиг-ошибка даёт пустую сессию в UI морды и задачу,
+# помеченную провалом, вместо честного «не сконфигурировано».
+dsh_require_provider_env || exit 1
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
 WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"
@@ -35,7 +47,6 @@ ERR_FILE="$WORK/stderr.txt"
 EVENTS_FILE="$WORK/events.jsonl"
 START_MARK="$WORK/.start-mark"
 SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина dsh-hands-streamer
-DRAIN_CURSOR="$WORK/.drain-cursor"            # сколько полных строк спула принято журналом
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
 
@@ -50,18 +61,12 @@ api_post() {
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }
 
-# ── Журнал-seq: один писатель — bash. ─────────────────────────────────────────────
-# Два независимых счётчика (основной поток + drain-цикл) гонялись бы за одной
-# парой UNIQUE(task_id, seq). Писатели здесь не гоняются: в каждый момент
-# времени события добавляет ровно один из них (drain-цикл жив только между
-# start_drain и stop_drain, основной поток не добавляет события в этом окне),
-# а $SEQ_FILE — сквозное место правды счётчика для передачи нумерации.
-# seq батча стрима привязан к ПОЗИЦИИ строки в спуле (DRAIN_BASE + индекс):
-# повторная доставка тех же строк несёт ТЕ ЖЕ seq — сервер гасит дубль
-# UNIQUE(task_id, seq), если батч был принят, а ответ потерялся. Верхняя
-# граница аллокации пишется в файл до поста: сбой батча оставляет дырку
-# (легальна), но не возвращает seq в оборот — чужое событие не встанет на
-# чужой номер и не будет молча съедено серверным INSERT OR IGNORE.
+# ── Журнал-seq: один писатель — bash (клиент рук). ────────────────────────────────
+# Жизненный цикл job (job_start/bootstrap/agent_answer/stream_note/agent_error/
+# job_end) — зона ЭТОГО файла: события с уникальным journal-seq уходят в журнал
+# edge-harness. Транскрипт сессии (drain спула) сюда не ходит — он в морду через
+# scripts/lib/dsh-edge-session.sh и на SEQ не влияет. seq_load — передача
+# нумерации, если какой-то цикл временно заберёт писательство (точка возврата).
 SEQ=0
 seq_persist() { printf '%s\n' "$SEQ" >"$SEQ_FILE"; }
 seq_load() { SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo "$SEQ"); }
@@ -88,118 +93,10 @@ flush_events() {
   return 1
 }
 
-# ── Drain спула стрима (слайс 2) ──────────────────────────────────────────────────
-# Новые полные строки спула → redact → journal-seq → батчи в POST /api/events.
-# Батч режется сразу по обоим потолкам сервера: ≤DRAIN_BATCH строк И
-# ≤DRAIN_BATCH_BYTES байт (тело 1 MiB). Курсор — число строк, ПРИНЯТЫХ
-# журналом, обновляется после КАЖДОГО принятого батча: строки, дописанные
-# плагином во время чтения, остаются на следующий тик, принятые не
-# перечитываются. Незавершённая последняя строка (torn tail, обрыв записи без
-# \n) не считается и не читается — доставляется только committed prefix.
-# mode=soft: одна попытка на батч, сбой мягкий — ретрай следующим тиком
-# (с теми же seq — привязка «строка ↔ seq» детерминирована).
-# mode=hard: до 5 ретраев с бэкоффом, как у flush_events; несовместимый сбой —
-# красный job.
-
-post_session_batch() { # mode lines_file lo hi — seq строк: DRAIN_BASE+lo .. DRAIN_BASE+hi
-  local mode=$1 lines=$2 lo=$3 hi=$4 total n=0 seq sline
-  local batch_events="$WORK/drain-batch.events"
-  : >"$batch_events"
-  total=$(wc -l <"$lines")
-  while [ "$n" -lt "$total" ]; do
-    n=$((n + 1))
-    seq=$((DRAIN_BASE + lo - 1 + n))
-    sline=$(sed -n "${n}p" "$lines")
-    printf '%s\n' "$sline" | jq -c --argjson s "$seq" '{
-      seq: $s,
-      kind: "session_event",
-      ts: (if (.time | type) == "number" then .time else null end),
-      data: ({session_id: .session_id, session_seq: .seq, type: .type}
-             + (if (.data.turn // null) != null then {turn: .data.turn} else {} end)
-             + (if (.data.step // null) != null then {step: .data.step} else {} end)
-             + {payload: .data})
-    }' >>"$batch_events"
-  done
-  # Верхняя граница аллокации — до поста: краш не возвращает seq в оборот.
-  # Пост идёт с seq, детерминированными позициями строк, поэтому ретрай этого
-  # же батча (тиком, хард-циклом или cleanup'ом) несёт ТЕ ЖЕ seq.
-  SEQ=$((DRAIN_BASE + hi))
-  seq_persist
-  local body attempt
-  body=$(jq -s --arg t "$TASK_ID" '{task_id: $t, source: "job", events: .}' "$batch_events")
-  for attempt in 1 2 3 4 5; do
-    if api_post /api/events "$body" >/dev/null; then return 0; fi
-    [ "$mode" = "hard" ] || return 1
-    sleep $((attempt * 2))
-  done
-  echo "::error::Журнал не принял батч session_event (строки спула $lo–$hi) из 5 попыток — улики прогресса потеряны не могут" >&2
-  return 1
-}
-
-drain_spool() { # mode — 0: спул дочитан до конца; 1: сбой поста, ретрай позже
-  local mode=$1 drained lo end bl batch_lines
-  drained=$(cat "$DRAIN_CURSOR" 2>/dev/null || echo 0)
-  [ -f "$SPOOL_FILE" ] || return 0
-  # Сравнение с курсором по wc спула — только быстрый выход на пустом тике:
-  # tail читает ДО EOF, и строки, дописанные после wc, попадают в чанк
-  # и учитываются курсором по факту приёма (курсор считает принятое, а не
-  # устаревший wc). Незавершённый хвост (без \n) не считается: wc выдаёт
-  # число полных строк — committed prefix.
-  local avail chunk_lines
-  avail=$(wc -l <"$SPOOL_FILE")
-  [ "$avail" -gt "$drained" ] || return 0
-  tail -n +"$((drained + 1))" "$SPOOL_FILE" | redact >"$WORK/drain-chunk.jsonl"
-  chunk_lines=$(wc -l <"$WORK/drain-chunk.jsonl")
-  [ "$chunk_lines" -gt 0 ] || return 0
-  # Нарезка по обоим потолкам сразу: ≤50 строк и ≤бюджет байт на батч
-  # (строка, не влезающая в бюджет, начинает СЛЕДУЮЩИЙ батч — инвариант
-  # «батч ≤ бюджета» строгий). head отсекает возможный незавершённый хвост,
-  # который awk иначе дочитал бы как полную запись. LC_ALL=C — length() в
-  # байтах, не в символах локали; имена батчей с нулём-набивкой: glob обязан
-  # давать числовой порядок.
-  head -n "$chunk_lines" "$WORK/drain-chunk.jsonl" | LC_ALL=C \
-    awk -v ml="$DRAIN_BATCH" -v mb="$DRAIN_BATCH_BYTES" -v out="$WORK/drain-batch" '
-      function flushbatch() { printf "%s", buf > (out "." sprintf("%03d", ++k) ".lines"); buf = ""; n = 0; b = 0 }
-      { len = length($0) + 1
-        if (n >= ml || (n > 0 && b + len > mb)) flushbatch()
-        buf = buf $0 "\n"; n++; b += len }
-      END { if (n > 0) flushbatch() }'
-  lo=$drained
-  for batch_lines in "$WORK"/drain-batch.*.lines; do
-    [ -e "$batch_lines" ] || continue   # шаблон без совпадений (nullglob выключен)
-    bl=$(wc -l <"$batch_lines")
-    end=$((lo + bl))
-    post_session_batch "$mode" "$batch_lines" "$((lo + 1))" "$end" || return 1
-    lo=$end
-    echo "$lo" >"$DRAIN_CURSOR"   # курсор растёт с каждым ПРИНЯТЫМ батчем
-  done
-}
-
-DRAIN_PID=""
-DRAIN_BASE=0
-start_drain() {
-  # База дрена: seq строки спула = DRAIN_BASE + позиция строки. Фиксируется
-  # один раз на прогон — детерминированная привязка «строка ↔ seq» на все
-  # ретраи (софт-тики, хард-цикл, cleanup). Основной поток в окне дрена seq
-  # не двигает (один писатель).
-  DRAIN_BASE=$SEQ
-  (
-    while :; do
-      sleep "$DRAIN_INTERVAL_SECS"
-      drain_spool soft || true   # мягкий сбой: батч остаётся в спуле до следующего тика
-    done
-  ) &
-  DRAIN_PID=$!
-}
-
-stop_drain() {
-  if [ -n "$DRAIN_PID" ]; then
-    kill "$DRAIN_PID" 2>/dev/null || true
-    wait "$DRAIN_PID" 2>/dev/null || true
-    DRAIN_PID=""
-  fi
-  seq_load   # нумерация возвращается основному потоку без коллизий
-}
+# ── Транскрипт сессии: дрен спула в морду (#119) ──────────────────────────────────
+# Спул плагина — единственный источник; дрен живёт в scripts/lib/dsh-edge-session.sh
+# и постит батчи строк спула в DSH-сессию (POST /api/sessions/:id/ingest).
+# Журнал-seq остаётся за жизненным циклом job; дрен морды на SEQ не влияет.
 
 JOB_ENDED=0
 # Единственная точка финального статуса. job_end уходит ТОЛЬКО после того, как
@@ -218,10 +115,10 @@ start_heartbeat() {
   done
 }
 cleanup() {
-  stop_drain   # после него add_event снова принадлежит основному потоку
+  dsh_edge_stop_drain
   if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
   if [ "$JOB_ENDED" -eq 0 ]; then
-    drain_spool hard || true   # улики — до job_end; упавший дрен не отменяет финальный статус
+    dsh_edge_drain_spool hard || true   # улики — до job_end; упавший дрен не отменяет финальный статус
     add_event "agent_error" '{"stderr":"job завершён до финала (отмена/ошибка среды)"}'
     post_job_end "fail" || true
   fi
@@ -258,22 +155,67 @@ fi
 seq_persist
 echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
 
+# ── 1a. Аренда задачи (#121): заказ «поработай над issue-N» берётся только ────────
+# через атомарный claim. Без замка морда-агент мог заказать работу по задаче,
+# которую уже делает воркер, — два исполнителя на одной работе. Отказ —
+# зелёный no-op job'а (контракт #121), но журнал получает честный финал
+# task_busy + job_end: задача не должна висеть «dispatched» вечно, а «done»
+# означал бы ложь «работа сделана». Задачи без issue (manual-*) — вне пула,
+# аренды не имеют. Поломка утилиты — громкий красный job: «инструмент сломан»
+# и «задача занята» — разные состояния.
+if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
+  # CLAIM_ACTOR обязан быть валидным логином (назначение идёт им): не
+  # переопределяем — current_actor() возьмёт GITHUB_ACTOR (аккаунт,
+  # инициировавший dispatch). Канал для следа в задаче — CLAIM_VIA.
+  export CLAIM_VIA="hands $TASK_ID (run ${GITHUB_RUN_ID:-local})"
+  claim_out="$(lease_cli claim "${BASH_REMATCH[1]}" 2>&1)" && claim_rc=0 || claim_rc=$?
+  if [ "$claim_rc" -eq 1 ]; then
+    echo "Задача #${BASH_REMATCH[1]} занята другим исполнителем — зелёный no-op: $claim_out"
+    add_event "agent_error" \
+      "$(jq -n --arg t "$claim_out" '{error: "task_busy", detail: $t}')"
+    post_job_end "fail"
+    exit 0
+  fi
+  if [ "$claim_rc" -ne 0 ]; then
+    echo "::error::claim_task сломался (rc=$claim_rc): $claim_out" >&2
+    exit 1
+  fi
+  echo "Аренда взята: $claim_out"
+fi
+
+# Токен аренды больше не нужен никому ниже, включая DSH: снимается сразу после
+# блока аренды и до любого выхода из скрипта. Раньше блока снимать нельзя —
+# claim в проде авторизуется именно GH_RUN_TOKEN.
+unset GH_RUN_TOKEN
+
 add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
 flush_events
 start_heartbeat &
 HB_PID=$!
 
-# ── 2. Провайдер: без ключа работа невозможна — падаем сразу, не через 10 минут ───
-if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-  echo "::error::DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель" >&2
-  exit 1
+# ── 1b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ─────────
+# Отказ громкий: без сессии ход работы владельцу не виден, job красный.
+# «Не настроено» и «сломано» — разные сообщения (dsh_edge_require_config).
+if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
+  HARNESS_SID="harness-${BASH_REMATCH[1]}"
+  HARNESS_TITLE="#${BASH_REMATCH[1]}: $(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
+else
+  slug=$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]' | tr -cs 'A-Za-z0-9' '-' \
+  | sed -e 's/-\{2,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-48)
+  HARNESS_SID="harness-${slug:-manual}"
+  HARNESS_TITLE="$(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
 fi
+dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
+dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
+  || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
+export DSH_EDGE_SESSION_ID="$HARNESS_SID"
+echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
+
+# ── 2. Провайдер: проверка выше (блок обязательных переменных) — здесь только export ──
 # Профиль headless — pnpm-workspace: `pnpm add` внутри требует явного
 # подтверждения root (иначе ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30).
 export npm_config_ignore_workspace_root_check=true
-export DEEPSEEK_API_KEY
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://integrate.api.nvidia.com/v1}"
-export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
+export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
@@ -322,11 +264,11 @@ cd "${GITHUB_WORKSPACE:-$WORK}"
 touch "$START_MARK"
 
 # Спул стрима: путь задаётся плагину через env до старта dsh; чистый прогон не
-# должен дочитывать старьё от предыдущей попытки. Пока жив drain-цикл, события
-# в журнал добавляет ТОЛЬКО он (один писатель journal-seq).
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json" "$DRAIN_CURSOR"
+# должен дочитывать старьё от предыдущей попытки. Курсор дрена — единственный
+# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от содержимого).
+rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 export HANDS_SPOOL="$SPOOL_FILE"
-start_drain
+dsh_edge_start_drain
 
 DSH_START_TS=$(date -u +%s)
 set +e
@@ -335,19 +277,19 @@ rc=$?
 set -e
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
 
-# Финальный drain — жёсткий и ДО ответа: порядок журнала «события сессии →
-# финальный ответ → job_end» держится journal-seq, а не временем прихода.
-stop_drain
-drain_spool hard
-drained_lines=$(cat "$DRAIN_CURSOR" 2>/dev/null || echo 0)
+# Финальный drain — жёсткий и ДО ответа: транскрипт сессии в морде обязан
+# обгонять финальный статус job в журнале.
+dsh_edge_stop_drain
+dsh_edge_drain_spool hard || { echo "::error::Хвост транскрипта не принят мордой" >&2; exit 1; }
+drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
 
 # ── 5. Журнал: ответ и улики ───────────────────────────────────────────────────────
 ANSWER=$(tail -c 60000 "$ANSWER_FILE" | redact)
 add_event "agent_answer" \
   "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
 
-# Громкий отказ «стрим не доставил»: успешный прогон с нулём доставленных
-# session_event — молчаливая деградация слоя доказательств, job обязан краснеть.
+# Громкий отказ «стрим не доставил»: успешный прогон с пустым транскриптом
+# морды — молчаливая деградация слоя доказательств, job обязан краснеть.
 # «Спул не создан вовсе» — другой отказ: плагин не смонтировался ≠ событий не было.
 if [ "$rc" -eq 0 ]; then
   if [ ! -f "$SPOOL_FILE" ]; then
@@ -358,10 +300,10 @@ if [ "$rc" -eq 0 ]; then
     exit 1
   fi
   if [ "$drained_lines" -eq 0 ]; then
-    add_event "agent_error" '{"error":"stream_no_events","stderr":"прогон успешен, а из спула не доставлен ни один session_event — стрим не доставил событий"}'
+    add_event "agent_error" '{"error":"stream_no_events","stderr":"прогон успешен, а в сессию морды не доставлено ни одного события — транскрипт пуст (#119)"}'
     flush_events
     post_job_end "fail"
-    echo "::error::Ноль session_event при успешном прогоне — стрим не доставил событий" >&2
+    echo "::error::Ноль событий в сессии морды при успешном прогоне — стрим не доставил событий" >&2
     exit 1
   fi
 fi
