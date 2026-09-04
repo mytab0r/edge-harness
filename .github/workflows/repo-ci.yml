@@ -146,11 +146,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/review/test_ai_review.py -q
 
-      # Гвардия аргумента --tree (bootstrap PR #138): check_pr.py исполняется
-      # доверенным чекаутом main, а не деревом проверяемого PR (см. комментарий
-      # в pr-review.yml). Регресс сигнатуры вернёт bootstrap-тупик
-      # «unrecognized arguments: --tree» на первом же PR, который его зовёт.
-      - name: Гвардия аргумента --tree в check_pr.py
+      # Гвардии check_pr.py. Одна — аргумент --tree (bootstrap PR #138):
+      # check_pr.py исполняется доверенным чекаутом main, а не деревом
+      # проверяемого PR (см. комментарий в pr-review.yml); регресс сигнатуры
+      # вернёт bootstrap-тупик «unrecognized arguments: --tree» на первом же
+      # PR, который его зовёт. Вторая — размерный гейт (#90): условие жило
+      # инлайном в main() без тестов, и там стоял NameError (задача #90,
+      # дошёл с #85) — обязательная проверка review молча падала только на
+      # диффах > LARGE_DIFF_LINES, где её нельзя не заметить.
+      - name: Гвардии check_pr.py — аргумент --tree и размерный гейт (#90)
         run: |
           pip install --quiet pytest
           python -m pytest scripts/review/test_check_pr.py -q
