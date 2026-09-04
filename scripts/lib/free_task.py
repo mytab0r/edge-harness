@@ -94,9 +94,10 @@ def oldest_free(
 
 
 def declared_pr_for_task(prs: list[dict[str, Any]], task_number: int) -> dict[str, Any] | None:
-    """Открытый PR, ОБЪЯВЛЯЮЩИЙ задачу `task_number` первой строкой тела —
-    то же правило, что `contract_check.py` (`declared_tasks(body)[0]`),
-    применённое симметрично к «своему» и «чужому» PR."""
+    """Открытый PR, ОБЪЯВЛЯЮЩИЙ задачу `task_number` первым объявленным в теле
+    (`declared_tasks(body)[0]` — строка тела, начинающаяся с `#N`, обычно
+    первая) — то же правило, что `contract_check.py`, применённое симметрично
+    к «своему» и «чужому» PR."""
     for pull in prs:
         body = pull.get("body") or ""
         declared = task_ref.declared_tasks(body)
