@@ -88,6 +88,45 @@ def added_lines(diff: str) -> list[str]:
     return [line[1:] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
 
+def size_gate(added: int, labels) -> tuple[bool, bool]:
+    """Размерный гейт (#90): `(size_overflow, is_large)`.
+
+    size_overflow — дифф крупнее LARGE_DIFF_LINES; is_large — крупный И НЕ
+    принят меткой LARGE_OK. Единственное место формулировки условия: раньше
+    оно жило инлайном в main(), и именно здесь (#90) стоял NameError — на
+    маленьких диффах короткое замыкание `and` не доставало до неопределённого
+    имени, поэтому баг молча ждал первого крупного PR. Тест кормится этой
+    функцией (прод-форма: имена меток из review_labels), а не пересказом.
+    """
+    size_overflow = added > LARGE_DIFF_LINES
+    return size_overflow, size_overflow and LARGE_OK not in labels
+
+
+def large_acceptance_message(added: int, size_overflow: bool, is_large: bool) -> str | None:
+    """«Принят меткой» — только когда метка review:large-ok ЕСТЬ.
+
+    Задача #90 назвала это условие перевёрнутым («печатается, когда метки
+    нет») — проверка случаями показывает обратное: is_large уже включает
+    «метки нет», поэтому `size_overflow and not is_large` истинно ровно при
+    наличии метки (прод-пруф: прогон 33693163400, PR #159 +1127 строк,
+    печатает «принят меткой review:large-ok» и завершается review:ok).
+    Условие зафиксировано функцией, чтобы правка по мотивам #90 не
+    перевернула его молча.
+    """
+    if size_overflow and not is_large:
+        return f"review: крупный дифф (+{added}) принят меткой {LARGE_OK}"
+    return None
+
+
+def verdict_for(is_large: bool, findings: list[str]) -> str:
+    """Вердикт-метка: размер не принят → review:large — гейт размера падает
+    (merge_label_gate не видит review:ok, слияние закрыто), иначе — по находкам.
+    """
+    if is_large:
+        return REVIEW_LARGE
+    return REVIEW_OK if not findings else REVIEW_CHANGES
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", type=int, required=True)
@@ -132,10 +171,10 @@ def main() -> int:
     # Остальные проверки метка не отключает.
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     current = {label["name"] for label in pull["labels"]}
-    size_overflow = added > LARGE_DIFF_LINES
-    is_large = size_overflow and LARGE_OK not in current
-    if size_overflow and not is_large:
-        print(f"review: крупный дифф (+{added}) принят меткой {LARGE_OK}")
+    size_overflow, is_large = size_gate(added, current)
+    message = large_acceptance_message(added, size_overflow, is_large)
+    if message:
+        print(message)
 
     # Каждый изменённый .py обязан компилироваться: ловит обрезанные файлы и
     # неразрешённые конфликты, которые ломают скрипты молча (случалось с scheduler.py).
@@ -161,7 +200,7 @@ def main() -> int:
     # старого head. Новое ревью поставит свежую метку на новый head.
     for old in review_labels.ai_verdicts_to_drop(current):
         run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
-    verdict = REVIEW_LARGE if is_large else (REVIEW_OK if not findings else REVIEW_CHANGES)
+    verdict = verdict_for(is_large, findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
 
     if findings:
