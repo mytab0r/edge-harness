@@ -214,6 +214,8 @@ def test_archive_rpc_failure_is_hard_failure(monkeypatch):
 def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
@@ -233,6 +235,8 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
 def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
@@ -860,6 +864,18 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         # failures=0 — иначе не отличить «серии не было» от «проба ещё бежит».
         # Пустая история worker.yml => маркеров нет, но запрос всё равно уходит.
         "issues/120/comments?per_page=100": [],
+        # Сверка дрейфа пина (#134) ходит в каждом холостом пульсе: теги апстрима
+        # (прод-форма repos/tags, снята живым запросом 2026-09-03; sha первого
+        # тега = текущий пин dsh-edge/upstream.json) и метки задачи #134.
+        # Пин свеж → состояние ok → только чтение: гвардия внизу требует,
+        # что и здесь не было ни одного POST/PUT/DELETE.
+        "repos/pawaca/dsh-edge/tags?per_page=100": [
+            {"name": "dsh-edge-v0.8.0",
+             "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
+            {"name": "dsh-edge-v0.7.1",
+             "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
+        ],
+        "issues/134": {"number": 134, "labels": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
