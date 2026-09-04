@@ -1184,13 +1184,28 @@ def merged_pr_map(pulls: list[dict]) -> dict[int, dict]:
     return best
 
 
-def deploy_evidence(repo: str, merged_at: datetime) -> tuple[str, str]:
+def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None) -> tuple[str, str]:
     """('ok'|'fail'|'pending', детали). Поднимает RuntimeError только на
     инфраструктурный сбой (DSH_EDGE_URL не задан, /api/health недоступен) —
-    это отличается от 'fail' (улика получена и она красная)."""
+    это отличается от 'fail' (улика получена и она красная).
+
+    Улика — прогон deploy-worker.yml ИМЕННО ЭТОГО мержа, а не «самый новый
+    после merged_at»: оркестратор сливает по одному PR каждые 15 минут, и
+    при двух cf-worker-мержах подряд «самый новый» после первого мержа —
+    это прогон ВТОРОГО (список идёт от нового к старому), и задача первого
+    тогда судится по чужому прогону (найдено в разборе AI-ревью PR #253).
+    Точный критерий — head_sha прогона равен merge_commit_sha этого PR (тот
+    же коммит, что и включает push-триггер деплоя). merge_commit_sha не
+    всегда доступен (пул не даёт его сразу после мержа) — тогда резерв:
+    самый РАННИЙ прогон после merged_at (его диспатчит push сразу же после
+    мержа), а не самый новый."""
     payload = gh(f"repos/{repo}/actions/workflows/deploy-worker.yml/runs?per_page=10") or {}
     runs = payload.get("workflow_runs", [])
-    candidate = next((r for r in runs if parse_time(r["created_at"]) >= merged_at), None)
+    if merge_commit_sha:
+        candidate = next((r for r in runs if r.get("head_sha") == merge_commit_sha), None)
+    else:
+        after = [r for r in runs if parse_time(r["created_at"]) >= merged_at]
+        candidate = min(after, key=lambda r: parse_time(r["created_at"])) if after else None
     if candidate is None:
         return "pending", "deploy-worker.yml после мержа ещё не запускался"
     if candidate.get("conclusion") is None:
@@ -1224,17 +1239,28 @@ def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
     return "ok", f"{len(runs)} проверок PR зелёные (прогон с выводом)"
 
 
-def docs_missing(repo: str, filenames: list[str]) -> list[str]:
-    """Файлы из тела PR, которых нет в main — редкий случай (переименовали/
-    удалили ПОСЛЕ мержа): единственная проверяемая форма критерия «источник
-    правды на месте» для правки, не имеющей наблюдаемого результата в рантайме.
+def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
+    """Файлы из тела PR, которых нет в main, хотя должны быть — редкий случай
+    (переименовали/удалили ПОСЛЕ мержа, а не самим этим PR): единственная
+    проверяемая форма критерия «источник правды на месте» для правки, не
+    имеющей наблюдаемого результата в рантайме.
+
+    `status=removed` из files API (пул PR удалил файл — например архивация
+    openspec/changes/* в specs, добавления и удаления одним PR) — это ЕСТЬ
+    результат мержа, а не пропажа улики: отсутствие такого файла в main не
+    проверяем вовсе, иначе легальная чистка вечно судилась бы как провал
+    (найдено в разборе AI-ревью PR #253). Для `renamed` проверяем новый путь
+    (`filename`), не старый (`previous_filename`) — старый закономерно исчез.
     «Файла нет» отличается по точной форме gh «HTTP 404» (тот же приём, что
     is_not_found в scripts/review/ai_review.py) — любой другой отказ (ратлимит,
     сеть, 5xx) не «файла нет», а «возможность сломана»: поднимаем наверх, там
     его ловит общий except в accept_merged_tasks и эскалирует, а не тихо
-    засчитывает как провал улики (найдено в разборе AI-ревью PR #253)."""
+    засчитывает как провал улики."""
     missing = []
-    for name in filenames:
+    for entry in files_payload:
+        if entry.get("status") == "removed":
+            continue
+        name = entry["filename"]
         try:
             gh(f"repos/{repo}/contents/{name}?ref=main")
         except RuntimeError as error:
@@ -1287,13 +1313,20 @@ def accept_merged_tasks(
             filenames = [f["filename"] for f in files_payload]
             category = classify_acceptance(filenames)
             if category == ACCEPT_DOCS:
-                missing = docs_missing(repo, filenames)
+                missing = docs_missing(repo, files_payload)
                 if missing:
                     state, detail = "fail", f"файлы отсутствуют в main: {', '.join(missing)}"
                 else:
-                    state, detail = "docs", f"файлы на месте в main: {', '.join(filenames)}"
+                    # removed-файлы (архивация) не проверяются физически —
+                    # их отсутствие в main и есть результат мержа; в улику
+                    # попадают только добавленные/изменённые/переименованные.
+                    checked = [f["filename"] for f in files_payload if f.get("status") != "removed"]
+                    if checked:
+                        state, detail = "docs", f"файлы на месте в main: {', '.join(checked)}"
+                    else:
+                        state, detail = "docs", "правка — только удаления (архивация), физической проверки нет"
             elif category == ACCEPT_DEPLOY:
-                state, detail = deploy_evidence(repo, merged_at)
+                state, detail = deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
             else:
                 state, detail = script_evidence(repo, pull["head"]["sha"])
         except RuntimeError as error:
@@ -1336,10 +1369,19 @@ def accept_merged_tasks(
             reasoning = ("документационная правка, наблюдаемого результата по природе нет — "
                          "закрываю с этим обоснованием"
                          if state == "docs" else "улика получена — закрываю задачу")
-            post_issue_comment(
-                repo, number,
-                f"✅ {marker} PR #{pull['number']} ({category}): {reasoning}. {detail}.")
-            gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
+            try:
+                post_issue_comment(
+                    repo, number,
+                    f"✅ {marker} PR #{pull['number']} ({category}): {reasoning}. {detail}.")
+                gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
+            except RuntimeError as error:
+                # Сетевой/API сбой на комментарии или PATCH не должен ронять
+                # обход остальных задач — та же гарантия, что уже даёт этот
+                # приём чтению маркеров и claim_task.release ниже (найдено в
+                # разборе AI-ревью PR #253: докстринг функции обещал это для
+                # ВСЕХ пунктов пульса, а тут обещание не выполнялось).
+                lines.append(f"⚠️ #{number}: закрытие приёмкой не завершено — {error}")
+                continue
             try:
                 lines.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
@@ -1353,14 +1395,18 @@ def accept_merged_tasks(
             continue
 
         # state == "fail"
-        post_issue_comment(
-            repo, number,
-            f"♻️ {fail_marker} — улика ({category}) показала, что результат не достигнут: "
-            f"{detail}. Задача НЕ закрыта: нужна доработка (новый PR или правка "
-            f"существующей работы), не тихое закрытие.")
-        if issue["assignees"]:
-            who = ", ".join(a["login"] for a in issue["assignees"])
-            gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+        try:
+            post_issue_comment(
+                repo, number,
+                f"♻️ {fail_marker} — улика ({category}) показала, что результат не достигнут: "
+                f"{detail}. Задача НЕ закрыта: нужна доработка (новый PR или правка "
+                f"существующей работы), не тихое закрытие.")
+            if issue["assignees"]:
+                who = ", ".join(a["login"] for a in issue["assignees"])
+                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+        except RuntimeError as error:
+            lines.append(f"⚠️ #{number}: отметка провала приёмки не завершена — {error}")
+            continue
         try:
             lines.append(f"🔓 {claim_task.release(repo, int(number))}")
         except RuntimeError as error:
