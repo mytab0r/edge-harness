@@ -44,6 +44,13 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
           подтягивание синхронизирует pr-review.yml/ai-review.yml и снимает
           валидный ai:*-вердикт без пользы для PR, которому рано сливаться.
           Конфликт (DIRTY) не молчит: строка в отчёте + метка conflict.
+          И даже среди подходящих — не все разом (#252, третий заход):
+          максимум один УСПЕШНО подтянутый кандидат за ПРОГОН — слот общий
+          и живёт в update_branch (не по одному на каждую точку вызова),
+          поэтому та же дисциплина держит и behind-ветку merge_queue ниже.
+          Остальные получают строку и ждут следующего прогона — иначе
+          подтягивание первого кандидата может сбросить ai:ok второго тем же
+          циклом.
      Пороги — AI_REVIEW_RETRY_AFTER_MINUTES / AI_REVIEW_MAX_ATTEMPTS /
      UNHEALTHY_PR_AFTER_MINUTES в pulse_guard.py, рядом с остальными порогами
      предохранителя (одно место правды).
@@ -203,6 +210,25 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     return lines
 
 
+def _set_conflict_label(repo: str, pull: dict, *, present: bool) -> None:
+    """Единственное место, которое меняет метку CONFLICT_LABEL сразу и на
+    сервере, и в переданном объекте `pull` — одним действием, а не двумя
+    независимыми (класс «устаревшая метка в памяти», найден 2026-09-04:
+    mark_conflicts снимала/ставила метку через gh, но `pull["labels"]`
+    оставался прежним, и тот же объект уходил дальше в merge_queue/
+    update_remaining_pulls, где review_labels.should_update_branch читал уже
+    неактуальное состояние). Вызывающий код не может забыть обновить
+    `pull["labels"]` отдельно — этой возможности здесь просто нет."""
+    labels = pull["labels"]
+    has = any(label["name"] == CONFLICT_LABEL for label in labels)
+    if present and not has:
+        gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
+        labels.append({"name": CONFLICT_LABEL})
+    elif not present and has:
+        gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+        pull["labels"] = [label for label in labels if label["name"] != CONFLICT_LABEL]
+
+
 def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
     lines = []
     for pull in pulls:
@@ -216,12 +242,12 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
             # явно неконфликтным состояниям (review_labels.CONFLICT_CLEAR_STATES);
             # None/"unknown" не в счёт — «не знаю» не значит «нет конфликта».
             if CONFLICT_LABEL in labels and state in review_labels.CONFLICT_CLEAR_STATES:
-                gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+                _set_conflict_label(repo, pull, present=False)
                 lines.append(f"✅ PR #{pull['number']}: метка `conflict` снята (mergeable_state={state})")
             continue
         if CONFLICT_LABEL in labels:
             continue
-        gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
+        _set_conflict_label(repo, pull, present=True)
         rivals = ", ".join(f"#{other['number']}" for other in pulls if other["number"] != pull["number"]) or "нет"
         gh(
             "-X", "POST", f"repos/{repo}/issues/{pull['number']}/comments",
@@ -234,11 +260,54 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
     return lines
 
 
+class UpdateBranchBudgetExhausted(RuntimeError):
+    """Слот update_branch этого прогона уже занят (см. update_branch, #252,
+    третий заход) — не инфраструктурный сбой, вызывающий код обязан поймать
+    её отдельно и написать строку "подтянет следующий прогон", а не
+    смешивать с реальными ошибками update-branch (конфликт, сеть)."""
+
+
+# Слот на весь ПРОГОН планировщика, не на точку вызова: если бы дисциплина
+# «максимум один успешно подтянутый update-branch за прогон» жила локальной
+# переменной внутри update_remaining_pulls (как было раньше), вторая точка
+# вызова — behind-ветка merge_queue ниже — могла бы независимо подтянуть ещё
+# один PR тем же прогоном и снова запустить цикл push → сброс ai:ok →
+# pr-review → ai-review, который эта задача (#252) и закрывает. Слот живёт
+# здесь, в самой функции, которую обе точки вызова обязаны использовать для
+# настоящего push'а — обойти его, не обходя update_branch, нельзя. Если
+# появится третья точка вызова, ей тоже придётся идти через update_branch:
+# другого способа дёрнуть PUT .../update-branch в этом файле нет.
+_update_branch_used_this_run = False
+
+
+def reset_update_branch_budget() -> None:
+    """Обнуляет слот update_branch. main() вызывает это ровно один раз в
+    начале каждого прогона планировщика — без явного сброса единожды
+    потраченный слот остался бы закрытым до перезапуска процесса. Тесты
+    сбрасывают его тем же вызовом перед каждым сценарием (см. autouse-фикстуру
+    в test_scheduler.py)."""
+    global _update_branch_used_this_run
+    _update_branch_used_this_run = False
+
+
 def update_branch(repo: str, pr_number: int) -> None:
     """gh pr update-branch. Обновление через GITHUB_TOKEN не зажигает проверки
     (защита GitHub от рекурсии) — бот-PR навсегда зависает в blocked, поэтому
     PAT, если задан. Один вызов — переиспользуется merge_queue (PR behind) и
-    after_merge (#196, поведение 3: подтянуть остальных после слияния)."""
+    after_merge → update_remaining_pulls (#196, поведение 3: подтянуть
+    остальных после слияния).
+
+    Слот на прогон (см. _update_branch_used_this_run выше): вторая попытка
+    подтянуть ЛЮБОЙ PR этим же прогоном — из любой точки вызова — кидает
+    UpdateBranchBudgetExhausted вместо push'а. Успех отмечает слот занятым;
+    неудачная попытка (RuntimeError/CalledProcessError, вероятный конфликт)
+    слот не трогает — head не изменился, следующий кандидат в этом же
+    прогоне ничем не рискует."""
+    global _update_branch_used_this_run
+    if _update_branch_used_this_run:
+        raise UpdateBranchBudgetExhausted(
+            f"слот update_branch этого прогона уже занят до PR #{pr_number}"
+        )
     pat = os.environ.get("ORCHESTRA_PAT")
     if pat:
         subprocess.run(
@@ -249,6 +318,51 @@ def update_branch(repo: str, pr_number: int) -> None:
         )
     else:
         gh("-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch")
+    _update_branch_used_this_run = True
+
+
+def update_branch_or_report(
+    repo: str,
+    pr_number: int,
+    *,
+    on_success: str,
+    on_budget_exhausted: str,
+    on_error: str,
+) -> str:
+    """Единственное место, где разбираются три исхода update_branch — успех,
+    исчерпанный слот прогона (UpdateBranchBudgetExhausted), сетевой/иной сбой
+    (RuntimeError/subprocess.CalledProcessError). Закрывает класс "разная
+    обработка ошибок update_branch в разных точках вызова" (PR #288): раньше
+    behind-ветка merge_queue ловила только UpdateBranchBudgetExhausted, а
+    update_remaining_pulls — оба исхода, из-за чего сетевой сбой в
+    merge_queue ронял весь main() без отчёта. Тот же класс уже чинили
+    точечно в #248 (находка 3, вызовы детектора без try) и #253 (находка 4,
+    ветки ok/fail без per-item try).
+
+    Обе точки вызова обязаны идти через эту функцию, а не звать update_branch
+    напрямую и заводить свой try/except — три параметра-текста обязательные,
+    без значений по умолчанию, поэтому новая (третья) точка вызова, забывшая
+    текст на сетевой сбой, падает TypeError'ом сразу при вызове, а не тонет в
+    проде необработанным исключением. on_error форматируется через
+    .format(error=...).
+
+    subprocess.CalledProcessError разбирается отдельно от RuntimeError
+    (находка AI-ревью PR #288): в проде ORCHESTRA_PAT задан
+    (.github/workflows/orchestra.yml), значит update_branch падает не через
+    gh()/RuntimeError, а через subprocess.run(check=True) — исключение несёт
+    stderr `gh api`, а str(CalledProcessError) его не включает (только код
+    возврата). Без разбора отдельно строка отчёта теряет причину сбоя —
+    остаётся голое "returned non-zero exit status 1"."""
+    try:
+        update_branch(repo, pr_number)
+    except UpdateBranchBudgetExhausted:
+        return on_budget_exhausted
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or str(error)).strip()
+        return on_error.format(error=detail)
+    except RuntimeError as error:
+        return on_error.format(error=error)
+    return on_success
 
 
 def pr_bad_checks(repo: str, pull: dict) -> list[str]:
@@ -285,8 +399,23 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
                     "подтягивание пропущено (#252)"
                 )
                 continue
-            update_branch(repo, pull["number"])
-            skipped.append(f"#{pull['number']} — обновлена из main, проверки пойдут заново")
+            # Слот update_branch общий на весь прогон (#252, третий заход) —
+            # эта ветка и update_remaining_pulls после слияния делят один и
+            # тот же слот внутри update_branch, поэтому здесь тоже возможен
+            # UpdateBranchBudgetExhausted, а не только сетевой сбой. Обработка
+            # обоих исходов — в update_branch_or_report (#288), не здесь.
+            skipped.append(update_branch_or_report(
+                repo, pull["number"],
+                on_success=f"#{pull['number']} — обновлена из main, проверки пойдут заново",
+                on_budget_exhausted=(
+                    f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
+                    "этого прогона уже занят другим PR; подтянет следующий прогон оркестратора (#252)"
+                ),
+                on_error=(
+                    f"#{pull['number']} — behind main и близок к слиянию, но update_branch не удался "
+                    "(вероятен конфликт — попадёт под mark_conflicts): {error}"
+                ),
+            ))
             continue
         if state not in ("clean", "unstable", "has_hooks"):
             skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
@@ -531,7 +660,25 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     pr-review.yml и снимает валидные ai:*-метки без всякой пользы для PR,
     которому рано сливаться. Кандидат подтягивается, только если он реально
     близок к слиянию (оба вердикта зелёные) или уже в конфликте (подтягивание
-    может его расшить)."""
+    может его расшить).
+
+    Максимум один УСПЕШНО подтянутый кандидат за ПРОГОН, не за вызов этой
+    функции (#252, третий заход): подтягивание близких к слиянию PR меняет
+    их head — и само может сбросить их же `ai:ok` (pr-review.yml
+    перезапускается на пуш и снимает ai:*-метки), то есть тот кандидат,
+    который секунду назад проходил предикат, после первого же подтягивания
+    может из него выпасть. Подтягивать сразу нескольких — значит гонять этот
+    цикл несколько раз за один прогон. Слот общий с behind-веткой
+    merge_queue: обе точки вызова делят один и тот же счётчик внутри
+    update_branch (_update_branch_used_this_run), а не по локальной
+    переменной на каждую точку вызова — иначе поведение осталось бы прежним,
+    просто с двумя независимыми лимитами по одному вместо одного общего.
+    Слот считается занятым только УСПЕХОМ: неудачная попытка (вероятный
+    конфликт) не трогает head, значит следующий кандидат в этом же вызове
+    ничем не рискует. Пропущенные из-за уже занятого слота кандидаты не
+    молчат — они получают отдельную строку с указанием, что подтянет их
+    следующий прогон оркестратора (тот же газ без состояния, что и у
+    should_update_branch)."""
     lines = []
     for other in other_pulls:
         if other["number"] == merged_number or other.get("draft"):
@@ -542,14 +689,20 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
                 "— не близок к слиянию и не в конфликте (#252)"
             )
             continue
-        try:
-            update_branch(repo, other["number"])
-            lines.append(f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}")
-        except (RuntimeError, subprocess.CalledProcessError) as error:
-            lines.append(
+        # Обработка всех трёх исходов — в update_branch_or_report (#288), не здесь.
+        lines.append(update_branch_or_report(
+            repo, other["number"],
+            on_success=f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}",
+            on_budget_exhausted=(
+                f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
+                "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
+                "оркестратора (#252)"
+            ),
+            on_error=(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "
-                f"(вероятен конфликт — попадёт под mark_conflicts): {error}"
-            )
+                "(вероятен конфликт — попадёт под mark_conflicts): {error}"
+            ),
+        ))
     return lines
 
 
@@ -754,6 +907,11 @@ def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
     lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
+    # Слот update_branch общий на ВЕСЬ этот прогон (#252, третий заход) —
+    # обнуляем его один раз здесь, до merge_queue и до update_remaining_pulls,
+    # которые обе точки вызова делят через один и тот же счётчик внутри
+    # update_branch (см. reset_update_branch_budget).
+    reset_update_branch_budget()
 
     # «Кто следит за следящим» (#120): первой проверкой, пока этот запуск жив,
     # кричим о пропавших пульсах — остальная работа может не иметь смысла,
