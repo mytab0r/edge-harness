@@ -321,6 +321,39 @@ def update_branch(repo: str, pr_number: int) -> None:
     _update_branch_used_this_run = True
 
 
+def update_branch_or_report(
+    repo: str,
+    pr_number: int,
+    *,
+    on_success: str,
+    on_budget_exhausted: str,
+    on_error: str,
+) -> str:
+    """Единственное место, где разбираются три исхода update_branch — успех,
+    исчерпанный слот прогона (UpdateBranchBudgetExhausted), сетевой/иной сбой
+    (RuntimeError/subprocess.CalledProcessError). Закрывает класс "разная
+    обработка ошибок update_branch в разных точках вызова" (PR #288): раньше
+    behind-ветка merge_queue ловила только UpdateBranchBudgetExhausted, а
+    update_remaining_pulls — оба исхода, из-за чего сетевой сбой в
+    merge_queue ронял весь main() без отчёта. Тот же класс уже чинили
+    точечно в #248 (находка 3, вызовы детектора без try) и #253 (находка 4,
+    ветки ok/fail без per-item try).
+
+    Обе точки вызова обязаны идти через эту функцию, а не звать update_branch
+    напрямую и заводить свой try/except — три параметра-текста обязательные,
+    без значений по умолчанию, поэтому новая (третья) точка вызова, забывшая
+    текст на сетевой сбой, падает TypeError'ом сразу при вызове, а не тонет в
+    проде необработанным исключением. on_error форматируется через
+    .format(error=...)."""
+    try:
+        update_branch(repo, pr_number)
+    except UpdateBranchBudgetExhausted:
+        return on_budget_exhausted
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        return on_error.format(error=error)
+    return on_success
+
+
 def pr_bad_checks(repo: str, pull: dict) -> list[str]:
     """Имена красных (не success/skipped/neutral) check-run'ов текущего head.
     Один и тот же критерий «красного обязательного чека», что и внутри
@@ -358,16 +391,20 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
             # Слот update_branch общий на весь прогон (#252, третий заход) —
             # эта ветка и update_remaining_pulls после слияния делят один и
             # тот же слот внутри update_branch, поэтому здесь тоже возможен
-            # UpdateBranchBudgetExhausted, а не только сетевой сбой.
-            try:
-                update_branch(repo, pull["number"])
-            except UpdateBranchBudgetExhausted:
-                skipped.append(
+            # UpdateBranchBudgetExhausted, а не только сетевой сбой. Обработка
+            # обоих исходов — в update_branch_or_report (#288), не здесь.
+            skipped.append(update_branch_or_report(
+                repo, pull["number"],
+                on_success=f"#{pull['number']} — обновлена из main, проверки пойдут заново",
+                on_budget_exhausted=(
                     f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
                     "этого прогона уже занят другим PR; подтянет следующий прогон оркестратора (#252)"
-                )
-                continue
-            skipped.append(f"#{pull['number']} — обновлена из main, проверки пойдут заново")
+                ),
+                on_error=(
+                    f"#{pull['number']} — behind main и близок к слиянию, но update_branch не удался "
+                    "(вероятен конфликт — попадёт под mark_conflicts): {error}"
+                ),
+            ))
             continue
         if state not in ("clean", "unstable", "has_hooks"):
             skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
@@ -641,19 +678,19 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
                 "— не близок к слиянию и не в конфликте (#252)"
             )
             continue
-        try:
-            update_branch(repo, other["number"])
-            lines.append(f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}")
-        except UpdateBranchBudgetExhausted:
-            lines.append(
+        # Обработка всех трёх исходов — в update_branch_or_report (#288), не здесь.
+        lines.append(update_branch_or_report(
+            repo, other["number"],
+            on_success=f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}",
+            on_budget_exhausted=(
                 f"⏭️ PR #{other['number']} уже обновлён этим запуском — за раз подтягивается "
                 f"только один кандидат (#252); подтянет следующий прогон оркестратора"
-            )
-        except (RuntimeError, subprocess.CalledProcessError) as error:
-            lines.append(
+            ),
+            on_error=(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "
-                f"(вероятен конфликт — попадёт под mark_conflicts): {error}"
-            )
+                "(вероятен конфликт — попадёт под mark_conflicts): {error}"
+            ),
+        ))
     return lines
 
 

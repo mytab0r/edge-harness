@@ -815,6 +815,45 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
     assert any("слот update_branch" in line and "#3" in line for line in lines)
 
 
+def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
+    # #288 (класс: разная обработка ошибок update_branch в разных точках
+    # вызова, тот же класс, что уже чинили точечно в #248 находка 3 и #253
+    # находка 4). До фикса behind-ветка merge_queue ловила только
+    # UpdateBranchBudgetExhausted — сетевой сбой (RuntimeError/
+    # CalledProcessError) пробрасывался наружу и ронял merge_queue и main()
+    # целиком: без summary, без отчёта, без очереди слияний. Два behind-PR:
+    # первый падает по сети, второй обязан получить попытку тем же обходом —
+    # неудача не потребляет общий слот update_branch (см. update_branch).
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),  # обновление упадёт по сети
+        pull(3, labels=["review:ok", "ai:ok"]),  # обязан получить попытку следом
+    ]
+    fake = FakeGh({
+        # Более специфичные маршруты (.../update-branch) обязаны идти ПЕРЕД
+        # короткими (.../pulls/N) — FakeGh матчит по первой подходящей
+        # подстроке, и короткий фрагмент иначе перехватит PUT-запрос раньше,
+        # чем до него дойдёт исключение (см. соседние тесты behind-ветки).
+        "pulls/2/update-branch": RuntimeError("dial tcp: connection refused"),
+        "pulls/3/update-branch": None,
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    lines, hard_failure = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
+
+    assert not hard_failure
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "сбой на #2 не должен остановить обход — #3 обязан получить попытку"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+    failed_lines = [line for line in lines if "не удался" in line]
+    updated_lines = [line for line in lines if "обновлена из main" in line]
+    assert len(failed_lines) == 1 and "#2" in failed_lines[0] and "dial tcp" in failed_lines[0]
+    assert len(updated_lines) == 1 and "#3" in updated_lines[0]
+
+
 # Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
 def test_mark_conflicts_clears_label_on_explicit_non_conflict_state(monkeypatch):
     pulls = [pull(2, labels=["conflict"])]
