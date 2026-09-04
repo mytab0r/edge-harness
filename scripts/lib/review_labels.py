@@ -36,6 +36,12 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # scheduler.py) — should_update_branch ниже читает её же.
 CONFLICT_LABEL = "conflict"
 
+# Состояния mergeable_state, при которых GitHub ЯВНО подтвердил «не dirty» —
+# только по ним mark_conflicts вправе снять CONFLICT_LABEL (#270). None/
+# "unknown" сюда не входят: «вычисление не завершилось» — не то же самое,
+# что «конфликта нет» (снятие по ним спрятало бы реальный конфликт).
+CONFLICT_CLEAR_STATES = ("clean", "unstable", "has_hooks", "behind", "blocked")
+
 
 def _names(labels) -> set[str]:
     """Имена меток из любой прод-формы: список dict'ов API или множество имён."""

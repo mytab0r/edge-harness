@@ -736,6 +736,26 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     assert any("pulls/2/update-branch" in c for c in fake.calls)
 
 
+# Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
+def test_mark_conflicts_clears_label_on_explicit_non_conflict_state(monkeypatch):
+    pulls = [pull(2, labels=["conflict"])]
+    fake = FakeGh({"pulls/2": {"mergeable_state": "clean"}, "labels/conflict": None})
+    patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, pulls)
+    assert any(c.startswith("-X DELETE") and "labels/conflict" in c for c in fake.calls)
+    assert any("снята" in line for line in lines)
+    assert sch.review_labels.should_update_branch(set()) is False  # больше не газ
+
+
+def test_mark_conflicts_keeps_label_on_unknown_state_not_silent_wrong(monkeypatch):
+    pulls = [pull(2, labels=["conflict"])]  # mergeable_state ещё не вычислен (null)
+    fake = FakeGh({"pulls/2": {"mergeable_state": None}})
+    patch_gh(monkeypatch, fake)
+    lines = sch.mark_conflicts(REPO, pulls)
+    assert lines == []
+    assert not any(c.startswith(("-X POST", "-X PUT", "-X DELETE")) for c in fake.calls)
+
+
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 

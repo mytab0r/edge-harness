@@ -209,9 +209,16 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
         # mergeable_state живёт только на endpoint'е одиночного PR: в списке он
         # всегда отсутствует, и доверие ему — тихая потеря всех кандидатов.
         single = gh(f"repos/{repo}/pulls/{pull['number']}")
-        if single.get("mergeable_state") != "dirty":
-            continue
+        state = single.get("mergeable_state")
         labels = {label["name"] for label in pull["labels"]}
+        if state != "dirty":
+            # Газ (#270): раньше метка не снималась никогда. Снимаем только по
+            # явно неконфликтным состояниям (review_labels.CONFLICT_CLEAR_STATES);
+            # None/"unknown" не в счёт — «не знаю» не значит «нет конфликта».
+            if CONFLICT_LABEL in labels and state in review_labels.CONFLICT_CLEAR_STATES:
+                gh("-X", "DELETE", f"repos/{repo}/issues/{pull['number']}/labels/{CONFLICT_LABEL}")
+                lines.append(f"✅ PR #{pull['number']}: метка `conflict` снята (mergeable_state={state})")
+            continue
         if CONFLICT_LABEL in labels:
             continue
         gh("-X", "POST", f"repos/{repo}/issues/{pull['number']}/labels", "-f", f"labels[]={CONFLICT_LABEL}")
