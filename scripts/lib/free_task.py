@@ -9,8 +9,8 @@
      (`scan("#[0-9]+")` по всему тексту) — тот же класс подстрочного
      совпадения, что уже чинили в `scripts/orchestra/contract_check.py`
      (#187, #195). Здесь номер задачи, которую PR ОБЪЯВЛЯЕТ, берётся из
-     `task_ref.declared_tasks` — первая строка тела, начинающаяся с `#N`,
-     симметрично contract_check.py.
+     `task_ref.declared_tasks` — строка тела, начинающаяся с `#N` (обычно
+     первая), симметрично contract_check.py.
 
   2. Открытый PR у задачи БЕЗ исполнителя (issue.assignees пуст) больше не
      исключает её из пула. `scheduler.py::unhealthy_pulls` снимает
@@ -94,9 +94,10 @@ def oldest_free(
 
 
 def declared_pr_for_task(prs: list[dict[str, Any]], task_number: int) -> dict[str, Any] | None:
-    """Открытый PR, ОБЪЯВЛЯЮЩИЙ задачу `task_number` первой строкой тела —
-    то же правило, что `contract_check.py` (`declared_tasks(body)[0]`),
-    применённое симметрично к «своему» и «чужому» PR."""
+    """Открытый PR, ОБЪЯВЛЯЮЩИЙ задачу `task_number` первым объявленным в теле
+    (`declared_tasks(body)[0]` — строка тела, начинающаяся с `#N`, обычно
+    первая) — то же правило, что `contract_check.py`, применённое симметрично
+    к «своему» и «чужому» PR."""
     for pull in prs:
         body = pull.get("body") or ""
         declared = task_ref.declared_tasks(body)
