@@ -127,6 +127,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_task_ref_usage_guard.py -q
 
+      # Класс «страница GitHub API без обхода молча теряет хвост» (#308): за
+      # сутки чинили точечно семь раз (check_pr.py, ai_review.py, scheduler.py,
+      # review_labels, таймлайн), каждый раз находилось следующее место.
+      # Гвардия сканирует scripts/ на сырые gh(...per_page=...) без параметра
+      # page= вне ALLOWED_SINGLE_PAGE_CALLS (список ограничен по природе или
+      # уже кричит громко на упоре) — новое такое место красит CI.
+      - name: Гвардия пагинации — списочный ответ GitHub API без обхода страниц
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pagination_guard.py -q
+
       # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
       # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
       # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает
