@@ -8,7 +8,17 @@
 #   1) fetch + авторитетная сверка ls-remote — тихо упавший fetch base не выдаёт;
 #   2) самовосстановление core.hooksPath — гвардия свежести обязательна всегда.
 #
-# Использование: scripts/git/task-branch <номер>-<slug>
+# Рабочее дерево (#332): агенты заводили `.claude/worktrees/<...>` вручную кто
+# как — разнобой имён стал причиной трижды за сутки (агент правил чужую ветку
+# в чужом дереве, дифф чужой задачи затирался). Здесь дерево заводится/
+# переиспользуется по одному правилу (`.githooks/pre-commit` его же и
+# проверяет): `<корень репозитория>/.claude/worktrees/<номер>-<slug>`. В CI
+# (GITHUB_ACTIONS=true) поведение старое — переключение ветки в текущем
+# каталоге: воркер (scripts/worker/task.sh) уже работает в одноразовом
+# изолированном чекауте на один прогон, заводить там ещё и worktree незачем
+# и меняло бы каталог работы у уже написанного пайплайна.
+#
+# Использование: scripts/git/task-branch <номер>-<slug>   (без изменений)
 set -euo pipefail
 
 task="${1:-}"
@@ -114,18 +124,74 @@ if [ -n "$epic_task_num" ]; then
   fi
 fi
 
-# Ветка уже существует — повторно не заводим и аренду под неё НЕ берём (находка
-# ревью PR #360): иначе claim проходит, а `git switch -c` ниже падает на
-# существующем имени — замок остаётся висеть до TTL-сборщика (24 ч), ровно тот
-# осиротевший замок, от которого этот скрипт защищает. Проверка ДО claim'а и
-# ДО флага транспорта: существующая ветка — это доводка, у неё другой вход
-# (чекаут, WORKER-PLAYBOOK.md «Ветка»), и аренда там берётся вручную до чекаута.
-if git show-ref --verify --quiet "refs/heads/agent/$task" \
-   || git ls-remote --heads origin "refs/heads/agent/$task" | grep -q .; then
-  echo "ОШИБКА: ветка agent/$task уже существует — task-branch заводит только НОВЫЕ ветки." >&2
-  echo "  Доводи существующую: git fetch origin agent/$task && git checkout -B agent/$task origin/agent/$task," >&2
-  echo "  аренду для доводки возьми вручную (python3 scripts/lib/claim_task.py claim N) ДО чекаута." >&2
-  exit 1
+branch="agent/$task"
+
+# Печать ключевых граблей инфраструктуры в момент старта задачи, а не когда-нибудь
+# потом «если вспомнить прочитать» (задача #323): task-branch — один из ДВУХ
+# входов в agent-ветку (второй — доводка уже открытого PR в scripts/worker/task.sh,
+# он тоже зовёт print_infra_digest напрямую, минуя этот файл, — см. #326 находка 1).
+# Текст — одно место правды в scripts/gh/infra_digest.sh, не копия здесь.
+# Функция, а не копии: выходов здесь несколько (переиспользование дерева,
+# усыновление осиротевшей ветки, CI-переключение, новое дерево) — путь агенту
+# печатается последним в каждом, грабли идут перед ним во всех.
+print_digest() {
+  source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
+  print_infra_digest
+}
+
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  # CI: одноразовый изолированный чекаут на прогон — worktree не нужен,
+  # старое поведение (переключение в текущем каталоге) сохранено как есть.
+  # Отказ «ветка уже существует» (#360) живёт и здесь: иначе claim (ниже)
+  # проходит, а `git switch -c` (ниже) падает на существующем имени — замок
+  # остаётся висеть до TTL-сборщика (24 ч), ровно тот осиротевший замок,
+  # от которого отказ защищает. Проверка ДО claim'а и ДО флага транспорта:
+  # существующая ветка — это доводка, у неё другой вход.
+  if git show-ref --verify --quiet "refs/heads/$branch" \
+     || git ls-remote --heads origin "refs/heads/$branch" | grep -q .; then
+    echo "ОШИБКА: ветка $branch уже существует — task-branch заводит только НОВЫЕ ветки." >&2
+    echo "  Доводи существующую: git fetch origin $branch && git checkout -B $branch origin/$branch," >&2
+    echo "  аренду для доводки возьми вручную (python3 scripts/lib/claim_task.py claim $task_number) ДО чекаута." >&2
+    exit 1
+  fi
+else
+  # ── Рабочее дерево (#332) ──────────────────────────────────────────────────
+  # Разрешение дерева стоит ДО аренды: повторный запуск на той же задаче
+  # обязан напечатать путь, а не отвалиться о собственный замок (claim не
+  # идемпотентен по актору, #356), и не оставить осиротевший замок — оба
+  # выхода ниже стоят до claim'а и ничего не захватывают (класс #360).
+  main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+  wt_dir="$main_root/.claude/worktrees/$task"
+
+  # Уже есть worktree на эту ветку (повторный запуск на той же задаче) —
+  # переиспользуем его, а не пытаемся завести дубль (git worktree add откажет
+  # сам, но сообщение должно указывать путь, а не сырой git-эксепшн).
+  existing_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) cur_path="${line#worktree }" ;;
+      branch\ refs/heads/"$branch") existing_path="$cur_path" ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [ -n "$existing_path" ]; then
+    echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
+    echo "$existing_path"
+    exit 0
+  fi
+
+  if git rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
+    # Ветка существует, но ни в одном дереве не зачекаучена (осиротела) —
+    # заводим дерево на неё, не создавая вторую ветку.
+    git worktree add "$wt_dir" "$branch"
+    git config core.hooksPath .githooks
+    echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+    echo "$wt_dir"
+    print_digest
+    exit 0
+  fi
+  # Ветки нет ни локально, ни в дереве — падаем сквозь: аренда ниже, затем
+  # создание ветки СРАЗУ в дереве (хвост файла).
 fi
 
 # Аренда задачи (#121, ADR 0006) — до сих пор её брал только облачный воркер
@@ -220,17 +286,22 @@ else
   fi
 fi
 
-git switch -c "agent/$task" refs/remotes/origin/main
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  git switch -c "$branch" refs/remotes/origin/main
+  git config core.hooksPath .githooks
+  echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+  print_digest
+  exit 0
+fi
 
-# Гвардия свежести ставится каждым запуском: пересозданный клон защищён сразу.
+# Гвардия свежести ставится в общем конфиге репозитория (git config без
+# --worktree пишет в <git-common-dir>/config) — общий для ВСЕХ worktree,
+# ставить заново в каждом дереве не нужно, но лишним не будет.
 git config core.hooksPath .githooks
 
-echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
-
-# Печать ключевых граблей инфраструктуры в момент старта задачи, а не когда-нибудь
-# потом «если вспомнить прочитать» (задача #323): task-branch — один из ДВУХ
-# входов в agent-ветку (второй — доводка уже открытого PR в scripts/worker/task.sh,
-# он тоже зовёт print_infra_digest напрямую, минуя этот файл, — см. #326 находка 1).
-# Текст — одно место правды в scripts/gh/infra_digest.sh, не копия здесь.
-source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
-print_infra_digest
+mkdir -p "$(dirname "$wt_dir")"
+git worktree add -b "$branch" "$wt_dir" refs/remotes/origin/main
+echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+echo "$wt_dir"
+print_digest
