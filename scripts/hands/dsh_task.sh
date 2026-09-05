@@ -308,16 +308,29 @@ if [ "$rc" -eq 0 ]; then
   fi
 fi
 
+# Рендер транскрипта (#131): доставка в морду не значит, что владелец увидит
+# актуальные provider/model и раскрытые детали тула — структурный инвариант
+# формы батча (research/12), best-effort (не роняет успешный прогон).
+transcript_issues="[]"
+if [ "${drained_lines:-0}" -gt 0 ]; then
+  verify_out=$(dsh_edge_verify_transcript "$DSH_EDGE_SESSION_ID" 2>&1 >/dev/null) && verify_rc=0 || verify_rc=$?
+  if [ "$verify_rc" != 0 ]; then
+    transcript_issues=$(printf '%s\n' "$verify_out" | jq -R . | jq -s .)
+  fi
+fi
+
 # Статистика плагина (счётчики отброшенного, capped) — одна строка stream_note
-# на прогон вместо строк на каждое событие. capped — warn: деградация объявлена.
+# на прогон вместо строк на каждое событие. capped/транскрипт-находки — warn.
 if [ -f "$SPOOL_FILE.stats.json" ]; then
   jq -e . "$SPOOL_FILE.stats.json" >/dev/null 2>&1 || { echo '{"accepted":null,"capped":false,"note":"stats повреждён"}' >"$SPOOL_FILE.stats.json"; }
   add_event "stream_note" "$(jq -n \
     --slurpfile s "$SPOOL_FILE.stats.json" \
     --argjson drained "${drained_lines:-0}" \
-    '{level: (if ($s[0].capped // false) then "warn" else "debug" end),
+    --argjson transcript_issues "$transcript_issues" \
+    '{level: (if (($s[0].capped // false) or ($transcript_issues | length) > 0) then "warn" else "debug" end),
       note: "статистика стрима сессии",
-      spool: {accepted: $s[0].accepted, drained: $drained, dropped: ($s[0].dropped // {}), capped: ($s[0].capped // false)}}')"
+      spool: {accepted: $s[0].accepted, drained: $drained, dropped: ($s[0].dropped // {}), capped: ($s[0].capped // false)},
+      transcript_render: {issues: $transcript_issues}}')"
 fi
 
 if [ "$rc" -eq 0 ]; then

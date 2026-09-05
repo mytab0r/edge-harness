@@ -390,6 +390,15 @@ if [ "$rc" -eq 0 ]; then
   [ "$drained_lines" -gt 0 ] || { echo "::error::Ноль событий в сессии морды при успешном прогоне (#119)" >&2; exit 1; }
 fi
 
+# Рендер транскрипта (#131): доставка в морду не значит, что владелец увидит
+# актуальные provider/model и раскрытые детали тула — это отдельный
+# структурный инвариант формы батча (research/12), проверяется best-effort
+# (не роняет успешный прогон, warning уже пишет сама функция).
+if [ "$drained_lines" -gt 0 ]; then
+  dsh_edge_verify_transcript "$DSH_EDGE_SESSION_ID" \
+    || echo "::warning::Транскрипт-проверка (#131) нашла расхождения — см. warning'и выше" >&2
+fi
+
 ANSWER_TAIL=$(tail -c 4000 "$ANSWER_FILE" | redact)
 ERR_TAIL=$(tail -c 4000 "$ERR_FILE" | redact)
 echo "--- хвост ответа DSH ---"; [ -n "$ANSWER_TAIL" ] && printf '%s\n' "$ANSWER_TAIL"

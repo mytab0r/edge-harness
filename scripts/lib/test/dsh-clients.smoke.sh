@@ -71,6 +71,12 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
       count=$(command jq -s 'length' <"$data_file" 2>/dev/null || echo 0)
       log_call "MORDE-INGEST $url events=$count"
       body="{\"appended\":$count,\"lastSeq\":$count}" ;;
+    */api/sessions/*/events)
+      # Replay (#131, транскрипт-проверка): SSE `data: {...}` построчно —
+      # те же три события, что пишет dsh-заглушка в спул (turn/start,
+      # user/message без tool-вызовов, turn/end); нулевые находки ожидаемы.
+      log_call "MORDE-EVENTS $url"
+      body=$'data: {"type":"turn/start","data":{"turn":1}}\ndata: {"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}\ndata: {"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' ;;
     *journal.test/api/events*)
       if [ "$have_post" -eq 1 ]; then
         log_call "JOURNAL-POST /api/events"
