@@ -30,6 +30,14 @@ _spec = importlib.util.spec_from_file_location("ai_review", SCRIPT_DIR / "ai_rev
 ai_review = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ai_review)
 
+# Единственное место правды на чтение/запись графа зависимостей (#361,
+# scripts/lib/task_deps.py) — та же обвязка importlib, что уже применяет
+# scheduler.py, не второй экземпляр модуля.
+_td_spec = importlib.util.spec_from_file_location(
+    "task_deps", SCRIPT_DIR.parent / "lib" / "task_deps.py")
+task_deps = importlib.util.module_from_spec(_td_spec)
+_td_spec.loader.exec_module(task_deps)
+
 
 def gh(*args: str):
     return ai_review.gh(*args)
@@ -74,11 +82,20 @@ def latest_review_comment(repo: str, pr: int) -> dict | None:
     return latest
 
 
-def open_task_titles(repo: str) -> set[str]:
-    return {
-        issue["title"] for issue in _pages(f"repos/{repo}/issues?state=open&labels=task")
+def open_pool_issues(repo: str) -> list[dict]:
+    """Открытые задачи пула (метка `task`), без PR — один фактический
+    источник и для заголовков (идемпотентность по названию), и для номеров
+    (валидация нативной связи ниже): раньше `open_task_titles` делал
+    отдельный проход только за заголовками, второй проход за номерами
+    дублировал бы тот же запрос."""
+    return [
+        issue for issue in _pages(f"repos/{repo}/issues?state=open&labels=task")
         if "pull_request" not in issue
-    }
+    ]
+
+
+def open_task_titles(repo: str) -> set[str]:
+    return {issue["title"] for issue in open_pool_issues(repo)}
 
 
 def file_task(repo: str, task: dict) -> int:
@@ -90,6 +107,40 @@ def file_task(repo: str, task: dict) -> int:
                  "-f", "body=" + body,
                  "-f", "labels[]=task")
     return int(created["number"])
+
+
+def wire_declared_dependency(
+    repo: str, new_number: int, body: str, open_numbers: set[int],
+) -> list[int]:
+    """Переносит явный ответ «БЛОКИРУЕТСЯ: …» (последняя строка тела,
+    `ai_review.blocked_by_numbers`) в нативный граф `blockedBy` — задача
+    #371, продолжение #361: связь ставится ТЕМ, КТО ЗНАЕТ факт (здесь —
+    прямо в момент создания issue, той же командой), не отдельным
+    обходом-сканером — дешевле (без второго периодического прохода пула
+    по расписанию) и без риска устаревания.
+
+    Номер, которого нет в ТЕКУЩЕМ открытом пуле с меткой `task`
+    (уже закрыт, не задача, не существует, модель ошиблась) — НЕ линкуется,
+    печатается предупреждение: ложная связь опаснее отсутствующей (то же
+    правило, что для ручной миграции #371). Отсутствие строки вовсе (`None`
+    — старый формат комментария, до этой задачи) не роняет заведение
+    задачи — деградирует молча в лог, не в исключение: комментарий мог
+    быть создан до деплоя этого контракта."""
+    numbers = ai_review.blocked_by_numbers(body)
+    if numbers is None:
+        print(f"    ! #{new_number}: нет строки «БЛОКИРУЕТСЯ: …» в теле "
+              f"(старый формат комментария) — граф не тронут")
+        return []
+    linked: list[int] = []
+    for n in numbers:
+        if n not in open_numbers:
+            print(f"    ! #{new_number}: «БЛОКИРУЕТСЯ: #{n}» — #{n} не открытая "
+              f"задача пула с меткой task — связь НЕ поставлена")
+            continue
+        task_deps.add_dependency(repo, blocked=new_number, blocking=n, gh_call=gh)
+        linked.append(n)
+        print(f"    -> #{new_number} заблокирована #{n} (нативный граф)")
+    return linked
 
 
 def current_repo() -> str:
@@ -153,7 +204,9 @@ def main() -> int:
               f"задачи уже заведены ({' '.join(f'#{n}' for n in already)}) — идемпотентность по маркеру")
         return 0
 
-    existing = open_task_titles(repo)
+    pool = open_pool_issues(repo)
+    existing = {issue["title"] for issue in pool}
+    open_numbers = {issue["number"] for issue in pool}
     print(f"Ревью {facts.get('reviewer')} при head {facts.get('head', '?')[:12]}: "
           f"{len(tasks)} предложенных задач, открытых с меткой task: {len(existing)}")
     filed: list[int] = []
@@ -162,11 +215,17 @@ def main() -> int:
             print(f"  = «{task['title']}» — уже открыта, пропущено (идемпотентность)")
             continue
         if args.dry_run:
-            print(f"  [dry-run] завёл бы: «{task['title']}»")
+            preview = ai_review.blocked_by_numbers(task["body"])
+            print(f"  [dry-run] завёл бы: «{task['title']}» (блокируется: {preview})")
             continue
         number = file_task(repo, task)
         filed.append(number)
         print(f"  + #{number} «{task['title']}»")
+        # Перенос заявленной зависимости в нативный граф — та же команда,
+        # что создала issue (#371): номер новой задачи уже известен, второй
+        # обход пула не нужен.
+        open_numbers.add(number)
+        wire_declared_dependency(repo, number, task["body"], open_numbers)
     if args.dry_run:
         return 0
     if filed:

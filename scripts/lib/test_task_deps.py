@@ -127,6 +127,42 @@ def test_fetch_pool_rejects_label_that_is_not_a_literal():
         td.fetch_pool("owner/repo", label="not a label; DROP")
 
 
+def test_fetch_pool_include_body_adds_field_to_query_and_result():
+    node = issue_node(43, "мета")
+    node["body"] = "Тело задачи с текстом."
+    page = {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [node],
+            }
+        }
+    }
+    fake = FakeGraphQL(pages=[page])
+    import unittest.mock as mock
+    with mock.patch.object(td, "subprocess", SimpleNamespace(run=fake.run)):
+        issues = td.fetch_pool("owner/repo", include_body=True)
+    assert issues[0]["body"] == "Тело задачи с текстом."
+    # запрос реально несёт поле body — не тихая заглушка
+    assert any("body" in " ".join(call) for call in fake.calls)
+
+
+def test_fetch_pool_default_omits_body_key():
+    page = {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [issue_node(43, "мета")],
+            }
+        }
+    }
+    fake = FakeGraphQL(pages=[page])
+    import unittest.mock as mock
+    with mock.patch.object(td, "subprocess", SimpleNamespace(run=fake.run)):
+        issues = td.fetch_pool("owner/repo")
+    assert "body" not in issues[0]
+
+
 def test_gh_graphql_surfaces_gh_failure_loudly():
     fake = FakeGraphQL()
     fake.run = lambda *a, **kw: gh_error(401, "Bad credentials")

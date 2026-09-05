@@ -28,6 +28,27 @@ body:
         - area:process
     validations:
       required: true
+  - type: input
+    id: blocked_by
+    attributes:
+      label: Чем блокируется
+      description: >-
+        Номера issue через пробел (#123 #124) или «ничем». Явный ответ обязателен —
+        «не думал об этом» не вариант. Это человекочитаемый след в теле: настоящая
+        связь ставится отдельно, python scripts/lib/task_deps.py block <эта#> <блокирующая#>.
+      placeholder: "ничем"
+    validations:
+      required: true
+  - type: input
+    id: blocking
+    attributes:
+      label: Что блокирует
+      description: >-
+        Номера issue через пробел (#123 #124) или «ничем» — какие ДРУГИЕ задачи не
+        могут начаться раньше этой. Тоже явный ответ, не пропуск.
+      placeholder: "ничем"
+    validations:
+      required: true
   - type: textarea
     id: context
     attributes:

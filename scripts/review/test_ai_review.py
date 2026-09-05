@@ -113,15 +113,18 @@ def test_parse_tasks_two_blocks():
         "ЗАДАЧА: Убрать дубликат пина DSH\n"
         "Цель: один пин в одном месте.\n"
         "Критерий готовности: греп по репо находит одно место.\n"
+        "БЛОКИРУЕТСЯ: ничем\n"
         "КОНЕЦ ЗАДАЧИ\n"
         "Ещё проза.\n"
-        "ЗАДАЧА: Вторая\nТело два.\nКОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Вторая\nТело два.\nБЛОКИРУЕТСЯ: #12 #34\nКОНЕЦ ЗАДАЧИ\n"
         "ВЕРДИКТ: approve"
     )
     tasks = ai.parse_tasks(answer)
     assert [t["title"] for t in tasks] == ["Убрать дубликат пина DSH", "Вторая"]
     assert "Цель: один пин в одном месте." in tasks[0]["body"]
     assert "Критерий готовности" in tasks[0]["body"]
+    assert ai.blocked_by_numbers(tasks[0]["body"]) == []
+    assert ai.blocked_by_numbers(tasks[1]["body"]) == [12, 34]
 
 
 def test_parse_tasks_unterminated_block_dropped():
@@ -131,11 +134,46 @@ def test_parse_tasks_unterminated_block_dropped():
 
 def test_parse_tasks_empty_title_not_matched():
     # «ЗАДАЧА:» без заголовка — не блок: полузадача в пуле хуже её отсутствия
-    assert ai.parse_tasks("ЗАДАЧА:\nтело\nКОНЕЦ ЗАДАЧИ\nВЕРДИКТ: approve") == []
+    assert ai.parse_tasks("ЗАДАЧА:\nтело\nБЛОКИРУЕТСЯ: ничем\nКОНЕЦ ЗАДАЧИ\nВЕРДИКТ: approve") == []
 
 
 def test_parse_tasks_none():
     assert ai.parse_tasks("Проза без предложений.\nВЕРДИКТ: approve") == []
+
+
+def test_parse_tasks_missing_blocked_by_dropped(capsys):
+    # #371: строка «БЛОКИРУЕТСЯ: …» обязательна и последняя — блок без неё
+    # (старый формат промпта, до этой задачи) отбрасывается целиком, громко.
+    answer = "ЗАДАЧА: Без ответа\nЦель.\nКритерий.\nКОНЕЦ ЗАДАЧИ\nВЕРДИКТ: approve"
+    assert ai.parse_tasks(answer) == []
+    out = capsys.readouterr().out
+    assert "::warning::" in out
+    assert "Без ответа" in out
+
+
+def test_parse_tasks_blocked_by_must_be_last_line():
+    # Строка есть, но не последняя перед КОНЕЦ ЗАДАЧИ — не считается ответом
+    # (структурная позиция, не любое упоминание в теле).
+    answer = (
+        "ЗАДАЧА: Плохой порядок\n"
+        "БЛОКИРУЕТСЯ: ничем\n"
+        "Ещё строка после маркера.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ВЕРДИКТ: approve"
+    )
+    assert ai.parse_tasks(answer) == []
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("Цель.\nБЛОКИРУЕТСЯ: ничем", []),
+    ("Цель.\nБЛОКИРУЕТСЯ: #5", [5]),
+    ("Цель.\nБЛОКИРУЕТСЯ: #5 #12", [5, 12]),
+    ("Цель.\nКритерий.", None),
+    ("", None),
+    ("Цель.\nблокируется: #5", None),  # регистр — не «любое упоминание»
+])
+def test_blocked_by_numbers(body, expected):
+    assert ai.blocked_by_numbers(body) == expected
 
 
 # ── Выжимка находок: без вердикта и без блоков задач ──────────────────────────
@@ -143,7 +181,7 @@ def test_parse_tasks_none():
 def test_findings_of_strips_verdict_and_tasks():
     answer = (
         "Находка одна: файл X.\n\n"
-        "ЗАДАЧА: Предложение\nТело.\nКОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Предложение\nТело.\nБЛОКИРУЕТСЯ: ничем\nКОНЕЦ ЗАДАЧИ\n"
         "ВЕРДИКТ: rework"
     )
     findings = ai.findings_of(answer)
