@@ -7,6 +7,20 @@
 # чекаут по умолчанию — ref: main, ИЗ НЕГО исполняется check_pr.py с
 # pull-requests:write. Дерево PR — отдельным чекаутом в pr-tree и только как
 # ДАННЫЕ: check_pr компилирует из него изменённые .py (парс, не исполнение).
+#
+# Последний шаг (#297) будит orchestra.yml сразу, не дожидаясь расписания:
+# `gh workflow run` — это workflow_dispatch, единственное (вместе с
+# repository_dispatch) исключение из антирекурсии GITHUB_TOKEN
+# (docs/research/21-github-actions.md: «events triggered by the GITHUB_TOKEN,
+# with the exception of workflow_dispatch и repository_dispatch, will not
+# create a new workflow run») — та же механика, что уже проверена живьём для
+# scheduler.py → worker.yml. Ставить это на `labeled` нельзя: метку тоже
+# ставит GITHUB_TOKEN, а `on: pull_request: [labeled]` для такого события НЕ
+# создаёт рана (замерено 2026-08-31, #18, тот же файл-источник) — explicit
+# workflow_dispatch обходит именно эту ловушку. Диспатч безусловный (не только
+# при review:ok): review:changes-requested тоже может разблокировать других
+# кандидатов в очереди (например снять conflict), а orchestra.yml сам решает,
+# есть ли что сливать — быстро и дёшево, если нечего.
 name: pr-review
 
 on:
@@ -16,6 +30,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  actions: write
 
 jobs:
   review:
@@ -42,3 +57,17 @@ jobs:
           python scripts/review/check_pr.py
           --pr ${{ github.event.pull_request.number }}
           --tree pr-tree
+
+      # if: always() — check_pr.py возвращает 1 ровно в ветке changes-requested
+      # (тот самый случай, ради которого будильник объявлен безусловным выше);
+      # без always() дефолтный `if: success()` пропускал бы его именно там.
+      # continue-on-error: true — форковые/dependabot PR получают GITHUB_TOKEN
+      # без actions:write независимо от `permissions` этого файла, `gh workflow
+      # run` ответит 403 и без этого уронил бы весь job review (готовый PR
+      # получал бы красный чек на голове до ручного перезапуска).
+      - name: "Разбудить оркестратор (#297): вердикт изменился, не ждать расписания"
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run orchestra.yml --ref main
