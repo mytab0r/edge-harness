@@ -34,6 +34,14 @@ export const LIMITS = {
   /** Inbox: сообщение в processing дольше этого порога — изолят умер посреди
    *  внешнего вызова; пульс возвращает его в new (ватчдог по образцу stale_dispatch). */
   messageStuckProcessingMs: 10 * 60_000,
+  /** Inbox: таймаут одного вызова GitHub при создании issue. Обязан быть
+   *  заведомо меньше messageStuckProcessingMs (гвардится тестом): иначе висящий
+   *  fetch доживёт до ретрая другой проходки — двойной issue. */
+  messageIssueFetchTimeoutMs: 30_000,
+  /** Inbox: сколько сообщений отдаёт список, если лимит не назван. */
+  messagesListDefault: 50,
+  /** Inbox: потолок одной страницы списка. */
+  messagesListMax: 200,
 } as const;
 
 /** Сессия браузера: подписанная кука вместо долгоживущего HANDS_TOKEN в query/JS

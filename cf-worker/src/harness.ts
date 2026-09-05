@@ -8,7 +8,6 @@ const MESSAGE_MAX_CHARS = LIMITS.messageMaxChars;
 const MESSAGE_PROCESS_MAX = LIMITS.messageProcessMax;
 const MESSAGE_GROUP_WINDOW_MS = LIMITS.messageGroupWindowMs;
 const MESSAGE_MAX_ATTEMPTS = LIMITS.messageMaxAttempts;
-const MESSAGE_STUCK_MS = LIMITS.messageStuckProcessingMs;
 
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
@@ -1351,17 +1350,20 @@ export class Harness extends DurableObject<Env> {
 
     // Заголовок — первая строка без командного слова, потолок 80 символов.
     const firstLine = text.trim().split(/\r?\n/)[0];
-    let title = firstLine
+    const stripped = firstLine
       .replace(/^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\s*/i, "")
       .trim();
-    if (!title || title.length > 80) title = firstLine.slice(0, 80);
-    if (title.length > 80) title = title.slice(0, 77) + "...";
+    const base = stripped || firstLine;
+    const title = base.length > 80 ? base.slice(0, 77) + "..." : base;
 
     const body = `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${text}\n\`\`\`\n\n---\n*Создано автоматически из инбокса владельца (задача #20). Обработай по playbook.*`;
 
     try {
+      // Таймаут заведомо меньше ватчдога (messageStuckProcessingMs): висящий
+      // fetch не должен дожить до ретрая другой проходки (ревью PR #173).
       const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/issues`, {
         method: "POST",
+        signal: AbortSignal.timeout(LIMITS.messageIssueFetchTimeoutMs),
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
@@ -1384,12 +1386,18 @@ export class Harness extends DurableObject<Env> {
     }
   }
 
-  /** Финальное состояние: статус + результат + отметка времени. */
-  #finishMessage(messageId: number, status: "done" | "failed" | "ignored", result: Record<string, unknown>): void {
-    this.#sql.exec(
-      "UPDATE messages SET status = ?, result = ?, processed_ts = ? WHERE id = ?",
-      status, JSON.stringify(result), Date.now(), messageId,
+  /**
+   * Финальное состояние: статус + результат + отметка времени. CAS по моменту
+   * захвата: если ватчдог уже вернул сообщение в new и его забрала другая
+   * проходка — наша запись устарела, перезаписывать чужой результат нельзя
+   * (иначе двойной issue «выиграл» бы молча, ревью PR #173, находка Б2).
+   */
+  #finishMessage(messageId: number, status: "done" | "failed" | "ignored", result: Record<string, unknown>, claimedTs: number): boolean {
+    const cursor = this.#sql.exec(
+      "UPDATE messages SET status = ?, result = ?, processed_ts = ? WHERE id = ? AND status = 'processing' AND processing_ts = ?",
+      status, JSON.stringify(result), Date.now(), messageId, claimedTs,
     );
+    return Number(cursor.rowsWritten) > 0;
   }
 
   /** Обработка одного сообщения. Захват атомарный: ровно один обработчик уводит
@@ -1400,10 +1408,11 @@ export class Harness extends DurableObject<Env> {
     if (String(row.status) !== "new") return { action: "skipped" };
     const { kind, priority } = this.#classifyMessage(String(row.text));
 
+    const claimedTs = Date.now();
     const claimed = this.#sql.exec(
       `UPDATE messages SET kind = ?, priority = ?, status = 'processing', attempts = attempts + 1, processing_ts = ?
        WHERE id = ? AND status = 'new'`,
-      kind, priority, Date.now(), messageId,
+      kind, priority, claimedTs, messageId,
     );
     if (claimed.rowsWritten === 0) return { action: "skipped" };
     this.#groupMessages(messageId);
@@ -1411,19 +1420,31 @@ export class Harness extends DurableObject<Env> {
     if (kind === "directive") {
       const outcome = await this.#createIssue(messageId, String(row.text));
       if (outcome.ok) {
-        this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url });
-        return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url };
+        if (this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url }, claimedTs)) {
+          return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url };
+        }
+        // Наш захват устарел (ватчдог вернул сообщение в очередь): issue от
+        // этой проходки мог задвоиться с новой — честно помечаем проходку.
+        console.log(`inbox: pass on message ${messageId} lost ownership after issue #${outcome.number}`);
+        return { action: "skipped", issue_number: outcome.number };
       }
       const attempts = Number(
         this.#rows(this.#sql.exec("SELECT attempts FROM messages WHERE id = ?", messageId))[0].attempts,
       );
       if (!outcome.retryable || attempts >= MESSAGE_MAX_ATTEMPTS) {
-        this.#finishMessage(messageId, "failed", { error: outcome.error });
-        return { action: "issue_failed", error: outcome.error, attempts };
+        if (this.#finishMessage(messageId, "failed", { error: outcome.error }, claimedTs)) {
+          return { action: "issue_failed", error: outcome.error, attempts };
+        }
+        return { action: "skipped" };
       }
       // Повторяемая ошибка (токен не задан, сеть, 5xx) — обратно в очередь:
       // пульс или ручной process доведут; кап попыток не даст штурмовать вечно.
-      this.#sql.exec("UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ?", messageId);
+      // CAS: чужую захватку сбивать нельзя.
+      const released = this.#sql.exec(
+        "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing' AND processing_ts = ?",
+        messageId, claimedTs,
+      );
+      if (Number(released.rowsWritten) === 0) return { action: "skipped" };
       return { action: "issue_retry", error: outcome.error, attempts };
     }
 
@@ -1431,25 +1452,40 @@ export class Harness extends DurableObject<Env> {
       // Неразобранное: классификатор детерминирован — в new возвращать нельзя
       // (сырьё забило бы очередь и голодало бы всё новое). ignored = припарковано
       // для ручного триажа, видно в списке и в счётчиках статуса.
-      this.#finishMessage(messageId, "ignored", { note: "needs_manual_triage" });
-      return { action: "ignored" };
+      if (this.#finishMessage(messageId, "ignored", { note: "needs_manual_triage" }, claimedTs)) {
+        return { action: "ignored" };
+      }
+      return { action: "skipped" };
     }
 
     // chat / doc_edit: автоматического действия в фазе 1 нет — разобрано и
     // припарковано с явной пометкой; триаж (морда, фаза 2) решает дальнейшее.
-    this.#finishMessage(messageId, "done", { kind, note: "classified_for_manual_review" });
-    return { action: "parked" };
+    if (this.#finishMessage(messageId, "done", { kind, note: "classified_for_manual_review" }, claimedTs)) {
+      return { action: "parked" };
+    }
+    return { action: "skipped" };
   }
 
   /** Ватчдог: processing дольше порога — изолят умер посреди внешнего вызова.
-   *  Возврат в new; attempts сохраняются, кап не даст крутить бесконечно. */
+   *  Возврат в new; attempts сохраняются, кап не даст крутить бесконечно.
+   *  Порог — единственное место правды: чистая messageStuck (гвардится и юнит-
+   *  тестом границы, и сквозным тестом alarm ниже). */
   #reclaimStuckMessages(): number {
-    const cursor = this.#sql.exec(
-      `UPDATE messages SET status = 'new', processing_ts = NULL
-       WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?`,
-      Date.now() - MESSAGE_STUCK_MS,
+    const now = Date.now();
+    const candidates = this.#rows(
+      this.#sql.exec("SELECT id, processing_ts FROM messages WHERE status = 'processing' AND processing_ts IS NOT NULL"),
     );
-    return Number(cursor.rowsWritten);
+    let reclaimed = 0;
+    for (const row of candidates) {
+      if (!messageStuck(Number(row.processing_ts), now)) continue;
+      reclaimed += Number(
+        this.#sql.exec(
+          "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
+          Number(row.id),
+        ).rowsWritten,
+      );
+    }
+    return reclaimed;
   }
 
   /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в
@@ -1503,56 +1539,69 @@ export class Harness extends DurableObject<Env> {
       const senderName =
         asString(body.sender_name) ?? asString(from?.username) ?? asString(from?.first_name);
 
-      // Идемпотентность — пречтением (по образцу журнала: rowsWritten после
-      // ON CONFLICT DO NOTHING в workerd признаком «свежести» не служит).
-      // Блок синхронный после readJson — гонки двух одновременных инестов нет.
-      const existing = this.#rows(
-        this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
-      )[0];
-      if (existing) {
+      const stored = this.#putMessage({ source, sourceMsgId, chatId, senderId, senderName, text });
+      if (!stored.fresh) {
         // Ретрай (Telegram повторяет апдейты с тем же update_id) — в ту же строку.
-        return this.#json({ message_id: Number(existing.id), status: "exists" });
+        // Статусы не менялись — broadcast не нужен: несимметрия осознанная.
+        return this.#json({ message_id: stored.id, status: "exists" });
       }
-      this.#sql.exec(
-        `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
-         ON CONFLICT(source, source_msg_id) DO NOTHING`,
-        Date.now(), source, sourceMsgId, chatId, senderId, senderName, text,
-      );
-      const row = this.#rows(
-        this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
-      )[0];
       this.#broadcastStatus();
-      return this.#json({ message_id: Number(row.id), status: "accepted" }, { status: 201 });
+      return this.#json({ message_id: stored.id, status: "accepted" }, { status: 201 });
     });
   }
 
-  /** Ручное создание сообщения (для тестов/админа). */
-  async #postMessage(request: Request): Promise<Response> {
-    const body = await this.#readJson(request);
-    const text = typeof body.text === "string" ? body.text : "";
-    if (!text || !text.trim()) {
-      throw new ApiError(400, "need_text");
-    }
-    if (text.length > MESSAGE_MAX_CHARS) {
-      throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
-    }
-    const source = asString(body.source) ?? "api";
-    const sourceMsgId = asString(body.source_msg_id) ?? `manual-${crypto.randomUUID()}`;
-    const chatId = asString(body.chat_id);
-    const senderId = asString(body.sender_id);
-    const senderName = asString(body.sender_name);
-
+  /**
+   * Единственная точка вставки сообщения (ingest и ручной POST — один класс).
+   * Идемпотентность — пречтением (по образцу журнала: rowsWritten после
+   * ON CONFLICT DO NOTHING в workerd признаком «свежести» не служит); блок
+   * синхронный после readJson — гонки двух одновременных вставок нет.
+   */
+  #putMessage(f: {
+    source: string; sourceMsgId: string;
+    chatId: string | null; senderId: string | null; senderName: string | null;
+    text: string;
+  }): { id: number; fresh: boolean } {
+    const existing = this.#rows(
+      this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
+    )[0];
+    if (existing) return { id: Number(existing.id), fresh: false };
     this.#sql.exec(
       `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')`,
-      Date.now(), source, sourceMsgId, chatId, senderId, senderName, text,
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
+       ON CONFLICT(source, source_msg_id) DO NOTHING`,
+      Date.now(), f.source, f.sourceMsgId, f.chatId, f.senderId, f.senderName, f.text,
     );
     const row = this.#rows(
-      this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
+      this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
-    this.#broadcastStatus();
-    return this.#json({ message_id: Number(row.id), status: "created" }, { status: 201 });
+    return { id: Number(row.id), fresh: true };
+  }
+
+  /** Ручное создание сообщения (для тестов/админа) — тот же класс идемпотентности,
+   *  что и ingest: повтор с тем же source_msg_id отвечает существующей строкой. */
+  #postMessage(request: Request): Promise<Response> {
+    return this.#readJson(request).then((body) => {
+      const text = typeof body.text === "string" ? body.text : "";
+      if (!text || !text.trim()) {
+        throw new ApiError(400, "need_text");
+      }
+      if (text.length > MESSAGE_MAX_CHARS) {
+        throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
+      }
+      const stored = this.#putMessage({
+        source: asString(body.source) ?? "api",
+        sourceMsgId: asString(body.source_msg_id) ?? `manual-${crypto.randomUUID()}`,
+        chatId: asString(body.chat_id),
+        senderId: asString(body.sender_id),
+        senderName: asString(body.sender_name),
+        text,
+      });
+      if (!stored.fresh) {
+        return this.#json({ message_id: stored.id, status: "exists" });
+      }
+      this.#broadcastStatus();
+      return this.#json({ message_id: stored.id, status: "created" }, { status: 201 });
+    });
   }
 
   /** Список сообщений с фильтрами. Пагинация курсором по id ПРОТИВ сортировки:
@@ -1560,7 +1609,7 @@ export class Harness extends DurableObject<Env> {
   #getMessages(url: URL): Response {
     const status = url.searchParams.get("status");
     const kind = url.searchParams.get("kind");
-    const limit = Math.min(this.#intParam(url, "limit", 50), 200);
+    const limit = Math.min(this.#intParam(url, "limit", LIMITS.messagesListDefault), LIMITS.messagesListMax);
     const after = this.#intParam(url, "after", 0);
     const senderId = url.searchParams.get("sender_id");
 

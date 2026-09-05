@@ -874,6 +874,74 @@ describe("inbox: сообщения владельца", () => {
     const after = await getJson<{ messages: Record<string, number> }>("/api/status");
     expect(after.messages.new).toBe((before.messages.new || 0) + 1);
   });
+
+  it("ватчдог и водитель работают через публичный alarm(): зависший processing доводится, свежий new разбирается без ручного вызова", async () => {
+    const s = sender();
+    // A — «изолят умер посреди внешнего вызова»: processing давний.
+    const a = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `stuck-${s}`, sender_id: s, text: "завис в processing" })
+    ).json<{ message_id: number }>();
+    // B — просто новое: водитель обязан разобрать сам, без ручного POST.
+    const b = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `fresh-${s}`, sender_id: s, text: "свежая заметка" })
+    ).json<{ message_id: number }>();
+
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', attempts = 1, processing_ts = ? WHERE id = ?",
+        Date.now() - LIMITS.messageStuckProcessingMs - 1, a.message_id,
+      );
+    });
+
+    // Публичный alarm(). GH_DISPATCH_TOKEN ставится локально: без него alarm
+    // выходит рано до ватчдога; все внешние вызовы (dispatch оркестратора,
+    // сверка dsh-edge) — заглушки, реальные версии равны → тихо.
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com") && url.includes("/dispatches")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("dsh-edge.mytab0r.workers.dev") || url.includes("registry.npmjs.org")) {
+        return new Response(JSON.stringify({ version: "0.0.0" }), { status: 200 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    let alarmRan = false;
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await (instance as unknown as { alarm(): Promise<void> }).alarm();
+        alarmRan = true;
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+    expect(alarmRan).toBe(true);
+
+    // A: ватчдог вернул в new, водитель довёл до терминала (raw → ignored).
+    const gotA = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${a.message_id}`);
+    expect(gotA.message.status).toBe("ignored");
+    expect(gotA.message.attempts).toBe(2);
+    // B: разобран тем же тиком.
+    const gotB = await getJson<{ message: { status: string } }>(`/api/messages/${b.message_id}`);
+    expect(gotB.message.status).toBe("ignored");
+  });
+
+  it("ручной POST идемпотентен: повтор с тем же source_msg_id отвечает существующей строкой (тот же класс, что ingest)", async () => {
+    const dupKey = `dup-${Date.now()}`;
+    const first = await postJson("/api/messages", { source: "manual", source_msg_id: dupKey, text: "первый" });
+    expect(first.status).toBe(201);
+    const dup = await postJson("/api/messages", { source: "manual", source_msg_id: dupKey, text: "второй" });
+    expect(dup.status).toBe(200);
+    const firstBody = await first.json<{ message_id: number }>();
+    const dupBody = await dup.json<{ message_id: number; status: string }>();
+    expect(dupBody.message_id).toBe(firstBody.message_id);
+    expect(dupBody.status).toBe("exists");
+  });
 });
 
 describe("чистые функции инбокса", () => {
@@ -893,5 +961,9 @@ describe("чистые функции инбокса", () => {
     expect(asString(undefined)).toBeNull();
     expect(asString(NaN)).toBeNull();
     expect(asString({ id: 1 })).toBeNull();
+  });
+
+  it("таймаут вызова GitHub заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной issue)", () => {
+    expect(LIMITS.messageIssueFetchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
   });
 });
