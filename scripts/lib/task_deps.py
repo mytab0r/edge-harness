@@ -110,6 +110,7 @@ query($owner: String!, $repo: String!, $after: String) {{
       nodes {{
         number
         title
+        {body_field}
         labels(first: 20) {{ nodes {{ name }} }}
         assignees(first: 5) {{ nodes {{ login }} }}
         blockedBy(first: 20) {{ totalCount nodes {{ number state }} }}
@@ -125,16 +126,24 @@ def _is_open(node: dict) -> bool:
     return (node.get("state") or "").upper() == "OPEN"
 
 
-def fetch_pool(repo: str, label: str = "task", gh_call=_default_gh) -> list[dict]:
+def fetch_pool(
+    repo: str, label: str = "task", gh_call=_default_gh, include_body: bool = False,
+) -> list[dict]:
     """Открытый пул с меткой `label`, одним пагинированным GraphQL-проходом.
     Единственный источник, отдающий и список задач, и граф зависимостей —
     REST для этого недостаточен (см. docstring модуля). `gh_call` — тот же
     параметр, что у `gh_graphql`: подмена вызывающей стороной (scheduler.py
-    передаёт свой `gh`, единый с REST-вызовами, тестируемый тем же `patch_gh`)."""
+    передаёт свой `gh`, единый с REST-вызовами, тестируемый тем же `patch_gh`).
+
+    `include_body` (по умолчанию `False`, задача #371) — добавляет
+    скалярное поле `body` в тот же запрос (без второго прохода): нужно
+    только детектору рассинхрона `scripts/lib/declared_deps.py`, обычные
+    потребители (`free_task.py`, `scheduler.py`) текст тела не используют —
+    не тянуть лишний трафик там, где он не читается."""
     if not _LABEL_TOKEN_RE.match(label):
         raise TaskDepsError(f"метка не похожа на литерал GitHub-метки: {label!r}")
     owner, name = _split_repo(repo)
-    query = _POOL_QUERY_TMPL.format(label=label)
+    query = _POOL_QUERY_TMPL.format(label=label, body_field="body" if include_body else "")
     issues: list[dict] = []
     after: str | None = None
     while True:
@@ -150,7 +159,7 @@ def fetch_pool(repo: str, label: str = "task", gh_call=_default_gh) -> list[dict
             # блокировщик (>20 открытых блокируемых — ровно кейс, ради которого
             # эта задача заводилась) молча застыл бы на 20, и приоритет —
             # единственный смысл этого модуля — тихо соврал бы. Считаем это
-            # sil ent-wrong и падаем громко, а не дотягиваем страницу: 20
+            # silent-wrong и падаем громко, а не дотягиваем страницу: 20
             # прямых блокировок/блокируемых на одну задачу — само по себе
             # аномалия организации работы, требующая разбора человеком, не
             # тихого дотягивания.
@@ -171,14 +180,17 @@ def fetch_pool(repo: str, label: str = "task", gh_call=_default_gh) -> list[dict
                     f"({len(blocked_by_nodes)} из {blocked_by_total}) — "
                     "первая страница коннекшена не покрывает все связи"
                 )
-            issues.append({
+            issue = {
                 "number": node["number"],
                 "title": node["title"],
                 "labels": node["labels"]["nodes"],
                 "assignees": node["assignees"]["nodes"],
                 "blocking_open": sum(1 for b in blocking_nodes if _is_open(b)),
                 "blocked_by_open": [b["number"] for b in blocked_by_nodes if _is_open(b)],
-            })
+            }
+            if include_body:
+                issue["body"] = node.get("body") or ""
+            issues.append(issue)
         page_info = connection["pageInfo"]
         if not page_info["hasNextPage"]:
             break
