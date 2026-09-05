@@ -9,9 +9,8 @@
 при не заданном вопросе «а нет ли нативного пути». Ответ по конкретно этому пункту
 уже нашёлся отдельной задачей (#339) — нативная GitHub Merge Queue **недоступна**
 на этом репозитории (владение пользователем, не организацией; см.
-[ADR 0012](../decisions/0012-native-merge-queue-not-available.md) — ссылка красная,
-пока задача не слита в main, это не ошибка, тот же принцип, что у `INFRA-CF.md` в
-`docs/agents/INFRA-GH.md`). Значит своя очередь обоснована ограничением платформы,
+[ADR 0012](../decisions/0012-native-merge-queue-not-available.md) — ссылка красная
+до слияния #340, оживёт после мержа). Значит своя очередь обоснована ограничением платформы,
 а не ленью проверить. Ниже — тот же вопрос по остальным местам, где своё решение
 дублирует то, что теоретически могла бы дать платформа.
 
@@ -37,7 +36,7 @@ update-branch/ai-review, которые и породили #208/#252/#189.
 (`review:ok`/`review:changes-requested`, `ai:ok`/`ai:changes-requested`/`ai:failed`)
 через `gh issue edit --add-label`. Метки — не required status checks: GitHub не
 видит их при решении «можно ли смержить». Гейт по ним живёт целиком в
-`scheduler.py::merge_label_gate`, опрашивается раз в 15 минут.
+`scripts/lib/review_labels.py::merge_label_gate`, опрашивается раз в 15 минут.
 
 **Платформа предлагает.** [Commit Status API](https://docs.github.com/en/rest/commits/statuses)
 (`POST /repos/{owner}/{repo}/statuses/{sha}`) создаёт **статус с произвольным
