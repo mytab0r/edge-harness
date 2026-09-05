@@ -21,9 +21,12 @@ permissions:
   issues: write # kind=pool: создание задачи пула с меткой task
 
 concurrency:
-  # Прогоны одной автоматизации не соревновались бы за journal-seq и каналы;
-  # разные автоматизации друг другу не мешают (критерий #116).
-  group: automation-${{ github.event.client_payload.task_id || inputs.automation_id }}
+  # Прогоны ОДНОЙ автоматизации не соревновались бы за journal-seq и каналы;
+  # разные автоматизации друг другу не мешают (критерий #116). Ключ —
+  # automation_id, не task_id: task_id прогона несёт nonce (runTaskId) и
+  # уникален на каждый вызов — group по нему никогда бы не совпадала и не
+  # сериализовала бы ничего (находка AI-ревью PR #241, дважды повторённая).
+  group: automation-${{ github.event.client_payload.automation_id || inputs.automation_id }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +34,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      # persist-credentials: false — github.token не остаётся в .git/config
+      # воркспейса: для kind=hands DSH работает в этом же чекауте и иначе
+      # прочитал бы токен из конфига git (тот же класс, что hands.yml/worker.yml
+      # уже закрывают — находка AI-ревью PR #241, здесь открыта заново).
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

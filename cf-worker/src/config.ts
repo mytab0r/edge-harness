@@ -144,6 +144,19 @@ export const AUTOMATIONS = {
    *  зацикливалась бы по одному агент-прогону за цикл (ревью #116). Каденс —
    *  как у пульса, которым тикают и расписания. */
   journalCooldownMs: 30 * 60_000,
+  /** kind'ы системных событий, которые сам механизм автоматизаций эмитит ПОД
+   *  task_id с префиксом runTaskPrefix ("automation:...") — #fireJournalTriggers
+   *  исключает такие события из кандидатов гвардией петли ДО сравнения kind,
+   *  так что journal-триггер с любым из этих kind никогда не сработает.
+   *  Раньше PUT принимал такой конфиг как валидный — silent-wrong, находка
+   *  AI-ревью PR #241 (мёртвый триггер без единой ошибки). */
+  reservedJournalKinds: [
+    "automation_updated",
+    "automation_deleted",
+    "automation_triggered",
+    "automation_dispatched",
+    "automation_webhook_rejected",
+  ],
 } as const;
 
 /** Локаль сообщений API. Словари — в messages.ts. */
