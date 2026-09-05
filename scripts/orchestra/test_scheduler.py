@@ -477,6 +477,7 @@ CHECK_RUNS_RED = {"check_runs": [
     {"name": "lint", "conclusion": "success"},
 ]}
 CHECK_RUNS_GREEN = {"check_runs": [{"name": "test", "conclusion": "success"}]}
+CHECK_RUNS_EMPTY = {"check_runs": []}
 
 
 def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
@@ -625,6 +626,181 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
         assert sch.pr_is_unhealthy(REPO, unhealthy_changes) is not None
         assert sch.pr_is_unhealthy(REPO, draft) is None
         assert sch.pr_is_unhealthy(REPO, conflict) is None
+    finally:
+        sch.gh = orig_gh
+
+
+# ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
+# Противоположный класс unhealthy_pulls: PR ЗДОРОВ (обе метки-гейта, зелёные
+# проверки), но слияния не было дольше UNHEALTHY_PR_AFTER_MINUTES с момента
+# готовности (позже из двух событий 'labeled' review:ok/ai:ok в таймлайне).
+
+
+def timeline_ready(review_at: str, ai_at: str):
+    return [
+        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": review_at},
+        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": ai_at},
+    ]
+
+
+def test_stale_ready_pulls_escalates_when_ready_longer_than_threshold(monkeypatch):
+    p = pull(301, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/301": {"mergeable_state": "clean"},
+        "commits/sha301/check-runs": CHECK_RUNS_GREEN,
+        "issues/301/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 2, 10, 30)  # 145 мин с готовности (08:05) > порог 120
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+
+    assert any("301" in line and "готов" in line for line in lines)
+    assert posted and posted[0][0] == sch.WATCHDOG_ISSUE
+    assert sch.READY_STALL_MARKER in posted[0][1]
+    assert "301" in posted[0][1]
+
+
+def test_stale_ready_pulls_silent_before_threshold(monkeypatch):
+    p = pull(302, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/302": {"mergeable_state": "clean"},
+        "commits/sha302/check-runs": CHECK_RUNS_GREEN,
+        "issues/302/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
+
+    now = utc(2026, 9, 2, 9, 0)  # 55 мин < порог 120
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+    assert lines == []
+    assert not any("issues/120/comments" in c for c in fake.calls)  # маркеры лениво
+
+
+def test_stale_ready_pulls_silent_when_ai_gate_missing(monkeypatch):
+    # Только review:ok — вторая метка-гейт не стоит, PR не готов вовсе.
+    p = pull(303, labels=["review:ok"])
+    fake = FakeGh({"pulls/303": {"mergeable_state": "clean"}, "commits/sha303/check-runs": CHECK_RUNS_GREEN})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("гейта нет — не готов"))
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert lines == []
+    assert not any("timeline" in c for c in fake.calls)  # готовность даже не проверяем
+
+
+def test_stale_ready_pulls_silent_when_checks_red(monkeypatch):
+    p = pull(304, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({"pulls/304": {"mergeable_state": "clean"}, "commits/sha304/check-runs": CHECK_RUNS_RED})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("красный чек — не готов"))
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert lines == []
+
+
+def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
+    # Маркер новее момента готовности — уже оповещено, второй раз не пишем.
+    p = pull(305, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/305": {"mergeable_state": "clean"},
+        "commits/sha305/check-runs": CHECK_RUNS_GREEN,
+        "issues/305/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #305\nPR #305 …"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("уже оповещено — не дублируем"))
+    now = utc(2026, 9, 2, 10, 30)  # тот же возраст, что в escalates-тесте
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+    assert lines == []
+
+
+def test_stale_ready_pulls_signals_each_pr_independently(monkeypatch):
+    # #303, находка ревью: маркер по PR #301 не имеет права подавить #302 —
+    # у каждого просроченного PR маркер свой (номер — часть текста маркера).
+    # Мутация-гвардия: если вернуть общий READY_STALL_MARKER без номера PR,
+    # маркер по #301 (10:01, новее готовности #302 в 08:30) подавит #302 и
+    # второй assert покраснеет.
+    p301 = pull(301, labels=["review:ok", "ai:ok"])
+    p302 = pull(302, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/301": {"mergeable_state": "clean"},
+        "pulls/302": {"mergeable_state": "clean"},
+        "commits/sha301/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha302/check-runs": CHECK_RUNS_GREEN,
+        "issues/301/timeline": timeline_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
+        "issues/302/timeline": timeline_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
+        # #301 уже прокричал в 10:01 — маркер несёт свой номер.
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-02T10:01:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #301\nPR #301 …"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 2, 10, 31)  # #301: 151 мин с 08:00; #302: 121 мин с 08:30 — оба > 120
+    lines = sch.stale_ready_pulls(REPO, now, [p301, p302])
+
+    assert not any("301" in line for line in lines)  # #301 уже оповещён — молчим
+    assert any("302" in line and "готов" in line for line in lines)  # #302 обязан прокричать
+    assert len(posted) == 1 and "302" in posted[0][1]
+
+
+def test_stale_ready_pulls_noop_on_empty_queue(monkeypatch):
+    fake = FakeGh({})  # ни один маршрут не должен понадобиться
+    patch_gh(monkeypatch, fake)
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [])
+    assert lines == []
+    assert fake.calls == []
+
+
+# ── Мутация гвардии инварианта #269: без ОБЕИХ меток-гейта готовность ложная ─────
+
+
+def test_pr_is_merge_ready_mutation_requires_both_gate_labels_and_green_checks():
+    only_review = pull(1, labels=["review:ok"])
+    both_gates = pull(2, labels=["review:ok", "ai:ok"])
+    red_checks = pull(3, labels=["review:ok", "ai:ok"])
+    draft = pull(4, labels=["review:ok", "ai:ok"], draft=True)
+    for p in (only_review, both_gates, red_checks, draft):
+        p["mergeable_state"] = "clean"
+
+    fake = FakeGh({
+        "commits/sha1/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha2/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha3/check-runs": CHECK_RUNS_RED,
+        "commits/sha4/check-runs": CHECK_RUNS_GREEN,
+    })
+    orig_gh = sch.gh
+    sch.gh = fake
+    try:
+        assert sch.pr_is_merge_ready(REPO, only_review) is False
+        assert sch.pr_is_merge_ready(REPO, both_gates) is True
+        assert sch.pr_is_merge_ready(REPO, red_checks) is False
+        assert sch.pr_is_merge_ready(REPO, draft) is False
+    finally:
+        sch.gh = orig_gh
+
+
+# НАХОДКА РЕВЬЮ (#303): докстринг pr_is_merge_ready заявляет «тот же критерий
+# готовности, что merge_queue», но merge_queue на пустом списке check-run'ов
+# явно пропускает PR («проверки ещё не заведены», scheduler.py:434), а
+# pr_bad_checks на пустом списке отдаёт [] — «красных нет» — что без отдельной
+# проверки сделало бы пустые check-run'ы неотличимыми от зелёных именно здесь.
+# Докажи мутацией: убери `if not runs: return False` из pr_is_merge_ready —
+# тест ниже покраснеет (готовность станет True на пустом списке).
+def test_pr_is_merge_ready_false_on_empty_check_runs_same_as_merge_queue():
+    empty_checks = pull(5, labels=["review:ok", "ai:ok"])
+    empty_checks["mergeable_state"] = "clean"
+    fake = FakeGh({"commits/sha5/check-runs": CHECK_RUNS_EMPTY})
+    orig_gh = sch.gh
+    sch.gh = fake
+    try:
+        assert sch.pr_is_merge_ready(REPO, empty_checks) is False
     finally:
         sch.gh = orig_gh
 
@@ -993,6 +1169,42 @@ def test_after_merge_reads_files_through_paginated_helper():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "review_labels.list_pr_files(repo, number, gh)" in source
     assert 'gh(f"repos/{repo}/pulls/{number}/files?per_page=100")' not in source
+
+
+# ── Пагинация таймлайна: тот же класс, тесно в один хелпер (#303, находка
+# ревью) — last_review_ok_labeled_at и last_ready_labeled_at читали сырую
+# первую страницу timeline?per_page=100 без обхода, событие 'labeled' за
+# первой сотней молча терялось на длинном таймлайне ────────────────────────
+
+
+def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
+    # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
+    # выше): обе функции обязаны ходить через review_labels.list_timeline
+    # (полный обход постранично), а не читать сырую первую страницу —
+    # поведенческая проверка самой пагинации живёт в
+    # scripts/lib/test_review_labels.py::test_list_timeline_paginates_finds_event_beyond_first_page
+    # (мутация доказана там: обход убран — тест краснеет).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
+    assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
+
+
+def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):
+    # Поведенческое доказательство на уровне вызывающей функции: labeled-события
+    # обеих меток-гейтов лежат за первой страницей (100 посторонних событий
+    # перед ними) — без полного обхода last_ready_labeled_at вернул бы None.
+    page1 = [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"} for _ in range(100)]
+    page2 = [
+        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-01T00:00:00Z"},
+        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-01T01:00:00Z"},
+    ]
+    fake = FakeGh({
+        "timeline?per_page=100&page=1": page1,
+        "timeline?per_page=100&page=2": page2,
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_ready_labeled_at(REPO, 999)
+    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух — labeled ai:ok, найдено на второй странице
 
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────

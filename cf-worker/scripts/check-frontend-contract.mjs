@@ -9,6 +9,13 @@
 //   3. Каждый route("ключ") в app.js существует в таблице.
 //   4. Каждый ключ локализации t("…") и data-i18n из разметки есть в словарях i18n/*.
 //   5. docs/api.md сгенерирован из текущей спеки (не устарел).
+//   6. Шаблоны "pulse.unhealthy" И "pulse.stale" (обе ветки бейджа пульса —
+//      #303, находка ревью: гвардия покрывала только dispatch/run_confirmed
+//      ветку через detail, а «alarm подвис», где detail остаётся null,
+//      осталась бы незамеченной), скопированные в test/pulse.spec.ts
+//      (workerd-раннер без document/node:fs не может прогнать реальный
+//      app.js), побайтово совпадают с прод-текстом в i18n/ru.js — иначе тест
+//      сторожит пересказ, а не прод-текст.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -80,5 +87,29 @@ for (const file of readdirSync(i18nDir).filter((name) => name.endsWith(".js"))) 
 execSync("node scripts/generate-api-docs.mjs", { cwd: root, stdio: "pipe" });
 const generatedDiff = execSync("git diff --stat -- docs/api.md src/api-spec.ts", { cwd: root }).toString().trim();
 if (generatedDiff) fail("docs/api.md или src/api-spec.ts устарел — запусти npm run docs и закоммить");
+
+// 6. Шаблоны обеих веток бейджа пульса, скопированные в test/pulse.spec.ts, совпадают
+// с прод-текстом (#303, находка ревью: одна ветка бейджа гуляла без гвардии).
+const pulseSpec = readFileSync(join(root, "test/pulse.spec.ts"), "utf8");
+const ruDict = readFileSync(join(i18nDir, "ru.js"), "utf8");
+const STRING_LITERAL_BODY = String.raw`(?:[^"\\]|\\.)*`;
+for (const [constName, i18nKey] of [
+  ["PULSE_UNHEALTHY_TEMPLATE", "pulse.unhealthy"],
+  ["PULSE_STALE_TEMPLATE", "pulse.stale"],
+]) {
+  const templateMatch = pulseSpec.match(new RegExp(`${constName}\\s*=\\s*"(${STRING_LITERAL_BODY})"`));
+  if (!templateMatch) fail(`в test/pulse.spec.ts не найдена константа ${constName}`);
+  const testTemplate = templateMatch[1];
+  const keyPattern = i18nKey.replace(/\./g, String.raw`\.`);
+  const prodMatch = ruDict.match(new RegExp(`"${keyPattern}":\\s*"(${STRING_LITERAL_BODY})"`));
+  if (!prodMatch) fail(`в i18n/ru.js не найден ключ "${i18nKey}"`);
+  const prodTemplate = prodMatch[1];
+  if (testTemplate !== prodTemplate) {
+    fail(
+      `test/pulse.spec.ts::${constName} разошёлся с i18n/ru.js["${i18nKey}"] — ` +
+        `тест сторожит пересказ, а не прод-текст (test: "${testTemplate}", прод: "${prodTemplate}")`,
+    );
+  }
+}
 
 console.log(`check-frontend-contract: OK (${Object.keys(specTable).length} маршрутов, ${usedKeys.length} ключей локализации)`);

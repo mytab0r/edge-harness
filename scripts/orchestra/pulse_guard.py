@@ -93,6 +93,14 @@ AI_REVIEW_RETRY_MARKER = "[ai-review: авто-повтор]"
 # класса «уже обработано» не заводится.
 UNHEALTHY_PR_AFTER_MINUTES = 120
 
+# Инвариант issue #269: PR полностью готов к слиянию (обе метки-гейта, все
+# обязательные проверки зелёные), а слияния не произошло дольше того же
+# UNHEALTHY_PR_AFTER_MINUTES — своего порога не заводим, это тот же класс
+# «наблюдаемая величина — задержка, а не статус последнего прогона»
+# (см. scheduler.stale_ready_pulls). Маркер — идемпотентность сигнала в #120,
+# тот же приём, что PAUSE_MARKER/HEARTBEAT_MARKER выше.
+READY_STALL_MARKER = "[статус: PR готов, слияние не идёт]"
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(

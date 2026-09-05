@@ -179,6 +179,30 @@ def list_pr_files(repo: str, pr: int, gh_func) -> list[dict]:
     return files
 
 
+def list_timeline(repo: str, number: int, gh_func) -> list[dict]:
+    """Весь таймлайн issue/PR постранично, не только первая страница
+    `per_page=100` (#303, тот же класс пагинации, что list_pr_files выше и
+    вердикт ai-review PR #294): `last_review_ok_labeled_at` и
+    `last_ready_labeled_at` в scheduler.py читали сырой первый ответ
+    `timeline?per_page=100` без обхода — на PR с длинным таймлайном (много
+    комментариев/пушей/перелейбловок) событие `labeled` за первой сотней
+    молча не находилось, `ready_since`/anchor обнулялись именно на самых
+    долгоживущих PR — тех, ради которых порог и написан. Листание — та же
+    форма, что list_pr_files: короткая страница (`len(chunk) < 100`) значит
+    «дальше страниц нет»."""
+    page = 1
+    events: list[dict] = []
+    while True:
+        chunk = gh_func(f"repos/{repo}/issues/{number}/timeline?per_page=100&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        events.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return events
+
+
 def diff_fingerprint(files) -> str:
     """Отпечаток содержимого диффа PR — sha256 по отсортированному списку
     `имя_файла:статус:blob-sha` из прод-формы `gh api .../pulls/{n}/files`.

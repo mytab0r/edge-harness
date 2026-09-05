@@ -388,6 +388,37 @@ def test_list_pr_files_fixes_added_undercount_pr294():
     assert added_full != added_first_page_only
 
 
+# ── list_timeline: тот же класс пагинации, что list_pr_files, теперь на
+# таймлайне issue/PR (#303, находка ревью) — last_review_ok_labeled_at и
+# last_ready_labeled_at в scheduler.py читали сырую первую страницу
+# timeline?per_page=100 без обхода: на PR с длинным таймлайном (много
+# комментариев/пушей/перелейбловок) событие 'labeled' за первой сотней
+# молча не находилось. ────────────────────────────────────────────────────────
+
+
+def test_list_timeline_paginates_finds_event_beyond_first_page():
+    # Докажи мутацией: замени `while True: ... page += 1` на однократный вызов
+    # без обхода (сырой `gh_func(f"...timeline?per_page=100")`) — этот тест
+    # покраснеет, потому что labeled-событие лежит на второй странице.
+    page1 = [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"} for _ in range(100)]
+    page2 = [{"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-01T00:00:00Z"}]
+    fake_gh = _paged_gh({"1": page1, "2": page2})
+    timeline = review_labels.list_timeline("o/r", 1, fake_gh)
+    assert len(timeline) == len(page1) + len(page2)
+    labeled = [e for e in timeline if e.get("event") == "labeled"]
+    assert labeled and labeled[0]["created_at"] == "2026-09-01T00:00:00Z"  # событие за первой страницей найдено
+
+
+def test_list_timeline_stops_on_short_page():
+    fake_gh = _paged_gh({"1": [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"}]})
+    timeline = review_labels.list_timeline("o/r", 1, fake_gh)
+    assert len(timeline) == 1
+
+
+def test_list_timeline_empty_on_no_events():
+    assert review_labels.list_timeline("o/r", 1, lambda url: []) == []
+
+
 # ── should_run_ai_review: дорогой прогон второго гейта переживает
 # подтягивание main, но не отнимает газ #196 у ai:failed (находка вердикта
 # ai-review PR #294) ─────────────────────────────────────────────────────────
