@@ -5,11 +5,8 @@ name: cf-inventory
 
 on:
   workflow_dispatch:
-  # Временно, только для первого прогона доказательства (issue #322): dispatch
-  # недоступен, пока файл не на default branch. Уберётся до мерджа, реальный
-  # прогон останется в истории Actions по ссылке.
   push:
-    branches: [agent/322-cf-infra-toolkit]
+    branches: [agent/322-cf-infra-toolkit]  # временно, для прогона доказательства (issue #322), уберётся до мерджа
 
 jobs:
   inventory:
