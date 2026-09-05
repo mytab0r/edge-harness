@@ -6,7 +6,8 @@
  */
 
 import { readFile } from 'node:fs/promises'
-import { join, relative } from 'node:path'
+import { existsSync } from 'node:fs'
+import { join, relative, resolve, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
@@ -18,7 +19,23 @@ if (!pluginDir) {
 }
 
 const repoRoot = join(fileURLToPath(import.meta.url), '..', '..')
-const absPluginDir = join(repoRoot, pluginDir)
+// resolve(), не join(): join('<repo>', '/tmp/x') склеивает абсолютный второй
+// аргумент как относительный сегмент ('<repo>/tmp/x') — вызывающий передал
+// путь к реальному /tmp/x, а чекер молча полез в чужой каталог внутри репо.
+// resolve() трактует абсолютный pluginDir как есть (стандартная семантика
+// path.resolve), а относительный — от repoRoot, как и раньше. Отсутствие
+// каталога после этого проверяем явно: раньше ошибка обнаруживалась только
+// на первом чтении package.json/npm pack и называла склеенный (неверный)
+// путь, не объясняя, что аргумент вообще был абсолютным (находка AI-ревью PR #271).
+const absPluginDir = resolve(repoRoot, pluginDir)
+if (!existsSync(absPluginDir)) {
+  process.stderr.write(
+    `plugin-compat: каталог плагина не найден: ${pluginDir}` +
+    (isAbsolute(pluginDir) ? '' : ` (резолвится в ${absPluginDir}, относительно ${repoRoot})`) +
+    '\n',
+  )
+  process.exit(2)
+}
 
 async function main() {
   console.log(`plugin-compat: проверка ${pluginDir}${checkClient ? ' (client=true)' : ''}`)
@@ -241,7 +258,14 @@ async function checkNoSyncFsInApply() {
     // Ищем синхронные fs.*Sync вызовы по всему файлу плагина (не только внутри
     // apply) — строгость оправдана: node:fs в плагине вообще не место (Workers
     // не даёт настоящей ФС), точечный "контекст apply" ничего бы не смягчил.
-    const syncFsCalls = [...content.matchAll(/\bfs\.(readFileSync|writeFileSync|statSync|readdirSync|mkdirSync|rmSync|unlinkSync|realpathSync)\b/g)]
+    //
+    // Раньше список функций (readFileSync/writeFileSync/...) перечислялся
+    // руками и был неполон: existsSync, accessSync, openSync, appendFileSync,
+    // copyFileSync (и любая будущая *Sync-функция fs) проходили молча
+    // (находка AI-ревью PR #271). fs.*Sync — это всегда синхронный вызов по
+    // соглашению самого модуля node:fs, генеричный паттерн по суффиксу Sync
+    // короче перечисления и не может забыть новую функцию.
+    const syncFsCalls = [...content.matchAll(/\bfs\.\w*Sync\b/g)]
     if (syncFsCalls.length > 0) {
       violations.push(`${relPath}: синхронные fs вызовы (${syncFsCalls.length}) — в Edge ФС только VFS Computer'а`)
     }
@@ -254,25 +278,56 @@ async function checkNoSyncFsInApply() {
 }
 
 async function checkClientBundle() {
-  const clientPath = join(absPluginDir, 'client', 'client.js')
+  const pkgPath = join(absPluginDir, 'package.json')
+  const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
+
+  // Путь резолвится из package.json#exports['./client'] — прод-формы, по
+  // которой реально резолвит потребитель пакета (require/import). Раньше
+  // путь был захардкожен как client/client.js: плагин, объявивший другой
+  // путь в exports, проверялся бы не по тому файлу вообще (находка AI-ревью
+  // PR #271). checkPackageJson уже гарантирует наличие exports['./client'],
+  // но здесь проверка независима (checkClientBundle может быть вызвана и без
+  // неё в будущем) и явно требует строковой формы.
+  const clientExport = pkg.exports?.['./client']
+  if (!clientExport || typeof clientExport !== 'string') {
+    throw new Error('package.json: нужен строковый экспорт "./client" для клиентских плагинов')
+  }
+  const clientPath = join(absPluginDir, clientExport)
+
+  let content
   try {
-    await readFile(clientPath, 'utf8')
+    content = await readFile(clientPath, 'utf8')
   } catch {
-    // Клиентский бандл может генерироваться на этапе сборки (например, plugin-manager)
-    // В этом случае проверяем, что package.json объявляет экспорт ./client
-    const pkgPath = join(absPluginDir, 'package.json')
-    const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
-    if (!pkg.exports?.['./client']) {
-      throw new Error('package.json: нужен экспорт "./client" для клиентских плагинов')
+    // Файла на диске нет — легально, ЕСЛИ он генерируется на этапе сборки:
+    // либо npm-скрипт package.json#scripts.build, либо (прод-конвенция этого
+    // репозитория, см. plugins-src/*/build.mjs) отдельный build.mjs в
+    // каталоге плагина, запускаемый напрямую (node .../build.mjs), а не
+    // через "npm run build". Раньше в этой ветке ставилась зелёная галочка
+    // «будет собран на этапе сборки» просто по наличию exports['./client'] —
+    // не проверяя, что механизм сборки вообще существует: плагин без единого
+    // build-шага и без файла на диске проходил молча (находка AI-ревью PR
+    // #271). Форма самого бандла (window.__ModuleLoader__.load) в этой ветке
+    // физически непроверяема (файла нет), поэтому дальше — не зелёная
+    // галочка, а честное предупреждение с явным «форма не проверялась», а
+    // при отсутствии любого механизма сборки — ошибка: взяться файлу неоткуда.
+    const hasBuildScript = typeof pkg.scripts?.build === 'string'
+    const hasBuildScriptFile = existsSync(join(absPluginDir, 'build.mjs'))
+    if (!hasBuildScript && !hasBuildScriptFile) {
+      throw new Error(
+        `package.json: exports['./client'] указывает на ${clientExport}, файла нет на диске, ` +
+        'и у плагина нет ни package.json#scripts.build, ни build.mjs — взяться файлу неоткуда',
+      )
     }
-    console.log('  ✓ клиентский бандл: будет собран на этапе сборки (export ./client объявлен)')
+    console.warn(
+      `plugin-compat: предупреждение — ${clientExport} будет собран на этапе сборки, ` +
+      'форма (window.__ModuleLoader__.load) не проверялась',
+    )
     return
   }
 
   // Проверка обёртки ModuleLoader
-  const content = await readFile(clientPath, 'utf8')
   if (!content.includes('window.__ModuleLoader__.load')) {
-    throw new Error('client/client.js: отсутствует обёртка window.__ModuleLoader__.load — невалидная форма ростера')
+    throw new Error(`${clientExport}: отсутствует обёртка window.__ModuleLoader__.load — невалидная форма ростера`)
   }
 
   // Проверка exports.inject: раньше условие было `!includes('exports.inject')
@@ -283,7 +338,7 @@ async function checkClientBundle() {
     console.warn('plugin-compat: предупреждение — не найден exports.inject в клиентском бандле')
   }
 
-  console.log('  ✓ клиентский бандл: форма валидна')
+  console.log(`  ✓ клиентский бандл: форма валидна (${clientExport})`)
 }
 
 async function checkSyntax() {
@@ -315,6 +370,23 @@ async function checkSyntax() {
 // проверок с одним и тем же absPluginDir; без кэша npm pack --dry-run
 // запускался бы 4 раза за прогон.
 const jsFilesCache = new Map()
+
+// Расширения, которые чекер реально разбирает (forbidden imports, dynamic
+// import, sync fs, синтаксис). .cjs раньше сюда не входил — единственный
+// канонический способ положить CommonJS-файл в tarball при "type": "module"
+// целиком пропадал из ВСЕХ проверок разом, а не только из синтаксической
+// (плагин с legacy.cjs, `require('child_process')` и `spawnSync` внутри,
+// уходил зелёным: находка AI-ревью PR #271, мутационно доказана). node --check
+// разбирает .cjs как обычный CommonJs-синтаксис, никакого спецкейса не нужно.
+const CHECKED_EXTENSIONS = ['.js', '.mjs', '.cjs', '.ts']
+
+// Остальные расширения одного семейства JS/TS, которые тоже могут нести
+// исполняемый код, но чекер их пока не разбирает вовсе. Плагин с .cjs раньше
+// пропадал из отчёта молча — единственный сигнал о непокрытом файле был для
+// .ts (предупреждение о пропуске синтаксиса в checkSyntax). Любой файл,
+// похожий на код, но не в CHECKED_EXTENSIONS, обязан быть назван вслух, а не
+// просто исчезнуть из выборки — иначе «все файлы валидны» врёт о покрытии.
+const UNCHECKED_CODE_EXTENSIONS = ['.jsx', '.tsx', '.mts', '.cts']
 
 /**
  * Состав файлов плагина — берём из `npm pack --dry-run` (прод-форма: это
@@ -360,9 +432,15 @@ async function collectJsFiles(dir) {
     throw new Error(`npm pack --dry-run: неожиданная форма ответа в ${relative(repoRoot, dir)}`)
   }
 
-  const files = entry.files
-    .map(f => f.path)
-    .filter(p => p.endsWith('.js') || p.endsWith('.ts') || p.endsWith('.mjs'))
+  const allPaths = entry.files.map(f => f.path)
+
+  const uncheckedCode = allPaths.filter(p => UNCHECKED_CODE_EXTENSIONS.some(ext => p.endsWith(ext)))
+  for (const p of uncheckedCode) {
+    console.warn(`plugin-compat: предупреждение — ${p} пропущен (расширение чекером не разбирается)`)
+  }
+
+  const files = allPaths
+    .filter(p => CHECKED_EXTENSIONS.some(ext => p.endsWith(ext)))
     .map(p => join(dir, p))
 
   jsFilesCache.set(dir, files)
