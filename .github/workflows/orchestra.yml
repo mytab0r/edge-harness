@@ -75,3 +75,16 @@ jobs:
           DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: python scripts/orchestra/scheduler.py
+
+      # Гвардия «протухшей» метки blocked (#334): чисто читающий шаг, ничего
+      # не блокирует и не решает вместо владельца (снятие метки — по-прежнему
+      # ручное, docs/agents/LABELS.md). continue-on-error нарочно: красный шаг
+      # виден в логе (fail loud), но не гасит зелёный статус всего job'а —
+      # предохранитель конвейера (#120) читает историю ИМЕННО этого job'а как
+      # пульс, и ложный «пульс пропал» от находки на живых issue дороже
+      # задержанного обнаружения протухшей метки.
+      - name: Гвардия протухшей метки blocked (#334)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/stale_blocked_guard.py
