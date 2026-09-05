@@ -51,22 +51,27 @@ DAILY_LIMIT = 5_000_000
 # SQLite, поэтому storage-датасет проверяется тоже, но после periodic).
 CANDIDATE_DATASETS = ["durableObjectsPeriodicGroups", "durableObjectsStorageGroups"]
 
-INTROSPECT_TYPE_QUERY = """
-query IntrospectType($name: String!) {
-  __type(name: $name) {
+# Найдено живым прогоном (#320, 2026-09-05): поля вида `[X!]!` заворачивают тип
+# в NON_NULL(LIST(NON_NULL(X))) — три уровня `ofType` до именованного типа, не
+# два. Запрашиваем на один уровень глубже, чем казалось бы достаточно.
+TYPE_REF_FRAGMENT = "name kind ofType { name kind ofType { name kind ofType { name kind } } }"
+
+INTROSPECT_TYPE_QUERY = f"""
+query IntrospectType($name: String!) {{
+  __type(name: $name) {{
     name
     kind
-    fields {
+    fields {{
       name
-      type { name kind ofType { name kind ofType { name kind } } }
-      args { name type { name kind ofType { name kind } } }
-    }
-    inputFields {
+      type {{ {TYPE_REF_FRAGMENT} }}
+      args {{ name type {{ {TYPE_REF_FRAGMENT} }} }}
+    }}
+    inputFields {{
       name
-      type { name kind ofType { name kind } }
-    }
-  }
-}
+      type {{ {TYPE_REF_FRAGMENT} }}
+    }}
+  }}
+}}
 """
 
 SCHEMA_ROOT_QUERY = "query { __schema { queryType { name } } }"
