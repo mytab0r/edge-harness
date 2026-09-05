@@ -716,3 +716,81 @@ def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, 
     # именно это и не должно происходить в проде, что и доказывает предыдущий
     # тест на текущем (исправленном) cmd_verdict.
     assert run_gh_calls != []
+
+
+# ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
+
+def _status_calls(run_gh_calls: list[tuple]) -> list[tuple]:
+    return [a for a in run_gh_calls
+            if a[:2] == ("api", "-X") and "/statuses/" in a[3]]
+
+
+def test_cmd_verdict_posts_success_status_on_approve(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "repos/o/r/statuses/deadbeef" in joined
+    assert f"context={rl.STATUS_AI_REVIEW}" in joined
+    assert "state=success" in joined
+
+
+def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Есть находки.\nВЕРДИКТ: rework"))
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    assert "state=failure" in " ".join(status_calls[0])
+
+
+def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeypatch, tmp_path):
+    # Обоснование задачи #345: ошибка провайдера/транспорта (dsh_rc != 0) не
+    # вердикт о коде — required status check не должен намертво краснеть до
+    # нового пуша человеком, у ai:failed уже есть автоповтор по таймеру (#196).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")  # пустой ответ + dsh_rc≠0 → transport_failed
+    args.dsh_rc = "1"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1  # шаг всё равно красный (fail loud), но статус — не failure
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "state=pending" in joined
+    assert "state=failure" not in joined
+
+
+def test_ai_review_verdict_posts_status_through_review_labels_helper():
+    # Гвардия по исходнику (тот же класс, что test_check_pr_reads_files_through_paginated_helper):
+    # публикация статуса обязана идти через одно место правды review_labels,
+    # а не второй прямой gh api-вызов рядом.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "review_labels.post_commit_status(" in source
+    assert "review_labels.STATUS_AI_REVIEW" in source
+    assert "review_labels.ai_status_state(verdict)" in source

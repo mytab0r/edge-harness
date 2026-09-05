@@ -5,7 +5,11 @@
 # создают событий (антирекурсия GitHub), и on: pull_request[labeled] молчал
 # бы вечно; workflow_run — документированный обход этого ограничения
 # (research/21). Фильтр: pr-review завершился успехом И на PR стоит метка
-# review:ok (проверяет facts-шаг: успех бывает и с review:large).
+# review:ok ИЛИ review:large (проверяет facts-шаг) — второе нужно, чтобы
+# газ размерного гейта (#204, apply_large_ok) вообще имел шанс сработать:
+# крупный-но-безнаходочный дифф получает review:large, а не review:ok
+# (check_pr.py::verdict_for), и без этого условия AI-ревью на нём не
+# запускалось бы никогда — тормоз стоял бы без единого AI-вердикта.
 # Повтор/миграция — workflow_dispatch (input pr): события отгоревших PR
 # не восстановить.
 # review:ok сам по себе НЕ означает, что дорогой прогон нужен (#294): чистое
@@ -31,7 +35,9 @@
 # нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET* из model-shell
 # вызовов (живой прогон 2026-08-30, см. worker.yml).
 # Job `verdict`: СВЕЖАЯ машина, свой чекаут main, свой GH_TOKEN с
-# pull-requests:write. Ответ ревью переезжает между job'ами ВЫВОДОМ
+# pull-requests:write (+ statuses:write — вердикт публикуется вторым каналом,
+# Commit Status API harness/ai-review, параллельно метке, #345). Ответ ревью
+# переезжает между job'ами ВЫВОДОМ
 # доверенного шага (данные, не код); head для сверки — step-output фактов,
 # закрытый до недоверенного шага: файлы $AI_WORK агенту принадлежат.
 #
@@ -139,13 +145,26 @@ jobs:
           head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)
           [ -n "$head" ] || { echo "::error::у PR #$pr нет head-sha"; exit 1; }
           # Источник правды — метка, а не вывод из conclusion: pr-review мог
-          # завершиться успехом с review:large (не ок) — тогда гейт не открыт.
+          # завершиться успехом с review:large (не ок) — тогда гейт всё равно
+          # открыт: review:large — ЕДИНСТВЕННЫЙ путь, которым size_gate метит
+          # крупный-но-безнаходочный дифф (verdict_for в check_pr.py ставит
+          # либо review:ok, либо review:large — никогда оба сразу), а газ
+          # этого тормоза (#204, apply_large_ok в ai_review.py::cmd_verdict)
+          # обязан опираться на состоявшийся AI-вердикт на этом же PR. Если
+          # не открыть гейт и для review:large, AI-ревью никогда не запустится
+          # на крупном диффе вообще — тормоз без AI-вердикта, апрув
+          # review:large-ok мёртв по построению, а PR стоит молча (живой
+          # замер #204, второй заход: PR #387/#384/#367/#262 без единого
+          # ai:*-события в таймлайне). review:changes-requested (есть
+          # findings) сюда не попадает — при findings pr-review сам
+          # завершается кодом 1, workflow_run.conclusion != success, и job
+          # review вообще не стартует по условию выше.
           labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels" --jq '[.[].name] | join(" ")')
           case " $labels " in
-            *" review:ok "*) go=true ;;
+            *" review:ok "*|*" review:large "*) go=true ;;
             *)
               echo "go=false" >> "$GITHUB_OUTPUT"
-              echo "PR #$pr: review:ok не стоит ($labels) — гейт первого ревью не открыт, выходим без ревью."
+              echo "PR #$pr: ни review:ok, ни review:large не стоит ($labels) — гейт первого ревью не открыт, выходим без ревью."
               exit 0
               ;;
           esac
@@ -290,6 +309,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: write
+      statuses: write
     steps:
       # Доверенный инструментарий — из main; ревьюимое дерево тут не нужно:
       # verdict парсит ответ и ходит в API, текущий head он сверяет сам.

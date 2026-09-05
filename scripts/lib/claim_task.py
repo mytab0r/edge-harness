@@ -125,6 +125,23 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
     в задаче (логин у всех агентов один — различает каналы именно она)."""
     now = now or datetime.now(timezone.utc)
     ref = lock_ref(task)
+    # Проверка на входе (не гвардия постфактум): закрытая задача не должна
+    # снова уходить в аренду — иначе воркер/hands начинают работу над тем,
+    # что приёмка уже закрыла (тот же класс живого случая #320/#325, что и
+    # accept_merged_tasks выше по конвейеру, симметричная сторона). Дешёвый
+    # GET перед дорогим созданием коммита/ref'а ниже.
+    issue = gh(f"repos/{repo}/issues/{task}")
+    if issue.get("state") != "open":
+        return ClaimResult(claimed=False, task=task,
+                           detail=f"задача #{task} закрыта — аренда не выдана")
+    # blocked (эскалация владельцу) — тот же класс, что и closed выше: символ
+    # той же дыры описан в задаче #357 («уже закрытую ИЛИ заблокированную»).
+    # Проверка нужна здесь отдельно от task-branch: hands (dsh_task.sh) не
+    # проходят через task-branch вовсе, единственные их ворота — claim.
+    labels = {label.get("name") for label in issue.get("labels", []) if isinstance(label, dict)}
+    if "blocked" in labels:
+        return ClaimResult(claimed=False, task=task,
+                           detail=f"задача #{task} заблокирована (label blocked) — аренда не выдана")
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
     base = gh(f"repos/{repo}/commits/main")
     commit = gh(

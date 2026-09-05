@@ -559,6 +559,17 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
            "-f", f"labels[]={label}")
 
+    # Commit Status API — тот же вердикт вторым каналом, параллельно метке
+    # (#345): allow_auto_merge читает required status checks, не метки.
+    # error → pending, не failure (review_labels.ai_status_state): сбой
+    # провайдера/транспорта — не решение о коде, у него свой газ — автоповтор
+    # по таймеру (#196), failure держал бы проверку красной до нового пуша.
+    status_description = f"ai-review: error — {reason}" if verdict == "error" else f"ai-review: {verdict}"
+    review_labels.post_commit_status(
+        repo, args.head, review_labels.STATUS_AI_REVIEW,
+        review_labels.ai_status_state(verdict), status_description,
+        run_gh, review_labels.run_target_url(repo))
+
     # Газ к тормозу review:large (#204): подтверждение размера опирается на
     # состоявшийся вердикт AI, а не на факт запуска — added считается по
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
