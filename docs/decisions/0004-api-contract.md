@@ -39,7 +39,8 @@
    (код ответа — не `not_found`), без токена — ровно 401, незаявленный путь/метод —
    ровно `not_found`. Дока по API (`docs/api.md`) — рендер той же спеки.
 4. **Канарейки**: `scripts/canary-ui.mjs` на Playwright. В CI: job `canary` в
-   `worker-ci` (против локального `wrangler dev`) и шаг после деплоя (против прода).
+   [`worker-ci.yml`](../../.github/workflows/worker-ci.yml) (против локального
+   `wrangler dev`) и шаг после деплоя (против прода).
 5. **`.gitattributes`**: `* text=auto eol=lf` + ренормализация — workerd и CRLF-JSON
    несовместимы (воспроизведено и изолировано пробами; 49 CRLF в файле — crash-loop).
 

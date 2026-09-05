@@ -1,0 +1,94 @@
+# Ворота CI морды до прода (ADR 0004, «Два ворот»): контракт фронтенда, typecheck
+# и vitest на настоящем workerd — job `worker-test`; канарейка UI реальным браузером
+# против локального `wrangler dev` — job `canary`. Сломанные тесты, устаревшая спека
+# или битый вход не доезжают до прода, где осталась только постфактум-канарейка
+# шага после деплоя (deploy-worker.yml).
+#
+# История: файл удалён cleanup-коммитом 09ef969 вместе с каркасом, ворота исчезли,
+# а ADR 0004 продолжал их обещать (задача #72). Восстановлен по исходной форме —
+# она доказана зелёными прогонами 2026-08-28.
+#
+# Job id `worker-test`, а не `test`: обязательная проверка `test` защиты main
+# поставляется job'ом `test` в repo-ci.yml, и одноимённый чек второго workflow
+# сделал бы контекст проверки двусмысленным. `pull_request` без фильтра путей:
+# ворота обязаны стоять на каждом PR, а не только на PR с изменениями cf-worker.
+name: worker-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cf-worker/**"
+      - ".github/workflows/worker-ci.yml"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  worker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - run: npm ci
+        working-directory: cf-worker
+
+      - name: Контракт фронтенда (пути и локализация)
+        run: npm run check
+        working-directory: cf-worker
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: cf-worker
+
+      - name: Тесты на настоящем workerd (vitest + @cloudflare/vitest-plugin)
+        run: npm test
+        working-directory: cf-worker
+
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - run: npm ci
+        working-directory: cf-worker
+
+      - name: Браузер для канарейки
+        run: npx playwright install --with-deps chromium
+        working-directory: cf-worker
+
+      # Канарейка против локального wrangler dev: вход в морду реальным браузером
+      # ДО прода. Готовность воркера — критерий шага: не дождались — падаем громко
+      # с хвостом лога wrangler, а не с невнятной сетевой ошибкой канарейки.
+      - name: Канарейка UI против wrangler dev
+        working-directory: cf-worker
+        env:
+          HANDS_TOKEN: dev-token
+        run: |
+          cp .dev.vars.example .dev.vars
+          npx wrangler dev --port 8808 > /tmp/wrangler-dev.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8808/assets/app.js > /dev/null && break
+            sleep 1
+          done
+          if ! curl -sf http://127.0.0.1:8808/assets/app.js > /dev/null; then
+            echo "::error::wrangler dev не поднялся за 60с — хвост лога:"
+            tail -40 /tmp/wrangler-dev.log
+            exit 1
+          fi
+          node scripts/canary-ui.mjs --url http://127.0.0.1:8808 --token dev-token
