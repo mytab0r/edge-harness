@@ -18,10 +18,11 @@ patchedDependencies), и эта гвардия делает его возвра�
 невозможным — регресс красит CI, а не собирает тихо неверную морду.
 
 Правила:
-  1. deploy-dsh-edge.yml не ставит пакеты npm'ом: ни `npm install`, ни
-     `npm ci`, ни `npm add` (это единственный workflow, работающий в
-     pnpm-дереве dsh-edge). `npm pack` легален — он скачивает tarball
-     префаба во временный каталог и node_modules не трогает.
+  1. deploy-dsh-edge.yml не ставит пакеты npm'ом: ни `npm install`, ни его
+     шорткат `npm i`, ни `npm ci`, ни `npm add` — в любой форме записи шага
+     (блочной `run: |` и инлайн `- run: npm …`; это единственный workflow,
+     работающий в pnpm-дереве dsh-edge). `npm pack` легален — он скачивает
+     tarball префаба во временный каталог и node_modules не трогает.
   2. `--legacy-peer-deps` запрещён ВЕЗДЕ, где он вообще может появиться:
      все .github/workflows/*.yml|yaml и scripts/**/*.sh. Флаг — не решение
      peer-конфликта, а его маскировка (тот же класс); peer-конфликт чинится
@@ -51,11 +52,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 DEPLOY_DSH_EDGE = WORKFLOWS / "deploy-dsh-edge.yml"
 
-# npm как УСТАНОВЩИК пакетов (меняет node_modules): install/ci/add.
-# `npm pack` (скачать tarball) установщиком не является. Якорь `^\s*` вместе
-# с отсечением комментариев (см. _code_lines_numbered) исключает прозу
+# npm как УСТАНОВЩИК пакетов (меняет node_modules): install/ci/add — включая
+# шорткат `i` и инлайн-форму YAML (`- run: npm install …`, как в
+# deploy-worker.yml:28). `npm pack` (скачать tarball) установщиком не является.
+# `\b` после `i` не цепляет `npm init`/`npm info` (они не ставят пакеты);
+# `^` не даёт матчнуться внутри `pnpm add` (находка AI-ревью #313: шорткат
+# `npm i` и инлайн-форма проходили первую версию правила молча). Якорь `^\s*`
+# вместе с отсечением комментариев (см. _code_lines_numbered) исключает прозу
 # комментариев: «npm install» в тексте комментария — не вызов.
-NPM_INSTALLER_RE = re.compile(r"^\s*npm\s+(?:install|ci|add)\b", re.M)
+NPM_INSTALLER_RE = re.compile(
+    r"^\s*(?:(?:-\s*)?(?:run|script):\s*)?npm\s+(?:install|i|ci|add)\b", re.M
+)
 
 # Маскирующий флаг peer-конфликтов — запрещён в любых файлах, которые
 # вообще могут исполняться (workflow + shell-скрипты репозитория).
@@ -169,3 +176,11 @@ def test_deploy_dsh_edge_keeps_pnpm_plugin_route():
 #     no-op-команду `: "--legacy-peer-deps"` (строка с флагом в комментарии
 #     красить не должна — комментарии отсечены) — красен
 #     test_no_legacy_peer_deps_masking_anywhere; удалить строку.
+#   М4 (правило 1, инлайн-форма и шорткат — находка AI-ревью #313): дописать
+#     в deploy-dsh-edge.yml шаг `- run: npm i pnpm` — красен
+#     test_deploy_dsh_edge_never_installs_packages_with_npm; а
+#     `- run: npm init -y` КРАСИТЬ НЕ ДОЛЖЕН (\b после `i`; init не ставит
+#     пакеты) — проверить и на него; удалить строки.
+#   М5 (правило 1, ложный позитив): строка `          pnpm add --save-exact`
+#     не матчится (якорь `^` + `npm\s`) — гвардия зелёная на неизменённом
+#     дереве; также `- uses: actions/checkout@v7` и `npm pack` не красят.
