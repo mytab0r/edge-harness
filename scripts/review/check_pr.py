@@ -236,11 +236,37 @@ def main() -> int:
         stored_fp = review_labels.header_facts(ai_comment.get("body") or "").get("diff") if ai_comment else None
     if ai_verdict_keep(current, stored_fp, current_fp):
         print(f"review: дифф не изменился с прошлого вердикта AI ({current_fp[:12]}…) — {', '.join(to_drop)} сохранены")
+        # Зеркало на новый head (находка ai-ревью PR #346): пока метка сохраняется,
+        # ai-review.yml сам эту ветку не проходит — should_run_ai_review отдаёт
+        # false, job verdict скипается целиком, и harness/ai-review на текущем SHA
+        # никогда не появляется. Без этой публикации PR застревал бы в required
+        # status checks в состоянии «Expected» навсегда после включения контекста
+        # (тормоз без газа) — ai_comment уже прочитан выше для сверки отпечатка,
+        # второй сетевой запрос не нужен, решение то же самое, что и у метки.
+        reviewer = review_labels.header_facts(ai_comment.get("body") or "").get("reviewer") if ai_comment else None
+        if reviewer:
+            review_labels.post_commit_status(
+                repo, pull["head"]["sha"], review_labels.STATUS_AI_REVIEW,
+                review_labels.ai_status_state(reviewer),
+                f"ai-review: {reviewer} (вердикт сохранён, дифф не изменился)",
+                run_gh, review_labels.run_target_url(repo))
+        else:
+            print("::warning::review: дифф не изменился, но вердикт AI не удалось прочитать — harness/ai-review не обновлён на новом head")
     else:
         for old in to_drop:
             run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     verdict = verdict_for(is_large, findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
+
+    # Commit Status API — тот же вердикт вторым каналом, параллельно метке
+    # (#345): allow_auto_merge (уже включён на репозитории) читает required
+    # status checks, не метки. Состояние вычислено из ТОЙ ЖЕ переменной
+    # verdict, что и метка выше — второго источника истины не заводим.
+    review_labels.post_commit_status(
+        repo, pull["head"]["sha"], review_labels.STATUS_REVIEW,
+        review_labels.review_status_state(verdict),
+        f"review: {verdict}" + (f" (+{added} строк)" if not findings else f" ({len(findings)} находок)"),
+        run_gh, review_labels.run_target_url(repo))
 
     if findings:
         body = "Ревью нашло замечания:\n" + "\n".join(f"- {f}" for f in findings)

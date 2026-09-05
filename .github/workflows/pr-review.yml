@@ -2,6 +2,9 @@
 # review:ok / review:changes-requested (+ review:large для крупных диффов).
 # Оркестратор сливает только PR с метками review:ok И ai:ok — метки и есть
 # триггер следующих шагов (см. docs/agents/PROTOCOL.md и ADR 0007).
+# Тот же вердикт публикуется вторым каналом — Commit Status API (#345,
+# harness/review), параллельно метке: нативный allow_auto_merge required
+# status checks видит, метки — нет (statuses: write ниже).
 #
 # Trust-зона (класс «PR подсунул код под write-токен», закрыт по ревью PR #138):
 # чекаут по умолчанию — ref: main, ИЗ НЕГО исполняется check_pr.py с
@@ -31,6 +34,7 @@ permissions:
   contents: read
   pull-requests: write
   actions: write
+  statuses: write
 
 jobs:
   review:
