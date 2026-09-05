@@ -1687,6 +1687,56 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
     assert posted and "улика получена" in posted[0][1]
 
 
+def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
+    """Пагинация (находка AI-ревью PR #253, четвёртое место того же класса
+    #294/#303): accept_merged_tasks читал сырую первую страницу
+    `pulls/{n}/files?per_page=100` вместо review_labels.list_pr_files —
+    у PR за сотню файлов, где cf-worker/* стоит за сотой позицией,
+    classify_acceptance видел бы только первую сотню (обычные скрипты) и
+    выдал бы класс "script" вместо "deploy". Последствие: задача закрылась
+    бы по зелёным check-runs головы PR, а не по деплою+канарейке, которых
+    требует критерий — и after_merge (уже читающий все страницы) запустил
+    бы deploy-worker.yml, разойдясь с приёмкой в классификации ОДНОГО PR."""
+    page1 = [{"filename": f"scripts/file{i}.py"} for i in range(100)]
+    page2 = [{"filename": "cf-worker/worker.js"}]  # значимый файл СТРОГО за первой сотней
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined == f"repos/{REPO}/pulls/999/files?per_page=100&page=1":
+            return page1
+        if joined == f"repos/{REPO}/pulls/999/files?per_page=100&page=2":
+            return page2
+        if joined == f"repos/{REPO}/pulls/999/files?per_page=100":
+            # Сырая одностраничная форма (мутация класса #294/#303): реальный
+            # GitHub API без &page= отдаёт первую сотню — именно её вернул бы
+            # старый код, теряя cf-worker/worker.js со страницы 2.
+            return page1
+        if joined == f"repos/{REPO}/issues/21/comments?per_page=100":
+            return []
+        if joined == f"-X PATCH repos/{REPO}/issues/21 -f state=closed":
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    patch_gh(monkeypatch, fake_gh)
+    # deploy_evidence/script_evidence застублены — тест доказывает КЛАССИФИКАЦИЮ
+    # (какая из двух вызвана), а не саму проверку улики (та уже покрыта другими
+    # тестами deploy/script-класса выше).
+    monkeypatch.setattr(sch, "deploy_evidence", lambda repo, merged_at, sha: ("ok", "стаб: деплой"))
+    monkeypatch.setattr(
+        sch, "script_evidence",
+        lambda repo, sha: (_ for _ in ()).throw(AssertionError("script_evidence не должен вызываться — файл cf-worker/ виден только через полный обход страниц")))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    pr = merged_pull(999, "#21\n\nПравка cf-worker/worker.js среди сотни прочих файлов",
+                      "headsha999", "2026-09-04T10:00:00Z")
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr})
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой (deploy)" in line and "#21" in line for line in lines)
+
+
 # ── /api/health: находки AI-ревью PR #253 (403 без явного UA, таймаут не громкий) ─
 
 

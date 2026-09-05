@@ -1343,7 +1343,11 @@ def accept_merged_tasks(
         category = None
         merged_at = parse_time(pull["merged_at"])
         try:
-            files_payload = gh(f"repos/{repo}/pulls/{pull['number']}/files?per_page=100") or []
+            # Пагинация (#294/#253, четвёртое место того же класса: after_merge
+            # выше уже переведён на review_labels.list_pr_files) — PR за сотню
+            # файлов, где cf-worker/* стоят за сотой позицией, классифицировал
+            # бы приёмку как "script" вместо "deploy", разойдясь с after_merge.
+            files_payload = review_labels.list_pr_files(repo, pull["number"], gh)
             filenames = [f["filename"] for f in files_payload]
             category = classify_acceptance(filenames)
             if category == ACCEPT_DOCS:
