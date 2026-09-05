@@ -49,6 +49,27 @@ def gh(*args: str) -> dict | list:
     return json.loads(result.stdout)
 
 
+def _all_open_pulls(repo: str) -> list[dict]:
+    """Все открытые PR постранично, не только первая страница `per_page=100`
+    (класс #294/#303/#308: сырой `pulls?state=open&per_page=100` без обхода
+    молча теряет хвост — на репозитории за сотню открытых PR второй PR на ту
+    же задачу за первой сотней не находился бы, и контракт «одна задача — один
+    PR» тихо переставал бы работать именно там, где список самый длинный).
+    Листание — та же форма, что review_labels.list_pr_files/list_timeline:
+    короткая страница (`len(chunk) < 100`) значит «дальше страниц нет»."""
+    page = 1
+    pulls: list[dict] = []
+    while True:
+        chunk = gh(f"repos/{repo}/pulls?state=open&per_page=100&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        pulls.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return pulls
+
+
 def fail(messages: list[str], repo: str, pr_number: int) -> None:
     # Провал громкий на самом PR: метка + комментарий, а не только строка в логах CI.
     try:
@@ -139,7 +160,7 @@ def main() -> int:
             # номер в прозе описания (#195 — второй экземпляр асимметрии #187:
             # своя декларация уже была узкой, чужая гонялась по всему тексту).
             others = []
-            pulls = gh(f"repos/{repo}/pulls?state=open&per_page=100")
+            pulls = _all_open_pulls(repo)
             for other in pulls:
                 if other["number"] == args.pr:
                     continue

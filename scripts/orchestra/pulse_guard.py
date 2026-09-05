@@ -323,8 +323,30 @@ def last_failure_error(repo: str, run: dict) -> str:
     return "; ".join(bad)
 
 
+def _all_issue_comments(repo: str, issue_number: int) -> list[dict]:
+    """Все комментарии issue постранично, не только первая страница
+    `per_page=100` (#276, тот же класс, что review_labels.list_pr_files/
+    list_timeline и #294/#303: молчаливая обрезка на самом длинном обсуждении
+    прятала бы САМЫЙ СВЕЖИЙ маркер серии — issue_marker_times/issue_markers_any
+    решают «уже сигналили в этом эпизоде» по последнему маркеру, поэтому именно
+    длинная задача-статус #120/#134, у которой маркеров и так больше всего,
+    первой теряла бы хвост). Листание — та же форма: короткая страница
+    (`len(chunk) < 100`) значит «дальше страниц нет»."""
+    page = 1
+    comments: list[dict] = []
+    while True:
+        chunk = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100&page={page}") or []
+        if not isinstance(chunk, list) or not chunk:
+            break
+        comments.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return comments
+
+
 def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
-    payload = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100") or []
+    payload = _all_issue_comments(repo, issue_number)
     return [
         parse_time(comment["created_at"])
         for comment in payload
@@ -336,7 +358,7 @@ def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) ->
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
     но и от его содержимого (номер попытки пробы, #205)."""
-    payload = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100") or []
+    payload = _all_issue_comments(repo, issue_number)
     result = []
     for comment in payload:
         body = comment.get("body") or ""
