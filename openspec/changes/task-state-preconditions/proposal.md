@@ -40,9 +40,11 @@
    Явный HTTP 404 (задача точно не существует) — тем не менее отказ, это не
    офлайн-случай.
 3. `scripts/lib/claim_task.py::claim` перед созданием коммита/ref'а замка
-   запрашивает `repos/<repo>/issues/<task>` — `state != "open"` → аренда не
-   выдаётся, `ClaimResult(claimed=False, …)` (тот же зелёный no-op, что и
-   «занята», не поломка).
+   запрашивает `repos/<repo>/issues/<task>` — `state != "open"` или метка
+   `blocked` → аренда не выдаётся, `ClaimResult(claimed=False, …)` (тот же
+   зелёный no-op, что и «занята», не поломка). `blocked` проверяется именно
+   тут, а не только в `task-branch`: hands (`dsh_task.sh`) — единственные их
+   ворота это `claim`, `task-branch` они не проходят вовсе.
 
 ## Четвёртое место (аудит, не исправлено в этом change)
 

@@ -134,6 +134,14 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
     if issue.get("state") != "open":
         return ClaimResult(claimed=False, task=task,
                            detail=f"задача #{task} закрыта — аренда не выдана")
+    # blocked (эскалация владельцу) — тот же класс, что и closed выше: символ
+    # той же дыры описан в задаче #357 («уже закрытую ИЛИ заблокированную»).
+    # Проверка нужна здесь отдельно от task-branch: hands (dsh_task.sh) не
+    # проходят через task-branch вовсе, единственные их ворота — claim.
+    labels = {label.get("name") for label in issue.get("labels", []) if isinstance(label, dict)}
+    if "blocked" in labels:
+        return ClaimResult(claimed=False, task=task,
+                           detail=f"задача #{task} заблокирована (label blocked) — аренда не выдана")
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
     base = gh(f"repos/{repo}/commits/main")
     commit = gh(

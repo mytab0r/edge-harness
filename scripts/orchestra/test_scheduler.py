@@ -1860,7 +1860,7 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#21" in line for line in lines)
@@ -1934,7 +1934,7 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr_first})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr_first}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#21" in line for line in lines)
@@ -1989,7 +1989,7 @@ def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
     pr = merged_pull(999, "#21\n\nПравка cf-worker/worker.js среди сотни прочих файлов",
                       "headsha999", "2026-09-04T10:00:00Z")
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой (deploy)" in line and "#21" in line for line in lines)
@@ -2129,7 +2129,7 @@ def test_accept_merged_tasks_health_timeout_is_hard_failure_not_a_crash(hanging_
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -2154,7 +2154,7 @@ def test_accept_merged_tasks_does_not_close_on_red_deploy(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("не закрыта" in line and "#21" in line for line in lines)
@@ -2177,7 +2177,7 @@ def test_accept_merged_tasks_closes_on_green_check_runs(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: None)
 
     pool = [issue(18, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#18" in line for line in lines)
@@ -2201,7 +2201,7 @@ def test_accept_merged_tasks_does_not_close_on_red_check_run(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(18, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("провалена" in line and "#18" in line for line in lines)
@@ -2225,7 +2225,7 @@ def test_accept_merged_tasks_closes_docs_only_with_no_observable_result(monkeypa
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#78" in line for line in lines)
@@ -2253,7 +2253,7 @@ def test_accept_merged_tasks_does_not_close_docs_when_file_missing_from_main(mon
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(call.startswith("-X PATCH") for call in fake.calls)
@@ -2286,7 +2286,7 @@ def test_accept_merged_tasks_closes_docs_when_pr_only_removes_files(monkeypatch)
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: archive_pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: archive_pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#78" in line for line in lines)
@@ -2314,7 +2314,7 @@ def test_accept_merged_tasks_docs_missing_escalates_on_non_404_error(monkeypatch
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("сбой инструмента не пишет обычный комментарий"))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -2341,7 +2341,7 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -2371,7 +2371,7 @@ def test_accept_merged_tasks_hard_failure_escalation_is_idempotent(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
     assert any("уже эскалировано" in line and "#21" in line for line in lines)
@@ -2395,7 +2395,7 @@ def test_accept_merged_tasks_stays_quiet_when_pending_within_threshold(monkeypat
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("ещё не готова" in line and "#21" in line for line in lines)
@@ -2422,7 +2422,7 @@ def test_accept_merged_tasks_escalates_when_pending_past_threshold(monkeypatch):
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -2448,7 +2448,7 @@ def test_accept_merged_tasks_pending_escalation_is_idempotent(monkeypatch):
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now)
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("уже эскалировано" in line and "#21" in line for line in lines)
@@ -2466,7 +2466,7 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
 
     pool = [issue(18, assignees=())]  # уже без исполнителя — как после первого провала
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert lines == []
@@ -2491,7 +2491,7 @@ def test_accept_merged_tasks_fail_retries_cleanup_when_assignee_stuck(monkeypatc
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",))]  # снятие assignee в прошлый раз не завершилось
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/18/assignees") for c in fake.calls)
@@ -2525,7 +2525,7 @@ def test_accept_merged_tasks_ok_close_failure_does_not_stop_the_rest(monkeypatch
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",)), issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
 
     assert any("#18" in line and "закрытие приёмкой не завершено" in line for line in lines)
     assert not any(call.startswith(f"-X PATCH repos/{REPO}/issues/18") for call in fake.calls)
@@ -2560,7 +2560,7 @@ def test_accept_merged_tasks_fail_comment_failure_does_not_stop_the_rest(monkeyp
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",)), issue(78, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
 
     assert any("#18" in line and "отметка провала приёмки не завершена" in line for line in lines)
     assert not any(call.startswith(f"-X DELETE repos/{REPO}/issues/18") for call in fake.calls)
@@ -2582,7 +2582,7 @@ def test_accept_merged_tasks_never_closes_watchdog_issue(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(sch.WATCHDOG_ISSUE, assignees=())]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {sch.WATCHDOG_ISSUE: pr126})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {sch.WATCHDOG_ISSUE: pr126}, open_pulls_list=[])
 
     assert hard_failure is False
     assert lines == []
@@ -2599,7 +2599,7 @@ def test_accept_merged_tasks_zero_calls_when_no_task_has_merged_pr(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать"))
 
     pool = [issue(999, assignees=("mytab0r",)), issue(1000, assignees=())]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})  # #18 не в пуле
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])  # #18 не в пуле
 
     assert lines == []
     assert hard_failure is False
@@ -2713,7 +2713,7 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(number, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(f"#{number}" in line and "закрыта приёмкой" in line for line in lines)
@@ -2743,7 +2743,7 @@ def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeyp
     patch_post_issue_comment(monkeypatch, lambda *a: None)
 
     pool = [issue(297, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#297" in line for line in lines)
@@ -2763,7 +2763,7 @@ def test_accept_merged_tasks_partial_disclaimer_is_idempotent(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
 
     pool = [issue(297, assignees=())]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert lines == []
@@ -2788,7 +2788,7 @@ def test_accept_merged_tasks_partial_disclaimer_retries_cleanup_when_assignee_st
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(297, assignees=("mytab0r",))]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/297/assignees") for c in fake.calls)
@@ -2827,7 +2827,7 @@ def test_accept_merged_tasks_never_closes_epic(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эпик не комментируется приёмкой"))
 
     pool = [issue(115, assignees=(), title="ЭПИК: интеграции внешних систем")]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {115: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {115: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert lines == []
@@ -2848,7 +2848,7 @@ def test_accept_merged_tasks_marks_epic_completed_when_all_sub_issues_closed(mon
 
     pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
                   sub_issues_summary={"total": 8, "completed": 8})]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
@@ -2871,7 +2871,7 @@ def test_accept_merged_tasks_epic_completed_marker_is_idempotent(monkeypatch):
 
     pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
                   sub_issues_summary={"total": 8, "completed": 8})]
-    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr})
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert lines == []

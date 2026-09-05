@@ -161,6 +161,23 @@ def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):
     assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
 
 
+def test_claim_refuses_blocked_task_without_creating_lock(monkeypatch):
+    # Симметрично closed выше (#357): задача открыта, но несёт blocked —
+    # эскалация владельцу, hands (dsh_task.sh) идут мимо task-branch и
+    # единственные их ворота это claim. Мутация: закомментируй проверку
+    # blocked в claim() — этот тест краснеет (claimed становится True).
+    routes = dict(BASE)
+    routes["repos/o/r/issues/5"] = {
+        "number": 5, "state": "open", "labels": [{"name": "task"}, {"name": "blocked"}],
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+    assert result.claimed is False
+    assert "заблокирована" in result.detail
+    assert not any("git/commits" in c for c in server.calls)
+    assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
+
+
 def test_claim_success_visibility_after_lock(monkeypatch):
     server = install(monkeypatch, FakeServer(dict(BASE)))
     result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))

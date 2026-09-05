@@ -169,7 +169,12 @@ fi
 # ── случай 7: gh не установлен — предупреждение, ветка заводится ────────────
 # PATH без каталогов, где лежит хоть какой-то `gh` (фейковый из $WORK/bin
 # или настоящий из системного PATH) — портируемо между Windows/Linux, без
-# завязки на имя каталога.
+# завязки на имя каталога. На GitHub-раннерах gh и bash оба лежат в /usr/bin —
+# та же чистка вынесла бы и bash: PATH="$safe_path" bash… не находит команду
+# `bash` (assignment-префикс простой команды режет PATH и для её собственного
+# поиска, не только для дочернего процесса — проверено). Резолвим bash
+# абсолютным путём ДО чистки, зовём по нему — сам bash от PATH не зависит.
+bash_bin="$(command -v bash)"
 safe_path=""
 IFS=':' read -ra _dirs <<<"$PATH"
 for _d in "${_dirs[@]}"; do
@@ -183,7 +188,7 @@ safe_path="${safe_path#:}"
 make_tree "case7"
 if (
   cd "$WORK/case7"
-  PATH="$safe_path" bash "$SCRIPT_SRC" "67-no-gh"
+  PATH="$safe_path" "$bash_bin" "$SCRIPT_SRC" "67-no-gh"
 ) 2>"$WORK/case7.stderr"; then
   branch=$(git -C "$WORK/case7" branch --show-current)
   if [ "$branch" = "agent/67-no-gh" ]; then

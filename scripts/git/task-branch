@@ -34,7 +34,12 @@ else
   # git config --get (не `git remote get-url`, который резолвит url.*.insteadOf
   # и отдал бы уже переписанный адрес) — сырой сконфигурированный URL origin.
   origin_url=$(git config --get remote.origin.url 2>/dev/null || true)
-  repo=$(printf '%s' "$origin_url" | sed -E 's#^(git@|https://)[^:/]+[:/](.+?)(\.git)?$#\2#')
+  # Только срез схемы+хоста регэкспом (ERE не умеет ленивый +?: (.+?) жадно
+  # проглатывает .git, и (\.git)? матчит пустоту — суффикс не срезался,
+  # gh api видел «o/r.git» и 404-ил на реальных клонах). Суффикс .git снимается
+  # отдельно точным суффиксом shell-параметра, а не регэкспом.
+  repo=$(printf '%s' "$origin_url" | sed -E 's#^(git@|https://)[^:/]+[:/]##')
+  repo="${repo%.git}"
   if [ -z "$repo" ] || [ "$repo" = "$origin_url" ]; then
     echo "ПРЕДУПРЕЖДЕНИЕ: не смог определить owner/repo из origin ($origin_url) — задача #$task_number не проверена." >&2
   else

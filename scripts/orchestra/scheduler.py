@@ -1515,14 +1515,18 @@ def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
 
 def accept_merged_tasks(
     repo: str, pool: list[dict], merged: dict[int, dict], now: datetime | None = None,
-    open_pulls_list: list[dict] | None = None,
+    *, open_pulls_list: list[dict],
 ) -> tuple[list[str], bool]:
     """Стадия приёмки (#227) — см. блок комментариев выше. merged — карта
     Task#N → слитый PR (merged_pr_map(all_merged_pulls(repo)), один общий
     обход на весь прогон оркестратора, тот же, что использует reap_stale).
     now — момент прогона (по умолчанию текущее время), нужен только для
     порога ACCEPTANCE_PENDING_HOURS. open_pulls_list — открытые PR того же
-    прогона (open_pulls(repo)); передаётся не None только вызовом из main().
+    прогона (open_pulls(repo)) — обязателен (keyword-only, без дефолта): молчаливый
+    None вернул бы инцидент #320/#325 тихо для любого забывшего вызывающего
+    (находка AI-ревью PR #358) — пустой список `[]` explicit допустим и
+    означает «других открытых PR не было», но это решение вызывающего, а не
+    дефолт по умолчанию.
 
     Живой случай (проверки на входе вместо гвардий постфактум, задача о
     приёмке при открытом втором PR): приёмка закрыла #320, пока по нему был
@@ -1846,7 +1850,8 @@ def main() -> int:
     # Проверка на входе, не гвардия постфактум (см. докстринг accept_merged_tasks):
     # свежий снимок открытых PR, а не тот, что собран в начале прогона выше —
     # PR, который стал причиной этой приёмки, мог открыться только что.
-    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged, now, open_pulls(repo))
+    accept_lines, accept_hard_failure = accept_merged_tasks(
+        repo, pool, merged, now, open_pulls_list=open_pulls(repo))
     if accept_lines:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])
