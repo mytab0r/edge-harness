@@ -1286,11 +1286,83 @@ ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
 ACCEPTANCE_DOCS_MARKER = "[приёмка: без наблюдаемого результата]"
 ACCEPTANCE_PENDING_MARKER = "[приёмка: зависла]"
 ACCEPTANCE_ERROR_MARKER = "[приёмка: сбой]"
+ACCEPTANCE_PARTIAL_MARKER = "[приёмка: требует проверки человеком]"
+ACCEPTANCE_EPIC_MARKER = "[приёмка: эпик завершён]"
 
 # Рядом со STALE_HOURS (то же назначение — «сколько ждать, прежде чем бить
 # тревогу», но для другого канала: STALE_HOURS про назначение без PR,
 # ACCEPTANCE_PENDING_HOURS — про PR, который слит, но улика не появляется).
 ACCEPTANCE_PENDING_HOURS = 6
+
+# Дисклеймер о неполноте в теле закрывающего PR (#335): декларация первой
+# строкой (task_ref.declared_tasks) отвечает «к какой задаче относится PR»,
+# не «закрывает ли он её целиком» — приёмка раньше читала только декларацию
+# и закрывала задачу вопреки собственному тексту PR. Живой случай: PR #303
+# объявляет #297 первой строкой и пишет прозой «эта часть — открытая #297»/
+# «#269 остаётся открытой до решения #297» — приёмка закрыла #297 вопреки
+# дисклеймеру. Список — ОДНО место правды для всех веток приёмки (#335).
+# Ложноположительный риск принят намеренно (маркер может относиться к чужому
+# упомянутому issue, не к объявленному) — минимально достаточная защита
+# сейчас дешевле точного справочника машиночитаемых критериев, развилка и
+# цена каждого варианта —
+# openspec/changes/acceptance-partial-pr-guard/design.md, следующий шаг —
+# задача пула #355.
+PARTIAL_DISCLAIMER_MARKERS = (
+    "не реализован",   # реализован/-а/-о/-ы — общий префикс всех форм
+    "остаётся открыт",  # открытой/-ым/-а — общий префикс
+    "стопгэп",
+    "propose-фаза",
+    "перенесён в #",
+    "перенесена в #",
+    "перенесено в #",
+)
+
+
+def partial_disclaimer(body: str) -> str | None:
+    """Найденный маркер неполноты (см. PARTIAL_DISCLAIMER_MARKERS) в теле PR,
+    без учёта регистра, или None. Сравнение по подстроке, не по регекспу —
+    маркеры уже достаточно специфичны, лишняя мощь регекспа тут не нужна.
+    «Ё» нормализуется в «е» с обеих сторон (находка AI-ревью PR #342): «е»
+    вместо «ё» в живых телах PR — норма («перенесен в #», не «перенесён»),
+    без нормализации маркер молча не находится и приёмка тихо закрывает
+    задачу вопреки дисклеймеру — тот самый класс, который #335 и чинит."""
+    lowered = (body or "").lower().replace("ё", "е")
+    for marker in PARTIAL_DISCLAIMER_MARKERS:
+        if marker.replace("ё", "е") in lowered:
+            return marker
+    return None
+
+
+# Заголовок эпика в этом репозитории начинается с «ЭПИК» (проверено фактом
+# по живым issues: #116, #77, #17 «ЭПИК. Фаза 2…», #115 — все четыре начинаются
+# так, вариации «ЭПИК:»/«ЭПИК.» покрыты одним префиксом без двоеточия).
+EPIC_TITLE_PREFIX = "ЭПИК"
+
+
+def is_epic_issue(issue: dict) -> bool:
+    """Родительская задача (#335): реализация эпика обычно распределена по
+    нескольким PR на дочерние задачи — слитый PR, объявляющий эпик первой
+    строкой, не значит «эпик готов целиком», приёмка не должна закрывать
+    эпик автоматом. Два признака, оба уже есть в ответе issues API (лишнего
+    запроса нет): заголовок с префиксом «ЭПИК» и незакрытые нативные
+    sub-issues (`sub_issues_summary`, #202). Ни один не покрывает оба
+    случая сам по себе — #115 эпик по заголовку, но `sub_issues_summary`
+    у него нулевой (дочерние задачи не оформлены как нативные sub-issues),
+    поэтому проверяем оба.
+
+    `sub_issues_summary` подтверждён живым ответом ИМЕННО того эндпоинта,
+    которым пользуется `open_task_issues` — `GET issues?state=open&labels=task`
+    (не только `GET issues/{n}`): замер 2026-09-05, #77 вернулся с
+    `{"total": 8, "completed": 6, "percent_completed": 75}` прямо в
+    list-ответе, поле не пустое и не требует отдельного запроса на issue.
+    Второй сигнал живой, не мёртвый."""
+    title = issue.get("title") or ""
+    if title.startswith(EPIC_TITLE_PREFIX):
+        return True
+    summary = issue.get("sub_issues_summary") or {}
+    total = summary.get("total") or 0
+    completed = summary.get("completed") or 0
+    return total > completed
 
 DSH_EDGE_HEALTH_TIMEOUT = 15
 
@@ -1466,15 +1538,104 @@ def accept_merged_tasks(
             # задача провалилась», а тихая порча канала эскалации молчаливым
             # побочным эффектом, обнаружено при разборе AI-ревью PR #253.
             continue
+        if is_epic_issue(issue):
+            # Эпик — не закрывается приёмкой автоматом (см. is_epic_issue),
+            # запрет сохраняется всегда. Но у WATCHDOG_ISSUE открытость —
+            # функция (постоянный канал эскалации), а у эпика открытость
+            # значит «работа не завершена» — когда все нативные sub-issues
+            # уже закрыты (`sub_issues_summary.total == completed`, оба > 0),
+            # молчание навсегда означало бы, что завершённый эпик никто
+            # никогда не увидит и не закроет вручную (находка AI-ревью
+            # PR #342: «тормоз без газа»). Разовый идемпотентный маркер —
+            # не автозакрытие, только сигнал человеку.
+            summary = issue.get("sub_issues_summary") or {}
+            total = summary.get("total") or 0
+            completed = summary.get("completed") or 0
+            if total > 0 and total == completed:
+                try:
+                    if not issue_marker_times(repo, number, ACCEPTANCE_EPIC_MARKER):
+                        post_issue_comment(
+                            repo, number,
+                            f"{ACCEPTANCE_EPIC_MARKER} все {total} дочерних sub-issues "
+                            f"закрыты — эпик выглядит завершённым и требует ручного "
+                            f"закрытия (приёмка эпики автоматом не закрывает).")
+                        lines.append(
+                            f"📋 #{number}: {ACCEPTANCE_EPIC_MARKER} все {total} "
+                            f"дочерних sub-issues закрыты — требует ручного закрытия")
+                except RuntimeError as error:
+                    lines.append(f"⚠️ #{number}: маркер завершённого эпика не поставлен — {error}")
+            continue
         pull = merged.get(number)
         if pull is None:
             continue
+
+        disclaimer = partial_disclaimer(pull.get("body") or "")
+        if disclaimer is not None:
+            partial_marker = f"{ACCEPTANCE_PARTIAL_MARKER} PR #{pull['number']}"
+            try:
+                already_marked = bool(issue_marker_times(repo, number, partial_marker))
+            except RuntimeError as error:
+                lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+                continue
+            # Дедуп по факту завершения расчистки, не по одному лишь маркеру
+            # (находка AI-ревью PR #342, класс воспроизведён в этой же ветке
+            # предыдущей правкой): комментарий мог встать, а DELETE assignees/
+            # claim_task.release ниже — упасть отдельным HTTP-сбоем. Пока
+            # исполнитель ещё висит на задаче, «маркер уже стоит» не значит
+            # «уже обработано» — уходим молча только когда пул реально принял
+            # задачу обратно.
+            if already_marked and not issue["assignees"]:
+                continue  # и маркер есть, и assignee уже снят прошлым пульсом
+            if not already_marked:
+                text = (f"{partial_marker} тело PR #{pull['number']} содержит дисклеймер "
+                        f"о неполноте («{disclaimer}») — критерий требует проверки человеком, "
+                        f"не закрываю. Задача возвращена в пул, докрытие — новый PR (#335).")
+                try:
+                    post_issue_comment(repo, number, text)
+                except RuntimeError as error:
+                    lines.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
+                    continue
+                lines.append(f"⚠️ #{number}: {text}")
+            if issue["assignees"]:
+                who = ", ".join(a["login"] for a in issue["assignees"])
+                try:
+                    gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+                except RuntimeError as error:
+                    lines.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
+                    continue
+            try:
+                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+            except RuntimeError as error:
+                # Та же гарантия, что и у fail/ok-веток ниже: сбой снятия замка
+                # не должен ронять обход остальных задач пула (найдено при
+                # разборе AI-ревью PR #342 — было «висит вечно», без освобождения
+                # ни assignee, ни замка не снимался).
+                lines.append(f"⚠️ замок task-{number} не снят: {error}")
+            continue
+
         fail_marker = f"{ACCEPTANCE_FAIL_MARKER} PR #{pull['number']}"
         try:
-            if issue_marker_times(repo, number, fail_marker):
-                continue  # эта пара (задача, PR) уже провалила приёмку — не спамим
+            already_failed = bool(issue_marker_times(repo, number, fail_marker))
         except RuntimeError as error:
             lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+            continue
+        if already_failed:
+            if not issue["assignees"]:
+                continue  # эта пара (задача, PR) уже провалила приёмку и уже в пуле
+            # Тот же класс, что и в ветке дисклеймера выше (находка AI-ревью
+            # PR #342): fail_marker стоит, но снятие assignee тогда не
+            # завершилось — не спамим комментарий провала повторно, но обязаны
+            # довести расчистку (assignee + замок) до конца.
+            who = ", ".join(a["login"] for a in issue["assignees"])
+            try:
+                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+            except RuntimeError as error:
+                lines.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
+                continue
+            try:
+                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+            except RuntimeError as error:
+                lines.append(f"⚠️ замок task-{number} не снят: {error}")
             continue
 
         category = None
