@@ -257,6 +257,25 @@ describe("automations: webhook", () => {
     expect(row?.last_run?.task_id).toBe(taskId);
   });
 
+  it("прогон автоматизации инвалидирует кеш счётчиков задач (#320): новый queued виден в /api/status сразу (находка ревью PR #241, дельта)", async () => {
+    const id = uniqueId("counts");
+    expect((await putAutomation(id, {
+      enabled: true,
+      trigger: { type: "webhook" },
+      task: { kind: "digest" },
+      report: { channels: [{ type: "slack", target: "#harness" }, { type: "telegram" }] },
+    })).status).toBe(201);
+
+    const before = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    const res = await signedWebhook(id, "sha256=" + (await hmacHex(WEBHOOK_SECRET, BODY)));
+    expect(res.status).toBe(202);
+    // dispatch-токен в тестовой среде не задан: задача остаётся queued —
+    // и она обязана быть видна счётчиками сразу, а не после чужой мутации,
+    // иначе кеш (#320) молча врёт дашборду (#111).
+    const after = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(after.tasks.queued ?? 0).toBe((before.tasks.queued ?? 0) + 1);
+  });
+
   it("не webhook-триггерная автоматизация — 409 automation_not_webhook: вход не сдвигает фазу расписания", async () => {
     const id = uniqueId("sched-hook");
     expect((await putAutomation(id, digestConfig())).status).toBe(201); // trigger: schedule

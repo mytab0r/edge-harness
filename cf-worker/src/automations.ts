@@ -37,6 +37,15 @@ export interface AutomationConfig {
 
 export const AUTOMATION_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,47}$";
 
+/** Именованный доступ эмиттеров к служебному kind журнала автоматизаций
+ *  (список — AUTOMATIONS.reservedJournalKinds в config.ts, единственное место
+ *  правды). Параметр типизирован самим списком: опечатка в kind или новый вид
+ *  события, не внесённый в список, — ошибка компиляции, а не тихое расхождение
+ *  «список валидации знает, эмиттер пишет другое» (находка AI-ревью #241). */
+export function automationServiceKind(name: (typeof AUTOMATIONS.reservedJournalKinds)[number]): string {
+  return name;
+}
+
 export type ConfigParseResult =
   | { ok: true; config: AutomationConfig }
   | { ok: false; error: string };

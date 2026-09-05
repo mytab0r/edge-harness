@@ -38,6 +38,9 @@ jobs:
       # воркспейса: для kind=hands DSH работает в этом же чекауте и иначе
       # прочитал бы токен из конфига git (тот же класс, что hands.yml/worker.yml
       # уже закрывают — находка AI-ревью PR #241, здесь открыта заново).
+      # Гвардия класса (оба workflow + env-снятие в run.sh):
+      # test_dsh_workspace_checkout_does_not_persist_token /
+      # test_automation_hands_branch_strips_repo_token_from_env.
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
