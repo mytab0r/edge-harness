@@ -108,6 +108,10 @@ export interface Status {
   /** Предвычислено сервером — фронту не нужно знать пороги (те же соображения,
    *  что у hands_alive). См. pulseHealthy. */
   pulse_healthy: boolean;
+  /** Предвычислено сервером (#303, находка ревью): фронт не должен знать
+   *  литерал-сентинел notConfiguredDetail — переименование в одном месте
+   *  (config.ts) не должно требовать второй правки в app.js. См. pulseNotConfigured. */
+  pulse_not_configured: boolean;
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -172,6 +176,15 @@ export async function attemptOrchestraDispatch(
  * (issue #269, находка ревью). `null`, если запрос не удался или run'ов ещё
  * не было вовсе — вызывающий код обязан считать это «рано/нечем судить», а не
  * «run не появился». fetchImpl инъецируется — тест не ходит в реальный GitHub.
+ *
+ * `event=workflow_dispatch` в запросе обязателен (#303, находка ревью): у
+ * orchestra.yml есть и другие триггеры — job `contract` на каждый
+ * pull_request (пуш, навешивание метки) и `schedule`. Без фильтра последний
+ * run почти всегда чужой (не наш dispatch), id почти всегда отличается от
+ * baseline — confirmPreviousRun() почти всегда врёт true именно тогда, когда
+ * дело плохо: 204 есть, а нашего run'а нет. Фильтр по событию делает
+ * baseline/latest сравнением id внутри ОДНОЙ и той же выборки run'ов
+ * workflow_dispatch, где различие действительно означает «появился новый».
  */
 export async function fetchLatestOrchestraRunId(
   token: string,
@@ -180,7 +193,7 @@ export async function fetchLatestOrchestraRunId(
 ): Promise<number | null> {
   try {
     const res = await fetchImpl(
-      `${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/runs?per_page=1`,
+      `${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/runs?event=workflow_dispatch&per_page=1`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -236,6 +249,20 @@ export function handsAreAlive(now: number, lastHeartbeatTs: number | null): bool
 }
 
 /**
+ * «Возможности нет» (секреты не заданы) — единственное место, что читает
+ * сентинел HEARTBEAT.notConfiguredDetail (#303, находка ревью): литерал жил
+ * ещё и во фронте (app.js: status.last_pulse.detail === "not_configured")
+ * второй копией строки в обход заявленного «одна константа вместо двух
+ * копий» из docstring notConfiguredDetail — переименование сентинела молча
+ * ломало бы обе ветки бейджа во фронте, а pulse_healthy оставался бы true.
+ * Фронт теперь получает готовый флаг (pulse_not_configured в Status) и
+ * вообще не знает про сам литерал сервера.
+ */
+export function pulseNotConfigured(lastPulse: PulseStatus | null): boolean {
+  return lastPulse !== null && lastPulse.detail === HEARTBEAT.notConfiguredDetail;
+}
+
+/**
  * Пульс оркестрации (#269) здоров, если:
  *  - тика ещё не было (холодный старт DO — не повод кричать до первой попытки);
  *  - секретов нет («возможности нет» — конфигурация, а не поломка, отличать от
@@ -249,7 +276,7 @@ export function handsAreAlive(now: number, lastHeartbeatTs: number | null): bool
  */
 export function pulseHealthy(now: number, lastPulse: PulseStatus | null): boolean {
   if (lastPulse === null) return true;
-  if (lastPulse.detail === HEARTBEAT.notConfiguredDetail) return true;
+  if (pulseNotConfigured(lastPulse)) return true;
   if (!lastPulse.dispatch_ok) return false;
   if (lastPulse.run_confirmed === false) return false;
   return now - lastPulse.ts < HEARTBEAT.selfOrchestrationMs * 2;
@@ -519,6 +546,7 @@ export class Harness extends DurableObject<Env> {
       },
       last_pulse: lastPulse,
       pulse_healthy: pulseHealthy(now, lastPulse),
+      pulse_not_configured: pulseNotConfigured(lastPulse),
     };
   }
 

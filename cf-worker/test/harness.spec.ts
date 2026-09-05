@@ -376,9 +376,14 @@ describe("пульс оркестрации: alarm() всегда перезак
     const status = await getJson<{
       last_pulse: { dispatch_ok: boolean; detail: string | null } | null;
       pulse_healthy: boolean;
+      pulse_not_configured: boolean;
     }>("/api/status");
     expect(status.last_pulse).toMatchObject({ dispatch_ok: false, detail: "not_configured" });
     expect(status.pulse_healthy).toBe(true);
+    // #303, находка ревью: фронт больше не сравнивает literal "not_configured"
+    // сам — сервер отдаёт готовый флаг, чтобы переименование сентинела в
+    // config.ts не могло молча сломать бейдж app.js.
+    expect(status.pulse_not_configured).toBe(true);
   });
 });
 

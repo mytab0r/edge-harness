@@ -787,7 +787,11 @@ def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
 
 
 def last_review_ok_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    timeline = gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")
+    """Момент последней простановки review:ok — весь таймлайн (не только
+    первая страница, review_labels.list_timeline, #303: класс потери хвоста
+    на длинном таймлайне, тот же что list_pr_files/#294), None — метки не
+    было вовсе."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
         if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == review_labels.REVIEW_OK
@@ -915,11 +919,12 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
 
 def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
     """Момент, когда PR стал полностью готов к слиянию: позже из двух событий
-    'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна,
-    что last_review_ok_labeled_at. None — событие по какой-то из меток не найдено
-    в последних 100 записях таймлайна (например, PR открыт раньше окна) —
-    тогда возраст не считаем, не гадаем по неполным данным."""
-    timeline = gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")
+    'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна
+    (весь таймлайн постранично, review_labels.list_timeline), что
+    last_review_ok_labeled_at. None — событие по какой-то из меток не найдено
+    нигде в таймлайне (например, метка не проставлялась вовсе) — тогда
+    возраст не считаем, не гадаем по неполным данным."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
     def labeled_at(label_name: str) -> list[str]:
         return [
             event["created_at"] for event in timeline

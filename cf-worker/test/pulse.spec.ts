@@ -6,6 +6,7 @@ import {
   fetchLatestOrchestraRunId,
   pulseDetailForRecord,
   pulseHealthy,
+  pulseNotConfigured,
 } from "../src/harness";
 import { HEARTBEAT } from "../src/config";
 
@@ -103,6 +104,24 @@ describe("пульс оркестрации: fetchLatestOrchestraRunId (issue #2
     }) as typeof fetch;
     expect(await fetchLatestOrchestraRunId("token", "owner/repo", throwingFetch)).toBeNull();
   });
+
+  // НАХОДКА РЕВЬЮ (#303): orchestra.yml запускается не только нашим
+  // workflow_dispatch — job `contract` триггерится на каждый pull_request
+  // (пуш, навешивание метки), плюс `schedule`. Без ?event=workflow_dispatch
+  // запрос видит ЛЮБОЙ последний run, id почти всегда отличается от
+  // baseline — confirmPreviousRun() почти всегда докладывает "запуск
+  // подтверждён" именно тогда, когда наш dispatch не выстрелил. Докажи
+  // мутацией: убери `&event=workflow_dispatch` из URL в
+  // fetchLatestOrchestraRunId — этот тест покраснеет.
+  it("запрос фильтрует run'ы по событию workflow_dispatch — не любой последний run", async () => {
+    let requestedUrl: string | null = null;
+    const fakeFetch = (async (url: string) => {
+      requestedUrl = url;
+      return new Response(JSON.stringify({ workflow_runs: [{ id: 1 }] }), { status: 200 });
+    }) as typeof fetch;
+    await fetchLatestOrchestraRunId("token", "owner/repo", fakeFetch);
+    expect(requestedUrl).toContain("event=workflow_dispatch");
+  });
 });
 
 describe("пульс оркестрации: confirmPreviousRun — реальный запуск, не только приём (issue #269)", () => {
@@ -120,6 +139,30 @@ describe("пульс оркестрации: confirmPreviousRun — реальн
 
   it("latest неизвестен (fetch не удался) — null, рано судить", () => {
     expect(confirmPreviousRun(100, null)).toBeNull();
+  });
+});
+
+// #303, находка ревью: HEARTBEAT.notConfiguredDetail — единственное место
+// правды в TypeScript, но литерал "not_configured" был продублирован во
+// фронте (app.js сравнивал status.last_pulse.detail === "not_configured"
+// сам) — переименование значения сломало бы обе ветки бейджа во фронте
+// молча. pulseNotConfigured — то, что теперь пишется в Status.pulse_not_configured
+// и заменяет литерал во фронте на предвычисленный флаг.
+describe("пульс оркестрации: pulseNotConfigured (issue #303)", () => {
+  it("холодный старт (null) — не 'возможности нет', это ещё рано", () => {
+    expect(pulseNotConfigured(null)).toBe(false);
+  });
+
+  it("detail совпадает с сентинелом — возможности нет", () => {
+    expect(
+      pulseNotConfigured({ ts: NOW, dispatch_ok: false, detail: "not_configured", run_confirmed: null }),
+    ).toBe(true);
+  });
+
+  it("detail другой (реальная поломка) — не 'возможности нет'", () => {
+    expect(
+      pulseNotConfigured({ ts: NOW, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null }),
+    ).toBe(false);
   });
 });
 
@@ -192,8 +235,12 @@ describe("пульс оркестрации: pulseDetailForRecord — detail н�
 // app.js:179 (renderStatus). Без DOM/fs в тестовом workerd-раннере (нет
 // document, node:fs читает только виртуальную ФС песочницы — проверено пробой)
 // прогнать реальный app.js нельзя; вместо пересказа шаблон скопирован дословно
-// из public/assets/i18n/ru.js — паритет ключей и текста охраняет отдельно
-// scripts/check-frontend-contract.mjs (npm run check).
+// из public/assets/i18n/ru.js — но копия сама по себе пересказ, а не гарантия:
+// правку прод-текста в ru.js этот файл не заметит. Побайтовый паритет самой
+// строки PULSE_UNHEALTHY_TEMPLATE ниже с i18n/ru.js["pulse.unhealthy"]
+// охраняет отдельно scripts/check-frontend-contract.mjs (npm run check,
+// #303, находка ревью) — красный check, если кто-то поправит один файл и
+// забудет другой.
 const PULSE_UNHEALTHY_TEMPLATE = "⚠️ пульс оркестрации не бьётся: {detail} ({minutes} мин назад)";
 function renderPulseUnhealthy(params: Record<string, unknown>): string {
   return PULSE_UNHEALTHY_TEMPLATE.replace(/\{(\w+)\}/g, (_, k) => (k in params ? String(params[k]) : `{${k}}`));

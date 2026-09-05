@@ -170,7 +170,10 @@ function renderStatus(status) {
   // то же самое, что «пульс работает»: бейдж не должен молчать так же, как при
   // реальном здоровье — иначе «возможности нет» и «возможность есть, но не
   // проверялась» неотличимы (находка ревью, тот же класс, что #hands/#watchdog).
-  if (status.last_pulse && status.last_pulse.detail === "not_configured") {
+  // pulse_not_configured — предвычислено сервером (#303, находка ревью):
+  // фронт не сравнивает last_pulse.detail с сентинел-литералом сам, поэтому
+  // переименование сентинела в config.ts не может молча сломать эту ветку.
+  if (status.pulse_not_configured) {
     $("pulse").textContent = t("pulse.not_configured");
     $("pulse").className = "badge warn";
     $("pulse").hidden = false;

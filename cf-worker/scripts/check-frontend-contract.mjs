@@ -9,6 +9,10 @@
 //   3. Каждый route("ключ") в app.js существует в таблице.
 //   4. Каждый ключ локализации t("…") и data-i18n из разметки есть в словарях i18n/*.
 //   5. docs/api.md сгенерирован из текущей спеки (не устарел).
+//   6. Шаблон "pulse.unhealthy", скопированный в test/pulse.spec.ts (workerd-раннер
+//      без document/node:fs не может прогнать реальный app.js), побайтово совпадает
+//      с прод-текстом в i18n/ru.js — иначе тест сторожит пересказ, а не прод-текст
+//      (#303, находка ревью: правка ru.js осталась бы незамеченной зелёным тестом).
 
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -80,5 +84,21 @@ for (const file of readdirSync(i18nDir).filter((name) => name.endsWith(".js"))) 
 execSync("node scripts/generate-api-docs.mjs", { cwd: root, stdio: "pipe" });
 const generatedDiff = execSync("git diff --stat -- docs/api.md src/api-spec.ts", { cwd: root }).toString().trim();
 if (generatedDiff) fail("docs/api.md или src/api-spec.ts устарел — запусти npm run docs и закоммить");
+
+// 6. Шаблон pulse.unhealthy, скопированный в test/pulse.spec.ts, совпадает с прод-текстом
+const pulseSpec = readFileSync(join(root, "test/pulse.spec.ts"), "utf8");
+const templateMatch = pulseSpec.match(/PULSE_UNHEALTHY_TEMPLATE\s*=\s*"((?:[^"\\]|\\.)*)"/);
+if (!templateMatch) fail("в test/pulse.spec.ts не найдена константа PULSE_UNHEALTHY_TEMPLATE");
+const testTemplate = templateMatch[1];
+const ruDict = readFileSync(join(i18nDir, "ru.js"), "utf8");
+const prodMatch = ruDict.match(/"pulse\.unhealthy":\s*"((?:[^"\\]|\\.)*)"/);
+if (!prodMatch) fail('в i18n/ru.js не найден ключ "pulse.unhealthy"');
+const prodTemplate = prodMatch[1];
+if (testTemplate !== prodTemplate) {
+  fail(
+    `test/pulse.spec.ts::PULSE_UNHEALTHY_TEMPLATE разошёлся с i18n/ru.js["pulse.unhealthy"] — ` +
+      `тест сторожит пересказ, а не прод-текст (test: "${testTemplate}", прод: "${prodTemplate}")`,
+  );
+}
 
 console.log(`check-frontend-contract: OK (${Object.keys(specTable).length} маршрутов, ${usedKeys.length} ключей локализации)`);

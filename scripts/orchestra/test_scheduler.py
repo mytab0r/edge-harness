@@ -1151,6 +1151,42 @@ def test_after_merge_reads_files_through_paginated_helper():
     assert 'gh(f"repos/{repo}/pulls/{number}/files?per_page=100")' not in source
 
 
+# ── Пагинация таймлайна: тот же класс, тесно в один хелпер (#303, находка
+# ревью) — last_review_ok_labeled_at и last_ready_labeled_at читали сырую
+# первую страницу timeline?per_page=100 без обхода, событие 'labeled' за
+# первой сотней молча терялось на длинном таймлайне ────────────────────────
+
+
+def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
+    # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
+    # выше): обе функции обязаны ходить через review_labels.list_timeline
+    # (полный обход постранично), а не читать сырую первую страницу —
+    # поведенческая проверка самой пагинации живёт в
+    # scripts/lib/test_review_labels.py::test_list_timeline_paginates_finds_event_beyond_first_page
+    # (мутация доказана там: обход убран — тест краснеет).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
+    assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
+
+
+def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):
+    # Поведенческое доказательство на уровне вызывающей функции: labeled-события
+    # обеих меток-гейтов лежат за первой страницей (100 посторонних событий
+    # перед ними) — без полного обхода last_ready_labeled_at вернул бы None.
+    page1 = [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"} for _ in range(100)]
+    page2 = [
+        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-01T00:00:00Z"},
+        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-01T01:00:00Z"},
+    ]
+    fake = FakeGh({
+        "timeline?per_page=100&page=1": page1,
+        "timeline?per_page=100&page=2": page2,
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_ready_labeled_at(REPO, 999)
+    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух — labeled ai:ok, найдено на второй странице
+
+
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 
