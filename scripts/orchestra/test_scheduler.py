@@ -2444,6 +2444,29 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
     assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100&page=1"]
 
 
+def test_accept_merged_tasks_fail_retries_cleanup_when_assignee_stuck(monkeypatch):
+    """Тот же класс, что и у ветки дисклеймера (находка AI-ревью PR #342,
+    класс воспроизведён): fail_marker уже стоит, но assignee всё ещё висит —
+    прошлый DELETE assignees упал отдельным сбоем. Дедуп по одному лишь
+    маркеру ушёл бы молча навсегда с занятым замком; пульс обязан довести
+    расчистку, не переспрашивая комментарий провала."""
+    fail_marker = f"{sch.ACCEPTANCE_FAIL_MARKER} PR #138"
+    fake = FakeGh({
+        "issues/18/comments": [{"created_at": "2026-09-02T22:00:00Z", "body": f"♻️ {fail_marker} — было плохо"}],
+        "issues/18/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("маркер уже стоит — комментарий не повторяем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    pool = [issue(18, assignees=("mytab0r",))]  # снятие assignee в прошлый раз не завершилось
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+
+    assert hard_failure is False
+    assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/18/assignees") for c in fake.calls)
+    assert any("замок task-18 снят" in line for line in lines)
+
+
 def test_accept_merged_tasks_ok_close_failure_does_not_stop_the_rest(monkeypatch):
     """Находка AI-ревью PR #253: докстринг accept_merged_tasks обещает «не
     прерывает обход остальных», но post_issue_comment/PATCH в ветке ok/docs
@@ -2696,8 +2719,10 @@ def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeyp
 
 
 def test_accept_merged_tasks_partial_disclaimer_is_idempotent(monkeypatch):
-    """Маркер уже стоит на этой паре (задача, PR) — второй пульс не должен
-    писать комментарий повторно (тот же приём, что и у fail_marker/pending)."""
+    """Маркер уже стоит на этой паре (задача, PR), assignee уже снят прошлым
+    пульсом (расчистка завершена) — второй пульс не должен писать комментарий
+    повторно и не должен трогать assignee/замок вовсе (тот же приём, что и у
+    fail_marker/pending)."""
     pr = merged_pull(900, PR_303_BODY, "sha900", "2026-09-04T10:00:00Z")
     fake = FakeGh({
         "issues/297/comments": [{"body": f"{sch.ACCEPTANCE_PARTIAL_MARKER} PR #900 …",
@@ -2706,11 +2731,37 @@ def test_accept_merged_tasks_partial_disclaimer_is_idempotent(monkeypatch):
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
 
-    pool = [issue(297, assignees=("mytab0r",))]
+    pool = [issue(297, assignees=())]
     lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
 
     assert hard_failure is False
     assert lines == []
+    assert fake.calls == [f"repos/{REPO}/issues/297/comments?per_page=100&page=1"]
+
+
+def test_accept_merged_tasks_partial_disclaimer_retries_cleanup_when_assignee_stuck(monkeypatch):
+    """Класс, воспроизведённый в предыдущей правке этой же ветки (находка
+    AI-ревью PR #342): маркер «требует проверки человеком» уже стоит, но
+    DELETE assignees в прошлом пульсе упал отдельным HTTP-сбоем — assignee
+    всё ещё висит на задаче. Дедуп по одному лишь факту маркера ушёл бы молча
+    навсегда, оставив исполнителя и замок claim_task. Пульс обязан ДОВЕСТИ
+    расчистку, не переспрашивая комментарий."""
+    pr = merged_pull(900, PR_303_BODY, "sha900", "2026-09-04T10:00:00Z")
+    fake = FakeGh({
+        "issues/297/comments": [{"body": f"{sch.ACCEPTANCE_PARTIAL_MARKER} PR #900 …",
+                                  "created_at": "2026-09-04T11:00:00Z"}],
+        "issues/297/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("маркер уже стоит — комментарий не повторяем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    pool = [issue(297, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+
+    assert hard_failure is False
+    assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/297/assignees") for c in fake.calls)
+    assert any("замок task-297 снят" in line for line in lines)
 
 
 # ── эпик (#335) — родительскую задачу приёмка не закрывает автоматом ────────
@@ -2750,6 +2801,49 @@ def test_accept_merged_tasks_never_closes_epic(monkeypatch):
     assert hard_failure is False
     assert lines == []
     assert fake.calls == []
+
+
+def test_accept_merged_tasks_marks_epic_completed_when_all_sub_issues_closed(monkeypatch):
+    """Находка AI-ревью PR #342: «эпики приёмка не трогает никогда» — тормоз
+    без газа, если `sub_issues_summary.total == completed` (все дочерние
+    задачи закрыты) и никто никогда не узнает, что эпик готов к ручному
+    закрытию. Автозакрытие остаётся запрещённым (issue не закрывается,
+    только комментарий-маркер)."""
+    pr = merged_pull(400, "#77\n\nПлагин из эпика.", "sha400", "2026-09-04T10:00:00Z")
+    fake = FakeGh({"issues/77/comments": []})
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
+                  sub_issues_summary={"total": 8, "completed": 8})]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr})
+
+    assert hard_failure is False
+    assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+    assert posted and posted[0][0] == 77
+    assert sch.ACCEPTANCE_EPIC_MARKER in posted[0][1]
+    assert "ручного закрытия" in posted[0][1]
+    assert any(sch.ACCEPTANCE_EPIC_MARKER in line for line in lines)
+
+
+def test_accept_merged_tasks_epic_completed_marker_is_idempotent(monkeypatch):
+    """Маркер завершённого эпика уже стоит — второй пульс не должен писать
+    комментарий повторно (тот же приём дедупа, что и у остальных маркеров)."""
+    pr = merged_pull(400, "#77\n\nПлагин из эпика.", "sha400", "2026-09-04T10:00:00Z")
+    fake = FakeGh({
+        "issues/77/comments": [{"body": f"{sch.ACCEPTANCE_EPIC_MARKER} …",
+                                 "created_at": "2026-09-04T11:00:00Z"}],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
+
+    pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
+                  sub_issues_summary={"total": 8, "completed": 8})]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr})
+
+    assert hard_failure is False
+    assert lines == []
 
 
 # ── reap_stale (#227): слитая-но-непринятая задача — не «PR не появился» ────────
