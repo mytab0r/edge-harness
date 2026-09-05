@@ -2701,7 +2701,12 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     Находка AI-ревью PR #342: раньше ветка дисклеймера оставляла только
     комментарий и задача зависала — assignee не снят, замок не освобождён,
     задача недостижима ни воркером, ни повторной приёмкой. Теперь ветка
-    зеркалит `fail`: снимает assignee и вызывает `claim_task.release`."""
+    зеркалит `fail`: снимает assignee и вызывает `claim_task.release`.
+
+    Живой случай #335/#382 (владелец: «схуяли это вообще написали»):
+    сообщение обязано уйти каналом escalate() (issue + Telegram, не только
+    обычным комментарием), назвать прямые ссылки на задачу и PR, процитировать
+    дисклеймер и предложить готовые варианты."""
     pr = merged_pull(900, body, "sha900", "2026-09-04T10:00:00Z")
     fake = FakeGh({
         f"issues/{number}/comments": [],
@@ -2709,19 +2714,61 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    posted = []
-    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, n, text: escalated.append((n, text)) or "ок")
+    patch_post_issue_comment(
+        monkeypatch,
+        lambda *a: pytest.fail("должен эскалировать через escalate(), не писать обычным комментарием"))
 
     pool = [issue(number, assignees=("mytab0r",))]
     lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(f"#{number}" in line and "закрыта приёмкой" in line for line in lines)
-    assert posted and posted[0][0] == number
-    assert "требует проверки человеком" in posted[0][1]
-    assert "возвращена в пул" in posted[0][1]
+    assert escalated and escalated[0][0] == number
+    text = escalated[0][1]
+    assert f"https://github.com/{REPO}/issues/{number}" in text
+    assert "https://github.com/{}/pull/900".format(REPO) in text
+    assert "Нужно ваше решение" in text
+    assert "Почему не решает автоматика" in text
+    assert "Close issue" in text
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/{number}/assignees") for c in fake.calls)
     assert any(f"замок task-{number} снят" in line for line in lines)
+
+
+def test_accept_merged_tasks_partial_disclaimer_skips_escalation_when_followup_already_open(monkeypatch):
+    """Пункт 3 живого случая #335/#382 («можно ли решить машинно?»): если
+    задачу СЕЙЧАС ЖЕ объявляет ещё один открытый PR — докрытие уже в работе,
+    решение владельца не нужно вовсе. Тот же способ узнать «какая задача у
+    PR», что и в ветке ok/docs (#358, task_ref.resolve_pr_task). Assignee и
+    замок не трогаем — задачу всё ещё держит исполнитель второго PR."""
+    pr = merged_pull(900, PR_303_BODY, "sha900", "2026-09-04T10:00:00Z")
+    fake = FakeGh({"issues/297/comments": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("докрытие уже открыто — эскалация не нужна"))
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(297, assignees=("mytab0r",))]
+    followup_pr = {"number": 950, "body": "#297\n\nДокрытие остатка."}
+    lines, hard_failure = sch.accept_merged_tasks(
+        REPO, pool, {297: pr}, open_pulls_list=[followup_pr])
+
+    assert hard_failure is False
+    assert not any(c.startswith(f"-X DELETE repos/{REPO}/issues/297/assignees") for c in fake.calls)
+    assert posted and posted[0][0] == 297
+    assert "#950" in posted[0][1]
+    assert "решение владельца не нужно" in posted[0][1]
+    assert any("эскалация владельцу не нужна" in line for line in lines)
+
+
+def test_disclaimer_quote_returns_real_sentence_not_bare_marker():
+    """Находка живого случая #335/#382: комментарий раньше показывал только
+    слово-маркер («не реализован»), а не предложение, из которого владельцу
+    приходилось самому реконструировать контекст. Цитата — реальная строка
+    тела PR #303."""
+    quote = sch.disclaimer_quote(PR_303_BODY, "не реализован")
+    assert quote == "этим PR НЕ реализован: job `orchestra` на `pull_request: labeled`"
 
 
 def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeypatch):
@@ -2839,12 +2886,16 @@ def test_accept_merged_tasks_marks_epic_completed_when_all_sub_issues_closed(mon
     без газа, если `sub_issues_summary.total == completed` (все дочерние
     задачи закрыты) и никто никогда не узнает, что эпик готов к ручному
     закрытию. Автозакрытие остаётся запрещённым (issue не закрывается,
-    только комментарий-маркер)."""
+    только комментарий-маркер). Тот же класс, что #335/#382: сигнал обязан
+    уйти каналом escalate() (issue + Telegram), не только тихим комментарием
+    в задаче, и назвать прямую ссылку."""
     pr = merged_pull(400, "#77\n\nПлагин из эпика.", "sha400", "2026-09-04T10:00:00Z")
     fake = FakeGh({"issues/77/comments": []})
     patch_gh(monkeypatch, fake)
-    posted = []
-    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, n, text: escalated.append((n, text)) or "ок")
+    patch_post_issue_comment(
+        monkeypatch, lambda *a: pytest.fail("должен эскалировать через escalate(), не обычным комментарием"))
 
     pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
                   sub_issues_summary={"total": 8, "completed": 8})]
@@ -2852,9 +2903,10 @@ def test_accept_merged_tasks_marks_epic_completed_when_all_sub_issues_closed(mon
 
     assert hard_failure is False
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
-    assert posted and posted[0][0] == 77
-    assert sch.ACCEPTANCE_EPIC_MARKER in posted[0][1]
-    assert "ручного закрытия" in posted[0][1]
+    assert escalated and escalated[0][0] == 77
+    assert sch.ACCEPTANCE_EPIC_MARKER in escalated[0][1]
+    assert "закрыть" in escalated[0][1].lower()
+    assert f"https://github.com/{REPO}/issues/77" in escalated[0][1]
     assert any(sch.ACCEPTANCE_EPIC_MARKER in line for line in lines)
 
 

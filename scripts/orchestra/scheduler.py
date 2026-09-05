@@ -1333,6 +1333,21 @@ def partial_disclaimer(body: str) -> str | None:
     return None
 
 
+def disclaimer_quote(body: str, marker: str) -> str:
+    """Строка тела PR, где нашёлся marker (см. partial_disclaimer) — цитата,
+    а не пересказ (находка живого случая #335/#382: комментарий приёмки
+    показывал владельцу только само слово маркера («не реализован»), не
+    предложение целиком, — решение приходилось принимать вслепую или идти
+    читать PR за контекстом). Тот же приём ё→е и сравнение без учёта
+    регистра, что и у partial_disclaimer, но строка возвращается из
+    оригинального (не lower()) текста, чтобы цитата была читаемой."""
+    needle = marker.replace("ё", "е")
+    for line in (body or "").splitlines():
+        if needle in line.lower().replace("ё", "е"):
+            return line.strip()
+    return marker  # маркер найден, но splitlines() почему-то не подтвердил — не молчим совсем
+
+
 # Заголовок эпика в этом репозитории начинается с «ЭПИК» (проверено фактом
 # по живым issues: #116, #77, #17 «ЭПИК. Фаза 2…», #115 — все четыре начинаются
 # так, вариации «ЭПИК:»/«ЭПИК.» покрыты одним префиксом без двоеточия).
@@ -1565,14 +1580,17 @@ def accept_merged_tasks(
             if total > 0 and total == completed:
                 try:
                     if not issue_marker_times(repo, number, ACCEPTANCE_EPIC_MARKER):
-                        post_issue_comment(
+                        issue_url = f"https://github.com/{repo}/issues/{number}"
+                        escalation = escalate(
                             repo, number,
-                            f"{ACCEPTANCE_EPIC_MARKER} все {total} дочерних sub-issues "
-                            f"закрыты — эпик выглядит завершённым и требует ручного "
-                            f"закрытия (приёмка эпики автоматом не закрывает).")
+                            f"Все {total} дочерних sub-issues эпика {issue_url} закрыты — "
+                            f"эпик выглядит завершённым. Приёмка эпики автоматом не "
+                            f"закрывает: закрыть {issue_url} вручную (кнопка Close issue), "
+                            f"если это так. {ACCEPTANCE_EPIC_MARKER}")
                         lines.append(
                             f"📋 #{number}: {ACCEPTANCE_EPIC_MARKER} все {total} "
-                            f"дочерних sub-issues закрыты — требует ручного закрытия")
+                            f"дочерних sub-issues закрыты — требует ручного закрытия "
+                            f"({escalation})")
                 except RuntimeError as error:
                     lines.append(f"⚠️ #{number}: маркер завершённого эпика не поставлен — {error}")
             continue
@@ -1597,16 +1615,68 @@ def accept_merged_tasks(
             # задачу обратно.
             if already_marked and not issue["assignees"]:
                 continue  # и маркер есть, и assignee уже снят прошлым пульсом
+
+            issue_url = f"https://github.com/{repo}/issues/{number}"
+            pr_url = f"https://github.com/{repo}/pull/{pull['number']}"
+            quote = disclaimer_quote(pull.get("body") or "", disclaimer)
+
+            # Живой случай #335/#382: если задачу СЕЙЧАС ЖЕ объявляет ещё один
+            # открытый PR, докрытие уже в работе — решение владельца не нужно
+            # вовсе, это и есть лучший исход (машина решила сама). Тот же
+            # способ узнать «какая задача у PR», что и в ветке ok/docs выше
+            # (#358, task_ref.resolve_pr_task — одно место правды). Задачу не
+            # трогаем: её всё ещё держит исполнитель второго PR.
+            other_open = [
+                p for p in (open_pulls_list or [])
+                if p.get("number") != pull["number"]
+                and task_ref.resolve_pr_task(p) == number
+            ]
+            if other_open:
+                if not already_marked:
+                    followup = ", ".join(f"#{p['number']}" for p in other_open)
+                    text = (f"{partial_marker} PR {pr_url} пишет прозой, что часть задачи "
+                            f"{issue_url} не сделана («{quote}»), но довершение уже открыто "
+                            f"в PR {followup} — решение владельца не нужно, жду слияния, "
+                            f"задачу не закрываю.")
+                    try:
+                        post_issue_comment(repo, number, text)
+                    except RuntimeError as error:
+                        lines.append(f"⚠️ #{number}: отметка не завершена — {error}")
+                        continue
+                    lines.append(f"⏳ #{number}: докрытие уже открыто в PR {followup} — "
+                                 f"эскалация владельцу не нужна")
+                continue
+
             if not already_marked:
-                text = (f"{partial_marker} тело PR #{pull['number']} содержит дисклеймер "
-                        f"о неполноте («{disclaimer}») — критерий требует проверки человеком, "
-                        f"не закрываю. Задача возвращена в пул, докрытие — новый PR (#335).")
+                # Сообщение отвечает на четыре вопроса, которые владелец
+                # задал живьём на #382 («схуяли это вообще написали»): зачем
+                # нужен человек, что именно проверить (цитата, не пересказ),
+                # почему не решила автоматика, что нажать. Уходит тем же
+                # каналом escalate() (issue + Telegram), что и остальные
+                # эскалации приёмки — второй канал не заводим.
+                text = (
+                    f"Нужно ваше решение по задаче {issue_url}.\n\n"
+                    f"PR {pr_url} объявил, что относится к ней, но сам пишет прозой, что "
+                    f"часть работы не сделана:\n«{quote}»\n\n"
+                    f"Почему не решает автоматика: правило ищет слово-маркер («{disclaimer}») "
+                    f"в тексте PR, а не структурированный критерий приёмки — не отличает "
+                    f"«ещё не готово» от «сознательно вне рамок этого PR» (точный критерий по "
+                    f"схеме — задача #355, ещё не сделана).\n\n"
+                    f"Варианты, любой — с телефона:\n"
+                    f"1. Задача сделана целиком → закрыть {issue_url} (кнопка Close issue).\n"
+                    f"2. Нужна доработка → ничего не делать: задача уже в пуле, исполнитель "
+                    f"снят, следующий агент возьмёт её заново.\n"
+                    f"3. Нужен отдельный узкий довесок → новая задача с меткой task, ссылка "
+                    f"на {issue_url} и на {pr_url}.\n\n"
+                    f"{partial_marker}"
+                )
                 try:
-                    post_issue_comment(repo, number, text)
+                    escalation = escalate(repo, number, text)
                 except RuntimeError as error:
                     lines.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
                     continue
-                lines.append(f"⚠️ #{number}: {text}")
+                lines.append(f"⚠️ #{number}: PR #{pull['number']} — нужно решение владельца "
+                             f"(«{disclaimer}»), {escalation}")
             if issue["assignees"]:
                 who = ", ".join(a["login"] for a in issue["assignees"])
                 try:
