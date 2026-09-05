@@ -96,10 +96,16 @@ jobs:
           # существующей записи — весь апсерт-путь остаётся мёртвым кодом
           # (находка AI-ревью PR #273, воспроизведена на каноническом
           # прогоне: смоук строил состав из пяти плагинов вместо четырёх).
+          # Пакет уже известен манифесту под другим id — берём id манифеста, а
+          # не красим прогон: явный ввод остаётся способом завести НОВЫЙ id,
+          # а бамп существующего пакета без --plugin_id обязан находить
+          # свою историческую запись сам (находка AI-ревью PR #273: критерий
+          # готовности #268 требует зелёного прогона без явного plugin_id
+          # именно на историческом пакете hello-world/id=hello).
           MANIFEST_ID=$(jq -r --arg pkg "$PLUGIN_NAME" '.plugins[] | select(.package == $pkg) | .id' dsh-edge/plugins.json)
           if [ -n "$MANIFEST_ID" ] && [ "$MANIFEST_ID" != "$PLUGIN_ID" ]; then
-            echo "::error::Пакет $PLUGIN_NAME уже в манифесте под id '$MANIFEST_ID', а вычислен id '$PLUGIN_ID' — запустите форж с plugin_id=$MANIFEST_ID"
-            exit 1
+            echo "Пакет $PLUGIN_NAME уже в манифесте под id '$MANIFEST_ID' (вычислен был '$PLUGIN_ID') — беру id манифеста"
+            PLUGIN_ID="$MANIFEST_ID"
           fi
 
           # Зеркальный случай: явный (или вычисленный) plugin_id уже занят в
@@ -309,19 +315,25 @@ jobs:
           pnpm --dir apps/dsh-edge/standalone run build
 
           # Гвардия gzip-бюджета direct-воркера (design.md «Workers-совместимость»,
-          # «Размер»): бюджет 900 KiB (921600 байт) общий, PoC-замер с одним
-          # плагином — 775046/921600 (tasks.md §1, запас ~143 KiB). Design
-          # называет точный замер — вклад ИМЕННО tarball'а по bundle-meta.json
-          # пробной сборки — но bundle-meta.json в этой схеме сборки эфемерен
-          # (design «Девиации» п.2) и такой замер требует отдельной пробной
-          # сборки без плагина; здесь — ДЕШЁВЫЙ прокси на уже собранном
-          # артефакте: gzip всего direct-воркера (с новым плагином внутри,
-          # т.к. кодогенерация выше уже включила его через FORGE_EXTRA_PLUGIN)
-          # против общего бюджета. Не точный вклад одного плагина, а верхняя
-          # граница на весь бандл — без гейта плагины ехали бы без проверки
-          # размера вовсе, а не с приблизительной (находка AI-ревью PR #273).
-          # Точный замер вклада — отдельная работа (design.md, tasks.md §3).
-          BUNDLE_BUDGET_BYTES=921600
+          # «Размер») — ДЕШЁВЫЙ прокси на уже собранном артефакте: gzip всего
+          # direct-воркера (с новым плагином внутри, т.к. кодогенерация выше
+          # уже включила его через FORGE_EXTRA_PLUGIN) против общего бюджета.
+          # Не точный вклад одного плагина, а верхняя граница на весь бандл —
+          # без гейта плагины ехали бы без проверки размера вовсе, а не с
+          # приблизительной (находка AI-ревью PR #273). Точный замер вклада —
+          # отдельная работа (design.md, tasks.md §3).
+          #
+          # Порог — НЕ своя константа: `bundle-standalone.mjs` (только что
+          # отработавший в `pnpm run build` выше) уже гвардирует тот же
+          # DIRECT_GZIP_BUDGET_BYTES сам (design.md «Факты-основания» п.1) —
+          # вторая копия числа здесь разошлась бы молча, если апстрим подвинет
+          # бюджет (находка AI-ревью PR #273). Читаем константу из уже
+          # склонированного и запатченного файла на диске, а не дублируем.
+          BUNDLE_BUDGET_SRC="apps/dsh-edge/standalone/scripts/bundle-standalone.mjs"
+          [ -f "$BUNDLE_BUDGET_SRC" ] || { echo "::error::$BUNDLE_BUDGET_SRC не найден — гвардия бюджета не может прочитать порог"; exit 1; }
+          BUNDLE_BUDGET_EXPR=$(grep -oP 'DIRECT_GZIP_BUDGET_BYTES\s*=\s*\K[0-9 *_]+(?=;)' "$BUNDLE_BUDGET_SRC" | head -1)
+          [ -n "$BUNDLE_BUDGET_EXPR" ] || { echo "::error::не удалось прочитать DIRECT_GZIP_BUDGET_BYTES из $BUNDLE_BUDGET_SRC — апстрим переименовал/убрал константу, гвардия слепа"; exit 1; }
+          BUNDLE_BUDGET_BYTES=$(( BUNDLE_BUDGET_EXPR ))
           DIRECT_WORKER="apps/dsh-edge/standalone/worker/direct/index.js"
           [ -f "$DIRECT_WORKER" ] || { echo "::error::direct-воркер не собран: $DIRECT_WORKER"; exit 1; }
           BUNDLE_GZIP_BYTES=$(gzip -c "$DIRECT_WORKER" | wc -c)
@@ -607,8 +619,7 @@ jobs:
           STATE: failed
           SOURCE: forge
           DETAIL: "форж упал: см. лог job ${{ github.run_id }}"
-          FINAL: "1"
         run: |
           PLUGIN_ID="${PLUGIN_ID_INPUT:-$(basename "$PLUGIN_PATH")}"
           PLUGIN_ID="${PLUGIN_ID:-unknown}"
-          PLUGIN_ID="$PLUGIN_ID" STATE=failed SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh || true
+          PLUGIN_ID="$PLUGIN_ID" STATE=failed SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh || true
