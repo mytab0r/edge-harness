@@ -289,6 +289,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: write
     steps:
       # Доверенный инструментарий — из main; ревьюимое дерево тут не нужно:
       # verdict парсит ответ и ходит в API, текущий head он сверяет сам.
@@ -316,3 +317,15 @@ jobs:
           python scripts/review/ai_review.py verdict \
             --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED" \
             --dsh-rc "$DSH_RC"
+
+      # Разбудить оркестратор (#297) сразу после вердикта, а не ждать
+      # расписания: тот же приём, что в pr-review.yml (workflow_dispatch —
+      # документированное исключение из антирекурсии GITHUB_TOKEN, см.
+      # комментарий там). Второй гейт (ai:ok/changes-requested/failed)
+      # решает готовность PR не меньше первого — если этот вердикт делает
+      # PR полностью готовым (review:ok уже стоит), слияние не должно ждать
+      # следующего тика расписания.
+      - name: "Разбудить оркестратор (#297): вердикт AI готов, не ждать расписания"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run orchestra.yml --ref main

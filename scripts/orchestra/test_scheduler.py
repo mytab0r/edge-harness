@@ -223,7 +223,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], True))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], True))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
@@ -246,7 +246,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: (["✅ PR #1 слит"], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
@@ -266,7 +266,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
@@ -1029,9 +1029,11 @@ def test_merge_queue_behind_not_close_to_merge_skips_without_update(monkeypatch)
     fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
     patch_gh(monkeypatch, fake)
 
-    lines, hard_failure = sch.merge_queue(REPO, pulls)
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
+    assert merged_number is None
+    assert updated is False
     assert not any("update-branch" in c for c in fake.calls)
     assert any("не близок к слиянию" in line for line in lines)
 
@@ -1042,9 +1044,11 @@ def test_merge_queue_behind_close_to_merge_updates(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    lines, hard_failure = sch.merge_queue(REPO, pulls)
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
+    assert merged_number is None
+    assert updated is True
     assert any("pulls/2/update-branch" in c for c in fake.calls)
     assert any("обновлена из main" in line for line in lines)
 
@@ -1055,9 +1059,11 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    lines, hard_failure = sch.merge_queue(REPO, pulls)
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
+    assert merged_number is None
+    assert updated is True
     assert any("pulls/2/update-branch" in c for c in fake.calls)
 
 
@@ -1081,11 +1087,13 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    lines, hard_failure = sch.merge_queue(REPO, pulls)
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
+    assert merged_number is None
+    assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1, "два behind-PR за один прогон не должны дать два update-branch"
+    assert len(update_calls) == 1, "два behind-PR за один проход не должны дать два update-branch"
     assert any("pulls/2/update-branch" in c for c in update_calls)
     assert any("слот update_branch" in line and "#3" in line for line in lines)
 
@@ -1116,9 +1124,11 @@ def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    lines, hard_failure = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
 
     assert not hard_failure
+    assert merged_number is None
+    assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
     assert len(update_calls) == 2, "сбой на #2 не должен остановить обход — #3 обязан получить попытку"
     assert any("pulls/2/update-branch" in c for c in update_calls)
@@ -1127,6 +1137,146 @@ def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
     updated_lines = [line for line in lines if "обновлена из main" in line]
     assert len(failed_lines) == 1 and "#2" in failed_lines[0] and "dial tcp" in failed_lines[0]
     assert len(updated_lines) == 1 and "#3" in updated_lines[0]
+
+
+# ── Гвардия clean-состояния: гейт слияния не обходится за пределами behind ──────
+
+
+def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
+    """#297: цикл слияний доверяет решение "готов ли PR" merge_queue — эта
+    гвардия доказывает, что clean-состояние с зелёными чеками, но БЕЗ ai:ok,
+    не сливается. Мутация: закомментировать проверку gate_reason ниже —
+    тест обязан покраснеть (появится -X PUT .../merge)."""
+    pulls = [pull(2, labels=["review:ok"])]  # нет ai:ok — второй гейт не пройден
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "clean"},
+        "commits/sha2/check-runs": {"check_runs": [{"name": "ci", "conclusion": "success"}]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    lines, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number is None
+    assert updated is False
+    assert not any(c.startswith("-X PUT") and "/merge" in c for c in fake.calls)
+    assert any("ai:ok" in line for line in lines)
+
+
+# ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
+# merge_loop оборачивает merge_queue повторными проходами — тесты ниже
+# подставляют свой merge_queue (не гоняют реальную логику готовности PR,
+# та уже покрыта тестами выше) и проверяют именно управление циклом: сколько
+# проходов, когда останов, когда пауза.
+
+
+def test_merge_loop_merges_multiple_prs_in_one_run(monkeypatch):
+    """#297: один прогон обязан провести ОЧЕРЕДЬ, а не одного кандидата —
+    до этой правки main() звал merge_queue ровно один раз, и второе готовое
+    слияние ждало следующего запуска планировщика (расписание с доставкой
+    ~7%, docs/research/21). Три прохода: первые два сливают, третий говорит
+    "нечего сливать" — итог два слияния за один вызов merge_loop, без пауз
+    (каждый прогресс был слиянием, а не обновлением ветки)."""
+    calls = []
+    results = [
+        (["✅ PR #1 слит (squash)"], False, 1, True),
+        (["✅ PR #2 слит (squash)"], False, 2, True),
+        (["⏸️ очередь пуста"], False, None, False),
+    ]
+
+    def fake_merge_queue(repo, pulls):
+        calls.append(pulls)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    slept = []
+    monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
+
+    lines, hard_failure = sch.merge_loop(REPO, [])
+
+    assert not hard_failure
+    assert len(calls) == 3
+    assert not slept, "прогресс был только слияниями — ждать было нечего"
+    assert any("2 PR слито" in line for line in lines)
+
+
+def test_merge_loop_stops_at_max_merges_cap(monkeypatch):
+    """#297: потолок MERGE_LOOP_MAX_MERGES обязан остановить цикл, даже если
+    формально есть что сливать ещё дальше — без потолка событийный триггер
+    на большую скопившуюся очередь держал бы concurrency-слот orchestra
+    сколь угодно долго. Предохранитель в самом фейке (len(calls) > cap+5)
+    страхует от зависания теста, если потолок в коде сломан вовсе."""
+    calls = []
+
+    def fake_merge_queue(repo, pulls):
+        calls.append(1)
+        if len(calls) > sch.MERGE_LOOP_MAX_MERGES + 5:
+            raise AssertionError("цикл слияний не останавливается на потолке — уходит в бесконечность")
+        return ([f"✅ PR #{len(calls)} слит (squash)"], False, len(calls), True)
+
+    monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(
+        sch.time, "sleep",
+        lambda s: pytest.fail("не должен ждать — каждый проход сливал, прогресс всегда был мержем"),
+    )
+
+    lines, hard_failure = sch.merge_loop(REPO, [])
+
+    assert not hard_failure
+    assert len(calls) == sch.MERGE_LOOP_MAX_MERGES, "цикл обязан остановиться ровно на потолке слияний"
+    assert any(f"{sch.MERGE_LOOP_MAX_MERGES} PR слито" in line for line in lines)
+
+
+def test_merge_loop_stops_immediately_without_progress(monkeypatch):
+    """#297: проход без слияния и без обновления ветки не даёт циклу
+    продолжать вслепую — без нового внешнего события (нет проверок, ветка не
+    отставала) повтор прямо сейчас даст тот же результат. Мутация: убрать
+    `if not updated: break` в merge_loop — тест обязан покраснеть (второй
+    вызов merge_queue вместо одного)."""
+    calls = []
+
+    def fake_merge_queue(repo, pulls):
+        calls.append(1)
+        return (["⏸️ #1 — нет вердикта ai:ok"], False, None, False)
+
+    monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch.time, "sleep", lambda s: pytest.fail("нечего ждать — прогресса не было"))
+
+    lines, hard_failure = sch.merge_loop(REPO, [])
+
+    assert not hard_failure
+    assert len(calls) == 1, "без прогресса цикл обязан остановиться после первого прохода"
+
+
+def test_merge_loop_waits_after_branch_update_before_retry(monkeypatch):
+    """#297: проход, который только обновил ветку (checks перезапущены), — это
+    прогресс, не тупик: цикл ждёт MERGE_LOOP_POLL_SECONDS и пробует снова.
+    Второй проход без изменений (checks ещё не готовы) останавливает цикл —
+    в проде следующая попытка придёт по новому событию workflow_dispatch,
+    не по бесконечному опросу."""
+    calls = []
+    results = [
+        (["🔄 #1 обновлён из main"], False, None, True),
+        (["⏸️ #1 — behind main, checks ещё не готовы"], False, None, False),
+    ]
+
+    def fake_merge_queue(repo, pulls):
+        calls.append(1)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    slept = []
+    monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
+
+    lines, hard_failure = sch.merge_loop(REPO, [])
+
+    assert not hard_failure
+    assert len(calls) == 2
+    assert slept == [sch.MERGE_LOOP_POLL_SECONDS]
 
 
 # Газ mark_conflicts (#270): метка conflict должна и сниматься тоже.
@@ -1519,7 +1669,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_queue", lambda repo, pulls: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
