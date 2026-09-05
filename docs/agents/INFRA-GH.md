@@ -26,14 +26,26 @@
    декодирует ЧУЖОЙ пайп кодовой страницей консоли (cp1251 на Windows) — эта переменная на
    решение подпроцесса не влияет. Единственное лекарство —
    `subprocess.run(..., encoding="utf-8")` явно в каждом вызове (найдено и исправлено в
-   `scripts/lib/claim_task.py::gh()`, вердикт ai-review PR #326; тот же класс не закрыт ещё
-   в `contract_check.py`/`pulse_guard.py`/`dispatch_tail.py` — не стреляет в CI из-за
-   UTF-8-локали раннера, стреляет на Windows-агенте).
+   `scripts/lib/claim_task.py::gh()`, вердикт ai-review PR #326). Класс не закрыт целиком —
+   именной список мест устареет быстрее этого файла (находка ревью #326: список из трёх
+   имён уже отстал от кода на момент проверки), поэтому вместо перечня — команда,
+   актуальная всегда:
+   `grep -rn 'text=True' scripts | grep -v encoding=` (не стреляет в CI из-за UTF-8-локали
+   раннера, стреляет на Windows-агенте). Полное закрытие класса — отдельная задача
+   (единый helper вместо `subprocess.run` россыпью).
 4. **Смешение `\n` и `\r\n`** в файлах, которые правит и bash, и Windows-инструмент — не
    специфично для GitHub, но регулярно всплывает в диффах workflow-файлов; проверяй
    `git diff` перед коммитом, если правил не через `Edit`/`Write`.
 
-## Инвентарь workflow (`.github/workflows/*.yml`, прочитаны все, 2026-09-05)
+## Инвентарь workflow (`.github/workflows/*.yml`, прочитаны все, 2026-09-06)
+
+Найдено расхождение доки с кодом ревью PR #326/#333: таблица не поспевала за
+`.github/workflows/` — `worker-ci.yml` был удалён cleanup-коммитом и
+восстановлен задачей #72 (#331) уже ПОСЛЕ прошлой сверки этой таблицы, строка
+не добавилась. Защита от такого же протухания молча теперь механическая, не
+дисциплина памяти: `scripts/lib/test_infra_gh_inventory.py` в `repo-ci.yml`
+требует, чтобы каждый `.yml` из `.github/workflows/` встречался здесь по
+имени (и наоборот — удалённый workflow не оставляет мёртвой строки).
 
 | Файл | Триггер | Что делает | Секреты | Vars |
 |---|---|---|---|---|
@@ -43,6 +55,7 @@
 | `pr-review.yml` | `pull_request` (opened/synchronize/reopened) | Гейт 1: детерминированное ревью диффа (`check_pr.py`), метки `review:ok`/`review:changes-requested`/`review:large`. Доверенный код — чекаут `ref: main`, дерево PR — только данные | `github.token` | — |
 | `ai-review.yml` | `workflow_run` (завершение `pr-review`), `workflow_dispatch` (input `pr`) | Гейт 2: AI-ревью диффа. Trust-зона между job'ами: недоверенный DSH-шаг без токенов, доверенный `verdict` — свежая VM, свой чекаут main. Метки `ai:ok`/`ai:changes-requested`/`ai:failed` | `github.token`, `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL` |
 | `deploy-worker.yml` | `push` на `main` (`cf-worker/**`, `.github/workflows/deploy-worker.yml`), `workflow_dispatch` | Деплой морды (edge-harness) в Cloudflare: проверка секретов → гвардия актуальности типов → гвардия узости `GH_DISPATCH_TOKEN` → `wrangler deploy` → синк секретов воркера → канарейка UI на проде | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `HANDS_TOKEN`, `GH_DISPATCH_TOKEN`, `SESSION_SECRET` | `HARNESS_URL`, `GH_DISPATCH_TOKEN_KIND` |
+| `worker-ci.yml` | `push` на `main` (`cf-worker/**`, `.github/workflows/worker-ci.yml`), `pull_request` (без фильтра путей — на каждый PR) | Ворота CI морды до прода (ADR 0004): `worker-test` — контракт фронтенда, typecheck, vitest на настоящем workerd; `canary` — канарейка UI реальным браузером (playwright) против локального `wrangler dev`. Восстановлен задачей #72 (#331) после случайного удаления cleanup-коммитом | `github.token` (read) | — |
 | `deploy-dsh-edge.yml` | `schedule` (`37 4 * * *`), `workflow_dispatch` (input `version`) | Деплой морды dsh-edge: source-build с плагинами по манифесту (основной путь) либо npm-префаб (fallback при пустом манифесте). Синк `GH_RUNNER_TOKEN` (=`GH_PIPELINE_PAT`) и опциональных секретов интеграций (#115) в воркер dsh-edge | `CLOUDFLARE_*`, `GH_PIPELINE_PAT`, `DSH_EDGE_ACCESS_KEY`, `DEEPSEEK_*`, `JIRA_*`, `CONFLUENCE_*`, `BITBUCKET_*`, `SLACK_BOT_TOKEN`, `TELEGRAM_*` (интеграционные — опциональны, отсутствие не красит деплой) | `DSH_EDGE_URL`, `DSH_EDGE_PROVIDER_NAME`, `DSH_EDGE_MODEL_CATALOG` |
 | `dispatch-latency-probe.yml` | `schedule */15`, `repository_dispatch` (`dispatch-latency-probe`), `workflow_dispatch` | Кампания замера хвоста задержки dispatch→старт job'а (#4/ADR 0005). `tick` шлёт dispatch и пишет CSV/PR под PAT; `probe` — сам измеряемый job | `GH_PIPELINE_PAT` | — |
 | `repo-ci.yml` | `pull_request`, `push` на `main` | Обязательная проверка `test` защиты ветки: компиляция Python, гвардии классов (`body=`, провайдер/модель, разделение токенов, реестр меток, concurrency), юнит-тесты скриптов и плагинов, валидность YAML всех workflow | `github.token` (read) | — |
