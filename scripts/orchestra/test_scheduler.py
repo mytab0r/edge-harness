@@ -979,6 +979,22 @@ def test_mark_conflicts_post_syncs_pull_object_so_predicate_sees_it_now(monkeypa
     # без синхронизации объект p её бы не содержал до следующего fetch.
     assert sch.review_labels.should_update_branch(p["labels"]) is True
 
+# ── Пагинация файлов PR: третье место того же класса (находка вердикта на
+# PR #294) — after_merge читал сырую первую страницу, теперь через общий
+# review_labels.list_pr_files, как check_pr.py и ai_review.py ───────────────
+
+
+def test_after_merge_reads_files_through_paginated_helper():
+    # Гвардия по исходнику: after_merge обязан ходить через
+    # review_labels.list_pr_files (общее место с check_pr.py/ai_review.py),
+    # а не читать сырую первую страницу gh(...pulls/{number}/files?per_page=100)
+    # — эта форма молча теряла файлы за сотым (PR за сотню файлов с
+    # cf-worker/* в хвосте не запускал бы deploy-worker.yml).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "review_labels.list_pr_files(repo, number, gh)" in source
+    assert 'gh(f"repos/{repo}/pulls/{number}/files?per_page=100")' not in source
+
+
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 

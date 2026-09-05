@@ -97,12 +97,18 @@ merge-коммита.
 число «после» сам после слияния — за то же окно, что и «до»):
 
 ```
-# Все старты ai-review.yml за окно (НЕ метрика экономии — не убывает):
+# Все старты ai-review.yml за окно (НЕ метрика экономии — не убывает).
+# --jq '.total_count' — из ОДНОЙ страницы (не .workflow_runs | length,
+# который считает только элементы текущей страницы, то есть максимум 100
+# даже при реальных сотнях прогонов в окне):
 gh api "repos/mytab0r/edge-harness/actions/workflows/ai-review.yml/runs?created=<окно>&per_page=100" \
-  --jq '.workflow_runs | length'
+  --jq '.total_count'
 
-# ДОРОГИЕ прогоны — job review дошёл до шага gather (conclusion не skipped):
-for id in $(gh api "repos/mytab0r/edge-harness/actions/workflows/ai-review.yml/runs?created=<окно>&per_page=100" \
+# ДОРОГИЕ прогоны — job review дошёл до шага gather (conclusion не skipped).
+# --paginate обязателен: без него gh api отдаёт только первую страницу
+# (максимум 100 id), и цикл ниже молча пересчитает только их (тот же класс,
+# что закрыт в pulls/{n}/files — см. review_labels.list_pr_files):
+for id in $(gh api --paginate "repos/mytab0r/edge-harness/actions/workflows/ai-review.yml/runs?created=<окно>&per_page=100" \
   --jq '.workflow_runs[].id'); do
   gh api "repos/mytab0r/edge-harness/actions/runs/$id/jobs" \
     --jq '.jobs[] | select(.name=="review") | .steps[]
