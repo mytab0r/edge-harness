@@ -28,17 +28,17 @@
 | Возможность | Статус | Что показывает |
 |---|---|---|
 | Права токена (`/user/tokens/verify`) | проверено | активен, `status: active` |
-| Список воркеров (`/workers/scripts`) | проверено, отфильтровано | наши: `edge-harness`, `dsh-edge`; ещё 7 в аккаунте — чужие, скрыты |
-| Деплой edge-harness (`/workers/scripts/edge-harness/deployments`) | проверено | полная история деплоев с id/timestamp |
-| Bindings edge-harness (`/workers/scripts/edge-harness/settings`) | проверено | `ASSETS`, `GH_DISPATCH_TOKEN`(secret), `GH_REPO`(plain), `HANDS_TOKEN`(secret), `HARNESS`(DO-класс `Harness`), `SESSION_SECRET`(secret) |
-| Bindings dsh-edge (`/workers/scripts/dsh-edge/settings`) | проверено | `ASSETS`, `DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL`/`DSH_EDGE_ACCESS_KEY`(secrets), `DSH_EDGE_INSTANCE`(DO-класс `DshEdgeInstance`), `GH_RUNNER_REPO`(plain) |
-| Поддомен workers.dev (`/workers/subdomain`) | проверено | `mytab0r` |
-| DO namespaces (`/workers/durable_objects/namespaces`) | проверено, отфильтровано | наши: `edge-harness_Harness`, `dsh-edge_DshEdgeInstance`; 1 чужой в аккаунте, скрыт |
-| KV namespaces (`/storage/kv/namespaces`) | проверено, только счётчик | 7 в аккаунте, 0 у этого проекта (`wrangler.jsonc` без `kv_namespaces`) |
-| D1 databases (`/d1/database`) | проверено, только счётчик | 4 в аккаунте, 0 у этого проекта |
-| R2 buckets (`/r2/buckets`) | проверено, только счётчик | 1 в аккаунте, 0 у этого проекта |
-| Зоны/домены (`/zones`) | проверено | **0 зон во всём аккаунте** — закрывает issue #289: своего домена у CF-аккаунта нет |
-| Logpush jobs (`/logpush/jobs`) | **нет доступа** | HTTP 403 "Authentication error" — токену не хватает права **Logs Read** |
+| Список воркеров (`/accounts/{account_id}/workers/scripts`) | проверено, отфильтровано | наши: `edge-harness`, `dsh-edge`; ещё 7 в аккаунте — чужие, скрыты |
+| Деплой edge-harness (`/accounts/{account_id}/workers/scripts/edge-harness/deployments`) | проверено | полная история деплоев с id/timestamp |
+| Bindings edge-harness (`/accounts/{account_id}/workers/scripts/edge-harness/settings`) | проверено | `ASSETS`, `GH_DISPATCH_TOKEN`(secret), `GH_REPO`(plain), `HANDS_TOKEN`(secret), `HARNESS`(DO-класс `Harness`), `SESSION_SECRET`(secret) |
+| Bindings dsh-edge (`/accounts/{account_id}/workers/scripts/dsh-edge/settings`) | проверено | `ASSETS`, `DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL`/`DSH_EDGE_ACCESS_KEY`(secrets), `DSH_EDGE_INSTANCE`(DO-класс `DshEdgeInstance`), `GH_RUNNER_REPO`(plain) |
+| Поддомен workers.dev (`/accounts/{account_id}/workers/subdomain`) | проверено | `mytab0r` |
+| DO namespaces (`/accounts/{account_id}/workers/durable_objects/namespaces`) | проверено, отфильтровано | наши: `edge-harness_Harness`, `dsh-edge_DshEdgeInstance`; 1 чужой в аккаунте, скрыт |
+| KV namespaces (`/accounts/{account_id}/storage/kv/namespaces`) | проверено, только счётчик | 7 в аккаунте, 0 у этого проекта (`wrangler.jsonc` без `kv_namespaces`) |
+| D1 databases (`/accounts/{account_id}/d1/database`) | проверено, только счётчик | 4 в аккаунте, 0 у этого проекта |
+| R2 buckets (`/accounts/{account_id}/r2/buckets`) | проверено, только счётчик | 1 в аккаунте, 0 у этого проекта |
+| Зоны/домены (`/zones`, не account-scoped) | проверено | **0 зон во всём аккаунте** — закрывает issue #289: своего домена у CF-аккаунта нет |
+| Logpush jobs (`/accounts/{account_id}/logpush/jobs`) | **нет доступа** | HTTP 403 "Authentication error" — токену не хватает права **Logs Read** |
 | Живые логи воркера в моменте | доступно вне API | `npx wrangler tail edge-harness` из `cf-worker/` — WebSocket, интерактивно, не для CI |
 | Расход по квотам (requests/duration/rows_read) | **не проверено намеренно** | простым GET не отдаётся; нужен GraphQL Analytics API (`POST /client/v4/graphql`, право **Account Analytics**) — схему вслепую не гадаем, см. ниже |
 | Статические лимиты Free-плана | см. research | [docs/research/20-cloudflare-free.md](../research/20-cloudflare-free.md) |
