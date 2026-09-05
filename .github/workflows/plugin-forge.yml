@@ -339,19 +339,22 @@ jobs:
           # Проверяем, есть ли уже плагин с таким id
           EXISTS=$(jq --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id)' <<<"$MANIFEST")
           if [ -n "$EXISTS" ]; then
-            # Обновляем существующую запись
+            # Обновляем существующую запись. server НЕ переписывается на true
+            # безусловно: для client-only плагина (напр. plugin-manager,
+            # server:false) бамп через форж иначе тихо сделал бы его
+            # серверным (находка AI-ревью PR #273) — .server внутри update-
+            # фильтра ссылается на текущее значение поля этой же записи.
             MANIFEST=$(jq --arg id "$PLUGIN_ID" \
               --arg pkg "$PLUGIN_PACKAGE" \
               --arg release "$RELEASE_TAG" \
               --arg asset "$ASSET" \
               --arg sha "$SHA256" \
-              --argjson server true \
               --argjson client "$HAS_CLIENT" \
               '(.plugins[] | select(.id == $id)) |= {
                 id: $id,
                 package: $pkg,
                 source: { release: $release, asset: $asset, sha256: $sha },
-                server: $server,
+                server: .server,
                 client: $client
               }' <<<"$MANIFEST")
             PR_TITLE="chore(plugins): обновить $PLUGIN_ID до v$PLUGIN_VERSION"
