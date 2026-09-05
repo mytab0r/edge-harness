@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { handsAreAlive } from "../src/harness";
+import { classifyStorageError, handsAreAlive, storageErrorResponse } from "../src/harness";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -441,5 +441,87 @@ describe("живой поток", () => {
     expect(hello.type).toBe("hello");
     expect(hello.status.heartbeat_fresh_ms).toBe(60_000);
     ws.close();
+  });
+});
+
+describe("класс ошибки хранилища (#320)", () => {
+  it("ловит формулировки квоты rows_read/rows_written и общий 'quota'", () => {
+    expect(classifyStorageError("exceeded the daily Durable Objects free tier limit of 5000000 rows_read"))
+      .toBe("quota_exceeded");
+    expect(classifyStorageError("rows_written limit exceeded")).toBe("quota_exceeded");
+    expect(classifyStorageError("quota exceeded")).toBe("quota_exceeded");
+  });
+
+  it("не путает обычную ошибку с квотой", () => {
+    expect(classifyStorageError("network timeout")).toBe("unknown");
+    expect(classifyStorageError("unexpected token in JSON")).toBe("unknown");
+  });
+});
+
+// Спека 5.1: маппинг classifyStorageError → HTTP-код проверялся раньше только на
+// самой функции классификации, не на месте применения — общем catch #fetch()
+// (находка ревью PR #321). storageErrorResponse — тот же код, что реально уходит
+// клиенту (fetch() зовёт именно эту функцию), гоняем его напрямую вместо того,
+// чтобы реально исчерпывать суточную квоту DO в тесте — такой отказ вне окна
+// инцидента не воспроизвести (docs/research/20, «не подтверждено»).
+describe("ответ на ошибку хранилища (спека 5.1, #320)", () => {
+  it("текст похож на исчерпание квоты — 500 storage_quota_exceeded", async () => {
+    const res = storageErrorResponse("exceeded the daily Durable Objects free tier limit of rows_read");
+    expect(res.status).toBe(500);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("storage_quota_exceeded");
+  });
+
+  it("обычная ошибка — 500 internal, не квота", async () => {
+    const res = storageErrorResponse("network timeout");
+    expect(res.status).toBe(500);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("internal");
+  });
+});
+
+// Спека 14.4: тест 14.3 («dispatched-задача старше порога видна в stale_dispatch»)
+// гвардит только видимость зависшей задачи, не использование индекса — это другое
+// требование (находка ревью PR #321). EXPLAIN QUERY PLAN того же запроса, что
+// #status() реально исполняет, обязан ссылаться на tasks_status_dispatch —
+// докажи мутацией: убери строку `CREATE INDEX tasks_status_dispatch` из SCHEMA,
+// тест покраснеет (план перейдёт на SCAN TABLE tasks).
+describe("watchdog-запрос использует индекс tasks(status, dispatch_ts) (спека 14.4, #320)", () => {
+  it("EXPLAIN QUERY PLAN ссылается на tasks_status_dispatch", async () => {
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const plan = state.storage.sql
+        .exec(
+          `EXPLAIN QUERY PLAN SELECT COUNT(*) AS n, MIN(dispatch_ts) AS oldest FROM tasks
+           WHERE status = 'dispatched' AND dispatch_ts IS NOT NULL AND dispatch_ts < ?`,
+          Date.now(),
+        )
+        .toArray() as Record<string, SqlStorageValue>[];
+      const detail = plan.map((row) => String(row.detail)).join(" | ");
+      expect(detail).toContain("tasks_status_dispatch");
+    });
+  });
+});
+
+describe("кэш счётчиков задач по статусу (#320)", () => {
+  // Регрессия на возврат полного GROUP BY в горячий путь: если инвалидация
+  // кэша при записи в tasks пропадёт, счётчики застынут на значении первого
+  // вызова #status() и перестанут отражать реальные переходы — тест это ловит
+  // дельтой, а не абсолютным числом (в файле общее хранилище DO между тестами).
+  it("queued/running/done меняются по фактическим переходам, не только по факту чтения", async () => {
+    const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const taskId = created.task_id;
+
+    const afterCreate = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 1, kind: "job_start" }] });
+    const afterStart = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(afterStart.tasks.queued).toBe(afterCreate.tasks.queued - 1);
+    expect(afterStart.tasks.running).toBe(afterCreate.tasks.running + 1);
+
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 2, kind: "job_end", data: { result: "ok" } }] });
+    const afterEnd = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
+    expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
   });
 });
