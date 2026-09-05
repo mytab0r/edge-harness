@@ -830,14 +830,33 @@ export class Harness extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const token = this.env.GH_DISPATCH_TOKEN;
     const repo = this.env.GH_REPO;
+    // Тик перезакладывается ПЕРВОЙ строкой, до какого-либо I/O (issue #269) — этот
+    // инвариант не может жить внутри общего try ниже: если бы setAlarm упал там, catch
+    // проглотил бы исключение и alarm() завершился бы успешно, а CF ретраит упавший
+    // хендлер, только когда исключение ВЫХОДИТ из него, — успешный возврат ретрая не
+    // вызовет. #320 добавил ровно тот класс отказа: setAlarm сам может упасть на
+    // исчерпании суточной квоты rows_written. Ловим отдельно и пробуем один раз ещё —
+    // если и повтор не удался, честно называем итог: цепочка встала до пересоздания DO.
     try {
-      // Тик перезакладывается ПЕРВОЙ строкой внутри общего try/catch (#320):
-      // не только setAlarm, но и #sql.exec ниже (#getStoredPulse, #recordPulse)
-      // может упасть на исчерпании суточной квоты rows_read/rows_written —
-      // раньше такое исключение уходило из alarm() непойманным, и единственным
-      // следом оставалось молчание пульса (issue #269 — тот же класс проблем,
-      // «таблица ловушек для этого места», просто другая причина отказа).
       await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`alarm: setAlarm упал (${classifyStorageError(detail)}): ${detail} — повторная попытка`);
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
+      } catch (retryError) {
+        const retryDetail = retryError instanceof Error ? retryError.message : String(retryError);
+        console.error(
+          `alarm: повторная попытка setAlarm тоже упала (${classifyStorageError(retryDetail)}): ` +
+            `${retryDetail} — цепочка пульса встала до пересоздания DO`,
+        );
+      }
+      return;
+    }
+    try {
+      // #sql.exec ниже (#getStoredPulse, #recordPulse) тоже может упасть на исчерпании
+      // суточной квоты rows_read/rows_written — но тик уже перезаложен строкой выше,
+      // поэтому падение здесь не убивает цепочку, только этот конкретный дозвон.
       if (!token || !repo) {
         // «Возможности нет» — не поломка, но и не тишина: видно в /api/status, что
         // секретов нет, а не гадать по отсутствию прогонов оркестратора.
@@ -865,11 +884,11 @@ export class Harness extends DurableObject<Env> {
         console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
       }
     } catch (error) {
-      // #320: похожая на исчерпание квоты storage (rows_read/rows_written)
-      // ошибка здесь раньше уходила из alarm() непойманным — единственным
-      // следом оставалось молчание пульса. CF ретраит упавший alarm сам (не
-      // подтверждено число попыток/окно — docs/research/20), но пока имя
-      // причины не названо явно, отказ неотличим от «пульс просто не бьётся».
+      // #320: похожая на исчерпание квоты storage (rows_read/rows_written) ошибка
+      // здесь раньше уходила из alarm() непойманным — единственным следом оставалось
+      // молчание пульса. Тик к этому моменту УЖЕ перезаложен (см. try выше) — цепочка
+      // жива в любом случае, это ловит только конкретный неудавшийся дозвон и называет
+      // причину по имени вместо тихого «пульс просто не бьётся».
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`alarm: упал (${classifyStorageError(detail)}): ${detail}`);
       return;
