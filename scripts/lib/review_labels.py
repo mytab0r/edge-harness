@@ -254,6 +254,40 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 # только в ai_review.py, check_pr.py читало бы вторую копию regex.
 FACT_RE = re.compile(r"^(pr|head|reviewer|diff):\s*(.+)$")
 
+# ── Автор вердикта — не любой комментатор (дыра, найдена вердиктом ai-review
+# PR #294, у неё выше приоритет, чем у самого #294) ──────────────────────────
+#
+# Шапка `reviewer:`/`diff:` — это ТЕКСТ ТЕЛА комментария, его пишет автор
+# комментария, а не GitHub. Репозиторий публичный: до этой правки
+# latest_ai_comment брала последний комментарий с такой шапкой от ЛЮБОГО
+# user.login. diff_fingerprint считается из публичного `pulls/{n}/files`
+# (см. diff_fingerprint выше) — его может вычислить и опубликовать в
+# поддельном комментарии кто угодно, получив `ai_verdict_keep == True` на
+# реально изменённом диффе и `should_run_ai_review == False`: дорогое
+# AI-ревью пропускается молча, merge_label_gate смотрит только метки — и
+# непроверенный код едет в main. Наш же фикс #252/#294 открыл этот канал:
+# до него check_pr.py снимал ai:*-метки безусловно, комментарии в решение
+# гейта не входили вовсе.
+#
+# Проверено по факту на PR #294 (2026-09-05), а не по предположению:
+#   gh api "repos/mytab0r/edge-harness/issues/294/comments" \
+#     --jq '.[]|select(.body|test("reviewer:"))|"\(.user.login) \(.user.type)"'
+# все 4 настоящих ai-ревью-комментария — "github-actions[bot] Bot": вердикт
+# публикует шаг verdict workflow ai-review.yml через `gh -f body=...` от
+# имени GITHUB_TOKEN. user.login/user.type в ответе GitHub API — это факт
+# об АВТОРЕ комментария в базе GitHub, не текст, который пишет автор, и
+# подделать его публикацией нового комментария нельзя.
+TRUSTED_VERDICT_LOGIN = "github-actions[bot]"
+
+
+def _is_trusted_verdict_author(comment: dict) -> bool:
+    """True — комментарий опубликован сервисной учёткой GITHUB_TOKEN самого
+    workflow, не посторонним читателем публичного репозитория. Единственное
+    место правды на признак автора — latest_ai_comment (этот модуль) и
+    file_tasks.latest_review_comment опираются на неё же, не на свою копию."""
+    author = comment.get("user") or {}
+    return author.get("login") == TRUSTED_VERDICT_LOGIN and author.get("type") == "Bot"
+
 
 def header_facts(comment_body: str) -> dict[str, str]:
     lines = (comment_body or "").splitlines()
@@ -268,12 +302,19 @@ def header_facts(comment_body: str) -> dict[str, str]:
 
 
 def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
-    """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`) —
+    """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
+    опубликованный доверенной учёткой — _is_trusted_verdict_author) —
     источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
     вызывающий `gh(*args)` того же модуля (subprocess-обёртка над `gh api`,
     паттерн уже используемый в check_pr/ai_review) — сеть здесь не
     зашивается, чтобы функция оставалась инъекцией зависимости и её решение
     (diff_unchanged) проверялось без сети.
+
+    Комментарии от кого угодно, кроме доверенной учётки, пропускаются ДО
+    разбора шапки: посторонний участник публичного репозитория может
+    опубликовать комментарий с валидной шапкой reviewer:/diff: (находка
+    дыры безопасности, вердикт ai-review PR #294) — доверять телу
+    комментария можно только после проверки автора, не вместо неё.
 
     Листает все страницы (per_page=100) — эндпоинт комментариев не
     поддерживает сортировку по убыванию (замер file_tasks.py на PR #138),
@@ -285,6 +326,8 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
         if not isinstance(chunk, list) or not chunk:
             break
         for comment in chunk:
+            if not _is_trusted_verdict_author(comment):
+                continue
             facts = header_facts(comment.get("body") or "")
             if facts.get("reviewer") in ("approve", "rework", "error"):
                 latest = comment

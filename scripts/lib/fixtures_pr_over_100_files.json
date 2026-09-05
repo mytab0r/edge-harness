@@ -1,821 +1,113 @@
 {
-  "_comment": "Синтетическая фикстура (#294): реальный репозиторий не содержит PR с >100 изменённых файлов (проверено graphql changedFiles по всем 135 PR, максимум 76 — PR #278). page1/page2 склеены из ДВУХ настоящих ответов gh api pulls/{n}/files: page1 = первые 100 элементов конкатенации PR #278 (76 файлов) + PR #10 (32 файла), page2 = оставшиеся 8 элементов (все поля — реальные значения API, склейка синтетическая). page2_edited имитирует правку файла за сотой позиции (scripts/orchestra/scheduler.py получает sha другого реального файла того же снимка, .github/workflows/decommission-worker.yml) — доказывает, что без пагинации отпечаток не видит правку в хвосте.",
+  "_comment": "Синтетическая фикстура (#294): реальный репозиторий не содержит PR с >100 изменённых файлов (проверено graphql changedFiles по всем 135 PR, максимум 76 — PR #278). page1/page2 склеены из ДВУХ настоящих ответов gh api pulls/{n}/files: page1 = первые 100 элементов конкатенации PR #278 (76 файлов) + PR #10 (32 файла), page2 = ДВА элемента из оставшихся 8 (ужато вердиктом ai-review PR #294 — диффу нужен размер, не число хвостовых записей; оставлены первый и последний из исходных 8, все поля — реальные значения API того же снимка). page2_edited имитирует правку файла за сотой позицией (scripts/orchestra/scheduler.py получает sha другого реального файла того же снимка, .github/workflows/decommission-worker.yml) — доказывает, что без пагинации отпечаток не видит правку в хвосте.",
   "page1": [
-    {
-      "additions": 1,
-      "deletions": 1,
-      "filename": ".github/dependabot.yml",
-      "sha": "e8eeb9d436273a66b84b372b61607758f7b0d15b",
-      "status": "modified"
-    },
-    {
-      "additions": 158,
-      "deletions": 0,
-      "filename": ".github/workflows/decommission-worker.yml",
-      "sha": "c54f993571d9c8d6039b2b1f1bca32c56f2b47e7",
-      "status": "added"
-    },
-    {
-      "additions": 36,
-      "deletions": 11,
-      "filename": ".github/workflows/deploy-dsh-edge.yml",
-      "sha": "571bb9d4dc5239aecf3352b4915d3c313257b848",
-      "status": "modified"
-    },
-    {
-      "additions": 114,
-      "deletions": 0,
-      "filename": ".github/workflows/deploy-pulse.yml",
-      "sha": "db5232c22cbaa57a9a9a8e7cc2319e3cb538fe97",
-      "status": "added"
-    },
-    {
-      "additions": 0,
-      "deletions": 148,
-      "filename": ".github/workflows/deploy-worker.yml",
-      "sha": "16dcb93898017c91f71693f9594b082a91e4aa20",
-      "status": "removed"
-    },
-    {
-      "additions": 8,
-      "deletions": 7,
-      "filename": ".github/workflows/hands.yml",
-      "sha": "a87fd30f567cde38ccf31a5b5967694f9b7d5b35",
-      "status": "modified"
-    },
-    {
-      "additions": 24,
-      "deletions": 5,
-      "filename": ".github/workflows/repo-ci.yml",
-      "sha": "c5bf6a2735913f70e03a68a007cf7c0866b897b0",
-      "status": "modified"
-    },
-    {
-      "additions": 0,
-      "deletions": 5,
-      "filename": ".github/workflows/worker.yml",
-      "sha": "30130fdd2ef019913e5a0312ab834874745d0a00",
-      "status": "modified"
-    },
-    {
-      "additions": 2,
-      "deletions": 2,
-      "filename": "AGENTS.md",
-      "sha": "1f0da84eab66e5d293f59a56ccb6568638da7292",
-      "status": "modified"
-    },
-    {
-      "additions": 9,
-      "deletions": 6,
-      "filename": "README.md",
-      "sha": "35e1a6413807bd563b4f488ef5c245609fb2bf07",
-      "status": "modified"
-    },
-    {
-      "additions": 40,
-      "deletions": 0,
-      "filename": "cf-pulse/README.md",
-      "sha": "dff50ac7d68b08b42ae58d76dc30796abb033d38",
-      "status": "added"
-    },
-    {
-      "additions": 15,
-      "deletions": 0,
-      "filename": "cf-pulse/package.json",
-      "sha": "c0682f19db0f3fef99f54576738e6c329dbb0a77",
-      "status": "added"
-    },
-    {
-      "additions": 43,
-      "deletions": 0,
-      "filename": "cf-pulse/src/config.ts",
-      "sha": "791665dce426d873fcb0507f4cd02c4eb2cfe060",
-      "status": "added"
-    },
-    {
-      "additions": 19,
-      "deletions": 0,
-      "filename": "cf-pulse/src/decision.ts",
-      "sha": "aa14d628b5050041c00b3f72785eed3f1a9f36c6",
-      "status": "added"
-    },
-    {
-      "additions": 12,
-      "deletions": 0,
-      "filename": "cf-pulse/src/env.d.ts",
-      "sha": "9526b5f02da1668b00f6e60f6a96678a2a0bd6fc",
-      "status": "added"
-    },
-    {
-      "additions": 123,
-      "deletions": 0,
-      "filename": "cf-pulse/src/index.ts",
-      "sha": "d04131ebdeea4ee04229e4fc00c07b2d8e097511",
-      "status": "added"
-    },
-    {
-      "additions": 46,
-      "deletions": 0,
-      "filename": "cf-pulse/test/decision.test.ts",
-      "sha": "d7a9826605e39fb3c5d1642436335be405d1e5e8",
-      "status": "added"
-    },
-    {
-      "additions": 14,
-      "deletions": 0,
-      "filename": "cf-pulse/wrangler.jsonc",
-      "sha": "3267f559def4858fe4198faa9dca9a10985177cc",
-      "status": "added"
-    },
-    {
-      "additions": 0,
-      "deletions": 6,
-      "filename": "cf-worker/.dev.vars.example",
-      "sha": "addba9c96dc2ab09a13973b5bb047cb732f310ea",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 3,
-      "filename": "cf-worker/.dockerignore",
-      "sha": "073e02da0a11565b06f259988e2cd48894f5b183",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 15,
-      "filename": "cf-worker/Dockerfile",
-      "sha": "03f66ef603bd1a58670897a21adc1b6df1fae07c",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 100,
-      "filename": "cf-worker/README.md",
-      "sha": "7d649c3c7f65d9415facd8a12e77278e95585b65",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 56,
-      "filename": "cf-worker/api-spec.json",
-      "sha": "0ecdd8af810997017deff881c1d18ca7acc2b5bd",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 3251,
-      "filename": "cf-worker/package-lock.json",
-      "sha": "a43519c3f6c8a4465876573dd43c57e3857986c2",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 24,
-      "filename": "cf-worker/package.json",
-      "sha": "592a46451f734515973ba2d773ff768b43c74ad2",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 316,
-      "filename": "cf-worker/public/assets/app.js",
-      "sha": "9b337d2e0c6e5d03cb0621a4740e72d51932bbd1",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 22,
-      "filename": "cf-worker/public/assets/config.js",
-      "sha": "06d1b261a0b9d0bf9759558e1ac00495e07d277a",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 36,
-      "filename": "cf-worker/public/assets/i18n/ru.js",
-      "sha": "765d5168de274ee4bc2118139e5640ef9da5673d",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 61,
-      "filename": "cf-worker/public/assets/style.css",
-      "sha": "e11fee16a84611ddbe905c34cc14ac9ead79d787",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 54,
-      "filename": "cf-worker/public/index.html",
-      "sha": "2c5722a1f99e2764262f72a0696c61d773be52c5",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 130,
-      "filename": "cf-worker/scripts/canary-ui.mjs",
-      "sha": "f36d77fa2c4c09f010ba489351f3066b9f13c191",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 84,
-      "filename": "cf-worker/scripts/check-frontend-contract.mjs",
-      "sha": "e219e975e23f35b9632f8f471ed1e347b3d04cac",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 86,
-      "filename": "cf-worker/scripts/generate-api-docs.mjs",
-      "sha": "0d4eaa266ab5999d726533dfe8c6673ecf5a91fc",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 130,
-      "filename": "cf-worker/scripts/smoke-local.mjs",
-      "sha": "f353f9ce0e79731469f8df93bfcfcbe7d1ebb46e",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 115,
-      "filename": "cf-worker/src/api-spec.ts",
-      "sha": "63c6ec5eb2ec318eadc085a00fb23659c2e1b32b",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 81,
-      "filename": "cf-worker/src/config.ts",
-      "sha": "6b3d4ad3b3e1c407913bb6038b9034f8789a3a0d",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 772,
-      "filename": "cf-worker/src/harness.ts",
-      "sha": "737aeb75b71d7124e8b8ab209a5d369cc0e50f6c",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 18,
-      "filename": "cf-worker/src/index.ts",
-      "sha": "4514270a67b28c47cd335fe92c469332be4362be",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 41,
-      "filename": "cf-worker/src/messages.ts",
-      "sha": "5af6883feef3b6537ab8b97913c90fd5a05ace17",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 60,
-      "filename": "cf-worker/test/api-contract.spec.ts",
-      "sha": "05657739d80281a99d6c03949ee7acf3e603d443",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 406,
-      "filename": "cf-worker/test/harness.spec.ts",
-      "sha": "fd768c9dfdaef4b58308d9d410235f4de05c37f7",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 26,
-      "filename": "cf-worker/test/pulse.spec.ts",
-      "sha": "4ec9dc84d086e9069692feb705e75ee4735e275b",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 16,
-      "filename": "cf-worker/tsconfig.json",
-      "sha": "29b6fe78df512efdd0e32ff58ec124ae55a0f22a",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 20,
-      "filename": "cf-worker/vitest.config.ts",
-      "sha": "9d09a6cd7fe3c9f6ae371dbb4671e247cc9efdda",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 15373,
-      "filename": "cf-worker/worker-configuration.d.ts",
-      "sha": "7851c1dfc88059d5a4997843a81f30172fad2228",
-      "status": "removed"
-    },
-    {
-      "additions": 0,
-      "deletions": 45,
-      "filename": "cf-worker/wrangler.jsonc",
-      "sha": "bec9ad680fba6dca2184eb99095e1809e25f60e1",
-      "status": "removed"
-    },
-    {
-      "additions": 5,
-      "deletions": 4,
-      "filename": "docs/agents/PROTOCOL.md",
-      "sha": "e05154961b0c510fb7fc56fbb317bd3dddf9867f",
-      "status": "modified"
-    },
-    {
-      "additions": 4,
-      "deletions": 7,
-      "filename": "docs/agents/ROADMAP.md",
-      "sha": "d4d5b17c0448c0be83311d54b47f4b012c9cf3dd",
-      "status": "modified"
-    },
-    {
-      "additions": 0,
-      "deletions": 36,
-      "filename": "docs/api.md",
-      "sha": "986b48076728de472bd6ed320df98f5f967e58d3",
-      "status": "removed"
-    },
-    {
-      "additions": 7,
-      "deletions": 3,
-      "filename": "docs/decisions/0004-api-contract.md",
-      "sha": "ab8b6affe35d8f6c2be8636ddc77e301d676b9f3",
-      "status": "modified"
-    },
-    {
-      "additions": 10,
-      "deletions": 6,
-      "filename": "docs/decisions/0008-narrow-dispatch-token.md",
-      "sha": "2bbf20d58f9a7ebd12b2766df19ca96e6cd016f1",
-      "status": "modified"
-    },
-    {
-      "additions": 13,
-      "deletions": 12,
-      "filename": "docs/research/12-dsh-edge-session-api.md",
-      "sha": "6c53b611dc65bc441ee07f9e2daab9a5ae22a847",
-      "status": "modified"
-    },
-    {
-      "additions": 6,
-      "deletions": 3,
-      "filename": "docs/research/21-github-actions.md",
-      "sha": "83f40ad2c3a41a04d70514f0c1bb56bdb3d39fa3",
-      "status": "modified"
-    },
-    {
-      "additions": 9,
-      "deletions": 1,
-      "filename": "dsh-edge/PATCHES.md",
-      "sha": "fecd004f24d7f1e33c4fd1dcc0d1e74df1e2d545",
-      "status": "modified"
-    },
-    {
-      "additions": 270,
-      "deletions": 0,
-      "filename": "dsh-edge/patches/0005-harness-pipeline-view.patch",
-      "sha": "e385653970d622994b417734178d6626602c4951",
-      "status": "added"
-    },
-    {
-      "additions": 225,
-      "deletions": 0,
-      "filename": "dsh-edge/pipeline-integration/check.mjs",
-      "sha": "137d2bf43d3c1e8d6bd560856764ea6b627da820",
-      "status": "added"
-    },
-    {
-      "additions": 195,
-      "deletions": 0,
-      "filename": "openspec/changes/edge-harness-decommission/design.md",
-      "sha": "78e496461bd8b4487b084a42211f8993f810eecd",
-      "status": "added"
-    },
-    {
-      "additions": 68,
-      "deletions": 0,
-      "filename": "openspec/changes/edge-harness-decommission/proposal.md",
-      "sha": "fc38f3227db6cc3a36f407c46aab3fd8cfe75857",
-      "status": "added"
-    },
-    {
-      "additions": 63,
-      "deletions": 0,
-      "filename": "openspec/changes/edge-harness-decommission/tasks.md",
-      "sha": "f3603f3821635f2ddab4817ee9311e8111661dcb",
-      "status": "added"
-    },
-    {
-      "additions": 111,
-      "deletions": 94,
-      "filename": "openspec/specs/journal-tasks-hands.md",
-      "sha": "294ffa1b5c3e49babec2216c565e45b68007e07f",
-      "status": "modified"
-    },
-    {
-      "additions": 5,
-      "deletions": 5,
-      "filename": "plugins-src/integrations/src/body.js",
-      "sha": "d15b3806b3f4ef10d13d7afb97308d42a5149454",
-      "status": "modified"
-    },
-    {
-      "additions": 2,
-      "deletions": 2,
-      "filename": "plugins-src/integrations/test/client.test.mjs",
-      "sha": "a38c757c235c39dfb5a0f073ce6ecd5737c35e10",
-      "status": "modified"
-    },
-    {
-      "additions": 9,
-      "deletions": 8,
-      "filename": "plugins-src/plugin-manager/src/body.js",
-      "sha": "c0fcd5219df907f447999f9dd1892a206e567e76",
-      "status": "modified"
-    },
-    {
-      "additions": 1,
-      "deletions": 1,
-      "filename": "plugins-src/plugin-manager/test/client.test.mjs",
-      "sha": "630733bcb438e47bf14ad94a62a142f9db626602",
-      "status": "modified"
-    },
-    {
-      "additions": 0,
-      "deletions": 77,
-      "filename": "scripts/canary-dispatch.sh",
-      "sha": "c4adfa7d0bb39d3934fe47b4f9ca7c6697082ff6",
-      "status": "removed"
-    },
-    {
-      "additions": 48,
-      "deletions": 121,
-      "filename": "scripts/hands/dsh_task.sh",
-      "sha": "8119aaafa603ac9f1f91d99c389512d41b49483e",
-      "status": "modified"
-    },
-    {
-      "additions": 138,
-      "deletions": 0,
-      "filename": "scripts/lib/dsh-edge-pipeline.sh",
-      "sha": "0afe1d59fc713f8b6d5dff1856b9105fc1bfbceb",
-      "status": "added"
-    },
-    {
-      "additions": 0,
-      "deletions": 99,
-      "filename": "scripts/lib/journal_status.sh",
-      "sha": "bd610853b7da477b9b70ed14ff70d64820360a44",
-      "status": "removed"
-    },
-    {
-      "additions": 35,
-      "deletions": 40,
-      "filename": "scripts/lib/test/dsh-clients.smoke.sh",
-      "sha": "fd48aa1b76698608e3836daf49ea8721814d255a",
-      "status": "modified"
-    },
-    {
-      "additions": 16,
-      "deletions": 11,
-      "filename": "scripts/lib/test_dispatch_token_usage.py",
-      "sha": "98616bb2f0255d2e5bb9a35012370cc2a923ff25",
-      "status": "modified"
-    },
-    {
-      "additions": 15,
-      "deletions": 7,
-      "filename": "scripts/orchestra/scheduler.py",
-      "sha": "79e0c5e423a0487053994e6559883e3c16b7fcf8",
-      "status": "modified"
-    },
-    {
-      "additions": 40,
-      "deletions": 0,
-      "filename": "scripts/orchestra/test_scheduler.py",
-      "sha": "238355e29daa697be6131defdbbb384288ef23ec",
-      "status": "modified"
-    },
-    {
-      "additions": 11,
-      "deletions": 10,
-      "filename": "scripts/plugins/integration_status.sh",
-      "sha": "2343104c035e4b533cdfb932d3cce8524e26e7d5",
-      "status": "modified"
-    },
-    {
-      "additions": 13,
-      "deletions": 13,
-      "filename": "scripts/plugins/plugin_status.sh",
-      "sha": "686052e3135fe58179ea7cfe2fb1a6b3eed347d1",
-      "status": "modified"
-    },
-    {
-      "additions": 99,
-      "deletions": 100,
-      "filename": "scripts/plugins/test/status-scripts.smoke.sh",
-      "sha": "100df833689fc169f385834eb5130ea9317083d0",
-      "status": "modified"
-    },
-    {
-      "additions": 5,
-      "deletions": 26,
-      "filename": "scripts/worker/task.sh",
-      "sha": "8d801c43dbb8b136983b77c534a405c4d29c8a57",
-      "status": "modified"
-    },
-    {
-      "additions": 11,
-      "deletions": 0,
-      "filename": ".gitattributes",
-      "sha": "002dccba69d2491674b61ebc6cea1ef7d80fb2ed",
-      "status": "added"
-    },
-    {
-      "additions": 9,
-      "deletions": 0,
-      "filename": ".github/workflows/deploy-worker.yml",
-      "sha": "65ad03cbb76e5c908a443801c56176ee8c21ae91",
-      "status": "modified"
-    },
-    {
-      "additions": 34,
-      "deletions": 0,
-      "filename": ".github/workflows/worker-ci.yml",
-      "sha": "7aa9391b9927aa738d637cc472446e8ef45109fc",
-      "status": "modified"
-    },
-    {
-      "additions": 3,
-      "deletions": 0,
-      "filename": "cf-worker/.dockerignore",
-      "sha": "073e02da0a11565b06f259988e2cd48894f5b183",
-      "status": "added"
-    },
-    {
-      "additions": 15,
-      "deletions": 0,
-      "filename": "cf-worker/Dockerfile",
-      "sha": "03f66ef603bd1a58670897a21adc1b6df1fae07c",
-      "status": "added"
-    },
-    {
-      "additions": 7,
-      "deletions": 7,
-      "filename": "cf-worker/README.md",
-      "sha": "a0f56d898ca960f0f628f0dcea85feb69a543402",
-      "status": "modified"
-    },
-    {
-      "additions": 49,
-      "deletions": 0,
-      "filename": "cf-worker/api-spec.json",
-      "sha": "3935d7cafa5c1b3806e924e18a9daa7289680e69",
-      "status": "added"
-    },
-    {
-      "additions": 48,
-      "deletions": 0,
-      "filename": "cf-worker/package-lock.json",
-      "sha": "a297b76d420a4e3fbd350e0349a1eb76d0a30cef",
-      "status": "modified"
-    },
-    {
-      "additions": 4,
-      "deletions": 1,
-      "filename": "cf-worker/package.json",
-      "sha": "2b3b51add85862b5b9a818659aadaf5ef32fa379",
-      "status": "modified"
-    },
-    {
-      "additions": 27,
-      "deletions": 13,
-      "filename": "cf-worker/public/assets/app.js",
-      "sha": "1dc447dd446ecb904381e8de0aee32caea572220",
-      "status": "modified"
-    },
-    {
-      "additions": 3,
-      "deletions": 3,
-      "filename": "cf-worker/public/assets/config.js",
-      "sha": "6102942d6af8aecb90b87fea277ca8593c279a30",
-      "status": "modified"
-    },
-    {
-      "additions": 2,
-      "deletions": 0,
-      "filename": "cf-worker/public/assets/style.css",
-      "sha": "e11fee16a84611ddbe905c34cc14ac9ead79d787",
-      "status": "modified"
-    },
-    {
-      "additions": 72,
-      "deletions": 0,
-      "filename": "cf-worker/scripts/canary-ui.mjs",
-      "sha": "5369a622f265b1c3d894426675db4949dc621b41",
-      "status": "added"
-    },
-    {
-      "additions": 50,
-      "deletions": 33,
-      "filename": "cf-worker/scripts/check-frontend-contract.mjs",
-      "sha": "6d23dbc1d893650cbda74414fdf9c9bea7c066aa",
-      "status": "modified"
-    },
-    {
-      "additions": 32,
-      "deletions": 0,
-      "filename": "cf-worker/scripts/generate-api-docs.mjs",
-      "sha": "212572d62ab3b5235866f8e70c63878dee29b33b",
-      "status": "added"
-    },
-    {
-      "additions": 103,
-      "deletions": 0,
-      "filename": "cf-worker/src/api-spec.ts",
-      "sha": "184ee9eeb3353499ecc0c8ea8303542c99e6b1f9",
-      "status": "added"
-    },
-    {
-      "additions": 3,
-      "deletions": 13,
-      "filename": "cf-worker/src/config.ts",
-      "sha": "cef4537967d6369261d549acb1b0d257136ca741",
-      "status": "modified"
-    },
-    {
-      "additions": 23,
-      "deletions": 11,
-      "filename": "cf-worker/src/harness.ts",
-      "sha": "0d63679b290714ca0b0e6e5f21931fcd69efa044",
-      "status": "modified"
-    },
-    {
-      "additions": 4,
-      "deletions": 2,
-      "filename": "cf-worker/src/index.ts",
-      "sha": "4514270a67b28c47cd335fe92c469332be4362be",
-      "status": "modified"
-    },
-    {
-      "additions": 1,
-      "deletions": 0,
-      "filename": "cf-worker/src/messages.ts",
-      "sha": "089724208790407b004f1fb88a50572b59bafc13",
-      "status": "modified"
-    },
-    {
-      "additions": 60,
-      "deletions": 0,
-      "filename": "cf-worker/test/api-contract.spec.ts",
-      "sha": "05657739d80281a99d6c03949ee7acf3e603d443",
-      "status": "added"
-    },
-    {
-      "additions": 1,
-      "deletions": 0,
-      "filename": "cf-worker/tsconfig.json",
-      "sha": "cd3ddfbcb23bc56c974ddd11d3404fa340e412d3",
-      "status": "modified"
-    },
-    {
-      "additions": 7,
-      "deletions": 0,
-      "filename": "docs/INDEX.md",
-      "sha": "d2ab48561f0815eac2678b6e5de049f52ab606e3",
-      "status": "modified"
-    },
-    {
-      "additions": 4,
-      "deletions": 0,
-      "filename": "docs/agents/PROTOCOL.md",
-      "sha": "5916eb57f627ac4ec9175e49a318719586f9e8c8",
-      "status": "modified"
-    }
+    {"additions": 1, "deletions": 1, "filename": ".github/dependabot.yml", "sha": "e8eeb9d436273a66b84b372b61607758f7b0d15b", "status": "modified"},
+    {"additions": 158, "deletions": 0, "filename": ".github/workflows/decommission-worker.yml", "sha": "c54f993571d9c8d6039b2b1f1bca32c56f2b47e7", "status": "added"},
+    {"additions": 36, "deletions": 11, "filename": ".github/workflows/deploy-dsh-edge.yml", "sha": "571bb9d4dc5239aecf3352b4915d3c313257b848", "status": "modified"},
+    {"additions": 114, "deletions": 0, "filename": ".github/workflows/deploy-pulse.yml", "sha": "db5232c22cbaa57a9a9a8e7cc2319e3cb538fe97", "status": "added"},
+    {"additions": 0, "deletions": 148, "filename": ".github/workflows/deploy-worker.yml", "sha": "16dcb93898017c91f71693f9594b082a91e4aa20", "status": "removed"},
+    {"additions": 8, "deletions": 7, "filename": ".github/workflows/hands.yml", "sha": "a87fd30f567cde38ccf31a5b5967694f9b7d5b35", "status": "modified"},
+    {"additions": 24, "deletions": 5, "filename": ".github/workflows/repo-ci.yml", "sha": "c5bf6a2735913f70e03a68a007cf7c0866b897b0", "status": "modified"},
+    {"additions": 0, "deletions": 5, "filename": ".github/workflows/worker.yml", "sha": "30130fdd2ef019913e5a0312ab834874745d0a00", "status": "modified"},
+    {"additions": 2, "deletions": 2, "filename": "AGENTS.md", "sha": "1f0da84eab66e5d293f59a56ccb6568638da7292", "status": "modified"},
+    {"additions": 9, "deletions": 6, "filename": "README.md", "sha": "35e1a6413807bd563b4f488ef5c245609fb2bf07", "status": "modified"},
+    {"additions": 40, "deletions": 0, "filename": "cf-pulse/README.md", "sha": "dff50ac7d68b08b42ae58d76dc30796abb033d38", "status": "added"},
+    {"additions": 15, "deletions": 0, "filename": "cf-pulse/package.json", "sha": "c0682f19db0f3fef99f54576738e6c329dbb0a77", "status": "added"},
+    {"additions": 43, "deletions": 0, "filename": "cf-pulse/src/config.ts", "sha": "791665dce426d873fcb0507f4cd02c4eb2cfe060", "status": "added"},
+    {"additions": 19, "deletions": 0, "filename": "cf-pulse/src/decision.ts", "sha": "aa14d628b5050041c00b3f72785eed3f1a9f36c6", "status": "added"},
+    {"additions": 12, "deletions": 0, "filename": "cf-pulse/src/env.d.ts", "sha": "9526b5f02da1668b00f6e60f6a96678a2a0bd6fc", "status": "added"},
+    {"additions": 123, "deletions": 0, "filename": "cf-pulse/src/index.ts", "sha": "d04131ebdeea4ee04229e4fc00c07b2d8e097511", "status": "added"},
+    {"additions": 46, "deletions": 0, "filename": "cf-pulse/test/decision.test.ts", "sha": "d7a9826605e39fb3c5d1642436335be405d1e5e8", "status": "added"},
+    {"additions": 14, "deletions": 0, "filename": "cf-pulse/wrangler.jsonc", "sha": "3267f559def4858fe4198faa9dca9a10985177cc", "status": "added"},
+    {"additions": 0, "deletions": 6, "filename": "cf-worker/.dev.vars.example", "sha": "addba9c96dc2ab09a13973b5bb047cb732f310ea", "status": "removed"},
+    {"additions": 0, "deletions": 3, "filename": "cf-worker/.dockerignore", "sha": "073e02da0a11565b06f259988e2cd48894f5b183", "status": "removed"},
+    {"additions": 0, "deletions": 15, "filename": "cf-worker/Dockerfile", "sha": "03f66ef603bd1a58670897a21adc1b6df1fae07c", "status": "removed"},
+    {"additions": 0, "deletions": 100, "filename": "cf-worker/README.md", "sha": "7d649c3c7f65d9415facd8a12e77278e95585b65", "status": "removed"},
+    {"additions": 0, "deletions": 56, "filename": "cf-worker/api-spec.json", "sha": "0ecdd8af810997017deff881c1d18ca7acc2b5bd", "status": "removed"},
+    {"additions": 0, "deletions": 3251, "filename": "cf-worker/package-lock.json", "sha": "a43519c3f6c8a4465876573dd43c57e3857986c2", "status": "removed"},
+    {"additions": 0, "deletions": 24, "filename": "cf-worker/package.json", "sha": "592a46451f734515973ba2d773ff768b43c74ad2", "status": "removed"},
+    {"additions": 0, "deletions": 316, "filename": "cf-worker/public/assets/app.js", "sha": "9b337d2e0c6e5d03cb0621a4740e72d51932bbd1", "status": "removed"},
+    {"additions": 0, "deletions": 22, "filename": "cf-worker/public/assets/config.js", "sha": "06d1b261a0b9d0bf9759558e1ac00495e07d277a", "status": "removed"},
+    {"additions": 0, "deletions": 36, "filename": "cf-worker/public/assets/i18n/ru.js", "sha": "765d5168de274ee4bc2118139e5640ef9da5673d", "status": "removed"},
+    {"additions": 0, "deletions": 61, "filename": "cf-worker/public/assets/style.css", "sha": "e11fee16a84611ddbe905c34cc14ac9ead79d787", "status": "removed"},
+    {"additions": 0, "deletions": 54, "filename": "cf-worker/public/index.html", "sha": "2c5722a1f99e2764262f72a0696c61d773be52c5", "status": "removed"},
+    {"additions": 0, "deletions": 130, "filename": "cf-worker/scripts/canary-ui.mjs", "sha": "f36d77fa2c4c09f010ba489351f3066b9f13c191", "status": "removed"},
+    {"additions": 0, "deletions": 84, "filename": "cf-worker/scripts/check-frontend-contract.mjs", "sha": "e219e975e23f35b9632f8f471ed1e347b3d04cac", "status": "removed"},
+    {"additions": 0, "deletions": 86, "filename": "cf-worker/scripts/generate-api-docs.mjs", "sha": "0d4eaa266ab5999d726533dfe8c6673ecf5a91fc", "status": "removed"},
+    {"additions": 0, "deletions": 130, "filename": "cf-worker/scripts/smoke-local.mjs", "sha": "f353f9ce0e79731469f8df93bfcfcbe7d1ebb46e", "status": "removed"},
+    {"additions": 0, "deletions": 115, "filename": "cf-worker/src/api-spec.ts", "sha": "63c6ec5eb2ec318eadc085a00fb23659c2e1b32b", "status": "removed"},
+    {"additions": 0, "deletions": 81, "filename": "cf-worker/src/config.ts", "sha": "6b3d4ad3b3e1c407913bb6038b9034f8789a3a0d", "status": "removed"},
+    {"additions": 0, "deletions": 772, "filename": "cf-worker/src/harness.ts", "sha": "737aeb75b71d7124e8b8ab209a5d369cc0e50f6c", "status": "removed"},
+    {"additions": 0, "deletions": 18, "filename": "cf-worker/src/index.ts", "sha": "4514270a67b28c47cd335fe92c469332be4362be", "status": "removed"},
+    {"additions": 0, "deletions": 41, "filename": "cf-worker/src/messages.ts", "sha": "5af6883feef3b6537ab8b97913c90fd5a05ace17", "status": "removed"},
+    {"additions": 0, "deletions": 60, "filename": "cf-worker/test/api-contract.spec.ts", "sha": "05657739d80281a99d6c03949ee7acf3e603d443", "status": "removed"},
+    {"additions": 0, "deletions": 406, "filename": "cf-worker/test/harness.spec.ts", "sha": "fd768c9dfdaef4b58308d9d410235f4de05c37f7", "status": "removed"},
+    {"additions": 0, "deletions": 26, "filename": "cf-worker/test/pulse.spec.ts", "sha": "4ec9dc84d086e9069692feb705e75ee4735e275b", "status": "removed"},
+    {"additions": 0, "deletions": 16, "filename": "cf-worker/tsconfig.json", "sha": "29b6fe78df512efdd0e32ff58ec124ae55a0f22a", "status": "removed"},
+    {"additions": 0, "deletions": 20, "filename": "cf-worker/vitest.config.ts", "sha": "9d09a6cd7fe3c9f6ae371dbb4671e247cc9efdda", "status": "removed"},
+    {"additions": 0, "deletions": 15373, "filename": "cf-worker/worker-configuration.d.ts", "sha": "7851c1dfc88059d5a4997843a81f30172fad2228", "status": "removed"},
+    {"additions": 0, "deletions": 45, "filename": "cf-worker/wrangler.jsonc", "sha": "bec9ad680fba6dca2184eb99095e1809e25f60e1", "status": "removed"},
+    {"additions": 5, "deletions": 4, "filename": "docs/agents/PROTOCOL.md", "sha": "e05154961b0c510fb7fc56fbb317bd3dddf9867f", "status": "modified"},
+    {"additions": 4, "deletions": 7, "filename": "docs/agents/ROADMAP.md", "sha": "d4d5b17c0448c0be83311d54b47f4b012c9cf3dd", "status": "modified"},
+    {"additions": 0, "deletions": 36, "filename": "docs/api.md", "sha": "986b48076728de472bd6ed320df98f5f967e58d3", "status": "removed"},
+    {"additions": 7, "deletions": 3, "filename": "docs/decisions/0004-api-contract.md", "sha": "ab8b6affe35d8f6c2be8636ddc77e301d676b9f3", "status": "modified"},
+    {"additions": 10, "deletions": 6, "filename": "docs/decisions/0008-narrow-dispatch-token.md", "sha": "2bbf20d58f9a7ebd12b2766df19ca96e6cd016f1", "status": "modified"},
+    {"additions": 13, "deletions": 12, "filename": "docs/research/12-dsh-edge-session-api.md", "sha": "6c53b611dc65bc441ee07f9e2daab9a5ae22a847", "status": "modified"},
+    {"additions": 6, "deletions": 3, "filename": "docs/research/21-github-actions.md", "sha": "83f40ad2c3a41a04d70514f0c1bb56bdb3d39fa3", "status": "modified"},
+    {"additions": 9, "deletions": 1, "filename": "dsh-edge/PATCHES.md", "sha": "fecd004f24d7f1e33c4fd1dcc0d1e74df1e2d545", "status": "modified"},
+    {"additions": 270, "deletions": 0, "filename": "dsh-edge/patches/0005-harness-pipeline-view.patch", "sha": "e385653970d622994b417734178d6626602c4951", "status": "added"},
+    {"additions": 225, "deletions": 0, "filename": "dsh-edge/pipeline-integration/check.mjs", "sha": "137d2bf43d3c1e8d6bd560856764ea6b627da820", "status": "added"},
+    {"additions": 195, "deletions": 0, "filename": "openspec/changes/edge-harness-decommission/design.md", "sha": "78e496461bd8b4487b084a42211f8993f810eecd", "status": "added"},
+    {"additions": 68, "deletions": 0, "filename": "openspec/changes/edge-harness-decommission/proposal.md", "sha": "fc38f3227db6cc3a36f407c46aab3fd8cfe75857", "status": "added"},
+    {"additions": 63, "deletions": 0, "filename": "openspec/changes/edge-harness-decommission/tasks.md", "sha": "f3603f3821635f2ddab4817ee9311e8111661dcb", "status": "added"},
+    {"additions": 111, "deletions": 94, "filename": "openspec/specs/journal-tasks-hands.md", "sha": "294ffa1b5c3e49babec2216c565e45b68007e07f", "status": "modified"},
+    {"additions": 5, "deletions": 5, "filename": "plugins-src/integrations/src/body.js", "sha": "d15b3806b3f4ef10d13d7afb97308d42a5149454", "status": "modified"},
+    {"additions": 2, "deletions": 2, "filename": "plugins-src/integrations/test/client.test.mjs", "sha": "a38c757c235c39dfb5a0f073ce6ecd5737c35e10", "status": "modified"},
+    {"additions": 9, "deletions": 8, "filename": "plugins-src/plugin-manager/src/body.js", "sha": "c0fcd5219df907f447999f9dd1892a206e567e76", "status": "modified"},
+    {"additions": 1, "deletions": 1, "filename": "plugins-src/plugin-manager/test/client.test.mjs", "sha": "630733bcb438e47bf14ad94a62a142f9db626602", "status": "modified"},
+    {"additions": 0, "deletions": 77, "filename": "scripts/canary-dispatch.sh", "sha": "c4adfa7d0bb39d3934fe47b4f9ca7c6697082ff6", "status": "removed"},
+    {"additions": 48, "deletions": 121, "filename": "scripts/hands/dsh_task.sh", "sha": "8119aaafa603ac9f1f91d99c389512d41b49483e", "status": "modified"},
+    {"additions": 138, "deletions": 0, "filename": "scripts/lib/dsh-edge-pipeline.sh", "sha": "0afe1d59fc713f8b6d5dff1856b9105fc1bfbceb", "status": "added"},
+    {"additions": 0, "deletions": 99, "filename": "scripts/lib/journal_status.sh", "sha": "bd610853b7da477b9b70ed14ff70d64820360a44", "status": "removed"},
+    {"additions": 35, "deletions": 40, "filename": "scripts/lib/test/dsh-clients.smoke.sh", "sha": "fd48aa1b76698608e3836daf49ea8721814d255a", "status": "modified"},
+    {"additions": 16, "deletions": 11, "filename": "scripts/lib/test_dispatch_token_usage.py", "sha": "98616bb2f0255d2e5bb9a35012370cc2a923ff25", "status": "modified"},
+    {"additions": 15, "deletions": 7, "filename": "scripts/orchestra/scheduler.py", "sha": "79e0c5e423a0487053994e6559883e3c16b7fcf8", "status": "modified"},
+    {"additions": 40, "deletions": 0, "filename": "scripts/orchestra/test_scheduler.py", "sha": "238355e29daa697be6131defdbbb384288ef23ec", "status": "modified"},
+    {"additions": 11, "deletions": 10, "filename": "scripts/plugins/integration_status.sh", "sha": "2343104c035e4b533cdfb932d3cce8524e26e7d5", "status": "modified"},
+    {"additions": 13, "deletions": 13, "filename": "scripts/plugins/plugin_status.sh", "sha": "686052e3135fe58179ea7cfe2fb1a6b3eed347d1", "status": "modified"},
+    {"additions": 99, "deletions": 100, "filename": "scripts/plugins/test/status-scripts.smoke.sh", "sha": "100df833689fc169f385834eb5130ea9317083d0", "status": "modified"},
+    {"additions": 5, "deletions": 26, "filename": "scripts/worker/task.sh", "sha": "8d801c43dbb8b136983b77c534a405c4d29c8a57", "status": "modified"},
+    {"additions": 11, "deletions": 0, "filename": ".gitattributes", "sha": "002dccba69d2491674b61ebc6cea1ef7d80fb2ed", "status": "added"},
+    {"additions": 9, "deletions": 0, "filename": ".github/workflows/deploy-worker.yml", "sha": "65ad03cbb76e5c908a443801c56176ee8c21ae91", "status": "modified"},
+    {"additions": 34, "deletions": 0, "filename": ".github/workflows/worker-ci.yml", "sha": "7aa9391b9927aa738d637cc472446e8ef45109fc", "status": "modified"},
+    {"additions": 3, "deletions": 0, "filename": "cf-worker/.dockerignore", "sha": "073e02da0a11565b06f259988e2cd48894f5b183", "status": "added"},
+    {"additions": 15, "deletions": 0, "filename": "cf-worker/Dockerfile", "sha": "03f66ef603bd1a58670897a21adc1b6df1fae07c", "status": "added"},
+    {"additions": 7, "deletions": 7, "filename": "cf-worker/README.md", "sha": "a0f56d898ca960f0f628f0dcea85feb69a543402", "status": "modified"},
+    {"additions": 49, "deletions": 0, "filename": "cf-worker/api-spec.json", "sha": "3935d7cafa5c1b3806e924e18a9daa7289680e69", "status": "added"},
+    {"additions": 48, "deletions": 0, "filename": "cf-worker/package-lock.json", "sha": "a297b76d420a4e3fbd350e0349a1eb76d0a30cef", "status": "modified"},
+    {"additions": 4, "deletions": 1, "filename": "cf-worker/package.json", "sha": "2b3b51add85862b5b9a818659aadaf5ef32fa379", "status": "modified"},
+    {"additions": 27, "deletions": 13, "filename": "cf-worker/public/assets/app.js", "sha": "1dc447dd446ecb904381e8de0aee32caea572220", "status": "modified"},
+    {"additions": 3, "deletions": 3, "filename": "cf-worker/public/assets/config.js", "sha": "6102942d6af8aecb90b87fea277ca8593c279a30", "status": "modified"},
+    {"additions": 2, "deletions": 0, "filename": "cf-worker/public/assets/style.css", "sha": "e11fee16a84611ddbe905c34cc14ac9ead79d787", "status": "modified"},
+    {"additions": 72, "deletions": 0, "filename": "cf-worker/scripts/canary-ui.mjs", "sha": "5369a622f265b1c3d894426675db4949dc621b41", "status": "added"},
+    {"additions": 50, "deletions": 33, "filename": "cf-worker/scripts/check-frontend-contract.mjs", "sha": "6d23dbc1d893650cbda74414fdf9c9bea7c066aa", "status": "modified"},
+    {"additions": 32, "deletions": 0, "filename": "cf-worker/scripts/generate-api-docs.mjs", "sha": "212572d62ab3b5235866f8e70c63878dee29b33b", "status": "added"},
+    {"additions": 103, "deletions": 0, "filename": "cf-worker/src/api-spec.ts", "sha": "184ee9eeb3353499ecc0c8ea8303542c99e6b1f9", "status": "added"},
+    {"additions": 3, "deletions": 13, "filename": "cf-worker/src/config.ts", "sha": "cef4537967d6369261d549acb1b0d257136ca741", "status": "modified"},
+    {"additions": 23, "deletions": 11, "filename": "cf-worker/src/harness.ts", "sha": "0d63679b290714ca0b0e6e5f21931fcd69efa044", "status": "modified"},
+    {"additions": 4, "deletions": 2, "filename": "cf-worker/src/index.ts", "sha": "4514270a67b28c47cd335fe92c469332be4362be", "status": "modified"},
+    {"additions": 1, "deletions": 0, "filename": "cf-worker/src/messages.ts", "sha": "089724208790407b004f1fb88a50572b59bafc13", "status": "modified"},
+    {"additions": 60, "deletions": 0, "filename": "cf-worker/test/api-contract.spec.ts", "sha": "05657739d80281a99d6c03949ee7acf3e603d443", "status": "added"},
+    {"additions": 1, "deletions": 0, "filename": "cf-worker/tsconfig.json", "sha": "cd3ddfbcb23bc56c974ddd11d3404fa340e412d3", "status": "modified"},
+    {"additions": 7, "deletions": 0, "filename": "docs/INDEX.md", "sha": "d2ab48561f0815eac2678b6e5de049f52ab606e3", "status": "modified"},
+    {"additions": 4, "deletions": 0, "filename": "docs/agents/PROTOCOL.md", "sha": "5916eb57f627ac4ec9175e49a318719586f9e8c8", "status": "modified"}
   ],
   "page2": [
-    {
-      "additions": 32,
-      "deletions": 0,
-      "filename": "docs/api.md",
-      "sha": "ce527edab2a5aeb527cdf53a60f52893b661dde1",
-      "status": "added"
-    },
-    {
-      "additions": 64,
-      "deletions": 0,
-      "filename": "docs/decisions/0003-dispatch-latency-verdict.md",
-      "sha": "3ed9c666207d8c2ea3ac7c55c6f17bf7d8dbbe2b",
-      "status": "added"
-    },
-    {
-      "additions": 58,
-      "deletions": 0,
-      "filename": "docs/decisions/0004-api-contract.md",
-      "sha": "c5026b00684956b267c0f9eadfb1206c93913e9c",
-      "status": "added"
-    },
-    {
-      "additions": 10,
-      "deletions": 0,
-      "filename": "docs/research/22-cf-testing-toolchain.md",
-      "sha": "48f37486d9336e78f09c4859b29937032074fb21",
-      "status": "modified"
-    },
-    {
-      "additions": 36,
-      "deletions": 2,
-      "filename": "docs/research/99-open-questions.md",
-      "sha": "6f6a3d99aabd2f589c764ed59d2ea4f262a43b01",
-      "status": "modified"
-    },
-    {
-      "additions": 23,
-      "deletions": 0,
-      "filename": "docs/research/data/dispatch-latency-2026-08-28.csv",
-      "sha": "f31078355f009c05f9f90a8172d2ace80ea3fe64",
-      "status": "added"
-    },
-    {
-      "additions": 25,
-      "deletions": 18,
-      "filename": "openspec/changes/walking-skeleton/tasks.md",
-      "sha": "f2e060907eda834f5331428e1740a7f6d396d79b",
-      "status": "modified"
-    },
-    {
-      "additions": 22,
-      "deletions": 4,
-      "filename": "scripts/orchestra/scheduler.py",
-      "sha": "76f48af7d39a385f087c0c03752ce94493224285",
-      "status": "modified"
-    }
+    {"additions": 32, "deletions": 0, "filename": "docs/api.md", "sha": "ce527edab2a5aeb527cdf53a60f52893b661dde1", "status": "added"},
+    {"additions": 22, "deletions": 4, "filename": "scripts/orchestra/scheduler.py", "sha": "76f48af7d39a385f087c0c03752ce94493224285", "status": "modified"}
   ],
   "page2_edited": [
-    {
-      "additions": 32,
-      "deletions": 0,
-      "filename": "docs/api.md",
-      "sha": "ce527edab2a5aeb527cdf53a60f52893b661dde1",
-      "status": "added"
-    },
-    {
-      "additions": 64,
-      "deletions": 0,
-      "filename": "docs/decisions/0003-dispatch-latency-verdict.md",
-      "sha": "3ed9c666207d8c2ea3ac7c55c6f17bf7d8dbbe2b",
-      "status": "added"
-    },
-    {
-      "additions": 58,
-      "deletions": 0,
-      "filename": "docs/decisions/0004-api-contract.md",
-      "sha": "c5026b00684956b267c0f9eadfb1206c93913e9c",
-      "status": "added"
-    },
-    {
-      "additions": 10,
-      "deletions": 0,
-      "filename": "docs/research/22-cf-testing-toolchain.md",
-      "sha": "48f37486d9336e78f09c4859b29937032074fb21",
-      "status": "modified"
-    },
-    {
-      "additions": 36,
-      "deletions": 2,
-      "filename": "docs/research/99-open-questions.md",
-      "sha": "6f6a3d99aabd2f589c764ed59d2ea4f262a43b01",
-      "status": "modified"
-    },
-    {
-      "additions": 23,
-      "deletions": 0,
-      "filename": "docs/research/data/dispatch-latency-2026-08-28.csv",
-      "sha": "f31078355f009c05f9f90a8172d2ace80ea3fe64",
-      "status": "added"
-    },
-    {
-      "additions": 25,
-      "deletions": 18,
-      "filename": "openspec/changes/walking-skeleton/tasks.md",
-      "sha": "f2e060907eda834f5331428e1740a7f6d396d79b",
-      "status": "modified"
-    },
-    {
-      "additions": 22,
-      "deletions": 4,
-      "filename": "scripts/orchestra/scheduler.py",
-      "sha": "c54f993571d9c8d6039b2b1f1bca32c56f2b47e7",
-      "status": "modified"
-    }
+    {"additions": 32, "deletions": 0, "filename": "docs/api.md", "sha": "ce527edab2a5aeb527cdf53a60f52893b661dde1", "status": "added"},
+    {"additions": 22, "deletions": 4, "filename": "scripts/orchestra/scheduler.py", "sha": "c54f993571d9c8d6039b2b1f1bca32c56f2b47e7", "status": "modified"}
   ]
 }

@@ -48,3 +48,25 @@
       «Что вне рамок» и `docs/agents/LABELS.md` приведены в соответствие с
       реальным механизмом (workflow_run, не метка), ссылки в форме
       `file::symbol`.
+
+## Правка после вердикта AI-ревью PR #294 (четыре находки)
+
+- [x] `scripts/lib/review_labels.py::latest_ai_comment` /
+      `scripts/review/file_tasks.py::latest_review_comment` — дыра
+      безопасности: комментарий с шапкой `reviewer:` принимался от ЛЮБОГО
+      автора (репозиторий публичный, `diff:` вычислим кем угодно из
+      публичного `pulls/{n}/files`). Фильтр по автору
+      (`_is_trusted_verdict_author`, `github-actions[bot]`/`Bot`), тест
+      воспроизводит атаку и доказан мутацией (снят фильтр — тест краснеет).
+- [x] `docs/agents/LABELS.md`, строка `ai:failed` — фраза «при неизменном
+      диффе новый пуш не перезапускает» была противоположна коду
+      (`should_run_ai_review` для `ai:failed` не пропускает никогда);
+      исправлено на «перезапускает, таймер #196 — независимый путь».
+- [x] `proposal.md` — критерий направления 1 переформулирован: метрика —
+      число ДОРОГИХ прогонов (дошедших до шага gather), не общее число
+      стартов `ai-review.yml` (`workflow_run`-триггер не тронут); добавлен
+      `gh api`-запрос для подсчёта.
+- [x] `scripts/lib/test_review_labels.py::test_diff_fingerprint_misses_tail_edit_without_pagination_pr294` —
+      тавтологичное сравнение `diff_fingerprint(page1) == diff_fingerprint(page1)`
+      (одинаковый вход) снято; защита от регресса «прод-код читает только
+      первую страницу» — grep-гвардии в `test_check_pr.py`/`test_ai_review.py`.
