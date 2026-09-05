@@ -1,6 +1,6 @@
 {
   "name": "@edge-harness/dsh-plugin-runner-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "dsh-edge edge plugin: runner_task and runner_status tools that delegate server-side work to the edge-harness runner (GitHub Actions worker) and report its progress back to the chat",
   "type": "module",
   "main": "server/index.js",
