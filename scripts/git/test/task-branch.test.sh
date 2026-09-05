@@ -167,13 +167,21 @@ else
 fi
 
 # ── случай 7: gh не установлен — предупреждение, ветка заводится ────────────
-# PATH без каталогов, где лежит хоть какой-то `gh` (фейковый из $WORK/bin
-# или настоящий из системного PATH) — портируемо между Windows/Linux, без
-# завязки на имя каталога. На GitHub-раннерах gh и bash оба лежат в /usr/bin —
-# та же чистка вынесла бы и bash: PATH="$safe_path" bash… не находит команду
-# `bash` (assignment-префикс простой команды режет PATH и для её собственного
-# поиска, не только для дочернего процесса — проверено). Резолвим bash
-# абсолютным путём ДО чистки, зовём по нему — сам bash от PATH не зависит.
+# Вычитание каталогов из PATH (первая попытка) ломалось на GitHub-раннере:
+# там git/grep/bash/gh все живут в ОДНОМ /usr/bin, и вычёркивание каталога
+# с gh вычёркивает вместе с ним и git, и grep, которыми пользуется сам
+# task-branch (не только bash — тот уже резолвится абсолютным путём). Голый
+# каталог символических ссылок вместо PATH тоже не универсален: на Windows
+# динамический линкер ищет DLL рядом с запускаемым файлом по каталогу
+# СИМЛИНКА, а не по каталогу цели — grep/git оттуда падают на "cannot open
+# shared object file" (в Linux этой проблемы нет — там разрешение библиотек
+# не завязано на PATH). Комбинация: safe_path (каталоги без gh) — ПЕРВЫМ,
+# им покрыт случай «gh лежит отдельно от остальных инструментов» (Windows
+# здесь и локальная разработка) без риска для DLL; shim (символические
+# ссылки на нужные внешние команды без gh) — ВТОРЫМ, страхует случай «gh
+# живёт в том же каталоге, что и остальные инструменты» (GitHub-раннер),
+# где safe_path вычёркивает и их, но PATH там не нужен для разрешения
+# библиотек.
 bash_bin="$(command -v bash)"
 safe_path=""
 IFS=':' read -ra _dirs <<<"$PATH"
@@ -184,11 +192,18 @@ for _d in "${_dirs[@]}"; do
   fi
 done
 safe_path="${safe_path#:}"
+shim="$WORK/shim-no-gh"
+mkdir -p "$shim"
+for tool in git grep sed cut mktemp cat rm; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$tool_path" ] || { note "случай 7: инструмент $tool не найден в окружении теста — ОШИБКА"; fail=1; continue; }
+  ln -sf "$tool_path" "$shim/$tool"
+done
 
 make_tree "case7"
 if (
   cd "$WORK/case7"
-  PATH="$safe_path" "$bash_bin" "$SCRIPT_SRC" "67-no-gh"
+  PATH="$safe_path:$shim" "$bash_bin" "$SCRIPT_SRC" "67-no-gh"
 ) 2>"$WORK/case7.stderr"; then
   branch=$(git -C "$WORK/case7" branch --show-current)
   if [ "$branch" = "agent/67-no-gh" ]; then
