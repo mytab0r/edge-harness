@@ -443,13 +443,20 @@ jobs:
         env:
           HARNESS_URL: ${{ vars.HARNESS_URL }}
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          # inputs.plugin_path может содержать "/" (напр. plugins-src/my-plugin) —
-          # невалидный id для plugin_status.sh; basename хотя бы убирает путь,
-          # если провалидированный plugin_id ещё не вычислен.
-          PLUGIN_ID: ${{ inputs.plugin_id || 'unknown' }}
+          # inputs.plugin_id опционален и при обычном запуске пуст — фолбэк
+          # вычисляется В BASH от inputs.plugin_path (basename), а не на
+          # уровне expression: `inputs.plugin_id || 'unknown'` не подставляет
+          # basename никогда, единственное падение реального плагина уезжало
+          # в plugin:unknown, и таймлайн плагина вечно висел на deploying
+          # (находка AI-ревью PR #273 — комментарий обещал basename, в коде
+          # он не применялся).
+          PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
+          PLUGIN_PATH: ${{ inputs.plugin_path }}
           STATE: failed
           SOURCE: forge
           DETAIL: "форж упал: см. лог job ${{ github.run_id }}"
           FINAL: "1"
         run: |
+          PLUGIN_ID="${PLUGIN_ID_INPUT:-$(basename "$PLUGIN_PATH")}"
+          PLUGIN_ID="${PLUGIN_ID:-unknown}"
           PLUGIN_ID="$PLUGIN_ID" STATE=failed SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh || true
