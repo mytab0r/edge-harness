@@ -95,8 +95,10 @@ pulse_guard.py, как и были, — сюда не дублируются, а
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import NamedTuple
 
 from pulse_guard import (
@@ -108,6 +110,13 @@ from pulse_guard import (
     parse_time,
     post_issue_comment,
 )
+
+# list_pages — обход страниц GitHub API (класс #308), одно место правды в
+# scripts/lib/review_labels.py (тот же приём, что scheduler.py/repo_invariants.py).
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
 # ── Пороги (одно место правды этого детектора) ────────────────────────────
 
@@ -226,7 +235,11 @@ def _evidence_marker(fingerprint: str, evidence_text: str) -> str:
 
 
 def open_auto_tasks(repo: str) -> list[dict]:
-    issues = gh(f"repos/{repo}/issues?state=open&labels={AUTO_LABEL}&per_page=100") or []
+    """Постранично (review_labels.list_pages, класс #308) — сырой
+    одностраничный вызов молча терял бы автозадачи за первой сотней открытых
+    issues с меткой auto-detected (находка гвардии test_pagination_guard.py)."""
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=open&labels={AUTO_LABEL}&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
@@ -296,8 +309,11 @@ def create_task(repo: str, fingerprint: str, evidence: list[str], run_url: str |
 def auto_tasks_created_since(repo: str, since: datetime) -> int:
     """Все issues (открытые и закрытые) с меткой auto-detected, созданные не
     раньше `since` — суточный потолок считается по факту создания, не по
-    текущей открытости (закрытая сегодня автозадача всё равно сожгла квоту)."""
-    issues = gh(f"repos/{repo}/issues?state=all&labels={AUTO_LABEL}&per_page=100") or []
+    текущей открытости (закрытая сегодня автозадача всё равно сожгла квоту).
+    Постранично (review_labels.list_pages, класс #308) — сырой одностраничный
+    вызов молча занижал бы потолок после сотни автозадач за всё время."""
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=all&labels={AUTO_LABEL}&per_page=100", gh)
     return sum(
         1 for issue in issues
         if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
@@ -325,8 +341,11 @@ def _closed_task_reset_times(repo: str) -> dict[str, datetime]:
     `age >= STALL_PERSIST_MINUTES` истинно немедленно, и задача заводится по
     одному блипу, не продержавшись ни минуты в ЭТОМ эпизоде. Сайтинги
     старше момента закрытия своей задачи не считаются в счёт нового эпизода
-    — `detect_and_act` отфильтровывает их до вычисления возраста."""
-    issues = gh(f"repos/{repo}/issues?state=closed&labels={AUTO_LABEL}&per_page=100") or []
+    — `detect_and_act` отфильтровывает их до вычисления возраста. Постранично
+    (review_labels.list_pages, класс #308) — сырой одностраничный вызов молча
+    терял бы точки сброса за первой сотней закрытых автозадач."""
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=closed&labels={AUTO_LABEL}&per_page=100", gh)
     resets: dict[str, datetime] = {}
     for issue in issues:
         if "pull_request" in issue or not issue.get("closed_at"):
