@@ -37,20 +37,9 @@ git config core.hooksPath .githooks
 echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
 
 # Печать ключевых граблей инфраструктуры в момент старта задачи, а не когда-нибудь
-# потом «если вспомнить прочитать» (задача #323): task-branch — единственный
-# разрешённый вход в agent-ветку (см. выше и docs/agents/PROTOCOL.md), поэтому это
-# единственное место, которое гарантированно исполняется у КАЖДОГО агента КАЖДЫЙ
-# раз перед первым сетевым вызовом к GitHub/Cloudflare. Полные справочники —
-# docs/agents/INFRA-GH.md и docs/agents/INFRA-CF.md, здесь — только то, что стоит
-# денег времени при незнании.
-cat >&2 <<'DIGEST'
-
-── Инфраструктура: граблям не удивляться (полностью — docs/agents/INFRA-*.md) ──
-GitHub: прокси ОБЯЗАТЕЛЕН перед gh/git — export HTTPS_PROXY=socks5://127.0.0.1:1084
-        (не прошло — 1083, потом 1085; scripts/gh/lib.sh перебирает сам).
-        gh issue/pr view/create — GraphQL, падает чаще gh api. heredoc в bash —
-        блокируется, многострочный текст через Write в файл.
-        scripts/gh/queue.py и pr_blockers.py <N> — что мешает PR слиться.
-Cloudflare: см. docs/agents/INFRA-CF.md (лимиты DO/Workers, если документ уже есть).
-─────────────────────────────────────────────────────────────────────────────
-DIGEST
+# потом «если вспомнить прочитать» (задача #323): task-branch — один из ДВУХ
+# входов в agent-ветку (второй — доводка уже открытого PR в scripts/worker/task.sh,
+# он тоже зовёт print_infra_digest напрямую, минуя этот файл, — см. #326 находка 1).
+# Текст — одно место правды в scripts/gh/infra_digest.sh, не копия здесь.
+source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
+print_infra_digest

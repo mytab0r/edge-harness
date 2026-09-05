@@ -323,6 +323,13 @@ if [ -n "$CONTINUE_PR_NUMBER" ]; then
   # git rebase origin/main — свежесть базы не предполагается, а доказывается.
   git config core.hooksPath .githooks
   echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) чекаутнута для доводки: $(git rev-parse --short HEAD)"
+  # Второй вход в agent-ветку (первый — task-branch ниже): доводка уже
+  # открытого PR не проходит через task-branch, поэтому дайджест граблей
+  # инфраструктуры печатается здесь явно — тем же общим модулем, не второй
+  # копией текста (#326 находка 1: свежий агент на доводке стартовал без
+  # дайджеста, хотя scripts/gh/* нужны там раньше всего).
+  source "$SCRIPT_DIR/../gh/infra_digest.sh"
+  print_infra_digest
 else
   "$SCRIPT_DIR/../git/task-branch" "$number-$slug"
 fi
