@@ -39,14 +39,21 @@ _spec.loader.exec_module(scheduler)
 
 def current_repo() -> str | None:
     """GITHUB_REPOSITORY в CI уже задан; локально — тем же способом, что
-    scripts/git/task-branch применяет для аренды задачи (`gh repo view`)."""
+    scripts/git/task-branch применяет для аренды задачи (`gh repo view`).
+    Офлайн-режима у входа в задачу нет (proposal.md): gh физически
+    отсутствующий (FileNotFoundError) — тот же отказ, что и gh, ответивший
+    ошибкой (returncode != 0) — None, чистый EXIT_ERROR у вызывающего, а не
+    необработанный traceback."""
     repo = os.environ.get("GITHUB_REPOSITORY")
     if repo:
         return repo
-    result = subprocess.run(
-        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
     if result.returncode != 0:
         return None
     repo = result.stdout.strip()
@@ -65,14 +72,17 @@ def open_sub_issues(repo: str, number: int) -> list[dict]:
         "repository(owner:$owner,name:$name){issue(number:$number){"
         "subIssues(first:50){nodes{number title state}}}}}"
     )
-    result = subprocess.run(
-        ["gh", "api", "graphql",
-         "-f", f"query={query}",
-         "-f", f"owner={owner}",
-         "-f", f"name={name}",
-         "-F", f"number={number}"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={query}",
+             "-f", f"owner={owner}",
+             "-f", f"name={name}",
+             "-F", f"number={number}"],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return []
     if result.returncode != 0:
         return []
     try:
@@ -83,6 +93,13 @@ def open_sub_issues(repo: str, number: int) -> list[dict]:
 
 
 def check(repo: str, number: int) -> tuple[bool, dict]:
+    """`sub_issues_summary` подтверждён живым ответом ИМЕННО этого эндпоинта
+    (не только list-эндпоинта `issues?state=open&labels=task`, документ по
+    которому дан в is_epic_issue выше): замер 2026-09-06,
+    `gh api repos/mytab0r/edge-harness/issues/77` вернул
+    `{"total": 8, "completed": 6, "percent_completed": 75}` прямо в ответе
+    одиночной issue — второй сигнал живой на этом эндпоинте тоже, не только
+    на list."""
     issue = scheduler.gh(f"repos/{repo}/issues/{number}")
     return scheduler.is_epic_issue(issue), issue
 
@@ -121,7 +138,7 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
     try:
         is_epic, issue = check(repo, number)
-    except RuntimeError as error:
+    except (RuntimeError, OSError) as error:
         print(f"::error::epic_guard: не удалось проверить #{number} ({error}) — "
               "почини сеть/gh, вход в задачу без этой проверки не даю", file=sys.stderr)
         return EXIT_ERROR

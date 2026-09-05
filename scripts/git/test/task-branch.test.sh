@@ -24,18 +24,55 @@ fail=0
 note() { echo "$@"; }
 
 # ── фейковый gh: маршруты по номеру issue в URL ──────────────────────────────
+# Два потребителя одного бинаря в одном прогоне: «Проверка на входе» (#357/
+# #358, `gh api .../issues/N --jq '[.state, labels] | @tsv'`) и гвардия «PR не
+# заводится на эпик» (#376, `scripts/lib/epic_guard.py` → `gh repo view` +
+# `gh api .../issues/N` БЕЗ --jq, ждёт настоящий JSON). Разветвление по
+# наличию --jq: тот же URL, разный формат ответа — ни один из тестовых issue
+# здесь не эпик (без префикса ЭПИК, sub_issues_summary нулевой), поэтому
+# гвардия эпика везде молча пропускает и не мешает случаям 1-7.
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  echo "o/r"
+  exit 0
+fi
 if [ "$1" = "api" ]; then
-  url="$2"
+  shift
+  has_jq=0
+  url=""
+  for arg in "$@"; do
+    case "$arg" in
+      --jq) has_jq=1 ;;
+      -*) : ;;
+      *) [ -n "$url" ] || url="$arg" ;;
+    esac
+  done
   case "$url" in
-    */issues/61) printf 'open\ttask\n' ;;
-    */issues/62) printf 'closed\ttask\n' ;;
-    */issues/63) printf 'open\t\n' ;;
-    */issues/64) printf 'open\ttask,blocked\n' ;;
+    graphql) echo '{"data":{"repository":{"issue":{"subIssues":{"nodes":[]}}}}}'; exit 0 ;;
+    */issues/61)
+      if [ "$has_jq" = 1 ]; then printf 'open\ttask\n'
+      else echo '{"state":"open","title":"т","labels":[{"name":"task"}],"sub_issues_summary":{"total":0,"completed":0}}'
+      fi ;;
+    */issues/62)
+      if [ "$has_jq" = 1 ]; then printf 'closed\ttask\n'
+      else echo '{"state":"closed","title":"т","labels":[{"name":"task"}],"sub_issues_summary":{"total":0,"completed":0}}'
+      fi ;;
+    */issues/63)
+      if [ "$has_jq" = 1 ]; then printf 'open\t\n'
+      else echo '{"state":"open","title":"т","labels":[],"sub_issues_summary":{"total":0,"completed":0}}'
+      fi ;;
+    */issues/64)
+      if [ "$has_jq" = 1 ]; then printf 'open\ttask,blocked\n'
+      else echo '{"state":"open","title":"т","labels":[{"name":"task"},{"name":"blocked"}],"sub_issues_summary":{"total":0,"completed":0}}'
+      fi ;;
     */issues/65) echo "gh: HTTP 404: Not Found" >&2; exit 1 ;;
     */issues/66) echo "dial tcp: lookup api.github.com: no such host" >&2; exit 1 ;;
+    */issues/67)
+      if [ "$has_jq" = 1 ]; then printf 'open\ttask\n'
+      else echo '{"state":"open","title":"т","labels":[{"name":"task"}],"sub_issues_summary":{"total":0,"completed":0}}'
+      fi ;;
     *) echo "фейковый gh: неизвестный маршрут $url" >&2; exit 1 ;;
   esac
   exit 0
@@ -149,24 +186,35 @@ else
   esac
 fi
 
-# ── случай 6: gh отвечает сетевой ошибкой (не HTTP-код) — предупреждение, НЕ отказ ──
+# ── случай 6: gh отвечает сетевой ошибкой (не HTTP-код) ──────────────────────
+# Проверка «открыта/метки» одна прощает сетевую ошибку (предупреждение,
+# ветка заводится непроверенной), но та же сетевая ошибка бьёт и по gh-вызову
+# гвардии эпика (#376) на том же номере — а для неё offline не прощается
+# (proposal.md: «сбой сети/gh при проверке эпика тоже громкий»). Итог всего
+# скрипта — отказ с обоими сообщениями, не успех.
 make_tree "case6"
 if out=$(run_task_branch "case6" "66-offline" 2>"$WORK/case6.stderr"); then
-  branch=$(git -C "$WORK/case6" branch --show-current)
-  if [ "$branch" = "agent/66-offline" ]; then
-    note "случай 6 (сетевая ошибка gh): ветка заведена непроверенной — ОК"
-  else
-    note "случай 6: ветка не та ($branch) — ОШИБКА"
-    fail=1
-  fi
-  grep -q "ПРЕДУПРЕЖДЕНИЕ" "$WORK/case6.stderr" || { note "случай 6: нет предупреждения — ОШИБКА"; fail=1; }
-else
-  note "случай 6 (сетевая ошибка gh): скрипт отказал — ОШИБКА, ожидалось предупреждение и успех"
-  cat "$WORK/case6.stderr" >&2
+  note "случай 6 (сетевая ошибка gh): скрипт создал ветку — ОШИБКА, ожидался отказ гвардии эпика (офлайн-режима нет)"
   fail=1
+else
+  branch=$(git -C "$WORK/case6" branch --show-current)
+  [ "$branch" = "main" ] || { note "случай 6: ветка всё же переключена на «$branch» — ОШИБКА"; fail=1; }
+  grep -q "ПРЕДУПРЕЖДЕНИЕ" "$WORK/case6.stderr" || { note "случай 6: нет предупреждения проверки «открыта/метки» — ОШИБКА"; fail=1; }
+  grep -q "epic_guard" "$WORK/case6.stderr" || { note "случай 6: нет громкого отказа гвардии эпика — ОШИБКА"; fail=1; }
+  if [ "$fail" = 0 ]; then
+    note "случай 6 (сетевая ошибка gh): предупреждение по задаче + громкий отказ гвардии эпика — ОК"
+  fi
 fi
 
-# ── случай 7: gh не установлен — предупреждение, ветка заводится ────────────
+# ── случай 7: gh не установлен ───────────────────────────────────────────────
+# Проверка «открыта/метки» (#357/#358) без gh — мягкое предупреждение, но
+# гвардия эпика (#376, тот же task-branch, тот же PATH) объявляет прямо в
+# proposal.md: «офлайн-режима у входа в задачу нет… сбой сети/gh при проверке
+# эпика тоже громкий, не тихий пропуск проверки». Цена молчаливого пропуска
+# именно этой проверки — не абстрактная (PR #162, 44 раунда ревью на ветку,
+# привязанную к эпику #77) — выше цены отказа завести ветку офлайн. Поэтому
+# итог всего скрипта на «gh не найден» — отказ (с обоими сообщениями:
+# предупреждение первой проверки + громкая ошибка эпик-гвардии), а не успех.
 # Вычитание каталогов из PATH (первая попытка) ломалось на GitHub-раннере:
 # там git/grep/bash/gh все живут в ОДНОМ /usr/bin, и вычёркивание каталога
 # с gh вычёркивает вместе с ним и git, и grep, которыми пользуется сам
@@ -205,18 +253,16 @@ if (
   cd "$WORK/case7"
   PATH="$safe_path:$shim" "$bash_bin" "$SCRIPT_SRC" "67-no-gh"
 ) 2>"$WORK/case7.stderr"; then
-  branch=$(git -C "$WORK/case7" branch --show-current)
-  if [ "$branch" = "agent/67-no-gh" ]; then
-    note "случай 7 (gh не найден): ветка заведена непроверенной — ОК"
-  else
-    note "случай 7: ветка не та ($branch) — ОШИБКА"
-    fail=1
-  fi
-  grep -q "ПРЕДУПРЕЖДЕНИЕ" "$WORK/case7.stderr" || { note "случай 7: нет предупреждения — ОШИБКА"; fail=1; }
-else
-  note "случай 7 (gh не найден): скрипт отказал — ОШИБКА, ожидался успех с предупреждением"
-  cat "$WORK/case7.stderr" >&2 || true
+  note "случай 7 (gh не найден): скрипт создал ветку — ОШИБКА, ожидался отказ гвардии эпика (офлайн-режима нет)"
   fail=1
+else
+  branch=$(git -C "$WORK/case7" branch --show-current)
+  [ "$branch" = "main" ] || { note "случай 7: ветка всё же переключена на «$branch» — ОШИБКА"; fail=1; }
+  grep -q "ПРЕДУПРЕЖДЕНИЕ" "$WORK/case7.stderr" || { note "случай 7: нет предупреждения проверки «открыта/метки» — ОШИБКА"; fail=1; }
+  grep -q "epic_guard" "$WORK/case7.stderr" || { note "случай 7: нет громкого отказа гвардии эпика — ОШИБКА"; fail=1; }
+  if [ "$fail" = 0 ]; then
+    note "случай 7 (gh не найден): предупреждение по задаче + громкий отказ гвардии эпика — ОК"
+  fi
 fi
 
 if [ "$fail" = 0 ]; then
