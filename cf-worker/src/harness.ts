@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
+import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 import { redact } from "./redact";
@@ -42,6 +42,9 @@ const SCHEMA = [
      UNIQUE(task_id, seq)
    )`,
   `CREATE INDEX IF NOT EXISTS events_by_id ON events(id)`,
+  // Ретеншн (#306/#305): без индекса по ts пачечное удаление старых событий
+  // (RETENTION_TABLES ниже) само превратилось бы в полный скан на каждый тик.
+  `CREATE INDEX IF NOT EXISTS events_by_ts ON events(ts)`,
   `CREATE TABLE IF NOT EXISTS tasks (
      id          TEXT PRIMARY KEY,
      created_ts  INTEGER NOT NULL,
@@ -54,6 +57,12 @@ const SCHEMA = [
   // найти зависшие dispatched-задачи. Индекс сводит эту выборку к текущим
   // dispatched-строкам — их всегда мало, в отличие от истории.
   `CREATE INDEX IF NOT EXISTS tasks_status_dispatch ON tasks(status, dispatch_ts)`,
+  // Ретеншн (#306/#305): пачечное удаление терминальных (done/failed) задач
+  // старше порога фильтрует по (status, created_ts) — без индекса это тоже
+  // была бы полная история на каждый тик. Отдельный индекс от #320 выше:
+  // разное назначение (watchdog по dispatch_ts, ретеншн по created_ts),
+  // разный набор колонок — не задвоение.
+  `CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_ts)`,
   `CREATE TABLE IF NOT EXISTS heartbeat (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
      ts     INTEGER NOT NULL,
@@ -102,6 +111,41 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS messages_by_kind ON messages(kind)`,
   `CREATE INDEX IF NOT EXISTS messages_by_group ON messages(grouped_with)`,
 ];
+
+/**
+ * Ретеншн (#306/#305): одна таблица конфигурации вместо трёх похожих методов —
+ * добавить/поменять политику для очередной таблицы (например `messages`, когда
+ * инбокс #20/PR #173 сольётся) значит дописать строку сюда, а не новый код.
+ * `DELETE ... WHERE id IN (SELECT id FROM ... WHERE cond LIMIT ?)` — портируемая
+ * форма пакетного удаления: DO SQLite нигде не документирует сборку с
+ * SQLITE_ENABLE_UPDATE_DELETE_LIMIT, а вложенный SELECT с LIMIT работает в любой
+ * SQLite. Порядок отбора внутри LIMIT не важен — цель «удалить часть просроченных
+ * за тик», а не «удалить конкретно самые старые первыми».
+ */
+const RETENTION_TABLES = [
+  {
+    name: "events",
+    maxAgeMs: RETENTION.eventsMaxAgeMs,
+    sql: "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE ts < ? LIMIT ?)",
+  },
+  {
+    name: "tasks",
+    maxAgeMs: RETENTION.tasksMaxAgeMs,
+    sql: "DELETE FROM tasks WHERE id IN (SELECT id FROM tasks WHERE status IN ('done', 'failed') AND created_ts < ? LIMIT ?)",
+  },
+] as const;
+
+/** Итог последнего прогона ретеншена (#306/#305) — в памяти объекта, не в SQL:
+ *  это телеметрия про сам процесс чистки, а не данные, ценные после гибернации
+ *  DO. Пересчитывается на первый попавшийся alarm-тик после холодного старта,
+ *  ничего не теряя по существу. `pruned` — сколько строк снято на КАЖДОЙ
+ *  таблице за последний тик; `backlog` — «не успеваем» (см. RETENTION.
+ *  backlogStreakThreshold), не «сработал ли последний тик». */
+export interface RetentionOutcome {
+  ts: number;
+  pruned: Record<string, number>;
+  backlog: boolean;
+}
 
 export interface EventRow {
   id: number;
@@ -198,6 +242,11 @@ export interface Status {
   pulse_stale: boolean;
   /** Inbox: сообщения по статусам. */
   messages: Record<string, number>;
+  /** Ретеншн DO SQLite (#306/#305): исход последнего alarm-тика чистки, `null`
+   *  до первого тика после холодного старта объекта (не поломка — тик ещё не
+   *  случался, см. тот же принцип, что у last_pulse). `backlog: true` — не
+   *  успеваем, морда обязана показать это громко (см. retentionBacklog). */
+  retention: RetentionOutcome | null;
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -428,6 +477,17 @@ export function asObject(value: unknown): Record<string, unknown> | null {
 type IssueOutcome =
   | { ok: true; number: number; url: string; redacted: boolean }
   | { ok: false; retryable: boolean; error: string };
+
+/**
+ * Ретеншн (#306/#305) «не успеваем»: чистая функция порога, проверяется тестом
+ * отдельно от хранилища (тот же приём, что pulseHealthy/pulseStale выше). Один
+ * полный тик после большого бэклога (первый деплой этого change'а, откат) —
+ * не тревога, поэтому порог считает ПОДРЯД идущие полные/упавшие тики, а не
+ * последний тик в одиночку.
+ */
+export function retentionBacklog(consecutiveFullOrFailedTicks: number): boolean {
+  return consecutiveFullOrFailedTicks >= RETENTION.backlogStreakThreshold;
+}
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
 export function constantTimeEqual(a: string, b: string): boolean {
@@ -769,6 +829,7 @@ export class Harness extends DurableObject<Env> {
       pulse_not_configured: pulseNotConfigured(lastPulse),
       pulse_stale: pulseStale(now, lastPulse),
       messages: msgCounts,
+      retention: this.#retentionLast,
     };
   }
 
@@ -1004,6 +1065,14 @@ export class Harness extends DurableObject<Env> {
       return;
     }
 
+    // Ретеншн (#306/#305) — СРАЗУ после успешного setAlarm, ДО ветки «секретов
+    // нет»: на инсталляции без GH_DISPATCH_TOKEN/GH_REPO alarm() иначе
+    // завершался бы ранним return'ом каждый тик, и чистка не бежала бы
+    // никогда, а таблицы продолжали расти вечно — тот же класс проблем, что
+    // подпалил rows_read (#320). #pruneRetention сама изолирует ошибку
+    // каждой таблицы: авария здесь не должна убить dispatch/self-update ниже.
+    this.#pruneRetention(Date.now());
+
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
     // GH_DISPATCH_TOKEN, ни от GH_REPO (п.33 спеки) — при пустом токене пульс
@@ -1067,6 +1136,42 @@ export class Harness extends DurableObject<Env> {
       const detail = error instanceof Error ? error.message : String(error);
       console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
     }
+  }
+
+  /** Ретеншн (#306/#305): в памяти объекта, НЕ в SQL — это телеметрия про сам
+   *  процесс чистки (см. docstring RetentionOutcome), пересчитывается заново
+   *  после каждой гибернации без потери данных по существу. */
+  #retentionStreak = 0;
+  #retentionLast: RetentionOutcome | null = null;
+
+  /**
+   * Одна пачка ретеншена на каждую таблицу из RETENTION_TABLES за alarm-тик:
+   * LIMIT ограничивает объём (RETENTION.batchSize), фильтр идёт по индексу
+   * (events_by_ts / tasks_status_created в SCHEMA) — не полный скан истории.
+   * Каждая таблица в своём try/catch: авария на одной («тот стол уже упал на
+   * квоте rows_written» и т.п.) не должна скрыть чистку другой. Полная пачка
+   * (rowsWritten === batchSize) или ошибка — сигнал «есть ещё что чистить или
+   * чистка сама не работает»; фиксируется как один тик в #retentionStreak,
+   * fail loud — не «тихо доели меньше, чем было нужно».
+   */
+  #pruneRetention(now: number): void {
+    let full = false;
+    const pruned: Record<string, number> = {};
+    for (const table of RETENTION_TABLES) {
+      try {
+        const cursor = this.#sql.exec(table.sql, now - table.maxAgeMs, RETENTION.batchSize);
+        pruned[table.name] = cursor.rowsWritten;
+        if (cursor.rowsWritten >= RETENTION.batchSize) full = true;
+      } catch (error) {
+        full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
+        pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»
+        console.error(
+          `retention prune ${table.name} failed: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+    this.#retentionStreak = full ? this.#retentionStreak + 1 : 0;
+    this.#retentionLast = { ts: now, pruned, backlog: retentionBacklog(this.#retentionStreak) };
   }
 
   /** Текущая строка пульса (issue #269), полное внутреннее представление —
