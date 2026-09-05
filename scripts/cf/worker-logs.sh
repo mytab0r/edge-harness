@@ -14,9 +14,16 @@ source "$dir/lib.sh"
 cf_require_env || exit 1
 
 echo "== Logpush jobs (/accounts/{id}/logpush/jobs) =="
-if cf_get "/accounts/${CLOUDFLARE_ACCOUNT_ID}/logpush/jobs"; then
+# Account-wide список: джобы могут принадлежать другим проектам того же
+# аккаунта — печатаем только количество и dataset/enabled, никогда имя джоба.
+if resp=$(cf_get "/accounts/${CLOUDFLARE_ACCOUNT_ID}/logpush/jobs"); then
+  if command -v jq >/dev/null 2>&1; then
+    echo "$resp" | jq '[.result[]? | {dataset, enabled}]'
+  else
+    echo "jq недоступен — количество не посчитано, сырьё не печатаю."
+  fi
   echo
-  echo "Пусто/список выше = логи воркера НЕ архивируются нигде: окно для чтения нет."
+  echo "Пусто = логи воркера НЕ архивируются нигде: окна для чтения прошлого нет."
   echo "Живые логи в моменте: 'npx wrangler tail edge-harness' из cf-worker/ (нужен CLOUDFLARE_API_TOKEN, интерактивно, не для CI)."
 else
   echo

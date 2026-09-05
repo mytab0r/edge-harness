@@ -18,8 +18,8 @@ section() { echo; echo "== $1 =="; }
 section "Токен: что он может (/user/tokens/verify)"
 cf_get "/user/tokens/verify"
 
-section "Воркеры аккаунта (/accounts/{id}/workers/scripts)"
-cf_get "/accounts/${acc}/workers/scripts"
+section "Воркеры проекта (/workers/scripts, отфильтровано до edge-harness/dsh-edge — аккаунт общий с другими проектами владельца)"
+cf_workers_own
 
 section "Последний деплой edge-harness (/workers/scripts/edge-harness/deployments)"
 cf_get "/accounts/${acc}/workers/scripts/edge-harness/deployments"
@@ -30,20 +30,20 @@ cf_get "/accounts/${acc}/workers/scripts/edge-harness/settings"
 section "Поддомен workers.dev (/workers/subdomain)"
 cf_get "/accounts/${acc}/workers/subdomain"
 
-section "Durable Object namespaces (/durable_objects/namespaces)"
-cf_get "/accounts/${acc}/durable_objects/namespaces"
+section "Durable Object namespaces проекта (/durable_objects/namespaces, отфильтровано так же)"
+cf_do_namespaces_own
 
-section "KV namespaces (/storage/kv/namespaces)"
-cf_get "/accounts/${acc}/storage/kv/namespaces"
+section "KV namespaces — этот проект их не использует (wrangler.jsonc без kv_namespaces), только счётчик аккаунта"
+cf_count_only "/accounts/${acc}/storage/kv/namespaces"
 
-section "D1 databases (/d1/database)"
-cf_get "/accounts/${acc}/d1/database"
+section "D1 databases — этот проект их не использует, только счётчик аккаунта"
+cf_count_only "/accounts/${acc}/d1/database"
 
-section "R2 buckets (/r2/buckets)"
-cf_get "/accounts/${acc}/r2/buckets"
+section "R2 buckets — этот проект их не использует, только счётчик аккаунта"
+cf_count_only "/accounts/${acc}/r2/buckets"
 
-section "Зоны/домены (/zones) — требует Zone:Read, у аккаунта может не быть своей зоны (issue #289)"
-cf_get "/zones"
+section "Зоны/домены — только счётчик (домены других проектов не публикуем); issue #289 остаётся открытым вопросом"
+cf_count_only "/zones"
 
 section "Расход по квотам"
 cat <<'EOF'
