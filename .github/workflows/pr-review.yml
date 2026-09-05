@@ -58,7 +58,16 @@ jobs:
           --pr ${{ github.event.pull_request.number }}
           --tree pr-tree
 
+      # if: always() — check_pr.py возвращает 1 ровно в ветке changes-requested
+      # (тот самый случай, ради которого будильник объявлен безусловным выше);
+      # без always() дефолтный `if: success()` пропускал бы его именно там.
+      # continue-on-error: true — форковые/dependabot PR получают GITHUB_TOKEN
+      # без actions:write независимо от `permissions` этого файла, `gh workflow
+      # run` ответит 403 и без этого уронил бы весь job review (готовый PR
+      # получал бы красный чек на голове до ручного перезапуска).
       - name: "Разбудить оркестратор (#297): вердикт изменился, не ждать расписания"
+        if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run orchestra.yml --ref main

@@ -325,7 +325,14 @@ jobs:
       # решает готовность PR не меньше первого — если этот вердикт делает
       # PR полностью готовым (review:ok уже стоит), слияние не должно ждать
       # следующего тика расписания.
+      # if: always() + continue-on-error: true — тот же довод, что в
+      # pr-review.yml: cmd_verdict возвращает 1 ровно при verdict == "error"
+      # (ai:failed), а дефолтный `if: success()` пропускал бы будильник
+      # именно в этой ветке; сбой самого диспатча (сеть/лимит) тоже не
+      # должен красить job verdict — расписание остаётся страховкой.
       - name: "Разбудить оркестратор (#297): вердикт AI готов, не ждать расписания"
+        if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run orchestra.yml --ref main
