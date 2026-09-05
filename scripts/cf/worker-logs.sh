@@ -19,12 +19,15 @@ echo "== Logpush jobs (/accounts/{id}/logpush/jobs) =="
 if resp=$(cf_get "/accounts/${CLOUDFLARE_ACCOUNT_ID}/logpush/jobs"); then
   if command -v jq >/dev/null 2>&1; then
     echo "$resp" | jq '[.result[]? | {dataset, enabled}]'
+    echo
+    echo "Пусто = логи воркера НЕ архивируются нигде: окна для чтения прошлого нет."
+    echo "Живые логи в моменте: 'npx wrangler tail edge-harness' из cf-worker/ (нужен CLOUDFLARE_API_TOKEN, интерактивно, не для CI)."
   else
-    echo "jq недоступен — количество не посчитано, сырьё не печатаю."
+    # Находка ревью PR #328: раньше эта строка-инструкция шла СРАЗУ после
+    # «jq недоступен», хотя без jq-фильтра нельзя утверждать «пусто» —
+    # список мог быть непустым, просто не отфильтрован для показа.
+    echo "jq недоступен — количество не посчитано, сырьё не печатаю. Пусто это или нет — не определено без jq."
   fi
-  echo
-  echo "Пусто = логи воркера НЕ архивируются нигде: окна для чтения прошлого нет."
-  echo "Живые логи в моменте: 'npx wrangler tail edge-harness' из cf-worker/ (нужен CLOUDFLARE_API_TOKEN, интерактивно, не для CI)."
 else
   echo
   echo "НЕТ ДОСТУПА к списку Logpush-джобов — токену не хватает права Logs Read, или Logpush недоступен на текущем плане."

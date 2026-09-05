@@ -22,6 +22,40 @@ export CLOUDFLARE_API_TOKEN="test-token"
 FOREIGN_NAMES="foo-1 foo-2 foo-3 foo-4 foo-5 foo-6 foo-7"
 SECRET_TEXT="do-not-print-me"
 
+fail=0
+
+# ── 0: cf_get (реальная функция lib.sh, до заглушки ниже) — HTTP 200 с
+# success:false в конверте v4 — отказ, не молчаливая подмена ошибки нулём
+# (находка ревью PR #328, находка 3). curl застаблен ЛОКАЛЬНО (function
+# перекрывает бинарь только в этом шелле), реальная сеть не нужна.
+curl() {
+  local out_file="" prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then out_file="$arg"; fi
+    prev="$arg"
+  done
+  printf '{"success": false, "errors": [{"message": "test failure"}]}' > "$out_file"
+  printf '200'
+}
+set +e
+out=$(cf_get "/user/tokens/verify" 2>/tmp/cf_guard_stderr_success)
+rc=$?
+set -e
+if [ "$rc" = 0 ]; then
+  echo "::error::cf_get вернул успех (rc=0) на HTTP 200 с success:false в конверте — должен отказать"
+  fail=1
+fi
+if [ -n "$out" ]; then
+  echo "::error::cf_get напечатал тело в stdout при success:false — должен молчать в stdout и писать причину в stderr (получено: $out)"
+  fail=1
+fi
+if ! grep -q "success:false" /tmp/cf_guard_stderr_success; then
+  echo "::error::cf_get не назвал причину «success:false» в stderr"
+  fail=1
+fi
+rm -f /tmp/cf_guard_stderr_success
+unset -f curl
+
 # cf_get заглушен: возвращает консервный статический JSON по path, не делает
 # сетевых запросов. Экспортируется через `export -f`, чтобы функции lib.sh
 # (которые вызывают cf_get по имени, не по ссылке) увидели заглушку.
@@ -58,8 +92,6 @@ JSON
   esac
 }
 export -f cf_get
-
-fail=0
 
 # ── 1/2: cf_workers_own — чужие имена не в stdout, счётчик совпадает ──────
 out=$(cf_workers_own 2>/tmp/cf_guard_stderr)
@@ -113,7 +145,49 @@ fi
 
 rm -f /tmp/cf_guard_stderr
 
+# ── 7/8: api.sh — отказ по умолчанию вне allowlist, без сети (находка ревью
+# PR #328, находка 1). Подставной curl в PATH (не function — api.sh запускается
+# отдельным процессом) на случай, если путь всё же дойдёт до cf_get: если
+# гвардия регрессирует в блок-лист/пропускает лишнее, тест должен упасть на
+# конкретном отказавшем пути, а не тихо съесть реальный сетевой вызов.
+api_sh="$dir/api.sh"
+curl_stub_dir=$(mktemp -d)
+cat >"$curl_stub_dir/curl" <<'CURL_STUB'
+#!/usr/bin/env bash
+out_file="" prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out_file="$arg"; fi
+  prev="$arg"
+done
+printf '{"success": true, "result": {}}' > "$out_file"
+printf '200'
+CURL_STUB
+chmod +x "$curl_stub_dir/curl"
+
+# 7: путь вне allowlist (account-wide, чужой класс инцидента 2026-09-05) —
+# отказ ДО сети, без CF_API_SH_ALLOW_RAW.
+if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "/accounts/test-acct/workers/scripts" 2>&1); then
+  echo "::error::api.sh пропустил account-wide путь вне allowlist (должен отказать по умолчанию): $out"
+  fail=1
+elif ! grep -q "ОТКАЗ" <<<"$out"; then
+  echo "::error::api.sh отказал без внятной причины «ОТКАЗ»: $out"
+  fail=1
+fi
+
+# 8: путь по нашему воркеру (allowlist) — не блокируется гейтом (сеть
+# застаблена, дальше curl_stub отвечает success:true пустым result).
+if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "/accounts/test-acct/workers/scripts/edge-harness/deployments" 2>&1); then
+  :
+else
+  if grep -q "ОТКАЗ" <<<"$out"; then
+    echo "::error::api.sh отказал на пути по нашему воркеру (должен быть в allowlist): $out"
+    fail=1
+  fi
+fi
+
+rm -rf "$curl_stub_dir"
+
 if [ "$fail" = 0 ]; then
-  echo "cf-inventory: фильтры account-wide листингов и bindings — чужие id/значения в stdout не попадают, счётчики верны"
+  echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт и allowlist api.sh — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
 fi
 exit "$fail"

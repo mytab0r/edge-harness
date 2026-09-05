@@ -37,6 +37,16 @@ cf_get() {
     "$url")
   case "$code" in
     200)
+      # HTTP 200 не значит успех: v4-конверт может нести success:false с
+      # errors (находка ревью PR #328) — cf_count_only на таком ответе тихо
+      # печатал бы "count: 0" через (.result // []), подменяя ошибку честным
+      # на вид нулём. jq недоступен здесь же (до сюда ещё никто не проверял) —
+      # без него полагаемся на код 200 как раньше, честнее не разгадать нечем.
+      if command -v jq >/dev/null 2>&1 && ! jq -e '.success == true' >/dev/null 2>&1 < "$tmp"; then
+        echo "ОШИБКА: GET $path вернул HTTP 200, но success:false в конверте." >&2
+        cat "$tmp" >&2; rm -f "$tmp"
+        return 1
+      fi
       cat "$tmp"; rm -f "$tmp"
       ;;
     403)

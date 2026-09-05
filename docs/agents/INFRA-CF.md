@@ -58,8 +58,13 @@ SHA `0b85fd5`. Более ранние прогоны выполняли код 
   `.github/workflows/cf-inventory.yml` (`workflow_dispatch`) — там секреты.
 - `bash scripts/cf/worker-logs.sh` — проверка, настроен ли Logpush (не сами
   логи — их API не отдаёт без Logpush).
-- `bash scripts/cf/api.sh <path>` — разовый безопасный GET к любому пути CF
-  API v4 (`<path>` — всё после `/client/v4`). Тот же контракт: маскирование
+- `bash scripts/cf/api.sh <path>` — разовый GET к пути CF API v4 (`<path>` —
+  всё после `/client/v4`). Отказ по умолчанию для всего, что не проверка
+  токена (`/user/tokens/verify`) и не наш воркер из `CF_OWN_WORKERS`
+  (`scripts/cf/lib.sh`) — не блок-лист конкретных известных путей (класс
+  инцидента 2026-09-05: незаблокированный account-wide путь печатал бы
+  сырьё). Путь вне allowlist — явный opt-in `CF_API_SH_ALLOW_RAW=1`
+  (печатает сырьё, не для публичного лога). Тот же контракт: маскирование
   токена, явная причина 403/404, никогда не печатает секрет.
 - Все три — только `GET`. Локально без секретов падают с понятной ошибкой
   (`cf_require_env` в `scripts/cf/lib.sh`), не тихо и не с общим "error".
