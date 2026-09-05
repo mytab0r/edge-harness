@@ -238,6 +238,52 @@ def test_cf_rows_metric_found_via_introspection_real_field_names(monkeypatch):
     assert calls["data_query"] is not None
 
 
+def test_cf_rows_metric_search_failure_is_no_data_not_crash(monkeypatch):
+    """Находка 1 (ревью PR #327): интроспекция полей (cf_type_fields внутри
+    find_row_metric) может упасть транзиентно ПОСЛЕ успешной cf_type_names —
+    один упавший __type-запрос не должен ронять весь collect_cloudflare и
+    терять уже собранные Workers/storage строки."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            raise RuntimeError("HTTP 500: transient")
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": [{"sum": {"requests": 5}}]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "ok"  # строка выше по коду не потеряна
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "упали" in rows_read_row.note
+
+
+def test_cf_rows_metric_aggregation_picked_by_type_suffix(monkeypatch):
+    """Находка 1: агрегация — по суффиксу типа (Sum→sum, Max→max), не
+    захардкожена как "sum" — найденное в Max-типе поле иначе не пройдёт
+    валидацию GraphQL-схемы (запрос попросил бы sum{field} у Max-типа)."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsStorageGroupsMax"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsReadMax"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "storedBytes" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        assert "max { rowsReadMax }" in query.replace("\n", " ")
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": [{"max": {"rowsReadMax": 42}}]}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "ok"
+    assert rows_read_row.current == 42
+
+
 def test_cf_schema_introspection_failure_is_no_data_for_all_cf_rows(monkeypatch):
     def broken(token, query, variables=None):
         raise RuntimeError("HTTP 401: invalid token")
@@ -257,3 +303,48 @@ def test_provider_reports_no_quota_api_with_reason():
     assert len(rows) == 1
     assert rows[0].status == "no-data"
     assert "RATE_LIMIT" in rows[0].note
+
+
+# ── main(): связка «порог → эскалация» (находка 3, ревью PR #327) ───────────
+# Собственно громкий сигнал, ради которого затевался инструмент, — вызов
+# pulse_guard.escalate из main() при превышении порога. over_threshold()
+# тестировался отдельно, а сама проводка main→escalate не была покрыта.
+
+
+def _patch_collectors(monkeypatch, cf_row):
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [cf_row])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [])
+    monkeypatch.setattr(qz, "collect_provider", lambda: [])
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+
+def test_main_calls_escalate_when_threshold_breached(monkeypatch, capsys):
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")  # 96%
+    _patch_collectors(monkeypatch, breached_row)
+
+    calls = []
+    monkeypatch.setattr(qz.pulse_guard, "escalate",
+                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+
+    assert qz.main() == 0
+    assert len(calls) == 1
+    repo, issue, text = calls[0]
+    assert repo == "mytab0r/edge-harness"
+    assert issue == qz.pulse_guard.WATCHDOG_ISSUE
+    assert "DO rows_read/сутки" in text
+
+
+def test_main_does_not_call_escalate_below_threshold(monkeypatch, capsys):
+    safe_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                       10, 5_000_000, "rows", "00:00 UTC", "ok")  # ~0%
+    _patch_collectors(monkeypatch, safe_row)
+
+    calls = []
+    monkeypatch.setattr(qz.pulse_guard, "escalate",
+                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+
+    assert qz.main() == 0
+    assert calls == []

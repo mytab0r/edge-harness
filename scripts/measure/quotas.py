@@ -199,22 +199,30 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
         rows.append(no_data("DO storage/аккаунт", source, LIMITS["cf_do_storage_account_bytes"], "bytes", str(error)))
 
     # DO rows_read/rows_written — имя поля не задокументировано, ищем интроспекцией.
+    # Поиск (find_row_metric → cf_type_fields → cf_query) — тоже сетевой вызов и
+    # тоже может упасть транзиентно; весь блок для строки в одном try, чтобы
+    # сбой поиска одной метрики не убивал main() и уже собранные строки выше
+    # (найдено исполнением: 500 на __type-запросе валил RuntimeError наружу).
     for label, limit_key, keyword in (
         ("DO rows_read/сутки", "cf_do_rows_read_day", "rowsread"),
         ("DO rows_written/сутки", "cf_do_rows_written_day", "rowswritten"),
     ):
-        found = find_row_metric(token, type_names, keyword)
-        if found is None:
-            rows.append(no_data(
-                label, source, LIMITS[limit_key], "rows",
-                f"поле, содержащее '{keyword}', не найдено ни в одном Sum/Max-типе "
-                "датасетов Durable Objects через интроспекцию схемы — метрика, "
-                "возможно, не экспонируется через GraphQL Analytics (инцидент "
-                "#320 был замечен по письму Cloudflare, не по дашборду/API)",
-            ))
-            continue
-        type_name, field_name = found
         try:
+            found = find_row_metric(token, type_names, keyword)
+            if found is None:
+                rows.append(no_data(
+                    label, source, LIMITS[limit_key], "rows",
+                    f"поле, содержащее '{keyword}', не найдено ни в одном Sum/Max-типе "
+                    "датасетов Durable Objects через интроспекцию схемы — метрика, "
+                    "возможно, не экспонируется через GraphQL Analytics (инцидент "
+                    "#320 был замечен по письму Cloudflare, не по дашборду/API)",
+                ))
+                continue
+            type_name, field_name = found
+            # Агрегация выбирается по фактическому суффиксу типа (Sum/Max), а не
+            # захардкожена как "sum" — find_row_metric ищет и в Max-типах тоже,
+            # и запрос с "sum" на Max-типе не пройдёт валидацию GraphQL-схемы.
+            agg = "max" if type_name.lower().endswith("max") else "sum"
             group_field = next(
                 n for n in ("durableObjectsInvocationsAdaptiveGroups", "durableObjectsPeriodicGroups",
                              "durableObjectsStorageGroups", "durableObjectsSubrequestsAdaptiveGroups")
@@ -225,19 +233,18 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
                 f"""query($accountTag: string, $start: string) {{
                     viewer {{ accounts(filter: {{accountTag: $accountTag}}) {{
                         {group_field}(limit: 1000, filter: {{date_geq: $start}}) {{
-                            sum {{ {field_name} }}
+                            {agg} {{ {field_name} }}
                         }}
                     }} }}
                 }}""",
                 {"accountTag": account_id, "start": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
             )
             accounts = data["viewer"]["accounts"]
-            total = sum(item["sum"][field_name] for acc in accounts for item in acc[group_field])
-            rows.append(Row(label, source, total, LIMITS[limit_key], "rows", reset, "ok", f"поле {field_name} в {type_name}"))
+            values = [item[agg][field_name] for acc in accounts for item in acc[group_field]]
+            total = max(values) if agg == "max" and values else sum(values)
+            rows.append(Row(label, source, total, LIMITS[limit_key], "rows", reset, "ok", f"поле {field_name} в {type_name} (агрегат {agg})"))
         except (RuntimeError, KeyError, TypeError) as error:
-            rows.append(no_data(label, source, LIMITS[limit_key], "rows",
-                                 f"поле {field_name} найдено интроспекцией ({type_name}), "
-                                 f"но запрос данных упал: {error}"))
+            rows.append(no_data(label, source, LIMITS[limit_key], "rows", f"интроспекция или запрос данных упали: {error}"))
 
     return rows
 
