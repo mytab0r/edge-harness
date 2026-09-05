@@ -39,6 +39,30 @@
 AI-ревью PR #247, 2026-09-03). Загрузка task_ref и разбор JSON поэтому
 обёрнуты явно: любой сбой — код 2 и причина в stderr, fail loud вместо
 silent-wrong.
+
+Приоритет внутри свободных (задача #361, владелец 2026-09-06): три уровня,
+в этом порядке — (1) метка `area:process` (задача про сам процесс работы —
+протокол, гвардии, контракт, ревью-гейты, CI-ворота — фундаментальнее любой
+прикладной: блокирует ВСЮ остальную работу, не одну ветку); (2) число
+ОТКРЫТЫХ задач, которые эта задача блокирует (нативный граф GitHub
+`blockedBy`/`blocking`, поле `blocking_open`, читается
+`scripts/lib/task_deps.py` — НЕ прозопарсинг тела, тот же запрещённый
+класс, что уже закрыт для контракта «PR → задача», #251/#259); (3) номер
+issue как proxy даты создания (монотонен по построению GitHub — меньше
+номер, раньше создан, без исключений; design.md этого change объясняет,
+почему не брать `createdAt` напрямую). `issue_priority_key`/
+`prioritized_free` — новая сортировка; имя `oldest_free` и CLI-глагол
+`oldest-free` сохранены ради совместимости вызова из task.sh, но читают
+новый ключ — старая чистая сортировка по номеру не живёт вторым путём
+параллельно, она — частный случай нового ключа при пустом графе и без меты
+(все существующие тесты на «выбрать по номеру» остаются зелёными без
+изменений: `labels`/`blocking_open` отсутствуют → уровни 1/2 не отличают
+кандидатов → тайбрейк по номеру, тот же результат, что и раньше).
+
+Граф пуст (ни один кандидат не блокирует ничего открытого) или мета-метка
+не стоит ни у кого — не молчаливое вырождение: `main()` печатает
+предупреждение в stderr при выборе (видимый сигнал, не тихий факт), выбор
+при этом не останавливается (вырождение в уровень 3 для всех — легитимно).
 """
 
 from __future__ import annotations
@@ -48,6 +72,10 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+
+# Метка мета-уровня (docs/agents/LABELS.md): задача про сам процесс работы —
+# протокол, гвардии, контракт, приёмка, аренда, ревью-гейты, CI-ворота.
+META_LABEL = "area:process"
 
 
 def _load_task_ref():
@@ -76,21 +104,64 @@ def _load_json(path: Path) -> Any:
 def free_candidates(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Открытые задачи пула без исполнителя и без живого замка аренды (#121),
-    отсортированные по номеру (старейшая первой — воркер не должен хватать
-    самую свежую косметику)."""
+    """Открытые задачи пула без исполнителя и без живого замка аренды (#121)
+    — ФИЛЬТР, без сортировки (сортировку по приоритету делает
+    `prioritized_free`; исторически эта функция и сортировала по номеру —
+    поведение перенесено в `prioritized_free`, здесь остаётся один фильтр,
+    чтобы не задавать порядок в двух местах)."""
     locked = locked or set()
-    free = [
+    return [
         issue for issue in issues
         if not (issue.get("assignees") or []) and issue["number"] not in locked
     ]
-    return sorted(free, key=lambda issue: issue["number"])
+
+
+def _is_meta(issue: dict[str, Any], meta_label: str = META_LABEL) -> bool:
+    return any(label.get("name") == meta_label for label in (issue.get("labels") or []))
+
+
+def issue_priority_key(issue: dict[str, Any], meta_label: str = META_LABEL) -> tuple:
+    """Три уровня приоритета, в этом порядке (задача #361):
+    (1) 0, если помечена `meta_label` (раньше всех), иначе 1;
+    (2) минус число ОТКРЫТЫХ задач, которые блокирует эта (`blocking_open`,
+        поле из `scripts/lib/task_deps.py` — больше блокирует, раньше);
+    (3) номер issue — тайбрейк, proxy даты создания (меньше — раньше).
+    Отсутствие `labels`/`blocking_open` в issue (REST-форма без графа) —
+    легитимное значение «неизвестно», трактуется как «не мета»/«блокирует 0»,
+    не ошибка: тайбрейк по номеру воспроизводит старое поведение целиком."""
+    return (
+        0 if _is_meta(issue, meta_label) else 1,
+        -int(issue.get("blocking_open") or 0),
+        issue["number"],
+    )
+
+
+def prioritized_free(
+    issues: list[dict[str, Any]], locked: set[int] | None = None, meta_label: str = META_LABEL,
+) -> list[dict[str, Any]]:
+    """Свободные кандидаты, отсортированные по приоритету #361 (см.
+    `issue_priority_key`) — старейшая-по-номеру больше не единственный
+    критерий, это частный случай (уровень 3) при пустом графе/без меты."""
+    candidates = free_candidates(issues, locked)
+    return sorted(candidates, key=lambda issue: issue_priority_key(issue, meta_label))
+
+
+def graph_is_empty(issues: list[dict[str, Any]], meta_label: str = META_LABEL) -> bool:
+    """Ни у кого нет `blocking_open` > 0 и ни у кого нет `meta_label` — уровни
+    1/2 не отличают НИ ОДНОГО кандидата, приоритет целиком вырождается в
+    уровень 3 (номер). Не поломка (легитимное состояние на старте внедрения
+    графа), но обязана быть видимым сигналом (AGENTS.md: fail loud, не
+    silent-wrong) — печатается предупреждением в `main()`, не проглатывается."""
+    return all(
+        not int(issue.get("blocking_open") or 0) and not _is_meta(issue, meta_label)
+        for issue in issues
+    )
 
 
 def oldest_free(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
 ) -> dict[str, Any] | None:
-    candidates = free_candidates(issues, locked)
+    candidates = prioritized_free(issues, locked)
     return candidates[0] if candidates else None
 
 
@@ -125,10 +196,16 @@ def main(argv: list[str]) -> int:
     if len(argv) in (2, 3) and argv[0] == "oldest-free":
         issues = _load_json(Path(argv[1]))
         locked = _parse_locked(argv[2]) if len(argv) == 3 else None
-        issue = oldest_free(issues, locked)
-        if issue is None:
+        candidates = prioritized_free(issues, locked)
+        if not candidates:
             return 1
-        _print_issue_line(issue)
+        if graph_is_empty(candidates):
+            print(
+                "free_task.py: граф блокировок пуст и ни одна свободная задача "
+                "не помечена area:process — приоритет сведён к дате создания "
+                "(#361)", file=sys.stderr,
+            )
+        _print_issue_line(candidates[0])
         return 0
     if len(argv) == 3 and argv[0] == "declared-pr":
         task_number = int(argv[1])

@@ -127,16 +127,19 @@ telegram_report() { # $1 — текст
 free_task() {
   local issues_file locked line rc
   issues_file="$WORK/pool-issues.json"
-  gh issue list --label task --state open --limit 100 --json number,assignees,title \
+  # Пул — через task_deps.py (GraphQL), не `gh issue list` (REST): приоритет
+  # #361 читает граф блокировок (blockedBy/blocking), которого REST не отдаёт
+  # ни в каком виде (проверено живым запросом, design.md этого change) —
+  # одно место получения пула, не два расходящихся запроса.
+  python3 "$SCRIPT_DIR/../lib/task_deps.py" pool "$GITHUB_REPOSITORY" \
     >"$issues_file" || return 2
   # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
   # канал (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
   # остаётся атомарный claim ниже. Сломался список замков — сломан инструмент
   # (2), а не «пул пуст» (1).
   locked=$(lease_cli locks) || return 2
-  # oldest-free сам сортирует по номеру (issues API отдаёт по убыванию
-  # новизны — без сортировки воркер брал бы свежайшую задачу, не старейшую)
-  # и фильтрует замки из locked.
+  # oldest-free сам считает приоритет (#361: мета-метка → число блокируемых
+  # открытых задач → номер issue как тайбрейк) и фильтрует замки из locked.
   set +e
   line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" oldest-free "$issues_file" "$locked")
   rc=$?

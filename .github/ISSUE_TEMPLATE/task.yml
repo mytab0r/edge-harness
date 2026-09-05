@@ -25,6 +25,7 @@ body:
         - area:hands
         - area:docs
         - area:orchestra
+        - area:process
     validations:
       required: true
   - type: textarea

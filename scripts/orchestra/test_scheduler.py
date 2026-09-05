@@ -1577,15 +1577,37 @@ def workflow_run(run_id, status):
     }
 
 
+def graphql_pool_response(issues_list):
+    """Ответ `gh api graphql` (уже распарсенный JSON, как его отдаёт
+    `_default_gh`/`gh(*args)`) на запрос `task_deps.fetch_pool` — один
+    короткий page с нодами, собранными из тех же фикстур `issue()`, что и
+    REST-пул: `assignees`/`labels` совместимы по форме (список словарей с
+    `login`/`name`), blockedBy/blocking пусты по умолчанию (#361: приоритет
+    отчёта dispatch_worker без явно заданного графа деградирует к номеру)."""
+    nodes = [{
+        "number": iss["number"],
+        "title": iss.get("title", ""),
+        "labels": {"nodes": iss.get("labels", [])},
+        "assignees": {"nodes": iss.get("assignees", [])},
+        "blockedBy": {"nodes": []},
+        "blocking": {"nodes": []},
+    } for iss in issues_list]
+    return {"data": {"repository": {"issues": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": nodes,
+    }}}}
+
+
 def test_dispatch_worker_fires_once_for_idle_worker_and_free_pool(monkeypatch):
+    pool = [issue(95), issue(89, assignees=())]
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
         # POST .../dispatches отвечает 204 без тела — прод-форма «успех» есть None.
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    pool = [issue(95), issue(89, assignees=())]
     lines = sch.dispatch_worker(REPO, pool)
     assert lines == [
         "👷 свободная задача #89 — worker.yml запущен "
@@ -1600,16 +1622,57 @@ def test_dispatch_worker_names_oldest_free_task_like_worker_will_pick(monkeypatc
     # Пул приходит от issues API по убыванию новизны: без сортировки отчёт
     # назвал бы #101, а воркер выберет старейшую свободную (oldest_free,
     # #245) — строка отчёта обязана называть ту задачу, которую реально возьмут.
+    pool = [issue(101, assignees=()), issue(95), issue(89, assignees=())]
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    pool = [issue(101, assignees=()), issue(95), issue(89, assignees=())]
     lines = sch.dispatch_worker(REPO, pool)
     assert lines[0].startswith("👷 свободная задача #89 ")
     assert not any("#101" in line for line in lines)
+
+
+def test_dispatch_worker_names_task_with_more_blocking_over_older_number(monkeypatch):
+    # #361: приоритет отчёта — тот же, что реально использует task.sh, не
+    # только номер. #101 блокирует 2 открытые задачи, #89 — ни одной: #101
+    # обязана называться первой, хотя её номер больше (свежее).
+    pool = [issue(101, assignees=()), issue(89, assignees=())]
+    graphql_response = graphql_pool_response(pool)
+    graphql_response["data"]["repository"]["issues"]["nodes"][0]["blocking"] = {
+        "nodes": [{"number": 500, "state": "OPEN"}, {"number": 501, "state": "OPEN"}],
+    }
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_response,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    lines = sch.dispatch_worker(REPO, pool)
+    assert lines[0].startswith("👷 свободная задача #101 ")
+
+
+def test_dispatch_worker_degrades_to_rest_pool_when_graph_unavailable(monkeypatch):
+    # Сбой ДОПОЛНИТЕЛЬНОГО GraphQL-запроса (граф блокировок) не должен
+    # останавливать сам dispatch — деградация к REST-пулу (номер), видимым
+    # предупреждением, не молчанием и не падением всего пульса.
+    pool = [issue(101, assignees=()), issue(89, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": RuntimeError("gh: HTTP 401: Bad credentials"),
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    lines = sch.dispatch_worker(REPO, pool)
+    assert any("граф блокировок недоступен" in line for line in lines)
+    assert any(line.startswith("👷 свободная задача #89 ") for line in lines)
+    assert fake.mutating_calls() == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main"
+    ]
 
 
 def test_dispatch_worker_silent_when_pool_has_no_free_task(monkeypatch):
@@ -1648,14 +1711,16 @@ def test_dispatch_worker_survives_dispatch_failure(monkeypatch):
     # Best-effort по построению: 403/сеть на диспатче не роняют планировщик —
     # слияния важнее подряда воркеру. Доведение функции до возврата и есть
     # проверка: исключение ушло бы дальше этого assert.
+    pool = [issue(89, assignees=())]
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
         "workflows/worker.yml/dispatches": RuntimeError(
             "gh api repos/o/r/actions/workflows/worker.yml/dispatches: HTTP 403"),
     })
     patch_gh(monkeypatch, fake)
-    lines = sch.dispatch_worker(REPO, [issue(89, assignees=())])
+    lines = sch.dispatch_worker(REPO, pool)
     assert len(lines) == 1 and lines[0].startswith("⚠️ dispatch воркера не удался")
 
 
