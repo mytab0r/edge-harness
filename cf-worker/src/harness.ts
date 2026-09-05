@@ -1367,13 +1367,14 @@ export class Harness extends DurableObject<Env> {
   }
 
   /**
-   * Issue для директивы. Токен — собственный узкий секрет GH_ISSUES_TOKEN
+   * Issue для директивы или правки доков (обе получают issue-след, kind —
+   * в теле). Токен — собственный узкий секрет GH_ISSUES_TOKEN
    * (fine-grained, только Issues:RW; ADR 0011): GH_DISPATCH_TOKEN по ADR 0008
    * не имеет права на Issues — его 403 ловить здесь нечему. Пока секрет не
    * задан владельцем, директива честно повторяется (issues_not_configured) —
    * установка секрета сама доводит очередь, без ручного шага.
    */
-  async #createIssue(messageId: number, text: string): Promise<IssueOutcome> {
+  async #createIssue(messageId: number, text: string, kind: string): Promise<IssueOutcome> {
     const token = this.env.GH_ISSUES_TOKEN;
     const repo = this.env.GH_REPO;
     if (!token || !repo) {
@@ -1381,9 +1382,12 @@ export class Harness extends DurableObject<Env> {
     }
 
     // Заголовок — первая строка без командного слова (общий с классификатором
-    // список DIRECTIVE_WORDS), потолок 80 символов. Маскирование ДО нарезки:
-    // усечённый секрет короче минимума паттерна уже не маскируется и утекает
-    // в публичный заголовок сырым хвостом (ревью head 3706d87).
+    // список DIRECTIVE_WORDS), потолок 80 символов (меньше 422-потолка GitHub).
+    // Маскирование ДО нарезки: усечённый секрет короче минимума паттерна уже
+    // не маскируется и утекает в публичный заголовок сырым хвостом (ревью head
+    // 3706d87). В GitHub уходит именно усечённый title: сырой titleRedacted.text
+    // длиннее 256 символов — невозвратный 422 по разобраемому сообщению
+    // (ревью head dfd167f, мёртвый потолок).
     const firstLine = text.trim().split(/\r?\n/)[0];
     const stripped = firstLine.replace(TITLE_PREFIX_RE, "").trim();
     const base = stripped || firstLine;
@@ -1396,7 +1400,7 @@ export class Harness extends DurableObject<Env> {
     // (п.29 спеки), факт маскирования виден в result сообщения.
     const bodyRedacted = redact(text);
     const body =
-      `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${bodyRedacted.text}\n\`\`\`\n\n---\n` +
+      `## Сообщение владельца (inbox #${messageId})\n\n*kind: ${kind}*\n\n\`\`\`\n${bodyRedacted.text}\n\`\`\`\n\n---\n` +
       `*Создано автоматически из инбокса владельца (задача #20). Обработай по playbook.*`;
 
     try {
@@ -1412,7 +1416,7 @@ export class Harness extends DurableObject<Env> {
           "User-Agent": GITHUB.userAgent,
           "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
-        body: JSON.stringify({ title: titleRedacted.text, body, labels: ["task", "source:inbox"] }),
+        body: JSON.stringify({ title, body, labels: ["task", "source:inbox"] }),
       });
       if (!res.ok) {
         const detail = redact((await res.text()).slice(0, 500)).text;
@@ -1458,8 +1462,12 @@ export class Harness extends DurableObject<Env> {
     if (claimed.rowsWritten === 0) return { action: "skipped" };
     this.#groupMessages(messageId);
 
-    if (kind === "directive") {
-      const outcome = await this.#createIssue(messageId, String(row.text));
+    // directive и doc_edit — оба получают issue-след: «у каждой директивы есть
+    // issue-след» относится и к правкам доков («обнови docs/INDEX.md» —
+    // директива в обычном смысле), иначе целый класс команд владельца исчезает
+    // из рабочих процессов (ревью head dfd167f). kind уезжает в тело issue.
+    if (kind === "directive" || kind === "doc_edit") {
+      const outcome = await this.#createIssue(messageId, String(row.text), kind);
       if (outcome.ok) {
         if (this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted }, claimedTs)) {
           return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted };
@@ -1499,8 +1507,8 @@ export class Harness extends DurableObject<Env> {
       return { action: "skipped" };
     }
 
-    // chat / doc_edit: автоматического действия в фазе 1 нет — разобрано и
-    // припарковано с явной пометкой; триаж (морда, фаза 2) решает дальнейшее.
+    // chat: автоматического действия в фазе 1 нет — разобрано и припарковано
+    // с явной пометкой; триаж (морда, фаза 2) решает дальнейшее.
     if (this.#finishMessage(messageId, "done", { kind, note: "classified_for_manual_review" }, claimedTs)) {
       return { action: "parked" };
     }
@@ -1508,17 +1516,25 @@ export class Harness extends DurableObject<Env> {
   }
 
   /** Ватчдог: processing дольше порога — изолят умер посреди внешнего вызова.
-   *  Возврат в new; attempts сохраняются, кап не даст крутить бесконечно.
-   *  Порог — единственное место правды: чистая messageStuck (гвардится и юнит-
-   *  тестом границы, и сквозным тестом alarm ниже). */
+   *  Возврат в new; attempts сохраняются, а исчерпанный кап на этом пути тоже
+   *  проверяется — иначе сообщение ходит по кругу reclaim → claim вечно
+   *  (ревью head dfd167f): кап исчерпан — честный failed со stuck_reclaimed,
+   *  оживить может retry_failed после устранения причины. Порог — единственное
+   *  место правды: чистая messageStuck (гвардится и юнит-тестом границы, и
+   *  сквозным тестом alarm ниже). */
   #reclaimStuckMessages(): number {
     const now = Date.now();
     const candidates = this.#rows(
-      this.#sql.exec("SELECT id, processing_ts FROM messages WHERE status = 'processing' AND processing_ts IS NOT NULL"),
+      this.#sql.exec("SELECT id, attempts, processing_ts FROM messages WHERE status = 'processing' AND processing_ts IS NOT NULL"),
     );
     let reclaimed = 0;
     for (const row of candidates) {
       if (!messageStuck(Number(row.processing_ts), now)) continue;
+      if (Number(row.attempts) >= MESSAGE_MAX_ATTEMPTS) {
+        // CAS по моменту захвата: чужой результат не перезаписываем.
+        this.#finishMessage(Number(row.id), "failed", { error: "stuck_reclaimed", attempts: Number(row.attempts) }, Number(row.processing_ts));
+        continue;
+      }
       reclaimed += Number(
         this.#sql.exec(
           "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
