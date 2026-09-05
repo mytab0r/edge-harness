@@ -86,6 +86,15 @@ jobs:
             exit 1
           fi
 
+          # server существующей записи манифеста (для дыма, см. FORGE_EXTRA_PLUGIN
+          # ниже): бамп client-only плагина (server:false, напр. plugin-manager)
+          # не должен внезапно валидировать серверную композицию, которую
+          # PR-шаг потом не опубликует (находка AI-ревью PR #273). Пусто —
+          # значит пакета в манифесте ещё нет (новый плагин); дефолт true —
+          # известное ограничение, см. комментарий у FORGE_EXTRA_PLUGIN.
+          MANIFEST_SERVER=$(jq -r --arg pkg "$PLUGIN_NAME" '.plugins[] | select(.package == $pkg) | .server' dsh-edge/plugins.json)
+          [ -n "$MANIFEST_SERVER" ] || MANIFEST_SERVER=true
+
           # Определяем, есть ли клиентская часть
           CLIENT=$(jq -r '.dsh.client.platform // ""' "$PLUGIN_PATH/package.json")
           [ "$CLIENT" = "web" ] && HAS_CLIENT=true || HAS_CLIENT=false
@@ -93,6 +102,7 @@ jobs:
           echo "plugin_name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
           echo "plugin_version=$PLUGIN_VERSION" >> "$GITHUB_OUTPUT"
           echo "plugin_id=$PLUGIN_ID" >> "$GITHUB_OUTPUT"
+          echo "plugin_server=$MANIFEST_SERVER" >> "$GITHUB_OUTPUT"
           echo "has_client=$HAS_CLIENT" >> "$GITHUB_OUTPUT"
           echo "plugin_path=$PLUGIN_PATH" >> "$GITHUB_OUTPUT"
 
@@ -175,14 +185,19 @@ jobs:
           # создаётся позже, см. шаг «Подготовить PR с обновлением манифеста») —
           # без FORGE_EXTRA_PLUGIN кодогенерация и гвардия состава проверяли бы
           # только старый состав, а новый плагин нигде бы не верифицировался.
-          # server:true зеркалит продовый путь генерации манифеста (шаг
-          # «Подготовить PR с обновлением манифеста» ниже ставит server:true
-          # безусловно) — форж целиком (design.md) не поддерживает client-only
-          # плагины, это pre-existing ограничение всего форжа, а не этого шага.
+          # server — из существующей записи манифеста (steps.validate.outputs.
+          # plugin_server), НЕ безусловный true: PR-шаг ниже сохраняет текущий
+          # .server при бампе (не переворачивает его на true), так что дым
+          # обязан валидировать ту же композицию, которую PR-шаг реально
+          # опубликует (находка AI-ревью PR #273 — было рассинхронизировано).
+          # true остаётся дефолтом ТОЛЬКО для генуинно нового плагина (записи
+          # в манифесте ещё нет) — известное ограничение форжа (design.md):
+          # client-only плагин, форжащийся впервые, всё равно провалидируется
+          # как серверный.
           FORGE_EXTRA_PLUGIN: >-
             {"id":"${{ steps.validate.outputs.plugin_id }}",
             "package":"${{ steps.validate.outputs.plugin_name }}",
-            "server":true,
+            "server":${{ steps.validate.outputs.plugin_server }},
             "client":${{ steps.validate.outputs.has_client }}}
         run: |
           # Клонируем апстрим на пине, применяем патчи, ставим плагин, кодогеним,
