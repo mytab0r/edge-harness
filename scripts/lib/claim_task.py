@@ -50,7 +50,7 @@ EXIT_ERROR = 2
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:

@@ -58,7 +58,7 @@ class FakeServer:
     def add_ref(self, ref):
         self.existing_refs.add(ref)
 
-    def run(self, args, capture_output=True, text=True, env=None):
+    def run(self, args, capture_output=True, text=True, encoding=None, env=None):
         joined = " ".join(args)
         self.calls.append(joined)
         if "-X" in args and "POST" in args and "git/refs" in joined and "matching-refs" not in joined:
@@ -109,6 +109,23 @@ def test_gh_status_parsing_prod_form():
     assert ct.gh_status("gh: HTTP 422: Reference already exists [...]") == 422
     assert ct.gh_status("gh: HTTP 404: Not Found") == 404
     assert ct.gh_status("dial tcp: connectex failed") is None
+
+
+def test_gh_pins_utf8_encoding_not_console_codepage(monkeypatch):
+    # Находка ai-review PR #326: text=True без явного encoding декодирует
+    # чужой пайп кодовой страницей консоли (cp1251 на Windows), не UTF-8 —
+    # PYTHONIOENCODING на это не влияет (та переменная задаёт кодировку
+    # только собственных stdin/stdout/stderr процесса). Мутационная проверка:
+    # убери encoding="utf-8" в gh() — этот тест покраснеет.
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.gh("repos/o/r")
+    assert seen.get("encoding") == "utf-8"
 
 
 # ── TTL по дате коммита замка ────────────────────────────────────────────────────
@@ -186,10 +203,10 @@ def test_claim_unexpected_422_is_loud_not_busy(monkeypatch):
     # отказ аренды (зелёный), прочие validation-ошибки — поломка (громко).
     # Различение по тексту, симметрично _ref_missing() у release.
     class ValidationServer(FakeServer):
-        def run(self, args, capture_output=True, text=True, env=None):
+        def run(self, args, capture_output=True, text=True, encoding=None, env=None):
             if "-X" in args and "POST" in args and "git/refs" in " ".join(args):
                 return fail(422, "Validation Failed: tree sha wasn't found")
-            return super().run(args, capture_output=capture_output, text=text, env=env)
+            return super().run(args, capture_output=capture_output, text=text, encoding=encoding, env=env)
     install(monkeypatch, ValidationServer(dict(BASE)))
     with pytest.raises(RuntimeError):
         ct.claim("o/r", 5, "worker-a", now=utc(12, 0))

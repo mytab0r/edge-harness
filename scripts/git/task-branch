@@ -20,12 +20,12 @@ fi
 git fetch origin --prune
 
 # ls-remote идёт мимо локальных ссылок: если после fetch локальный origin/main
-# не равен серверному — сеть/прокси врут, работать на таком base нельзя.
+# не равен серверному — сеть врёт, работать на таком base нельзя.
 remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
 local_head=$(git rev-parse refs/remotes/origin/main)
 if [ "$remote_head" != "$local_head" ]; then
   echo "ОШИБКА: origin/main протух даже после fetch (локально $local_head, на сервере $remote_head)." >&2
-  echo "Разберись с сетью/прокси — протухший base не выдаю." >&2
+  echo "Разберись с сетью — протухший base не выдаю." >&2
   exit 1
 fi
 
@@ -35,3 +35,11 @@ git switch -c "agent/$task" refs/remotes/origin/main
 git config core.hooksPath .githooks
 
 echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+
+# Печать ключевых граблей инфраструктуры в момент старта задачи, а не когда-нибудь
+# потом «если вспомнить прочитать» (задача #323): task-branch — один из ДВУХ
+# входов в agent-ветку (второй — доводка уже открытого PR в scripts/worker/task.sh,
+# он тоже зовёт print_infra_digest напрямую, минуя этот файл, — см. #326 находка 1).
+# Текст — одно место правды в scripts/gh/infra_digest.sh, не копия здесь.
+source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
+print_infra_digest

@@ -209,6 +209,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
+      # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
+      # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
+      # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
+      # «прочитаны все». Две мутации краснят по отдельности: новый/восстановленный
+      # .yml без строки в таблице; мёртвая строка на удалённый .yml.
+      - name: Гвардия инвентаря INFRA-GH.md — каждый workflow назван в таблице
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_infra_gh_inventory.py -q
+
       # Паритет маскирования (ревью PR #173): инбокс морды пишет фриформ-текст
       # владельца в публичный issue — паттерны секретов cf-worker/src/redact.ts
       # обязаны совпадать один к одному с dsh-ci.sh::redact. Две мутации
