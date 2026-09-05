@@ -246,10 +246,8 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
 
 
 def gh_api(*args: str) -> dict | list | None:
-    # encoding явный: без него subprocess.run на Windows читает вывод в
-    # кодировке консоли (cp1251), а GitHub honestly отдаёт кириллицу в
-    # заголовках коммитов/PR — падение на decode найдено живым прогоном
-    # 2026-09-05, не гипотетика.
+    # encoding явный: иначе Windows читает вывод в кодировке консоли, а
+    # реальные ответы GitHub несут кириллицу (найдено живым прогоном 2026-09-05).
     result = subprocess.run(["gh", "api", *args], capture_output=True, text=True,
                              encoding="utf-8", env={**os.environ, "NO_COLOR": "1"})
     if result.returncode != 0:
@@ -279,9 +277,7 @@ def collect_github(repo: str) -> list[Row]:
         since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         dispatch_count = 0
         for event in ("repository_dispatch", "workflow_dispatch"):
-            # --method GET обязателен: gh api молча переключается на POST, если
-            # заданы -f поля без явного метода — на этом эндпоинте POST даёт 404,
-            # а не осмысленную ошибку метода (найдено живым прогоном 2026-09-05).
+            # --method GET обязателен: с -f полями gh api иначе уходит в POST → 404.
             data = gh_api("--method", "GET", f"repos/{repo}/actions/runs", "-f", f"event={event}",
                           "-f", f"created=>={since}", "-f", "per_page=100")
             dispatch_count += data.get("total_count", 0)

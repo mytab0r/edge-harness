@@ -127,10 +127,8 @@ def test_collect_github_in_progress_reads_real_payload(monkeypatch):
 
 
 def test_collect_github_runs_lookups_force_method_get(monkeypatch):
-    """Класс бага, найденного живым прогоном 2026-09-05: `gh api` молча
-    переключается на POST, если заданы `-f` поля без явного `--method` — на
-    `actions/runs` это даёт 404 вместо количества, а не осмысленную ошибку.
-    Оба GET-с-параметрами вызова обязаны нести явный `--method GET`."""
+    """Живой баг 2026-09-05: `gh api` молча уходит в POST при `-f` без
+    `--method` — actions/runs отвечает 404 вместо числа, не осмысленно."""
     seen_args = []
 
     def fake_gh_api(*args):
