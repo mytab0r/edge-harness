@@ -46,11 +46,11 @@ from datetime import date, datetime, timedelta, timezone
 API = "https://api.cloudflare.com/client/v4/graphql"
 DAILY_LIMIT = 5_000_000
 
-# GraphQL Analytics API режет ответ на этом числе строк молча (без флага
-# has_more) — если запрошенный диапазон/число namespace даёт больше строк,
-# итог по хвостовым дням окажется занижен без единого сигнала. Одно место
-# правды: используется и в запросе (build_data_query), и в проверке
-# (check_not_truncated) — раздельные литералы уже расходились бы незаметно.
+# Факт и его источник — docs/research/20-cloudflare-free.md, раздел «Замер
+# факта: rows_read в проде» (не подтверждено официальной докой Cloudflare,
+# эмпирическое наблюдение). Одно место правды: используется и в запросе
+# (build_data_query), и в проверке (check_not_truncated) — раздельные
+# литералы уже расходились бы незаметно.
 GRAPHQL_ROW_LIMIT = 10000
 
 # Порядок проверки — по правдоподобию (docs/research/20-cloudflare-free.md,
@@ -394,6 +394,10 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--days", type=int, default=7, help="сколько последних суток UTC снять")
     args = parser.parse_args()
+    if args.days < 1:
+        parser.error(f"--days должен быть >= 1, получено {args.days} — "
+                     "0 или отрицательное число даёт пустой отчёт с exit 0, "
+                     "неотличимый от «данных нет» при том, что замера не было")
 
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
