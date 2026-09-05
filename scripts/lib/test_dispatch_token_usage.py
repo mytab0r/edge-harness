@@ -69,6 +69,7 @@ EXPECTED_WORKFLOWS = frozenset({
     "orchestra.yml",
     "plugin-forge.yml",
     "pr-review.yml",
+    "quotas.yml",
     "repo-ci.yml",
     # Восстановлен в #72 (ворота CI морды по ADR 0004). Репо-секретов не читает
     # вовсе: канарейка в CI ходит тестовым dev-token против локального wrangler
