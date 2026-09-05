@@ -35,20 +35,20 @@ POST — задача в очередь + repository_dispatch (без GH_DISPATC
 
 Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed.
 
-## `POST /api/messages/webhook`
+## `POST /api/messages/ingest`
 
-Вебхук для входящих сообщений (Telegram, и др.). Принимает JSON с полями source, source_msg_id, chat_id, sender_id, sender_name, text. Идемпотентен по source+source_msg_id. Возвращает {message_id, status}.
+Приём сообщения владельца в инбокс (#20) под обычной авторизацией — эндпоинт админско-релейный; прямая доставка вебхуком Telegram не подключена. Понимает плоскую форму (source, source_msg_id, chat_id, sender_id, sender_name, text) и сырой Telegram update (update_id, message.from/chat — числа приводятся к строкам). Ключ идемпотентности: source_msg_id, иначе update_id, иначе message.message_id; без идентификатора — 400 need_source_msg_id. Возвращает {message_id, status: accepted|exists}.
 
 ## `GET/POST /api/messages`
 
-GET — список сообщений с фильтрами (status, kind, limit, after). POST — ручное создание сообщения (для тестов/админа).
+GET — список сообщений с фильтрами (status, kind, sender_id; пагинация after — курсор по id против сортировки ts DESC — и limit). POST — ручное создание сообщения.
 
 ## `GET /api/messages/`
 
-Одна сообщение по id.
+Одно сообщение по id.
 
 Остаток пути после `/api/messages/` — параметр.
 
 ## `POST /api/messages/process`
 
-Запустить обработку новых сообщений: классификация, группировка, создание задач для директив. Возвращает {processed, created_issues, errors}.
+Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив — issue под GH_ISSUES_TOKEN (не задан или сеть — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен.
