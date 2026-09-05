@@ -21,11 +21,14 @@
 
 3. **`python3 ... | gh ...` и любой subprocess, читающий вывод `gh`, падает на кириллице**
    (`UnicodeDecodeError: 'charmap' codec ... cp1251`), если процесс не переведён явно на UTF-8.
-   Для собственного кода — `subprocess.run(..., encoding="utf-8")` (не полагаться на
-   `text=True` без этого: она декодирует кодовой страницей консоли). Для скриптов
-   репозитория, читающих свой stdout/stderr, — `PYTHONIOENCODING=utf-8` перед вызовом
-   (пример: `scripts/lib/claim_task.py` на Windows без этой переменной падает тем же классом
-   ошибки на кириллице в теле issue).
+   `PYTHONIOENCODING=utf-8` здесь НЕ спасает: она задаёт кодировку только собственных
+   stdin/stdout/stderr процесса, а `subprocess.run(..., text=True)` без явного `encoding`
+   декодирует ЧУЖОЙ пайп кодовой страницей консоли (cp1251 на Windows) — эта переменная на
+   решение подпроцесса не влияет. Единственное лекарство —
+   `subprocess.run(..., encoding="utf-8")` явно в каждом вызове (найдено и исправлено в
+   `scripts/lib/claim_task.py::gh()`, вердикт ai-review PR #326; тот же класс не закрыт ещё
+   в `contract_check.py`/`pulse_guard.py`/`dispatch_tail.py` — не стреляет в CI из-за
+   UTF-8-локали раннера, стреляет на Windows-агенте).
 4. **Смешение `\n` и `\r\n`** в файлах, которые правит и bash, и Windows-инструмент — не
    специфично для GitHub, но регулярно всплывает в диффах workflow-файлов; проверяй
    `git diff` перед коммитом, если правил не через `Edit`/`Write`.
@@ -36,10 +39,10 @@
 |---|---|---|---|---|
 | `worker.yml` | `workflow_dispatch` (task опционален) | Автономный воркер: берёт задачу из пула (или конкретную), DSH headless по `WORKER-PLAYBOOK.md`, открывает PR. Один прогон на репозиторий (`concurrency: worker`) | `GH_PIPELINE_PAT`, `DEEPSEEK_API_KEY`, `HANDS_TOKEN`, `DSH_EDGE_ACCESS_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | `HARNESS_URL`, `DSH_EDGE_URL`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL` |
 | `hands.yml` | `repository_dispatch` (`harness-task`), `workflow_dispatch` (ручной прогон под `manual-<run_id>`) | «Руки» слайса dsh-in-job: исполняет одну задачу из морды, стримит журнал в DO. Аренда задачи — `github.token` (`contents:write`, снимается до старта DSH) | `HANDS_TOKEN`, `DEEPSEEK_API_KEY`, `DSH_EDGE_ACCESS_KEY` | `HARNESS_URL`, `DSH_EDGE_URL`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL` |
-| `orchestra.yml` | `pull_request` (opened/synchronize/reopened/labeled), `schedule */15`, `workflow_dispatch` | Два джоба: `contract` (обязательная проверка PR↔задача на каждый PR) и `orchestra` (просроченные назначения, метки конфликтов, очередь слияний — ровно один PR/прогон). `concurrency` — на уровне джоба, не файла (класс #189) | `GH_PIPELINE_PAT` (как `ORCHESTRA_PAT`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | `DSH_EDGE_URL` |
+| `orchestra.yml` | `pull_request` (opened/synchronize/reopened/labeled), `schedule */15`, `workflow_dispatch` | Два джоба: `contract` (обязательная проверка PR↔задача на каждый PR) и `orchestra` (просроченные назначения, метки конфликтов, очередь слияний — ровно один PR/прогон). `concurrency` — на уровне джоба, не файла (класс #189) | `GH_PIPELINE_PAT` (как `ORCHESTRA_PAT`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DSH_EDGE_ACCESS_KEY` (архив сессий) | `DSH_EDGE_URL` |
 | `pr-review.yml` | `pull_request` (opened/synchronize/reopened) | Гейт 1: детерминированное ревью диффа (`check_pr.py`), метки `review:ok`/`review:changes-requested`/`review:large`. Доверенный код — чекаут `ref: main`, дерево PR — только данные | `github.token` | — |
 | `ai-review.yml` | `workflow_run` (завершение `pr-review`), `workflow_dispatch` (input `pr`) | Гейт 2: AI-ревью диффа. Trust-зона между job'ами: недоверенный DSH-шаг без токенов, доверенный `verdict` — свежая VM, свой чекаут main. Метки `ai:ok`/`ai:changes-requested`/`ai:failed` | `github.token`, `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL` |
-| `deploy-worker.yml` | `push` на `main` (`cf-worker/**`), `workflow_dispatch` | Деплой морды (edge-harness) в Cloudflare: проверка секретов → гвардия актуальности типов → гвардия узости `GH_DISPATCH_TOKEN` → `wrangler deploy` → синк секретов воркера → канарейка UI на проде | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `HANDS_TOKEN`, `GH_DISPATCH_TOKEN`, `SESSION_SECRET` | `HARNESS_URL`, `GH_DISPATCH_TOKEN_KIND` |
+| `deploy-worker.yml` | `push` на `main` (`cf-worker/**`, `.github/workflows/deploy-worker.yml`), `workflow_dispatch` | Деплой морды (edge-harness) в Cloudflare: проверка секретов → гвардия актуальности типов → гвардия узости `GH_DISPATCH_TOKEN` → `wrangler deploy` → синк секретов воркера → канарейка UI на проде | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `HANDS_TOKEN`, `GH_DISPATCH_TOKEN`, `SESSION_SECRET` | `HARNESS_URL`, `GH_DISPATCH_TOKEN_KIND` |
 | `deploy-dsh-edge.yml` | `schedule` (`37 4 * * *`), `workflow_dispatch` (input `version`) | Деплой морды dsh-edge: source-build с плагинами по манифесту (основной путь) либо npm-префаб (fallback при пустом манифесте). Синк `GH_RUNNER_TOKEN` (=`GH_PIPELINE_PAT`) и опциональных секретов интеграций (#115) в воркер dsh-edge | `CLOUDFLARE_*`, `GH_PIPELINE_PAT`, `DSH_EDGE_ACCESS_KEY`, `DEEPSEEK_*`, `JIRA_*`, `CONFLUENCE_*`, `BITBUCKET_*`, `SLACK_BOT_TOKEN`, `TELEGRAM_*` (интеграционные — опциональны, отсутствие не красит деплой) | `DSH_EDGE_URL`, `DSH_EDGE_PROVIDER_NAME`, `DSH_EDGE_MODEL_CATALOG` |
 | `dispatch-latency-probe.yml` | `schedule */15`, `repository_dispatch` (`dispatch-latency-probe`), `workflow_dispatch` | Кампания замера хвоста задержки dispatch→старт job'а (#4/ADR 0005). `tick` шлёт dispatch и пишет CSV/PR под PAT; `probe` — сам измеряемый job | `GH_PIPELINE_PAT` | — |
 | `repo-ci.yml` | `pull_request`, `push` на `main` | Обязательная проверка `test` защиты ветки: компиляция Python, гвардии классов (`body=`, провайдер/модель, разделение токенов, реестр меток, concurrency), юнит-тесты скриптов и плагинов, валидность YAML всех workflow | `github.token` (read) | — |
@@ -164,6 +167,24 @@
 - **Отключение обязательных проверок** — `test`/`contract` не отключаются и не обходятся;
   единственный предусмотренный обход контракта — метка `orchestra:skip` на PR для мелочей вне
   пула задач (см. `PROTOCOL.md`), не общий рецепт.
+
+## Не подтверждено
+
+Этот документ — не живой опрос API, а срез, снятый прогоном 2026-09-05 (дата стоит в
+заголовках разделов выше). Защита ветки, список секретов/переменных и лимиты меняются
+владельцем вне этого репозитория и протухнут первыми же изменениями настроек — документ
+сам по себе не узнаёт об этом. Перепроверить срез теми же командами, что снимали его:
+
+```
+gh api repos/mytab0r/edge-harness/branches/main/protection
+gh api repos/mytab0r/edge-harness/actions/secrets --jq '.secrets[].name'
+gh api repos/mytab0r/edge-harness/actions/variables --jq '.variables[].name'
+gh api rate_limit
+```
+
+Не подтверждено также: сохранится ли для `GH_DISPATCH_TOKEN_KIND` статус «не выставлена»
+после того, как владелец завершит миграцию ADR 0008 шагом 2 — раздел «Секреты и переменные»
+описывает состояние на дату снятия среза, не гарантию на будущее.
 
 ## Куда смотреть при отказе
 
