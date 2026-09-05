@@ -19,6 +19,10 @@ on:
         description: "ID плагина для манифеста (по умолчанию — имя каталога)"
         required: false
         type: string
+      task_issue:
+        description: "Номер issue-задачи (опционально) — ссылкой попадёт в тело авто-PR"
+        required: false
+        type: string
 
 permissions:
   contents: write       # для создания релиза и PR
@@ -55,6 +59,7 @@ jobs:
         env:
           PLUGIN_PATH: ${{ inputs.plugin_path }}
           PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
+          TASK_ISSUE_INPUT: ${{ inputs.task_issue }}
         run: |
           PLUGIN_PATH="${PLUGIN_PATH}"
           [ -d "$PLUGIN_PATH" ] || { echo "::error::Каталог плагина не найден: $PLUGIN_PATH"; exit 1; }
@@ -73,6 +78,15 @@ jobs:
           fi
           # Проверка формата ID (как в manifest.mjs)
           [[ "$PLUGIN_ID" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^[a-z][a-z0-9-]*$"; exit 1; }
+
+          # Номер задачи для тела авто-PR — отдельный опциональный числовой
+          # вход, НЕ plugin_id: plugin_id validate пропускает только через
+          # ^[a-z][a-z0-9-]*$, номером задачи он быть не может, и «#$plugin_id»
+          # рендерился нерабочей ссылкой вида «#hello» на каждом PR (находка
+          # AI-ревью PR #273). Пусто — строка со ссылкой в PR просто не пишется.
+          if [ -n "$TASK_ISSUE_INPUT" ]; then
+            [[ "$TASK_ISSUE_INPUT" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$TASK_ISSUE_INPUT' должен быть числом (номер issue)"; exit 1; }
+          fi
 
           # Сверка с манифестом: basename каталога — только дефолт, а пакет
           # может уже быть установлен под ДРУГИМ id (канонический
@@ -107,6 +121,7 @@ jobs:
           echo "plugin_server=$MANIFEST_SERVER" >> "$GITHUB_OUTPUT"
           echo "has_client=$HAS_CLIENT" >> "$GITHUB_OUTPUT"
           echo "plugin_path=$PLUGIN_PATH" >> "$GITHUB_OUTPUT"
+          echo "task_issue=$TASK_ISSUE_INPUT" >> "$GITHUB_OUTPUT"
 
           echo "Плагин: $PLUGIN_NAME v$PLUGIN_VERSION (id: $PLUGIN_ID, client: $HAS_CLIENT)"
 
@@ -368,7 +383,7 @@ jobs:
           ASSET: ${{ steps.pack.outputs.asset }}
           SHA256: ${{ steps.pack.outputs.sha256 }}
           HAS_CLIENT: ${{ steps.validate.outputs.has_client }}
-          PLUGIN_ISSUE_INPUT: ${{ github.event.inputs.plugin_id }}
+          TASK_ISSUE: ${{ steps.validate.outputs.task_issue }}
         run: |
           # GH_TOKEN авторизует только `gh`-вызовы; голому `git push` нужен
           # credential helper — `gh auth setup-git` (тот же паттерн, что в
@@ -445,15 +460,24 @@ jobs:
 
           git push -u origin "$BRANCH"
 
-          PLUGIN_ISSUE="$PLUGIN_ISSUE_INPUT"
-          [ -n "$PLUGIN_ISSUE" ] || PLUGIN_ISSUE="$PLUGIN_ID"
+          # Ссылка на задачу — только если task_issue реально передан числом
+          # (см. вход workflow_dispatch и валидацию в шаге «Валидация входа»).
+          # Раньше сюда шёл inputs.plugin_id, который validate пропускает
+          # только через ^[a-z][a-z0-9-]*$ — номером задачи он быть не может,
+          # и строка рендерилась мёртвой ссылкой вида «#hello» на каждом PR
+          # (находка AI-ревью PR #273). Нет task_issue — строки нет вовсе.
+          if [ -n "$TASK_ISSUE" ]; then
+            TASK_LINE=$(printf 'Задача: #%s\n\n' "$TASK_ISSUE")
+          else
+            TASK_LINE=""
+          fi
           # Ранее тело утверждало «после мержа PR автоматически запустится
           # deploy-dsh-edge.yml (push-триггер)» — неверно: этот workflow
           # триггерится только schedule/workflow_dispatch, push в main его не
           # запускает (находка AI-ревью PR #162). Текст ниже описывает
           # реальный путь.
-          PR_BODY=$(printf '#%s\n\n## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. Постит `plugin_status: ready` в журнал\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
-            "$PLUGIN_ISSUE" "${{ steps.release.outputs.release_tag }}")
+          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. Постит `plugin_status: ready` в журнал\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
+            "$TASK_LINE" "${{ steps.release.outputs.release_tag }}")
           PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
