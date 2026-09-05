@@ -379,7 +379,11 @@ def check_duplicate_evidence(open_tasks: list[dict]) -> list[dict]:
 
 
 def fetch_open_task_issues(repo: str) -> list[dict]:
-    payload = gh(f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100")
+    """Постранично (review_labels.list_pages, класс #308) — сырой одностраничный
+    вызов молча терял бы задачи за первой сотней открытых issues с меткой task
+    (находка гвардии scripts/lib/test_pagination_guard.py на этом же PR)."""
+    payload = review_labels.list_pages(
+        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
     return [issue for issue in payload if "pull_request" not in issue]
 
 
@@ -404,7 +408,9 @@ def fetch_merged_pulls(repo: str, max_pages: int = 5) -> list[dict]:
 
 
 def fetch_open_pulls(repo: str) -> list[dict]:
-    return gh(f"repos/{repo}/pulls?state=open&per_page=100")
+    """Постранично (review_labels.list_pages, класс #308) — тот же приём, что
+    fetch_open_task_issues выше."""
+    return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
 
 
 def build_report(repo: str, now: datetime) -> tuple[list[str], dict[int, list]]:
