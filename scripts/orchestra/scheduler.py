@@ -94,6 +94,13 @@ from pathlib import Path
 # escalate — общий канал «поломка → задача-статус + Telegram», #120/#174;
 # пороги петли открытого PR #196 — там же: AI_REVIEW_RETRY_AFTER_MINUTES,
 # AI_REVIEW_MAX_ATTEMPTS, AI_REVIEW_RETRY_MARKER, UNHEALTHY_PR_AFTER_MINUTES).
+# Модуль целиком (не только именованный импорт ниже) — REWORK_BUDGET/
+# rework_cycle_count/rework_events/NEEDS_SPEC_MARKER (task-rework-loop #256)
+# читаются квалифицированно как pulse_guard.<имя>, чтобы тесты могли
+# monkeypatch'ить pulse_guard.gh отдельно от gh() этого модуля (иначе один
+# monkeypatch.setattr(sch, "gh", ...) молча не подменил бы вызовы gh() внутри
+# pulse_guard.rework_events).
+import pulse_guard
 from pulse_guard import (
     AI_REVIEW_MAX_ATTEMPTS,
     AI_REVIEW_RETRY_AFTER_MINUTES,
@@ -1041,12 +1048,28 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
 
 
 # ── #196, поведение 2: нездоровый PR — вернуть задачу в пул ──────────────────────
-# Красный обязательный чек ИЛИ ai:changes-requested дольше UNHEALTHY_PR_AFTER_MINUTES
-# (отсчёт — updated_at PR: в отличие от review:ok, здесь нет перелейбловки на
-# каждый пуш, «нездоровье» живёт, пока его не почини́ли, — updated_at не тикает,
-# пока PR не тронули). Идемпотентность без отдельного маркера: снятие assignee
+# Красный обязательный чек ИЛИ вердикт ревью (ai:changes-requested ИЛИ
+# review:changes-requested — task-rework-loop #256, «Известный разрыв»: до
+# этой правки здесь проверялся только ai:changes-requested, PR, застрявший
+# исключительно на гейте 1, никогда не возвращался в пул и не попадал под
+# бюджет реворка ниже) дольше UNHEALTHY_PR_AFTER_MINUTES (отсчёт — updated_at
+# PR: в отличие от review:ok, здесь нет перелейбловки на каждый пуш,
+# «нездоровье» живёт, пока его не почини́ли, — updated_at не тикает, пока PR
+# не тронули). Идемпотентность без отдельного маркера: снятие assignee
 # у задачи делает её невидимой для follow-up вызовов reap_stale/этой же функции
 # (issue["assignees"] пуст), тот же приём, что уже использует reap_stale.
+#
+# Бюджет реворка (task-rework-loop #256, design.md п.2/п.4): причина
+# «вердикт ревью» (не красный чек) И rework_cycle_count(pr) >= REWORK_BUDGET —
+# вместо возврата в пул задача уходит в needs-spec, PR закрывается
+# (route_to_needs_spec ниже). Красный чек ИЛИ rework_cycle_count < REWORK_BUDGET —
+# прежнее поведение (возврат в пул) не меняется.
+
+# Метки-вердикты, наличие любой из которых на PR — «причина нездоровья —
+# вердикт ревью», не красный чек (см. ветвление в unhealthy_pulls ниже).
+# Читается из тех же labels, что уже разобрал pr_is_unhealthy — не второй
+# сетевой вызов, вычисление по уже полученному pull["labels"].
+_VERDICT_UNHEALTHY_LABELS = (review_labels.AI_CHANGES, review_labels.REVIEW_CHANGES)
 
 
 def pr_is_unhealthy(repo: str, pull: dict) -> str | None:
@@ -1058,10 +1081,145 @@ def pr_is_unhealthy(repo: str, pull: dict) -> str | None:
         return None
     if review_labels.AI_CHANGES in labels:
         return f"метка {review_labels.AI_CHANGES}"
+    if review_labels.REVIEW_CHANGES in labels:
+        return f"метка {review_labels.REVIEW_CHANGES}"
     bad = pr_bad_checks(repo, pull)
     if bad:
         return f"красные проверки: {', '.join(bad)}"
     return None
+
+
+def _pr_unhealthy_reason_is_verdict(pull: dict) -> bool:
+    """True — pr_is_unhealthy вернул причину по вердикту ревью (гейт 1 или
+    гейт 2), не по красным чекам. Не парсинг текста reason (хрупко) — прямая
+    проверка labels, которые pr_is_unhealthy сам же проверяет первыми и
+    возвращает раньше, чем доходит до pr_bad_checks."""
+    labels = {label["name"] for label in pull["labels"]}
+    return bool(labels & set(_VERDICT_UNHEALTHY_LABELS))
+
+
+def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220) -> str:
+    """Короткая выжимка последнего вердикта «нужны правки» по PR — не имя
+    метки и не дата, а СУТЬ находки, для эскалации владельцу (design.md
+    task-rework-loop не требует этого текста дословно, но эскалация,
+    читаемая занятым человеком с телефона, обязана называть, ЧТО именно
+    просит ревьюер, не пересказ истории меток). Источники — прод-форма,
+    не наш пересказ: гейт 2 (AI) — прозa после шапки факта в комментарии
+    review_labels.latest_ai_comment (header_facts останавливается на первой
+    пустой строке — то, что после неё, findings); гейт 1 — тело последнего
+    комментария check_pr.py, начинающегося с «Ревью нашло замечания:».
+    Best-effort: ни один не нашёлся — честная строка, не выдумка."""
+    ai_comment = None
+    try:
+        ai_comment = review_labels.latest_ai_comment(repo, pr_number, gh)
+    except RuntimeError:
+        pass
+    review_comment = None
+    try:
+        for comment in review_labels.list_pages(
+                f"repos/{repo}/issues/{pr_number}/comments?per_page=100", gh):
+            if (comment.get("body") or "").startswith("Ревью нашло замечания:"):
+                review_comment = comment  # последний по порядку выдачи API
+    except RuntimeError:
+        pass
+    candidates = [c for c in (ai_comment, review_comment) if c]
+    if not candidates:
+        return "текст вердикта недоступен"
+    latest = max(candidates, key=lambda c: c.get("created_at", ""))
+    body = latest.get("body") or ""
+    if latest is ai_comment:
+        lines = body.splitlines()
+        blank = next((i for i, l in enumerate(lines) if not l.strip()), len(lines))
+        prose = " ".join(lines[blank + 1:]).strip()
+    else:
+        prose = body.replace("Ревью нашло замечания:", "").strip()
+    prose = " ".join(prose.split())
+    if not prose:
+        return "текст вердикта пуст"
+    return (prose[:max_len] + "…") if len(prose) > max_len else prose
+
+
+def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: str) -> str:
+    """Design.md task-rework-loop (#256), п.4: бюджет REWORK_BUDGET исчерпан
+    вердиктом ревью (не красным чеком) — вместо возврата в пул задача уходит
+    в needs-spec, PR закрывается (не сливается, не reopen — новый заход это
+    новый PR с чистым таймлайном, design.md п.2). Действия одной транзакцией
+    отчёта, как и остальные шаги unhealthy_pulls:
+      1. снять assignee с issue (как и при обычном возврате в пул);
+      2. поставить label needs-spec на issue;
+      3. комментарий в issue — перечень ВСЕХ кругов реворка (дата + метка) +
+         явный вопрос аналитику (design.md: без ответа задача не выходит из
+         needs-spec);
+      4. закрыть PR (не слить) с комментарием, называющим номер задачи;
+      5. эскалация владельцу тем же каналом/идемпотентностью (маркер с
+         номером задачи), что stale_ready_pulls (#269) — needs-spec обязан
+         быть виден владельцу СРАЗУ, не только тому, кто листает issues
+         с этой меткой (design.md п.4, действие 5)."""
+    number = issue["number"]
+    who = ", ".join(a["login"] for a in issue["assignees"])
+    gh(
+        "-X", "DELETE", f"repos/{repo}/issues/{number}/assignees",
+        "-f", f"assignees[]={who}",
+    )
+    try:
+        release_line = f"🔓 {claim_task.release(repo, int(number))}"
+    except RuntimeError as error:
+        release_line = f"⚠️ замок task-{number} не снят: {error}"
+    gh(
+        "-X", "POST", f"repos/{repo}/issues/{number}/labels",
+        "-f", "labels[]=needs-spec",
+    )
+    events = pulse_guard.rework_events(repo, pull["number"])
+    rounds_text = "\n".join(
+        f"  {i}. {event.get('created_at', '?')} — {(event.get('label') or {}).get('name', '?')}"
+        for i, event in enumerate(events, start=1)
+    ) or "  (таймлайн круга не восстановлен)"
+    post_issue_comment(
+        repo, number,
+        f"🧭 Бюджет реворка исчерпан оркестратором: PR #{pull['number']} держит "
+        f"вердикт «нужны правки» {count}/{pulse_guard.REWORK_BUDGET} раз(а) "
+        f"({reason}). Все круги реворка этого PR:\n{rounds_text}\n"
+        f"Задача переведена в needs-spec, PR #{pull['number']} закрыт (не слит). "
+        "Аналитику: что неясно в формулировке задачи, какой блокер держит её, "
+        "какой ресёрч нужен — без ответа задача не выходит из needs-spec. "
+        "Выход: комментарий с маркером [needs-spec: снято] (называет обновлённую "
+        "формулировку критерия готовности, ИЛИ явный блокер со ссылкой, ИЛИ "
+        "ссылку на ресёрч) И снятие метки needs-spec — оба условия одновременно "
+        "(design.md task-rework-loop п.4).",
+    )
+    gh(
+        "-X", "PATCH", f"repos/{repo}/pulls/{pull['number']}",
+        "-f", "state=closed",
+    )
+    post_issue_comment(
+        repo, pull["number"],
+        f"🧭 Закрыт оркестратором — бюджет реворка исчерпан "
+        f"(rework_cycle_count={count}, порог {pulse_guard.REWORK_BUDGET}). "
+        f"Задача #{number} ушла в needs-spec. Ветка сохранена (не удалена) — "
+        "продолжение работы это НОВЫЙ PR после уточнения задачи, не reopen "
+        "этого (design.md task-rework-loop п.2: reopen вернул бы старую историю "
+        "label-событий, и rework_cycle_count немедленно снова превысил бы бюджет).",
+    )
+    marker = f"{pulse_guard.NEEDS_SPEC_MARKER} #{number}"
+    excerpt = last_verdict_excerpt(repo, pull["number"])
+    text = (
+        f"🧭 edge-harness: {marker}\n"
+        f"PR #{pull['number']} (задача #{number}) прошёл {count} круг(ов) "
+        f"реворка — бюджет {pulse_guard.REWORK_BUDGET} исчерпан. "
+        f"Последнее требование ревью: {excerpt}\n"
+        "Решить: слить как есть (переоткрыть работу вручную) / разбить задачу "
+        "на части / закрыть задачу насовсем.\n"
+        f"Снять блокировку: комментарий в #{number} с маркером "
+        "[needs-spec: снято] (причина/блокер/ресёрч) и снятие метки needs-spec "
+        "— задача вернётся в пул на общих основаниях."
+    )
+    already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+    escalation = "уже эскалировано ранее" if already else escalate(repo, WATCHDOG_ISSUE, text)
+    return (
+        f"🧭 #{number} ушла в needs-spec: PR #{pull['number']} исчерпал бюджет "
+        f"реворка ({count}/{pulse_guard.REWORK_BUDGET}, {reason}), PR закрыт "
+        f"({release_line}; эскалация: {escalation})"
+    )
 
 
 def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
@@ -1082,6 +1240,11 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             age = minutes_between(parse_time(pull["updated_at"]), now)
             if age < UNHEALTHY_PR_AFTER_MINUTES:
                 continue
+            if _pr_unhealthy_reason_is_verdict(pull):
+                count = pulse_guard.rework_cycle_count(repo, pull["number"])
+                if count >= pulse_guard.REWORK_BUDGET:
+                    lines.append(route_to_needs_spec(repo, issue, pull, count, reason))
+                    break
             who = ", ".join(a["login"] for a in issue["assignees"])
             gh(
                 "-X", "DELETE", f"repos/{repo}/issues/{number}/assignees",

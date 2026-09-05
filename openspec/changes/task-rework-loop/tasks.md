@@ -13,6 +13,10 @@ free_task не подхватывает продолжение ветки, и ne
 
 ## 1. REWORK_BUDGET в pulse_guard.py
 
+Статус: сделано (scripts/orchestra/pulse_guard.py — REWORK_BUDGET,
+rework_events, rework_cycle_count; тесты — scripts/orchestra/test_pulse_guard.py,
+фикстуры реальных таймлайнов — scripts/orchestra/fixtures_timeline_pr_*_256.json).
+
 Исполнитель: воркер/агент. Правка: константа REWORK_BUDGET=5 с комментарием
 (design.md п.2, дословно обоснование из proposal.md "Посылка каркаса") рядом
 с UNHEALTHY_PR_AFTER_MINUTES. Функция rework_cycle_count(repo, pr_number) -
@@ -23,6 +27,18 @@ rework_cycle_count(239)==1 и т.д. (кормится сохранённым JS
 timeline, не живым API - тест детерминирован без сети).
 
 ## 2. Метка needs-spec + вход (scheduler.py)
+
+Статус: сделано (scripts/orchestra/scheduler.py — pr_is_unhealthy видит оба
+гейта, route_to_needs_spec, ветвление в unhealthy_pulls; docs/agents/LABELS.md
+получил строку needs-spec — иначе test_label_registry.py краснеет на новом
+литерале в коде, эта правка не входила в п.1/п.2 буквально, но без неё CI
+красный). Смежность с #248 (stall_detector) проверена: новые строки отчёта
+(эмодзи 🧭, не ⚠️/🚨) не совпадают ни с одним regex extract_signals в diff PR
+#248 (_RED_CHECKS_RE/_NO_VERDICT_RE/_STALE_RE/_PAUSE_RE/_ARCHIVE_FAIL_RE/
+_MORDE_UNREACHABLE_RE, ни generic ⚠️/🚨 catch-all) — молча игнорируются,
+парсинг существующих отпечатков не задет. Пп.3/4/6 (free_task.py, гвардия
+маркера выхода, доки PROTOCOL/WORKER-PLAYBOOK) — отдельная задача, не входили
+в это исполнение.
 
 Исполнитель: воркер/агент. Правка первая (закрывает известный разрыв,
 specs/journal-tasks-hands/spec.md "Известный разрыв" - настоящий дефект,

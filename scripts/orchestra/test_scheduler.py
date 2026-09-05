@@ -542,6 +542,12 @@ def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
         "issues?state=open&labels=task": [task],
         "commits/sha211/check-runs": CHECK_RUNS_GREEN,  # чек зелёный — причина не в нём
         "issues/210/assignees": None,
+        # ПОД бюджетом (1 < REWORK_BUDGET=5) — остаётся обычный возврат в пул,
+        # не needs-spec (см. test_unhealthy_pulls_routes_to_needs_spec_* ниже).
+        "issues/211/timeline": [
+            {"event": "labeled", "created_at": "2026-09-02T08:00:00Z",
+             "label": {"name": "ai:changes-requested"}},
+        ],
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: None)
@@ -550,6 +556,8 @@ def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
     now = utc(2026, 9, 2, 12, 0)
     lines = sch.unhealthy_pulls(REPO, now, [p])
     assert any("ai:changes-requested" in line for line in lines)
+    assert not any("needs-spec" in line for line in lines)
+    assert not any("-X PATCH" in c and "pulls/211" in c for c in fake.calls)  # PR не закрыт
 
 
 def test_unhealthy_pulls_silent_before_threshold(monkeypatch):
@@ -641,12 +649,19 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
     unhealthy_changes = pull(2, labels=["review:ok", "ai:changes-requested"])
     draft = pull(3, labels=["review:ok"], draft=True)
     conflict = pull(4, labels=["review:ok", "conflict"])
+    # task-rework-loop #256, «Известный разрыв»: ДО этой правки pr_is_unhealthy
+    # проверял только ai:changes-requested — PR только с review:changes-requested
+    # (гейт 1) не признавался нездоровым вовсе, никогда не возвращался в пул и
+    # не попадал под бюджет реворка. Снявший ветку review:changes-requested в
+    # pr_is_unhealthy красит именно этот assert.
+    unhealthy_review_changes = pull(5, labels=["review:changes-requested"])
 
     import scheduler as _unused  # noqa: F401  (модуль уже импортирован как sch)
 
     fake = FakeGh({
         "commits/sha1/check-runs": CHECK_RUNS_GREEN,
         "commits/sha2/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha5/check-runs": CHECK_RUNS_GREEN,
     })
 
     def with_gh(fn):
@@ -659,8 +674,264 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
         assert sch.pr_is_unhealthy(REPO, unhealthy_changes) is not None
         assert sch.pr_is_unhealthy(REPO, draft) is None
         assert sch.pr_is_unhealthy(REPO, conflict) is None
+        assert sch.pr_is_unhealthy(REPO, unhealthy_review_changes) is not None
+        assert "review:changes-requested" in sch.pr_is_unhealthy(REPO, unhealthy_review_changes)
     finally:
         sch.gh = orig_gh
+
+
+# ── Бюджет реворка (task-rework-loop #256): needs-spec вместо возврата в пул ─────
+
+
+def _rework_timeline(label_name: str, count: int) -> list[dict]:
+    """Таймлайн-фикстура с ровно `count` событиями labeled того же имени —
+    не реальный снимок API (в отличие от fixtures_timeline_pr_*_256.json у
+    pulse_guard, которые кормят rework_cycle_count напрямую), а синтетика,
+    нужная только затем, чтобы контролируемо перейти порог REWORK_BUDGET в
+    сценарии unhealthy_pulls/route_to_needs_spec — сама функция подсчёта уже
+    доказана на реальных телах в test_pulse_guard.py."""
+    return [
+        {"event": "labeled", "created_at": f"2026-09-0{min(i + 1, 9)}T0{i % 9}:00:00Z",
+         "label": {"name": label_name}}
+        for i in range(count)
+    ]
+
+
+def test_unhealthy_pulls_routes_to_needs_spec_when_ai_budget_exhausted(monkeypatch):
+    task = issue(400)
+    p = pull(401, labels=["review:ok", "ai:changes-requested"],
+              updated_at="2026-09-02T09:00:00Z", pr_body="#400")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha401/check-runs": CHECK_RUNS_GREEN,
+        "issues/400/assignees": None,
+        "issues/401/timeline": _rework_timeline("ai:changes-requested", 5),  # == REWORK_BUDGET
+        "issues/401/comments?per_page=100": [],  # last_verdict_excerpt: нет вердикта — честная строка
+        "issues/400/labels": None,
+        "pulls/401": None,  # -X PATCH state=closed
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+
+    assert any("needs-spec" in line and "401" in line for line in lines)
+    # issue переведена: assignee снят, метка needs-spec поставлена
+    assert any("issues/400/assignees" in c and "-X DELETE" in c for c in fake.calls)
+    assert any("issues/400/labels" in c and "needs-spec" in c for c in fake.calls)
+    # PR закрыт, не слит
+    assert any("-X PATCH" in c and "pulls/401" in c and "state=closed" in c for c in fake.calls)
+    assert not any("-X PUT" in c and "merge" in c for c in fake.calls)
+    # оба комментария (issue-разбор + PR-закрытие) реально отправлены
+    assert any(n == 400 and "needs-spec" in text for n, text in posted)
+    assert any(n == 401 and "закрыт" in text.lower() for n, text in posted)
+    # эскалация — комментарий в WATCHDOG_ISSUE с маркером и номером задачи
+    assert any(n == sch.WATCHDOG_ISSUE and sch.pulse_guard.NEEDS_SPEC_MARKER in text
+               and "400" in text for n, text in posted)
+
+
+def test_unhealthy_pulls_routes_to_needs_spec_on_review_changes_requested_only(monkeypatch):
+    # Обязательная фикстура задания: PR ТОЛЬКО с review:changes-requested,
+    # ai:changes-requested не стоит вовсе. Без фикса pr_is_unhealthy (см. выше)
+    # PR не считался бы нездоровым — этот тест красен без него: reason был
+    # бы None, unhealthy_pulls вообще не входит в тело цикла по этому PR.
+    task = issue(410)
+    p = pull(411, labels=["review:changes-requested"],
+              updated_at="2026-09-02T09:00:00Z", pr_body="#410")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha411/check-runs": CHECK_RUNS_GREEN,
+        "issues/410/assignees": None,
+        "issues/411/timeline": _rework_timeline("review:changes-requested", 5),
+        "issues/411/comments?per_page=100": [],
+        "issues/410/labels": None,
+        "pulls/411": None,
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+
+    assert any("needs-spec" in line and "411" in line for line in lines)
+    assert any("issues/410/labels" in c and "needs-spec" in c for c in fake.calls)
+    assert any("-X PATCH" in c and "pulls/411" in c and "state=closed" in c for c in fake.calls)
+
+
+def test_unhealthy_pulls_stays_in_pool_under_rework_budget(monkeypatch):
+    # 4 круга < REWORK_BUDGET=5 — прежнее поведение (возврат в пул, PR не
+    # закрыт), needs-spec не наступает раньше времени.
+    task = issue(420)
+    p = pull(421, labels=["review:ok", "ai:changes-requested"],
+              updated_at="2026-09-02T09:00:00Z", pr_body="#420")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha421/check-runs": CHECK_RUNS_GREEN,
+        "issues/420/assignees": None,
+        "issues/421/timeline": _rework_timeline("ai:changes-requested", 4),
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+    assert any("возвращена в пул" in line for line in lines)
+    assert not any("needs-spec" in line for line in lines)
+    assert not any("-X PATCH" in c and "pulls/421" in c for c in fake.calls)
+
+
+def test_unhealthy_pulls_stays_in_pool_on_red_check_regardless_of_rework_count(monkeypatch):
+    # Красный обязательный чек — не бюджет реворка (design.md п.2): даже если
+    # rework_cycle_count был бы огромным, причина «красные проверки» не ведёт
+    # в needs-spec, а таймлайн вообще не должен читаться (флаки-тест — другой
+    # класс, timeline читать незачем).
+    task = issue(430)
+    p = pull(431, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z", pr_body="#430")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha431/check-runs": CHECK_RUNS_RED,
+        "issues/430/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+    assert any("возвращена в пул" in line for line in lines)
+    assert not any("timeline" in c for c in fake.calls)  # красный чек — не наш класс
+
+
+# ── Мутация гвардии бюджета: без ветвления needs-spec никогда не наступает ───────
+
+
+def test_unhealthy_pulls_mutation_without_budget_branch_never_reaches_needs_spec(monkeypatch):
+    task = issue(440)
+    p = pull(441, labels=["review:ok", "ai:changes-requested"],
+              updated_at="2026-09-02T09:00:00Z", pr_body="#440")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha441/check-runs": CHECK_RUNS_GREEN,
+        "issues/440/assignees": None,
+        "issues/441/timeline": _rework_timeline("ai:changes-requested", 5),
+        "issues/440/labels": None,
+        "pulls/441": None,
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    # Мутация: обнуляем ветвление — как будто route_to_needs_spec никогда не
+    # вызывается (снят порог/условие в unhealthy_pulls). Гвардия: пока
+    # ветвление НА МЕСТЕ (без monkeypatch ниже), тест снизу это доказывает;
+    # здесь же — прямое доказательство, что убрав функцию, поведение красится.
+    monkeypatch.setattr(sch, "route_to_needs_spec",
+                         lambda *a, **k: pytest.fail("мутация: не должно быть вызвано"))
+    monkeypatch.setattr(sch.pulse_guard, "REWORK_BUDGET", 999)  # бюджет недостижим
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+    assert any("возвращена в пул" in line for line in lines)
+    assert not any("needs-spec" in line for line in lines)
+
+
+def test_route_to_needs_spec_escalates_with_marker_and_pr_number(monkeypatch):
+    """Мутация прицельно на эскалацию (design.md п.4, действие 5): снять
+    вызов escalate/маркер — этот тест перестаёт находить маркер в
+    WATCHDOG_ISSUE и краснеет."""
+    task = issue(450)
+    p = pull(451, labels=["review:ok", "ai:changes-requested"], pr_body="#450")
+    fake = FakeGh({
+        "issues/450/assignees": None,
+        "issues/450/labels": None,
+        "pulls/451": None,
+        "issues/451/timeline": _rework_timeline("ai:changes-requested", 5),
+        "issues/451/comments?per_page=100": [],  # last_verdict_excerpt: нет вердикта — честная строка
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    sch.route_to_needs_spec(REPO, task, p, 5, "метка ai:changes-requested")
+
+    watchdog_posts = [text for n, text in posted if n == sch.WATCHDOG_ISSUE]
+    assert watchdog_posts, "эскалация в WATCHDOG_ISSUE не отправлена"
+    assert sch.pulse_guard.NEEDS_SPEC_MARKER in watchdog_posts[0]
+    assert "451" in watchdog_posts[0] and "450" in watchdog_posts[0]
+
+
+def test_route_to_needs_spec_idempotent_when_marker_already_posted(monkeypatch):
+    """Тот же приём, что READY_STALL_MARKER/stale_ready_pulls — если маркер
+    по этой задаче уже стоит в WATCHDOG_ISSUE, повторная эскалация не шлётся
+    (issue при этом обычно уже закрыта/не существует в open_pulls к моменту
+    повторного прохода — этот тест доказывает поведение самой функции даже
+    если её вызвали повторно)."""
+    task = issue(460)
+    p = pull(461, labels=["review:ok", "ai:changes-requested"], pr_body="#460")
+    marker = f"{sch.pulse_guard.NEEDS_SPEC_MARKER} #460"
+    fake = FakeGh({
+        "issues/460/assignees": None,
+        "issues/460/labels": None,
+        "pulls/461": None,
+        "issues/461/timeline": _rework_timeline("ai:changes-requested", 5),
+        "issues/461/comments?per_page=100": [],
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-01T00:00:00Z", "body": f"🧭 edge-harness: {marker}\n…"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    sch.route_to_needs_spec(REPO, task, p, 5, "метка ai:changes-requested")
+
+    assert not any(n == sch.WATCHDOG_ISSUE for n, _ in posted), "маркер уже стоит — повторно не шлём"
+
+
+def test_last_verdict_excerpt_pulls_real_ai_review_findings_not_header(monkeypatch):
+    """Выжимка для эскалации — реальная прод-форма комментария AI-ревью
+    (ai_review.build_comment, не наш пересказ формата): шапка pr:/head:/
+    reviewer:/diff: должна остаться ЗА кадром, в выжимке — findings-текст,
+    который реально просит доработать."""
+    import importlib.util as _ilu
+    ai_spec = _ilu.spec_from_file_location(
+        "ai_review", _DIR.parent / "review" / "ai_review.py")
+    ai = _ilu.module_from_spec(ai_spec)
+    ai_spec.loader.exec_module(ai)
+
+    body = ai.build_comment(
+        501, "sha501", "rework",
+        "Найдена гонка в claim_task.release — замок снимается до commit.",
+        [], diff_fp="deadbeef",
+    )
+    fake = FakeGh({
+        "issues/501/comments?per_page=100": [{
+            "created_at": "2026-09-05T10:00:00Z",
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "body": body,
+        }],
+    })
+    patch_gh(monkeypatch, fake)
+    excerpt = sch.last_verdict_excerpt(REPO, 501)
+    assert "гонка в claim_task.release" in excerpt
+    assert "reviewer:" not in excerpt and "head:" not in excerpt  # шапка не просочилась
+
+
+def test_last_verdict_excerpt_honest_when_no_verdict_found(monkeypatch):
+    fake = FakeGh({"issues/502/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.last_verdict_excerpt(REPO, 502) == "текст вердикта недоступен"
 
 
 # ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
