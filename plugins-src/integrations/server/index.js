@@ -58,7 +58,7 @@ import {
   SLACK_API,
 } from './core.js'
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '0.1.1'
 const TOOL_TIMEOUT_MS = 15_000
 // Первый же комментарий-лимит: fields=comment отдаёт первую страницу
 // (максимум из настроек задачи), latest добирается отдельным вызовом.
@@ -208,12 +208,15 @@ function defineConfluencePageTool() {
     parameters: {
       query: {
         type: 'string',
-        required: false,
+        // Опциональный параметр объявляется ОТСУТСТВИЕМ ключа required —
+        // ставить его со значением "false" контракт схем cordis 4 отклоняет
+        // (UNSUPPORTED_SCHEMA: «parameters.query.required must be true when
+        // present»), см. дым dsh-edge/smoke-edge-plugins.mjs и гвардию
+        // check-plugin-compat.mjs (класс #314).
         description: 'CQL-поиск, например type=page AND text~"runbook". Найдёт до 5 страниц.',
       },
       page_id: {
         type: 'string',
-        required: false,
         description: 'Id страницы (из результата поиска) — тогда вернётся содержимое.',
       },
     },
@@ -290,7 +293,9 @@ function defineBitbucketPrTool() {
       title: { type: 'string', required: true, description: 'Заголовок PR.' },
       source: { type: 'string', required: true, description: 'Ветка-источник (существующая).' },
       destination: { type: 'string', required: true, description: 'Ветка-приёмник (существующая).' },
-      description: { type: 'string', required: false, description: 'Описание PR (markdown Bitbucket).' },
+      // required не объявлен: опциональный параметр — отсутствием ключа, не
+      // значением "false" (класс #314, см. комментарий у confluence_page выше).
+      description: { type: 'string', description: 'Описание PR (markdown Bitbucket).' },
     },
     output: { schema: outputSchema(), render: textRender() },
     timeoutMs: 45_000,
