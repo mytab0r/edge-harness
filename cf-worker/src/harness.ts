@@ -1381,16 +1381,19 @@ export class Harness extends DurableObject<Env> {
     }
 
     // Заголовок — первая строка без командного слова (общий с классификатором
-    // список DIRECTIVE_WORDS), потолок 80 символов.
+    // список DIRECTIVE_WORDS), потолок 80 символов. Маскирование ДО нарезки:
+    // усечённый секрет короче минимума паттерна уже не маскируется и утекает
+    // в публичный заголовок сырым хвостом (ревью head 3706d87).
     const firstLine = text.trim().split(/\r?\n/)[0];
     const stripped = firstLine.replace(TITLE_PREFIX_RE, "").trim();
     const base = stripped || firstLine;
-    const title = base.length > 80 ? base.slice(0, 77) + "..." : base;
+    const titleRedacted = redact(base);
+    const title =
+      titleRedacted.text.length > 80 ? titleRedacted.text.slice(0, 77) + "..." : titleRedacted.text;
 
     // Публичный issue — первый наружный путь произвольного фриформ-текста:
     // секреты маскируются тем же классом паттернов, что dsh-ci.sh::redact
     // (п.29 спеки), факт маскирования виден в result сообщения.
-    const titleRedacted = redact(title);
     const bodyRedacted = redact(text);
     const body =
       `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${bodyRedacted.text}\n\`\`\`\n\n---\n` +

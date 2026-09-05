@@ -786,6 +786,19 @@ describe("inbox: сообщения владельца", () => {
 
   it("текст владельца с секретом уезжает в публичный issue замаскированным (первый наружный путь фриформа)", async () => {
     const s = sender();
+    // Граничный случай (ревью head 3706d87): секрет начинается близко к
+    // порогу нарезки заголовка — усечение ДО маскирования оставляло сырой
+    // хвост короче минимума паттерна.
+    const fakeGhp = `ghp_${"a1".repeat(15)}`;
+    const filler = "/task Секреты: " + "слово ".repeat(13); // ~80 символов до токена
+    const boundary = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `secret-boundary-${s}`,
+        sender_id: s,
+        text: `${filler}${fakeGhp}`,
+      })
+    ).json<{ message_id: number }>();
     const created = await (
       await postJson("/api/messages", {
         source: "test-process",
@@ -822,6 +835,13 @@ describe("inbox: сообщения владельца", () => {
 
       const msg = await getJson<{ message: { result: string } }>(`/api/messages/${created.message_id}`);
       expect(JSON.parse(msg.message.result).secrets_redacted).toBe(true);
+
+      // Секрет на границе нарезки: никакого сырого фрагмента ghp_<символы>
+      // в публичном заголовке — маскирование случилось до усечения.
+      const boundaryCall = calls.find((c) => String(c.body.title).includes("Секреты"));
+      expect(boundaryCall).toBeDefined();
+      expect(boundaryCall!.body.title).not.toContain(fakeGhp);
+      expect(boundaryCall!.body.title).not.toMatch(/ghp_[A-Za-z0-9]{2,}/);
     } finally {
       vi.unstubAllGlobals();
       env.GH_ISSUES_TOKEN = "";
