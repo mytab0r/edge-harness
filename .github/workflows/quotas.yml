@@ -1,0 +1,42 @@
+# Срез квот и лимитов харнеса (#324): Cloudflare/GitHub/LLM-провайдер в одну
+# таблицу, а не гадание при следующем инциденте (см.
+# scripts/measure/quotas.py). Секреты Cloudflare есть только здесь — поэтому
+# отдельный маленький workflow с ручным триггером, а не часть другого файла.
+#
+# permissions.issues:write — escalate() пишет след в задачу-статус #120 при
+# превышении порога 80% (тот же канал, что у предохранителя конвейера, второй
+# не заводим). Периодического расписания нет намеренно: снятие среза —
+# by-demand операция; если станет нужен регулярный мониторинг — добавить cron
+# отдельным решением, а не тихой мутацией этого файла.
+name: quotas
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  quotas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Тесты сборщика квот
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/measure/test_quotas.py -q
+
+      - name: Снять срез квот
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quotas.py
