@@ -229,11 +229,57 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
+    # Детектор простоя (#201) — отдельная забота, не эта гвардия; здесь важен
+    # только путь «жёсткий сбой архивации красит прогон», не его проводка.
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
     code = sch.main()
     assert code == 1  # прогон окрашен красным — мерж уже состоялся, но поломка не молчит
     assert escalated and escalated[0][0] == "o/r" and escalated[0][1] == sch.WATCHDOG_ISSUE
+
+
+def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
+    """Находка ревью PR #248: до фикса RuntimeError из detect_and_act/
+    escalate_stale_auto_tasks (сеть, gh без авторизации) выходил из main()
+    НЕПОЙМАННЫМ — отчёт пульса (уже посчитанные строки: мержи, heartbeat)
+    терялся целиком, summary(lines) не вызывался вовсе. Гвардия: сбой
+    детектора красит прогон, но summary всё равно получает строки отчёта,
+    включая уже сделанное слияние — тот же приём, что у archive_hard_failure."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], False))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
+
+    def boom(repo, now, lines, run_url=None):
+        raise RuntimeError("gh api issues?labels=auto-detected: authentication required")
+
+    monkeypatch.setattr(sch, "detect_and_act", boom)
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: pytest.fail(
+        "не должен вызываться — detect_and_act уже упал"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    saved = []
+    monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
+
+    code = sch.main()
+
+    assert code == 1  # детектор сломан — прогон окрашен красным
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert saved, "summary(lines) обязан быть вызван — отчёт не теряется на сбое детектора"
+    assert any("✅ PR #1 слит" in line for line in saved[0]), (
+        "отчёт о слиянии, посчитанном ДО сбоя детектора, потерян"
+    )
 
 
 def test_main_stays_green_when_archive_ok(monkeypatch):
@@ -252,6 +298,9 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
+    # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать — сбоя не было"))
     assert sch.main() == 0
 
@@ -261,6 +310,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     ветка, независимая от archive_hard_failure."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
@@ -274,29 +324,38 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
+    # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "escalate", lambda *a: "ок")
     assert sch.main() == 1
 
 
-# pulse_guard живёт как отдельный модуль (sys.modules["pulse_guard"], тот же
-# файл, что импортирует scheduler.py через `from pulse_guard import …`).
-# issue_marker_times/post_issue_comment внутри pulse_guard вызывают СВОЙ
-# module-level gh — патчить нужно оба модуля разом (см. patch_gh ниже),
-# иначе часть вызовов уходит в настоящий `gh api` подпроцесс.
+# pulse_guard/stall_detector живут как отдельные модули (sys.modules[…], те
+# же файлы, что импортирует scheduler.py через `from … import …`). Функции,
+# определённые В НИХ (issue_marker_times/post_issue_comment/conveyor_gate/
+# heartbeat_check/detect_and_act), резолвят `gh` через __globals__ СВОЕГО
+# модуля — патчить нужно все три модуля разом (см. patch_gh ниже), иначе
+# часть вызовов уходит в настоящий `gh api` подпроцесс (класс #201: то же
+# самое разбиралось для scripts/orchestra/test_stall_detector.py).
 pg = sys.modules["pulse_guard"]
+sd = sys.modules["stall_detector"]
 
 
 def patch_gh(monkeypatch, fake):
-    """Единая точка патча: и scheduler.gh (для прямых вызовов scheduler.py),
-    и pulse_guard.gh (для issue_marker_times/post_issue_comment/conveyor_gate/
-    heartbeat_check, которые scheduler лишь реэкспортирует по имени)."""
+    """Единая точка патча: scheduler.gh (прямые вызовы scheduler.py),
+    pulse_guard.gh (issue_marker_times/post_issue_comment/conveyor_gate/
+    heartbeat_check, которые scheduler лишь реэкспортирует по имени) и
+    stall_detector.gh (detect_and_act/escalate_stale_auto_tasks, #201)."""
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(sd, "gh", fake)
 
 
 def patch_post_issue_comment(monkeypatch, fn):
     monkeypatch.setattr(sch, "post_issue_comment", fn)
     monkeypatch.setattr(pg, "post_issue_comment", fn)
+    monkeypatch.setattr(sd, "post_issue_comment", fn)
 
 
 def utc(*args):
@@ -1675,6 +1734,13 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    # Без заглушки эти два вызова main() бьют настоящим `gh api` (#201) —
+    # в CI без GH_TOKEN это гарантированный красный прогон (находка ревью PR #248):
+    # gh отказывает без авторизации ДО сетевого запроса, а не молча читает
+    # публичный эндпоинт анонимно.
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
@@ -1726,6 +1792,11 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
              "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
         ],
         "issues/134": {"number": 134, "labels": []},
+        # Детектор простоя (#201): пустой отчёт => detect_and_act не делает ни
+        # одного вызова (см. test_stall_detector.py::test_idle_conveyor_makes_zero_calls);
+        # escalate_stale_auto_tasks всё равно читает список автозадач — маршрут
+        # нужен, пустой список => дальше вызовов нет вовсе.
+        "issues?state=open&labels=auto-detected": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
