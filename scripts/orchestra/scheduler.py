@@ -160,12 +160,23 @@ def summary(lines: list[str]) -> None:
 
 
 def open_task_issues(repo: str) -> list[dict]:
-    issues = gh(f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100")
+    # Пагинация (#308, тот же класс, что list_pr_files/list_timeline, #294/
+    # #303): сырая первая страница `per_page=100` молча теряла хвост — при
+    # 106 открытых задачах с меткой task (107 сырых записей issues на этой
+    # выборке, одна из них — #248, сама PR под меткой task, отфильтрована
+    # ниже по ключу pull_request; замер 2026-09-05, живой репозиторий —
+    # `open_task_issues` и `search/issues?...&label:task` сошлись на 107)
+    # воркер и планировщик не видели последние 7, без ошибки и без
+    # предупреждения.
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
 def open_pulls(repo: str) -> list[dict]:
-    return gh(f"repos/{repo}/pulls?state=open&per_page=100")
+    # Тот же класс #308: список PR растёт тем же темпом, что и пул задач —
+    # первая страница молча теряла бы хвост тем же образом.
+    return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
 
 
 def pr_references_issue(pull: dict, issue_number: int) -> bool:
@@ -189,7 +200,11 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, di
         number = issue["number"]
         if any(pr_references_issue(pull, number) for pull in pulls):
             continue
-        timeline = gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")
+        # Пагинация (#308, тот же класс, что last_review_ok_labeled_at/
+        # last_ready_labeled_at ниже, #303): сырая первая страница таймлайна
+        # молча теряла событие assigned за первой сотней записей на длинном
+        # таймлайне — сюда фикс #303 не мигрировали.
+        timeline = review_labels.list_timeline(repo, number, gh)
         assigned_at = [
             event["created_at"] for event in timeline
             if event.get("event") == "assigned"
