@@ -43,3 +43,32 @@
       `harness/review: success`, `harness/ai-review: pending`.
 - [ ] Владелец включает контексты в branch protection (команда — в отчёте
       задачи #345) — после подтверждения живым прогоном.
+
+## Доработка по ревью PR #346 (вердикт rework → исправлено)
+
+- [x] [blocker] Skip-путь второго гейта (`check_pr.py::ai_verdict_keep` ==
+      True) оставлял `harness/ai-review` без статуса на новом head:
+      `ai-review.yml` сам эту ветку не проходит (`should_run_ai_review`
+      отдаёт `go=false`), значит статус там ставить некому — после
+      включения required status checks PR застревал бы в «Expected»
+      навсегда. Исправлено: `check_pr.py` зеркалит уже вынесенный вердикт
+      на текущий head через `post_commit_status`, читая `reviewer:` из уже
+      прочитанного (для сверки отпечатка) AI-комментария — второго
+      сетевого запроса и второго решения нет. Тесты:
+      `test_check_pr_mirrors_ai_status_on_keep_path`,
+      `test_check_pr_mirrors_ai_status_rework_on_keep_path`,
+      `test_check_pr_mutation_guard_no_mirror_without_keep`
+      (`scripts/review/test_check_pr.py`); мутация подтверждена вручную —
+      снятие зеркала красит первые два теста.
+- [x] [minor] `post_commit_status` докстринг «140 байт» → «140 символов»
+      (срез `[:140]` режет по символам Python-строки, лимит API — в
+      символах; байтовая формулировка соблазняла бы будущий фикс резать по
+      байтам UTF-8 и обрезать кириллицу сильнее нужного).
+- [x] [minor] `proposal.md`: ссылка на «ADR 0012» помечена форвард-ссылкой
+      явно (как и research/23 выше) — номер 0012 уже занят в main другим
+      решением (`docs/decisions/0012-orchestra-event-trigger-merge-loop.md`),
+      PR #340 предлагает тот же номер для «Merge Queue недоступна» —
+      коллизия резолвится при слиянии #340, здесь номер не фиксируется.
+- [x] [мелочь] Дельта занимала п.19 (уже «Аутентификация» в основной
+      спеке) — перенумеровано в свободный п.38 (следующий за максимумом
+      37 в `openspec/specs/journal-tasks-hands.md` на момент правки).

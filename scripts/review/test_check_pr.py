@@ -257,7 +257,8 @@ def test_ai_verdict_keep_mutation_guard_diff_unchanged():
 # «gh pr diff» (единственный сырой вызов внутри main(), gh()/run_gh()
 # перехватываются собственными функциями модуля целиком).
 
-def _run_check_pr_main(monkeypatch, capsys, diff_text: str, pull: dict, files: list):
+def _run_check_pr_main(monkeypatch, capsys, diff_text: str, pull: dict, files: list,
+                        comments: list | None = None):
     import subprocess as real_subprocess
     from types import SimpleNamespace
 
@@ -276,6 +277,9 @@ def _run_check_pr_main(monkeypatch, capsys, diff_text: str, pull: dict, files: l
         if url.startswith("repos/o/r/pulls/1/files"):
             page = url.split("page=")[-1]
             return files if page == "1" else []
+        if url.startswith("repos/o/r/issues/1/comments"):
+            page = url.split("page=")[-1]
+            return (comments or []) if page == "1" else []
         raise AssertionError(f"неожиданный вызов gh: {url}")
 
     run_gh_calls: list[tuple] = []
@@ -333,3 +337,72 @@ def test_check_pr_posts_status_through_review_labels_helper():
     assert "review_labels.post_commit_status(" in source
     assert "review_labels.STATUS_REVIEW" in source
     assert "review_labels.review_status_state(verdict)" in source
+
+
+# Зеркало harness/ai-review на keep-пути (находка ai-ревью PR #346): чистое
+# подтягивание main сохраняет ai:*-метку (ai_verdict_keep), но ai-review.yml
+# сам эту ветку не проходит (should_run_ai_review отдаёт false, job verdict
+# скипается) — без публикации здесь статус на новом head не появился бы
+# НИКОГДА, и после включения required status checks PR застревал бы в
+# «Expected» без единого механизма его снять.
+
+def test_check_pr_mirrors_ai_status_on_keep_path(monkeypatch, capsys):
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    fp = rl.diff_fingerprint(files)
+    pull = {"head": {"sha": "newsha"}, "labels": [{"name": rl.AI_OK}]}
+    comments = [{
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: oldsha\nreviewer: approve\ndiff: {fp}\n\nпроза",
+    }]
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert len(ai_calls) == 1, run_gh_calls
+    joined = " ".join(ai_calls[0])
+    assert "repos/o/r/statuses/newsha" in joined
+    assert "state=success" in joined  # approve → success (ai_status_state)
+
+    # Метка ai:ok не снята — гейт сохранён (существующее поведение keep-пути).
+    label_deletes = [a for a in run_gh_calls
+                     if "DELETE" in a and "labels/ai:" in " ".join(a)]
+    assert label_deletes == []
+
+
+def test_check_pr_mirrors_ai_status_rework_on_keep_path(monkeypatch, capsys):
+    # Тот же путь, но сохранённый вердикт — rework: зеркало обязано отразить
+    # failure, не success, иначе required status check лгал бы об отклонённом коде.
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    fp = rl.diff_fingerprint(files)
+    pull = {"head": {"sha": "newsha2"}, "labels": [{"name": rl.AI_CHANGES}]}
+    comments = [{
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: oldsha\nreviewer: rework\ndiff: {fp}\n\nпроза",
+    }]
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert len(ai_calls) == 1, run_gh_calls
+    joined = " ".join(ai_calls[0])
+    assert "repos/o/r/statuses/newsha2" in joined
+    assert "state=failure" in joined  # rework → failure (ai_status_state)
+
+
+def test_check_pr_mutation_guard_no_mirror_without_keep(monkeypatch, capsys):
+    # Мутационная гвардия: без ai:*-метки на PR (первое ревью) keep-путь не
+    # исполняется вовсе — зеркало не публикуется, второй прогон ai-review сам
+    # поставит harness/ai-review после настоящего вердикта.
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    pull = {"head": {"sha": "freshsha"}, "labels": []}
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments=None)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert ai_calls == []

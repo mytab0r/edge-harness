@@ -426,8 +426,10 @@ def post_commit_status(repo: str, sha: str, context: str, state: str,
     состоянием, что метка (см. review_status_state/ai_status_state).
     `run_gh_func` — вызывающий `gh(*args)`/`run_gh` того же модуля (паттерн
     остальных функций этого файла: сеть не зашивается сюда, инъекция
-    зависимости для тестов без сети). description обрезается до 140 байт —
-    жёсткий лимит самого API, обрезка здесь, а не молчаливый отказ GitHub."""
+    зависимости для тестов без сети). description обрезается до 140 символов —
+    жёсткий лимит самого API именно в символах (срез `[:140]` режет по
+    символам Python-строки, не по байтам UTF-8 — кириллица не обрезается
+    сильнее нужного), обрезка здесь, а не молчаливый отказ GitHub."""
     args = ["api", "-X", "POST", f"repos/{repo}/statuses/{sha}",
             "-f", f"state={state}", "-f", f"context={context}",
             "-f", f"description={description[:140]}"]
