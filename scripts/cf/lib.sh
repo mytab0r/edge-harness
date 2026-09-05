@@ -24,16 +24,37 @@ cf_require_env() {
 # cf_get <path> — GET https://api.cloudflare.com/client/v4<path>.
 # Печатает тело ответа (JSON) в stdout при успехе. При отказе пишет причину
 # в stderr и возвращает ненулевой код — вызывающий решает, останавливаться или
-# продолжать инвентарь дальше.
+# продолжать инвентарь дальше. Только GET: это инвентарь, не панель управления —
+# мутирующих запросов (POST/PUT/DELETE) в scripts/cf/ намеренно нет, см.
+# docs/agents/INFRA-CF.md, раздел «Границы».
 cf_get() {
   local path="$1"
-  _cf_request GET "$path" ""
-}
-
-# cf_post <path> <json-body> — POST с тем же контрактом, что и cf_get.
-cf_post() {
-  local path="$1" body="$2"
-  _cf_request POST "$path" "$body"
+  local url="https://api.cloudflare.com/client/v4${path}"
+  local tmp code
+  tmp=$(mktemp)
+  code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    "$url")
+  case "$code" in
+    200)
+      cat "$tmp"; rm -f "$tmp"
+      ;;
+    403)
+      echo "НЕТ ДОСТУПА: 403 на GET $path — токену не хватает права на эту область." >&2
+      cat "$tmp" >&2; rm -f "$tmp"
+      return 1
+      ;;
+    404)
+      echo "НЕ НАЙДЕНО: 404 на GET $path — ресурс отсутствует или путь неверен." >&2
+      cat "$tmp" >&2; rm -f "$tmp"
+      return 1
+      ;;
+    *)
+      echo "ОШИБКА: GET $path вернул HTTP $code" >&2
+      cat "$tmp" >&2; rm -f "$tmp"
+      return 1
+      ;;
+  esac
 }
 
 # Проект, за который отвечает этот репозиторий, — ровно два воркера
@@ -95,41 +116,4 @@ cf_do_namespaces_own() {
     (.result // []) as $all
     | ($all | map(select(.script as $s | $allow | index($s)))) as $own
     | {"свои": $own, "всего_в_аккаунте": ($all|length), "чужих_не_показано": (($all|length)-($own|length))}'
-}
-
-_cf_request() {
-  local method="$1" path="$2" body="$3"
-  local url="https://api.cloudflare.com/client/v4${path}"
-  local tmp code
-  tmp=$(mktemp)
-  if [ -n "$body" ]; then
-    code=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
-      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$body" "$url")
-  else
-    code=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
-      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-      "$url")
-  fi
-  case "$code" in
-    200)
-      cat "$tmp"; rm -f "$tmp"
-      ;;
-    403)
-      echo "НЕТ ДОСТУПА: 403 на $method $path — токену не хватает права на эту область." >&2
-      cat "$tmp" >&2; rm -f "$tmp"
-      return 1
-      ;;
-    404)
-      echo "НЕ НАЙДЕНО: 404 на $method $path — ресурс отсутствует или путь неверен." >&2
-      cat "$tmp" >&2; rm -f "$tmp"
-      return 1
-      ;;
-    *)
-      echo "ОШИБКА: $method $path вернул HTTP $code" >&2
-      cat "$tmp" >&2; rm -f "$tmp"
-      return 1
-      ;;
-  esac
 }
