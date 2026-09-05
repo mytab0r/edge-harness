@@ -9,6 +9,7 @@
 Запуск: python -m pytest scripts/measure/test_dispatch_tail.py -q
 """
 
+import argparse
 import importlib.util
 import subprocess
 import sys
@@ -183,7 +184,8 @@ def test_summarize_numbers_and_evidence():
     assert "p90 9.0 с" in text
     assert "max 10.0 с" in text
     # бакеты: бизнес-окно 2 замера медиана 9.5 с; прочее 8 замеров медиана 4.5 с
-    assert "медиана 9.5 с, max 10.0 с (2 замеров)" in text
+    assert ("медиана 9.5 с, max 10.0 с (2 замеров; по дням UTC: 2026-08-31 — 2; "
+            "критерий дня закрыт одной серией (2 из 2))") in text
     assert "медиана 4.5 с" in text
     # улики: ссылка на худший run и сверка с базовыми 22 замерами
     assert "runs/1000009" in text
@@ -329,3 +331,281 @@ def test_append_and_push_dedupes_probe_id(tmp_path):
     assert dt.append_and_push(str(work), again, "probe probe-dup: late") is False
     rows = dt.read_rows((work / dt.CSV_PATH).read_text(encoding="utf-8"))
     assert len(rows) == 1 and rows[0]["status"] == "timeout"
+
+
+# ── Цепочка тиков: решение о следующей ступени ───────────────────────────────────
+
+
+def active_cov():
+    return dt.coverage(make_rows(10, utc(2026, 8, 31, 13, 0), timedelta(minutes=20)),
+                       now=utc(2026, 9, 1, 0))
+
+
+def test_should_chain_continues_active_campaign():
+    assert dt.should_chain(active_cov(), workflow_on_main=True) == ""
+
+
+def test_should_chain_stops_on_success_limit_and_inactive_workflow():
+    met = dt.coverage(make_rows(100, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                      now=utc(2026, 9, 2, 0))
+    assert "покрытие достигнуто" in dt.should_chain(met, workflow_on_main=True)
+    overdue = dt.coverage(make_rows(3, utc(2026, 8, 31, 13, 0), timedelta(minutes=20)),
+                          now=utc(2026, 9, 10, 0))
+    assert "лимит дней" in dt.should_chain(overdue, workflow_on_main=True)
+    # неактивная кампания: отказ без новой ступени — иначе красная цепочка зациклится
+    assert "неактивна" in dt.should_chain(active_cov(), workflow_on_main=False)
+
+
+# ── Финализация: успех и недобор обязаны отличаться снаружи ──────────────────────
+
+
+def test_finalize_outcome_met_marks_pr_ready():
+    met = dt.coverage(make_rows(100, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                      now=utc(2026, 9, 2, 0))
+    outcome = dt.finalize_outcome(met)
+    assert outcome["ready"] is True
+    assert outcome["verdict"] == ""
+    assert "закрой задачу" in outcome["closing"]
+
+
+def test_finalize_outcome_unmet_keeps_draft_and_forbids_closing():
+    # предохранитель: строк много, но критерий не набран — ровно путь из ревью #108
+    unmet = dt.coverage(make_rows(45, utc(2026, 8, 31, 12, 0), timedelta(minutes=20)),
+                        now=utc(2026, 9, 10, 0))
+    assert unmet["overdue"] and not unmet["met"]
+    outcome = dt.finalize_outcome(unmet)
+    assert outcome["ready"] is False
+    assert "НЕ достигнут" in outcome["verdict"]
+    assert "НЕ закрывать" in outcome["closing"]
+    assert "закрой задачу" not in outcome["closing"]
+    assert "CAMPAIGN_MAX_DAYS" in outcome["closing"]  # путь продления назван явно
+
+
+# ── Продление кампании — env снаружи кода, а не правка константы ─────────────────
+
+
+def test_campaign_max_days_env_override(monkeypatch):
+    monkeypatch.delenv(dt.CAMPAIGN_MAX_DAYS_ENV, raising=False)
+    assert dt.campaign_max_days() == 7
+    monkeypatch.setenv(dt.CAMPAIGN_MAX_DAYS_ENV, "30")
+    assert dt.campaign_max_days() == 30
+
+
+def test_coverage_overdue_follows_max_days_argument():
+    rows = make_rows(3, utc(2026, 8, 31, 13, 0), timedelta(minutes=20))
+    assert dt.coverage(rows, now=utc(2026, 9, 4, 0), max_days=3)["overdue"]
+    assert not dt.coverage(rows, now=utc(2026, 9, 4, 0), max_days=10)["overdue"]
+
+
+# ── Сводка: неравномерность сбора и вырожденная очередь видны ────────────────────
+
+
+def test_summarize_reports_cadence():
+    text = dt.summarize(summary_fixture())
+    assert "интервалы между замерами: медиана 10 мин" in text
+    # самая длинная щель: 13:10 вс 2026-08-30 → 13:00 пн 2026-08-31
+    assert "max 23.8 ч" in text
+
+
+def test_summarize_marks_zero_queue_as_not_measured():
+    rows = summary_fixture()
+    for row in rows:
+        if row["status"] == "ok":
+            row["queue_ms"] = "0"
+    text = dt.summarize(rows)
+    assert "queue_ms = 0 во всех строках" in text
+    assert "не измеряется" in text
+    # вырожденная колонка не дублируется статистикой «медиана 0.0 с»
+    assert "чистое ожидание раннера (часы GitHub" not in text
+
+
+def test_summarize_keeps_silent_on_informative_queue():
+    assert "queue_ms = 0 во всех строках" not in dt.summarize(summary_fixture())
+
+
+def test_summarize_business_rows_breakdown_by_day():
+    """Ревью #108: 53 из 71 бизнес-строк лежали в одной двухчасовой серии —
+    сводка печатала «71/20 ✅» без оговорки. Бизнес-строки обязаны быть видны
+    по дням UTC, а доминирование одного дня — названо прямо."""
+    text = dt.summarize(summary_fixture())  # 2 бизнес-строки, обе 2026-08-31
+    assert "по дням UTC: 2026-08-31 — 2" in text
+    assert "критерий дня закрыт одной серией (2 из 2)" in text
+
+
+def test_summarize_business_rows_no_dominance_flag_when_spread():
+    rows = summary_fixture()
+    extra = make_rows(2, utc(2026, 9, 1, 14, 0), timedelta(minutes=10))
+    for i, row in enumerate(extra):
+        row["probe_id"] = f"spread-{i}"
+    rows += extra
+    text = dt.summarize(rows)
+    assert "2026-09-01 — 2" in text
+    assert "критерий дня закрыт одной серией" not in text
+
+
+# ── Один писатель следа неудачи тика (ревью #108) ────────────────────────────────
+
+
+def test_failed_tick_leaves_one_trace():
+    """Класс «двойной след одной неудачи»: cmd_dispatch при отказе POST больше
+    не пишет строку сам — единственный писатель dispatch_failed это
+    failure()-шаг tick_failed, деталь ошибки приезжает в TICK_NOTE через
+    GITHUB_OUTPUT. Иначе сводка насчитывает два сбоя на один инцидент."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    dispatch_src = src.split("def cmd_dispatch", 1)[1].split("\ndef ", 1)[0]
+    assert "dispatch_failed_row" not in dispatch_src, (
+        "cmd_dispatch снова пишет след сбоя сам — двойной след одной неудачи")
+    append_calls = [line.strip() for line in dispatch_src.splitlines()
+                    if "append_and_push(" in line]
+    # единственная запись из dispatch — timeout-строка: это сам замер (job не
+    # стартовал), а не след неудачи; шаг тика при ней завершается успехом
+    assert len(append_calls) == 1 and "timeout_row" in append_calls[0], (
+        "cmd_dispatch пишет что-то кроме timeout-строки — лишний писатель")
+    steps = {s.get("name"): s for s in load_workflow()["jobs"]["tick"]["steps"]}
+    assert steps["Тик кампании"].get("id") == "tick", (
+        "шаг тика без id: tick_failed не прочитает его вывод")
+    trace_env = steps["След тика, умершего до диспатча"].get("env") or {}
+    assert trace_env.get("TICK_NOTE") == "${{ steps.tick.outputs.tick_note }}", (
+        "TICK_NOTE не подключён к выводу шага тика — деталь ошибки потеряется")
+
+
+def test_dispatch_failure_writes_note_not_row(monkeypatch, tmp_path):
+    """Отказ POST /dispatches: команде нечем мерить — она возвращает 1 и кладёт
+    деталь в GITHUB_OUTPUT; строку и клонирование не делает вовсе."""
+
+    class FakeGh:
+        def __init__(self, token, repo):
+            assert token == "t" and repo == "o/r"
+            self.repo = repo
+
+        def contents(self, path, ref):
+            if path == dt.CSV_PATH:
+                rows = make_rows(10, utc(2026, 8, 31, 13, 0), timedelta(minutes=20))
+                return dt.rows_to_csv(rows)
+            return "on: workflow_dispatch"  # workflow на main есть
+
+        def request(self, method, path, body=None):
+            raise RuntimeError("POST /dispatches: HTTP 403: нет прав\nвторая строка")
+
+    monkeypatch.setattr(dt, "Github", FakeGh)
+    monkeypatch.setattr(dt, "append_and_push",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("двойной след: dispatch не пишет строки")))
+    out = tmp_path / "github_output.txt"
+    out.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GH_PIPELINE_PAT", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.delenv(dt.CAMPAIGN_MAX_DAYS_ENV, raising=False)
+    assert dt.cmd_dispatch(argparse.Namespace()) == 1
+    note_line = next(l for l in out.read_text(encoding="utf-8").splitlines()
+                     if l.startswith("tick_note="))
+    assert "HTTP 403" in note_line
+    assert "\n" not in note_line and "\r" not in note_line
+
+
+# ── Git-транспорт финализации: регрессия probe 33937006302 ───────────────────────
+
+
+def test_rewinding_git_ops_carry_identity_and_never_target_main():
+    """Регрессия probe 33937006302: `rebase --autostash origin/main` в
+    финализации перепроигрывал ВСЕ коммиты ветки данных (ветка отошла от main
+    на сотни коммитов) и падал на пустой коммиттер-идентичности — голый клон
+    job'а user.name не знает. Класс «git-операция, переписывающая коммиты»:
+    каждая переигрывающая (rebase) идёт под COMMIT_IDENTITY — --abort не
+    считается, коммитов не создаёт — и ни одна не таргетит main: ветка данных
+    append-only, интеграцию делает мерж PR."""
+    rebase_lines = [line.strip() for line in
+                    SCRIPT.read_text(encoding="utf-8").splitlines()
+                    if '"rebase"' in line]
+    assert rebase_lines, "rebase исчез из git-транспорта — гвардия ослепла"
+    for line in rebase_lines:
+        if "--abort" in line:
+            continue
+        assert "COMMIT_IDENTITY" in line, (
+            f"rebase без коммиттер-идентичности — упадёт на голом клоне: {line[:90]}")
+        assert "origin/main" not in line and '"main"' not in line, (
+            f"rebase таргетит main — перепишет всю ветку данных: {line[:90]}")
+
+
+# ── Гвардии workflow: цепочка, след тика, страховочный cron ──────────────────────
+
+
+def load_workflow():
+    import yaml
+    path = (Path(__file__).parents[2] / ".github" / "workflows"
+            / "dispatch-latency-probe.yml")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_tick_job_chains_and_traces_failed_ticks():
+    steps = {s.get("name"): s for s in load_workflow()["jobs"]["tick"]["steps"]}
+    chain = steps.get("Цепочка — следующая ступень тика")
+    assert chain and chain["if"] == "always()", (
+        "цепочка перестала быть always(): один сбой тика роняет каденцию "
+        "до страховочного cron")
+    assert "dispatch_tail.py chain" in (chain.get("run") or "")
+    trace = steps.get("След тика, умершего до диспатча")
+    assert trace and trace["if"] == "failure()", (
+        "след умершего тика перестал быть failure(): класс «тик умер молча» открыт")
+    assert "dispatch_tail.py tick_failed" in (trace.get("run") or "")
+    for step in (chain, trace):
+        assert "GH_TOKEN" in (step.get("env") or {}), (
+            f"шаг «{step.get('name')}» без GH_TOKEN: его запись никогда не попадёт в CSV")
+
+
+def test_every_dispatch_tail_step_provides_token_the_code_reads():
+    """Гвардия-класс «код читает один токен, шаг прокидывает другой»: все команды
+    dispatch_tail.py читают GH_PIPELINE_PAT (имя с задачи #6), а credential
+    helper'у нужен GH_TOKEN. Шаг, прокидывающий только GH_TOKEN, роняет команду
+    с ошибкой про не ту переменную; имя до задачи #6 (GH_DISPATCH_TOKEN)
+    возвращаться не должно."""
+    steps = [step for job in load_workflow()["jobs"].values()
+             for step in job.get("steps", [])
+             if "dispatch_tail.py" in (step.get("run") or "")]
+    assert steps, "шаги кампании исчезли из workflow — гвардия ослепла"
+    code_reads = "GH_PIPELINE_PAT" in (
+        SCRIPT.read_text(encoding="utf-8").replace("GH_DISPATCH_TOKEN", ""))
+    assert code_reads, "скрипт снова читает GH_DISPATCH_TOKEN — гвардия ждёт GH_PIPELINE_PAT"
+    for step in steps:
+        env = step.get("env") or {}
+        assert "GH_PIPELINE_PAT" in env, (
+            f"шаг «{step.get('name')}» зовёт dispatch_tail.py без GH_PIPELINE_PAT — "
+            "команда упадёт на пустом токене с ошибкой про не ту переменную")
+        assert "GH_DISPATCH_TOKEN" not in env, (
+            f"шаг «{step.get('name')}» прокидывает GH_DISPATCH_TOKEN — имя до задачи #6, "
+            "код его не читает: секрет под чужим именем")
+
+
+def test_campaign_max_days_declared_once_at_workflow_level():
+    """Гвардия-класс «два job'а читают переменную, а задаётся она в одном месте»:
+    CAMPAIGN_MAX_DAYS читают и тик (dispatch), и probe (record→finalize).
+    Объявление на уровне шага доходит только до одного job'а — продление кампании
+    умирает при рождении: probe досчитает до 7 дней и финализирует снова
+    (ревью #108)."""
+    data = load_workflow()
+    env = data.get("env") or {}
+    raw = str(env.get("CAMPAIGN_MAX_DAYS", "")).strip()
+    assert raw.isdigit() and int(raw) > 0, (
+        "CAMPAIGN_MAX_DAYS не объявлена на верхнем уровне workflow — "
+        "путь продления кампании после unmet-финализации мёртв")
+    for job_name, job in data["jobs"].items():
+        assert "CAMPAIGN_MAX_DAYS" not in (job.get("env") or {}), (
+            f"job {job_name} переопределяет CAMPAIGN_MAX_DAYS — второе место правды")
+        for step in job.get("steps", []):
+            assert "CAMPAIGN_MAX_DAYS" not in (step.get("env") or {}), (
+                f"шаг «{step.get('name')}» переопределяет CAMPAIGN_MAX_DAYS — "
+                "доходит только до одного job'а")
+
+
+def test_schedule_cron_is_backup_only_and_off_quarter_hours():
+    data = load_workflow()
+    on = data.get(True) or data.get("on")  # PyYAML читает ключ `on` как булев True
+    crons = [trigger["cron"] for trigger in on["schedule"]]
+    assert crons, "страховочный cron исчез — смерть цепочки оставит кампанию без страховки"
+    for expr in crons:
+        minute = int(expr.split()[0])
+        assert minute % 15 != 0, (
+            f"cron «{expr}» стоит на четверти часа — задокументированный пик "
+            "нагрузки schedule (21-github-actions.md)")

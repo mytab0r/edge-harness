@@ -10,6 +10,13 @@
 #         простым шагом (метрика фиксируется GitHub'ом в run_started_at ДО любого
 #         шага) и записывает свою строку в CSV на ветке данных.
 #
+# Каденция — самоподдержка, не schedule: шаг «Цепочка» из always()-шага тика
+# диспатчит следующий workflow_dispatch; cron — только страховка смерти цепочки.
+# Замер 2026-09-04: cron `*/15` на этом репозитории доставил ~7% тиков (31 из
+# ~465 за 116.3 ч), dispatch-события — 32 из 32 (docs/research/21-github-actions.md,
+# «Замер schedule на этом репозитории»). Минуты страховочного cron сдвинуты с
+# четвертей часа — рекомендация GitHub на случай пиков нагрузки в начале часа.
+#
 # Файл обязан лежать на default branch — dispatch с ветки молча возвращает 204
 # без запуска; гвардия в scripts/measure/dispatch_tail.py это проверяет.
 # После финализации кампания отключает этот workflow сама (gh workflow enable —
@@ -21,13 +28,22 @@ name: dispatch-latency-probe
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "37 4,16 * * *"
+    - cron: "11 10,22 * * *"
   repository_dispatch:
     types: [dispatch-latency-probe]
   workflow_dispatch:
 
 permissions:
   contents: read  # checkout; все записи (CSV, PR, комментарии) идут под PAT
+
+env:
+  # Сознательное продление кампании после unmet-финализации (ADR 0005, дельта
+  # «Темп добора»): ОДНА декларация на оба job'а — тик и probe считают один
+  # лимит. Переопределение на уровне шага доходит только до одного job'а, и
+  # продление умирает при рождении: probe досчитает до 7 дней и финализирует
+  # снова. Гвардия — scripts/measure/test_dispatch_tail.py.
+  CAMPAIGN_MAX_DAYS: "7"
 
 jobs:
   tick:
@@ -51,6 +67,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: gh auth setup-git
       - name: Тик кампании
+        id: tick
         env:
           GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           # Без GH_TOKEN в env credential helper gh не авторизует push из
@@ -58,6 +75,30 @@ jobs:
           # никогда, и кампания молча деградировала бы до «только ok».
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py dispatch
+      - name: След тика, умершего до диспатча
+        # Класс «молча деградировало и никто не заметил»: тик, умерший до
+        # POST /dispatches или на отказе диспатча, обязан оставить ОДНУ строку
+        # dispatch_failed, а не только красный job — писатель здесь один,
+        # деталь ошибки приезжает в TICK_NOTE из вывода шага тика (ревью #108:
+        # два писателя насчитывали два сбоя на один инцидент). Доставку
+        # schedule это не ловит (ран не создан — ловить нечем): она видна
+        # сверкой истории runs, см. замер schedule в доке.
+        if: failure()
+        env:
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          TICK_NOTE: ${{ steps.tick.outputs.tick_note }}
+        run: python scripts/measure/dispatch_tail.py tick_failed
+      - name: Цепочка — следующая ступень тика
+        # Основной механизм каденции. always(): один сбой тика не роняет
+        # кампанию до страховочного cron; ограничитель повтора — CHAIN_DELAY_S
+        # и сериализация тиков (concurrency ниже). Останавливается сам:
+        # покрытие достигнуто, лимит дней или workflow не на main.
+        if: always()
+        env:
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: python scripts/measure/dispatch_tail.py chain
 
   probe:
     if: github.event_name == 'repository_dispatch'
