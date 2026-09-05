@@ -979,6 +979,23 @@ export class Harness extends DurableObject<Env> {
       }
       return;
     }
+
+    // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
+    // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
+    // GH_DISPATCH_TOKEN, ни от GH_REPO (п.33 спеки) — при пустом токене пульс
+    // обязан продолжать разбирать инбокс, а не молча пропускать гарантию
+    // непотери. Любой сбой здесь не роняет пульс: тик уже перезаложен.
+    try {
+      this.#reclaimStuckMessages();
+    } catch (error) {
+      console.log(`inbox reclaim failed: ${error instanceof Error ? error.message : error}`);
+    }
+    try {
+      await this.#processInbox(MESSAGE_PROCESS_MAX, false);
+    } catch (error) {
+      console.log(`inbox process failed: ${error instanceof Error ? error.message : error}`);
+    }
+
     try {
       // #sql.exec ниже (#getStoredPulse, #recordPulse) тоже может упасть на исчерпании
       // суточной квоты rows_read/rows_written — но тик уже перезаложен строкой выше,
@@ -1025,20 +1042,6 @@ export class Harness extends DurableObject<Env> {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
-    }
-
-    // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
-    // Сообщение не может ждать ручного POST: критерий задачи — ни одно сообщение
-    // не теряется. Любой сбой здесь не роняет пульс: тик уже перезаложен.
-    try {
-      this.#reclaimStuckMessages();
-    } catch (error) {
-      console.log(`inbox reclaim failed: ${error instanceof Error ? error.message : error}`);
-    }
-    try {
-      await this.#processInbox(MESSAGE_PROCESS_MAX, false);
-    } catch (error) {
-      console.log(`inbox process failed: ${error instanceof Error ? error.message : error}`);
     }
   }
 
@@ -1578,7 +1581,9 @@ export class Harness extends DurableObject<Env> {
   }
 
   /** Ручное создание сообщения (для тестов/админа) — тот же класс идемпотентности,
-   *  что и ingest: повтор с тем же source_msg_id отвечает существующей строкой. */
+   *  что и ingest: повтор с тем же source_msg_id отвечает существующей строкой.
+   *  Без идентификатора — 400: молча сгенерированный одноразовый id превращает
+   *  повтор админа во второй issue в пуле (п.31 спеки, ревью #173). */
   #postMessage(request: Request): Promise<Response> {
     return this.#readJson(request).then((body) => {
       const text = typeof body.text === "string" ? body.text : "";
@@ -1588,9 +1593,11 @@ export class Harness extends DurableObject<Env> {
       if (text.length > MESSAGE_MAX_CHARS) {
         throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
       }
+      const sourceMsgId = asString(body.source_msg_id);
+      if (!sourceMsgId) throw new ApiError(400, "need_source_msg_id");
       const stored = this.#putMessage({
         source: asString(body.source) ?? "api",
-        sourceMsgId: asString(body.source_msg_id) ?? `manual-${crypto.randomUUID()}`,
+        sourceMsgId,
         chatId: asString(body.chat_id),
         senderId: asString(body.sender_id),
         senderName: asString(body.sender_name),

@@ -654,7 +654,7 @@ describe("inbox: сообщения владельца", () => {
     }
   });
 
-  it("POST /api/messages создаёт сообщение вручную; повтор без id не двоит", async () => {
+  it("POST /api/messages создаёт сообщение вручную; без id — громкий 400, повтор с id — exists (тот же класс, что ingest)", async () => {
     const res = await postJson("/api/messages", {
       source: "manual",
       source_msg_id: `manual-${Date.now()}`,
@@ -665,8 +665,12 @@ describe("inbox: сообщения владельца", () => {
     expect(body.message_id).toBeGreaterThan(0);
     expect(body.status).toBe("created");
 
-    const auto = await postJson("/api/messages", { text: "Без id — генерируется" });
-    expect(auto.status).toBe(201);
+    // Молча сгенерированный одноразовый id превращает повтор админа во второй
+    // issue — требуем id явно, как в ingest (п.31 спеки).
+    const noId = await postJson("/api/messages", { text: "Без id — отказ" });
+    expect(noId.status).toBe(400);
+    const noIdBody = await noId.json<{ error: { code: string } }>();
+    expect(noIdBody.error.code).toBe("need_source_msg_id");
   });
 
   it("разбор: директива без GH_ISSUES_TOKEN повторяется (issue_retry), после капа попыток — честный failed", async () => {
@@ -895,22 +899,12 @@ describe("inbox: сообщения владельца", () => {
       );
     });
 
-    // Публичный alarm(). GH_DISPATCH_TOKEN ставится локально: без него alarm
-    // выходит рано до ватчдога; все внешние вызовы (dispatch оркестратора,
-    // сверка dsh-edge) — заглушки, реальные версии равны → тихо.
-    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
-    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input);
-      if (url.includes("api.github.com") && url.includes("/dispatches")) {
-        return new Response(null, { status: 204 });
-      }
-      if (url.includes("dsh-edge.mytab0r.workers.dev") || url.includes("registry.npmjs.org")) {
-        return new Response(JSON.stringify({ version: "0.0.0" }), { status: 200 });
-      }
-      // Неожиданный вызов = тест вышел за рамки замысла: громко, а не в сеть
-      // (замечание ревью #173 — иначе будущее директивное сообщение в этом
-      // тесте молча ходило бы в настоящий GitHub).
-      throw new Error(`неожиданный fetch в alarm-тесте: ${url}`);
+    // Публичный alarm() БЕЗ GH_DISPATCH_TOKEN: разбор инбокса не зависит от
+    // конфигурации dispatch (п.33 спеки) — ватчдог и водитель обязаны отработать
+    // до раннего возврата по токену. Строгий стаб ловит любой неожидаемый
+    // сетевой вызов: громко, а не в настоящий GitHub.
+    vi.stubGlobal("fetch", (async (input: string | URL | Request) => {
+      throw new Error(`неожиданный fetch в alarm-тесте: ${String(input)}`);
     }) as typeof fetch);
     let alarmRan = false;
     try {
@@ -920,7 +914,6 @@ describe("inbox: сообщения владельца", () => {
       });
     } finally {
       vi.unstubAllGlobals();
-      env.GH_DISPATCH_TOKEN = "";
     }
     expect(alarmRan).toBe(true);
 
