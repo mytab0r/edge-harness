@@ -27,11 +27,23 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
+
+# Метки-вердикты ревью (review:*, ai:*) — одно место правды в
+# scripts/lib/review_labels.py (тот же паттерн importlib-по-файлу, что
+# scheduler.py: скрипты запускаются как файлы, не как пакет). Нужны здесь
+# только имена меток и list_timeline (пагинация таймлайна) для
+# rework_cycle_count ниже — второй копии этих строк заводить не нужно.
+_rl_spec = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_rl_spec)
+_rl_spec.loader.exec_module(review_labels)
 
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
@@ -100,6 +112,68 @@ UNHEALTHY_PR_AFTER_MINUTES = 120
 # (см. scheduler.stale_ready_pulls). Маркер — идемпотентность сигнала в #120,
 # тот же приём, что PAUSE_MARKER/HEARTBEAT_MARKER выше.
 READY_STALL_MARKER = "[статус: PR готов, слияние не идёт]"
+
+# ── Бюджет кругов реворка на PR (task-rework-loop, #256) ─────────────────────────
+# Круг реворка — событие timeline PR event=labeled с именем
+# review:changes-requested ИЛИ ai:changes-requested (rework_cycle_count ниже —
+# ОБА гейта, не только ai:changes-requested, который сегодня один проверяет
+# pr_is_unhealthy в scheduler.py — design.md task-rework-loop, п.2 и «Известный
+# разрыв»). Красные обязательные чеки в счёт НЕ входят: флаки-тест или сбой CI —
+# другой класс причины, не сигнал «требование неясно» (design.md п.2).
+#
+# Круги «требуются правки» (review:changes-requested + ai:changes-requested
+# по timeline PR) на ОДИН PR, после которых задача уходит в needs-spec
+# вместо возврата в пул на ещё один заход. Порог измерен 2026-09-03
+# (openspec/changes/task-rework-loop/proposal.md, раздел «Посылка каркаса»):
+# среди 17 PR, слитых за предыдущие сутки, максимум кругов реворка — 4;
+# среди зависших без движения к зелёному вердикту — минимум 8. Порог
+# поставлен на 1 круг выше максимума успешного слияния, с запасом до
+# минимума зависшего (5 меньше 8) — НАЧАЛЬНОЕ значение, n=28 мало для точной
+# калибровки (design.md, «Метрики», план уточнения).
+REWORK_BUDGET = 5
+
+# Метки, каждое событие labeled с одной из которых — круг реворка (design.md
+# п.2). Модульная константа — одно место правды для rework_events/
+# rework_cycle_count ниже, а не локальная переменная в каждой функции.
+REWORK_LABELS = (review_labels.REVIEW_CHANGES, review_labels.AI_CHANGES)
+
+# Эскалация владельцу при исчерпании бюджета (design.md п.4, действие 5) —
+# тот же приём идемпотентности, что READY_STALL_MARKER/stale_ready_pulls:
+# маркер несёт номер ЗАДАЧИ (не PR — задача, а не конкретная попытка, уходит
+# в needs-spec), issue_marker_times сверяется ПЕРЕД повторной посылкой.
+NEEDS_SPEC_MARKER = "[статус: бюджет реворка исчерпан]"
+
+
+def rework_events(repo: str, pr_number: int) -> list[dict]:
+    """Все события timeline «нужны правки» (labeled review:changes-requested
+    ИЛИ ai:changes-requested) по PR, в порядке таймлайна — весь таймлайн
+    постранично (review_labels.list_timeline, тот же приём, что
+    last_review_ok_labeled_at в scheduler.py). Одно место правды на фильтр:
+    rework_cycle_count ниже — len() от этого списка, scheduler.route_to_needs_spec
+    использует сам список (даты + имя метки) для комментария-разбора
+    (design.md п.4, «перечень всех вердиктов»)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    return [
+        event for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") in REWORK_LABELS
+    ]
+
+
+def rework_cycle_count(repo: str, pr_number: int) -> int:
+    """Число кругов реворка на PR — ВСЕ события timeline «нужны правки»
+    (rework_events выше) за всю историю ЭТОГО номера PR. Не «текущая серия
+    подряд без сброса успехом» — явный сброс не нужен (design.md п.2): успех
+    (оба вердикта зелёные) завершает цикл слиянием, а не продолжает его,
+    поэтому для ОДНОГО ОТКРЫТОГО PR суммарный счёт за жизнь и счёт «с
+    последнего сброса» совпадают — сбрасывать нечего, PR либо сливается
+    (жизнь счётчика кончается), либо остаётся открытым, и каждый новый
+    вердикт «нужны правки» — это новый, настоящий круг того же незакрытого
+    цикла. Уход в needs-spec закрывает PR и не переиспользует его номер
+    (reopen запрещён тем же п.2) — новый заход открывает новый PR с чистым
+    таймлайном, счётчик «сбрасывается» по факту нового номера, без явного
+    кода сброса."""
+    return len(rework_events(repo, pr_number))
 
 
 def gh(*args: str) -> dict | list | None:

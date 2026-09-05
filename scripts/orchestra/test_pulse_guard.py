@@ -511,3 +511,74 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     # (30-минутная выдержка после первой красной пробы на 15-й минуте истекает
     # на 45-й) — итого РОВНО 2 пробы, не 5 (столько дал бы пульс без выдержки)
     assert probes == 2, f"гвардия частоты нарушена: проб за час {probes}, ожидалось 2"
+
+
+# ── Бюджет кругов реворка (task-rework-loop, #256) ───────────────────────────────
+#
+# Фикстуры — реальные таймлайны живых/исторических PR репозитория (не
+# пересказ, прод-форма событий event=labeled), собраны 2026-09-06:
+#   gh api repos/mytab0r/edge-harness/issues/<N>/timeline --paginate
+# Поля, которых код не читает (тела комментариев, коммиты, дифф-статистика),
+# срезаны — оставлены event/created_at/label.name, ровно то, что читает
+# rework_cycle_count. #166/#239 — числа, названные дословно в tasks.md п.1
+# (task-rework-loop): rework_cycle_count(166)==10, rework_cycle_count(239)==1.
+# #173 — реальный PR с ОБОИМИ гейтами (19 ai:changes-requested + 1
+# review:changes-requested = 20) — доказывает, что счётчик не теряет вклад
+# гейта 1, когда он смешан с гейтом 2 на одном PR. #362 — реальный ЖИВОЙ PR
+# (снят 2026-09-06), несущий ТОЛЬКО review:changes-requested (1 круг), НИ
+# ОДНОГО ai:changes-requested — обязательная фикстура задания: без учёта
+# гейта 1 rework_cycle_count(362) молча дал бы 0.
+
+def _fixture_timeline(repo: str, pr_number: int) -> list[dict]:
+    import json
+    path = Path(__file__).with_name(f"fixtures_timeline_pr_{pr_number}_256.json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _paged_gh(events: list[dict]):
+    """Эмулирует пагинацию GitHub (100 записей на страницу) поверх плоского
+    списка событий фикстуры — тот же контракт, что list_pages/list_timeline
+    реально дёргают (`...&page=N`), без сети."""
+    def _gh(url: str):
+        query = url.split("?", 1)[1] if "?" in url else ""
+        params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+        page = int(params.get("page", "1"))
+        start = (page - 1) * 100
+        return events[start:start + 100]
+    return _gh
+
+
+@pytest.mark.parametrize("pr_number,expected", [
+    (166, 10),  # tasks.md п.1, дословно
+    (239, 1),   # tasks.md п.1, дословно
+    (173, 20),  # 19 ai:changes-requested + 1 review:changes-requested
+    (362, 1),   # ТОЛЬКО review:changes-requested, ai:changes-requested нет вовсе
+])
+def test_rework_cycle_count_real_pr_bodies(monkeypatch, pr_number, expected):
+    events = _fixture_timeline("mytab0r/edge-harness", pr_number)
+    monkeypatch.setattr(pg, "gh", _paged_gh(events))
+    assert pg.rework_cycle_count("mytab0r/edge-harness", pr_number) == expected
+
+
+def test_rework_cycle_count_counts_both_gates_not_only_ai(monkeypatch):
+    """Мутация: если бы rework_cycle_count смотрел только ai:changes-requested
+    (как сегодня делает pr_is_unhealthy до фикса task-rework-loop п.2) — PR
+    #362 (только review:changes-requested) дал бы 0, а не 1. Это и есть
+    фикстура «PR только с review:changes-requested, без ai:changes-requested»,
+    обязательная заданием: снять review:changes-requested из rework_labels ->
+    этот тест краснеет."""
+    events = _fixture_timeline("mytab0r/edge-harness", 362)
+    monkeypatch.setattr(pg, "gh", _paged_gh(events))
+    assert pg.rework_cycle_count("mytab0r/edge-harness", 362) >= 1, (
+        "круг реворка по review:changes-requested (гейт 1) обязан считаться, "
+        "не только ai:changes-requested (гейт 2)"
+    )
+
+
+def test_rework_cycle_count_zero_without_labeled_events(monkeypatch):
+    monkeypatch.setattr(pg, "gh", _paged_gh([
+        {"event": "commented"},
+        {"event": "labeled", "created_at": "2026-09-01T00:00:00Z",
+         "label": {"name": "task"}},  # чужая метка — не в счёт
+    ]))
+    assert pg.rework_cycle_count("mytab0r/edge-harness", 1) == 0
