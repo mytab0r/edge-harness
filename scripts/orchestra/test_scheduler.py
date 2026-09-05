@@ -1776,9 +1776,12 @@ PR_163_FILES = [
 ]
 
 
-def merged_pull(number, body, head_sha, merged_at, merge_commit_sha=None):
+def merged_pull(number, body, head_sha, merged_at, merge_commit_sha=None, branch=None):
+    head = {"sha": head_sha}
+    if branch is not None:
+        head["ref"] = branch
     return {"number": number, "state": "closed", "merged_at": merged_at,
-            "body": body, "head": {"sha": head_sha}, "labels": [],
+            "body": body, "head": head, "labels": [],
             "merge_commit_sha": merge_commit_sha}
 
 
@@ -1818,6 +1821,21 @@ def test_merged_pr_map_keeps_most_recent_merge_for_same_task():
     newer = merged_pull(2, "#5\n\nновая работа поверх старой", "sha2", "2026-02-01T00:00:00Z")
     mapping = sch.merged_pr_map([older, newer])
     assert mapping[5]["number"] == 2
+
+
+def test_merged_pr_map_registers_rework_supersession_under_both_numbers():
+    # Живой класс #394 (PR #388/#384/#359/#167 репозитория на 2026-09-06):
+    # ветка называет уже закрытую задачу #256, тело докрытия объявляет
+    # открытую-преемницу #391 — регистрация под ОБОИМИ числами: accept_merged_tasks
+    # ищет только среди открытых задач пула, закрытая #256 там не значится,
+    # находит только запись под настоящей #391.
+    reworked = merged_pull(
+        388, "#391\n\nRelated: #256 (закрыта акцептансом, докрытие — #391)",
+        "sha388", "2026-09-06T00:00:00Z", branch="agent/256-task-rework-loop",
+    )
+    mapping = sch.merged_pr_map([reworked])
+    assert mapping[391]["number"] == 388
+    assert mapping[256]["number"] == 388  # безвредная запись — 256 закрыта, пул её не спросит
 
 
 class _FakeHealthResponse:

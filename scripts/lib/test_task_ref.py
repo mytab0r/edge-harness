@@ -323,6 +323,56 @@ def test_task_from_branch_matches_agent_convention_only():
     assert task_ref.task_from_branch("") is None
 
 
+# ── pr_task_candidates (#394) — прод-форма реальных PR этого репозитория ──
+#
+# Живой класс: задача закрыта раньше срока («закрытая задача не
+# переоткрывается»), докрытие оформлено НОВОЙ узкой задачей, объявленной
+# первой строкой тела — ветку переименовать нельзя (agent/<N>-slug создаётся
+# один раз, scripts/git/task-branch). Тела сохранены дословно
+# (`gh api repos/mytab0r/edge-harness/pulls/388 --jq .body`), снято
+# 2026-09-06.
+
+_PR_388_BODY = (
+    "#391\n\n"
+    "Related: #256 (закрыта акцептансом 2026-09-05 как «без наблюдаемого "
+    "результата» по доковому PR #260 — код по пп.1-2 tasks.md на тот момент "
+    "ещё не был смёржен; правило 2026-09-06: закрытая задача не "
+    "переоткрывается, новая узкая #391 по фактическому содержимому).\n"
+)
+_PR_388_PULL = {
+    "number": 388,
+    "head": {"ref": "agent/256-task-rework-loop"},
+    "body": _PR_388_BODY,
+}
+
+
+def test_pr_task_candidates_rework_supersession_branch_and_body_both_present():
+    # Живой случай #388 (постановка #394): ветка называет закрытую #256,
+    # тело объявляет открытую-преемницу #391 — оба узких источника обязаны
+    # попасть в кандидатов, ветка первой.
+    assert task_ref.pr_task_candidates(_PR_388_PULL) == [256, 391]
+
+
+def test_pr_task_candidates_dedupes_when_branch_and_body_agree():
+    # Обычный случай (без реворка): ветка и тело называют одну и ту же
+    # задачу — кандидат один, не дублируется.
+    assert task_ref.pr_task_candidates(_PR_253_PULL) == [227]
+
+
+def test_pr_task_candidates_bot_pr_has_no_candidates():
+    assert task_ref.pr_task_candidates(_PR_282_PULL) == []
+
+
+def test_pr_task_candidates_body_only_without_agent_branch():
+    pull = {"head": {"ref": "fix/typo"}, "body": "#42\n\nОпечатка в доке."}
+    assert task_ref.pr_task_candidates(pull) == [42]
+
+
+def test_pr_task_candidates_branch_only_without_declaration():
+    pull = {"head": {"ref": "agent/700-shell-body-only"}, "body": "просто описание без номера"}
+    assert task_ref.pr_task_candidates(pull) == [700]
+
+
 # Мутация, которой доказан resolve_pr_task (#259, воспроизведена буквально
 # при разработке — вывод до/после в отчёте PR): временно замени тело функции
 # на `refs = sorted(set(extract_task_refs(pull.get("body") or ""))); return
