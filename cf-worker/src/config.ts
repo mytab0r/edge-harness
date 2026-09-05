@@ -34,10 +34,11 @@ export const LIMITS = {
   /** Inbox: сообщение в processing дольше этого порога — изолят умер посреди
    *  внешнего вызова; пульс возвращает его в new (ватчдог по образцу stale_dispatch). */
   messageStuckProcessingMs: 10 * 60_000,
-  /** Inbox: таймаут одного вызова GitHub при создании issue. Обязан быть
-   *  заведомо меньше messageStuckProcessingMs (гвардится тестом): иначе висящий
-   *  fetch доживёт до ретрая другой проходки — двойной issue. */
-  messageIssueFetchTimeoutMs: 30_000,
+  /** Inbox: таймаут вызова repository_dispatch (создание issue уносит job
+   *  .github/workflows/inbox-issue.yml, здесь только приём события). Обязан
+   *  быть заведомо меньше messageStuckProcessingMs (гвардится тестом): иначе
+   *  висящий fetch доживёт до ретрая другой проходки — двойной dispatch. */
+  messageIssueDispatchTimeoutMs: 30_000,
   /** Inbox: сколько сообщений отдаёт список, если лимит не назван. */
   messagesListDefault: 50,
   /** Inbox: потолок одной страницы списка. */
@@ -106,8 +107,12 @@ export const GITHUB = {
   apiBase: "https://api.github.com",
   apiVersion: "2022-11-28",
   userAgent: "edge-harness-do",
-  /** event_type для repository_dispatch. */
+  /** event_type для repository_dispatch (очередь задач → hands.yml). */
   dispatchEventType: "harness-task",
+  /** event_type для repository_dispatch директивы инбокса → создание issue
+   *  (.github/workflows/inbox-issue.yml, штатный github.token, ADR 0013:
+   *  замена ADR 0011 — без отдельного секрета GH_ISSUES_TOKEN). */
+  inboxIssueEventType: "inbox-issue",
 } as const;
 
 /** Имя единственного объекта. Мультитенантности нет, владелец один. */

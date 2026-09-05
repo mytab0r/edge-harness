@@ -35,7 +35,6 @@ jobs:
           HANDS: ${{ secrets.HANDS_TOKEN }}
           DISPATCH: ${{ secrets.GH_DISPATCH_TOKEN }}
           SESSION: ${{ secrets.SESSION_SECRET }}
-          ISSUES: ${{ secrets.GH_ISSUES_TOKEN }}
         run: |
           missing=0
           for pair in "CLOUDFLARE_API_TOKEN:$CF_TOKEN" "CLOUDFLARE_ACCOUNT_ID:$CF_ACCOUNT" \
@@ -46,12 +45,6 @@ jobs:
               missing=1
             fi
           done
-          # GH_ISSUES_TOKEN (ADR 0011) — опционален: без него деплой работает,
-          # но инбокс не создаёт issues — директивы честно повторяются с
-          # issues_not_configured. Газ — задать секрет; деплой не блокируем.
-          if [ -z "$ISSUES" ]; then
-            echo "::warning::GH_ISSUES_TOKEN не задан: инбокс владельца не создаёт issues (директивы повторяются до капа попыток, ADR 0011). Задай узкий fine-grained PAT (только Issues:RW)."
-          fi
           exit $missing
 
       - name: Типы актуальны?
@@ -131,8 +124,9 @@ jobs:
       # Значения — те же секреты репозитория, что использует канарейка и hands-job.
       # GH_DISPATCH_TOKEN — узкий fine-grained PAT (Contents+Actions на этот
       # репозиторий, задача #6): морда больше не держит широкий PAT владельца.
-      # GH_ISSUES_TOKEN — узкий fine-grained PAT (Issues:RW, ADR 0011): опционален,
-      # синхронизируется только если задан — его отсутствие не красит деплой.
+      # Директивы инбокса несёт этот же токен (repository_dispatch → job
+      # .github/workflows/inbox-issue.yml, ADR 0013) — третьего секрета
+      # GH_ISSUES_TOKEN больше нет.
       - name: Секреты воркера
         working-directory: cf-worker
         env:
@@ -141,16 +135,10 @@ jobs:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
           GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
           SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
-          GH_ISSUES_TOKEN: ${{ secrets.GH_ISSUES_TOKEN }}
         run: |
           printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
           printf '%s' "$GH_DISPATCH_TOKEN" | npx wrangler secret put GH_DISPATCH_TOKEN
           printf '%s' "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
-          if [ -n "$GH_ISSUES_TOKEN" ]; then
-            printf '%s' "$GH_ISSUES_TOKEN" | npx wrangler secret put GH_ISSUES_TOKEN
-          else
-            echo "::warning::GH_ISSUES_TOKEN не задан — в воркере секрет не обновлялся (инбокс без права на issues, ADR 0011)"
-          fi
 
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде
