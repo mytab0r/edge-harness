@@ -350,6 +350,38 @@ env через инсталл-цикл. Нюансы: значения коэр�
 
 ---
 
+## Возможности платформы, которые мы не используем (аудит 2026-09-05)
+
+Тот же принцип, что в аудите GitHub ([research/21](21-github-actions.md)): по каждой
+возможности — используем / не используем / недоступно на нашем плане, проверено
+живым запросом к documentation (дата снятия рядом с числом) или чтением фактической
+конфигурации воркера (`cf-worker/wrangler.jsonc`, `cf-worker/src/harness.ts`), не по
+памяти. Прямого доступа к Cloudflare API (нужен `CLOUDFLARE_API_TOKEN`, это секрет CI)
+из этой сессии не было — там, где вывод зависит от аккаунтных данных, а не от
+документации или кода репозитория, помечено отдельно.
+
+| Возможность | Статус | Проверено | Что даёт |
+|---|---|---|---|
+| **DO Alarms** | используем | `cf-worker/src/harness.ts::alarm()` — пульс оркестрации каждый тик перезакладывает следующий будильник, затем дёргает `workflow_dispatch` | Разбуженный по расписанию DO без постоянно висящего процесса; `alarm = 1 request`, бюджет requests не жжётся |
+| **WebSocket Hibernation API** | используем | `cf-worker/src/harness.ts::#openLiveSocket` — `this.ctx.acceptWebSocket(pair[1])` (не `ws.accept()`) | Живой поток события клиенту без постоянного расхода GB-s — комментарий в коде прямо это называет |
+| **Outgoing WS-туннель к раннеру** | отвергнуто осознанно | См. [ADR 0001](../decisions/0001-push-model-not-tunnel.md) и [research/30](30-rejected-alternatives.md), п. 3 | Не «не используем по недосмотру» — отдельное решение с двумя независимыми причинами отказа (ToS + 85% дневного GB-s) |
+| **Queues** | **не используем** | Нет `queues` в `wrangler.jsonc`. Доступно на Free: 10 000 standard operations/день бесплатно (Workers Paid — 1 млн/мес + $0.40/млн доп.), retention на Free — фиксированные 24 ч (не настраивается), egress бесплатен ([Queues Limits](https://developers.cloudflare.com/queues/platform/limits/), «Last updated Apr 21, 2026» — снимок; [Pricing](https://developers.cloudflare.com/queues/platform/pricing/), тот же снимок) | Буфер сообщений между воркерами. У Queues есть pull-консьюмеры по HTTP ([Pull consumers](https://developers.cloudflare.com/queues/configuration/pull-consumers/)) — консьюмером может быть и job раннера, платформенного ограничения тут нет. Не берём по другой причине: свой диспетч (Durable Object → `workflow_dispatch`) уже работает и закрывает единственный сценарий «диспетч работы в раннер»; очередь добавила бы новый stateful-компонент (токен пул-консьюмера, 24-часовой retention) без второго продюсера, который оправдал бы буфер |
+| **Cron Triggers** | **не используем как отдельный механизм** — вместо него DO `alarm()` | В `wrangler.jsonc` нет секции `triggers.crons`. Cron Triggers на Free: 5 триггеров/аккаунт, минимум раз в минуту, 10 ms CPU на тик ([research/20](20-cloudflare-free.md) выше) | Cron Trigger будит **воркер**, без привязки к конкретному DO-инстансу и его состоянию — пришлось бы делать доп. `fetch` к DO изнутри cron-хендлера ради того же результата, что `alarm()` даёт напрямую. Осознанно не меняем: alarm ближе к данным, cron был бы лишним прыжком, не выигрышем |
+| **Workers Analytics Engine** | **не используем** | Нет `analytics_engine_datasets` в `wrangler.jsonc`. На Free: 100 000 data points записи/день + 10 000 read-запросов/день, **сейчас вообще не биллится** ни на каком плане ([Pricing](https://developers.cloudflare.com/analytics/analytics-engine/pricing/), «Last updated Apr 23, 2026» — снимок) | Структурная агрегированная аналитика без ручного SQL по большой таблице. Реальная находка: инцидент #320 (суточная квота `rows_read` исчерпана) вырос ровно из ручного `GROUP BY status` по всей истории `tasks` в DO SQLite на каждый heartbeat — `writeDataPoint()` на каждое изменение статуса задачи и чтение агрегата из Analytics Engine обошли бы это `rows_read` вовсе, ценой отдельного (тоже конечного) бюджета 100k/день. Не замена уже принятому фиксу #320 (индекс + кэш), а альтернатива для рассмотрения отдельной задачей — см. «Что взять вместо своего» |
+| **Logpush** | **недоступно на нашем плане** | Availability-таблица: Free — **No**, Pro — No, Business — No, Enterprise — Yes; оговорка «Users without an Enterprise plan can still access Workers Trace Events Logpush by subscribing to the Workers Paid plan» — мы на **Workers Free**, не Paid ([Logpush docs](https://developers.cloudflare.com/logs/logpush/), «Last updated Aug 14, 2026» — снимок) | Потоковая выгрузка логов воркера во внешнее хранилище/SIEM почти в реальном времени |
+| **KV / D1 / R2** | **не используем** | Нет соответствующих bindings в `wrangler.jsonc`; состояние целиком в DO SQLite (`HARNESS`/`Harness`) | KV/D1/R2 — альтернативные хранилища, разобраны в исходном исследовании ([таблица «Что строится на Free»](#что-строится-на-free-без-единого-доллара)); объём состояния сейчас укладывается в лимиты DO SQLite, миграция не оправдана размером |
+| **Smart Placement** | **не используем** | Нет `placement` в `wrangler.jsonc`. Доступно на Free: «Smart Placement is available on all Workers plans» ([Placement docs](https://developers.cloudflare.com/workers/configuration/placement/), «Last updated Apr 23, 2026» — снимок; доступна по URL `/workers/configuration/smart-placement/`, редиректящему на `/workers/configuration/placement/`) | Авторазмещение воркера ближе к апстриму с наибольшей нагрузкой. У нас нет такого апстрима: `api.github.com` — глобальный CDN, а не единая точка, DO уже совместно размещён со своим воркером по умолчанию — нет профиля трафика, которому это помогло бы |
+| **Tail Workers** | **недоступно на нашем плане** | Дословно: «Tail Workers are available to all customers on the Workers Paid and Enterprise tiers» ([Tail Workers docs](https://developers.cloudflare.com/workers/observability/logs/tail-workers/), «Last updated Jun 25, 2026» — снимок). Мы на Workers Free | Централизованный сбор логов/исключений другого воркера без изменения его кода |
+| **Версионирование деплоев / gradual deployments** | **не используем** | `deploy-worker.yml` делает прямой `wrangler deploy` без %-сплита трафика. В документации ограничения по плану для gradual deployments не найдено (единственный найденный лимит — «last 100 uploaded versions», без слова Free/Paid) ([Gradual deployments docs](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/), «Last updated Jul 3, 2026» — снимок; **не проверено окончательно**, доступность на Free не подтверждена отдельной строкой, только отсутствием явного запрета) | Официальный %-сплит трафика между версиями с наблюдением ошибок и откатом без redeploy — сейчас у нас функцию отката частично закрывает шаг «канарейка» в `deploy-worker.yml` (проверка постфактум, не сплит трафика) |
+| `observability.enabled` (Workers Logs) | используем | `wrangler.jsonc`: `"observability": { "enabled": true }` | Структурные логи воркера — база для будущего Tail Worker/Logpush, если перейдём на Paid |
+
+### Что взять вместо своего — см. отдельный документ
+
+Разбор кандидатов на замену (Analytics Engine вместо ручной агрегации статусов,
+почему Cron Triggers не меняем на alarm, почему git-ref-замок аренды задачи уже и
+есть нативный примитив) — в
+[`docs/research/23-platform-native-vs-custom.md`](23-platform-native-vs-custom.md).
+
 ## Что не подтверждено
 
 Не выдумывать факты вокруг этих пунктов — они реально не закрыты докой на 2026-08-28.
@@ -390,3 +422,17 @@ env через инсталл-цикл. Нюансы: значения коэр�
 - [AI Gateway — Dynamic Routing](https://developers.cloudflare.com/ai-gateway/features/dynamic-routing/)
 - [AI Gateway — BYOK](https://developers.cloudflare.com/ai-gateway/features/byok/)
 - [Cloudflare Changelog](https://developers.cloudflare.com/changelog/) — записи 2025-04-07 (DO на Free, SQLite GA), 2025-12-12 (биллинг storage с 2026-01-07), 2026-03-24 (Dynamic Workers open beta для paid), 2026-06-19 (outbound WS держит объект живым до 15 мин)
+
+Аудит 2026-09-05 (раздел «Возможности платформы, которые мы не используем»), ссылки
+проверены живым запросом в этот день, каждая дата «Last updated» — снимок с самой
+страницы, не дата нашей проверки:
+
+- [Queues — Limits](https://developers.cloudflare.com/queues/platform/limits/)
+- [Queues — Pricing](https://developers.cloudflare.com/queues/platform/pricing/)
+- [Workers Analytics Engine — Pricing](https://developers.cloudflare.com/analytics/analytics-engine/pricing/)
+- [Workers Analytics Engine — Limits](https://developers.cloudflare.com/analytics/analytics-engine/limits/)
+- [Logpush](https://developers.cloudflare.com/logs/logpush/) — таблица Availability по планам
+- [Placement (Smart Placement)](https://developers.cloudflare.com/workers/configuration/placement/) — «available on all Workers plans»
+- [Tail Workers](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) — «available to all customers on the Workers Paid and Enterprise tiers»
+- [Gradual deployments](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/) — лимит «last 100 uploaded versions»
+- `cf-worker/wrangler.jsonc`, `cf-worker/src/harness.ts` этого репозитория — фактическая конфигурация, 2026-09-05
