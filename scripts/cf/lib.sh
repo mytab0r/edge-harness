@@ -69,18 +69,22 @@ cf_workers_own() {
   fi
   local allow_json
   allow_json=$(printf '%s\n' $CF_OWN_WORKERS | jq -R . | jq -s .)
+  # jq не принимает не-ASCII ключи как bare-идентификаторы в {key: ...} —
+  # только строковые литералы в кавычках.
   echo "$resp" | jq --argjson allow "$allow_json" '
     (.result // []) as $all
     | ($all | map(select(.id as $id | $allow | index($id))
         | {id, modified_on, last_deployed_from, compatibility_date, usage_model})) as $own
-    | {свои: $own, всего_в_аккаунте: ($all|length), чужих_не_показано: (($all|length)-($own|length))}'
+    | {"свои": $own, "всего_в_аккаунте": ($all|length), "чужих_не_показано": (($all|length)-($own|length))}'
 }
 
-# cf_do_namespaces_own — /durable_objects/namespaces отфильтрован по script
-# из CF_OWN_WORKERS тем же способом.
+# cf_do_namespaces_own — список DO namespaces отфильтрован по script из
+# CF_OWN_WORKERS тем же способом. Путь под /workers/, не под корнем аккаунта
+# (реальный путь проверен прогоном — плоский /durable_objects/namespaces
+# отдаёт 7003 "No route for that URI").
 cf_do_namespaces_own() {
   local resp
-  resp=$(cf_get "/accounts/${CLOUDFLARE_ACCOUNT_ID}/durable_objects/namespaces") || return 1
+  resp=$(cf_get "/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/durable_objects/namespaces") || return 1
   if ! command -v jq >/dev/null 2>&1; then
     echo "ОШИБКА: jq недоступен — не печатаю account-wide список без фильтра (чужие проекты в том же аккаунте)." >&2
     return 1
@@ -90,7 +94,7 @@ cf_do_namespaces_own() {
   echo "$resp" | jq --argjson allow "$allow_json" '
     (.result // []) as $all
     | ($all | map(select(.script as $s | $allow | index($s)))) as $own
-    | {свои: $own, всего_в_аккаунте: ($all|length), чужих_не_показано: (($all|length)-($own|length))}'
+    | {"свои": $own, "всего_в_аккаунте": ($all|length), "чужих_не_показано": (($all|length)-($own|length))}'
 }
 
 _cf_request() {
