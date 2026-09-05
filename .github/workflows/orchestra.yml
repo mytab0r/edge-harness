@@ -75,3 +75,19 @@ jobs:
           DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: python scripts/orchestra/scheduler.py
+
+      # Инварианты состояния репозитория (#244): состояние дрейфует БЕЗ
+      # коммитов (задачу закрыли, PR слили, метку снял бот) — repo-ci.yml
+      # реагирует только на push/PR, здесь тот же отчёт бежит по расписанию
+      # (cron */15 мин, тот же job, что и планировщик выше). --orchestra
+      # включает эскалацию (scripts/orchestra/pulse_guard.py::escalate,
+      # канал #120 + Telegram — третий канал не заводим) для инвариантов 1 и
+      # 3: у обоих есть естественный возраст состояния (когда слит PR, когда
+      # поставлена review:ok), эскалация — один раз на конкретный набор
+      # нарушителей (issue_marker_times), не на каждый пульс.
+      - name: Инварианты состояния репозитория
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/repo_invariants.py --orchestra
