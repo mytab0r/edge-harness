@@ -163,6 +163,23 @@ def test_build_comment_facts_header_and_fences():
     assert "Хорошая работа." in body
 
 
+def test_build_comment_diff_field_optional_backward_compat():
+    # Без diff_fp (старые вызовы, старые тесты) шапка не несёт поля diff —
+    # прежнее поведение не ломается.
+    tasks = [{"title": "Задача раз", "body": "Цель.\nКритерий."}]
+    body = ai.build_comment(140, "abcdef1234567890", "approve", "Хорошая работа.", tasks)
+    facts = ai.header_facts(body)
+    assert "diff" not in facts
+
+
+def test_build_comment_includes_diff_fingerprint_when_given():
+    # #252: поле diff — отпечаток диффа PR на момент вердикта, читает его
+    # check_pr.py на следующем пуше (review_labels.diff_fingerprint/diff_unchanged).
+    body = ai.build_comment(292, "5432ce5", "approve", "Ок.", [], diff_fp="deadbeef")
+    facts = ai.header_facts(body)
+    assert facts == {"pr": "292", "head": "5432ce5", "reviewer": "approve", "diff": "deadbeef"}
+
+
 def test_header_facts_ignores_fenced_and_prose_lines():
     # строка «pr: …» внутри фенса/прозы не факт: шапка кончается первым пустой строкой
     body = (

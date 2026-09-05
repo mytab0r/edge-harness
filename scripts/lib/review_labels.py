@@ -13,11 +13,20 @@
 Слияние (scheduler.merge_queue) требует review:ok И ai:ok. Вердикт AI
 привязан к head, который ревьюили: детерминированное ревью при каждом своём
 запуске (новый пуш) снимает все ai:*-метки — протухший вердикт не может
-открыть слияние (см. ai_verdicts_to_drop).
+открыть слияние (см. ai_verdicts_to_drop) — ЕСЛИ дифф PR относительно base
+действительно изменился. Подтягивание main без конфликтов меняет только
+head (новый merge-коммит), но не патчи PR: check_pr.py сверяет отпечаток
+диффа (diff_fingerprint) с тем, что сохранён в шапке последнего
+AI-ревью-комментария (latest_ai_comment), и сохраняет ai:*-метку, если
+отпечаток не изменился (#252, диагноз «вердикт AI не должен сбрасываться,
+когда подтягивание не изменило дифф») — см. diff_unchanged.
 
 Импорт из соседних каталогов — importlib по файлу (паттерн claim_task):
 скрипты запускаются как файлы, не как пакет.
 """
+
+import hashlib
+import re
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -125,3 +134,94 @@ def ai_verdicts_to_drop(labels) -> list[str]:
     """
     names = _names(labels)
     return [label for label in AI_VERDICTS if label in names]
+
+
+# ── Вердикт AI переживает подтягивание main без изменения диффа (#252) ──────
+#
+# Корень, который направления «выборочное подтягивание» (should_update_branch
+# выше) и «одна задача — один PR» (mark_conflicts) лечили только как
+# следствие: сам сброс ai:*-метки на каждом пуше не различает «дифф PR
+# изменился» и «в ветку влили main, а дифф относительно base — тот же набор
+# патчей». Проверено на реальном PR #292 (2026-09-04): у него один
+# собственный коммит и один `Merge branch 'main'`; `git diff --stat` между
+# merge-base и головой ДО и ПОСЛЕ слияния даёт побайтово идентичный список
+# файлов — GitHub App API `pulls/{n}/files` вычисляет дифф той же логикой
+# (base...head по merge-base), поэтому отпечаток по нему устойчив к чистому
+# подтягиванию main и меняется только при реальной правке файлов PR.
+
+def diff_fingerprint(files) -> str:
+    """Отпечаток содержимого диффа PR — sha256 по отсортированному списку
+    `имя_файла:статус:blob-sha` из прод-формы `gh api .../pulls/{n}/files`.
+
+    Почему blob-sha, а не число строк/изменений: длина диффа — не признак
+    содержимого, две разные правки могут случайно дать одинаковое число
+    добавленных/удалённых строк (класс, который явно назвала задача #252).
+    `sha` каждого файла в этом ответе — SHA блоба GitHub на голове PR
+    (для removed — блоб удалённого содержимого): он меняется тогда и только
+    тогда, когда меняются байты файла, поэтому две разные правки одного
+    размера получают разные отпечатки, а чистое подтягивание main (файлы PR
+    не тронуты) — тот же самый. Сортировка по строке снимает зависимость от
+    порядка страниц API; статус в строке отличает rename/added/removed друг
+    от друга даже при совпадении итогового имени файла.
+    """
+    parts = sorted(
+        f"{f.get('filename', '')}:{f.get('status', '')}:{f.get('sha', '')}"
+        for f in files
+    )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def diff_unchanged(stored_fingerprint: str | None, current_fingerprint: str) -> bool:
+    """True — дифф PR не изменился с момента последнего вердикта AI (совпали
+    отпечатки). Нет сохранённого отпечатка (None/пусто — старый комментарий
+    без поля `diff:`, сеть не отдала комментарий) трактуется как «изменился»:
+    ложный сброс стоит лишнего круга ревью, ложное сохранение пропускает
+    непроверенный код в main — при сомнении выбираем сброс (AGENTS.md)."""
+    return bool(stored_fingerprint) and stored_fingerprint == current_fingerprint
+
+
+# Шапка-факты ревью-комментария: pr/head/reviewer (ai_review.build_comment)
+# плюс diff — отпечаток diff_fingerprint на момент вердикта (#252). Разбор
+# останавливается на первой пустой строке, чтобы проза/фенсы ниже не
+# притворялись фактами (см. header_facts). Одно место правды — раньше жило
+# только в ai_review.py, check_pr.py читало бы вторую копию regex.
+FACT_RE = re.compile(r"^(pr|head|reviewer|diff):\s*(.+)$")
+
+
+def header_facts(comment_body: str) -> dict[str, str]:
+    lines = (comment_body or "").splitlines()
+    facts: dict[str, str] = {}
+    for line in lines:
+        if not line.strip():
+            break  # шапка кончилась: дальше проза и фенсы, не факты
+        match = FACT_RE.match(line.strip())
+        if match:
+            facts[match.group(1)] = match.group(2).strip()
+    return facts
+
+
+def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
+    """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`) —
+    источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
+    вызывающий `gh(*args)` того же модуля (subprocess-обёртка над `gh api`,
+    паттерн уже используемый в check_pr/ai_review) — сеть здесь не
+    зашивается, чтобы функция оставалась инъекцией зависимости и её решение
+    (diff_unchanged) проверялось без сети.
+
+    Листает все страницы (per_page=100) — эндпоинт комментариев не
+    поддерживает сортировку по убыванию (замер file_tasks.py на PR #138),
+    поэтому «последний» ищем перебором, как уже делает file_tasks.latest_review_comment."""
+    page = 1
+    latest = None
+    while True:
+        chunk = gh_func(f"repos/{repo}/issues/{pr}/comments?per_page=100&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        for comment in chunk:
+            facts = header_facts(comment.get("body") or "")
+            if facts.get("reviewer") in ("approve", "rework", "error"):
+                latest = comment
+        if len(chunk) < 100:
+            break
+        page += 1
+    return latest

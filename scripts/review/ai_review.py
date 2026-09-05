@@ -22,8 +22,11 @@ error, неоднозначность никогда не одобряет.
 ревью, а детерминированное ревью к тому же снимает старые ai:*-метки.
 
 Состояние для «завести задачи в беклог одной командой» живёт в комментарии:
-шапка-факты (pr/head/reviewer) до первого пустой строки + канонические
-блоки-заборы ````задача — парсит scripts/review/file_tasks.py.
+шапка-факты (pr/head/reviewer/diff) до первого пустой строки + канонические
+блоки-заборы ````задача — парсит scripts/review/file_tasks.py. Поле diff —
+отпечаток диффа PR на момент вердикта (review_labels.diff_fingerprint,
+#252): check_pr.py сверяет его с текущим и сохраняет ai:*-метку, если
+подтягивание main не изменило дифф PR — см. review_labels.diff_unchanged.
 
 Тормоз/газ размерного гейта (#204): approve на том же head, что и review:large,
 автоматически ставит review:large-ok (см. apply_large_ok/large_ok_decision) —
@@ -102,9 +105,11 @@ TASK_CLOSE = "КОНЕЦ ЗАДАЧИ"
 # кода) не закрывает блок — иначе roundtrip молча обрезал бы тело.
 TASK_FENCE = "````задача"
 FENCE_CLOSE_RE = re.compile(r"^`{4,}\s*$")
-# Шапка-факты комментария: разбираются только до первого пустой строки,
-# чтобы проза/фенсы ниже не притворялись фактами.
-FACT_RE = re.compile(r"^(pr|head|reviewer):\s*(.+)$")
+# Шапка-факты комментария (pr/head/reviewer/diff) — одно место правды в
+# review_labels.py (#252): check_pr.py читает ту же функцию, не вторую копию
+# регэкспа, чтобы разбор поля diff не разошёлся между читателем и писателем.
+FACT_RE = review_labels.FACT_RE
+header_facts = review_labels.header_facts
 
 
 def gh(*args: str) -> dict | list:
@@ -278,12 +283,19 @@ def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
 
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
-                  tasks: list[dict]) -> str:
+                  tasks: list[dict], diff_fp: str | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
-    зону и фенсы задач, проза и заборы не могут притвориться фактами)."""
+    зону и фенсы задач, проза и заборы не могут притвориться фактами).
+
+    diff_fp — отпечаток диффа PR на момент вердикта (review_labels.
+    diff_fingerprint, #252): check_pr.py читает его из поля `diff:` шапки,
+    чтобы решить, сохранять ли ai:*-метку при следующем пуше. Необязателен
+    (None не добавляет строку) — не ломает старые вызовы/тесты, которые
+    факта diff не ждут."""
+    diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     head = (
-        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n\n"
+        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     body = findings.strip()
@@ -297,18 +309,6 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
             f"    python scripts/review/file_tasks.py --pr {number}\n\n{blocks}"
         )
     return f"{head}\n\n{body}\n".strip() + "\n"
-
-
-def header_facts(comment_body: str) -> dict[str, str]:
-    lines = (comment_body or "").splitlines()
-    facts: dict[str, str] = {}
-    for line in lines:
-        if not line.strip():
-            break  # шапка кончилась: дальше проза и фенсы, не факты
-        match = FACT_RE.match(line.strip())
-        if match:
-            facts[match.group(1)] = match.group(2).strip()
-    return facts
 
 
 def tasks_from_comment(comment_body: str) -> list[dict]:
@@ -475,7 +475,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     added = sum(f["additions"] for f in files)
     apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
-    body = build_comment(args.pr, args.head, verdict, findings, tasks)
+    # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
+    # следующем пуше мог сравнить и сохранить метку, если PR не изменился
+    # (см. review_labels.diff_fingerprint/diff_unchanged).
+    diff_fp = review_labels.diff_fingerprint(files)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 

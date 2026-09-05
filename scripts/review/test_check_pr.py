@@ -25,11 +25,13 @@ scripts/lib/review_labels.py (одного места правды), а не с�
 """
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("check_pr.py")
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 
 _spec = importlib.util.spec_from_file_location("check_pr_module", SCRIPT)
 check_pr = importlib.util.module_from_spec(_spec)
@@ -135,3 +137,57 @@ def test_findings_outweigh_accepted_size():
     # Метка размера не отключает остальные проверки: находка → changes-requested.
     assert check_pr.verdict_for(is_large=False, findings=["Похоже на GitHub PAT"]) == (
         rl.REVIEW_CHANGES)
+
+
+# ── Вердикт AI переживает подтягивание main без изменения диффа (#252) ───────
+#
+# Прод-форма: те же fixtures_pr292_merge_diff.json / fixtures_pr253_edit_diff.json,
+# что доказывают review_labels.diff_fingerprint (scripts/lib/test_review_labels.py) —
+# здесь проверяется решение check_pr.ai_verdict_keep, которое их использует.
+
+def _fingerprint(fixture_name: str, key: str) -> str:
+    with open(LIB_DIR / fixture_name, encoding="utf-8") as file:
+        files = json.load(file)[key]
+    return rl.diff_fingerprint(files)
+
+
+def test_ai_verdict_keep_true_after_clean_merge_pr292():
+    # PR #292: подтягивание main без конфликтов — отпечаток тот же, ai:ok
+    # (или любая другая ai:*-метка) обязана сохраниться.
+    stored = _fingerprint("fixtures_pr292_merge_diff.json", "before_merge")
+    current = _fingerprint("fixtures_pr292_merge_diff.json", "after_merge")
+    assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is True
+
+
+def test_ai_verdict_keep_false_after_real_edit_pr253():
+    # PR #253: реальная правка автора между двумя пушами — отпечаток другой,
+    # метка обязана сниматься, как до этой правки.
+    stored = _fingerprint("fixtures_pr253_edit_diff.json", "rev1")
+    current = _fingerprint("fixtures_pr253_edit_diff.json", "rev2")
+    assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is False
+
+
+def test_ai_verdict_keep_false_without_existing_ai_label():
+    # Нечего сохранять: без ai:*-метки на PR решение всегда False, даже если
+    # отпечатки совпадут (первое ревью PR, метки ещё нет).
+    fp = _fingerprint("fixtures_pr292_merge_diff.json", "before_merge")
+    assert check_pr.ai_verdict_keep([], fp, fp) is False
+
+
+def test_ai_verdict_keep_false_without_stored_fingerprint():
+    # Нет сохранённого отпечатка (старый комментарий без diff:, сеть отказала,
+    # комментария вовсе нет) — трактуется как «изменился»: метка снимается.
+    current = _fingerprint("fixtures_pr292_merge_diff.json", "after_merge")
+    assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], None, current) is False
+
+
+def test_ai_verdict_keep_mutation_guard_diff_unchanged():
+    # Мутационная проверка (AGENTS.md, «доказано мутацией»): если убрать
+    # условие diff_unchanged и оставить только «есть ai:*-метка» — этот тест
+    # обязан покраснеть на реальной правке PR #253, доказывая, что сравнение
+    # отпечатков — не пустая формальность.
+    stored = _fingerprint("fixtures_pr253_edit_diff.json", "rev1")
+    current = _fingerprint("fixtures_pr253_edit_diff.json", "rev2")
+    naive_keep_without_diff_check = bool(rl.ai_verdicts_to_drop([{"name": rl.AI_OK}]))
+    assert naive_keep_without_diff_check is True  # «мутант» сохранил бы метку
+    assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is False  # фикс — нет
