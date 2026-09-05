@@ -1,6 +1,9 @@
 name: 🕳️ Белое пятно / противоречие
 description: Нашёл противоречие в доке/спеке/коде или утверждение, выданное за факт без улики. Сообщи сразу — это канал для всех агентов.
-labels: [white-spot]
+# task обязателен: без неё пул воркера (scripts/orchestra/scheduler.py,
+# scripts/worker/task.sh) даже не видит issue — white-spot был бы заведён,
+# но никогда не взят в работу (задача #179).
+labels: [white-spot, task]
 body:
   - type: dropdown
     id: kind

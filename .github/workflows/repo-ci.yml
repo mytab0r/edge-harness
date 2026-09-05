@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
 
 jobs:
   test:
@@ -28,6 +29,28 @@ jobs:
 
       - name: Python-скрипты компилируются
         run: python -m compileall -q scripts
+
+      # Гвардия класса #179: white-spot без метки task физически не попадает
+      # в пул воркера (scripts/orchestra/scheduler.py читает только `task`).
+      # Шаблон теперь заводит обе метки сразу — эта проверка ловит рецидив
+      # (кто-то навесил white-spot вручную без task, или снял task не тронув
+      # white-spot) и красит CI, а не молчит до случайной находки человеком.
+      # Газ (правило «тормоз без газа», AGENTS.md): владелец/агент навешивает
+      # `task` на осиротевший issue (`gh issue edit <N> --add-label task`) или
+      # закрывает его — следующий прогон repo-ci перечитывает список и красный
+      # уходит сам, снимать вручную нечего.
+      - name: Белые пятна без метки task (класс #179)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          orphans=$(gh issue list --repo "$GITHUB_REPOSITORY" --label white-spot --state open --limit 100 \
+            --json number,labels --jq '[.[] | select(.labels | map(.name) | index("task") | not) | .number]')
+          count=$(echo "$orphans" | python -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          if [ "$count" != "0" ]; then
+            echo "::error::white-spot issues без метки task (класс #179): $orphans"
+            exit 1
+          fi
+          echo "white-spot: сирот без task нет"
 
       # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
       # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
