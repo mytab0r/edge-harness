@@ -46,7 +46,7 @@ jobs:
           node-version: 24
 
       # pnpm нужен dsh plugin add (монтаж стрим-плагина в профиль headless)
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
