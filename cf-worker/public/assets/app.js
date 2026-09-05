@@ -163,6 +163,16 @@ function renderStatus(status) {
   } else {
     $("watchdog").hidden = true;
   }
+  // Пульс оркестрации (#269): раньше сбой dispatch'а был виден только вживую в
+  // tail, теперь сервер сам решает «здоров ли пульс» (pulse_healthy) — фронту
+  // остаётся только показать причину из last_pulse.detail.
+  if (!status.pulse_healthy) {
+    const minutes = Math.round((status.now - status.last_pulse.ts) / 60000);
+    $("pulse").textContent = t("pulse.unhealthy", { detail: status.last_pulse.detail, minutes });
+    $("pulse").hidden = false;
+  } else {
+    $("pulse").hidden = true;
+  }
 }
 
 // ── Живой поток ───────────────────────────────────────────────────────────────────

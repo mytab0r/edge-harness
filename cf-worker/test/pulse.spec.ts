@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { dshEdgeUpdateDecision } from "../src/harness";
+import { attemptOrchestraDispatch, dshEdgeUpdateDecision, pulseHealthy } from "../src/harness";
+import { HEARTBEAT } from "../src/config";
 
 // Чистое решение самообновления морды (#73): все ветки логики без сети.
 // Проводка (fetch/storage/dispatch) тонкая и зеркалит уже доказанный
@@ -22,5 +23,66 @@ describe("самообновление морды: решение", () => {
   });
   it("даунгрейд тоже чинится: расхождение в любую сторону — dispatch", () => {
     expect(dshEdgeUpdateDecision("0.7.1", "0.7.0", undefined, NOW)).toBe("dispatch");
+  });
+});
+
+// Гвардия issue #269: раньше alarm() не проверял статус ответа GitHub на dispatch
+// оркестратора вовсе — fetch() не бросает на HTTP-ошибках, только на сетевых, и
+// 403/404/429 тонули как «успех» (класс уже пофикшен в #postTask, но не здесь).
+// Докажи мутацией: убери проверку `res.status !== 204` в attemptOrchestraDispatch
+// (замени на `if (false)`) — тест «403 … — ok:false» покраснеет.
+describe("пульс оркестрации: dispatch-тик (issue #269)", () => {
+  function fakeFetch(status: number): typeof fetch {
+    return (async () => new Response(null, { status })) as typeof fetch;
+  }
+
+  it("204 — единственное доказательство запуска: ok:true, detail:null", async () => {
+    const result = await attemptOrchestraDispatch("token", "owner/repo", fakeFetch(204));
+    expect(result).toEqual({ ok: true, detail: null });
+  });
+
+  it("403 (вторичный rate-limit GitHub) — ok:false с кодом в detail, не тихий успех", async () => {
+    const result = await attemptOrchestraDispatch("token", "owner/repo", fakeFetch(403));
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("403");
+  });
+
+  it("404 (протухший токен/репозиторий) — ok:false", async () => {
+    const result = await attemptOrchestraDispatch("token", "owner/repo", fakeFetch(404));
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("404");
+  });
+
+  it("сетевая ошибка (fetch бросает) — ok:false, сообщение в detail", async () => {
+    const throwingFetch = (async () => {
+      throw new Error("network unreachable");
+    }) as typeof fetch;
+    const result = await attemptOrchestraDispatch("token", "owner/repo", throwingFetch);
+    expect(result).toEqual({ ok: false, detail: "network unreachable" });
+  });
+});
+
+describe("пульс оркестрации: pulseHealthy — здоров ли пульс (issue #269)", () => {
+  const FRESH_MS = HEARTBEAT.selfOrchestrationMs * 2 - 1;
+  const STALE_MS = HEARTBEAT.selfOrchestrationMs * 2 + 1;
+
+  it("ни разу не тикал (холодный старт) — здоров, не повод кричать", () => {
+    expect(pulseHealthy(NOW, null)).toBe(true);
+  });
+
+  it("возможности нет (секреты не заданы) — здоров, это конфигурация, не поломка", () => {
+    expect(pulseHealthy(NOW, { ts: NOW - 10 * 60_000, dispatch_ok: false, detail: "not_configured" })).toBe(true);
+  });
+
+  it("последний dispatch удался и свежий — здоров", () => {
+    expect(pulseHealthy(NOW, { ts: NOW - FRESH_MS, dispatch_ok: true, detail: null })).toBe(true);
+  });
+
+  it("последний dispatch удался, но давно (alarm подвис) — нездоров", () => {
+    expect(pulseHealthy(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null })).toBe(false);
+  });
+
+  it("последний dispatch провалился (даже свежий тик) — нездоров сразу, без ожидания порога", () => {
+    expect(pulseHealthy(NOW, { ts: NOW, dispatch_ok: false, detail: "dispatch отклонён: 403" })).toBe(false);
   });
 });

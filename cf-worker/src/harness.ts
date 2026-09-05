@@ -36,6 +36,17 @@ const SCHEMA = [
      ts     INTEGER NOT NULL,
      job_id TEXT NOT NULL
    )`,
+  // Пульс оркестрации (issue #269): одна строка (id=1) — исход ПОСЛЕДНЕЙ попытки
+  // alarm() дёрнуть workflow_dispatch оркестратора. Сам будильник не может застрять
+  // (setAlarm перезакладывается первой строкой alarm()), но раньше исход dispatch'а
+  // (не настроен / сеть упала / GitHub отклонил не-204) тонул в console.log, который
+  // никто не смотрит между дедами. Эта строка — видимый артефакт вместо тихой лжи.
+  `CREATE TABLE IF NOT EXISTS pulse (
+     id          INTEGER PRIMARY KEY CHECK (id = 1),
+     ts          INTEGER NOT NULL,
+     dispatch_ok INTEGER NOT NULL,
+     detail      TEXT
+   )`,
 ];
 
 export interface EventRow {
@@ -65,6 +76,11 @@ export interface Status {
   last_event_id: number;
   /** Watchdog (#7): задачи, висящие в dispatched дольше порога без рук. */
   stale_dispatch: { count: number; oldest_age_ms: number | null };
+  /** Пульс оркестрации (#269): исход последней попытки alarm() дёрнуть orchestra. */
+  last_pulse: { ts: number; dispatch_ok: boolean; detail: string | null } | null;
+  /** Предвычислено сервером — фронту не нужно знать пороги (те же соображения,
+   *  что у hands_alive). См. pulseHealthy. */
+  pulse_healthy: boolean;
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -82,8 +98,63 @@ export function dshEdgeUpdateDecision(
   return deployed === latest ? "quiet" : "dispatch";
 }
 
+/**
+ * Один dispatch-тик оркестратора (issue #269). Никогда не бросает — исход
+ * упакован в объект: единственное доказательство запуска — HTTP 204 от GitHub
+ * (docs/research/21-github-actions.md: «успешный HTTP-код — не доказательство
+ * запуска»). До этой правки статус ответа вообще не проверялся: 403 (вторичный
+ * rate-limit GitHub, 500/час) или 404 (протухший токен/репо) тонули как «успех»,
+ * потому что fetch() не бросает на HTTP-ошибках сам по себе — бросает только
+ * сеть. fetchImpl инъецируется, чтобы тест не ходил в реальный GitHub.
+ */
+export async function attemptOrchestraDispatch(
+  token: string,
+  repo: string,
+  fetchImpl: typeof fetch,
+): Promise<{ ok: boolean; detail: string | null }> {
+  try {
+    const res = await fetchImpl(
+      `${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({ ref: "main" }),
+      },
+    );
+    if (res.status !== 204) {
+      return { ok: false, detail: `dispatch отклонён: ${res.status}` };
+    }
+    return { ok: true, detail: null };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export function handsAreAlive(now: number, lastHeartbeatTs: number | null): boolean {
   return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
+}
+
+/**
+ * Пульс оркестрации (#269) здоров, если:
+ *  - тика ещё не было (холодный старт DO — не повод кричать до первой попытки);
+ *  - секретов нет («возможности нет» — конфигурация, а не поломка, отличать от
+ *    «возможность есть, но сломана» обязательно: лечатся по-разному);
+ *  - последняя попытка dispatch'а удалась И была не раньше двух тактов назад —
+ *    один пропущенный такт не тревога, а вот подвисший на дольше alarm — уже да.
+ */
+export function pulseHealthy(
+  now: number,
+  lastPulse: { ts: number; dispatch_ok: boolean; detail: string | null } | null,
+): boolean {
+  if (lastPulse === null) return true;
+  if (lastPulse.detail === "not_configured") return true;
+  if (!lastPulse.dispatch_ok) return false;
+  return now - lastPulse.ts < HEARTBEAT.selfOrchestrationMs * 2;
 }
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
@@ -336,6 +407,10 @@ export class Harness extends DurableObject<Env> {
       ),
     )[0];
     const hbTs = hb ? Number(hb.ts) : null;
+    const pulseRow = this.#rows(this.#sql.exec("SELECT ts, dispatch_ok, detail FROM pulse WHERE id = 1"))[0];
+    const lastPulse = pulseRow
+      ? { ts: Number(pulseRow.ts), dispatch_ok: Number(pulseRow.dispatch_ok) === 1, detail: pulseRow.detail === null ? null : String(pulseRow.detail) }
+      : null;
     return {
       now,
       heartbeat_fresh_ms: LIMITS.heartbeatFreshMs,
@@ -347,6 +422,8 @@ export class Harness extends DurableObject<Env> {
         count: Number(stale.n),
         oldest_age_ms: stale.oldest === null || stale.oldest === undefined ? null : now - Number(stale.oldest),
       },
+      last_pulse: lastPulse,
+      pulse_healthy: pulseHealthy(now, lastPulse),
     };
   }
 
@@ -554,30 +631,41 @@ export class Harness extends DurableObject<Env> {
    *  и проверяем, не отстала ли морда dsh-edge от npm. */
 
   override async alarm(): Promise<void> {
+    // Тик перезакладывается ПЕРВОЙ строкой, до какого-либо I/O: ничто ниже не
+    // может убить цепочку (issue #269 — таблица ловушек для этого места).
     await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
     const token = this.env.GH_DISPATCH_TOKEN;
     const repo = this.env.GH_REPO;
-    if (!token || !repo) return; // «возможности нет» — не поломка, тихо ждём конфигурации
-    try {
-      await fetch(`${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/dispatches`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": GITHUB.userAgent,
-          "X-GitHub-Api-Version": GITHUB.apiVersion,
-        },
-        body: JSON.stringify({ ref: "main" }),
-      });
-    } catch (error) {
-      // Пульс не роняет объект: ошибка уйдёт в observability, цепочка уже перезаложена.
-      console.log(`heartbeat dispatch failed: ${error instanceof Error ? error.message : error}`);
+    if (!token || !repo) {
+      // «Возможности нет» — не поломка, но и не тишина: видно в /api/status, что
+      // секретов нет, а не гадать по отсутствию прогонов оркестратора.
+      this.#recordPulse(false, "not_configured");
+      return;
+    }
+    const result = await attemptOrchestraDispatch(token, repo, fetch);
+    this.#recordPulse(result.ok, result.detail);
+    if (!result.ok) {
+      // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
+      // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
+      // который никто не смотрит между дедами (fail loud, issue #269).
+      console.log(`heartbeat dispatch failed: ${result.detail}`);
     }
     try {
       await this.#checkDshEdgeUpdate(token, repo);
     } catch (error) {
       console.log(`dsh-edge update check failed: ${error instanceof Error ? error.message : error}`);
     }
+  }
+
+  /** Единственное место, где обновляется видимый исход пульса (issue #269). */
+  #recordPulse(ok: boolean, detail: string | null): void {
+    this.#sql.exec(
+      `INSERT INTO pulse (id, ts, dispatch_ok, detail) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, dispatch_ok = excluded.dispatch_ok, detail = excluded.detail`,
+      Date.now(),
+      ok ? 1 : 0,
+      detail,
+    );
   }
 
   /** #73: морда dsh-edge должна быть последней версии. Сверяем версию, которую

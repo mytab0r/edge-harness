@@ -352,6 +352,36 @@ describe("watchdog зависших задач", () => {
   });
 });
 
+// Гвардия issue #269: пульс оркестрации не должен молчать шестнадцать часов
+// незамеченным. Ловит именно «alarm не переустановился после сбоя» — докажи
+// мутацией: перенеси `await this.ctx.storage.setAlarm(...)` в src/harness.ts#alarm()
+// на строку ПОСЛЕ `if (!token || !repo) { ...; return; }` — тест «тик
+// перезакладывается» покраснеет (getAlarm() вернёт null, потому что в тестовом
+// окружении GH_DISPATCH_TOKEN сознательно не задан и alarm() уходит в ранний return).
+describe("пульс оркестрации: alarm() всегда перезакладывает следующий тик (issue #269)", () => {
+  it("тик перезакладывается и исход фиксируется, даже когда dispatch невозможен (нет секретов)", async () => {
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.deleteAlarm();
+      expect(await state.storage.getAlarm()).toBeNull();
+      await instance.alarm();
+      // Главное утверждение гвардии: alarm() обязан перезаложить будильник
+      // ДО какой-либо попытки dispatch'а — падение/отсутствие возможности внутри
+      // не может убить цепочку.
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+    // И исход не тонет молча: /api/status видит причину и не паникует зря —
+    // «возможности нет» отличается от «возможность есть, но сломана».
+    const status = await getJson<{
+      last_pulse: { dispatch_ok: boolean; detail: string | null } | null;
+      pulse_healthy: boolean;
+    }>("/api/status");
+    expect(status.last_pulse).toMatchObject({ dispatch_ok: false, detail: "not_configured" });
+    expect(status.pulse_healthy).toBe(true);
+  });
+});
+
 describe("живой поток", () => {
   async function openSocket(after = 0): Promise<WebSocket> {
     const res = await WORKER.fetch(`https://example.com/api/events.live?after=${after}`, {
