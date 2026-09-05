@@ -126,6 +126,24 @@ def test_collect_github_in_progress_reads_real_payload(monkeypatch):
     assert row.limit == qz.LIMITS["gh_concurrent_jobs"]
 
 
+def test_collect_github_runs_lookups_force_method_get(monkeypatch):
+    """Класс бага, найденного живым прогоном 2026-09-05: `gh api` молча
+    переключается на POST, если заданы `-f` поля без явного `--method` — на
+    `actions/runs` это даёт 404 вместо количества, а не осмысленную ошибку.
+    Оба GET-с-параметрами вызова обязаны нести явный `--method GET`."""
+    seen_args = []
+
+    def fake_gh_api(*args):
+        seen_args.append(args)
+        return {"total_count": 0, "resources": {"core": {}, "graphql": {}}}
+
+    monkeypatch.setattr(qz, "gh_api", fake_gh_api)
+    qz.collect_github("mytab0r/edge-harness")
+    runs_calls = [a for a in seen_args if "actions/runs" in " ".join(a)]
+    assert len(runs_calls) == 3  # 2 события диспатча + in-progress
+    assert all(a[:2] == ("--method", "GET") for a in runs_calls)
+
+
 def test_collect_github_reports_actions_minutes_not_applicable(monkeypatch):
     monkeypatch.setattr(qz, "gh_api", lambda *a: {"total_count": 0, "resources": {"core": {}, "graphql": {}}})
     rows = qz.collect_github("mytab0r/edge-harness")
