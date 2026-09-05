@@ -1,0 +1,25 @@
+# Прогон инвентаря возможностей Cloudflare (issue #322): секреты есть только
+# здесь, локально агент их не видит. Лог — доказательство, не пересказ
+# документации. Ничего не пишет и не удаляет — только GET/безопасные проверки.
+name: cf-inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Инвентарь (workers, DO, KV/D1/R2, зоны, bindings-имена)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash scripts/cf/status.sh
+
+      - name: Логи воркера — доступны ли за окно
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash scripts/cf/worker-logs.sh
