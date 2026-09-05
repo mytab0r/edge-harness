@@ -4,10 +4,16 @@
 Правила (нарушение = проверка красная, такой PR не слить):
   1. PR с меткой `orchestra:skip` — явный обход контракта (мелочи вне пула).
   2. В теле PR есть ссылка на задачу `#N`.
-  3. Задача #N открыта и помечена меткой `task`.
-  4. Задача назначена ровно одному исполнителю.
+  3. Задача #N существует как issue (не PR), открыта, помечена меткой `task`
+     и не помечена `blocked` — см. task_eligibility_problems, одно место
+     правды. Задача НЕПРИГОДНА хотя бы по одной из этих причин — контракт
+     не выполняет над ней ни одного изменяющего вызова (не назначает
+     исполнителя, не сверяет дубликаты PR): нарушение только докладывается.
+  4. Задача назначена ровно одному исполнителю (проверяется/чинится только
+     для пригодной задачи, см. правило 3).
   5. У этой задачи нет ДРУГОГО открытого PR — второй PR на ту же задачу закрывается
-     оркестратором, брать задачу надо через назначение, а не через гонку веток.
+     оркестратором, брать задачу надо через назначение, а не через гонку веток
+     (тоже только для пригодной задачи).
 
 Среда: runner с `gh`, GH_TOKEN с правами issues/pull-requests.
 """
@@ -29,6 +35,12 @@ _TR_SPEC.loader.exec_module(task_ref)
 
 SKIP_LABEL = "orchestra:skip"
 TASK_LABEL = "task"
+# Эскалация playbook (scheduler.py: BLOCKED_LABEL) — «ждёт владельца», не
+# кандидат на авто-назначение. Строка та же, что и в scheduler.py, но
+# отдельная константа: тащить сюда модуль scheduler.py ради одного имени —
+# лишняя связка (contract_check и scheduler уже читают общие lib-модули, но
+# не друг друга).
+BLOCKED_LABEL = "blocked"
 
 
 def run_gh(*args: str) -> None:
@@ -68,6 +80,41 @@ def _all_open_pulls(repo: str) -> list[dict]:
             break
         page += 1
     return pulls
+
+
+def task_eligibility_problems(issue: dict, issue_number: int) -> list[str]:
+    """Единое место правды «можно ли вообще действовать над этой задачей» —
+    существует ли она как issue (не PR), открыта, несёт метку `task`, не
+    `blocked`. Пока этот список непуст, main() не имеет права выполнить НИ
+    ОДНОГО изменяющего вызова над issue_number (назначение, метки, комментарии
+    от её имени) — только копить причины отказа.
+
+    Живой случай, который эта функция закрывает (лог прогона 2026-09-06,
+    контракт PR #359): «contract: авто-назначение mytab0r на #131» сразу
+    следом за «Задача #131 закрыта — возьми открытую». Раньше проверка
+    состояния и авто-назначение стояли рядом в одной ветке if/else, и ничего
+    не мешало назначению выполниться уже ПОСЛЕ того, как о непригодности было
+    известно — правило есть, действие ему не подчинялось. Здесь пригодность
+    считается один раз, до всех действующих вызовов, и других мест, где эти
+    условия проверяются заново, в контракте больше нет."""
+    problems: list[str] = []
+    if "pull_request" in issue:
+        # Это PR, а не issue — остальные поля (state/labels исполнителя)
+        # созданы для issue и не значат то же самое на PR; дальше нечего
+        # проверять.
+        problems.append(f"#{issue_number} — это PR, а не задача из пула.")
+        return problems
+    if issue["state"] != "open":
+        problems.append(f"Задача #{issue_number} закрыта — возьми открытую или заведи новую.")
+    labels_issue = {label["name"] for label in issue["labels"]}
+    if TASK_LABEL not in labels_issue:
+        problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
+    if BLOCKED_LABEL in labels_issue:
+        problems.append(
+            f"Задача #{issue_number} помечена `{BLOCKED_LABEL}` — ждёт решения владельца, "
+            "бери свободную из пула."
+        )
+    return problems
 
 
 def fail(messages: list[str], repo: str, pr_number: int) -> None:
@@ -134,14 +181,13 @@ def main() -> int:
     if issue_numbers:
         issue_number = issue_numbers[0]
         issue = gh(f"repos/{repo}/issues/{issue_number}")
-        if "pull_request" in issue:
-            problems.append(f"#{issue_number} — это PR, а не задача из пула.")
+        # Пригодность считается ОДИН раз, ДО единого изменяющего вызова над
+        # этой issue (см. task_eligibility_problems) — непригодна, дальше не
+        # действуем вовсе, только докладываем причину.
+        eligibility = task_eligibility_problems(issue, issue_number)
+        if eligibility:
+            problems.extend(eligibility)
         else:
-            if issue["state"] != "open":
-                problems.append(f"Задача #{issue_number} закрыта — возьми открытую или заведи новую.")
-            labels_issue = {label["name"] for label in issue["labels"]}
-            if TASK_LABEL not in labels_issue:
-                problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
             assignees = [a["login"] for a in issue["assignees"]]
             author = pull["user"]["login"]
             if not assignees:
