@@ -352,6 +352,19 @@ class ApiError extends Response {
   }
 }
 
+/**
+ * Ответ на неизвестную ошибку, дошедшую до общего catch `#fetch()` (#320, спека
+ * 5.1). Раньше `classifyStorageError` тестировался только сам по себе — маппинг
+ * "quota_exceeded" → код `storage_quota_exceeded` (а не общий `internal`) и сама
+ * сборка ответа не проверялись тестом (находка ревью PR #321). Вынесено отдельной
+ * функцией, чтобы гонять именно тот код, который реально уходит клиенту, без
+ * необходимости реально исчерпывать суточную квоту DO в тесте.
+ */
+export function storageErrorResponse(detail: string): Response {
+  const code = classifyStorageError(detail) === "quota_exceeded" ? "storage_quota_exceeded" : "internal";
+  return new ApiError(500, code, { detail });
+}
+
 // ── Durable Object ──────────────────────────────────────────────────────────────────
 
 export class Harness extends DurableObject<Env> {
@@ -385,7 +398,14 @@ export class Harness extends DurableObject<Env> {
           return this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        // #320: единственная пересборка цепочки после гибели пульса (см. alarm()) —
+        // молчание здесь тот же класс «немое падение пульса», который PR закрывает
+        // в alarm(). Здесь падать некуда (конструктор не может ждать промис), но
+        // хотя бы громко в лог, тем же классификатором, что и alarm().
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`ensureHeartbeat: упал (${classifyStorageError(detail)}): ${detail}`);
+      });
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -398,8 +418,7 @@ export class Harness extends DurableObject<Env> {
       // Квоту storage называем по имени (#320) — иначе отказ DO SQLite виден
       // как обычный «internal», и никто не свяжет его с исчерпанием rows_read.
       const detail = error instanceof Error ? error.message : String(error);
-      const code = classifyStorageError(detail) === "quota_exceeded" ? "storage_quota_exceeded" : "internal";
-      return new ApiError(500, code, { detail });
+      return storageErrorResponse(detail);
     }
   }
 
