@@ -54,6 +54,7 @@
 - [0010. Интеграции внешних систем: REST-инструменты своим edge-плагином, не MCP-серверы](decisions/0010-integrations-edge-plugin-rest-tools.md)
 - [0011. Инбокс создаёт issues под собственным узким GH_ISSUES_TOKEN](decisions/0011-inbox-issues-token.md)
 - [0012. Событийный триггер оркестратора и цикл слияний за один прогон](decisions/0012-orchestra-event-trigger-merge-loop.md)
+- [0013. Нативная GitHub Merge Queue недоступна на этом репозитории — своя очередь остаётся](decisions/0013-native-merge-queue-not-available.md)
 
 ## Операционные процедуры
 
