@@ -333,6 +333,139 @@ def test_duplicate_evidence_mutation_guard():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 6: защита main-ветки не откатилась молча (#341)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма — сырой `gh api repos/mytab0r/edge-harness/branches/main/protection`
+# на момент задачи #341 (2026-09-06), не пересказ.
+HEALTHY_PROTECTION = {
+    "required_status_checks": {"strict": True, "contexts": ["test", "contract"]},
+    "enforce_admins": {"enabled": True},
+    "allow_force_pushes": {"enabled": False},
+    "allow_deletions": {"enabled": False},
+}
+
+
+def test_branch_protection_healthy_snapshot_no_violations():
+    assert ri.check_branch_protection_drift(HEALTHY_PROTECTION) == []
+
+
+def test_branch_protection_flags_enforce_admins_disabled():
+    # Живой класс задачи #341: enforce_admins стоял в false, admin-токен
+    # сливал мимо всех обязательных проверок (HTTP 405 при попытке
+    # воспроизвести проверку задним числом подтвердил пропуск).
+    broken = {**HEALTHY_PROTECTION, "enforce_admins": {"enabled": False}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "enforce_admins"
+    assert "проверок" in violations[0]["consequence"]
+
+
+def test_branch_protection_flags_missing_context():
+    broken = {**HEALTHY_PROTECTION,
+              "required_status_checks": {"strict": True, "contexts": ["test"]}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "required_status_checks.contexts"
+    assert violations[0]["actual"] == ["test"]
+    assert violations[0]["expected"] == sorted(ri.EXPECTED_STATUS_CHECK_CONTEXTS)
+
+
+def test_branch_protection_flags_extra_context_too():
+    # Не только пропажа контекста — лишний неожиданный контекст тоже дрейф
+    # (кто-то включил обязательную проверку, для которой не подтверждён
+    # живой прогон, и вся очередь PR рискует зависнуть в «Expected»).
+    broken = {**HEALTHY_PROTECTION,
+              "required_status_checks": {"strict": True,
+                                          "contexts": ["test", "contract", "harness/review"]}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "required_status_checks.contexts"
+
+
+def test_branch_protection_flags_strict_disabled():
+    broken = {**HEALTHY_PROTECTION,
+              "required_status_checks": {"strict": False, "contexts": ["test", "contract"]}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "required_status_checks.strict"
+
+
+def test_branch_protection_flags_force_pushes_enabled():
+    broken = {**HEALTHY_PROTECTION, "allow_force_pushes": {"enabled": True}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "allow_force_pushes"
+
+
+def test_branch_protection_flags_deletions_enabled():
+    broken = {**HEALTHY_PROTECTION, "allow_deletions": {"enabled": True}}
+    violations = ri.check_branch_protection_drift(broken)
+    assert len(violations) == 1
+    assert violations[0]["setting"] == "allow_deletions"
+
+
+def test_branch_protection_missing_keys_treated_as_drift():
+    # Ответ GitHub без ключа вовсе (сеть отдала урезанный объект, старый
+    # формат) — трактуем как расхождение, не как «всё ок»: при сомнении гейт
+    # не ослабляется (AGENTS.md).
+    violations = ri.check_branch_protection_drift({})
+    settings = {v["setting"] for v in violations}
+    assert settings == {
+        "enforce_admins", "required_status_checks.strict",
+        "required_status_checks.contexts", "allow_force_pushes", "allow_deletions",
+    }
+
+
+def test_branch_protection_all_violations_name_a_consequence():
+    # AGENTS.md: «Инвариант обязан называть, ЧТО сломается при расхождении».
+    violations = ri.check_branch_protection_drift({})
+    assert all(v["consequence"] for v in violations)
+
+
+def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
+    # build_report() по умолчанию НЕ дёргает fetch_branch_protection вовсе:
+    # GITHUB_TOKEN не может получить право administration ни при какой
+    # правке permissions в workflow — вызов оттуда всегда 403. Гвардия ловит
+    # регресс «кто-то включил инвариант 6 в стандартный отчёт по умолчанию»
+    # мутацией — если бы default стал True, fetch полетел бы в FakeGh без
+    # маршрута и тест упал бы AssertionError из самого FakeGh.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert 6 not in findings
+    assert any("⏭️" in line and "[6]" in line for line in lines)
+
+
+def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "branches/main/protection": HEALTHY_PROTECTION,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now, check_branch_protection=True)
+    assert findings[6] == []
+    assert any("💚" in line and "[6]" in line for line in lines)
+
+
+def test_branch_protection_not_in_ci_gating():
+    # Не может быть в CI_GATING по конструкции: включение обязательной
+    # проверки для инварианта, которому GITHUB_TOKEN не может дать ответ,
+    # красило бы main на КАЖДОМ прогоне — хуже отсутствия проверки.
+    assert 6 not in ri.CI_GATING
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
