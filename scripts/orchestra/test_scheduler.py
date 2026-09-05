@@ -1239,6 +1239,48 @@ def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeyp
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 
+def test_after_merge_promises_auto_close_only_for_declared_task(monkeypatch):
+    """Находка AI-ревью PR #253: accept_merged_tasks видит только ДЕКЛАРИРУЮЩИЕ
+    рефы (merged_pr_map строится из declared_tasks) — обещание «приёмка
+    закроет её сама» для ЛЮБОГО упоминания в прозе было ложным (задача,
+    упомянутая не первой строкой, не в карте приёмки, и через
+    ACCEPTANCE_PENDING_HOURS reap_stale снял бы с неё назначение с ложной
+    причиной «PR не появился»). #78 объявлена первой строкой — получает
+    обещание автозакрытия; #79 просто упомянута в прозе — получает
+    предупреждение завести декларирующий PR."""
+    body = "#78\n\nОсновная реализация. Заодно поправил соседний баг из #79."
+    merged = pull(163, pr_body=body)
+    posted = {}
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined == "repos/o/r/pulls/163/files?per_page=100&page=1":
+            return []
+        if joined == "repos/o/r/pulls/163/files?per_page=100&page=2":
+            return []
+        if joined == "repos/o/r/issues/78":
+            return {**issue(78, assignees=("mytab0r",)), "state": "open"}
+        if joined == "repos/o/r/issues/79":
+            return {**issue(79, assignees=("mytab0r",)), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/78/comments"):
+            posted[78] = args[-1].removeprefix("body=")
+            return None
+        if joined.startswith("-X POST repos/o/r/issues/79/comments"):
+            posted[79] = args[-1].removeprefix("body=")
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    sch.after_merge("o/r", merged, [])
+
+    assert "стадия приёмки закроет её сама" in posted[78]
+    assert "не объявил её" in posted[79]
+    assert "стадия приёмки закроет её сама" not in posted[79]
+
+
 def test_after_merge_wires_update_remaining_pulls(monkeypatch):
     # after_merge обязан прокинуть other_pulls в update_remaining_pulls — иначе
     # поведение 3 реализовано, но не вызывается ниоткуда (мертвый код).
@@ -1768,6 +1810,7 @@ def test_accept_merged_tasks_health_timeout_is_hard_failure_not_a_crash(hanging_
     fake = FakeGh({
         "pulls/177/files": files_payload(PR_177_FILES),
         "issues/21/comments": [],
+        "issues/120/comments?per_page=100": [],
         **_green_deploy_gh().routes,
     })
     patch_gh(monkeypatch, fake)
@@ -1951,6 +1994,7 @@ def test_accept_merged_tasks_docs_missing_escalates_on_non_404_error(monkeypatch
     fake = FakeGh({
         "pulls/163/files": files_payload(PR_163_FILES),
         "issues/78/comments": [],
+        "issues/120/comments?per_page=100": [],
         f"contents/{PR_163_FILES[0]}?ref=main": {"name": "design.md"},
         f"contents/{PR_163_FILES[1]}?ref=main": {"name": "proposal.md"},
         f"contents/{PR_163_FILES[2]}?ref=main": RuntimeError(
@@ -1977,6 +2021,7 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     fake = FakeGh({
         "pulls/177/files": files_payload(PR_177_FILES),
         "issues/21/comments": [],
+        "issues/120/comments?per_page=100": [],
         "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
             {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z", "html_url": "https://x"},
         ]},
@@ -1993,6 +2038,35 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
+
+
+def test_accept_merged_tasks_hard_failure_escalation_is_idempotent(monkeypatch):
+    """Находка AI-ревью PR #253: жёсткий сбой (возможность сломана) раньше
+    эскалировал на КАЖДОМ пульсе, пока не восстановится — временный HTTP 502
+    спамил бы Telegram каждые 15 минут. Маркер уже стоит в WATCHDOG_ISSUE
+    (не в задаче — жёсткий сбой её не трогает, см. соседний тест) — второй
+    прогон не должен слать Telegram повторно."""
+    error_marker = f"{sch.ACCEPTANCE_ERROR_MARKER} #21 PR #177"
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-04T18:00:00Z", "body": f"🚨 {error_marker} — уже сказано"},
+        ],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z", "html_url": "https://x"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "")  # не задан — деплой-джоб есть, health не проверить
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
+
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177})
+
+    assert hard_failure is True
+    assert any("уже эскалировано" in line and "#21" in line for line in lines)
 
 
 def test_accept_merged_tasks_stays_quiet_when_pending_within_threshold(monkeypatch):

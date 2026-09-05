@@ -680,16 +680,33 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             if "task" not in {label["name"] for label in issue["labels"]}:
                 continue
             task_numbers.append(int(task_number))
-            gh(
-                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
-                "-f",
-                "body=" + (
+            # Приёмка (accept_merged_tasks) видит только ДЕКЛАРИРУЮЩИЕ рефы
+            # (task_ref.declares_task, первая строка тела PR) — merged_pr_map
+            # строится из declared_tasks, не из extract_task_refs. Обещание
+            # «приёмка закроет её сама» для ЛЮБОГО упоминания было ложным:
+            # задача, упомянутая в прозе, не в карте приёмки, а через
+            # ACCEPTANCE_PENDING_HOURS её снимает reap_stale с причиной
+            # «PR не появился» — ровно тот класс неверных причин, что этот
+            # PR чинит для объявленных задач (находка AI-ревью PR #253).
+            if task_ref.declares_task(pull.get("body") or "", int(task_number)):
+                reminder = (
                     f"🔁 PR #{number} слит в main. Мерж — ещё не готовность: если критерий "
                     "требует реального пост-мерж прогона (канарейка/E2E), проведи его и "
                     "оставь улику. Задачу закрывать не нужно и нельзя (`gh issue close` — "
                     "обход проверки, класс #56/#57) — стадия приёмки закроет её сама по "
                     "проверяемой улике (деплой/check-runs/файлы в main)."
-                ),
+                )
+            else:
+                reminder = (
+                    f"🔁 PR #{number} слит в main и упомянул эту задачу, но не объявил её "
+                    "первой строкой тела PR — стадия приёмки её не увидит и не закроет "
+                    "сама. Если критерий требует реального пост-мерж прогона (канарейка/E2E), "
+                    "проведи его и оставь улику; закрывай задачу только через PR, "
+                    "декларирующий её номер первой строкой, иначе приёмка её не увидит."
+                )
+            gh(
+                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
+                "-f", "body=" + reminder,
             )
             lines.append(f"🔁 #{task_number}: напоминание про пост-мерж проверку — закрывает приёмка (#227)")
         except RuntimeError as error:
@@ -1131,6 +1148,7 @@ ACCEPTANCE_OK_MARKER = "[приёмка: улика]"
 ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
 ACCEPTANCE_DOCS_MARKER = "[приёмка: без наблюдаемого результата]"
 ACCEPTANCE_PENDING_MARKER = "[приёмка: зависла]"
+ACCEPTANCE_ERROR_MARKER = "[приёмка: сбой]"
 
 # Рядом со STALE_HOURS (то же назначение — «сколько ждать, прежде чем бить
 # тревогу», но для другого канала: STALE_HOURS про назначение без PR,
@@ -1346,10 +1364,28 @@ def accept_merged_tasks(
             else:
                 state, detail = script_evidence(repo, pull["head"]["sha"])
         except RuntimeError as error:
+            # Идемпотентность (находка AI-ревью PR #253): ветки fail/pending
+            # уже дедуплицируют эскалацию маркером — эта ветка эскалировала
+            # на КАЖДОМ пульсе, пока возможность не восстановится (временный
+            # HTTP 502/лежащая морда деплой-класса → Telegram каждые 15 мин
+            # в тот самый канал, где маркеры заведены ради «один сигнал на
+            # серию»). Сама проверка улики повторяется каждый пульс (в
+            # отличие от fail — сбой может исчезнуть сам), эскалация — нет.
+            # Маркер живёт в WATCHDOG_ISSUE вместе с самой эскалацией (не в
+            # задаче #number — жёсткий сбой её не трогает, см. соседний тест
+            # test_accept_merged_tasks_escalates_hard_failure_without_touching_task).
+            error_marker = f"{ACCEPTANCE_ERROR_MARKER} #{number} PR #{pull['number']}"
             text = (f"🚨 #{number}: приёмка PR #{pull['number']} "
                     f"({category or '?'}) не смогла проверить улику — возможность сломана: {error}")
-            escalation = escalate(repo, WATCHDOG_ISSUE, text)
-            lines.append(f"{text} ({escalation})")
+            try:
+                already_escalated = issue_marker_times(repo, WATCHDOG_ISSUE, error_marker)
+            except RuntimeError:
+                already_escalated = []  # маркер не прочитан — эскалируем громко, не молчим
+            if already_escalated:
+                lines.append(f"{text} (уже эскалировано, повторный Telegram не шлём)")
+            else:
+                escalation = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}")
+                lines.append(f"{text} ({escalation})")
             hard_failure = True
             continue
 
