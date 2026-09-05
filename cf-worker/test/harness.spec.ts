@@ -1,7 +1,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
-import { classifyStorageError, handsAreAlive, storageErrorResponse } from "../src/harness";
+import { describe, expect, it, vi } from "vitest";
+import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
+
+import { redact } from "../src/redact";
+import { LIMITS } from "../src/config";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -38,6 +41,19 @@ async function allEventsFor(taskId: string): Promise<{ id: number; seq: number; 
     events.push(...page.events.filter((event) => event.task_id === taskId));
     if (!page.has_more) return events;
     after = page.next_after;
+  }
+}
+
+// Заглушки fetch распознают вызов GitHub issues API по хосту и пути, а не
+// подстрокой: «api.github.com» может сидеть где угодно в URL
+// (CodeQL js/incomplete-url-substring-sanitization, ревью PR #173).
+// Один предикат на все заглушки — класс закрыт в одном месте.
+function isGitHubIssuesCall(input: string | URL | Request): boolean {
+  try {
+    const url = new URL(String(input));
+    return url.hostname === "api.github.com" && url.pathname.endsWith("/issues");
+  } catch {
+    return false;
   }
 }
 
@@ -523,5 +539,747 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     const afterEnd = await getJson<{ tasks: Record<string, number> }>("/api/status");
     expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
     expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
+  });
+});
+
+describe("inbox: сообщения владельца", () => {
+  // Каждый тест — со своим sender_id: хранилище DO между тестами одного файла
+  // не изолируется, утверждения фильтруются по своим строкам.
+  let senderSeq = 0;
+  const sender = () => `inbox-tester-${Date.now()}-${senderSeq++}`;
+
+  it("ingest принимает плоскую форму и возвращает id", async () => {
+    const s = sender();
+    const res = await postJson("/api/messages/ingest", {
+      source: "telegram",
+      source_msg_id: `ingest-${s}`,
+      chat_id: "chat-456",
+      sender_id: s,
+      sender_name: "Owner",
+      text: "Привет, это тестовое сообщение",
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ message_id: number; status: string }>();
+    expect(body.message_id).toBeGreaterThan(0);
+    expect(body.status).toBe("accepted");
+  });
+
+  it("ingest понимает настоящую Telegram-форму update: числа приводятся к строкам (гвардия идемпотентности)", async () => {
+    // Прод-форма: Telegram шлёт update_id/message_id/from.id/chat.id ЧИСЛАМИ.
+    // Без нормализации реальный апдейт падает мимо UNIQUE(source, source_msg_id)
+    // и каждый ретрай создавал бы новую строку.
+    const s = sender();
+    const update = {
+      update_id: 918273645,
+      message: {
+        message_id: 42,
+        from: { id: 777000, is_bot: false, first_name: "Владелец", username: s },
+        chat: { id: -1001234567890, title: "dev", type: "supergroup" },
+        date: 1756400000,
+        text: "/task Проверь инбокс владельца",
+      },
+    };
+    const first = await postJson("/api/messages/ingest", update);
+    expect(first.status).toBe(201);
+    const firstBody = await first.json<{ message_id: number }>();
+
+    // Ретрай Telegram несёт тот же update_id — обязан вернуться в ту же строку.
+    const retry = await postJson("/api/messages/ingest", update);
+    expect(retry.status).toBe(200);
+    const retryBody = await retry.json<{ message_id: number; status: string }>();
+    expect(retryBody.message_id).toBe(firstBody.message_id);
+    expect(retryBody.status).toBe("exists");
+
+    const got = await getJson<{ message: { source: string; source_msg_id: string; chat_id: string; sender_id: string; sender_name: string; text: string } }>(
+      `/api/messages/${firstBody.message_id}`,
+    );
+    expect(got.message.source).toBe("telegram");
+    expect(got.message.source_msg_id).toBe("918273645");
+    expect(got.message.chat_id).toBe("-1001234567890");
+    expect(got.message.sender_id).toBe("777000");
+    expect(got.message.sender_name).toBe(s);
+    expect(got.message.text).toBe("/task Проверь инбокс владельца");
+  });
+
+  it("ingest без идентификатора — громкий 400: идемпотентность невозможна", async () => {
+    const res = await postJson("/api/messages/ingest", { text: "без id" });
+    expect(res.status).toBe(400);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("need_source_msg_id");
+  });
+
+  it("ingest отклоняет пустой text", async () => {
+    const res = await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `empty-${Date.now()}`,
+      text: "",
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("need_text");
+  });
+
+  it("ingest отклоняет слишком длинное сообщение", async () => {
+    const res = await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `long-${Date.now()}`,
+      text: "а".repeat(20000),
+    });
+    expect(res.status).toBe(413);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("message_too_large");
+  });
+
+  it("GET /api/messages: обход пагинации без дублей и пропусков при равных ts (курсор согласован с DESC)", async () => {
+    const s = sender();
+    // Быстрая серия: ts в одну миллисекунду — гвардия тайбрейкера id DESC.
+    for (let i = 0; i < 5; i++) {
+      await postJson("/api/messages/ingest", {
+        source: "api",
+        source_msg_id: `walk-${s}-${i}`,
+        sender_id: s,
+        text: `Сообщение ${i}`,
+      });
+    }
+    const seen: number[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await getJson<{ messages: { id: number; text: string }[]; has_more: boolean; next_after: number }>(
+        `/api/messages?sender_id=${s}&limit=2&after=${after}`,
+      );
+      seen.push(...page.messages.map((m) => m.id));
+      if (!page.has_more) break;
+      after = page.next_after;
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5);
+    // DESC по id: каждая следующая страница строго старше.
+    for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeLessThan(seen[i - 1]);
+  });
+
+  it("фильтр по status работает", async () => {
+    const s = sender();
+    await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `filter-new-${s}`,
+      sender_id: s,
+      text: "Новое сообщение",
+    });
+    const res = await getJson<{ messages: { status: string }[] }>(`/api/messages?status=new&sender_id=${s}`);
+    expect(res.messages.length).toBeGreaterThan(0);
+    for (const m of res.messages) {
+      expect(m.status).toBe("new");
+    }
+  });
+
+  it("POST /api/messages создаёт сообщение вручную; без id — громкий 400, повтор с id — exists (тот же класс, что ingest)", async () => {
+    const res = await postJson("/api/messages", {
+      source: "manual",
+      source_msg_id: `manual-${Date.now()}`,
+      text: "Ручное сообщение",
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ message_id: number; status: string }>();
+    expect(body.message_id).toBeGreaterThan(0);
+    expect(body.status).toBe("created");
+
+    // Молча сгенерированный одноразовый id превращает повтор админа во второй
+    // issue — требуем id явно, как в ingest (п.31 спеки).
+    const noId = await postJson("/api/messages", { text: "Без id — отказ" });
+    expect(noId.status).toBe(400);
+    const noIdBody = await noId.json<{ error: { code: string } }>();
+    expect(noIdBody.error.code).toBe("need_source_msg_id");
+  });
+
+  it("разбор: директива без GH_ISSUES_TOKEN повторяется (issue_retry), после капа попыток — честный failed", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `retry-${s}`,
+        sender_id: s,
+        text: "/task Сделай что-то важное",
+      })
+    ).json<{ message_id: number }>();
+
+    // Попытки 1 и 2: токена нет — повторяемая ошибка, сообщение живёт в new.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ processed: number; results: { message_id: number; action: string; attempts?: number }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_retry");
+      expect(mine?.attempts).toBe(attempt);
+      const msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("new");
+    }
+
+    // Попытка 3 = кап: honest failed вместо вечного штурма.
+    const res = await postJson("/api/messages/process", { limit: 100 });
+    const body = await res.json<{ processed: number; results: { message_id: number; action: string; error?: string }[] }>();
+    const mine = body.results.find((r) => r.message_id === created.message_id);
+    expect(mine?.action).toBe("issue_failed");
+    expect(mine?.error).toBe("issues_not_configured");
+    const msg = await getJson<{ message: { status: string; kind: string; priority: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("failed");
+    expect(msg.message.kind).toBe("directive");
+    expect(msg.message.priority).toBe(10);
+  });
+
+  it("retry_failed возвращает failed в new с обнулёнными попытками — газ после устранения причины", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `requeue-${s}`,
+        sender_id: s,
+        text: "/task Доведись до конца",
+      })
+    ).json<{ message_id: number }>();
+
+    // Доводим до failed тремя прогонами.
+    for (let i = 0; i < 3; i++) await postJson("/api/messages/process", { limit: 100 });
+    let msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("failed");
+
+    // Газ: failed → new, attempts=0; очередной прогон делает первую попытку и
+    // (токена по-прежнему нет) возвращает в new, а не в failed.
+    await postJson("/api/messages/process", { limit: 100, retry_failed: true });
+    msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("new");
+    expect(msg.message.attempts).toBe(1);
+  });
+
+  it("разбор: директива с настроенным GH_ISSUES_TOKEN создаёт issue (fetch заглушен прод-формой ответа GitHub)", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `issue-${s}`,
+        sender_id: s,
+        text: "/task Заведи задачу из инбокса",
+      })
+    ).json<{ message_id: number }>();
+
+    // Токен и fetch — только внутри теста: env-биндинги общие, восстанавливаем.
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    // Заглушка кормится прод-формой: 201 + JSON issue (number, html_url).
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (isGitHubIssuesCall(input)) {
+        calls.push({ url, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ number: 4242, html_url: "https://github.com/mytab0r/edge-harness/issues/4242" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; issue_number?: number }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_created");
+      expect(mine?.issue_number).toBe(4242);
+
+      // Улика: запрос ушёл в GitHub API под узким токеном и с метками пула.
+      // Хранилище общее — в очереди есть директивы прошлых тестов, берём свою.
+      const mineCall = calls.find((c) => String(c.body.title).includes("Заведи задачу из инбокса"));
+      expect(mineCall).toBeDefined();
+      expect(mineCall!.url).toContain("/repos/mytab0r/edge-harness/issues");
+      expect(mineCall!.body.labels).toContain("task");
+
+      const msg = await getJson<{ message: { status: string; result: string } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("done");
+      expect(JSON.parse(msg.message.result)).toEqual({
+        issue_number: 4242,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4242",
+        secrets_redacted: false,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("текст владельца с секретом уезжает в публичный issue замаскированным (первый наружный путь фриформа)", async () => {
+    const s = sender();
+    // Граничный случай (ревью head 3706d87): секрет начинается близко к
+    // порогу нарезки заголовка — усечение ДО маскирования оставляло сырой
+    // хвост короче минимума паттерна.
+    const fakeGhp = `ghp_${"a1".repeat(15)}`;
+    const filler = "/task Секреты: " + "слово ".repeat(13); // ~80 символов до токена
+    const boundary = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `secret-boundary-${s}`,
+        sender_id: s,
+        text: `${filler}${fakeGhp}`,
+      })
+    ).json<{ message_id: number }>();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `secret-${s}`,
+        sender_id: s,
+        text: "/task Проверь ключ sk-abcdefgh12345678 в конфиге",
+      })
+    ).json<{ message_id: number }>();
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    const calls: { body: { title?: string; body?: string } }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubIssuesCall(input)) {
+        calls.push({ body: JSON.parse(String(init?.body)) as { title?: string; body?: string } });
+        return new Response(JSON.stringify({ number: 4243, html_url: "https://github.com/mytab0r/edge-harness/issues/4243" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; secrets_redacted?: boolean }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_created");
+
+      const mineCall = calls.find((c) => String(c.body.title).includes("Проверь ключ"));
+      expect(mineCall).toBeDefined();
+      // Ни заголовок, ни тело не содержат сырого ключа — ни в title, ни в body.
+      expect(mineCall!.body.title).not.toContain("sk-abcdefgh12345678");
+      expect(mineCall!.body.body).not.toContain("sk-abcdefgh12345678");
+      expect(mineCall!.body.body).toContain("sk-[REDACTED]");
+      expect(mine?.secrets_redacted).toBe(true);
+
+      const msg = await getJson<{ message: { result: string } }>(`/api/messages/${created.message_id}`);
+      expect(JSON.parse(msg.message.result).secrets_redacted).toBe(true);
+
+      // Секрет на границе нарезки: никакого сырого фрагмента ghp_<символы>
+      // в публичном заголовке — маскирование случилось до усечения.
+      const boundaryCall = calls.find((c) => String(c.body.title).includes("Секреты"));
+      expect(boundaryCall).toBeDefined();
+      expect(boundaryCall!.body.title).not.toContain(fakeGhp);
+      expect(boundaryCall!.body.title).not.toMatch(/ghp_[A-Za-z0-9]{2,}/);
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("в GitHub уходит усечённый заголовок (≤80): сырой длинный текст — 422 и невозвратный failed по разбираемому сообщению (мёртвый потолок, ревью head dfd167f)", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "t",
+        source_msg_id: `long-title-${s}`,
+        sender_id: s,
+        text: `/task ${"очень длинная первая строка владельца ".repeat(8)}`,
+      })
+    ).json<{ message_id: number }>();
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    const titles: string[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubIssuesCall(input)) {
+        titles.push(String((JSON.parse(String(init?.body)) as { title?: string }).title));
+        return new Response(JSON.stringify({ number: 4245, html_url: "https://github.com/mytab0r/edge-harness/issues/4245" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_created");
+      expect(titles).toHaveLength(1);
+      // Мутация «в JSON уходит titleRedacted.text целиком» красит тест:
+      // заголовок длиннее 256 символов GitHub отвечает 422, а это честный
+      // невозвратный failed — по сообщению, которое можно было разобрать.
+      expect(titles[0].length).toBeLessThanOrEqual(80);
+      expect(titles[0].endsWith("...")).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("разбор: 4xx от GitHub — не штурмуем (сразу failed), 5xx — повторяем до капа", async () => {
+    const s = sender();
+    const make = async (id: string, text: string) =>
+      (
+        await postJson("/api/messages", {
+          source: "test-process",
+          source_msg_id: id,
+          sender_id: s,
+          text,
+        })
+      ).json<{ message_id: number }>();
+    // Различаем ответы заглушки по тексту задачи — он уезжает в title.
+    const forbidden = await make(`gh403-${s}`, "/task Сорок три навсегда");
+    const serverError = await make(`gh500-${s}`, "/task Пятьсот время от времени");
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubIssuesCall(input)) {
+        const bodyText = String(init?.body);
+        if (bodyText.includes("Сорок три")) return new Response('{"message":"forbidden"}', { status: 403 });
+        if (bodyText.includes("Пятьсот")) return new Response('{"message":"boom"}', { status: 500 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; error?: string; attempts?: number }[] }>();
+      const byId = new Map(body.results.map((r) => [r.message_id, r]));
+
+      // 403 — детерминированный отказ (токен без права/кривая форма): failed сразу.
+      const f = byId.get(forbidden.message_id);
+      expect(f?.action).toBe("issue_failed");
+      expect(f?.error).toContain("github_403");
+
+      // 500 — временный: попытки 1 и 2 в new, третья (кап) — failed.
+      expect(byId.get(serverError.message_id)?.action).toBe("issue_retry");
+      await postJson("/api/messages/process", { limit: 100 });
+      const res3 = await postJson("/api/messages/process", { limit: 100 });
+      const body3 = await res3.json<{ results: { message_id: number; action: string; error?: string }[] }>();
+      const se = body3.results.find((r) => r.message_id === serverError.message_id);
+      expect(se?.action).toBe("issue_failed");
+      expect(se?.error).toContain("github_500");
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("разбор: chat припаркован с пометкой, doc_edit получает issue-след, raw уходит в ignored на ручной триаж", async () => {
+    const s = sender();
+    const chat = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-chat-${s}`, sender_id: s, text: "Как думаешь, что лучше?" })
+    ).json<{ message_id: number }>();
+    const doc = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-doc-${s}`, sender_id: s, text: "Обнови docs/INDEX.md с новой инфой" })
+    ).json<{ message_id: number }>();
+    const raw = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-raw-${s}`, sender_id: s, text: "просто заметка без действия" })
+    ).json<{ message_id: number }>();
+
+    // doc_edit идёт путём директивы: «у каждой директивы есть issue-след»
+    // относится и к правкам доков — иначе весь класс императивов исчезает
+    // из рабочих процессов (ревью head dfd167f). Заглушка как в директивных
+    // тестах, кормится прод-формой ответа GitHub.
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    const calls: { body: { title?: string; body?: string; labels?: string[] } }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubIssuesCall(input)) {
+        calls.push({ body: JSON.parse(String(init?.body)) as { title?: string; body?: string; labels?: string[] } });
+        return new Response(JSON.stringify({ number: 4244, html_url: "https://github.com/mytab0r/edge-harness/issues/4244" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ processed: number; results: { message_id: number; action: string }[] }>();
+      const byId = new Map(body.results.map((r) => [r.message_id, r.action]));
+      expect(byId.get(chat.message_id)).toBe("parked");
+      expect(byId.get(doc.message_id)).toBe("issue_created");
+      expect(byId.get(raw.message_id)).toBe("ignored");
+
+      // Улика issue-следа правки доков: kind уехал в тело, метки пула на месте.
+      const docCall = calls.find((c) => String(c.body.title).includes("Обнови docs/INDEX.md"));
+      expect(docCall).toBeDefined();
+      expect(docCall!.body.body).toContain("kind: doc_edit");
+      expect(docCall!.body.labels).toContain("task");
+      expect(docCall!.body.labels).toContain("source:inbox");
+
+      // raw больше не возвращается в new: очередь не забивается непроходящим сырьём.
+      const rawMsg = await getJson<{ message: { status: string; kind: string; result: string } }>(`/api/messages/${raw.message_id}`);
+      expect(rawMsg.message.status).toBe("ignored");
+      expect(rawMsg.message.kind).toBe("raw");
+      expect(JSON.parse(rawMsg.message.result).note).toBe("needs_manual_triage");
+
+      const chatMsg = await getJson<{ message: { status: string; kind: string; priority: number; result: string } }>(`/api/messages/${chat.message_id}`);
+      expect(chatMsg.message.status).toBe("done");
+      expect(chatMsg.message.priority).toBe(1);
+      expect(JSON.parse(chatMsg.message.result).note).toBe("classified_for_manual_review");
+
+      const docMsg = await getJson<{ message: { kind: string; priority: number; status: string; result: string } }>(`/api/messages/${doc.message_id}`);
+      expect(docMsg.message.kind).toBe("doc_edit");
+      expect(docMsg.message.priority).toBe(5);
+      expect(docMsg.message.status).toBe("done");
+      expect(JSON.parse(docMsg.message.result).issue_number).toBe(4244);
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("классификация: русские директивы без префикса — directive (гвардия не-ASCII границы слова, ревью ffd6bfe)", async () => {
+    const s = sender();
+    const make = async (id: string, text: string) =>
+      (
+        await postJson("/api/messages", {
+          source: "test-classify",
+          source_msg_id: id,
+          sender_id: s,
+          text,
+        })
+      ).json<{ message_id: number }>();
+    // До фикса «\b после кириллицы не возникает» все эти тексты молча
+    // уезжали в raw → ignored, минуя issue-след.
+    const fix = await make(`ru-verb-${s}`, "исправь баг в инбоксе");
+    const check = await make(`ru-verb2-${s}`, "проверь, почему пульс молчит");
+    const prefixed = await make(`ru-prefix-${s}`, "/задача проверь инбокс владельца");
+
+    await postJson("/api/messages/process", { limit: 200 });
+    for (const [name, created] of [
+      ["исправь", fix],
+      ["проверь", check],
+      ["/задача", prefixed],
+    ] as const) {
+      const msg = await getJson<{ message: { kind: string; priority: number; status: string } }>(
+        `/api/messages/${created.message_id}`,
+      );
+      expect(msg.message.kind, name).toBe("directive");
+      expect(msg.message.priority, name).toBe(10);
+      // Токена нет — директива живёт в очереди с честным retry, не в ignored.
+      expect(msg.message.status, name).toBe("new");
+    }
+  });
+
+  it("группировка: серия из трёх сообщений одного отправителя в пределах окна — цепочка grouped_with (сценарий дельта-спеки)", async () => {
+    const s = sender();
+    const chat = `group-chat-${Date.now()}`;
+    const make = async (i: number) =>
+      (
+        await postJson("/api/messages", {
+          source: "telegram",
+          source_msg_id: `group-${s}-${i}`,
+          chat_id: chat,
+          sender_id: s,
+          text: `сообщение серии ${i}`,
+        })
+      ).json<{ message_id: number }>();
+    const first = await make(1);
+    const second = await make(2);
+    const third = await make(3);
+
+    await postJson("/api/messages/process", { limit: 200 });
+
+    const got = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${first.message_id}`);
+    expect(got.message.grouped_with).toBeNull(); // начало серии
+    const got2 = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${second.message_id}`);
+    expect(got2.message.grouped_with).toBe(first.message_id);
+    const got3 = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${third.message_id}`);
+    expect(got3.message.grouped_with).toBe(second.message_id);
+  });
+
+  it("статус включает счётчики сообщений", async () => {
+    const s = sender();
+    const before = await getJson<{ messages: Record<string, number> }>("/api/status");
+    await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `status-count-${s}`,
+      sender_id: s,
+      text: "Тест счетчика",
+    });
+    const after = await getJson<{ messages: Record<string, number> }>("/api/status");
+    expect(after.messages.new).toBe((before.messages.new || 0) + 1);
+  });
+
+  it("process: битый JSON — честный 400 bad_json, пустое тело — валидный прогон (никаких 200 с побочным эффектом)", async () => {
+    const bad = await WORKER.fetch("https://example.com/api/messages/process", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: "{это не json",
+    });
+    expect(bad.status).toBe(400);
+    const badBody = await bad.json<{ error: { code: string } }>();
+    expect(badBody.error.code).toBe("bad_json");
+
+    // Пустое тело — легально ТОЛЬКО у process (единственный маршрут с
+    // опциональным телом): значения по умолчанию.
+    const empty = await WORKER.fetch("https://example.com/api/messages/process", {
+      method: "POST",
+      headers: { ...AUTH },
+    });
+    expect(empty.status).toBe(200);
+    const emptyBody = await empty.json<{ processed: number }>();
+    expect(typeof emptyBody.processed).toBe("number");
+  });
+
+  it("пустой POST /api/tasks — громкий 400, а не молчаливая задача с dispatch (опциональное тело только у process, ревью head 7a21536)", async () => {
+    const empty = await WORKER.fetch("https://example.com/api/tasks", {
+      method: "POST",
+      headers: { ...AUTH },
+    });
+    expect(empty.status).toBe(400);
+    const body = await empty.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("bad_json");
+
+    // Мутация «вернуть if (!text.trim()) return {} в общий #parseJsonText»
+    // красит тест: пустой POST уходит в #postTask с опциональными полями,
+    // создаёт задачу и стреляет repository_dispatch — 200 с побочным эффектом.
+  });
+
+  it("ватчдог и водитель работают через публичный alarm(): зависший processing доводится, свежий new разбирается без ручного вызова", async () => {    const s = sender();
+    // A — «изолят умер посреди внешнего вызова»: processing давний.
+    const a = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `stuck-${s}`, sender_id: s, text: "завис в processing" })
+    ).json<{ message_id: number }>();
+    // B — просто новое: водитель обязан разобрать сам, без ручного POST.
+    const b = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `fresh-${s}`, sender_id: s, text: "свежая заметка" })
+    ).json<{ message_id: number }>();
+
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', attempts = 1, processing_ts = ? WHERE id = ?",
+        Date.now() - LIMITS.messageStuckProcessingMs - 1, a.message_id,
+      );
+    });
+
+    // Публичный alarm() БЕЗ GH_DISPATCH_TOKEN: разбор инбокса не зависит от
+    // конфигурации dispatch (п.33 спеки) — ватчдог и водитель обязаны отработать
+    // до раннего возврата по токену. Строгий стаб ловит любой неожидаемый
+    // сетевой вызов: громко, а не в настоящий GitHub.
+    vi.stubGlobal("fetch", (async (input: string | URL | Request) => {
+      throw new Error(`неожиданный fetch в alarm-тесте: ${String(input)}`);
+    }) as typeof fetch);
+    let alarmRan = false;
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await (instance as unknown as { alarm(): Promise<void> }).alarm();
+        alarmRan = true;
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(alarmRan).toBe(true);
+
+    // A: ватчдог вернул в new, водитель довёл до терминала (raw → ignored).
+    const gotA = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${a.message_id}`);
+    expect(gotA.message.status).toBe("ignored");
+    expect(gotA.message.attempts).toBe(2);
+    // B: разобран тем же тиком.
+    const gotB = await getJson<{ message: { status: string } }>(`/api/messages/${b.message_id}`);
+    expect(gotB.message.status).toBe("ignored");
+  });
+
+  it("ватчдог уважает кап попыток: зависший processing с исчерпанным капом — честный failed stuck_reclaimed, а не вечный круг reclaim → claim (ревью head dfd167f)", async () => {
+    const s = sender();
+    const cap = LIMITS.messageMaxAttempts;
+    const exhausted = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `stuck-cap-${s}`, sender_id: s, text: "завис навсегда" })
+    ).json<{ message_id: number }>();
+    const belowCap = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `stuck-below-${s}`, sender_id: s, text: "завис однажды" })
+    ).json<{ message_id: number }>();
+
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', attempts = ?, processing_ts = ? WHERE id = ?",
+        cap, Date.now() - LIMITS.messageStuckProcessingMs - 1, exhausted.message_id,
+      );
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', attempts = ?, processing_ts = ? WHERE id = ?",
+        cap - 1, Date.now() - LIMITS.messageStuckProcessingMs - 1, belowCap.message_id,
+      );
+    });
+
+    vi.stubGlobal("fetch", (async (input: string | URL | Request) => {
+      throw new Error(`неожиданный fetch в ватчдог-тесте: ${String(input)}`);
+    }) as typeof fetch);
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await (instance as unknown as { alarm(): Promise<void> }).alarm();
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    // Кап исчерпан: failed с именованной ошибкой — газ тот же (retry_failed),
+    // бесконечный круг разорван. Мутация «возврат в new безусловно» красит тест.
+    const gotEx = await getJson<{ message: { status: string; attempts: number; result: string } }>(`/api/messages/${exhausted.message_id}`);
+    expect(gotEx.message.status).toBe("failed");
+    expect(gotEx.message.attempts).toBe(cap);
+    expect(JSON.parse(gotEx.message.result).error).toBe("stuck_reclaimed");
+    // Ниже капа: ватчдог вернул в new, водитель того же тика довёл до терминала.
+    const gotBelow = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${belowCap.message_id}`);
+    expect(gotBelow.message.status).toBe("ignored");
+    expect(gotBelow.message.attempts).toBe(cap);
+  });
+
+  it("ручной POST идемпотентен: повтор с тем же source_msg_id отвечает существующей строкой (тот же класс, что ingest)", async () => {
+    const dupKey = `dup-${Date.now()}`;
+    const first = await postJson("/api/messages", { source: "manual", source_msg_id: dupKey, text: "первый" });
+    expect(first.status).toBe(201);
+    const dup = await postJson("/api/messages", { source: "manual", source_msg_id: dupKey, text: "второй" });
+    expect(dup.status).toBe(200);
+    const firstBody = await first.json<{ message_id: number }>();
+    const dupBody = await dup.json<{ message_id: number; status: string }>();
+    expect(dupBody.message_id).toBe(firstBody.message_id);
+    expect(dupBody.status).toBe("exists");
+  });
+});
+
+describe("чистые функции инбокса", () => {
+  const NOW = 1_800_000_000_000;
+
+  it("messageStuck: порог объявлен одной константой и работает на границе", () => {
+    expect(messageStuck(null, NOW)).toBe(false);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs + 1, NOW)).toBe(false);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs, NOW)).toBe(true);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs - 1, NOW)).toBe(true);
+  });
+
+  it("asString: числа Telegram приводятся к строке, мусор — в null", () => {
+    expect(asString(918273645)).toBe("918273645");
+    expect(asString("918273645")).toBe("918273645");
+    expect(asString(-1001234567890)).toBe("-1001234567890");
+    expect(asString(undefined)).toBeNull();
+    expect(asString(NaN)).toBeNull();
+    expect(asString({ id: 1 })).toBeNull();
+  });
+
+  it("таймаут вызова GitHub заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной issue)", () => {
+    expect(LIMITS.messageIssueFetchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
+  });
+});
+
+describe("маскирование наружных текстов инбокса (тот же класс паттернов, что dsh-ci.sh::redact)", () => {
+  // Фикстуры здесь — пересказ; ФОРМАЛЬНАЯ гвардия паритета —
+  // scripts/lib/test_redact_parity.py (repo-ci): извлекает sed-подстановки
+  // из dsh-ci.sh и сверяет с REDACT_PATTERNS один к одному.
+  // Длинные формы собираются в рантайме: литерал из 20+ символов после
+  // github_pat_/ghp_ — находка детерминированного ревью (check_pr), даже если
+  // это фейковая фикстура теста.
+  const fakeGhp = `ghp_${"a1".repeat(15)}`;
+  const fakePat = `github_pat_${"b2".repeat(15)}`;
+  it("маскирует формы секретов в середине текста и у краёв", () => {
+    const text = `вот ключ sk-abcdefgh12345678 и nvapi-abcdefgh12, токен ${fakeGhp} и ${fakePat}`;
+    const out = redact(text).text;
+    expect(out).not.toContain("sk-abcdefgh12345678");
+    expect(out).toContain("sk-[REDACTED]");
+    expect(out).not.toContain("nvapi-abcdefgh12");
+    expect(out).toContain("nvapi-[REDACTED]");
+    expect(out).not.toContain(fakeGhp);
+    expect(out).toContain("ghp_[REDACTED]");
+    expect(out).not.toContain(fakePat);
+    expect(out).toContain("github_pat_[REDACTED]");
+  });
+
+  it("секрет в начале строки тоже маскируется (прецедент начала текста)", () => {
+    const out = redact("sk-abcdefgh12345678 в начале").text;
+    expect(out).not.toContain("sk-abcdefgh12345678");
+    expect(out.startsWith("sk-[REDACTED]")).toBe(true);
+  });
+
+  it("текст без секретов не трогается вовсе (факт замены = false)", () => {
+    const source = "обычный текст владельца без секретов";
+    expect(redact(source)).toEqual({ text: source, redacted: false });
   });
 });

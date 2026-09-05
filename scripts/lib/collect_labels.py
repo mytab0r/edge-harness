@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 ISSUE_TEMPLATE_DIR = REPO_ROOT / ".github" / "ISSUE_TEMPLATE"
+WORKER_SRC_DIR = REPO_ROOT / "cf-worker" / "src"
 
 _LABEL_TOKEN = r"[a-z][a-z0-9:_-]*"
 
@@ -49,6 +50,11 @@ _JQ_SELECT_RE = re.compile(r'select\(\.name == "(' + _LABEL_TOKEN + r')"\)')
 _ADD_LABEL_RE = re.compile(r"--add-label\s+(" + _LABEL_TOKEN + r")\b")
 # Форма 3: YAML-шапка шаблона issue `labels: [значение, ...]`.
 _YAML_LABELS_RE = re.compile(r"^labels:\s*\[([^\]]*)\]", re.MULTILINE)
+# Форма 4: массив меток в TS-коде морды `labels: ["task", "source:inbox"]`
+# (cf-worker/src ставит метки при создании issue из инбокса; без этого скана
+# метка появлялась в морде молча, мимо реестра — ревью PR #173).
+_TS_LABELS_RE = re.compile(r"labels:\s*\[([^\]]*)\]")
+_TS_QUOTED_RE = re.compile(r"['\"](" + _LABEL_TOKEN + r")['\"]")
 
 
 def _review_labels_module():
@@ -100,6 +106,17 @@ def _scan_issue_templates() -> set[str]:
     return found
 
 
+def _scan_worker_ts_files() -> set[str]:
+    found: set[str] = set()
+    if not WORKER_SRC_DIR.is_dir():
+        return found
+    for path in WORKER_SRC_DIR.rglob("*.ts"):
+        text = path.read_text(encoding="utf-8")
+        for match in _TS_LABELS_RE.findall(text):
+            found.update(_TS_QUOTED_RE.findall("[" + match + "]"))
+    return found
+
+
 def collect_labels() -> set[str]:
     """Все строковые литералы меток, реально используемые кодом репозитория."""
     review_labels = _review_labels_module()
@@ -116,6 +133,7 @@ def collect_labels() -> set[str]:
     found |= _scan_shell_files()
     found |= _scan_workflow_files()
     found |= _scan_issue_templates()
+    found |= _scan_worker_ts_files()
     return found
 
 

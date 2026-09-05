@@ -29,6 +29,10 @@ const MESSAGES = {
     // #320: тот же 500, что и internal, но с именем причины — квота DO SQLite
     // (rows_read/rows_written) на бесплатном тарифе, а не безымянная поломка.
     storage_quota_exceeded: "Хранилище DO вернуло похожую на квоту ошибку: {detail}",
+    need_text: "Нужно поле text",
+    message_not_found: "Сообщение {message_id} не найдено",
+    message_too_large: "Сообщение больше {limit} символов",
+    need_source_msg_id: "Нужен идентификатор сообщения: source_msg_id, либо update_id (Telegram update), либо message.message_id — без него идемпотентность невозможна",
   },
 } as const;
 

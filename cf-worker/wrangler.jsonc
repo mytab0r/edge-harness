@@ -40,6 +40,10 @@
   //   GH_DISPATCH_TOKEN  — узкий fine-grained GitHub PAT (Contents+Actions RW только
   //                        на этот репозиторий, задача #6/ADR 0008): DO дёргает
   //                        repository_dispatch задач и workflow_dispatch пульса
+  //   GH_ISSUES_TOKEN    — узкий fine-grained GitHub PAT (только Issues RW на этот
+  //                        репозиторий, ADR 0011): инбокс создаёт issue для директивы
+  //                        владельца; не задан — директивы повторяются с честной
+  //                        issues_not_configured, деплой не блокируется
   //   SESSION_SECRET     — HMAC-ключ подписи сессионной куки браузера (issue #5);
   //                        вращение мгновенно разлогинивает все открытые сессии
 }

@@ -4,3 +4,7 @@ HANDS_TOKEN=dev-token
 SESSION_SECRET=dev-session-secret
 # Пусто — POST /api/tasks честно ответит «dispatch не настроен»:
 GH_DISPATCH_TOKEN=
+# Узкий fine-grained GitHub PAT (только Issues:RW на этот репозиторий, ADR 0011):
+# инбокс создаёт issue для директивы владельца. Пусто — директива повторяется
+# с честной ошибкой issues_not_configured, пока секрет не задан.
+GH_ISSUES_TOKEN=

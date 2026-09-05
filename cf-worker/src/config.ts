@@ -22,6 +22,26 @@ export const LIMITS = {
    *  heartbeat — ненормальное состояние, морда показывает предупреждение.
    *  Медиана старта 8.3 с (ADR 0003), хвост ничем не ограничен — порог щедрый. */
   staleDispatchMs: 30 * 60_000,
+  /** Inbox: макс. длина текста сообщения. */
+  messageMaxChars: 16384,
+  /** Inbox: макс. сообщений за один вызов process. */
+  messageProcessMax: 100,
+  /** Inbox: окно группировки сообщений (мс). */
+  messageGroupWindowMs: 5 * 60 * 1000,
+  /** Inbox: попыток обработки директивы до честного failed (не настроенный токен
+   *  и сеть — повторяемы; после капа сообщение видно в failed и ждёт retry_failed). */
+  messageMaxAttempts: 3,
+  /** Inbox: сообщение в processing дольше этого порога — изолят умер посреди
+   *  внешнего вызова; пульс возвращает его в new (ватчдог по образцу stale_dispatch). */
+  messageStuckProcessingMs: 10 * 60_000,
+  /** Inbox: таймаут одного вызова GitHub при создании issue. Обязан быть
+   *  заведомо меньше messageStuckProcessingMs (гвардится тестом): иначе висящий
+   *  fetch доживёт до ретрая другой проходки — двойной issue. */
+  messageIssueFetchTimeoutMs: 30_000,
+  /** Inbox: сколько сообщений отдаёт список, если лимит не назван. */
+  messagesListDefault: 50,
+  /** Inbox: потолок одной страницы списка. */
+  messagesListMax: 200,
 } as const;
 
 /** Сессия браузера: подписанная кука вместо долгоживущего HANDS_TOKEN в query/JS
