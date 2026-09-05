@@ -76,10 +76,17 @@ SCHEMA_ROOT_QUERY = "query { __schema { queryType { name } } }"
 
 
 def unwrap_type_name(type_ref: dict | None) -> str | None:
-    """GraphQL заворачивает тип в NON_NULL/LIST — разворачиваем до named type."""
-    while type_ref is not None and type_ref.get("name") is None:
+    """GraphQL заворачивает тип в NON_NULL/LIST — разворачиваем до named type.
+
+    Находка на живой схеме Cloudflare (2026-09-05, прогон #320): для NON_NULL/LIST
+    поле `name` приходит не как `null` (как того требует спецификация GraphQL
+    introspection), а как пустая строка `""`. Проверка `is None` эту обёртку не
+    ловила и разворот останавливался на первом уровне — отсюда `тип '' не найден`.
+    Значение считается «нет имени» при falsy (`None` ИЛИ `""`), не только `None`.
+    """
+    while type_ref is not None and not type_ref.get("name"):
         type_ref = type_ref.get("ofType")
-    return type_ref["name"] if type_ref else None
+    return (type_ref.get("name") or None) if type_ref else None
 
 
 def find_field(type_obj: dict, field_name: str) -> dict:
