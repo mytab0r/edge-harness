@@ -45,10 +45,16 @@ def label(name):
     return {"id": "LA_kwDOUHBaqc8AAAACypPLSQ", "name": name}
 
 
-def pull(number, *, body="", labels=(), author="mytab0r"):
+def pull(number, *, pr_body="", labels=(), author="mytab0r"):
+    # Параметр называется pr_body, не body (тот же приём, что test_scheduler.py::pull):
+    # CI-гвардия класса #124 (repo-ci.yml "Оркестрация без keyword-аргументов gh()")
+    # грепает вызовы вида "запятая-пробел-body-равно" по всему scripts/orchestra/
+    # буквально, без разбора AST — keyword-параметр тестового хелпера с таким же
+    # именем ловится тем же паттерном, что и настоящий баг (позиционный
+    # "-f", f"body=..." — единственная разрешённая форма для gh()).
     return {
         "number": number,
-        "body": body,
+        "body": pr_body,
         "labels": [label(n) for n in labels],
         "user": {"login": author},
     }
@@ -114,7 +120,7 @@ def test_closed_task_gets_no_assignment_call(monkeypatch):
     на eligibility) — этот тест краснеет с AssertionError на непустом
     assignees-вызове."""
     routes = {
-        "pulls/359": pull(359, body="#131\n\nостальной текст", labels=()),
+        "pulls/359": pull(359, pr_body="#131\n\nостальной текст", labels=()),
         "issues/131": issue(131, state="closed", assignees=()),
     }
     fake = FakeGh(routes)
@@ -133,7 +139,7 @@ def test_no_task_label_gets_no_assignment_call(monkeypatch):
     без метки `task`. Авто-назначение не должно выполняться и здесь —
     непригодность есть непригодность, независимо от конкретной причины."""
     routes = {
-        "pulls/400": pull(400, body="#500\n\nтекст", labels=()),
+        "pulls/400": pull(400, pr_body="#500\n\nтекст", labels=()),
         "issues/500": issue(500, state="open", labels=(), assignees=()),
     }
     fake = FakeGh(routes)
@@ -150,7 +156,7 @@ def test_blocked_task_gets_no_assignment_call(monkeypatch):
     playbook держит существующее назначение, но НОВОЕ авто-назначение через
     контракт не должно случиться."""
     routes = {
-        "pulls/401": pull(401, body="#501\n\nтекст", labels=()),
+        "pulls/401": pull(401, pr_body="#501\n\nтекст", labels=()),
         "issues/501": issue(501, state="open", labels=("task", "blocked"), assignees=()),
     }
     fake = FakeGh(routes)
@@ -170,7 +176,7 @@ def test_eligible_free_task_still_gets_auto_assigned(monkeypatch):
     авто-назначения (docstring contract_check.py, правило 4) обязан
     сохраниться."""
     routes = {
-        "pulls/600": pull(600, body="#700\n\nтекст", labels=(), author="mytab0r"),
+        "pulls/600": pull(600, pr_body="#700\n\nтекст", labels=(), author="mytab0r"),
         "issues/700": issue(700, state="open", labels=("task",), assignees=()),
         "pulls?state=open": [],
     }
