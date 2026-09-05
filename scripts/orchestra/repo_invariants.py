@@ -34,6 +34,16 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      полностью отмечен, а каталог не в openspec/changes/archive/.
   5. check_duplicate_evidence — два открытых task-issue ссылаются в теле на
      один и тот же file:line (класс #202/#213/#212). Честный потолок ниже.
+  6. check_branch_protection_drift (#341) — enforce_admins/required_status_
+     checks.strict/.contexts/allow_force_pushes/allow_deletions защиты
+     main разошлись с EXPECTED_* (класс: admin-токен сливал мимо всех
+     проверок, пока enforce_admins стоял в false и это нигде не
+     проверялось). НЕ входит в стандартный отчёт build_report() и в
+     CI_GATING: `GET .../branches/main/protection` требует токен с правом
+     `administration`, которого у GITHUB_TOKEN нет структурно (не входит в
+     перечисляемый набор scope Actions) — включается только вручную
+     (`--check-branch-protection`, admin-токен владельца), см. docstring
+     build_report.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -374,6 +384,118 @@ def check_duplicate_evidence(open_tasks: list[dict]) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 6: настройки защиты main-ветки не откатились молча (#341)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Замер аудита #341 (2026-09-06): admin-токен сливал мимо всех проверок до
+# 2026-09-05, потому что enforce_admins стоял в false и это нигде не
+# проверялось — `grep -rn protection scripts/` на тот момент был пуст, ни
+# одна из настроек защиты ветки не читалась никаким механизмом репозитория.
+# Найдено ЖИВОЙ мутацией: PR со сломанным `contract` слился (HTTP 405 при
+# попытке повторить проверку задним числом подтвердил, что она была
+# пропущена), а не догадкой.
+#
+# Единственное место правды на ожидаемое состояние — EXPECTED_* ниже. Любая
+# правка настроек защиты ветки обязана сопровождаться правкой этих констант
+# в ТОМ ЖЕ PR — иначе следующий прогон немедленно закричит о расхождении,
+# что и есть цель инварианта (не «настройки правильные раз и навсегда», а
+# «расхождение видно на первом же прогоне после отката»).
+EXPECTED_ENFORCE_ADMINS = True
+EXPECTED_STATUS_CHECKS_STRICT = True
+# «test»/«contract» — обязательные проверки на момент задачи #341.
+# «harness/review»/«harness/ai-review» (Commit Status API, #345) добавляются
+# сюда ТОЙ ЖЕ правкой, что добавляет их в required_status_checks.contexts на
+# GitHub — см. openspec/changes/verdict-commit-status/tasks.md, «владелец
+# включает контексты» (последовательность обязательна: статусы существуют на
+# живом PR раньше, чем становятся обязательными — иначе вся очередь открытых
+# PR молча зависает в «Expected»).
+EXPECTED_STATUS_CHECK_CONTEXTS = frozenset({"test", "contract"})
+EXPECTED_ALLOW_FORCE_PUSHES = False
+EXPECTED_ALLOW_DELETIONS = False
+
+# Что именно ломается при каждом конкретном расхождении (AGENTS.md: «Инвариант
+# обязан называть, что именно сломается при расхождении, а не просто
+# constatировать несовпадение») — печатается вместе с violation, не только
+# «ожидалось X, получено Y».
+_BRANCH_PROTECTION_CONSEQUENCE = {
+    "enforce_admins": "admin-токен (в т.ч. учётка владельца) сможет сливать в main "
+                       "мимо обязательных проверок — класс #341, уже приводил к "
+                       "слиянию PR с красным contract",
+    "required_status_checks.strict": "PR сливается без пересборки проверок на "
+                                      "актуальном main — зелёный чек на устаревшей "
+                                      "базе не значит зелёный чек на итоговом коде",
+    "required_status_checks.contexts": "обязательная проверка выпала из гейта — PR "
+                                        "с красным этим контекстом сможет слиться "
+                                        "(или наоборот, новый контекст стал "
+                                        "обязательным без подтверждения живым "
+                                        "прогоном и вся очередь виснет в «Expected»)",
+    "allow_force_pushes": "историю main можно переписать force-push — слитые "
+                           "коммиты и их проверки становятся заменяемыми задним числом",
+    "allow_deletions": "ветку main можно удалить целиком",
+}
+
+
+def check_branch_protection_drift(protection: dict) -> list[dict]:
+    """Инвариант 6: `enforce_admins`/`required_status_checks.strict`/
+    `.contexts`/`allow_force_pushes`/`allow_deletions` защиты ветки main не
+    откатились молча относительно EXPECTED_* выше. `protection` — прод-форма
+    `GET /repos/{repo}/branches/main/protection` целиком (см.
+    fetch_branch_protection): большинство булевых настроек лежат как
+    `{"enabled": bool}` — расхождение с задачей #341 в том, что до этой
+    правки НИ ОДНА из них не читалась вообще ни одним механизмом репозитория
+    (`grep -rn protection scripts/` был пуст)."""
+    violations = []
+
+    enforce_admins = (protection.get("enforce_admins") or {}).get("enabled")
+    if enforce_admins is not EXPECTED_ENFORCE_ADMINS:
+        violations.append({
+            "setting": "enforce_admins",
+            "expected": EXPECTED_ENFORCE_ADMINS,
+            "actual": enforce_admins,
+            "consequence": _BRANCH_PROTECTION_CONSEQUENCE["enforce_admins"],
+        })
+
+    rsc = protection.get("required_status_checks") or {}
+    strict = rsc.get("strict")
+    if strict is not EXPECTED_STATUS_CHECKS_STRICT:
+        violations.append({
+            "setting": "required_status_checks.strict",
+            "expected": EXPECTED_STATUS_CHECKS_STRICT,
+            "actual": strict,
+            "consequence": _BRANCH_PROTECTION_CONSEQUENCE["required_status_checks.strict"],
+        })
+
+    contexts = frozenset(rsc.get("contexts") or [])
+    if contexts != EXPECTED_STATUS_CHECK_CONTEXTS:
+        violations.append({
+            "setting": "required_status_checks.contexts",
+            "expected": sorted(EXPECTED_STATUS_CHECK_CONTEXTS),
+            "actual": sorted(contexts),
+            "consequence": _BRANCH_PROTECTION_CONSEQUENCE["required_status_checks.contexts"],
+        })
+
+    allow_force_pushes = (protection.get("allow_force_pushes") or {}).get("enabled")
+    if allow_force_pushes is not EXPECTED_ALLOW_FORCE_PUSHES:
+        violations.append({
+            "setting": "allow_force_pushes",
+            "expected": EXPECTED_ALLOW_FORCE_PUSHES,
+            "actual": allow_force_pushes,
+            "consequence": _BRANCH_PROTECTION_CONSEQUENCE["allow_force_pushes"],
+        })
+
+    allow_deletions = (protection.get("allow_deletions") or {}).get("enabled")
+    if allow_deletions is not EXPECTED_ALLOW_DELETIONS:
+        violations.append({
+            "setting": "allow_deletions",
+            "expected": EXPECTED_ALLOW_DELETIONS,
+            "actual": allow_deletions,
+            "consequence": _BRANCH_PROTECTION_CONSEQUENCE["allow_deletions"],
+        })
+
+    return violations
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -413,10 +535,32 @@ def fetch_open_pulls(repo: str) -> list[dict]:
     return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
 
 
-def build_report(repo: str, now: datetime) -> tuple[list[str], dict[int, list]]:
+def fetch_branch_protection(repo: str) -> dict:
+    """`GET /repos/{repo}/branches/main/protection` целиком — один запрос,
+    не listing, страница не нужна (см. check_branch_protection_drift, #341)."""
+    return gh(f"repos/{repo}/branches/main/protection")
+
+
+def build_report(repo: str, now: datetime,
+                  check_branch_protection: bool = False) -> tuple[list[str], dict[int, list]]:
     """Возвращает (строки отчёта, {номер_инварианта: violations}). Чистых
     мутирующих вызовов здесь нет — только GET (см. gh()); гвардия холостого
-    хода проверяет именно это."""
+    хода проверяет именно это.
+
+    check_branch_protection — инвариант 6 (#341) выключен по умолчанию:
+    `GET /branches/main/protection` требует у токена право `administration`
+    (документировано самим GitHub на этом эндпоинте), а у GITHUB_TOKEN такого
+    права нет вовсе — оно не входит в перечисляемый набор scope'ов Actions
+    (`actions/checks/contents/deployments/discussions/id-token/issues/
+    packages/pages/pull-requests/repository-projects/security-events/
+    statuses`, без `administration`), и никакая правка `permissions:` в
+    workflow этого не меняет — это ограничение самого GITHUB_TOKEN, не
+    настройка репозитория. Включать этот инвариант в repo-ci.yml/orchestra.yml
+    с GITHUB_TOKEN означало бы падать 403 на КАЖДОМ прогоне и по построению,
+    что хуже отсутствия проверки. Инвариант вызывается вручную (main()
+    `--check-branch-protection`) владельцем/агентом с токеном, у которого
+    реально есть admin-права на репозиторий (например, `gh auth token`
+    личной учётки) — см. docs/research/21-github-actions.md."""
     open_tasks = fetch_open_task_issues(repo)
     merged_pulls = fetch_merged_pulls(repo)
     open_pulls = fetch_open_pulls(repo)
@@ -465,6 +609,25 @@ def build_report(repo: str, now: datetime) -> tuple[list[str], dict[int, list]]:
             lines.append(f"   — #{a} и #{b} — {item['shared_location']}")
     else:
         lines.append("💚 [5] нет открытых задач с пересекающейся уликой file:line")
+
+    if check_branch_protection:
+        protection = fetch_branch_protection(repo)
+        v6 = check_branch_protection_drift(protection)
+        findings[6] = v6
+        if v6:
+            lines.append(f"🚨 [6] {len(v6)} настроек защиты main разошлись с ожидаемыми:")
+            for item in v6:
+                lines.append(
+                    f"   — {item['setting']}: ожидалось {item['expected']!r}, "
+                    f"сейчас {item['actual']!r} — {item['consequence']}"
+                )
+        else:
+            lines.append("💚 [6] защита main совпадает с ожидаемой (enforce_admins/strict/"
+                          "contexts/force-push/deletions)")
+    else:
+        lines.append("⏭️ [6] защита main не проверена в этом прогоне (нужен токен с "
+                      "правом administration — GITHUB_TOKEN его структурно не имеет; "
+                      "запусти вручную: --check-branch-protection с admin-токеном)")
 
     return lines, findings
 
@@ -531,11 +694,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestra", action="store_true",
                          help="периодический режим: report + escalate (инварианты 1 и 3)")
+    parser.add_argument(
+        "--check-branch-protection", action="store_true",
+        help="включить инвариант 6 (защита main-ветки, #341) — требует токен "
+             "с правом administration (GITHUB_TOKEN его структурно не имеет, "
+             "запускать вручную с admin-токеном владельца, не из CI)")
     args = parser.parse_args()
 
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
-    lines, findings = build_report(repo, now)
+    lines, findings = build_report(repo, now,
+                                    check_branch_protection=args.check_branch_protection)
 
     if args.orchestra:
         lines += run_escalations(repo, findings)
@@ -560,6 +729,16 @@ def main() -> int:
                 f"{GATING_RELEASE_CONDITION[number]}"
             )
         return 1
+
+    # Инвариант 6 не в CI_GATING (не может быть — GITHUB_TOKEN без
+    # administration), но ручной запуск с --check-branch-protection обязан
+    # быть fail loud сам по себе: тихое расхождение защиты ветки — ровно та
+    # дыра, ради которой инвариант написан.
+    if args.check_branch_protection and findings.get(6):
+        for item in findings[6]:
+            print(f"::error::branch protection: {item['setting']} — {item['consequence']}")
+        return 1
+
     return 0
 
 
