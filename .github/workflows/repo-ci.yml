@@ -115,6 +115,18 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_task_ref.py -q
 
+      # Резолвер «PR → задача» (#259): task_section обязан резолвить задачу
+      # PR через resolve_pr_task (имя ветки → закрывающая issue → декларация
+      # первой строкой), а не «первое попавшееся число» из прозы описания —
+      # этот класс путал #253 с #120, #248 с #119, #247 с #43, #263 с #4.
+      # Гвардия сканирует вызовы task_ref.extract_task_refs/TASK_REF_RE вне
+      # ALLOWED_WIDE_USAGE и красит CI, если узкий контекст «эта задача
+      # закрыта/занята» вновь тронут широкой семантикой.
+      - name: Гвардия «резолвер PR → задача, не подстрока прозы»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_ref_usage_guard.py -q
+
       # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
       # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
       # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает

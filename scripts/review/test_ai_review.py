@@ -258,20 +258,59 @@ def test_redact_plain_text_untouched():
     assert ai.redact("обычный текст ревью без секретов") == "обычный текст ревью без секретов"
 
 
-# ── Номера задач из тела PR: одно место правды task_ref, не подстрока (#187) ──
+# ── task_section резолвит задачу через task_ref.resolve_pr_task, не через
+# первое попавшееся упоминание в прозе (#259) ─────────────────────────────────
+#
+# Живой замер #259: со старой реализацией (sorted(set(extract_task_refs(body)))
+# + первый открытый issue с меткой task) PR #253 судили по #120 — задача
+# упомянута в прозе («issue #120 + Telegram»), хотя ветка agent/227-… и
+# первая строка тела объявляют #227. Кейс ниже — реальное тело PR #253.
 
-def test_task_section_uses_task_ref_not_substring():
-    # прод-форма тела PR (#188): «#180\n…» не должно отдавать 18 —
-    # task_section обязан брать номера через task_ref.extract_task_refs,
-    # не через голый r"#(\d+)".
-    body = "#180\n\nописание изменений"
-    assert ai.task_ref.extract_task_refs(body) == [180]
-    assert sorted(set(ai.task_ref.extract_task_refs(body))) == [180]
+_PR_253_BODY = (
+    "#227\n\n"
+    "## Что сделано\n\n"
+    "Стадия приёмки: слитый PR больше не оставляет задачу висеть с "
+    "комментарием-напоминанием «исполнителю».\n\n"
+    "проверка улики сама сломана (сеть/секрет/API — не «улики нет», а "
+    "«возможность сломана») → эскалация владельцу (issue #120 + Telegram), "
+    "задача не тронута.\n\n"
+    "Прод-форма: фикстуры — реальные тела PR #138, #177, #163 и реальные "
+    "записи задач #18, #21, #78.\n"
+)
 
 
-def test_task_section_dedupes_and_sorts_numbers():
-    body = "см. #182 и снова #182, а также #18"
-    assert sorted(set(ai.task_ref.extract_task_refs(body))) == [18, 182]
+def test_task_section_resolves_declared_task_not_prose_mention(monkeypatch):
+    pull = {"head": {"ref": "agent/227-acceptance-stage-after-merge"}, "body": _PR_253_BODY}
+    calls = []
+
+    def fake_gh(path):
+        calls.append(path)
+        if path == "repos/o/r/issues/227":
+            return {"state": "open", "labels": [{"name": "task"}], "title": "Стадия приёмки"}
+        raise RuntimeError(f"gh api {path}: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    section = ai.task_section(pull, "o/r")
+    assert "#227" in section
+    assert "Стадия приёмки" in section
+    assert "#120" not in section
+    # резолвер не гадает по прозе — единственный запрос к issues/227, не обход
+    # 120/138/163/177/18/21/78 в поисках первого валидного.
+    assert calls == ["repos/o/r/issues/227"]
+
+
+def test_task_section_bot_pr_has_no_task(monkeypatch):
+    # dependabot: ветка не agent/, декларации нет — «нет задачи», gh не вызывается.
+    pull = {
+        "head": {"ref": "dependabot/github_actions/pnpm/action-setup-6"},
+        "body": "Bumps pnpm/action-setup from 4 to 6.\n\nfix: update pnpm to v11 (#283)\n",
+    }
+
+    def fail_gh(path):
+        raise AssertionError(f"gh не должен вызываться без резолвнутой задачи: {path}")
+
+    monkeypatch.setattr(ai, "gh", fail_gh)
+    assert ai.task_section(pull, "o/r") == ai.NO_TASK_MESSAGE
 
 
 # ── Ошибка провайдера/транспорта vs нарушение контракта моделью ──────────────

@@ -10,6 +10,24 @@
 
 Импорт — importlib по файлу (паттерн claim_task/review_labels): скрипты
 запускаются как файлы, не как пакет.
+
+Два разных вопроса, две разные группы функций — не путать (#259, живой
+замер: ai_review.py:353 отвечал на вопрос «какая задача упомянута первой в
+прозе» там, где нужен ответ на «какая задача у этого PR», и путал #253 с
+#120, #248 с #119, #247 с #43, #263 с #4):
+
+  «Какая задача у этого PR» (узкая, для решений вида «этот PR закрывает
+  задачу N», «контекст ревью», «занята ли задача») — `resolve_pr_task` и то,
+  из чего он собран: `task_from_branch`, `declared_tasks`/`declares_task`.
+  Расчёт по иерархии источников, а не по первому попавшемуся упоминанию.
+
+  «Упоминает ли текст задачу» (широкая, ЛЮБОЕ вхождение `#N`) —
+  `extract_task_refs`/`references_task`. Годится только там, где широта
+  осознанна и названа в докстринге места вызова: `reap_stale`/
+  `unhealthy_pulls`/`after_merge` в scheduler.py (не потерять живой PR или
+  не снять чужой замок — ошибиться в сторону «не трогать» там дешевле, чем
+  в сторону «занята»). Новый вызов этой пары ВНЕ scheduler.py — красный
+  тест `scripts/lib/test_task_ref_usage_guard.py`, не только докстринг.
 """
 
 import re
@@ -63,3 +81,63 @@ def declared_tasks(text: str) -> list[int]:
 def declares_task(text: str, task_number: int) -> bool:
     """Объявляет ли тело PR задачу `#task_number` (см. declared_tasks)."""
     return task_number in declared_tasks(text)
+
+
+# ── Резолвер «PR → задача» (#259) — одно место правды, три источника ─────────
+#
+# Порядок — от надёжного к запасному, останавливаемся на первом, который
+# что-то дал:
+#
+#   а) имя ветки agent/<N>-<slug> — самый надёжный источник: ветку создаёт
+#      ТОЛЬКО scripts/git/task-branch (enforced-правило репозитория, гвардия
+#      .githooks/pre-commit), номер в ней подделать случайно нельзя;
+#   б) формальная связь GitHub «closes/fixes» (closingIssuesReferences) —
+#      доступна только через GraphQL в этой среде (см. ниже, REST-эквивалента
+#      нет), поэтому необязательна: значение передаёт вызывающий код, отказ
+#      получить его не роняет резолвер, а просто пропускает источник;
+#   в) декларация первой строкой тела (declared_tasks) — соглашение
+#      репозитория, действует и для PR без agent-ветки (ручной пуш).
+#
+# Проза по всему телу (extract_task_refs) как источник НЕ используется вовсе:
+# это была ошибка ai_review.py:353 (см. докстринг модуля).
+#
+# Про источник (б): проверено на живом PR #253 (repos/.../issues/253/timeline) —
+# REST-таймлайн issue отдаёт события `cross-referenced`, но они заводятся на
+# ЛЮБОЕ упоминание `#N` в другом PR/issue, а не только на Closes/Fixes/Resolves
+# (сам репозиторий вдобавок ЗАПРЕЩАЕТ эти ключевые слова, contract_check.py) —
+# то есть REST cross-referenced это тот же «упомянут», что и extract_task_refs,
+# а не формальная связь GraphQL closingIssuesReferences. Значит REST-заменителя
+# для источника (б) нет: используем GraphQL, если вызывающий код его добыл, и
+# ничего не подставляем взамен при его отсутствии.
+
+_BRANCH_TASK_RE = re.compile(r"^agent/(\d+)-")
+
+
+def task_from_branch(branch: str) -> int | None:
+    """Номер задачи из имени agent-ветки `agent/<N>-<slug>`, источник (а)
+    резолвера (см. блок выше). `None`, если ветка не этой формы (ручной пуш,
+    боты вроде dependabot — «задачи нет», а не ошибка)."""
+    if not branch:
+        return None
+    match = _BRANCH_TASK_RE.match(branch)
+    return int(match.group(1)) if match else None
+
+
+def resolve_pr_task(pull: dict, closing_issue: int | None = None) -> int | None:
+    """Задача, которой принадлежит PR — единственная точка входа для этого
+    вопроса (см. докстринг модуля). `None` — «у PR нет задачи», ожидаемый
+    ответ для ботов (dependabot) и PR без agent-ветки/декларации, не ошибка.
+
+    `pull` — объект PR из `gh api repos/.../pulls/N` (нужны `head.ref` и
+    `body`). `closing_issue` — номер из GitHub closingIssuesReferences
+    (источник б), если вызывающий код его добыл через GraphQL; функция сама
+    сети не трогает — резолвер обязан оставаться чистым и тестируемым без
+    gh/сети (прод-форма тел PR кормит test_task_ref.py напрямую)."""
+    branch = ((pull.get("head") or {}).get("ref")) or ""
+    from_branch = task_from_branch(branch)
+    if from_branch is not None:
+        return from_branch
+    if closing_issue is not None:
+        return closing_issue
+    declared = declared_tasks(pull.get("body") or "")
+    return declared[0] if declared else None
