@@ -14,7 +14,7 @@
      проверок точно: один PAT на весь пишущий путь (docs/research/21-github-actions.md).
      Каденция — самоподдержка: тик в конце диспатчит следующий workflow_dispatch
      (`chain`), cron — страховка смерти цепочки. Замер 2026-09-04: cron `*/15` на
-     этом репозитории доставил ~7% тиков (31 из ~449 за 112 ч), dispatch-события —
+     этом репозитории доставил ~7% тиков (31 из ~465 за 116.3 ч), dispatch-события —
      32 из 32; долгие кампании на schedule не строятся
      (docs/research/21-github-actions.md, «Замер schedule на этом репозитории»).
   2. Подъём workflow → job `probe` → `record`: замеряет себя сам по серверным
@@ -303,10 +303,22 @@ def summarize(rows: list[dict]) -> str:
             f"медиана {fmt(statistics.median(qvals))}, p99 {fmt(percentile(qvals, 0.99))}, "
             f"max {fmt(max(qvals))}")
     if business:
+        # Ревью #108: критерий бизнес-окна не должен читаться как «естественное
+        # покрытие», если его закрыла одна плотная серия — считаем по дням UTC.
+        by_day: dict[str, int] = {}
+        for row in ok:
+            sent = sent_at_datetime(int(row["sent_at"]))
+            if is_us_business(sent):
+                key = sent.date().isoformat()
+                by_day[key] = by_day.get(key, 0) + 1
+        days = ", ".join(f"{day} — {n}" for day, n in sorted(by_day.items()))
+        top_day = max(by_day.values())
+        dominance = (f"; критерий дня закрыт одной серией ({top_day} из "
+                     f"{len(business)})" if top_day * 2 > len(business) else "")
         lines.append(
             f"- американский рабочий день (пн–пт 13:00–24:00 UTC): медиана "
             f"{fmt(statistics.median(business))}, max {fmt(max(business))} "
-            f"({len(business)} замеров)")
+            f"({len(business)} замеров; по дням UTC: {days}{dominance})")
     if off:
         lines.append(
             f"- прочее время: медиана {fmt(statistics.median(off))}, "
@@ -487,12 +499,16 @@ def cmd_dispatch(_args: argparse.Namespace) -> int:
             "client_payload": {"probe_id": probe_id, "sent_at": sent_at},
         })
     except RuntimeError as error:
-        # Транспорт сломан (права, лимит, сеть) — это не молчание: красный тик + строка.
-        note = str(error)[:200]
-        clone_data_branch(workdir)
-        append_and_push(workdir, dispatch_failed_row(probe_id, sent_at, note),
-                        f"probe {probe_id}: dispatch_failed")
-        print(f"::error::dispatch отклонён — строка dispatch_failed записана: {note}")
+        # Транспорт сломан (права, лимит, сеть). Один писатель на одну неудачу
+        # (ревью #108): строку dispatch_failed пишет failure()-шаг tick_failed,
+        # деталь ошибки приезжает к нему через GITHUB_OUTPUT — иначе сводка
+        # насчитает два сбоя на один инцидент.
+        note = str(error)[:200].replace("\r", " ").replace("\n", " ")
+        output = os.environ.get("GITHUB_OUTPUT", "")
+        if output:
+            with open(output, "a", encoding="utf-8") as file:
+                file.write(f"tick_note={note}\n")
+        print(f"::error::dispatch отклонён — след запишет tick_failed: {note}")
         return 1
 
     deadline = time.monotonic() + TIMEOUT_S
@@ -560,21 +576,23 @@ def cmd_chain(_args: argparse.Namespace) -> int:
 
 
 def cmd_tick_failed(_args: argparse.Namespace) -> int:
-    """След тика, умершего до POST /dispatches: строка dispatch_failed с note.
-    Доставку schedule это не ловит (ран не создан — ловить нечем, см. замер
-    schedule в 21-github-actions.md), ловит смерть начавшегося тика. Лучшее
-    усилие: без токена строка не запишется — останется красный job (классы
-    «молча деградировало до только ok» и «код читает один токен, шаг прокидывает
-    другой» держат гвардии-тесты на GH_TOKEN и GH_PIPELINE_PAT)."""
+    """Единственный писатель строки dispatch_failed для умершего тика: смерть до
+    POST /dispatches ИЛИ отказ самого диспатча (деталь ошибки — в TICK_NOTE из
+    вывода шага тика; ревью #108: двойной след одной неудачи в сводке хуже
+    умолчания). Доставку schedule это не ловит (ран не создан — ловить нечем,
+    см. замер schedule в 21-github-actions.md). Лучшее усилие: без токена строка
+    не запишется — останется красный job (классы «молча деградировало до только
+    ok» и «код читает один токен, шаг прокидывает другой» держат гвардии-тесты
+    на GH_TOKEN и GH_PIPELINE_PAT)."""
     run_id = required_env("GITHUB_RUN_ID")
     sent_at = int(time.time() * 1000)
     gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail-tickfail")
-    note = (f"тик умер до диспатча: run {run_id}, "
+    note = (f"тик умер без замера: run {run_id}, "
             f"{os.environ.get('TICK_NOTE', 'шаг тика завершился ошибкой')}")
     clone_data_branch(workdir)
     wrote = append_and_push(workdir, dispatch_failed_row(f"tick-{run_id}", sent_at, note),
-                            f"tick {run_id}: dispatch_failed (умер до POST /dispatches)")
+                            f"tick {run_id}: dispatch_failed (тик умер без замера)")
     print(f"след тика {run_id} записан: {wrote}")
     return 0
 
