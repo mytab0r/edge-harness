@@ -246,8 +246,12 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
 
 
 def gh_api(*args: str) -> dict | list | None:
+    # encoding явный: без него subprocess.run на Windows читает вывод в
+    # кодировке консоли (cp1251), а GitHub honestly отдаёт кириллицу в
+    # заголовках коммитов/PR — падение на decode найдено живым прогоном
+    # 2026-09-05, не гипотетика.
     result = subprocess.run(["gh", "api", *args], capture_output=True, text=True,
-                             env={**os.environ, "NO_COLOR": "1"})
+                             encoding="utf-8", env={**os.environ, "NO_COLOR": "1"})
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"gh api {args} завершился с кодом {result.returncode}")
     return json.loads(result.stdout) if result.stdout.strip() else None
@@ -275,7 +279,10 @@ def collect_github(repo: str) -> list[Row]:
         since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         dispatch_count = 0
         for event in ("repository_dispatch", "workflow_dispatch"):
-            data = gh_api(f"repos/{repo}/actions/runs", "-f", f"event={event}",
+            # --method GET обязателен: gh api молча переключается на POST, если
+            # заданы -f поля без явного метода — на этом эндпоинте POST даёт 404,
+            # а не осмысленную ошибку метода (найдено живым прогоном 2026-09-05).
+            data = gh_api("--method", "GET", f"repos/{repo}/actions/runs", "-f", f"event={event}",
                           "-f", f"created=>={since}", "-f", "per_page=100")
             dispatch_count += data.get("total_count", 0)
         rows.append(Row(
@@ -288,7 +295,7 @@ def collect_github(repo: str) -> list[Row]:
         rows.append(no_data("Диспатчи этого репо/час", source, LIMITS["gh_dispatch_hour"], "runs/час", str(error)))
 
     try:
-        data = gh_api(f"repos/{repo}/actions/runs", "-f", "status=in_progress", "-f", "per_page=100")
+        data = gh_api("--method", "GET", f"repos/{repo}/actions/runs", "-f", "status=in_progress", "-f", "per_page=100")
         in_progress = data.get("total_count", 0)
         rows.append(Row(
             "In-progress workflow runs этого репо (приближение к concurrency 20, аккаунт-wide)",
