@@ -73,16 +73,14 @@
 на которые ссылается `deploy-dsh-edge.yml`, **сейчас не заведены** — интеграции живут в
 состоянии `not_configured`, это ожидаемо, не белое пятно.
 
-Переменные (`gh api repos/mytab0r/edge-harness/actions/variables`):
-
-| Имя | Значение |
-|---|---|
-| `HARNESS_URL` | `https://edge-harness.mytab0r.workers.dev` |
-| `DSH_EDGE_URL` | `https://dsh-edge.mytab0r.workers.dev` |
-| `DEEPSEEK_BASE_URL` | `https://api.z.ai/api/coding/paas/v4` |
-| `DEEPSEEK_MODEL` | `glm-5.3-flash` |
-| `DSH_EDGE_PROVIDER_NAME` | `GLM` |
-| `DSH_EDGE_MODEL_CATALOG` | JSON-каталог моделей (glm-5/5.3/5.3-flash/4.7) |
+Переменные (`gh api repos/mytab0r/edge-harness/actions/variables`, имена, без значений):
+`HARNESS_URL`, `DSH_EDGE_URL`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, `DSH_EDGE_PROVIDER_NAME`,
+`DSH_EDGE_MODEL_CATALOG`. Текущий провайдер/модель — намеренно не значение здесь, а
+команда, которой его смотреть: `gh api repos/mytab0r/edge-harness/actions/variables/DEEPSEEK_MODEL`.
+Причина — не лень, а гвардия класса #153 (`scripts/lib/test/provider-default.guard.sh`):
+`docs/agents/**` конкатенируется прямо в промпт агента (`WORKER-PLAYBOOK.md` читается
+целиком), и литерал текущей модели здесь стал бы вторым местом правды, которое устареет
+при следующей смене провайдера и никто не обязан был бы это заметить.
 
 `GH_DISPATCH_TOKEN_KIND` не выставлена — гвардия узости токена (deploy-worker.yml) сейчас
 только предупреждает (`::warning::`), не красит деплой (миграция ADR 0008 не завершена шагом
