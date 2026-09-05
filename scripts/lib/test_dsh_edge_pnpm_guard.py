@@ -19,11 +19,11 @@ patchedDependencies), и эта гвардия делает его возвра�
 
 Правила:
   1. deploy-dsh-edge.yml не ставит пакеты npm'ом: ни `npm install`, ни его
-     шорткат `npm i`, ни `npm ci`, ни `npm add` — в любой форме записи шага
-     (блочной `run: |`, инлайн `- run: npm …`) и в любой позиции команды в
-     строке, включая цепочку `cd … && npm install` (это единственный
-     workflow, работающий в pnpm-дереве dsh-edge). `npm pack` легален — он
-     скачивает tarball префаба во временный каталог и node_modules не трогает.
+     шорткат `npm i`, ни `npm ci`, ни `npm add` — в ЛЮБОЙ форме записи и
+     позиции: блочная `run: |` (голая строка), инлайн `- run: npm …`,
+     цепочка `cd … && npm install` (это единственный workflow, работающий
+     в pnpm-дереве dsh-edge). `npm pack` легален — он скачивает tarball
+     префаба во временный каталог и node_modules не трогает.
   2. `--legacy-peer-deps` запрещён ВЕЗДЕ, где он вообще может появиться:
      все .github/workflows/*.yml|yaml и scripts/**/*.sh. Флаг — не решение
      peer-конфликта, а его маскировка (тот же класс); peer-конфликт чинится
@@ -54,21 +54,20 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 DEPLOY_DSH_EDGE = WORKFLOWS / "deploy-dsh-edge.yml"
 
 # npm как УСТАНОВЩИК пакетов (меняет node_modules): install/ci/add — включая
-# шорткат `i`, инлайн-форму YAML (`- run: npm install …`, как в
-# deploy-worker.yml:28) и позицию ПОСЛЕ шелл-разделителей/ключевых слов
-# (`cd … && npm install`, `… ; npm i`, `then npm install`) — находки
-# AI-ревью #313: инлайн-форма, шорткат и cd-цепочка проходили первые версии
-# правила молча. `npm pack` (скачать tarball) установщиком не является.
-# `\b` после `i` не цепляет `npm init`/`npm info` (они не ставят пакеты);
-# перед `npm` обязан быть якорь/разделитель/ключевое слово, поэтому `pnpm add`
-# (перед `npm` стоит `p`) и `echo "используй npm install"` (перед `npm` пробел
-# внутри строки) не красятся. Отсечение комментариев (см.
-# _code_lines_numbered) исключает прозу: «npm install» в комментарии — не вызов.
-NPM_INSTALLER_RE = re.compile(
-    r"(?:^\s*(?:-\s*)?(?:run|script):\s*|[;&|(]\s*|\b(?:then|do|else)\s+)"
-    r"npm\s+(?:install|i|ci|add)\b",
-    re.M,
-)
+# шорткат `i`. В deploy-dsh-edge.yml легального npm-установщика нет вовсе
+# (npm участвует только как `npm pack` — скачать tarball префаба, он в
+# чередование не входит), поэтому позиционные якоря не нужны: ловится ЛЮБОЕ
+# вхождение в строках кода. История правила — три находки AI-ревью #313:
+# (1) шорткат `npm i` и инлайн `- run: npm install`, (2) цепочка
+# `cd … && npm install`, (3) САМАЯ ОБЫЧНАЯ блочная форма — голая строка
+# `npm install …` внутри `run: |`-блока: все три проходили позиционные
+# версии якоря молча. Негативный просмотр `(?<![A-Za-z])` отсекает `pnpm`
+# (перед `npm` буква `p`); `\b` после `i` не цепляет `npm init`/`npm info`.
+# Цена честности: npm-install в ПРОЗЕ кодовой строки (echo «используй
+# npm install») тоже красится — в этом workflow такого писать нельзя, и
+# ложный красный громок и чинится в секунды, а не маскирует класс #43.
+# Отсечение комментариев (_code_lines_numbered) исключает прозу комментариев.
+NPM_INSTALLER_RE = re.compile(r"(?<![A-Za-z])npm\s+(?:install|i|ci|add)\b")
 
 # Маскирующий флаг peer-конфликтов — запрещён в любых файлах, которые
 # вообще могут исполняться (workflow + shell-скрипты репозитория).
@@ -167,14 +166,16 @@ def test_deploy_dsh_edge_keeps_pnpm_plugin_route():
     )
 
 
-# Мутации, которыми доказана гвардия (каждая — красный тест, возврат — зелёный):
+# Мутации, которыми доказана гвардия (каждая — красный тест, возврат — зелёный;
+# перечень краснеющих тестов в каждой записи — проверенный факт, а не ожидание:
+# неточная запись ловилась AI-ревью #313, раунд 3):
 #
 #   М1 (правила 1+2+3): в deploy-dsh-edge.yml заменить
 #     `pnpm add --save-exact "${args[@]}"` на
 #     `npm install --legacy-peer-deps "${args[@]}"` —
-#     красны test_deploy_dsh_edge_never_installs_packages_with_npm,
-#     test_no_legacy_peer_deps_masking_anywhere,
-#     test_deploy_dsh_edge_keeps_pnpm_plugin_route.
+#     красны test_deploy_dsh_edge_never_installs_packages_with_npm
+#     (голая строка npm install в run-блоке), test_no_legacy_peer_deps_masking_anywhere
+#     (флаг), test_deploy_dsh_edge_keeps_pnpm_plugin_route (pnpm add исчез).
 #   М2 (правило 3, вторая половина): удалить только строку
 #     `grep -q "patchedDependencies" pnpm-workspace.yaml …` —
 #     красен исключительно test_deploy_dsh_edge_keeps_pnpm_plugin_route.
@@ -182,17 +183,23 @@ def test_deploy_dsh_edge_keeps_pnpm_plugin_route():
 #     no-op-команду `: "--legacy-peer-deps"` (строка с флагом в комментарии
 #     красить не должна — комментарии отсечены) — красен
 #     test_no_legacy_peer_deps_masking_anywhere; удалить строку.
-#   М4 (правило 1, инлайн-форма и шорткат — находка AI-ревью #313): дописать
-#     в deploy-dsh-edge.yml шаг `- run: npm i pnpm` — красен
+#   М4 (правило 1, инлайн-форма и шорткат — находка AI-ревью #313, раунд 1):
+#     дописать в deploy-dsh-edge.yml шаг `- run: npm i pnpm` — красен
 #     test_deploy_dsh_edge_never_installs_packages_with_npm; а
 #     `- run: npm init -y` КРАСИТЬ НЕ ДОЛЖЕН (\b после `i`; init не ставит
 #     пакеты) — проверить и на него; удалить строки.
-#   М5 (правило 1, ложный позитив): строка `          pnpm add --save-exact`
-#     не матчится (перед `npm` в `pnpm` стоит `p`, не якорь/разделитель) —
-#     гвардия зелёная на неизменённом дереве; также `- uses: actions/checkout@v7`,
-#     `npm pack` и `echo "… npm install …"` (перед `npm` пробел внутри строки,
-#     не разделитель) не красят.
-#   М6 (правило 1, cd-цепочка — находка AI-ревью #313, второй раунд): в
+#   М5 (правило 1, ложный позитив): на неизменённом дереве не красят:
+#     `pnpm add --save-exact` (перед `npm` в `pnpm` стоит `p`),
+#     `npm pack "$SPEC"`, `- uses: actions/checkout@v7`, `node --check`,
+#     `npm init -y`. НП: `echo "… npm install …"` теперь КРАСИТ — это
+#     осознанная цена правила «в этом workflow npm-установщика нет вовсе»
+#     (см. комментарий у NPM_INSTALLER_RE): громкий ложный красный чинится
+#     в секунды, тихий пропуск класса #43 — нет.
+#   М6 (правило 1, cd-цепочка — находка AI-ревью #313, раунд 2): в
 #     deploy-dsh-edge.yml в любом run-блоке дописать строку
 #     `          cd clone/apps/dsh-edge/standalone && npm install` — красен
+#     test_deploy_dsh_edge_never_installs_packages_with_npm; удалить строку.
+#   М7 (правило 1, блочная форма — находка AI-ревью #313, раунд 3): дописать
+#     в run-блок голую строку `          npm install foo.tgz` (pnpm-маршрут
+#     и флаг не тронуты) — красен
 #     test_deploy_dsh_edge_never_installs_packages_with_npm; удалить строку.
