@@ -421,6 +421,30 @@ def test_summarize_keeps_silent_on_informative_queue():
     assert "queue_ms = 0 во всех строках" not in dt.summarize(summary_fixture())
 
 
+# ── Git-транспорт финализации: регрессия probe 33937006302 ───────────────────────
+
+
+def test_rewinding_git_ops_carry_identity_and_never_target_main():
+    """Регрессия probe 33937006302: `rebase --autostash origin/main` в
+    финализации перепроигрывал ВСЕ коммиты ветки данных (ветка отошла от main
+    на сотни коммитов) и падал на пустой коммиттер-идентичности — голый клон
+    job'а user.name не знает. Класс «git-операция, переписывающая коммиты»:
+    каждая переигрывающая (rebase) идёт под COMMIT_IDENTITY — --abort не
+    считается, коммитов не создаёт — и ни одна не таргетит main: ветка данных
+    append-only, интеграцию делает мерж PR."""
+    rebase_lines = [line.strip() for line in
+                    SCRIPT.read_text(encoding="utf-8").splitlines()
+                    if '"rebase"' in line]
+    assert rebase_lines, "rebase исчез из git-транспорта — гвардия ослепла"
+    for line in rebase_lines:
+        if "--abort" in line:
+            continue
+        assert "COMMIT_IDENTITY" in line, (
+            f"rebase без коммиттер-идентичности — упадёт на голом клоне: {line[:90]}")
+        assert "origin/main" not in line and '"main"' not in line, (
+            f"rebase таргетит main — перепишет всю ветку данных: {line[:90]}")
+
+
 # ── Гвардии workflow: цепочка, след тика, страховочный cron ──────────────────────
 
 
@@ -445,6 +469,50 @@ def test_tick_job_chains_and_traces_failed_ticks():
     for step in (chain, trace):
         assert "GH_TOKEN" in (step.get("env") or {}), (
             f"шаг «{step.get('name')}» без GH_TOKEN: его запись никогда не попадёт в CSV")
+
+
+def test_every_dispatch_tail_step_provides_token_the_code_reads():
+    """Гвардия-класс «код читает один токен, шаг прокидывает другой»: все команды
+    dispatch_tail.py читают GH_PIPELINE_PAT (имя с задачи #6), а credential
+    helper'у нужен GH_TOKEN. Шаг, прокидывающий только GH_TOKEN, роняет команду
+    с ошибкой про не ту переменную; имя до задачи #6 (GH_DISPATCH_TOKEN)
+    возвращаться не должно."""
+    steps = [step for job in load_workflow()["jobs"].values()
+             for step in job.get("steps", [])
+             if "dispatch_tail.py" in (step.get("run") or "")]
+    assert steps, "шаги кампании исчезли из workflow — гвардия ослепла"
+    code_reads = "GH_PIPELINE_PAT" in (
+        SCRIPT.read_text(encoding="utf-8").replace("GH_DISPATCH_TOKEN", ""))
+    assert code_reads, "скрипт снова читает GH_DISPATCH_TOKEN — гвардия ждёт GH_PIPELINE_PAT"
+    for step in steps:
+        env = step.get("env") or {}
+        assert "GH_PIPELINE_PAT" in env, (
+            f"шаг «{step.get('name')}» зовёт dispatch_tail.py без GH_PIPELINE_PAT — "
+            "команда упадёт на пустом токене с ошибкой про не ту переменную")
+        assert "GH_DISPATCH_TOKEN" not in env, (
+            f"шаг «{step.get('name')}» прокидывает GH_DISPATCH_TOKEN — имя до задачи #6, "
+            "код его не читает: секрет под чужим именем")
+
+
+def test_campaign_max_days_declared_once_at_workflow_level():
+    """Гвардия-класс «два job'а читают переменную, а задаётся она в одном месте»:
+    CAMPAIGN_MAX_DAYS читают и тик (dispatch), и probe (record→finalize).
+    Объявление на уровне шага доходит только до одного job'а — продление кампании
+    умирает при рождении: probe досчитает до 7 дней и финализирует снова
+    (ревью #108)."""
+    data = load_workflow()
+    env = data.get("env") or {}
+    raw = str(env.get("CAMPAIGN_MAX_DAYS", "")).strip()
+    assert raw.isdigit() and int(raw) > 0, (
+        "CAMPAIGN_MAX_DAYS не объявлена на верхнем уровне workflow — "
+        "путь продления кампании после unmet-финализации мёртв")
+    for job_name, job in data["jobs"].items():
+        assert "CAMPAIGN_MAX_DAYS" not in (job.get("env") or {}), (
+            f"job {job_name} переопределяет CAMPAIGN_MAX_DAYS — второе место правды")
+        for step in job.get("steps", []):
+            assert "CAMPAIGN_MAX_DAYS" not in (step.get("env") or {}), (
+                f"шаг «{step.get('name')}» переопределяет CAMPAIGN_MAX_DAYS — "
+                "доходит только до одного job'а")
 
 
 def test_schedule_cron_is_backup_only_and_off_quarter_hours():

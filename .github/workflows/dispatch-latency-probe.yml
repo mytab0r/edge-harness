@@ -37,6 +37,14 @@ on:
 permissions:
   contents: read  # checkout; все записи (CSV, PR, комментарии) идут под PAT
 
+env:
+  # Сознательное продление кампании после unmet-финализации (ADR 0005, дельта
+  # «Темп добора»): ОДНА декларация на оба job'а — тик и probe считают один
+  # лимит. Переопределение на уровне шага доходит только до одного job'а, и
+  # продление умирает при рождении: probe досчитает до 7 дней и финализирует
+  # снова. Гвардия — scripts/measure/test_dispatch_tail.py.
+  CAMPAIGN_MAX_DAYS: "7"
+
 jobs:
   tick:
     if: github.event_name != 'repository_dispatch'
@@ -73,7 +81,7 @@ jobs:
         # нечем): она видна сверкой истории runs, см. замер schedule в доке.
         if: failure()
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py tick_failed
       - name: Цепочка — следующая ступень тика
@@ -83,7 +91,7 @@ jobs:
         # покрытие достигнуто, лимит дней или workflow не на main.
         if: always()
         env:
-          GH_DISPATCH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: python scripts/measure/dispatch_tail.py chain
 

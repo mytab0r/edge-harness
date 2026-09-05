@@ -234,8 +234,10 @@ def finalize_outcome(cov: dict) -> dict:
         "ready": False,
         "verdict": "Финализация по лимиту дней: критерий НЕ достигнут, кампания остановлена.",
         "closing": "Критерий задачи НЕ выполнен — задачу НЕ закрывать, PR остаётся "
-                   "черновиком. Продолжить сбор: задай CAMPAIGN_MAX_DAYS в env шага "
-                   "«Тик кампании» (сознательное продление) и "
+                   "черновиком. Продолжить сбор: задай CAMPAIGN_MAX_DAYS в env на "
+                   "уровне workflow (одно объявление на оба job'а — тик и probe "
+                   "считают один лимит; переопределение на уровне шага доходит "
+                   "только до тика, и probe досчитает до 7 дней снова) и "
                    "`gh workflow enable dispatch-latency-probe.yml`.",
     }
 
@@ -542,7 +544,7 @@ def cmd_chain(_args: argparse.Namespace) -> int:
     тика (один сбой не должен ронять кампанию до ближайшего cron-страхового),
     но не зацикливает красное: при неактивной кампании громко отказывается и
     выходит 0. Ограничитель темпа — CHAIN_DELAY_S и сериализация тиков."""
-    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workflow_on_main = gh.contents(WORKFLOW_FILE, "main") is not None
     cov = coverage(read_rows(gh.contents(CSV_PATH, DATA_BRANCH) or ""),
                    max_days=campaign_max_days())
@@ -561,11 +563,12 @@ def cmd_tick_failed(_args: argparse.Namespace) -> int:
     """След тика, умершего до POST /dispatches: строка dispatch_failed с note.
     Доставку schedule это не ловит (ран не создан — ловить нечем, см. замер
     schedule в 21-github-actions.md), ловит смерть начавшегося тика. Лучшее
-    усилие: без токена строка не запишется — останется красный job (класс
-    «молча деградировало до только ok» держит гвардия-тест на GH_TOKEN)."""
+    усилие: без токена строка не запишется — останется красный job (классы
+    «молча деградировало до только ok» и «код читает один токен, шаг прокидывает
+    другой» держат гвардии-тесты на GH_TOKEN и GH_PIPELINE_PAT)."""
     run_id = required_env("GITHUB_RUN_ID")
     sent_at = int(time.time() * 1000)
-    gh = Github(os.environ.get("GH_DISPATCH_TOKEN", ""), required_env("GITHUB_REPOSITORY"))
+    gh = Github(os.environ.get("GH_PIPELINE_PAT", ""), required_env("GITHUB_REPOSITORY"))
     workdir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "dispatch-tail-tickfail")
     note = (f"тик умер до диспатча: run {run_id}, "
             f"{os.environ.get('TICK_NOTE', 'шаг тика завершился ошибкой')}")
@@ -588,8 +591,9 @@ def ensure_draft_pr(gh: Github) -> None:
         "коммит в CSV. При достижении критерия (100+ замеров, включая американский "
         "рабочий день, разброс ≥24 ч) кампания сама допишет сводку в "
         "`docs/research/99-open-questions.md`, переведёт PR в готовность и оставит "
-        "комментарий в задаче.\n\nИнфраструктура кампании — отдельный уже смерженный PR; "
-        "этот PR содержит только данные и сводку."
+        "комментарий в задаче.\n\nПока кампания активна, её инфраструктурные дельты "
+        "(workflow, скрипт, доки) едут этим же PR: отдельный инфраструктурный PR — "
+        "второй претендент на задачу #4, контракт его отклонит."
     )
     gh.request("POST", f"/repos/{gh.repo}/pulls", {
         "title": PR_TITLE, "head": DATA_BRANCH, "base": "main",
@@ -624,20 +628,31 @@ def cmd_finalize(_args: argparse.Namespace) -> int:
     if committed.returncode != 0 and "nothing to commit" not in (
             committed.stdout + committed.stderr).lower():
         raise RuntimeError(f"git commit сводки: {committed.stderr.strip()[:300]}")
-    git("fetch", "--quiet", "origin", "main", DATA_BRANCH, cwd=workdir)
-    git("rebase", "--autostash", "origin/main", cwd=workdir)
-    # Редкая гонка двух финализаций: чужой коммит на ветке данных не должен
-    # ронять наш — перебазируемся и пушим снова (до 3 раз), дальше громкий отказ.
+    # Регрессия probe 33937006302: здесь стоял `rebase --autostash origin/main` —
+    # он перепроигрывал ВСЕ коммиты ветки данных (она отошла от main на сотни
+    # коммитов) и падал на пустой коммиттер-идентичности: голый клон job'а
+    # user.name не знает. Ветка данных append-only — перебазировать её на main
+    # не нужно (интеграцию делает мерж PR). Гонку с чужой строкой разруливает
+    # перебазирование только СВОЕГО коммита сводки, уже под идентичностью.
+    git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir)
     for _ in range(3):
         if git("push", "--quiet", "origin", f"HEAD:{DATA_BRANCH}", cwd=workdir,
                check=False).returncode == 0:
             break
-        git("rebase", "--autostash", f"origin/{DATA_BRANCH}", cwd=workdir, check=False)
-        git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir, check=False)
+        git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir)
+        git(*COMMIT_IDENTITY, "rebase", "--autostash", f"origin/{DATA_BRANCH}", cwd=workdir)
     else:
         raise RuntimeError("push финального коммита на ветку данных не прошёл за 3 попытки")
 
-    for pull in gh.open_pulls_on_branch():
+    pulls = gh.open_pulls_on_branch()
+    if not pulls:
+        # Маршрут сводки в main (ревью #108): финализация после мержа дельты —
+        # открытого PR на ветке нет, и сводка обязана сама получить новый PR,
+        # иначе остаётся на ветке данных, ::warning:: в логе job'а никто не
+        # читает, а workflow уже выключен.
+        ensure_draft_pr(gh)
+        pulls = gh.open_pulls_on_branch()
+    for pull in pulls:
         if pull.get("draft") and outcome["ready"]:
             ready = subprocess.run(["gh", "pr", "ready", str(pull["number"])],
                                    capture_output=True, text=True)
