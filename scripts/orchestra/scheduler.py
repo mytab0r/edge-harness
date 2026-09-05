@@ -60,6 +60,13 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       scripts/orchestra/upstream_drift.py; сбой сверки не роняет планировщик,
       но и не молчит — ⚠️ в отчёте (сломанная сверка прячет дрейф так же
       надёжно, как её отсутствие).
+  11. Инвариант «готовый PR не должен ждать» (#269): PR, у которого ОБЕ метки-
+      гейта стоят и все обязательные проверки зелёные, но слияния не
+      произошло дольше UNHEALTHY_PR_AFTER_MINUTES с момента готовности —
+      кричит тем же каналом escalate(), что предохранитель конвейера (#120).
+      Наблюдаемая величина именно эта (задержка слияния готового PR), а не
+      статус последнего прогона оркестратора — тот может быть сплошь success,
+      пока сам прогон не случается достаточно часто (issue #269, #297).
 """
 
 import http.cookiejar
@@ -83,6 +90,7 @@ from pulse_guard import (
     AI_REVIEW_MAX_ATTEMPTS,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
+    READY_STALL_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
     WATCHDOG_ISSUE,
     conveyor_gate,
@@ -896,6 +904,96 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     return lines
 
 
+# ── issue #269: PR полностью готов, а слияния не произошло — газ обязан гореть ──
+# unhealthy_pulls (выше) ловит нездоровые PR (красный чек/ai:changes-requested).
+# Этот инвариант — противоположный случай: PR ЗДОРОВ и готов (оба вердикта,
+# зелёные проверки, mergeable_state допускает слияние), но остался несмерженным
+# дольше порога. merge_queue сливает не более одного PR за прогон — если
+# кандидатов несколько или прогон долго не случался (issue #269 — как раз про
+# это), готовый PR может прождать часами при формально зелёных прогонах.
+
+
+def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент, когда PR стал полностью готов к слиянию: позже из двух событий
+    'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна,
+    что last_review_ok_labeled_at. None — событие по какой-то из меток не найдено
+    в последних 100 записях таймлайна (например, PR открыт раньше окна) —
+    тогда возраст не считаем, не гадаем по неполным данным."""
+    timeline = gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")
+    def labeled_at(label_name: str) -> list[str]:
+        return [
+            event["created_at"] for event in timeline
+            if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == label_name
+        ]
+    review_at = labeled_at(review_labels.REVIEW_OK)
+    ai_at = labeled_at(review_labels.AI_OK)
+    if not review_at or not ai_at:
+        return None
+    return parse_time(max(max(review_at), max(ai_at)))
+
+
+def pr_is_merge_ready(repo: str, pull: dict) -> bool:
+    """Тот же критерий готовности, что merge_queue проверяет перед PUT /merge
+    (одно место правды по смыслу — сериализация решения дублирует условие,
+    не значение): черновик и неподходящий mergeable_state исключены, красные
+    проверки исключены, обе метки-гейта обязаны стоять. `pull` обязан уже
+    нести mergeable_state (в списке open_pulls его нет — вызывающий код читает
+    одиночный PR, как и merge_queue)."""
+    if pull.get("draft"):
+        return False
+    if pull.get("mergeable_state") not in ("clean", "unstable", "has_hooks"):
+        return False
+    if pr_bad_checks(repo, pull):
+        return False
+    labels = {label["name"] for label in pull["labels"]}
+    return review_labels.merge_label_gate(labels) is None
+
+
+def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
+    """Инвариант issue #269: готовый PR не должен ждать слияния дольше
+    UNHEALTHY_PR_AFTER_MINUTES — это и есть наблюдаемая величина «задержка
+    слияния», а не статус последнего прогона оркестратора (тот может быть
+    сплошь success, пока сам прогон не случается достаточно часто). Сигнал —
+    тот же канал escalate(), что предохранитель конвейера (#120), идемпотентно:
+    маркер READY_STALL_MARKER новее момента готовности — уже оповещено, молчим.
+
+    Маркеры читаются ЛЕНИВО (только когда найден хотя бы один просроченный
+    кандидат), а не в начале функции: пустая очередь PR обязана давать ноль
+    вызовов gh(), как и остальные механизмы (гвардия холостого хода)."""
+    lines: list[str] = []
+    markers: list[datetime] | None = None
+    for pull in pulls:
+        if pull.get("draft"):
+            continue
+        single = gh(f"repos/{repo}/pulls/{pull['number']}")  # mergeable_state только тут
+        candidate = {**pull, "mergeable_state": single.get("mergeable_state")}
+        if not pr_is_merge_ready(repo, candidate):
+            continue
+        ready_since = last_ready_labeled_at(repo, pull["number"])
+        if ready_since is None:
+            continue
+        age = minutes_between(ready_since, now)
+        if age < UNHEALTHY_PR_AFTER_MINUTES:
+            continue
+        if markers is None:
+            try:
+                markers = issue_marker_times(repo, WATCHDOG_ISSUE, READY_STALL_MARKER)
+            except RuntimeError as error:
+                lines.append(f"⚠️ не смог сверить маркеры готовности #{WATCHDOG_ISSUE}: {error}")
+                continue
+        if any(marker_at > ready_since for marker_at in markers):
+            continue  # уже оповещено про эту готовность
+        text = (
+            f"🚨 edge-harness: {READY_STALL_MARKER}\n"
+            f"PR #{pull['number']} готов к слиянию (обе метки-гейта, зелёные проверки) "
+            f"{int(age)} мин — дольше {UNHEALTHY_PR_AFTER_MINUTES}, слияния не произошло. "
+            "Проверь status.pulse_healthy (cf-worker) и последние прогоны orchestra.yml."
+        )
+        result = escalate(repo, WATCHDOG_ISSUE, text)
+        lines.append(f"🚨 PR #{pull['number']}: готов {int(age)} мин, слияние не идёт ({result})")
+    return lines
+
+
 def upstream_drift_lines(repo: str) -> list[str]:
     """Сигнал дрейфа пина апстрима (#134) — обёртка для main(): сверка не должна
     ронять планировщик (слияния важнее), но и не имеет права молчать: сломанная
@@ -947,6 +1045,9 @@ def main() -> int:
     # берём заново: merge_queue мог слить один PR этим же прогоном, и старый
     # снимок pulls содержал бы уже закрытый номер.
     ai_retry_lines = trigger_ai_review(repo, now, open_pulls(repo))
+    # Инвариант issue #269: готовый PR, который так и не слился, кричит — та же
+    # свежая выборка, что уже понадобилась trigger_ai_review выше.
+    stale_ready_lines = stale_ready_pulls(repo, now, open_pulls(repo))
 
     pool = open_task_issues(repo)
     free = sum(1 for issue in pool if not issue["assignees"])
@@ -958,10 +1059,10 @@ def main() -> int:
     worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
 
     if (stale_lines or conflict_lines or unhealthy_lines or merge_lines or ai_retry_lines
-            or lease_lines or conveyor_lines or worker_lines):
+            or stale_ready_lines or lease_lines or conveyor_lines or worker_lines):
         lines += ["", "### Действия",
                   *stale_lines, *lease_lines, *conflict_lines, *unhealthy_lines, *merge_lines,
-                  *ai_retry_lines, *conveyor_lines, *worker_lines]
+                  *ai_retry_lines, *stale_ready_lines, *conveyor_lines, *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
 

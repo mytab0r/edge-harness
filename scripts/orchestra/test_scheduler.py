@@ -629,6 +629,130 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
         sch.gh = orig_gh
 
 
+# ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
+# Противоположный класс unhealthy_pulls: PR ЗДОРОВ (обе метки-гейта, зелёные
+# проверки), но слияния не было дольше UNHEALTHY_PR_AFTER_MINUTES с момента
+# готовности (позже из двух событий 'labeled' review:ok/ai:ok в таймлайне).
+
+
+def timeline_ready(review_at: str, ai_at: str):
+    return [
+        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": review_at},
+        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": ai_at},
+    ]
+
+
+def test_stale_ready_pulls_escalates_when_ready_longer_than_threshold(monkeypatch):
+    p = pull(301, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/301": {"mergeable_state": "clean"},
+        "commits/sha301/check-runs": CHECK_RUNS_GREEN,
+        "issues/301/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 2, 10, 30)  # 145 мин с готовности (08:05) > порог 120
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+
+    assert any("301" in line and "готов" in line for line in lines)
+    assert posted and posted[0][0] == sch.WATCHDOG_ISSUE
+    assert sch.READY_STALL_MARKER in posted[0][1]
+    assert "301" in posted[0][1]
+
+
+def test_stale_ready_pulls_silent_before_threshold(monkeypatch):
+    p = pull(302, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/302": {"mergeable_state": "clean"},
+        "commits/sha302/check-runs": CHECK_RUNS_GREEN,
+        "issues/302/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
+
+    now = utc(2026, 9, 2, 9, 0)  # 55 мин < порог 120
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+    assert lines == []
+    assert not any("issues/120/comments" in c for c in fake.calls)  # маркеры лениво
+
+
+def test_stale_ready_pulls_silent_when_ai_gate_missing(monkeypatch):
+    # Только review:ok — вторая метка-гейт не стоит, PR не готов вовсе.
+    p = pull(303, labels=["review:ok"])
+    fake = FakeGh({"pulls/303": {"mergeable_state": "clean"}, "commits/sha303/check-runs": CHECK_RUNS_GREEN})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("гейта нет — не готов"))
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert lines == []
+    assert not any("timeline" in c for c in fake.calls)  # готовность даже не проверяем
+
+
+def test_stale_ready_pulls_silent_when_checks_red(monkeypatch):
+    p = pull(304, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({"pulls/304": {"mergeable_state": "clean"}, "commits/sha304/check-runs": CHECK_RUNS_RED})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("красный чек — не готов"))
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert lines == []
+
+
+def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
+    # Маркер новее момента готовности — уже оповещено, второй раз не пишем.
+    p = pull(305, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/305": {"mergeable_state": "clean"},
+        "commits/sha305/check-runs": CHECK_RUNS_GREEN,
+        "issues/305/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER}\nPR #305 …"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("уже оповещено — не дублируем"))
+    now = utc(2026, 9, 2, 10, 30)  # тот же возраст, что в escalates-тесте
+    lines = sch.stale_ready_pulls(REPO, now, [p])
+    assert lines == []
+
+
+def test_stale_ready_pulls_noop_on_empty_queue(monkeypatch):
+    fake = FakeGh({})  # ни один маршрут не должен понадобиться
+    patch_gh(monkeypatch, fake)
+    lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [])
+    assert lines == []
+    assert fake.calls == []
+
+
+# ── Мутация гвардии инварианта #269: без ОБЕИХ меток-гейта готовность ложная ─────
+
+
+def test_pr_is_merge_ready_mutation_requires_both_gate_labels_and_green_checks():
+    only_review = pull(1, labels=["review:ok"])
+    both_gates = pull(2, labels=["review:ok", "ai:ok"])
+    red_checks = pull(3, labels=["review:ok", "ai:ok"])
+    draft = pull(4, labels=["review:ok", "ai:ok"], draft=True)
+    for p in (only_review, both_gates, red_checks, draft):
+        p["mergeable_state"] = "clean"
+
+    fake = FakeGh({
+        "commits/sha1/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha2/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha3/check-runs": CHECK_RUNS_RED,
+        "commits/sha4/check-runs": CHECK_RUNS_GREEN,
+    })
+    orig_gh = sch.gh
+    sch.gh = fake
+    try:
+        assert sch.pr_is_merge_ready(REPO, only_review) is False
+        assert sch.pr_is_merge_ready(REPO, both_gates) is True
+        assert sch.pr_is_merge_ready(REPO, red_checks) is False
+        assert sch.pr_is_merge_ready(REPO, draft) is False
+    finally:
+        sch.gh = orig_gh
+
+
 # ── Поведение 3: после слияния — подтянуть остальных, но выборочно (#252) ────────
 # Раньше update_remaining_pulls дёргал update-branch для ВСЕХ открытых недрафт
 # PR — каждый такой push синхронизирует pr-review.yml и снимает валидные

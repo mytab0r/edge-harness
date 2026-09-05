@@ -41,11 +41,19 @@ const SCHEMA = [
   // (setAlarm перезакладывается первой строкой alarm()), но раньше исход dispatch'а
   // (не настроен / сеть упала / GitHub отклонил не-204) тонул в console.log, который
   // никто не смотрит между дедами. Эта строка — видимый артефакт вместо тихой лжи.
+  // dispatch_ok — принят ли dispatch GitHub'ом (HTTP 204). Это НЕ доказательство
+  // запуска (docs/research/21-github-actions.md: файл workflow не на default
+  // branch тоже отвечает 204 и ничего не запускает) — запуск подтверждает
+  // last_run_id/run_confirmed: id последнего run'а orchestra.yml на момент ЭТОГО
+  // тика (баланс для проверки на СЛЕДУЮЩЕМ) и тройное состояние подтверждения
+  // ПРЕДЫДУЩЕГО dispatch'а (NULL — рано судить, 0 — запуск не появился, 1 — появился).
   `CREATE TABLE IF NOT EXISTS pulse (
-     id          INTEGER PRIMARY KEY CHECK (id = 1),
-     ts          INTEGER NOT NULL,
-     dispatch_ok INTEGER NOT NULL,
-     detail      TEXT
+     id            INTEGER PRIMARY KEY CHECK (id = 1),
+     ts            INTEGER NOT NULL,
+     dispatch_ok   INTEGER NOT NULL,
+     detail        TEXT,
+     last_run_id   INTEGER,
+     run_confirmed INTEGER
    )`,
 ];
 
@@ -67,6 +75,26 @@ export interface TaskRow {
   status: "queued" | "dispatched" | "running" | "done" | "failed";
 }
 
+/** Пульс оркестрации (#269): исход последней попытки alarm() дёрнуть orchestra.
+ *  dispatch_ok — принят ли GitHub'ом dispatch (HTTP 204) — это ПРИЁМ, не запуск
+ *  (см. docstring pulseHealthy). run_confirmed — появился ли реальный run
+ *  orchestra.yml после ПРЕДЫДУЩЕГО принятого dispatch'а: null (рано судить,
+ *  ещё не было следующего тика или fetch не удался), true/false. */
+export interface PulseStatus {
+  ts: number;
+  dispatch_ok: boolean;
+  detail: string | null;
+  run_confirmed: boolean | null;
+}
+
+/** То же самое плюс last_run_id — baseline id run'а orchestra.yml, замеченный
+ *  на момент записи этой строки, для сверки на следующем тике
+ *  (confirmPreviousRun). Внутреннее представление хранилища, наружу (Status)
+ *  не течёт — фронту это число не нужно. */
+interface StoredPulse extends PulseStatus {
+  last_run_id: number | null;
+}
+
 export interface Status {
   now: number;
   heartbeat_fresh_ms: number;
@@ -76,8 +104,7 @@ export interface Status {
   last_event_id: number;
   /** Watchdog (#7): задачи, висящие в dispatched дольше порога без рук. */
   stale_dispatch: { count: number; oldest_age_ms: number | null };
-  /** Пульс оркестрации (#269): исход последней попытки alarm() дёрнуть orchestra. */
-  last_pulse: { ts: number; dispatch_ok: boolean; detail: string | null } | null;
+  last_pulse: PulseStatus | null;
   /** Предвычислено сервером — фронту не нужно знать пороги (те же соображения,
    *  что у hands_alive). См. pulseHealthy. */
   pulse_healthy: boolean;
@@ -100,12 +127,16 @@ export function dshEdgeUpdateDecision(
 
 /**
  * Один dispatch-тик оркестратора (issue #269). Никогда не бросает — исход
- * упакован в объект: единственное доказательство запуска — HTTP 204 от GitHub
- * (docs/research/21-github-actions.md: «успешный HTTP-код — не доказательство
- * запуска»). До этой правки статус ответа вообще не проверялся: 403 (вторичный
- * rate-limit GitHub, 500/час) или 404 (протухший токен/репо) тонули как «успех»,
- * потому что fetch() не бросает на HTTP-ошибках сам по себе — бросает только
- * сеть. fetchImpl инъецируется, чтобы тест не ходил в реальный GitHub.
+ * упакован в объект: HTTP 204 от GitHub доказывает только ПРИЁМ dispatch'а,
+ * не запуск (docs/research/21-github-actions.md, «🔴 Ловушка: файл обязан
+ * лежать на default branch» — workflow в feature-ветке даёт 204 и ничего не
+ * происходит: «успешный HTTP-код здесь не является доказательством запуска»).
+ * До этой правки статус ответа вообще не проверялся: 403 (вторичный
+ * rate-limit GitHub, 500/час) или 404 (протухший токен/репо) тонули как
+ * «успех», потому что fetch() не бросает на HTTP-ошибках сам по себе —
+ * бросает только сеть. Настоящее доказательство запуска — появление нового
+ * run'а orchestra.yml, это проверяет confirmPreviousRun() на следующем тике
+ * (см. alarm()). fetchImpl инъецируется, чтобы тест не ходил в реальный GitHub.
  */
 export async function attemptOrchestraDispatch(
   token: string,
@@ -135,6 +166,52 @@ export async function attemptOrchestraDispatch(
   }
 }
 
+/**
+ * id последнего run'а orchestra.yml — единственный способ отличить «GitHub
+ * принял dispatch» от «GitHub принял dispatch и правда что-то запустил»
+ * (issue #269, находка ревью). `null`, если запрос не удался или run'ов ещё
+ * не было вовсе — вызывающий код обязан считать это «рано/нечем судить», а не
+ * «run не появился». fetchImpl инъецируется — тест не ходит в реальный GitHub.
+ */
+export async function fetchLatestOrchestraRunId(
+  token: string,
+  repo: string,
+  fetchImpl: typeof fetch,
+): Promise<number | null> {
+  try {
+    const res = await fetchImpl(
+      `${GITHUB.apiBase}/repos/${repo}/actions/workflows/${HEARTBEAT.orchestraWorkflow}/runs?per_page=1`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+      },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { workflow_runs?: Array<{ id: number }> };
+    return body.workflow_runs?.[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Подтверждение ПРЕДЫДУЩЕГО принятого dispatch'а (issue #269, находка ревью):
+ * baseline — id последнего run'а orchestra.yml, замеченный ДО того dispatch'а;
+ * latest — id последнего run'а на момент ЭТОГО тика. Появился новый run —
+ * baseline и latest различаются (id только растут, поэтому строгое сравнение
+ * без гонки за направлением). `null` — baseline или latest неизвестны (fetch
+ * не удался, либо это самый первый тик и подтверждать ещё нечего) — тогда
+ * решение «рано судить», а не «не подтверждено».
+ */
+export function confirmPreviousRun(baseline: number | null, latest: number | null): boolean | null {
+  if (baseline === null || latest === null) return null;
+  return latest !== baseline;
+}
+
 export function handsAreAlive(now: number, lastHeartbeatTs: number | null): boolean {
   return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
 }
@@ -144,16 +221,18 @@ export function handsAreAlive(now: number, lastHeartbeatTs: number | null): bool
  *  - тика ещё не было (холодный старт DO — не повод кричать до первой попытки);
  *  - секретов нет («возможности нет» — конфигурация, а не поломка, отличать от
  *    «возможность есть, но сломана» обязательно: лечатся по-разному);
- *  - последняя попытка dispatch'а удалась И была не раньше двух тактов назад —
- *    один пропущенный такт не тревога, а вот подвисший на дольше alarm — уже да.
+ *  - GitHub принял dispatch (HTTP 204) И это не единственное доказательство —
+ *    run_confirmed не должен быть явно false (принят, но запуск не появился —
+ *    находка ревью: 204 доказывает приём, не запуск; частый виновник —
+ *    workflow-файл не на default branch, docs/research/21-github-actions.md);
+ *  - последняя попытка была не раньше двух тактов назад — один пропущенный
+ *    такт не тревога, а вот подвисший на дольше alarm — уже да.
  */
-export function pulseHealthy(
-  now: number,
-  lastPulse: { ts: number; dispatch_ok: boolean; detail: string | null } | null,
-): boolean {
+export function pulseHealthy(now: number, lastPulse: PulseStatus | null): boolean {
   if (lastPulse === null) return true;
-  if (lastPulse.detail === "not_configured") return true;
+  if (lastPulse.detail === HEARTBEAT.notConfiguredDetail) return true;
   if (!lastPulse.dispatch_ok) return false;
+  if (lastPulse.run_confirmed === false) return false;
   return now - lastPulse.ts < HEARTBEAT.selfOrchestrationMs * 2;
 }
 
@@ -407,10 +486,7 @@ export class Harness extends DurableObject<Env> {
       ),
     )[0];
     const hbTs = hb ? Number(hb.ts) : null;
-    const pulseRow = this.#rows(this.#sql.exec("SELECT ts, dispatch_ok, detail FROM pulse WHERE id = 1"))[0];
-    const lastPulse = pulseRow
-      ? { ts: Number(pulseRow.ts), dispatch_ok: Number(pulseRow.dispatch_ok) === 1, detail: pulseRow.detail === null ? null : String(pulseRow.detail) }
-      : null;
+    const lastPulse = this.#getPulse();
     return {
       now,
       heartbeat_fresh_ms: LIMITS.heartbeatFreshMs,
@@ -639,16 +715,27 @@ export class Harness extends DurableObject<Env> {
     if (!token || !repo) {
       // «Возможности нет» — не поломка, но и не тишина: видно в /api/status, что
       // секретов нет, а не гадать по отсутствию прогонов оркестратора.
-      this.#recordPulse(false, "not_configured");
+      this.#recordPulse(false, HEARTBEAT.notConfiguredDetail, null, null);
       return;
     }
+    const previous = this.#getStoredPulse();
+    // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
+    // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
+    // baseline для следующего тика — и одновременно сверяем, появился ли новый
+    // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
+    // всегда на такт позже, а не блокирует этот alarm).
+    const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
+    const runConfirmed =
+      previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
     const result = await attemptOrchestraDispatch(token, repo, fetch);
-    this.#recordPulse(result.ok, result.detail);
-    if (!result.ok) {
+    this.#recordPulse(result.ok, result.detail, latestRunId, runConfirmed);
+    if (!result.ok || runConfirmed === false) {
       // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
       // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
       // который никто не смотрит между дедами (fail loud, issue #269).
-      console.log(`heartbeat dispatch failed: ${result.detail}`);
+      console.log(
+        `heartbeat dispatch: accepted=${result.ok} detail=${result.detail} run_confirmed=${runConfirmed}`,
+      );
     }
     try {
       await this.#checkDshEdgeUpdate(token, repo);
@@ -657,20 +744,50 @@ export class Harness extends DurableObject<Env> {
     }
   }
 
+  /** Текущая строка пульса (issue #269), полное внутреннее представление —
+   *  единственное место чтения, делят #status() (через #getPulse) и alarm()
+   *  (baseline для confirmPreviousRun). */
+  #getStoredPulse(): StoredPulse | null {
+    const row = this.#rows(
+      this.#sql.exec("SELECT ts, dispatch_ok, detail, last_run_id, run_confirmed FROM pulse WHERE id = 1"),
+    )[0];
+    if (!row) return null;
+    return {
+      ts: Number(row.ts),
+      dispatch_ok: Number(row.dispatch_ok) === 1,
+      detail: row.detail === null ? null : String(row.detail),
+      last_run_id: row.last_run_id === null ? null : Number(row.last_run_id),
+      run_confirmed: row.run_confirmed === null ? null : Number(row.run_confirmed) === 1,
+    };
+  }
+
+  /** Проекция для #status()/pulseHealthy — last_run_id наружу не течёт, фронту
+   *  это число не нужно (см. StoredPulse). */
+  #getPulse(): PulseStatus | null {
+    const row = this.#getStoredPulse();
+    if (!row) return null;
+    const { last_run_id: _lastRunId, ...pulse } = row;
+    return pulse;
+  }
+
   /** Единственное место, где обновляется видимый исход пульса (issue #269). */
-  #recordPulse(ok: boolean, detail: string | null): void {
+  #recordPulse(ok: boolean, detail: string | null, lastRunId: number | null, runConfirmed: boolean | null): void {
     this.#sql.exec(
-      `INSERT INTO pulse (id, ts, dispatch_ok, detail) VALUES (1, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, dispatch_ok = excluded.dispatch_ok, detail = excluded.detail`,
+      `INSERT INTO pulse (id, ts, dispatch_ok, detail, last_run_id, run_confirmed) VALUES (1, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, dispatch_ok = excluded.dispatch_ok,
+         detail = excluded.detail, last_run_id = excluded.last_run_id, run_confirmed = excluded.run_confirmed`,
       Date.now(),
       ok ? 1 : 0,
       detail,
+      lastRunId,
+      runConfirmed === null ? null : runConfirmed ? 1 : 0,
     );
   }
 
   /** #73: морда dsh-edge должна быть последней версии. Сверяем версию, которую
    *  отдаёт её публичный /api/health, с latest в npm; расхождение при истёкшем
-   *  троттле → workflow_dispatch деплой-воркфлоу. GitHub'овский cron не тикает,
+   *  троттле → workflow_dispatch деплой-воркфлоу. GitHub'овский `schedule` на
+   *  этом репозитории ненадёжен (см. HEARTBEAT, замер docs/research/21),
    *  поэтому живём на пульсе. Любой сбой здесь не роняет пульс: тик уже
    *  перезаложен, ошибка уходит в observability. */
   async #checkDshEdgeUpdate(token: string, repo: string): Promise<void> {

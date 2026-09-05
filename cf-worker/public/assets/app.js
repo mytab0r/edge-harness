@@ -166,9 +166,18 @@ function renderStatus(status) {
   // Пульс оркестрации (#269): раньше сбой dispatch'а был виден только вживую в
   // tail, теперь сервер сам решает «здоров ли пульс» (pulse_healthy) — фронту
   // остаётся только показать причину из last_pulse.detail.
-  if (!status.pulse_healthy) {
+  // «Возможности нет» (секреты не заданы) — здоров по pulse_healthy, но это не
+  // то же самое, что «пульс работает»: бейдж не должен молчать так же, как при
+  // реальном здоровье — иначе «возможности нет» и «возможность есть, но не
+  // проверялась» неотличимы (находка ревью, тот же класс, что #hands/#watchdog).
+  if (status.last_pulse && status.last_pulse.detail === "not_configured") {
+    $("pulse").textContent = t("pulse.not_configured");
+    $("pulse").className = "badge warn";
+    $("pulse").hidden = false;
+  } else if (!status.pulse_healthy) {
     const minutes = Math.round((status.now - status.last_pulse.ts) / 60000);
     $("pulse").textContent = t("pulse.unhealthy", { detail: status.last_pulse.detail, minutes });
+    $("pulse").className = "badge bad";
     $("pulse").hidden = false;
   } else {
     $("pulse").hidden = true;
