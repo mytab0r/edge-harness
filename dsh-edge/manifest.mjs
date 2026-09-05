@@ -110,24 +110,31 @@ export async function loadManifestWithForgeExtra(repoRoot) {
   failUnless(typeof extra.server === 'boolean' && typeof extra.client === 'boolean',
     'FORGE_EXTRA_PLUGIN: server and client must be booleans.')
   failUnless(extra.server || extra.client, 'FORGE_EXTRA_PLUGIN: at least one of server/client must be true.')
-  failUnless(!manifest.plugins.some(p => p.id === extra.id),
-    `FORGE_EXTRA_PLUGIN: id "${extra.id}" already present in dsh-edge/plugins.json.`)
 
-  return {
-    ...manifest,
-    plugins: [
-      ...manifest.plugins,
-      {
-        id: extra.id,
-        package: extra.package,
-        // Дым офлайн, релиз ещё не существует на этом шаге форжа — заглушка
-        // валидной формы, не используемая ни кодогенератором, ни гвардией.
-        source: { release: 'forge-smoke-placeholder', asset: 'forge-smoke-placeholder.tgz', sha256: '0'.repeat(64) },
-        server: extra.server,
-        client: extra.client,
-      },
-    ],
+  const entry = {
+    id: extra.id,
+    package: extra.package,
+    // Дым офлайн, релиз ещё не существует на этом шаге форжа — заглушка
+    // валидной формы, не используемая ни кодогенератором, ни гвардией.
+    source: { release: 'forge-smoke-placeholder', asset: 'forge-smoke-placeholder.tgz', sha256: '0'.repeat(64) },
+    server: extra.server,
+    client: extra.client,
   }
+
+  // Бамп версии УЖЕ установленного плагина — главный цикл форжа, а не только
+  // добавление нового: id почти всегда уже есть в манифесте (hello-world,
+  // runner-bridge, plugin-manager, integrations — на момент этого коммита все
+  // четыре). Раньше повторный id тут бросал throw, дым красил job ДО шага PR,
+  // и весь апсерт-путь `MANIFEST |= {...}` в plugin-forge.yml оставался мёртвым
+  // кодом — до него ни разу не доезжали (находка AI-ревью PR #273). Апсерт
+  // зеркалит jq-логику PR-шага: существующая запись заменяется целиком, а не
+  // добавляется вторая с тем же id.
+  const existingIndex = manifest.plugins.findIndex(p => p.id === extra.id)
+  const plugins = existingIndex === -1
+    ? [...manifest.plugins, entry]
+    : manifest.plugins.map((p, i) => (i === existingIndex ? entry : p))
+
+  return { ...manifest, plugins }
 }
 
 const CATALOG_VERSION = 1

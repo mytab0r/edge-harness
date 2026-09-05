@@ -267,12 +267,16 @@ jobs:
 
       - name: plugin_status → ready (forge done)
         # Финальный ready — БЕЗ continue-on-error (симметрично deploy-dsh-edge.yml:
-        # там на финальном ready его тоже нет, только на промежуточных статусах).
-        # plugin_status.sh при FINAL=1 сам делает exit 1, если журнал недоступен
-        # или не принял событие — это должно красить job (fail loud: деплой без
+        # там на финальном ready его тоже нет, только на промежуточных статусах),
+        # и БЕЗ `if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''` — этот `if`
+        # был на промежуточных статусах и случайно скопирован сюда: при пустых
+        # vars/secrets шаг молча пропускался бы, job зелёный, события в журнале
+        # нет — ровно silent-wrong, от которого обещает защищать комментарий ниже
+        # (находка AI-ревью PR #273). plugin_status.sh при FINAL=1 сам делает
+        # exit 1, если журнал недоступен, HARNESS_URL/HANDS_TOKEN не заданы или
+        # событие не принято — это должно красить job (fail loud: деплой без
         # ready/failed события в журнале = silent-wrong, design.md). Находка
         # AI-ревью PR #162.
-        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
         env:
           HARNESS_URL: ${{ vars.HARNESS_URL }}
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
@@ -393,7 +397,11 @@ jobs:
           echo "Тарболл: ${{ steps.pack.outputs.asset }} (sha256: ${{ steps.pack.outputs.sha256 }})"
           echo "PR: ${{ steps.pr.outputs.pr_url }}"
           echo ""
-          echo "Следующий шаг: ревью и мёрж PR. После мержа deploy-dsh-edge.yml соберёт и задеплоит морду с плагином."
+          # deploy-dsh-edge.yml НЕ триггерится на push в main (только schedule/
+          # workflow_dispatch, см. PR-body «Пост-мерж проверка») — тот же текст,
+          # что и в теле авто-PR ниже; было рассинхронизировано (находка AI-ревью
+          # PR #273: лог обещал автодеплой, которого не будет).
+          echo "Следующий шаг: ревью и мёрж PR. Деплой — НЕ автоматический: после мержа либо дождаться ежедневного schedule deploy-dsh-edge.yml, либо запустить его вручную (gh workflow run deploy-dsh-edge)."
 
   # Если форж упал — постим failed статус
   forge-failed:
@@ -402,6 +410,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Без чекаута scripts/plugins/plugin_status.sh не существует в воркспейсе:
+      # вызов ниже падал бы всегда, а `|| true` эту постоянную ошибку маскировал —
+      # финальный failed-статус молча не доезжал до журнала (находка AI-ревью PR
+      # #273, тот же класс, что #271: silent-wrong под `|| true`).
+      - uses: actions/checkout@v7
+
       - name: plugin_status → failed
         if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
         env:
