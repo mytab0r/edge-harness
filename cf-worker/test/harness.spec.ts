@@ -1096,7 +1096,8 @@ describe("inbox: сообщения владельца", () => {
     const badBody = await bad.json<{ error: { code: string } }>();
     expect(badBody.error.code).toBe("bad_json");
 
-    // Пустое тело — легально: значения по умолчанию.
+    // Пустое тело — легально ТОЛЬКО у process (единственный маршрут с
+    // опциональным телом): значения по умолчанию.
     const empty = await WORKER.fetch("https://example.com/api/messages/process", {
       method: "POST",
       headers: { ...AUTH },
@@ -1104,6 +1105,20 @@ describe("inbox: сообщения владельца", () => {
     expect(empty.status).toBe(200);
     const emptyBody = await empty.json<{ processed: number }>();
     expect(typeof emptyBody.processed).toBe("number");
+  });
+
+  it("пустой POST /api/tasks — громкий 400, а не молчаливая задача с dispatch (опциональное тело только у process, ревью head 7a21536)", async () => {
+    const empty = await WORKER.fetch("https://example.com/api/tasks", {
+      method: "POST",
+      headers: { ...AUTH },
+    });
+    expect(empty.status).toBe(400);
+    const body = await empty.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("bad_json");
+
+    // Мутация «вернуть if (!text.trim()) return {} в общий #parseJsonText»
+    // красит тест: пустой POST уходит в #postTask с опциональными полями,
+    // создаёт задачу и стреляет repository_dispatch — 200 с побочным эффектом.
   });
 
   it("ватчдог и водитель работают через публичный alarm(): зависший processing доводится, свежий new разбирается без ручного вызова", async () => {    const s = sender();

@@ -689,14 +689,18 @@ export class Harness extends DurableObject<Env> {
     return this.#parseJsonText(await request.text());
   }
 
-  /** Пустое тело — валидный пустой объект (маршруты с опциональным телом);
-   *  битый JSON — громкий 400, проглатывать его нигде нельзя (ревью PR #173:
-   *  единственный .catch(() => ({})) давал 200 с побочным эффектом). */
+  /** Битый JSON И пустое тело — громкий 400: пустой POST не должен молча
+   *  проходить валидацией «все поля опциональны» и давать побочный эффект
+   *  (ревью head 7a21536: пустой POST /api/tasks стрелял dispatch'ом).
+   *  Единственный маршрут с опциональным телом — POST /api/messages/process:
+   *  он сам допускает пустое тело, минуя этот общий путь. */
   #parseJsonText(text: string): Record<string, unknown> {
     if (text.length > LIMITS.bodyMaxBytes) {
       throw new ApiError(413, "too_large", { limit: LIMITS.bodyMaxBytes });
     }
-    if (!text.trim()) return {};
+    if (!text.trim()) {
+      throw new ApiError(400, "bad_json", { detail: msg("body_not_object") });
+    }
     try {
       const parsed: unknown = JSON.parse(text);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1741,10 +1745,12 @@ export class Harness extends DurableObject<Env> {
   }
 
   /** Ручной запуск разбора (админ/тесты). Основной водитель — пульс DO.
-   *  Тело опционально ({limit, retry_failed}), но битый JSON — честный 400:
+   *  Тело опционально — единственный такой маршрут (пустое тело = значения по
+   *  умолчанию, минуя общий #parseJsonText), но битый JSON — честный 400:
    *  молча трактовать его как «обработай всю очередь» нельзя (ревью PR #173). */
   async #processMessages(request: Request): Promise<Response> {
-    const body = this.#parseJsonText(await request.text());
+    const text = await request.text();
+    const body = text.trim() ? this.#parseJsonText(text) : {};
     const limit =
       typeof body.limit === "number" && Number.isFinite(body.limit)
         ? Math.min(Math.max(1, Math.trunc(body.limit)), MESSAGE_PROCESS_MAX)
