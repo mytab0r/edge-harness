@@ -18,30 +18,40 @@ patchedDependencies), и эта гвардия делает его возвра�
 невозможным — регресс красит CI, а не собирает тихо неверную морду.
 
 Правила:
-  1. deploy-dsh-edge.yml не ставит пакеты npm'ом: ни `npm install`, ни его
-     шорткат `npm i`, ни `npm ci`, ни `npm add` — в ЛЮБОЙ форме записи и
-     позиции: блочная `run: |` (голая строка), инлайн `- run: npm …`,
-     цепочка `cd … && npm install` (это единственный workflow, работающий
-     в pnpm-дереве dsh-edge). `npm pack` легален — он скачивает tarball
-     префаба во временный каталог и node_modules не трогает.
+  1. deploy-dsh-edge.yml и plugin-forge.yml не ставят пакеты npm'ом: ни
+     `npm install`, ни его шорткат `npm i`, ни `npm ci`, ни `npm add` — в
+     ЛЮБОЙ форме записи и позиции: блочная `run: |` (голая строка), инлайн
+     `- run: npm …`, цепочка `cd … && npm install` (это единственные два
+     workflow, работающие в pnpm-дереве dsh-edge — второй появился в
+     plugin-forge.yml, дым форжа ставит плагин в то же дерево тем же
+     маршрутом, находка AI-ревью PR #273). `npm pack` легален — он
+     скачивает tarball во временный каталог и node_modules не трогает.
   2. `--legacy-peer-deps` запрещён ВЕЗДЕ, где он вообще может появиться:
      все .github/workflows/*.yml|yaml и scripts/**/*.sh. Флаг — не решение
      peer-конфликта, а его маскировка (тот же класс); peer-конфликт чинится
      явным пином/исключением, а не молчаливым «поставь как нибудь».
      cf-worker и его `npm ci` в deploy-worker.yml не тронуты правилом 1:
      там своё npm-дерево с package-lock, pnpm-патчей нет.
-  3. pnpm-маршрут плагинов обязан оставаться на месте: шаг
-     `pnpm add --save-exact` (единственный установщик плагинов) и следующая
-     за ним проверка `patchedDependencies` в pnpm-workspace.yaml. Исчезла
-     проверка — `pnpm add` снова может потерять патчи молча (класс #43),
-     и CI обязан об этом крикнуть, а не довериться.
+  3. pnpm-маршрут плагинов обязан оставаться на месте В ОБОИХ workflow: шаг
+     `pnpm add --save-exact` (в deploy-dsh-edge.yml) / `pnpm --dir … add
+     --save-exact` (в plugin-forge.yml — форма с `--dir` вместо `cd`,
+     единственные установщики плагинов) и следующая за ним проверка
+     `patchedDependencies` в pnpm-workspace.yaml (путь к файлу разный —
+     `pnpm-workspace.yaml` при `cd`, `apps/dsh-edge/standalone/
+     pnpm-workspace.yaml` при `--dir` без `cd`). Исчезла проверка — `pnpm
+     add` снова может потерять патчи молча (класс #43), и CI обязан об
+     этом крикнуть, а не довериться.
 
-Область действия правила 1 — ровно deploy-dsh-edge.yml, потому что путь
-`clone/apps/dsh-edge/standalone` существует только внутри него; иных мест,
-где скрипты этого репозитория ставят пакеты в pnpm-дерево, нет (проверено
-grep по scripts/ при написании гвардии). Сопредельные npm-употребления —
-`npm install -g ./*.tgz` в scripts/lib/dsh-ci.sh (глобальная установка CLI
-раннера из локальных tarball'ов, не pnpm-дерево) — правилами не запрещены.
+Область действия правил 1 и 3 — deploy-dsh-edge.yml и plugin-forge.yml,
+потому что путь `.../apps/dsh-edge/standalone` (pnpm-дерево с обязательными
+патчами Workers) существует только внутри них; иных мест, где скрипты этого
+репозитория ставят пакеты в ЭТО pnpm-дерево, нет (проверено grep по
+scripts/ и .github/workflows/ при написании и расширении гвардии — находка
+AI-ревью PR #273: раньше в область входил только deploy-dsh-edge.yml, хотя
+plugin-forge.yml уже ставил пакеты туда же тем же классом риска). Сопредельные
+npm-употребления — `npm install -g ./*.tgz` в scripts/lib/dsh-ci.sh
+(глобальная установка CLI раннера из локальных tarball'ов, не pnpm-дерево) —
+правилами не запрещены.
 
 Запуск: python -m pytest scripts/lib/test_dsh_edge_pnpm_guard.py -q
 """
@@ -52,6 +62,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 DEPLOY_DSH_EDGE = WORKFLOWS / "deploy-dsh-edge.yml"
+PLUGIN_FORGE = WORKFLOWS / "plugin-forge.yml"
+# Оба workflow ставят пакеты в pnpm-дерево apps/dsh-edge/standalone с
+# обязательными для Workers патчами — правила 1 и 3 действуют на оба
+# (находка AI-ревью PR #273: изначально гвардия видела только deploy).
+PNPM_TREE_WORKFLOWS = (DEPLOY_DSH_EDGE, PLUGIN_FORGE)
 
 # npm как УСТАНОВЩИК пакетов (меняет node_modules): install/ci/add — включая
 # шорткат `i`. В deploy-dsh-edge.yml легального npm-установщика нет вовсе
@@ -74,9 +89,20 @@ NPM_INSTALLER_RE = re.compile(r"(?<![A-Za-z])npm\s+(?:install|i|ci|add)\b")
 MASKING_FLAG = "--legacy-peer-deps"
 
 # Правило 3: единственный легальный установщик плагинов и его страховка.
-PNPM_ADD_RE = re.compile(r"^\s*pnpm add --save-exact\b", re.M)
+# Две формы: deploy-dsh-edge.yml делает `cd clone/apps/dsh-edge/standalone`
+# заранее и зовёт `pnpm add --save-exact` без `--dir`; plugin-forge.yml не
+# меняет cwd и зовёт `pnpm --dir apps/dsh-edge/standalone add --save-exact`
+# — обе формы обязаны совпасть под одним регэкспом, иначе гвардия слепа на
+# вторую (находка AI-ревью PR #273).
+PNPM_ADD_RE = re.compile(
+    r"^\s*pnpm(?:\s+--dir\s+\S+)?\s+add\s+--save-exact\b", re.M
+)
+# Путь к pnpm-workspace.yaml тоже отличается формой (относительный от cwd в
+# deploy-dsh-edge.yml, с префиксом apps/dsh-edge/standalone/ в
+# plugin-forge.yml, где cwd — корень клона) — `\S*` перед именем файла ловит
+# обе формы, не только голое имя.
 PATCHED_GUARD_RE = re.compile(
-    r"^\s*grep -q [\"']patchedDependencies[\"'] pnpm-workspace\.yaml", re.M
+    r"^\s*grep -q [\"']patchedDependencies[\"'] \S*pnpm-workspace\.yaml", re.M
 )
 
 
@@ -111,25 +137,28 @@ def _workflow_files() -> list[Path]:
 
 
 def test_deploy_dsh_edge_never_installs_packages_with_npm():
-    """Правило 1: npm — не установщик пакетов в workflow деплоя dsh-edge."""
-    assert DEPLOY_DSH_EDGE.exists(), (
-        "deploy-dsh-edge.yml исчез или переименован — обнови путь в гвардии "
-        "сознательной правкой, а не молчаливым обходом"
-    )
-    text = DEPLOY_DSH_EDGE.read_text(encoding="utf-8")
-    offenders = [
-        f"строка {idx} — {line.strip()}"
-        for idx, line in _code_lines_numbered(text)
-        if NPM_INSTALLER_RE.search(line)
-    ]
-    assert not offenders, (
-        "deploy-dsh-edge.yml ставит пакеты npm'ом (класс #43): npm "
-        "переопределяет node_modules поверх pnpm-дерева standalone и теряет "
-        "семь обязательных для Workers pnpm-патчей — сборка пройдёт зелёной, "
-        f"но с бепатчными пакетами (молча неверная морда): {offenders}. "
-        "Зависимости dsh-edge ставь pnpm (pnpm add/install); npm pack для "
-        "скачивания префаба легален — дерево он не трогает"
-    )
+    """Правило 1: npm — не установщик пакетов ни в одном workflow, работающем
+    в pnpm-дереве dsh-edge (deploy-dsh-edge.yml и plugin-forge.yml)."""
+    for workflow in PNPM_TREE_WORKFLOWS:
+        assert workflow.exists(), (
+            f"{workflow.name} исчез или переименован — обнови путь в "
+            "гвардии сознательной правкой, а не молчаливым обходом"
+        )
+        text = workflow.read_text(encoding="utf-8")
+        offenders = [
+            f"строка {idx} — {line.strip()}"
+            for idx, line in _code_lines_numbered(text)
+            if NPM_INSTALLER_RE.search(line)
+        ]
+        assert not offenders, (
+            f"{workflow.name} ставит пакеты npm'ом (класс #43): npm "
+            "переопределяет node_modules поверх pnpm-дерева standalone и "
+            "теряет семь обязательных для Workers pnpm-патчей — сборка "
+            f"пройдёт зелёной, но с бепатчными пакетами (молча неверная "
+            f"морда): {offenders}. Зависимости dsh-edge ставь pnpm (pnpm "
+            "add/install); npm pack для скачивания tarball'а легален — "
+            "дерево он не трогает"
+        )
 
 
 def test_no_legacy_peer_deps_masking_anywhere():
@@ -151,19 +180,20 @@ def test_no_legacy_peer_deps_masking_anywhere():
 
 def test_deploy_dsh_edge_keeps_pnpm_plugin_route():
     """Правило 3: pnpm-маршрут плагинов (add --save-exact + проверка
-    patchedDependencies) обязан оставаться в workflow — исчезновение проверки
-    возвращает класс «pnpm add потерял патчи молча»."""
-    code = _code_lines(DEPLOY_DSH_EDGE.read_text(encoding="utf-8"))
-    assert PNPM_ADD_RE.search(code), (
-        "deploy-dsh-edge.yml потерял `pnpm add --save-exact` — установщик "
-        "плагинов ушёл с pnpm-маршрута (класс #43: чужой пакетный менеджер "
-        "поверх pnpm-дерева теряет обязательные патчи Workers)"
-    )
-    assert PATCHED_GUARD_RE.search(code), (
-        "deploy-dsh-edge.yml потерял проверку patchedDependencies после "
-        "pnpm add — `pnpm add` снова может потерять pnpm-патчи молча "
-        "(класс #43), и это обязано остаться красным шагом деплоя"
-    )
+    patchedDependencies) обязан оставаться в ОБОИХ workflow — исчезновение
+    проверки возвращает класс «pnpm add потерял патчи молча»."""
+    for workflow in PNPM_TREE_WORKFLOWS:
+        code = _code_lines(workflow.read_text(encoding="utf-8"))
+        assert PNPM_ADD_RE.search(code), (
+            f"{workflow.name} потерял `pnpm add --save-exact` — установщик "
+            "плагинов ушёл с pnpm-маршрута (класс #43: чужой пакетный "
+            "менеджер поверх pnpm-дерева теряет обязательные патчи Workers)"
+        )
+        assert PATCHED_GUARD_RE.search(code), (
+            f"{workflow.name} потерял проверку patchedDependencies после "
+            "pnpm add — `pnpm add` снова может потерять pnpm-патчи молча "
+            "(класс #43), и это обязано остаться красным шагом"
+        )
 
 
 # Мутации, которыми доказана гвардия (каждая — красный тест, возврат — зелёный;

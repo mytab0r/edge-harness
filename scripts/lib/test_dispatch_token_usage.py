@@ -17,8 +17,9 @@ runner-bridge — сузили токен, сломали конвейер. Ра
      (`wrangler secret put GH_DISPATCH_TOKEN`) — иначе узкий токен не доедет
      до воркера, и морда молча останется на старом значении.
   3. Бывшие широкие потребители (worker, orchestra, deploy-dsh-edge,
-     dispatch-latency-probe) обязаны читать `secrets.GH_PIPELINE_PAT` —
-     исчезновение источника PAT замечается здесь, а не 401 на первом пуше.
+     dispatch-latency-probe, plugin-forge) обязаны читать
+     `secrets.GH_PIPELINE_PAT` — исчезновение источника PAT замечается здесь,
+     а не 401 на первом пуше.
 
 Запуск: python -m pytest scripts/lib/test_dispatch_token_usage.py -q
 """
@@ -40,10 +41,14 @@ PIPELINE_SECRET = "secrets.GH_PIPELINE_PAT"
 DISPATCH_CONSUMER = "deploy-worker.yml"
 
 # Бывшие скваттеры широкого PAT: их миграция на GH_PIPELINE_PAT — часть задачи #6.
+# plugin-forge.yml (#77) — тот же класс: PR с обновлением plugins.json обязан
+# идти под широким PAT, иначе GITHUB_TOKEN-пуш не зажигает test/CodeQL/review/
+# contract на самом себе (защита GitHub от рекурсии workflow).
 PIPELINE_CONSUMERS = [
     "deploy-dsh-edge.yml",
     "dispatch-latency-probe.yml",
     "orchestra.yml",
+    "plugin-forge.yml",
     "worker.yml",
 ]
 
@@ -58,6 +63,7 @@ EXPECTED_WORKFLOWS = frozenset({
     "dispatch-latency-probe.yml",
     "hands.yml",
     "orchestra.yml",
+    "plugin-forge.yml",
     "pr-review.yml",
     "repo-ci.yml",
     # Восстановлен в #72 (ворота CI морды по ADR 0004). Репо-секретов не читает
