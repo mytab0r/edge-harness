@@ -226,6 +226,30 @@ def pause_notification_pending(marker_times: list[datetime], last_success_at: da
 # ── Чистые решения: возраст пульса ───────────────────────────────────────────────
 
 
+def real_orchestra_ticks(runs: list[dict]) -> list[dict]:
+    """Прогоны РЕАЛЬНОГО job'а `orchestra` (schedule/workflow_dispatch), не
+    `contract` того же файла (issue #133, живой замер 2026-09-05).
+
+    `orchestra.yml` несёт два job'а: `contract` — на КАЖДЫЙ `pull_request`,
+    быстрая проверка контракта PR↔задача, ничего общего с пульсом планировщика
+    (`if: github.event_name == 'pull_request'`); `orchestra` — сам
+    планировщик (мерж-очередь, предохранитель, ЭТОТ watchdog) — только на
+    `schedule`/`workflow_dispatch` (`if: github.event_name != 'pull_request'`).
+    `heartbeat_check` до этой правки брал последний success БЕЗ учёта
+    события: частые зелёные `contract`-прогоны (от параллельных PR нескольких
+    агентов, десятки в час) маскировали то, что job `orchestra` не
+    запускался часами — ровно тогда, когда наблюдатель нужнее всего (тот же
+    класс силент-неправды, что #303 уже закрыл в `fetchLatestOrchestraRunId`
+    фильтром `event=workflow_dispatch`, только там событие ровно одно
+    легитимное, а здесь два: `schedule` И `workflow_dispatch`, поэтому
+    фильтр — исключение `pull_request`, а не единственное разрешённое
+    значение). Живая улика: 2026-09-05, DO-пульс (`workflow_dispatch`) не
+    создавал ран orchestra.yml с 04:35 до как минимум 14:24 (~9ч49м при
+    цикле 15 мин), а `heartbeat_check` не закричал ни разу — маскировали
+    непрерывные `pull_request`-прогоны `contract`."""
+    return [run for run in runs if run.get("event") != "pull_request"]
+
+
 def heartbeat_age_minutes(last_success_at: str | datetime, now: datetime) -> float:
     if isinstance(last_success_at, str):
         last_success_at = parse_time(last_success_at)
@@ -420,11 +444,16 @@ def escalate(repo: str, issue_number: int, text: str) -> str:
 def heartbeat_check(repo: str, now: datetime) -> list[str]:
     """«Кто следит за следящим»: вызывается КАЖДЫМ запуском планировщика до всей
     остальной работы. Опоздавший запуск — единственный, кто может закричать о
-    пропавших пульсах, поэтому проверка первая."""
-    runs = recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=5)
+    пропавших пульсах, поэтому проверка первая.
+
+    per_page=100 (потолок GitHub на страницу), а не 5: `contract` того же
+    файла может дать десятки прогонов между двумя настоящими тиками
+    `orchestra` (см. real_orchestra_ticks) — короткой выборки не хватает,
+    чтобы дотянуться до последнего реального успеха сквозь них."""
+    runs = real_orchestra_ticks(recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=100))
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     if last_ok is None:
-        return [f"ℹ️ успешных прогонов {ORCHESTRA_WORKFLOW} не найдено — возраст пульса не оценить"]
+        return [f"ℹ️ успешных прогонов {ORCHESTRA_WORKFLOW} (не pull_request) не найдено — возраст пульса не оценить"]
     age = heartbeat_age_minutes(last_ok["created_at"], now)
     if decide_heartbeat(last_ok["created_at"], now) == "ok":
         return [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "

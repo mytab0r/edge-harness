@@ -24,14 +24,17 @@ def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
 
-def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run"):
-    """Прод-форма элемента workflow_runs (поля, которые читает модуль)."""
+def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch"):
+    """Прод-форма элемента workflow_runs (поля, которые читает модуль).
+    event по умолчанию — workflow_dispatch (реальный тик), чтобы существующие
+    тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать."""
     return {
         "id": run_id,
         "conclusion": conclusion,
         "created_at": created_at,
         "html_url": f"https://github.com/mytab0r/edge-harness/actions/runs/{run_id}",
         "display_title": title,
+        "event": event,
     }
 
 
@@ -333,6 +336,50 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 1))
     assert len(sent) == 1 and "пропадал" in sent[0]
     assert any("пропадал" in line for line in lines)
+
+
+# ── #133: contract (pull_request) не маскирует пропавший пульс orchestra ────────
+
+
+def test_real_orchestra_ticks_drops_pull_request_runs():
+    runs = [
+        run("success", "2026-09-05T14:19:00Z", 1, event="pull_request"),
+        run("success", "2026-09-05T13:32:00Z", 2, event="schedule"),
+        run("success", "2026-09-05T04:35:00Z", 3, event="workflow_dispatch"),
+    ]
+    ticks = pg.real_orchestra_ticks(runs)
+    assert [t["id"] for t in ticks] == [2, 3]
+
+
+def test_heartbeat_check_blind_to_pull_request_contract_runs_mutation_guard(monkeypatch):
+    # Живая форма #133 (замер 2026-09-05): job orchestra (workflow_dispatch)
+    # не бежал ~9ч49м, но между ним и «сейчас» — россыпь зелёных pull_request
+    # прогонов job'а contract. Без фильтра last_ok подхватил бы самый свежий
+    # pull_request-прогон и heartbeat_check остался бы тихим — ровно тот
+    # силент-баг, который держал наблюдателя слепым в проде.
+    runs = {"workflow_runs": [
+        run("success", "2026-09-05T14:19:02Z", 10, event="pull_request"),
+        run("success", "2026-09-05T14:01:22Z", 9, event="pull_request"),
+        run("success", "2026-09-05T13:51:26Z", 8, event="pull_request"),
+        run("success", "2026-09-05T04:35:49Z", 1, event="workflow_dispatch"),
+    ]}
+    fake = FakeGh({"workflows/orchestra.yml/runs": runs, "issues/120/comments": []})
+    monkeypatch.setattr(pg, "gh", fake)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+
+    now = utc(2026, 9, 5, 14, 24, 0)
+    lines = pg.heartbeat_check("mytab0r/edge-harness", now)
+    assert len(sent) == 1 and "пропадал" in sent[0]
+    assert any("пропадал" in line for line in lines)
+
+    # Мутация: без фильтра (как раньше) last_ok — самый свежий success ЛЮБОГО
+    # события, то есть pull_request-прогон 14:19:02 — 5 минут назад, ниже
+    # порога HEARTBEAT_MAX_AGE_MINUTES=45 — heartbeat_check красит тест выше
+    # молчанием. Доказываем это явно на тех же данных без фильтра.
+    unfiltered_last_ok = next(r for r in runs["workflow_runs"] if r["conclusion"] == "success")
+    assert pg.decide_heartbeat(unfiltered_last_ok["created_at"], now) == "ok"
 
 
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
