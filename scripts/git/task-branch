@@ -61,23 +61,61 @@ wt_dir="$main_root/.claude/worktrees/$task"
 # Уже есть worktree на эту ветку (повторный запуск на той же задаче) —
 # переиспользуем его, а не пытаемся завести дубль (git worktree add откажет
 # сам, но сообщение должно указывать путь, а не сырой git-эксепшн).
+#
+# Только под .claude/worktrees/ (находка ревью #333): главная запись
+# `worktree list` (корень репозитория) не годится — это и есть инцидент
+# #332 (ветка задачи зачекаучена в главном дереве). Легализовать его тут
+# значило бы тут же противоречить .githooks/pre-commit, которая коммит из
+# главного дерева на agent/<N>-* отклонит. Ветка вне .claude/worktrees/ —
+# заводим отдельное дерево по правилу, а не переиспользуем чужое место.
 existing_path=""
 while IFS= read -r line; do
   case "$line" in
     worktree\ *) cur_path="${line#worktree }" ;;
-    branch\ refs/heads/"$branch") existing_path="$cur_path" ;;
+    branch\ refs/heads/"$branch")
+      case "$cur_path" in
+        "$main_root"/.claude/worktrees/*) existing_path="$cur_path" ;;
+      esac
+      ;;
   esac
 done < <(git worktree list --porcelain)
 
 if [ -n "$existing_path" ]; then
-  echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
-  echo "$existing_path"
-  exit 0
+  if [ -d "$existing_path" ]; then
+    echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
+    echo "$existing_path"
+    exit 0
+  fi
+  # Протухшая запись (находка ревью #333): каталог стёрт мимо
+  # `git worktree remove` — не молчать и не выдавать путь в никуда, а
+  # вычистить запись и завести дерево заново.
+  echo "Рабочее дерево $existing_path пропало с диска — чищу протухшую запись и завожу заново." >&2
+  git worktree prune
 fi
 
 if git rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
-  # Ветка существует, но ни в одном дереве не зачекаучена (осиротела) —
-  # заводим дерево на неё, не создавая вторую ветку.
+  # Ветка существует, но нужного дерева под .claude/worktrees/ нет. Если она
+  # при этом зачекаучена ГДЕ-ТО ещё (например прямо в главном дереве —
+  # инцидент #332) — не легализуем это молча (находка ревью #333):
+  # `git worktree add` на такую ветку упадёт сырым git-фаталом, здесь —
+  # понятная ошибка с указанием, где ветка застряла.
+  checked_out_elsewhere=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) cur_path="${line#worktree }" ;;
+      branch\ refs/heads/"$branch") checked_out_elsewhere="$cur_path" ;;
+    esac
+  done < <(git worktree list --porcelain)
+  if [ -n "$checked_out_elsewhere" ]; then
+    echo "ОШИБКА: ветка $branch уже зачекаучена вне .claude/worktrees/:" >&2
+    echo "  $checked_out_elsewhere" >&2
+    echo "Не переиспользую чужое место (класс #332) — перенеси ветку туда самостоятельно:" >&2
+    echo "  git -C \"$checked_out_elsewhere\" switch - (вернуть исходную ветку)" >&2
+    echo "  git worktree add \"$wt_dir\" $branch" >&2
+    exit 1
+  fi
+  # Осиротела (нигде не зачекаучена) — заводим дерево на неё, не создавая
+  # вторую ветку.
   git worktree add "$wt_dir" "$branch"
 else
   mkdir -p "$(dirname "$wt_dir")"

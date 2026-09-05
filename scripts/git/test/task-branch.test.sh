@@ -10,10 +10,17 @@
 #   3) в CI (GITHUB_ACTIONS=true) — старое поведение: переключает ветку
 #      прямо в текущем каталоге, worktree не заводит (обратная совместимость
 #      с scripts/worker/task.sh, который сам работает в одноразовом чекауте).
+#   4) стык с гвардией (находка ревью #333): после переключения ветки в
+#      CI-режиме коммит настоящим .githooks/pre-commit обязан проходить —
+#      без этого случая тест-1 (CI-режим task-branch) и тест
+#      worktree-guard.test.sh (гвардия вне CI) проверяют половины отдельно,
+#      а стык — коммит после CI-переключения под настоящим хуком — не
+#      покрывает никто.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_SRC="$REPO_ROOT/scripts/git/task-branch"
+HOOK_SRC="$REPO_ROOT/.githooks/pre-commit"
 
 WORK="$(mktemp -d)"
 cleanup() { rm -rf "$WORK"; }
@@ -98,7 +105,34 @@ else
   fail=1
 fi
 
+
+# ── случай 4: после CI-переключения коммит настоящим хуком обязан пройти ────
+new_origin "c"
+git clone -q --branch main "$WORK/c-origin.git" "$WORK/c-main" 2>/dev/null
+cp "$SCRIPT_SRC" "$WORK/c-main/task-branch"
+chmod +x "$WORK/c-main/task-branch"
+mkdir -p "$WORK/c-main/.githooks"
+cp "$HOOK_SRC" "$WORK/c-main/.githooks/pre-commit"
+chmod +x "$WORK/c-main/.githooks/pre-commit"
+(cd "$WORK/c-main" && GITHUB_ACTIONS=true bash ./task-branch 77-ci-commit) \
+  >"$WORK/c-run.out" 2>&1 || { fail=1; note "случай 4: CI-переключение упало:"; cat "$WORK/c-run.out"; }
+(
+  cd "$WORK/c-main"
+  git config user.email test@example.com
+  git config user.name test
+  echo "change" >>note.txt
+  git add note.txt
+  GITHUB_ACTIONS=true git commit -q -m "ci commit after task-branch"
+) >"$WORK/c-commit.out" 2>"$WORK/c-commit.stderr"
+if [ -f "$WORK/c-commit.out" ] && grep -qF "ci commit after task-branch" <(git -C "$WORK/c-main" log -1 --format=%s 2>/dev/null); then
+  note "случай 4 (коммит после CI-переключения настоящим хуком): прошёл — ОК"
+else
+  note "случай 4 (коммит после CI-переключения настоящим хуком): ОТКЛОНЁН — ОШИБКА"
+  cat "$WORK/c-commit.stderr" >&2
+  fail=1
+fi
+
 if [ "$fail" = 0 ]; then
-  echo "task-branch: worktree заводится/переиспользуется вне CI, в CI поведение не изменилось"
+  echo "task-branch: worktree заводится/переиспользуется вне CI, в CI поведение не изменилось, стык с гвардией не ломается"
 fi
 exit "$fail"
