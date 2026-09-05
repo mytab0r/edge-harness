@@ -139,19 +139,29 @@ async function login(origin) {
   return response.headers.get('set-cookie')?.split(';', 1)[0]
 }
 
-/** Выбор протоколов так, как это делает клиент (protocolChoices). */
+/** Выбор протоколов ТОЧНО по тому пути, что клиент и registry.test.mjs
+ *  (providers → dict-запись → object → api), а не первый попавшийся union
+ *  где угодно в схеме (находка AI-ревью PR #237: union, случайно уехавший
+ *  с этого пути, давал бы ложный зелёный на мёртвой кнопке создания).
+ *  schemaJson — сырой {uid, refs} от Schema.prototype.toJSON (см.
+ *  @deepseek-ai/schemastery): refs[uid].dict/.inner/.list хранят UID'ы
+ *  дочерних узлов, не сами узлы — разрешаем на каждом шаге. */
 function protocolChoices(schemaJson) {
   const refs = schemaJson?.refs ?? {}
-  for (const node of Object.values(refs)) {
-    if (node?.type !== 'union' || !Array.isArray(node.list)) continue
-    const values = node.list
-      .map((uid) => refs[String(uid)])
-      .filter((member) => member?.type === 'const')
-      .map((member) => member.value)
-      .filter((value) => typeof value === 'string')
-    if (values.length > 0) return values
+  const ref = (uid) => (uid === undefined || uid === null ? undefined : refs[String(uid)])
+  let node = ref(schemaJson?.uid)
+  for (const key of ['providers', '\0probe', 'api']) {
+    if (!node) return []
+    if (node.type === 'object') node = ref(node.dict?.[key])
+    else if (node.type === 'dict' || node.type === 'array') node = ref(node.inner)
+    else return []
   }
-  return []
+  if (node?.type !== 'union' || !Array.isArray(node.list)) return []
+  return node.list
+    .map((uid) => ref(uid))
+    .filter((member) => member?.type === 'const')
+    .map((member) => member.value)
+    .filter((value) => typeof value === 'string')
 }
 
 // Состав directory-каталога читается из directory.json плагина — единственного

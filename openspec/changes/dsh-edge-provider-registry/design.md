@@ -376,7 +376,10 @@ proposal: реестр даёт данные и видимость, маршру
    резолвиться) — last-good + один громкий лог на версию раздела. Инсталл-статус
    `failed` в DO storage при падении всего apply пишется патчем 0002 как раньше.
 3. **Directory — статический каталог из четырёх маршрутов** (`zhipu`, `nvidia-nim`,
-   `openrouter`, `deepseek`; константа `DIRECTORY` в `plugins-src/provider-registry/server/index.js`)
+   `openrouter`, `deepseek`; единственное место правды —
+   `plugins-src/provider-registry/directory.json`, импортируется в
+   `server/index.js` как `DIRECTORY`, тот же файл читают юнит-тесты,
+   `dsh-edge/registry-integration/check.mjs` и канарейка деплоя)
    плюс все настроенные маршруты (включая произвольные из CustomProviderCard — иначе
    строка и кнопка Remove у них не появились бы). Дизайн называл directory «что можно
    настроить», состав не определял; выбраны провайдеры, названные в документах
