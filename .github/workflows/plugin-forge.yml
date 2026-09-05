@@ -383,29 +383,6 @@ jobs:
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: plugin_status → ready (forge done)
-        # Финальный ready — БЕЗ continue-on-error (симметрично deploy-dsh-edge.yml:
-        # там на финальном ready его тоже нет, только на промежуточных статусах),
-        # и БЕЗ `if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''` — этот `if`
-        # был на промежуточных статусах и случайно скопирован сюда: при пустых
-        # vars/secrets шаг молча пропускался бы, job зелёный, события в журнале
-        # нет — ровно silent-wrong, от которого обещает защищать комментарий ниже
-        # (находка AI-ревью PR #273). plugin_status.sh при FINAL=1 сам делает
-        # exit 1, если журнал недоступен, HARNESS_URL/HANDS_TOKEN не заданы или
-        # событие не принято — это должно красить job (fail loud: деплой без
-        # ready/failed события в журнале = silent-wrong, design.md). Находка
-        # AI-ревью PR #162.
-        env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
-          STATE: ready
-          SOURCE: forge
-          DETAIL: "релиз ${{ steps.release.outputs.release_tag }}, tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}"
-          FINAL: "1"
-        run: |
-          PLUGIN_ID="$PLUGIN_ID" STATE=ready SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh
-
       # ── 5. PR с обновлением plugins.json ────────────────────────────────────────
       - name: Подготовить PR с обновлением манифеста
         id: pr
@@ -436,9 +413,38 @@ jobs:
           BRANCH="forge/${PLUGIN_ID}-v${PLUGIN_VERSION}-$(date -u +%Y%m%dT%H%M%S)"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Между чекаутом в начале job'а и этим шагом лежат чеклист/сборка/
+          # дым — 10-20 минут; concurrency-группа задана по plugin_path, т.е.
+          # другие плагины форжатся ОДНОВРЕМЕННО и могут за это время смержить
+          # свою правку dsh-edge/plugins.json в main. Ветка обязана расти от
+          # СВЕЖЕГО main, а не от того, что видел actions/checkout на старте
+          # job'а: иначе jq ниже пересериализует устаревший манифест в
+          # идентичном формате, git не увидит конфликта при пуше — и авто-PR
+          # молча откатит чужую запись (находка AI-ревью PR #273).
+          git fetch origin main
           git switch -c "$BRANCH" origin/main
 
-          # Читаем текущий манифест
+          # Обе сверки занятости из шага «Валидация входа» — ЗАНОВО, по
+          # только что политянутому манифесту, а не по тому, что читался в
+          # начале job'а: за время чеклиста/сборки/дыма манифест мог
+          # измениться так, что прежний вывод validate больше не верен (тот
+          # же пакет успел появиться под другим id, или id занят другим
+          # пакетом). Совпало — бампаем ниже штатно; разошлось — падаем
+          # громко с внятным сообщением, а не молча переписываем чужую
+          # запись (тот же класс проверки, что и первичная сверка).
+          FRESH_MANIFEST_ID=$(jq -r --arg pkg "$PLUGIN_PACKAGE" '.plugins[] | select(.package == $pkg) | .id' dsh-edge/plugins.json)
+          if [ -n "$FRESH_MANIFEST_ID" ] && [ "$FRESH_MANIFEST_ID" != "$PLUGIN_ID" ]; then
+            echo "::error::Манифест изменился, пока форж собирался: пакет $PLUGIN_PACKAGE теперь в манифесте под id '$FRESH_MANIFEST_ID', а форж вычислил id '$PLUGIN_ID' — перезапустите форж с plugin_id=$FRESH_MANIFEST_ID"
+            exit 1
+          fi
+          FRESH_MANIFEST_PACKAGE=$(jq -r --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id) | .package' dsh-edge/plugins.json)
+          if [ -n "$FRESH_MANIFEST_PACKAGE" ] && [ "$FRESH_MANIFEST_PACKAGE" != "$PLUGIN_PACKAGE" ]; then
+            echo "::error::Манифест изменился, пока форж собирался: id '$PLUGIN_ID' теперь занят пакетом '$FRESH_MANIFEST_PACKAGE', а форж собирал пакет '$PLUGIN_PACKAGE' — запустите форж заново с другим plugin_id"
+            exit 1
+          fi
+
+          # Читаем текущий манифест (уже свежий — из git fetch выше)
           MANIFEST=$(cat dsh-edge/plugins.json)
 
           # Проверяем, есть ли уже плагин с таким id
@@ -520,6 +526,38 @@ jobs:
           PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: plugin_status → ready (forge done)
+        # Финальный ready — ПОСЛЕ шага «Подготовить PR», а не до него: ready
+        # означает «форж закончен», а форж не закончен, пока PR не создан.
+        # Раньше этот шаг стоял перед PR-шагом — упавший `gh pr create` (права
+        # PAT, rate limit) давал журналу пару событий «ready», а следом
+        # «failed» от job forge-failed, и таймлайн плагина врал: «форж
+        # закончен» объявлено до того, как он реально закончился (находка
+        # AI-ревью PR #273). Теперь упавшее создание PR даёт только failed,
+        # без предшествующего ready.
+        #
+        # БЕЗ continue-on-error (симметрично deploy-dsh-edge.yml: там на
+        # финальном ready его тоже нет, только на промежуточных статусах), и
+        # БЕЗ `if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''` — этот `if`
+        # был на промежуточных статусах и случайно скопирован сюда: при пустых
+        # vars/secrets шаг молча пропускался бы, job зелёный, события в журнале
+        # нет — ровно silent-wrong, от которого обещает защищать комментарий ниже
+        # (находка AI-ревью PR #273). plugin_status.sh при FINAL=1 сам делает
+        # exit 1, если журнал недоступен, HARNESS_URL/HANDS_TOKEN не заданы или
+        # событие не принято — это должно красить job (fail loud: деплой без
+        # ready/failed события в журнале = silent-wrong, design.md). Находка
+        # AI-ревью PR #162.
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: ready
+          SOURCE: forge
+          DETAIL: "релиз ${{ steps.release.outputs.release_tag }}, tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}, PR ${{ steps.pr.outputs.pr_url }}"
+          FINAL: "1"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=ready SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh
 
       - name: Итог
         run: |
