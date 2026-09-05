@@ -172,11 +172,12 @@ short_title() { # $1 — заголовок
 free_task() {
   local issues_file locked excluded line rc
   issues_file="$WORK/pool-issues.json"
-  # labels — находка AI-ревью PR #471/#470: free_candidates фильтрует по
-  # waiting:owner (задача ждёт решения владельца, не должна стопорить весь
-  # диспатч как «старейшая свободная»), полю нужны сами метки, не только
-  # assignees.
-  gh issue list --label task --state open --limit 100 --json number,assignees,title,labels \
+  # Пул — через task_deps.py (GraphQL), не `gh issue list` (REST): приоритет
+  # #361 читает граф блокировок (blockedBy/blocking), которого REST не отдаёт
+  # ни в каком виде (проверено живым запросом, design.md этого change) —
+  # одно место получения пула, не два расходящихся запроса. Отдаёт и labels
+  # (находка AI-ревью PR #471/#470 — waiting:owner), и blocking_open.
+  python3 "$SCRIPT_DIR/../lib/task_deps.py" pool "$GITHUB_REPOSITORY" \
     >"$issues_file" || return 2
   # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
   # канал (#121). Фильтр здесь — экономия прогона, НЕ защита: гарантией
@@ -191,9 +192,9 @@ free_task() {
   # того, как снова её занял. $WORK/pool-prs.json читается один раз выше
   # (шаг 0), не второй HTTP-обход.
   excluded=$(python3 "$SCRIPT_DIR/../lib/free_task.py" conflict-tasks "$WORK/pool-prs.json") || return 2
-  # oldest-free сам сортирует по номеру (issues API отдаёт по убыванию
-  # новизны — без сортировки воркер брал бы свежайшую задачу, не старейшую)
-  # и фильтрует замки из locked и конфликтные задачи из excluded.
+  # oldest-free сам считает приоритет (#361: мета-метка → число блокируемых
+  # открытых задач → номер issue как тайбрейк) и фильтрует замки из locked и
+  # конфликтные задачи из excluded.
   set +e
   line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" oldest-free "$issues_file" "$locked" "$excluded")
   rc=$?
