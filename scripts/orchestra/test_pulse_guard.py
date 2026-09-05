@@ -382,6 +382,102 @@ def test_heartbeat_check_blind_to_pull_request_contract_runs_mutation_guard(monk
     assert pg.decide_heartbeat(unfiltered_last_ok["created_at"], now) == "ok"
 
 
+# ── Находка ревью PR #318: клиентский фильтр на одной сырой странице не ─────────
+# ── спасает от труncации ≥100 contract-прогонов — нужен серверный ?event=... ────
+
+
+def test_orchestra_tick_runs_queries_each_legit_event_separately_no_pull_request(monkeypatch):
+    """orchestra_tick_runs делает ОТДЕЛЬНЫЙ запрос на каждое легитимное
+    событие (?event=schedule, ?event=workflow_dispatch) и ни разу не просит
+    event=pull_request — contract, сколько бы его ни было между тиками, на
+    эти страницы в принципе не попадает (сервер фильтрует до пагинации)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T13:32:00Z", 501, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-09-05T04:35:00Z", 502, event="workflow_dispatch"),
+        ]},
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    ticks = pg.orchestra_tick_runs("mytab0r/edge-harness")
+    assert [t["id"] for t in ticks] == [501, 502]
+    assert len(fake.calls) == 2
+    assert all("event=pull_request" not in c for c in fake.calls)
+
+
+def test_heartbeat_check_finds_real_tick_past_page_full_of_contract_runs(monkeypatch):
+    """Граничный случай, явно запрошенный ревью: ≥100 pull_request-прогонов
+    contract между двумя настоящими тиками. Раньше (клиентский фильтр на
+    ОДНОЙ сырой странице) эта масса contract-прогонов ЗАНИМАЛА всю страницу
+    per_page=100 и настоящий success 04:35 терялся за ней — heartbeat_check
+    молчал бы «не найдено». Серверный фильтр по событию делает вопрос
+    неприменимым: страница event=workflow_dispatch физически не может
+    содержать ни одного прогона contract, сколько бы их ни было."""
+    # Живая форма находки: 150 (>per_page=100) прогонов contract на event=
+    # pull_request «существуют», но код НЕ ИМЕЕТ ПРАВА их запрашивать — в
+    # FakeGh для event=pull_request нарочно нет маршрута, любой такой запрос
+    # упадёт громким AssertionError вместо тихой подмены страницы.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-09-05T04:35:49Z", 1, event="workflow_dispatch"),
+        ]},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+
+    now = utc(2026, 9, 5, 14, 24, 0)
+    lines = pg.heartbeat_check("mytab0r/edge-harness", now)
+    assert len(sent) == 1 and "пропадал" in sent[0]
+    assert any("пропадал" in line for line in lines)
+
+
+def test_heartbeat_check_loud_when_zero_ticks_found_after_server_filter(monkeypatch):
+    """Пустой результат ПОСЛЕ серверного фильтра (оба легитимных события
+    отдали 0 success) — не «выборка коротка» (см. docstring heartbeat_check),
+    а реальный тревожный случай: находка ревью #318 — прежняя версия молчала
+    ℹ️ без Telegram и без следа в задаче; теперь кричит 🚨 обоими каналами."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1 and "HEARTBEAT_NO_TICKS" in sent[0]
+    assert len(posted) == 1 and "HEARTBEAT_NO_TICKS" in posted[0]
+
+
+def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(monkeypatch):
+    """Один след в задаче на эпизод (маркер HEARTBEAT_NO_TICKS уже стоит) —
+    повторный комментарий не плодится, но Telegram кричит на каждый прогон
+    (тот же приём, что у heartbeat_alert_text/PAUSE_MARKER)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-05T14:00:00Z", "body": "🚨 edge-harness: HEARTBEAT_NO_TICKS\nтекст"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1
+    assert posted == []
+
+
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
 
 
