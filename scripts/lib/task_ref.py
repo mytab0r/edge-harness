@@ -17,9 +17,13 @@
 #120, #248 с #119, #247 с #43, #263 с #4):
 
   «Какая задача у этого PR» (узкая, для решений вида «этот PR закрывает
-  задачу N», «контекст ревью», «занята ли задача») — `resolve_pr_task` и то,
-  из чего он собран: `task_from_branch`, `declared_tasks`/`declares_task`.
-  Расчёт по иерархии источников, а не по первому попавшемуся упоминанию.
+  задачу N», «контекст ревью», «занята ли задача») — `resolve_pr_task` (один
+  ответ, ветка приоритетна всегда) и `pr_task_candidates` (#394, список
+  кандидатов без схлопывания — нужен там, где решение зависит от пригодности
+  каждого, а не только от надёжности источника, см. докстринг
+  `pr_task_candidates`), и то, из чего оба собраны: `task_from_branch`,
+  `declared_tasks`/`declares_task`. Расчёт по иерархии источников, а не по
+  первому попавшемуся упоминанию.
 
   «Упоминает ли текст задачу» (широкая, ЛЮБОЕ вхождение `#N`) —
   `extract_task_refs`/`references_task`. Годится только там, где широта
@@ -151,6 +155,38 @@ def task_from_branch(branch: str) -> int | None:
         return None
     match = _BRANCH_TASK_RE.match(branch)
     return int(match.group(1)) if match else None
+
+
+def pr_task_candidates(pull: dict) -> list[int]:
+    """Кандидаты номера задачи для PR, по убыванию надёжности, БЕЗ схлопывания
+    в один ответ: имя agent-ветки (`task_from_branch`) первым, декларация
+    первой строкой тела (`declared_tasks`) вторым, без повторов (#394).
+
+    Отличие от `resolve_pr_task` ниже: тот выбирает РОВНО ОДИН номер (ветка
+    приоритетна всегда) — годится для вопросов вида «какая задача у PR»
+    (контекст AI-ревью, приёмка). Здесь оба узких источника нужны ПОРОЗНЬ:
+    ветку можно создать только один раз (`scripts/git/task-branch`), а
+    докрытие после того, как задача закрыта раньше срока («закрытая задача
+    не переоткрывается», task-rework-loop), оформляется НОВОЙ узкой задачей,
+    объявленной первой строкой тела, без переименования ветки — живые PR
+    репозитория на 2026-09-06: #388 (ветка называет закрытую #256, тело
+    объявляет открытую #391), #384 (закрытая #20 → открытая #389), #359
+    (закрытая #131 → открытая #383), #167 (закрытая #95 → открытая #390).
+    Вызывающий код (contract_check.py, free_task.py) сам решает, что делать
+    при нескольких кандидатах — обычно пробует их по порядку и берёт
+    первого, для которого задача пригодна/свободна, а не слепо первый.
+
+    Прозаические упоминания (`extract_task_refs`) сюда не входят — только
+    эти два узких источника."""
+    branch = ((pull.get("head") or {}).get("ref")) or ""
+    from_branch = task_from_branch(branch)
+    declared = declared_tasks(pull.get("body") or "")
+    declared_number = declared[0] if declared else None
+    candidates: list[int] = []
+    for number in (from_branch, declared_number):
+        if number is not None and number not in candidates:
+            candidates.append(number)
+    return candidates
 
 
 def resolve_pr_task(pull: dict, closing_issue: int | None = None) -> int | None:
