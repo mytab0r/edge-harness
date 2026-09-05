@@ -210,6 +210,37 @@ def test_declaration_only_from_true_first_line_not_any_leading_hash_line():
     assert task_ref.declares_task(body, 118) is False
 
 
+def test_markdown_heading_with_hash_number_is_not_a_declaration():
+    # #312: `## Задача #245: …` — markdown-заголовок, начинающийся с `#`, но
+    # не декларация (после `#` не цифра, а второй `#`). Докстринг обещал
+    # «первая строка ЦЕЛИКОМ декларация», а старый код принимал любую первую
+    # строку с ведущим `#`, включая заголовок.
+    body = "## Задача #245: контекст\n\nТекст.\n"
+    assert task_ref.declared_tasks(body) == []
+    assert task_ref.declares_task(body, 245) is False
+
+
+# #312: живая регрессия сужения из #251. `.github/PULL_REQUEST_TEMPLATE.md`
+# начинается с HTML-комментария (`<!-- Правило: … -->`), который GitHub при
+# рендере тела PR не вырезает, но и не показывает — значит для человека он
+# невидим, а `declared_tasks` (первая непустая строка тела) без вырезания
+# комментария видел бы первой строкой `<!--` и терял декларацию `#N` для
+# ЛЮБОГО PR, открытого по штатному шаблону через веб-форму. Тест кормится
+# самим файлом шаблона (прод-форма), а не пересказом его текста — иначе
+# шаблон и тест разойдутся незамеченными.
+_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / ".github" / "PULL_REQUEST_TEMPLATE.md"
+
+
+def test_real_pr_template_html_comment_before_declaration_is_skipped():
+    template_body = _TEMPLATE_PATH.read_text(encoding="utf-8")
+    assert "<!--" in template_body, "шаблон должен начинаться с HTML-комментария (иначе тест не о том)"
+    # Автор PR правит только строку-плейсхолдер `#N`, комментарий-инструкцию
+    # не трогает (веб-форма подставляет шаблон целиком, комментарий невидим).
+    body = template_body.replace("#N\n", "#245\n", 1)
+    assert task_ref.declared_tasks(body) == [245]
+    assert task_ref.declares_task(body, 245) is True
+
+
 # ── Резолвер «PR → задача» (#259) — прод-форма реальных PR этого репозитория ──
 #
 # Живой замер, который и породил задачу: ai_review.py:353 брал ЛЮБОЕ #N из
