@@ -1,7 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
-import { classifyStorageError, handsAreAlive, storageErrorResponse } from "../src/harness";
+import { describe, expect, it, vi } from "vitest";
+import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
+import { LIMITS } from "../src/config";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -524,12 +525,18 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
     expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
 describe("inbox: сообщения владельца", () => {
-  it("вебхук принимает сообщение и возвращает id", async () => {
-    const res = await postJson("/api/messages/webhook", {
+  // Каждый тест — со своим sender_id: хранилище DO между тестами одного файла
+  // не изолируется, утверждения фильтруются по своим строкам.
+  let senderSeq = 0;
+  const sender = () => `inbox-tester-${Date.now()}-${senderSeq++}`;
+
+  it("ingest принимает плоскую форму и возвращает id", async () => {
+    const s = sender();
+    const res = await postJson("/api/messages/ingest", {
       source: "telegram",
-      source_msg_id: "msg-123",
+      source_msg_id: `ingest-${s}`,
       chat_id: "chat-456",
-      sender_id: "user-789",
+      sender_id: s,
       sender_name: "Owner",
       text: "Привет, это тестовое сообщение",
     });
@@ -539,29 +546,54 @@ describe("inbox: сообщения владельца", () => {
     expect(body.status).toBe("accepted");
   });
 
-  it("вебхук идемпотентен по source+source_msg_id", async () => {
-    const payload = {
-      source: "telegram",
-      source_msg_id: "msg-456",
-      chat_id: "chat-456",
-      sender_id: "user-789",
-      sender_name: "Owner",
-      text: "Второе сообщение",
+  it("ingest понимает настоящую Telegram-форму update: числа приводятся к строкам (гвардия идемпотентности)", async () => {
+    // Прод-форма: Telegram шлёт update_id/message_id/from.id/chat.id ЧИСЛАМИ.
+    // Без нормализации реальный апдейт падает мимо UNIQUE(source, source_msg_id)
+    // и каждый ретрай создавал бы новую строку.
+    const s = sender();
+    const update = {
+      update_id: 918273645,
+      message: {
+        message_id: 42,
+        from: { id: 777000, is_bot: false, first_name: "Владелец", username: s },
+        chat: { id: -1001234567890, title: "dev", type: "supergroup" },
+        date: 1756400000,
+        text: "/task Проверь инбокс владельца",
+      },
     };
-    const first = await (await postJson("/api/messages/webhook", payload)).json<{ message_id: number }>();
-    const second = await (await postJson("/api/messages/webhook", payload)).json<{ message_id: number }>();
-    expect(first.message_id).toBe(second.message_id);
+    const first = await postJson("/api/messages/ingest", update);
+    expect(first.status).toBe(201);
+    const firstBody = await first.json<{ message_id: number }>();
 
-    // Проверяем, что в БД только одно сообщение
-    const list = await getJson<{ messages: { id: number }[] }>("/api/messages?source=telegram&sender_id=user-789");
-    const mine = list.messages.filter((m) => m.source_msg_id === "msg-456");
-    expect(mine).toHaveLength(1);
+    // Ретрай Telegram несёт тот же update_id — обязан вернуться в ту же строку.
+    const retry = await postJson("/api/messages/ingest", update);
+    expect(retry.status).toBe(200);
+    const retryBody = await retry.json<{ message_id: number; status: string }>();
+    expect(retryBody.message_id).toBe(firstBody.message_id);
+    expect(retryBody.status).toBe("exists");
+
+    const got = await getJson<{ message: { source: string; source_msg_id: string; chat_id: string; sender_id: string; sender_name: string; text: string } }>(
+      `/api/messages/${firstBody.message_id}`,
+    );
+    expect(got.message.source).toBe("telegram");
+    expect(got.message.source_msg_id).toBe("918273645");
+    expect(got.message.chat_id).toBe("-1001234567890");
+    expect(got.message.sender_id).toBe("777000");
+    expect(got.message.sender_name).toBe(s);
+    expect(got.message.text).toBe("/task Проверь инбокс владельца");
   });
 
-  it("вебхук отклоняет пустой text", async () => {
-    const res = await postJson("/api/messages/webhook", {
-      source: "telegram",
-      source_msg_id: "msg-empty",
+  it("ingest без идентификатора — громкий 400: идемпотентность невозможна", async () => {
+    const res = await postJson("/api/messages/ingest", { text: "без id" });
+    expect(res.status).toBe(400);
+    const body = await res.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("need_source_msg_id");
+  });
+
+  it("ingest отклоняет пустой text", async () => {
+    const res = await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `empty-${Date.now()}`,
       text: "",
     });
     expect(res.status).toBe(400);
@@ -569,158 +601,297 @@ describe("inbox: сообщения владельца", () => {
     expect(body.error.code).toBe("need_text");
   });
 
-  it("вебхук отклоняет слишком длинное сообщение", async () => {
-    const longText = "а".repeat(20000);
-    const res = await postJson("/api/messages/webhook", {
-      source: "telegram",
-      source_msg_id: "msg-long",
-      text: longText,
+  it("ingest отклоняет слишком длинное сообщение", async () => {
+    const res = await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `long-${Date.now()}`,
+      text: "а".repeat(20000),
     });
     expect(res.status).toBe(413);
     const body = await res.json<{ error: { code: string } }>();
     expect(body.error.code).toBe("message_too_large");
   });
 
-  it("GET /api/messages возвращает список с пагинацией", async () => {
-    // Создаём несколько сообщений
+  it("GET /api/messages: обход пагинации без дублей и пропусков при равных ts (курсор согласован с DESC)", async () => {
+    const s = sender();
+    // Быстрая серия: ts в одну миллисекунду — гвардия тайбрейкера id DESC.
     for (let i = 0; i < 5; i++) {
-      await postJson("/api/messages/webhook", {
+      await postJson("/api/messages/ingest", {
         source: "api",
-        source_msg_id: `list-${i}`,
+        source_msg_id: `walk-${s}-${i}`,
+        sender_id: s,
         text: `Сообщение ${i}`,
       });
     }
-    const res = await getJson<{ messages: { id: number; text: string }[]; has_more: boolean }>(
-      "/api/messages?limit=2"
-    );
-    expect(res.messages).toHaveLength(2);
-    expect(res.has_more).toBe(true);
-    expect(res.messages[0].text).toBe("Сообщение 4"); // DESC по ts
+    const seen: number[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await getJson<{ messages: { id: number; text: string }[]; has_more: boolean; next_after: number }>(
+        `/api/messages?sender_id=${s}&limit=2&after=${after}`,
+      );
+      seen.push(...page.messages.map((m) => m.id));
+      if (!page.has_more) break;
+      after = page.next_after;
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5);
+    // DESC по id: каждая следующая страница строго старше.
+    for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeLessThan(seen[i - 1]);
   });
 
   it("фильтр по status работает", async () => {
-    await postJson("/api/messages/webhook", {
+    const s = sender();
+    await postJson("/api/messages/ingest", {
       source: "api",
-      source_msg_id: "filter-new",
+      source_msg_id: `filter-new-${s}`,
+      sender_id: s,
       text: "Новое сообщение",
     });
-    const res = await getJson<{ messages: { status: string }[] }>("/api/messages?status=new");
+    const res = await getJson<{ messages: { status: string }[] }>(`/api/messages?status=new&sender_id=${s}`);
+    expect(res.messages.length).toBeGreaterThan(0);
     for (const m of res.messages) {
       expect(m.status).toBe("new");
     }
   });
 
-  it("фильтр по kind работает", async () => {
-    await postJson("/api/messages/webhook", {
-      source: "api",
-      source_msg_id: "filter-kind",
-      text: "Просто чат",
-    });
-    const res = await getJson<{ messages: { kind: string }[] }>("/api/messages?kind=raw");
-    for (const m of res.messages) {
-      expect(m.kind).toBe("raw");
-    }
-  });
-
-  it("GET /api/messages/:id возвращает одно сообщение", async () => {
-    const created = await (await postJson("/api/messages/webhook", {
-      source: "api",
-      source_msg_id: "single-msg",
-      text: "Единочное сообщение",
-    })).json<{ message_id: number }>();
-
-    const res = await getJson<{ message: { id: number; text: string } }>(
-      `/api/messages/${created.message_id}`
-    );
-    expect(res.message.id).toBe(created.message_id);
-    expect(res.message.text).toBe("Единочное сообщение");
-  });
-
-  it("POST /api/messages создаёт сообщение вручную", async () => {
+  it("POST /api/messages создаёт сообщение вручную; повтор без id не двоит", async () => {
     const res = await postJson("/api/messages", {
       source: "manual",
-      source_msg_id: "manual-1",
+      source_msg_id: `manual-${Date.now()}`,
       text: "Ручное сообщение",
     });
     expect(res.status).toBe(201);
     const body = await res.json<{ message_id: number; status: string }>();
     expect(body.message_id).toBeGreaterThan(0);
     expect(body.status).toBe("created");
+
+    const auto = await postJson("/api/messages", { text: "Без id — генерируется" });
+    expect(auto.status).toBe(201);
   });
 
-  it("классификация: директива с /task создаёт kind=directive", async () => {
-    const created = await (await postJson("/api/messages", {
-      source: "test-classify",
-      source_msg_id: `classify-directive-${Date.now()}`,
-      text: "/task Сделай новую фичу",
-    })).json<{ message_id: number }>();
+  it("разбор: директива без GH_ISSUES_TOKEN повторяется (issue_retry), после капа попыток — честный failed", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `retry-${s}`,
+        sender_id: s,
+        text: "/task Сделай что-то важное",
+      })
+    ).json<{ message_id: number }>();
 
-    await postJson("/api/messages/process", { limit: 100 });
-    const msg = await getJson<{ message: { kind: string; priority: number } }>(
-      `/api/messages/${created.message_id}`
-    );
+    // Попытки 1 и 2: токена нет — повторяемая ошибка, сообщение живёт в new.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ processed: number; results: { message_id: number; action: string; attempts?: number }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_retry");
+      expect(mine?.attempts).toBe(attempt);
+      const msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("new");
+    }
+
+    // Попытка 3 = кап: honest failed вместо вечного штурма.
+    const res = await postJson("/api/messages/process", { limit: 100 });
+    const body = await res.json<{ processed: number; results: { message_id: number; action: string; error?: string }[] }>();
+    const mine = body.results.find((r) => r.message_id === created.message_id);
+    expect(mine?.action).toBe("issue_failed");
+    expect(mine?.error).toBe("issues_not_configured");
+    const msg = await getJson<{ message: { status: string; kind: string; priority: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("failed");
     expect(msg.message.kind).toBe("directive");
     expect(msg.message.priority).toBe(10);
   });
 
-  it("классификация: вопрос создаёт kind=chat", async () => {
-    const created = await (await postJson("/api/messages", {
-      source: "test-classify",
-      source_msg_id: `classify-chat-${Date.now()}`,
-      text: "Как думаешь, что лучше?",
-    })).json<{ message_id: number }>();
+  it("retry_failed возвращает failed в new с обнулёнными попытками — газ после устранения причины", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `requeue-${s}`,
+        sender_id: s,
+        text: "/task Доведись до конца",
+      })
+    ).json<{ message_id: number }>();
 
-    await postJson("/api/messages/process", { limit: 100 });
-    const msg = await getJson<{ message: { kind: string; priority: number } }>(
-      `/api/messages/${created.message_id}`
-    );
-    expect(msg.message.kind).toBe("chat");
-    expect(msg.message.priority).toBe(1);
+    // Доводим до failed тремя прогонами.
+    for (let i = 0; i < 3; i++) await postJson("/api/messages/process", { limit: 100 });
+    let msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("failed");
+
+    // Газ: failed → new, attempts=0; очередной прогон делает первую попытку и
+    // (токена по-прежнему нет) возвращает в new, а не в failed.
+    await postJson("/api/messages/process", { limit: 100, retry_failed: true });
+    msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+    expect(msg.message.status).toBe("new");
+    expect(msg.message.attempts).toBe(1);
   });
 
-  it("классификация: упоминание docs/ создаёт kind=doc_edit", async () => {
-    const created = await (await postJson("/api/messages", {
-      source: "test-classify",
-      source_msg_id: `classify-doc-${Date.now()}`,
-      text: "Обнови docs/INDEX.md с новой инфой",
-    })).json<{ message_id: number }>();
+  it("разбор: директива с настроенным GH_ISSUES_TOKEN создаёт issue (fetch заглушен прод-формой ответа GitHub)", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `issue-${s}`,
+        sender_id: s,
+        text: "/task Заведи задачу из инбокса",
+      })
+    ).json<{ message_id: number }>();
 
-    await postJson("/api/messages/process", { limit: 100 });
-    const msg = await getJson<{ message: { kind: string; priority: number } }>(
-      `/api/messages/${created.message_id}`
-    );
-    expect(msg.message.kind).toBe("doc_edit");
-    expect(msg.message.priority).toBe(5);
+    // Токен и fetch — только внутри теста: env-биндинги общие, восстанавливаем.
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    // Заглушка кормится прод-формой: 201 + JSON issue (number, html_url).
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com") && url.includes("/issues")) {
+        calls.push({ url, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ number: 4242, html_url: "https://github.com/mytab0r/edge-harness/issues/4242" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; issue_number?: number }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_created");
+      expect(mine?.issue_number).toBe(4242);
+
+      // Улика: запрос ушёл в GitHub API под узким токеном и с метками пула.
+      // Хранилище общее — в очереди есть директивы прошлых тестов, берём свою.
+      const mineCall = calls.find((c) => String(c.body.title).includes("Заведи задачу из инбокса"));
+      expect(mineCall).toBeDefined();
+      expect(mineCall!.url).toContain("/repos/mytab0r/edge-harness/issues");
+      expect(mineCall!.body.labels).toContain("task");
+
+      const msg = await getJson<{ message: { status: string; result: string } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("done");
+      expect(JSON.parse(msg.message.result)).toEqual({
+        issue_number: 4242,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4242",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
   });
 
-  it("process без GH токена помечает directive как failed", async () => {
-    const created = await (await postJson("/api/messages", {
-      source: "test-process",
-      source_msg_id: `process-no-token-${Date.now()}`,
-      text: "/task Сделай что-то без токена",
-    })).json<{ message_id: number }>();
+  it("разбор: 4xx от GitHub — не штурмуем (сразу failed), 5xx — повторяем до капа", async () => {
+    const s = sender();
+    const make = async (id: string, text: string) =>
+      (
+        await postJson("/api/messages", {
+          source: "test-process",
+          source_msg_id: id,
+          sender_id: s,
+          text,
+        })
+      ).json<{ message_id: number }>();
+    // Различаем ответы заглушки по тексту задачи — он уезжает в title.
+    const forbidden = await make(`gh403-${s}`, "/task Сорок три навсегда");
+    const serverError = await make(`gh500-${s}`, "/task Пятьсот время от времени");
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com") && url.includes("/issues")) {
+        const bodyText = String(init?.body);
+        if (bodyText.includes("Сорок три")) return new Response('{"message":"forbidden"}', { status: 403 });
+        if (bodyText.includes("Пятьсот")) return new Response('{"message":"boom"}', { status: 500 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; error?: string; attempts?: number }[] }>();
+      const byId = new Map(body.results.map((r) => [r.message_id, r]));
+
+      // 403 — детерминированный отказ (токен без права/кривая форма): failed сразу.
+      const f = byId.get(forbidden.message_id);
+      expect(f?.action).toBe("issue_failed");
+      expect(f?.error).toContain("github_403");
+
+      // 500 — временный: попытки 1 и 2 в new, третья (кап) — failed.
+      expect(byId.get(serverError.message_id)?.action).toBe("issue_retry");
+      await postJson("/api/messages/process", { limit: 100 });
+      const res3 = await postJson("/api/messages/process", { limit: 100 });
+      const body3 = await res3.json<{ results: { message_id: number; action: string; error?: string }[] }>();
+      const se = body3.results.find((r) => r.message_id === serverError.message_id);
+      expect(se?.action).toBe("issue_failed");
+      expect(se?.error).toContain("github_500");
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("разбор: чат и правка доков припаркованы с пометкой, raw уходит в ignored на ручной триаж", async () => {
+    const s = sender();
+    const chat = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-chat-${s}`, sender_id: s, text: "Как думаешь, что лучше?" })
+    ).json<{ message_id: number }>();
+    const doc = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-doc-${s}`, sender_id: s, text: "Обнови docs/INDEX.md с новой инфой" })
+    ).json<{ message_id: number }>();
+    const raw = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `kind-raw-${s}`, sender_id: s, text: "просто заметка без действия" })
+    ).json<{ message_id: number }>();
 
     const res = await postJson("/api/messages/process", { limit: 100 });
-    const body = await res.json<{ processed: number; results: { action: string }[] }>();
-    // Находим наш результат среди обработанных
-    const ourResult = body.results.find((r) => r.message_id === created.message_id);
-    expect(ourResult).toBeDefined();
-    expect(ourResult!.action).toBe("issue_failed");
+    const body = await res.json<{ processed: number; results: { message_id: number; action: string }[] }>();
+    const byId = new Map(body.results.map((r) => [r.message_id, r.action]));
+    expect(byId.get(chat.message_id)).toBe("parked");
+    expect(byId.get(doc.message_id)).toBe("parked");
+    expect(byId.get(raw.message_id)).toBe("ignored");
 
-    const msg = await getJson<{ message: { status: string } }>(
-      `/api/messages/${created.message_id}`
-    );
-    expect(msg.message.status).toBe("failed");
+    // raw больше не возвращается в new: очередь не забивается непроходящим сырьём.
+    const rawMsg = await getJson<{ message: { status: string; kind: string; result: string } }>(`/api/messages/${raw.message_id}`);
+    expect(rawMsg.message.status).toBe("ignored");
+    expect(rawMsg.message.kind).toBe("raw");
+    expect(JSON.parse(rawMsg.message.result).note).toBe("needs_manual_triage");
+
+    const chatMsg = await getJson<{ message: { status: string; kind: string; priority: number; result: string } }>(`/api/messages/${chat.message_id}`);
+    expect(chatMsg.message.status).toBe("done");
+    expect(chatMsg.message.priority).toBe(1);
+    expect(JSON.parse(chatMsg.message.result).note).toBe("classified_for_manual_review");
+
+    const docMsg = await getJson<{ message: { kind: string; priority: number; grouped_with: number | null } }>(`/api/messages/${doc.message_id}`);
+    expect(docMsg.message.kind).toBe("doc_edit");
+    expect(docMsg.message.priority).toBe(5);
   });
 
-  it("статус включает счетчики сообщений", async () => {
+  it("статус включает счётчики сообщений", async () => {
+    const s = sender();
     const before = await getJson<{ messages: Record<string, number> }>("/api/status");
-    await postJson("/api/messages/webhook", {
-      source: "telegram",
-      source_msg_id: "status-count",
+    await postJson("/api/messages/ingest", {
+      source: "api",
+      source_msg_id: `status-count-${s}`,
+      sender_id: s,
       text: "Тест счетчика",
     });
     const after = await getJson<{ messages: Record<string, number> }>("/api/status");
     expect(after.messages.new).toBe((before.messages.new || 0) + 1);
+  });
+});
+
+describe("чистые функции инбокса", () => {
+  const NOW = 1_800_000_000_000;
+
+  it("messageStuck: порог объявлен одной константой и работает на границе", () => {
+    expect(messageStuck(null, NOW)).toBe(false);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs + 1, NOW)).toBe(false);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs, NOW)).toBe(true);
+    expect(messageStuck(NOW - LIMITS.messageStuckProcessingMs - 1, NOW)).toBe(true);
+  });
+
+  it("asString: числа Telegram приводятся к строке, мусор — в null", () => {
+    expect(asString(918273645)).toBe("918273645");
+    expect(asString("918273645")).toBe("918273645");
+    expect(asString(-1001234567890)).toBe("-1001234567890");
+    expect(asString(undefined)).toBeNull();
+    expect(asString(NaN)).toBeNull();
+    expect(asString({ id: 1 })).toBeNull();
   });
 });

@@ -7,6 +7,8 @@ import { matchRoute } from "./api-spec";
 const MESSAGE_MAX_CHARS = LIMITS.messageMaxChars;
 const MESSAGE_PROCESS_MAX = LIMITS.messageProcessMax;
 const MESSAGE_GROUP_WINDOW_MS = LIMITS.messageGroupWindowMs;
+const MESSAGE_MAX_ATTEMPTS = LIMITS.messageMaxAttempts;
+const MESSAGE_STUCK_MS = LIMITS.messageStuckProcessingMs;
 
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
@@ -66,21 +68,23 @@ const SCHEMA = [
      run_confirmed INTEGER
    )`,
   `CREATE TABLE IF NOT EXISTS messages (
-     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-     ts           INTEGER NOT NULL,
-     source       TEXT NOT NULL,           -- 'telegram', 'api', etc.
-     source_msg_id TEXT,                   -- original message ID from source
-     chat_id      TEXT,                    -- chat/channel identifier
-     sender_id    TEXT,                    -- sender identifier
-     sender_name  TEXT,                    -- sender display name
-     text         TEXT NOT NULL,           -- message text
-     kind         TEXT NOT NULL DEFAULT 'raw',  -- 'raw', 'directive', 'chat', 'doc_edit', 'system'
-     priority     INTEGER NOT NULL DEFAULT 0,   -- higher = more urgent
-     status       TEXT NOT NULL DEFAULT 'new',  -- 'new', 'processing', 'done', 'failed', 'ignored'
-     result       TEXT,                    -- JSON: {issue_number, issue_url, error, ...}
-     grouped_with INTEGER,                 -- message id this was grouped with
-     processed_ts INTEGER,
-     UNIQUE(source, source_msg_id)        -- idempotency per source
+     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+     ts            INTEGER NOT NULL,
+     source        TEXT NOT NULL,           -- 'telegram', 'api', etc.
+     source_msg_id TEXT,                    -- original message ID from source
+     chat_id       TEXT,                    -- chat/channel identifier
+     sender_id     TEXT,                    -- sender identifier
+     sender_name   TEXT,                    -- sender display name
+     text          TEXT NOT NULL,           -- message text
+     kind          TEXT NOT NULL DEFAULT 'raw',  -- 'raw', 'directive', 'chat', 'doc_edit', 'system'
+     priority      INTEGER NOT NULL DEFAULT 0,   -- higher = more urgent
+     status        TEXT NOT NULL DEFAULT 'new',  -- 'new', 'processing', 'done', 'failed', 'ignored'
+     result        TEXT,                    -- JSON: {issue_number, issue_url, error, note, ...}
+     grouped_with  INTEGER,                 -- message id this was grouped with
+     attempts      INTEGER NOT NULL DEFAULT 0,   -- попыток обработки (кап — LIMITS.messageMaxAttempts)
+     processing_ts INTEGER,                 -- момент атомарного захвата; NULL вне processing
+     processed_ts  INTEGER,
+     UNIQUE(source, source_msg_id)          -- идемпотентность приёма
    )`,
   `CREATE INDEX IF NOT EXISTS messages_by_ts ON messages(ts DESC)`,
   `CREATE INDEX IF NOT EXISTS messages_by_status ON messages(status)`,
@@ -140,7 +144,19 @@ export interface MessageRow {
   status: string;
   result: string | null;
   grouped_with: number | null;
+  attempts: number;
+  processing_ts: number | null;
   processed_ts: number | null;
+}
+
+/** Результат обработки одного сообщения инбокса. */
+export interface MessageProcessResult {
+  message_id: number;
+  action: "issue_created" | "issue_failed" | "issue_retry" | "parked" | "ignored" | "skipped" | "not_found";
+  issue_number?: number;
+  issue_url?: string;
+  error?: string;
+  attempts?: number;
 }
 
 export interface Status {
@@ -376,6 +392,30 @@ export function pulseStale(now: number, lastPulse: PulseStatus | null): boolean 
   if (lastPulse.run_confirmed === false) return false;
   return now - lastPulse.ts >= HEARTBEAT.selfOrchestrationMs * 2;
 }
+/** Чистое решение ватчдога инбокса: сообщение висит в processing дольше порога —
+ *  изолят умер посреди внешнего вызова, пульс вернёт его в new. */
+export function messageStuck(processingTs: number | null, now: number): boolean {
+  return processingTs !== null && now - processingTs >= LIMITS.messageStuckProcessingMs;
+}
+
+/** Telegram шлёт идентификаторы числами (update_id, message.id, from.id, chat.id):
+ *  без приведения к строке реальный апдейт падает мимо UNIQUE-идемпотентности. */
+export function asString(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+/** Безопасное чтение вложенного объекта (message/from/chat Telegram-update). */
+export function asObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+/** Итог создания issue для директивы. retryable=false — повторять бессмысленно. */
+type IssueOutcome =
+  | { ok: true; number: number; url: string }
+  | { ok: false; retryable: boolean; error: string };
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
 export function constantTimeEqual(a: string, b: string): boolean {
@@ -526,8 +566,8 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "session" && request.method === "DELETE") {
       return this.#dropSession();
     }
-    if (route.name === "messagesWebhook") {
-      return this.#postMessageWebhook(request);
+    if (route.name === "messagesIngest") {
+      return this.#postMessageIngest(request);
     }
     if (route.name === "messages" && request.method === "GET") {
       return this.#getMessages(url);
@@ -987,6 +1027,20 @@ export class Harness extends DurableObject<Env> {
       const detail = error instanceof Error ? error.message : String(error);
       console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
     }
+
+    // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
+    // Сообщение не может ждать ручного POST: критерий задачи — ни одно сообщение
+    // не теряется. Любой сбой здесь не роняет пульс: тик уже перезаложен.
+    try {
+      this.#reclaimStuckMessages();
+    } catch (error) {
+      console.log(`inbox reclaim failed: ${error instanceof Error ? error.message : error}`);
+    }
+    try {
+      await this.#processInbox(MESSAGE_PROCESS_MAX, false);
+    } catch (error) {
+      console.log(`inbox process failed: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   /** Текущая строка пульса (issue #269), полное внутреннее представление —
@@ -1222,10 +1276,17 @@ export class Harness extends DurableObject<Env> {
     return this.#json({ hands_alive: status.hands_alive, ts: now });
   }
 
-  // ── Inbox: сообщения владельца ──────────────────────────────────────────────────────
+  // ── Inbox: сообщения владельца (#20) ────────────────────────────────────────────────
+  //
+  // Жизненный цикл: new → (атомарный захват) → processing → done | failed | ignored,
+  // с двумя гарантиями непотери: зависший processing пульс возвращает в new
+  // (ватчдог по образцу stale_dispatch), а повторяемая ошибка директивы живёт
+  // в new до капа попыток (LIMITS.messageMaxAttempts) — потом честный failed.
+  // Водитель разбора — пульс DO (alarm); POST /api/messages/process — ручной
+  // прогон и retry_failed после устранения причины.
 
-  /** Классификация сообщения: директива, чат, правка доков, системное. */
-  #classifyMessage(text: string): { kind: string; priority: number; directiveMatch: RegExpMatchArray | null } {
+  /** Классификация сообщения: директива, чат, правка доков, неразобранное. */
+  #classifyMessage(text: string): { kind: string; priority: number } {
     const trimmed = text.trim();
     // Директивы: начинаются с / или !, или содержат ключевые слова действия
     const directivePatterns = [
@@ -1235,25 +1296,25 @@ export class Harness extends DurableObject<Env> {
       /^#\d+\s/,
     ];
     for (const pattern of directivePatterns) {
-      const match = trimmed.match(pattern);
-      if (match) return { kind: "directive", priority: 10, directiveMatch: match };
+      if (pattern.test(trimmed)) return { kind: "directive", priority: 10 };
     }
     // Правки доков: явные ссылки на файлы docs/ или openspec/
     if (/(docs\/|openspec\/|\.md\s|в\sдоке|в\sспеке|обнови\sдок)/i.test(trimmed)) {
-      return { kind: "doc_edit", priority: 5, directiveMatch: null };
+      return { kind: "doc_edit", priority: 5 };
     }
     // Чат/обсуждение: вопросы, комментарии без явного действия
     // Используем (^|\s) и (\s|[?,.!]|$) вместо \b для поддержки кириллицы
     if (/^[\?\¿]|(^|\s)(как|почему|что\sдумаешь|мнение|вопрос)(\s|[?,.!]|$)/i.test(trimmed)) {
-      return { kind: "chat", priority: 1, directiveMatch: null };
+      return { kind: "chat", priority: 1 };
     }
-    // По умолчанию — raw, будет обработан повторно или проигнорирован
-    return { kind: "raw", priority: 0, directiveMatch: null };
+    // По умолчанию — неразобранное: классификатор детерминирован, повторная
+    // обработка ничего не добавит — уходит в ignored на ручной триаж.
+    return { kind: "raw", priority: 0 };
   }
 
-  /** Группировка сообщений: собирает близкие по времени/теме сообщения в цепочки. */
+  /** Группировка сообщений: серия от того же отправителя в том же чате в пределах
+   *  окна — цепочка (grouped_with), чтобы триаж видел серию, а не россыпь. */
   #groupMessages(messageId: number): number | null {
-    // Ищем сообщения за последние MESSAGE_GROUP_WINDOW_MS от того же отправителя в том же чате
     const msg = this.#rows(this.#sql.exec("SELECT sender_id, chat_id, ts FROM messages WHERE id = ?", messageId))[0];
     if (!msg) return null;
     const senderId = msg.sender_id;
@@ -1268,31 +1329,35 @@ export class Harness extends DurableObject<Env> {
     ));
     if (recent.length > 0) {
       const groupWith = Number(recent[0].id);
-      // Обновляем текущее сообщение
       this.#sql.exec("UPDATE messages SET grouped_with = ? WHERE id = ?", groupWith, messageId);
       return groupWith;
     }
     return null;
   }
 
-  /** Создаёт GitHub Issue для директивы. Возвращает {number, url} или null при ошибке. */
-  async #createIssueForDirective(messageId: number, text: string): Promise<{ number: number; url: string } | null> {
-    const token = this.env.GH_PIPELINE_PAT || this.env.GH_DISPATCH_TOKEN;
+  /**
+   * Issue для директивы. Токен — собственный узкий секрет GH_ISSUES_TOKEN
+   * (fine-grained, только Issues:RW; ADR 0011): GH_DISPATCH_TOKEN по ADR 0008
+   * не имеет права на Issues — его 403 ловить здесь нечему. Пока секрет не
+   * задан владельцем, директива честно повторяется (issues_not_configured) —
+   * установка секрета сама доводит очередь, без ручного шага.
+   */
+  async #createIssue(messageId: number, text: string): Promise<IssueOutcome> {
+    const token = this.env.GH_ISSUES_TOKEN;
     const repo = this.env.GH_REPO;
     if (!token || !repo) {
-      console.log(`createIssueForDirective: GH_PIPELINE_PAT/GH_DISPATCH_TOKEN или GH_REPO не заданы`);
-      return null;
+      return { ok: false, retryable: true, error: "issues_not_configured" };
     }
 
-    // Извлекаем заголовок из первой строки или первых 80 символов
-    const lines = text.trim().split(/\r?\n/);
-    let title = lines[0].replace(/^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\s*/i, "").trim();
-    if (!title || title.length > 80) {
-      title = text.trim().slice(0, 80);
-    }
+    // Заголовок — первая строка без командного слова, потолок 80 символов.
+    const firstLine = text.trim().split(/\r?\n/)[0];
+    let title = firstLine
+      .replace(/^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\s*/i, "")
+      .trim();
+    if (!title || title.length > 80) title = firstLine.slice(0, 80);
     if (title.length > 80) title = title.slice(0, 77) + "...";
 
-    const body = `## Сообщение владельца (inbox)\n\n**ID сообщения:** ${messageId}\n**Текст:**\n\`\`\`\n${text}\n\`\`\`\n\n---\n*Создано автоматически из inbox владельца. Обработай по playbook.*`;
+    const body = `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${text}\n\`\`\`\n\n---\n*Создано автоматически из инбокса владельца (задача #20). Обработай по playbook.*`;
 
     try {
       const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/issues`, {
@@ -1304,128 +1369,162 @@ export class Harness extends DurableObject<Env> {
           "User-Agent": GITHUB.userAgent,
           "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
-        body: JSON.stringify({
-          title,
-          body,
-          labels: ["task", "source:inbox"],
-        }),
+        body: JSON.stringify({ title, body, labels: ["task", "source:inbox"] }),
       });
       if (!res.ok) {
-        const err = await res.text();
-        console.log(`createIssueForDirective: GitHub API ${res.status}: ${err}`);
-        return null;
+        const detail = (await res.text()).slice(0, 500);
+        // 5xx и 429 — временные; 4xx (403 без права, 422 кривая форма) —
+        // повторять бессмысленно, это honest failed.
+        return { ok: false, retryable: res.status >= 500 || res.status === 429, error: `github_${res.status}: ${detail}` };
       }
       const issue = await res.json<{ number: number; html_url: string }>();
-      return { number: issue.number, url: issue.html_url };
+      return { ok: true, number: issue.number, url: issue.html_url };
     } catch (error) {
-      console.log(`createIssueForDirective: ошибка сети: ${error instanceof Error ? error.message : error}`);
-      return null;
+      return { ok: false, retryable: true, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
-  /** Обработка одного сообщения: классификация, группировка, действие. */
-  async #processSingleMessage(messageId: number): Promise<{ action: string; issue?: { number: number; url: string }; error?: string }> {
-    const msg = this.#rows(this.#sql.exec("SELECT * FROM messages WHERE id = ?", messageId))[0];
-    if (!msg) return { action: "not_found", error: "Message not found" };
+  /** Финальное состояние: статус + результат + отметка времени. */
+  #finishMessage(messageId: number, status: "done" | "failed" | "ignored", result: Record<string, unknown>): void {
+    this.#sql.exec(
+      "UPDATE messages SET status = ?, result = ?, processed_ts = ? WHERE id = ?",
+      status, JSON.stringify(result), Date.now(), messageId,
+    );
+  }
 
-    const text = String(msg.text);
-    const { kind, priority, directiveMatch } = this.#classifyMessage(text);
+  /** Обработка одного сообщения. Захват атомарный: ровно один обработчик уводит
+   *  сообщение в processing, двойная обработка при параллельном вызове невозможна. */
+  async #processSingleMessage(messageId: number): Promise<Omit<MessageProcessResult, "message_id">> {
+    const row = this.#rows(this.#sql.exec("SELECT status, text FROM messages WHERE id = ?", messageId))[0];
+    if (!row) return { action: "not_found" };
+    if (String(row.status) !== "new") return { action: "skipped" };
+    const { kind, priority } = this.#classifyMessage(String(row.text));
 
-    // Обновляем классификацию
-    this.#sql.exec("UPDATE messages SET kind = ?, priority = ?, status = 'processing' WHERE id = ?", kind, priority, messageId);
-
-    // Группировка
+    const claimed = this.#sql.exec(
+      `UPDATE messages SET kind = ?, priority = ?, status = 'processing', attempts = attempts + 1, processing_ts = ?
+       WHERE id = ? AND status = 'new'`,
+      kind, priority, Date.now(), messageId,
+    );
+    if (claimed.rowsWritten === 0) return { action: "skipped" };
     this.#groupMessages(messageId);
 
-    let result: { issue?: { number: number; url: string }; error?: string } = {};
-
     if (kind === "directive") {
-      // Создаём Issue
-      const issue = await this.#createIssueForDirective(messageId, text);
-      if (issue) {
-        result.issue = issue;
-        this.#sql.exec(
-          "UPDATE messages SET status = 'done', result = ?, processed_ts = ? WHERE id = ?",
-          JSON.stringify({ issue_number: issue.number, issue_url: issue.url }),
-          Date.now(),
-          messageId
-        );
-        return { action: "issue_created", issue };
-      } else {
-        this.#sql.exec(
-          "UPDATE messages SET status = 'failed', result = ?, processed_ts = ? WHERE id = ?",
-          JSON.stringify({ error: "Failed to create GitHub issue" }),
-          Date.now(),
-          messageId
-        );
-        return { action: "issue_failed", error: "Failed to create GitHub issue" };
+      const outcome = await this.#createIssue(messageId, String(row.text));
+      if (outcome.ok) {
+        this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url });
+        return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url };
       }
-    } else if (kind === "doc_edit" || kind === "chat") {
-      // Помечаем как обработанное (требует ручного рассмотрения или ответа)
-      this.#sql.exec(
-        "UPDATE messages SET status = 'done', result = ?, processed_ts = ? WHERE id = ?",
-        JSON.stringify({ kind, note: "Requires manual review" }),
-        Date.now(),
-        messageId
+      const attempts = Number(
+        this.#rows(this.#sql.exec("SELECT attempts FROM messages WHERE id = ?", messageId))[0].attempts,
       );
-      return { action: "classified", issue: undefined };
-    } else {
-      // raw — оставляем для повторной обработки
-      this.#sql.exec("UPDATE messages SET status = 'new' WHERE id = ?", messageId);
-      return { action: "deferred", issue: undefined };
+      if (!outcome.retryable || attempts >= MESSAGE_MAX_ATTEMPTS) {
+        this.#finishMessage(messageId, "failed", { error: outcome.error });
+        return { action: "issue_failed", error: outcome.error, attempts };
+      }
+      // Повторяемая ошибка (токен не задан, сеть, 5xx) — обратно в очередь:
+      // пульс или ручной process доведут; кап попыток не даст штурмовать вечно.
+      this.#sql.exec("UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ?", messageId);
+      return { action: "issue_retry", error: outcome.error, attempts };
     }
+
+    if (kind === "raw") {
+      // Неразобранное: классификатор детерминирован — в new возвращать нельзя
+      // (сырьё забило бы очередь и голодало бы всё новое). ignored = припарковано
+      // для ручного триажа, видно в списке и в счётчиках статуса.
+      this.#finishMessage(messageId, "ignored", { note: "needs_manual_triage" });
+      return { action: "ignored" };
+    }
+
+    // chat / doc_edit: автоматического действия в фазе 1 нет — разобрано и
+    // припарковано с явной пометкой; триаж (морда, фаза 2) решает дальнейшее.
+    this.#finishMessage(messageId, "done", { kind, note: "classified_for_manual_review" });
+    return { action: "parked" };
   }
 
-  /** Вебхук для входящих сообщений (Telegram и др.). auth=false — верификация через секрет в теле. */
-  async #postMessageWebhook(request: Request): Promise<Response> {
-    const body = await this.#readJson(request);
-
-    // Поддержка формата Telegram webhook
-    let source = typeof body.source === "string" ? body.source : "telegram";
-    let sourceMsgId = typeof body.source_msg_id === "string" ? body.source_msg_id : 
-                      typeof body.message_id === "string" ? body.message_id :
-                      typeof body.update_id === "string" ? body.update_id :
-                      String(Date.now() + Math.random());
-    let chatId = typeof body.chat_id === "string" ? body.chat_id :
-                 typeof body.chat?.id === "string" ? String(body.chat.id) :
-                 typeof body.chat?.id === "number" ? String(body.chat.id) : null;
-    let senderId = typeof body.sender_id === "string" ? body.sender_id :
-                   typeof body.from?.id === "string" ? body.from.id :
-                   typeof body.from?.id === "number" ? String(body.from.id) : null;
-    let senderName = typeof body.sender_name === "string" ? body.sender_name :
-                     typeof body.from?.username === "string" ? body.from.username :
-                     typeof body.from?.first_name === "string" ? body.from.first_name : null;
-    let text = typeof body.text === "string" ? body.text :
-               typeof body.message?.text === "string" ? body.message.text : "";
-
-    if (!text || !text.trim()) {
-      throw new ApiError(400, "need_text");
-    }
-    if (text.length > MESSAGE_MAX_CHARS) {
-      throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
-    }
-
-    const now = Date.now();
-    // Идемпотентность: UNIQUE(source, source_msg_id)
+  /** Ватчдог: processing дольше порога — изолят умер посреди внешнего вызова.
+   *  Возврат в new; attempts сохраняются, кап не даст крутить бесконечно. */
+  #reclaimStuckMessages(): number {
     const cursor = this.#sql.exec(
-      `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
-       ON CONFLICT(source, source_msg_id) DO NOTHING`,
-      now, source, sourceMsgId, chatId, senderId, senderName, text
+      `UPDATE messages SET status = 'new', processing_ts = NULL
+       WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?`,
+      Date.now() - MESSAGE_STUCK_MS,
     );
+    return Number(cursor.rowsWritten);
+  }
 
-    let messageId: number;
-    if (cursor.rowsWritten === 0) {
-      // Уже есть — получаем id
-      const existing = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
-      messageId = Number(existing.id);
-    } else {
-      const row = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
-      messageId = Number(row.id);
+  /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в
+   *  new с обнулёнными попытками (после устранения причины, например установки
+   *  GH_ISSUES_TOKEN). */
+  async #processInbox(limit: number, retryFailed: boolean): Promise<MessageProcessResult[]> {
+    if (retryFailed) {
+      this.#sql.exec(
+        "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL WHERE status = 'failed'",
+      );
     }
+    const rows = this.#rows(
+      this.#sql.exec(
+        "SELECT id FROM messages WHERE status = 'new' ORDER BY priority DESC, ts ASC, id ASC LIMIT ?",
+        limit,
+      ),
+    );
+    const results: MessageProcessResult[] = [];
+    for (const row of rows) {
+      const id = Number(row.id);
+      results.push({ message_id: id, ...(await this.#processSingleMessage(id)) });
+    }
+    return results;
+  }
 
-    this.#broadcastStatus();
-    return this.#json({ message_id: messageId, status: "accepted" }, { status: 201 });
+  /**
+   * Приём сообщения владельца в инбокс. Авторизация — обычная (Bearer/кука):
+   * эндпоинт админско-релейный, прямая доставка вебхуком Telegram не подключена
+   * (для неё нужен свой секрет — отдельное решение). Понимает и плоскую форму
+   * (source, source_msg_id, …), и сырой Telegram update.
+   */
+  #postMessageIngest(request: Request): Promise<Response> {
+    return this.#readJson(request).then((body) => {
+      const message = asObject(body.message);
+      const from = asObject(body.from) ?? asObject(message?.from);
+      const chat = asObject(body.chat) ?? asObject(message?.chat);
+      const source = asString(body.source) ?? (body.update_id !== undefined || message ? "telegram" : "api");
+      // Ключ идемпотентности: явный source_msg_id, иначе update_id (ключ ретраев
+      // Telegram), иначе message_id. Только числа Telegram нормализуются в строку.
+      const sourceMsgId =
+        asString(body.source_msg_id) ?? asString(body.update_id) ?? asString(message?.message_id);
+      if (!sourceMsgId) throw new ApiError(400, "need_source_msg_id");
+
+      const text = asString(body.text) ?? asString(message?.text) ?? "";
+      if (!text.trim()) throw new ApiError(400, "need_text");
+      if (text.length > MESSAGE_MAX_CHARS) {
+        throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
+      }
+      const chatId = asString(body.chat_id) ?? asString(chat?.id);
+      const senderId = asString(body.sender_id) ?? asString(from?.id);
+      const senderName =
+        asString(body.sender_name) ?? asString(from?.username) ?? asString(from?.first_name);
+
+      // Идемпотентность — пречтением (по образцу журнала: rowsWritten после
+      // ON CONFLICT DO NOTHING в workerd признаком «свежести» не служит).
+      // Блок синхронный после readJson — гонки двух одновременных инестов нет.
+      const existing = this.#rows(
+        this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
+      )[0];
+      if (existing) {
+        // Ретрай (Telegram повторяет апдейты с тем же update_id) — в ту же строку.
+        return this.#json({ message_id: Number(existing.id), status: "exists" });
+      }
+      this.#sql.exec(
+        `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
+         ON CONFLICT(source, source_msg_id) DO NOTHING`,
+        Date.now(), source, sourceMsgId, chatId, senderId, senderName, text,
+      );
+      const row = this.#rows(
+        this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
+      )[0];
+      this.#broadcastStatus();
+      return this.#json({ message_id: Number(row.id), status: "accepted" }, { status: 201 });
+    });
   }
 
   /** Ручное создание сообщения (для тестов/админа). */
@@ -1438,25 +1537,26 @@ export class Harness extends DurableObject<Env> {
     if (text.length > MESSAGE_MAX_CHARS) {
       throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
     }
-    const source = typeof body.source === "string" ? body.source : "api";
-    const sourceMsgId = typeof body.source_msg_id === "string" ? body.source_msg_id : `manual-${Date.now()}`;
-    const chatId = typeof body.chat_id === "string" ? body.chat_id : null;
-    const senderId = typeof body.sender_id === "string" ? body.sender_id : null;
-    const senderName = typeof body.sender_name === "string" ? body.sender_name : null;
+    const source = asString(body.source) ?? "api";
+    const sourceMsgId = asString(body.source_msg_id) ?? `manual-${crypto.randomUUID()}`;
+    const chatId = asString(body.chat_id);
+    const senderId = asString(body.sender_id);
+    const senderName = asString(body.sender_name);
 
-    const now = Date.now();
     this.#sql.exec(
       `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')`,
-      now, source, sourceMsgId, chatId, senderId, senderName, text
+      Date.now(), source, sourceMsgId, chatId, senderId, senderName, text,
     );
-    const row = this.#rows(this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId))[0];
-    const messageId = Number(row.id);
+    const row = this.#rows(
+      this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", source, sourceMsgId),
+    )[0];
     this.#broadcastStatus();
-    return this.#json({ message_id: messageId, status: "created" }, { status: 201 });
+    return this.#json({ message_id: Number(row.id), status: "created" }, { status: 201 });
   }
 
-  /** Список сообщений с фильтрами. */
+  /** Список сообщений с фильтрами. Пагинация курсором по id ПРОТИВ сортировки:
+   *  выдача newest-first (ts DESC, id DESC) — следующая страница это id < after. */
   #getMessages(url: URL): Response {
     const status = url.searchParams.get("status");
     const kind = url.searchParams.get("kind");
@@ -1464,99 +1564,81 @@ export class Harness extends DurableObject<Env> {
     const after = this.#intParam(url, "after", 0);
     const senderId = url.searchParams.get("sender_id");
 
-    let where = "WHERE id > ?";
-    const params: (string | number)[] = [after];
+    const filters = ["WHERE 1=1"];
+    const params: (string | number)[] = [];
+    if (after > 0) {
+      filters.push("AND id < ?");
+      params.push(after);
+    }
     if (status) {
-      where += " AND status = ?";
+      filters.push("AND status = ?");
       params.push(status);
     }
     if (kind) {
-      where += " AND kind = ?";
+      filters.push("AND kind = ?");
       params.push(kind);
     }
     if (senderId) {
-      where += " AND sender_id = ?";
+      filters.push("AND sender_id = ?");
       params.push(senderId);
     }
 
     const rows = this.#rows(
       this.#sql.exec(
-        `SELECT id, ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status, result, grouped_with, processed_ts
-         FROM messages ${where} ORDER BY ts DESC LIMIT ?`,
-        ...params, limit + 1
-      )
+        `SELECT id, ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority,
+                status, result, grouped_with, attempts, processing_ts, processed_ts
+         FROM messages ${filters.join(" ")} ORDER BY ts DESC, id DESC LIMIT ?`,
+        ...params, limit + 1,
+      ),
     );
 
     const hasMore = rows.length > limit;
-    const messages: MessageRow[] = rows.slice(0, limit).map((row) => ({
-      id: Number(row.id),
-      ts: Number(row.ts),
-      source: String(row.source),
-      source_msg_id: row.source_msg_id === null ? null : String(row.source_msg_id),
-      chat_id: row.chat_id === null ? null : String(row.chat_id),
-      sender_id: row.sender_id === null ? null : String(row.sender_id),
-      sender_name: row.sender_name === null ? null : String(row.sender_name),
-      text: String(row.text),
-      kind: String(row.kind),
-      priority: Number(row.priority),
-      status: String(row.status),
-      result: row.result === null ? null : String(row.result),
-      grouped_with: row.grouped_with === null ? null : Number(row.grouped_with),
-      processed_ts: row.processed_ts === null ? null : Number(row.processed_ts),
-    }));
-
+    const messages: MessageRow[] = rows.slice(0, limit).map((row) => this.#messageRow(row));
+    const nextAfter = messages.length ? messages[messages.length - 1].id : after;
     return this.#json(
-      { messages, has_more: hasMore, next_after: messages.length ? messages[messages.length - 1].id : after },
-      { headers: { "x-has-more": hasMore ? "true" : "false", "x-next-after": String(messages.length ? messages[messages.length - 1].id : after) } }
+      { messages, has_more: hasMore, next_after: nextAfter },
+      { headers: { "x-has-more": hasMore ? "true" : "false", "x-next-after": String(nextAfter) } },
     );
   }
 
-  /** Одна сообщение по id. */
+  /** Одно сообщение по id. */
   #message(id: string): MessageRow | null {
     const row = this.#rows(this.#sql.exec("SELECT * FROM messages WHERE id = ?", id))[0];
-    if (!row) return null;
+    return row ? this.#messageRow(row) : null;
+  }
+
+  #messageRow(row: Record<string, SqlStorageValue>): MessageRow {
     return {
       id: Number(row.id),
       ts: Number(row.ts),
       source: String(row.source),
-      source_msg_id: row.source_msg_id === null ? null : String(row.source_msg_id),
-      chat_id: row.chat_id === null ? null : String(row.chat_id),
-      sender_id: row.sender_id === null ? null : String(row.sender_id),
-      sender_name: row.sender_name === null ? null : String(row.sender_name),
+      source_msg_id: row.source_msg_id === null || row.source_msg_id === undefined ? null : String(row.source_msg_id),
+      chat_id: row.chat_id === null || row.chat_id === undefined ? null : String(row.chat_id),
+      sender_id: row.sender_id === null || row.sender_id === undefined ? null : String(row.sender_id),
+      sender_name: row.sender_name === null || row.sender_name === undefined ? null : String(row.sender_name),
       text: String(row.text),
       kind: String(row.kind),
       priority: Number(row.priority),
       status: String(row.status),
-      result: row.result === null ? null : String(row.result),
-      grouped_with: row.grouped_with === null ? null : Number(row.grouped_with),
-      processed_ts: row.processed_ts === null ? null : Number(row.processed_ts),
+      result: row.result === null || row.result === undefined ? null : String(row.result),
+      grouped_with: row.grouped_with === null || row.grouped_with === undefined ? null : Number(row.grouped_with),
+      attempts: Number(row.attempts ?? 0),
+      processing_ts:
+        row.processing_ts === null || row.processing_ts === undefined ? null : Number(row.processing_ts),
+      processed_ts:
+        row.processed_ts === null || row.processed_ts === undefined ? null : Number(row.processed_ts),
     };
   }
 
-  /** Запуск обработки новых сообщений. */
+  /** Ручной запуск разбора (админ/тесты). Основной водитель — пульс DO. */
   async #processMessages(request: Request): Promise<Response> {
-    const body = await this.#readJson(request).catch(() => ({}));
-    const limit = typeof body.limit === "number" ? Math.min(body.limit, MESSAGE_PROCESS_MAX) : 50;
-
-    const messages = this.#rows(
-      this.#sql.exec(
-        `SELECT id FROM messages WHERE status = 'new' ORDER BY priority DESC, ts ASC LIMIT ?`,
-        limit
-      )
-    );
-
-    const results = [];
-    for (const row of messages) {
-      const result = await this.#processSingleMessage(Number(row.id));
-      results.push({ message_id: row.id, ...result });
-    }
-
+    const body: Record<string, unknown> = await this.#readJson(request).catch(() => ({}));
+    const limit =
+      typeof body.limit === "number" && Number.isFinite(body.limit)
+        ? Math.min(Math.max(1, Math.trunc(body.limit)), MESSAGE_PROCESS_MAX)
+        : MESSAGE_PROCESS_MAX;
+    const results = await this.#processInbox(limit, body.retry_failed === true);
     this.#broadcastStatus();
     return this.#json({ processed: results.length, results });
-  }
-
-  // ── Тестовый хелпер: сброс inbox (только для тестов)
-  async #resetInboxForTest(): Promise<void> {
-    this.#sql.exec("DELETE FROM messages");
   }
 }

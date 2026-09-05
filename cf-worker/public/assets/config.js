@@ -11,7 +11,7 @@ window.EDGE_CONFIG = {
     task: "/api/tasks/",
     heartbeat: "/api/heartbeat",
     session: "/api/session",
-    messagesWebhook: "/api/messages/webhook",
+    messagesIngest: "/api/messages/ingest",
     messages: "/api/messages",
     message: "/api/messages/",
     messagesProcess: "/api/messages/process",

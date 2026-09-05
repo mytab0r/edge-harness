@@ -28,6 +28,12 @@ export const LIMITS = {
   messageProcessMax: 100,
   /** Inbox: окно группировки сообщений (мс). */
   messageGroupWindowMs: 5 * 60 * 1000,
+  /** Inbox: попыток обработки директивы до честного failed (не настроенный токен
+   *  и сеть — повторяемы; после капа сообщение видно в failed и ждёт retry_failed). */
+  messageMaxAttempts: 3,
+  /** Inbox: сообщение в processing дольше этого порога — изолят умер посреди
+   *  внешнего вызова; пульс возвращает его в new (ватчдог по образцу stale_dispatch). */
+  messageStuckProcessingMs: 10 * 60_000,
 } as const;
 
 /** Сессия браузера: подписанная кука вместо долгоживущего HANDS_TOKEN в query/JS
