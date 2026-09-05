@@ -61,6 +61,7 @@ EXPECTED_WORKFLOWS = frozenset({
     # write) + секреты TELEGRAM_* — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
+    "cf-inventory.yml",
     "codeql.yml",
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",

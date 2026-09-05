@@ -303,7 +303,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh scripts/cf/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -320,6 +320,13 @@ jobs:
       # проводка scripts/lib/journal_status.sh — тихий пропуск статуса на деплое.
       - name: Smoke обёрток статусов журнала
         run: bash scripts/plugins/test/status-scripts.smoke.sh
+
+      # Гвардия класса «инцидент 2026-09-05» (#322, ревью PR #328 находка 3):
+      # bash -n не исполняет тело функций scripts/cf/lib.sh — регресс jq-фильтра
+      # на `.result` целиком вернул бы утечку чужих id/значений bindings в
+      # публичный лог молча. cf_get заглушен консервным JSON, проверка живая.
+      - name: Гвардия фильтров cf-inventory (чужие id/значения не в stdout)
+        run: bash scripts/lib/test/cf-inventory.guard.sh
 
       # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
       # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на
