@@ -141,8 +141,9 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
 куда писать и откуда читать, агент может вернуться к незаконченной работе).
 Блокер задачи #133 — не отсутствие памяти, а `403 error code 1010` при попытке
 раннера достучаться до GitHub на эгрессе (Cloudflare перед мордой режет запросы
-по сигнатуре, код инструмента не видна). Решение: полностью отделить
-раннерский код от GitHub (только dispatch для запуска, дальше работает в DSH).
+по сигнатуре, код инструмента не видна). Направление, обсуждаемое в #133 (не
+принятое решение, ADR/change не заведены): полностью отделить раннерский код
+от GitHub (только dispatch для запуска, дальше работает в DSH).
 История: попытка в #119 восстановить сессию раннера через `ctx.agents.resume`
 натолкнулась на отсутствие хранилища (решение требует #119 + новая
 инфраструктура), а не на отсутствие места в облаке.
@@ -177,15 +178,6 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   и поведение UI при `mode:'queue'` для заказа плагина — до первого живого
   заказа. Плагин при несоответствии громко покажет ошибку секции (форма
   конверта проверяется).
-
-## Источники
-
-- Живой прод (RPC-пробы 2026-08-31): workspace/session/rename/archive/list,
-  кодировки заголовков, идемпотентность workspace.create.
-- npm-пакеты `@deepseek-ai/dsh-session`, `dsh-llm`, `dsh-workspace`,
-  `dsh-host-apiproxy`, `dsh-session-title*` 0.1.1-rc.2 (types и lib).
-- `apps/dsh-edge/src/{index,instance,session-store,http,auth,edge-api}.ts`
-  на пине 113a969; `standalone/patches/audit.json`.
 - Память раннера vs облака — два разных, не смёрженных на момент написания
   change (проверить актуальность ссылок при их archive): `openspec/changes/
   task-rework-loop/design.md` раздел 3 (Развилка), п. (а) — почему
@@ -197,3 +189,12 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   сессий в Durable Object с SQLite уже сегодня, бесплатно, ветка
   `agent/258-cloud-orchestrator-convergence`, PR #262, не смёржено на
   момент написания).
+
+## Источники
+
+- Живой прод (RPC-пробы 2026-08-31): workspace/session/rename/archive/list,
+  кодировки заголовков, идемпотентность workspace.create.
+- npm-пакеты `@deepseek-ai/dsh-session`, `dsh-llm`, `dsh-workspace`,
+  `dsh-host-apiproxy`, `dsh-session-title*` 0.1.1-rc.2 (types и lib).
+- `apps/dsh-edge/src/{index,instance,session-store,http,auth,edge-api}.ts`
+  на пине 113a969; `standalone/patches/audit.json`.
