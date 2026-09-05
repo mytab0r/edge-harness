@@ -160,23 +160,12 @@ def list_pr_files(repo: str, pr: int, gh_func) -> list[dict]:
     только первую (`?per_page=100` без `page=`), поэтому у PR за сотню файлов
     правка файла ЗА первой сотней не меняла `diff_fingerprint` — `ai:ok`
     переживал настоящую правку автора молча (гейт открыт по протухшему
-    вердикту), а сумма `additions` занижалась в обоих гейтах. Листание —
-    та же форма, что уже доказана `latest_ai_comment` ниже: короткая
-    страница (`len(chunk) < 100`) означает «дальше страниц нет» — bool(chunk)
-    защищает от пустого/не-списочного ответа на случай гонки (PR закрыт
-    между страницами).
+    вердикту), а сумма `additions` занижалась в обоих гейтах. Обход страниц —
+    одно место правды в list_pages ниже (#308: та же форма для любого
+    списочного эндпоинта, четвёртая копия того же цикла здесь была бы
+    рецидивом того же класса, что и сам #308) — эта функция лишь несёт URL.
     """
-    page = 1
-    files: list[dict] = []
-    while True:
-        chunk = gh_func(f"repos/{repo}/pulls/{pr}/files?per_page=100&page={page}")
-        if not isinstance(chunk, list) or not chunk:
-            break
-        files.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return files
+    return list_pages(f"repos/{repo}/pulls/{pr}/files?per_page=100", gh_func)
 
 
 def list_pages(url: str, gh_func) -> list[dict]:
@@ -188,13 +177,27 @@ def list_pages(url: str, gh_func) -> list[dict]:
 
     Найдено на живом репозитории (2026-09-05): `open_task_issues` и
     `open_pulls` в scheduler.py читали сырую первую страницу
-    `...?state=open&...&per_page=100` без обхода — при 107 открытых задачах
-    с меткой `task` (и растущем числе открытых PR) воркер и планировщик
-    молча не видели хвост за первой сотней: не ошибка, не предупреждение,
-    задачи просто не существовали для пула. `reap_stale` читал таймлайн той
-    же сырой формой (`.../timeline?per_page=100`) — тот же класс, что уже
-    чинили в `last_review_ok_labeled_at`/`last_ready_labeled_at` (#303), сюда
-    не мигрировали; там теперь используется list_timeline ниже."""
+    `...?state=open&...&per_page=100` без обхода — при 106 открытых задачах
+    с меткой `task` (107 сырых записей issues на этой выборке; одна из них,
+    #248, сама PR под меткой task и отфильтровывается по ключу
+    pull_request — см. fixtures_open_task_issues_310.json) и растущем числе
+    открытых PR воркер и планировщик молча не видели хвост за первой сотней:
+    не ошибка, не предупреждение, задачи просто не существовали для пула.
+    `reap_stale` читал таймлайн той же сырой формой
+    (`.../timeline?per_page=100`) — тот же класс, что уже чинили в
+    `last_review_ok_labeled_at`/`last_ready_labeled_at` (#303), сюда не
+    мигрировали; там теперь используется list_timeline ниже.
+
+    Fail loud (находка ревью PR #311): стоп-условие ниже — `len(chunk) < 100`,
+    жёстко зашитое число, а не размер страницы из URL. Вызов с чужим
+    `per_page` (например 50 на списке из 120 записей) молча вернул бы только
+    первую страницу — тот же класс silent-wrong, который эта функция и
+    закрывает для остальных вызовов. Проверка ниже делает такой вызов
+    невозможным вместо того, чтобы полагаться на дисциплину вызывающих."""
+    if "per_page=100" not in url:
+        raise ValueError(
+            f"list_pages требует per_page=100 в URL (стоп-условие "
+            f"len(chunk) < 100 иначе молча теряет хвост): {url!r}")
     page = 1
     items: list[dict] = []
     while True:
@@ -216,20 +219,10 @@ def list_timeline(repo: str, number: int, gh_func) -> list[dict]:
     `timeline?per_page=100` без обхода — на PR с длинным таймлайном (много
     комментариев/пушей/перелейбловок) событие `labeled` за первой сотней
     молча не находилось, `ready_since`/anchor обнулялись именно на самых
-    долгоживущих PR — тех, ради которых порог и написан. Листание — та же
-    форма, что list_pr_files: короткая страница (`len(chunk) < 100`) значит
-    «дальше страниц нет»."""
-    page = 1
-    events: list[dict] = []
-    while True:
-        chunk = gh_func(f"repos/{repo}/issues/{number}/timeline?per_page=100&page={page}")
-        if not isinstance(chunk, list) or not chunk:
-            break
-        events.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return events
+    долгоживущих PR — тех, ради которых порог и написан. Обход страниц —
+    одно место правды в list_pages ниже (та же причина, что у list_pr_files
+    выше): эта функция лишь несёт URL."""
+    return list_pages(f"repos/{repo}/issues/{number}/timeline?per_page=100", gh_func)
 
 
 def diff_fingerprint(files) -> str:
@@ -374,20 +367,17 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
 
     Листает все страницы (per_page=100) — эндпоинт комментариев не
     поддерживает сортировку по убыванию (замер file_tasks.py на PR #138),
-    поэтому «последний» ищем перебором, как уже делает file_tasks.latest_review_comment."""
-    page = 1
+    поэтому «последний» ищем перебором, как уже делает file_tasks.latest_review_comment.
+    Обход страниц — тот же list_pages, что у list_pr_files/list_timeline
+    выше (#308): полный список собирается сначала, «последний подходящий»
+    ищется одним проходом по нему — порядок выдачи API list_pages сохраняет
+    (extend по страницам подряд), поэтому семантика «последний по порядку
+    среди доверенных с решающей шапкой» не меняется."""
     latest = None
-    while True:
-        chunk = gh_func(f"repos/{repo}/issues/{pr}/comments?per_page=100&page={page}")
-        if not isinstance(chunk, list) or not chunk:
-            break
-        for comment in chunk:
-            if not _is_trusted_verdict_author(comment):
-                continue
-            facts = header_facts(comment.get("body") or "")
-            if facts.get("reviewer") in ("approve", "rework", "error"):
-                latest = comment
-        if len(chunk) < 100:
-            break
-        page += 1
+    for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
+        if not _is_trusted_verdict_author(comment):
+            continue
+        facts = header_facts(comment.get("body") or "")
+        if facts.get("reviewer") in ("approve", "rework", "error"):
+            latest = comment
     return latest

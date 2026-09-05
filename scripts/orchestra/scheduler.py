@@ -162,8 +162,12 @@ def summary(lines: list[str]) -> None:
 def open_task_issues(repo: str) -> list[dict]:
     # Пагинация (#308, тот же класс, что list_pr_files/list_timeline, #294/
     # #303): сырая первая страница `per_page=100` молча теряла хвост — при
-    # 107 открытых задачах с меткой task (замер 2026-09-05) воркер и
-    # планировщик не видели последние 7, без ошибки и без предупреждения.
+    # 106 открытых задачах с меткой task (107 сырых записей issues на этой
+    # выборке, одна из них — #248, сама PR под меткой task, отфильтрована
+    # ниже по ключу pull_request; замер 2026-09-05, живой репозиторий —
+    # `open_task_issues` и `search/issues?...&label:task` сошлись на 107)
+    # воркер и планировщик не видели последние 7, без ошибки и без
+    # предупреждения.
     issues = review_labels.list_pages(
         f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]

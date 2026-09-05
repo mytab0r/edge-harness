@@ -1222,11 +1222,13 @@ def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
 
 # ── Пагинация пула задач/PR/таймлайна reap_stale: активный дефект в проде
 # (#308-класс): open_task_issues/open_pulls читали сырую первую страницу
-# `per_page=100` без обхода — при 107 открытых задачах с меткой task (замер
-# 2026-09-05, живой репозиторий) хвост за первой сотней был невидим воркеру
-# и планировщику без ошибки. reap_stale читал таймлайн issue той же сырой
-# формой — тот же класс, что last_review_ok_labeled_at/last_ready_labeled_at
-# (#303), сюда не мигрировали. ────────────────────────────────────────────────
+# `per_page=100` без обхода — при 106 открытых задачах с меткой task (107
+# сырых записей issues на этой выборке; #248 сама PR под меткой task,
+# отфильтровывается по ключу pull_request — замер 2026-09-05, живой
+# репозиторий) хвост за первой сотней был невидим воркеру и планировщику
+# без ошибки. reap_stale читал таймлайн issue той же сырой формой — тот же
+# класс, что last_review_ok_labeled_at/last_ready_labeled_at (#303), сюда не
+# мигрировали. ─────────────────────────────────────────────────────────────
 
 
 def test_open_task_issues_and_open_pulls_read_through_paginated_helper():
@@ -1253,10 +1255,12 @@ def test_reap_stale_reads_timeline_through_paginated_helper():
 
 def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
     # Поведенческое доказательство на уровне вызывающей функции open_task_issues
-    # (не только текст исходника выше): реальный снимок 100+7 открытых задач с
+    # (не только текст исходника выше): реальный снимок 100+7 открытых issue с
     # меткой task (repos/mytab0r/edge-harness/issues?state=open&labels=task,
     # 2026-09-05) — до фикса (сырая первая страница) видны только 100, после —
-    # все 107.
+    # все 107 сырых записей, но одна из них (#248) сама PR (несёт ключ
+    # "pull_request", по которому open_task_issues и фильтрует) — то есть
+    # настоящих задач 106, а #248 обязана быть отфильтрована.
     import json
     fixture = _DIR.parent / "lib" / "fixtures_open_task_issues_310.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -1276,9 +1280,14 @@ def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
 
     monkeypatch.setattr(sch, "gh", fake_gh)
     issues = sch.open_task_issues(REPO)
-    # Мутация: верни только первую страницу (уберите обход в list_pages/
-    # верните gh(...) без page=) — это число упадёт до 100, тест покраснеет.
-    assert len(issues) == len(page1) + len(page2) == 107
+    numbers = [issue["number"] for issue in issues]
+    # Мутация 1: верни только первую страницу (уберите обход в list_pages/
+    # верните gh(...) без page=) — упадёт до 99 (page1 без #248), покраснеет.
+    # Мутация 2: сотри фильтр "pull_request" not in issue в open_task_issues —
+    # #248 вернётся в список, число снова станет 107, покраснеет.
+    assert len(issues) == 106
+    assert 248 not in numbers  # #248 — настоящий PR (несёт "pull_request"), не задача
+    assert 86 in numbers  # последняя запись второй страницы — обход не потерял хвост
 
 
 def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):
@@ -1774,7 +1783,10 @@ def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
             # GitHub API без &page= отдаёт первую сотню — именно её вернул бы
             # старый код, теряя cf-worker/worker.js со страницы 2.
             return page1
-        if joined == f"repos/{REPO}/issues/21/comments?per_page=100":
+        # Маршрут с &page=1 — pulse_guard.issue_marker_times читает через
+        # _all_issue_comments (#308/#309, слито параллельно этому PR): та же
+        # пагинация, что и у review_labels.list_pages, обход добавляет page=.
+        if joined == f"repos/{REPO}/issues/21/comments?per_page=100&page=1":
             return []
         if joined == f"-X PATCH repos/{REPO}/issues/21 -f state=closed":
             return None
@@ -2275,7 +2287,9 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
 
     assert hard_failure is False
     assert lines == []
-    assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100"]  # только чтение маркера
+    # только чтение маркера — pulse_guard._all_issue_comments (#308/#309)
+    # листает страницы, короткая первая страница останавливает обход сразу.
+    assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100&page=1"]
 
 
 def test_accept_merged_tasks_ok_close_failure_does_not_stop_the_rest(monkeypatch):

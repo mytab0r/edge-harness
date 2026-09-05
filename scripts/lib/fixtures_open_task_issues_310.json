@@ -1,5 +1,5 @@
 {
-  "_comment": "Прод-форма: gh api repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100 (page1) и page=2 (page2), снято 2026-09-05. Поля сужены jq-фильтром до number/has_pr (has(\"pull_request\")) — только то, что использует open_task_issues.",
+  "_comment": "Прод-форма: gh api repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100 (page1) и page=2 (page2), снято 2026-09-05. Поля сужены jq-фильтром до number/has_pr — но open_task_issues фильтрует ровно по ключу \"pull_request\" (`\"pull_request\" not in issue`), а не по has_pr: сужение молча роняло сам ключ, по которому идёт фильтр, и тест закреплял мёртвый фильтр (все 107 записей проходили). У #248 (единственный настоящий PR в этом снимке) ключ \"pull_request\" восстановлен в прод-форме (gh api repos/mytab0r/edge-harness/issues/248 --jq '{number, pull_request}', снято 2026-09-05) — has_pr оставлен рядом как читаемая аннотация, но фильтрует не он.",
   "page1": [
     {
       "has_pr": false,
@@ -151,7 +151,14 @@
     },
     {
       "has_pr": true,
-      "number": 248
+      "number": 248,
+      "pull_request": {
+        "url": "https://api.github.com/repos/mytab0r/edge-harness/pulls/248",
+        "html_url": "https://github.com/mytab0r/edge-harness/pull/248",
+        "diff_url": "https://github.com/mytab0r/edge-harness/pull/248.diff",
+        "patch_url": "https://github.com/mytab0r/edge-harness/pull/248.patch",
+        "merged_at": null
+      }
     },
     {
       "has_pr": false,

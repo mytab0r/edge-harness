@@ -66,21 +66,6 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "raise RuntimeError(...)` — полная страница кричит громко вместо "
         "молчаливой обрезки (AGENTS.md «fail loud»), листать страницы здесь "
         "осознанно не стали.",
-    # scripts/orchestra/scheduler.py занят параллельным агентом на дату этой
-    # гвардии (#308, 2026-09-05) — правка запрещена условиями задачи. Часть
-    # вызовов ниже безопасна по природе (bounded), часть — реальный риск
-    # усечения, оставленный НЕ починенным по этой же причине (см. отчёт #308):
-    # снять записи open_task_issues/open_pulls/reap_stale, когда файл освободится.
-    ("scripts/orchestra/scheduler.py", "open_task_issues"):
-        "ИЗВЕСТНЫЙ риск (открытых task-issue уже 91 из 100 на 2026-09-05) — "
-        "не починено этой гвардией: файл занят параллельным агентом (#308).",
-    ("scripts/orchestra/scheduler.py", "open_pulls"):
-        "ИЗВЕСТНЫЙ риск (список открытых PR может перевалить за 100) — не "
-        "починено этой гвардией: файл занят параллельным агентом (#308).",
-    ("scripts/orchestra/scheduler.py", "reap_stale"):
-        "ИЗВЕСТНЫЙ риск (таймлайн issue без обхода — тот же класс, что уже "
-        "чинили в last_review_ok_labeled_at/last_ready_labeled_at, #303) — не "
-        "починено этой гвардией: файл занят параллельным агентом (#308).",
     ("scripts/orchestra/scheduler.py", "pr_check_runs"):
         "check-run'ы ОДНОГО PR — фиксированный малый список обязательных "
         "проверок этого репозитория, не растущий список.",
@@ -88,6 +73,19 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "тот же check-runs, что pr_check_runs — тело инлайн внутри merge_queue.",
     ("scripts/orchestra/scheduler.py", "worker_runs_active"):
         "явный `per_page=1` — запрошен только последний прогон, не список.",
+    # Появились с #253 (стадия приёмки, слито после этой гвардии, #308/#309) —
+    # не находка PR #311, добавлены здесь только чтобы гвардия оставалась
+    # зелёной после ребейза на main; классификация та же, что у соседних
+    # записей pr_check_runs/merge_queue/recent_runs выше.
+    ("scripts/orchestra/scheduler.py", "deploy_evidence"):
+        "`per_page=10` — запрошены последние N прогонов ОДНОГО workflow "
+        "(deploy-worker.yml), кандидат ищется по head_sha=merge_commit_sha "
+        "среди них же — тот же контракт «дай N последних», что у "
+        "pulse_guard.recent_runs, не полный список.",
+    ("scripts/orchestra/scheduler.py", "script_evidence"):
+        "check-runs ОДНОГО коммита (head_sha) — тот же контракт, что "
+        "pr_check_runs выше: фиксированный малый список обязательных "
+        "проверок этого репозитория, не растущий список.",
 }
 
 
