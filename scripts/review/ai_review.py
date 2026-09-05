@@ -3,6 +3,10 @@
 
 Trust-зона разрезана по шагам workflow ai-review:
 
+  should-run (доверенный, GH_TOKEN) — trusted-facts шаг ai-review.yml: PR уже
+                                      прошёл review:ok, но дорогой прогон нужен,
+                                      только если дифф действительно изменился
+                                      с последнего вердикта (#294 — см. ниже)
   gather  (доверенный, GH_TOKEN)   — факты PR, дифф-пак, задача из пула,
                                       промпт по шаблону scripts/review/ai_prompt.md
   DSH     (НЕдоверенный, без токена) — агент читает репозиторий и дифф-пак,
@@ -27,6 +31,18 @@ error, неоднозначность никогда не одобряет.
 отпечаток диффа PR на момент вердикта (review_labels.diff_fingerprint,
 #252): check_pr.py сверяет его с текущим и сохраняет ai:*-метку, если
 подтягивание main не изменило дифф PR — см. review_labels.diff_unchanged.
+
+Триггер ai-review.yml — workflow_run от pr-review, не метка (GITHUB_TOKEN не
+создаёт событий по меткам): сохранённая check_pr.py метка сама по себе не
+мешает workflow_run запуститься заново на чистом подтягивании main. Находка
+вердикта AI-ревью PR #294: критерий приёмки «слияние одного PR не порождает
+дорогих прогонов у остальных» не выполнялся, пока сверка отпечатка жила
+только в check_pr.py. Чинит cmd_should_run/review_labels.should_run_ai_review
+— то же место правды, что диффов diff_fingerprint/diff_unchanged, читаемое
+шагом facts ai-review.yml ДО чекаута/gather/DSH: go=false — трудный прогон
+не идёт вовсе, не просто «метка не переставляется». ai:failed из этого
+пропуска исключён — его автоповтор по таймеру (#196) не должен зависеть от
+неизменности диффа.
 
 Тормоз/газ размерного гейта (#204): approve на том же head, что и review:large,
 автоматически ставит review:large-ok (см. apply_large_ok/large_ok_decision) —
@@ -385,7 +401,10 @@ def cmd_gather(args: argparse.Namespace) -> int:
         raise RuntimeError(f"gh pr diff {args.pr}: rc={diff_run.returncode}, "
                            f"diff пуст: {diff_run.stderr.strip()[:200]}")
     diff = diff_run.stdout
-    files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
+    # Постранично (#294): review_labels.list_pr_files — то же место правды,
+    # что и у check_pr.py; первая страница у PR за сотню файлов молча теряла
+    # хвост (недосчёт added, невидимая правка для diff_fingerprint в verdict).
+    files = review_labels.list_pr_files(repo, args.pr, gh)
     added = sum(f["additions"] for f in files)
     listing = "\n".join(f"{f['filename']} (+{f['additions']}/-{f['deletions']})" for f in files)
 
@@ -412,6 +431,31 @@ def cmd_gather(args: argparse.Namespace) -> int:
         json.dumps({"pr": args.pr, "head": pull["head"]["sha"]}), encoding="utf-8")
     print(f"gather: PR #{args.pr} head {pull['head']['sha'][:12]}, "
           f"+{added} строк, промпт {len(prompt)} байт, пак {pack}")
+    return 0
+
+
+# ── should-run: нужен ли дорогой прогон вообще (#294) ────────────────────────
+#
+# Вызывается из шага «trusted facts» самого ai-review.yml ДО чекаута
+# pr-head/gather/DSH: PR уже прошёл проверку `review:ok` (её делает bash-код
+# facts-шага), эта команда решает, оправдан ли дорогой вызов модели, ту же
+# функцию, что читает check_pr.py для решения «сохранить ли метку»
+# (review_labels.should_run_ai_review — одно место правды, а не вторая копия
+# условия в YAML).
+
+def cmd_should_run(args: argparse.Namespace) -> int:
+    repo = os.environ["GITHUB_REPOSITORY"]
+    pull = gh(f"repos/{repo}/pulls/{args.pr}")
+    current_labels = {label["name"] for label in pull["labels"]}
+    files = review_labels.list_pr_files(repo, args.pr, gh)
+    current_fp = review_labels.diff_fingerprint(files)
+    ai_comment = review_labels.latest_ai_comment(repo, args.pr, gh)
+    stored_fp = (review_labels.header_facts(ai_comment.get("body") or "").get("diff")
+                 if ai_comment else None)
+    run_needed = review_labels.should_run_ai_review(current_labels, stored_fp, current_fp)
+    # Единственная строка на stdout — bash-шаг ai-review.yml читает её как
+    # $(...), никакого другого вывода в этой команде быть не должно.
+    print("true" if run_needed else "false")
     return 0
 
 
@@ -471,7 +515,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # Газ к тормозу review:large (#204): подтверждение размера опирается на
     # состоявшийся вердикт AI, а не на факт запуска — считается ПОСЛЕ того,
     # как ai:*-метка на месте, чтобы large_ok_decision видел актуальный verdict.
-    files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
+    files = review_labels.list_pr_files(repo, args.pr, gh)
     added = sum(f["additions"] for f in files)
     apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
@@ -501,6 +545,11 @@ def main() -> int:
     gather.add_argument("--pr", type=int, required=True)
     gather.add_argument("--out", required=True)
     gather.set_defaults(func=cmd_gather)
+
+    should_run = sub.add_parser(
+        "should-run", help="нужен ли дорогой прогон (печатает true/false, #294)")
+    should_run.add_argument("--pr", type=int, required=True)
+    should_run.set_defaults(func=cmd_should_run)
 
     verdict = sub.add_parser("verdict", help="разбор ответа + комментарий + метка")
     verdict.add_argument("--pr", type=int, required=True)

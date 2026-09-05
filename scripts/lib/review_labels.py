@@ -149,6 +149,33 @@ def ai_verdicts_to_drop(labels) -> list[str]:
 # (base...head по merge-base), поэтому отпечаток по нему устойчив к чистому
 # подтягиванию main и меняется только при реальной правке файлов PR.
 
+def list_pr_files(repo: str, pr: int, gh_func) -> list[dict]:
+    """Все файлы PR постранично, не только первая страница `per_page=100`.
+
+    Класс (#294, вердикт ai-review PR #294): `gh api pulls/{n}/files` режет
+    ответ на страницы по 100; и `check_pr.py`, и `ai_review.py` раньше читали
+    только первую (`?per_page=100` без `page=`), поэтому у PR за сотню файлов
+    правка файла ЗА первой сотней не меняла `diff_fingerprint` — `ai:ok`
+    переживал настоящую правку автора молча (гейт открыт по протухшему
+    вердикту), а сумма `additions` занижалась в обоих гейтах. Листание —
+    та же форма, что уже доказана `latest_ai_comment` ниже: короткая
+    страница (`len(chunk) < 100`) означает «дальше страниц нет» — bool(chunk)
+    защищает от пустого/не-списочного ответа на случай гонки (PR закрыт
+    между страницами).
+    """
+    page = 1
+    files: list[dict] = []
+    while True:
+        chunk = gh_func(f"repos/{repo}/pulls/{pr}/files?per_page=100&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        files.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return files
+
+
 def diff_fingerprint(files) -> str:
     """Отпечаток содержимого диффа PR — sha256 по отсортированному списку
     `имя_файла:статус:blob-sha` из прод-формы `gh api .../pulls/{n}/files`.
@@ -178,6 +205,46 @@ def diff_unchanged(stored_fingerprint: str | None, current_fingerprint: str) -> 
     ложный сброс стоит лишнего круга ревью, ложное сохранение пропускает
     непроверенный код в main — при сомнении выбираем сброс (AGENTS.md)."""
     return bool(stored_fingerprint) and stored_fingerprint == current_fingerprint
+
+
+# ── Дорогой прогон второго гейта переживает подтягивание main (#294) ────────
+#
+# Диагноз вердикта AI-ревью на PR #294: `check_pr.py` сохраняет `ai:*`-метку
+# при неизменном диффе (diff_unchanged выше), НО сам workflow `ai-review.yml`
+# всё равно триггерится — он слушает не метку, а `workflow_run` от
+# `pr-review` (события от GITHUB_TOKEN не создают триггеров по меткам,
+# см. шапку ai-review.yml). Предохранители workflow (conclusion == success,
+# review:ok, совпадение head) при чистом подтягивании все зелёные — дорогой
+# вызов модели стартует вхолостую. Критерий приёмки задачи («слияние одного
+# PR не порождает прогонов второго гейта у остальных») этим не выполнялся.
+#
+# should_run_ai_review — общее решение «нужен ли этот прогон вообще»,
+# читаемое ai-review.yml (подкоманда ai_review.py::cmd_should_run) ДО того,
+# как job перейдёт к доверенному чекауту/gather/DSH: то же место правды, что
+# и diff_unchanged/ai_verdicts_to_drop, чтобы workflow не завёл вторую копию
+# условия рядом с check_pr.py.
+
+def should_run_ai_review(current_labels, stored_fingerprint: str | None,
+                          current_fingerprint: str) -> bool:
+    """True — второй гейт обязан выполнить дорогой прогон; False — прогон
+    можно пропустить целиком (ai-review.yml отдаёт go=false до чекаута/DSH).
+
+    Пропуск возможен ТОЛЬКО когда на PR уже стоит ОКОНЧАТЕЛЬНЫЙ вердикт
+    (`ai:ok`/`ai:changes-requested`) и его отпечаток диффа совпал с текущим
+    (`diff_unchanged`) — ревьюер уже видел ровно этот код. `ai:failed`
+    НИКОГДА не пропускает прогон, даже если дифф не менялся: у него
+    отдельный, ранее выданный газ на автоповтор по таймеру
+    (`scheduler.py::trigger_ai_review`, #196) — совпавший отпечаток не
+    должен отнимать этот газ, иначе повторная попытка после сбоя
+    провайдера/транспорта молча перестанет случаться. Вердикта нет вовсе
+    (первое ревью PR) — прогон тоже нужен, пропускать нечего.
+    """
+    names = _names(current_labels)
+    if AI_FAILED in names:
+        return True
+    if not (names & {AI_OK, AI_CHANGES}):
+        return True
+    return not diff_unchanged(stored_fingerprint, current_fingerprint)
 
 
 # Шапка-факты ревью-комментария: pr/head/reviewer (ai_review.build_comment)

@@ -20,3 +20,31 @@
       `ai:failed`: условие снятия уточнено («новый пуш с изменённым диффом»,
       не любой пуш), ссылки переведены на форму `file::symbol`.
 - [x] Дельта-спека `openspec/changes/ai-verdict-survives-merge/`.
+
+## Правка после вердикта AI-ревью PR #294 (три находки)
+
+- [x] `scripts/lib/review_labels.py` — `list_pr_files` (общая пагинация
+      `pulls/{n}/files`, переиспользуется `check_pr.py` и `ai_review.py`),
+      `should_run_ai_review` (различает `ai:failed` от `ai:ok`/
+      `ai:changes-requested`, газ #196 не отнимается).
+- [x] `scripts/review/ai_review.py` — подкоманда `should-run`
+      (`cmd_should_run`), `cmd_gather`/`cmd_verdict` переведены на
+      `review_labels.list_pr_files`.
+- [x] `scripts/review/check_pr.py` — `main()` переведён на
+      `review_labels.list_pr_files`.
+- [x] `.github/workflows/ai-review.yml` — новый шаг `fingerprint` (job
+      `review`) перед чекаутом `pr-head`/`gather`/DSH: `go=false` при
+      неизменном диффе и окончательном вердикте, останавливает job до
+      дорогой работы, не только не переставляет метку.
+- [x] Тесты (прод-форма, доказаны мутацией):
+      `scripts/lib/fixtures_pr_over_100_files.json` (синтетическая
+      фикстура — реальных PR с >100 файлами в репозитории нет, склеены две
+      настоящие страницы `pulls/{n}/files` PR #278 и #10),
+      `scripts/lib/test_review_labels.py` (`list_pr_files` пагинация,
+      `should_run_ai_review` все ветки + мутация),
+      `scripts/review/test_check_pr.py`/`test_ai_review.py` (пагинация не
+      теряет хвост в `added`).
+- [x] `openspec/changes/ai-verdict-survives-merge/proposal.md` — раздел
+      «Что вне рамок» и `docs/agents/LABELS.md` приведены в соответствие с
+      реальным механизмом (workflow_run, не метка), ссылки в форме
+      `file::symbol`.

@@ -10,6 +10,7 @@ gh не вызывается ни одной тестируемой функци
 Запуск: python -m pytest scripts/review/test_ai_review.py -q
 """
 
+import argparse
 import importlib.util
 from pathlib import Path
 
@@ -402,6 +403,100 @@ def test_huge_diff_escalation_text_ends_with_next_steps_section():
 
 
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
+
+# ── Пагинация файлов PR: класс «первая страница молча теряет хвосты»
+# закрыт (находка вердикта ai-review PR #294) ────────────────────────────────
+
+def test_ai_review_gather_and_verdict_read_files_through_paginated_helper():
+    # gather, verdict, should_run — все три места, читавшие раньше сырую
+    # первую страницу, теперь идут через общую пагинацию.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.list_pr_files(repo, args.pr, gh)") == 3
+    assert 'gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")' not in source
+
+
+# ── cmd_should_run: дорогой прогон второго гейта НЕ стартует на неизменном
+# диффе (находка 1 вердикта ai-review PR #294) — проверяется именно то, что
+# подкоманда отвечает go=false, а не только что метка бы сохранилась ────────
+
+def _fake_gh_should_run(labels, comment_body, files):
+    """gh(url) с прод-формой трёх эндпоинтов, которые дёргает cmd_should_run:
+    pulls/{pr} (labels), pulls/{pr}/files?...&page=N (постранично),
+    issues/{pr}/comments?...&page=N (постранично)."""
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"labels": [{"name": name} for name in labels]}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        if url.startswith("repos/o/r/issues/294/comments"):
+            page = url.split("page=")[-1]
+            return [{"body": comment_body}] if page == "1" and comment_body else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+    return fake_gh
+
+
+def test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok(monkeypatch, capsys):
+    files = [
+        {"filename": "a.py", "status": "modified", "sha": "aaa111"},
+        {"filename": "b.py", "status": "modified", "sha": "bbb222"},
+    ]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    # Прогон НЕ стартует: подкоманда сама отвечает "false", а не просто
+    # «метка сохранилась бы» — именно это читает шаг fingerprint ai-review.yml.
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_prints_true_when_diff_changed_ai_ok(monkeypatch, capsys):
+    files = [
+        {"filename": "a.py", "status": "modified", "sha": "aaa111"},
+        {"filename": "b.py", "status": "modified", "sha": "bbb222"},
+    ]
+    # Отпечаток в комментарии — от ДРУГОГО, более старого списка файлов:
+    # реальная правка автора между вердиктом и этим пушем.
+    stale_fp = rl.diff_fingerprint([{"filename": "a.py", "status": "modified", "sha": "old"}])
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {stale_fp}\n\nОк.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_prints_true_when_no_ai_comment_yet(monkeypatch, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok"], "", files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_prints_true_for_ai_failed_even_with_matching_fingerprint(monkeypatch, capsys):
+    # Газ #196: ai:failed никогда не должен пропускать прогон, даже если
+    # дифф не менялся — иначе таймерный автоповтор молча перестал бы случаться.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: error\ndiff: {fp}\n\nошибка.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:failed"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
 
 def test_is_not_found_exact_form_only():
     # прод-форма gh: «gh api repos/o/r/issues/404: Not Found (HTTP 404)»

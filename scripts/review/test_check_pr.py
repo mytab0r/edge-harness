@@ -181,6 +181,20 @@ def test_ai_verdict_keep_false_without_stored_fingerprint():
     assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], None, current) is False
 
 
+# ── Пагинация файлов PR: класс «первая страница молча теряет хвосты»
+# закрыт (находка вердикта ai-review PR #294) ────────────────────────────────
+
+def test_check_pr_reads_files_through_paginated_helper():
+    # Гвардия по исходнику: main() обязан ходить через review_labels.list_pr_files
+    # (одно место правды, разделяемое с ai_review.py), а не читать сырую первую
+    # страницу gh(...pulls/{pr}/files?per_page=100) — именно эта форма молча
+    # теряла файлы за сотым у PR с >100 изменённых файлов (недосчёт added
+    # и невидимая для diff_fingerprint правка в хвосте).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "review_labels.list_pr_files(repo, args.pr, gh)" in source
+    assert 'gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")' not in source
+
+
 def test_ai_verdict_keep_mutation_guard_diff_unchanged():
     # Мутационная проверка (AGENTS.md, «доказано мутацией»): если убрать
     # условие diff_unchanged и оставить только «есть ai:*-метка» — этот тест

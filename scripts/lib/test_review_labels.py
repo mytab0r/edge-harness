@@ -222,3 +222,129 @@ def test_latest_ai_comment_picks_last_reviewer_fact_paginated():
 def test_latest_ai_comment_none_when_no_fact_comments():
     assert review_labels.latest_ai_comment(
         "o/r", 1, lambda url: [{"body": "просто обсуждение, без шапки"}]) is None
+
+
+# ── Пагинация pulls/{n}/files: класс «первая страница молча теряет хвосты»
+# закрыт (находка вердикта ai-review PR #294) ────────────────────────────────
+#
+# fixtures_pr_over_100_files.json — СИНТЕТИЧЕСКАЯ фикстура: в репозитории на
+# момент проверки (graphql changedFiles по всем 135 PR, 2026-09-05) нет PR
+# с >100 изменённых файлов, максимум — 76 (#278). page1/page2 склеены из
+# ДВУХ настоящих ответов `gh api pulls/{n}/files` (PR #278, 76 файлов + PR
+# #10, 32 файла = 108) — все поля реальные, склейка синтетическая (см.
+# "_comment" внутри фикстуры). page2_edited имитирует правку файла ЗА сотой
+# позицией: последнему файлу page2 (scripts/orchestra/scheduler.py)
+# присвоен sha другого РЕАЛЬНОГО файла того же снимка — не выдуманное
+# значение.
+
+FIXTURE_OVER100 = _DIR / "fixtures_pr_over_100_files.json"
+
+
+def _load_over100(key: str) -> list[dict]:
+    with open(FIXTURE_OVER100, encoding="utf-8") as file:
+        return json.load(file)[key]
+
+
+def _paged_gh(pages: dict[str, list[dict]]):
+    """Fake gh(url) с точным разбором параметра page= (не подстрокой —
+    "per_page=100" сам содержит "page=1", см. test_latest_ai_comment_*)."""
+    def fake_gh(url: str):
+        query = url.split("?", 1)[1] if "?" in url else ""
+        params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+        return pages.get(params.get("page"), [])
+    return fake_gh
+
+
+def test_list_pr_files_paginates_over_100_real_files_pr294():
+    page1 = _load_over100("page1")
+    page2 = _load_over100("page2")
+    fake_gh = _paged_gh({"1": page1, "2": page2})
+    files = review_labels.list_pr_files("o/r", 1, fake_gh)
+    assert len(files) == 108
+    assert {f["filename"] for f in files} == {f["filename"] for f in page1 + page2}
+
+
+def test_list_pr_files_stops_on_short_page():
+    fake_gh = _paged_gh({"1": [{"filename": "a", "status": "modified", "sha": "x"}]})
+    files = review_labels.list_pr_files("o/r", 1, fake_gh)
+    assert len(files) == 1
+
+
+def test_list_pr_files_empty_on_no_files():
+    assert review_labels.list_pr_files("o/r", 1, lambda url: []) == []
+
+
+def test_diff_fingerprint_misses_tail_edit_without_pagination_pr294():
+    # Класс, который явно назвала находка вердикта PR #294: ДОБАГОВЫЙ код
+    # читал только ПЕРВУЮ страницу (files = gh(...per_page=100), без листания)
+    # — правка файла на 101-й позиции была для отпечатка невидима.
+    page1 = _load_over100("page1")
+    page2 = _load_over100("page2")
+    page2_edited = _load_over100("page2_edited")
+    assert page2 != page2_edited  # фикстура действительно содержит правку
+
+    # ПОСЛЕ фикса (полная пагинация, list_pr_files) — правка в хвосте видна:
+    before_full = review_labels.diff_fingerprint(page1 + page2)
+    after_full = review_labels.diff_fingerprint(page1 + page2_edited)
+    assert before_full != after_full
+
+    # Симуляция ДОБАГОВОГО поведения (только page1, «per_page=100» без
+    # листания) — тот же самый файл-хвост правки для отпечатка не существует:
+    before_first_page_only = review_labels.diff_fingerprint(page1)
+    after_first_page_only = review_labels.diff_fingerprint(page1)
+    assert before_first_page_only == after_first_page_only  # правка молча потеряна
+
+
+def test_list_pr_files_fixes_added_undercount_pr294():
+    # «Заодно это чинит занижение added в обоих гейтах» (находка вердикта
+    # PR #294): сумма additions по одной странице меньше суммы по полному
+    # списку ровно на additions хвостовых файлов.
+    page1 = _load_over100("page1")
+    page2 = _load_over100("page2")
+    added_full = sum(f["additions"] for f in page1 + page2)
+    added_first_page_only = sum(f["additions"] for f in page1)
+    added_tail = sum(f["additions"] for f in page2)
+    assert added_tail > 0
+    assert added_full == added_first_page_only + added_tail
+    assert added_full != added_first_page_only
+
+
+# ── should_run_ai_review: дорогой прогон второго гейта переживает
+# подтягивание main, но не отнимает газ #196 у ai:failed (находка вердикта
+# ai-review PR #294) ─────────────────────────────────────────────────────────
+
+def test_should_run_ai_review_skips_on_final_verdict_and_unchanged_diff():
+    assert review_labels.should_run_ai_review([{"name": "ai:ok"}], "fp", "fp") is False
+    assert review_labels.should_run_ai_review(
+        [{"name": "ai:changes-requested"}], "fp", "fp") is False
+
+
+def test_should_run_ai_review_runs_when_diff_changed():
+    assert review_labels.should_run_ai_review([{"name": "ai:ok"}], "fp-old", "fp-new") is True
+    assert review_labels.should_run_ai_review([{"name": "ai:ok"}], None, "fp-new") is True
+
+
+def test_should_run_ai_review_runs_when_no_final_verdict_yet():
+    assert review_labels.should_run_ai_review([], None, "fp") is True
+    assert review_labels.should_run_ai_review([{"name": "review:ok"}], None, "fp") is True
+
+
+def test_should_run_ai_review_never_skips_ai_failed_even_with_matching_fingerprint():
+    # Газ #196 (scheduler.trigger_ai_review — автоповтор ai:failed по таймеру)
+    # не должен гаситься совпавшим отпечатком: ai:failed всегда «нужен прогон».
+    assert review_labels.should_run_ai_review([{"name": "ai:failed"}], "fp", "fp") is True
+
+
+def test_should_run_ai_review_mutation_guard_naive_any_verdict_check():
+    # Мутационная проверка (AGENTS.md, «доказано мутацией»): наивная реализация
+    # «есть любой ai:*-вердикт (bool(ai_verdicts_to_drop)) И дифф не менялся —
+    # пропустить» (ровно то, чем сейчас пользуется check_pr.ai_verdict_keep для
+    # РЕШЕНИЯ О МЕТКЕ, но НЕ годится для решения о запуске прогона) молча
+    # накрыла бы и ai:failed — тогда его автоповтор по таймеру #196 перестал
+    # бы срабатывать, если пуш пришёл с тем же диффом (например, ретрай через
+    # workflow_dispatch на неизменном коде). should_run_ai_review обязан
+    # отличаться от этой наивной формы именно в этой точке.
+    naive_would_skip = bool(review_labels.ai_verdicts_to_drop([{"name": "ai:failed"}])) and \
+        review_labels.diff_unchanged("fp", "fp")
+    assert naive_would_skip is True  # «наивная» реализация пропустила бы прогон
+    assert review_labels.should_run_ai_review([{"name": "ai:failed"}], "fp", "fp") is True  # фикс — нет

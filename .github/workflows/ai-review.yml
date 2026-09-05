@@ -8,6 +8,13 @@
 # review:ok (проверяет facts-шаг: успех бывает и с review:large).
 # Повтор/миграция — workflow_dispatch (input pr): события отгоревших PR
 # не восстановить.
+# review:ok сам по себе НЕ означает, что дорогой прогон нужен (#294): чистое
+# подтягивание main переставляет review:ok, не меняя дифф PR, и check_pr.py
+# в этом случае СОХРАНЯЕТ ai:*-метку — job review проверяет это отдельным
+# шагом fingerprint (scripts/review/ai_review.py::cmd_should_run,
+# review_labels.should_run_ai_review) ДО чекаута/gather/DSH и отдаёт go=false,
+# если дифф не изменился с последнего вердикта AI (ai:failed — исключение,
+# его автоповтор по таймеру #196 от диффа не зависит).
 # Итог: содержательный ревью-комментарий в PR + вердикт-метка ai:ok /
 # ai:changes-requested / ai:failed. Оркестратор сливает только при
 # review:ok И ai:ok (scripts/lib/review_labels.py — одно место правды).
@@ -75,7 +82,11 @@ jobs:
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
       pr: ${{ steps.facts.outputs.pr }}
-      go: ${{ steps.facts.outputs.go }}
+      # go — окончательное решение job'а: review:ok есть (facts) И дорогой
+      # прогон оправдан (fingerprint, #294). Шаг fingerprint не выполняется,
+      # если facts.go уже false — тогда его output пуст, что не равно 'true',
+      # и needs.review.outputs.go == 'true' в job verdict тоже корректно False.
+      go: ${{ steps.fingerprint.outputs.go }}
     steps:
       # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
       # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
@@ -153,10 +164,36 @@ jobs:
           ref: main
           persist-credentials: false
 
+      # Сверка отпечатка диффа (#294, находка вердикта ai-review PR #294):
+      # review:ok мог переставиться чистым подтягиванием main, при котором
+      # check_pr.py СОХРАНИЛ существующую ai:*-метку (diff_unchanged) — тогда
+      # дорогой прогон не нужен вовсе, а не просто «метка не переставится».
+      # go=false здесь останавливает job ДО чекаута pr-head/gather/DSH.
+      # Решение — review_labels.should_run_ai_review, то же место правды,
+      # что читает check_pr.py (cmd_should_run в ai_review.py, не вторая
+      # копия условия в YAML). ai:failed никогда не даёт пропустить прогон —
+      # у него отдельный газ на автоповтор по таймеру (#196).
+      - if: steps.facts.outputs.go == 'true'
+        id: fingerprint
+        name: Нужен ли дорогой прогон (сверка отпечатка диффа)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.facts.outputs.pr }}
+        run: |
+          set -o pipefail
+          run_needed=$(python scripts/review/ai_review.py should-run --pr "$PR_NUMBER") \
+            || { echo "::error::не смог решить, нужен ли дорогой прогон ai-review для PR #$PR_NUMBER"; exit 1; }
+          if [ "$run_needed" = "true" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "PR #$PR_NUMBER: дифф не изменился с последнего вердикта AI — дорогой прогон не нужен."
+          fi
+
       # Дерево PR — только ДАННЫЕ для агента: агент читает репозиторий в
       # состоянии ветки (docs/спеки/код), но ни один доверенный шаг отсюда
       # не исполняется.
-      - if: steps.facts.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true'
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.facts.outputs.head }}
@@ -164,12 +201,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - if: steps.facts.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: 24
 
-      - if: steps.facts.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true'
         name: Сбор фактов и промпт (доверенный шаг)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -181,7 +218,7 @@ jobs:
 
       # ── НЕдоверенный шаг: НИКАКОГО GitHub-токена в env ────────────────────
       # cwd = дерево PR (данные агента), сам транспорт — из main-чекаута.
-      - if: steps.facts.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true'
         name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -203,7 +240,7 @@ jobs:
       # (контракт: ≤5 находок + блоки задач). ДелIMITER не встретится в
       # ответе; даже если встретится — вывод исковеркается и verdict уйдёт
       # в error → ai:failed (fail-closed).
-      - if: steps.facts.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true'
         name: Ответ ревью — в выводы job'а
         id: answer
         env:

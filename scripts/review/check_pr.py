@@ -172,7 +172,10 @@ def main() -> int:
         if CONFLICT_MARKER.match(line):
             findings.append(f"Неразрешённый конфликт-маркер уехал в коммит (строка {i + 1}).")
 
-    files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
+    # Постранично (#294): первая страница молча теряет хвост у PR за сотню
+    # файлов — правка файла за сотым не меняла бы ни отпечаток диффа, ни
+    # сумму added (review_labels.list_pr_files — одно место правды).
+    files = review_labels.list_pr_files(repo, args.pr, gh)
     for f in files:
         name = f["filename"]
         if name.endswith(FORBIDDEN_FILES) or name in FORBIDDEN_FILES:
