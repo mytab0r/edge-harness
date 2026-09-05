@@ -3,7 +3,6 @@ import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
 
-import { asString, handsAreAlive, messageStuck } from "../src/harness";
 import { redact } from "../src/redact";
 import { LIMITS } from "../src/config";
 
@@ -987,8 +986,27 @@ describe("inbox: сообщения владельца", () => {
     expect(after.messages.new).toBe((before.messages.new || 0) + 1);
   });
 
-  it("ватчдог и водитель работают через публичный alarm(): зависший processing доводится, свежий new разбирается без ручного вызова", async () => {
-    const s = sender();
+  it("process: битый JSON — честный 400 bad_json, пустое тело — валидный прогон (никаких 200 с побочным эффектом)", async () => {
+    const bad = await WORKER.fetch("https://example.com/api/messages/process", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: "{это не json",
+    });
+    expect(bad.status).toBe(400);
+    const badBody = await bad.json<{ error: { code: string } }>();
+    expect(badBody.error.code).toBe("bad_json");
+
+    // Пустое тело — легально: значения по умолчанию.
+    const empty = await WORKER.fetch("https://example.com/api/messages/process", {
+      method: "POST",
+      headers: { ...AUTH },
+    });
+    expect(empty.status).toBe(200);
+    const emptyBody = await empty.json<{ processed: number }>();
+    expect(typeof emptyBody.processed).toBe("number");
+  });
+
+  it("ватчдог и водитель работают через публичный alarm(): зависший processing доводится, свежий new разбирается без ручного вызова", async () => {    const s = sender();
     // A — «изолят умер посреди внешнего вызова»: processing давний.
     const a = await (
       await postJson("/api/messages", { source: "t", source_msg_id: `stuck-${s}`, sender_id: s, text: "завис в processing" })
@@ -1072,9 +1090,9 @@ describe("чистые функции инбокса", () => {
 });
 
 describe("маскирование наружных текстов инбокса (тот же класс паттернов, что dsh-ci.sh::redact)", () => {
-  // Фикстуры — те же формы секретов, что гасит scripts/lib/dsh-ci.sh::redact:
-  // nvapi-/sk-/ghp_/github_pat_ в середину текста и без следов. Новая форма
-  // секрета добавляется в dsh-ci.sh и сюда одним классом правки.
+  // Фикстуры здесь — пересказ; ФОРМАЛЬНАЯ гвардия паритета —
+  // scripts/lib/test_redact_parity.py (repo-ci): извлекает sed-подстановки
+  // из dsh-ci.sh и сверяет с REDACT_PATTERNS один к одному.
   // Длинные формы собираются в рантайме: литерал из 20+ символов после
   // github_pat_/ghp_ — находка детерминированного ревью (check_pr), даже если
   // это фейковая фикстура теста.

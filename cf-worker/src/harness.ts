@@ -686,10 +686,17 @@ export class Harness extends DurableObject<Env> {
   }
 
   async #readJson(request: Request): Promise<Record<string, unknown>> {
-    const text = await request.text();
+    return this.#parseJsonText(await request.text());
+  }
+
+  /** Пустое тело — валидный пустой объект (маршруты с опциональным телом);
+   *  битый JSON — громкий 400, проглатывать его нигде нельзя (ревью PR #173:
+   *  единственный .catch(() => ({})) давал 200 с побочным эффектом). */
+  #parseJsonText(text: string): Record<string, unknown> {
     if (text.length > LIMITS.bodyMaxBytes) {
       throw new ApiError(413, "too_large", { limit: LIMITS.bodyMaxBytes });
     }
+    if (!text.trim()) return {};
     try {
       const parsed: unknown = JSON.parse(text);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1714,9 +1721,11 @@ export class Harness extends DurableObject<Env> {
     };
   }
 
-  /** Ручной запуск разбора (админ/тесты). Основной водитель — пульс DO. */
+  /** Ручной запуск разбора (админ/тесты). Основной водитель — пульс DO.
+   *  Тело опционально ({limit, retry_failed}), но битый JSON — честный 400:
+   *  молча трактовать его как «обработай всю очередь» нельзя (ревью PR #173). */
   async #processMessages(request: Request): Promise<Response> {
-    const body: Record<string, unknown> = await this.#readJson(request).catch(() => ({}));
+    const body = this.#parseJsonText(await request.text());
     const limit =
       typeof body.limit === "number" && Number.isFinite(body.limit)
         ? Math.min(Math.max(1, Math.trunc(body.limit)), MESSAGE_PROCESS_MAX)

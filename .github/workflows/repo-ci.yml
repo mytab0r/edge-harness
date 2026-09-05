@@ -184,6 +184,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
+      # Паритет маскирования (ревью PR #173): инбокс морды пишет фриформ-текст
+      # владельца в публичный issue — паттерны секретов cf-worker/src/redact.ts
+      # обязаны совпадать один к одному с dsh-ci.sh::redact. Две мутации
+      # краснят: форма добавлена только в bash; число форм разъехалось.
+      - name: Гвардия паритета маскирования секретов (bash ↔ TS)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_redact_parity.py -q
+
       # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
       # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
       # канонический комментарий (шапка-факты + фенсы) и гейт слияния по
