@@ -60,6 +60,10 @@ EXPECTED_WORKFLOWS = frozenset({
     "orchestra.yml",
     "pr-review.yml",
     "repo-ci.yml",
+    # Восстановлен в #72 (ворота CI морды по ADR 0004). Репо-секретов не читает
+    # вовсе: канарейка в CI ходит тестовым dev-token против локального wrangler
+    # dev, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "worker-ci.yml",
     "worker.yml",
 })
 
