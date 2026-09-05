@@ -30,11 +30,19 @@
       `task_ref.extract_task_refs`/`references_task` вне
       `ALLOWED_WIDE_USAGE` (сейчас только `scheduler.py`) красят CI.
       Мутация (временный вызов широкой функции в `ai_review.py`) доказана.
+- [x] `.github/workflows/repo-ci.yml` — шаг `python -m pytest
+      scripts/lib/test_task_ref_usage_guard.py -q` (находка AI-ревью PR #292:
+      файл гвардии лежал, но ни один workflow его не звал — «красит CI» не
+      наступало на практике).
 
 ## 4. Дельта-спека
 
 - [x] `openspec/changes/pr-task-resolver/proposal.md`, `design.md`,
-      `specs/journal-tasks-hands/spec.md` (п.17.1).
+      `specs/journal-tasks-hands/spec.md` (п.17.1) — п.17.1 также добавлен
+      прямо в главную спеку `openspec/specs/journal-tasks-hands.md`
+      (находка AI-ревью PR #292: без этого главная спека не знала бы про
+      резолвер, хотя код и гвардия уже его проводят; прецедент — PR #275/#134
+      правил changes/ и specs/ одним коммитом).
 
 ## Явно не задачи этого change
 

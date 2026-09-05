@@ -258,22 +258,6 @@ def test_redact_plain_text_untouched():
     assert ai.redact("обычный текст ревью без секретов") == "обычный текст ревью без секретов"
 
 
-# ── Номера задач из тела PR: одно место правды task_ref, не подстрока (#187) ──
-
-def test_task_section_uses_task_ref_not_substring():
-    # прод-форма тела PR (#188): «#180\n…» не должно отдавать 18 —
-    # извлечение чисел обязано идти через task_ref.extract_task_refs, не
-    # через голый r"#(\d+)".
-    body = "#180\n\nописание изменений"
-    assert ai.task_ref.extract_task_refs(body) == [180]
-    assert sorted(set(ai.task_ref.extract_task_refs(body))) == [180]
-
-
-def test_task_section_dedupes_and_sorts_numbers():
-    body = "см. #182 и снова #182, а также #18"
-    assert sorted(set(ai.task_ref.extract_task_refs(body))) == [18, 182]
-
-
 # ── task_section резолвит задачу через task_ref.resolve_pr_task, не через
 # первое попавшееся упоминание в прозе (#259) ─────────────────────────────────
 #
