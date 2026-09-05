@@ -52,6 +52,7 @@ jobs:
         id: validate
         env:
           PLUGIN_PATH: ${{ inputs.plugin_path }}
+          PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
         run: |
           PLUGIN_PATH="${PLUGIN_PATH}"
           [ -d "$PLUGIN_PATH" ] || { echo "::error::Каталог плагина не найден: $PLUGIN_PATH"; exit 1; }
@@ -63,8 +64,8 @@ jobs:
           [ "$PLUGIN_VERSION" != "null" ] && [ -n "$PLUGIN_VERSION" ] || { echo "::error::package.json: version обязателен"; exit 1; }
 
           # ID плагина: из ввода или из имени каталога
-          if [ -n "${{ inputs.plugin_id }}" ]; then
-            PLUGIN_ID="${{ inputs.plugin_id }}"
+          if [ -n "$PLUGIN_ID_INPUT" ]; then
+            PLUGIN_ID="$PLUGIN_ID_INPUT"
           else
             PLUGIN_ID=$(basename "$PLUGIN_PATH")
           fi
@@ -323,6 +324,7 @@ jobs:
           ASSET: ${{ steps.pack.outputs.asset }}
           SHA256: ${{ steps.pack.outputs.sha256 }}
           HAS_CLIENT: ${{ steps.validate.outputs.has_client }}
+          PLUGIN_ISSUE_INPUT: ${{ github.event.inputs.plugin_id }}
         run: |
           # GH_TOKEN авторизует только `gh`-вызовы; голому `git push` нужен
           # credential helper — `gh auth setup-git` (тот же паттерн, что в
@@ -399,7 +401,7 @@ jobs:
 
           git push -u origin "$BRANCH"
 
-          PLUGIN_ISSUE="${{ github.event.inputs.plugin_id }}"
+          PLUGIN_ISSUE="$PLUGIN_ISSUE_INPUT"
           [ -n "$PLUGIN_ISSUE" ] || PLUGIN_ISSUE="$PLUGIN_ID"
           # Ранее тело утверждало «после мержа PR автоматически запустится
           # deploy-dsh-edge.yml (push-триггер)» — неверно: этот workflow
