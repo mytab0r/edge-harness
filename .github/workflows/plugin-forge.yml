@@ -167,6 +167,7 @@ jobs:
       - name: Интеграционный дым (локальная сборка с плагином)
         id: smoke
         env:
+          GH_TOKEN: ${{ github.token }}
           PLUGIN_TARBALL: ${{ steps.pack.outputs.tarball }}
           PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
           PLUGIN_PACKAGE: ${{ steps.validate.outputs.plugin_name }}
@@ -216,8 +217,34 @@ jobs:
           # Зависимости standalone
           pnpm --dir apps/dsh-edge/standalone install --frozen-lockfile
 
-          # Добавляем плагин
-          pnpm --dir apps/dsh-edge/standalone add --save-exact "$PLUGIN_TARBALL"
+          # Остальные плагины манифеста (кроме бампимого — для него уже есть
+          # свежий tarball из шага «Собрать tarball»). Кодогенерация эмитит
+          # импорты под ВЕСЬ состав манифеста, а @edge-harness/* пакеты нигде
+          # не публикуются в npm-registry и патчами не ставятся — без них
+          # smoke-edge-plugins.mjs красится ERR_MODULE_NOT_FOUND на любом
+          # плагине всегда, а не на реальной проблеме (находка AI-ревью PR
+          # #273). Тот же паттерн скачивания и сверки sha256, что и
+          # deploy-dsh-edge.yml, шаг «Скачать плагины и сверить sha256».
+          mkdir -p "$GITHUB_WORKSPACE/other-plugins-tgz"
+          jq -r --arg id "$PLUGIN_ID" \
+            '.plugins[] | select(.id != $id) | [.id, .source.release, .source.asset, .source.sha256] | @tsv' \
+            "$GITHUB_WORKSPACE/dsh-edge/plugins.json" > "$GITHUB_WORKSPACE/other-plugins.tsv"
+          : > "$GITHUB_WORKSPACE/other-checksums.txt"
+          OTHER_TGZ=()
+          while IFS=$'\t' read -r other_id other_release other_asset other_sha; do
+            echo "плагин манифеста $other_id: релиз $other_release, asset $other_asset"
+            gh release download "$other_release" --repo "$GITHUB_REPOSITORY" \
+              --dir "$GITHUB_WORKSPACE/other-plugins-tgz" --pattern "$other_asset" --clobber \
+              || { echo "::error::Релиз $other_release недоступен — манифест ссылается на несуществующий источник (плагин $other_id)"; exit 1; }
+            [ -f "$GITHUB_WORKSPACE/other-plugins-tgz/$other_asset" ] || { echo "::error::В релизе $other_release нет asset'а $other_asset (плагин $other_id)"; exit 1; }
+            echo "$other_sha  $GITHUB_WORKSPACE/other-plugins-tgz/$other_asset" >> "$GITHUB_WORKSPACE/other-checksums.txt"
+            OTHER_TGZ+=("$GITHUB_WORKSPACE/other-plugins-tgz/$other_asset")
+          done < "$GITHUB_WORKSPACE/other-plugins.tsv"
+          [ ! -s "$GITHUB_WORKSPACE/other-checksums.txt" ] || sha256sum -c "$GITHUB_WORKSPACE/other-checksums.txt" \
+            || { echo "::error::sha256 остальных плагинов манифеста не сошёлся"; exit 1; }
+
+          # Добавляем плагин: свежий tarball + весь остальной состав манифеста разом
+          pnpm --dir apps/dsh-edge/standalone add --save-exact "${OTHER_TGZ[@]}" "$PLUGIN_TARBALL"
           # pnpm-патчи Workers обязательны; add обязан сохранить patchedDependencies
           # (класс silent-wrong #43, та же гвардия, что deploy-dsh-edge.yml —
           # без неё дым проходит зелёным на уже запатченных node_modules от
