@@ -419,6 +419,50 @@ def test_list_timeline_empty_on_no_events():
     assert review_labels.list_timeline("o/r", 1, lambda url: []) == []
 
 
+# ── list_pages: тот же класс, обобщённый на URL целиком (#308) ───────────────
+#
+# scheduler.open_task_issues/open_pulls читали сырую первую страницу списка
+# (issues?state=open&labels=task&per_page=100 / pulls?state=open&per_page=100)
+# без обхода — при 107 открытых задачах с меткой task (замер 2026-09-05, живой
+# репозиторий) хвост за первой сотней был невидим воркеру и планировщику без
+# ошибки и без предупреждения. reap_stale читал таймлайн issue той же сырой
+# формой — тот же класс, что last_review_ok_labeled_at/last_ready_labeled_at
+# (#303), сюда не мигрировали.
+
+FIXTURE_TASK_ISSUES = _DIR / "fixtures_open_task_issues_308.json"
+
+
+def _load_task_issues_pages() -> dict:
+    with open(FIXTURE_TASK_ISSUES, encoding="utf-8") as file:
+        return json.load(file)
+
+
+def test_list_pages_paginates_over_100_real_open_task_issues_308():
+    # Прод-форма: gh api repos/mytab0r/edge-harness/issues?state=open&labels=task
+    # &per_page=100 (page=1) и page=2, снято 2026-09-05 — не пересказ.
+    data = _load_task_issues_pages()
+    page1, page2 = data["page1"], data["page2"]
+    assert len(page1) == 100  # предпосылка сценария: первая страница ровно полная
+    assert len(page2) > 0  # хвост существует — иначе тест ничего не доказывает
+    fake_gh = _paged_gh({"1": page1, "2": page2})
+    items = review_labels.list_pages(
+        "repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100", fake_gh)
+    # Мутация: замени `while True: ...` на однократный `gh_func(url)` без
+    # обхода — этот тест покраснеет (len(items) упадёт до 100).
+    assert len(items) == len(page1) + len(page2)
+    assert {i["number"] for i in items} == {i["number"] for i in page1 + page2}
+
+
+def test_list_pages_stops_on_short_page():
+    fake_gh = _paged_gh({"1": [{"number": 1}]})
+    items = review_labels.list_pages("repos/o/r/issues?state=open&per_page=100", fake_gh)
+    assert len(items) == 1
+
+
+def test_list_pages_empty_on_no_items():
+    assert review_labels.list_pages("repos/o/r/issues?state=open&per_page=100", lambda url: []) == []
+
+
 # ── should_run_ai_review: дорогой прогон второго гейта переживает
 # подтягивание main, но не отнимает газ #196 у ai:failed (находка вердикта
 # ai-review PR #294) ─────────────────────────────────────────────────────────

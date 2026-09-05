@@ -1,0 +1,435 @@
+{
+  "_comment": "Прод-форма: gh api repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100 (page1) и page=2 (page2), снято 2026-09-05. Поля сужены jq-фильтром до number/has_pr (has(\"pull_request\")) — только то, что использует open_task_issues.",
+  "page1": [
+    {
+      "has_pr": false,
+      "number": 308
+    },
+    {
+      "has_pr": false,
+      "number": 307
+    },
+    {
+      "has_pr": false,
+      "number": 306
+    },
+    {
+      "has_pr": false,
+      "number": 305
+    },
+    {
+      "has_pr": false,
+      "number": 304
+    },
+    {
+      "has_pr": false,
+      "number": 302
+    },
+    {
+      "has_pr": false,
+      "number": 301
+    },
+    {
+      "has_pr": false,
+      "number": 300
+    },
+    {
+      "has_pr": false,
+      "number": 299
+    },
+    {
+      "has_pr": false,
+      "number": 298
+    },
+    {
+      "has_pr": false,
+      "number": 297
+    },
+    {
+      "has_pr": false,
+      "number": 296
+    },
+    {
+      "has_pr": false,
+      "number": 295
+    },
+    {
+      "has_pr": false,
+      "number": 293
+    },
+    {
+      "has_pr": false,
+      "number": 291
+    },
+    {
+      "has_pr": false,
+      "number": 290
+    },
+    {
+      "has_pr": false,
+      "number": 289
+    },
+    {
+      "has_pr": false,
+      "number": 287
+    },
+    {
+      "has_pr": false,
+      "number": 281
+    },
+    {
+      "has_pr": false,
+      "number": 276
+    },
+    {
+      "has_pr": false,
+      "number": 274
+    },
+    {
+      "has_pr": false,
+      "number": 272
+    },
+    {
+      "has_pr": false,
+      "number": 269
+    },
+    {
+      "has_pr": false,
+      "number": 268
+    },
+    {
+      "has_pr": false,
+      "number": 267
+    },
+    {
+      "has_pr": false,
+      "number": 266
+    },
+    {
+      "has_pr": false,
+      "number": 265
+    },
+    {
+      "has_pr": false,
+      "number": 264
+    },
+    {
+      "has_pr": false,
+      "number": 259
+    },
+    {
+      "has_pr": false,
+      "number": 258
+    },
+    {
+      "has_pr": false,
+      "number": 257
+    },
+    {
+      "has_pr": false,
+      "number": 256
+    },
+    {
+      "has_pr": false,
+      "number": 255
+    },
+    {
+      "has_pr": false,
+      "number": 254
+    },
+    {
+      "has_pr": false,
+      "number": 252
+    },
+    {
+      "has_pr": false,
+      "number": 251
+    },
+    {
+      "has_pr": false,
+      "number": 250
+    },
+    {
+      "has_pr": true,
+      "number": 248
+    },
+    {
+      "has_pr": false,
+      "number": 244
+    },
+    {
+      "has_pr": false,
+      "number": 243
+    },
+    {
+      "has_pr": false,
+      "number": 242
+    },
+    {
+      "has_pr": false,
+      "number": 240
+    },
+    {
+      "has_pr": false,
+      "number": 238
+    },
+    {
+      "has_pr": false,
+      "number": 236
+    },
+    {
+      "has_pr": false,
+      "number": 235
+    },
+    {
+      "has_pr": false,
+      "number": 233
+    },
+    {
+      "has_pr": false,
+      "number": 227
+    },
+    {
+      "has_pr": false,
+      "number": 226
+    },
+    {
+      "has_pr": false,
+      "number": 224
+    },
+    {
+      "has_pr": false,
+      "number": 223
+    },
+    {
+      "has_pr": false,
+      "number": 221
+    },
+    {
+      "has_pr": false,
+      "number": 220
+    },
+    {
+      "has_pr": false,
+      "number": 219
+    },
+    {
+      "has_pr": false,
+      "number": 218
+    },
+    {
+      "has_pr": false,
+      "number": 217
+    },
+    {
+      "has_pr": false,
+      "number": 216
+    },
+    {
+      "has_pr": false,
+      "number": 215
+    },
+    {
+      "has_pr": false,
+      "number": 210
+    },
+    {
+      "has_pr": false,
+      "number": 204
+    },
+    {
+      "has_pr": false,
+      "number": 203
+    },
+    {
+      "has_pr": false,
+      "number": 201
+    },
+    {
+      "has_pr": false,
+      "number": 199
+    },
+    {
+      "has_pr": false,
+      "number": 197
+    },
+    {
+      "has_pr": false,
+      "number": 194
+    },
+    {
+      "has_pr": false,
+      "number": 192
+    },
+    {
+      "has_pr": false,
+      "number": 189
+    },
+    {
+      "has_pr": false,
+      "number": 183
+    },
+    {
+      "has_pr": false,
+      "number": 182
+    },
+    {
+      "has_pr": false,
+      "number": 179
+    },
+    {
+      "has_pr": false,
+      "number": 171
+    },
+    {
+      "has_pr": false,
+      "number": 170
+    },
+    {
+      "has_pr": false,
+      "number": 169
+    },
+    {
+      "has_pr": false,
+      "number": 168
+    },
+    {
+      "has_pr": false,
+      "number": 161
+    },
+    {
+      "has_pr": false,
+      "number": 160
+    },
+    {
+      "has_pr": false,
+      "number": 158
+    },
+    {
+      "has_pr": false,
+      "number": 157
+    },
+    {
+      "has_pr": false,
+      "number": 156
+    },
+    {
+      "has_pr": false,
+      "number": 155
+    },
+    {
+      "has_pr": false,
+      "number": 153
+    },
+    {
+      "has_pr": false,
+      "number": 150
+    },
+    {
+      "has_pr": false,
+      "number": 148
+    },
+    {
+      "has_pr": false,
+      "number": 145
+    },
+    {
+      "has_pr": false,
+      "number": 144
+    },
+    {
+      "has_pr": false,
+      "number": 143
+    },
+    {
+      "has_pr": false,
+      "number": 140
+    },
+    {
+      "has_pr": false,
+      "number": 139
+    },
+    {
+      "has_pr": false,
+      "number": 136
+    },
+    {
+      "has_pr": false,
+      "number": 134
+    },
+    {
+      "has_pr": false,
+      "number": 133
+    },
+    {
+      "has_pr": false,
+      "number": 131
+    },
+    {
+      "has_pr": false,
+      "number": 124
+    },
+    {
+      "has_pr": false,
+      "number": 120
+    },
+    {
+      "has_pr": false,
+      "number": 116
+    },
+    {
+      "has_pr": false,
+      "number": 115
+    },
+    {
+      "has_pr": false,
+      "number": 114
+    },
+    {
+      "has_pr": false,
+      "number": 112
+    },
+    {
+      "has_pr": false,
+      "number": 111
+    },
+    {
+      "has_pr": false,
+      "number": 105
+    },
+    {
+      "has_pr": false,
+      "number": 95
+    }
+  ],
+  "page2": [
+    {
+      "has_pr": false,
+      "number": 86
+    },
+    {
+      "has_pr": false,
+      "number": 80
+    },
+    {
+      "has_pr": false,
+      "number": 77
+    },
+    {
+      "has_pr": false,
+      "number": 72
+    },
+    {
+      "has_pr": false,
+      "number": 43
+    },
+    {
+      "has_pr": false,
+      "number": 20
+    },
+    {
+      "has_pr": false,
+      "number": 6
+    }
+  ]
+}

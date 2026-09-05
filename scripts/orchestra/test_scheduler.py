@@ -593,8 +593,10 @@ def test_unhealthy_pulls_idempotent_after_release_no_assignee(monkeypatch):
     lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
     assert lines == []
     # issue без assignees отфильтрован ДО чтения check-runs/мутирующих вызовов:
-    # единственный вызов — список задач пула, которым unhealthy_pulls начинает.
-    assert fake.calls == ["repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100"]
+    # единственный вызов — список задач пула, которым unhealthy_pulls начинает
+    # (#308: обход постранично добавляет &page=1 к первому вызову; короткая
+    # страница из одного issue останавливает обход сразу).
+    assert fake.calls == ["repos/mytab0r/edge-harness/issues?state=open&labels=task&per_page=100&page=1"]
 
 
 def test_unhealthy_pulls_skips_conflict_labeled_pr(monkeypatch):
@@ -1216,6 +1218,67 @@ def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
     source = SCRIPT.read_text(encoding="utf-8")
     assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
     assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
+
+
+# ── Пагинация пула задач/PR/таймлайна reap_stale: активный дефект в проде
+# (#308-класс): open_task_issues/open_pulls читали сырую первую страницу
+# `per_page=100` без обхода — при 107 открытых задачах с меткой task (замер
+# 2026-09-05, живой репозиторий) хвост за первой сотней был невидим воркеру
+# и планировщику без ошибки. reap_stale читал таймлайн issue той же сырой
+# формой — тот же класс, что last_review_ok_labeled_at/last_ready_labeled_at
+# (#303), сюда не мигрировали. ────────────────────────────────────────────────
+
+
+def test_open_task_issues_and_open_pulls_read_through_paginated_helper():
+    # Гвардия по исходнику: обе функции обязаны ходить через
+    # review_labels.list_pages (полный обход постранично), а не читать сырую
+    # первую страницу — поведенческая проверка пагинации на прод-форме живёт в
+    # scripts/lib/test_review_labels.py::test_list_pages_paginates_over_100_real_open_task_issues_308
+    # (мутация доказана там: обход убран — тест краснеет).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'review_labels.list_pages(\n        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)' in source
+    assert 'review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)' in source
+    assert 'gh(f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100")' not in source
+    assert 'gh(f"repos/{repo}/pulls?state=open&per_page=100")' not in source
+
+
+def test_reap_stale_reads_timeline_through_paginated_helper():
+    # reap_stale читал `gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")`
+    # без обхода — тот же класс, что last_review_ok_labeled_at/
+    # last_ready_labeled_at (#303), не мигрировали сюда.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.list_timeline(repo, number, gh)") == 1
+    assert 'gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")' not in source
+
+
+def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
+    # Поведенческое доказательство на уровне вызывающей функции open_task_issues
+    # (не только текст исходника выше): реальный снимок 100+7 открытых задач с
+    # меткой task (repos/mytab0r/edge-harness/issues?state=open&labels=task,
+    # 2026-09-05) — до фикса (сырая первая страница) видны только 100, после —
+    # все 107.
+    import json
+    fixture = _DIR.parent / "lib" / "fixtures_open_task_issues_308.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    page1, page2 = data["page1"], data["page2"]
+    assert len(page1) == 100
+    assert len(page2) == 7
+
+    def fake_gh(url: str):
+        query = url.split("?", 1)[1] if "?" in url else ""
+        params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+        page = params.get("page")
+        if page == "1":
+            return page1
+        if page == "2":
+            return page2
+        return []
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    issues = sch.open_task_issues(REPO)
+    # Мутация: верни только первую страницу (уберите обход в list_pages/
+    # верните gh(...) без page=) — это число упадёт до 100, тест покраснеет.
+    assert len(issues) == len(page1) + len(page2) == 107
 
 
 def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):

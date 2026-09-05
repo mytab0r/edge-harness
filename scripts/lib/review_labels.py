@@ -179,6 +179,35 @@ def list_pr_files(repo: str, pr: int, gh_func) -> list[dict]:
     return files
 
 
+def list_pages(url: str, gh_func) -> list[dict]:
+    """Обход постранично любого списочного эндпоинта GitHub API до короткой
+    страницы — та же форма, что list_pr_files/list_timeline выше, обобщённая
+    на URL целиком (класс #308: место общее для любого списка, а не только
+    files/timeline). `url` уже несёт свои query-параметры, включая
+    `per_page=100`; листание добавляет `&page=N`.
+
+    Найдено на живом репозитории (2026-09-05): `open_task_issues` и
+    `open_pulls` в scheduler.py читали сырую первую страницу
+    `...?state=open&...&per_page=100` без обхода — при 107 открытых задачах
+    с меткой `task` (и растущем числе открытых PR) воркер и планировщик
+    молча не видели хвост за первой сотней: не ошибка, не предупреждение,
+    задачи просто не существовали для пула. `reap_stale` читал таймлайн той
+    же сырой формой (`.../timeline?per_page=100`) — тот же класс, что уже
+    чинили в `last_review_ok_labeled_at`/`last_ready_labeled_at` (#303), сюда
+    не мигрировали; там теперь используется list_timeline ниже."""
+    page = 1
+    items: list[dict] = []
+    while True:
+        chunk = gh_func(f"{url}&page={page}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        items.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return items
+
+
 def list_timeline(repo: str, number: int, gh_func) -> list[dict]:
     """Весь таймлайн issue/PR постранично, не только первая страница
     `per_page=100` (#303, тот же класс пагинации, что list_pr_files выше и
