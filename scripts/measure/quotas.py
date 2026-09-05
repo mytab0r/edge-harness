@@ -310,20 +310,27 @@ def collect_github(repo: str) -> list[Row]:
     return rows
 
 
-# ── LLM-провайдер (z.ai/GLM) ─────────────────────────────────────────────────
+# ── LLM-провайдер ─────────────────────────────────────────────────────────────
+# Имя/URL текущего провайдера — одно место правды vars.DEEPSEEK_BASE_URL
+# (гвардия #153, scripts/lib/test/provider-default.guard.sh), сюда не зашиваем:
+# читаем из окружения, а не из строкового литерала.
 
-NO_PROVIDER_QUOTA_API = (
-    "z.ai (эндпоинт vars.DEEPSEEK_BASE_URL, сейчас api.z.ai/api/coding/paas/v4) "
-    "не публикует документированный REST-эндпоинт остатка квоты (проверено "
-    "2026-09-05: docs.z.ai — SPA без серверного рендера страниц API-reference, "
-    "прямой запрос .../api/paas/v4/usage не отвечает содержательно). Единственный "
-    "подтверждённый сигнал — строка 'RATE_LIMIT: ... reset at <дата>' в stderr "
-    "ответа модели, уже перехватывается в docs/runbooks/switch-llm-provider.md."
-)
+
+def provider_no_quota_api_reason() -> str:
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "не задан в окружении")
+    return (
+        f"Провайдер по vars.DEEPSEEK_BASE_URL ({base_url}) не публикует "
+        "документированный REST-эндпоинт остатка квоты (проверено 2026-09-05 "
+        "для z.ai: docs.z.ai — SPA без серверной отдачи страниц API-reference, "
+        "запрос по догадке .../usage не отвечает содержательно). Единственный "
+        "подтверждённый сигнал — строка 'RATE_LIMIT: ... reset at <дата>' в "
+        "stderr ответа модели, уже перехватывается в "
+        "docs/runbooks/switch-llm-provider.md."
+    )
 
 
 def collect_provider() -> list[Row]:
-    return [no_data("z.ai/GLM квота", "нет API", None, "-", NO_PROVIDER_QUOTA_API)]
+    return [no_data("LLM-провайдер квота", "нет API", None, "-", provider_no_quota_api_reason())]
 
 
 # ── Вывод и порог ─────────────────────────────────────────────────────────────
