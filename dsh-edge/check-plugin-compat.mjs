@@ -60,6 +60,9 @@ async function main() {
   // 6. Синтаксическая проверка всех JS файлов
   await checkSyntax()
 
+  // 7. Схемы инструментов не нарушают контракт cordis (required: false)
+  await checkToolSchemas()
+
   console.log('plugin-compat: ЗЕЛЁНЫЙ — все проверки совместимости пройдены')
 }
 
@@ -275,6 +278,64 @@ async function checkNoSyncFsInApply() {
     throw new Error('Синхронные fs вызовы:\n' + violations.map(v => `  - ${v}`).join('\n'))
   }
   console.log('  ✓ синхронные fs вызовы: не найдено')
+}
+
+// Красный прогон deploy-dsh-edge.yml дважды (2026-09-04, 2026-09-05, задача
+// #314): плагин integrations объявлял опциональный параметр инструмента
+// через `required: false`, схема-компилятор cordis 4 (@deepseek-ai/dsh-tools)
+// принимает только `required: true` либо ПОЛНОЕ ОТСУТСТВИЕ ключа —
+// `required: false` бросает `JsonSchemaError: unsupported JSON schema:
+// parameters.<field>.required must be true when present` уже во время
+// apply(), то есть в проде на каждом инсталле плагина. Раньше это ловил
+// только dsh-edge/smoke-edge-plugins.mjs — рантайм-дым внутри
+// deploy-dsh-edge.yml, ПОСЛЕ мержа PR и после сборки клона: контент плагина
+// с этим дефектом мог висеть в main сутками, роняя каждый деплой по
+// расписанию. Эта проверка — то же самое правило, но статически и до
+// публикации/деплоя (форж вызывает check-plugin-compat.mjs перед сборкой
+// tarball'а), чтобы дефектная схема не доезжала до рантайма вовсе.
+//
+// Проверка текстовая (regex), не AST: в этом файле уже так устроены
+// checkForbiddenImports/checkNoDynamicImports/checkNoSyncFsInApply — общий
+// стиль чекера. `required: false` не встречается ни в одном легальном месте
+// схемы инструмента ни у одного плагина этого репозитория (hello-world,
+// runner-bridge, plugin-manager): опциональное свойство параметров/output
+// всегда объявляется отсутствием ключа required, а не false-значением,
+// поэтому точное совпадение — не эвристика, а прямой признак дефекта этого
+// класса. Комментарии вырезаются перед матчингом (см. stripComments): при
+// починке этого самого дефекта пояснительный комментарий рядом с фиксом
+// сам содержал искомую строку и красил чекер на собственном тексте —
+// мутация поймана вживую, не гипотетически.
+function stripComments(source) {
+  // Черновой, не JS-парсер: строковые литералы с `//`/`/*` внутри (например,
+  // URL в строке) теоретически могут исказить границу комментария, но для
+  // цели чекера (не дать `required: false` просочиться в КОД) это приемлемо —
+  // тот же компромисс, что и у соседних regex-проверок этого файла.
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '')
+}
+
+async function checkToolSchemas() {
+  const files = await collectJsFiles(absPluginDir)
+  let violations = []
+
+  for (const file of files) {
+    const content = stripComments(await readFile(file, 'utf8'))
+    const relPath = relative(absPluginDir, file)
+
+    const matches = [...content.matchAll(/required\s*:\s*false/g)]
+    if (matches.length > 0) {
+      violations.push(`${relPath}: required: false (${matches.length} вхождений) — контракт cordis 4 требует true либо отсутствие ключа`)
+    }
+  }
+
+  if (violations.length > 0) {
+    throw new Error(
+      'Схема инструментов нарушает контракт cordis (UNSUPPORTED_SCHEMA в рантайме):\n'
+      + violations.map(v => `  - ${v}`).join('\n'),
+    )
+  }
+  console.log('  ✓ схемы инструментов: required: false не найдено')
 }
 
 async function checkClientBundle() {

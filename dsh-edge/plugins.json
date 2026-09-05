@@ -38,9 +38,9 @@
       "id": "integrations",
       "package": "@edge-harness/dsh-plugin-integrations",
       "source": {
-        "release": "plugins-integrations-v0.1.0",
-        "asset": "integrations-0.1.0.tgz",
-        "sha256": "d989acd970751f5c593c1b1f5d19bdb6c0dbbac84e9987686d05bcf4fd67f785"
+        "release": "plugins-integrations-v0.1.1",
+        "asset": "integrations-0.1.1.tgz",
+        "sha256": "700e0ee9822b5e635278c113cd520f8282c6b1039e83590bc0292977711df605"
       },
       "server": true,
       "client": true
