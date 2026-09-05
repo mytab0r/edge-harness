@@ -23,9 +23,18 @@ AI-ревью-комментария (latest_ai_comment), и сохраняет 
 
 Импорт из соседних каталогов — importlib по файлу (паттерн claim_task):
 скрипты запускаются как файлы, не как пакет.
+
+Commit Status API (#345, кандидат из docs/research/23-platform-native-vs-custom.md
+п.2): оба вердикта публикуются ВТОРЫМ каналом, POST /repos/{repo}/statuses/{sha},
+параллельно меткам — переходный период, метки не убираются. Второго источника
+истины не заводится: STATUS_* ниже вычисляются из ТОЙ ЖЕ переменной вердикта,
+которую вызывающий код (check_pr.py/ai_review.py) уже использует для метки, не
+отдельным запросом к GitHub. Цель — нативный `allow_auto_merge` (уже включён на
+репозитории): метки он не видит, required status checks — видит.
 """
 
 import hashlib
+import os
 import re
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
@@ -44,6 +53,12 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # Единственное определение (было задублировано локальной константой в
 # scheduler.py) — should_update_branch ниже читает её же.
 CONFLICT_LABEL = "conflict"
+
+# ── Commit Status API — вердикты вторым каналом, параллельно меткам (#345) ───
+# Контексты кандидата в required_status_checks (branch protection ставит
+# владелец вручную после подтверждения живым прогоном — не эта задача).
+STATUS_REVIEW = "harness/review"
+STATUS_AI_REVIEW = "harness/ai-review"
 
 # Состояния mergeable_state, при которых GitHub ЯВНО подтвердил «не dirty» —
 # только по ним mark_conflicts вправе снять CONFLICT_LABEL (#270). None/
@@ -381,3 +396,73 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
         if facts.get("reviewer") in ("approve", "rework", "error"):
             latest = comment
     return latest
+
+
+# ── Commit Status API: вторая проводка вердикта, не второй источник (#345) ───
+#
+# Мотив — docs/research/23-platform-native-vs-custom.md п.2: `allow_auto_merge`
+# (включён на репозитории) читает required status checks, не метки. Метка
+# остаётся единственным местом ПРИНЯТИЯ решения (merge_label_gate/scheduler
+# её не трогаем этой задачей) — статус только ЗЕРКАЛИТ то же решение вторым
+# каналом, вычисляясь из той же переменной вердикта в check_pr.py/ai_review.py.
+
+def run_target_url(repo: str) -> str | None:
+    """target_url текущего прогона Actions (GITHUB_SERVER_URL/{repo}/actions/runs/{id}).
+
+    None вне Actions (локальный запуск, тест, ручной вызов без окружения
+    раннера) — статус тогда публикуется без ссылки, не падает: отсутствие
+    диагностической ссылки не то же самое, что отсутствие самого вердикта."""
+    server = os.environ.get("GITHUB_SERVER_URL")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not server or not run_id:
+        return None
+    return f"{server}/{repo}/actions/runs/{run_id}"
+
+
+def post_commit_status(repo: str, sha: str, context: str, state: str,
+                        description: str, run_gh_func,
+                        target_url: str | None = None) -> None:
+    """POST /repos/{repo}/statuses/{sha} — вердикт вторым каналом, тем же
+    состоянием, что метка (см. review_status_state/ai_status_state).
+    `run_gh_func` — вызывающий `gh(*args)`/`run_gh` того же модуля (паттерн
+    остальных функций этого файла: сеть не зашивается сюда, инъекция
+    зависимости для тестов без сети). description обрезается до 140 байт —
+    жёсткий лимит самого API, обрезка здесь, а не молчаливый отказ GitHub."""
+    args = ["api", "-X", "POST", f"repos/{repo}/statuses/{sha}",
+            "-f", f"state={state}", "-f", f"context={context}",
+            "-f", f"description={description[:140]}"]
+    if target_url:
+        args += ["-f", f"target_url={target_url}"]
+    run_gh_func(*args)
+
+
+def review_status_state(verdict: str) -> str:
+    """Состояние статуса гейта 1 по вердикт-метке (REVIEW_OK/REVIEW_CHANGES/
+    REVIEW_LARGE) — success только при REVIEW_OK, ровно тот же порог, что
+    merge_label_gate. REVIEW_CHANGES и REVIEW_LARGE оба блокируют слияние —
+    оба дают failure, второго промежуточного состояния тут нет."""
+    return "success" if verdict == REVIEW_OK else "failure"
+
+
+def ai_status_state(verdict: str) -> str:
+    """Состояние статуса гейта 2 по вердикту ai_review.parse_verdict
+    (approve/rework/error, НЕ по имени метки): approve → success,
+    rework → failure, error → pending.
+
+    error — это НЕ вердикт о коде: ai_review.error_reason различает три
+    состояния, и error чаще всего означает сбой провайдера/транспорта DSH
+    (transport_failed), у которого уже есть свой газ — автоповтор по таймеру
+    (scheduler.py::trigger_ai_review, #196), не зависящий от того, что стоит
+    на PR сейчас. `failure` держал бы required status check красным
+    НАВСЕГДА до следующего пуша человеком (в отличие от метки, которую
+    сбрасывает следующий прогон конвейера, обязательная проверка сама себя
+    не пересчитывает) — то есть код мог быть безупречен, а слияние
+    заблокировано так, будто ревью его отвергло. `pending` — точное описание
+    факта: решение ещё не вынесено, придёт с автоповтором; ложноположительным
+    `success` это не грозит, потому что pending не открывает auto-merge.
+    """
+    if verdict == "approve":
+        return "success"
+    if verdict == "rework":
+        return "failure"
+    return "pending"

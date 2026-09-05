@@ -242,6 +242,16 @@ def main() -> int:
     verdict = verdict_for(is_large, findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
 
+    # Commit Status API — тот же вердикт вторым каналом, параллельно метке
+    # (#345): allow_auto_merge (уже включён на репозитории) читает required
+    # status checks, не метки. Состояние вычислено из ТОЙ ЖЕ переменной
+    # verdict, что и метка выше — второго источника истины не заводим.
+    review_labels.post_commit_status(
+        repo, pull["head"]["sha"], review_labels.STATUS_REVIEW,
+        review_labels.review_status_state(verdict),
+        f"review: {verdict}" + (f" (+{added} строк)" if not findings else f" ({len(findings)} находок)"),
+        run_gh, review_labels.run_target_url(repo))
+
     if findings:
         body = "Ревью нашло замечания:\n" + "\n".join(f"- {f}" for f in findings)
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")

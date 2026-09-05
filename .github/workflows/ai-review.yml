@@ -31,7 +31,9 @@
 # нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET* из model-shell
 # вызовов (живой прогон 2026-08-30, см. worker.yml).
 # Job `verdict`: СВЕЖАЯ машина, свой чекаут main, свой GH_TOKEN с
-# pull-requests:write. Ответ ревью переезжает между job'ами ВЫВОДОМ
+# pull-requests:write (+ statuses:write — вердикт публикуется вторым каналом,
+# Commit Status API harness/ai-review, параллельно метке, #345). Ответ ревью
+# переезжает между job'ами ВЫВОДОМ
 # доверенного шага (данные, не код); head для сверки — step-output фактов,
 # закрытый до недоверенного шага: файлы $AI_WORK агенту принадлежат.
 #
@@ -290,6 +292,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: write
+      statuses: write
     steps:
       # Доверенный инструментарий — из main; ревьюимое дерево тут не нужно:
       # verdict парсит ответ и ходит в API, текущий head он сверяет сам.
