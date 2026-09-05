@@ -519,6 +519,25 @@ def cmd_verdict(args: argparse.Namespace) -> int:
               f"новый пуш заведёт свежее ревью")
         return 0
 
+    # Файлы читаются ДО применения вердикта (находка 1 вердикта ai-review
+    # PR #294, гонка): list_pr_files — отдельный сетевой вызов (возможно,
+    # несколько страниц), и между проверкой головы выше и этим моментом
+    # проходит время, в которое автор успевает запушить новый коммит. Раньше
+    # это не было опасно — протухший ai:ok безусловно умирал на следующем
+    # check_pr.py; но #252 научил его переживать неизменный дифф, и та же
+    # гонка делает его вечным: комментарий уйдёт с `diff:` от НЕревьюенных
+    # файлов, ai_verdict_keep будет подтверждать его при каждом пуше. Поэтому
+    # СРАЗУ после чтения файлов голова сверяется ЕЩЁ РАЗ, и до единой строчки
+    # правки (метка/большой-ok/комментарий) — если она уехала от args.head,
+    # выходим без применения вердикта вовсе.
+    files = review_labels.list_pr_files(repo, args.pr, gh)
+    pull_after_files = gh(f"repos/{repo}/pulls/{args.pr}")
+    if pull_after_files["head"]["sha"] != args.head:
+        print(f"::warning::head PR #{args.pr} сменился во время чтения файлов "
+              f"({args.head[:12]} → {pull_after_files['head']['sha'][:12]}) — "
+              f"вердикт {verdict} не применяю: новый пуш заведёт свежее ревью")
+        return 0
+
     current = {label["name"] for label in pull["labels"]}
     for old in AI_VERDICTS:
         if old in current:
@@ -528,15 +547,16 @@ def cmd_verdict(args: argparse.Namespace) -> int:
            "-f", f"labels[]={label}")
 
     # Газ к тормозу review:large (#204): подтверждение размера опирается на
-    # состоявшийся вердикт AI, а не на факт запуска — считается ПОСЛЕ того,
-    # как ai:*-метка на месте, чтобы large_ok_decision видел актуальный verdict.
-    files = review_labels.list_pr_files(repo, args.pr, gh)
+    # состоявшийся вердикт AI, а не на факт запуска — added считается по
+    # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
+    # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
     apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
     # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
     # следующем пуше мог сравнить и сохранить метку, если PR не изменился
-    # (см. review_labels.diff_fingerprint/diff_unchanged).
+    # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
+    # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
     body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",

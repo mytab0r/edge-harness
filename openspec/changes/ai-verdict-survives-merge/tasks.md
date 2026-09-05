@@ -70,3 +70,27 @@
       тавтологичное сравнение `diff_fingerprint(page1) == diff_fingerprint(page1)`
       (одинаковый вход) снято; защита от регресса «прод-код читает только
       первую страницу» — grep-гвардии в `test_check_pr.py`/`test_ai_review.py`.
+
+## Правка после вердикта AI-ревью PR #294 (две находки)
+
+- [x] `scripts/review/ai_review.py::cmd_verdict` — гонка: между сверкой
+      головы PR и чтением файлов (`review_labels.list_pr_files`) проходит
+      сетевой вызов, в который автор успевает запушить новый коммит; без
+      повторной сверки вердикт применялся бы к нерецензированному диффу, а
+      #252 делал бы протухший `ai:*` вечным вместо снятия на следующем пуше.
+      Голова сверяется ЕЩЁ РАЗ сразу после `list_pr_files`, до применения
+      метки/`apply_large_ok`/комментария; заодно закрыт устаревший `added`
+      (считался бы по файлам уехавшей головы). Тест-гвардия порядка вызовов
+      (голова → файлы → голова ещё раз) и невозможности применения вердикта
+      при расхождении — `scripts/review/test_ai_review.py`
+      (`test_cmd_verdict_order_head_then_files_then_head_again`,
+      `test_cmd_verdict_race_head_moves_during_file_read_skips_verdict`,
+      `test_cmd_verdict_race_mutation_guard_without_second_head_check`),
+      доказана мутацией (снята повторная сверка — оба целевых теста
+      краснеют).
+- [x] Критерий приёмки 5 issue #252 («реальная история коммитов PR #173»)
+      дожат прод-фикстурой: `scripts/lib/fixtures_pr173_merge_diff.json`
+      (`gh api compare/main...<sha>` для merge-коммита `425d8382e6`,
+      2026-09-01T22:01:09Z — таймстемп, названный самим критерием),
+      `scripts/lib/test_review_labels.py::test_diff_fingerprint_unchanged_across_clean_merge_from_main_pr173_acceptance_criterion_5`,
+      `scripts/review/test_check_pr.py::test_ai_verdict_keep_true_after_clean_merge_pr173_acceptance_criterion_5`.

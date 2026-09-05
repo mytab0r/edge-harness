@@ -123,6 +123,7 @@ def test_should_update_branch_false_on_empty_labels():
 
 FIXTURE_PR292 = _DIR / "fixtures_pr292_merge_diff.json"
 FIXTURE_PR253 = _DIR / "fixtures_pr253_edit_diff.json"
+FIXTURE_PR173 = _DIR / "fixtures_pr173_merge_diff.json"
 
 
 def _load(fixture: Path, key: str) -> list[dict]:
@@ -140,6 +141,26 @@ def test_diff_fingerprint_changes_on_real_edit_pr253():
     rev1 = _load(FIXTURE_PR253, "rev1")
     rev2 = _load(FIXTURE_PR253, "rev2")
     assert review_labels.diff_fingerprint(rev1) != review_labels.diff_fingerprint(rev2)
+
+
+# ── Критерий приёмки 5 issue #252: прод-форма — реальная история коммитов
+# PR #173 (23-28 merge-коммитов с совпадающими таймстемпами) ─────────────────
+#
+# fixtures_pr173_merge_diff.json — `gh api repos/mytab0r/edge-harness/
+# compare/main...<sha>` (сужено до filename/status/sha) для PR #173, который
+# сама issue #252 назвала прод-примером (35 коммитов, 28 из них
+# `Merge branch 'main'`, критерий 5 приводит таймстемп 2026-09-01T22:01:09Z —
+# ровно этот merge-коммит и снят здесь). before_merge — голова ДО него
+# (собственный коммит автора `ab99330d1b`, 2026-09-01T21:36:42Z), after_merge
+# — сам merge-коммит (`425d8382e6`, 22:01:09Z), оба относительно merge-base с
+# `main` (compare API считает его сам). Ответ идентичен побайтово (10 файлов,
+# те же имена и blob-sha) — то же свойство, что и PR #292/#253 доказывают
+# выше, но кормлено именно тем PR, который назвал критерий приёмки, а не
+# каким-либо другим с тем же свойством.
+def test_diff_fingerprint_unchanged_across_clean_merge_from_main_pr173_acceptance_criterion_5():
+    before = _load(FIXTURE_PR173, "before_merge")
+    after = _load(FIXTURE_PR173, "after_merge")
+    assert review_labels.diff_fingerprint(before) == review_labels.diff_fingerprint(after)
 
 
 def test_diff_fingerprint_order_independent():

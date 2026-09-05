@@ -558,3 +558,122 @@ def test_is_not_found_exact_form_only():
         "gh api repos/mytab0r/edge-harness/issues/1404: Forbidden (HTTP 403)")) is False
     assert ai.is_not_found(RuntimeError(
         "gh api repos/mytab0r/edge-harness/issues/4040: Bad gateway (HTTP 502)")) is False
+
+
+# ── cmd_verdict: гонка «дифф уехал между сверкой головы и чтением файлов»
+# (находка 1 вердикта ai-review PR #294) — повторная сверка головы СРАЗУ
+# после list_pr_files, ДО единой строчки применения вердикта ───────────────
+
+def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: list):
+    """gh(url) с прод-формой: pulls/{pr} дёргается ДВАЖДЫ (до и после чтения
+    файлов) — первый раз отдаёт head_first, второй раз head_second (разные,
+    если в тесте моделируется гонка). files — одна короткая страница."""
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if url == "repos/o/r/pulls/294":
+            n = sum(1 for c in calls if c == url)
+            head = head_first if n == 1 else head_second
+            return {"head": {"sha": head}, "labels": [{"name": name} for name in labels]}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    return fake_gh, calls
+
+
+def _verdict_args(tmp_path, body: str) -> argparse.Namespace:
+    answer = tmp_path / "answer.txt"
+    answer.write_text(body, encoding="utf-8")
+    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="")
+
+
+def test_cmd_verdict_order_head_then_files_then_head_again(monkeypatch, tmp_path, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    # redact шелится через bash (dsh-ci.sh) — не предмет этого теста (класс
+    # среды: см. AGENTS.md, "падения redact — дефект среды, не регресс"),
+    # подменяется identity-функцией, чтобы не зависеть от наличия bash.
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    # Порядок обязателен: голова → файлы → голова ЕЩЁ РАЗ, до применения.
+    assert calls == [
+        "repos/o/r/pulls/294",
+        "repos/o/r/pulls/294/files?per_page=100&page=1",
+        "repos/o/r/pulls/294",
+    ]
+    # Голова не уехала — вердикт применяется: метка проставлена, комментарий ушёл.
+    urls = [a[3] for a in run_gh_calls if a[:2] == ("api", "-X")]
+    assert any(url.endswith("/labels") for url in urls)
+    assert any(url.endswith("/comments") for url in urls)
+
+
+def test_cmd_verdict_race_head_moves_during_file_read_skips_verdict(monkeypatch, tmp_path, capsys):
+    # Автор пушит РОВНО в окно между первой сверкой головы и чтением файлов:
+    # list_pr_files успевает вернуть файлы уже НОВОГО коммита, но args.head —
+    # старый. Без повторной сверки вердикт применился бы к нерецензированному
+    # диффу и (после #252) держался бы вечно через ai_verdict_keep.
+    files = [{"filename": "a.py", "status": "modified", "sha": "new-sha-after-push", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "1234567890abcdef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    # redact шелится через bash (dsh-ci.sh) — не предмет этого теста (класс
+    # среды: см. AGENTS.md, "падения redact — дефект среды, не регресс"),
+    # подменяется identity-функцией, чтобы не зависеть от наличия bash.
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    assert calls == [
+        "repos/o/r/pulls/294",
+        "repos/o/r/pulls/294/files?per_page=100&page=1",
+        "repos/o/r/pulls/294",
+    ]
+    # Вердикт НЕ применён вовсе: ни метки, ни large-ok, ни комментария.
+    assert run_gh_calls == []
+    out = capsys.readouterr().out
+    assert "сменился во время чтения файлов" in out
+    assert "не применяю" in out
+
+
+def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, tmp_path):
+    # Мутация (AGENTS.md, «доказано мутацией»): без повторной сверки головы
+    # тот же сценарий гонки применил бы вердикт к нерецензированному диффу —
+    # это и обязан ловить предыдущий тест, если убрать фикс.
+    files = [{"filename": "a.py", "status": "modified", "sha": "new-sha-after-push", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "1234567890abcdef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def cmd_verdict_without_second_check(args):
+        # Копия старого (уязвимого) поведения: одна сверка головы, ДО files.
+        repo = ai.os.environ["GITHUB_REPOSITORY"]
+        pull = ai.gh(f"repos/{repo}/pulls/{args.pr}")
+        if pull["head"]["sha"] != args.head:
+            return 0
+        files = ai.review_labels.list_pr_files(repo, args.pr, ai.gh)
+        current = {label["name"] for label in pull["labels"]}
+        label = ai.AI_OK
+        ai.run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
+                  "-f", f"labels[]={label}")
+        return 0
+
+    cmd_verdict_without_second_check(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+    # Мутант (старое поведение) применяет метку, несмотря на уехавшую голову —
+    # именно это и не должно происходить в проде, что и доказывает предыдущий
+    # тест на текущем (исправленном) cmd_verdict.
+    assert run_gh_calls != []

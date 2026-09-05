@@ -159,6 +159,16 @@ def test_ai_verdict_keep_true_after_clean_merge_pr292():
     assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is True
 
 
+def test_ai_verdict_keep_true_after_clean_merge_pr173_acceptance_criterion_5():
+    # Критерий приёмки 5 issue #252 — прод-форма, названная самой задачей:
+    # реальная история коммитов PR #173 (23-28 merge-коммитов с совпадающими
+    # таймстемпами). fixtures_pr173_merge_diff.json — один из этих
+    # merge-коммитов (см. docstring в test_review_labels.py).
+    stored = _fingerprint("fixtures_pr173_merge_diff.json", "before_merge")
+    current = _fingerprint("fixtures_pr173_merge_diff.json", "after_merge")
+    assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is True
+
+
 def test_ai_verdict_keep_false_after_real_edit_pr253():
     # PR #253: реальная правка автора между двумя пушами — отпечаток другой,
     # метка обязана сниматься, как до этой правки.
