@@ -71,6 +71,20 @@ jobs:
           # Проверка формата ID (как в manifest.mjs)
           [[ "$PLUGIN_ID" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^[a-z][a-z0-9-]*$"; exit 1; }
 
+          # Сверка с манифестом: basename каталога — только дефолт, а пакет
+          # может уже быть установлен под ДРУГИМ id (канонический
+          # plugins-src/hello-world → package @edge-harness/dsh-plugin-hello,
+          # в dsh-edge/plugins.json id "hello"). Без сверки форж заводит
+          # фантомную вторую установку того же пакета вместо бампа
+          # существующей записи — весь апсерт-путь остаётся мёртвым кодом
+          # (находка AI-ревью PR #273, воспроизведена на каноническом
+          # прогоне: смоук строил состав из пяти плагинов вместо четырёх).
+          MANIFEST_ID=$(jq -r --arg pkg "$PLUGIN_NAME" '.plugins[] | select(.package == $pkg) | .id' dsh-edge/plugins.json)
+          if [ -n "$MANIFEST_ID" ] && [ "$MANIFEST_ID" != "$PLUGIN_ID" ]; then
+            echo "::error::Пакет $PLUGIN_NAME уже в манифесте под id '$MANIFEST_ID', а вычислен id '$PLUGIN_ID' — запустите форж с plugin_id=$MANIFEST_ID"
+            exit 1
+          fi
+
           # Определяем, есть ли клиентская часть
           CLIENT=$(jq -r '.dsh.client.platform // ""' "$PLUGIN_PATH/package.json")
           [ "$CLIENT" = "web" ] && HAS_CLIENT=true || HAS_CLIENT=false

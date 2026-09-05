@@ -122,7 +122,7 @@ export async function loadManifestWithForgeExtra(repoRoot) {
   }
 
   // Бамп версии УЖЕ установленного плагина — главный цикл форжа, а не только
-  // добавление нового: id почти всегда уже есть в манифесте (hello-world,
+  // добавление нового: id почти всегда уже есть в манифесте (hello,
   // runner-bridge, plugin-manager, integrations — на момент этого коммита все
   // четыре). Раньше повторный id тут бросал throw, дым красил job ДО шага PR,
   // и весь апсерт-путь `MANIFEST |= {...}` в plugin-forge.yml оставался мёртвым
