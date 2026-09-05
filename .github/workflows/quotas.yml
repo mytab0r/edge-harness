@@ -39,4 +39,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # var, не секрет (гвардия #153) — без неё provider_no_quota_api_reason()
+          # читает "не задан в окружении" и строка выглядит как "провайдер не
+          # настроен", хотя он задан в vars репозитория, просто не проброшен сюда.
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
         run: python scripts/measure/quotas.py
