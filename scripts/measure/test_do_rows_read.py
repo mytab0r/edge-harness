@@ -88,6 +88,45 @@ def test_choose_query_shape_raises_when_no_date_filter_at_all():
         mod.choose_query_shape({"namespaceId"}, {"namespaceId"})
 
 
+# ── check_not_truncated: молчаливую обрезку GraphQL-ответа ловим, а не доверяем ──────
+
+
+def test_check_not_truncated_passes_under_limit():
+    mod.check_not_truncated([{"sum": {}}] * 5, limit=10)
+
+
+def test_check_not_truncated_raises_at_limit():
+    # Cloudflare не отдаёт признак обрезки — при len(rows) == limit неотличимо
+    # от «ровно limit строк было на самом деле», поэтому падаем громко.
+    with pytest.raises(RuntimeError, match="молчаливую обрезку"):
+        mod.check_not_truncated([{"sum": {}}] * 10, limit=10)
+
+
+def test_check_not_truncated_raises_over_limit():
+    with pytest.raises(RuntimeError, match="молчаливую обрезку"):
+        mod.check_not_truncated([{"sum": {}}] * 11, limit=10)
+
+
+# ── group_rows_by_day: склейка на стыке суток ────────────────────────────────────────
+
+
+def test_group_rows_by_day_splits_two_days_in_one_range_response():
+    rows = [
+        {"dimensions": {"date": "2026-09-01", "namespaceId": "ns-a"}, "sum": {"rowsRead": 10}},
+        {"dimensions": {"date": "2026-09-01", "namespaceId": "ns-b"}, "sum": {"rowsRead": 20}},
+        {"dimensions": {"date": "2026-09-02", "namespaceId": "ns-a"}, "sum": {"rowsRead": 30}},
+    ]
+    by_day = mod.group_rows_by_day(rows)
+    assert set(by_day) == {date(2026, 9, 1), date(2026, 9, 2)}
+    assert len(by_day[date(2026, 9, 1)]) == 2
+    assert len(by_day[date(2026, 9, 2)]) == 1
+    assert by_day[date(2026, 9, 2)][0]["sum"]["rowsRead"] == 30
+
+
+def test_group_rows_by_day_empty_rows_gives_empty_dict():
+    assert mod.group_rows_by_day([]) == {}
+
+
 # ── daily_totals_from_rows: арифметика суточного итога ───────────────────────────────
 
 ROWS_ONE_DAY = [
@@ -171,3 +210,10 @@ def test_build_data_query_per_day_shape_uses_exact_date():
     query = mod.build_data_query("durableObjectsPeriodicGroups", "per_day", ["rowsRead"], ["datetimeHour"])
     assert "filter: { date: $date }" in query
     assert "datetimeHour" in query
+
+
+def test_build_data_query_limit_matches_check_not_truncated_constant():
+    # Одно место правды: запрос и проверка обрезки обязаны ссылаться на одно
+    # и то же число — раздельные литералы уже расходились бы незаметно.
+    query = mod.build_data_query("durableObjectsPeriodicGroups", "range", ["rowsRead"], ["date"])
+    assert f"limit: {mod.GRAPHQL_ROW_LIMIT}" in query

@@ -41,10 +41,17 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 API = "https://api.cloudflare.com/client/v4/graphql"
 DAILY_LIMIT = 5_000_000
+
+# GraphQL Analytics API режет ответ на этом числе строк молча (без флага
+# has_more) — если запрошенный диапазон/число namespace даёт больше строк,
+# итог по хвостовым дням окажется занижен без единого сигнала. Одно место
+# правды: используется и в запросе (build_data_query), и в проверке
+# (check_not_truncated) — раздельные литералы уже расходились бы незаметно.
+GRAPHQL_ROW_LIMIT = 10000
 
 # Порядок проверки — по правдоподобию (docs/research/20-cloudflare-free.md,
 # раздел «Durable Objects на Free»: rows_read/rows_written — метрики хранилища
@@ -119,6 +126,28 @@ def choose_query_shape(filter_field_names: set[str], dim_field_names: set[str]) 
         return "per_day"
     raise RuntimeError(f"датасет не поддерживает ни диапазон, ни точную дату: "
                        f"доступные ключи фильтра {sorted(filter_field_names)}")
+
+
+def check_not_truncated(rows: list[dict], limit: int = GRAPHQL_ROW_LIMIT) -> None:
+    """Cloudflare режет range-ответ на `limit` строк без явного маркера обрезки.
+    Если пришло ровно `limit` строк — это неотличимо от «ровно столько и было»,
+    поэтому считаем труднее: падаем громко, а не тихо занижаем суточный итог."""
+    if len(rows) >= limit:
+        raise RuntimeError(
+            f"ответ GraphQL содержит {len(rows)} строк (>= лимита {limit}) — "
+            "похоже на молчаливую обрезку диапазона; уменьши --days или добавь "
+            "пагинацию вместо доверия этому числу")
+
+
+def group_rows_by_day(rows: list[dict]) -> dict[date, list[dict]]:
+    """Раскладка часовых/дневных строк range-ответа по суткам (`dimensions.date`).
+    Единственное место, где сутки можно тихо перепутать при склейке — поэтому
+    вынесено в чистую функцию и покрыто тестом на стыке двух дней."""
+    by_day: dict[date, list[dict]] = {}
+    for r in rows:
+        d = date.fromisoformat(r["dimensions"]["date"])
+        by_day.setdefault(d, []).append(r)
+    return by_day
 
 
 def daily_totals_from_rows(rows: list[dict], sum_has: set[str], dim_has: set[str]) -> dict:
@@ -277,7 +306,7 @@ query DoRowsReadRange($accountTag: string!, $start: Date, $end: Date) {{
     accounts(filter: {{ accountTag: $accountTag }}) {{
       rows: {dataset}(
         filter: {{ date_geq: $start, date_leq: $end }}
-        limit: 10000
+        limit: {GRAPHQL_ROW_LIMIT}
         orderBy: [date_ASC]
       ) {{
         dimensions {{ {dim_sel} }}
@@ -293,7 +322,7 @@ query DoRowsReadDay($accountTag: string!, $date: Date) {{
     accounts(filter: {{ accountTag: $accountTag }}) {{
       rows: {dataset}(
         filter: {{ date: $date }}
-        limit: 10000
+        limit: {GRAPHQL_ROW_LIMIT}
         orderBy: [datetimeHour_ASC]
       ) {{
         dimensions {{ {dim_sel} }}
@@ -316,7 +345,9 @@ def fetch_rows(token: str, account_id: str, query: str, shape: str, day: date,
         raise RuntimeError(
             "accounts пуст — CLOUDFLARE_ACCOUNT_ID не совпадает с аккаунтом токена "
             "или у токена нет доступа к этому аккаунту")
-    return accounts[0]["rows"]
+    rows = accounts[0]["rows"]
+    check_not_truncated(rows)
+    return rows
 
 
 # ── Оркестрация ─────────────────────────────────────────────────────────────────
@@ -330,15 +361,12 @@ def run(token: str, account_id: str, days: int) -> str:
     shape = choose_query_shape(info["filter_field_names"], info["dim_field_names"])
     query = build_data_query(dataset, shape, sum_fields, dim_fields)
 
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     per_day: list[tuple[date, dict]] = []
     if shape == "range":
         start = today - timedelta(days=days - 1)
         rows = fetch_rows(token, account_id, query, shape, today, start, today)
-        by_day: dict[date, list[dict]] = {}
-        for r in rows:
-            d = date.fromisoformat(r["dimensions"]["date"])
-            by_day.setdefault(d, []).append(r)
+        by_day = group_rows_by_day(rows)
         for offset in range(days):
             d = today - timedelta(days=offset)
             per_day.append((d, daily_totals_from_rows(by_day.get(d, []), info["sum_field_names"],
