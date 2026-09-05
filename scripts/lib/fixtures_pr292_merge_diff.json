@@ -1,0 +1,96 @@
+{
+  "before_merge": [
+    {
+      "filename": "openspec/changes/pr-task-resolver/design.md",
+      "status": "added",
+      "sha": "dc55107fe84ced3381e058d55d0b2e96bff467e5"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/proposal.md",
+      "status": "added",
+      "sha": "ec2effd46e32e44343002d4c395dc6a79a73ef8c"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/specs/journal-tasks-hands/spec.md",
+      "status": "added",
+      "sha": "1affae0d0152f970d95a8a05358a2e86143f7de5"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/tasks.md",
+      "status": "added",
+      "sha": "4ecee88d4e76c7ec39751a920f55a9b4e033c95e"
+    },
+    {
+      "filename": "scripts/lib/task_ref.py",
+      "status": "modified",
+      "sha": "98514414deb6d8d9919fa352d88ff1e84347b140"
+    },
+    {
+      "filename": "scripts/lib/test_task_ref.py",
+      "status": "modified",
+      "sha": "ee1662120932c70ff7f98e26c42363af5797c5f5"
+    },
+    {
+      "filename": "scripts/lib/test_task_ref_usage_guard.py",
+      "status": "added",
+      "sha": "44df741ae4055c117b937986b4111df0b48761f6"
+    },
+    {
+      "filename": "scripts/review/ai_review.py",
+      "status": "modified",
+      "sha": "f3e2f2bdc2cc1f077e82994d2d087e34fb4c84bc"
+    },
+    {
+      "filename": "scripts/review/test_ai_review.py",
+      "status": "modified",
+      "sha": "9a44cbdf030944a1ca4f66af22225f2fb829e224"
+    }
+  ],
+  "after_merge": [
+    {
+      "filename": "openspec/changes/pr-task-resolver/design.md",
+      "status": "added",
+      "sha": "dc55107fe84ced3381e058d55d0b2e96bff467e5"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/proposal.md",
+      "status": "added",
+      "sha": "ec2effd46e32e44343002d4c395dc6a79a73ef8c"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/specs/journal-tasks-hands/spec.md",
+      "status": "added",
+      "sha": "1affae0d0152f970d95a8a05358a2e86143f7de5"
+    },
+    {
+      "filename": "openspec/changes/pr-task-resolver/tasks.md",
+      "status": "added",
+      "sha": "4ecee88d4e76c7ec39751a920f55a9b4e033c95e"
+    },
+    {
+      "filename": "scripts/lib/task_ref.py",
+      "status": "modified",
+      "sha": "98514414deb6d8d9919fa352d88ff1e84347b140"
+    },
+    {
+      "filename": "scripts/lib/test_task_ref.py",
+      "status": "modified",
+      "sha": "ee1662120932c70ff7f98e26c42363af5797c5f5"
+    },
+    {
+      "filename": "scripts/lib/test_task_ref_usage_guard.py",
+      "status": "added",
+      "sha": "44df741ae4055c117b937986b4111df0b48761f6"
+    },
+    {
+      "filename": "scripts/review/ai_review.py",
+      "status": "modified",
+      "sha": "f3e2f2bdc2cc1f077e82994d2d087e34fb4c84bc"
+    },
+    {
+      "filename": "scripts/review/test_ai_review.py",
+      "status": "modified",
+      "sha": "9a44cbdf030944a1ca4f66af22225f2fb829e224"
+    }
+  ]
+}

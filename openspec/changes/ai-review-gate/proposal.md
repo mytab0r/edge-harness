@@ -34,7 +34,12 @@ DSH-агента в trust-зоне без GitHub-токена — и делае�
 6. `scripts/review/check_pr.py` — при каждом запуске снимает `ai:*`: вердикт
    AI действителен только для head, на котором сделан (скрипт выполняется на
    каждый пуш). Вместе с проверкой head в verdict-шаге закрывает гонку
-   «слив по протухшему вердикту».
+   «слив по протухшему вердикту». **Суперсессия (2026-09-05):** заменено
+   изменением `ai-verdict-survives-merge` (#294) — снятие условное, по
+   отпечатку диффа PR (`review_labels.diff_fingerprint`/`diff_unchanged`),
+   шапка вердикта получила поле `diff:`; см.
+   `openspec/changes/ai-verdict-survives-merge/proposal.md` и
+   `docs/decisions/0007-ai-review-gate.md` (раздел «Дельта 2026-09-05»).
 7. `scripts/review/file_tasks.py` — задачи в беклог из ревью одной командой:
    `python scripts/review/file_tasks.py --pr N` создаёт issue с меткой `task`
    из канонических фенсов последнего ревью-комментария, идемпотентно по

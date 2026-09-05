@@ -54,13 +54,20 @@ def _pages(url_head: str):
 
 
 def latest_review_comment(repo: str, pr: int) -> dict | None:
-    """Последний комментарий AI-ревью: шапка-факты с решающим reviewer:.
-    Чужие комментарии (автора, оркестратора) фактов не имеют. Endpoint
-    комментариев НЕ поддерживает sort/direction (всегда по созданию,
-    asc — замер на PR #138: desc-параметры молча игнорируются) — листаем
-    все страницы и берём ПОСЛЕДНЕЕ совпадение."""
+    """Последний комментарий AI-ревью: шапка-факты с решающим reviewer:,
+    опубликованный доверенной учёткой (review_labels._is_trusted_verdict_author
+    — то же место правды, что читает review_labels.latest_ai_comment).
+    Репозиторий публичный: посторонний участник может опубликовать
+    комментарий с валидной шапкой reviewer: (находка дыры безопасности,
+    вердикт ai-review PR #294) — без проверки автора file_tasks завёл бы
+    задачи из чужого, не реального ревью. Endpoint комментариев НЕ
+    поддерживает sort/direction (всегда по созданию, asc — замер на PR #138:
+    desc-параметры молча игнорируются) — листаем все страницы и берём
+    ПОСЛЕДНЕЕ совпадение среди доверенных."""
     latest = None
     for comment in _pages(f"repos/{repo}/issues/{pr}/comments"):
+        if not ai_review.review_labels._is_trusted_verdict_author(comment):
+            continue
         facts = ai_review.header_facts(comment.get("body") or "")
         if facts.get("reviewer") in ("approve", "rework", "error"):
             latest = comment

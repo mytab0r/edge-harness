@@ -1,0 +1,26 @@
+{
+  "before_merge": [
+    {"filename": "cf-worker/api-spec.json", "status": "modified", "sha": "4d818cddffe9a72dd04664677303750b08bdc57c"},
+    {"filename": "cf-worker/package-lock.json", "status": "modified", "sha": "7fd6f0e168d8856f429a505102eb518a7a0320bd"},
+    {"filename": "cf-worker/public/assets/config.js", "status": "modified", "sha": "f213754376e4cacac6abdfb4f30baf0fa53d3b7c"},
+    {"filename": "cf-worker/scripts/check-frontend-contract.mjs", "status": "modified", "sha": "7709306833f2ef51a1d033f322be744b0ad7719c"},
+    {"filename": "cf-worker/src/api-spec.ts", "status": "modified", "sha": "3077668a57e7e478833b7e5f90521189ced01666"},
+    {"filename": "cf-worker/src/config.ts", "status": "modified", "sha": "5f163a9944984fead2bece5c11e9b7e5aca54cf7"},
+    {"filename": "cf-worker/src/harness.ts", "status": "modified", "sha": "cafa0395f2e36a03c4464cc6cc6a01b02f620559"},
+    {"filename": "cf-worker/src/messages.ts", "status": "modified", "sha": "f98da219b2c0241d90ab0374cc2a2d4b6dfe7270"},
+    {"filename": "cf-worker/test/harness.spec.ts", "status": "modified", "sha": "61186f12035359964fd49c4ea455db3cf2ef9f32"},
+    {"filename": "docs/api.md", "status": "modified", "sha": "2d5d6e01d8141556d9df6345d50f3822ce51f220"}
+  ],
+  "after_merge": [
+    {"filename": "cf-worker/api-spec.json", "status": "modified", "sha": "4d818cddffe9a72dd04664677303750b08bdc57c"},
+    {"filename": "cf-worker/package-lock.json", "status": "modified", "sha": "7fd6f0e168d8856f429a505102eb518a7a0320bd"},
+    {"filename": "cf-worker/public/assets/config.js", "status": "modified", "sha": "f213754376e4cacac6abdfb4f30baf0fa53d3b7c"},
+    {"filename": "cf-worker/scripts/check-frontend-contract.mjs", "status": "modified", "sha": "7709306833f2ef51a1d033f322be744b0ad7719c"},
+    {"filename": "cf-worker/src/api-spec.ts", "status": "modified", "sha": "3077668a57e7e478833b7e5f90521189ced01666"},
+    {"filename": "cf-worker/src/config.ts", "status": "modified", "sha": "5f163a9944984fead2bece5c11e9b7e5aca54cf7"},
+    {"filename": "cf-worker/src/harness.ts", "status": "modified", "sha": "cafa0395f2e36a03c4464cc6cc6a01b02f620559"},
+    {"filename": "cf-worker/src/messages.ts", "status": "modified", "sha": "f98da219b2c0241d90ab0374cc2a2d4b6dfe7270"},
+    {"filename": "cf-worker/test/harness.spec.ts", "status": "modified", "sha": "61186f12035359964fd49c4ea455db3cf2ef9f32"},
+    {"filename": "docs/api.md", "status": "modified", "sha": "2d5d6e01d8141556d9df6345d50f3822ce51f220"}
+  ]
+}

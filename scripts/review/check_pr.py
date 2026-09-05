@@ -15,9 +15,15 @@
      после вердикта ai:ok на том же head AI-ревью само ставит review:large-ok
      (scripts/review/ai_review.py::cmd_verdict). Диффы длиннее LARGE_DIFF_HUGE_LINES
      автоматика не подтверждает вовсе — эскалирует владельцу.
-  4. Каждый запуск снимает ai:*-метки второго гейта (AI-ревью, #18): вердикт AI
-     действителен только для head, на котором сделан, а этот скрипт выполняется
-     на каждый пуш. Свежую метку поставит новое AI-ревью (workflow ai-review).
+  4. Каждый запуск проверяет вердикт второго гейта (AI-ревью, #18) против
+     ТЕКУЩЕГО диффа PR (#252): дифф относительно base не изменился с момента
+     последнего вердикта (отпечаток совпал — review_labels.diff_fingerprint,
+     сохранён в поле `diff:` шапки комментария ai_review.build_comment) —
+     ai:*-метка сохраняется, повторное дорогое AI-ревью не нужно. Подтягивание
+     main без конфликтов меняет только head (merge-коммит), не патчи PR.
+     Дифф действительно изменился (реальная правка), или отпечаток не удалось
+     прочитать (старый комментарий без поля diff, сеть отказала) — метка
+     снимается, как раньше; свежую поставит новое AI-ревью (workflow ai-review).
 
 Среда: runner с `gh`, GH_TOKEN с правами pull-requests: write.
 """
@@ -127,6 +133,18 @@ def verdict_for(is_large: bool, findings: list[str]) -> str:
     return REVIEW_OK if not findings else REVIEW_CHANGES
 
 
+def ai_verdict_keep(current_labels, stored_fp: str | None, current_fp: str) -> bool:
+    """True — на PR есть хотя бы одна ai:*-метка (review_labels.
+    ai_verdicts_to_drop не пуст), и её отпечаток диффа (#252) совпадает с
+    сохранённым в последнем ревью-комментарии AI: метку снимать не нужно,
+    дифф относительно base тот же, что ревьюили. Иначе (меток нет, дифф
+    изменился, отпечаток отсутствует/не прочитан) — False, метка снимается,
+    как раньше — при сомнении гейт не ослабляется (AGENTS.md).
+    """
+    return bool(review_labels.ai_verdicts_to_drop(current_labels)) and \
+        review_labels.diff_unchanged(stored_fp, current_fp)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", type=int, required=True)
@@ -154,7 +172,10 @@ def main() -> int:
         if CONFLICT_MARKER.match(line):
             findings.append(f"Неразрешённый конфликт-маркер уехал в коммит (строка {i + 1}).")
 
-    files = gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")
+    # Постранично (#294): первая страница молча теряет хвост у PR за сотню
+    # файлов — правка файла за сотым не меняла бы ни отпечаток диффа, ни
+    # сумму added (review_labels.list_pr_files — одно место правды).
+    files = review_labels.list_pr_files(repo, args.pr, gh)
     for f in files:
         name = f["filename"]
         if name.endswith(FORBIDDEN_FILES) or name in FORBIDDEN_FILES:
@@ -195,11 +216,29 @@ def main() -> int:
         if old in current:
             run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     # Вердикт AI-ревью (второй гейт, #18) привязан к head, который ревьюили:
-    # этот скрипт выполняется на каждый пуш, и обязан снять протухший ai:*
-    # ДО нового AI-ревью — иначе оркестратор может слить PR по метке от
-    # старого head. Новое ревью поставит свежую метку на новый head.
-    for old in review_labels.ai_verdicts_to_drop(current):
-        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+    # этот скрипт выполняется на каждый пуш и обязан снять протухший ai:* ДО
+    # нового AI-ревью — иначе оркестратор может слить PR по метке от старого
+    # head. ИСКЛЮЧЕНИЕ (#252): если дифф PR относительно base не изменился с
+    # момента вердикта (сверка отпечатков, ai_verdict_keep) — подтягивание
+    # main без конфликтов меняет только head, метка остаётся в силе, лишний
+    # дорогой прогон ai-review не нужен. Отпечаток не удалось прочитать (нет
+    # комментария, старый формат без diff:, сеть отказала) — трактуем как
+    # «изменился»: метка снимается, как раньше.
+    current_fp = review_labels.diff_fingerprint(files)
+    to_drop = review_labels.ai_verdicts_to_drop(current)
+    stored_fp = None
+    if to_drop:  # нечего сверять, если ai:*-метки на PR ещё нет (первое ревью)
+        try:
+            ai_comment = review_labels.latest_ai_comment(repo, args.pr, gh)
+        except RuntimeError as error:
+            print(f"::warning::review: не удалось прочитать вердикт AI для сверки диффа ({error}) — считаю дифф изменившимся")
+            ai_comment = None
+        stored_fp = review_labels.header_facts(ai_comment.get("body") or "").get("diff") if ai_comment else None
+    if ai_verdict_keep(current, stored_fp, current_fp):
+        print(f"review: дифф не изменился с прошлого вердикта AI ({current_fp[:12]}…) — {', '.join(to_drop)} сохранены")
+    else:
+        for old in to_drop:
+            run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     verdict = verdict_for(is_large, findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
 

@@ -593,7 +593,11 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     lines = []
     hard_failure = False
     number = pull["number"]
-    files = gh(f"repos/{repo}/pulls/{number}/files?per_page=100")
+    # Пагинация (#294, третье место того же класса: check_pr.py и ai_review.py
+    # уже читали через review_labels.list_pr_files, здесь оставалась сырая
+    # первая страница) — PR за сотню файлов, где cf-worker/* стоят за сотой
+    # позицией, молча не запускал бы deploy-worker.yml.
+    files = review_labels.list_pr_files(repo, number, gh)
     if any((f["filename"] or "").startswith("cf-worker/") for f in files):
         subprocess.run(
             ["gh", "workflow", "run", "deploy-worker.yml", "--ref", "main"],

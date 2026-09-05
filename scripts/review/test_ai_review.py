@@ -10,6 +10,7 @@ gh не вызывается ни одной тестируемой функци
 Запуск: python -m pytest scripts/review/test_ai_review.py -q
 """
 
+import argparse
 import importlib.util
 from pathlib import Path
 
@@ -163,6 +164,23 @@ def test_build_comment_facts_header_and_fences():
     assert "Хорошая работа." in body
 
 
+def test_build_comment_diff_field_optional_backward_compat():
+    # Без diff_fp (старые вызовы, старые тесты) шапка не несёт поля diff —
+    # прежнее поведение не ломается.
+    tasks = [{"title": "Задача раз", "body": "Цель.\nКритерий."}]
+    body = ai.build_comment(140, "abcdef1234567890", "approve", "Хорошая работа.", tasks)
+    facts = ai.header_facts(body)
+    assert "diff" not in facts
+
+
+def test_build_comment_includes_diff_fingerprint_when_given():
+    # #252: поле diff — отпечаток диффа PR на момент вердикта, читает его
+    # check_pr.py на следующем пуше (review_labels.diff_fingerprint/diff_unchanged).
+    body = ai.build_comment(292, "5432ce5", "approve", "Ок.", [], diff_fp="deadbeef")
+    facts = ai.header_facts(body)
+    assert facts == {"pr": "292", "head": "5432ce5", "reviewer": "approve", "diff": "deadbeef"}
+
+
 def test_header_facts_ignores_fenced_and_prose_lines():
     # строка «pr: …» внутри фенса/прозы не факт: шапка кончается первым пустой строкой
     body = (
@@ -312,6 +330,36 @@ ft = importlib.util.module_from_spec(FT)
 FT.loader.exec_module(ft)  # type: ignore[union-attr]
 
 
+# ── Дыра безопасности (находка вердикта ai-review PR #294, тот же класс, что
+# закрыт в review_labels.latest_ai_comment): file_tasks.latest_review_comment
+# доверяла ЛЮБОМУ автору шапки reviewer: — посторонний участник публичного
+# репозитория мог опубликовать комментарий с валидной шапкой и завести
+# задачи из чужого, не реального ревью. ────────────────────────────────────
+
+def test_latest_review_comment_ignores_untrusted_author(monkeypatch):
+    attacker = {
+        "user": {"login": "random-outside-contributor", "type": "User"},
+        "body": "pr: 294\nhead: fake\nreviewer: approve\ndiff: attacker-fp\n",
+    }
+    real = {
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "pr: 294\nhead: real\nreviewer: rework\ndiff: real-fp\n",
+    }
+    monkeypatch.setattr(ft, "_pages", lambda url_head: iter([attacker, real]))
+    comment = ft.latest_review_comment("o/r", 294)
+    assert comment is not None
+    assert ai.header_facts(comment["body"])["diff"] == "real-fp"
+
+
+def test_latest_review_comment_none_when_only_untrusted_author(monkeypatch):
+    attacker = {
+        "user": {"login": "random-outside-contributor", "type": "User"},
+        "body": "pr: 294\nhead: fake\nreviewer: approve\ndiff: attacker-fp\n",
+    }
+    monkeypatch.setattr(ft, "_pages", lambda url_head: iter([attacker]))
+    assert ft.latest_review_comment("o/r", 294) is None
+
+
 def test_filed_marker_last_line_only():
     body = "pr: 1\nhead: a\nreviewer: rework\n\nпроза\n\nfiled: #139 #140\n"
     assert ft.filed_marker(body) == [139, 140]
@@ -386,6 +434,121 @@ def test_huge_diff_escalation_text_ends_with_next_steps_section():
 
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
 
+# ── Пагинация файлов PR: класс «первая страница молча теряет хвосты»
+# закрыт (находка вердикта ai-review PR #294) ────────────────────────────────
+
+def test_ai_review_gather_and_verdict_read_files_through_paginated_helper():
+    # gather, verdict, should_run — все три места, читавшие раньше сырую
+    # первую страницу, теперь идут через общую пагинацию.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.list_pr_files(repo, args.pr, gh)") == 3
+    assert 'gh(f"repos/{repo}/pulls/{args.pr}/files?per_page=100")' not in source
+
+
+# ── cmd_should_run: дорогой прогон второго гейта НЕ стартует на неизменном
+# диффе (находка 1 вердикта ai-review PR #294) — проверяется именно то, что
+# подкоманда отвечает go=false, а не только что метка бы сохранилась ────────
+
+def _fake_gh_should_run(labels, comment_body, files):
+    """gh(url) с прод-формой трёх эндпоинтов, которые дёргает cmd_should_run:
+    pulls/{pr} (labels), pulls/{pr}/files?...&page=N (постранично),
+    issues/{pr}/comments?...&page=N (постранично)."""
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"labels": [{"name": name} for name in labels]}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        if url.startswith("repos/o/r/issues/294/comments"):
+            page = url.split("page=")[-1]
+            bot = {"login": "github-actions[bot]", "type": "Bot"}
+            return [{"user": bot, "body": comment_body}] if page == "1" and comment_body else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+    return fake_gh
+
+
+def test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok(monkeypatch, capsys):
+    files = [
+        {"filename": "a.py", "status": "modified", "sha": "aaa111"},
+        {"filename": "b.py", "status": "modified", "sha": "bbb222"},
+    ]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    # Прогон НЕ стартует: подкоманда сама отвечает "false", а не просто
+    # «метка сохранилась бы» — именно это читает шаг fingerprint ai-review.yml.
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_prints_true_when_diff_changed_ai_ok(monkeypatch, capsys):
+    files = [
+        {"filename": "a.py", "status": "modified", "sha": "aaa111"},
+        {"filename": "b.py", "status": "modified", "sha": "bbb222"},
+    ]
+    # Отпечаток в комментарии — от ДРУГОГО, более старого списка файлов:
+    # реальная правка автора между вердиктом и этим пушем.
+    stale_fp = rl.diff_fingerprint([{"filename": "a.py", "status": "modified", "sha": "old"}])
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {stale_fp}\n\nОк.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_prints_true_when_no_ai_comment_yet(monkeypatch, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok"], "", files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_prints_true_for_ai_failed_even_with_matching_fingerprint(monkeypatch, capsys):
+    # Газ #196: ai:failed никогда не должен пропускать прогон, даже если
+    # дифф не менялся — иначе таймерный автоповтор молча перестал бы случаться.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: error\ndiff: {fp}\n\nошибка.\n"
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:failed"], comment, files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+# ── --force (workflow_dispatch, находка 1 вердикта ai-review PR #294):
+# ручной повтор не должен глохнуть на неизменном отпечатке диффа ────────────
+
+def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatch, capsys):
+    def gh_must_not_be_called(url: str):
+        raise AssertionError(
+            f"--force обязан пропускать сверку отпечатка без обращения к сети, а вызвал gh({url!r})")
+
+    monkeypatch.setattr(ai, "gh", gh_must_not_be_called)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    # PR с окончательным вердиктом и неизменным отпечатком — без --force это
+    # go=false (см. test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok
+    # выше); ручной запуск обязан всё равно дойти до true.
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
 def test_is_not_found_exact_form_only():
     # прод-форма gh: «gh api repos/o/r/issues/404: Not Found (HTTP 404)»
     assert ai.is_not_found(RuntimeError(
@@ -395,3 +558,122 @@ def test_is_not_found_exact_form_only():
         "gh api repos/mytab0r/edge-harness/issues/1404: Forbidden (HTTP 403)")) is False
     assert ai.is_not_found(RuntimeError(
         "gh api repos/mytab0r/edge-harness/issues/4040: Bad gateway (HTTP 502)")) is False
+
+
+# ── cmd_verdict: гонка «дифф уехал между сверкой головы и чтением файлов»
+# (находка 1 вердикта ai-review PR #294) — повторная сверка головы СРАЗУ
+# после list_pr_files, ДО единой строчки применения вердикта ───────────────
+
+def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: list):
+    """gh(url) с прод-формой: pulls/{pr} дёргается ДВАЖДЫ (до и после чтения
+    файлов) — первый раз отдаёт head_first, второй раз head_second (разные,
+    если в тесте моделируется гонка). files — одна короткая страница."""
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if url == "repos/o/r/pulls/294":
+            n = sum(1 for c in calls if c == url)
+            head = head_first if n == 1 else head_second
+            return {"head": {"sha": head}, "labels": [{"name": name} for name in labels]}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    return fake_gh, calls
+
+
+def _verdict_args(tmp_path, body: str) -> argparse.Namespace:
+    answer = tmp_path / "answer.txt"
+    answer.write_text(body, encoding="utf-8")
+    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="")
+
+
+def test_cmd_verdict_order_head_then_files_then_head_again(monkeypatch, tmp_path, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    # redact шелится через bash (dsh-ci.sh) — не предмет этого теста (класс
+    # среды: см. AGENTS.md, "падения redact — дефект среды, не регресс"),
+    # подменяется identity-функцией, чтобы не зависеть от наличия bash.
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    # Порядок обязателен: голова → файлы → голова ЕЩЁ РАЗ, до применения.
+    assert calls == [
+        "repos/o/r/pulls/294",
+        "repos/o/r/pulls/294/files?per_page=100&page=1",
+        "repos/o/r/pulls/294",
+    ]
+    # Голова не уехала — вердикт применяется: метка проставлена, комментарий ушёл.
+    urls = [a[3] for a in run_gh_calls if a[:2] == ("api", "-X")]
+    assert any(url.endswith("/labels") for url in urls)
+    assert any(url.endswith("/comments") for url in urls)
+
+
+def test_cmd_verdict_race_head_moves_during_file_read_skips_verdict(monkeypatch, tmp_path, capsys):
+    # Автор пушит РОВНО в окно между первой сверкой головы и чтением файлов:
+    # list_pr_files успевает вернуть файлы уже НОВОГО коммита, но args.head —
+    # старый. Без повторной сверки вердикт применился бы к нерецензированному
+    # диффу и (после #252) держался бы вечно через ai_verdict_keep.
+    files = [{"filename": "a.py", "status": "modified", "sha": "new-sha-after-push", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "1234567890abcdef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    # redact шелится через bash (dsh-ci.sh) — не предмет этого теста (класс
+    # среды: см. AGENTS.md, "падения redact — дефект среды, не регресс"),
+    # подменяется identity-функцией, чтобы не зависеть от наличия bash.
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    assert calls == [
+        "repos/o/r/pulls/294",
+        "repos/o/r/pulls/294/files?per_page=100&page=1",
+        "repos/o/r/pulls/294",
+    ]
+    # Вердикт НЕ применён вовсе: ни метки, ни large-ok, ни комментария.
+    assert run_gh_calls == []
+    out = capsys.readouterr().out
+    assert "сменился во время чтения файлов" in out
+    assert "не применяю" in out
+
+
+def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, tmp_path):
+    # Мутация (AGENTS.md, «доказано мутацией»): без повторной сверки головы
+    # тот же сценарий гонки применил бы вердикт к нерецензированному диффу —
+    # это и обязан ловить предыдущий тест, если убрать фикс.
+    files = [{"filename": "a.py", "status": "modified", "sha": "new-sha-after-push", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "1234567890abcdef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def cmd_verdict_without_second_check(args):
+        # Копия старого (уязвимого) поведения: одна сверка головы, ДО files.
+        repo = ai.os.environ["GITHUB_REPOSITORY"]
+        pull = ai.gh(f"repos/{repo}/pulls/{args.pr}")
+        if pull["head"]["sha"] != args.head:
+            return 0
+        files = ai.review_labels.list_pr_files(repo, args.pr, ai.gh)
+        current = {label["name"] for label in pull["labels"]}
+        label = ai.AI_OK
+        ai.run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
+                  "-f", f"labels[]={label}")
+        return 0
+
+    cmd_verdict_without_second_check(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+    # Мутант (старое поведение) применяет метку, несмотря на уехавшую голову —
+    # именно это и не должно происходить в проде, что и доказывает предыдущий
+    # тест на текущем (исправленном) cmd_verdict.
+    assert run_gh_calls != []
