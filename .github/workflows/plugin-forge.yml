@@ -217,6 +217,11 @@ jobs:
 
           # Добавляем плагин
           pnpm --dir apps/dsh-edge/standalone add --save-exact "$PLUGIN_TARBALL"
+          # pnpm-патчи Workers обязательны; add обязан сохранить patchedDependencies
+          # (класс silent-wrong #43, та же гвардия, что deploy-dsh-edge.yml —
+          # без неё дым проходит зелёным на уже запатченных node_modules от
+          # --frozen-lockfile, пока прод соберёт другой состав).
+          grep -q "patchedDependencies" apps/dsh-edge/standalone/pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
 
           # Кодогенерация
           node "$GITHUB_WORKSPACE/dsh-edge/codegen-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
