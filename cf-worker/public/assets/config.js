@@ -16,6 +16,7 @@ window.EDGE_CONFIG = {
     message: "/api/messages/",
     messagesProcess: "/api/messages/process",
     ready: "/api/ready",
+    messagesIssueCreated: "/api/messages/issue-created",
   },
   replayPageSize: 200,
   /* Сокет переподключается проактивно: точное значение idle-timeout Cloudflare

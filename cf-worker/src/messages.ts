@@ -33,6 +33,9 @@ const MESSAGES = {
     message_not_found: "Сообщение {message_id} не найдено",
     message_too_large: "Сообщение больше {limit} символов",
     need_source_msg_id: "Нужен идентификатор сообщения: source_msg_id, либо update_id (Telegram update), либо message.message_id — без него идемпотентность невозможна",
+    need_message_id: "Нужно целое положительное поле message_id",
+    need_claimed_ts: "Нужно целое поле claimed_ts — эхо client_payload.claimed_ts из dispatch'а",
+    need_issue_fields: "Без error нужны issue_number (целое > 0) и issue_url",
   },
 } as const;
 
