@@ -51,6 +51,17 @@ jobs:
       - name: Провайдер/модель LLM — одно место правды (vars), без зашитых дефолтов
         run: bash scripts/lib/test/provider-default.guard.sh
 
+      # Гвардия «дерево == задача» (#332): .githooks/pre-commit отклоняет коммит
+      # в agent/<N>-* не из своего рабочего дерева — прогоняет РЕАЛЬНЫЙ файл
+      # гвардии на синтетических git-worktree, не пересказ поведения.
+      - name: pre-commit отклоняет коммит в agent/<N>-* не из своего дерева
+        run: bash scripts/git/test/worktree-guard.test.sh
+
+      # task-branch заводит/переиспользует рабочее дерево (#332): CI-режим
+      # (GITHUB_ACTIONS=true) сохраняет старое поведение для scripts/worker/task.sh.
+      - name: task-branch заводит/переиспользует worktree, CI-режим не меняется
+        run: bash scripts/git/test/task-branch.test.sh
+
       # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
       # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
       - name: Тесты кампании dispatch-tail
@@ -269,7 +280,10 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/* scripts/git/test/*.sh .githooks/*; do
+            # scripts/git/* теперь задевает и подкаталог scripts/git/test/ —
+            # bash -n на каталоге падает; файлы -- проверяются отдельным паттерном.
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
