@@ -26,6 +26,9 @@ const MESSAGES = {
     dispatch_network_failed: "GitHub API недоступен: {detail}",
     dispatch_rejected: "GitHub ответил {status} на dispatch (ожидался 204)",
     internal: "{detail}",
+    // #320: тот же 500, что и internal, но с именем причины — квота DO SQLite
+    // (rows_read/rows_written) на бесплатном тарифе, а не безымянная поломка.
+    storage_quota_exceeded: "Хранилище DO вернуло похожую на квоту ошибку: {detail}",
   },
 } as const;
 

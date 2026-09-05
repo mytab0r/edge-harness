@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { handsAreAlive } from "../src/harness";
+import { classifyStorageError, handsAreAlive } from "../src/harness";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -441,5 +441,41 @@ describe("живой поток", () => {
     expect(hello.type).toBe("hello");
     expect(hello.status.heartbeat_fresh_ms).toBe(60_000);
     ws.close();
+  });
+});
+
+describe("класс ошибки хранилища (#320)", () => {
+  it("ловит формулировки квоты rows_read/rows_written и общий 'quota'", () => {
+    expect(classifyStorageError("exceeded the daily Durable Objects free tier limit of 5000000 rows_read"))
+      .toBe("quota_exceeded");
+    expect(classifyStorageError("rows_written limit exceeded")).toBe("quota_exceeded");
+    expect(classifyStorageError("quota exceeded")).toBe("quota_exceeded");
+  });
+
+  it("не путает обычную ошибку с квотой", () => {
+    expect(classifyStorageError("network timeout")).toBe("unknown");
+    expect(classifyStorageError("unexpected token in JSON")).toBe("unknown");
+  });
+});
+
+describe("кэш счётчиков задач по статусу (#320)", () => {
+  // Регрессия на возврат полного GROUP BY в горячий путь: если инвалидация
+  // кэша при записи в tasks пропадёт, счётчики застынут на значении первого
+  // вызова #status() и перестанут отражать реальные переходы — тест это ловит
+  // дельтой, а не абсолютным числом (в файле общее хранилище DO между тестами).
+  it("queued/running/done меняются по фактическим переходам, не только по факту чтения", async () => {
+    const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const taskId = created.task_id;
+
+    const afterCreate = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 1, kind: "job_start" }] });
+    const afterStart = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(afterStart.tasks.queued).toBe(afterCreate.tasks.queued - 1);
+    expect(afterStart.tasks.running).toBe(afterCreate.tasks.running + 1);
+
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 2, kind: "job_end", data: { result: "ok" } }] });
+    const afterEnd = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
+    expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
   });
 });

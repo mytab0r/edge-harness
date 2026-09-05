@@ -31,6 +31,11 @@ const SCHEMA = [
      latency_ms  INTEGER,
      status      TEXT NOT NULL DEFAULT 'queued'
    )`,
+  // Квота rows_read (#320): без индекса #status() сканировал ВСЮ историческую
+  // таблицу tasks на каждый heartbeat (раз в 20 с при работающей job), чтобы
+  // найти зависшие dispatched-задачи. Индекс сводит эту выборку к текущим
+  // dispatched-строкам — их всегда мало, в отличие от истории.
+  `CREATE INDEX IF NOT EXISTS tasks_status_dispatch ON tasks(status, dispatch_ts)`,
   `CREATE TABLE IF NOT EXISTS heartbeat (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
      ts     INTEGER NOT NULL,
@@ -257,6 +262,21 @@ export function handsAreAlive(now: number, lastHeartbeatTs: number | null): bool
 }
 
 /**
+ * Класс ошибки хранилища DO по тексту исключения (#320). Cloudflare не
+ * документирует точную форму отказа при исчерпании суточной квоты
+ * rows_read/rows_written (docs/research/20-cloudflare-free.md, «Durable
+ * Objects на Free»/«Что не подтверждено») — известна только фраза из письма
+ * «further operations of that type will fail with an error» и названия
+ * операций (rows_read, rows_written). НЕ ПОДТВЕРЖДЕНО: точный текст
+ * исключения workerd не проверен на живом отказе — ловим широко по
+ * ключевым словам, а не по одной строке, и называем находку своим именем
+ * вместо общего «internal»/«пульс не бьётся».
+ */
+export function classifyStorageError(message: string): "quota_exceeded" | "unknown" {
+  return /rows[_ ]?(read|written)|quota|exceeded.*(limit|tier)/i.test(message) ? "quota_exceeded" : "unknown";
+}
+
+/**
  * «Возможности нет» (секреты не заданы) — единственное место, что читает
  * сентинел HEARTBEAT.notConfiguredDetail (#303, находка ревью): литерал жил
  * ещё и во фронте (app.js: status.last_pulse.detail === "not_configured")
@@ -337,6 +357,13 @@ class ApiError extends Response {
 export class Harness extends DurableObject<Env> {
   #sql: SqlStorage;
 
+  // Кэш агрегата «сколько задач в каждом статусе» (#320, рецепт rows_read).
+  // Не зависит от времени — меняется ТОЛЬКО записью в tasks, поэтому
+  // инвалидация по месту записи корректна (в отличие от stale_dispatch,
+  // который зависит от текущего момента и обязан читаться заново). null —
+  // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
+  #taskCountsCache: Record<TaskRow["status"], number> | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
@@ -368,8 +395,11 @@ export class Harness extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof ApiError) return error;
       // Неизвестная ошибка — громко, с текстом в ответе: silent-wrong дороже падения.
+      // Квоту storage называем по имени (#320) — иначе отказ DO SQLite виден
+      // как обычный «internal», и никто не свяжет его с исчерпанием rows_read.
       const detail = error instanceof Error ? error.message : String(error);
-      return new ApiError(500, "internal", { detail });
+      const code = classifyStorageError(detail) === "quota_exceeded" ? "storage_quota_exceeded" : "internal";
+      return new ApiError(500, code, { detail });
     }
   }
 
@@ -540,19 +570,30 @@ export class Harness extends DurableObject<Env> {
 
   // ── Состояние ─────────────────────────────────────────────────────────────────────
 
+  /** #taskCountsCache лениво: пересчёт — единственное место, где GROUP BY по
+   *  ВСЕЙ таблице tasks вообще выполняется, и то не чаще, чем реально меняется
+   *  состав задач (создание/переход статуса), а не каждый heartbeat. */
+  #taskCounts(): Record<TaskRow["status"], number> {
+    if (this.#taskCountsCache === null) {
+      const counts: Record<TaskRow["status"], number> = {
+        queued: 0,
+        dispatched: 0,
+        running: 0,
+        done: 0,
+        failed: 0,
+      };
+      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
+        counts[String(row.status) as TaskRow["status"]] = Number(row.n);
+      }
+      this.#taskCountsCache = counts;
+    }
+    return this.#taskCountsCache;
+  }
+
   #status(): Status {
     const now = Date.now();
     const hb = this.#rows(this.#sql.exec("SELECT ts, job_id FROM heartbeat WHERE id = 1"))[0];
-    const counts: Record<TaskRow["status"], number> = {
-      queued: 0,
-      dispatched: 0,
-      running: 0,
-      done: 0,
-      failed: 0,
-    };
-    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
-      counts[String(row.status) as TaskRow["status"]] = Number(row.n);
-    }
+    const counts = this.#taskCounts();
     const lastEventId = Number(this.#rows(this.#sql.exec("SELECT COALESCE(MAX(id), 0) AS m FROM events"))[0].m);
     const stale = this.#rows(
       this.#sql.exec(
@@ -700,14 +741,16 @@ export class Harness extends DurableObject<Env> {
   /** Переходы задач и сброс heartbeat живут здесь и нигде больше. */
   #applySideEffects(row: EventRow): void {
     if (row.kind === "job_start") {
-      this.#sql.exec(
+      const cursor = this.#sql.exec(
         "UPDATE tasks SET status = 'running' WHERE id = ? AND status NOT IN ('done', 'failed')",
         row.task_id,
       );
+      if (cursor.rowsWritten > 0) this.#taskCountsCache = null;
     }
     if (row.kind === "job_end") {
       const failed = (row.data as { result?: string } | null)?.result === "fail";
       this.#sql.exec("UPDATE tasks SET status = ? WHERE id = ?", failed ? "failed" : "done", row.task_id);
+      this.#taskCountsCache = null;
       // Руки закончили — «руки живы» уходит сразу, а не через порог свежести.
       this.#sql.exec("DELETE FROM heartbeat WHERE id = 1");
     }
@@ -785,41 +828,58 @@ export class Harness extends DurableObject<Env> {
    *  и проверяем, не отстала ли морда dsh-edge от npm. */
 
   override async alarm(): Promise<void> {
-    // Тик перезакладывается ПЕРВОЙ строкой, до какого-либо I/O: ничто ниже не
-    // может убить цепочку (issue #269 — таблица ловушек для этого места).
-    await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
     const token = this.env.GH_DISPATCH_TOKEN;
     const repo = this.env.GH_REPO;
-    if (!token || !repo) {
-      // «Возможности нет» — не поломка, но и не тишина: видно в /api/status, что
-      // секретов нет, а не гадать по отсутствию прогонов оркестратора.
-      this.#recordPulse(false, HEARTBEAT.notConfiguredDetail, null, null);
+    try {
+      // Тик перезакладывается ПЕРВОЙ строкой внутри общего try/catch (#320):
+      // не только setAlarm, но и #sql.exec ниже (#getStoredPulse, #recordPulse)
+      // может упасть на исчерпании суточной квоты rows_read/rows_written —
+      // раньше такое исключение уходило из alarm() непойманным, и единственным
+      // следом оставалось молчание пульса (issue #269 — тот же класс проблем,
+      // «таблица ловушек для этого места», просто другая причина отказа).
+      await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationMs);
+      if (!token || !repo) {
+        // «Возможности нет» — не поломка, но и не тишина: видно в /api/status, что
+        // секретов нет, а не гадать по отсутствию прогонов оркестратора.
+        this.#recordPulse(false, HEARTBEAT.notConfiguredDetail, null, null);
+        return;
+      }
+      const previous = this.#getStoredPulse();
+      // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
+      // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
+      // baseline для следующего тика — и одновременно сверяем, появился ли новый
+      // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
+      // всегда на такт позже, а не блокирует этот alarm).
+      const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
+      const runConfirmed =
+        previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
+      const result = await attemptOrchestraDispatch(token, repo, fetch);
+      // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
+      // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
+      const detail = pulseDetailForRecord(result, runConfirmed);
+      this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
+      if (!result.ok || runConfirmed === false) {
+        // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
+        // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
+        // который никто не смотрит между дедами (fail loud, issue #269).
+        console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
+      }
+    } catch (error) {
+      // #320: похожая на исчерпание квоты storage (rows_read/rows_written)
+      // ошибка здесь раньше уходила из alarm() непойманным — единственным
+      // следом оставалось молчание пульса. CF ретраит упавший alarm сам (не
+      // подтверждено число попыток/окно — docs/research/20), но пока имя
+      // причины не названо явно, отказ неотличим от «пульс просто не бьётся».
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`alarm: упал (${classifyStorageError(detail)}): ${detail}`);
       return;
     }
-    const previous = this.#getStoredPulse();
-    // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
-    // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
-    // baseline для следующего тика — и одновременно сверяем, появился ли новый
-    // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
-    // всегда на такт позже, а не блокирует этот alarm).
-    const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
-    const runConfirmed =
-      previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
-    const result = await attemptOrchestraDispatch(token, repo, fetch);
-    // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
-    // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
-    const detail = pulseDetailForRecord(result, runConfirmed);
-    this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
-    if (!result.ok || runConfirmed === false) {
-      // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
-      // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
-      // который никто не смотрит между дедами (fail loud, issue #269).
-      console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
-    }
     try {
-      await this.#checkDshEdgeUpdate(token, repo);
+      // token/repo здесь гарантированно заданы: иначе выше уже был return.
+      await this.#checkDshEdgeUpdate(token!, repo!);
     } catch (error) {
-      console.log(`dsh-edge update check failed: ${error instanceof Error ? error.message : error}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
     }
   }
 
@@ -918,6 +978,7 @@ export class Harness extends DurableObject<Env> {
     const id = crypto.randomUUID();
     const now = Date.now();
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", id, now);
+    this.#taskCountsCache = null;
     this.#emitSystemEvent(id, "task_queued", { payload });
     this.#broadcastStatus();
 
@@ -969,6 +1030,7 @@ export class Harness extends DurableObject<Env> {
     }
 
     this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
+    this.#taskCountsCache = null;
     this.#emitSystemEvent(id, "task_dispatched", {});
     this.#broadcastStatus();
     return this.#json({ task_id: id, dispatched: true }, { status: 201 });
