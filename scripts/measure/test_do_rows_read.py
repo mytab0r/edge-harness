@@ -41,6 +41,17 @@ def test_unwrap_type_name_none():
     assert mod.unwrap_type_name(None) is None
 
 
+def test_unwrap_type_name_empty_string_name_on_wrapper():
+    # Живая схема Cloudflare (прогон #320, 2026-09-05): NON_NULL/LIST отдают
+    # name="" вместо null — разворот обязан продолжаться, а не считать это именем.
+    wrapped = {
+        "name": "", "kind": "NON_NULL",
+        "ofType": {"name": "", "kind": "LIST",
+                   "ofType": {"name": "AccountsFilterable", "kind": "OBJECT", "ofType": None}},
+    }
+    assert mod.unwrap_type_name(wrapped) == "AccountsFilterable"
+
+
 # ── find_field / find_arg ──────────────────────────────────────────────────────────
 
 
