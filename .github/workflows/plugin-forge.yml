@@ -42,10 +42,11 @@ jobs:
     outputs:
       # Даёт job'у forge-failed канонический plugin_id (после сверки с
       # манифестом — не basename каталога), чтобы падение ПОСЛЕ валидации
-      # писало failed в тот же псевдо-задачник, что building/built/
-      # deploying, а не в plugin:<basename> (находка AI-ревью PR #273:
-      # без этого таймлайн канонического плагина hello/hello-world вечно
-      # висел на deploying, а failed уходил в соседний, никогда не
+      # писало failed в тот же псевдо-задачник, что building/built (форж
+      # эмитит только эти два — deploying/ready постит канал деплоя, см.
+      # шаг «Итог» ниже), а не в plugin:<basename> (находка AI-ревью PR
+      # #273: без этого таймлайн канонического плагина hello/hello-world
+      # вечно висел на building, а failed уходил в соседний, никогда не
       # начинавшийся id).
       plugin_id: ${{ steps.validate.outputs.plugin_id }}
     steps:
@@ -194,6 +195,7 @@ jobs:
         env:
           NPM_CONFIG_CACHE: /tmp/npm-cache
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
           npm pack --cache /tmp/npm-cache --pack-destination "$GITHUB_WORKSPACE/artifacts" --loglevel=error >/dev/null
           TARBALL=$(ls "$GITHUB_WORKSPACE/artifacts"/*.tgz | head -1)
           SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
@@ -364,19 +366,6 @@ jobs:
           pnpm --dir apps/dsh-edge/standalone run verify
 
           echo "smoke=passed" >> "$GITHUB_OUTPUT"
-
-      - name: plugin_status → deploying
-        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
-        continue-on-error: true
-        env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
-          STATE: deploying
-          SOURCE: forge
-          DETAIL: "интеграционный дым пройден"
-        run: |
-          PLUGIN_ID="$PLUGIN_ID" STATE=deploying SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh
 
       # ── 4. Релиз ─────────────────────────────────────────────────────────────────
       - name: Создать/обновить релиз plugins-<id>-v<version>
@@ -550,43 +539,11 @@ jobs:
           # триггерится только schedule/workflow_dispatch, push в main его не
           # запускает (находка AI-ревью PR #162). Текст ниже описывает
           # реальный путь.
-          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. Постит `plugin_status: ready` в журнал\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
+          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n- Финальный статус этого шага в журнале — `built` (design.md «Канал обновления и статусы»: форж не деплоит и не постит `deploying`/`ready`)\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. `plugin_status: deploying`/`ready` постит канал деплоя, а не этот PR — это отдельная задача (доводка деплоя до ready, остаток #162), сюда ещё не подключена\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
             "$TASK_LINE" "${{ steps.release.outputs.release_tag }}")
           PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: plugin_status → ready (forge done)
-        # Финальный ready — ПОСЛЕ шага «Подготовить PR», а не до него: ready
-        # означает «форж закончен», а форж не закончен, пока PR не создан.
-        # Раньше этот шаг стоял перед PR-шагом — упавший `gh pr create` (права
-        # PAT, rate limit) давал журналу пару событий «ready», а следом
-        # «failed» от job forge-failed, и таймлайн плагина врал: «форж
-        # закончен» объявлено до того, как он реально закончился (находка
-        # AI-ревью PR #273). Теперь упавшее создание PR даёт только failed,
-        # без предшествующего ready.
-        #
-        # БЕЗ continue-on-error (симметрично deploy-dsh-edge.yml: там на
-        # финальном ready его тоже нет, только на промежуточных статусах), и
-        # БЕЗ `if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''` — этот `if`
-        # был на промежуточных статусах и случайно скопирован сюда: при пустых
-        # vars/secrets шаг молча пропускался бы, job зелёный, события в журнале
-        # нет — ровно silent-wrong, от которого обещает защищать комментарий ниже
-        # (находка AI-ревью PR #273). plugin_status.sh при FINAL=1 сам делает
-        # exit 1, если журнал недоступен, HARNESS_URL/HANDS_TOKEN не заданы или
-        # событие не принято — это должно красить job (fail loud: деплой без
-        # ready/failed события в журнале = silent-wrong, design.md). Находка
-        # AI-ревью PR #162.
-        env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
-          STATE: ready
-          SOURCE: forge
-          DETAIL: "релиз ${{ steps.release.outputs.release_tag }}, tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}, PR ${{ steps.pr.outputs.pr_url }}"
-          FINAL: "1"
-        run: |
-          PLUGIN_ID="$PLUGIN_ID" STATE=ready SOURCE=forge DETAIL="$DETAIL" FINAL=1 bash scripts/plugins/plugin_status.sh
 
       - name: Итог
         run: |
@@ -595,11 +552,17 @@ jobs:
           echo "Тарболл: ${{ steps.pack.outputs.asset }} (sha256: ${{ steps.pack.outputs.sha256 }})"
           echo "PR: ${{ steps.pr.outputs.pr_url }}"
           echo ""
-          # deploy-dsh-edge.yml НЕ триггерится на push в main (только schedule/
-          # workflow_dispatch, см. PR-body «Пост-мерж проверка») — тот же текст,
-          # что и в теле авто-PR ниже; было рассинхронизировано (находка AI-ревью
-          # PR #273: лог обещал автодеплой, которого не будет).
-          echo "Следующий шаг: ревью и мёрж PR. Деплой — НЕ автоматический: после мержа либо дождаться ежедневного schedule deploy-dsh-edge.yml, либо запустить его вручную (gh workflow run deploy-dsh-edge)."
+          # Форж заканчивается на built (design.md, «Канал обновления и
+          # статусы») — deploying/ready принадлежат каналу деплоя, а не
+          # этому job'у. deploy-dsh-edge.yml НЕ триггерится на push в main
+          # (только schedule/workflow_dispatch), поэтому постить ready здесь
+          # было бы silent-wrong: журнал сказал бы «готов» в момент, когда
+          # манифест-PR только создан, морда не пересобрана и плагина в
+          # ростере ещё нет (находка разбора PR #273, устраняющая
+          # расхождение с design.md, введённое в ходе AI-ревью того же PR).
+          # Канал «мерж → деплой → ready» — отдельная задача (см. #268 и
+          # issue из остатка #162 про доводку deploying/ready до деплоя).
+          echo "Следующий шаг: ревью и мёрж PR. Финальный статус этого шага — built. Ready проставит канал деплоя (отдельная задача): либо дождаться ежедневного schedule deploy-dsh-edge.yml, либо запустить его вручную (gh workflow run deploy-dsh-edge)."
 
   # Если форж упал — постим failed статус
   forge-failed:
@@ -633,8 +596,8 @@ jobs:
           # фолбэк на basename(inputs.plugin_path) в BASH ниже (находка
           # AI-ревью PR #273: без канонического id падение ПОСЛЕ валидации
           # уезжало в plugin:<basename>, а не в тот id, что уже видел
-          # building/built/deploying — таймлайн канонического плагина вечно
-          # висел на deploying).
+          # building/built — таймлайн канонического плагина вечно висел на
+          # building).
           PLUGIN_ID_INPUT: ${{ needs.forge.outputs.plugin_id }}
           PLUGIN_PATH: ${{ inputs.plugin_path }}
           STATE: failed
