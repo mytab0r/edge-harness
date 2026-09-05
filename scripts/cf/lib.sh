@@ -88,8 +88,9 @@ cf_workers_own() {
     echo "ОШИБКА: jq недоступен — не печатаю account-wide список без фильтра (чужие проекты в том же аккаунте)." >&2
     return 1
   fi
-  local allow_json
+  local allow_json expect own_count
   allow_json=$(printf '%s\n' $CF_OWN_WORKERS | jq -R . | jq -s .)
+  expect=$(printf '%s\n' $CF_OWN_WORKERS | wc -w)
   # jq не принимает не-ASCII ключи как bare-идентификаторы в {key: ...} —
   # только строковые литералы в кавычках.
   echo "$resp" | jq --argjson allow "$allow_json" '
@@ -97,6 +98,27 @@ cf_workers_own() {
     | ($all | map(select(.id as $id | $allow | index($id))
         | {id, modified_on, last_deployed_from, compatibility_date, usage_model})) as $own
     | {"свои": $own, "всего_в_аккаунте": ($all|length), "чужих_не_показано": (($all|length)-($own|length))}'
+  own_count=$(echo "$resp" | jq --argjson allow "$allow_json" \
+    '[(.result // [])[] | select(.id as $id | $allow | index($id))] | length')
+  if [ "$own_count" != "$expect" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: CF_OWN_WORKERS перечисляет $expect воркеров, а найдено $own_count — allowlist разошёлся со списком в аккаунте, инвентарь может лгать (см. CF_OWN_WORKERS в lib.sh)." >&2
+  fi
+}
+
+# cf_bindings_names <path> — для /workers/scripts/<name>/settings: печатает
+# ТОЛЬКО имя и тип каждого binding, никогда не печатает поле "text" — на
+# /settings оно приходит для plain_text bindings и это уже значение, не имя.
+# "Только имена" в заголовках status.sh и в docs/agents/INFRA-CF.md было
+# правдой для листингов (cf_workers_own и т.п.), но не для этого эндпоинта —
+# без фильтра сырой JSON с значениями plain_text утёк бы в публичный лог.
+cf_bindings_names() {
+  local path="$1" resp
+  resp=$(cf_get "$path") || return 1
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ОШИБКА: jq недоступен — не печатаю settings без фильтра (могут быть значения bindings)." >&2
+    return 1
+  fi
+  echo "$resp" | jq '{bindings: [.result.bindings[]? | {name, type}]}'
 }
 
 # cf_do_namespaces_own — список DO namespaces отфильтрован по script из
@@ -110,10 +132,16 @@ cf_do_namespaces_own() {
     echo "ОШИБКА: jq недоступен — не печатаю account-wide список без фильтра (чужие проекты в том же аккаунте)." >&2
     return 1
   fi
-  local allow_json
+  local allow_json expect own_count
   allow_json=$(printf '%s\n' $CF_OWN_WORKERS | jq -R . | jq -s .)
+  expect=$(printf '%s\n' $CF_OWN_WORKERS | wc -w)
   echo "$resp" | jq --argjson allow "$allow_json" '
     (.result // []) as $all
     | ($all | map(select(.script as $s | $allow | index($s)))) as $own
     | {"свои": $own, "всего_в_аккаунте": ($all|length), "чужих_не_показано": (($all|length)-($own|length))}'
+  own_count=$(echo "$resp" | jq --argjson allow "$allow_json" \
+    '[(.result // [])[] | select(.script as $s | $allow | index($s))] | length')
+  if [ "$own_count" != "$expect" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: CF_OWN_WORKERS перечисляет $expect воркеров, а найдено $own_count DO-namespace'ов с нашим script — на момент написания это 1:1 (по одному классу на воркер); расхождение может быть и дрейфом allowlist, и новым вторым классом — проверь CF_OWN_WORKERS в lib.sh." >&2
+  fi
 }
