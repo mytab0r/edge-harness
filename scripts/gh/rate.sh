@@ -4,11 +4,9 @@
 # workflow_dispatch) GitHub НЕ публикует через этот эндпоинт — см.
 # docs/agents/INFRA-GH.md и docs/research/21-github-actions.md.
 set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-gh_net_setup || exit 1
 
 data=$(gh api rate_limit) || {
-  echo "ОШИБКА: gh api rate_limit не ответил — сеть/прокси/токен." >&2
+  echo "ОШИБКА: gh api rate_limit не ответил — сеть/токен." >&2
   exit 1
 }
 
