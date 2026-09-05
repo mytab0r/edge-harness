@@ -27,6 +27,9 @@ cf_get "/accounts/${acc}/workers/scripts/edge-harness/deployments"
 section "Bindings edge-harness — только имена, не значения (/workers/scripts/edge-harness/settings)"
 cf_get "/accounts/${acc}/workers/scripts/edge-harness/settings"
 
+section "Bindings dsh-edge — только имена, не значения (/workers/scripts/dsh-edge/settings)"
+cf_get "/accounts/${acc}/workers/scripts/dsh-edge/settings"
+
 section "Поддомен workers.dev (/workers/subdomain)"
 cf_get "/accounts/${acc}/workers/subdomain"
 
