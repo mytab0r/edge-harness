@@ -102,6 +102,17 @@ jobs:
             exit 1
           fi
 
+          # Зеркальный случай: явный (или вычисленный) plugin_id уже занят в
+          # манифесте ЧУЖИМ пакетом. Без этой проверки апсерт в шаге «Подготовить
+          # PR» молча перепишет чужую запись — id, package и sha256 — вместо
+          # того, чтобы завести новую (находка AI-ревью PR #273: проверка выше
+          # ловит совпадение по package в одну сторону, но не по id в другую).
+          MANIFEST_PACKAGE=$(jq -r --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id) | .package' dsh-edge/plugins.json)
+          if [ -n "$MANIFEST_PACKAGE" ] && [ "$MANIFEST_PACKAGE" != "$PLUGIN_NAME" ]; then
+            echo "::error::id '$PLUGIN_ID' уже в манифесте под пакетом '$MANIFEST_PACKAGE', а вычислен пакет '$PLUGIN_NAME' — id занят другим плагином, укажите свой plugin_id"
+            exit 1
+          fi
+
           # server существующей записи манифеста (для дыма, см. FORGE_EXTRA_PLUGIN
           # ниже): бамп client-only плагина (server:false, напр. plugin-manager)
           # не должен внезапно валидировать серверную композицию, которую
@@ -240,9 +251,14 @@ jobs:
           git fetch -q --depth 1 origin "$SHA"
           git checkout -q FETCH_HEAD
 
-          # Патчи
+          # Патчи. Гвардия на пустую серию — то же место правды о поведении,
+          # что и deploy-dsh-edge.yml, шаг «Патч-серия»: без неё опустевшая
+          # серия молча даёт tarball, собранный и опубликованный против
+          # непатченного апстрима (находка AI-ревью PR #273).
           shopt -s nullglob
-          for p in "$GITHUB_WORKSPACE/dsh-edge/patches"/*.patch; do
+          patches=("$GITHUB_WORKSPACE/dsh-edge/patches"/*.patch)
+          [ ${#patches[@]} -gt 0 ] || { echo "::error::Патч-серия пуста, а манифест требует source-build"; exit 1; }
+          for p in "${patches[@]}"; do
             git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p"; exit 1; }
           done
 
@@ -292,6 +308,26 @@ jobs:
           # Сборка
           pnpm --dir apps/dsh-edge/standalone run build
 
+          # Гвардия gzip-бюджета direct-воркера (design.md «Workers-совместимость»,
+          # «Размер»): бюджет 900 KiB (921600 байт) общий, PoC-замер с одним
+          # плагином — 775046/921600 (tasks.md §1, запас ~143 KiB). Design
+          # называет точный замер — вклад ИМЕННО tarball'а по bundle-meta.json
+          # пробной сборки — но bundle-meta.json в этой схеме сборки эфемерен
+          # (design «Девиации» п.2) и такой замер требует отдельной пробной
+          # сборки без плагина; здесь — ДЕШЁВЫЙ прокси на уже собранном
+          # артефакте: gzip всего direct-воркера (с новым плагином внутри,
+          # т.к. кодогенерация выше уже включила его через FORGE_EXTRA_PLUGIN)
+          # против общего бюджета. Не точный вклад одного плагина, а верхняя
+          # граница на весь бандл — без гейта плагины ехали бы без проверки
+          # размера вовсе, а не с приблизительной (находка AI-ревью PR #273).
+          # Точный замер вклада — отдельная работа (design.md, tasks.md §3).
+          BUNDLE_BUDGET_BYTES=921600
+          DIRECT_WORKER="apps/dsh-edge/standalone/worker/direct/index.js"
+          [ -f "$DIRECT_WORKER" ] || { echo "::error::direct-воркер не собран: $DIRECT_WORKER"; exit 1; }
+          BUNDLE_GZIP_BYTES=$(gzip -c "$DIRECT_WORKER" | wc -c)
+          echo "gzip direct-воркера: $BUNDLE_GZIP_BYTES / $BUNDLE_BUDGET_BYTES байт (прокси, не точный вклад плагина)"
+          [ "$BUNDLE_GZIP_BYTES" -le "$BUNDLE_BUDGET_BYTES" ] || { echo "::error::gzip-бюджет direct-воркера превышен: $BUNDLE_GZIP_BYTES > $BUNDLE_BUDGET_BYTES байт (design.md «Размер»)"; exit 1; }
+
           # Гвардия состава
           node "$GITHUB_WORKSPACE/dsh-edge/verify-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
 
@@ -338,9 +374,12 @@ jobs:
               --title "$RELEASE_TITLE" --notes "Автоматический релиз из plugin-forge (${GITHUB_RUN_ID})"
           fi
 
-          # Публикуем checksums как отдельный asset
+          # Публикуем checksums как отдельный asset. Без `|| true`: упавшая
+          # заливка молча давала бы зелёный job и релиз без checksums, хотя
+          # задача требует релиз «с checksums» (находка AI-ревью PR #273) —
+          # tarball строкой выше уже заливается без маскировки, здесь то же.
           echo "$SHA256  $ASSET" > "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256"
-          gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256" --clobber || true
+          gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256" --clobber
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
@@ -506,7 +545,12 @@ jobs:
       # вызов ниже падал бы всегда, а `|| true` эту постоянную ошибку маскировал —
       # финальный failed-статус молча не доезжал до журнала (находка AI-ревью PR
       # #273, тот же класс, что #271: silent-wrong под `|| true`).
+      # persist-credentials: false — как во всех остальных checkout'ах репозитория
+      # (main-job, deploy, worker): без него токен с contents:write остаётся в
+      # .git/config воркспейса этого job'а (находка AI-ревью PR #273).
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: plugin_status → failed
         if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
