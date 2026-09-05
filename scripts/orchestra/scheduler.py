@@ -1515,15 +1515,22 @@ def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
 
 def accept_merged_tasks(
     repo: str, pool: list[dict], merged: dict[int, dict], now: datetime | None = None,
+    open_pulls_list: list[dict] | None = None,
 ) -> tuple[list[str], bool]:
     """Стадия приёмки (#227) — см. блок комментариев выше. merged — карта
     Task#N → слитый PR (merged_pr_map(all_merged_pulls(repo)), один общий
     обход на весь прогон оркестратора, тот же, что использует reap_stale).
     now — момент прогона (по умолчанию текущее время), нужен только для
-    порога ACCEPTANCE_PENDING_HOURS.
-    Возвращает (строки отчёта, был_ли_жёсткий_сбой): жёсткий сбой эскалируется
-    тут же на каждую затронутую задачу отдельно, но не прерывает обход
-    остальных (мерж уже состоялся, задачи независимы)."""
+    порога ACCEPTANCE_PENDING_HOURS. open_pulls_list — открытые PR того же
+    прогона (open_pulls(repo)); передаётся не None только вызовом из main().
+
+    Живой случай (проверки на входе вместо гвардий постфактум, задача о
+    приёмке при открытом втором PR): приёмка закрыла #320, пока по нему был
+    открыт второй PR #325 — тот немедленно упал на contract («задача #320
+    закрыта»), хотя работа по нему ещё шла. Улика (`state == "ok"/"docs"`)
+    относится к ОДНОМУ слитому PR — этого недостаточно, если задачу СЕЙЧАС
+    же объявляет ещё один открытый PR: закрытие оборвало бы его работу.
+    Проверка ниже — до PATCH state=closed, не после."""
     now = now or datetime.now(timezone.utc)
     lines: list[str] = []
     hard_failure = False
@@ -1719,6 +1726,22 @@ def accept_merged_tasks(
             continue
 
         if state in ("ok", "docs"):
+            # Проверка на входе (см. докстринг функции, живой случай #320/#325):
+            # задачу может ПРЯМО СЕЙЧАС объявлять ещё один открытый PR — улика
+            # про уже слитый не отменяет его работу. task_ref.resolve_pr_task —
+            # то же единственное место правды, что и у остальных решений
+            # «какая задача у этого PR» (#259), не самодельное сравнение строк.
+            other_open = [
+                p for p in (open_pulls_list or [])
+                if p.get("number") != pull["number"]
+                and task_ref.resolve_pr_task(p) == number
+            ]
+            if other_open:
+                others = ", ".join(f"#{p['number']}" for p in other_open)
+                lines.append(
+                    f"⏳ #{number}: приёмка отложена — задачу ещё объявляет "
+                    f"открытый PR {others}, закрывать по PR #{pull['number']} рано ({category})")
+                continue
             marker = ACCEPTANCE_DOCS_MARKER if state == "docs" else ACCEPTANCE_OK_MARKER
             reasoning = ("документационная правка, наблюдаемого результата по природе нет — "
                          "закрываю с этим обоснованием"
@@ -1820,7 +1843,10 @@ def main() -> int:
     # Приёмка (#227): задачи, чей PR уже слит, разбираются по улике ДО подсчёта
     # пула — свободно/в работе должно отражать уже закрытые этим же прогоном.
     pool = open_task_issues(repo)
-    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged, now)
+    # Проверка на входе, не гвардия постфактум (см. докстринг accept_merged_tasks):
+    # свежий снимок открытых PR, а не тот, что собран в начале прогона выше —
+    # PR, который стал причиной этой приёмки, мог открыться только что.
+    accept_lines, accept_hard_failure = accept_merged_tasks(repo, pool, merged, now, open_pulls(repo))
     if accept_lines:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])

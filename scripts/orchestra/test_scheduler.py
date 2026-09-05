@@ -225,7 +225,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], True))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -248,7 +248,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -270,7 +270,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
-        lambda repo, pool, merged, now=None: (["🚨 #227: улика не проверена"], True))
+        lambda repo, pool, merged, now=None, open_pulls_list=None: (["🚨 #227: улика не проверена"], True))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
     monkeypatch.setattr(sch, "summary", lambda lines: None)
@@ -1673,7 +1673,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], False))
     dispatched = []
     monkeypatch.setattr(
@@ -1866,6 +1866,37 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
     assert any("закрыта приёмкой" in line and "#21" in line for line in lines)
     assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/21") for call in fake.calls)
     assert posted and "улика получена" in posted[0][1]
+
+
+def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
+    """Проверка на входе (живой случай #320/#325): приёмка закрыла #320, пока
+    по нему был открыт второй PR #325, объявляющий ту же задачу первой строкой
+    тела, — тот немедленно упал на contract («задача #320 закрыта»). Улика по
+    уже слитому PR #177 не отменяет работу открытого PR #325 по той же
+    задаче — закрывать рано, задача остаётся в работе."""
+    fake = FakeGh({
+        "pulls/177/files": files_payload(PR_177_FILES),
+        "issues/21/comments": [],
+        "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "success", "created_at": "2026-09-02T23:31:31Z",
+             "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/33695471222"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
+    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    still_open = pull(325, pr_body="#21\n\nвторой PR по этой задаче, работа продолжается")
+    pool = [issue(21, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(
+        REPO, pool, {21: PR177}, open_pulls_list=[still_open])
+
+    assert hard_failure is False
+    assert any("приёмка отложена" in line and "#325" in line for line in lines)
+    assert not any(call.startswith(f"-X PATCH repos/{REPO}/issues/21") for call in fake.calls)
+    assert posted == []
 
 
 def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):

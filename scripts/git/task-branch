@@ -17,6 +17,58 @@ if [ -z "$task" ] || printf '%s' "$task" | grep -qE '[^A-Za-z0-9._-]'; then
   exit 1
 fi
 
+# Проверка на входе, не гвардия постфактум: задача обязана существовать, быть
+# открытой, нести метку task и НЕ нести blocked — иначе ветка заводится под
+# то, чего уже нет/чем нельзя заниматься, и это обнаруживается только ПОСЛЕ
+# работы (тот же класс живого случая #320/#325: приёмка закрыла задачу, пока
+# по ней был открыт второй PR — contract упал уже после того, как работа
+# сделана). gh недоступен (офлайн/не установлен/сеть не отвечает) — только
+# предупреждение: у агента без сети нет способа спросить GitHub вообще, а
+# отказ создавать ветку в таком случае обошёлся бы дороже непроверенной ветки.
+task_number="${task%%-*}"
+if ! printf '%s' "$task_number" | grep -qE '^[0-9]+$'; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: не смог извлечь номер задачи из «$task» (ожидается N-slug) — проверка GitHub пропущена." >&2
+elif ! command -v gh >/dev/null 2>&1; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: gh не найден — задача #$task_number не проверена (открыта/метки), ветка заводится непроверенной." >&2
+else
+  # git config --get (не `git remote get-url`, который резолвит url.*.insteadOf
+  # и отдал бы уже переписанный адрес) — сырой сконфигурированный URL origin.
+  origin_url=$(git config --get remote.origin.url 2>/dev/null || true)
+  repo=$(printf '%s' "$origin_url" | sed -E 's#^(git@|https://)[^:/]+[:/](.+?)(\.git)?$#\2#')
+  if [ -z "$repo" ] || [ "$repo" = "$origin_url" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: не смог определить owner/repo из origin ($origin_url) — задача #$task_number не проверена." >&2
+  else
+    err_file=$(mktemp)
+    info=$(gh api "repos/$repo/issues/$task_number" \
+      --jq '[.state, (.labels // [] | map(.name) | join(","))] | @tsv' 2>"$err_file") && rc=0 || rc=$?
+    err=$(cat "$err_file"); rm -f "$err_file"
+    if [ "$rc" -ne 0 ]; then
+      if printf '%s' "$err" | grep -qE 'HTTP 404'; then
+        echo "ОШИБКА: задача #$task_number не найдена в $repo — ветку не завожу." >&2
+        exit 1
+      fi
+      echo "ПРЕДУПРЕЖДЕНИЕ: задача #$task_number не проверена (gh/сеть: $err) — ветка заводится непроверенной." >&2
+    else
+      state=$(printf '%s' "$info" | cut -f1)
+      labels=",$(printf '%s' "$info" | cut -f2),"
+      if [ "$state" != "open" ]; then
+        echo "ОШИБКА: задача #$task_number закрыта — ветку не завожу." >&2
+        exit 1
+      fi
+      case "$labels" in
+        *,task,*) : ;;
+        *) echo "ОШИБКА: на задаче #$task_number нет метки task — это не задача пула, ветку не завожу." >&2; exit 1 ;;
+      esac
+      case "$labels" in
+        *,blocked,*)
+          echo "ОШИБКА: на задаче #$task_number метка blocked — она ждёт владельца, ветку не завожу." >&2
+          exit 1
+          ;;
+      esac
+    fi
+  fi
+fi
+
 git fetch origin --prune
 
 # ls-remote идёт мимо локальных ссылок: если после fetch локальный origin/main

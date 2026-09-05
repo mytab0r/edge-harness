@@ -125,6 +125,15 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
     в задаче (логин у всех агентов один — различает каналы именно она)."""
     now = now or datetime.now(timezone.utc)
     ref = lock_ref(task)
+    # Проверка на входе (не гвардия постфактум): закрытая задача не должна
+    # снова уходить в аренду — иначе воркер/hands начинают работу над тем,
+    # что приёмка уже закрыла (тот же класс живого случая #320/#325, что и
+    # accept_merged_tasks выше по конвейеру, симметричная сторона). Дешёвый
+    # GET перед дорогим созданием коммита/ref'а ниже.
+    issue = gh(f"repos/{repo}/issues/{task}")
+    if issue.get("state") != "open":
+        return ClaimResult(claimed=False, task=task,
+                           detail=f"задача #{task} закрыта — аренда не выдана")
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
     base = gh(f"repos/{repo}/commits/main")
     commit = gh(
