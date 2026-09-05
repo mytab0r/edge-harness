@@ -74,6 +74,13 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       Наблюдаемая величина именно эта (задержка слияния готового PR), а не
       статус последнего прогона оркестратора — тот может быть сплошь success,
       пока сам прогон не случается достаточно часто (issue #269, #297).
+  12. Запрет переоткрытия (#369, решение владельца): закрытая задача не
+      переоткрывается никогда — остаток работы оформляется НОВОЙ, более узкой
+      задачей со ссылкой на закрытую. GitHub не умеет отклонить reopen нативно
+      (нет ни repo-настройки, ни API-поля), поэтому носитель правила — пульс:
+      issue из пула с `state_reason == "reopened"` закрывается обратно с
+      комментарием-отказом ДО того, как её увидит accept_merged_tasks (см.
+      reject_reopened_tasks).
 """
 
 import http.cookiejar
@@ -1513,6 +1520,80 @@ def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
     return missing
 
 
+REOPEN_REJECTED_MARKER = "[оркестратор: переоткрытие закрытой задачи отклонено]"
+
+
+def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
+    """Закрытая задача не переоткрывается никогда (решение владельца, #369,
+    дословно: «если закрыли то всё, создавайте новую»). GitHub не умеет
+    отклонить reopen нативно — ни repo-настройки, ни API-поля под это нет
+    (Lock conversation ограничивает только новые комментарии участников без
+    write-доступа, состояние issue не трогает); носитель правила — эта
+    проверка пульса.
+
+    Issues API уже отдаёт `state_reason` в САМОМ списке `open_task_issues`
+    (тот же приём, что уже применяет is_epic_issue для sub_issues_summary —
+    поле есть в list-ответе, второго запроса на issue не нужно): "reopened"
+    однозначно значит «текущее открытое состояние достигнуто событием
+    reopened», в отличие от issue, открытого с рождения (там `state_reason`
+    — null). Проверено фактом на живых #111/#114/#115/#158 (закрыты и
+    переоткрыты человеком 2026-09-05): `state_reason` остаётся "reopened"
+    и после последующих assign/unassign — соседние события его не сбрасывают
+    (не подтверждено для остальных типов событий — не проверялось).
+
+    Найдя такую issue — закрывает её обратно с комментарием-отказом,
+    называющим готовое действие (завести НОВУЮ, более узкую задачу со
+    ссылкой на эту как related — не переоткрывать снова), и снимает
+    assignee/lock, если реопен успел их вернуть.
+
+    Дедупликации не нужно: как только issue закрыта, `state=open` фильтр
+    `open_task_issues` больше её не вернёт — второй раз в `pool` она не
+    попадёт (тот же приём, которым ok/docs-ветка accept_merged_tasks сама
+    выходит из повторной обработки). Новое переоткрытие после этого —
+    новое нарушение и снова отклоняется, а не повтор старого; отдельный
+    маркер-комментарий для дедупликации (как у accept_merged_tasks) тут не
+    нужен вовсе.
+
+    Вызывается в main() ДО accept_merged_tasks на том же снимке pool: пока
+    issue не успела снова смэтчиться со старым merged_pr_map по декларации
+    первой строки PR (тот класс, который защищал несостоявшийся PR #366 —
+    при этом правиле сценарий, который он защищал, больше не существует).
+
+    WATCHDOG_ISSUE — постоянный канал эскалации (#120), не задача из пула,
+    и намеренно исключён (тот же приём, что у accept_merged_tasks)."""
+    lines: list[str] = []
+    for issue in pool:
+        if issue.get("state_reason") != "reopened":
+            continue
+        number = issue["number"]
+        if number == WATCHDOG_ISSUE:
+            continue
+        text = (
+            f"{REOPEN_REJECTED_MARKER} закрытая задача не переоткрывается "
+            "никогда (решение владельца). Остаток работы, если он есть, "
+            "оформляется НОВОЙ, более узкой задачей со ссылкой на эту "
+            f"(#{number}) как related — не переоткрытием этой. Закрываю обратно."
+        )
+        try:
+            post_issue_comment(repo, number, text)
+            gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
+        except RuntimeError as error:
+            lines.append(f"⚠️ #{number}: переоткрытие не отклонено — {error}")
+            continue
+        if issue["assignees"]:
+            who = ", ".join(a["login"] for a in issue["assignees"])
+            try:
+                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+            except RuntimeError as error:
+                lines.append(f"⚠️ #{number}: assignee не снят после отклонённого переоткрытия — {error}")
+        try:
+            lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+        except RuntimeError as error:
+            lines.append(f"⚠️ замок task-{number} не снят: {error}")
+        lines.append(f"🚫 #{number}: переоткрытие отклонено, задача закрыта обратно")
+    return lines
+
+
 def accept_merged_tasks(
     repo: str, pool: list[dict], merged: dict[int, dict], now: datetime | None = None,
     *, open_pulls_list: list[dict],
@@ -1847,6 +1928,12 @@ def main() -> int:
     # Приёмка (#227): задачи, чей PR уже слит, разбираются по улике ДО подсчёта
     # пула — свободно/в работе должно отражать уже закрытые этим же прогоном.
     pool = open_task_issues(repo)
+    # Запрет переоткрытия (#369) — ДО accept_merged_tasks: переоткрытая задача
+    # закрывается обратно раньше, чем успеет снова смэтчиться со старым
+    # merged_pr_map по декларации первой строки PR.
+    reopen_lines = reject_reopened_tasks(repo, pool)
+    if reopen_lines:
+        pool = open_task_issues(repo)  # пересчёт: отклонённое переоткрытие закрыло задачи
     # Проверка на входе, не гвардия постфактум (см. докстринг accept_merged_tasks):
     # свежий снимок открытых PR, а не тот, что собран в начале прогона выше —
     # PR, который стал причиной этой приёмки, мог открыться только что.
@@ -1863,10 +1950,12 @@ def main() -> int:
     worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
 
     if (stale_lines or conflict_lines or unhealthy_lines or merge_lines or ai_retry_lines
-            or stale_ready_lines or accept_lines or lease_lines or conveyor_lines or worker_lines):
+            or stale_ready_lines or reopen_lines or accept_lines or lease_lines or conveyor_lines
+            or worker_lines):
         lines += ["", "### Действия",
                   *stale_lines, *lease_lines, *conflict_lines, *unhealthy_lines, *merge_lines,
-                  *ai_retry_lines, *stale_ready_lines, *accept_lines, *conveyor_lines, *worker_lines]
+                  *ai_retry_lines, *stale_ready_lines, *reopen_lines, *accept_lines, *conveyor_lines,
+                  *worker_lines]
     else:
         lines += ["", "Действий не требуется."]
 
