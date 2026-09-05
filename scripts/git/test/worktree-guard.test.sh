@@ -57,7 +57,14 @@ make_worktree() {
 }
 
 try_commit() {
-  # echo "ok" >&2 через git commit — возвращает код возврата коммита
+  # echo "ok" >&2 через git commit — возвращает код возврата коммита.
+  # -u GITHUB_ACTIONS: гвардия несёт исключение «в CI (GITHUB_ACTIONS=true)
+  # task-branch не заводит worktree» (#333) — этот тест симулирует ИМЕННО
+  # локальный не-CI коммит агента, но если сам ЭТОТ тест-раннер запущен
+  # внутри настоящего GitHub Actions job, переменная GITHUB_ACTIONS=true уже
+  # стоит в окружении и наследуется сюда, отключая гвардию по ошибочной
+  # причине — случай 2 молча переставал ловить регресс на CI (не локально,
+  # где GITHUB_ACTIONS обычно не задана).
   local dir="$1"
   (
     cd "$WORK/$dir"
@@ -65,7 +72,7 @@ try_commit() {
     git config user.name test
     echo "change in $dir at $(date +%s%N)" >>note.txt
     git add note.txt
-    git commit -q -m "test commit" 2>"$WORK/$dir.stderr"
+    env -u GITHUB_ACTIONS git commit -q -m "test commit" 2>"$WORK/$dir.stderr"
   )
 }
 

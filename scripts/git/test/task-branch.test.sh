@@ -20,11 +20,18 @@
 #      падает и не плодит второе;
 #   10) в CI (GITHUB_ACTIONS=true) — старое поведение: переключает ветку
 #       прямо в текущем каталоге, worktree не заводит (обратная совместимость
-#       с scripts/worker/task.sh, который сам работает в одноразовом чекауте).
+#       с scripts/worker/task.sh, который сам работает в одноразовом чекауте);
+#   11) стык с гвардией (находка ревью #333): после переключения ветки в
+#       CI-режиме коммит настоящим .githooks/pre-commit обязан проходить —
+#       без этого случая случай 10 (CI-режим task-branch) и
+#       worktree-guard.test.sh (гвардия вне CI) проверяют половины отдельно,
+#       а стык — коммит после CI-переключения под настоящим хуком — не
+#       покрывает никто.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_SRC="$REPO_ROOT/scripts/git/task-branch"
+HOOK_SRC="$REPO_ROOT/.githooks/pre-commit"
 
 WORK="$(mktemp -d)"
 cleanup() { rm -rf "$WORK"; }
@@ -408,7 +415,36 @@ else
   fail=1
 fi
 
+# ── случай 11: после CI-переключения коммит настоящим хуком обязан пройти ───
+# Скрипт зовётся по $SCRIPT_SRC (не копией): эпик-гвардия (#376) и lease.sh
+# тянут соседей относительно СЕБЯ; сам ХУК при этом копируется в c-main —
+# смысл случая в том, что коммит идёт под НАСТОЯЩИМ файлом гвардии. Номер 61 —
+# из маршрутов фейкового gh: на неизвестном маршруте эпик-гвардия отказала бы
+# громко ещё до переключения ветки.
+new_origin "c"
+git clone -q --branch main "$WORK/c-origin.git" "$WORK/c-main" 2>/dev/null
+mkdir -p "$WORK/c-main/.githooks"
+cp "$HOOK_SRC" "$WORK/c-main/.githooks/pre-commit"
+chmod +x "$WORK/c-main/.githooks/pre-commit"
+(cd "$WORK/c-main" && GITHUB_ACTIONS=true PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 61-ci-commit) \
+  >"$WORK/c-run.out" 2>&1 || { fail=1; note "случай 11: CI-переключение упало:"; cat "$WORK/c-run.out"; }
+(
+  cd "$WORK/c-main"
+  git config user.email test@example.com
+  git config user.name test
+  echo "change" >>note.txt
+  git add note.txt
+  GITHUB_ACTIONS=true git commit -q -m "ci commit after task-branch"
+) >"$WORK/c-commit.out" 2>"$WORK/c-commit.stderr"
+if [ -f "$WORK/c-commit.out" ] && grep -qF "ci commit after task-branch" <(git -C "$WORK/c-main" log -1 --format=%s 2>/dev/null); then
+  note "случай 11 (коммит после CI-переключения настоящим хуком): прошёл — ОК"
+else
+  note "случай 11 (коммит после CI-переключения настоящим хуком): ОТКЛОНЁН — ОШИБКА"
+  cat "$WORK/c-commit.stderr" >&2
+  fail=1
+fi
+
 if [ "$fail" = 0 ]; then
-  echo "task-branch: все случаи входной проверки и работы с worktree прошли как ожидалось"
+  echo "task-branch: все случаи входной проверки, работы с worktree и стыка с гвардией прошли как ожидалось"
 fi
 exit "$fail"
