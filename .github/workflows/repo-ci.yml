@@ -303,7 +303,8 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/* scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
