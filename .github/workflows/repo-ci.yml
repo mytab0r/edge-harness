@@ -292,10 +292,21 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/* scripts/git/test/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Аренда задачи в task-branch (#356): внешний/ручной канал теперь тоже
+      # берёт claim при создании ветки, не только облачный воркер — иначе
+      # free_task() в scripts/worker/task.sh считал бы такую задачу свободной,
+      # пока над ней прямо сейчас работает внешний агент. Локальный bare-репо +
+      # заглушки gh/python3 (без сети), мутационно доказано (см. заголовок
+      # файла): без вызова claim в task-branch сценарий «занятая задача»
+      # красный.
+      - name: task-branch берёт аренду задачи, не арендует дважды за транспортом
+        run: bash scripts/git/test/task-branch-lease.test.sh
 
       # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
       # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
