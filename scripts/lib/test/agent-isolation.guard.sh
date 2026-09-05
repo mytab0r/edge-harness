@@ -29,19 +29,23 @@ sudo -n true 2>/dev/null \
   || { echo "::error::ГВАРДИЯ #140: sudo недоступен — изоляцию невозможно ни установить, ни проверить" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
+chmod 755 "$TMP"   # агент-юзер обязан проходить к лаунчеру и каталогам (mktemp даёт 700)
 GUARD_USER="dsh-agent-guard$$"   # ≤32 символов, одноразовый
 GUARD_SUDOERS="/etc/sudoers.d/99-$GUARD_USER-env"
 cleanup() {
   sudo userdel -r "$GUARD_USER" >/dev/null 2>&1 || true
   sudo rm -f "$GUARD_SUDOERS" || true
-  rm -rf "$TMP"
+  sudo rm -rf "$TMP"   # часть дерева принадлежит агент-юзеру — сносит только root
 }
 trap cleanup EXIT
 
 # Фальшивые значения секретных ПО ИМЕНИ переменных: проверяем проводку env_keep,
-# а не секреты (в репозитории секретов нет ни в тестах, ни в примерах).
+# а не секреты (в репозитории секретов нет ни в тестах, ни в примерах). Значение
+# DEEPSEEK_API_KEY короче 20 символов: детерминированный гейт сканирует
+# добавленные строки паттерном KEY="<20+ символов>" — фикстура не должна в него
+# попадать (та же причина, что у dsh-clients.smoke.sh).
 export DSH_AGENT_USER="$GUARD_USER"
-export DEEPSEEK_API_KEY="guard-fake-key-value"
+export DEEPSEEK_API_KEY="guard-fake-key"
 export DEEPSEEK_BASE_URL="https://guard.invalid/v1"
 export DEEPSEEK_MODEL="guard-model"
 
@@ -64,7 +68,7 @@ fi
 # транспорта, и проверка вырождалась бы в пустой успех.
 # shellcheck disable=SC2016
 crossed="$(dsh_agent_run bash -c 'printf %s "$DEEPSEEK_API_KEY"')"
-[ "$crossed" = "guard-fake-key-value" ] || fail "env_keep не провёл DEEPSEEK_API_KEY агенту (получено '$crossed')"
+[ "$crossed" = "guard-fake-key" ] || fail "env_keep не провёл DEEPSEEK_API_KEY агенту (получено '$crossed')"
 # shellcheck disable=SC2016
 crossed="$(dsh_agent_run bash -c 'printf %s "$DEEPSEEK_MODEL"')"
 [ "$crossed" = "guard-model" ] || fail "env_keep не провёл DEEPSEEK_MODEL агенту"

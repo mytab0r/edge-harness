@@ -162,6 +162,16 @@ dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FIL
     created_uid="$(id -u "$DSH_AGENT_USER" 2>/dev/null || true)"
     echo "Агент-юзер $DSH_AGENT_USER создан${created_uid:+ (uid $created_uid)}"
   fi
+  # 1а. Дом транспорта обязан пропускать «только проход» (x без r): воркспейс,
+  # RUNNER_TEMP и лаунчер лежат под $HOME (/home/runner на GitHub-раннерах,
+  # дефолт 750) — без этого агент физически не дойдёт до своего cwd, спула и
+  # лаунчера. Найдено CI-гвардией #140 на настоящем sudo; Smoke это показать
+  # не может (sudo заглушен — uid-граница отсутствует).
+  if [ "$(stat -c %u "$HOME" 2>/dev/null)" = "$(id -u)" ] \
+      && [ "$(stat -c %a "$HOME" | cut -c3)" != 7 ]; then
+    sudo chmod 711 "$HOME"
+    echo "::warning::$HOME был без прохода для других uid — открыт 711: агенту нужен проход до воркспейса, спула и лаунчера (#140)"
+  fi
   # 2. Группа docker агенту запрещена: на этой машине она равна доступу к ключу
   # (#140). Чиним сами (самовосстановление на переиспользуемом раннере), не молча.
   if id -nG "$DSH_AGENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
@@ -236,6 +246,12 @@ LAUNCHER
   crossed="$(dsh_agent_run bash -c 'printf %s "$DEEPSEEK_MODEL"')"
   if [ "$crossed" != "$DEEPSEEK_MODEL" ]; then
     echo "::error::env_keep не провёл DEEPSEEK_MODEL агент-юзеру (получено '$crossed') — запуск без ключа молча бы сломал модель" >&2
+    return 1
+  fi
+  # 8а-бис. Агент обязан достигать воркспейса (свой cwd): проход по $HOME
+  # и правам на каталоги — иначе dsh стартует в недостижимом каталоге.
+  if ! dsh_agent_run test -d "$workspace"; then
+    echo "::error::агент-юзер не видит воркспейс $workspace (проход по $HOME/каталогам?) — cwd dsh был бы недостижим" >&2
     return 1
   fi
   # 8б. Негатив: environ процессов транспорта агенту не читается. Проверка
