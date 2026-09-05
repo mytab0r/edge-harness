@@ -34,6 +34,8 @@ const PR_DETAIL_LIMIT = 2
 
 const REPO_PATTERN = /^[^/\s]+\/[^/\s]+$/
 
+export { readRepo, readToken, githubFetch, callSignal, describeFailure, configError, networkError, networkReason, defineRunnerTaskTool, defineRunnerStatusTool, collectPullRequests };
+
 export default {
   name: 'edge-plugins:runner-bridge',
   // cordis 4: сервис можно читать через ctx.<service> только если плагин
