@@ -529,6 +529,26 @@ def test_cmd_should_run_prints_true_for_ai_failed_even_with_matching_fingerprint
     assert capsys.readouterr().out.strip() == "true"
 
 
+# ── --force (workflow_dispatch, находка 1 вердикта ai-review PR #294):
+# ручной повтор не должен глохнуть на неизменном отпечатке диффа ────────────
+
+def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatch, capsys):
+    def gh_must_not_be_called(url: str):
+        raise AssertionError(
+            f"--force обязан пропускать сверку отпечатка без обращения к сети, а вызвал gh({url!r})")
+
+    monkeypatch.setattr(ai, "gh", gh_must_not_be_called)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    # PR с окончательным вердиктом и неизменным отпечатком — без --force это
+    # go=false (см. test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok
+    # выше); ручной запуск обязан всё равно дойти до true.
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
 def test_is_not_found_exact_form_only():
     # прод-форма gh: «gh api repos/o/r/issues/404: Not Found (HTTP 404)»
     assert ai.is_not_found(RuntimeError(

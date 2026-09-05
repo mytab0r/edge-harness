@@ -442,8 +442,23 @@ def cmd_gather(args: argparse.Namespace) -> int:
 # функцию, что читает check_pr.py для решения «сохранить ли метку»
 # (review_labels.should_run_ai_review — одно место правды, а не вторая копия
 # условия в YAML).
+#
+# --force (находка 1 вердикта ai-review PR #294): ручной workflow_dispatch —
+# единственный документированный путь повтора ревью (ADR 0007 п.4, шапка
+# ai-review.yml) и инструмент оркестратора для проводки PR через ревью.
+# Сверка отпечатка диффа здесь неуместна вовсе: она проверяет «AI уже видел
+# ровно этот код автоматически», а не «владелец согласен с прошлым вердиктом»
+# — и ручной запуск на PR с окончательным вердиктом (ai:ok/ai:changes) и
+# неизменным диффом (например пустой коммит) без --force превращался бы в
+# зелёный no-op без единой строчки ревью, снимая единственный газ пересмотра.
 
 def cmd_should_run(args: argparse.Namespace) -> int:
+    if getattr(args, "force", False):
+        # Ручной повтор не заходит в сеть вообще: решение не зависит от
+        # состояния PR, а необращение к gh здесь же и доказывает мутацией
+        # (test_cmd_should_run_force_skips_check_no_network_call).
+        print("true")
+        return 0
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     current_labels = {label["name"] for label in pull["labels"]}
@@ -549,6 +564,10 @@ def main() -> int:
     should_run = sub.add_parser(
         "should-run", help="нужен ли дорогой прогон (печатает true/false, #294)")
     should_run.add_argument("--pr", type=int, required=True)
+    # Ручной workflow_dispatch (находка 1 вердикта ai-review PR #294):
+    # пропускает сверку отпечатка целиком, печатает true без обращения к сети.
+    should_run.add_argument("--force", action="store_true", default=False,
+                             help="ручной повтор (workflow_dispatch) — не сверять отпечаток диффа")
     should_run.set_defaults(func=cmd_should_run)
 
     verdict = sub.add_parser("verdict", help="разбор ответа + комментарий + метка")

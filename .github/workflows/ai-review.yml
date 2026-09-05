@@ -173,15 +173,33 @@ jobs:
       # что читает check_pr.py (cmd_should_run в ai_review.py, не вторая
       # копия условия в YAML). ai:failed никогда не даёт пропустить прогон —
       # у него отдельный газ на автоповтор по таймеру (#196).
+      #
+      # workflow_dispatch — единственный документированный путь ручного
+      # повтора (ADR 0007 п.4, шапка этого файла) и рабочий инструмент
+      # оркестратора для проводки PR через ревью: отпечаток сверять НЕЛЬЗЯ,
+      # иначе ручной запуск на PR с окончательным вердиктом и неизменным
+      # диффом становится зелёным no-op без единой строчки ревью — владелец
+      # теряет единственный газ пересмотра (находка 1 вердикта ai-review
+      # PR #294). --force просит cmd_should_run отдать "true" без обращения
+      # к сети вовсе (доказано мутацией: без --force дорогой прогон на
+      # неизменном отпечатке пропускается и при dispatch). Пустой output
+      # шага останавливает job verdict молча (needs.review.outputs.go !=
+      # 'true') — поэтому go=true пишется явно в обеих ветках, не только
+      # выводом python-команды.
       - if: steps.facts.outputs.go == 'true'
         id: fingerprint
         name: Нужен ли дорогой прогон (сверка отпечатка диффа)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -o pipefail
-          run_needed=$(python scripts/review/ai_review.py should-run --pr "$PR_NUMBER") \
+          force_flag=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            force_flag="--force"
+          fi
+          run_needed=$(python scripts/review/ai_review.py should-run --pr "$PR_NUMBER" $force_flag) \
             || { echo "::error::не смог решить, нужен ли дорогой прогон ai-review для PR #$PR_NUMBER"; exit 1; }
           if [ "$run_needed" = "true" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
