@@ -898,7 +898,6 @@ describe("inbox: сообщения владельца", () => {
     // Публичный alarm(). GH_DISPATCH_TOKEN ставится локально: без него alarm
     // выходит рано до ватчдога; все внешние вызовы (dispatch оркестратора,
     // сверка dsh-edge) — заглушки, реальные версии равны → тихо.
-    const realFetch = globalThis.fetch;
     env.GH_DISPATCH_TOKEN = "test-dispatch-token";
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
@@ -908,7 +907,10 @@ describe("inbox: сообщения владельца", () => {
       if (url.includes("dsh-edge.mytab0r.workers.dev") || url.includes("registry.npmjs.org")) {
         return new Response(JSON.stringify({ version: "0.0.0" }), { status: 200 });
       }
-      return realFetch(input as RequestInfo, init);
+      // Неожиданный вызов = тест вышел за рамки замысла: громко, а не в сеть
+      // (замечание ревью #173 — иначе будущее директивное сообщение в этом
+      // тесте молча ходило бы в настоящий GitHub).
+      throw new Error(`неожиданный fetch в alarm-тесте: ${url}`);
     }) as typeof fetch);
     let alarmRan = false;
     try {
