@@ -10,8 +10,8 @@
  *     алиасом патча 0001 и при неразрешении валит сборку, так что литерал в
  *     бандле доказывает: композиция собрана и код плагина внутри.
  *     Замечание против дизайна: bundle-meta.json, названный в design.md,
- *     эфемерен — bundle-standalone.mjs удаляет временную папку с метаданными;
- *     гвардия проверяет durability-артефакт того же доказательства.
+ *     без патча 0006 удаляется вместе с временным outdir; гвардия проверяет
+ *     durability-артефакт того же доказательства.
  *   - client: true → собранный клиентский бандл обязан лежать в
  *     dist/plugins/<package>/client.js, а boot-граф в dist/index.html обязан
  *     содержать запись с id = имя пакета (то есть плагин попал в ростер
@@ -22,7 +22,7 @@
 
 import { access, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { loadManifest, manifestDirectory } from './manifest.mjs'
+import { loadManifestWithForgeExtra, manifestDirectory } from './manifest.mjs'
 
 const cloneRoot = process.argv[2]
 if (!cloneRoot) {
@@ -30,7 +30,9 @@ if (!cloneRoot) {
   process.exit(2)
 }
 
-const manifest = await loadManifest(manifestDirectory())
+// FORGE_EXTRA_PLUGIN (env) — плагин форжа, которого ещё нет в dsh-edge/plugins.json
+// на момент интеграционного дыма plugin-forge.yml; см. manifest.mjs.
+const manifest = await loadManifestWithForgeExtra(manifestDirectory())
 const standaloneRoot = join(cloneRoot, 'apps', 'dsh-edge', 'standalone')
 
 for (const plugin of manifest.plugins) {

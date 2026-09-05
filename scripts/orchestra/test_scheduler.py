@@ -1516,6 +1516,70 @@ def test_after_merge_wires_update_remaining_pulls(monkeypatch):
     assert calls == [(1, [other])]
 
 
+# ── Канал обновления морды (стройка 3 эпика #77) ────────────────────────────────
+# Мерж правки dsh-edge/** (манифест plugin-forge, патч-серия, пин апстрима)
+# обязан диспатчить deploy-dsh-edge.yml СРАЗУ после мержа. Класс тот же, что у
+# cf-worker → deploy-worker: merge через GITHUB_TOKEN push-события не создаёт
+# (защита GitHub от рекурсии), триггером канал не держится; крон — страховка
+# на сутки, а не канал («морда перезапускается с плагином» — минуты, не сутки).
+
+
+def test_after_merge_dispatches_dsh_edge_deploy(monkeypatch):
+    merged = pull(77)
+    dispatches = []
+
+    def fake_run(cmd, **_kwargs):
+        dispatches.append(cmd)
+        return None
+
+    monkeypatch.setattr(sch, "gh", FakeGh({
+        "pulls/77/files?per_page=100&page=1": [{"filename": "dsh-edge/plugins.json"}],
+        "pulls/77/files?per_page=100&page=2": [],
+    }))
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: [])
+    lines, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert ["gh", "workflow", "run", "deploy-dsh-edge.yml", "--ref", "main"] in dispatches
+    assert any("deploy-dsh-edge запущен" in line for line in lines)
+
+
+def test_after_merge_skips_dsh_edge_deploy_for_other_paths(monkeypatch):
+    merged = pull(78)
+    dispatches = []
+
+    def fake_run(cmd, **_kwargs):
+        dispatches.append(cmd)
+        return None
+
+    monkeypatch.setattr(sch, "gh", FakeGh({
+        "pulls/78/files?per_page=100&page=1": [{"filename": "scripts/orchestra/scheduler.py"}],
+        "pulls/78/files?per_page=100&page=2": [],
+    }))
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: [])
+    lines, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert dispatches == []
+    assert not any("deploy-dsh-edge" in line for line in lines)
+
+
+def test_deploy_on_merge_class_covers_both_deployables():
+    # Гвардия класса (один хелпер на оба деплоя): снимать диспатч cf-worker или
+    # dsh-edge из after_merge — красный тест; новый деплой-таргет добавляется
+    # строкой того же вида, а не своей копией subprocess.run.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'dispatch_deploy_on_merge(files, "cf-worker/", "deploy-worker.yml")' in source
+    assert 'dispatch_deploy_on_merge(files, "dsh-edge/", "deploy-dsh-edge.yml")' in source
+    # В after_merge не осталось инлайновых копий диспатча мимо хелпера: старая
+    # копия была `subprocess.run(` + `["gh", "workflow", "run"` с отступом
+    # 12 пробелов (внутри if); у хелпера — 4/8. Снятие любого из двух вызовов
+    # хелпера выше красит этот тест, новая копия — последний assert.
+    assert 'subprocess.run(\n            ["gh", "workflow", "run"' not in source
+
+
 # ── Гвардия холостого хода (критерий приёмки, пункт 4) ───────────────────────────
 # Пустая очередь (нет PR, нет задач) — ни одного мутирующего вызова gh ни от
 # одного из трёх поведений и от main() целиком. Это САМАЯ важная гвардия:

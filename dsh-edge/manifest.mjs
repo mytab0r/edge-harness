@@ -21,6 +21,16 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const MANIFEST_VERSION = 1
+/**
+ * Потолок вклада одного плагина в серверный бандл, байты bytesInOutput
+ * esbuild-метафайла (минифицированный вклад входов плагина в вывод сборки).
+ * Якорь: gzip-бюджет direct-воркера 900 KiB общий (design.md «Размер»),
+ * пробная сборка PoC занимала ~775 KiB — запас ~143 KiB gzip; 256 KiB
+ * минифицированных байт на плагин оставляет запас на несколько плагинов и
+ * громко отсекает плагин, притащивший тяжёлую зависимость или дата-блоб.
+ * Единственное место правды порога; читает check-plugin-compat.mjs (форж).
+ */
+export const PLUGIN_BUNDLE_CONTRIBUTION_LIMIT_BYTES = 256 * 1024
 export const PLUGIN_SCOPE = '@edge-harness'
 // Тело шаблона id БЕЗ якорей — единственное место правды: сам ID_PATTERN
 // получает якоря здесь, а производные регэкспы (маркер заказа
@@ -129,6 +139,71 @@ export function parseCatalog(source) {
 /** Читает и валидирует каталог заказа из каталога dsh-edge (рядом с манифестом). */
 export async function loadCatalog(repoDir) {
   return parseCatalog(await readFile(join(repoDir, 'plugins-catalog.json'), 'utf8'))
+}
+
+/**
+ * Читает манифест и, если задан env FORGE_EXTRA_PLUGIN (JSON вида
+ * { id, package, server, client }), добавляет в него плагин форжа — только в
+ * памяти, файл на диске не трогается. Нужно интеграционному дыму
+ * plugin-forge.yml: на момент дыма PR с обновлением dsh-edge/plugins.json ещё
+ * не создан (см. шаг «Подготовить PR с обновлением манифеста»), поэтому без
+ * этой подстановки кодогенерация и гвардия состава проверяют только старый
+ * состав, а новый плагин нигде не верифицируется (silent-wrong).
+ *
+ * Подстановка — АПСЕРТ (ревью PR #162): при существующем id запись ЗАМЕНЯЕТСЯ
+ * на месте, а не «падай». Форж обязан уметь перевыпуск уже выпущенного
+ * плагина (бамп версии — главный повторяющийся сценарий), а дым форжа всегда
+ * подставляет FORGE_EXTRA_PLUGIN — жёсткий запрет на существующий id ломал бы
+ * любой повторный прогон на первом же шаге дыма. Замена зеркальна jq-ветке
+ * обновления в шаге PR plugin-forge.yml (запись на том же месте — порядок
+ * манифеста = порядок инсталла) и требует того же пакета: смена пакета под
+ * существующим id — решение владельца через правку манифеста PR-ом, не побочный
+ * эффект форжа. Гвардия подстановки — dsh-edge/test/manifest.test.mjs.
+ *
+ * source-поля (release/asset/sha256) кодогенератору и гвардии состава не
+ * нужны — они не используются в рендере/проверке артефактов — и на момент
+ * дыма релиз ещё не существует, так что подставляется валидная по форме
+ * заглушка.
+ */
+export async function loadManifestWithForgeExtra(repoRoot) {
+  const manifest = await loadManifest(repoRoot)
+  const extraRaw = process.env.FORGE_EXTRA_PLUGIN
+  if (!extraRaw) return manifest
+
+  let extra
+  try {
+    extra = JSON.parse(extraRaw)
+  } catch (error) {
+    throw new Error(`FORGE_EXTRA_PLUGIN is not valid JSON: ${error.message}`)
+  }
+  failUnless(objectShape(extra), 'FORGE_EXTRA_PLUGIN must be an object.')
+  failUnless(ID_PATTERN.test(extra.id), `FORGE_EXTRA_PLUGIN: id must match ${ID_PATTERN}.`)
+  failUnless(PACKAGE_PATTERN.test(extra.package), `FORGE_EXTRA_PLUGIN: package must match ${PACKAGE_PATTERN}.`)
+  failUnless(typeof extra.server === 'boolean' && typeof extra.client === 'boolean',
+    'FORGE_EXTRA_PLUGIN: server and client must be booleans.')
+  failUnless(extra.server || extra.client, 'FORGE_EXTRA_PLUGIN: at least one of server/client must be true.')
+
+  const record = {
+    id: extra.id,
+    package: extra.package,
+    // Дым офлайн, релиз ещё не существует на этом шаге форжа — заглушка
+    // валидной формы, не используемая ни кодогенератором, ни гвардией.
+    source: { release: 'forge-smoke-placeholder', asset: 'forge-smoke-placeholder.tgz', sha256: '0'.repeat(64) },
+    server: extra.server,
+    client: extra.client,
+  }
+
+  const index = manifest.plugins.findIndex((plugin) => plugin.id === extra.id)
+  if (index !== -1) {
+    const existing = manifest.plugins[index]
+    failUnless(existing.package === extra.package,
+      `FORGE_EXTRA_PLUGIN: id "${extra.id}" is already declared with package ${existing.package}, ` +
+      `forge built ${extra.package} — changing the package of an existing id goes through a manifest PR, not the forge.`)
+    const plugins = manifest.plugins.slice()
+    plugins[index] = record
+    return { ...manifest, plugins }
+  }
+  return { ...manifest, plugins: [...manifest.plugins, record] }
 }
 
 /** Каталог dsh-edge/, в котором лежит этот модуль. */

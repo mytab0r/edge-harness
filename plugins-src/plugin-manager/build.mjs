@@ -5,12 +5,19 @@
  *   client/client.js — финальный клиентский бандл в обёртке
  *                      window.__ModuleLoader__.load({id, factory}) (форма
  *                      продовых бандлов ростера, напр. dsh-edge-client-ui);
- *   manifest.json    — байт-в-байт копия dsh-edge/plugins.json: манифест
- *                      приезжает в пакет при сборке релиза, чтобы в бандле
- *                      и в tarball был один и тот же проверенный источник.
+ *   manifest.json    — копия dsh-edge/plugins.json (байт-в-байт файла, а с
+ *                      FORGE_EXTRA_PLUGIN — детерминированная сериализация
+ *                      эффективного состава, см. §2): манифест приезжает в
+ *                      пакет при сборке релиза, чтобы в бандле и в tarball
+ *                      был один и тот же проверенный источник.
  *
  * Единственное место правды формы манифеста — dsh-edge/manifest.mjs
  * (parseManifest): невалидный манифест = ненулевой exit без записи продукта.
+ * Состав читается через loadManifestWithForgeExtra: без env это обычный
+ * манифест, а форж (#77) подставляет им собираемый плагин ДО создания PR с
+ * манифестом — прямое чтение файла красило бы любой НОВЫЙ плагин с build.mjs
+ * («не объявлен в каталоге») на корню, т.е. фича «агент пишет плагин в
+ * раннере» работала бы только на переиздании уже объявленного.
  *
  * Дальше по конвейеру #80 (см. README): npm pack → переименование asset'а →
  * gh release create → sha256 в dsh-edge/plugins.json (PR).
@@ -22,7 +29,7 @@ import { spawnSync } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseManifest, loadCatalog, ID_PATTERN_SOURCE } from '../../dsh-edge/manifest.mjs'
+import { loadManifestWithForgeExtra, loadCatalog, ID_PATTERN_SOURCE } from '../../dsh-edge/manifest.mjs'
 
 const pluginDir = dirname(fileURLToPath(import.meta.url))
 const repoRoot = join(pluginDir, '..', '..')
@@ -40,14 +47,18 @@ failUnless(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length 
   'package.json: dsh.client.inject обязан перечислять сервисные пакеты (порядок загрузки ростера)')
 
 // ── 2. Манифест (одно место правды формы — dsh-edge/manifest.mjs) ─────────────
-const manifestPath = join(repoRoot, 'dsh-edge', 'plugins.json')
-const manifestSource = await readFile(manifestPath, 'utf8')
-const manifest = parseManifest(manifestSource)
+const dshEdgeDir = join(repoRoot, 'dsh-edge')
+// Состав — через loadManifestWithForgeExtra: без FORGE_EXTRA_PLUGIN это
+// прочитанный и валидированный манифест; форж (#77) тем же env подставляет
+// собираемый плагин ДО создания PR с манифестом (см. шапку).
+const manifest = await loadManifestWithForgeExtra(dshEdgeDir)
 // Пакет обязан быть объявлен в том каталоге, из которого собирается: sha256
 // в каталоге доказывает целостность артефакта, но не его свежесть — сборка
 // из устаревшего среза каталога молча уехала бы в релиз с чужим составом.
+// С подстановкой форжа объявленность даёт сам форжевый env (запись ещё не
+// в файле) — гвардия остаётся честной и для переиздания, и для нового плагина.
 failUnless(manifest.plugins.some((plugin) => plugin.package === pkg.name),
-  `dsh-edge/plugins.json: пакет ${pkg.name} не объявлен в каталоге — релиз нельзя собирать из несвежего среза`)
+  `dsh-edge/plugins.json: пакет ${pkg.name} не объявлен в каталоге (ни записью, ни FORGE_EXTRA_PLUGIN) — релиз нельзя собирать из несвежего среза`)
 // Клиенту нужен только состав: id и где он живёт. release/sha256 — канал
 // поставки, воркеру и журналу они в браузере ничего не говорят.
 const roster = manifest.plugins.map(({ id, server, client }) => ({ id, server, client }))
@@ -56,7 +67,7 @@ const roster = manifest.plugins.map(({ id, server, client }) => ({ id, server, c
 // Вшивается целиком: «доступные для заказа» = каталог минус установленные,
 // вычитание делает клиент (переход «заказано → установлено» автоматичен при
 // обновлении манифеста, каталог не надо синхронизировать с ним в данных).
-const catalog = await loadCatalog(join(repoRoot, 'dsh-edge'))
+const catalog = await loadCatalog(dshEdgeDir)
 
 // Маркер заказа выводится из шаблона id (одно место правды), а не копируется
 // в теле бандла: расширят шаблон id — маркер расширится вместе с ним, иначе
@@ -132,9 +143,18 @@ const bundle = [
 await mkdir(join(pluginDir, 'client'), { recursive: true })
 const bundlePath = join(pluginDir, 'client', 'client.js')
 await writeFile(bundlePath, bundle, 'utf8')
-// Копия — байт-в-байт: пакет показывает тот же проверенный манифест, из
-// которого сшит бандл, а не пересказ.
-await writeFile(join(pluginDir, 'manifest.json'), manifestSource, 'utf8')
+// Копия манифеста в пакет: без подстановки форжа — байт-в-байт файл (пакет
+// показывает тот же проверенный манифест, из которого сшит бандл, а не
+// пересказ); с FORGE_EXTRA_PLUGIN эффективный состав ШИРЕ файла (запись форжа
+// ещё не в plugins.json), и в пакет едет детерминированная сериализация
+// эффективного манифеста — гвардия деплоя сверяет ростер (id/server/client)
+// релизного пакета с манифестом, который форж предложит в PR, и обе стороны
+// сходятся байт-в-байт по форме jq-сравнения.
+const forgeExtra = process.env.FORGE_EXTRA_PLUGIN !== undefined
+const manifestBaked = forgeExtra
+  ? `${JSON.stringify(manifest, null, 2)}\n`
+  : await readFile(join(dshEdgeDir, 'plugins.json'), 'utf8')
+await writeFile(join(pluginDir, 'manifest.json'), manifestBaked, 'utf8')
 
 checkSyntax(join(pluginDir, 'src', 'body.js'))
 checkSyntax(bundlePath)

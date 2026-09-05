@@ -11,12 +11,28 @@
 # годится; префаб-деплой делает то же без вопросов. Данные Durable Object
 # переживают деплой (класс и миграция v1 не меняются), секреты воркера
 # (DSH_EDGE_ACCESS_KEY, DEEPSEEK_*) wrangler не трогает.
+#
+# Канал обновления морды (стройка 3 эпика #77) — по приоритету:
+#  1. оркестратор диспатчит этот воркфлоу сразу после мержа PR, тронувшего
+#     dsh-edge/** (scripts/orchestra/scheduler.py::dispatch_deploy_on_merge) —
+#     основной путь: merge через GITHUB_TOKEN push-события НЕ создаёт
+#     (защита GitHub от рекурсии), триггером этот канал не держится;
+#  2. push в main по dsh-edge/** — мержи руками владельца и прямые пуши;
+#  3. крон ниже — страховка на случай несработавших 1–2.
+# Гонок деплоев нет: concurrency-группа сериализует, деплой идемпотентен.
 name: deploy-dsh-edge
 
 on:
   schedule:
     # Ежедневно вне топ-часа; расписание действует только на default branch.
     - cron: "37 4 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      # Всё, что входит в сборку морды: манифест плагинов, патч-серия, пин
+      # апстрима, кодогенератор/гвардии, реестр интеграций, бренд-носители.
+      - 'dsh-edge/**'
   workflow_dispatch:
     inputs:
       version:
@@ -105,46 +121,7 @@ jobs:
         if: steps.route.outputs.plugins != '0'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p plugins-tgz
-          # Имена релизов, assets и ожидаемые sha256 — из валидированного
-          # манифеста (CLI manifest.mjs), не из сырого JSON и не из логов.
-          # Скачиваем ТОЛЬКО названные assets (--pattern), а не весь релиз:
-          # лишний tgz не имеет права проехать в pnpm add. Цикл — из файла,
-          # не из pipeline: exit внутри subshell пайпа не ронял бы шаг.
-          manifest=$(node dsh-edge/manifest.mjs)
-          jq -r '.plugins[] | [.id, .release, .asset, .sha256] | @tsv' <<<"$manifest" > plugins.tsv
-          : > checksums.txt
-          : > plugins-tgz/downloaded.txt
-          while IFS=$'\t' read -r id release asset sha; do
-            echo "плагин $id: релиз $release, asset $asset"
-            gh release download "$release" --repo "$GITHUB_REPOSITORY" \
-              --dir plugins-tgz --pattern "$asset" --clobber \
-              || { echo "::error::Релиз $release недоступен — манифест ссылается на несуществующий источник"; exit 1; }
-            [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
-            echo "$sha  plugins-tgz/$asset" >> checksums.txt
-            echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
-            # Срезы правды, вшитые в релизный пакет, сверяются с репо (#115):
-            # иначе правка dsh-edge/integrations.json или plugins.json без
-            # пересборки и релиза даёт зелёный деплой, который синкует секреты
-            # и пишет статусы по новому реестру, а секция UI молча показывает
-            # старый состав. integrations.json — байт-в-байт; у manifest.json
-            # plugin-manager сверяется ростер id/server/client (sha самой
-            # записи в копии пакета отстаёт по принятой самореференции).
-            if tar -tf "plugins-tgz/$asset" | grep -q '^package/integrations.json$'; then
-              tar -xOf "plugins-tgz/$asset" package/integrations.json \
-                | diff -q - "$GITHUB_WORKSPACE/dsh-edge/integrations.json" >/dev/null \
-                || { echo "::error::Реестр интеграций в релизе $asset разошёлся с dsh-edge/integrations.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1; }
-            fi
-            if tar -tf "plugins-tgz/$asset" | grep -q '^package/manifest.json$'; then
-              if ! diff \
-                <(tar -xOf "plugins-tgz/$asset" package/manifest.json | jq -S '[.plugins[] | {id, server, client}]') \
-                <(jq -S '[.plugins[] | {id, server, client}]' "$GITHUB_WORKSPACE/dsh-edge/plugins.json") >/dev/null; then
-                echo "::error::Ростер манифеста в релизе $asset разошёлся с dsh-edge/plugins.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1
-              fi
-            fi
-          done < plugins.tsv
-          sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
+        run: bash dsh-edge/download-manifest-plugins.sh plugins-tgz
 
       - name: Установить плагины в standalone (pnpm, не npm)
         if: steps.route.outputs.plugins != '0'

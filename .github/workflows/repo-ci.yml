@@ -273,14 +273,22 @@ jobs:
       # false вместо true/отсутствия ключа) уходил дальше codegen'а и
       # ловился только рантайм-дымом deploy-dsh-edge.yml ПОСЛЕ мержа — сломанный
       # контент плагина сутками красил ежедневный деплой по расписанию.
-      # check-plugin-compat.mjs запускается форжем перед сборкой tarball'а
-      # (plugin-forge.yml ещё не смёржен, #268) — здесь та же проверка на
+      # check-plugin-compat.mjs запускается и форжем перед сборкой tarball'а
+      # (plugin-forge.yml, #162/#268) — здесь та же проверка на
       # каждый PR, до публикации, а не только на деплое.
       - name: Совместимость плагинов (Workers + схема инструментов)
         run: |
           for dir in plugins-src/*/; do
             node dsh-edge/check-plugin-compat.mjs "$dir"
           done
+      # Юнит-гвардии чекера и подстановки форжа (#77): семантика счёта вклада
+      # в бандл по прод-форме esbuild-метафайла, конвенция server/client,
+      # сверенная с манифестом всех реальных плагинов, и upsert-семантика
+      # FORGE_EXTRA_PLUGIN (снятие любой проверки красит node --test здесь).
+      - name: Юнит-тесты чекера совместимости и форж-манифеста
+        run: |
+          node --test dsh-edge/test/check-plugin-compat.test.mjs
+          node --test dsh-edge/test/manifest.test.mjs
 
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им

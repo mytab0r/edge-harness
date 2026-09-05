@@ -2,20 +2,44 @@
  * Проверка совместимости плагина с Workers Free (design.md «Workers-совместимость»).
  * Запускается форжем перед сборкой tarball'а — красный выход = запрет публикации.
  *
- * Использование: node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> [--client]
+ * Использование:
+ *   node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> [--client]
+ *       [--bundle-meta <esbuild-metafile> --package <package-name>]
+ *   node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> --detect
+ *
+ *   --client       проверять клиентский бандл (плагин с client: true);
+ *   --bundle-meta  замерить вклад пакета --package в серверный бандл по
+ *                  esbuild-метафайлу пробной сборки (design.md «Размер»);
+ *                  метафайл делает долговечным патч 0006;
+ *   --detect       напечатать {server, client} из package.json и выйти —
+ *                  единственное место правды конвенции «корневой экспорт "." =
+ *                  серверный вход, dsh.client.platform = client»; форж берёт
+ *                  отсюда флаги и для FORGE_EXTRA_PLUGIN, и для PR-манифеста.
+ *
+ * История слияния: версия из PR #271 (main) дала весь проверочный движок —
+ * состав файлов из `npm pack --dry-run`, программная генерация паттернов
+ * запрещённых импортов, stripComments, генеричный `fs.*Sync`,
+ * checkToolSchemas; версия форжа (#162) добавила --detect/--bundle-meta и
+ * библиотечный режим для юнит-тестов.
  */
 
-import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { join, relative, resolve, isAbsolute } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { PLUGIN_BUNDLE_CONTRIBUTION_LIMIT_BYTES } from './manifest.mjs'
 
-const pluginDir = process.argv[2]
-const checkClient = process.argv.includes('--client')
-if (!pluginDir) {
-  process.stderr.write('Usage: node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> [--client]\n')
-  process.exit(2)
+const args = process.argv.slice(2)
+const pluginDir = args.find(a => !a.startsWith('--'))
+const checkClient = args.includes('--client')
+const detectOnly = args.includes('--detect')
+const bundleMetaPath = argValue('--bundle-meta')
+const packageName = argValue('--package')
+
+function argValue(name) {
+  const index = args.indexOf(name)
+  return index !== -1 ? args[index + 1] : undefined
 }
 
 const repoRoot = join(fileURLToPath(import.meta.url), '..', '..')
@@ -24,24 +48,75 @@ const repoRoot = join(fileURLToPath(import.meta.url), '..', '..')
 // путь к реальному /tmp/x, а чекер молча полез в чужой каталог внутри репо.
 // resolve() трактует абсолютный pluginDir как есть (стандартная семантика
 // path.resolve), а относительный — от repoRoot, как и раньше. Отсутствие
-// каталога после этого проверяем явно: раньше ошибка обнаруживалась только
-// на первом чтении package.json/npm pack и называла склеенный (неверный)
-// путь, не объясняя, что аргумент вообще был абсолютным (находка AI-ревью PR #271).
-const absPluginDir = resolve(repoRoot, pluginDir)
-if (!existsSync(absPluginDir)) {
-  process.stderr.write(
-    `plugin-compat: каталог плагина не найден: ${pluginDir}` +
-    (isAbsolute(pluginDir) ? '' : ` (резолвится в ${absPluginDir}, относительно ${repoRoot})`) +
-    '\n',
-  )
-  process.exit(2)
+// каталога проверяем явно (assertPluginDirExists, только в CLI-режиме: при
+// импорте как библиотеки (юнит-тесты) pluginDir нет — модуль не должен падать
+// на верхнем уровне), а не молчаливым ENOENT на первом чтении package.json.
+const absPluginDir = pluginDir ? resolve(repoRoot, pluginDir) : undefined
+
+function assertPluginDirExists() {
+  if (!pluginDir) usage()
+  if (!existsSync(absPluginDir)) {
+    process.stderr.write(
+      `plugin-compat: каталог плагина не найден: ${pluginDir}` +
+      (isAbsolute(pluginDir) ? '' : ` (резолвится в ${absPluginDir}, относительно ${repoRoot})`) +
+      '\n',
+    )
+    process.exit(2)
+  }
+}
+
+/**
+ * Конвенция «что в плагине серверное, а что клиентское» — по декларации
+ * package.json, не по хардкоду: server = есть корневой экспорт "." (серверный
+ * вход; кодогенератор для server:true рендерит `import <id> from '<package>'`,
+ * который без корневого экспорта не резолвится), client = dsh.client.platform
+ * === 'web'. Сверяется тестом с манифестом всех реальных плагинов репо.
+ */
+export function detectServerClient(pkg) {
+  return {
+    server: pkg.exports?.['.'] !== undefined,
+    client: pkg.dsh?.client?.platform === 'web',
+  }
+}
+
+/**
+ * Вклад пакета в серверный бандл по esbuild-метафайлу: сумма bytesInOutput
+ * входов пакета по всем выводам (та же прод-форма, что читает апстримный
+ * reportLargestInputs). Входы плагина в pnpm-клоне лежат под
+ * `…/node_modules/<package>/…`, поэтому признак — `/<package>/` в пути.
+ */
+export function sumBundleContribution(metafile, pkgName) {
+  let bytes = 0
+  for (const output of Object.values(metafile.outputs ?? {})) {
+    for (const [path, detail] of Object.entries(output.inputs ?? {})) {
+      if (path.includes(`/${pkgName}/`)) bytes += Number(detail.bytesInOutput ?? 0)
+    }
+  }
+  return bytes
+}
+
+/**
+ * Точка входа клиентского бандла — из exports['./client'] package.json
+ * (может быть ./dist/client.js, ./build/index.js — что угодно), не хардкод.
+ * Условные экспорты разрешаются в порядке апстримного exportPath
+ * (worker → browser → import → default).
+ */
+export function resolveClientEntry(clientExport) {
+  if (clientExport === undefined || clientExport === null) return undefined
+  if (typeof clientExport === 'string') return clientExport
+  if (typeof clientExport !== 'object') return undefined
+  return resolveClientEntry(clientExport.worker)
+    ?? resolveClientEntry(clientExport.browser)
+    ?? resolveClientEntry(clientExport.import)
+    ?? resolveClientEntry(clientExport.default)
 }
 
 async function main() {
+  assertPluginDirExists()
   console.log(`plugin-compat: проверка ${pluginDir}${checkClient ? ' (client=true)' : ''}`)
 
   // 1. package.json — форма, dsh.client, экспорты
-  await checkPackageJson()
+  const pkg = await checkPackageJson()
 
   // 2. Запрещённые импорты во всех .js/.ts файлах плагина
   await checkForbiddenImports()
@@ -54,7 +129,7 @@ async function main() {
 
   // 5. Если client=true — проверка клиентского бандла
   if (checkClient) {
-    await checkClientBundle()
+    await checkClientBundle(pkg)
   }
 
   // 6. Синтаксическая проверка всех JS файлов
@@ -63,12 +138,28 @@ async function main() {
   // 7. Схемы инструментов не нарушают контракт cordis (required: false)
   await checkToolSchemas()
 
+  // 8. Вклад в серверный бандл (design.md «Размер»), если дан метафайл
+  if (bundleMetaPath) {
+    await checkBundleSizeContribution(bundleMetaPath, packageName)
+  }
+
   console.log('plugin-compat: ЗЕЛЁНЫЙ — все проверки совместимости пройдены')
 }
 
+function usage() {
+  process.stderr.write(
+    'Usage: node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> [--client] '
+    + '[--bundle-meta <esbuild-metafile> --package <package-name>] | --detect\n',
+  )
+  process.exit(2)
+}
+
+async function readPackageJson() {
+  return JSON.parse(await readFile(join(absPluginDir, 'package.json'), 'utf8'))
+}
+
 async function checkPackageJson() {
-  const pkgPath = join(absPluginDir, 'package.json')
-  const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
+  const pkg = await readPackageJson()
 
   // dsh.client декларация
   if (checkClient) {
@@ -87,6 +178,7 @@ async function checkPackageJson() {
   }
 
   console.log('  ✓ package.json: форма валидна')
+  return pkg
 }
 
 // design.md «Workers-совместимость» задаёт ЧЁРНЫЙ список запрещённых node:*
@@ -104,7 +196,7 @@ async function checkPackageJson() {
 
 // Запрещённые Node builtin-модули (обе формы — с префиксом node: и голая) и
 // npm-пакеты нативных аддонов. Раньше каждая форма импорта прописывалась
-// вручную парой from/require на модуль — third форма, голый side-effect
+// вручную парой from/require на модуль — третья форма, голый side-effect
 // `import 'node:child_process'` (без from), не проверялась вовсе и давала
 // ЗЕЛЁНЫЙ (находка AI-ревью PR #271, мутационно доказана). Паттерны теперь
 // генерируются программно на все три формы разом — новый запрещённый
@@ -338,22 +430,23 @@ async function checkToolSchemas() {
   console.log('  ✓ схемы инструментов: required: false не найдено')
 }
 
-async function checkClientBundle() {
-  const pkgPath = join(absPluginDir, 'package.json')
-  const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
-
+async function checkClientBundle(pkg) {
   // Путь резолвится из package.json#exports['./client'] — прод-формы, по
-  // которой реально резолвит потребитель пакета (require/import). Раньше
-  // путь был захардкожен как client/client.js: плагин, объявивший другой
-  // путь в exports, проверялся бы не по тому файлу вообще (находка AI-ревью
-  // PR #271). checkPackageJson уже гарантирует наличие exports['./client'],
-  // но здесь проверка независима (checkClientBundle может быть вызвана и без
-  // неё в будущем) и явно требует строковой формы.
-  const clientExport = pkg.exports?.['./client']
-  if (!clientExport || typeof clientExport !== 'string') {
-    throw new Error('package.json: нужен строковый экспорт "./client" для клиентских плагинов')
+  // которой реально резолвит потребитель пакета (require/import); условные
+  // экспорты разрешает resolveClientEntry (worker → browser → import →
+  // default). Раньше путь был захардкожен как client/client.js: плагин,
+  // объявивший другой путь в exports, проверялся бы не по тому файлу вообще
+  // (находка AI-ревью PR #271). checkPackageJson уже гарантирует наличие
+  // exports['./client'], но здесь проверка независима (checkClientBundle
+  // может быть вызвана и без неё в будущем).
+  const entry = resolveClientEntry(pkg.exports?.['./client'])
+  if (!entry) {
+    throw new Error('package.json: нужен экспорт "./client" для клиентских плагинов')
   }
-  const clientPath = join(absPluginDir, clientExport)
+  if (!entry.endsWith('.js')) {
+    throw new Error(`package.json: exports["./client"] должен указывать на .js бандл, найдено: ${JSON.stringify(pkg.exports['./client'])}`)
+  }
+  const clientPath = join(absPluginDir, entry)
 
   let content
   try {
@@ -367,20 +460,21 @@ async function checkClientBundle() {
     // «будет собран на этапе сборки» просто по наличию exports['./client'] —
     // не проверяя, что механизм сборки вообще существует: плагин без единого
     // build-шага и без файла на диске проходил молча (находка AI-ревью PR
-    // #271). Форма самого бандла (window.__ModuleLoader__.load) в этой ветке
-    // физически непроверяема (файла нет), поэтому дальше — не зелёная
-    // галочка, а честное предупреждение с явным «форма не проверялась», а
-    // при отсутствии любого механизма сборки — ошибка: взяться файлу неоткуда.
+    // #271). Чекер сам сборку НЕ запускает (это дело реальной сборки
+    // tarball'а в форже, не dev-гейта совместимости), поэтому в форже шаг
+    // сборки клиентского бандла стоит ДО этого чекера: здесь форма
+    // проверяется на реальном артефакте, а предупреждение достаётся только
+    // ручным прогонам без сборки.
     const hasBuildScript = typeof pkg.scripts?.build === 'string'
     const hasBuildScriptFile = existsSync(join(absPluginDir, 'build.mjs'))
     if (!hasBuildScript && !hasBuildScriptFile) {
       throw new Error(
-        `package.json: exports['./client'] указывает на ${clientExport}, файла нет на диске, ` +
+        `package.json: exports['./client'] указывает на ${entry}, файла нет на диске, ` +
         'и у плагина нет ни package.json#scripts.build, ни build.mjs — взяться файлу неоткуда',
       )
     }
     console.warn(
-      `plugin-compat: предупреждение — ${clientExport} будет собран на этапе сборки, ` +
+      `plugin-compat: предупреждение — ${entry} будет собран на этапе сборки, ` +
       'форма (window.__ModuleLoader__.load) не проверялась',
     )
     return
@@ -388,7 +482,7 @@ async function checkClientBundle() {
 
   // Проверка обёртки ModuleLoader
   if (!content.includes('window.__ModuleLoader__.load')) {
-    throw new Error(`${clientExport}: отсутствует обёртка window.__ModuleLoader__.load — невалидная форма ростера`)
+    throw new Error(`${entry}: отсутствует обёртка window.__ModuleLoader__.load — невалидная форма ростера`)
   }
 
   // Проверка exports.inject: раньше условие было `!includes('exports.inject')
@@ -399,7 +493,36 @@ async function checkClientBundle() {
     console.warn('plugin-compat: предупреждение — не найден exports.inject в клиентском бандле')
   }
 
-  console.log(`  ✓ клиентский бандл: форма валидна (${clientExport})`)
+  console.log(`  ✓ клиентский бандл: форма валидна (${entry})`)
+}
+
+/**
+ * Вклад плагина в серверный бандл против порога-константы (design.md
+ * «Размер»). Метафайл — esbuild bundle-meta.json пробной сборки; патч 0006
+ * копирует его из эфемерного outdir апстрима рядом с артефактом. Наличие
+ * плагина в бандле здесь не проверяется — это класс гвардии состава
+ * (verify-edge-plugins.mjs); здесь — только размер.
+ */
+async function checkBundleSizeContribution(metaPath, pkgName) {
+  if (!pkgName) usage()
+  let metafile
+  try {
+    metafile = JSON.parse(await readFile(metaPath, 'utf8'))
+  } catch (error) {
+    throw new Error(
+      `метафайл сборки ${metaPath} не читается (${error.message}) — патч 0006 не применён `
+      + 'или пробная сборка не писала bundle-meta.json; мерить вклад нечем, падаю громко',
+    )
+  }
+  const bytes = sumBundleContribution(metafile, pkgName)
+  if (bytes > PLUGIN_BUNDLE_CONTRIBUTION_LIMIT_BYTES) {
+    throw new Error(
+      `вклад ${pkgName} в серверный бандл ${bytes} байт превышает потолок `
+      + `${PLUGIN_BUNDLE_CONTRIBUTION_LIMIT_BYTES} (design.md «Размер»: gzip-бюджет direct-воркера `
+      + '900 KiB общий) — уменьшите код плагина или вынесите тяжёлую зависимость',
+    )
+  }
+  console.log(`  ✓ вклад в бандл: ${bytes}/${PLUGIN_BUNDLE_CONTRIBUTION_LIMIT_BYTES} байт (bytesInOutput)`)
 }
 
 async function checkSyntax() {
@@ -427,9 +550,9 @@ async function checkSyntax() {
   console.log('  ✓ синтаксис: все файлы валидны')
 }
 
-// Кэш по каталогу плагина — collectJsFiles вызывается из четырёх разных
+// Кэш по каталогу плагина — collectJsFiles вызывается из пяти разных
 // проверок с одним и тем же absPluginDir; без кэша npm pack --dry-run
-// запускался бы 4 раза за прогон.
+// запускался бы 5 раз за прогон.
 const jsFilesCache = new Map()
 
 // Расширения, которые чекер реально разбирает (forbidden imports, dynamic
@@ -508,7 +631,29 @@ async function collectJsFiles(dir) {
   return files
 }
 
-main().catch(err => {
-  console.error(`plugin-compat: ОШИБКА — ${err.message}`)
-  process.exit(1)
-})
+// CLI-режим — только при запуске напрямую (паттерн manifest.mjs): при импорте
+// как библиотеки (юнит-тесты) модуль только экспортирует чистые функции.
+const invokedDirectly = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href
+if (invokedDirectly) {
+  if (detectOnly) {
+    assertPluginDirExists()
+    const pkg = await readPackageJson()
+    process.stdout.write(`${JSON.stringify(detectServerClient(pkg))}\n`)
+  } else {
+    // Флаг без пары не имеет права тихо пропускать замер: argValue вернул бы
+    // undefined, шаг 8 не выполнился, а чекер рапортовал бы «ЗЕЛЁНЫЙ» без
+    // проверки размера — silent-skip там, где всё остальное падает громко.
+    if (args.includes('--bundle-meta') && (bundleMetaPath === undefined || packageName === undefined)) {
+      process.stderr.write(
+        'plugin-compat: --bundle-meta требует пару аргументов: '
+        + '--bundle-meta <esbuild-metafile> --package <package-name>\n',
+      )
+      process.exit(2)
+    }
+    main().catch(err => {
+      console.error(`plugin-compat: ОШИБКА — ${err.message}`)
+      process.exit(1)
+    })
+  }
+}

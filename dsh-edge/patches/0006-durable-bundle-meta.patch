@@ -1,0 +1,28 @@
+diff --git a/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs b/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
+index 171e0ca..bf48526 100644
+--- a/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
++++ b/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
+@@ -1,9 +1,9 @@
+ /** Build one Worker mode from Edge-owned source plus pinned published packages. */
+ 
+ import { createRequire } from 'node:module'
+-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
++import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+-import { join, resolve } from 'node:path'
++import { dirname, join, resolve } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+ import { execa } from 'execa'
+ import { parse, printParseErrorCode } from 'jsonc-parser'
+@@ -185,6 +185,11 @@ async function publishArtifact(runtimeMode, source) {
+   const bundle = (await readFile(source, 'utf8'))
+     .replace(/\n\/\/# sourceMappingURL=index\.js\.map\s*$/u, '\n')
+   await writeFile(destination, bundle, { encoding: 'utf8', mode: 0o644, flag: 'wx' })
++  // EDGE-HARNESS (#77): keep the esbuild metafile next to the artifact.
++  // bundle-standalone deletes its temporary outdir in a `finally`, so without
++  // this copy the per-input size data is lost the moment the build ends and
++  // the plugin forge cannot measure a plugin's bundle contribution.
++  await copyFile(join(dirname(source), 'bundle-meta.json'), join(destinationDirectory, 'bundle-meta.json'))
+   process.stdout.write(`Wrote standalone ${runtimeMode} Worker artifact to ${destination}.\n`)
+ }
+ 

@@ -758,6 +758,23 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     return lines, hard_failure
 
 
+def dispatch_deploy_on_merge(files: list[dict], prefix: str, workflow: str) -> bool:
+    """Диспатч деплой-воркфлоу, если слитый PR тронул prefix/. Один экземпляр
+    класса «мерж через GITHUB_TOKEN не создаёт push-события» (защита GitHub от
+    рекурсии) на оба деплоя репозитория: канал «мерж PR → деплой» держится
+    явным `gh workflow run`, а не триггером, который в основном пути слияния
+    (orchestra) молча не срабатывает. True — диспатч сделан (check=True:
+    несостоявшийся запуск — красный прогон, а не тихий пропуск канала)."""
+    if not any((f["filename"] or "").startswith(prefix) for f in files):
+        return False
+    subprocess.run(
+        ["gh", "workflow", "run", workflow, "--ref", "main"],
+        capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+        check=True,
+    )
+    return True
+
+
 def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) -> tuple[list[str], bool]:
     """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
     (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно.
@@ -776,13 +793,17 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     # первая страница) — PR за сотню файлов, где cf-worker/* стоят за сотой
     # позицией, молча не запускал бы deploy-worker.yml.
     files = review_labels.list_pr_files(repo, number, gh)
-    if any((f["filename"] or "").startswith("cf-worker/") for f in files):
-        subprocess.run(
-            ["gh", "workflow", "run", "deploy-worker.yml", "--ref", "main"],
-            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
-            check=True,
-        )
+    if dispatch_deploy_on_merge(files, "cf-worker/", "deploy-worker.yml"):
         lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
+    # Канал обновления морды (стройка 3 эпика #77) — тот же класс, что
+    # cf-worker выше: правка dsh-edge/** (манифест плагинов plugin-forge,
+    # патч-серия, пин апстрима) обязана доезжать до деплоя сразу после мержа,
+    # а не по суточному крону. Форж остановился на built (design.md «Канал
+    # обновления и статусы»: deploying/ready — только у деплоя), так что без
+    # этого диспатча манифест-PR висел бы в built до крона — канал эпика
+    # «морда перезапускается с плагином» молча терял минуты/часы.
+    if dispatch_deploy_on_merge(files, "dsh-edge/", "deploy-dsh-edge.yml"):
+        lines.append("🚀 deploy-dsh-edge запущен (мерж правки dsh-edge/** — канал обновления морды, #77)")
     # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю про реальный пост-мерж прогон,
