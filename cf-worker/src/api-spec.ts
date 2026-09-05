@@ -149,7 +149,7 @@ const spec = {
 export interface ApiRoute {
   name: string;
   path: string;
-  methods: ("GET" | "POST" | "DELETE")[];
+  methods: ("GET" | "POST" | "PUT" | "DELETE")[];
   auth: boolean;
   /** path — префикс маршрута; остаток пути — параметр (например, id задачи). */
   rest?: boolean;
@@ -169,13 +169,13 @@ export const ROUTES: Record<string, string> = Object.fromEntries(
 export function matchRoute(method: string, pathname: string): { route: ApiRoute; rest: string } | null {
   for (const route of API_SPEC) {
     if (route.rest) continue;
-    if (route.methods.includes(method as "GET" | "POST" | "DELETE") && route.path === pathname) {
+    if (route.methods.includes(method as "GET" | "POST" | "PUT" | "DELETE") && route.path === pathname) {
       return { route, rest: "" };
     }
   }
   for (const route of API_SPEC) {
     if (!route.rest) continue;
-    if (route.methods.includes(method as "GET" | "POST" | "DELETE") && pathname.startsWith(route.path)) {
+    if (route.methods.includes(method as "GET" | "POST" | "PUT" | "DELETE") && pathname.startsWith(route.path)) {
       return { route, rest: decodeURIComponent(pathname.slice(route.path.length)) };
     }
   }

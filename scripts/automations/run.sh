@@ -171,7 +171,12 @@ case "$KIND" in
     TEXT="${TEXT//\{period_until\}/$(date -u -d "@$((UNTIL_MS / 1000))" '+%Y-%m-%d')}"
     echo "Передача в DSH headless (scripts/hands/dsh_task.sh), шаблон подставлен"
     set +e
-    TASK_TEXT="$TEXT" bash "$SCRIPT_DIR/../hands/dsh_task.sh"
+    # GH_TOKEN/GITHUB_TOKEN живут в env этого job'а ради kind=pool (gh issue
+    # create выше) — DSH headless их видеть не должен: у агента нет прав на
+    # пуш (тот же класс, что hands.yml закрывает persist-credentials:false +
+    # unset GH_RUN_TOKEN в dsh_task.sh до старта DSH; здесь другое имя
+    # переменной — GH_TOKEN, тот же принцип, находка AI-ревью PR #241).
+    TASK_TEXT="$TEXT" env -u GH_TOKEN -u GITHUB_TOKEN bash "$SCRIPT_DIR/../hands/dsh_task.sh"
     RESULT_RC=$?
     set -e
     ;;

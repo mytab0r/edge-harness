@@ -1399,6 +1399,12 @@ export class Harness extends DurableObject<Env> {
     if (cursor.rowsWritten === 0) {
       throw new ApiError(404, "automation_not_found", { automation_id: restId });
     }
+    // Симметрично PUT (automation_updated) — иначе журнал/дашборд (#111) молчит
+    // об удалении: конфигурация исчезает без следа, а webhook на неё начинает
+    // 404-ить без объяснения (находка AI-ревью PR #241). Под тем же task_id
+    // automation:<id>, что и остальные системные события автоматизации —
+    // гвардия петли journal-триггеров (префикс automation:) их уже исключает.
+    this.#emitSystemEvent(`automation:${restId}`, "automation_deleted", {});
     return this.#json({ ok: true });
   }
 

@@ -87,6 +87,18 @@ export function parseAutomationConfig(raw: unknown): ConfigParseResult {
     if (typeof kind !== "string" || !kind || kind.length > 128) {
       return { ok: false, error: "trigger.kind: непустая строка до 128 символов" };
     }
+    // Служебные kind'ы системных событий самой автоматизации всегда живут под
+    // task_id с префиксом AUTOMATIONS.runTaskPrefix — гвардия петли исключает
+    // их из кандидатов #fireJournalTriggers ДО сравнения kind, так что триггер
+    // с таким kind никогда не сработает. Отклоняем явно, а не молча сохраняем
+    // мёртвый конфиг (находка AI-ревью PR #241).
+    if ((AUTOMATIONS.reservedJournalKinds as readonly string[]).includes(kind)) {
+      return {
+        ok: false,
+        error: `trigger.kind: "${kind}" — служебный kind самой автоматизации, `
+          + "триггером быть не может (никогда не сработает)",
+      };
+    }
     if (Object.keys(triggerInput).length !== 2) {
       return { ok: false, error: "trigger: неизвестные поля для type=journal" };
     }

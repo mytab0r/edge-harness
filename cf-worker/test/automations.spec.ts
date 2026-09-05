@@ -98,6 +98,15 @@ describe("automations: валидация конфига", () => {
     expect(parseAutomationConfig({ ...digestConfig(), task: { kind: "hands", text: "" } }).ok).toBe(false);
     expect(parseAutomationConfig(null).ok).toBe(false);
   });
+
+  it("journal-триггер со служебным kind самой автоматизации отклоняется (никогда не сработал бы, находка ревью PR #241)", () => {
+    for (const kind of AUTOMATIONS.reservedJournalKinds) {
+      const parsed = parseAutomationConfig({ ...digestConfig(), trigger: { type: "journal", kind } });
+      expect(parsed.ok, `kind=${kind} должен быть отклонён`).toBe(false);
+    }
+    // Обычный kind события job'а — по-прежнему валиден.
+    expect(parseAutomationConfig({ ...digestConfig(), trigger: { type: "journal", kind: "job_end" } }).ok).toBe(true);
+  });
 });
 
 const NOW = 1_800_000_000_000;
@@ -174,6 +183,15 @@ describe("automations: CRUD", () => {
     });
     expect(missing.status).toBe(404);
     expect((await missing.json<{ error: { code: string } }>()).error.code).toBe("automation_not_found");
+  });
+
+  it("DELETE оставляет след automation_deleted в журнале — симметрично PUT (находка ревью PR #241)", async () => {
+    const id = uniqueId("del");
+    await putAutomation(id, digestConfig());
+    const deleted = await WORKER.fetch(`https://example.com/api/automations/${id}`, { method: "DELETE", headers: AUTH });
+    expect(deleted.status).toBe(200);
+    const events = await allEventsFor(`automation:${id}`);
+    expect(events.some((event) => event.kind === "automation_deleted")).toBe(true);
   });
 });
 
