@@ -57,8 +57,18 @@ def references_task(text: str, task_number: int) -> bool:
 
 def declared_tasks(text: str) -> list[int]:
     """Задачи, ОБЪЯВЛЕННЫЕ телом PR — соглашение репозитория: номер задачи на
-    строке, которая начинается с `#N` (обычно первая строка тела), а не любое
-    упоминание номера в прозе (#195, второй экземпляр класса #187).
+    ПЕРВОЙ непустой строке тела, а не любая строка, начинающаяся с `#N`
+    (#195, второй экземпляр класса #187; #251, третий: строка прозы,
+    начавшаяся с `#N` после переноса строки внутри тела, читалась как
+    декларация — живой инцидент, PR #247 «объявил» девять чужих задач из
+    строки «#153, #158, #179`. Из них 7 (...) уходят», оказавшейся не первой
+    строкой, а переносом абзаца).
+
+    Первая непустая строка либо ЦЕЛИКОМ является декларацией (начинается с
+    `#`), либо декларации нет вовсе — дальше по тексту не ищем: как только
+    разрешено «декларация — это ЛЮБАЯ строка с `#` в начале», в тело
+    неизбежно попадает перенесённая строка прозы, и семейство открывается
+    заново (третий раз подряд).
 
     `references_task`/`extract_task_refs` по всему тексту — это «упомянута»,
     не «объявлена»: у reap_stale/after_merge в scheduler.py широкая семантика
@@ -69,13 +79,14 @@ def declared_tasks(text: str) -> list[int]:
     """
     if not text:
         return []
-    refs = []
     for line in text.splitlines():
-        stripped = line.lstrip()
-        if not stripped.startswith("#"):
+        stripped = line.strip()
+        if not stripped:
             continue
-        refs.extend(extract_task_refs(stripped))
-    return refs
+        if not stripped.startswith("#"):
+            return []
+        return extract_task_refs(stripped)
+    return []
 
 
 def declares_task(text: str, task_number: int) -> bool:
