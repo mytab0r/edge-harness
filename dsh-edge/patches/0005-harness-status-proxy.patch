@@ -1,0 +1,111 @@
+diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
+index bf1b380..0939723 100644
+--- a/apps/dsh-edge/src/index.ts
++++ b/apps/dsh-edge/src/index.ts
+@@ -70,6 +70,23 @@ export default {
+ 
+       rejectCrossOriginAuthenticatedRequest(request, url)
+       rejectLegacyInstanceSelector(request, url)
++
++      // Status journal proxy (PATCHES.md, 0005-harness-status-proxy, issue #105):
++      // the Plugins section reads statuses from the edge-harness journal, which lives
++      // on another origin (the journal's session cookie is SameSite=Strict and the
++      // journal sends no CORS headers), so the browser cannot reach it directly. The
++      // browser goes same-origin with the owner session cookie; the proxy forwards the
++      // journal query ({HARNESS_URL}/api/events) with Bearer HANDS_TOKEN — the same
++      // token the journal accepts from hands. Request and response form is the journal
++      // contract (openspec/specs/journal-tasks-hands.md, cf-worker/src/harness.ts);
++      // the proxy stays transparent and does not reshape either side.
++      if (request.method === 'GET' && url.pathname === '/api/harness/events') {
++        // return await, не «голый» return промиса: отказ помощника обязан
++        // попасть в catch ниже и уйти клиенту как {ok:false} через
++        // errorResponse, а не как текст «Error: …» workerd.
++        return await proxyHarnessEvents(url, env)
++      }
++
+       const instanceStub = env.DSH_EDGE_INSTANCE.getByName(OWNER_INSTANCE)
+       if (isInstanceApiPath(url.pathname)) {
+         const response = await instanceStub.fetch(
+@@ -143,6 +160,67 @@ export default {
+   },
+ } satisfies ExportedHandler<Env>
+ 
++// The proxy validates the query shape itself but does not redefine the journal
++// contract: the journal defaults `after` to 0 and clamps `limit` to its replayMax
++// (cf-worker/src/harness.ts), so the proxy always forwards `after` (0 when the
++// caller omitted it) and forwards `limit` only when present. The limit ceiling
++// mirrors the journal's own replayMax (cf-worker/src/config.ts
++// LIMITS.replayMax = 500) — rejecting here what the journal would silently clamp
++// keeps the contract single-sourced.
++const HARNESS_PROXY_MAX_TASK_ID_CHARS = 256
++const HARNESS_PROXY_MAX_LIMIT = 500
++
++async function proxyHarnessEvents(url: URL, env: Env): Promise<Response> {
++  const taskId = url.searchParams.get('task_id')
++  if (taskId === null || taskId === '' || taskId.length > HARNESS_PROXY_MAX_TASK_ID_CHARS) {
++    throw new EdgeHttpError(400, 'task_id query parameter is required (up to 256 characters).')
++  }
++  const afterRaw = url.searchParams.get('after') ?? '0'
++  const after = Number(afterRaw)
++  if (!Number.isInteger(after) || after < 0) {
++    throw new EdgeHttpError(400, 'after must be a non-negative integer.')
++  }
++  const limitRaw = url.searchParams.get('limit')
++  if (limitRaw !== null) {
++    const limit = Number(limitRaw)
++    if (!Number.isInteger(limit) || limit < 1 || limit > HARNESS_PROXY_MAX_LIMIT) {
++      throw new EdgeHttpError(400, `limit must be an integer between 1 and ${HARNESS_PROXY_MAX_LIMIT}.`)
++    }
++  }
++
++  const harnessUrl = env.HARNESS_URL
++  const handsToken = env.HANDS_TOKEN
++  // "No capability" is not "no statuses": with the journal not configured the section
++  // must show a loud error, not silently render an empty status list (issue #105).
++  if (harnessUrl === undefined || harnessUrl === '' || handsToken === undefined || handsToken === '') {
++    throw new EdgeHttpError(503, 'Harness journal proxy is not configured (HARNESS_URL / HANDS_TOKEN).')
++  }
++
++  const journalUrl = new URL('/api/events', harnessUrl)
++  journalUrl.searchParams.set('task_id', taskId)
++  journalUrl.searchParams.set('after', String(after))
++  if (limitRaw !== null) journalUrl.searchParams.set('limit', limitRaw)
++
++  let journalResponse: Response
++  try {
++    journalResponse = await fetch(journalUrl, {
++      method: 'GET',
++      headers: { accept: 'application/json', authorization: `Bearer ${handsToken}` },
++      signal: AbortSignal.timeout(10_000),
++    })
++  } catch {
++    throw new EdgeHttpError(502, 'Harness journal is unreachable.')
++  }
++
++  const headers = new Headers(journalResponse.headers)
++  for (const [name, value] of Object.entries(corsHeaders())) headers.set(name, value)
++  return new Response(journalResponse.body, {
++    status: journalResponse.status,
++    statusText: journalResponse.statusText,
++    headers,
++  })
++}
++
+ function rejectLegacyInstanceSelector(request: Request, url: URL): void {
+   if (request.headers.has('x-dsh-edge-instance') || url.searchParams.has('instance')) {
+     throw new EdgeHttpError(400, 'This deployment has one owner workspace; instance selectors are not supported.')
+diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
+index 43f172f..576b164 100644
+--- a/apps/dsh-edge/src/instance.ts
++++ b/apps/dsh-edge/src/instance.ts
+@@ -156,6 +156,10 @@ export interface EdgeEnv {
+   DEEPSEEK_STREAM_IDLE_TIMEOUT_MS?: string
+   DSH_EDGE_DEFAULT_COMMAND_TIMEOUT_MS?: string
+   DSH_EDGE_MAX_COMMAND_TIMEOUT_MS?: string
++  // Status journal proxy (PATCHES.md, 0005-harness-status-proxy, issue #105):
++  // where the journal lives and the token it accepts from hands (Bearer).
++  HARNESS_URL?: string
++  HANDS_TOKEN?: string
+ }
+ 
+ class DshEdgeObjectBase extends DurableObject<EdgeEnv> {
