@@ -87,6 +87,17 @@ const SCHEMA = [
      last_run_id   INTEGER,
      run_confirmed INTEGER
    )`,
+  // Ретеншн (#306/#305, находка ревью): streak/last-исход обязаны пережить
+  // выгрузку DO из памяти (idle ~10 с) между тиками alarm (раз в ~15 мин) — на
+  // проде объект почти всегда пересоздаётся между тиками, поэтому счётчик В
+  // ПАМЯТИ обнулялся бы каждый раз и retentionBacklog() не срабатывал бы
+  // практически никогда — тот же принцип персиста, что у pulse выше (#269).
+  `CREATE TABLE IF NOT EXISTS retention_state (
+     id     INTEGER PRIMARY KEY CHECK (id = 1),
+     ts     INTEGER NOT NULL,
+     pruned TEXT NOT NULL,
+     streak INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS messages (
      id            INTEGER PRIMARY KEY AUTOINCREMENT,
      ts            INTEGER NOT NULL,
@@ -135,10 +146,11 @@ const RETENTION_TABLES = [
   },
 ] as const;
 
-/** Итог последнего прогона ретеншена (#306/#305) — в памяти объекта, не в SQL:
- *  это телеметрия про сам процесс чистки, а не данные, ценные после гибернации
- *  DO. Пересчитывается на первый попавшийся alarm-тик после холодного старта,
- *  ничего не теряя по существу. `pruned` — сколько строк снято на КАЖДОЙ
+/** Итог последнего прогона ретеншена (#306/#305) — персистентен в SQL
+ *  (таблица retention_state), не в памяти объекта (находка ревью PR #329):
+ *  DO выгружается из памяти между тиками alarm чаще, чем сами тики случаются,
+ *  поэтому счётчик серии обязан пережить пересоздание инстанса — тот же
+ *  принцип, что у pulse (#269). `pruned` — сколько строк снято на КАЖДОЙ
  *  таблице за последний тик; `backlog` — «не успеваем» (см. RETENTION.
  *  backlogStreakThreshold), не «сработал ли последний тик». */
 export interface RetentionOutcome {
@@ -829,7 +841,7 @@ export class Harness extends DurableObject<Env> {
       pulse_not_configured: pulseNotConfigured(lastPulse),
       pulse_stale: pulseStale(now, lastPulse),
       messages: msgCounts,
-      retention: this.#retentionLast,
+      retention: this.#getRetentionOutcome(),
     };
   }
 
@@ -1138,12 +1150,6 @@ export class Harness extends DurableObject<Env> {
     }
   }
 
-  /** Ретеншн (#306/#305): в памяти объекта, НЕ в SQL — это телеметрия про сам
-   *  процесс чистки (см. docstring RetentionOutcome), пересчитывается заново
-   *  после каждой гибернации без потери данных по существу. */
-  #retentionStreak = 0;
-  #retentionLast: RetentionOutcome | null = null;
-
   /**
    * Одна пачка ретеншена на каждую таблицу из RETENTION_TABLES за alarm-тик:
    * LIMIT ограничивает объём (RETENTION.batchSize), фильтр идёт по индексу
@@ -1151,10 +1157,15 @@ export class Harness extends DurableObject<Env> {
    * Каждая таблица в своём try/catch: авария на одной («тот стол уже упал на
    * квоте rows_written» и т.п.) не должна скрыть чистку другой. Полная пачка
    * (rowsWritten === batchSize) или ошибка — сигнал «есть ещё что чистить или
-   * чистка сама не работает»; фиксируется как один тик в #retentionStreak,
-   * fail loud — не «тихо доели меньше, чем было нужно».
+   * чистка сама не работает»; фиксируется как один тик в streak, который
+   * ЖИВЁТ В SQL (retention_state), не в памяти объекта (находка ревью PR
+   * #329): DO выгружается из памяти через ~10 с простоя, а alarm тикает раз в
+   * ~15 мин — счётчик в памяти обнулялся бы почти на каждом тике, и
+   * retentionBacklog() не срабатывал бы практически никогда (fail loud
+   * канал спеки 14.6 молча не работал бы). Тот же приём, что у pulse (#269).
    */
   #pruneRetention(now: number): void {
+    const streakBefore = this.#getRetentionStreak();
     let full = false;
     const pruned: Record<string, number> = {};
     for (const table of RETENTION_TABLES) {
@@ -1170,8 +1181,39 @@ export class Harness extends DurableObject<Env> {
         );
       }
     }
-    this.#retentionStreak = full ? this.#retentionStreak + 1 : 0;
-    this.#retentionLast = { ts: now, pruned, backlog: retentionBacklog(this.#retentionStreak) };
+    const streak = full ? streakBefore + 1 : 0;
+    this.#sql.exec(
+      `INSERT INTO retention_state (id, ts, pruned, streak) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, pruned = excluded.pruned, streak = excluded.streak`,
+      now,
+      JSON.stringify(pruned),
+      streak,
+    );
+  }
+
+  /** Streak подряд идущих полных/упавших тиков ретеншена — единственное место
+   *  чтения, делят #pruneRetention (инкремент) и #getRetentionOutcome
+   *  (backlog для #status()). 0, если тика ещё не было (холодный старт до
+   *  первого alarm) — не отличается от «серия только что сброшена», это и
+   *  есть тот же смысл «пока не бэклог». */
+  #getRetentionStreak(): number {
+    const row = this.#rows(this.#sql.exec("SELECT streak FROM retention_state WHERE id = 1"))[0];
+    return row ? Number(row.streak) : 0;
+  }
+
+  /** Проекция retention_state для #status() — backlog пересчитывается чистой
+   *  retentionBacklog() из сохранённого streak, не хранится сам (тот же
+   *  приём, что pulseHealthy у pulse: производное не дублируется в хранилище). */
+  #getRetentionOutcome(): RetentionOutcome | null {
+    const row = this.#rows(
+      this.#sql.exec("SELECT ts, pruned, streak FROM retention_state WHERE id = 1"),
+    )[0];
+    if (!row) return null;
+    return {
+      ts: Number(row.ts),
+      pruned: JSON.parse(String(row.pruned)) as Record<string, number>,
+      backlog: retentionBacklog(Number(row.streak)),
+    };
   }
 
   /** Текущая строка пульса (issue #269), полное внутреннее представление —

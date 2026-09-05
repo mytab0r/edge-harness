@@ -112,8 +112,9 @@ export const GITHUB = {
 
 /** Ретеншн DO SQLite (#306/#305): без него `events`/`tasks` растут вечно, и
  *  любой скан со временем дорожает — тот же класс, что подпалил суточную квоту
- *  rows_read (#320, docs/research/20-cloudflare-free.md, «Инцидент»). Политика
- *  разная для каждой таблицы — см. proposal.md change'а do-sqlite-retention. */
+ *  rows_read (#320, docs/research/20-cloudflare-free.md, раздел «Инцидент:
+ *  rows_read исчерпан на живом аккаунте (#320)»). Политика разная для каждой
+ *  таблицы — см. proposal.md change'а do-sqlite-retention. */
 export const RETENTION = {
   /** Сколько строк снимает один прогон ОДНОЙ таблицы за alarm-тик — пачка по
    *  индексу, не полный скан (см. RETENTION_TABLES в harness.ts). Число не
