@@ -9,6 +9,10 @@
 #     который перезатирает dsh_install/dsh_patch_profile, при этом не обманешь —
 #     его сетевые зависимости (npm pack из реестра, openssl-сверка целостности)
 #     застаблены ПУТЁМ: npm, openssl, git — исполняемые заглушки в PATH;
+#   - изоляция адаптера (#140) — sudo/docker исполняемыми заглушками в PATH:
+#     sudo реально исполняет только `bash <launcher>` агента (там exported-
+#     функции dsh/gh живут), всё остальное — журнал вызовов; ассерты доказывают,
+#     что прогон dsh идёт через dsh_agent_run, а не напрямую от транспорта;
 #   - dsh_install честно отрабатывает на заглушках (пустые tgz + константы
 #     integrity из dsh-ci.sh), сетевых вызовов нет.
 # Заглушки пишут журнал вызовов; после прогона — ассерты: код 0, журнал получил
@@ -198,7 +202,10 @@ GITSTUB
 # (-g и пр.) глотаются: install -g у dsh_install не должен падать на basename.
 cat >"$TMP/bin/npm" <<'NPMSTUB'
 #!/usr/bin/env bash
-[ "${1:-}" = "pack" ] && shift
+# Файлы пишет ТОЛЬКО pack: install (dsh_install и pnpm в prepare #140) —
+# no-op, иначе заглушка сорит tarball'ами в cwd вызывающего клиента.
+[ "${1:-}" = "pack" ] || exit 0
+shift
 dest="."
 specs=()
 prev=""
@@ -244,6 +251,14 @@ chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/openssl"
 # по коду возврата.
 cat >"$TMP/bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
+# gh уровня ПРОЦЕССА для лаунчера агента (#140): exec не видит exported-функций,
+# поэтому `gh auth status` из prepare должен отвечать ЗДЕСЬ и ДО проверки
+# GH_TOKEN — авторизация агента живёт в зеркале hosts.yml, не в env (это ровно
+# та модель, которую проверяет prepare в режиме gh).
+if [[ " $* " == *" auth status "* ]]; then
+  printf '%s\n' '{"github.com":{"user":"mytab0r"}}'
+  exit 0
+fi
 # Прод-форма gh (#121-ревью): без токена реальный gh неавторизован — заглушка
 # обязана падать так же (rc 4 + ::error::), иначе безтокенная ветка канала
 # (например «unset GH_RUN_TOKEN до вызова аренды») зелёная в тесте и красная
@@ -318,6 +333,77 @@ esac
 GHSTUB
 chmod +x "$TMP/bin/gh"
 
+# sudo уровня процесса (#140): изоляция адаптера вызывает useradd/chown/install
+# и запускает лаунчер агент-юзера. Реального sudo в smoke нет и быть не должно:
+# юзеры не создаются, /etc не пишется, chown не выполняется. Реально исполняется
+# только `bash <launcher>` (домен агента): exported-функции dsh/gh/timeout
+# наследуются этим bash, поэтому проводка «dsh стартует через dsh_agent_run»
+# доказывается журналом (AGENT-EXEC), а не правдоподобием заглушки.
+cat >"$TMP/bin/sudo" <<'SUDOSTUB'
+#!/usr/bin/env bash
+rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|-H) shift ;;
+    -u) shift 2 ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+if [ "${rest[0]:-}" = "bash" ]; then
+  # rest = bash <launcher> <PATH> <команда домена агента...>. install в smoke
+  # не исполняется: реальный дом агента не существует (юзер не заводится),
+  # важен факт проводки — он в журнале (AGENT-INSTALL).
+  if [ "${rest[3]:-}" = "install" ]; then
+    printf 'AGENT-INSTALL %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+    exit 0
+  fi
+  printf 'AGENT-EXEC %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+  exec "${rest[@]}"
+fi
+printf 'SUDO %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+exit 0
+SUDOSTUB
+
+# docker: агент-юзер ОБЯЗАН получить отказ по правам (эскейп #140 закрыт).
+# Prepare принимает отказ только с "permission denied", любой другой исход — красный.
+cat >"$TMP/bin/docker" <<'DOCKERSTUB'
+#!/usr/bin/env bash
+echo "Got permission denied while trying to connect to the Docker daemon socket at /var/run/docker.sock"
+exit 1
+DOCKERSTUB
+
+# dsh-БИНАРНИК для exec-пути лаунчера агента (#140): exec не видит exported-
+# функций, и без этой заглушки лаунчер нашёл бы РЕАЛЬНЫЙ dsh из PATH инструмента
+# (hostedtoolcache) — живой прогон с фейковым ключом вместо smoke. Логика
+# повторяет функцию dsh выше; расхождение двух заглушек ловится ассертами
+# сценариев (спул, answer, dump-config).
+cat >"$TMP/bin/dsh" <<'DSHSTUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version)
+    echo "dsh 0.0.0-smoke"
+    exit 0 ;;
+  plugin)
+    exit 0 ;;
+  --profile)
+    if [ "${3:-}" = "--dump-config" ]; then
+      printf -- '- id: hands-streamer\n'
+      exit 0
+    fi
+    [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; exit 1; }
+    printf '%s\n' \
+      '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
+      '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
+      '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+    echo "smoke: работа сделана"
+    exit 0 ;;
+  *)
+    echo "::error::SMOKE: dsh-заглушка (бинарник) не знает вызов: $*" >&2
+    exit 99 ;;
+esac
+DSHSTUB
+chmod +x "$TMP/bin/sudo" "$TMP/bin/docker" "$TMP/bin/dsh"
+
 # ── Окружение клиентов ────────────────────────────────────────────────────────────
 export DSH_EDGE_URL="https://morde.test"
 export DSH_EDGE_ACCESS_KEY="smoke-access-key-at-least-32-bytes-long!!"
@@ -333,6 +419,13 @@ export DEEPSEEK_MODEL="glm-5"
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
+# Изоляция #140: подготовка требует gh-конфиг транспорта (режим gh: worker/hands)
+# и каталог воркспейса. HOME уводится в фикстуру, чтобы не трогать реальный.
+export HOME="$TMP/home"
+mkdir -p "$HOME/.config/gh" "$TMP/workspace"
+printf 'github.com:\n    users:\n        mytab0r:\n            oauth_token: smoke-fake-pat\n' >"$HOME/.config/gh/hosts.yml"
+printf '[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n' >"$HOME/.gitconfig"
+export GITHUB_WORKSPACE="$TMP/workspace"
 export PATH="$TMP/bin:$PATH"
 export -f curl gh dsh pnpm timeout log_call
 export CALLLOG
@@ -349,6 +442,20 @@ assert_log() { # SUBSTR MESSAGE
 assert_not_log() { # SUBSTR MESSAGE — отрицательный ассерт честен на чистом журнале
   if grep -qF -- "$1" "$CALLLOG"; then
     echo "::error::SMOKE: нежданный вызов «$1» — $2" >&2
+    echo "--- журнал вызовов ---" >&2
+    cat "$CALLLOG" >&2
+    exit 1
+  fi
+}
+
+# Гвардия класса #140: сам ПРОГОН dsh обязан идти через изоляцию (dsh_agent_run
+# → sudo -u агент bash лаунчер), а не напрямую из транспорта. Ищем AGENT-EXEC-
+# строку именно прогона: `dsh --profile headless <текст>` — не plugin add и
+# не --dump-config.
+assert_isolated_launch() { # MESSAGE
+  if ! grep '^AGENT-EXEC' "$CALLLOG" | grep -F ' dsh --profile headless ' \
+      | grep -vF 'plugin' | grep -vF 'dump-config' | grep -q .; then
+    echo "::error::SMOKE: прогон dsh прошёл мимо изоляции — $1" >&2
     echo "--- журнал вызовов ---" >&2
     cat "$CALLLOG" >&2
     exit 1
@@ -394,6 +501,9 @@ assert_log "MORDE-RPC session.create" "hands: сессия морды не со�
 assert_log "MORDE-RPC session.rename" "hands: сессия морды не названа"
 assert_log "MORDE-INGEST" "hands: транскрипт не уехал в морду"
 assert_log "JOURNAL-POST /api/events" "hands: журнал не получил жизненный цикл job"
+# Изоляция #140: профильный патч ставится агентом, прогон идёт под агент-юзером.
+assert_log "AGENT-INSTALL" "hands: патч профиля не поставлен в дом агента"
+assert_isolated_launch "hands: dsh запущен под транспортом"
 # Аренда взята до работы (#121): замок создан, назначение и след — после него.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "hands: аренда issue-123 не взята"
 assert_log "GH-API-ASSIGN issue-123" "hands: задача не назначена при claim"
@@ -423,6 +533,9 @@ assert_log "MORDE-INGEST" "worker: транскрипт не уехал в мо�
 assert_log "GH-COMMENT" "worker: нет отчёта в задачу"
 # Захват через аренду (#121): замок создан ДО сессии и работы.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "worker: аренда задачи 123 не взята"
+# Изоляция #140: патч в дом агента ставит агент, прогон — под агент-юзером.
+assert_log "AGENT-INSTALL" "worker: патч профиля не поставлен в дом агента"
+assert_isolated_launch "worker: dsh запущен под транспортом"
 echo "SMOKE: worker — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
@@ -477,8 +590,9 @@ GH_ISSUE_JSON='{"number":201,"title":"Свободна для воркера","b
   run_client "worker-auto" "$REPO/scripts/worker/task.sh"
 assert_log "GH-API-LOCK-CREATE refs/locks/task-201" "worker-auto: свободная 201 не взята в аренду"
 assert_not_log "refs/locks/task-200" "worker-auto: задача под живым замком попала в работу"
-assert_log "MORDE-RPC session.create" "worker-auto: сессия морды не создана"
+assert_log "MORDE-RPC session.create" "worker-auto: сессия в морде не создана"
 assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
+assert_isolated_launch "worker-auto: dsh запущен под транспортом"
 echo "SMOKE: worker-auto — ок"
 
 # ── Клиент AI-ревью (второй гейт #18) ────────────────────────────────────────
@@ -507,6 +621,9 @@ grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt не записан — verdict не сможет отличить ошибку провайдера от плохого формата ответа" >&2; exit 1; }
 grep -qx "0" "$AI_SMOKE/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt ожидал '0' на успешном прогоне, получено: $(cat "$AI_SMOKE/dsh_rc.txt")" >&2; exit 1; }
+# Изоляция #140 в режиме nogh: зеркало gh-конфига снесено, прогон — под агент-юзером.
+assert_log "SUDO rm -rf" "ai-review: nogh-режим не снёс протухшее зеркало gh-конфига"
+assert_isolated_launch "ai-review: dsh запущен под транспортом"
 echo "SMOKE: ai-review — ок"
 
 echo "SMOKE: все клиенты целы — гвардия класса зелёная"
