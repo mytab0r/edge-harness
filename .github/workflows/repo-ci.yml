@@ -282,6 +282,19 @@ jobs:
             node dsh-edge/check-plugin-compat.mjs "$dir"
           done
 
+      # Реестр провайдеров морды (#114): плагин инсталлируется в настоящий
+      # cordis с LlmRuntime + SettingsProvider (фикстура — tarball'ы
+      # @deepseek-ai с пином целостности): namespace, directory, добавление,
+      # рестарт DO, негатив при записи, MISSING_CREDENTIAL без сети.
+      - name: Юнит-тесты плагина provider-registry
+        run: node --test plugins-src/provider-registry/test/registry.test.mjs
+
+      # Гвардия литерала llm-pi-ai (#114) доказана мутацией: зелёная на живом
+      # литерале, красная с ожидаемым сообщением на переименованном (это и
+      # есть симуляция апстримного релиза, убившего кнопку создания).
+      - name: Мутационный тест гвардии литерала namespace
+        run: node --test dsh-edge/verify-provider-namespace.test.mjs
+
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.

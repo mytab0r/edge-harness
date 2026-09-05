@@ -44,6 +44,17 @@
       },
       "server": true,
       "client": true
+    },
+    {
+      "id": "provider-registry",
+      "package": "@edge-harness/dsh-plugin-provider-registry",
+      "source": {
+        "release": "plugins-registry-v0.1.1",
+        "asset": "provider-registry-0.1.1.tgz",
+        "sha256": "2ad628c62b61168783d288c4d7cc74b0aefb4a1601344f51d6263fd73059d5a9"
+      },
+      "server": true,
+      "client": false
     }
   ]
 }

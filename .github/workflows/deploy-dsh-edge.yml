@@ -213,6 +213,16 @@ jobs:
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
         run: node "$GITHUB_WORKSPACE/dsh-edge/proxy-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
+      # Реестр провайдеров (#114) обязан работать на СОБРАННОМ артефакте до
+      # деплоя: unstable_dev поднимает direct-воркер с настоящим DO SQLite и
+      # прогоняет путь владельца Settings → Models теми же RPC, что шлёт UI
+      # (namespace llm-pi-ai, directory, негатив при записи, добавление,
+      # пикер, рестарт DO, удаление). Красный шаг — деплой не начинается.
+      - name: Интеграция реестра провайдеров на собранном артефакте (#114)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/registry-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge" "$GITHUB_WORKSPACE/plugins-src/provider-registry/directory.json"
+
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
         run: |
@@ -409,6 +419,18 @@ jobs:
           fi
           # пропатченный бандл обязан остаться валидным JS
           node --check worker.js
+
+      # Гвардия завязки реестра провайдеров на приватный литерал апстрима
+      # (#114): кнопка «Add custom provider» штатного UI пишет в namespace,
+      # чьё имя зашито в клиентском бандле литералом NS$1 = "llm-pi-ai".
+      # Апстрим может переименовать его без semver-сигнала — тогда кнопка
+      # тихо умрёт при зелёной сборке. Гвардия стоит на общей части обоих
+      # путей сборки (source-build и префаб) и роняет деплой громко.
+      # Мутационное доказательство гвардии — repo-ci
+      # (dsh-edge/verify-provider-namespace.test.mjs).
+      - name: Гвардия литерала namespace реестра провайдеров (#114)
+        working-directory: ${{ github.workspace }}/deploy
+        run: node "$GITHUB_WORKSPACE/dsh-edge/verify-provider-namespace.mjs" dist
 
       # ── Общая часть: конфиг, секреты провайдера, деплой, канарейка ─────────────
 
@@ -646,6 +668,47 @@ jobs:
             || { echo "::error::Ingest канарейки #119 не принял батч (appended=$appended)"; exit 1; }
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
           echo "✅ ingest-шов #119 жив: сессия $sid создана, наполнена, заархивирована"
+
+      # Канарейка реестра провайдеров (#114), только чтение: деплой обязан не
+      # просто поднять морду, а смонтировать namespace llm-pi-ai и directory
+      # готовых маршрутов — без них кнопки Settings → Models мертвы, и это
+      # видно только живым RPC. Мутаций в проде канарейка не делает
+      # (добавление/удаление доказано интеграцией на собранном артефакте).
+      # Состав directory-маршрутов ниже генерируется из
+      # plugins-src/provider-registry/directory.json — единственного места
+      # правды о каталоге (плюс штатный deepseek-official); списки руками
+      # не ведутся.
+      - name: Канарейка реестра провайдеров (#114)
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/dsh-edge-registry-canary.cookies"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин канарейки #114 не удался (HTTP $code)"; exit 1; }
+          rpc() {
+            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+              -X POST "$base/api/$1" -d "$2"
+          }
+          rpc settings.describe '{"type":"client-request","rpcId":"canary114","method":"settings.describe","payload":{}}' \
+            > "$RUNNER_TEMP/registry-describe.json"
+          jq -e '.result.value.namespaces[] | select(.ns == "llm-pi-ai")' "$RUNNER_TEMP/registry-describe.json" >/dev/null \
+            || { echo "::error::Namespace llm-pi-ai не смонтирован на проде — кнопки Settings → Models мертвы (#114)"; exit 1; }
+          rpc llm.providers '{"type":"client-request","rpcId":"canary114","method":"llm.providers","payload":{}}' \
+            > "$RUNNER_TEMP/registry-providers.json"
+          routes="deepseek-official $(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).map((x) => x.route).join(" "))' plugins-src/provider-registry/directory.json)"
+          for route in $routes; do
+            jq -e --arg route "$route" '.result.value.providers[] | select(.provider == $route)' \
+              "$RUNNER_TEMP/registry-providers.json" >/dev/null \
+              || { echo "::error::Маршрута $route нет в llm.providers на проде (#114)"; exit 1; }
+          done
+          official_active=$(jq -r '.result.value.providers[] | select(.provider == "deepseek-official") | .active' \
+            "$RUNNER_TEMP/registry-providers.json")
+          [ "$official_active" = "true" ] || { echo "::error::Штатный провайдер deepseek-official не активен на проде — селектор моделей сломан"; exit 1; }
+          echo "✅ реестр #114 жив на проде: namespace llm-pi-ai смонтирован, directory содержит штатного и 4 готовых маршрута"
 
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
