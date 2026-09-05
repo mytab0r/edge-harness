@@ -445,6 +445,49 @@ polling'ом по cron — ему события не нужны), но собы
 
 ---
 
+## Возможности платформы, которые мы не используем (аудит 2026-09-05)
+
+Справочники до сих пор описывали то, что мы уже построили, а не то, что реально
+даёт платформа — из-за этого месяц писали свою очередь слияний в
+`scripts/orchestra/scheduler.py`, не спросив факт про нативную GitHub Merge Queue.
+Ниже — по каждой возможности: используем / не используем / недоступно на нашем
+плане, с проверкой на этом конкретном репозитории (`gh api`), не по памяти.
+Собственник репозитория — пользователь `mytab0r` (не организация), план — Free,
+видимость — public.
+
+| Возможность | Статус | Проверено | Что даёт |
+|---|---|---|---|
+| **Merge Queue** (ruleset `merge_queue`) | **недоступно** | Живой `POST .../rulesets` с правилом `merge_queue` → `422` с пустой деталью; контроль `{"type":"deletion"}` → `201`, контроль богус-типа → другая ошибка схемы («no possible input»). Разница сообщений доказывает: тип распознан, отклонён бизнес-правилом плана/владельца, не формой запроса. Дословно из доки: «available in any public repository owned by an organization». Репозиторий во владении пользователя, не организации. Полный разбор — [ADR 0012](../decisions/0012-native-merge-queue-not-available.md) (задача #339 — ссылка красная до слияния этой ветки, см. заметку про INFRA-CF.md выше по тому же принципу) | Серийное слияние с ре-тестом каждого PR против актуального main, без гонок update-branch/ai-review (#208, #252, #189) |
+| **Auto-merge** (`allow_auto_merge`) | доступно, **включено на репо, но не используется** | `gh api repos/mytab0r/edge-harness --jq .allow_auto_merge` → `true` (включено владельцем 2026-09-05) | Автослияние PR, когда required status checks и required reviews зелёные. У нас гейт **на метках** (`review:ok`/`ai:ok`), которые не являются required status checks (см. ниже) — включённый auto-merge слил бы PR сразу после `test`+`contract`, до вердикта ai-review. Не берём **без предварительного перевода меток в статусы** (см. раздел «Что взять вместо своего») |
+| **Update branch** (`allow_update_branch`) | доступно, **включено на репо** | То же поле репо → `true` (включено вместе с auto-merge, 2026-09-05) | Кнопка «Update branch» в UI PR для человека. Сам REST-эндпоинт `PUT .../pulls/{n}/update-branch` **уже используется headless** `scripts/orchestra/scheduler.py::update_branch` (с бюджетом «один успешный подтяг за прогон», #252/#288) — переключатель управляет только видимостью кнопки людям, на нашу автоматизацию не влияет никак |
+| **Required status checks** vs **метки** | required checks — используем (`test`, `contract`); `review:ok`/`ai:ok` — метки, не checks | `gh api repos/.../branches/main/protection` → `required_status_checks.contexts = ["test","contract"]`, `required_pull_request_reviews: null` | Метки нельзя включить в `required_status_checks.contexts` напрямую — гейт по ним живёт в логике `scheduler.py::merge_label_gate`, не в защите ветки GitHub |
+| **CODEOWNERS** / required reviews | **не используем** | Файла `.github/CODEOWNERS`/`CODEOWNERS` в репозитории нет; `required_pull_request_reviews: null` в защите ветки | Автоназначение ревьюеров по пути файла + возможность требовать N approvals — бесплатно на public repo, просто не заведено |
+| **Repository rulesets** vs классическая branch protection | используем **классическую** branch protection; rulesets — пусто | `gh api repos/.../rulesets` → `[]`. API работает (см. probe ADR 0012: тестовый ruleset создан и удалён), просто ни одного не оставлено активным | Rulesets умеют слоиться (org+repo) и типы вроде `merge_queue` — но `merge_queue` всё равно недоступен по владению, а остального classic protection хватает |
+| `workflow_run` / `repository_dispatch` / `schedule` | используем все три | Инвентарь workflow выше, `docs/research/21` разделы про ловушки (default-branch, события от `GITHUB_TOKEN`) | Обходят антирекурсию GITHUB_TOKEN (`workflow_run`), внешний триггер конкретной задачи (`repository_dispatch`), периодику (`schedule`, но замерена доставка ~7% на `*/15`, см. выше) |
+| `merge_group` | **недоступно** (следствие недоступности Merge Queue) | Событие стреляет только при слитой Merge Queue — она недоступна по владению, событие никогда не наступит | Прогон CI над временным объединением веток очереди до реального мержа |
+| `concurrency` (группы) | используем | `worker.yml` (repo-wide), `hands.yml`, `orchestra.yml` (per-job, класс #189), `ai-review.yml` (по `workflow_run.id`), `dispatch-latency-probe.yml`, `deploy-dsh-edge.yml` | Сериализация: один воркер-прогон разом, не более одного ai-review на PR одновременно |
+| **Reusable workflows** (`workflow_call`) | **не используем** | `grep -r workflow_call .github/workflows` — пусто | Общий job-шаблон вместо копипасты между workflow (например, checkout+setup-node дублируется в 9 файлах) |
+| **Composite actions** (`.github/actions/*`) | **не используем** | Каталог `.github/actions/` не существует | То же дублирование шагов checkout/setup, вынесенное в один переиспользуемый шаг |
+| `if: always()` | используем, ровно 1 раз | `dispatch-latency-probe.yml` — шаг «Цепочка» самоподдержки каденции | Гарантированный шаг вне зависимости от исхода предыдущих — здесь: продолжить цепочку тиков даже если сам тик отказал |
+| **Dependabot** (version updates) | используем | `.github/dependabot.yml`: `npm` (`/cf-worker`, weekly) + `github-actions` (`/`, weekly) | Автоматические PR на обновление зависимостей и версий actions |
+| Dependabot **security updates** | **выключено явно** | `gh api repos/... --jq .security_and_analysis.dependabot_security_updates.status` → `disabled` | Автоматические PR на уязвимости отдельно от версийных апдейтов |
+| Dependabot **vulnerability alerts** | включено | `gh api .../vulnerability-alerts` → `204` (включено) | Алерты по известным CVE в зависимостях |
+| **Secret scanning** / **push protection** | оба включены | `security_and_analysis.secret_scanning.status`/`secret_scanning_push_protection.status` → `enabled` | Обнаружение утечки секретов в истории и блокировка пуша с секретом до попадания в историю |
+| Secret scanning **validity checks** / **non-provider patterns** | выключены | Те же поля → `disabled` | Проверка, что найденный секрет ещё живой (не отозван) / поиск по несигнатурным паттернам |
+| `actions/cache` (явно) | **не используем**; встроенный `cache: npm` — в 2 из 9 workflow с `setup-node` | `grep -r "actions/cache"` — пусто; `cache: npm` есть только в `deploy-worker.yml` и `worker-ci.yml`, отсутствует в `worker.yml`/`hands.yml`/`deploy-dsh-edge.yml`/`ai-review.yml`/`repo-ci.yml` (несогласованно, не проверено — сознательно это или недосмотр) | Кэш `node_modules`/`~/.npm` между прогонами — ускоряет установку; аккаунт уже держит 18 активных кэшей, 601 MB (`gh api .../actions/cache/usage`) |
+| **Artifacts** (`upload-artifact`) | **не используем** | `grep -r "upload-artifact"` — пусто; `gh api .../actions/artifacts --jq .total_count` → `0` | Кампания задержки (`dispatch-latency-probe.yml`) пишет CSV прямо в git-ветку `data/dispatch-latency-tail`, не в artifact — сознательный выбор: артефакты стираются по retention, ветка живёт бессрочно |
+| **Environments** + deployment protection rules | **не используем** | `gh api repos/.../environments` → `{"total_count":0}` | Ручной approve перед деплоем, задержка, ограничение по веткам — у нас гейт целиком **до** мержа (required checks + метки), после мержа деплой идёт без паузы |
+| GraphQL `closingIssuesReferences` | **не используем** | Живой GraphQL-запрос по PR #326 → пустой список (тело PR ссылается на `#323` прозой, не `Closes #323`) | Автозакрытие issue при мерже PR — у нас закрытие ручное и сознательное: исполнитель закрывает issue после своей пост-мерж проверки (см. «Границы» ниже), а не GitHub по факту слияния |
+| GraphQL **sub-issues** | **не используем** | `issue(number:323){ subIssues { totalCount } }` → `0` | Иерархия issue → sub-issue вместо связи прозой/номером в теле |
+| **Projects v2** | используем | Борда `edge-harness` (`projectsV2` → номер 2), задокументирована в `docs/agents/PROTOCOL.md` (#182) | Канбан-доска поверх issues/PR, автодобавление по фильтру |
+
+### Что взять вместо своего — см. отдельный документ
+
+Разбор «где своё написано, а платформа даёт готовое» (auto-merge + метки-как-статусы,
+Cron Triggers CF vs alarm-пульс, git-ref-замок аренды задачи) — в
+[`docs/research/23-platform-native-vs-custom.md`](23-platform-native-vs-custom.md),
+чтобы не смешивать факт-аудит (этот раздел) с рекомендациями по замене.
+
 ## Источники
 
 Все ссылки проверены 2026-08-28; цитаты в тексте сверены с живыми страницами.
@@ -459,3 +502,10 @@ polling'ом по cron — ему события не нужны), но собы
 - [Security hardening / secure use reference](https://docs.github.com/en/actions/reference/security/secure-use) — маскирование, structured data, `pull_request_target`, self-hosted на public repo
 - [GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) — сетевые требования, endpoint'ы, `GET /meta`
 - Сторонние (не GitHub, для порядка величины): замеры cold start runs-on.com; community discussions #186198, #147604 — жалобы на многочасовые очереди
+
+Аудит 2026-09-05 (раздел «Возможности платформы, которые мы не используем»):
+
+- [Managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue) — «available in any public repository owned by an organization»
+- [Create a repository ruleset (REST)](https://docs.github.com/rest/repos/rules#create-a-repository-ruleset) — форма ошибки при неподдержанном правиле
+- [Create a commit status (REST)](https://docs.github.com/en/rest/commits/statuses) — «Users with push access … can create commit statuses», скоуп `repo:status`, лимит 1000 статусов на sha+context
+- Живые `gh api` этого репозитория: `repos/mytab0r/edge-harness` (allow_auto_merge, allow_update_branch, security_and_analysis), `branches/main/protection`, `rulesets`, `actions/cache/usage`, `actions/artifacts`, `vulnerability-alerts`, GraphQL `closingIssuesReferences`/`subIssues`/`projectsV2` — 2026-09-05
