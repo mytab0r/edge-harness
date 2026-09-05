@@ -26,18 +26,22 @@ review:changes-requested или ai:changes-requested. Красные обяза�
 (rework_cycle_count=5=REWORK_BUDGET) -> вместо возврата в пул задача уходит
 в needs-spec (см. следующее требование), PR закрывается.
 
-Известный разрыв (не чинится этим change, proposal.md "Out"): переход в
-needs-spec врезан в scheduler.py::unhealthy_pulls, а
+Известный разрыв на момент написания этой спеки (закрывается ЭТИМ же
+change, tasks.md п.2, правка первая - не выносится в отдельную задачу вне
+#256): переход в needs-spec врезан в scheduler.py::unhealthy_pulls, а
 scheduler.py::pr_is_unhealthy сегодня признаёт нездоровым PR только по
 метке ai:changes-requested (и красным обязательным чекам) - метку
 review:changes-requested (гейт 1) он не проверяет вовсе. Поэтому
-rework_cycle_count УЧИТЫВАЕТ оба лейбла (для метрики и для будущего фикса),
-но ПЕРЕХОД в needs-spec сегодня фактически может сработать только когда
-среди пяти кругов есть достаточно ai:changes-requested, чтобы
-pr_is_unhealthy(pull) вернул причину не-None и PR попал в unhealthy_pulls
-- PR, накопивший REWORK_BUDGET кругов исключительно за счёт
-review:changes-requested, needs-spec сегодня не получает. Фикс -
-отдельная задача из беклога этого ревью, не блокирует данный change.
+rework_cycle_count УЧИТЫВАЕТ оба лейбла, но без правки pr_is_unhealthy
+ПЕРЕХОД в needs-spec фактически срабатывал бы только когда среди пяти
+кругов есть достаточно ai:changes-requested, чтобы pr_is_unhealthy(pull)
+вернул причину не-None и PR попал в unhealthy_pulls - PR, накопивший
+REWORK_BUDGET кругов исключительно за счёт review:changes-requested,
+needs-spec не получил бы. Это настоящий дефект существующего кода (не
+специфичный для бюджета реворка - он же не даёт unhealthy_pulls вернуть в
+пул задачу, застрявшую на вердикте первого гейта, независимо от бюджета),
+поэтому tasks.md п.2 требует чинить его, а не документировать как
+допустимое ограничение.
 
 ## ADDED: Состояние needs-spec
 
@@ -46,7 +50,12 @@ rework_cycle_count её текущего PR достигает REWORK_BUDGET. В
 needs-spec: assignee снят, PR, приведший к needs-spec, закрыт (не слит) с
 комментарием, объясняющим причину и перечисляющим все круги реворка,
 issue получает комментарий с тем же перечнем и явным вопросом аналитику
-(design.md п.4).
+(design.md п.4). Тем же переходом оркестратор вызывает
+`pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)` - тот же приём
+идемпотентного оповещения владельца, что уже использует `stale_ready_pulls`
+(#269) для другого инварианта; без этого шага исчерпание бюджета видно
+только тому, кто отдельно листает issues с меткой needs-spec (design.md
+п.4, действие 5).
 
 Требование: задача с меткой needs-spec ИСКЛЮЧЕНА из автоматического выбора
 воркером (scripts/lib/free_task.py::free_candidates), независимо от
