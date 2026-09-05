@@ -46,7 +46,8 @@ ANSWER_FILE="$WORK/answer.txt"
 ERR_FILE="$WORK/stderr.txt"
 EVENTS_FILE="$WORK/events.jsonl"
 START_MARK="$WORK/.start-mark"
-SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина dsh-hands-streamer
+AGENT_DIR="$WORK/agent"                       # каталог агента: спул пишет он сам (#140)
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson" # NDJSON-спул плагина dsh-hands-streamer
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
 
@@ -222,6 +223,11 @@ PKGS="$WORK/pkgs"
 dsh_install "$PKGS"
 dsh --version || true
 
+# ── 3-iso. Изоляция адаптера модели (#140): dsh — под агент-юзером без docker ─────
+# model-shell с доступом к docker читает ключ из environ dsh через эскейп-контейнер
+# (docs/research/40-model-shell-key-exposure.md). Отказ изоляции — красный job.
+dsh_agent_isolation_prepare gh "${GITHUB_WORKSPACE:-$REPO_DIR}" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
+
 # ── 3a. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
 # Порядок важен: --dump-config в 3b обязан доказывать монтаж плагина поверх
 # ИТОГОВОГО патча профиля — ровно той конфигурации, с которой стартует dsh,
@@ -230,7 +236,10 @@ dsh --version || true
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
 # без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
 # maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
-dsh_patch_profile headless
+# Патч пишет транспорт в свой каталог, в дом агента ставит агент (#140).
+dsh_patch_profile headless "$WORK/agent-headless.cordis.patch.yml"
+dsh_agent_run install -D -m 644 "$WORK/agent-headless.cordis.patch.yml" \
+  "$DSH_AGENT_HOME/.dsh/profiles/headless/cordis.patch.yml"
 
 # ── 3b. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
 # (dsh-streaming, проверка допущений 0: `dsh plugin add` + `--dump-config`
@@ -245,8 +254,10 @@ command -v pnpm >/dev/null || { echo "::error::pnpm не найден — dsh pl
 PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
 npm pack "$REPO_DIR/scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
 mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
-dsh plugin --profile headless add "$PLUGIN_TGZ"
-dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+# Монтаж и доказательство конфига — под агент-юзером: профиль живёт в его доме,
+# доказывать надо конфиг ровно того пользователя, с которым стартует dsh (#140).
+dsh_agent_run dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh_agent_run dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
   || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался: --dump-config без его строки; стрим событий невозможен" >&2; exit 1; }
@@ -272,7 +283,7 @@ dsh_edge_start_drain
 
 DSH_START_TS=$(date -u +%s)
 set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$TASK_TEXT" >"$ANSWER_FILE" 2>"$ERR_FILE"
+timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$TASK_TEXT" >"$ANSWER_FILE" 2>"$ERR_FILE"
 rc=$?
 set -e
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
