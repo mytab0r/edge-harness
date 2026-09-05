@@ -4,6 +4,7 @@ import {
   confirmPreviousRun,
   dshEdgeUpdateDecision,
   fetchLatestOrchestraRunId,
+  pulseDetailForRecord,
   pulseHealthy,
 } from "../src/harness";
 import { HEARTBEAT } from "../src/config";
@@ -158,5 +159,59 @@ describe("пульс оркестрации: pulseHealthy — здоров ли 
   // сколь угодно долго, потому что 204 продолжал бы приходить каждый тик.
   it("204 принят, но run НЕ подтверждён — нездоров сразу, даже на свежем тике", () => {
     expect(pulseHealthy(NOW, { ts: NOW, dispatch_ok: true, detail: null, run_confirmed: false })).toBe(false);
+  });
+});
+
+// НАХОДКА РЕВЬЮ (#303): главный сценарий этого фикса — dispatch ЭТОГО тика принят
+// (attemptOrchestraDispatch честно отдаёт detail: null, причины нет), но
+// run_confirmed о ПРЕДЫДУЩЕМ dispatch'е — false. Без подмены detail это null
+// уходит в pulse.detail, а морда (public/assets/app.js:179,
+// t("pulse.unhealthy", { detail: status.last_pulse.detail })) рендерит буквальную
+// строку "null" — неотличимо от честной поломки. Докажи мутацией: верни в
+// pulseDetailForRecord просто `result.detail` без спецслучая run_confirmed —
+// и тест «бейдж не содержит null» ниже покраснеет.
+describe("пульс оркестрации: pulseDetailForRecord — detail не должен тонуть в null (issue #303)", () => {
+  it("dispatch принят, но run НЕ подтверждён — detail человекочитаемый, не null", () => {
+    expect(pulseDetailForRecord({ ok: true, detail: null }, false)).toBe(HEARTBEAT.runNotConfirmedDetail);
+  });
+
+  it("dispatch принят и run подтверждён (или рано судить) — detail как есть (null)", () => {
+    expect(pulseDetailForRecord({ ok: true, detail: null }, true)).toBeNull();
+    expect(pulseDetailForRecord({ ok: true, detail: null }, null)).toBeNull();
+  });
+
+  it("dispatch провалился ЭТОГО тика — реальная причина в приоритете, не подмена run_confirmed", () => {
+    expect(pulseDetailForRecord({ ok: false, detail: "dispatch отклонён: 403" }, false)).toBe(
+      "dispatch отклонён: 403",
+    );
+  });
+});
+
+// Прод-форма рендера бейджа — тот же шаблон (i18n/ru.js: "pulse.unhealthy") и та
+// же подстановка `{key}` → String(params[key]), что app.js:12-16 (t()) и
+// app.js:179 (renderStatus). Без DOM/fs в тестовом workerd-раннере (нет
+// document, node:fs читает только виртуальную ФС песочницы — проверено пробой)
+// прогнать реальный app.js нельзя; вместо пересказа шаблон скопирован дословно
+// из public/assets/i18n/ru.js — паритет ключей и текста охраняет отдельно
+// scripts/check-frontend-contract.mjs (npm run check).
+const PULSE_UNHEALTHY_TEMPLATE = "⚠️ пульс оркестрации не бьётся: {detail} ({minutes} мин назад)";
+function renderPulseUnhealthy(params: Record<string, unknown>): string {
+  return PULSE_UNHEALTHY_TEMPLATE.replace(/\{(\w+)\}/g, (_, k) => (k in params ? String(params[k]) : `{${k}}`));
+}
+
+describe("бейдж пульса: отрендеренный текст не содержит null (issue #303, находка ревью)", () => {
+  it("главный сценарий — dispatch принят, run не подтверждён: detail из pulseDetailForRecord, бейдж без 'null'", () => {
+    const detail = pulseDetailForRecord({ ok: true, detail: null }, false);
+    const rendered = renderPulseUnhealthy({ detail, minutes: 5 });
+    expect(rendered).not.toContain("null");
+    expect(rendered).toBe("⚠️ пульс оркестрации не бьётся: принят, запуск не появился (5 мин назад)");
+  });
+
+  it("сырой null (без фикса) — контрольный пример: бейдж содержит 'null'", () => {
+    // Не проверка кода pulseDetailForRecord — иллюстрация того, что чинит фикс:
+    // если бы detail остался null (как отдаёт attemptOrchestraDispatch при ok:true),
+    // бейдж показывал бы буквальное "null" — ровно находка ревью.
+    const rendered = renderPulseUnhealthy({ detail: null, minutes: 5 });
+    expect(rendered).toContain("null");
   });
 });

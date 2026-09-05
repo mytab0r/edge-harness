@@ -212,6 +212,25 @@ export function confirmPreviousRun(baseline: number | null, latest: number | nul
   return latest !== baseline;
 }
 
+/**
+ * detail, который попадает в pulse.detail (#303, находка ревью): dispatch ЭТОГО
+ * тика принят (result.ok, detail: null — attemptOrchestraDispatch честно не
+ * пишет причину, потому что причины нет), но run_confirmed о ПРЕДЫДУЩЕМ
+ * dispatch'е — false. pulseHealthy() уже гасит бейдж в этом случае, но само
+ * поле detail без этой подмены остаётся null — фронт (cf-worker/public/assets/app.js,
+ * t("pulse.unhealthy", { detail })) отрендерит буквальную строку "null", что
+ * неотличимо от честной поломки dispatch'а. Реальная ошибка ЭТОГО тика
+ * (result.ok === false, detail уже заполнен) в приоритете — это не тот
+ * случай, что «ok сейчас, но не подтвердилось раньше».
+ */
+export function pulseDetailForRecord(
+  result: { ok: boolean; detail: string | null },
+  runConfirmed: boolean | null,
+): string | null {
+  if (result.ok && runConfirmed === false) return HEARTBEAT.runNotConfirmedDetail;
+  return result.detail;
+}
+
 export function handsAreAlive(now: number, lastHeartbeatTs: number | null): boolean {
   return lastHeartbeatTs !== null && now - lastHeartbeatTs < LIMITS.heartbeatFreshMs;
 }
@@ -728,14 +747,15 @@ export class Harness extends DurableObject<Env> {
     const runConfirmed =
       previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
     const result = await attemptOrchestraDispatch(token, repo, fetch);
-    this.#recordPulse(result.ok, result.detail, latestRunId, runConfirmed);
+    // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
+    // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
+    const detail = pulseDetailForRecord(result, runConfirmed);
+    this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
     if (!result.ok || runConfirmed === false) {
       // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
       // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
       // который никто не смотрит между дедами (fail loud, issue #269).
-      console.log(
-        `heartbeat dispatch: accepted=${result.ok} detail=${result.detail} run_confirmed=${runConfirmed}`,
-      );
+      console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
     }
     try {
       await this.#checkDshEdgeUpdate(token, repo);

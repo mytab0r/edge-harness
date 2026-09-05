@@ -954,14 +954,19 @@ def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     UNHEALTHY_PR_AFTER_MINUTES — это и есть наблюдаемая величина «задержка
     слияния», а не статус последнего прогона оркестратора (тот может быть
     сплошь success, пока сам прогон не случается достаточно часто). Сигнал —
-    тот же канал escalate(), что предохранитель конвейера (#120), идемпотентно:
-    маркер READY_STALL_MARKER новее момента готовности — уже оповещено, молчим.
+    тот же канал escalate(), что предохранитель конвейера (#120), идемпотентно
+    для КАЖДОГО PR по отдельности: номер PR — часть самого маркера
+    (f"{READY_STALL_MARKER} #{n}", по образцу AI_REVIEW_RETRY_MARKER выше),
+    а не общий текст на всю задачу-статус #120. Общий маркер без номера
+    (#303, находка ревью) даёт ложное молчание: маркер, поставленный по PR
+    #301, новее момента готовности #302 — #302 подавлен навсегда, новых
+    маркеров по нему уже не будет, пока молчат про #301.
 
-    Маркеры читаются ЛЕНИВО (только когда найден хотя бы один просроченный
-    кандидат), а не в начале функции: пустая очередь PR обязана давать ноль
-    вызовов gh(), как и остальные механизмы (гвардия холостого хода)."""
+    Маркеры читаются ЛЕНИВО (только для PR, прошедшего фильтры готовности и
+    возраста выше) — пустая очередь PR или очередь без просроченных кандидатов
+    обязана давать ноль вызовов gh() за маркерами, как и остальные механизмы
+    (гвардия холостого хода)."""
     lines: list[str] = []
-    markers: list[datetime] | None = None
     for pull in pulls:
         if pull.get("draft"):
             continue
@@ -975,16 +980,16 @@ def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
         age = minutes_between(ready_since, now)
         if age < UNHEALTHY_PR_AFTER_MINUTES:
             continue
-        if markers is None:
-            try:
-                markers = issue_marker_times(repo, WATCHDOG_ISSUE, READY_STALL_MARKER)
-            except RuntimeError as error:
-                lines.append(f"⚠️ не смог сверить маркеры готовности #{WATCHDOG_ISSUE}: {error}")
-                continue
+        marker = f"{READY_STALL_MARKER} #{pull['number']}"
+        try:
+            markers = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+        except RuntimeError as error:
+            lines.append(f"⚠️ не смог сверить маркеры готовности #{WATCHDOG_ISSUE}: {error}")
+            continue
         if any(marker_at > ready_since for marker_at in markers):
-            continue  # уже оповещено про эту готовность
+            continue  # уже оповещено про эту готовность именно этого PR
         text = (
-            f"🚨 edge-harness: {READY_STALL_MARKER}\n"
+            f"🚨 edge-harness: {marker}\n"
             f"PR #{pull['number']} готов к слиянию (обе метки-гейта, зелёные проверки) "
             f"{int(age)} мин — дольше {UNHEALTHY_PR_AFTER_MINUTES}, слияния не произошло. "
             "Проверь status.pulse_healthy (cf-worker) и последние прогоны orchestra.yml."

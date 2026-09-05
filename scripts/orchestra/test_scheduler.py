@@ -707,7 +707,7 @@ def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
         "commits/sha305/check-runs": CHECK_RUNS_GREEN,
         "issues/305/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
         "issues/120/comments?per_page=100": [
-            {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER}\nPR #305 …"},
+            {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #305\nPR #305 …"},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -715,6 +715,38 @@ def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
     now = utc(2026, 9, 2, 10, 30)  # тот же возраст, что в escalates-тесте
     lines = sch.stale_ready_pulls(REPO, now, [p])
     assert lines == []
+
+
+def test_stale_ready_pulls_signals_each_pr_independently(monkeypatch):
+    # #303, находка ревью: маркер по PR #301 не имеет права подавить #302 —
+    # у каждого просроченного PR маркер свой (номер — часть текста маркера).
+    # Мутация-гвардия: если вернуть общий READY_STALL_MARKER без номера PR,
+    # маркер по #301 (10:01, новее готовности #302 в 08:30) подавит #302 и
+    # второй assert покраснеет.
+    p301 = pull(301, labels=["review:ok", "ai:ok"])
+    p302 = pull(302, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        "pulls/301": {"mergeable_state": "clean"},
+        "pulls/302": {"mergeable_state": "clean"},
+        "commits/sha301/check-runs": CHECK_RUNS_GREEN,
+        "commits/sha302/check-runs": CHECK_RUNS_GREEN,
+        "issues/301/timeline": timeline_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
+        "issues/302/timeline": timeline_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
+        # #301 уже прокричал в 10:01 — маркер несёт свой номер.
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-02T10:01:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #301\nPR #301 …"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 2, 10, 31)  # #301: 151 мин с 08:00; #302: 121 мин с 08:30 — оба > 120
+    lines = sch.stale_ready_pulls(REPO, now, [p301, p302])
+
+    assert not any("301" in line for line in lines)  # #301 уже оповещён — молчим
+    assert any("302" in line and "готов" in line for line in lines)  # #302 обязан прокричать
+    assert len(posted) == 1 and "302" in posted[0][1]
 
 
 def test_stale_ready_pulls_noop_on_empty_queue(monkeypatch):
