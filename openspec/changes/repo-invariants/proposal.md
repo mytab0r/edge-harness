@@ -29,6 +29,17 @@
    полностью отмечен, а каталог не под `archive/`.
 5. `check_duplicate_evidence` — два открытых task-issue ссылаются на
    пересекающийся `file:line` в теле (класс #202/#213/#212).
+6. `check_branch_protection_drift` (#341) — `enforce_admins`/
+   `required_status_checks.strict`/`.contexts`/`allow_force_pushes`/
+   `allow_deletions` защиты `main` разошлись с `EXPECTED_*` (класс: аудит
+   #341 нашёл `enforce_admins=false` — admin-токен сливал мимо всех
+   обязательных проверок, `grep -rn protection scripts/` был пуст до этой
+   правки). НЕ подключён к `build_report()`/`CI_GATING` по умолчанию:
+   `GET .../branches/main/protection` требует у токена право
+   `administration`, которого структурно нет у `GITHUB_TOKEN` (не входит в
+   перечисляемый набор permissions Actions) — включается только вручную
+   (`--check-branch-protection`, токен с реальными admin-правами). Решение
+   о канале автоматизации — за владельцем, см. issue #370.
 
 ## Расписание и required-гейт
 
