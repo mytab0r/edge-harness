@@ -1233,7 +1233,7 @@ def test_open_task_issues_and_open_pulls_read_through_paginated_helper():
     # Гвардия по исходнику: обе функции обязаны ходить через
     # review_labels.list_pages (полный обход постранично), а не читать сырую
     # первую страницу — поведенческая проверка пагинации на прод-форме живёт в
-    # scripts/lib/test_review_labels.py::test_list_pages_paginates_over_100_real_open_task_issues_308
+    # scripts/lib/test_review_labels.py::test_list_pages_paginates_over_100_real_open_task_issues_310
     # (мутация доказана там: обход убран — тест краснеет).
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'review_labels.list_pages(\n        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)' in source
@@ -1258,7 +1258,7 @@ def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
     # 2026-09-05) — до фикса (сырая первая страница) видны только 100, после —
     # все 107.
     import json
-    fixture = _DIR.parent / "lib" / "fixtures_open_task_issues_308.json"
+    fixture = _DIR.parent / "lib" / "fixtures_open_task_issues_310.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     page1, page2 = data["page1"], data["page2"]
     assert len(page1) == 100

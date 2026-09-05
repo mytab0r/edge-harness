@@ -429,7 +429,7 @@ def test_list_timeline_empty_on_no_events():
 # формой — тот же класс, что last_review_ok_labeled_at/last_ready_labeled_at
 # (#303), сюда не мигрировали.
 
-FIXTURE_TASK_ISSUES = _DIR / "fixtures_open_task_issues_308.json"
+FIXTURE_TASK_ISSUES = _DIR / "fixtures_open_task_issues_310.json"
 
 
 def _load_task_issues_pages() -> dict:
@@ -437,7 +437,7 @@ def _load_task_issues_pages() -> dict:
         return json.load(file)
 
 
-def test_list_pages_paginates_over_100_real_open_task_issues_308():
+def test_list_pages_paginates_over_100_real_open_task_issues_310():
     # Прод-форма: gh api repos/mytab0r/edge-harness/issues?state=open&labels=task
     # &per_page=100 (page=1) и page=2, снято 2026-09-05 — не пересказ.
     data = _load_task_issues_pages()
