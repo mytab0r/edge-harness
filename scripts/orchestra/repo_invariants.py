@@ -17,15 +17,16 @@ task — repo-ci.yml, #179; реестр меток — scripts/lib/test_label_r
 gh() (общий с pulse_guard/scheduler, тот же субпроцесс-контракт) и печатает
 отчёт; мутирующие вызовы (escalate) — только когда violations непусты.
 
-Пять инвариантов первой волны:
+Пять инвариантов первой волны, из них 2 выведен из состава после ревью
+(см. блок-комментарий у бывшего check_free_task_count_mismatch):
   1. check_reopened_after_merge — открытая задача task без исполнителя,
      чей PR уже слит: воркер/scheduler.dispatch_worker выберут её снова
      (класс #18/#21/#78 при слитых PR #138/#177/#163).
-  2. check_free_task_count_mismatch — «истинное» число свободных задач
-     (без assignee) расходится с тем, что реально выберет
-     scripts/worker/task.sh::free_task() (баг класса «substring-scan по
-     всему телу открытых PR»). Файл не трогаем — паттерн scan("...")
-     вытаскивается из него же в рантайме.
+  2. (retired) check_free_task_count_mismatch сравнивал «истинное» число
+     свободных задач с тем, что вернёт scripts/worker/task.sh::free_task()
+     через подстрочный scan("..."). #247 заменил scan() на
+     scripts/lib/free_task.py::free_candidates — тот же критерий, что и
+     метод A, сравнивать стало не с чем (тавтология), класс закрыт.
   3. check_stuck_review_gate — review:ok стоит дольше порога без НИКАКОГО
      ai:*-вердикта (класс #147, сутки простоя). Порог — существующее место
      правды pulse_guard.UNHEALTHY_PR_AFTER_MINUTES, своего числа не заводим.
@@ -43,9 +44,9 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
 этого конкретного пуша, и превращать его в требование «почини чужой бэклог,
 чтобы слить свой PR» было бы третьим по счёту тормозом без объявленного газа
 (AGENTS.md, правило «Тормоз без газа не принимается»). Замер на живом
-репозитории 2026-09-03 (см. README PR): инварианты 1/2/5 уже находят реальный
-накопленный долг (17/20 из 66/7 нарушений) — сделать их required-гейтом
-немедленно означало бы покрасить main для всех агентов из-за чужого долга.
+репозитории 2026-09-03 (см. README PR): инварианты 1/5 уже находят реальный
+накопленный долг (17/7 нарушений) — сделать их required-гейтом немедленно
+означало бы покрасить main для всех агентов из-за чужого долга.
 
 Решение владельца (PR #249, комментарий 2026-09-03 «Решение по CI_GATING —
 принято, чтобы не осталось в чате»): инварианты 3 и 4 — ноль нарушений на
@@ -55,12 +56,14 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
 газа (trigger_ai_review, scheduler.py) обнаружилась зависимость от такта
 оркестратора, а такт ненадёжен (#269, см. подробности у CI_GATING ниже) —
 это внешняя находка, не пересмотр решения владельца. Условие обратного
-включения 3 — закрытие #269. Инварианты 1, 2, 5 остаются наблюдательными по
-исходному решению, пока не разгребён долг: 2 обнулит PR #247 (`free_task`:
-скан по прозе вместо объявления), 1 обнулит стадия приёмки, 5 —
-дедупликация по отпечатку (#201/#243). Каждый включается отдельным шагом,
-привязанным к обнулению его счётчика (или, для 3 — к закрытию #269), правкой
-CI_GATING ниже — не разовым решением «включим всё позже».
+включения 3 — закрытие #269. Инвариант 2 выведен из состава после ревью PR
+#249 (#247 закрыл сам класс substring-scan, сравнивать стало не с чем —
+см. блок-комментарий на месте бывшего check_free_task_count_mismatch).
+Инварианты 1 и 5 остаются наблюдательными по исходному решению, пока не
+разгребён долг: 1 обнулит стадия приёмки, 5 — дедупликация по отпечатку
+(#201/#243). Каждый включается отдельным шагом, привязанным к обнулению его
+счётчика (или, для 3 — к закрытию #269), правкой CI_GATING ниже — не
+разовым решением «включим всё позже».
 
 Запуск:
   python scripts/orchestra/repo_invariants.py             # печать отчёта (repo-ci.yml)
@@ -102,7 +105,6 @@ review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
-TASK_SH = REPO_ROOT / "scripts" / "worker" / "task.sh"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
 # Инварианты, включённые в обязательную проверку repo-ci.yml `test` — их
@@ -202,53 +204,21 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 2: число свободных задач — два независимых метода расходятся
+# Инвариант 2 — ВЫВЕДЕН ИЗ СОСТАВА (находка AI-ревью PR #249, 4 независимых
+# раунда). Первоначальный вариант сравнивал «открытые task-issue без
+# assignee» с тем, что вернёт scripts/worker/task.sh::free_task(), решавший
+# «занята» подстрочным scan("#[0-9]+") по телам ЧУЖИХ PR — класс, из-за
+# которого воркеру было доступно 50 из 66 свободных задач (замер 2026-09-03).
+# #247 (free-task-declared-scope) заменил этот scan() на
+# scripts/lib/free_task.py::free_candidates — тот же критерий, что и метод A
+# (issue.assignees пуст), плюс фильтр по живым замкам аренды (#121). Извлекать
+# паттерн scan(...) из task.sh стало нечего (RuntimeError на каждом прогоне —
+# инвариант вечно печатал «не удалось проверить», найдено ревью), а
+# реализовать метод B через free_candidates() означало бы сравнивать функцию
+# саму с собой — не независимая проверка, а тавтология. Класс, который
+# инвариант ловил, закрыт #247; воскрешать его есть смысл только если
+# появится НОВЫЙ независимый способ занять задачу без ведома free_task.py.
 # ══════════════════════════════════════════════════════════════════════════
-
-
-def extract_task_sh_scan_pattern(text: str) -> str:
-    """Паттерн, которым task.sh::free_task() решает «эта задача занята
-    открытым PR» — вытащен из ФАЙЛА в рантайме, не хардкожен: если task.sh
-    когда-нибудь поправят (баг класса «substring-scan», сейчас в отдельном
-    PR — этот файл мы не трогаем), инвариант сам увидит новый паттерн и
-    сам замолчит, без правки здесь."""
-    match = re.search(r'scan\("([^"]+)"\)', text)
-    if not match:
-        raise RuntimeError(
-            "scripts/worker/task.sh: не нашёл scan(\"...\") в free_task() — "
-            "скрипт переписан, обнови extract_task_sh_scan_pattern"
-        )
-    return match.group(1)
-
-
-def check_free_task_count_mismatch(
-    open_tasks: list[dict], open_pulls: list[dict], task_sh_text: str,
-) -> dict | None:
-    """Метод A (истина пула — то же, чем пользуется scheduler.dispatch_worker):
-    открытые task-issue без assignee. Метод B — то же множество, из которого
-    вычтены номера, которые task.sh::free_task() посчитает «занятыми»: паттерн
-    scan(...) применяется к телам ВСЕХ открытых PR буквально так же, как это
-    делает сам скрипт (subprocess его не трогаем, регэксп читаем из файла).
-    Расхождение A и B — ложно заблокированные номера: воркер не возьмёт
-    задачу, которая на самом деле свободна, потому что её номер просто
-    УПОМЯНУТ в чужом PR (баг класса substring-scan, а не декларация)."""
-    ground_truth = sorted(t["number"] for t in open_tasks if not t["assignees"])
-    pattern = extract_task_sh_scan_pattern(task_sh_text)
-    taken: set[int] = set()
-    for pull in open_pulls:
-        for match in re.finditer(pattern, pull.get("body") or ""):
-            digits = match.group(0).lstrip("#")
-            if digits.isdigit():
-                taken.add(int(digits))
-    worker_would_pick = sorted(n for n in ground_truth if n not in taken)
-    falsely_blocked = sorted(set(ground_truth) - set(worker_would_pick))
-    if not falsely_blocked:
-        return None
-    return {
-        "ground_truth_count": len(ground_truth),
-        "worker_count": len(worker_would_pick),
-        "falsely_blocked": falsely_blocked,
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -257,11 +227,14 @@ def check_free_task_count_mismatch(
 
 
 def last_review_ok_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Тот же приём, что scheduler.last_review_ok_labeled_at (#196) — не
-    импортируем scheduler.py (по нему открытый PR другого агента, не трогаем
-    файл), логика достаточно мала (скан таймлайна), чтобы держать копию
-    локально было безопаснее, чем зависеть от чужого модуля в разработке."""
-    timeline = gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")
+    """Момент последней простановки review:ok — весь таймлайн через
+    review_labels.list_timeline, не сырая первая страница `per_page=100`
+    (находка AI-ревью PR #249: у долгоживущего PR, который сам же разгоняют
+    авто-повторы #196, событие `labeled` уезжает за первую сотню — сырой
+    вызов возвращал None и застрявший гейт молча пропускался, ровно тот
+    класс, который #303 уже закрыл для scheduler.last_review_ok_labeled_at
+    той же функцией; копия здесь была рассинхронизирована с исправлением)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
         if event.get("event") == "labeled"
@@ -457,24 +430,7 @@ def build_report(repo: str, now: datetime) -> tuple[list[str], dict[int, list]]:
     else:
         lines.append("💚 [1] нет открытых задач с уже слитым PR")
 
-    v2_error = None
-    try:
-        task_sh_text = TASK_SH.read_text(encoding="utf-8")
-        v2 = check_free_task_count_mismatch(open_tasks, open_pulls, task_sh_text)
-    except (OSError, RuntimeError) as error:
-        v2 = None
-        v2_error = error
-    findings[2] = [v2] if v2 else []
-    if v2_error is not None:
-        lines.append(f"⚠️ [2] не удалось проверить (fail loud, не молчим): {v2_error}")
-    elif v2:
-        lines.append(
-            f"🚨 [2] свободных задач по факту {v2['ground_truth_count']}, "
-            f"воркер выберет из {v2['worker_count']} — ложно заблокированы: "
-            + ", ".join(f"#{n}" for n in v2['falsely_blocked'])
-        )
-    else:
-        lines.append("💚 [2] число свободных задач совпадает по обоим методам")
+    findings[2] = []  # выведен из состава — см. блок-комментарий выше, класс закрыт #247
 
     v3 = check_stuck_review_gate(repo, now, open_pulls)
     findings[3] = v3

@@ -109,68 +109,11 @@ def test_reopened_after_merge_mutation_guard():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 2: число свободных задач — два метода расходятся
+# Инвариант 2 — выведен из состава (см. блок-комментарий в
+# repo_invariants.py на месте бывшего check_free_task_count_mismatch):
+# #247 закрыл класс substring-scan, который он ловил, сравнивать стало
+# не с чем. Тестов для отсутствующей функции нет.
 # ══════════════════════════════════════════════════════════════════════════
-
-# Фрагмент реальной строки scripts/worker/task.sh (класс substring-scan).
-TASK_SH_FRAGMENT = '''
-free_task() {
-  local taken candidates number title
-  taken=$(gh pr list --state open --limit 100 --json body \\
-    | jq -r '[.[].body // "" | scan("#[0-9]+") | ltrimstr("#")] | unique | join(" ")') || return 2
-  candidates=$(gh issue list --label task --state open --limit 100 --json number,assignees,title \\
-    | jq -r '.[] | select((.assignees | length) == 0) | [.number, .title] | @tsv' \\
-    | sort -n) || return 2
-}
-'''
-
-
-def test_extract_task_sh_scan_pattern():
-    assert ri.extract_task_sh_scan_pattern(TASK_SH_FRAGMENT) == "#[0-9]+"
-
-
-def test_extract_task_sh_scan_pattern_missing_raises():
-    with pytest.raises(RuntimeError):
-        ri.extract_task_sh_scan_pattern("free_task() { echo no-scan-here; }")
-
-
-def test_free_task_mismatch_flags_substring_false_block():
-    # #18 упомянуто в прозе PR #200 (не декларация), но task.sh's scan
-    # ловит "#18" ЛЮБЫМ вхождением — ложно блокирует свободную задачу #18.
-    tasks = [task_issue(18, assignees=()), task_issue(80, assignees=())]
-    pulls = [open_pr(200, "#207\n\nупоминает попутно #18 в примере")]
-    result = ri.check_free_task_count_mismatch(tasks, pulls, TASK_SH_FRAGMENT)
-    assert result is not None
-    assert result["ground_truth_count"] == 2
-    assert result["worker_count"] == 1
-    assert result["falsely_blocked"] == [18]
-
-
-def test_free_task_mismatch_silent_when_methods_agree():
-    tasks = [task_issue(18, assignees=())]
-    pulls = [open_pr(200, "#207\n\nникаких других номеров")]
-    assert ri.check_free_task_count_mismatch(tasks, pulls, TASK_SH_FRAGMENT) is None
-
-
-def test_free_task_mismatch_mutation_guard():
-    # Мутация: заменить scan("#[0-9]+") на границу-осознанный паттерн
-    # (как в task_ref.py) — расхождение обязано исчезнуть.
-    tasks = [task_issue(18, assignees=())]
-    pulls = [open_pr(200, "#207\n\nупоминает #18 в прозе")]
-    buggy = ri.check_free_task_count_mismatch(tasks, pulls, TASK_SH_FRAGMENT)
-    assert buggy is not None
-    fixed_fragment = TASK_SH_FRAGMENT.replace(
-        'scan("#[0-9]+")', 'scan("(?<![0-9])#[0-9]+(?![0-9])")'
-    )
-    # с границей вхождение "#18 в прозе" всё ещё матчит (граница не про
-    # позицию в тексте, а про соседние цифры) — берём паттерн, который
-    # реально требует декларации, чтобы показать: инвариант считает то,
-    # что реально лежит в файле, не хардкод
-    fixed_fragment_no_scan = TASK_SH_FRAGMENT.replace(
-        'scan("#[0-9]+")', 'scan("NEVER_MATCHES_ANYTHING_XYZ")'
-    )
-    result = ri.check_free_task_count_mismatch(tasks, pulls, fixed_fragment_no_scan)
-    assert result is None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -210,7 +153,6 @@ def patch_gh(monkeypatch, fake):
     Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh."""
     monkeypatch.setattr(ri, "gh", fake)
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
-    monkeypatch.setattr(ri.pulse_guard, "gh", fake)
 
 
 def timeline_with_review_ok(when: str):
@@ -244,10 +186,18 @@ def test_stuck_review_gate_silent_when_verdict_present(monkeypatch):
     assert fake.calls == []
 
 
-def test_stuck_review_gate_mutation_guard():
-    # Мутация: убрать порог UNHEALTHY_PR_AFTER_MINUTES из решения — тест на
-    # «в пределах порога» обязан покраснеть, если функция всегда репортит.
-    assert ri.UNHEALTHY_PR_AFTER_MINUTES > 0
+def test_stuck_review_gate_mutation_guard(monkeypatch):
+    # Мутация: тот же PR/таймлайн, порог опущен ниже возраста — обязан
+    # появиться как нарушение (реальная мутация значения, не проверка > 0,
+    # находка AI-ревью PR #249: старый вариант не краснел на снятии фикса).
+    pull = open_pr(246, labels=["review:ok"])
+    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z")})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 13)  # 6 минут — в пределах порога 120 (см. silent_within_threshold)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+    monkeypatch.setattr(ri, "UNHEALTHY_PR_AFTER_MINUTES", 1)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -268,10 +218,6 @@ def test_unarchived_complete_flags_fully_checked(tmp_path):
     assert violations == [{"change": "walking-skeleton", "checked": 2}]
 
 
-def test_unarchived_complete_silent_with_open_box():
-    pass  # покрыто ниже параметризованно
-
-
 def test_unarchived_complete_silent_when_box_unchecked(tmp_path):
     write_tasks_md(tmp_path, "ai-review-gate", "- [x] один\n- [ ] два — в пуле\n")
     assert ri.check_unarchived_complete_changes(tmp_path) == []
@@ -290,11 +236,14 @@ def test_unarchived_complete_ignores_archive_dir(tmp_path):
 def test_unarchived_complete_mutation_guard(tmp_path):
     write_tasks_md(tmp_path, "walking-skeleton", "- [x] один\n- [x] два\n")
     assert len(ri.check_unarchived_complete_changes(tmp_path)) == 1
-    # мутация: если бы фильтр archive/ исчез — тот же каталог под archive/
-    # тоже нашёлся бы (доказываем разницу двух прогонов)
-    write_tasks_md(tmp_path / "archive", "walking-skeleton", "- [x] один\n")
-    total_with_archive_dir = ri.check_unarchived_complete_changes(tmp_path)
-    assert all(v["change"] != "archive/walking-skeleton" for v in total_with_archive_dir)
+    # Реальная мутация: каталог, буквально названный "archive", с полностью
+    # отмеченным tasks.md прямо внутри него (не под ним) — фильтр
+    # `entry.name == "archive"` обязан его исключить. Снять фильтр (удалить
+    # условие `or entry.name == "archive"` в repo_invariants.py) — тест ниже
+    # покраснеет: без фильтра "archive" стал бы обычной записью с checked=1.
+    write_tasks_md(tmp_path, "archive", "- [x] один\n")
+    violations = ri.check_unarchived_complete_changes(tmp_path)
+    assert all(v["change"] != "archive" for v in violations)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -402,8 +351,6 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
-    monkeypatch.setattr(ri, "TASK_SH", tmp_path / "task.sh")
-    (tmp_path / "task.sh").write_text(TASK_SH_FRAGMENT, encoding="utf-8")
 
     now = utc(2026, 9, 3, 12, 0)
     lines, findings = ri.build_report("mytab0r/edge-harness", now)
