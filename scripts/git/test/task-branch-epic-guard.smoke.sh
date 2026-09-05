@@ -49,10 +49,19 @@ WORK="$TMP/work"
 git clone -q "$ORIGIN" "$WORK"
 git -C "$WORK" config user.email test@example.com
 git -C "$WORK" config user.name test
+# Github-вид URL для owner/repo (проверка на входе, #357/#358 читает его из
+# origin) — реально резолвится в локальный bare через insteadOf, как в
+# scripts/git/test/task-branch.test.sh: сеть не нужна, но owner/repo парсится
+# тем же кодом, что и в проде.
+git -C "$WORK" remote set-url origin https://github.com/o/r.git
+git -C "$WORK" config "url.$ORIGIN.insteadOf" https://github.com/o/r.git
 
-# ── Заглушка python3: тот же CLI-контракт, что epic_guard.py (путь к скрипту
-#    + номер задачи), без сети/gh. Реальный epic_guard.py — под своими
-#    юнит-тестами (scripts/lib/test_epic_guard.py).
+# ── Заглушки python3 и gh: тот же CLI-контракт, что epic_guard.py (путь к
+#    скрипту + номер задачи) и что «проверка на входе» task-branch (#357/#358,
+#    gh api repos/.../issues/N → state,labels), без сети. Реальные epic_guard.py
+#    и «проверка на входе» — под своими тестами (scripts/lib/test_epic_guard.py,
+#    scripts/git/test/task-branch.test.sh) — здесь только проводка, чтобы одна
+#    фича не гасила проверку другой.
 BIN="$TMP/bin"
 mkdir -p "$BIN"
 cat > "$BIN/python3" <<'PY_STUB'
@@ -73,6 +82,17 @@ echo "python3-stub: неожиданный вызов: $*" >&2
 exit 2
 PY_STUB
 chmod +x "$BIN/python3"
+
+cat > "$BIN/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+if [ "$1" = "api" ]; then
+  printf 'open\ttask\n'
+  exit 0
+fi
+echo "gh-stub: неожиданный вызов: $*" >&2
+exit 2
+GH_STUB
+chmod +x "$BIN/gh"
 
 export PATH="$BIN:$PATH"
 

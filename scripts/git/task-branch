@@ -95,9 +95,13 @@ fi
 # правды, копия не заводится; обёртка scripts/lib/epic_guard.py. Номер
 # извлекается из "$task" тем же способом (^[0-9]+), что и остальные точки
 # входа задачи; нечисловой префикс не поддержан этим входом — проверка
-# пропускается, а не выдумывает номер.
+# пропускается, а не выдумывает номер. Офлайн-режима у входа в задачу нет
+# (proposal.md): сбой сети/gh при проверке эпика тоже громкий, не тихий
+# пропуск — поэтому здесь нет `command -v python3`/`command -v gh`, только
+# сам вызов; отсутствие интерпретатора роняет `set -e` сам, отсутствие gh
+# эпик_guard.py ловит и превращает в чистый EXIT_ERROR (не traceback).
 epic_task_num=$(printf '%s' "$task" | grep -oE '^[0-9]+' || true)
-if [ -n "$epic_task_num" ] && command -v python3 >/dev/null 2>&1; then
+if [ -n "$epic_task_num" ]; then
   if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/epic_guard.py" "$epic_task_num"; then
     exit 1
   fi
