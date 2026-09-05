@@ -452,7 +452,7 @@ describe("ретеншн DO SQLite (#306/#305)", () => {
     expect(queuedRes.task.status).toBe("queued");
   });
 
-  it("/api/status.retention виден после тика — pruned по таблицам, backlog не паникует на первом полном тике", async () => {
+  it("/api/status.retention виден после тика — pruned по таблицам", async () => {
     const taskId = uniqueTaskId("retention-status");
     await insertOldEvents(taskId, 1, RETENTION.eventsMaxAgeMs + 60_000);
     await runInDurableObject(HARNESS_ID(), async (instance) => {
@@ -464,6 +464,60 @@ describe("ретеншн DO SQLite (#306/#305)", () => {
     expect(status.retention).not.toBeNull();
     expect(status.retention!.pruned).toHaveProperty("events");
     expect(status.retention!.pruned).toHaveProperty("tasks");
+  });
+
+  // Находка ревью PR #329: имя теста обещало «backlog не паникует на первом
+  // полном тике», но тик в нём не был полным (1 строка из batchSize) и
+  // backlog не проверялся вовсе. Здесь — настоящий полный тик (ровно
+  // batchSize строк) и явный assert на backlog === false: один полный тик
+  // после отката/первого деплоя — не тревога (см. docstring retentionBacklog).
+  it("backlog остаётся false после одного полного тика — не паникуем на разовом всплеске", async () => {
+    const taskId = uniqueTaskId("retention-single-full-tick");
+    await insertOldEvents(taskId, RETENTION.batchSize, RETENTION.eventsMaxAgeMs + 60_000);
+    await runInDurableObject(HARNESS_ID(), async (instance) => {
+      await instance.alarm();
+    });
+    const status = await getJson<{ retention: { pruned: Record<string, number>; backlog: boolean } | null }>(
+      "/api/status",
+    );
+    expect(status.retention).not.toBeNull();
+    expect(status.retention!.pruned.events).toBe(RETENTION.batchSize);
+    expect(status.retention!.backlog).toBe(false);
+  });
+
+  // Находка ревью PR #329: серия из RETENTION.backlogStreakThreshold подряд
+  // ПОЛНЫХ тиков обязана дать backlog=true, даже если КАЖДЫЙ тик выполняется в
+  // НОВОМ инстансе DO (runInDurableObject создаёт и утилизирует инстанс на
+  // каждый вызов — та же модель, что и в проде: DO выгружается из памяти
+  // между тиками alarm). Докажи мутацией: верни streak в поле класса
+  // (`#retentionStreak`) вместо строки `retention_state` — тест обязан
+  // покраснеть, потому что каждый новый инстанс увидит streak=0 и никогда не
+  // накопит 4 подряд.
+  it("backlog становится true после серии полных тиков даже через пересоздание DO", async () => {
+    const taskId = uniqueTaskId("retention-backlog-streak");
+    // С запасом на любой остаточный старый мусор от предыдущих тестов файла
+    // (общее хранилище DO, см. предупреждение вверху файла): гарантированно
+    // хватает на RETENTION.backlogStreakThreshold ПОЛНЫХ тиков только из
+    // собственных данных этого теста.
+    await insertOldEvents(taskId, RETENTION.batchSize * (RETENTION.backlogStreakThreshold + 1),
+      RETENTION.eventsMaxAgeMs + 60_000);
+
+    const stub = HARNESS_ID();
+    for (let tick = 0; tick < RETENTION.backlogStreakThreshold; tick++) {
+      // Каждый вызов runInDurableObject — новый инстанс класса (утилизируется
+      // после callback'а): любое состояние в памяти объекта здесь не выжило бы.
+      await runInDurableObject(stub, async (instance) => {
+        await instance.alarm();
+      });
+    }
+    const streak = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql.exec("SELECT streak FROM retention_state WHERE id = 1").toArray()[0].streak,
+    );
+    expect(Number(streak)).toBeGreaterThanOrEqual(RETENTION.backlogStreakThreshold);
+
+    const status = await getJson<{ retention: { backlog: boolean } | null }>("/api/status");
+    expect(status.retention).not.toBeNull();
+    expect(status.retention!.backlog).toBe(true);
   });
 });
 
