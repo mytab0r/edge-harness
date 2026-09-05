@@ -1,7 +1,7 @@
 # Форж плагинов dsh-edge: исходники плагина → релиз + PR в plugins.json
 #
 # Вход: workflow_dispatch с путём к исходникам плагина (относительно корня репо).
-# Выход: релиз plugins-<name>-v<version> с tarball и checksums, PR с обновлённым
+# Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR с обновлённым
 # dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
 # (design.md «Workers-совместимость») и интеграционном дыме.
 #
@@ -39,6 +39,15 @@ jobs:
   forge:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # Даёт job'у forge-failed канонический plugin_id (после сверки с
+      # манифестом — не basename каталога), чтобы падение ПОСЛЕ валидации
+      # писало failed в тот же псевдо-задачник, что building/built/
+      # deploying, а не в plugin:<basename> (находка AI-ревью PR #273:
+      # без этого таймлайн канонического плагина hello/hello-world вечно
+      # висел на deploying, а failed уходил в соседний, никогда не
+      # начинавшийся id).
+      plugin_id: ${{ steps.validate.outputs.plugin_id }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,8 +85,14 @@ jobs:
           else
             PLUGIN_ID=$(basename "$PLUGIN_PATH")
           fi
-          # Проверка формата ID (как в manifest.mjs)
-          [[ "$PLUGIN_ID" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^[a-z][a-z0-9-]*$"; exit 1; }
+          # Проверка формата ID — паттерн ЧИТАЕТСЯ из manifest.mjs
+          # (ID_PATTERN_SOURCE), а не копируется строкой: manifest.mjs
+          # объявляет ID_BODY_SOURCE единственным местом правды с явным
+          # запретом копий, вторая копия регэкспа здесь расходилась бы
+          # молча при правке паттерна там (находка AI-ревью PR #273).
+          ID_PATTERN_SOURCE=$(node -e "import('./dsh-edge/manifest.mjs').then(m => process.stdout.write(m.ID_PATTERN_SOURCE))") \
+            || { echo "::error::не удалось прочитать ID_PATTERN_SOURCE из dsh-edge/manifest.mjs"; exit 1; }
+          [[ "$PLUGIN_ID" =~ ^($ID_PATTERN_SOURCE)$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^$ID_PATTERN_SOURCE\$"; exit 1; }
 
           # Номер задачи для тела авто-PR — отдельный опциональный числовой
           # вход, НЕ plugin_id: plugin_id validate пропускает только через
@@ -183,7 +198,9 @@ jobs:
           TARBALL=$(ls "$GITHUB_WORKSPACE/artifacts"/*.tgz | head -1)
           SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           ASSET_NAME=$(basename "$TARBALL")
-          # Имя asset'а для релиза: <basename>-<version>.tgz (как в hello-world/runner-bridge)
+          # Имя asset'а для релиза: <id>-<version>.tgz — от plugin_id, не от
+          # basename пакета (hello-world — ровно тот случай, где name пакета
+          # ≠ id манифеста, находка AI-ревью PR #273).
           RELEASE_ASSET="${{ steps.validate.outputs.plugin_id }}-${{ steps.validate.outputs.plugin_version }}.tgz"
           cp "$TARBALL" "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET"
           SHA256_RELEASE=$(sha256sum "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET" | cut -d' ' -f1)
@@ -362,7 +379,7 @@ jobs:
           PLUGIN_ID="$PLUGIN_ID" STATE=deploying SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh
 
       # ── 4. Релиз ─────────────────────────────────────────────────────────────────
-      - name: Создать/обновить релиз plugins-<name>-v<version>
+      - name: Создать/обновить релиз plugins-<id>-v<version>
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -607,14 +624,18 @@ jobs:
         env:
           HARNESS_URL: ${{ vars.HARNESS_URL }}
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          # inputs.plugin_id опционален и при обычном запуске пуст — фолбэк
-          # вычисляется В BASH от inputs.plugin_path (basename), а не на
-          # уровне expression: `inputs.plugin_id || 'unknown'` не подставляет
-          # basename никогда, единственное падение реального плагина уезжало
-          # в plugin:unknown, и таймлайн плагина вечно висел на deploying
-          # (находка AI-ревью PR #273 — комментарий обещал basename, в коде
-          # он не применялся).
-          PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
+          # Канонический id из job forge (steps.validate.outputs.plugin_id —
+          # после сверки с манифестом, см. output `plugin_id` job'а forge) —
+          # не inputs.plugin_id: тот опционален и при обычном запуске пуст,
+          # а даже заданный входом id может быть переопределён валидацией на
+          # id из манифеста (бамп существующего пакета под другим id). Пусто
+          # (validate упала до записи output, т.е. до конца валидации) —
+          # фолбэк на basename(inputs.plugin_path) в BASH ниже (находка
+          # AI-ревью PR #273: без канонического id падение ПОСЛЕ валидации
+          # уезжало в plugin:<basename>, а не в тот id, что уже видел
+          # building/built/deploying — таймлайн канонического плагина вечно
+          # висел на deploying).
+          PLUGIN_ID_INPUT: ${{ needs.forge.outputs.plugin_id }}
           PLUGIN_PATH: ${{ inputs.plugin_path }}
           STATE: failed
           SOURCE: forge
