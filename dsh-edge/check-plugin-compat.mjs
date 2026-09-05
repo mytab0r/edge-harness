@@ -5,7 +5,7 @@
  * Использование: node dsh-edge/check-plugin-compat.mjs <plugin-source-dir> [--client]
  */
 
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -69,53 +69,87 @@ async function checkPackageJson() {
   console.log('  ✓ package.json: форма валидна')
 }
 
-// Разрешённые node:*-спецификаторы — одно место правды, читают и
-// checkForbiddenImports (статические/require), и checkNoDynamicImports
-// (динамический import()). Раньше список был локальным в checkForbiddenImports,
-// и checkNoDynamicImports запрещал то же самое ещё раз без сверки со списком —
-// разрешённый `import('node:crypto')` ловился как нарушение (находка AI-ревью
-// PR #162, issue #265).
-const ALLOWED_NODE_IMPORTS = [
-  'node:path',
-  'node:url',
-  'node:util',
-  'node:events',
-  'node:stream',
-  'node:crypto',
-  'node:buffer',
-  'node:assert',
-  'node:querystring',
+// design.md «Workers-совместимость» задаёт ЧЁРНЫЙ список запрещённых node:*
+// (см. FORBIDDEN_NODE_BUILTINS ниже) и явно разрешает только node:path/node:url —
+// но не запрещает остальные builtin'ы Workers nodejs_compat. Раньше здесь был
+// отдельный WHITE-список (`ALLOWED_NODE_IMPORTS`) на девять модулей, строже
+// самой спеки: легальный `node:zlib` (есть в nodejs_compat, не упомянут в
+// design.md вовсе) красил бы прогон только потому, что не значился в списке
+// разрешённых, а сопоставление шло через `startsWith` — `node:crypto-bogus`
+// проходил как «разрешённый node:crypto» (находка AI-ревью PR #271). Единый
+// источник правды теперь один — чёрный список FORBIDDEN_NODE_BUILTINS,
+// используемый и здесь (dynamic import), и в checkForbiddenImports
+// (static import/require), с точным сопоставлением имени модуля
+// (см. isForbiddenNodeBuiltin).
+
+// Запрещённые Node builtin-модули (обе формы — с префиксом node: и голая) и
+// npm-пакеты нативных аддонов. Раньше каждая форма импорта прописывалась
+// вручную парой from/require на модуль — third форма, голый side-effect
+// `import 'node:child_process'` (без from), не проверялась вовсе и давала
+// ЗЕЛЁНЫЙ (находка AI-ревью PR #271, мутационно доказана). Паттерны теперь
+// генерируются программно на все три формы разом — новый запрещённый
+// спецификатор не может забыть форму импорта.
+const FORBIDDEN_NODE_BUILTINS = [
+  { name: 'fs', note: 'используйте VFS Computer /workspace' },
+  { name: 'child_process', note: null },
+  { name: 'net', note: null },
+  { name: 'dgram', note: null },
+  { name: 'module', note: 'динамические части недоступны' },
 ]
 
-async function checkForbiddenImports() {
-  const FORBIDDEN_PATTERNS = [
-    { pattern: /from\s+['"]node:fs['"]/g, desc: 'node:fs (используйте VFS Computer /workspace)' },
-    { pattern: /require\(['"]node:fs['"]\)/g, desc: 'node:fs (require)' },
-    { pattern: /from\s+['"]fs['"]/g, desc: 'fs (bare import, недоступно в Workers — используйте VFS Computer /workspace)' },
-    { pattern: /require\(['"]fs['"]\)/g, desc: 'fs (bare require, недоступно в Workers)' },
-    { pattern: /from\s+['"]node:child_process['"]/g, desc: 'node:child_process' },
-    { pattern: /require\(['"]node:child_process['"]\)/g, desc: 'node:child_process (require)' },
-    { pattern: /from\s+['"]child_process['"]/g, desc: 'child_process (bare import, недоступно в Workers)' },
-    { pattern: /require\(['"]child_process['"]\)/g, desc: 'child_process (bare require, недоступно в Workers)' },
-    { pattern: /from\s+['"]node:net['"]/g, desc: 'node:net' },
-    { pattern: /require\(['"]node:net['"]\)/g, desc: 'node:net (require)' },
-    { pattern: /from\s+['"]net['"]/g, desc: 'net (bare import, недоступно в Workers)' },
-    { pattern: /require\(['"]net['"]\)/g, desc: 'net (bare require, недоступно в Workers)' },
-    { pattern: /from\s+['"]node:dgram['"]/g, desc: 'node:dgram' },
-    { pattern: /require\(['"]node:dgram['"]\)/g, desc: 'node:dgram (require)' },
-    { pattern: /from\s+['"]dgram['"]/g, desc: 'dgram (bare import, недоступно в Workers)' },
-    { pattern: /require\(['"]dgram['"]\)/g, desc: 'dgram (bare require, недоступно в Workers)' },
-    { pattern: /from\s+['"]node:module['"]/g, desc: 'node:module (динамические части недоступны)' },
-    { pattern: /require\(['"]node:module['"]\)/g, desc: 'node:module (require)' },
-    { pattern: /from\s+['"]module['"]/g, desc: 'module (bare import, недоступно в Workers)' },
-    { pattern: /require\(['"]module['"]\)/g, desc: 'module (bare require, недоступно в Workers)' },
-    { pattern: /from\s+['"]koffi['"]/g, desc: 'koffi (нативные аддоны недоступны)' },
-    { pattern: /require\(['"]koffi['"]\)/g, desc: 'koffi (require)' },
-    { pattern: /from\s+['"]node-pty['"]/g, desc: 'node-pty (нативные аддоны недоступны)' },
-    { pattern: /require\(['"]node-pty['"]\)/g, desc: 'node-pty (require)' },
-    { pattern: /@deepseek-ai\/node-addon-landlock-run/g, desc: 'landlock-run (нативный аддон)' },
-  ]
+const FORBIDDEN_PACKAGES = [
+  { name: 'koffi', note: 'нативные аддоны недоступны' },
+  { name: 'node-pty', note: 'нативные аддоны недоступны' },
+]
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * from/require/side-effect формы импорта одного спецификатора.
+ * `allowSubpath`: для builtin'ов вида `node:fs` матчит и подпуть `node:fs/promises` —
+ * иначе `import 'node:fs/promises'` (тот же запрещённый доступ к ФС) молча проходил бы,
+ * потому что регекс требовал точного совпадения строки целиком.
+ */
+function importFormsFor(spec, label, { allowSubpath = false } = {}) {
+  const esc = escapeRegExp(spec)
+  const specPattern = allowSubpath ? `${esc}(?:/[^'"]*)?` : esc
+  return [
+    { pattern: new RegExp(`from\\s+['"]${specPattern}['"]`, 'g'), desc: label },
+    { pattern: new RegExp(`require\\(['"]${specPattern}['"]\\)`, 'g'), desc: `${label} (require)` },
+    { pattern: new RegExp(`import\\s+['"]${specPattern}['"]`, 'g'), desc: `${label} (side-effect import)` },
+  ]
+}
+
+function buildForbiddenPatterns() {
+  const patterns = []
+  for (const { name, note } of FORBIDDEN_NODE_BUILTINS) {
+    patterns.push(...importFormsFor(`node:${name}`, `node:${name}${note ? ` (${note})` : ''}`, { allowSubpath: true }))
+    patterns.push(...importFormsFor(name, `${name} (bare import, недоступно в Workers${note ? ' — ' + note : ''})`, { allowSubpath: true }))
+  }
+  for (const { name, note } of FORBIDDEN_PACKAGES) {
+    patterns.push(...importFormsFor(name, `${name}${note ? ` (${note})` : ''}`))
+  }
+  patterns.push({ pattern: /@deepseek-ai\/node-addon-landlock-run/g, desc: 'landlock-run (нативный аддон)' })
+  return patterns
+}
+
+const FORBIDDEN_PATTERNS = buildForbiddenPatterns()
+
+/**
+ * Точное (с учётом подпути `node:name/sub`) сопоставление динамического
+ * `import('node:...')` с чёрным списком FORBIDDEN_NODE_BUILTINS — единственное
+ * место, решающее «этот node:-спецификатор запрещён», используется и здесь
+ * (dynamic import), и подразумевается статическими паттернами выше.
+ */
+function isForbiddenNodeBuiltin(specifier) {
+  if (!specifier.startsWith('node:')) return false
+  const name = specifier.slice('node:'.length)
+  return FORBIDDEN_NODE_BUILTINS.some(({ name: forbidden }) => name === forbidden || name.startsWith(`${forbidden}/`))
+}
+
+async function checkForbiddenImports() {
   const files = await collectJsFiles(absPluginDir)
   let violations = []
 
@@ -130,21 +164,14 @@ async function checkForbiddenImports() {
       }
     }
 
-    // Проверка node:* импортов — разрешаем только ALLOWED_NODE_IMPORTS
-    const nodeImports = [...content.matchAll(/from\s+['"](node:[^'"]+)['"]/g)]
-      .concat([...content.matchAll(/require\(['"](node:[^'"]+)['"]\)/g)])
-      .map(m => m[1])
-    // Также проверяем import() с node: спецификаторами
+    // Динамический import('node:...') не матчится паттернами from/require/side-effect
+    // выше (это вызов, а не одна из трёх статических форм) — проверяем его
+    // отдельно против того же чёрного списка (isForbiddenNodeBuiltin).
     const dynamicNodeImports = [...content.matchAll(/import\s*\(\s*['"](node:[^'"]+)['"]\s*\)/g)]
       .map(m => m[1])
     for (const imp of dynamicNodeImports) {
-      if (!ALLOWED_NODE_IMPORTS.some(allowed => imp.startsWith(allowed))) {
-        violations.push(`${relPath}: динамический import() ${imp} не в списке разрешённых (${ALLOWED_NODE_IMPORTS.join(', ')})`)
-      }
-    }
-    for (const imp of nodeImports) {
-      if (!ALLOWED_NODE_IMPORTS.some(allowed => imp.startsWith(allowed))) {
-        violations.push(`${relPath}: импорт ${imp} не в списке разрешённых (${ALLOWED_NODE_IMPORTS.join(', ')})`)
+      if (isForbiddenNodeBuiltin(imp)) {
+        violations.push(`${relPath}: динамический import() ${imp} — запрещённый модуль (design.md «Workers-совместимость»)`)
       }
     }
   }
@@ -163,22 +190,32 @@ async function checkNoDynamicImports() {
     const content = await readFile(file, 'utf8')
     const relPath = relative(absPluginDir, file)
 
-    // Ищем import() с не-статическими аргументами (переменные, конкатенация)
+    // Ищем import() с не-статическими аргументами (переменные, конкатенация).
     // Статические import('./relative-path') разрешены. Статические
-    // import('node:allowed-specifier') тоже разрешены — checkForbiddenImports
-    // уже проверяет их состав против ALLOWED_NODE_IMPORTS; здесь нельзя
-    // запрещать повторно то, что там явно допущено (иначе легальный
-    // import('node:crypto') красит прогон — находка AI-ревью PR #162, #265).
+    // import('node:builtin') тоже разрешены, ЕСЛИ builtin не в чёрном списке
+    // FORBIDDEN_NODE_BUILTINS (isForbiddenNodeBuiltin) — тот же список, что и
+    // checkForbiddenImports, единое место правды (иначе легальный
+    // import('node:crypto') красит прогон — находка AI-ревью PR #162, #265;
+    // запрещённый import('node:fs') обязан краснеть — ловится ниже, в
+    // checkForbiddenImports, тем же isForbiddenNodeBuiltin). Любой другой
+    // строковый литерал (npm-спецификатор без node:-префикса) design.md
+    // запрещает явно («нет рантайм import() npm-спецификаторов») — такой
+    // литерал тоже считается нарушением, не только переменная/конкатенация.
+    //
+    // Литерал обязан ЦЕЛИКОМ совпадать с аргументом (якоря ^...$ на весь
+    // обрезанный текст, включая кавычки) — раньше `/^['"].\//`  проверяла
+    // только ПРЕФИКС, поэтому `import('./' + name)` (конкатенация) проходила
+    // как «относительный путь» (находка AI-ревью PR #271, мутационно
+    // доказана: конкатенация — ровно то нестатическое поведение, которое
+    // design требует запрещать).
+    const RELATIVE_LITERAL = /^(['"])\.{1,2}\/[^'"]*\1$/
     const dynamicImports = [...content.matchAll(/import\s*\(\s*([^)]+)\s*\)/g)]
       .filter(m => {
         const arg = m[1].trim()
-        // Разрешаем строковые литералы с относительными путями
-        if (/^['"].\//.test(arg) || /^['"]\.\.\//.test(arg)) return false
-        // Разрешаем строковые литералы с допущенными node:*-спецификаторами
+        if (RELATIVE_LITERAL.test(arg)) return false
+        // Уже анкоренный на весь литерал (^...$) — конкатенация сюда не проходит.
         const nodeSpecifier = /^['"](node:[^'"]+)['"]$/.exec(arg)
-        if (nodeSpecifier && ALLOWED_NODE_IMPORTS.some(allowed => nodeSpecifier[1].startsWith(allowed))) {
-          return false
-        }
+        if (nodeSpecifier && !isForbiddenNodeBuiltin(nodeSpecifier[1])) return false
         return true
       })
 
@@ -238,8 +275,11 @@ async function checkClientBundle() {
     throw new Error('client/client.js: отсутствует обёртка window.__ModuleLoader__.load — невалидная форма ростера')
   }
 
-  // Проверка экспортов inject и apply
-  if (!content.includes('exports.inject') && !content.includes('export')) {
+  // Проверка exports.inject: раньше условие было `!includes('exports.inject')
+  // && !includes('export')` — вторая половина всегда true (подстрока 'export'
+  // входит в саму 'exports.inject', и в любой бандл, где вообще есть export),
+  // поэтому warn не срабатывал никогда (находка AI-ревью PR #271, мёртвый код).
+  if (!content.includes('exports.inject')) {
     console.warn('plugin-compat: предупреждение — не найден exports.inject в клиентском бандле')
   }
 
@@ -248,64 +288,85 @@ async function checkClientBundle() {
 
 async function checkSyntax() {
   const files = await collectJsFiles(absPluginDir)
+  let skippedTs = 0
   for (const file of files) {
+    if (file.endsWith('.ts')) {
+      // node --check не парсит TypeScript-синтаксис (типы, generics, ...) —
+      // легальный .ts-файл красил бы прогон бессмысленным SyntaxError
+      // (находка AI-ревью PR #271, мутационно доказана: `const x: number = 1`
+      // в реальном .ts плагине). В репозитории пока нет TS-плагинов; когда
+      // появятся, здесь нужен tsc/esbuild --noEmit, а не node --check —
+      // .ts осознанно пропускается, а не тихо считается прошедшим.
+      skippedTs++
+      continue
+    }
     const result = spawnSync(process.execPath, ['--check', file], { stdio: 'pipe' })
     if (result.status !== 0) {
       throw new Error(`node --check не прошёл для ${relative(absPluginDir, file)}:\n${result.stderr.toString()}`)
     }
   }
+  if (skippedTs > 0) {
+    console.warn(`plugin-compat: предупреждение — ${skippedTs} .ts файл(ов) пропущено в проверке синтаксиса (node --check не понимает TypeScript)`)
+  }
   console.log('  ✓ синтаксис: все файлы валидны')
 }
 
+// Кэш по каталогу плагина — collectJsFiles вызывается из четырёх разных
+// проверок с одним и тем же absPluginDir; без кэша npm pack --dry-run
+// запускался бы 4 раза за прогон.
+const jsFilesCache = new Map()
+
+/**
+ * Состав файлов плагина — берём из `npm pack --dry-run` (прод-форма: это
+ * ровно то, что уедет в tarball, который форж публикует и который апстрим
+ * реально ставит через pnpm add). Раньше состав вычислялся самодельным
+ * minimatch поверх package.json#files — расходился с настоящей npm-семантикой
+ * `**` (требовал разделитель там, где npm его не требует) и применял фильтр
+ * только на верхнем уровне рекурсии (в подкаталогах package.json не находился
+ * повторно, и туда утекала проверка всех файлов без фильтра). Итог: плагин с
+ * `files: ["**\/*.js"]` и запрещённым импортом в корневом index.js проходил
+ * зелёным (находка AI-ревью PR #271, мутационно доказана).
+ *
+ * `--offline --ignore-scripts`: чекер только читает состав, не должен ходить
+ * в сеть или исполнять prepack/postpack-скрипты плагина (это дело реальной
+ * сборки tarball'а в форже, не dev-гейта совместимости).
+ */
 async function collectJsFiles(dir) {
-  const files = []
-  const pkgPath = join(dir, 'package.json')
-  let pkgFiles = null
+  if (jsFilesCache.has(dir)) return jsFilesCache.get(dir)
+
+  // На Windows `npm` — это npm.cmd, а не PE-бинарник; spawnSync без shell:true
+  // падает с ENOENT (проверено локально), а вызов 'npm.cmd' напрямую без shell
+  // падает с EINVAL (известное ограничение Node на .cmd-файлах). CI-раннер —
+  // Linux, где голый 'npm' работает без shell; shell:true нужен только на
+  // win32 для локальной разработки, аргументы здесь — статические литералы,
+  // так что DEP0190 (экранирование) не риск.
+  const result = spawnSync('npm', ['pack', '--dry-run', '--json', '--offline', '--ignore-scripts'], {
+    cwd: dir,
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  })
+  if (result.status !== 0) {
+    throw new Error(`npm pack --dry-run не смог перечислить состав пакета в ${relative(repoRoot, dir)}:\n${(result.stderr || result.error?.message || '').toString()}`)
+  }
+
+  let parsed
   try {
-    const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
-    pkgFiles = pkg.files
-  } catch {
-    // package.json не читается — проверяем всё
+    parsed = JSON.parse(result.stdout)
+  } catch (error) {
+    throw new Error(`npm pack --dry-run вернул невалидный JSON в ${relative(repoRoot, dir)}: ${error.message}`)
+  }
+  const entry = parsed[0]
+  if (!entry || !Array.isArray(entry.files)) {
+    throw new Error(`npm pack --dry-run: неожиданная форма ответа в ${relative(repoRoot, dir)}`)
   }
 
-  const entries = await readdir(dir, { withFileTypes: true })
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      // Пропускаем служебные каталоги и тесты
-      if (!['node_modules', '.git', 'dist', 'build', 'test', 'tests', '__tests__'].includes(entry.name)) {
-        files.push(...await collectJsFiles(fullPath))
-      }
-    } else if (entry.name.endsWith('.js') || entry.name.endsWith('.ts') || entry.name.endsWith('.mjs')) {
-      // Если в package.json есть files — проверяем только то, что туда входит
-      if (pkgFiles && Array.isArray(pkgFiles) && pkgFiles.length > 0) {
-        const relPath = relative(dir, fullPath)
-        const included = pkgFiles.some(pattern => {
-          if (pattern.endsWith('/')) {
-            return relPath.startsWith(pattern) || relPath === pattern.slice(0, -1)
-          }
-          return relPath === pattern || minimatch(relPath, pattern)
-        })
-        if (included) files.push(fullPath)
-      } else {
-        files.push(fullPath)
-      }
-    }
-  }
+  const files = entry.files
+    .map(f => f.path)
+    .filter(p => p.endsWith('.js') || p.endsWith('.ts') || p.endsWith('.mjs'))
+    .map(p => join(dir, p))
+
+  jsFilesCache.set(dir, files)
   return files
-}
-
-function minimatch(path, pattern) {
-  // Простая реализация minimatch для базовых паттернов.
-  // Сначала экранируем ВСЕ спецсимволы regex (включая сам `\`, иначе
-  // произвольный `\` в паттерне из чужого package.json меняет смысл
-  // следующего символа в собранном regex — CodeQL js/incomplete-sanitization),
-  // и только потом раскрываем `**`/`*` обратно в свои конструкции.
-  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const regex = escaped
-    .replace(/\\\*\\\*/g, '.*')
-    .replace(/\\\*/g, '[^/]*')
-  return new RegExp(`^${regex}$`).test(path)
 }
 
 main().catch(err => {
