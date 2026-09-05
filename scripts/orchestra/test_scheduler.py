@@ -477,6 +477,7 @@ CHECK_RUNS_RED = {"check_runs": [
     {"name": "lint", "conclusion": "success"},
 ]}
 CHECK_RUNS_GREEN = {"check_runs": [{"name": "test", "conclusion": "success"}]}
+CHECK_RUNS_EMPTY = {"check_runs": []}
 
 
 def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
@@ -781,6 +782,25 @@ def test_pr_is_merge_ready_mutation_requires_both_gate_labels_and_green_checks()
         assert sch.pr_is_merge_ready(REPO, both_gates) is True
         assert sch.pr_is_merge_ready(REPO, red_checks) is False
         assert sch.pr_is_merge_ready(REPO, draft) is False
+    finally:
+        sch.gh = orig_gh
+
+
+# НАХОДКА РЕВЬЮ (#303): докстринг pr_is_merge_ready заявляет «тот же критерий
+# готовности, что merge_queue», но merge_queue на пустом списке check-run'ов
+# явно пропускает PR («проверки ещё не заведены», scheduler.py:434), а
+# pr_bad_checks на пустом списке отдаёт [] — «красных нет» — что без отдельной
+# проверки сделало бы пустые check-run'ы неотличимыми от зелёных именно здесь.
+# Докажи мутацией: убери `if not runs: return False` из pr_is_merge_ready —
+# тест ниже покраснеет (готовность станет True на пустом списке).
+def test_pr_is_merge_ready_false_on_empty_check_runs_same_as_merge_queue():
+    empty_checks = pull(5, labels=["review:ok", "ai:ok"])
+    empty_checks["mergeable_state"] = "clean"
+    fake = FakeGh({"commits/sha5/check-runs": CHECK_RUNS_EMPTY})
+    orig_gh = sch.gh
+    sch.gh = fake
+    try:
+        assert sch.pr_is_merge_ready(REPO, empty_checks) is False
     finally:
         sch.gh = orig_gh
 

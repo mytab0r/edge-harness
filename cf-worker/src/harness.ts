@@ -112,6 +112,14 @@ export interface Status {
    *  литерал-сентинел notConfiguredDetail — переименование в одном месте
    *  (config.ts) не должно требовать второй правки в app.js. См. pulseNotConfigured. */
   pulse_not_configured: boolean;
+  /** Предвычислено сервером (#303, вторая находка ревью того же PR): unhealthy
+   *  по причине «alarm подвис» — единственная ветка pulseHealthy(), где
+   *  last_pulse.detail остаётся null (dispatch ЭТОГО тика был не при чём,
+   *  просто следующий тик не пришёл). Раньше фронт в этой ветке рендерил
+   *  сырой detail и получал буквальную строку "null" — тот же класс, что и
+   *  pulse_not_configured выше, просто вторая ветка того же if/else. См.
+   *  pulseStale. */
+  pulse_stale: boolean;
 }
 
 /** Чистая функция порога — проверяется тестом отдельно от хранилища. */
@@ -280,6 +288,28 @@ export function pulseHealthy(now: number, lastPulse: PulseStatus | null): boolea
   if (!lastPulse.dispatch_ok) return false;
   if (lastPulse.run_confirmed === false) return false;
   return now - lastPulse.ts < HEARTBEAT.selfOrchestrationMs * 2;
+}
+
+/**
+ * unhealthy по причине «подвис alarm» (#303, вторая находка ревью): последний
+ * тик прошёл успешно (dispatch_ok, run_confirmed не false), но сам тик был
+ * давно — дольше 2×selfOrchestrationMs. Это ЕДИНСТВЕННАЯ ветка pulseHealthy(),
+ * где last_pulse.detail остаётся null (attemptOrchestraDispatch пишет
+ * detail: null именно на успехе) — dispatch ни при чём, просто следующий
+ * тик не пришёл. pulseDetailForRecord() здесь ничего не подменяет (это не
+ * его случай — там речь про run_confirmed именно ЭТОГО тика), поэтому фронт
+ * не может достать причину из detail и обязан получить готовый флаг, как и
+ * для pulse_not_configured. Первые два if повторяют начало pulseHealthy —
+ * умышленно: stale относится ТОЛЬКО к третьей ветке (аларм подвис), не к
+ * «возможности нет» и не к «dispatch/run сломан» — те уже несут свой
+ * человекочитаемый detail и не должны попадать в эту ветку тоже.
+ */
+export function pulseStale(now: number, lastPulse: PulseStatus | null): boolean {
+  if (lastPulse === null) return false;
+  if (pulseNotConfigured(lastPulse)) return false;
+  if (!lastPulse.dispatch_ok) return false;
+  if (lastPulse.run_confirmed === false) return false;
+  return now - lastPulse.ts >= HEARTBEAT.selfOrchestrationMs * 2;
 }
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
@@ -547,6 +577,7 @@ export class Harness extends DurableObject<Env> {
       last_pulse: lastPulse,
       pulse_healthy: pulseHealthy(now, lastPulse),
       pulse_not_configured: pulseNotConfigured(lastPulse),
+      pulse_stale: pulseStale(now, lastPulse),
     };
   }
 

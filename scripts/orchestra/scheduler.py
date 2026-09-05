@@ -373,15 +373,34 @@ def update_branch_or_report(
     return on_success
 
 
+def pr_check_runs(repo: str, pull: dict) -> list[dict]:
+    """check-run'ы текущего head — общая точка HTTP для pr_bad_checks и
+    pr_is_merge_ready (#303, находка ревью: раньше pr_is_merge_ready не мог
+    отличить «проверки ещё не заведены» от «проверки зелёные», не читая сам
+    список — вынесено сюда, чтобы обе функции читали один и тот же ответ, не
+    делая по два вызова gh() на PR)."""
+    checks = gh(f"repos/{repo}/commits/{pull['head']['sha']}/check-runs?per_page=100")
+    return checks.get("check_runs", [])
+
+
+def bad_check_names(runs: list[dict]) -> list[str]:
+    """Имена красных (не success/skipped/neutral) среди уже полученных
+    check-run'ов. Пустой список runs даёт пустой список здесь — это НЕ
+    «красных нет», а «проверки ещё не заведены»; вызывающий код обязан
+    проверять пустоту runs отдельно (см. pr_is_merge_ready)."""
+    return [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+
+
 def pr_bad_checks(repo: str, pull: dict) -> list[str]:
     """Имена красных (не success/skipped/neutral) check-run'ов текущего head.
     Один и тот же критерий «красного обязательного чека», что и внутри
     merge_queue (гейт слияния) — но отдельный вызов: unhealthy_pulls (#196,
     поведение 2) читает состояние ДО очереди слияния и по другому набору PR
-    (у задачи может быть несколько PR), переиспользовать один HTTP-ответ негде."""
-    checks = gh(f"repos/{repo}/commits/{pull['head']['sha']}/check-runs?per_page=100")
-    runs = checks.get("check_runs", [])
-    return [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+    (у задачи может быть несколько PR), переиспользовать один HTTP-ответ негде.
+    Пустой список check-run'ов здесь намеренно трактуется как «красных нет»
+    (PR ещё не нездоров, просто рано судить) — в отличие от pr_is_merge_ready,
+    где пустой список обязан значить «не готов» (см. bad_check_names)."""
+    return bad_check_names(pr_check_runs(repo, pull))
 
 
 def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
@@ -940,15 +959,22 @@ def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
 def pr_is_merge_ready(repo: str, pull: dict) -> bool:
     """Тот же критерий готовности, что merge_queue проверяет перед PUT /merge
     (одно место правды по смыслу — сериализация решения дублирует условие,
-    не значение): черновик и неподходящий mergeable_state исключены, красные
-    проверки исключены, обе метки-гейта обязаны стоять. `pull` обязан уже
-    нести mergeable_state (в списке open_pulls его нет — вызывающий код читает
-    одиночный PR, как и merge_queue)."""
+    не значение): черновик и неподходящий mergeable_state исключены, ПУСТОЙ
+    список check-run'ов исключён явно (#303, находка ревью: pr_bad_checks на
+    пустом списке отдаёт [] — «красных нет» — но merge_queue в этом же месте
+    (пункт «проверки ещё не заведены») не считает такой PR готовым; без
+    отдельной проверки здесь докстринг расходился с кодом на этом самом
+    случае), красные проверки исключены, обе метки-гейта обязаны стоять.
+    `pull` обязан уже нести mergeable_state (в списке open_pulls его нет —
+    вызывающий код читает одиночный PR, как и merge_queue)."""
     if pull.get("draft"):
         return False
     if pull.get("mergeable_state") not in ("clean", "unstable", "has_hooks"):
         return False
-    if pr_bad_checks(repo, pull):
+    runs = pr_check_runs(repo, pull)
+    if not runs:
+        return False
+    if bad_check_names(runs):
         return False
     labels = {label["name"] for label in pull["labels"]}
     return review_labels.merge_label_gate(labels) is None

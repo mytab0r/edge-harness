@@ -21,6 +21,7 @@ window.EDGE_I18N = {
     "queue.warn": "задачи: {failed} упало",
     "watchdog.stale": "⚠️ задача висит в dispatched без рук: {count} шт, старше {minutes} мин",
     "pulse.unhealthy": "⚠️ пульс оркестрации не бьётся: {detail} ({minutes} мин назад)",
+    "pulse.stale": "⚠️ пульс оркестрации не бьётся: тик давно не обновлялся ({minutes} мин назад)",
     "pulse.not_configured": "пульс оркестрации не настроен (нет GH_DISPATCH_TOKEN/GH_REPO)",
     "conn.connecting": "соединение…",
     "conn.ok": "живой поток: подключено",

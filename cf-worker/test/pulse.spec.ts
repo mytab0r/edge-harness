@@ -7,6 +7,7 @@ import {
   pulseDetailForRecord,
   pulseHealthy,
   pulseNotConfigured,
+  pulseStale,
 } from "../src/harness";
 import { HEARTBEAT } from "../src/config";
 
@@ -205,6 +206,47 @@ describe("пульс оркестрации: pulseHealthy — здоров ли 
   });
 });
 
+// НАХОДКА РЕВЬЮ (#303, вторая находка того же PR): pulseHealthy() гасит бейдж по
+// ДВУМ разным причинам — «dispatch/run сломан» (detail всегда человекочитаемый,
+// см. pulseDetailForRecord) и «подвис alarm» (detail остаётся null, потому что
+// dispatch ЭТОГО тика был успешен). pulseStale выделяет вторую причину отдельным
+// флагом — фронт обязан различать их ДО того, как решит, можно ли подставлять
+// detail в бейдж. Докажи мутацией: замени `>=` на `>` (или вовсе `return false`)
+// в pulseStale — тест «alarm подвис ровно на пороге — stale» покраснеет либо
+// граничный тест перестанет ловить регресс.
+describe("пульс оркестрации: pulseStale — unhealthy из-за подвисшего alarm, не из-за dispatch/run (issue #303)", () => {
+  const FRESH_MS = HEARTBEAT.selfOrchestrationMs * 2 - 1;
+  const STALE_MS = HEARTBEAT.selfOrchestrationMs * 2;
+
+  it("ни разу не тикал (холодный старт) — не stale", () => {
+    expect(pulseStale(NOW, null)).toBe(false);
+  });
+
+  it("возможности нет (секреты не заданы) — не stale, это другая причина", () => {
+    expect(
+      pulseStale(NOW, { ts: NOW - STALE_MS, dispatch_ok: false, detail: "not_configured", run_confirmed: null }),
+    ).toBe(false);
+  });
+
+  it("dispatch провалился — не stale, причина уже в detail (dispatch/run, не alarm)", () => {
+    expect(
+      pulseStale(NOW, { ts: NOW - STALE_MS, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null }),
+    ).toBe(false);
+  });
+
+  it("run НЕ подтверждён — не stale, причина уже в detail (через pulseDetailForRecord)", () => {
+    expect(pulseStale(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null, run_confirmed: false })).toBe(false);
+  });
+
+  it("dispatch удался и свежий — не stale", () => {
+    expect(pulseStale(NOW, { ts: NOW - FRESH_MS, dispatch_ok: true, detail: null, run_confirmed: true })).toBe(false);
+  });
+
+  it("dispatch удался, но давно (alarm подвис) — stale, detail в хранилище честно null", () => {
+    expect(pulseStale(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null, run_confirmed: true })).toBe(true);
+  });
+});
+
 // НАХОДКА РЕВЬЮ (#303): главный сценарий этого фикса — dispatch ЭТОГО тика принят
 // (attemptOrchestraDispatch честно отдаёт detail: null, причины нет), но
 // run_confirmed о ПРЕДЫДУЩЕМ dispatch'е — false. Без подмены detail это null
@@ -246,7 +288,18 @@ function renderPulseUnhealthy(params: Record<string, unknown>): string {
   return PULSE_UNHEALTHY_TEMPLATE.replace(/\{(\w+)\}/g, (_, k) => (k in params ? String(params[k]) : `{${k}}`));
 }
 
-describe("бейдж пульса: отрендеренный текст не содержит null (issue #303, находка ревью)", () => {
+// Прод-текст второй ветки бейджа (i18n/ru.js: "pulse.stale") — «подвис alarm»,
+// та самая ветка, где last_pulse.detail остаётся null (см. pulseStale в
+// src/harness.ts). Шаблон без {detail}: это ровно фикс находки ревью — фронт
+// не подставляет сюда сырой (потенциально null) detail вообще, текст
+// самодостаточен и параметризован только {minutes}. Паритет со строкой в
+// ru.js охраняет scripts/check-frontend-contract.mjs (пункт 6).
+const PULSE_STALE_TEMPLATE = "⚠️ пульс оркестрации не бьётся: тик давно не обновлялся ({minutes} мин назад)";
+function renderPulseStale(params: Record<string, unknown>): string {
+  return PULSE_STALE_TEMPLATE.replace(/\{(\w+)\}/g, (_, k) => (k in params ? String(params[k]) : `{${k}}`));
+}
+
+describe("бейдж пульса: ветка 'dispatch/run сломан' не содержит null (issue #303, находка ревью)", () => {
   it("главный сценарий — dispatch принят, run не подтверждён: detail из pulseDetailForRecord, бейдж без 'null'", () => {
     const detail = pulseDetailForRecord({ ok: true, detail: null }, false);
     const rendered = renderPulseUnhealthy({ detail, minutes: 5 });
@@ -259,6 +312,29 @@ describe("бейдж пульса: отрендеренный текст не с
     // если бы detail остался null (как отдаёт attemptOrchestraDispatch при ok:true),
     // бейдж показывал бы буквальное "null" — ровно находка ревью.
     const rendered = renderPulseUnhealthy({ detail: null, minutes: 5 });
+    expect(rendered).toContain("null");
+  });
+});
+
+// НАХОДКА РЕВЬЮ (#303, вторая находка того же PR): гвардия выше покрывала только
+// ветку «dispatch/run сломан» — вторая ветка unhealthy («подвис alarm», где
+// last_pulse.detail остаётся честным null уже в хранилище, см. pulseStale)
+// оставалась незамеченной: старый app.js подставлял туда тот же сырой detail
+// и рендерил буквальную строку "null". Докажи мутацией: в app.js убери ветку
+// `else if (status.pulse_stale) { … }` (оставь только `!status.pulse_healthy`
+// с сырым detail) — «сырой null (stale, без фикса)» ниже иллюстрирует ровно
+// то, что стало бы видно пользователю.
+describe("бейдж пульса: ветка 'подвис alarm' (stale) не содержит null (issue #303, вторая находка ревью)", () => {
+  it("stale-ветка: свой самодостаточный текст, detail вообще не участвует — бейдж без 'null'", () => {
+    const rendered = renderPulseStale({ minutes: 35 });
+    expect(rendered).not.toContain("null");
+    expect(rendered).toBe("⚠️ пульс оркестрации не бьётся: тик давно не обновлялся (35 мин назад)");
+  });
+
+  it("сырой null (stale, без фикса) — контрольный пример: если бы stale-ветка рендерила pulse.unhealthy с detail из хранилища, бейдж содержал бы 'null'", () => {
+    // last_pulse.detail в stale-сценарии — честный null (dispatch этого тика
+    // был успешен, alarm просто давно не тикал) — см. описание pulseStale.
+    const rendered = renderPulseUnhealthy({ detail: null, minutes: 35 });
     expect(rendered).toContain("null");
   });
 });

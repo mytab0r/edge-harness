@@ -173,9 +173,22 @@ function renderStatus(status) {
   // pulse_not_configured — предвычислено сервером (#303, находка ревью):
   // фронт не сравнивает last_pulse.detail с сентинел-литералом сам, поэтому
   // переименование сентинела в config.ts не может молча сломать эту ветку.
+  //
+  // pulse_stale — вторая ветка того же класса (#303, вторая находка ревью
+  // того же PR): «подвис alarm» — единственный случай unhealthy, где
+  // last_pulse.detail остаётся null (dispatch ЭТОГО тика был успешен, просто
+  // следующий тик не пришёл). Проверка ДО `!status.pulse_healthy` намеренно:
+  // без неё фронт подставлял бы сырой detail и рендерил буквальную строку
+  // "null" — ровно та ошибка, что уже чинили для pulse_not_configured, просто
+  // во второй ветке. См. pulseStale в src/harness.ts.
   if (status.pulse_not_configured) {
     $("pulse").textContent = t("pulse.not_configured");
     $("pulse").className = "badge warn";
+    $("pulse").hidden = false;
+  } else if (status.pulse_stale) {
+    const minutes = Math.round((status.now - status.last_pulse.ts) / 60000);
+    $("pulse").textContent = t("pulse.stale", { minutes });
+    $("pulse").className = "badge bad";
     $("pulse").hidden = false;
   } else if (!status.pulse_healthy) {
     const minutes = Math.round((status.now - status.last_pulse.ts) / 60000);

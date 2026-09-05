@@ -377,6 +377,7 @@ describe("пульс оркестрации: alarm() всегда перезак
       last_pulse: { dispatch_ok: boolean; detail: string | null } | null;
       pulse_healthy: boolean;
       pulse_not_configured: boolean;
+      pulse_stale: boolean;
     }>("/api/status");
     expect(status.last_pulse).toMatchObject({ dispatch_ok: false, detail: "not_configured" });
     expect(status.pulse_healthy).toBe(true);
@@ -384,6 +385,9 @@ describe("пульс оркестрации: alarm() всегда перезак
     // сам — сервер отдаёт готовый флаг, чтобы переименование сентинела в
     // config.ts не могло молча сломать бейдж app.js.
     expect(status.pulse_not_configured).toBe(true);
+    // #303, вторая находка ревью того же PR: «возможности нет» — не «подвис
+    // alarm», это разные ветки бейджа с разными причинами (см. pulseStale).
+    expect(status.pulse_stale).toBe(false);
   });
 });
 
