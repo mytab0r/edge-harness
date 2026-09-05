@@ -113,6 +113,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_upstream_drift.py -q
 
+      # Сигнал ослабления защиты main событием branch_protection_rule (#370,
+      # #341): инвариант 6 не может опрашивать protection (GET требует
+      # administration, которого нет у GITHUB_TOKEN) — сигнал приходит вместе
+      # с самим фактом изменения через payload события, читать API не нужно.
+      # Прод-форма фикстур — вербатим примеры payload'ов GitHub (octokit/webhooks),
+      # проводка на моке pulse_guard.gh: согласованное состояние — ноль мутаций.
+      - name: Тесты сигнала ослабления защиты main (#370)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
+
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
       # обоими зелёными вердиктами или уже в конфликте, не всех открытых
