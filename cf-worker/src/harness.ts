@@ -1290,20 +1290,30 @@ export class Harness extends DurableObject<Env> {
   /** Классификация сообщения: директива, чат, правка доков, неразобранное. */
   #classifyMessage(text: string): { kind: string; priority: number } {
     const trimmed = text.trim();
-    // Директивы: начинаются с / или !, или содержат ключевые слова действия
-    const directivePatterns = [
-      /^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\b/i,
-      /^(создай|добавь|исправь|проверь|проанализируй|исследуй|напиши|обнови)\b/i,
+    // Граница слова: \b в JS — ASCII-граница и после кириллицы не возникает
+    // никогда, русские директивы молча уезжали в raw (ревью head ffd6bfe).
+    // «Далее не буква и не цифра», флаг u — для \p{...}.
+    const wordEnd = "(?![\\p{L}\\p{N}])";
+    // Явные префиксы — сильнейший сигнал, проверяются первыми.
+    const explicitDirective = [
+      new RegExp(`^[\\/!]\\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)${wordEnd}`, "iu"),
       /^\[TASK\]/i,
       /^#\d+\s/,
     ];
-    for (const pattern of directivePatterns) {
+    for (const pattern of explicitDirective) {
       if (pattern.test(trimmed)) return { kind: "directive", priority: 10 };
     }
-    // Правки доков: явные ссылки на файлы docs/ или openspec/
+    // Правки доков — раньше глагольных директив: «обнови docs/INDEX.md» это
+    // правка дока, а не абстрактная директива (пересечение классов, ревью ffd6bfe).
     if (/(docs\/|openspec\/|\.md\s|в\sдоке|в\sспеке|обнови\sдок)/i.test(trimmed)) {
       return { kind: "doc_edit", priority: 5 };
     }
+    // Глагольные директивы без префикса — с той же не-ASCII границей слова.
+    const verbDirective = new RegExp(
+      `^(создай|добавь|исправь|проверь|проанализируй|исследуй|напиши|обнови)${wordEnd}`,
+      "iu",
+    );
+    if (verbDirective.test(trimmed)) return { kind: "directive", priority: 10 };
     // Чат/обсуждение: вопросы, комментарии без явного действия
     // Используем (^|\s) и (\s|[?,.!]|$) вместо \b для поддержки кириллицы
     if (/^[\?\¿]|(^|\s)(как|почему|что\sдумаешь|мнение|вопрос)(\s|[?,.!]|$)/i.test(trimmed)) {
@@ -1315,7 +1325,9 @@ export class Harness extends DurableObject<Env> {
   }
 
   /** Группировка сообщений: серия от того же отправителя в том же чате в пределах
-   *  окна — цепочка (grouped_with), чтобы триаж видел серию, а не россыпь. */
+   *  окна — цепочка (grouped_with → предыдущее сообщение серии), чтобы триаж
+   *  видел нить разговора и мог пройти её назад. Якорь строго раньше по id:
+   *  пришедшие позже сообщения не тянут ранние в «звезду» вокруг себя. */
   #groupMessages(messageId: number): number | null {
     const msg = this.#rows(this.#sql.exec("SELECT sender_id, chat_id, ts FROM messages WHERE id = ?", messageId))[0];
     if (!msg) return null;
@@ -1325,8 +1337,8 @@ export class Harness extends DurableObject<Env> {
     const windowAgo = ts - MESSAGE_GROUP_WINDOW_MS;
     const recent = this.#rows(this.#sql.exec(
       `SELECT id FROM messages
-       WHERE sender_id = ? AND chat_id = ? AND ts > ? AND id != ? AND status != 'ignored'
-       ORDER BY ts DESC LIMIT 1`,
+       WHERE sender_id = ? AND chat_id = ? AND ts > ? AND id < ?
+       ORDER BY id DESC LIMIT 1`,
       senderId, chatId, windowAgo, messageId
     ));
     if (recent.length > 0) {

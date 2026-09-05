@@ -866,6 +866,66 @@ describe("inbox: сообщения владельца", () => {
     expect(docMsg.message.priority).toBe(5);
   });
 
+  it("классификация: русские директивы без префикса — directive (гвардия не-ASCII границы слова, ревью ffd6bfe)", async () => {
+    const s = sender();
+    const make = async (id: string, text: string) =>
+      (
+        await postJson("/api/messages", {
+          source: "test-classify",
+          source_msg_id: id,
+          sender_id: s,
+          text,
+        })
+      ).json<{ message_id: number }>();
+    // До фикса «\b после кириллицы не возникает» все эти тексты молча
+    // уезжали в raw → ignored, минуя issue-след.
+    const fix = await make(`ru-verb-${s}`, "исправь баг в инбоксе");
+    const check = await make(`ru-verb2-${s}`, "проверь, почему пульс молчит");
+    const prefixed = await make(`ru-prefix-${s}`, "/задача проверь инбокс владельца");
+
+    await postJson("/api/messages/process", { limit: 200 });
+    for (const [name, created] of [
+      ["исправь", fix],
+      ["проверь", check],
+      ["/задача", prefixed],
+    ] as const) {
+      const msg = await getJson<{ message: { kind: string; priority: number; status: string } }>(
+        `/api/messages/${created.message_id}`,
+      );
+      expect(msg.message.kind, name).toBe("directive");
+      expect(msg.message.priority, name).toBe(10);
+      // Токена нет — директива живёт в очереди с честным retry, не в ignored.
+      expect(msg.message.status, name).toBe("new");
+    }
+  });
+
+  it("группировка: серия из трёх сообщений одного отправителя в пределах окна — цепочка grouped_with (сценарий дельта-спеки)", async () => {
+    const s = sender();
+    const chat = `group-chat-${Date.now()}`;
+    const make = async (i: number) =>
+      (
+        await postJson("/api/messages", {
+          source: "telegram",
+          source_msg_id: `group-${s}-${i}`,
+          chat_id: chat,
+          sender_id: s,
+          text: `сообщение серии ${i}`,
+        })
+      ).json<{ message_id: number }>();
+    const first = await make(1);
+    const second = await make(2);
+    const third = await make(3);
+
+    await postJson("/api/messages/process", { limit: 200 });
+
+    const got = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${first.message_id}`);
+    expect(got.message.grouped_with).toBeNull(); // начало серии
+    const got2 = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${second.message_id}`);
+    expect(got2.message.grouped_with).toBe(first.message_id);
+    const got3 = await getJson<{ message: { grouped_with: number | null } }>(`/api/messages/${third.message_id}`);
+    expect(got3.message.grouped_with).toBe(second.message_id);
+  });
+
   it("статус включает счётчики сообщений", async () => {
     const s = sender();
     const before = await getJson<{ messages: Record<string, number> }>("/api/status");
