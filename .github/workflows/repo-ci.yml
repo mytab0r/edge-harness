@@ -58,6 +58,14 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_dispatch_tail.py -q
 
+      # Замер факта rows_read Durable Objects (задача #320): арифметика суточного
+      # итога, разбор GraphQL introspection, выбор формы запроса по факту схемы —
+      # кормится прод-формой ответов Cloudflare, сеть не трогаем.
+      - name: Тесты замера rows_read
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_do_rows_read.py -q
+
       # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
       # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
       - name: Тесты предохранителя конвейера orchestra

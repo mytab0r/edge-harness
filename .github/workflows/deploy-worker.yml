@@ -12,9 +12,39 @@ on:
       - "cf-worker/**"
       - ".github/workflows/deploy-worker.yml"
   workflow_dispatch:
+    inputs:
+      measure_rows_read_days:
+        description: >-
+          Задача #320: если задано (число суток), вместо деплоя запускает
+          разовый замер rows_read Durable Objects (scripts/measure/do_rows_read.py)
+          и ничего не деплоит. Пусто — обычный ручной деплой.
+        required: false
+        default: ""
 
 jobs:
+  # Задача #320: разовый диагностический прогон в существующем workflow — здесь
+  # уже прокинуты CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, а новый workflow-файл
+  # не дал бы себя задиспатчить до мержа в main (workflow_dispatch виден GitHub
+  # только для файлов, уже существующих на default branch). Job независим от
+  # deploy, деплойные шаги не трогает.
+  measure-rows-read:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.measure_rows_read_days != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Замер rows_read (#320)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python scripts/measure/do_rows_read.py --days "${{ github.event.inputs.measure_rows_read_days }}"
+
   deploy:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.measure_rows_read_days == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
