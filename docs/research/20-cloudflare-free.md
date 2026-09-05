@@ -73,6 +73,73 @@ rows_read (то есть практически любой `SELECT`, включ�
 сброса счётчика в 00:00 UTC. Точный текст/код исключения на стороне workerd
 не проверен на живом отказе — см. «Что не подтверждено» ниже.
 
+### Замер факта: rows_read в проде (2026-09-05, задача #320)
+
+Письмо Cloudflare от 2026-09-03 сообщило об исчерпании квоты rows_read; по коду
+нашлась причина (`#status()` в `cf-worker/src/harness.ts` делает два полных
+скана таблицы `tasks` на каждый heartbeat, раз в 20 с), но числа не было —
+оценка «десятки-сотни тысяч на job» ничем не подтверждалась. Инструмент
+`scripts/measure/do_rows_read.py` снял факт через Cloudflare GraphQL Analytics
+API **до мержа фикса** (индекс + кэш агрегата, PR #321 на момент замера ещё
+открыт) — это база для сравнения «было / стало».
+
+**Датасет — не угадан, а найден интроспекцией живой схемы.** Официальная
+страница метрик DO называет 4 датасета-кандидата и отсылает к самостоятельной
+интроспекции, не называя точное поле. Скрипт идёт по схеме от корня
+(`Query.viewer.accounts.<датасет>`) и берёт первый, где объект `sum` реально
+содержит `rowsRead`: это `durableObjectsPeriodicGroups`, не
+`durableObjectsStorageGroups` (то же имя фигурирует в неофициальном источнике,
+но при живой проверке `sum` этого датасета `rowsRead` не содержит).
+`durableObjectsPeriodicGroups.filter` поддерживает диапазон (`date_geq`/
+`date_leq`), а `dimensions` — и `date`, и `datetimeHour` одновременно, поэтому
+неделя снимается одним запросом с почасовой группировкой внутри.
+
+Находка на пути: живая схема Cloudflare нарушает спецификацию GraphQL
+introspection — у обёрточных типов (`NON_NULL`/`LIST`) поле `name` приходит
+как пустая строка `""`, а не `null`. Разворот типа, писаный по спецификации
+(«останавливаться, когда `name is None`»), с этим падал; исправлено на
+«falsy» (`None` ИЛИ `""`). Второй нюанс: `[X!]!` — это три уровня `ofType` до
+именованного типа, не два, как выглядело бы по типичным примерам в доках.
+
+Прогон: `deploy-worker.yml`, job `measure-rows-read` (workflow_dispatch,
+секреты общие с деплоем), запуск на ветке задачи до мержа —
+[run 33975023605](https://github.com/mytab0r/edge-harness/actions/runs/33975023605).
+
+| Дата (UTC) | rows_read | % от лимита 5 000 000 | Пиковый час (rows_read) | rows_written |
+|---|---|---|---|---|
+| 2026-08-30 | 65 323 | 1.3 % | 15:00 (21 473) | 7 114 |
+| 2026-08-31 | 1 406 775 | 28.1 % | 17:00 (398 829) | 17 584 |
+| 2026-09-01 | 2 697 129 | 53.9 % | 23:00 (1 155 414) | 24 773 |
+| 2026-09-02 | 1 547 850 | 31.0 % | 23:00 (888 338) | 8 106 |
+| **2026-09-03** | **5 264 205** | **105.3 %** | 21:00 (678 075) | 81 578 |
+| 2026-09-04 | 882 708 | 17.7 % | 19:00 (244 065) | 11 417 |
+| 2026-09-05 (частично) | 1 346 393 | 26.9 % | 05:00 (496 129) | 13 811 |
+
+**Подтверждает день инцидента напрямую:** 2026-09-03 — единственный день
+недели, где факт (105.3 %) превысил лимит, и это ровно дата письма Cloudflare
+в #320. Разбивка по `namespaceId` за неделю: один namespace —
+`a59c9e7e4ef541878ab82100923cf4e4` — даёт 13 125 347 rows_read из
+~13 210 383 суммарных (>99 %), второй — 85 036, третий — 0. Практически весь
+расход идёт через одну DO-неймспейс (харнес), что согласуется с гипотезой
+кода, а не с чем-то внешним.
+
+**Порядок величины подтверждает гипотезу #status(), не опровергает.** Пиковый
+час 2026-09-03 21:00 — 678 075 rows_read; при heartbeat раз в 20 с это 180
+вызовов/час → ≈3 767 rows_read на один heartbeat (оба скана `#status()`
+вместе), то есть таблица `tasks` в тот момент — порядка 1,5–2 тысяч строк на
+скан. Один job с несколькими десятками heartbeat'ов (типичная длительность
+задачи в этом харнесе — минуты) даёт **десятки-сотни тысяч rows_read за
+job** — оценка из #320 была верна по порядку величины, теперь подтверждена
+числом, а не предположением. Часовой пик сам по себе исчерпал бы суточную
+квоту за ~7.4 часа (5 000 000 / 678 075), если бы держался весь день —
+поэтому реальный пробой квоты (105.3 % за сутки) требует не одного пикового
+часа, а устойчиво растущего профиля по мере роста нератенированной таблицы
+`tasks` (рост изо дня в день 08-30 → 09-03 в таблице выше это подтверждает).
+
+**После мержа фикса (#321) замер стоит повторить тем же инструментом** —
+`python scripts/measure/do_rows_read.py --days 7` через тот же
+workflow_dispatch, и сравнить с этой базой.
+
 ### Ловушка: доки противоречат сами себе про storage на объект
 
 Таблица лимитов даёт строку «Storage per Durable Object | 10 GB» **без разделения планов**. FAQ на том же сайте пишет дословно: *«When a SQLite-backed Durable Object reaches its maximum storage limit (10 GB on Workers Paid, or 1 GB on the Free plan)»*.
@@ -383,6 +450,8 @@ env через инсталл-цикл. Нюансы: значения коэр�
 - [Workers — Runtime APIs: WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 - [Workers — Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/) — стабы `node:child_process`
 - [Workers — Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+- [Durable Objects — Metrics and analytics](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/) — 4 датасета-кандидата GraphQL, отсылка к интроспекции; проверено 2026-09-05, использовано для замера rows_read (задача #320, `scripts/measure/do_rows_read.py`)
+- [Analytics GraphQL API — Introspection](https://developers.cloudflare.com/analytics/graphql-api/features/discovery/introspection/) — механизм интроспекции; проверено 2026-09-05
 - [Workflows — Limits](https://developers.cloudflare.com/workflows/reference/limits/)
 - [Dynamic Workers (Worker Loaders)](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader/)
 - [Sandbox SDK](https://developers.cloudflare.com/sandbox/)
