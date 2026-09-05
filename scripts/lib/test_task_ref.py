@@ -150,3 +150,96 @@ def test_two_prs_declaring_same_task_still_conflict():
     pr_b = "#42\n\nВторая попытка, другая ветка.\n"
     declared = task_ref.declared_tasks(pr_a)[0]
     assert task_ref.declares_task(pr_b, declared) is True
+
+
+# ── Резолвер «PR → задача» (#259) — прод-форма реальных PR этого репозитория ──
+#
+# Живой замер, который и породил задачу: ai_review.py:353 брал ЛЮБОЕ #N из
+# прозы тела, сортировал по возрастанию и судил PR по первому попавшемуся
+# открытому issue с меткой task — #253 судили по #120 (упомянут в прозе,
+# «issue #120 + Telegram»), хотя ветка и первая строка тела объявляют #227.
+
+_PR_253_BODY = (
+    "#227\n\n"
+    "## Что сделано\n\n"
+    "Стадия приёмки: слитый PR больше не оставляет задачу висеть с "
+    "комментарием-напоминанием «исполнителю», которого к тому моменту уже "
+    "нет (job воркера завершился).\n\n"
+    "3. Три исхода, ни один не тихий: … проверка улики сама сломана "
+    "(сеть/секрет/API — не «улики нет», а «возможность сломана») → "
+    "эскалация владельцу (issue #120 + Telegram), задача не тронута.\n\n"
+    "Прод-форма: фикстуры — реальные тела/списки файлов/check-runs PR #138, "
+    "#177, #163 и реальные записи задач #18, #21, #78.\n"
+)
+
+_PR_253_PULL = {
+    "number": 253,
+    "head": {"ref": "agent/227-acceptance-stage-after-merge"},
+    "body": _PR_253_BODY,
+}
+
+# Тело dependabot-PR #282: в тексте много #N (номера чужих PR из changelog
+# pnpm/action-setup — #175, #186, #283…), ветка не agent/, декларации нет —
+# задачи нет вовсе, это ожидаемый, а не ошибочный ответ.
+_PR_282_PULL = {
+    "number": 282,
+    "head": {"ref": "dependabot/github_actions/pnpm/action-setup-6"},
+    "body": (
+        "Bumps pnpm/action-setup from 4 to 6.\n\n"
+        "- fix: update pnpm to v11.19.0 (#283)\n"
+        "- docs: Update README (#273)\n"
+        "- Additional commits viewable in compare view (#175, #186, #199)\n"
+    ),
+}
+
+
+def test_resolve_pr_task_prefers_branch_over_prose_mention():
+    # Живой случай #253: ветка/декларация #227, в прозе #120 — резолвер
+    # обязан вернуть 227, не 120 (класс #259, второй экземпляр #187/#195:
+    # первое попавшееся число в тексте вместо реального источника).
+    assert task_ref.resolve_pr_task(_PR_253_PULL) == 227
+
+
+def test_resolve_pr_task_bot_pr_has_no_task():
+    # dependabot: ветка не agent/, декларации нет — «задачи нет», не 283/273.
+    assert task_ref.resolve_pr_task(_PR_282_PULL) is None
+
+
+def test_resolve_pr_task_falls_back_to_declared_without_agent_branch():
+    # Ручной PR без agent-ветки — декларация первой строкой остаётся рабочим
+    # источником (в отличие от прозы).
+    pull = {"head": {"ref": "fix/typo"}, "body": "#42\n\nОпечатка в доке."}
+    assert task_ref.resolve_pr_task(pull) == 42
+
+
+def test_resolve_pr_task_uses_closing_issue_when_no_branch_or_declaration():
+    # Источник (б) — формальная связь GitHub, передаётся вызывающим кодом
+    # (GraphQL closingIssuesReferences, недоступен из task_ref.py напрямую —
+    # резолвер обязан оставаться чистым, без сети).
+    pull = {"head": {"ref": "fix/typo"}, "body": "Опечатка, без декларации."}
+    assert task_ref.resolve_pr_task(pull, closing_issue=99) == 99
+    assert task_ref.resolve_pr_task(pull) is None
+
+
+def test_resolve_pr_task_branch_wins_over_closing_issue():
+    # Иерархия строгая: ветка (а) надёжнее формальной связи (б).
+    assert task_ref.resolve_pr_task(_PR_253_PULL, closing_issue=999) == 227
+
+
+def test_task_from_branch_matches_agent_convention_only():
+    assert task_ref.task_from_branch("agent/227-acceptance-stage-after-merge") == 227
+    assert task_ref.task_from_branch("agent/259-pr-task-resolver") == 259
+    assert task_ref.task_from_branch("dependabot/github_actions/foo-1") is None
+    assert task_ref.task_from_branch("fix/typo") is None
+    assert task_ref.task_from_branch("") is None
+
+
+# Мутация, которой доказан resolve_pr_task (#259, воспроизведена буквально
+# при разработке — вывод до/после в отчёте PR): временно замени тело функции
+# на `refs = sorted(set(extract_task_refs(pull.get("body") or ""))); return
+# refs[0] if refs else None` (старая широкая семантика ai_review.py:353) —
+# extract_task_refs(_PR_253_BODY) отдаёт {18, 21, 78, 120, 138, 163, 177,
+# 227}, наименьший 18 — test_resolve_pr_task_prefers_branch_over_prose_mention
+# краснеет с `AssertionError: assert 18 == 227`, и ещё три теста резолвера
+# падают вместе с ним (bot PR получает 175 вместо None, closing_issue
+# перестаёт быть источником). Верни иерархию источников — все снова зелёные.
