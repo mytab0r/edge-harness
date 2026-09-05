@@ -25,10 +25,10 @@ section "Последний деплой edge-harness (/workers/scripts/edge-har
 cf_get "/accounts/${acc}/workers/scripts/edge-harness/deployments"
 
 section "Bindings edge-harness — только имена, не значения (/workers/scripts/edge-harness/settings)"
-cf_get "/accounts/${acc}/workers/scripts/edge-harness/settings"
+cf_bindings_names "/accounts/${acc}/workers/scripts/edge-harness/settings"
 
 section "Bindings dsh-edge — только имена, не значения (/workers/scripts/dsh-edge/settings)"
-cf_get "/accounts/${acc}/workers/scripts/dsh-edge/settings"
+cf_bindings_names "/accounts/${acc}/workers/scripts/dsh-edge/settings"
 
 section "Поддомен workers.dev (/workers/subdomain)"
 cf_get "/accounts/${acc}/workers/subdomain"
@@ -45,7 +45,7 @@ cf_count_only "/accounts/${acc}/d1/database"
 section "R2 buckets — этот проект их не использует, только счётчик аккаунта"
 cf_count_only "/accounts/${acc}/r2/buckets"
 
-section "Зоны/домены — только счётчик (домены других проектов не публикуем); issue #289 остаётся открытым вопросом"
+section "Зоны/домены — только счётчик (домены других проектов не публикуем); 0 зон закрывает issue #289, см. docs/research/20-cloudflare-free.md"
 cf_count_only "/zones"
 
 section "Расход по квотам"
