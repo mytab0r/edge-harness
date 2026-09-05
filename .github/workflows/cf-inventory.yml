@@ -5,8 +5,6 @@ name: cf-inventory
 
 on:
   workflow_dispatch:
-  push:
-    branches: [agent/322-cf-infra-toolkit]  # временно, для прогона доказательства (issue #322), уберётся до мерджа
 
 jobs:
   inventory:
