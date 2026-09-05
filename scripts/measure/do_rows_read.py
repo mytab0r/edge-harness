@@ -180,11 +180,12 @@ def graphql(token: str, query: str, variables: dict) -> dict:
     return payload["data"]
 
 
-def introspect(token: str, type_name: str) -> dict:
+def introspect(token: str, type_name: str, step: str = "") -> dict:
     data = graphql(token, INTROSPECT_TYPE_QUERY, {"name": type_name})
     t = data["__type"]
     if t is None:
-        raise RuntimeError(f"тип {type_name!r} не найден в живой схеме Cloudflare GraphQL API")
+        where = f" (шаг: {step})" if step else ""
+        raise RuntimeError(f"тип {type_name!r} не найден в живой схеме Cloudflare GraphQL API{where}")
     return t
 
 
@@ -194,13 +195,18 @@ def discover_dataset(token: str) -> dict:
     основного запроса — без единой догадки об именах полей."""
     root = graphql(token, SCHEMA_ROOT_QUERY, {})
     query_type_name = root["__schema"]["queryType"]["name"]
+    print(f"[introspection] queryType = {query_type_name!r}")
 
-    query_type = introspect(token, query_type_name)
-    viewer_type_name = unwrap_type_name(find_field(query_type, "viewer")["type"])
+    query_type = introspect(token, query_type_name, step="Query.viewer")
+    viewer_field = find_field(query_type, "viewer")
+    viewer_type_name = unwrap_type_name(viewer_field["type"])
+    print(f"[introspection] viewer field type = {viewer_type_name!r} (raw: {viewer_field['type']})")
 
-    viewer_type = introspect(token, viewer_type_name)
-    accounts_type_name = unwrap_type_name(find_field(viewer_type, "accounts")["type"])
-    accounts_type = introspect(token, accounts_type_name)
+    viewer_type = introspect(token, viewer_type_name, step="Viewer.accounts")
+    accounts_field = find_field(viewer_type, "accounts")
+    accounts_type_name = unwrap_type_name(accounts_field["type"])
+    print(f"[introspection] accounts field type = {accounts_type_name!r} (raw: {accounts_field['type']})")
+    accounts_type = introspect(token, accounts_type_name, step="Accounts.<dataset>")
 
     tried: dict[str, str] = {}
     for dataset in CANDIDATE_DATASETS:
@@ -210,25 +216,29 @@ def discover_dataset(token: str) -> dict:
             tried[dataset] = str(error)
             continue
         ds_type_name = unwrap_type_name(ds_field["type"])
-        ds_type = introspect(token, ds_type_name)
+        print(f"[introspection] {dataset} field type = {ds_type_name!r}")
+        ds_type = introspect(token, ds_type_name, step=f"{dataset}.sum/dimensions")
 
         sum_type_name = unwrap_type_name(find_field(ds_type, "sum")["type"])
-        sum_type = introspect(token, sum_type_name)
+        sum_type = introspect(token, sum_type_name, step=f"{dataset}.sum fields")
         sum_field_names = {f["name"] for f in sum_type.get("fields") or []}
+        print(f"[introspection] {dataset}.sum fields = {sorted(sum_field_names)}")
         if "rowsRead" not in sum_field_names:
             tried[dataset] = f"sum не содержит rowsRead (доступно: {sorted(sum_field_names)})"
             continue
 
         dim_type_name = unwrap_type_name(find_field(ds_type, "dimensions")["type"])
-        dim_type = introspect(token, dim_type_name)
+        dim_type = introspect(token, dim_type_name, step=f"{dataset}.dimensions fields")
         dim_field_names = {f["name"] for f in dim_type.get("fields") or []}
+        print(f"[introspection] {dataset}.dimensions fields = {sorted(dim_field_names)}")
 
         filter_arg = find_arg(ds_field, "filter")
         filter_field_names: set[str] = set()
         if filter_arg is not None:
             filter_type_name = unwrap_type_name(filter_arg["type"])
-            filter_type = introspect(token, filter_type_name)
+            filter_type = introspect(token, filter_type_name, step=f"{dataset}.filter fields")
             filter_field_names = {f["name"] for f in filter_type.get("inputFields") or []}
+            print(f"[introspection] {dataset}.filter fields = {sorted(filter_field_names)}")
 
         return {
             "dataset": dataset,
