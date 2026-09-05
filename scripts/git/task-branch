@@ -20,12 +20,12 @@ fi
 git fetch origin --prune
 
 # ls-remote идёт мимо локальных ссылок: если после fetch локальный origin/main
-# не равен серверному — сеть/прокси врут, работать на таком base нельзя.
+# не равен серверному — сеть врёт, работать на таком base нельзя.
 remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
 local_head=$(git rev-parse refs/remotes/origin/main)
 if [ "$remote_head" != "$local_head" ]; then
   echo "ОШИБКА: origin/main протух даже после fetch (локально $local_head, на сервере $remote_head)." >&2
-  echo "Разберись с сетью/прокси — протухший base не выдаю." >&2
+  echo "Разберись с сетью — протухший base не выдаю." >&2
   exit 1
 fi
 
