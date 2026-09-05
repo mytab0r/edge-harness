@@ -59,6 +59,19 @@ curl() {
         printf '{"automations": [{"id": "smoke", "enabled": true, "config": %s}]}' "$(cat "$STATE/config")"
       fi
       ;;
+    */api/events\?*)
+      # journal_seq_seed (посев seq, находка ревью PR #241 п.1): отдаём события,
+      # уже накопленные в $EVENTS для этого task_id — та же прод-форма ответа
+      # GET /api/events (events/has_more/next_after), одной страницы достаточно
+      # для смоука ($EVENTS всегда короче limit=256).
+      local q_task
+      q_task=$(printf '%s' "$url" | sed -n 's/.*task_id=\([^&]*\).*/\1/p')
+      if [ -s "$EVENTS" ]; then
+        jq -s --arg t "$q_task" '{events: [.[] | select(.task_id == $t) | .events[]], has_more: false, next_after: 0}' "$EVENTS"
+      else
+        printf '{"events": [], "has_more": false, "next_after": 0}'
+      fi
+      ;;
     *) printf '{}' ;;
   esac
 }
@@ -138,6 +151,24 @@ touch "$STATE/disabled"
 run_automation "automation:smoke:D"; check "код 0" "$?"
 check "job_start с skipped=disabled" "$(journal_has '.kind == "job_start" and .data.skipped == "disabled"' && echo 0 || echo 1)"
 check "job_end ok" "$(journal_has '.kind == "job_end" and .data.result == "ok"' && echo 0 || echo 1)"
+
+: >"$EVENTS"
+rm -f "$STATE/disabled"
+
+# ── E: повторный прогон под тем же TASK_ID (находка ревью PR #241, п.1) ─────────────
+# $EVENTS НЕ чистится между двумя прогонами — второй видит события первого через
+# заглушку GET /api/events (журнал в проде тоже их отдал бы) и обязан сеять SEQ
+# с них, а не с нуля: иначе оба прогона используют seq 1/2/3, и события второго
+# (успешного повтора) молча отбросились бы сервером по UNIQUE(task_id, seq).
+echo "E: повторный прогон под тем же TASK_ID"
+printf '{"enabled": true, "trigger": {"type": "webhook"}, "task": {"kind": "pool", "title": "разобрать хвост", "body": "тело"}, "report": {"channels": []}}' >"$STATE/config"
+run_automation "automation:smoke:E"; check "первый прогон: код 0" "$?"
+run_automation "automation:smoke:E"; check "повторный прогон: код 0" "$?"
+first_seqs=$(jq -s '[.[] | select(.task_id == "automation:smoke:E") | .events[].seq]' "$EVENTS")
+seq_count=$(jq 'length' <<<"$first_seqs")
+seq_unique=$(jq 'unique | length' <<<"$first_seqs")
+check "6 событий за два прогона (3+3), все seq уникальны" "$([ "$seq_count" = 6 ] && [ "$seq_unique" = 6 ] && echo 0 || echo 1)"
+check "повтор не начал нумерацию с 1 (seq второго прогона продолжает первый)" "$(jq -e 'max > 3' <<<"$first_seqs" >/dev/null && echo 0 || echo 1)"
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

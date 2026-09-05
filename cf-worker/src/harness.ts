@@ -115,13 +115,19 @@ const SCHEMA = [
   // (секция «Автоматизации» через прокси /api/harness/*). last_fired_ts — троттл
   // триггеров-расписаний: обновляется при любом исходе запуска, чтобы упавший
   // dispatch не штурмовался каждым 15-минутным пульсом.
+  // last_run_task_id (находка ревью PR #241, п.3): #fireAutomation уже знает
+  // taskId запуска — хранение здесь заменяет LIKE-скан ВСЕЙ таблицы tasks на
+  // каждую автоматизацию при каждом GET /api/automations (класс квоты
+  // rows_read, #320) одиночным lookup по PK. Таблица новая в этом PR (ещё не
+  // деплоилась) — колонка сразу в CREATE, миграция не нужна.
   `CREATE TABLE IF NOT EXISTS automations (
-     id            TEXT PRIMARY KEY,
-     enabled       INTEGER NOT NULL,
-     config        TEXT NOT NULL,
-     created_ts    INTEGER NOT NULL,
-     updated_ts    INTEGER NOT NULL,
-     last_fired_ts INTEGER
+     id                TEXT PRIMARY KEY,
+     enabled           INTEGER NOT NULL,
+     config            TEXT NOT NULL,
+     created_ts        INTEGER NOT NULL,
+     updated_ts        INTEGER NOT NULL,
+     last_fired_ts     INTEGER,
+     last_run_task_id  TEXT
    )`,
 ];
 
@@ -1252,6 +1258,9 @@ export class Harness extends DurableObject<Env> {
     }
 
     this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
+    // Счётчики кеша (#320) обязаны перечитаться после смены статуса — иначе
+    // квота rows_read снова течёт (дашборд молча врёт до следующей мутации).
+    this.#taskCountsCache = null;
     this.#emitSystemEvent(id, "task_dispatched", {});
     this.#broadcastStatus();
     return this.#json({ task_id: id, dispatched: true }, { status: 201 });
@@ -1317,21 +1326,24 @@ export class Harness extends DurableObject<Env> {
   #automationRow(id: string): Record<string, SqlStorageValue> | null {
     return this.#rows(
       this.#sql.exec(
-        "SELECT enabled, config, created_ts, updated_ts, last_fired_ts FROM automations WHERE id = ?",
+        "SELECT enabled, config, created_ts, updated_ts, last_fired_ts, last_run_task_id FROM automations WHERE id = ?",
         id,
       ),
     )[0] ?? null;
   }
 
   /** Вид для UI: конфиг распарсен (писался только через валидацию), последний
-   *  прогон — по префиксу task_id прогона; разделитель «:» в id запрещён, так
-   *  что префикс `automation:<id>:` не пересекается с чужими автоматизациями. */
+   *  прогон — одиночный lookup по PK tasks через last_run_task_id (находка
+   *  ревью PR #241, п.3): раньше был LIKE-скан ВСЕЙ таблицы tasks на каждую
+   *  автоматизацию при каждом GET /api/automations — тот же класс квоты
+   *  rows_read, на котором репо уже обжигалось (#320). #fireAutomation — ЕДИНСТВЕННЫЙ
+   *  писатель last_run_task_id, второго источника рассинхрона нет. */
   #automationView(id: string, row: Record<string, SqlStorageValue>): Record<string, unknown> {
-    const lastRun = this.#rows(
-      this.#sql.exec(
-        "SELECT id, status, created_ts FROM tasks WHERE id LIKE ? ORDER BY created_ts DESC LIMIT 1",
-        `${AUTOMATIONS.runTaskPrefix}${id}:%`,
-      ),
+    const lastRunTaskId = row.last_run_task_id === null || row.last_run_task_id === undefined
+      ? null
+      : String(row.last_run_task_id);
+    const lastRun = lastRunTaskId === null ? undefined : this.#rows(
+      this.#sql.exec("SELECT id, status, created_ts FROM tasks WHERE id = ?", lastRunTaskId),
     )[0];
     return {
       id,
@@ -1348,7 +1360,9 @@ export class Harness extends DurableObject<Env> {
 
   #listAutomations(): Record<string, unknown>[] {
     return this.#rows(
-      this.#sql.exec("SELECT id, enabled, config, created_ts, updated_ts, last_fired_ts FROM automations ORDER BY id"),
+      this.#sql.exec(
+        "SELECT id, enabled, config, created_ts, updated_ts, last_fired_ts, last_run_task_id FROM automations ORDER BY id",
+      ),
     ).map((row) => this.#automationView(String(row.id), row));
   }
 
@@ -1507,7 +1521,12 @@ export class Harness extends DurableObject<Env> {
       // обязаны перечитаться, иначе дашборд молча врёт до следующей мутации.
       this.#taskCountsCache = null;
     }
-    this.#sql.exec("UPDATE automations SET last_fired_ts = ? WHERE id = ?", now, automationId);
+    // last_run_task_id (находка ревью PR #241, п.3): пишем здесь же, ЭТА функция
+    // единственная, что заводит запуски автоматизации — второго писателя нет.
+    this.#sql.exec(
+      "UPDATE automations SET last_fired_ts = ?, last_run_task_id = ? WHERE id = ?",
+      now, taskId, automationId,
+    );
     this.#broadcastStatus();
     return { taskId, dispatched };
   }
