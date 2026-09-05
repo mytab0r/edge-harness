@@ -21,9 +21,11 @@ on:
         type: string
 
 permissions:
-  contents: write  # для создания релиза и PR
-  issues: write    # для постинга статусов в журнал (если нужно)
-  pull-requests: write
+  contents: write       # для создания релиза и PR
+  pull-requests: write  # для gh pr create
+  # issues: write не нужен — статусы уходят по HTTP в журнал (POST /api/events,
+  # scripts/plugins/plugin_status.sh), PR создаётся под GH_PIPELINE_PAT, к
+  # GitHub Issues API/CLI этот workflow не обращается (находка AI-ревью PR #273).
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.plugin_path }}
