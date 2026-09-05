@@ -319,11 +319,13 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
     }
 
 
-def issue(number, *, assignees=("someone",), labels=("task",)):
+def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None):
     return {
         "number": number,
         "assignees": [{"login": a} for a in assignees],
         "labels": [{"name": n} for n in labels],
+        "title": title,
+        "sub_issues_summary": sub_issues_summary or {"total": 0, "completed": 0},
     }
 
 
@@ -2547,6 +2549,182 @@ def test_accept_merged_tasks_zero_calls_when_no_task_has_merged_pr(monkeypatch):
 
     assert lines == []
     assert hard_failure is False
+    assert fake.calls == []
+
+
+# ── дисклеймер о неполноте в теле PR (#335) — прод-форма реальных тел ────────
+
+# Реальное тело PR #303 (мерж-случай #335): объявляет #297 первой строкой,
+# прозой оговаривает прямо противоположное — «эта часть — открытая #297»,
+# «#269 остаётся открытой до решения #297».
+PR_303_BODY = """#297
+
+## Область (находка ревью, #303): что этот PR закрывает, а что нет
+
+Симптом и «Что сделано» ниже — из #269 (`schedule */15` доставляется ~7%
+тиков, готовый PR ждёт часами). Этот PR закрывает fail-loud часть находки:
+dispatch пульса больше не глотает не-204 ответ GitHub молча (бейдж и тест-
+гвардия отдельно различают «возможности нет», «dispatch/run сломан» и «alarm
+подвис» — три разных причины, три разных текста), плюс инвариант «PR готов к
+слиянию, но не слит» (`stale_ready_pulls`, `pr_is_merge_ready`).
+
+Главный запрос #269 — «движение конвейера не должно зависеть от такта»,
+то есть слияние по событию простановки метки-вердикта, а не по периодике —
+этим PR НЕ реализован: job `orchestra` на `pull_request: labeled`
+(`.github/workflows/orchestra.yml`) по-прежнему `skipped`
+(`if: github.event_name != 'pull_request'`), решение остаётся периодическим
+(DO alarm раз в 15 мин вместо GitHub'овского schedule, но всё ещё периодика,
+не событие). Эта часть — открытая #297 (её и объявляет первая строка):
+«механизм слияний не зависит от канала с измеренной потерей ~93% доставок».
+#269 остаётся открытой до решения #297, упомянута здесь прозой, не декларацией.
+"""
+
+# Реальное тело PR #159 (мерж-случай #335): объявляет #158, «Propose-фаза,
+# кода нет» — диф только спека, реализации нет.
+PR_159_BODY = """#158
+
+Propose-фаза, кода нет. Change: `dsh-edge-provider-registry`.
+
+## Пост-мерж проверка
+
+Не применимо: propose-фаза. Реализация — после ворот #1 (вердикт критика файлом
+в `openspec/changes/dsh-edge-provider-registry/reviews/`).
+"""
+
+# Реальное тело PR #123 (мерж-случай #335): объявляет #112, заголовок и тело
+# сами называют правку «стопгэп».
+PR_123_BODY = """#112 (стопгэп к транскрипту сессии #119)
+
+Ответ на «как понять, что агент не завис»: пока DSH работает, task.sh шлёт
+/api/heartbeat (контракт рук) — свежий heartbeat = «жив, работает».
+
+Пост-мерж: следующий прогон воркера → /api/status показывает свежий heartbeat
+worker-…; закрыть стопгэп-часть #112 уликой.
+"""
+
+
+@pytest.mark.parametrize("body,marker", [
+    (PR_303_BODY, "не реализован"),
+    (PR_159_BODY, "propose-фаза"),
+    (PR_123_BODY, "стопгэп"),
+])
+def test_partial_disclaimer_finds_marker_in_real_pr_bodies(body, marker):
+    assert sch.partial_disclaimer(body) == marker
+
+
+def test_partial_disclaimer_none_when_no_marker():
+    assert sch.partial_disclaimer(PR_177_BODY) is None
+
+
+@pytest.mark.parametrize("number,body", [
+    (297, PR_303_BODY),
+    (158, PR_159_BODY),
+    (112, PR_123_BODY),
+])
+def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(monkeypatch, number, body):
+    """Прод-форма #335: приёмка не закрывает задачу, если тело закрывающего
+    PR несёт дисклеймер о неполноте, даже когда первая строка объявляет её.
+    Доказано мутацией: без partial_disclaimer (см. следующий тест) приёмка
+    ушла бы к классификации (`pulls/900/files`), которого здесь нет —
+    маршрут отсутствует нарочно, чтобы такой обход провалил тест."""
+    pr = merged_pull(900, body, "sha900", "2026-09-04T10:00:00Z")
+    # Единственный допустимый вызов gh на этом пути — чтение комментариев для
+    # идемпотентности маркера; всё остальное (files/check-runs/PATCH) —
+    # доказательство, что до классификации дело не дошло.
+    fake = FakeGh({f"issues/{number}/comments": []})
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(number, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr})
+
+    assert hard_failure is False
+    assert fake.calls == [f"repos/{REPO}/issues/{number}/comments?per_page=100&page=1"]
+    assert not any(f"#{number}" in line and "закрыта приёмкой" in line for line in lines)
+    assert posted and posted[0][0] == number
+    assert "требует проверки человеком" in posted[0][1]
+
+
+def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeypatch):
+    """Гвардия мутацией (#335): то же тело PR #303, но без дисклеймера
+    (последний абзац с «остаётся открытой»/«НЕ реализован» вырезан) — приёмка
+    обязана закрыть #297 обычным путём, доказывая, что закрытие блокировала
+    именно фраза, а не что-то ещё в теле."""
+    body_without_disclaimer = PR_303_BODY.split("Главный запрос #269")[0]
+    assert sch.partial_disclaimer(body_without_disclaimer) is None
+    pr = merged_pull(900, body_without_disclaimer, "sha900", "2026-09-04T10:00:00Z")
+    fake = FakeGh({
+        "pulls/900/files": files_payload(["scripts/orchestra/scheduler.py"]),
+        "issues/297/comments": [],
+        "issues/297 -f state=closed": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("ok", "стаб"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    pool = [issue(297, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой" in line and "#297" in line for line in lines)
+
+
+def test_accept_merged_tasks_partial_disclaimer_is_idempotent(monkeypatch):
+    """Маркер уже стоит на этой паре (задача, PR) — второй пульс не должен
+    писать комментарий повторно (тот же приём, что и у fail_marker/pending)."""
+    pr = merged_pull(900, PR_303_BODY, "sha900", "2026-09-04T10:00:00Z")
+    fake = FakeGh({
+        "issues/297/comments": [{"body": f"{sch.ACCEPTANCE_PARTIAL_MARKER} PR #900 …",
+                                  "created_at": "2026-09-04T11:00:00Z"}],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
+
+    pool = [issue(297, assignees=("mytab0r",))]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr})
+
+    assert hard_failure is False
+    assert lines == []
+
+
+# ── эпик (#335) — родительскую задачу приёмка не закрывает автоматом ────────
+
+
+def test_is_epic_issue_true_by_title_prefix():
+    """#115/#116/#77/#17 — все начинаются с «ЭПИК» (проверено фактом на
+    живых issues репозитория); #115 при этом имеет нулевой
+    sub_issues_summary — заголовок остаётся единственным сигналом."""
+    assert sch.is_epic_issue(issue(115, title="ЭПИК: интеграции внешних систем — Atlassian…",
+                                    sub_issues_summary={"total": 0, "completed": 0}))
+
+
+def test_is_epic_issue_true_by_open_sub_issues():
+    assert sch.is_epic_issue(issue(77, title="", sub_issues_summary={"total": 8, "completed": 6}))
+
+
+def test_is_epic_issue_false_for_plain_task():
+    assert not sch.is_epic_issue(issue(21, title="dev:docker в cf-worker",
+                                        sub_issues_summary={"total": 0, "completed": 0}))
+
+
+def test_accept_merged_tasks_never_closes_epic(monkeypatch):
+    """Прод-форма #335: PR #123 объявляет #112 первой строкой, #112 сам не
+    эпик — но ЭПИК #115 из того же аудита валит прод-деплой, и здесь
+    проверяем именно ветку «эпик» отдельно от ветки «дисклеймер»: тело без
+    маркера, задача помечена эпиком по заголовку — приёмка обязана пропустить
+    её без единого вызова gh (тот же приём, что и WATCHDOG_ISSUE)."""
+    pr = merged_pull(400, "#115\n\nПлагин из эпика.", "sha400", "2026-09-04T10:00:00Z")
+    fake = FakeGh({})  # любой вызов — провал теста
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эпик не комментируется приёмкой"))
+
+    pool = [issue(115, assignees=(), title="ЭПИК: интеграции внешних систем")]
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {115: pr})
+
+    assert hard_failure is False
+    assert lines == []
     assert fake.calls == []
 
 

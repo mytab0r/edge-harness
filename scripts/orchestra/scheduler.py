@@ -1286,11 +1286,69 @@ ACCEPTANCE_FAIL_MARKER = "[приёмка: доработка]"
 ACCEPTANCE_DOCS_MARKER = "[приёмка: без наблюдаемого результата]"
 ACCEPTANCE_PENDING_MARKER = "[приёмка: зависла]"
 ACCEPTANCE_ERROR_MARKER = "[приёмка: сбой]"
+ACCEPTANCE_PARTIAL_MARKER = "[приёмка: требует проверки человеком]"
 
 # Рядом со STALE_HOURS (то же назначение — «сколько ждать, прежде чем бить
 # тревогу», но для другого канала: STALE_HOURS про назначение без PR,
 # ACCEPTANCE_PENDING_HOURS — про PR, который слит, но улика не появляется).
 ACCEPTANCE_PENDING_HOURS = 6
+
+# Дисклеймер о неполноте в теле закрывающего PR (#335): декларация первой
+# строкой (task_ref.declared_tasks) отвечает «к какой задаче относится PR»,
+# не «закрывает ли он её целиком» — приёмка раньше читала только декларацию
+# и закрывала задачу вопреки собственному тексту PR. Живой случай: PR #303
+# объявляет #297 первой строкой и пишет прозой «эта часть — открытая #297»/
+# «#269 остаётся открытой до решения #297» — приёмка закрыла #297 вопреки
+# дисклеймеру. Список — ОДНО место правды для всех веток приёмки (#335).
+# Ложноположительный риск принят намеренно (маркер может относиться к чужому
+# упомянутому issue, не к объявленному) — минимально достаточная защита
+# сейчас дешевле точного справочника машиночитаемых критериев, разбор —
+# следующим шагом (design.md #335, вариант с полем в теле по контракту).
+PARTIAL_DISCLAIMER_MARKERS = (
+    "не реализован",   # реализован/-а/-о/-ы — общий префикс всех форм
+    "остаётся открыт",  # открытой/-ым/-а — общий префикс
+    "стопгэп",
+    "propose-фаза",
+    "перенесён в #",
+    "перенесена в #",
+    "перенесено в #",
+)
+
+
+def partial_disclaimer(body: str) -> str | None:
+    """Найденный маркер неполноты (см. PARTIAL_DISCLAIMER_MARKERS) в теле PR,
+    без учёта регистра, или None. Сравнение по подстроке, не по регекспу —
+    маркеры уже достаточно специфичны, лишняя мощь регекспа тут не нужна."""
+    lowered = (body or "").lower()
+    for marker in PARTIAL_DISCLAIMER_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+# Заголовок эпика в этом репозитории начинается с «ЭПИК» (проверено фактом
+# по живым issues: #116, #77, #17 «ЭПИК. Фаза 2…», #115 — все четыре начинаются
+# так, вариации «ЭПИК:»/«ЭПИК.» покрыты одним префиксом без двоеточия).
+EPIC_TITLE_PREFIX = "ЭПИК"
+
+
+def is_epic_issue(issue: dict) -> bool:
+    """Родительская задача (#335): реализация эпика обычно распределена по
+    нескольким PR на дочерние задачи — слитый PR, объявляющий эпик первой
+    строкой, не значит «эпик готов целиком», приёмка не должна закрывать
+    эпик автоматом. Два признака, оба уже есть в ответе issues API (лишнего
+    запроса нет): заголовок с префиксом «ЭПИК» и незакрытые нативные
+    sub-issues (`sub_issues_summary`, #202). Ни один не покрывает оба
+    случая сам по себе — #115 эпик по заголовку, но `sub_issues_summary`
+    у него нулевой (дочерние задачи не оформлены как нативные sub-issues),
+    поэтому проверяем оба."""
+    title = issue.get("title") or ""
+    if title.startswith(EPIC_TITLE_PREFIX):
+        return True
+    summary = issue.get("sub_issues_summary") or {}
+    total = summary.get("total") or 0
+    completed = summary.get("completed") or 0
+    return total > completed
 
 DSH_EDGE_HEALTH_TIMEOUT = 15
 
@@ -1466,9 +1524,36 @@ def accept_merged_tasks(
             # задача провалилась», а тихая порча канала эскалации молчаливым
             # побочным эффектом, обнаружено при разборе AI-ревью PR #253.
             continue
+        if is_epic_issue(issue):
+            # Эпик — не закрывается приёмкой автоматом (см. is_epic_issue).
+            # Молча, тем же приёмом, что и WATCHDOG_ISSUE выше: это не
+            # неуверенность (ветка «требует проверки человеком» ниже), а
+            # структурное решение «эпики приёмка не трогает никогда».
+            continue
         pull = merged.get(number)
         if pull is None:
             continue
+
+        disclaimer = partial_disclaimer(pull.get("body") or "")
+        if disclaimer is not None:
+            partial_marker = f"{ACCEPTANCE_PARTIAL_MARKER} PR #{pull['number']}"
+            try:
+                if issue_marker_times(repo, number, partial_marker):
+                    continue  # уже отмечено на этой паре (задача, PR) — не спамим
+            except RuntimeError as error:
+                lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+                continue
+            text = (f"{partial_marker} тело PR #{pull['number']} содержит дисклеймер "
+                    f"о неполноте («{disclaimer}») — критерий требует проверки человеком, "
+                    f"не закрываю (#335).")
+            try:
+                post_issue_comment(repo, number, text)
+            except RuntimeError as error:
+                lines.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
+                continue
+            lines.append(f"⚠️ #{number}: {text}")
+            continue
+
         fail_marker = f"{ACCEPTANCE_FAIL_MARKER} PR #{pull['number']}"
         try:
             if issue_marker_times(repo, number, fail_marker):
