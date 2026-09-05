@@ -8,7 +8,17 @@
 #   1) fetch + авторитетная сверка ls-remote — тихо упавший fetch base не выдаёт;
 #   2) самовосстановление core.hooksPath — гвардия свежести обязательна всегда.
 #
-# Использование: scripts/git/task-branch <номер>-<slug>
+# Рабочее дерево (#332): агенты заводили `.claude/worktrees/<...>` вручную кто
+# как — разнобой имён стал причиной трижды за сутки (агент правил чужую ветку
+# в чужом дереве, дифф чужой задачи затирался). Здесь дерево заводится/
+# переиспользуется по одному правилу (`.githooks/pre-commit` его же и
+# проверяет): `<корень репозитория>/.claude/worktrees/<номер>-<slug>`. В CI
+# (GITHUB_ACTIONS=true) поведение старое — переключение ветки в текущем
+# каталоге: воркер (scripts/worker/task.sh) уже работает в одноразовом
+# изолированном чекауте на один прогон, заводить там ещё и worktree незачем
+# и меняло бы каталог работы у уже написанного пайплайна.
+#
+# Использование: scripts/git/task-branch <номер>-<slug>   (без изменений)
 set -euo pipefail
 
 task="${1:-}"
@@ -29,9 +39,89 @@ if [ "$remote_head" != "$local_head" ]; then
   exit 1
 fi
 
-git switch -c "agent/$task" refs/remotes/origin/main
+branch="agent/$task"
 
-# Гвардия свежести ставится каждым запуском: пересозданный клон защищён сразу.
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  # CI: одноразовый изолированный чекаут на прогон — worktree не нужен,
+  # старое поведение (переключение в текущем каталоге) сохранено как есть.
+  git switch -c "$branch" refs/remotes/origin/main
+  git config core.hooksPath .githooks
+  echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+  exit 0
+fi
+
+# Гвардия свежести ставится в общем конфиге репозитория (git config без
+# --worktree пишет в <git-common-dir>/config) — общий для ВСЕХ worktree,
+# ставить заново в каждом дереве не нужно, но лишним не будет.
 git config core.hooksPath .githooks
 
-echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+wt_dir="$main_root/.claude/worktrees/$task"
+
+# Уже есть worktree на эту ветку (повторный запуск на той же задаче) —
+# переиспользуем его, а не пытаемся завести дубль (git worktree add откажет
+# сам, но сообщение должно указывать путь, а не сырой git-эксепшн).
+#
+# Только под .claude/worktrees/ (находка ревью #333): главная запись
+# `worktree list` (корень репозитория) не годится — это и есть инцидент
+# #332 (ветка задачи зачекаучена в главном дереве). Легализовать его тут
+# значило бы тут же противоречить .githooks/pre-commit, которая коммит из
+# главного дерева на agent/<N>-* отклонит. Ветка вне .claude/worktrees/ —
+# заводим отдельное дерево по правилу, а не переиспользуем чужое место.
+existing_path=""
+while IFS= read -r line; do
+  case "$line" in
+    worktree\ *) cur_path="${line#worktree }" ;;
+    branch\ refs/heads/"$branch")
+      case "$cur_path" in
+        "$main_root"/.claude/worktrees/*) existing_path="$cur_path" ;;
+      esac
+      ;;
+  esac
+done < <(git worktree list --porcelain)
+
+if [ -n "$existing_path" ]; then
+  if [ -d "$existing_path" ]; then
+    echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
+    echo "$existing_path"
+    exit 0
+  fi
+  # Протухшая запись (находка ревью #333): каталог стёрт мимо
+  # `git worktree remove` — не молчать и не выдавать путь в никуда, а
+  # вычистить запись и завести дерево заново.
+  echo "Рабочее дерево $existing_path пропало с диска — чищу протухшую запись и завожу заново." >&2
+  git worktree prune
+fi
+
+if git rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
+  # Ветка существует, но нужного дерева под .claude/worktrees/ нет. Если она
+  # при этом зачекаучена ГДЕ-ТО ещё (например прямо в главном дереве —
+  # инцидент #332) — не легализуем это молча (находка ревью #333):
+  # `git worktree add` на такую ветку упадёт сырым git-фаталом, здесь —
+  # понятная ошибка с указанием, где ветка застряла.
+  checked_out_elsewhere=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) cur_path="${line#worktree }" ;;
+      branch\ refs/heads/"$branch") checked_out_elsewhere="$cur_path" ;;
+    esac
+  done < <(git worktree list --porcelain)
+  if [ -n "$checked_out_elsewhere" ]; then
+    echo "ОШИБКА: ветка $branch уже зачекаучена вне .claude/worktrees/:" >&2
+    echo "  $checked_out_elsewhere" >&2
+    echo "Не переиспользую чужое место (класс #332) — перенеси ветку туда самостоятельно:" >&2
+    echo "  git -C \"$checked_out_elsewhere\" switch - (вернуть исходную ветку)" >&2
+    echo "  git worktree add \"$wt_dir\" $branch" >&2
+    exit 1
+  fi
+  # Осиротела (нигде не зачекаучена) — заводим дерево на неё, не создавая
+  # вторую ветку.
+  git worktree add "$wt_dir" "$branch"
+else
+  mkdir -p "$(dirname "$wt_dir")"
+  git worktree add -b "$branch" "$wt_dir" refs/remotes/origin/main
+fi
+
+echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+echo "$wt_dir"
