@@ -22,7 +22,7 @@ verify_transcript = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify_transcript)
 
 
-def assistant_message(turn, step, content, provider="deepseek-official", model="glm-5.3-flash"):
+def assistant_message(turn, step, content, provider="test-provider", model="test-model"):
     return {
         "type": "assistant/message",
         "data": {
