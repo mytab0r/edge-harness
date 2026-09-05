@@ -11,6 +11,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# journal-seq: посев максимумом с сервера (находка ревью PR #241, п.1) — один
+# хелпер, тем же приёмом, что scripts/hands/dsh_task.sh.
+# shellcheck source=scripts/lib/journal_seq_seed.sh
+source "$SCRIPT_DIR/../lib/journal_seq_seed.sh"
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIMEOUT=30
@@ -20,7 +24,6 @@ CURL_MAX_TIMEOUT=30
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или workflow input)}"
 : "${AUTOMATION_ID:?AUTOMATION_ID не задан (repository_dispatch payload или workflow input)}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY не задан}"
-CONFIG="${CONFIG:-}"
 TRIGGER="${TRIGGER:-manual}"
 PERIOD_SINCE_TS="${PERIOD_SINCE_TS:-}"
 PERIOD_UNTIL_TS="${PERIOD_UNTIL_TS:-}"
@@ -41,7 +44,11 @@ api_post() { # path body
 
 # journal-seq: единственный писатель — этот файл (для kind=hands нумерацию
 # продолжит scripts/hands/dsh_task.sh, посеяв максимум с сервера: уникальность
-# (task_id, seq) соблюдается, события не теряются и не двоятся).
+# (task_id, seq) соблюдается, события не теряются и не двоятся). Посев здесь
+# максимумом с сервера ПО ВСЕМ страницам под TASK_ID (находка ревью PR #241,
+# п.1) — повторный прогон job'а под тем же TASK_ID (re-run failed jobs) без
+# посева начинал бы с SEQ=0, сервер молча отбрасывал бы дубликаты по
+# UNIQUE(task_id, seq), и успешный повтор остался бы невидим в журнале.
 SEQ=0
 add_event() { # kind json_data
   SEQ=$((SEQ + 1))
@@ -92,15 +99,15 @@ fail_loud() { # сообщение — конфигурационная поло
   exit 1
 }
 
+# Посев SEQ — до первого add_event (fail_loud тоже пишет события): сеть/gh
+# ещё не тронуты ниже, посев не может провалиться позже них.
+SEQ=$(journal_seq_seed) || fail_loud "не смог посеять journal-seq с сервера для $TASK_ID — прогон без этого рискует затоптать чужие seq"
+
 # ── 1. Конфиг — из журнала, не из payload и не из догадок ──────────────────────────
-if [ -n "$CONFIG" ]; then
-  printf '%s' "$CONFIG" >"$CONFIG_FILE"
-else
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
-    -H "Authorization: Bearer $HANDS_TOKEN" "$HANDS_URL/api/automations" \
-    | jq -c --arg id "$AUTOMATION_ID" '.automations[] | select(.id == $id) | .config' >"$CONFIG_FILE" \
-    || true
-fi
+curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
+  -H "Authorization: Bearer $HANDS_TOKEN" "$HANDS_URL/api/automations" \
+  | jq -c --arg id "$AUTOMATION_ID" '.automations[] | select(.id == $id) | .config' >"$CONFIG_FILE" \
+  || true
 [ -s "$CONFIG_FILE" ] || fail_loud "конфиг автоматизации $AUTOMATION_ID не найден в журнале — прогон без конфига невозможен"
 jq -e . "$CONFIG_FILE" >/dev/null || fail_loud "конфиг автоматизации $AUTOMATION_ID — не JSON"
 KIND=$(jq -r '.task.kind // "unknown"' "$CONFIG_FILE")

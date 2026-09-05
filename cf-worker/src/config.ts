@@ -156,6 +156,10 @@ export const AUTOMATIONS = {
     "automation_triggered",
     "automation_dispatched",
     "automation_webhook_rejected",
+    // Эмитит только scripts/automations/run.sh, строго под task_id с префиксом
+    // runTaskPrefix — тем же гейтом петли, что и остальные пять; без него
+    // тот же класс мёртвого триггера (находка ревью PR #241, п.2).
+    "automation_result",
   ],
 } as const;
 
