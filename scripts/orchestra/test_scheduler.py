@@ -2616,6 +2616,22 @@ def test_partial_disclaimer_none_when_no_marker():
     assert sch.partial_disclaimer(PR_177_BODY) is None
 
 
+def test_partial_disclaimer_matches_body_without_yo():
+    """Находка AI-ревью PR #342: живые тела PR пишут «перенесен» без «ё» —
+    это норма написания, не опечатка. Маркер объявлен с «ё» («перенесён в #»)
+    — без нормализации сравнение молча не находит совпадение, и приёмка тихо
+    закрывает задачу вопреки дисклеймеру (тот самый класс, который #335 чинит)."""
+    body = "#10\n\nЭта часть перенесен в #11, докрытие отдельным PR."
+    assert sch.partial_disclaimer(body) == "перенесён в #"
+
+
+def test_partial_disclaimer_matches_second_yo_marker_without_yo():
+    """Тот же класс, второй маркер с «ё» в списке («остаётся открыт») —
+    без нормализации падал бы так же молча, как и «перенесён в #»."""
+    body = "#10\n\nЧасть работы остается открытой до решения #11."
+    assert sch.partial_disclaimer(body) == "остаётся открыт"
+
+
 @pytest.mark.parametrize("number,body", [
     (297, PR_303_BODY),
     (158, PR_159_BODY),
@@ -2626,13 +2642,19 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     PR несёт дисклеймер о неполноте, даже когда первая строка объявляет её.
     Доказано мутацией: без partial_disclaimer (см. следующий тест) приёмка
     ушла бы к классификации (`pulls/900/files`), которого здесь нет —
-    маршрут отсутствует нарочно, чтобы такой обход провалил тест."""
+    маршрут отсутствует нарочно, чтобы такой обход провалил тест.
+
+    Находка AI-ревью PR #342: раньше ветка дисклеймера оставляла только
+    комментарий и задача зависала — assignee не снят, замок не освобождён,
+    задача недостижима ни воркером, ни повторной приёмкой. Теперь ветка
+    зеркалит `fail`: снимает assignee и вызывает `claim_task.release`."""
     pr = merged_pull(900, body, "sha900", "2026-09-04T10:00:00Z")
-    # Единственный допустимый вызов gh на этом пути — чтение комментариев для
-    # идемпотентности маркера; всё остальное (files/check-runs/PATCH) —
-    # доказательство, что до классификации дело не дошло.
-    fake = FakeGh({f"issues/{number}/comments": []})
+    fake = FakeGh({
+        f"issues/{number}/comments": [],
+        f"issues/{number}/assignees": None,
+    })
     patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
@@ -2640,10 +2662,12 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr})
 
     assert hard_failure is False
-    assert fake.calls == [f"repos/{REPO}/issues/{number}/comments?per_page=100&page=1"]
     assert not any(f"#{number}" in line and "закрыта приёмкой" in line for line in lines)
     assert posted and posted[0][0] == number
     assert "требует проверки человеком" in posted[0][1]
+    assert "возвращена в пул" in posted[0][1]
+    assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/{number}/assignees") for c in fake.calls)
+    assert any(f"замок task-{number} снят" in line for line in lines)
 
 
 def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeypatch):

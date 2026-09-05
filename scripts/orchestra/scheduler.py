@@ -1318,10 +1318,14 @@ PARTIAL_DISCLAIMER_MARKERS = (
 def partial_disclaimer(body: str) -> str | None:
     """Найденный маркер неполноты (см. PARTIAL_DISCLAIMER_MARKERS) в теле PR,
     без учёта регистра, или None. Сравнение по подстроке, не по регекспу —
-    маркеры уже достаточно специфичны, лишняя мощь регекспа тут не нужна."""
-    lowered = (body or "").lower()
+    маркеры уже достаточно специфичны, лишняя мощь регекспа тут не нужна.
+    «Ё» нормализуется в «е» с обеих сторон (находка AI-ревью PR #342): «е»
+    вместо «ё» в живых телах PR — норма («перенесен в #», не «перенесён»),
+    без нормализации маркер молча не находится и приёмка тихо закрывает
+    задачу вопреки дисклеймеру — тот самый класс, который #335 и чинит."""
+    lowered = (body or "").lower().replace("ё", "е")
     for marker in PARTIAL_DISCLAIMER_MARKERS:
-        if marker in lowered:
+        if marker.replace("ё", "е") in lowered:
             return marker
     return None
 
@@ -1341,7 +1345,14 @@ def is_epic_issue(issue: dict) -> bool:
     sub-issues (`sub_issues_summary`, #202). Ни один не покрывает оба
     случая сам по себе — #115 эпик по заголовку, но `sub_issues_summary`
     у него нулевой (дочерние задачи не оформлены как нативные sub-issues),
-    поэтому проверяем оба."""
+    поэтому проверяем оба.
+
+    `sub_issues_summary` подтверждён живым ответом ИМЕННО того эндпоинта,
+    которым пользуется `open_task_issues` — `GET issues?state=open&labels=task`
+    (не только `GET issues/{n}`): замер 2026-09-05, #77 вернулся с
+    `{"total": 8, "completed": 6, "percent_completed": 75}` прямо в
+    list-ответе, поле не пустое и не требует отдельного запроса на issue.
+    Второй сигнал живой, не мёртвый."""
     title = issue.get("title") or ""
     if title.startswith(EPIC_TITLE_PREFIX):
         return True
@@ -1545,12 +1556,23 @@ def accept_merged_tasks(
                 continue
             text = (f"{partial_marker} тело PR #{pull['number']} содержит дисклеймер "
                     f"о неполноте («{disclaimer}») — критерий требует проверки человеком, "
-                    f"не закрываю (#335).")
+                    f"не закрываю. Задача возвращена в пул, докрытие — новый PR (#335).")
             try:
                 post_issue_comment(repo, number, text)
+                if issue["assignees"]:
+                    who = ", ".join(a["login"] for a in issue["assignees"])
+                    gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
             except RuntimeError as error:
                 lines.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
                 continue
+            try:
+                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+            except RuntimeError as error:
+                # Та же гарантия, что и у fail/ok-веток ниже: сбой снятия замка
+                # не должен ронять обход остальных задач пула (найдено при
+                # разборе AI-ревью PR #342 — было «висит вечно», без освобождения
+                # ни assignee, ни замка не снимался).
+                lines.append(f"⚠️ замок task-{number} не снят: {error}")
             lines.append(f"⚠️ #{number}: {text}")
             continue
 
