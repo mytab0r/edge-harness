@@ -38,6 +38,12 @@ Issues:RW, ADR 0011) с метками `task`, `source:inbox`. `GH_DISPATCH_TOKE
 `LIMITS.messageIssueFetchTimeoutMs` — заведомо меньше порога ватчдога
 (инвариант гвардится тестом).
 
+Требование: текст публичного issue (заголовок и тело) проходит маскирование
+секретов тем же классом паттернов, что `dsh-ci.sh::redact`
+(nvapi-/sk-/ghp_/github_pat_; фикстуры общие), факт маскирования — в
+`result.secrets_redacted`. Командные слова директив — один список
+(`DIRECTIVE_WORDS`) для классификатора и чистки заголовка.
+
 Требование: `raw` уходит в `ignored` (не возвращается в `new`);
 `chat`/`doc_edit` завершаются `done` с пометкой
 `classified_for_manual_review`.

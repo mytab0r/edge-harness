@@ -2,6 +2,9 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
+
+import { asString, handsAreAlive, messageStuck } from "../src/harness";
+import { redact } from "../src/redact";
 import { LIMITS } from "../src/config";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
@@ -774,7 +777,52 @@ describe("inbox: сообщения владельца", () => {
       expect(JSON.parse(msg.message.result)).toEqual({
         issue_number: 4242,
         issue_url: "https://github.com/mytab0r/edge-harness/issues/4242",
+        secrets_redacted: false,
       });
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+  });
+
+  it("текст владельца с секретом уезжает в публичный issue замаскированным (первый наружный путь фриформа)", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `secret-${s}`,
+        sender_id: s,
+        text: "/task Проверь ключ sk-abcdefgh12345678 в конфиге",
+      })
+    ).json<{ message_id: number }>();
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token";
+    const calls: { body: { title?: string; body?: string } }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com") && url.includes("/issues")) {
+        calls.push({ body: JSON.parse(String(init?.body)) as { title?: string; body?: string } });
+        return new Response(JSON.stringify({ number: 4243, html_url: "https://github.com/mytab0r/edge-harness/issues/4243" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postJson("/api/messages/process", { limit: 100 });
+      const body = await res.json<{ results: { message_id: number; action: string; secrets_redacted?: boolean }[] }>();
+      const mine = body.results.find((r) => r.message_id === created.message_id);
+      expect(mine?.action).toBe("issue_created");
+
+      const mineCall = calls.find((c) => String(c.body.title).includes("Проверь ключ"));
+      expect(mineCall).toBeDefined();
+      // Ни заголовок, ни тело не содержат сырого ключа — ни в title, ни в body.
+      expect(mineCall!.body.title).not.toContain("sk-abcdefgh12345678");
+      expect(mineCall!.body.body).not.toContain("sk-abcdefgh12345678");
+      expect(mineCall!.body.body).toContain("sk-[REDACTED]");
+      expect(mine?.secrets_redacted).toBe(true);
+
+      const msg = await getJson<{ message: { result: string } }>(`/api/messages/${created.message_id}`);
+      expect(JSON.parse(msg.message.result).secrets_redacted).toBe(true);
     } finally {
       vi.unstubAllGlobals();
       env.GH_ISSUES_TOKEN = "";
@@ -1020,5 +1068,34 @@ describe("чистые функции инбокса", () => {
 
   it("таймаут вызова GitHub заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной issue)", () => {
     expect(LIMITS.messageIssueFetchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
+  });
+});
+
+describe("маскирование наружных текстов инбокса (тот же класс паттернов, что dsh-ci.sh::redact)", () => {
+  // Фикстуры — те же формы секретов, что гасит scripts/lib/dsh-ci.sh::redact:
+  // nvapi-/sk-/ghp_/github_pat_ в середину текста и без следов. Новая форма
+  // секрета добавляется в dsh-ci.sh и сюда одним классом правки.
+  it("маскирует формы секретов в середине текста и у краёв", () => {
+    const text = "вот ключ sk-abcdefgh12345678 и nvapi-abcdefgh12, токен ghp_0123456789abcdefghijklmnop и github_pat_0123456789ABCDEFGHIJKLMNOPQRSTUVWX";
+    const out = redact(text).text;
+    expect(out).not.toContain("sk-abcdefgh12345678");
+    expect(out).toContain("sk-[REDACTED]");
+    expect(out).not.toContain("nvapi-abcdefgh12");
+    expect(out).toContain("nvapi-[REDACTED]");
+    expect(out).not.toContain("ghp_0123456789abcdefghijklmnop");
+    expect(out).toContain("ghp_[REDACTED]");
+    expect(out).not.toContain("github_pat_0123456789");
+    expect(out).toContain("github_pat_[REDACTED]");
+  });
+
+  it("секрет в начале строки тоже маскируется (прецедент начала текста)", () => {
+    const out = redact("sk-abcdefgh12345678 в начале").text;
+    expect(out).not.toContain("sk-abcdefgh12345678");
+    expect(out.startsWith("sk-[REDACTED]")).toBe(true);
+  });
+
+  it("текст без секретов не трогается вовсе (факт замены = false)", () => {
+    const source = "обычный текст владельца без секретов";
+    expect(redact(source)).toEqual({ text: source, redacted: false });
   });
 });

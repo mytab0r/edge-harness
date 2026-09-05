@@ -2,12 +2,24 @@ import { DurableObject } from "cloudflare:workers";
 import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, SESSION } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
+import { redact } from "./redact";
 
 // ── Inbox constants (from config) ──────────────────────────────────────────────────────
 const MESSAGE_MAX_CHARS = LIMITS.messageMaxChars;
 const MESSAGE_PROCESS_MAX = LIMITS.messageProcessMax;
 const MESSAGE_GROUP_WINDOW_MS = LIMITS.messageGroupWindowMs;
 const MESSAGE_MAX_ATTEMPTS = LIMITS.messageMaxAttempts;
+
+// Командные слова директив — ОДИН список: классификатор (явный префикс и
+// глагольные формы) и чистка заголовка issue строятся из него; новый глагол
+// добавляется в одном месте, расхождение «классификатор знает — заголовок не
+// чистит» невозможно (ревью head a9c4cce).
+export const DIRECTIVE_WORDS = [
+  "task", "issue", "задача", "сделай", "создай", "добавь", "исправь",
+  "проверь", "проанализируй", "исследуй", "напиши", "обнови",
+] as const;
+const DIRECTIVE_WORDS_RE = DIRECTIVE_WORDS.join("|");
+const TITLE_PREFIX_RE = new RegExp(`^[\\/]\\s*(?:${DIRECTIVE_WORDS_RE})\\s*`, "i");
 
 // ── Схема данных ────────────────────────────────────────────────────────────────────
 //
@@ -156,6 +168,7 @@ export interface MessageProcessResult {
   issue_url?: string;
   error?: string;
   attempts?: number;
+  secrets_redacted?: boolean;
 }
 
 export interface Status {
@@ -413,7 +426,7 @@ export function asObject(value: unknown): Record<string, unknown> | null {
 
 /** Итог создания issue для директивы. retryable=false — повторять бессмысленно. */
 type IssueOutcome =
-  | { ok: true; number: number; url: string }
+  | { ok: true; number: number; url: string; redacted: boolean }
   | { ok: false; retryable: boolean; error: string };
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
@@ -1296,7 +1309,7 @@ export class Harness extends DurableObject<Env> {
     const wordEnd = "(?![\\p{L}\\p{N}])";
     // Явные префиксы — сильнейший сигнал, проверяются первыми.
     const explicitDirective = [
-      new RegExp(`^[\\/!]\\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)${wordEnd}`, "iu"),
+      new RegExp(`^[\\/]\\s*(?:${DIRECTIVE_WORDS_RE})${wordEnd}`, "iu"),
       /^\[TASK\]/i,
       /^#\d+\s/,
     ];
@@ -1309,10 +1322,7 @@ export class Harness extends DurableObject<Env> {
       return { kind: "doc_edit", priority: 5 };
     }
     // Глагольные директивы без префикса — с той же не-ASCII границей слова.
-    const verbDirective = new RegExp(
-      `^(создай|добавь|исправь|проверь|проанализируй|исследуй|напиши|обнови)${wordEnd}`,
-      "iu",
-    );
+    const verbDirective = new RegExp(`^(?:${DIRECTIVE_WORDS_RE})${wordEnd}`, "iu");
     if (verbDirective.test(trimmed)) return { kind: "directive", priority: 10 };
     // Чат/обсуждение: вопросы, комментарии без явного действия
     // Используем (^|\s) и (\s|[?,.!]|$) вместо \b для поддержки кириллицы
@@ -1363,15 +1373,21 @@ export class Harness extends DurableObject<Env> {
       return { ok: false, retryable: true, error: "issues_not_configured" };
     }
 
-    // Заголовок — первая строка без командного слова, потолок 80 символов.
+    // Заголовок — первая строка без командного слова (общий с классификатором
+    // список DIRECTIVE_WORDS), потолок 80 символов.
     const firstLine = text.trim().split(/\r?\n/)[0];
-    const stripped = firstLine
-      .replace(/^[\/!]\s*(task|issue|задача|сделай|добавь|исправь|проверь|проанализируй|исследуй)\s*/i, "")
-      .trim();
+    const stripped = firstLine.replace(TITLE_PREFIX_RE, "").trim();
     const base = stripped || firstLine;
     const title = base.length > 80 ? base.slice(0, 77) + "..." : base;
 
-    const body = `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${text}\n\`\`\`\n\n---\n*Создано автоматически из инбокса владельца (задача #20). Обработай по playbook.*`;
+    // Публичный issue — первый наружный путь произвольного фриформ-текста:
+    // секреты маскируются тем же классом паттернов, что dsh-ci.sh::redact
+    // (п.29 спеки), факт маскирования виден в result сообщения.
+    const titleRedacted = redact(title);
+    const bodyRedacted = redact(text);
+    const body =
+      `## Сообщение владельца (inbox #${messageId})\n\n\`\`\`\n${bodyRedacted.text}\n\`\`\`\n\n---\n` +
+      `*Создано автоматически из инбокса владельца (задача #20). Обработай по playbook.*`;
 
     try {
       // Таймаут заведомо меньше ватчдога (messageStuckProcessingMs): висящий
@@ -1386,16 +1402,16 @@ export class Harness extends DurableObject<Env> {
           "User-Agent": GITHUB.userAgent,
           "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
-        body: JSON.stringify({ title, body, labels: ["task", "source:inbox"] }),
+        body: JSON.stringify({ title: titleRedacted.text, body, labels: ["task", "source:inbox"] }),
       });
       if (!res.ok) {
-        const detail = (await res.text()).slice(0, 500);
+        const detail = redact((await res.text()).slice(0, 500)).text;
         // 5xx и 429 — временные; 4xx (403 без права, 422 кривая форма) —
         // повторять бессмысленно, это honest failed.
         return { ok: false, retryable: res.status >= 500 || res.status === 429, error: `github_${res.status}: ${detail}` };
       }
       const issue = await res.json<{ number: number; html_url: string }>();
-      return { ok: true, number: issue.number, url: issue.html_url };
+      return { ok: true, number: issue.number, url: issue.html_url, redacted: titleRedacted.redacted || bodyRedacted.redacted };
     } catch (error) {
       return { ok: false, retryable: true, error: error instanceof Error ? error.message : String(error) };
     }
@@ -1435,8 +1451,8 @@ export class Harness extends DurableObject<Env> {
     if (kind === "directive") {
       const outcome = await this.#createIssue(messageId, String(row.text));
       if (outcome.ok) {
-        if (this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url }, claimedTs)) {
-          return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url };
+        if (this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted }, claimedTs)) {
+          return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted };
         }
         // Наш захват устарел (ватчдог вернул сообщение в очередь): issue от
         // этой проходки мог задвоиться с новой — честно помечаем проходку.
