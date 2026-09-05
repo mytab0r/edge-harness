@@ -29,6 +29,56 @@ if [ "$remote_head" != "$local_head" ]; then
   exit 1
 fi
 
+# Аренда задачи (#121, ADR 0006) — до сих пор её брал только облачный воркер
+# (scripts/worker/task.sh); внешние агенты создавали ветку в обход claim, и
+# free_task() (scripts/worker/task.sh) считал такую задачу свободной — облачный
+# воркер мог взять работу, которую прямо сейчас делает внешний агент (#356).
+# Ветка создаётся только этим скриптом — забыть аренду здесь стало невозможно.
+# Тот же вход, что у воркера/hands (lease_cli, scripts/lib/lease.sh) — второй
+# путь claim'а не заводим.
+#
+# LEASE_ALREADY_CLAIMED=1 — транспорт (task.sh, dsh_task.sh) арендует задачу
+# раньше (до старта агента, ради дешёвого fail-fast) и пробрасывает флаг сюда
+# через окружение процесса-агента: без него второй claim того же номера тем же
+# держателем отклонился бы как «занято» (claim не идемпотентен по актору) и
+# валил бы штатный путь транспорта. Внешний путь (человек/агент без
+# транспорта) флаг не ставит — тогда аренда полностью на task-branch.
+if [ "${LEASE_ALREADY_CLAIMED:-0}" = "1" ]; then
+  echo "Аренда уже взята транспортом (LEASE_ALREADY_CLAIMED=1) — task-branch её не повторяет."
+else
+  task_num=$(printf '%s' "$task" | grep -oE '^[0-9]+' || true)
+  if [ -z "$task_num" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: «$task» не начинается с номера задачи — аренда пропущена (branch без claim)." >&2
+  elif ! command -v gh >/dev/null 2>&1; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: gh недоступен (офлайн?) — аренда задачи #$task_num пропущена, ветка создаётся без неё." >&2
+  else
+    # GITHUB_REPOSITORY: в CI уже задан; локально берём тем же способом, что
+    # scripts/review/file_tasks.py::current_repo — gh repo view.
+    repo="${GITHUB_REPOSITORY:-}"
+    if [ -z "$repo" ]; then
+      repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+    fi
+    if [ -z "$repo" ]; then
+      echo "ПРЕДУПРЕЖДЕНИЕ: не удалось определить репозиторий (gh repo view, офлайн?) — аренда #$task_num пропущена." >&2
+    else
+      export GITHUB_REPOSITORY="$repo"
+      export CLAIM_VIA="${CLAIM_VIA:-task-branch (local)}"
+      source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/lease.sh"
+      claim_out="$(lease_cli claim "$task_num" 2>&1)" && claim_rc=0 || claim_rc=$?
+      if [ "$claim_rc" -eq 1 ]; then
+        echo "ОШИБКА: задача #$task_num уже арендована другим исполнителем: $claim_out" >&2
+        echo "  Кто держит: assignee и комментарий 🔒 в issue #$task_num (там канал и время аренды)." >&2
+        echo "  Что делать: возьми другую свободную задачу — ветка не создаётся." >&2
+        exit 1
+      elif [ "$claim_rc" -ne 0 ]; then
+        echo "ПРЕДУПРЕЖДЕНИЕ: claim_task сломался (rc=$claim_rc) — аренда #$task_num пропущена, ветка создаётся без неё: $claim_out" >&2
+      else
+        echo "Аренда взята: $claim_out"
+      fi
+    fi
+  fi
+fi
+
 git switch -c "agent/$task" refs/remotes/origin/main
 
 # Гвардия свежести ставится каждым запуском: пересозданный клон защищён сразу.
