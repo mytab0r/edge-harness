@@ -199,6 +199,20 @@ jobs:
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
         run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
+      # Прокси статусов журнала (#105, патч 0005) обязан работать на СОБРАННОМ
+      # артефакте до деплоя — тем же способом, что и ingest-шов: unstable_dev
+      # поднимает direct-воркер, рядом заглушка журнала (node:http), и
+      # прогоняется контракт /api/harness/events: 401 без куки (журнал не
+      # дёргается), 403 кросс-origin, Bearer HANDS_TOKEN и параметры журнала
+      # на заглушке, прозрачный проход ответа (включая 401/500 журнала),
+      # 400 на кривые параметры, 503 при незаданном HARNESS_URL/HANDS_TOKEN.
+      # Красный шаг — деплой не начинается: сломанный прокси = громко
+      # ошибающиеся статусы раздела «Плагины» на свежесобранной морде (#235).
+      - name: Интеграция прокси статусов на собранном артефакте (#105)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        run: node "$GITHUB_WORKSPACE/dsh-edge/proxy-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
         run: |
@@ -411,7 +425,14 @@ jobs:
             "vars": {
               // Потолок GLM: дефолт адаптера 256000 отвергается (max 131072)
               "DEEPSEEK_MAX_OUTPUT_TOKENS": "131072",
-              "GH_RUNNER_REPO": "mytab0r/edge-harness"
+              "GH_RUNNER_REPO": "mytab0r/edge-harness",
+              // Куда прокси статусов (патч 0005, issue #105) ходит за журналом:
+              // GET {HARNESS_URL}/api/events с Bearer HANDS_TOKEN (секрет ниже).
+              // На префаб-маршруте var мёртв и безвреден: маршрута
+              // /api/harness/events в префаб-артефакте нет (патчи не применяются);
+              // секрет HANDS_TOKEN при этом на префаб не ставится — обещать
+              // возможность без артефакта нечестно, var без неё безопасен.
+              "HARNESS_URL": "${{ vars.HARNESS_URL }}"
             },
             "assets": {
               "binding": "ASSETS",
@@ -525,6 +546,24 @@ jobs:
             '.integrations[] | {id: .id, missing: ($missing[.id].missing // [])}' \
             > "$GITHUB_WORKSPACE/integration-states.ndjson"
           echo "Секретов интеграций синхронизировано в воркер: $synced"
+
+      # Секрет журнала для прокси статусов (issue #105, патч 0005-harness-
+      # status-proxy): маршрут GET /api/harness/events на морде ходит в журнал
+      # (HARNESS_URL) с Authorization: Bearer <HANDS_TOKEN> — тем же токеном,
+      # который журнал принимает от рук (cf-worker/src/harness.ts: exact match
+      # на Bearer). Патч существует только на source-build маршруте, поэтому
+      # и секрет синкается только там: класть его префаб-воркеру — обещать
+      # возможность, которой в артефакте нет.
+      - name: Секрет журнала для прокси статусов (HANDS_TOKEN)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+        run: |
+          [ -n "$HANDS_TOKEN" ] || { echo "::error::HANDS_TOKEN не задан — прокси /api/harness/events не сможет аутентифицироваться в журнале"; exit 1; }
+          printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
 
       - name: plugin_status → deploying
         if: steps.route.outputs.plugins != '0'
