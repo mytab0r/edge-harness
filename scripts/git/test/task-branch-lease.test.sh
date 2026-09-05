@@ -114,20 +114,60 @@ branch2="$(git -C "$WORK2" branch --show-current)"
   || fail "сценарий 2: ветка agent/2-busy-task не должна существовать"
 echo "OK: сценарий 2 (занятая задача) — ветка не создана, отказ внятный"
 
-# ── Сценарий 3: транспорт уже арендовал (LEASE_ALREADY_CLAIMED=1) → task-branch
-# не арендует повторно, даже если бы повторный claim был бы отклонён ────────────
+# ── Сценарий 3: транспорт уже арендовал ЭТУ ЖЕ задачу (LEASE_ALREADY_CLAIMED=3,
+# совпадает с номером ветки) → task-branch не арендует повторно, даже если бы
+# повторный claim был бы отклонён ─────────────────────────────────────────────
 WORK3="$TMP/work3"
 git clone --quiet "$ORIGIN" "$WORK3"
-out3="$(cd "$WORK3" && PATH="$FAKEBIN:$PATH" FAKE_GH_CLAIM_BUSY=1 LEASE_ALREADY_CLAIMED=1 \
+out3="$(cd "$WORK3" && PATH="$FAKEBIN:$PATH" FAKE_GH_CLAIM_BUSY=1 LEASE_ALREADY_CLAIMED=3 \
         env -u GITHUB_REPOSITORY -u CLAIM_ACTOR -u CLAIM_VIA \
         "$REPO/scripts/git/task-branch" 3-transport-claimed 2>&1)" \
-  || fail "сценарий 3 (LEASE_ALREADY_CLAIMED=1) должен создать ветку без повторного claim:\n$out3"
+  || fail "сценарий 3 (LEASE_ALREADY_CLAIMED=3) должен создать ветку без повторного claim:\n$out3"
 printf '%s\n' "$out3" | grep -qi "не повторяет" \
   || fail "сценарий 3: нет отметки, что повторный claim пропущен:\n$out3"
 branch3="$(git -C "$WORK3" branch --show-current)"
 [ "$branch3" = "agent/3-transport-claimed" ] \
   || fail "сценарий 3: ожидал ветку agent/3-transport-claimed, получил «$branch3»"
-echo "OK: сценарий 3 (транспорт уже арендовал) — task-branch не арендует повторно"
+echo "OK: сценарий 3 (транспорт уже арендовал ЭТУ задачу) — task-branch не арендует повторно"
+
+# ── Сценарий 3b (гвардия #356-фоллоуап): транспорт арендовал ДРУГУЮ задачу
+# (LEASE_ALREADY_CLAIMED=50), в этом же прогоне task-branch зовут для #77 →
+# номер не совпал, аренда #77 ДОЛЖНА быть взята заново, а не пропущена.
+# Мутация: верни булеву проверку ("${LEASE_ALREADY_CLAIMED:-0}" = 1) — этот
+# сценарий покраснеет, потому что «Аренда взята» пропадёт из вывода: claim
+# #77 молча не возьмётся, хотя #50 никак не арендует #77.
+WORK3B="$TMP/work3b"
+git clone --quiet "$ORIGIN" "$WORK3B"
+out3b="$(cd "$WORK3B" && PATH="$FAKEBIN:$PATH" LEASE_ALREADY_CLAIMED=50 \
+        env -u GITHUB_REPOSITORY -u CLAIM_ACTOR -u CLAIM_VIA \
+        "$REPO/scripts/git/task-branch" 77-other-task 2>&1)" \
+  || fail "сценарий 3b (номер флага не совпал) должен создать ветку и взять аренду #77:\n$out3b"
+printf '%s\n' "$out3b" | grep -q "Аренда взята" \
+  || fail "сценарий 3b: LEASE_ALREADY_CLAIMED=50 не должен подавлять аренду #77 (номер не совпал), но «Аренда взята» нет в выводе:\n$out3b"
+printf '%s\n' "$out3b" | grep -qi "не к этой ветке" \
+  || fail "сценарий 3b: нет предупреждения, что флаг относится к другой задаче:\n$out3b"
+branch3b="$(git -C "$WORK3B" branch --show-current)"
+[ "$branch3b" = "agent/77-other-task" ] \
+  || fail "сценарий 3b: ожидал ветку agent/77-other-task, получил «$branch3b»"
+echo "OK: сценарий 3b (флаг несёт номер ДРУГОЙ задачи) — аренда #77 взята заново, не пропущена"
+
+# ── Сценарий 3c: LEASE_ALREADY_CLAIMED — мусор (не число, устаревший булев
+# флаг «1» без нового контракта или битые данные) → громкий отказ, ветка НЕ
+# создаётся: тихо угадывать смысл мусорного флага опаснее, чем остановиться.
+WORK3C="$TMP/work3c"
+git clone --quiet "$ORIGIN" "$WORK3C"
+set +e
+out3c="$(cd "$WORK3C" && PATH="$FAKEBIN:$PATH" LEASE_ALREADY_CLAIMED=true \
+        env -u GITHUB_REPOSITORY -u CLAIM_ACTOR -u CLAIM_VIA \
+        "$REPO/scripts/git/task-branch" 78-garbage-flag 2>&1)"
+rc3c=$?
+set -e
+[ "$rc3c" -ne 0 ] || fail "сценарий 3c (мусор в LEASE_ALREADY_CLAIMED) должен завершиться отказом:\n$out3c"
+printf '%s\n' "$out3c" | grep -qi "не номер задачи" \
+  || fail "сценарий 3c: в отказе нет объяснения, что флаг должен быть номером:\n$out3c"
+[ -z "$(git -C "$WORK3C" branch --list 'agent/78-garbage-flag')" ] \
+  || fail "сценарий 3c: ветка НЕ должна была создаться при мусорном флаге"
+echo "OK: сценарий 3c (мусор в LEASE_ALREADY_CLAIMED) — громкий отказ, ветка не создана"
 
 # ── Сценарий 4: gh недоступен (офлайн) → предупреждение, ветка всё равно создаётся ──
 WORK4="$TMP/work4"
