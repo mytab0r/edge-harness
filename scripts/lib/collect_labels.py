@@ -48,6 +48,9 @@ _LABELS_QS_RE = re.compile(r"labels\[\]=(" + _LABEL_TOKEN + r")\b")
 _JQ_SELECT_RE = re.compile(r'select\(\.name == "(' + _LABEL_TOKEN + r')"\)')
 # Форма 2в: bash CLI `--add-label значение`.
 _ADD_LABEL_RE = re.compile(r"--add-label\s+(" + _LABEL_TOKEN + r")\b")
+# Форма 2г: bash CLI `--label значение` (gh issue create/list --label; #116 —
+# автоматизации создают задачи пула с меткой task).
+_CLI_LABEL_RE = re.compile(r"(?<![-\w])--label\s+(" + _LABEL_TOKEN + r")\b")
 # Форма 3: YAML-шапка шаблона issue `labels: [значение, ...]`.
 _YAML_LABELS_RE = re.compile(r"^labels:\s*\[([^\]]*)\]", re.MULTILINE)
 # Форма 4: массив меток в TS-коде морды `labels: ["task", "source:inbox"]`
@@ -81,6 +84,7 @@ def _scan_shell_files() -> set[str]:
         text = path.read_text(encoding="utf-8")
         found.update(_JQ_SELECT_RE.findall(text))
         found.update(_ADD_LABEL_RE.findall(text))
+        found.update(_CLI_LABEL_RE.findall(text))
     return found
 
 

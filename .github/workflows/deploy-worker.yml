@@ -152,6 +152,22 @@ jobs:
             echo "::warning::GH_ISSUES_TOKEN не задан — в воркере секрет не обновлялся (инбокс без права на issues, ADR 0011)"
           fi
 
+      # Подпись webhook'ов автоматизаций (#116): секрет опционален — пока его нет,
+      # вход /api/webhooks/* отвечает 500 webhook_secret_missing («приём
+      # невозможен», не «отклонён»). Задан — синк идемпотентен, как выше.
+      - name: Секрет подписи webhook'ов автоматизаций (#116)
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WEBHOOK_SECRET: ${{ secrets.AUTOMATION_WEBHOOK_SECRET }}
+        run: |
+          if [ -z "$WEBHOOK_SECRET" ]; then
+            echo "::notice::AUTOMATION_WEBHOOK_SECRET не задан — webhook-вход автоматизаций не настроен (500 webhook_secret_missing)"
+            exit 0
+          fi
+          printf '%s' "$WEBHOOK_SECRET" | npx wrangler secret put AUTOMATION_WEBHOOK_SECRET
+
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде
         run: |

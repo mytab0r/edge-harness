@@ -134,7 +134,11 @@ while :; do
   resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256")
   n=$(jq '.events | length' <<<"$resp")
   if [ "$n" -eq 0 ]; then break; fi
-  ms=$(jq '[.events[] | select(.source == "job") | .seq] | max // 0' <<<"$resp")
+  # Максимум по ВСЕМ источникам, не только source=job: UNIQUE(task_id, seq)
+  # не знает про source, и чужое событие (автоматизации, статусы) под тем же
+  # task_id при выборочном посеве переиспользовало бы его seq — событие молча
+  # глоталось бы INSERT OR IGNORE (класс, пойманный ревью #116, major 2).
+  ms=$(jq '[.events[] | .seq] | max // 0' <<<"$resp")
   if [ "$ms" -gt "$SEQ" ]; then SEQ=$ms; fi
   if [ -z "$TASK_TEXT" ]; then
     extracted=$(jq -r '

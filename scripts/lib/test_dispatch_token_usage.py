@@ -57,6 +57,7 @@ PIPELINE_CONSUMERS = [
 # по себе ничего не фиксирует). Содержимое сканируется динамически в правилах ниже.
 EXPECTED_WORKFLOWS = frozenset({
     "ai-review.yml",
+    "automation.yml",  # руки автоматизаций (#116): repository_dispatch harness-automation; секреты — HANDS_TOKEN/каналы, GH_DISPATCH_TOKEN не трогает
     # #370/#341: событие branch_protection_rule, только github.token (issues:
     # write) + секреты TELEGRAM_* — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
@@ -163,20 +164,50 @@ def test_hands_lease_visibility_needs_issues_write():
     )
 
 
-def test_hands_checkout_does_not_persist_token():
+# Workflows, отдающие воркспейс DSH-агенту (находка AI-ревью #241: гвардия,
+# пришитая только к hands.yml, не заметила бы тот же класс в automation.yml).
+DSH_WORKSPACE_WORKFLOWS = [
+    "hands.yml",
+    "automation.yml",  # kind=hands передаёт работу dsh_task.sh (#116)
+]
+
+# Скрипт-клиент автоматизаций: перед стартом dsh_task.sh обязан снять токены
+# репозитория из окружения — иначе DSH-агент наследует github.token job'а.
+AUTOMATIONS_RUN_SH = REPO_ROOT / "scripts" / "automations" / "run.sh"
+
+
+def test_dsh_workspace_checkout_does_not_persist_token():
     # Проверка ПО СТРУКТУРЕ YAML, не подстрокой: упоминание в комментарии
     # («persist-credentials: false ниже») не должно закрывать гвардию —
     # поймано мутацией этой же гвардии (#246).
-    doc = yaml.safe_load(workflow_text("hands.yml"))
-    checkouts = [
-        step
-        for job in (doc.get("jobs") or {}).values()
-        for step in (job.get("steps") or [])
-        if str(step.get("uses") or "").startswith("actions/checkout")
-    ]
-    assert checkouts, "hands.yml: не найден ни один checkout — структура workflow изменилась, обнови гвардию"
-    for step in checkouts:
-        assert step.get("with", {}).get("persist-credentials") is False, (
-            "hands.yml: checkout оставляет github.token в .git/config воркспейса — "
-            "DSH прочитает токен с contents:write и получит пуш (ADR 0006 «Права»)"
-        )
+    for name in DSH_WORKSPACE_WORKFLOWS:
+        doc = yaml.safe_load(workflow_text(name))
+        checkouts = [
+            step
+            for job in (doc.get("jobs") or {}).values()
+            for step in (job.get("steps") or [])
+            if str(step.get("uses") or "").startswith("actions/checkout")
+        ]
+        assert checkouts, f"{name}: не найден ни один checkout — структура workflow изменилась, обнови гвардию"
+        for step in checkouts:
+            assert step.get("with", {}).get("persist-credentials") is False, (
+                f"{name}: checkout оставляет github.token в .git/config воркспейса — "
+                "DSH прочитает токен и получит права job'а (issues:write и/или "
+                "contents:write), ADR 0006 «прав на пуш/токен у агента нет»"
+            )
+
+
+def test_automation_hands_branch_strips_repo_token_from_env():
+    """run.sh (kind=hands) снимает GH_TOKEN/GITHUB_TOKEN до старта dsh_task.sh.
+
+    Класс: GH_TOKEN job'а automation.yml — github.token с issues:write; без
+    снятия DSH-агент наследует его из окружения (находка AI-ревью #241). Пулу
+    выше по скрипту gh issue create токен нужен, поэтому требование — точечное
+    снятие в вызове, а не отсутствие токена в job."""
+    text = AUTOMATIONS_RUN_SH.read_text(encoding="utf-8")
+    invocations = re.findall(r"env\s+-u\s+GH_TOKEN\s+-u\s+GITHUB_TOKEN\s+bash\s+.*dsh_task\.sh", text)
+    assert invocations, (
+        "scripts/automations/run.sh: вызов dsh_task.sh не снимает GH_TOKEN/"
+        "GITHUB_TOKEN (env -u) — DSH-агент наследует github.token job'а "
+        "automation.yml с issues:write (ADR 0006, находка AI-ревью #241)"
+    )

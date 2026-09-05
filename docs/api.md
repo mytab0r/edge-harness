@@ -52,3 +52,19 @@ GET — список сообщений с фильтрами (status, kind, sen
 ## `POST /api/messages/process`
 
 Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — issue под GH_ISSUES_TOKEN (kind в теле issue; не задан токен или сеть — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен.
+
+## `GET /api/automations`
+
+Список автоматизаций (#116) с конфигом, last_fired_ts и последним прогоном (задача со статусом из очереди). Форму конфига валидирует src/automations.ts; секция «Автоматизации» морды читает это через прокси /api/harness/*.
+
+## `PUT/DELETE /api/automations/`
+
+PUT — создать/заменить автоматизацию {automation_id} (тело {config}, жёсткая валидация, потолок LIMITS.automationsMax); DELETE — удалить. Запись конфига не запускает прогон — прогон порождают только триггеры.
+
+Остаток пути после `/api/automations/` — параметр.
+
+## `POST /api/webhooks/`
+
+Внешний webhook автоматизации (#116). Аутентификация — не кука/Bearer, а подпись X-Harness-Signature: sha256=<hex HMAC-SHA256(raw body, AUTOMATION_WEBHOOK_SECRET)>. Без подписи или с неверной — 401 и событие automation_webhook_rejected в журнале (громко). Валидная подпись + включённая автоматизация с trigger.type=webhook → repository_dispatch harness-automation, 202 {task_id}; секрет не задан — 500, выключена — 409 automation_disabled, не webhook-триггерная — 409 automation_not_webhook (вход не сдвигает фазу расписания). Повторная доставка отправителя — новый прогон (at-least-once).
+
+Остаток пути после `/api/webhooks/` — параметр.
