@@ -303,10 +303,17 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Проверка на входе в task-branch (не гвардия постфактум): задача обязана
+      # существовать/быть открытой/нести task/не нести blocked до создания
+      # ветки — прогон на реальном git с фейковым gh, сеть не нужна.
+      - name: Smoke task-branch — проверка задачи на входе
+        run: bash scripts/git/test/task-branch.test.sh
 
       # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
       # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
