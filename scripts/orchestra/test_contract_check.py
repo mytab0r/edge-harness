@@ -45,19 +45,27 @@ def label(name):
     return {"id": "LA_kwDOUHBaqc8AAAACypPLSQ", "name": name}
 
 
-def pull(number, *, pr_body="", labels=(), author="mytab0r"):
+def pull(number, *, pr_body="", labels=(), author="mytab0r", branch=None):
     # Параметр называется pr_body, не body (тот же приём, что test_scheduler.py::pull):
     # CI-гвардия класса #124 (repo-ci.yml "Оркестрация без keyword-аргументов gh()")
     # грепает вызовы вида "запятая-пробел-body-равно" по всему scripts/orchestra/
     # буквально, без разбора AST — keyword-параметр тестового хелпера с таким же
     # именем ловится тем же паттерном, что и настоящий баг (позиционный
     # "-f", f"body=..." — единственная разрешённая форма для gh()).
-    return {
+    # `branch` не задан по умолчанию (не "" ) — большинство тестов этого файла
+    # доказывают поведение декларации тела БЕЗ ветки agent/<N>-slug, и головы
+    # без поля `head` вовсе (как в прод-форме `gh api .../pulls/N`, где ветка
+    # реального PR почти всегда есть) — тест не должен молчаливо считать это
+    # эквивалентным "ветка есть, но пустая".
+    result = {
         "number": number,
         "body": pr_body,
         "labels": [label(n) for n in labels],
         "user": {"login": author},
     }
+    if branch is not None:
+        result["head"] = {"ref": branch}
+    return result
 
 
 def issue(number, *, state="open", labels=("task",), assignees=()):
@@ -207,3 +215,110 @@ def test_task_eligibility_problems_collects_multiple_reasons():
     # список (не «первая найденная и остановились»): main() докладывает все.
     problems = cc.task_eligibility_problems(issue(1, state="closed", labels=()), 1)
     assert len(problems) == 2
+
+
+# ── #394: задача PR резолвится по ветке, не по прямому declared_tasks ───────
+
+
+def test_task_number_taken_from_branch_when_body_prose_first_line(monkeypatch):
+    """Ветка agent/<N>-slug первична: тело PR не начинается голым #N (живой
+    случай #388 из постановки #394 — первая строка была прозой «Задача #256
+    (task-rework-loop). Реализует пп.1-2», контракт красил «нет ссылки на
+    задачу», хотя ветка и так называет её однозначно). Задача из ветки
+    пригодна и свободна — контракт обязан пройти и назначить автора именно
+    на неё, а не упасть из-за формы первой строки тела."""
+    routes = {
+        "pulls/900": pull(
+            900, branch="agent/256-task-rework-loop",
+            pr_body="Задача #256 (task-rework-loop). Реализует пп.1-2",
+        ),
+        "issues/256": issue(256, state="open", assignees=()),
+        "pulls?state=open": [],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=900)
+
+    assert code == 0, "ветка однозначно называет открытую задачу — контракт обязан пройти"
+    assignment_calls = [c for c in fake.mutating_calls() if "assignees" in c]
+    assert len(assignment_calls) == 1
+    assert "issues/256/assignees" in assignment_calls[0]
+
+
+def test_no_branch_and_no_declaration_names_the_fix(monkeypatch):
+    """Отказ обязан называть готовое действие (постановка #394, п.4), не
+    просто «нет ссылки на задачу»."""
+    routes = {
+        "pulls/901": pull(901, pr_body="просто описание без номера задачи"),
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=901)
+
+    assert code == 1
+    assert not fake.mutating_calls()
+
+
+def test_rework_supersession_body_overrides_closed_branch_task(monkeypatch):
+    """Живой класс #394 (4 из 30 открытых PR репозитория на 2026-09-06: #388,
+    #384, #359, #167): задача закрыта раньше срока («закрытая задача не
+    переоткрывается»), докрытие оформлено НОВОЙ узкой задачей, объявленной
+    первой строкой тела — ветку переименовать нельзя (agent/<N>-slug ставится
+    один раз). Контракт обязан подхватить пригодную задачу из тела, а не
+    упасть на закрытой из ветки."""
+    routes = {
+        "pulls/902": pull(
+            902, branch="agent/256-task-rework-loop",
+            pr_body="#391\n\nRelated: #256 (закрыта акцептансом, докрытие — #391)",
+        ),
+        "issues/256": issue(256, state="closed", assignees=("mytab0r",)),
+        "issues/391": issue(391, state="open", assignees=()),
+        "pulls?state=open": [],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=902)
+
+    assert code == 0, "тело объявляет пригодную задачу-преемницу — контракт обязан пройти"
+    assignment_calls = [c for c in fake.mutating_calls() if "assignees" in c]
+    assert len(assignment_calls) == 1
+    assert "issues/391/assignees" in assignment_calls[0], (
+        "контракт обязан назначить на ОТКРЫТУЮ задачу-преемницу #391, "
+        f"не на закрытую #256 из ветки: {assignment_calls}"
+    )
+
+
+def test_both_branch_and_body_task_closed_reports_branch_reason(monkeypatch):
+    """Ни один кандидат не пригоден — контракт докладывает причину ПЕРВОГО
+    (ветка, надёжный источник), не молчит и не выбирает произвольно."""
+    routes = {
+        "pulls/903": pull(
+            903, branch="agent/256-task-rework-loop",
+            pr_body="#392\n\nтекст",
+        ),
+        "issues/256": issue(256, state="closed"),
+        "issues/392": issue(392, state="closed"),
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=903)
+
+    assert code == 1
+    assert not fake.mutating_calls()
+
+
+def test_duplicate_pr_detected_via_other_branch_not_only_declaration(monkeypatch):
+    """Симметрия #394: чужой открытый PR на ту же задачу ловится и по имени
+    его ветки, даже если его тело не декларирует номер первой строкой (PR по
+    шаблону, автор ещё не заполнил описание) — раньше (`declares_task` по
+    телу) такой конфликт был бы не пойман вовсе."""
+    routes = {
+        "pulls/906": pull(906, branch="agent/701-race", pr_body="#701\n\nтекст"),
+        "issues/701": issue(701, state="open", assignees=()),
+        "pulls?state=open": [
+            pull(907, branch="agent/701-race-again", pr_body="шаблонное описание без декларации"),
+        ],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=906)
+
+    assert code == 1, (
+        "чужой открытый PR #907 назвал ту же задачу #701 своей веткой — "
+        "второй PR на задачу не проходит контракт, даже без декларации в теле"
+    )
