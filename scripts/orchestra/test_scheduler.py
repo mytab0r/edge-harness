@@ -2444,6 +2444,44 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
     assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100&page=1"]
 
 
+def test_accept_merged_tasks_does_not_reclose_after_manual_reopen(monkeypatch):
+    """Живой случай #363 (#131 ← PR #132, воспроизведено трижды за PR #359):
+    задачу закрыли приёмкой, кто-то переоткрыл её осознанно — на следующем
+    пульсе она снова в пуле (открытых issues) и снова матчится с тем же
+    старым УЖЕ слитым PR через merged_pr_map (мерж никуда не делся). Улика
+    от этого PR по-прежнему валидна, и без guard'а ok/docs закрывала бы её
+    заново за секунды, отменяя переоткрытие. Маркер `ACCEPTANCE_OK_MARKER
+    PR #138` в комментариях — прод-форма того, что приёмка САМА оставляет
+    перед PATCH при первом закрытии (см. test_accept_merged_tasks_closes_on_
+    green_check_runs) — обязан остановить второе закрытие, не трогая
+    files/check-runs и не отправляя PATCH снова."""
+    ok_marker = f"{sch.ACCEPTANCE_OK_MARKER} PR #138"
+    fake = FakeGh({
+        "issues/18/comments": [{
+            "created_at": "2026-09-02T22:00:00Z",
+            "body": f"✅ {ok_marker} (script): улика получена — закрываю задачу. Прогон зелёный.",
+        }],
+        # Улика по-прежнему доступна и после реопена (мерж — свершившийся
+        # факт), поэтому если бы guard отсутствовал, evidence нашлась бы и
+        # PATCH прошёл бы заново — маршруты намеренно настоящие, не пустые.
+        "pulls/138/files": files_payload(PR_138_FILES),
+        "issues/18 -f state=closed": None,
+        f"commits/{PR138['head']['sha']}/check-runs?per_page=100": PR_138_CHECK_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: pytest.fail("замок не трогаем — не закрывали"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("маркер уже стоит — комментарий не повторяем"))
+
+    pool = [issue(18, assignees=())]  # переоткрыта человеком, исполнитель не назначен
+    lines, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138})
+
+    assert hard_failure is False
+    assert any("уже закрывала" in line and "#18" in line for line in lines)
+    assert not any(call.startswith(f"-X PATCH repos/{REPO}/issues/18") for call in fake.calls)
+    assert not any("pulls/138/files" in call for call in fake.calls)
+    assert not any("check-runs" in call for call in fake.calls)
+
+
 def test_accept_merged_tasks_fail_retries_cleanup_when_assignee_stuck(monkeypatch):
     """Тот же класс, что и у ветки дисклеймера (находка AI-ревью PR #342,
     класс воспроизведён): fail_marker уже стоит, но assignee всё ещё висит —

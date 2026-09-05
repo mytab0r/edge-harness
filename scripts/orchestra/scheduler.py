@@ -106,6 +106,7 @@ from pulse_guard import (
     gh,
     heartbeat_check,
     issue_marker_times,
+    issue_markers_any,
     minutes_between,
     parse_time,
     post_issue_comment,
@@ -1289,6 +1290,19 @@ ACCEPTANCE_ERROR_MARKER = "[приёмка: сбой]"
 ACCEPTANCE_PARTIAL_MARKER = "[приёмка: требует проверки человеком]"
 ACCEPTANCE_EPIC_MARKER = "[приёмка: эпик завершён]"
 
+
+def acceptance_pr_marker(base: str, pr_number: int) -> str:
+    """Единое место правды для формата маркера дедупликации «это действие уже
+    произошло для ЭТОЙ пары (issue, PR)» — partial/fail/ok/docs строят маркер
+    одинаково (`{MARKER} PR #{pr_number}`). До #363 каждая ветка собирала эту
+    f-строку заново, и именно поэтому ветка ok/docs осталась вообще БЕЗ
+    признака: не было одного места, куда новый guard мог бы просто дописаться.
+    Маркер собирается из константы, уникальной для КОНКРЕТНОГО PR (не просто
+    «наш служебный текст»), поэтому «маркер найден» равносильно «приёмка уже
+    произвела это действие для этого самого PR», а не для какого-то другого
+    мержа этой же задачи."""
+    return f"{base} PR #{pr_number}"
+
 # Рядом со STALE_HOURS (то же назначение — «сколько ждать, прежде чем бить
 # тревогу», но для другого канала: STALE_HOURS про назначение без PR,
 # ACCEPTANCE_PENDING_HOURS — про PR, который слит, но улика не появляется).
@@ -1571,7 +1585,7 @@ def accept_merged_tasks(
 
         disclaimer = partial_disclaimer(pull.get("body") or "")
         if disclaimer is not None:
-            partial_marker = f"{ACCEPTANCE_PARTIAL_MARKER} PR #{pull['number']}"
+            partial_marker = acceptance_pr_marker(ACCEPTANCE_PARTIAL_MARKER, pull["number"])
             try:
                 already_marked = bool(issue_marker_times(repo, number, partial_marker))
             except RuntimeError as error:
@@ -1613,7 +1627,7 @@ def accept_merged_tasks(
                 lines.append(f"⚠️ замок task-{number} не снят: {error}")
             continue
 
-        fail_marker = f"{ACCEPTANCE_FAIL_MARKER} PR #{pull['number']}"
+        fail_marker = acceptance_pr_marker(ACCEPTANCE_FAIL_MARKER, pull["number"])
         try:
             already_failed = bool(issue_marker_times(repo, number, fail_marker))
         except RuntimeError as error:
@@ -1636,6 +1650,37 @@ def accept_merged_tasks(
                 lines.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
                 lines.append(f"⚠️ замок task-{number} не снят: {error}")
+            continue
+
+        # Дедуп закрытия по ЭТОМУ PR (#363, живой случай — #131 ← PR #132):
+        # ветка ok/docs ниже раньше не проверяла, закрывала ли приёмка эту
+        # пару (issue, PR) уже один раз. Улика мержа не исчезает — после
+        # переоткрытия issue снова попадает в pool, снова матчится с тем же
+        # старым merged PR через merged_pr_map, улика снова читается как
+        # валидная, и PATCH state=closed отменял переоткрытие за 20-80с на
+        # следующем же пульсе. Признак «уже закрывали ИМЕННО этим PR» — маркер
+        # ACCEPTANCE_OK_MARKER/ACCEPTANCE_DOCS_MARKER с номером ЭТОГО PR: его
+        # ставит сама эта же ветка непосредственно перед PATCH ниже, то есть
+        # «маркер найден» эквивалентно «PATCH state=closed по этому PR уже
+        # прошёл» — это и есть факт закрытия, а не косвенная примета. Иные
+        # кандидаты ненадёжны: `closed_at > merged_at` ничего не говорит о
+        # ПРИЧИНЕ закрытия (issue могли закрыть вручную по другому поводу),
+        # событие timeline «closed» не хранит, каким PR оно вызвано. Найдя
+        # маркер — уходим молча: переоткрытие человеком уважаем, приёмка с
+        # ним не спорит.
+        closed_markers = (
+            acceptance_pr_marker(ACCEPTANCE_OK_MARKER, pull["number"]),
+            acceptance_pr_marker(ACCEPTANCE_DOCS_MARKER, pull["number"]),
+        )
+        try:
+            already_closed = bool(issue_markers_any(repo, number, closed_markers))
+        except RuntimeError as error:
+            lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+            continue
+        if already_closed:
+            lines.append(
+                f"↩️ #{number}: приёмка уже закрывала задачу по PR #{pull['number']} — "
+                f"задача переоткрыта, повторно не закрываю")
             continue
 
         category = None
