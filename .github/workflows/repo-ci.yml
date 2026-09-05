@@ -65,6 +65,13 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_pulse_guard.py -q
 
+      # Сборщик квот харнеса (#324): Cloudflare/GitHub/LLM в одну таблицу.
+      # Кормится реальными фикстурами (gh api rate_limit, пример из доков CF).
+      - name: Тесты сборщика квот
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_quotas.py -q
+
       # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
       # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
       # ловил 403 на автослежении), сбой архивации — жёсткий и эскалируется

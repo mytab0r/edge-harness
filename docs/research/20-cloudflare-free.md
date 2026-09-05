@@ -350,6 +350,46 @@ env через инсталл-цикл. Нюансы: значения коэр�
 
 ---
 
+## Метрики использования: как снять срез, не гадая (дополнено 2026-09-05, #324)
+
+Повод: 2026-09-03 система молча упёрлась в дневной лимит DO `rows_read`
+(5 000 000) — узнали из письма Cloudflare, а не из дашборда или API, причину
+искали три версии подряд. `scripts/measure/quotas.py` (#324) снимает срез по
+всем ресурсам разом; здесь — что у него получилось узнать про сам API.
+
+**Workers requests и DO storage — задокументированы дословно.**
+GraphQL Analytics API (`https://api.cloudflare.com/client/v4/graphql`), датасеты
+подтверждены [примером в доках](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
+и [странице метрик DO](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/):
+
+- `workersInvocationsAdaptive` → `sum { requests, errors, subrequests }`,
+  `quantiles { cpuTimeP50, cpuTimeP99 }`;
+- `durableObjectsStorageGroups` → `max { storedBytes }`.
+
+**DO `rows_read`/`rows_written` — имя GraphQL-поля Cloudflare НЕ публикует.**
+Страница метрик DO перечисляет 4 датасета (`durableObjectsInvocationsAdaptiveGroups`,
+`durableObjectsPeriodicGroups`, `durableObjectsStorageGroups`,
+`durableObjectsSubrequestsAdaptiveGroups`) и явно отсылает к
+[интроспекции](https://developers.cloudflare.com/analytics/graphql-api/features/discovery/introspection/)
+за именами полей — в отличие от D1, где [есть таблица «GraphQL Field Name»](https://developers.cloudflare.com/d1/observability/metrics-analytics/)
+(`rowsRead`/`rowsWritten` подтверждены дословно, но это другой продукт). Ни в
+одном официальном примере запроса к DO-датасетам поле, содержащее
+rows/строки, не встретилось. Рабочая гипотеза (**не подтверждено**): метрика
+`rows_read` могла долго не экспонироваться через Analytics API вовсе — только
+через биллинговый алерт по почте, что и объясняет, почему инцидент 2026-09-03
+не был виден заранее ни в дашборде, ни живым запросом. `quotas.py` не
+угадывает имя поля — сначала интроспектирует схему (`__schema { types { name } }`,
+затем `__type(name: …) { fields { name } }` по каждому Sum/Max-типу датасетов
+DO) и ищет подстроку `rowsread`/`rowswritten`; не находит → «нет данных» с
+этой причиной в отчёте, а не тихий 0. Первый живой прогон `quotas.yml`
+покажет, экспонируется метрика или нет — досюда факт либо подтвердится, либо
+опровергнется прогоном, а не рассуждением.
+
+**GitHub-часть — не Cloudflare, но родственный «не гадать»-вопрос** решён в
+[research/21](21-github-actions.md#метрики-квот-github-дополнено-2026-09-05-324).
+
+---
+
 ## Что не подтверждено
 
 Не выдумывать факты вокруг этих пунктов — они реально не закрыты докой на 2026-08-28.
