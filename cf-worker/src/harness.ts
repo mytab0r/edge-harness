@@ -1015,6 +1015,19 @@ export class Harness extends DurableObject<Env> {
       console.log(`inbox reclaim failed: ${error instanceof Error ? error.message : error}`);
     }
     try {
+      // Автодовод failed-директив после появления GH_ISSUES_TOKEN (#304): без
+      // этого шага установка секрета не доводила накопленные failed —
+      // требовался ручной retry_failed, хотя критерий #20 («ни одно сообщение
+      // не теряется») подразумевает самовосстановление. Ставится ДО
+      // #processInbox — ожившие сообщения разбираются тем же тиком.
+      const revived = this.#reviveConfiguredInboxFailures();
+      if (revived > 0) {
+        console.log(`inbox: GH_ISSUES_TOKEN обнаружен — ${revived} failed-сообщени(е/й) с issues_not_configured возвращены в new`);
+      }
+    } catch (error) {
+      console.log(`inbox auto-revive failed: ${error instanceof Error ? error.message : error}`);
+    }
+    try {
       await this.#processInbox(MESSAGE_PROCESS_MAX, false);
     } catch (error) {
       console.log(`inbox process failed: ${error instanceof Error ? error.message : error}`);
@@ -1547,6 +1560,31 @@ export class Harness extends DurableObject<Env> {
       );
     }
     return reclaimed;
+  }
+
+  /**
+   * Автодовод после установки GH_ISSUES_TOKEN (#304, ADR 0011): пока секрета
+   * нет, `#createIssue` честно отвечает `issues_not_configured`, и после
+   * `LIMITS.messageMaxAttempts` попыток сообщение уходит в failed — раньше
+   * единственным газом был ручной `retry_failed`, который штурмует ВСЕ failed
+   * без разбора причины. Здесь — узкая, самоограничивающаяся ревизия: строку
+   * `"error":"issues_not_configured"` `#createIssue` пишет ТОЛЬКО когда токена
+   * нет (`if (!token || !repo)`, первая строка функции) — значит, пока токен
+   * настроен, это условие физически не может произойти заново, и множество
+   * подходящих строк только опустошается, не пополняется. Отдельного флага
+   * «уже разбужено один раз» не нужно: возврат в new с capped `attempts=0`
+   * — единственное действие, а следующая попытка либо создаст issue (done),
+   * либо провалится по ДРУГОЙ причине (сеть/403/422), которая под этот
+   * фильтр уже не попадает. Прочие failed (`stuck_reclaimed`, github_4xx и
+   * т.п.) не трогает — «без штурма прочих failed» (критерий #304).
+   */
+  #reviveConfiguredInboxFailures(): number {
+    if (!this.env.GH_ISSUES_TOKEN) return 0;
+    const cursor = this.#sql.exec(
+      `UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL
+       WHERE status = 'failed' AND result LIKE '%"error":"issues_not_configured"%'`,
+    );
+    return Number(cursor.rowsWritten);
   }
 
   /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в

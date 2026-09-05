@@ -1213,6 +1213,62 @@ describe("inbox: сообщения владельца", () => {
     expect(gotBelow.message.attempts).toBe(cap);
   });
 
+  it("автодовод (#304): пульс сам возвращает в new failed с issues_not_configured, как только GH_ISSUES_TOKEN появился — прочие failed не трогает", async () => {
+    const s = sender();
+    // A — раньше упёрлась в отсутствие токена (симулируем итог капа попыток
+    // напрямую в хранилище — то же состояние, в которое реально приводит
+    // "разбор: директива без GH_ISSUES_TOKEN повторяется" выше).
+    const revivable = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `revive-${s}`, sender_id: s, text: "/task Ожившая директива" })
+    ).json<{ message_id: number }>();
+    // B — failed по ДРУГОЙ причине: не должна ожить вместе с A ("без штурма прочих failed").
+    const other = await (
+      await postJson("/api/messages", { source: "t", source_msg_id: `other-failed-${s}`, sender_id: s, text: "/task Провалилась иначе" })
+    ).json<{ message_id: number }>();
+
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'failed', kind = 'directive', attempts = 3, result = ? WHERE id = ?",
+        JSON.stringify({ error: "issues_not_configured" }), revivable.message_id,
+      );
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'failed', kind = 'directive', attempts = 3, result = ? WHERE id = ?",
+        JSON.stringify({ error: "github_403: forbidden" }), other.message_id,
+      );
+    });
+
+    const realFetch = globalThis.fetch;
+    env.GH_ISSUES_TOKEN = "test-issue-token-revive";
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubIssuesCall(input)) {
+        return new Response(JSON.stringify({ number: 5150, html_url: "https://github.com/mytab0r/edge-harness/issues/5150" }), { status: 201 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await (instance as unknown as { alarm(): Promise<void> }).alarm();
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_ISSUES_TOKEN = "";
+    }
+
+    // A: ожила (attempts=0 → одна попытка того же тика) и создала issue.
+    const gotRevivable = await getJson<{ message: { status: string; attempts: number; result: string } }>(`/api/messages/${revivable.message_id}`);
+    expect(gotRevivable.message.status).toBe("done");
+    expect(gotRevivable.message.attempts).toBe(1);
+    expect(JSON.parse(gotRevivable.message.result).issue_number).toBe(5150);
+
+    // B: не тронута — осталась failed с прежней причиной, тем же capped attempts.
+    const gotOther = await getJson<{ message: { status: string; attempts: number; result: string } }>(`/api/messages/${other.message_id}`);
+    expect(gotOther.message.status).toBe("failed");
+    expect(gotOther.message.attempts).toBe(3);
+    expect(JSON.parse(gotOther.message.result).error).toBe("github_403: forbidden");
+  });
+
   it("ручной POST идемпотентен: повтор с тем же source_msg_id отвечает существующей строкой (тот же класс, что ingest)", async () => {
     const dupKey = `dup-${Date.now()}`;
     const first = await postJson("/api/messages", { source: "manual", source_msg_id: dupKey, text: "первый" });
