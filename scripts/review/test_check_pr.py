@@ -305,12 +305,17 @@ def test_check_pr_posts_success_status_on_review_ok(monkeypatch, capsys):
 
 
 def test_check_pr_posts_failure_status_on_findings(monkeypatch, capsys):
-    # Секрет в добавленной строке диффа (AWS access key, AKIA + 16 симв.) —
-    # находка → review:changes-requested → статус обязан стать failure,
-    # не success, тем же порогом, что и метка.
+    # Неразрешённый конфликт-маркер в добавленной строке диффа — находка →
+    # review:changes-requested → статус обязан стать failure, не success,
+    # тем же порогом, что и метка. Маркер собран конкатенацией (не литералом
+    # в исходнике теста): собственный check_pr.py сканирует ЭТОТ файл в
+    # своём диффе на PR данной задачи — литеральный секрет/маркер здесь же
+    # сам стал бы находкой (живой урок #345: PR #346 словил ровно это на
+    # прежней версии теста с литеральным AKIA-ключом).
     pull = {"head": {"sha": "cafef00d"}, "labels": []}
+    conflict_marker_line = "+" + ("<" * 7) + " HEAD\n"
     rc, run_gh_calls = _run_check_pr_main(
-        monkeypatch, capsys, "+AKIAABCDEFGHIJKLMNOP\n", pull, [])
+        monkeypatch, capsys, conflict_marker_line, pull, [])
 
     assert rc == 1  # находка — шаг красный (fail loud), как и до этой правки
     status_calls = _status_calls(run_gh_calls)
