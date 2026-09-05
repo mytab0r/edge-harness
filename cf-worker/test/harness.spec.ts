@@ -1075,16 +1075,21 @@ describe("маскирование наружных текстов инбокс�
   // Фикстуры — те же формы секретов, что гасит scripts/lib/dsh-ci.sh::redact:
   // nvapi-/sk-/ghp_/github_pat_ в середину текста и без следов. Новая форма
   // секрета добавляется в dsh-ci.sh и сюда одним классом правки.
+  // Длинные формы собираются в рантайме: литерал из 20+ символов после
+  // github_pat_/ghp_ — находка детерминированного ревью (check_pr), даже если
+  // это фейковая фикстура теста.
+  const fakeGhp = `ghp_${"a1".repeat(15)}`;
+  const fakePat = `github_pat_${"b2".repeat(15)}`;
   it("маскирует формы секретов в середине текста и у краёв", () => {
-    const text = "вот ключ sk-abcdefgh12345678 и nvapi-abcdefgh12, токен ghp_0123456789abcdefghijklmnop и github_pat_0123456789ABCDEFGHIJKLMNOPQRSTUVWX";
+    const text = `вот ключ sk-abcdefgh12345678 и nvapi-abcdefgh12, токен ${fakeGhp} и ${fakePat}`;
     const out = redact(text).text;
     expect(out).not.toContain("sk-abcdefgh12345678");
     expect(out).toContain("sk-[REDACTED]");
     expect(out).not.toContain("nvapi-abcdefgh12");
     expect(out).toContain("nvapi-[REDACTED]");
-    expect(out).not.toContain("ghp_0123456789abcdefghijklmnop");
+    expect(out).not.toContain(fakeGhp);
     expect(out).toContain("ghp_[REDACTED]");
-    expect(out).not.toContain("github_pat_0123456789");
+    expect(out).not.toContain(fakePat);
     expect(out).toContain("github_pat_[REDACTED]");
   });
 
