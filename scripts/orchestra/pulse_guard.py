@@ -8,6 +8,9 @@
    НЕуспешные прогоны worker.yml (conclusion=failure/cancelled, любой success
    между ними сбрасывает счётчик). От WORKER_FAILURE_PAUSE_AFTER подряд —
    диспатч остановлен, сигнал уходит один раз на серию (не на каждый пульс).
+   Возобновление (#220): success-маркер RESUME_MARKER в #120 (ставит его
+   scheduler.after_merge, когда слит PR задачи, над которой работал последний
+   красный прогон) считается виртуальным success серии — сброс без пробы.
 2. «Кто следит за следящим»: мёртвый scheduler сам крикнуть не может, поэтому
    возраст последнего успешного пульса проверяет КАЖДЫЙ запуск планировщика:
    если предыдущий успех старше HEARTBEAT_MAX_AGE_MINUTES — значит пульсы
@@ -75,6 +78,15 @@ PROBE_MARKER = "[статус конвейера: проба"
 # PR #318, п.1: было — один комментарий на всю жизнь задачи #120).
 HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
 HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
+
+# Success-маркер авто-возобновления (#220): scheduler.after_merge ставит его в
+# #120, когда слит PR задачи ветки, а последний красный прогон worker.yml
+# работал именно над этой задачей (след аренды «worker run <id>»). conveyor_gate
+# считает маркер виртуальным success серии: красные прогоны и маркеры старше
+# него перестают участвовать в решении, ожидать пробу (#205) не нужно. Номер PR
+# дописывается в тот же маркер: "[статус конвейера: возобновлено по мержу #N]" —
+# по полному токену (маркер+номер) дедуплицируется «один сигнал на мерж».
+RESUME_MARKER = "[статус конвейера: возобновлено по мержу"
 
 # ── Пороги петли открытого PR (#196) ─────────────────────────────────────────────
 # Три поведения scheduler.py читают пороги отсюда — рядом с остальными порогами
@@ -198,6 +210,24 @@ def decide_gate_state(
         return "first"
     backoff = probe_backoff_minutes(probe_attempts + 1)
     return "probe" if minutes_between(last_marker_at, now) >= backoff else "open"
+
+
+def series_anchor(last_success_at: datetime | None, resume_at: datetime | None) -> datetime | None:
+    """#220: точка, левее которой серия не существует — последний реальный
+    success ИЛИ success-маркер возобновления (сброс мержем), что новее.
+    None, когда нет ни того, ни другого: серия бесконечна, в счёт всё."""
+    times = [t for t in (last_success_at, resume_at) if t is not None]
+    return max(times) if times else None
+
+
+def runs_after(runs: list[dict], anchor: datetime | None) -> list[dict]:
+    """Прогоны новее якоря серии. Красные прогоны старше якоря объяснены
+    (закрыты success'ом или сброшены мержем, #220) и подсчёт серии не кормят:
+    series_anchor + эта фильтрация вместе дают ровно семантику «виртуального
+    success», вставленного в момент якоря."""
+    if anchor is None:
+        return runs
+    return [r for r in runs if parse_time(r["created_at"]) > anchor]
 
 
 def probe_marker_attempts(markers: list[tuple[datetime, str]]) -> int:
@@ -342,8 +372,9 @@ def pause_alert_text(failures: int, run: dict | None, error: str) -> str:
         f"Ошибка последнего прогона: {error}\n"
         f"Возобновление: полуоткрытое состояние (#205) само пробует диспатч по "
         f"истечении выдержки (от {PROBE_BACKOFF_BASE_MINUTES} мин, экспоненциально, "
-        f"потолок {PROBE_BACKOFF_MAX_MINUTES} мин) — либо ручной "
-        "`gh workflow run worker`, который сбрасывает счётчик сразу."
+        f"потолок {PROBE_BACKOFF_MAX_MINUTES} мин); мерж PR, чинившего причину "
+        f"(задачи последнего красного прогона), сбрасывает счётчик сразу (#220); "
+        f"либо ручной `gh workflow run worker`, который сбрасывает счётчик тоже."
     )
 
 
@@ -360,6 +391,26 @@ def probe_alert_text(attempt: int, backoff_minutes: float, run: dict | None, err
         f"Ошибка последнего прогона: {error}\n"
         "Зелёная проба замкнёт предохранитель; красная — выдержка вырастет "
         "экспоненциально и уйдёт следующая проба."
+    )
+
+
+def resume_alert_text(pr_number: int, task_number: int, run: dict | None) -> str:
+    """Сигнал сброса серии мержем (#220). Маркер RESUME_MARKER с номером PR —
+    единственное, по чему conveyor_gate отличает возобновление от обычного
+    текста и по чему дедуплицируется повторный сигнал о том же мерже; ссылка
+    на прогон — та же улика, что в pause/probe текстах выше."""
+    run_line = ""
+    if run:
+        run_line = f"\nПоследний красный: {run.get('display_title') or run.get('name') or 'run'} — {run.get('html_url', 'без ссылки')}"
+    return (
+        f"✅ edge-harness: {RESUME_MARKER} #{pr_number}]\n"
+        f"Слит PR #{pr_number} — задача #{task_number}, над которой работал "
+        f"последний красный прогон {WORKER_WORKFLOW}. Причина серии с высокой "
+        f"вероятностью починена этим мержем: серия сбрасывается сразу, без "
+        f"ожидания пробы (#220)."
+        f"{run_line}\n"
+        f"Следующий пульс диспатчит воркера как обычно; если причина жива, "
+        f"серия наберётся заново и предохранитель сработает как обычно."
     )
 
 
@@ -455,7 +506,7 @@ def last_failure_error(repo: str, run: dict) -> str:
     return "; ".join(bad)
 
 
-def _all_issue_comments(repo: str, issue_number: int) -> list[dict]:
+def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     """Все комментарии issue постранично, не только первая страница
     `per_page=100` (#276, тот же класс, что review_labels.list_pr_files/
     list_timeline и #294/#303: молчаливая обрезка на самом длинном обсуждении
@@ -463,7 +514,9 @@ def _all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     решают «уже сигналили в этом эпизоде» по последнему маркеру, поэтому именно
     длинная задача-статус #120/#134, у которой маркеров и так больше всего,
     первой теряла бы хвост). Листание — та же форма: короткая страница
-    (`len(chunk) < 100`) значит «дальше страниц нет»."""
+    (`len(chunk) < 100`) значит «дальше страниц нет». Публичная (без
+    подчёркивания), потому что читается и вне пары «предохранитель/пульс» —
+    scheduler.resume_series_by_merge ищет в задачах след аренды (#220)."""
     page = 1
     comments: list[dict] = []
     while True:
@@ -478,7 +531,7 @@ def _all_issue_comments(repo: str, issue_number: int) -> list[dict]:
 
 
 def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
-    payload = _all_issue_comments(repo, issue_number)
+    payload = all_issue_comments(repo, issue_number)
     return [
         parse_time(comment["created_at"])
         for comment in payload
@@ -490,7 +543,7 @@ def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) ->
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
     но и от его содержимого (номер попытки пробы, #205)."""
-    payload = _all_issue_comments(repo, issue_number)
+    payload = all_issue_comments(repo, issue_number)
     result = []
     for comment in payload:
         body = comment.get("body") or ""
@@ -671,6 +724,11 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     open   — серия красная, выдержка не истекла — диспатч заблокирован, тихо
              (маркер уже стоит, второй раз не оповещаем).
 
+    Сброс серии без пробы (#220): success-маркер RESUME_MARKER в #120 (его
+    ставит scheduler.after_merge для мержа, чинившего причину) работает как
+    виртуальный success — series_anchor берёт его вместо последнего зелёного
+    прогона, и красные прогоны/маркеры старше якоря в решении не участвуют.
+
     Носитель состояния — комментарии-маркеры в #120 (тот же приём, что уже
     даёт issue_marker_times для пульса и что #196 использует для счётчика
     попыток ai-review): переживают перезапуск оркестратора, читаются заново
@@ -688,7 +746,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = parse_time(last_ok["created_at"]) if last_ok else None
     try:
-        all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER,))
+        all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER))
     except RuntimeError as error:
         if decide_dispatch(failures):
             return ([f"🟢 серия красных worker.yml: {failures} "
@@ -701,13 +759,26 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
         return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
                  f"подряд — диспатч остановлен (маркеры #{WATCHDOG_ISSUE} недоступны)"], [],
                 False)
-    # Маркеры прошлой серии (старше последнего success) не в счёт — иначе новая
-    # серия унаследует чужой номер попытки и выдержку с первого же пульса.
-    markers = [(t, b) for t, b in all_markers if last_ok_at is None or t > last_ok_at]
+    # #220: success-маркер возобновления — виртуальный success серии. Якорь —
+    # что новее, последний success или сброс мержем; красные прогоны и маркеры
+    # серий старше якоря объяснены и в решении не участвуют — иначе сброс
+    # мержем не снял бы ни счётчик, ни выдержку/номер попытки прошлой серии.
+    resume_at = max((t for t, body in all_markers if RESUME_MARKER in body), default=None)
+    anchor = series_anchor(last_ok_at, resume_at)
+    failures = count_consecutive_failures(
+        [r.get("conclusion") for r in runs_after(runs, anchor)])
+    # Маркеры прошлой серии (старше якоря: success или сброс мержем) не в счёт —
+    # иначе новая серия унаследует чужой номер попытки и выдержку с первого же
+    # пульса. Маркеры возобновления выпадают сами: resume_at — наибольший из
+    # них, якорь не бывает его старше, поэтому «строже якоря» не бывает.
+    markers = [(t, body) for t, body in all_markers if anchor is None or t > anchor]
     if not markers and decide_dispatch(failures):
-        return ([f"🟢 серия красных worker.yml: {failures} "
-                 f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"], [],
-                True)
+        allowed_line = (f"🟢 серия красных worker.yml: {failures} "
+                        f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён")
+        if resume_at is not None and (last_ok_at is None or resume_at > last_ok_at):
+            # сброс именно мержем, а не зелёным прогоном — назови причину
+            allowed_line += " (серия сброшена мержем, см. #120)"
+        return ([allowed_line], [], True)
     marker_times = [t for t, _ in markers]
     last_marker_at = max(marker_times) if marker_times else None
     probe_attempts = probe_marker_attempts(markers)

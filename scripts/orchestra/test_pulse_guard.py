@@ -820,3 +820,145 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     # (30-минутная выдержка после первой красной пробы на 15-й минуте истекает
     # на 45-й) — итого РОВНО 2 пробы, не 5 (столько дал бы пульс без выдержки)
     assert probes == 2, f"гвардия частоты нарушена: проб за час {probes}, ожидалось 2"
+
+
+# ── Авто-возобновление по мержу (#220): success-маркер — виртуальный success ──────
+
+
+def resume_body(pr: int = 445, task: int = 205) -> str:
+    """Прод-форма тела маркера возобновления: собирается той же функцией кода,
+    что пишет его в проде (resume_alert_text) — не пересказом."""
+    return pg.resume_alert_text(pr, task, None)
+
+
+def test_series_anchor_takes_latest_of_success_and_resume():
+    assert pg.series_anchor(None, None) is None
+    assert pg.series_anchor(M(9), None) == M(9)
+    assert pg.series_anchor(None, M(11)) == M(11)
+    assert pg.series_anchor(M(9), M(11)) == M(11)
+    assert pg.series_anchor(M(12), M(11)) == M(12)  # зелёный прогон новее сброса
+
+
+def test_runs_after_keeps_only_runs_newer_than_anchor():
+    runs = [run("failure", "2026-08-31T11:50:00Z", 3),
+            run("failure", "2026-08-31T11:35:00Z", 2),
+            run("failure", "2026-08-31T11:20:00Z", 1)]
+    assert pg.runs_after(runs, None) == runs  # без якоря — серия бесконечна
+    assert pg.runs_after(runs, utc(2026, 8, 31, 11, 35)) == runs[:1]
+    assert pg.runs_after(runs, utc(2026, 8, 31, 11, 55)) == []
+
+
+def test_gate_resume_marker_reopens_dispatch_without_probe(monkeypatch):
+    """Ключевой сценарий #220: серия красная, пауза стоит, но слит PR задачи
+    последнего красного прогона (маркер возобновления 11:55 новее маркера
+    паузы 11:45) — диспатч разрешён СРАЗУ, без выдержки и без комментария
+    (новых сигналов серия не породила). Мутации: (а) не читать RESUME_MARKER
+    — гейт ушёл бы в пробу с новым комментарием; (б) не отфильтровать маркер
+    возобновления из серийных — гейт ушёл бы в open, 5 минут выдержки."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.pause_alert_text(3, None, "err")},
+            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert actions == [], "сброс мержем — новых сигналов серия не порождает"
+    assert any("сброшена мержем" in line for line in observations), \
+        "сброс именно мержем (зелёного прогона не было) обязан быть назван в отчёте"
+
+
+def test_gate_resume_resets_probe_attempt_numbering(monkeypatch):
+    """Сброс мержем закрывает и счётчик попыток пробы: маркеры «пауза»/«проба 1»
+    старше маркера возобновления — гейт обязан вернуться в closed, а не считать
+    выдержку попытки 2 (30 мин) от чужого маркера. Мутация: оставить маркеры
+    в серии — allowed False (open)."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)},
+            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert actions == []
+    assert not any("пробный диспатч" in line for line in observations)
+
+
+def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
+    """Сброс не анестезия: красные прогоны ПОСЛЕ маркера возобновления — новая
+    серия, считаются с нуля. Два красных после сброса (порог 3) — диспатч
+    разрешён; мутация без runs_after: failures=4 по старым красным — пауза."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run("failure", "2026-08-31T11:50:00Z", 4),
+            run("failure", "2026-08-31T11:45:00Z", 3),
+            run("failure", "2026-08-31T11:20:00Z", 2),
+            run("failure", "2026-08-31T11:10:00Z", 1),
+        ]},
+        "runs/4/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:40:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+
+    # три красных после сброса — предохранитель срабатывает заново (first):
+    # гвардия, что сброс не отменяет сам механизм паузы
+    fake.routes["workflows/worker.yml/runs"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 5),
+        run("failure", "2026-08-31T11:45:00Z", 4),
+        run("failure", "2026-08-31T11:42:00Z", 3),
+        run("failure", "2026-08-31T11:20:00Z", 2),
+        run("failure", "2026-08-31T11:10:00Z", 1),
+    ]}
+    fake.routes["runs/5/jobs"] = JOBS_PAYLOAD
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert len(posted) == 1 and pg.PAUSE_MARKER in posted[0]
+    assert len(actions) == 1 and "паузе" in actions[0]  # постинг паузы — действие
+
+
+def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
+    """Возобновление старше последнего зелёного прогона — история, не якорь:
+    серия после зелёного считается по зелёному, и в отчёте нет слов про мерж."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_OK,  # success 11:50 — новее сброса 11:30
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:30:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert not any("мержем" in line for line in observations)
+
+
+def test_resume_alert_text_carries_marker_evidence():
+    text = resume_body(pr=445, task=205)
+    assert f"{pg.RESUME_MARKER} #445]" in text   # токен, по которому gate и дедуп читают сброс
+    assert "#205" in text                        # задача последнего красного прогона
+    assert "без ожидания пробы" in text          # путь возобновления назван
+    assert pg.PAUSE_MARKER not in text           # маркер серии — не сброс: их нельзя смешивать
