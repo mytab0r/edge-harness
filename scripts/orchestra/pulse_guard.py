@@ -46,12 +46,23 @@ PAUSE_MARKER ставится только сигнальным коммента
 
 import hashlib
 import html
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+
+# Заведение issue пула — одно место правды (pool_issue.create_pool_issue,
+# #526): labels без `task` — RuntimeError ДО сетевого вызова. Подключение тем
+# же приёмом, что в stall_detector.py (pulse_guard сам грузится через
+# importlib, обычный импорт scripts.lib здесь не работает).
+_PI_SPEC = importlib.util.spec_from_file_location(
+    "pool_issue", Path(__file__).resolve().parents[1] / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_PI_SPEC)
+_PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
@@ -1293,9 +1304,13 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             title = f"CI: {workflow} падает — {job_name}"
             body = failure_watch_task_body(workflow, job_name, fact, run_url, fingerprint)
             try:
-                gh("-X", "POST", f"repos/{repo}/issues",
-                   "-f", "title=" + title, "-f", "body=" + body,
-                   "-f", "labels[]=task", "-f", "labels[]=" + FAILURE_WATCH_LABEL)
+                # Заведение issue пула — только через pool_issue.create_pool_issue
+                # (одно место правды #526: labels без `task` — RuntimeError ДО
+                # сетевого вызова; CI-гвардия «сырой POST repos/{repo}/issues
+                # вне pool_issue.py» ловит обход — красный чек прогона
+                # 34049072989 на этом PR).
+                pool_issue.create_pool_issue(
+                    gh, repo, title, body, ["task", FAILURE_WATCH_LABEL])
             except RuntimeError as error:
                 observations.append(
                     f"⚠️ failure-watch {workflow} (job «{job_name}»): задача по дефекту не заведена ({error})")
