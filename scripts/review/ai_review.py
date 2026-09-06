@@ -228,13 +228,13 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
                                           RATE_LIMIT вовсе), либо контракт
                                           ответа (rc=0, формат нарушен).
     """
-    if failure_reason == "quota_exhausted":
+    if failure_reason == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
         return (f"ревью не состоялось — квота провайдера исчерпана надолго "
                 f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
                 f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
                 "ждать вне CI или сменить провайдера "
                 "(docs/runbooks/switch-llm-provider.md)")
-    if failure_reason == "rate_limit_retry_budget_exceeded":
+    if failure_reason == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET:
         return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
                 f"снялся за отведённый бюджет ожидания внутри прогона (код "
                 f"возврата {dsh_rc})")
