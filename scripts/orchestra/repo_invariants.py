@@ -27,8 +27,10 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      через подстрочный scan("..."). #247 заменил scan() на
      scripts/lib/free_task.py::free_candidates — тот же критерий, что и
      метод A, сравнивать стало не с чем (тавтология), класс закрыт.
-  3. check_stuck_review_gate — review:ok стоит дольше порога без НИКАКОГО
-     ai:*-вердикта (класс #147, сутки простоя). Порог — существующее место
+  3. check_stuck_review_gate — гейт 1 (review:ok/review:large) отработал
+     дольше порога без НИКАКОГО ai:*-вердикта (класс #147, сутки простоя;
+     #432 — гейт 1 считается отработавшим и по review:large, не только по
+     review:ok). Порог — существующее место
      правды pulse_guard.UNHEALTHY_PR_AFTER_MINUTES, своего числа не заводим.
   4. check_unarchived_complete_changes — openspec/changes/<id>/tasks.md
      полностью отмечен, а каталог не в openspec/changes/archive/.
@@ -239,29 +241,35 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 3: review:ok без вердикта ai:* дольше порога
+# Инвариант 3: гейт 1 отработал без вердикта ai:* дольше порога
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def last_review_ok_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент последней простановки review:ok — весь таймлайн через
+def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки вердикта гейта 1 (review:ok ИЛИ
+    review:large — review_labels.GATE1_LABELS, #432) — весь таймлайн через
     review_labels.list_timeline, не сырая первая страница `per_page=100`
     (находка AI-ревью PR #249: у долгоживущего PR, который сам же разгоняют
     авто-повторы #196, событие `labeled` уезжает за первую сотню — сырой
     вызов возвращал None и застрявший гейт молча пропускался, ровно тот
-    класс, который #303 уже закрыл для scheduler.last_review_ok_labeled_at
-    той же функцией; копия здесь была рассинхронизирована с исправлением)."""
+    класс, который #303 уже закрыл для scheduler.last_gate1_labeled_at той же
+    функцией; копия здесь была рассинхронизирована с исправлением — и снова
+    разошлась на #432, только на смотрящей метке, не на пагинации: старая
+    версия смотрела ТОЛЬКО на review:ok, поэтому PR с review:large и без
+    единой ai:*-метки был невидим этому инварианту тем же классом, каким
+    scheduler.trigger_ai_review был невидим PR #412)."""
     timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
         if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == review_labels.REVIEW_OK
+        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
     ]
     return parse_time(max(labeled_at)) if labeled_at else None
 
 
 def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) -> list[dict]:
-    """review:ok стоит дольше UNHEALTHY_PR_AFTER_MINUTES, и НИ ОДНОЙ ai:*
+    """Гейт 1 отработал (review:ok ИЛИ review:large, review_labels.
+    gate1_decided, #432) дольше UNHEALTHY_PR_AFTER_MINUTES, и НИ ОДНОЙ ai:*
     метки ещё нет. scheduler.trigger_ai_review (#196) уже пытается сам
     перезапустить ai-review.yml на меньшем пороге
     (AI_REVIEW_RETRY_AFTER_MINUTES) с ограничением попыток
@@ -272,9 +280,9 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     violations = []
     for pull in open_pulls:
         labels = {label["name"] for label in pull["labels"]}
-        if review_labels.REVIEW_OK not in labels or labels & ai_labels:
+        if not review_labels.gate1_decided(labels) or labels & ai_labels:
             continue
-        labeled_at = last_review_ok_labeled_at(repo, pull["number"])
+        labeled_at = last_gate1_labeled_at(repo, pull["number"])
         if labeled_at is None:
             continue
         age = minutes_between(labeled_at, now)
@@ -592,11 +600,11 @@ def build_report(repo: str, now: datetime,
     v3 = check_stuck_review_gate(repo, now, open_pulls)
     findings[3] = v3
     if v3:
-        lines.append(f"🚨 [3] {len(v3)} открытых PR с review:ok без вердикта ai:* дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:")
+        lines.append(f"🚨 [3] {len(v3)} открытых PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:")
         for item in v3:
             lines.append(f"   — PR #{item['pr']} — {int(item['age_minutes'])} мин без ai:*")
     else:
-        lines.append("💚 [3] нет застрявших review:ok без ai:*")
+        lines.append("💚 [3] нет застрявших PR с гейтом 1 без ai:*")
 
     v4 = check_unarchived_complete_changes(OPENSPEC_CHANGES)
     findings[4] = v4
@@ -687,7 +695,7 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         key = ",".join(f"#{i['pr']}" for i in v3)
         text = (
             "🚨 edge-harness: инвариант 3 (застрявший гейт) — "
-            f"{len(v3)} PR с review:ok без вердикта ai:* дольше "
+            f"{len(v3)} PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше "
             f"{UNHEALTHY_PR_AFTER_MINUTES} мин: " + key + ". "
             "Авто-повтор #196 либо исчерпал попытки, либо не сработал — нужен человек."
         )

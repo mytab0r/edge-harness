@@ -203,6 +203,37 @@ def test_stuck_review_gate_silent_when_verdict_present(monkeypatch):
     assert fake.calls == []
 
 
+def timeline_with_review_large(when: str):
+    """Прод-форма таймлайна крупного PR (#432): verdict_for ставит РОВНО одну
+    из двух меток гейта 1 — "labeled: review:ok" в таком таймлайне не
+    наступает никогда."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
+
+
+def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch):
+    # #432: review:large — тоже «гейт 1 отработал» (review_labels.gate1_decided).
+    # До фикса эта проверка требовала ровно review:ok, и PR с review:large без
+    # единой ai:*-метки был невидим инварианту тем же классом, каким
+    # scheduler.trigger_ai_review был невидим PR #412.
+    pull = open_pr(432, labels=["review:large"])
+    fake = FakeGh({"issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z")})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 432
+
+
+def test_stuck_review_gate_silent_when_neither_gate1_label_present(monkeypatch):
+    # Без review:ok И без review:large гейт 1 ещё не отработал вовсе — этот
+    # инвариант обязан молчать (не путать «гейт молчит» с «гейт застрял»).
+    pull = open_pr(500, labels=[])
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", utc(2026, 9, 3, 14, 0), [pull]) == []
+    assert fake.calls == []
+
+
 def test_stuck_review_gate_mutation_guard(monkeypatch):
     # Мутация: тот же PR/таймлайн, порог опущен ниже возраста — обязан
     # появиться как нарушение (реальная мутация значения, не проверка > 0,

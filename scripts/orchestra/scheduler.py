@@ -247,7 +247,7 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, di
         number = issue["number"]
         if any(pr_references_issue(pull, number) for pull in pulls):
             continue
-        # Пагинация (#308, тот же класс, что last_review_ok_labeled_at/
+        # Пагинация (#308, тот же класс, что last_gate1_labeled_at/
         # last_ready_labeled_at ниже, #303): сырая первая страница таймлайна
         # молча теряла событие assigned за первой сотней записей на длинном
         # таймлайне — сюда фикс #303 не мигрировали.
@@ -1004,13 +1004,14 @@ def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
 
 
 # ── #196, поведение 1: готовый PR без вердикта — дёрнуть гейт самому ─────────────
-# Триггер: review:ok стоит (или ai:failed — «ревью не состоялось ИЛИ провалено»,
+# Триггер: гейт 1 отработал (review:ok ИЛИ review:large — review_labels.
+# gate1_decided, #432; или ai:failed — «ревью не состоялось ИЛИ провалено»,
 # ADR 0007) дольше AI_REVIEW_RETRY_AFTER_MINUTES с момента ПОСЛЕДНЕГО события
-# "labeled: review:ok" в таймлайне PR (новый пуш переставляет review:ok заново —
-# см. review_labels.py, значит и таймер обязан отсчитывать от последней
-# перестановки, а не от первого появления PR). ai:changes-requested и ai:ok сюда
-# не попадают — это не «нет вердикта», это готовый вердикт (обрабатывает
-# unhealthy_pulls/merge_queue соответственно).
+# "labeled" по любой из этих двух меток в таймлайне PR (новый пуш переставляет
+# метку заново — см. review_labels.py, значит и таймер обязан отсчитывать от
+# последней перестановки, а не от первого появления PR). ai:changes-requested
+# и ai:ok сюда не попадают — это не «нет вердикта», это готовый вердикт
+# (обрабатывает unhealthy_pulls/merge_queue соответственно).
 #
 # Носитель счётчика попыток — комментарий-маркер AI_REVIEW_RETRY_MARKER в самом
 # PR (issues/{n}/comments — тот же endpoint, что и у задач, PR это issue).
@@ -1022,15 +1023,24 @@ def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
 # reap_stale/mark_conflicts.
 
 
-def last_review_ok_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент последней простановки review:ok — весь таймлайн (не только
-    первая страница, review_labels.list_timeline, #303: класс потери хвоста
-    на длинном таймлайне, тот же что list_pr_files/#294), None — метки не
-    было вовсе."""
+def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки вердикта гейта 1 — весь таймлайн (не
+    только первая страница, review_labels.list_timeline, #303: класс потери
+    хвоста на длинном таймлайне, тот же что list_pr_files/#294), None —
+    ни одна из меток гейта 1 не проставлялась вовсе.
+
+    Смотрит на review:ok И на review:large (review_labels.GATE1_LABELS, #432)
+    — не только на review:ok, как было раньше (последнее событие «labeled:
+    review:ok» на PR #412 не наступает НИКОГДА, потому что verdict_for ставит
+    ровно одну из двух меток: PR с review:large никогда не получит review:ok,
+    и старая версия этой функции возвращала None навечно — trigger_ai_review
+    не мог посчитать возраст и не срабатывал вовсе, даже если сам входной
+    гейт (ниже) уже пропускал такой PR)."""
     timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
-        if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == review_labels.REVIEW_OK
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
     ]
     return parse_time(max(labeled_at)) if labeled_at else None
 
@@ -1043,13 +1053,13 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
     lines = []
     for pull in pulls:
         labels = {label["name"] for label in pull["labels"]}
-        if review_labels.REVIEW_OK not in labels:
+        if not review_labels.gate1_decided(labels):
             continue  # первый гейт ещё не пройден — рано
         has_verdict = bool(labels & set(review_labels.AI_VERDICTS))
         needs_retry = review_labels.AI_FAILED in labels
         if has_verdict and not needs_retry:
             continue  # ai:ok или ai:changes-requested — вердикт уже есть
-        anchor = last_review_ok_labeled_at(repo, pull["number"])
+        anchor = last_gate1_labeled_at(repo, pull["number"])
         if anchor is None:
             continue  # событие не нашлось — не на чем считать порог, не гадаем
         age = minutes_between(anchor, now)
@@ -1066,10 +1076,14 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             "-X", "POST", f"repos/{repo}/actions/workflows/ai-review.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[pr]={pull['number']}",
         )
+        # Причина в сообщении — ai:failed, если он и есть настоящий повод
+        # (needs_retry), иначе фактическая метка гейта 1 на PR (review:ok
+        # или review:large, #432) — не жёстко "review:ok", как было раньше.
+        gate1_label = next((l for l in review_labels.GATE1_LABELS if l in labels), review_labels.REVIEW_OK)
         post_issue_comment(
             repo, pull["number"],
             f"🤖 {AI_REVIEW_RETRY_MARKER} Оркестратор сам запустил ai-review.yml: "
-            f"{'review:ok' if not needs_retry else review_labels.AI_FAILED} держится "
+            f"{gate1_label if not needs_retry else review_labels.AI_FAILED} держится "
             f"{int(age)} мин без готового вердикта (попытка {attempts + 1}/{AI_REVIEW_MAX_ATTEMPTS}).",
         )
         lines.append(
@@ -1160,9 +1174,14 @@ def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
     """Момент, когда PR стал полностью готов к слиянию: позже из двух событий
     'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна
     (весь таймлайн постранично, review_labels.list_timeline), что
-    last_review_ok_labeled_at. None — событие по какой-то из меток не найдено
+    last_gate1_labeled_at. None — событие по какой-то из меток не найдено
     нигде в таймлайне (например, метка не проставлялась вовсе) — тогда
-    возраст не считаем, не гадаем по неполным данным."""
+    возраст не считаем, не гадаем по неполным данным.
+
+    Намеренно ТОЛЬКО review:ok, не review_labels.gate1_decided (#432): готов к
+    СЛИЯНИЮ — это merge_label_gate, а он review:large не пропускает (блокирует
+    до review:large-ok) — «готовность» здесь про разрешение слияния, а не про
+    то, что гейт 1 вообще отработал."""
     timeline = review_labels.list_timeline(repo, pr_number, gh)
     def labeled_at(label_name: str) -> list[str]:
         return [

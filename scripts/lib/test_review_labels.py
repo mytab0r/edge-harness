@@ -80,6 +80,40 @@ def test_should_update_branch_true_when_both_verdicts_green_without_conflict():
     assert review_labels.should_update_branch(labels) is True
 
 
+# ── gate1_decided (#432): «гейт 1 вынес вердикт» ≠ «гейт 1 разрешил слияние» ─────
+# review:large тоже означает «гейт 1 отработал» — merge_label_gate его по-прежнему
+# не пропускает (слияние ждёт review:large-ok).
+
+
+def test_gate1_decided_true_for_review_ok():
+    assert review_labels.gate1_decided(["review:ok"]) is True
+
+
+def test_gate1_decided_true_for_review_large():
+    # Живой случай #412 (#432): review:large без review:ok — гейт 1 отработал,
+    # просто вердикт другой; это не то же самое, что «гейта не было».
+    assert review_labels.gate1_decided(["review:large", "ai:failed"]) is True
+
+
+def test_gate1_decided_false_without_any_gate1_label():
+    assert review_labels.gate1_decided([]) is False
+    assert review_labels.gate1_decided(["ai:failed"]) is False
+
+
+def test_gate1_decided_true_does_not_imply_merge_label_gate_open():
+    # Граница, которую нельзя сломать (#432): review:large решает «гейт 1
+    # отработал», но merge_label_gate обязан оставаться закрытым для него —
+    # слияние ждёт review:large-ok, а не просто отметки гейта 1.
+    labels = ["review:large", "ai:ok"]
+    assert review_labels.gate1_decided(labels) is True
+    assert review_labels.merge_label_gate(labels) is not None
+
+
+def test_gate1_decided_accepts_label_name_set_and_dict_list():
+    assert review_labels.gate1_decided([{"name": "review:large"}]) is True
+    assert review_labels.gate1_decided({"review:ok"}) is True
+
+
 def test_should_update_branch_accepts_label_name_set_and_dict_list():
     # _names() поддерживает обе прод-формы: список dict'ов API и множество имён
     # (см. review_labels._names) — предикат обязан работать с обеими.
