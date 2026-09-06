@@ -43,6 +43,14 @@ origin/main` вручную. Живой пример на момент пост�
   (`mark_conflicts`), и без перепроверки эскалация могла бы соврать
   «остаётся в конфликте» в окне между успешным ребейзом и пересчётом
   состояния сервером;
+- текст эскалации называет ФАКТ, не диагноз («алерт не гадает», AGENTS.md,
+  находка ревью PR #478, второй раунд): единственное подтверждённое —
+  `mergeable_state=dirty` после одной попытки, причина отсюда не
+  различается (инфраструктурный сбой воркера/квота/таймаут дают тот же
+  итог, что настоящий содержательный конфликт) — `last_worker_run_conclusion`
+  называет conclusion последнего прогона, атрибутированного этой задаче
+  (переиспользует `run_claimed_task`/`recent_runs`), честно «не
+  атрибутирован», если следа нет;
 - гонка «эскалация раньше времени» (найдена живым прогоном #408, см. ниже):
   пока единственная попытка ещё физически идёт (`worker_runs_active`),
   эскалация ждёт — иначе следующий тик планировщика (15 мин) объявил бы
@@ -67,7 +75,7 @@ origin/main` вручную. Живой пример на момент пост�
 ## Проверено
 
 - `python -m pytest scripts/orchestra/test_scheduler.py -q` — сюита зелёная
-  (188 тестов, 12 новых).
+  (191 тест, 15 новых).
 - Мутация 1: снять проверку `attempts >= CONFLICT_REWORK_MAX_ATTEMPTS` —
   `test_dispatch_conflict_rework_escalates_after_budget_exhausted` и
   `test_dispatch_conflict_rework_escalation_is_idempotent` краснеют (второй
@@ -78,6 +86,10 @@ origin/main` вручную. Живой пример на момент пост�
 - Мутация 3: снять перепроверку `mergeable_state` перед эскалацией —
   `test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfirmed`
   краснеет.
+- Мутация 4: вернуть текст эскалации к диагнозу «содержательный конфликт»
+  вместо факта conclusion — `test_dispatch_conflict_rework_escalates_after_budget_exhausted`
+  и `test_dispatch_conflict_rework_escalation_text_admits_unattributed_run`
+  краснеют.
 - **Живая проверка на реальном PR #408** (задача #391, `mergeable_state=dirty`
   на момент работы): прямой вызов `dispatch_conflict_rework` на реальных
   данных освободил задачу #391 и задиспетчил `worker.yml` адресно (run
