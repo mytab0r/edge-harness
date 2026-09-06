@@ -66,6 +66,15 @@ HEARTBEAT_MARKER = "[статус пульса: пропадал]"
 # ищется подстрокой без номера (issue_marker_times), номер разбирается отдельно
 # (probe_marker_attempts) там, где нужна выдержка, а не просто факт «была проба».
 PROBE_MARKER = "[статус конвейера: проба"
+# Скобочные, как остальные (докстринг модуля требует — находка ревью PR #318,
+# п.2: голый CAPS-токен без скобок мог случайно процитироваться в обсуждении
+# #120 и навсегда подавить комментарий как «уже бывший»). Пара маркеров, а не
+# один: у эпизода «тиков нет вовсе» нет успешного прогона, чей timestamp можно
+# сравнить (в отличие от HEARTBEAT_MARKER/pause_notification_pending) — эпизод
+# закрывается ЯВНЫМ комментарием, когда тики снова нашлись (находка ревью
+# PR #318, п.1: было — один комментарий на всю жизнь задачи #120).
+HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
+HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
 
 # ── Пороги петли открытого PR (#196) ─────────────────────────────────────────────
 # Три поведения scheduler.py читают пороги отсюда — рядом с остальными порогами
@@ -222,6 +231,19 @@ def pause_notification_pending(marker_times: list[datetime], last_success_at: da
     if last_success_at is None:
         return False
     return max(marker_times) < last_success_at
+
+
+def episode_reopened(open_times: list[datetime], close_times: list[datetime]) -> bool:
+    """Двухмаркерный приём для эпизода без success-timestamp для сравнения
+    (находка ревью PR #318, п.1): открывающего маркера ещё не было — это
+    первое объявление; открывающий маркер старше самого свежего закрывающего —
+    предыдущий эпизод закрылся, текущий — новый, объявляем; открывающий маркер
+    новее (или закрывающего вовсе нет) — эпизод всё ещё тот же, повтор не шлём."""
+    if not open_times:
+        return True
+    if not close_times:
+        return False
+    return max(open_times) < max(close_times)
 
 
 # ── Чистые решения: возраст пульса ───────────────────────────────────────────────
@@ -548,20 +570,41 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
         # последних прогонов каждого легитимного события: сам по себе редкий
         # и тревожный случай (workflow мог быть отключён GitHub'ом после 60
         # дней простоя, docs/research/21), поэтому кричим, а не молчим ℹ️.
-        text = (f"🚨 edge-harness: HEARTBEAT_NO_TICKS\n"
+        text = (f"🚨 edge-harness: {HEARTBEAT_NO_TICKS_MARKER}\n"
                 f"Успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 "не найдено за последние 100 прогонов каждого события — пульс не "
                 "подтверждён, возможен отключённый workflow (docs/research/21).")
         delivered = send_telegram(text)
         try:
-            markers = issue_marker_times(repo, WATCHDOG_ISSUE, "HEARTBEAT_NO_TICKS")
-            if not markers:
+            # Двухмаркерный приём (episode_reopened, находка ревью PR #318, п.1):
+            # без этого первое же «тиков нет» глушило бы канал комментария
+            # навсегда — issue_marker_times ищет подстроку по ВСЕЙ истории #120.
+            open_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_NO_TICKS_MARKER)
+            close_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_TICKS_RESUMED_MARKER)
+            if episode_reopened(open_times, close_times):
                 post_issue_comment(repo, WATCHDOG_ISSUE, text)
         except RuntimeError as error:
             print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
         return [f"🚨 успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 f"не найдено (Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
                 f"след в #{WATCHDOG_ISSUE})"]
+    try:
+        # Эпизод HEARTBEAT_NO_TICKS закрывается явно, как только тики снова
+        # нашлись: без этого закрывающего маркера episode_reopened никогда не
+        # увидит момент восстановления и следующий «тиков нет» останется
+        # заглушен первым же старым маркером (тот же класс, что фикс выше).
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_NO_TICKS_MARKER)
+        if open_times:
+            close_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_TICKS_RESUMED_MARKER)
+            if not close_times or max(open_times) > max(close_times):
+                post_issue_comment(
+                    repo, WATCHDOG_ISSUE,
+                    f"✅ edge-harness: {HEARTBEAT_TICKS_RESUMED_MARKER}\n"
+                    f"Успешный прогон {ORCHESTRA_WORKFLOW} снова найден — эпизод "
+                    "«тиков нет» закрыт.",
+                )
+    except RuntimeError as error:
+        print(f"::warning::закрытие эпизода в #{WATCHDOG_ISSUE} не оставлено: {error}", file=sys.stderr)
     age = heartbeat_age_minutes(last_ok["created_at"], now)
     if decide_heartbeat(last_ok["created_at"], now) == "ok":
         return [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "

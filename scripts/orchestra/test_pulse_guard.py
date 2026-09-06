@@ -517,8 +517,8 @@ def test_heartbeat_check_loud_when_zero_ticks_found_after_server_filter(monkeypa
 
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
     assert lines and lines[0].startswith("🚨")
-    assert len(sent) == 1 and "HEARTBEAT_NO_TICKS" in sent[0]
-    assert len(posted) == 1 and "HEARTBEAT_NO_TICKS" in posted[0]
+    assert len(sent) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in sent[0]
+    assert len(posted) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in posted[0]
 
 
 def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(monkeypatch):
@@ -529,7 +529,8 @@ def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(
         "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
         "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
         "issues/120/comments": [
-            {"created_at": "2026-09-05T14:00:00Z", "body": "🚨 edge-harness: HEARTBEAT_NO_TICKS\nтекст"}],
+            {"created_at": "2026-09-05T14:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nтекст"}],
     })
     monkeypatch.setattr(pg, "gh", fake)
     sent, posted = [], []
@@ -539,6 +540,75 @@ def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
     assert lines and lines[0].startswith("🚨")
     assert len(sent) == 1
+    assert posted == []
+
+
+def test_heartbeat_check_no_ticks_episode_reopens_after_close_marker(monkeypatch):
+    """Находка ревью PR #318, п.1: старый код гасил канал навсегда после первого
+    же «тиков нет» — issue_marker_times ищет подстроку по ВСЕЙ истории #120.
+    Закрывающий маркер (тики вернулись) новее старого открывающего — новый
+    эпизод объявляется заново, а не подавляется старым следом."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"},
+            {"created_at": "2026-09-03T00:00:00Z",
+             "body": f"✅ edge-harness: {pg.HEARTBEAT_TICKS_RESUMED_MARKER}\nзакрыт"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(posted) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in posted[0]
+
+
+def test_heartbeat_check_closes_no_ticks_episode_when_ticks_return(monkeypatch):
+    """Тики снова нашлись, открытый эпизод HEARTBEAT_NO_TICKS ещё не закрыт —
+    heartbeat_check публикует закрывающий маркер (иначе episode_reopened
+    никогда не увидит момент восстановления)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T14:00:00Z", 1, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
+    assert len(posted) == 1 and pg.HEARTBEAT_TICKS_RESUMED_MARKER in posted[0]
+
+
+def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkeypatch):
+    """Эпизод уже закрыт (закрывающий маркер новее открывающего) — тики есть —
+    heartbeat_check не плодит второй закрывающий комментарий."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T14:00:00Z", 1, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"},
+            {"created_at": "2026-09-02T00:00:00Z",
+             "body": f"✅ edge-harness: {pg.HEARTBEAT_TICKS_RESUMED_MARKER}\nзакрыт"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
     assert posted == []
 
 
