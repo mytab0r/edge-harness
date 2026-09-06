@@ -245,10 +245,24 @@ def pr_references_issue(pull: dict, issue_number: int) -> bool:
     )
 
 
-def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, dict] | None = None) -> list[str]:
+def reap_stale(
+    repo: str, now: datetime, pulls: list[dict], merged: dict[int, dict] | None = None,
+    *, pool: list[dict],
+) -> list[str]:
+    """pool — открытые задачи (open_task_issues(repo)) одного прогона (#443):
+    раньше эта функция читала open_task_issues сама, отдельным HTTP-обходом
+    от unhealthy_pulls/main(), хотя все три смотрят на один и тот же список в
+    пределах одного прогона планировщика (между вызовами ничего, что меняет
+    состав/assignees открытых задач, не происходит — heartbeat/дрейф пина/
+    open_pulls/merged_pr_map их не трогают). Снятое здесь назначение
+    отражается СРАЗУ в переданных объектах (issue["assignees"] обнуляется
+    ниже) — тем же приёмом, что mark_conflicts уже применяет к pull["labels"]
+    (см. _set_conflict_label): вызывающий код, отдавший тот же `pool` дальше
+    (unhealthy_pulls, reject_reopened_tasks, accept_merged_tasks), видит
+    актуальное состояние без второго запроса к GitHub."""
     lines = []
     merged = merged or {}
-    for issue in open_task_issues(repo):
+    for issue in pool:
         if not issue["assignees"]:
             continue
         if _issue_is_blocked(issue):
@@ -290,6 +304,9 @@ def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, di
             "-X", "DELETE", f"repos/{repo}/issues/{number}/assignees",
             "-f", f"assignees[]={who}",
         )
+        # Локальная мутация вслед за серверной (см. докстринг pool выше) —
+        # дальнейшие потребители того же снимка обязаны увидеть снятие сразу.
+        issue["assignees"] = []
         gh(
             "-X", "POST", f"repos/{repo}/issues/{number}/comments",
             # body уходит ЗНАЧЕНИЕМ аргумента "-f body=…" (форма gh api):
@@ -598,10 +615,17 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool, int | No
     return lines, False, None, updated
 
 
-def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
+def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool, list[dict]]:
     """Цикл слияний одного прогона (#297) — main() зовёт эту функцию вместо
-    одиночного merge_queue. Возвращает (строки отчёта, был_ли_жёсткий_сбой) —
-    та же форма, что раньше отдавал сам merge_queue вызывающей стороне.
+    одиночного merge_queue. Возвращает (строки отчёта, был_ли_жёсткий_сбой,
+    финальный список открытых PR) — третье поле добавлено дедупликацией
+    запросов GitHub API (#443): раньше main() ПОСЛЕ этой функции трижды сам
+    перечитывал open_pulls(repo) для trigger_ai_review/stale_ready_pulls/
+    accept_merged_tasks, хотя нужный снежок уже лежит здесь — цикл сам ведёт
+    актуальный `pulls`, обновляя его КАЖДЫЙ раз, когда что-то реально
+    изменилось (слияние или подтянутая ветка), и не трогая его, когда проход
+    не сделал ничего. Возвращаемое значение — тот же снимок, что дал бы
+    свежий open_pulls(repo) в момент возврата, без отдельного HTTP-вызова.
 
     Каждая итерация — один проход merge_queue (сериализация «одно слияние
     или одно обновление ветки за проход» не меняется, #252/#288); слот
@@ -647,7 +671,7 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool]:
             f"🔁 цикл слияний: {merged_count} PR слито за прогон "
             f"(потолок {MERGE_LOOP_MAX_MERGES}, #297)"
         )
-    return lines, hard_failure
+    return lines, hard_failure, pulls
 
 
 # ── Сессии раннеров в морде dsh-edge (#119) ───────────────────────────────────────
@@ -1132,9 +1156,14 @@ def pr_is_unhealthy(repo: str, pull: dict) -> str | None:
     return None
 
 
-def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
+def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[dict]) -> list[str]:
+    """pool — тот же снимок open_task_issues(repo), что уже прочитан для
+    reap_stale выше (#443, см. её докстринг о причинах одного снимка на
+    прогон): reap_stale к этому моменту уже могла обнулить assignees части
+    issue-объектов ПРЯМО В pool — эта функция обязана видеть то же
+    актуальное состояние, не более старую копию своим отдельным запросом."""
     lines = []
-    for issue in open_task_issues(repo):
+    for issue in pool:
         if not issue["assignees"]:
             continue
         if _issue_is_blocked(issue):
@@ -1155,6 +1184,11 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
                 "-X", "DELETE", f"repos/{repo}/issues/{number}/assignees",
                 "-f", f"assignees[]={who}",
             )
+            # Локальная мутация вслед за серверной (см. докстринг pool у
+            # reap_stale) — дальнейшие потребители того же снимка (main(),
+            # reject_reopened_tasks, accept_merged_tasks) обязаны увидеть
+            # снятие сразу, без отдельного перечитывания.
+            issue["assignees"] = []
             try:
                 lines.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
@@ -1978,40 +2012,57 @@ def main() -> int:
     # ниже читают её из одного источника, без второго обхода закрытых PR.
     merged = merged_pr_map(all_merged_pulls(repo))
 
-    stale_lines = reap_stale(repo, now, pulls, merged)
+    # Один снимок открытых задач на большую часть прогона (#443): раньше
+    # reap_stale и unhealthy_pulls каждая сама опрашивала open_task_issues(repo)
+    # (2 страницы на ~125 задач) в отдельный момент — между их вызовами ничего,
+    # что меняет состав/assignees открытых задач, не происходит (heartbeat/
+    # дрейф пина/open_pulls/merged_pr_map/collect_stale/mark_conflicts их не
+    # трогают). Обе функции мутируют переданные issue-объекты СРАЗУ вслед за
+    # своими же серверными изменениями (см. их докстринги) — reject_reopened_tasks
+    # и accept_merged_tasks ниже видят актуальное состояние без второго обхода.
+    pool = open_task_issues(repo)
+
+    stale_lines = reap_stale(repo, now, pulls, merged, pool=pool)
     try:
         lease_lines = claim_task.collect_stale(repo, now)
     except RuntimeError as error:
         # сборщик замков не должен блокировать слияния, но и не молчит (#124-класс)
         lease_lines = [f"⚠️ обход замков задач не удался: {error}"]
-    pulls = open_pulls(repo)  # состояние могло измениться
+    # collect_stale трогает только замки задач/комментарии, не PR (#443) —
+    # повторное чтение open_pulls(repo) здесь было чистой тратой: состояние
+    # PR не могло измениться со времени снимка выше.
     conflict_lines = mark_conflicts(repo, pulls)
     # #196, поведение 2: нездоровый PR возвращает задачу в пул ДО очереди
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
-    unhealthy_lines = unhealthy_pulls(repo, now, pulls)
-    merge_lines, archive_hard_failure = merge_loop(repo, pulls)
+    unhealthy_lines = unhealthy_pulls(repo, now, pulls, pool=pool)
+    merge_lines, archive_hard_failure, pulls = merge_loop(repo, pulls)
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
-    # дольше порога — оркестратор сам запускает ai-review.yml. Список PR
-    # берём заново: merge_loop мог слить несколько PR этим же прогоном (#297),
-    # и старый снимок pulls содержал бы уже закрытые номера.
-    ai_retry_lines = trigger_ai_review(repo, now, open_pulls(repo))
-    # Инвариант issue #269: готовый PR, который так и не слился, кричит — та же
-    # свежая выборка, что уже понадобилась trigger_ai_review выше.
-    stale_ready_lines = stale_ready_pulls(repo, now, open_pulls(repo))
+    # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
+    # вернул актуальный список открытых PR (#443): если он что-то слил или
+    # подтянул за свой цикл, снимок обновлён ВНУТРИ самой функции — второй
+    # HTTP-вызов open_pulls(repo) здесь не нужен, closed-номера уже отфильтрованы.
+    ai_retry_lines = trigger_ai_review(repo, now, pulls)
+    # Инвариант issue #269: готовый PR, который так и не слился, кричит — тот же
+    # снимок, что уже обслужил trigger_ai_review выше (#443: раньше здесь был
+    # ЕЩЁ один открытый open_pulls(repo), хотя между двумя вызовами ничто не
+    # меняет состав открытых PR — ни trigger_ai_review, ни dispatch ai-review.yml
+    # не мержат и не закрывают PR).
+    stale_ready_lines = stale_ready_pulls(repo, now, pulls)
 
     # Приёмка (#227): задачи, чей PR уже слит, разбираются по улике ДО подсчёта
     # пула — свободно/в работе должно отражать уже закрытые этим же прогоном.
-    pool = open_task_issues(repo)
     # Запрет переоткрытия (#369) — ДО accept_merged_tasks: переоткрытая задача
     # закрывается обратно раньше, чем успеет снова смэтчиться со старым
-    # merged_pr_map по декларации первой строки PR.
+    # merged_pr_map по декларации первой строки PR. `pool` — тот же снимок,
+    # что уже видели reap_stale/unhealthy_pulls (их мутации отражены в нём).
     reopen_lines = reject_reopened_tasks(repo, pool)
     if reopen_lines:
         pool = open_task_issues(repo)  # пересчёт: отклонённое переоткрытие закрыло задачи
-    # Проверка на входе, не гвардия постфактум (см. докстринг accept_merged_tasks):
-    # свежий снимок открытых PR, а не тот, что собран в начале прогона выше —
-    # PR, который стал причиной этой приёмки, мог открыться только что.
+    # Проверка на входе, не гвардия постфактум (см. докстринг accept_merged_tasks,
+    # инцидент #320/#325): свежий снимок открытых PR НАМЕРЕННО не переиспользует
+    # pulls выше — PR, который стал причиной этой приёмки, мог открыться прямо
+    # перед этой строкой, и только явный поздний запрос страхует от гонки.
     accept_lines, accept_hard_failure = accept_merged_tasks(
         repo, pool, merged, now, open_pulls_list=open_pulls(repo))
     if accept_lines:
