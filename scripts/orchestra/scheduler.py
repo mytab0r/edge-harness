@@ -182,6 +182,7 @@ from pulse_guard import (
     all_issue_comments,
     conveyor_gate,
     escalate,
+    failure_watch,
     gh,
     heartbeat_check,
     issue_marker_times,
@@ -3337,6 +3338,11 @@ def main() -> int:
     # если конвейер стоял.
     lines += heartbeat_check(repo, now)
 
+    # Гвардия непрочитанных провалов ключевых workflow (#477): рядом с
+    # heartbeat_check — тот же «до всей остальной работы» довод, дешёвый
+    # запрос (status=completed, малый per_page), не блокирует остальной пульс.
+    failure_watch_observations, failure_watch_actions = failure_watch(repo, now)
+
     # Дрейф пина апстрима (#134): релиз новее пина source-build морды кричит
     # в задачу #134 + метка + Telegram, один раз на релиз.
     lines += upstream_drift_lines(repo)
@@ -3467,13 +3473,13 @@ def main() -> int:
     observations = (
         lease_observations + merge_observations + ai_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
-        + wip_observations + worker_observations
+        + wip_observations + worker_observations + failure_watch_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
         + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
-        + wip_actions + worker_actions
+        + wip_actions + worker_actions + failure_watch_actions
     )
     lines += render_action_report(observations, actions)
 

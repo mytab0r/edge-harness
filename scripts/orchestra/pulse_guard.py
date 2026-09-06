@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Предохранитель конвейера и «кто следит за следящим» (#120).
 
-Два механизма, живущие рядом, потому что у них один канал оповещения и один
+Три механизма, живущие рядом, потому что у них один канал оповещения и один
 носитель решения — отчёт оркестратора + Telegram + след в задаче #120:
 
 1. Предохранитель конвейера: перед dispatch воркера считаются подряд идущие
@@ -17,6 +17,22 @@
    пропадали, и этот, опоздавший, запуск кричит в Telegram, пока жив.
    Полный охват (scheduler не запустился вовсе) даёт только внешний монитор —
    не подтверждено, отложено; GitHub нативно шлёт failure-письма владельцу.
+3. Гвардия непрочитанных провалов (#477): владелец — «кто-то мониторит
+   ошибки?» — красный прогон worker.yml/hands.yml/orchestra.yml/deploy-*.yml
+   был строкой в Actions без разбора. failure_watch дешёвым запросом
+   (`status=completed` + клиентский фильтр вывода FAILURE_WATCH_RUN_CONCLUSIONS,
+   одна страница per_page=100) находит свежий провал (окно — от updated_at, момента
+   провала) каждого из WATCHED_WORKFLOWS, достаёт последнюю содержательную
+   строку лога упавшего job'а (##[error]-аннотация предпочтительна, иначе
+   plain-хвост упавшего шага; факт, не гипотеза — правило AGENTS.md) и
+   классифицирует причину: 'infra' (известная сигнатура лимита/сети — лечится
+   ожиданием, один тихий след в #120 на класс) или 'defect' (наш дефект —
+   заводит задачу в пул, тоже одну на класс). Дедуп — по отпечатку КЛАССА
+   причины (workflow + job + нормализованная строка ошибки), не по run id:
+   повторяющийся баг не должен плодить второй сигнал на каждый новый прогон.
+   Прогоны PR-событий не разбираются — красный обязательный чек на PR ведёт
+   автодетектор простоя (stall_detector, #201, check:red:<имя>); исключение
+   закрывает класс «один дефект — две задачи» (находка ревью PR #488).
 
 Единственный канал решения — отчёт + задача #120 + Telegram; «метки-статуса на
 workflow» у GitHub нет, а commit-статусы живут на sha и умирают на squash-мерже.
@@ -30,12 +46,25 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import hashlib
 import html
+import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Заведение issue пула — одно место правды (pool_issue.create_pool_issue,
+# #526): labels без `task` — RuntimeError ДО сетевого вызова. Подключение тем
+# же приёмом, что в stall_detector.py (pulse_guard сам грузится через
+# importlib, обычный импорт scripts.lib здесь не работает).
+_PI_SPEC = importlib.util.spec_from_file_location(
+    "pool_issue", Path(__file__).resolve().parents[1] / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_PI_SPEC)
+_PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
@@ -143,6 +172,110 @@ CONFLICT_REWORK_MARKER = "[conflict: авто-ребейз]"
 # бы навсегда все PR, кроме первого просигналившего.
 CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
 
+# ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
+# worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
+# сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
+# а failure_watch — на другой вопрос («кто-нибудь разберёт ПРИЧИНУ и заведёт
+# задачу на дефект»); это разные обязанности одного и того же провала.
+WATCHED_WORKFLOWS = (
+    "worker.yml", "hands.yml", "orchestra.yml",
+    "deploy-worker.yml", "deploy-dsh-edge.yml",
+)
+
+# Метка авто-заведённых задач по дефектам CI — рядом с обязательной `task`
+# (пул), чтобы дедуп искал ТОЛЬКО среди них, не среди всего пула.
+FAILURE_WATCH_LABEL = "ci-failure"
+
+# Известные сигнатуры ИНФРАСТРУКТУРНЫХ (не наших) причин — лимиты провайдера/
+# GitHub, сеть; лечится ожиданием, не диффом. Список закрытый и консервативный
+# НАРОЧНО (см. classify_failure_cause): нераспознанное считается дефектом, а
+# не тихо прощается как инфраструктура — fail loud по умолчанию.
+INFRA_ERROR_SIGNATURES = (
+    "rate_limit:",
+    "rate limit reached",
+    "secondary rate limit",
+    "abuse-rate-limit",
+    "quota_exhausted",
+    "rate_limit_retry_budget_exceeded",
+    "dial tcp",
+    "could not resolve host",
+    "connection reset",
+    "connection timed out",
+    "i/o timeout",
+    "etimedout",
+    "econnreset",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway",
+    "temporarily unavailable",
+)
+
+# Сигнатуры устаревшей базы: свой отдельный класс, не инфраструктура (не
+# лечится ожиданием) и не «наш дефект кода» — газ уже назван в другом месте
+# (issue #474, авто-ребейз конфликтных PR; task-branch/pre-commit сами
+# отказывают на протухшей базе и просят git rebase origin/main). failure_watch
+# узнаёт этот класс, чтобы НЕ дублировать задачу поверх уже объявленного газа —
+# наблюдение без задачи и без сигнала в #120 (не спамить тем, что уже лечится).
+STALE_BASE_SIGNATURES = (
+    "main уехал вперёд",
+    "non-fast-forward",
+    "failed to push some refs",
+    # «checks awaiting conflict resolution» была здесь до ревью PR #488 (раунд 2)
+    # и удалена как мёртвая: на конфликтном PR проверки не запускаются вовсе
+    # (docs/agents/PROTOCOL.md), строки в логе какого-либо прогона нет —
+    # сигнатура не могла сработать ни на одном реальном логе.
+)
+
+FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
+
+# Окно свежести провала (находка ревью PR #488): пульс ходит раз в 15 минут
+# (cron orchestra.yml), окно — двойной период с запасом на задержку раннера.
+# Без него `runs[0]` навсегда остаётся тем же старым красным прогоном после
+# закрытия задачи (отпечаток исчезает из открытых → следующий пульс заводит
+# задачу заново на уже почившую причину, бесконечный цикл).
+#
+# Якорь окна — `updated_at` прогона, НЕ `created_at` (находка ревью PR #488,
+# раунд 3): created_at у GitHub — момент ПОСТАНОВКИ В ОЧЕРЕДЬ, не провала.
+# Отслеживаемые workflows живут дольше окна по замыслу (worker.yml —
+# timeout-minutes: 280, hands.yml — 70, ожидание свободного раннера не
+# ограничено вовсе), поэтому типичный провал долгого воркера по created_at
+# лежит вне окна на КАЖДОМ пульсе — ни задачи, ни наблюдения, навсегда:
+# молчаливая потеря ровно тех провалов, ради которых #477. У ЗАВЕРШЁННОГО
+# прогона updated_at — момент завершения, то есть для красного прогона —
+# момент провала; «30 минут после провала» — ровно заявленная семантика.
+FAILURE_WATCH_WINDOW_MINUTES = 30
+
+# Выводы ЗАВЕРШЁННЫХ прогонов, которые failure_watch разбирает как провал.
+# Отдельный именованный набор, не общий FAILURE_CONCLUSIONS — судьба крайних
+# случаев решена здесь явно (находка ревью PR #488, раунд 3; серверный фильтр
+# `status=failure` не отдаёт `timed_out` вовсе):
+# `timed_out` — ВКЛЮЧЁН: прогон, убитый собственным капом (timeout-minutes:
+# worker.yml = 280 существует именно потому, что прогоны до него добираются),
+# — провал в смысле #477, его причина требует разбора как у всякого другого;
+# `cancelled` здесь НЕТ (в FAILURE_CONCLUSIONS есть): отмена — осознанное
+# действие человека или автоматики, а не сигнал о дефекте/инфраструктуре,
+# разбор отменённого прогона заводил бы задачи на нормальную работу конвейера.
+FAILURE_WATCH_RUN_CONCLUSIONS = ("failure", "timed_out")
+
+# Потолок разобранных упавших job'ов на один красный прогон (находка ревью PR
+# #488, чеклист: раньше разбирался только bad_jobs[0], хвост прятался молча).
+# Каждый job — загрузка полного лога (дорогой запрос, квота API); красных
+# job'ов на прогон обычно один-два. Остальные НЕ теряются — названы поимённо
+# в наблюдении (тот же класс «не прятать хвост молча», что #308).
+FAILURE_WATCH_MAX_JOBS_PER_RUN = 3
+
+# Размер страницы опроса (один запрос на workflow, листания нет) — единый
+# для всех отслеживаемых (находка ревью PR #488, раунды 4–5). Страница
+# считается БЕЗОТНОСИТЕЛЬНО окна свежести: это просто N новейших завершённых.
+# 100, а не 20: worker.yml при WIP_LIMIT=12 и пульсе каждые 15 минут даёт
+# 20+ завершённых за несколько часов, а провал с самым старым created_at —
+# timed_out (прогон, убитый капом timeout-minutes: 280, поставлен в очередь
+# ЗА ЧАСЫ до провала) — вытеснялся бы за страницу 20 молча: ни задачи, ни
+# наблюдения, пока не выйдет из окна. Прецедент одной страницы 100 в этом же
+# файле — heartbeat_check/real_orchestra_ticks; цена та же, один запрос на
+# workflow.
+FAILURE_WATCH_PER_PAGE = 100
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
@@ -187,6 +320,36 @@ def count_consecutive_failures(conclusions: list) -> int:
 def decide_dispatch(failures: int, pause_after: int = WORKER_FAILURE_PAUSE_AFTER) -> bool:
     """True — диспатч воркера разрешён; False — конвейер на паузе."""
     return failures < pause_after
+
+
+# ── Чистые решения: классификация причины провала (#477) ────────────────────────
+
+
+def classify_failure_cause(text: str) -> str:
+    """'stale_base' — устаревшая база (газ уже назван в #474/task-branch, не
+    дублируем задачу); 'infra' — известная сигнатура лимита/сети, лечится
+    ожиданием; 'defect' — всё остальное, В ТОМ ЧИСЛЕ нераспознанное (fail
+    loud по умолчанию: не прощаем молча то, чего не понимаем)."""
+    lowered = (text or "").lower()
+    for signature in STALE_BASE_SIGNATURES:
+        if signature in lowered:
+            return "stale_base"
+    for signature in INFRA_ERROR_SIGNATURES:
+        if signature in lowered:
+            return "infra"
+    return "defect"
+
+
+def failure_fingerprint(workflow: str, job_name: str, error_text: str) -> str:
+    """Отпечаток КЛАССА провала — workflow + упавший job + нормализованная
+    строка ошибки (без hex/id, схлопнутые пробелы, обрезка). НЕ run id:
+    одинаковый баг на разных прогонах обязан схлопнуться в одну запись —
+    правило «один сигнал на класс», не на каждый прогон."""
+    normalized = re.sub(r"\b[0-9a-f]{6,}\b", "", (error_text or "").lower())
+    normalized = re.sub(r"\d+", "N", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()[:160]
+    raw = f"{workflow}|{job_name}|{normalized}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
 # ── Полуоткрытое состояние (#205): проба после выдержки ──────────────────────────
@@ -504,18 +667,34 @@ def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None 
     return payload.get("workflow_runs", [])
 
 
+def failing_jobs(repo: str, run: dict, conclusions: tuple = FAILURE_CONCLUSIONS) -> list[dict]:
+    """Job'ы прогона с неуспешным conclusion — ЕДИНЫЙ источник для
+    last_failure_error и failure_watch: один запрос на прогон, не две копии
+    (чеклист ревью PR #488). Сбой запроса — RuntimeError наверх (fail loud:
+    «сбой» и «пусто» различают вызывающие, у них для этого разные тексты);
+    пустой список — честное «нет job'ов с таким выводом».
+
+    conclusions — какой набор выводов считать «упавшим». Дефолт — общий
+    FAILURE_CONCLUSIONS (предохранитель диспатча). failure_watch передаёт
+    СВОЙ FAILURE_WATCH_RUN_CONCLUSIONS: job, убитый капом (conclusion
+    timed_out), обязан разбираться иначе его причина не попадёт ни в задачу,
+    ни в наблюдение (находка ревью PR #488, раунд 3), — набор переопределяется
+    вызывающим, потому что «красный» для паузы диспатча и «разбираемый» для
+    задачи — разные вопросы над одним списком job'ов."""
+    payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+    return [job for job in payload.get("jobs", []) if job.get("conclusion") in conclusions]
+
+
 def last_failure_error(repo: str, run: dict) -> str:
     """Человекочитаемая причина последнего красного прогона: упавшие job'ы и шаги.
     Best-effort: недоступность деталей не мешает факту паузы, но и не теряется —
     уходит в текст сигнала."""
     try:
-        payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+        bad_jobs = failing_jobs(repo, run)
     except RuntimeError as error:
         return f"детали недоступны: {error}"
     bad = []
-    for job in payload.get("jobs", []):
-        if job.get("conclusion") not in FAILURE_CONCLUSIONS:
-            continue
+    for job in bad_jobs:
         steps = ", ".join(
             step["name"] for step in job.get("steps", [])
             if step.get("conclusion") in FAILURE_CONCLUSIONS
@@ -524,6 +703,116 @@ def last_failure_error(repo: str, run: dict) -> str:
     if not bad:
         return f"упавшие job'ы не найдены (conclusion прогона: {run.get('conclusion')})"
     return "; ".join(bad)
+
+
+# Строки-boilerplate раннера, аннотированные ##[error] самим GitHub Actions,
+# а не причиной провала (находка ревью PR #488, живой замер на прогоне
+# 34027035455): «Process completed with exit code N» и завершающие строки
+# раннера идут ПОСЛЕ содержательной ::error::-строки (например, из die() в
+# task.sh) и раньше неё в списке "с конца" — если их не пропускать, отпечаток
+# схлопывает разные дефекты одного job'а в один класс по коду выхода.
+LAST_ERROR_LOG_BOILERPLATE = (
+    "process completed with exit code",
+    "the operation was canceled",
+    "the job running on runner",
+    # Хвост job'а после падения шага (raw log).
+    "cleaning up orphan processes",
+)
+
+# Обёртки-не-факты: ::error::-строки, которые называют ФАКТ ПАДЕНИЯ ОБЁРТКИ,
+# а не его причину. «Воркер не справился: dsh завершился с кодом N без
+# открытого PR» (die() в task.sh:630) — единственная аннотированная строка
+# агентского провала, и нормализация цифр делала из неё ОДИН отпечаток на
+# ЛЮБУЮ причину (красный тест, падение DSH, сеть): второй отличный дефект
+# воркера дедупился как «уже в пуле» и задачи не получал (находка ревью
+# PR #488, раунд 6). Причина в таких провалах живёт в plain-хвосте лога
+# (вывод dsh) — см. вторую ветку last_error_log_line.
+LAST_ERROR_LOG_WRAPPERS = (
+    "воркер не справился",
+)
+
+LAST_ERROR_LOG_NON_FACTS = LAST_ERROR_LOG_BOILERPLATE + LAST_ERROR_LOG_WRAPPERS
+
+# ANSI-escape сырого лога не должны попадать в факт: строка уходит в тело
+# задачи и след #120/Telegram (мусорные управляющие коды в тексте сигнала).
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+# Префикс таймстампа сырого лога Actions (у ##[error]-строк мы начинали
+# чтение от маркера, у plain-строк его надо снять).
+LOG_TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
+
+
+def last_error_log_line(repo: str, job_id: int) -> str | None:
+    """Последняя СОДЕРЖАТЕЛЬНАЯ строка лога упавшего job'а — конкретный факт,
+    не гипотеза (правило AGENTS.md, PR #475): не заставляет человека открыть
+    Actions, чтобы увидеть, что именно сломалось.
+
+    Две ветки (находка ревью PR #488, раунд 6):
+    1) предпочтительная — последняя строка с `##[error]` вне
+       LAST_ERROR_LOG_NON_FACTS: так аннотируют причины наши скрипты (die()
+       в task.sh) и раннер;
+    2) если аннотированной содержательной строки нет — последняя
+       содержательная строка plain-хвоста упавшего шага: содержательные
+       причины большинства падений живут в stderr БЕЗ аннотации (bash печатает
+       «line N: ... No such file or directory» простой строкой — живой замер
+       на прогоне 34027035455; вывод git push и текст хуков тоже plain),
+       а orchestra.yml не содержит ни одного `::error` — без этой ветки
+       классификация и задача для него недостижимы вообще.
+    Обёртки-не-факты (LAST_ERROR_LOG_WRAPPERS) пропускаются в ОБЕИХ ветках:
+    задача с «Воркер не справился: ... код N» выглядит точной, но называет
+    факт падения обёртки, не причину.
+
+    Best-effort: недоступность лога (квота/права/раннер убит до записи) или
+    отсутствие содержательной строки не роняет классификацию — просто нет
+    строки, вызывающий откатывается на имена упавших шагов.
+
+    `--allow-escape-sequences` (находка живой проверки PR #488): сырой лог
+    job'а почти всегда несёт ANSI-escape, и gh (замер на 2.98.0, 2026-09-06)
+    отдаёт на него ОТКАЗ с exit 1 («the response contains terminal escape
+    sequences») — без флага факта не бывает НИКОГДА, весь failure_watch
+    мёртв в проде при живых зелёных тестах на моках. Флаг безопасен здесь:
+    лог нашего репозитория мы разбираем САМИ подстрочным поиском
+    `##[error]` и никогда не печатаем в терминал, где escape могли бы сыграть."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--allow-escape-sequences",
+             f"repos/{repo}/actions/jobs/{job_id}/logs"],
+            capture_output=True, text=True,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except OSError as error:
+        print(f"::warning::лог job {job_id} не прочитан: {error}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.splitlines()
+
+    def is_non_fact(candidate: str) -> bool:
+        lowered = candidate.lower()
+        return any(pattern in lowered for pattern in LAST_ERROR_LOG_NON_FACTS)
+
+    # Ветка 1: ##[error] — предпочтительный источник (аннотированная причина).
+    for line in reversed(lines):
+        idx = line.find("##[error]")
+        if idx == -1:
+            continue
+        candidate = ANSI_ESCAPE_RE.sub("", line[idx:]).strip()
+        if not candidate or is_non_fact(candidate):
+            continue
+        return candidate
+    # Ветка 2: plain-хвост упавшего шага — последняя содержательная строка
+    # до boilerplate раннера. Структурные маркеры `##[...]` (group/endgroup/
+    # command) и строки без букв/цифр (разделители) — не факт.
+    for line in reversed(lines):
+        text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", line)).strip()
+        if not text or text.startswith("##["):
+            continue
+        if not re.search(r"[A-Za-zА-Яа-я0-9]", text):
+            continue
+        if len(text) < 8 or is_non_fact(text):
+            continue
+        return text
+    return None
 
 
 def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
@@ -896,3 +1185,270 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
             False)
+
+
+def open_ci_failure_fingerprints(repo: str) -> set[str]:
+    """Отпечатки, уже заведённые задачами с меткой FAILURE_WATCH_LABEL —
+    дедуп «дефект этого класса уже в пуле» без второго обхода Issues.
+
+    Листает страницы сама (класс #308, тот же приём, что all_issue_comments
+    выше): список НЕ ограничен по природе — долгоживущие незакрытые дефекты
+    CI со временем накопятся так же, как обычный пул задач, а сырая первая
+    страница молча потеряла бы хвост — та же ошибка дедупа, что и без него,
+    просто отложенная во времени."""
+    page = 1
+    found: set[str] = set()
+    marker = "<!-- failure-fingerprint: "
+    while True:
+        chunk = gh(
+            f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}"
+            f"&per_page=100&page={page}"
+        ) or []
+        if not isinstance(chunk, list) or not chunk:
+            break
+        for issue in chunk:
+            body = issue.get("body") or ""
+            idx = body.find(marker)
+            if idx == -1:
+                continue
+            rest = body[idx + len(marker):]
+            found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
+        if len(chunk) < 100:
+            break
+        page += 1
+    return found
+
+
+def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str, steps: str) -> str:
+    """Тело авто-заведённой задачи — тот же формат, что шаблон «📋 Задача в
+    пул» (Цель/Критерий/Площадь), плюс отпечаток класса HTML-комментарием:
+    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
+    Упавшие шаги — рядом с фактом (критерий #477 называет «шаг + последняя
+    ##[error]-строка»): их имена уже прочитаны из job'а, второй запрос не
+    нужен (чеклист ревью PR #488)."""
+    return (
+        f"## Цель\n"
+        f"`{workflow}` (job «{job_name}») перестаёт падать этой причиной.\n\n"
+        f"## Критерий готовности\n"
+        f"Следующий прогон `{workflow}` на этом коде зелёный, либо причина "
+        "документированно устранена в другом месте (тогда — закрыть со ссылкой).\n\n"
+        f"## Площадь\n"
+        "area:orchestra\n\n"
+        f"## Контекст и ссылки\n"
+        f"Живой прогон: {run_url}\n"
+        f"Упавшие шаги job'а «{job_name}»: {steps}\n"
+        f"Факт: {fact}\n\n"
+        f"<!-- failure-fingerprint: {fingerprint} -->\n"
+    )
+
+
+def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
+    """Провалы ключевых workflow (#477): дешёвый опрос `status=completed`
+    с клиентским фильтром по выводу (FAILURE_WATCH_RUN_CONCLUSIONS:
+    failure + timed_out, без cancelled — см. комментарий у константы; одна
+    страница per_page=100 на workflow — единый размер FAILURE_WATCH_PER_PAGE,
+    без выгрузки логов всех прогонов
+    подряд — квота API дорога, см. rate_guard.py) по каждому
+    WATCHED_WORKFLOWS. Для самого свежего провала — по каждому упавшему job'у
+    (до FAILURE_WATCH_MAX_JOBS_PER_RUN): последняя содержательная строка
+    `##[error]` из лога (факт, не гипотеза), классификация
+    (classify_failure_cause) и дедуп по failure_fingerprint (класс причины,
+    НЕ run id — один сигнал на класс):
+
+    'stale_base' — газ уже назван в другом месте (#474, task-branch/pre-commit
+                   сами просят git rebase) — только наблюдение, без задачи и
+                   без следа в #120 (не дублировать уже объявленный газ);
+    'infra'      — известная сигнатура лимита/сети — лечится ожиданием: один
+                   тихий след в #120 на класс (issue_marker_times — тот же
+                   приём, что у остальных маркеров серий), Telegram не шлём —
+                   это не тревога, требующая действия человека;
+    'defect'     — наш дефект: задача в пул (label task + FAILURE_WATCH_LABEL)
+                   с конкретным фактом, если такого класса ещё нет среди
+                   открытых issues с меткой FAILURE_WATCH_LABEL.
+
+    Прогоны `event=pull_request` не разбираются (находка ревью PR #488,
+    раунд 2): красный прогон PR-события — это красный обязательный чек на PR,
+    его устойчивую причину уже заводит автодетектор простоя (stall_detector,
+    #201, отпечаток `check:red:<имя>`); вторая задача с меткой ci-failure на
+    тот же дефект — ровно тот спам, который запрещает критерий #477. Вариант
+    «перед заведением сверяться и с открытыми auto-detected» не выбран:
+    отпечатки двух детекторов несопоставимы (хэш против slug), а после
+    исключения PR-событий классы двух путей не пересекаются.
+
+    Строка ошибки не прочиталась — задача НЕ заводится (находка ревью PR #488,
+    чеклист): фолбэк-факт «шаги: …» грубее отпечатка с настоящей строкой,
+    задача по нему мигает во вторую, когда лог на следующем пульсе
+    прочитается. Критерий #477 требует точную причину — остаётся громкое
+    наблюдение (⚠️); устойчивый случай подберёт автодетектор #201 (класс
+    warn:), факт не теряется — ссылка на прогон в строке наблюдения.
+
+    Окно свежести измеряется от updated_at (момент провала), не от created_at
+    (момент постановки в очередь) — иначе провалы долгих прогонов (worker.yml
+    пашет десятки минут по замыслу) лежат вне окна на каждом пульсе. Реран
+    старого прогона обновляет updated_at — прогон снова «свежий», ПОКА задача
+    класса открыта (defect) или маркер в #120 стоит (infra) повторного
+    сигнала/задачи это не даёт: дедуп смотрит на них, не на свежесть. После
+    закрытия задачи реран в окне заведёт новую задачу на ту же причину — это
+    не бесконечный цикл, а переоткрытие эпизода с ограничителем-окном:
+    причина снова красит свежий прогон, значит снова требует разбора."""
+    observations: list[str] = []
+    actions: list[str] = []
+    ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
+
+    for workflow in WATCHED_WORKFLOWS:
+        try:
+            # status=completed (не status=failure): серверный фильтр failure
+            # не возвращает timed_out — провал по собственному капу остался бы
+            # неразобранным (находка ревью PR #488, раунд 3); вывод
+            # фильтруется клиентским списком FAILURE_WATCH_RUN_CONCLUSIONS.
+            # Размер страницы — единый FAILURE_WATCH_PER_PAGE (см. константу).
+            payload = gh(
+                f"repos/{repo}/actions/workflows/{workflow}"
+                f"/runs?status=completed&per_page={FAILURE_WATCH_PER_PAGE}"
+            ) or {}
+        except RuntimeError as error:
+            observations.append(f"⚠️ failure-watch {workflow}: список провалов не прочитан ({error})")
+            continue
+        runs = payload.get("workflow_runs", [])
+        # Класс «красный прогон PR-события» уже ведёт check:red-путь #201 (см.
+        # докстринг) — вычитается ДО окна свежести. Фильтр клиентский, не
+        # серверный `event=`: у API нет «не равно», а перебор легитимных
+        # событий — по запросу на каждое событие каждого workflow против одной
+        # страницы здесь. Страница — запас, чтобы клиентские фильтры
+        # (PR-прогоны, отменённые) не вытеснили свежий провал основного
+        # события за страницу; потеря хвоста за страницей стоит не дороже
+        # окна ниже — вне окна разбор и так не идёт.
+        runs = [r for r in runs if r.get("event") != "pull_request"]
+        runs = [r for r in runs if r.get("conclusion") in FAILURE_WATCH_RUN_CONCLUSIONS]
+        # Окно свежести (находка ревью PR #488): провал старше окна уже не
+        # актуален — задачу на него заводить поздно и незачем, `now` не
+        # декорация. Без фильтра `runs[0]` навсегда остаётся тем же старым
+        # красным прогоном после закрытия задачи по нему. Якорь — updated_at
+        # (момент провала), не created_at (момент постановки в очередь):
+        # см. комментарий у FAILURE_WATCH_WINDOW_MINUTES.
+        fresh_cutoff = now - timedelta(minutes=FAILURE_WATCH_WINDOW_MINUTES)
+        runs = [r for r in runs if parse_time(r["updated_at"]) >= fresh_cutoff]
+        if not runs:
+            continue
+        run_item = runs[0]  # самый свежий провал этого workflow в пределах окна
+        # Сбой запроса job'ов — отдельное наблюдение с причиной, не склейка с
+        # «упавший job не найден»: свод источников (failing_jobs) отдаёт
+        # RuntimeError, «сбой» и «пусто» — разные факты (чеклист ревью PR #488).
+        try:
+            bad_jobs = failing_jobs(repo, run_item, FAILURE_WATCH_RUN_CONCLUSIONS)
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ failure-watch {workflow}: job'ы прогона "
+                f"{run_item.get('html_url')} не прочитаны ({error})")
+            continue
+        if not bad_jobs:
+            observations.append(
+                f"⚠️ failure-watch {workflow}: прогон {run_item.get('html_url')} красный, "
+                f"упавших job'ов с выводом {('+'.join(FAILURE_WATCH_RUN_CONCLUSIONS))} не найдено")
+            continue
+        run_url = run_item.get("html_url", "")
+        # Каждый упавший job — отдельный кандидат класса: разные job'ы одного
+        # прогона падают по разным причинам, и раньше разбирался только
+        # bad_jobs[0] (находка ревью PR #488, чеклист). Лог job'а — дорогой
+        # запрос, поэтому потолок FAILURE_WATCH_MAX_JOBS_PER_RUN; хвост НЕ
+        # прячется — назван поимённо в наблюдении после цикла.
+        for job in bad_jobs[:FAILURE_WATCH_MAX_JOBS_PER_RUN]:
+            error_line = last_error_log_line(repo, job["id"])
+            job_name = job.get("name", "?")
+            step_names = ", ".join(
+                step["name"] for step in job.get("steps", [])
+                if step.get("conclusion") in FAILURE_CONCLUSIONS
+            ) or "нет (упал до шагов)"
+            if error_line is None:
+                observations.append(
+                    f"⚠️ failure-watch {workflow} (job «{job_name}»): прогон {run_url} красный, "
+                    f"строка ##[error] недоступна (шаги: {step_names}) — задачу не "
+                    "заводим без факта, устойчивый случай возьмёт автодетектор (#201, warn:)")
+                continue
+            fact = error_line
+            cause = classify_failure_cause(f"{error_line} {step_names}")
+            fingerprint = failure_fingerprint(workflow, job_name, fact)
+
+            if cause == "stale_base":
+                observations.append(
+                    f"⏭️ failure-watch {workflow} (job «{job_name}»): устаревшая база "
+                    f"(класс {fingerprint}) — газ уже назван в #474/task-branch "
+                    "(git rebase), задачу не дублируем")
+                continue
+
+            if cause == "infra":
+                marker = f"{FAILURE_WATCH_INFRA_MARKER} {fingerprint}]"
+                try:
+                    already = bool(issue_marker_times(repo, WATCHDOG_ISSUE, marker))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow} (job «{job_name}»): маркеры "
+                        f"#{WATCHDOG_ISSUE} не прочитаны ({error})")
+                    continue
+                if already:
+                    observations.append(
+                        f"🕓 failure-watch {workflow} (job «{job_name}»): инфраструктурная "
+                        f"причина, класс {fingerprint} (уже сигналили) — молча ждём")
+                    continue
+                text = (
+                    f"🕓 edge-harness: {marker}\n"
+                    f"{workflow} (job «{job_name}») падает по инфраструктурной причине, "
+                    "не наш дефект — лечится ожиданием, задача в пул не заводится.\n"
+                    f"Факт: {fact}\n"
+                    f"{run_url}"
+                )
+                # posted — находка ревью PR #488 (раунд 2; тот же класс, что
+                # heartbeat_check после PR #318): упавший пост уходит в
+                # warning, и отчёт не вправе утверждать «след оставлен».
+                posted = True
+                try:
+                    post_issue_comment(repo, WATCHDOG_ISSUE, text)
+                except RuntimeError as error:
+                    posted = False
+                    print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+                observations.append(
+                    f"🕓 failure-watch {workflow} (job «{job_name}»): инфраструктурная "
+                    f"причина, класс {fingerprint} — след в #{WATCHDOG_ISSUE} "
+                    f"{'оставлен' if posted else 'НЕ оставлен'}, диспатч не трогаем")
+                continue
+
+            # cause == "defect": заводим задачу, если класса ещё нет в пуле.
+            if ci_fingerprints is None:
+                try:
+                    ci_fingerprints = open_ci_failure_fingerprints(repo)
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow}: список задач {FAILURE_WATCH_LABEL} не прочитан ({error})")
+                    continue
+            if fingerprint in ci_fingerprints:
+                observations.append(
+                    f"🔁 failure-watch {workflow} (job «{job_name}»): дефект класса "
+                    f"{fingerprint} уже в пуле — не дублируем")
+                continue
+            title = f"CI: {workflow} падает — {job_name}"
+            body = failure_watch_task_body(
+                workflow, job_name, fact, run_url, fingerprint, step_names)
+            try:
+                # Заведение issue пула — только через pool_issue.create_pool_issue
+                # (одно место правды #526: labels без `task` — RuntimeError ДО
+                # сетевого вызова; CI-гвардия «сырой POST repos/{repo}/issues
+                # вне pool_issue.py» ловит обход — красный чек прогона
+                # 34049072989 на этом PR).
+                pool_issue.create_pool_issue(
+                    gh, repo, title, body, ["task", FAILURE_WATCH_LABEL])
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ failure-watch {workflow} (job «{job_name}»): задача по дефекту не заведена ({error})")
+                continue
+            ci_fingerprints.add(fingerprint)
+            actions.append(
+                f"🛠️ failure-watch {workflow}: заведена задача по дефекту "
+                f"(job «{job_name}», шаги: {step_names}, класс {fingerprint}) — {fact}")
+        hidden = bad_jobs[FAILURE_WATCH_MAX_JOBS_PER_RUN:]
+        if hidden:
+            observations.append(
+                f"⚠️ failure-watch {workflow}: ещё {len(hidden)} упавших job'ов не разобраны "
+                f"(потолок {FAILURE_WATCH_MAX_JOBS_PER_RUN} логов на прогон): "
+                + ", ".join(f"«{j.get('name', '?')}»" for j in hidden))
+
+    return observations, actions

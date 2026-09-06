@@ -27,14 +27,18 @@ def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
 
-def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch"):
+def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch", updated_at=None):
     """Прод-форма элемента workflow_runs (поля, которые читает модуль).
     event по умолчанию — workflow_dispatch (реальный тик), чтобы существующие
-    тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать."""
+    тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать.
+    updated_at по умолчанию = created_at: у короткого прогона моменты очереди
+    и завершения совпадают; долгий прогон задаётся явно (см. регресс-тест
+    окна свежести на находку ревью PR #488, раунд 3)."""
     return {
         "id": run_id,
         "conclusion": conclusion,
         "created_at": created_at,
+        "updated_at": updated_at or created_at,
         "html_url": f"https://github.com/mytab0r/edge-harness/actions/runs/{run_id}",
         "display_title": title,
         "event": event,
@@ -294,6 +298,41 @@ def test_last_failure_error_loud_when_details_unavailable(monkeypatch):
         raise RuntimeError("gh api: 502")
     monkeypatch.setattr(pg, "gh", broken)
     assert "детали недоступны" in pg.last_failure_error("o/r", {"id": 1})
+
+
+def test_last_failure_error_shares_failing_jobs_not_second_copy():
+    # Чеклист ревью PR #488: докстринг называл failing_jobs общим источником
+    # с last_failure_error, а запрос жил в двух копиях. Свод настоящий —
+    # гвардия по исходнику: last_failure_error не делает собственного
+    # gh-вызова, читает job'ы только через failing_jobs.
+    import inspect
+    source = inspect.getsource(pg.last_failure_error)
+    assert "failing_jobs(repo, run)" in source
+    assert 'gh(f"repos' not in source
+
+
+def test_failing_jobs_conclusions_param_and_loud_failure(monkeypatch):
+    # Параметр выводов: timed_out-job «упавший» для failure_watch
+    # (FAILURE_WATCH_RUN_CONCLUSIONS) и «не упавший» для дефолтного набора
+    # предохранителя — один список job'ов, два вопроса. Сбой запроса —
+    # RuntimeError наверх, а не пустой список: «сбой» и «пусто» различаются.
+    payload = {"jobs": [
+        {"id": 1, "name": "task", "conclusion": "timed_out", "steps": []},
+        {"id": 2, "name": "dsh-task", "conclusion": "failure", "steps": []},
+    ]}
+    monkeypatch.setattr(pg, "gh", lambda *a: payload)
+    assert [j["id"] for j in pg.failing_jobs("o/r", {"id": 7}, pg.FAILURE_WATCH_RUN_CONCLUSIONS)] == [1, 2]
+    assert [j["id"] for j in pg.failing_jobs("o/r", {"id": 7})] == [2]  # дефолт: timed_out не красный
+
+    def broken(*a):
+        raise RuntimeError("gh api: 502")
+    monkeypatch.setattr(pg, "gh", broken)
+    try:
+        pg.failing_jobs("o/r", {"id": 7})
+    except RuntimeError:
+        pass
+    else:
+        pytest.fail("сбой запроса job'ов обязан быть громким (RuntimeError), не пустым списком")
 
 
 # ── Проводка: gate останавливает диспатч, heartbeat кричит ───────────────────────
@@ -1027,3 +1066,588 @@ def test_resume_alert_text_carries_marker_evidence():
     assert "#205" in text                        # задача последнего красного прогона
     assert "без ожидания пробы" in text          # путь возобновления назван
     assert pg.PAUSE_MARKER not in text           # маркер серии — не сброс: их нельзя смешивать
+
+
+# ── Гвардия непрочитанных провалов ключевых workflow (#477) ─────────────────────
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("dsh: RATE_LIMIT: Rate limit reached for requests", "infra"),
+    ("dial tcp: lookup api.github.com: no such host", "infra"),
+    ("gh: 502 Bad Gateway", "infra"),
+    ("ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.", "stale_base"),
+    # Находка ревью PR #488: "protected branch hook declined" — НЕ признак
+    # протухшей базы (это отказ серверного хука по другой причине, обычно
+    # наш дефект workflow), сигнатуру убрали из STALE_BASE_SIGNATURES —
+    # такой текст обязан классифицироваться как defect, не тихо прощаться.
+    ("! [remote rejected] agent/1-x -> agent/1-x (protected branch hook declined)", "defect"),
+    ("scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory", "defect"),
+    ("AssertionError: expected 3 got 2", "defect"),
+    ("что угодно нераспознанное", "defect"),  # fail loud: непонятное — дефект, не прощаем молча
+])
+def test_classify_failure_cause(text, expected):
+    assert pg.classify_failure_cause(text) == expected
+
+
+def test_failure_fingerprint_stable_across_run_specific_noise():
+    # Один и тот же баг на РАЗНЫХ прогонах (разные run id/номера строк/hex) —
+    # обязан схлопнуться в один отпечаток: иначе «не спамить» не работает.
+    a = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    b = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 402: .../infra_digest.sh: No such file or directory")
+    assert a == b
+
+
+def test_failure_fingerprint_distinguishes_workflow_and_job():
+    base = pg.failure_fingerprint("worker.yml", "task", "No such file or directory")
+    other_workflow = pg.failure_fingerprint("hands.yml", "task", "No such file or directory")
+    other_job = pg.failure_fingerprint("worker.yml", "dsh-task", "No such file or directory")
+    other_text = pg.failure_fingerprint("worker.yml", "task", "AssertionError: boom")
+    assert len({base, other_workflow, other_job, other_text}) == 4
+
+
+FAILURE_WATCH_QUIET_ROUTES = {
+    f"workflows/{wf}/runs?status=completed": {"workflow_runs": []}
+    for wf in pg.WATCHED_WORKFLOWS
+}
+
+
+def _stdout_with_error(line: str):
+    return SimpleNamespace(returncode=0, stdout=f"2026-09-06T10:18:00.0000000Z {line}\n")
+
+
+def test_last_error_log_line_skips_runner_boilerplate_finds_real_cause(monkeypatch):
+    # Ветка 1 (предпочтительная): причина аннотирована ::error::-строкой
+    # (наши die()/echo "::error::" в task.sh), boilerplate раннера
+    # («Process completed with exit code N», «Cleaning up») пропускается.
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[error]Нет доступа к морде dsh-edge — "
+        "job красный (#119)\n"
+        "2026-09-06T10:17:59.0000000Z Cleaning up orphan processes\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "dsh-edge" in line
+    assert "exit code" not in line
+
+
+def test_last_error_log_line_plain_stderr_tail_when_no_error_annotation(monkeypatch):
+    # Находка ревью PR #488 (раунд 6, блокирующая): содержательные причины
+    # почти везде идут ПРОСТОЙ stderr-строкой без ##[error] — живой замер на
+    # прогоне 34027035455: bash печатает «line N: ... No such file or
+    # directory» plain-строкой, аннотированной в логе только boilerplate
+    # раннера. Только-##[error]-канал делал факт недостижимым (orchestra.yml
+    # не содержит ни одного ::error вовсе). Фикстура — прод-форма, не пересказ.
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[group]Run bash scripts/worker/task.sh\n"
+        "2026-09-06T10:17:58.5000000Z source: /home/runner/work/edge-harness/edge-harness/scripts/gh/infra_digest.sh: No such file or directory\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "No such file or directory" in line
+    assert "##[" not in line and "exit code" not in line
+
+
+def test_last_error_log_line_worker_wrapper_is_not_a_fact(monkeypatch):
+    # Находка ревью PR #488 (раунд 6, блокирующая): «Воркер не справился:
+    # dsh завершился с кодом N без открытого PR» (die() в task.sh) — факт
+    # падения ОБЁРТКИ, не причина; нормализация цифр делала из него один
+    # отпечаток на любую причину агентского провала. Причина живёт в
+    # plain-хвосте (вывод dsh) — факт берётся оттуда.
+    log = (
+        "2026-09-06T10:17:57.0000000Z dsh: AssertionError: пул пуст, а задача назначена\n"
+        "2026-09-06T10:17:58.0000000Z ##[error]Воркер не справился: dsh завершился с кодом 1 без открытого PR\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "пул пуст" in line
+    assert "Воркер не справился" not in line
+
+
+def test_last_error_log_line_wrapper_without_tail_returns_none(monkeypatch):
+    # Обёртка без содержательного хвоста — не превращается в «факт с ложной
+    # точностью»: нет строки → вызывающий уходит в громкое наблюдение, задачу
+    # не заводит (тот же контракт, что у only-boilerplate выше).
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[error]Воркер не справился: dsh завершился с кодом 1 без открытого PR\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-06T10:18:01.0000000Z Cleaning up orphan processes\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    assert pg.last_error_log_line("mytab0r/edge-harness", 999) is None
+
+
+def test_last_error_log_line_only_boilerplate_returns_none(monkeypatch):
+    # Без содержательной строки — None, вызывающий откатывается на имена шагов
+    # (существующая ветка `fact = error_line or f"шаги: {step_names}"`).
+    log = "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    assert pg.last_error_log_line("mytab0r/edge-harness", 999) is None
+
+
+def test_last_error_log_line_passes_allow_escape_sequences():
+    # Живая проверка PR #488: сырой лог job'а несёт ANSI-escape, и gh (замер
+    # 2.98.0, 2026-09-06) отвечает ОТКАЗОМ exit 1 без --allow-escape-sequences
+    # («the response contains terminal escape sequences») — без флага факт
+    # недостижим в проде вообще, при зелёных тестах на моках. Гвардия по
+    # исходнику: мок subprocess принимает любые аргументы и этого не ловит.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '"gh", "api", "--allow-escape-sequences"' in source, (
+        "last_error_log_line обязан звать gh api с --allow-escape-sequences")
+
+
+def test_last_error_log_line_strips_ansi_escapes_from_fact(monkeypatch):
+    # Факт уходит в тело задачи и след #120/Telegram — управляющие коды сырого
+    # лога не должны попадать в текст сигнала.
+    log = (
+        "\x1b[31m2026-09-06T10:17:58.0000000Z ##[error]scripts/worker/task.sh: "
+        "infra_digest.sh: No such file or directory\x1b[0m\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "infra_digest.sh" in line
+    assert "\x1b" not in line
+
+
+def test_failure_watch_quiet_when_no_failed_runs(monkeypatch):
+    fake = FakeGh(dict(FAILURE_WATCH_QUIET_ROUTES))
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert observations == [] and actions == []
+
+
+def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []  # пока пусто — класса ещё нет
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1
+    joined = " ".join(created[0])
+    assert "labels[]=task" in joined and "labels[]=ci-failure" in joined
+    assert "infra_digest.sh" in joined
+    assert any("заведена задача" in line for line in actions)
+
+    # второй пульс: тот же класс уже в открытых issues (метка ci-failure) —
+    # не заводим вторую задачу на тот же баг.
+    fp = pg.failure_fingerprint("worker.yml", "task",
+                                 "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"body": f"...<!-- failure-fingerprint: {fp} -->\n"},
+    ]
+    observations2, actions2 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions2 == []
+    assert any("не дублируем" in line for line in observations2)
+    assert len(created) == 1  # вторая задача не заведена
+
+
+def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/hands.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 7),
+    ]}
+    routes["runs/7/jobs"] = {"jobs": [
+        {"id": 1, "name": "dsh-task", "conclusion": "failure", "steps": [
+            {"name": "Прогон задачи через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues/120/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "dsh: RATE_LIMIT: Rate limit reached for requests")))
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(posted) == 1
+    assert pg.FAILURE_WATCH_INFRA_MARKER in posted[0]
+    assert actions == []  # инфраструктура — наблюдение, не действие пула
+
+    # второй пульс: маркер уже стоит — молчим, не спамим
+    fp = pg.failure_fingerprint("hands.yml", "dsh-task", "dsh: RATE_LIMIT: Rate limit reached for requests")
+    routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:55:00Z",
+         "body": f"...{pg.FAILURE_WATCH_INFRA_MARKER} {fp}]..."},
+    ]
+    posted.clear()
+    observations2, _ = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert posted == []
+    assert any("уже сигналили" in line for line in observations2)
+
+
+def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
+    # Находка ревью PR #488: провал старше окна не заводит задачу заново на
+    # уже неактуальную причину — `now` обязан использоваться, не просто
+    # приниматься в сигнатуру. Прогон на 4 дня старше NOW заведомо за окном
+    # FAILURE_WATCH_WINDOW_MINUTES (30 мин).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-27T11:50:00Z", 34027035455,
+            updated_at="2026-08-27T11:55:00Z"),
+    ]}
+
+    def boom(*a):
+        pytest.fail("прогон вне окна свежести не должен запрашивать детали job'ов")
+
+    monkeypatch.setattr(pg, "gh", FakeGh(routes))
+    monkeypatch.setattr(pg, "failing_jobs", boom)
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert observations == [] and actions == []
+
+
+def test_failure_watch_window_anchor_is_failure_moment_not_queue_time(monkeypatch):
+    # Находка ревью PR #488 (раунд 3, блокирующая): created_at у GitHub —
+    # момент ПОСТАНОВКИ В ОЧЕРЕДЬ, не провала. Воркер по замыслу пашет десятки
+    # минут (worker.yml — timeout-minutes: 280): прогон, поставленный в
+    # очередь 200 минут назад и УПАВШИЙ 10 минут назад, по created_at лежал бы
+    # вне окна на каждом пульсе — ни задачи, ни наблюдения, навсегда. Якорь
+    # окна — updated_at (у завершённого красного прогона это момент провала).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T08:40:00Z", 34027035455,  # очередь: 200 мин до NOW
+            updated_at="2026-08-31T11:50:00Z"),              # провал: 10 мин до NOW
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1, (
+        "долгий прогон, упавший внутри окна, обязан разбираться — "
+        "якорь окна created_at хоронит провалы долгих воркеров")
+    assert any("заведена задача" in line for line in actions)
+
+
+def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeypatch):
+    # Находка ревью PR #488 (раунд 3, блокирующая): серверный фильтр
+    # status=failure не возвращает timed_out, а прогон, убитый собственным
+    # капом (timeout-minutes: worker.yml = 280), — провал в смысле #477.
+    # Опрос идёт по status=completed с клиентским фильтром
+    # FAILURE_WATCH_RUN_CONCLUSIONS; cancelled там НЕТ — отмена это
+    # осознанное действие, не сигнал о дефекте/инфраструктуре.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        # Прод-форма: список от нового к старому — отменённый прогон СТОИТ
+        # ВПЕРЕДИ провального. Без клиентского фильтра вывода runs[0] — это
+        # отменённый прогон, и разбор ушёл бы на него (мутация: снятие
+        # фильтра красит этот тест — FakeGh громко требует маршрут jobs
+        # для прогона 222, которого быть не должно).
+        run("cancelled", "2026-08-31T11:52:00Z", 222,
+            updated_at="2026-08-31T11:53:00Z"),
+        run("timed_out", "2026-08-31T11:50:00Z", 111,
+            updated_at="2026-08-31T11:51:00Z"),
+    ]}
+    # Маршрут jobs заведён ТОЛЬКО для timed_out-прогона 111: разбор
+    # отменённого 222 уронил бы FakeGh AssertionError — громко, не молча.
+    routes["runs/111/jobs"] = {"jobs": [
+        {"id": 111, "name": "task", "conclusion": "timed_out", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1  # задача — по timed_out-прогону; cancelled не разбирается
+    assert "actions/runs/111" in " ".join(created[0])
+    assert "actions/runs/222" not in " ".join(created[0])
+
+
+def test_failure_watch_task_body_names_failed_steps(monkeypatch):
+    # Чеклист ревью PR #488 (раунд 3): критерий #477 называет «шаг + последняя
+    # ##[error]-строка» — тело заведённой задачи обязано нести упавшие шаги
+    # job'а (имена уже прочитаны из job'а, второй запрос не нужен).
+    body = pg.failure_watch_task_body(
+        "worker.yml", "task",
+        "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory",
+        "https://github.com/mytab0r/edge-harness/actions/runs/1",
+        "ce6fa14c0089",
+        "Задача через DSH headless")
+    assert "Упавшие шаги job'а «task»: Задача через DSH headless" in body
+    assert "Факт: ##[error]scripts/worker/task.sh" in body
+
+
+def test_failure_watch_stale_base_neither_files_task_nor_signals(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 8),
+    ]}
+    routes["runs/8/jobs"] = {"jobs": [
+        {"id": 2, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Ветка: новая от свежего origin/main", "conclusion": "failure"},
+        ]},
+    ]}
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать — газ уже назван в #474"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions == []
+    assert any("устаревшая база" in line for line in observations)
+    assert any("#474" in line for line in observations)
+
+
+def test_failure_watch_skips_pull_request_runs_their_class_belongs_to_stall_detector(monkeypatch):
+    # Находка ревью PR #488 (раунд 2, блокирующая): красный прогон PR-события —
+    # это красный обязательный чек на PR; устойчивую причину того же класса
+    # уже заводит автодетектор простоя (#201, отпечаток check:red:<имя>).
+    # Вторая задача с меткой ci-failure на тот же дефект — тот спам, который
+    # запрещает критерий #477. Прод-форма: PR-триггер среди отслеживаемых
+    # workflow есть только у orchestra.yml (job contract), свежий красный
+    # pull_request-прогон стоит в одной странице ПЕРЕД свежим schedule-прогоном.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:55:00Z", 555, event="pull_request"),
+        run("failure", "2026-08-31T11:50:00Z", 34027035455, event="schedule"),
+    ]}
+    # Маршрут jobs заведён ТОЛЬКО для schedule-прогона: разбор PR-прогона 555
+    # уронил бы FakeGh AssertionError («нет маршрута») — громко, не молча.
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Планировщик", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]AssertionError: пул пуст, а задача назначена")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1  # задача — по schedule-прогону, не по PR-прогону
+    assert any("orchestra.yml" in line for line in actions)
+    # В теле задачи — ссылка на schedule-прогон 34027035455, не на PR-прогон 555.
+    assert "actions/runs/34027035455" in " ".join(created[0])
+    assert "actions/runs/555" not in " ".join(created[0])
+
+
+def test_failure_watch_infra_reports_trace_not_posted_when_comment_fails(monkeypatch):
+    # Находка ревью PR #488 (раунд 2, блокирующая; тот же класс, что
+    # heartbeat_check после PR #318): упавший post_issue_comment уходит в
+    # warning — и отчёт не имеет права утверждать «след в #120 оставлен».
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/hands.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 7),
+    ]}
+    routes["runs/7/jobs"] = {"jobs": [
+        {"id": 1, "name": "dsh-task", "conclusion": "failure", "steps": [
+            {"name": "Прогон задачи через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues/120/comments"] = []
+    monkeypatch.setattr(pg, "gh", FakeGh(routes))
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "dsh: RATE_LIMIT: Rate limit reached for requests")))
+
+    def broken_post(*a):
+        raise RuntimeError("gh api: 502")
+    monkeypatch.setattr(pg, "post_issue_comment", broken_post)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions == []  # инфраструктура — наблюдение, не действие пула
+    line = next(l for l in observations if "инфраструктурная причина" in l)
+    assert "НЕ оставлен" in line
+
+
+def test_failure_watch_no_task_without_error_line(monkeypatch):
+    # Чеклист ревью PR #488: фолбэк-факт «шаги: …» грубее отпечатка с
+    # настоящей строкой — задача по нему мигает во вторую, когда лог на
+    # следующем пульсе прочитается. Без строки ##[error] задачи нет — только
+    # громкое наблюдение; устойчивый случай возьмёт автодетектор (#201, warn:).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    # Маршрутов issues НЕТ нарочно: попытка дедупа/создания задачи уронило бы
+    # FakeGh AssertionError — заведение задачи без факта красит тест громко.
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    # Лог содержит только boilerplate раннера — содержательной строки нет.
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]Process completed with exit code 1.")))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions == []
+    line = next(l for l in observations if "задачу не" in l and "заводим" in l)
+    assert "Задача через DSH headless" in line
+
+
+def test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest(monkeypatch):
+    # Чеклист ревью PR #488: разбираются ВСЕ упавшие job'ы (до потолка
+    # FAILURE_WATCH_MAX_JOBS_PER_RUN логов на прогон), хвост назван поимённо —
+    # не прячется молча (тот же класс «не прятать хвост», что #308).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/hands.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 7),
+    ]}
+    routes["runs/7/jobs"] = {"jobs": [
+        {"id": 1 + i, "name": f"job-{i}", "conclusion": "failure", "steps": [
+            {"name": "шаг", "conclusion": "failure"},
+        ]}
+        for i in range(pg.FAILURE_WATCH_MAX_JOBS_PER_RUN + 1)
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]AssertionError: красный тест")))
+
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 900 + len(created)}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    # Разные job'ы — разные классы: по задаче на каждый разобранный job.
+    assert len(created) == pg.FAILURE_WATCH_MAX_JOBS_PER_RUN
+    assert len(actions) == pg.FAILURE_WATCH_MAX_JOBS_PER_RUN
+    hidden_line = next(l for l in observations if "не разобраны" in l)
+    assert f"job-{pg.FAILURE_WATCH_MAX_JOBS_PER_RUN}" in hidden_line
+
+
+def test_failure_watch_single_page_100_for_every_watched_workflow(monkeypatch):
+    # Находка ревью PR #488 (раунды 4–5): страница считается безотносительно
+    # окна, а провал с самым старым created_at — timed_out долгого воркера
+    # (кап 280 мин: создан ЗА ЧАСЫ до провала) — вытеснялся бы за страницу 20
+    # молча. Размер ЕДИНЫЙ для всех отслеживаемых (FAILURE_WATCH_PER_PAGE=100,
+    # прецедент — heartbeat_check), тот же ОДИН запрос на workflow.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    pg.failure_watch("mytab0r/edge-harness", NOW)
+    poll_calls = [url for url in fake.calls if "runs?status=completed" in url]
+    assert len(poll_calls) == len(pg.WATCHED_WORKFLOWS)  # по одному на workflow
+    for url in poll_calls:
+        assert "per_page=100" in url, url
+
+
+def test_failure_watch_jobs_request_failure_is_named_observation(monkeypatch):
+    # Свод источников (failing_jobs) сделал сбой запроса громким: «job'ы не
+    # прочитаны» и «упавших job'ов нет» — разные факты, разные наблюдения;
+    # сбой одного workflow не роняет обход остальных и сам пульс.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 31337,
+            updated_at="2026-08-31T11:51:00Z"),
+    ]}
+    # Маршрута runs/31337/jobs НЕТ: FakeGh бросает AssertionError, оборачиваем
+    # в RuntimeError — прод-форма сетевого сбоя gh().
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "failing_jobs",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gh api: 502 (почти как в проде)")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions == []
+    line = next(l for l in observations if "не прочитаны" in l)
+    assert "worker.yml" in line and "502" in line
+
+
+def test_stale_base_signatures_no_dead_strings():
+    # Каждая сигнатура обязанa быть достижимой в реальном логе: «checks
+    # awaiting conflict resolution» была удалена ревью PR #488 (раунд 2) —
+    # на конфликтном PR проверки не запускаются вовсе, строки в логе нет.
+    # Гвардия против возврата мёртвых сигнатур: новая добавляется только с
+    # указанием живого источника строки.
+    assert all(
+        "awaiting conflict" not in signature
+        for signature in pg.STALE_BASE_SIGNATURES
+    )
