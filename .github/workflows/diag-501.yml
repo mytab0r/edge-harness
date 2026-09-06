@@ -6,6 +6,8 @@ name: diag-501
 # проверено (см. tasks в этом же PR).
 on:
   workflow_dispatch: {}
+  push:
+    branches: [agent/501-journal-proxy-404]
 
 jobs:
   diag:
