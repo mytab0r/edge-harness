@@ -119,8 +119,9 @@ merge-коммит), но не патчи PR относительно base. Бе
 относительно того, что сохранён в шапке последнего AI-комментария
 (`review_labels.diff_unchanged`) — см. `scripts/lib/review_labels.py`. Сам
 workflow `ai-review.yml` при этом всё ещё стартует на каждый `workflow_run` от
-`pr-review` (см. `openspec/changes/ai-verdict-survives-merge/specs/
-journal-tasks-hands/spec.md`), но шаг `fingerprint` job'а `review` сверяет то
+`pr-review` (см.
+`openspec/changes/archive/ai-verdict-survives-merge/specs/journal-tasks-hands/spec.md`),
+но шаг `fingerprint` job'а `review` сверяет то
 же условие (`ai_review.py::cmd_should_run`,
 `review_labels.should_run_ai_review` — одно место правды с `check_pr.py`) и
 отдаёт `go=false` до чекаута `pr-head`/`gather`/DSH, если дорогой прогон не
