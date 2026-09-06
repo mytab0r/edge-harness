@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Тесты автофикса инварианта 4 (scripts/orchestra/archive_complete_changes.py,
-issue #493) — только чистая часть (rewrite_inbound_links): переписывание
-входящих markdown-ссылок при переносе openspec/changes/<id> в archive/, без
-реального git. Мутация: убери границу `(?![\\w-])` — тест на префиксный
-false-positive должен покраснеть; убери фильтр skip_prefix — тест
-«собственные файлы не трогаются» должен покраснеть.
+issue #493) — чистая часть (rewrite_inbound_links): переписывание входящих
+markdown-ссылок при переносе openspec/changes/<id> в archive/, без реального
+git. Мутация: убери границу `(?![\\w-])` — тест на префиксный false-positive
+должен покраснеть; убери фильтр skip_prefix — тест «собственные файлы не
+трогаются» должен покраснеть.
+
+Плюс регрессия #506 (живой факт: прогон repo-ci.yml 34036104522, сразу после
+мержа PR #500, — «No such file or directory» на ветке PR старше появления
+этого файла): REPO_ROOT обязан браться из cwd вызова, а не из расположения
+самого файла — иначе job archive-fixup ломается на КАЖДОЙ ветке, созданной до
+появления скрипта. Мутация: верни `REPO_ROOT = _DIR.parents[1]` — тест
+краснеет.
 
 Запуск: python -m pytest scripts/orchestra/test_archive_complete_changes.py -q
 """
 
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent
@@ -17,6 +26,26 @@ SCRIPT = _DIR / "archive_complete_changes.py"
 spec = importlib.util.spec_from_file_location("archive_complete_changes", SCRIPT)
 acc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acc)  # type: ignore[union-attr]
+
+
+def test_repo_root_comes_from_cwd_not_from_script_location(tmp_path: Path):
+    # Регрессия #506: скрипт живёт в main-дереве job'а, но обязан править
+    # ДРУГОЕ дерево (linked worktree ветки PR), в которое workflow cd'нулся
+    # перед вызовом. Прогон в отдельном процессе с cwd = tmp_path (внутри
+    # него НЕТ scripts/orchestra/archive_complete_changes.py вовсе — та же
+    # форма, что ветка PR старше появления этого файла) — REPO_ROOT обязан
+    # резолвиться в tmp_path, а не в scripts/orchestra (расположение файла),
+    # и импорт не должен падать на отсутствии файла в cwd.
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--print-repo-root-for-test"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    printed_root = Path(result.stdout.strip())
+    assert printed_root.resolve() == tmp_path.resolve(), (
+        f"REPO_ROOT резолвился в {printed_root}, ожидался cwd вызова {tmp_path} — "
+        "regressия #506 (job archive-fixup падает на ветке PR старше появления скрипта)"
+    )
 
 
 def write(path: Path, text: str) -> None:
