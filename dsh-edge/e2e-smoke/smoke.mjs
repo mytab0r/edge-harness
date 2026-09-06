@@ -125,7 +125,18 @@ async function main() {
 
   // ── Открыть Settings ──────────────────────────────────────────────────────
   currentSection = 'settings:open'
-  await page.getByRole('button', { name: 'Settings' }).click({ timeout: 15_000 })
+  try {
+    await page.getByRole('button', { name: 'Settings' }).click({ timeout: 15_000 })
+  } catch (error) {
+    // Диагностика (#518): кнопка «Settings» не нашлась — печатаем видимые
+    // кнопки шелла, чтобы не гадать вслепую при следующем прогоне (apstream
+    // сменил разметку — точный accessible name важнее пересказа).
+    const labels = await page.evaluate(() => Array.from(document.querySelectorAll('button'))
+      .map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim())
+      .filter((text) => text.length > 0 && text.length <= 60))
+    console.error(`::error::кнопка «Settings» не найдена; видимые кнопки шелла: ${JSON.stringify(labels)}`)
+    throw error
+  }
   const dialog = page.locator('[role="dialog"]')
   await dialog.waitFor({ state: 'visible', timeout: 15_000 })
   await page.waitForTimeout(500)
