@@ -142,6 +142,14 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
     if "blocked" in labels:
         return ClaimResult(claimed=False, task=task,
                            detail=f"задача #{task} заблокирована (label blocked) — аренда не выдана")
+    # waiting:owner (#254/#470) — задача ждёт явного выбора владельца между
+    # названными вариантами, агент не может решить за него. Тот же класс, что
+    # blocked выше (символ той же дыры — воркер начинает работу над тем, что
+    # ещё не выбрано), тот же путь проверки: без неё hands (dsh_task.sh) всё
+    # равно берут задачу в работу — единственные их ворота это claim.
+    if "waiting:owner" in labels:
+        return ClaimResult(claimed=False, task=task,
+                           detail=f"задача #{task} ждёт решения владельца (label waiting:owner) — аренда не выдана")
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
     base = gh(f"repos/{repo}/commits/main")
     commit = gh(
