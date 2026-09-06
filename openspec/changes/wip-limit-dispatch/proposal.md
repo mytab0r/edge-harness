@@ -41,7 +41,8 @@
 ## Проверено
 
 - `python -m pytest scripts/orchestra/test_scheduler.py -q` — сюита зелёная
-  (188 тестов).
+  (число тестов в прозе не фиксируем: счётчик протухает при каждом ребейзе,
+  как показал этот самый пункт).
 - Мутация 1: вернуть `if dispatch_allowed and wip_allowed:` в `main()` —
   `test_main_still_dispatches_worker_for_rework_when_wip_gate_closed`
   краснеет.

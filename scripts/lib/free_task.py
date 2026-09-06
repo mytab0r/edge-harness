@@ -225,17 +225,23 @@ def oldest_free(
 
 
 def conflict_declared_tasks(prs: list[dict[str, Any]]) -> set[int]:
-    """Номера задач, чей объявленный PR (`task_ref.task_from_branch` по
-    `headRefName` — тот же единственный источник, что `declared_pr_for_task`)
+    """Номера задач, чей объявленный PR (`task_ref.task_from_branch` —
+    единственный источник имени ветки, тот же, что `declared_pr_for_task`)
     несёт метку `conflict`. См. докстринг модуля (находка ревью PR #478) —
     такие задачи доводятся только адресно (`scheduler.py::
     dispatch_conflict_rework`, вход `task`), не через общий выбор.
 
-    `prs` — форма `gh pr list --json number,headRefName,labels` (labels —
-    та же плоская форма `[{"name": ...}, ...]`, что использует scheduler.py)."""
+    `prs` — принимаются ОБЕ формы ветки PR: плоское `headRefName`
+    (`gh pr list --json number,headRefName,labels` — форма общего выбора
+    воркера) и вложенная REST `head.ref` (снимок открытых PR scheduler.py):
+    предикат «объявленный PR несёт conflict» не зависит от формы payload'а —
+    вызов с REST-формой молча возвращал пустое множество, и исключение не
+    работало (блокирующая находка 1 ревью PR #466). Labels — та же плоская
+    форма `[{"name": ...}, ...]` в обеих формах."""
     result: set[int] = set()
     for pull in prs:
-        number = task_ref.task_from_branch(pull.get("headRefName") or "")
+        branch = pull.get("headRefName") or (pull.get("head") or {}).get("ref") or ""
+        number = task_ref.task_from_branch(branch)
         if number is None:
             continue
         names = {label.get("name") for label in pull.get("labels") or []}
