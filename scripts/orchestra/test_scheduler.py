@@ -3701,6 +3701,13 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     # Расшивка конфликтов (#474) — не предмет теста: её цикл читает labels[]
     # каждого PR, а здесь снимок — маркер-заглушка без полей.
     monkeypatch.setattr(sch, "dispatch_conflict_rework", lambda repo, pulls, pool: ([], [], False))
+    # Детектор простоя (#201) — не предмет теста: он читает строки отчёта
+    # (включая здешнюю «новые задачи не берутся»), сверяет отпечаток по сети
+    # и в среде без gh-токена падает RuntimeError'ом, крася прогон (return 1),
+    # хотя предмет теста — проводка dispatch_worker. Изолируем, как соседние
+    # main()-тесты.
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(
         sch, "wip_gate",
         lambda repo, now, pulls, pool: (["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
