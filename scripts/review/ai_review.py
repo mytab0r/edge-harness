@@ -733,12 +733,26 @@ def main() -> int:
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()
-    return args.func(args)
+    # RuntimeError (gh() — сеть/права/битый ответ API) ловится ЗДЕСЬ, внутри
+    # main(), а не в блоке if __name__ снаружи (было — регрессия #416/#399,
+    # живой прогон 34009775887, PR #333): should-run вызывается из
+    # ai-review.yml как `run_needed=$(python ... should-run ...)` — bash
+    # command substitution забирает ТОЛЬКО stdout процесса. print() без
+    # file=sys.stderr писал причину сбоя в stdout — она уезжала в
+    # переменную $run_needed и никогда не попадала в лог job'а: шаг падал
+    # (echo "::error::не смог решить...") без единой подсказки почему.
+    # Различие «решили не запускать» (false, exit 0 — все ветки
+    # cmd_should_run/cmd_verdict/cmd_gather явно возвращают 0) и «не смогли
+    # решить» (RuntimeError, exit 1) не терялось само по себе — терялось
+    # ТОЛЬКО видимое обоснование второго исхода. Тот же приём, что уже у
+    # scripts/lib/claim_task.py::main — try/except внутри функции, а не
+    # снаружи, потому и тестируем вызовом main() напрямую (test_ai_review.py).
+    try:
+        return args.func(args)
+    except RuntimeError as error:
+        print(f"::error::ai-review: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except RuntimeError as error:
-        print(f"::error::ai-review: {error}")
-        sys.exit(1)
+    sys.exit(main())
