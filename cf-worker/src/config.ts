@@ -120,7 +120,12 @@ export const TELEGRAM = {
   /** Заголовок вебхука Telegram (`setWebhook(secret_token=...)`), которым
    *  морда отличает настоящий апдейт от чужого POST на тот же путь. */
   webhookSecretHeader: "X-Telegram-Bot-Api-Secret-Token",
-  /** Префикс callback_data — не про секретность, а разбор формата. */
+  /** Префикс callback_data — не про секретность, а разбор формата. Значение
+   *  обязано совпасть с Python-стороной (scripts/orchestra/pulse_guard.py::
+   *  OWNER_DECISION_CALLBACK_PREFIX, строит клавиатуру) — синхронность
+   *  проверяет scripts/lib/test_telegram_callback_format_sync.py (#254,
+   *  находка ревью PR #486: раньше расхождение не ловилось ничем — юнит-
+   *  тесты каждой стороны прибиты к своему литералу). */
   callbackPrefix: "wo",
   /** event_type repository_dispatch, которым решение владельца уходит в
    *  тонкий job (только issues:write, .github/workflows/owner-decision.yml) —
@@ -131,7 +136,10 @@ export const TELEGRAM = {
    *  #470/#471) снимает метку waiting:owner: гвардия waiting_owner_guard.py
    *  (#470/#471, слит) читает его на следующем пульсе orchestra. Кнопка
    *  производит тот же артефакт, что и ручной ответ владельца, второй способ
-   *  применения не заводится. */
+   *  применения не заводится. Ни один TS-код это значение не читает — пишет
+   *  его Python (pulse_guard.py::DECISION_COMMENT_PREFIX), константа здесь
+   *  документирует контракт формата и сверяется тем же
+   *  test_telegram_callback_format_sync.py, что и callbackPrefix выше. */
   decisionCommentPrefix: "РЕШЕНИЕ",
 } as const;
 

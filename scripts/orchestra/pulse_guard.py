@@ -621,13 +621,19 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
 # Префикс комментария-решения — то же значение, что cf-worker/src/config.ts::
 # TELEGRAM.decisionCommentPrefix (пишет apply_owner_decision.py) и что разбирает
 # scripts/orchestra/waiting_owner_guard.py::DECISION_MARKER_RE (#471, слит) —
-# одно место правды по формату в Python-стороне этого модуля.
+# одно место правды по формату в Python-стороне этого модуля. Синхронность с
+# config.ts проверяет scripts/lib/test_telegram_callback_format_sync.py (#254,
+# находка ревью PR #486: раньше это утверждалось прозой без гвардии — тест
+# юнит-стороны Python и юнит-тест TS проверяли один и тот же литерал каждый
+# сам по себе, ни один не читал оба исходника, рассинхрон прошёл бы CI зелёным).
 DECISION_COMMENT_PREFIX = "РЕШЕНИЕ"
 
-# Префикс callback_data и лимит байт совпадают с cf-worker/src/config.ts::
-# TELEGRAM (первое разбирает cf-worker/src/harness.ts::parseOwnerDecisionCallback)
-# — два языка, одно место правды по формату, расхождение ловится тестом обеих
-# сторон по одному и тому же примеру (#254).
+# Префикс callback_data — то же значение, что cf-worker/src/config.ts::
+# TELEGRAM.callbackPrefix (разбирает cf-worker/src/harness.ts::
+# parseOwnerDecisionCallback) — синхронность проверяет тот же
+# test_telegram_callback_format_sync.py, что и DECISION_COMMENT_PREFIX выше.
+# Лимит байт — свойство Bot API, не выбор репозитория, сверять нечего (см.
+# докстринг гвардии).
 OWNER_DECISION_CALLBACK_PREFIX = "wo"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 

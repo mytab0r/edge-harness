@@ -63,6 +63,17 @@ NEW_FORMAT_BODY_ONE_VARIANT = (
     "## Варианты владельца\n1. Единственный вариант без выбора — сделать так\n"
 )
 
+# Находка ревью PR #486 (второй заход): PROTOCOL.md требует «не меньше двух
+# пронумерованных строк», но НЕ требует подряд идущей нумерации — валиден и
+# такой блок (два варианта — MIN_VARIANTS выполнен, should_auto_label true),
+# но кнопки на нём собирать нельзя: позиционная нумерация build_decision_
+# keyboard разошлась бы с письменным номером «3.».
+NEW_FORMAT_BODY_NON_SEQUENTIAL_NUMBERS = (
+    "## Варианты владельца\n"
+    "1. Секрет с правами администратора — включаем автоматику полностью\n"
+    "3. Оставить ручной инструмент — автоматики не будет вовсе\n"
+)
+
 
 def issue(number, body, labels=("task",), comments_text=()):
     return {
@@ -112,6 +123,16 @@ def test_variant_option_labels_empty_without_variants_block():
     """Тот же честный крайний случай, что variant_lines()/should_auto_label():
     блока нет вовсе — пустой список, не исключение."""
     assert wog.variant_option_labels(ISSUE_370_BODY) == []
+
+
+def test_variant_option_labels_empty_when_written_numbers_not_sequential():
+    """Находка ревью PR #486 (второй заход): письменные номера «1., 3.» —
+    валидный блок вариантов (should_auto_label остаётся true), но кнопки не
+    строятся — позиционная нумерация build_decision_keyboard разошлась бы с
+    написанным номером, нажатие «второй кнопки» записало бы «РЕШЕНИЕ: 2» за
+    вариант, названный в тексте «3.»."""
+    assert wog.should_auto_label(NEW_FORMAT_BODY_NON_SEQUENTIAL_NUMBERS) is True
+    assert wog.variant_option_labels(NEW_FORMAT_BODY_NON_SEQUENTIAL_NUMBERS) == []
 
 
 def test_should_auto_label_true_for_two_variants():
