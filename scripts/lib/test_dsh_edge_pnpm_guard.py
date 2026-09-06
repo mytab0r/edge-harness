@@ -18,37 +18,40 @@ patchedDependencies), и эта гвардия делает его возвра�
 невозможным — регресс красит CI, а не собирает тихо неверную морду.
 
 Правила:
-  1. deploy-dsh-edge.yml и plugin-forge.yml не ставят пакеты npm'ом: ни
-     `npm install`, ни его шорткат `npm i`, ни `npm ci`, ни `npm add` — в
-     ЛЮБОЙ форме записи и позиции: блочная `run: |` (голая строка), инлайн
-     `- run: npm …`, цепочка `cd … && npm install` (это единственные два
+  1. deploy-dsh-edge.yml, plugin-forge.yml и dsh-edge-pr-smoke.yml не ставят
+     пакеты npm'ом: ни `npm install`, ни его шорткат `npm i`, ни `npm ci`, ни
+     `npm add` — в ЛЮБОЙ форме записи и позиции: блочная `run: |` (голая
+     строка), инлайн `- run: npm …`, цепочка `cd … && npm install` (это три
      workflow, работающие в pnpm-дереве dsh-edge — второй появился в
      plugin-forge.yml, дым форжа ставит плагин в то же дерево тем же
-     маршрутом, находка AI-ревью PR #273). `npm pack` легален — он
-     скачивает tarball во временный каталог и node_modules не трогает.
+     маршрутом, находка AI-ревью PR #273; третий — dsh-edge-pr-smoke.yml,
+     issue #600, PR-смоук строит тот же артефакт локальной сборкой). `npm
+     pack` легален — он скачивает tarball во временный каталог и
+     node_modules не трогает.
   2. `--legacy-peer-deps` запрещён ВЕЗДЕ, где он вообще может появиться:
      все .github/workflows/*.yml|yaml и scripts/**/*.sh. Флаг — не решение
      peer-конфликта, а его маскировка (тот же класс); peer-конфликт чинится
      явным пином/исключением, а не молчаливым «поставь как нибудь».
      cf-worker и его `npm ci` в deploy-worker.yml не тронуты правилом 1:
      там своё npm-дерево с package-lock, pnpm-патчей нет.
-  3. pnpm-маршрут плагинов обязан оставаться на месте В ОБОИХ workflow: шаг
-     `pnpm add --save-exact` (в deploy-dsh-edge.yml) / `pnpm --dir … add
-     --save-exact` (в plugin-forge.yml — форма с `--dir` вместо `cd`,
-     единственные установщики плагинов) и следующая за ним проверка
-     `patchedDependencies` в pnpm-workspace.yaml (путь к файлу разный —
-     `pnpm-workspace.yaml` при `cd`, `apps/dsh-edge/standalone/
-     pnpm-workspace.yaml` при `--dir` без `cd`). Исчезла проверка — `pnpm
-     add` снова может потерять патчи молча (класс #43), и CI обязан об
+  3. pnpm-маршрут плагинов обязан оставаться на месте ВО ВСЕХ ТРЁХ workflow:
+     шаг `pnpm add --save-exact` (deploy-dsh-edge.yml и dsh-edge-pr-smoke.yml,
+     обе — `cd`-форма) / `pnpm --dir … add --save-exact` (plugin-forge.yml —
+     форма с `--dir` вместо `cd`, единственные установщики плагинов) и
+     следующая за ним проверка `patchedDependencies` в pnpm-workspace.yaml
+     (путь к файлу разный — `pnpm-workspace.yaml` при `cd`, `apps/dsh-edge/
+     standalone/pnpm-workspace.yaml` при `--dir` без `cd`). Исчезла проверка —
+     `pnpm add` снова может потерять патчи молча (класс #43), и CI обязан об
      этом крикнуть, а не довериться.
 
-Область действия правил 1 и 3 — deploy-dsh-edge.yml и plugin-forge.yml,
-потому что путь `.../apps/dsh-edge/standalone` (pnpm-дерево с обязательными
-патчами Workers) существует только внутри них; иных мест, где скрипты этого
-репозитория ставят пакеты в ЭТО pnpm-дерево, нет (проверено grep по
-scripts/ и .github/workflows/ при написании и расширении гвардии — находка
-AI-ревью PR #273: раньше в область входил только deploy-dsh-edge.yml, хотя
-plugin-forge.yml уже ставил пакеты туда же тем же классом риска). Сопредельные
+Область действия правил 1 и 3 — deploy-dsh-edge.yml, plugin-forge.yml и
+dsh-edge-pr-smoke.yml, потому что путь `.../apps/dsh-edge/standalone`
+(pnpm-дерево с обязательными патчами Workers) существует только внутри них
+(проверено grep по scripts/ и .github/workflows/ при написании и расширении
+гвардии — находка AI-ревью PR #273: раньше в область входил только
+deploy-dsh-edge.yml, хотя plugin-forge.yml уже ставил пакеты туда же тем же
+классом риска; issue #600 добавил третий workflow тем же классом риска —
+PR-смоук строит артефакт локальной сборкой той же командой). Сопредельные
 npm-употребления — `npm install -g ./*.tgz` в scripts/lib/dsh-ci.sh
 (глобальная установка CLI раннера из локальных tarball'ов, не pnpm-дерево) —
 правилами не запрещены.
@@ -63,10 +66,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 DEPLOY_DSH_EDGE = WORKFLOWS / "deploy-dsh-edge.yml"
 PLUGIN_FORGE = WORKFLOWS / "plugin-forge.yml"
-# Оба workflow ставят пакеты в pnpm-дерево apps/dsh-edge/standalone с
-# обязательными для Workers патчами — правила 1 и 3 действуют на оба
-# (находка AI-ревью PR #273: изначально гвардия видела только deploy).
-PNPM_TREE_WORKFLOWS = (DEPLOY_DSH_EDGE, PLUGIN_FORGE)
+PR_SMOKE = WORKFLOWS / "dsh-edge-pr-smoke.yml"
+# Все три workflow ставят пакеты в pnpm-дерево apps/dsh-edge/standalone с
+# обязательными для Workers патчами — правила 1 и 3 действуют на все три
+# (находка AI-ревью PR #273: изначально гвардия видела только deploy; issue
+# #600 добавил третий workflow тем же классом риска).
+PNPM_TREE_WORKFLOWS = (DEPLOY_DSH_EDGE, PLUGIN_FORGE, PR_SMOKE)
 
 # npm как УСТАНОВЩИК пакетов (меняет node_modules): install/ci/add — включая
 # шорткат `i`. В deploy-dsh-edge.yml легального npm-установщика нет вовсе
