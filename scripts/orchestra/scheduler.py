@@ -8,8 +8,12 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
 Обязанности:
   1. Просроченные назначения: задачу назначили, PR так и не появился за STALE_HOURS —
      назначение снимается, задача возвращается в пул (агент мог умереть посреди работы).
-  2. Конфликты: открытые PR, которые больше не сливаются в main без ручного
-     разрешения, получают метку `conflict` и комментарий со списком соперников.
+  2. Конфликты: открытые PR, у которых mergeable_state=dirty, получают метку
+     `conflict` и комментарий со списком соперников (mark_conflicts). Расшивка
+     не ждёт человека (#474): dispatch_conflict_rework снимает assignee+замок
+     задачи и запускает worker.yml адресно (вход `task`, тот же путь, что уже
+     доводит открытые PR, #245/#394) на авто-ребейз — одна попытка на PR
+     (лифтайм-бюджет), не сошлось — эскалация владельцу с файлами-кандидатами.
   3. Очередь слияний: PR с зелёными проверками и чистым контрактом сливается.
      За один проход очереди — ровно один PR (сериализация merge_queue, #252/#288
      не меняется), но один ЗАПУСК планировщика (#297) — это цикл таких проходов
@@ -125,6 +129,9 @@ from pulse_guard import (
     AI_REVIEW_MAX_ATTEMPTS,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
+    CONFLICT_ESCALATION_MARKER,
+    CONFLICT_REWORK_MARKER,
+    CONFLICT_REWORK_MAX_ATTEMPTS,
     FAILURE_CONCLUSIONS,
     READY_STALL_MARKER,
     RESUME_MARKER,
@@ -454,11 +461,165 @@ def mark_conflicts(repo: str, pulls: list[dict]) -> list[str]:
             "-X", "POST", f"repos/{repo}/issues/{pull['number']}/comments",
             "-f", "body=" + (
                 f"PR конфликтует с main (открытые конкуренты: {rivals}). "
-                "Перебазируй на свежий main и продолжай — оркестратор подхватит."
+                # Текст переписан под #474: раньше звал человека перебазировать
+                # руками ("Перебазируй … — оркестратор подхватит"), хотя ничего
+                # не подхватывало — dispatch_conflict_rework ниже теперь и есть
+                # тот, кто подхватывает, следующим проходом (до 15 мин, cron
+                # orchestra.yml).
+                "Оркестратор запустит адресный авто-ребейз воркером следующим "
+                "проходом (до 15 мин). Не сойдётся с первой попытки — эскалация "
+                f"владельцу в #{WATCHDOG_ISSUE}."
             ),
         )
         lines.append(f"⚠️ PR #{pull['number']} помечен `conflict`")
     return lines
+
+
+def conflict_overlap_hint(repo: str, pull: dict) -> str:
+    """Эвристика «какие файлы могли столкнуться» — для текста эскалации, не
+    для решения о дальнейших действиях. GitHub REST отдаёт только
+    mergeable_state (dirty/clean), не сами конфликтующие ханки, а
+    scheduler.py принципиально не заводит локальный git-клон (единственный
+    источник состояния здесь — gh api, см. докстринг модуля). Поэтому здесь —
+    ПЕРЕСЕЧЕНИЕ файлов, изменённых PR, и файлов, изменённых в main с момента
+    base-коммита PR: не точные конфликтующие строки, но достаточно, чтобы
+    человек не гадал с нуля. Пустая строка — определить не удалось (нет
+    base.sha или сбой API) — вызывающий код обязан сказать это честно
+    (AGENTS.md: «не знаешь — пиши «не подтверждено»»), не выдать пустоту за
+    «пересечения нет»."""
+    base_sha = ((pull.get("base") or {}).get("sha")) or ""
+    if not base_sha:
+        return ""
+    try:
+        pr_files = {f["filename"] for f in review_labels.list_pr_files(repo, pull["number"], gh)}
+        compare = gh(f"repos/{repo}/compare/{base_sha}...main")
+        main_files = {f["filename"] for f in (compare or {}).get("files") or []}
+    except RuntimeError:
+        return ""
+    return ", ".join(sorted(pr_files & main_files))
+
+
+def conflict_rework_attempts(repo: str, pr_number: int) -> int:
+    return len(issue_marker_times(repo, pr_number, CONFLICT_REWORK_MARKER))
+
+
+def dispatch_conflict_rework(
+    repo: str, pulls: list[dict], *, pool: list[dict],
+) -> tuple[list[str], list[str], bool]:
+    """Расшивка конфликта не должна ждать человека (issue #474): PR с меткой
+    conflict (mark_conflicts выше) почти всегда просто отстал от main
+    (механический дрейф, ~55 слияний/сутки на живом репозитории) — git
+    rebase origin/main решает это без содержательного решения. Путь
+    переиспользован целиком, второй не изобретается: worker.yml уже
+    принимает вход `task` (#245/#394 — доводка существующего открытого PR,
+    task.sh: checkout ветки, запрет второго PR, тот же промпт, что и для
+    ai:changes-requested/красного чека), а снятие assignee+замка задачи —
+    тот же приём, что unhealthy_pulls уже применяет к нездоровым PR
+    НЕ-conflict классов (conflict там намеренно исключён — «свой цикл
+    ручного разрешения»; эта функция и есть тот цикл, теперь автоматический).
+
+    Признака «механический дрейф или содержательный конфликт» ДО попытки не
+    существует: GitHub REST отдаёт только mergeable_state, не конфликтующие
+    ханки. Поэтому решение простое (владелец, issue #474): РОВНО одна
+    авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1, лифтайм-
+    счётчик — маркер в комментариях PR, тот же приём, что
+    ai_review_retry_count, — НЕ сбрасывается по эпизодам конфликта, тот же
+    компромисс, что уже принят для AI_REVIEW_MAX_ATTEMPTS). Сошлось —
+    mark_conflicts снимет метку сама следующим проходом (это и есть признак
+    «был дрейф», ПОСТфактум); не сошлось — эскалация владельцу (escalate,
+    тот же канал, что предохранитель конвейера #120) с файлами-кандидатами
+    (conflict_overlap_hint — эвристика, честно помечена как таковая).
+
+    Идемпотентность — worker_runs_active (тот же гейт, что dispatch_worker):
+    воркер один на репозиторий, пока прошлый прогон жив (in_progress/
+    queued), второй dispatch не уходит. Третий элемент возвращаемого
+    кортежа (dispatched) — сигнал main() не звать следом обычный
+    dispatch_worker в этом же проходе: «ровно один workflow_dispatch воркера
+    за пульс» не должно превратиться в два только из-за гонки — GitHub не
+    гарантирует, что только что созданный прогон немедленно виден как
+    queued в следующем же запросе статуса."""
+    observations: list[str] = []
+    actions: list[str] = []
+    dispatched = False
+    pool_by_number = {issue["number"]: issue for issue in pool}
+    for pull in pulls:
+        labels = {label["name"] for label in pull["labels"]}
+        if CONFLICT_LABEL not in labels:
+            continue
+        number = pull["number"]
+        task_number = task_ref.resolve_pr_task(pull)
+        if task_number is None:
+            observations.append(
+                f"⚠️ PR #{number} в конфликте, но ветка не называет задачу "
+                "(agent/N-slug) — авто-расшивка недоступна, нужен человек"
+            )
+            continue
+        attempts = conflict_rework_attempts(repo, number)
+        if attempts >= CONFLICT_REWORK_MAX_ATTEMPTS:
+            marker = f"{CONFLICT_ESCALATION_MARKER} #{number}"
+            try:
+                already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+            except RuntimeError as error:
+                observations.append(f"⚠️ не смог сверить маркер эскалации конфликта #{number}: {error}")
+                continue
+            if already:
+                continue  # уже эскалировано этим эпизодом — не спамим, ждём владельца
+            overlap = conflict_overlap_hint(repo, pull)
+            overlap_text = overlap or "не удалось определить (см. PR вручную)"
+            text = (
+                f"🚨 edge-harness: {marker}\n"
+                f"PR #{number} (задача #{task_number}) остаётся в конфликте (mergeable_state=dirty) "
+                f"после {attempts} авто-попытки ребейза worker.yml — не механический дрейф, "
+                "содержательный конфликт (main и PR правят одно и то же по-разному), нужно "
+                f"решение владельца, чья версия верна. Файлы-кандидаты (пересечение изменений "
+                f"PR и main, не точные конфликтующие строки): {overlap_text}."
+            )
+            escalation = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 PR #{number}: авто-расшивка конфликта исчерпана ({attempts}/"
+                f"{CONFLICT_REWORK_MAX_ATTEMPTS}) — эскалация владельцу ({escalation})"
+            )
+            continue
+        issue = pool_by_number.get(task_number)
+        if issue is None:
+            observations.append(
+                f"⚠️ PR #{number} в конфликте, задача #{task_number} не найдена в открытом пуле "
+                "— авто-расшивка недоступна"
+            )
+            continue
+        if _issue_is_blocked(issue):
+            continue  # эскалация playbook уже идёт своим путём — не мешаем ей
+        if dispatched or worker_runs_active(repo):
+            observations.append(f"⏸️ PR #{number} в конфликте, но воркер занят — расшивка отложена")
+            continue
+        if issue["assignees"]:
+            who = ", ".join(a["login"] for a in issue["assignees"])
+            gh("-X", "DELETE", f"repos/{repo}/issues/{task_number}/assignees", "-f", f"assignees[]={who}")
+            # Мутация pool сразу вслед за серверной (тот же приём, что
+            # reap_stale/unhealthy_pulls) — потребители этого же снимка
+            # видят актуальное состояние без второго запроса.
+            issue["assignees"] = []
+        try:
+            release_note = claim_task.release(repo, int(task_number))
+        except RuntimeError as error:
+            release_note = f"замок не снят: {error}"
+        gh(
+            "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+            "-f", "ref=main", "-f", f"inputs[task]={task_number}",
+        )
+        post_issue_comment(
+            repo, number,
+            f"🤖 {CONFLICT_REWORK_MARKER} Оркестратор снял назначение с задачи #{task_number} "
+            f"и запустил worker.yml адресно (попытка {attempts + 1}/{CONFLICT_REWORK_MAX_ATTEMPTS}): "
+            "main ушёл вперёд, git rebase origin/main почти всегда решает такой конфликт сам.",
+        )
+        actions.append(
+            f"🔧 PR #{number} в конфликте — задача #{task_number} освобождена ({release_note}), "
+            f"worker.yml запущен адресно на авто-ребейз (попытка {attempts + 1}/"
+            f"{CONFLICT_REWORK_MAX_ATTEMPTS})"
+        )
+        dispatched = True
+    return observations, actions, dispatched
 
 
 class UpdateBranchBudgetExhausted(RuntimeError):
@@ -2462,19 +2623,35 @@ def main() -> int:
 
     # Предохранитель (#120) решает, разрешён ли диспатч воркера в этом пульсе.
     conveyor_observations, conveyor_actions, dispatch_allowed = conveyor_gate(repo, now)
+    # Расшивка конфликтов (#474) — за тем же предохранителем: конвейер уже
+    # нездоров (диспатч закрыт) — не добавляем новых прогонов воркеру и по
+    # этому классу тоже, класс тот же («сломан сам worker.yml»), не другой.
+    # `pulls` — тот же снимок, что merge_loop уже довёл до актуального
+    # состояния этим прогоном (#443/#456: второго обхода нет).
     if dispatch_allowed:
+        conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = (
+            dispatch_conflict_rework(repo, pulls, pool=pool)
+        )
+    else:
+        conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = [], [], False
+    # dispatch_worker пропускается этим проходом, если расшивка конфликта уже
+    # ушла: «ровно один workflow_dispatch воркера за пульс» (докстринг модуля,
+    # п.4) не должен превратиться в два только из-за гонки worker_runs_active
+    # (только что созданный прогон не обязан быть виден как queued немедленно).
+    if dispatch_allowed and not conflict_rework_dispatched:
         worker_observations, worker_actions = dispatch_worker(repo, pool)
     else:
         worker_observations, worker_actions = [], []
 
     observations = (
         lease_observations + merge_observations + ai_observations
-        + accept_observations + conveyor_observations + worker_observations
+        + accept_observations + conveyor_observations + conflict_rework_observations
+        + worker_observations
     )
     actions = (
         stale_lines + lease_actions + conflict_lines + unhealthy_lines + merge_actions
         + ai_actions + stale_ready_lines + reopen_lines + accept_actions
-        + stale_unclaimed_lines + conveyor_actions + worker_actions
+        + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions + worker_actions
     )
     lines += render_action_report(observations, actions)
 

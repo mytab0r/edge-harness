@@ -386,11 +386,12 @@ def label(name):
     return {"id": "LA_kwDOUHBaqc8AAAACypPLSQ", "name": name, "description": "", "color": "0E8A16"}
 
 
-def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", pr_body="", ref=None):
+def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", pr_body="",
+         ref=None, base_sha=None):
     head = {"sha": f"sha{number}"}
     if ref is not None:
         head["ref"] = ref
-    return {
+    result = {
         "number": number,
         "draft": draft,
         "labels": [label(n) for n in labels],
@@ -398,6 +399,9 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
         "body": pr_body,
         "head": head,
     }
+    if base_sha is not None:
+        result["base"] = {"sha": base_sha}
+    return result
 
 
 def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None,
@@ -1615,6 +1619,226 @@ def test_mark_conflicts_post_syncs_pull_object_so_predicate_sees_it_now(monkeypa
     # should_update_branch должен теперь видеть свежепоставленную conflict —
     # без синхронизации объект p её бы не содержал до следующего fetch.
     assert sch.review_labels.should_update_branch(p["labels"]) is True
+
+
+# ── Расшивка конфликтов, автоматическая (#474) ───────────────────────────────────
+# mark_conflicts (выше) только ставит метку и ждёт человека. dispatch_conflict_rework
+# — цикл, который её подхватывает: снимает assignee+замок задачи и запускает
+# worker.yml адресно (вход task, тот же путь, что доводка открытых PR). Признака
+# «дрейф или содержательный конфликт» до попытки нет — решение простое: одна
+# авто-попытка на PR (лифтайм-счётчик), не сошлось — эскалация владельцу.
+
+
+def test_dispatch_conflict_rework_releases_task_and_dispatches_targeted_worker(monkeypatch):
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/comments": [],  # ни одной авто-попытки ещё не было
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,  # 204 без тела — прод-форма успеха
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert task["assignees"] == []  # мутация pool сразу вслед за DELETE (тот же приём, что unhealthy_pulls)
+    assert any(c.startswith("-X DELETE") and "issues/474/assignees" in c for c in fake.calls)
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=474" in dispatch_calls[0]
+    assert posted and posted[0][0] == 560
+    assert sch.CONFLICT_REWORK_MARKER in posted[0][1]
+    assert any("#560" in line and "освобождена" in line for line in actions)
+    assert observations == []
+
+
+def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("воркер занят — не пишем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("воркер занят — не трогаем задачу"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("занят" in line and "#560" in line for line in observations)
+    assert task["assignees"] != []  # задача не тронута
+    assert not any(c.startswith("-X DELETE") for c in fake.calls)
+
+
+def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
+    # Мутация: убери проверку `attempts >= CONFLICT_REWORK_MAX_ATTEMPTS` в
+    # dispatch_conflict_rework — этот тест покраснеет (ушёл бы второй dispatch
+    # worker.yml вместо эскалации; assert ниже про отсутствие dispatches это
+    # и доказывает).
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/comments": [
+            {"created_at": "2026-09-05T10:00:00Z",
+             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/560/files": files_payload(["a.py", "b.py"]),
+        "compare/basesha...main": {"files": files_payload(["b.py", "c.py"])},
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)  # второй попытки не было
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "b.py" in escalated[0][2]  # пересечение изменений PR и main
+    assert "a.py" not in escalated[0][2] and "c.py" not in escalated[0][2]
+    assert any("исчерпана" in line and "#560" in line for line in actions)
+    assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
+    marker = f"{sch.CONFLICT_ESCALATION_MARKER} #560"
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/comments": [
+            {"created_at": "2026-09-05T10:00:00Z",
+             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        ],
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-05T11:00:00Z", "body": f"🚨 {marker} — уже сказано"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert observations == []
+    # уже эскалировано — не читаем файлы PR/main зря
+    assert not any("pulls/560/files" in c or "compare/" in c for c in fake.calls)
+
+
+def test_dispatch_conflict_rework_observes_when_branch_has_no_task(monkeypatch):
+    p = pull(560, labels=["conflict"], ref="dependabot/npm_and_yarn/foo-1.2.3")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[])
+    assert dispatched is False
+    assert actions == []
+    assert any("не называет задачу" in line and "#560" in line for line in observations)
+    assert fake.calls == []
+
+
+def test_dispatch_conflict_rework_dispatches_only_one_pr_per_pass(monkeypatch):
+    # Идемпотентность внутри одного вызова: второй конфликтующий PR тем же
+    # проходом получает "воркер занят", а не второй dispatch — иначе
+    # "ровно один workflow_dispatch воркера за пульс" (докстринг модуля)
+    # нарушался бы уже внутри самой этой функции.
+    task_a = issue(474, assignees=("mytab0r",))
+    task_b = issue(475, assignees=("mytab0r",))
+    p_a = pull(560, labels=["conflict"], ref="agent/474-x")
+    p_b = pull(561, labels=["conflict"], ref="agent/475-y")
+    fake = FakeGh({
+        "issues/560/comments": [],
+        "issues/561/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p_a, p_b], pool=[task_a, task_b])
+
+    assert dispatched is True
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=474" in dispatch_calls[0]
+    assert any("#561" in line and "занят" in line for line in observations)
+    assert task_b["assignees"] != []  # вторая задача этим же проходом не тронута
+
+
+def test_conflict_overlap_hint_intersects_pr_and_main_changed_files(monkeypatch):
+    p = pull(560, base_sha="basesha")
+    fake = FakeGh({
+        "pulls/560/files": files_payload(["shared.py", "only_pr.py"]),
+        "compare/basesha...main": {"files": files_payload(["shared.py", "only_main.py"])},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_overlap_hint(REPO, p) == "shared.py"
+
+
+def test_conflict_overlap_hint_empty_when_no_base_sha():
+    p = pull(560)  # base_sha не передан — прод-форма без base тоже возможна (частичный ответ API)
+    assert sch.conflict_overlap_hint(REPO, p) == ""
+
+
+def test_conflict_overlap_hint_empty_on_api_failure_not_silent_wrong(monkeypatch):
+    # Сбой API — пустая строка, а не «пересечения нет» (AGENTS.md: «не знаешь —
+    # пиши «не подтверждено»»); вызывающий код (эскалация) обязан различить это
+    # в тексте ("не удалось определить"), сама функция только возвращает "".
+    p = pull(560, base_sha="basesha")
+    fake = FakeGh({"pulls/560/files": RuntimeError("gh api repos/o/r/pulls/560/files: HTTP 502")})
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_overlap_hint(REPO, p) == ""
+
+
+def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatched(monkeypatch):
+    """#474: расшивка конфликта и обычный dispatch_worker не должны дать ДВА
+    workflow_dispatch worker.yml за один проход main() — "ровно один за
+    пульс" (докстринг модуля, п.4). conveyor_gate открыт, но
+    dispatch_conflict_rework этим проходом уже дёрнул worker.yml — обычный
+    dispatch_worker обязан промолчать."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    monkeypatch.setattr(
+        sch, "dispatch_conflict_rework",
+        lambda repo, pulls, *, pool: (["конфликт расшит"], ["🔧 расшивка ушла"], True),
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        sch, "dispatch_worker",
+        lambda repo, pool: dispatched.append((repo, pool)) or (["не должно быть вызвано"], []),
+    )
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+
+    assert sch.main() == 0
+    assert dispatched == []
+
 
 # ── Пагинация файлов PR: третье место того же класса (находка вердикта на
 # PR #294) — after_merge читал сырую первую страницу, теперь через общий
