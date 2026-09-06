@@ -6,11 +6,18 @@ name: cf-inventory
 on:
   workflow_dispatch:
 
+# github.token этой работе не нужен вовсе (только CLOUDFLARE_*, ниже) — без
+# явного permissions: {} он получает дефолтные права репозитория (тот же
+# класс, с которым борется ADR 0008). Находка ревью PR #328, п.3.
+permissions: {}
+
 jobs:
   inventory:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Инвентарь (workers, DO, KV/D1/R2, зоны, bindings-имена)
         env:

@@ -187,6 +187,22 @@ fi
 
 rm -rf "$curl_stub_dir"
 
+# 9: status.sh не хардкодит имена воркеров вне цикла по $CF_OWN_WORKERS —
+# третий воркер в allowlist иначе молча не попал бы в деплои/bindings
+# (находка ревью PR #328, п.2). Ищем литеральный путь .../workers/scripts/
+# /<имя>/(deployments|settings) вне переменной $worker — секции ниже
+# токена "for worker in $CF_OWN_WORKERS" в исходнике не считаются.
+status_sh="$dir/status.sh"
+hardcoded=$(awk '
+  /for worker in \$CF_OWN_WORKERS/ { in_loop = 1 }
+  /^done/ { in_loop = 0 }
+  !in_loop && /workers\/scripts\/[a-z-]+\/(deployments|settings)/ { print }
+' "$status_sh")
+if [ -n "$hardcoded" ]; then
+  echo "::error::status.sh хардкодит путь воркера вне цикла CF_OWN_WORKERS: $hardcoded"
+  fail=1
+fi
+
 if [ "$fail" = 0 ]; then
   echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт и allowlist api.sh — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
 fi

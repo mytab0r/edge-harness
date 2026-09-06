@@ -27,20 +27,22 @@ run() { if "$@"; then ok_count=$((ok_count + 1)); else fail_count=$((fail_count 
 section "Токен: что он может (/user/tokens/verify)"
 run cf_get "/user/tokens/verify"
 
-section "Воркеры проекта (/workers/scripts, отфильтровано до edge-harness/dsh-edge — аккаунт общий с другими проектами владельца)"
+section "Воркеры проекта (/workers/scripts, отфильтровано до \$CF_OWN_WORKERS — аккаунт общий с другими проектами владельца)"
 run cf_workers_own
 
-section "Последний деплой edge-harness (/workers/scripts/edge-harness/deployments)"
-run cf_get "/accounts/${acc}/workers/scripts/edge-harness/deployments"
+# Секции ниже — цикл по CF_OWN_WORKERS (lib.sh, единственное место правды),
+# а не N хардкоженных секций: третий воркер в allowlist раньше не попадал бы
+# в деплои/bindings молча, дрейф ловился только предупреждением lib.sh, а не
+# самим составом инвентаря (находка ревью PR #328, п.2).
+for worker in $CF_OWN_WORKERS; do
+  section "Последний деплой $worker (/workers/scripts/$worker/deployments)"
+  run cf_get "/accounts/${acc}/workers/scripts/$worker/deployments"
+done
 
-section "Последний деплой dsh-edge (/workers/scripts/dsh-edge/deployments)"
-run cf_get "/accounts/${acc}/workers/scripts/dsh-edge/deployments"
-
-section "Bindings edge-harness — только имена, не значения (/workers/scripts/edge-harness/settings)"
-run cf_bindings_names "/accounts/${acc}/workers/scripts/edge-harness/settings"
-
-section "Bindings dsh-edge — только имена, не значения (/workers/scripts/dsh-edge/settings)"
-run cf_bindings_names "/accounts/${acc}/workers/scripts/dsh-edge/settings"
+for worker in $CF_OWN_WORKERS; do
+  section "Bindings $worker — только имена, не значения (/workers/scripts/$worker/settings)"
+  run cf_bindings_names "/accounts/${acc}/workers/scripts/$worker/settings"
+done
 
 section "Поддомен workers.dev (/workers/subdomain)"
 run cf_get "/accounts/${acc}/workers/subdomain"
