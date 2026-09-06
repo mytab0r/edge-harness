@@ -71,6 +71,10 @@ EXPECTED_WORKFLOWS = frozenset({
     "pr-review.yml",
     "quotas.yml",
     "repo-ci.yml",
+    # #490: регистрация вебхука Telegram — только секреты TELEGRAM_BOT_TOKEN/
+    # TELEGRAM_WEBHOOK_SECRET, ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
+    # читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "telegram-webhook.yml",
     # Восстановлен в #72 (ворота CI морды по ADR 0004). Репо-секретов не читает
     # вовсе: канарейка в CI ходит тестовым dev-token против локального wrangler
     # dev, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
