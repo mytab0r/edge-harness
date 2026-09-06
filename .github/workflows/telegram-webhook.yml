@@ -65,6 +65,18 @@ jobs:
             echo "::endgroup::"
           done
 
+      # Продолжение диагностики #524: curl прошёл (см. предыдущий шаг), тот же
+      # urllib.request из-под Python — нет (реальный прогон, тот же job). Этот
+      # шаг проверяет, снимается ли блок сменой ТОЛЬКО заголовка User-Agent на
+      # urllib (без переезда на другой HTTP-клиент) — если да, дело в
+      # заголовке, не в TLS-профиле интерпретатора. Скрипт временный (снять
+      # вместе с шагом перед мержем).
+      - name: 'ВРЕМЕННО (#524): urllib с явным User-Agent'
+        env:
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+        run: python3 scripts/telegram/_diag_524.py
+
       - name: Регистрация вебхука
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
