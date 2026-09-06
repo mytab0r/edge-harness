@@ -131,7 +131,7 @@ index d408d3f..02fb4f0 100644
 +    try {
 +      const session = handle.agent.session
 +      let baseTurn = 0
-+      for (const event of session.events) {
++      for (const event of session.snapshotEvents()) {
 +        const turn = (event.data as { turn?: unknown }).turn
 +        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
 +      }
