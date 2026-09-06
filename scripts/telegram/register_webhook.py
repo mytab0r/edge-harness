@@ -90,7 +90,12 @@ def probe_route(harness_url: str, secret: str) -> str:
     маршрут с разошедшимся секретом — оба случая означают «не регистрируем
     вебхук сейчас», различать их не обязательно, оба требуют человека.
     Что угодно ещё — 'unexpected:<status>', неожиданный ответ, разбираться
-    вручную, а не гадать."""
+    вручную, а не гадать.
+
+    Форма тела ошибки (issue #524, находка живого прогона) — `ApiError` в
+    cf-worker/src/harness.ts всегда отдаёт `{"error": {"code": …, "message": …}}`,
+    вложенный объект, а не плоскую строку `{"error": "need_source_msg_id"}` —
+    сверяется именно `error.code`."""
     status, parsed = _request(
         f"{harness_url}{WEBHOOK_PATH}",
         method="POST",
@@ -100,7 +105,9 @@ def probe_route(harness_url: str, secret: str) -> str:
         },
         data=b"{}",
     )
-    if status == 400 and isinstance(parsed, dict) and parsed.get("error") == "need_source_msg_id":
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if status == 400 and code == "need_source_msg_id":
         return "ready"
     if status == 401:
         return "not_ready"

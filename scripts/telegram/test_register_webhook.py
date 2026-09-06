@@ -40,27 +40,35 @@ def _http_error(status: int, body: dict) -> urllib.error.HTTPError:
     return error
 
 
+def _api_error_body(code: str) -> dict:
+    """Настоящая форма тела `ApiError` (cf-worker/src/harness.ts) — вложенный
+    объект `{"error": {"code": …, "message": …}}`, а не плоская строка (issue
+    #524, находка живого прогона: зонд сверял `parsed["error"] == code`,
+    что никогда не совпадало бы с реальным ответом воркера)."""
+    return {"error": {"code": code, "message": f"<{code}>"}}
+
+
 # ── probe_route ──────────────────────────────────────────────────────────────
 
 
 def test_probe_route_ready_on_need_source_msg_id():
-    with patch("urllib.request.urlopen", side_effect=_http_error(400, {"error": "need_source_msg_id"})):
+    with patch("urllib.request.urlopen", side_effect=_http_error(400, _api_error_body("need_source_msg_id"))):
         assert rw.probe_route("https://harness.example", "s3cr3t") == "ready"
 
 
 def test_probe_route_not_ready_on_401_missing_pr486():
-    with patch("urllib.request.urlopen", side_effect=_http_error(401, {"error": "unauthorized"})):
+    with patch("urllib.request.urlopen", side_effect=_http_error(401, _api_error_body("unauthorized"))):
         assert rw.probe_route("https://harness.example", "s3cr3t") == "not_ready"
 
 
 def test_probe_route_not_ready_on_401_wrong_secret():
     # Тот же код, что «маршрут ещё не задеплоен» — намеренно неразличимо (см. докстрок).
-    with patch("urllib.request.urlopen", side_effect=_http_error(401, {"error": "unauthorized"})):
+    with patch("urllib.request.urlopen", side_effect=_http_error(401, _api_error_body("unauthorized"))):
         assert rw.probe_route("https://harness.example", "wrong") == "not_ready"
 
 
 def test_probe_route_unexpected_status():
-    with patch("urllib.request.urlopen", side_effect=_http_error(500, {"error": "internal"})):
+    with patch("urllib.request.urlopen", side_effect=_http_error(500, _api_error_body("internal"))):
         assert rw.probe_route("https://harness.example", "s3cr3t") == "unexpected:500"
 
 
@@ -70,7 +78,7 @@ def test_probe_route_sends_secret_header_and_empty_object():
     def fake_urlopen(request, timeout=None):
         captured["header"] = request.get_header("X-telegram-bot-api-secret-token")
         captured["data"] = request.data
-        raise _http_error(400, {"error": "need_source_msg_id"})
+        raise _http_error(400, _api_error_body("need_source_msg_id"))
 
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
         rw.probe_route("https://harness.example", "the-secret")
@@ -89,7 +97,7 @@ def test_request_overrides_default_urllib_user_agent():
 
     def fake_urlopen(request, timeout=None):
         captured["user_agent"] = request.get_header("User-agent")
-        raise _http_error(400, {"error": "need_source_msg_id"})
+        raise _http_error(400, _api_error_body("need_source_msg_id"))
 
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
         rw.probe_route("https://harness.example", "the-secret")
@@ -235,7 +243,7 @@ def test_main_missing_env_warns_and_exits_zero_on_auto_trigger(capsys):
 def test_main_route_not_ready_fails_on_manual_dispatch(capsys):
     env = _env(FAIL_ON_NOT_READY="true")
     with patch.dict(os.environ, env, clear=True), patch(
-        "urllib.request.urlopen", side_effect=_http_error(401, {"error": "unauthorized"})
+        "urllib.request.urlopen", side_effect=_http_error(401, _api_error_body("unauthorized"))
     ):
         assert rw.main() == 1
     assert "PR #486" in capsys.readouterr().err
@@ -244,7 +252,7 @@ def test_main_route_not_ready_fails_on_manual_dispatch(capsys):
 def test_main_route_not_ready_warns_on_auto_trigger(capsys):
     env = _env(FAIL_ON_NOT_READY="false")
     with patch.dict(os.environ, env, clear=True), patch(
-        "urllib.request.urlopen", side_effect=_http_error(401, {"error": "unauthorized"})
+        "urllib.request.urlopen", side_effect=_http_error(401, _api_error_body("unauthorized"))
     ):
         assert rw.main() == 0
     assert "::warning::" in capsys.readouterr().err
@@ -253,7 +261,7 @@ def test_main_route_not_ready_warns_on_auto_trigger(capsys):
 def test_main_already_registered_short_circuits(capsys):
     env = _env()
     responses = [
-        _http_error(400, {"error": "need_source_msg_id"}),  # probe_route
+        _http_error(400, _api_error_body("need_source_msg_id")),  # probe_route
         FakeResponse(
             200,
             {
@@ -280,7 +288,7 @@ def test_main_already_registered_short_circuits(capsys):
 def test_main_full_registration_flow(capsys):
     env = _env()
     responses = [
-        _http_error(400, {"error": "need_source_msg_id"}),  # probe_route
+        _http_error(400, _api_error_body("need_source_msg_id")),  # probe_route
         FakeResponse(200, {"ok": True, "result": {"url": "", "pending_update_count": 0}}),  # getWebhookInfo (до)
         FakeResponse(200, {"ok": True, "result": True}),  # setWebhook
         FakeResponse(
@@ -317,7 +325,7 @@ def test_main_never_prints_bot_token_or_secret_anywhere(capsys):
         TELEGRAM_WEBHOOK_SECRET="leak-guard-sec-01",
     )
     responses = [
-        _http_error(400, {"error": "need_source_msg_id"}),
+        _http_error(400, _api_error_body("need_source_msg_id")),
         FakeResponse(200, {"ok": True, "result": {"url": "", "pending_update_count": 0}}),
         FakeResponse(200, {"ok": True, "result": True}),
         FakeResponse(
