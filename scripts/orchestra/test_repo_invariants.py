@@ -55,14 +55,19 @@ def open_pr(number, pr_body="", labels=()):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_reopened_after_merge_flags_free_task_with_merged_pr():
+REPO = "mytab0r/edge-harness"
+
+
+def test_reopened_after_merge_flags_free_task_with_merged_pr(monkeypatch):
     # #394: задача PR резолвится ТОЛЬКО по имени ветки, тело не читается —
     # оба PR названы agent/18-*, тела нет вовсе (штатный PR может быть слит
     # без единого номера в теле).
+    fake = FakeGh({"issues/18/comments": []})  # приёмка ещё не выносила вердикт
+    patch_gh(monkeypatch, fake)
     tasks = [task_issue(18, "AI-ревьюер диффа", assignees=())]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z"),
              merged_pr(138, "agent/18-second-pass", "2026-09-02T21:31:47Z")]
-    violations = ri.check_reopened_after_merge(tasks, pulls)
+    violations = ri.check_reopened_after_merge(REPO, tasks, pulls)
     assert len(violations) == 1
     assert violations[0]["issue"] == 18
     assert violations[0]["prs"] == [137, 138]
@@ -71,28 +76,87 @@ def test_reopened_after_merge_flags_free_task_with_merged_pr():
 
 def test_reopened_after_merge_silent_when_assigned():
     # тот же слитый PR, но задача СЕЙЧАС занята исполнителем — норма
-    # (пост-мерж проверка ещё не сделана, это не бросили)
+    # (пост-мерж проверка ещё не сделана, это не бросили). Без FakeGh-маршрута
+    # нарочно: маркер приёмки не должен даже спрашиваться (short-circuit по
+    # unassigned раньше).
     tasks = [task_issue(18, assignees=("mytab0r",))]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
 def test_reopened_after_merge_silent_without_merged_pr():
     tasks = [task_issue(18, assignees=())]
     pulls = [merged_pr(999, "agent/77-other-task", "2026-08-31T17:46:11Z")]  # чужая ветка
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
-def test_reopened_after_merge_mutation_guard():
+def test_reopened_after_merge_mutation_guard(monkeypatch):
     # Мутация: если бы проверка не сверялась с unassigned (снят фильтр по
     # исполнителю), КАЖДАЯ задача со слитым PR стала бы «нарушением» — на
     # живом репозитории это стандартный кратковременный путь после мержа,
     # а не баг. Тест доказывает, что фильтр обязателен.
     tasks = [task_issue(18, assignees=("mytab0r",))]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+    fake = FakeGh({"issues/18/comments": []})
+    patch_gh(monkeypatch, fake)
     tasks_unassigned = [task_issue(18, assignees=())]
-    assert len(ri.check_reopened_after_merge(tasks_unassigned, pulls)) == 1
+    assert len(ri.check_reopened_after_merge(REPO, tasks_unassigned, pulls)) == 1
+
+
+def test_reopened_after_merge_excludes_watchdog_issue():
+    """#467: WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача
+    из пула; accept_merged_tasks её тоже явно пропускает (см. её докстринг) —
+    эта проверка обязана делать то же самое, а не находить #120 в списке
+    нарушителей своего же канала (живой случай)."""
+    watchdog = ri.WATCHDOG_ISSUE
+    tasks = [task_issue(watchdog, "Предохранитель конвейера", assignees=())]
+    pulls = [merged_pr(126, f"agent/{watchdog}-pause", "2026-08-31T12:01:11Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_partial(monkeypatch):
+    """#467, живой случай PR #455/задача #454: приёмка уже вынесла терминальный
+    вердикт «требует проверки человеком» именно по этому слитому PR и сама
+    сняла исполнителя как часть штатного пути — не тихий пробел, инвариант 1
+    не должен пересчитывать эту задачу нарушителем снова и снова."""
+    fake = FakeGh({
+        "issues/454/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_PARTIAL_MARKER} PR #455 …",
+             "created_at": "2026-09-06T05:45:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(454, "ранний отказ по квоте", assignees=())]
+    pulls = [merged_pr(455, "agent/454-gh-quota-early-exit", "2026-09-06T05:43:14Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_fail(monkeypatch):
+    """Тот же класс, второй терминальный маркер (#467, живой случай PR #437/
+    задача #432): «доработка» — штатный путь назад в пул для НОВОГО PR, не
+    нарушение инварианта 1."""
+    fake = FakeGh({
+        "issues/432/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_FAIL_MARKER} PR #437 — улика показала…",
+             "created_at": "2026-09-06T04:08:27Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(432, "review:large тоже гейт 1", assignees=())]
+    pulls = [merged_pr(437, "agent/432-gate1-decided", "2026-09-06T04:05:48Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_still_flags_task_never_verdicted(monkeypatch):
+    """Контроль: пустые комментарии (приёмка ещё не смотрела на эту пару
+    задача/PR) — инвариант 1 обязан сработать как раньше, различение не
+    глотает настоящий, ещё никем не замеченный пробел."""
+    fake = FakeGh({"issues/21/comments": []})
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(21, "dev:docker", assignees=())]
+    pulls = [merged_pr(177, "agent/21-dev-docker", "2026-09-02T17:01:28Z")]
+    assert len(ri.check_reopened_after_merge(REPO, tasks, pulls)) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -146,14 +210,26 @@ def timeline_with_review_ok(when: str):
     return [{"event": "labeled", "label": {"name": "review:ok"}, "created_at": when}]
 
 
+def retry_marker_comment(when: str, attempt: int):
+    return {
+        "created_at": when,
+        "body": f"🤖 {ri.AI_REVIEW_RETRY_MARKER} попытка {attempt}/{ri.AI_REVIEW_MAX_ATTEMPTS}",
+    }
+
+
 def test_stuck_review_gate_flags_after_threshold(monkeypatch):
     pull = open_pr(246, labels=["review:ok"])
-    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z")})
+    fake = FakeGh({
+        "issues/246/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/246/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
     assert len(violations) == 1
     assert violations[0]["pr"] == 246
+    assert violations[0]["attempts_total"] == 0
+    assert violations[0]["verdict_ever"] is None
 
 
 def test_stuck_review_gate_silent_within_threshold(monkeypatch):
@@ -186,7 +262,10 @@ def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch
     # единой ai:*-метки был невидим инварианту тем же классом, каким
     # scheduler.trigger_ai_review был невидим PR #412.
     pull = open_pr(432, labels=["review:large"])
-    fake = FakeGh({"issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z")})
+    fake = FakeGh({
+        "issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z"),
+        "issues/432/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
@@ -209,13 +288,164 @@ def test_stuck_review_gate_mutation_guard(monkeypatch):
     # появиться как нарушение (реальная мутация значения, не проверка > 0,
     # находка AI-ревью PR #249: старый вариант не краснел на снятии фикса).
     pull = open_pr(246, labels=["review:ok"])
-    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z")})
+    fake = FakeGh({
+        "issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z"),
+        "issues/246/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 13)  # 6 минут — в пределах порога 120 (см. silent_within_threshold)
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
     monkeypatch.setattr(ri, "UNHEALTHY_PR_AFTER_MINUTES", 1)
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
     assert len(violations) == 1
+
+
+# ── #472: факт, не гипотеза — прод-форма живых PR #387/#329/#327 ────────────
+#
+# Живой алерт 2026-09-06T09:00:06Z (issue #120): «3 PR ... Авто-повтор #196
+# либо исчерпал попытки, либо не сработал — нужен человек». Снято `gh api`
+# по этому репозиторию тем же днём (issues/{n}/timeline, issues/{n}/comments)
+# — не пересказ, реальные метки и реальные тексты маркеров-автоповторов.
+# Единственное отличие фикстур от сырого ответа: комментарии без маркера
+# `AI_REVIEW_RETRY_MARKER` выброшены — код под тестом (retry_budget_fact)
+# смотрит только на маркер, отбрасывая остальные тем же фильтром сам.
+ALERT_TIME = utc(2026, 9, 6, 9, 0, 6)
+
+
+def test_stuck_gate_fact_pr387_never_had_a_verdict(monkeypatch):
+    """#387: единственная эпоха (review:ok с 03:13:09), 3 маркера автоповтора
+    ВСЕ в этой же эпохе — бюджет исчерпан в ТЕКУЩЕЙ эпохе, а ai:*-вердикта не
+    было ни разу за всю жизнь PR (не «был и протух», как у #329/#327ниже)."""
+    pull = open_pr(387, labels=["review:ok", "review:large", "review:large-ok"])
+    fake = FakeGh({
+        "issues/387/timeline": [
+            {"event": "labeled", "label": {"name": "review:large"}, "created_at": "2026-09-05T23:02:59Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:13:09Z"},
+        ],
+        "issues/387/comments": [
+            retry_marker_comment("2026-09-06T03:45:03Z", 1),
+            retry_marker_comment("2026-09-06T03:46:33Z", 2),
+            retry_marker_comment("2026-09-06T03:48:40Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["age_minutes"] == pytest.approx(346.9, abs=0.1)
+    assert item["attempts_total"] == 3
+    assert item["attempts_in_epoch"] == 3  # все три — в той же (единственной) эпохе
+    assert item["verdict_ever"] is None  # НИ РАЗУ, а не «был и устарел»
+    line = ri.stuck_gate_fact_line(item)
+    assert "исчерпан в этой же эпохе (3/3)" in line
+    assert "не было НИ РАЗУ" in line
+
+
+def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
+    """#329: на момент алерта текущая эпоха (review:ok с 03:48:22) не получила
+    НИ ОДНОГО автоповтора, но глобальный счётчик (issue_marker_times без
+    since — та же метрика, что видит scheduler.trigger_ai_review) уже
+    показывает 3/3, потому что все три маркера принадлежат СТАРОЙ эпохе
+    (якорь 03:05:20), которая своё уже получила вердикт (ai:ok, 03:46:52).
+    Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
+    pull = open_pr(329, labels=["review:ok"])
+    fake = FakeGh({
+        "issues/329/timeline": [
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:05:20Z"},
+            {"event": "labeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:13:07Z"},
+            {"event": "unlabeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:46:51Z"},
+            {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-06T03:46:52Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:00Z"},
+            {"event": "unlabeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-06T03:48:01Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:02Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:22Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:22Z"},
+        ],
+        "issues/329/comments": [
+            retry_marker_comment("2026-09-06T03:37:16Z", 1),
+            retry_marker_comment("2026-09-06T03:38:48Z", 2),
+            retry_marker_comment("2026-09-06T03:40:21Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["labeled_at"] == "2026-09-06T03:48:22+00:00"  # эпоха началась ПОСЛЕ вердикта
+    assert item["age_minutes"] == pytest.approx(311.7, abs=0.1)
+    assert item["attempts_total"] == 3
+    assert item["attempts_in_epoch"] == 0  # ни одного автоповтора в ТЕКУЩЕЙ эпохе
+    assert item["verdict_ever"] == {"label": "ai:ok", "at": "2026-09-06T03:46:52+00:00"}
+    line = ri.stuck_gate_fact_line(item)
+    assert "исчерпан СТАРОЙ эпохой (3/3, в текущей — 0/3)" in line
+    assert "перенос бюджета между эпохами" in line
+    assert "вердикт был — ai:ok" in line
+
+
+def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
+    """#327: ровно ТА ЖЕ картина, что #329 — глобальный счётчик 3/3 из СТАРОЙ,
+    уже решённой эпохи (якорь 03:09:50, вердикт ai:changes-requested в
+    04:10:03), 0 автоповторов в текущей эпохе (якорь 05:46:16). Живой алерт
+    ошибочно предполагал «четыре автоповтора при лимите три» — маркеров
+    ровно три, не четыре (мутация ниже это и доказывает)."""
+    pull = open_pr(327, labels=["review:ok", "review:large", "review:large-ok"])
+    fake = FakeGh({
+        "issues/327/timeline": [
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:09:50Z"},
+            {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T04:10:03Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:23:35Z"},
+            {"event": "unlabeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:23:36Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:23:36Z"},
+            {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:33:52Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:46:15Z"},
+            {"event": "unlabeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:46:16Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:46:16Z"},
+        ],
+        "issues/327/comments": [
+            retry_marker_comment("2026-09-06T03:42:09Z", 1),
+            retry_marker_comment("2026-09-06T03:43:30Z", 2),
+            retry_marker_comment("2026-09-06T03:45:11Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["age_minutes"] == pytest.approx(193.8, abs=0.1)
+    assert item["attempts_total"] == 3  # не 4 — живая проверка алерта была неточна
+    assert item["attempts_in_epoch"] == 0
+    assert item["verdict_ever"] == {"label": "ai:changes-requested", "at": "2026-09-06T05:33:52+00:00"}
+    line = ri.stuck_gate_fact_line(item)
+    assert "3/3, в текущей — 0/3" in line
+
+
+def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
+    """Мутация: без различения attempts_in_epoch от attempts_total текст не
+    отличил бы «исчерпан старой эпохой» (#329/#327) от «исчерпан в этой же»
+    (#387) — оба читались бы одинаково «исчерпан», и находка issue #472
+    (перенос бюджета между эпохами) стала бы снова невидимой."""
+    same_epoch = {
+        "pr": 1, "age_minutes": 200.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 3, "attempts_in_epoch": 3, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+    }
+    carried_over = dict(same_epoch, attempts_in_epoch=0)
+    line_same = ri.stuck_gate_fact_line(same_epoch)
+    line_carried = ri.stuck_gate_fact_line(carried_over)
+    assert line_same != line_carried
+    assert "СТАРОЙ эпохой" not in line_same
+    assert "СТАРОЙ эпохой" in line_carried
+
+
+def test_stuck_gate_fact_line_budget_not_exhausted():
+    item = {
+        "pr": 2, "age_minutes": 150.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 1, "attempts_in_epoch": 1, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "не исчерпан (1/3)" in line
+    assert "ближайшем тике" in line
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -484,6 +714,74 @@ def test_branch_protection_not_in_ci_gating():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 7: двусмысленная формула принадлежности плагина (#219)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: реальные строки из репозитория ДО правки #219
+# (openspec/changes/dsh-in-job/), на которых класс и случился, — не пересказ.
+
+
+def write_md(tmp_path, rel, content):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_ambiguous_artifact_phrase_flags_prod_forms(tmp_path):
+    write_md(tmp_path, "openspec/changes/dsh-in-job/tasks.md",
+             "- [ ] Подключение плагинов владельца (combo-router из"
+             " `vars.PLUGINS_SUITE_URL`)\n")
+    write_md(tmp_path, "openspec/changes/dsh-in-job/design.md",
+             "**Провайдер — плагины владельца, не новый код.**\n")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert {v["file"] for v in violations} == {
+        "openspec/changes/dsh-in-job/tasks.md",
+        "openspec/changes/dsh-in-job/design.md",
+    }
+    by_file = {v["file"]: v for v in violations}
+    assert by_file["openspec/changes/dsh-in-job/design.md"]["line"] == 1
+    assert "плагины владельца" in by_file["openspec/changes/dsh-in-job/design.md"]["match"]
+
+
+def test_ambiguous_artifact_phrase_silent_on_unambiguous_wording(tmp_path):
+    # Обе разрешённые замены и порядок слов «владелец подключает свой плагин» —
+    # инвариант молчит: гвардится именно двусмысленная формула, не упоминание
+    # владельца вообще.
+    write_md(tmp_path, "docs/x.md",
+             "артефакт владельца по адресу X\n"
+             "наш плагин (пишем мы, не апстрим)\n"
+             "владелец подключает свой плагин\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_ignores_non_document_dirs(tmp_path):
+    write_md(tmp_path, ".git/notes.md", "плагины владельца\n")
+    write_md(tmp_path, "node_modules/pkg/README.md", "плагины владельца\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_mutation_guard(tmp_path):
+    path = write_md(tmp_path, "docs/x.md", "документ без формулы\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+    # Мутация: вернуть прод-форму (строка proposal.md до #219, с заглавной
+    # буквы — регистр не должен спасать) — инвариант обязан покраснеть.
+    path.write_text("Плагины владельца устанавливаются job'ом.\n", encoding="utf-8")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert len(violations) == 1
+    assert violations[0]["line"] == 1
+
+
+def test_ambiguous_artifact_phrase_in_ci_gating_with_gas():
+    # Инвариант включён в обязательную проверку сразу при создании (#219):
+    # на момент включения ноль нарушений — фраза вычищена тем же PR. Газ
+    # объявлен в GATING_RELEASE_CONDITION — гвардия main() падает громко,
+    # если газ отберут, не назвав замену (AGENTS.md, «Тормоз без газа»).
+    assert 7 in ri.CI_GATING
+    assert 7 in ri.GATING_RELEASE_CONDITION
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -502,6 +800,11 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
+    # Инвариант 7 сканирует документы репозитория — подменяем корень, чтобы
+    # юнит-тест оставался герметичным и не зависел от живого дерева; живое
+    # дерево проверяет сам инвариант в repo-ci/orchestra.
+    monkeypatch.setattr(ri, "REPO_ROOT", tmp_path)
+    write_md(tmp_path, "README.md", "# здоровый снимок\n")
 
     now = utc(2026, 9, 3, 12, 0)
     lines, findings = ri.build_report("mytab0r/edge-harness", now)
