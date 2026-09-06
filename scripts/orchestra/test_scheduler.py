@@ -3888,6 +3888,14 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
     just_now = datetime.now(timezone.utc)
     recent_success_iso = just_now.isoformat(timespec="seconds").replace("+00:00", "Z")
     fake = FakeGh({
+        # failure_watch (#477): дешёвый опрос status=failure по каждому из
+        # WATCHED_WORKFLOWS — один маршрут по подстроке "runs?status=failure"
+        # обслуживает все пять (имя workflow в него не входит). Обязан идти
+        # ПЕРВЫМ ключом: FakeGh матчит по первому совпадению подстроки в
+        # порядке вставки, а более общий ключ "workflows/orchestra.yml/runs"
+        # ниже иначе перехватил бы и этот запрос тоже (оба — подстроки одного
+        # реального URL "workflows/orchestra.yml/runs?status=failure&...").
+        "runs?status=failure": {"workflow_runs": []},
         # event — прод-форма поля, которое реально возвращает GitHub для
         # запроса, отфильтрованного по ?event=... (real_orchestra_ticks,
         # находка AI-ревью PR #318, второй раунд, поймана при фиксе:
@@ -3963,6 +3971,11 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
     recent_success_iso = just_now.isoformat(timespec="seconds").replace("+00:00", "Z")
     old_task = issue(300, assignees=(), labels=["task"], created_at="2020-01-01T00:00:00Z")
     fake = FakeGh({
+        # failure_watch (#477): ПЕРВЫМ ключом — см. обоснование в
+        # test_main_makes_zero_mutating_calls_on_fully_empty_queue выше
+        # (иначе "workflows/orchestra.yml/runs" ниже перехватывает и этот
+        # запрос тоже, оба матчат одну и ту же реальную строку URL).
+        "runs?status=failure": {"workflow_runs": []},
         "workflows/orchestra.yml/runs": {"workflow_runs": [
             {"conclusion": "success", "created_at": recent_success_iso,
              "html_url": "https://x", "display_title": "x", "event": "schedule"}]},
@@ -4381,6 +4394,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     с ещё открытой (на самом деле уже закрытой) issue и увидит её снова."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
