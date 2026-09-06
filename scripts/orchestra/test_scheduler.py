@@ -253,16 +253,21 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
-    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
-    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], False))
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
-        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], False))
-    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: ([], []))
 
     def boom(repo, now, lines, run_url=None):
         raise RuntimeError("gh api issues?labels=auto-detected: authentication required")
@@ -2519,6 +2524,10 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         # Пул с одной свободной задачей допускает dispatch воркера (#120) —
         # не предмет этого теста, но main() дойдёт до него раньше отчёта.
         "workflows/worker.yml/dispatches": None,
+        # escalate_stale_auto_tasks (#201) читает список автозадач на КАЖДОМ
+        # пульсе, даже здоровом (см. docstring) — без маршрута main() упал бы
+        # на этом же вызове раньше, чем дошёл до предмета этого теста.
+        "issues?state=open&labels=auto-detected": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
