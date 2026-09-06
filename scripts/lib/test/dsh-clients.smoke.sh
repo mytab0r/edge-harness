@@ -169,6 +169,34 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
         printf -- '- id: hands-streamer\n'
         return 0
       fi
+      # Ретрай RATE_LIMIT в ai-review (#419): режим задаёт сценарий через
+      # SMOKE_RATE_LIMIT_MODE, попытки считает переменная процесса — эта
+      # заглушка живёт в одном bash-процессе ai_dsh.sh на весь ретрай-цикл
+      # (несколько вызовов dsh — один процесс, файл состояния не нужен).
+      if [ -n "${SMOKE_RATE_LIMIT_MODE:-}" ]; then
+        _smoke_rl_attempt=$(( ${_smoke_rl_attempt:-0} + 1 ))
+        case "$SMOKE_RATE_LIMIT_MODE" in
+          transient-then-ok)
+            if [ "$_smoke_rl_attempt" -le "${SMOKE_RATE_LIMIT_TRANSIENT_COUNT:-1}" ]; then
+              echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+              return 1
+            fi
+            echo "smoke: работа сделана после ретрая"
+            return 0 ;;
+          always-transient)
+            echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+            return 1 ;;
+          quota-exhausted)
+            echo "dsh: RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10T00:00:00Z" >&2
+            return 1 ;;
+          real-error)
+            echo "dsh: HTTP_404: modelCode does not exist" >&2
+            return 1 ;;
+          *)
+            echo "::error::SMOKE: неизвестный SMOKE_RATE_LIMIT_MODE: $SMOKE_RATE_LIMIT_MODE" >&2
+            return 99 ;;
+        esac
+      fi
       [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; return 1; }
       printf '%s\n' \
         '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
@@ -528,5 +556,82 @@ grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
 grep -qx "0" "$AI_SMOKE/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt ожидал '0' на успешном прогоне, получено: $(cat "$AI_SMOKE/dsh_rc.txt")" >&2; exit 1; }
 echo "SMOKE: ai-review — ок"
+
+# ── Ретрай RATE_LIMIT в ai-review (#419) ──────────────────────────────────────
+# Живой факт: worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate limit
+# reached for requests» — квоту съело параллельное ai-review. Здесь —
+# полный прогон ai_dsh.sh (не bash -n) на четырёх сценариях: временный
+# лимит снимается ретраем, недельный/месячный лимит и настоящая ошибка не
+# ждут вовсе, бюджет ожидания короткого лимита конечен. sleep стаблен
+# ТОЛЬКО здесь (после уже отработавших worker/hands выше) — эти клиенты
+# реального сна не ждут, а фоновый heartbeat-луп воркера/рук их не
+# использует постфактум.
+sleep() { :; }
+export -f sleep
+
+# 1) Временный RATE_LIMIT дважды, затем успех — ретрай обязан выжить.
+AI_RL1="$TMP/ai-rl-transient"
+mkdir -p "$AI_RL1"
+printf 'Промпт ревью (smoke): временный RATE_LIMIT\n' >"$AI_RL1/prompt.md"
+AI_WORK="$AI_RL1" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="transient-then-ok" \
+SMOKE_RATE_LIMIT_TRANSIENT_COUNT="2" \
+AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
+AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="1" \
+  run_client "ai-review-rate-limit-transient" "$REPO/scripts/review/ai_dsh.sh"
+grep -q "работа сделана после ретрая" "$AI_RL1/answer.txt" \
+  || { echo "::error::SMOKE: ai-review-transient: ретрай не довёл до успешного ответа" >&2; cat "$AI_RL1/answer.txt" >&2; exit 1; }
+grep -qx "0" "$AI_RL1/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-transient: dsh_rc.txt ожидал '0' после успешного ретрая, получено: $(cat "$AI_RL1/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+[ -s "$AI_RL1/failure_reason.txt" ] \
+  && { echo "::error::SMOKE: ai-review-transient: failure_reason.txt обязан быть пуст после успеха, получено: $(cat "$AI_RL1/failure_reason.txt")" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-transient — ок"
+
+# 2) RATE_LIMIT: Weekly/Monthly Limit Exhausted — падаем СРАЗУ, без ретрая
+# (сброс через дни — ждать внутри прогона бессмысленно).
+AI_RL2="$TMP/ai-rl-quota"
+mkdir -p "$AI_RL2"
+printf 'Промпт ревью (smoke): квота исчерпана надолго\n' >"$AI_RL2/prompt.md"
+AI_WORK="$AI_RL2" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
+  run_client "ai-review-rate-limit-quota" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL2/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL2/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "quota_exhausted" "$AI_RL2/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'quota_exhausted', получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-quota — ок"
+
+# 3) Настоящая ошибка провайдера (нет строки RATE_LIMIT вовсе) — падаем
+# сразу, как и до #419: ретрай не должен трогать этот класс.
+AI_RL3="$TMP/ai-rl-real-error"
+mkdir -p "$AI_RL3"
+printf 'Промпт ревью (smoke): настоящая ошибка\n' >"$AI_RL3/prompt.md"
+AI_WORK="$AI_RL3" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="real-error" \
+  run_client "ai-review-rate-limit-real-error" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL3/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-real-error: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL3/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+[ -s "$AI_RL3/failure_reason.txt" ] \
+  && { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt обязан быть пуст на настоящей ошибке (не лимит), получено: $(cat "$AI_RL3/failure_reason.txt")" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-real-error — ок"
+
+# 4) Временный RATE_LIMIT, который не снимается, — бюджет ожидания обязан
+# кончиться (не бесконечный ретрай, не занятый навечно job-слот).
+AI_RL4="$TMP/ai-rl-budget"
+mkdir -p "$AI_RL4"
+printf 'Промпт ревью (smoke): бюджет ретрая исчерпан\n' >"$AI_RL4/prompt.md"
+AI_WORK="$AI_RL4" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="always-transient" \
+AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="0" \
+  run_client "ai-review-rate-limit-budget" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL4/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL4/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "rate_limit_retry_budget_exceeded" "$AI_RL4/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'rate_limit_retry_budget_exceeded', получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-budget — ок"
 
 echo "SMOKE: все клиенты целы — гвардия класса зелёная"
