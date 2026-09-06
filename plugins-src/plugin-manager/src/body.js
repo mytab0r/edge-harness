@@ -615,17 +615,26 @@ function PluginsSection(props) {
 // см. комментарий в начале файла), locale (словари) — dsh-client-locale.
 const inject = ["slots", "locale"];
 
+// Неймспейс локали "settings.harnessPlugins" (issue #518, не "settings.plugins"):
+// апстрим 0.11.0 добавил СВОЙ нативный плагин @deepseek-ai/dsh-client-ui-
+// settings-plugins (Plugin inventory, changelog 0.11.0 #137), который
+// регистрирует ТУ ЖЕ локаль "settings.plugins" — вторая регистрация того же
+// namespace бросает "locale namespace ... already has locale ..." прямо при
+// буте (живой прогон deploy-dsh-edge.yml, консоль браузера), роняя монтаж
+// шелла целиком (кнопка Settings переставала находиться вообще). Совпадение
+// имён — наше (плагин появился раньше апстримного одноимённого), апстрим не
+// виноват; уникальное имя снимает коллизию раз и навсегда.
 function apply(ctx) {
   ctx.effect(
-    () => ctx.locale.register("settings.plugins", dictionaries),
-    "plugin-manager: settings.plugins dictionaries",
+    () => ctx.locale.register("settings.harnessPlugins", dictionaries),
+    "plugin-manager: settings.harnessPlugins dictionaries",
   );
   ctx.slots.inject("settings.section", () => ctx.slots.register({
     name: "settings.section",
     id: "plugin-manager",
     order: 95,
-    label: () => ctx.locale.bind("settings.plugins")("nav"),
-    locale: "settings.plugins",
+    label: () => ctx.locale.bind("settings.harnessPlugins")("nav"),
+    locale: "settings.harnessPlugins",
   }, PluginsSection));
 }
 //#endregion

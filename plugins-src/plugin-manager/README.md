@@ -115,8 +115,10 @@ package.json не декларирует: в апстриме 0.11.1 серви�
 убранный апстримом `dsh-client-runtime` (issue #518).
 
 Слот — `settings.section` (списочный), id `plugin-manager`, order 95, по
-образцу ui-edge. Словари регистрируются в namespace `settings.plugins`
-(en/zh/ru, наборы ключей одинаковы).
+образцу ui-edge. Словари регистрируются в namespace `settings.harnessPlugins`
+(en/zh/ru, наборы ключей одинаковы) — не `settings.plugins`: апстрим 0.11.0
+занял это имя своим нативным плагином `dsh-client-ui-settings-plugins`
+(Plugin inventory, #518).
 
 ## Пересборка tarball
 

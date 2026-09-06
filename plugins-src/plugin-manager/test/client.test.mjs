@@ -296,10 +296,10 @@ test('монтаж: декларация settings.section с id plugin-manager; 
   const { mount } = loadBundle(async () => { throw new Error('fetch не ожидается') })
   assert.equal(mount.declaration.name, 'settings.section')
   assert.equal(mount.declaration.id, 'plugin-manager')
-  assert.equal(mount.declaration.locale, 'settings.plugins')
-  assert.equal(mount.declaration.label(), 'settings.plugins:nav')
-  const dicts = mount.dictionaries['settings.plugins']
-  assert.ok(dicts, 'словари settings.plugins не зарегистрированы')
+  assert.equal(mount.declaration.locale, 'settings.harnessPlugins')
+  assert.equal(mount.declaration.label(), 'settings.harnessPlugins:nav')
+  const dicts = mount.dictionaries['settings.harnessPlugins']
+  assert.ok(dicts, 'словари settings.harnessPlugins не зарегистрированы')
   const keySet = (dict) => Object.keys(dict).sort().join(',')
   const reference = keySet(dicts.en)
   for (const [locale, dict] of Object.entries(dicts)) {
