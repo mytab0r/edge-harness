@@ -741,7 +741,7 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
 
 
 def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None,
-          state_reason=None, created_at="2026-09-01T00:00:00Z"):
+          state_reason=None, created_at="2026-09-01T00:00:00Z", state="open"):
     return {
         "number": number,
         "assignees": [{"login": a} for a in assignees],
@@ -758,6 +758,11 @@ def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_iss
         # mark_stale_unclaimed (#427) как проксирующий возраст задачи без
         # исполнителя.
         "created_at": created_at,
+        # state — прод-форма (Issues API отдаёт его всегда); дефолт "open"
+        # годится большинству существующих тестов (open_task_issues и так
+        # фильтрует state=open на запросе), "closed" нужен там, где функция
+        # сама проверяет состояние конкретной issue (#543, replace_closed_task_prs).
+        "state": state,
     }
 
 
@@ -4114,6 +4119,162 @@ def test_merged_pr_map_ignores_body_successor_when_branch_task_closed():
     mapping = sch.merged_pr_map([reworked])
     assert mapping[256]["number"] == 388
     assert 391 not in mapping
+
+
+# ── Замена PR, чья ветка называет закрытую задачу (#543) ─────────────────────
+
+
+def test_replace_closed_task_prs_skips_when_branch_task_is_open(monkeypatch):
+    """Задача ветки #100 есть в переданном пуле (открыта) — функция не имеет
+    права сделать НИ ОДНОГО сетевого вызова: сравнение чисел уже даёт ответ
+    «всё в порядке»."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    p = pull(500, ref="agent/100-fix-thing")
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[issue(100)])
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_replace_closed_task_prs_skips_pr_without_agent_branch(monkeypatch):
+    """PR без agent-ветки (resolve_pr_task вернёт None — ручной пуш,
+    dependabot) — не наш случай, ни одного вызова."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    p = pull(501)  # ref не задан
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[])
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_replace_closed_task_prs_skips_already_marked_pr(monkeypatch):
+    """PR уже помечен маркером прошлым прогоном — повторный поиск/создание
+    не нужны вовсе, маркер в уже прочитанном теле снимка решает вопрос без
+    единого сетевого вызова (экономия search-бюджета, #543 п.2 «не
+    плодить»)."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    body = sch.TASK_REPLACEMENT_MARKER + "\nRelated: #900\n\nостальное тело"
+    p = pull(502, ref="agent/431-old-task", pr_body=body)
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[])
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_replace_closed_task_prs_creates_replacement_for_closed_task(monkeypatch):
+    """Прод-форма (PR #439, 2026-09-06): ветка называет закрытую задачу
+    #431, в переданном пуле её нет, Search API не находит существующей
+    замены — заводит новую узкую задачу, метит тело и комментирует PR."""
+    fake = FakeGh({
+        "search/issues": {"items": []},
+        f"repos/{REPO}/issues/431": issue(431, state="closed"),
+        f"-X POST repos/{REPO}/issues -f title=": {"number": 999},
+        f"-X PATCH repos/{REPO}/pulls/439": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    p = pull(439, ref="agent/431-ai-review-retry-budget",
+              pr_body="#538\n\n## Проблема\n...")
+    p["title"] = "#431: ai:failed — бюджет автоповторов по эпохе review:ok"
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[issue(100)])
+
+    assert any("заведена замена #999" in line for line in lines)
+    create_call = next(c for c in fake.calls if c.startswith(f"-X POST repos/{REPO}/issues"))
+    assert "Related: #431" in create_call
+    assert "labels[]=task" in create_call and "labels[]=auto-detected" in create_call
+    patch_call = next(c for c in fake.calls if c.startswith(f"-X PATCH repos/{REPO}/pulls/439"))
+    assert sch.TASK_REPLACEMENT_MARKER in patch_call
+    assert "Related: #999" in patch_call
+    assert p["body"].startswith(sch.TASK_REPLACEMENT_MARKER)  # снимок мутирован сразу
+    assert posted and posted[0][0] == 439
+    assert "#999" in posted[0][1] and "#431" in posted[0][1]
+
+
+def test_replace_closed_task_prs_is_idempotent_across_two_runs(monkeypatch):
+    """Второй прогон на том же (уже помеченном первым прогоном) PR не должен
+    завести вторую задачу-замену — «не плодить» (#543 п.2), мутация: без
+    маркера/skip-проверки счётчик создания вырос бы до 2."""
+    fake = FakeGh({
+        "search/issues": {"items": []},
+        f"repos/{REPO}/issues/431": issue(431, state="closed"),
+        f"-X POST repos/{REPO}/issues -f title=": {"number": 999},
+        f"-X PATCH repos/{REPO}/pulls/439": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    p = pull(439, ref="agent/431-ai-review-retry-budget", pr_body="исходное тело")
+
+    sch.replace_closed_task_prs(REPO, [p], pool=[])
+    first = [c for c in fake.calls if c.startswith(f"-X POST repos/{REPO}/issues")]
+    assert len(first) == 1
+
+    lines_second = sch.replace_closed_task_prs(REPO, [p], pool=[])  # тот же PR-объект, второй прогон
+    assert lines_second == []
+    second = [c for c in fake.calls if c.startswith(f"-X POST repos/{REPO}/issues")]
+    assert len(second) == 1  # не выросло
+
+
+def test_replace_closed_task_prs_finds_existing_manual_replacement_prod_form(monkeypatch):
+    """Мутационный прод-случай (#431→#538, снят живым запросом Search API
+    2026-09-06): PR #439 (ветка agent/431-...), задача #431 закрыта
+    приёмкой, владелец уже вручную завёл замену #538 с телом «Related: #431
+    (закрыта приёмкой, работа продолжается в PR #439)». Функция обязана
+    НАЙТИ эту замену и не завести вторую — без ветки `if existing is not
+    None: ... continue` этот тест красен (заводит дубль поверх #538)."""
+    fake = FakeGh({
+        "search/issues": {
+            "items": [
+                {"number": 538, "state": "open",
+                 "title": "бюджет автоповторов AI-ревью привязан к эпохе кода"},
+            ]
+        },
+        f"-X PATCH repos/{REPO}/pulls/439": None,
+    })
+    patch_gh(monkeypatch, fake)
+    p = pull(439, ref="agent/431-ai-review-retry-budget", pr_body="#538\n\nостальное тело")
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[])
+
+    assert any("замена #538" in line and "уже существует" in line for line in lines)
+    assert not any(c.startswith(f"-X POST repos/{REPO}/issues") for c in fake.calls)
+    assert p["body"].startswith(sch.TASK_REPLACEMENT_MARKER)
+    assert "Related: #538" in p["body"]
+
+
+def test_replace_closed_task_prs_skips_task_that_turns_out_still_open(monkeypatch):
+    """Задачи ветки нет в переданном пуле (например, страница сместилась
+    между двумя вызовами в этом же прогоне), но точечная проверка находит
+    её ОТКРЫТОЙ — не наш случай: другая причина непригодности, contract сам
+    разберётся, вторая задача не заводится."""
+    fake = FakeGh({
+        "search/issues": {"items": []},
+        f"repos/{REPO}/issues/777": issue(777, state="open"),
+    })
+    patch_gh(monkeypatch, fake)
+    p = pull(600, ref="agent/777-something")
+    lines = sch.replace_closed_task_prs(REPO, [p], pool=[])
+    assert lines == []
+    assert not any(c.startswith(f"-X POST repos/{REPO}/issues") for c in fake.calls)
+
+
+def test_replace_closed_task_prs_reports_soft_failure_without_crashing(monkeypatch):
+    """Сбой (сеть/API) на ОДНОМ PR не должен уронить обход остальных —
+    строка-предупреждение в отчёте, следующий PR обрабатывается как ни в
+    чём не бывало (тот же принцип, что у lease_observations в main())."""
+    fake = FakeGh({
+        'search/issues -f q=repo:mytab0r/edge-harness in:body "Related: #111"': RuntimeError("HTTP 500"),
+        'search/issues -f q=repo:mytab0r/edge-harness in:body "Related: #431"': {"items": []},
+        f"repos/{REPO}/issues/431": issue(431, state="closed"),
+        f"-X POST repos/{REPO}/issues -f title=": {"number": 999},
+        f"-X PATCH repos/{REPO}/pulls/439": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    broken = pull(700, ref="agent/111-broken")
+    healthy = pull(439, ref="agent/431-ai-review-retry-budget")
+    lines = sch.replace_closed_task_prs(REPO, [broken, healthy], pool=[])
+    assert any("поиск существующей замены" in line and "111" in line for line in lines)
+    assert any("заведена замена #999" in line for line in lines)
 
 
 # ── Запрет переоткрытия (#369): закрытая задача не переоткрывается никогда ──────
