@@ -48,10 +48,17 @@ async function apiJson(path, options) {
   const body = await res.json().catch(() => null);
   if (!res.ok) {
     const message = body?.error?.message || `HTTP ${res.status}`;
-    $("tasks").textContent = t("task.error", { detail: message });
     if (res.status === 401) {
-      // Сессия кончилась (или её не было): сокет молча переподключаться не должен.
-      showGate(t("gate.error_http", { status: 401 }));
+      // Сессии нет или она истекла (в том числе на самой первой загрузке,
+      // когда владелец ещё ничего не вводил) — сокет молча переподключаться
+      // не должен. Гейт — единственное место, где владелец видит это: сырой
+      // API-текст (упоминающий Authorization: Bearer) в панель задач не
+      // идёт — она не про авторизацию, а нейтральная формулировка "войдите"
+      // (не "сервер отклонил вход") не путает первый заход с провалом
+      // реальной попытки логина, за которую отвечает свой текст в login() (#492).
+      showGate(t("gate.hint_relogin"));
+    } else {
+      $("tasks").textContent = t("task.error", { detail: message });
     }
     const error = new Error(message);
     error.status = res.status;

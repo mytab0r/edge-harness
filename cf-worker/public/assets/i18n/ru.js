@@ -9,6 +9,7 @@ window.EDGE_I18N = {
     "gate.show": "показать",
     "gate.enter": "Войти",
     "gate.error_empty": "Пустой токен.",
+    "gate.hint_relogin": "Войдите: сессия истекла или её ещё не было.",
     "gate.error_http": "Сервер отклонил вход (HTTP {status}). Проверь токен.",
     "gate.error_network": "Сервер недоступен ({detail}).",
     "gate.error_socket_write": "Соединение закрыто сервером (запись в сокет только для чтения). Войдите заново.",
