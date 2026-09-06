@@ -290,9 +290,12 @@ def test_main_full_registration_flow(capsys):
 
 
 def test_main_never_prints_bot_token_or_secret_anywhere(capsys):
+    # Литералы короче 20 символов нарочно (scripts/review/check_pr.py::
+    # SECRET_PATTERNS матчит `TOKEN=`/`SECRET=` с кавычкой на 20+ символов —
+    # тестовая фикстура не должна сама выглядеть как утечка секрета).
     env = _env(
-        TELEGRAM_BOT_TOKEN="super-secret-bot-token-value",
-        TELEGRAM_WEBHOOK_SECRET="super-secret-webhook-value",
+        TELEGRAM_BOT_TOKEN="leak-guard-tok-01",
+        TELEGRAM_WEBHOOK_SECRET="leak-guard-sec-01",
     )
     responses = [
         _http_error(400, {"error": "need_source_msg_id"}),
@@ -319,7 +322,7 @@ def test_main_never_prints_bot_token_or_secret_anywhere(capsys):
     with patch.dict(os.environ, env, clear=True), patch("urllib.request.urlopen", side_effect=fake_urlopen):
         rw.main()
     captured = capsys.readouterr()
-    assert "super-secret-bot-token-value" not in captured.out
-    assert "super-secret-bot-token-value" not in captured.err
-    assert "super-secret-webhook-value" not in captured.out
-    assert "super-secret-webhook-value" not in captured.err
+    assert "leak-guard-tok-01" not in captured.out
+    assert "leak-guard-tok-01" not in captured.err
+    assert "leak-guard-sec-01" not in captured.out
+    assert "leak-guard-sec-01" not in captured.err
