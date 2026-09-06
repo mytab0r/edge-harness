@@ -63,6 +63,13 @@ const SCHEMA = [
   // разное назначение (watchdog по dispatch_ts, ретеншн по created_ts),
   // разный набор колонок — не задвоение.
   `CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_ts)`,
+  // #575 (инвентаризация всех SQL в #route на предмет полного скана): GET
+  // /api/tasks (#recentTasks) сортирует ORDER BY created_ts DESC LIMIT без
+  // WHERE — без индекса, ведущего created_ts, SQLite обязан прочитать и
+  // отсортировать ВСЮ историю tasks (до 30 суток, RETENTION.tasksMaxAgeMs),
+  // чтобы отдать последние 100 строк. Индекс сводит это к чтению LIMIT строк
+  // с конца индекса, без сортировки в памяти.
+  `CREATE INDEX IF NOT EXISTS tasks_by_created ON tasks(created_ts DESC)`,
   `CREATE TABLE IF NOT EXISTS heartbeat (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
      ts     INTEGER NOT NULL,
@@ -121,6 +128,11 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS messages_by_status ON messages(status)`,
   `CREATE INDEX IF NOT EXISTS messages_by_kind ON messages(kind)`,
   `CREATE INDEX IF NOT EXISTS messages_by_group ON messages(grouped_with)`,
+  // Ретеншн (#575, по образцу tasks_status_created у #320/#305): пачечное
+  // удаление терминальных (done/failed/ignored) сообщений старше порога
+  // фильтрует по (status, processed_ts) — без индекса это была бы полная
+  // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
+  `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
 ];
 
 /**
@@ -144,6 +156,18 @@ const RETENTION_TABLES = [
     name: "tasks",
     maxAgeMs: RETENTION.tasksMaxAgeMs,
     sql: "DELETE FROM tasks WHERE id IN (SELECT id FROM tasks WHERE status IN ('done', 'failed') AND created_ts < ? LIMIT ?)",
+  },
+  // #575: messages росла вечно (единственная таблица без ретеншена, полный
+  // скан #status() дорожал с каждым днём). Терминальные статусы ТОЛЬКО:
+  // 'new'/'processing' (непрочитанное/необработанное сообщение владельца,
+  // #20/#173) не попадают под это условие ни при каком возрасте — фильтр по
+  // status здесь и есть носитель этого ограничения, не комментарий рядом.
+  // processed_ts — возраст решения (когда обработка закончилась), не ts
+  // (когда сообщение пришло): messagesMaxAgeMs см. RETENTION в config.ts.
+  {
+    name: "messages",
+    maxAgeMs: RETENTION.messagesMaxAgeMs,
+    sql: "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE status IN ('done', 'failed', 'ignored') AND processed_ts < ? LIMIT ?)",
   },
 ] as const;
 
@@ -564,6 +588,12 @@ export class Harness extends DurableObject<Env> {
   // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
   #taskCountsCache: Record<TaskRow["status"], number> | null = null;
 
+  // Тот же рецепт для messages (#575: инцидент #321 закрыл tasks, messages
+  // осталась с полным GROUP BY на каждый #status()). Ключ — реальный статус
+  // ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
+  // как у tasks — форма ответа /api/status.messages не менялась этим фиксом.
+  #msgCountsCache: Record<string, number> | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
@@ -873,6 +903,23 @@ export class Harness extends DurableObject<Env> {
     return this.#taskCountsCache;
   }
 
+  /** #msgCountsCache лениво (#575, тот же рецепт, что #taskCounts выше, #320):
+   *  GROUP BY по ВСЕЙ таблице messages — единственное место, где он вообще
+   *  выполняется, и то не чаще, чем реально меняется состав сообщений
+   *  (приём/захват в обработку/финал/ватчдог), а не каждый вызов #status().
+   *  До этой правки счётчик читался тут же инлайном на каждый вызов —
+   *  ровно тот класс, что #321 уже закрыл для tasks. */
+  #msgCounts(): Record<string, number> {
+    if (this.#msgCountsCache === null) {
+      const counts: Record<string, number> = {};
+      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
+        counts[String(row.status)] = Number(row.n);
+      }
+      this.#msgCountsCache = counts;
+    }
+    return this.#msgCountsCache;
+  }
+
   #status(): Status {
     const now = Date.now();
     const hb = this.#rows(this.#sql.exec("SELECT ts, job_id FROM heartbeat WHERE id = 1"))[0];
@@ -885,10 +932,7 @@ export class Harness extends DurableObject<Env> {
         now - LIMITS.staleDispatchMs,
       ),
     )[0];
-    const msgCounts: Record<string, number> = {};
-    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
-      msgCounts[String(row.status)] = Number(row.n);
-    }
+    const msgCounts = this.#msgCounts();
     const hbTs = hb ? Number(hb.ts) : null;
     const lastPulse = this.#getPulse();
     return {
@@ -1020,21 +1064,39 @@ export class Harness extends DurableObject<Env> {
 
     // Побочные эффекты — только для действительно новых событий: повторная доставка
     // батча не должна ни двоить журнал, ни перезапускать переходы статуса задачи.
-    for (const row of accepted) this.#applySideEffects(row);
+    // broadcastStatus() — ТОЛЬКО если батч реально сдвинул состояние задачи
+    // (#applySideEffects вернул true): #status() перестал быть бесплатным
+    // счётчиком-заглушкой (#575/#320), но каждый SQL внутри него всё ещё
+    // стоит рядов чтения, и обычный поток прогресс-событий job'а (без
+    // job_start/job_end) идёт через #postEvents гораздо чаще, чем реально
+    // меняется что-либо видимое на бейдже статуса. Событие само уже уходит
+    // подписчикам через #broadcastEvent ниже (WS «event»), фронт считает свой
+    // last_event_id из него — полный статус на пустой батч не нужен.
+    let stateChanged = false;
+    for (const row of accepted) {
+      if (this.#applySideEffects(row)) stateChanged = true;
+    }
     for (const row of accepted) this.#broadcastEvent(row);
-    if (accepted.length) this.#broadcastStatus();
+    if (stateChanged) this.#broadcastStatus();
 
     return this.#json({ accepted: accepted.length, duplicates, task_id: taskId });
   }
 
-  /** Переходы задач и сброс heartbeat живут здесь и нигде больше. */
-  #applySideEffects(row: EventRow): void {
+  /** Переходы задач и сброс heartbeat живут здесь и нигде больше.
+   *  Возвращает true, если состояние задачи (или heartbeat) реально
+   *  изменилось — вызывающий (#postEvents) решает по этому флагу, нужен ли
+   *  broadcastStatus() (#575). */
+  #applySideEffects(row: EventRow): boolean {
+    let changed = false;
     if (row.kind === "job_start") {
       const cursor = this.#sql.exec(
         "UPDATE tasks SET status = 'running' WHERE id = ? AND status NOT IN ('done', 'failed')",
         row.task_id,
       );
-      if (cursor.rowsWritten > 0) this.#taskCountsCache = null;
+      if (cursor.rowsWritten > 0) {
+        this.#taskCountsCache = null;
+        changed = true;
+      }
     }
     if (row.kind === "job_end") {
       const failed = (row.data as { result?: string } | null)?.result === "fail";
@@ -1042,7 +1104,9 @@ export class Harness extends DurableObject<Env> {
       this.#taskCountsCache = null;
       // Руки закончили — «руки живы» уходит сразу, а не через порог свежести.
       this.#sql.exec("DELETE FROM heartbeat WHERE id = 1");
+      changed = true;
     }
+    return changed;
   }
 
   // ── Журнал: replay ────────────────────────────────────────────────────────────────
@@ -1258,6 +1322,9 @@ export class Harness extends DurableObject<Env> {
         // а чистка нет. Без сброса /api/status завышает done/failed до
         // следующей записи задачи (на тёплом инстансе — надолго).
         if (table.name === "tasks" && cursor.rowsWritten > 0) this.#taskCountsCache = null;
+        // #575: тот же принцип для messages — чистка терминальных сообщений
+        // меняет msgCounts.done/failed/ignored так же, как finish/reclaim.
+        if (table.name === "messages" && cursor.rowsWritten > 0) this.#msgCountsCache = null;
       } catch (error) {
         full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
         pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»
@@ -1686,7 +1753,14 @@ export class Harness extends DurableObject<Env> {
       "UPDATE messages SET status = ?, result = ?, processed_ts = ? WHERE id = ? AND status = 'processing' AND processing_ts = ?",
       status, JSON.stringify(result), Date.now(), messageId, claimedTs,
     );
-    return Number(cursor.rowsWritten) > 0;
+    // processing → терминальный статус — единственная точка финала (все вызовы
+    // #processSingleMessage/#reclaimStuckMessages идут через неё), поэтому
+    // единственная точка сброса msgCounts на терминальный переход (#575).
+    if (Number(cursor.rowsWritten) > 0) {
+      this.#msgCountsCache = null;
+      return true;
+    }
+    return false;
   }
 
   /** Обработка одного сообщения. Захват атомарный: ровно один обработчик уводит
@@ -1704,6 +1778,8 @@ export class Harness extends DurableObject<Env> {
       kind, priority, claimedTs, messageId,
     );
     if (claimed.rowsWritten === 0) return { action: "skipped" };
+    // new → processing — msgCounts сдвигается тем же переходом (#575).
+    this.#msgCountsCache = null;
     this.#groupMessages(messageId);
 
     // directive и doc_edit — оба получают issue-след: «у каждой директивы есть
@@ -1738,6 +1814,8 @@ export class Harness extends DurableObject<Env> {
         messageId, claimedTs,
       );
       if (Number(released.rowsWritten) === 0) return { action: "skipped" };
+      // processing → new (повторяемая ошибка) — тот же переход, что и захват выше (#575).
+      this.#msgCountsCache = null;
       return { action: "issue_retry", error: outcome.error, attempts };
     }
 
@@ -1779,12 +1857,13 @@ export class Harness extends DurableObject<Env> {
         this.#finishMessage(Number(row.id), "failed", { error: "stuck_reclaimed", attempts: Number(row.attempts) }, Number(row.processing_ts));
         continue;
       }
-      reclaimed += Number(
-        this.#sql.exec(
-          "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
-          Number(row.id),
-        ).rowsWritten,
-      );
+      const released = this.#sql.exec(
+        "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
+        Number(row.id),
+      ).rowsWritten;
+      // processing → new (ватчдог) — тот же переход, что ручной release выше (#575).
+      if (released > 0) this.#msgCountsCache = null;
+      reclaimed += Number(released);
     }
     return reclaimed;
   }
@@ -1794,9 +1873,12 @@ export class Harness extends DurableObject<Env> {
    *  GH_ISSUES_TOKEN). */
   async #processInbox(limit: number, retryFailed: boolean): Promise<MessageProcessResult[]> {
     if (retryFailed) {
-      this.#sql.exec(
+      const cursor = this.#sql.exec(
         "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL WHERE status = 'failed'",
       );
+      // failed → new (bulk retry) — та же msgCounts-инвалидация, что у
+      // одиночных переходов выше (#575).
+      if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
     }
     const rows = this.#rows(
       this.#sql.exec(
@@ -1948,7 +2030,13 @@ export class Harness extends DurableObject<Env> {
       });
     }
 
-    this.#broadcastStatus();
+    // broadcastStatus() — только на реально НОВОЕ нажатие (stored.fresh):
+    // Telegram ретраит callback-апдейты так же, как обычные сообщения, и
+    // #postMessageIngest уже не шлёт статус на повтор (см. stored.fresh выше
+    // в ingest) — эта ветка была единственной, что делала это безусловно на
+    // каждое нажатие, включая дубли и чужие чаты (#575: избыточный вызов
+    // #status() там, где ничего не изменилось).
+    if (stored.fresh) this.#broadcastStatus();
     return this.#json({
       message_id: stored.id,
       status: parsed ? (stored.fresh ? "callback_processed" : "callback_duplicate") : "callback_ignored",
@@ -2043,12 +2131,16 @@ export class Harness extends DurableObject<Env> {
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
     if (existing) return { id: Number(existing.id), fresh: false };
-    this.#sql.exec(
+    const cursor = this.#sql.exec(
       `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
        ON CONFLICT(source, source_msg_id) DO NOTHING`,
       Date.now(), f.source, f.sourceMsgId, f.chatId, f.senderId, f.senderName, f.text,
     );
+    // Новая строка меняет msgCounts['new'] (#575, тот же принцип, что у
+    // #taskCountsCache при insert в tasks) — только на реальную вставку, не
+    // на гипотетический проигрыш гонки (её здесь нет, см. docstring выше).
+    if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
