@@ -60,7 +60,23 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # этот job — самый дорогой потребитель общего бюджета 1000 запросов/час
+      # на репозиторий (150-250 REST-вызовов за прогон при непустой очереди,
+      # issue #443), и именно он ронял чужие обязательные проверки живым
+      # прогоном 2026-09-06 (PR #428/#453). scripts/lib/rate_guard.py — порог
+      # и обоснование там же. `gh api rate_limit` не тратит собственную
+      # квоту (подтверждено, см. докстринг), поэтому эта проверка сама не
+      # приближает то, от чего защищает.
+      - name: Квота GitHub API — ранняя проверка
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job orchestra
+
       - name: Обход пула и очередь слияний
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # PAT для update-branch: GITHUB_TOKEN-обновления не зажигают проверки
@@ -86,6 +102,7 @@ jobs:
       # поставлена review:ok), эскалация — один раз на конкретный набор
       # нарушителей (issue_marker_times), не на каждый пульс.
       - name: Инварианты состояния репозитория
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
