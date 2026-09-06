@@ -175,6 +175,88 @@ def test_blocked_task_gets_no_assignment_call(monkeypatch):
     assert not assignment_calls, f"назначение на заблокированную задачу: {assignment_calls}"
 
 
+# ── close-директива по прод-форме PR #415 (#423) ─────────────────────────────
+#
+# Живой случай: прогон `contract` 02:46:46 (2026-09-06) покрасил PR #415 —
+# на тот момент тело содержало голое `Closes #413` (первая форма ниже),
+# настоящую директиву GitHub (проверено рендерером, task_ref.py). После
+# правки автором (`Closes/Fixes/Resolves` перенесены в inline-код, номер
+# вынесен отдельным `#413`) тело стало безопасным (вторая форма). Старая
+# проверка contract_check.py (`line.lstrip().lower().startswith(...)`) не
+# красила бы вторую форму ПО СЛУЧАЙНОСТИ позиции обратной кавычки — не по
+# семантике: см. test_task_ref.py::test_closing_keyword_mutation_... для
+# формы, где старая логика ложноположительна по-настоящему.
+
+_PR_415_BODY_V1_LITERAL_DIRECTIVE = (
+    "#413\n\n"
+    "## Проблема\n\n"
+    "`scripts/worker/task.sh` считал успехом прогона только ОТКРЫТЫЙ PR.\n\n"
+    "Closes #413 руками не пишу (контракт запрещает `Closes/Fixes/Resolves` в\n"
+    "теле PR) — issue закрою отдельно после мержа.\n"
+)
+
+_PR_415_BODY_V2_FIXED = (
+    "#413\n\n"
+    "## Проблема\n\n"
+    "`scripts/worker/task.sh` считал успехом прогона только ОТКРЫТЫЙ PR.\n\n"
+    "Слово «закрывает issue» намеренно не пишу ключевым словом GitHub (контракт\n"
+    "`contract_check.py` отклоняет Closes/Fixes/Resolves в теле PR) — #413\n"
+    "закрою отдельным комментарием после мержа, с уликами.\n"
+)
+
+
+def test_real_pr_415_literal_directive_fails_contract(monkeypatch):
+    routes = {
+        "pulls/415": pull(415, pr_body=_PR_415_BODY_V1_LITERAL_DIRECTIVE, labels=()),
+        "issues/413": issue(413, state="open", assignees=("mytab0r",)),
+        "pulls?state=open": [],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=415)
+    assert code == 1, "голое Closes #413 — настоящая директива, контракт обязан упасть"
+
+
+def test_real_pr_415_fixed_body_passes_contract(monkeypatch):
+    # Живой факт: этот PR был разблокирован ручной правкой тела на именно
+    # эту форму — контракт обязан пропустить её без вмешательства человека.
+    routes = {
+        "pulls/415": pull(415, pr_body=_PR_415_BODY_V2_FIXED, labels=(), branch="agent/413-pr-merged-is-success"),
+        "issues/413": issue(413, state="open", assignees=("mytab0r",)),
+        "pulls?state=open": [],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=415)
+    assert code == 0, "объяснение правила в inline-коде не должно красить контракт"
+
+
+def test_false_positive_prose_about_the_rule_passes_contract(monkeypatch):
+    # Находка ревью #429: гвардия функции (test_task_ref.py::
+    # test_closing_keyword_mutation_startswith_regresses_on_pr_415_v1) держит
+    # только task_ref.closing_keyword_refs саму по себе, не проводку через
+    # contract_check.py — снятая мутация (вернуть старую позиционную проверку
+    # `line.lstrip().lower().startswith(...)` прямо в contract_check.py)
+    # оставляла оба контрактовых теста выше зелёными по случайности, потому
+    # что #415-v2 не начинается со слова Closes. Эта форма ложноположительна
+    # по-настоящему на старой логике: строка "Closes/Fixes/Resolves запрещены
+    # контрактом — не пиши их." начинается ровно со слова Closes.
+    body = (
+        "#413\n\n"
+        "Closes/Fixes/Resolves запрещены контрактом — не пиши их. Задачу\n"
+        "закрою отдельным комментарием после мержа, с уликами.\n"
+    )
+    routes = {
+        "pulls/413": pull(413, pr_body=body, labels=(), branch="agent/413-pr-merged-is-success"),
+        "issues/413": issue(413, state="open", assignees=("mytab0r",)),
+        "pulls?state=open": [],
+    }
+    fake = FakeGh(routes)
+    code = _run_main(monkeypatch, fake, pr_number=413)
+    assert code == 0, (
+        "не директива: после ключевого слова нет #N вплотную — GitHub тут "
+        "ничего не закроет, контракт красить не должен"
+    )
+
+
 # ── Контроль: пригодная свободная задача по-прежнему авто-назначается ───────
 
 
