@@ -20,6 +20,14 @@ on:
     types: [owner-decision]
 
 permissions:
+  # contents: read обязателен рядом с issues: write (находка ревью PR #486,
+  # третий заход) — явный блок permissions обнуляет ВСЕ остальные скоупы
+  # токена, а actions/checkout@v7 ниже клонирует репозиторий этим же
+  # github.token; без contents:read checkout падает 403, job красный
+  # каждый прогон, комментарий «РЕШЕНИЕ: N» не появляется никогда — тот же
+  # приём, что уже применяют соседние тонкие job'ы branch-protection-watch.yml
+  # и quotas.yml.
+  contents: read
   issues: write
 
 concurrency:

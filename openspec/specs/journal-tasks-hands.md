@@ -62,6 +62,13 @@
     в браузере не хранится и повторно не передаётся (образец — dsh-edge,
     `docs/research/11-dsh-edge.md`). `DELETE /api/session` сбрасывает куку
     (Max-Age=0); у HttpOnly-куки это умеет делать только сервер.
+
+> **П.20 ниже неполон.** `POST /api/messages/ingest` вдобавок принимает
+> третий способ авторизации (секретный заголовок вебхука Telegram) — в
+> дельта-спеке
+> [`telegram-inline-buttons/specs/journal-tasks-hands/spec.md`](../changes/telegram-inline-buttons/specs/journal-tasks-hands/spec.md);
+> вливается в этот пункт при архивации change'а.
+
 20. Запросы к `/api/*` авторизуются либо сессионной кукой (браузер, включая
     WebSocket — кука уходит с апгрейдом сама), либо `Authorization: Bearer`
     (job, `scripts/hands`). Ни один запрос к `/api/*` не несёт токен в URL.
@@ -252,6 +259,13 @@
     возвращает существующую строку (`exists`), дубли не создаются. Правило
     одно для обоих приёмных маршрутов — `ingest` и ручной
     `POST /api/messages`.
+> **П.32 ниже устарел.** Прямая доставка вебхуком Telegram ПОДКЛЮЧЕНА
+> (третий способ авторизации + привязка к владельцу по `chat_id` +
+> `callback_query` инлайн-кнопок, #254) — актуальное поведение в
+> дельта-спеке
+> [`telegram-inline-buttons/specs/journal-tasks-hands/spec.md`](../changes/telegram-inline-buttons/specs/journal-tasks-hands/spec.md);
+> вливается в этот пункт при архивации change'а.
+
 32. Маршрут админско-релейный и авторизуется как все `/api/*` (пп. 20–22).
     Прямая доставка вебхуком Telegram не подключена — для неё нужен свой
     секрет; релей/админ шлёт update'ы сам.
