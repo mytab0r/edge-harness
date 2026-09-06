@@ -158,6 +158,14 @@ _rl_spec = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_rl_spec)
 _rl_spec.loader.exec_module(review_labels)
 
+# Чеклист некритичных замечаний ревью в теле PR (#462, третья категория
+# находок) — одно место правды в lib, общее с scripts/review/ai_review.py:
+# тот пишет пункты при вердикте, этот читает незакрытые при слиянии.
+_rc_spec = importlib.util.spec_from_file_location(
+    "review_checklist", Path(__file__).resolve().parents[1] / "lib" / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_rc_spec)
+_rc_spec.loader.exec_module(review_checklist)
+
 # Номер задачи из текста PR/issue — одно место правды (#187): границы числа
 # с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
 # 33570081734).
@@ -568,6 +576,26 @@ def pr_check_runs(repo: str, pull: dict) -> list[dict]:
     return checks.get("check_runs", [])
 
 
+def latest_check_runs(runs: list[dict]) -> list[dict]:
+    """Один чек-ран на имя — самый свежий по `started_at`, если тот же чек
+    перезапускался (rerun) на одном и том же head sha (#467). GitHub
+    check-runs API отдаёт КАЖДУЮ попытку отдельным объектом с тем же `name` —
+    старая упавшая попытка не пропадает из ответа после успешного повтора;
+    branch protection сама учитывает только последнюю попытку при решении
+    «можно ли сливать», наш собственный разбор — нет, если не отфильтровать
+    явно. Живой случай: PR #437 (задача #432) — `contract` на одном head sha
+    сначала `failure` (04:02:20Z), потом `success` того же имени (rerun,
+    04:03:39Z); без этого фильтра приёмка находила первую попытку и красила
+    задачу в fail, хотя PR к тому моменту был зелёным и уже слит."""
+    latest: dict[str, dict] = {}
+    for run in runs:
+        name = run["name"]
+        current = latest.get(name)
+        if current is None or run.get("started_at", "") > current.get("started_at", ""):
+            latest[name] = run
+    return list(latest.values())
+
+
 def bad_check_names(runs: list[dict]) -> list[str]:
     """Одно место правды (находка AI-ревью PR #253) для критерия «красного
     обязательного чека»: раньше `conclusion not in (success, skipped, neutral)`
@@ -575,8 +603,10 @@ def bad_check_names(runs: list[dict]) -> list[str]:
     расхождение критерия в одной из копий при правке двух других осталось бы
     незамеченным. Все три места зовут эту функцию. Пустой список runs даёт
     пустой список здесь — это НЕ «красных нет», а «проверки ещё не заведены»;
-    вызывающий код обязан проверять пустоту runs отдельно (см. pr_is_merge_ready)."""
-    return [run["name"] for run in runs if run["conclusion"] not in ("success", "skipped", "neutral")]
+    вызывающий код обязан проверять пустоту runs отдельно (см. pr_is_merge_ready).
+    Дедуп по имени (см. latest_check_runs, #467) — на входе с уже отфильтрованным
+    списком это холостой проход, безопасно для всех трёх вызывающих."""
+    return [run["name"] for run in latest_check_runs(runs) if run["conclusion"] not in ("success", "skipped", "neutral")]
 
 
 def pr_bad_checks(repo: str, pull: dict) -> list[str]:
@@ -1102,6 +1132,42 @@ def after_merge(
     if task_numbers:
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
+    # Чеклист некритичных замечаний ревью (#462, третья категория находок):
+    # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
+    # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
+    # что у review:large) и НЕ теряются молча — ОДНА задача-хвост со ссылкой
+    # на PR, не issue на каждый пункт. `pull.get("body")` (не отдельный
+    # перезапрос) — тело PR несёт чеклист уже с момента ai:ok (гейт слияния
+    # требует его до того, как PR вообще попадёт в очередь на слияние), а не
+    # изменяется в промежутке между списком PR и этим моментом.
+    try:
+        unresolved = review_checklist.unresolved_items(pull.get("body") or "")
+        if unresolved:
+            tail_title = review_checklist.tail_issue_title(number)
+            open_titles = {
+                issue["title"]
+                for issue in review_labels.list_pages(
+                    f"repos/{repo}/issues?state=open&labels=task&per_page=100", gh)
+                if "pull_request" not in issue
+            }
+            if tail_title in open_titles:
+                observations.append(
+                    f"ℹ️ хвост чеклиста PR #{number}: задача уже заведена (идемпотентность по заголовку)")
+            else:
+                created = gh(
+                    "-X", "POST", f"repos/{repo}/issues",
+                    "-f", f"title={tail_title}",
+                    "-f", "body=" + review_checklist.tail_issue_body(repo, number, unresolved),
+                    "-f", "labels[]=task",
+                )
+                actions.append(
+                    f"📋 хвост чеклиста PR #{number}: заведена #{created['number']} "
+                    f"({len(unresolved)} незакрытых пунктов)")
+    except RuntimeError as error:
+        # Мерж уже состоялся — недоступность GitHub здесь не откатывает его,
+        # но и не молчит: видимое ⚠️ в отчёте, тот же приём, что у release
+        # замка/напоминания выше в этой функции.
+        observations.append(f"⚠️ хвост чеклиста PR #{number} не заведён: {error}")
     remaining_observations, remaining_actions = update_remaining_pulls(repo, pull["number"], other_pulls or [])
     observations += remaining_observations
     actions += remaining_actions
@@ -1622,18 +1688,56 @@ PARTIAL_DISCLAIMER_MARKERS = (
     "перенесено в #",
 )
 
+# Сузить ложноположительный класс (#467): маркер внутри абзаца, который
+# описывает РАССМОТРЕННУЮ И ОТКЛОНЁННУЮ альтернативу ДРУГОЙ, не заявленной
+# здесь работы — не дисклеймер критерия ЭТОЙ задачи. Признак — прозаический,
+# минимально достаточный (не машиночитаемое поле, см. #355), одно из
+# нескольких характерных слов, которыми исполнитель в этом репозитории
+# отмечает «я это обдумал и сознательно не стал делать».
+_DISCLAIMER_REJECTED_ALT_SIGNALS = ("рассмотрен", "отклонен", "отклонён", "решил не", "решили не")
 
-def partial_disclaimer(body: str) -> str | None:
+
+def partial_disclaimer(body: str, task_number: int) -> str | None:
     """Найденный маркер неполноты (см. PARTIAL_DISCLAIMER_MARKERS) в теле PR,
     без учёта регистра, или None. Сравнение по подстроке, не по регекспу —
     маркеры уже достаточно специфичны, лишняя мощь регекспа тут не нужна.
     «Ё» нормализуется в «е» с обеих сторон (находка AI-ревью PR #342): «е»
     вместо «ё» в живых телах PR — норма («перенесен в #», не «перенесён»),
     без нормализации маркер молча не находится и приёмка тихо закрывает
-    задачу вопреки дисклеймеру — тот самый класс, который #335 и чинит."""
-    lowered = (body or "").lower().replace("ё", "е")
-    for marker in PARTIAL_DISCLAIMER_MARKERS:
-        if marker.replace("ё", "е") in lowered:
+    задачу вопреки дисклеймеру — тот самый класс, который #335 и чинит.
+
+    Абзац с маркером (текст между пустыми строками — та же мелкая единица
+    прозы, которую исполнитель пишет вокруг самой фразы) НЕ считается
+    дисклеймером ИМЕННО ЭТОЙ задачи (`task_number`), если ОБА условия верны
+    разом:
+    1. абзац не упоминает #task_number (task_ref.references_task — номер с
+       границей с обеих сторон, не подстрока);
+    2. абзац несёт явный сигнал рассмотренной-и-отклонённой альтернативы
+       (см. _DISCLAIMER_REJECTED_ALT_SIGNALS).
+
+    Оба условия разом, не по отдельности — у каждого поодиночке есть живой
+    контрпример. Живой ложноположительный случай (#467, #454): PR #455 несёт
+    абзац «Дешёвая предпроверка... — рассмотрено и НЕ реализовано» под
+    заголовком «Что НЕ сделано в этом PR и почему» — абзац не упоминает #454
+    и явно называет рассмотренную-отклонённую альтернативу другой работы;
+    собственный критерий #454 при этом выполнен и доказан тестами тем же
+    телом PR. Живой ИСТИННО положительный случай, который «нет #N» в одиночку
+    сломал бы: PR #382 (задача #370) несёт абзац «Смежные события (не
+    реализовано, для отдельного обсуждения)» — тоже не упоминает #370, но и
+    не несёт сигнала отклонённой альтернативы (это открытые предложения на
+    будущее, не отказ) — #370 сам требует явного решения владельца независимо
+    от улик, дисклеймер обязан остаться в силе. Требование обоих условий
+    разом различает эти два случая без регрессии (test_partial_disclaimer_*
+    в test_scheduler.py — прод-форма обоих тел)."""
+    for paragraph in (body or "").split("\n\n"):
+        lowered = paragraph.lower().replace("ё", "е")
+        for marker in PARTIAL_DISCLAIMER_MARKERS:
+            if marker.replace("ё", "е") not in lowered:
+                continue
+            mentions_own_task = task_ref.references_task(paragraph, task_number)
+            looks_like_rejected_alt = any(sig in lowered for sig in _DISCLAIMER_REJECTED_ALT_SIGNALS)
+            if not mentions_own_task and looks_like_rejected_alt:
+                continue  # похоже на отклонённую альтернативу другой работы, не на дисклеймер этой задачи
             return marker
     return None
 
@@ -1779,15 +1883,31 @@ def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None
 
 def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
     """('ok'|'fail'|'pending', детали) — тот же критерий красного обязательного
-    чека, что уже применяет pr_bad_checks/merge_queue (см. bad_check_names)."""
+    чека, что уже применяет pr_bad_checks/merge_queue (см. bad_check_names).
+
+    «Ещё выполняется» (status != completed на самом свежем чек-ране с этим
+    именем, см. latest_check_runs) и «завершился и он красный» — разные
+    исходы (#467, AGENTS.md «fail loud, не silent-wrong»): раньше оба читались
+    одним и тем же bad_check_names (conclusion=None у незавершённого чека —
+    "не success/skipped/neutral", то есть формально "плохой"), и приёмка
+    писала «результат не достигнут» про чек, который просто ещё не досчитал.
+    Проверяем незавершённость ДО красноты — незавершённый чек не судим по
+    conclusion вовсе, откладываем на следующий пульс."""
     payload = gh(f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100") or {}
     runs = payload.get("check_runs", [])
     if not runs:
         return "pending", "проверки PR на head sha ещё не найдены"
-    bad = bad_check_names(runs)
+    latest = latest_check_runs(runs)
+    # default "completed" на отсутствующем поле — только страховка для старых
+    # фикстур тестов без status (реальный ответ GitHub несёт его всегда);
+    # у настоящего check-run без status считаем, что он уже завершён.
+    unfinished = sorted({run["name"] for run in latest if run.get("status", "completed") != "completed"})
+    if unfinished:
+        return "pending", f"проверки ещё выполняются: {', '.join(unfinished)}"
+    bad = bad_check_names(latest)
     if bad:
         return "fail", f"красные проверки: {', '.join(bad)}"
-    return "ok", f"{len(runs)} проверок PR зелёные (прогон с выводом)"
+    return "ok", f"{len(latest)} проверок PR зелёные (прогон с выводом)"
 
 
 def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
@@ -1974,7 +2094,7 @@ def accept_merged_tasks(
         if pull is None:
             continue
 
-        disclaimer = partial_disclaimer(pull.get("body") or "")
+        disclaimer = partial_disclaimer(pull.get("body") or "", number)
         if disclaimer is not None:
             partial_marker = f"{ACCEPTANCE_PARTIAL_MARKER} PR #{pull['number']}"
             try:
@@ -1994,7 +2114,7 @@ def accept_merged_tasks(
             if not already_marked:
                 text = (f"{partial_marker} тело PR #{pull['number']} содержит дисклеймер "
                         f"о неполноте («{disclaimer}») — критерий требует проверки человеком, "
-                        f"не закрываю. Задача возвращена в пул, докрытие — новый PR (#335).")
+                        f"не закрываю. Задача возвращена в пул, докрытие — новый PR.")
                 try:
                     post_issue_comment(repo, number, text)
                 except RuntimeError as error:
