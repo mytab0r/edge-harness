@@ -8,7 +8,7 @@
 
 Требование: каждый пульс оркестратора дешёвым запросом (`status=completed`
 с клиентским фильтром по выводу `FAILURE_WATCH_RUN_CONCLUSIONS`, одна
-страница `per_page=20` на workflow, без выгрузки логов всех прогонов подряд)
+страница `per_page=100` на workflow, без выгрузки логов всех прогонов подряд)
 проверяет свежие провалы каждого из `WATCHED_WORKFLOWS` (`worker.yml`,
 `hands.yml`, `orchestra.yml`, `deploy-worker.yml`, `deploy-dsh-edge.yml`).
 Выводы решены явно: `failure` и `timed_out` — провал (прогон, убитый

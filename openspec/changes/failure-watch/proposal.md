@@ -19,7 +19,7 @@
 Каждый пульс оркестратора, до всей остальной работы (тот же довод, что у
 `heartbeat_check`):
 
-- **Дешёвый опрос** — `status=completed&per_page=20` по каждому из пяти
+- **Дешёвый опрос** — `status=completed&per_page=100` по каждому из пяти
   отслеживаемых workflow (одна страница на workflow, логи прогонов подряд не
   выгружаются); вывод фильтруется клиентским набором
   `FAILURE_WATCH_RUN_CONCLUSIONS` (failure + timed_out, без cancelled —
