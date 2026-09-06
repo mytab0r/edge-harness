@@ -190,7 +190,7 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             }""",
             {"accountTag": account_id, "start": day_start},
         )
-        accounts = data["viewer"]["accounts"]
+        accounts = do_rows_read.require_accounts(data["viewer"]["accounts"])
         items = [item for acc in accounts for item in acc["workersInvocationsAdaptive"]]
         # Гвардия обрезки (находка AI-ревью PR #327, третий раунд): CF режет
         # group-ответы на limit БЕЗ маркера — see do_rows_read.check_not_truncated.
@@ -219,7 +219,7 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             }""",
             {"accountTag": account_id},
         )
-        accounts = data["viewer"]["accounts"]
+        accounts = do_rows_read.require_accounts(data["viewer"]["accounts"])
         items = [item for acc in accounts for item in acc["durableObjectsStorageGroups"]]
         do_rows_read.check_not_truncated(items, limit=10000)
         if items:
@@ -280,7 +280,7 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
                 }}""",
                 {"accountTag": account_id, "start": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
             )
-            accounts = data["viewer"]["accounts"]
+            accounts = do_rows_read.require_accounts(data["viewer"]["accounts"])
             items = [item for acc in accounts for item in acc[group_field]]
             # Гвардия обрезки (та же находка): limit: 1000 может обрезаться
             # молча так же, как limit: 10000 в остальных двух местах.

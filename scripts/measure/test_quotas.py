@@ -243,6 +243,34 @@ def test_cf_storage_sums_stored_bytes_of_latest_date_across_namespaces(monkeypat
     assert storage_row.current == 350
 
 
+def test_cf_empty_accounts_is_no_data_not_silent_zero(monkeypatch):
+    """Находка AI-ревью PR #327 (четвёртый раунд): `viewer.accounts` пустой
+    значит «токен не видит этот аккаунт» (accountTag не совпадает, или у
+    токена нет доступа) — не «метрика равна нулю». Без гвардии sum/max по
+    пустому списку молча дают 0, и все три блока (workers requests, DO
+    storage, DO rows_read/written) рапортовали бы status="ok" с current=0 —
+    0% никогда не пробьёт порог 80%, эскалация не уйдёт именно в момент
+    инцидента с недоступным аккаунтом. Мутация: убери
+    do_rows_read.require_accounts из любого блока collect_cloudflare — тот
+    блок вернёт "ok"/0 вместо "no-data" на этой фикстуре."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [
+                {"name": "DurableObjectsInvocationsAdaptiveGroupsSum"},
+            ]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        return {"viewer": {"accounts": []}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    by_resource = {r.resource: r for r in rows}
+    assert by_resource["Workers requests/сутки"].status == "no-data"
+    assert by_resource["DO storage/аккаунт"].status == "no-data"
+    assert "accounts пуст" in by_resource["Workers requests/сутки"].note
+    assert "accounts пуст" in by_resource["DO storage/аккаунт"].note
+
+
 def test_cf_workers_invocations_truncation_is_no_data_not_silent_undercount(monkeypatch):
     """Находка AI-ревью PR #327 (третий раунд): CF режет group-ответы на
     limit БЕЗ маркера обрезки (research/20) — ровно limit=10000 строк
