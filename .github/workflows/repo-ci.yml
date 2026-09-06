@@ -74,6 +74,16 @@ jobs:
           python -m pytest scripts/lib/test_declared_deps.py -q
           python scripts/lib/declared_deps.py check "$GITHUB_REPOSITORY"
 
+      # Граф блокировок пула (#361), который declared_deps.py сверяет с прозой
+      # выше — сам модуль scripts/lib/task_deps.py (разбор/сборка GraphQL-запроса
+      # addBlockedBy/removeBlockedBy) остался без единого шага CI (находка
+      # канарейки осиротевших тестов, #583) — класс тот же, что и у
+      # test_duplicate_guard.py ниже: файл лежал, но не запускался.
+      - name: Тесты графа блокировок пула task_deps
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_deps.py -q
+
       # Гвардия класса #179/#526: программное заведение issue пула (POST
       # repos/{repo}/issues) обязано идти через ЕДИНУЮ точку
       # scripts/lib/pool_issue.py::create_pool_issue — она физически не даёт
@@ -91,6 +101,15 @@ jobs:
             exit 1
           fi
           echo "orchestra+lib+review: заведение issue пула только через pool_issue.create_pool_issue"
+
+      # Единственная точка правды create_pool_issue, которую гвардия выше
+      # защищает статическим грепом, сама осталась без юнит-теста в CI
+      # (находка канарейки осиротевших тестов, #583): test_pool_issue.py
+      # доказывает мутацией, что RuntimeError бросается ДО сетевого вызова gh.
+      - name: Тесты create_pool_issue — отказ до сетевого вызова при отсутствии task
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_pool_issue.py -q
 
       # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
       # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
@@ -178,6 +197,18 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_repo_invariants.py -q
 
+      # Автофикс инварианта 4 (#493, job archive-fixup ниже): чистая часть
+      # rewrite_inbound_links (переписывание входящих markdown-ссылок при
+      # переносе openspec/changes/<id> в archive/) плюс регресс #506
+      # (REPO_ROOT из cwd вызова, не из расположения файла). Лежал без
+      # единого шага CI (находка канарейки осиротевших тестов, #583) — сам
+      # скрипт зовётся отдельным job'ом archive-fixup, но его чистая логика
+      # юнит-тестом не проверялась вовсе.
+      - name: Тесты автофикса архивации openspec/changes (#493/#506)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/orchestra/test_archive_complete_changes.py -q
+
       # Гвардия класса #510/#516: скрипт под scripts/, вызванный из workflow
       # НАПРЯМУЮ (run: scripts/foo.sh, без bash/python/node перед путём), без
       # бита исполнения падает Permission denied на КАЖДОМ прогоне — и падение
@@ -191,6 +222,15 @@ jobs:
           python -m pytest scripts/lib/test_exec_bit_guard.py -q
       - name: Гвардия бита исполнения — живой снимок workflow (#510/#516)
         run: python scripts/lib/exec_bit_guard.py
+
+      # Сам scripts/gh/wake_orchestra.sh (#456), тот самый «образцовый случай»
+      # выше — экономит диспатч orchestra.yml, только когда он заведомо
+      # избыточен. Юнит-тест лежал без единого шага CI (находка канарейки
+      # осиротевших тестов, #583): фейковый `gh` на PATH, сеть не нужна.
+      - name: Тесты экономии диспатча wake_orchestra (#456)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/gh/test_wake_orchestra.py -q
 
       # Гвардия протухшей метки blocked (#334): без этого шага тесты
       # гвардии живут только текстом файла — по собственному правилу
@@ -397,6 +437,25 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_infra_gh_inventory.py -q
 
+      # Канарейка класса «осиротевший тест» (#583): PR #568 слил
+      # scripts/lib/test_duplicate_guard.py (семь тестов гвардии дублей issue)
+      # — файл НЕ БЫЛ подключён ни к одному workflow, ни разу не выполнялся.
+      # Вскрылось не проверкой, а ручным чтением. scripts/lib/orphan_test_guard.py
+      # сканирует файловую систему на все виды тестов (python/bash/node/vitest),
+      # разбирает РЕАЛЬНЫЕ run:-команды .github/workflows/*.yml (не греп по
+      # имени файла — pytest на директорию покрывает всё под ней) и красит CI
+      # точным текстом «какой файл — что сделать», если тест не покрыт ни
+      # одной командой. Легальный газ — маркер `ORPHAN-TEST-OK: <причина>`
+      # внутри самого файла теста (docstring модуля — вся механика). Живой
+      # снимок ниже — сама канарейка обязана проверять состояние репозитория,
+      # а не только доказывать логику мутацией юнит-тестов.
+      - name: Тесты канарейки осиротевших тестов
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_orphan_test_guard.py -q
+      - name: Канарейка осиротевших тестов — живой снимок (#583)
+        run: python scripts/lib/orphan_test_guard.py
+
       # Паритет маскирования (ревью PR #173): инбокс морды пишет фриформ-текст
       # владельца в публичный issue — паттерны секретов cf-worker/src/redact.ts
       # обязаны совпадать один к одному с dsh-ci.sh::redact. Две мутации
@@ -415,6 +474,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/review/test_ai_review.py -q
 
+      # Гейт первого ревью в ai-review.yml (#204, второй заход): шаг `facts`
+      # решает `go=true/false` bash-логикой ВНУТРИ самого workflow — тест
+      # исполняет РЕАЛЬНЫЙ `run:`-скрипт этого шага, не пересказ на python.
+      # Лежал без единого шага CI (находка канарейки осиротевших тестов,
+      # #583) — тот же класс, что закрывали test_waiting_owner_guard.py и
+      # test_apply_owner_decision.py выше по этому же файлу.
+      - name: Гвардия гейта первого ревью ai-review.yml (#204)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_ai_review_gate.py -q
+
       # Масштаб находки (#426): file_tasks.py заводит issue только для
       # МАСШТАБ: отдельно — фильтр защиты в глубину (build_comment уже не
       # фенсит хвост/без-поля, но искажённый/ручной комментарий проверяется
@@ -423,6 +493,14 @@ jobs:
         run: |
           pip install --quiet pytest
           python -m pytest scripts/review/test_file_tasks.py -q
+
+      # Третья категория находок ревью (#462): блок ЗАМЕЧАНИЕ, слияние с
+      # чеклистом тела PR, незакрытые пункты при слиянии. Лежал без единого
+      # шага CI (находка канарейки осиротевших тестов, #583).
+      - name: Тесты review_checklist.py — категория ЗАМЕЧАНИЕ (#462)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_review_checklist.py -q
 
       # Гвардии check_pr.py. Одна — аргумент --tree (bootstrap PR #138):
       # check_pr.py исполняется доверенным чекаутом main, а не деревом
@@ -558,6 +636,20 @@ jobs:
       - name: Smoke issue-create — issue без task отклоняется до вызова gh (#526)
         run: bash scripts/gh/test/issue-create.test.sh
 
+      # Второй тормоз того же issue-create (#566): заголовок сверяется с уже
+      # открытыми задачами пула (scripts/lib/duplicate_guard.py) ДО вызова
+      # `gh issue create`. Оба файла — чистая логика duplicate_guard.py и
+      # smoke самой обёртки — лежали в репозитории без единого шага CI
+      # (находка канарейки осиротевших тестов, #583): реальный измеренный
+      # случай #562/#564, который они ловят, не был бы пойман повторно, если
+      # бы порог/regex в самом duplicate_guard.py тихо сломался.
+      - name: Тесты чистой логики duplicate_guard (#566)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_duplicate_guard.py -q
+      - name: Smoke issue-create — похожий заголовок отклоняется до вызова gh (#566)
+        run: bash scripts/gh/test/issue-create-duplicate-guard.test.sh
+
       # Гвардия класса #526 (статический скан «сырой gh issue create вне
       # обёртки») РАССМОТРЕНА и сознательно НЕ заведена по ТОЙ ЖЕ причине,
       # что и класс #496 выше: подстрока `gh issue create` легитимно
@@ -689,6 +781,15 @@ jobs:
               sys.exit("\n".join(missing))
           print(f"docs: все {total} ссылок на .github/workflows/ существуют")
           PY
+
+      # rate_guard.py (#454) — гейт квоты, который шаг ниже вызывает напрямую —
+      # лежал без единого шага CI своего юнит-теста (находка канарейки
+      # осиротевших тестов, #583): фикстура REAL_RATE_LIMIT_RESPONSE — дословный
+      # вывод `gh api rate_limit`, захваченный живым вызовом 2026-09-06.
+      - name: Тесты гейта квоты rate_guard (#454)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_rate_guard.py -q
 
       # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
       # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
