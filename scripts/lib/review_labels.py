@@ -49,6 +49,11 @@ AI_CHANGES = "ai:changes-requested"
 AI_FAILED = "ai:failed"
 AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 
+# ── Вердикт-метки гейта 1 одним кортежем (#203) ──────────────────────────────
+# Любой момент времени на PR должен существовать не более чем один из этих
+# трёх; своп решает verdict_label_changes ниже.
+REVIEW_VERDICTS = (REVIEW_OK, REVIEW_CHANGES, REVIEW_LARGE)
+
 # ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
 # Единственное определение (было задублировано локальной константой в
 # scheduler.py) — should_update_branch ниже читает её же.
@@ -412,6 +417,34 @@ def header_facts(comment_body: str) -> dict[str, str]:
     return facts
 
 
+def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches) -> dict | None:
+    """Последний комментарий ДОВЕРЕННОЙ сервисной учётки
+    (_is_trusted_verdict_author), тело которого удовлетворяет
+    `body_matches(body)` — общий обход «найти свой прошлый комментарий на PR».
+
+    Единственное место цикла «постранично (list_pages) + фильтр доверия»:
+    раньше он жил в latest_ai_comment, и идемпотентность комментариев
+    contract:failed/находок ревью (#203) требовала бы точных копий —
+    очередной экземпляр класса дублированного обхода, который уже собирали
+    в list_pages (#308). Комментарии от кого угодно, кроме доверенной
+    учётки, пропускаются ДО разбора тела: репозиторий публичный, посторонний
+    участник может опубликовать любой текст (находка вердикта ai-review
+    PR #294) — доверять телу можно только после проверки автора, не вместо
+    неё. Порядок выдачи API сохраняется (extend по страницам подряд),
+    «последний по порядку среди доверенных» возвращается как есть."""
+    latest = None
+    for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
+        if not _is_trusted_verdict_author(comment):
+            continue
+        if body_matches(comment.get("body") or ""):
+            latest = comment
+    return latest
+
+
+def _is_ai_verdict_body(body: str) -> bool:
+    return header_facts(body).get("reviewer") in ("approve", "rework", "error")
+
+
 def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
     опубликованный доверенной учёткой — _is_trusted_verdict_author) —
@@ -421,28 +454,77 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     зашивается, чтобы функция оставалась инъекцией зависимости и её решение
     (diff_unchanged) проверялось без сети.
 
-    Комментарии от кого угодно, кроме доверенной учётки, пропускаются ДО
-    разбора шапки: посторонний участник публичного репозитория может
-    опубликовать комментарий с валидной шапкой reviewer:/diff: (находка
-    дыры безопасности, вердикт ai-review PR #294) — доверять телу
-    комментария можно только после проверки автора, не вместо неё.
+    Обход и фильтр доверия — общий latest_trusted_comment выше (#294, #308):
+    матч по значению шапки `reviewer:` отделён в _is_ai_verdict_body."""
+    return latest_trusted_comment(repo, pr, gh_func, _is_ai_verdict_body)
 
-    Листает все страницы (per_page=100) — эндпоинт комментариев не
-    поддерживает сортировку по убыванию (замер file_tasks.py на PR #138),
-    поэтому «последний» ищем перебором, как уже делает file_tasks.latest_review_comment.
-    Обход страниц — тот же list_pages, что у list_pr_files/list_timeline
-    выше (#308): полный список собирается сначала, «последний подходящий»
-    ищется одним проходом по нему — порядок выдачи API list_pages сохраняет
-    (extend по страницам подряд), поэтому семантика «последний по порядку
-    среди доверенных с решающей шапкой» не меняется."""
-    latest = None
-    for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
-        if not _is_trusted_verdict_author(comment):
-            continue
-        facts = header_facts(comment.get("body") or "")
-        if facts.get("reviewer") in ("approve", "rework", "error"):
-            latest = comment
-    return latest
+
+# ── Идемпотентная публикация вердиктов и комментариев провала (#203) ─────────
+#
+# Оба гейта на каждом прогоне безусловно перевешивали то, что уже висит:
+# check_pr.py снимал и ставил вердикт-метку заново (unlabeled+labeled одного
+# и того же значения в таймлайне PR), contract_check.py POST-ил заново
+# одинаковый комментарий провала. Замер по живому репозиторию
+# (scripts/measure/label_churn_203.py, окно 2026-09-05T03:00..2026-09-06T03:00Z):
+# 213 событий labeled за сутки, из них 88 — review:ok, при этом unlabeled
+# review:ok — 74, а реальных смен вердикта (в review:changes-requested — 1,
+# в review:large — 10) на порядок меньше: подавляющая часть — чистая
+# перестановка без изменения решения. Плюс цепочки дублей комментария
+# контракта (#162 — 9 штук, #173/#191 — по 3). orchestra.yml слушает
+# `labeled` — лишний своп метки означает лишний прогон.
+
+def verdict_label_changes(current, verdict: str,
+                          verdicts=REVIEW_VERDICTS) -> tuple[list[str], bool]:
+    """`(метки к снятию, ставить ли вердикт)` — единственное место решения
+    идемпотентной перестановки метки-вердикта (гейт 1: review:*; тот же код
+    принимает `verdicts=AI_VERDICTS` у гейта 2).
+
+    Вердикт не изменился → `([], False)`: вызывающий не выполняет НИ ОДНОГО
+    изменяющего вызова — ни лишнего unlabeled/labeled в таймлайне, ни
+    триггера `on: pull_request: [labeled]`. Вердикт сменился → чужие
+    вердикты из `verdicts` снимаются, актуальный ставится (обратная
+    проверка: перестановка при смене решения обязана остаться). Метки вне
+    `verdicts` (review:large-ok, ai:*, conflict) решение не трогает — у них
+    свои газы (LABELS.md)."""
+    names = _names(current)
+    stale = sorted(label for label in verdicts if label != verdict and label in names)
+    return stale, verdict not in names
+
+
+# Первые строки «своих» комментариев: константа здесь, рядом с матчером, а
+# вторая копия строки не заводится — сборщики тела импортируют оттуда же.
+CONTRACT_FAIL_HEADER = "Контракт PR ↔ задача нарушен:"
+REVIEW_FINDINGS_HEADER = "Ревью нашло замечания:"
+
+
+def comment_update_action(existing: dict | None, new_body: str) -> str | None:
+    """`'post'` | `'patch'` | `None` — что делать с комментарием провала при
+    повторном прогоне с тем же результатом (#203, критерий приёмки: второго
+    одинакового комментария появляться не должно).
+
+    `None` — комментарий уже висит с ТОЧНО этим текстом (найден
+    latest_comment_by_header, то есть от доверенной учётки): молчание —
+    здесь не silent-wrong, а доказанное «ничего не изменилось».
+    `'patch'` — свой комментарий есть, но текст нарушений другой:
+    обновляется существующий (одно живое сообщение на PR), а не цепочка
+    дубликатов. `'post'` — своего комментария ещё нет."""
+    if existing is None:
+        return "post"
+    if (existing.get("body") or "").strip() == new_body.strip():
+        return None
+    return "patch"
+
+
+def latest_comment_by_header(repo: str, pr: int, gh_func, header: str) -> dict | None:
+    """Последний ДОВЕРЕННЫЙ комментарий, начинающийся с `header`, — поиск
+    «своего прошлого комментария» для comment_update_action. Совпадение по
+    первой строке: `header` — маркер издателя, живёт константой рядом
+    (CONTRACT_FAIL_HEADER/REVIEW_FINDINGS_HEADER) и в сборщике тела, и здесь,
+    в одном экземпляре строки. Посторонний комментарий с тем же текстом
+    доверия не получает (latest_trusted_comment) и заглушить гейт не может —
+    дубликат публикуется, а не пропадает."""
+    return latest_trusted_comment(repo, pr, gh_func,
+                                  lambda body: body.startswith(header))
 
 
 # ── Commit Status API: вторая проводка вердикта, не второй источник (#345) ───
