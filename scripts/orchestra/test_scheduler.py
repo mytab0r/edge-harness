@@ -319,14 +319,17 @@ def label(name):
     return {"id": "LA_kwDOUHBaqc8AAAACypPLSQ", "name": name, "description": "", "color": "0E8A16"}
 
 
-def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", pr_body=""):
+def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", pr_body="", ref=None):
+    head = {"sha": f"sha{number}"}
+    if ref is not None:
+        head["ref"] = ref
     return {
         "number": number,
         "draft": draft,
         "labels": [label(n) for n in labels],
         "updated_at": updated_at,
         "body": pr_body,
-        "head": {"sha": f"sha{number}"},
+        "head": head,
     }
 
 
@@ -1532,17 +1535,17 @@ def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeyp
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
 
 
-def test_after_merge_promises_auto_close_only_for_declared_task(monkeypatch):
-    """Находка AI-ревью PR #253: accept_merged_tasks видит только ДЕКЛАРИРУЮЩИЕ
-    рефы (merged_pr_map строится из declared_tasks) — обещание «приёмка
+def test_after_merge_promises_auto_close_only_for_own_branch_task(monkeypatch):
+    """Находка AI-ревью PR #253: accept_merged_tasks видит только задачу ВЕТКИ
+    (merged_pr_map строится из task_ref.resolve_pr_task) — обещание «приёмка
     закроет её сама» для ЛЮБОГО упоминания в прозе было ложным (задача,
-    упомянутая не первой строкой, не в карте приёмки, и через
+    упомянутая не веткой, не в карте приёмки, и через
     ACCEPTANCE_PENDING_HOURS reap_stale снял бы с неё назначение с ложной
-    причиной «PR не появился»). #78 объявлена первой строкой — получает
-    обещание автозакрытия; #79 просто упомянута в прозе — получает
-    предупреждение завести декларирующий PR."""
+    причиной «PR не появился»). #78 — задача ветки — получает обещание
+    автозакрытия; #79 просто упомянута в прозе — получает предупреждение
+    завести PR на ветке agent/<N>-<slug>."""
     body = "#78\n\nОсновная реализация. Заодно поправил соседний баг из #79."
-    merged = pull(163, pr_body=body)
+    merged = pull(163, pr_body=body, ref="agent/78-dsh-edge")
     posted = {}
 
     def fake_gh(*args):
@@ -1570,18 +1573,19 @@ def test_after_merge_promises_auto_close_only_for_declared_task(monkeypatch):
     sch.after_merge("o/r", merged, [])
 
     assert "стадия приёмки закроет её сама" in posted[78]
-    assert "не объявил её" in posted[79]
+    assert "не назвал её именем ветки" in posted[79]
     assert "стадия приёмки закроет её сама" not in posted[79]
 
 
 def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     """#170: слияние в main — единственный факт, на который Telegram говорит
     «выполнена»; раньше этот канал молчал вовсе, и владелец узнавал о готовности
-    только руками. Один PR = ОДНО сообщение, даже когда в теле объявлена #78 и
-    рядом упомянута #79 (дубль на каждую задачу — спам). Номера задачи и PR —
-    кликабельные <a>-ссылки, заголовок задачи экранирован (мержится как HTML)."""
+    только руками. Один PR = ОДНО сообщение, даже когда ветка называет #78 и
+    рядом в теле упомянута #79 (дубль на каждую задачу — спам). Номера задачи и
+    PR — кликабельные <a>-ссылки, заголовок задачи экранирован (мержится как
+    HTML)."""
     body = "#78\n\nОсновная реализация. Заодно поправил соседний баг из #79."
-    merged = pull(163, pr_body=body)
+    merged = pull(163, pr_body=body, ref="agent/78-dsh-edge")
     sent = []
 
     def fake_gh(*args):
@@ -1618,15 +1622,15 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     assert any("Telegram" in line and "доставлено" in line for line in lines)
 
 
-def test_after_merge_announces_only_declared_task_not_prose_mentions(monkeypatch):
-    """#404 (ревью PR #402): «выполнена» вправе звучать только о задаче, которую
-    PR ОБЪЯВИЛ первой строкой тела. Упомянутая в прозе более старая открытая
-    задача (#78 идёт раньше #79 в сортировке упоминаний) не перебивает
-    объявленную: канал не говорит «#78 выполнена» про задачу, которую этот PR
-    не делал и которую приёмка (#227) не закроет. Мутация: вернуть захват
-    first_task до проверки declares_task — тест краснеет."""
+def test_after_merge_announces_only_own_branch_task_not_prose_mentions(monkeypatch):
+    """#404 (ревью PR #402), переведено на #394 (решение владельца 2026-09-06):
+    «выполнена» вправе звучать только о задаче ВЕТКИ PR. Упомянутая в прозе
+    более старая открытая задача (#78 идёт раньше #79 в сортировке упоминаний)
+    не перебивает задачу ветки: канал не говорит «#78 выполнена» про задачу,
+    которую этот PR не делал и которую приёмка (#227) не закроет. Мутация:
+    вернуть захват first_task до сравнения с own_task — тест краснеет."""
     body = "#79\n\nОсновная реализация. Заодно поправил соседний баг из #78."
-    merged = pull(163, pr_body=body)
+    merged = pull(163, pr_body=body, ref="agent/79-second-fix")
     sent = []
 
     def fake_gh(*args):
@@ -1659,10 +1663,10 @@ def test_after_merge_announces_only_declared_task_not_prose_mentions(monkeypatch
     assert "#78" not in text and "Старая задача из прозы" not in text
 
 
-def test_after_merge_without_declared_task_sends_nothing(monkeypatch):
-    """#404: PR без декларации (задача упомянута только в прозе) не порождает
-    «задача #N выполнена» вовсе — нечего announcing, приёмка такую задачу всё
-    равно не закроет."""
+def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
+    """#404, переведено на #394: PR без agent-ветки (задача упомянута только в
+    прозе) не порождает «задача #N выполнена» вовсе — нечего announcing,
+    приёмка такую задачу всё равно не закроет."""
     body = "Попутно задел соседний баг из #78."
     merged = pull(163, pr_body=body)
     sent = []
@@ -1697,7 +1701,7 @@ def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
     """#170: недоставленный Telegram не откатывает мерж и не роняет after_merge —
     место правды (комментарий в задаче выше) уже оставлен; но и не молчит: ⚠️ в отчёте."""
     body = "#78\n\nОсновная реализация."
-    merged = pull(163, pr_body=body)
+    merged = pull(163, pr_body=body, ref="agent/78-dsh-edge")
 
     def fake_gh(*args):
         joined = " ".join(args)
@@ -1956,12 +1960,13 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
 # ── Приёмка (#227): задача закрывается только по проверяемой улике ──────────────
 #
 # Фикстуры ниже — реальные ответы `gh api` по этому репозиторию (снято
-# 2026-09-03): PR #138 (задача #18, "#18\n\n…" — тело объявляет задачу первой
-# строкой, как требует task_ref.declared_tasks), PR #177 (#21), PR #163 (#78).
-# На момент инцидента #227 все три были слиты, а задачи оставались открытыми
-# без исполнителя (reap_stale успел снять assignee по неверной причине «PR не
-# появился») — сейчас #18/#21/#78 уже закрыты вручную, но тела PR и списки
-# файлов ниже — то, что реально видел бы этот код в момент инцидента.
+# 2026-09-03, ветки досняты 2026-09-06 после решения владельца сделать ветку
+# единственным источником): PR #138 (ветка agent/18-…, задача #18), PR #177
+# (agent/21-…, #21), PR #163 (agent/78-…, #78). На момент инцидента #227 все
+# три были слиты, а задачи оставались открытыми без исполнителя (reap_stale
+# успел снять assignee по неверной причине «PR не появился») — сейчас
+# #18/#21/#78 уже закрыты вручную, но тела PR и списки файлов ниже — то, что
+# реально видел бы этот код в момент инцидента.
 
 PR_138_BODY = "#18\n\nПост-мерж фиксы AI-ревьюера, вскрытые первыми живыми прогонами."
 PR_138_FILES = [
@@ -2006,9 +2011,12 @@ def files_payload(names):
     return [{"filename": name} for name in names]
 
 
-PR138 = merged_pull(138, PR_138_BODY, "aaebecbb6adf816be99ab76ab30c3de796e3ff89", "2026-09-02T21:31:47Z")
-PR177 = merged_pull(177, PR_177_BODY, "67b23c9fb1bd43984c3a734bed569f0ae01a8d3c", "2026-09-02T17:01:28Z")
-PR163 = merged_pull(163, PR_163_BODY, "fc3e8b2ba2422e81ab23a7ebc2948d84d1f71650", "2026-09-02T20:46:31Z")
+PR138 = merged_pull(138, PR_138_BODY, "aaebecbb6adf816be99ab76ab30c3de796e3ff89", "2026-09-02T21:31:47Z",
+                     branch="agent/18-ai-trusted-from-main")
+PR177 = merged_pull(177, PR_177_BODY, "67b23c9fb1bd43984c3a734bed569f0ae01a8d3c", "2026-09-02T17:01:28Z",
+                     branch="agent/21-dev-wrangler-dev")
+PR163 = merged_pull(163, PR_163_BODY, "fc3e8b2ba2422e81ab23a7ebc2948d84d1f71650", "2026-09-02T20:46:31Z",
+                     branch="agent/78-dsh-edge")
 
 
 def test_classify_acceptance_deploy_when_cf_worker_touched():
@@ -2023,9 +2031,9 @@ def test_classify_acceptance_docs_when_only_openspec_md():
     assert sch.classify_acceptance(PR_163_FILES) == sch.ACCEPT_DOCS
 
 
-def test_merged_pr_map_uses_declared_task_not_prose_mention():
-    # Тело PR #138 объявляет #18 первой строкой ("#18\n\n…") — узкая семантика
-    # declared_tasks, симметричная contract_check при авто-назначении.
+def test_merged_pr_map_uses_branch_not_prose_mention():
+    # Задача PR — имя ветки (agent/18-…), не декларация тела (решение владельца
+    # 2026-09-06: тело не читается вовсе).
     mapping = sch.merged_pr_map([PR138, PR177, PR163])
     assert mapping[18]["number"] == 138
     assert mapping[21]["number"] == 177
@@ -2034,25 +2042,26 @@ def test_merged_pr_map_uses_declared_task_not_prose_mention():
 
 
 def test_merged_pr_map_keeps_most_recent_merge_for_same_task():
-    older = merged_pull(1, "#5\n\nстарая работа", "sha1", "2026-01-01T00:00:00Z")
-    newer = merged_pull(2, "#5\n\nновая работа поверх старой", "sha2", "2026-02-01T00:00:00Z")
+    older = merged_pull(1, "старая работа", "sha1", "2026-01-01T00:00:00Z", branch="agent/5-old")
+    newer = merged_pull(2, "новая работа поверх старой", "sha2", "2026-02-01T00:00:00Z", branch="agent/5-new")
     mapping = sch.merged_pr_map([older, newer])
     assert mapping[5]["number"] == 2
 
 
-def test_merged_pr_map_registers_rework_supersession_under_both_numbers():
-    # Живой класс #394 (PR #388/#384/#359/#167 репозитория на 2026-09-06):
-    # ветка называет уже закрытую задачу #256, тело докрытия объявляет
-    # открытую-преемницу #391 — регистрация под ОБОИМИ числами: accept_merged_tasks
-    # ищет только среди открытых задач пула, закрытая #256 там не значится,
-    # находит только запись под настоящей #391.
+def test_merged_pr_map_ignores_body_successor_when_branch_task_closed():
+    # Живой класс (PR #388/#384/#359/#167 репозитория на 2026-09-06): ветка
+    # называет уже закрытую задачу #256, тело докрытия объявляет
+    # открытую-преемницу #391. Решение владельца 2026-09-06 отменило
+    # регистрацию по телу без исключений: карта видит только #256 (задачу
+    # ветки), #391 в неё не попадает — правильная починка для #391 - новая
+    # ветка agent/391-<slug>, не эта запись.
     reworked = merged_pull(
         388, "#391\n\nRelated: #256 (закрыта акцептансом, докрытие — #391)",
         "sha388", "2026-09-06T00:00:00Z", branch="agent/256-task-rework-loop",
     )
     mapping = sch.merged_pr_map([reworked])
-    assert mapping[391]["number"] == 388
-    assert mapping[256]["number"] == 388  # безвредная запись — 256 закрыта, пул её не спросит
+    assert mapping[256]["number"] == 388
+    assert 391 not in mapping
 
 
 # ── Запрет переоткрытия (#369): закрытая задача не переоткрывается никогда ──────
@@ -2263,8 +2272,8 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
 
 def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
     """Проверка на входе (живой случай #320/#325): приёмка закрыла #320, пока
-    по нему был открыт второй PR #325, объявляющий ту же задачу первой строкой
-    тела, — тот немедленно упал на contract («задача #320 закрыта»). Улика по
+    по нему был открыт второй PR #325, чья ветка называет ту же задачу, —
+    тот немедленно упал на contract («задача #320 закрыта»). Улика по
     уже слитому PR #177 не отменяет работу открытого PR #325 по той же
     задаче — закрывать рано, задача остаётся в работе."""
     fake = FakeGh({
@@ -2281,7 +2290,8 @@ def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
-    still_open = pull(325, pr_body="#21\n\nвторой PR по этой задаче, работа продолжается")
+    still_open = pull(325, pr_body="#21\n\nвторой PR по этой задаче, работа продолжается",
+                       ref="agent/21-second-pr")
     pool = [issue(21, assignees=("mytab0r",))]
     lines, hard_failure = sch.accept_merged_tasks(
         REPO, pool, {21: PR177}, open_pulls_list=[still_open])

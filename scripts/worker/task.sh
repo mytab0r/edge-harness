@@ -222,7 +222,8 @@ echo "Задача #$number: $title"
 # без исполнителя, но с уже открытым PR — сигнал «довести» (сценарий
 # scheduler.py::unhealthy_pulls, снявшего исполнителя с нездорового PR), не
 # «пропустить». Одно место правды на объявление PR задачи —
-# scripts/lib/task_ref.py::declared_tasks через scripts/lib/free_task.py,
+# scripts/lib/task_ref.py::task_from_branch (имя agent-ветки, единственный
+# источник, решение владельца 2026-09-06) через scripts/lib/free_task.py,
 # то же самое, что использует contract_check.py — симметрично для явного
 # входа --task и для авто-выбора free_task(). Атомарная защита от гонки
 # каналов на этот же PR — claim ниже (шаг 4), не эта проверка.

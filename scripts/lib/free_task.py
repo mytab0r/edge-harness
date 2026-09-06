@@ -9,11 +9,8 @@
      (`scan("#[0-9]+")` по всему тексту) — тот же класс подстрочного
      совпадения, что уже чинили в `scripts/orchestra/contract_check.py`
      (#187, #195). Здесь номер задачи, которую PR ОБЪЯВЛЯЕТ, берётся через
-     `task_ref.resolve_pr_task` (#394) — имя agent-ветки (`headRefName`)
-     первично, `task_ref.declared_tasks` (ПЕРВАЯ непустая строка тела, без
-     учёта HTML-комментариев, начинающаяся с `#` и сразу цифрой, #251,
-     #312) — запасной путь, симметрично contract_check.py. Не любая строка
-     с `#N` в тексте (#251, #312).
+     `task_ref.task_from_branch` (`headRefName`) — единственный источник
+     (#394, решение владельца 2026-09-06): тело PR не читается вовсе.
 
   2. Открытый PR у задачи БЕЗ исполнителя (issue.assignees пуст) больше не
      исключает её из пула. `scheduler.py::unhealthy_pulls` снимает
@@ -97,29 +94,15 @@ def oldest_free(
 
 
 def declared_pr_for_task(prs: list[dict[str, Any]], task_number: int) -> dict[str, Any] | None:
-    """Открытый PR, у которого `task_number` — среди кандидатов номера задачи
-    (`task_ref.pr_task_candidates`, #394, одно место правды #259): имя
-    agent-ветки ИЛИ декларация первой строкой тела (без учёта
-    HTML-комментариев, начинающаяся с `#` и сразу цифрой, #251, #312). То же
-    правило, что `contract_check.py`, применённое симметрично к «своему» и
-    «чужому» PR.
+    """Открытый PR, чья ветка называет `task_number` (#394, одно место
+    правды #259, решение владельца 2026-09-06: единственный источник — имя
+    agent-ветки, тело PR не читается вовсе). То же правило, что
+    `contract_check.py`, применённое симметрично к «своему» и «чужому» PR.
 
-    Не `task_ref.resolve_pr_task` (тот схлопывает в ОДИН номер, ветка
-    приоритетна всегда) — здесь нужна проверка «входит ли task_number в
-    кандидатов», а не «совпадает ли единственный резолв», иначе PR,
-    переориентированный в реворке (ветка называет уже закрытую задачу, тело
-    объявляет новую узкую — живые PR #388/#384/#359/#167 на 2026-09-06), не
-    находился бы по номеру новой задачи, хотя её PR уже открыт.
-
-    `prs` — форма `gh pr list --json number,body,headRefName` (плоское поле
-    `headRefName`, не вложенный REST `head.ref`) — адаптируется под форму,
-    которую ждёт `pr_task_candidates`."""
+    `prs` — форма `gh pr list --json number,headRefName` (плоское поле
+    `headRefName`, не вложенный REST `head.ref`)."""
     for pull in prs:
-        adapted = {
-            "head": {"ref": pull.get("headRefName") or ""},
-            "body": pull.get("body") or "",
-        }
-        if task_number in task_ref.pr_task_candidates(adapted):
+        if task_ref.task_from_branch(pull.get("headRefName") or "") == task_number:
             return pull
     return None
 
