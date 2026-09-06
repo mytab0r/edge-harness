@@ -1848,38 +1848,50 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
     Мутация 2: в resume_series_by_merge убрать проверку следа — после
     test_after_merge_resume_skips_without_claim_trace краснеет."""
     merged = resume_pull()
-    escalated = []
+    # #120 — живой носитель: escalate зовётся НАСТОЯЩИЙ, постинг пишет в store,
+    # чтение дедупа и перечитывания факта сброса видят ровно то, что в нём.
+    store = []
 
-    def fake_escalate(repo, number, text):
-        escalated.append((repo, number, text))
-        return "Telegram: доставлен; след в #120: оставлен"
-
-    fake = FakeGh({
+    def fake_gh(*args):
+        joined = " ".join(args)
         # порядок важен: FakeGh матчит по подстроке, более частный фрагмент — раньше
-        f"{REPO}/pulls/163/files": [],
-        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
-        f"{REPO}/issues/217/comments?per_page": [
-            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
-        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
-        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
-        f"{REPO}/issues/120/comments?per_page": [],
-    })
-    patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", fake_escalate)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            store.append({"created_at": "2026-09-06T04:41:00Z",
+                          "body": args[-1].removeprefix("body=")})
+            return None
+        if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
+            return list(store)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/217/comments"):
+            return None  # напоминание о пост-мерж проверке
+        if joined in (
+                f"repos/{REPO}/pulls/163/files?per_page=100&page=1",
+                f"repos/{REPO}/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == f"repos/{REPO}/pulls/163":
+            return {"number": 163, "merged_at": "2026-09-06T04:40:56Z"}
+        if joined == f"repos/{REPO}/issues/217/comments?per_page=100&page=1":
+            return [{"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}]
+        if joined == f"repos/{REPO}/issues/217":
+            return {**issue(217, assignees=("mytab0r",)), "state": "open"}
+        if joined == f"repos/{REPO}/actions/workflows/worker.yml/runs?per_page=10":
+            return RESUME_RED_RUNS
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    patch_gh(monkeypatch, fake_gh)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert len(escalated) == 1
-    repo, number, text = escalated[0]
-    assert (repo, number) == (REPO, 120)                       # канал — задача-статус
-    assert f"{pg.RESUME_MARKER} #163]" in text                 # токен для gate и дедупа
-    assert "#217" in text and "#163" in text                   # задача и PR названы
-    assert any("сброшена мержем #163" in line for line in lines)
-    assert any("Telegram: доставлен" in line for line in lines)
+    # видимый результат: маркер реально лежит в #120 с нужным содержимым
+    assert len(store) == 1
+    assert f"{pg.RESUME_MARKER} #163]" in store[0]["body"]     # токен для gate и дедупа
+    assert "#217" in store[0]["body"] and "#163" in store[0]["body"]
+    assert any("сброшена мержем #163" in line for line in actions + observations)
+    assert any("Telegram: доставлен" in line for line in actions + observations)
 
 
 def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
@@ -1901,10 +1913,10 @@ def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("сброшена мержем" in line for line in lines)
+    assert not any("сброшена мержем" in line for line in actions + observations)
 
 
 def test_after_merge_resume_skips_when_series_closed(monkeypatch):
@@ -1929,10 +1941,10 @@ def test_after_merge_resume_skips_when_series_closed(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("сброшена мержем" in line for line in lines)
+    assert not any("сброшена мержем" in line for line in actions + observations)
 
 
 def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
@@ -1957,10 +1969,10 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("сброшена мержем" in line for line in lines)
+    assert not any("сброшена мержем" in line for line in actions + observations)
 
 
 def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
@@ -1985,10 +1997,10 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("сброшена мержем" in line for line in lines)
+    assert not any("сброшена мержем" in line for line in actions + observations)
 
 
 def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypatch):
@@ -1997,6 +2009,8 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
     (гейт маркер не увидит). Отчёт не вправе утверждать «сброшена». Мутация:
     убрать проверку статуса в resume_series_by_merge — тест краснеет."""
     merged = resume_pull()
+    # Постинг в #120 падает ПО-НАСТОЯЩЕМУ (RuntimeError от gh): реальный
+    # escalate глотает отказ post_issue_comment — маркер не появляется.
     fake = FakeGh({
         f"{REPO}/pulls/163/files": [],
         f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
@@ -2005,22 +2019,22 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
             {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
         f"-X POST repos/{REPO}/issues/217/comments": None,
         f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"-X POST repos/{REPO}/issues/120/comments": RuntimeError("500 постинг не прошёл"),
         f"{REPO}/issues/120/comments?per_page": [],
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate",
-                        lambda repo, number, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
 
-    lines, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("сброшена мержем" in line for line in lines), \
+    assert not any("сброшена мержем" in line for line in actions + observations), \
         "без маркера в #120 серия не снята — отчёт не утверждает сброс"
-    assert any("НЕ снята" in line and "#163" in line for line in lines)
-    assert any("пробой (#205)" in line for line in lines)  # газ возобновления назван
+    assert any("НЕ снята" in line and "#163" in line for line in actions + observations)
+    assert any("пробой (#205)" in line for line in actions + observations)  # газ возобновления назван
 
 
 def test_run_claimed_task_matches_own_run_not_prefix(monkeypatch):
