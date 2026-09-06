@@ -3449,6 +3449,12 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         # пульсе, даже здоровом (см. docstring) — без маршрута main() упал бы
         # на этом же вызове раньше, чем дошёл до предмета этого теста.
         "issues?state=open&labels=auto-detected": [],
+        # detect_worker_dispatch (#361) — задача 300 свободна, main() дойдёт
+        # до именованного приоритета через graphql-пул; без маршрута
+        # деградация печатает "⚠️ граф блокировок недоступен" в observations,
+        # это выглядит как симптом для stall_detector и требует ещё один
+        # маршрут (issue comment), не относящийся к предмету этого теста.
+        "graphql": graphql_pool_response([old_task]),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
