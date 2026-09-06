@@ -210,14 +210,26 @@ def timeline_with_review_ok(when: str):
     return [{"event": "labeled", "label": {"name": "review:ok"}, "created_at": when}]
 
 
+def retry_marker_comment(when: str, attempt: int):
+    return {
+        "created_at": when,
+        "body": f"🤖 {ri.AI_REVIEW_RETRY_MARKER} попытка {attempt}/{ri.AI_REVIEW_MAX_ATTEMPTS}",
+    }
+
+
 def test_stuck_review_gate_flags_after_threshold(monkeypatch):
     pull = open_pr(246, labels=["review:ok"])
-    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z")})
+    fake = FakeGh({
+        "issues/246/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/246/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
     assert len(violations) == 1
     assert violations[0]["pr"] == 246
+    assert violations[0]["attempts_total"] == 0
+    assert violations[0]["verdict_ever"] is None
 
 
 def test_stuck_review_gate_silent_within_threshold(monkeypatch):
@@ -250,7 +262,10 @@ def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch
     # единой ai:*-метки был невидим инварианту тем же классом, каким
     # scheduler.trigger_ai_review был невидим PR #412.
     pull = open_pr(432, labels=["review:large"])
-    fake = FakeGh({"issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z")})
+    fake = FakeGh({
+        "issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z"),
+        "issues/432/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
@@ -273,13 +288,164 @@ def test_stuck_review_gate_mutation_guard(monkeypatch):
     # появиться как нарушение (реальная мутация значения, не проверка > 0,
     # находка AI-ревью PR #249: старый вариант не краснел на снятии фикса).
     pull = open_pr(246, labels=["review:ok"])
-    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z")})
+    fake = FakeGh({
+        "issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z"),
+        "issues/246/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 13)  # 6 минут — в пределах порога 120 (см. silent_within_threshold)
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
     monkeypatch.setattr(ri, "UNHEALTHY_PR_AFTER_MINUTES", 1)
     violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
     assert len(violations) == 1
+
+
+# ── #472: факт, не гипотеза — прод-форма живых PR #387/#329/#327 ────────────
+#
+# Живой алерт 2026-09-06T09:00:06Z (issue #120): «3 PR ... Авто-повтор #196
+# либо исчерпал попытки, либо не сработал — нужен человек». Снято `gh api`
+# по этому репозиторию тем же днём (issues/{n}/timeline, issues/{n}/comments)
+# — не пересказ, реальные метки и реальные тексты маркеров-автоповторов.
+# Единственное отличие фикстур от сырого ответа: комментарии без маркера
+# `AI_REVIEW_RETRY_MARKER` выброшены — код под тестом (retry_budget_fact)
+# смотрит только на маркер, отбрасывая остальные тем же фильтром сам.
+ALERT_TIME = utc(2026, 9, 6, 9, 0, 6)
+
+
+def test_stuck_gate_fact_pr387_never_had_a_verdict(monkeypatch):
+    """#387: единственная эпоха (review:ok с 03:13:09), 3 маркера автоповтора
+    ВСЕ в этой же эпохе — бюджет исчерпан в ТЕКУЩЕЙ эпохе, а ai:*-вердикта не
+    было ни разу за всю жизнь PR (не «был и протух», как у #329/#327ниже)."""
+    pull = open_pr(387, labels=["review:ok", "review:large", "review:large-ok"])
+    fake = FakeGh({
+        "issues/387/timeline": [
+            {"event": "labeled", "label": {"name": "review:large"}, "created_at": "2026-09-05T23:02:59Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:13:09Z"},
+        ],
+        "issues/387/comments": [
+            retry_marker_comment("2026-09-06T03:45:03Z", 1),
+            retry_marker_comment("2026-09-06T03:46:33Z", 2),
+            retry_marker_comment("2026-09-06T03:48:40Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["age_minutes"] == pytest.approx(346.9, abs=0.1)
+    assert item["attempts_total"] == 3
+    assert item["attempts_in_epoch"] == 3  # все три — в той же (единственной) эпохе
+    assert item["verdict_ever"] is None  # НИ РАЗУ, а не «был и устарел»
+    line = ri.stuck_gate_fact_line(item)
+    assert "исчерпан в этой же эпохе (3/3)" in line
+    assert "не было НИ РАЗУ" in line
+
+
+def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
+    """#329: на момент алерта текущая эпоха (review:ok с 03:48:22) не получила
+    НИ ОДНОГО автоповтора, но глобальный счётчик (issue_marker_times без
+    since — та же метрика, что видит scheduler.trigger_ai_review) уже
+    показывает 3/3, потому что все три маркера принадлежат СТАРОЙ эпохе
+    (якорь 03:05:20), которая своё уже получила вердикт (ai:ok, 03:46:52).
+    Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
+    pull = open_pr(329, labels=["review:ok"])
+    fake = FakeGh({
+        "issues/329/timeline": [
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:05:20Z"},
+            {"event": "labeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:13:07Z"},
+            {"event": "unlabeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:46:51Z"},
+            {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-06T03:46:52Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:00Z"},
+            {"event": "unlabeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-06T03:48:01Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:02Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:22Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:48:22Z"},
+        ],
+        "issues/329/comments": [
+            retry_marker_comment("2026-09-06T03:37:16Z", 1),
+            retry_marker_comment("2026-09-06T03:38:48Z", 2),
+            retry_marker_comment("2026-09-06T03:40:21Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["labeled_at"] == "2026-09-06T03:48:22+00:00"  # эпоха началась ПОСЛЕ вердикта
+    assert item["age_minutes"] == pytest.approx(311.7, abs=0.1)
+    assert item["attempts_total"] == 3
+    assert item["attempts_in_epoch"] == 0  # ни одного автоповтора в ТЕКУЩЕЙ эпохе
+    assert item["verdict_ever"] == {"label": "ai:ok", "at": "2026-09-06T03:46:52+00:00"}
+    line = ri.stuck_gate_fact_line(item)
+    assert "исчерпан СТАРОЙ эпохой (3/3, в текущей — 0/3)" in line
+    assert "перенос бюджета между эпохами" in line
+    assert "вердикт был — ai:ok" in line
+
+
+def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
+    """#327: ровно ТА ЖЕ картина, что #329 — глобальный счётчик 3/3 из СТАРОЙ,
+    уже решённой эпохи (якорь 03:09:50, вердикт ai:changes-requested в
+    04:10:03), 0 автоповторов в текущей эпохе (якорь 05:46:16). Живой алерт
+    ошибочно предполагал «четыре автоповтора при лимите три» — маркеров
+    ровно три, не четыре (мутация ниже это и доказывает)."""
+    pull = open_pr(327, labels=["review:ok", "review:large", "review:large-ok"])
+    fake = FakeGh({
+        "issues/327/timeline": [
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:09:50Z"},
+            {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T04:10:03Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:23:35Z"},
+            {"event": "unlabeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:23:36Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:23:36Z"},
+            {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:33:52Z"},
+            {"event": "unlabeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:46:15Z"},
+            {"event": "unlabeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T05:46:16Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T05:46:16Z"},
+        ],
+        "issues/327/comments": [
+            retry_marker_comment("2026-09-06T03:42:09Z", 1),
+            retry_marker_comment("2026-09-06T03:43:30Z", 2),
+            retry_marker_comment("2026-09-06T03:45:11Z", 3),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", ALERT_TIME, [pull])
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["age_minutes"] == pytest.approx(193.8, abs=0.1)
+    assert item["attempts_total"] == 3  # не 4 — живая проверка алерта была неточна
+    assert item["attempts_in_epoch"] == 0
+    assert item["verdict_ever"] == {"label": "ai:changes-requested", "at": "2026-09-06T05:33:52+00:00"}
+    line = ri.stuck_gate_fact_line(item)
+    assert "3/3, в текущей — 0/3" in line
+
+
+def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
+    """Мутация: без различения attempts_in_epoch от attempts_total текст не
+    отличил бы «исчерпан старой эпохой» (#329/#327) от «исчерпан в этой же»
+    (#387) — оба читались бы одинаково «исчерпан», и находка issue #472
+    (перенос бюджета между эпохами) стала бы снова невидимой."""
+    same_epoch = {
+        "pr": 1, "age_minutes": 200.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 3, "attempts_in_epoch": 3, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+    }
+    carried_over = dict(same_epoch, attempts_in_epoch=0)
+    line_same = ri.stuck_gate_fact_line(same_epoch)
+    line_carried = ri.stuck_gate_fact_line(carried_over)
+    assert line_same != line_carried
+    assert "СТАРОЙ эпохой" not in line_same
+    assert "СТАРОЙ эпохой" in line_carried
+
+
+def test_stuck_gate_fact_line_budget_not_exhausted():
+    item = {
+        "pr": 2, "age_minutes": 150.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 1, "attempts_in_epoch": 1, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "не исчерпан (1/3)" in line
+    assert "ближайшем тике" in line
 
 
 # ══════════════════════════════════════════════════════════════════════════
