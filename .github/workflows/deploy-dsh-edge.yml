@@ -615,6 +615,7 @@ jobs:
           done
 
       - name: Деплой
+        id: deploy
         working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -704,6 +705,72 @@ jobs:
           pnpm install --no-frozen-lockfile
           node smoke.mjs
 
+      # Тормоз без газа не принимается (issue #549, живой случай #518/#544/#547):
+      # канарейки и e2e-смоук выше красятся ПОСЛЕ `wrangler deploy` — сломанная
+      # сборка уже отвечает трафиком, пока job красится постфактум (владелец
+      # 2026-09-06 увидел пустой шелл на телефоне раньше, чем job стал
+      # красным, 4 падения за час). Газ — автоматический, прямо в этом job'е:
+      # любая канарейка/смоук красная (failure()) И сам деплой прошёл
+      # (steps.deploy.outcome == 'success', НЕ откатываем то, чего не
+      # разворачивали, если упал сам `wrangler deploy`) → откатываемся на
+      # прошлую 100%-версию.
+      #
+      # `wrangler rollback` без явного version-id сам находит нужную версию —
+      # прочитано в реализации апстрима (cloudflare/workers-sdk,
+      # packages/wrangler/src/versions/rollback/index.ts::
+      # fetchDefaultRollbackVersionId): сортирует деплои по created_on,
+      # убирает текущий (только что раскатанный сломанный) и берёт первый с
+      # percentage:100 — «прошлый стабильный деплой», не «предыдущий по
+      # хронологии вообще». Наш путь деплоя всегда 100% (без gradual-сплита),
+      # так что «прошлая 100%-версия» = «прошлый деплой». `--message`
+      # заполняет и confirm(), и prompt() дефолтом без интерактива на
+      # не-TTY раннере — тот же паттерн, каким этот файл уже гоняет
+      # `wrangler secret put`/`wrangler deploy` без зависаний.
+      #
+      # Первый деплой воркера вообще (нет ни одной прежней 100%-версии,
+      # апстрим бросает «Could not find stable Worker Version») — этот шаг
+      # сам упадёт с понятной ошибкой апстрима; continue-on-error не даёт
+      # этому отказу потеряться поверх уже красной канарейки/смоука (исходный
+      # сигнал остаётся видимым, а не маскируется вторичным).
+      - name: Автооткат прода при красной канарейке/смоуке
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        # confirm()/prompt() апстрима — best-effort неинтерактивны на не-TTY
+        # раннере (дефолты возвращаются без ожидания ввода, тот же паттерн,
+        # что уже работает у `wrangler secret put`/`wrangler deploy` в этом
+        # файле), но это поведение не проверено живым прогоном именно для
+        # `wrangler rollback` — короткий таймаут вместо расходования всего
+        # 30-минутного бюджета job'а, если апстрим когда-нибудь всё-таки
+        # зависнет на вводе.
+        timeout-minutes: 3
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          npx wrangler rollback --yes \
+            --message "auto-rollback: канарейка/e2e-смоук красные, run ${{ github.run_id }}" \
+            2>&1 | tee rollback.log
+          grep -qi "has been deployed to 100% of traffic" rollback.log \
+            || { echo "::error::Автооткат не подтвердил успех — см. лог шага, прод может остаться на сломанной версии"; exit 1; }
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "🔙 Прод автоматически откачен на предыдущую 100%-версию"
+
+      # Газ обязан быть доказан, не заявлен: после отката корень снова обязан
+      # отвечать 200 — иначе «откатили» не значит «работает», и владелец
+      # остаётся со сломанным продом второй раз молча.
+      - name: Канарейка после автооткота
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          if [ "$code" = "200" ]; then
+            echo "✅ После автооткота прод отвечает 200 — интерфейс восстановлен на прошлой версии"
+          else
+            echo "::error::После автооткота прод всё ещё отвечает $code — автоматика не справилась, нужно ручное вмешательство НЕМЕДЛЕННО"
+          fi
+
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
         env:
@@ -749,7 +816,11 @@ jobs:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
           SOURCE: deploy
           STATE: failed
-          DETAIL: "деплой упал, см. лог job ${{ github.run_id }}"
+          # rolled_back=true — газ сработал, прод не остался на сломанной
+          # версии (см. шаг «Автооткат прода при красной канарейке/смоуке»);
+          # пусто — либо деплой упал раньше промоушена (нечего откатывать),
+          # либо сам автооткат не смог (см. лог job'а).
+          DETAIL: "деплой упал, см. лог job ${{ github.run_id }}${{ steps.auto_rollback.outputs.rolled_back == 'true' && ' — прод автоматически откачен на прошлую версию' || '' }}"
         run: |
           for id in ${{ steps.route.outputs.ids }}; do
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh || true
