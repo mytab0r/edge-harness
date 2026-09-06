@@ -121,6 +121,7 @@ parse_time = pulse_guard.parse_time
 minutes_between = pulse_guard.minutes_between
 escalate = pulse_guard.escalate
 issue_marker_times = pulse_guard.issue_marker_times
+issue_markers_any = pulse_guard.issue_markers_any
 WATCHDOG_ISSUE = pulse_guard.WATCHDOG_ISSUE
 # «PR нездоров дольше этого — действуй» — уже объявленный порог для «состояние
 # держится слишком долго» (scheduler.py, #196). Инварианты 1 и 3 переиспользуют
@@ -404,9 +405,17 @@ def check_ai_failed_budget_exhausted(repo: str, now: datetime, pull: dict) -> di
     if budget["attempts_in_epoch"] < AI_REVIEW_MAX_ATTEMPTS:
         return None  # бюджет ещё не исчерпан в этой эпохе — #196 может повторить сам
     marker = f"{pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #{pull['number']}"
-    already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
-    if any(marker_at > anchor for marker_at in already):
-        return None  # уже эскалировано в этой эпохе — #196 справился сам
+    # Находка ревью PR #439, вторая половина: газ #196 мог исчерпать бюджет
+    # ТРЕМЯ провалами, из которых последний — квота провайдера (ветка
+    # trigger_ai_review стоит РАНЬШЕ счётчика попыток и делает continue,
+    # эскалируя AI_REVIEW_QUOTA_MARKER, не AI_REVIEW_EXHAUSTED_MARKER).
+    # Инвариант обязан знать оба маркера — иначе он бьёт ложное
+    # «не эскалировано», хотя человек уже оповещён тем же каналом (#120),
+    # тот самый класс фолз-алерта, за который было стыдно в #472.
+    quota_marker = f"{pulse_guard.AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
+    already = issue_markers_any(repo, WATCHDOG_ISSUE, (marker, quota_marker))
+    if any(marker_at > anchor for marker_at, _ in already):
+        return None  # уже эскалировано в этой эпохе (любым из двух маркеров) — #196 справился сам
     verdict_ever = last_ai_verdict_ever(timeline)  # сам ai:failed — тоже вердикт
     return {
         "pr": pull["number"],

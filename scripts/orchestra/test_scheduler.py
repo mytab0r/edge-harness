@@ -1180,6 +1180,44 @@ def test_trigger_ai_review_quota_exhausted_escalation_is_idempotent_per_epoch(mo
     assert actions == []
 
 
+def test_trigger_ai_review_quota_reason_from_prior_epoch_is_not_used(monkeypatch):
+    # Находка ревью PR #439: reason: quota_exhausted из ПРОШЛОЙ эпохи (якорь
+    # 09:00) не должен управлять решением текущей эпохи (якорь 15:00, PR
+    # перелейблован новым пушем — свежий вердикт ai-review из-за очереди
+    # раннеров ещё не пришёл). Без якоря latest_ai_failure_reason нашёл бы
+    # старый quota-комментарий и эскалировал вместо того, чтобы дать эпохе
+    # автоповтор — ровно живой сценарий из ревью.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    old_quota_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha-old\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        # Якорь текущей эпохи — 15:00 (перелейбловка новым пушем), старше
+        # прошлой эпохи 09:00.
+        "issues/163/timeline": timeline_with_review_ok("2026-09-02T15:00:00Z"),
+        "issues/163/comments": [old_quota_comment],  # единственный комментарий — из ПРОШЛОЙ эпохи
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(
+        sch, "escalate",
+        lambda *a: pytest.fail("причина из прошлой эпохи не должна закрывать автоповтор новой"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert posted and "попытка 1/3" in posted[0][1]
+
+
 def timeline_with_review_large_only(when: str):
     """Прод-форма таймлайна крупного PR (#412, #432): verdict_for ставит РОВНО
     одну из двух меток гейта 1 — событие "labeled: review:ok" в таком

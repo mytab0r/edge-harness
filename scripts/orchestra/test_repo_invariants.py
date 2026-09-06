@@ -335,6 +335,31 @@ def test_stuck_review_gate_silent_ai_failed_already_escalated(monkeypatch):
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
 
 
+def test_stuck_review_gate_silent_ai_failed_already_escalated_via_quota_marker(monkeypatch):
+    # Находка ревью PR #439: газ #196 мог исчерпать бюджет ТРЕМЯ провалами, из
+    # которых последний — quota_exhausted (ветка trigger_ai_review стоит
+    # раньше счётчика попыток и эскалирует AI_REVIEW_QUOTA_MARKER, не
+    # AI_REVIEW_EXHAUSTED_MARKER). До фикса инвариант знал только про
+    # EXHAUSTED_MARKER и бил ложное «не эскалировано», хотя человек уже
+    # оповещён тем же каналом #120.
+    pull = open_pr(167, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "issues/167/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/167/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_QUOTA_MARKER} #167\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
 def test_stuck_review_gate_ai_failed_mutation_guard(monkeypatch):
     # Мутация: убрать вызов check_ai_failed_budget_exhausted из ветки
     # ai:failed (вернуть "labels & ai_labels: continue" безусловно) — этот

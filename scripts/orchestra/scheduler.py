@@ -1718,13 +1718,25 @@ def ai_review_retry_count(repo: str, pr_number: int, since: datetime | None = No
     return len(times)
 
 
-def latest_ai_failure_reason(repo: str, pr_number: int) -> str | None:
+def latest_ai_failure_reason(repo: str, pr_number: int, anchor: datetime | None = None) -> str | None:
     """Тег причины последнего вердикта error (review_labels.reason_tag,
     ai_review.build_comment, #431) — факт `reason:` в шапке последнего
-    доверенного AI-комментария. None — комментария нет, его вердикт не
-    error, либо тега ещё нет (комментарий написан до #431) — тогда причина
-    неизвестна и решение принимается по общему бюджету, как раньше."""
-    comment = review_labels.latest_ai_comment(repo, pr_number, gh)
+    доверенного AI-комментария ЭТОЙ ЭПОХИ (созданного строго после `anchor`
+    — той же простановки review:ok/review:large, что уже скоупит
+    ai_review_retry_count). None — комментария нет, его вердикт не error,
+    тега ещё нет (комментарий написан до #431), либо единственный
+    подходящий комментарий старше anchor (эпоха прошлая — причина
+    неизвестна В ЭТОЙ эпохе) — тогда решение принимается по общему бюджету,
+    как раньше.
+
+    Находка ревью PR #439: без anchor функция читала последний доверенный
+    комментарий БЕЗ ограничения по эпохе — пуш с неизменным диффом
+    (подтягивание main) переставляет review:ok, открывая новую эпоху N+1, а
+    свежий прогон ai-review ещё не ответил (очередь раннеров — иногда часы,
+    docs/research/21); trigger_ai_review читал `reason: quota_exhausted` из
+    ПРОШЛОЙ эпохи N и закрывал автоповторы новой эпохи, не дав ей ни одной
+    попытки."""
+    comment = review_labels.latest_ai_comment(repo, pr_number, gh, since=anchor)
     if comment is None:
         return None
     facts = review_labels.header_facts(comment.get("body") or "")
@@ -1755,7 +1767,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
             continue  # ещё не истёк порог ожидания вердикта
 
         if needs_retry:
-            reason = latest_ai_failure_reason(repo, pull["number"])
+            reason = latest_ai_failure_reason(repo, pull["number"], anchor=anchor)
             if reason == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
                 marker = f"{AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
                 try:

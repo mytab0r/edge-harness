@@ -36,6 +36,7 @@ Commit Status API (#345, кандидат из docs/research/23-platform-native-
 import hashlib
 import os
 import re
+from datetime import datetime
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -457,7 +458,7 @@ def header_facts(comment_body: str) -> dict[str, str]:
     return facts
 
 
-def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
+def latest_ai_comment(repo: str, pr: int, gh_func, since: datetime | None = None) -> dict | None:
     """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
     опубликованный доверенной учёткой — _is_trusted_verdict_author) —
     источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
@@ -465,6 +466,13 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     паттерн уже используемый в check_pr/ai_review) — сеть здесь не
     зашивается, чтобы функция оставалась инъекцией зависимости и её решение
     (diff_unchanged) проверялось без сети.
+
+    `since` — необязательный якорь эпохи (находка ревью PR #439): без него
+    функция читает всю историю PR, что для check_pr.py/ai_review.py верно
+    (им нужен последний вердикт вообще, для сравнения отпечатка диффа), но
+    неверно там, где решение обязано различать «вердикт ЭТОЙ эпохи» от
+    «вердикт эпохи прошлой» (scheduler.latest_ai_failure_reason) — комментарии
+    с created_at <= since пропускаются целиком, как будто их не было.
 
     Комментарии от кого угодно, кроме доверенной учётки, пропускаются ДО
     разбора шапки: посторонний участник публичного репозитория может
@@ -484,6 +492,10 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
         if not _is_trusted_verdict_author(comment):
             continue
+        if since is not None:
+            created_at = comment.get("created_at")
+            if not created_at or datetime.fromisoformat(created_at.replace("Z", "+00:00")) <= since:
+                continue
         facts = header_facts(comment.get("body") or "")
         if facts.get("reviewer") in ("approve", "rework", "error"):
             latest = comment
