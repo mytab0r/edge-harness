@@ -197,9 +197,12 @@ def test_header_facts_ignores_fenced_and_prose_lines():
 
 
 def test_tasks_from_comment_roundtrip():
+    # Роундтрип через фенсы — только для МАСШТАБ: отдельно (#426): именно эти
+    # задачи file_tasks.py заводит issue'ами, остальное build_comment уводит
+    # прозой (см. test_build_comment_tail_scope_not_fenced ниже).
     tasks = [
-        {"title": "Задача раз", "body": "Цель.\nКритерий."},
-        {"title": "Задача два", "body": "Тело."},
+        {"title": "Задача раз", "body": "Цель.\nКритерий.", "scope": "отдельно"},
+        {"title": "Задача два", "body": "Тело.", "scope": "отдельно"},
     ]
     body = ai.build_comment(140, "abc", "rework", "Находки.", tasks)
     assert ai.tasks_from_comment(body) == tasks
@@ -208,7 +211,8 @@ def test_tasks_from_comment_roundtrip():
 def test_tasks_roundtrip_keeps_inner_code_fence():
     # тело задачи с ```-фенсом (пример команды) не должно обрезаться:
     # внешний забор — 4 бэктика, внутренний тройной остаётся телом
-    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий."}]
+    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий.",
+              "scope": "отдельно"}]
     body = ai.build_comment(140, "abc", "approve", "Ок.", tasks)
     assert ai.tasks_from_comment(body) == tasks
 
