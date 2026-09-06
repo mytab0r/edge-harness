@@ -72,6 +72,16 @@ origin/main` вручную. Живой пример на момент пост�
 #476, изоляция continuation-режима в отдельный git worktree) — эта правка
 подхвачена ребейзом, второй, более узкий фикс не заводился.
 
+`scripts/lib/free_task.py::conflict_declared_tasks` — четвёртая находка
+ревью PR #478 (блокирующая): освобождённая задача была видна и generic-
+пульсу воркера (`free_task()` без `--task`) в обход бюджета «ровно одна
+попытка» — если адресный прогон падал по квоте/крашу до повторного
+захвата (`task.sh::release-full`), задача временно свободна, и generic-
+пульс мог взять её снова, уже ПОСЛЕ эскалации владельцу. `free_candidates`/
+`oldest_free` получили параметр `excluded` (задачи, чей объявленный PR
+несёт `conflict`); `task.sh::free_task()` вызывает новую подкоманду CLI
+`conflict-tasks` перед `oldest-free`.
+
 ## Проверено
 
 - `python -m pytest scripts/orchestra/test_scheduler.py -q` — сюита зелёная
@@ -90,6 +100,10 @@ origin/main` вручную. Живой пример на момент пост�
   вместо факта conclusion — `test_dispatch_conflict_rework_escalates_after_budget_exhausted`
   и `test_dispatch_conflict_rework_escalation_text_admits_unattributed_run`
   краснеют.
+- `python -m pytest scripts/lib/test_free_task.py -q` — 23 теста (6 новых).
+  Мутация 5: снять фильтр `excluded` в `free_candidates` —
+  `test_free_candidates_excludes_conflict_declared_task_even_when_oldest` и
+  `test_cli_oldest_free_excludes_conflict_declared_task` краснеют.
 - **Живая проверка на реальном PR #408** (задача #391, `mergeable_state=dirty`
   на момент работы): прямой вызов `dispatch_conflict_rework` на реальных
   данных освободил задачу #391 и задиспетчил `worker.yml` адресно (run
