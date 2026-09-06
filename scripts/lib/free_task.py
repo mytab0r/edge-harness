@@ -46,6 +46,15 @@
 Импорт task_ref — importlib по файлу (тот же приём, что в contract_check.py):
 скрипты запускаются как файлы, не как пакет.
 
+Четвёртый фильтр (task-rework-loop #256, design.md п.5): задачи с меткой
+needs-spec или blocked не выбираются автоматически (EXCLUDED_LABELS ниже) —
+обе означают «ждёт человека, не исполнителя», и автоматический выбор вернул
+бы задачу в работу сразу после того, как route_to_needs_spec/эскалация
+нарочно сняли её с исполнителя. Фильтр жив только при полном списке полей
+в вызывающем task.sh (`--json …,labels`) — гвардия
+test_free_task.py::test_task_sh_passes_labels_field_to_free_task красит
+пропавший `labels`.
+
 «Пусто» и «сломано» — разные состояния CLI (rc 1 против rc 2), и это различие
 обязано доходить до вызывающего task.sh: незаловленное исключение здесь
 (битый JSON пула, не загрузившийся task_ref.py) молча превращалось бы в
@@ -103,21 +112,43 @@ def _load_json(path: Path) -> Any:
         sys.exit(2)
 
 
+# Метки, исключающие задачу из выбора, — имена из docs/agents/LABELS.md
+# (реестр гвардится test_label_registry.py, там же газ каждой):
+#   needs-spec — бюджет реворка исчерпан (task-rework-loop #256, design.md
+#     п.5): задача ждёт уточнения требования аналитиком, не исполнителя;
+#     выбор её воркером сжёг бы бюджет заново на новом PR, пока владельцу
+#     уходит эскалация о задаче, которую уже «перерабатывают» (находка
+#     AI-ревью PR #408 — тормоз без газа в обратную сторону);
+#   blocked — эскалация владельцу (playbook): то же состояние ожидания.
+# scheduler.py пропускает обе метки в unhealthy_pulls/reap_stale
+# (BLOCKED_LABEL/_issue_is_blocked) — здесь закрыт второй путь класса
+# «метка есть, а путь выбора её не проверяет».
+EXCLUDED_LABELS = ("needs-spec", "blocked")
+
+
+def _label_names(issue: dict[str, Any]) -> set[str]:
+    """Прод-форма `gh issue list --json labels` — массив объектов с полем
+    `name` (замер живого API 2026-09-06), не плоские строки."""
+    return {label["name"] for label in issue.get("labels") or [] if label.get("name")}
+
+
 def free_candidates(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Открытые задачи пула без исполнителя, без живого замка аренды (#121) и
+    """Открытые задачи пула без исполнителя, без живого замка аренды (#121),
     без метки `waiting:owner` (находка AI-ревью PR #471, #470 — без этого
     фильтра задача, ждущая владельца, но ещё без исполнителя, стопорила бы
-    весь диспатч как «старейшая свободная», см. докстринг модуля),
-    отсортированные по номеру (старейшая первой — воркер не должен хватать
-    самую свежую косметику)."""
+    весь диспатч как «старейшая свободная», см. докстринг модуля) и без
+    исключающей метки (EXCLUDED_LABELS выше, design.md task-rework-loop
+    п.5), отсортированные по номеру (старейшая первой — воркер не должен
+    хватать самую свежую косметику)."""
     locked = locked or set()
     free = [
         issue for issue in issues
         if not (issue.get("assignees") or [])
         and issue["number"] not in locked
         and not _has_waiting_owner_label(issue)
+        and not (_label_names(issue) & set(EXCLUDED_LABELS))
     ]
     return sorted(free, key=lambda issue: issue["number"])
 

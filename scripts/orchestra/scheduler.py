@@ -1488,7 +1488,38 @@ def _pr_unhealthy_reason_is_verdict(pull: dict) -> bool:
     return bool(labels & set(_VERDICT_UNHEALTHY_LABELS))
 
 
-def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220) -> str:
+# Комментарий-вердикт гейта 1 опознаётся по маркеру из check_pr.py (прод-форма
+# тела, которое тот пишет при findings). Признак нужен двум потребителям здесь —
+# last_verdict_excerpt (текст последнего вердикта) и verdict_round_links ниже
+# (ссылка на каждый вердикт) — одна константа, не две копии литерала.
+GATE1_VERDICT_PREFIX = "Ревью нашло замечания:"
+
+# Окно поиска комментария-вердикта ПОСЛЕ события labeled (verdict_round_links
+# ниже). Связь детерминирована порядком публикации в коде обоих гейтов: метка
+# ставится РАНЬШЕ комментария одним job'ом (check_pr.py: POST labels, потом
+# POST comments; ai_review.py::cmd_verdict — тот же порядок), поэтому
+# комментарий ищется строго после события. Окно щедрое — медленный ретрай API
+# между двумя POST не должен рвать пару; промах окна — честное «ссылка не
+# восстановлена» у круга, не выдуманная ссылка (fail loud, не silent-wrong).
+VERDICT_LINK_WINDOW_MINUTES = 10
+
+
+def _is_gate1_verdict_comment(comment: dict) -> bool:
+    return (comment.get("body") or "").startswith(GATE1_VERDICT_PREFIX)
+
+
+def _is_gate2_rework_comment(comment: dict) -> bool:
+    """Вердикт гейта 2 именно «нужны правки»: доверенная учётка workflow
+    (review_labels._is_trusted_verdict_author — посторонний комментарий с
+    подделанной шапкой не станет ссылкой-вердиктом, находка PR #294) + шапка
+    reviewer: rework (approve/error — другие вердикты, другие метки)."""
+    if not review_labels._is_trusted_verdict_author(comment):
+        return False
+    return review_labels.header_facts(comment.get("body") or "").get("reviewer") == "rework"
+
+
+def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220,
+                         comments: list[dict] | None = None) -> str:
     """Короткая выжимка последнего вердикта «нужны правки» по PR — не имя
     метки и не дата, а СУТЬ находки, для эскалации владельцу (design.md
     task-rework-loop не требует этого текста дословно, но эскалация,
@@ -1497,18 +1528,23 @@ def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220) -> str:
     не наш пересказ: гейт 2 (AI) — прозa после шапки факта в комментарии
     review_labels.latest_ai_comment (header_facts останавливается на первой
     пустой строке — то, что после неё, findings); гейт 1 — тело последнего
-    комментария check_pr.py, начинающегося с «Ревью нашло замечания:».
-    Best-effort: ни один не нашёлся — честная строка, не выдумка."""
+    комментария check_pr.py, начинающегося с GATE1_VERDICT_PREFIX.
+    Best-effort: ни один не нашёлся — честная строка, не выдумка.
+    `comments` — уже прочитанный список комментариев PR (route_to_needs_spec
+    читает их один раз и для ссылок кругов, и для этой выжимки); None —
+    читать самому."""
     ai_comment = None
     try:
-        ai_comment = review_labels.latest_ai_comment(repo, pr_number, gh)
+        ai_comment = review_labels.latest_ai_comment(repo, pr_number, gh, comments=comments)
     except RuntimeError:
         pass
     review_comment = None
     try:
-        for comment in review_labels.list_pages(
-                f"repos/{repo}/issues/{pr_number}/comments?per_page=100", gh):
-            if (comment.get("body") or "").startswith("Ревью нашло замечания:"):
+        if comments is None:
+            comments = review_labels.list_pages(
+                f"repos/{repo}/issues/{pr_number}/comments?per_page=100", gh)
+        for comment in comments:
+            if _is_gate1_verdict_comment(comment):
                 review_comment = comment  # последний по порядку выдачи API
     except RuntimeError:
         pass
@@ -1522,11 +1558,49 @@ def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220) -> str:
         blank = next((i for i, l in enumerate(lines) if not l.strip()), len(lines))
         prose = " ".join(lines[blank + 1:]).strip()
     else:
-        prose = body.replace("Ревью нашло замечания:", "").strip()
+        prose = body.replace(GATE1_VERDICT_PREFIX, "").strip()
     prose = " ".join(prose.split())
     if not prose:
         return "текст вердикта пуст"
     return (prose[:max_len] + "…") if len(prose) > max_len else prose
+
+
+def verdict_round_links(repo: str, pr_number: int, events: list[dict],
+                        comments: list[dict] | None = None) -> list[str | None]:
+    """Ссылка на комментарий-вердикт для каждого круга реворка (design.md
+    task-rework-loop п.4, действие 3: «номер круга, дата, ссылка на
+    комментарий-вердикт») — аналитик разбирает находки по самим вердиктам,
+    не по датам меток. Пара восстанавливается по детерминированному порядку
+    публикации одного job'а (см. VERDICT_LINK_WINDOW_MINUTES): событие
+    ai:changes-requested матчится только с AI-вердиктом «нужны правки»,
+    review:changes-requested — только с маркером check_pr.py; каждый
+    комментарий потребляется один раз (следующий круг не может украсть
+    вердикт предыдущего). Комментарии читаются один раз; `comments` — уже
+    прочитанный список (None — читать самому). Best-effort: пара не
+    нашлась (промах окна, сбой чтения) — None, вызывающий пишет честную
+    приписку, не выдуманную ссылку."""
+    if comments is None:
+        try:
+            comments = review_labels.list_pages(
+                f"repos/{repo}/issues/{pr_number}/comments?per_page=100", gh)
+        except RuntimeError:
+            return [None] * len(events)
+    unused = list(comments)
+    window = timedelta(minutes=VERDICT_LINK_WINDOW_MINUTES)
+    links: list[str | None] = []
+    for event in events:
+        label_name = (event.get("label") or {}).get("name")
+        matcher = _is_gate2_rework_comment if label_name == review_labels.AI_CHANGES else _is_gate1_verdict_comment
+        link = None
+        if event.get("created_at"):
+            start = parse_time(event["created_at"])
+            match = next((c for c in unused if matcher(c) and c.get("created_at")
+                          and start <= parse_time(c["created_at"]) <= start + window), None)
+            if match is not None:
+                link = match.get("html_url")
+                unused.remove(match)
+        links.append(link)
+    return links
 
 
 def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: str) -> str:
@@ -1537,7 +1611,9 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
     отчёта, как и остальные шаги unhealthy_pulls:
       1. снять assignee с issue (как и при обычном возврате в пул);
       2. поставить label needs-spec на issue;
-      3. комментарий в issue — перечень ВСЕХ кругов реворка (дата + метка) +
+      3. комментарий в issue — перечень ВСЕХ кругов реворка (дата + метка +
+         ссылка на комментарий-вердикт, design.md п.4 действие 3; пара
+         восстанавливается по порядку публикации — verdict_round_links) +
          явный вопрос аналитику (design.md: без ответа задача не выходит из
          needs-spec);
       4. закрыть PR (не слить) с комментарием, называющим номер задачи;
@@ -1564,9 +1640,20 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         "-f", "labels[]=needs-spec",
     )
     events = pulse_guard.rework_events(repo, pull["number"])
+    # Комментарии PR читаются ОДИН раз на оба потребителя: ссылки кругов
+    # (verdict_round_links) и выжимка последнего вердикта в эскалации
+    # (last_verdict_excerpt) — тот же класс экономии, что #443, второй
+    # постраничный обход того же эндпоинта не нужен.
+    try:
+        comments = review_labels.list_pages(
+            f"repos/{repo}/issues/{pull['number']}/comments?per_page=100", gh)
+    except RuntimeError:
+        comments = None
+    links = verdict_round_links(repo, pull["number"], events, comments)
     rounds_text = "\n".join(
         f"  {i}. {event.get('created_at', '?')} — {(event.get('label') or {}).get('name', '?')}"
-        for i, event in enumerate(events, start=1)
+        + (f" — [вердикт]({link})" if link else " — (ссылка на вердикт не восстановлена)")
+        for i, (event, link) in enumerate(zip(events, links), start=1)
     ) or "  (таймлайн круга не восстановлен)"
     post_issue_comment(
         repo, number,
@@ -1595,7 +1682,7 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         "label-событий, и rework_cycle_count немедленно снова превысил бы бюджет).",
     )
     marker = f"{pulse_guard.NEEDS_SPEC_MARKER} #{number}"
-    excerpt = last_verdict_excerpt(repo, pull["number"])
+    excerpt = last_verdict_excerpt(repo, pull["number"], comments=comments)
     text = (
         f"🧭 edge-harness: {marker}\n"
         f"PR #{pull['number']} (задача #{number}) прошёл {count} круг(ов) "

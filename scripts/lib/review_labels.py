@@ -406,7 +406,8 @@ def header_facts(comment_body: str) -> dict[str, str]:
     return facts
 
 
-def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
+def latest_ai_comment(repo: str, pr: int, gh_func,
+                      comments: list[dict] | None = None) -> dict | None:
     """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
     опубликованный доверенной учёткой — _is_trusted_verdict_author) —
     источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
@@ -428,9 +429,15 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     выше (#308): полный список собирается сначала, «последний подходящий»
     ищется одним проходом по нему — порядок выдачи API list_pages сохраняет
     (extend по страницам подряд), поэтому семантика «последний по порядку
-    среди доверенных с решающей шапкой» не меняется."""
+    среди доверенных с решающей шапкой» не меняется.
+
+    `comments` — уже прочитанный тем же list_pages список комментариев PR
+    (scheduler.route_to_needs_spec читает эндпоинт один раз на ссылки
+    вердиктов и выжимку, класс экономии #443); None — листать самому."""
     latest = None
-    for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
+    if comments is None:
+        comments = list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func)
+    for comment in comments:
         if not _is_trusted_verdict_author(comment):
             continue
         facts = header_facts(comment.get("body") or "")

@@ -134,6 +134,61 @@ def test_oldest_free_skips_waiting_owner_to_next_candidate():
     assert free_task.oldest_free(issues)["number"] == 233
 
 
+# ── (d) исключающие метки: needs-spec/blocked не выбираются автоматически ──────────
+# task-rework-loop #256, design.md п.5: обе метки означают «ждёт человека, не
+# исполнителя» — route_to_needs_spec/эскалация playbook нарочно сняли задачу
+# с исполнителя; автоматический выбор вернул бы её в работу тут же (находка
+# AI-ревью PR #408: бюджет сгорает заново, владельцу уходит эскалация про
+# задачу, которую уже «перерабатывают»).
+
+
+def test_free_candidates_excludes_needs_spec():
+    issues = [issue(43, assignees=[], labels=["task", "needs-spec"]),
+              issue(90, assignees=[], labels=["task", "area:worker"])]
+    result = [i["number"] for i in free_task.free_candidates(issues)]
+    assert result == [90]  # needs-spec исключена, обычная метка не мешает
+
+
+def test_free_candidates_excludes_blocked():
+    issues = [issue(43, assignees=[], labels=["task", "blocked"]),
+              issue(90, assignees=[], labels=["task"])]
+    result = [i["number"] for i in free_task.free_candidates(issues)]
+    assert result == [90]
+
+
+def test_oldest_free_skips_needs_spec_regardless_of_number():
+    # Старейшая задача пула под needs-spec не возвращается воркеру —
+    # выбирается следующая свободная.
+    issues = [issue(20, assignees=[], labels=["task", "needs-spec"]),
+              issue(158, assignees=[], labels=["task"])]
+    assert free_task.oldest_free(issues)["number"] == 158
+
+
+def test_free_candidates_survives_missing_labels_field():
+    # Фильтр не имеет права падать или исключать всё, если поле labels не
+    # пришло в JSON (потребитель — free_task.py, а форма зависит от
+    # вызывающего task.sh; гвардия полноты полей — отдельный тест ниже).
+    issues = [{"number": 43, "title": "задача", "assignees": []}]
+    assert [i["number"] for i in free_task.free_candidates(issues)] == [43]
+
+
+# ── гвардия полноты полей: task.sh передаёт labels в JSON для free_task ────────────
+# Без `labels` в `--json` фильтр выше молча не работает в проде при зелёных
+# тестах на fixture (tasks.md task-rework-loop п.3, «Impacted domains»).
+# Статическая проверка исходника — та же жанровая гвардия, что
+# test_task_ref_usage_guard/test_pagination_guard: она ловит момент, когда
+# кто-то уронит поле из списка.
+
+
+def test_task_sh_passes_labels_field_to_free_task():
+    task_sh = Path(__file__).resolve().parents[1] / "worker" / "task.sh"
+    source = task_sh.read_text(encoding="utf-8")
+    assert "--json number,assignees,title,labels" in source, (
+        "task.sh потерял поле labels в gh issue list — фильтр needs-spec/blocked "
+        "в free_candidates молча не работает в проде"
+    )
+
+
 # ── (a) прод-форма: упоминание в прозе не делает задачу «объявленной» ──────────────
 
 

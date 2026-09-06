@@ -1161,6 +1161,137 @@ def test_route_to_needs_spec_idempotent_when_marker_already_posted(monkeypatch):
     assert not any(n == sch.WATCHDOG_ISSUE for n, _ in posted), "маркер уже стоит — повторно не шлём"
 
 
+# ── Ссылки на комментарии-вердикты в разборе кругов (design.md п.4, действие 3) ───
+# Прод-форма комментариев: гейт 2 — шапка фактов от доверенной учётки workflow
+# (review_labels.TRUSTED_VERDICT_LOGIN, build_comment в ai_review.py), гейт 1 —
+# тело от check_pr.py с маркером GATE1_VERDICT_PREFIX. Связь «метка → комментарий»
+# детерминирована порядком публикации одного job'а: метка ставится раньше
+# комментария (check_pr.py и ai_review.py::cmd_verdict — оба POST labels до
+# POST comments).
+
+
+def _ai_rework_comment(created_at: str, comment_id: str, login: str = "github-actions[bot]",
+                       user_type: str = "Bot", number: int = 451) -> dict:
+    return {
+        "created_at": created_at,
+        "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+        "user": {"login": login, "type": user_type},
+        "body": (f"pr: {number}\nhead: sha{number}\nreviewer: rework\ndiff: abc123def456\n\n"
+                 "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: rework.\n\n"
+                 "1. находка: пример"),
+    }
+
+
+def _gate1_comment(created_at: str, comment_id: str, number: int = 451) -> dict:
+    return {
+        "created_at": created_at,
+        "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "Ревью нашло замечания:\n- находка: пример гейта 1",
+    }
+
+
+def test_verdict_round_links_pairs_each_gate_to_its_own_comment():
+    events = [
+        {"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+         "label": {"name": "review:changes-requested"}},
+        {"event": "labeled", "created_at": "2026-09-01T13:00:00Z",
+         "label": {"name": "ai:changes-requested"}},
+    ]
+    comments = [
+        _gate1_comment("2026-09-01T12:00:07Z", "g1"),
+        _ai_rework_comment("2026-09-01T13:00:11Z", "g2"),
+    ]
+    links = sch.verdict_round_links(REPO, 451, events, comments)
+    assert links[0] and links[0].endswith("#issuecomment-g1")  # гейт 1 → маркер check_pr
+    assert links[1] and links[1].endswith("#issuecomment-g2")  # гейт 2 → AI-вердикт
+
+
+def test_verdict_round_links_gate2_never_links_gate1_or_forged_comment():
+    # ai:changes-requested не ссылается на комментарий гейта 1, а «вердикт» от
+    # посторонней учётки (дыра #294: шапку подделать можно, учётку — нет) —
+    # тем более; пары нет — честный промах, не выдуманная ссылка.
+    events = [{"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+               "label": {"name": "ai:changes-requested"}}]
+    comments = [
+        _gate1_comment("2026-09-01T12:00:05Z", "g1"),
+        _ai_rework_comment("2026-09-01T12:00:06Z", "fake",
+                           login="random-reader", user_type="User"),
+    ]
+    assert sch.verdict_round_links(REPO, 451, events, comments) == [None]
+
+
+def test_verdict_round_links_consumes_comment_once_in_order():
+    # Два круга в окне друг от друга и один комментарий: первый круг забирает
+    # вердикт, второму остаётся честное «не восстановлена» — ссылка не может
+    # задвоиться на один комментарий.
+    events = [
+        {"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+         "label": {"name": "ai:changes-requested"}},
+        {"event": "labeled", "created_at": "2026-09-01T12:01:00Z",
+         "label": {"name": "ai:changes-requested"}},
+    ]
+    comments = [_ai_rework_comment("2026-09-01T12:00:30Z", "only")]
+    links = sch.verdict_round_links(REPO, 451, events, comments)
+    assert links[0] and links[0].endswith("#issuecomment-only")
+    assert links[1] is None
+
+
+def test_verdict_round_links_window_miss_is_honest_none():
+    # Комментарий за пределами окна VERDICT_LINK_WINDOW_MINUTES после события —
+    # не пара (следующий круг ещё не значит «этот»): оба круга без ссылки.
+    events = [
+        {"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+         "label": {"name": "ai:changes-requested"}},
+        {"event": "labeled", "created_at": "2026-09-01T12:01:00Z",
+         "label": {"name": "ai:changes-requested"}},
+    ]
+    comments = [_ai_rework_comment("2026-09-01T12:20:00Z", "late")]
+    assert sch.verdict_round_links(REPO, 451, events, comments) == [None, None]
+
+
+def test_route_to_needs_spec_comment_carries_verdict_links(monkeypatch):
+    """Мутация на находку 2 ревью PR #408 (design.md п.4 действие 3 требовал
+    ссылок, код писал только дату и метку): разобрать комментарий-разбор —
+    без verdict_round_links/подстановки в текст он не содержит ни одной
+    ссылки-вердикта и честных приписок, тест краснеет."""
+    task = issue(470)
+    p = pull(471, labels=["review:ok", "ai:changes-requested"], pr_body="#470")
+    fake = FakeGh({
+        "issues/470/assignees": None,
+        "issues/470/labels": None,
+        "pulls/471": None,
+        "issues/471/timeline": [
+            {"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+             "label": {"name": "review:changes-requested"}},
+            {"event": "labeled", "created_at": "2026-09-01T13:00:00Z",
+             "label": {"name": "ai:changes-requested"}},
+            {"event": "labeled", "created_at": "2026-09-01T14:00:00Z",
+             "label": {"name": "ai:changes-requested"}},  # комментария нет — промах
+        ],
+        "issues/471/comments?per_page=100": [
+            _gate1_comment("2026-09-01T12:00:07Z", "g1", number=471),
+            _ai_rework_comment("2026-09-01T13:00:11Z", "g2", number=471),
+        ],
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    sch.route_to_needs_spec(REPO, task, p, 3, "метка ai:changes-requested")
+
+    breakdown = next(text for n, text in posted if n == 470 and "Бюджет реворка" in text)
+    assert "[вердикт](https://github.com/mytab0r/edge-harness/issues/471#issuecomment-g1)" in breakdown
+    assert "[вердикт](https://github.com/mytab0r/edge-harness/issues/471#issuecomment-g2)" in breakdown
+    assert "(ссылка на вердикт не восстановлена)" in breakdown  # третий круг — честный промах
+    # Комментарии прочитаны ОДИН раз на ссылки и выжимку (класс #443 —
+    # дублирующий постраничный обход того же эндпоинта не нужен).
+    assert sum(1 for c in fake.calls
+               if "issues/471/comments?per_page=100" in c) == 1
+
+
 def test_last_verdict_excerpt_pulls_real_ai_review_findings_not_header(monkeypatch):
     """Выжимка для эскалации — реальная прод-форма комментария AI-ревью
     (ai_review.build_comment, не наш пересказ формата): шапка pr:/head:/

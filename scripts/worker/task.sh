@@ -172,10 +172,10 @@ short_title() { # $1 — заголовок
 free_task() {
   local issues_file locked line rc
   issues_file="$WORK/pool-issues.json"
-  # labels — находка AI-ревью PR #471/#470: free_candidates фильтрует по
-  # waiting:owner (задача ждёт решения владельца, не должна стопорить весь
-  # диспатч как «старейшая свободная»), полю нужны сами метки, не только
-  # assignees.
+  # labels в списке полей ОБЯЗАТЕЛЕН: free_candidates фильтрует по меткам —
+  # needs-spec/blocked (task-rework-loop #256, design.md п.5) и waiting:owner
+  # (#470) — без поля фильтры молча мертвы в проде при зелёных тестах на fixture.
+  # Гвардия полноты списка: test_free_task.py::test_task_sh_passes_labels_field_to_free_task
   gh issue list --label task --state open --limit 100 --json number,assignees,title,labels \
     >"$issues_file" || return 2
   # Замок (в том числе ещё не собранный протухший) = задачу уже взял другой
