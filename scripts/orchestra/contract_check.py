@@ -43,7 +43,12 @@ _TR_SPEC.loader.exec_module(task_ref)
 
 # CONTRACT_FAILED_LABEL — одно место правды (review_labels.py, тот же приём,
 # что уже применён к CONFLICT_LABEL): раньше литерал "contract:failed" был
-# задублирован здесь дважды и ещё дважды в scheduler.py.
+# задублирован здесь дважды и ещё дважды в scheduler.py. Оттуда же —
+# идемпотентность комментария провала и константа заголовка (#203):
+# доверенный автор (_is_trusted_verdict_author), постраничный обход
+# (list_pages) и решение post/patch/none. contract_check уже читает общие
+# lib-модули (task_ref выше); scheduler.py ради одного имени сюда
+# по-прежнему не тащится.
 _RL_SPEC = importlib.util.spec_from_file_location(
     "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
@@ -138,8 +143,25 @@ def fail(messages: list[str], repo: str, pr_number: int) -> None:
     try:
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels",
                "-f", f"labels[]={review_labels.CONTRACT_FAILED_LABEL}")
-        body = "Контракт PR ↔ задача нарушен:" + "".join(f"\n- {m}" for m in messages)
-        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "-f", f"body={body}")
+        body = review_labels.CONTRACT_FAIL_HEADER + "".join(f"\n- {m}" for m in messages)
+        # Идемпотентность (#203): первый прогон с нарушением публикует
+        # комментарий, повторный с ТЕМ ЖЕ текстом — молчит (критерий
+        # приёмки: второго одинакового комментария не появляется),
+        # изменившийся текст нарушения — обновляет существующий комментарий,
+        # а не плодит цепочку дубликатов (#162 — 9, #173/#191 — по 3).
+        # Свой комментарий ищется только среди доверенных (github-actions[bot]
+        # — оба workflow с этим скриптом ходят под github.token): чужой
+        # комментарий с тем же текстом заглушкой не служит — публикуем свой.
+        existing = review_labels.latest_comment_by_header(
+            repo, pr_number, gh, review_labels.CONTRACT_FAIL_HEADER)
+        action = review_labels.comment_update_action(existing, body)
+        if action == "post":
+            run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments",
+                   "-f", f"body={body}")
+        elif action == "patch":
+            run_gh("api", "-X", "PATCH",
+                   f"repos/{repo}/issues/{pr_number}/comments/{existing['id']}",
+                   "-f", f"body={body}")
     except RuntimeError as error:
         print(f"contract: не смог оставить комментарий на PR: {error}")
     for message in messages:
