@@ -7,9 +7,11 @@
 // фабрики), INTEGRATIONS, module/exports (обёртка).
 //
 // Прецедент и приёмка формы — plugin-manager (#102): тот же списочный слот
-// settings.section, те же seed-модули (react, ui-primitives), сервисы
-// ctx.slots (dsh-client-runtime) и ctx.locale (dsh-client-locale) приходят
-// из dsh.client.inject package.json.
+// settings.section, те же seed-модули (react, ui-primitives). ctx.locale
+// (dsh-client-locale) объявлен в dsh.client.inject package.json; ctx.slots
+// в 0.11.1 приносит @deepseek-ai/dsh-client-ui-renderer, который package.json
+// не объявляет (тот же приём, что у апстримного ui-edge — см. комментарий
+// в src/body.js plugin-manager, issue #518).
 //
 // Секция показывает: что подключено (реестр), чей ключ (имена секретов с
 // описаниями — ЗНАЧЕНИЙ секретов не существует в реестре и в бандле), что
@@ -321,7 +323,8 @@ function IntegrationsSection(props) {
 
 // ── Монтаж ────────────────────────────────────────────────────────────────────
 // Сервисы ctx, без которых apply не имеет смысла: slots (реестр слотов) даёт
-// dsh-client-runtime, locale (словари) — dsh-client-locale.
+// dsh-client-ui-renderer (всегда в ростере, package.json это не объявляет),
+// locale (словари) — dsh-client-locale.
 const inject = ["slots", "locale"];
 
 function apply(ctx) {

@@ -106,10 +106,13 @@ PR в `dsh-edge/plugins.json` → деплой; прогресс — `plugin_sta
 (`window.__ModuleLoader__.load({ id: "<package>", factory })`, у фабрики
 экспортируются `inject` и `apply`). Модули берутся из seed-карты шелла
 (`react`, `@deepseek-ai/dsh-client-ui-primitives` — список зашит в
-`build.mjs` и проверяется при сборке), сервисы `ctx.slots`/`ctx.locale`
-приносят пакеты из `dsh.client.inject` (`dsh-client-runtime`,
-`dsh-client-locale`) — их assemble-standalone-web.mjs проверяет по ростеру
-и строит порядок загрузки.
+`build.mjs` и проверяется при сборке). Сервис `ctx.locale` приносит пакет
+из `dsh.client.inject` (`dsh-client-locale`) — assemble-standalone-web.mjs
+проверяет этот список по ростеру и строит порядок загрузки. `ctx.slots`
+package.json не декларирует: в апстриме 0.11.1 сервис "slots" приносит
+`@deepseek-ai/dsh-client-ui-renderer`, который всегда в reviewed-составе
+ростера (тот же приём, что у апстримного `ui-edge`) — до 0.10.0 его нёс
+убранный апстримом `dsh-client-runtime` (issue #518).
 
 Слот — `settings.section` (списочный), id `plugin-manager`, order 95, по
 образцу ui-edge. Словари регистрируются в namespace `settings.plugins`
