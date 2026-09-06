@@ -1634,11 +1634,16 @@ def verdict_round_links(repo: str, pr_number: int, events: list[dict],
     return links
 
 
-def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: str) -> str:
+def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: str,
+                        events: list[dict] | None = None) -> str:
     """Design.md task-rework-loop (#256), п.4: бюджет REWORK_BUDGET исчерпан
     вердиктом ревью (не красным чеком) — вместо возврата в пул задача уходит
     в needs-spec, PR закрывается (не сливается, не reopen — новый заход это
-    новый PR с чистым таймлайном, design.md п.2). Действия одной транзакцией
+    новый PR с чистым таймлайном, design.md п.2). `events` — круги реворка,
+    уже прочитанные вызывающим unhealthy_pulls (тот зовёт rework_events один
+    раз и для порога, и сюда; второй полный обход timeline — класс #443),
+    None — читать самому (прямые вызовы в тестах).
+    Действия одной транзакцией
     отчёта, как и остальные шаги unhealthy_pulls:
       1. снять assignee с issue (как и при обычном возврате в пул);
       2. поставить label needs-spec на issue;
@@ -1680,7 +1685,8 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
     # ровно до конца этого прогона.
     issue["labels"] = [*(issue.get("labels") or []),
                        {"name": review_labels.NEEDS_SPEC_LABEL}]
-    events = pulse_guard.rework_events(repo, pull["number"])
+    if events is None:
+        events = pulse_guard.rework_events(repo, pull["number"])
     # Комментарии PR читаются ОДИН раз на оба потребителя: ссылки кругов
     # (verdict_round_links) и выжимка последнего вердикта в эскалации
     # (last_verdict_excerpt) — тот же класс экономии, что #443, второй
@@ -1771,9 +1777,14 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
             if age < UNHEALTHY_PR_AFTER_MINUTES:
                 continue
             if _pr_unhealthy_reason_is_verdict(pull):
-                count = pulse_guard.rework_cycle_count(repo, pull["number"])
+                # rework_events читается ОДИН раз: len() — порог, сам список
+                # уезжает в route_to_needs_spec для разбора кругов (второй
+                # полный обход timeline — класс #443).
+                events = pulse_guard.rework_events(repo, pull["number"])
+                count = len(events)
                 if count >= pulse_guard.REWORK_BUDGET:
-                    lines.append(route_to_needs_spec(repo, issue, pull, count, reason))
+                    lines.append(route_to_needs_spec(
+                        repo, issue, pull, count, reason, events=events))
                     break
             who = ", ".join(a["login"] for a in issue["assignees"])
             gh(

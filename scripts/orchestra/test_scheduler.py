@@ -1013,6 +1013,9 @@ def test_unhealthy_pulls_routes_to_needs_spec_when_ai_budget_exhausted(monkeypat
     # эскалация — комментарий в WATCHDOG_ISSUE с маркером и номером задачи
     assert any(n == sch.WATCHDOG_ISSUE and sch.pulse_guard.NEEDS_SPEC_MARKER in text
                and "400" in text for n, text in posted)
+    # Таймлайн читается ОДИН раз на порог и разбор кругов (класс #443):
+    # unhealthy_pulls зовёт rework_events и передаёт список в route_to_needs_spec.
+    assert sum(1 for c in fake.calls if "issues/401/timeline" in c) == 1
 
 
 def test_unhealthy_pulls_routes_to_needs_spec_on_review_changes_requested_only(monkeypatch):
