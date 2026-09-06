@@ -263,6 +263,20 @@ FAILURE_WATCH_RUN_CONCLUSIONS = ("failure", "timed_out")
 # в наблюдении (тот же класс «не прятать хвост молча», что #308).
 FAILURE_WATCH_MAX_JOBS_PER_RUN = 3
 
+# Размер страницы опроса (один запрос на workflow, листания нет). 20 — запас,
+# чтобы клиентские фильтры не вытеснили свежий провал основного события за
+# страницу. orchestra.yml — ДВОЙНОЙ запас: единственный отслеживаемый workflow
+# с PR-триггером (job contract), а страница считается БЕЗОТНОСИТЕЛЬНО окна —
+# 20 новейших завершённых; при merge-шторме красных contract-прогонов бывает
+# больше 20 за окно (замер ревью PR #488, раунд 4: 11 за 42 минуты, 2026-09-06),
+# и свежий schedule-провал ушёл бы за страницу молча, без наблюдения.
+FAILURE_WATCH_PER_PAGE = 20
+FAILURE_WATCH_PER_PAGE_BY_WORKFLOW = {"orchestra.yml": 100}
+
+
+def _failure_watch_per_page(workflow: str) -> int:
+    return FAILURE_WATCH_PER_PAGE_BY_WORKFLOW.get(workflow, FAILURE_WATCH_PER_PAGE)
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
@@ -1220,9 +1234,12 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
     Окно свежести измеряется от updated_at (момент провала), не от created_at
     (момент постановки в очередь) — иначе провалы долгих прогонов (worker.yml
     пашет десятки минут по замыслу) лежат вне окна на каждом пульсе. Реран
-    старого прогона обновляет updated_at — прогон снова «свежий»; повторного
-    сигнала/задачи это не даёт: дедуп по отпечатку класса смотрит на открытую
-    задачу (defect) или маркер в #120 (infra), не на свежесть."""
+    старого прогона обновляет updated_at — прогон снова «свежий», ПОКА задача
+    класса открыта (defect) или маркер в #120 стоит (infra) повторного
+    сигнала/задачи это не даёт: дедуп смотрит на них, не на свежесть. После
+    закрытия задачи реран в окне заведёт новую задачу на ту же причину — это
+    не бесконечный цикл, а переоткрытие эпизода с ограничителем-окном:
+    причина снова красит свежий прогон, значит снова требует разбора."""
     observations: list[str] = []
     actions: list[str] = []
     ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
@@ -1233,8 +1250,11 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             # не возвращает timed_out — провал по собственному капу остался бы
             # неразобранным (находка ревью PR #488, раунд 3); вывод
             # фильтруется клиентским списком FAILURE_WATCH_RUN_CONCLUSIONS.
+            # Размер страницы — FAILURE_WATCH_PER_PAGE, для orchestra.yml —
+            # больше (см. комментарий у константы).
             payload = gh(
-                f"repos/{repo}/actions/workflows/{workflow}/runs?status=completed&per_page=20"
+                f"repos/{repo}/actions/workflows/{workflow}"
+                f"/runs?status=completed&per_page={_failure_watch_per_page(workflow)}"
             ) or {}
         except RuntimeError as error:
             observations.append(f"⚠️ failure-watch {workflow}: список провалов не прочитан ({error})")
@@ -1244,12 +1264,12 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         # докстринг) — вычитается ДО окна свежести. Фильтр клиентский, не
         # серверный `event=`: у API нет «не равно», а перебор легитимных
         # событий — по запросу на каждое событие каждого workflow против одной
-        # страницы здесь. per_page=20 — запас, чтобы клиентские фильтры
+        # страницы здесь. Страница — запас, чтобы клиентские фильтры
         # (PR-прогоны, отменённые) не вытеснили свежий провал основного
         # события за страницу: PR-триггер среди отслеживаемых есть только у
-        # orchestra.yml (job contract), двадцати завершённых прогонов за окно
-        # свежести не бывает; потеря хвоста за страницей стоит не дороже окна
-        # ниже — вне окна разбор и так не идёт.
+        # orchestra.yml, и у него страница больше (см. константы); потеря
+        # хвоста за страницей стоит не дороже окна ниже — вне окна разбор
+        # и так не идёт.
         runs = [r for r in runs if r.get("event") != "pull_request"]
         runs = [r for r in runs if r.get("conclusion") in FAILURE_WATCH_RUN_CONCLUSIONS]
         # Окно свежести (находка ревью PR #488): провал старше окна уже не

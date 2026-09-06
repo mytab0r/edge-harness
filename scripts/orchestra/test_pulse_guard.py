@@ -1553,6 +1553,26 @@ def test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest(monkeypatch):
     assert f"job-{pg.FAILURE_WATCH_MAX_JOBS_PER_RUN}" in hidden_line
 
 
+def test_failure_watch_per_page_bigger_for_pr_triggered_workflow(monkeypatch):
+    # Замер ревью PR #488 (раунд 4): страница считается безотносительно окна,
+    # а красных PR-контрактных прогонов orchestra.yml при merge-шторме бывает
+    # >20 за окно (11 за 42 мин) — свежий schedule-провал вытеснялся за
+    # страницу молча. orchestra.yml — единственный отслеживаемый с PR-триггером,
+    # у него страница FAILURE_WATCH_PER_PAGE_BY_WORKFLOW (100), у остальных —
+    # FAILURE_WATCH_PER_PAGE (20). Тот же ОДИН запрос на workflow.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    pg.failure_watch("mytab0r/edge-harness", NOW)
+    by_workflow = {
+        url.split("/workflows/")[1].split("/runs")[0]: url
+        for url in fake.calls
+        if "runs?status=completed" in url
+    }
+    assert "per_page=100" in by_workflow["orchestra.yml"]
+    assert "per_page=20" in by_workflow["worker.yml"]
+
+
 def test_failure_watch_jobs_request_failure_is_named_observation(monkeypatch):
     # Свод источников (failing_jobs) сделал сбой запроса громким: «job'ы не
     # прочитаны» и «упавших job'ов нет» — разные факты, разные наблюдения;
