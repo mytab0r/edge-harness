@@ -189,14 +189,14 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   `dsh-host-apiproxy`, `dsh-session-title*` 0.1.1-rc.2 (types и lib).
 - `apps/dsh-edge/src/{index,instance,session-store,http,auth,edge-api}.ts`
   на пине 113a969; `standalone/patches/audit.json`.
-- Память раннера vs облака — два разных, не смёрженных на момент написания
-  change (проверить актуальность ссылок при их archive): `openspec/changes/
-  task-rework-loop/design.md` раздел 3 (Развилка), п. (а) — почему
-  резюме DSH-агента недоступно (сериализуется только сессионный лог на
-  диске раннера, раннер эфемерный, ветка `agent/256-task-rework-loop`, PR
-  #260, не смёржено на момент написания); `openspec/changes/
-  cloud-orchestrator-convergence/design.md` раздел "Развилка 1", условие
-  пересмотра A→C — почему память НЕ требует денег (dsh-edge хранит историю
-  сессий в Durable Object с SQLite уже сегодня, бесплатно, ветка
-  `agent/258-cloud-orchestrator-convergence`, PR #262, не смёржено на
-  момент написания).
+- Память раннера vs облака — два разных источника:
+  `openspec/changes/task-rework-loop/design.md` раздел 3 (Развилка), п. (а) —
+  почему резюме DSH-агента недоступно (сериализуется только сессионный лог
+  на диске раннера, раннер эфемерный; PR #260, слит); PR #262 (ветка
+  `agent/258-cloud-orchestrator-convergence`, design.md раздел «Развилка 1»,
+  условие пересмотра A→C) — почему память НЕ требует денег (dsh-edge хранит
+  историю сессий в Durable Object с SQLite уже сегодня, бесплатно). #262 НЕ
+  смёржен на момент написания — локатор здесь намеренно номер PR/ветки, не
+  репозиторный путь: `openspec/changes/cloud-orchestrator-convergence/`
+  ещё нет в дереве, а после мержа и архивации change'а путь снова переедет —
+  замени на актуальный адрес, когда он появится.
