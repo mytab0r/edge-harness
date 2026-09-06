@@ -8,6 +8,24 @@
 # отчитаться (комментарий в задачу + Telegram). Работу над задачей делает
 # DSH — этот скрипт за него ничего не решает и не пишет.
 #
+# Ретрай временного RATE_LIMIT провайдера (#422, механизм #419/#421 —
+# dsh_run_with_retry в lib/dsh-ci.sh): живой факт — прогоны worker.yml
+# 34007508064/34006554580 упали с «dsh: RATE_LIMIT: Rate limit reached for
+# requests», раньше, чем ретрай вообще появился (тогда — только у ai-review).
+# Бюджет ожидания WORKER_RATE_LIMIT_MAX_WAIT_SECS (по умолчанию 1800с/30 мин —
+# та же длительность короткого окна провайдера, что и у ai-review: она не
+# зависит от вызывающего канала) подобран под ОДИН прогон DSH_TIMEOUT_SECS
+# (150 мин): реалистичный случай — первая попытка падает СРАЗУ (провайдер
+# отклоняет самый первый вызов модели), не после долгой работы, поэтому
+# бюджета хватает без риска упереться в 6-часовой потолок job'а (см.
+# worker.yml timeout-minutes). Патологический случай «упало после 140 минут
+# работы» теоретически возможен и не решён здесь (тот же непокрытый класс уже
+# принят в #421 для ai-review) — задокументирован, не тихо проигнорирован.
+# quota_exhausted (недельная/месячная квота) и rate_limit_retry_budget_exceeded
+# (бюджет короткого окна кончился) — обе причины возвращают задачу в пул СРАЗУ
+# (lease_cli release-full, #422), не дожидаясь 24-часового TTL-сборщика: вина
+# не в задаче, держать assignee до таймера — зря прятать её от других каналов.
+#
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
 #   task.sh --task 89     — выполнить конкретную задачу (если она открыта и свободна)
@@ -15,7 +33,9 @@
 #                           ничего не назначая, не запуская и не отправляя
 #
 # Итог запуска: PR открыт → job зелёный; эскалация (метка blocked) → зелёный;
-# иначе (нет PR) → job красный. Нет свободных задач → зелёный без действий.
+# провайдер в лимите/квоте надолго → job красный, но задача честно возвращена
+# в пул (не «воркер не справился» — вина не его); иначе (нет PR, реальный
+# сбой) → job красный. Нет свободных задач → зелёный без действий.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -33,6 +53,11 @@ source "$SCRIPT_DIR/../lib/lease.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
+# Бюджет ретрая временного RATE_LIMIT (#422) — суммарно, не на попытку;
+# обоснование значений — комментарий в шапке файла.
+WORKER_RATE_LIMIT_MAX_WAIT_SECS="${WORKER_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+WORKER_RATE_LIMIT_INITIAL_DELAY_SECS="${WORKER_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
+WORKER_RATE_LIMIT_MAX_DELAY_SECS="${WORKER_RATE_LIMIT_MAX_DELAY_SECS:-300}"
 # Профиль headless — pnpm-workspace: инициализация делает pnpm add в корень
 # профиля. Без этого флага — ERR_PNPM_ADDING_TO_ROOT (#93/#94); фикс обязан
 # быть в ОБЕИХ транспортных обёртках (worker task.sh и hands dsh_task.sh):
@@ -390,11 +415,13 @@ SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (д�
 rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 export HANDS_SPOOL="$SPOOL_FILE"
 dsh_edge_start_drain
-set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$PROMPT_FILE")" \
-  >"$ANSWER_FILE" 2>"$ERR_FILE"
-rc=$?
-set -e
+WORKER_TASK_FAILURE_REASON=""
+DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
+DSH_RATE_LIMIT_MAX_DELAY_SECS="$WORKER_RATE_LIMIT_MAX_DELAY_SECS" \
+  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
+rc=$DSH_RUN_RC
+WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 echo "dsh завершился с кодом $rc"
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
@@ -468,6 +495,48 @@ COMMENT
   telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
+fi
+
+# Провайдер в лимите (#422) — не сбой агента: сообщение и Telegram обязаны
+# звучать иначе, чем «воркер не справился» (правило AGENTS.md — «возможности
+# нет» и «возможность есть, но сломана» лечатся по-разному), а задача обязана
+# вернуться в пул СРАЗУ (снять и замок, и назначение), не ждать 24-часовой
+# TTL-сборщик — вина не в задаче, держать её занятой зря.
+if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; then
+  if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ]; then
+    reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)"
+  else
+    reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)"
+  fi
+  release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
+  if [ "$release_rc" -eq 0 ]; then
+    echo "Провайдер в лимите — задача #$number возвращена в пул немедленно: $release_out"
+    release_note="Задача возвращена в пул немедленно — снят и замок, и назначение ($release_out)."
+  else
+    echo "::warning::задача #$number не возвращена в пул (rc=$release_rc): $release_out — снимет TTL-сборщик через 24 ч"
+    release_note="Возврат в пул не подтверждён (см. лог job'а) — снимет TTL-сборщик через 24 ч."
+  fi
+  comment=$(cat <<COMMENT
+🤖 Автономный воркер остановлен провайдером, не своей ошибкой: $reason.
+$release_note Хвосты логов ниже (секреты замаскированы).
+
+Хвост stderr DSH:
+
+~~~~
+$ERR_TAIL
+~~~~
+
+Хвост ответа DSH:
+
+~~~~
+$ANSWER_TAIL
+~~~~
+COMMENT
+  )
+  gh issue comment "$number" --body "$comment" >/dev/null
+  telegram_report "worker: задача #$number — провайдер в лимите, не сбой агента ($reason). Задача возвращена в пул" || true
+  die "Провайдер в лимите: $reason"
 fi
 
 reason="dsh завершился с кодом $rc без открытого PR"

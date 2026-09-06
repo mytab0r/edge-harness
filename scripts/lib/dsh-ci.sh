@@ -104,3 +104,78 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
     maxTokens: $DSH_MAX_TOKENS
 PATCH
 }
+
+# Ретрай временного RATE_LIMIT провайдера вокруг ОДНОГО прогона dsh (#422,
+# наследует механизм #419/#421 — там он появился только у ai-review, хотя
+# первым от лимита падает автономный воркер: живой факт — прогоны worker.yml
+# 34007508064/34006554580 упали с «dsh: RATE_LIMIT: Rate limit reached for
+# requests», ai-review в тот момент ретраить ещё не умел вовсе). Единственное
+# место правды: ai_dsh.sh (ревью), worker/task.sh, hands/dsh_task.sh зовут эту
+# функцию вместо копии цикла — три расходящиеся копии дороже одной.
+#
+# Классификация по тексту stderr (docs/runbooks/switch-llm-provider.md):
+#   «RATE_LIMIT: Weekly/Monthly Limit Exhausted…» — квота на дни, ретраить
+#     внутри прогона бессмысленно — падаем сразу (failure_reason=quota_exhausted).
+#   «RATE_LIMIT: …» без этой формы — короткое окно, снимается ожиданием:
+#     экспоненциальная пауза с потолком и общим бюджетом ожидания.
+#   Нет строки RATE_LIMIT вовсе — настоящая ошибка (ключ/модель/битый
+#     запрос/сеть) — падаем сразу, как и раньше.
+#
+# Использование:
+#   dsh_run_with_retry <answer_file> <err_file> <prompt_text>
+# Настройки — через env (у каждого вызывающего свой бюджет и обоснование,
+# см. worker.yml/hands.yml/ai-review.yml):
+#   DSH_TIMEOUT_SECS               — таймаут КАЖДОЙ попытки (вызывающий уже задаёт)
+#   DSH_RATE_LIMIT_MAX_WAIT_SECS   — суммарный бюджет ожидания (по умолчанию 1800 — 30 мин)
+#   DSH_RATE_LIMIT_INITIAL_DELAY_SECS / DSH_RATE_LIMIT_MAX_DELAY_SECS — старт/потолок паузы
+# Результат (переменные, не stdout — вызывающий печатает свой отчёт):
+#   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки dsh
+#   DSH_RUN_FAILURE_REASON  — "" (успех/обычный транспортный отказ) |
+#                             quota_exhausted | rate_limit_retry_budget_exceeded
+dsh_run_with_retry() { # answer_file err_file prompt_text
+  local answer_file=$1 err_file=$2 prompt_text=$3
+  local max_wait="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+  local delay="${DSH_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
+  local max_delay="${DSH_RATE_LIMIT_MAX_DELAY_SECS:-300}"
+  local timeout_secs="${DSH_TIMEOUT_SECS:-3600}"
+  local waited=0 attempt=1 wait_left rc
+  DSH_RUN_FAILURE_REASON=""
+  while :; do
+    echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
+    set +e
+    timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
+      >"$answer_file" 2>"$err_file"
+    rc=$?
+    set -e
+    echo "dsh завершился с кодом $rc (попытка $attempt)"
+
+    [ "$rc" -eq 0 ] && break
+
+    if grep -q 'RATE_LIMIT: Weekly/Monthly Limit Exhausted' "$err_file"; then
+      DSH_RUN_FAILURE_REASON="quota_exhausted"
+      echo "::warning::квота провайдера исчерпана надолго (Weekly/Monthly) — повтор внутри прогона бессмысленен, падаю сразу (docs/runbooks/switch-llm-provider.md)"
+      break
+    fi
+
+    if ! grep -q 'RATE_LIMIT:' "$err_file"; then
+      # Настоящая ошибка провайдера/транспорта (ключ, модель, битый запрос,
+      # сеть) — ждать её повтором нет смысла, падаем сразу, как и раньше.
+      break
+    fi
+
+    wait_left=$((max_wait - waited))
+    if [ "$wait_left" -le 0 ]; then
+      DSH_RUN_FAILURE_REASON="rate_limit_retry_budget_exceeded"
+      echo "::warning::бюджет ожидания временного RATE_LIMIT (${max_wait}с) исчерпан — сдаюсь"
+      break
+    fi
+    [ "$delay" -gt "$wait_left" ] && delay=$wait_left
+    echo "::warning::временный RATE_LIMIT провайдера — жду ${delay}с и повторяю (в сумме ждал ${waited}с)"
+    sleep "$delay"
+    waited=$((waited + delay))
+    delay=$((delay * 2))
+    [ "$delay" -gt "$max_delay" ] && delay=$max_delay
+    attempt=$((attempt + 1))
+  done
+  DSH_RUN_RC=$rc
+}

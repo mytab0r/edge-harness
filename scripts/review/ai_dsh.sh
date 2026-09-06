@@ -11,11 +11,12 @@
 # *TOKEN*/*KEY*/*SECRET* из model-shell вызовов — агент и его не видит
 # (проверено живым прогоном 2026-08-30, см. worker.yml).
 #
-# Ретрай на временный RATE_LIMIT провайдера (#419): живой случай — прогон
-# worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate limit reached for
-# requests» из-за квоты, съеденной параллельными ai-review. Job живёт до
-# 6 часов (docs/research/21-github-actions.md) — ждать есть чем, но не
-# бесконечно и не всегда: docs/runbooks/switch-llm-provider.md различает
+# Ретрай на временный RATE_LIMIT провайдера (#419, механизм теперь общий с
+# worker/hands — #422, вынесен в dsh_run_with_retry в lib/dsh-ci.sh): живой
+# случай — прогон worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate limit
+# reached for requests» из-за квоты, съеденной параллельными ai-review. Job
+# живёт до 6 часов (docs/research/21-github-actions.md) — ждать есть чем, но
+# не бесконечно и не всегда: docs/runbooks/switch-llm-provider.md различает
 # два признака RATE_LIMIT в stderr dsh —
 #   «RATE_LIMIT: Weekly/Monthly Limit Exhausted…» — недельная/месячная
 #     квота, сброс через дни; ждать внутри одного прогона бессмысленно —
@@ -30,6 +31,11 @@
 # (шаг «Ответ ревью») и передаёт в ai_review.py verdict --failure-reason:
 # различает в тексте вердикта «возможности нет» (лимит) от «возможность
 # есть, но сломана» (реальная ошибка) — правило AGENTS.md.
+#
+# Имена ручек ретрая (AI_REVIEW_RATE_LIMIT_*) — публичный контракт этого
+# скрипта (используется dsh-clients.smoke.sh), поэтому остаются как есть и
+# просто транслируются в универсальные ручки dsh_run_with_retry ниже —
+# смена имени сломала бы внешний вызывающий тест, а не только внутренний код.
 #
 # Использование: AI_WORK=<каталог с prompt.md> bash scripts/review/ai_dsh.sh
 # Результат: $AI_WORK/answer.txt (ответ последней попытки), $AI_WORK/
@@ -70,46 +76,14 @@ dsh_patch_profile headless
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
-waited=0
-delay=$AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS
-attempt=1
-while :; do
-  echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS}с)"
-  set +e
-  timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$AI_WORK/prompt.md")" \
-    >"$AI_WORK/answer.txt" 2>"$AI_WORK/stderr.txt"
-  rc=$?
-  set -e
-  echo "dsh завершился с кодом $rc (попытка $attempt)"
-
-  [ "$rc" -eq 0 ] && break
-
-  if grep -q 'RATE_LIMIT: Weekly/Monthly Limit Exhausted' "$AI_WORK/stderr.txt"; then
-    printf '%s' "quota_exhausted" >"$AI_WORK/failure_reason.txt"
-    echo "::warning::квота провайдера исчерпана надолго (Weekly/Monthly) — повтор внутри прогона бессмысленен, падаю сразу (docs/runbooks/switch-llm-provider.md)"
-    break
-  fi
-
-  if ! grep -q 'RATE_LIMIT:' "$AI_WORK/stderr.txt"; then
-    # Настоящая ошибка провайдера/транспорта (ключ, модель, битый запрос,
-    # сеть) — ждать её повтором нет смысла, падаем сразу, как и раньше.
-    break
-  fi
-
-  wait_left=$((AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS - waited))
-  if [ "$wait_left" -le 0 ]; then
-    printf '%s' "rate_limit_retry_budget_exceeded" >"$AI_WORK/failure_reason.txt"
-    echo "::warning::бюджет ожидания временного RATE_LIMIT (${AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS}с) исчерпан — сдаюсь"
-    break
-  fi
-  [ "$delay" -gt "$wait_left" ] && delay=$wait_left
-  echo "::warning::временный RATE_LIMIT провайдера — жду ${delay}с и повторяю (в сумме ждал ${waited}с)"
-  sleep "$delay"
-  waited=$((waited + delay))
-  delay=$((delay * 2))
-  [ "$delay" -gt "$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS" ] && delay=$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS
-  attempt=$((attempt + 1))
-done
+DSH_RATE_LIMIT_MAX_WAIT_SECS="$AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS" \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS" \
+DSH_RATE_LIMIT_MAX_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS" \
+  dsh_run_with_retry "$AI_WORK/answer.txt" "$AI_WORK/stderr.txt" "$(cat "$AI_WORK/prompt.md")"
+rc=$DSH_RUN_RC
+if [ -n "$DSH_RUN_FAILURE_REASON" ]; then
+  printf '%s' "$DSH_RUN_FAILURE_REASON" >"$AI_WORK/failure_reason.txt"
+fi
 
 printf '%s' "$rc" >"$AI_WORK/dsh_rc.txt"
 
