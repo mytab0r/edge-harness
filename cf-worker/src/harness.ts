@@ -126,7 +126,8 @@ const SCHEMA = [
 /**
  * Ретеншн (#306/#305): одна таблица конфигурации вместо трёх похожих методов —
  * добавить/поменять политику для очередной таблицы (например `messages`, когда
- * инбокс #20/PR #173 сольётся) значит дописать строку сюда, а не новый код.
+ * #305 решит возрастную политику по классам сообщений) значит дописать строку
+ * сюда, а не новый код.
  * `DELETE ... WHERE id IN (SELECT id FROM ... WHERE cond LIMIT ?)` — портируемая
  * форма пакетного удаления: DO SQLite нигде не документирует сборку с
  * SQLITE_ENABLE_UPDATE_DELETE_LIMIT, а вложенный SELECT с LIMIT работает в любой
@@ -1163,9 +1164,23 @@ export class Harness extends DurableObject<Env> {
    * ~15 мин — счётчик в памяти обнулялся бы почти на каждом тике, и
    * retentionBacklog() не срабатывал бы практически никогда (fail loud
    * канал спеки 14.6 молча не работал бы). Тот же приём, что у pulse (#269).
+   *
+   * Чтение streak и финальная запись `retention_state` — тоже в своих
+   * try/catch (находка ревью PR #329): это отдельные SQL-вызовы вне цикла по
+   * таблицам, и при исчерпании квоты rows_read/rows_written (#320) они падают
+   * так же, как DELETE внутри цикла. Без обёртки исключение уходило бы навылет
+   * из alarm() и срывало dispatch/self-update ниже по той же функции — ровно
+   * тот класс, который #321 уже закрыл для инбокса/dispatch.
    */
   #pruneRetention(now: number): void {
-    const streakBefore = this.#getRetentionStreak();
+    let streakBefore = 0;
+    try {
+      streakBefore = this.#getRetentionStreak();
+    } catch (error) {
+      console.error(
+        `retention prune: чтение streak упало: ${error instanceof Error ? error.message : error}`,
+      );
+    }
     let full = false;
     const pruned: Record<string, number> = {};
     for (const table of RETENTION_TABLES) {
@@ -1182,13 +1197,21 @@ export class Harness extends DurableObject<Env> {
       }
     }
     const streak = full ? streakBefore + 1 : 0;
-    this.#sql.exec(
-      `INSERT INTO retention_state (id, ts, pruned, streak) VALUES (1, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, pruned = excluded.pruned, streak = excluded.streak`,
-      now,
-      JSON.stringify(pruned),
-      streak,
-    );
+    try {
+      this.#sql.exec(
+        `INSERT INTO retention_state (id, ts, pruned, streak) VALUES (1, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, pruned = excluded.pruned, streak = excluded.streak`,
+        now,
+        JSON.stringify(pruned),
+        streak,
+      );
+    } catch (error) {
+      // Таблицы уже почищены (циклом выше) даже если запись состояния не
+      // удалась — backlog-счётчик просто не продвинется на этом тике.
+      console.error(
+        `retention prune: запись retention_state упала: ${error instanceof Error ? error.message : error}`,
+      );
+    }
   }
 
   /** Streak подряд идущих полных/упавших тиков ретеншена — единственное место
