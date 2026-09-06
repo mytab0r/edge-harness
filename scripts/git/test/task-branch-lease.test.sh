@@ -195,7 +195,10 @@ done
 safe_path="${safe_path#:}"
 shim4="$TMP/shim-no-gh"
 mkdir -p "$shim4"
-for tool in git grep sed cut mktemp cat rm dirname; do
+# env — тоже сюда: safe_path вычёркивает /usr/bin целиком (там на GitHub-раннере
+# лежит и gh, и env) — без своей копии сам `env -u ...` ниже не резолвится
+# («env: command not found»), симулируя не «офлайн», а сломанный тест.
+for tool in git grep sed cut mktemp cat rm dirname env; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [ -n "$tool_path" ] || fail "сценарий 4: инструмент $tool не найден в окружении теста"
   ln -sf "$tool_path" "$shim4/$tool"
