@@ -1,8 +1,10 @@
 # plugin-manager — раздел «Плагины» в настройках морды
 
 Клиентский плагин `@edge-harness/dsh-plugin-manager` (задача #102, заказ
-установки — #113): секция **Settings → Плагины** в ростере dsh-edge.
-Клиент-only: `server: false`, `client: true` в
+установки — #113): секция **Settings → Harness Plugins** в ростере dsh-edge
+(видимый текст — не голое «Plugins»: апстрим 0.11.0 занял это имя своим
+разделом Plugin inventory, коллизия найдена и снята #518). Клиент-only:
+`server: false`, `client: true` в
 [`dsh-edge/plugins.json`](../../dsh-edge/plugins.json).
 
 Состав секции:

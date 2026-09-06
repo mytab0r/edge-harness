@@ -278,10 +278,18 @@ function statusView(t, data, noEventsText) {
 // Набор ключей одинаков во всех локалях; zh — по конвенции апстрима источник
 // набора, en и ru с ним сверены. ru — для владельца, если локаль морды когда-
 // нибудь получит ru (каталог Language row сейчас en/zh).
+// nav/title — "Harness Plugins" (issue #518), не голое "Plugins": апстрим
+// 0.11.0 добавил СВОЙ раздел настроек «Plugins» (Plugin inventory,
+// @deepseek-ai/dsh-client-ui-settings-plugins, changelog 0.11.0 #137) — два
+// пункта навигации с одинаковым видимым текстом (найдено e2e-смоуком #502:
+// Playwright locator упал с «strict mode violation… resolved to 2 elements»,
+// живой владелец видел бы то же самое — два неразличимых пункта меню).
+// Коллизия наша (наш раздел старше апстримного одноимённого), апстрим не
+// виноват; уникальный текст решает и для человека, и для локатора.
 const dictionaries = {
   en: {
-    nav: "Plugins",
-    title: "Plugins",
+    nav: "Harness Plugins",
+    title: "Harness Plugins",
     intro: "Harness plugins installed from the release manifest.",
     flagServer: "server",
     flagClient: "client",
@@ -307,8 +315,8 @@ const dictionaries = {
     dedupError: "Cannot check for duplicate orders",
   },
   zh: {
-    nav: "插件",
-    title: "插件",
+    nav: "Harness 插件",
+    title: "Harness 插件",
     intro: "从发布清单安装的 harness 插件。",
     flagServer: "服务端",
     flagClient: "客户端",
@@ -334,8 +342,8 @@ const dictionaries = {
     dedupError: "无法检查重复订单",
   },
   ru: {
-    nav: "Плагины",
-    title: "Плагины",
+    nav: "Плагины харнеса",
+    title: "Плагины харнеса",
     intro: "Плагины харнеса, установленные из релизного манифеста.",
     flagServer: "сервер",
     flagClient: "клиент",
