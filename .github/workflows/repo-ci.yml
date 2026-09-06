@@ -300,6 +300,17 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/review/test_check_pr.py -q
 
+      # Триггерная проводка обоих гейтов (#208): класс «ботовский update-branch
+      # снёс свежий ai:ok, а второй гейт сам не перезапустился» закрыт связкой
+      # pr-review: synchronize → workflow_run(pr-review, completed) → ai-review.
+      # Эти блоки YAML не читает ни один скрипт — их читает только GitHub, поэтому
+      # снять любое звено можно молча для всех юнит-тестов; гвардия краснеет при
+      # правке триггеров, а не при первом живом инциденте.
+      - name: Гвардия триггеров гейтов ревью (#208)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_gate_triggers.py -q
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24
