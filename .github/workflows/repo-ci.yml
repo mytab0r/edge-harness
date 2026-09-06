@@ -585,3 +585,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/orchestra/repo_invariants.py
+
+  # Инвариант 4 (#244) — автофикс НА ВХОДЕ, не гейт постфактум (issue #493).
+  # Замер 2026-09-06 06:00-12:00 UTC: 5 падений job `test` подряд красили
+  # ЧУЖИЕ PR состоянием main (openspec/changes/<id> с полностью отмеченным
+  # tasks.md, не перенесённый в archive/ — ручной шаг, забытый агентом).
+  # Только pull_request: прямой пуш в main отклоняется защитой (AGENTS.md,
+  # «Прямой пуш в main не проходит обязательные проверки») — эта job чинит
+  # ветку PR, где чекбоксы дозакрылись, ДО того как состояние долетит до
+  # main. github.token не подходит: пуш от github-actions[bot] не зажигает
+  # новый workflow-run (антирекурсия GitHub) — ветка осталась бы с фиксом, но
+  # БЕЗ статуса test/contract на новом коммите, required checks зависли бы в
+  # Expected. secrets.GH_PIPELINE_PAT (широкий PAT владельца — тот же, что
+  # worker.yml/orchestra.yml, реестр PIPELINE_CONSUMERS,
+  # scripts/lib/test_dispatch_token_usage.py) пушит реальным аккаунтом —
+  # required-проверки перезапускаются на свежем коммите штатно.
+  archive-fixup:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GH_PIPELINE_PAT }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Автоархивация openspec/changes с полностью выполненным tasks.md (#493)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: python scripts/orchestra/archive_complete_changes.py
