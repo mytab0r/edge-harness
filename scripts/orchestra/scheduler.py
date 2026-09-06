@@ -3340,7 +3340,7 @@ def main() -> int:
 
     # Гвардия непрочитанных провалов ключевых workflow (#477): рядом с
     # heartbeat_check — тот же «до всей остальной работы» довод, дешёвый
-    # запрос (status=failure, малый per_page), не блокирует остальной пульс.
+    # запрос (status=completed, малый per_page), не блокирует остальной пульс.
     failure_watch_observations, failure_watch_actions = failure_watch(repo, now)
 
     # Дрейф пина апстрима (#134): релиз новее пина source-build морды кричит
