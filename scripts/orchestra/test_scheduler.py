@@ -3117,6 +3117,94 @@ def test_accept_merged_tasks_does_not_close_on_red_check_run(monkeypatch):
     assert posted and "test" in posted[0][1]
 
 
+def test_latest_check_runs_keeps_newest_attempt_per_name():
+    """Прод-форма (#467, PR #437, задача #432): `contract` на одном head sha —
+    первая попытка failure 04:02:20Z, rerun success 04:03:39Z. Доказательство,
+    что дедуп берёт именно вторую (свежую), а не первую по порядку в ответе."""
+    runs = [
+        {"name": "contract", "conclusion": "failure", "started_at": "2026-09-06T04:02:15Z"},
+        {"name": "test", "conclusion": "success", "started_at": "2026-09-06T04:02:15Z"},
+        {"name": "contract", "conclusion": "success", "started_at": "2026-09-06T04:03:33Z"},
+    ]
+    latest = sch.latest_check_runs(runs)
+    by_name = {run["name"]: run["conclusion"] for run in latest}
+    assert by_name == {"contract": "success", "test": "success"}
+
+
+def test_bad_check_names_ignores_stale_failed_rerun():
+    """Мутация: без дедупа (см. соседний тест) bad_check_names нашла бы
+    старую failure-попытку contract и покрасила бы её в список — с дедупом
+    список пуст, потому что АКТУАЛЬНОЕ состояние contract зелёное."""
+    runs = [
+        {"name": "contract", "conclusion": "failure", "started_at": "2026-09-06T04:02:15Z"},
+        {"name": "contract", "conclusion": "success", "started_at": "2026-09-06T04:03:33Z"},
+    ]
+    assert sch.bad_check_names(runs) == []
+
+
+def test_accept_merged_tasks_closes_when_stale_rerun_failure_superseded_by_success(monkeypatch):
+    """Живой случай #467 (PR #437, задача #432): без дедупа приёмка находила
+    старую упавшую попытку contract и писала «результат не достигнут», хотя
+    PR к моменту прогона приёмки уже был зелёным и слитым."""
+    runs_with_stale_failure = {"check_runs": [
+        {"name": "CodeQL", "conclusion": "success", "started_at": "2026-09-06T04:02:15Z", "status": "completed"},
+        {"name": "contract", "conclusion": "failure", "started_at": "2026-09-06T04:02:15Z", "status": "completed"},
+        {"name": "test", "conclusion": "success", "started_at": "2026-09-06T04:02:15Z", "status": "completed"},
+        {"name": "contract", "conclusion": "success", "started_at": "2026-09-06T04:03:33Z", "status": "completed"},
+    ]}
+    fake = FakeGh({
+        "pulls/138/files": files_payload(PR_138_FILES),
+        "issues/18/comments": [],
+        "issues/18 -f state=closed": None,
+        f"commits/{PR138['head']['sha']}/check-runs?per_page=100": runs_with_stale_failure,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    pool = [issue(18, assignees=("mytab0r",))]
+    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+
+    assert hard_failure is False
+    assert any("закрыта приёмкой" in line and "#18" in line for line in (observations + actions))
+
+
+def test_script_evidence_pending_when_latest_attempt_still_running(monkeypatch):
+    """#467, AGENTS.md «fail loud, не silent-wrong»: чек ещё выполняется
+    (status=in_progress, conclusion=None) — это «ещё неизвестно», не
+    «результат не достигнут». bad_check_names до фикса читал conclusion=None
+    как «плохой», и script_evidence вернул бы fail про live-прогон."""
+    fake = FakeGh({
+        "commits/shaXYZ/check-runs?per_page=100": {"check_runs": [
+            {"name": "test", "conclusion": "success", "status": "completed", "started_at": "t1"},
+            {"name": "contract", "conclusion": None, "status": "in_progress", "started_at": "t1"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    state, detail = sch.script_evidence(REPO, "shaXYZ")
+
+    assert state == "pending"
+    assert "contract" in detail
+
+
+def test_script_evidence_fail_when_latest_completed_attempt_is_red(monkeypatch):
+    """Контроль к предыдущему тесту: завершённый и красный чек — по-прежнему
+    fail, различение pending/fail не глотает настоящий провал."""
+    fake = FakeGh({
+        "commits/shaXYZ/check-runs?per_page=100": {"check_runs": [
+            {"name": "test", "conclusion": "success", "status": "completed", "started_at": "t1"},
+            {"name": "contract", "conclusion": "failure", "status": "completed", "started_at": "t1"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    state, detail = sch.script_evidence(REPO, "shaXYZ")
+
+    assert state == "fail"
+    assert "contract" in detail
+
+
 def test_accept_merged_tasks_closes_docs_only_with_no_observable_result(monkeypatch):
     """Докс-класс (#78/PR #163 — только openspec/**/*.md): третий, законный
     исход из требований #227 — закрыт с явным обоснованием «улики по природе
@@ -3567,17 +3655,17 @@ worker-…; закрыть стопгэп-часть #112 уликой.
 """
 
 
-@pytest.mark.parametrize("body,marker", [
-    (PR_303_BODY, "не реализован"),
-    (PR_159_BODY, "propose-фаза"),
-    (PR_123_BODY, "стопгэп"),
+@pytest.mark.parametrize("number,body,marker", [
+    (297, PR_303_BODY, "не реализован"),
+    (158, PR_159_BODY, "propose-фаза"),
+    (112, PR_123_BODY, "стопгэп"),
 ])
-def test_partial_disclaimer_finds_marker_in_real_pr_bodies(body, marker):
-    assert sch.partial_disclaimer(body) == marker
+def test_partial_disclaimer_finds_marker_in_real_pr_bodies(number, body, marker):
+    assert sch.partial_disclaimer(body, number) == marker
 
 
 def test_partial_disclaimer_none_when_no_marker():
-    assert sch.partial_disclaimer(PR_177_BODY) is None
+    assert sch.partial_disclaimer(PR_177_BODY, 21) is None
 
 
 def test_partial_disclaimer_matches_body_without_yo():
@@ -3586,14 +3674,88 @@ def test_partial_disclaimer_matches_body_without_yo():
     — без нормализации сравнение молча не находит совпадение, и приёмка тихо
     закрывает задачу вопреки дисклеймеру (тот самый класс, который #335 чинит)."""
     body = "#10\n\nЭта часть перенесен в #11, докрытие отдельным PR."
-    assert sch.partial_disclaimer(body) == "перенесён в #"
+    assert sch.partial_disclaimer(body, 10) == "перенесён в #"
 
 
 def test_partial_disclaimer_matches_second_yo_marker_without_yo():
     """Тот же класс, второй маркер с «ё» в списке («остаётся открыт») —
     без нормализации падал бы так же молча, как и «перенесён в #»."""
     body = "#10\n\nЧасть работы остается открытой до решения #11."
-    assert sch.partial_disclaimer(body) == "остаётся открыт"
+    assert sch.partial_disclaimer(body, 10) == "остаётся открыт"
+
+
+# Реальное тело PR #455 (задача #454, живой ложноположительный случай #467):
+# критерий #454 (ранний отказ по квоте GitHub API) выполнен и доказан тестами
+# тем же телом PR — абзац с «не реализован» описывает РАССМОТРЕННУЮ И
+# ОТКЛОНЁННУЮ альтернативу другой, не заявленной здесь работы (дешёвая
+# предпроверка перед сканом orchestra), не критерий #454.
+PR_455_BODY = """#454
+
+Живые случаи 2026-09-06: PR #428 — оба обязательных гейта (`test`,
+`contract`) упали с `API rate limit exceeded for installation`.
+
+## Что сделано
+
+`scripts/lib/rate_guard.py` — читает `.resources.core` и решает, пропускать
+ли дорогой путь. Подключено в три точки.
+
+## Что НЕ сделано в этом PR и почему
+
+- **Дешёвая предпроверка «есть ли кандидат на слияние» перед полным сканом
+  orchestra** — рассмотрено и НЕ реализовано. Причины: (а) mark_conflicts/
+  unhealthy_pulls/stale_ready_pulls делают независимую полезную работу; (б)
+  единственный найденный чистый дубль — scheduler.py уже правится параллельно,
+  трогать его core merge-логику ещё раз в этом же PR — риск коллизии без
+  согласования; оставляю как конкретную находку для отдельной задачи.
+- **Регулярный вызов `scripts/measure/quotas.py`** — этот файл существует
+  только в PR #327, который в статусе CONFLICTING и не смёржен в main.
+
+## Проверено
+
+`python -m pytest scripts/lib/test_rate_guard.py -q` — 13/13, включая мутацию
+границы порога и мутацию кода возврата — оба раза тест красился.
+"""
+
+# Реальное тело PR #382 (задача #370, живой ИСТИННО положительный случай
+# #467): #370 сам требует явного решения владельца из нескольких вариантов
+# независимо от улик — абзац «не реализовано» тоже не упоминает #370, но не
+# несёт признака отклонённой альтернативы (это открытые предложения на
+# будущее, не отказ от чего-то другого) — дисклеймер обязан остаться в силе,
+# приёмка не должна закрыть #370 автоматом.
+PR_382_BODY = """#370
+
+## Решение
+
+`.github/workflows/branch-protection-watch.yml` — триггер branch_protection_rule.
+
+## Смежные события (не реализовано, для отдельного обсуждения)
+
+- workflow_run/settings изменение прав Actions — нет штатного события уровня
+  репозитория для этого.
+- Удаление ветки — есть событие delete, можно так же кричать при удалении
+  main/защищённых веток без опроса.
+- Ротация/изменение секретов и vars репозитория — штатного события нет.
+
+Не делаю ничего из списка — один объём работы за раз, как и просили.
+"""
+
+
+def test_partial_disclaimer_suppresses_rejected_alternative_not_own_criterion():
+    """Живой случай #467: PR #455 (задача #454) — маркер «не реализован»
+    относится к рассмотренной-и-отклонённой альтернативе другой работы, не к
+    критерию #454. Доказано мутацией соседним тестом
+    (test_partial_disclaimer_keeps_true_positive_without_rejection_signal),
+    где то же «нет #N в абзаце» без сигнала отклонения маркер НЕ гасит."""
+    assert sch.partial_disclaimer(PR_455_BODY, 454) is None
+
+
+def test_partial_disclaimer_keeps_true_positive_without_rejection_signal():
+    """Живой случай #467: PR #382 (задача #370) — абзац тоже не упоминает
+    #370, но не несёт сигнала рассмотренной-отклонённой альтернативы отдельно
+    от этого — дисклеймер обязан остаться в силе (#370 требует явного решения
+    владельца независимо от улик). Доказывает, что подавление зависит именно
+    от ОБОИХ условий разом, не только от отсутствия ссылки на свою задачу."""
+    assert sch.partial_disclaimer(PR_382_BODY, 370) == "не реализован"
 
 
 @pytest.mark.parametrize("number,body", [
@@ -3640,7 +3802,7 @@ def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeyp
     обязана закрыть #297 обычным путём, доказывая, что закрытие блокировала
     именно фраза, а не что-то ещё в теле."""
     body_without_disclaimer = PR_303_BODY.split("Главный запрос #269")[0]
-    assert sch.partial_disclaimer(body_without_disclaimer) is None
+    assert sch.partial_disclaimer(body_without_disclaimer, 297) is None
     pr = merged_pull(900, body_without_disclaimer, "sha900", "2026-09-04T10:00:00Z")
     fake = FakeGh({
         "pulls/900/files": files_payload(["scripts/orchestra/scheduler.py"]),
