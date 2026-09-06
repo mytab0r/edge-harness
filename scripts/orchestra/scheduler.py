@@ -1536,6 +1536,14 @@ def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220,
     ai_comment = None
     try:
         ai_comment = review_labels.latest_ai_comment(repo, pr_number, gh, comments=comments)
+        # approve — не «требование ревью»: эскалация называет, ЧТО просят
+        # править; вердикт «одобрено» требованием не является (находка
+        # AI-ревью PR #408) — иначе свежий approve затирал бы собой текст
+        # последнего реального замечания. ai:failed (reviewer: error) — тоже
+        # не требование: это сбой прогона, не находка.
+        if ai_comment and review_labels.header_facts(
+                ai_comment.get("body") or "").get("reviewer") != "rework":
+            ai_comment = None
     except RuntimeError:
         pass
     review_comment = None

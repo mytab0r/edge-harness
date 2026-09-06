@@ -1327,6 +1327,36 @@ def test_last_verdict_excerpt_honest_when_no_verdict_found(monkeypatch):
     assert sch.last_verdict_excerpt(REPO, 502) == "текст вердикта недоступен"
 
 
+def test_last_verdict_excerpt_ignores_fresh_approve_verdict(monkeypatch):
+    """Находка AI-ревью PR #408: свежий вердикт approve (или ai:failed —
+    reviewer: error) — не «требование ревью»; эскалация обязан цитировать
+    текст последнего РЕАЛЬНОГО замечания, а не прозу «одобрено» / сбоя.
+    Мутация: снять фильтр reviewer != rework в last_verdict_excerpt — тест
+    краснеет (выжимка берётся из approve-комментария)."""
+    import importlib.util as _ilu
+    ai_spec = _ilu.spec_from_file_location(
+        "ai_review", _DIR.parent / "review" / "ai_review.py")
+    ai = _ilu.module_from_spec(ai_spec)
+    ai_spec.loader.exec_module(ai)
+
+    approve_body = ai.build_comment(503, "sha503", "approve", "Хороший дифф.", [], diff_fp="feedface")
+    gate1_rework = {
+        "created_at": "2026-09-05T09:00:00Z",  # СТАРШЕ approve ниже
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "Ревью нашло замечания:\n- секрет в фикстуре не замаскирован",
+    }
+    fake = FakeGh({"issues/503/comments?per_page=100": [
+        gate1_rework,
+        {"created_at": "2026-09-05T12:00:00Z",
+         "user": {"login": "github-actions[bot]", "type": "Bot"},
+         "body": approve_body},
+    ]})
+    patch_gh(monkeypatch, fake)
+    excerpt = sch.last_verdict_excerpt(REPO, 503)
+    assert "секрет в фикстуре" in excerpt          # текст реального замечания
+    assert "Хороший дифф" not in excerpt           # approve не требование
+
+
 # ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
 # Противоположный класс unhealthy_pulls: PR ЗДОРОВ (обе метки-гейта, зелёные
 # проверки), но слияния не было дольше UNHEALTHY_PR_AFTER_MINUTES с момента
