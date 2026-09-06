@@ -163,7 +163,15 @@ export interface MessageRow {
 /** Результат обработки одного сообщения инбокса. */
 export interface MessageProcessResult {
   message_id: number;
-  action: "issue_created" | "issue_failed" | "issue_retry" | "parked" | "ignored" | "skipped" | "not_found";
+  action:
+    | "issue_dispatched"
+    | "issue_created"
+    | "issue_failed"
+    | "issue_retry"
+    | "parked"
+    | "ignored"
+    | "skipped"
+    | "not_found";
   issue_number?: number;
   issue_url?: string;
   error?: string;
@@ -424,9 +432,12 @@ export function asObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-/** Итог создания issue для директивы. retryable=false — повторять бессмысленно. */
-type IssueOutcome =
-  | { ok: true; number: number; url: string; redacted: boolean }
+/**
+ * Итог dispatch'а создания issue для директивы (не самого создания — см.
+ * #dispatchIssueCreation). retryable=false — повторять бессмысленно.
+ */
+type IssueDispatchOutcome =
+  | { ok: true }
   | { ok: false; retryable: boolean; error: string };
 
 /** Сравнение подписей без утечки длины совпадения по времени. */
@@ -595,6 +606,9 @@ export class Harness extends DurableObject<Env> {
     }
     if (route.name === "messagesProcess") {
       return this.#processMessages(request);
+    }
+    if (route.name === "messagesIssueCreated") {
+      return this.#postIssueCreated(request);
     }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
@@ -1371,18 +1385,39 @@ export class Harness extends DurableObject<Env> {
   }
 
   /**
-   * Issue для директивы или правки доков (обе получают issue-след, kind —
-   * в теле). Токен — собственный узкий секрет GH_ISSUES_TOKEN
-   * (fine-grained, только Issues:RW; ADR 0011): GH_DISPATCH_TOKEN по ADR 0008
-   * не имеет права на Issues — его 403 ловить здесь нечему. Пока секрет не
-   * задан владельцем, директива честно повторяется (issues_not_configured) —
-   * установка секрета сама доводит очередь, без ручного шага.
+   * Директива/doc_edit → repository_dispatch (event_type inbox-issue,
+   * GH_DISPATCH_TOKEN — тот же секрет, что и остальные dispatch'и морды, ADR
+   * 0008). Владелец решил не заводить третий узкий секрет GH_ISSUES_TOKEN
+   * (ADR 0013, заменяет ADR 0011): job .github/workflows/inbox-issue.yml
+   * создаёт issue штатным `github.token` под `permissions: issues: write` —
+   * та же поверхность прав, что уже стоит у orchestra.yml, новой не заводит.
+   *
+   * ВАЖНО: 204 здесь — приём dispatch'а GitHub'ом, НЕ доказательство
+   * созданной issue (docs/research/21-github-actions.md: «успешный HTTP-код
+   * здесь не является доказательством запуска»). Эта функция поэтому не
+   * возвращает issue_number/url — их знает только сам job, и подтверждает
+   * отдельным вызовом (#postIssueCreated, Bearer HANDS_TOKEN — тот же канал,
+   * что heartbeat). До подтверждения сообщение остаётся `processing`;
+   * ватчдог (messageStuck) вернёт его в new/failed, если job не подтвердил.
+   *
+   * `claimedTs` (момент атомарного захвата, `processing_ts` строки) уезжает
+   * в `client_payload` и обязан вернуться в callback'е job'а НЕТРОНУТЫМ: это
+   * тот же CAS-инвариант, что у #finishMessage — без него запоздавшее
+   * подтверждение от проходки, которую ватчдог уже увёл дальше (реclaim →
+   * повторный dispatch), считало бы себя владельцем текущей `processing`-
+   * строки и задвоило бы issue молча (класс, закрытый ревью PR #173, находка
+   * Б2 — здесь тот же класс, только на новой границе job↔DO).
    */
-  async #createIssue(messageId: number, text: string, kind: string): Promise<IssueOutcome> {
-    const token = this.env.GH_ISSUES_TOKEN;
+  async #dispatchIssueCreation(
+    messageId: number,
+    text: string,
+    kind: string,
+    claimedTs: number,
+  ): Promise<IssueDispatchOutcome> {
+    const token = this.env.GH_DISPATCH_TOKEN;
     const repo = this.env.GH_REPO;
     if (!token || !repo) {
-      return { ok: false, retryable: true, error: "issues_not_configured" };
+      return { ok: false, retryable: true, error: "dispatch_not_configured" };
     }
 
     // Заголовок — первая строка без командного слова (общий с классификатором
@@ -1399,9 +1434,11 @@ export class Harness extends DurableObject<Env> {
     const title =
       titleRedacted.text.length > 80 ? titleRedacted.text.slice(0, 77) + "..." : titleRedacted.text;
 
-    // Публичный issue — первый наружный путь произвольного фриформ-текста:
-    // секреты маскируются тем же классом паттернов, что dsh-ci.sh::redact
-    // (п.29 спеки), факт маскирования виден в result сообщения.
+    // Тело issue уходит в client_payload видимым в API/логах Actions —
+    // тот же публичный периметр, что раньше был телом запроса к issues API:
+    // маскирование секретов тем же классом паттернов, что dsh-ci.sh::redact
+    // (п.29 спеки), обязано случиться ЗДЕСЬ, до отправки job'у, а не внутри
+    // job'а (у него нет доступа к redact()).
     const bodyRedacted = redact(text);
     const body =
       `## Сообщение владельца (inbox #${messageId})\n\n*kind: ${kind}*\n\n\`\`\`\n${bodyRedacted.text}\n\`\`\`\n\n---\n` +
@@ -1409,10 +1446,11 @@ export class Harness extends DurableObject<Env> {
 
     try {
       // Таймаут заведомо меньше ватчдога (messageStuckProcessingMs): висящий
-      // fetch не должен дожить до ретрая другой проходки (ревью PR #173).
-      const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/issues`, {
+      // fetch не должен дожить до ретрая другой проходки (ревью PR #173,
+      // тот же инвариант, что был у прямого вызова issues API).
+      const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
         method: "POST",
-        signal: AbortSignal.timeout(LIMITS.messageIssueFetchTimeoutMs),
+        signal: AbortSignal.timeout(LIMITS.messageIssueDispatchTimeoutMs),
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
@@ -1420,16 +1458,18 @@ export class Harness extends DurableObject<Env> {
           "User-Agent": GITHUB.userAgent,
           "X-GitHub-Api-Version": GITHUB.apiVersion,
         },
-        body: JSON.stringify({ title, body, labels: ["task", "source:inbox"] }),
+        body: JSON.stringify({
+          event_type: GITHUB.inboxIssueEventType,
+          client_payload: { message_id: messageId, claimed_ts: claimedTs, title, body },
+        }),
       });
-      if (!res.ok) {
+      if (res.status !== 204) {
         const detail = redact((await res.text()).slice(0, 500)).text;
         // 5xx и 429 — временные; 4xx (403 без права, 422 кривая форма) —
         // повторять бессмысленно, это honest failed.
         return { ok: false, retryable: res.status >= 500 || res.status === 429, error: `github_${res.status}: ${detail}` };
       }
-      const issue = await res.json<{ number: number; html_url: string }>();
-      return { ok: true, number: issue.number, url: issue.html_url, redacted: titleRedacted.redacted || bodyRedacted.redacted };
+      return { ok: true };
     } catch (error) {
       return { ok: false, retryable: true, error: error instanceof Error ? error.message : String(error) };
     }
@@ -1471,15 +1511,14 @@ export class Harness extends DurableObject<Env> {
     // директива в обычном смысле), иначе целый класс команд владельца исчезает
     // из рабочих процессов (ревью head dfd167f). kind уезжает в тело issue.
     if (kind === "directive" || kind === "doc_edit") {
-      const outcome = await this.#createIssue(messageId, String(row.text), kind);
+      const outcome = await this.#dispatchIssueCreation(messageId, String(row.text), kind, claimedTs);
       if (outcome.ok) {
-        if (this.#finishMessage(messageId, "done", { issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted }, claimedTs)) {
-          return { action: "issue_created", issue_number: outcome.number, issue_url: outcome.url, secrets_redacted: outcome.redacted };
-        }
-        // Наш захват устарел (ватчдог вернул сообщение в очередь): issue от
-        // этой проходки мог задвоиться с новой — честно помечаем проходку.
-        console.log(`inbox: pass on message ${messageId} lost ownership after issue #${outcome.number}`);
-        return { action: "skipped", issue_number: outcome.number };
+        // 204 — только приём dispatch'а (docs/research/21-github-actions.md):
+        // финальный статус здесь НЕ пишем, «done» по одному лишь приёму было
+        // бы silent-wrong. Сообщение остаётся processing — job подтвердит
+        // созданную issue отдельным вызовом (#postIssueCreated) либо ватчдог
+        // (messageStuck) вернёт его в очередь, если job не подтвердил.
+        return { action: "issue_dispatched" };
       }
       const attempts = Number(
         this.#rows(this.#sql.exec("SELECT attempts FROM messages WHERE id = ?", messageId))[0].attempts,
@@ -1519,6 +1558,71 @@ export class Harness extends DurableObject<Env> {
     return { action: "skipped" };
   }
 
+  /**
+   * Подтверждение job'а `.github/workflows/inbox-issue.yml` (Bearer
+   * HANDS_TOKEN — тот же канал, что heartbeat): 204 от repository_dispatch
+   * доказывает только приём, единственное доказательство фактически
+   * созданной issue — этот вызов (fail loud, docs/research/21-github-actions.md).
+   * Тело либо `{message_id, claimed_ts, issue_number, issue_url}` (issue
+   * реально создана), либо `{message_id, claimed_ts, error}` (job сам
+   * сообщает о неудаче создания — быстрее и честнее, чем ждать ватчдог).
+   *
+   * `claimed_ts` обязан быть тем же числом, что #dispatchIssueCreation
+   * положил в `client_payload` (job его не понимает, просто эхо-вернул) —
+   * CAS по НЕМУ, а не по свежепрочитанному `processing_ts` строки: если
+   * ватчдог уже увёл сообщение дальше (реclaim → новый dispatch с новым
+   * `processing_ts`), запоздавшее подтверждение старой проходки не найдёт
+   * совпадения в #finishMessage и НЕ перезапишет чужой результат —
+   * `accepted: false` без ошибки, это ожидаемая гонка, не поломка (тот же
+   * инвариант, что у #finishMessage везде в инбоксе).
+   */
+  async #postIssueCreated(request: Request): Promise<Response> {
+    const body = await this.#readJson(request);
+    const messageId = typeof body.message_id === "number" ? body.message_id : Number(asString(body.message_id));
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+      throw new ApiError(400, "need_message_id");
+    }
+    const claimedTs = typeof body.claimed_ts === "number" ? body.claimed_ts : Number(asString(body.claimed_ts));
+    if (!Number.isInteger(claimedTs)) {
+      throw new ApiError(400, "need_claimed_ts");
+    }
+    const row = this.#rows(this.#sql.exec("SELECT text, attempts FROM messages WHERE id = ?", messageId))[0];
+    if (!row) throw new ApiError(404, "message_not_found", { message_id: messageId });
+    const errorField = asString(body.error);
+
+    if (errorField) {
+      // Явный отказ job'а: тот же кап попыток, что у ошибки dispatch'а —
+      // штурмовать бессмысленную повторяемую поломку до бесконечности нельзя.
+      const attempts = Number(row.attempts);
+      if (attempts >= MESSAGE_MAX_ATTEMPTS) {
+        const finished = this.#finishMessage(messageId, "failed", { error: errorField }, claimedTs);
+        if (finished) this.#broadcastStatus();
+        return this.#json({ accepted: finished, action: "issue_failed" });
+      }
+      const released = this.#sql.exec(
+        "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing' AND processing_ts = ?",
+        messageId, claimedTs,
+      );
+      const accepted = Number(released.rowsWritten) > 0;
+      if (accepted) this.#broadcastStatus();
+      return this.#json({ accepted, action: "issue_retry" });
+    }
+
+    const issueNumber = typeof body.issue_number === "number" ? body.issue_number : Number(asString(body.issue_number));
+    const issueUrl = asString(body.issue_url);
+    if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !issueUrl) {
+      throw new ApiError(400, "need_issue_fields");
+    }
+    // Признак маскирования секретов пересчитывается здесь же, из уже
+    // сохранённого текста сообщения: job не видит исходный текст и не
+    // умеет решать, был ли он замаскирован (redact() живёт только в DO).
+    const redacted = redact(String(row.text)).redacted;
+    const result = { issue_number: issueNumber, issue_url: issueUrl, secrets_redacted: redacted };
+    const finished = this.#finishMessage(messageId, "done", result, claimedTs);
+    if (finished) this.#broadcastStatus();
+    return this.#json({ accepted: finished, action: "issue_created", issue_number: issueNumber, issue_url: issueUrl });
+  }
+
   /** Ватчдог: processing дольше порога — изолят умер посреди внешнего вызова.
    *  Возврат в new; attempts сохраняются, а исчерпанный кап на этом пути тоже
    *  проверяется — иначе сообщение ходит по кругу reclaim → claim вечно
@@ -1550,8 +1654,8 @@ export class Harness extends DurableObject<Env> {
   }
 
   /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в
-   *  new с обнулёнными попытками (после устранения причины, например установки
-   *  GH_ISSUES_TOKEN). */
+   *  new с обнулёнными попытками (после устранения причины, например сетевого
+   *  сбоя dispatch'а или упавшего job'а inbox-issue). */
   async #processInbox(limit: number, retryFailed: boolean): Promise<MessageProcessResult[]> {
     if (retryFailed) {
       this.#sql.exec(

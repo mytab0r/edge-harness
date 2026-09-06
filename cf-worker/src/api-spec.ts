@@ -107,7 +107,16 @@ const spec = {
         "POST"
       ],
       "auth": true,
-      "summary": "Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — issue под GH_ISSUES_TOKEN (kind в теле issue; не задан токен или сеть — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен."
+      "summary": "Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — repository_dispatch (event_type inbox-issue) под GH_DISPATCH_TOKEN (kind в теле issue; не задан токен, сеть или отказ job'а — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). 204 dispatch'а — не доказательство созданной issue, сообщение остаётся processing до подтверждения job'ом (messagesIssueCreated) либо возврата ватчдогом. Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен."
+    },
+    {
+      "name": "messagesIssueCreated",
+      "path": "/api/messages/issue-created",
+      "methods": [
+        "POST"
+      ],
+      "auth": true,
+      "summary": "Подтверждение job'а .github/workflows/inbox-issue.yml (Bearer HANDS_TOKEN — тот же канал, что heartbeat): repository_dispatch (204) не доказывает созданную issue (docs/research/21-github-actions.md), эта строка — единственное доказательство. Тело {message_id, issue_number, issue_url} — issue создана, сообщение → done; {message_id, error} — job сам сообщает об отказе, тот же кап попыток, что у ошибки dispatch'а. Не в processing (ватчдог уже вернул сообщение в очередь) — {accepted: false, reason: \"not_processing\"} без ошибки."
     }
   ]
 };

@@ -66,6 +66,10 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
     "hands.yml",
+    # Job для директив инбокса (#20, ADR 0013): repository_dispatch из DO под
+    # GH_DISPATCH_TOKEN (значение читает только сам DO как секрет воркера —
+    # этот workflow токена НЕ читает, создаёт issue штатным github.token).
+    "inbox-issue.yml",
     "orchestra.yml",
     "plugin-forge.yml",
     "pr-review.yml",

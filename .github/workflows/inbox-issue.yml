@@ -1,0 +1,86 @@
+# Создаёт issue для директивы инбокса владельца (#20) по repository_dispatch
+# из DO морды (GH_DISPATCH_TOKEN, event_type inbox-issue). Владелец решил не
+# заводить отдельный секрет GH_ISSUES_TOKEN (ADR 0013, заменяет ADR 0011):
+# штатный github.token под permissions: issues: write делает то же самое —
+# точно такая же поверхность прав, что уже стоит у orchestra.yml, новой не
+# заводит.
+#
+# 204 от POST /repos/.../dispatches доказывает только приём события
+# (docs/research/21-github-actions.md: «успешный HTTP-код здесь не является
+# доказательством запуска»), а не то, что issue реально создана. Поэтому этот
+# job ОБЯЗАН подтвердить исход явным callback'ом в DO — POST
+# /api/messages/issue-created, тем же каналом (Bearer HANDS_TOKEN), которым
+# hands.yml подтверждает живость job'а (heartbeat). Пока подтверждения нет,
+# сообщение в инбоксе остаётся processing — ватчдог DO вернёт его в очередь,
+# если этот job не запустился вовсе или упал раньше callback'а (fail loud,
+# не silent-wrong: 204 ≠ issue создана).
+name: inbox-issue
+
+on:
+  repository_dispatch:
+    types: [inbox-issue]
+
+permissions:
+  issues: write
+
+# Группа — по сообщению: два дубля dispatch'а одного message_id (ретрай DO
+# после сетевой ошибки на самом dispatch'е) не создают issue параллельно;
+# разные сообщения не блокируют друг друга.
+concurrency:
+  group: inbox-issue-${{ github.event.client_payload.message_id }}
+  cancel-in-progress: false
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Issue из директивы инбокса
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Из event.client_payload — НЕ интерполируется прямо в run: (шаблоны
+          # ${{ }} внутри многострочного title/body были бы инъекцией в shell);
+          # DO уже замаскировал секреты в title/body до dispatch'а (redact()).
+          TITLE: ${{ github.event.client_payload.title }}
+          BODY: ${{ github.event.client_payload.body }}
+        run: |
+          set -euo pipefail
+          created=$(gh api -X POST "repos/$REPO/issues" \
+            -f "title=$TITLE" -f "body=$BODY" \
+            -f "labels[]=task" -f "labels[]=source:inbox")
+          echo "number=$(printf '%s' "$created" | jq -r .number)" >> "$GITHUB_OUTPUT"
+          echo "url=$(printf '%s' "$created" | jq -r .html_url)" >> "$GITHUB_OUTPUT"
+
+      # always(): подтверждение уходит и при упавшем шаге создания — тогда
+      # с explicit error, чтобы DO не ждал ватчдога (10 минут) без нужды.
+      - name: Подтвердить исход в DO (HANDS_TOKEN)
+        if: always()
+        env:
+          HANDS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          MESSAGE_ID: ${{ github.event.client_payload.message_id }}
+          # Эхо claimed_ts из dispatch'а НЕТРОНУТЫМ — DO сверяет его с текущим
+          # processing_ts сообщения (CAS): без этого запоздавшее подтверждение
+          # от проходки, которую ватчдог уже увёл дальше, задвоило бы issue.
+          CLAIMED_TS: ${{ github.event.client_payload.claimed_ts }}
+          ISSUE_NUMBER: ${{ steps.create.outputs.number }}
+          ISSUE_URL: ${{ steps.create.outputs.url }}
+          CREATE_OUTCOME: ${{ steps.create.outcome }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HANDS_URL" ] || [ -z "$HANDS_TOKEN" ]; then
+            echo "::error::HARNESS_URL/HANDS_TOKEN не заданы — DO не узнает об этом job'е, сообщение $MESSAGE_ID зависнет до ватчдога"
+            exit 1
+          fi
+          if [ "$CREATE_OUTCOME" = "success" ] && [ -n "$ISSUE_NUMBER" ] && [ "$ISSUE_NUMBER" != "null" ]; then
+            body=$(jq -n --argjson id "$MESSAGE_ID" --argjson ts "$CLAIMED_TS" --argjson n "$ISSUE_NUMBER" --arg u "$ISSUE_URL" \
+              '{message_id: $id, claimed_ts: $ts, issue_number: $n, issue_url: $u}')
+          else
+            body=$(jq -n --argjson id "$MESSAGE_ID" --argjson ts "$CLAIMED_TS" --arg e "inbox-issue job: создание issue не удалось (outcome=$CREATE_OUTCOME)" \
+              '{message_id: $id, claimed_ts: $ts, error: $e}')
+          fi
+          curl -fsS --connect-timeout 10 --max-time 30 \
+            -X POST -H "Authorization: Bearer $HANDS_TOKEN" -H "Content-Type: application/json" \
+            -d "$body" "$HANDS_URL/api/messages/issue-created"

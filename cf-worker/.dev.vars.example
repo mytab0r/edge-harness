@@ -2,9 +2,8 @@
 HANDS_TOKEN=dev-token
 # Ключ подписи сессионной куки браузера (POST /api/session). Любая строка локально.
 SESSION_SECRET=dev-session-secret
-# Пусто — POST /api/tasks честно ответит «dispatch не настроен»:
+# Пусто — POST /api/tasks честно ответит «dispatch не настроен»; тот же
+# токен несёт директивы инбокса дальше (repository_dispatch event_type
+# inbox-issue → .github/workflows/inbox-issue.yml, ADR 0013): пусто —
+# директива повторяется с честной ошибкой dispatch_not_configured.
 GH_DISPATCH_TOKEN=
-# Узкий fine-grained GitHub PAT (только Issues:RW на этот репозиторий, ADR 0011):
-# инбокс создаёт issue для директивы владельца. Пусто — директива повторяется
-# с честной ошибкой issues_not_configured, пока секрет не задан.
-GH_ISSUES_TOKEN=

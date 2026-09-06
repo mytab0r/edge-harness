@@ -44,14 +44,18 @@ async function allEventsFor(taskId: string): Promise<{ id: number; seq: number; 
   }
 }
 
-// Заглушки fetch распознают вызов GitHub issues API по хосту и пути, а не
+// Заглушки fetch распознают repository_dispatch по хосту и пути, а не
 // подстрокой: «api.github.com» может сидеть где угодно в URL
 // (CodeQL js/incomplete-url-substring-sanitization, ревью PR #173).
-// Один предикат на все заглушки — класс закрыт в одном месте.
-function isGitHubIssuesCall(input: string | URL | Request): boolean {
+// Путь — голый /repos/<owner>/<repo>/dispatches (тот же REST-вызов, что и
+// очередь задач /api/tasks — событие различают по event_type в теле), а НЕ
+// /repos/.../actions/workflows/<name>/dispatches (workflow_dispatch пульса
+// оркестратора и деплоя dsh-edge — другой класс вызова, той же заглушкой не
+// перехватывается).
+function isGitHubRepositoryDispatchCall(input: string | URL | Request): boolean {
   try {
     const url = new URL(String(input));
-    return url.hostname === "api.github.com" && url.pathname.endsWith("/issues");
+    return url.hostname === "api.github.com" && /^\/repos\/[^/]+\/[^/]+\/dispatches$/.test(url.pathname);
   } catch {
     return false;
   }
@@ -691,7 +695,7 @@ describe("inbox: сообщения владельца", () => {
     expect(noIdBody.error.code).toBe("need_source_msg_id");
   });
 
-  it("разбор: директива без GH_ISSUES_TOKEN повторяется (issue_retry), после капа попыток — честный failed", async () => {
+  it("разбор: директива без GH_DISPATCH_TOKEN повторяется (issue_retry), после капа попыток — честный failed", async () => {
     const s = sender();
     const created = await (
       await postJson("/api/messages", {
@@ -718,7 +722,7 @@ describe("inbox: сообщения владельца", () => {
     const body = await res.json<{ processed: number; results: { message_id: number; action: string; error?: string }[] }>();
     const mine = body.results.find((r) => r.message_id === created.message_id);
     expect(mine?.action).toBe("issue_failed");
-    expect(mine?.error).toBe("issues_not_configured");
+    expect(mine?.error).toBe("dispatch_not_configured");
     const msg = await getJson<{ message: { status: string; kind: string; priority: number } }>(`/api/messages/${created.message_id}`);
     expect(msg.message.status).toBe("failed");
     expect(msg.message.kind).toBe("directive");
@@ -749,7 +753,7 @@ describe("inbox: сообщения владельца", () => {
     expect(msg.message.attempts).toBe(1);
   });
 
-  it("разбор: директива с настроенным GH_ISSUES_TOKEN создаёт issue (fetch заглушен прод-формой ответа GitHub)", async () => {
+  it("разбор: директива с GH_DISPATCH_TOKEN только дожидается 204 (issue_dispatched) — done наступает лишь после confirm job'а (issue-created), 204 сам по себе не доказательство", async () => {
     const s = sender();
     const created = await (
       await postJson("/api/messages", {
@@ -762,30 +766,51 @@ describe("inbox: сообщения владельца", () => {
 
     // Токен и fetch — только внутри теста: env-биндинги общие, восстанавливаем.
     const realFetch = globalThis.fetch;
-    env.GH_ISSUES_TOKEN = "test-issue-token";
-    // Заглушка кормится прод-формой: 201 + JSON issue (number, html_url).
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
     const calls: { url: string; body: Record<string, unknown> }[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
-      if (isGitHubIssuesCall(input)) {
+      if (isGitHubRepositoryDispatchCall(input)) {
         calls.push({ url, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
-        return new Response(JSON.stringify({ number: 4242, html_url: "https://github.com/mytab0r/edge-harness/issues/4242" }), { status: 201 });
+        return new Response(null, { status: 204 });
       }
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
       const res = await postJson("/api/messages/process", { limit: 100 });
-      const body = await res.json<{ results: { message_id: number; action: string; issue_number?: number }[] }>();
+      const body = await res.json<{ results: { message_id: number; action: string }[] }>();
       const mine = body.results.find((r) => r.message_id === created.message_id);
-      expect(mine?.action).toBe("issue_created");
-      expect(mine?.issue_number).toBe(4242);
+      expect(mine?.action).toBe("issue_dispatched");
 
-      // Улика: запрос ушёл в GitHub API под узким токеном и с метками пула.
+      // Улика: repository_dispatch ушёл под GH_DISPATCH_TOKEN с нашим event_type
+      // и claimed_ts — issue создаёт job (inbox-issue.yml), не сам DO.
       // Хранилище общее — в очереди есть директивы прошлых тестов, берём свою.
-      const mineCall = calls.find((c) => String(c.body.title).includes("Заведи задачу из инбокса"));
+      const mineCall = calls.find(
+        (c) => (c.body.client_payload as Record<string, unknown> | undefined)?.message_id === created.message_id,
+      );
       expect(mineCall).toBeDefined();
-      expect(mineCall!.url).toContain("/repos/mytab0r/edge-harness/issues");
-      expect(mineCall!.body.labels).toContain("task");
+      expect(mineCall!.url).toBe("https://api.github.com/repos/mytab0r/edge-harness/dispatches");
+      expect(mineCall!.body.event_type).toBe("inbox-issue");
+      const payload = mineCall!.body.client_payload as { title: string; body: string; claimed_ts: number };
+      expect(payload.title).toContain("Заведи задачу из инбокса");
+      expect(typeof payload.claimed_ts).toBe("number");
+
+      // 204 — только приём: сообщение остаётся processing, НЕ done.
+      const pending = await getJson<{ message: { status: string } }>(`/api/messages/${created.message_id}`);
+      expect(pending.message.status).toBe("processing");
+
+      // Job подтверждает созданную issue тем же каналом, что heartbeat (HANDS_TOKEN),
+      // эхом возвращая claimed_ts из dispatch'а.
+      const confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id,
+        claimed_ts: payload.claimed_ts,
+        issue_number: 4242,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4242",
+      });
+      expect(confirm.status).toBe(200);
+      const confirmBody = await confirm.json<{ accepted: boolean; action: string }>();
+      expect(confirmBody.accepted).toBe(true);
+      expect(confirmBody.action).toBe("issue_created");
 
       const msg = await getJson<{ message: { status: string; result: string } }>(`/api/messages/${created.message_id}`);
       expect(msg.message.status).toBe("done");
@@ -796,11 +821,125 @@ describe("inbox: сообщения владельца", () => {
       });
     } finally {
       vi.unstubAllGlobals();
-      env.GH_ISSUES_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
     }
   });
 
-  it("текст владельца с секретом уезжает в публичный issue замаскированным (первый наружный путь фриформа)", async () => {
+  it("подтверждение job'а с устаревшим claimed_ts (ватчдог уже увёл сообщение дальше) — accepted:false, чужой результат не перезаписывается (CAS)", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `cas-${s}`,
+        sender_id: s,
+        text: "/task Проверка CAS запоздавшего подтверждения",
+      })
+    ).json<{ message_id: number }>();
+
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    let staleClaimedTs = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubRepositoryDispatchCall(input)) {
+        const payload = (JSON.parse(String(init?.body)) as { client_payload: { claimed_ts: number } }).client_payload;
+        staleClaimedTs = payload.claimed_ts;
+        return new Response(null, { status: 204 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      await postJson("/api/messages/process", { limit: 100 });
+      expect(staleClaimedTs).toBeGreaterThan(0);
+
+      // Ватчдог увёл сообщение дальше: processing_ts сменился на «новый» —
+      // имитирует reclaim → повторный dispatch с НОВЫМ моментом захвата.
+      const id = env.HARNESS.idFromName("owner");
+      const stub = env.HARNESS.get(id);
+      await runInDurableObject(stub, async (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE messages SET processing_ts = ? WHERE id = ?",
+          staleClaimedTs + 1, created.message_id,
+        );
+      });
+
+      // Запоздавшее подтверждение первой (уже неактуальной) проходки.
+      const confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id,
+        claimed_ts: staleClaimedTs,
+        issue_number: 5001,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/5001",
+      });
+      const confirmBody = await confirm.json<{ accepted: boolean }>();
+      expect(confirmBody.accepted).toBe(false);
+
+      // Результат не задвоился: чужая (новая) проходка ничего не потеряла.
+      const msg = await getJson<{ message: { status: string; result: string | null } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("processing");
+      expect(msg.message.result).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
+  it("job сообщает явный error через issue-created — тот же кап попыток, что у ошибки dispatch'а, не бесконечный штурм", async () => {
+    const s = sender();
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: `job-error-${s}`,
+        sender_id: s,
+        text: "/task Job сам сообщит об отказе",
+      })
+    ).json<{ message_id: number }>();
+
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    let claimedTs = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubRepositoryDispatchCall(input)) {
+        claimedTs = (JSON.parse(String(init?.body)) as { client_payload: { claimed_ts: number } }).client_payload.claimed_ts;
+        return new Response(null, { status: 204 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      // Попытка 1: dispatch принят, job сам сообщает об отказе — повторяемо.
+      await postJson("/api/messages/process", { limit: 100 });
+      let confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id, claimed_ts: claimedTs, error: "gh issue create упал",
+      });
+      let confirmBody = await confirm.json<{ accepted: boolean; action: string }>();
+      expect(confirmBody.accepted).toBe(true);
+      expect(confirmBody.action).toBe("issue_retry");
+      let msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("new");
+      expect(msg.message.attempts).toBe(1);
+
+      // Попытка 2: тот же исход.
+      await postJson("/api/messages/process", { limit: 100 });
+      confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id, claimed_ts: claimedTs, error: "gh issue create упал",
+      });
+      expect((await confirm.json<{ action: string }>()).action).toBe("issue_retry");
+
+      // Попытка 3 = кап: честный failed вместо вечного штурма.
+      await postJson("/api/messages/process", { limit: 100 });
+      confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id, claimed_ts: claimedTs, error: "gh issue create упал",
+      });
+      confirmBody = await confirm.json<{ accepted: boolean; action: string }>();
+      expect(confirmBody.accepted).toBe(true);
+      expect(confirmBody.action).toBe("issue_failed");
+      msg = await getJson<{ message: { status: string; attempts: number } }>(`/api/messages/${created.message_id}`);
+      expect(msg.message.status).toBe("failed");
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
+  it("текст владельца с секретом уезжает в client_payload замаскированным (первый наружный путь фриформа, ДО передачи job'у)", async () => {
     const s = sender();
     // Граничный случай (ревью head 3706d87): секрет начинается близко к
     // порогу нарезки заголовка — усечение ДО маскирования оставляло сырой
@@ -825,45 +964,56 @@ describe("inbox: сообщения владельца", () => {
     ).json<{ message_id: number }>();
 
     const realFetch = globalThis.fetch;
-    env.GH_ISSUES_TOKEN = "test-issue-token";
-    const calls: { body: { title?: string; body?: string } }[] = [];
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    const calls: { body: { client_payload?: { message_id?: number; title?: string; body?: string; claimed_ts?: number } } }[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
-      if (isGitHubIssuesCall(input)) {
-        calls.push({ body: JSON.parse(String(init?.body)) as { title?: string; body?: string } });
-        return new Response(JSON.stringify({ number: 4243, html_url: "https://github.com/mytab0r/edge-harness/issues/4243" }), { status: 201 });
+      if (isGitHubRepositoryDispatchCall(input)) {
+        calls.push({ body: JSON.parse(String(init?.body)) });
+        return new Response(null, { status: 204 });
       }
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
       const res = await postJson("/api/messages/process", { limit: 100 });
-      const body = await res.json<{ results: { message_id: number; action: string; secrets_redacted?: boolean }[] }>();
+      const body = await res.json<{ results: { message_id: number; action: string }[] }>();
       const mine = body.results.find((r) => r.message_id === created.message_id);
-      expect(mine?.action).toBe("issue_created");
+      expect(mine?.action).toBe("issue_dispatched");
 
-      const mineCall = calls.find((c) => String(c.body.title).includes("Проверь ключ"));
+      const mineCall = calls.find((c) => c.body.client_payload?.message_id === created.message_id);
       expect(mineCall).toBeDefined();
+      const payload = mineCall!.body.client_payload!;
       // Ни заголовок, ни тело не содержат сырого ключа — ни в title, ни в body.
-      expect(mineCall!.body.title).not.toContain("sk-abcdefgh12345678");
-      expect(mineCall!.body.body).not.toContain("sk-abcdefgh12345678");
-      expect(mineCall!.body.body).toContain("sk-[REDACTED]");
-      expect(mine?.secrets_redacted).toBe(true);
+      expect(payload.title).not.toContain("sk-abcdefgh12345678");
+      expect(payload.body).not.toContain("sk-abcdefgh12345678");
+      expect(payload.body).toContain("sk-[REDACTED]");
 
+      // Job подтверждает создание — secrets_redacted пересчитывается из уже
+      // сохранённого текста сообщения (job его не видит и не решает: redact()
+      // живёт только в DO).
+      const confirm = await postJson("/api/messages/issue-created", {
+        message_id: created.message_id,
+        claimed_ts: payload.claimed_ts,
+        issue_number: 4243,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4243",
+      });
+      expect((await confirm.json<{ accepted: boolean }>()).accepted).toBe(true);
       const msg = await getJson<{ message: { result: string } }>(`/api/messages/${created.message_id}`);
       expect(JSON.parse(msg.message.result).secrets_redacted).toBe(true);
 
       // Секрет на границе нарезки: никакого сырого фрагмента ghp_<символы>
-      // в публичном заголовке — маскирование случилось до усечения.
-      const boundaryCall = calls.find((c) => String(c.body.title).includes("Секреты"));
+      // в заголовке — маскирование случилось до усечения, до отправки job'у.
+      const boundaryCall = calls.find((c) => c.body.client_payload?.message_id === boundary.message_id);
       expect(boundaryCall).toBeDefined();
-      expect(boundaryCall!.body.title).not.toContain(fakeGhp);
-      expect(boundaryCall!.body.title).not.toMatch(/ghp_[A-Za-z0-9]{2,}/);
+      const boundaryPayload = boundaryCall!.body.client_payload!;
+      expect(boundaryPayload.title).not.toContain(fakeGhp);
+      expect(boundaryPayload.title).not.toMatch(/ghp_[A-Za-z0-9]{2,}/);
     } finally {
       vi.unstubAllGlobals();
-      env.GH_ISSUES_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
     }
   });
 
-  it("в GitHub уходит усечённый заголовок (≤80): сырой длинный текст — 422 и невозвратный failed по разбираемому сообщению (мёртвый потолок, ревью head dfd167f)", async () => {
+  it("в client_payload уходит усечённый заголовок (≤80 символов) — ниже 256-потолка issues API, с которым столкнётся job", async () => {
     const s = sender();
     const created = await (
       await postJson("/api/messages", {
@@ -875,12 +1025,13 @@ describe("inbox: сообщения владельца", () => {
     ).json<{ message_id: number }>();
 
     const realFetch = globalThis.fetch;
-    env.GH_ISSUES_TOKEN = "test-issue-token";
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
     const titles: string[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
-      if (isGitHubIssuesCall(input)) {
-        titles.push(String((JSON.parse(String(init?.body)) as { title?: string }).title));
-        return new Response(JSON.stringify({ number: 4245, html_url: "https://github.com/mytab0r/edge-harness/issues/4245" }), { status: 201 });
+      if (isGitHubRepositoryDispatchCall(input)) {
+        const payload = (JSON.parse(String(init?.body)) as { client_payload: { title?: string } }).client_payload;
+        titles.push(String(payload.title));
+        return new Response(null, { status: 204 });
       }
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
@@ -888,20 +1039,20 @@ describe("inbox: сообщения владельца", () => {
       const res = await postJson("/api/messages/process", { limit: 100 });
       const body = await res.json<{ results: { message_id: number; action: string }[] }>();
       const mine = body.results.find((r) => r.message_id === created.message_id);
-      expect(mine?.action).toBe("issue_created");
+      expect(mine?.action).toBe("issue_dispatched");
       expect(titles).toHaveLength(1);
       // Мутация «в JSON уходит titleRedacted.text целиком» красит тест:
-      // заголовок длиннее 256 символов GitHub отвечает 422, а это честный
-      // невозвратный failed — по сообщению, которое можно было разобрать.
+      // такой заголовок доехал бы до job'а и получил бы 422 от issues API
+      // (256-потолок) — по сообщению, которое можно было разобрать.
       expect(titles[0].length).toBeLessThanOrEqual(80);
       expect(titles[0].endsWith("...")).toBe(true);
     } finally {
       vi.unstubAllGlobals();
-      env.GH_ISSUES_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
     }
   });
 
-  it("разбор: 4xx от GitHub — не штурмуем (сразу failed), 5xx — повторяем до капа", async () => {
+  it("разбор: 4xx от GitHub на dispatch — не штурмуем (сразу failed), 5xx — повторяем до капа", async () => {
     const s = sender();
     const make = async (id: string, text: string) =>
       (
@@ -917,9 +1068,9 @@ describe("inbox: сообщения владельца", () => {
     const serverError = await make(`gh500-${s}`, "/task Пятьсот время от времени");
 
     const realFetch = globalThis.fetch;
-    env.GH_ISSUES_TOKEN = "test-issue-token";
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
-      if (isGitHubIssuesCall(input)) {
+      if (isGitHubRepositoryDispatchCall(input)) {
         const bodyText = String(init?.body);
         if (bodyText.includes("Сорок три")) return new Response('{"message":"forbidden"}', { status: 403 });
         if (bodyText.includes("Пятьсот")) return new Response('{"message":"boom"}', { status: 500 });
@@ -931,7 +1082,7 @@ describe("inbox: сообщения владельца", () => {
       const body = await res.json<{ results: { message_id: number; action: string; error?: string; attempts?: number }[] }>();
       const byId = new Map(body.results.map((r) => [r.message_id, r]));
 
-      // 403 — детерминированный отказ (токен без права/кривая форма): failed сразу.
+      // 403 — детерминированный отказ (нет прав/кривая форма): failed сразу.
       const f = byId.get(forbidden.message_id);
       expect(f?.action).toBe("issue_failed");
       expect(f?.error).toContain("github_403");
@@ -946,11 +1097,11 @@ describe("inbox: сообщения владельца", () => {
       expect(se?.error).toContain("github_500");
     } finally {
       vi.unstubAllGlobals();
-      env.GH_ISSUES_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
     }
   });
 
-  it("разбор: chat припаркован с пометкой, doc_edit получает issue-след, raw уходит в ignored на ручной триаж", async () => {
+  it("разбор: chat припаркован с пометкой, doc_edit получает issue-след (dispatch + confirm job'а), raw уходит в ignored на ручной триаж", async () => {
     const s = sender();
     const chat = await (
       await postJson("/api/messages", { source: "t", source_msg_id: `kind-chat-${s}`, sender_id: s, text: "Как думаешь, что лучше?" })
@@ -965,14 +1116,14 @@ describe("inbox: сообщения владельца", () => {
     // doc_edit идёт путём директивы: «у каждой директивы есть issue-след»
     // относится и к правкам доков — иначе весь класс императивов исчезает
     // из рабочих процессов (ревью head dfd167f). Заглушка как в директивных
-    // тестах, кормится прод-формой ответа GitHub.
+    // тестах — только dispatch, issue создаёт job.
     const realFetch = globalThis.fetch;
-    env.GH_ISSUES_TOKEN = "test-issue-token";
-    const calls: { body: { title?: string; body?: string; labels?: string[] } }[] = [];
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    const calls: { body: { client_payload?: { message_id?: number; title?: string; body?: string; claimed_ts?: number } } }[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
-      if (isGitHubIssuesCall(input)) {
-        calls.push({ body: JSON.parse(String(init?.body)) as { title?: string; body?: string; labels?: string[] } });
-        return new Response(JSON.stringify({ number: 4244, html_url: "https://github.com/mytab0r/edge-harness/issues/4244" }), { status: 201 });
+      if (isGitHubRepositoryDispatchCall(input)) {
+        calls.push({ body: JSON.parse(String(init?.body)) });
+        return new Response(null, { status: 204 });
       }
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
@@ -981,15 +1132,26 @@ describe("inbox: сообщения владельца", () => {
       const body = await res.json<{ processed: number; results: { message_id: number; action: string }[] }>();
       const byId = new Map(body.results.map((r) => [r.message_id, r.action]));
       expect(byId.get(chat.message_id)).toBe("parked");
-      expect(byId.get(doc.message_id)).toBe("issue_created");
+      expect(byId.get(doc.message_id)).toBe("issue_dispatched");
       expect(byId.get(raw.message_id)).toBe("ignored");
 
-      // Улика issue-следа правки доков: kind уехал в тело, метки пула на месте.
-      const docCall = calls.find((c) => String(c.body.title).includes("Обнови docs/INDEX.md"));
+      // Улика dispatch'а правки доков: kind уехал в тело client_payload'а.
+      const docCall = calls.find((c) => c.body.client_payload?.message_id === doc.message_id);
       expect(docCall).toBeDefined();
-      expect(docCall!.body.body).toContain("kind: doc_edit");
-      expect(docCall!.body.labels).toContain("task");
-      expect(docCall!.body.labels).toContain("source:inbox");
+      const docPayload = docCall!.body.client_payload!;
+      expect(docPayload.title).toContain("Обнови docs/INDEX.md");
+      expect(docPayload.body).toContain("kind: doc_edit");
+
+      // doc_edit остаётся processing до подтверждения — issue создаёт job.
+      const docPending = await getJson<{ message: { status: string } }>(`/api/messages/${doc.message_id}`);
+      expect(docPending.message.status).toBe("processing");
+      const confirm = await postJson("/api/messages/issue-created", {
+        message_id: doc.message_id,
+        claimed_ts: docPayload.claimed_ts,
+        issue_number: 4244,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4244",
+      });
+      expect((await confirm.json<{ accepted: boolean }>()).accepted).toBe(true);
 
       // raw больше не возвращается в new: очередь не забивается непроходящим сырьём.
       const rawMsg = await getJson<{ message: { status: string; kind: string; result: string } }>(`/api/messages/${raw.message_id}`);
@@ -1009,7 +1171,7 @@ describe("inbox: сообщения владельца", () => {
       expect(JSON.parse(docMsg.message.result).issue_number).toBe(4244);
     } finally {
       vi.unstubAllGlobals();
-      env.GH_ISSUES_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
     }
   });
 
@@ -1245,8 +1407,8 @@ describe("чистые функции инбокса", () => {
     expect(asString({ id: 1 })).toBeNull();
   });
 
-  it("таймаут вызова GitHub заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной issue)", () => {
-    expect(LIMITS.messageIssueFetchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
+  it("таймаут dispatch'а заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной dispatch)", () => {
+    expect(LIMITS.messageIssueDispatchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
   });
 });
 

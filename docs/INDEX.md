@@ -52,8 +52,9 @@
 - [0008. Узкий GH_DISPATCH_TOKEN: dispatch-токен морды отделён от PAT конвейера](decisions/0008-narrow-dispatch-token.md)
 - [0009. Заказ установки плагина: RPC морды (session.prompt), не POST /api/tasks](decisions/0009-plugin-order-via-morde-rpc.md)
 - [0010. Интеграции внешних систем: REST-инструменты своим edge-плагином, не MCP-серверы](decisions/0010-integrations-edge-plugin-rest-tools.md)
-- [0011. Инбокс создаёт issues под собственным узким GH_ISSUES_TOKEN](decisions/0011-inbox-issues-token.md)
+- [0011. Инбокс создаёт issues под собственным узким GH_ISSUES_TOKEN](decisions/0011-inbox-issues-token.md) — ЗАМЕНЕНО ADR 0013
 - [0012. Событийный триггер оркестратора и цикл слияний за один прогон](decisions/0012-orchestra-event-trigger-merge-loop.md)
+- [0013. Инбокс создаёт issues репозиторным dispatch'ем в свой job — без нового секрета](decisions/0013-inbox-dispatch-no-new-secret.md)
 
 ## Операционные процедуры
 
