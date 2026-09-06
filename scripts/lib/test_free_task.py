@@ -189,6 +189,28 @@ def test_task_sh_passes_labels_field_to_free_task():
     )
 
 
+def test_needs_spec_and_blocked_names_have_single_source():
+    """Находка 2 AI-ревью PR #408 (блокирующая): имя needs-spec жило голыми
+    литералами в scheduler.py (ставит метку) и free_task.py (фильтрует) —
+    переезд имени в одном месте убивал второй потребитель молча при зелёных
+    тестах. Гвардия по исходнику (жанр test_task_ref_usage_guard): литерал
+    определяется только в review_labels.py, потребители читают константу."""
+    lib = Path(__file__).resolve().parent
+    orchestra = lib.parent / "orchestra"
+    single_source = (lib / "review_labels.py").read_text(encoding="utf-8")
+    for name in ("NEEDS_SPEC_LABEL", "BLOCKED_LABEL"):
+        assert f'{name} = "' in single_source, (
+            f"{name} обязан быть определён в review_labels.py — единственном "
+            "месте правды на имя метки с несколькими потребителями"
+        )
+    for consumer in (lib / "free_task.py", orchestra / "scheduler.py"):
+        source = consumer.read_text(encoding="utf-8")
+        assert '"needs-spec"' not in source, (
+            f"{consumer.name}: голый литерал needs-spec — читать "
+            "review_labels.NEEDS_SPEC_LABEL, второй источник имён запрещён"
+        )
+
+
 # ── (a) прод-форма: упоминание в прозе не делает задачу «объявленной» ──────────────
 
 

@@ -168,6 +168,14 @@ _claim_spec = importlib.util.spec_from_file_location("claim_task", _LIB)
 claim_task = importlib.util.module_from_spec(_claim_spec)
 _claim_spec.loader.exec_module(claim_task)
 
+# free_task живёт в scripts/lib (одно место правды на критерий «свободная
+# задача», #245): dispatch_worker ниже зовёт free_candidates — ту же
+# функцию, что и воркер в task.sh, не вторую копию фильтра.
+_ft_spec = importlib.util.spec_from_file_location(
+    "free_task", Path(__file__).resolve().parents[1] / "lib" / "free_task.py")
+free_task = importlib.util.module_from_spec(_ft_spec)
+_ft_spec.loader.exec_module(free_task)
+
 # Метки-вердикты ревью (review:*, ai:*) и формулировка гейта слияния —
 # одно место правды в scripts/lib/review_labels.py (общее для check_pr,
 # ai_review и scheduler).
@@ -204,7 +212,9 @@ CONFLICT_LABEL = review_labels.CONFLICT_LABEL
 # как старейшую, пульс диспатчит воркера на то же самое блокирующее условие —
 # вечный цикл без газа (замер AI-ревью PR #247, 2026-09-03). Газ — тот же, что
 # у самой метки (docs/agents/LABELS.md): владелец снимает `blocked` вручную.
-BLOCKED_LABEL = "blocked"
+# Имя — одно место правды (review_labels.py): его же читает free_task
+# (EXCLUDED_LABELS) — голый литерал во втором файле умирал бы молча.
+BLOCKED_LABEL = review_labels.BLOCKED_LABEL
 MERGE_METHOD = "squash"
 # Видимость непринятых задач (#427) — метка, не тормоз (см. mark_stale_unclaimed
 # ниже и запись в docs/agents/LABELS.md). Порог — STALE_HOURS выше, то же число,
@@ -407,6 +417,12 @@ def mark_stale_unclaimed(repo: str, now: datetime, pool: list[dict]) -> list[str
             continue
         if _issue_is_blocked(issue):
             continue  # blocked уже сигнализирует владельцу отдельно, не дублируем
+        if review_labels.NEEDS_SPEC_LABEL in {label["name"] for label in issue.get("labels") or []}:
+            # needs-spec уже сигнализирована эскалацией NEEDS_SPEC_MARKER
+            # (task-rework-loop), а воркер её всё равно не возьмёт
+            # (free_candidates исключает) — подмешивать её в «никто не взял»
+            # (#427) и в замеры позабытых задач нельзя: сигнал другого класса.
+            continue
         if has_label:
             continue
         age_hours = minutes_between(parse_time(issue["created_at"]), now) / 60
@@ -1314,15 +1330,13 @@ def dispatch_worker(repo: str, pool: list[dict]) -> tuple[list[str], list[str]]:
     действие этого прогона."""
     observations: list[str] = []
     actions: list[str] = []
-    # Старейшая свободная — та же, которую воркер выберет oldest_free
-    # (scripts/lib/free_task.py, #245): issues API отдаёт пул по убыванию
-    # новизны, и без сортировки строка отчёта называла бы свежайшую задачу,
-    # а не ту, которую воркер фактически возьмёт. Замки здесь не фильтруются —
-    # это делает сам воркер на claim'е (#121).
-    free = sorted(
-        (issue for issue in pool if not issue["assignees"]),
-        key=lambda issue: issue["number"],
-    )
+    # Критерий «свободная задача» — буквально та же функция, которую зовёт
+    # воркер (free_task.free_candidates, #245): старейшая первой, без
+    # needs-spec/blocked (воркер их не возьмёт — строка отчёта обязана звать
+    # ту же задачу, иначе пульс зря поднимает worker.yml, который выйдет по
+    # «свободных задач нет», находка AI-ревью PR #408, вторая). Замки здесь
+    # не фильтруются — это делает сам воркер на claim'е (#121).
+    free = free_task.free_candidates(pool)
     if not free:
         return observations, actions
     try:
@@ -1645,7 +1659,10 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         release_line = f"⚠️ замок task-{number} не снят: {error}"
     gh(
         "-X", "POST", f"repos/{repo}/issues/{number}/labels",
-        "-f", "labels[]=needs-spec",
+        # Имя — одно место правды (review_labels.NEEDS_SPEC_LABEL): его же
+        # фильтрует free_task.free_candidates — голые литералы в двух файлах
+        # расходились бы молча (находка AI-ревью PR #408, вторая).
+        "-f", f"labels[]={review_labels.NEEDS_SPEC_LABEL}",
     )
     events = pulse_guard.rework_events(repo, pull["number"])
     # Комментарии PR читаются ОДИН раз на оба потребителя: ссылки кругов

@@ -112,8 +112,9 @@ def _load_json(path: Path) -> Any:
         sys.exit(2)
 
 
-# Метки, исключающие задачу из выбора, — имена из docs/agents/LABELS.md
-# (реестр гвардится test_label_registry.py, там же газ каждой):
+# Метки, исключающие задачу из выбора, — одно место правды на имя в
+# scripts/lib/review_labels.py (NEEDS_SPEC_LABEL/BLOCKED_LABEL, реестр —
+# docs/agents/LABELS.md, гвардия test_label_registry.py):
 #   needs-spec — бюджет реворка исчерпан (task-rework-loop #256, design.md
 #     п.5): задача ждёт уточнения требования аналитиком, не исполнителя;
 #     выбор её воркером сжёг бы бюджет заново на новом PR, пока владельцу
@@ -122,8 +123,15 @@ def _load_json(path: Path) -> Any:
 #   blocked — эскалация владельцу (playbook): то же состояние ожидания.
 # scheduler.py пропускает обе метки в unhealthy_pulls/reap_stale
 # (BLOCKED_LABEL/_issue_is_blocked) — здесь закрыт второй путь класса
-# «метка есть, а путь выбора её не проверяет».
-EXCLUDED_LABELS = ("needs-spec", "blocked")
+# «метка есть, а путь выбора её не проверяет». Константы берутся из
+# review_labels (importlib — тот же приём, что task_ref выше), не литералами:
+# переезд имени в одном месте не оставляет второй потребитель молча мёртвым.
+_rl_spec = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().with_name("review_labels.py"))
+review_labels = importlib.util.module_from_spec(_rl_spec)
+_rl_spec.loader.exec_module(review_labels)
+
+EXCLUDED_LABELS = (review_labels.NEEDS_SPEC_LABEL, review_labels.BLOCKED_LABEL)
 
 
 def _label_names(issue: dict[str, Any]) -> set[str]:

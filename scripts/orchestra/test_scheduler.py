@@ -546,6 +546,21 @@ def test_mark_stale_unclaimed_skips_blocked_issue(monkeypatch):
     assert fake.calls == []
 
 
+def test_mark_stale_unclaimed_skips_needs_spec_issue(monkeypatch):
+    """Хвост AI-ревью PR #408: needs-spec-задача (assignee снят
+    route_to_needs_spec по построению) не получает stale-unclaimed — владелец
+    уже сигнализирован эскалацией NEEDS_SPEC_MARKER, а воркер её всё равно не
+    возьмёт (free_candidates исключает). Мутация: снять skip — тест краснеет,
+    needs-spec подмешивается в «никто не взял» (#427) навсегда."""
+    task = issue(304, assignees=(), labels=["task", "needs-spec"], created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert lines == []
+    assert fake.calls == []
+
+
 def test_mark_stale_unclaimed_idempotent_when_already_labeled(monkeypatch):
     task = issue(303, assignees=(), labels=["task", "stale-unclaimed"], created_at="2026-09-01T00:00:00Z")
     fake = FakeGh({})
@@ -2866,6 +2881,36 @@ def test_dispatch_worker_silent_when_pool_has_no_free_task(monkeypatch):
     patch_gh(monkeypatch, fake)
     assert sch.dispatch_worker(REPO, [issue(89)]) == ([], [])
     assert fake.calls == []  # ноль вызовов вовсе: на занятый пул даже статусы не смотрим
+
+
+def test_dispatch_worker_skips_excluded_labels_like_worker_does(monkeypatch):
+    """Находка 2 AI-ревью PR #408: dispatch_worker дублировал критерий
+    «свободная задача» голым `not issue["assignees"]`, а его комментарий
+    обещал «та же, которую воркер выберет oldest_free». Теперь пул с одними
+    needs-spec/blocked не диспетчит worker.yml, который вышел бы по «свободных
+    задач нет» — каждый пульс поднимал бы прогон впустую до ручного выхода из
+    needs-spec. Мутация: вернуть в dispatch_worker собственный фильтр
+    (или убрать free_candidates) — тест краснеет на обоих assert'ах."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pool = [
+        issue(89, assignees=(), labels=["task", "needs-spec"]),
+        issue(95, assignees=(), labels=["task", "blocked"]),
+        issue(158, assignees=()),  # свободна — единственный настоящий кандидат
+    ]
+    observations, actions = sch.dispatch_worker(REPO, pool)
+    assert any("#158" in line for line in (observations + actions))
+    assert not any("#89" in line or "#95" in line for line in (observations + actions))
+
+    fake_only_excluded = FakeGh({})
+    patch_gh(monkeypatch, fake_only_excluded)
+    assert sch.dispatch_worker(
+        REPO, [issue(89, assignees=(), labels=["task", "needs-spec"])]) == ([], [])
+    assert fake_only_excluded.calls == []  # воркер бы не взял — dispatch не нужен
 
 
 def test_dispatch_worker_silent_while_worker_run_in_progress(monkeypatch):

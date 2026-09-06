@@ -62,6 +62,22 @@ CONFLICT_LABEL = "conflict"
 # читает конвейер; кто ставит/что блокирует/порог — docs/agents/LABELS.md.
 REVERT_OK = "revert-ok"
 
+# ── Метки состояния задачи пула ──────────────────────────────────────────────
+# Единственное определение имён, которые читает БОЛЬШЕ ОДНОГО потребителя:
+# здесь они рядом с остальными метками конвейера, реестр — docs/agents/
+# LABELS.md (гвардия test_label_registry.py). Голый литерал в двух файлах —
+# тихое расхождение: переедет имя в одном месте — второй потребитель молча
+# умрёт при зелёных тестах (находка AI-ревью PR #408 про needs-spec).
+#
+# needs-spec (task-rework-loop #256): бюджет реворка исчерпан — ставит
+# route_to_needs_spec, фильтрует free_task.free_candidates; обе стороны
+# обязаны читать одно значение.
+NEEDS_SPEC_LABEL = "needs-spec"
+# blocked (эскалация playbook): ставит task.sh, читают scheduler
+# (reap_stale/unhealthy_pulls), free_task.free_candidates и
+# stale_blocked_guard — тот же класс многопотребительского имени.
+BLOCKED_LABEL = "blocked"
+
 # ── Commit Status API — вердикты вторым каналом, параллельно меткам (#345) ───
 # Контексты кандидата в required_status_checks (branch protection ставит
 # владелец вручную после подтверждения живым прогоном — не эта задача).
