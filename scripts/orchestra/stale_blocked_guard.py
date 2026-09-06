@@ -99,7 +99,12 @@ def stale_marker_targets(own_number: int, texts: list[str]) -> list[int]:
     отдельным регэкспом task_ref: `\\d+` в STALE_MARKER_RE уже жадный и
     захватывает ВЕСЬ прогон цифр целиком, а слева от `#` в маркере всегда
     буква/двоеточие/пробел, не цифра — подстрочное слипание чисел здесь
-    структурно невозможно."""
+    структурно невозможно.
+
+    Это ВСЯ история упоминаний, не только текущая причина (см.
+    `current_stale_marker_target` ниже для решения о нарушении) —
+    используется только чтобы знать, чьё состояние (open/closed) вообще
+    стоит проверить сетевым вызовом."""
     numbers: list[int] = []
     seen: set[int] = {own_number}
     for text in texts:
@@ -112,6 +117,30 @@ def stale_marker_targets(own_number: int, texts: list[str]) -> list[int]:
     return numbers
 
 
+def current_stale_marker_target(own_number: int, texts: list[str]) -> int | None:
+    """Текущая причина блокировки — ПОСЛЕДНИЙ по порядку текст (тело, затем
+    комментарии хронологически), несущий маркер «Блокирована: #N», решает,
+    более ранние — не в счёт (находка AI-ревью PR #336, третий раунд).
+
+    Живой контрпример, на котором старая семантика («любое упоминание в
+    истории — нарушение, если номер закрыт») ловила ложное срабатывание:
+    эпизод «Блокирована: #265» решён — #265 закрыт, метку сняли, — задача
+    затем ЗАКОННО пере-блокирована новым эскалационным комментарием
+    «Блокирована: #300» (#300 ещё открыт). Старая семантика продолжала бы
+    видеть #265 в списке целей и красить шаг каждый прогон, хотя текущая
+    причина легитимна и вообще другая. Последний маркер вытесняет прежние —
+    ровно то же правило, что уже применяется к DRIFT_MARKER/PAUSE_MARKER
+    эпизодам в pulse_guard/upstream_drift (актуально только последнее
+    состояние маркера, не вся история)."""
+    for text in reversed(texts):
+        match = STALE_MARKER_RE.search(text or "")
+        if match:
+            number = int(match.group(1))
+            if number != own_number:
+                return number
+    return None
+
+
 def find_stale_blocked(issues: list[dict], closed_numbers: set[int]) -> list[dict]:
     """issues — прод-форма repos/{repo}/issues, дополненная ключом
     `comments_text: list[str]` (тела комментариев, собранные IO-обвязкой ниже).
@@ -119,8 +148,11 @@ def find_stale_blocked(issues: list[dict], closed_numbers: set[int]) -> list[dic
 
     Issue без метки `blocked` — не наш случай. Issue с меткой, но без маркера
     «Блокирована: #N» в тексте — законный ручной случай (LABELS.md) или форма
-    вне признака (честный потолок в докстринге модуля), не нарушение. Issue с
-    маркером на закрытый номер — протухшая блокировка, входит в отчёт."""
+    вне признака (честный потолок в докстринге модуля), не нарушение. Issue,
+    чья ТЕКУЩАЯ причина (последний маркер, `current_stale_marker_target`) —
+    закрытый номер, протухшая блокировка, входит в отчёт. Более ранние,
+    вытесненные маркеры в счёт не идут (находка AI-ревью PR #336, третий
+    раунд, см. докстринг `current_stale_marker_target`)."""
     violations = []
     for issue in issues:
         labels = {label["name"] for label in issue.get("labels") or []}
@@ -128,10 +160,9 @@ def find_stale_blocked(issues: list[dict], closed_numbers: set[int]) -> list[dic
             continue
         number = issue["number"]
         texts = [issue.get("body") or ""] + list(issue.get("comments_text") or [])
-        targets = stale_marker_targets(number, texts)
-        stale = sorted(n for n in targets if n in closed_numbers)
-        if stale:
-            violations.append({"number": number, "stale_refs": stale})
+        current = current_stale_marker_target(number, texts)
+        if current is not None and current in closed_numbers:
+            violations.append({"number": number, "stale_refs": [current]})
     return violations
 
 

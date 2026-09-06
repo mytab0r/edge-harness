@@ -113,6 +113,19 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_repo_invariants.py -q
 
+      # Гвардия протухшей метки blocked (#334): без этого шага тесты
+      # гвардии живут только текстом файла — по собственному правилу
+      # этого же PR («решение — это механизм, а не текст») это ровно тот
+      # класс, который PR закрывает для остальных, но сам изначально
+      # не подключал себе (находка AI-ревью PR #336, третий раунд):
+      # continue-on-error в orchestra.yml держит job зелёным при любой
+      # поломке STALE_MARKER_RE/find_stale_blocked, и без обязательного
+      # прогона тестов здесь это никто не заметит.
+      - name: Тесты гвардии протухшей метки blocked
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_stale_blocked_guard.py -q
+
       # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
       # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
       # ловил 403 на автослежении), сбой архивации — жёсткий и эскалируется

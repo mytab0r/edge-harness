@@ -142,6 +142,56 @@ def test_find_stale_blocked_no_false_positive_on_216_even_with_163_164_closed():
     assert violations == []
 
 
+def test_find_stale_blocked_silent_on_resolved_episode_after_legit_reblock():
+    """Находка AI-ревью PR #336 (третий раунд), живой контрпример на
+    сгенерированном моке (реальный #268 на сегодня несёт только один эпизод —
+    этот сценарий гипотетический, но структурно неизбежен при первом же
+    resolve→re-block): эпизод «Блокирована: #265» решён (#265 закрыт), метку
+    сняли и снова поставили с НОВЫМ легитимным эскалационным комментарием
+    «Блокирована: #300» (#300 ещё открыт). Старая семантика («любое
+    упоминание в истории — нарушение, если номер закрыт») продолжала бы
+    видеть #265 и красить шаг каждый прогон; правильное поведение — молчать,
+    текущая причина (#300) легитимна."""
+    issue = {
+        "number": 268,
+        "labels": [{"name": "task"}, {"name": "blocked"}],
+        "body": ISSUE_268_BODY,
+        "comments_text": [
+            ISSUE_268_ESCALATION_COMMENT,  # старый эпизод: «Блокирована: #265»
+            "Метка blocked снята владельцем — #265 слит.",
+            "Блокирована: #300\n\nНовый эпизод: задача снова заблокирована "
+            "на #300, ещё не готов.",
+        ],
+    }
+    # #265 закрыт (старый эпизод), #300 ещё открыт (текущий) — старая
+    # семантика нашла бы #265 в истории и ложно сработала.
+    violations = sbg.find_stale_blocked([issue], closed_numbers={265})
+    assert violations == []
+
+
+def test_find_stale_blocked_flags_current_marker_when_reblock_target_closed():
+    """Зеркало предыдущего теста: если ТЕКУЩИЙ (последний) маркер указывает
+    на уже закрытый номер — нарушение есть, несмотря на более раннюю (и не
+    закрытую) историю."""
+    issue = {
+        "number": 268,
+        "labels": [{"name": "task"}, {"name": "blocked"}],
+        "body": ISSUE_268_BODY,
+        "comments_text": [
+            "Блокирована: #400\n\nПервый эпизод, #400 ещё открыт на тот момент.",
+            "Метка blocked снята владельцем — #400 слит.",
+            ISSUE_268_ESCALATION_COMMENT,  # текущий эпизод: «Блокирована: #265»
+        ],
+    }
+    violations = sbg.find_stale_blocked([issue], closed_numbers={265})
+    assert violations == [{"number": 268, "stale_refs": [265]}]
+
+
+def test_current_stale_marker_target_picks_last_not_first():
+    texts = ["Блокирована: #100", "не маркер, просто текст", "Блокирована: #200"]
+    assert sbg.current_stale_marker_target(268, texts) == 200
+
+
 def test_find_stale_blocked_silent_on_blocked_issue_without_any_reference():
     """Законный ручной случай (LABELS.md): эскалация «нужен секрет владельца»
     без ссылки на другой issue — не флагуется, это не машинно проверяемо."""
