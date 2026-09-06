@@ -1,6 +1,6 @@
 {
   "name": "@edge-harness/dsh-plugin-manager",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Client plugin: Plugins settings section for the dsh-edge web roster — manifest inventory, journal statuses, orderable catalog and plugin ordering (#102, #113)",
   "type": "module",
   "exports": {
@@ -11,7 +11,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-locale"
       ]
     }
