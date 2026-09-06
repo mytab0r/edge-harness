@@ -13,7 +13,9 @@ free_task не подхватывает продолжение ветки, и ne
 
 ## 1. REWORK_BUDGET в pulse_guard.py
 
-Статус: сделано, PR #388 (scripts/orchestra/pulse_guard.py — REWORK_BUDGET,
+Статус: сделано, PR #408 (ветка продолжения #388: код тот же, едет в новую
+ветку agent/391-task-rework-loop, т.к. резолвер «PR → задача» — по имени
+ветки, #394) — scripts/orchestra/pulse_guard.py (REWORK_BUDGET,
 rework_events, rework_cycle_count; тесты — scripts/orchestra/test_pulse_guard.py,
 фикстуры реальных таймлайнов — scripts/orchestra/fixtures_timeline_pr_*_256.json).
 
@@ -28,7 +30,8 @@ timeline, не живым API - тест детерминирован без с�
 
 ## 2. Метка needs-spec + вход (scheduler.py)
 
-Статус: сделано, PR #388 (scripts/orchestra/scheduler.py — pr_is_unhealthy видит оба
+Статус: сделано, PR #408 (ветка продолжения #388, тот же дифф; scripts/orchestra/scheduler.py —
+pr_is_unhealthy видит оба
 гейта, route_to_needs_spec, ветвление в unhealthy_pulls; docs/agents/LABELS.md
 получил строку needs-spec — иначе test_label_registry.py краснеет на новом
 литерале в коде, эта правка не входила в п.1/п.2 буквально, но без неё CI
