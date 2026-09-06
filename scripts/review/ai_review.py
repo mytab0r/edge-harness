@@ -848,12 +848,23 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         return 0
 
     current = {label["name"] for label in pull["labels"]}
-    for old in AI_VERDICTS:
-        if old in current:
-            run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
-    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
-           "-f", f"labels[]={label}")
+    # Тот же класс идемпотентности, что вердикт-метка review:* в check_pr.py
+    # (#203): повторный вердикт ТОГО ЖЕ значения (автоповтор ai:failed по
+    # таймеру #196, повторный approve после подтягивания main) не выполняет
+    # ни одного изменяющего вызова — ни лишних unlabeled/labeled в таймлайне;
+    # смена вердикта переставляет метку как раньше (решение —
+    # verdict_label_changes, одно место правды с check_pr.py).
+    stale_verdicts, need_verdict_post = review_labels.verdict_label_changes(
+        current, label, AI_VERDICTS)
+    for old in stale_verdicts:
+        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+    if need_verdict_post:
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
+               "-f", f"labels[]={label}")
+    # Множество меток ПОСЛЕ свопа — то, что реально осталось на сервере
+    # (раньше сюда уходило current | {label} без снятых старых ai:*).
+    labels_after = (current - set(stale_verdicts)) | ({label} if need_verdict_post else set())
 
     # Commit Status API — тот же вердикт вторым каналом, параллельно метке
     # (#345): allow_auto_merge читает required status checks, не метки.
@@ -871,7 +882,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
     # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
-    apply_large_ok(repo, args.pr, added, current | {label}, verdict)
+    apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
     # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
     # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
