@@ -421,7 +421,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/test/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -432,6 +432,33 @@ jobs:
       # ветки — прогон на реальном git с фейковым gh, сеть не нужна.
       - name: Smoke task-branch — проверка задачи на входе
         run: bash scripts/git/test/task-branch.test.sh
+
+      # Проверка на входе в scripts/git/pr-create (не гвардия постфактум,
+      # issue #496): тело PR с Closes/Fixes/Resolves отклоняется ДО вызова
+      # `gh pr create` — реальный gh не вызывается вовсе (фейковый gh в
+      # PATH), а не только позже краснеет контракт.
+      - name: Smoke pr-create — Closes/Fixes/Resolves отклоняется до вызова gh (#496)
+        run: bash scripts/git/test/pr-create-guard.test.sh
+
+      # Паритет слов между scripts/git/pr-create и scripts/orchestra/
+      # contract_check.py (#496) — копия намеренная (contract_check.py
+      # дорабатывается параллельно, PR #423/#429, не общий импорт), расхождение
+      # списка слов красит CI, а не тихо теряется.
+      - name: Тесты паритета scripts/git/pr-create ↔ contract_check.py
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_create_guard.py -q
+
+      # Гвардия класса #496 (статический скан «raw gh pr create вне обёртки»)
+      # РАССМОТРЕНА и сознательно НЕ заведена: подстрока `gh pr create`
+      # легитимно встречается в комментариях/доках/тексте тестов (в т.ч. в
+      # этом же PR — комментарии выше, промпт-строка scripts/worker/task.sh,
+      # сама обёртка), различить «упоминание» от «настоящий вызов» без
+      # полноценного парсера — та же неразрешимая в общем виде граница, что
+      # уже честно признана для #219 (AGENTS.md: «статически не выразим»).
+      # Два реальных места вызова (scripts/worker/task.sh, plugin-forge.yml)
+      # уже переведены на scripts/git/pr-create этим PR; страховка для новых
+      # мест — ревью, не статический греп (честная граница, issue #496).
 
       # Гвардия класса #476 (живой прогон worker.yml 34027035455, PR #408):
       # доводка уже открытого PR обязана исполнять scripts/* (по пути, включая

@@ -26,7 +26,7 @@ on:
 
 permissions:
   contents: write       # для создания релиза и PR
-  pull-requests: write  # для gh pr create
+  pull-requests: write  # для scripts/git/pr-create
   # issues: write не нужен — статусы уходят по HTTP в журнал (POST /api/events,
   # scripts/plugins/plugin_status.sh), PR создаётся под GH_PIPELINE_PAT, к
   # GitHub Issues API/CLI этот workflow не обращается (находка AI-ревью PR #273).
@@ -541,7 +541,9 @@ jobs:
           # реальный путь.
           PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n- Финальный статус этого шага в журнале — `built` (design.md «Канал обновления и статусы»: форж не деплоит и не постит `deploying`/`ready`)\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. `plugin_status: deploying`/`ready` постит канал деплоя, а не этот PR — это отдельная задача (доводка деплоя до ready, остаток #162), сюда ещё не подключена\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
             "$TASK_LINE" "${{ steps.release.outputs.release_tag }}")
-          PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
+          # scripts/git/pr-create (#496) — единственный документированный путь
+          # открытия PR, тот же интерфейс, что gh pr create.
+          PR_URL=$(scripts/git/pr-create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
