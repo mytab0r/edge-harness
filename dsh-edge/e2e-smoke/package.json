@@ -1,0 +1,10 @@
+{
+  "name": "dsh-edge-e2e-smoke",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Generic browser smoke для морды dsh-edge (issue #502): playwright-core под системным Chrome раннера, без загрузки браузерных бинарников Playwright.",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

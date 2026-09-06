@@ -1,8 +1,8 @@
 name: diag-502
-# Временный диагностический workflow (issue #502): смотрит на реальную DOM-
-# структуру морды dsh-edge (сайдбар настроек, вкладки) под системным Chrome
-# раннера, чтобы e2e-смоук строился по факту разметки, а не по пересказу.
-# Удаляется вместе с PR, закрывающим #502.
+# Временный диагностический workflow (issue #502): прогоняет dsh-edge/e2e-smoke
+# на реальном проде под системным Chrome раннера, чтобы доказать рабочесть
+# смоука перед тем, как звать его частью deploy-dsh-edge.yml. Удаляется вместе
+# с PR, закрывающим #502.
 on:
   push:
     branches: [agent/502-dsh-edge-e2e-smoke]
@@ -12,96 +12,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Установить playwright-core (без загрузки браузеров — используем системный Chrome)
-        run: npm install --no-save playwright-core@1.63.0
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Снять разметку сайдбара настроек под системным Chrome
+      - name: npm install (playwright-core, без загрузки браузеров)
+        working-directory: dsh-edge/e2e-smoke
+        run: npm install --no-audit --no-fund
+
+      - name: Прогон e2e-смоука на живом проде
+        working-directory: dsh-edge/e2e-smoke
         env:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          BASE_URL: https://dsh-edge.mytab0r.workers.dev
         run: |
-          cat > explore.mjs <<'NODE'
-          import { chromium } from 'playwright-core'
-          import { writeFileSync } from 'node:fs'
-          const base = 'https://dsh-edge.mytab0r.workers.dev'
-          const browser = await chromium.launch({ channel: 'chrome' })
-          const context = await browser.newContext()
-          const page = await context.newPage()
-          page.on('console', msg => console.log('CONSOLE:', msg.type(), msg.text()))
-          page.on('pageerror', err => console.log('PAGEERROR:', err.message))
-          await page.goto(base + '/login', { waitUntil: 'networkidle' })
-          await page.waitForTimeout(1000)
-          const loginHtml = await page.content()
-          writeFileSync('/tmp/login.html', loginHtml)
-          console.log('--- login page html length ---', loginHtml.length)
-          const inputs = await page.$$eval('input', els => els.map(e => ({ type: e.type, name: e.name, id: e.id, placeholder: e.placeholder })))
-          console.log('--- inputs on /login ---', JSON.stringify(inputs))
-          const buttons = await page.$$eval('button', els => els.map(e => ({ text: (e.textContent||'').trim(), type: e.type })))
-          console.log('--- buttons on /login ---', JSON.stringify(buttons))
-          await page.locator('input').first().fill(process.env.DSH_EDGE_ACCESS_KEY)
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => {}),
-            page.locator('button[type=submit], button').first().click().catch(() => page.keyboard.press('Enter')),
-          ])
-          await page.waitForTimeout(2000)
-          console.log('--- URL after login ---', page.url())
-          await page.goto(base + '/', { waitUntil: 'networkidle' })
-          await page.waitForTimeout(3000)
-          console.log('--- root page title ---', await page.title())
-          const bodyHtml = await page.content()
-          console.log('--- root body length ---', bodyHtml.length)
-          writeFileSync('/tmp/root.html', bodyHtml)
-          const navTexts = await page.$$eval('a, button, [role="tab"], [role="link"], [role="menuitem"], [role="listitem"], li', els =>
-            els.slice(0, 300).map(e => ({ tag: e.tagName, text: (e.textContent||'').trim().slice(0,40), href: e.getAttribute('href'), role: e.getAttribute('role'), testid: e.getAttribute('data-testid'), cls: (e.getAttribute('class')||'').slice(0,60) })).filter(e => e.text)
-          )
-          console.log('--- nav-like elements (first 300) ---')
-          console.log(JSON.stringify(navTexts, null, 2))
-
-          // Первый визит показывает оверлей-тур ("Continue") поверх шелла —
-          // маскирует клики, пока не закрыт.
-          const tourContinue = page.getByRole('button', { name: 'Continue' })
-          if (await tourContinue.count() > 0) {
-            console.log('--- закрываю оверлей-тур (Continue) ---')
-            await tourContinue.click({ timeout: 5000 }).catch(e => console.log('tour continue click failed:', e.message))
-            await page.waitForTimeout(1000)
-          }
-
-          // Открыть Settings и снять разметку панели/вкладок.
-          await page.getByRole('button', { name: 'Settings' }).click()
-          await page.waitForTimeout(2000)
-          console.log('--- URL after Settings click ---', page.url())
-          const settingsHtml = await page.content()
-          writeFileSync('/tmp/settings.html', settingsHtml)
-          console.log('--- settings html length ---', settingsHtml.length)
-          const dialogCount = await page.locator('[role="dialog"]').count()
-          console.log('--- [role=dialog] count ---', dialogCount)
-          const dialogInfo = await page.$$eval('[role="dialog"]', els => els.map(e => ({ cls: (e.getAttribute('class')||''), ariaLabel: e.getAttribute('aria-label'), ariaLabelledby: e.getAttribute('aria-labelledby') })))
-          console.log('--- dialog elements ---', JSON.stringify(dialogInfo))
-
-          // Структурная эвристика без хардкода имён/хешей: самая большая группа
-          // кнопок-СИБЛИНГОВ (общий родитель) с коротким однострочным текстом —
-          // это и есть навигация по разделам (устойчиво к смене build-хешей CSS
-          // modules при апдейте dsh-edge).
-          const tabGroup = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button'))
-            const groups = new Map()
-            for (const b of buttons) {
-              const parent = b.parentElement
-              if (!parent) continue
-              const text = (b.textContent || '').trim()
-              if (!text || text.length > 30) continue
-              if (b.querySelector('input, textarea, select')) continue
-              if (!groups.has(parent)) groups.set(parent, [])
-              groups.get(parent).push(text)
-            }
-            let best = []
-            for (const list of groups.values()) {
-              if (list.length > best.length) best = list
-            }
-            return best
-          })
-          console.log('--- structural tab-group heuristic (largest sibling-button group) ---')
-          console.log(JSON.stringify(tabGroup))
-
-          await browser.close()
-          NODE
-          node explore.mjs 2>&1 | tail -100
+          time node smoke.mjs
