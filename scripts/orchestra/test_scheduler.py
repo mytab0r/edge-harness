@@ -770,8 +770,19 @@ class FakeGh:
     """Маршрутизатор вызовов gh api по подстроке пути; каждый вызов пишется —
     для гвардии холостого хода это и есть доказательство "ни одного вызова"."""
 
+    # Тормоз гонки update_branch/ai-review (#488, review_labels.
+    # other_active_ai_review_runs) читает этот эндпоинт ПЕРЕД КАЖДЫМ
+    # update_branch, включая все существовавшие ДО этой правки тесты
+    # update-branch/merge_queue/update_remaining_pulls, которым сама гонка не
+    # предмет. Без запасного маршрута каждый такой тест был бы обязан
+    # завести собственную строку "нет активных прогонов" — тот же шум, что
+    # уже отвергнут для остальной инфраструктуры моков (routes уже позволяет
+    # тесту переопределить конкретный fragment явно, если гонка — его предмет,
+    # см. test_update_branch_skips_when_ai_review_running_for_pr ниже).
+    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
+
     def __init__(self, routes: dict):
-        self.routes = routes
+        self.routes = {**self._DEFAULT_ROUTES, **routes}
         self.calls: list[str] = []
 
     def __call__(self, *args):
@@ -1586,8 +1597,44 @@ def test_update_remaining_pulls_excludes_just_merged_and_empty_is_noop(monkeypat
 # возврата ненулевой — ровно то, что кидает subprocess.run(check=True).
 
 
+def test_update_branch_skips_when_ai_review_running_for_pr(monkeypatch):
+    # Тормоз гонки update_branch/ai-review (#488, живой инцидент): PR #2
+    # behind main и близок к слиянию (оба вердикта зелёные), но по нему
+    # ПРЯМО СЕЙЧАС летит ai-review.yml (in_progress) — update_branch обязан
+    # отказаться двигать head ДО самого push'а (см. update_branch,
+    # review_labels.other_active_ai_review_runs), а merge_queue — доложить
+    # об этом отдельной строкой-наблюдением, не веткой "не удался" (та —
+    # для реальных сетевых сбоев push'а, см. соседний тест сетевого сбоя) и
+    # не веткой "слот занят" (слот вообще не был потрачен).
+    pulls = [pull(2, labels=["review:ok", "ai:ok"])]
+    running_title = sch.review_labels.ai_review_run_name(2)
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "behind"},
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [{"id": 999, "display_title": running_title, "status": "in_progress"}],
+        },
+        # Не должен быть вызван вовсе — мутация ниже это и проверяет.
+        "pulls/2/update-branch": AssertionError("update-branch не должен был вызываться"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number is None
+    assert updated is False
+    assert not any("update-branch" in c for c in fake.calls)
+    assert any("летит ai-review" in line and "#2" in line for line in observations)
+    assert not any("не удался" in line for line in (observations + actions))
+
+
 def test_update_branch_or_report_pat_set_called_process_error_includes_stderr(monkeypatch):
     monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    # update_branch сверяет активные ai-review-прогоны ДО push'а (тормоз
+    # гонки, #488) — здесь их нет, дальше должен дойти реальный push и упасть
+    # на subprocess.CalledProcessError, который и есть предмет теста.
+    patch_gh(monkeypatch, FakeGh({"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}))
 
     def fake_run(cmd, **kwargs):
         raise subprocess.CalledProcessError(
@@ -1601,6 +1648,7 @@ def test_update_branch_or_report_pat_set_called_process_error_includes_stderr(mo
         REPO, 2,
         on_success="успех — быть не должно",
         on_budget_exhausted="слот — быть не должно",
+        on_ai_review_running="ai-review летит — быть не должно",
         on_error="#2 — update_branch не удался: {error}",
     )
 
@@ -1613,6 +1661,7 @@ def test_update_branch_or_report_pat_set_success_uses_subprocess(monkeypatch):
     # (не gh()), иначе тест выше проверял бы ветку, которая в проде не
     # используется вовсе.
     monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    patch_gh(monkeypatch, FakeGh({"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}))
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -1626,7 +1675,8 @@ def test_update_branch_or_report_pat_set_success_uses_subprocess(monkeypatch):
     monkeypatch.setattr(sch.subprocess, "run", fake_run)
 
     line = sch.update_branch_or_report(
-        REPO, 2, on_success="✅", on_budget_exhausted="budget", on_error="{error}",
+        REPO, 2, on_success="✅", on_budget_exhausted="budget",
+        on_ai_review_running="ai-review летит — быть не должно", on_error="{error}",
     )
 
     assert line == "✅"

@@ -86,6 +86,16 @@ AI_CHANGES = review_labels.AI_CHANGES
 AI_FAILED = review_labels.AI_FAILED
 AI_VERDICTS = review_labels.AI_VERDICTS
 
+# Видимый след гонки «head PR сменился во время ai-review» (cmd_verdict ниже):
+# без него job зелёный, меток нет, единственный след — ::warning:: в логе шага,
+# который никто не читает без явного повода (живой инцидент 2026-09-06, PR
+# #488 — тормоз самой гонки см. scheduler.py::AiReviewRunning, это не он, а
+# то, что уже прогнало DSH ВПУСТУЮ и вердикт всё равно некуда применить).
+# Marker несёт оба sha перехода — второй прогон на ТОТ ЖЕ переход A→B (retry
+# job'а на неизменной гонке) находит уже опубликованный комментарий и не
+# плодит вторую копию (см. notify_head_moved).
+HEAD_MOVED_MARKER_PREFIX = "<!-- ai-review:head-moved:"
+
 # Номер задачи из текста PR/issue — одно место правды (#187): границы числа
 # с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
 # 33570081734).
@@ -762,6 +772,30 @@ def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str)
           f"эскалация владельцу ({result})")
 
 
+def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head: str) -> None:
+    """Комментарий в PR — единственный видимый след того, что вердикт `verdict`
+    НЕ применён из-за смены head (см. вызовы в cmd_verdict). Job остаётся
+    зелёным (гонка — не ошибка кода, см. AGENTS.md), но без этого следа
+    единственная улика — ::warning:: в логе шага, который никто не открывает
+    без повода.
+
+    Дедуп по marker+shas (#488): листает уже опубликованные комментарии PR и
+    молчит, если переход ИМЕННО old_head→new_head уже отмечен — повторный
+    вызов на тот же переход (retry job'а verdict, не новый пуш) не плодит
+    вторую копию того же следа."""
+    marker = f"{HEAD_MOVED_MARKER_PREFIX}{old_head}:{new_head} -->"
+    for comment in review_labels.list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh):
+        if marker in (comment.get("body") or ""):
+            return
+    body = (
+        f"{marker}\n"
+        f"⏭️ Вердикт `{verdict}` не применён: head PR сменился "
+        f"`{old_head[:12]}` → `{new_head[:12]}` во время ревью — по новому "
+        "head поднимется новое ревью."
+    )
+    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-f", f"body={body}")
+
+
 def cmd_verdict(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
@@ -790,6 +824,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"::warning::head PR #{args.pr} сменился ({args.head[:12]} → "
               f"{pull['head']['sha'][:12]}) — вердикт {verdict} не применяю: "
               f"новый пуш заведёт свежее ревью")
+        notify_head_moved(repo, args.pr, verdict, args.head, pull["head"]["sha"])
         return 0
 
     # Файлы читаются ДО применения вердикта (находка 1 вердикта ai-review
@@ -809,6 +844,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"::warning::head PR #{args.pr} сменился во время чтения файлов "
               f"({args.head[:12]} → {pull_after_files['head']['sha'][:12]}) — "
               f"вердикт {verdict} не применяю: новый пуш заведёт свежее ревью")
+        notify_head_moved(repo, args.pr, verdict, args.head, pull_after_files["head"]["sha"])
         return 0
 
     current = {label["name"] for label in pull["labels"]}
