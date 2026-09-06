@@ -392,9 +392,11 @@ def test_collect_stale_removes_only_expired_and_leaves_trace(monkeypatch):
         "issues/5/comments": ok_no_body(),
     }
     server = install(monkeypatch, FakeServer(routes))
-    lines = ct.collect_stale("o/r", utc(12, 0))
-    assert any("task-5" in line and "снят" in line for line in lines)
-    assert any("task-6" in line and "жив" in line for line in lines)
+    observations, actions = ct.collect_stale("o/r", utc(12, 0))
+    assert any("task-5" in line and "снят" in line for line in actions)
+    # #456: живой замок — наблюдение (ничего не изменилось), не действие
+    assert any("task-6" in line and "жив" in line for line in observations)
+    assert not any("task-6" in line for line in actions)
     assert any("DELETE" in c and "task-5" in c for c in server.calls)
     assert not any("DELETE" in c and "task-6" in c for c in server.calls)
     # след в задаче: комментарий с причиной и порогом
@@ -415,8 +417,8 @@ def test_collect_stale_delete_failure_is_loud_not_fatal(monkeypatch):
             return super().run(args, **kw)
 
     install(monkeypatch, DeleteBroken(routes))
-    lines = ct.collect_stale("o/r", utc(12, 0))
-    assert any("не снят" in line for line in lines)  # не уронил обход, но и не молчит
+    _, actions = ct.collect_stale("o/r", utc(12, 0))
+    assert any("не снят" in line for line in actions)  # не уронил обход, но и не молчит
 
 
 # ── CLI: контракт для каналов worker/hands ───────────────────────────────────────

@@ -267,22 +267,31 @@ def lock_commit_date(repo: str, sha: str) -> datetime:
     return datetime.fromisoformat(commit["commit"]["committer"]["date"].replace("Z", "+00:00"))
 
 
-def collect_stale(repo: str, now: datetime, ttl_hours: float = LOCK_TTL_HOURS) -> list[str]:
+def collect_stale(
+    repo: str, now: datetime, ttl_hours: float = LOCK_TTL_HOURS,
+) -> tuple[list[str], list[str]]:
     """Снять протухшие замки и оставить след в задаче. Назначение при этом не
     трогается: возврат assignee в пул — работа механизма просроченных
     назначений (reap_stale, тот же порог 24 ч) — второе место правды для того
-    же класса создавать запрещено. Замок и назначение протухают в одном такте."""
-    lines = []
+    же класса создавать запрещено. Замок и назначение протухают в одном такте.
+
+    Возвращает (наблюдения, действия) — разведено по #456: «замок ещё жив»
+    ничего не меняет и раньше попадало в тот же список, что реальное снятие
+    протухшего замка, из-за чего этот список был непуст почти всегда (в
+    репозитории почти постоянно есть хотя бы одна живая аренда) и один этот
+    факт красил main() как «есть действия», даже когда снимать было нечего."""
+    observations = []
+    actions = []
     for lock in list_locks(repo):
         date = lock_commit_date(repo, lock["sha"])
         if not is_stale(date, now, ttl_hours):
-            lines.append(f"🔒 замок task-{lock['task']} жив "
-                         f"({lock_age_hours(date, now):.1f} ч из {ttl_hours})")
+            observations.append(f"🔒 замок task-{lock['task']} жив "
+                                 f"({lock_age_hours(date, now):.1f} ч из {ttl_hours})")
             continue
         try:
             gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{lock['task']}")
         except GhError as error:
-            lines.append(f"⚠️ замок task-{lock['task']} не снят: {error}")
+            actions.append(f"⚠️ замок task-{lock['task']} не снят: {error}")
             continue
         try:
             gh("-X", "POST", f"repos/{repo}/issues/{lock['task']}/comments",
@@ -293,10 +302,10 @@ def collect_stale(repo: str, now: datetime, ttl_hours: float = LOCK_TTL_HOURS) -
                    "с тем же порогом. Задача свободна — бери через claim."
                ))
         except RuntimeError as error:
-            lines.append(f"⚠️ след в #{lock['task']} не оставлен: {error}")
-        lines.append(f"♻️ замок task-{lock['task']} протух "
-                     f"({lock_age_hours(date, now):.1f} ч) — снят, задача в пул")
-    return lines
+            actions.append(f"⚠️ след в #{lock['task']} не оставлен: {error}")
+        actions.append(f"♻️ замок task-{lock['task']} протух "
+                       f"({lock_age_hours(date, now):.1f} ч) — снят, задача в пул")
+    return observations, actions
 
 
 def release_merged(repo: str, task_numbers: list[int]) -> list[str]:

@@ -277,9 +277,9 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
 
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False                # диспатч остановлен
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in actions)  # первая тревога серии — действие
     assert len(posted) == 1 and len(sent) == 1
     assert pg.PAUSE_MARKER in posted[0] and "actions/runs/3" in sent[0]
 
@@ -289,7 +289,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
         {"created_at": "2026-08-31T11:59:00Z", "body": f"x {pg.PAUSE_MARKER}"}]
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: posted.append("spam"))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append("spam") or True)
-    _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    _, _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed2 is False
     assert posted == [posted[0]] and sent == [sent[0]]
 
@@ -303,9 +303,11 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
-    assert any("разрешён" in line for line in lines)
+    # closed-состояние ничего не меняет — это наблюдение (#456), не действие
+    assert any("разрешён" in line for line in observations)
+    assert actions == []
 
 
 # ── Полуоткрытое состояние (#205): чистые решения ─────────────────────────────────
@@ -652,11 +654,11 @@ def test_gate_first_entry_posts_pause_marker_and_blocks(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
 
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
     assert len(posted) == 1
     assert pg.PAUSE_MARKER in posted[0] and pg.PROBE_MARKER not in posted[0]
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in actions)  # первая тревога — действие
 
 
 def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
@@ -670,9 +672,11 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    # state=="open" (выдержка не истекла, уже оповещено) ничего не меняет — наблюдение
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
     # ровно 15 минут прошло — выдержка истекла: ровно одна проба, диспатч разрешён
     fake.routes["issues/120/comments"] = [
@@ -680,11 +684,11 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert len(posted) == 1 and f"{pg.PROBE_MARKER} 1]" in posted[0]
-    # проба отличима отдельной строкой в отчёте — иначе её не отладить
-    assert any("пробный диспатч после паузы" in line for line in lines)
+    # проба отличима отдельной строкой в отчёте — иначе её не отладить (действие)
+    assert any("пробный диспатч после паузы" in line for line in actions)
 
 
 def probe_body(attempt: int) -> str:
@@ -705,9 +709,10 @@ def test_gate_probe_success_closes_breaker_via_reset_streak(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
-    assert any("разрешён" in line for line in lines)
+    assert any("разрешён" in line for line in observations)
+    assert actions == []
 
 
 def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
@@ -724,9 +729,11 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    # state=="open" (уже оповещено) — наблюдение, не действие
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
     # доказательство мутацией: без роста выдержки (attempt всегда 1) те же
     # 20 минут с последней пробы были бы >= 15 и пропустили бы вторую пробу —
@@ -734,7 +741,7 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     fake.routes["issues/120/comments"] = [
         {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
         {"created_at": "2026-08-31T11:40:00Z", "body": probe_body(1)}]
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
+    _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
     assert allowed is False  # exp-выдержка (30 мин) ещё не истекла
     broken_backoff_would_allow = pg.minutes_between(
         utc(2026, 8, 31, 11, 40), NOW) >= pg.probe_backoff_minutes(1)
@@ -770,9 +777,10 @@ def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
     assert pg.decide_dispatch(0) is True
 
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
 
 def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
@@ -803,7 +811,7 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
         from datetime import timedelta
         current_now[0] = start + timedelta(minutes=minute_offset)
         fake.routes["issues/120/comments"] = list(comments)
-        _, allowed = pg.conveyor_gate("mytab0r/edge-harness", current_now[0])
+        _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", current_now[0])
         if allowed:
             probes += 1
 

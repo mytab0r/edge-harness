@@ -521,9 +521,19 @@ def pr_bad_checks(repo: str, pull: dict) -> list[str]:
     return bad_check_names(pr_check_runs(repo, pull))
 
 
-def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool, int | None, bool]:
-    """Возвращает (строки отчёта, был_ли_жёсткий_сбой_after_merge, номер слитого
-    PR или None, была_ли_обновлена_ветка) — см. after_merge.
+def merge_queue(
+    repo: str, pulls: list[dict],
+) -> tuple[list[str], list[str], bool, int | None, bool]:
+    """Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_after_merge,
+    номер слитого PR или None, была_ли_обновлена_ветка) — см. after_merge.
+
+    Наблюдения vs действия разведены по #456: причины ПРОПУСКА кандидата
+    (черновик, не тот mergeable_state, проверки не готовы/красные, гейт меток
+    не пройден, слот update_branch уже занят этим же проходом) ничего не
+    меняют — раньше они попадали в тот же список, что реальное слияние или
+    обновление ветки, и делали merge_lines непустым на каждом проходе с
+    открытой, но не готовой очередью PR (обычное дело), заставляя main()
+    считать это «действием».
 
     Последние два поля (#297) — сигнал для merge_loop ниже: слитый номер
     решает, продолжать ли цикл (очередь изменилась — есть смысл посмотреть
@@ -534,7 +544,7 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool, int | No
     ОДНОЙ ветки (сериализация #252/#288 не меняется) — цикл вокруг может
     делать таких проходов несколько подряд, каждый со своим слотом
     update_branch (см. merge_loop)."""
-    lines = []
+    actions: list[str] = []
     skipped = []
     updated = False
     for pull in pulls:
@@ -562,21 +572,29 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool, int | No
             # возможен UpdateBranchBudgetExhausted, а не только сетевой сбой.
             # Обработка обоих исходов — в update_branch_or_report (#288), не здесь.
             success_text = f"#{pull['number']} — обновлена из main, проверки пойдут заново"
+            budget_exhausted_text = (
+                f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
+                "этого прохода уже занят другим PR; подтянет следующая итерация цикла слияний (#252/#297)"
+            )
             result = update_branch_or_report(
                 repo, pull["number"],
                 on_success=success_text,
-                on_budget_exhausted=(
-                    f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
-                    "этого прохода уже занят другим PR; подтянет следующая итерация цикла слияний (#252/#297)"
-                ),
+                on_budget_exhausted=budget_exhausted_text,
                 on_error=(
                     f"#{pull['number']} — behind main и близок к слиянию, но update_branch не удался "
                     "(вероятен конфликт — попадёт под mark_conflicts): {error}"
                 ),
             )
-            skipped.append(result)
             if result == success_text:
                 updated = True
+                actions.append(result)
+            elif result == budget_exhausted_text:
+                # Слот занят этим же прогоном — попытки push'а не было вовсе.
+                skipped.append(result)
+            else:
+                # Сетевой/иной сбой реальной попытки push'а — действие с
+                # неудачным результатом, не наблюдение.
+                actions.append(result)
             continue
         if state not in ("clean", "unstable", "has_hooks"):
             skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
@@ -603,29 +621,29 @@ def merge_queue(repo: str, pulls: list[dict]) -> tuple[list[str], bool, int | No
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
             "-f", f"merge_method={MERGE_METHOD}",
         )
-        lines.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
-        if skipped:
-            lines += [f"   (отложены: {item})" for item in skipped]
+        actions.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
+        observations = [f"⏸️ {item}" for item in skipped]
         other_pulls = [p for p in pulls if p["number"] != pull["number"]]
-        after_lines, hard_failure = after_merge(repo, pull, other_pulls)
-        lines += after_lines
-        return lines, hard_failure, pull["number"], True  # один за проход: см. merge_loop
-    if skipped:
-        lines += [f"⏸️ {item}" for item in skipped]
-    return lines, False, None, updated
+        after_observations, after_actions, hard_failure = after_merge(repo, pull, other_pulls)
+        observations += after_observations
+        actions += after_actions
+        return observations, actions, hard_failure, pull["number"], True  # один за проход: см. merge_loop
+    observations = [f"⏸️ {item}" for item in skipped]
+    return observations, actions, False, None, updated
 
 
-def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool, list[dict]]:
+def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool, list[dict]]:
     """Цикл слияний одного прогона (#297) — main() зовёт эту функцию вместо
-    одиночного merge_queue. Возвращает (строки отчёта, был_ли_жёсткий_сбой,
-    финальный список открытых PR) — третье поле добавлено дедупликацией
-    запросов GitHub API (#443): раньше main() ПОСЛЕ этой функции трижды сам
-    перечитывал open_pulls(repo) для trigger_ai_review/stale_ready_pulls/
-    accept_merged_tasks, хотя нужный снежок уже лежит здесь — цикл сам ведёт
-    актуальный `pulls`, обновляя его КАЖДЫЙ раз, когда что-то реально
-    изменилось (слияние или подтянутая ветка), и не трогая его, когда проход
-    не сделал ничего. Возвращаемое значение — тот же снимок, что дал бы
-    свежий open_pulls(repo) в момент возврата, без отдельного HTTP-вызова.
+    одиночного merge_queue. Возвращает (наблюдения, действия,
+    был_ли_жёсткий_сбой, финальный список открытых PR) — четвёртое поле
+    добавлено дедупликацией запросов GitHub API (#443): раньше main() ПОСЛЕ
+    этой функции трижды сам перечитывал open_pulls(repo) для
+    trigger_ai_review/stale_ready_pulls/accept_merged_tasks, хотя нужный
+    снимок уже лежит здесь — цикл сам ведёт актуальный `pulls`, обновляя его
+    КАЖДЫЙ раз, когда что-то реально изменилось (слияние или подтянутая
+    ветка), и не трогая его, когда проход не сделал ничего. Возвращаемое
+    значение — тот же снимок, что дал бы свежий open_pulls(repo) в момент
+    возврата, без отдельного HTTP-вызова.
 
     Каждая итерация — один проход merge_queue (сериализация «одно слияние
     или одно обновление ветки за проход» не меняется, #252/#288); слот
@@ -644,7 +662,8 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool, list[dict
     и повторяет — обновлённому PR нужно время на пересчёт проверок
     (pr-review.yml/ai-review.yml запускаются заново), а не мгновенно
     доступный mergeable_state."""
-    lines: list[str] = []
+    observations: list[str] = []
+    actions: list[str] = []
     hard_failure = False
     merged_count = 0
     deadline = time.monotonic() + MERGE_LOOP_TIMEOUT_SECONDS
@@ -652,8 +671,9 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool, list[dict
         # Слот на ЭТОТ проход (см. merge_queue) — сбрасывается заново каждую
         # итерацию, не один раз на весь прогон (было так до #297).
         reset_update_branch_budget()
-        iter_lines, iter_hard_failure, merged_number, updated = merge_queue(repo, pulls)
-        lines += iter_lines
+        iter_observations, iter_actions, iter_hard_failure, merged_number, updated = merge_queue(repo, pulls)
+        observations += iter_observations
+        actions += iter_actions
         hard_failure = hard_failure or iter_hard_failure
         if merged_number is not None:
             merged_count += 1
@@ -667,11 +687,11 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], bool, list[dict
         time.sleep(min(MERGE_LOOP_POLL_SECONDS, remaining))
         pulls = open_pulls(repo)  # проверки могли завершиться за паузу
     if merged_count:
-        lines.append(
+        actions.append(
             f"🔁 цикл слияний: {merged_count} PR слито за прогон "
             f"(потолок {MERGE_LOOP_MAX_MERGES}, #297)"
         )
-    return lines, hard_failure, pulls
+    return observations, actions, hard_failure, pulls
 
 
 # ── Сессии раннеров в морде dsh-edge (#119) ───────────────────────────────────────
@@ -800,17 +820,24 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     return lines, hard_failure
 
 
-def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) -> tuple[list[str], bool]:
+def after_merge(
+    repo: str, pull: dict, other_pulls: list[dict] | None = None,
+) -> tuple[list[str], list[str], bool]:
     """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
     (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно.
     other_pulls — открытые PR, кроме только что слитого (#196, поведение 3:
     подтянуть их из main); по умолчанию пусто — вызывающий код без списка
     остальных PR просто не подтягивает никого (сохраняет старое поведение).
 
-    Возвращает (строки отчёта, был_ли_жёсткий_сбой_архивации). Мерж уже
-    состоялся — жёсткий сбой не откатывает и не блокирует эту функцию, только
-    поднимается наверх для эскалации (main() красит прогон ПОСЛЕ мержа)."""
-    lines = []
+    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_архивации) — #456:
+    все строки этой функции сама по себе — действия (мерж уже случился,
+    release/dispatch/напоминание/Telegram/архив — реальные вызовы), кроме
+    того, что кладёт update_remaining_pulls (там есть настоящие наблюдения —
+    см. её докстринг). Мерж уже состоялся — жёсткий сбой не откатывает и не
+    блокирует эту функцию, только поднимается наверх для эскалации (main()
+    красит прогон ПОСЛЕ мержа)."""
+    observations: list[str] = []
+    actions = []
     hard_failure = False
     number = pull["number"]
     # Пагинация (#294, третье место того же класса: check_pr.py и ai_review.py
@@ -824,7 +851,7 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
             check=True,
         )
-        lines.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
+        actions.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
     # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю про реальный пост-мерж прогон,
@@ -856,9 +883,9 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
         # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
         # Идемпотентно: замка может не быть (канал без аренды) — это не ошибка.
         try:
-            lines.append(f"🔓 {claim_task.release(repo, int(task_number))}")
+            actions.append(f"🔓 {claim_task.release(repo, int(task_number))}")
         except RuntimeError as error:
-            lines.append(f"⚠️ замок task-{task_number} не снят: {error}")
+            actions.append(f"⚠️ замок task-{task_number} не снят: {error}")
         try:
             issue = gh(f"repos/{repo}/issues/{task_number}")
             if "pull_request" in issue or issue["state"] != "open":
@@ -901,10 +928,10 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
                 "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
                 "-f", "body=" + reminder,
             )
-            lines.append(f"🔁 #{task_number}: напоминание про пост-мерж проверку — закрывает приёмка (#227)")
+            actions.append(f"🔁 #{task_number}: напоминание про пост-мерж проверку — закрывает приёмка (#227)")
         except RuntimeError as error:
             # один кривой реф не должен ронять остальные действия after_merge
-            lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
+            actions.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
     # Telegram «задача выполнена — слито в main» (#170): мерж — единственный факт,
     # на котором звучит «выполнена»; раньше об этом канале молчал вовсе, и владелец
     # узнавал о готовности только руками. Один PR = одно сообщение (по задаче
@@ -919,20 +946,22 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             merge_telegram_text(repo, pull["number"], tg_task_number, tg_task_title),
             as_html=True,
         ):
-            lines.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
+            actions.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
         else:
-            lines.append("⚠️ Telegram: сообщение о слиянии не доставлено — след в задаче выше остаётся местом правды")
+            actions.append("⚠️ Telegram: сообщение о слиянии не доставлено — след в задаче выше остаётся местом правды")
     # Архив сессий раннеров (#119) — только для ЗАДАЧ пула (метка task): номер из
     # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
     # его нельзя — утащим чужую живую сессию в архив.
     if task_numbers:
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
-        lines += archive_lines
-    lines += update_remaining_pulls(repo, pull["number"], other_pulls or [])
-    return lines, hard_failure
+        actions += archive_lines
+    remaining_observations, remaining_actions = update_remaining_pulls(repo, pull["number"], other_pulls or [])
+    observations += remaining_observations
+    actions += remaining_actions
+    return observations, actions, hard_failure
 
 
-def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict]) -> list[str]:
+def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict]) -> tuple[list[str], list[str]]:
     """#196, поведение 3: сливаем по одному, а очередь пересчитывается только
     следующим запуском — без этого каждое слияние гарантированно оставляет
     остаток BEHIND main. gh pr update-branch для остальных открытых PR;
@@ -965,32 +994,45 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     кандидаты не молчат — они получают отдельную строку с указанием, что
     подтянет их следующий проход цикла слияний (merge_loop, #297; слот
     сбрасывается заново КАЖДЫЙ проход — reset_update_branch_budget внутри
-    merge_loop, не один раз на весь запуск, как было до #297)."""
-    lines = []
+    merge_loop, не один раз на весь запуск, как было до #297).
+
+    Возвращает (наблюдения, действия) — разведено по #456: «не подтянут, не
+    близок к слиянию» и «слот уже занят другим PR» ничего не меняют (push не
+    делался вовсе); успешное обновление и сетевой сбой при реальной попытке
+    push'а — оба действия (второе — попытка с эффектом, пусть и неудачным)."""
+    observations: list[str] = []
+    actions: list[str] = []
     for other in other_pulls:
         if other["number"] == merged_number or other.get("draft"):
             continue
         if not review_labels.should_update_branch(other["labels"]):
-            lines.append(
+            observations.append(
                 f"⏸️ PR #{other['number']} не подтянут из main после слияния #{merged_number} "
                 "— не близок к слиянию и не в конфликте (#252)"
             )
             continue
         # Обработка всех трёх исходов — в update_branch_or_report (#288), не здесь.
-        lines.append(update_branch_or_report(
+        budget_exhausted_text = (
+            f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
+            "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
+            "оркестратора (#252)"
+        )
+        result = update_branch_or_report(
             repo, other["number"],
             on_success=f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}",
-            on_budget_exhausted=(
-                f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
-                "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
-                "оркестратора (#252)"
-            ),
+            on_budget_exhausted=budget_exhausted_text,
             on_error=(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "
                 "(вероятен конфликт — попадёт под mark_conflicts): {error}"
             ),
-        ))
-    return lines
+        )
+        if result == budget_exhausted_text:
+            # Слот занят самим этим прогоном (не сеть/сервер) — попытки push'а
+            # не было вовсе, значит и наблюдение, не действие.
+            observations.append(result)
+        else:
+            actions.append(result)
+    return observations, actions
 
 
 def worker_runs_active(repo: str) -> bool:
@@ -1007,12 +1049,17 @@ def worker_runs_active(repo: str) -> bool:
     return False
 
 
-def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
+def dispatch_worker(repo: str, pool: list[dict]) -> tuple[list[str], list[str]]:
     """Пульс конвейера: свободная задача есть, воркер простаивает → ровно один
     dispatch worker.yml за запуск оркестратора. Best-effort по построению:
     прав на dispatch нет, workflow нет на main, сеть — любой сбой диспатча
-    не роняет оркестратор, слияния важнее подряда воркеру."""
-    lines = []
+    не роняет оркестратор, слияния важнее подряда воркеру.
+
+    Возвращает (наблюдения, действия) — разведено по #456: «воркер уже
+    работает — dispatch не нужен» ничего не меняет, это факт состояния, а не
+    действие этого прогона."""
+    observations: list[str] = []
+    actions: list[str] = []
     # Старейшая свободная — та же, которую воркер выберет oldest_free
     # (scripts/lib/free_task.py, #245): issues API отдаёт пул по убыванию
     # новизны, и без сортировки строка отчёта называла бы свежайшую задачу,
@@ -1023,23 +1070,23 @@ def dispatch_worker(repo: str, pool: list[dict]) -> list[str]:
         key=lambda issue: issue["number"],
     )
     if not free:
-        return lines
+        return observations, actions
     try:
         if worker_runs_active(repo):
-            lines.append("👷 воркер уже работает — dispatch не нужен")
-            return lines
+            observations.append("👷 воркер уже работает — dispatch не нужен")
+            return observations, actions
         gh(
             "-X", "POST",
             f"repos/{repo}/actions/workflows/worker.yml/dispatches",
             "-f", "ref=main",
         )
-        lines.append(
+        actions.append(
             f"👷 свободная задача #{free[0]['number']} — worker.yml запущен "
             "(воркер сам назначится и откроет PR)"
         )
     except RuntimeError as error:
-        lines.append(f"⚠️ dispatch воркера не удался (не критично): {error}")
-    return lines
+        actions.append(f"⚠️ dispatch воркера не удался (не критично): {error}")
+    return observations, actions
 
 
 # ── #196, поведение 1: готовый PR без вердикта — дёрнуть гейт самому ─────────────
@@ -1088,8 +1135,12 @@ def ai_review_retry_count(repo: str, pr_number: int) -> int:
     return len(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
 
 
-def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
-    lines = []
+def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list[str], list[str]]:
+    """Возвращает (наблюдения, действия) — разведено по #456: «бюджет
+    авто-повторов исчерпан, не дёргаю снова» ничего не меняет (диспатча не
+    было) и раньше попадало в тот же список, что реальный запуск ai-review.yml."""
+    observations: list[str] = []
+    actions: list[str] = []
     for pull in pulls:
         labels = {label["name"] for label in pull["labels"]}
         if not review_labels.gate1_decided(labels):
@@ -1106,7 +1157,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             continue  # ещё не истёк порог ожидания вердикта
         attempts = ai_review_retry_count(repo, pull["number"])
         if attempts >= AI_REVIEW_MAX_ATTEMPTS:
-            lines.append(
+            observations.append(
                 f"⏸️ PR #{pull['number']} без вердикта AI {int(age)} мин, но "
                 f"авто-повторов уже {attempts}/{AI_REVIEW_MAX_ATTEMPTS} — не дёргаю снова, нужен человек"
             )
@@ -1125,11 +1176,11 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             f"{gate1_label if not needs_retry else review_labels.AI_FAILED} держится "
             f"{int(age)} мин без готового вердикта (попытка {attempts + 1}/{AI_REVIEW_MAX_ATTEMPTS}).",
         )
-        lines.append(
+        actions.append(
             f"🤖 PR #{pull['number']}: ai-review.yml запущен оркестратором "
             f"(попытка {attempts + 1}/{AI_REVIEW_MAX_ATTEMPTS}, {int(age)} мин без вердикта)"
         )
-    return lines
+    return observations, actions
 
 
 # ── #196, поведение 2: нездоровый PR — вернуть задачу в пул ──────────────────────
@@ -1706,7 +1757,7 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
 def accept_merged_tasks(
     repo: str, pool: list[dict], merged: dict[int, dict], now: datetime | None = None,
     *, open_pulls_list: list[dict],
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], list[str], bool]:
     """Стадия приёмки (#227) — см. блок комментариев выше. merged — карта
     Task#N → слитый PR (merged_pr_map(all_merged_pulls(repo)), один общий
     обход на весь прогон оркестратора, тот же, что использует reap_stale).
@@ -1718,6 +1769,11 @@ def accept_merged_tasks(
     означает «других открытых PR не было», но это решение вызывающего, а не
     дефолт по умолчанию.
 
+    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой) — #456: «улика ещё
+    не готова» и «приёмка отложена другим открытым PR» ничего не меняют
+    (ничего не запощено, ничего не закрыто) — раньше эти строки попадали в
+    тот же список, что реальные закрытия/провалы/эскалации.
+
     Живой случай (проверки на входе вместо гвардий постфактум, задача о
     приёмке при открытом втором PR): приёмка закрыла #320, пока по нему был
     открыт второй PR #325 — тот немедленно упал на contract («задача #320
@@ -1726,7 +1782,8 @@ def accept_merged_tasks(
     же объявляет ещё один открытый PR: закрытие оборвало бы его работу.
     Проверка ниже — до PATCH state=closed, не после."""
     now = now or datetime.now(timezone.utc)
-    lines: list[str] = []
+    observations: list[str] = []
+    actions: list[str] = []
     hard_failure = False
     for issue in pool:
         number = issue["number"]
@@ -1760,11 +1817,11 @@ def accept_merged_tasks(
                             f"{ACCEPTANCE_EPIC_MARKER} все {total} дочерних sub-issues "
                             f"закрыты — эпик выглядит завершённым и требует ручного "
                             f"закрытия (приёмка эпики автоматом не закрывает).")
-                        lines.append(
+                        actions.append(
                             f"📋 #{number}: {ACCEPTANCE_EPIC_MARKER} все {total} "
                             f"дочерних sub-issues закрыты — требует ручного закрытия")
                 except RuntimeError as error:
-                    lines.append(f"⚠️ #{number}: маркер завершённого эпика не поставлен — {error}")
+                    actions.append(f"⚠️ #{number}: маркер завершённого эпика не поставлен — {error}")
             continue
         pull = merged.get(number)
         if pull is None:
@@ -1776,7 +1833,7 @@ def accept_merged_tasks(
             try:
                 already_marked = bool(issue_marker_times(repo, number, partial_marker))
             except RuntimeError as error:
-                lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+                actions.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
                 continue
             # Дедуп по факту завершения расчистки, не по одному лишь маркеру
             # (находка AI-ревью PR #342, класс воспроизведён в этой же ветке
@@ -1794,31 +1851,31 @@ def accept_merged_tasks(
                 try:
                     post_issue_comment(repo, number, text)
                 except RuntimeError as error:
-                    lines.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
+                    actions.append(f"⚠️ #{number}: отметка «требует проверки человеком» не завершена — {error}")
                     continue
-                lines.append(f"⚠️ #{number}: {text}")
+                actions.append(f"⚠️ #{number}: {text}")
             if issue["assignees"]:
                 who = ", ".join(a["login"] for a in issue["assignees"])
                 try:
                     gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
                 except RuntimeError as error:
-                    lines.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
+                    actions.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
                     continue
             try:
-                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+                actions.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
                 # Та же гарантия, что и у fail/ok-веток ниже: сбой снятия замка
                 # не должен ронять обход остальных задач пула (найдено при
                 # разборе AI-ревью PR #342 — было «висит вечно», без освобождения
                 # ни assignee, ни замка не снимался).
-                lines.append(f"⚠️ замок task-{number} не снят: {error}")
+                actions.append(f"⚠️ замок task-{number} не снят: {error}")
             continue
 
         fail_marker = f"{ACCEPTANCE_FAIL_MARKER} PR #{pull['number']}"
         try:
             already_failed = bool(issue_marker_times(repo, number, fail_marker))
         except RuntimeError as error:
-            lines.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
+            actions.append(f"⚠️ #{number}: комментарии не прочитаны, приёмка отложена: {error}")
             continue
         if already_failed:
             if not issue["assignees"]:
@@ -1831,12 +1888,12 @@ def accept_merged_tasks(
             try:
                 gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
             except RuntimeError as error:
-                lines.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
+                actions.append(f"⚠️ #{number}: assignee не снят (маркер уже стоит) — {error}")
                 continue
             try:
-                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+                actions.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
-                lines.append(f"⚠️ замок task-{number} не снят: {error}")
+                actions.append(f"⚠️ замок task-{number} не снят: {error}")
             continue
 
         category = None
@@ -1885,10 +1942,10 @@ def accept_merged_tasks(
             except RuntimeError:
                 already_escalated = []  # маркер не прочитан — эскалируем громко, не молчим
             if already_escalated:
-                lines.append(f"{text} (уже эскалировано, повторный Telegram не шлём)")
+                actions.append(f"{text} (уже эскалировано, повторный Telegram не шлём)")
             else:
                 escalation = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}")
-                lines.append(f"{text} ({escalation})")
+                actions.append(f"{text} ({escalation})")
             hard_failure = True
             continue
 
@@ -1902,10 +1959,10 @@ def accept_merged_tasks(
                 try:
                     already_escalated = issue_marker_times(repo, number, pending_marker)
                 except RuntimeError as error:
-                    lines.append(f"⚠️ #{number}: маркер зависшей приёмки не прочитан: {error}")
+                    actions.append(f"⚠️ #{number}: маркер зависшей приёмки не прочитан: {error}")
                     continue
                 if already_escalated:
-                    lines.append(
+                    observations.append(
                         f"⏳ #{number}: улика ({category}) не готова дольше "
                         f"{ACCEPTANCE_PENDING_HOURS} ч — уже эскалировано, жду новую работу")
                     continue
@@ -1913,10 +1970,10 @@ def accept_merged_tasks(
                         f"pending дольше {ACCEPTANCE_PENDING_HOURS} ч после мержа — {detail}")
                 escalation = escalate(repo, WATCHDOG_ISSUE, text)
                 post_issue_comment(repo, number, f"{pending_marker} {detail} ({escalation}).")
-                lines.append(text)
+                actions.append(text)
                 hard_failure = True
                 continue
-            lines.append(f"⏳ #{number}: улика ({category}) ещё не готова — {detail}")
+            observations.append(f"⏳ #{number}: улика ({category}) ещё не готова — {detail}")
             continue
 
         if state in ("ok", "docs"):
@@ -1932,7 +1989,7 @@ def accept_merged_tasks(
             ]
             if other_open:
                 others = ", ".join(f"#{p['number']}" for p in other_open)
-                lines.append(
+                observations.append(
                     f"⏳ #{number}: приёмка отложена — задачу ещё объявляет "
                     f"открытый PR {others}, закрывать по PR #{pull['number']} рано ({category})")
                 continue
@@ -1951,18 +2008,18 @@ def accept_merged_tasks(
                 # приём чтению маркеров и claim_task.release ниже (найдено в
                 # разборе AI-ревью PR #253: докстринг функции обещал это для
                 # ВСЕХ пунктов пульса, а тут обещание не выполнялось).
-                lines.append(f"⚠️ #{number}: закрытие приёмкой не завершено — {error}")
+                actions.append(f"⚠️ #{number}: закрытие приёмкой не завершено — {error}")
                 continue
             try:
-                lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+                actions.append(f"🔓 {claim_task.release(repo, int(number))}")
             except RuntimeError as error:
                 # claim_task.release сам возвращает строку (не исключение) для
                 # «замка не было» (см. _ref_missing) — RuntimeError сюда долетает
                 # только на настоящей поломке (сеть/права/5xx), и её нельзя
                 # глотать молча (тот же приём, что уже используют after_merge/
                 # unhealthy_pulls).
-                lines.append(f"⚠️ замок task-{number} не снят: {error}")
-            lines.append(f"✅ #{number}: закрыта приёмкой ({category}) — {detail}")
+                actions.append(f"⚠️ замок task-{number} не снят: {error}")
+            actions.append(f"✅ #{number}: закрыта приёмкой ({category}) — {detail}")
             continue
 
         # state == "fail"
@@ -1976,14 +2033,35 @@ def accept_merged_tasks(
                 who = ", ".join(a["login"] for a in issue["assignees"])
                 gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
         except RuntimeError as error:
-            lines.append(f"⚠️ #{number}: отметка провала приёмки не завершена — {error}")
+            actions.append(f"⚠️ #{number}: отметка провала приёмки не завершена — {error}")
             continue
         try:
-            lines.append(f"🔓 {claim_task.release(repo, int(number))}")
+            actions.append(f"🔓 {claim_task.release(repo, int(number))}")
         except RuntimeError as error:
-            lines.append(f"⚠️ замок task-{number} не снят: {error}")
-        lines.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
-    return lines, hard_failure
+            actions.append(f"⚠️ замок task-{number} не снят: {error}")
+        actions.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
+    return observations, actions, hard_failure
+
+
+def render_action_report(observations: list[str], actions: list[str]) -> list[str]:
+    """Собирает секции отчёта из уже классифицированных источников (#456):
+    «наблюдения» (замок ещё жив, PR в очереди, дозволен диспатч без изменений
+    и т.п.) — факты без изменения состояния, показываются отдельно и всегда,
+    если есть. «### Действия»/«Действий не требуется» решается ПО СПИСКУ
+    ДЕЙСТВИЙ, не по факту наличия любых строк вообще — до #456 главный
+    источник лжи был именно здесь: conveyor_gate в здоровом состоянии
+    (диспатч разрешён без изменений — обычное дело) и collect_stale
+    («замок жив» — почти всегда есть хоть одна активная аренда) сами по себе
+    делали список «есть что показать» непустым на КАЖДОМ прогоне, даже когда
+    планировщик не изменил ни одного бита состояния."""
+    result: list[str] = []
+    if observations:
+        result += ["", "### Наблюдения (без изменения состояния)", *observations]
+    if actions:
+        result += ["", "### Действия", *actions]
+    else:
+        result += ["", "Действий не требуется."]
+    return result
 
 
 def main() -> int:
@@ -2022,12 +2100,18 @@ def main() -> int:
     # и accept_merged_tasks ниже видят актуальное состояние без второго обхода.
     pool = open_task_issues(repo)
 
+    # Наблюдения и действия разведены по #456 — см. render_action_report:
+    # функции ниже возвращают их отдельно там, где смешивали раньше; там, где
+    # функция и раньше была чистым источником действий (reap_stale/
+    # mark_conflicts/unhealthy_pulls/stale_ready_pulls/reject_reopened_tasks —
+    # строка появляется, только если состояние реально изменилось), список
+    # идёт прямо в actions без переклассификации.
     stale_lines = reap_stale(repo, now, pulls, merged, pool=pool)
     try:
-        lease_lines = claim_task.collect_stale(repo, now)
+        lease_observations, lease_actions = claim_task.collect_stale(repo, now)
     except RuntimeError as error:
         # сборщик замков не должен блокировать слияния, но и не молчит (#124-класс)
-        lease_lines = [f"⚠️ обход замков задач не удался: {error}"]
+        lease_observations, lease_actions = [], [f"⚠️ обход замков задач не удался: {error}"]
     # collect_stale трогает только замки задач/комментарии, не PR (#443) —
     # повторное чтение open_pulls(repo) здесь было чистой тратой: состояние
     # PR не могло измениться со времени снимка выше.
@@ -2036,13 +2120,13 @@ def main() -> int:
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
     unhealthy_lines = unhealthy_pulls(repo, now, pulls, pool=pool)
-    merge_lines, archive_hard_failure, pulls = merge_loop(repo, pulls)
+    merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
     # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
     # вернул актуальный список открытых PR (#443): если он что-то слил или
     # подтянул за свой цикл, снимок обновлён ВНУТРИ самой функции — второй
     # HTTP-вызов open_pulls(repo) здесь не нужен, closed-номера уже отфильтрованы.
-    ai_retry_lines = trigger_ai_review(repo, now, pulls)
+    ai_observations, ai_actions = trigger_ai_review(repo, now, pulls)
     # Инвариант issue #269: готовый PR, который так и не слился, кричит — тот же
     # снимок, что уже обслужил trigger_ai_review выше (#443: раньше здесь был
     # ЕЩЁ один открытый open_pulls(repo), хотя между двумя вызовами ничто не
@@ -2063,27 +2147,31 @@ def main() -> int:
     # инцидент #320/#325): свежий снимок открытых PR НАМЕРЕННО не переиспользует
     # pulls выше — PR, который стал причиной этой приёмки, мог открыться прямо
     # перед этой строкой, и только явный поздний запрос страхует от гонки.
-    accept_lines, accept_hard_failure = accept_merged_tasks(
+    accept_observations, accept_actions, accept_hard_failure = accept_merged_tasks(
         repo, pool, merged, now, open_pulls_list=open_pulls(repo))
-    if accept_lines:
+    if accept_actions:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])
     taken = len(pool) - free
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
 
     # Предохранитель (#120) решает, разрешён ли диспатч воркера в этом пульсе.
-    conveyor_lines, dispatch_allowed = conveyor_gate(repo, now)
-    worker_lines = dispatch_worker(repo, pool) if dispatch_allowed else []
-
-    if (stale_lines or conflict_lines or unhealthy_lines or merge_lines or ai_retry_lines
-            or stale_ready_lines or reopen_lines or accept_lines or lease_lines or conveyor_lines
-            or worker_lines):
-        lines += ["", "### Действия",
-                  *stale_lines, *lease_lines, *conflict_lines, *unhealthy_lines, *merge_lines,
-                  *ai_retry_lines, *stale_ready_lines, *reopen_lines, *accept_lines, *conveyor_lines,
-                  *worker_lines]
+    conveyor_observations, conveyor_actions, dispatch_allowed = conveyor_gate(repo, now)
+    if dispatch_allowed:
+        worker_observations, worker_actions = dispatch_worker(repo, pool)
     else:
-        lines += ["", "Действий не требуется."]
+        worker_observations, worker_actions = [], []
+
+    observations = (
+        lease_observations + merge_observations + ai_observations
+        + accept_observations + conveyor_observations + worker_observations
+    )
+    actions = (
+        stale_lines + lease_actions + conflict_lines + unhealthy_lines + merge_actions
+        + ai_actions + stale_ready_lines + reopen_lines + accept_actions + conveyor_actions
+        + worker_actions
+    )
+    lines += render_action_report(observations, actions)
 
     # Приёмка (#227): жёсткий сбой уже эскалирован по каждой затронутой задаче
     # внутри accept_merged_tasks — здесь только красим прогон, второй сигнал

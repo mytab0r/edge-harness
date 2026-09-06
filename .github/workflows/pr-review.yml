@@ -20,10 +20,15 @@
 # scheduler.py → worker.yml. Ставить это на `labeled` нельзя: метку тоже
 # ставит GITHUB_TOKEN, а `on: pull_request: [labeled]` для такого события НЕ
 # создаёт рана (замерено 2026-08-31, #18, тот же файл-источник) — explicit
-# workflow_dispatch обходит именно эту ловушку. Диспатч безусловный (не только
-# при review:ok): review:changes-requested тоже может разблокировать других
-# кандидатов в очереди (например снять conflict), а orchestra.yml сам решает,
-# есть ли что сливать — быстро и дёшево, если нечего.
+# workflow_dispatch обходит именно эту ловушку. Диспатч безусловный по СОБЫТИЮ
+# (не только при review:ok — ADR 0012, ломать нельзя): review:changes-requested
+# тоже может разблокировать других кандидатов в очереди (например снять
+# conflict), а orchestra.yml сам решает, есть ли что сливать — быстро и
+# дёшево, если нечего. Но диспатч экономится, если orchestra.yml уже
+# запущен/в очереди (#456, scripts/gh/wake_orchestra.sh) — concurrency-группа
+# `orchestra` всё равно даёт исполниться только одному за раз, и уже
+# идущий/ждущий прогон увидит это же событие на СТАРТЕ, не по снимку на
+# момент диспатча — событие не теряется, экономится только лишний триггер.
 name: pr-review
 
 on:
@@ -74,4 +79,4 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run orchestra.yml --ref main
+        run: scripts/gh/wake_orchestra.sh "$GITHUB_REPOSITORY"

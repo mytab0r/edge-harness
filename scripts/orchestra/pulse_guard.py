@@ -652,9 +652,16 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
             f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
 
 
-def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
-    """Предохранитель: перед dispatch воркера. Возвращает (строки отчёта,
-    разрешён_ли_диспетч). Три состояния (#205):
+def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]:
+    """Предохранитель: перед dispatch воркера. Возвращает (наблюдения,
+    действия, разрешён_ли_диспетч) — разведено по #456: «диспатч разрешён» и
+    «пауза уже объявлена» ничего не меняют на сервере и раньше делали
+    conveyor_lines непустым буквально на КАЖДОМ прогоне (closed — обычное
+    состояние здорового конвейера), из-за чего main() красноречиво врал
+    «### Действия» там, где планировщик ничего не сделал. Действие — только
+    там, где эта функция реально пишет (post_issue_comment/send_telegram):
+    первая тревога серии (state=="first") и пробный диспатч (state=="probe").
+    Три состояния (#205):
 
     closed — failures < порога, диспатч обычный, тихо;
     probe  — серия красная, выдержка с последнего маркера серии истекла —
@@ -685,20 +692,21 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     except RuntimeError as error:
         if decide_dispatch(failures):
             return ([f"🟢 серия красных worker.yml: {failures} "
-                     f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
+                     f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"], [],
                     True)
         # не смогли прочитать маркеры — не гадаем о выдержке, диспатч не даём
-        # (fail loud: серия красная, значит по умолчанию заперто)
+        # (fail loud: серия красная, значит по умолчанию заперто). Ничего не
+        # писали на сервер — тоже наблюдение, не действие.
         print(f"::warning::маркеры #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
         return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
-                 f"подряд — диспатч остановлен (маркеры #{WATCHDOG_ISSUE} недоступны)"],
+                 f"подряд — диспатч остановлен (маркеры #{WATCHDOG_ISSUE} недоступны)"], [],
                 False)
     # Маркеры прошлой серии (старше последнего success) не в счёт — иначе новая
     # серия унаследует чужой номер попытки и выдержку с первого же пульса.
     markers = [(t, b) for t, b in all_markers if last_ok_at is None or t > last_ok_at]
     if not markers and decide_dispatch(failures):
         return ([f"🟢 серия красных worker.yml: {failures} "
-                 f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"],
+                 f"(порог {WORKER_FAILURE_PAUSE_AFTER}) — диспатч разрешён"], [],
                 True)
     marker_times = [t for t, _ in markers]
     last_marker_at = max(marker_times) if marker_times else None
@@ -711,8 +719,10 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     state = decide_gate_state(effective_failures, probe_attempts, last_marker_at, now)
 
     if state == "open":
+        # Уже оповещено раньше этим же прогоном серии — второй раз ничего не
+        # пишем, значит это наблюдение, не действие.
         return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
-                 f"подряд — диспатч остановлен (уже оповещено, см. #{WATCHDOG_ISSUE})"],
+                 f"подряд — диспатч остановлен (уже оповещено, см. #{WATCHDOG_ISSUE})"], [],
                 False)
 
     error = last_failure_error(repo, runs[0]) if runs else "прогонов не найдено"
@@ -725,7 +735,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
         except RuntimeError as err:
             print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
         delivered = send_telegram(text)
-        return ([f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
+        return ([], [f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
                  f"{failures} красных {WORKER_WORKFLOW} подряд (Telegram: "
                  f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
                 True)
@@ -739,7 +749,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:
     except RuntimeError as err:
         print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
     delivered = send_telegram(text)
-    return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
+    return ([], [f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
             False)
