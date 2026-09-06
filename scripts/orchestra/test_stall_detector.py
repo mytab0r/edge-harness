@@ -390,6 +390,42 @@ def test_daily_cap_blocks_creation_loudly_once_exhausted(monkeypatch):
     assert any("потолок" in line and "исчерпан" in line for line in result)
 
 
+def test_daily_cap_stops_creation_mid_pulse_across_many_new_fingerprints(monkeypatch):
+    """Находка AI-ревью PR #248 (второй раунд): счётчик `created_today` растёт
+    ВНУТРИ одного вызова `detect_and_act` (одна строка отчёта может нести
+    несколько новых отпечатков разом — «красные проверки: a, b, c, ...»), а
+    прежний тест кормил детектор только ОДНИМ отпечатком при уже заполненной
+    истории — накопление счётчика в одном пульсе не было доказано ничем.
+    Мутация: убери `created_today += 1` после `create_task` в detect_and_act —
+    этот тест покраснеет (create_task вызовется больше STALL_DAILY_CAP раз)."""
+    names = [f"fresh-{i}" for i in range(sd.STALL_DAILY_CAP + 2)]  # 7 новых отпечатков разом
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker(f'check:red:{name}')}\n..."}
+            for name in names
+        ],
+        "issues?state=all&labels=auto-detected": [],  # created_today стартует с нуля
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+
+    created = []
+    def counting_create(repo, fingerprint, evidence, run_url):
+        created.append(fingerprint)
+        return 1000 + len(created)
+    monkeypatch.setattr(sd, "create_task", counting_create)
+
+    report_line = "⏸️ #205 — красные проверки: " + ", ".join(names)
+    result = sd.detect_and_act(REPO, NOW, [report_line])
+
+    assert len(created) == sd.STALL_DAILY_CAP
+    capped = [line for line in result if "потолок" in line and "исчерпан" in line]
+    assert len(capped) == 2  # ровно два отпечатка сверх потолка не заведены
+
+
 # ── Холостой ход: здоровый конвейер — ни одного вызова ─────────────────────
 
 def test_idle_conveyor_makes_zero_calls(monkeypatch):
