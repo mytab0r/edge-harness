@@ -258,7 +258,9 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: (["✅ PR #1 слит"], False))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None: ([], False))
+    monkeypatch.setattr(
+        sch, "accept_merged_tasks",
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
 
@@ -2761,6 +2763,11 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сбоя тут нет"))
+    # Детектор устойчивого простоя (#201) — не предмет этого теста, гасим
+    # (без мока main() дошёл бы до open_auto_tasks/escalate_stale_auto_tasks
+    # с реальным списком auto-detected issues, которого нет в FakeGh ниже).
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     # Единственный сырой gh-вызов этого сценария — PATCH закрытия отклонённого
     # переоткрытия (post_issue_comment/claim_task.release уже замоканы выше).
     patch_gh(monkeypatch, FakeGh({"issues/131 -f state=closed": None}))
