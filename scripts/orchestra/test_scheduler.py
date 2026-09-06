@@ -1704,6 +1704,17 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Вторая находка ревью PR #478 ("алерт не гадает"): текст обязан
+        # называть conclusion прогона, атрибутированного задаче, а не
+        # утверждать причину («содержательный конфликт») от себя.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 34011108934, "conclusion": "success"},
+        ]},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-474` "
+                     "(TTL 24 ч по коммиту замка). Канал: worker run 34011108934."},
+        ],
     })
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -1718,8 +1729,42 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
     assert "b.py" in escalated[0][2]  # пересечение изменений PR и main
     assert "a.py" not in escalated[0][2] and "c.py" not in escalated[0][2]
+    assert "conclusion='success'" in escalated[0][2]  # факт, не диагноз
+    # больше не утверждаем диагноз как решённый факт — только гипотеза наравне с другими
+    assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
     assert any("исчерпана" in line and "#560" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkeypatch):
+    # Находка ревью PR #478: если след аренды не нашёлся (например, комментарий
+    # с "worker run <id>" ещё не появился/сгорел) — текст честно говорит "не
+    # атрибутирован", не выдумывает conclusion и не утверждает диагноз.
+    task = issue(475, assignees=("mytab0r",))
+    p = pull(561, labels=["conflict"], ref="agent/475-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/561/comments": [
+            {"created_at": "2026-09-05T10:00:00Z",
+             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/561/files": files_payload([]),
+        "compare/basesha...main": {"files": files_payload([])},
+        "pulls/561": {"mergeable_state": "dirty"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},  # атрибуции нет
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: None)
+
+    sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert escalated and "не атрибутирован" in escalated[0][2]
+    assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
 
 
 def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfirmed(monkeypatch):
@@ -2626,6 +2671,36 @@ def test_run_claimed_task_matches_own_run_not_prefix(monkeypatch):
     assert sch.run_claimed_task(REPO, 217, 34011108934) is True
     assert sch.run_claimed_task(REPO, 217, 3401110893) is False
     assert sch.run_claimed_task(REPO, 217, 999) is False
+
+
+def test_last_worker_run_conclusion_returns_attributed_run(monkeypatch):
+    # #478: dispatch_conflict_rework называет conclusion атрибутированного
+    # прогона в тексте эскалации, не гадает — здесь проверяется сам источник
+    # факта отдельно от сборки текста.
+    fake = FakeGh({
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            # #217 упоминает только "worker run 34011108934" (CLAIM_TRACE_BODY) —
+            # более новый прогон 999999 в этом же следе не найдётся, recent_runs
+            # идёт новее→старше, поэтому цикл дойдёт до второго элемента.
+            {"id": 999999, "conclusion": "cancelled"},
+            {"id": 34011108934, "conclusion": "failure"},
+        ]},
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.last_worker_run_conclusion(REPO, 217) == "failure"
+
+
+def test_last_worker_run_conclusion_none_when_unattributed(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 1, "conclusion": "success"},
+        ]},
+        f"{REPO}/issues/217/comments?per_page": [],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.last_worker_run_conclusion(REPO, 217) is None
 
 
 def test_task_sh_composes_claim_via_worker_run_format():

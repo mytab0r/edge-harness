@@ -600,13 +600,29 @@ def dispatch_conflict_rework(
                 continue
             overlap = conflict_overlap_hint(repo, pull)
             overlap_text = overlap or "не удалось определить (см. PR вручную)"
+            # Находка ревью PR #478 ("алерт не гадает", AGENTS.md, тот же
+            # класс, что инвариант 3/#472): единственный ПОДТВЕРЖДЁННЫЙ факт
+            # здесь — mergeable_state=dirty после одной попытки. Причину
+            # отсюда не различить: инфраструктурный сбой воркера (#476, живой
+            # прогон 34027035455 упал именно так — маркер попытки уже стоял
+            # бы, бюджет считался бы сгоревшим), квота, таймаут 280 минут,
+            # неудавшийся push дают тот же итог, что настоящий содержательный
+            # конфликт. Текст называет ФАКТ (conclusion последнего прогона,
+            # атрибутированного этой задаче), не утверждает причину.
+            run_conclusion = last_worker_run_conclusion(repo, task_number)
+            run_note = (
+                f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
+                if run_conclusion is not None
+                else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?) — см. лог worker.yml вручную"
+            )
             text = (
                 f"🚨 edge-harness: {marker}\n"
-                f"PR #{number} (задача #{task_number}) остаётся в конфликте (mergeable_state=dirty) "
-                f"после {attempts} авто-попытки ребейза worker.yml — не механический дрейф, "
-                "содержательный конфликт (main и PR правят одно и то же по-разному), нужно "
-                f"решение владельца, чья версия верна. Файлы-кандидаты (пересечение изменений "
-                f"PR и main, не точные конфликтующие строки): {overlap_text}."
+                f"PR #{number} (задача #{task_number}) остаётся dirty после {attempts} "
+                f"авто-попытки ребейза worker.yml ({run_note}). Причина отсюда не различается "
+                "(инфраструктурный сбой воркера/квота/таймаут дают тот же итог, что настоящий "
+                "содержательный конфликт) — нужно решение владельца: посмотреть лог последнего "
+                f"прогона и разобраться. Файлы-кандидаты (пересечение изменений PR и main, "
+                f"не точные конфликтующие строки): {overlap_text}."
             )
             escalation = escalate(repo, WATCHDOG_ISSUE, text)
             actions.append(
@@ -1139,6 +1155,21 @@ def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
         pattern.search(comment.get("body") or "")
         for comment in all_issue_comments(repo, task_number)
     )
+
+
+def last_worker_run_conclusion(repo: str, task_number: int) -> str | None:
+    """Conclusion последнего прогона worker.yml, атрибутированного задаче
+    (run_claimed_task ищет след аренды среди свежих прогонов, новее→старше) —
+    None, если атрибуции не нашлось вовсе (аренда сгорела до следа/прогон
+    ещё не отметился). Используется dispatch_conflict_rework::escalate ниже
+    (находка ревью PR #478 — "алерт не гадает"): текст эскалации обязан
+    называть ФАКТ (conclusion прогона), а не утверждать причину («содержательный
+    конфликт»), которую отсюда не различить (инфраструктурный сбой/квота/
+    таймаут дают тот же итог «PR всё ещё dirty», что и настоящий конфликт)."""
+    for run in recent_runs(repo, WORKER_WORKFLOW, per_page=10):
+        if run_claimed_task(repo, task_number, run.get("id")):
+            return run.get("conclusion")
+    return None
 
 
 def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | None:
