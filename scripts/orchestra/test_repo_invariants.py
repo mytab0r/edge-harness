@@ -42,8 +42,8 @@ def task_issue(number, title="", issue_body="", assignees=()):
     }
 
 
-def merged_pr(number, pr_body, merged_at):
-    return {"number": number, "body": pr_body, "merged_at": merged_at}
+def merged_pr(number, ref, merged_at):
+    return {"number": number, "head": {"ref": ref}, "merged_at": merged_at}
 
 
 def open_pr(number, pr_body="", labels=()):
@@ -55,43 +55,13 @@ def open_pr(number, pr_body="", labels=()):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_primary_declared_task_requires_bare_line():
-    assert ri.primary_declared_task("#18\n\nтекст") == 18
-    assert ri.primary_declared_task("#205") == 205
-    # живая находка PR #137: перенос строки внутри прозы уронил "#119 из
-    # пула..." на отдельную строку — это НЕ декларация, реальная первая
-    # строка тела — "#18"
-    assert ri.primary_declared_task(
-        "#18\n\nAI-ревьюер...\n\n"
-        "`gather` прогнан на живом PR #130: промпт собран с телом задачи\n"
-        "#119 из пула, meta.json с head — выверено."
-    ) == 18
-    assert ri.primary_declared_task("## Что сделано\n#18") is None  # заголовок первой строкой — не декларация
-    assert ri.primary_declared_task("") is None
-    assert ri.primary_declared_task(None) is None
-
-
-def test_primary_declared_task_sees_canonical_template_body():
-    """Находка ревью PR #249: прод-форма тела PR, открытого через веб-форму
-    по `.github/PULL_REQUEST_TEMPLATE.md` (HTML-комментарий первыми тремя
-    строками, `#N` — реальным номером — только потом). До фикса
-    `primary_declared_task` не вырезал HTML-комментарии и падал на `None` для
-    КАЖДОГО такого PR — инвариант 1 был слеп именно к штатному классу
-    PR (#18/#21/#78), ради которого заведён."""
-    template_body = (
-        "<!-- Правило: один PR — одна задача. Ссылайся на задачу просто #N.\n"
-        "НЕ пиши Closes/Fixes/Resolves: задачу закрывает исполнитель ПОСЛЕ пост-мерж\n"
-        "проверки (деплой/канарейка/E2E), приложив улики. Контракт такие слова отклоняет. -->\n"
-        "#244\n\n"
-        "## Что сделано\n-\n"
-    )
-    assert ri.primary_declared_task(template_body) == 244
-
-
 def test_reopened_after_merge_flags_free_task_with_merged_pr():
+    # #394: задача PR резолвится ТОЛЬКО по имени ветки, тело не читается —
+    # оба PR названы agent/18-*, тела нет вовсе (штатный PR может быть слит
+    # без единого номера в теле).
     tasks = [task_issue(18, "AI-ревьюер диффа", assignees=())]
-    pulls = [merged_pr(137, "#18\n\nтекст", "2026-08-31T17:46:11Z"),
-             merged_pr(138, "#18\n\nвторой заход", "2026-09-02T21:31:47Z")]
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z"),
+             merged_pr(138, "agent/18-second-pass", "2026-09-02T21:31:47Z")]
     violations = ri.check_reopened_after_merge(tasks, pulls)
     assert len(violations) == 1
     assert violations[0]["issue"] == 18
@@ -103,13 +73,13 @@ def test_reopened_after_merge_silent_when_assigned():
     # тот же слитый PR, но задача СЕЙЧАС занята исполнителем — норма
     # (пост-мерж проверка ещё не сделана, это не бросили)
     tasks = [task_issue(18, assignees=("mytab0r",))]
-    pulls = [merged_pr(137, "#18", "2026-08-31T17:46:11Z")]
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
     assert ri.check_reopened_after_merge(tasks, pulls) == []
 
 
 def test_reopened_after_merge_silent_without_merged_pr():
     tasks = [task_issue(18, assignees=())]
-    pulls = [merged_pr(999, "#77", "2026-08-31T17:46:11Z")]  # чужая декларация
+    pulls = [merged_pr(999, "agent/77-other-task", "2026-08-31T17:46:11Z")]  # чужая ветка
     assert ri.check_reopened_after_merge(tasks, pulls) == []
 
 
@@ -119,7 +89,7 @@ def test_reopened_after_merge_mutation_guard():
     # живом репозитории это стандартный кратковременный путь после мержа,
     # а не баг. Тест доказывает, что фильтр обязателен.
     tasks = [task_issue(18, assignees=("mytab0r",))]
-    pulls = [merged_pr(137, "#18", "2026-08-31T17:46:11Z")]
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
     assert ri.check_reopened_after_merge(tasks, pulls) == []
     tasks_unassigned = [task_issue(18, assignees=())]
     assert len(ri.check_reopened_after_merge(tasks_unassigned, pulls)) == 1

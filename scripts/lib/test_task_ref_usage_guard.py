@@ -2,8 +2,8 @@
 """Гвардия «взял не ту функцию task_ref» (#259).
 
 Класс проблемы: task_ref.py давно документирует разделение «источник
-задачи PR» (узкая семантика: `resolve_pr_task`/`task_from_branch`/
-`declared_tasks`/`declares_task`) и «упоминания» (широкая:
+задачи PR» (узкая семантика: `resolve_pr_task`/`task_from_branch`) и
+«упоминания» (широкая:
 `extract_task_refs`/`references_task`, годится только там, где широта
 осознанна и названа в докстринге места вызова). Докстринг НЕ помешал
 `ai_review.py` взять `extract_task_refs` для `task_section` — резолюции

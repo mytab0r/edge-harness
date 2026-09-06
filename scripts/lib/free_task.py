@@ -8,10 +8,9 @@
   1. «Занята» раньше значило «номер где-то упомянут в теле открытого PR»
      (`scan("#[0-9]+")` по всему тексту) — тот же класс подстрочного
      совпадения, что уже чинили в `scripts/orchestra/contract_check.py`
-     (#187, #195). Здесь номер задачи, которую PR ОБЪЯВЛЯЕТ, берётся из
-     `task_ref.declared_tasks` — ПЕРВАЯ непустая строка тела (без учёта
-     HTML-комментариев), начинающаяся с `#` и сразу цифрой, не любая
-     строка с `#N` (#251, #312), симметрично contract_check.py.
+     (#187, #195). Здесь номер задачи, которую PR ОБЪЯВЛЯЕТ, берётся через
+     `task_ref.task_from_branch` (`headRefName`) — единственный источник
+     (#394, решение владельца 2026-09-06): тело PR не читается вовсе.
 
   2. Открытый PR у задачи БЕЗ исполнителя (issue.assignees пуст) больше не
      исключает её из пула. `scheduler.py::unhealthy_pulls` снимает
@@ -95,15 +94,15 @@ def oldest_free(
 
 
 def declared_pr_for_task(prs: list[dict[str, Any]], task_number: int) -> dict[str, Any] | None:
-    """Открытый PR, ОБЪЯВЛЯЮЩИЙ задачу `task_number` первым объявленным в теле
-    (`declared_tasks(body)[0]` — ПЕРВАЯ непустая строка тела, без учёта
-    HTML-комментариев, начинающаяся с `#` и сразу цифрой, #251, #312) —
-    то же правило, что `contract_check.py`, применённое симметрично
-    к «своему» и «чужому» PR."""
+    """Открытый PR, чья ветка называет `task_number` (#394, одно место
+    правды #259, решение владельца 2026-09-06: единственный источник — имя
+    agent-ветки, тело PR не читается вовсе). То же правило, что
+    `contract_check.py`, применённое симметрично к «своему» и «чужому» PR.
+
+    `prs` — форма `gh pr list --json number,headRefName` (плоское поле
+    `headRefName`, не вложенный REST `head.ref`)."""
     for pull in prs:
-        body = pull.get("body") or ""
-        declared = task_ref.declared_tasks(body)
-        if declared and declared[0] == task_number:
+        if task_ref.task_from_branch(pull.get("headRefName") or "") == task_number:
             return pull
     return None
 

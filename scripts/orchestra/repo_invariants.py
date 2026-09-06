@@ -116,14 +116,15 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
-# Номер задачи, ОБЪЯВЛЕННЫЙ первой строкой тела PR — одно место правды (#187,
-# #195, #251, #312), не второе определение того же правила здесь (находка
-# ревью PR #249): собственный `_BARE_TASK_REF_RE`/`primary_declared_task` не
-# вырезал HTML-комментарии, а `.github/PULL_REQUEST_TEMPLATE.md` начинается
-# именно с такого комментария — инвариант 1 не видел НИ ОДНОГО штатного PR,
-# открытого через веб-форму по шаблону (только руками написанные тела вида
-# голого "#N"), то есть слеп именно к классу #18/#21/#78, ради которого
-# заведён.
+# Номер задачи PR — одно место правды, `task_ref.resolve_pr_task` (#394,
+# решение владельца 2026-09-06: только имя agent-ветки, тело PR не читается
+# вовсе). До #394 инвариант 1 держал собственный `primary_declared_task`
+# (декларация первой строкой тела, симметрично тогдашнему contract_check.py)
+# — после того как контракт перестал читать тело, второе определение того же
+# правила здесь стало бы расхождением: PR может быть слит без единого номера
+# в теле (шаблон прямо говорит, что «#N» — для человека, не источник истины),
+# и инвариант 1 снова ослеп бы, теперь по новой причине. Резолвим тем же
+# вызовом, что и контракт.
 _TR_SPEC = importlib.util.spec_from_file_location(
     "task_ref", REPO_ROOT / "scripts" / "lib" / "task_ref.py")
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
@@ -176,25 +177,11 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
 # Инвариант 1: открытая задача без исполнителя, чей PR уже слит
 # ══════════════════════════════════════════════════════════════════════════
 
-def primary_declared_task(body: str) -> int | None:
-    """Задача, объявленная ПЕРВОЙ непустой строкой тела PR (после вырезания
-    HTML-комментариев) — тонкая обёртка над `task_ref.declared_tasks`, одним
-    и тем же правилом с `contract_check.py` (симметрия: инвариант 1 не должен
-    видеть декларацию иначе, чем видит её контракт при мерже). НЕ
-    `extract_task_refs`/`references_task` (широкая семантика «упомянута где
-    угодно в прозе») — живая находка PR #137 показала, зачем: перенос строки
-    внутри абзаца уронил `#119 из пула...` на отдельную строку, и наивный
-    скан «первая строка с `#`» принял бы её за декларацию, хотя реальная
-    первая строка тела — `#18`. `declared_tasks` уже закрывает этот класс
-    (останавливается на первой непустой строке, не сканирует дальше, если она
-    не декларация)."""
-    declared = task_ref.declared_tasks(body or "")
-    return declared[0] if declared else None
 
 
 def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
-    """Открытая задача task без assignee, для которой уже есть слитый PR,
-    декларировавший её первой строкой. Механизм инцидента: reap_stale
+    """Открытая задача task без assignee, для которой уже есть слитый PR
+    этой задачи (`task_ref.resolve_pr_task` по имени ветки). Механизм инцидента: reap_stale
     (scheduler.py) смотрит только ОТКРЫТЫЕ PR — если PR уже слит, «нет
     открытого PR, ссылающегося на задачу» читается как «работа брошена», и
     assignee снимается ДАЖЕ когда работа честно завершена, просто исполнитель
@@ -204,7 +191,7 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
     unassigned = {t["number"]: t for t in open_tasks if not t["assignees"]}
     by_task: dict[int, list[dict]] = {}
     for pull in merged_pulls:
-        declared = primary_declared_task(pull.get("body") or "")
+        declared = task_ref.resolve_pr_task(pull)
         if declared is not None:
             by_task.setdefault(declared, []).append(pull)
 
