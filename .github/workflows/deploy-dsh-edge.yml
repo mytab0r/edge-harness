@@ -680,6 +680,30 @@ jobs:
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
           echo "✅ ingest-шов #119 жив: сессия $sid создана, наполнена, заархивирована"
 
+      # e2e generic browser smoke (#502): владелец нашёл руками то, чего не
+      # находит ни один прежний тест — раздел Settings → Integrations месяцами
+      # показывал «Journal unavailable: HTTP 404» (issue #501, Cloudflare error
+      # 1042), потому что весь CI проверял код и API, но никто не открывал
+      # интерфейс. Playwright (playwright-core, системный Chrome раннера — без
+      # загрузки ~130+ MB своего браузера) логинится, обходит вкладки Settings
+      # СТРУКТУРНОЙ эвристикой (не захардкоженным списком имён — новый раздел
+      # не выпадает из проверки), на каждой ловит console-ошибки и сетевые
+      # ответы ≥400. Красный шаг — деплой поставил регрессию интерфейса,
+      # видную владельцу, но невидимую прежним проверкам кода/API.
+      # pnpm, не npm: dsh-edge/e2e-smoke — отдельный от standalone-дерева
+      # пакет (никаких pnpm-патчей Workers тут нет и не может быть), но
+      # гвардия класса #43 (test_dsh_edge_pnpm_guard.py) запрещает npm install
+      # в ЛЮБОМ месте этого файла безусловно — pnpm везде, без исключений.
+      - name: e2e generic browser smoke морды (#502)
+        if: success()
+        working-directory: dsh-edge/e2e-smoke
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          BASE_URL: https://dsh-edge.mytab0r.workers.dev
+        run: |
+          pnpm install --no-frozen-lockfile
+          node smoke.mjs
+
       - name: plugin_status → ready
         if: success() && steps.route.outputs.plugins != '0'
         env:
