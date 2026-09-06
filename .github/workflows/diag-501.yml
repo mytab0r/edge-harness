@@ -1,0 +1,51 @@
+name: diag-501
+# Временный диагностический workflow (issue #501): снимает доказательство
+# точной причины «Journal unavailable: HTTP 404» в разделе Integrations на
+# ЖИВОМ проде — реальными секретами, не пересказом. Удаляется вместе с PR,
+# закрывающим #501, после того как причина подтверждена и исправление
+# проверено (см. tasks в этом же PR).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Прямой запрос к journal (harness) с Bearer HANDS_TOKEN
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+        run: |
+          set -x
+          code=$(curl -s -o /tmp/direct.json -w "%{http_code}" \
+            -H "Authorization: Bearer $HANDS_TOKEN" \
+            "$HARNESS_URL/api/events?task_id=integration:telegram&after=0&limit=10")
+          echo "direct harness status: $code"
+          cat /tmp/direct.json
+          echo
+
+      - name: Логин владельца в dsh-edge и запрос через прокси
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -x
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/diag-501.cookies"
+          login_code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          echo "login status: $login_code"
+          [ "$login_code" = "303" ] || { echo "::error::логин не удался"; exit 1; }
+          proxy_code=$(curl -s -o /tmp/proxy.json -w "%{http_code}" -b "$jar" \
+            -H "accept: application/json" \
+            "$base/api/harness/events?task_id=$(python3 -c "import urllib.parse;print(urllib.parse.quote('integration:telegram'))")")
+          echo "proxy status: $proxy_code"
+          echo "proxy body:"
+          cat /tmp/proxy.json
+          echo
+          proxy_code_noquery=$(curl -s -o /tmp/proxy2.json -w "%{http_code}" -b "$jar" \
+            -H "accept: application/json" \
+            "$base/api/harness/events?task_id=integration:telegram")
+          echo "proxy (unencoded colon) status: $proxy_code_noquery"
+          cat /tmp/proxy2.json
+          echo
