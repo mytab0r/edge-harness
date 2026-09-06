@@ -123,6 +123,26 @@ UNHEALTHY_PR_AFTER_MINUTES = 120
 # тот же приём, что PAUSE_MARKER/HEARTBEAT_MARKER выше.
 READY_STALL_MARKER = "[статус: PR готов, слияние не идёт]"
 
+# ── Расшивка конфликтов (issue #474) ──────────────────────────────────────────────
+# Конфликт (mergeable_state=dirty, scheduler.mark_conflicts) раньше был тормозом
+# без газа: метка + комментарий, дальше ждём человека. Причина конфликта почти
+# всегда одна — main ушёл вперёд (механический дрейф), а разрешение —
+# механическое (git rebase origin/main). Признака «дрейф или содержательный
+# конфликт» ДО попытки нет: GitHub REST отдаёт только mergeable_state
+# (dirty/clean), не конфликтующие ханки — поэтому решение простое (владелец,
+# issue #474): РОВНО одна авто-попытка ребейза на PR (лифтайм-счётчик, тот же
+# приём, что AI_REVIEW_MAX_ATTEMPTS — не сбрасывается по эпизодам конфликта,
+# см. scheduler.conflict_rework_attempts); сошлось — mark_conflicts снимет
+# метку сама на следующем проходе, не сошлось — эскалация владельцу.
+CONFLICT_REWORK_MAX_ATTEMPTS = 1
+
+CONFLICT_REWORK_MARKER = "[conflict: авто-ребейз]"
+
+# Номер PR — часть маркера (по образцу READY_STALL_MARKER выше): эскалация
+# конфликта решается по каждому PR отдельно, общий маркер без номера подавил
+# бы навсегда все PR, кроме первого просигналившего.
+CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(

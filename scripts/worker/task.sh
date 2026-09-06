@@ -170,7 +170,7 @@ short_title() { # $1 — заголовок
 # Коды: 0 — нашла; 1 — пул пуст; 2 — сломался инструмент (gh/python/сеть):
 # «пусто» и «сломано» — разные состояния, смешивать запрещено (fail loud).
 free_task() {
-  local issues_file locked line rc
+  local issues_file locked excluded line rc
   issues_file="$WORK/pool-issues.json"
   # labels — находка AI-ревью PR #471/#470: free_candidates фильтрует по
   # waiting:owner (задача ждёт решения владельца, не должна стопорить весь
@@ -183,17 +183,32 @@ free_task() {
   # остаётся атомарный claim ниже. Сломался список замков — сломан инструмент
   # (2), а не «пул пуст» (1).
   locked=$(lease_cli locks) || return 2
+  # Задача, чей объявленный PR в конфликте, исключена из ОБЩЕГО выбора
+  # (находка ревью PR #478): её доводка — только адресно, через
+  # scheduler.py::dispatch_conflict_rework (бюджет РОВНО одна попытка +
+  # эскалация). Без исключения generic-пульс мог бы взять её мимо этого
+  # бюджета, если адресный прогон освободил задачу (упал по квоте/крашу) до
+  # того, как снова её занял. $WORK/pool-prs.json читается один раз выше
+  # (шаг 0), не второй HTTP-обход.
+  excluded=$(python3 "$SCRIPT_DIR/../lib/free_task.py" conflict-tasks "$WORK/pool-prs.json") || return 2
   # oldest-free сам сортирует по номеру (issues API отдаёт по убыванию
   # новизны — без сортировки воркер брал бы свежайшую задачу, не старейшую)
-  # и фильтрует замки из locked.
+  # и фильтрует замки из locked и конфликтные задачи из excluded.
   set +e
-  line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" oldest-free "$issues_file" "$locked")
+  line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" oldest-free "$issues_file" "$locked" "$excluded")
   rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then printf '%s\n' "$line"; return 0; fi
   if [ "$rc" -eq 1 ]; then return 1; fi
   return 2
 }
+
+# ── 0. Открытые PR — читаются ОДИН раз, используются и здесь (free_task —
+# исключение конфликтных задач из общего выбора, #478), и на шаге 1b ниже
+# (декларация PR текущей задачи) — второй HTTP-обход не заводится. `labels`
+# нужен именно для конфликтного фильтра — до #478 запрос не нёс его вовсе.
+gh pr list --state open --limit 100 --json number,body,headRefName,labels \
+  >"$WORK/pool-prs.json" || die "не смог прочитать открытые PR (gh/jq/сеть)"
 
 # ── 1. Выбор задачи ────────────────────────────────────────────────────────────────
 if [ -n "$TASK_INPUT" ]; then
@@ -233,8 +248,7 @@ echo "Задача #$number: $title"
 # то же самое, что использует contract_check.py — симметрично для явного
 # входа --task и для авто-выбора free_task(). Атомарная защита от гонки
 # каналов на этот же PR — claim ниже (шаг 4), не эта проверка.
-gh pr list --state open --limit 100 --json number,body,headRefName \
-  >"$WORK/pool-prs.json" || die "не смог прочитать открытые PR (gh/jq/сеть)"
+# $WORK/pool-prs.json уже прочитан на шаге 0 — второй HTTP-обход не нужен.
 set +e
 pr_line=$(python3 "$SCRIPT_DIR/../lib/free_task.py" declared-pr "$number" "$WORK/pool-prs.json")
 pr_rc=$?
@@ -295,7 +309,7 @@ $criterion
 # Твой маршрут (транспорт уже подготовлен скриптом)
 1. Прочитай docs/INDEX.md и относящиеся к задаче спеки/research. Архитектурное предложение — только после docs/research/30-rejected-alternatives.md.
 2. Сделай задачу: минимальный правильный дифф, тесты, саморевью (секреты, мёртвый код, расхождение доков с кодом, вызовы переименованных функций по всему репо).
-3. Закоммить осмысленными коммитами (git add -A; git commit) и запушь: git push -u origin $BRANCH — проверь вывод пуша. При «main уехал» — git fetch и git rebase origin/main.
+3. Закоммить осмысленными коммитами (git add -A; git commit) и запушь: git push -u origin $BRANCH — проверь вывод пуша. При «main уехал» (в т.ч. метка conflict на этом PR — почти всегда механический дрейф, не содержательный конфликт) — git fetch origin main, git rebase origin/main, вручную сведи конфликтующие файлы (обе стороны), git rebase --continue. Ребейз переписывает историю ветки — обычный push после него отклоняется (non-fast-forward); пушь git push --force-with-lease (НЕ голый --force: lease проверяет, что на origin именно ожидаемый коммит, а не чья-то ещё работа поверх той же ветки).
 4. $route_pr_step
 5. Упёрся в то, что есть только у владельца (секрет вне хранилища, доступ, деньги, необратимое внешнее действие), — единственная эскалация: комментарий в задачу #$number (что нужно и почему не сам) + метка blocked (gh issue edit $number --add-label blocked), PR не открывай, работу останови. Это законный исход запуска.
 6. Финальный ответ в stdout — краткий отчёт: ссылка на PR или причина отказа/эскалации.
