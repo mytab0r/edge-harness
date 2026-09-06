@@ -405,6 +405,7 @@ def main() -> int:
     if no_data_rows:
         print(f"::warning::{len(no_data_rows)} источник(ов) без данных — см. колонку «Заметка» выше")
 
+    exit_code = 0
     if breached:
         text = "🚨 Квота харнеса перевалила за {}%:\n".format(THRESHOLD_PCT) + "\n".join(
             f"- {r.resource}: {r.current:,} / {r.limit:,} ({r.pct}%)".replace(",", " ") for r in breached
@@ -419,10 +420,20 @@ def main() -> int:
               + ", ".join(r.resource for r in breached))
         result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
         print(result)
+        # Находка ревью PR #327: escalate() — best-effort по обоим каналам
+        # (Telegram, след в issue), возврат печатался, но не проверялся, и
+        # прогон всегда завершался 0. Порог пробит И сигнал не дошёл ни одним
+        # каналом ("НЕ доставлен" + "НЕ оставлен") — прогон обязан красить
+        # список workflow-раннов, а не жить одной строкой в логе, который
+        # никто не читает между пультами (тот же принцип, что у
+        # scheduler.py::accept_merged_tasks hard_failure).
+        if "НЕ доставлен" in result and "НЕ оставлен" in result:
+            print(f"::error::квота пробита, но сигнал не дошёл ни одним каналом: {result}")
+            exit_code = 1
     else:
         print(f"Порог {THRESHOLD_PCT}% не превышен ни по одному измеренному ресурсу.")
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

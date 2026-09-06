@@ -407,3 +407,33 @@ def test_main_does_not_call_escalate_below_threshold(monkeypatch, capsys):
 
     assert qz.main() == 0
     assert calls == []
+
+
+def test_main_exits_nonzero_when_escalation_reaches_no_channel(monkeypatch, capsys):
+    """Находка ревью PR #327: escalate() best-effort по двум каналам (Telegram,
+    след в issue) — раньше возврат печатался, но не проверялся, main() всегда
+    отдавал 0. Порог пробит И оба канала молчат ("НЕ доставлен" + "НЕ оставлен")
+    обязаны красить прогон — иначе пробитый порог с умершим сигналом виден
+    только тому, кто читает лог."""
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")
+    _patch_collectors(monkeypatch, breached_row)
+    monkeypatch.setattr(
+        qz.pulse_guard, "escalate",
+        lambda repo, issue, text: "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+
+    assert qz.main() == 1
+    assert "::error::" in capsys.readouterr().out
+
+
+def test_main_stays_green_when_escalation_reaches_at_least_one_channel(monkeypatch, capsys):
+    """Мутационная пара к тесту выше: хотя бы один канал дошёл — прогон зелёный,
+    сигнал состоялся (частичная доставка — не отказ)."""
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")
+    _patch_collectors(monkeypatch, breached_row)
+    monkeypatch.setattr(
+        qz.pulse_guard, "escalate",
+        lambda repo, issue, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+
+    assert qz.main() == 0
