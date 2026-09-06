@@ -893,6 +893,26 @@ def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict
     return inner.get("value", {})
 
 
+def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events: list[dict]) -> dict:
+    """POST /api/sessions/<id>/ingest (патч 0004-harness-ingest) — форма ответа
+    и ошибок другая, чем у RPC-конверта _morde_rpc: тело запроса — сырой
+    `{"events":[...]}` БЕЗ обёртки client-request, успех — сырой JSON
+    `{appended,lastSeq}`, отказ — обычный HTTP-код (400 allowlist/форма, 404
+    нет сессии, 413 потолки), а не `{result:{ok:false}}` (docs/research/12,
+    dsh-edge/patches/0004-harness-ingest.patch)."""
+    body = json.dumps({"events": events}).encode()
+    req = urllib.request.Request(
+        DSH_EDGE_URL.rstrip("/") + f"/api/sessions/{session_id}/ingest",
+        data=body, method="POST",
+        headers={"content-type": "application/json"})
+    try:
+        with opener.open(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"HTTP {error.code}: {detail}") from error
+
+
 def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR.
 
@@ -927,6 +947,62 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
                 hard_failure = True
         except (OSError, ValueError) as error:
             lines.append(f"🚨 #{number}: архив сессии не удался (возможность сломана): {error}")
+            hard_failure = True
+    return lines, hard_failure
+
+
+# ── Заметки-итоги в сессии раннера (#480) ─────────────────────────────────────────
+# Сессия harness-<N> обрывается ровно в момент, когда агент закончил работу —
+# что случилось ПОСЛЕ (слияние, приёмка, возврат в пул) в ней не видно вовсе,
+# и владелец идёт сверять с GitHub руками. Дописывается СТРОГО в тех местах,
+# где пульс УЖЕ обнаруживает факт как часть существующего одноразового
+# действия (after_merge/accept_merged_tasks/unhealthy_pulls) — новый опрос по
+# всем сессиям на каждый пульс не заводится (квота GitHub API и DO rows_read
+# и так была на пределе, #320/#325). «PR открыт» и позитивный вердикт гейтов
+# намеренно вне скоупа: то и другое либо уже видно живым транскриптом (агент
+# сам вызывает `gh pr create` внутри хода), либо секунды спустя сменяется
+# слиянием — отдельное отслеживание потребовало бы нового маркера/опроса.
+def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]:
+    """notes — [(номер задачи, текст заметки), …], собранные вызывающей
+    функцией за ОДИН проход (не по одной заметке): один логин в морду на весь
+    вызов, а не на каждую задачу. Пустой список — ноль сетевых вызовов вовсе
+    (гвардия холостого хода, тот же приём, что stale_ready_pulls).
+
+    Возвращает (строки отчёта, был_ли_жёсткий_сбой) — тот же контракт, что
+    archive_runner_sessions: сессии нет (задача без раннера, например
+    ручной PR) — норма, не ошибка; сама морда недоступна — возможность
+    сломана, сигнал громкий, но не валит вызывающую стадию (мерж/приёмка уже
+    состоялись и не откатываются)."""
+    if not notes:
+        return ([], False)
+    if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
+        return ([], False)  # см. archive_runner_sessions — конфигурации нет, канал просто пуст
+    try:
+        opener = _morde_opener()
+        _morde_login(opener)
+    except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
+        return ([f"🚨 морда dsh-edge недоступна для лога итогов сессии (возможность сломана, не отсутствует): {error}"],
+                True)
+    lines: list[str] = []
+    hard_failure = False
+    for number, text in notes:
+        session_id = f"harness-{number}"
+        event = {
+            "type": "assistant/message",
+            "data": {
+                "turn": 1, "step": 1,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+            },
+        }
+        try:
+            _morde_ingest(opener, session_id, [event])
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                continue  # сессии раннера в морде нет — писать некуда, это норма
+            lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
+            hard_failure = True
+        except (OSError, ValueError) as error:
+            lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
             hard_failure = True
     return lines, hard_failure
 
@@ -1166,6 +1242,14 @@ def after_merge(
     if task_numbers:
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
+        # Заметка-итог в сессии раннера (#480): «PR слит в main» — факт,
+        # который эта функция и так обнаружила (мерж), без нового опроса.
+        # Дописывается ДО архива (порядок внутри отчёта не важен: архив не
+        # стирает историю сессии — см. append_session_notes).
+        note_lines, note_hard_failure = append_session_notes(
+            [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
+        actions += note_lines
+        hard_failure = hard_failure or note_hard_failure
     # Чеклист некритичных замечаний ревью (#462, третья категория находок):
     # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
     # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
@@ -1461,6 +1545,9 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
     issue-объектов ПРЯМО В pool — эта функция обязана видеть то же
     актуальное состояние, не более старую копию своим отдельным запросом."""
     lines = []
+    # Заметки-итоги в сессии раннера (#480) — один логин на весь обход, см.
+    # append_session_notes.
+    session_notes: list[tuple[int, str]] = []
     for issue in pool:
         if not issue["assignees"]:
             continue
@@ -1501,7 +1588,11 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
                 f"♻️ #{number} возвращена в пул: PR #{pull['number']} нездоров "
                 f"{int(age)} мин ({reason})"
             )
+            session_notes.append(
+                (number, f"♻️ Задача #{number} возвращена в пул: PR #{pull['number']} нездоров ({reason})."))
             break  # одной причины на задачу достаточно — не дублируем комментарии
+    note_lines, _note_hard_failure = append_session_notes(session_notes)
+    lines += note_lines
     return lines
 
 
@@ -2086,6 +2177,10 @@ def accept_merged_tasks(
     observations: list[str] = []
     actions: list[str] = []
     hard_failure = False
+    # Заметки-итоги в сессии раннера (#480): собираются за весь обход пула,
+    # один логин в морду на всю функцию — не на каждую задачу (см.
+    # append_session_notes).
+    session_notes: list[tuple[int, str]] = []
     for issue in pool:
         number = issue["number"]
         if number == WATCHDOG_ISSUE:
@@ -2321,6 +2416,7 @@ def accept_merged_tasks(
                 # unhealthy_pulls).
                 actions.append(f"⚠️ замок task-{number} не снят: {error}")
             actions.append(f"✅ #{number}: закрыта приёмкой ({category}) — {detail}")
+            session_notes.append((number, f"✅ Задача #{number} закрыта приёмкой ({category}): {detail}."))
             continue
 
         # state == "fail"
@@ -2341,6 +2437,10 @@ def accept_merged_tasks(
         except RuntimeError as error:
             actions.append(f"⚠️ замок task-{number} не снят: {error}")
         actions.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
+        session_notes.append((number, f"♻️ Задача #{number} не закрыта приёмкой ({category}) — {detail}."))
+    note_lines, note_hard_failure = append_session_notes(session_notes)
+    actions += note_lines
+    hard_failure = hard_failure or note_hard_failure
     return observations, actions, hard_failure
 
 
