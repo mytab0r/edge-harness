@@ -129,8 +129,13 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
     payload="${GH_ISSUE_LIST_JSON:-[]}"
   elif [[ "$sig" == *"pr list"* && "$sig" == *"--json url"* ]]; then
     # Переопределяемо сценарием (#422): провайдер в лимите — PR не открыт,
-    # worker/task.sh обязан различить это от «PR уже есть».
-    payload="${GH_PR_LIST_URL_JSON:-[{\"url\":\"https://github.test/mytab0r/edge-harness/pull/9\"}]}"
+    # worker/task.sh обязан различить это от «PR уже есть». Дефолт — ОТДЕЛЬНОЙ
+    # переменной, не буквальными скобками внутри ${VAR:-...}: непарная '}' в
+    # литерале JSON преждевременно закрывает подстановку (bash: первая
+    # НЕэкранированная '}' завершает ${...}, даже если это середина JSON) —
+    # живой прогон CI 34009616520, jq упал на «Unmatched ']'».
+    _default_pr_list_url='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
+    payload="${GH_PR_LIST_URL_JSON:-$_default_pr_list_url}"
   elif [[ "$sig" == *"pr list"* ]]; then
     payload='[]'
   elif [[ "$sig" == *"run list"* ]]; then
