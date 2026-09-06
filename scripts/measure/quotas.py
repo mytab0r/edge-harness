@@ -21,6 +21,9 @@ DO отсылает к интроспекции для таких случаев
 
 Лимиты — одно место правды здесь (LIMITS), значения совпадают с
 docs/research/20-cloudflare-free.md и docs/research/21-github-actions.md.
+Исключение: rows_read/day берётся из do_rows_read.DAILY_LIMIT — то место
+правды для этого числа уже существовало с #320, второй копией здесь не
+заводим (находка AI-ревью PR #327).
 
 Запуск: python scripts/measure/quotas.py
 Тесты:  python -m pytest scripts/measure/test_quotas.py -q
@@ -63,7 +66,7 @@ THRESHOLD_PCT = 80.0
 # лимиты Workers») и docs/research/21-github-actions.md («API-лимиты»).
 LIMITS = {
     "cf_workers_requests_day": 100_000,        # Workers Free: requests/day
-    "cf_do_rows_read_day": 5_000_000,          # DO Free: rows_read/day — тот самый инцидент
+    "cf_do_rows_read_day": do_rows_read.DAILY_LIMIT,  # DO Free: rows_read/day — тот самый инцидент (#320, одно место правды)
     "cf_do_rows_written_day": 100_000,         # DO Free: rows_written/day
     "cf_do_storage_account_bytes": 5 * 1024 ** 3,   # DO Free: 5 GB на аккаунт
     "gh_dispatch_hour": 500,                   # вторичный лимит content-generating/час
