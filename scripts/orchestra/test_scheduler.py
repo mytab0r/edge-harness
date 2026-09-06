@@ -1307,6 +1307,52 @@ def test_route_to_needs_spec_comment_carries_verdict_links(monkeypatch):
                if "issues/471/comments?per_page=100" in c) == 1
 
 
+def test_route_to_needs_spec_updates_snapshot_for_same_run_consumers(monkeypatch):
+    """Блокирующая находка вердикта на head 2007f9e (класс #252 «устаревшая
+    метка в памяти»): main() отдаёт тот же снимок pool/pulls дальше по прогону —
+    после route снимок обязан видеть needs-spec, пустой assignees и закрытый PR,
+    иначе mark_stale_unclaimed клеит stale-unclaimed на свежую needs-spec,
+    а dispatch_worker поднимает worker.yml на задачу, которую воркер не возьмёт.
+    Мутация: убрать дописывание метки/`pull["state"]` — тест краснеет."""
+    task = issue(480)
+    p = pull(481, labels=["review:ok", "ai:changes-requested"], pr_body="#480")
+    fake = FakeGh({
+        "issues/480/assignees": None,
+        "issues/480/labels": None,
+        "pulls/481": None,
+        "issues/481/timeline": _rework_timeline("ai:changes-requested", 5),
+        "issues/481/comments?per_page=100": [],
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    sch.route_to_needs_spec(REPO, task, p, 5, "метка ai:changes-requested")
+
+    assert task["assignees"] == []
+    assert task["labels"] and task["labels"][-1]["name"] == "needs-spec"
+    assert p["state"] == "closed"
+
+    # Тот же прогон: потребители снимка обязаны промолчать на этой задаче.
+    assert sch.mark_stale_unclaimed(REPO, utc(2026, 9, 2, 12, 0), [task]) == []
+    assert sch.dispatch_worker(REPO, [task]) == ([], [])
+
+
+def test_trigger_ai_review_skips_pr_closed_in_same_run(monkeypatch):
+    """Некритичное замечание ревью PR #408 (класс #252): PR, закрытый
+    route_to_needs_spec в этом же прогоне, не должен получить dispatch
+    ai-review.yml — снимок помечен state=closed, trigger его пропускает.
+    Мутация: убрать пропуск — тест краснеет (dispatch на закрытый PR)."""
+    p = pull(485, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z")
+    p["state"] = "closed"
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.trigger_ai_review(REPO, utc(2026, 9, 2, 12, 0), [p])
+    assert (observations, actions) == ([], [])
+    assert fake.calls == []
+
+
 def test_last_verdict_excerpt_pulls_real_ai_review_findings_not_header(monkeypatch):
     """Выжимка для эскалации — реальная прод-форма комментария AI-ревью
     (ai_review.build_comment, не наш пересказ формата): шапка pr:/head:/

@@ -1410,6 +1410,10 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
     observations: list[str] = []
     actions: list[str] = []
     for pull in pulls:
+        if pull.get("state") == "closed":
+            # закрыт этим же прогоном (route_to_needs_spec) — ai-review.yml
+            # на закрытый PR не дёргаем (класс #252 «устаревшая метка в памяти»)
+            continue
         labels = {label["name"] for label in pull["labels"]}
         if not review_labels.gate1_decided(labels):
             continue  # первый гейт ещё не пройден — рано
@@ -1519,7 +1523,12 @@ VERDICT_LINK_WINDOW_MINUTES = 10
 
 
 def _is_gate1_verdict_comment(comment: dict) -> bool:
-    return (comment.get("body") or "").startswith(GATE1_VERDICT_PREFIX)
+    """Маркер + доверенная учётка workflow: посторонний комментарий с
+    подделанным маркером не становится «вердиктом» ни для выжимки эскалации,
+    ни для ссылки круга (тот же класс доверия, что гейт 2 — дыра #294:
+    check_pr.py публикует от GITHUB_TOKEN, т.е. github-actions[bot])."""
+    return (review_labels._is_trusted_verdict_author(comment)
+            and (comment.get("body") or "").startswith(GATE1_VERDICT_PREFIX))
 
 
 def _is_gate2_rework_comment(comment: dict) -> bool:
@@ -1664,6 +1673,13 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         # расходились бы молча (находка AI-ревью PR #408, вторая).
         "-f", f"labels[]={review_labels.NEEDS_SPEC_LABEL}",
     )
+    # Локальная мутация вслед за серверной и здесь (класс #252 «устаревшая
+    # метка в памяти», приём _set_conflict_label): main() отдаёт тот же
+    # снимок pool дальше mark_stale_unclaimed/dispatch_worker — без дописанной
+    # метки они видели бы задачу свободной и «никем не сигнализированной»
+    # ровно до конца этого прогона.
+    issue["labels"] = [*(issue.get("labels") or []),
+                       {"name": review_labels.NEEDS_SPEC_LABEL}]
     events = pulse_guard.rework_events(repo, pull["number"])
     # Комментарии PR читаются ОДИН раз на оба потребителя: ссылки кругов
     # (verdict_round_links) и выжимка последнего вердикта в эскалации
@@ -1697,6 +1713,9 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         "-X", "PATCH", f"repos/{repo}/pulls/{pull['number']}",
         "-f", "state=closed",
     )
+    # Снимок pulls — тоже живой: trigger_ai_review ниже в этом же прогоне
+    # иначе мог бы дёрнуть ai-review.yml на только что закрытый needs-spec PR.
+    pull["state"] = "closed"
     post_issue_comment(
         repo, pull["number"],
         f"🧭 Закрыт оркестратором — бюджет реворка исчерпан "
@@ -2731,8 +2750,11 @@ def main() -> int:
         repo, pool, merged, now, open_pulls_list=open_pulls(repo))
     if accept_actions:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
-    free = sum(1 for issue in pool if not issue["assignees"])
+    free = len(free_task.free_candidates(pool))
     taken = len(pool) - free
+    # «свободно» здесь — кандидаты free_candidates, не «без assignee»:
+    # needs-spec/blocked числиться свободными не должны, строка отчёта
+    # обязана сходиться с тем, кого реально возьмёт dispatch/воркер.
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
 
     # Видимость непринятых задач (#427) — метка, не тормоз; использует уже
