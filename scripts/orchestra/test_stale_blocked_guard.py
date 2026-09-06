@@ -115,6 +115,22 @@ def test_stale_marker_targets_excludes_self_and_dedupes():
     assert sbg.stale_marker_targets(268, texts) == [265]
 
 
+def test_stale_marker_targets_ignores_marker_quoted_mid_prose():
+    """Находка ревью PR #336: маркер обязан стоять в НАЧАЛЕ строки. Цитата
+    старого маркера посреди прозы (пересказ/обсуждение) — не новая причина,
+    иначе гвардия сама сеет ложное срабатывание своим же эскалационным
+    текстом (violation_text цитирует маркер)."""
+    texts = ['Обсуждаем старый эпизод: было «Блокирована: #265», уже решено']
+    assert sbg.stale_marker_targets(268, texts) == []
+
+
+def test_stale_marker_targets_ignores_marker_inside_word():
+    """Находка ревью PR #336: «заблокирована: #N» (маркер — суффикс другого
+    слова, не начало строки) не считается названной причиной."""
+    texts = ["задача заблокирована: #164"]
+    assert sbg.stale_marker_targets(268, texts) == []
+
+
 def test_find_stale_blocked_flags_268_on_prod_form_with_265_closed():
     """Мутация (а): #265 закрыт (прод-форма факта) — #268 обязана попасть в отчёт."""
     violations = sbg.find_stale_blocked([issue_268()], closed_numbers={265})
