@@ -72,6 +72,15 @@ _spec = importlib.util.spec_from_file_location("review_labels", _LIB)
 review_labels = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(review_labels)
 
+# Третья категория находок — чеклист некритичных замечаний в теле PR (#462):
+# парсинг блока ЗАМЕЧАНИЕ и слияние с телом PR — общее место правды с
+# after_merge в scheduler.py (тот же файл читает unresolved_items при
+# слиянии), поэтому живёт в lib, не дублируется здесь второй копией регэкспа.
+_rc_spec = importlib.util.spec_from_file_location(
+    "review_checklist", SCRIPT_DIR.parent / "lib" / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_rc_spec)
+_rc_spec.loader.exec_module(review_checklist)
+
 AI_OK = review_labels.AI_OK
 AI_CHANGES = review_labels.AI_CHANGES
 AI_FAILED = review_labels.AI_FAILED
@@ -348,13 +357,20 @@ def partition_tasks(tasks: list[dict]) -> tuple[list[dict], list[dict], list[dic
     return backlog, tail, unscoped
 
 
-def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
-    """Проза ответа без строк вердикта и блоков задач: маркер вердикта
-    отражается в reviewer:, задачи переезжают в канонические фенсы."""
+def findings_of(answer: str, tasks: list[dict] | None = None,
+                 remarks: list[dict] | None = None) -> str:
+    """Проза ответа без строк вердикта, блоков задач И блоков замечаний
+    (#462): маркер вердикта отражается в reviewer:, задачи переезжают в
+    канонические фенсы, замечания — в чеклист тела PR (review_checklist).
+    Ничего из трёх категорий не должно задваиваться в свободной прозе
+    комментария."""
     tasks = tasks if tasks is not None else parse_tasks(answer)
-    titles = {t["title"] for t in tasks}
+    remarks = remarks if remarks is not None else review_checklist.parse_remarks(answer)
+    task_titles = {t["title"] for t in tasks}
+    remark_titles = {r["title"] for r in remarks}
     lines: list[str] = []
     in_task = False
+    in_remark = False
     for line in (answer or "").splitlines():
         stripped = line.strip()
         if VERDICT_RE.match(stripped):
@@ -363,16 +379,25 @@ def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
             if stripped == TASK_CLOSE:
                 in_task = False
             continue
+        if in_remark:
+            if stripped == review_checklist.REMARK_CLOSE:
+                in_remark = False
+            continue
         match = TASK_OPEN_RE.match(stripped)
-        if match and match.group(1).strip() in titles:
+        if match and match.group(1).strip() in task_titles:
             in_task = True
+            continue
+        rmatch = review_checklist.REMARK_OPEN_RE.match(stripped)
+        if rmatch and rmatch.group(1).strip() in remark_titles:
+            in_remark = True
             continue
         lines.append(line.rstrip())
     return "\n".join(lines).strip("\n").strip()
 
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
-                  tasks: list[dict], diff_fp: str | None = None) -> str:
+                  tasks: list[dict], diff_fp: str | None = None,
+                  remarks: list[dict] | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -390,7 +415,12 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     предупреждением: отсутствие МАСШТАБ не трактуется молча как «отдельно»
     (fail loud) — граница проведена здесь, а не в file_tasks.py, ОДНИМ
     местом правды: file_tasks.py читает только фенсы, значит незафенсенное
-    физически не может быть заведено issue."""
+    физически не может быть заведено issue.
+
+    remarks — блоки ЗАМЕЧАНИЕ (#462, третья категория находок): сам чеклист
+    живёт в ТЕЛЕ PR (review_checklist.merge_checklist, отдельный PATCH), не
+    здесь — комментарий только указывает, что чеклист обновлён, чтобы автор
+    не искал замечания в прозе комментария, которую отсюда убрал findings_of."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
@@ -412,6 +442,12 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
             "не угадывает поле молча (fail loud, #426). Заведи issue вручную, если "
             "это реально отдельная работа, либо допиши прямо здесь, если это хвост.\n\n"
             f"{unscoped_text}"
+        )
+    if remarks:
+        titles = "\n".join(f"- {r['title']}" for r in remarks)
+        body += (
+            "\n\nНекритичные замечания (не блокируют мерж) — в чеклисте тела PR:\n"
+            f"{titles}"
         )
     if backlog:
         close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
@@ -686,11 +722,15 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
     verdict = parse_verdict(answer)
     tasks = parse_tasks(answer)
-    findings = redact(findings_of(answer, tasks))
+    remarks = review_checklist.parse_remarks(answer)
+    findings = redact(findings_of(answer, tasks, remarks))
     tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip(),
               "scope": t.get("scope")}
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
+    remarks = [{"title": redact(r["title"]).strip(), "body": redact(r["body"]).strip()}
+               for r in remarks]
+    remarks = [r for r in remarks if r["title"]]
 
     # Причина «error» — вычисляется ДО комментария: четыре разных состояния
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
@@ -752,12 +792,23 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     added = sum(f["additions"] for f in files)
     apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
+    # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
+    # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
+    # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
+    # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
+    if remarks:
+        new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
+        if new_pr_body is not None:
+            run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
+                   "-f", "body=" + new_pr_body)
+            print(f"checklist: {len(remarks)} замечаний слито в тело PR")
+
     # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
     # следующем пуше мог сравнить и сохранить метку, если PR не изменился
     # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
     # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp, remarks=remarks)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
