@@ -411,7 +411,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -422,6 +422,15 @@ jobs:
       # ветки — прогон на реальном git с фейковым gh, сеть не нужна.
       - name: Smoke task-branch — проверка задачи на входе
         run: bash scripts/git/test/task-branch.test.sh
+
+      # Гвардия класса #476 (живой прогон worker.yml 34027035455, PR #408):
+      # доводка уже открытого PR обязана исполнять scripts/* (по пути, включая
+      # scripts/gh/infra_digest.sh) из main-дерева job'а, а не из ветки PR —
+      # инструментарий, добавленный в main ПОСЛЕ ответвления ветки PR, не
+      # должен пропадать. Прогон настоящего блока «5. Ветка» из
+      # scripts/worker/task.sh на реальном git, сеть не нужна.
+      - name: Smoke доводки PR — инструментарий из main, ветка PR отдельным worktree (#476)
+        run: bash scripts/worker/test/continue-pr-worktree.smoke.sh
 
       # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
       # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
