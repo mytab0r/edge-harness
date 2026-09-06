@@ -23,6 +23,44 @@ permissions:
   issues: write
 
 jobs:
+  # ВРЕМЕННО (issue #503, снять этим же PR до мержа) — прогон доказательства
+  # после реального деплоя фикса; см. коммит фикса для контекста.
+  diag-503-proof:
+    if: github.ref == 'refs/heads/agent/503-integrations-404-cause'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Морда — логин владельца и запрос прокси (тот же путь, что плагин)
+        env:
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          login_code=$(curl -sS -o /tmp/login.json -D /tmp/login_headers.txt -w '%{http_code}' \
+            -X POST "${DSH_EDGE_URL%/}/api/auth/login" \
+            -H 'content-type: application/x-www-form-urlencoded' \
+            --data-urlencode "accessKey=${DSH_EDGE_ACCESS_KEY}" \
+            --max-redirs 0 || true)
+          echo "логин HTTP $login_code"
+          cookie=$(grep -i '^set-cookie:' /tmp/login_headers.txt | head -1 | sed -E 's/^[Ss]et-[Cc]ookie: *//; s/\r$//' | cut -d';' -f1)
+          [ -n "$cookie" ] || { echo "::error::кука не выдана"; cat /tmp/login.json; exit 1; }
+          for id in telegram jira confluence bitbucket slack; do
+            url="${DSH_EDGE_URL%/}/api/harness/events?task_id=integration:$id&limit=5&after=0"
+            code=$(curl -sS -o /tmp/body.json -w '%{http_code}' -H "cookie: ${cookie}" -H 'accept: application/json' "$url")
+            echo "integration:$id → HTTP $code"
+            cat /tmp/body.json
+            echo
+            if [ "$code" != "200" ]; then
+              echo "::error::integration:$id — прокси всё ещё не 200"
+              exit 1
+            fi
+          done
+          echo "OK: все интеграции получают 200 через прокси после фикса"
+
   quotas:
     runs-on: ubuntu-latest
     steps:
