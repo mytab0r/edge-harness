@@ -265,6 +265,37 @@ RECENT_OK = {"workflow_runs": [
 ]}
 
 
+# ── issue_marker_times: маркер с номером PR — не подстрока чужого номера ────
+# (находка ревью #439): "... #16" — подстрока "... #163", голая проверка
+# `marker in body` считала эскалацию по PR #16 "уже случившейся" внутри
+# комментария про совсем другой PR #163.
+
+
+def test_issue_marker_times_does_not_match_longer_pr_number(monkeypatch):
+    marker = "[ai-review: автоповторы исчерпаны] #16"
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": "🚨 edge-harness: [ai-review: автоповторы исчерпаны] #163\nдругой PR"},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    assert pg.issue_marker_times("mytab0r/edge-harness", 120, marker) == []
+
+
+def test_issue_marker_times_matches_exact_pr_number(monkeypatch):
+    marker = "[ai-review: автоповторы исчерпаны] #163"
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": "🚨 edge-harness: [ai-review: автоповторы исчерпаны] #163\nтот самый PR"},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    times = pg.issue_marker_times("mytab0r/edge-harness", 120, marker)
+    assert times == [utc(2026, 9, 6, 10, 0)]
+
+
 def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs": RECENT_FAILURES,

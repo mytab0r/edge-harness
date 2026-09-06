@@ -33,6 +33,7 @@ PAUSE_MARKER ставится только сигнальным коммента
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -571,12 +572,25 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     return comments
 
 
+def _marker_present(marker: str, body: str) -> bool:
+    """Маркер найден в теле комментария как ЦЕЛОЕ число, не префикс чужого
+    (находка ревью #439): маркеры вида «... #16» и «... #163» — оба
+    заканчиваются числом, и голая подстрока `marker in body` считает «#16»
+    найденным внутри «... #163» (163 начинается с 16), потому что справа от
+    совпадения ничего не проверялось. Запрещаем цифре идти сразу за концом
+    маркера — если сам маркер кончается цифрой, а справа в теле стоит ещё
+    одна цифра, это другой номер, не совпадение. Маркеры, не кончающиеся
+    цифрой, ведут себя как раньше (граница всегда выполнена)."""
+    pattern = re.escape(marker) + (r"(?!\d)" if marker and marker[-1].isdigit() else "")
+    return re.search(pattern, body) is not None
+
+
 def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
     payload = all_issue_comments(repo, issue_number)
     return [
         parse_time(comment["created_at"])
         for comment in payload
-        if marker in (comment.get("body") or "")
+        if _marker_present(marker, comment.get("body") or "")
     ]
 
 
@@ -588,7 +602,7 @@ def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) ->
     result = []
     for comment in payload:
         body = comment.get("body") or ""
-        if any(marker in body for marker in markers):
+        if any(_marker_present(marker, body) for marker in markers):
             result.append((parse_time(comment["created_at"]), body))
     return result
 

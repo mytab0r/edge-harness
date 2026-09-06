@@ -1709,7 +1709,7 @@ def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
 def ai_review_retry_count(repo: str, pr_number: int, since: datetime | None = None) -> int:
     """Число уже потраченных автоповторов ai-review НА ЭТОМ PR — с момента
     `since` (эпоха текущего review:ok, #431), либо за всю историю, если
-    since не задан (совместимость: last_review_ok_labeled_at уже гарантирует
+    since не задан (совместимость: last_gate1_labeled_at уже гарантирует
     якорь для реальных вызовов trigger_ai_review, но функция остаётся
     честной и без него)."""
     times = issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER)

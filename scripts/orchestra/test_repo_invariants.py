@@ -273,6 +273,89 @@ def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch
     assert violations[0]["pr"] == 432
 
 
+# ── ai:failed — газ #196 исчерпал бюджет, но не эскалировал (находка ревью
+# #439, класс #431): раньше check_stuck_review_gate пропускала ЛЮБОЙ PR с
+# ai:*-меткой, включая ai:failed, и это состояние было невидимо инварианту.
+
+
+def test_stuck_review_gate_flags_ai_failed_when_budget_exhausted_not_escalated(monkeypatch):
+    pull = open_pr(163, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "issues/163/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/163/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],  # эскалации исчерпания ещё нет
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 163
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+    assert violations[0]["attempts_in_epoch"] == 3
+
+
+def test_stuck_review_gate_silent_ai_failed_budget_not_exhausted_yet(monkeypatch):
+    # Бюджет ещё не исчерпан в этой эпохе (2/3) — у #196 остаётся попытка,
+    # инвариант не должен опережать газ.
+    pull = open_pr(164, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "issues/164/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/164/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_silent_ai_failed_already_escalated(monkeypatch):
+    # #196 сам эскалировал исчерпание в #120 в этой же эпохе — инвариант не
+    # дублирует сигнал.
+    pull = open_pr(165, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "issues/165/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/165/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #165\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_ai_failed_mutation_guard(monkeypatch):
+    # Мутация: убрать вызов check_ai_failed_budget_exhausted из ветки
+    # ai:failed (вернуть "labels & ai_labels: continue" безусловно) — этот
+    # тест обязан покраснеть, реальная проверка, не > 0 без содержания.
+    pull = open_pr(166, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "issues/166/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/166/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+
+
 def test_stuck_review_gate_silent_when_neither_gate1_label_present(monkeypatch):
     # Без review:ok И без review:large гейт 1 ещё не отработал вовсе — этот
     # инвариант обязан молчать (не путать «гейт молчит» с «гейт застрял»).

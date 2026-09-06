@@ -1146,6 +1146,40 @@ def test_trigger_ai_review_quota_exhausted_escalates_without_spending_attempt(mo
     assert any("квота провайдера исчерпана" in line for line in actions)
 
 
+def test_trigger_ai_review_quota_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Зеркало test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch
+    # для quota-ветки (находка ревью #439) — та же логика marker_at > anchor,
+    # уже эскалированная в этой эпохе квота не должна эскалироваться повторно
+    # на каждом тике оркестратора.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    marker = f"{sch.AI_REVIEW_QUOTA_MARKER} #163"
+    fake = FakeGh({
+        "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T09:10:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert actions == []
+
+
 def timeline_with_review_large_only(when: str):
     """Прод-форма таймлайна крупного PR (#412, #432): verdict_for ставит РОВНО
     одну из двух меток гейта 1 — событие "labeled: review:ok" в таком

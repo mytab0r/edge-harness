@@ -208,11 +208,17 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
     транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
-    что-то другое», правило AGENTS.md). Порядок проверки важен: failure_reason
-    (ai_dsh.sh уже решил за нас, что это лимит) — раньше generic-транспорта,
-    транспорт — раньше формата, потому что при упавшем транспорте answer пуст
-    и verdict_line_present всё равно вернёт False — не значит «модель
-    промолчала».
+    что-то другое», правило AGENTS.md).
+
+    Классификация (порядок проверки, приоритет между причинами) — ЕДИНСТВЕННО
+    в review_labels.reason_tag (находка ревью #439: раньше порядок был
+    продублирован здесь второй копией if/elif, связанной с оригиналом только
+    комментарием «тот же порядок» — разъехались бы молча, добавь кто-то
+    причину в одном месте и забудь про другое). Эта функция только рендерит
+    прозу для человека по уже вынесенному тегу; текст для FAILURE_REASON_
+    CONTRACT дополнительно различает две подпричины через verdict_line_present
+    (тег их не различает — обеим достаточно значения «формат ответа
+    нарушен», разница есть только в тексте для человека).
 
     failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
     ai_dsh.sh, #419), пробрасывается step-output'ами ai-review.yml в
@@ -228,18 +234,21 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
                                           RATE_LIMIT вовсе), либо контракт
                                           ответа (rc=0, формат нарушен).
     """
-    if failure_reason == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
+    tag = review_labels.reason_tag(dsh_rc, failure_reason)
+    if tag == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
         return (f"ревью не состоялось — квота провайдера исчерпана надолго "
                 f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
                 f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
                 "ждать вне CI или сменить провайдера "
                 "(docs/runbooks/switch-llm-provider.md)")
-    if failure_reason == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET:
+    if tag == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET:
         return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
                 f"снялся за отведённый бюджет ожидания внутри прогона (код "
                 f"возврата {dsh_rc})")
-    if transport_failed(dsh_rc):
+    if tag == review_labels.FAILURE_REASON_TRANSPORT:
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
+    # tag == FAILURE_REASON_CONTRACT — единственная причина, которую тег не
+    # делит на подпричины; текст для человека делит дальше.
     if verdict_line_present(answer):
         return "модель ответила, но строка «ВЕРДИКТ: …» есть, а не единственная и/или не последняя"
     return "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
