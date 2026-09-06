@@ -4,9 +4,9 @@
 - **Статус:** принято (факт, не выбор вкуса)
 - **Смежное:** [GitHub Actions — лимиты и границы](../research/21-github-actions.md),
   `scripts/orchestra/scheduler.py` (`merge_queue`, `update_remaining_pulls`,
-  `update_branch_or_report`; `merge_loop` — событийный триггер из
-  незамердженного [#330](https://github.com/mytab0r/edge-harness/pull/330),
-  в текущем `main` его ещё нет), задача
+  `update_branch_or_report`; `merge_loop` — событийный триггер, реализован в
+  [#330](https://github.com/mytab0r/edge-harness/pull/330), см.
+  [ADR 0012](0012-orchestra-event-trigger-merge-loop.md)), задача
   [#252](https://github.com/mytab0r/edge-harness/issues/252) (автоподтягивание
   веток жжёт AI-ревью), заявка на этот вопрос — задача
   [#339](https://github.com/mytab0r/edge-harness/issues/339).
@@ -14,9 +14,9 @@
 ## Контекст
 
 Ровно месяц своей реализации очереди слияний (`merge_queue()` в
-`scripts/orchestra/scheduler.py`; событийный триггер `merge_loop()` живёт
-только в незамердженном PR #330, в текущем `main` его нет) — и постоянные
-грабли: гонки update-branch с AI-ревью (#208), сожжённый
+`scripts/orchestra/scheduler.py`; событийный триггер `merge_loop()` реализован
+в #330, см. [ADR 0012](0012-orchestra-event-trigger-merge-loop.md)) — и
+постоянные грабли: гонки update-branch с AI-ревью (#208), сожжённый
 бюджет ревью при массовом автоподтягивании (#252), гонка `concurrency` с
 обязательной проверкой `contract` (#189). Естественный вопрос: почему не
 штатная GitHub Merge Queue, которая как раз это и решает нативно.
