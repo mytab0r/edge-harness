@@ -312,6 +312,54 @@ def test_release_merged_is_idempotent_batch(monkeypatch):
     assert len(lines) == 2 and all("снят" in line or "отсутствовал" in line for line in lines)
 
 
+# ── release_full: и назначение, и замок (#422 — провайдер в лимите/квоте) ────────
+
+
+def test_release_full_removes_assignee_and_lock(monkeypatch):
+    # Живой случай #422: воркер узнал СРАЗУ, что дальше нет смысла (бюджет
+    # ретрая RATE_LIMIT исчерпан) — задача обязана вернуться в пул целиком,
+    # не дожидаясь 24-часового reap_stale.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5")
+    detail = ct.release_full("o/r", 5)
+    assert "назначение снято" in detail and "mytab0r" in detail
+    assert "снят" in detail  # часть release() тоже отражена в итоговой строке
+    assert any("DELETE" in c and "issues/5/assignees" in c and "mytab0r" in c
+               for c in server.calls)
+    assert any("DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
+def test_release_full_without_assignee_only_touches_lock(monkeypatch):
+    routes = {"repos/o/r/issues/7": {"number": 7, "assignees": []}}
+    server = install(monkeypatch, FakeServer(routes))
+    detail = ct.release_full("o/r", 7)
+    assert "назначения не было" in detail
+    assert not any("DELETE" in c and "issues/7/assignees" in c for c in server.calls)
+
+
+def test_release_full_assignee_removal_failure_does_not_block_lock_release(monkeypatch):
+    # Снятие assignee — видимость, не защита (симметрично claim._visibility):
+    # сбой не должен помешать снять замок — иначе задача осталась бы занятой
+    # ДВОЙНО (и assignee, и мёртвый замок) именно там, где нужно освободить её
+    # быстрее всего.
+    class ForbiddenAssignees(FakeServer):
+        def run(self, args, **kw):
+            joined = " ".join(args)
+            if "-X" in args and "DELETE" in args and "issues/5/assignees" in joined:
+                return fail(403, "Forbidden")
+            return super().run(args, **kw)
+    routes = {"repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]}}
+    server = install(monkeypatch, ForbiddenAssignees(routes))
+    server.add_ref("refs/locks/task-5")
+    detail = ct.release_full("o/r", 5)
+    assert "не снято" in detail
+    assert any("DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
 # ── Сборщик протухших замков ─────────────────────────────────────────────────────
 
 
@@ -394,6 +442,8 @@ def test_cli_exit_codes_contract(monkeypatch):
     assert ct.main(["x", "claim", "5"]) == ct.EXIT_BUSY  # зелёный no-op вызывающего
     monkeypatch.setattr(ct, "release", lambda *a, **kw: "снят")
     assert ct.main(["x", "release", "5"]) == ct.EXIT_OK
+    monkeypatch.setattr(ct, "release_full", lambda *a, **kw: "назначение снято; снят")
+    assert ct.main(["x", "release-full", "5"]) == ct.EXIT_OK
 
 
 def test_cli_requires_repo_and_valid_task(monkeypatch):

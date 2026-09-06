@@ -211,6 +211,34 @@ def _ref_missing(error: "GhError") -> bool:
     return error.status == 422 and "does not exist" in str(error).lower()
 
 
+def release_full(repo: str, task: int) -> str:
+    """Снять аренду ПОЛНОСТЬЮ — и назначение, и замок, не только замок (#422).
+
+    Обычный `release()` возвращает только замок; assignee уходит лишь через
+    24-часовой `reap_stale` (scheduler.py). Это верно, когда причина отказа —
+    в самой задаче (пусть ждёт человека/повторной попытки), но не тогда, когда
+    известно СРАЗУ, что работать не получится по вине провайдера (RATE_LIMIT
+    исчерпан надолго, или бюджет ретрая кончился) — держать assignee до
+    таймера значило бы зря прятать свободную задачу от остальных каналов.
+    Логика снятия assignee — та же, что уже использует `reap_stale`
+    (DELETE issues/{N}/assignees), вынесена сюда, а не продублирована."""
+    issue = gh(f"repos/{repo}/issues/{task}")
+    assignees = issue.get("assignees") or []
+    lines = []
+    if assignees:
+        who = ", ".join(a["login"] for a in assignees)
+        args = [arg for a in assignees for arg in ("-f", f"assignees[]={a['login']}")]
+        try:
+            gh("-X", "DELETE", f"repos/{repo}/issues/{task}/assignees", *args)
+            lines.append(f"назначение снято ({who})")
+        except GhError as error:
+            lines.append(f"⚠️ назначение не снято ({who}): {error}")
+    else:
+        lines.append("назначения не было")
+    lines.append(release(repo, task))
+    return "; ".join(lines)
+
+
 # ── Сборщик протухших замков (вызывает scheduler) ────────────────────────────────
 
 
@@ -286,8 +314,9 @@ def current_actor() -> str:
 
 
 def main(argv: list[str]) -> int:
-    usage = ("использование: claim_task.py claim <N> | release <N> | status | locks "
-             "(locks — номера задач под замком через пробел, для выбора пула)")
+    usage = ("использование: claim_task.py claim <N> | release <N> | release-full <N> "
+             "| status | locks (locks — номера задач под замком через пробел, для "
+             "выбора пула; release-full — снять и замок, и назначение, #422)")
     if len(argv) < 2:
         print(f"::error::{usage}", file=sys.stderr)
         return EXIT_ERROR
@@ -305,6 +334,9 @@ def main(argv: list[str]) -> int:
                 print(result.detail)
                 return EXIT_OK if result.claimed else EXIT_BUSY
             print(release(repo, task))
+            return EXIT_OK
+        if command == "release-full" and len(argv) == 3 and argv[2].isdigit():
+            print(release_full(repo, int(argv[2])))
             return EXIT_OK
         if command == "locks":
             print(" ".join(str(task) for task in locked_tasks(repo)))
