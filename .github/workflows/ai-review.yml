@@ -153,12 +153,37 @@ jobs:
       # и needs.review.outputs.go == 'true' в job verdict тоже корректно False.
       go: ${{ steps.fingerprint.outputs.go }}
     steps:
+      # Доверенный чекаут main только ради гейта квоты ниже (та же граница
+      # доверия, что и у остальных доверенных шагов job'а: код из main, а не
+      # из ревьюимой ветки — её чекаут случится позже и в другой каталог).
+      - name: Чекаут main (для гейта квоты)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # живой прогон 2026-09-06 падал ровно в этом job'е — PR #453 упал на
+      # `gh api repos/.../pulls/453` внутри шага fingerprint, потому что
+      # общий бюджет 1000 запросов/час/репозиторий уже был съеден другими
+      # job'ами того же часа. Мало квоты → facts не выполняется (условие
+      # ниже) → go остаётся пустым → вся цепочка (fingerprint/gather/DSH/
+      # verdict) гасится уже существующими условиями `steps.facts.outputs.go` —
+      # job зелёный (skipped), а не красный по чужой причине. Порог и
+      # обоснование — scripts/lib/rate_guard.py.
+      - name: Квота GitHub API — ранняя проверка
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job ai-review
+
       # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
       # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
       # Step-outputs читаются из СВОЕГО временного файла на момент закрытия
       # шага — поздние записи в него игнорируются.
       - name: Факты PR (номер, head, решение «ревьюим?»)
         id: facts
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_INPUT: ${{ github.event.inputs.pr }}

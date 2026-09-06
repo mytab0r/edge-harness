@@ -461,6 +461,20 @@ jobs:
           print(f"docs: все {total} ссылок на .github/workflows/ существуют")
           PY
 
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
+      # живого падения, что у PR #428 (оба обязательных гейта, `test` в том
+      # числе, упали с `API rate limit exceeded for installation`). Мало
+      # квоты → шаг инвариантов пропускается (условие ниже) и job `test`
+      # остаётся зелёным вместо случайного красного по чужой причине;
+      # предупреждение печатается здесь же, до пропуска. Порог и обоснование —
+      # scripts/lib/rate_guard.py.
+      - name: Квота GitHub API — ранняя проверка (инварианты)
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job repo-ci-invariants
+
       # Живой снимок инвариантов состояния репозитория (#244) — на каждый
       # push/PR, раньше следующего пульса orchestra (см. также periodic-шаг
       # в orchestra.yml с эскалацией). Все инварианты проверяют СОСТОЯНИЕ
@@ -477,6 +491,7 @@ jobs:
       # для газа. 1/2/5 — наблюдательные, пока не обнулён накопленный долг
       # (17/20 из 66/7 нарушений на замер).
       - name: Инварианты состояния репозитория — живой снимок (4 — required)
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/orchestra/repo_invariants.py
