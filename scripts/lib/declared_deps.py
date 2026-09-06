@@ -42,11 +42,32 @@ _TRIGGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Канонический рендер обязательного поля формы «Чем блокируется»
+# (.github/ISSUE_TEMPLATE/task.yml, white-spot.yml) — GitHub рендерит поле
+# формы как `### <label>\n\n<ответ>\n` (design.md task-priority-blocking-graph,
+# развилка про рендер формы). Это форма СХЕМЫ, не прозопарсинг: значение поля
+# приходит структурно, ответ — первая непустая строка после заголовка.
+# Находка AI-ревью PR #387: _TRIGGER_RE не пересекает пустую строку между
+# заголовком и значением ([^#).\n]{0,20} не проходит через \n), поэтому
+# канонический рендер формы («### Чем блокируется\n\n#123 #124») давал
+# ПУСТОЙ набор кандидатов — ровно тот путь, где перенос в граф ручной и
+# пропуск наиболее вероятен, гвардия молча пропускала.
+_FORM_FIELD_RE = re.compile(
+    r"^###\s*Чем\s+блокируется\s*\n\s*\n([^\n]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def declared_candidates(body: str) -> set[int]:
     """Номера issue рядом с формулировкой зависимости — эвристика для
-    предупреждения, не факт (см. docstring модуля)."""
-    return {int(n) for n in _TRIGGER_RE.findall(body or "")}
+    предупреждения, не факт (см. docstring модуля). Плюс структурное поле
+    формы «Чем блокируется» (см. `_FORM_FIELD_RE` выше) — не эвристика,
+    ответ схемы."""
+    found = {int(n) for n in _TRIGGER_RE.findall(body or "")}
+    form_match = _FORM_FIELD_RE.search(body or "")
+    if form_match:
+        found |= {int(n) for n in re.findall(r"#(\d+)", form_match.group(1))}
+    return found
 
 
 def find_desync(issues: list[dict]) -> list[dict]:

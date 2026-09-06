@@ -59,6 +59,24 @@ def test_declared_candidates_no_trigger_no_candidates():
     assert dd.declared_candidates("Обычный текст с номером #55 без формулировки.") == set()
 
 
+def test_declared_candidates_finds_canonical_form_field_render():
+    # Находка AI-ревью PR #387: канонический рендер GitHub обязательного поля
+    # формы `### <label>\n\n<ответ>` (task.yml/white-spot.yml, id blocked_by)
+    # не пересекался окном _TRIGGER_RE (не проходит через пустую строку между
+    # заголовком и значением) — ровно тот путь, где перенос в граф ручной.
+    body = (
+        "### Цель\n\nСделать штуку.\n\n"
+        "### Чем блокируется\n\n#123 #124\n\n"
+        "### Контекст и ссылки\n\nпросто текст без формулировки зависимости"
+    )
+    assert dd.declared_candidates(body) == {123, 124}
+
+
+def test_declared_candidates_form_field_nichem_no_candidates():
+    body = "### Чем блокируется\n\nничем\n\n### Что блокирует\n\n#55"
+    assert dd.declared_candidates(body) == set()
+
+
 # ── find_desync: тело называет открытую задачу, граф не знает ──────────────
 
 
