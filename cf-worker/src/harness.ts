@@ -1081,6 +1081,23 @@ export class Harness extends DurableObject<Env> {
       console.log(`inbox process failed: ${error instanceof Error ? error.message : error}`);
     }
 
+    // Триггеры-расписания автоматизаций (#116): тот же пульс, что гоняет
+    // orchestra — отдельного cron в Actions нет (research/21: не тикает).
+    // ДО раннего возврата по конфигурации ORCHESTRA-дозвона: #fireDueSchedules
+    // → #fireAutomation → #dispatchToGitHub читает GH_DISPATCH_TOKEN/GH_REPO
+    // САМ и независимо возвращает честный not_configured (тот же приём, что у
+    // webhook/journal-триггеров) — привязывать расписания к тому же раннему
+    // return, что и heartbeat orchestra, значило бы гасить их МОЛЧА (без даже
+    // честного not_configured) при отсутствии ровно этой пары секретов, хотя
+    // сама автоматизация в них не нуждается (находка AI-ревью PR #241, третий
+    // раунд: #fireDueSchedules не поднимался ни одним тестом — при проверке
+    // выяснилось, что и в проде он не дошёл бы дальше этого return).
+    try {
+      await this.#fireDueSchedules(Date.now());
+    } catch (error) {
+      console.log(`automation schedules failed: ${error instanceof Error ? error.message : error}`);
+    }
+
     try {
       // #sql.exec ниже (#getStoredPulse, #recordPulse) тоже может упасть на исчерпании
       // суточной квоты rows_read/rows_written — но тик уже перезаложен строкой выше,
@@ -1127,13 +1144,6 @@ export class Harness extends DurableObject<Env> {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.log(`dsh-edge update check failed (${classifyStorageError(detail)}): ${detail}`);
-    }
-    // Триггеры-расписания автоматизаций (#116): тот же пульс, что гоняет
-    // orchestra — отдельного cron в Actions нет (research/21: не тикает).
-    try {
-      await this.#fireDueSchedules(Date.now());
-    } catch (error) {
-      console.log(`automation schedules failed: ${error instanceof Error ? error.message : error}`);
     }
   }
 

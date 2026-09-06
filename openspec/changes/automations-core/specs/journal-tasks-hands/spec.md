@@ -19,15 +19,24 @@
       каждый тик;
     - `webhook` — внешний вход `POST /api/webhooks/:id`, аутентификация
       подписью (см. п.20), последующий запуск идёт через `#fireAutomation`;
-    - `journal` — kind события журнала. Кулдаун одной автоматизации —
-      `AUTOMATIONS.journalCooldownMs` (30 минут). Kind, под который сама
-      автоматизация пишет свои системные события
-      (`AUTOMATIONS.reservedJournalKinds` — `automation_updated`,
-      `automation_deleted`, `automation_triggered`, `automation_dispatched`,
-      `automation_webhook_rejected`, `automation_result`), запрещён на входе
-      `PUT`: такой конфиг никогда не сработал бы (гвардия петли по префиксу
-      `task_id` `automation:...`), поэтому отклоняется явно, а не
-      сохраняется мёртвым.
+    - `journal` — kind события журнала. `AUTOMATIONS.journalCooldownMs`
+      (30 минут) — это только ТЕМП повторов между срабатываниями, а не
+      разрыв цикла. Kind, под который сама автоматизация пишет свои
+      системные события (`AUTOMATIONS.reservedJournalKinds` —
+      `automation_updated`, `automation_deleted`, `automation_triggered`,
+      `automation_dispatched`, `automation_webhook_rejected`,
+      `automation_result`), запрещён на входе `PUT`: такой конфиг никогда
+      не сработал бы (гвардия петли по префиксу `task_id`
+      `automation:...`), поэтому отклоняется явно, а не сохраняется
+      мёртвым. Отдельно и тем же приёмом на `PUT` отклоняется сочетание
+      `trigger.type=journal` + `task.kind=pool`: прогон заводит issue,
+      воркер завершает её `job_end`'ом под task_id `issue-N` без префикса
+      `automation:...` — гвардия петли по префиксу это событие не отличает
+      от обычного, и кулдаун здесь не разрыв, а именно темп: цикл длиннее
+      кулдауна (аренда, PR, слияние) кулдаун вообще не режет, цикл короче —
+      штампует issue с воркер-прогонами и расходом LLM без остановки.
+      Настоящее решение — отслеживание происхождения задачи (issue →
+      создавшая автоматизация) — вне рамок этого PR (беклог).
 
 40. Journal-триггер проверяется на КАЖДОЕ принятое событие журнала — и на
     батч из `POST /api/events` (раннер), и на системные события, которые DO

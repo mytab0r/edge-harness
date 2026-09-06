@@ -185,6 +185,23 @@ export function parseAutomationConfig(raw: unknown): ConfigParseResult {
   if (task.kind === "digest" && channels.length === 0) {
     return { ok: false, error: "task=digest требует хотя бы один канал в report.channels" };
   }
+  // trigger=journal + task=pool самоподдерживает себя: прогон заводит issue,
+  // воркер завершает её job_end'ом под task_id `issue-N` — БЕЗ префикса
+  // runTaskPrefix, гвардия петли по префиксу его не отличает от обычного
+  // journal-события. Кулдаун (AUTOMATIONS.journalCooldownMs) — это только
+  // ТЕМП повторов, а не разрыв цикла: цикл длиннее кулдауна (аренда, PR,
+  // слияние — обычное дело) кулдаун вообще не режет, цикл короче — штампует
+  // до 48 реальных issue в сутки с воркер-прогонами и расходом LLM. Настоящее
+  // решение — отслеживание происхождения (issue → создавшая автоматизация),
+  // его нет; до тех пор сочетание отклоняется на входе тем же приёмом, что
+  // reservedJournalKinds (находка AI-ревью PR #241, третий раунд).
+  if (trigger.type === "journal" && task.kind === "pool") {
+    return {
+      ok: false,
+      error: "trigger.type=journal + task.kind=pool порождает самоподдерживающуюся петлю "
+        + "(job_end воркера по заведённой задаче — новое journal-событие без гвардии по префиксу)",
+    };
+  }
 
   return { ok: true, config: { enabled: input.enabled, trigger, task, report: { channels } } };
 }
@@ -202,10 +219,12 @@ export function scheduleDue(intervalHours: number, lastFiredTs: number | null, n
 }
 
 /** Решение «пора ли journal-триггеру» — кулдаун от прошлого запуска
- *  (AUTOMATIONS.journalCooldownMs). Работа прогона может порождать события
- *  журнала с чужими task_id (kind=pool → job_end воркера под issue-N):
- *  префикс-гвардия их не отличает, кулдаун рвёт цикл, сводя частоту к каденсу
- *  пульса (ревью #116, minor 3). */
+ *  (AUTOMATIONS.journalCooldownMs). Это только ТЕМП повторов, не разрыв
+ *  цикла: связка trigger=journal + task=pool (прогон порождает issue, воркер
+ *  завершает её job_end'ом под task_id без префикса runTaskPrefix — гвардия
+ *  петли по префиксу такое событие не отличает) кулдауном не лечится и
+ *  поэтому отклоняется отдельно на PUT, см. parseAutomationConfig (находка
+ *  AI-ревью PR #241, третий раунд). */
 export function journalTriggerDue(lastFiredTs: number | null, now: number, cooldownMs: number): boolean {
   if (lastFiredTs === null) return true;
   return now - lastFiredTs >= cooldownMs;

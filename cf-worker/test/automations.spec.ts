@@ -1,6 +1,7 @@
-import { exports } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { AUTOMATIONS } from "../src/config";
+import { AUTOMATIONS, OWNER_OBJECT_NAME } from "../src/config";
 import {
   AUTOMATION_ID_PATTERN,
   digestPeriod,
@@ -77,9 +78,12 @@ async function hmacHex(secret: string, payload: string): Promise<string> {
 
 describe("automations: валидация конфига", () => {
   it("полный конфиг проходит и нормализуется (pool.body дописывается пустым)", () => {
+    // trigger=schedule, не journal: сочетание journal+pool отдельно отклоняется
+    // ниже (находка AI-ревью PR #241, третий раунд) — эта проверка про
+    // нормализацию task.kind=pool как таковую, не про конкретный триггер.
     const parsed = parseAutomationConfig({
       enabled: false,
-      trigger: { type: "journal", kind: "job_end" },
+      trigger: { type: "schedule", intervalHours: 24 },
       task: { kind: "pool", title: "разобрать" },
       report: { channels: [] },
     });
@@ -106,6 +110,27 @@ describe("automations: валидация конфига", () => {
     }
     // Обычный kind события job'а — по-прежнему валиден.
     expect(parseAutomationConfig({ ...digestConfig(), trigger: { type: "journal", kind: "job_end" } }).ok).toBe(true);
+  });
+
+  it("сочетание trigger=journal + task=pool отклоняется — самоподдерживающаяся петля (находка ревью PR #241, третий раунд)", () => {
+    const parsed = parseAutomationConfig({
+      enabled: true,
+      trigger: { type: "journal", kind: "job_end" },
+      task: { kind: "pool", title: "разобрать" },
+      report: { channels: [] },
+    });
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.error).toMatch(/петл/);
+    }
+    // journal + digest/hands — по-прежнему валидны, петля возможна только с pool.
+    expect(parseAutomationConfig({ ...digestConfig(), trigger: { type: "journal", kind: "job_end" } }).ok).toBe(true);
+    expect(parseAutomationConfig({
+      enabled: true,
+      trigger: { type: "journal", kind: "job_end" },
+      task: { kind: "hands", text: "разобрать" },
+      report: { channels: [] },
+    }).ok).toBe(true);
   });
 });
 
@@ -312,11 +337,14 @@ describe("automations: journal-триггер", () => {
   it("событие нужного kind поднимает прогон; события самих автоматизаций — нет", async () => {
     const id = uniqueId("jrn");
     const kind = `gate_${counter}`;
+    // task=hands, не pool: сочетание journal+pool отдельно отклоняется на PUT
+    // (находка ревью PR #241, третий раунд) — этот тест проверяет срабатывание
+    // триггера и гвардию петли, для чего вид задачи не важен.
     expect((
       await putAutomation(id, {
         enabled: true,
         trigger: { type: "journal", kind },
-        task: { kind: "pool", title: "разобрать событие" },
+        task: { kind: "hands", text: "разобрать событие" },
         report: { channels: [] },
       })
     ).status).toBe(201);
@@ -341,5 +369,60 @@ describe("automations: journal-триггер", () => {
     const runId = tasks.tasks.find((task) => task.id.startsWith(`automation:${id}:`))!.id;
     await post(runId);
     expect(await countRuns()).toBe(1);
+  });
+});
+
+// ── DO: триггер «расписание» реально поднимается будильником DO ────────────────
+//
+// Единственная из трёх веток триггеров, которую остальные тесты этого файла не
+// поднимали через настоящий alarm(): webhook и journal гоняются сквозь HTTP,
+// schedule был покрыт только чистой scheduleDue() — #fireDueSchedules() внутри
+// alarm() ни разу не вызывался (находка AI-ревью PR #241, третий раунд).
+describe("automations: schedule-триггер поднимается будильником DO", () => {
+  it("due-расписание запускает прогон на alarm(); дистанция уже пройдена — прогона нет", async () => {
+    const dueId = uniqueId("sched-alarm-due");
+    const notDueId = uniqueId("sched-alarm-not-due");
+    // intervalHours=1: обеим PUT сразу ставит last_fired_ts=null → scheduleDue
+    // вернёт true при первом alarm(); notDueId получит last_fired_ts свежим
+    // прогоном ниже, чтобы вторая проверка была честной «рано».
+    expect((await putAutomation(dueId, {
+      enabled: true,
+      trigger: { type: "schedule", intervalHours: 1 },
+      task: { kind: "hands", text: "дайджест" },
+      report: { channels: [] },
+    })).status).toBe(201);
+    expect((await putAutomation(notDueId, {
+      enabled: true,
+      trigger: { type: "schedule", intervalHours: 1 },
+      task: { kind: "hands", text: "дайджест" },
+      report: { channels: [] },
+    })).status).toBe(201);
+
+    const countRuns = async (prefix: string): Promise<number> => {
+      const tasks = await getJson<{ tasks: { id: string }[] }>("/api/tasks");
+      return tasks.tasks.filter((task) => task.id.startsWith(`automation:${prefix}:`)).length;
+    };
+
+    const id = env.HARNESS.idFromName(OWNER_OBJECT_NAME);
+    const stub = env.HARNESS.get(id);
+    // notDueId уже "отстрелялся" только что — следующий пульс ему рано.
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE automations SET last_fired_ts = ? WHERE id = ?", Date.now(), notDueId,
+      );
+    });
+
+    expect(await countRuns(dueId)).toBe(0);
+    expect(await countRuns(notDueId)).toBe(0);
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as unknown as { alarm(): Promise<void> }).alarm();
+    });
+
+    // due — прогон появился (диспатч в тестовой среде честно not_configured,
+    // сама очередь — доказательство, что #fireDueSchedules сработал).
+    expect(await countRuns(dueId)).toBe(1);
+    // not_due — интервал не истёк, alarm() не должен был его тронуть.
+    expect(await countRuns(notDueId)).toBe(0);
   });
 });
