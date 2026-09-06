@@ -11,7 +11,7 @@ scripts/lib/test_label_registry.py): новый или восстановлен�
 попадает в таблицу, и никто не обязан заметить пропуск, пока не читает файл
 целиком построчно.
 
-Единственное правило: каждое имя `.yml` из `.github/workflows/` обязано
+Единственное правило: каждое имя `.yml`/`.yaml` из `.github/workflows/` обязано
 встречаться в таблице инвентаря как отдельная ячейка `| `<file>` |`
 (markdown-код в первой колонке), не просто где-то в тексте — упоминание в
 прозе (как у samого worker-ci.yml в пункте про грабли) не считается строкой
@@ -35,7 +35,10 @@ TABLE_HEADER = "| Файл | Триггер |"
 
 
 def workflow_files() -> list[str]:
-    return sorted(p.name for p in WORKFLOWS_DIR.glob("*.yml"))
+    # `.yaml` тоже валидное расширение workflow-файла GitHub Actions (находка
+    # ревью PR #326): сейчас в репозитории таких нет, но glob по одному `.yml`
+    # молча пропустил бы будущий `*.yaml`, и эта же гвардия его не поймала бы.
+    return sorted(p.name for p in WORKFLOWS_DIR.glob("*.y*ml"))
 
 
 def inventory_table_rows(text: str) -> list[str]:
@@ -62,7 +65,7 @@ def files_named_in_table(rows: list[str]) -> set[str]:
         if row.startswith("|---"):
             continue
         first_cell = row.strip("|").split("|", 1)[0].strip()
-        match = re.fullmatch(r"`([\w.-]+\.yml)`", first_cell)
+        match = re.fullmatch(r"`([\w.-]+\.ya?ml)`", first_cell)
         if match:
             names.add(match.group(1))
     return names
