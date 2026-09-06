@@ -690,6 +690,10 @@ jobs:
       # не выпадает из проверки), на каждой ловит console-ошибки и сетевые
       # ответы ≥400. Красный шаг — деплой поставил регрессию интерфейса,
       # видную владельцу, но невидимую прежним проверкам кода/API.
+      # pnpm, не npm: dsh-edge/e2e-smoke — отдельный от standalone-дерева
+      # пакет (никаких pnpm-патчей Workers тут нет и не может быть), но
+      # гвардия класса #43 (test_dsh_edge_pnpm_guard.py) запрещает npm install
+      # в ЛЮБОМ месте этого файла безусловно — pnpm везде, без исключений.
       - name: e2e generic browser smoke морды (#502)
         if: success()
         working-directory: dsh-edge/e2e-smoke
@@ -697,7 +701,7 @@ jobs:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
           BASE_URL: https://dsh-edge.mytab0r.workers.dev
         run: |
-          npm install --no-audit --no-fund
+          pnpm install --no-frozen-lockfile
           node smoke.mjs
 
       - name: plugin_status → ready
