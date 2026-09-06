@@ -14,14 +14,45 @@
 # подтверждение --no-task-ack "<причина>" пропускает проверку и печатает
 # причину в лог, чтобы пропуск был осознанным решением, а не забытой меткой.
 #
+# Второй тормоз (#566): заголовок сверяется с уже ОТКРЫТЫМИ задачами пула
+# (scripts/lib/duplicate_guard.py, токенная схожесть заголовка) — измеренный
+# случай 2026-09-06: три агента одной сессии независимо диагностировали один
+# и тот же дефект и завели под него отдельные issue (#518/#547/#564), #548 и
+# #564 закрыты как дубликат УЖЕ ПОСЛЕ того, как под ними были открыты PR.
+# Единственная защита сегодня (аренда claim_task.py, #121) привязана к
+# номеру задачи — здесь номера ещё нет, диагностика начинается без него.
+# Совпадение выше порога — отказ ДО создания issue со списком кандидатов;
+# газ — явный `--confirm-not-duplicate "<почему не дубль>"`, причина попадает
+# в тело issue (не тонет в одном терминале). Совпадений нет — флаг не нужен.
+#
 # Использование: то же самое, что `gh issue create` — все аргументы
 # проксируются без изменений (--title, --body/--body-file, --label, …),
-# плюс свой --no-task-ack "<причина>" (в gh не уходит).
+# плюс свои --no-task-ack "<причина>" и --confirm-not-duplicate "<причина>"
+# (в gh не уходят).
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 labels=()
 args=()
 no_task_ack=""
+confirm_not_duplicate=""
+title=""
+body=""
+# body_slot_kind/body_slot_index — где в args лежит тело, чтобы позже (если
+# нашлись похожие задачи И дан --confirm-not-duplicate) переписать РОВНО этот
+# слот сноской с причиной, не трогая остальные аргументы. kind:
+#   value        — args[index] это САМО значение (после отдельного --body)
+#   value_inline — args[index] это "--body=значение" одной строкой
+#   file         — args[index] это ПУТЬ к файлу (после отдельного --body-file)
+#   file_inline  — args[index] это "--body-file=путь" одной строкой
+body_slot_kind=""
+body_slot_index=""
+tmp_body_file=""
+tmp_footer_file=""
+cleanup() { [ -z "$tmp_body_file" ] || rm -f "$tmp_body_file"; [ -z "$tmp_footer_file" ] || rm -f "$tmp_footer_file"; }
+trap cleanup EXIT
+
 n=$#
 i=1
 while [ "$i" -le "$n" ]; do
@@ -44,6 +75,58 @@ while [ "$i" -le "$n" ]; do
       ;;
     --no-task-ack=*)
       no_task_ack="${arg#--no-task-ack=}"
+      ;;
+    --confirm-not-duplicate)
+      i=$((i + 1))
+      confirm_not_duplicate="${!i}"
+      ;;
+    --confirm-not-duplicate=*)
+      confirm_not_duplicate="${arg#--confirm-not-duplicate=}"
+      ;;
+    --title)
+      i=$((i + 1))
+      title="${!i}"
+      args+=("--title" "$title")
+      ;;
+    --title=*)
+      title="${arg#--title=}"
+      args+=("$arg")
+      ;;
+    --body)
+      i=$((i + 1))
+      body="${!i}"
+      args+=("--body")
+      body_slot_kind="value"; body_slot_index=${#args[@]}
+      args+=("$body")
+      ;;
+    --body=*)
+      body="${arg#--body=}"
+      body_slot_kind="value_inline"; body_slot_index=${#args[@]}
+      args+=("$arg")
+      ;;
+    --body-file)
+      i=$((i + 1))
+      body_file="${!i}"
+      if [ "$body_file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body_file="$tmp_body_file"
+      fi
+      body="$(cat "$body_file")"
+      args+=("--body-file")
+      body_slot_kind="file"; body_slot_index=${#args[@]}
+      args+=("$body_file")
+      ;;
+    --body-file=*)
+      body_file="${arg#--body-file=}"
+      if [ "$body_file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body_file="$tmp_body_file"
+      fi
+      body="$(cat "$body_file")"
+      body_slot_kind="file_inline"; body_slot_index=${#args[@]}
+      args+=("--body-file=$body_file")
       ;;
     *)
       args+=("$arg")
@@ -72,6 +155,63 @@ if [ "$has_task" -ne 1 ]; then
     echo "::error::issue заводится без метки task — пул воркера её не увидит (scheduler.py, класс #179, живые случаи #523/#425). Добавь --label task, либо явно распишись --no-task-ack \"причина\", если это НЕ задача пула." >&2
     echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
     exit 1
+  fi
+fi
+
+# Дедупликация по похожести заголовка (#566) — только для реальных задач
+# пула (has_task=1: --no-task-ack явно объявил «это не пул», сравнивать не с
+# чем сравнивать по смыслу) и только если заголовок вообще известен (пустой
+# --title — забота самого gh issue create, здесь просто нечего сравнивать).
+if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
+  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  if [ -z "$repo" ]; then
+    echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести пропущена." >&2
+  else
+    dg_err_file="$(mktemp)"
+    matches="$(python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file" || true)"
+    dg_err="$(cat "$dg_err_file" 2>/dev/null || true)"; rm -f "$dg_err_file"
+    [ -z "$dg_err" ] || echo "$dg_err" >&2
+    if [ -n "$matches" ]; then
+      if [ -n "$confirm_not_duplicate" ]; then
+        listed=$(printf '%s\n' "$matches" | awk -F'\t' '{printf "- #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}')
+        echo "issue-create: похожие открытые задачи найдены, но --confirm-not-duplicate дан:" >&2
+        printf '%s\n' "$listed" >&2
+        footer="
+
+---
+Проверено на дубли перед заведением (--confirm-not-duplicate, #566). Похожие открытые задачи:
+$listed
+Не дубль, потому что: $confirm_not_duplicate"
+        new_body="${body}${footer}"
+        case "$body_slot_kind" in
+          value)
+            args[$body_slot_index]="$new_body"
+            ;;
+          value_inline)
+            args[$body_slot_index]="--body=$new_body"
+            ;;
+          file)
+            tmp_footer_file="$(mktemp)"
+            printf '%s' "$new_body" >"$tmp_footer_file"
+            args[$body_slot_index]="$tmp_footer_file"
+            ;;
+          file_inline)
+            tmp_footer_file="$(mktemp)"
+            printf '%s' "$new_body" >"$tmp_footer_file"
+            args[$body_slot_index]="--body-file=$tmp_footer_file"
+            ;;
+          *)
+            echo "::warning::issue-create: --confirm-not-duplicate дан, но тело (--body/--body-file) не передано — причина не записана в issue, видна только в этом логе." >&2
+            ;;
+        esac
+      else
+        echo "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть — вероятно, дефект уже диагностируется (класс #566, живой случай #518/#547/#564):" >&2
+        printf '%s\n' "$matches" | awk -F'\t' '{printf "  #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}' >&2
+        echo "Свяжись с существующей задачей (комментарий/assign) вместо новой, либо, если это ДЕЙСТВИТЕЛЬНО не дубль, передай --confirm-not-duplicate \"<почему не дубль>\" — причина попадёт в тело issue." >&2
+        echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+        exit 1
+      fi
+    fi
   fi
 fi
 
