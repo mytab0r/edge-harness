@@ -578,6 +578,26 @@ def dispatch_conflict_rework(
                 continue
             if already:
                 continue  # уже эскалировано этим эпизодом — не спамим, ждём владельца
+            # Находка ревью PR #478: метка `conflict` намеренно переживает
+            # mergeable_state None/unknown (mark_conflicts — «„не знаю“ не
+            # значит „нет конфликта“»), значит на момент эскалации PR МОГ уже
+            # успешно перебазироваться (ребейз прошёл, прогон кончился), а
+            # пересчёт mergeable ещё не вернулся из None/unknown в явное
+            # состояние — метка честно ещё стоит, но факта «остаётся dirty»
+            # уже нет. Без перепроверки эскалация соврала бы «содержательный
+            # конфликт», а маркер CONFLICT_ESCALATION_MARKER подавил бы её
+            # навсегда для этого PR. Один дешёвый вызов в редкой ветке —
+            # перечитать актуальный mergeable_state перед тем, как объявлять
+            # факт, а не доверять метке, которая по своей природе может
+            # отставать.
+            single = gh(f"repos/{repo}/pulls/{number}")
+            state = single.get("mergeable_state")
+            if state != "dirty":
+                observations.append(
+                    f"⏸️ PR #{number}: mergeable_state={state!r} не подтверждён как dirty — "
+                    "эскалация отложена (mark_conflicts разберётся со снятием метки следующим проходом)"
+                )
+                continue
             overlap = conflict_overlap_hint(repo, pull)
             overlap_text = overlap or "не удалось определить (см. PR вручную)"
             text = (

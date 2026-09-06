@@ -1692,8 +1692,14 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
              "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
         ],
         "issues/120/comments?per_page=100": [],
+        # Порядок ключей важен (FakeGh матчит первую подстроку по вставке):
+        # "pulls/560/files" обязан проверяться раньше "pulls/560" — иначе
+        # более короткий фрагмент "pulls/560" перехватил бы и вызов files.
         "pulls/560/files": files_payload(["a.py", "b.py"]),
         "compare/basesha...main": {"files": files_payload(["b.py", "c.py"])},
+        # Находка ревью PR #478: эскалация перепроверяет актуальный
+        # mergeable_state (не доверяет только метке) — здесь он подтверждён.
+        "pulls/560": {"mergeable_state": "dirty"},
         # Единственная попытка уже ЗАВЕРШИЛАСЬ (не в in_progress/queued) —
         # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
@@ -1714,6 +1720,40 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert "a.py" not in escalated[0][2] and "c.py" not in escalated[0][2]
     assert any("исчерпана" in line and "#560" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfirmed(monkeypatch):
+    # Находка ревью PR #478 (блокирующая): метка `conflict` НАМЕРЕННО
+    # переживает mergeable_state None/unknown (mark_conflicts — «"не знаю"
+    # не значит "нет конфликта"»). Окно: воркер успешно перебазировал и
+    # запушил, прогон завершился, бюджет исчерпан — но GitHub ещё не
+    # пересчитал mergeable_state из None обратно в явное состояние. Без
+    # перепроверки эскалация соврала бы владельцу «остаётся в конфликте», и
+    # маркер эскалации подавил бы её навсегда, хотя реального контента-
+    # конфликта уже нет. Мутация: убери перечитывание mergeable_state перед
+    # escalate — этот тест покраснеет (escalate был бы вызван на state=None).
+    task = issue(474, assignees=())
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/comments": [
+            {"created_at": "2026-09-05T10:00:00Z",
+             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "issues/120/comments?per_page=100": [],
+        "pulls/560": {"mergeable_state": None},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("mergeable_state не подтверждён — рано эскалировать"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("не подтверждён" in line and "#560" in line for line in observations)
+    # не тратим вызовы на файлы PR/main — решение уже принято по state
+    assert not any("pulls/560/files" in c or "compare/" in c for c in fake.calls)
 
 
 def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(monkeypatch):
