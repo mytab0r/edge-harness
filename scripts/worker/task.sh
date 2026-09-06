@@ -99,6 +99,18 @@ if [ "$DRY_RUN" != "1" ] && [ -z "${WORKER_SKIP_DUPGUARD:-}" ]; then
   fi
 fi
 
+# ── Изоляция адаптера модели (#140) — до выбора/захвата задачи: отказ изоляции
+# не должен оставлять живую аренду. dsh с ключом в env обязан пойти под
+# выделенным агент-юзером без группы docker, иначе model-shell читает ключ через
+# docker-эскейп (docs/research/40-model-shell-key-exposure.md). Отказ изоляции —
+# громкий красный job, а не запуск без защиты.
+AGENT_DIR="$WORK/agent"   # каталог агента: NDJSON-спул стрим-плагина пишет он сам
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson"
+# HANDS_SPOOL экспортируется ДО prepare: prepare доказывает проводку каждой
+# заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
+dsh_agent_isolation_prepare gh "$GITHUB_WORKSPACE" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
+
 # Отчёт в Telegram — best-effort: место правды всегда комментарий в задаче,
 # но промах кричит warning'ом в лог job'а, не молчит.
 telegram_report() { # $1 — текст
@@ -344,16 +356,12 @@ export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
 # ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
+# Изоляция уже установлена (блок после dupguard, #140); здесь только export
+# для env_keep и установка транспорта.
 export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
-# Изоляция адаптера модели (#140) — ДО любых дорогих шагов: dsh с ключом в env
-# обязан пойти под выделенным агент-юзером без группы docker, иначе model-shell
-# читает ключ через docker-эскейп (docs/research/40-model-shell-key-exposure.md).
-# Отказ изоляции — громкий красный job, а не запуск без защиты.
-AGENT_DIR="$WORK/agent"   # каталог агента: NDJSON-спул стрим-плагина пишет он сам
-dsh_agent_isolation_prepare gh "$GITHUB_WORKSPACE" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
-
 dsh_install "$WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 # Патч модели пишет транспорт в СВОЙ каталог, в дом агента его ставит агент:
 # у транспорта нет прав на запись в /home/<agent> (#140).
@@ -382,10 +390,9 @@ grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался — транскрипт морды невозможен (#119)" >&2; exit 1; }
 
 # ── 7. Прогон: cwd до старта = корень воркспейса и после не меняется (контракт dsh)
-SPOOL_FILE="$AGENT_DIR/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
-# Спул пишет сам dsh (агент-юзер) — путь обязан лежать в его каталоге (#140).
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# Спул пишет сам dsh (агент-юзер) — путь обязан лежать в его каталоге (#140);
+# HANDS_SPOOL экспортирован до prepare. Файлы агента — снос тоже под агентом.
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
 set +e
 timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$(cat "$PROMPT_FILE")" \

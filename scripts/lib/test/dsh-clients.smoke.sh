@@ -453,6 +453,9 @@ assert_not_log() { # SUBSTR MESSAGE — отрицательный ассерт 
 # строку именно прогона: `dsh --profile headless <текст>` — не plugin add и
 # не --dump-config.
 assert_isolated_launch() { # MESSAGE
+  # Выфильтровка по словам надёжна, потому что тексты задач smoke-фикстур
+  # контролированы (слов «plugin»/«dump-config» в них нет); для произвольного
+  # текста задач матчить пришлось бы по структуре argv, а не по подстроке.
   if ! grep '^AGENT-EXEC' "$CALLLOG" | grep -F ' dsh --profile headless ' \
       | grep -vF 'plugin' | grep -vF 'dump-config' | grep -q .; then
     echo "::error::SMOKE: прогон dsh прошёл мимо изоляции — $1" >&2

@@ -113,21 +113,30 @@ PATCH
 # Замер 2026-09-05 живым прогоном из model-shell
 # (docs/research/40-model-shell-key-exposure.md): вырезание env (*KEY*/*TOKEN*/
 # *SECRET*) из model-shell вызовов НЕ гарантирует «агент ключ не видит».
-# Прямое чтение /proc/<pid-dsh>/environ блокирует ядро (yama ptrace_scope=1 на
-# GitHub-раннерах: environ читается только у собственных потомков), НО доступный
-# model-shell сокет docker даёт полный обход того же класса: контейнер
-# `--pid=host --cap-add SYS_PTRACE --security-opt apparmor=unconfined` читает
-# environ любого процесса хоста, включая dsh. Подтверждено прогоном: в environ
-# dsh лежат DEEPSEEK_API_KEY, GH_TOKEN, HANDS_TOKEN, TELEGRAM_BOT_TOKEN,
-# DSH_EDGE_ACCESS_KEY.
+# Два измеренных факта:
+#   (1) ПОДТВЕРДИЛСЯ docker-эскейп: доступный model-shell сокет docker даёт
+#       полный обход — контейнер `--pid=host --cap-add SYS_PTRACE
+#       --security-opt apparmor=unconfined` читает environ ЛЮБОГО процесса
+#       хоста, включая dsh, где лежат DEEPSEEK_API_KEY, GH_TOKEN, HANDS_TOKEN,
+#       TELEGRAM_BOT_TOKEN, DSH_EDGE_ACCESS_KEY.
+#   (2) НЕ подтвердился вектор из названия задачи: прямое чтение model-shell'ом
+#       environ предков (dsh — родитель model-shell) в живом замере запрещено.
+#       МЕХАНИЗМ ЗАПРЕТА НЕ АТРИБУТИРОВАН: контрольный эксперимент на том же
+#       ядре показал, что same-uid не-потомок (orphan, setsid-сиблинг) environ
+#       ЧИТАЕТ, — то есть ссылки на yama ptrace_scope=1 как на гарантию
+#       некорректны; вероятный носитель запрета — dumpable-эффект процессов
+#       job-цепочки раннера. Это свойство СРЕДЫ, не гарантия ядра; изоляция
+#       ниже на него не опирается, а зонд 8г в каждом прогоне кричит, если
+#       среда изменилась.
 #
 # Решение — «отдельный uid» из критерия #140: dsh (держатель ключа) стартует под
 # выделенным непривилегированным пользователем БЕЗ группы docker. model-shell
 # наследует этот uid, поэтому: сокет docker (root:docker 660) агенту недоступен
-# (EACCES), environ процессов транспорта (другой uid) недоступен, /proc/<pid-dsh>/
-# environ по-прежнему закрыт yama. Ключ по-прежнему нужен только dsh-процессу и
-# передаётся ТОЛЬКО ему — через sudoers env_keep (память sudo), не argv и не файлы:
-# argv читаем всеми через /proc/*/cmdline, файл в домене агента читал бы сам агент.
+# (EACCES) — единственный ПОДТВЕРЖДЁННЫЙ вектор закрыт; environ процессов
+# транспорта (другой uid) недоступен. Ключ по-прежнему нужен только dsh-процессу
+# и передаётся ТОЛЬКО ему — через sudoers env_keep (память sudo), не argv и не
+# файлы: argv читаем всеми через /proc/*/cmdline, файл в домене агента читал бы
+# сам агент.
 #
 # Gas (правило «тормоз без газа»): агент-юзер без docker — осознанный тормоз.
 # Возврат: задача, которой нужен docker на раннере, эскалирует владельцу
@@ -138,12 +147,22 @@ PATCH
 DSH_AGENT_USER="${DSH_AGENT_USER:-dsh-agent}"
 DSH_AGENT_HOME=""      # заполняет dsh_agent_isolation_prepare
 DSH_AGENT_LAUNCHER=""  # заполняет dsh_agent_isolation_prepare
+# Один источник правды на каналы «транспорт → агент»: из него собирается
+# sudoers env_keep И проверка проводки в prepare. Расширять — только здесь.
+DSH_AGENT_ENV_KEEP="DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL HANDS_SPOOL GH_REPO"
 
 dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FILE
-  # MODE=gh — агенту нужен gh/git-push (worker, hands): зеркало gh-конфига.
-  # MODE=nogh — доверенная граница #18 (ai-review): gh-авторизации у агента
-  # быть НЕ должно, протухшее зеркало сносится, отсутствие проверяется.
+  # MODE=gh — агенту нужен gh/git-push (worker): зеркало gh-конфига.
+  # MODE=nogh — gh-авторизации у агента быть НЕ должно: граница доверия #18
+  # (ai-review) и руки (пуш/PR рукам запрещены по дизайну, GH_RUN_TOKEN
+  # снимается до старта DSH). Протухшее зеркало сносится, отсутствие
+  # проверяется. pnpm для `dsh plugin add` ставится в gh-режиме и при
+  # DSH_AGENT_PNPM=1 (руки: плагин стрима нужен, gh-зеркало — нет).
   local mode=$1 workspace=$2 agent_dir=$3 launcher=$4
+  case "$mode" in
+    gh|nogh) ;;
+    *) echo "::error::изоляция #140: MODE обязан быть gh или nogh, получено '$mode'" >&2; return 1 ;;
+  esac
   DSH_AGENT_HOME="/home/$DSH_AGENT_USER"
   DSH_AGENT_LAUNCHER=$launcher
   [ -d "$workspace" ] || { echo "::error::изоляция #140: нет каталога воркспейса $workspace" >&2; return 1; }
@@ -166,9 +185,10 @@ dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FIL
   # RUNNER_TEMP и лаунчер лежат под $HOME (/home/runner на GitHub-раннерах,
   # дефолт 750) — без этого агент физически не дойдёт до своего cwd, спула и
   # лаунчера. Найдено CI-гвардией #140 на настоящем sudo; Smoke это показать
-  # не может (sudo заглушен — uid-граница отсутствует).
+  # не может (sudo заглушен — uid-граница отсутствует). Правим только биту
+  # others-execute: уже проходимый дом (x5/x7) не трогаем.
   if [ "$(stat -c %u "$HOME" 2>/dev/null)" = "$(id -u)" ] \
-      && [ "$(stat -c %a "$HOME" | cut -c3)" != 7 ]; then
+      && [ $(( 8#$(stat -c %a "$HOME") & 1 )) -eq 0 ]; then
     sudo chmod 711 "$HOME"
     echo "::warning::$HOME был без прохода для других uid — открыт 711: агенту нужен проход до воркспейса, спула и лаунчера (#140)"
   fi
@@ -181,17 +201,20 @@ dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FIL
   fi
   # 3. pnpm для `dsh plugin add` под агентом: action-setup кладёт его в
   # /home/runner (750) — агенту туда не пройти. Ставим ту же версию в общий
-  # префикс node (доступен агенту на чтение/исполнение), лаунчер ставит его
-  # первым в PATH.
-  if [ "$mode" = gh ]; then
+  # префикс node (доступен агенту на чтение/исполнение). Нужен gh-режиму
+  # (worker) и рукам (DSH_AGENT_PNPM=1: плагин стрима, gh-зеркало — нет).
+  if [ "$mode" = gh ] || [ "${DSH_AGENT_PNPM:-}" = 1 ]; then
     command -v pnpm >/dev/null || { echo "::error::pnpm не найден — dsh plugin add без него не работает" >&2; return 1; }
     npm install -g "pnpm@$(pnpm --version)" >/dev/null \
       || { echo "::error::не смог поставить pnpm в общий префикс node для агент-юзера" >&2; return 1; }
   fi
-  # 4. gh-конфиг: зеркало для gh/nogh-снос для nogh.
+  # 4. gh-конфиг: зеркало для gh/nogh-снос для nogh. Снос ПЕРЕД копированием:
+  # `cp -r src dst` на существующий dst дал бы вложенный gh/gh без hosts.yml
+  # (ревью #140: идемпотентность на переиспользуемом раннере).
   if [ "$mode" = gh ]; then
     [ -f "$HOME/.config/gh/hosts.yml" ] \
       || { echo "::error::нет $HOME/.config/gh/hosts.yml — агент без gh-авторизации не откроет PR; шаг gh auth login обязан идти раньше" >&2; return 1; }
+    sudo rm -rf "$DSH_AGENT_HOME/.config/gh"
     sudo mkdir -p "$DSH_AGENT_HOME/.config"
     sudo cp -r "$HOME/.config/gh" "$DSH_AGENT_HOME/.config/gh"
     [ -f "$HOME/.gitconfig" ] && sudo cp "$HOME/.gitconfig" "$DSH_AGENT_HOME/.gitconfig"
@@ -200,14 +223,16 @@ dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FIL
     sudo rm -rf "$DSH_AGENT_HOME/.config/gh"
   fi
   sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$DSH_AGENT_HOME"
-  # 5. Секреты — только через env_keep (память sudo). Валидация до установки.
+  # 5. Секреты — только через env_keep (память sudo). Список — константа
+  # DSH_AGENT_ENV_KEEP (один источник правды: генерация + проверка 8а).
+  # Валидация до установки.
   local sudoers_file="/etc/sudoers.d/99-$DSH_AGENT_USER-env"
   local sudoers_tmp; sudoers_tmp="$(mktemp)"
   cat >"$sudoers_tmp" <<SUDOERS
 # Изоляция адаптера модели (#140): секреты и спул едут в $DSH_AGENT_USER
 # через env_keep (память sudo), не через argv (читаем всем через
 # /proc/*/cmdline) и не через файлы (домен агента читает сам агент).
-Defaults env_keep += "DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL HANDS_SPOOL GH_REPO"
+Defaults env_keep += "$DSH_AGENT_ENV_KEEP"
 SUDOERS
   if ! sudo visudo -cf "$sudoers_tmp" >/dev/null; then
     rm -f "$sudoers_tmp"
@@ -217,8 +242,10 @@ SUDOERS
   sudo install -m 440 "$sudoers_tmp" "$sudoers_file"
   rm -f "$sudoers_tmp"
   # 6. Лаунчер: PATH/HOME/флаг pnpm — не секреты, задаются здесь явно. Секреты
-  # через него не идут. Файл в домене транспорта: агент читает, но не пишет —
-  # менять его агенту выгоды нет, он и так исполняется его uid.
+  # через него не идут. umask 022 — детерминированные права файлов агента:
+  # спул пишет агент, читает транспорт-дрен (ревью #140: без фиксации umask
+  # права спула — предположение). Файл в домене транспорта: агент читает,
+  # но не пишет — менять его агенту выгоды нет, он и так исполняется его uid.
   local node_bin; node_bin="$(dirname "$(command -v node)")"
   mkdir -p "$agent_dir"
   cat >"$launcher" <<LAUNCHER
@@ -226,6 +253,7 @@ SUDOERS
 # Мост окружения транспорт → агент-юзер (#140). Секретов здесь нет: они едут
 # через sudoers env_keep. PATH/HOME/флаг pnpm — не секреты.
 set -euo pipefail
+umask 022
 # PATH транспорта первым (заглушки теста обязаны выигрывать у реальных
 # бинарников), каталог node — в хвосте как страховка на минимальный PATH.
 export PATH="\$1:$node_bin"; shift
@@ -238,16 +266,22 @@ LAUNCHER
   sudo chown "$DSH_AGENT_USER:$DSH_AGENT_USER" "$agent_dir"
   sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$workspace"
   # 8. Доказательства изоляции — до запуска dsh, каждое громкое.
-  # 8а. Позитив: env_keep реально проводит переменные (механика sudo работает).
-  # Одинарные кавычки ниже обязательны: раскрыть переменную обязан
-  # агент-домен, не транспорт.
-  # shellcheck disable=SC2016
-  local crossed
-  crossed="$(dsh_agent_run bash -c 'printf %s "$DEEPSEEK_MODEL"')"
-  if [ "$crossed" != "$DEEPSEEK_MODEL" ]; then
-    echo "::error::env_keep не провёл DEEPSEEK_MODEL агент-юзеру (получено '$crossed') — запуск без ключа молча бы сломал модель" >&2
-    return 1
-  fi
+  # 8а. Позитив: КАЖДАЯ переменная из env_keep-списка, заданная у транспорта,
+  # обязана доехать до агента (ревью #140: проверка одного DEEPSEEK_MODEL
+  # пропускала тихое выпадение DEEPSEEK_BASE_URL — silent-wrong). Переменные,
+  # не заданные у транспорта, пропускаются осознанно (нечего проводить).
+  # shellcheck disable=SC2086
+  local agent_env crossed var want
+  agent_env="$(dsh_agent_run env)"
+  for var in $DSH_AGENT_ENV_KEEP; do
+    want="${!var:-}"
+    [ -n "$want" ] || continue
+    crossed="$(grep "^$var=" <<<"$agent_env" | cut -d= -f2-)"
+    if [ "$crossed" != "$want" ]; then
+      echo "::error::env_keep не провёл $var агент-юзеру (получено '${crossed:-<пусто>}') — канал sudoers сломан, прогон без секрета/спула молча бы сломался" >&2
+      return 1
+    fi
+  done
   # 8а-бис. Агент обязан достигать воркспейса (свой cwd): проход по $HOME
   # и правам на каталоги — иначе dsh стартует в недостижимом каталоге.
   if ! dsh_agent_run test -d "$workspace"; then
@@ -292,6 +326,21 @@ LAUNCHER
     fi
   else
     echo "::note::docker-сокета на раннере нет — негативная проверка docker пропущена"
+  fi
+  # 8г. Зонд вектора из названия #140: «дочерний шелл читает environ родителя».
+  # dsh и model-shell — один uid, ядерной гарантии запрета нет: same-uid
+  # не-потомки читают environ (контрольный эксперимент, research/40), а denial
+  # живого замера — свойство среды раннера с неатрибутированным механизмом.
+  # Изоляция на это свойство НЕ опирается, поэтому зонд не красит прогон —
+  # но смена среды обязана быть громкой: открывшееся ребро = ключ в env dsh
+  # достижим model-shell, и вынос ключа с раннера становится обязательным.
+  local parent_edge
+  # shellcheck disable=SC2016
+  parent_edge="$(dsh_agent_run bash -c 'bash -c "cat /proc/$PPID/environ" >/dev/null 2>&1 && echo READABLE || echo DENIED')"
+  if [ "$parent_edge" = "READABLE" ]; then
+    echo "::warning::ребро #140 ОТКРЫТО: дочерний процесс этой среды читает environ родителя (same-uid) — модель может дотянуться до env dsh мимо uid-изоляции. Газ: вынос ключа с раннера (research/40, «Остаточный риск»)"
+  else
+    echo "Зонд #140: чтение environ родителя из дочернего шелла запрещено (как в живом замере 2026-09-05)"
   fi
   # 9. Режимные проверки: gh работает у агента (gh) / gh-конфига нет (nogh).
   if [ "$mode" = gh ]; then

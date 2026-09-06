@@ -48,8 +48,19 @@ EVENTS_FILE="$WORK/events.jsonl"
 START_MARK="$WORK/.start-mark"
 AGENT_DIR="$WORK/agent"                       # каталог агента: спул пишет он сам (#140)
 SPOOL_FILE="$AGENT_DIR/session-stream.ndjson" # NDJSON-спул плагина dsh-hands-streamer
+# HANDS_SPOOL экспортируется ДО prepare (#140): prepare доказывает проводку
+# каждой заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
+
+# ── Изоляция адаптера модели (#140) — сразу после проверки провайдера и ДО
+# аренды: отказ изоляции не должен оставлять живую аренду задачи. Руки — режим
+# nogh: пуш/PR рукам запрещены по дизайну (GH_RUN_TOKEN снимается до старта
+# DSH), gh-авторизации у агента нет и быть не должно; DSH_AGENT_PNPM=1 —
+# плагин стрима ставится под агентом (dsh plugin add), gh-зеркало не нужно.
+export DSH_AGENT_PNPM=1
+dsh_agent_isolation_prepare nogh "${GITHUB_WORKSPACE:-$REPO_DIR}" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
 
 api() {
   curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
@@ -221,12 +232,8 @@ export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
 dsh_install "$PKGS"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
-
-# ── 3-iso. Изоляция адаптера модели (#140): dsh — под агент-юзером без docker ─────
-# model-shell с доступом к docker читает ключ из environ dsh через эскейп-контейнер
-# (docs/research/40-model-shell-key-exposure.md). Отказ изоляции — красный job.
-dsh_agent_isolation_prepare gh "${GITHUB_WORKSPACE:-$REPO_DIR}" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
 
 # ── 3a. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
 # Порядок важен: --dump-config в 3b обязан доказывать монтаж плагина поверх
@@ -276,9 +283,10 @@ touch "$START_MARK"
 
 # Спул стрима: путь задаётся плагину через env до старта dsh; чистый прогон не
 # должен дочитывать старьё от предыдущей попытки. Курсор дрена — единственный
-# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от содержимого).
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от
+# содержимого). Файлы принадлежат агент-юзеру (#140) — снос тоже под агентом:
+# у транспорта нет права записи в каталог агента.
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
 
 DSH_START_TS=$(date -u +%s)

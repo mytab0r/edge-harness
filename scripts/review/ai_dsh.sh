@@ -36,6 +36,7 @@ export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"
 
 dsh_install "$AI_WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 
 # Изоляция #140, режим nogh: у ревью-агента не должно быть gh-авторизации
