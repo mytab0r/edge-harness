@@ -1120,22 +1120,71 @@ def _stdout_with_error(line: str):
 
 
 def test_last_error_log_line_skips_runner_boilerplate_finds_real_cause(monkeypatch):
-    # Находка ревью PR #488, живой замер на прогоне 34027035455: последняя
-    # ##[error]-строка сырого лога почти всегда boilerplate самого раннера
-    # ("Process completed with exit code N"), а реальная причина (наш die() в
-    # task.sh) идёт РАНЬШЕ неё. Без пропуска boilerplate отпечаток схлопывает
-    # разные дефекты одного job'а по одинаковому коду выхода.
+    # Ветка 1 (предпочтительная): причина аннотирована ::error::-строкой
+    # (наши die()/echo "::error::" в task.sh), boilerplate раннера
+    # («Process completed with exit code N», «Cleaning up») пропускается.
     log = (
-        "2026-09-06T10:17:58.0000000Z ##[error]scripts/worker/task.sh: line 375: "
-        ".../infra_digest.sh: No such file or directory\n"
+        "2026-09-06T10:17:58.0000000Z ##[error]Нет доступа к морде dsh-edge — "
+        "job красный (#119)\n"
         "2026-09-06T10:17:59.0000000Z Cleaning up orphan processes\n"
         "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
     )
     monkeypatch.setattr(
         pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
     line = pg.last_error_log_line("mytab0r/edge-harness", 999)
-    assert line is not None and "infra_digest.sh" in line
+    assert line is not None and "dsh-edge" in line
     assert "exit code" not in line
+
+
+def test_last_error_log_line_plain_stderr_tail_when_no_error_annotation(monkeypatch):
+    # Находка ревью PR #488 (раунд 6, блокирующая): содержательные причины
+    # почти везде идут ПРОСТОЙ stderr-строкой без ##[error] — живой замер на
+    # прогоне 34027035455: bash печатает «line N: ... No such file or
+    # directory» plain-строкой, аннотированной в логе только boilerplate
+    # раннера. Только-##[error]-канал делал факт недостижимым (orchestra.yml
+    # не содержит ни одного ::error вовсе). Фикстура — прод-форма, не пересказ.
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[group]Run bash scripts/worker/task.sh\n"
+        "2026-09-06T10:17:58.5000000Z source: /home/runner/work/edge-harness/edge-harness/scripts/gh/infra_digest.sh: No such file or directory\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "No such file or directory" in line
+    assert "##[" not in line and "exit code" not in line
+
+
+def test_last_error_log_line_worker_wrapper_is_not_a_fact(monkeypatch):
+    # Находка ревью PR #488 (раунд 6, блокирующая): «Воркер не справился:
+    # dsh завершился с кодом N без открытого PR» (die() в task.sh) — факт
+    # падения ОБЁРТКИ, не причина; нормализация цифр делала из него один
+    # отпечаток на любую причину агентского провала. Причина живёт в
+    # plain-хвосте (вывод dsh) — факт берётся оттуда.
+    log = (
+        "2026-09-06T10:17:57.0000000Z dsh: AssertionError: пул пуст, а задача назначена\n"
+        "2026-09-06T10:17:58.0000000Z ##[error]Воркер не справился: dsh завершился с кодом 1 без открытого PR\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "пул пуст" in line
+    assert "Воркер не справился" not in line
+
+
+def test_last_error_log_line_wrapper_without_tail_returns_none(monkeypatch):
+    # Обёртка без содержательного хвоста — не превращается в «факт с ложной
+    # точностью»: нет строки → вызывающий уходит в громкое наблюдение, задачу
+    # не заводит (тот же контракт, что у only-boilerplate выше).
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[error]Воркер не справился: dsh завершился с кодом 1 без открытого PR\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-06T10:18:01.0000000Z Cleaning up orphan processes\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    assert pg.last_error_log_line("mytab0r/edge-harness", 999) is None
 
 
 def test_last_error_log_line_only_boilerplate_returns_none(monkeypatch):
@@ -1197,7 +1246,7 @@ def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
     created = []
 
     def fake_gh_dispatch(*args):
@@ -1217,7 +1266,7 @@ def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
     # второй пульс: тот же класс уже в открытых issues (метка ci-failure) —
     # не заводим вторую задачу на тот же баг.
     fp = pg.failure_fingerprint("worker.yml", "task",
-                                 "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+                                 "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
     routes["issues?state=open&labels=ci-failure"] = [
         {"body": f"...<!-- failure-fingerprint: {fp} -->\n"},
     ]
@@ -1243,7 +1292,7 @@ def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]dsh: RATE_LIMIT: Rate limit reached for requests")))
+            "dsh: RATE_LIMIT: Rate limit reached for requests")))
     posted = []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
@@ -1253,7 +1302,7 @@ def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
     assert actions == []  # инфраструктура — наблюдение, не действие пула
 
     # второй пульс: маркер уже стоит — молчим, не спамим
-    fp = pg.failure_fingerprint("hands.yml", "dsh-task", "##[error]dsh: RATE_LIMIT: Rate limit reached for requests")
+    fp = pg.failure_fingerprint("hands.yml", "dsh-task", "dsh: RATE_LIMIT: Rate limit reached for requests")
     routes["issues/120/comments"] = [
         {"created_at": "2026-08-31T11:55:00Z",
          "body": f"...{pg.FAILURE_WATCH_INFRA_MARKER} {fp}]..."},
@@ -1307,7 +1356,7 @@ def test_failure_watch_window_anchor_is_failure_moment_not_queue_time(monkeypatc
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
     created = []
 
     def fake_gh_dispatch(*args):
@@ -1356,7 +1405,7 @@ def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeyp
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
     created = []
 
     def fake_gh_dispatch(*args):
@@ -1401,7 +1450,7 @@ def test_failure_watch_stale_base_neither_files_task_nor_signals(monkeypatch):
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.")))
+            "ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.")))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать — газ уже назван в #474"))
 
     observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
@@ -1472,7 +1521,7 @@ def test_failure_watch_infra_reports_trace_not_posted_when_comment_fails(monkeyp
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "##[error]dsh: RATE_LIMIT: Rate limit reached for requests")))
+            "dsh: RATE_LIMIT: Rate limit reached for requests")))
 
     def broken_post(*a):
         raise RuntimeError("gh api: 502")

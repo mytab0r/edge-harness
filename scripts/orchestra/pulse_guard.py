@@ -23,8 +23,9 @@
    (`status=completed` + клиентский фильтр вывода FAILURE_WATCH_RUN_CONCLUSIONS,
    одна страница per_page=100) находит свежий провал (окно — от updated_at, момента
    провала) каждого из WATCHED_WORKFLOWS, достаёт последнюю содержательную
-   строку `##[error]` из лога упавшего job'а (факт, не гипотеза — правило
-   AGENTS.md) и классифицирует причину: 'infra' (известная сигнатура лимита/сети — лечится
+   строку лога упавшего job'а (##[error]-аннотация предпочтительна, иначе
+   plain-хвост упавшего шага; факт, не гипотеза — правило AGENTS.md) и
+   классифицирует причину: 'infra' (известная сигнатура лимита/сети — лечится
    ожиданием, один тихий след в #120 на класс) или 'defect' (наш дефект —
    заводит задачу в пул, тоже одну на класс). Дедуп — по отпечатку КЛАССА
    причины (workflow + job + нормализованная строка ошибки), не по run id:
@@ -714,22 +715,56 @@ LAST_ERROR_LOG_BOILERPLATE = (
     "process completed with exit code",
     "the operation was canceled",
     "the job running on runner",
+    # Хвост job'а после падения шага (raw log).
+    "cleaning up orphan processes",
 )
+
+# Обёртки-не-факты: ::error::-строки, которые называют ФАКТ ПАДЕНИЯ ОБЁРТКИ,
+# а не его причину. «Воркер не справился: dsh завершился с кодом N без
+# открытого PR» (die() в task.sh:630) — единственная аннотированная строка
+# агентского провала, и нормализация цифр делала из неё ОДИН отпечаток на
+# ЛЮБУЮ причину (красный тест, падение DSH, сеть): второй отличный дефект
+# воркера дедупился как «уже в пуле» и задачи не получал (находка ревью
+# PR #488, раунд 6). Причина в таких провалах живёт в plain-хвосте лога
+# (вывод dsh) — см. вторую ветку last_error_log_line.
+LAST_ERROR_LOG_WRAPPERS = (
+    "воркер не справился",
+)
+
+LAST_ERROR_LOG_NON_FACTS = LAST_ERROR_LOG_BOILERPLATE + LAST_ERROR_LOG_WRAPPERS
 
 # ANSI-escape сырого лога не должны попадать в факт: строка уходит в тело
 # задачи и след #120/Telegram (мусорные управляющие коды в тексте сигнала).
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
+# Префикс таймстампа сырого лога Actions (у ##[error]-строк мы начинали
+# чтение от маркера, у plain-строк его надо снять).
+LOG_TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
+
 
 def last_error_log_line(repo: str, job_id: int) -> str | None:
-    """Последняя СОДЕРЖАТЕЛЬНАЯ строка `##[error]` из лога упавшего job'а —
-    конкретный факт, не гипотеза (правило AGENTS.md, PR #475): не заставляет
-    человека открывать Actions, чтобы увидеть, что именно сломалось.
-    Boilerplate-строки самого раннера (LAST_ERROR_LOG_BOILERPLATE) —
-    не причина, пропускаются. Best-effort: недоступность лога (квота/права/
-    раннер убит до записи) или отсутствие содержательной строки не роняет
-    классификацию — просто нет строки, вызывающий откатывается на имена
-    упавших шагов.
+    """Последняя СОДЕРЖАТЕЛЬНАЯ строка лога упавшего job'а — конкретный факт,
+    не гипотеза (правило AGENTS.md, PR #475): не заставляет человека открыть
+    Actions, чтобы увидеть, что именно сломалось.
+
+    Две ветки (находка ревью PR #488, раунд 6):
+    1) предпочтительная — последняя строка с `##[error]` вне
+       LAST_ERROR_LOG_NON_FACTS: так аннотируют причины наши скрипты (die()
+       в task.sh) и раннер;
+    2) если аннотированной содержательной строки нет — последняя
+       содержательная строка plain-хвоста упавшего шага: содержательные
+       причины большинства падений живут в stderr БЕЗ аннотации (bash печатает
+       «line N: ... No such file or directory» простой строкой — живой замер
+       на прогоне 34027035455; вывод git push и текст хуков тоже plain),
+       а orchestra.yml не содержит ни одного `::error` — без этой ветки
+       классификация и задача для него недостижимы вообще.
+    Обёртки-не-факты (LAST_ERROR_LOG_WRAPPERS) пропускаются в ОБЕИХ ветках:
+    задача с «Воркер не справился: ... код N» выглядит точной, но называет
+    факт падения обёртки, не причину.
+
+    Best-effort: недоступность лога (квота/права/раннер убит до записи) или
+    отсутствие содержательной строки не роняет классификацию — просто нет
+    строки, вызывающий откатывается на имена упавших шагов.
 
     `--allow-escape-sequences` (находка живой проверки PR #488): сырой лог
     job'а почти всегда несёт ANSI-escape, и gh (замер на 2.98.0, 2026-09-06)
@@ -750,16 +785,33 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         return None
     if result.returncode != 0:
         return None
-    marker = "##[error]"
-    for line in reversed(result.stdout.splitlines()):
-        idx = line.find(marker)
+    lines = result.stdout.splitlines()
+
+    def is_non_fact(candidate: str) -> bool:
+        lowered = candidate.lower()
+        return any(pattern in lowered for pattern in LAST_ERROR_LOG_NON_FACTS)
+
+    # Ветка 1: ##[error] — предпочтительный источник (аннотированная причина).
+    for line in reversed(lines):
+        idx = line.find("##[error]")
         if idx == -1:
             continue
         candidate = ANSI_ESCAPE_RE.sub("", line[idx:]).strip()
-        lowered = candidate.lower()
-        if any(pattern in lowered for pattern in LAST_ERROR_LOG_BOILERPLATE):
+        if not candidate or is_non_fact(candidate):
             continue
         return candidate
+    # Ветка 2: plain-хвост упавшего шага — последняя содержательная строка
+    # до boilerplate раннера. Структурные маркеры `##[...]` (group/endgroup/
+    # command) и строки без букв/цифр (разделители) — не факт.
+    for line in reversed(lines):
+        text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", line)).strip()
+        if not text or text.startswith("##["):
+            continue
+        if not re.search(r"[A-Za-zА-Яа-я0-9]", text):
+            continue
+        if len(text) < 8 or is_non_fact(text):
+            continue
+        return text
     return None
 
 
@@ -1264,10 +1316,8 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         # событий — по запросу на каждое событие каждого workflow против одной
         # страницы здесь. Страница — запас, чтобы клиентские фильтры
         # (PR-прогоны, отменённые) не вытеснили свежий провал основного
-        # события за страницу: PR-триггер среди отслеживаемых есть только у
-        # orchestra.yml, и у него страница больше (см. константы); потеря
-        # хвоста за страницей стоит не дороже окна ниже — вне окна разбор
-        # и так не идёт.
+        # события за страницу; потеря хвоста за страницей стоит не дороже
+        # окна ниже — вне окна разбор и так не идёт.
         runs = [r for r in runs if r.get("event") != "pull_request"]
         runs = [r for r in runs if r.get("conclusion") in FAILURE_WATCH_RUN_CONCLUSIONS]
         # Окно свежести (находка ревью PR #488): провал старше окна уже не
