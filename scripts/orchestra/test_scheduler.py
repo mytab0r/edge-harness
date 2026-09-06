@@ -2413,6 +2413,55 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
     assert "### Действия" not in report_text
 
 
+def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
+    """Проводка mark_stale_unclaimed внутри main() (не сама функция — её
+    гвардирует блок выше): старая свободная задача пула получает метку
+    `stale-unclaimed` через настоящий gh POST и попадает строкой в отчёт.
+    Находка ревью #428, п.2 — удаление вызова mark_stale_unclaimed из main()
+    раньше проходило мимо всех тестов; этот тест красит именно такую мутацию,
+    в отличие от гвардии холостого хода выше (та кормит пустой пул)."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    just_now = datetime.now(timezone.utc)
+    recent_success_iso = just_now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    old_task = issue(300, assignees=(), labels=["task"], created_at="2020-01-01T00:00:00Z")
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs": {"workflow_runs": [
+            {"conclusion": "success", "created_at": recent_success_iso,
+             "html_url": "https://x", "display_title": "x", "event": "schedule"}]},
+        "issues?state=open&labels=task": [old_task],
+        "pulls?state=open": [],
+        "pulls?state=closed&per_page=100&page=1": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
+        "issues/120/comments?per_page=100": [],
+        "repos/pawaca/dsh-edge/tags?per_page=100": [
+            {"name": "dsh-edge-v0.8.0",
+             "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
+            {"name": "dsh-edge-v0.7.1",
+             "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
+        ],
+        "issues/134": {"number": 134, "labels": []},
+        "issues/300/labels": None,
+        # Пул с одной свободной задачей допускает dispatch воркера (#120) —
+        # не предмет этого теста, но main() дойдёт до него раньше отчёта.
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    reports = []
+    monkeypatch.setattr(sch, "summary", lambda lines: reports.append(lines))
+
+    code = sch.main()
+
+    assert code == 0
+    posts = [c for c in fake.calls if c.startswith("-X POST") and "300/labels" in c]
+    assert len(posts) == 1, f"main() не поставил метку stale-unclaimed: {fake.calls}"
+    [report] = reports
+    assert any("stale-unclaimed" in line and "300" in line for line in report), report
+
+
 # ── Приёмка (#227): задача закрывается только по проверяемой улике ──────────────
 #
 # Фикстуры ниже — реальные ответы `gh api` по этому репозиторию (снято
