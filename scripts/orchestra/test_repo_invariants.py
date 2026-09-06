@@ -548,6 +548,74 @@ def test_branch_protection_not_in_ci_gating():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 7: двусмысленная формула принадлежности плагина (#219)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: реальные строки из репозитория ДО правки #219
+# (openspec/changes/dsh-in-job/), на которых класс и случился, — не пересказ.
+
+
+def write_md(tmp_path, rel, content):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_ambiguous_artifact_phrase_flags_prod_forms(tmp_path):
+    write_md(tmp_path, "openspec/changes/dsh-in-job/tasks.md",
+             "- [ ] Подключение плагинов владельца (combo-router из"
+             " `vars.PLUGINS_SUITE_URL`)\n")
+    write_md(tmp_path, "openspec/changes/dsh-in-job/design.md",
+             "**Провайдер — плагины владельца, не новый код.**\n")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert {v["file"] for v in violations} == {
+        "openspec/changes/dsh-in-job/tasks.md",
+        "openspec/changes/dsh-in-job/design.md",
+    }
+    by_file = {v["file"]: v for v in violations}
+    assert by_file["openspec/changes/dsh-in-job/design.md"]["line"] == 1
+    assert "плагины владельца" in by_file["openspec/changes/dsh-in-job/design.md"]["match"]
+
+
+def test_ambiguous_artifact_phrase_silent_on_unambiguous_wording(tmp_path):
+    # Обе разрешённые замены и порядок слов «владелец подключает свой плагин» —
+    # инвариант молчит: гвардится именно двусмысленная формула, не упоминание
+    # владельца вообще.
+    write_md(tmp_path, "docs/x.md",
+             "артефакт владельца по адресу X\n"
+             "наш плагин (пишем мы, не апстрим)\n"
+             "владелец подключает свой плагин\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_ignores_non_document_dirs(tmp_path):
+    write_md(tmp_path, ".git/notes.md", "плагины владельца\n")
+    write_md(tmp_path, "node_modules/pkg/README.md", "плагины владельца\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_mutation_guard(tmp_path):
+    path = write_md(tmp_path, "docs/x.md", "документ без формулы\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+    # Мутация: вернуть прод-форму (строка proposal.md до #219, с заглавной
+    # буквы — регистр не должен спасать) — инвариант обязан покраснеть.
+    path.write_text("Плагины владельца устанавливаются job'ом.\n", encoding="utf-8")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert len(violations) == 1
+    assert violations[0]["line"] == 1
+
+
+def test_ambiguous_artifact_phrase_in_ci_gating_with_gas():
+    # Инвариант включён в обязательную проверку сразу при создании (#219):
+    # на момент включения ноль нарушений — фраза вычищена тем же PR. Газ
+    # объявлен в GATING_RELEASE_CONDITION — гвардия main() падает громко,
+    # если газ отберут, не назвав замену (AGENTS.md, «Тормоз без газа»).
+    assert 7 in ri.CI_GATING
+    assert 7 in ri.GATING_RELEASE_CONDITION
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -566,6 +634,11 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
+    # Инвариант 7 сканирует документы репозитория — подменяем корень, чтобы
+    # юнит-тест оставался герметичным и не зависел от живого дерева; живое
+    # дерево проверяет сам инвариант в repo-ci/orchestra.
+    monkeypatch.setattr(ri, "REPO_ROOT", tmp_path)
+    write_md(tmp_path, "README.md", "# здоровый снимок\n")
 
     now = utc(2026, 9, 3, 12, 0)
     lines, findings = ri.build_report("mytab0r/edge-harness", now)
