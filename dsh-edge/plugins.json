@@ -27,9 +27,9 @@
       "id": "plugin-manager",
       "package": "@edge-harness/dsh-plugin-manager",
       "source": {
-        "release": "plugins-manager-v0.1.7",
-        "asset": "plugin-manager-0.1.7.tgz",
-        "sha256": "4118b2ff13c1b048c1f6dbcdb2bd49069b72c95a02c1946c259710e8e72e202a"
+        "release": "plugins-plugin-manager-v0.1.8",
+        "asset": "plugin-manager-0.1.8.tgz",
+        "sha256": "8debd8e429bb1b563ce893a9473cfa8404877856a3241a936ea54d8c78d0ee8d"
       },
       "server": false,
       "client": true
