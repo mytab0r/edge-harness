@@ -284,8 +284,17 @@ def real_orchestra_ticks(runs: list[dict]) -> list[dict]:
     (`?event=...`, по одному запросу на легитимное событие, тот же приём, что
     #303 уже применил в cf-worker/src/harness.ts): страница GitHub для каждого
     события содержит ТОЛЬКО прогоны этого события, contract её не засоряет.
-    Эта функция остаётся как чистый юнит и вторая линия защиты, не единственная."""
-    return [run for run in runs if run.get("event") != "pull_request"]
+    Эта функция остаётся как чистый юнит и вторая линия защиты, не единственная.
+
+    Allowlist по `ORCHESTRA_TICK_EVENTS`, не denylist `!= "pull_request"`
+    (находка AI-ревью PR #318, второй раунд): `ORCHESTRA_TICK_EVENTS` —
+    уже единственное место правды о легитимных событиях для серверного
+    фильтра выше (`orchestra_tick_runs`). Denylist держал бы второе,
+    расходящееся определение «легитимного» здесь — третий триггер
+    `orchestra.yml` (например `push`) молча прошёл бы эту вторую линию
+    защиты, ровно тот же класс маскировки через чёрный ход, что #303 и
+    сам этот PR уже закрывали для других мест."""
+    return [run for run in runs if run.get("event") in ORCHESTRA_TICK_EVENTS]
 
 
 def orchestra_tick_runs(repo: str, per_page: int = 100) -> list[dict]:
