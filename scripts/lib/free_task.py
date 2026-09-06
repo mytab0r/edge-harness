@@ -43,6 +43,20 @@
 переданные без этого поля (объект без ключа `labels`), считаются НЕ несущими
 метку (см. `_has_waiting_owner_label`).
 
+Пятый фильтр (находка ревью PR #478): задача, чей объявленный PR несёт
+метку `conflict`, тоже исключается из ОБЩЕГО выбора. Без него — реальная дыра:
+`scheduler.py::dispatch_conflict_rework` снимает assignee+замок ИМЕННО чтобы
+адресно (вход `task=N`) довести конфликтный PR с бюджетом РОВНО одна попытка,
+но освобождённая задача видна и generic-пульсу (`free_task()` без `--task`).
+Если адресный прогон падает по квоте/крашу ДО того, как задача снова занята
+(`task.sh::release-full` при quota_exhausted освобождает и то, и другое), она
+временно свободна — и generic-пульс мог бы взять её В ОБХОД бюджета попыток,
+даже ПОСЛЕ того, как владельцу уже ушла эскалация «бюджет исчерпан». Тот же
+класс, который `unhealthy_pulls` уже закрывает СО СВОЕЙ стороны (conflict-PR
+не считается «нездоровым», её задача никогда не освобождается ЭТИМ путём) —
+но dispatch_conflict_rework ввёл НОВЫЙ путь освобождения, и его тоже нужно
+исключить из общего пула, а не только направить в правильный адресный путь.
+
 Импорт task_ref — importlib по файлу (тот же приём, что в contract_check.py):
 скрипты запускаются как файлы, не как пакет.
 
@@ -65,19 +79,22 @@ from pathlib import Path
 from typing import Any
 
 
-def _load_task_ref():
+def _load_sibling(name: str):
     try:
         spec = importlib.util.spec_from_file_location(
-            "task_ref", Path(__file__).resolve().with_name("task_ref.py"))
+            name, Path(__file__).resolve().with_name(f"{name}.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)  # type: ignore[union-attr]
         return module
     except Exception as exc:  # noqa: BLE001 — любой сбой загрузки инструмента = код 2
-        print(f"free_task.py: не смог загрузить task_ref.py: {exc}", file=sys.stderr)
+        print(f"free_task.py: не смог загрузить {name}.py: {exc}", file=sys.stderr)
         sys.exit(2)
 
 
-task_ref = _load_task_ref()
+task_ref = _load_sibling("task_ref")
+# CONFLICT_LABEL — одно место правды scripts/lib/review_labels.py, не вторая
+# копия литерала "conflict" (тот же класс, что уже сводили #326/LABELS.md).
+review_labels = _load_sibling("review_labels")
 
 # Одно место правды на литерал — тот же, что claim_task.py::claim уже
 # использует для отказа в аренде (docs/agents/LABELS.md, строка waiting:owner).
@@ -105,18 +122,22 @@ def _load_json(path: Path) -> Any:
 
 def free_candidates(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
+    excluded: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Открытые задачи пула без исполнителя, без живого замка аренды (#121) и
+    """Открытые задачи пула без исполнителя, без живого замка аренды (#121),
     без метки `waiting:owner` (находка AI-ревью PR #471, #470 — без этого
     фильтра задача, ждущая владельца, но ещё без исполнителя, стопорила бы
-    весь диспатч как «старейшая свободная», см. докстринг модуля),
-    отсортированные по номеру (старейшая первой — воркер не должен хватать
-    самую свежую косметику)."""
+    весь диспатч как «старейшая свободная», см. докстринг модуля) и без
+    объявленного PR в конфликте (`excluded` — `conflict_declared_tasks`,
+    #478), отсортированные по номеру (старейшая первой — воркер не должен
+    хватать самую свежую косметику)."""
     locked = locked or set()
+    excluded = excluded or set()
     free = [
         issue for issue in issues
         if not (issue.get("assignees") or [])
         and issue["number"] not in locked
+        and issue["number"] not in excluded
         and not _has_waiting_owner_label(issue)
     ]
     return sorted(free, key=lambda issue: issue["number"])
@@ -124,9 +145,30 @@ def free_candidates(
 
 def oldest_free(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
+    excluded: set[int] | None = None,
 ) -> dict[str, Any] | None:
-    candidates = free_candidates(issues, locked)
+    candidates = free_candidates(issues, locked, excluded)
     return candidates[0] if candidates else None
+
+
+def conflict_declared_tasks(prs: list[dict[str, Any]]) -> set[int]:
+    """Номера задач, чей объявленный PR (`task_ref.task_from_branch` по
+    `headRefName` — тот же единственный источник, что `declared_pr_for_task`)
+    несёт метку `conflict`. См. докстринг модуля (находка ревью PR #478) —
+    такие задачи доводятся только адресно (`scheduler.py::
+    dispatch_conflict_rework`, вход `task`), не через общий выбор.
+
+    `prs` — форма `gh pr list --json number,headRefName,labels` (labels —
+    та же плоская форма `[{"name": ...}, ...]`, что использует scheduler.py)."""
+    result: set[int] = set()
+    for pull in prs:
+        number = task_ref.task_from_branch(pull.get("headRefName") or "")
+        if number is None:
+            continue
+        names = {label.get("name") for label in pull.get("labels") or []}
+        if review_labels.CONFLICT_LABEL in names:
+            result.add(number)
+    return result
 
 
 def declared_pr_for_task(prs: list[dict[str, Any]], task_number: int) -> dict[str, Any] | None:
@@ -151,16 +193,22 @@ def _print_pr_line(pull: dict[str, Any]) -> None:
     print(f"{pull['number']}\t{pull.get('headRefName') or ''}")
 
 
-def _parse_locked(text: str) -> set[int]:
-    """`lease_cli locks` печатает номера через пробел (пусто — замков нет)."""
+def _parse_numbers(text: str) -> set[int]:
+    """Формат общий и для `lease_cli locks` (замки), и для `conflict-tasks`
+    ниже (номера через пробел, пусто — множество пусто)."""
     return {int(token) for token in text.split() if token}
 
 
+def _print_numbers(numbers: set[int]) -> None:
+    print(" ".join(str(n) for n in sorted(numbers)))
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) in (2, 3) and argv[0] == "oldest-free":
+    if len(argv) in (2, 3, 4) and argv[0] == "oldest-free":
         issues = _load_json(Path(argv[1]))
-        locked = _parse_locked(argv[2]) if len(argv) == 3 else None
-        issue = oldest_free(issues, locked)
+        locked = _parse_numbers(argv[2]) if len(argv) >= 3 else None
+        excluded = _parse_numbers(argv[3]) if len(argv) == 4 else None
+        issue = oldest_free(issues, locked, excluded)
         if issue is None:
             return 1
         _print_issue_line(issue)
@@ -173,9 +221,13 @@ def main(argv: list[str]) -> int:
             return 1
         _print_pr_line(pull)
         return 0
+    if len(argv) == 2 and argv[0] == "conflict-tasks":
+        prs = _load_json(Path(argv[1]))
+        _print_numbers(conflict_declared_tasks(prs))
+        return 0
     print(
-        "использование: free_task.py oldest-free <issues.json> [<locked>] "
-        "| declared-pr <N> <prs.json>",
+        "использование: free_task.py oldest-free <issues.json> [<locked>] [<excluded>] "
+        "| declared-pr <N> <prs.json> | conflict-tasks <prs.json>",
         file=sys.stderr,
     )
     return 2

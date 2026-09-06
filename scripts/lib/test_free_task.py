@@ -198,6 +198,45 @@ def test_declared_pr_for_task_does_not_find_rework_successor_by_body():
 # ── (c) обратная проверка: задача с открытым PR И исполнителем не выбирается ───────
 
 
+# ── (d) задача с конфликтным PR исключена из общего выбора (находка ревью PR #478) ──
+# scheduler.py::dispatch_conflict_rework снимает assignee+замок ИМЕННО чтобы
+# довести PR адресно (вход `task=N`, бюджет РОВНО одна попытка). Без этого
+# фильтра generic-пульс (free_task() без --task) мог бы взять ту же задачу
+# мимо бюджета, если адресный прогон освободил её (упал по квоте/крашу) до
+# того, как снова занял.
+
+
+def pr(number, ref, labels=()):
+    return {"number": number, "headRefName": ref, "body": "", "labels": [{"name": n} for n in labels]}
+
+
+def test_conflict_declared_tasks_finds_task_by_branch_and_label():
+    prs = [
+        pr(560, "agent/474-conflict-auto-rebase", labels=["conflict", "review:ok"]),
+        pr(561, "agent/475-something", labels=["review:ok"]),  # не конфликтует
+        pr(562, "dependabot/npm/foo", labels=["conflict"]),  # не agent-ветка — не задача
+    ]
+    assert free_task.conflict_declared_tasks(prs) == {474}
+
+
+def test_free_candidates_excludes_conflict_declared_task_even_when_oldest(monkeypatch):
+    # Мутация: убери фильтр `excluded` в free_candidates — этот тест покраснеет
+    # (задача #43 снова оказалась бы выбрана как старейшая свободная).
+    issues = [issue(43, assignees=[]), issue(90, assignees=[])]
+    excluded = free_task.conflict_declared_tasks(
+        [pr(560, "agent/43-conflicted", labels=["conflict"])])
+    assert excluded == {43}
+    chosen = free_task.oldest_free(issues, excluded=excluded)
+    assert chosen is not None and chosen["number"] == 90  # не #43 — она конфликтует
+
+
+def test_free_candidates_excluded_defaults_to_empty_set_backward_compatible():
+    # Вызывающий код, ещё не переданный на новый параметр (три прежних
+    # позиционных теста файла), обязан продолжать работать без изменений.
+    issues = [issue(43, assignees=[]), issue(90, assignees=[])]
+    assert [i["number"] for i in free_task.free_candidates(issues)] == [43, 90]
+
+
 def test_task_with_open_pr_and_assignee_is_not_selected():
     issues = [issue(179, assignees=["mytab0r"])]  # кто-то уже работает
     assert free_task.oldest_free(issues) is None
@@ -240,9 +279,55 @@ def test_cli_declared_pr_contract(tmp_path):
     assert not_found.stdout == ""
 
 
+def test_cli_conflict_tasks_contract(tmp_path):
+    prs_file = tmp_path / "prs.json"
+    prs_file.write_text(json.dumps([
+        {"number": 560, "headRefName": "agent/474-x", "body": "",
+         "labels": [{"name": "conflict"}]},
+        {"number": 561, "headRefName": "agent/475-y", "body": "", "labels": []},
+    ]), encoding="utf-8")
+    result = run_cli(["conflict-tasks", str(prs_file)])
+    assert result.returncode == 0
+    assert result.stdout.strip() == "474"
+
+    empty_file = tmp_path / "empty.json"
+    empty_file.write_text("[]", encoding="utf-8")
+    empty_result = run_cli(["conflict-tasks", str(empty_file)])
+    assert empty_result.returncode == 0
+    assert empty_result.stdout.strip() == ""
+
+
+def test_cli_oldest_free_excludes_conflict_declared_task(tmp_path):
+    # Контракт task.sh целиком: oldest-free с третьим позиционным аргументом
+    # (excluded) — тот же формат, что locked (номера через пробел).
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text(json.dumps([
+        issue(43, title="конфликтная", assignees=[]),
+        issue(90, title="обычная", assignees=[]),
+    ]), encoding="utf-8")
+    result = run_cli(["oldest-free", str(issues_file), "", "43"])
+    assert result.returncode == 0
+    assert result.stdout.strip() == "90\tобычная"
+
+
 def test_cli_unknown_arguments_are_rejected():
     result = run_cli(["bogus"])
     assert result.returncode == 2
+
+
+def test_task_sh_wires_conflict_exclusion_into_free_task(monkeypatch):
+    # Гвардия по исходнику (класс тот же, что test_task_sh_composes_claim_via_
+    # worker_run_format в test_scheduler.py): не бас-тест поведения bash (для
+    # этого понадобился бы полноценный интеграционный прогон), а доказательство,
+    # что task.sh реально ЗОВЁТ conflict-tasks и передаёт результат в
+    # oldest-free — легко забыть при рефакторинге, раз exclusion живёт в
+    # отдельном вызове, а не внутри free_task.py::oldest_free по умолчанию.
+    task_sh = (Path(__file__).with_name("..") / "worker" / "task.sh").resolve().read_text(encoding="utf-8")
+    assert 'free_task.py" conflict-tasks' in task_sh
+    assert 'oldest-free "$issues_file" "$locked" "$excluded"' in task_sh
+    # labels обязателен в запросе PR — без него conflict-tasks увидит labels=[]
+    # и фильтр молча не сработает никогда (silent-wrong, не сбой).
+    assert "gh pr list --state open --limit 100 --json number,body,headRefName,labels" in task_sh
 
 
 # ── «пусто» vs «сломано»: rc 1 (пул пуст) и rc 2 (инструмент сломался) ─────────────
