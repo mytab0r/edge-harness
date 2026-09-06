@@ -193,16 +193,17 @@ def _pool_page(blocker_edges):
                     {
                         "number": 10, "title": "блокирующая",
                         "labels": {"nodes": []}, "assignees": {"nodes": []},
-                        "blockedBy": {"nodes": []},
-                        "blocking": {"nodes": [
-                            {"number": n, "state": s} for n, s in blocker_edges
-                        ]},
+                        "blockedBy": {"totalCount": 0, "nodes": []},
+                        "blocking": {
+                            "totalCount": len(blocker_edges),
+                            "nodes": [{"number": n, "state": s} for n, s in blocker_edges],
+                        },
                     },
                     {
                         "number": 20, "title": "контрольная",
                         "labels": {"nodes": []}, "assignees": {"nodes": []},
-                        "blockedBy": {"nodes": []},
-                        "blocking": {"nodes": [
+                        "blockedBy": {"totalCount": 0, "nodes": []},
+                        "blocking": {"totalCount": 2, "nodes": [
                             {"number": 200, "state": "OPEN"},
                             {"number": 201, "state": "OPEN"},
                         ]},

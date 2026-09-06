@@ -112,8 +112,8 @@ query($owner: String!, $repo: String!, $after: String) {{
         title
         labels(first: 20) {{ nodes {{ name }} }}
         assignees(first: 5) {{ nodes {{ login }} }}
-        blockedBy(first: 20) {{ nodes {{ number state }} }}
-        blocking(first: 20) {{ nodes {{ number state }} }}
+        blockedBy(first: 20) {{ totalCount nodes {{ number state }} }}
+        blocking(first: 20) {{ totalCount nodes {{ number state }} }}
       }}
     }}
   }}
@@ -144,13 +144,40 @@ def fetch_pool(repo: str, label: str = "task", gh_call=_default_gh) -> list[dict
         data = gh_graphql(query, variables, gh_call=gh_call)
         connection = data["repository"]["issues"]
         for node in connection["nodes"]:
+            # Находка ревью PR #367: `blocking(first: 20)`/`blockedBy(first: 20)` —
+            # усечённая страница вложенного коннекшена, не сам пул задач (у него
+            # своя пагинация выше, hasNextPage/endCursor). Без totalCount тяжёлый
+            # блокировщик (>20 открытых блокируемых — ровно кейс, ради которого
+            # эта задача заводилась) молча застыл бы на 20, и приоритет —
+            # единственный смысл этого модуля — тихо соврал бы. Считаем это
+            # sil ent-wrong и падаем громко, а не дотягиваем страницу: 20
+            # прямых блокировок/блокируемых на одну задачу — само по себе
+            # аномалия организации работы, требующая разбора человеком, не
+            # тихого дотягивания.
+            blocking_total = node["blocking"]["totalCount"]
+            blocking_nodes = node["blocking"]["nodes"]
+            if blocking_total > len(blocking_nodes):
+                raise TaskDepsError(
+                    f"issue #{node['number']}: blocking усечён "
+                    f"({len(blocking_nodes)} из {blocking_total}) — "
+                    "первая страница коннекшена не покрывает все связи, "
+                    "приоритет по blocking_open соврёт молча"
+                )
+            blocked_by_total = node["blockedBy"]["totalCount"]
+            blocked_by_nodes = node["blockedBy"]["nodes"]
+            if blocked_by_total > len(blocked_by_nodes):
+                raise TaskDepsError(
+                    f"issue #{node['number']}: blockedBy усечён "
+                    f"({len(blocked_by_nodes)} из {blocked_by_total}) — "
+                    "первая страница коннекшена не покрывает все связи"
+                )
             issues.append({
                 "number": node["number"],
                 "title": node["title"],
                 "labels": node["labels"]["nodes"],
                 "assignees": node["assignees"]["nodes"],
-                "blocking_open": sum(1 for b in node["blocking"]["nodes"] if _is_open(b)),
-                "blocked_by_open": [b["number"] for b in node["blockedBy"]["nodes"] if _is_open(b)],
+                "blocking_open": sum(1 for b in blocking_nodes if _is_open(b)),
+                "blocked_by_open": [b["number"] for b in blocked_by_nodes if _is_open(b)],
             })
         page_info = connection["pageInfo"]
         if not page_info["hasNextPage"]:

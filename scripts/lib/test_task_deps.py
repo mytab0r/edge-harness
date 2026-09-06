@@ -35,14 +35,28 @@ def gh_error(status, message="ошибка"):
     return SimpleNamespace(returncode=1, stdout="", stderr=f"gh: HTTP {status}: {message}")
 
 
-def issue_node(number, title="задача", labels=(), assignees=(), blocked_by=(), blocking=()):
+def issue_node(
+    number, title="задача", labels=(), assignees=(), blocked_by=(), blocking=(),
+    blocked_by_total=None, blocking_total=None,
+):
+    """`blocked_by_total`/`blocking_total` — по умолчанию совпадают с длиной
+    переданного списка (страница полная, находка ревью PR #367 неприменима);
+    передай явно бОльшее число, чтобы смоделировать усечённую страницу."""
+    blocked_by_nodes = [{"number": n, "state": s} for n, s in blocked_by]
+    blocking_nodes = [{"number": n, "state": s} for n, s in blocking]
     return {
         "number": number,
         "title": title,
         "labels": {"nodes": [{"name": name} for name in labels]},
         "assignees": {"nodes": [{"login": a} for a in assignees]},
-        "blockedBy": {"nodes": [{"number": n, "state": s} for n, s in blocked_by]},
-        "blocking": {"nodes": [{"number": n, "state": s} for n, s in blocking]},
+        "blockedBy": {
+            "totalCount": blocked_by_total if blocked_by_total is not None else len(blocked_by_nodes),
+            "nodes": blocked_by_nodes,
+        },
+        "blocking": {
+            "totalCount": blocking_total if blocking_total is not None else len(blocking_nodes),
+            "nodes": blocking_nodes,
+        },
     }
 
 
@@ -93,6 +107,46 @@ def test_fetch_pool_single_page_shapes_fields():
     # blocking_open считает ТОЛЬКО OPEN (91 CLOSED не считается)
     assert meta["blocking_open"] == 1
     assert issues[1]["assignees"] == [{"login": "someone"}]
+
+
+def test_fetch_pool_raises_loudly_on_truncated_blocking_page():
+    """Находка ревью PR #367: `blocking(first: 20)` — усечённая страница
+    вложенного коннекшена. Без проверки totalCount тяжёлый блокировщик
+    (>20 открытых блокируемых) молча застыл бы на 20, и приоритет — весь
+    смысл модуля — тихо соврал бы. Обязан упасть громко, не тихо усечься."""
+    page = {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    issue_node(43, blocking=[(90, "OPEN")], blocking_total=25),
+                ],
+            }
+        }
+    }
+    fake = FakeGraphQL(pages=[page])
+    import unittest.mock as mock
+    with mock.patch.object(td, "subprocess", SimpleNamespace(run=fake.run)):
+        with pytest.raises(td.TaskDepsError, match="blocking усечён"):
+            td.fetch_pool("owner/repo")
+
+
+def test_fetch_pool_raises_loudly_on_truncated_blocked_by_page():
+    page = {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    issue_node(43, blocked_by=[(90, "OPEN")], blocked_by_total=21),
+                ],
+            }
+        }
+    }
+    fake = FakeGraphQL(pages=[page])
+    import unittest.mock as mock
+    with mock.patch.object(td, "subprocess", SimpleNamespace(run=fake.run)):
+        with pytest.raises(td.TaskDepsError, match="blockedBy усечён"):
+            td.fetch_pool("owner/repo")
 
 
 def test_fetch_pool_paginates_until_short_page():

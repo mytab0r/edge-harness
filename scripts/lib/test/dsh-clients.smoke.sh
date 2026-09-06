@@ -384,7 +384,7 @@ case "$sig" in
     # (blockedBy/blocking всегда []) — сценарии этого файла его не проверяют,
     # только фильтр «свободна/занята» (locked/assignees).
     nodes=$(printf '%s' "${GH_ISSUE_LIST_JSON:-[]}" | command jq -c \
-      '[.[] | {number, title, labels: {nodes: (.labels // [])}, assignees: {nodes: (.assignees // [])}, blockedBy: {nodes: []}, blocking: {nodes: []}}]')
+      '[.[] | {number, title, labels: {nodes: (.labels // [])}, assignees: {nodes: (.assignees // [])}, blockedBy: {totalCount: 0, nodes: []}, blocking: {totalCount: 0, nodes: []}}]')
     resp "{\"data\":{\"repository\":{\"issues\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":$nodes}}}}" ;;
   *)
     echo "gh: SMOKE: заглушка не знает вызов: $sig" >&2

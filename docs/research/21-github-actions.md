@@ -497,6 +497,37 @@ Enterprise Cloud» — ключевое условие: **владелец-ор�
 
 ---
 
+## Нативный граф зависимостей issue (`blockedBy`/`blocking`): доступен только через GraphQL (замер 2026-09-06)
+
+Найдено ревью PR #367: факты о внешней системе жили в `openspec/changes/
+task-priority-blocking-graph/design.md` — каталоге активного change, который
+архивируется после применения; по правилу AGENTS.md («не переисследуй
+документированное») и `docs/INDEX.md` таким фактам место здесь, в research,
+не в спеке, обречённой уйти в `archive/`.
+
+**Живая проверка (не документация), сделанная при внедрении `scripts/lib/task_deps.py`
+(задача #361):**
+
+- Introspection `__type(name: "Issue")` подтвердил поля `blockedBy`,
+  `blocking`, `issueDependenciesSummary` в схеме GraphQL этого репозитория и
+  мутации `addBlockedBy`/`removeBlockedBy` в мутационном типе.
+- Round-trip на реальной паре issues (#350 ↔ #320, оба закрыты, выбраны как
+  безопасные для проверки): `addBlockedBy` поставил связь, чтение
+  `blockedBy.nodes`/`blocking.nodes` её увидело, `removeBlockedBy` снял,
+  повторное чтение подтвердило 0 — мутации реально исполняются на этом
+  плане/токене, не только объявлены в схеме.
+- REST `repos/{owner}/{repo}/issues/{n}` при этом отдаёт `sub_issues_summary`
+  (декомпозиция, отдельный механизм), но НЕ отдаёт `blockedBy`/`blocking` ни
+  в каком виде ни на одном поле ответа — граф зависимостей доступен ТОЛЬКО
+  через GraphQL. Отсюда `scripts/lib/task_deps.py` использует `gh api
+  graphql`, не REST.
+
+Sub-issues (декомпозиция, эпик → подзадачи) — отдельная семантика, отдельные
+поля схемы (`subIssues`/`subIssuesSummary`), смешивать с `blockedBy`/`blocking`
+запрещено (`docs/agents/PROTOCOL.md`, раздел «Зависимости»).
+
+---
+
 ## Что не подтверждено
 
 Явный список того, где документация молчит. Строить на этом можно только осознанно.

@@ -294,8 +294,11 @@ GitHub различает у Issues декомпозицию (sub-issues) и п�
    Читается `scripts/lib/free_task.py` при выборе свободной задачи: число
    ОТКРЫТЫХ задач, которые блокирует issue, — второй уровень приоритета
    (первый — метка `area:process`, docs/agents/LABELS.md). Живая проверка
-   мутаций (`addBlockedBy`/`removeBlockedBy`) и REST vs GraphQL — 
-   `openspec/changes/task-priority-blocking-graph/design.md`.
+   мутаций (`addBlockedBy`/`removeBlockedBy`) и REST vs GraphQL — находка
+   ревью PR #367, вынесена из каталога активного change (архивируется после
+   применения) в постоянный источник фактов о внешней системе:
+   [`docs/research/21-github-actions.md`](../research/21-github-actions.md),
+   раздел «Нативный граф зависимостей issue».
 
 Не смешивай механизмы на одной паре задач: если это декомпозиция — sub-issue, если
 порядок/блокировка — граф `blockedBy`/`blocking` через `task_deps.py`.

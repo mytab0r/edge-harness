@@ -3122,8 +3122,8 @@ def graphql_pool_response(issues_list):
         "title": iss.get("title", ""),
         "labels": {"nodes": iss.get("labels", [])},
         "assignees": {"nodes": iss.get("assignees", [])},
-        "blockedBy": {"nodes": []},
-        "blocking": {"nodes": []},
+        "blockedBy": {"totalCount": 0, "nodes": []},
+        "blocking": {"totalCount": 0, "nodes": []},
     } for iss in issues_list]
     return {"data": {"repository": {"issues": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -3175,6 +3175,7 @@ def test_dispatch_worker_names_task_with_more_blocking_over_older_number(monkeyp
     pool = [issue(101, assignees=()), issue(89, assignees=())]
     graphql_response = graphql_pool_response(pool)
     graphql_response["data"]["repository"]["issues"]["nodes"][0]["blocking"] = {
+        "totalCount": 2,
         "nodes": [{"number": 500, "state": "OPEN"}, {"number": 501, "state": "OPEN"}],
     }
     fake = FakeGh({
@@ -3184,8 +3185,8 @@ def test_dispatch_worker_names_task_with_more_blocking_over_older_number(monkeyp
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    lines = sch.dispatch_worker(REPO, pool)
-    assert lines[0].startswith("👷 свободная задача #101 ")
+    observations, actions = sch.dispatch_worker(REPO, pool)
+    assert (observations + actions)[0].startswith("👷 свободная задача #101 ")
 
 
 def test_dispatch_worker_degrades_to_rest_pool_when_graph_unavailable(monkeypatch):
@@ -3200,7 +3201,8 @@ def test_dispatch_worker_degrades_to_rest_pool_when_graph_unavailable(monkeypatc
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    lines = sch.dispatch_worker(REPO, pool)
+    observations, actions = sch.dispatch_worker(REPO, pool)
+    lines = observations + actions
     assert any("граф блокировок недоступен" in line for line in lines)
     assert any(line.startswith("👷 свободная задача #89 ") for line in lines)
     assert fake.mutating_calls() == [
