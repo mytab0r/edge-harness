@@ -584,6 +584,13 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                 "не найдено за последние 100 прогонов каждого события — пульс не "
                 "подтверждён, возможен отключённый workflow (docs/research/21).")
         delivered = send_telegram(text)
+        # posted/attempted — находка AI-ревью PR #318, третий раунд: строка
+        # отчёта раньше безусловно утверждала «след в #120», даже если
+        # post_issue_comment упал (RuntimeError уходил только в warning) —
+        # именно в сценарии «тиков нет» канал задачи может быть сломан по
+        # той же причине, что и пульс, поэтому отчёт не может тут врать.
+        attempted = False
+        posted = False
         try:
             # Двухмаркерный приём (episode_reopened, находка ревью PR #318, п.1):
             # без этого первое же «тиков нет» глушило бы канал комментария
@@ -591,12 +598,15 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
             open_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_NO_TICKS_MARKER)
             close_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_TICKS_RESUMED_MARKER)
             if episode_reopened(open_times, close_times):
+                attempted = True
                 post_issue_comment(repo, WATCHDOG_ISSUE, text)
+                posted = True
         except RuntimeError as error:
             print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+        trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
         return [f"🚨 успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 f"не найдено (Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
-                f"след в #{WATCHDOG_ISSUE})"]
+                f"след в #{WATCHDOG_ISSUE}: {trace})"]
     try:
         # Эпизод HEARTBEAT_NO_TICKS закрывается явно, как только тики снова
         # нашлись: без этого закрывающего маркера episode_reopened никогда не
@@ -620,18 +630,26 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                 f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
     text = heartbeat_alert_text(age, last_ok)
     delivered = send_telegram(text)
+    # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
+    # (находка AI-ревью PR #318, третий раунд): безусловное «след в #120» в
+    # тексте отчёта было неверно, если post_issue_comment упал.
+    attempted = False
+    posted = False
     try:
         # Telegram — на каждый опоздавший запуск; след в задаче — один на эпизод:
         # новый комментарий только если прежний маркер старше последнего успеха
         # (пульсы успели восстановиться и снова пропали).
         markers = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_MARKER)
         if pause_notification_pending(markers, parse_time(last_ok["created_at"])):
+            attempted = True
             post_issue_comment(repo, WATCHDOG_ISSUE, text)
+            posted = True
     except RuntimeError as error:
         print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+    trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
     return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
             f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
-            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"]
+            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
 
 
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:

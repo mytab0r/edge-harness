@@ -521,6 +521,30 @@ def test_heartbeat_check_loud_when_zero_ticks_found_after_server_filter(monkeypa
     assert len(posted) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in posted[0]
 
 
+def test_heartbeat_check_no_ticks_report_honest_when_comment_post_fails(monkeypatch):
+    """Находка AI-ревью PR #318 (третий раунд): строка отчёта раньше
+    безусловно утверждала «след в #120», даже если post_issue_comment упал
+    (RuntimeError уходил только в stderr-warning) — именно в сценарии
+    «тиков нет» канал задачи может быть сломан по той же причине, что и
+    пульс. Мутация: убери условный `trace` и верни жёсткое «след в #120)» —
+    этот тест покраснеет."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+
+    def failing_post(repo, n, text):
+        raise RuntimeError("HTTP 500: transient")
+    monkeypatch.setattr(pg, "post_issue_comment", failing_post)
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and "НЕ оставлен" in lines[0]
+    assert "след в #120: оставлен)" not in lines[0]
+
+
 def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(monkeypatch):
     """Один след в задаче на эпизод (маркер HEARTBEAT_NO_TICKS уже стоит) —
     повторный комментарий не плодится, но Telegram кричит на каждый прогон
