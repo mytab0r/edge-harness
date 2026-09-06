@@ -424,6 +424,26 @@ polling'ом по cron — ему события не нужны), но собы
 
 ---
 
+## Merge Queue: недоступна на этом репозитории (замер 2026-09-05)
+
+Ruleset-правило `merge_queue` (серийное слияние PR с ре-тестом каждого против
+актуального main, без ручного опроса и без гонок update-branch/ai-review) по
+документации GitHub «available in any public repository owned by an
+organization, or in private repositories owned by organizations using GitHub
+Enterprise Cloud» — ключевое условие: **владелец-организация**. Репозиторий
+`mytab0r/edge-harness` принадлежит аккаунту пользователя, не организации.
+
+Живая проверка независимо подтверждает цитату: `POST .../rulesets` с правилом
+`merge_queue` → `422` с пустой деталью, при этом контрольный `{"type":
+"deletion"}` → `201` (тип распознан и работает), а контрольный богус-тип →
+другая ошибка схемы («no possible input»). Разница сообщений показывает, что
+`merge_queue` распознан схемой и отклонён именно бизнес-правилом
+плана/владельца, а не формой запроса. Полный разбор с командами —
+[ADR 0013](../decisions/0013-native-merge-queue-not-available.md), задача
+[#339](https://github.com/mytab0r/edge-harness/issues/339).
+
+---
+
 ## Что не подтверждено
 
 Явный список того, где документация молчит. Строить на этом можно только осознанно.
