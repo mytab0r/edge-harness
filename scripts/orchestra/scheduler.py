@@ -1240,15 +1240,16 @@ def after_merge(
     # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
     # его нельзя — утащим чужую живую сессию в архив.
     if task_numbers:
-        archive_lines, hard_failure = archive_runner_sessions(task_numbers)
-        actions += archive_lines
         # Заметка-итог в сессии раннера (#480): «PR слит в main» — факт,
         # который эта функция и так обнаружила (мерж), без нового опроса.
-        # Дописывается ДО архива (порядок внутри отчёта не важен: архив не
-        # стирает историю сессии — см. append_session_notes).
+        # Дописывается ДО архива (находка ревью PR #489: обратный порядок
+        # льёт заметку в уже заархивированную сессию — комбинацию, которую
+        # design.md прямо называет непроверенной живьём).
         note_lines, note_hard_failure = append_session_notes(
             [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
         actions += note_lines
+        archive_lines, hard_failure = archive_runner_sessions(task_numbers)
+        actions += archive_lines
         hard_failure = hard_failure or note_hard_failure
     # Чеклист некритичных замечаний ревью (#462, третья категория находок):
     # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы

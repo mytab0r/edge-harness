@@ -400,6 +400,40 @@ def test_after_merge_appends_session_note_for_each_declared_task(monkeypatch):
     assert captured["notes"] == [(91, "🔀 PR #9 слит в main.")]
 
 
+def test_after_merge_appends_session_note_before_archiving(monkeypatch):
+    # Находка ревью PR #489: заметка обязана дописываться ДО архивации сессии
+    # (design.md, "after_merge дописывает заметку ДО архивации в рамках одного
+    # вызова") — обратный порядок льёт заметку в уже заархивированную сессию,
+    # комбинацию, которую design.md сам называет непроверенной живьём.
+    merged = pull(9, ref="agent/91-x", pr_body="#91")
+    order = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/9/files?per_page=100&page=1",
+                      "repos/o/r/pulls/9/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/91":
+            return {**issue(91, assignees=("mytab0r",), title="т"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(
+        sch, "append_session_notes",
+        lambda notes: (order.append("note") and []) or ([], False),
+    )
+    monkeypatch.setattr(
+        sch, "archive_runner_sessions",
+        lambda numbers: (order.append("archive") and []) or ([], False),
+    )
+    sch.after_merge("o/r", merged, [])
+    assert order == ["note", "archive"]
+
+
 def test_after_merge_skips_session_note_when_no_task_numbers(monkeypatch):
     # Гвардия холостого хода: PR без задач пула (упоминание чужой/несуществующей
     # задачи в прозе) не должен даже пытаться дописать заметку — append_session_notes
