@@ -142,6 +142,15 @@ def main() -> int:
         return 1
     facts = ai_review.header_facts(comment.get("body") or "")
     tasks = ai_review.tasks_from_comment(comment.get("body") or "")
+    # Защита в глубину (#426): build_comment фенсит ТОЛЬКО МАСШТАБ: отдельно —
+    # фенс с другим/пустым scope сюда попасть не должен по построению, но
+    # молчаливое заведение issue из искажённого/ручного комментария хуже явного
+    # пропуска с причиной (fail loud, не silent-wrong).
+    non_backlog = [t for t in tasks if t.get("scope") != ai_review.SCOPE_SEPARATE]
+    tasks = [t for t in tasks if t.get("scope") == ai_review.SCOPE_SEPARATE]
+    for t in non_backlog:
+        print(f"::warning::пропущено «{t['title']}» — в фенсе МАСШТАБ != {ai_review.SCOPE_SEPARATE} "
+              f"(искажённый или ручной комментарий); issue не заводится")
     if not tasks:
         print(f"Ревью {facts.get('reviewer')} при head {facts.get('head', '?')[:12]} "
               f"не предложило задач — пул не тронут")

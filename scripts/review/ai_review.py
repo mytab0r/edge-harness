@@ -117,6 +117,20 @@ VERDICT_RE = re.compile(r"^(\*\*|__|)ВЕРДИКТ:\s*(approve|rework)\s*\.?\1$
 # не принимается — тихо взять половину хуже, чем не взять совсем.
 TASK_OPEN_RE = re.compile(r"^ЗАДАЧА:\s*(\S.*)$")
 TASK_CLOSE = "КОНЕЦ ЗАДАЧИ"
+# Масштаб находки — обязательное второе поле блока задачи, сразу после
+# заголовка, критерий различения в ai_prompt.md. Замер по маркерам
+# `filed: #N` за реальные сутки (2026-09-05 03:37 → 2026-09-06 03:37 UTC,
+# PR #313/#395/#162/#173): 22 задачи заведено автоматом за сутки (не оценка —
+# прямой подсчёт по факту file_tasks.py). Из них 5/22 (23%) классифицированы
+# объективным прокси-критерием («все пути к файлам из тела задачи входят в
+# diff PR») как «хвост» — не были бы заведены новой логикой (см. PR #433,
+# раздел «Замер на реальных данных» — это НИЖНЯЯ оценка: семантический разбор
+# нескольких находок без явной ссылки на файл относит их к «хвосту» тоже).
+# Отсутствие поля НЕ трактуется молча как "отдельно" (fail loud, #426): смотри
+# partition_tasks ниже.
+SCOPE_RE = re.compile(r"^МАСШТАБ:\s*(хвост|отдельно)\.?\s*$")
+SCOPE_TAIL = "хвост"
+SCOPE_SEPARATE = "отдельно"
 # Блок-забор задачи в комментарии: строится только транспортом, парсится
 # file_tasks. ЧЕТЫРЕ бэктика: внутренний ```-фенс в теле задачи (пример
 # кода) не закрывает блок — иначе roundtrip молча обрезал бы тело.
@@ -284,6 +298,22 @@ def huge_diff_escalation_text(pr: int, added: int) -> str:
     )
 
 
+def _split_scope(body_lines: list[str]) -> tuple[str | None, list[str]]:
+    """МАСШТАБ — первая непустая строка тела блока задачи (сразу после
+    заголовка). Найден и снят — не попадает в текст тела ни находки, ни
+    комментария; не найден — scope=None (см. partition_tasks: отсутствие
+    поля не значит «отдельно» молча, #426)."""
+    for i, line in enumerate(body_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = SCOPE_RE.match(stripped)
+        if match:
+            return match.group(1), body_lines[:i] + body_lines[i + 1:]
+        break  # первая непустая строка не МАСШТАБ — поля нет вовсе
+    return None, body_lines
+
+
 def parse_tasks(answer: str) -> list[dict]:
     """Блоки ЗАДАЧА: … КОНЕЦ ЗАДАЧИ из ответа. Незакрытый/пустой блок
     отбрасывается целиком: полузадача в пуле хуже отсутствия задачи."""
@@ -298,11 +328,24 @@ def parse_tasks(answer: str) -> list[dict]:
                 title = match.group(1).strip()
                 body = []
         elif stripped == TASK_CLOSE:
-            tasks.append({"title": title, "body": "\n".join(body).strip()})
+            scope, rest = _split_scope(body)
+            tasks.append({"title": title, "body": "\n".join(rest).strip(), "scope": scope})
             title, body = None, []
         else:
             body.append(line.rstrip())
     return tasks
+
+
+def partition_tasks(tasks: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Судьба находки по МАСШТАБ (#426): `отдельно` — в беклог (issue заведёт
+    file_tasks.py); `хвост` — дописать в этом же PR, issue не заводим;
+    отсутствие поля — НЕ трактуется молча как «отдельно» (fail loud): видимо
+    в комментарии отдельным разделом, но не заводится и не считается хвостом
+    без явного решения ревьюера."""
+    backlog = [t for t in tasks if t.get("scope") == SCOPE_SEPARATE]
+    tail = [t for t in tasks if t.get("scope") == SCOPE_TAIL]
+    unscoped = [t for t in tasks if t.get("scope") not in (SCOPE_SEPARATE, SCOPE_TAIL)]
+    return backlog, tail, unscoped
 
 
 def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
@@ -338,17 +381,43 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     diff_fingerprint, #252): check_pr.py читает его из поля `diff:` шапки,
     чтобы решить, сохранять ли ai:*-метку при следующем пуше. Необязателен
     (None не добавляет строку) — не ломает старые вызовы/тесты, которые
-    факта diff не ждут."""
+    факта diff не ждут.
+
+    tasks делится по МАСШТАБ (#426, partition_tasks): в фенсы (то, что
+    file_tasks.py читает и заводит issue'ами) попадают ТОЛЬКО `отдельно`.
+    `хвост` уходит прозой в раздел «доделай в этом PR» — содержимое не
+    теряется, issue не заводится. Без поля — тоже прозой, но с явным
+    предупреждением: отсутствие МАСШТАБ не трактуется молча как «отдельно»
+    (fail loud) — граница проведена здесь, а не в file_tasks.py, ОДНИМ
+    местом правды: file_tasks.py читает только фенсы, значит незафенсенное
+    физически не может быть заведено issue."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
+    backlog, tail, unscoped = partition_tasks(tasks)
     body = findings.strip()
-    if tasks:
+    if tail:
+        tail_text = "\n\n".join(f"- **{t['title']}**\n  {t['body']}" for t in tail)
+        body += (
+            "\n\n### Доделай в этом PR (масштаб «хвост» — issue не заводится)\n\n"
+            f"{tail_text}"
+        )
+    if unscoped:
+        unscoped_text = "\n\n".join(f"- **{t['title']}**\n  {t['body']}" for t in unscoped)
+        body += (
+            "\n\n### ⚠️ Без объявленного МАСШТАБА — не заведено автоматически\n"
+            "Ревьюер не указал МАСШТАБ (хвост/отдельно) у находки ниже — контракт "
+            "не угадывает поле молча (fail loud, #426). Заведи issue вручную, если "
+            "это реально отдельная работа, либо допиши прямо здесь, если это хвост.\n\n"
+            f"{unscoped_text}"
+        )
+    if backlog:
         close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
         blocks = "\n\n".join(
-            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{close}" for t in tasks
+            f"{TASK_FENCE}\n{t['title']}\nМАСШТАБ: {SCOPE_SEPARATE}\n{t['body']}\n{close}"
+            for t in backlog
         )
         body += (
             f"\n\nЗадачи в беклог из этого ревью — завести одной командой:\n"
@@ -372,9 +441,11 @@ def tasks_from_comment(comment_body: str) -> list[dict]:
                 block.append(lines[i].rstrip())
                 i += 1
             if block and i < len(lines):  # забор закрыт
+                scope, rest = _split_scope(block[1:])
                 tasks.append({
                     "title": block[0].strip(),
-                    "body": "\n".join(block[1:]).strip(),
+                    "body": "\n".join(rest).strip(),
+                    "scope": scope,
                 })
         i += 1
     return [t for t in tasks if t["title"]]
@@ -616,7 +687,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     verdict = parse_verdict(answer)
     tasks = parse_tasks(answer)
     findings = redact(findings_of(answer, tasks))
-    tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip()}
+    tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip(),
+              "scope": t.get("scope")}
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
 
