@@ -73,11 +73,14 @@ PR_181_BODY = (
 PR_181 = {"number": 181, "headRefName": "agent/179-white-spot-in-pool", "body": PR_181_BODY}
 
 
-def issue(number, title="задача", assignees=None):
-    return {"number": number, "title": title, "assignees": [{"login": a} for a in (assignees or [])]}
+def issue(number, title="задача", assignees=None, labels=None):
+    result = {"number": number, "title": title, "assignees": [{"login": a} for a in (assignees or [])]}
+    if labels is not None:
+        result["labels"] = [{"name": name} for name in labels]
+    return result
 
 
-# ── free_candidates / oldest_free: единственный критерий — assignees ───────────────
+# ── free_candidates / oldest_free: assignees, замок, waiting:owner ─────────────────
 
 
 def test_free_candidates_excludes_assigned_and_sorts_by_number():
@@ -96,6 +99,39 @@ def test_oldest_free_picks_lowest_number_not_newest():
 def test_oldest_free_empty_pool_is_none():
     assert free_task.oldest_free([]) is None
     assert free_task.oldest_free([issue(5, assignees=["x"])]) is None
+
+
+def test_free_candidates_excludes_waiting_owner_without_assignee():
+    """Находка AI-ревью PR #471 (#470): задача без исполнителя, но с меткой
+    waiting:owner, иначе прошла бы фильтр «нет assignees» как свободная —
+    oldest_free выбирал бы ровно её каждый пульс, claim() отказывал бы, и
+    задачи ЗА ней в очереди не брались бы вовсе (класс #255). Мутация:
+    убери условие `_has_waiting_owner_label` в free_candidates — этот тест
+    краснеет (233 возвращается в списке кандидатов)."""
+    issues = [
+        issue(43, assignees=[]),
+        issue(233, assignees=[], labels=["task", "waiting:owner"]),
+    ]
+    result = [i["number"] for i in free_task.free_candidates(issues)]
+    assert result == [43]
+
+
+def test_free_candidates_keeps_issue_without_labels_key():
+    """Issue без ключа `labels` вовсе (старые фикстуры/вызовы) не считается
+    несущей waiting:owner — то же допущение, что уже применяет `assignees`."""
+    issues = [issue(43, assignees=[])]
+    assert [i["number"] for i in free_task.free_candidates(issues)] == [43]
+
+
+def test_oldest_free_skips_waiting_owner_to_next_candidate():
+    """Симметрично test_free_candidates_excludes_waiting_owner_without_assignee,
+    но через oldest_free (то, что реально вызывает task.sh): старейшая задача
+    несёт waiting:owner — воркер обязан получить СЛЕДУЮЩУЮ, не None и не её."""
+    issues = [
+        issue(43, assignees=[], labels=["task", "waiting:owner"]),
+        issue(233, assignees=[]),
+    ]
+    assert free_task.oldest_free(issues)["number"] == 233
 
 
 # ── (a) прод-форма: упоминание в прозе не делает задачу «объявленной» ──────────────
