@@ -48,7 +48,13 @@ def main() -> None:
     if gate_reason:
         reasons.append(gate_reason)
 
-    if not reasons:
+    # state in (None, "unknown") — вычисление GitHub ещё не завершилось, это
+    # НЕ то же самое, что «конфликта нет» (доктрина review_labels.CONFLICT_
+    # CLEAR_STATES): печатать «готов к слиянию» здесь было бы silent-wrong
+    # ровно в окне сразу после пуша (находка ревью PR #326, п.1).
+    if not reasons and state in (None, "unknown"):
+        print(f"  mergeable_state={state} — GitHub ещё не вычислил слияние, повтори через минуту.")
+    elif not reasons:
         print("  Готов к слиянию: оба вердикта зелёные, конфликтов нет — "
               "ждёт своей очереди оркестратора (ровно один PR за прогон).")
     else:

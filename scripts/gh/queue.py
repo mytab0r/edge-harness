@@ -38,6 +38,12 @@ def main() -> None:
             verdict = "conflict — нужен rebase"
         elif state not in (None, "unknown", *review_labels.CONFLICT_CLEAR_STATES):
             verdict = f"mergeable_state={state}"
+        elif state in (None, "unknown"):
+            # Вычисление GitHub ещё не завершилось — не то же самое, что
+            # «конфликта нет» (доктрина review_labels.CONFLICT_CLEAR_STATES);
+            # печатать «готов к слиянию» здесь — silent-wrong на любом свежем
+            # PR из двух десятков (находка ревью PR #326, п.1).
+            verdict = f"mergeable_state={state} — ещё не вычислен GitHub"
         else:
             gate_reason = review_labels.merge_label_gate(labels)
             verdict = gate_reason or "готов к слиянию"

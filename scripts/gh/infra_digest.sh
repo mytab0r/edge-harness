@@ -15,7 +15,7 @@ print_infra_digest() {
   cat >&2 <<DIGEST
 
 ── Инфраструктура: граблям не удивляться (полностью — docs/agents/INFRA-*.md) ──
-GitHub: gh issue/pr view/create — GraphQL, падает чаще gh api. heredoc в bash —
+GitHub: gh issue/pr view/create — GraphQL, при отказе пробуй gh api. heredoc в bash —
         блокируется, многострочный текст через Write в файл.
         scripts/gh/queue.py и pr_blockers.py <N> — что мешает PR слиться.
 Cloudflare: см. docs/agents/INFRA-CF.md (лимиты DO/Workers, если документ уже есть).
