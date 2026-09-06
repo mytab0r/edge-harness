@@ -170,13 +170,37 @@ printf '%s\n' "$out3c" | grep -qi "не номер задачи" \
 echo "OK: сценарий 3c (мусор в LEASE_ALREADY_CLAIMED) — громкий отказ, ветка не создана"
 
 # ── Сценарий 4: gh недоступен (офлайн) → предупреждение, ветка всё равно создаётся ──
+# Вычитание каталога gh из PATH одной строкой (grep -vF "$gh_dir") ненадёжно
+# на GitHub-раннере: там gh лежит в /usr/bin вместе с git/grep/sed/cut, и
+# фильтрация по подстроке каталога либо не убирает gh (если PATH хранит его
+# отдельной записью помимо общего /usr/bin — воспроизведено живым прогоном:
+# gh нашёлся и упал на отсутствии GH_TOKEN вместо «не найден»), либо вычёркивает
+# заодно и сами инструменты. Тот же двухслойный приём, что и case 7 в
+# task-branch.test.sh: safe_path (каталоги PATH, где нет ни gh, ни gh.exe) —
+# основа; shim (симлинки на нужные внешние команды без gh) — подстраховка на
+# случай, когда safe_path вычеркнул и остальные инструменты того же каталога.
 WORK4="$TMP/work4"
 git clone --quiet "$ORIGIN" "$WORK4"
-# Офлайн-PATH: весь текущий PATH, но без каталога настоящего gh и без заглушки —
-# task-branch должен пройти без gh вообще в PATH (claim_task.py тут не нужен).
-gh_dir="$(dirname "$(command -v gh 2>/dev/null || echo /nonexistent)")"
-OFFLINE_PATH="$(printf '%s\n' "$PATH" | tr ':' '\n' | grep -vF "$gh_dir" | grep -vF "$FAKEBIN" | paste -sd: -)"
-out4="$(cd "$WORK4" && PATH="$OFFLINE_PATH" \
+safe_path=""
+IFS=':' read -ra _dirs <<<"$PATH"
+for _d in "${_dirs[@]}"; do
+  [ -n "$_d" ] || continue
+  case "$_d" in
+    "$FAKEBIN") continue ;;
+  esac
+  if [ ! -e "$_d/gh" ] && [ ! -e "$_d/gh.exe" ]; then
+    safe_path="$safe_path:$_d"
+  fi
+done
+safe_path="${safe_path#:}"
+shim4="$TMP/shim-no-gh"
+mkdir -p "$shim4"
+for tool in git grep sed cut mktemp cat rm dirname; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$tool_path" ] || fail "сценарий 4: инструмент $tool не найден в окружении теста"
+  ln -sf "$tool_path" "$shim4/$tool"
+done
+out4="$(cd "$WORK4" && PATH="$safe_path:$shim4" \
         env -u GITHUB_REPOSITORY -u CLAIM_ACTOR -u CLAIM_VIA -u LEASE_ALREADY_CLAIMED \
         "$REPO/scripts/git/task-branch" 4-offline-task 2>&1)" \
   || fail "сценарий 4 (офлайн, gh недоступен) должен создать ветку, не блокировать:\n$out4"
