@@ -1943,12 +1943,14 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
     fake = FakeGh({
         f"{REPO}/pulls/163/files": [],
         f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
-        f"-X POST repos/{REPO}/issues/217/comments": None,
-        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
-        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+        # комментарии задач — раньше одиночного issue: фрагмент частнее, иначе
+        # GET комментариев уйдёт на маршрут одиночного issue и тест солжёт
         f"{REPO}/issues/217/comments?per_page": [
             {"created_at": "2026-09-06T04:17:30Z",
              "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-217`. Канал: hands."}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("следа аренды нет — сброса быть не должно"))
@@ -1968,14 +1970,15 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
     fake = FakeGh({
         f"{REPO}/pulls/163/files": [],
         f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
-        f"-X POST repos/{REPO}/issues/217/comments": None,
-        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
-        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+        # комментарии задач — раньше одиночного issue: фрагмент частнее
         f"{REPO}/issues/217/comments?per_page": [
             {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
         f"{REPO}/issues/120/comments?per_page": [
             {"created_at": "2026-09-06T04:41:00Z",
              "body": pg.resume_alert_text(163, 217, None)}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сброс этим мержем уже сигналился"))
@@ -1986,6 +1989,38 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in lines)
+
+
+def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypatch):
+    """Находка AI-ревью (класс #318): escalate глотает отказ постинга и
+    возвращает «след в #120: НЕ оставлен» — серия при этом реально НЕ снята
+    (гейт маркер не увидит). Отчёт не вправе утверждать «сброшена». Мутация:
+    убрать проверку статуса в resume_series_by_merge — тест краснеет."""
+    merged = resume_pull()
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"{REPO}/issues/120/comments?per_page": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate",
+                        lambda repo, number, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+
+    lines, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in lines), \
+        "без маркера в #120 серия не снята — отчёт не утверждает сброс"
+    assert any("НЕ снята" in line and "#163" in line for line in lines)
+    assert any("пробой (#205)" in line for line in lines)  # газ возобновления назван
 
 
 def test_run_claimed_task_matches_own_run_not_prefix(monkeypatch):

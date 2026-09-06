@@ -877,6 +877,13 @@ def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | Non
         return None  # сброс этим мержем уже сигналился — один сигнал на мерж
     text = resume_alert_text(pull["number"], task_number, last_red)
     status = escalate(repo, WATCHDOG_ISSUE, text)
+    # Сброс ДОКАЗАН маркером в #120, а не фактом вызова escalate: канал глотает
+    # отказ постинга (best-effort) и честно сообщает «НЕ оставлен». Утверждать
+    # «сброшена» без маркера — тот же класс врущего отчёта, что чинили в пульсе
+    # (PR #318): гейт маркер не увидит и паузу продолжит держать.
+    if f"след в #{WATCHDOG_ISSUE}: НЕ оставлен" in status:
+        return (f"⚠️ сброс мержем #{pull['number']} не оставлен в #{WATCHDOG_ISSUE} — "
+                f"серия НЕ снята, возобновление остаётся за пробой (#205); {status}")
     return (f"🔄 серия красных {WORKER_WORKFLOW} сброшена мержем #{pull['number']} "
             f"(задача #{task_number}; {status})")
 
