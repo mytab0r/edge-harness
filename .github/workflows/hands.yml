@@ -19,9 +19,12 @@ permissions:
   # contents:write — аренда задачи (#121, ADR 0006): замок refs/locks/task-N
   # создаётся и снимается Git-дата-API. issues:write — видимость аренды:
   # claim() после замка назначает исполнителя и ставит след в задаче. Токен
-  # (GH_RUN_TOKEN ниже) живёт только внутри вызова аренды в dsh_task.sh и
-  # снимается до старта DSH; checkout не оставляет его в .git/config
-  # (persist-credentials: false ниже) — прав на пуш у агента нет.
+  # (GH_RUN_TOKEN ниже) уходит из ЭКСПОРТИРУЕМОГО окружения (unset) до старта
+  # DSH — агент его не видит; dsh_task.sh хранит копию в необязательной
+  # переменной bash (#422, не export) и использует её ПОСЛЕ выхода DSH —
+  # только для release-full при провайдере в лимите, снова без экспорта.
+  # checkout не оставляет токен в .git/config (persist-credentials: false
+  # ниже) — прав на пуш у агента нет.
   contents: write
   issues: write
 
@@ -32,7 +35,11 @@ concurrency:
 jobs:
   dsh-task:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 70 (#422, было 30): 25 мин таймаут DSH за попытку + до 10 мин бюджета
+    # ожидания временного RATE_LIMIT (HANDS_RATE_LIMIT_MAX_WAIT_SECS в
+    # dsh_task.sh, короче, чем у worker/ai-review — канал интерактивный,
+    # см. обоснование в dsh_task.sh) + повторная попытка до 25 мин + запас.
+    timeout-minutes: 70
     steps:
       # persist-credentials: false — github.token (теперь с contents:write) не
       # остаётся в .git/config воркспейса: DSH работает именно в корне чекаута
@@ -69,6 +76,8 @@ jobs:
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
           # Аренда задачи (#121): claim_task.py создаёт refs/locks/task-N под
-          # этим токеном; dsh_task.sh снимает переменную до старта DSH.
+          # этим токеном; dsh_task.sh снимает переменную ИЗ ЭКСПОРТА до старта
+          # DSH (копия остаётся в bash-переменной без export для release-full
+          # ПОСЛЕ выхода DSH при провайдере в лимите, #422 — см. dsh_task.sh).
           GH_RUN_TOKEN: ${{ github.token }}
         run: bash scripts/hands/dsh_task.sh
