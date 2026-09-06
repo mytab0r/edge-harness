@@ -822,10 +822,15 @@ def test_is_not_found_exact_form_only():
 # (находка 1 вердикта ai-review PR #294) — повторная сверка головы СРАЗУ
 # после list_pr_files, ДО единой строчки применения вердикта ───────────────
 
-def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: list):
+def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: list,
+                      existing_comments: list | None = None):
     """gh(url) с прод-формой: pulls/{pr} дёргается ДВАЖДЫ (до и после чтения
     файлов) — первый раз отдаёт head_first, второй раз head_second (разные,
-    если в тесте моделируется гонка). files — одна короткая страница."""
+    если в тесте моделируется гонка). files — одна короткая страница.
+
+    issues/294/comments — читается notify_head_moved (#488, дедуп следа
+    «head сменился») при гонке; existing_comments — уже опубликованные
+    комментарии (по умолчанию пусто, одна короткая страница)."""
     calls: list[str] = []
 
     def fake_gh(url: str):
@@ -837,6 +842,9 @@ def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: lis
         if url.startswith("repos/o/r/pulls/294/files"):
             page = url.split("page=")[-1]
             return files if page == "1" else []
+        if url.startswith("repos/o/r/issues/294/comments"):
+            page = url.split("page=")[-1]
+            return (existing_comments or []) if page == "1" else []
         raise AssertionError(f"неожиданный вызов gh: {url}")
 
     return fake_gh, calls
@@ -899,12 +907,73 @@ def test_cmd_verdict_race_head_moves_during_file_read_skips_verdict(monkeypatch,
         "repos/o/r/pulls/294",
         "repos/o/r/pulls/294/files?per_page=100&page=1",
         "repos/o/r/pulls/294",
+        "repos/o/r/issues/294/comments?per_page=100&page=1",
     ]
-    # Вердикт НЕ применён вовсе: ни метки, ни large-ok, ни комментария.
-    assert run_gh_calls == []
+    # Вердикт НЕ применён: ни метки, ни large-ok. Единственный след —
+    # служебный комментарий о смене head (#488, notify_head_moved).
+    verdict_urls = [a[3] for a in run_gh_calls if a[:2] == ("api", "-X") and a[2] == "POST"
+                    and "/labels" in a[3]]
+    assert verdict_urls == []
+    comment_calls = [a for a in run_gh_calls if a[:2] == ("api", "-X") and a[2] == "POST"
+                      and a[3].endswith("/comments")]
+    assert len(comment_calls) == 1
+    posted_body = comment_calls[0][-1]
+    assert posted_body.startswith("body=")
+    assert "deadbeef" in posted_body and "1234567890abcdef" in posted_body
+    assert "head PR сменился" in posted_body
     out = capsys.readouterr().out
     assert "сменился во время чтения файлов" in out
     assert "не применяю" in out
+
+
+def test_cmd_verdict_head_moved_before_files_posts_comment(monkeypatch, tmp_path, capsys):
+    # Голова уже уехала на самой ПЕРВОЙ сверке (до list_pr_files вообще) —
+    # ветка cmd_verdict короче (files не читаются), но след — тот же
+    # комментарий notify_head_moved (#488): без него единственная улика —
+    # ::warning:: в логе, который никто не открывает без явного повода.
+    fake_gh, calls = _fake_gh_verdict("1234567890abcdef", "1234567890abcdef", [], [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    # Первая же сверка уже разошлась — до files и до второй сверки дело не
+    # доходит вовсе, только комментарий-след.
+    assert calls == [
+        "repos/o/r/pulls/294",
+        "repos/o/r/issues/294/comments?per_page=100&page=1",
+    ]
+    comment_calls = [a for a in run_gh_calls if a[:2] == ("api", "-X") and a[2] == "POST"
+                      and a[3].endswith("/comments")]
+    assert len(comment_calls) == 1
+    assert "deadbeef" in comment_calls[0][-1] and "1234567890abcdef" in comment_calls[0][-1]
+    out = capsys.readouterr().out
+    assert "не применяю" in out
+
+
+def test_cmd_verdict_head_moved_comment_not_duplicated_on_retry(monkeypatch, tmp_path):
+    # Тот же переход A→B (retry job'а verdict, не новый пуш автора) — второй
+    # вызов cmd_verdict не должен опубликовать вторую копию следа (#488,
+    # notify_head_moved): уже опубликованный комментарий с ТЕМ ЖЕ marker
+    # находится через список комментариев PR и вызов молчит.
+    marker = f"{ai.HEAD_MOVED_MARKER_PREFIX}deadbeef:1234567890abcdef -->"
+    existing = [{"body": f"{marker}\nуже отмечено раньше"}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "1234567890abcdef", [], [],
+                                       existing_comments=existing)
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    assert run_gh_calls == [], "переход уже отмечен — второй копии следа быть не должно"
 
 
 def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, tmp_path):
@@ -1132,6 +1201,21 @@ def test_ai_review_workflow_run_name_uses_review_labels_prefix():
     source = AI_REVIEW_YML.read_text(encoding="utf-8")
     needle = f"format('{rl.AI_REVIEW_RUN_NAME_PREFIX}{{0}}'"
     assert source.count(needle) == 2
+
+
+def test_ai_review_workflow_gate1_case_matches_gate1_labels():
+    # Bash не может импортировать Python (два языка) — `case " $labels " in
+    # *" review:ok "*|*" review:large "*)` в ai-review.yml (шаг facts, #204)
+    # дублирует GATE1_LABELS буквально, не читает его. Расхождение (гейт 1
+    # обзавёлся третьей меткой в Python, но не в YAML, или наоборот) молча
+    # закрыло/открыло бы дорогой прогон без единого красного теста — bash и
+    # python здесь никак не связаны импортом.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    needle = "|".join(f'*" {label} "*' for label in rl.GATE1_LABELS)
+    assert needle in source, (
+        f"case-ветка ai-review.yml не совпадает с GATE1_LABELS {rl.GATE1_LABELS} — "
+        f"ожидали найти {needle!r}"
+    )
 
 
 def test_other_active_ai_review_runs_filters_by_pr_and_status_excludes_self():
