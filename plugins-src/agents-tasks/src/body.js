@@ -34,8 +34,11 @@ const GITHUB_REPO = "mytab0r/edge-harness"; // TODO: сделать настра
 const TASK_LABEL = "task";
 
 const JOURNAL_PAGE_SIZE = 20;
-const JOURNAL_QUERY = "/api/events?task_id=";
-const JOURNAL_LIVE = "/api/events.live?after=";
+// Путь — ПРОКСИ СТОРОНЫ МОРДЫ (/api/harness/* → журнал edge-harness, белое
+// пятно #105 закрыто патчем 0005, см. plugins-src/plugin-manager/src/body.js
+// — тот же контракт, тот же приём). Same-origin `/api/events` — чужой API
+// самой морды (401/HTML), не журнал: находка ревью PR #412.
+const JOURNAL_QUERY = "/api/harness/events?task_id=";
 
 const POLL_INTERVAL_MS = 5000; // поллинг статусов задач и журнала
 const TASKS_POLL_INTERVAL_MS = 15000; // поллинг списка задач (GitHub API)
@@ -268,26 +271,7 @@ const styles = {
   loadingRow: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '16px', color: 'var(--dsh-text-3, #6b6b6b)', fontSize: '13px' },
   emptyState: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '24px', color: 'var(--dsh-text-3, #6b6b6b)', fontSize: '13px', textAlign: 'center' },
   linkBtn: { display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '2px 6px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--dsh-border, #3e3e42)', background: 'transparent', color: 'var(--dsh-text-2, #a1a1aa)', cursor: 'pointer' },
-  liveIndicator: { display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--dsh-success, #22c55e)' },
-  liveDot: { width: '6px', height: '6px', borderRadius: '50%', background: 'var(--dsh-success, #22c55e)', animation: 'pulse 1.5s infinite' },
 };
-
-const styleSheet = `
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-`;
-
-// Инъекция стилей при первом рендере
-let stylesInjected = false;
-function injectStyles() {
-  if (stylesInjected || typeof document === 'undefined') return;
-  const style = document.createElement('style');
-  style.textContent = styleSheet;
-  document.head.appendChild(style);
-  stylesInjected = true;
-}
 
 // ── Компонент строки задачи ────────────────────────────────────────────────────
 
@@ -393,11 +377,10 @@ function AgentsTasksSection(props) {
   const [error, setError] = useState(null);
   const [selectedTaskNumber, setSelectedTaskNumber] = useState(null);
   const [expandedTasks, setExpandedTasks] = useState(new Set());
-  const [liveConnected, setLiveConnected] = useState(false);
-  const wsRef = useRef(null);
   const pollTimersRef = useRef({ tasks: null, journal: null });
-
-  injectStyles();
+  // Задачи, для которых автозагрузка журнала уже пыталась сработать (см.
+  // эффект автозагрузки ниже) — переживает ре-рендер, не зависит от `tasks`.
+  const attemptedRef = useRef(new Set());
 
   const loadTasks = useCallback(async () => {
     try {
@@ -435,30 +418,21 @@ function AgentsTasksSection(props) {
     }
   }, []);
 
-  // Внутренняя функция загрузки событий для задачи (возвращает события и статус)
+  // Внутренняя функция загрузки событий для задачи (возвращает события и
+  // статус). Единственная каноническая форма task_id продюсера —
+  // `issue-<N>` (дефис, без двоеточия/решётки): scripts/worker/task.sh:370
+  // (`"task_id":"issue-$number"`), scripts/hands/dsh_task.sh:183 матчит
+  // ровно `^issue-([0-9]+)$`. Находка ревью PR #412: четыре угаданные формы
+  // (`issue:#N`, `task:#N`, `#N`, голое число) не совпадают с продюсером
+  // НИ ОДНА — молчаливое «Событий пока нет» на реальной задаче.
+  //
+  // Честный предел (пока не закрыт отдельной задачей из ревью): воркер
+  // сегодня пишет под `issue-<N>` только heartbeat — `job_start`/`job_end`
+  // живут под UUID задач мордочной очереди, не под id issue. Статус пула
+  // до появления такого продюсера остаётся 'unknown' даже при свежем
+  // heartbeat — это честный пробел, не регресс этого PR.
   const loadTaskEventsInternal = useCallback(async (taskNumber) => {
-    const taskIdCandidates = [
-      `issue:#${taskNumber}`,
-      `task:#${taskNumber}`,
-      `#${taskNumber}`,
-      String(taskNumber),
-    ];
-
-    let events = [];
-    let lastError = null;
-
-    for (const taskId of taskIdCandidates) {
-      try {
-        events = await fetchAllJournalEvents(taskId);
-        if (events.length > 0) break;
-      } catch (e) {
-        lastError = e;
-      }
-    }
-
-    if (events.length === 0 && lastError) {
-      throw lastError;
-    }
+    const events = await fetchAllJournalEvents(`issue-${taskNumber}`);
 
     // Определяем статус из последних событий задачи
     let status = 'unknown';
@@ -513,76 +487,32 @@ function AgentsTasksSection(props) {
     });
   }, []);
 
-  // Подключение к live-стриму журнала
-  const connectLive = useCallback(() => {
-    if (wsRef.current) return;
-    try {
-      const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${JOURNAL_LIVE}0`);
-      wsRef.current = ws;
-      ws.onopen = () => setLiveConnected(true);
-      ws.onclose = () => { wsRef.current = null; setLiveConnected(false); };
-      ws.onmessage = (msg) => {
-        try {
-          const data = JSON.parse(msg.data);
-          if (data.type === 'event') {
-            const event = data.event;
-            // Обновляем задачу, к которой относится событие
-            setTasks(prev => prev.map(task => {
-              // Проверяем соответствие task_id
-              const matches = task.issue.number.toString() === event.task_id.replace(/^(issue|task):#?/, '');
-              if (!matches) return task;
-              const newEvents = [...task.events, event];
-              // Обновляем статус
-              let status = task.status;
-              switch (event.kind) {
-                case 'task_queued': status = 'queued'; break;
-                case 'task_dispatched': status = 'dispatched'; break;
-                case 'job_start': status = 'running'; break;
-                case 'job_end': status = (event.data?.result === 'fail') ? 'failed' : 'done'; break;
-                case 'dispatch_failed': status = 'failed'; break;
-              }
-              return { ...task, events: newEvents, status };
-            }));
-          } else if (data.type === 'status') {
-            // Статус рук — можно использовать для индикатора
-          }
-        } catch (e) {
-          console.warn('[agents-tasks] live event parse error:', e);
-        }
-      };
-      ws.onerror = () => { wsRef.current = null; setLiveConnected(false); };
-    } catch (e) {
-      console.warn('[agents-tasks] WebSocket connection failed:', e);
-      setLiveConnected(false);
-    }
-  }, []);
-
-  const disconnectLive = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-      setLiveConnected(false);
-    }
-  }, []);
-
-  // Эффекты: загрузка, поллинг, live
+  // Эффекты: загрузка, поллинг.
+  // Живой WS-стрим убран (находка ревью PR #412): патч 0005 проксирует
+  // стороной морды только REST `/api/harness/events`, WebSocket-путь
+  // `/api/events.live` им не покрыт вовсе — same-origin WS упирается в тот
+  // же 401/HTML, что и REST до фикса JOURNAL_QUERY. Продюсер живого стрима
+  // через прокси морды — отдельная задача (см. чеклист ревью PR #412);
+  // сейчас статусы обновляются поллингом TASKS_POLL_INTERVAL_MS.
   useEffect(() => {
     loadTasks();
     const timer = setInterval(loadTasks, TASKS_POLL_INTERVAL_MS);
     pollTimersRef.current.tasks = timer;
-    connectLive();
-    return () => {
-      clearInterval(timer);
-      disconnectLive();
-    };
-  }, [loadTasks, connectLive, disconnectLive]);
+    return () => clearInterval(timer);
+  }, [loadTasks]);
 
-  // Автозагрузка событий для выбранной задачи
+  // Автозагрузка событий для выбранной задачи — ровно один раз на выбор.
+  // Находка ревью PR #412: зависимость от всего `tasks` устраивала
+  // бесконечный молотильный цикл на любой задаче с пустым/ошибочным
+  // журналом (а это ЛЮБАЯ задача до фикса форм task_id выше) — каждый
+  // fetch менял `tasks` (setTasks), эффект перезапускался снова. Гвардия —
+  // per-задача флаг «уже пытались» (attemptedRef), не содержимое events.
   useEffect(() => {
-    if (selectedTaskNumber && !tasks.find(t => t.issue.number === selectedTaskNumber)?.events.length) {
-      loadTaskEvents(selectedTaskNumber);
-    }
-  }, [selectedTaskNumber, tasks, loadTaskEvents]);
+    if (selectedTaskNumber === null) return;
+    if (attemptedRef.current.has(selectedTaskNumber)) return;
+    attemptedRef.current.add(selectedTaskNumber);
+    loadTaskEvents(selectedTaskNumber);
+  }, [selectedTaskNumber, loadTaskEvents]);
 
   // Рендер
   if (loading) {
@@ -606,9 +536,6 @@ function AgentsTasksSection(props) {
         h(IconTerminal, { size: 16 }), t('title')
       ),
       h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-        liveConnected && h('span', { style: styles.liveIndicator },
-          h('span', { style: styles.liveDot }), t('live')
-        ),
         error && h('span', { style: { fontSize: '11px', color: 'var(--dsh-error, #ef4444)' } }, error),
         h(Button, { variant: 'outline', size: 'sm', onClick: loadTasks }, h(IconRefreshCw, { size: 12 }), t('refresh'))
       )
@@ -640,8 +567,6 @@ const SETTINGS_SLOT = 'settings.section';
 const inject = ['slots', 'locale'];
 
 function apply(ctx) {
-  if (typeof document !== 'undefined') injectStyles();
-
   ctx.effect(
     () => ctx.locale.register('agents.tasks', dictionaries),
     'agents-tasks: dictionaries',
@@ -683,7 +608,6 @@ const dictionaries = {
     openPR: 'Open PR',
     retry: 'Retry',
     refresh: 'Refresh',
-    live: 'Live',
     statusQueued: 'Queued',
     statusDispatched: 'Dispatched',
     statusRunning: 'Running',
@@ -719,7 +643,6 @@ const dictionaries = {
     openPR: '打开 PR',
     retry: '重试',
     refresh: '刷新',
-    live: '实时',
     statusQueued: '排队中',
     statusDispatched: '已分发',
     statusRunning: '运行中',
@@ -755,7 +678,6 @@ const dictionaries = {
     openPR: 'Открыть PR',
     retry: 'Повторить',
     refresh: 'Обновить',
-    live: 'Онлайн',
     statusQueued: 'В очереди',
     statusDispatched: 'Распределена',
     statusRunning: 'Выполняется',

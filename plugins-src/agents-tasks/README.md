@@ -9,26 +9,35 @@
 - **Список задач из GitHub Issues** — запрос `GET /repos/{owner}/{repo}/issues?labels=task`.
   Показываются: номер, заголовок, статус (из журнала), исполнитель, ссылки на Issue/PR.
 - **Лента событий журнала** — по клику на задачу раскрывается лента
-  `GET /api/events?task_id=issue:#{number}&limit=20&after=...` с проходом
-  до конца выборки (`has_more`/`next_after`).
+  `GET /api/harness/events?task_id=issue-{number}&limit=20&after=...` с проходом
+  до конца выборки (`has_more`/`next_after`). `issue-{number}` — ЕДИНСТВЕННАЯ
+  каноническая форма task_id продюсера (`scripts/worker/task.sh`,
+  `scripts/hands/dsh_task.sh`), без вариантов.
   - Системные события: `task_queued`, `task_dispatched`, `job_start`, `job_end`,
     `first_heartbeat`, `dispatch_failed` — определяют статус задачи.
   - События `session_event` (от `dsh-hands-streamer`, задача #69) парсятся как чат:
     `think` (agent/request), `tool/call`, `tool/result`, `assistant/message`.
-- **Живое обновление** — WebSocket `/api/events.live?after=0` (гибернация DO),
-  события пушатся в UI без поллинга. Поллинг GitHub API каждые 15 с, журнал —
-  каждые 5 с как фолбэк.
+- **Поллинг** — GitHub API каждые 15 с, журнал — каждые 5 с. Живой WS-стрим
+  не реализован (см. «Честные пробелы» ниже).
 - **Подсказка** — «Новые задачи: создай Issue с меткой `task` — оркестратор
   подхватит и запустит агента».
 
-## Блокер
+## Честные пробелы (находки ревью PR #412)
 
-Журнал живёт в воркере `edge-harness` (cf-worker), морда — в воркере `dsh-edge`.
-Секция ходит по относительному пути `/api/events` и `/api/events.live` того же
-origin, где стоит страница, — а этот путь в морде **не проксирован** к журналу
-(issue #105). Пока #105 не закрыт, журнал вернёт 404/HTML, и content-type-гвардия
-превратит это в громкую ошибку статусов; список задач (GitHub API) при этом
-работает. Разбор и варианты закрытия — issue #105.
+- **Живой WS-стрим не реализован.** Журнал живёт в воркере `edge-harness`
+  (cf-worker), морда — в воркере `dsh-edge`. Прокси стороны морды (патч 0005,
+  `GET /api/harness/events`) закрывает белое пятно #105 только для REST —
+  WebSocket-путь им не покрыт вовсе, same-origin WS упёрся бы в тот же
+  401/HTML, что REST до фикса пути выше. Продюсер живого стрима через прокси
+  морды — отдельная задача из чеклиста ревью; сейчас статусы обновляются
+  поллингом.
+- **Статусы пула сегодня в основном `unknown`.** Воркер пишет под
+  `issue-<N>` только heartbeat (`first_heartbeat`) — события `task_queued`/
+  `task_dispatched`/`job_start`/`job_end` живут под UUID задач мордочной
+  очереди (dsh-edge), не под id issue. Пока нет отдельного продюсера,
+  пишущего эти события под `issue-<N>` (см. чеклист ревью PR #412), статус
+  пула виден только как `unknown`/`running` (по свежести heartbeat), не
+  полный `queued → running → done`.
 
 ## Как устроен бандл
 
@@ -48,31 +57,31 @@ origin, где стоит страница, — а этот путь в морд
 
 Словари регистрируются в namespace `agents.tasks` (en/zh/ru, наборы ключей одинаковы).
 
-## Пересборка tarball
+## Публикация: пока НЕ зарегистрирован в dsh-edge/plugins.json (находка ревью PR #412)
 
-```bash
-cd plugins-src/agents-tasks
-node build.mjs          # сгенерирует client/client.js + manifest.json, прогонит гвардии
-npm pack                # edge-harness-dsh-agents-tasks-0.1.0.tgz
-```
+`build.mjs` (и, транзитивно, `test/client.test.mjs`, который сам его
+запускает) требует, чтобы пакет уже был объявлен записью в
+`dsh-edge/plugins.json` — без неё `node build.mjs` падает громко
+(`пакет @edge-harness/dsh-agents-tasks не объявлен в каталоге`). Первая
+версия этого PR держала такую запись САМА, но с фиктивным sha256 (нули) и
+ссылкой на несуществующий релиз `plugins-agents-tasks-v0.1.0` — repo-ci это
+не ловит (не проверяет существование релизов), а ближайший `deploy-dsh-edge.yml`
+упал бы громко на `sha256sum -c` ассета. Запись убрана из этого PR.
 
-Публикация (конвейер #80, по образцу hello-world): релиз **этого**
-репозитория с тегом `plugins-agents-tasks-v0.1.0`, asset
-`agents-tasks-0.1.0.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
-фиксирует манифест), затем sha256 — PR'ом в `dsh-edge/plugins.json`:
+Штатный путь регистрации — **plugin-forge** (`.github/workflows/plugin-forge.yml`,
+`workflow_dispatch` с `plugin_path: plugins-src/agents-tasks`): он сам
+собирает пакет, публикует релиз с настоящим sha256 и открывает СВОЙ PR с
+записью в `dsh-edge/plugins.json` (апсерт по имени пакета — не дублирует
+запись при повторном запуске). До этого PR:
 
-```bash
-cp edge-harness-dsh-agents-tasks-0.1.0.tgz agents-tasks-0.1.0.tgz
-sha256sum agents-tasks-0.1.0.tgz
-gh release create plugins-agents-tasks-v0.1.0 agents-tasks-0.1.0.tgz \
-  --title "plugins-agents-tasks-v0.1.0 — agents-tasks: раздел «Агенты и задачи» в морде" \
-  --notes "Клиентский плагин #111: GitHub Issues пул, журнал как чат, live-обновления."
-```
-
-Цикличность sha (принято, по образцу hello/runner): вшитая `manifest.json`
-в пакете содержит каталог с sha256 **этого же** пакета — финальной своей sha
-там быть не может. Проверяется всегда sha артефакта против каталога репо;
-вшитая копия нужна ради ростера `[id, server, client]`, который циклы не имеет.
+- локальная разработка/тесты требуют временной записи в `plugins.json` (не
+  коммитить — только для `node build.mjs`/`node --test .../client.test.mjs`
+  на своей машине);
+- CI-шаг `node --test plugins-src/agents-tasks/test/client.test.mjs` **не
+  подключён** в `repo-ci.yml` тем же самым чисто — подключать его раньше
+  появления записи в манифесте означало бы постоянно красный обязательный
+  чек; подключается той же следующей PR-парой (запись + шаг), что вводит
+  plugin-forge.
 
 Сгенерированное (`client/`, `manifest.json`) в git не хранится: манифест
 меняется — пересборка перед каждым `npm pack` обязательна, иначе в бандл
@@ -85,11 +94,14 @@ gh release create plugins-agents-tasks-v0.1.0 agents-tasks-0.1.0.tgz \
 node --test plugins-src/agents-tasks/test/client.test.mjs
 ```
 
+Требует временной записи в `dsh-edge/plugins.json` (см. раздел «Публикация»
+выше) — без неё `build.mjs`, который тест сам запускает, откажет.
+
 Поведенческая гвардия (`test/client.test.mjs`, `node --test`, без
 зависимостей): обёртка бандла, монтаж в `sidebar.section`/`settings.section`,
 паритет ключей словарей и ячейки статусов на прод-форме ответа журнала —
-`{events: [{id, kind, data}], has_more, next_after}`; системные события
-определяют статус задачи; `session_event` парсится как чат (think/tool/assistant);
-пагинация добирает свежие события; отказ и чужой ответ = громкая ошибка.
-Шаг включён в `repo-ci.yml`. Мутационная проверка: подмена «последнего события»
-на «первое» красит набор.
+`{events: [{id, kind, data}], has_more, next_after}` с каноническим
+`task_id=issue-<N>`; системные события определяют статус задачи;
+`session_event` парсится как чат (think/tool/assistant); пагинация добирает
+свежие события; отказ и чужой ответ = громкая ошибка. Мутационная проверка:
+подмена «последнего события» на «первое» красит набор.

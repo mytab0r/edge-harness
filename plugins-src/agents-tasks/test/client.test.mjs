@@ -250,21 +250,21 @@ test('статусы задач: последние системные собы�
   }
   // Мокаем журнал: первая задача — running, вторая — done
   const journalResponses = {
-    'issue:#123': {
+    'issue-123': {
       ok: true, status: 200, contentType: 'application/json',
       body: { events: [
-        { id: 1, task_id: 'issue:#123', seq: -1, ts: Date.now()-10000, source: 'system', kind: 'task_queued', data: {} },
-        { id: 2, task_id: 'issue:#123', seq: -2, ts: Date.now()-5000, source: 'system', kind: 'task_dispatched', data: {} },
-        { id: 3, task_id: 'issue:#123', seq: 1, ts: Date.now()-1000, source: 'job', kind: 'job_start', data: {} },
+        { id: 1, task_id: 'issue-123', seq: -1, ts: Date.now()-10000, source: 'system', kind: 'task_queued', data: {} },
+        { id: 2, task_id: 'issue-123', seq: -2, ts: Date.now()-5000, source: 'system', kind: 'task_dispatched', data: {} },
+        { id: 3, task_id: 'issue-123', seq: 1, ts: Date.now()-1000, source: 'job', kind: 'job_start', data: {} },
       ], has_more: false, next_after: 3 },
     },
-    'issue:#124': {
+    'issue-124': {
       ok: true, status: 200, contentType: 'application/json',
       body: { events: [
-        { id: 4, task_id: 'issue:#124', seq: -1, ts: Date.now()-20000, source: 'system', kind: 'task_queued', data: {} },
-        { id: 5, task_id: 'issue:#124', seq: -2, ts: Date.now()-15000, source: 'system', kind: 'task_dispatched', data: {} },
-        { id: 6, task_id: 'issue:#124', seq: 1, ts: Date.now()-10000, source: 'job', kind: 'job_start', data: {} },
-        { id: 7, task_id: 'issue:#124', seq: 2, ts: Date.now()-5000, source: 'job', kind: 'job_end', data: { result: 'success' } },
+        { id: 4, task_id: 'issue-124', seq: -1, ts: Date.now()-20000, source: 'system', kind: 'task_queued', data: {} },
+        { id: 5, task_id: 'issue-124', seq: -2, ts: Date.now()-15000, source: 'system', kind: 'task_dispatched', data: {} },
+        { id: 6, task_id: 'issue-124', seq: 1, ts: Date.now()-10000, source: 'job', kind: 'job_start', data: {} },
+        { id: 7, task_id: 'issue-124', seq: 2, ts: Date.now()-5000, source: 'job', kind: 'job_end', data: { result: 'success' } },
       ], has_more: false, next_after: 7 },
     },
   }
@@ -276,7 +276,7 @@ test('статусы задач: последние системные собы�
       calls.github++
       return responseStub(githubResponse)
     }
-    if (urlStr.includes('/api/events?task_id=')) {
+    if (urlStr.includes('/api/harness/events?task_id=')) {
       calls.journal++
       const taskId = decodeURIComponent(urlStr.match(/[?&]task_id=([^&]+)/)?.[1] || '')
       const response = journalResponses[taskId]
@@ -316,8 +316,8 @@ test('session_event: think-блоки и tool-вызовы видны в раз�
   const journalResponse = {
     ok: true, status: 200, contentType: 'application/json',
     body: { events: [
-      { id: 10, task_id: 'issue:#200', seq: -1, ts: Date.now()-10000, source: 'system', kind: 'task_queued', data: {} },
-      { id: 11, task_id: 'issue:#200', seq: 1, ts: Date.now()-5000, source: 'job', kind: 'session_event', data: { events: [
+      { id: 10, task_id: 'issue-200', seq: -1, ts: Date.now()-10000, source: 'system', kind: 'task_queued', data: {} },
+      { id: 11, task_id: 'issue-200', seq: 1, ts: Date.now()-5000, source: 'job', kind: 'session_event', data: { events: [
         { type: 'agent/request', prompt: 'Please solve this task...' },
         { type: 'tool/call', name: 'bash', args: { command: 'ls -la' } },
         { type: 'tool/result', name: 'bash', result: 'total 0\n', error: null },
@@ -333,7 +333,7 @@ test('session_event: think-блоки и tool-вызовы видны в раз�
       calls.github++
       return responseStub(githubResponse)
     }
-    if (urlStr.includes('/api/events?task_id=')) {
+    if (urlStr.includes('/api/harness/events?task_id=')) {
       calls.journal++
       return responseStub(journalResponse)
     }
@@ -375,7 +375,7 @@ test('пагинация журнала: свежайшие события до�
       ok: true, status: 200, contentType: 'application/json',
       body: {
         events: Array.from({ length: 20 }, (_, i) => ({
-          id: i + 1, task_id: 'issue:#300', seq: i + 1, ts: Date.now() - (20-i)*1000, source: 'job',
+          id: i + 1, task_id: 'issue-300', seq: i + 1, ts: Date.now() - (20-i)*1000, source: 'job',
           kind: 'plugin_status', data: { plugin: 'test', state: 'deploying' },
         })),
         has_more: true, next_after: 20,
@@ -385,7 +385,7 @@ test('пагинация журнала: свежайшие события до�
       ok: true, status: 200, contentType: 'application/json',
       body: {
         events: [
-          { id: 21, task_id: 'issue:#300', seq: 21, ts: Date.now(), source: 'job',
+          { id: 21, task_id: 'issue-300', seq: 21, ts: Date.now(), source: 'job',
             kind: 'session_event', data: { events: [{ type: 'assistant/message', content: 'Latest result' }] } },
         ],
         has_more: false, next_after: 21,
@@ -397,7 +397,7 @@ test('пагинация журнала: свежайшие события до�
   const { sandbox } = loadBundle(async (url) => {
     const urlStr = String(url)
     if (urlStr.startsWith('https://api.github.com/')) return responseStub(githubResponse)
-    if (urlStr.includes('/api/events?task_id=')) {
+    if (urlStr.includes('/api/harness/events?task_id=')) {
       journalCalls.push(urlStr)
       const after = urlStr.split('after=')[1]?.split('&')[0] || '0'
       const response = pages.get('after=' + after)
@@ -412,7 +412,7 @@ test('пагинация журнала: свежайшие события до�
   sandbox.render()
 
   // Должно быть 2 запроса к журналу (пагинация)
-  const taskCalls = journalCalls.filter(u => u.includes('issue%3A%23300'))
+  const taskCalls = journalCalls.filter(u => u.includes('issue-300'))
   assert.ok(taskCalls.length >= 2, 'пагинация не отработала: ' + JSON.stringify(taskCalls))
   // Последний запрос должен быть after=20
   assert.ok(taskCalls.some(u => u.includes('after=20')), 'вторая страница не запрошена')
@@ -441,7 +441,7 @@ test('ошибка журнала (не JSON): форма ответа пров�
   const { sandbox } = loadBundle(async (url) => {
     const urlStr = String(url)
     if (urlStr.startsWith('https://api.github.com/')) return responseStub(githubResponse)
-    if (urlStr.includes('/api/events?task_id=')) return responseStub({
+    if (urlStr.includes('/api/harness/events?task_id=')) return responseStub({
       ok: true, status: 200, contentType: 'text/html',
       body: '<html>не журнал</html>',
     })
