@@ -145,8 +145,9 @@ PATCH
 # машине / платная песочница) — решение владельца, не воркера.
 
 DSH_AGENT_USER="${DSH_AGENT_USER:-dsh-agent}"
-DSH_AGENT_HOME=""      # заполняет dsh_agent_isolation_prepare
-DSH_AGENT_LAUNCHER=""  # заполняет dsh_agent_isolation_prepare
+DSH_AGENT_HOME=""        # заполняет dsh_agent_isolation_prepare
+DSH_AGENT_LAUNCHER=""    # заполняет dsh_agent_isolation_prepare
+DSH_AGENT_WORKSPACE=""   # заполняет dsh_agent_isolation_prepare, читает dsh_agent_handover
 # Один источник правды на каналы «транспорт → агент»: из него собирается
 # sudoers env_keep И проверка проводки в prepare. Расширять — только здесь.
 DSH_AGENT_ENV_KEEP="DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL HANDS_SPOOL GH_REPO"
@@ -261,10 +262,14 @@ export HOME="$DSH_AGENT_HOME" DSH_HOME="$DSH_AGENT_HOME/.dsh"
 export npm_config_ignore_workspace_root_check=true
 exec "\$@"
 LAUNCHER
-  # 7. Воркспейс и агент-каталог — во владение агенту: модель пишет файлы
-  # (git, спул) своим uid, транспорт после прогона читает их (644).
+  # 7. Каталог агента — во владение агенту: спул пишет он сам, транспорт
+  # читает (644, umask лаунчера зафиксирован). САМ воркспейс сюда НЕ входит:
+  # транспорт после prepare ещё исполняет свои git-команды (task-branch,
+  # git config) — передача воркспейса делается отдельным поздним шагом
+  # dsh_agent_handover перед самым прогоном (ревью #395: chown -R ранним
+  # шагом ломал транспорт «dubious ownership»+EACCES после взятия аренды).
+  DSH_AGENT_WORKSPACE=$workspace
   sudo chown "$DSH_AGENT_USER:$DSH_AGENT_USER" "$agent_dir"
-  sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$workspace"
   # 8. Доказательства изоляции — до запуска dsh, каждое громкое.
   # 8а. Позитив: КАЖДАЯ переменная из env_keep-списка, заданная у транспорта,
   # обязана доехать до агента (ревью #140: проверка одного DEEPSEEK_MODEL
@@ -276,7 +281,9 @@ LAUNCHER
   for var in $DSH_AGENT_ENV_KEEP; do
     want="${!var:-}"
     [ -n "$want" ] || continue
-    crossed="$(grep "^$var=" <<<"$agent_env" | cut -d= -f2-)"
+    # || true обязателен: pipefail при отсутствии строки убил бы присваивание
+    # молча, до нашей диагностики дело не дошло бы (находка ревью #395).
+    crossed="$(grep "^$var=" <<<"$agent_env" | cut -d= -f2- || true)"
     if [ "$crossed" != "$want" ]; then
       echo "::error::env_keep не провёл $var агент-юзеру (получено '${crossed:-<пусто>}') — канал sudoers сломан, прогон без секрета/спула молча бы сломался" >&2
       return 1
@@ -335,8 +342,12 @@ LAUNCHER
   # но смена среды обязана быть громкой: открывшееся ребро = ключ в env dsh
   # достижим model-shell, и вынос ключа с раннера становится обязательным.
   local parent_edge
+  # \$PPID экранирован: развернуть его обязан ВНУТРЕННИЙ bash (его родитель —
+  # внешний агент-башик, тот самый same-uid родитель из замера). Без экранирования
+  # $PPID разворачивает внешний башик в pid root-ового sudo — пробник всегда
+  # отвечает DENIED и мёртв (ревью #395).
   # shellcheck disable=SC2016
-  parent_edge="$(dsh_agent_run bash -c 'bash -c "cat /proc/$PPID/environ" >/dev/null 2>&1 && echo READABLE || echo DENIED')"
+  parent_edge="$(dsh_agent_run bash -c 'bash -c "cat /proc/\$PPID/environ" >/dev/null 2>&1 && echo READABLE || echo DENIED')"
   if [ "$parent_edge" = "READABLE" ]; then
     echo "::warning::ребро #140 ОТКРЫТО: дочерний процесс этой среды читает environ родителя (same-uid) — модель может дотянуться до env dsh мимо uid-изоляции. Газ: вынос ключа с раннера (research/40, «Остаточный риск»)"
   else
@@ -359,4 +370,13 @@ dsh_agent_run() { # cmd args... — исполнить команду от аг�
   : "${DSH_AGENT_LAUNCHER:?dsh_agent_isolation_prepare не вызван}"
   : "${DSH_AGENT_USER:?DSH_AGENT_USER не задан}"
   sudo -n -H -u "$DSH_AGENT_USER" bash "$DSH_AGENT_LAUNCHER" "$PATH" "$@"
+}
+
+dsh_agent_handover() { # передать воркспейс агенту — ПОСЛЕДНИЙ шаг перед прогоном
+  # Отдельно от prepare, потому что между ними транспорт ещё работает руками
+  # в воркспейсе (task-branch: fetch/switch -c/hooksPath, git config): chown
+  # ранним шагом отдаёт репо другому uid и валит транспорт «dubious ownership»
+  # + EACCES (ревью #395). После handover транспорт в воркспейсс не пишет.
+  : "${DSH_AGENT_WORKSPACE:?dsh_agent_isolation_prepare не вызван}"
+  sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$DSH_AGENT_WORKSPACE"
 }

@@ -394,6 +394,9 @@ grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
 # HANDS_SPOOL экспортирован до prepare. Файлы агента — снос тоже под агентом.
 dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
+# Передача воркспейса агенту — ПОСЛЕДНИЙ транспортный шаг: git-операции
+# (task-branch, config) выше исполнены транспортом в своём uid (#140).
+dsh_agent_handover
 set +e
 timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$(cat "$PROMPT_FILE")" \
   >"$ANSWER_FILE" 2>"$ERR_FILE"

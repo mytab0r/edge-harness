@@ -49,6 +49,8 @@ dsh_agent_run install -D -m 644 "$AI_WORK/agent-headless.cordis.patch.yml" \
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 set +e
 timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$(cat "$AI_WORK/prompt.md")" \
   >"$AI_WORK/answer.txt" 2>"$AI_WORK/stderr.txt"

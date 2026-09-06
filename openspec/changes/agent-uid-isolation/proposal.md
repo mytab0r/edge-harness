@@ -20,7 +20,9 @@
    образа раннера): контейнер `--pid=host --cap-add SYS_PTRACE
    --security-opt apparmor=unconfined` прочитал environ dsh, где лежат
    `DEEPSEEK_API_KEY`, `GH_TOKEN`, `HANDS_TOKEN`, `TELEGRAM_BOT_TOKEN`,
-   `DSH_EDGE_ACCESS_KEY`.
+   `DSH_EDGE_ACCESS_KEY`. Единственный подтверждённый вектор закрыт
+   uid-барьером ядра; неподтвердившийся /proc-вектор — свойство среды раннера
+   с неатрибутированным механизмом, за ним следит зонд prepare.
 
 ## Решение
 

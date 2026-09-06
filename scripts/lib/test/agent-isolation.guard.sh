@@ -96,6 +96,10 @@ if dsh_agent_run test -e "$DSH_AGENT_HOME/.config/gh/hosts.yml"; then
   fail "у ревью-агента нашёлся hosts.yml — граница #18 нарушена"
 fi
 
+# 5б. Handover: воркспейс передан агенту (транспорт после этого в нём не пишет).
+[ "$(stat -c %u "$WS")" = "$(id -u "$GUARD_USER")" ] \
+  || fail "handover не передал воркспейс агент-юзеру"
+
 # 6. sudoers-файл установлен и валиден (visudo — арбитр, не наш grep).
 sudo test -f "$GUARD_SUDOERS" || fail "sudoers env_keep файл не установлен"
 sudo visudo -cf "$GUARD_SUDOERS" >/dev/null || fail "установленный sudoers-файл не валиден"

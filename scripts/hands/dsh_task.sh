@@ -288,6 +288,8 @@ touch "$START_MARK"
 # у транспорта нет права записи в каталог агента.
 dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 
 DSH_START_TS=$(date -u +%s)
 set +e
