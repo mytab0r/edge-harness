@@ -87,6 +87,7 @@ import http.cookiejar
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -100,14 +101,20 @@ from pathlib import Path
 # (пороги WORKER_FAILURE_PAUSE_AFTER / HEARTBEAT_MAX_AGE_MINUTES живут там же;
 # escalate — общий канал «поломка → задача-статус + Telegram», #120/#174;
 # пороги петли открытого PR #196 — там же: AI_REVIEW_RETRY_AFTER_MINUTES,
-# AI_REVIEW_MAX_ATTEMPTS, AI_REVIEW_RETRY_MARKER, UNHEALTHY_PR_AFTER_MINUTES).
+# AI_REVIEW_MAX_ATTEMPTS, AI_REVIEW_RETRY_MARKER, UNHEALTHY_PR_AFTER_MINUTES;
+# серия красных и её сброс мержем #220 — там же: WORKER_WORKFLOW,
+# FAILURE_CONCLUSIONS, recent_runs, RESUME_MARKER).
 from pulse_guard import (
     AI_REVIEW_MAX_ATTEMPTS,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
+    FAILURE_CONCLUSIONS,
     READY_STALL_MARKER,
+    RESUME_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
     WATCHDOG_ISSUE,
+    WORKER_WORKFLOW,
+    all_issue_comments,
     conveyor_gate,
     escalate,
     gh,
@@ -117,6 +124,8 @@ from pulse_guard import (
     minutes_between,
     parse_time,
     post_issue_comment,
+    recent_runs,
+    resume_alert_text,
     send_telegram,
 )
 # Сигнал дрейфа пина апстрима (#134): вся логика — upstream_drift.py, здесь
@@ -820,6 +829,68 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     return lines, hard_failure
 
 
+def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
+    """След аренды: работал ли прогон `worker run <run_id>` над задачей #N.
+
+    Формат следа — одно место правды в scripts/worker/task.sh (CLAIM_VIA =
+    «worker run <GITHUB_RUN_ID>», гвардия формата — в test_scheduler.py);
+    в задачу его кладёт claim_task.claim. Здесь только чтение, и чтение с
+    границей по цифре: подстрока «worker run 123» без неё совпала бы с чужим
+    следом «worker run 1234»."""
+    pattern = re.compile(rf"worker run {re.escape(str(run_id))}(?!\d)")
+    return any(
+        pattern.search(comment.get("body") or "")
+        for comment in all_issue_comments(repo, task_number)
+    )
+
+
+def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | None:
+    """#220, эвристика авто-возобновления предохранителя: слит PR задачи ветки,
+    а последний красный прогон worker.yml работал над этой же задачей — причина
+    серии с высокой вероятностью починена этим мержем, и серия сбрасывается
+    сразу, без ожидания пробы (#205). Сам сброс — success-маркер RESUME_MARKER
+    в #120: conveyor_gate считает его виртуальным success (series_anchor),
+    старые красные прогоны и маркеры прошлой серии перестают участвовать в
+    решении. Тело последнего красного прогона (display_title «worker») PR-номер
+    не несёт, поэтому связь берётся из следа аренды — единственного места, где
+    прогон и задача уже сопоставлены самим фактом захвата.
+
+    Все проверки — по фактам, не по «сейчас»: серия должна быть жива (красный
+    новее зелёного), мерж — новее начала красного прогона (красный ПОСЛЕ мержа
+    — довод «причина жива», возобновлять его мерж не даёт права), задача —
+    занята именно этим прогоном. Возвращает строку отчёта или None (связи или
+    серии нет — не событие, а не ошибка)."""
+    runs = recent_runs(repo, WORKER_WORKFLOW, per_page=10)
+    last_red = next((r for r in runs if r.get("conclusion") in FAILURE_CONCLUSIONS), None)
+    last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
+    if last_red is None:
+        return None
+    if last_ok is not None and parse_time(last_ok["created_at"]) >= parse_time(last_red["created_at"]):
+        return None  # серия закрыта зелёным прогоном — возобновлять нечего
+    merged_at = (gh(f"repos/{repo}/pulls/{pull['number']}") or {}).get("merged_at")
+    if not merged_at or parse_time(last_red["created_at"]) >= parse_time(merged_at):
+        return None  # мерж не позже красного прогона: красный уже видел фикс
+    if not run_claimed_task(repo, task_number, last_red.get("id")):
+        return None  # последний красный работал над другой задачей — связи нет
+    resume_token = f"{RESUME_MARKER} #{pull['number']}]"
+    if issue_marker_times(repo, WATCHDOG_ISSUE, resume_token):
+        return None  # сброс этим мержем уже сигналился — один сигнал на мерж
+    text = resume_alert_text(pull["number"], task_number, last_red)
+    status = escalate(repo, WATCHDOG_ISSUE, text)
+    # Сброс ДОКАЗАН маркером в #120 — судим по факту (перечитываем #120), а не
+    # по вызову escalate и не по его человеческой строке: канал best-effort и
+    # глотает отказ постинга, а парсинг прозы статуса молча ломается от любой
+    # переформулировки (тот же класс врущего отчёта, что чинили в пульсе
+    # после #318). Гейт видит только #120 — значит сброс для него существует
+    # только вместе с маркером там.
+    if not issue_marker_times(repo, WATCHDOG_ISSUE, resume_token):
+        return (f"⚠️ сброс мержем #{pull['number']} не подтверждён маркером в "
+                f"#{WATCHDOG_ISSUE} — серия НЕ снята, возобновление остаётся за "
+                f"пробой (#205); {status}")
+    return (f"🔄 серия красных {WORKER_WORKFLOW} сброшена мержем #{pull['number']} "
+            f"(задача #{task_number}; {status})")
+
+
 def after_merge(
     repo: str, pull: dict, other_pulls: list[dict] | None = None,
 ) -> tuple[list[str], list[str], bool]:
@@ -949,6 +1020,21 @@ def after_merge(
             actions.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
         else:
             actions.append("⚠️ Telegram: сообщение о слиянии не доставлено — след в задаче выше остаётся местом правды")
+    # Авто-возобновление предохранителя по мержу (#220) — только для задачи
+    # ветки (own_task): «последний красный прогон работал над этой задачей»
+    # сопоставляет след аренды с задачей именно этого PR, упоминание в прозе
+    # такой связью не является (та же узкая семантика, что у own_task выше).
+    # Best-effort, как всё after_merge: мерж уже состоялся, недоступность
+    # прогонов/маркеров его не откатывает — газ возобновления остаётся у
+    # пробы (#205), просто срабатывающей медленнее.
+    if own_task is not None:
+        try:
+            resume_line = resume_series_by_merge(repo, pull, own_task)
+        except RuntimeError as error:
+            resume_line = None
+            actions.append(f"⚠️ авто-возобновление предохранителя не сработало: {error}")
+        if resume_line:
+            actions.append(resume_line)
     # Архив сессий раннеров (#119) — только для ЗАДАЧ пула (метка task): номер из
     # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
     # его нельзя — утащим чужую живую сессию в архив.

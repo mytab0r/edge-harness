@@ -1563,6 +1563,7 @@ def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
         return []
 
     monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     issues = sch.open_task_issues(REPO)
     numbers = [issue["number"] for issue in issues]
     # Мутация 1: верни только первую страницу (уберите обход в list_pages/
@@ -1627,6 +1628,7 @@ def test_after_merge_promises_auto_close_only_for_own_branch_task(monkeypatch):
         raise AssertionError(f"нет маршрута для: {joined}")
 
     monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
@@ -1663,6 +1665,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
         raise AssertionError(f"нет маршрута для: {joined}")
 
     monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
     monkeypatch.setattr(
@@ -1744,6 +1747,7 @@ def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
         raise AssertionError(f"нет маршрута для: {joined}")
 
     monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
     monkeypatch.setattr(
@@ -1797,6 +1801,263 @@ def test_after_merge_wires_update_remaining_pulls(monkeypatch):
                          lambda repo, merged_number, others: calls.append((merged_number, others)) or ([], []))
     sch.after_merge(REPO, merged, [other])
     assert calls == [(1, [other])]
+
+
+# ── Авто-возобновление предохранителя по мержу (#220) ────────────────────────────
+# Прод-форма снята живым API 2026-09-06: worker.yml run 34011108934 (failure,
+# 04:17:03Z) — реальный красный прогон; его след аренды в #217 — реальный
+# комментарий claim_task; merged_at 04:40:56Z — реальный squash-мерж PR #445.
+# Прогон и его заголовок («worker», PR-номера не несёт) — как отдаёт GitHub.
+
+
+RESUME_RED_RUNS = {"workflow_runs": [
+    {"id": 34011108934, "conclusion": "failure", "created_at": "2026-09-06T04:17:03Z",
+     "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34011108934",
+     "display_title": "worker"},
+    {"id": 34011017990, "conclusion": "success", "created_at": "2026-09-06T04:14:57Z",
+     "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34011017990",
+     "display_title": "worker"},
+]}
+# Реально закрытая серия из живой истории worker.yml (2026-09-06): зелёная
+# проба 34007871665 (02:59:58Z) новее красного 34007508064 (02:50:34Z) —
+# порядок как отдаёт GitHub, от нового к старому.
+RESUME_CLOSED_RUNS = {"workflow_runs": [
+    {"id": 34007871665, "conclusion": "success", "created_at": "2026-09-06T02:59:58Z",
+     "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34007871665",
+     "display_title": "worker"},
+    {"id": 34007508064, "conclusion": "failure", "created_at": "2026-09-06T02:50:34Z",
+     "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34007508064",
+     "display_title": "worker"},
+]}
+# Реальный след аренды (#217, комментарий claim_task.claim через task.sh):
+CLAIM_TRACE_BODY = ("🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-217` "
+                    "(TTL 24 ч по коммиту замка). Канал: worker run 34011108934.")
+
+
+def resume_pull(number=163, task=217):
+    return pull(number, pr_body=f"#{task}\n\nРеализация.",
+                ref=f"agent/{task}-slug")
+
+
+def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
+    """#220, основной сценарий: слит PR задачи ветки (#217), последний красный
+    прогон worker.yml работал над ней (след аренды в комментариях задачи),
+    мерж новее прогона — серия сбрасывается success-маркером в #120 через
+    escalate, в отчёте названа причина. Мутация: выкинуть вызов
+    resume_series_by_merge из after_merge — тест краснеет (escalate не звался).
+    Мутация 2: в resume_series_by_merge убрать проверку следа — после
+    test_after_merge_resume_skips_without_claim_trace краснеет."""
+    merged = resume_pull()
+    # #120 — живой носитель: escalate зовётся НАСТОЯЩИЙ, постинг пишет в store,
+    # чтение дедупа и перечитывания факта сброса видят ровно то, что в нём.
+    store = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        # порядок важен: FakeGh матчит по подстроке, более частный фрагмент — раньше
+        if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            store.append({"created_at": "2026-09-06T04:41:00Z",
+                          "body": args[-1].removeprefix("body=")})
+            return None
+        if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
+            return list(store)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/217/comments"):
+            return None  # напоминание о пост-мерж проверке
+        if joined in (
+                f"repos/{REPO}/pulls/163/files?per_page=100&page=1",
+                f"repos/{REPO}/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == f"repos/{REPO}/pulls/163":
+            return {"number": 163, "merged_at": "2026-09-06T04:40:56Z"}
+        if joined == f"repos/{REPO}/issues/217/comments?per_page=100&page=1":
+            return [{"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}]
+        if joined == f"repos/{REPO}/issues/217":
+            return {**issue(217, assignees=("mytab0r",)), "state": "open"}
+        if joined == f"repos/{REPO}/actions/workflows/worker.yml/runs?per_page=10":
+            return RESUME_RED_RUNS
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    patch_gh(monkeypatch, fake_gh)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    # видимый результат: маркер реально лежит в #120 с нужным содержимым
+    assert len(store) == 1
+    assert f"{pg.RESUME_MARKER} #163]" in store[0]["body"]     # токен для gate и дедупа
+    assert "#217" in store[0]["body"] and "#163" in store[0]["body"]
+    assert any("сброшена мержем #163" in line for line in actions + observations)
+    assert any("Telegram: доставлен" in line for line in actions + observations)
+
+
+def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
+    """Красный ПОСЛЕ мержа — довод «причина жива»: прогон уже видел фикс и всё
+    равно упал, возобновлять мерж права не даёт. Мутация: убрать проверку
+    merged_at — тест краснеет (escalate зовётся)."""
+    merged = resume_pull()
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:00:00Z"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("мерж старше красного прогона — сброса быть не должно"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+def test_after_merge_resume_skips_when_series_closed(monkeypatch):
+    """Свежий зелёный прогон новее красного — серия закрыта, возобновлять
+    нечего: ни escalate, ни строки в отчёте."""
+    merged = resume_pull()
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_CLOSED_RUNS,
+        # след в формате claim_task про КРАСНЫЙ прогон этой серии: единственным
+        # несработавшим барьером остаётся проверка серии (зелёный новее красного)
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T02:51:00Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-217` "
+                     "(TTL 24 ч по коммиту замка). Канал: worker run 34007508064."}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("серия закрыта зелёным — сброса быть не должно"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
+    """Последний красный прогон работал над другой задачей (следа аренды в
+    комментариях задачи нет) — связь «мерж чинил причину» не доказана, сброс
+    был бы ложным. Мутация: убрать проверку следа — тест краснеет."""
+    merged = resume_pull()
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
+        # комментарии задач — раньше одиночного issue: фрагмент частнее, иначе
+        # GET комментариев уйдёт на маршрут одиночного issue и тест солжёт
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-217`. Канал: hands."}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("следа аренды нет — сброса быть не должно"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
+    """Один сигнал на мерж: маркер возобновления этого PR уже стоит в #120 —
+    второй после перезапуска оркестратора не пишется."""
+    merged = resume_pull()
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
+        # комментарии задач — раньше одиночного issue: фрагмент частнее
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+        f"{REPO}/issues/120/comments?per_page": [
+            {"created_at": "2026-09-06T04:41:00Z",
+             "body": pg.resume_alert_text(163, 217, None)}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сброс этим мержем уже сигналился"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypatch):
+    """Находка AI-ревью (класс #318): escalate глотает отказ постинга и
+    возвращает «след в #120: НЕ оставлен» — серия при этом реально НЕ снята
+    (гейт маркер не увидит). Отчёт не вправе утверждать «сброшена». Мутация:
+    убрать проверку статуса в resume_series_by_merge — тест краснеет."""
+    merged = resume_pull()
+    # Постинг в #120 падает ПО-НАСТОЯЩЕМУ (RuntimeError от gh): реальный
+    # escalate глотает отказ post_issue_comment — маркер не появляется.
+    fake = FakeGh({
+        f"{REPO}/pulls/163/files": [],
+        f"repos/{REPO}/pulls/163": {"number": 163, "merged_at": "2026-09-06T04:40:56Z"},
+        f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+        f"-X POST repos/{REPO}/issues/217/comments": None,
+        f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
+        f"-X POST repos/{REPO}/issues/120/comments": RuntimeError("500 постинг не прошёл"),
+        f"{REPO}/issues/120/comments?per_page": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("сброшена мержем" in line for line in actions + observations), \
+        "без маркера в #120 серия не снята — отчёт не утверждает сброс"
+    assert any("НЕ снята" in line and "#163" in line for line in actions + observations)
+    assert any("пробой (#205)" in line for line in actions + observations)  # газ возобновления назван
+
+
+def test_run_claimed_task_matches_own_run_not_prefix(monkeypatch):
+    """След сопоставляется с границей по цифре: «worker run 34011108934» —
+    про прогон ...934, и подстрока «worker run 3401110893» не должна совпасть
+    с чужим (более коротким) id. Мутация: убрать (?!\\d) — тест краснеет."""
+    fake = FakeGh({
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.run_claimed_task(REPO, 217, 34011108934) is True
+    assert sch.run_claimed_task(REPO, 217, 3401110893) is False
+    assert sch.run_claimed_task(REPO, 217, 999) is False
+
+
+def test_task_sh_composes_claim_via_worker_run_format():
+    """Гвардия формата следа по исходнику: run_claimed_task читает «worker run
+    <id>», а пишет его task.sh (CLAIM_VIA). Переименование формата в одном
+    месте без другого обязано краснить этот тест, а не молча сломать
+    эвристику #220."""
+    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text()
+    assert 'CLAIM_VIA="worker run ${GITHUB_RUN_ID' in task_sh
 
 
 # ── Гвардия холостого хода (критерий приёмки, пункт 4) ───────────────────────────
@@ -2481,7 +2742,7 @@ def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
             # старый код, теряя cf-worker/worker.js со страницы 2.
             return page1
         # Маршрут с &page=1 — pulse_guard.issue_marker_times читает через
-        # _all_issue_comments (#308/#309, слито параллельно этому PR): та же
+        # all_issue_comments (#308/#309, слито параллельно этому PR): та же
         # пагинация, что и у review_labels.list_pages, обход добавляет page=.
         if joined == f"repos/{REPO}/issues/21/comments?per_page=100&page=1":
             return []
@@ -2986,7 +3247,7 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
 
     assert hard_failure is False
     assert (observations + actions) == []
-    # только чтение маркера — pulse_guard._all_issue_comments (#308/#309)
+    # только чтение маркера — pulse_guard.all_issue_comments (#308/#309)
     # листает страницы, короткая первая страница останавливает обход сразу.
     assert fake.calls == [f"repos/{REPO}/issues/18/comments?per_page=100&page=1"]
 
