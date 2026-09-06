@@ -55,6 +55,7 @@
 - [0011. Инбокс создаёт issues под собственным узким GH_ISSUES_TOKEN](decisions/0011-inbox-issues-token.md)
 - [0012. Событийный триггер оркестратора и цикл слияний за один прогон](decisions/0012-orchestra-event-trigger-merge-loop.md)
 - [0013. Нативная GitHub Merge Queue недоступна на этом репозитории — своя очередь остаётся](decisions/0013-native-merge-queue-not-available.md)
+- [0014. Инлайн-кнопки решения владельца в Telegram: узкий webhook-секрет, не второй канал записи](decisions/0014-telegram-inline-buttons.md)
 
 ## Операционные процедуры
 

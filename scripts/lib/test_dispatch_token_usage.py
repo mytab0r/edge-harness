@@ -71,6 +71,11 @@ EXPECTED_WORKFLOWS = frozenset({
     "dispatch-latency-probe.yml",
     "hands.yml",
     "orchestra.yml",
+    # #254: repository_dispatch от морды (owner-decision), только github.token
+    # (issues: write) — тот же класс, что branch-protection-watch.yml выше:
+    # ни GH_DISPATCH_TOKEN (его читает только сама морда через fetch, не этот
+    # workflow), ни GH_PIPELINE_PAT здесь не используются.
+    "owner-decision.yml",
     "plugin-forge.yml",
     "pr-review.yml",
     "quotas.yml",

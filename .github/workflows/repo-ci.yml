@@ -99,6 +99,34 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_pulse_guard.py -q
 
+      # Гвардия «waiting:owner» (#470/#471) — метка, машиночитаемый блок
+      # вариантов, эскалация с инлайн-кнопками (#254, PR #486). Находка
+      # AI-ревью PR #486 (четвёртый заход): файл существовал, но не был
+      # подключён ни к одному workflow — тот же класс, что уже находили у
+      # test_stale_blocked_guard.py (PR #336, третий раунд) этим же приёмом.
+      - name: Тесты гвардии waiting:owner (метка, варианты, эскалация)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_waiting_owner_guard.py -q
+
+      # Применение решения владельца по нажатию кнопки (#254, PR #486):
+      # apply_owner_decision.py пишет «РЕШЕНИЕ: N» тем же способом, что
+      # ручной ответ. Не был подключён к CI (находка того же ревью, тот же
+      # заход, что и гвардия waiting:owner выше).
+      - name: Тесты применения решения владельца (owner-decision)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_apply_owner_decision.py -q
+
+      # Синхронность формата кнопки между TS и Python, и внутри самого
+      # Python (#254, PR #486, находка того же ревью): без этого шага
+      # гвардия ловит рассинхрон так же плохо, как ловили его комментарии
+      # без гвардии — тестом, который никто не запускает.
+      - name: Гвардия синхронности формата кнопки Telegram (TS ↔ Python)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_telegram_callback_format_sync.py -q
+
       # Инварианты состояния репозитория (#244): «такого состояния быть не
       # должно» — открытая задача с уже слитым PR, застрявший review:ok без
       # ai:*, полностью отмеченный незаархивированный openspec/changes, две

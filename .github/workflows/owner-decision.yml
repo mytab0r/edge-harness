@@ -1,0 +1,59 @@
+# Применение решения владельца, присланного нажатием инлайн-кнопки в Telegram
+# (#254). Морда шлёт repository_dispatch тем же узким GH_DISPATCH_TOKEN, что и
+# остальной dispatch-путь (ADR 0008: только Contents+Actions на этот
+# репозиторий) — этот job не получает НИКАКОГО нового секрета, только
+# issues:write из своих же permissions (github.token).
+#
+# Результат неотличим от ручного ответа владельца комментарием (#470/#471):
+# первая строка «РЕШЕНИЕ: N» — тот же артефакт, который снимает waiting:owner
+# гвардия scripts/orchestra/waiting_owner_guard.py (#470/#471, слит) на
+# следующем пульсе orchestra. Второй "apply"-путь здесь НЕ заводится, только
+# запись комментария (apply_owner_decision.py переиспользует post_issue_comment).
+#
+# ⚠️ repository_dispatch запускает воркфлоу только с файла на default branch
+#    (docs/research/21-github-actions.md) — до мержа этого файла в main
+#    события owner-decision принимаются GitHub API (204), но job не стартует.
+name: owner-decision
+
+on:
+  repository_dispatch:
+    types: [owner-decision]
+
+permissions:
+  # contents: read обязателен рядом с issues: write (находка ревью PR #486,
+  # третий заход) — явный блок permissions обнуляет ВСЕ остальные скоупы
+  # токена, а actions/checkout@v7 ниже клонирует репозиторий этим же
+  # github.token; без contents:read checkout падает 403, job красный
+  # каждый прогон, комментарий «РЕШЕНИЕ: N» не появляется никогда — тот же
+  # приём, что уже применяют соседние тонкие job'ы branch-protection-watch.yml
+  # и quotas.yml.
+  contents: read
+  issues: write
+
+concurrency:
+  # Сериализация по задаче: два подряд нажатия на одну и ту же задачу (двойной
+  # тап, повтор доставки) не гонятся друг с другом за порядком комментариев.
+  group: owner-decision-${{ github.event.client_payload.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Комментарий с решением владельца
+        # client_payload — через env, не подставлен в shell напрямую (тот же
+        # приём, что hands.yml/dispatch-latency-probe.yml): единственный заслон
+        # от произвольного содержимого — numeric-валидация argparse на другом
+        # конце доверия (--issue/--option: type=int), не сам workflow.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          OPTION: ${{ github.event.client_payload.option }}
+        run: |
+          python3 scripts/orchestra/apply_owner_decision.py \
+            --repo "$REPO" \
+            --issue "$ISSUE_NUMBER" \
+            --option "$OPTION"

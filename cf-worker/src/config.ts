@@ -110,6 +110,39 @@ export const GITHUB = {
   dispatchEventType: "harness-task",
 } as const;
 
+/** Инлайн-кнопки решения владельца в Telegram (#254). callback_data ограничен
+ *  64 байтами (лимит Bot API) — формат `{callbackPrefix}:<issue>:<option>`
+ *  укладывается с большим запасом даже при 10-значном номере issue и
+ *  двузначном номере варианта (не подтверждено больше пары цифр вариантов —
+ *  UI не предполагает десятки кнопок в одном сообщении). */
+export const TELEGRAM = {
+  apiBase: "https://api.telegram.org",
+  /** Заголовок вебхука Telegram (`setWebhook(secret_token=...)`), которым
+   *  морда отличает настоящий апдейт от чужого POST на тот же путь. */
+  webhookSecretHeader: "X-Telegram-Bot-Api-Secret-Token",
+  /** Префикс callback_data — не про секретность, а разбор формата. Значение
+   *  обязано совпасть с Python-стороной (scripts/orchestra/pulse_guard.py::
+   *  OWNER_DECISION_CALLBACK_PREFIX, строит клавиатуру) — синхронность
+   *  проверяет scripts/lib/test_telegram_callback_format_sync.py (#254,
+   *  находка ревью PR #486: раньше расхождение не ловилось ничем — юнит-
+   *  тесты каждой стороны прибиты к своему литералу). */
+  callbackPrefix: "wo",
+  /** event_type repository_dispatch, которым решение владельца уходит в
+   *  тонкий job (только issues:write, .github/workflows/owner-decision.yml) —
+   *  НЕ переиспользует GITHUB.dispatchEventType: тот поднимает полноценный
+   *  DSH-джоб hands.yml, здесь только один комментарий в issue. */
+  ownerDecisionDispatchType: "owner-decision",
+  /** Первая строка комментария — единственный формат, который (по решению
+   *  #470/#471) снимает метку waiting:owner: гвардия waiting_owner_guard.py
+   *  (#470/#471, слит) читает его на следующем пульсе orchestra. Кнопка
+   *  производит тот же артефакт, что и ручной ответ владельца, второй способ
+   *  применения не заводится. Ни один TS-код это значение не читает — пишет
+   *  его Python (pulse_guard.py::DECISION_COMMENT_PREFIX), константа здесь
+   *  документирует контракт формата и сверяется тем же
+   *  test_telegram_callback_format_sync.py, что и callbackPrefix выше. */
+  decisionCommentPrefix: "РЕШЕНИЕ",
+} as const;
+
 /** Ретеншн DO SQLite (#306/#305): без него `events`/`tasks` растут вечно, и
  *  любой скан со временем дорожает — тот же класс, что подпалил суточную квоту
  *  rows_read (#320, docs/research/20-cloudflare-free.md, раздел «Инцидент:

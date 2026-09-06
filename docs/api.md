@@ -37,7 +37,7 @@ POST — задача в очередь + repository_dispatch (без GH_DISPATC
 
 ## `POST /api/messages/ingest`
 
-Приём сообщения владельца в инбокс (#20) под обычной авторизацией — эндпоинт админско-релейный; прямая доставка вебхуком Telegram не подключена. Понимает плоскую форму (source, source_msg_id, chat_id, sender_id, sender_name, text) и сырой Telegram update (update_id, message.from/chat — числа приводятся к строкам). Ключ идемпотентности: source_msg_id, иначе update_id, иначе message.message_id; без идентификатора — 400 need_source_msg_id. Возвращает {message_id, status: accepted|exists}.
+Приём сообщения владельца в инбокс (#20) под обычной авторизацией (Bearer/кука) ИЛИ заголовком X-Telegram-Bot-Api-Secret-Token, равным TELEGRAM_WEBHOOK_SECRET (#254) — второй способ авторизует только этот маршрут, не остальной API. Понимает плоскую форму (source, source_msg_id, chat_id, sender_id, sender_name, text), сырой Telegram update сообщения (update_id, message.from/chat — числа приводятся к строкам) и update с callback_query (нажатие инлайн-кнопки решения владельца #470/#471: callback_data `wo:<issue>:<option>`) — обрабатывается отдельно, отвечает answerCallbackQuery/editMessageText через TELEGRAM_BOT_TOKEN и уходит repository_dispatch'ем (event_type owner-decision) в комментарий-решение. Ключ идемпотентности сообщения: source_msg_id, иначе update_id, иначе message.message_id; без идентификатора — 400 need_source_msg_id. Возвращает {message_id, status: accepted|exists} для сообщений и {status: callback_processed|...} для callback_query.
 
 ## `GET/POST /api/messages`
 

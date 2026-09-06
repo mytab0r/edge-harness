@@ -576,7 +576,7 @@ def post_issue_comment(repo: str, issue_number: int, text: str) -> None:
     gh("-X", "POST", f"repos/{repo}/issues/{issue_number}/comments", "-f", "body=" + text)
 
 
-def send_telegram(text: str, as_html: bool = False) -> bool:
+def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
     канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
 
@@ -588,7 +588,11 @@ def send_telegram(text: str, as_html: bool = False) -> bool:
     (заголовки прогонов, причины сбоев) больше не могут развалить доставку
     случайным < или &. as_html=True — текст уже собран как Telegram-HTML
     (merge_telegram_text): его динамические части обязаны были пройти tg_html
-    у сборщика, повторное экранирование убило бы ссылки."""
+    у сборщика, повторное экранирование убило бы ссылки.
+
+    reply_markup (#254) — инлайн-клавиатура решения владельца (см.
+    build_decision_keyboard); необязательна, обычные алерты её не передают —
+    сигнатура обратно совместима, поведение существующих вызовов не меняется."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
@@ -596,15 +600,15 @@ def send_telegram(text: str, as_html: bool = False) -> bool:
               file=sys.stderr)
         return False
     payload_text = text if as_html else tg_html(text)
+    args = ["curl", "-fsS", "--max-time", "30", "-X", "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            "--data-urlencode", f"chat_id={chat}",
+            "--data-urlencode", "parse_mode=HTML",
+            "--data-urlencode", f"text={payload_text}"]
+    if reply_markup is not None:
+        args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
     try:
-        result = subprocess.run(
-            ["curl", "-fsS", "--max-time", "30", "-X", "POST",
-             f"https://api.telegram.org/bot{token}/sendMessage",
-             "--data-urlencode", f"chat_id={chat}",
-             "--data-urlencode", "parse_mode=HTML",
-             "--data-urlencode", f"text={payload_text}"],
-            capture_output=True, text=True,
-        )
+        result = subprocess.run(args, capture_output=True, text=True)
     except OSError as error:
         print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
         return False
@@ -614,19 +618,67 @@ def send_telegram(text: str, as_html: bool = False) -> bool:
     return True
 
 
-def escalate(repo: str, issue_number: int, text: str) -> str:
+# Префикс комментария-решения — то же значение, что cf-worker/src/config.ts::
+# TELEGRAM.decisionCommentPrefix (пишет apply_owner_decision.py) и что разбирает
+# scripts/orchestra/waiting_owner_guard.py::DECISION_MARKER_RE (#471, слит) —
+# одно место правды по формату в Python-стороне этого модуля. Синхронность с
+# config.ts проверяет scripts/lib/test_telegram_callback_format_sync.py (#254,
+# находка ревью PR #486: раньше это утверждалось прозой без гвардии — тест
+# юнит-стороны Python и юнит-тест TS проверяли один и тот же литерал каждый
+# сам по себе, ни один не читал оба исходника, рассинхрон прошёл бы CI зелёным).
+DECISION_COMMENT_PREFIX = "РЕШЕНИЕ"
+
+# Префикс callback_data — то же значение, что cf-worker/src/config.ts::
+# TELEGRAM.callbackPrefix (разбирает cf-worker/src/harness.ts::
+# parseOwnerDecisionCallback) — синхронность проверяет тот же
+# test_telegram_callback_format_sync.py, что и DECISION_COMMENT_PREFIX выше.
+# Лимит байт — свойство Bot API, не выбор репозитория, сверять нечего (см.
+# докстринг гвардии).
+OWNER_DECISION_CALLBACK_PREFIX = "wo"
+TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+
+
+def build_decision_keyboard(issue_number: int, options: list[str]) -> dict:
+    """Инлайн-клавиатура решения владельца (#254): одна кнопка на вариант,
+    подпись — сам текст варианта (владелец видит формулировку, не номер),
+    callback_data — `wo:<issue>:<option>` (1-based номер, тот же формат
+    разбирает cf-worker). Каждая кнопка — отдельная строка клавиатуры: у
+    Telegram узкий экран, а вариантов решения обычно 2-4, не про экономию
+    места в ряд. Вызывается из waiting_owner_guard.py (#470/#471) для задач с
+    машиночитаемым блоком «## Варианты владельца»."""
+    if not options:
+        raise ValueError("build_decision_keyboard: нужен хотя бы один вариант")
+    keyboard = []
+    for i, option in enumerate(options, start=1):
+        callback_data = f"{OWNER_DECISION_CALLBACK_PREFIX}:{issue_number}:{i}"
+        assert len(callback_data.encode("utf-8")) <= TELEGRAM_CALLBACK_DATA_MAX_BYTES, (
+            f"callback_data превышает лимит Bot API 64 байта: {callback_data!r}"
+        )
+        keyboard.append([{"text": option, "callback_data": callback_data}])
+    return {"inline_keyboard": keyboard}
+
+
+def escalate(repo: str, issue_number: int, text: str, options: list[str] | None = None) -> str:
     """Канал эскалации поломок — общий с предохранителем конвейера: комментарий
     в задачу-статус + Telegram, best-effort по каждому (см. send_telegram).
     Переиспользуется вне пары «предохранитель/пульс» (scheduler.archive_runner_sessions,
     #119/#174) — нельзя заводить второй канал для того же класса «поломка после
-    мержа», один канал решения уже есть."""
+    мержа», один канал решения уже есть.
+
+    options (#254) — перечисленные варианты решения владельца (из блока
+    «## Варианты владельца», waiting_owner_guard.py): если заданы, Telegram-
+    сообщение уходит с инлайн-кнопками (build_decision_keyboard), иначе
+    поведение не меняется (обычный текстовый алерт, как раньше)."""
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
     except RuntimeError as error:
         print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
         posted = False
-    delivered = send_telegram(text)
+    delivered = (
+        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
+        if options else send_telegram(text)
+    )
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
             f"след в #{issue_number}: {'оставлен' if posted else 'НЕ оставлен'}")
 
