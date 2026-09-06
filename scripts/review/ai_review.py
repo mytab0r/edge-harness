@@ -150,6 +150,11 @@ FENCE_CLOSE_RE = re.compile(r"^`{4,}\s*$")
 # регэкспа, чтобы разбор поля diff не разошёлся между читателем и писателем.
 FACT_RE = review_labels.FACT_RE
 header_facts = review_labels.header_facts
+# transport_failed/reason_tag — одно место правды в review_labels.py (#431):
+# scheduler.trigger_ai_review читает тот же тег из шапки комментария
+# (facts["reason"]), второй копии классификации не заводим.
+transport_failed = review_labels.transport_failed
+reason_tag = review_labels.reason_tag
 
 
 def gh(*args: str) -> dict | list:
@@ -196,21 +201,6 @@ def parse_verdict(answer: str) -> str:
     if len(marks) == 1 and lines and VERDICT_RE.match(lines[-1]):
         return marks[0]
     return "error"
-
-
-def transport_failed(dsh_rc: str) -> bool:
-    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
-
-    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
-    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
-    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
-    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
-    точный «модель ответила не по контракту» в редком крайнем случае.
-    """
-    try:
-        return int(dsh_rc) != 0
-    except (TypeError, ValueError):
-        return False
 
 
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
@@ -397,7 +387,8 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
                   tasks: list[dict], diff_fp: str | None = None,
-                  remarks: list[dict] | None = None) -> str:
+                  remarks: list[dict] | None = None,
+                  reason_tag_value: str | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -420,10 +411,17 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     remarks — блоки ЗАМЕЧАНИЕ (#462, третья категория находок): сам чеклист
     живёт в ТЕЛЕ PR (review_checklist.merge_checklist, отдельный PATCH), не
     здесь — комментарий только указывает, что чеклист обновлён, чтобы автор
-    не искал замечания в прозе комментария, которую отсюда убрал findings_of."""
+    не искал замечания в прозе комментария, которую отсюда убрал findings_of.
+
+    reason_tag_value — тег причины verdict=error (review_labels.reason_tag,
+    #431): факт `reason:` в шапке, который scheduler.trigger_ai_review читает
+    для решения о бюджете автоповторов. None (verdict != "error" или вызов
+    без классификации) не добавляет строку — та же обратная совместимость,
+    что у diff_fp."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
+    reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
     head = (
-        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
+        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}{reason_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -739,6 +737,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     reason = error_reason(answer, args.dsh_rc, args.failure_reason) if verdict == "error" else None
     if reason and not findings.strip():
         findings = reason
+    # Тег для шапки комментария (#431) — независимо от findings/reason (та
+    # проза может оказаться текстом самой модели, а не error_reason, см.
+    # review_labels.FAILURE_REASON_* докстринг): scheduler.trigger_ai_review
+    # решает бюджет автоповторов по структурному факту `reason:`, не по
+    # пересказу.
+    reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason) if verdict == "error" else None
 
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     if pull["head"]["sha"] != args.head:
@@ -808,7 +812,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
     # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp, remarks=remarks)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
+                          remarks=remarks, reason_tag_value=reason_tag_value)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 

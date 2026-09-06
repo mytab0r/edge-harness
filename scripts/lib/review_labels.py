@@ -49,6 +49,22 @@ AI_CHANGES = "ai:changes-requested"
 AI_FAILED = "ai:failed"
 AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 
+# ── Классификация причины verdict=error (#431) ───────────────────────────────
+# Четыре состояния transport_failed/error_reason различают уже с #419 —
+# reason_tag ниже даёт им короткие теги, чтобы их читал не только человек
+# (findings — проза), но и scheduler.trigger_ai_review (факт `reason:` в
+# шапке комментария, см. FACT_RE/header_facts): «квота исчерпана на неделю»
+# и «модель ответила криво» — разные вещи и заслуживают разного числа
+# автоповторов, а парсить прозу findings для этого решения нельзя — находка
+# #431 на PR #329: findings там оказался ПРОЗОЙ МОДЕЛИ ("Установка прошла
+# неполно..."), а не текстом error_reason, потому что reason подставляется в
+# findings, только если findings пуст (см. ai_review.cmd_verdict) — прод-
+# форма подтверждает: решение обязано читать структурный факт, не пересказ.
+FAILURE_REASON_QUOTA_EXHAUSTED = "quota_exhausted"
+FAILURE_REASON_RATE_LIMIT_BUDGET = "rate_limit_retry_budget_exceeded"
+FAILURE_REASON_TRANSPORT = "transport_error"
+FAILURE_REASON_CONTRACT = "contract_violation"
+
 # ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
 # Единственное определение (было задублировано локальной константой в
 # scheduler.py) — should_update_branch ниже читает её же.
@@ -353,11 +369,46 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 
 
 # Шапка-факты ревью-комментария: pr/head/reviewer (ai_review.build_comment)
-# плюс diff — отпечаток diff_fingerprint на момент вердикта (#252). Разбор
-# останавливается на первой пустой строке, чтобы проза/фенсы ниже не
+# плюс diff — отпечаток diff_fingerprint на момент вердикта (#252), плюс
+# reason — тег причины verdict=error (#431, см. FAILURE_REASON_* выше).
+# Разбор останавливается на первой пустой строке, чтобы проза/фенсы ниже не
 # притворялись фактами (см. header_facts). Одно место правды — раньше жило
 # только в ai_review.py, check_pr.py читало бы вторую копию regex.
-FACT_RE = re.compile(r"^(pr|head|reviewer|diff):\s*(.+)$")
+FACT_RE = re.compile(r"^(pr|head|reviewer|diff|reason):\s*(.+)$")
+
+
+def transport_failed(dsh_rc: str) -> bool:
+    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
+
+    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
+    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
+    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
+    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
+    точный «модель ответила не по контракту» в редком крайнем случае.
+
+    Одно место правды (#431): раньше жила только в ai_review.py — scheduler
+    (reason_tag ниже) теперь тоже классифицирует по ней, второй копии не
+    заводим (ai_review.transport_failed — реэкспорт отсюда, как и header_facts)."""
+    try:
+        return int(dsh_rc) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def reason_tag(dsh_rc: str, failure_reason: str = "") -> str:
+    """Короткий машиночитаемый тег причины verdict=error — одно из
+    FAILURE_REASON_* выше. Пара к ai_review.error_reason (тот же порядок
+    проверки и те же входы), но возвращает тег для шапки комментария
+    (`reason:`, см. FACT_RE), не текст для человека — scheduler.trigger_ai_review
+    (#431) решает по тегу, не по прозе findings (findings может оказаться
+    и текстом самой модели, см. FAILURE_REASON_* докстринг выше)."""
+    if failure_reason == FAILURE_REASON_QUOTA_EXHAUSTED:
+        return FAILURE_REASON_QUOTA_EXHAUSTED
+    if failure_reason == FAILURE_REASON_RATE_LIMIT_BUDGET:
+        return FAILURE_REASON_RATE_LIMIT_BUDGET
+    if transport_failed(dsh_rc):
+        return FAILURE_REASON_TRANSPORT
+    return FAILURE_REASON_CONTRACT
 
 # ── Автор вердикта — не любой комментатор (дыра, найдена вердиктом ai-review
 # PR #294, у неё выше приоритет, чем у самого #294) ──────────────────────────

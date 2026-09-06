@@ -1000,10 +1000,14 @@ def test_trigger_ai_review_silent_when_changes_requested(monkeypatch):
     assert fake.calls == []
 
 
-def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
+def test_trigger_ai_review_stops_after_max_attempts_and_escalates(monkeypatch):
+    # #431: исчерпание бюджета — тормоз без газа, если молчит. Теперь
+    # эскалирует тем же каналом, что предохранитель конвейера, вместо тихой
+    # строки в отчёте, которую никто не читает.
     p = pull(163, labels=["review:ok"])
     # AI_REVIEW_MAX_ATTEMPTS маркеров уже стоит в комментариях — прод-форма
-    # ответа issues/{n}/comments (голый массив объектов с created_at/body).
+    # ответа issues/{n}/comments (голый массив объектов с created_at/body),
+    # все ПОСЛЕ якоря текущей эпохи (09:00) — считаются как есть.
     comments = [
         {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
         for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
@@ -1011,16 +1015,135 @@ def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
     fake = FakeGh({
         "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
         "issues/163/comments": comments,
+        "issues/120/comments": [],  # WATCHDOG_ISSUE — эскалации ещё не было
     })
     patch_gh(monkeypatch, fake)
-    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем в PR"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
     assert not any("dispatches" in c for c in fake.calls)  # квота не жжётся дальше
-    # #456: «не дёргаю снова» ничего не меняет — наблюдение, не действие.
-    assert any("нужен человек" in line for line in observations)
+    # #456: сама эскалация меняет состояние (issue-комментарий) — действие,
+    # а не наблюдение.
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and str(sch.AI_REVIEW_MAX_ATTEMPTS) in escalated[0][2]
+    assert any("эскалировано" in line for line in actions)
+    assert observations == []
+
+
+def test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Уже эскалировали в этой эпохе — второй раз молчим (идемпотентность по
+    # PR+эпоха, тот же приём, что READY_STALL_MARKER/#269).
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
+        for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
+    ]
+    marker = f"{sch.AI_REVIEW_EXHAUSTED_MARKER} #163"
+    fake = FakeGh({
+        "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
+        "issues/163/comments": comments,
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T11:30:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert any("уже эскалировано" in line for line in observations)
     assert actions == []
+
+
+def test_trigger_ai_review_resets_attempt_budget_on_new_epoch(monkeypatch):
+    # Мутация класса #431 (живой случай #249): без сброса по эпохе маркеры
+    # ДВУХ РАЗНЫХ эпох суммируются в один общий счётчик и запирают PR
+    # навсегда. Здесь 2 старых маркера — из ПРОШЛОЙ эпохи (якорь 09:00,
+    # PR ещё не был перелейблован), 1 — из ТЕКУЩЕЙ (якорь 15:00). Итого
+    # исторически 3 (= AI_REVIEW_MAX_ATTEMPTS), но в текущей эпохе — только 1:
+    # бюджет обязан позволить ещё один автоповтор.
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": "2026-09-02T09:30:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 0"},
+        {"created_at": "2026-09-02T09:45:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 1"},
+        {"created_at": "2026-09-02T15:20:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 2"},
+    ]
+    fake = FakeGh({
+        "issues/163/timeline": timeline_with_review_ok("2026-09-02T15:00:00Z"),
+        "issues/163/comments": comments,
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет этой эпохи не исчерпан — эскалации нет"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    sch.trigger_ai_review(REPO, now, [p])
+    dispatch_calls = [c for c in fake.calls if "ai-review.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert posted and "попытка 2/3" in posted[0][1]
+
+
+def test_trigger_ai_review_dispatches_on_ai_failed_without_reason_fact_backward_compat(monkeypatch):
+    # Комментарий до #431 не несёт факта reason: — latest_ai_failure_reason
+    # обязан вернуть None (не притвориться, что причина известна), решение
+    # принимается по общему бюджету, как раньше (никакой quota-эскалации).
+    p = pull(178, labels=["review:ok", "ai:failed"])
+    old_verdict_comment = {
+        "created_at": "2026-09-01T22:40:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "pr: 178\nhead: sha178\nreviewer: error\n\n🤖 AI-ревью — второй гейт (#18). Вердикт: error.",
+    }
+    fake = FakeGh({
+        "issues/178/timeline": timeline_with_review_ok("2026-09-01T22:37:09Z"),
+        "issues/178/comments": [old_verdict_comment],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("причина неизвестна — не наш класс, обычный путь"))
+
+    now = utc(2026, 9, 1, 23, 30)
+    sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+def test_trigger_ai_review_quota_exhausted_escalates_without_spending_attempt(monkeypatch):
+    # quota_exhausted (#419/#431) — ждать внутри CI бессмысленно, автоповтор
+    # не тратится вовсе, эскалация с первого обнаружения в эпохе.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR — эскалация, не ретрай"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and "квота" in escalated[0][2]
+    assert any("квота провайдера исчерпана" in line for line in actions)
 
 
 def timeline_with_review_large_only(when: str):
