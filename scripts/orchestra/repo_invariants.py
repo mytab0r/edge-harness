@@ -27,8 +27,10 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      через подстрочный scan("..."). #247 заменил scan() на
      scripts/lib/free_task.py::free_candidates — тот же критерий, что и
      метод A, сравнивать стало не с чем (тавтология), класс закрыт.
-  3. check_stuck_review_gate — review:ok стоит дольше порога без НИКАКОГО
-     ai:*-вердикта (класс #147, сутки простоя). Порог — существующее место
+  3. check_stuck_review_gate — гейт 1 (review:ok/review:large) отработал
+     дольше порога без НИКАКОГО ai:*-вердикта (класс #147, сутки простоя;
+     #432 — гейт 1 считается отработавшим и по review:large, не только по
+     review:ok). Порог — существующее место
      правды pulse_guard.UNHEALTHY_PR_AFTER_MINUTES, своего числа не заводим.
   4. check_unarchived_complete_changes — openspec/changes/<id>/tasks.md
      полностью отмечен, а каталог не в openspec/changes/archive/.
@@ -44,6 +46,15 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      перечисляемый набор scope Actions) — включается только вручную
      (`--check-branch-protection`, admin-токен владельца), см. docstring
      build_report.
+  7. check_ambiguous_artifact_phrase (#219) — ни один *.md репозитория не
+     содержит двусмысленной формулы принадлежности плагина (читалась двумя
+     способами — «артефакт уже есть у владельца» против «наш, пишем мы»;
+     цена: готовая ротация учёток пять суток лежала неподключённой, #215).
+     Включён в CI_GATING сразу при создании: на момент включения ноль
+     нарушений — фраза вычищена тем же PR, что и правило (#219). Честная
+     граница: общий класс «утверждение о готовом артефакте без адреса»
+     статически не выразим и этой гвардией НЕ покрыт — правило держится на
+     ревью (AGENTS.md), инвариант закрывает только саму формулу.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -114,18 +125,32 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
-# Номер задачи, ОБЪЯВЛЕННЫЙ первой строкой тела PR — одно место правды (#187,
-# #195, #251, #312), не второе определение того же правила здесь (находка
-# ревью PR #249): собственный `_BARE_TASK_REF_RE`/`primary_declared_task` не
-# вырезал HTML-комментарии, а `.github/PULL_REQUEST_TEMPLATE.md` начинается
-# именно с такого комментария — инвариант 1 не видел НИ ОДНОГО штатного PR,
-# открытого через веб-форму по шаблону (только руками написанные тела вида
-# голого "#N"), то есть слеп именно к классу #18/#21/#78, ради которого
-# заведён.
+# Номер задачи PR — одно место правды, `task_ref.resolve_pr_task` (#394,
+# решение владельца 2026-09-06: только имя agent-ветки, тело PR не читается
+# вовсе). До #394 инвариант 1 держал собственный `primary_declared_task`
+# (декларация первой строкой тела, симметрично тогдашнему contract_check.py)
+# — после того как контракт перестал читать тело, второе определение того же
+# правила здесь стало бы расхождением: PR может быть слит без единого номера
+# в теле (шаблон прямо говорит, что «#N» — для человека, не источник истины),
+# и инвариант 1 снова ослеп бы, теперь по новой причине. Резолвим тем же
+# вызовом, что и контракт.
 _TR_SPEC = importlib.util.spec_from_file_location(
     "task_ref", REPO_ROOT / "scripts" / "lib" / "task_ref.py")
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
 _TR_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
+
+# ACCEPTANCE_PARTIAL_MARKER/ACCEPTANCE_FAIL_MARKER — только константы текста
+# маркера приёмки (не вызов её функций, circular import: scheduler.py не
+# импортирует repo_invariants, но держим импорт узким по духу остальных
+# ленивых importlib выше). Нужны инварианту 1 (#467, см.
+# check_reopened_after_merge) — приёмка (accept_merged_tasks) уже ставит
+# такой маркер на задачу, когда сама вынесла терминальный вердикт по
+# конкретному слитому PR; одно место правды на текст маркера, не вторая копия
+# строки здесь.
+_SCH_SPEC = importlib.util.spec_from_file_location(
+    "scheduler", REPO_ROOT / "scripts" / "orchestra" / "scheduler.py")
+scheduler = importlib.util.module_from_spec(_SCH_SPEC)
+_SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
@@ -153,7 +178,7 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # 1, 2, 5 остаются наблюдательными по исходному решению владельца (см.
 # docstring выше). Включение любого номера — явная правка этой константы
 # после проверки условия.
-CI_GATING: frozenset[int] = frozenset({4})
+CI_GATING: frozenset[int] = frozenset({4, 7})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -167,6 +192,11 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
     4: "перенеси openspec/changes/<id> в openspec/changes/archive/ (создай "
        "каталог, если его ещё нет) — раздел полностью выполнен, самое время "
        "заархивировать",
+    7: "переформулируй однозначно — «артефакт владельца по адресу X» либо "
+       "«наш плагин (пишем мы, не апстрим)»; правило — AGENTS.md, "
+       "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
+       "Если формулировка нужна как цитата самого инцидента — расширь паттерн "
+       "инварианта осознанно, с комментарием, почему цитата безопаснее",
 }
 
 
@@ -174,35 +204,59 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
 # Инвариант 1: открытая задача без исполнителя, чей PR уже слит
 # ══════════════════════════════════════════════════════════════════════════
 
-def primary_declared_task(body: str) -> int | None:
-    """Задача, объявленная ПЕРВОЙ непустой строкой тела PR (после вырезания
-    HTML-комментариев) — тонкая обёртка над `task_ref.declared_tasks`, одним
-    и тем же правилом с `contract_check.py` (симметрия: инвариант 1 не должен
-    видеть декларацию иначе, чем видит её контракт при мерже). НЕ
-    `extract_task_refs`/`references_task` (широкая семантика «упомянута где
-    угодно в прозе») — живая находка PR #137 показала, зачем: перенос строки
-    внутри абзаца уронил `#119 из пула...` на отдельную строку, и наивный
-    скан «первая строка с `#`» принял бы её за декларацию, хотя реальная
-    первая строка тела — `#18`. `declared_tasks` уже закрывает этот класс
-    (останавливается на первой непустой строке, не сканирует дальше, если она
-    не декларация)."""
-    declared = task_ref.declared_tasks(body or "")
-    return declared[0] if declared else None
 
 
-def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
-    """Открытая задача task без assignee, для которой уже есть слитый PR,
-    декларировавший её первой строкой. Механизм инцидента: reap_stale
+def _acceptance_already_verdicted(repo: str, issue_number: int, pr_number: int) -> bool:
+    """Приёмка (scheduler.accept_merged_tasks) уже написала терминальный
+    вердикт по ИМЕННО ЭТОМУ слитому PR — ACCEPTANCE_PARTIAL_MARKER («требует
+    проверки человеком») или ACCEPTANCE_FAIL_MARKER («доработка»), оба вместе
+    со снятием assignee как часть штатного пути приёмки, а не как «никем не
+    замеченный пробел» (#467, см. check_reopened_after_merge). Текст маркера
+    строится тем же способом, что и сама приёмка (f"{MARKER} PR #{n}") — одно
+    место правды на форму строки, не вторая копия здесь.
+
+    RuntimeError (комментарии не прочитаны — сеть/права) не глотаем молча:
+    возвращаем False, чтобы инвариант сработал и не спрятал реальный сбой
+    чтения за тишиной "уже обработано"."""
+    for marker_const in (scheduler.ACCEPTANCE_PARTIAL_MARKER, scheduler.ACCEPTANCE_FAIL_MARKER):
+        marker = f"{marker_const} PR #{pr_number}"
+        try:
+            if issue_marker_times(repo, issue_number, marker):
+                return True
+        except RuntimeError:
+            return False
+    return False
+
+
+def check_reopened_after_merge(repo: str, open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
+    """Открытая задача task без assignee, для которой уже есть слитый PR
+    этой задачи (`task_ref.resolve_pr_task` по имени ветки). Механизм инцидента: reap_stale
     (scheduler.py) смотрит только ОТКРЫТЫЕ PR — если PR уже слит, «нет
     открытого PR, ссылающегося на задачу» читается как «работа брошена», и
     assignee снимается ДАЖЕ когда работа честно завершена, просто исполнитель
     ещё не сделал пост-мерж проверку и не закрыл issue. Свободная задача с
     уже слитым PR — именно то состояние, в котором free_task()/
-    dispatch_worker выберут её заново (класс #18/#21/#78)."""
-    unassigned = {t["number"]: t for t in open_tasks if not t["assignees"]}
+    dispatch_worker выберут её заново (класс #18/#21/#78).
+
+    Два исключения (#467, живой случай: 6 задач в одном алерте, растёт без
+    возврата — «тормоз без газа»):
+
+    - WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача из пула;
+      accept_merged_tasks её тоже явно пропускает (см. её докстринг), эта
+      проверка не пропускала — сама WATCHDOG_ISSUE однажды оказалась в
+      списке нарушителей своего же канала эскалации.
+    - Задача, по которой приёмка УЖЕ вынесла терминальный вердикт для
+      именно этого слитого PR (см. _acceptance_already_verdicted) — это не
+      тихий пробел, который ловит инвариант 1, а уже озвученный исход:
+      либо ждёт решения человека (маркер называет причину прямо в этой же
+      задаче), либо ждёт НОВОГО PR от воркера (fail — штатный путь назад в
+      пул, не нарушение). Без этого исключения список нарушителей растёт
+      монотонно на каждый цикл приёмки без возврата."""
+    unassigned = {t["number"]: t for t in open_tasks
+                  if not t["assignees"] and t["number"] != WATCHDOG_ISSUE}
     by_task: dict[int, list[dict]] = {}
     for pull in merged_pulls:
-        declared = primary_declared_task(pull.get("body") or "")
+        declared = task_ref.resolve_pr_task(pull)
         if declared is not None:
             by_task.setdefault(declared, []).append(pull)
 
@@ -211,6 +265,8 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
         if number not in unassigned:
             continue
         newest = max(pulls, key=lambda p: p["merged_at"])
+        if _acceptance_already_verdicted(repo, number, newest["number"]):
+            continue
         violations.append({
             "issue": number,
             "title": unassigned[number]["title"],
@@ -239,29 +295,35 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 3: review:ok без вердикта ai:* дольше порога
+# Инвариант 3: гейт 1 отработал без вердикта ai:* дольше порога
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def last_review_ok_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент последней простановки review:ok — весь таймлайн через
+def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки вердикта гейта 1 (review:ok ИЛИ
+    review:large — review_labels.GATE1_LABELS, #432) — весь таймлайн через
     review_labels.list_timeline, не сырая первая страница `per_page=100`
     (находка AI-ревью PR #249: у долгоживущего PR, который сам же разгоняют
     авто-повторы #196, событие `labeled` уезжает за первую сотню — сырой
     вызов возвращал None и застрявший гейт молча пропускался, ровно тот
-    класс, который #303 уже закрыл для scheduler.last_review_ok_labeled_at
-    той же функцией; копия здесь была рассинхронизирована с исправлением)."""
+    класс, который #303 уже закрыл для scheduler.last_gate1_labeled_at той же
+    функцией; копия здесь была рассинхронизирована с исправлением — и снова
+    разошлась на #432, только на смотрящей метке, не на пагинации: старая
+    версия смотрела ТОЛЬКО на review:ok, поэтому PR с review:large и без
+    единой ai:*-метки был невидим этому инварианту тем же классом, каким
+    scheduler.trigger_ai_review был невидим PR #412)."""
     timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
         if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == review_labels.REVIEW_OK
+        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
     ]
     return parse_time(max(labeled_at)) if labeled_at else None
 
 
 def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) -> list[dict]:
-    """review:ok стоит дольше UNHEALTHY_PR_AFTER_MINUTES, и НИ ОДНОЙ ai:*
+    """Гейт 1 отработал (review:ok ИЛИ review:large, review_labels.
+    gate1_decided, #432) дольше UNHEALTHY_PR_AFTER_MINUTES, и НИ ОДНОЙ ai:*
     метки ещё нет. scheduler.trigger_ai_review (#196) уже пытается сам
     перезапустить ai-review.yml на меньшем пороге
     (AI_REVIEW_RETRY_AFTER_MINUTES) с ограничением попыток
@@ -272,9 +334,9 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     violations = []
     for pull in open_pulls:
         labels = {label["name"] for label in pull["labels"]}
-        if review_labels.REVIEW_OK not in labels or labels & ai_labels:
+        if not review_labels.gate1_decided(labels) or labels & ai_labels:
             continue
-        labeled_at = last_review_ok_labeled_at(repo, pull["number"])
+        labeled_at = last_gate1_labeled_at(repo, pull["number"])
         if labeled_at is None:
             continue
         age = minutes_between(labeled_at, now)
@@ -503,6 +565,52 @@ def check_branch_protection_drift(protection: dict) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 7: двусмысленная формула принадлежности плагина (#219)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Правило AGENTS.md «Утверждение о готовом артефакте обязано нести его адрес»
+# в общем виде статически НЕ выразимо — оно про смысл текста, и этот инвариант
+# не претендует на его покрытие (правило держится на ревью, честно). Гвардится
+# узкий класс, оплаченный задачей #219: формула принадлежности плагина вида
+# «плагин + словоформа + „владельца“», читавшаяся двумя способами — «артефакт
+# уже есть у владельца» против «наш, пишем мы». Из-за этого исполнители и
+# владелец одновременно ждали работу друг от друга, и готовая ротация учёток
+# пять суток лежала неподключённой (#215). Формула запрещена к употреблению
+# вовсе: вместо неё — «артефакт владельца по адресу X» либо «наш плагин
+# (пишем мы, не апстрим)». Паттерн объявлен один раз здесь; дословно формулу
+# нигде не пишем (включая этот файл), чтобы будущий рефакторинг сканера не
+# поймал инвариант на его собственном исходнике.
+_AMBIGUOUS_ARTIFACT_PHRASE = re.compile(r"плагин\w*\s+владельца", re.IGNORECASE)
+_SCAN_SKIP_DIRS = frozenset({".git", "node_modules"})
+
+
+def check_ambiguous_artifact_phrase(docs_root: Path) -> list[dict]:
+    """Инвариант 7: ни один markdown-документ репозитория не содержит
+    двусмысленной формулы принадлежности плагина (любые словоформы «плагин*»
+    с «владельца», регистр не важен). Сканируются ВСЕ *.md под корнем —
+    документ остаётся документом в любом каталоге, включая архив спек и
+    шаблоны .github. Замена — однозначная формулировка с адресом или
+    принадлежностью; правило — AGENTS.md, «Утверждение о готовом артефакте
+    обязано нести его адрес» (#219)."""
+    if not docs_root.is_dir():
+        return []
+    violations = []
+    for path in sorted(docs_root.rglob("*.md")):
+        if set(path.parts) & _SCAN_SKIP_DIRS:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            match = _AMBIGUOUS_ARTIFACT_PHRASE.search(line)
+            if match:
+                violations.append({
+                    "file": path.relative_to(docs_root).as_posix(),
+                    "line": lineno,
+                    "match": match.group(0),
+                })
+    return violations
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -575,7 +683,7 @@ def build_report(repo: str, now: datetime,
     findings: dict[int, list] = {}
     lines = ["## Инварианты состояния репозитория (#244)"]
 
-    v1 = check_reopened_after_merge(open_tasks, merged_pulls)
+    v1 = check_reopened_after_merge(repo, open_tasks, merged_pulls)
     findings[1] = v1
     if v1:
         lines.append(f"🚨 [1] {len(v1)} открытых задач без исполнителя с уже слитым PR:")
@@ -592,11 +700,11 @@ def build_report(repo: str, now: datetime,
     v3 = check_stuck_review_gate(repo, now, open_pulls)
     findings[3] = v3
     if v3:
-        lines.append(f"🚨 [3] {len(v3)} открытых PR с review:ok без вердикта ai:* дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:")
+        lines.append(f"🚨 [3] {len(v3)} открытых PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:")
         for item in v3:
             lines.append(f"   — PR #{item['pr']} — {int(item['age_minutes'])} мин без ai:*")
     else:
-        lines.append("💚 [3] нет застрявших review:ok без ai:*")
+        lines.append("💚 [3] нет застрявших PR с гейтом 1 без ai:*")
 
     v4 = check_unarchived_complete_changes(OPENSPEC_CHANGES)
     findings[4] = v4
@@ -635,6 +743,15 @@ def build_report(repo: str, now: datetime,
         lines.append("⏭️ [6] защита main не проверена в этом прогоне (нужен токен с "
                       "правом administration — GITHUB_TOKEN его структурно не имеет; "
                       "запусти вручную: --check-branch-protection с admin-токеном)")
+
+    v7 = check_ambiguous_artifact_phrase(REPO_ROOT)
+    findings[7] = v7
+    if v7:
+        lines.append(f"🚨 [7] {len(v7)} мест называют принадлежность плагина двусмысленно (#219):")
+        for item in v7:
+            lines.append(f"   — {item['file']}:{item['line']} — «{item['match']}»")
+    else:
+        lines.append("💚 [7] двусмысленной формулы принадлежности плагина нет")
 
     return lines, findings
 
@@ -687,7 +804,7 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         key = ",".join(f"#{i['pr']}" for i in v3)
         text = (
             "🚨 edge-harness: инвариант 3 (застрявший гейт) — "
-            f"{len(v3)} PR с review:ok без вердикта ai:* дольше "
+            f"{len(v3)} PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше "
             f"{UNHEALTHY_PR_AFTER_MINUTES} мин: " + key + ". "
             "Авто-повтор #196 либо исчерпал попытки, либо не сработал — нужен человек."
         )

@@ -42,8 +42,8 @@ def task_issue(number, title="", issue_body="", assignees=()):
     }
 
 
-def merged_pr(number, pr_body, merged_at):
-    return {"number": number, "body": pr_body, "merged_at": merged_at}
+def merged_pr(number, ref, merged_at):
+    return {"number": number, "head": {"ref": ref}, "merged_at": merged_at}
 
 
 def open_pr(number, pr_body="", labels=()):
@@ -55,44 +55,19 @@ def open_pr(number, pr_body="", labels=()):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_primary_declared_task_requires_bare_line():
-    assert ri.primary_declared_task("#18\n\nтекст") == 18
-    assert ri.primary_declared_task("#205") == 205
-    # живая находка PR #137: перенос строки внутри прозы уронил "#119 из
-    # пула..." на отдельную строку — это НЕ декларация, реальная первая
-    # строка тела — "#18"
-    assert ri.primary_declared_task(
-        "#18\n\nAI-ревьюер...\n\n"
-        "`gather` прогнан на живом PR #130: промпт собран с телом задачи\n"
-        "#119 из пула, meta.json с head — выверено."
-    ) == 18
-    assert ri.primary_declared_task("## Что сделано\n#18") is None  # заголовок первой строкой — не декларация
-    assert ri.primary_declared_task("") is None
-    assert ri.primary_declared_task(None) is None
+REPO = "mytab0r/edge-harness"
 
 
-def test_primary_declared_task_sees_canonical_template_body():
-    """Находка ревью PR #249: прод-форма тела PR, открытого через веб-форму
-    по `.github/PULL_REQUEST_TEMPLATE.md` (HTML-комментарий первыми тремя
-    строками, `#N` — реальным номером — только потом). До фикса
-    `primary_declared_task` не вырезал HTML-комментарии и падал на `None` для
-    КАЖДОГО такого PR — инвариант 1 был слеп именно к штатному классу
-    PR (#18/#21/#78), ради которого заведён."""
-    template_body = (
-        "<!-- Правило: один PR — одна задача. Ссылайся на задачу просто #N.\n"
-        "НЕ пиши Closes/Fixes/Resolves: задачу закрывает исполнитель ПОСЛЕ пост-мерж\n"
-        "проверки (деплой/канарейка/E2E), приложив улики. Контракт такие слова отклоняет. -->\n"
-        "#244\n\n"
-        "## Что сделано\n-\n"
-    )
-    assert ri.primary_declared_task(template_body) == 244
-
-
-def test_reopened_after_merge_flags_free_task_with_merged_pr():
+def test_reopened_after_merge_flags_free_task_with_merged_pr(monkeypatch):
+    # #394: задача PR резолвится ТОЛЬКО по имени ветки, тело не читается —
+    # оба PR названы agent/18-*, тела нет вовсе (штатный PR может быть слит
+    # без единого номера в теле).
+    fake = FakeGh({"issues/18/comments": []})  # приёмка ещё не выносила вердикт
+    patch_gh(monkeypatch, fake)
     tasks = [task_issue(18, "AI-ревьюер диффа", assignees=())]
-    pulls = [merged_pr(137, "#18\n\nтекст", "2026-08-31T17:46:11Z"),
-             merged_pr(138, "#18\n\nвторой заход", "2026-09-02T21:31:47Z")]
-    violations = ri.check_reopened_after_merge(tasks, pulls)
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z"),
+             merged_pr(138, "agent/18-second-pass", "2026-09-02T21:31:47Z")]
+    violations = ri.check_reopened_after_merge(REPO, tasks, pulls)
     assert len(violations) == 1
     assert violations[0]["issue"] == 18
     assert violations[0]["prs"] == [137, 138]
@@ -101,28 +76,87 @@ def test_reopened_after_merge_flags_free_task_with_merged_pr():
 
 def test_reopened_after_merge_silent_when_assigned():
     # тот же слитый PR, но задача СЕЙЧАС занята исполнителем — норма
-    # (пост-мерж проверка ещё не сделана, это не бросили)
+    # (пост-мерж проверка ещё не сделана, это не бросили). Без FakeGh-маршрута
+    # нарочно: маркер приёмки не должен даже спрашиваться (short-circuit по
+    # unassigned раньше).
     tasks = [task_issue(18, assignees=("mytab0r",))]
-    pulls = [merged_pr(137, "#18", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
 def test_reopened_after_merge_silent_without_merged_pr():
     tasks = [task_issue(18, assignees=())]
-    pulls = [merged_pr(999, "#77", "2026-08-31T17:46:11Z")]  # чужая декларация
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    pulls = [merged_pr(999, "agent/77-other-task", "2026-08-31T17:46:11Z")]  # чужая ветка
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
-def test_reopened_after_merge_mutation_guard():
+def test_reopened_after_merge_mutation_guard(monkeypatch):
     # Мутация: если бы проверка не сверялась с unassigned (снят фильтр по
     # исполнителю), КАЖДАЯ задача со слитым PR стала бы «нарушением» — на
     # живом репозитории это стандартный кратковременный путь после мержа,
     # а не баг. Тест доказывает, что фильтр обязателен.
     tasks = [task_issue(18, assignees=("mytab0r",))]
-    pulls = [merged_pr(137, "#18", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+    fake = FakeGh({"issues/18/comments": []})
+    patch_gh(monkeypatch, fake)
     tasks_unassigned = [task_issue(18, assignees=())]
-    assert len(ri.check_reopened_after_merge(tasks_unassigned, pulls)) == 1
+    assert len(ri.check_reopened_after_merge(REPO, tasks_unassigned, pulls)) == 1
+
+
+def test_reopened_after_merge_excludes_watchdog_issue():
+    """#467: WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача
+    из пула; accept_merged_tasks её тоже явно пропускает (см. её докстринг) —
+    эта проверка обязана делать то же самое, а не находить #120 в списке
+    нарушителей своего же канала (живой случай)."""
+    watchdog = ri.WATCHDOG_ISSUE
+    tasks = [task_issue(watchdog, "Предохранитель конвейера", assignees=())]
+    pulls = [merged_pr(126, f"agent/{watchdog}-pause", "2026-08-31T12:01:11Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_partial(monkeypatch):
+    """#467, живой случай PR #455/задача #454: приёмка уже вынесла терминальный
+    вердикт «требует проверки человеком» именно по этому слитому PR и сама
+    сняла исполнителя как часть штатного пути — не тихий пробел, инвариант 1
+    не должен пересчитывать эту задачу нарушителем снова и снова."""
+    fake = FakeGh({
+        "issues/454/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_PARTIAL_MARKER} PR #455 …",
+             "created_at": "2026-09-06T05:45:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(454, "ранний отказ по квоте", assignees=())]
+    pulls = [merged_pr(455, "agent/454-gh-quota-early-exit", "2026-09-06T05:43:14Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_fail(monkeypatch):
+    """Тот же класс, второй терминальный маркер (#467, живой случай PR #437/
+    задача #432): «доработка» — штатный путь назад в пул для НОВОГО PR, не
+    нарушение инварианта 1."""
+    fake = FakeGh({
+        "issues/432/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_FAIL_MARKER} PR #437 — улика показала…",
+             "created_at": "2026-09-06T04:08:27Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(432, "review:large тоже гейт 1", assignees=())]
+    pulls = [merged_pr(437, "agent/432-gate1-decided", "2026-09-06T04:05:48Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_still_flags_task_never_verdicted(monkeypatch):
+    """Контроль: пустые комментарии (приёмка ещё не смотрела на эту пару
+    задача/PR) — инвариант 1 обязан сработать как раньше, различение не
+    глотает настоящий, ещё никем не замеченный пробел."""
+    fake = FakeGh({"issues/21/comments": []})
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(21, "dev:docker", assignees=())]
+    pulls = [merged_pr(177, "agent/21-dev-docker", "2026-09-02T17:01:28Z")]
+    assert len(ri.check_reopened_after_merge(REPO, tasks, pulls)) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -200,6 +234,37 @@ def test_stuck_review_gate_silent_when_verdict_present(monkeypatch):
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+    assert fake.calls == []
+
+
+def timeline_with_review_large(when: str):
+    """Прод-форма таймлайна крупного PR (#432): verdict_for ставит РОВНО одну
+    из двух меток гейта 1 — "labeled: review:ok" в таком таймлайне не
+    наступает никогда."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
+
+
+def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch):
+    # #432: review:large — тоже «гейт 1 отработал» (review_labels.gate1_decided).
+    # До фикса эта проверка требовала ровно review:ok, и PR с review:large без
+    # единой ai:*-метки был невидим инварианту тем же классом, каким
+    # scheduler.trigger_ai_review был невидим PR #412.
+    pull = open_pr(432, labels=["review:large"])
+    fake = FakeGh({"issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z")})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 432
+
+
+def test_stuck_review_gate_silent_when_neither_gate1_label_present(monkeypatch):
+    # Без review:ok И без review:large гейт 1 ещё не отработал вовсе — этот
+    # инвариант обязан молчать (не путать «гейт молчит» с «гейт застрял»).
+    pull = open_pr(500, labels=[])
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", utc(2026, 9, 3, 14, 0), [pull]) == []
     assert fake.calls == []
 
 
@@ -483,6 +548,74 @@ def test_branch_protection_not_in_ci_gating():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 7: двусмысленная формула принадлежности плагина (#219)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: реальные строки из репозитория ДО правки #219
+# (openspec/changes/dsh-in-job/), на которых класс и случился, — не пересказ.
+
+
+def write_md(tmp_path, rel, content):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_ambiguous_artifact_phrase_flags_prod_forms(tmp_path):
+    write_md(tmp_path, "openspec/changes/dsh-in-job/tasks.md",
+             "- [ ] Подключение плагинов владельца (combo-router из"
+             " `vars.PLUGINS_SUITE_URL`)\n")
+    write_md(tmp_path, "openspec/changes/dsh-in-job/design.md",
+             "**Провайдер — плагины владельца, не новый код.**\n")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert {v["file"] for v in violations} == {
+        "openspec/changes/dsh-in-job/tasks.md",
+        "openspec/changes/dsh-in-job/design.md",
+    }
+    by_file = {v["file"]: v for v in violations}
+    assert by_file["openspec/changes/dsh-in-job/design.md"]["line"] == 1
+    assert "плагины владельца" in by_file["openspec/changes/dsh-in-job/design.md"]["match"]
+
+
+def test_ambiguous_artifact_phrase_silent_on_unambiguous_wording(tmp_path):
+    # Обе разрешённые замены и порядок слов «владелец подключает свой плагин» —
+    # инвариант молчит: гвардится именно двусмысленная формула, не упоминание
+    # владельца вообще.
+    write_md(tmp_path, "docs/x.md",
+             "артефакт владельца по адресу X\n"
+             "наш плагин (пишем мы, не апстрим)\n"
+             "владелец подключает свой плагин\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_ignores_non_document_dirs(tmp_path):
+    write_md(tmp_path, ".git/notes.md", "плагины владельца\n")
+    write_md(tmp_path, "node_modules/pkg/README.md", "плагины владельца\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+
+
+def test_ambiguous_artifact_phrase_mutation_guard(tmp_path):
+    path = write_md(tmp_path, "docs/x.md", "документ без формулы\n")
+    assert ri.check_ambiguous_artifact_phrase(tmp_path) == []
+    # Мутация: вернуть прод-форму (строка proposal.md до #219, с заглавной
+    # буквы — регистр не должен спасать) — инвариант обязан покраснеть.
+    path.write_text("Плагины владельца устанавливаются job'ом.\n", encoding="utf-8")
+    violations = ri.check_ambiguous_artifact_phrase(tmp_path)
+    assert len(violations) == 1
+    assert violations[0]["line"] == 1
+
+
+def test_ambiguous_artifact_phrase_in_ci_gating_with_gas():
+    # Инвариант включён в обязательную проверку сразу при создании (#219):
+    # на момент включения ноль нарушений — фраза вычищена тем же PR. Газ
+    # объявлен в GATING_RELEASE_CONDITION — гвардия main() падает громко,
+    # если газ отберут, не назвав замену (AGENTS.md, «Тормоз без газа»).
+    assert 7 in ri.CI_GATING
+    assert 7 in ri.GATING_RELEASE_CONDITION
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -501,6 +634,11 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
+    # Инвариант 7 сканирует документы репозитория — подменяем корень, чтобы
+    # юнит-тест оставался герметичным и не зависел от живого дерева; живое
+    # дерево проверяет сам инвариант в repo-ci/orchestra.
+    monkeypatch.setattr(ri, "REPO_ROOT", tmp_path)
+    write_md(tmp_path, "README.md", "# здоровый снимок\n")
 
     now = utc(2026, 9, 3, 12, 0)
     lines, findings = ri.build_report("mytab0r/edge-harness", now)

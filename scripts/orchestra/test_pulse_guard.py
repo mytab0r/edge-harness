@@ -26,14 +26,17 @@ def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
 
-def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run"):
-    """Прод-форма элемента workflow_runs (поля, которые читает модуль)."""
+def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch"):
+    """Прод-форма элемента workflow_runs (поля, которые читает модуль).
+    event по умолчанию — workflow_dispatch (реальный тик), чтобы существующие
+    тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать."""
     return {
         "id": run_id,
         "conclusion": conclusion,
         "created_at": created_at,
         "html_url": f"https://github.com/mytab0r/edge-harness/actions/runs/{run_id}",
         "display_title": title,
+        "event": event,
     }
 
 
@@ -274,9 +277,9 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
 
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False                # диспатч остановлен
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in actions)  # первая тревога серии — действие
     assert len(posted) == 1 and len(sent) == 1
     assert pg.PAUSE_MARKER in posted[0] and "actions/runs/3" in sent[0]
 
@@ -286,7 +289,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
         {"created_at": "2026-08-31T11:59:00Z", "body": f"x {pg.PAUSE_MARKER}"}]
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: posted.append("spam"))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append("spam") or True)
-    _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    _, _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed2 is False
     assert posted == [posted[0]] and sent == [sent[0]]
 
@@ -300,9 +303,11 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
-    assert any("разрешён" in line for line in lines)
+    # closed-состояние ничего не меняет — это наблюдение (#456), не действие
+    assert any("разрешён" in line for line in observations)
+    assert actions == []
 
 
 # ── Полуоткрытое состояние (#205): чистые решения ─────────────────────────────────
@@ -399,6 +404,240 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     assert any("пропадал" in line for line in lines)
 
 
+# ── #133: contract (pull_request) не маскирует пропавший пульс orchestra ────────
+
+
+def test_real_orchestra_ticks_drops_pull_request_runs():
+    runs = [
+        run("success", "2026-09-05T14:19:00Z", 1, event="pull_request"),
+        run("success", "2026-09-05T13:32:00Z", 2, event="schedule"),
+        run("success", "2026-09-05T04:35:00Z", 3, event="workflow_dispatch"),
+    ]
+    ticks = pg.real_orchestra_ticks(runs)
+    assert [t["id"] for t in ticks] == [2, 3]
+
+
+def test_heartbeat_check_blind_to_pull_request_contract_runs_mutation_guard(monkeypatch):
+    # Живая форма #133 (замер 2026-09-05): job orchestra (workflow_dispatch)
+    # не бежал ~9ч49м, но между ним и «сейчас» — россыпь зелёных pull_request
+    # прогонов job'а contract. Без фильтра last_ok подхватил бы самый свежий
+    # pull_request-прогон и heartbeat_check остался бы тихим — ровно тот
+    # силент-баг, который держал наблюдателя слепым в проде.
+    runs = {"workflow_runs": [
+        run("success", "2026-09-05T14:19:02Z", 10, event="pull_request"),
+        run("success", "2026-09-05T14:01:22Z", 9, event="pull_request"),
+        run("success", "2026-09-05T13:51:26Z", 8, event="pull_request"),
+        run("success", "2026-09-05T04:35:49Z", 1, event="workflow_dispatch"),
+    ]}
+    fake = FakeGh({"workflows/orchestra.yml/runs": runs, "issues/120/comments": []})
+    monkeypatch.setattr(pg, "gh", fake)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+
+    now = utc(2026, 9, 5, 14, 24, 0)
+    lines = pg.heartbeat_check("mytab0r/edge-harness", now)
+    assert len(sent) == 1 and "пропадал" in sent[0]
+    assert any("пропадал" in line for line in lines)
+
+    # Мутация: без фильтра (как раньше) last_ok — самый свежий success ЛЮБОГО
+    # события, то есть pull_request-прогон 14:19:02 — 5 минут назад, ниже
+    # порога HEARTBEAT_MAX_AGE_MINUTES=45 — heartbeat_check красит тест выше
+    # молчанием. Доказываем это явно на тех же данных без фильтра.
+    unfiltered_last_ok = next(r for r in runs["workflow_runs"] if r["conclusion"] == "success")
+    assert pg.decide_heartbeat(unfiltered_last_ok["created_at"], now) == "ok"
+
+
+# ── Находка ревью PR #318: клиентский фильтр на одной сырой странице не ─────────
+# ── спасает от труncации ≥100 contract-прогонов — нужен серверный ?event=... ────
+
+
+def test_orchestra_tick_runs_queries_each_legit_event_separately_no_pull_request(monkeypatch):
+    """orchestra_tick_runs делает ОТДЕЛЬНЫЙ запрос на каждое легитимное
+    событие (?event=schedule, ?event=workflow_dispatch) и ни разу не просит
+    event=pull_request — contract, сколько бы его ни было между тиками, на
+    эти страницы в принципе не попадает (сервер фильтрует до пагинации)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T13:32:00Z", 501, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-09-05T04:35:00Z", 502, event="workflow_dispatch"),
+        ]},
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    ticks = pg.orchestra_tick_runs("mytab0r/edge-harness")
+    assert [t["id"] for t in ticks] == [501, 502]
+    assert len(fake.calls) == 2
+    assert all("event=pull_request" not in c for c in fake.calls)
+
+
+def test_heartbeat_check_finds_real_tick_past_page_full_of_contract_runs(monkeypatch):
+    """Граничный случай, явно запрошенный ревью: ≥100 pull_request-прогонов
+    contract между двумя настоящими тиками. Раньше (клиентский фильтр на
+    ОДНОЙ сырой странице) эта масса contract-прогонов ЗАНИМАЛА всю страницу
+    per_page=100 и настоящий success 04:35 терялся за ней — heartbeat_check
+    молчал бы «не найдено». Серверный фильтр по событию делает вопрос
+    неприменимым: страница event=workflow_dispatch физически не может
+    содержать ни одного прогона contract, сколько бы их ни было."""
+    # Живая форма находки: 150 (>per_page=100) прогонов contract на event=
+    # pull_request «существуют», но код НЕ ИМЕЕТ ПРАВА их запрашивать — в
+    # FakeGh для event=pull_request нарочно нет маршрута, любой такой запрос
+    # упадёт громким AssertionError вместо тихой подмены страницы.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-09-05T04:35:49Z", 1, event="workflow_dispatch"),
+        ]},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+
+    now = utc(2026, 9, 5, 14, 24, 0)
+    lines = pg.heartbeat_check("mytab0r/edge-harness", now)
+    assert len(sent) == 1 and "пропадал" in sent[0]
+    assert any("пропадал" in line for line in lines)
+
+
+def test_heartbeat_check_loud_when_zero_ticks_found_after_server_filter(monkeypatch):
+    """Пустой результат ПОСЛЕ серверного фильтра (оба легитимных события
+    отдали 0 success) — не «выборка коротка» (см. docstring heartbeat_check),
+    а реальный тревожный случай: находка ревью #318 — прежняя версия молчала
+    ℹ️ без Telegram и без следа в задаче; теперь кричит 🚨 обоими каналами."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in sent[0]
+    assert len(posted) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in posted[0]
+
+
+def test_heartbeat_check_no_ticks_report_honest_when_comment_post_fails(monkeypatch):
+    """Находка AI-ревью PR #318 (третий раунд): строка отчёта раньше
+    безусловно утверждала «след в #120», даже если post_issue_comment упал
+    (RuntimeError уходил только в stderr-warning) — именно в сценарии
+    «тиков нет» канал задачи может быть сломан по той же причине, что и
+    пульс. Мутация: убери условный `trace` и верни жёсткое «след в #120)» —
+    этот тест покраснеет."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+
+    def failing_post(repo, n, text):
+        raise RuntimeError("HTTP 500: transient")
+    monkeypatch.setattr(pg, "post_issue_comment", failing_post)
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and "НЕ оставлен" in lines[0]
+    assert "след в #120: оставлен)" not in lines[0]
+
+
+def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(monkeypatch):
+    """Один след в задаче на эпизод (маркер HEARTBEAT_NO_TICKS уже стоит) —
+    повторный комментарий не плодится, но Telegram кричит на каждый прогон
+    (тот же приём, что у heartbeat_alert_text/PAUSE_MARKER)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-05T14:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nтекст"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1
+    assert posted == []
+
+
+def test_heartbeat_check_no_ticks_episode_reopens_after_close_marker(monkeypatch):
+    """Находка ревью PR #318, п.1: старый код гасил канал навсегда после первого
+    же «тиков нет» — issue_marker_times ищет подстроку по ВСЕЙ истории #120.
+    Закрывающий маркер (тики вернулись) новее старого открывающего — новый
+    эпизод объявляется заново, а не подавляется старым следом."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"},
+            {"created_at": "2026-09-03T00:00:00Z",
+             "body": f"✅ edge-harness: {pg.HEARTBEAT_TICKS_RESUMED_MARKER}\nзакрыт"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
+    assert lines and lines[0].startswith("🚨")
+    assert len(posted) == 1 and pg.HEARTBEAT_NO_TICKS_MARKER in posted[0]
+
+
+def test_heartbeat_check_closes_no_ticks_episode_when_ticks_return(monkeypatch):
+    """Тики снова нашлись, открытый эпизод HEARTBEAT_NO_TICKS ещё не закрыт —
+    heartbeat_check публикует закрывающий маркер (иначе episode_reopened
+    никогда не увидит момент восстановления)."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T14:00:00Z", 1, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
+    assert len(posted) == 1 and pg.HEARTBEAT_TICKS_RESUMED_MARKER in posted[0]
+
+
+def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkeypatch):
+    """Эпизод уже закрыт (закрывающий маркер новее открывающего) — тики есть —
+    heartbeat_check не плодит второй закрывающий комментарий."""
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=schedule": {"workflow_runs": [
+            run("success", "2026-09-05T14:00:00Z", 1, event="schedule"),
+        ]},
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T00:00:00Z",
+             "body": f"🚨 edge-harness: {pg.HEARTBEAT_NO_TICKS_MARKER}\nстарый эпизод"},
+            {"created_at": "2026-09-02T00:00:00Z",
+             "body": f"✅ edge-harness: {pg.HEARTBEAT_TICKS_RESUMED_MARKER}\nзакрыт"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
+    assert posted == []
+
+
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
 
 
@@ -415,11 +654,11 @@ def test_gate_first_entry_posts_pause_marker_and_blocks(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
 
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
     assert len(posted) == 1
     assert pg.PAUSE_MARKER in posted[0] and pg.PROBE_MARKER not in posted[0]
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in actions)  # первая тревога — действие
 
 
 def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
@@ -433,9 +672,11 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    # state=="open" (выдержка не истекла, уже оповещено) ничего не меняет — наблюдение
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
     # ровно 15 минут прошло — выдержка истекла: ровно одна проба, диспатч разрешён
     fake.routes["issues/120/comments"] = [
@@ -443,11 +684,11 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert len(posted) == 1 and f"{pg.PROBE_MARKER} 1]" in posted[0]
-    # проба отличима отдельной строкой в отчёте — иначе её не отладить
-    assert any("пробный диспатч после паузы" in line for line in lines)
+    # проба отличима отдельной строкой в отчёте — иначе её не отладить (действие)
+    assert any("пробный диспатч после паузы" in line for line in actions)
 
 
 def probe_body(attempt: int) -> str:
@@ -468,9 +709,10 @@ def test_gate_probe_success_closes_breaker_via_reset_streak(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
-    assert any("разрешён" in line for line in lines)
+    assert any("разрешён" in line for line in observations)
+    assert actions == []
 
 
 def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
@@ -487,9 +729,11 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    # state=="open" (уже оповещено) — наблюдение, не действие
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
     # доказательство мутацией: без роста выдержки (attempt всегда 1) те же
     # 20 минут с последней пробы были бы >= 15 и пропустили бы вторую пробу —
@@ -497,7 +741,7 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     fake.routes["issues/120/comments"] = [
         {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
         {"created_at": "2026-08-31T11:40:00Z", "body": probe_body(1)}]
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
+    _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
     assert allowed is False  # exp-выдержка (30 мин) ещё не истекла
     broken_backoff_would_allow = pg.minutes_between(
         utc(2026, 8, 31, 11, 40), NOW) >= pg.probe_backoff_minutes(1)
@@ -533,9 +777,10 @@ def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
     assert pg.decide_dispatch(0) is True
 
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
-    lines, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
-    assert any("паузе" in line for line in lines)
+    assert any("паузе" in line for line in observations)
+    assert actions == []
 
 
 def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
@@ -566,7 +811,7 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
         from datetime import timedelta
         current_now[0] = start + timedelta(minutes=minute_offset)
         fake.routes["issues/120/comments"] = list(comments)
-        _, allowed = pg.conveyor_gate("mytab0r/edge-harness", current_now[0])
+        _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", current_now[0])
         if allowed:
             probes += 1
 
@@ -575,3 +820,145 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     # (30-минутная выдержка после первой красной пробы на 15-й минуте истекает
     # на 45-й) — итого РОВНО 2 пробы, не 5 (столько дал бы пульс без выдержки)
     assert probes == 2, f"гвардия частоты нарушена: проб за час {probes}, ожидалось 2"
+
+
+# ── Авто-возобновление по мержу (#220): success-маркер — виртуальный success ──────
+
+
+def resume_body(pr: int = 445, task: int = 205) -> str:
+    """Прод-форма тела маркера возобновления: собирается той же функцией кода,
+    что пишет его в проде (resume_alert_text) — не пересказом."""
+    return pg.resume_alert_text(pr, task, None)
+
+
+def test_series_anchor_takes_latest_of_success_and_resume():
+    assert pg.series_anchor(None, None) is None
+    assert pg.series_anchor(M(9), None) == M(9)
+    assert pg.series_anchor(None, M(11)) == M(11)
+    assert pg.series_anchor(M(9), M(11)) == M(11)
+    assert pg.series_anchor(M(12), M(11)) == M(12)  # зелёный прогон новее сброса
+
+
+def test_runs_after_keeps_only_runs_newer_than_anchor():
+    runs = [run("failure", "2026-08-31T11:50:00Z", 3),
+            run("failure", "2026-08-31T11:35:00Z", 2),
+            run("failure", "2026-08-31T11:20:00Z", 1)]
+    assert pg.runs_after(runs, None) == runs  # без якоря — серия бесконечна
+    assert pg.runs_after(runs, utc(2026, 8, 31, 11, 35)) == runs[:1]
+    assert pg.runs_after(runs, utc(2026, 8, 31, 11, 55)) == []
+
+
+def test_gate_resume_marker_reopens_dispatch_without_probe(monkeypatch):
+    """Ключевой сценарий #220: серия красная, пауза стоит, но слит PR задачи
+    последнего красного прогона (маркер возобновления 11:55 новее маркера
+    паузы 11:45) — диспатч разрешён СРАЗУ, без выдержки и без комментария
+    (новых сигналов серия не породила). Мутации: (а) не читать RESUME_MARKER
+    — гейт ушёл бы в пробу с новым комментарием; (б) не отфильтровать маркер
+    возобновления из серийных — гейт ушёл бы в open, 5 минут выдержки."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.pause_alert_text(3, None, "err")},
+            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert actions == [], "сброс мержем — новых сигналов серия не порождает"
+    assert any("сброшена мержем" in line for line in observations), \
+        "сброс именно мержем (зелёного прогона не было) обязан быть назван в отчёте"
+
+
+def test_gate_resume_resets_probe_attempt_numbering(monkeypatch):
+    """Сброс мержем закрывает и счётчик попыток пробы: маркеры «пауза»/«проба 1»
+    старше маркера возобновления — гейт обязан вернуться в closed, а не считать
+    выдержку попытки 2 (30 мин) от чужого маркера. Мутация: оставить маркеры
+    в серии — allowed False (open)."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)},
+            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert actions == []
+    assert not any("пробный диспатч" in line for line in observations)
+
+
+def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
+    """Сброс не анестезия: красные прогоны ПОСЛЕ маркера возобновления — новая
+    серия, считаются с нуля. Два красных после сброса (порог 3) — диспатч
+    разрешён; мутация без runs_after: failures=4 по старым красным — пауза."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run("failure", "2026-08-31T11:50:00Z", 4),
+            run("failure", "2026-08-31T11:45:00Z", 3),
+            run("failure", "2026-08-31T11:20:00Z", 2),
+            run("failure", "2026-08-31T11:10:00Z", 1),
+        ]},
+        "runs/4/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:40:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+
+    # три красных после сброса — предохранитель срабатывает заново (first):
+    # гвардия, что сброс не отменяет сам механизм паузы
+    fake.routes["workflows/worker.yml/runs"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 5),
+        run("failure", "2026-08-31T11:45:00Z", 4),
+        run("failure", "2026-08-31T11:42:00Z", 3),
+        run("failure", "2026-08-31T11:20:00Z", 2),
+        run("failure", "2026-08-31T11:10:00Z", 1),
+    ]}
+    fake.routes["runs/5/jobs"] = JOBS_PAYLOAD
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False
+    assert len(posted) == 1 and pg.PAUSE_MARKER in posted[0]
+    assert len(actions) == 1 and "паузе" in actions[0]  # постинг паузы — действие
+
+
+def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
+    """Возобновление старше последнего зелёного прогона — история, не якорь:
+    серия после зелёного считается по зелёному, и в отчёте нет слов про мерж."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_OK,  # success 11:50 — новее сброса 11:30
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:30:00Z", "body": resume_body()},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True
+    assert not any("мержем" in line for line in observations)
+
+
+def test_resume_alert_text_carries_marker_evidence():
+    text = resume_body(pr=445, task=205)
+    assert f"{pg.RESUME_MARKER} #445]" in text   # токен, по которому gate и дедуп читают сброс
+    assert "#205" in text                        # задача последнего красного прогона
+    assert "без ожидания пробы" in text          # путь возобновления назван
+    assert pg.PAUSE_MARKER not in text           # маркер серии — не сброс: их нельзя смешивать

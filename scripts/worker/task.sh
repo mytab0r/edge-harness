@@ -222,7 +222,8 @@ echo "Задача #$number: $title"
 # без исполнителя, но с уже открытым PR — сигнал «довести» (сценарий
 # scheduler.py::unhealthy_pulls, снявшего исполнителя с нездорового PR), не
 # «пропустить». Одно место правды на объявление PR задачи —
-# scripts/lib/task_ref.py::declared_tasks через scripts/lib/free_task.py,
+# scripts/lib/task_ref.py::task_from_branch (имя agent-ветки, единственный
+# источник, решение владельца 2026-09-06) через scripts/lib/free_task.py,
 # то же самое, что использует contract_check.py — симметрично для явного
 # входа --task и для авто-выбора free_task(). Атомарная защита от гонки
 # каналов на этот же PR — claim ниже (шаг 4), не эта проверка.
@@ -366,6 +367,13 @@ if [ -n "$CONTINUE_PR_NUMBER" ]; then
   # git rebase origin/main — свежесть базы не предполагается, а доказывается.
   git config core.hooksPath .githooks
   echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) чекаутнута для доводки: $(git rev-parse --short HEAD)"
+  # Второй вход в agent-ветку (первый — task-branch ниже): доводка уже
+  # открытого PR не проходит через task-branch, поэтому дайджест граблей
+  # инфраструктуры печатается здесь явно — тем же общим модулем, не второй
+  # копией текста (#326 находка 1: свежий агент на доводке стартовал без
+  # дайджеста, хотя scripts/gh/* нужны там раньше всего).
+  source "$SCRIPT_DIR/../gh/infra_digest.sh"
+  print_infra_digest
 else
   "$SCRIPT_DIR/../git/task-branch" "$number-$slug"
 fi

@@ -1,0 +1,160 @@
+diff --git a/dsh-edge/PATCHES.md b/dsh-edge/PATCHES.md
+index 1a746515..e926ae5b 100644
+--- a/dsh-edge/PATCHES.md
++++ b/dsh-edge/PATCHES.md
+@@ -13,13 +13,11 @@
+ | Патч | Файлы апстрима | Причина | removeWhen |
+ |---|---|---|---|
+ | `0001-alias-scope.patch` | `standalone/scripts/bundle-standalone.mjs` | Регэксп `publishedPackageAliases()` знает только `@deepseek-ai`/`@cloudflare`/`just-bash`/`fast-png`/`jpeg-js` — импорт плагина `@edge-harness/*` в сгенерированном `edge-plugins.generated.ts` не построит алиас, и плагин никогда не попадёт в бандл (класс #43). Второй хунк того же файла добавляет `@edge-harness` в гвардию `requirePublishedDependencyInputs`: рантайм-зависимость плагина обязана резолвиться из `standalone/node_modules` (из лока), не из чужой копии. | Апстрим принял PR «дополнительный скоуп опубликованных пакетов» (design.md, «Апстрим») — патч снимается, состав сверяется. |
+-| `0002-edge-plugins-module.patch` | `src/session-store.ts` | Композиция апстрима — статическая очередь `context.plugin(...)`; точки монтирования владельческих плагинов нет. Патч ставит в хвост `initialize()` вызов `installEdgePlugins(storage)`: цикл по сгенерированному списку, изоляция по прецеденту LLM-плагина (строка ~245): упавший плагин не роняет DO, пишет `console.error` + статус в ключ `dsh-edge-plugins:<id>`, цикл продолжается. Самого файла `edge-plugins.generated.ts` патч не содержит — его пишет `codegen-edge-plugins.mjs` до сборки; без кодогенерации сборка падает громко (импорт не резолвится) — это сознательный fail loud. Хвост `initialize()` — не «слишком поздно»: тулсет агента не снапшотится ни в момент создания AgentLoop, ни в момент создания агента — `ToolRuntime` регистрирует у `SystemPrompt` живой провайдер, и каждая сборка хода читает реестр тулов заново (доказано репродукцией на реальных пакетах, см. openspec design, «Девиации», п.9). Контракт, который ПАТЧ на себя берёт: плагин сам объявляет `inject` (cordis 4 без объявления бросает «cannot get property … without inject» прямо в apply) — за этим следит дым инсталла (см. «Гвардия состава»). | Апстрим предоставит официальную точку входа плагинов (исход спайка pawaca/dsh-edge#43 в пользу предрегистрации). |
++| `0002-edge-plugins-module.patch` | `src/session-store.ts` | Композиция апстрима — статическая очередь `context.plugin(...)`; точки монтирования владельческих плагинов нет. Патч ставит в хвост `initialize()` вызов `installEdgePlugins(storage)`: цикл по сгенерированному списку, изоляция по прецеденту LLM-плагина (строка ~245): упавший плагин не роняет DO, пишет `console.error` + статус в ключ `dsh-edge-plugins:<id>`, цикл продолжается. Самого файла `edge-plugins.generated.ts` патч не содержит — его пишет `codegen-edge-plugins.mjs` до сборки; без кодогенерации сборка падает громко (импорт не резолвится) — это сознательный fail loud. | Апстрим предоставит официальную точку входа плагинов (исход спайка pawaca/dsh-edge#43 в пользу предрегистрации). |
+ | `0003-web-roster-manifest.patch` | `standalone/scripts/assemble-standalone-web.mjs`, `standalone/scripts/verify-standalone.mjs` | Ростер клиентских плагинов строится только из upstream-патчей (`cordis.patch.yml` опубликованных пакетов) — манифестный плагин в морду не попадает. Патч читает `standalone/edge-plugins.json` и дописывает клиентские записи; для манифестных записей гвардия ГРОМЧЕ апстримной: отсутствие пакета в `node_modules` или web-декларации `dsh.client` — падение сборки, тогда как апстримный путь молча делает `continue` (тишина = зелёная сборка без плагина). Второй файл: строгая сверка boot-графа с `expected-boot-graph.json` в `verify-standalone.mjs` не знает о манифестных записях — патч делит записи на апстримные (сверяются с-reviewed контрактом, как раньше) и манифестные (проверяется наличие в графe и в dist). | Апстрим построит ростер из скана установленных пакетов с `dsh.client`-декларациями. |
+-| `0004-harness-ingest.patch` | `src/http.ts`, `src/index.ts`, `src/instance.ts`, `src/session-store.ts` | Сессии агентов-раннеров (#119) должны быть видны в нативной морде: раннер гоняет своего DSH вне деплоя и зеркалирует канонические события сессии в сессию-просмотрщик. Шов апстрима нет: surface-события пишет только агент-цикл. Патч добавляет `POST /api/sessions/:id/ingest` (владелец-авторизация как у всех маршрутов): батч событий в форме спула раннера `{type, data}`, allowlist = allowlist спула, перенумерация turn поверх хранимого лога (переиспользованная сессия не откатывается), surface-события встают в хвост (`surfaceOp: 'append'`), батч флашится до ответа («принято = сохранено»), публикация живым подписчикам — штатный late-event путь стора. Два новых потолка тела в `http.ts` (1 MiB / 256 событий) и внешний баунд в `requestForInstance`. Известная шероховатость: тип события в ingest рантайм-динамический, поэтому единственный вызов `session.append` идёт через `as unknown as` + `bind()` (append читает приватное состояние сессии через `this`; без bind — «Cannot read properties of undefined» в рантайме, найдено локальной интеграцией, а не компилятором). | Апстрим даст штатный API дописывания событий в чужую сессию (или раннеры переедут внутрь DO). |
+ 
+-Размер серии: 4 патча, содержательные изменения 8 / 26 / ~60 / ~120 строк.
+-Патч 0004 — у порога «>100 содержательных строк»; при первом же расширении шва —
+-выносить нормализацию в отдельный модуль или пересматривать «серия против форка».
++Размер серии: 3 патча, содержательные изменения 8 / 26 / ~60 строк — внутри
++порога; счётчик пересматривается при каждом обновлении пина.
+ 
+ Бамп пина #134 (0.7.1 → 0.8.0, `dsh-edge/upstream.json`): патчи 0001–0003
+ наложились без изменений. Патч 0004 (`0004-harness-ingest.patch`) конфликтовал
+@@ -50,13 +48,3 @@ package.json` пиннует `@deepseek-ai/dsh-web-app` и `@deepseek-ai/dsh-web
+ метафайл эфемерен — `bundle-standalone.mjs` удаляет временный outdir; гвардия
+ проверяет durability-артефакт того же доказательства. Отсутствие плагина в
+ артефакте — красный деплой, а не тихая неполная морда.
+-
+-[`smoke-edge-plugins.mjs`](smoke-edge-plugins.mjs) — вторая половина
+-доказательства, «манифест ↔ рантайм-инсталл» (класс #100): гвардия состава
+-доказывает «плагин в бандле», но не «плагин инсталлируется» — #100 проехал
+-зелёной сборкой при плагине, чей apply падал в рантайме DO. Дым исполняется
+-в CI сразу после кодогенерации: инсталлирует каждый серверный плагин в
+-настоящий cordis Context с SystemPrompt + ToolRuntime из node_modules клона;
+-не инсталлировался — красный деплой. Честная граница: дым идёт в Node, не в
+-workerd, и покрывает путь монтирования (apply + регистрация тулов), не путь
+-execute() инструментов.
+diff --git a/dsh-edge/plugins.json b/dsh-edge/plugins.json
+index 902305fc..975f40e6 100644
+--- a/dsh-edge/plugins.json
++++ b/dsh-edge/plugins.json
+@@ -5,34 +5,12 @@
+       "id": "hello",
+       "package": "@edge-harness/dsh-plugin-hello",
+       "source": {
+-        "release": "plugins-hello-v0.1.1",
+-        "asset": "hello-world-0.1.1.tgz",
+-        "sha256": "f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"
++        "release": "plugins-hello-v0.1.0",
++        "asset": "hello-world-0.1.0.tgz",
++        "sha256": "0dae042b58e2702e5b0f31c552f76df26f53f72019703aa98f20f6a5f431d7f3"
+       },
+       "server": true,
+       "client": true
+-    },
+-    {
+-      "id": "runner-bridge",
+-      "package": "@edge-harness/dsh-plugin-runner-bridge",
+-      "source": {
+-        "release": "plugins-runner-v0.1.1",
+-        "asset": "runner-bridge-0.1.1.tgz",
+-        "sha256": "8ed9b451ffa731f1427f3425e818325dc198425d7197d003bc26d4c092b01733"
+-      },
+-      "server": true,
+-      "client": false
+-    },
+-    {
+-      "id": "plugin-manager",
+-      "package": "@edge-harness/dsh-plugin-manager",
+-      "source": {
+-        "release": "plugins-manager-v0.1.1",
+-        "asset": "plugin-manager-0.1.1.tgz",
+-        "sha256": "8597b1b68938a1ff73a6f60480cbb10c830b906bfbc400130ad013737e1e9d66"
+-      },
+-      "server": false,
+-      "client": true
+     }
+   ]
+ }
+diff --git a/plugins-src/hello-world/README.md b/plugins-src/hello-world/README.md
+index ac952964..7b79b1a1 100644
+--- a/plugins-src/hello-world/README.md
++++ b/plugins-src/hello-world/README.md
+@@ -24,20 +24,15 @@
+ ```bash
+ cd plugins-src/hello-world
+ node --check server/index.js && node --check client/client.js   # синтаксис
+-npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.1.tgz
+-sha256sum edge-harness-dsh-plugin-hello-0.1.1.tgz
++npm pack                                                         # edge-harness-dsh-plugin-hello-0.1.0.tgz
++sha256sum edge-harness-dsh-plugin-hello-0.1.0.tgz
+ ```
+ 
+-Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.1` и
+-asset'ом `hello-world-0.1.1.tgz` (то же содержимое, имя asset'а фиксирует
++Публикация: релиз **этого** репозитория с тегом `plugins-hello-v0.1.0` и
++asset'ом `hello-world-0.1.0.tgz` (то же содержимое, имя asset'а фиксирует
+ манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
+ merge = аппрув владельца.
+ 
+ Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
+ (инструмент объявляется апстримным `defineTool`); пин версии peer-зависимости
+ переставляет `.pnpmfile.cjs` апстрима под свой `dshEdge.upstreamVersion`.
+-
+-Серверная половина объявляет `inject: ['tools']` — контракт cordis 4: чтение
+-`ctx.<service>` в apply без объявления в `inject` бросает
+-`cannot get property … without inject` (класс ошибки #100; ловит дым инсталла
+-[`dsh-edge/smoke-edge-plugins.mjs`](../../dsh-edge/smoke-edge-plugins.mjs)).
+diff --git a/plugins-src/hello-world/package.json b/plugins-src/hello-world/package.json
+index b07f5142..9a81295a 100644
+--- a/plugins-src/hello-world/package.json
++++ b/plugins-src/hello-world/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@edge-harness/dsh-plugin-hello",
+-  "version": "0.1.1",
++  "version": "0.1.0",
+   "description": "PoC edge plugin: hello-world proving the manifest -> bundle -> deploy -> web roster channel for dsh-edge",
+   "type": "module",
+   "main": "server/index.js",
+diff --git a/plugins-src/hello-world/server/index.js b/plugins-src/hello-world/server/index.js
+index c01b4291..ba52c16f 100644
+--- a/plugins-src/hello-world/server/index.js
++++ b/plugins-src/hello-world/server/index.js
+@@ -9,14 +9,11 @@
+ 
+ import { defineTool } from '@deepseek-ai/dsh-tools'
+ 
+-const GREETING = 'Hello from the dsh-edge plugin system (hello-world v0.1.1, @edge-harness/dsh-plugin-hello).'
++const GREETING = 'Hello from the dsh-edge plugin system (hello-world v0.1.0, @edge-harness/dsh-plugin-hello).'
+ 
+ export default {
+   name: 'edge-plugins:hello',
+-  // cordis 4: сервис можно читать через ctx.<service> только если плагин
+-  // объявил его в inject (иначе apply падает «cannot get property … without
+-  // inject»). Контракт тех же апстримных плагинов (dsh-tool-web и др.).
+-  inject: ['tools'],
++  inject: [],
+   apply(ctx) {
+     ctx.effect(() => ctx.tools.register(defineHelloTool()), 'edge-plugins:hello tool')
+     console.info('edge-plugin:hello installed (plugin_hello tool registered)')
+diff --git a/scripts/plugins/plugin_status.sh b/scripts/plugins/plugin_status.sh
+index e4dd795b..ece5b664 100644
+--- a/scripts/plugins/plugin_status.sh
++++ b/scripts/plugins/plugin_status.sh
+@@ -62,10 +62,12 @@ if [ "$seeded" != "1" ]; then
+ fi
+ seq=$((max_seq + 1))
+ 
+-# DETAIL — свободный текст (не JSON): передаём строкой через --arg,
+-# пустая строка = поля detail в событии нет.
+-data=$(jq -n --arg p "$PLUGIN_ID" --arg s "$STATE" --arg d "${DETAIL:-}" \
+-  '{plugin: $p, state: $s} + (if $d == "" then {} else {detail: $d} end)')
++detail_arg="null"
++if [ -n "${DETAIL:-}" ]; then
++  detail_arg=$(jq -rn --arg d "$DETAIL" '$d')
++fi
++data=$(jq -n --arg p "$PLUGIN_ID" --arg s "$STATE" --argjson d "$detail_arg" \
++  '{plugin: $p, state: $s} + (if $d == null then {} else {detail: $d} end)')
+ body=$(jq -n --arg t "$TASK_ID" --arg src "$SOURCE" --argjson seq "$seq" --argjson data "$data" --argjson ts "$(date -u +%s000)" \
+   '{task_id: $t, source: $src, events: [{seq: $seq, ts: $ts, kind: "plugin_status", data: $data}]}')
+ 

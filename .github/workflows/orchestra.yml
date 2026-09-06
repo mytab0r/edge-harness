@@ -60,7 +60,23 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # этот job — самый дорогой потребитель общего бюджета 1000 запросов/час
+      # на репозиторий (150-250 REST-вызовов за прогон при непустой очереди,
+      # issue #443), и именно он ронял чужие обязательные проверки живым
+      # прогоном 2026-09-06 (PR #428/#453). scripts/lib/rate_guard.py — порог
+      # и обоснование там же. `gh api rate_limit` не тратит собственную
+      # квоту (подтверждено, см. докстринг), поэтому эта проверка сама не
+      # приближает то, от чего защищает.
+      - name: Квота GitHub API — ранняя проверка
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job orchestra
+
       - name: Обход пула и очередь слияний
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # PAT для update-branch: GITHUB_TOKEN-обновления не зажигают проверки
@@ -86,8 +102,28 @@ jobs:
       # поставлена review:ok), эскалация — один раз на конкретный набор
       # нарушителей (issue_marker_times), не на каждый пульс.
       - name: Инварианты состояния репозитория
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/orchestra/repo_invariants.py --orchestra
+
+      # Гвардия «протухшей» метки blocked (#334): чисто читающий шаг, ничего
+      # не блокирует и не решает вместо владельца (снятие метки — по-прежнему
+      # ручное, docs/agents/LABELS.md). continue-on-error нарочно: красный шаг
+      # виден в логе (fail loud), но не гасит зелёный статус всего job'а — сам
+      # пульс (heartbeat_check, #120) читает историю ИМЕННО этого job'а
+      # orchestra (не предохранитель конвейера — тот читает worker.yml, это
+      # другой механизм, находка AI-ревью PR #336, третий раунд), и ложный
+      # «пульс пропал» от находки на живых issue дороже задержанного
+      # обнаружения протухшей метки.
+      - name: Гвардия протухшей метки blocked (#334)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Тот же канал эскалации, что у scheduler-шага выше (#120) — без него
+          # pulse_guard.escalate всегда вернёт «НЕ доставлен» (нет токена/чата).
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/stale_blocked_guard.py
