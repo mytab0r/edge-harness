@@ -1944,6 +1944,13 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
                          lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    # Детектор простоя (#201) — не предмет этого теста, но main() зовёт его
+    # безусловно; без мока непатченный detect_and_act/escalate_stale_auto_tasks
+    # бьёт по настоящему gh (нашла CI, не локальный прогон — токен раннера уже
+    # PAT/GITHUB_TOKEN, а personal auth разработчика молча делал вызов
+    # безобидным локально).
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(
         sch, "dispatch_conflict_rework",
         lambda repo, pulls, *, pool: (["конфликт расшит"], ["🔧 расшивка ушла"], True),
