@@ -203,9 +203,15 @@ for tool in git grep sed cut mktemp cat rm dirname env; do
   [ -n "$tool_path" ] || fail "сценарий 4: инструмент $tool не найден в окружении теста"
   ln -sf "$tool_path" "$shim4/$tool"
 done
+# Абсолютный путь к bash РЕЗОЛВИТСЯ ДО подмены PATH и передаётся напрямую
+# (не через шебанг `#!/usr/bin/env bash` скрипта) — тот же приём, что и в
+# case 7 task-branch.test.sh: шебанг сам вызывает `env bash`, а bash в шейм
+# не положен (safe_path его тоже вычёркивает вместе с /usr/bin) — без этого
+# обхода `/usr/bin/env: 'bash': No such file or directory» вместо «офлайн».
+bash4="$(command -v bash)"
 out4="$(cd "$WORK4" && PATH="$safe_path:$shim4" \
         env -u GITHUB_REPOSITORY -u CLAIM_ACTOR -u CLAIM_VIA -u LEASE_ALREADY_CLAIMED \
-        "$REPO/scripts/git/task-branch" 4-offline-task 2>&1)" \
+        "$bash4" "$REPO/scripts/git/task-branch" 4-offline-task 2>&1)" \
   || fail "сценарий 4 (офлайн, gh недоступен) должен создать ветку, не блокировать:\n$out4"
 printf '%s\n' "$out4" | grep -qi "gh недоступен" \
   || fail "сценарий 4: нет предупреждения про недоступный gh:\n$out4"
