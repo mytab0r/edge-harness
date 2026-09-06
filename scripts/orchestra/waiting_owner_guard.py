@@ -255,30 +255,47 @@ def waiting_owner_check(repo: str, now: datetime) -> list[str]:
         except RuntimeError as error:
             print(f"::warning::метка waiting:owner не поставлена на #{issue['number']}: {error}",
                   file=sys.stderr)
+            # Симметрично провалу remove_label ниже (находка AI-ревью PR #471):
+            # молчаливое «::warning:: и продолжаем» без строки отчёта могло
+            # оставить прогон вовсе без строк (холостое 💗 не печатается,
+            # раз candidates непуст) — провал постановки не должен быть тише
+            # провала снятия.
+            lines.append(f"🚨 #{issue['number']}: найден блок вариантов, но метка "
+                         f"waiting:owner НЕ поставлена: {error}")
 
     labeled = open_waiting_owner_issues(repo)
     if not labeled and not candidates:
         lines.append(f"💗 {WAITING_OWNER_LABEL}: открытых задач с меткой нет")
 
+    comments_by_number: dict[int, list[dict]] = {}
     for issue in labeled:
         comments = fetch_comments(repo, issue["number"])
+        comments_by_number[issue["number"]] = comments
         issue["comments_text"] = [comment.get("body") or "" for comment in comments]
-        option = decision_marker([issue.get("body") or ""] + issue["comments_text"])
-        if option is not None:
+
+    # find_resolved — то же чистое решение, что уже покрыто юнит-тестами
+    # (находка AI-ревью PR #471: не дублируем его логику инлайн здесь).
+    resolved_options = {item["number"]: item["option"] for item in find_resolved(labeled)}
+
+    for issue in labeled:
+        number = issue["number"]
+        comments = comments_by_number[number]
+        if number in resolved_options:
+            option = resolved_options[number]
             try:
-                remove_label(repo, issue["number"])
+                remove_label(repo, number)
             except RuntimeError as error:
-                print(f"::warning::метка waiting:owner не снята с #{issue['number']}: {error}",
+                print(f"::warning::метка waiting:owner не снята с #{number}: {error}",
                       file=sys.stderr)
-                lines.append(f"🚨 #{issue['number']}: решение получено (вариант {option}), "
+                lines.append(f"🚨 #{number}: решение получено (вариант {option}), "
                              f"но метка НЕ снята: {error}")
                 continue
             try:
-                pulse_guard.post_issue_comment(repo, issue["number"], resolved_comment_text(option))
+                pulse_guard.post_issue_comment(repo, number, resolved_comment_text(option))
             except RuntimeError as error:
-                print(f"::warning::подтверждение не оставлено в #{issue['number']}: {error}",
+                print(f"::warning::подтверждение не оставлено в #{number}: {error}",
                       file=sys.stderr)
-            lines.append(f"✅ #{issue['number']}: решение получено (вариант {option}), метка снята")
+            lines.append(f"✅ #{number}: решение получено (вариант {option}), метка снята")
             continue
 
         marker_times = [

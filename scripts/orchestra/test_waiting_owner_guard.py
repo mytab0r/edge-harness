@@ -275,6 +275,27 @@ def test_waiting_owner_check_auto_labels_new_candidate(monkeypatch):
     assert any(a == "labels[]=waiting:owner" for a in posted[0])
 
 
+def test_waiting_owner_check_reports_failed_auto_label_not_silently(monkeypatch):
+    """Находка AI-ревью PR #471: провал POST labels не должен быть тише
+    провала DELETE labels ниже — прогон обязан вернуть 🚨-строку, не пустой
+    список (который main() принял бы за холостой ход)."""
+    def fake(*args):
+        if args[0] == "-X" and args[1] == "POST" and "labels" in args[2]:
+            raise RuntimeError("HTTP 404: Label does not exist")
+        url = args[0]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
+            return [{"number": 500, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+            return []
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    lines = wog.waiting_owner_check(REPO, utc(12, 0))
+    assert len(lines) == 1
+    assert lines[0].startswith("🚨 #500")
+    assert not any(line.startswith("💗") for line in lines)
+
+
 def test_waiting_owner_check_resolves_on_decision_comment(monkeypatch, offline_telegram):
     """Мутация (б): комментарий с маркером «РЕШЕНИЕ: N» — метка снимается
     DELETE'ом, подтверждение оставлено, эскалация не идёт."""
