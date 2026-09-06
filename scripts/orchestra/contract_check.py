@@ -161,18 +161,23 @@ def main() -> int:
 
     problems: list[str] = []
     body = pull["body"] or ""
-    refs = [line for line in body.splitlines() if "#" in line]
     # Закрытие задачи — действие исполнителя ПОСЛЕ пост-мерж проверки, с уликами:
     # мерж доказывает PR, а не готовность задачи (кейс #56/#57: Closes закрыл
     # задачу до зелёной канарейки). GitHub сам авто-закрывает issue по ключевым
     # словам при слиянии, поэтому единственная преграда — контракт на входе.
-    close_lines = [
-        line for line in refs
-        if line.lstrip().lower().startswith(("closes", "fixes", "resolves"))
-    ]
-    if close_lines:
+    #
+    # Директива — только там, где её реально распознаёт GitHub (#423, живой
+    # ложноположительный случай PR #415: объяснение правила в теле красило
+    # PR так же, как настоящая директива). task_ref.closing_keyword_refs —
+    # одно место правды рядом с extract_task_refs (#398: declared_tasks/
+    # declares_task удалены, номер задачи — только из имени ветки): вырезает
+    # inline-код/fenced-код/HTML-комментарии, не привязано к началу строки
+    # (директива работает где угодно в теле).
+    close_refs = task_ref.closing_keyword_refs(body)
+    if close_refs:
         problems.append(
-            "Не пиши Closes/Fixes/Resolves: задачу закрывает исполнитель ПОСЛЕ "
+            "Не пиши Closes/Fixes/Resolves рядом с #N (нашёл: "
+            f"«{close_refs[0]}»): задачу закрывает исполнитель ПОСЛЕ "
             "пост-мерж проверки (деплой/канарейка/E2E), приложив улики. "
             "Ссылайся на задачу просто #N."
         )
