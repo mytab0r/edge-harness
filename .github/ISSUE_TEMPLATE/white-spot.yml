@@ -37,6 +37,17 @@ body:
       description: Что ломается или куда опираются, пока это не закрыто.
     validations:
       required: true
+  - type: input
+    id: blocked_by
+    attributes:
+      label: Чем блокируется
+      description: >-
+        Номера issue через пробел (#123 #124) или «ничем» (эта запись тоже входит в
+        пул воркера, метка task, #179 — граф зависимостей #361 её тоже касается).
+        Настоящая связь: python scripts/lib/task_deps.py block <эта#> <блокирующая#>.
+      placeholder: "ничем"
+    validations:
+      required: true
   - type: checkboxes
     attributes:
       label: Действия
