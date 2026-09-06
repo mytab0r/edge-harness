@@ -405,6 +405,39 @@ def test_reap_stale_skips_blocked_labeled_issue(monkeypatch):
     assert not any("timeline" in c for c in fake.calls)
 
 
+def test_pr_references_issue_true_on_branch_without_body_number():
+    # Находка AI-ревью PR #398: после #394 тело PR не обязано называть номер
+    # вовсе (шаблон говорит, что «#N» — для человека, не источник истины) —
+    # чистого references_task(body) стало недостаточно, PR с пустым/чужим
+    # телом, но веткой agent/256-… должен быть виден как ссылающийся на #256.
+    p = pull(500, ref="agent/256-fix-thing", pr_body="Просто описание, без номера.")
+    assert sch.pr_references_issue(p, 256) is True
+
+
+def test_pr_references_issue_false_when_neither_branch_nor_body_match():
+    p = pull(501, ref="agent/999-unrelated", pr_body="Тоже без номера.")
+    assert sch.pr_references_issue(p, 256) is False
+
+
+def test_reap_stale_skips_task_covered_by_pr_branch_without_body_number(monkeypatch):
+    # Тот же класс: reap_stale раньше сканировал только тело — контракт-
+    # проходящий PR с телом без номера (ветка agent/256-…) был бы невидим,
+    # и задача-«просрочена» снялась бы при живом PR.
+    old_assigned = [{"event": "assigned", "created_at": "2026-08-01T00:00:00Z"}]
+    fake = FakeGh({
+        "issues?state=open&labels=task": [issue(256, assignees=("mytab0r",))],
+        "issues/256/timeline?per_page=100": old_assigned,
+    })
+    patch_gh(monkeypatch, fake)
+    p = pull(500, ref="agent/256-fix-thing", pr_body="Просто описание, без номера.")
+    now = datetime.now(timezone.utc)
+
+    lines = sch.reap_stale(REPO, now, [p])
+
+    assert lines == []
+    assert fake.mutating_calls() == []
+
+
 # ── Поведение 1: готовый PR без вердикта — дёрнуть гейт самому ───────────────────
 
 
@@ -622,6 +655,28 @@ def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
     now = utc(2026, 9, 2, 12, 0)
     lines = sch.unhealthy_pulls(REPO, now, [p])
     assert any("ai:changes-requested" in line for line in lines)
+
+
+def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch):
+    # Тот же класс, что reap_stale выше (находка AI-ревью PR #398): тело PR
+    # без номера, но ветка agent/220-… — unhealthy_pulls обязан найти задачу
+    # через ветку, а не промолчать «нет ссылающегося PR».
+    task = issue(220)
+    p = pull(221, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z",
+              pr_body="Описание без номера задачи.", ref="agent/220-fix-thing")
+    fake = FakeGh({
+        "issues?state=open&labels=task": [task],
+        "commits/sha221/check-runs": CHECK_RUNS_RED,
+        "issues/220/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
+    lines = sch.unhealthy_pulls(REPO, now, [p])
+
+    assert any("возвращена в пул" in line and "221" in line for line in lines)
 
 
 def test_unhealthy_pulls_silent_before_threshold(monkeypatch):

@@ -233,7 +233,16 @@ def pr_references_issue(pull: dict, issue_number: int) -> bool:
     # ссылается на неё не веткой. Ошибиться в сторону «не трогать» тут
     # дешевле, чем в сторону «занята». Симметричная узкая проверка —
     # task_ref.resolve_pr_task, для решений вида «эта задача уже занята PR».
-    return task_ref.references_task(pull.get("body") or "", issue_number)
+    #
+    # После #394 тело PR не обязано называть номер вовсе (шаблон прямо
+    # говорит, что строка «#N» — для человека, не источник истины), поэтому
+    # чистого references_task(body) стало недостаточно: контракт-проходящий
+    # PR с телом без единого номера был бы невидим для reap_stale и
+    # unhealthy_pulls. Добавляем ветку как второй, столь же широкий признак.
+    return (
+        task_ref.references_task(pull.get("body") or "", issue_number)
+        or task_ref.resolve_pr_task(pull) == issue_number
+    )
 
 
 def reap_stale(repo: str, now: datetime, pulls: list[dict], merged: dict[int, dict] | None = None) -> list[str]:

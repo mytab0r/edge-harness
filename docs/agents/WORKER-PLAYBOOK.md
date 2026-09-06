@@ -72,10 +72,13 @@
 
 ## Грабли конвейера (каждая оплачена)
 
-- Контракт: задача резолвится по имени ветки (запасной путь — строка тела с
-  `#N`), задача ОТКРЫТА и назначена тебе; иначе — `contract:failed`. Для
-  docs-only после закрытой задачи — метка `orchestra:skip` + `gh run rerun
-  <orchestra-run> --failed` + `gh workflow run orchestra`.
+- Контракт: задача резолвится ТОЛЬКО по имени ветки (`agent/<N>-<slug>`),
+  тело PR не читается вовсе — задача ОТКРЫТА и назначена тебе; иначе —
+  `contract:failed`. Строка `#N` в теле — для человека, не запасной путь;
+  чинить `contract:failed` правкой тела не работает, нужна новая ветка
+  (`scripts/git/task-branch <N>-<slug>`). Для docs-only после закрытой задачи
+  — метка `orchestra:skip` + `gh run rerun <orchestra-run> --failed` +
+  `gh workflow run orchestra`.
 - Большие диффы (>800 строк): реальное ревью (второй агент, вердикт в PR) →
   метка `review:large-ok` → merge.
 - Второй гейт (#18): после `review:ok` дифф ревьюит AI-агент (workflow
