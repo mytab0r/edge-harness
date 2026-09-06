@@ -99,6 +99,17 @@ jobs:
           [ -n "$CF_TOKEN" ] || { echo "::error::CLOUDFLARE_API_TOKEN не задан"; exit 1; }
           [ -n "$CF_ACCOUNT" ] || { echo "::error::CLOUDFLARE_ACCOUNT_ID не задан"; exit 1; }
 
+      # Коллизия имён с апстримом (issue #518/#547/#551, класс PR #521): три
+      # раза всплывала ПОСТФАКТУМ — красной сборкой или жалобой владельца,
+      # не проверкой. Проверка читает реальный апстримный артефакт на пине
+      # (не захардкоженный список) ДО любых дорогих шагов сборки — красный
+      # деплой лучше, чем "тихо накатили сломанный settings-раздел".
+      - name: Коллизия имён с апстримом (namespace/label/inject/slot)
+        if: steps.route.outputs.plugins != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node dsh-edge/check-upstream-namespace-collision.mjs
+
       # ── Основной путь: сборка из исходников с плагинами ────────────────────────
 
       - name: Клон апстрима на пине
