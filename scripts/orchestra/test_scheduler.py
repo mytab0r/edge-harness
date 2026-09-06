@@ -559,7 +559,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия; здесь важен
@@ -599,7 +599,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
 
     def boom(repo, now, lines, run_url=None):
@@ -637,7 +637,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
@@ -664,7 +664,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
         sch, "accept_merged_tasks",
         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], ["🚨 #227: улика не проверена"], True))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
@@ -3466,7 +3466,7 @@ def test_wip_gate_matches_live_repository_snapshot_2026_09_06(monkeypatch):
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
     })
     patch_gh(monkeypatch, fake)
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 5), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 5), pulls, pool=[])
     assert allowed is False
     assert any("25" in line and "12" in line for line in observations + actions)
     assert any("не берутся" in line for line in observations + actions)
@@ -3495,7 +3495,7 @@ def test_integration_gate_closed_dispatches_rework_not_new_task(monkeypatch):
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 12, 0), rework_pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 12, 0), rework_pulls, pool=[])
     assert allowed is False  # WIP_LIMIT PR ждут доводки — новые задачи закрыты
     pool = [issue(95, assignees=()), issue(89, assignees=())]
     d_observations, d_actions = sch.dispatch_worker(
@@ -3520,7 +3520,7 @@ def test_integration_gate_open_dispatches_oldest_free_task_as_before(monkeypatch
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 12, 0), few_rework_pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 12, 0), few_rework_pulls, pool=[])
     assert allowed is True
     pool = [issue(95, assignees=()), issue(89, assignees=())]
     d_observations, d_actions = sch.dispatch_worker(
@@ -3536,7 +3536,7 @@ def test_wip_gate_allows_dispatch_when_rework_below_limit(monkeypatch):
     fake = FakeGh({"issues/120/comments?per_page=100": []})
     patch_gh(monkeypatch, fake)
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT - 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[])
     assert allowed is True
     assert actions == []  # эпизода не было — просто наблюдение, действий нет
     assert any("разрешены" in line for line in observations)
@@ -3550,7 +3550,7 @@ def test_wip_gate_closes_dispatch_when_rework_at_limit_and_posts_marker_once(mon
     })
     patch_gh(monkeypatch, fake)
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[])
     assert allowed is False
     assert any("не берутся" in line for line in observations + actions)
     posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
@@ -3566,7 +3566,7 @@ def test_wip_gate_does_not_repost_open_marker_while_episode_active(monkeypatch):
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[])
     assert allowed is False
     assert fake.mutating_calls() == []  # уже оповещено — наблюдение, не действие
     assert any("не берутся" in line for line in observations)
@@ -3580,7 +3580,7 @@ def test_wip_gate_reopens_dispatch_and_posts_close_marker_when_queue_drains(monk
     })
     patch_gh(monkeypatch, fake)
     pulls = [pull(1, labels=["ai:changes-requested"])]  # очередь поредела ниже лимита
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[])
     assert allowed is True
     posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
     assert len(posts) == 1
@@ -3595,10 +3595,42 @@ def test_wip_gate_escalates_when_episode_older_than_stuck_threshold(monkeypatch)
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls)
+    # Доводка доступна: свободная задача #89 объявлена открытым PR (ветка
+    # agent/89-... в снимке pulls) — сигнал обязан назвать этот факт и адрес,
+    # а не гадать между «не успевает» и «доводить нечего» (AGENTS.md).
+    pulls.append(pull(500, labels=["review:ok"], ref="agent/89-rework"))
+    pool = [issue(89, assignees=())]
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool)
     assert allowed is False
     assert escalated and sch.WIP_GATE_STUCK_MARKER_PREFIX in escalated[0]
+    assert "доводить есть что" in escalated[0]
+    assert "#89" in escalated[0]
+    assert "не успевает" in escalated[0]
+    assert "диспатчей доводки не было" not in escalated[0]
     assert any("держит взятие новых задач" in line for line in actions)
+
+
+def test_wip_gate_stuck_escalation_states_nothing_to_rework_when_no_targets(monkeypatch):
+    """Находка ревью PR #466 + AGENTS.md «алерт не гадает»: когда ни у одной
+    свободной задачи нет открытого PR, сигнал не вправе утверждать, что
+    «воркер всё это время диспетчируется на доводку» (диспатчей не было), и
+    не вправе оставлять владельцу выбор из «либо/либо» — код различает причины
+    сам по данным того же прогона. Мутация: замени ветку `if targets:` в
+    wip_gate на безусловный текст «доводить есть что» — тест покраснеет."""
+    opened_at = utc(2026, 9, 6, 0, 0)
+    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[])
+    assert allowed is False
+    assert escalated
+    assert "доводить нечего" in escalated[0]
+    assert "диспатчей доводки не было" in escalated[0]
+    assert "доводить есть что" not in escalated[0]
+    assert "диспетчируется" not in escalated[0]
 
 
 def test_wip_gate_does_not_escalate_twice_for_the_same_stuck_episode(monkeypatch):
@@ -3611,7 +3643,7 @@ def test_wip_gate_does_not_escalate_twice_for_the_same_stuck_episode(monkeypatch
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать повторно"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[])
     assert allowed is False
     assert fake.mutating_calls() == []  # ни открытия (уже есть), ни повторной тревоги
 
@@ -3637,7 +3669,7 @@ def test_wip_gate_does_not_escalate_blindly_when_stuck_markers_unreadable(monkey
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail(
         "не должен эскалировать вслепую при сбое чтения stuck-маркеров"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
-    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls)
+    observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[])
     assert allowed is False
     assert any("не прочитаны" in line for line in actions)
 
@@ -3671,7 +3703,7 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     monkeypatch.setattr(sch, "dispatch_conflict_rework", lambda repo, pulls, pool: ([], [], False))
     monkeypatch.setattr(
         sch, "wip_gate",
-        lambda repo, now, pulls: (["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
+        lambda repo, now, pulls, pool: (["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
@@ -3711,7 +3743,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], [], False))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     # Не предмет этого теста (#427) — issue(89) без исполнителя и старым
     # дефолтным created_at реально старее STALE_HOURS к моменту прогона:
     # непатченный mark_stale_unclaimed бил бы по настоящему gh (нашла CI, не я).
@@ -4096,7 +4128,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
-    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сбоя тут нет"))
