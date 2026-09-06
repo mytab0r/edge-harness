@@ -35,7 +35,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
@@ -78,6 +78,28 @@ PROBE_MARKER = "[статус конвейера: проба"
 # PR #318, п.1: было — один комментарий на всю жизнь задачи #120).
 HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
 HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
+
+# ── Сторож живости: событийный будильник оркестратора (issue #297/#456, #510/#519) ──
+# Класс, ОТЛИЧНЫЙ от heartbeat_check выше: heartbeat_check видит «пульс жив»,
+# если сработал ЛЮБОЙ из двух легитимных каналов (schedule ИЛИ workflow_dispatch,
+# ORCHESTRA_TICK_EVENTS) — и потому слеп к образцовому случаю #510:
+# scripts/gh/wake_orchestra.sh потерял бит исполнения, событийный канал не
+# работал ДВА ЧАСА, а cron (schedule) исправно тикал каждые 15 мин и держал
+# heartbeat_check зелёным. Один канал маскировал поломку другого. Этот сторож
+# проверяет ИМЕННО событийный канал — но только когда он был нужен (не ложная
+# тревога): ai-review.yml/pr-review.yml реально завершились в окне, то есть
+# был повод разбудить оркестратор шагом «Разбудить оркестратор».
+EVENT_WAKE_GRACE_MINUTES = 5
+# Дать шагу «Разбудить оркестратор» время дойти до создания прогона
+# orchestra.yml (очередь GitHub Actions, не мгновенно) — ревью моложе этого
+# порога ещё не «повод для тревоги», это не окончание применимости.
+EVENT_WAKE_STALE_AFTER_MINUTES = 30
+# Два такта cron orchestra.yml (15 мин) — дольше значит событийный канал
+# сломан, не просто ждёт очереди. Само число не переиспользует
+# HEARTBEAT_MAX_AGE_MINUTES: разный смысл (там — «любой тик пропал полностью»,
+# здесь — «конкретно событийный канал не отработал после конкретного повода»).
+EVENT_WAKE_MARKER = "[статус: событийный будильник не сработал]"
+EVENT_WAKE_RESUMED_MARKER = "[статус: событийный будильник снова работает]"
 
 # Success-маркер авто-возобновления (#220): scheduler.after_merge ставит его в
 # #120, когда слит PR задачи ветки, а последний красный прогон worker.yml
@@ -775,6 +797,93 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
             f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
             f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+
+
+def decide_event_wake(
+    review_runs: list[dict], dispatch_runs: list[dict], now: datetime,
+    grace_minutes: float = EVENT_WAKE_GRACE_MINUTES,
+    stale_after_minutes: float = EVENT_WAKE_STALE_AFTER_MINUTES,
+) -> tuple[str, datetime | None]:
+    """Чистое решение события #510/#519. review_runs — прогоны ai-review.yml/
+    pr-review.yml (прод-форма workflow_runs); dispatch_runs — прогоны
+    orchestra.yml с event=workflow_dispatch. 'not_applicable' — ни один
+    прогон ревью не попал в применимое окно (grace..stale_after минут
+    назад) — нечего было будить, тревоги не заводим. 'ok'/'stale' —
+    применимо: есть ли тик оркестратора не раньше anchor (самый ранний
+    применимый прогон ревью) минус небольшой допуск на порядок событий
+    внутри одной минуты GitHub API."""
+    qualifying = [
+        r for r in review_runs
+        if grace_minutes <= minutes_between(parse_time(r["created_at"]), now) <= stale_after_minutes
+    ]
+    if not qualifying:
+        return "not_applicable", None
+    anchor = min(parse_time(r["created_at"]) for r in qualifying)
+    ok = any(parse_time(r["created_at"]) >= anchor - timedelta(minutes=2) for r in dispatch_runs)
+    return ("ok" if ok else "stale"), anchor
+
+
+def event_wake_alert_text(anchor: datetime, age_minutes: float) -> str:
+    return (
+        f"🚨 edge-harness: {EVENT_WAKE_MARKER}\n"
+        f"ai-review.yml/pr-review.yml завершились {int(age_minutes)} мин назад "
+        f"({anchor.isoformat()}), а прогона orchestra.yml с event=workflow_dispatch "
+        "с этого момента не найдено — событийный будильник "
+        "(scripts/gh/wake_orchestra.sh, #297/#456) не сработал. Образцовый "
+        "случай — #510 (бит исполнения); проверь также права actions:write "
+        "у GITHUB_TOKEN на форковых/dependabot PR."
+    )
+
+
+def event_wake_check(repo: str, now: datetime) -> list[str]:
+    """Сторож живости #510/#519 — отличается от heartbeat_check выше классом:
+    тот видит «пропал пульс ЦЕЛИКОМ» (ни одного тика ни по одному каналу),
+    этот — «событийный канал молчит, пока расписание маскирует поломку».
+
+    Применимость проверяется ПЕРВОЙ, дёшево (2 вызова recent_runs) — холостая
+    очередь без завершившихся ai-review/pr-review за окно не делает больше
+    ни одного вызова (гвардия холостого хода, тот же приём, что у
+    stale_ready_pulls/dispatch_conflict_rework)."""
+    review_runs = recent_runs(repo, "ai-review.yml", per_page=5) + recent_runs(repo, "pr-review.yml", per_page=5)
+    state, anchor = decide_event_wake(review_runs, [], now)
+    if state == "not_applicable":
+        return []
+    dispatch_runs = recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=10, event="workflow_dispatch")
+    state, anchor = decide_event_wake(review_runs, dispatch_runs, now)
+    age = minutes_between(anchor, now)
+
+    if state == "ok":
+        # Эпизод закрывается явно, как только тик снова нашёлся — тот же
+        # приём, что HEARTBEAT_NO_TICKS/HEARTBEAT_TICKS_RESUMED выше:
+        # без закрывающего маркера episode_reopened не увидит восстановление
+        # и следующий сбой останется заглушен старым маркером.
+        try:
+            open_times = issue_marker_times(repo, WATCHDOG_ISSUE, EVENT_WAKE_MARKER)
+            if open_times:
+                close_times = issue_marker_times(repo, WATCHDOG_ISSUE, EVENT_WAKE_RESUMED_MARKER)
+                if not close_times or max(open_times) > max(close_times):
+                    post_issue_comment(
+                        repo, WATCHDOG_ISSUE,
+                        f"✅ edge-harness: {EVENT_WAKE_RESUMED_MARKER}\n"
+                        "Прогон orchestra.yml с event=workflow_dispatch снова "
+                        "найден после завершения ai-review.yml/pr-review.yml — "
+                        "эпизод «событийный будильник не сработал» закрыт.",
+                    )
+        except RuntimeError as error:
+            print(f"::warning::закрытие эпизода будильника в #{WATCHDOG_ISSUE} не оставлено: {error}",
+                  file=sys.stderr)
+        return [f"💗 событийный будильник оркестратора в норме (ревью {int(age)} мин назад, тик найден)"]
+
+    try:
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, EVENT_WAKE_MARKER)
+        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, EVENT_WAKE_RESUMED_MARKER)
+    except RuntimeError as error:
+        return [f"⚠️ не смог сверить маркеры событийного будильника #{WATCHDOG_ISSUE}: {error}"]
+    if not episode_reopened(open_times, close_times):
+        return [f"🚨 событийный будильник оркестратора не сработал ({int(age)} мин назад, эпизод уже оповещён)"]
+    text = event_wake_alert_text(anchor, age)
+    result = escalate(repo, WATCHDOG_ISSUE, text)
+    return [f"🚨 событийный будильник оркестратора не сработал, ревью {int(age)} мин назад без тика ({result})"]
 
 
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]:

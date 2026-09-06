@@ -547,6 +547,7 @@ def test_unhealthy_pulls_calls_append_session_notes_with_empty_list_when_queue_e
 def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -581,6 +582,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     включая уже сделанное слияние — тот же приём, что у archive_hard_failure."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -624,6 +626,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
 def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -649,6 +652,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     ветка, независимая от archive_hard_failure."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -2262,6 +2266,7 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     dispatch_worker обязан промолчать."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -3301,6 +3306,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     вовсе (проводка в main, не внутри dispatch_worker)."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -3387,6 +3393,11 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         # escalate_stale_auto_tasks всё равно читает список автозадач — маршрут
         # нужен, пустой список => дальше вызовов нет вовсе.
         "issues?state=open&labels=auto-detected": [],
+        # Сторож живости событийного будильника (#510/#519): холостая очередь —
+        # ни одного недавнего прогона ai-review.yml/pr-review.yml, event_wake_check
+        # уходит в "not_applicable" за 2 дешёвых вызова, третьего не делает.
+        "workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
@@ -3455,6 +3466,10 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         # это выглядит как симптом для stall_detector и требует ещё один
         # маршрут (issue comment), не относящийся к предмету этого теста.
         "graphql": graphql_pool_response([old_task]),
+        # Сторож живости событийного будильника (#510/#519) — см. комментарий
+        # в test_main_makes_zero_mutating_calls_on_fully_empty_queue выше.
+        "workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
@@ -3681,6 +3696,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     с ещё открытой (на самом деле уже закрытой) issue и увидит её снова."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "event_wake_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])

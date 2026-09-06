@@ -703,6 +703,149 @@ def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkey
     assert posted == []
 
 
+# ── Сторож живости: событийный будильник оркестратора (#510/#519) ────────────────
+# Класс, ОТЛИЧНЫЙ от heartbeat_check выше: тот видит «пропал пульс ЦЕЛИКОМ»
+# (ни одного тика ни по одному из ORCHESTRA_TICK_EVENTS), этот — «событийный
+# канал молчит, пока расписание маскирует поломку» (образцовый случай #510:
+# wake_orchestra.sh без бита исполнения, событийный тик не работал 2 часа,
+# cron держал heartbeat_check зелёным).
+
+
+def review_run(created_at, run_id):
+    return run("success", created_at, run_id, event="pull_request")
+
+
+def test_decide_event_wake_not_applicable_without_recent_review_runs():
+    # Нет прогонов ai-review/pr-review в применимом окне — нечего было
+    # будить, тревога не заводится (главное требование: не ложная тревога).
+    state, anchor = pg.decide_event_wake([], [], NOW)
+    assert state == "not_applicable" and anchor is None
+
+
+def test_decide_event_wake_ok_when_dispatch_tick_found_after_anchor():
+    review_runs = [review_run("2026-08-31T11:40:00Z", 1)]  # 20 мин назад
+    dispatch_runs = [run("success", "2026-08-31T11:41:00Z", 2, event="workflow_dispatch")]
+    state, anchor = pg.decide_event_wake(review_runs, dispatch_runs, NOW)
+    assert state == "ok"
+    assert anchor == pg.parse_time("2026-08-31T11:40:00Z")
+
+
+def test_decide_event_wake_stale_when_review_completed_without_dispatch_tick():
+    # Образцовый случай #510: ревью отработало, событийного тика нет вовсе.
+    review_runs = [review_run("2026-08-31T11:40:00Z", 1)]  # 20 мин назад, в окне (5..30)
+    state, anchor = pg.decide_event_wake(review_runs, [], NOW)
+    assert state == "stale"
+    assert anchor == pg.parse_time("2026-08-31T11:40:00Z")
+
+
+def test_decide_event_wake_respects_grace_period():
+    # Ревью завершилось 2 минуты назад — меньше EVENT_WAKE_GRACE_MINUTES (5):
+    # шагу «Разбудить» ещё не дали время дойти, тревоги пока нет.
+    review_runs = [review_run("2026-08-31T11:58:00Z", 1)]
+    state, anchor = pg.decide_event_wake(review_runs, [], NOW)
+    assert state == "not_applicable"
+
+
+def test_decide_event_wake_ignores_review_runs_older_than_stale_window():
+    # Ревью завершилось 40 минут назад — старше EVENT_WAKE_STALE_AFTER_MINUTES
+    # (30): это уже прошлый эпизод, не повод для новой тревоги этим окном.
+    review_runs = [review_run("2026-08-31T11:20:00Z", 1)]
+    state, anchor = pg.decide_event_wake(review_runs, [], NOW)
+    assert state == "not_applicable"
+
+
+def test_decide_event_wake_mutation_guard_dispatch_before_anchor_does_not_count():
+    # Мутация-гвардия: тик ДО anchor (устаревший, от предыдущего события) не
+    # доказывает, что ИМЕННО это ревью разбудило оркестратор — без сравнения
+    # с anchor любой старый тик молча закрывал бы новый эпизод.
+    review_runs = [review_run("2026-08-31T11:40:00Z", 1)]
+    old_dispatch = [run("success", "2026-08-31T10:00:00Z", 2, event="workflow_dispatch")]
+    state, _ = pg.decide_event_wake(review_runs, old_dispatch, NOW)
+    assert state == "stale"
+
+
+def test_event_wake_check_quiet_and_cheap_when_no_recent_review_runs(monkeypatch):
+    """Гвардия холостого хода: пустая очередь (ни одного недавнего прогона
+    ревью) — ровно 2 вызова gh (ai-review.yml + pr-review.yml), без третьего
+    запроса за тиками оркестратора."""
+    fake = FakeGh({
+        "workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    lines = pg.event_wake_check("mytab0r/edge-harness", NOW)
+    assert lines == []
+    assert len(fake.calls) == 2
+
+
+def test_event_wake_check_escalates_on_stale_and_dedupes_same_episode(monkeypatch):
+    fake = FakeGh({
+        "workflows/ai-review.yml/runs": {"workflow_runs": [review_run("2026-08-31T11:40:00Z", 1)]},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=10&event=workflow_dispatch": {"workflow_runs": []},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    lines = pg.event_wake_check("mytab0r/edge-harness", NOW)
+    assert lines and lines[0].startswith("🚨")
+    assert len(posted) == 1 and pg.EVENT_WAKE_MARKER in posted[0]
+    assert len(sent) == 1 and pg.EVENT_WAKE_MARKER in sent[0]
+
+    # тот же эпизод (маркер уже стоит новее anchor) — второй пульс молчит
+    fake.routes["issues/120/comments"] = [
+        {"created_at": NOW.isoformat(), "body": f"🚨 edge-harness: {pg.EVENT_WAKE_MARKER}\nстарый"}]
+    posted.clear()
+    sent.clear()
+    lines2 = pg.event_wake_check("mytab0r/edge-harness", NOW)
+    assert posted == [] and sent == []
+    assert lines2 and "уже оповещён" in lines2[0]
+
+
+def test_event_wake_check_closes_episode_when_tick_returns(monkeypatch):
+    fake = FakeGh({
+        "workflows/ai-review.yml/runs": {"workflow_runs": [review_run("2026-08-31T11:40:00Z", 1)]},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=10&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-08-31T11:41:00Z", 2, event="workflow_dispatch")]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T10:00:00Z",
+             "body": f"🚨 edge-harness: {pg.EVENT_WAKE_MARKER}\nстарый эпизод"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+
+    lines = pg.event_wake_check("mytab0r/edge-harness", NOW)
+    assert any("в норме" in line for line in lines)
+    assert len(posted) == 1 and pg.EVENT_WAKE_RESUMED_MARKER in posted[0]
+
+
+def test_event_wake_check_does_not_reclose_already_closed_episode(monkeypatch):
+    fake = FakeGh({
+        "workflows/ai-review.yml/runs": {"workflow_runs": [review_run("2026-08-31T11:40:00Z", 1)]},
+        "workflows/pr-review.yml/runs": {"workflow_runs": []},
+        "workflows/orchestra.yml/runs?per_page=10&event=workflow_dispatch": {"workflow_runs": [
+            run("success", "2026-08-31T11:41:00Z", 2, event="workflow_dispatch")]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T09:00:00Z",
+             "body": f"🚨 edge-harness: {pg.EVENT_WAKE_MARKER}\nстарый эпизод"},
+            {"created_at": "2026-08-31T10:00:00Z",
+             "body": f"✅ edge-harness: {pg.EVENT_WAKE_RESUMED_MARKER}\nзакрыт"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+
+    pg.event_wake_check("mytab0r/edge-harness", NOW)
+    assert posted == []
+
+
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
 
 
