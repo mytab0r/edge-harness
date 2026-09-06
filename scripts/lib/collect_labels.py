@@ -9,13 +9,25 @@
   1. Метки-вердикты ревью (review:*, ai:*) — импортом настоящих констант из
      scripts/lib/review_labels.py (существующее место правды, задача #18) —
      не переписываются строками.
-  2. Остальные метки — регулярками по трём формам записи литерала, реально
+  2. Остальные метки — регулярками по четырём формам записи литерала, реально
      встречающимся в этом репозитории:
        - Python-константы `*_LABEL = "значение"` (contract_check.py,
          scheduler.py: SKIP_LABEL, TASK_LABEL, CONFLICT_LABEL);
        - прямые литералы в вызовах gh/jq (`labels[]=contract:failed`,
          `labels[]=task`, `select(.name == "task")`, `--add-label blocked`);
-       - YAML-шапка шаблонов issue (`labels: [task]`).
+       - YAML-шапка шаблонов issue (`labels: [task]`);
+       - YAML-дропдаун `options:` шаблонов issue (`area:worker`/`area:process`
+         и т.п. — `.github/ISSUE_TEMPLATE/task.yml`, поле «Площадь»). Найдено
+         задачей #361: до этой правки дропдаун не сканировался вовсе — все
+         пять `area:*` были невидимы гвардии реестра меток
+         (`test_label_registry.py`), хотя реально применяются как метки
+         (`gh issue edit --add-label area:worker` по конвенции агентов —
+         подтверждено живым запросом: 27/28 issues несут `area:worker`/
+         `area:orchestra`). Регэксп ограничен строками, ЦЕЛИКОМ совпадающими
+         с `_LABEL_TOKEN` (нижний регистр, `[a-z0-9:_-]`) — не ловит
+         содержательные Cyrillic-предложения дропдауна «Тип» в
+         `white-spot.yml` («Противоречие (док ↔ код...)» и т.п.), у которых
+         нет ни одного полного совпадения со схемой литерала метки.
 
 Гвардия расширяется правкой ЭТИХ regex'ов, если код начнёт метить иначе —
 не строкой в списке меток.
@@ -50,6 +62,15 @@ _JQ_SELECT_RE = re.compile(r'select\(\.name == "(' + _LABEL_TOKEN + r')"\)')
 _ADD_LABEL_RE = re.compile(r"--add-label\s+(" + _LABEL_TOKEN + r")\b")
 # Форма 3: YAML-шапка шаблона issue `labels: [значение, ...]`.
 _YAML_LABELS_RE = re.compile(r"^labels:\s*\[([^\]]*)\]", re.MULTILINE)
+# Форма 3б: YAML-дропдаун `options:\n  - значение\n  - значение2` шаблона
+# issue (поле «Площадь», area:*) — блок отступленных `- ...` строк сразу
+# после `options:`, до первой строки, что не начинается с `-` (следующий
+# ключ шаблона). Внутри блока берутся ТОЛЬКО строки, целиком совпадающие с
+# `_LABEL_TOKEN` — «- Противоречие (док ↔ код...)» дропдауна «Тип» в
+# white-spot.yml не матчит целиком (Cyrillic, пробелы, скобки) и отсеивается
+# на этом шаге, не блочным регэкспом.
+_YAML_OPTIONS_BLOCK_RE = re.compile(r"options:\s*\n((?:[ \t]+-[ \t].*\n?)+)")
+_YAML_OPTION_ITEM_RE = re.compile(r"^\s*-\s*(" + _LABEL_TOKEN + r")\s*$", re.MULTILINE)
 # Форма 4: массив меток в TS-коде морды `labels: ["task", "source:inbox"]`
 # (cf-worker/src ставит метки при создании issue из инбокса; без этого скана
 # метка появлялась в морде молча, мимо реестра — ревью PR #173).
@@ -103,6 +124,8 @@ def _scan_issue_templates() -> set[str]:
         text = path.read_text(encoding="utf-8")
         for match in _YAML_LABELS_RE.findall(text):
             found.update(item.strip() for item in match.split(",") if item.strip())
+        for block in _YAML_OPTIONS_BLOCK_RE.findall(text):
+            found.update(_YAML_OPTION_ITEM_RE.findall(block))
     return found
 
 

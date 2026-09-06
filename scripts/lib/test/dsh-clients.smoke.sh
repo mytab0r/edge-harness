@@ -311,6 +311,16 @@ case "$sig" in
     # проверку (сама задача занятости решается ниже, замком/веткой), поэтому
     # заглушка отвечает одинаково открытой/размеченной задачей для любого номера.
     resp '{"state":"open","labels":[{"name":"task"}]}' ;;
+  *"graphql"*"issues(states: OPEN"*)
+    # Пул через GraphQL (#361, task_deps.py::fetch_pool) — тот же процесс-
+    # уровень, что и остальной этот файл (subprocess.run, export -f не
+    # достаёт): нода собирается из GH_ISSUE_LIST_JSON (REST-форма, уже есть
+    # у сценариев auto) в форму GraphQL-ответа. Граф блокировок в smoke пуст
+    # (blockedBy/blocking всегда []) — сценарии этого файла его не проверяют,
+    # только фильтр «свободна/занята» (locked/assignees).
+    nodes=$(printf '%s' "${GH_ISSUE_LIST_JSON:-[]}" | command jq -c \
+      '[.[] | {number, title, labels: {nodes: (.labels // [])}, assignees: {nodes: (.assignees // [])}, blockedBy: {nodes: []}, blocking: {nodes: []}}]')
+    resp "{\"data\":{\"repository\":{\"issues\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":$nodes}}}}" ;;
   *)
     echo "gh: SMOKE: заглушка не знает вызов: $sig" >&2
     exit 99 ;;
