@@ -78,6 +78,25 @@ def test_probe_route_sends_secret_header_and_empty_object():
     assert captured["data"] == b"{}"
 
 
+def test_request_overrides_default_urllib_user_agent():
+    """Регрессия issue #524: дефолтный `Python-urllib/…` от urllib.request
+    ловит Cloudflare error 1010 (Browser Integrity Check) перед воркером на
+    `*.workers.dev` раньше, чем запрос доходит до кода — засвидетельствовано
+    живым прогоном из GitHub Actions (curl тем же секретом — 400, дефолтный
+    urllib — 403, urllib с любым не-дефолтным User-Agent — снова 400).
+    Убери переопределение из `_request()` — тест обязан покраснеть."""
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["user_agent"] = request.get_header("User-agent")
+        raise _http_error(400, {"error": "need_source_msg_id"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        rw.probe_route("https://harness.example", "the-secret")
+    assert captured["user_agent"] is not None
+    assert not captured["user_agent"].startswith("Python-urllib")
+
+
 # ── set_webhook / get_webhook_info ──────────────────────────────────────────
 
 

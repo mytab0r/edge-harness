@@ -23,6 +23,17 @@ Telegram доставит их через новый вебхук (идемпо�
 TELEGRAM_BOT_TOKEN/TELEGRAM_WEBHOOK_SECRET в текст исключений не
 подставляется нигде в этом файле.
 
+Заголовок User-Agent (issue #524): по умолчанию `urllib.request` отправляет
+`Python-urllib/<версия>` — Cloudflare перед `{HARNESS_URL}` (воркер живёт на
+shared-зоне `*.workers.dev`, своих правил WAF там нет, см.
+docs/research/20-cloudflare-free.md) отвечает на этот конкретный User-Agent
+403 `error code: 1010` (Browser Integrity Check) ДО того, как запрос доходит
+до воркера — измерено живым прогоном из GitHub Actions: curl тем же секретом
+с того же job получает штатный 400 need_source_msg_id, тот же urllib с тем же
+секретом без переопределения User-Agent — 403 1010, тот же urllib с любым
+неблокируемым User-Agent — снова 400. Поэтому здесь свой честный UA, а не
+имитация браузера.
+
 Запуск:  python scripts/telegram/register_webhook.py
 Тесты:   python -m pytest scripts/telegram/test_register_webhook.py -q
 """
@@ -37,6 +48,10 @@ import urllib.request
 
 WEBHOOK_PATH = "/api/messages/ingest"
 TIMEOUT = 15
+# См. докстрок модуля, issue #524: значение по умолчанию у urllib.request
+# ловит Cloudflare error 1010 перед *.workers.dev — здесь единственное место
+# правды, читают все вызовы _request через дефолт headers.
+USER_AGENT = "edge-harness-telegram-webhook/1 (+https://github.com/mytab0r/edge-harness)"
 
 
 def _request(
@@ -48,7 +63,8 @@ def _request(
 ) -> tuple[int, dict | None]:
     """Возвращает (http_status, json_или_None). URL строит вызывающий —
     здесь он не логируется и не появляется в тексте исключений."""
-    request = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
+    merged_headers = {"User-Agent": USER_AGENT, **(headers or {})}
+    request = urllib.request.Request(url, method=method, headers=merged_headers, data=data)
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             body = response.read()
