@@ -66,6 +66,15 @@ HEARTBEAT_MARKER = "[статус пульса: пропадал]"
 # ищется подстрокой без номера (issue_marker_times), номер разбирается отдельно
 # (probe_marker_attempts) там, где нужна выдержка, а не просто факт «была проба».
 PROBE_MARKER = "[статус конвейера: проба"
+# Скобочные, как остальные (докстринг модуля требует — находка ревью PR #318,
+# п.2: голый CAPS-токен без скобок мог случайно процитироваться в обсуждении
+# #120 и навсегда подавить комментарий как «уже бывший»). Пара маркеров, а не
+# один: у эпизода «тиков нет вовсе» нет успешного прогона, чей timestamp можно
+# сравнить (в отличие от HEARTBEAT_MARKER/pause_notification_pending) — эпизод
+# закрывается ЯВНЫМ комментарием, когда тики снова нашлись (находка ревью
+# PR #318, п.1: было — один комментарий на всю жизнь задачи #120).
+HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
+HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
 
 # ── Пороги петли открытого PR (#196) ─────────────────────────────────────────────
 # Три поведения scheduler.py читают пороги отсюда — рядом с остальными порогами
@@ -224,7 +233,85 @@ def pause_notification_pending(marker_times: list[datetime], last_success_at: da
     return max(marker_times) < last_success_at
 
 
+def episode_reopened(open_times: list[datetime], close_times: list[datetime]) -> bool:
+    """Двухмаркерный приём для эпизода без success-timestamp для сравнения
+    (находка ревью PR #318, п.1): открывающего маркера ещё не было — это
+    первое объявление; открывающий маркер старше самого свежего закрывающего —
+    предыдущий эпизод закрылся, текущий — новый, объявляем; открывающий маркер
+    новее (или закрывающего вовсе нет) — эпизод всё ещё тот же, повтор не шлём."""
+    if not open_times:
+        return True
+    if not close_times:
+        return False
+    return max(open_times) < max(close_times)
+
+
 # ── Чистые решения: возраст пульса ───────────────────────────────────────────────
+
+
+ORCHESTRA_TICK_EVENTS = ("schedule", "workflow_dispatch")
+
+
+def real_orchestra_ticks(runs: list[dict]) -> list[dict]:
+    """Клиентский фильтр-гвардия (защита в глубину) поверх серверного:
+    прогоны РЕАЛЬНОГО job'а `orchestra` (schedule/workflow_dispatch), не
+    `contract` того же файла (issue #133, живой замер 2026-09-05).
+
+    `orchestra.yml` несёт два job'а: `contract` — на КАЖДЫЙ `pull_request`,
+    быстрая проверка контракта PR↔задача, ничего общего с пульсом планировщика
+    (`if: github.event_name == 'pull_request'`); `orchestra` — сам
+    планировщик (мерж-очередь, предохранитель, ЭТОТ watchdog) — только на
+    `schedule`/`workflow_dispatch` (`if: github.event_name != 'pull_request'`).
+    `heartbeat_check` до этой правки брал последний success БЕЗ учёта
+    события: частые зелёные `contract`-прогоны (от параллельных PR нескольких
+    агентов, десятки в час) маскировали то, что job `orchestra` не
+    запускался часами — ровно тогда, когда наблюдатель нужнее всего (тот же
+    класс силент-неправды, что #303 уже закрыл в `fetchLatestOrchestraRunId`
+    фильтром `event=workflow_dispatch`, только там событие ровно одно
+    легитимное, а здесь два: `schedule` И `workflow_dispatch`, поэтому
+    фильтр — исключение `pull_request`, а не единственное разрешённое
+    значение). Живая улика: 2026-09-05, DO-пульс (`workflow_dispatch`) не
+    создавал ран orchestra.yml с 04:35 до как минимум 14:24 (~9ч49м при
+    цикле 15 мин), а `heartbeat_check` не закричал ни разу — маскировали
+    непрерывные `pull_request`-прогоны `contract`.
+
+    Клиентский фильтр САМ ПО СЕБЕ не спасает от труncации: если он применяется
+    к одной сырой странице (`per_page=100`) и между двумя настоящими тиками
+    пролетело ≥100 `pull_request`-прогонов `contract` (достижимо при
+    параллельной работе нескольких агентов — ровно находка ревью PR #318),
+    отфильтрованный список молча пустеет и настоящий тик теряется за
+    страницей. Поэтому решающая фильтрация — серверная, в `orchestra_tick_runs`
+    (`?event=...`, по одному запросу на легитимное событие, тот же приём, что
+    #303 уже применил в cf-worker/src/harness.ts): страница GitHub для каждого
+    события содержит ТОЛЬКО прогоны этого события, contract её не засоряет.
+    Эта функция остаётся как чистый юнит и вторая линия защиты, не единственная.
+
+    Allowlist по `ORCHESTRA_TICK_EVENTS`, не denylist `!= "pull_request"`
+    (находка AI-ревью PR #318, второй раунд): `ORCHESTRA_TICK_EVENTS` —
+    уже единственное место правды о легитимных событиях для серверного
+    фильтра выше (`orchestra_tick_runs`). Denylist держал бы второе,
+    расходящееся определение «легитимного» здесь — третий триггер
+    `orchestra.yml` (например `push`) молча прошёл бы эту вторую линию
+    защиты, ровно тот же класс маскировки через чёрный ход, что #303 и
+    сам этот PR уже закрывали для других мест."""
+    return [run for run in runs if run.get("event") in ORCHESTRA_TICK_EVENTS]
+
+
+def orchestra_tick_runs(repo: str, per_page: int = 100) -> list[dict]:
+    """Реальные тики job'а `orchestra`: серверный фильтр `?event=...`, по
+    одному запросу на каждое легитимное событие (`schedule`,
+    `workflow_dispatch`), результаты слиты и отсортированы по свежести.
+    В отличие от одной сырой страницы + клиентского `real_orchestra_ticks`,
+    страница на каждый запрос не тратится на `pull_request`-прогоны
+    `contract` — GitHub фильтрует их до пагинации, не после (найдено ревью
+    PR #318: `exclude_pull_requests=true` на этом же эндпоинте проверен живым
+    запросом и НЕ фильтрует по событию — параметр относится к другому
+    признаку; используем `event=` явно на каждое легитимное значение)."""
+    runs: list[dict] = []
+    for event in ORCHESTRA_TICK_EVENTS:
+        runs.extend(recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=per_page, event=event))
+    runs.sort(key=lambda run: run["created_at"], reverse=True)
+    return real_orchestra_ticks(runs)
 
 
 def heartbeat_age_minutes(last_success_at: str | datetime, now: datetime) -> float:
@@ -336,9 +423,12 @@ def merge_telegram_text(repo: str, pr_number: int, task_number: int, task_title:
 # ── IO-обвязка: чтение прогонов, сигналы, след в задаче ──────────────────────────
 
 
-def recent_runs(repo: str, workflow: str, per_page: int = 10) -> list[dict]:
+def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None = None) -> list[dict]:
+    query = f"per_page={per_page}"
+    if event:
+        query += f"&event={event}"
     payload = gh(
-        f"repos/{repo}/actions/workflows/{workflow}/runs?per_page={per_page}"
+        f"repos/{repo}/actions/workflows/{workflow}/runs?{query}"
     ) or {}
     return payload.get("workflow_runs", [])
 
@@ -474,29 +564,92 @@ def escalate(repo: str, issue_number: int, text: str) -> str:
 def heartbeat_check(repo: str, now: datetime) -> list[str]:
     """«Кто следит за следящим»: вызывается КАЖДЫМ запуском планировщика до всей
     остальной работы. Опоздавший запуск — единственный, кто может закричать о
-    пропавших пульсах, поэтому проверка первая."""
-    runs = recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=5)
+    пропавших пульсах, поэтому проверка первая.
+
+    Выборка идёт по `orchestra_tick_runs` — серверный фильтр `?event=...` на
+    оба легитимных события (`schedule`, `workflow_dispatch`), не клиентская
+    фильтрация одной сырой страницы: `per_page=100` на КАЖДЫЙ запрос не
+    тратится на `pull_request`-прогоны `contract`, так что труncация страницы
+    настоящими тиками (найдено ревью PR #318) больше не молчит."""
+    runs = orchestra_tick_runs(repo, per_page=100)
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     if last_ok is None:
-        return [f"ℹ️ успешных прогонов {ORCHESTRA_WORKFLOW} не найдено — возраст пульса не оценить"]
+        # Пустой результат ПОСЛЕ серверного фильтра — не «выборка коротка»
+        # (см. docstring выше), а «настоящих тиков не найдено вовсе» за 100
+        # последних прогонов каждого легитимного события: сам по себе редкий
+        # и тревожный случай (workflow мог быть отключён GitHub'ом после 60
+        # дней простоя, docs/research/21), поэтому кричим, а не молчим ℹ️.
+        text = (f"🚨 edge-harness: {HEARTBEAT_NO_TICKS_MARKER}\n"
+                f"Успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
+                "не найдено за последние 100 прогонов каждого события — пульс не "
+                "подтверждён, возможен отключённый workflow (docs/research/21).")
+        delivered = send_telegram(text)
+        # posted/attempted — находка AI-ревью PR #318, третий раунд: строка
+        # отчёта раньше безусловно утверждала «след в #120», даже если
+        # post_issue_comment упал (RuntimeError уходил только в warning) —
+        # именно в сценарии «тиков нет» канал задачи может быть сломан по
+        # той же причине, что и пульс, поэтому отчёт не может тут врать.
+        attempted = False
+        posted = False
+        try:
+            # Двухмаркерный приём (episode_reopened, находка ревью PR #318, п.1):
+            # без этого первое же «тиков нет» глушило бы канал комментария
+            # навсегда — issue_marker_times ищет подстроку по ВСЕЙ истории #120.
+            open_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_NO_TICKS_MARKER)
+            close_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_TICKS_RESUMED_MARKER)
+            if episode_reopened(open_times, close_times):
+                attempted = True
+                post_issue_comment(repo, WATCHDOG_ISSUE, text)
+                posted = True
+        except RuntimeError as error:
+            print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+        trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
+        return [f"🚨 успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
+                f"не найдено (Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
+                f"след в #{WATCHDOG_ISSUE}: {trace})"]
+    try:
+        # Эпизод HEARTBEAT_NO_TICKS закрывается явно, как только тики снова
+        # нашлись: без этого закрывающего маркера episode_reopened никогда не
+        # увидит момент восстановления и следующий «тиков нет» останется
+        # заглушен первым же старым маркером (тот же класс, что фикс выше).
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_NO_TICKS_MARKER)
+        if open_times:
+            close_times = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_TICKS_RESUMED_MARKER)
+            if not close_times or max(open_times) > max(close_times):
+                post_issue_comment(
+                    repo, WATCHDOG_ISSUE,
+                    f"✅ edge-harness: {HEARTBEAT_TICKS_RESUMED_MARKER}\n"
+                    f"Успешный прогон {ORCHESTRA_WORKFLOW} снова найден — эпизод "
+                    "«тиков нет» закрыт.",
+                )
+    except RuntimeError as error:
+        print(f"::warning::закрытие эпизода в #{WATCHDOG_ISSUE} не оставлено: {error}", file=sys.stderr)
     age = heartbeat_age_minutes(last_ok["created_at"], now)
     if decide_heartbeat(last_ok["created_at"], now) == "ok":
         return [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "
                 f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
     text = heartbeat_alert_text(age, last_ok)
     delivered = send_telegram(text)
+    # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
+    # (находка AI-ревью PR #318, третий раунд): безусловное «след в #120» в
+    # тексте отчёта было неверно, если post_issue_comment упал.
+    attempted = False
+    posted = False
     try:
         # Telegram — на каждый опоздавший запуск; след в задаче — один на эпизод:
         # новый комментарий только если прежний маркер старше последнего успеха
         # (пульсы успели восстановиться и снова пропали).
         markers = issue_marker_times(repo, WATCHDOG_ISSUE, HEARTBEAT_MARKER)
         if pause_notification_pending(markers, parse_time(last_ok["created_at"])):
+            attempted = True
             post_issue_comment(repo, WATCHDOG_ISSUE, text)
+            posted = True
     except RuntimeError as error:
         print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+    trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
     return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
             f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
-            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"]
+            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
 
 
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], bool]:

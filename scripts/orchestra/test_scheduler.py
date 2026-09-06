@@ -1975,9 +1975,13 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
     just_now = datetime.now(timezone.utc)
     recent_success_iso = just_now.isoformat(timespec="seconds").replace("+00:00", "Z")
     fake = FakeGh({
+        # event — прод-форма поля, которое реально возвращает GitHub для
+        # запроса, отфильтрованного по ?event=... (real_orchestra_ticks,
+        # находка AI-ревью PR #318, второй раунд, поймана при фиксе:
+        # allowlist по ORCHESTRA_TICK_EVENTS отсеивал фикстуру без event).
         "workflows/orchestra.yml/runs": {"workflow_runs": [
             {"conclusion": "success", "created_at": recent_success_iso,
-             "html_url": "https://x", "display_title": "x"}]},
+             "html_url": "https://x", "display_title": "x", "event": "schedule"}]},
         "issues?state=open&labels=task": [],
         "pulls?state=open": [],
         # Приёмка (#227): merged_pr_map(all_merged_pulls(repo)) обходит слитые
