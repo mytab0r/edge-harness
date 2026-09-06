@@ -502,6 +502,13 @@ export class Harness extends DurableObject<Env> {
   // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
   #taskCountsCache: Record<TaskRow["status"], number> | null = null;
 
+  // Троттлинг журнала отказов webhook'а автоматизаций (#116, находка AI-ревью
+  // PR #241): эндпоинт неаутентифицированный, luп без подписи писал бы в DO
+  // событие на каждый запрос — заметная доля дневных 100k строк (класс #320).
+  // Ключ — reason (bad_signature/signature_missing), значение — момент
+  // последней ЗАПИСАННОЙ записи и число проглоченных попыток с тех пор.
+  #webhookRejectThrottle: Map<string, { lastTs: number; suppressed: number }> = new Map();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
@@ -1226,7 +1233,7 @@ export class Harness extends DurableObject<Env> {
     const now = Date.now();
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", id, now);
     this.#taskCountsCache = null;
-    this.#emitSystemEvent(id, "task_queued", { payload });
+    await this.#emitSystemEvent(id, "task_queued", { payload });
     this.#broadcastStatus();
 
     const result = await this.#dispatchToGitHub(GITHUB.dispatchEventType, { task_id: id });
@@ -1243,7 +1250,7 @@ export class Harness extends DurableObject<Env> {
       );
     }
     if (result.status === -1) {
-      this.#emitSystemEvent(id, "dispatch_failed", { detail: result.error });
+      await this.#emitSystemEvent(id, "dispatch_failed", { detail: result.error });
       this.#broadcastStatus();
       throw new ApiError(502, "dispatch_network_failed", { detail: result.error ?? "" });
     }
@@ -1252,7 +1259,7 @@ export class Harness extends DurableObject<Env> {
       // 204 от dispatch — не доказательство запуска job'а (и 204 при отсутствии
       // workflow-файла на default branch тоже). Ловится отсутствием job_start, см.
       // docs/research/21-github-actions.md. Здесь доказываем только приём события API.
-      this.#emitSystemEvent(id, "dispatch_failed", { github_status: result.status });
+      await this.#emitSystemEvent(id, "dispatch_failed", { github_status: result.status });
       this.#broadcastStatus();
       throw new ApiError(502, "dispatch_rejected", { status: result.status });
     }
@@ -1261,7 +1268,7 @@ export class Harness extends DurableObject<Env> {
     // Счётчики кеша (#320) обязаны перечитаться после смены статуса — иначе
     // квота rows_read снова течёт (дашборд молча врёт до следующей мутации).
     this.#taskCountsCache = null;
-    this.#emitSystemEvent(id, "task_dispatched", {});
+    await this.#emitSystemEvent(id, "task_dispatched", {});
     this.#broadcastStatus();
     return this.#json({ task_id: id, dispatched: true }, { status: 201 });
   }
@@ -1396,7 +1403,7 @@ export class Harness extends DurableObject<Env> {
     );
     // След конфигурации в журнале — виден с дашборда (#111); прогон это событие
     // НЕ запускает: прогон порождают только триггеры.
-    this.#emitSystemEvent(`automation:${restId}`, automationServiceKind("automation_updated"), {
+    await this.#emitSystemEvent(`automation:${restId}`, automationServiceKind("automation_updated"), {
       created: !existing,
       enabled: parsed.config.enabled,
       trigger: parsed.config.trigger.type,
@@ -1406,7 +1413,7 @@ export class Harness extends DurableObject<Env> {
     return this.#json({ automation: this.#automationView(restId, row!) }, { status: existing ? 200 : 201 });
   }
 
-  #deleteAutomation(restId: string): Response {
+  async #deleteAutomation(restId: string): Promise<Response> {
     if (!isValidAutomationId(restId)) {
       throw new ApiError(400, "automation_id_invalid");
     }
@@ -1419,7 +1426,7 @@ export class Harness extends DurableObject<Env> {
     // 404-ить без объяснения (находка AI-ревью PR #241). Под тем же task_id
     // automation:<id>, что и остальные системные события автоматизации —
     // гвардия петли journal-триггеров (префикс automation:) их уже исключает.
-    this.#emitSystemEvent(`automation:${restId}`, automationServiceKind("automation_deleted"), {});
+    await this.#emitSystemEvent(`automation:${restId}`, automationServiceKind("automation_deleted"), {});
     return this.#json({ ok: true });
   }
 
@@ -1440,10 +1447,8 @@ export class Harness extends DurableObject<Env> {
     const provided = request.headers.get(AUTOMATIONS.webhookSignatureHeader) ?? "";
     const expected = `sha256=${await this.#hmacHex(secret, rawBody)}`;
     if (!provided || !constantTimeEqual(provided, expected)) {
-      this.#emitSystemEvent(AUTOMATIONS.webhookRejectedTaskId, automationServiceKind("automation_webhook_rejected"), {
-        automation: String(automationId).slice(0, 64),
-        reason: provided ? "bad_signature" : "signature_missing",
-      });
+      const reason = provided ? "bad_signature" : "signature_missing";
+      await this.#emitThrottledWebhookRejected(reason, String(automationId).slice(0, 64));
       throw new ApiError(401, "webhook_signature_invalid");
     }
     if (!isValidAutomationId(automationId)) {
@@ -1455,14 +1460,14 @@ export class Harness extends DurableObject<Env> {
     }
     const config = JSON.parse(String(row.config)) as AutomationConfig;
     if (!config.enabled) {
-      this.#emitSystemEvent(`automation:${automationId}`, automationServiceKind("automation_webhook_rejected"), { reason: "disabled" });
+      await this.#emitSystemEvent(`automation:${automationId}`, automationServiceKind("automation_webhook_rejected"), { reason: "disabled" });
       throw new ApiError(409, "automation_disabled", { automation_id: automationId });
     }
     if (config.trigger.type !== "webhook") {
       // Вход должен стрелять только webhook-триггерной автоматизацией: иначе
       // schedule/journal прогон сработал бы мимо своего триггера, а last_fired_ts
       // молча сдвинул бы фазу расписания (нашёл AI-ревью PR #241).
-      this.#emitSystemEvent(`automation:${automationId}`, automationServiceKind("automation_webhook_rejected"), { reason: "not_webhook_trigger" });
+      await this.#emitSystemEvent(`automation:${automationId}`, automationServiceKind("automation_webhook_rejected"), { reason: "not_webhook_trigger" });
       throw new ApiError(409, "automation_not_webhook", { automation_id: automationId });
     }
     const fired = await this.#fireAutomation(automationId, row.last_fired_ts, config, "webhook", Date.now());
@@ -1494,7 +1499,7 @@ export class Harness extends DurableObject<Env> {
     const taskId = runTaskId(automationId, now, nonce);
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", taskId, now);
     this.#taskCountsCache = null; // каждая мутация tasks инвалидирует кеш (#320), incl. путь not_configured
-    this.#emitSystemEvent(taskId, automationServiceKind("automation_triggered"), { automation: automationId, trigger });
+    await this.#emitSystemEvent(taskId, automationServiceKind("automation_triggered"), { automation: automationId, trigger });
     const period = config.trigger.type === "schedule"
       ? digestPeriod(lastFiredTs === null || lastFiredTs === undefined ? null : Number(lastFiredTs), config.trigger.intervalHours, now)
       : null;
@@ -1508,13 +1513,13 @@ export class Harness extends DurableObject<Env> {
     if (result.status === 204) {
       dispatched = true;
       this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, taskId);
-      this.#emitSystemEvent(taskId, automationServiceKind("automation_dispatched"), {});
+      await this.#emitSystemEvent(taskId, automationServiceKind("automation_dispatched"), {});
     } else if (result.status === 0) {
       // «Возможности нет» (GH_DISPATCH_TOKEN не задан): прогон ждёт конфигурации
       // в очереди — как обычная задача, ответ честно называет not_configured.
     } else {
       this.#sql.exec("UPDATE tasks SET status = 'failed' WHERE id = ?", taskId);
-      this.#emitSystemEvent(taskId, "dispatch_failed", { github_status: result.status, detail: result.error });
+      await this.#emitSystemEvent(taskId, "dispatch_failed", { github_status: result.status, detail: result.error });
     }
     if (dispatched || result.status > 0) {
       // Статус задачи здесь менялся (dispatched/failed) — счётчики кеша (#320)
@@ -1588,8 +1593,15 @@ export class Harness extends DurableObject<Env> {
   /**
    * Системное событие. seq у системных событий отрицательные (−1, −2…): job нумерует
    * свои события с 1, и UNIQUE(task_id, seq) не должен сталкивать их между собой.
+   *
+   * Journal-триггер (#116) зовётся и отсюда, не только из #postEvents: иначе
+   * `trigger.kind: "dispatch_failed"` (и любой другой внутренний kind, эмитимый
+   * самим DO, а не батчем раннера) молча никогда не сработает — находка AI-ревью
+   * PR #241. Гвардия петли по task_id-префиксу внутри #fireJournalTriggers и
+   * запрет reservedJournalKinds на этапе PUT (automations.ts) уже не пускают
+   * событие автоматизации ретриггерить само себя.
    */
-  #emitSystemEvent(taskId: string, kind: string, data: unknown): void {
+  async #emitSystemEvent(taskId: string, kind: string, data: unknown): Promise<void> {
     const now = Date.now();
     const previous = Number(
       this.#rows(this.#sql.exec("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND source = 'system'", taskId))[0].n,
@@ -1607,7 +1619,33 @@ export class Harness extends DurableObject<Env> {
     const id = Number(
       this.#rows(this.#sql.exec("SELECT id FROM events WHERE task_id = ? AND seq = ?", taskId, seq))[0].id,
     );
-    this.#broadcastEvent({ id, task_id: taskId, seq, ts: now, source: "system", kind, data });
+    const row: EventRow = { id, task_id: taskId, seq, ts: now, source: "system", kind, data };
+    this.#broadcastEvent(row);
+    await this.#fireJournalTriggers([row]);
+  }
+
+  /**
+   * Запись «webhook отклонён» для неаутентифицированного пути (подпись отсутствует
+   * или неверна) — не чаще одного события на reason за webhookRejectThrottleMs.
+   * Без троттла луп без подписи выжигал бы дневную квоту строк журнала DO на
+   * публичном эндпоинте без авторизации (находка AI-ревью PR #241, класс #320).
+   * Проглоченные попытки не молчат бесследно — их число едет в data следующей
+   * прошедшей записи, «громко» остаётся, просто не на каждый запрос.
+   */
+  async #emitThrottledWebhookRejected(reason: string, automation: string): Promise<void> {
+    const now = Date.now();
+    const state = this.#webhookRejectThrottle.get(reason);
+    if (state && now - state.lastTs < AUTOMATIONS.webhookRejectThrottleMs) {
+      state.suppressed += 1;
+      return;
+    }
+    const suppressed = state?.suppressed ?? 0;
+    this.#webhookRejectThrottle.set(reason, { lastTs: now, suppressed: 0 });
+    await this.#emitSystemEvent(AUTOMATIONS.webhookRejectedTaskId, automationServiceKind("automation_webhook_rejected"), {
+      automation,
+      reason,
+      suppressed_since_last: suppressed,
+    });
   }
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────────────
@@ -1633,7 +1671,7 @@ export class Harness extends DurableObject<Env> {
       if (task && task.dispatch_ts !== null && task.latency_ms === null) {
         const latency = now - task.dispatch_ts;
         this.#sql.exec("UPDATE tasks SET latency_ms = ? WHERE id = ?", latency, taskId);
-        this.#emitSystemEvent(taskId, "first_heartbeat", { latency_ms: latency, job_id: jobId });
+        await this.#emitSystemEvent(taskId, "first_heartbeat", { latency_ms: latency, job_id: jobId });
       }
     }
 

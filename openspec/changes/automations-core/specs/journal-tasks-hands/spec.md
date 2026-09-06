@@ -1,0 +1,59 @@
+# Дельта-спека: журнал (journal-tasks-hands) — автоматизации, ядро (#116)
+
+Третий режим аутентификации (webhook-подпись) уже задокументирован п.20
+основной спеки этим же PR — здесь не повторяется. Ниже — новый раздел,
+пункты вслед за существующим п.37.
+
+## ADDED: Автоматизации
+
+38. Конфиг автоматизации — `{enabled, trigger, task, report}`
+    (`cf-worker/src/automations.ts`, `AutomationConfig`), единственное
+    место правды формы: ту же форму читает `PUT /api/automations/:id`
+    (жёсткая валидация — неизвестные поля отклоняются, а не игнорируются),
+    раннер (`scripts/automations/run.sh`) и UI. Хранилище — таблица
+    `automations` в DO SQLite (`cf-worker/src/harness.ts:123-131`), потолок
+    записей — `LIMITS.automationsMax` (`config.ts:23`, 50).
+
+39. Триггеры — три типа, только один активен за раз:
+    - `schedule` — интервал в часах, пульс DO проверяет `journalTriggerDue`
+      каждый тик;
+    - `webhook` — внешний вход `POST /api/webhooks/:id`, аутентификация
+      подписью (см. п.20), последующий запуск идёт через `#fireAutomation`;
+    - `journal` — kind события журнала. Кулдаун одной автоматизации —
+      `AUTOMATIONS.journalCooldownMs` (30 минут). Kind, под который сама
+      автоматизация пишет свои системные события
+      (`AUTOMATIONS.reservedJournalKinds` — `automation_updated`,
+      `automation_deleted`, `automation_triggered`, `automation_dispatched`,
+      `automation_webhook_rejected`, `automation_result`), запрещён на входе
+      `PUT`: такой конфиг никогда не сработал бы (гвардия петли по префиксу
+      `task_id` `automation:...`), поэтому отклоняется явно, а не
+      сохраняется мёртвым.
+
+40. Journal-триггер проверяется на КАЖДОЕ принятое событие журнала — и на
+    батч из `POST /api/events` (раннер), и на системные события, которые DO
+    эмитит сам (`task_queued`, `dispatch_failed`, `task_dispatched`,
+    `first_heartbeat` и другие через `#emitSystemEvent`). Оба пути зовут
+    один и тот же `#fireJournalTriggers`; молчаливой половины, где триггер
+    принят конфигом, но никогда не проверяется, — нет.
+
+41. Задача автоматизации — один из трёх видов:
+    - `digest` — встроенный сборщик (`scripts/automations/digest.py`);
+    - `hands` — прямой прогон раннера по шаблону текста (DSH headless);
+    - `pool` — issue с меткой `task` (подхватывает существующий пульс
+      orchestra, не отдельный воркер).
+
+    Отчёт — канал `slack` (Web API `chat.postMessage`) или `telegram`
+    (`sendMessage`); секреты каналов — в секретах репозитория, конфиг несёт
+    только тип и target, значений нет.
+
+42. `GET /api/automations` отдаёт список с `last_run` — одиночный lookup по
+    PK `tasks` через `last_run_task_id` (не скан всей таблицы на каждую
+    автоматизацию — класс квоты rows_read, #320).
+
+43. Webhook-вход без валидной подписи не пишет событие в журнал на каждый
+    запрос: запись троттлится — не чаще одной на `reason`
+    (`bad_signature`/`signature_missing`) за
+    `AUTOMATIONS.webhookRejectThrottleMs` (5 минут), число проглоченных
+    попыток едет полем `suppressed_since_last` в следующей прошедшей записи.
+    Публичный неаутентифицированный эндпоинт не может в одиночку выжечь
+    заметную долю дневной квоты строк журнала DO (тот же класс, что #320).
