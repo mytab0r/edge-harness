@@ -71,6 +71,23 @@ def test_primary_declared_task_requires_bare_line():
     assert ri.primary_declared_task(None) is None
 
 
+def test_primary_declared_task_sees_canonical_template_body():
+    """Находка ревью PR #249: прод-форма тела PR, открытого через веб-форму
+    по `.github/PULL_REQUEST_TEMPLATE.md` (HTML-комментарий первыми тремя
+    строками, `#N` — реальным номером — только потом). До фикса
+    `primary_declared_task` не вырезал HTML-комментарии и падал на `None` для
+    КАЖДОГО такого PR — инвариант 1 был слеп именно к штатному классу
+    PR (#18/#21/#78), ради которого заведён."""
+    template_body = (
+        "<!-- Правило: один PR — одна задача. Ссылайся на задачу просто #N.\n"
+        "НЕ пиши Closes/Fixes/Resolves: задачу закрывает исполнитель ПОСЛЕ пост-мерж\n"
+        "проверки (деплой/канарейка/E2E), приложив улики. Контракт такие слова отклоняет. -->\n"
+        "#244\n\n"
+        "## Что сделано\n-\n"
+    )
+    assert ri.primary_declared_task(template_body) == 244
+
+
 def test_reopened_after_merge_flags_free_task_with_merged_pr():
     tasks = [task_issue(18, "AI-ревьюер диффа", assignees=())]
     pulls = [merged_pr(137, "#18\n\nтекст", "2026-08-31T17:46:11Z"),

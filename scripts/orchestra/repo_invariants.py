@@ -114,6 +114,19 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
+# Номер задачи, ОБЪЯВЛЕННЫЙ первой строкой тела PR — одно место правды (#187,
+# #195, #251, #312), не второе определение того же правила здесь (находка
+# ревью PR #249): собственный `_BARE_TASK_REF_RE`/`primary_declared_task` не
+# вырезал HTML-комментарии, а `.github/PULL_REQUEST_TEMPLATE.md` начинается
+# именно с такого комментария — инвариант 1 не видел НИ ОДНОГО штатного PR,
+# открытого через веб-форму по шаблону (только руками написанные тела вида
+# голого "#N"), то есть слеп именно к классу #18/#21/#78, ради которого
+# заведён.
+_TR_SPEC = importlib.util.spec_from_file_location(
+    "task_ref", REPO_ROOT / "scripts" / "lib" / "task_ref.py")
+task_ref = importlib.util.module_from_spec(_TR_SPEC)
+_TR_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
@@ -124,7 +137,9 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # расписания оркестратора. Инвариант 3 СУЖЕН обратно до наблюдательного —
 # не пересмотром решения владельца, а внешней причиной, найденной уже после
 # включения (#269): газ инварианта 3 — trigger_ai_review — вызывается только
-# из main() оркестратора (scheduler.py:702), а orchestra.yml (cron */15 мин)
+# из main() оркестратора (`scheduler.py::trigger_ai_review`, вызов из
+# `main()`; форма `file::symbol`, не `file:line` — номера строк гниют, класс
+# уже закрывался этим переходом), а orchestra.yml (cron */15 мин)
 # фактически не идёт по расписанию (7 прогонов за сутки вместо 96, интервалы
 # до 4.5 часов — замер #269). При таком интервале PR успевает покраснеть по
 # инварианту 3 (порог UNHEALTHY_PR_AFTER_MINUTES=120 мин) раньше, чем газ
@@ -159,28 +174,20 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
 # Инвариант 1: открытая задача без исполнителя, чей PR уже слит
 # ══════════════════════════════════════════════════════════════════════════
 
-# Первая НЕпустая строка тела PR, если это РОВНО `#N` и больше ничего.
-# Строже task_ref.declared_tasks (который матчит ЛЮБУЮ строку, начинающуюся
-# с `#`, — заголовки `## Что сделано` не страдают, там нет цифр сразу после
-# `#`, но живая находка на PR #137 показала другой случай: перенос строки
-# внутри абзаца прозы уронил ` #119 из пула...` на новую строку, и
-# declared_tasks() принял её за декларацию — задача #119 никогда не
-# объявлялась PR #137 первой строкой, реальная первая строка — `#18`. Здесь
-# те же слова, что и во всех живых декларациях (#18, #205, #207, #80…) —
-# ровно `#N`, ничего больше на строке.
-_BARE_TASK_REF_RE = re.compile(r"#(\d+)")
-
-
 def primary_declared_task(body: str) -> int | None:
-    if not body:
-        return None
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        match = re.fullmatch(_BARE_TASK_REF_RE, stripped)
-        return int(match.group(1)) if match else None
-    return None
+    """Задача, объявленная ПЕРВОЙ непустой строкой тела PR (после вырезания
+    HTML-комментариев) — тонкая обёртка над `task_ref.declared_tasks`, одним
+    и тем же правилом с `contract_check.py` (симметрия: инвариант 1 не должен
+    видеть декларацию иначе, чем видит её контракт при мерже). НЕ
+    `extract_task_refs`/`references_task` (широкая семантика «упомянута где
+    угодно в прозе») — живая находка PR #137 показала, зачем: перенос строки
+    внутри абзаца уронил `#119 из пула...` на отдельную строку, и наивный
+    скан «первая строка с `#`» принял бы её за декларацию, хотя реальная
+    первая строка тела — `#18`. `declared_tasks` уже закрывает этот класс
+    (останавливается на первой непустой строке, не сканирует дальше, если она
+    не декларация)."""
+    declared = task_ref.declared_tasks(body or "")
+    return declared[0] if declared else None
 
 
 def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
