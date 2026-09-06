@@ -126,6 +126,23 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       предохранителе (#120) гейт молчит и закрывает свой эпизод:
       действующий тормоз один, назван предохранителем (блокирующая находка
       2 ревью PR #466).
+  16. Замена PR, чья ветка называет закрытую задачу (#543, живой замер:
+      владелец делал это руками 9 раз за сутки — PR #359/#384/#388/#167/
+      #231/#393/#439/#415 и задача #530). Контракт резолвит задачу PR ТОЛЬКО
+      по имени ветки (task_ref.resolve_pr_task, #394/#398) — правка тела PR
+      контракт больше не читает вовсе, единственный официальный выход —
+      новая ветка на новый номер (docs/agents/PROTOCOL.md). replace_closed_task_prs
+      заводит узкую задачу-замену (pool_issue.create_pool_issue, метки
+      task+auto-detected) и метит PR (тело + комментарий) на уже прочитанном
+      снимке pulls/pool этого прогона — сама смена ветки/открытие нового PR
+      остаётся исполнителю (закрытие/переоткрытие чужого PR — необратимое
+      действие фонового job'а, здесь сознательно не делается, см. живой
+      эксперимент в openspec/changes/archive/contract-task-from-branch/design.md:
+      переименование ветки закрывает открытый PR вместо переориентации).
+      Идемпотентность — маркер в теле PR плюс поиск существующей замены по
+      конвенции `Related: #<старая>` (Search API, отдельный бюджет 30/мин,
+      не общий core 5000/час, #454) — ловит и ручные замены (живой случай
+      #431→#538), не только свои.
 """
 
 import http.cookiejar
@@ -183,7 +200,10 @@ from upstream_drift import upstream_drift_check
 # Детектор устойчивого простоя (#201): читает уже готовый отчёт пульса и
 # заводит задачу пула по незнакомому отпечатку причины — своя ответственность,
 # свой модуль (см. docstring stall_detector.py), сюда только вызов из main().
-from stall_detector import detect_and_act, escalate_stale_auto_tasks
+# AUTO_LABEL (#543) — та же метка происхождения «заведено автоматикой»,
+# переиспользуется replace_closed_task_prs ниже: второй одноимённой константы
+# не заводим.
+from stall_detector import AUTO_LABEL, detect_and_act, escalate_stale_auto_tasks
 
 # claim_task живёт в scripts/lib (общее место для всех каналов): TTL замка —
 # одна константа LOCK_TTL_HOURS там, сюда не дублируется.
@@ -2721,6 +2741,191 @@ def docs_missing(repo: str, files_payload: list[dict]) -> list[str]:
 
 REOPEN_REJECTED_MARKER = "[оркестратор: переоткрытие закрытой задачи отклонено]"
 
+# ── Замена PR, чья ветка называет закрытую задачу (#543) ──────────────────────
+#
+# Класс проблемы (живой замер владельца, 2026-09-06): приёмка закрывает
+# задачу, пока PR по ней ещё открыт и дорабатывается. contract_check.py
+# резолвит задачу PR ТОЛЬКО по имени ветки (task_ref.resolve_pr_task, #394/
+# #398) — правка тела PR для этого вопроса больше не читается вовсе, значит
+# больше не помогает пройти контракт. Единственный официальный выход —
+# scripts/git/task-branch на новый номер (docs/agents/PROTOCOL.md); эту
+# ветку и новый PR заводит исполнитель (см. ниже, почему НЕ этот код).
+#
+# Отклонённый способ — переименование существующей ветки (GitHub `POST
+# .../branches/{branch}/rename`): живой эксперимент в
+# openspec/changes/archive/contract-task-from-branch/design.md (#394) прямо
+# показал, что для НЕ-default ветки GitHub закрывает открытый PR вместо
+# переориентации на новое имя — «перевешивание» в буквальном смысле (тот же
+# номер PR продолжает работать под новым именем ветки) технически
+# недостижимо. Открыть НОВЫЙ PR с новой ветки автоматически и закрыть
+# старый молча — тоже отклонено для ЭТОГО кода: закрытие чужого открытого
+# PR фоновым job'ом необратимо (человек мог быть посреди пуша), а сам факт
+# «задача закрыта» не отличает докрытие (работа продолжается) от «PR
+# устарел и годится на слом» (см. AGENTS.md: «не подменять настоящую
+# ошибку»). Значит то, что этот код умеет сделать безопасно и обратимо —
+# завести узкую задачу-замену и сделать её видимой на PR; саму смену ветки
+# исполнитель делает сам, по инструкции в комментарии.
+TASK_REPLACEMENT_MARKER = "<!-- task-replacement:auto -->"
+
+
+def _existing_task_replacement(repo: str, task_number: int) -> int | None:
+    """Уже заведённая замена закрытой задаче `task_number` — ищем по
+    конвенции `Related: #<task_number>` в теле issue через Search API
+    (отдельный бюджет 30 запросов/мин, не общий core 5000/час — квота
+    именно core разряжалась в проде и роняла чужие обязательные проверки,
+    #454; эта проверка её не трогает вовсе). Конвенция не изобретена этим
+    change — тот же формат уже применяет владелец вручную (живой случай
+    #431→#538: тело #538 начинается с «Related: #431 (закрыта приёмкой,
+    работа продолжается в PR #439)»), поэтому один и тот же поиск ловит и
+    ручные, и автоматические замены — не плодит вторую поверх уже
+    существующей человеческой. `None` — ни одной не нашли, можно заводить."""
+    query = f'repo:{repo} in:body "Related: #{task_number}"'
+    result = gh("-X", "GET", "search/issues", "-f", f"q={query}")
+    for item in (result or {}).get("items") or []:
+        if "pull_request" in item:
+            continue  # ищем задачу-замену, не PR со случайным совпадением текста
+        return item["number"]
+    return None
+
+
+def _mark_pr_with_replacement(repo: str, pull: dict, replacement_number: int) -> None:
+    """Отмечает тело PR маркером + Related — один и тот же вызов используют
+    оба исхода replace_closed_task_prs (свежесозданная замена и уже
+    найденная существующая): маркер — единственный способ не спрашивать
+    Search API повторно на каждом пульсе про один и тот же PR (экономия
+    того же бюджета, что и сам поиск)."""
+    body = pull.get("body") or ""
+    if TASK_REPLACEMENT_MARKER in body:
+        return
+    banner = (
+        f"{TASK_REPLACEMENT_MARKER}\n"
+        f"Related: #{replacement_number} (докрытие — ветка этого PR называет "
+        "уже закрытую задачу, см. комментарий ниже)\n\n"
+    )
+    new_body = banner + body
+    gh("-X", "PATCH", f"repos/{repo}/pulls/{pull['number']}", "-f", f"body={new_body}")
+    pull["body"] = new_body  # мутируем снимок — тот же приём, что reject_reopened_tasks
+
+
+def _replacement_pr_comment(task_number: int, replacement_number: int) -> str:
+    return (
+        f"{TASK_REPLACEMENT_MARKER}\n"
+        f"🔁 Задача #{task_number} закрыта, а эта ветка её всё ещё называет — "
+        "contract_check.py резолвит задачу PR только по имени ветки (#398) и "
+        "тело PR для этого вопроса не читает вовсе, поэтому правка тела не "
+        "помогает пройти контракт.\n\n"
+        f"Автоматически заведена узкая задача-замена #{replacement_number} "
+        f"(Related: #{task_number}).\n\n"
+        "Что дальше:\n"
+        f"- работа ещё нужна — заведи новую ветку `scripts/git/task-branch "
+        f"{replacement_number}-<slug>` тем же диффом (тот же коммит, новое "
+        "имя) и открой новый PR; этот можно закрыть как докрытый;\n"
+        "- этот PR на самом деле устарел и продолжать не нужно — закрой его; "
+        f"в этом случае закрой и задачу-замену #{replacement_number} вручную "
+        "как ненужную (в этом репозитории задачи закрываются только по "
+        "улике постмерж-приёмки — автоматического закрытия по факту "
+        "закрытия PR нет, эта задача сама себя не закроет)."
+    )
+
+
+_LEADING_TASK_REF_RE = re.compile(r"^#(\d+)\b[:\s—-]*")
+
+
+def _create_task_replacement(repo: str, pull: dict, task_number: int) -> int:
+    pr_number = pull["number"]
+    branch = ((pull.get("head") or {}).get("ref")) or "?"
+    pr_title = (pull.get("title") or f"PR #{pr_number}").strip()
+    # PR старой конвенции сам называет закрытую задачу первым словом
+    # заголовка («#335: …») — без среза «Докрытие #335: #335: …» дублирует
+    # номер (живой случай PR #397 при ретроспективном прогоне #543).
+    leading = _LEADING_TASK_REF_RE.match(pr_title)
+    if leading and int(leading.group(1)) == task_number:
+        pr_title = _LEADING_TASK_REF_RE.sub("", pr_title, count=1).strip() or pr_title
+    title = f"Докрытие #{task_number}: {pr_title}"
+    body = (
+        f"Related: #{task_number} (закрыта, работа продолжается в PR #{pr_number}).\n\n"
+        f"Заведено автоматически (#543): ветка PR #{pr_number} (`{branch}`) "
+        f"называет закрытую задачу #{task_number}; контракт резолвит задачу PR "
+        "только по имени ветки (#398) и правку тела для этого больше не "
+        "читает, поэтому контракт продолжит красить этот PR, пока имя ветки "
+        "не сменится.\n\n"
+        "## Что дальше\n\n"
+        "- работа ещё нужна — заведи новую ветку `scripts/git/task-branch "
+        "<номер этой задачи>-<slug>` тем же диффом, что уже лежит в "
+        f"PR #{pr_number}, и открой новый PR (contract требует имя ветки "
+        "agent/<N>-<slug>; переименовывать СУЩЕСТВУЮЩУЮ ветку нельзя — "
+        "переименование закрывает открытый PR вместо переориентации, живой "
+        "эксперимент в "
+        "openspec/changes/archive/contract-task-from-branch/design.md);\n"
+        f"- PR #{pr_number} на самом деле устарел — закрой его; тогда закрой "
+        "и эту задачу вручную как ненужную (задачи здесь закрываются только "
+        "по улике постмерж-приёмки, автозакрытия по факту закрытия PR нет).\n\n"
+        "## Оставшаяся работа (тело исходного PR, без изменений)\n\n"
+        f"{pull.get('body') or '_тело PR пустое_'}"
+    )
+    result = pool_issue.create_pool_issue(
+        gh, repo, title, body, [TASK_LABEL, AUTO_LABEL])
+    return result["number"]
+
+
+def replace_closed_task_prs(repo: str, pulls: list[dict], *, pool: list[dict]) -> list[str]:
+    """Один открытый PR, чья ветка резолвится (task_ref.resolve_pr_task) на
+    ЗАКРЫТУЮ задачу — заводит задачу-замену и метит PR (см. блок комментариев
+    выше — почему именно так, не переименованием ветки/новым PR). `pool` —
+    уже прочитанный снимок открытых задач этого прогона (main()) — второго
+    обхода Issues здесь нет, только числа сравниваются.
+
+    Пропускает: PR без agent-ветки (resolve_pr_task вернул None — не наш
+    случай); PR, чья задача ЕСТЬ среди открытых (`pool`, никакого сетевого
+    вызова); PR, уже помеченный TASK_REPLACEMENT_MARKER (обработан раньше);
+    задачу, которая при сетевой проверке оказалась PR'ом или не закрыта на
+    самом деле (другая причина непригодности — не эта функция её чинит, см.
+    task_eligibility_problems в contract_check.py).
+
+    Сбой сети/API на одном PR не должен уронить обход остальных — попадает
+    строкой-предупреждением в отчёт, следующий PR обрабатывается как ни в
+    чём не бывало (тот же приём, что у lease_observations в main())."""
+    open_numbers = {issue["number"] for issue in pool}
+    lines: list[str] = []
+    for pull in pulls:
+        task_number = task_ref.resolve_pr_task(pull)
+        if task_number is None or task_number in open_numbers:
+            continue
+        pr_number = pull["number"]
+        if TASK_REPLACEMENT_MARKER in (pull.get("body") or ""):
+            continue
+        try:
+            existing = _existing_task_replacement(repo, task_number)
+        except RuntimeError as error:
+            lines.append(f"⚠️ PR #{pr_number}: поиск существующей замены задаче #{task_number} не удался — {error}")
+            continue
+        if existing is not None:
+            try:
+                _mark_pr_with_replacement(repo, pull, existing)
+            except RuntimeError as error:
+                lines.append(f"⚠️ PR #{pr_number}: не смог отметить уже существующую замену #{existing} — {error}")
+                continue
+            lines.append(
+                f"🔁 PR #{pr_number}: задача #{task_number} закрыта, замена #{existing} "
+                "уже существует — тело PR отмечено")
+            continue
+        try:
+            issue = gh(f"repos/{repo}/issues/{task_number}")
+        except RuntimeError as error:
+            lines.append(f"⚠️ PR #{pr_number}: не смог проверить состояние задачи #{task_number} — {error}")
+            continue
+        if "pull_request" in issue or issue["state"] != "closed":
+            continue  # другая причина непригодности — вне ответственности этой функции
+        try:
+            replacement_number = _create_task_replacement(repo, pull, task_number)
+            _mark_pr_with_replacement(repo, pull, replacement_number)
+            post_issue_comment(repo, pr_number, _replacement_pr_comment(task_number, replacement_number))
+        except RuntimeError as error:
+            lines.append(f"⚠️ PR #{pr_number}: замена задаче #{task_number} не заведена — {error}")
+            continue
+        lines.append(f"🔁 PR #{pr_number}: задача #{task_number} закрыта — заведена замена #{replacement_number}")
+    return lines
+
 
 def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
     """Закрытая задача не переоткрывается никогда (решение владельца, #369,
@@ -3154,6 +3359,16 @@ def main() -> int:
     # и accept_merged_tasks ниже видят актуальное состояние без второго обхода.
     pool = open_task_issues(repo)
 
+    # Замена PR, чья ветка называет закрытую задачу (#543) — на том же
+    # снимке pulls/pool, без дополнительного обхода Issues (кроме точечной
+    # сетевой проверки состояния конкретной закрытой задачи и Search API,
+    # см. докстринг replace_closed_task_prs). Заведённые замены пополняют
+    # пул свободных задач — пересчёт нужен, чтобы wip_gate/dispatch_worker
+    # ниже увидели их этим же прогоном, а не следующим.
+    replacement_lines = replace_closed_task_prs(repo, pulls, pool=pool)
+    if replacement_lines:
+        pool = open_task_issues(repo)  # пересчёт: заведённые замены — новые свободные задачи
+
     # Наблюдения и действия разведены по #456 — см. render_action_report:
     # функции ниже возвращают их отдельно там, где смешивали раньше; там, где
     # функция и раньше была чистым источником действий (reap_stale/
@@ -3255,8 +3470,8 @@ def main() -> int:
         + wip_observations + worker_observations
     )
     actions = (
-        stale_lines + lease_actions + conflict_lines + unhealthy_lines + merge_actions
-        + ai_actions + stale_ready_lines + reopen_lines + accept_actions
+        stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
+        + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
         + wip_actions + worker_actions
     )
