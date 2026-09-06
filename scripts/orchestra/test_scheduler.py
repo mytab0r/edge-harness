@@ -962,6 +962,25 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
         sch.gh = orig_gh
 
 
+def test_verdict_unhealthy_labels_is_single_source_for_both_readers(monkeypatch):
+    """Находка AI-ревью PR #408 (head cf79dc9): pr_is_unhealthy кодировал тот
+    же список вердикт-меток двумя параллельными if рядом с кортежем
+    _VERDICT_UNHEALTHY_LABELS — добавленный третий вердикт-лейбл попал бы в
+    бюджет реворка только с одной стороны пары. Теперь pr_is_unhealthy читает
+    тот же кортеж: расширение кортежа продлевает И критерий нездоровья, И
+    признак «причина — вердикт» (budget/unhealthy ветвление) одновременно.
+    Мутация: вернуть параллельные if в pr_is_unhealthy — тест краснеет на
+    «метка fake:verdict» (новый лейбл не распознан)."""
+    monkeypatch.setattr(
+        sch, "_VERDICT_UNHEALTHY_LABELS",
+        (*sch._VERDICT_UNHEALTHY_LABELS, "fake:verdict"))
+    # Чистая функция без сети: ветка красных чеков в мутации не участвует.
+    monkeypatch.setattr(sch, "pr_bad_checks", lambda repo, pull: [])
+    p = pull(6, labels=["review:ok", "fake:verdict"])
+    assert sch.pr_is_unhealthy(REPO, p) == "метка fake:verdict"
+    assert sch._pr_unhealthy_reason_is_verdict(p) is True
+
+
 # ── Бюджет реворка (task-rework-loop #256): needs-spec вместо возврата в пул ─────
 
 
@@ -1010,9 +1029,12 @@ def test_unhealthy_pulls_routes_to_needs_spec_when_ai_budget_exhausted(monkeypat
     # оба комментария (issue-разбор + PR-закрытие) реально отправлены
     assert any(n == 400 and "needs-spec" in text for n, text in posted)
     assert any(n == 401 and "закрыт" in text.lower() for n, text in posted)
-    # эскалация — комментарий в WATCHDOG_ISSUE с маркером и номером задачи
+    # эскалация — комментарий в WATCHDOG_ISSUE с маркером, номером задачи
+    # и номером PR (граница эпизода, находка AI-ревью PR #408, head cf79dc9:
+    # маркер только с задачей глушил бы и второй эпизод — новый PR после
+    # ручного выхода не получил бы свежей эскалации)
     assert any(n == sch.WATCHDOG_ISSUE and sch.pulse_guard.NEEDS_SPEC_MARKER in text
-               and "400" in text for n, text in posted)
+               and "400" in text and "(PR #401)" in text for n, text in posted)
     # Таймлайн читается ОДИН раз на порог и разбор кругов (класс #443):
     # unhealthy_pulls зовёт rework_events и передаёт список в route_to_needs_spec.
     assert sum(1 for c in fake.calls if "issues/401/timeline" in c) == 1
@@ -1155,10 +1177,16 @@ def test_route_to_needs_spec_idempotent_when_marker_already_posted(monkeypatch):
     по этой задаче уже стоит в WATCHDOG_ISSUE, повторная эскалация не шлётся
     (issue при этом обычно уже закрыта/не существует в open_pulls к моменту
     повторного прохода — этот тест доказывает поведение самой функции даже
-    если её вызвали повторно)."""
+    если её вызвали повторно).
+
+    Маркер несёт пару «задача + PR» (находка AI-ревью PR #408, head cf79dc9):
+    тот же PR — дедупликация держится; ДРУГОЙ PR той же задачи (второй эпизод
+    после ручного выхода) — НЕ глушится, владелец получает свежую эскалацию.
+    Мутация: убрать номер PR из маркера — краснеет второй блок (второй эпизод
+    заглушён старым маркером другой попытки)."""
     task = issue(460)
     p = pull(461, labels=["review:ok", "ai:changes-requested"], pr_body="#460")
-    marker = f"{sch.pulse_guard.NEEDS_SPEC_MARKER} #460"
+    marker = f"{sch.pulse_guard.NEEDS_SPEC_MARKER} #460 (PR #461)"
     fake = FakeGh({
         "issues/460/assignees": None,
         "issues/460/labels": None,
@@ -1177,6 +1205,18 @@ def test_route_to_needs_spec_idempotent_when_marker_already_posted(monkeypatch):
     sch.route_to_needs_spec(REPO, task, p, 5, "метка ai:changes-requested")
 
     assert not any(n == sch.WATCHDOG_ISSUE for n, _ in posted), "маркер уже стоит — повторно не шлём"
+
+    # Второй эпизод той же задачи: прошлый эскалации был про ДРУГОЙ PR (#999),
+    # молчать нельзя — задача повторно ушла в needs-spec, владелец не уведомлён.
+    old_episode = [
+        {"created_at": "2026-09-01T00:00:00Z",
+         "body": f"🧭 edge-harness: {sch.pulse_guard.NEEDS_SPEC_MARKER} #460 (PR #999)\n…"},
+    ]
+    fake.routes["issues/120/comments?per_page=100"] = old_episode
+    posted.clear()
+    sch.route_to_needs_spec(REPO, task, p, 5, "метка ai:changes-requested")
+    assert any(n == sch.WATCHDOG_ISSUE and "(PR #461)" in text
+               for n, text in posted), "второй эпизод обязан эскалироваться заново"
 
 
 # ── Ссылки на комментарии-вердикты в разборе кругов (design.md п.4, действие 3) ───
@@ -1206,7 +1246,11 @@ def _gate1_comment(created_at: str, comment_id: str, number: int = 451,
         "created_at": created_at,
         "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
         "user": {"login": login, "type": user_type},
-        "body": "Ревью нашло замечания:\n- находка: пример гейта 1",
+        # Прод-форма тела гейта 1 — сборка тем же кодом, что пишет check_pr.py
+        # (review_labels.gate1_verdict_body), не пересказ литерала: вердикт
+        # AI-ревью PR #408 (head cf79dc9) — вторая копия прод-формы маскирует
+        # её переформулировку зелёными тестами.
+        "body": sch.review_labels.gate1_verdict_body(["находка: пример гейта 1"]),
     }
 
 
@@ -1425,7 +1469,7 @@ def test_last_verdict_excerpt_ignores_fresh_approve_verdict(monkeypatch):
     gate1_rework = {
         "created_at": "2026-09-05T09:00:00Z",  # СТАРШЕ approve ниже
         "user": {"login": "github-actions[bot]", "type": "Bot"},
-        "body": "Ревью нашло замечания:\n- секрет в фикстуре не замаскирован",
+        "body": sch.review_labels.gate1_verdict_body(["секрет в фикстуре не замаскирован"]),
     }
     fake = FakeGh({"issues/503/comments?per_page=100": [
         gate1_rework,

@@ -484,7 +484,7 @@ def main() -> int:
         run_gh, review_labels.run_target_url(repo))
 
     if findings:
-        body = "Ревью нашло замечания:\n" + "\n".join(f"- {f}" for f in findings)
+        body = review_labels.gate1_verdict_body(findings)
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")
         for f in findings:
             print(f"::error::{f}")

@@ -1487,10 +1487,14 @@ def pr_is_unhealthy(repo: str, pull: dict) -> str | None:
     labels = {label["name"] for label in pull["labels"]}
     if pull.get("draft") or CONFLICT_LABEL in labels:
         return None
-    if review_labels.AI_CHANGES in labels:
-        return f"метка {review_labels.AI_CHANGES}"
-    if review_labels.REVIEW_CHANGES in labels:
-        return f"метка {review_labels.REVIEW_CHANGES}"
+    # Один список — оба читателя (_pr_unhealthy_reason_is_verdict ниже читает
+    # тот же кортеж): новый вердикт-лейбл достаточно добавить в кортеж, и
+    # обе стороны увидят его сами; параллельные if в этой функции молча
+    # оставили бы бюджет реворка без нового вердикта (находка AI-ревью
+    # PR #408, head cf79dc9).
+    for verdict_label in _VERDICT_UNHEALTHY_LABELS:
+        if verdict_label in labels:
+            return f"метка {verdict_label}"
     bad = pr_bad_checks(repo, pull)
     if bad:
         return f"красные проверки: {', '.join(bad)}"
@@ -1506,11 +1510,12 @@ def _pr_unhealthy_reason_is_verdict(pull: dict) -> bool:
     return bool(labels & set(_VERDICT_UNHEALTHY_LABELS))
 
 
-# Комментарий-вердикт гейта 1 опознаётся по маркеру из check_pr.py (прод-форма
-# тела, которое тот пишет при findings). Признак нужен двум потребителям здесь —
-# last_verdict_excerpt (текст последнего вердикта) и verdict_round_links ниже
-# (ссылка на каждый вердикт) — одна константа, не две копии литерала.
-GATE1_VERDICT_PREFIX = "Ревью нашло замечания:"
+# Комментарий-вердикт гейта 1 опознаётся по маркеру из review_labels.py
+# (GATE1_VERDICT_PREFIX — единственное место правды прод-формы, которую
+# пишет check_pr.main; вторая копия литерала здесь молча умирала бы при
+# переформулировке заголовка — находка AI-ревью PR #408, head cf79dc9).
+# Признак нужен двум потребителям ниже — last_verdict_excerpt (текст
+# последнего вердикта) и verdict_round_links (ссылка на каждый вердикт).
 
 # Окно поиска комментария-вердикта ПОСЛЕ события labeled (verdict_round_links
 # ниже). Связь детерминирована порядком публикации в коде обоих гейтов: метка
@@ -1528,7 +1533,7 @@ def _is_gate1_verdict_comment(comment: dict) -> bool:
     ни для ссылки круга (тот же класс доверия, что гейт 2 — дыра #294:
     check_pr.py публикует от GITHUB_TOKEN, т.е. github-actions[bot])."""
     return (review_labels._is_trusted_verdict_author(comment)
-            and (comment.get("body") or "").startswith(GATE1_VERDICT_PREFIX))
+            and (comment.get("body") or "").startswith(review_labels.GATE1_VERDICT_PREFIX))
 
 
 def _is_gate2_rework_comment(comment: dict) -> bool:
@@ -1551,7 +1556,7 @@ def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220,
     не наш пересказ: гейт 2 (AI) — прозa после шапки факта в комментарии
     review_labels.latest_ai_comment (header_facts останавливается на первой
     пустой строке — то, что после неё, findings); гейт 1 — тело последнего
-    комментария check_pr.py, начинающегося с GATE1_VERDICT_PREFIX.
+    комментария check_pr.py, начинающегося с review_labels.GATE1_VERDICT_PREFIX.
     Best-effort: ни один не нашёлся — честная строка, не выдумка.
     `comments` — уже прочитанный список комментариев PR (route_to_needs_spec
     читает их один раз и для ссылок кругов, и для этой выжимки); None —
@@ -1589,7 +1594,7 @@ def last_verdict_excerpt(repo: str, pr_number: int, max_len: int = 220,
         blank = next((i for i, l in enumerate(lines) if not l.strip()), len(lines))
         prose = " ".join(lines[blank + 1:]).strip()
     else:
-        prose = body.replace(GATE1_VERDICT_PREFIX, "").strip()
+        prose = body.replace(review_labels.GATE1_VERDICT_PREFIX, "").strip()
     prose = " ".join(prose.split())
     if not prose:
         return "текст вердикта пуст"
@@ -1731,7 +1736,13 @@ def route_to_needs_spec(repo: str, issue: dict, pull: dict, count: int, reason: 
         "этого (design.md task-rework-loop п.2: reopen вернул бы старую историю "
         "label-событий, и rework_cycle_count немедленно снова превысил бы бюджет).",
     )
-    marker = f"{pulse_guard.NEEDS_SPEC_MARKER} #{number}"
+    # Маркер несёт пару «задача + PR» — граница эпизода (находка AI-ревью
+    # PR #408, head cf79dc9): маркер только с номером задачи глушит и ВТОРОЙ
+    # эпизод той же задачи — после ручного выхода ([needs-spec: снято]) и
+    # повторного исчерпания бюджета на новом PR метка и комментарий в задаче
+    # появились бы, а пуша владельцу не было бы («уже эскалировано ранее»).
+    # Повтор на ту же пару (задача, PR) по-прежнему дедуплицируется.
+    marker = f"{pulse_guard.NEEDS_SPEC_MARKER} #{number} (PR #{pull['number']})"
     excerpt = last_verdict_excerpt(repo, pull["number"], comments=comments)
     text = (
         f"🧭 edge-harness: {marker}\n"

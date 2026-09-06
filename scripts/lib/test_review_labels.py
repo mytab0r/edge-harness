@@ -635,3 +635,38 @@ def test_run_target_url_built_from_actions_env(monkeypatch):
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     assert review_labels.run_target_url("o/r") == "https://github.com/o/r/actions/runs/123"
+
+
+def test_gate1_verdict_prefix_has_single_source():
+    """Находка AI-ревью PR #408 (head cf79dc9, блокирующая): прод-форма
+    комментария гейта 1 жила второй копией литерала в scheduler.py —
+    переформулировка заголовка в check_pr делала ссылки кругов реворка и
+    выжимку эскалации молча мёртвыми при зелёных тестах (тот же класс, что
+    needs-spec/blocked, прецеденты #259/#308). Гвардия по исходнику: литерал
+    определяется только в review_labels.py; потребители (check_pr.py пишет
+    тело через gate1_verdict_body, scheduler опознаёт через
+    GATE1_VERDICT_PREFIX) читают константу, а не копируют строку.
+    Мутация: вернуть литерал в check_pr.py или scheduler.py — тест краснеет."""
+    consumers = (
+        _DIR.parent / "review" / "check_pr.py",
+        _DIR.parent / "orchestra" / "scheduler.py",
+    )
+    for consumer in consumers:
+        source = consumer.read_text(encoding="utf-8")
+        assert "Ревью нашло замечания:" not in source, (
+            f"{consumer.name}: голый литерал прод-формы комментария гейта 1 — "
+            "читать review_labels.GATE1_VERDICT_PREFIX / gate1_verdict_body, "
+            "второй источник маркера запрещён"
+        )
+    source = review_labels.__dict__  # сам модуль загружен — константа живая
+    assert review_labels.GATE1_VERDICT_PREFIX == "Ревью нашло замечания:"
+    assert review_labels.gate1_verdict_body(["x"]) == "Ревью нашло замечания:\n- x"
+
+
+def test_gate1_verdict_body_matches_check_pr_production_form():
+    """Тест кормится прод-формой: тело, которое публикует check_pr.main,
+    собирается той же функцией, которую читают потребители маркера —
+    расхождение формата между писателем и читателями невозможно."""
+    body = review_labels.gate1_verdict_body(["находка один", "находка два"])
+    assert body.startswith(review_labels.GATE1_VERDICT_PREFIX + "\n")
+    assert body.endswith("\n- находка один\n- находка два")

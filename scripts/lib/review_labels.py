@@ -43,6 +43,20 @@ REVIEW_CHANGES = "review:changes-requested"
 REVIEW_LARGE = "review:large"
 LARGE_OK = "review:large-ok"
 
+# Тело комментария-вердикта гейта 1 — единственное место правды маркера
+# (находка AI-ревью PR #408, head cf79dc9:.scheduler держал вторую копию
+# литерала — переформулируй check_pr заголовок, и ссылки кругов реворка
+# вместе с выжимкой эскалации молча стали бы «ссылка не восстановлена» при
+# зелёных тестах). Пишет check_pr.main при findings, опознают scheduler
+# (_is_gate1_verdict_comment → verdict_round_links/last_verdict_excerpt).
+GATE1_VERDICT_PREFIX = "Ревью нашло замечания:"
+
+
+def gate1_verdict_body(findings: list[str]) -> str:
+    """Прод-форма тела комментария гейта 1: check_pr публикует ровно её,
+    тесты кормятся ею же (прод-форма, не пересказ формата)."""
+    return GATE1_VERDICT_PREFIX + "\n" + "\n".join(f"- {f}" for f in findings)
+
 # ── Гейт 2: AI-ревью ─────────────────────────────────────────────────────────
 AI_OK = "ai:ok"
 AI_CHANGES = "ai:changes-requested"
