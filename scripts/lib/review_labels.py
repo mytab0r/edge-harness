@@ -446,6 +446,77 @@ def review_status_state(verdict: str) -> str:
     return "success" if verdict == REVIEW_OK else "failure"
 
 
+
+# ── Ручной workflow_dispatch не должен дублировать прогон, который уже
+# идёт или уже вынес окончательный вердикт (#399) ───────────────────────────
+#
+# Аудит 197 платных прогонов ai-review за 2026-09-05/06 нашёл утечку: 44 из
+# них (22%) — ручные workflow_dispatch под личным токеном владельца,
+# дублирующие уже идущий или уже завершённый прогон на том же PR, БЕЗ
+# ai:failed. Причина — ai_review.py::cmd_should_run с --force не заходил в
+# сеть вовсе, а сам workflow выставлял --force БЕЗУСЛОВНО для любого
+# workflow_dispatch (см. Дельта 2026-09-05 в
+# docs/decisions/0007-ai-review-gate.md), минуя should_run_ai_review выше
+# целиком. --force остаётся, но только по явному input force:true — по
+# умолчанию ручной запуск проходит ТУ ЖЕ сверку, что и автоматический.
+#
+# Отдельная гонка, которую сверка отпечатка не ловит: PR ещё БЕЗ вердикта
+# (первое ревью), но прогон УЖЕ идёт прямо сейчас — should_run_ai_review
+# честно вернёт True (вердикта нет — прогон нужен), хотя второй одновременный
+# прогон того же PR бессмыслен. Единственный надёжный признак «этот прогон
+# про PR N» — run-name (см. `run-name:` в ai-review.yml): у самого
+# ai-review-рана head_branch/head_sha ВСЕГДА "main" (job чекаутит main первым
+# шагом) независимо от триггера — проверено на живых прогонах 2026-09-06
+# (`gh api .../actions/workflows/ai-review.yml/runs` отдаёт
+# head_branch=head_sha=main и для workflow_run, и для workflow_dispatch),
+# поэтому матч по head_sha/head_branch не отличает прогоны разных PR вовсе.
+
+AI_REVIEW_WORKFLOW_FILE = "ai-review.yml"
+# Префикс совпадает с run-name: в ai-review.yml дословно — тест
+# test_ai_review_workflow_run_name_uses_review_labels_prefix в
+# scripts/review/test_ai_review.py сверяет буквально, иначе стороны могут
+# разойтись молча (yml не читает эту константу — два языка).
+AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
+
+
+def ai_review_run_name(pr: int) -> str:
+    """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
+    ДО старта job'а (workflow-level `run-name:`, вычисляется из события: у
+    workflow_dispatch — input `pr`, у workflow_run — из
+    `github.event.workflow_run.pull_requests[0].number`, доступного в
+    событии pr-review БЕЗ похода в API). Форк-PR — известное ограничение:
+    `pull_requests` пуст для PR не из этого репозитория (документированное
+    поведение GitHub) — тогда автоматический прогон получает run-name без
+    номера PR и этой функцией не матчится: деградация признака для форков,
+    не молчаливая ошибка гейта (остальные PR защищены)."""
+    return f"{AI_REVIEW_RUN_NAME_PREFIX}{pr}"
+
+
+def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> list[dict]:
+    """Прогоны `ai-review.yml` (`queued`/`in_progress`) для PR #pr, кроме
+    прогона `exclude_run_id` (себя) — читает ручной `workflow_dispatch`
+    (`ai_review.py::cmd_should_run`), чтобы отказать, если ревью этого PR уже
+    идёт прямо сейчас: второй одновременный прогон денег ждать не должен.
+
+    Не листает глубже одной страницы на статус (`per_page=100`): одновременно
+    активных прогонов одного workflow на масштабе этого репозитория ожидается
+    единицы, не сотни — при реальном превышении это отдельная, более крупная
+    проблема, которую этот гейт не обязан решать."""
+    target = ai_review_run_name(pr)
+    matches: list[dict] = []
+    for status in ("in_progress", "queued"):
+        chunk = gh_func(
+            f"repos/{repo}/actions/workflows/{AI_REVIEW_WORKFLOW_FILE}/runs"
+            f"?status={status}&per_page=100")
+        runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
+        matches.extend(
+            run for run in runs
+            if run.get("display_title") == target
+            and str(run.get("id")) != str(exclude_run_id)
+        )
+    return matches
+
+
 def ai_status_state(verdict: str) -> str:
     """Состояние статуса гейта 2 по вердикту ai_review.parse_verdict
     (approve/rework/error, НЕ по имени метки): approve → success,

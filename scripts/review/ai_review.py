@@ -61,6 +61,7 @@ import re
 import string
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -456,20 +457,89 @@ def cmd_gather(args: argparse.Namespace) -> int:
 # (review_labels.should_run_ai_review — одно место правды, а не вторая копия
 # условия в YAML).
 #
-# --force (находка 1 вердикта ai-review PR #294): ручной workflow_dispatch —
-# единственный документированный путь повтора ревью (ADR 0007 п.4, шапка
-# ai-review.yml) и инструмент оркестратора для проводки PR через ревью.
-# Сверка отпечатка диффа здесь неуместна вовсе: она проверяет «AI уже видел
-# ровно этот код автоматически», а не «владелец согласен с прошлым вердиктом»
-# — и ручной запуск на PR с окончательным вердиктом (ai:ok/ai:changes) и
-# неизменным диффом (например пустой коммит) без --force превращался бы в
-# зелёный no-op без единой строчки ревью, снимая единственный газ пересмотра.
+# Утечка денег владельца (#399, аудит 197 платных прогонов за 2026-09-05/06):
+# 44 из них (22%) — ручные workflow_dispatch, дублирующие уже идущий или уже
+# завершённый прогон на том же PR, без ai:failed. До этой правки
+# ai-review.yml выставлял --force БЕЗУСЛОВНО для любого workflow_dispatch
+# (см. Дельта 2026-09-05 в docs/decisions/0007-ai-review-gate.md) — сверка
+# отпечатка не выполнялась вовсе, повод «владелец хочет пересмотра» не
+# отличался от «оркестратор нажал Run workflow по инерции».
+#
+# --force остаётся (владелец, не согласный с окончательным вердиктом на
+# неизменном диффе, теряет иначе единственный газ пересмотра — находка 1
+# вердикта ai-review PR #294), но теперь это ОТДЕЛЬНЫЙ, осознанный вход:
+# ai-review.yml просит --force, только если ручной запуск явно нёс
+# input force: true (default false) — не любой workflow_dispatch. Без него
+# ручной запуск проходит ТУ ЖЕ сверку, что и автоматический
+# (review_labels.should_run_ai_review), плюс дополнительную гонку «прогон
+# уже идёт прямо сейчас» (review_labels.other_active_ai_review_runs) — её
+# автоматический путь не нуждается в проверке (свой прогон на run_id
+# сериализован concurrency-группой), а ручной может выстрелить поверх уже
+# летящего.
+
+def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
+    """Текст отказа: на PR #pr уже идёт другой прогон ai-review.yml прямо
+    сейчас — второй одновременно бессмыслен, а не просто дорог."""
+    url = other_run.get("html_url")
+    where = f" ({url})" if url else ""
+    return (
+        f"::warning::ручной прогон PR #{pr} отклонён: уже идёт другой прогон "
+        f"ai-review.yml (run {other_run.get('id')}, статус "
+        f"{other_run.get('status', '?')}){where} — второй прогон параллельно "
+        "ничего не даст. Дождитесь его завершения; принудительно запустить "
+        "поверх летящего прогона нельзя даже через force: true."
+    )
+
+
+def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
+    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
+    сколько минут назад он вынесен, и что делать вместо ручного повтора
+    (правило репозитория: отказ без «что дальше» не принимается)."""
+    names = review_labels._names(current_labels)
+    verdict_label = next(
+        (label for label in (review_labels.AI_OK, review_labels.AI_CHANGES) if label in names),
+        "неизвестный вердикт")
+    age = "неизвестно когда"
+    created_at = (ai_comment or {}).get("created_at")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+            age = f"{minutes} мин назад"
+        except ValueError:
+            pass
+    return (
+        f"::notice::ручной прогон PR #{pr} отклонён: дифф не изменился с "
+        f"последнего вердикта {verdict_label} ({age}) — второй прогон на том "
+        "же коде ничего нового не покажет. Автоматический повтор придёт сам, "
+        "если дифф изменится; принудительный пересмотр ровно этого же "
+        "диффа — запуск с явным входом force: true."
+    )
+
 
 def cmd_should_run(args: argparse.Namespace) -> int:
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if manual:
+        # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО
+        # --force: второй одновременный прогон того же PR бессмыслен
+        # независимо от того, хочет ли владелец пересмотра того же диффа
+        # (manual_dispatch_busy_reason это и объявляет: force не пробивает
+        # занятость). Заодно ловит PR без вердикта (первое ревью) —
+        # should_run_ai_review ниже честно вернул бы True, хотя параллельный
+        # прогон того же PR уже летит (#399).
+        repo = os.environ["GITHUB_REPOSITORY"]
+        active = review_labels.other_active_ai_review_runs(
+            repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
+        if active:
+            print(manual_dispatch_busy_reason(args.pr, active[0]), file=sys.stderr)
+            print("false")
+            return 0
     if getattr(args, "force", False):
-        # Ручной повтор не заходит в сеть вообще: решение не зависит от
-        # состояния PR, а необращение к gh здесь же и доказывает мутацией
-        # (test_cmd_should_run_force_skips_check_no_network_call).
+        # Осознанный ручной повтор (не занят — проверено выше) не заходит в
+        # сеть дальше: решение не зависит от отпечатка диффа, а необращение к
+        # gh здесь же и доказывает мутацией
+        # (test_cmd_should_run_force_skips_fingerprint_check_no_network_call).
         print("true")
         return 0
     repo = os.environ["GITHUB_REPOSITORY"]
@@ -481,6 +551,8 @@ def cmd_should_run(args: argparse.Namespace) -> int:
     stored_fp = (review_labels.header_facts(ai_comment.get("body") or "").get("diff")
                  if ai_comment else None)
     run_needed = review_labels.should_run_ai_review(current_labels, stored_fp, current_fp)
+    if not run_needed and manual:
+        print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
     # Единственная строка на stdout — bash-шаг ai-review.yml читает её как
     # $(...), никакого другого вывода в этой команде быть не должно.
     print("true" if run_needed else "false")
@@ -608,10 +680,11 @@ def main() -> int:
     should_run = sub.add_parser(
         "should-run", help="нужен ли дорогой прогон (печатает true/false, #294)")
     should_run.add_argument("--pr", type=int, required=True)
-    # Ручной workflow_dispatch (находка 1 вердикта ai-review PR #294):
-    # пропускает сверку отпечатка целиком, печатает true без обращения к сети.
+    # Осознанный ручной повтор (input force:true, #399, было — любой
+    # workflow_dispatch безусловно): пропускает сверку отпечатка целиком,
+    # печатает true без обращения к сети.
     should_run.add_argument("--force", action="store_true", default=False,
-                             help="ручной повтор (workflow_dispatch) — не сверять отпечаток диффа")
+                             help="явный вход force:true (workflow_dispatch) — не сверять отпечаток диффа")
     should_run.set_defaults(func=cmd_should_run)
 
     verdict = sub.add_parser("verdict", help="разбор ответа + комментарий + метка")

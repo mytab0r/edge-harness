@@ -48,6 +48,25 @@
 # а протухший вердикт и так не применяется (verdict сверяет head с gather).
 name: ai-review
 
+# run-name зашивается из события ДО старта job'а (только github.event.*,
+# шаги ещё не выполнялись) — единственный надёжный признак «этот прогон про
+# PR N» для scripts/lib/review_labels.py::other_active_ai_review_runs (#399):
+# у самого ai-review-рана head_branch/head_sha ВСЕГДА "main" (job чекаутит
+# main первым шагом) независимо от триггера, поэтому матчить прогоны разных
+# PR по head_sha/head_branch нельзя вовсе. workflow_dispatch несёт номер PR
+# прямо во входе; workflow_run (от pr-review) — через
+# github.event.workflow_run.pull_requests[0].number, доступный в событии
+# БЕЗ похода в API (пусто для PR не из этого репозитория — известное
+# ограничение GitHub, деградация признака для форков, не молчаливая ошибка).
+# Префикс "ai-review PR #" продублирован в
+# scripts/lib/review_labels.py::AI_REVIEW_RUN_NAME_PREFIX — тест
+# test_ai_review_workflow_run_name_uses_review_labels_prefix сверяет
+# буквально, чтобы стороны не разошлись молча.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('ai-review PR #{0}', github.event.inputs.pr)
+   || (github.event.workflow_run.pull_requests[0] && format('ai-review PR #{0}', github.event.workflow_run.pull_requests[0].number))
+   || 'ai-review' }}
+
 on:
   workflow_run:
     workflows: [pr-review]
@@ -58,11 +77,26 @@ on:
         description: "Номер PR (повтор ревью, например после ai:failed)"
         required: true
         type: string
+      force:
+        description: >-
+          Пересмотреть даже без изменений в диффе (по умолчанию выключено,
+          #399: безусловный --force жёг деньги на дублях без ai:failed —
+          22% платных прогонов за 2026-09-05/06). Включайте осознанно, когда
+          нужен пересмотр РОВНО того же кода, который уже получил вердикт.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
+  # actions:read — шагу fingerprint нужен API /actions/workflows/.../runs
+  # (review_labels.other_active_ai_review_runs, #399): без этого пункта
+  # GITHUB_TOKEN получает actions:none (пункты, не перечисленные в этом
+  # блоке, GitHub обнуляет — не «как у репозитория по умолчанию»), и
+  # ручная сверка «прогон уже идёт» падала бы 403 на каждом workflow_dispatch.
+  actions: read
 
 concurrency:
   # Группа = породивший run pr-review (уникален) либо номер PR из dispatch:
@@ -193,18 +227,18 @@ jobs:
       # копия условия в YAML). ai:failed никогда не даёт пропустить прогон —
       # у него отдельный газ на автоповтор по таймеру (#196).
       #
-      # workflow_dispatch — единственный документированный путь ручного
-      # повтора (ADR 0007 п.4, шапка этого файла) и рабочий инструмент
-      # оркестратора для проводки PR через ревью: отпечаток сверять НЕЛЬЗЯ,
-      # иначе ручной запуск на PR с окончательным вердиктом и неизменным
-      # диффом становится зелёным no-op без единой строчки ревью — владелец
-      # теряет единственный газ пересмотра (находка 1 вердикта ai-review
-      # PR #294). --force просит cmd_should_run отдать "true" без обращения
-      # к сети вовсе (доказано мутацией: без --force дорогой прогон на
-      # неизменном отпечатке пропускается и при dispatch). Пустой output
-      # шага останавливает job verdict молча (needs.review.outputs.go !=
-      # 'true') — поэтому go=true пишется явно в обеих ветках, не только
-      # выводом python-команды.
+      # Ручной workflow_dispatch БЕЗ явного input force:true проходит ТУ ЖЕ
+      # сверку, что и автоматический путь (#399, было — --force безусловно
+      # для любого dispatch, что жгло 22% платных прогонов на дублях уже
+      # вынесенного вердикта без ai:failed — см. Дельта 2026-09-06 в ADR
+      # 0007). --force остаётся, но включается только явным входом force —
+      # owner, не согласный с окончательным вердиктом на неизменном диффе
+      # (например хочет пересмотра без правки кода), иначе терял бы
+      # единственный газ пересмотра (находка 1 вердикта ai-review PR #294):
+      # cmd_should_run с --force отдаёт "true" без обращения к сети вовсе
+      # (доказано мутацией). Пустой output шага останавливает job verdict
+      # молча (needs.review.outputs.go != 'true') — поэтому go=true пишется
+      # явно в обеих ветках, не только выводом python-команды.
       - if: steps.facts.outputs.go == 'true'
         id: fingerprint
         name: Нужен ли дорогой прогон (сверка отпечатка диффа)
@@ -212,10 +246,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
           set -o pipefail
           force_flag=""
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE_INPUT" = "true" ]; then
             force_flag="--force"
           fi
           run_needed=$(python scripts/review/ai_review.py should-run --pr "$PR_NUMBER" $force_flag) \
@@ -224,7 +259,7 @@ jobs:
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "PR #$PR_NUMBER: дифф не изменился с последнего вердикта AI — дорогой прогон не нужен."
+            echo "PR #$PR_NUMBER: дорогой прогон не нужен (причина — в stderr выше: дифф не изменился, либо уже идёт другой прогон этого PR)."
           fi
 
       # Дерево PR — только ДАННЫЕ для агента: агент читает репозиторий в
