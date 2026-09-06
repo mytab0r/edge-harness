@@ -222,6 +222,55 @@ def test_tasks_from_comment_unclosed_fence_dropped():
     assert ai.tasks_from_comment(body) == []
 
 
+def test_build_comment_tail_scope_not_fenced():
+    # Обещанный тест (находка ревью #433, п.2): сырой ответ модели с ТРЕМЯ
+    # блоками — отдельно/хвост/без поля — от parse_tasks до tasks_from_comment,
+    # доказывающий оба свойства критерия готовности #426: (а) МАСШТАБ реально
+    # разбирается в scope (значение или None), (б) содержимое хвостов и
+    # безполевых находок остаётся ВИДИМО в комментарии автору, а не молча
+    # исчезает — только не фенсится issue'ом.
+    answer = (
+        "Находки описаны ниже.\n\n"
+        "ЗАДАЧА: Отдельная работа\n"
+        "МАСШТАБ: отдельно\n"
+        "Требует нового дизайна вне этого PR.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Доделай прямо тут\n"
+        "МАСШТАБ: хвост\n"
+        "Укладывается в уже изменённые файлы.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Забыли поле\n"
+        "Модель не указала масштаб.\n"
+        "КОНЕЦ ЗАДАЧИ\n\n"
+        "ВЕРДИКТ: rework"
+    )
+    tasks = ai.parse_tasks(answer)
+    by_title = {t["title"]: t for t in tasks}
+    # (а) scope реально разобран — не угадан молча.
+    assert by_title["Отдельная работа"]["scope"] == "отдельно"
+    assert by_title["Доделай прямо тут"]["scope"] == "хвост"
+    assert by_title["Забыли поле"]["scope"] is None
+
+    findings = ai.findings_of(answer, tasks)
+    body = ai.build_comment(163, "sha163", "rework", findings, tasks)
+
+    # (б) содержимое хвоста и безполевой находки живёт в комментарии —
+    # мутация «выпилить обе секции из build_comment» красит эти строки.
+    assert "### Доделай в этом PR" in body
+    assert "Доделай прямо тут" in body
+    assert "Укладывается в уже изменённые файлы." in body
+    assert "### ⚠️ Без объявленного МАСШТАБА" in body
+    assert "Забыли поле" in body
+    assert "Модель не указала масштаб." in body
+
+    # Только «отдельно» уходит фенсом — file_tasks.py заведёт issue РОВНО
+    # на одну находку, не на три (граница в build_comment, не в file_tasks.py).
+    fenced = ai.tasks_from_comment(body)
+    assert [t["title"] for t in fenced] == ["Отдельная работа"]
+    assert "Доделай прямо тут" not in [t["title"] for t in fenced]
+    assert "Забыли поле" not in [t["title"] for t in fenced]
+
+
 # ── Гейт слияния по меткам (одно место правды — review_labels) ────────────────
 
 def test_merge_gate_requires_both_gates():
