@@ -3,23 +3,31 @@
 // 0005-harness-status-proxy) на СОБРАННОМ воркере dsh-edge. Вызывается
 // deploy-dsh-edge.yml рядом с ingest-проверкой (#119): поднимает
 // standalone-артефакт (direct) через unstable_dev на реальном workerd,
-// журнал мокается **service binding** (`serviceBindings` опция unstable_dev —
-// та же механика, что и прод-биндинг HARNESS_SERVICE, см. #501), не
-// отдельным HTTP-сервером на localhost: до фикса #501 прокси ходил обычным
-// `fetch()` на публичный HARNESS_URL, и этот приём в тесте маскировал живую
-// поломку — на localhost (тот же процесс) Cloudflare-ошибка 1042
-// («Worker не может fetch() другой Worker на *.workers.dev того же
-// аккаунта», docs/research/20-cloudflare-free.md) физически не
-// воспроизводима, только на реальном проде между двумя воркерами. Прогоняет
-// контракт прокси: без куки → 401 ДО прокси (auth морды стоит раньше
-// роутинга, секрет воркера браузеру недоступен); кросс-origin → 403;
-// владелец → запрос доходит до /api/events НА БИНДИНГЕ с Bearer HANDS_TOKEN
-// и параметрами журнала (task_id/after/limit, отсутствующий limit не
-// пересылается), ответ журнала проходит насквозь без изменения формы,
-// включая его ошибки (500/401 — прозрачность: форму ответа проверяет
-// клиент морды); кривые параметры режутся самим прокси (400, журнал не
-// дёргается); без HARNESS_SERVICE/HANDS_TOKEN → 503 «возможности нет», не
-// «статусов нет».
+// журнал мокается **отдельным локальным Worker'ом** (тоже через
+// unstable_dev), а не HTTP-сервером на localhost и не JS-функцией в опции
+// unstable_dev (испробовано и отброшено — опция `serviceBindings` unstable_dev
+// не подставляет env.HARNESS_SERVICE в этой версии wrangler: воркер получал
+// его как undefined и честно отвечал 503, см. issue #501, находка при первой
+// попытке чинить). Два `unstable_dev`-воркера в одном процессе резолвят
+// `services`-биндинг друг на друга через локальный dev-registry wrangler —
+// та же механика, что и прод HARNESS_SERVICE (Worker-to-Worker, без
+// публичного DNS/HTTP): до фикса #501 прокси ходил обычным `fetch()` на
+// публичный HARNESS_URL, и HTTP-заглушка на localhost это маскировала — на
+// localhost Cloudflare-ошибка 1042 («Worker не может fetch() другой Worker
+// на *.workers.dev того же аккаунта», docs/research/20-cloudflare-free.md)
+// физически не воспроизводима, только на реальном проде между двумя
+// воркерами. Прогоняет контракт прокси: без куки → 401 ДО прокси (auth
+// морды стоит раньше роутинга, секрет воркера браузеру недоступен);
+// кросс-origin → 403; владелец → запрос доходит до /api/events на биндинге
+// с Bearer HANDS_TOKEN и параметрами журнала (task_id/after/limit,
+// отсутствующий limit не пересылается — факты о полученном запросе читаются
+// из заголовков x-stub-*, которые заглушка-воркер эхом ставит на свой
+// ответ, а прокси пересылает насквозь), ответ журнала проходит насквозь без
+// изменения формы, включая его ошибки (500/401 — прозрачность: форму
+// ответа проверяет клиент морды); кривые параметры режутся самим прокси
+// (400 в форме {ok:false} морды — раз журнал их не видел, они не могли
+// прийти в форме ApiError журнала); без HARNESS_SERVICE/HANDS_TOKEN → 503
+// «возможности нет», не «статусов нет».
 //
 // Использование: node check.mjs <APP_DIR>
 //   APP_DIR — apps/dsh-edge клона апстрима на пине с применённой серией
@@ -55,6 +63,7 @@ const { unstable_dev } = standaloneRequire('wrangler')
 // одноразовая заглушка журнала; эвристика check_pr.py не задета).
 const AUTH_DUMMY = ['proxy-check', 'owner', 'access', 'key-0123456789abcdef'].join('-')
 const JOURNAL_BEARER_DUMMY = ['proxy-check', 'journal', 'bearer', '0123456789abcdef'].join('-')
+const JOURNAL_STUB_NAME = 'dsh-edge-proxy-check-journal-stub'
 
 // ── Заглушка журнала: копия формы ответа cf-worker/src/harness.ts ────────────
 // GET /api/events?task_id=&after=&limit= →
@@ -62,7 +71,6 @@ const JOURNAL_BEARER_DUMMY = ['proxy-check', 'journal', 'bearer', '0123456789abc
 // + заголовки x-has-more/x-next-after, как отдаёт настоящий журнал. Ошибки —
 // форма ApiError журнала: {"error":{"code","message"}} (harness.ts:100-106),
 // не {ok:false} — это форма ошибок МОРДЫ, журнал её не отдаёт.
-const journalCalls = []
 const JOURNAL_PAGE = {
   events: [
     {
@@ -80,56 +88,86 @@ const JOURNAL_PAGE = {
 }
 // task_id → нестандартный ответ: проверка прозрачности чужих кодов в форме
 // ApiError журнала (codes — из messages.ts, «тест кормится прод-формой»).
-const journalSpecial = new Map([
-  ['probe:journal-500', {
+const JOURNAL_SPECIAL = {
+  'probe:journal-500': {
     status: 500,
     body: { error: { code: 'internal', message: 'proxy-check: журнал взорвался' } },
-  }],
-  ['probe:journal-401', {
+  },
+  'probe:journal-401': {
     status: 401,
     body: { error: { code: 'unauthorized', message: 'Нужна авторизация: сессионная кука истекла или отсутствует, либо заголовок Authorization: Bearer <HANDS_TOKEN>' } },
-  }],
-  ['probe:has-more', { status: 200, body: { ...JOURNAL_PAGE, events: [], has_more: true, next_after: 99 } }],
-])
+  },
+  'probe:has-more': { status: 200, body: { ...JOURNAL_PAGE, events: [], has_more: true, next_after: 99 } },
+}
 
-// Заглушка журнала как service binding (не HTTP-сервер): unstable_dev's
-// `serviceBindings` option вызывает эту функцию напрямую вместо диспетчинга
-// в реальный воркер — та же механика биндинга, что и прод HARNESS_SERVICE
-// (Worker-to-Worker, без публичного DNS/HTTP), поэтому тест кормится тем же
-// путём вызова, что и прод, а не отдельным localhost-имитатором.
-function journalServiceBinding(request) {
-  const url = new URL(request.url)
-  journalCalls.push({
-    path: url.pathname,
-    task_id: url.searchParams.get('task_id'),
-    after: url.searchParams.get('after'),
-    limit: url.searchParams.get('limit'),
-    authorization: request.headers.get('authorization'),
-    accept: request.headers.get('accept'),
-  })
-  const special = journalSpecial.get(url.searchParams.get('task_id') ?? '')
-  const status = special?.status ?? 200
-  const body = special?.body ?? JOURNAL_PAGE
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
+// ── Помощники: конфиг, бут, готовность, логин ────────────────────────────────
+
+// Заглушка-воркер журнала — НАСТОЯЩИЙ отдельный Worker (не JS-функция, не
+// HTTP-сервер): дсш-эдж резолвит его по имени через `services`-биндинг, ту
+// же механику, что и прод HARNESS_SERVICE → воркер edge-harness. Факты о
+// полученном запросе кладутся в заголовки ответа x-stub-*: сам ответ
+// прокси-код пересылает клиенту насквозь без изменения формы, поэтому тест
+// читает их с ВНЕШНЕГО ответа, не разделяя JS-память с изолятом заглушки.
+function writeJournalStubWorker(dir) {
+  const src = `
+const JOURNAL_PAGE = ${JSON.stringify(JOURNAL_PAGE)}
+const JOURNAL_SPECIAL = ${JSON.stringify(JOURNAL_SPECIAL)}
+export default {
+  async fetch(request) {
+    const url = new URL(request.url)
+    const taskId = url.searchParams.get('task_id') ?? ''
+    const after = url.searchParams.get('after')
+    const limit = url.searchParams.get('limit')
+    const special = JOURNAL_SPECIAL[taskId]
+    const status = special ? special.status : 200
+    const body = special ? special.body : JOURNAL_PAGE
+    const headers = new Headers({
       'content-type': 'application/json',
       'x-has-more': String(body.has_more),
       'x-next-after': String(body.next_after),
-    },
+      'x-stub-path': url.pathname,
+    })
+    if (taskId !== '') headers.set('x-stub-task-id', taskId)
+    if (after !== null) headers.set('x-stub-after', after)
+    if (limit !== null) headers.set('x-stub-limit', limit)
+    const authorization = request.headers.get('authorization')
+    if (authorization !== null) headers.set('x-stub-authorization', authorization)
+    const accept = request.headers.get('accept')
+    if (accept !== null) headers.set('x-stub-accept', accept)
+    return new Response(JSON.stringify(body), { status, headers })
+  },
+}
+`
+  const scriptPath = join(dir, 'journal-stub.mjs')
+  writeFileSync(scriptPath, src)
+  const configPath = join(dir, 'wrangler-journal-stub.jsonc')
+  writeFileSync(configPath, JSON.stringify({
+    name: JOURNAL_STUB_NAME,
+    main: 'journal-stub.mjs',
+    compatibility_date: '2026-08-14',
+  }))
+  return { scriptPath, configPath }
+}
+
+async function bootJournalStub() {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-edge-proxy-check-journal-'))
+  const { scriptPath, configPath } = writeJournalStubWorker(dir)
+  return unstable_dev(scriptPath, {
+    config: configPath,
+    env: '',
+    logLevel: 'warn',
+    experimental: { disableExperimentalWarning: true, showInteractiveDevSession: false, watch: false },
   })
 }
 
-// ── Помощники: конфиг, бут, готовность, логин (два воркера — два сценария) ───
 function writeConfig(dir, { withJournal }) {
   // Минимальный прям-режим: тот же состав биндингов, что у деплоя
   // (deploy-dsh-edge.yml, шаг «Конфиг воркера»). services (HARNESS_SERVICE)
-  // объявлен ТОЛЬКО для первого воркера, как HARNESS_URL раньше: второй
-  // сценарий — воркер БЕЗ биндинга вовсе (503 «возможности нет»), а не
-  // воркер с биндингом на несуществующий сервис (это была бы другая ошибка —
-  // wrangler не поднимется, а не 503 из кода прокси).
+  // объявлен ТОЛЬКО для первого воркера: второй сценарий — воркер БЕЗ
+  // биндинга вовсе (503 «возможности нет»), а не биндинг на несуществующий
+  // сервис (это была бы другая ошибка — wrangler не поднимется).
   const services = withJournal
-    ? `"services": [{ "binding": "HARNESS_SERVICE", "service": "dsh-edge-proxy-check-journal-stub" }],`
+    ? `"services": [{ "binding": "HARNESS_SERVICE", "service": ${JSON.stringify(JOURNAL_STUB_NAME)} }],`
     : ''
   const config = `{
     "name": "dsh-edge-proxy-check",
@@ -154,7 +192,7 @@ function writeConfig(dir, { withJournal }) {
 
 async function bootWorker({ withJournal }) {
   const persistedState = mkdtempSync(join(tmpdir(), 'dsh-edge-proxy-check-'))
-  const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
+  return unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
     config: writeConfig(persistedState, { withJournal }),
     env: '',
     persistTo: persistedState,
@@ -163,9 +201,6 @@ async function bootWorker({ withJournal }) {
       DSH_EDGE_ACCESS_KEY: AUTH_DUMMY,
       ...(withJournal ? { HANDS_TOKEN: JOURNAL_BEARER_DUMMY } : {}),
     },
-    // Мок service binding, вызывается напрямую вместо диспетчинга в реальный
-    // воркер "dsh-edge-proxy-check-journal-stub" из конфига выше.
-    ...(withJournal ? { serviceBindings: { HARNESS_SERVICE: journalServiceBinding } } : {}),
     logLevel: 'warn',
     experimental: {
       disableExperimentalWarning: true,
@@ -173,7 +208,6 @@ async function bootWorker({ withJournal }) {
       watch: false,
     },
   })
-  return worker
 }
 
 // Готовность воркера (как в ingest-проверке: зависший бут виден в логе шага).
@@ -219,53 +253,55 @@ function requestFor(worker, ownerCookie, path, init) {
   return worker.fetch(`http://dsh-edge.test${path}`, { ...init, headers })
 }
 
+// Заглушка запущена ДО обоих сценариев и живёт до конца скрипта: dev-registry
+// wrangler резолвит `services`-биндинг по имени между любыми параллельно
+// запущенными unstable_dev-воркерами этого процесса.
+const journalStub = await bootJournalStub()
+
 // ── Сценарий 1: воркер с настроенным прокси (HARNESS_SERVICE + HANDS_TOKEN) ──
-let journalCallsAfterScenario1 = 0
 let worker = await bootWorker({ withJournal: true })
 try {
   const entryOrigin = await waitReady(worker)
   const ownerCookie = await loginOwner(entryOrigin)
   const request = (path, init) => requestFor(worker, ownerCookie, path, init)
 
-  // 1. Без куки прокси недостижим: auth морды стоит ДО роутинга (research/12),
-  //    и журнал при этом НЕ дёргается — секрет не тратится на чужака.
+  // 1. Без куки прокси недостижим: auth морды стоит ДО роутинга (research/12).
+  //    Форма ответа — {ok:false} морды, не форма журнала: журнал не мог быть
+  //    вызван (если бы был, ответ нёс бы его собственную форму ApiError).
   //    Сырой fetch без кук-хелпера: владелец ещё не логинился.
   const anon = await fetch(`${entryOrigin}/api/harness/events?task_id=plugin:demo`)
   const anonBody = await anon.json()
   assert.equal(anon.status, 401, 'без куки → 401')
-  assert.equal(anonBody.ok, false, '401 в форме ошибки морды')
-  assert.equal(journalCalls.length, 0, 'неавторизованный запрос не дошёл до журнала')
+  assert.equal(anonBody.ok, false, '401 в форме ошибки морды (не журнала — журнал не дёргался)')
 
   // 2. Кросс-origin авторизованный запрос режется общим гвардом морды.
   const evil = await request('/api/harness/events?task_id=plugin:demo', {
     headers: { origin: 'https://evil.example' },
   })
   assert.equal(evil.status, 403, 'кросс-origin → 403')
-  assert.equal(journalCalls.length, 0, 'кросс-origin запрос не дошёл до журнала')
 
-  // 3. Владелец: запрос доходит до журнала с Bearer и параметрами; отсутствующий
-  //    limit не пересылается (журнал применит свой replayDefault — прозрачность).
+  // 3. Владелец: запрос доходит до журнала с Bearer и параметрами (факты о
+  //    полученном запросе — в заголовках x-stub-*, эхом от заглушки,
+  //    пересланных прокси насквозь); отсутствующий limit не пересылается
+  //    (журнал применит свой replayDefault — прозрачность).
   const ok = await request('/api/harness/events?task_id=' + encodeURIComponent('plugin:demo'))
   assert.equal(ok.status, 200, 'прокси отвечает 200')
   const okBody = await ok.json()
   assert.deepEqual(okBody, JOURNAL_PAGE, 'ответ журнала прошёл насквозь без изменения формы')
-  assert.equal(journalCalls.length, 1, 'ровно один вызов журнала')
-  const call = journalCalls[0]
-  assert.equal(call.path, '/api/events', 'путь журнала')
-  assert.equal(call.task_id, 'plugin:demo', 'task_id передан как есть')
-  assert.equal(call.after, '0', 'after по умолчанию 0')
-  assert.equal(call.limit, null, 'отсутствующий limit не пересылается')
-  assert.equal(call.authorization, `Bearer ${JOURNAL_BEARER_DUMMY}`, 'Bearer HANDS_TOKEN добавлен прокси, не браузером')
-  assert.equal(call.accept, 'application/json', 'журналу обещан JSON')
+  assert.equal(ok.headers.get('x-stub-path'), '/api/events', 'путь журнала (доказывает, что запрос дошёл до заглушки)')
+  assert.equal(ok.headers.get('x-stub-task-id'), 'plugin:demo', 'task_id передан как есть')
+  assert.equal(ok.headers.get('x-stub-after'), '0', 'after по умолчанию 0')
+  assert.equal(ok.headers.get('x-stub-limit'), null, 'отсутствующий limit не пересылается')
+  assert.equal(ok.headers.get('x-stub-authorization'), `Bearer ${JOURNAL_BEARER_DUMMY}`, 'Bearer HANDS_TOKEN добавлен прокси, не браузером')
+  assert.equal(ok.headers.get('x-stub-accept'), 'application/json', 'журналу обещан JSON')
   assert.match(ok.headers.get('content-type') ?? '', /json/, 'клиент получит JSON-форму')
 
   // 4. Явные limit/after пересылаются.
   const paged = await request('/api/harness/events?task_id=plugin:demo&limit=10&after=42')
   assert.equal(paged.status, 200)
   await paged.text()
-  assert.equal(journalCalls.length, 2)
-  assert.equal(journalCalls[1].limit, '10', 'limit переслан')
-  assert.equal(journalCalls[1].after, '42', 'after переслан')
+  assert.equal(paged.headers.get('x-stub-limit'), '10', 'limit переслан')
+  assert.equal(paged.headers.get('x-stub-after'), '42', 'after переслан')
 
   // 5. has_more/next_after проходят насквозь — клиент морды листает страницы.
   const more = await request('/api/harness/events?task_id=probe:has-more')
@@ -273,8 +309,11 @@ try {
   const moreBody = await more.json()
   assert.equal(moreBody.has_more, true, 'has_more прошёл насквозь')
   assert.equal(moreBody.next_after, 99, 'next_after прошёл насквозь')
+  assert.equal(more.headers.get('x-stub-path'), '/api/events', 'запрос дошёл до заглушки (доказательство для probe:has-more)')
 
-  // 6. Кривые параметры режет сам прокси (400), журнал не дёргается.
+  // 6. Кривые параметры режет сам прокси (400), журнал не дёргается: форма
+  //    ответа — {ok:false} морды, не ApiError журнала, и заголовков x-stub-*
+  //    на ответе нет (заглушка их не ставила бы, если бы её не вызвали).
   for (const query of [
     '',
     '?task_id=',
@@ -289,8 +328,8 @@ try {
     const badBody = await bad.json()
     assert.equal(bad.status, 400, `кривой запрос ${query || '<без параметров>'} → 400`)
     assert.equal(badBody.ok, false, '400 в форме {ok:false}')
+    assert.equal(bad.headers.get('x-stub-path'), null, 'журнал кривым запросом не дёргался')
   }
-  assert.equal(journalCalls.length, 3, 'журнал кривыми запросами не дёргался')
 
   // 7. Ошибки журнала проходят насквозь В ЕГО СОБСТВЕННОЙ форме ApiError
   //    {"error":{code,message}}: форму отвечает журнал, её судьбу — громкая
@@ -307,7 +346,6 @@ try {
   }
 
   console.log('proxy-check: сценарий 1 (настроенный прокси) — контракт выполнен')
-  journalCallsAfterScenario1 = journalCalls.length
 } finally {
   await worker.stop()
 }
@@ -328,10 +366,11 @@ try {
   assert.equal(unconfigured.status, 503, 'без настроек прокси → 503')
   assert.equal(unconfiguredBody.ok, false, '503 в форме {ok:false}')
   assert.match(String(unconfiguredBody.error), /not configured/, 'ошибка называет причину: прокси не настроен')
-  assert.equal(journalCalls.length, journalCallsAfterScenario1, 'ненастроенный воркер журнал не дёргал')
+  assert.equal(unconfigured.headers.get('x-stub-path'), null, 'ненастроенный воркер журнал (заглушку) не дёргал')
   console.log('proxy-check: сценарий 2 (прокси не настроен) — 503 «возможности нет», не «статусов нет»')
 } finally {
   await worker.stop()
+  await journalStub.stop()
 }
 
 console.log('✅ proxy-check: контракт прокси /api/harness/events выполнен на собранном артефакте')
