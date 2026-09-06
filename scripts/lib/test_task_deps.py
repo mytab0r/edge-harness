@@ -147,25 +147,6 @@ def test_gh_graphql_surfaces_graphql_errors_field_loudly():
             td.fetch_pool("owner/repo")
 
 
-# ── graph_is_empty ───────────────────────────────────────────────────────────
-
-
-def test_graph_is_empty_true_when_no_edges_anywhere():
-    issues = [
-        {"number": 1, "blocking_open": 0, "blocked_by_open": []},
-        {"number": 2, "blocking_open": 0, "blocked_by_open": []},
-    ]
-    assert td.graph_is_empty(issues) is True
-
-
-def test_graph_is_empty_false_when_one_edge_exists():
-    issues = [
-        {"number": 1, "blocking_open": 1, "blocked_by_open": []},
-        {"number": 2, "blocking_open": 0, "blocked_by_open": []},
-    ]
-    assert td.graph_is_empty(issues) is False
-
-
 # ── add_dependency/remove_dependency: резолв id + мутация ───────────────────
 
 

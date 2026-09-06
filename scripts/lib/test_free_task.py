@@ -37,11 +37,17 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("free_task.py")
 spec = importlib.util.spec_from_file_location("free_task", SCRIPT)
 free_task = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(free_task)  # type: ignore[union-attr]
+
+TASK_DEPS_SCRIPT = Path(__file__).with_name("task_deps.py")
+_td_spec = importlib.util.spec_from_file_location("task_deps", TASK_DEPS_SCRIPT)
+task_deps = importlib.util.module_from_spec(_td_spec)
+_td_spec.loader.exec_module(task_deps)  # type: ignore[union-attr]
 
 
 # ── Прод-форма: реальное тело PR #181 (gh pr view 181 --json body), ────────────────
@@ -175,34 +181,69 @@ def test_cli_silent_when_graph_has_signal(tmp_path):
     assert "граф блокировок пуст" not in result.stderr
 
 
+def _pool_page(blocker_edges):
+    """Форма ответа GraphQL `task_deps._POOL_QUERY_TMPL` с двумя задачами:
+    #10 (блокирует узлы `blocker_edges`) и контрольная #20 (блокирует 2
+    открытых, не меняется по ходу теста)."""
+    return {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {
+                        "number": 10, "title": "блокирующая",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []},
+                        "blockedBy": {"nodes": []},
+                        "blocking": {"nodes": [
+                            {"number": n, "state": s} for n, s in blocker_edges
+                        ]},
+                    },
+                    {
+                        "number": 20, "title": "контрольная",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []},
+                        "blockedBy": {"nodes": []},
+                        "blocking": {"nodes": [
+                            {"number": 200, "state": "OPEN"},
+                            {"number": 201, "state": "OPEN"},
+                        ]},
+                    },
+                ],
+            }
+        }
+    }
+
+
 def test_mutation_closing_blocked_issues_flips_priority_order_next_run():
     # Авто-возврат (#361, п.5): "blocking_open" — живой пересчёт (сколько
     # ОТКРЫТЫХ задач блокирует эта СЕЙЧАС), не кэш и не метка, которую надо
-    # снимать руками. task_deps.fetch_pool считает только state == OPEN на
-    # КАЖДОМ прогоне — закрытие блокируемых задач меняет счётчик, а значит и
-    # порядок, следующим же запуском без единого дополнительного действия.
-    def blocking_open_from_native(nodes):
-        return sum(1 for node in nodes if node["state"] == "OPEN")
+    # снимать руками. Прогнано через прод-цепочку целиком: task_deps.fetch_pool
+    # (GraphQL, monkeypatch subprocess — тот же приём, что test_task_deps.py) ->
+    # free_task.prioritized_free, а не пересчёт локальной копией формулы.
+    edges_before = [(90, "OPEN"), (91, "OPEN"), (92, "OPEN")]
+    edges_after = [(90, "CLOSED"), (91, "CLOSED"), (92, "OPEN")]  # 2 из 3 закрылись
 
-    blocker_before = [{"number": 90, "state": "OPEN"}, {"number": 91, "state": "OPEN"},
-                       {"number": 92, "state": "OPEN"}]
-    blocker_after = [{"number": 90, "state": "CLOSED"}, {"number": 91, "state": "CLOSED"},
-                      {"number": 92, "state": "OPEN"}]  # 2 из 3 блокируемых закрылись
-    assert blocking_open_from_native(blocker_before) == 3
-    assert blocking_open_from_native(blocker_after) == 1
+    def gh_call_before(*args):
+        assert args[0] == "graphql"
+        return {"data": _pool_page(edges_before)}
 
-    blocker = issue(10, blocking_open=blocking_open_from_native(blocker_before))
-    other = issue(20, blocking_open=2)  # не меняется весь тест — контрольная величина
+    def gh_call_after(*args):
+        assert args[0] == "graphql"
+        return {"data": _pool_page(edges_after)}
 
-    # ДО закрытия: 10 блокирует больше (3 > 2) — выбирается первым.
-    assert free_task.prioritized_free([other, blocker])[0]["number"] == 10
+    # ДО закрытия: #10 блокирует больше открытых (3 > 2) — выбирается первым.
+    pool_before = task_deps.fetch_pool("owner/repo", gh_call=gh_call_before)
+    assert [i["number"] for i in pool_before] == [10, 20]
+    assert pool_before[0]["blocking_open"] == 3
+    assert free_task.prioritized_free(pool_before)[0]["number"] == 10
 
-    # Мутация: блокирующая задача №10 теряет два открытых блокируемых.
-    blocker["blocking_open"] = blocking_open_from_native(blocker_after)
+    # Мутация: две из трёх блокируемых задачами #10 закрылись — следующий
+    # прогон `fetch_pool` (не ручная правка поля) видит счётчик 1 < 2.
+    pool_after = task_deps.fetch_pool("owner/repo", gh_call=gh_call_after)
+    assert pool_after[0]["blocking_open"] == 1
 
-    # ПОСЛЕ: 10 блокирует меньше, чем other (1 < 2) — порядок ПЕРЕВОРАЧИВАЕТСЯ,
+    # ПОСЛЕ: #10 блокирует меньше, чем #20 (1 < 2) — порядок ПЕРЕВОРАЧИВАЕТСЯ,
     # без правки кода/метки/ручного вмешательства — только следующий пересчёт.
-    assert free_task.prioritized_free([other, blocker])[0]["number"] == 20
+    assert free_task.prioritized_free(pool_after)[0]["number"] == 20
 
 
 def test_oldest_free_empty_pool_is_none():

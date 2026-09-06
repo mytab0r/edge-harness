@@ -159,16 +159,6 @@ def fetch_pool(repo: str, label: str = "task", gh_call=_default_gh) -> list[dict
     return issues
 
 
-def graph_is_empty(issues: list[dict]) -> bool:
-    """Ни одна задача пула не блокирует и не блокирована ничем открытым —
-    приоритет по графу выродится в тайбрейк по номеру для всех кандидатов
-    (см. free_task.py::issue_priority_key). Видимый сигнал, не молчание."""
-    return all(
-        not issue.get("blocking_open") and not issue.get("blocked_by_open")
-        for issue in issues
-    )
-
-
 # ── Запись связи (ручной шаг, тот же паттерн, что sub-issues в PROTOCOL.md) ──
 
 _ISSUE_ID_QUERY = """

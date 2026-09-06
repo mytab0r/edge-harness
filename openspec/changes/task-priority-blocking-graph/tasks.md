@@ -6,7 +6,7 @@
       `gh_call("graphql", ...)`, по умолчанию `_default_gh` = `gh api graphql`,
       инъекция `gh_call` — для scheduler.py, единая точка мока с REST),
       `fetch_pool(repo, label="task")` (пагинированный GraphQL, поля
-      number/title/labels/assignees/blockedBy/blocking), `graph_is_empty`,
+      number/title/labels/assignees/blockedBy/blocking),
       `add_dependency`/`remove_dependency` (резолв node id по номеру +
       мутации `addBlockedBy`/`removeBlockedBy`), CLI `pool`/`block`/`unblock`.
 - [x] Тест: живой round-trip доказан отдельно (issue #350↔#320, 2026-09-06,
