@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Единственный документированный путь заводить issue — что через gh CLI, что
+# из промпта агента (docs/agents/PROTOCOL.md, docs/agents/LABELS.md). Обёртка
+# над `gh issue create`, аргументы проксируются как есть. Отказывает ДО
+# вызова gh issue create (ничего не создаётся, сеть не тратится), если среди
+# --label не нашлось `task` — класс #179: issue заведена агентом напрямую
+# (`gh issue create --label white-spot`) мимо шаблона (шаблон применяется
+# только к веб-форме, не к API/CLI-созданию), без task она физически не
+# видна пулу воркера (scheduler.py читает только label=task). Живой случай —
+# issue #523 (метка white-spot без task) и #425 (без единой метки).
+#
+# Если issue заведомо НЕ для пула (сейчас в репозитории таких шаблонов нет —
+# оба существующих, task.yml и white-spot.yml, требуют task) — явное
+# подтверждение --no-task-ack "<причина>" пропускает проверку и печатает
+# причину в лог, чтобы пропуск был осознанным решением, а не забытой меткой.
+#
+# Использование: то же самое, что `gh issue create` — все аргументы
+# проксируются без изменений (--title, --body/--body-file, --label, …),
+# плюс свой --no-task-ack "<причина>" (в gh не уходит).
+set -euo pipefail
+
+labels=()
+args=()
+no_task_ack=""
+n=$#
+i=1
+while [ "$i" -le "$n" ]; do
+  arg="${!i}"
+  case "$arg" in
+    --label)
+      i=$((i + 1))
+      val="${!i}"
+      labels+=("$val")
+      args+=("--label" "$val")
+      ;;
+    --label=*)
+      val="${arg#--label=}"
+      labels+=("$val")
+      args+=("$arg")
+      ;;
+    --no-task-ack)
+      i=$((i + 1))
+      no_task_ack="${!i}"
+      ;;
+    --no-task-ack=*)
+      no_task_ack="${arg#--no-task-ack=}"
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+# --label поддерживает одно значение вида "a,b,c" (форма gh issue create) —
+# разворачиваем перед проверкой, иначе "--label white-spot,task" молча
+# проходит мимо has_task.
+has_task=0
+for l in "${labels[@]+"${labels[@]}"}"; do
+  IFS=',' read -ra parts <<<"$l"
+  for p in "${parts[@]}"; do
+    if [ "$p" = "task" ]; then
+      has_task=1
+    fi
+  done
+done
+
+if [ "$has_task" -ne 1 ]; then
+  if [ -n "$no_task_ack" ]; then
+    echo "issue-create: заведено БЕЗ task, осознанно (--no-task-ack): $no_task_ack" >&2
+  else
+    echo "::error::issue заводится без метки task — пул воркера её не увидит (scheduler.py, класс #179, живые случаи #523/#425). Добавь --label task, либо явно распишись --no-task-ack \"причина\", если это НЕ задача пула." >&2
+    echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+    exit 1
+  fi
+fi
+
+exec gh issue create "${args[@]}"

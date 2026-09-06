@@ -204,6 +204,15 @@ _rc_spec = importlib.util.spec_from_file_location(
 review_checklist = importlib.util.module_from_spec(_rc_spec)
 _rc_spec.loader.exec_module(review_checklist)
 
+# Единственное место правды на заведение issue пула (#526): без него labels
+# без `task` собирались бы копией той же проверки, что уже есть у
+# file_tasks.py/stall_detector.py/upstream_drift.py — вместо этого все
+# четверо зовут одну функцию.
+_pi_spec = importlib.util.spec_from_file_location(
+    "pool_issue", Path(__file__).resolve().parents[1] / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_pi_spec)
+_pi_spec.loader.exec_module(pool_issue)
+
 # Номер задачи из текста PR/issue — одно место правды (#187): границы числа
 # с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
 # 33570081734).
@@ -1536,11 +1545,10 @@ def after_merge(
                 observations.append(
                     f"ℹ️ хвост чеклиста PR #{number}: задача уже заведена (идемпотентность по заголовку)")
             else:
-                created = gh(
-                    "-X", "POST", f"repos/{repo}/issues",
-                    "-f", f"title={tail_title}",
-                    "-f", "body=" + review_checklist.tail_issue_body(repo, number, unresolved),
-                    "-f", "labels[]=task",
+                created = pool_issue.create_pool_issue(
+                    gh, repo, tail_title,
+                    review_checklist.tail_issue_body(repo, number, unresolved),
+                    ["task"],
                 )
                 actions.append(
                     f"📋 хвост чеклиста PR #{number}: заведена #{created['number']} "

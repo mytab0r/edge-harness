@@ -38,6 +38,15 @@ _td_spec = importlib.util.spec_from_file_location(
 task_deps = importlib.util.module_from_spec(_td_spec)
 _td_spec.loader.exec_module(task_deps)
 
+# Единственное место правды на заведение issue пула (#526): без него labels
+# без `task` собирались бы здесь копией той же проверки, что уже есть в
+# scheduler.py/stall_detector.py/upstream_drift.py — вместо этого все
+# четверо зовут одну функцию.
+_pi_spec = importlib.util.spec_from_file_location(
+    "pool_issue", SCRIPT_DIR.parent / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_pi_spec)
+_pi_spec.loader.exec_module(pool_issue)
+
 
 def gh(*args: str):
     return ai_review.gh(*args)
@@ -102,10 +111,7 @@ def file_task(repo: str, task: dict) -> int:
     """Создать issue с меткой task; ответ API — созданный issue (номер из него,
     а не из догадок по спискам — гонка невозможна по построению)."""
     body = task["body"] or "(тело не предложено ревью — уточни цель и критерий готовности)"
-    created = gh("-X", "POST", f"repos/{repo}/issues",
-                 "-f", f"title={task['title']}",
-                 "-f", "body=" + body,
-                 "-f", "labels[]=task")
+    created = pool_issue.create_pool_issue(gh, repo, task["title"], body, ["task"])
     return int(created["number"])
 
 

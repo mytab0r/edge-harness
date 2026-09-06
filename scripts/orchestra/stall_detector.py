@@ -118,6 +118,15 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
+# Единственное место правды на заведение issue пула (#526): без него labels
+# без `task` собирались бы копией той же проверки, что уже есть у
+# file_tasks.py/scheduler.py/upstream_drift.py — вместо этого все четверо
+# зовут одну функцию.
+_PI_SPEC = importlib.util.spec_from_file_location(
+    "pool_issue", Path(__file__).resolve().parents[1] / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_PI_SPEC)
+_PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
+
 # ── Пороги (одно место правды этого детектора) ────────────────────────────
 
 # Отпечаток должен продержаться дольше этого с момента первого наблюдения
@@ -296,13 +305,7 @@ def _render_body(fingerprint: str, evidence: list[str], run_url: str | None) -> 
 def create_task(repo: str, fingerprint: str, evidence: list[str], run_url: str | None) -> int:
     body = _render_body(fingerprint, evidence, run_url)
     title = f"Простой конвейера: {fingerprint}"
-    result = gh(
-        "-X", "POST", f"repos/{repo}/issues",
-        "-f", f"title={title}",
-        "-f", "body=" + body,
-        "-f", f"labels[]={TASK_LABEL}",
-        "-f", f"labels[]={AUTO_LABEL}",
-    )
+    result = pool_issue.create_pool_issue(gh, repo, title, body, [TASK_LABEL, AUTO_LABEL])
     return result["number"]
 
 
