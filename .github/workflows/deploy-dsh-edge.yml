@@ -485,6 +485,65 @@ jobs:
           }
           WRANGLER
 
+      - name: plugin_status → deploying
+        if: steps.route.outputs.plugins != '0'
+        # Промежуточный статус — best-effort: лежащий журнал не имеет права
+        # блокировать деплой морды (скрипт для non-final ретраит и не красит
+        # job; continue-on-error страхует от неожиданных ошибок самого шага).
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          SOURCE: deploy
+          STATE: deploying
+        run: |
+          for id in ${{ steps.route.outputs.ids }}; do
+            PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
+          done
+
+      # Деплой — ПЕРЕД синком секретов (issue #549, находка живого прогона
+      # 34049854919: `wrangler secret put` отказал «the latest version of
+      # your Worker isn't currently deployed»). Причина — новый автооткат
+      # (`wrangler rollback` в конце этого job'а): rollback делает АКТИВНОЙ
+      # старую версию, но НЕ трогает «последнюю созданную» (ей остаётся
+      # версия, раскатанная сломанным прогоном) — до следующего `wrangler
+      # deploy` эти две версии расходятся, а `wrangler secret put`
+      # (легаси-команда поверх Versions API) отказывается работать именно в
+      # этом рассинхроне, чтобы не переоткатить прод молча. `wrangler deploy`
+      # этого разногласия не разбирает — он всегда создаёт НОВУЮ версию и
+      # безусловно делает её активной на 100%, поэтому сдвиг его перед секретами
+      # чинит рассинхрон синхронно с обычным деплоем, а не отдельным шагом.
+      # Секреты Cloudflare переживают редеплой сами (`versions upload --help`:
+      # «secrets are never deleted by deployments») — поставить их МОМЕНТОМ
+      # позже, чем код, ничего не ломает: канарейки и e2e-смоук всё равно идут
+      # в конце job'а, к тому моменту секреты уже синхроны.
+      - name: Деплой
+        id: deploy
+        working-directory: ${{ github.workspace }}/deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # pipefail обязателен: pipeline | tail маскирует код wrangler,
+          # и упавший деплой дошёл бы до канарейки старого воркера и
+          # ложного ready в журнале.
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tail -8
+
+      # Деплой, не оставивший живую морду, — не деплой, а поломка. Корень для
+      # неавторизованных отвечает 302 на /login (проверено на проде), поэтому
+      # идём за редиректом и требуем 200 конечной страницы. Канарейка стоит
+      # сразу за деплоем (не в конце job'а) — сломанный код не имеет смысла
+      # прогонять через синк секретов/интеграций.
+      - name: Канарейка прода
+        run: |
+          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          if [ "$code" != "200" ]; then
+            echo "::error::Морда отвечает $code после деплоя $VERSION_DEPLOYED"
+            exit 1
+          fi
+          echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
+
       # Морда и руки читают провайдера из ОДНОГО места правды — vars репозитория
       # (DEEPSEEK_* — унаследованное имя, значение любой OpenAI-compat endpoint).
       # Секреты воркера переживают деплой, put идемпотентен. ВСЕ ТРИ провайдерных
@@ -597,47 +656,6 @@ jobs:
         run: |
           [ -n "$HANDS_TOKEN" ] || { echo "::error::HANDS_TOKEN не задан — прокси /api/harness/events не сможет аутентифицироваться в журнале"; exit 1; }
           printf '%s' "$HANDS_TOKEN" | npx wrangler secret put HANDS_TOKEN
-
-      - name: plugin_status → deploying
-        if: steps.route.outputs.plugins != '0'
-        # Промежуточный статус — best-effort: лежащий журнал не имеет права
-        # блокировать деплой морды (скрипт для non-final ретраит и не красит
-        # job; continue-on-error страхует от неожиданных ошибок самого шага).
-        continue-on-error: true
-        env:
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          SOURCE: deploy
-          STATE: deploying
-        run: |
-          for id in ${{ steps.route.outputs.ids }}; do
-            PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
-          done
-
-      - name: Деплой
-        id: deploy
-        working-directory: ${{ github.workspace }}/deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          # pipefail обязателен: pipeline | tail маскирует код wrangler,
-          # и упавший деплой дошёл бы до канарейки старого воркера и
-          # ложного ready в журнале.
-          set -o pipefail
-          npx wrangler deploy 2>&1 | tail -8
-
-      # Деплой, не оставивший живую морду, — не деплой, а поломка. Корень для
-      # неавторизованных отвечает 302 на /login (проверено на проде), поэтому
-      # идём за редиректом и требуем 200 конечной страницы.
-      - name: Канарейка прода
-        run: |
-          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
-          if [ "$code" != "200" ]; then
-            echo "::error::Морда отвечает $code после деплоя $VERSION_DEPLOYED"
-            exit 1
-          fi
-          echo "✅ dsh-edge $VERSION_DEPLOYED жив: https://dsh-edge.mytab0r.workers.dev"
 
       # Шов «сессия раннера в морде» (#119): деплой обязан не просто поднять
       # морду, а оставить работающим маршрут ingest транскрипта — им живут все
