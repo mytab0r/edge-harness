@@ -12,6 +12,7 @@ gh не вызывается ни одной тестируемой функци
 
 import argparse
 import importlib.util
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -645,6 +646,39 @@ def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatc
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "true"
+
+
+# ── main(): «решили не запускать» (go=false, exit 0) не путать с «не смогли
+# решить» (RuntimeError гейта — сеть/права/битый ответ API, exit 1) ───────────
+#
+# Регрессия 2026-09-06 (PR #416/#399, живой прогон 34009775887, PR #333):
+# ai-review.yml читает should-run как `run_needed=$(python ... should-run
+# ...)` — bash command substitution забирает ТОЛЬКО stdout процесса. main()
+# ловил RuntimeError СНАРУЖИ функции (в блоке if __name__) и печатал причину
+# без file=sys.stderr — она уезжала в $run_needed и пропадала из лога job'а:
+# шаг падал с голым «::error::не смог решить...» без единой подсказки почему.
+# Обе строки ниже уже покрыты (test_cmd_should_run_prints_false_when_diff_
+# unchanged_ai_ok — go=false здесь ВСЕГДА exit 0, «решили не запускать»
+# никогда не роняет job); эта пара добавляет вторую половину — «не смогли
+# решить» обязано быть exit 1 С ВИДИМОЙ причиной именно в stderr.
+
+def test_main_reports_gh_runtime_error_on_stderr_not_stdout(monkeypatch, capsys):
+    def gh_network_down(*_args, **_kwargs):
+        raise RuntimeError("FAKE_GH_API_5xx_MARKER")
+
+    monkeypatch.setattr(ai, "gh", gh_network_down)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setattr(sys, "argv", ["ai_review.py", "should-run", "--pr", "294"])
+
+    rc = ai.main()
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "FAKE_GH_API_5xx_MARKER" in captured.err, (
+        "причина сбоя обязана быть в stderr — иначе она пропадает при "
+        f"$(...) в ai-review.yml (stdout был: {captured.out!r})")
+    assert "FAKE_GH_API_5xx_MARKER" not in captured.out
 
 
 def test_is_not_found_exact_form_only():
