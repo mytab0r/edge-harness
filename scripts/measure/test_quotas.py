@@ -17,6 +17,7 @@ scripts/orchestra/test_pulse_guard.py.
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,15 @@ FIXTURES = Path(__file__).with_name("fixtures")
 
 def load(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def query_limit(query: str) -> int:
+    """Достаёт число из `limit: N` в тексте GraphQL-запроса — используется
+    fake'ами, которые обязаны УВАЖАТЬ limit (находка 1, ревью PR #327), а не
+    игнорировать его и отдавать все группы независимо от запрошенного среза."""
+    match = re.search(r"limit:\s*(\d+)", query)
+    assert match, "запрос обязан явно указывать limit"
+    return int(match.group(1))
 
 
 # ── Row: процент и порог ──────────────────────────────────────────────────────
@@ -182,6 +192,55 @@ def test_cf_workers_invocations_doc_example_sums_requests(monkeypatch):
     assert workers_row.status == "ok"
     assert workers_row.current == 6
     assert workers_row.limit == qz.LIMITS["cf_workers_requests_day"]
+
+
+def test_cf_workers_invocations_limit_covers_all_groups_not_one(monkeypatch):
+    """Находка 1 (ревью PR #327): workersInvocationsAdaptive — adaptive-groups
+    датасет, каждая строка ответа — ОДНА группа измерений (дата/минута,
+    scriptName, status); limit режет именно группы. limit: 1 брал бы запросы
+    одной случайной группы вместо всех суток — тихий undercount. Fake уважает
+    limit из текста запроса, чтобы обрезка красила тест мутационно: откати
+    limit на 1 в quotas.py — этот тест покраснеет (30 != 10)."""
+    groups = [{"sum": {"requests": 10}} for _ in range(3)]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "workersInvocationsAdaptive" in query:
+            limit = query_limit(query)
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": groups[:limit]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.current == 30
+
+
+def test_cf_storage_sums_stored_bytes_of_latest_date_across_namespaces(monkeypatch):
+    """Находка 1: DO storage разбит по namespaceId, на аккаунте их несколько
+    (#322) — сумма storedBytes ПОСЛЕДНЕЙ даты по всем namespace, не max одной
+    произвольной группы. limit: 1 брал бы один случайный namespace вместо
+    аккаунта целиком. Fake уважает limit — откати его на 1 в quotas.py, тест
+    покраснеет (350 != 100)."""
+    groups = [
+        {"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 100}},
+        {"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 250}},
+        {"dimensions": {"date": "2026-09-04"}, "max": {"storedBytes": 999}},  # старая дата — не считается
+    ]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "durableObjectsStorageGroups" in query:
+            limit = query_limit(query)
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": groups[:limit]}]}}
+        return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    storage_row = next(r for r in rows if r.resource == "DO storage/аккаунт")
+    assert storage_row.current == 350
 
 
 def test_cf_rows_metric_not_found_is_no_data_not_guess(monkeypatch):

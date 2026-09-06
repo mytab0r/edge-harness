@@ -159,13 +159,18 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
     rows: list[Row] = []
 
     # Workers requests — поля подтверждены доком дословно (workersInvocationsAdaptive
-    # sum{requests,errors,subrequests}), интроспекция не нужна.
+    # sum{requests,errors,subrequests}), интроспекция не нужна. Это adaptive-
+    # groups датасет, каждая строка ответа — ОДНА группа измерений (дата/
+    # минута, scriptName, status), limit режет группы, не строки данных
+    # (находка ревью PR #327): limit: 1 брал бы запросы одной случайной группы
+    # вместо всех суток — тихий undercount, порог 80% молча не сработал бы.
+    # limit: 10000 — тот же порядок, что в цитируемом тут же туториале Cloudflare.
     try:
         data = cf_query(
             token,
             """query($accountTag: string, $start: string) {
                 viewer { accounts(filter: {accountTag: $accountTag}) {
-                    workersInvocationsAdaptive(limit: 1, filter: {datetime_geq: $start}) {
+                    workersInvocationsAdaptive(limit: 10000, filter: {datetime_geq: $start}) {
                         sum { requests }
                     }
                 } }
@@ -178,13 +183,19 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
     except (RuntimeError, KeyError, TypeError) as error:
         rows.append(no_data("Workers requests/сутки", source, LIMITS["cf_workers_requests_day"], "requests", str(error)))
 
-    # DO storage — поле storedBytes подтверждено доком дословно.
+    # DO storage — поле storedBytes подтверждено доком дословно. limit: 1
+    # (та же находка, что выше): storage-группы разбиты по namespaceId, на
+    # аккаунте их несколько (#322) — limit: 1 брал бы один произвольный
+    # namespace вместо аккаунта целиком. dimensions.date нужен, чтобы взять
+    # ПОСЛЕДНЮЮ дату и просуммировать storedBytes по всем namespace именно
+    # этой даты, а не смешать даты между собой.
     try:
         data = cf_query(
             token,
             """query($accountTag: string) {
                 viewer { accounts(filter: {accountTag: $accountTag}) {
-                    durableObjectsStorageGroups(limit: 1, orderBy: [date_DESC]) {
+                    durableObjectsStorageGroups(limit: 10000, orderBy: [date_DESC]) {
+                        dimensions { date }
                         max { storedBytes }
                     }
                 } }
@@ -192,8 +203,12 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             {"accountTag": account_id},
         )
         accounts = data["viewer"]["accounts"]
-        values = [item["max"]["storedBytes"] for acc in accounts for item in acc["durableObjectsStorageGroups"]]
-        current = max(values) if values else 0
+        items = [item for acc in accounts for item in acc["durableObjectsStorageGroups"]]
+        if items:
+            latest_date = items[0]["dimensions"]["date"]  # orderBy date_DESC — первые строки самые свежие
+            current = sum(item["max"]["storedBytes"] for item in items if item["dimensions"]["date"] == latest_date)
+        else:
+            current = 0
         rows.append(Row("DO storage/аккаунт", source, current, LIMITS["cf_do_storage_account_bytes"], "bytes", "-", "ok"))
     except (RuntimeError, KeyError, TypeError) as error:
         rows.append(no_data("DO storage/аккаунт", source, LIMITS["cf_do_storage_account_bytes"], "bytes", str(error)))
@@ -394,7 +409,14 @@ def main() -> int:
         text = "🚨 Квота харнеса перевалила за {}%:\n".format(THRESHOLD_PCT) + "\n".join(
             f"- {r.resource}: {r.current:,} / {r.limit:,} ({r.pct}%)".replace(",", " ") for r in breached
         )
-        print(f"::warning::{text}")
+        # ::warning:: — workflow-команда GitHub Actions, обрывается на первом
+        # переводе строки: многострочный text как аннотация показал бы только
+        # первую строку, остальные breached-ресурсы ушли бы в лог простым
+        # текстом (находка ревью PR #327). Полный список — обычным print,
+        # аннотация — однострочная сводка.
+        print(text)
+        print(f"::warning::квота харнеса перевалила за {THRESHOLD_PCT}%: "
+              + ", ".join(r.resource for r in breached))
         result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
         print(result)
     else:
