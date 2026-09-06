@@ -2131,16 +2131,19 @@ export class Harness extends DurableObject<Env> {
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
     if (existing) return { id: Number(existing.id), fresh: false };
-    const cursor = this.#sql.exec(
+    this.#sql.exec(
       `INSERT INTO messages (ts, source, source_msg_id, chat_id, sender_id, sender_name, text, kind, priority, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', 0, 'new')
        ON CONFLICT(source, source_msg_id) DO NOTHING`,
       Date.now(), f.source, f.sourceMsgId, f.chatId, f.senderId, f.senderName, f.text,
     );
     // Новая строка меняет msgCounts['new'] (#575, тот же принцип, что у
-    // #taskCountsCache при insert в tasks) — только на реальную вставку, не
-    // на гипотетический проигрыш гонки (её здесь нет, см. docstring выше).
-    if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
+    // #taskCountsCache при insert в tasks). Безусловно, НЕ по cursor.rowsWritten:
+    // докстринг выше уже объявляет этот сигнал ненадёжным в workerd после
+    // ON CONFLICT DO NOTHING, а пречтение (`existing` выше) уже гарантирует,
+    // что сюда доходит только настоящая новая строка — условие на негодном
+    // сигнале защищало бы случай, которого здесь нет.
+    this.#msgCountsCache = null;
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
