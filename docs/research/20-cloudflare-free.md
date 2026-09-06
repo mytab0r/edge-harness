@@ -12,6 +12,7 @@
 - **Исходящий WS-туннель к внешнему раннеру технически работает, но не гибернирует** и держит объект живым максимум 15 минут за соединение. Это и есть причина отказа от туннельной схемы: ~85 % дневного GB-s за один туннель.
 - **Изоляция чужого кода на Free невозможна.** Dynamic Workers (бывш. Worker Loaders) — open beta только для paid. Containers / Sandbox SDK — в таблице прайсинга Free = N/A. Минимальный вход $5/мес.
 - **Статика SPA (Workers Assets) бесплатна и безлимитна по запросам** на обоих планах.
+- **Worker не может `fetch()` другой Worker на `*.workers.dev`** — Cloudflare режет это антипетлевой защитой (error 1042), без домена не спасает даже флаг `global_fetch_strictly_public`. Обход бесплатный и штатный — [Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) (найдено живьём, #503).
 
 Проверено по докам 2026-08-28: лимиты Workers, лимиты и прайсинг DO, FAQ DO, лимиты D1, прайсинг R2, прайсинг Containers, биллинг Workers Assets. Расхождений с исходным исследованием не найдено; три уточнения помечены ниже словом «уточнение».
 
@@ -448,6 +449,58 @@ env через инсталл-цикл. Нюансы: значения коэр�
 Источник: developers.cloudflare.com/workers/runtime-apis/nodejs/process/.
 На живом деплое #95 подтверждается тем, что инструмент отвечает не
 «токена нет», а осмысленным ответом GitHub.
+
+### Worker → Worker на *.workers.dev: fetch() между воркерами одного аккаунта запрещён (error 1042, найдено #503)
+
+Живой инцидент: dsh-edge (`dsh-edge.mytab0r.workers.dev`) проксирует раздел
+«Интеграции» в edge-harness (`edge-harness.mytab0r.workers.dev`) обычным
+`fetch()` (патч `dsh-edge/patches/0005-harness-status-proxy.patch`). Оба
+воркера — на одном аккаунте Cloudflare, оба на поддоменах общего домена
+`workers.dev`. Прямой запрос к харнесу извне (GitHub Actions под Bearer
+HANDS_TOKEN) отвечал 200 с валидными данными; тот же самый запрос ИЗНУТРИ
+воркера dsh-edge отвечал **404** с телом `error code: 1042` (голый текст, не
+JSON журнала) — раздел «Интеграции» показывал «Journal unavailable: HTTP 404»
+под каждой строкой владельцу с валидной сессией.
+
+Причина — задокументированное ограничение платформы: **error 1042** =
+«Worker tried to fetch from another Worker on the same domain» — Cloudflare
+запрещает Worker'у делать публичный `fetch()` на хостнейм другого Worker'а на
+`*.workers.dev` (антипетлевая защита, не зависит от того, один аккаунт или
+разные). Важная деталь для диагностики: ограничение **не бросает исключение**
+— рантайм подставляет синтетический ответ (в нашем случае — статус 404 с
+текстовым телом) ДО того, как запрос вообще уходит в публичную сеть, поэтому
+код, который просто пересылает статус/тело ответа насквозь (как патч 0005),
+пересылает и это — неотличимо от настоящего 404 самого журнала для стороны,
+которая смотрит только на HTTP-код.
+
+Есть флаг совместимости `global_fetch_strictly_public`, но он не спасает
+именно этот случай: он разрешает Worker-to-Worker fetch ТОЛЬКО на публичные
+хостнеймы (кастомный домен зоны или `*.pages.dev`) — `*.workers.dev` остаётся
+«непубличным» и запрет действует независимо от флага, если у воркера нет
+подключённого кастомного домена.
+
+**Рабочий обход без домена и без денег — [Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/):**
+`env.<BINDING>.fetch(...)` вызывает целевой Worker напрямую, в процессе
+рантайма, вообще не выходя в публичную сеть — ограничение 1042 к нему не
+применяется, это ровно то, для чего Service bindings предназначены
+(«Facilitate Worker-to-Worker communication ... without going through a
+publicly-accessible URL»). Конфиг:
+```jsonc
+"services": [ { "binding": "HARNESS_SERVICE", "service": "edge-harness" } ]
+```
+— имя `service` — это `name` таргет-воркера в ЕГО wrangler-конфиге, воркер
+должен быть уже задеплоен. Использование: `env.HARNESS_SERVICE.fetch(url, init)`
+вместо глобального `fetch(url, init)`; сигнатура совместима. Фикс применён в
+патче 0005 (`dsh-edge/patches/0005-harness-status-proxy.patch`) и в
+`deploy-dsh-edge.yml` (конфиг воркера dsh-edge).
+
+Источники: developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/
+(текст цитаты выше); community.cloudflare.com, тред «Get error code 1042 when
+fetching within worker» (подтверждение поведения «без исключения, статус
+подставляется»); стороннее (не Cloudflare) описание флага
+`global_fetch_strictly_public` и его области действия — onescales.com,
+«How to Fix Cloudflare Workers Error 1042» (не первоисточник, но согласуется
+с официальной страницей флага, на которую сама статья ссылается).
 
 ---
 

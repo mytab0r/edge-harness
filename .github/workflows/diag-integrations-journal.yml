@@ -1,30 +1,22 @@
-# Временный диагностический workflow (issue #503): владелец видит в разделе
-# Settings → Integrations «Journal unavailable: HTTP 404» на каждой строке.
-# Предыдущий PR поправил только формулировку ошибки — не причину. Этот
-# workflow бьёт РЕАЛЬНЫЕ эндпоинты теми же запросами, что делает плагин
-# (plugins-src/integrations/src/body.js, JOURNAL_QUERY), под настоящими
-# секретами (HARNESS_URL/HANDS_TOKEN/DSH_EDGE_ACCESS_KEY — уже в GitHub
-# Actions secrets/vars), и печатает коды+тела ответов. Секреты в лог не
-# печатаются — только результаты HTTP-запросов.
+# Канарейка прокси статусов интеграций (issue #503) — ручной прогон под
+# РЕАЛЬНЫМИ секретами (HARNESS_URL/HANDS_TOKEN/DSH_EDGE_ACCESS_KEY), теми же
+# запросами, что делает плагин (plugins-src/integrations/src/body.js,
+# JOURNAL_QUERY). Причина держать именно этот workflow, а не полагаться
+# только на dsh-edge/proxy-integration/check.mjs: check.mjs гоняет патч 0005
+# против заглушки журнала на node:http — он доказывает контракт прокси
+# (валидация параметров, форма ответа), но НЕ доказывает, что путь до
+# настоящего воркера edge-harness вообще открыт с прода (issue #503,
+# найдено живьём: Cloudflare error 1042 — fetch() между двумя *.workers.dev
+# воркерами одного аккаунта запрещён антипетлевой защитой платформы, и
+# заглушка check.mjs это в принципе не воспроизводит, см.
+# docs/research/20-cloudflare-free.md, «Worker → Worker на *.workers.dev»).
+# Секреты в лог не печатаются — только коды ответов и тела (тела не содержат
+# значений секретов).
 #
-# Проверяет:
-#   1) GET {HARNESS_URL}/api/events?task_id=integration:telegram — журнал
-#      харнеса напрямую, с правильным Bearer HANDS_TOKEN;
-#   1b) тот же запрос с заведомо неверным Bearer — 401 (доказательство, что
-#      маршрут /api/events вообще существует в задеплоенном воркере харнеса:
-#      его отсутствие дало бы 404 уже на этом шаге, авторизация ни при чём);
-#   2) GET {DSH_EDGE_URL}/api/harness/events?task_id=integration:telegram —
-#      тот же запрос, что плагин, через прокси морды с сессионной кукой
-#      владельца (логин по DSH_EDGE_ACCESS_KEY);
-#   2b) тот же путь без куки — ожидание 401 (морда режет раньше прокси);
-#   3) полный дамп журнала харнеса без фильтра по task_id (limit=200) —
-#      ищем события kind=integration_status и по каждому id из
-#      dsh-edge/integrations.json смотрим, есть ли для него хоть одно
-#      событие. Пустой список для всех id — тогда деплой не пишет статусы
-#      вовсе (белое пятно в другом месте, не в проксировании).
-#
-# Снять после починки или оставить как канарейку — решается в PR по факту
-# найденной причины (design.md этого не требует держать вечно).
+# Шаг 2c — единственная проверка с фактическим fail loud: без неё workflow
+# был бы «тормозом без газа» — принтует коды, но зелёный статус ничего не
+# доказывает. Шаги 1/1b/2a/3/3b — диагностический контекст (коды ожидаемо
+# отличаются: 401 без сессии, 200 с ней), не самостоятельные гварды.
 name: diag-integrations-journal
 
 on:
@@ -58,7 +50,6 @@ jobs:
           echo "--- тело ---"
           cat /tmp/body1.json
           echo
-          echo "code=$code" >> "$GITHUB_OUTPUT" 2>/dev/null || true
 
       - name: 1b) Харнес — тот же путь с заведомо НЕВЕРНЫМ Bearer (маршрут существует ⇒ 401, не 404)
         env:
@@ -120,6 +111,21 @@ jobs:
           echo "--- тело ---"
           cat /tmp/body2b.json
           echo
+          echo "$code" > /tmp/body2b_code.txt
+
+      - name: 2c) Гвардия — прокси обязан отдать 200 и настоящий журнал (fail loud)
+        run: |
+          set -euo pipefail
+          code=$(cat /tmp/body2b_code.txt)
+          if [ "$code" != "200" ]; then
+            echo "::error::прокси /api/harness/events отдал $code вместо 200 — см. тело шага 2b"
+            exit 1
+          fi
+          if ! jq -e '.events | type == "array"' /tmp/body2b.json >/dev/null; then
+            echo "::error::ответ 200, но не форма журнала ({events:[...],has_more,next_after}) — см. тело шага 2b"
+            exit 1
+          fi
+          echo "OK: прокси отдал 200 и форму журнала (events: $(jq '.events | length' /tmp/body2b.json) шт.)"
 
       - name: 3) Харнес — полный дамп журнала (без фильтра task_id, limit=200), ищем integration_status
         env:

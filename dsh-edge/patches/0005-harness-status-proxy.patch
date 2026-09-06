@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
-index bf1b380..0939723 100644
+index bf1b380..2707729 100644
 --- a/apps/dsh-edge/src/index.ts
 +++ b/apps/dsh-edge/src/index.ts
 @@ -70,6 +70,23 @@ export default {
@@ -26,7 +26,7 @@ index bf1b380..0939723 100644
        const instanceStub = env.DSH_EDGE_INSTANCE.getByName(OWNER_INSTANCE)
        if (isInstanceApiPath(url.pathname)) {
          const response = await instanceStub.fetch(
-@@ -143,6 +160,67 @@ export default {
+@@ -143,6 +160,83 @@ export default {
    },
  } satisfies ExportedHandler<Env>
  
@@ -71,9 +71,25 @@ index bf1b380..0939723 100644
 +  journalUrl.searchParams.set('after', String(after))
 +  if (limitRaw !== null) journalUrl.searchParams.set('limit', limitRaw)
 +
++  // Cloudflare error 1042 (docs/research/20-cloudflare-free.md, «Worker → Worker
++  // на *.workers.dev»): fetch() с одного *.workers.dev воркера на другой
++  // *.workers.dev того же аккаунта запрещён антипетлевой защитой Cloudflare — и
++  // не бросает исключение, а возвращает синтетический ответ (в проде наблюдался
++  // как текст "error code: 1042" с кодом 404), который этот код раньше
++  // прозрачно пересылал владельцу как «журнал ответил 404» (issue #503: раздел
++  // «Интеграции» показывал Journal unavailable на каждой строке — HTTP 404
++  // выглядел «журнала нет», а не «сеть между воркерами запрещена платформой»).
++  // Service binding (env.HARNESS_SERVICE, деплойный wrangler.jsonc) вызывает
++  // edge-harness напрямую, минуя публичную сеть и этот запрет вовсе. Фолбэк на
++  // глобальный fetch — для check.mjs (заглушка журнала — node:http, не воркер,
++  // забиндить нельзя) и локальной разработки без второго воркера.
++  const journalFetch: typeof fetch = env.HARNESS_SERVICE !== undefined
++    ? (env.HARNESS_SERVICE.fetch.bind(env.HARNESS_SERVICE) as unknown as typeof fetch)
++    : fetch
++
 +  let journalResponse: Response
 +  try {
-+    journalResponse = await fetch(journalUrl, {
++    journalResponse = await journalFetch(journalUrl, {
 +      method: 'GET',
 +      headers: { accept: 'application/json', authorization: `Bearer ${handsToken}` },
 +      signal: AbortSignal.timeout(10_000),
@@ -95,10 +111,10 @@ index bf1b380..0939723 100644
    if (request.headers.has('x-dsh-edge-instance') || url.searchParams.has('instance')) {
      throw new EdgeHttpError(400, 'This deployment has one owner workspace; instance selectors are not supported.')
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index 43f172f..576b164 100644
+index 43f172f..8166572 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
-@@ -156,6 +156,10 @@ export interface EdgeEnv {
+@@ -156,6 +156,16 @@ export interface EdgeEnv {
    DEEPSEEK_STREAM_IDLE_TIMEOUT_MS?: string
    DSH_EDGE_DEFAULT_COMMAND_TIMEOUT_MS?: string
    DSH_EDGE_MAX_COMMAND_TIMEOUT_MS?: string
@@ -106,6 +122,12 @@ index 43f172f..576b164 100644
 +  // where the journal lives and the token it accepts from hands (Bearer).
 +  HARNESS_URL?: string
 +  HANDS_TOKEN?: string
++  // Service binding to the edge-harness Worker (issue #503): a public fetch()
++  // between two *.workers.dev Workers on the same account is blocked by
++  // Cloudflare's loop protection (error 1042) — this binding calls it
++  // in-process instead. Optional: unset in local dev / check.mjs, where the
++  // proxy falls back to a plain fetch() against HARNESS_URL.
++  HARNESS_SERVICE?: Fetcher
  }
  
  class DshEdgeObjectBase extends DurableObject<EdgeEnv> {
