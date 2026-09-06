@@ -364,6 +364,62 @@ def test_error_reason_transport_failure_wins_over_line_check():
     assert "ошибка провайдера" in reason
 
 
+# ── RATE_LIMIT: «лимита нет вовсе» vs «лимит есть, но что-то ещё сломано»
+# (#419, живой факт: worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate
+# limit reached for requests» — квоту съело параллельное ai-review). Разные
+# failure_reason из ai_dsh.sh обязаны звучать по-разному в тексте вердикта —
+# правило AGENTS.md: «возможности нет» и «возможность есть, но сломана» не
+# смешиваются в одно сообщение.
+
+def test_error_reason_quota_exhausted_distinct_from_generic_transport():
+    reason = ai.error_reason("", "1", "quota_exhausted")
+    assert "исчерпана надолго" in reason
+    assert "Weekly/Monthly" in reason
+    # не должно читаться как generic-транспорт (иначе владелец не поймёт,
+    # что повторять внутри прогона бессмысленно, а не «просто не повезло»)
+    assert "ошибка провайдера/транспорта DSH" not in reason
+
+
+def test_error_reason_rate_limit_retry_budget_exceeded_distinct():
+    reason = ai.error_reason("", "1", "rate_limit_retry_budget_exceeded")
+    assert "RATE_LIMIT" in reason
+    assert "бюджет ожидания" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+    # и не должно путаться с quota_exhausted — разный класс, разный текст
+    assert "исчерпана надолго" not in reason
+
+
+@pytest.mark.parametrize("failure_reason", ["quota_exhausted", "rate_limit_retry_budget_exceeded"])
+def test_error_reason_rate_limit_variants_differ_from_each_other(failure_reason):
+    # Мутация-гвардия: если бы обе ветки схлопнулись в одну (например забыли
+    # elif и обе попадали в один return), эти два текста стали бы идентичны —
+    # тест на нашёл бы разницу; сравнение явное, чтобы разница была видна.
+    quota = ai.error_reason("", "1", "quota_exhausted")
+    budget = ai.error_reason("", "1", "rate_limit_retry_budget_exceeded")
+    assert quota != budget
+
+
+def test_error_reason_empty_failure_reason_keeps_old_behavior():
+    # Обратная совместимость: вызов без failure_reason (как раньше, включая
+    # ручной запуск verdict без --failure-reason) не должен внезапно решить,
+    # что это лимит — старое поведение (generic-транспорт) остаётся.
+    reason = ai.error_reason("", "1")
+    assert "ошибка провайдера/транспорта DSH" in reason
+    assert "quota_exhausted" not in reason
+    assert "RATE_LIMIT" not in reason
+
+
+def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
+    # cmd_verdict считает reason только когда verdict == "error" (см. cmd_verdict) —
+    # здесь фиксируем контракт самой функции error_reason: она не смотрит на
+    # verdict вообще, решение «звать ли её» — вызывающего (cmd_verdict).
+    # Гвардия от регресса: failure_reason не должен давать любой другой текст,
+    # когда явно не распознан (опечатка в теге) — тогда падаем на generic-путь,
+    # а не молчим.
+    reason = ai.error_reason("", "1", "какой-то незнакомый тег")
+    assert "ошибка провайдера/транспорта DSH" in reason
+
+
 # ── Идемпотентность file_tasks: маркер filed: в ПОСЛЕДНЕЙ строке ───────────────
 
 FT = importlib.util.spec_from_file_location(
@@ -629,7 +685,8 @@ def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: lis
 def _verdict_args(tmp_path, body: str) -> argparse.Namespace:
     answer = tmp_path / "answer.txt"
     answer.write_text(body, encoding="utf-8")
-    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="")
+    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="",
+                               failure_reason="")
 
 
 def test_cmd_verdict_order_head_then_files_then_head_again(monkeypatch, tmp_path, capsys):
