@@ -2335,6 +2335,10 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], [], False))
+    # Не предмет этого теста (#427) — issue(89) без исполнителя и старым
+    # дефолтным created_at реально старее STALE_HOURS к моменту прогона:
+    # непатченный mark_stale_unclaimed бил бы по настоящему gh (нашла CI, не я).
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
