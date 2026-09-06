@@ -134,7 +134,16 @@ async function main() {
     const labels = await page.evaluate(() => Array.from(document.querySelectorAll('button'))
       .map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim())
       .filter((text) => text.length > 0 && text.length <= 60))
-    console.error(`::error::кнопка «Settings» не найдена; видимые кнопки шелла: ${JSON.stringify(labels)}`)
+    // Пусто и здесь: шелл мог вообще не смонтироваться (JS-ошибка бута) —
+    // title/readyState/длина body отличают пустой шелл от иной разметки кнопок.
+    const boot = await page.evaluate(() => ({
+      title: document.title,
+      readyState: document.readyState,
+      bodyLength: document.body?.innerHTML?.length ?? 0,
+      rootChildren: document.getElementById('root')?.children.length
+        ?? document.body?.children.length ?? 0,
+    }))
+    console.error(`::error::кнопка «Settings» не найдена; видимые кнопки шелла: ${JSON.stringify(labels)}; boot: ${JSON.stringify(boot)}`)
     throw error
   }
   const dialog = page.locator('[role="dialog"]')
@@ -210,6 +219,19 @@ main()
     console.log(`✅ e2e-смоук: интерфейс чист (консоль/нетворк без ошибок) за ${elapsedMs} мс`)
   })
   .catch((error) => {
+    // Диагностика (#518): падение ДО конца main() обходит печать findings в
+    // .then() выше — консольные/сетевые находки, собранные до отказа
+    // (например, JS-ошибка бута шелла до самого клика), иначе теряются молча.
+    if (findings.length > 0) {
+      console.error(`::error::находки (консоль/нетворк) до отказа (${findings.length}):`)
+      for (const f of findings) {
+        if (f.kind === 'network') {
+          console.error(`  [${f.section}] network ${f.method} ${f.status} ${f.url}`)
+        } else {
+          console.error(`  [${f.section}] ${f.kind}: ${f.text}`)
+        }
+      }
+    }
     console.error(`::error::e2e-смоук упал: ${error?.stack ?? error}`)
     process.exit(1)
   })
