@@ -20,10 +20,11 @@
 3. Гвардия непрочитанных провалов (#477): владелец — «кто-то мониторит
    ошибки?» — красный прогон worker.yml/hands.yml/orchestra.yml/deploy-*.yml
    был строкой в Actions без разбора. failure_watch дешёвым запросом
-   (`status=failure`, малый per_page) находит свежий провал каждого из
-   WATCHED_WORKFLOWS, достаёт последнюю содержательную строку `##[error]`
-   из лога упавшего job'а (факт, не гипотеза — правило AGENTS.md) и
-   классифицирует причину: 'infra' (известная сигнатура лимита/сети — лечится
+   (`status=completed` + клиентский фильтр вывода FAILURE_WATCH_RUN_CONCLUSIONS,
+   малый per_page) находит свежий провал (окно — от updated_at, момента
+   провала) каждого из WATCHED_WORKFLOWS, достаёт последнюю содержательную
+   строку `##[error]` из лога упавшего job'а (факт, не гипотеза — правило
+   AGENTS.md) и классифицирует причину: 'infra' (известная сигнатура лимита/сети — лечится
    ожиданием, один тихий след в #120 на класс) или 'defect' (наш дефект —
    заводит задачу в пул, тоже одну на класс). Дедуп — по отпечатку КЛАССА
    причины (workflow + job + нормализованная строка ошибки), не по run id:
@@ -231,7 +232,29 @@ FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 # Без него `runs[0]` навсегда остаётся тем же старым красным прогоном после
 # закрытия задачи (отпечаток исчезает из открытых → следующий пульс заводит
 # задачу заново на уже почившую причину, бесконечный цикл).
+#
+# Якорь окна — `updated_at` прогона, НЕ `created_at` (находка ревью PR #488,
+# раунд 3): created_at у GitHub — момент ПОСТАНОВКИ В ОЧЕРЕДЬ, не провала.
+# Отслеживаемые workflows живут дольше окна по замыслу (worker.yml —
+# timeout-minutes: 280, hands.yml — 70, ожидание свободного раннера не
+# ограничено вовсе), поэтому типичный провал долгого воркера по created_at
+# лежит вне окна на КАЖДОМ пульсе — ни задачи, ни наблюдения, навсегда:
+# молчаливая потеря ровно тех провалов, ради которых #477. У ЗАВЕРШЁННОГО
+# прогона updated_at — момент завершения, то есть для красного прогона —
+# момент провала; «30 минут после провала» — ровно заявленная семантика.
 FAILURE_WATCH_WINDOW_MINUTES = 30
+
+# Выводы ЗАВЕРШЁННЫХ прогонов, которые failure_watch разбирает как провал.
+# Отдельный именованный набор, не общий FAILURE_CONCLUSIONS — судьба крайних
+# случаев решена здесь явно (находка ревью PR #488, раунд 3; серверный фильтр
+# `status=failure` не отдаёт `timed_out` вовсе):
+# `timed_out` — ВКЛЮЧЁН: прогон, убитый собственным капом (timeout-minutes:
+# worker.yml = 280 существует именно потому, что прогоны до него добираются),
+# — провал в смысле #477, его причина требует разбора как у всякого другого;
+# `cancelled` здесь НЕТ (в FAILURE_CONCLUSIONS есть): отмена — осознанное
+# действие человека или автоматики, а не сигнал о дефекте/инфраструктуре,
+# разбор отменённого прогона заводил бы задачи на нормальную работу конвейера.
+FAILURE_WATCH_RUN_CONCLUSIONS = ("failure", "timed_out")
 
 # Потолок разобранных упавших job'ов на один красный прогон (находка ревью PR
 # #488, чеклист: раньше разбирался только bad_jobs[0], хвост прятался молча).
@@ -631,16 +654,22 @@ def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None 
     return payload.get("workflow_runs", [])
 
 
-def failing_jobs(repo: str, run: dict) -> list[dict]:
-    """Job'ы прогона с неуспешным conclusion — общий источник для
-    last_failure_error и failure_watch (одна выборка, не вторая копия
-    запроса). Пустой список и при отсутствии упавших job'ов, и при сбое
-    самого запроса (best-effort, вызывающий решает, что это значит)."""
-    try:
-        payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
-    except RuntimeError:
-        return []
-    return [job for job in payload.get("jobs", []) if job.get("conclusion") in FAILURE_CONCLUSIONS]
+def failing_jobs(repo: str, run: dict, conclusions: tuple = FAILURE_CONCLUSIONS) -> list[dict]:
+    """Job'ы прогона с неуспешным conclusion — ЕДИНЫЙ источник для
+    last_failure_error и failure_watch: один запрос на прогон, не две копии
+    (чеклист ревью PR #488). Сбой запроса — RuntimeError наверх (fail loud:
+    «сбой» и «пусто» различают вызывающие, у них для этого разные тексты);
+    пустой список — честное «нет job'ов с таким выводом».
+
+    conclusions — какой набор выводов считать «упавшим». Дефолт — общий
+    FAILURE_CONCLUSIONS (предохранитель диспатча). failure_watch передаёт
+    СВОЙ FAILURE_WATCH_RUN_CONCLUSIONS: job, убитый капом (conclusion
+    timed_out), обязан разбираться иначе его причина не попадёт ни в задачу,
+    ни в наблюдение (находка ревью PR #488, раунд 3), — набор переопределяется
+    вызывающим, потому что «красный» для паузы диспатча и «разбираемый» для
+    задачи — разные вопросы над одним списком job'ов."""
+    payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+    return [job for job in payload.get("jobs", []) if job.get("conclusion") in conclusions]
 
 
 def last_failure_error(repo: str, run: dict) -> str:
@@ -648,13 +677,11 @@ def last_failure_error(repo: str, run: dict) -> str:
     Best-effort: недоступность деталей не мешает факту паузы, но и не теряется —
     уходит в текст сигнала."""
     try:
-        payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+        bad_jobs = failing_jobs(repo, run)
     except RuntimeError as error:
         return f"детали недоступны: {error}"
     bad = []
-    for job in payload.get("jobs", []):
-        if job.get("conclusion") not in FAILURE_CONCLUSIONS:
-            continue
+    for job in bad_jobs:
         steps = ", ".join(
             step["name"] for step in job.get("steps", [])
             if step.get("conclusion") in FAILURE_CONCLUSIONS
@@ -1128,10 +1155,13 @@ def open_ci_failure_fingerprints(repo: str) -> set[str]:
     return found
 
 
-def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str) -> str:
+def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str, steps: str) -> str:
     """Тело авто-заведённой задачи — тот же формат, что шаблон «📋 Задача в
     пул» (Цель/Критерий/Площадь), плюс отпечаток класса HTML-комментарием:
-    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу."""
+    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
+    Упавшие шаги — рядом с фактом (критерий #477 называет «шаг + последняя
+    ##[error]-строка»): их имена уже прочитаны из job'а, второй запрос не
+    нужен (чеклист ревью PR #488)."""
     return (
         f"## Цель\n"
         f"`{workflow}` (job «{job_name}») перестаёт падать этой причиной.\n\n"
@@ -1142,13 +1172,16 @@ def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: st
         "area:orchestra\n\n"
         f"## Контекст и ссылки\n"
         f"Живой прогон: {run_url}\n"
+        f"Упавшие шаги job'а «{job_name}»: {steps}\n"
         f"Факт: {fact}\n\n"
         f"<!-- failure-fingerprint: {fingerprint} -->\n"
     )
 
 
 def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
-    """Провалы ключевых workflow (#477): дешёвый опрос `status=failure` (одна
+    """Провалы ключевых workflow (#477): дешёвый опрос `status=completed`
+    с клиентским фильтром по выводу (FAILURE_WATCH_RUN_CONCLUSIONS:
+    failure + timed_out, без cancelled — см. комментарий у константы; одна
     страница малого `per_page` на workflow, без выгрузки логов всех прогонов
     подряд — квота API дорога, см. rate_guard.py) по каждому
     WATCHED_WORKFLOWS. Для самого свежего провала — по каждому упавшему job'у
@@ -1182,15 +1215,26 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
     задача по нему мигает во вторую, когда лог на следующем пульсе
     прочитается. Критерий #477 требует точную причину — остаётся громкое
     наблюдение (⚠️); устойчивый случай подберёт автодетектор #201 (класс
-    warn:), факт не теряется — ссылка на прогон в строке наблюдения."""
+    warn:), факт не теряется — ссылка на прогон в строке наблюдения.
+
+    Окно свежести измеряется от updated_at (момент провала), не от created_at
+    (момент постановки в очередь) — иначе провалы долгих прогонов (worker.yml
+    пашет десятки минут по замыслу) лежат вне окна на каждом пульсе. Реран
+    старого прогона обновляет updated_at — прогон снова «свежий»; повторного
+    сигнала/задачи это не даёт: дедуп по отпечатку класса смотрит на открытую
+    задачу (defect) или маркер в #120 (infra), не на свежесть."""
     observations: list[str] = []
     actions: list[str] = []
     ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
 
     for workflow in WATCHED_WORKFLOWS:
         try:
+            # status=completed (не status=failure): серверный фильтр failure
+            # не возвращает timed_out — провал по собственному капу остался бы
+            # неразобранным (находка ревью PR #488, раунд 3); вывод
+            # фильтруется клиентским списком FAILURE_WATCH_RUN_CONCLUSIONS.
             payload = gh(
-                f"repos/{repo}/actions/workflows/{workflow}/runs?status=failure&per_page=20"
+                f"repos/{repo}/actions/workflows/{workflow}/runs?status=completed&per_page=20"
             ) or {}
         except RuntimeError as error:
             observations.append(f"⚠️ failure-watch {workflow}: список провалов не прочитан ({error})")
@@ -1200,27 +1244,39 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         # докстринг) — вычитается ДО окна свежести. Фильтр клиентский, не
         # серверный `event=`: у API нет «не равно», а перебор легитимных
         # событий — по запросу на каждое событие каждого workflow против одной
-        # страницы здесь. per_page=20 — запас, чтобы PR-прогоны не вытеснили
-        # свежий провал основного события за страницу: PR-триггер среди
-        # отслеживаемых есть только у orchestra.yml (job contract), двадцати
-        # красных contract-прогонов за окно свежести не бывает; потеря хвоста
-        # за страницей стоит не дороже окна ниже — вне окна разбор и так
-        # не идёт.
+        # страницы здесь. per_page=20 — запас, чтобы клиентские фильтры
+        # (PR-прогоны, отменённые) не вытеснили свежий провал основного
+        # события за страницу: PR-триггер среди отслеживаемых есть только у
+        # orchestra.yml (job contract), двадцати завершённых прогонов за окно
+        # свежести не бывает; потеря хвоста за страницей стоит не дороже окна
+        # ниже — вне окна разбор и так не идёт.
         runs = [r for r in runs if r.get("event") != "pull_request"]
+        runs = [r for r in runs if r.get("conclusion") in FAILURE_WATCH_RUN_CONCLUSIONS]
         # Окно свежести (находка ревью PR #488): провал старше окна уже не
         # актуален — задачу на него заводить поздно и незачем, `now` не
         # декорация. Без фильтра `runs[0]` навсегда остаётся тем же старым
-        # красным прогоном после закрытия задачи по нему.
+        # красным прогоном после закрытия задачи по нему. Якорь — updated_at
+        # (момент провала), не created_at (момент постановки в очередь):
+        # см. комментарий у FAILURE_WATCH_WINDOW_MINUTES.
         fresh_cutoff = now - timedelta(minutes=FAILURE_WATCH_WINDOW_MINUTES)
-        runs = [r for r in runs if parse_time(r["created_at"]) >= fresh_cutoff]
+        runs = [r for r in runs if parse_time(r["updated_at"]) >= fresh_cutoff]
         if not runs:
             continue
         run_item = runs[0]  # самый свежий провал этого workflow в пределах окна
-        bad_jobs = failing_jobs(repo, run_item)
+        # Сбой запроса job'ов — отдельное наблюдение с причиной, не склейка с
+        # «упавший job не найден»: свод источников (failing_jobs) отдаёт
+        # RuntimeError, «сбой» и «пусто» — разные факты (чеклист ревью PR #488).
+        try:
+            bad_jobs = failing_jobs(repo, run_item, FAILURE_WATCH_RUN_CONCLUSIONS)
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ failure-watch {workflow}: job'ы прогона "
+                f"{run_item.get('html_url')} не прочитаны ({error})")
+            continue
         if not bad_jobs:
             observations.append(
                 f"⚠️ failure-watch {workflow}: прогон {run_item.get('html_url')} красный, "
-                "упавший job не найден (детали недоступны)")
+                f"упавших job'ов с выводом {('+'.join(FAILURE_WATCH_RUN_CONCLUSIONS))} не найдено")
             continue
         run_url = run_item.get("html_url", "")
         # Каждый упавший job — отдельный кандидат класса: разные job'ы одного
@@ -1302,7 +1358,8 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                     f"{fingerprint} уже в пуле — не дублируем")
                 continue
             title = f"CI: {workflow} падает — {job_name}"
-            body = failure_watch_task_body(workflow, job_name, fact, run_url, fingerprint)
+            body = failure_watch_task_body(
+                workflow, job_name, fact, run_url, fingerprint, step_names)
             try:
                 # Заведение issue пула — только через pool_issue.create_pool_issue
                 # (одно место правды #526: labels без `task` — RuntimeError ДО
@@ -1318,7 +1375,7 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             ci_fingerprints.add(fingerprint)
             actions.append(
                 f"🛠️ failure-watch {workflow}: заведена задача по дефекту "
-                f"(job «{job_name}», класс {fingerprint}) — {fact}")
+                f"(job «{job_name}», шаги: {step_names}, класс {fingerprint}) — {fact}")
         hidden = bad_jobs[FAILURE_WATCH_MAX_JOBS_PER_RUN:]
         if hidden:
             observations.append(
