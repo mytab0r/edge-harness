@@ -807,8 +807,12 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     # оставить висеть.
     task_refs = sorted(set(task_ref.extract_task_refs(pull.get("body") or "")))
     task_numbers: list[int] = []
-    # Заголовок первой подтверждённой задачи (#170) — для Telegram «слито в main»;
-    # один PR = одно сообщение, даже если в теле несколько задач.
+    # Номер и заголовок первой ОБЪЯВЛЕННОЙ задачи (#404, ревью PR #402) — для
+    # Telegram «слито в main»; один PR = одно сообщение, даже если в теле
+    # несколько задач. Захват — ТОЛЬКО на ветке declares_task ниже: утверждение
+    # «этот PR выполнил задачу N» — узкая семантика (#259), упоминание в прозе
+    # (тем более более старой открытой задачи, которая перебивает сортировкой)
+    # не делает задачу выполненной этим PR.
     first_task: tuple[int, str] | None = None
     for task_number in task_refs:
         # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
@@ -824,8 +828,6 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             if "task" not in {label["name"] for label in issue["labels"]}:
                 continue
             task_numbers.append(int(task_number))
-            if first_task is None:
-                first_task = (int(task_number), issue.get("title") or "")
             # Приёмка (accept_merged_tasks) видит только ДЕКЛАРИРУЮЩИЕ рефы
             # (task_ref.declares_task, первая строка тела PR) — merged_pr_map
             # строится из declared_tasks, не из extract_task_refs. Обещание
@@ -835,6 +837,12 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             # «PR не появился» — ровно тот класс неверных причин, что этот
             # PR чинит для объявленных задач (находка AI-ревью PR #253).
             if task_ref.declares_task(pull.get("body") or "", int(task_number)):
+                if first_task is None:
+                    # Захват здесь, на ветке declares_task (#404): «выполнена»
+                    # вправе звучать только о задаче, которую PR объявил —
+                    # приёмка (#227) закрывает именно такие, и в чате не
+                    # появится «#N выполнена» о задаче из чужого упоминания.
+                    first_task = (int(task_number), issue.get("title") or "")
                 reminder = (
                     f"🔁 PR #{number} слит в main. Мерж — ещё не готовность: если критерий "
                     "требует реального пост-мерж прогона (канарейка/E2E), проведи его и "
@@ -861,7 +869,9 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     # Telegram «задача выполнена — слито в main» (#170): мерж — единственный факт,
     # на котором звучит «выполнена»; раньше об этом канале молчал вовсе, и владелец
     # узнавал о готовности только руками. Один PR = одно сообщение (по первой
-    # задаче), даже если тело упоминает несколько. Best-effort, как весь канал
+    # ОБЪЯВЛЕННОЙ задаче, #404 — упоминания в прозе каналу не доверяются),
+    # даже если тело упоминает несколько. Объявленных задач нет (dependabot,
+    # orchestra:skip) — сообщений нет вовсе. Best-effort, как весь канал
     # (#120): место правды — комментарий в задаче выше, недоставленный Telegram
     # мерж не откатывает и прогон не красит, но и не молчит — ⚠️ в отчёте.
     if first_task is not None:

@@ -1567,6 +1567,81 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     assert any("Telegram" in line and "доставлено" in line for line in lines)
 
 
+def test_after_merge_announces_only_declared_task_not_prose_mentions(monkeypatch):
+    """#404 (ревью PR #402): «выполнена» вправе звучать только о задаче, которую
+    PR ОБЪЯВИЛ первой строкой тела. Упомянутая в прозе более старая открытая
+    задача (#78 идёт раньше #79 в сортировке упоминаний) не перебивает
+    объявленную: канал не говорит «#78 выполнена» про задачу, которую этот PR
+    не делал и которую приёмка (#227) не закроет. Мутация: вернуть захват
+    first_task до проверки declares_task — тест краснеет."""
+    body = "#79\n\nОсновная реализация. Заодно поправил соседний баг из #78."
+    merged = pull(163, pr_body=body)
+    sent = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/163/files?per_page=100&page=1",
+                      "repos/o/r/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/78":
+            return {**issue(78, assignees=("mytab0r",), title="Старая задача из прозы"),
+                    "state": "open"}
+        if joined == "repos/o/r/issues/79":
+            return {**issue(79, assignees=("mytab0r",), title="Настоящая задача"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(
+        sch, "send_telegram",
+        lambda text, as_html=False: sent.append((text, as_html)) or True)
+
+    sch.after_merge("o/r", merged, [])
+
+    assert len(sent) == 1
+    text = sent[0][0]
+    assert '<a href="https://github.com/o/r/issues/79">#79</a>' in text
+    assert "Настоящая задача" in text
+    assert "#78" not in text and "Старая задача из прозы" not in text
+
+
+def test_after_merge_without_declared_task_sends_nothing(monkeypatch):
+    """#404: PR без декларации (задача упомянута только в прозе) не порождает
+    «задача #N выполнена» вовсе — нечего announcing, приёмка такую задачу всё
+    равно не закроет."""
+    body = "Попутно задел соседний баг из #78."
+    merged = pull(163, pr_body=body)
+    sent = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/163/files?per_page=100&page=1",
+                      "repos/o/r/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/78":
+            return {**issue(78, assignees=("mytab0r",), title="Старая задача из прозы"),
+                    "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(
+        sch, "send_telegram",
+        lambda text, as_html=False: sent.append(text) or True)
+
+    lines, hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert sent == [], "нет объявленной задачи — нет и «выполнена» в канале"
+    assert hard_failure is False
+    assert not any("Telegram" in line and "доставлено" in line for line in lines)
+
+
 def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
     """#170: недоставленный Telegram не откатывает мерж и не роняет after_merge —
     место правды (комментарий в задаче выше) уже оставлен; но и не молчит: ⚠️ в отчёте."""
