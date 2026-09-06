@@ -12,7 +12,7 @@ OpenAI-compatible эндпоинт.
 
 Второй провайдер **в самой морде** (для чата, не для раннеров) добавляется без
 передеплоя через штатный Settings → Models — кнопки ожили после плагина
-`provider-registry` (#114, [research/11](../research/11-dsh-edge.md)), см.
+`provider-registry` (#378, [research/11](../research/11-dsh-edge.md)), см.
 [README плагина](../../plugins-src/provider-registry/README.md). Смешивать эти
 два механизма не нужно: раннеры продолжают читать `DEEPSEEK_*` из деплоя, морда —
 из своего реестра.

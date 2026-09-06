@@ -665,14 +665,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node dsh-edge/check-upstream-namespace-collision.mjs
 
-      # Реестр провайдеров морды (#114): плагин инсталлируется в настоящий
+      # Реестр провайдеров морды (#378): плагин инсталлируется в настоящий
       # cordis с LlmRuntime + SettingsProvider (фикстура — tarball'ы
       # @deepseek-ai с пином целостности): namespace, directory, добавление,
       # рестарт DO, негатив при записи, MISSING_CREDENTIAL без сети.
       - name: Юнит-тесты плагина provider-registry
         run: node --test plugins-src/provider-registry/test/registry.test.mjs
 
-      # Гвардия литерала llm-pi-ai (#114) доказана мутацией: зелёная на живом
+      # Гвардия литерала llm-pi-ai (#378) доказана мутацией: зелёная на живом
       # литерале, красная с ожидаемым сообщением на переименованном (это и
       # есть симуляция апстримного релиза, убившего кнопку создания).
       - name: Мутационный тест гвардии литерала namespace

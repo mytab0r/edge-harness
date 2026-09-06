@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Гвардия завязки реестра провайдеров на приватный литерал апстрима (#114,
+ * Гвардия завязки реестра провайдеров на приватный литерал апстрима (#378,
  * change dsh-edge-provider-registry, design «Цена решения»): кнопка
  * «Add custom provider» штатного Settings → Models пишет settings.mutate
  * в namespace, чьё имя ЗАШИТО в клиентском бандле литералом NS$1 = "llm-pi-ai"

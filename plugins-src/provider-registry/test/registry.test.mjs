@@ -1,4 +1,4 @@
-// Юнит-проверки провайдер-реестра морды (#114). Фикстура — настоящие пакеты
+// Юнит-проверки провайдер-реестра морды (#378). Фикстура — настоящие пакеты
 // @deepseek-ai (tarball'ы с пином целостности, тот же supply-chain паттерн,
 // что у streamer.test.mjs): plugin инсталлируется в настоящий cordis Context
 // с настоящими LlmRuntime + SettingsProvider, не пересказ API.
@@ -168,7 +168,7 @@ describe('provider-registry: добавление провайдера (как C
   it('произвольный маршрут появляется в directory с declared (строка и Remove живы)', async () => {
     const ctx = await mountMordre();
     await ctx.settings.mutate('llm-pi-ai', [
-      { op: 'set', path: ['providers', 'my-gateway'], value: { api: 'openai-completions', baseURL: 'https://gw.example/v1', models: [{ id: 'm1' }] } },
+      { op: 'set', path: ['providers', 'my-gateway'], value: { apiKeyEnv: 'MY_GATEWAY_API_KEY', api: 'openai-completions', baseURL: 'https://gw.example/v1', models: [{ id: 'm1' }] } },
     ], undefined);
     const entry = ctx.llm.listConfigurableProviders().find((e) => e.provider === 'my-gateway');
     assert.ok(entry !== undefined, 'настроенного маршрута нет в directory — UI не покажет строку и Remove');
@@ -241,10 +241,17 @@ describe('provider-registry: негатив — мусор не проходит
     assert.ok(!activeRoutes(ctx).includes('no-url'));
   });
 
+  it('профиль без apiKeyEnv отказан (находка ревью #453 — сервер не выводит имя ref сам)', async () => {
+    const ctx = await rejected('no-key', { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] });
+    // Маршрут не зарегистрирован: без apiKeyEnv отказ записи, не тихая
+    // регистрация с угаданным именем ref'а.
+    assert.ok(!activeRoutes(ctx).includes('no-key'));
+  });
+
   it('правка настроенного маршрута доходит до запроса без перерегистрации', async () => {
     const ctx = await mountMordre();
     await ctx.settings.mutate('llm-pi-ai', [
-      { op: 'set', path: ['providers', 'zhipu'], value: { displayName: 'Z.ai (GLM)', api: 'openai-completions', baseURL: 'https://old.example/v1', models: [{ id: 'glm-4.6' }] } },
+      { op: 'set', path: ['providers', 'zhipu'], value: { displayName: 'Z.ai (GLM)', apiKeyEnv: 'ZHIPU_API_KEY', api: 'openai-completions', baseURL: 'https://old.example/v1', models: [{ id: 'glm-4.6' }] } },
     ], undefined);
     assert.deepEqual((await ctx.llm.listModels('zhipu')).map((m) => m.id), ['glm-4.6']);
     // Владелец правит каталог маршрута (та же карточка, тот же route-id):
@@ -283,8 +290,11 @@ describe('provider-registry: негатив — мусор не проходит
 
   it('ход без ключа падает громко MISSING_CREDENTIAL, не молча (сеть не вызывается)', async () => {
     const ctx = await mountMordre();
+    // apiKeyEnv указан (обязателен, находка ревью #453 — сервер больше не
+    // выводит имя ref'а сам), но ни credentials-сервиса, ни env-переменной
+    // с таким именем нет: ref не резолвится, ход обязан упасть громко.
     await ctx.settings.mutate('llm-pi-ai', [
-      { op: 'set', path: ['providers', 'keyless'], value: { api: 'openai-completions', baseURL: 'https://keyless.example/v1', models: [{ id: 'm1' }] } },
+      { op: 'set', path: ['providers', 'keyless'], value: { apiKeyEnv: 'KEYLESS_API_KEY', api: 'openai-completions', baseURL: 'https://keyless.example/v1', models: [{ id: 'm1' }] } },
     ], undefined);
     assert.ok(activeRoutes(ctx).includes('keyless'));
     // Ход к маршруту без ключа: терминальный error-чunk с кодом и именем

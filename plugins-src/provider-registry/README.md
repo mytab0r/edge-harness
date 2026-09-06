@@ -1,4 +1,4 @@
-# provider-registry — реестр LLM-провайдеров морды (#114)
+# provider-registry — реестр LLM-провайдеров морды (#378)
 
 Серверный DSH-плагин по образцу [runner-bridge](../runner-bridge/): делает
 работающими кнопки добавления провайдера в штатном **Settings → Models**

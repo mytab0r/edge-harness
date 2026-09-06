@@ -1,5 +1,5 @@
 /**
- * provider-registry: серверный плагин реестра LLM-провайдеров морды (#114,
+ * provider-registry: серверный плагин реестра LLM-провайдеров морды (#378,
  * change openspec/changes/dsh-edge-provider-registry).
  *
  * Занимает settings-namespace `llm-pi-ai` своей реализацией (без пакета
@@ -55,11 +55,6 @@ const PROTOCOLS = ['openai-completions']
 /** Маршрут, пригодный и ключом настроек, и основой имени креда (клиентский ROUTE_PATTERN). */
 const ROUTE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
 
-/** Тот же вывод имени креда, что у клиента (deriveKeyRef): <ROUTE>_API_KEY. */
-function deriveKeyRef(route) {
-  return credentialRef(`${route.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`)
-}
-
 const modelProfile = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -100,6 +95,18 @@ function assertServiceable(config) {
     if (source.baseURL === undefined || !/^https?:\/\/\S+/.test(source.baseURL)) {
       throw new Error(`provider-registry: у провайдера "${route}" должен быть baseURL — http(s)-адрес эндпоинта`)
     }
+    // apiKeyEnv обязателен, вывод из route НЕ подставляется (находка ревью
+    // #453): штатный UI сам кладёт apiKeyEnv по своей формуле deriveKeyRef
+    // (`client.js:477`, design.md «Где живут креды») ПРИ ЗАПИСИ раздела —
+    // сервер её никогда не видит и не может независимо доказать байт-в-байт
+    // эквивалентность своей копии формулы клиентской без сверки по бандлу
+    // (которой здесь нет). Дублирующая реализация без пина — риск молчаливого
+    // расхождения на маршрутах с дефисом (`nvidia-nim` → `NVIDIA_NIM_API_KEY`
+    // против гипотетического иного разделителя в апстриме); fail loud на
+    // записи безопаснее угадывания имени ref'а.
+    if (typeof source.apiKeyEnv !== 'string' || source.apiKeyEnv.length === 0) {
+      throw new Error(`provider-registry: у провайдера "${route}" должен быть apiKeyEnv — имя credential-ref (штатный UI ставит его сам)`)
+    }
     if (source.displayName !== undefined && source.displayName.length === 0) {
       throw new Error(`provider-registry: у провайдера "${route}" displayName не может быть пустым`)
     }
@@ -123,12 +130,13 @@ function routeMaxTokens() {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOKENS_FALLBACK
 }
 
-/** Профиль → соединение DeepSeekAdapter; отказ resolve = отказ будущего хода. */
+/** Профиль → соединение DeepSeekAdapter; отказ resolve = отказ будущего хода.
+ * apiKeyEnv берётся из записи как есть — assertServiceable уже отказал бы
+ * записи без него (находка ревью #453: без независимого вывода имени ref'а
+ * не тратим догадку, которая могла бы разойтись с клиентской формулой). */
 function connectionOf(route, profileValue) {
   return resolveAdapterOptions({
-    apiKeyEnv: typeof profileValue.apiKeyEnv === 'string' && profileValue.apiKeyEnv.length > 0
-      ? profileValue.apiKeyEnv
-      : deriveKeyRef(route),
+    apiKeyEnv: profileValue.apiKeyEnv,
     baseURL: profileValue.baseURL,
     models: (profileValue.models ?? []).map(model => ({
       id: model.id,

@@ -12,7 +12,7 @@
  * Ограничение честно названо: дым идёт в Node, не в workerd — путь execute()
  * инструментов (fetch, env воркера) им не покрыт; покрыт путь монтирования
  * (apply + effect + регистрация в реестре тулов), на котором случился #100.
- * С #114 в бутстрапе смонтированы также LlmRuntime и in-memory
+ * С #378 в бутстрапе смонтированы также LlmRuntime и in-memory
  * SettingsProvider: серверный плагин реестра провайдеров объявляет inject
  * ['llm'] и монтирует settings-namespace — без этих сервисов его apply
  * не дошёл бы до конца, и дым не поймал бы класс «плагин не монтируется
@@ -74,7 +74,7 @@ import { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import SettingsProvider from '@deepseek-ai/dsh-settings'
 
 // Сервисы, без которых плагины морды не монтируются: LlmRuntime ('llm' —
-// inject плагина реестра провайдеров #114) и провайдер настроек ('settings' —
+// inject плагина реестра провайдеров #378) и провайдер настроек ('settings' —
 // шов installSettingsSection). In-memory SettingsProvider: persist — no-op
 // (write() сам кладёт раздел в this.document), load() отдаёт текущий документ.
 class MemorySettingsProvider extends SettingsProvider {
