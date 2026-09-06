@@ -124,6 +124,25 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
 
+      # Гвардия «PR не заводится на эпик» (#376): task-branch отказывает на
+      # номере эпика ДО git switch -c — признак эпика (is_epic_issue,
+      # scripts/orchestra/scheduler.py) не дублируется вторым определением,
+      # scripts/lib/epic_guard.py импортирует его. Мутация «убрать вызов
+      # is_epic_issue» краснит check_epic_by_title/check_epic_by_open_sub_issues.
+      - name: Тесты гвардии «PR не заводится на эпик»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_epic_guard.py -q
+
+      # Проводка той же гвардии в task-branch целиком (не только логика
+      # epic_guard.py выше): номер эпика падает ДО создания ветки, ветка не
+      # остаётся созданной; обычная задача заводится штатно. python3
+      # застаблен в PATH тем же CLI-контрактом, что epic_guard.py — сеть/gh
+      # не нужны (класс воспроизведён живьём: PR #162, 44 раунда ревью на
+      # ветку, привязанную к эпику #77).
+      - name: Smoke «task-branch отказывает на эпике»
+        run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
+
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
       # обоими зелёными вердиктами или уже в конфликте, не всех открытых
