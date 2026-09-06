@@ -26,12 +26,13 @@ pr_outcome = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pr_outcome)  # type: ignore[union-attr]
 
 
-def pr(number, state, additions=10, deletions=1, url=None):
+def pr(number, state, additions=10, deletions=1, changed_files=1, url=None):
     return {
         "number": number,
         "state": state,
         "additions": additions,
         "deletions": deletions,
+        "changedFiles": changed_files,
         "url": url or f"https://github.com/mytab0r/edge-harness/pull/{number}",
     }
 
@@ -72,9 +73,20 @@ def test_closed_unmerged_pr_is_failure():
 def test_open_pr_without_diff_is_failure_not_success():
     # Промежуточный случай владельца: PR открыт, но пуст (DSH создал ветку/PR,
     # не поработав над задачей) — это провал, не подмена «PR существует».
-    status, chosen = pr_outcome.pick_pr_outcome([pr(12, "OPEN", additions=0, deletions=0)])
+    # Пустая ветка = ни текстового диффа, ни файлов вовсе.
+    status, chosen = pr_outcome.pick_pr_outcome([pr(12, "OPEN", additions=0, deletions=0, changed_files=0)])
     assert status == "empty"
     assert chosen["number"] == 12
+
+
+def test_open_pr_binary_only_change_is_success_not_empty():
+    # Находка ревью PR #415: additions=deletions=0 бывает и у ЖИВОЙ работы —
+    # PR меняет только бинарник или делает чистое переименование. changedFiles
+    # > 0 при нулевом текстовом диффе обязан считаться успехом, не «пусто».
+    status, chosen = pr_outcome.pick_pr_outcome(
+        [pr(13, "OPEN", additions=0, deletions=0, changed_files=1)])
+    assert status == "open"
+    assert chosen["number"] == 13
 
 
 # ── Выбор среди нескольких PR на одну ветку: MERGED побеждает всегда ──────────────
@@ -90,7 +102,11 @@ def test_merged_wins_over_open_regardless_of_order():
 
 
 def test_open_wins_over_empty_and_absent():
-    prs = [pr(30, "CLOSED"), pr(31, "OPEN", additions=0, deletions=0), pr(32, "OPEN")]
+    prs = [
+        pr(30, "CLOSED"),
+        pr(31, "OPEN", additions=0, deletions=0, changed_files=0),
+        pr(32, "OPEN"),
+    ]
     status, chosen = pr_outcome.pick_pr_outcome(prs)
     assert status == "open" and chosen["number"] == 32
 

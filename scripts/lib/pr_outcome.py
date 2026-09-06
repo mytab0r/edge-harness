@@ -38,7 +38,15 @@ STATUS_ORDER = {"merged": 0, "open": 1, "empty": 2, "absent": 3}
 
 
 def _is_empty(pull: dict[str, Any]) -> bool:
-    return int(pull.get("additions") or 0) + int(pull.get("deletions") or 0) == 0
+    """Находка ревью PR #415: additions+deletions==0 в одиночку ложно метит
+    провалом PR, который меняет ТОЛЬКО бинарники или делает чистое
+    переименование — у GitHub такой PR имеет нулевой текстовый дифф, но
+    changedFiles > 0 (реальная работа есть). "Пусто" — только когда файлов
+    тоже ноль (task.sh обязан передавать changedFiles в --json)."""
+    additions = int(pull.get("additions") or 0)
+    deletions = int(pull.get("deletions") or 0)
+    changed_files = int(pull.get("changedFiles") or 0)
+    return additions + deletions == 0 and changed_files == 0
 
 
 def classify(pull: dict[str, Any]) -> str:

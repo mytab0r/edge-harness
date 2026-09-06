@@ -513,13 +513,22 @@ echo "--- хвост stderr DSH ---"; [ -n "$ERR_TAIL" ] && printf '%s\n' "$ERR_
 # (fail loud, тот же промпт мог быть исполнен мимо PR), «открыт с диффом» и
 # «слит» — оба успех.
 gh pr list --head "$BRANCH" --state all --limit 10 \
-    --json number,state,additions,deletions,url >"$WORK/branch-prs.json" \
+    --json number,state,additions,deletions,changedFiles,url >"$WORK/branch-prs.json" \
   || die "не смог прочитать PR ветки $BRANCH (gh/сеть)"
 set +e
 pr_line=$(python3 "$SCRIPT_DIR/../lib/pr_outcome.py" "$WORK/branch-prs.json")
 pr_outcome_rc=$?
 set -e
-[ "$pr_outcome_rc" != "2" ] || die "проверка PR ветки $BRANCH сломалась (python/json)"
+# Находка ревью PR #415: только 0/1 — легитимные исходы (успех/провал).
+# Любой другой код (2 — контракт CLI сломан, 127 — python3 не найден,
+# необработанный трейсбек и т.п.) — поломка самой проверки, не «PR открыт,
+# но пуст»: смешивать их значило бы съедать сломанный tooling под видом
+# честного провала задачи (тот же принцип «пусто ≠ сломано», что уже
+# проводит pr_outcome.py и что закрывал #245 для free_task.py).
+case "$pr_outcome_rc" in
+  0|1) ;;
+  *) die "проверка PR ветки $BRANCH сломалась (rc=$pr_outcome_rc)" ;;
+esac
 pr_status=${pr_line%%$'\t'*}
 pr_url=${pr_line#*$'\t'}
 
