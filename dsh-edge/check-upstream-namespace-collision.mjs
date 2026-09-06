@@ -86,7 +86,15 @@ async function fetchGithubFile(repo, sha, path) {
 }
 
 async function npmPackageMeta(name) {
-  const res = await fetch(`${NPM_REGISTRY}/${encodeURIComponent(name).replace('%40', '@').replace('%2F', '/')}`)
+  // name приходит из внешних данных (ключ dependencies апстримного пакета на
+  // npm registry) — кодируем ПОЛНОСТЬЮ (encodeURIComponent), затем возвращаем
+  // читаемыми только "@" и "/" (npm registry принимает обе формы для scoped-
+  // имени). Замена ГЛОБАЛЬНАЯ (/g): строковый .replace(str, ...) заменяет
+  // только первое вхождение и оставляет второе "%2F"/"%40" percent-encoded
+  // внутри URL для имени с более чем одним "@"/"/" (CodeQL js/incomplete-
+  // sanitization, было здесь — та же схема, что уже верно сделана в
+  // fetchGithubFile выше, строка 80).
+  const res = await fetch(`${NPM_REGISTRY}/${encodeURIComponent(name).replace(/%40/g, '@').replace(/%2F/g, '/')}`)
   if (!res.ok) throw new Error(`npm registry ${name} -> HTTP ${res.status}`)
   return res.json()
 }
