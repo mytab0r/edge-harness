@@ -13,13 +13,27 @@ workflow'а (github.token).
 следующем пульсе orchestra. Второй путь применения здесь НЕ заводится,
 переиспользован post_issue_comment из pulse_guard.py без изменений.
 
+Проверка «задача всё ещё ждёт» (находка ревью PR #486, четвёртый заход):
+клавиатуры прошлых эскалаций ничем не удаляются (кнопки снимает только
+`editMessageText` по нажатию), а гвардия шлёт НОВОЕ кнопочное сообщение
+каждые `WAITING_OWNER_REESCALATE_HOURS` часов — после ответа комментарием
+в чате несколько наборов живых кнопок остаются нажимаемыми. Случайное
+нажатие протухшей кнопки без этой проверки записало бы «РЕШЕНИЕ: N» в
+задачу, уже взятую воркером, закрытую, или переоткрытую под новый раунд с
+другой нумерацией вариантов — молча неверный артефакт, выглядящий
+авторитетным решением владельца. Морда к этому моменту уже ответила
+владельцу «Принято» (answerCallbackQuery по 204 от dispatch) — красный job
+здесь единственный видимый сигнал расхождения, поэтому отказ громкий
+(RuntimeError → `::error::` → exit 1), не тихий no-op.
+
 Запуск: python scripts/orchestra/apply_owner_decision.py --repo o/r --issue N --option M
 """
 
 import argparse
 import sys
 
-from pulse_guard import DECISION_COMMENT_PREFIX, post_issue_comment
+from pulse_guard import DECISION_COMMENT_PREFIX, gh, post_issue_comment
+from waiting_owner_guard import WAITING_OWNER_LABEL
 
 
 def decision_comment(option: int) -> str:
@@ -29,12 +43,30 @@ def decision_comment(option: int) -> str:
     )
 
 
+def issue_still_waiting(repo: str, issue_number: int) -> bool:
+    """Задача открыта И всё ещё несёт waiting:owner — решение по нажатой
+    кнопке применимо. False — задача закрыта, или метку уже сняли/сменили
+    раунд (см. докстринг модуля)."""
+    issue = gh(f"repos/{repo}/issues/{issue_number}")
+    if not issue or issue.get("state") != "open":
+        return False
+    labels = {label["name"] for label in (issue.get("labels") or [])}
+    return WAITING_OWNER_LABEL in labels
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="owner/repo")
     parser.add_argument("--issue", required=True, type=int, help="номер задачи (issue), не PR")
     parser.add_argument("--option", required=True, type=int, help="номер выбранного варианта (с 1)")
     args = parser.parse_args(argv)
+
+    if not issue_still_waiting(args.repo, args.issue):
+        raise RuntimeError(
+            f"#{args.issue}: задача не в состоянии waiting:owner (закрыта либо метка "
+            "снята/сменился раунд) — решение НЕ записано, нажата протухшая кнопка "
+            "прошлой эскалации"
+        )
 
     post_issue_comment(args.repo, args.issue, decision_comment(args.option))
     print(f"apply_owner_decision: #{args.issue} — РЕШЕНИЕ: {args.option} записано комментарием")
