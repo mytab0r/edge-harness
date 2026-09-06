@@ -269,6 +269,40 @@ def test_issue_node_id_missing_issue_is_loud():
             td.issue_node_id("owner/repo", 999999)
 
 
+# ── wire_dependencies: единый цикл переноса объявленного в граф (#529) ───────
+
+
+def test_wire_dependencies_links_only_numbers_in_open_pool(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        td, "add_dependency",
+        lambda repo, blocked, blocking, gh_call=None: calls.append((blocked, blocking)),
+    )
+    linked = td.wire_dependencies(
+        "owner/repo", 500, [55, 999], {55, 60}, log=lambda *a: None,
+    )
+    assert linked == [55]
+    assert calls == [(500, 55)]
+
+
+def test_wire_dependencies_skips_self_reference_without_network_call():
+    linked = td.wire_dependencies("owner/repo", 500, [500], {500}, log=lambda *a: None)
+    assert linked == []
+
+
+def test_wire_dependencies_logs_skip_reason_for_unknown_number(monkeypatch):
+    monkeypatch.setattr(td, "add_dependency", lambda *a, **kw: None)
+    logged = []
+    linked = td.wire_dependencies("owner/repo", 500, [999], {55}, log=logged.append)
+    assert linked == []
+    assert any("не открытая" in line for line in logged)
+
+
+def test_wire_dependencies_empty_input_no_calls():
+    linked = td.wire_dependencies("owner/repo", 500, [], {55}, log=lambda *a: None)
+    assert linked == []
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 

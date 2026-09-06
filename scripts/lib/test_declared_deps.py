@@ -128,3 +128,156 @@ def test_find_desync_ignores_self_reference():
         {"number": 5, "body": "После #5 ничего не меняется.", "blocked_by_open": []},
     ]
     assert dd.find_desync(issues) == []
+
+
+# ── form_field_numbers: структурный ответ поля, не любое «#N» в теле ────────
+
+# Реальный ответ `gh api repos/mytab0r/edge-harness/issues/529 --jq .body`
+# (задача #529, эта же задача, заведённая перед реализацией) — прод-форма,
+# не пересказ: секция «Чем блокируется» отвечает «ничем», а секция «Контекст
+# и ссылки» ниже упоминает #361/#371/#387 — ровно тот класс ложного
+# срабатывания, которого структурный разбор обязан избежать (наивный поиск
+# «любое #N в теле» дал бы [361, 371, 387], что неверно).
+ISSUE_529_BODY = (
+    "### Цель\n\n"
+    "Поле «Чем блокируется» (обязательное с #387, шаблоны `task.yml`/`white-spot.yml`)\n"
+    "должно автоматически становиться связью `blockedBy` графа зависимостей для\n"
+    "ЛЮБОГО пути заведения задачи (форма, API, агент) — сегодня перенос делает\n"
+    "только `wire_declared_dependency` в `file_tasks.py` (АИ-ревью-путь), для\n"
+    "остальных нужна ручная команда `task_deps.py block`.\n\n"
+    "### Критерий готовности\n\n"
+    "- Открытая задача любого происхождения с заполненным полем «Чем блокируется»\n"
+    "  и номером, которого нет в нативном `blockedBy`, получает эту связь\n"
+    "  автоматически на ближайшем прогоне без ручной команды.\n"
+    "- Поле разбирается структурно (по заголовку секции формы `### Чем\n"
+    "  блокируется`), не по любому `#N` в теле — ложная связь опаснее отсутствующей.\n"
+    "- Явный ответ «ничем» не создаёт предупреждений и не считается пропуском.\n"
+    "- Тесты на мутацию прод-формы (реальный рендер поля формы, реальные тела\n"
+    "  открытых задач) зелёные.\n\n"
+    "### Площадь\n\n"
+    "area:process\n\n"
+    "### Чем блокируется\n\n"
+    "ничем\n\n"
+    "### Что блокирует\n\n"
+    "ничем\n\n"
+    "### Контекст и ссылки\n\n"
+    "Продолжение #361 (`scripts/lib/task_deps.py`, граф блокировок) и #371\n"
+    "(`scripts/lib/declared_deps.py`, `wire_declared_dependency` в\n"
+    "`scripts/review/file_tasks.py`) — тот же класс, что закрыт для АИ-ревью-пути,\n"
+    "здесь нужен для человеческого/шаблонного пути. `design.md` #361/#371 сознательно\n"
+    "оставлял человеческий путь ручным («форма не структурная для программных\n"
+    "создателей») — пересматривается прямым решением владельца, обоснование в\n"
+    "`design.md` этой задачи.\n"
+)
+
+
+def test_form_field_numbers_real_body_nichem_ignores_unrelated_numbers_below():
+    # Прод-тело реальной issue #529: поле отвечает «ничем», а несвязанные
+    # #361/#371/#387 ниже по телу НЕ должны попасть в результат.
+    assert dd.form_field_numbers(ISSUE_529_BODY) == []
+
+
+def test_form_field_numbers_none_when_section_absent():
+    assert dd.form_field_numbers("Обычное тело безо всякой формы.") is None
+
+
+def test_form_field_numbers_case_insensitive_nichem():
+    body = "### Чем блокируется\n\nНичем\n\n### Контекст\n\nтекст"
+    assert dd.form_field_numbers(body) == []
+
+
+def test_form_field_numbers_parses_canonical_render():
+    # Тот же канонический рендер, что уже проверен для declared_candidates
+    # (находка AI-ревью PR #387) — здесь для отдельного структурного разбора.
+    body = (
+        "### Цель\n\nСделать штуку.\n\n"
+        "### Чем блокируется\n\n#123 #124\n\n"
+        "### Контекст и ссылки\n\nссылка на #999 в другом разделе"
+    )
+    assert dd.form_field_numbers(body) == [123, 124]
+
+
+# ── auto_wire: единый перенос поля формы в граф (задача #529) ───────────────
+
+
+class FakeTaskDeps:
+    """Двойник task_deps.py для `auto_wire`: без сети и без импорта настоящего
+    модуля — тестируем только логику declared_deps.py (form_field_numbers +
+    фильтр «уже в графе» + делегирование в wire_dependencies)."""
+
+    def __init__(self, issues):
+        self.issues = issues
+        self._default_gh = object()
+        self.wire_calls: list[tuple[int, list[int]]] = []
+
+    def fetch_pool(self, repo, label="task", include_body=False, gh_call=None):
+        return self.issues
+
+    def wire_dependencies(self, repo, blocked, blocking_numbers, open_numbers, gh_call=None, log=print):
+        self.wire_calls.append((blocked, list(blocking_numbers)))
+        return list(blocking_numbers)
+
+
+def test_auto_wire_links_declared_numbers_missing_from_graph(monkeypatch):
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []},
+        {"number": 55, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 500, "linked": [55]}]
+    assert fake.wire_calls == [(500, [55])]
+
+
+def test_auto_wire_idempotent_when_already_native_no_network_calls(monkeypatch):
+    # Мутация: тот же ответ поля, но связь УЖЕ проставлена в графе — не должно
+    # быть повторного вызова wire_dependencies (сетевого добавления связи).
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": [55]},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == []
+    assert fake.wire_calls == []
+
+
+def test_auto_wire_ignores_missing_field_and_nichem(monkeypatch):
+    issues = [
+        {"number": 1, "body": "Тело без поля формы вовсе.", "blocked_by_open": []},
+        {"number": 2, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == []
+    assert fake.wire_calls == []
+
+
+def test_auto_wire_real_issue_529_body_yields_nothing():
+    # Прод-тело: поле «ничем» — auto_wire не должен даже пытаться дойти до
+    # wire_dependencies для этой issue (никакой FakeTaskDeps не нужен — форма
+    # уже отфильтрована на form_field_numbers).
+    assert dd.form_field_numbers(ISSUE_529_BODY) == []
+
+
+# ── CLI wire ─────────────────────────────────────────────────────────────────
+
+
+def test_cli_wire_reports_nothing_to_link(monkeypatch, capsys):
+    fake = FakeTaskDeps([{"number": 1, "body": "ничего", "blocked_by_open": []}])
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    rc = dd.main(["wire", "owner/repo"])
+    assert rc == 0
+    assert "переносить нечего" in capsys.readouterr().out
+
+
+def test_cli_wire_prints_linked_numbers(monkeypatch, capsys):
+    issues = [{"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []}]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    rc = dd.main(["wire", "owner/repo"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "#500" in out and "#55" in out

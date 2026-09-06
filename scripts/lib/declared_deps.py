@@ -24,8 +24,18 @@ repo-ci.yml`. Живой замер при внедрении (2026-09-06): бо
 связи на закрытую задачу не влияет ни на что (design.md task-priority-
 blocking-graph, задача #371 report).
 
+Отдельно — `auto_wire`/CLI `wire` (задача #529, продолжение #371): значение
+СТРУКТУРНОГО поля формы «Чем блокируется» (`form_field_numbers`, тот же
+`_FORM_FIELD_RE`, что и `declared_candidates` выше) — не эвристика, ответ
+схемы issue-формы, поэтому переносится в граф АВТОМАТИЧЕСКИ, тем же путём,
+что `file_tasks.py::wire_declared_dependency` уже делает для строки
+«БЛОКИРУЕТСЯ:» (общий цикл — `task_deps.wire_dependencies`). Прозаическая
+эвристика `_TRIGGER_RE` в автопереносе НЕ участвует ни в каком виде — только
+в `find_desync` (предупреждение, не запись).
+
 CLI:
     python scripts/lib/declared_deps.py check <owner/repo> [label]
+    python scripts/lib/declared_deps.py wire <owner/repo> [label]
 """
 
 from __future__ import annotations
@@ -68,6 +78,66 @@ def declared_candidates(body: str) -> set[int]:
     if form_match:
         found |= {int(n) for n in re.findall(r"#(\d+)", form_match.group(1))}
     return found
+
+
+def form_field_numbers(body: str) -> list[int] | None:
+    """Структурный ответ обязательного поля «Чем блокируется» (issue-формы
+    `task.yml`/`white-spot.yml`, обязательное с #387) — не эвристика прозы,
+    ответ схемы формы: GitHub рендерит поле как `### Чем блокируется\\n\\n<ответ>`,
+    ответ — первая непустая строка после заголовка (`_FORM_FIELD_RE`).
+
+    `None` — секции нет вовсе в теле (issue не из этого шаблона, или заведена
+    до введения обязательного поля) — автопереносу не из чего переносить,
+    это НЕ то же самое, что «явно ничем» (см. ниже).
+    `[]` — явный ответ «ничем» (или пустое значение) — зависимостей нет,
+    ВАЛИДНЫЙ ответ обязательного поля, не повод для предупреждения/шума
+    (задача #529, требование «поле обязательное — «ничем» тоже ответ»).
+    Иначе — список номеров issue, названных в ответе."""
+    match = _FORM_FIELD_RE.search(body or "")
+    if not match:
+        return None
+    value = match.group(1).strip()
+    if not value or value.lower() == "ничем":
+        return []
+    return [int(n) for n in re.findall(r"#(\d+)", value)]
+
+
+def auto_wire(
+    repo: str, label: str = "task", gh_call=None, log=print,
+) -> list[dict]:
+    """Единый механизм автопереноса структурного поля формы «Чем блокируется»
+    в нативный `blockedBy` — задача #529, продолжение #371/#387: поле
+    обязательно с #387, но до этой задачи перенос для человеческого/шаблонного
+    пути был ручной командой `task_deps.py block`. Переиспользует
+    `task_deps.wire_dependencies` (тот же цикл, что уже применяет
+    `file_tasks.py::wire_declared_dependency` для АИ-ревью-пути) — не третья
+    копия «пропустить номер вне пула, иначе add_dependency».
+
+    Идемпотентно: номера, уже присутствующие в `blocked_by_open`, повторно не
+    линкуются (не тратит сетевой вызов на уже поставленную связь) — безопасно
+    гонять на каждый push, не только один раз.
+
+    Возвращает список `{"issue": N, "linked": [...]}` только для issues, где
+    реально что-то дописано в граф на ЭТОМ прогоне."""
+    task_deps = _load_task_deps()
+    gh_call = gh_call or task_deps._default_gh
+    issues = task_deps.fetch_pool(repo, label=label, include_body=True, gh_call=gh_call)
+    open_numbers = {issue["number"] for issue in issues}
+    report: list[dict] = []
+    for issue in issues:
+        number = issue["number"]
+        numbers = form_field_numbers(issue.get("body") or "")
+        if not numbers:
+            continue  # None (поля нет) или [] (явно «ничем») — переносить нечего
+        already = set(issue.get("blocked_by_open") or [])
+        missing = [n for n in numbers if n not in already]
+        if not missing:
+            continue  # весь объявленный набор уже в графе — идемпотентность
+        linked = task_deps.wire_dependencies(
+            repo, number, missing, open_numbers, gh_call=gh_call, log=log)
+        if linked:
+            report.append({"issue": number, "linked": linked})
+    return report
 
 
 def find_desync(issues: list[dict]) -> list[dict]:
@@ -117,7 +187,22 @@ def main(argv: list[str]) -> int:
                 f"{finding['issue']} {finding['declared_blocking']}`"
             )
         return 0
-    print("использование: declared_deps.py check <owner/repo> [label]", file=sys.stderr)
+    if len(argv) in (2, 3) and argv[0] == "wire":
+        repo = argv[1]
+        label = argv[2] if len(argv) == 3 else "task"
+        report = auto_wire(repo, label)
+        if not report:
+            print("declared_deps: переносить нечего (поле пусто/«ничем»/уже в графе)")
+            return 0
+        for item in report:
+            linked = " ".join(f"#{n}" for n in item["linked"])
+            print(f"declared_deps: #{item['issue']} -> {linked} (поле «Чем блокируется»)")
+        return 0
+    print(
+        "использование: declared_deps.py check <owner/repo> [label] "
+        "| wire <owner/repo> [label]",
+        file=sys.stderr,
+    )
     return 2
 
 

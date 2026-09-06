@@ -251,6 +251,37 @@ def remove_dependency(repo: str, blocked: int, blocking: int, gh_call=_default_g
     )
 
 
+# ── Перенос объявленной зависимости в граф — одно место на все пути ──────────
+
+
+def wire_dependencies(
+    repo: str, blocked: int, blocking_numbers: list[int], open_numbers: set[int],
+    gh_call=_default_gh, log=print,
+) -> list[int]:
+    """Единственное место, переносящее «номера, объявленные структурным
+    полем/строкой» в нативный `blockedBy` — задача #529, продолжение #371:
+    до этой задачи цикл «пропустить номер вне открытого пула, иначе
+    `add_dependency` + лог» жил ТОЛЬКО в `file_tasks.py::wire_declared_dependency`
+    (путь АИ-ревью, строка «БЛОКИРУЕТСЯ:»). Второй вызывающий (авто-перенос
+    структурного поля формы «Чем блокируется», `declared_deps.py::auto_wire`)
+    переиспользует эту же функцию — третья копия одного цикла не заводится.
+
+    Номер вне ТЕКУЩЕГО открытого пула с меткой `task` (уже закрыт, не задача,
+    не существует) или ссылка на саму `blocked` — НЕ линкуется, печатается
+    предупреждение: ложная связь опаснее отсутствующей (то же правило, что
+    для ручной миграции #371)."""
+    linked: list[int] = []
+    for n in blocking_numbers:
+        if n == blocked or n not in open_numbers:
+            log(f"    ! #{blocked}: «#{n}» — не открытая задача пула с меткой "
+                f"task (или ссылка на себя) — связь НЕ поставлена")
+            continue
+        add_dependency(repo, blocked=blocked, blocking=n, gh_call=gh_call)
+        linked.append(n)
+        log(f"    -> #{blocked} заблокирована #{n} (нативный граф)")
+    return linked
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
