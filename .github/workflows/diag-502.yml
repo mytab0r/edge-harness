@@ -72,13 +72,36 @@ jobs:
           const settingsHtml = await page.content()
           writeFileSync('/tmp/settings.html', settingsHtml)
           console.log('--- settings html length ---', settingsHtml.length)
-          const settingsNav = await page.$$eval('a, button, [role="tab"], [role="link"], [role="menuitem"], [role="listitem"], li, [role="dialog"] *', els =>
-            els.slice(0, 400).map(e => ({ tag: e.tagName, text: (e.textContent||'').trim().slice(0,50), href: e.getAttribute('href'), role: e.getAttribute('role'), testid: e.getAttribute('data-testid'), cls: (e.getAttribute('class')||'').slice(0,70), ariaSelected: e.getAttribute('aria-selected') })).filter(e => e.text && e.text.length < 50)
-          )
-          console.log('--- settings panel elements (first 400) ---')
-          console.log(JSON.stringify(settingsNav, null, 2))
           const dialogCount = await page.locator('[role="dialog"]').count()
           console.log('--- [role=dialog] count ---', dialogCount)
+          const dialogInfo = await page.$$eval('[role="dialog"]', els => els.map(e => ({ cls: (e.getAttribute('class')||''), ariaLabel: e.getAttribute('aria-label'), ariaLabelledby: e.getAttribute('aria-labelledby') })))
+          console.log('--- dialog elements ---', JSON.stringify(dialogInfo))
+
+          // Структурная эвристика без хардкода имён/хешей: самая большая группа
+          // кнопок-СИБЛИНГОВ (общий родитель) с коротким однострочным текстом —
+          // это и есть навигация по разделам (устойчиво к смене build-хешей CSS
+          // modules при апдейте dsh-edge).
+          const tabGroup = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'))
+            const groups = new Map()
+            for (const b of buttons) {
+              const parent = b.parentElement
+              if (!parent) continue
+              const text = (b.textContent || '').trim()
+              if (!text || text.length > 30) continue
+              if (b.querySelector('input, textarea, select')) continue
+              if (!groups.has(parent)) groups.set(parent, [])
+              groups.get(parent).push(text)
+            }
+            let best = []
+            for (const list of groups.values()) {
+              if (list.length > best.length) best = list
+            }
+            return best
+          })
+          console.log('--- structural tab-group heuristic (largest sibling-button group) ---')
+          console.log(JSON.stringify(tabGroup))
+
           await browser.close()
           NODE
-          node explore.mjs 2>&1 | head -400
+          node explore.mjs 2>&1 | tail -100
