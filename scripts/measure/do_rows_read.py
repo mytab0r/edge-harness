@@ -139,6 +139,21 @@ def check_not_truncated(rows: list[dict], limit: int = GRAPHQL_ROW_LIMIT) -> Non
             "пагинацию вместо доверия этому числу")
 
 
+def require_accounts(accounts: list[dict]) -> list[dict]:
+    """Пустой `viewer.accounts` — не «ноль метрики», а «токен не видит этот
+    аккаунт» (accountTag не совпадает с аккаунтом токена, или у токена нет
+    доступа). Silent-zero здесь опаснее ошибки: sum/max по пустому списку
+    молча даёт 0, а квота, честно отрапортовавшая «0%», не пробьёт порог 80%
+    ровно в момент, для наблюдения за которым и заведён инструмент (находка
+    AI-ревью PR #327). Одно место правды на эту проверку — используется и
+    здесь (fetch_rows), и в scripts/measure/quotas.py::collect_cloudflare."""
+    if not accounts:
+        raise RuntimeError(
+            "accounts пуст — CLOUDFLARE_ACCOUNT_ID не совпадает с аккаунтом токена "
+            "или у токена нет доступа к этому аккаунту")
+    return accounts
+
+
 def group_rows_by_day(rows: list[dict]) -> dict[date, list[dict]]:
     """Раскладка часовых/дневных строк range-ответа по суткам (`dimensions.date`).
     Единственное место, где сутки можно тихо перепутать при склейке — поэтому
@@ -340,11 +355,7 @@ def fetch_rows(token: str, account_id: str, query: str, shape: str, day: date,
                  if shape == "range"
                  else {"accountTag": account_id, "date": day.isoformat()})
     data = graphql(token, query, variables)
-    accounts = data["viewer"]["accounts"]
-    if not accounts:
-        raise RuntimeError(
-            "accounts пуст — CLOUDFLARE_ACCOUNT_ID не совпадает с аккаунтом токена "
-            "или у токена нет доступа к этому аккаунту")
+    accounts = require_accounts(data["viewer"]["accounts"])
     rows = accounts[0]["rows"]
     check_not_truncated(rows)
     return rows

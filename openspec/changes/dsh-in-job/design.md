@@ -36,9 +36,13 @@
 Job делает `npm pack <pkg>@<pin>` + установку из локальных tgz.
 Версии пинятся в одном месте — вверху скрипта клиента.
 
-**Провайдер — плагины владельца, не новый код.** combo-router (виртуальная модель
-`combo/auto`: классификация, circuit breaker, failover, режимы auto/quality/economy)
-и anthropic-oauth-pool подключаются в раннере — они для этого и построены.
+**Провайдер — готовые плагины, не новый код.** Подключаются два собранных артефакта
+владельца: `dsh-combo-suite-0.1.0.tgz` (внутри `dsh-combo-router-0.1.0`: виртуальная
+модель `combo/auto`, классификация, circuit breaker, failover, режимы
+auto/quality/economy) и `dsh-anthropic-oauth-pool-0.1.0.tgz` (пул учёток с cooldown).
+Оба собраны 2026-08-28 — они для этого и построены; состав и местоположение
+зафиксированы в #215, подключение в раннер — #215 (проводка `PLUGINS_SUITE_URL`)
+и #216 (перенос и адаптация).
 До их подключения достаточно env-переменных `DEEPSEEK_BASE_URL` /
 `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL`: префикс `DEEPSEEK_` — наследие, значение —
 любой OpenAI-compat endpoint (NVIDIA NIM проверен). Секреты — из секретов
