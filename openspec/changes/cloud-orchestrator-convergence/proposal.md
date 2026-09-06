@@ -54,7 +54,7 @@ heartbeat — DO) должны быть связаны, а не расходит
 | Канал | Есть/нет | Код | Доказано | Не хватает |
 |---|---|---|---|---|
 | Морда dsh-edge (чат) | частично | сторонний CF-воркер `dsh-edge` (не в этом репо) + `scripts/lib/dsh-edge-session.sh` | Владелец сидит в чате; агент-цикл исполняется внутри чужого DO; job'ы задачи пишут транскрипт хода `harness-<N>` в сессию морды через `POST /api/sessions/:id/ingest` (патч 0004, [runner-sessions-in-dsh-morde](../runner-sessions-in-dsh-morde/proposal.md)) — это ОТВЕТ по конкретной задаче, не диалог общего назначения. Заказ плагина (ADR 0009) — единственный прецедент «сообщение из морды -> пул», узкий: одна выделенная сессия `plugin-orders`, один машиночитаемый формат `[plugin-order:<id>]` | Нет пути «произвольное сообщение владельца в чате морды -> оркестратор». Прямой агент морды не может сам действовать в GitHub — egress `api.github.com` из воркера `dsh-edge` даёт 403 (issue #133, `state: open`, проверено `gh api` 2026-09-03; тело без `message` — похоже на edge-блокировку, не ответ приложения) |
-| Telegram (входящий) | частично, PR #173 открыт, НЕ смёржен | `cf-worker/src/harness.ts` (`#postMessageWebhook`, `#classifyMessage`, `#groupMessages`, `#createIssueForDirective`), `cf-worker/src/api-spec.ts` | Вебхук принимает Telegram-формат в таблицу `messages` DO SQLite (source/source_msg_id/chat_id/sender_id/text/kind/status); идемпотентность `UNIQUE(source, source_msg_id)`; классификация regex'ом `directive/doc_edit/chat/raw`; для `directive` — прямой `POST api.github.com/repos/.../issues` **из `cf-worker`, не из `dsh-edge`** — другой воркер, другой egress, НЕ тот же класс, что блок #133 | **(a)** `/api/messages/webhook` — `auth: false`, проверено чтением `api-spec.ts`-диффа и `#postMessageWebhook`: НИ ОДНОЙ проверки происхождения. Уже поймано AI-ревьюером PR #173 как finding номер 1: кто угодно, узнав URL, пишет в пул от имени владельца. **(b)** `chat`/`doc_edit` помечаются `done` с `result:{note:"Requires manual review"}` — действия НЕТ, реагирует только `directive`. **(c)** ответа в Telegram нет нигде: `grep -rn "telegram\|sendMessage" cf-worker/src` — ноль совпадений вне словаря кодов ошибок `messages.ts`. **(d)** PR #173 сам не сливается: второй гейт (`ai-review`) стабильно `error` (парсер не находит строку «ВЕРДИКТ:» — разбирается параллельным change `input-schema-not-output-parsing`) |
+| Telegram (входящий) | частично, PR #173 смёржен (находка AI-ревью PR #262: прежняя редакция описывала до-мержное состояние) | `cf-worker/src/harness.ts` (`#postMessageIngest`, `#classifyMessage`, `#groupMessages`, `#createIssue`), `cf-worker/src/api-spec.ts` | Релей-эндпоинт принимает плоскую форму или сырой Telegram update в таблицу `messages` DO SQLite (source/source_msg_id/chat_id/sender_id/text/kind/status); идемпотентность `UNIQUE(source, source_msg_id)`; классификация regex'ом `directive/doc_edit/chat/raw`; для `directive` И `doc_edit` — прямой `POST api.github.com/repos/.../issues` (`#processSingleMessage`, `harness.ts:1473`) **из `cf-worker`, не из `dsh-edge`** — другой воркер, другой egress, НЕ тот же класс, что блок #133 | **(a)** `/api/messages/ingest` — `auth: true`, обычная авторизация (Bearer/кука), но это админский РЕЛЕЙ: прямой публичный вебхук Telegram (без релея, с секретом заголовка) ещё не построен — открытая работа, не открытая дыра (см. design.md, требование 11). **(b)** только `chat` помечается `done` с `result:{note:"classified_for_manual_review"}` — действия нет; `doc_edit` с #173 уже действует (создаёт issue, как `directive`). **(c)** ответа в Telegram нет нигде: `grep -rn "telegram\|sendMessage" cf-worker/src` — ноль совпадений вне словаря кодов ошибок `messages.ts`. |
 | Локальная сессия | есть, не облачная | эта сессия | Полный контекст, полное рассуждение | Работает МИМО очереди/журнала: результат — файлы на диске владельца, не событие DO/issue GitHub |
 
 ### 2. Где сегодня принимается решение оркестратора
@@ -125,16 +125,23 @@ mytab0r — «у каждого тормоза назван газ»); инва�
 
 ### 5. Идентичность ответа
 
-- Исходящий Telegram уже работает: `scripts/orchestra/pulse_guard.py:344-368`
-  (`send_telegram`) шлёт в ОДИН фиксированный `TELEGRAM_CHAT_ID` из GitHub
+- Исходящий Telegram уже работает: `scripts/orchestra/pulse_guard.py`,
+  функция `send_telegram` (строка дрейфует быстрее, чем живёт change —
+  сверено по HEAD 2026-09-06: строка 416, было указано 344-368 в ревью
+  этого PR, найдено уже сдвинувшимся на момент фикса — искать по имени
+  функции, не по номеру) шлёт в ОДИН фиксированный `TELEGRAM_CHAT_ID` из GitHub
   Actions job'а; используется `pulse_guard.escalate` и `WORKER-PLAYBOOK.md`.
   Секреты уже заведены: `orchestra.yml:69-70`, `worker.yml:98-99`,
   `deploy-dsh-edge.yml:504-505`. Но функция не принимает `chat_id` параметром —
   ответить в чат, ИЗ КОТОРОГО пришло сообщение (не обязательно совпадает с
   `TELEGRAM_CHAT_ID`), сегодняшний код не умеет, хотя `chat_id` уже сохранён по
   каждой строке `messages`.
-- Входящий Telegram (PR #173) не проверяет отправителя вовсе (см. п.1) — открытая
-  дыра, уже пойманная AI-ревьюером PR #173.
+- Входящий Telegram сегодня — только админский релей `POST /api/messages/ingest`
+  за обычной авторизацией (не публичный вебхук; находка AI-ревью PR #262:
+  прежняя редакция этой строки описывала до-мержное состояние PR #173, где
+  вход действительно был непроверяемым публичным вебхуком). Открытая работа —
+  построить ПУБЛИЧНЫЙ вебхук Telegram (требование 11) сразу с проверкой
+  источника, а не закрыть существующую дыру.
 - Путь «ответить в морду» существует как ПРИМИТИВ, не как готовый механизм для
   диалога: `dsh-edge-session.sh` умеет логиниться кукой владельца и постить
   события в сессию через `ingest`, но сегодня это делают только job'ы КОНКРЕТНОЙ
