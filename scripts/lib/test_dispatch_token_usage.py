@@ -44,11 +44,15 @@ DISPATCH_CONSUMER = "deploy-worker.yml"
 # plugin-forge.yml (#77) — тот же класс: PR с обновлением plugins.json обязан
 # идти под широким PAT, иначе GITHUB_TOKEN-пуш не зажигает test/CodeQL/review/
 # contract на самом себе (защита GitHub от рекурсии workflow).
+# repo-ci.yml (job archive-fixup, #493) — тот же класс: пуш автофикса
+# инварианта 4 обратно в ветку PR реальным аккаунтом, иначе github-actions[bot]
+# не зажжёт required-проверки заново на новом коммите (антирекурсия GitHub).
 PIPELINE_CONSUMERS = [
     "deploy-dsh-edge.yml",
     "dispatch-latency-probe.yml",
     "orchestra.yml",
     "plugin-forge.yml",
+    "repo-ci.yml",
     "worker.yml",
 ]
 
