@@ -158,6 +158,38 @@ def test_findings_of_strips_verdict_and_tasks():
     assert "Тело." not in findings
 
 
+# ── Третья категория находок: блок ЗАМЕЧАНИЕ (#462) ───────────────────────────
+
+def test_findings_of_strips_remark_blocks_too():
+    # Замечание (некритичная находка) не должно задваиваться свободной прозой
+    # комментария — оно уходит в чеклист тела PR (review_checklist), не сюда.
+    answer = (
+        "Основной вывод: всё хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: docs/foo.md устарел\nПоправь формулировку.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    findings = ai.findings_of(answer)
+    assert "Основной вывод: всё хорошо." in findings
+    assert "ЗАМЕЧАНИЕ" not in findings
+    assert "docs/foo.md устарел" not in findings
+    assert "Поправь формулировку." not in findings
+
+
+def test_build_comment_notes_remarks_moved_to_pr_body_checklist():
+    remarks = [{"title": "Замечание раз", "body": "Поправь X."}]
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [], remarks=remarks)
+    assert "Замечание раз" in body
+    assert "чеклист" in body.lower()
+    # Само тело ЗАМЕЧАНИЯ не дублируется в комментарий — оно живёт в PR body
+    # (review_checklist.merge_checklist), комментарий только ссылается на факт.
+    assert "Поправь X." not in body
+
+
+def test_build_comment_without_remarks_no_checklist_mention():
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [])
+    assert "чеклист" not in body.lower()
+
+
 # ── Канонический комментарий: шапка-факты + фенсы задач ──────────────────────
 
 def test_build_comment_facts_header_and_fences():
@@ -197,9 +229,12 @@ def test_header_facts_ignores_fenced_and_prose_lines():
 
 
 def test_tasks_from_comment_roundtrip():
+    # Роундтрип через фенсы — только для МАСШТАБ: отдельно (#426): именно эти
+    # задачи file_tasks.py заводит issue'ами, остальное build_comment уводит
+    # прозой (см. test_build_comment_tail_scope_not_fenced ниже).
     tasks = [
-        {"title": "Задача раз", "body": "Цель.\nКритерий."},
-        {"title": "Задача два", "body": "Тело."},
+        {"title": "Задача раз", "body": "Цель.\nКритерий.", "scope": "отдельно"},
+        {"title": "Задача два", "body": "Тело.", "scope": "отдельно"},
     ]
     body = ai.build_comment(140, "abc", "rework", "Находки.", tasks)
     assert ai.tasks_from_comment(body) == tasks
@@ -208,7 +243,8 @@ def test_tasks_from_comment_roundtrip():
 def test_tasks_roundtrip_keeps_inner_code_fence():
     # тело задачи с ```-фенсом (пример команды) не должно обрезаться:
     # внешний забор — 4 бэктика, внутренний тройной остаётся телом
-    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий."}]
+    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий.",
+              "scope": "отдельно"}]
     body = ai.build_comment(140, "abc", "approve", "Ок.", tasks)
     assert ai.tasks_from_comment(body) == tasks
 
@@ -216,6 +252,55 @@ def test_tasks_roundtrip_keeps_inner_code_fence():
 def test_tasks_from_comment_unclosed_fence_dropped():
     body = "pr: 1\nhead: a\nreviewer: approve\n\n````задача\nОборванная задача"
     assert ai.tasks_from_comment(body) == []
+
+
+def test_build_comment_tail_scope_not_fenced():
+    # Обещанный тест (находка ревью #433, п.2): сырой ответ модели с ТРЕМЯ
+    # блоками — отдельно/хвост/без поля — от parse_tasks до tasks_from_comment,
+    # доказывающий оба свойства критерия готовности #426: (а) МАСШТАБ реально
+    # разбирается в scope (значение или None), (б) содержимое хвостов и
+    # безполевых находок остаётся ВИДИМО в комментарии автору, а не молча
+    # исчезает — только не фенсится issue'ом.
+    answer = (
+        "Находки описаны ниже.\n\n"
+        "ЗАДАЧА: Отдельная работа\n"
+        "МАСШТАБ: отдельно\n"
+        "Требует нового дизайна вне этого PR.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Доделай прямо тут\n"
+        "МАСШТАБ: хвост\n"
+        "Укладывается в уже изменённые файлы.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Забыли поле\n"
+        "Модель не указала масштаб.\n"
+        "КОНЕЦ ЗАДАЧИ\n\n"
+        "ВЕРДИКТ: rework"
+    )
+    tasks = ai.parse_tasks(answer)
+    by_title = {t["title"]: t for t in tasks}
+    # (а) scope реально разобран — не угадан молча.
+    assert by_title["Отдельная работа"]["scope"] == "отдельно"
+    assert by_title["Доделай прямо тут"]["scope"] == "хвост"
+    assert by_title["Забыли поле"]["scope"] is None
+
+    findings = ai.findings_of(answer, tasks)
+    body = ai.build_comment(163, "sha163", "rework", findings, tasks)
+
+    # (б) содержимое хвоста и безполевой находки живёт в комментарии —
+    # мутация «выпилить обе секции из build_comment» красит эти строки.
+    assert "### Доделай в этом PR" in body
+    assert "Доделай прямо тут" in body
+    assert "Укладывается в уже изменённые файлы." in body
+    assert "### ⚠️ Без объявленного МАСШТАБА" in body
+    assert "Забыли поле" in body
+    assert "Модель не указала масштаб." in body
+
+    # Только «отдельно» уходит фенсом — file_tasks.py заведёт issue РОВНО
+    # на одну находку, не на три (граница в build_comment, не в file_tasks.py).
+    fenced = ai.tasks_from_comment(body)
+    assert [t["title"] for t in fenced] == ["Отдельная работа"]
+    assert "Доделай прямо тут" not in [t["title"] for t in fenced]
+    assert "Забыли поле" not in [t["title"] for t in fenced]
 
 
 # ── Гейт слияния по меткам (одно место правды — review_labels) ────────────────
@@ -810,6 +895,104 @@ def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, 
     # именно это и не должно происходить в проде, что и доказывает предыдущий
     # тест на текущем (исправленном) cmd_verdict.
     assert run_gh_calls != []
+
+
+# ── cmd_verdict: третья категория находок — чеклист тела PR (#462) ───────────
+
+def _pr_patches(run_gh_calls: list[tuple], pr: int = 294) -> list[str]:
+    """PATCH-вызовы run_gh на тело именно этого PR — тело чеклиста лежит
+    последним элементом кортежа (см. вызов в cmd_verdict: -f body=...)."""
+    return [a[-1].split("body=", 1)[1] for a in run_gh_calls
+            if a[:3] == ("api", "-X", "PATCH") and a[3] == f"repos/o/r/pulls/{pr}"]
+
+
+def test_cmd_verdict_merges_remark_blocks_into_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Всё в целом хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: Мелкая неточность\nПоправь X.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "Мелкая неточность" in patches[0]
+    assert ai.review_checklist.CHECKLIST_BEGIN in patches[0]
+    assert "Описание PR." in patches[0]   # исходное тело PR не потеряно
+
+
+def test_cmd_verdict_without_remarks_does_not_patch_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+    assert rc == 0
+    assert _pr_patches(run_gh_calls) == []
+
+
+def test_cmd_verdict_preserves_checked_checklist_items_on_new_round(monkeypatch, tmp_path):
+    # Раунд 2 ревью с новым замечанием не должен снимать отметку, которую
+    # автор уже поставил у пункта из раунда 1 (нативный чекбокс GitHub).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    existing_body = (
+        "Описание PR.\n\n"
+        f"{ai.review_checklist.CHECKLIST_BEGIN}\n{ai.review_checklist.CHECKLIST_TITLE}\n\n"
+        "- [x] **Старое замечание** — уже сделано\n"
+        f"{ai.review_checklist.CHECKLIST_END}\n"
+    )
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": existing_body}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = "ЗАМЕЧАНИЕ: Новое замечание\nПоправь Y.\nКОНЕЦ ЗАМЕЧАНИЯ\nВЕРДИКТ: approve"
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "- [x] **Старое замечание** — уже сделано" in patches[0]
+    assert "- [ ] **Новое замечание** — Поправь Y." in patches[0]
 
 
 # ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
