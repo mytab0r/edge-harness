@@ -113,6 +113,20 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_repo_invariants.py -q
 
+      # Гвардия класса #510/#516: скрипт под scripts/, вызванный из workflow
+      # НАПРЯМУЮ (run: scripts/foo.sh, без bash/python/node перед путём), без
+      # бита исполнения падает Permission denied на КАЖДОМ прогоне — и падение
+      # невидимо (шаг часто continue-on-error, красным не светится). Образцовый
+      # случай: scripts/gh/wake_orchestra.sh два часа не будил оркестратор.
+      # Живой прогон ниже — required-гейт сразу (0 запросов к GitHub API,
+      # только локальный git ls-tree — цена не аргумент против включения).
+      - name: Тесты гвардии бита исполнения
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_exec_bit_guard.py -q
+      - name: Гвардия бита исполнения — живой снимок workflow (#510/#516)
+        run: python scripts/lib/exec_bit_guard.py
+
       # Гвардия протухшей метки blocked (#334): без этого шага тесты
       # гвардии живут только текстом файла — по собственному правилу
       # этого же PR («решение — это механизм, а не текст») это ровно тот
