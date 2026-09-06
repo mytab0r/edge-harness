@@ -23,6 +23,7 @@ window.EDGE_I18N = {
     "pulse.unhealthy": "⚠️ пульс оркестрации не бьётся: {detail} ({minutes} мин назад)",
     "pulse.stale": "⚠️ пульс оркестрации не бьётся: тик давно не обновлялся ({minutes} мин назад)",
     "pulse.not_configured": "пульс оркестрации не настроен (нет GH_DISPATCH_TOKEN/GH_REPO)",
+    "retention.backlog": "⚠️ ретеншн не успевает: таблицы растут быстрее, чем чистятся",
     "conn.connecting": "соединение…",
     "conn.ok": "живой поток: подключено",
     "conn.reconnect": "живой поток: обрыв, переподключение через {seconds} с",

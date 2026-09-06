@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
 
 import { redact } from "../src/redact";
-import { LIMITS } from "../src/config";
+import { LIMITS, RETENTION } from "../src/config";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -368,6 +368,194 @@ describe("watchdog зависших задач", () => {
   });
 });
 
+// Ретеншн DO SQLite (#306/#305): без него `events`/`tasks` растут вечно — тот же
+// класс, что подпалил суточную квоту rows_read (#320): любой скан со временем
+// дорожает. Пачка на тик, по индексу, alarm() уже существующий — новый таймер
+// не заводится. Докажи мутацией: убери `LIMIT ?`/подмени на `LIMIT 100000` в
+// RETENTION_TABLES[…].sql (src/harness.ts) — тест «пачка ограничена
+// RETENTION.batchSize» ниже покраснеет (останется 0 старых вместо остатка).
+describe("ретеншн DO SQLite (#306/#305)", () => {
+  const HARNESS_ID = () => env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+  async function insertOldEvents(taskId: string, count: number, ageMs: number): Promise<void> {
+    const stub = HARNESS_ID();
+    const oldTs = Date.now() - ageMs;
+    await runInDurableObject(stub, async (_instance, state) => {
+      for (let seq = 1; seq <= count; seq++) {
+        state.storage.sql.exec(
+          "INSERT INTO events (task_id, seq, ts, source, kind, data) VALUES (?, ?, ?, 'system', 'retention_test', NULL)",
+          taskId, seq, oldTs,
+        );
+      }
+    });
+  }
+
+  it("события старше RETENTION.eventsMaxAgeMs уходят, свежие того же task_id остаются", async () => {
+    const taskId = uniqueTaskId("retention-events");
+    await insertOldEvents(taskId, 3, RETENTION.eventsMaxAgeMs + 60_000);
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 100, kind: "fresh" }] });
+
+    await runInDurableObject(HARNESS_ID(), async (instance) => {
+      await instance.alarm();
+    });
+
+    const remaining = await allEventsFor(taskId);
+    expect(remaining.map((event) => event.kind)).toEqual(["fresh"]);
+  });
+
+  it("пачка ограничена RETENTION.batchSize — не полный снос за один тик", async () => {
+    const taskId = uniqueTaskId("retention-batch");
+    const seeded = RETENTION.batchSize + 3;
+    await insertOldEvents(taskId, seeded, RETENTION.eventsMaxAgeMs + 60_000);
+
+    const stub = HARNESS_ID();
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+    const afterOneTick = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql.exec("SELECT COUNT(*) AS n FROM events WHERE task_id = ?", taskId).toArray()[0].n,
+    );
+    // Один тик снимает РОВНО batchSize строк, не все 503 разом — доказательство,
+    // что удаление идёт пачкой (LIMIT), а не одним запросом на всю таблицу.
+    expect(Number(afterOneTick)).toBe(seeded - RETENTION.batchSize);
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+    const afterSecondTick = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql.exec("SELECT COUNT(*) AS n FROM events WHERE task_id = ?", taskId).toArray()[0].n,
+    );
+    expect(Number(afterSecondTick)).toBe(0);
+  });
+
+  it("задача done старше RETENTION.tasksMaxAgeMs уходит; queued того же возраста — нет", async () => {
+    const doneTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const queuedTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const stub = HARNESS_ID();
+    const oldCreatedTs = Date.now() - (RETENTION.tasksMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'done', created_ts = ? WHERE id = ?", oldCreatedTs, doneTask.task_id,
+      );
+      // queued остаётся queued, но с тем же старым возрастом — ретеншн обязан
+      // не трогать активные статусы независимо от того, сколько им лет.
+      state.storage.sql.exec("UPDATE tasks SET created_ts = ? WHERE id = ?", oldCreatedTs, queuedTask.task_id);
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const doneRes = await WORKER.fetch(`https://example.com/api/tasks/${doneTask.task_id}`, { headers: AUTH });
+    expect(doneRes.status).toBe(404);
+    const queuedRes = await getJson<{ task: { id: string; status: string } }>(`/api/tasks/${queuedTask.task_id}`);
+    expect(queuedRes.task.status).toBe("queued");
+  });
+
+  it("задача failed старше порога уходит; dispatched/running того же возраста — нет (находка ревью PR #329)", async () => {
+    const failedTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const dispatchedTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const runningTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const stub = HARNESS_ID();
+    const oldCreatedTs = Date.now() - (RETENTION.tasksMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'failed', created_ts = ? WHERE id = ?", oldCreatedTs, failedTask.task_id,
+      );
+      // dispatched/running остаются активными статусами — ретеншн обязан не
+      // трогать их независимо от возраста, только queued/dispatched/running
+      // проверялись раньше только через queued.
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'dispatched', created_ts = ? WHERE id = ?", oldCreatedTs, dispatchedTask.task_id,
+      );
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'running', created_ts = ? WHERE id = ?", oldCreatedTs, runningTask.task_id,
+      );
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const failedRes = await WORKER.fetch(`https://example.com/api/tasks/${failedTask.task_id}`, { headers: AUTH });
+    expect(failedRes.status).toBe(404);
+    const dispatchedRes = await getJson<{ task: { id: string; status: string } }>(
+      `/api/tasks/${dispatchedTask.task_id}`,
+    );
+    expect(dispatchedRes.task.status).toBe("dispatched");
+    const runningRes = await getJson<{ task: { id: string; status: string } }>(`/api/tasks/${runningTask.task_id}`);
+    expect(runningRes.task.status).toBe("running");
+  });
+
+  it("/api/status.retention виден после тика — pruned по таблицам", async () => {
+    const taskId = uniqueTaskId("retention-status");
+    await insertOldEvents(taskId, 1, RETENTION.eventsMaxAgeMs + 60_000);
+    await runInDurableObject(HARNESS_ID(), async (instance) => {
+      await instance.alarm();
+    });
+    const status = await getJson<{ retention: { ts: number; pruned: Record<string, number>; backlog: boolean } | null }>(
+      "/api/status",
+    );
+    expect(status.retention).not.toBeNull();
+    expect(status.retention!.pruned).toHaveProperty("events");
+    expect(status.retention!.pruned).toHaveProperty("tasks");
+  });
+
+  // Находка ревью PR #329: имя теста обещало «backlog не паникует на первом
+  // полном тике», но тик в нём не был полным (1 строка из batchSize) и
+  // backlog не проверялся вовсе. Здесь — настоящий полный тик (ровно
+  // batchSize строк) и явный assert на backlog === false: один полный тик
+  // после отката/первого деплоя — не тревога (см. docstring retentionBacklog).
+  it("backlog остаётся false после одного полного тика — не паникуем на разовом всплеске", async () => {
+    const taskId = uniqueTaskId("retention-single-full-tick");
+    await insertOldEvents(taskId, RETENTION.batchSize, RETENTION.eventsMaxAgeMs + 60_000);
+    await runInDurableObject(HARNESS_ID(), async (instance) => {
+      await instance.alarm();
+    });
+    const status = await getJson<{ retention: { pruned: Record<string, number>; backlog: boolean } | null }>(
+      "/api/status",
+    );
+    expect(status.retention).not.toBeNull();
+    expect(status.retention!.pruned.events).toBe(RETENTION.batchSize);
+    expect(status.retention!.backlog).toBe(false);
+  });
+
+  // Находка ревью PR #329: серия из RETENTION.backlogStreakThreshold подряд
+  // ПОЛНЫХ тиков обязана дать backlog=true, даже если КАЖДЫЙ тик выполняется в
+  // НОВОМ инстансе DO (runInDurableObject создаёт и утилизирует инстанс на
+  // каждый вызов — та же модель, что и в проде: DO выгружается из памяти
+  // между тиками alarm). Докажи мутацией: верни streak в поле класса
+  // (`#retentionStreak`) вместо строки `retention_state` — тест обязан
+  // покраснеть, потому что каждый новый инстанс увидит streak=0 и никогда не
+  // накопит 4 подряд.
+  it("backlog становится true после серии полных тиков даже через пересоздание DO", async () => {
+    const taskId = uniqueTaskId("retention-backlog-streak");
+    // С запасом на любой остаточный старый мусор от предыдущих тестов файла
+    // (общее хранилище DO, см. предупреждение вверху файла): гарантированно
+    // хватает на RETENTION.backlogStreakThreshold ПОЛНЫХ тиков только из
+    // собственных данных этого теста.
+    await insertOldEvents(taskId, RETENTION.batchSize * (RETENTION.backlogStreakThreshold + 1),
+      RETENTION.eventsMaxAgeMs + 60_000);
+
+    const stub = HARNESS_ID();
+    for (let tick = 0; tick < RETENTION.backlogStreakThreshold; tick++) {
+      // Каждый вызов runInDurableObject — новый инстанс класса (утилизируется
+      // после callback'а): любое состояние в памяти объекта здесь не выжило бы.
+      await runInDurableObject(stub, async (instance) => {
+        await instance.alarm();
+      });
+    }
+    const streak = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql.exec("SELECT streak FROM retention_state WHERE id = 1").toArray()[0].streak,
+    );
+    expect(Number(streak)).toBeGreaterThanOrEqual(RETENTION.backlogStreakThreshold);
+
+    const status = await getJson<{ retention: { backlog: boolean } | null }>("/api/status");
+    expect(status.retention).not.toBeNull();
+    expect(status.retention!.backlog).toBe(true);
+  });
+});
+
 // Гвардия issue #269: пульс оркестрации не должен молчать шестнадцать часов
 // незамеченным. Ловит именно «alarm не переустановился после сбоя» — докажи
 // мутацией: перенеси `await this.ctx.storage.setAlarm(...)` в src/harness.ts#alarm()
@@ -539,6 +727,35 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     const afterEnd = await getJson<{ tasks: Record<string, number> }>("/api/status");
     expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
     expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
+  });
+
+  it("ретеншн сбрасывает кэш счётчиков так же, как dispatch/job_end (находка ревью PR #329)", async () => {
+    const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const taskId = created.task_id;
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+    // Обычный путь до done (через #applySideEffects) — кэш честно инвалидируется
+    // и пересчитывается, как в соседнем тесте выше. afterDone — реальное число.
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 1, kind: "job_start" }] });
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 2, kind: "job_end", data: { result: "ok" } }] });
+    const afterDone = await getJson<{ tasks: Record<string, number> }>("/api/status");
+
+    // Состариваем ТОЛЬКО created_ts напрямую через SQL — статус уже done через
+    // штатный путь выше, это не новый переход и инвалидации кэша не касается.
+    const oldCreatedTs = Date.now() - (RETENTION.tasksMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE tasks SET created_ts = ? WHERE id = ?", oldCreatedTs, taskId);
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const after = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    // Ретеншн физически снёс эту done-строку. Без сброса #taskCountsCache в
+    // #pruneRetention кэш остался бы на значении afterDone (лишняя done-запись
+    // на бейдже до следующего перехода) — ровно та ложь, что нашёл ревьюер.
+    expect(after.tasks.done).toBe(afterDone.tasks.done - 1);
   });
 });
 
