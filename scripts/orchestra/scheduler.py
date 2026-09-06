@@ -143,6 +143,18 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       конвенции `Related: #<старая>` (Search API, отдельный бюджет 30/мин,
       не общий core 5000/час, #454) — ловит и ручные замены (живой случай
       #431→#538), не только свои.
+  17. Немедленная починка дефектов CI (#552, дословно владелец: «мониторинг
+      ошибок, который нихуя не исправляет?»): задача, заведённая failure_watch
+      (#477, метка ci-failure), ещё без исполнителя и без blocked, получает
+      адресный workflow_dispatch worker.yml раньше расшивки конфликтов (п.2) и
+      обычного диспетча (п.4) — dispatch_defect_rework вызывается ДО wip_gate
+      (п.15) и не получает его вердикт: сломанный конвейер важнее и очереди
+      пула, и WIP-лимита целиком. Тормоз тот же, что у расшивки конфликтов:
+      один лифтайм-бюджет попыток на задачу (DEFECT_DISPATCH_MAX_ATTEMPTS,
+      pulse_guard.py) — исчерпан, задача всё ещё открыта и свободна —
+      эскалация владельцу тем же каналом (#120 + Telegram), не повторный
+      диспетч. Предохранитель конвейера (п.5) — единственный тормоз, гасящий
+      этот путь целиком.
 """
 
 import http.cookiejar
@@ -173,7 +185,11 @@ from pulse_guard import (
     CONFLICT_ESCALATION_MARKER,
     CONFLICT_REWORK_MARKER,
     CONFLICT_REWORK_MAX_ATTEMPTS,
+    DEFECT_DISPATCH_MARKER,
+    DEFECT_DISPATCH_MAX_ATTEMPTS,
+    DEFECT_ESCALATION_MARKER,
     FAILURE_CONCLUSIONS,
+    FAILURE_WATCH_LABEL,
     READY_STALL_MARKER,
     RESUME_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
@@ -738,6 +754,101 @@ def dispatch_conflict_rework(
             f"🔧 PR #{number} в конфликте — задача #{task_number} освобождена ({release_note}), "
             f"worker.yml запущен адресно на авто-ребейз (попытка {attempts + 1}/"
             f"{CONFLICT_REWORK_MAX_ATTEMPTS})"
+        )
+        dispatched = True
+    return observations, actions, dispatched
+
+
+def defect_dispatch_attempts(repo: str, issue_number: int) -> int:
+    return len(issue_marker_times(repo, issue_number, DEFECT_DISPATCH_MARKER))
+
+
+def dispatch_defect_rework(repo: str, pool: list[dict]) -> tuple[list[str], list[str], bool]:
+    """Немедленная починка провалов CI (issue #552) — тот же приём, что уже
+    даёт dispatch_conflict_rework (#474) для конфликтных PR: адресный
+    `workflow_dispatch worker.yml` на конкретную задачу, минуя и общий подбор
+    (`free_task`/приоритет), и WIP-лимит (#464) целиком. Владелец: заведённая
+    `failure_watch` (#477) задача на дефект CI ждала своей очереди в общем
+    пуле наравне со всем остальным, пока человек не чинил её вручную — это и
+    есть «мониторинг ошибок, который ничего не исправляет».
+
+    Цель — задачи из `pool` (тот же снимок этого прогона, второй обход Issues
+    не заводится) с меткой FAILURE_WATCH_LABEL, ещё БЕЗ исполнителя: как
+    только задачу берут (адресный дispatch этой же функции, ручной claim,
+    обычный dispatch_worker), она перестаёт быть целью, — обычный жизненный
+    цикл пула довозит её дальше (доводка PR, приёмка). Уже эскалированная по
+    WORKER-PLAYBOOK (`blocked`, воркер сам решил, что чинить нечего его
+    силами) не трогается — эта эскалация уже видима владельцу, вторая поверх
+    неё — тот самый шум, которого просит избежать критерий #552.
+
+    Бюджет попыток — DEFECT_DISPATCH_MAX_ATTEMPTS на ЗАДАЧУ (маркер-комментарий
+    на самой задаче, issue_marker_times — тот же приём, что
+    conflict_rework_attempts на PR): задача всё ещё открыта и свободна после
+    исчерпания бюджета — автопочинка не справилась, эскалация владельцу тем
+    же каналом (#120 + Telegram), идемпотентная по номеру задачи (маркер
+    DEFECT_ESCALATION_MARKER + номер, по образцу CONFLICT_ESCALATION_MARKER) —
+    не бесконечный повтор диспатча на прогон, который уже провалился.
+
+    Идемпотентность «один workflow_dispatch воркера за пульс» — тот же
+    приём, что dispatch_conflict_rework/dispatch_worker: worker_runs_active
+    плюс собственный `dispatched`, возвращаемый наружу, чтобы main() не звал
+    следом dispatch_conflict_rework/dispatch_worker тем же проходом."""
+    observations: list[str] = []
+    actions: list[str] = []
+    dispatched = False
+    for issue in pool:
+        labels = {label["name"] for label in issue["labels"]}
+        if FAILURE_WATCH_LABEL not in labels:
+            continue
+        if issue["assignees"]:
+            continue  # уже в работе — обычный путь пула довезёт дальше
+        if _issue_is_blocked(issue):
+            continue  # воркер уже эскалировал сам по playbook — не дублируем сигнал
+        number = issue["number"]
+        try:
+            attempts = defect_dispatch_attempts(repo, number)
+        except RuntimeError as error:
+            observations.append(f"⚠️ ci-failure #{number}: маркеры попытки не прочитаны ({error})")
+            continue
+        if attempts >= DEFECT_DISPATCH_MAX_ATTEMPTS:
+            marker = f"{DEFECT_ESCALATION_MARKER} #{number}"
+            try:
+                already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+            except RuntimeError as error:
+                observations.append(f"⚠️ ci-failure #{number}: не смог сверить маркер эскалации ({error})")
+                continue
+            if already:
+                continue  # уже эскалировано этим эпизодом — не спамим, ждём владельца
+            text = (
+                f"🚨 edge-harness: {marker}\n"
+                f"Задача #{number} (заведена failure-watch, #477) остаётся открытой и без "
+                f"исполнителя после {attempts} авто-{'попытки' if attempts == 1 else 'попыток'} "
+                f"адресного диспетча worker.yml ({DEFECT_DISPATCH_MAX_ATTEMPTS}/"
+                f"{DEFECT_DISPATCH_MAX_ATTEMPTS}) — автопочинка не справилась, нужно решение "
+                f"владельца. https://github.com/{repo}/issues/{number}"
+            )
+            escalation = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 ci-failure #{number}: автопочинка исчерпана ({attempts}/"
+                f"{DEFECT_DISPATCH_MAX_ATTEMPTS}) — эскалация владельцу ({escalation})"
+            )
+            continue
+        if dispatched or worker_runs_active(repo):
+            observations.append(f"⏸️ ci-failure #{number}: воркер занят — адресный диспетч отложен")
+            continue
+        gh(
+            "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+            "-f", "ref=main", "-f", f"inputs[task]={number}",
+        )
+        post_issue_comment(
+            repo, number,
+            f"🤖 {DEFECT_DISPATCH_MARKER} Оркестратор запустил worker.yml адресно на эту задачу "
+            f"(попытка {attempts + 1}/{DEFECT_DISPATCH_MAX_ATTEMPTS}): сломанный конвейер важнее "
+            "очереди пула (#552), WIP-лимит на этот прогон не распространяется.",
+        )
+        actions.append(
+            f"🛠️ ci-failure #{number}: worker.yml запущен адресно (попытка {attempts + 1}/"
+            f"{DEFECT_DISPATCH_MAX_ATTEMPTS}) — сломанный конвейер, не ждём очереди пула"
         )
         dispatched = True
     return observations, actions, dispatched
@@ -3436,6 +3547,22 @@ def main() -> int:
 
     # Предохранитель (#120) решает, разрешён ли диспатч воркера в этом пульсе.
     conveyor_observations, conveyor_actions, dispatch_allowed = conveyor_gate(repo, now)
+    # Немедленная починка дефектов CI (#552) — за тем же предохранителем и
+    # ПЕРЕД расшивкой конфликтов: сломанный конвейер (класс «сам worker.yml/
+    # hands.yml/orchestra.yml/deploy-*.yml падает», failure_watch выше)
+    # важнее и очереди пула, и одного застрявшего PR — тот же довод, что уже
+    # применяет dispatch_conflict_rework («класс тот же, не добавляем новых
+    # прогонов воркеру, пока конвейер уже нездоров»). `pool` — тот же снимок,
+    # что уже видели reap_stale/unhealthy_pulls (freshly заведённая
+    # failure_watch задача этим же прогоном уже в нём — она читается ПОСЛЕ
+    # failure_watch(), см. начало main()). WIP-лимит (#464) этот путь тоже
+    # не трогает — адресный прогон на конкретную задачу, не подбор новой.
+    if dispatch_allowed:
+        defect_rework_observations, defect_rework_actions, defect_rework_dispatched = (
+            dispatch_defect_rework(repo, pool)
+        )
+    else:
+        defect_rework_observations, defect_rework_actions, defect_rework_dispatched = [], [], False
     # Расшивка конфликтов (#474) — за тем же предохранителем: конвейер уже
     # нездоров (диспатч закрыт) — не добавляем новых прогонов воркеру и по
     # этому классу тоже, класс тот же («сломан сам worker.yml»), не другой.
@@ -3443,7 +3570,10 @@ def main() -> int:
     # состояния этим прогоном (#443/#456: второго обхода нет). WIP-лимит
     # (#464) расшивку НЕ трогает: адресный прогон на конкретный
     # сконфликтовавший PR — доводка существующего PR, а не новая задача.
-    if dispatch_allowed:
+    # Пропускается этим проходом, если дефект-починка уже ушла — тот же
+    # приём «ровно один workflow_dispatch воркера за пульс», что и у
+    # dispatch_worker ниже относительно conflict_rework_dispatched.
+    if dispatch_allowed and not defect_rework_dispatched:
         conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = (
             dispatch_conflict_rework(repo, pulls, pool=pool)
         )
@@ -3460,11 +3590,12 @@ def main() -> int:
     # о сломанном самом конвейере, а не о размере очереди доработки.
     wip_observations, wip_actions, wip_allowed = wip_gate(
         repo, now, pulls, pool, dispatch_allowed=dispatch_allowed)
-    # dispatch_worker пропускается этим проходом, если расшивка конфликта уже
-    # ушла: «ровно один workflow_dispatch воркера за пульс» (докстринг модуля,
-    # п.4) не должен превратиться в два только из-за гонки worker_runs_active
-    # (только что созданный прогон не обязан быть виден как queued немедленно).
-    if dispatch_allowed and not conflict_rework_dispatched:
+    # dispatch_worker пропускается этим проходом, если дефект-починка или
+    # расшивка конфликта уже ушли: «ровно один workflow_dispatch воркера за
+    # пульс» (докстринг модуля, п.4) не должен превратиться в два только из-за
+    # гонки worker_runs_active (только что созданный прогон не обязан быть
+    # виден как queued немедленно).
+    if dispatch_allowed and not defect_rework_dispatched and not conflict_rework_dispatched:
         worker_observations, worker_actions = dispatch_worker(
             repo, pool, wip_allowed=wip_allowed, pulls=pulls)
     else:
@@ -3472,13 +3603,15 @@ def main() -> int:
 
     observations = (
         lease_observations + merge_observations + ai_observations
-        + accept_observations + conveyor_observations + conflict_rework_observations
+        + accept_observations + conveyor_observations + defect_rework_observations
+        + conflict_rework_observations
         + wip_observations + worker_observations + failure_watch_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
         + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
-        + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
+        + stale_unclaimed_lines + conveyor_actions + defect_rework_actions
+        + conflict_rework_actions
         + wip_actions + worker_actions + failure_watch_actions
     )
     lines += render_action_report(observations, actions)

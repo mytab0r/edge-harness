@@ -2239,6 +2239,280 @@ def test_dispatch_conflict_rework_dispatches_only_one_pr_per_pass(monkeypatch):
     assert task_b["assignees"] != []  # вторая задача этим же проходом не тронута
 
 
+# ── Немедленная починка дефектов CI, автоматическая (#552) ──────────────────
+# failure_watch (#477) только заводит задачу с меткой ci-failure — чинит её
+# человек вручную, из общей очереди пула. dispatch_defect_rework — цикл,
+# который подхватывает такую задачу немедленно: адресный workflow_dispatch
+# worker.yml (inputs[task]), тот же приём, что уже даёт dispatch_conflict_rework
+# (#474) для конфликтных PR, минуя WIP-лимит (#464) целиком.
+
+
+def test_dispatch_defect_rework_dispatches_worker_for_open_unassigned_ci_failure_task(monkeypatch):
+    task = issue(552, assignees=(), labels=("task", "ci-failure"))
+    fake = FakeGh({
+        "issues/552/comments": [],  # ни одной авто-попытки ещё не было
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,  # 204 без тела — прод-форма успеха
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is True
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=552" in dispatch_calls[0]
+    assert posted and posted[0][0] == 552
+    assert sch.DEFECT_DISPATCH_MARKER in posted[0][1]
+    assert any("#552" in line and "worker.yml" in line for line in actions)
+    assert observations == []
+
+
+def test_dispatch_defect_rework_ignores_task_without_ci_failure_label(monkeypatch):
+    task = issue(89, assignees=(), labels=("task",))
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert actions == []
+    assert observations == []
+    assert fake.calls == []
+
+
+def test_dispatch_defect_rework_ignores_assigned_ci_failure_task(monkeypatch):
+    # Уже назначена (взял человек/worker обычным путём) — обычный жизненный
+    # цикл пула довозит её дальше, адресный дефект-диспетч не мешает и не
+    # тратит вызовов.
+    task = issue(552, assignees=("mytab0r",), labels=("task", "ci-failure"))
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert actions == []
+    assert observations == []
+    assert fake.calls == []
+
+
+def test_dispatch_defect_rework_ignores_blocked_ci_failure_task(monkeypatch):
+    # Воркер уже сам решил по WORKER-PLAYBOOK, что чинить нечего его силами
+    # (комментарий + метка blocked, без PR) — эта эскалация уже видима
+    # владельцу, дефект-диспетч не переэскалирует поверх и не диспетчит снова.
+    task = issue(552, assignees=(), labels=("task", "ci-failure", "blocked"))
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert actions == []
+    assert observations == []
+    assert fake.calls == []
+
+
+def test_dispatch_defect_rework_silent_while_worker_active(monkeypatch):
+    task = issue(552, assignees=(), labels=("task", "ci-failure"))
+    fake = FakeGh({
+        "issues/552/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run(1, "in_progress")]},
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("воркер занят — не пишем"))
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("занят" in line and "#552" in line for line in observations)
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)
+
+
+def test_dispatch_defect_rework_escalates_after_budget_exhausted(monkeypatch):
+    # Мутация: убери проверку `attempts >= DEFECT_DISPATCH_MAX_ATTEMPTS` в
+    # dispatch_defect_rework — этот тест покраснеет (ушёл бы второй dispatch
+    # worker.yml вместо эскалации; assert ниже про отсутствие dispatches это
+    # и доказывает).
+    task = issue(552, assignees=(), labels=("task", "ci-failure"))
+    fake = FakeGh({
+        "issues/552/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": f"🤖 {sch.DEFECT_DISPATCH_MARKER} попытка 1/1"},
+        ],
+        "issues/120/comments?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(
+        sch, "escalate",
+        lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий"))
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)  # второй попытки не было
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "#552" in escalated[0][2]
+    assert any("исчерпана" in line and "#552" in line for line in actions)
+
+
+def test_dispatch_defect_rework_escalation_is_idempotent(monkeypatch):
+    marker = f"{sch.DEFECT_ESCALATION_MARKER} #552"
+    task = issue(552, assignees=(), labels=("task", "ci-failure"))
+    fake = FakeGh({
+        "issues/552/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": f"🤖 {sch.DEFECT_DISPATCH_MARKER} попытка 1/1"},
+        ],
+        "issues/120/comments?per_page=100": [
+            {"created_at": "2026-09-06T11:00:00Z", "body": f"🚨 {marker} — уже сказано"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task])
+
+    assert dispatched is False
+    assert actions == []
+    assert observations == []
+
+
+def test_dispatch_defect_rework_dispatches_only_one_task_per_pass(monkeypatch):
+    # Идемпотентность внутри одного вызова: вторая ci-failure задача тем же
+    # проходом получает "воркер занят", а не второй dispatch — иначе "ровно
+    # один workflow_dispatch воркера за пульс" (докстринг модуля) нарушался
+    # бы уже внутри самой этой функции.
+    task_a = issue(552, assignees=(), labels=("task", "ci-failure"))
+    task_b = issue(553, assignees=(), labels=("task", "ci-failure"))
+    fake = FakeGh({
+        "issues/552/comments": [],
+        "issues/553/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    observations, actions, dispatched = sch.dispatch_defect_rework(REPO, [task_a, task_b])
+
+    assert dispatched is True
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=552" in dispatch_calls[0]
+    assert any("#553" in line and "занят" in line for line in observations)
+
+
+def test_main_dispatch_defect_rework_bypasses_wip_gate(monkeypatch):
+    """Проводка в main(): dispatch_defect_rework вызывается ДО wip_gate и не
+    получает его вердикт параметром — WIP-лимит (#464) структурно не может
+    закрыть адресную починку CI. Мутация: заведи зависимость от wip_allowed
+    (например `if dispatch_allowed and wip_allowed:`) — этот тест покраснеет
+    (dispatch_worker не будет вызван, хотя wip_gate закрыт)."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    task = issue(552, assignees=(), labels=("task", "ci-failure"))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [task])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(
+        sch, "dispatch_conflict_rework",
+        lambda repo, pulls, pool: pytest.fail("сломанный конвейер важнее — дефект-диспетч обязан уйти первым"))
+    monkeypatch.setattr(
+        sch, "wip_gate",
+        lambda repo, now, pulls, pool, dispatch_allowed: (
+            ["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
+    monkeypatch.setattr(
+        sch, "dispatch_worker",
+        lambda repo, pool, *, wip_allowed, pulls: pytest.fail(
+            "дефект-диспетч этим проходом уже дёрнул worker.yml — второго dispatch не должно быть"))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    fake = FakeGh({
+        "issues/552/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    reports = []
+    monkeypatch.setattr(sch, "summary", lambda lines: reports.append(lines))
+
+    code = sch.main()
+
+    assert code == 0
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=552" in dispatch_calls[0]
+    [report] = reports
+    assert any("#552" in line and "worker.yml" in line for line in report)
+
+
+def test_main_skips_conflict_rework_and_worker_dispatch_when_defect_rework_already_dispatched(monkeypatch):
+    """#552: дефект-починка и расшивка конфликтов/обычный dispatch_worker не
+    должны дать больше одного workflow_dispatch worker.yml за проход —
+    conveyor_gate открыт, но dispatch_defect_rework этим проходом уже дёрнул
+    worker.yml, поэтому и dispatch_conflict_rework, и dispatch_worker обязаны
+    промолчать."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(
+        sch, "dispatch_defect_rework",
+        lambda repo, pool: (["ci-failure починена"], ["🛠️ дефект-диспетч ушёл"], True),
+    )
+    monkeypatch.setattr(
+        sch, "dispatch_conflict_rework",
+        lambda repo, pulls, *, pool: pytest.fail("дефект-диспетч уже ушёл — конфликт-ребейз не должен звать worker.yml"))
+    dispatched = []
+    monkeypatch.setattr(
+        sch, "dispatch_worker",
+        lambda repo, pool, *, wip_allowed, pulls: dispatched.append((repo, pool)) or (["не должно быть вызвано"], []),
+    )
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+
+    assert sch.main() == 0
+    assert dispatched == []
+
+
 def test_conflict_overlap_hint_intersects_pr_and_main_changed_files(monkeypatch):
     p = pull(560, base_sha="basesha")
     fake = FakeGh({
