@@ -113,9 +113,11 @@ from pulse_guard import (
     gh,
     heartbeat_check,
     issue_marker_times,
+    merge_telegram_text,
     minutes_between,
     parse_time,
     post_issue_comment,
+    send_telegram,
 )
 # Сигнал дрейфа пина апстрима (#134): вся логика — upstream_drift.py, здесь
 # только вызов и честный сбой сверки (см. upstream_drift_lines ниже).
@@ -805,6 +807,9 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
     # оставить висеть.
     task_refs = sorted(set(task_ref.extract_task_refs(pull.get("body") or "")))
     task_numbers: list[int] = []
+    # Заголовок первой подтверждённой задачи (#170) — для Telegram «слито в main»;
+    # один PR = одно сообщение, даже если в теле несколько задач.
+    first_task: tuple[int, str] | None = None
     for task_number in task_refs:
         # Release аренды (#121): слит PR — работа принята, замок больше не нужен.
         # Идемпотентно: замка может не быть (канал без аренды) — это не ошибка.
@@ -819,6 +824,8 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
             if "task" not in {label["name"] for label in issue["labels"]}:
                 continue
             task_numbers.append(int(task_number))
+            if first_task is None:
+                first_task = (int(task_number), issue.get("title") or "")
             # Приёмка (accept_merged_tasks) видит только ДЕКЛАРИРУЮЩИЕ рефы
             # (task_ref.declares_task, первая строка тела PR) — merged_pr_map
             # строится из declared_tasks, не из extract_task_refs. Обещание
@@ -851,6 +858,21 @@ def after_merge(repo: str, pull: dict, other_pulls: list[dict] | None = None) ->
         except RuntimeError as error:
             # один кривой реф не должен ронять остальные действия after_merge
             lines.append(f"⚠️ напоминание в #{task_number} не доставлено: {error}")
+    # Telegram «задача выполнена — слито в main» (#170): мерж — единственный факт,
+    # на котором звучит «выполнена»; раньше об этом канале молчал вовсе, и владелец
+    # узнавал о готовности только руками. Один PR = одно сообщение (по первой
+    # задаче), даже если тело упоминает несколько. Best-effort, как весь канал
+    # (#120): место правды — комментарий в задаче выше, недоставленный Telegram
+    # мерж не откатывает и прогон не красит, но и не молчит — ⚠️ в отчёте.
+    if first_task is not None:
+        tg_task_number, tg_task_title = first_task
+        if send_telegram(
+            merge_telegram_text(repo, pull["number"], tg_task_number, tg_task_title),
+            as_html=True,
+        ):
+            lines.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
+        else:
+            lines.append("⚠️ Telegram: сообщение о слиянии не доставлено — след в задаче выше остаётся местом правды")
     # Архив сессий раннеров (#119) — только для ЗАДАЧ пула (метка task): номер из
     # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
     # его нельзя — утащим чужую живую сессию в архив.
