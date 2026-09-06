@@ -41,6 +41,14 @@ _TR_SPEC = importlib.util.spec_from_file_location(
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
 _TR_SPEC.loader.exec_module(task_ref)
 
+# CONTRACT_FAILED_LABEL — одно место правды (review_labels.py, тот же приём,
+# что уже применён к CONFLICT_LABEL): раньше литерал "contract:failed" был
+# задублирован здесь дважды и ещё дважды в scheduler.py.
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)
+
 SKIP_LABEL = "orchestra:skip"
 TASK_LABEL = "task"
 # Эскалация playbook (scheduler.py: BLOCKED_LABEL) — «ждёт владельца», не
@@ -129,7 +137,7 @@ def fail(messages: list[str], repo: str, pr_number: int) -> None:
     # Провал громкий на самом PR: метка + комментарий, а не только строка в логах CI.
     try:
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels",
-               "-f", "labels[]=contract:failed")
+               "-f", f"labels[]={review_labels.CONTRACT_FAILED_LABEL}")
         body = "Контракт PR ↔ задача нарушен:" + "".join(f"\n- {m}" for m in messages)
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments", "-f", f"body={body}")
     except RuntimeError as error:
@@ -239,7 +247,8 @@ def main() -> int:
         fail(problems, repo, args.pr)
     # Прошёл — снимаем метку провала, если была.
     try:
-        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/contract:failed")
+        run_gh("api", "-X", "DELETE",
+               f"repos/{repo}/issues/{args.pr}/labels/{review_labels.CONTRACT_FAILED_LABEL}")
     except Exception:
         pass
     print("contract: OK")
