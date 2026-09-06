@@ -112,6 +112,15 @@ concurrency-группой `orchestra` — два слияния никогда 
   отдельным PR (тот же исход, что и провал улики; подробности и пропуск эпиков —
   дельта-спека [`openspec/changes/acceptance-partial-pr-guard/specs/journal-tasks-hands/spec.md`](../../openspec/changes/acceptance-partial-pr-guard/specs/journal-tasks-hands/spec.md)).
   Исполнитель улику не заявляет и задачу сам не закрывает.
+- **Запрет переоткрытия (#369)**: закрытая задача не переоткрывается никогда — GitHub
+  не отклоняет reopen нативно, поэтому пульс сам находит задачу пула с
+  `state_reason == "reopened"` (поле уже в списке `open_task_issues`, без
+  дополнительного запроса) ДО стадии приёмки и закрывает её обратно с комментарием,
+  называющим действие вместо: завести новую, более узкую задачу со ссылкой на эту как
+  related. Проверяется раньше приёмки на том же пульсе — переоткрытая задача не
+  успевает снова смэтчиться со старым слитым PR (класс #363:
+  `scheduler.py::reject_reopened_tasks`, дельта-спека
+  [`openspec/changes/reopen-rejected/specs/journal-tasks-hands/spec.md`](../../openspec/changes/reopen-rejected/specs/journal-tasks-hands/spec.md)).
 
 ⚠️ Расписание на публичном репозитории GitHub отключает после 60 дней без активности
 репозитория — это задокументировано в [research/21](../research/21-github-actions.md).

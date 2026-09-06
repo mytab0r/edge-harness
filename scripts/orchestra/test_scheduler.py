@@ -319,13 +319,20 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
     }
 
 
-def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None):
+def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None,
+          state_reason=None):
     return {
         "number": number,
         "assignees": [{"login": a} for a in assignees],
         "labels": [{"name": n} for n in labels],
         "title": title,
         "sub_issues_summary": sub_issues_summary or {"total": 0, "completed": 0},
+        # Прод-форма (#369): Issues API отдаёт state_reason уже в list-ответе
+        # (open_task_issues); "reopened" — реальное значение для issue, чьё
+        # текущее открытое состояние достигнуто событием reopened (замер
+        # живых #111/#114/#115/#158, 2026-09-06). None — обычная (не
+        # переоткрытая) задача, дефолт большинства существующих тестов.
+        "state_reason": state_reason,
     }
 
 
@@ -1818,6 +1825,164 @@ def test_merged_pr_map_keeps_most_recent_merge_for_same_task():
     newer = merged_pull(2, "#5\n\nновая работа поверх старой", "sha2", "2026-02-01T00:00:00Z")
     mapping = sch.merged_pr_map([older, newer])
     assert mapping[5]["number"] == 2
+
+
+# ── Запрет переоткрытия (#369): закрытая задача не переоткрывается никогда ──────
+
+
+def test_reject_reopened_tasks_ignores_normal_open_issue(monkeypatch):
+    """Обычная (не переоткрытая) задача — state_reason=None в прод-форме
+    Issues API. Функция обязана не сделать НИ ОДНОГО вызова gh — дорогая
+    проверка на КАЖДОМ пульсе была бы штрафом за задачи, которые никто не
+    трогал."""
+    fake = FakeGh({})  # ни один маршрут не должен понадобиться
+    patch_gh(monkeypatch, fake)
+    pool = [issue(111, state_reason=None), issue(114, state_reason="completed")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_reject_reopened_tasks_closes_back_with_actionable_comment(monkeypatch):
+    """Прод-форма живого случая (#111, 2026-09-06): issue закрыта, потом
+    переоткрыта человеком, назначения нет. Ветка обязана закрыть её обратно
+    и оставить комментарий с ГОТОВЫМ действием (не просто «нельзя»)."""
+    fake = FakeGh({
+        "issues/111/comments": None,
+        "issues/111 -f state=closed": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    released = []
+    monkeypatch.setattr(sch.claim_task, "release",
+                         lambda repo, n: released.append(n) or f"замок task-{n} снят")
+
+    pool = [issue(111, assignees=(), state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+
+    assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/111") for call in fake.calls)
+    assert posted and posted[0][0] == 111
+    assert sch.REOPEN_REJECTED_MARKER in posted[0][1]
+    assert "новой" in posted[0][1].lower() and "related" in posted[0][1]
+    assert any("111" in line and "закрыта обратно" in line for line in lines)
+    # ни assignee, ни lock трогать не за что — их не было (release этой
+    # веткой вызывается безусловно — замокан, чтобы не бить прод-API, #380 находка 1)
+    assert not any("assignees" in call for call in fake.calls)
+    assert released == [111]
+
+
+def test_reject_reopened_tasks_releases_assignee_and_lock(monkeypatch):
+    """Реопен мог вернуть issue назначение (человек/агент назначил себя после
+    переоткрытия, #114 из живого случая) — ветка обязана снять и его, и
+    замок аренды (#121), не только закрыть issue."""
+    fake = FakeGh({
+        "issues/114/comments": None,
+        "issues/114 -f state=closed": None,
+        "-X DELETE repos/mytab0r/edge-harness/issues/114/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    released = []
+    monkeypatch.setattr(sch.claim_task, "release",
+                         lambda repo, n: released.append(n) or f"замок task-{n} снят")
+
+    pool = [issue(114, assignees=("mytab0r",), state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+
+    assert any("DELETE" in call and "114/assignees" in call for call in fake.calls)
+    assert released == [114]
+    assert any("замок task-114 снят" in line for line in lines)
+
+
+def test_reject_reopened_tasks_never_closes_watchdog_issue(monkeypatch):
+    """WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача из пула;
+    даже если он окажется reopened (в теории — он не заводился шаблоном
+    задачи), автоматика не имеет права его закрыть — тот же приём, что уже
+    защищает WATCHDOG_ISSUE в accept_merged_tasks."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    pool = [issue(sch.WATCHDOG_ISSUE, state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_reject_reopened_tasks_reports_soft_failure_without_crashing(monkeypatch):
+    """Сетевой/API сбой на комментарии или PATCH не должен ронять обход
+    остальных задач пула — тот же принцип, что и у accept_merged_tasks."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(
+        monkeypatch, lambda *a: (_ for _ in ()).throw(RuntimeError("HTTP 500")))
+    pool = [issue(111, state_reason="reopened"), issue(114, state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+    assert len([line for line in lines if "не отклонено" in line]) == 2
+
+
+def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
+    """Интеграционный тест на прод-сценарий #363/#369: переоткрытая задача с
+    ВСЁ ЕЩЁ валидным старым merged-PR обязана быть закрыта запретом
+    переоткрытия ДО того, как accept_merged_tasks её увидит — иначе она
+    снова смэтчится по декларации первой строки и «переоткрытие» будет
+    отменено приёмкой за один пульс (живой случай #131/PR #132, трижды).
+    Мутация: закомментировать пересчёт `pool = open_task_issues(repo)`
+    после reject_reopened_tasks — accept_merged_tasks получит СТАРЫЙ снимок
+    с ещё открытой (на самом деле уже закрытой) issue и увидит её снова."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None: [])
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: [])
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    # unhealthy_pulls (реальная реализация) сама опрашивает open_task_issues —
+    # без мока она бы съела первый ответ фейка ДО того, как до него дойдёт
+    # reject_reopened_tasks/accept_merged_tasks (найдено этим же тестом при
+    # написании: непатченный unhealthy_pulls тихо потреблял первый снимок пула).
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], False))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool: [])
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сбоя тут нет"))
+    # Единственный сырой gh-вызов этого сценария — PATCH закрытия отклонённого
+    # переоткрытия (post_issue_comment/claim_task.release уже замоканы выше).
+    patch_gh(monkeypatch, FakeGh({"issues/131 -f state=closed": None}))
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    reopened_issue = issue(131, assignees=(), state_reason="reopened")
+    # Прод-форма: open_task_issues — реальная функция репозитория, вызывается
+    # дважды за прогон (первый снимок пула + пересчёт после отклонённого
+    # переоткрытия): первый ответ — переоткрытая задача ещё открыта, второй
+    # (после reject_reopened_tasks её закрыл) — пуста.
+    calls_n = [0]
+
+    def _fake_open_task_issues(repo):
+        calls_n[0] += 1
+        return [reopened_issue] if calls_n[0] == 1 else []
+
+    monkeypatch.setattr(sch, "open_task_issues", _fake_open_task_issues)
+
+    accept_calls = []
+
+    def fake_accept(repo, pool, merged, now=None, *, open_pulls_list=None):
+        accept_calls.append([i["number"] for i in pool])
+        return [], False
+
+    monkeypatch.setattr(sch, "accept_merged_tasks", fake_accept)
+
+    code = sch.main()
+
+    assert code == 0
+    # accept_merged_tasks обязан увидеть ПЕРЕСЧИТАННЫЙ пул — без #131,
+    # закрытой запретом переоткрытия этим же прогоном.
+    assert accept_calls == [[]]
+    assert calls_n[0] == 2
 
 
 class _FakeHealthResponse:
