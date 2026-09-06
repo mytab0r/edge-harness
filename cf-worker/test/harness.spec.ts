@@ -452,6 +452,41 @@ describe("ретеншн DO SQLite (#306/#305)", () => {
     expect(queuedRes.task.status).toBe("queued");
   });
 
+  it("задача failed старше порога уходит; dispatched/running того же возраста — нет (находка ревью PR #329)", async () => {
+    const failedTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const dispatchedTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const runningTask = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const stub = HARNESS_ID();
+    const oldCreatedTs = Date.now() - (RETENTION.tasksMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'failed', created_ts = ? WHERE id = ?", oldCreatedTs, failedTask.task_id,
+      );
+      // dispatched/running остаются активными статусами — ретеншн обязан не
+      // трогать их независимо от возраста, только queued/dispatched/running
+      // проверялись раньше только через queued.
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'dispatched', created_ts = ? WHERE id = ?", oldCreatedTs, dispatchedTask.task_id,
+      );
+      state.storage.sql.exec(
+        "UPDATE tasks SET status = 'running', created_ts = ? WHERE id = ?", oldCreatedTs, runningTask.task_id,
+      );
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const failedRes = await WORKER.fetch(`https://example.com/api/tasks/${failedTask.task_id}`, { headers: AUTH });
+    expect(failedRes.status).toBe(404);
+    const dispatchedRes = await getJson<{ task: { id: string; status: string } }>(
+      `/api/tasks/${dispatchedTask.task_id}`,
+    );
+    expect(dispatchedRes.task.status).toBe("dispatched");
+    const runningRes = await getJson<{ task: { id: string; status: string } }>(`/api/tasks/${runningTask.task_id}`);
+    expect(runningRes.task.status).toBe("running");
+  });
+
   it("/api/status.retention виден после тика — pruned по таблицам", async () => {
     const taskId = uniqueTaskId("retention-status");
     await insertOldEvents(taskId, 1, RETENTION.eventsMaxAgeMs + 60_000);
