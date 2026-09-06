@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Предохранитель конвейера и «кто следит за следящим» (#120).
 
-Два механизма, живущие рядом, потому что у них один канал оповещения и один
+Три механизма, живущие рядом, потому что у них один канал оповещения и один
 носитель решения — отчёт оркестратора + Telegram + след в задаче #120:
 
 1. Предохранитель конвейера: перед dispatch воркера считаются подряд идущие
@@ -17,6 +17,17 @@
    пропадали, и этот, опоздавший, запуск кричит в Telegram, пока жив.
    Полный охват (scheduler не запустился вовсе) даёт только внешний монитор —
    не подтверждено, отложено; GitHub нативно шлёт failure-письма владельцу.
+3. Гвардия непрочитанных провалов (#477): владелец — «кто-то мониторит
+   ошибки?» — красный прогон worker.yml/hands.yml/orchestra.yml/deploy-*.yml
+   был строкой в Actions без разбора. failure_watch дешёвым запросом
+   (`status=failure`, маленький per_page) находит свежий провал каждого из
+   WATCHED_WORKFLOWS, достаёт последнюю строку `##[error]` из лога упавшего
+   job'а (факт, не гипотеза — правило AGENTS.md) и классифицирует причину:
+   'infra' (известная сигнатура лимита/сети — лечится ожиданием, один тихий
+   след в #120 на класс) или 'defect' (наш дефект — заводит задачу в пул,
+   тоже одну на класс). Дедуп — по отпечатку КЛАССА причины (workflow + job +
+   нормализованная строка ошибки), не по run id: повторяющийся баг не должен
+   плодить второй сигнал на каждый новый прогон.
 
 Единственный канал решения — отчёт + задача #120 + Telegram; «метки-статуса на
 workflow» у GitHub нет, а commit-статусы живут на sha и умирают на squash-мерже.
@@ -30,9 +41,11 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import hashlib
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -143,6 +156,60 @@ CONFLICT_REWORK_MARKER = "[conflict: авто-ребейз]"
 # бы навсегда все PR, кроме первого просигналившего.
 CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
 
+# ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
+# worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
+# сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
+# а failure_watch — на другой вопрос («кто-нибудь разберёт ПРИЧИНУ и заведёт
+# задачу на дефект»); это разные обязанности одного и того же провала.
+WATCHED_WORKFLOWS = (
+    "worker.yml", "hands.yml", "orchestra.yml",
+    "deploy-worker.yml", "deploy-dsh-edge.yml",
+)
+
+# Метка авто-заведённых задач по дефектам CI — рядом с обязательной `task`
+# (пул), чтобы дедуп искал ТОЛЬКО среди них, не среди всего пула.
+FAILURE_WATCH_LABEL = "ci-failure"
+
+# Известные сигнатуры ИНФРАСТРУКТУРНЫХ (не наших) причин — лимиты провайдера/
+# GitHub, сеть; лечится ожиданием, не диффом. Список закрытый и консервативный
+# НАРОЧНО (см. classify_failure_cause): нераспознанное считается дефектом, а
+# не тихо прощается как инфраструктура — fail loud по умолчанию.
+INFRA_ERROR_SIGNATURES = (
+    "rate_limit:",
+    "rate limit reached",
+    "secondary rate limit",
+    "abuse-rate-limit",
+    "quota_exhausted",
+    "rate_limit_retry_budget_exceeded",
+    "dial tcp",
+    "could not resolve host",
+    "connection reset",
+    "connection timed out",
+    "i/o timeout",
+    "etimedout",
+    "econnreset",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway",
+    "temporarily unavailable",
+)
+
+# Сигнатуры устаревшей базы: свой отдельный класс, не инфраструктура (не
+# лечится ожиданием) и не «наш дефект кода» — газ уже назван в другом месте
+# (issue #474, авто-ребейз конфликтных PR; task-branch/pre-commit сами
+# отказывают на протухшей базе и просят git rebase origin/main). failure_watch
+# узнаёт этот класс, чтобы НЕ дублировать задачу поверх уже объявленного газа —
+# наблюдение без задачи и без сигнала в #120 (не спамить тем, что уже лечится).
+STALE_BASE_SIGNATURES = (
+    "main уехал вперёд",
+    "protected branch",
+    "non-fast-forward",
+    "failed to push some refs",
+    "checks awaiting conflict resolution",
+)
+
+FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
@@ -187,6 +254,36 @@ def count_consecutive_failures(conclusions: list) -> int:
 def decide_dispatch(failures: int, pause_after: int = WORKER_FAILURE_PAUSE_AFTER) -> bool:
     """True — диспатч воркера разрешён; False — конвейер на паузе."""
     return failures < pause_after
+
+
+# ── Чистые решения: классификация причины провала (#477) ────────────────────────
+
+
+def classify_failure_cause(text: str) -> str:
+    """'stale_base' — устаревшая база (газ уже назван в #474/task-branch, не
+    дублируем задачу); 'infra' — известная сигнатура лимита/сети, лечится
+    ожиданием; 'defect' — всё остальное, В ТОМ ЧИСЛЕ нераспознанное (fail
+    loud по умолчанию: не прощаем молча то, чего не понимаем)."""
+    lowered = (text or "").lower()
+    for signature in STALE_BASE_SIGNATURES:
+        if signature in lowered:
+            return "stale_base"
+    for signature in INFRA_ERROR_SIGNATURES:
+        if signature in lowered:
+            return "infra"
+    return "defect"
+
+
+def failure_fingerprint(workflow: str, job_name: str, error_text: str) -> str:
+    """Отпечаток КЛАССА провала — workflow + упавший job + нормализованная
+    строка ошибки (без hex/id, схлопнутые пробелы, обрезка). НЕ run id:
+    одинаковый баг на разных прогонах обязан схлопнуться в одну запись —
+    правило «один сигнал на класс», не на каждый прогон."""
+    normalized = re.sub(r"\b[0-9a-f]{6,}\b", "", (error_text or "").lower())
+    normalized = re.sub(r"\d+", "N", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()[:160]
+    raw = f"{workflow}|{job_name}|{normalized}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
 # ── Полуоткрытое состояние (#205): проба после выдержки ──────────────────────────
@@ -504,6 +601,18 @@ def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None 
     return payload.get("workflow_runs", [])
 
 
+def failing_jobs(repo: str, run: dict) -> list[dict]:
+    """Job'ы прогона с неуспешным conclusion — общий источник для
+    last_failure_error и failure_watch (одна выборка, не вторая копия
+    запроса). Пустой список и при отсутствии упавших job'ов, и при сбое
+    самого запроса (best-effort, вызывающий решает, что это значит)."""
+    try:
+        payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+    except RuntimeError:
+        return []
+    return [job for job in payload.get("jobs", []) if job.get("conclusion") in FAILURE_CONCLUSIONS]
+
+
 def last_failure_error(repo: str, run: dict) -> str:
     """Человекочитаемая причина последнего красного прогона: упавшие job'ы и шаги.
     Best-effort: недоступность деталей не мешает факту паузы, но и не теряется —
@@ -524,6 +633,31 @@ def last_failure_error(repo: str, run: dict) -> str:
     if not bad:
         return f"упавшие job'ы не найдены (conclusion прогона: {run.get('conclusion')})"
     return "; ".join(bad)
+
+
+def last_error_log_line(repo: str, job_id: int) -> str | None:
+    """Последняя строка `##[error]` из лога упавшего job'а — конкретный факт,
+    не гипотеза (правило AGENTS.md, PR #475): не заставляет человека открывать
+    Actions, чтобы увидеть, что именно сломалось. Best-effort: недоступность
+    лога (квота/права/раннер убит до записи) не роняет классификацию — просто
+    нет строки, вызывающий откатывается на имена упавших шагов."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}/logs"],
+            capture_output=True, text=True,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except OSError as error:
+        print(f"::warning::лог job {job_id} не прочитан: {error}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        return None
+    marker = "##[error]"
+    for line in reversed(result.stdout.splitlines()):
+        idx = line.find(marker)
+        if idx != -1:
+            return line[idx:].strip()
+    return None
 
 
 def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
@@ -896,3 +1030,169 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
             False)
+
+
+def open_ci_failure_fingerprints(repo: str) -> set[str]:
+    """Отпечатки, уже заведённые задачами с меткой FAILURE_WATCH_LABEL —
+    дедуп «дефект этого класса уже в пуле» без второго обхода Issues.
+
+    Листает страницы сама (класс #308, тот же приём, что all_issue_comments
+    выше): список НЕ ограничен по природе — долгоживущие незакрытые дефекты
+    CI со временем накопятся так же, как обычный пул задач, а сырая первая
+    страница молча потеряла бы хвост — та же ошибка дедупа, что и без него,
+    просто отложенная во времени."""
+    page = 1
+    found: set[str] = set()
+    marker = "<!-- failure-fingerprint: "
+    while True:
+        chunk = gh(
+            f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}"
+            f"&per_page=100&page={page}"
+        ) or []
+        if not isinstance(chunk, list) or not chunk:
+            break
+        for issue in chunk:
+            body = issue.get("body") or ""
+            idx = body.find(marker)
+            if idx == -1:
+                continue
+            rest = body[idx + len(marker):]
+            found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
+        if len(chunk) < 100:
+            break
+        page += 1
+    return found
+
+
+def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str) -> str:
+    """Тело авто-заведённой задачи — тот же формат, что шаблон «📋 Задача в
+    пул» (Цель/Критерий/Площадь), плюс отпечаток класса HTML-комментарием:
+    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу."""
+    return (
+        f"## Цель\n"
+        f"`{workflow}` (job «{job_name}») перестаёт падать этой причиной.\n\n"
+        f"## Критерий готовности\n"
+        f"Следующий прогон `{workflow}` на этом коде зелёный, либо причина "
+        "документированно устранена в другом месте (тогда — закрыть со ссылкой).\n\n"
+        f"## Площадь\n"
+        "area:orchestra\n\n"
+        f"## Контекст и ссылки\n"
+        f"Живой прогон: {run_url}\n"
+        f"Факт: {fact}\n\n"
+        f"<!-- failure-fingerprint: {fingerprint} -->\n"
+    )
+
+
+def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
+    """Провалы ключевых workflow (#477): дешёвый опрос `status=failure` (малый
+    `per_page`, без выгрузки логов всех прогонов подряд — квота API дорога,
+    см. rate_guard.py) по каждому WATCHED_WORKFLOWS. Для самого свежего
+    провала — последняя строка `##[error]` из лога упавшего job'а (факт, не
+    гипотеза), классификация (classify_failure_cause) и дедуп по
+    failure_fingerprint (класс причины, НЕ run id — один сигнал на класс):
+
+    'stale_base' — газ уже назван в другом месте (#474, task-branch/pre-commit
+                   сами просят git rebase) — только наблюдение, без задачи и
+                   без следа в #120 (не дублировать уже объявленный газ);
+    'infra'      — известная сигнатура лимита/сети — лечится ожиданием: один
+                   тихий след в #120 на класс (issue_marker_times — тот же
+                   приём, что у остальных маркеров серий), Telegram не шлём —
+                   это не тревога, требующая действия человека;
+    'defect'     — наш дефект: задача в пул (label task + FAILURE_WATCH_LABEL)
+                   с конкретным фактом, если такого класса ещё нет среди
+                   открытых issues с меткой FAILURE_WATCH_LABEL."""
+    observations: list[str] = []
+    actions: list[str] = []
+    ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
+
+    for workflow in WATCHED_WORKFLOWS:
+        try:
+            payload = gh(
+                f"repos/{repo}/actions/workflows/{workflow}/runs?status=failure&per_page=3"
+            ) or {}
+        except RuntimeError as error:
+            observations.append(f"⚠️ failure-watch {workflow}: список провалов не прочитан ({error})")
+            continue
+        runs = payload.get("workflow_runs", [])
+        if not runs:
+            continue
+        run_item = runs[0]  # самый свежий провал этого workflow
+        bad_jobs = failing_jobs(repo, run_item)
+        if not bad_jobs:
+            observations.append(
+                f"⚠️ failure-watch {workflow}: прогон {run_item.get('html_url')} красный, "
+                "упавший job не найден (детали недоступны)")
+            continue
+        job = bad_jobs[0]
+        error_line = last_error_log_line(repo, job["id"])
+        step_names = ", ".join(
+            step["name"] for step in job.get("steps", [])
+            if step.get("conclusion") in FAILURE_CONCLUSIONS
+        ) or "нет (упал до шагов)"
+        fact = error_line or f"шаги: {step_names}"
+        job_name = job.get("name", "?")
+        cause = classify_failure_cause(f"{error_line or ''} {step_names}")
+        fingerprint = failure_fingerprint(workflow, job_name, fact)
+
+        if cause == "stale_base":
+            observations.append(
+                f"⏭️ failure-watch {workflow}: устаревшая база (класс {fingerprint}) — "
+                "газ уже назван в #474/task-branch (git rebase), задачу не дублируем")
+            continue
+
+        if cause == "infra":
+            marker = f"{FAILURE_WATCH_INFRA_MARKER} {fingerprint}]"
+            try:
+                already = bool(issue_marker_times(repo, WATCHDOG_ISSUE, marker))
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ failure-watch {workflow}: маркеры #{WATCHDOG_ISSUE} не прочитаны ({error})")
+                continue
+            if already:
+                observations.append(
+                    f"🕓 failure-watch {workflow}: инфраструктурная причина, класс {fingerprint} "
+                    "(уже сигналили) — молча ждём")
+                continue
+            text = (
+                f"🕓 edge-harness: {marker}\n"
+                f"{workflow} (job «{job_name}») падает по инфраструктурной причине, "
+                "не наш дефект — лечится ожиданием, задача в пул не заводится.\n"
+                f"Факт: {fact}\n"
+                f"{run_item.get('html_url', '')}"
+            )
+            try:
+                post_issue_comment(repo, WATCHDOG_ISSUE, text)
+            except RuntimeError as error:
+                print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
+            observations.append(
+                f"🕓 failure-watch {workflow}: инфраструктурная причина, класс {fingerprint} "
+                f"— след в #{WATCHDOG_ISSUE} оставлен, диспатч не трогаем")
+            continue
+
+        # cause == "defect": заводим задачу, если класса ещё нет в пуле.
+        if ci_fingerprints is None:
+            try:
+                ci_fingerprints = open_ci_failure_fingerprints(repo)
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ failure-watch {workflow}: список задач {FAILURE_WATCH_LABEL} не прочитан ({error})")
+                continue
+        if fingerprint in ci_fingerprints:
+            observations.append(
+                f"🔁 failure-watch {workflow}: дефект класса {fingerprint} уже в пуле — не дублируем")
+            continue
+        title = f"CI: {workflow} падает — {job_name}"
+        body = failure_watch_task_body(workflow, job_name, fact, run_item.get("html_url", ""), fingerprint)
+        try:
+            gh("-X", "POST", f"repos/{repo}/issues",
+               "-f", "title=" + title, "-f", "body=" + body,
+               "-f", "labels[]=task", "-f", "labels[]=" + FAILURE_WATCH_LABEL)
+        except RuntimeError as error:
+            observations.append(f"⚠️ failure-watch {workflow}: задача по дефекту не заведена ({error})")
+            continue
+        ci_fingerprints.add(fingerprint)
+        actions.append(
+            f"🛠️ failure-watch {workflow}: заведена задача по дефекту "
+            f"(job «{job_name}», класс {fingerprint}) — {fact}")
+
+    return observations, actions

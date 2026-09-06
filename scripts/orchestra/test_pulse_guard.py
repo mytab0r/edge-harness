@@ -1027,3 +1027,165 @@ def test_resume_alert_text_carries_marker_evidence():
     assert "#205" in text                        # задача последнего красного прогона
     assert "без ожидания пробы" in text          # путь возобновления назван
     assert pg.PAUSE_MARKER not in text           # маркер серии — не сброс: их нельзя смешивать
+
+
+# ── Гвардия непрочитанных провалов ключевых workflow (#477) ─────────────────────
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("dsh: RATE_LIMIT: Rate limit reached for requests", "infra"),
+    ("dial tcp: lookup api.github.com: no such host", "infra"),
+    ("gh: 502 Bad Gateway", "infra"),
+    ("ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.", "stale_base"),
+    ("! [remote rejected] agent/1-x -> agent/1-x (protected branch hook declined)", "stale_base"),
+    ("scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory", "defect"),
+    ("AssertionError: expected 3 got 2", "defect"),
+    ("что угодно нераспознанное", "defect"),  # fail loud: непонятное — дефект, не прощаем молча
+])
+def test_classify_failure_cause(text, expected):
+    assert pg.classify_failure_cause(text) == expected
+
+
+def test_failure_fingerprint_stable_across_run_specific_noise():
+    # Один и тот же баг на РАЗНЫХ прогонах (разные run id/номера строк/hex) —
+    # обязан схлопнуться в один отпечаток: иначе «не спамить» не работает.
+    a = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    b = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 402: .../infra_digest.sh: No such file or directory")
+    assert a == b
+
+
+def test_failure_fingerprint_distinguishes_workflow_and_job():
+    base = pg.failure_fingerprint("worker.yml", "task", "No such file or directory")
+    other_workflow = pg.failure_fingerprint("hands.yml", "task", "No such file or directory")
+    other_job = pg.failure_fingerprint("worker.yml", "dsh-task", "No such file or directory")
+    other_text = pg.failure_fingerprint("worker.yml", "task", "AssertionError: boom")
+    assert len({base, other_workflow, other_job, other_text}) == 4
+
+
+FAILURE_WATCH_QUIET_ROUTES = {
+    f"workflows/{wf}/runs?status=failure": {"workflow_runs": []}
+    for wf in pg.WATCHED_WORKFLOWS
+}
+
+
+def _stdout_with_error(line: str):
+    return SimpleNamespace(returncode=0, stdout=f"2026-09-06T10:18:00.0000000Z {line}\n")
+
+
+def test_failure_watch_quiet_when_no_failed_runs(monkeypatch):
+    fake = FakeGh(dict(FAILURE_WATCH_QUIET_ROUTES))
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert observations == [] and actions == []
+
+
+def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=failure"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []  # пока пусто — класса ещё нет
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1
+    joined = " ".join(created[0])
+    assert "labels[]=task" in joined and "labels[]=ci-failure" in joined
+    assert "infra_digest.sh" in joined
+    assert any("заведена задача" in line for line in actions)
+
+    # второй пульс: тот же класс уже в открытых issues (метка ci-failure) —
+    # не заводим вторую задачу на тот же баг.
+    fp = pg.failure_fingerprint("worker.yml", "task",
+                                 "##[error]scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"body": f"...<!-- failure-fingerprint: {fp} -->\n"},
+    ]
+    observations2, actions2 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions2 == []
+    assert any("не дублируем" in line for line in observations2)
+    assert len(created) == 1  # вторая задача не заведена
+
+
+def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/hands.yml/runs?status=failure"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 7),
+    ]}
+    routes["runs/7/jobs"] = {"jobs": [
+        {"id": 1, "name": "dsh-task", "conclusion": "failure", "steps": [
+            {"name": "Прогон задачи через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues/120/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]dsh: RATE_LIMIT: Rate limit reached for requests")))
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(posted) == 1
+    assert pg.FAILURE_WATCH_INFRA_MARKER in posted[0]
+    assert actions == []  # инфраструктура — наблюдение, не действие пула
+
+    # второй пульс: маркер уже стоит — молчим, не спамим
+    fp = pg.failure_fingerprint("hands.yml", "dsh-task", "##[error]dsh: RATE_LIMIT: Rate limit reached for requests")
+    routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:55:00Z",
+         "body": f"...{pg.FAILURE_WATCH_INFRA_MARKER} {fp}]..."},
+    ]
+    posted.clear()
+    observations2, _ = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert posted == []
+    assert any("уже сигналили" in line for line in observations2)
+
+
+def test_failure_watch_stale_base_neither_files_task_nor_signals(monkeypatch):
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=failure"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 8),
+    ]}
+    routes["runs/8/jobs"] = {"jobs": [
+        {"id": 2, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Ветка: новая от свежего origin/main", "conclusion": "failure"},
+        ]},
+    ]}
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "##[error]ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать — газ уже назван в #474"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions == []
+    assert any("устаревшая база" in line for line in observations)
+    assert any("#474" in line for line in observations)

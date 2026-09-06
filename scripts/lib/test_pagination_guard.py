@@ -62,6 +62,14 @@ ALLOWED_SINGLE_PAGE_CALLS = {
     ("scripts/orchestra/pulse_guard.py", "last_failure_error"):
         "job'ы ОДНОГО прогона workflow — фиксированное малое число шагов "
         "конвейера (repo-ci.yml — не растущий пользователем список).",
+    ("scripts/orchestra/pulse_guard.py", "failing_jobs"):
+        "тот же контракт, что last_failure_error выше (общий источник для неё "
+        "и failure_watch, #477) — job'ы ОДНОГО прогона workflow, фиксированное "
+        "малое число, не растущий список.",
+    ("scripts/orchestra/pulse_guard.py", "failure_watch"):
+        "явный `per_page=3` — запрошены последние N провалов ОДНОГО workflow "
+        "(#477), тот же контракт «дай N последних», что у recent_runs выше: "
+        "функция смотрит только на самый свежий (runs[0]), не листает список.",
     ("scripts/orchestra/upstream_drift.py", "upstream_drift_check"):
         "гвардия усечения уже в теле функции (#134): `if len(tags) >= 100: "
         "raise RuntimeError(...)` — полная страница кричит громко вместо "
