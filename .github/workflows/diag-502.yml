@@ -1,8 +1,4 @@
 name: diag-502
-# Временный диагностический workflow (issue #502): прогоняет dsh-edge/e2e-smoke
-# на реальном проде под системным Chrome раннера, чтобы доказать рабочесть
-# смоука перед тем, как звать его частью deploy-dsh-edge.yml. Удаляется вместе
-# с PR, закрывающим #502.
 on:
   push:
     branches: [agent/502-dsh-edge-e2e-smoke]
@@ -20,7 +16,20 @@ jobs:
         working-directory: dsh-edge/e2e-smoke
         run: npm install --no-audit --no-fund
 
-      - name: Прогон e2e-смоука на живом проде
+      - name: Мутационная проверка — заведомо неверный ключ доступа (смоук обязан покраснеть)
+        working-directory: dsh-edge/e2e-smoke
+        env:
+          DSH_EDGE_ACCESS_KEY: definitely-wrong-key-for-mutation-test-0000
+          BASE_URL: https://dsh-edge.mytab0r.workers.dev
+        run: |
+          if node smoke.mjs; then
+            echo "::error::смоук ДОЛЖЕН был покраснеть на неверном ключе — мутационная проверка провалена"
+            exit 1
+          else
+            echo "✅ мутационная проверка: смоук корректно красный на неверном ключе доступа"
+          fi
+
+      - name: Прогон e2e-смоука на живом проде (контроль — обязан быть зелёным)
         working-directory: dsh-edge/e2e-smoke
         env:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
