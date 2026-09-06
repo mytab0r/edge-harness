@@ -1,0 +1,8 @@
+diff --git a/dsh-edge/plugins.json b/dsh-edge/plugins.json
+deleted file mode 100644
+index 05e7230..0000000
+--- a/dsh-edge/plugins.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{"version":1,"plugins":[{"id":"hello","package":"@edge-harness/dsh-plugin-hello","source":{"release":"plugins-hello-v0.1.1","asset":"hello-world-0.1.1.tgz","sha256":"f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"},"server":true,"client":true},{"id":"runner-bridge","package":"@edge-harness/dsh-plugin-runner-bridge","source":{"release":"plugins-runner-v0.1.1","asset":"runner-bridge-0.1.1.tgz","sha256":"8ed9b451ffa731f1427f3425e818325dc198425d7197d003bc26d4c092b01733"},"server":true,"client":false},{"id":"plugin-manager","package":"@edge-harness/dsh-plugin-manager","source":{"release":"plugins-manager-v0.1.4","asset":"plugin-manager-0.1.4.tgz","sha256":"d8bf771ebcd52cbd483d234f35afce3f8eeeae4a2502c2e6489eda4a11a523e2"},"server":false,"client":true},{"id":"integrations","package":"@edge-harness/dsh-plugin-integrations","source":{"release":"plugins-integrations-v0.1.1","asset":"integrations-0.1.1.tgz","sha256":"700e0ee9822b5e635278c113cd520f8282c6b1039e83590bc0292977711df605"},"server":true,"client":true}]}
+\ No newline at end of file

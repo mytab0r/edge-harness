@@ -15,7 +15,15 @@
      после вердикта ai:ok на том же head AI-ревью само ставит review:large-ok
      (scripts/review/ai_review.py::cmd_verdict). Диффы длиннее LARGE_DIFF_HUGE_LINES
      автоматика не подтверждает вовсе — эскалирует владельцу.
-  4. Каждый запуск проверяет вердикт второго гейта (AI-ревью, #18) против
+  4. Гвардия молчаливого отката main (#217): дифф, удаляющий запись
+      прод-манифеста (PROD_MANIFESTS) или файл патч-серии (PATCHES_DIR),
+      даёт находку — откат уже приобретённого main не может проехать как
+      «отсутствие адаптации». Газ — метка revert-ok осознанно исполнителем
+      ПЛЮС объяснение в теле PR (обе части проверяет revert_ok_gas).
+      Класс пойман на PR #164: 17 merge-коммитов main→ветка, разрешённых
+      в пользу устаревшей стороны, выносили из plugins.json два работающих
+      плагина при стоящем review:ok.
+   5. Каждый запуск проверяет вердикт второго гейта (AI-ревью, #18) против
      ТЕКУЩЕГО диффа PR (#252): дифф относительно base не изменился с момента
      последнего вердикта (отпечаток совпал — review_labels.diff_fingerprint,
      сохранён в поле `diff:` шапки комментария ai_review.build_comment) —
@@ -67,6 +75,32 @@ REVIEW_OK = review_labels.REVIEW_OK
 REVIEW_CHANGES = review_labels.REVIEW_CHANGES
 REVIEW_LARGE = review_labels.REVIEW_LARGE
 LARGE_OK = review_labels.LARGE_OK
+REVERT_OK = review_labels.REVERT_OK
+
+# ── Гвардия молчаливого отката main (#217) ───────────────────────────────────
+#
+# Прод-манифесты — ЕДИНСТВЕННОЕ место правды списка. Это файлы, записи которых
+# есть работающее прод-состояние, а не просто код: plugins.json — состав
+# установленных плагинов морды (проверяется verify-edge-plugins и деплоем),
+# integrations.json — реестр инструментов агента (вшивается в бандл
+# integrations, их отсутствие = молча пропавший инструмент). В список НЕ
+# входят: plugins-catalog.json — каталог того, что можно ЗАКАЗАТЬ (#113),
+# его запись не работает в проде, а заказ виден в морде; upstream.json —
+# пин апстрима, его откат громко ловит сигнал дрейфа (#134).
+PROD_MANIFESTS = ("dsh-edge/plugins.json", "dsh-edge/integrations.json")
+
+# Патч-серия апстрима: файлы живут в этом каталоге до выполнения removeWhen
+# (PATCHES.md), apply идёт по имени из него. Удалённый файл — молча выпавшая
+# часть шва (случай #164: 0004-harness-ingest).
+PATCHES_DIR = "dsh-edge/patches/"
+
+# Заголовок хунка unified diff: начало с unprefixed `@@`. Строки содержимого
+# всегда несут префикс +/-/пробел, поэтому внутри хунка не путаются с ним.
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+# Запись прод-манифеста: оба манифеста — массивы объектов с полем `id`
+# (manifest.mjs/integrations.mjs — формы обоих файлов там и валидируются).
+MANIFEST_ENTRY_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 
 
 def gh(*args: str) -> dict | list:
@@ -145,6 +179,172 @@ def ai_verdict_keep(current_labels, stored_fp: str | None, current_fp: str) -> b
         review_labels.diff_unchanged(stored_fp, current_fp)
 
 
+# ── Гвардия молчаливого отката main (#217) ───────────────────────────────────
+
+def strip_diff_path(path: str) -> str | None:
+    """`a/…`/`b/…` → путь в репозитории; `/dev/null` → None (файла с этой
+    стороны диффа не существует: удаление или создание целиком)."""
+    path = path.strip()
+    if path == "/dev/null":
+        return None
+    if path.startswith(("a/", "b/")):
+        return path[2:]
+    return path
+
+
+def diff_sections(diff: str) -> list[dict]:
+    """Разобрать unified diff на секции файлов: `{old, new, removed, added}`.
+
+    `removed`/`added` — содержимое удалённых/добавленных строк БЕЗ префикса
+    диффа. Граница секции — строка `diff --git`; заголовки `---`/`+++`
+    разбираются только ДО первого хунка: строка содержимого всегда несёт
+    префикс, поэтому `--- foo` внутри хунка — это удалённая строка `-- foo`,
+    а не заголовок (то же различие закрывает случай патчей-в-патче: файлы
+    PATCHES_DIR сами диффы, их правка несёт `+@@`/`-@@` — префикс
+    сохраняет их содержимым, а новый хунок того же файла матчится
+    HUNK_HEADER_RE).
+    """
+    sections: list[dict] = []
+    current: dict | None = None
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if current is not None:
+                sections.append(current)
+            current = {"old": None, "new": None, "removed": [], "added": []}
+            in_hunk = False
+            continue
+        if current is None:
+            continue
+        if not in_hunk:
+            if line.startswith("--- "):
+                current["old"] = strip_diff_path(line[4:])
+            elif line.startswith("+++ "):
+                current["new"] = strip_diff_path(line[4:])
+            elif HUNK_HEADER_RE.match(line):
+                in_hunk = True
+            continue
+        if HUNK_HEADER_RE.match(line):
+            continue  # следующий хунок того же файла
+        if line.startswith("+"):
+            current["added"].append(line[1:])
+        elif line.startswith("-"):
+            current["removed"].append(line[1:])
+        # контекст (пробел) и «\ No newline at end of file» гвардии не нужны
+    if current is not None:
+        sections.append(current)
+    return sections
+
+
+def removed_manifest_entries(sections: list[dict]) -> dict[str, list[str]]:
+    """Манифест → id записей, которые дифф УДАЛЯЕТ.
+
+    Удалённая запись = её `id` есть среди удалённых строк секции и НЕТ среди
+    добавленных. Этим различаются три формы, из которых только первая — вред:
+      - запись убрали: id только среди удалённых → находка;
+      - файл переформатировали/переименовали с сохранением записей: id по
+        обе стороны секции (переименование манифеста — одна секция с
+        разными old/new, обе стороны сверяются вместе) → тишина;
+      - запись добавили: id только среди добавленных → тишина (критерий
+        приёмки 3 #217: добавление не срабатывает).
+    """
+    removed: dict[str, list[str]] = {}
+    for section in sections:
+        name = section["old"] if section["old"] in PROD_MANIFESTS else section["new"]
+        if name not in PROD_MANIFESTS:
+            continue
+        ids_removed = {m for line in section["removed"]
+                       for m in MANIFEST_ENTRY_RE.findall(line)}
+        ids_added = {m for line in section["added"]
+                     for m in MANIFEST_ENTRY_RE.findall(line)}
+        gone = sorted(ids_removed - ids_added)
+        if gone:
+            removed[name] = gone
+    return removed
+
+
+def removed_patch_files(pr_files: list[dict]) -> list[str]:
+    """Файлы патч-серии, которые PR убирает из PATCHES_DIR: status `removed`
+    или `renamed` наружу каталога (переименованный файл apply по имени из
+    каталога больше не находит — для серии это то же удаление). Прод-форма —
+    объекты `gh api repos/{repo}/pulls/{n}/files` (status/previous_filename),
+    как их отдаёт review_labels.list_pr_files.
+    """
+    gone: list[str] = []
+    for f in pr_files:
+        name = f.get("filename", "")
+        status = f.get("status", "")
+        if status == "removed" and name.startswith(PATCHES_DIR):
+            gone.append(name)
+        elif status == "renamed" and (f.get("previous_filename") or "").startswith(PATCHES_DIR) \
+                and not name.startswith(PATCHES_DIR):
+            gone.append(f"{f['previous_filename']} → {name}")
+    return sorted(gone)
+
+
+def revert_ok_gas(labels, pr_body: str | None) -> tuple[bool, str | None]:
+    """Газ гвардии отката (#217): `(принято, причина отказа)`.
+
+    Две ОБЯЗАТЕЛЬНЫЕ части (проверяются обе, отсутствие любой — находка):
+      1. метка revert-ok на PR — ставится исполнителем ОСОЗНАННО
+         (`gh pr edit <N> --add-label revert-ok`);
+      2. объяснение в теле PR — упоминание revert-ok в тексте тела: что
+         именно удаляется и почему это входит в замысел PR.
+    Метка без объяснения — не осознанный обход, а забытая половина: гейт
+    остаётся красным, сообщение называет, чего именно не хватает.
+    """
+    # _names — то же одно место правды нормализации прод-форм меток, что у
+    # всех предикатов review_labels (принимает и список dict'ов API, и set).
+    names = review_labels._names(labels)
+    if REVERT_OK not in names:
+        return False, f"нет метки {REVERT_OK}"
+    if REVERT_OK not in (pr_body or ""):
+        return False, (f"метка {REVERT_OK} есть, но в теле PR нет объяснения — "
+                       f"опиши в теле, что удаляется и почему это входит в замысел PR")
+    return True, None
+
+
+def revert_guard(sections: list[dict], pr_files: list[dict], labels, pr_body: str | None
+                 ) -> tuple[list[str], list[str]]:
+    """Гвардия молчаливого отката main (#217): `(находки, принятые-меткой)`.
+
+    Класс (#217, PR #164): долгоживущая ветка, которую «обновляли» мержами
+    main, при разрешении конфликтов в пользу устаревшей стороны тихо
+    откатывает уже приобретённое main; это не «плохой код», а отсутствие
+    адаптации, поэтому оба гейта его пропускали. Падаем громко на двух
+    дешёвых и точно наблюдённых формах:
+      1. удаляется запись прод-манифеста (PROD_MANIFESTS) — находка называет
+         конкретную запись (критерий приёмки 1 #217);
+      2. удаляется файл патч-серии (PATCHES_DIR).
+
+    ОБЩИЙ случай «файл изменён и в main, и в ветке, а результат совпадает с
+    базой» здесь НЕ покрыт — сознательно, как допускала сама задача #217:
+    ему нужно содержимое общей базы (merge-base), которого у доверенного
+    чекаута main в pr-review нет (shallow checkout), а поход в API за
+    версией каждого файла дал бы эвристику с ложными срабатываниями на
+    легитимные правки вместо гвардии. Пока закрыты первые две формы,
+    третья названа честно, а не изображена.
+    """
+    accepted, reject_reason = revert_ok_gas(labels, pr_body)
+    findings: list[str] = []
+    accepted_items: list[str] = []
+    items: list[str] = []
+    for name, entries in removed_manifest_entries(sections).items():
+        for entry in entries:
+            items.append(f"{name}: удаляется запись прод-манифеста «{entry}»")
+    items.extend(f"{name}: удаляется файл патч-серии ({PATCHES_DIR})"
+                 for name in removed_patch_files(pr_files))
+    for item in items:
+        if accepted:
+            accepted_items.append(item)
+        else:
+            findings.append(f"{item} — дифф молча откатывает состояние main (#217). "
+                            f"Если удаление входит в замысел PR — газ: метка {REVERT_OK} "
+                            f"осознанно исполнителем и объяснение в теле PR "
+                            f"(сейчас: {reject_reason}; реестр — docs/agents/LABELS.md)")
+    return findings, accepted_items
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", type=int, required=True)
@@ -210,6 +410,21 @@ def main() -> int:
                 py_compile.compile(local, doraise=True)
             except py_compile.PyCompileError as error:
                 findings.append(f"{name} не компилируется: {error.msg}")
+
+    # Гвардия молчаливого отката main (#217): удаление записей прод-манифеста
+    # и файлов патч-серии — находка, газ (revert-ok + объяснение в теле)
+    # проверяется той же функцией. Принятые меткой удаления публикуются в PR
+    # отдельным комментарием: осознанный обход обязан быть виден в самом PR,
+    # а не только в логе прогона (паттерн orchestra:skip).
+    revert_findings, revert_accepted = revert_guard(
+        diff_sections(diff), files, current, pull.get("body"))
+    findings.extend(revert_findings)
+    if revert_accepted:
+        body = ("Гвардия отката main (#217): удаление принято меткой "
+                f"{REVERT_OK}:\n" + "\n".join(f"- {item}" for item in revert_accepted))
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")
+        for item in revert_accepted:
+            print(f"review: {item} — принято меткой {REVERT_OK}")
 
     # Вердикт-метка: старые вердикты снимаются, вешается актуальный.
     for old in (REVIEW_OK, REVIEW_CHANGES):
