@@ -54,6 +54,12 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # scheduler.py) — should_update_branch ниже читает её же.
 CONFLICT_LABEL = "conflict"
 
+# ── Провал контракта PR↔задача (contract_check.py) ───────────────────────────
+# Единственное определение (было задублировано литералом "contract:failed"
+# четырежды: дважды в contract_check.py, дважды в scheduler.py — REWORK_LABELS
+# и test_scheduler.py читают её же).
+CONTRACT_FAILED_LABEL = "contract:failed"
+
 # ── Гвардия молчаливого отката main (#217) ───────────────────────────────────
 # Газ гвардии check_pr.revert_guard: PR, чей дифф удаляет запись прод-манифеста
 # или файл патч-серии, красит детерминированное ревью; эта метка, поставленная

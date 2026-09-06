@@ -102,6 +102,26 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       простоя заводит задачу пула с уликами; известный отпечаток получает
       комментарий с новой уликой, не вторую задачу. Своя ответственность,
       свой модуль — вся логика, пороги и честный потолок там.
+  15. WIP-лимит перед взятием НОВОЙ задачи (#464, решение владельца
+      2026-09-06: «вместо того чтобы доделать текущие ПР, агенты идут и
+      создают новые»): dispatch_worker до этого пункта смотрел только на пул
+      задач, не на очередь открытых PR — 29 открытых, 25 из них реально ждут
+      доработки, не мешали диспетчу тридцатой задачи. wip_gate — второй,
+      независимый от предохранителя конвейера (п.5) тормоз: считает открытые
+      PR, реально ждущие чужого труда (REWORK_LABELS — не вердикта, который
+      придёт сам), и держит закрытым взятие НОВОЙ задачи, пока их больше или
+      равно WIP_LIMIT. Доводку уже открытых PR гейт НЕ трогает (находка ревью
+      PR #466: закрывать диспетч воркера целиком — тормоз без газа, очередь
+      физически не могла бы разгрестись сама) — dispatch_worker при закрытом
+      гейте по-прежнему вправе адресно запустить воркера на задачу, у которой
+      уже есть открытая ветка/PR (см. её докстринг и main()); блокируется
+      только выбор задачи, у которой PR ещё нет вовсе. Газ — слияние/закрытие
+      PR ниже порога, снимается автоматически следующим прогоном; если гейт
+      держит взятие НОВЫХ задач закрытым дольше WIP_GATE_STUCK_HOURS —
+      отдельный сигнал тем же каналом, что предохранитель конвейера: сигнал
+      сам различает «доводить есть что, но не успевает» и «доводить нечего»
+      по данным того же прогона (AGENTS.md: алерт не гадает) — затор не в
+      притоке задач, а в доработке существующих PR.
 """
 
 import http.cookiejar
@@ -1624,11 +1644,284 @@ def worker_runs_active(repo: str) -> bool:
     return False
 
 
-def dispatch_worker(repo: str, pool: list[dict]) -> tuple[list[str], list[str]]:
+# ── WIP-лимит перед взятием НОВОЙ задачи (issue #464) ────────────────────────
+# Владелец, 2026-09-06: «вместо того чтобы доделать текущие ПР, агенты идут и
+# создают новые» — dispatch_worker до этой правки смотрел только на пул задач
+# и на то, не бежит ли уже воркер (см. её докстринг ниже); число открытых PR
+# не участвовало в решении вовсе. Замер того же дня: 29 открытых PR, из них 25
+# реально ждут чужого труда (см. REWORK_LABELS), а dispatch_worker с той же
+# готовностью диспетчит воркера на тридцатую задачу.
+#
+# Порог обоснован замером на живом репозитории (2026-09-06):
+#   - темп слияний ~1.6–1.8 PR/час (43 слито за последние 24ч, 47 — с полуночи
+#     UTC предыдущих суток, `search/issues?...+is:merged+merged:>=...`);
+#   - время жизни PR от открытия до слияния (те же 47): медиана 2.1ч (типичный
+#     случай), p75 13.8ч, среднее 16.3ч (утянуто вверх PR старше 2.5 суток —
+#     именно застрявшие в доработке тянут очередь вверх);
+#   - закон Литтла (L = λW): при цикле доработки вдвое короче нынешнего p75
+#     (~7ч — всё ещё щедрее медианы, не разовая случайность) устойчивая
+#     очередь ≈ 1.7×7 ≈ 12.
+# WIP_LIMIT = 12: выше темпа обработки (гейт стоит МЕЖДУ пульсами дольше, чем
+# требует здоровый цикл доработки, не душит сам конвейер слияний — merge_loop
+# сливает независимо от этого гейта, см. main()), ниже наблюдаемых 25/29
+# (гейт закрыт уже на сегодняшних живых данных — см. test_wip_gate_matches_
+# live_repository_snapshot_2026_09_06 в test_scheduler.py).
+WIP_LIMIT = 12
+
+# CONTRACT_FAILED_LABEL — review_labels.py (одно место правды: тот же литерал
+# был задублирован четырежды — дважды в contract_check.py, дважды здесь).
+# REWORK_LABELS — то, что реально доказывает «PR не движется сам, а ждёт
+# чужого труда»: ai:changes-requested — гейт 2 провален и НЕ самовосстанавливается
+# (в отличие от ai:failed — тот самолечится авто-повтором trigger_ai_review,
+# см. AI_REVIEW_MAX_ATTEMPTS выше, поэтому здесь его нет — тот же приём,
+# что pr_is_unhealthy уже применяет: ai:failed туда тоже не входит);
+# CONFLICT_LABEL — застрял, ждёт ребейза; CONTRACT_FAILED_LABEL — деталь PR не
+# проходит контракт «PR↔задача». PR без единой из этих меток либо ждёт
+# вердикта (движется сам), либо уже готов к слиянию — в лимит не входит.
+CONTRACT_FAILED_LABEL = review_labels.CONTRACT_FAILED_LABEL
+REWORK_LABELS = frozenset({review_labels.AI_CHANGES, CONFLICT_LABEL, CONTRACT_FAILED_LABEL})
+
+# Носитель состояния «эпизод WIP-гейта открыт/закрыт» — комментарии-маркеры в
+# WATCHDOG_ISSUE, тот же приём, что PAUSE_MARKER/RESUME_MARKER (conveyor_gate)
+# и HEARTBEAT_NO_TICKS/TICKS_RESUMED (heartbeat_check): переживают перезапуск
+# оркестратора, читаются заново каждым прогоном.
+WIP_GATE_OPEN_MARKER = "[статус конвейера: WIP-лимит закрыл диспатч]"
+WIP_GATE_CLOSE_MARKER = "[статус конвейера: WIP-лимит снят]"
+# Префикс без часов — issue_marker_times ищет подстрокой, число дописывается
+# в само сообщение (тот же приём, что PROBE_MARKER в pulse_guard). Текст про
+# «новые задачи», не про воркера целиком — воркер при закрытом гейте
+# по-прежнему диспетчируется на доводку уже открытых PR (см. dispatch_worker).
+WIP_GATE_STUCK_MARKER_PREFIX = "[статус: WIP-лимит держит новые задачи дольше "
+
+# Пункт задачи (AGENTS.md, «тормоз без газа не принимается», п.5 этого
+# change): если гейт держит взятие НОВЫХ задач закрытым дольше этого —
+# сигнал владельцу тем же каналом, что предохранитель конвейера (#120). Не
+# второй порог правды: то же обоснование, что у WIP_LIMIT выше (здоровый цикл
+# доработки ~7ч) плюс запас на то, что доработка PR — не мгновенное действие;
+# 8ч — рабочий день, разумный срок для «очередь должна была хоть немного
+# поредеть». Сигнал не утверждает, что диспатчи доводки были (находка ревью
+# PR #466), и не гадает между причинами (AGENTS.md, «алерт не гадает»):
+# причины различает сам по данным того же прогона — см. текст эскалации
+# в wip_gate ниже.
+WIP_GATE_STUCK_HOURS = 8
+
+
+def pr_needs_rework(pull: dict) -> bool:
+    """True — PR реально ждёт чужого труда (см. REWORK_LABELS), не движется
+    сам по себе. Черновики и PR ботов исключены (п.2 задачи): черновик ещё не
+    просит ревью; GitHub App-логины оканчиваются на `[bot]` (нативное
+    соглашение платформы) — живьём на этом репозитории не встречались (замер
+    2026-09-06: все 29 открытых PR от mytab0r), но фильтр остаётся на случай,
+    если появится dependabot и подобные."""
+    if pull.get("draft"):
+        return False
+    login = (pull.get("user") or {}).get("login") or ""
+    if login.endswith("[bot]"):
+        return False
+    labels = {label["name"] for label in pull.get("labels") or []}
+    return bool(labels & REWORK_LABELS)
+
+
+def wip_gate(
+    repo: str, now: datetime, pulls: list[dict], pool: list[dict],
+) -> tuple[list[str], list[str], bool]:
+    """WIP-лимит перед взятием НОВОЙ задачи (issue #464, см. блок констант
+    выше) — второй, независимый от conveyor_gate тормоз, но НЕ перед всем
+    dispatch_worker целиком: закрытый гейт (allowed=False) запрещает выбор
+    задачи, у которой ещё нет открытого PR, и не трогает доводку уже открытых
+    (находка ревью PR #466 — закрывать диспетч воркера целиком тут значило бы
+    держать тормоз без газа: очередь физически не смогла бы разгрестись сама,
+    только вручную). Разведение «новая задача»/«доводка» — в dispatch_worker,
+    см. её докстринг; здесь только счётчик и решение по НОВЫМ.
+
+    `pulls` — тот же снимок open_pulls, что merge_loop уже довёл до
+    актуального состояния этим прогоном (#443/#456: второй обход PR здесь не
+    заводится). `pool` — пул задач этого же прогона: из него и `pulls`
+    считается, есть ли при закрытом гейте вообще что доводить (свободная
+    задача с уже открытым PR). Без `pool` stuck-эскалация могла бы только
+    гадать между «доводка не успевает» и «доводить нечего» — по AGENTS.md
+    («алерт не гадает») причины различает сам, данные для этого в прогоне
+    уже есть.
+
+    Возвращает (наблюдения, действия, разрешён_ли_диспетч) — тот же контракт,
+    что conveyor_gate: «диспатч разрешён без изменений» и «уже оповещено» —
+    наблюдения (ничего не меняют на сервере), реальная простановка/снятие
+    маркера — действие.
+
+    Тормоз называет газ (AGENTS.md): строка при срабатывании прямо называет
+    число и порог, газ — слияние/закрытие PR ниже порога, снимается
+    автоматически следующим прогоном (episode-маркер закрывается сам, см.
+    ветку count < WIP_LIMIT ниже) — ручного участия не требуется."""
+    observations: list[str] = []
+    actions: list[str] = []
+    rework = [pull for pull in pulls if pr_needs_rework(pull)]
+    count = len(rework)
+
+    try:
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_OPEN_MARKER)
+        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_CLOSE_MARKER)
+    except RuntimeError as error:
+        # Маркеры недоступны — решение «разрешён ли диспатч» само по себе не
+        # гадает (зависит только от count/WIP_LIMIT, который известен точно),
+        # но длительность эпизода посчитать не можем — не эскалируем вслепую.
+        print(f"::warning::маркеры WIP-гейта в #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
+        if count < WIP_LIMIT:
+            return ([f"🟢 WIP: {count} PR ждут доработки (лимит {WIP_LIMIT}) — новые задачи разрешены"],
+                    [], True)
+        return ([f"⏸️ новые задачи не берутся: {count} открытых PR ждут доработки при лимите "
+                 f"{WIP_LIMIT} — сначала доводим (маркеры #{WATCHDOG_ISSUE} недоступны)"], [], False)
+
+    last_close = max(close_times) if close_times else None
+    # Открывающие маркеры ПОСЛЕ последнего закрытия — только они принадлежат
+    # текущему (ещё не закрытому) эпизоду; более старые — эхо прошлого,
+    # уже закрытого (тот же приём, что episode_reopened в pulse_guard).
+    episode_opens = [t for t in open_times if last_close is None or t > last_close]
+
+    if count < WIP_LIMIT:
+        if episode_opens:
+            try:
+                post_issue_comment(
+                    repo, WATCHDOG_ISSUE,
+                    f"✅ {WIP_GATE_CLOSE_MARKER}\n"
+                    f"Открытых PR, ждущих доработки: {count} < {WIP_LIMIT} — WIP-лимит снят, "
+                    "новые задачи снова диспетчируются.",
+                )
+                actions.append(f"✅ WIP-лимит снят: {count} < {WIP_LIMIT} — эпизод в #{WATCHDOG_ISSUE} закрыт")
+            except RuntimeError as error:
+                actions.append(f"⚠️ закрытие эпизода WIP-гейта в #{WATCHDOG_ISSUE} не оставлено: {error}")
+        else:
+            observations.append(
+                f"🟢 WIP: {count} PR ждут доработки (лимит {WIP_LIMIT}) — новые задачи разрешены")
+        return observations, actions, True
+
+    # count >= WIP_LIMIT — новые задачи не берутся. Строка обязана появиться
+    # в отчёте В ЛЮБОМ случае (тормоз называет газ, AGENTS.md) — не только
+    # когда эпизод только что открылся: наблюдение, отдельное от факта
+    # простановки маркера ниже (тот — действие, само решение — нет).
+    line = (f"⏸️ новые задачи не берутся: {count} открытых PR ждут доработки при лимите "
+            f"{WIP_LIMIT} — сначала доводим (газ: слияние/закрытие PR ниже порога снимает "
+            "тормоз автоматически следующим прогоном)")
+    observations.append(line)
+    if not episode_opens:
+        try:
+            post_issue_comment(
+                repo, WATCHDOG_ISSUE,
+                f"⏸️ {WIP_GATE_OPEN_MARKER}\n"
+                f"Открытых PR, ждущих доработки: {count} ≥ лимита {WIP_LIMIT}. Новые задачи не "
+                "диспетчируются, пока очередь не поредеет.",
+            )
+            actions.append(f"⏸️ WIP-лимит закрыл диспатч: {count} ≥ {WIP_LIMIT} — эпизод в #{WATCHDOG_ISSUE} открыт")
+            episode_opens = [now]
+        except RuntimeError as error:
+            actions.append(f"⚠️ маркер WIP-гейта в #{WATCHDOG_ISSUE} не оставлен: {error}")
+            return observations, actions, False
+
+    episode_start = min(episode_opens)
+    stuck_hours = minutes_between(episode_start, now) / 60
+    if stuck_hours > WIP_GATE_STUCK_HOURS:
+        try:
+            stuck_markers = [
+                t for t in issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_STUCK_MARKER_PREFIX)
+                if t >= episode_start
+            ]
+        except RuntimeError as error:
+            # Находка ревью PR #466: чтение упало — не то же самое, что
+            # «маркеров нет», и не повод эскалировать вслепую (та же
+            # политика, что уже применяет ветка недоступных маркеров в
+            # начале функции, и escalate_if_new в repo_invariants). Раньше
+            # `stuck_markers = []` в except делало ровно это — при
+            # ПОСТОЯННОМ сбое чтения (не разовом) эскалация уходила заново
+            # каждый пульс (каждые 15 минут), а не один раз на эпизод.
+            # Пропускаем этот прогон целиком — сигнал уйдёт следующим
+            # успешным чтением, warning уже есть в actions.
+            actions.append(f"⚠️ маркеры затянувшегося WIP-гейта в #{WATCHDOG_ISSUE} не прочитаны: {error}")
+            return observations, actions, False
+        if not stuck_markers:
+            # Текст сигнала (находка ревью PR #466 + AGENTS.md «алерт не
+            # гадает»): не утверждает непроверяемое «воркер всё это время
+            # диспетчируется на доводку» и не предлагает владельцу выбрать
+            # между гипотезами — причины различает сам по данным этого же
+            # прогона (pool × pulls, второго обхода нет). Есть свободные
+            # задачи с открытым PR — доводка гейтом не запрещена и адресуется
+            # воркеру (dispatch_worker), значит очередь, не редеющая 8ч,
+            # означает «не успевает». Таких задач нет — «доводить нечего»,
+            # диспатчей доводки не было вовсе.
+            targets = rework_target_numbers(pulls, pool)
+            if targets:
+                listed = ", ".join(f"#{n}" for n in sorted(targets))
+                rework_fact = (
+                    f"доводить есть что: свободные задачи с уже открытым PR — {listed}; "
+                    "закрытый гейт им доводку не запрещает (dispatch_worker), слияния идут "
+                    "независимо (merge_loop) — очередь не редеет, значит доводка не "
+                    "успевает за темпом появления находок ревью"
+                )
+            else:
+                rework_fact = (
+                    "доводить нечего: ни у одной свободной задачи нет открытого PR — "
+                    "диспатчей доводки не было вовсе, очередь ждёт ручной доработки "
+                    "владельца"
+                )
+            escalation = escalate(
+                repo, WATCHDOG_ISSUE,
+                f"🚨 edge-harness: {WIP_GATE_STUCK_MARKER_PREFIX}{WIP_GATE_STUCK_HOURS}ч]\n"
+                f"WIP-лимит держит взятие НОВЫХ задач закрытым {int(stuck_hours)}ч (порог "
+                f"{WIP_GATE_STUCK_HOURS}ч): {count} PR ждут доработки при лимите {WIP_LIMIT}. "
+                f"{rework_fact} — затор не в притоке новых задач, а в доработке существующих: "
+                "требует внимания владельца.",
+            )
+            actions.append(
+                f"🚨 WIP-гейт держит взятие новых задач {int(stuck_hours)}ч > "
+                f"{WIP_GATE_STUCK_HOURS}ч ({escalation})")
+
+    return observations, actions, False
+
+
+def declared_pr_task_numbers(pulls: list[dict]) -> set[int]:
+    """Номера задач, у которых уже есть открытый PR — единственный источник
+    task_ref.resolve_pr_task (имя agent-ветки, #394), тот же, что использует
+    `pr_references_issue`/`scripts/lib/free_task.py::declared_pr_for_task` для
+    того же вопроса симметрично со стороны task.sh."""
+    numbers = set()
+    for pull in pulls:
+        number = task_ref.resolve_pr_task(pull)
+        if number is not None:
+            numbers.add(number)
+    return numbers
+
+
+def rework_target_numbers(pulls: list[dict], pool: list[dict]) -> set[int]:
+    """Свободные задачи, у которых уже есть открытый PR: единственные, кого
+    dispatch_worker вправе диспетчить при закрытом WIP-гейте (доводка, #245),
+    и тот же счётчик для stuck-эскалации wip_gate — алерт называет факт
+    «доводить есть что/нечего», а не гадает между гипотезами (AGENTS.md).
+    Оба слагаемых уже прочитаны этим же прогоном: `pool` — пул задач,
+    `pulls` — снимок открытых PR (#443/#456), второго обхода нет."""
+    declared = declared_pr_task_numbers(pulls)
+    return {issue["number"] for issue in pool if not issue["assignees"]} & declared
+
+
+def dispatch_worker(
+    repo: str, pool: list[dict], *, wip_allowed: bool, pulls: list[dict],
+) -> tuple[list[str], list[str]]:
     """Пульс конвейера: свободная задача есть, воркер простаивает → ровно один
     dispatch worker.yml за запуск оркестратора. Best-effort по построению:
     прав на dispatch нет, workflow нет на main, сеть — любой сбой диспатча
     не роняет оркестратор, слияния важнее подряда воркеру.
+
+    `wip_allowed` — решение wip_gate (issue #464): False не запрещает диспатч
+    целиком (находка ревью PR #466 — WIP-гейт, закрывающий ВЕСЬ dispatch_worker,
+    держит недоступной и доводку уже открытых PR, а `free_task.free_candidates`
+    считает такую задачу свободной именно затем, чтобы её довели, — тормоз без
+    газа: очередь физически не может разгрестись сама). При wip_allowed=False
+    эта функция по-прежнему вправе адресно запустить воркера, но только на
+    задачу, у которой УЖЕ есть открытый PR (declared_pr_task_numbers по
+    `pulls` — тот же снимок, что main() передал в wip_gate): worker.yml
+    получает конкретный номер через input `task` (task.sh, режим #245 —
+    «PR уже открыт, довожу его, новый не открываю»), поэтому воркер не
+    может вместо этого случайно подхватить настоящую новую задачу тем же
+    вызовом free_task() без аргумента. Если среди свободных задач ни одна не
+    объявлена открытым PR — доводить нечего, диспатча не будет, гейт держит
+    свой тормоз честно.
 
     Возвращает (наблюдения, действия) — разведено по #456: «воркер уже
     работает — dispatch не нужен» ничего не меняет, это факт состояния, а не
@@ -1642,6 +1935,38 @@ def dispatch_worker(repo: str, pool: list[dict]) -> tuple[list[str], list[str]]:
     try:
         if worker_runs_active(repo):
             observations.append("👷 воркер уже работает — dispatch не нужен")
+            return observations, actions
+        if not wip_allowed:
+            # WIP-гейт закрыл взятие новых задач — только доводка уже открытых
+            # PR. Приоритет (#361) сюда не тянется: это АДРЕСНЫЙ прогон —
+            # worker.yml получает конкретный номер через input `task`, воркер
+            # ничего не выбирает, поэтому и граф блокировок для выбора не
+            # нужен (лишний GraphQL-запрос при закрытом гейте не делаем);
+            # среди нескольких целей берём старейшую по номеру — детерминизм.
+            # rework_target_numbers — то же одно место правды, что читает
+            # stuck-эскалация wip_gate: у алерта и у диспатча не могут
+            # разойтись ответы на вопрос «есть ли что доводить».
+            targets = rework_target_numbers(pulls, pool)
+            rework_free = sorted(
+                (issue for issue in free_task.free_candidates(pool) if issue["number"] in targets),
+                key=lambda issue: issue["number"],
+            )
+            if not rework_free:
+                observations.append(
+                    "⏸️ WIP-лимит закрыл новые задачи, и ни у одной свободной задачи ещё "
+                    "нет открытого PR — доводить нечего, dispatch не запущен"
+                )
+                return observations, actions
+            target = rework_free[0]["number"]
+            gh(
+                "-X", "POST",
+                f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+                "-f", "ref=main", "-f", f"inputs[task]={target}",
+            )
+            actions.append(
+                f"👷 WIP-лимит закрыл новые задачи, но задача #{target} уже с открытым PR — "
+                "worker.yml запущен адресно на её доводку"
+            )
             return observations, actions
         # Имя задачи в отчёте — та же функция приоритета (#361), что реально
         # использует scripts/worker/task.sh (scripts/lib/free_task.py), не
@@ -2820,31 +3145,45 @@ def main() -> int:
     # нездоров (диспатч закрыт) — не добавляем новых прогонов воркеру и по
     # этому классу тоже, класс тот же («сломан сам worker.yml»), не другой.
     # `pulls` — тот же снимок, что merge_loop уже довёл до актуального
-    # состояния этим прогоном (#443/#456: второго обхода нет).
+    # состояния этим прогоном (#443/#456: второго обхода нет). WIP-лимит
+    # (#464) расшивку НЕ трогает: адресный прогон на конкретный
+    # сконфликтовавший PR — доводка существующего PR, а не новая задача.
     if dispatch_allowed:
         conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = (
             dispatch_conflict_rework(repo, pulls, pool=pool)
         )
     else:
         conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = [], [], False
+    # WIP-лимит (#464) — второй, независимый тормоз, но только на НОВЫЕ
+    # задачи: пока открытых PR, реально ждущих доработки, больше или равно
+    # WIP_LIMIT (см. wip_gate), dispatch_worker не берёт задачу без открытого
+    # PR, но доводку уже открытых по-прежнему диспетчирует (находка ревью
+    # PR #466 — см. докстринг dispatch_worker). `pulls` и `pool` — те же
+    # снимки, что merge_loop и пул уже довели до актуального состояния этим
+    # прогоном (#443/#456: второго обхода нет). conveyor_gate (#120) —
+    # единственный тормоз, закрывающий dispatch_worker целиком: тот сигналит
+    # о сломанном самом конвейере, а не о размере очереди доработки.
+    wip_observations, wip_actions, wip_allowed = wip_gate(repo, now, pulls, pool)
     # dispatch_worker пропускается этим проходом, если расшивка конфликта уже
     # ушла: «ровно один workflow_dispatch воркера за пульс» (докстринг модуля,
     # п.4) не должен превратиться в два только из-за гонки worker_runs_active
     # (только что созданный прогон не обязан быть виден как queued немедленно).
     if dispatch_allowed and not conflict_rework_dispatched:
-        worker_observations, worker_actions = dispatch_worker(repo, pool)
+        worker_observations, worker_actions = dispatch_worker(
+            repo, pool, wip_allowed=wip_allowed, pulls=pulls)
     else:
         worker_observations, worker_actions = [], []
 
     observations = (
         lease_observations + merge_observations + ai_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
-        + worker_observations
+        + wip_observations + worker_observations
     )
     actions = (
         stale_lines + lease_actions + conflict_lines + unhealthy_lines + merge_actions
         + ai_actions + stale_ready_lines + reopen_lines + accept_actions
-        + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions + worker_actions
+        + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
+        + wip_actions + worker_actions
     )
     lines += render_action_report(observations, actions)
 
