@@ -2,6 +2,9 @@
 # review:ok / review:changes-requested (+ review:large для крупных диффов).
 # Оркестратор сливает только PR с метками review:ok И ai:ok — метки и есть
 # триггер следующих шагов (см. docs/agents/PROTOCOL.md и ADR 0007).
+# Тот же вердикт публикуется вторым каналом — Commit Status API (#345,
+# harness/review), параллельно метке: нативный allow_auto_merge required
+# status checks видит, метки — нет (statuses: write ниже).
 #
 # Trust-зона (класс «PR подсунул код под write-токен», закрыт по ревью PR #138):
 # чекаут по умолчанию — ref: main, ИЗ НЕГО исполняется check_pr.py с
@@ -17,10 +20,15 @@
 # scheduler.py → worker.yml. Ставить это на `labeled` нельзя: метку тоже
 # ставит GITHUB_TOKEN, а `on: pull_request: [labeled]` для такого события НЕ
 # создаёт рана (замерено 2026-08-31, #18, тот же файл-источник) — explicit
-# workflow_dispatch обходит именно эту ловушку. Диспатч безусловный (не только
-# при review:ok): review:changes-requested тоже может разблокировать других
-# кандидатов в очереди (например снять conflict), а orchestra.yml сам решает,
-# есть ли что сливать — быстро и дёшево, если нечего.
+# workflow_dispatch обходит именно эту ловушку. Диспатч безусловный по СОБЫТИЮ
+# (не только при review:ok — ADR 0012, ломать нельзя): review:changes-requested
+# тоже может разблокировать других кандидатов в очереди (например снять
+# conflict), а orchestra.yml сам решает, есть ли что сливать — быстро и
+# дёшево, если нечего. Но диспатч экономится, если orchestra.yml уже
+# запущен/в очереди (#456, scripts/gh/wake_orchestra.sh) — concurrency-группа
+# `orchestra` всё равно даёт исполниться только одному за раз, и уже
+# идущий/ждущий прогон увидит это же событие на СТАРТЕ, не по снимку на
+# момент диспатча — событие не теряется, экономится только лишний триггер.
 name: pr-review
 
 on:
@@ -31,6 +39,7 @@ permissions:
   contents: read
   pull-requests: write
   actions: write
+  statuses: write
 
 jobs:
   review:
@@ -70,4 +79,4 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run orchestra.yml --ref main
+        run: scripts/gh/wake_orchestra.sh "$GITHUB_REPOSITORY"

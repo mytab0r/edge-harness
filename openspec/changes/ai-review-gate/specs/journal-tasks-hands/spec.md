@@ -62,7 +62,7 @@ pull_request-контекста нет).
 (`review_labels.diff_fingerprint`/`diff_unchanged`), а не безусловным на
 каждый пуш; шапка ревью-комментария AI получила поле `diff:` для хранения
 этого отпечатка. См.
-`openspec/changes/ai-verdict-survives-merge/specs/journal-tasks-hands/spec.md`
+`openspec/changes/archive/ai-verdict-survives-merge/specs/journal-tasks-hands/spec.md`
 и `docs/decisions/0007-ai-review-gate.md` (раздел «Дельта 2026-09-05»). Текст
 требования выше не переписан — оставлен как принятый исходно.
 
@@ -74,3 +74,12 @@ pull_request-контекста нет).
 
 Сценарий: ревью предложило задачи → команда завела их в пул; повтор команды
 не создаёт дублей (совпадающий заголовок открытой задачи — пропуск).
+
+**Суперсессия (2026-09-06).** Требование выше — «любой блок ЗАДАЧА → issue»
+без разбора масштаба — заменено изменением `review-task-scope-split` (#426):
+каждый блок несёт обязательное поле `МАСШТАБ: хвост|отдельно`; `file_tasks.py`
+заводит issue только по `отдельно`, `хвост` уходит прозой в разделе «Доделай
+в этом PR» без issue, отсутствие поля — fail loud (видимо, не заведено). См.
+`openspec/changes/review-task-scope-split/specs/journal-tasks-hands/spec.md`
+и `docs/decisions/0007-ai-review-gate.md` (п.6). Текст требования выше не
+переписан — оставлен как принятый исходно.

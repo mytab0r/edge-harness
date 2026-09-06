@@ -1,0 +1,43 @@
+# Сигнал ослабления защиты main — событием, а не опросом (#370, #341).
+#
+# Инвариант 6 (scripts/orchestra/repo_invariants.py::check_branch_protection_drift,
+# PR #249) не может подключиться к CI: GET .../branches/main/protection требует
+# у токена право administration, которого структурно нет в перечне permissions
+# GITHUB_TOKEN (docs/research/21-github-actions.md). Вместо опроса состояния —
+# штатное событие Actions branch_protection_rule: срабатывает самим фактом
+# изменения защиты и несёт изменённое состояние в payload (rule/changes), читать
+# настройки через API не нужно вовсе — значит не нужно и administration.
+#
+# У события нет фильтра branches: в синтаксисе (оно репозиторное, не привязано
+# к ref) — какое правило это (main или нет) проверяет сам скрипт по rule.name.
+#
+# Вся логика — scripts/orchestra/branch_protection_watch.py (чистые решения +
+# тонкая проводка, по образцу pulse_guard.py/upstream_drift.py). Канал сигнала
+# общий с предохранителем конвейера (issue #120 + Telegram, pulse_guard.escalate)
+# — второй канал для того же класса «поломка инфраструктуры» не заводим.
+name: branch-protection-watch
+
+on:
+  branch_protection_rule:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Сверить защиту main против EXPECTED_* и сигналить при ослаблении
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/branch_protection_watch.py

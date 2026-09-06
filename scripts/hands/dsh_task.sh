@@ -8,6 +8,18 @@
 # dsh-hands-streamer пишет NDJSON-спул, этот клиент дренирует его в DSH-сессию
 # через scripts/lib/dsh-edge-session.sh). МЕХАНИЗМ ОДИН: журнал транскрипт
 # больше не получает — только жизненный цикл job (замещает стрим #112).
+#
+# Ретрай временного RATE_LIMIT провайдера (#422, механизм #419/#421 —
+# dsh_run_with_retry в lib/dsh-ci.sh). Бюджет ожидания HANDS_RATE_LIMIT_MAX_WAIT_SECS
+# (по умолчанию 600с/10 мин) короче, чем у ai-review/воркера (30 мин)
+# нарочно: канал рук — интерактивный (репозиторный dispatch из морды или
+# ручной запуск), собственный job живёт всего 30 мин (timeout-minutes), и
+# держать раннер занятым треть часа ради окна, которое обычно снимается
+# секундами (docs/runbooks/switch-llm-provider.md), не оправдано — короче
+# отказать и вернуть задачу в пул, чем занимать редкий Free-план слот. При
+# исчерпании бюджета (или недельной/месячной квоте) задача (issue-N, если
+# была аренда) возвращается в пул СРАЗУ: lease_cli release-full, не
+# 24-часовой TTL-сборщик — вина не в задаче.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +38,10 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-20}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
+# Бюджет ретрая временного RATE_LIMIT (#422) — обоснование см. в шапке файла.
+HANDS_RATE_LIMIT_MAX_WAIT_SECS="${HANDS_RATE_LIMIT_MAX_WAIT_SECS:-600}"
+HANDS_RATE_LIMIT_INITIAL_DELAY_SECS="${HANDS_RATE_LIMIT_INITIAL_DELAY_SECS:-15}"
+HANDS_RATE_LIMIT_MAX_DELAY_SECS="${HANDS_RATE_LIMIT_MAX_DELAY_SECS:-120}"
 DRAIN_INTERVAL_SECS="${DRAIN_INTERVAL_SECS:-1}"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле вешал бы клиент до конца job
@@ -163,14 +179,16 @@ echo "Задача $TASK_ID, seq посеян с $((SEQ + 1))"
 # означал бы ложь «работа сделана». Задачи без issue (manual-*) — вне пула,
 # аренды не имеют. Поломка утилиты — громкий красный job: «инструмент сломан»
 # и «задача занята» — разные состояния.
+ISSUE_NUMBER=""
 if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
+  ISSUE_NUMBER="${BASH_REMATCH[1]}"
   # CLAIM_ACTOR обязан быть валидным логином (назначение идёт им): не
   # переопределяем — current_actor() возьмёт GITHUB_ACTOR (аккаунт,
   # инициировавший dispatch). Канал для следа в задаче — CLAIM_VIA.
   export CLAIM_VIA="hands $TASK_ID (run ${GITHUB_RUN_ID:-local})"
-  claim_out="$(lease_cli claim "${BASH_REMATCH[1]}" 2>&1)" && claim_rc=0 || claim_rc=$?
+  claim_out="$(lease_cli claim "$ISSUE_NUMBER" 2>&1)" && claim_rc=0 || claim_rc=$?
   if [ "$claim_rc" -eq 1 ]; then
-    echo "Задача #${BASH_REMATCH[1]} занята другим исполнителем — зелёный no-op: $claim_out"
+    echo "Задача #$ISSUE_NUMBER занята другим исполнителем — зелёный no-op: $claim_out"
     add_event "agent_error" \
       "$(jq -n --arg t "$claim_out" '{error: "task_busy", detail: $t}')"
     post_job_end "fail"
@@ -185,7 +203,11 @@ fi
 
 # Токен аренды больше не нужен никому ниже, включая DSH: снимается сразу после
 # блока аренды и до любого выхода из скрипта. Раньше блока снимать нельзя —
-# claim в проде авторизуется именно GH_RUN_TOKEN.
+# claim в проде авторизуется именно GH_RUN_TOKEN. Копия в НЕэкспортируемую
+# переменную (#422) переживает unset: если провайдер окажется в лимите,
+# release-full в конце скрипта происходит уже ПОСЛЕ выхода DSH — не
+# экспортируется и агенту не видна, тот же trust-zone, что и раньше.
+LEASE_RELEASE_TOKEN="${GH_RUN_TOKEN:-}"
 unset GH_RUN_TOKEN
 
 add_event "job_start" "{\"job_id\":\"$JOB_ID\"}"
@@ -196,9 +218,9 @@ HB_PID=$!
 # ── 1b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ─────────
 # Отказ громкий: без сессии ход работы владельцу не виден, job красный.
 # «Не настроено» и «сломано» — разные сообщения (dsh_edge_require_config).
-if [[ "$TASK_ID" =~ ^issue-([0-9]+)$ ]]; then
-  HARNESS_SID="harness-${BASH_REMATCH[1]}"
-  HARNESS_TITLE="#${BASH_REMATCH[1]}: $(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
+if [ -n "$ISSUE_NUMBER" ]; then
+  HARNESS_SID="harness-${ISSUE_NUMBER}"
+  HARNESS_TITLE="#${ISSUE_NUMBER}: $(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
 else
   slug=$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]' | tr -cs 'A-Za-z0-9' '-' \
   | sed -e 's/-\{2,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-48)
@@ -271,10 +293,13 @@ export HANDS_SPOOL="$SPOOL_FILE"
 dsh_edge_start_drain
 
 DSH_START_TS=$(date -u +%s)
-set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$TASK_TEXT" >"$ANSWER_FILE" 2>"$ERR_FILE"
-rc=$?
-set -e
+HANDS_TASK_FAILURE_REASON=""
+DSH_RATE_LIMIT_MAX_WAIT_SECS="$HANDS_RATE_LIMIT_MAX_WAIT_SECS" \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$HANDS_RATE_LIMIT_INITIAL_DELAY_SECS" \
+DSH_RATE_LIMIT_MAX_DELAY_SECS="$HANDS_RATE_LIMIT_MAX_DELAY_SECS" \
+  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
+rc=$DSH_RUN_RC
+HANDS_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
 
 # Финальный drain — жёсткий и ДО ответа: транскрипт сессии в морде обязан
@@ -339,10 +364,37 @@ if [ "$rc" -eq 0 ]; then
   post_job_end "ok"
 else
   ERRTEXT=$(tail -c 8000 "$ERR_FILE" | redact)
+  # Провайдер в лимите (#422) — не сбой агента: событие журнала различает это
+  # явным полем failure_reason, а не общим stderr (правило AGENTS.md —
+  # «возможности нет» и «возможность есть, но сломана» лечатся по-разному).
   add_event "agent_error" \
-    "$(jq -n --arg t "$ERRTEXT" --argjson code "$rc" '{stderr: $t, exit_code: $code}')"
+    "$(jq -n --arg t "$ERRTEXT" --argjson code "$rc" --arg reason "$HANDS_TASK_FAILURE_REASON" \
+        '{stderr: $t, exit_code: $code, failure_reason: (if $reason == "" then null else $reason end)}')"
   flush_events
+  # Провайдер в лимите/квоте надолго — вина не в задаче: возвращаем её в пул
+  # СРАЗУ (замок + назначение), не дожидаясь 24-часового TTL-сборщика.
+  # Только для задач issue-N: manual-* аренды не имеют, снимать нечего.
+  if [ -n "$ISSUE_NUMBER" ] && { [ "$HANDS_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
+      [ "$HANDS_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; }; then
+    release_out="$(GH_RUN_TOKEN="$LEASE_RELEASE_TOKEN" lease_cli release-full "$ISSUE_NUMBER" 2>&1)" \
+      && release_rc=0 || release_rc=$?
+    if [ "$release_rc" -eq 0 ]; then
+      echo "Провайдер в лимите — задача #$ISSUE_NUMBER возвращена в пул немедленно: $release_out"
+    else
+      echo "::warning::задача #$ISSUE_NUMBER не возвращена в пул (rc=$release_rc): $release_out — снимет TTL-сборщик через 24 ч"
+    fi
+  fi
   post_job_end "fail"
-  echo "::error::dsh завершился с кодом $rc" >&2
+  case "$HANDS_TASK_FAILURE_REASON" in
+    quota_exhausted)
+      echo "::error::провайдер: квота исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — не сбой агента, см. docs/runbooks/switch-llm-provider.md" >&2
+      ;;
+    rate_limit_retry_budget_exceeded)
+      echo "::error::провайдер: временный RATE_LIMIT не снялся за бюджет ожидания ${HANDS_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc) — не сбой агента" >&2
+      ;;
+    *)
+      echo "::error::dsh завершился с кодом $rc" >&2
+      ;;
+  esac
   exit 1
 fi

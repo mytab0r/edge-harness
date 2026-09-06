@@ -105,6 +105,11 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
           body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"smoke-no-stub\",\"message\":\"нет заглушки для $m\"}}}"
           code=400 ;;
       esac ;;
+    *api.telegram.org*)
+      # Telegram-отчёт воркера (#170): каптурируем ВЕСЬ вызов — по журналу
+      # ассерты держат и parse_mode=HTML, и экранирование заголовка (tg_html).
+      log_call "TG-SEND $*"
+      body='{"ok":true,"result":{"message_id":1}}' ;;
     *)
       echo "::error::SMOKE: curl-заглушка не знает URL: ${url:-<пусто>}" >&2
       return 99 ;;
@@ -129,7 +134,14 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
     # Пул свободных задач для auto-сценария воркера (free_task).
     payload="${GH_ISSUE_LIST_JSON:-[]}"
   elif [[ "$sig" == *"pr list"* && "$sig" == *"--json url"* ]]; then
-    payload='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
+    # Переопределяемо сценарием (#422): провайдер в лимите — PR не открыт,
+    # worker/task.sh обязан различить это от «PR уже есть». Дефолт — ОТДЕЛЬНОЙ
+    # переменной, не буквальными скобками внутри ${VAR:-...}: непарная '}' в
+    # литерале JSON преждевременно закрывает подстановку (bash: первая
+    # НЕэкранированная '}' завершает ${...}, даже если это середина JSON) —
+    # живой прогон CI 34009616520, jq упал на «Unmatched ']'».
+    _default_pr_list_url='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
+    payload="${GH_PR_LIST_URL_JSON:-$_default_pr_list_url}"
   elif [[ "$sig" == *"pr list"* ]]; then
     payload='[]'
   elif [[ "$sig" == *"run list"* ]]; then
@@ -138,7 +150,10 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   elif [[ "$sig" == *"api users"* ]]; then
     payload='{"id":7416604}'
   elif [[ "$sig" == *" comment "* ]]; then
-    log_call "GH-COMMENT"
+    # Полные аргументы (не просто факт вызова) — тело комментария едет вторым
+    # словом --body: сценарии #422 сверяют, что текст различает «провайдер в
+    # лимите» от «воркер не справился» (правило AGENTS.md).
+    log_call "GH-COMMENT $*"
     return 0
   elif [[ "$sig" == *"issues/"* ]]; then
     log_call "GH-ISSUE-WRITE"
@@ -169,6 +184,42 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
       if [ "${3:-}" = "--dump-config" ]; then
         printf -- '- id: hands-streamer\n'
         return 0
+      fi
+      # Ретрай RATE_LIMIT в ai-review (#419): режим задаёт сценарий через
+      # SMOKE_RATE_LIMIT_MODE, попытки считает переменная процесса — эта
+      # заглушка живёт в одном bash-процессе ai_dsh.sh на весь ретрай-цикл
+      # (несколько вызовов dsh — один процесс, файл состояния не нужен).
+      if [ -n "${SMOKE_RATE_LIMIT_MODE:-}" ]; then
+        _smoke_rl_attempt=$(( ${_smoke_rl_attempt:-0} + 1 ))
+        case "$SMOKE_RATE_LIMIT_MODE" in
+          transient-then-ok)
+            if [ "$_smoke_rl_attempt" -le "${SMOKE_RATE_LIMIT_TRANSIENT_COUNT:-1}" ]; then
+              echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+              return 1
+            fi
+            # worker/hands (#422, в отличие от ai_dsh.sh) требуют спул стрима
+            # на успехе — та же запись, что и обычный успешный путь ниже.
+            if [ -n "${HANDS_SPOOL:-}" ]; then
+              printf '%s\n' \
+                '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
+                '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
+                '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+            fi
+            echo "smoke: работа сделана после ретрая"
+            return 0 ;;
+          always-transient)
+            echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+            return 1 ;;
+          quota-exhausted)
+            echo "dsh: RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10T00:00:00Z" >&2
+            return 1 ;;
+          real-error)
+            echo "dsh: HTTP_404: modelCode does not exist" >&2
+            return 1 ;;
+          *)
+            echo "::error::SMOKE: неизвестный SMOKE_RATE_LIMIT_MODE: $SMOKE_RATE_LIMIT_MODE" >&2
+            return 99 ;;
+        esac
       fi
       [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; return 1; }
       printf '%s\n' \
@@ -304,12 +355,27 @@ case "$sig" in
     exit 99 ;;
   *"issues/"*"assignees "*)
     issue="${sig##*issues/}"; issue="${issue%%/*}"
-    log "GH-API-ASSIGN issue-$issue"
+    # release_full (#422) снимает назначение через DELETE — отличаем от
+    # claim's POST: одно и то же слово "assignees" покрывает оба глагола.
+    if [[ "$sig" == *"-X DELETE"* ]]; then
+      log "GH-API-UNASSIGN issue-$issue"
+    else
+      log "GH-API-ASSIGN issue-$issue"
+    fi
     resp '{}' ;;
   *"issues/"*"comments "*)
     issue="${sig##*issues/}"; issue="${issue%%/*}"
     log "GH-API-COMMENT issue-$issue"
     resp '{}' ;;
+  *"issues/"*)
+    # Проверка на входе claim_task.py::claim (#357): GET состояния задачи
+    # перед созданием замка — открыта, метка task, не blocked. Все смоук-
+    # сценарии этого файла заводят задачи, которые ОБЯЗАНЫ пройти эту
+    # проверку (сама задача занятости решается ниже, замком/веткой), поэтому
+    # заглушка отвечает одинаково открытой/размеченной задачей для любого номера.
+    # assignees непусты (#422): к моменту, когда release_full() читает этот
+    # GET, claim уже назначил исполнителя — иначе снимать было бы нечего.
+    resp '{"state":"open","labels":[{"name":"task"}],"assignees":[{"login":"'"${WORKER_LOGIN:-mytab0r}"'"}]}' ;;
   *)
     echo "gh: SMOKE: заглушка не знает вызов: $sig" >&2
     exit 99 ;;
@@ -382,6 +448,27 @@ run_client() { # LABEL SCRIPT — прогон в дочернем bash; exit к
   fi
 }
 
+# Симметрично run_client, но для сценариев, где красный job — ОЖИДАЕМЫЙ
+# исход (#422: провайдер в лимите/квоте — die/exit 1 по контракту, это не
+# поломка клиента, а честный красный прогон): неожиданный rc=0 здесь и есть
+# провал smoke, не наоборот.
+run_client_expect_fail() { # LABEL SCRIPT
+  local label=$1 script=$2 rc=0
+  rm -f "$SMOKE_STATE/openssl-n"
+  echo "SMOKE: прогон $label (ожидаем красный job)"
+  if ( bash "$script" </dev/null ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::SMOKE: $label завершился ЗЕЛЁНЫМ (0), а обязан был провалиться (провайдер в лимите — #422)" >&2
+    echo "--- журнал вызовов ---" >&2
+    cat "$CALLLOG" >&2
+    exit 1
+  fi
+}
+
 # ── Клиент рук ────────────────────────────────────────────────────────────────────
 RUNNER_TEMP="$TMP/rt" \
 TASK_ID="issue-123" \
@@ -413,7 +500,9 @@ WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
 RUNNER_TEMP="$TMP/rtw" \
 GH_TOKEN="smoke-pat-token" \
-GH_ISSUE_JSON='{"number":123,"title":"Smoke задача для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke задача & для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker" "$REPO/scripts/worker/task.sh"
 
 assert_log "MORDE-RPC session.create" "worker: сессия морды не создана"
@@ -422,6 +511,19 @@ assert_log "MORDE-INGEST" "worker: транскрипт не уехал в мо�
 assert_log "GH-COMMENT" "worker: нет отчёта в задачу"
 # Захват через аренду (#121): замок создан ДО сессии и работы.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "worker: аренда задачи 123 не взята"
+# Telegram-отчёт (#170): доставлен С parse_mode (иначе кликабельных ссылок
+# не бывает — plain text), и заголовок с «&» ушёл экранированным (иначе
+# Telegram отклонил бы всё сообщение целиком). Слово «выполнена» в отчёте
+# воркера запрещено: открытый PR ≠ сделанная задача, это слово теперь значит
+# только «слито в main» (scheduler.after_merge).
+tg_line=$(grep -F "TG-SEND" "$CALLLOG" | head -1)
+[ -n "$tg_line" ] || { echo "::error::SMOKE: worker: Telegram-отчёт не отправлен" >&2; exit 1; }
+grep -qF -- "parse_mode=HTML" <<<"$tg_line" \
+  || { echo "::error::SMOKE: worker: Telegram-отчёт без parse_mode=HTML: $tg_line" >&2; exit 1; }
+grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$tg_line" \
+  || { echo "::error::SMOKE: worker: заголовок ушёл в Telegram неэкранированным: $tg_line" >&2; exit 1; }
+grep -qF -- "выполнена" <<<"$tg_line" \
+  && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
 echo "SMOKE: worker — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
@@ -507,5 +609,150 @@ grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
 grep -qx "0" "$AI_SMOKE/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt ожидал '0' на успешном прогоне, получено: $(cat "$AI_SMOKE/dsh_rc.txt")" >&2; exit 1; }
 echo "SMOKE: ai-review — ок"
+
+# ── Ретрай RATE_LIMIT в ai-review (#419) ──────────────────────────────────────
+# Живой факт: worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate limit
+# reached for requests» — квоту съело параллельное ai-review. Здесь —
+# полный прогон ai_dsh.sh (не bash -n) на четырёх сценариях: временный
+# лимит снимается ретраем, недельный/месячный лимит и настоящая ошибка не
+# ждут вовсе, бюджет ожидания короткого лимита конечен. sleep стаблен
+# ТОЛЬКО здесь (после уже отработавших worker/hands выше) — эти клиенты
+# реального сна не ждут, а фоновый heartbeat-луп воркера/рук их не
+# использует постфактум.
+sleep() { :; }
+export -f sleep
+
+# 1) Временный RATE_LIMIT дважды, затем успех — ретрай обязан выжить.
+AI_RL1="$TMP/ai-rl-transient"
+mkdir -p "$AI_RL1"
+printf 'Промпт ревью (smoke): временный RATE_LIMIT\n' >"$AI_RL1/prompt.md"
+AI_WORK="$AI_RL1" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="transient-then-ok" \
+SMOKE_RATE_LIMIT_TRANSIENT_COUNT="2" \
+AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
+AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="1" \
+  run_client "ai-review-rate-limit-transient" "$REPO/scripts/review/ai_dsh.sh"
+grep -q "работа сделана после ретрая" "$AI_RL1/answer.txt" \
+  || { echo "::error::SMOKE: ai-review-transient: ретрай не довёл до успешного ответа" >&2; cat "$AI_RL1/answer.txt" >&2; exit 1; }
+grep -qx "0" "$AI_RL1/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-transient: dsh_rc.txt ожидал '0' после успешного ретрая, получено: $(cat "$AI_RL1/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+[ -s "$AI_RL1/failure_reason.txt" ] \
+  && { echo "::error::SMOKE: ai-review-transient: failure_reason.txt обязан быть пуст после успеха, получено: $(cat "$AI_RL1/failure_reason.txt")" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-transient — ок"
+
+# 2) RATE_LIMIT: Weekly/Monthly Limit Exhausted — падаем СРАЗУ, без ретрая
+# (сброс через дни — ждать внутри прогона бессмысленно).
+AI_RL2="$TMP/ai-rl-quota"
+mkdir -p "$AI_RL2"
+printf 'Промпт ревью (smoke): квота исчерпана надолго\n' >"$AI_RL2/prompt.md"
+AI_WORK="$AI_RL2" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
+  run_client "ai-review-rate-limit-quota" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL2/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL2/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "quota_exhausted" "$AI_RL2/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'quota_exhausted', получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-quota — ок"
+
+# 3) Настоящая ошибка провайдера (нет строки RATE_LIMIT вовсе) — падаем
+# сразу, как и до #419: ретрай не должен трогать этот класс.
+AI_RL3="$TMP/ai-rl-real-error"
+mkdir -p "$AI_RL3"
+printf 'Промпт ревью (smoke): настоящая ошибка\n' >"$AI_RL3/prompt.md"
+AI_WORK="$AI_RL3" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="real-error" \
+  run_client "ai-review-rate-limit-real-error" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL3/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-real-error: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL3/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+[ -s "$AI_RL3/failure_reason.txt" ] \
+  && { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt обязан быть пуст на настоящей ошибке (не лимит), получено: $(cat "$AI_RL3/failure_reason.txt")" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-real-error — ок"
+
+# 4) Временный RATE_LIMIT, который не снимается, — бюджет ожидания обязан
+# кончиться (не бесконечный ретрай, не занятый навечно job-слот).
+AI_RL4="$TMP/ai-rl-budget"
+mkdir -p "$AI_RL4"
+printf 'Промпт ревью (smoke): бюджет ретрая исчерпан\n' >"$AI_RL4/prompt.md"
+AI_WORK="$AI_RL4" \
+DEEPSEEK_API_KEY="smoke-key" \
+SMOKE_RATE_LIMIT_MODE="always-transient" \
+AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="0" \
+  run_client "ai-review-rate-limit-budget" "$REPO/scripts/review/ai_dsh.sh"
+grep -qx "1" "$AI_RL4/dsh_rc.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL4/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "rate_limit_retry_budget_exceeded" "$AI_RL4/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'rate_limit_retry_budget_exceeded', получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+echo "SMOKE: ai-review-rate-limit-budget — ок"
+
+# ── Тот же ретрай у worker/hands (#422 — раньше был только у ai-review) ──────────
+# Общий механизм (dsh_run_with_retry, lib/dsh-ci.sh) теперь общий для трёх
+# каналов; здесь — доказательство, что worker/hands реально его вызывают (а
+# не третья копия цикла) и что провайдер в лимите/квоте возвращает задачу в
+# пул (release-full: и замок, и назначение), а не оставляет её висеть.
+
+# 1) worker: первая попытка RATE_LIMIT, вторая успешна — мутация класса:
+# без ретрая (старое поведение) этот сценарий падал бы «без открытого PR».
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-rl1" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke RATE_LIMIT транзит","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+SMOKE_RATE_LIMIT_MODE="transient-then-ok" \
+SMOKE_RATE_LIMIT_TRANSIENT_COUNT="1" \
+WORKER_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
+WORKER_RATE_LIMIT_MAX_DELAY_SECS="1" \
+  run_client "worker-rate-limit-transient" "$REPO/scripts/worker/task.sh"
+assert_log "GH-COMMENT" "worker-rate-limit-transient: нет отчёта в задачу после успешного ретрая"
+assert_not_log "провайдер в лимите" "worker-rate-limit-transient: успешный ретрай не должен звучать как провал провайдера"
+echo "SMOKE: worker-rate-limit-transient — ок"
+
+# 2) worker: RATE_LIMIT Weekly/Monthly (квота надолго) — падает СРАЗУ, задача
+# возвращается в пул (снят и замок, и назначение), сообщение различает
+# «провайдер в лимите» от «воркер не справился» (правило AGENTS.md).
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-rl2" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke квота исчерпана","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+GH_PR_LIST_URL_JSON='[]' \
+SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
+  run_client_expect_fail "worker-rate-limit-quota" "$REPO/scripts/worker/task.sh"
+assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-rate-limit-quota: замок не снят при квоте — задача осталась занятой"
+assert_log "GH-API-UNASSIGN issue-123" "worker-rate-limit-quota: назначение не снято при квоте — задача осталась занятой"
+assert_log "провайдер в лимите" "worker-rate-limit-quota: сообщение не различает провайдера от собственной ошибки"
+assert_not_log "Автономный воркер не справился" "worker-rate-limit-quota: сообщение спутало лимит провайдера с ошибкой агента"
+tg_line=$(grep -F "TG-SEND" "$CALLLOG" | tail -1)
+grep -qF -- "провайдер в лимите" <<<"$tg_line" \
+  || { echo "::error::SMOKE: worker-rate-limit-quota: Telegram не различает провайдера от ошибки агента: $tg_line" >&2; exit 1; }
+echo "SMOKE: worker-rate-limit-quota — ок"
+
+# 3) hands: бюджет короткого RATE_LIMIT кончился раньше успеха — задача
+# (issue-N) возвращается в пул ПОСЛЕ того, как GH_RUN_TOKEN уже снят из
+# экспорта (trust-zone, #121): release-full обязан пройти на СОХРАНЁННОЙ
+# копии токена (LEASE_RELEASE_TOKEN), не на переменной окружения.
+scenario_start
+TASK_ID="issue-123" \
+TASK_TEXT="Smoke: бюджет ретрая рук исчерпан" \
+RUNNER_TEMP="$TMP/rt-h-rl" \
+GH_RUN_TOKEN="smoke-run-token" \
+SMOKE_RATE_LIMIT_MODE="always-transient" \
+HANDS_RATE_LIMIT_MAX_WAIT_SECS="0" \
+  run_client_expect_fail "hands-rate-limit-budget" "$REPO/scripts/hands/dsh_task.sh"
+assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "hands-rate-limit-budget: замок не снят — задача осталась занятой"
+assert_log "GH-API-UNASSIGN issue-123" "hands-rate-limit-budget: назначение не снято — задача осталась занятой"
+grep -qF "rate_limit_retry_budget_exceeded" "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
+grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-rate-limit-budget: job_end не fail" >&2; exit 1; }
+echo "SMOKE: hands-rate-limit-budget — ок"
 
 echo "SMOKE: все клиенты целы — гвардия класса зелёная"

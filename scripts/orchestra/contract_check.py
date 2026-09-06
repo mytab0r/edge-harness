@@ -3,11 +3,25 @@
 
 Правила (нарушение = проверка красная, такой PR не слить):
   1. PR с меткой `orchestra:skip` — явный обход контракта (мелочи вне пула).
-  2. В теле PR есть ссылка на задачу `#N`.
-  3. Задача #N открыта и помечена меткой `task`.
-  4. Задача назначена ровно одному исполнителю.
+  2. У PR определена задача пула. Источник — единственный, `task_ref.resolve_pr_task`
+     (#394, решение владельца 2026-09-06): имя agent-ветки (`agent/<N>-<slug>`,
+     ставит только `scripts/git/task-branch`, подделать нельзя). Тело PR для
+     этого вопроса не читается вовсе — ни первой строкой, ни любым другим
+     упоминанием `#N` (класс #187/#195).
+  3. Задача #N существует как issue (не PR), открыта, помечена меткой `task`
+     и не помечена `blocked` — см. task_eligibility_problems, одно место
+     правды. Задача НЕПРИГОДНА хотя бы по одной из этих причин — контракт
+     не выполняет над ней ни одного изменяющего вызова (не назначает
+     исполнителя, не сверяет дубликаты PR): нарушение только докладывается.
+     Ветка, называющая закрытую задачу, не переориентируется на другой номер
+     неявным чтением тела — заводится новая ветка на новый номер.
+  4. Задача назначена ровно одному исполнителю (проверяется/чинится только
+     для пригодной задачи, см. правило 3).
   5. У этой задачи нет ДРУГОГО открытого PR — второй PR на ту же задачу закрывается
-     оркестратором, брать задачу надо через назначение, а не через гонку веток.
+     оркестратором, брать задачу надо через назначение, а не через гонку веток
+     (тоже только для пригодной задачи). «Другой PR» — тот, у которого та же
+     задача выходит из `task_ref.resolve_pr_task` (та же ветка), симметрично
+     правилу 2.
 
 Среда: runner с `gh`, GH_TOKEN с правами issues/pull-requests.
 """
@@ -29,6 +43,12 @@ _TR_SPEC.loader.exec_module(task_ref)
 
 SKIP_LABEL = "orchestra:skip"
 TASK_LABEL = "task"
+# Эскалация playbook (scheduler.py: BLOCKED_LABEL) — «ждёт владельца», не
+# кандидат на авто-назначение. Строка та же, что и в scheduler.py, но
+# отдельная константа: тащить сюда модуль scheduler.py ради одного имени —
+# лишняя связка (contract_check и scheduler уже читают общие lib-модули, но
+# не друг друга).
+BLOCKED_LABEL = "blocked"
 
 
 def run_gh(*args: str) -> None:
@@ -68,6 +88,41 @@ def _all_open_pulls(repo: str) -> list[dict]:
             break
         page += 1
     return pulls
+
+
+def task_eligibility_problems(issue: dict, issue_number: int) -> list[str]:
+    """Единое место правды «можно ли вообще действовать над этой задачей» —
+    существует ли она как issue (не PR), открыта, несёт метку `task`, не
+    `blocked`. Пока этот список непуст, main() не имеет права выполнить НИ
+    ОДНОГО изменяющего вызова над issue_number (назначение, метки, комментарии
+    от её имени) — только копить причины отказа.
+
+    Живой случай, который эта функция закрывает (лог прогона 2026-09-06,
+    контракт PR #359): «contract: авто-назначение mytab0r на #131» сразу
+    следом за «Задача #131 закрыта — возьми открытую». Раньше проверка
+    состояния и авто-назначение стояли рядом в одной ветке if/else, и ничего
+    не мешало назначению выполниться уже ПОСЛЕ того, как о непригодности было
+    известно — правило есть, действие ему не подчинялось. Здесь пригодность
+    считается один раз, до всех действующих вызовов, и других мест, где эти
+    условия проверяются заново, в контракте больше нет."""
+    problems: list[str] = []
+    if "pull_request" in issue:
+        # Это PR, а не issue — остальные поля (state/labels исполнителя)
+        # созданы для issue и не значат то же самое на PR; дальше нечего
+        # проверять.
+        problems.append(f"#{issue_number} — это PR, а не задача из пула.")
+        return problems
+    if issue["state"] != "open":
+        problems.append(f"Задача #{issue_number} закрыта — возьми открытую или заведи новую.")
+    labels_issue = {label["name"] for label in issue["labels"]}
+    if TASK_LABEL not in labels_issue:
+        problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
+    if BLOCKED_LABEL in labels_issue:
+        problems.append(
+            f"Задача #{issue_number} помечена `{BLOCKED_LABEL}` — ждёт решения владельца, "
+            "бери свободную из пула."
+        )
+    return problems
 
 
 def fail(messages: list[str], repo: str, pr_number: int) -> None:
@@ -121,27 +176,27 @@ def main() -> int:
             "пост-мерж проверки (деплой/канарейка/E2E), приложив улики. "
             "Ссылайся на задачу просто #N."
         )
-    # Номер задачи признаётся только на ПЕРВОЙ непустой строке тела (без
-    # учёта HTML-комментариев), начинающейся с `#` и сразу цифрой — не любое
-    # упоминание issue в тексте PR и не любая строка с ведущим `#` (#251,
-    # #312) — декларация, не упоминание. Одно место правды —
-    # task_ref.declared_tasks (#195): то же правило применяется и к чужим
-    # PR ниже, симметрично.
-    issue_numbers = task_ref.declared_tasks(body)
-    if not issue_numbers:
-        problems.append("В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула.")
+    # Задача PR — task_ref.resolve_pr_task (#394, решение владельца
+    # 2026-09-06): единственный источник — имя agent-ветки. Тело PR здесь
+    # не читается вовсе, ни первой строкой, ни любым другим способом.
+    issue_number = task_ref.resolve_pr_task(pull)
+    if issue_number is None:
+        problems.append(
+            "Не удалось определить задачу PR: ветка должна называться "
+            "agent/<N>-<slug>. Заведи её скриптом scripts/git/task-branch "
+            "<N>-<slug> — номер задачи берётся только из имени ветки, тело "
+            "PR не читается."
+        )
 
-    if issue_numbers:
-        issue_number = issue_numbers[0]
+    if issue_number is not None:
         issue = gh(f"repos/{repo}/issues/{issue_number}")
-        if "pull_request" in issue:
-            problems.append(f"#{issue_number} — это PR, а не задача из пула.")
+        # Пригодность считается ОДИН раз, ДО единого изменяющего вызова над
+        # этой issue (см. task_eligibility_problems) — непригодна, дальше не
+        # действуем вовсе, только докладываем причину.
+        eligibility = task_eligibility_problems(issue, issue_number)
+        if eligibility:
+            problems.extend(eligibility)
         else:
-            if issue["state"] != "open":
-                problems.append(f"Задача #{issue_number} закрыта — возьми открытую или заведи новую.")
-            labels_issue = {label["name"] for label in issue["labels"]}
-            if TASK_LABEL not in labels_issue:
-                problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
             assignees = [a["login"] for a in issue["assignees"]]
             author = pull["user"]["login"]
             if not assignees:
@@ -157,19 +212,17 @@ def main() -> int:
                     f"(назначено: {', '.join(assignees)}). Бери свободную из пула."
                 )
             # Чужие открытые PR на ту же задачу — гонка веток; она разрешается здесь.
-            # Симметрично своему PR: конфликт только если чужой PR ОБЪЯВЛЯЕТ эту
-            # задачу (ПЕРВАЯ непустая строка тела, без учёта HTML-комментариев,
-            # начинающаяся с `#` и сразу цифрой, #251, #312), а не просто
-            # упоминает её номер в прозе описания (#195 — второй экземпляр
-            # асимметрии #187: своя декларация уже была узкой, чужая гонялась
-            # по всему тексту).
+            # Симметрично своему PR (#394): конфликт, если ветка чужого PR
+            # называет ту же задачу (task_ref.resolve_pr_task), а не просто
+            # любое упоминание её номера в прозе описания (#195 — второй
+            # экземпляр асимметрии #187: своя декларация уже была узкой,
+            # чужая гонялась по всему тексту).
             others = []
             pulls = _all_open_pulls(repo)
             for other in pulls:
                 if other["number"] == args.pr:
                     continue
-                other_body = other["body"] or ""
-                if task_ref.declares_task(other_body, issue_number):
+                if task_ref.resolve_pr_task(other) == issue_number:
                     others.append(other["number"])
             if others:
                 problems.append(

@@ -17,7 +17,7 @@
 
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { loadManifest, manifestDirectory } from './manifest.mjs'
+import { loadManifestWithForgeExtra, manifestDirectory } from './manifest.mjs'
 
 const cloneRoot = process.argv[2]
 if (!cloneRoot) {
@@ -28,7 +28,9 @@ if (!cloneRoot) {
 const MODULE_HEADER = '// Generated from dsh-edge/plugins.json — do not edit; run dsh-edge/codegen-edge-plugins.mjs.\n'
 
 const repoDir = manifestDirectory()
-const manifest = await loadManifest(repoDir)
+// FORGE_EXTRA_PLUGIN (env) — плагин форжа, которого ещё нет в dsh-edge/plugins.json
+// на момент интеграционного дыма plugin-forge.yml; см. manifest.mjs.
+const manifest = await loadManifestWithForgeExtra(repoDir)
 
 const generatedModule = renderServerModule(manifest.plugins)
 const generatedRoster = renderClientRoster(manifest.plugins)

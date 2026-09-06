@@ -22,7 +22,7 @@
 
 import { access, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { loadManifest, manifestDirectory } from './manifest.mjs'
+import { loadManifestWithForgeExtra, manifestDirectory } from './manifest.mjs'
 
 const cloneRoot = process.argv[2]
 if (!cloneRoot) {
@@ -30,7 +30,9 @@ if (!cloneRoot) {
   process.exit(2)
 }
 
-const manifest = await loadManifest(manifestDirectory())
+// FORGE_EXTRA_PLUGIN (env) — плагин форжа, которого ещё нет в dsh-edge/plugins.json
+// на момент интеграционного дыма plugin-forge.yml; см. manifest.mjs.
+const manifest = await loadManifestWithForgeExtra(manifestDirectory())
 const standaloneRoot = join(cloneRoot, 'apps', 'dsh-edge', 'standalone')
 
 for (const plugin of manifest.plugins) {

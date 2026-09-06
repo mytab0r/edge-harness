@@ -80,6 +80,40 @@ def test_should_update_branch_true_when_both_verdicts_green_without_conflict():
     assert review_labels.should_update_branch(labels) is True
 
 
+# ── gate1_decided (#432): «гейт 1 вынес вердикт» ≠ «гейт 1 разрешил слияние» ─────
+# review:large тоже означает «гейт 1 отработал» — merge_label_gate его по-прежнему
+# не пропускает (слияние ждёт review:large-ok).
+
+
+def test_gate1_decided_true_for_review_ok():
+    assert review_labels.gate1_decided(["review:ok"]) is True
+
+
+def test_gate1_decided_true_for_review_large():
+    # Живой случай #412 (#432): review:large без review:ok — гейт 1 отработал,
+    # просто вердикт другой; это не то же самое, что «гейта не было».
+    assert review_labels.gate1_decided(["review:large", "ai:failed"]) is True
+
+
+def test_gate1_decided_false_without_any_gate1_label():
+    assert review_labels.gate1_decided([]) is False
+    assert review_labels.gate1_decided(["ai:failed"]) is False
+
+
+def test_gate1_decided_true_does_not_imply_merge_label_gate_open():
+    # Граница, которую нельзя сломать (#432): review:large решает «гейт 1
+    # отработал», но merge_label_gate обязан оставаться закрытым для него —
+    # слияние ждёт review:large-ok, а не просто отметки гейта 1.
+    labels = ["review:large", "ai:ok"]
+    assert review_labels.gate1_decided(labels) is True
+    assert review_labels.merge_label_gate(labels) is not None
+
+
+def test_gate1_decided_accepts_label_name_set_and_dict_list():
+    assert review_labels.gate1_decided([{"name": "review:large"}]) is True
+    assert review_labels.gate1_decided({"review:ok"}) is True
+
+
 def test_should_update_branch_accepts_label_name_set_and_dict_list():
     # _names() поддерживает обе прод-формы: список dict'ов API и множество имён
     # (см. review_labels._names) — предикат обязан работать с обеими.
@@ -519,3 +553,85 @@ def test_should_run_ai_review_mutation_guard_naive_any_verdict_check():
         review_labels.diff_unchanged("fp", "fp")
     assert naive_would_skip is True  # «наивная» реализация пропустила бы прогон
     assert review_labels.should_run_ai_review([{"name": "ai:failed"}], "fp", "fp") is True  # фикс — нет
+
+
+# ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
+#
+# Класс, который эти тесты ловят: состояние статуса обязано совпадать с тем,
+# что решает метка (review_status_state — тот же порог, что merge_label_gate;
+# ai_status_state — сбой транспорта не должен блокировать слияние навсегда).
+# Докажи мутацией: замени `if verdict == "approve"` на `if verdict != "rework"`
+# в ai_status_state — тест test_ai_status_state_error_is_pending_not_failure
+# покраснеет (error перестанет отличаться от approve).
+
+def test_review_status_state_success_only_on_review_ok():
+    assert review_labels.review_status_state(review_labels.REVIEW_OK) == "success"
+    assert review_labels.review_status_state(review_labels.REVIEW_CHANGES) == "failure"
+    assert review_labels.review_status_state(review_labels.REVIEW_LARGE) == "failure"
+
+
+def test_ai_status_state_matches_label_semantics():
+    assert review_labels.ai_status_state("approve") == "success"
+    assert review_labels.ai_status_state("rework") == "failure"
+
+
+def test_ai_status_state_error_is_pending_not_failure():
+    # Обоснование (см. docstring ai_status_state и отчёт задачи #345): error
+    # чаще всего — сбой провайдера/транспорта, не решение о коде. failure
+    # держал бы required status check красным до нового пуша человеком;
+    # pending — точное состояние «ещё не решено», снимается автоповтором
+    # по таймеру (#196) без вмешательства человека.
+    assert review_labels.ai_status_state("error") == "pending"
+    assert review_labels.ai_status_state("error") != "failure"
+
+
+def test_post_commit_status_builds_expected_gh_api_call():
+    calls: list[tuple] = []
+
+    def fake_run_gh(*args):
+        calls.append(args)
+
+    review_labels.post_commit_status(
+        "o/r", "deadbeef", review_labels.STATUS_REVIEW, "success",
+        "review: review:ok (+10 строк)", fake_run_gh, target_url="https://x/y")
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[:3] == ("api", "-X", "POST")
+    assert args[3] == "repos/o/r/statuses/deadbeef"
+    assert "-f" in args
+    joined = " ".join(args)
+    assert "state=success" in joined
+    assert f"context={review_labels.STATUS_REVIEW}" in joined
+    assert "description=review: review:ok (+10 строк)" in joined
+    assert "target_url=https://x/y" in joined
+
+
+def test_post_commit_status_omits_target_url_when_none():
+    calls: list[tuple] = []
+    review_labels.post_commit_status(
+        "o/r", "deadbeef", review_labels.STATUS_AI_REVIEW, "pending",
+        "ai-review: error", lambda *a: calls.append(a))
+    assert "target_url" not in " ".join(calls[0])
+
+
+def test_post_commit_status_truncates_description_to_140_chars():
+    long_description = "x" * 200
+    calls: list[tuple] = []
+    review_labels.post_commit_status(
+        "o/r", "sha", review_labels.STATUS_REVIEW, "failure",
+        long_description, lambda *a: calls.append(a))
+    description_arg = next(a for a in calls[0] if a.startswith("description="))
+    assert len(description_arg) == len("description=") + 140
+
+
+def test_run_target_url_none_without_actions_env(monkeypatch):
+    monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    assert review_labels.run_target_url("o/r") is None
+
+
+def test_run_target_url_built_from_actions_env(monkeypatch):
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    assert review_labels.run_target_url("o/r") == "https://github.com/o/r/actions/runs/123"

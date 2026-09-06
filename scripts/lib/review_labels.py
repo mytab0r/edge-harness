@@ -23,9 +23,18 @@ AI-ревью-комментария (latest_ai_comment), и сохраняет 
 
 Импорт из соседних каталогов — importlib по файлу (паттерн claim_task):
 скрипты запускаются как файлы, не как пакет.
+
+Commit Status API (#345, кандидат из docs/research/23-platform-native-vs-custom.md
+п.2): оба вердикта публикуются ВТОРЫМ каналом, POST /repos/{repo}/statuses/{sha},
+параллельно меткам — переходный период, метки не убираются. Второго источника
+истины не заводится: STATUS_* ниже вычисляются из ТОЙ ЖЕ переменной вердикта,
+которую вызывающий код (check_pr.py/ai_review.py) уже использует для метки, не
+отдельным запросом к GitHub. Цель — нативный `allow_auto_merge` (уже включён на
+репозитории): метки он не видит, required status checks — видит.
 """
 
 import hashlib
+import os
 import re
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
@@ -45,6 +54,20 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # scheduler.py) — should_update_branch ниже читает её же.
 CONFLICT_LABEL = "conflict"
 
+# ── Гвардия молчаливого отката main (#217) ───────────────────────────────────
+# Газ гвардии check_pr.revert_guard: PR, чей дифф удаляет запись прод-манифеста
+# или файл патч-серии, красит детерминированное ревью; эта метка, поставленная
+# исполнителем ОСОЗНАННО вместе с объяснением в теле PR, объявляет удаление
+# входящим в замысел. Значение здесь, рядом с остальными метками, которые
+# читает конвейер; кто ставит/что блокирует/порог — docs/agents/LABELS.md.
+REVERT_OK = "revert-ok"
+
+# ── Commit Status API — вердикты вторым каналом, параллельно меткам (#345) ───
+# Контексты кандидата в required_status_checks (branch protection ставит
+# владелец вручную после подтверждения живым прогоном — не эта задача).
+STATUS_REVIEW = "harness/review"
+STATUS_AI_REVIEW = "harness/ai-review"
+
 # Состояния mergeable_state, при которых GitHub ЯВНО подтвердил «не dirty» —
 # только по ним mark_conflicts вправе снять CONFLICT_LABEL (#270). None/
 # "unknown" сюда не входят: «вычисление не завершилось» — не то же самое,
@@ -60,6 +83,39 @@ def _names(labels) -> set[str]:
         return {label["name"] for label in labels}
     except TypeError:
         return set(labels)
+
+
+# Обе метки, любой из которых означает «гейт 1 вынёс вердикт» (#432) — общий
+# кортеж для gate1_decided ниже и для потребителей, которым нужен сам набор
+# имён меток (например, фильтр события `labeled` в таймлайне PR), не только
+# булев ответ.
+GATE1_LABELS = (REVIEW_OK, REVIEW_LARGE)
+
+
+def gate1_decided(labels) -> bool:
+    """True — гейт 1 (детерминированное ревью) уже вынес ЛЮБОЙ вердикт:
+    `review:ok` ИЛИ `review:large` (метки взаимоисключающие — verdict_for
+    ставит ровно одну, не обе сразу).
+
+    Не путать с merge_label_gate ниже: тот отвечает на другой вопрос —
+    «гейт 1 разрешил СЛИЯНИЕ» (там `review:large` не считается, оно и
+    блокирует слияние до `review:large-ok`). Этот предикат — про «гейт 1
+    уже закончил работу и решение можно продолжать конвейером» (двигать
+    таймер ожидания вердикта AI, запускать автоповтор, считать инвариант
+    состояния): для крупного PR это решение — `review:large`, и оно ничем
+    не хуже `review:ok` с точки зрения «есть на что реагировать дальше».
+
+    Смешение этих двух вопросов в одной проверке `REVIEW_OK in labels`
+    once уже сделало AI-ревью невидимым для крупных PR на полгода (#396,
+    PR #393 — `ai-review.yml::facts` открывался только по `review:ok`),
+    а второй раз то же смешение сделало недостижимым для review:large PR
+    и автоповтор ai-review, и наблюдательный инвариант
+    `repo_invariants.check_stuck_review_gate` (#432, живой случай — PR #412:
+    `review:large` + `ai:failed`, автоповторов ноль спустя полтора часа при
+    пороге 30 минут). Единственное место правды — здесь, оба потребителя
+    читают этот предикат, не переопределяют его локально."""
+    names = _names(labels)
+    return bool(names & set(GATE1_LABELS))
 
 
 def merge_label_gate(labels) -> str | None:
@@ -381,3 +437,146 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
         if facts.get("reviewer") in ("approve", "rework", "error"):
             latest = comment
     return latest
+
+
+# ── Commit Status API: вторая проводка вердикта, не второй источник (#345) ───
+#
+# Мотив — docs/research/23-platform-native-vs-custom.md п.2: `allow_auto_merge`
+# (включён на репозитории) читает required status checks, не метки. Метка
+# остаётся единственным местом ПРИНЯТИЯ решения (merge_label_gate/scheduler
+# её не трогаем этой задачей) — статус только ЗЕРКАЛИТ то же решение вторым
+# каналом, вычисляясь из той же переменной вердикта в check_pr.py/ai_review.py.
+
+def run_target_url(repo: str) -> str | None:
+    """target_url текущего прогона Actions (GITHUB_SERVER_URL/{repo}/actions/runs/{id}).
+
+    None вне Actions (локальный запуск, тест, ручной вызов без окружения
+    раннера) — статус тогда публикуется без ссылки, не падает: отсутствие
+    диагностической ссылки не то же самое, что отсутствие самого вердикта."""
+    server = os.environ.get("GITHUB_SERVER_URL")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not server or not run_id:
+        return None
+    return f"{server}/{repo}/actions/runs/{run_id}"
+
+
+def post_commit_status(repo: str, sha: str, context: str, state: str,
+                        description: str, run_gh_func,
+                        target_url: str | None = None) -> None:
+    """POST /repos/{repo}/statuses/{sha} — вердикт вторым каналом, тем же
+    состоянием, что метка (см. review_status_state/ai_status_state).
+    `run_gh_func` — вызывающий `gh(*args)`/`run_gh` того же модуля (паттерн
+    остальных функций этого файла: сеть не зашивается сюда, инъекция
+    зависимости для тестов без сети). description обрезается до 140 символов —
+    жёсткий лимит самого API именно в символах (срез `[:140]` режет по
+    символам Python-строки, не по байтам UTF-8 — кириллица не обрезается
+    сильнее нужного), обрезка здесь, а не молчаливый отказ GitHub."""
+    args = ["api", "-X", "POST", f"repos/{repo}/statuses/{sha}",
+            "-f", f"state={state}", "-f", f"context={context}",
+            "-f", f"description={description[:140]}"]
+    if target_url:
+        args += ["-f", f"target_url={target_url}"]
+    run_gh_func(*args)
+
+
+def review_status_state(verdict: str) -> str:
+    """Состояние статуса гейта 1 по вердикт-метке (REVIEW_OK/REVIEW_CHANGES/
+    REVIEW_LARGE) — success только при REVIEW_OK, ровно тот же порог, что
+    merge_label_gate. REVIEW_CHANGES и REVIEW_LARGE оба блокируют слияние —
+    оба дают failure, второго промежуточного состояния тут нет."""
+    return "success" if verdict == REVIEW_OK else "failure"
+
+
+
+# ── Ручной workflow_dispatch не должен дублировать прогон, который уже
+# идёт или уже вынес окончательный вердикт (#399) ───────────────────────────
+#
+# Аудит 197 платных прогонов ai-review за 2026-09-05/06 нашёл утечку: 44 из
+# них (22%) — ручные workflow_dispatch под личным токеном владельца,
+# дублирующие уже идущий или уже завершённый прогон на том же PR, БЕЗ
+# ai:failed. Причина — ai_review.py::cmd_should_run с --force не заходил в
+# сеть вовсе, а сам workflow выставлял --force БЕЗУСЛОВНО для любого
+# workflow_dispatch (см. Дельта 2026-09-05 в
+# docs/decisions/0007-ai-review-gate.md), минуя should_run_ai_review выше
+# целиком. --force остаётся, но только по явному input force:true — по
+# умолчанию ручной запуск проходит ТУ ЖЕ сверку, что и автоматический.
+#
+# Отдельная гонка, которую сверка отпечатка не ловит: PR ещё БЕЗ вердикта
+# (первое ревью), но прогон УЖЕ идёт прямо сейчас — should_run_ai_review
+# честно вернёт True (вердикта нет — прогон нужен), хотя второй одновременный
+# прогон того же PR бессмыслен. Единственный надёжный признак «этот прогон
+# про PR N» — run-name (см. `run-name:` в ai-review.yml): у самого
+# ai-review-рана head_branch/head_sha ВСЕГДА "main" (job чекаутит main первым
+# шагом) независимо от триггера — проверено на живых прогонах 2026-09-06
+# (`gh api .../actions/workflows/ai-review.yml/runs` отдаёт
+# head_branch=head_sha=main и для workflow_run, и для workflow_dispatch),
+# поэтому матч по head_sha/head_branch не отличает прогоны разных PR вовсе.
+
+AI_REVIEW_WORKFLOW_FILE = "ai-review.yml"
+# Префикс совпадает с run-name: в ai-review.yml дословно — тест
+# test_ai_review_workflow_run_name_uses_review_labels_prefix в
+# scripts/review/test_ai_review.py сверяет буквально, иначе стороны могут
+# разойтись молча (yml не читает эту константу — два языка).
+AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
+
+
+def ai_review_run_name(pr: int) -> str:
+    """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
+    ДО старта job'а (workflow-level `run-name:`, вычисляется из события: у
+    workflow_dispatch — input `pr`, у workflow_run — из
+    `github.event.workflow_run.pull_requests[0].number`, доступного в
+    событии pr-review БЕЗ похода в API). Форк-PR — известное ограничение:
+    `pull_requests` пуст для PR не из этого репозитория (документированное
+    поведение GitHub) — тогда автоматический прогон получает run-name без
+    номера PR и этой функцией не матчится: деградация признака для форков,
+    не молчаливая ошибка гейта (остальные PR защищены)."""
+    return f"{AI_REVIEW_RUN_NAME_PREFIX}{pr}"
+
+
+def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> list[dict]:
+    """Прогоны `ai-review.yml` (`queued`/`in_progress`) для PR #pr, кроме
+    прогона `exclude_run_id` (себя) — читает ручной `workflow_dispatch`
+    (`ai_review.py::cmd_should_run`), чтобы отказать, если ревью этого PR уже
+    идёт прямо сейчас: второй одновременный прогон денег ждать не должен.
+
+    Не листает глубже одной страницы на статус (`per_page=100`): одновременно
+    активных прогонов одного workflow на масштабе этого репозитория ожидается
+    единицы, не сотни — при реальном превышении это отдельная, более крупная
+    проблема, которую этот гейт не обязан решать."""
+    target = ai_review_run_name(pr)
+    matches: list[dict] = []
+    for status in ("in_progress", "queued"):
+        chunk = gh_func(
+            f"repos/{repo}/actions/workflows/{AI_REVIEW_WORKFLOW_FILE}/runs"
+            f"?status={status}&per_page=100")
+        runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
+        matches.extend(
+            run for run in runs
+            if run.get("display_title") == target
+            and str(run.get("id")) != str(exclude_run_id)
+        )
+    return matches
+
+
+def ai_status_state(verdict: str) -> str:
+    """Состояние статуса гейта 2 по вердикту ai_review.parse_verdict
+    (approve/rework/error, НЕ по имени метки): approve → success,
+    rework → failure, error → pending.
+
+    error — это НЕ вердикт о коде: ai_review.error_reason различает три
+    состояния, и error чаще всего означает сбой провайдера/транспорта DSH
+    (transport_failed), у которого уже есть свой газ — автоповтор по таймеру
+    (scheduler.py::trigger_ai_review, #196), не зависящий от того, что стоит
+    на PR сейчас. `failure` держал бы required status check красным
+    НАВСЕГДА до следующего пуша человеком (в отличие от метки, которую
+    сбрасывает следующий прогон конвейера, обязательная проверка сама себя
+    не пересчитывает) — то есть код мог быть безупречен, а слияние
+    заблокировано так, будто ревью его отвергло. `pending` — точное описание
+    факта: решение ещё не вынесено, придёт с автоповтором; ложноположительным
+    `success` это не грозит, потому что pending не открывает auto-merge.
+    """
+    if verdict == "approve":
+        return "success"
+    if verdict == "rework":
+        return "failure"
+    return "pending"

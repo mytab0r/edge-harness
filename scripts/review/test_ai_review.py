@@ -12,6 +12,8 @@ gh не вызывается ни одной тестируемой функци
 
 import argparse
 import importlib.util
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,8 @@ LABELS = Path(__file__).resolve().parents[1] / "lib" / "review_labels.py"
 rl_spec = importlib.util.spec_from_file_location("review_labels", LABELS)
 rl = importlib.util.module_from_spec(rl_spec)
 rl_spec.loader.exec_module(rl)  # type: ignore[union-attr]
+
+AI_REVIEW_YML = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ai-review.yml"
 
 
 # ── Контракт вердикта: неоднозначность никогда не одобряет ────────────────────
@@ -154,6 +158,38 @@ def test_findings_of_strips_verdict_and_tasks():
     assert "Тело." not in findings
 
 
+# ── Третья категория находок: блок ЗАМЕЧАНИЕ (#462) ───────────────────────────
+
+def test_findings_of_strips_remark_blocks_too():
+    # Замечание (некритичная находка) не должно задваиваться свободной прозой
+    # комментария — оно уходит в чеклист тела PR (review_checklist), не сюда.
+    answer = (
+        "Основной вывод: всё хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: docs/foo.md устарел\nПоправь формулировку.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    findings = ai.findings_of(answer)
+    assert "Основной вывод: всё хорошо." in findings
+    assert "ЗАМЕЧАНИЕ" not in findings
+    assert "docs/foo.md устарел" not in findings
+    assert "Поправь формулировку." not in findings
+
+
+def test_build_comment_notes_remarks_moved_to_pr_body_checklist():
+    remarks = [{"title": "Замечание раз", "body": "Поправь X."}]
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [], remarks=remarks)
+    assert "Замечание раз" in body
+    assert "чеклист" in body.lower()
+    # Само тело ЗАМЕЧАНИЯ не дублируется в комментарий — оно живёт в PR body
+    # (review_checklist.merge_checklist), комментарий только ссылается на факт.
+    assert "Поправь X." not in body
+
+
+def test_build_comment_without_remarks_no_checklist_mention():
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [])
+    assert "чеклист" not in body.lower()
+
+
 # ── Канонический комментарий: шапка-факты + фенсы задач ──────────────────────
 
 def test_build_comment_facts_header_and_fences():
@@ -193,9 +229,12 @@ def test_header_facts_ignores_fenced_and_prose_lines():
 
 
 def test_tasks_from_comment_roundtrip():
+    # Роундтрип через фенсы — только для МАСШТАБ: отдельно (#426): именно эти
+    # задачи file_tasks.py заводит issue'ами, остальное build_comment уводит
+    # прозой (см. test_build_comment_tail_scope_not_fenced ниже).
     tasks = [
-        {"title": "Задача раз", "body": "Цель.\nКритерий."},
-        {"title": "Задача два", "body": "Тело."},
+        {"title": "Задача раз", "body": "Цель.\nКритерий.", "scope": "отдельно"},
+        {"title": "Задача два", "body": "Тело.", "scope": "отдельно"},
     ]
     body = ai.build_comment(140, "abc", "rework", "Находки.", tasks)
     assert ai.tasks_from_comment(body) == tasks
@@ -204,7 +243,8 @@ def test_tasks_from_comment_roundtrip():
 def test_tasks_roundtrip_keeps_inner_code_fence():
     # тело задачи с ```-фенсом (пример команды) не должно обрезаться:
     # внешний забор — 4 бэктика, внутренний тройной остаётся телом
-    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий."}]
+    tasks = [{"title": "Задача с кодом", "body": "Цель.\n```\nкоманда --с флагом\n```\nКритерий.",
+              "scope": "отдельно"}]
     body = ai.build_comment(140, "abc", "approve", "Ок.", tasks)
     assert ai.tasks_from_comment(body) == tasks
 
@@ -212,6 +252,55 @@ def test_tasks_roundtrip_keeps_inner_code_fence():
 def test_tasks_from_comment_unclosed_fence_dropped():
     body = "pr: 1\nhead: a\nreviewer: approve\n\n````задача\nОборванная задача"
     assert ai.tasks_from_comment(body) == []
+
+
+def test_build_comment_tail_scope_not_fenced():
+    # Обещанный тест (находка ревью #433, п.2): сырой ответ модели с ТРЕМЯ
+    # блоками — отдельно/хвост/без поля — от parse_tasks до tasks_from_comment,
+    # доказывающий оба свойства критерия готовности #426: (а) МАСШТАБ реально
+    # разбирается в scope (значение или None), (б) содержимое хвостов и
+    # безполевых находок остаётся ВИДИМО в комментарии автору, а не молча
+    # исчезает — только не фенсится issue'ом.
+    answer = (
+        "Находки описаны ниже.\n\n"
+        "ЗАДАЧА: Отдельная работа\n"
+        "МАСШТАБ: отдельно\n"
+        "Требует нового дизайна вне этого PR.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Доделай прямо тут\n"
+        "МАСШТАБ: хвост\n"
+        "Укладывается в уже изменённые файлы.\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "ЗАДАЧА: Забыли поле\n"
+        "Модель не указала масштаб.\n"
+        "КОНЕЦ ЗАДАЧИ\n\n"
+        "ВЕРДИКТ: rework"
+    )
+    tasks = ai.parse_tasks(answer)
+    by_title = {t["title"]: t for t in tasks}
+    # (а) scope реально разобран — не угадан молча.
+    assert by_title["Отдельная работа"]["scope"] == "отдельно"
+    assert by_title["Доделай прямо тут"]["scope"] == "хвост"
+    assert by_title["Забыли поле"]["scope"] is None
+
+    findings = ai.findings_of(answer, tasks)
+    body = ai.build_comment(163, "sha163", "rework", findings, tasks)
+
+    # (б) содержимое хвоста и безполевой находки живёт в комментарии —
+    # мутация «выпилить обе секции из build_comment» красит эти строки.
+    assert "### Доделай в этом PR" in body
+    assert "Доделай прямо тут" in body
+    assert "Укладывается в уже изменённые файлы." in body
+    assert "### ⚠️ Без объявленного МАСШТАБА" in body
+    assert "Забыли поле" in body
+    assert "Модель не указала масштаб." in body
+
+    # Только «отдельно» уходит фенсом — file_tasks.py заведёт issue РОВНО
+    # на одну находку, не на три (граница в build_comment, не в file_tasks.py).
+    fenced = ai.tasks_from_comment(body)
+    assert [t["title"] for t in fenced] == ["Отдельная работа"]
+    assert "Доделай прямо тут" not in [t["title"] for t in fenced]
+    assert "Забыли поле" not in [t["title"] for t in fenced]
 
 
 # ── Гейт слияния по меткам (одно место правды — review_labels) ────────────────
@@ -359,6 +448,62 @@ def test_error_reason_transport_failure_wins_over_line_check():
     # что-то похожее на строку вердикта — транспорт упал раньше любого текста.
     reason = ai.error_reason("ВЕРДИКТ: approve", "1")
     assert "ошибка провайдера" in reason
+
+
+# ── RATE_LIMIT: «лимита нет вовсе» vs «лимит есть, но что-то ещё сломано»
+# (#419, живой факт: worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate
+# limit reached for requests» — квоту съело параллельное ai-review). Разные
+# failure_reason из ai_dsh.sh обязаны звучать по-разному в тексте вердикта —
+# правило AGENTS.md: «возможности нет» и «возможность есть, но сломана» не
+# смешиваются в одно сообщение.
+
+def test_error_reason_quota_exhausted_distinct_from_generic_transport():
+    reason = ai.error_reason("", "1", "quota_exhausted")
+    assert "исчерпана надолго" in reason
+    assert "Weekly/Monthly" in reason
+    # не должно читаться как generic-транспорт (иначе владелец не поймёт,
+    # что повторять внутри прогона бессмысленно, а не «просто не повезло»)
+    assert "ошибка провайдера/транспорта DSH" not in reason
+
+
+def test_error_reason_rate_limit_retry_budget_exceeded_distinct():
+    reason = ai.error_reason("", "1", "rate_limit_retry_budget_exceeded")
+    assert "RATE_LIMIT" in reason
+    assert "бюджет ожидания" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+    # и не должно путаться с quota_exhausted — разный класс, разный текст
+    assert "исчерпана надолго" not in reason
+
+
+@pytest.mark.parametrize("failure_reason", ["quota_exhausted", "rate_limit_retry_budget_exceeded"])
+def test_error_reason_rate_limit_variants_differ_from_each_other(failure_reason):
+    # Мутация-гвардия: если бы обе ветки схлопнулись в одну (например забыли
+    # elif и обе попадали в один return), эти два текста стали бы идентичны —
+    # тест на нашёл бы разницу; сравнение явное, чтобы разница была видна.
+    quota = ai.error_reason("", "1", "quota_exhausted")
+    budget = ai.error_reason("", "1", "rate_limit_retry_budget_exceeded")
+    assert quota != budget
+
+
+def test_error_reason_empty_failure_reason_keeps_old_behavior():
+    # Обратная совместимость: вызов без failure_reason (как раньше, включая
+    # ручной запуск verdict без --failure-reason) не должен внезапно решить,
+    # что это лимит — старое поведение (generic-транспорт) остаётся.
+    reason = ai.error_reason("", "1")
+    assert "ошибка провайдера/транспорта DSH" in reason
+    assert "quota_exhausted" not in reason
+    assert "RATE_LIMIT" not in reason
+
+
+def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
+    # cmd_verdict считает reason только когда verdict == "error" (см. cmd_verdict) —
+    # здесь фиксируем контракт самой функции error_reason: она не смотрит на
+    # verdict вообще, решение «звать ли её» — вызывающего (cmd_verdict).
+    # Гвардия от регресса: failure_reason не должен давать любой другой текст,
+    # когда явно не распознан (опечатка в теге) — тогда падаем на generic-путь,
+    # а не молчим.
+    reason = ai.error_reason("", "1", "какой-то незнакомый тег")
+    assert "ошибка провайдера/транспорта DSH" in reason
 
 
 # ── Идемпотентность file_tasks: маркер filed: в ПОСЛЕДНЕЙ строке ───────────────
@@ -588,6 +733,39 @@ def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatc
     assert capsys.readouterr().out.strip() == "true"
 
 
+# ── main(): «решили не запускать» (go=false, exit 0) не путать с «не смогли
+# решить» (RuntimeError гейта — сеть/права/битый ответ API, exit 1) ───────────
+#
+# Регрессия 2026-09-06 (PR #416/#399, живой прогон 34009775887, PR #333):
+# ai-review.yml читает should-run как `run_needed=$(python ... should-run
+# ...)` — bash command substitution забирает ТОЛЬКО stdout процесса. main()
+# ловил RuntimeError СНАРУЖИ функции (в блоке if __name__) и печатал причину
+# без file=sys.stderr — она уезжала в $run_needed и пропадала из лога job'а:
+# шаг падал с голым «::error::не смог решить...» без единой подсказки почему.
+# Обе строки ниже уже покрыты (test_cmd_should_run_prints_false_when_diff_
+# unchanged_ai_ok — go=false здесь ВСЕГДА exit 0, «решили не запускать»
+# никогда не роняет job); эта пара добавляет вторую половину — «не смогли
+# решить» обязано быть exit 1 С ВИДИМОЙ причиной именно в stderr.
+
+def test_main_reports_gh_runtime_error_on_stderr_not_stdout(monkeypatch, capsys):
+    def gh_network_down(*_args, **_kwargs):
+        raise RuntimeError("FAKE_GH_API_5xx_MARKER")
+
+    monkeypatch.setattr(ai, "gh", gh_network_down)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setattr(sys, "argv", ["ai_review.py", "should-run", "--pr", "294"])
+
+    rc = ai.main()
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "FAKE_GH_API_5xx_MARKER" in captured.err, (
+        "причина сбоя обязана быть в stderr — иначе она пропадает при "
+        f"$(...) в ai-review.yml (stdout был: {captured.out!r})")
+    assert "FAKE_GH_API_5xx_MARKER" not in captured.out
+
+
 def test_is_not_found_exact_form_only():
     # прод-форма gh: «gh api repos/o/r/issues/404: Not Found (HTTP 404)»
     assert ai.is_not_found(RuntimeError(
@@ -626,7 +804,8 @@ def _fake_gh_verdict(head_first: str, head_second: str, files: list, labels: lis
 def _verdict_args(tmp_path, body: str) -> argparse.Namespace:
     answer = tmp_path / "answer.txt"
     answer.write_text(body, encoding="utf-8")
-    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="")
+    return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="",
+                               failure_reason="")
 
 
 def test_cmd_verdict_order_head_then_files_then_head_again(monkeypatch, tmp_path, capsys):
@@ -716,3 +895,445 @@ def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, 
     # именно это и не должно происходить в проде, что и доказывает предыдущий
     # тест на текущем (исправленном) cmd_verdict.
     assert run_gh_calls != []
+
+
+# ── cmd_verdict: третья категория находок — чеклист тела PR (#462) ───────────
+
+def _pr_patches(run_gh_calls: list[tuple], pr: int = 294) -> list[str]:
+    """PATCH-вызовы run_gh на тело именно этого PR — тело чеклиста лежит
+    последним элементом кортежа (см. вызов в cmd_verdict: -f body=...)."""
+    return [a[-1].split("body=", 1)[1] for a in run_gh_calls
+            if a[:3] == ("api", "-X", "PATCH") and a[3] == f"repos/o/r/pulls/{pr}"]
+
+
+def test_cmd_verdict_merges_remark_blocks_into_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Всё в целом хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: Мелкая неточность\nПоправь X.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "Мелкая неточность" in patches[0]
+    assert ai.review_checklist.CHECKLIST_BEGIN in patches[0]
+    assert "Описание PR." in patches[0]   # исходное тело PR не потеряно
+
+
+def test_cmd_verdict_without_remarks_does_not_patch_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+    assert rc == 0
+    assert _pr_patches(run_gh_calls) == []
+
+
+def test_cmd_verdict_preserves_checked_checklist_items_on_new_round(monkeypatch, tmp_path):
+    # Раунд 2 ревью с новым замечанием не должен снимать отметку, которую
+    # автор уже поставил у пункта из раунда 1 (нативный чекбокс GitHub).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    existing_body = (
+        "Описание PR.\n\n"
+        f"{ai.review_checklist.CHECKLIST_BEGIN}\n{ai.review_checklist.CHECKLIST_TITLE}\n\n"
+        "- [x] **Старое замечание** — уже сделано\n"
+        f"{ai.review_checklist.CHECKLIST_END}\n"
+    )
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": existing_body}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = "ЗАМЕЧАНИЕ: Новое замечание\nПоправь Y.\nКОНЕЦ ЗАМЕЧАНИЯ\nВЕРДИКТ: approve"
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "- [x] **Старое замечание** — уже сделано" in patches[0]
+    assert "- [ ] **Новое замечание** — Поправь Y." in patches[0]
+
+
+# ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
+
+def _status_calls(run_gh_calls: list[tuple]) -> list[tuple]:
+    return [a for a in run_gh_calls
+            if a[:2] == ("api", "-X") and "/statuses/" in a[3]]
+
+
+def test_cmd_verdict_posts_success_status_on_approve(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "repos/o/r/statuses/deadbeef" in joined
+    assert f"context={rl.STATUS_AI_REVIEW}" in joined
+    assert "state=success" in joined
+
+
+def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Есть находки.\nВЕРДИКТ: rework"))
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    assert "state=failure" in " ".join(status_calls[0])
+
+
+def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeypatch, tmp_path):
+    # Обоснование задачи #345: ошибка провайдера/транспорта (dsh_rc != 0) не
+    # вердикт о коде — required status check не должен намертво краснеть до
+    # нового пуша человеком, у ai:failed уже есть автоповтор по таймеру (#196).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")  # пустой ответ + dsh_rc≠0 → transport_failed
+    args.dsh_rc = "1"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1  # шаг всё равно красный (fail loud), но статус — не failure
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "state=pending" in joined
+    assert "state=failure" not in joined
+
+
+def test_ai_review_verdict_posts_status_through_review_labels_helper():
+    # Гвардия по исходнику (тот же класс, что test_check_pr_reads_files_through_paginated_helper):
+    # публикация статуса обязана идти через одно место правды review_labels,
+    # а не второй прямой gh api-вызов рядом.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "review_labels.post_commit_status(" in source
+    assert "review_labels.STATUS_AI_REVIEW" in source
+    assert "review_labels.ai_status_state(verdict)" in source
+
+
+# ── Ручной workflow_dispatch не дублирует прогон, который уже идёт или уже
+# вынес окончательный вердикт на этом же диффе (#399, аудит 197 платных
+# прогонов ai-review за 2026-09-05/06: 44 из них — ручные дубли без ai:failed,
+# 22% всех платных прогонов) ─────────────────────────────────────────────────
+
+def test_ai_review_run_name_matches_prefix_constant():
+    assert rl.ai_review_run_name(399) == "ai-review PR #399"
+    assert rl.ai_review_run_name(399) == f"{rl.AI_REVIEW_RUN_NAME_PREFIX}399"
+
+
+def test_ai_review_workflow_run_name_uses_review_labels_prefix():
+    # yml не читает python-константу (два языка) — префикс обязан совпадать
+    # ДОСЛОВНО в обеих ветках run-name (workflow_dispatch и workflow_run),
+    # иначе матч по display_title в other_active_ai_review_runs молча
+    # перестанет находить свои же прогоны.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    needle = f"format('{rl.AI_REVIEW_RUN_NAME_PREFIX}{{0}}'"
+    assert source.count(needle) == 2
+
+
+def test_other_active_ai_review_runs_filters_by_pr_and_status_excludes_self():
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress", "html_url": "u111"},
+                {"id": 222, "display_title": "ai-review PR #400", "status": "in_progress"},  # чужой PR
+            ]}
+        if "status=queued" in url:
+            return {"workflow_runs": [
+                {"id": 333, "display_title": "ai-review PR #399", "status": "queued"},
+                {"id": 444, "display_title": "ai-review PR #399", "status": "queued"},  # сам вызывающий прогон
+            ]}
+        raise AssertionError(f"неожиданный url: {url}")
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id=444, gh_func=fake_gh)
+
+    assert {m["id"] for m in matches} == {111, 333}
+
+
+def test_other_active_ai_review_runs_queries_both_statuses_with_per_page_100():
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        return {"workflow_runs": []}
+
+    assert rl.other_active_ai_review_runs("o/r", 399, "", fake_gh) == []
+    assert calls == [
+        "repos/o/r/actions/workflows/ai-review.yml/runs?status=in_progress&per_page=100",
+        "repos/o/r/actions/workflows/ai-review.yml/runs?status=queued&per_page=100",
+    ]
+
+
+def test_manual_dispatch_busy_reason_names_run_status_and_declares_force_cannot_bypass():
+    other_run = {"id": 555, "status": "in_progress", "html_url": "https://github.com/o/r/actions/runs/555"}
+    text = ai.manual_dispatch_busy_reason(399, other_run)
+    assert "PR #399" in text
+    assert "555" in text
+    assert "in_progress" in text
+    assert "https://github.com/o/r/actions/runs/555" in text
+    assert "force: true" in text  # владелец не может пробить занятость даже принудительно
+
+
+def test_manual_dispatch_skip_reason_names_verdict_and_age_and_force_escape_hatch():
+    created = datetime.now(timezone.utc) - timedelta(minutes=12)
+    ai_comment = {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "ai:ok" in text
+    assert "force: true" in text
+    minutes = int(text.split("(")[1].split(" мин назад")[0])
+    assert 11 <= minutes <= 13
+
+
+def test_manual_dispatch_skip_reason_prefers_ai_changes_label_when_present():
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:changes-requested"], None)
+    assert "ai:changes-requested" in text
+    assert "неизвестно когда" in text  # ai_comment=None — created_at недоступен
+
+
+def test_manual_dispatch_skip_reason_falls_back_when_no_verdict_label():
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok"], None)
+    assert "неизвестный вердикт" in text
+
+
+def _fake_gh_manual_dispatch(active_runs: dict, labels, comment_body, files):
+    """gh(url) прод-форма для ручного workflow_dispatch: объединяет эндпоинт
+    занятости (actions/workflows/.../runs) с прод-формой pulls/files/comments
+    из _fake_gh_should_run."""
+    should_run_gh = _fake_gh_should_run(labels, comment_body, files)
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        return should_run_gh(url)
+
+    return fake_gh
+
+
+def test_cmd_should_run_manual_dispatch_denied_when_run_already_active(monkeypatch, capsys):
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress", "html_url": "https://x/777"},
+    ], "queued": []}
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость решается раньше сверки отпечатка, лишний вызов: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")  # свой прогон, не 777
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    assert "уже идёт другой прогон" in out.err
+    assert "777" in out.err
+    # Сверка отпечатка (pulls/files/comments) вообще не запрашивается —
+    # занятость отклоняет прогон раньше.
+    assert all("actions/workflows" in c for c in calls)
+
+
+def test_cmd_should_run_manual_dispatch_force_does_not_bypass_busy_check(monkeypatch, capsys):
+    # #399: force:true — осознанный пересмотр ТОГО ЖЕ диффа, а не пропуск
+    # проверки «прогон уже летит прямо сейчас» — второй одновременный прогон
+    # бессмыслен независимо от намерения владельца (см. manual_dispatch_busy_reason).
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость решается раньше --force, лишний вызов: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_manual_dispatch_not_active_denies_on_unchanged_diff(monkeypatch, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    fake_gh = _fake_gh_manual_dispatch(
+        {"in_progress": [], "queued": []}, ["review:ok", "ai:ok"], comment, files)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    assert "дифф не изменился" in out.err
+    assert "ai:ok" in out.err
+    assert "force: true" in out.err
+
+
+def test_cmd_should_run_manual_dispatch_not_active_and_diff_changed_prints_true_silently(monkeypatch, capsys):
+    # Ручной запуск на изменившемся диффе (легитимный повтор без force) не
+    # должен печатать отказ в stderr вовсе — это не дубль.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    stale_fp = rl.diff_fingerprint([{"filename": "a.py", "status": "modified", "sha": "old"}])
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {stale_fp}\n\nОк.\n"
+    fake_gh = _fake_gh_manual_dispatch(
+        {"in_progress": [], "queued": []}, ["review:ok", "ai:ok"], comment, files)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "true"
+    assert out.err == ""
+
+
+def test_cmd_should_run_manual_dispatch_force_true_not_busy_skips_fingerprint_check(monkeypatch, capsys):
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            return {"workflow_runs": []}
+        raise AssertionError(f"force обязан пропускать сверку отпечатка без сети: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+    # Только проверка занятости (in_progress+queued) — сверки отпечатка нет.
+    assert len(calls) == 2
+
+
+def test_cmd_should_run_busy_check_before_force_mutation_guard(monkeypatch, capsys):
+    # Мутация #399: до фикса cmd_should_run проверял --force ПЕРВЫМ (до
+    # занятости) — ручной дубль поверх уже летящего прогона молча проходил
+    # бы через force:true. Воспроизводим старый порядок как отдельную
+    # функцию и показываем разницу с текущим (исправленным) поведением.
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(url)
+
+    def old_buggy_order(args):
+        if getattr(args, "force", False):
+            print("true")
+            return 0
+        repo = ai.os.environ["GITHUB_REPOSITORY"]
+        active = rl.other_active_ai_review_runs(
+            repo, args.pr, ai.os.environ.get("GITHUB_RUN_ID", ""), fake_gh)
+        print("false" if active else "true")
+        return 0
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    old_buggy_order(argparse.Namespace(pr=294, force=True))
+    assert capsys.readouterr().out.strip() == "true"  # старый баг: дубль проходит
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"  # текущий код отказывает

@@ -1,0 +1,609 @@
+# Форж плагинов dsh-edge: исходники плагина → релиз + PR в plugins.json
+#
+# Вход: workflow_dispatch с путём к исходникам плагина (относительно корня репо).
+# Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR с обновлённым
+# dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
+# (design.md «Workers-совместимость») и интеграционном дыме.
+#
+# Форж не деплоит морду — деплой делает deploy-dsh-edge.yml после мержа PR.
+name: plugin-forge
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_path:
+        description: "Путь к исходникам плагина (относительно корня репо, напр. plugins-src/my-plugin)"
+        required: true
+        type: string
+      plugin_id:
+        description: "ID плагина для манифеста (по умолчанию — имя каталога)"
+        required: false
+        type: string
+      task_issue:
+        description: "Номер issue-задачи (опционально) — ссылкой попадёт в тело авто-PR"
+        required: false
+        type: string
+
+permissions:
+  contents: write       # для создания релиза и PR
+  pull-requests: write  # для gh pr create
+  # issues: write не нужен — статусы уходят по HTTP в журнал (POST /api/events,
+  # scripts/plugins/plugin_status.sh), PR создаётся под GH_PIPELINE_PAT, к
+  # GitHub Issues API/CLI этот workflow не обращается (находка AI-ревью PR #273).
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.plugin_path }}
+  cancel-in-progress: false
+
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      # Даёт job'у forge-failed канонический plugin_id (после сверки с
+      # манифестом — не basename каталога), чтобы падение ПОСЛЕ валидации
+      # писало failed в тот же псевдо-задачник, что building/built (форж
+      # эмитит только эти два — deploying/ready постит канал деплоя, см.
+      # шаг «Итог» ниже), а не в plugin:<basename> (находка AI-ревью PR
+      # #273: без этого таймлайн канонического плагина hello/hello-world
+      # вечно висел на building, а failed уходил в соседний, никогда не
+      # начинавшийся id).
+      plugin_id: ${{ steps.validate.outputs.plugin_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/setup@v2
+        with:
+          version: 11
+          install: false
+
+      - name: Валидация входа
+        id: validate
+        env:
+          PLUGIN_PATH: ${{ inputs.plugin_path }}
+          PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
+          TASK_ISSUE_INPUT: ${{ inputs.task_issue }}
+        run: |
+          PLUGIN_PATH="${PLUGIN_PATH}"
+          [ -d "$PLUGIN_PATH" ] || { echo "::error::Каталог плагина не найден: $PLUGIN_PATH"; exit 1; }
+          [ -f "$PLUGIN_PATH/package.json" ] || { echo "::error::package.json не найден в $PLUGIN_PATH"; exit 1; }
+
+          PLUGIN_NAME=$(jq -r '.name' "$PLUGIN_PATH/package.json")
+          PLUGIN_VERSION=$(jq -r '.version' "$PLUGIN_PATH/package.json")
+          [ "$PLUGIN_NAME" != "null" ] && [ -n "$PLUGIN_NAME" ] || { echo "::error::package.json: name обязателен"; exit 1; }
+          [ "$PLUGIN_VERSION" != "null" ] && [ -n "$PLUGIN_VERSION" ] || { echo "::error::package.json: version обязателен"; exit 1; }
+
+          # ID плагина: из ввода или из имени каталога
+          if [ -n "$PLUGIN_ID_INPUT" ]; then
+            PLUGIN_ID="$PLUGIN_ID_INPUT"
+          else
+            PLUGIN_ID=$(basename "$PLUGIN_PATH")
+          fi
+          # Проверка формата ID — паттерн ЧИТАЕТСЯ из manifest.mjs
+          # (ID_PATTERN_SOURCE), а не копируется строкой: manifest.mjs
+          # объявляет ID_BODY_SOURCE единственным местом правды с явным
+          # запретом копий, вторая копия регэкспа здесь расходилась бы
+          # молча при правке паттерна там (находка AI-ревью PR #273).
+          ID_PATTERN_SOURCE=$(node -e "import('./dsh-edge/manifest.mjs').then(m => process.stdout.write(m.ID_PATTERN_SOURCE))") \
+            || { echo "::error::не удалось прочитать ID_PATTERN_SOURCE из dsh-edge/manifest.mjs"; exit 1; }
+          [[ "$PLUGIN_ID" =~ ^($ID_PATTERN_SOURCE)$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^$ID_PATTERN_SOURCE\$"; exit 1; }
+
+          # Номер задачи для тела авто-PR — отдельный опциональный числовой
+          # вход, НЕ plugin_id: plugin_id validate пропускает только через
+          # ^[a-z][a-z0-9-]*$, номером задачи он быть не может, и «#$plugin_id»
+          # рендерился нерабочей ссылкой вида «#hello» на каждом PR (находка
+          # AI-ревью PR #273). Пусто — строка со ссылкой в PR просто не пишется.
+          if [ -n "$TASK_ISSUE_INPUT" ]; then
+            [[ "$TASK_ISSUE_INPUT" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$TASK_ISSUE_INPUT' должен быть числом (номер issue)"; exit 1; }
+          fi
+
+          # Сверка с манифестом: basename каталога — только дефолт, а пакет
+          # может уже быть установлен под ДРУГИМ id (канонический
+          # plugins-src/hello-world → package @edge-harness/dsh-plugin-hello,
+          # в dsh-edge/plugins.json id "hello"). Без сверки форж заводит
+          # фантомную вторую установку того же пакета вместо бампа
+          # существующей записи — весь апсерт-путь остаётся мёртвым кодом
+          # (находка AI-ревью PR #273, воспроизведена на каноническом
+          # прогоне: смоук строил состав из пяти плагинов вместо четырёх).
+          # Пакет уже известен манифесту под другим id — берём id манифеста, а
+          # не красим прогон: явный ввод остаётся способом завести НОВЫЙ id,
+          # а бамп существующего пакета без --plugin_id обязан находить
+          # свою историческую запись сам (находка AI-ревью PR #273: критерий
+          # готовности #268 требует зелёного прогона без явного plugin_id
+          # именно на историческом пакете hello-world/id=hello).
+          MANIFEST_ID=$(jq -r --arg pkg "$PLUGIN_NAME" '.plugins[] | select(.package == $pkg) | .id' dsh-edge/plugins.json)
+          if [ -n "$MANIFEST_ID" ] && [ "$MANIFEST_ID" != "$PLUGIN_ID" ]; then
+            echo "Пакет $PLUGIN_NAME уже в манифесте под id '$MANIFEST_ID' (вычислен был '$PLUGIN_ID') — беру id манифеста"
+            PLUGIN_ID="$MANIFEST_ID"
+          fi
+
+          # Зеркальный случай: явный (или вычисленный) plugin_id уже занят в
+          # манифесте ЧУЖИМ пакетом. Без этой проверки апсерт в шаге «Подготовить
+          # PR» молча перепишет чужую запись — id, package и sha256 — вместо
+          # того, чтобы завести новую (находка AI-ревью PR #273: проверка выше
+          # ловит совпадение по package в одну сторону, но не по id в другую).
+          MANIFEST_PACKAGE=$(jq -r --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id) | .package' dsh-edge/plugins.json)
+          if [ -n "$MANIFEST_PACKAGE" ] && [ "$MANIFEST_PACKAGE" != "$PLUGIN_NAME" ]; then
+            echo "::error::id '$PLUGIN_ID' уже в манифесте под пакетом '$MANIFEST_PACKAGE', а вычислен пакет '$PLUGIN_NAME' — id занят другим плагином, укажите свой plugin_id"
+            exit 1
+          fi
+
+          # server существующей записи манифеста (для дыма, см. FORGE_EXTRA_PLUGIN
+          # ниже): бамп client-only плагина (server:false, напр. plugin-manager)
+          # не должен внезапно валидировать серверную композицию, которую
+          # PR-шаг потом не опубликует (находка AI-ревью PR #273). Пусто —
+          # значит пакета в манифесте ещё нет (новый плагин); дефолт true —
+          # известное ограничение, см. комментарий у FORGE_EXTRA_PLUGIN.
+          MANIFEST_SERVER=$(jq -r --arg pkg "$PLUGIN_NAME" '.plugins[] | select(.package == $pkg) | .server' dsh-edge/plugins.json)
+          [ -n "$MANIFEST_SERVER" ] || MANIFEST_SERVER=true
+
+          # Определяем, есть ли клиентская часть
+          CLIENT=$(jq -r '.dsh.client.platform // ""' "$PLUGIN_PATH/package.json")
+          [ "$CLIENT" = "web" ] && HAS_CLIENT=true || HAS_CLIENT=false
+
+          echo "plugin_name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=$PLUGIN_VERSION" >> "$GITHUB_OUTPUT"
+          echo "plugin_id=$PLUGIN_ID" >> "$GITHUB_OUTPUT"
+          echo "plugin_server=$MANIFEST_SERVER" >> "$GITHUB_OUTPUT"
+          echo "has_client=$HAS_CLIENT" >> "$GITHUB_OUTPUT"
+          echo "plugin_path=$PLUGIN_PATH" >> "$GITHUB_OUTPUT"
+          echo "task_issue=$TASK_ISSUE_INPUT" >> "$GITHUB_OUTPUT"
+
+          echo "Плагин: $PLUGIN_NAME v$PLUGIN_VERSION (id: $PLUGIN_ID, client: $HAS_CLIENT)"
+
+      - name: plugin_status → building
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: building
+          SOURCE: forge
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=building SOURCE=forge bash scripts/plugins/plugin_status.sh
+
+      # ── 1. Чеклист совместимости (design.md «Workers-совместимость») ──────────────
+      - name: Проверка совместимости с Workers Free
+        id: compat
+        run: |
+          node dsh-edge/check-plugin-compat.mjs "${{ steps.validate.outputs.plugin_path }}" \
+            ${{ steps.validate.outputs.has_client == 'true' && '--client' || '' }}
+
+      # ── 2. Сборка tarball ────────────────────────────────────────────────────────
+      - name: Собрать клиентский бандл (если есть build.mjs)
+        id: build-client
+        working-directory: ${{ steps.validate.outputs.plugin_path }}
+        run: |
+          if [ -f "build.mjs" ]; then
+            echo "Обнаружен build.mjs — собираем клиентский бандл"
+            node build.mjs
+          else
+            echo "build.mjs не найден — пропускаем сборку клиента"
+          fi
+
+      - name: Собрать tarball (npm pack)
+        id: pack
+        working-directory: ${{ steps.validate.outputs.plugin_path }}
+        env:
+          NPM_CONFIG_CACHE: /tmp/npm-cache
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          npm pack --cache /tmp/npm-cache --pack-destination "$GITHUB_WORKSPACE/artifacts" --loglevel=error >/dev/null
+          TARBALL=$(ls "$GITHUB_WORKSPACE/artifacts"/*.tgz | head -1)
+          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          ASSET_NAME=$(basename "$TARBALL")
+          # Имя asset'а для релиза: <id>-<version>.tgz — от plugin_id, не от
+          # basename пакета (hello-world — ровно тот случай, где name пакета
+          # ≠ id манифеста, находка AI-ревью PR #273).
+          RELEASE_ASSET="${{ steps.validate.outputs.plugin_id }}-${{ steps.validate.outputs.plugin_version }}.tgz"
+          cp "$TARBALL" "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET"
+          SHA256_RELEASE=$(sha256sum "$GITHUB_WORKSPACE/artifacts/$RELEASE_ASSET" | cut -d' ' -f1)
+          [ "$SHA256" = "$SHA256_RELEASE" ] || { echo "::error::sha256 не сошёлся после копирования"; exit 1; }
+
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "asset=$RELEASE_ASSET" >> "$GITHUB_OUTPUT"
+          echo "Тарболл: $ASSET_NAME → $RELEASE_ASSET (sha256: $SHA256)"
+
+      - name: plugin_status → built
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          STATE: built
+          SOURCE: forge
+          DETAIL: "tarball ${{ steps.pack.outputs.asset }}, sha256 ${{ steps.pack.outputs.sha256 }}"
+        run: |
+          PLUGIN_ID="$PLUGIN_ID" STATE=built SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh
+
+      # ── 3. Интеграционный дым: локальная сборка клона с плагином ─────────────────
+      - name: Интеграционный дым (локальная сборка с плагином)
+        id: smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGIN_TARBALL: ${{ steps.pack.outputs.tarball }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          PLUGIN_PACKAGE: ${{ steps.validate.outputs.plugin_name }}
+          # dsh-edge/plugins.json на этом шаге ещё не обновлён (PR с манифестом
+          # создаётся позже, см. шаг «Подготовить PR с обновлением манифеста») —
+          # без FORGE_EXTRA_PLUGIN кодогенерация и гвардия состава проверяли бы
+          # только старый состав, а новый плагин нигде бы не верифицировался.
+          # server — из существующей записи манифеста (steps.validate.outputs.
+          # plugin_server), НЕ безусловный true: PR-шаг ниже сохраняет текущий
+          # .server при бампе (не переворачивает его на true), так что дым
+          # обязан валидировать ту же композицию, которую PR-шаг реально
+          # опубликует (находка AI-ревью PR #273 — было рассинхронизировано).
+          # true остаётся дефолтом ТОЛЬКО для генуинно нового плагина (записи
+          # в манифесте ещё нет) — известное ограничение форжа (design.md):
+          # client-only плагин, форжащийся впервые, всё равно провалидируется
+          # как серверный.
+          FORGE_EXTRA_PLUGIN: >-
+            {"id":"${{ steps.validate.outputs.plugin_id }}",
+            "package":"${{ steps.validate.outputs.plugin_name }}",
+            "server":${{ steps.validate.outputs.plugin_server }},
+            "client":${{ steps.validate.outputs.has_client }}}
+        run: |
+          # Клонируем апстрим на пине, применяем патчи, ставим плагин, кодогеним,
+          # билдим, прогоняем smoke-edge-plugins и verify — полный конвейер сборки.
+          # Читаем манифест АБСОЛЮТНЫМ путём и без подавления stderr: без
+          # фоллбэков — если manifest.mjs упадёт (битый манифест, нет
+          # upstream.json) или вернёт пустые upstream.repo/sha, job обязан
+          # провалиться здесь и громко, а не молча подставить дефолт и
+          # собрать плагин против не того апстрима (silent-wrong — находка
+          # AI-ревью PR #162). Заодно чинит соседний баг: относительный путь
+          # "dsh-edge/manifest.mjs" резолвился от $GITHUB_WORKSPACE/forge-clone
+          # (мы туда уже cd'нулись) — файла там нет, вызов падал всегда, и
+          # 2>/dev/null маскировал именно это, а не что-то редкое.
+          MANIFEST_JSON=$(node "$GITHUB_WORKSPACE/dsh-edge/manifest.mjs") \
+            || { echo "::error::dsh-edge/manifest.mjs не прочитался — не удалось получить upstream.json"; exit 1; }
+          UPSTREAM=$(jq -r '.upstream.repo' <<<"$MANIFEST_JSON")
+          SHA=$(jq -r '.upstream.sha' <<<"$MANIFEST_JSON")
+          [ -n "$UPSTREAM" ] && [ "$UPSTREAM" != "null" ] || { echo "::error::upstream.repo пуст в манифесте"; exit 1; }
+          [ -n "$SHA" ] && [ "$SHA" != "null" ] || { echo "::error::upstream.sha пуст в манифесте"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/forge-clone" && cd "$GITHUB_WORKSPACE/forge-clone"
+          git init -q
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+
+          # Патчи. Гвардия на пустую серию — то же место правды о поведении,
+          # что и deploy-dsh-edge.yml, шаг «Патч-серия»: без неё опустевшая
+          # серия молча даёт tarball, собранный и опубликованный против
+          # непатченного апстрима (находка AI-ревью PR #273).
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE/dsh-edge/patches"/*.patch)
+          [ ${#patches[@]} -gt 0 ] || { echo "::error::Патч-серия пуста, а манифест требует source-build"; exit 1; }
+          for p in "${patches[@]}"; do
+            git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p"; exit 1; }
+          done
+
+          # Зависимости standalone
+          pnpm --dir apps/dsh-edge/standalone install --frozen-lockfile
+
+          # Остальные плагины манифеста (кроме бампимого — для него уже есть
+          # свежий tarball из шага «Собрать tarball»). Кодогенерация эмитит
+          # импорты под ВЕСЬ состав манифеста, а @edge-harness/* пакеты нигде
+          # не публикуются в npm-registry и патчами не ставятся — без них
+          # smoke-edge-plugins.mjs красится ERR_MODULE_NOT_FOUND на любом
+          # плагине всегда, а не на реальной проблеме (находка AI-ревью PR
+          # #273). Тот же паттерн скачивания и сверки sha256, что и
+          # deploy-dsh-edge.yml, шаг «Скачать плагины и сверить sha256».
+          mkdir -p "$GITHUB_WORKSPACE/other-plugins-tgz"
+          jq -r --arg id "$PLUGIN_ID" \
+            '.plugins[] | select(.id != $id) | [.id, .source.release, .source.asset, .source.sha256] | @tsv' \
+            "$GITHUB_WORKSPACE/dsh-edge/plugins.json" > "$GITHUB_WORKSPACE/other-plugins.tsv"
+          : > "$GITHUB_WORKSPACE/other-checksums.txt"
+          OTHER_TGZ=()
+          while IFS=$'\t' read -r other_id other_release other_asset other_sha; do
+            echo "плагин манифеста $other_id: релиз $other_release, asset $other_asset"
+            gh release download "$other_release" --repo "$GITHUB_REPOSITORY" \
+              --dir "$GITHUB_WORKSPACE/other-plugins-tgz" --pattern "$other_asset" --clobber \
+              || { echo "::error::Релиз $other_release недоступен — манифест ссылается на несуществующий источник (плагин $other_id)"; exit 1; }
+            [ -f "$GITHUB_WORKSPACE/other-plugins-tgz/$other_asset" ] || { echo "::error::В релизе $other_release нет asset'а $other_asset (плагин $other_id)"; exit 1; }
+            echo "$other_sha  $GITHUB_WORKSPACE/other-plugins-tgz/$other_asset" >> "$GITHUB_WORKSPACE/other-checksums.txt"
+            OTHER_TGZ+=("$GITHUB_WORKSPACE/other-plugins-tgz/$other_asset")
+          done < "$GITHUB_WORKSPACE/other-plugins.tsv"
+          [ ! -s "$GITHUB_WORKSPACE/other-checksums.txt" ] || sha256sum -c "$GITHUB_WORKSPACE/other-checksums.txt" \
+            || { echo "::error::sha256 остальных плагинов манифеста не сошёлся"; exit 1; }
+
+          # Добавляем плагин: свежий tarball + весь остальной состав манифеста разом
+          pnpm --dir apps/dsh-edge/standalone add --save-exact "${OTHER_TGZ[@]}" "$PLUGIN_TARBALL"
+          # pnpm-патчи Workers обязательны; add обязан сохранить patchedDependencies
+          # (класс silent-wrong #43, та же гвардия, что deploy-dsh-edge.yml —
+          # без неё дым проходит зелёным на уже запатченных node_modules от
+          # --frozen-lockfile, пока прод соберёт другой состав).
+          grep -q "patchedDependencies" apps/dsh-edge/standalone/pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
+
+          # Кодогенерация
+          node "$GITHUB_WORKSPACE/dsh-edge/codegen-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Дым инсталла (cordis + ToolRuntime)
+          node "$GITHUB_WORKSPACE/dsh-edge/smoke-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Сборка
+          pnpm --dir apps/dsh-edge/standalone run build
+
+          # Гвардия gzip-бюджета direct-воркера (design.md «Workers-совместимость»,
+          # «Размер») — ДЕШЁВЫЙ прокси на уже собранном артефакте: gzip всего
+          # direct-воркера (с новым плагином внутри, т.к. кодогенерация выше
+          # уже включила его через FORGE_EXTRA_PLUGIN) против общего бюджета.
+          # Не точный вклад одного плагина, а верхняя граница на весь бандл —
+          # без гейта плагины ехали бы без проверки размера вовсе, а не с
+          # приблизительной (находка AI-ревью PR #273). Точный замер вклада —
+          # отдельная работа (design.md, tasks.md §3).
+          #
+          # Порог — НЕ своя константа: `bundle-standalone.mjs` (только что
+          # отработавший в `pnpm run build` выше) уже гвардирует тот же
+          # DIRECT_GZIP_BUDGET_BYTES сам (design.md «Факты-основания» п.1) —
+          # вторая копия числа здесь разошлась бы молча, если апстрим подвинет
+          # бюджет (находка AI-ревью PR #273). Читаем константу из уже
+          # склонированного и запатченного файла на диске, а не дублируем.
+          BUNDLE_BUDGET_SRC="apps/dsh-edge/standalone/scripts/bundle-standalone.mjs"
+          [ -f "$BUNDLE_BUDGET_SRC" ] || { echo "::error::$BUNDLE_BUDGET_SRC не найден — гвардия бюджета не может прочитать порог"; exit 1; }
+          BUNDLE_BUDGET_EXPR=$(grep -oP 'DIRECT_GZIP_BUDGET_BYTES\s*=\s*\K[0-9 *_]+(?=;)' "$BUNDLE_BUDGET_SRC" | head -1)
+          [ -n "$BUNDLE_BUDGET_EXPR" ] || { echo "::error::не удалось прочитать DIRECT_GZIP_BUDGET_BYTES из $BUNDLE_BUDGET_SRC — апстрим переименовал/убрал константу, гвардия слепа"; exit 1; }
+          BUNDLE_BUDGET_BYTES=$(( BUNDLE_BUDGET_EXPR ))
+          DIRECT_WORKER="apps/dsh-edge/standalone/worker/direct/index.js"
+          [ -f "$DIRECT_WORKER" ] || { echo "::error::direct-воркер не собран: $DIRECT_WORKER"; exit 1; }
+          BUNDLE_GZIP_BYTES=$(gzip -c "$DIRECT_WORKER" | wc -c)
+          echo "gzip direct-воркера: $BUNDLE_GZIP_BYTES / $BUNDLE_BUDGET_BYTES байт (прокси, не точный вклад плагина)"
+          [ "$BUNDLE_GZIP_BYTES" -le "$BUNDLE_BUDGET_BYTES" ] || { echo "::error::gzip-бюджет direct-воркера превышен: $BUNDLE_GZIP_BYTES > $BUNDLE_BUDGET_BYTES байт (design.md «Размер»)"; exit 1; }
+
+          # Гвардия состава
+          node "$GITHUB_WORKSPACE/dsh-edge/verify-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
+
+          # Контракт и детерминизм
+          pnpm --dir apps/dsh-edge/standalone run verify
+
+          echo "smoke=passed" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Релиз ─────────────────────────────────────────────────────────────────
+      - name: Создать/обновить релиз plugins-<id>-v<version>
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGIN_NAME: ${{ steps.validate.outputs.plugin_name }}
+          PLUGIN_VERSION: ${{ steps.validate.outputs.plugin_version }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          RELEASE_TAG="plugins-${PLUGIN_ID}-v${PLUGIN_VERSION}"
+          RELEASE_TITLE="${PLUGIN_NAME}: ${PLUGIN_ID} v${PLUGIN_VERSION}"
+
+          # Проверяем, существует ли релиз
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Релиз $RELEASE_TAG уже существует — обновляем asset"
+            gh release delete-asset "$RELEASE_TAG" "$ASSET" --yes || true
+            gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/$ASSET" --clobber
+          else
+            echo "Создаём релиз $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/$ASSET" \
+              --title "$RELEASE_TITLE" --notes "Автоматический релиз из plugin-forge (${GITHUB_RUN_ID})"
+          fi
+
+          # Публикуем checksums как отдельный asset. Без `|| true`: упавшая
+          # заливка молча давала бы зелёный job и релиз без checksums, хотя
+          # задача требует релиз «с checksums» (находка AI-ревью PR #273) —
+          # tarball строкой выше уже заливается без маскировки, здесь то же.
+          echo "$SHA256  $ASSET" > "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256"
+          gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/artifacts/${ASSET}.sha256" --clobber
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      # ── 5. PR с обновлением plugins.json ────────────────────────────────────────
+      - name: Подготовить PR с обновлением манифеста
+        id: pr
+        env:
+          # GITHUB_TOKEN-пуши/PR не зажигают другие workflows (защита GitHub от
+          # рекурсии) — этот PR должен пройти test/CodeQL/review/contract, как
+          # любой другой, поэтому широкий PAT конвейера (тот же класс операций,
+          # что в orchestra.yml/deploy-dsh-edge.yml), а не github.token.
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          PLUGIN_ID: ${{ steps.validate.outputs.plugin_id }}
+          PLUGIN_PACKAGE: ${{ steps.validate.outputs.plugin_name }}
+          PLUGIN_VERSION: ${{ steps.validate.outputs.plugin_version }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          HAS_CLIENT: ${{ steps.validate.outputs.has_client }}
+          TASK_ISSUE: ${{ steps.validate.outputs.task_issue }}
+        run: |
+          # GH_TOKEN авторизует только `gh`-вызовы; голому `git push` нужен
+          # credential helper — `gh auth setup-git` (тот же паттерн, что в
+          # worker.yml: без него push идёт анонимно и падает 403).
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
+          gh auth setup-git
+
+          BRANCH="forge/${PLUGIN_ID}-v${PLUGIN_VERSION}-$(date -u +%Y%m%dT%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Между чекаутом в начале job'а и этим шагом лежат чеклист/сборка/
+          # дым — 10-20 минут; concurrency-группа задана по plugin_path, т.е.
+          # другие плагины форжатся ОДНОВРЕМЕННО и могут за это время смержить
+          # свою правку dsh-edge/plugins.json в main. Ветка обязана расти от
+          # СВЕЖЕГО main, а не от того, что видел actions/checkout на старте
+          # job'а: иначе jq ниже пересериализует устаревший манифест в
+          # идентичном формате, git не увидит конфликта при пуше — и авто-PR
+          # молча откатит чужую запись (находка AI-ревью PR #273).
+          git fetch origin main
+          git switch -c "$BRANCH" origin/main
+
+          # Обе сверки занятости из шага «Валидация входа» — ЗАНОВО, по
+          # только что политянутому манифесту, а не по тому, что читался в
+          # начале job'а: за время чеклиста/сборки/дыма манифест мог
+          # измениться так, что прежний вывод validate больше не верен (тот
+          # же пакет успел появиться под другим id, или id занят другим
+          # пакетом). Совпало — бампаем ниже штатно; разошлось — падаем
+          # громко с внятным сообщением, а не молча переписываем чужую
+          # запись (тот же класс проверки, что и первичная сверка).
+          FRESH_MANIFEST_ID=$(jq -r --arg pkg "$PLUGIN_PACKAGE" '.plugins[] | select(.package == $pkg) | .id' dsh-edge/plugins.json)
+          if [ -n "$FRESH_MANIFEST_ID" ] && [ "$FRESH_MANIFEST_ID" != "$PLUGIN_ID" ]; then
+            echo "::error::Манифест изменился, пока форж собирался: пакет $PLUGIN_PACKAGE теперь в манифесте под id '$FRESH_MANIFEST_ID', а форж вычислил id '$PLUGIN_ID' — перезапустите форж с plugin_id=$FRESH_MANIFEST_ID"
+            exit 1
+          fi
+          FRESH_MANIFEST_PACKAGE=$(jq -r --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id) | .package' dsh-edge/plugins.json)
+          if [ -n "$FRESH_MANIFEST_PACKAGE" ] && [ "$FRESH_MANIFEST_PACKAGE" != "$PLUGIN_PACKAGE" ]; then
+            echo "::error::Манифест изменился, пока форж собирался: id '$PLUGIN_ID' теперь занят пакетом '$FRESH_MANIFEST_PACKAGE', а форж собирал пакет '$PLUGIN_PACKAGE' — запустите форж заново с другим plugin_id"
+            exit 1
+          fi
+
+          # Читаем текущий манифест (уже свежий — из git fetch выше)
+          MANIFEST=$(cat dsh-edge/plugins.json)
+
+          # Проверяем, есть ли уже плагин с таким id
+          EXISTS=$(jq --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id)' <<<"$MANIFEST")
+          if [ -n "$EXISTS" ]; then
+            # Обновляем существующую запись. server НЕ переписывается на true
+            # безусловно: для client-only плагина (напр. plugin-manager,
+            # server:false) бамп через форж иначе тихо сделал бы его
+            # серверным (находка AI-ревью PR #273) — .server внутри update-
+            # фильтра ссылается на текущее значение поля этой же записи.
+            MANIFEST=$(jq --arg id "$PLUGIN_ID" \
+              --arg pkg "$PLUGIN_PACKAGE" \
+              --arg release "$RELEASE_TAG" \
+              --arg asset "$ASSET" \
+              --arg sha "$SHA256" \
+              --argjson client "$HAS_CLIENT" \
+              '(.plugins[] | select(.id == $id)) |= {
+                id: $id,
+                package: $pkg,
+                source: { release: $release, asset: $asset, sha256: $sha },
+                server: .server,
+                client: $client
+              }' <<<"$MANIFEST")
+            PR_TITLE="chore(plugins): обновить $PLUGIN_ID до v$PLUGIN_VERSION"
+          else
+            # Добавляем новую запись
+            MANIFEST=$(jq --arg id "$PLUGIN_ID" \
+              --arg pkg "$PLUGIN_PACKAGE" \
+              --arg release "$RELEASE_TAG" \
+              --arg asset "$ASSET" \
+              --arg sha "$SHA256" \
+              --argjson server true \
+              --argjson client "$HAS_CLIENT" \
+              '.plugins += [{
+                id: $id,
+                package: $pkg,
+                source: { release: $release, asset: $asset, sha256: $sha },
+                server: $server,
+                client: $client
+              }]' <<<"$MANIFEST")
+            PR_TITLE="feat(plugins): добавить плагин $PLUGIN_ID v$PLUGIN_VERSION"
+          fi
+
+          echo "$MANIFEST" > dsh-edge/plugins.json
+
+          # Валидируем манифест
+          node dsh-edge/manifest.mjs >/dev/null || { echo "::error::Обновлённый манифест невалиден"; exit 1; }
+
+          git add dsh-edge/plugins.json
+          # Многострочные тексты — через printf с явными \n, а не heredoc:
+          # heredoc-тело без YAML-отступа обрывает блочный литерал run: | раньше
+          # времени (PyYAML: "while scanning a simple key" — гвардия «все workflows
+          # валидный YAML» в repo-ci красит именно на этом). printf-формат —
+          # одна физическая строка YAML, аргументы подставляются как обычно.
+          COMMIT_MSG=$(printf '%s\n\nАвтоматический PR из plugin-forge (run %s).\nПлагин: %s (%s) v%s\nРелиз: %s\nAsset: %s\nSHA256: %s' \
+            "$PR_TITLE" "${{ github.run_id }}" "$PLUGIN_PACKAGE" "$PLUGIN_ID" "$PLUGIN_VERSION" "$RELEASE_TAG" "$ASSET" "$SHA256")
+          git commit -m "$COMMIT_MSG"
+
+          git push -u origin "$BRANCH"
+
+          # Ссылка на задачу — только если task_issue реально передан числом
+          # (см. вход workflow_dispatch и валидацию в шаге «Валидация входа»).
+          # Раньше сюда шёл inputs.plugin_id, который validate пропускает
+          # только через ^[a-z][a-z0-9-]*$ — номером задачи он быть не может,
+          # и строка рендерилась мёртвой ссылкой вида «#hello» на каждом PR
+          # (находка AI-ревью PR #273). Нет task_issue — строки нет вовсе.
+          if [ -n "$TASK_ISSUE" ]; then
+            TASK_LINE=$(printf 'Задача: #%s\n\n' "$TASK_ISSUE")
+          else
+            TASK_LINE=""
+          fi
+          # Ранее тело утверждало «после мержа PR автоматически запустится
+          # deploy-dsh-edge.yml (push-триггер)» — неверно: этот workflow
+          # триггерится только schedule/workflow_dispatch, push в main его не
+          # запускает (находка AI-ревью PR #162). Текст ниже описывает
+          # реальный путь.
+          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n- Финальный статус этого шага в журнале — `built` (design.md «Канал обновления и статусы»: форж не деплоит и не постит `deploying`/`ready`)\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. `plugin_status: deploying`/`ready` постит канал деплоя, а не этот PR — это отдельная задача (доводка деплоя до ready, остаток #162), сюда ещё не подключена\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
+            "$TASK_LINE" "${{ steps.release.outputs.release_tag }}")
+          PR_URL=$(gh pr create --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY")
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Итог
+        run: |
+          echo "✅ Форж завершён для плагина ${{ steps.validate.outputs.plugin_id }}"
+          echo "Релиз: ${{ steps.release.outputs.release_tag }}"
+          echo "Тарболл: ${{ steps.pack.outputs.asset }} (sha256: ${{ steps.pack.outputs.sha256 }})"
+          echo "PR: ${{ steps.pr.outputs.pr_url }}"
+          echo ""
+          # Форж заканчивается на built (design.md, «Канал обновления и
+          # статусы») — deploying/ready принадлежат каналу деплоя, а не
+          # этому job'у. deploy-dsh-edge.yml НЕ триггерится на push в main
+          # (только schedule/workflow_dispatch), поэтому постить ready здесь
+          # было бы silent-wrong: журнал сказал бы «готов» в момент, когда
+          # манифест-PR только создан, морда не пересобрана и плагина в
+          # ростере ещё нет (находка разбора PR #273, устраняющая
+          # расхождение с design.md, введённое в ходе AI-ревью того же PR).
+          # Канал «мерж → деплой → ready» — отдельная задача (см. #268 и
+          # issue из остатка #162 про доводку deploying/ready до деплоя).
+          echo "Следующий шаг: ревью и мёрж PR. Финальный статус этого шага — built. Ready проставит канал деплоя (отдельная задача): либо дождаться ежедневного schedule deploy-dsh-edge.yml, либо запустить его вручную (gh workflow run deploy-dsh-edge)."
+
+  # Если форж упал — постим failed статус
+  forge-failed:
+    needs: forge
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Без чекаута scripts/plugins/plugin_status.sh не существует в воркспейсе:
+      # вызов ниже падал бы всегда, а `|| true` эту постоянную ошибку маскировал —
+      # финальный failed-статус молча не доезжал до журнала (находка AI-ревью PR
+      # #273, тот же класс, что #271: silent-wrong под `|| true`).
+      # persist-credentials: false — как во всех остальных checkout'ах репозитория
+      # (main-job, deploy, worker): без него токен с contents:write остаётся в
+      # .git/config воркспейса этого job'а (находка AI-ревью PR #273).
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: plugin_status → failed
+        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        env:
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          # Канонический id из job forge (steps.validate.outputs.plugin_id —
+          # после сверки с манифестом, см. output `plugin_id` job'а forge) —
+          # не inputs.plugin_id: тот опционален и при обычном запуске пуст,
+          # а даже заданный входом id может быть переопределён валидацией на
+          # id из манифеста (бамп существующего пакета под другим id). Пусто
+          # (validate упала до записи output, т.е. до конца валидации) —
+          # фолбэк на basename(inputs.plugin_path) в BASH ниже (находка
+          # AI-ревью PR #273: без канонического id падение ПОСЛЕ валидации
+          # уезжало в plugin:<basename>, а не в тот id, что уже видел
+          # building/built — таймлайн канонического плагина вечно висел на
+          # building).
+          PLUGIN_ID_INPUT: ${{ needs.forge.outputs.plugin_id }}
+          PLUGIN_PATH: ${{ inputs.plugin_path }}
+          STATE: failed
+          SOURCE: forge
+          DETAIL: "форж упал: см. лог job ${{ github.run_id }}"
+        run: |
+          PLUGIN_ID="${PLUGIN_ID_INPUT:-$(basename "$PLUGIN_PATH")}"
+          PLUGIN_ID="${PLUGIN_ID:-unknown}"
+          PLUGIN_ID="$PLUGIN_ID" STATE=failed SOURCE=forge DETAIL="$DETAIL" bash scripts/plugins/plugin_status.sh || true

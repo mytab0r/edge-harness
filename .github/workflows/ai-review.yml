@@ -5,7 +5,11 @@
 # создают событий (антирекурсия GitHub), и on: pull_request[labeled] молчал
 # бы вечно; workflow_run — документированный обход этого ограничения
 # (research/21). Фильтр: pr-review завершился успехом И на PR стоит метка
-# review:ok (проверяет facts-шаг: успех бывает и с review:large).
+# review:ok ИЛИ review:large (проверяет facts-шаг) — второе нужно, чтобы
+# газ размерного гейта (#204, apply_large_ok) вообще имел шанс сработать:
+# крупный-но-безнаходочный дифф получает review:large, а не review:ok
+# (check_pr.py::verdict_for), и без этого условия AI-ревью на нём не
+# запускалось бы никогда — тормоз стоял бы без единого AI-вердикта.
 # Повтор/миграция — workflow_dispatch (input pr): события отгоревших PR
 # не восстановить.
 # review:ok сам по себе НЕ означает, что дорогой прогон нужен (#294): чистое
@@ -31,7 +35,9 @@
 # нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET* из model-shell
 # вызовов (живой прогон 2026-08-30, см. worker.yml).
 # Job `verdict`: СВЕЖАЯ машина, свой чекаут main, свой GH_TOKEN с
-# pull-requests:write. Ответ ревью переезжает между job'ами ВЫВОДОМ
+# pull-requests:write (+ statuses:write — вердикт публикуется вторым каналом,
+# Commit Status API harness/ai-review, параллельно метке, #345). Ответ ревью
+# переезжает между job'ами ВЫВОДОМ
 # доверенного шага (данные, не код); head для сверки — step-output фактов,
 # закрытый до недоверенного шага: файлы $AI_WORK агенту принадлежат.
 #
@@ -40,7 +46,41 @@
 # параллельные ревью одного PR возможны, и это осознанно: cancel-in-progress
 # НАМЕРЕННО выключен — отмена погасила бы летящее ревью без автоперезапуска,
 # а протухший вердикт и так не применяется (verdict сверяет head с gather).
+#
+# Полная сериализация ревью РАЗНЫХ PR в одну группу рассмотрена и ОТКЛОНЕНА
+# (#419, живой факт: 24 прогона/час, до 7 одновременно, четыре PR с ai:failed
+# от RATE_LIMIT). Причина отказа — не проверена числом, а опровергнута
+# механикой: у группы concurrency может быть только один ОЖИДАЮЩИЙ прогон —
+# при общей группе новый триггер (ЛЮБОГО PR) отменяет ЧУЖОЙ ожидающий прогон
+# (documented GitHub Actions concurrency queueing), а не только повторный
+# триггер того же PR, как сейчас. Отменённый прогон PR-A не оставляет ни
+# ai:*-метки, ни ai:failed — PR-A просто никогда не получает вердикт, и
+# ничего не просит его повторить (таймер #196 реагирует только на живой
+# ai:failed). Это ровно silent-wrong класс, который AGENTS.md запрещает:
+# «возможности нет» стало бы неотличимо от «забыли просмотреть». Настоящий
+# фикс перегрузки — ретрай временного RATE_LIMIT внутри dsh (ai_dsh.sh,
+# #419): проваленные ПОВТОРНЫМИ запросами прогоны переживают лимит сами, не
+# уменьшая число параллельных PR, которые смогут получить вердикт.
 name: ai-review
+
+# run-name зашивается из события ДО старта job'а (только github.event.*,
+# шаги ещё не выполнялись) — единственный надёжный признак «этот прогон про
+# PR N» для scripts/lib/review_labels.py::other_active_ai_review_runs (#399):
+# у самого ai-review-рана head_branch/head_sha ВСЕГДА "main" (job чекаутит
+# main первым шагом) независимо от триггера, поэтому матчить прогоны разных
+# PR по head_sha/head_branch нельзя вовсе. workflow_dispatch несёт номер PR
+# прямо во входе; workflow_run (от pr-review) — через
+# github.event.workflow_run.pull_requests[0].number, доступный в событии
+# БЕЗ похода в API (пусто для PR не из этого репозитория — известное
+# ограничение GitHub, деградация признака для форков, не молчаливая ошибка).
+# Префикс "ai-review PR #" продублирован в
+# scripts/lib/review_labels.py::AI_REVIEW_RUN_NAME_PREFIX — тест
+# test_ai_review_workflow_run_name_uses_review_labels_prefix сверяет
+# буквально, чтобы стороны не разошлись молча.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('ai-review PR #{0}', github.event.inputs.pr)
+   || (github.event.workflow_run.pull_requests[0] && format('ai-review PR #{0}', github.event.workflow_run.pull_requests[0].number))
+   || 'ai-review' }}
 
 on:
   workflow_run:
@@ -52,11 +92,26 @@ on:
         description: "Номер PR (повтор ревью, например после ai:failed)"
         required: true
         type: string
+      force:
+        description: >-
+          Пересмотреть даже без изменений в диффе (по умолчанию выключено,
+          #399: безусловный --force жёг деньги на дублях без ai:failed —
+          22% платных прогонов за 2026-09-05/06). Включайте осознанно, когда
+          нужен пересмотр РОВНО того же кода, который уже получил вердикт.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
+  # actions:read — шагу fingerprint нужен API /actions/workflows/.../runs
+  # (review_labels.other_active_ai_review_runs, #399): без этого пункта
+  # GITHUB_TOKEN получает actions:none (пункты, не перечисленные в этом
+  # блоке, GitHub обнуляет — не «как у репозитория по умолчанию»), и
+  # ручная сверка «прогон уже идёт» падала бы 403 на каждом workflow_dispatch.
+  actions: read
 
 concurrency:
   # Группа = породивший run pr-review (уникален) либо номер PR из dispatch:
@@ -72,15 +127,25 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    # 60 мин — таймаут DSH (ai_dsh.sh) + установка и доверенный gather.
-    # Рабочий каталог — $RUNNER_TEMP/ai-review (шаги берут его из шелл-env
-    # раннера; job-level env не знает контекста runner — GitHub такой файл
-    # отклоняет целиком, поймано живым прогоном).
-    timeout-minutes: 70
+    # 130 мин (#419, было 70): один вызов dsh по-прежнему ограничен 60 мин
+    # (DSH_TIMEOUT_SECS ниже), но временный RATE_LIMIT теперь переживается
+    # ретраем внутри ai_dsh.sh — бюджет ожидания по умолчанию 30 мин
+    # (AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS), плюс до 60 мин на финальную
+    # успевшую попытку, плюс запас на установку/gather. Job живёт до 6 часов
+    # (docs/research/21-github-actions.md) — 130 мин оставляют большой запас,
+    # не подходя к жёсткому потолку. Рабочий каталог — $RUNNER_TEMP/ai-review
+    # (шаги берут его из шелл-env раннера; job-level env не знает контекста
+    # runner — GitHub такой файл отклоняет целиком, поймано живым прогоном).
+    timeout-minutes: 130
     outputs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
+      # failure_reason (#419): quota_exhausted | rate_limit_retry_budget_exceeded
+      # | пусто — пишет ai_dsh.sh в $AI_WORK/failure_reason.txt, различает в
+      # тексте вердикта «лимита нет вовсе» от «лимит есть, но что-то ещё
+      # сломано» (правило AGENTS.md, см. ai_review.py::error_reason).
+      failure_reason: ${{ steps.answer.outputs.failure_reason }}
       pr: ${{ steps.facts.outputs.pr }}
       # go — окончательное решение job'а: review:ok есть (facts) И дорогой
       # прогон оправдан (fingerprint, #294). Шаг fingerprint не выполняется,
@@ -88,12 +153,37 @@ jobs:
       # и needs.review.outputs.go == 'true' в job verdict тоже корректно False.
       go: ${{ steps.fingerprint.outputs.go }}
     steps:
+      # Доверенный чекаут main только ради гейта квоты ниже (та же граница
+      # доверия, что и у остальных доверенных шагов job'а: код из main, а не
+      # из ревьюимой ветки — её чекаут случится позже и в другой каталог).
+      - name: Чекаут main (для гейта квоты)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # живой прогон 2026-09-06 падал ровно в этом job'е — PR #453 упал на
+      # `gh api repos/.../pulls/453` внутри шага fingerprint, потому что
+      # общий бюджет 1000 запросов/час/репозиторий уже был съеден другими
+      # job'ами того же часа. Мало квоты → facts не выполняется (условие
+      # ниже) → go остаётся пустым → вся цепочка (fingerprint/gather/DSH/
+      # verdict) гасится уже существующими условиями `steps.facts.outputs.go` —
+      # job зелёный (skipped), а не красный по чужой причине. Порог и
+      # обоснование — scripts/lib/rate_guard.py.
+      - name: Квота GitHub API — ранняя проверка
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job ai-review
+
       # Факты идут step-outputs'ами, НЕ через GITHUB_ENV: env-файл общий на
       # job, и недоверенный шаг мог бы дописать туда переменные для соседей.
       # Step-outputs читаются из СВОЕГО временного файла на момент закрытия
       # шага — поздние записи в него игнорируются.
       - name: Факты PR (номер, head, решение «ревьюим?»)
         id: facts
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_INPUT: ${{ github.event.inputs.pr }}
@@ -139,13 +229,26 @@ jobs:
           head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)
           [ -n "$head" ] || { echo "::error::у PR #$pr нет head-sha"; exit 1; }
           # Источник правды — метка, а не вывод из conclusion: pr-review мог
-          # завершиться успехом с review:large (не ок) — тогда гейт не открыт.
+          # завершиться успехом с review:large (не ок) — тогда гейт всё равно
+          # открыт: review:large — ЕДИНСТВЕННЫЙ путь, которым size_gate метит
+          # крупный-но-безнаходочный дифф (verdict_for в check_pr.py ставит
+          # либо review:ok, либо review:large — никогда оба сразу), а газ
+          # этого тормоза (#204, apply_large_ok в ai_review.py::cmd_verdict)
+          # обязан опираться на состоявшийся AI-вердикт на этом же PR. Если
+          # не открыть гейт и для review:large, AI-ревью никогда не запустится
+          # на крупном диффе вообще — тормоз без AI-вердикта, апрув
+          # review:large-ok мёртв по построению, а PR стоит молча (живой
+          # замер #204, второй заход: PR #387/#384/#367/#262 без единого
+          # ai:*-события в таймлайне). review:changes-requested (есть
+          # findings) сюда не попадает — при findings pr-review сам
+          # завершается кодом 1, workflow_run.conclusion != success, и job
+          # review вообще не стартует по условию выше.
           labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels" --jq '[.[].name] | join(" ")')
           case " $labels " in
-            *" review:ok "*) go=true ;;
+            *" review:ok "*|*" review:large "*) go=true ;;
             *)
               echo "go=false" >> "$GITHUB_OUTPUT"
-              echo "PR #$pr: review:ok не стоит ($labels) — гейт первого ревью не открыт, выходим без ревью."
+              echo "PR #$pr: ни review:ok, ни review:large не стоит ($labels) — гейт первого ревью не открыт, выходим без ревью."
               exit 0
               ;;
           esac
@@ -174,18 +277,18 @@ jobs:
       # копия условия в YAML). ai:failed никогда не даёт пропустить прогон —
       # у него отдельный газ на автоповтор по таймеру (#196).
       #
-      # workflow_dispatch — единственный документированный путь ручного
-      # повтора (ADR 0007 п.4, шапка этого файла) и рабочий инструмент
-      # оркестратора для проводки PR через ревью: отпечаток сверять НЕЛЬЗЯ,
-      # иначе ручной запуск на PR с окончательным вердиктом и неизменным
-      # диффом становится зелёным no-op без единой строчки ревью — владелец
-      # теряет единственный газ пересмотра (находка 1 вердикта ai-review
-      # PR #294). --force просит cmd_should_run отдать "true" без обращения
-      # к сети вовсе (доказано мутацией: без --force дорогой прогон на
-      # неизменном отпечатке пропускается и при dispatch). Пустой output
-      # шага останавливает job verdict молча (needs.review.outputs.go !=
-      # 'true') — поэтому go=true пишется явно в обеих ветках, не только
-      # выводом python-команды.
+      # Ручной workflow_dispatch БЕЗ явного input force:true проходит ТУ ЖЕ
+      # сверку, что и автоматический путь (#399, было — --force безусловно
+      # для любого dispatch, что жгло 22% платных прогонов на дублях уже
+      # вынесенного вердикта без ai:failed — см. Дельта 2026-09-06 в ADR
+      # 0007). --force остаётся, но включается только явным входом force —
+      # owner, не согласный с окончательным вердиктом на неизменном диффе
+      # (например хочет пересмотра без правки кода), иначе терял бы
+      # единственный газ пересмотра (находка 1 вердикта ai-review PR #294):
+      # cmd_should_run с --force отдаёт "true" без обращения к сети вовсе
+      # (доказано мутацией). Пустой output шага останавливает job verdict
+      # молча (needs.review.outputs.go != 'true') — поэтому go=true пишется
+      # явно в обеих ветках, не только выводом python-команды.
       - if: steps.facts.outputs.go == 'true'
         id: fingerprint
         name: Нужен ли дорогой прогон (сверка отпечатка диффа)
@@ -193,10 +296,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
           set -o pipefail
           force_flag=""
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE_INPUT" = "true" ]; then
             force_flag="--force"
           fi
           run_needed=$(python scripts/review/ai_review.py should-run --pr "$PR_NUMBER" $force_flag) \
@@ -205,7 +309,7 @@ jobs:
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "PR #$PR_NUMBER: дифф не изменился с последнего вердикта AI — дорогой прогон не нужен."
+            echo "PR #$PR_NUMBER: дорогой прогон не нужен (причина — в stderr выше: дифф не изменился, либо уже идёт другой прогон этого PR)."
           fi
 
       # Дерево PR — только ДАННЫЕ для агента: агент читает репозиторий в
@@ -275,6 +379,9 @@ jobs:
             # silent-wrong). Файла может не быть при экзотическом обрыве шага
             # (например SIGKILL раннера) — тогда пусто читается как «неизвестно».
             echo "dsh_rc=$(cat "$AI_WORK/dsh_rc.txt" 2>/dev/null || echo '')"
+            # failure_reason (#419): пусто на успехе/обычном транспортном
+            # отказе — тот же принцип "файла может не быть", что у dsh_rc.
+            echo "failure_reason=$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')"
             printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
             cat "$AI_WORK/answer.txt"
             printf 'AI_REVIEW_ANSWER_EOF_7f3a\n'
@@ -290,6 +397,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: write
+      statuses: write
     steps:
       # Доверенный инструментарий — из main; ревьюимое дерево тут не нужно:
       # verdict парсит ответ и ходит в API, текущий head он сверяет сам.
@@ -312,11 +420,14 @@ jobs:
           HEAD_REVIEWED: ${{ needs.review.outputs.head }}
           ANSWER: ${{ needs.review.outputs.answer }}
           DSH_RC: ${{ needs.review.outputs.dsh_rc }}
+          # #419: quota_exhausted | rate_limit_retry_budget_exceeded | пусто —
+          # см. ai_review.py::error_reason.
+          FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
         run: |
           printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
             --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED" \
-            --dsh-rc "$DSH_RC"
+            --dsh-rc "$DSH_RC" --failure-reason "$FAILURE_REASON"
 
       # Разбудить оркестратор (#297) сразу после вердикта, а не ждать
       # расписания: тот же приём, что в pr-review.yml (workflow_dispatch —
@@ -330,9 +441,12 @@ jobs:
       # (ai:failed), а дефолтный `if: success()` пропускал бы будильник
       # именно в этой ветке; сбой самого диспатча (сеть/лимит) тоже не
       # должен красить job verdict — расписание остаётся страховкой.
+      # scripts/gh/wake_orchestra.sh (#456) экономит диспатч, если orchestra.yml
+      # уже запущен/в очереди — см. комментарий в pr-review.yml, то же место
+      # правды, не копия логики.
       - name: "Разбудить оркестратор (#297): вердикт AI готов, не ждать расписания"
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run orchestra.yml --ref main
+        run: scripts/gh/wake_orchestra.sh "$GITHUB_REPOSITORY"

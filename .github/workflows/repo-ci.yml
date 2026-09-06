@@ -15,7 +15,10 @@ on:
 
 permissions:
   contents: read
+  # Инварианты состояния репозитория (#244, scripts/orchestra/repo_invariants.py)
+  # читают открытые issues/PR живым gh api — read достаточно, шаг ниже не пишет.
   issues: read
+  pull-requests: read
 
 jobs:
   test:
@@ -81,12 +84,54 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_dispatch_tail.py -q
 
+      # Замер факта rows_read Durable Objects (задача #320): арифметика суточного
+      # итога, разбор GraphQL introspection, выбор формы запроса по факту схемы —
+      # кормится прод-формой ответов Cloudflare, сеть не трогаем.
+      - name: Тесты замера rows_read
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_do_rows_read.py -q
+
       # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
       # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
       - name: Тесты предохранителя конвейера orchestra
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_pulse_guard.py -q
+
+      # Инварианты состояния репозитория (#244): «такого состояния быть не
+      # должно» — открытая задача с уже слитым PR, застрявший review:ok без
+      # ai:*, полностью отмеченный незаархивированный openspec/changes, две
+      # открытые задачи с пересекающейся уликой file:line. Четыре чистых
+      # decide_*/check_* функции (инвариант 2 выведен из состава ревью PR
+      # #249 — класс, который он ловил, закрыл #247), каждая доказана
+      # мутацией на прод-форме фикстур (реальные тела issue #202/#213/#204/
+      # #217). Мета-течь, которую это закрывает: 2026-09-02/03 из ~15
+      # найденных дефектов конвейера НИ ОДИН не нашла система.
+      - name: Тесты инвариантов состояния репозитория
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_repo_invariants.py -q
+
+      # Гвардия протухшей метки blocked (#334): без этого шага тесты
+      # гвардии живут только текстом файла — по собственному правилу
+      # этого же PR («решение — это механизм, а не текст») это ровно тот
+      # класс, который PR закрывает для остальных, но сам изначально
+      # не подключал себе (находка AI-ревью PR #336, третий раунд):
+      # continue-on-error в orchestra.yml держит job зелёным при любой
+      # поломке STALE_MARKER_RE/find_stale_blocked, и без обязательного
+      # прогона тестов здесь это никто не заметит.
+      - name: Тесты гвардии протухшей метки blocked
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_stale_blocked_guard.py -q
+
+      # Сборщик квот харнеса (#324): Cloudflare/GitHub/LLM в одну таблицу.
+      # Кормится реальными фикстурами (gh api rate_limit, пример из доков CF).
+      - name: Тесты сборщика квот
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_quotas.py -q
 
       # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
       # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
@@ -102,6 +147,18 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
 
+      # Контракт PR ↔ задача (#394, находка при первом заходе на
+      # pr_task_candidates: у этого теста не было ни одного шага в CI —
+      # «файл гвардии лежал» не значило «красит CI», тот же класс, что уже
+      # чинили для test_task_ref_usage_guard.py при #259). Резолвер задачи
+      # PR (единственный источник — имя agent-ветки, решение владельца
+      # 2026-09-06), гвардия «нарушение записано → изменяющий вызов всё
+      # равно выполнен».
+      - name: Тесты контракта PR ↔ задача
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_contract_check.py -q
+
       # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
       # source-build морды кричит в задачу #134 + метка update-available +
       # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
@@ -112,6 +169,36 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_upstream_drift.py -q
+
+      # Сигнал ослабления защиты main событием branch_protection_rule (#370,
+      # #341): инвариант 6 не может опрашивать protection (GET требует
+      # administration, которого нет у GITHUB_TOKEN) — сигнал приходит вместе
+      # с самим фактом изменения через payload события, читать API не нужно.
+      # Прод-форма фикстур — вербатим примеры payload'ов GitHub (octokit/webhooks),
+      # проводка на моке pulse_guard.gh: согласованное состояние — ноль мутаций.
+      - name: Тесты сигнала ослабления защиты main (#370)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
+
+      # Гвардия «PR не заводится на эпик» (#376): task-branch отказывает на
+      # номере эпика ДО git switch -c — признак эпика (is_epic_issue,
+      # scripts/orchestra/scheduler.py) не дублируется вторым определением,
+      # scripts/lib/epic_guard.py импортирует его. Мутация «убрать вызов
+      # is_epic_issue» краснит check_epic_by_title/check_epic_by_open_sub_issues.
+      - name: Тесты гвардии «PR не заводится на эпик»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_epic_guard.py -q
+
+      # Проводка той же гвардии в task-branch целиком (не только логика
+      # epic_guard.py выше): номер эпика падает ДО создания ветки, ветка не
+      # остаётся созданной; обычная задача заводится штатно. python3
+      # застаблен в PATH тем же CLI-контрактом, что epic_guard.py — сеть/gh
+      # не нужны (класс воспроизведён живьём: PR #162, 44 раунда ревью на
+      # ветку, привязанную к эпику #77).
+      - name: Smoke «task-branch отказывает на эпике»
+        run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
 
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
@@ -140,10 +227,11 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_task_ref.py -q
 
-      # Резолвер «PR → задача» (#259): task_section обязан резолвить задачу
-      # PR через resolve_pr_task (имя ветки → закрывающая issue → декларация
-      # первой строкой), а не «первое попавшееся число» из прозы описания —
-      # этот класс путал #253 с #120, #248 с #119, #247 с #43, #263 с #4.
+      # Резолвер «PR → задача» (#259, #394): task_section обязан резолвить
+      # задачу PR через resolve_pr_task (единственный источник — имя ветки,
+      # тело PR не читается вовсе), а не «первое попавшееся число» из прозы
+      # описания — этот класс путал #253 с #120, #248 с #119, #247 с #43,
+      # #263 с #4.
       # Гвардия сканирует вызовы task_ref.extract_task_refs/TASK_REF_RE вне
       # ALLOWED_WIDE_USAGE и красит CI, если узкий контекст «эта задача
       # закрыта/занята» вновь тронут широкой семантикой.
@@ -179,8 +267,9 @@ jobs:
       # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
       # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
       # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает
-      # ТОЛЬКО declared_tasks (первая строка тела), не любое упоминание номера
-      # в прозе PR (класс #187/#195). Кормится реальным телом PR #181.
+      # ТОЛЬКО task_ref.task_from_branch (имя agent-ветки, #394, решение
+      # владельца 2026-09-06: тело PR не читается вовсе), не любое упоминание
+      # номера в прозе PR (класс #187/#195). Кормится реальным телом PR #181.
       - name: Тесты выбора свободной задачи free_task
         run: |
           pip install --quiet pytest pyyaml
@@ -209,6 +298,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
+      # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
+      # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
+      # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
+      # «прочитаны все». Две мутации краснят по отдельности: новый/восстановленный
+      # .yml без строки в таблице; мёртвая строка на удалённый .yml.
+      - name: Гвардия инвентаря INFRA-GH.md — каждый workflow назван в таблице
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_infra_gh_inventory.py -q
+
       # Паритет маскирования (ревью PR #173): инбокс морды пишет фриформ-текст
       # владельца в публичный issue — паттерны секретов cf-worker/src/redact.ts
       # обязаны совпадать один к одному с dsh-ci.sh::redact. Две мутации
@@ -227,6 +326,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/review/test_ai_review.py -q
 
+      # Масштаб находки (#426): file_tasks.py заводит issue только для
+      # МАСШТАБ: отдельно — фильтр защиты в глубину (build_comment уже не
+      # фенсит хвост/без-поля, но искажённый/ручной комментарий проверяется
+      # ещё раз здесь).
+      - name: Тесты file_tasks.py — фильтр МАСШТАБ (#426)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/review/test_file_tasks.py -q
+
       # Гвардии check_pr.py. Одна — аргумент --tree (bootstrap PR #138):
       # check_pr.py исполняется доверенным чекаутом main, а не деревом
       # проверяемого PR (см. комментарий в pr-review.yml); регресс сигнатуры
@@ -239,6 +347,17 @@ jobs:
         run: |
           pip install --quiet pytest
           python -m pytest scripts/review/test_check_pr.py -q
+
+      # Триггерная проводка обоих гейтов (#208): класс «ботовский update-branch
+      # снёс свежий ai:ok, а второй гейт сам не перезапустился» закрыт связкой
+      # pr-review: synchronize → workflow_run(pr-review, completed) → ai-review.
+      # Эти блоки YAML не читает ни один скрипт — их читает только GitHub, поэтому
+      # снять любое звено можно молча для всех юнит-тестов; гвардия краснеет при
+      # правке триггеров, а не при первом живом инциденте.
+      - name: Гвардия триггеров гейтов ревью (#208)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_gate_triggers.py -q
 
       - uses: actions/setup-node@v7
         with:
@@ -292,10 +411,26 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Проверка на входе в task-branch (не гвардия постфактум): задача обязана
+      # существовать/быть открытой/нести task/не нести blocked до создания
+      # ветки — прогон на реальном git с фейковым gh, сеть не нужна.
+      - name: Smoke task-branch — проверка задачи на входе
+        run: bash scripts/git/test/task-branch.test.sh
+
+      # Гвардия класса #476 (живой прогон worker.yml 34027035455, PR #408):
+      # доводка уже открытого PR обязана исполнять scripts/* (по пути, включая
+      # scripts/gh/infra_digest.sh) из main-дерева job'а, а не из ветки PR —
+      # инструментарий, добавленный в main ПОСЛЕ ответвления ветки PR, не
+      # должен пропадать. Прогон настоящего блока «5. Ветка» из
+      # scripts/worker/task.sh на реальном git, сеть не нужна.
+      - name: Smoke доводки PR — инструментарий из main, ветка PR отдельным worktree (#476)
+        run: bash scripts/worker/test/continue-pr-worktree.smoke.sh
 
       # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
       # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
@@ -403,3 +538,40 @@ jobs:
               sys.exit("\n".join(missing))
           print(f"docs: все {total} ссылок на .github/workflows/ существуют")
           PY
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
+      # живого падения, что у PR #428 (оба обязательных гейта, `test` в том
+      # числе, упали с `API rate limit exceeded for installation`). Мало
+      # квоты → шаг инвариантов пропускается (условие ниже) и job `test`
+      # остаётся зелёным вместо случайного красного по чужой причине;
+      # предупреждение печатается здесь же, до пропуска. Порог и обоснование —
+      # scripts/lib/rate_guard.py.
+      - name: Квота GitHub API — ранняя проверка (инварианты)
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job repo-ci-invariants
+
+      # Живой снимок инвариантов состояния репозитория (#244) — на каждый
+      # push/PR, раньше следующего пульса orchestra (см. также periodic-шаг
+      # в orchestra.yml с эскалацией). Все инварианты проверяют СОСТОЯНИЕ
+      # репозитория (issues/PR/openspec), а не дифф текущего PR — обвал
+      # состояния, накопленный за месяцы, не вина автора конкретного пуша,
+      # поэтому required-гейт включается точечно через CI_GATING
+      # (scripts/orchestra/repo_invariants.py), а не разом для всех.
+      # Решение владельца (PR #249, 2026-09-03) было включить 3 и 4 сразу —
+      # фактически required только 4 (архивация спеки, ноль нарушений на
+      # момент включения). Инвариант 3 сужен обратно до наблюдательного: его
+      # газ (trigger_ai_review) зависит от такта оркестратора, а такт
+      # ненадёжен (#269) — включится обратно после закрытия #269, см.
+      # CI_GATING в repo_invariants.py для условия и GATING_RELEASE_CONDITION
+      # для газа. 1/2/5 — наблюдательные, пока не обнулён накопленный долг
+      # (17/20 из 66/7 нарушений на замер). Инвариант 7 (#219, двусмысленная
+      # формула принадлежности плагина) включён required сразу при создании:
+      # ноль нарушений на момент включения — фраза вычищена тем же PR.
+      - name: Инварианты состояния репозитория — живой снимок (4, 7 — required)
+        if: steps.quota.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/repo_invariants.py

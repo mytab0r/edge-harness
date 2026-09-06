@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Гвардии check_pr.py: аргумент --tree (bootstrap PR #138) и размерный гейт (#90).
+"""Гвардии check_pr.py: аргумент --tree (bootstrap PR #138), размерный гейт (#90)
+и гвардия молчаливого отката main (#217).
 
 Класс, который ловит этот тест: pr-review исполняет check_pr.py из
 доверенного чекаута main (см. .github/workflows/pr-review.yml), а не из
@@ -29,7 +30,6 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-
 SCRIPT = Path(__file__).with_name("check_pr.py")
 LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 
@@ -248,3 +248,370 @@ def test_ai_verdict_keep_mutation_guard_diff_unchanged():
     naive_keep_without_diff_check = bool(rl.ai_verdicts_to_drop([{"name": rl.AI_OK}]))
     assert naive_keep_without_diff_check is True  # «мутант» сохранил бы метку
     assert check_pr.ai_verdict_keep([{"name": rl.AI_OK}], stored, current) is False  # фикс — нет
+
+
+# ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
+#
+# main() исполняется целиком (argv/env через monkeypatch), gh/run_gh
+# подменены на фейки без сети — subprocess.run патчится только для
+# «gh pr diff» (единственный сырой вызов внутри main(), gh()/run_gh()
+# перехватываются собственными функциями модуля целиком).
+
+def _run_check_pr_main(monkeypatch, capsys, diff_text: str, pull: dict, files: list,
+                        comments: list | None = None):
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(sys, "argv", ["check_pr.py", "--pr", "1"])
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def fake_diff_run(cmd, **kwargs):
+        assert cmd[:3] == ["gh", "pr", "diff"], cmd
+        return SimpleNamespace(stdout=diff_text, returncode=0)
+
+    monkeypatch.setattr(check_pr.subprocess, "run", fake_diff_run)
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/1":
+            return pull
+        if url.startswith("repos/o/r/pulls/1/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        if url.startswith("repos/o/r/issues/1/comments"):
+            page = url.split("page=")[-1]
+            return (comments or []) if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(check_pr, "gh", fake_gh)
+    monkeypatch.setattr(check_pr, "run_gh", lambda *a: run_gh_calls.append(a))
+
+    rc = check_pr.main()
+    return rc, run_gh_calls
+
+
+def _status_calls(run_gh_calls: list[tuple]) -> list[tuple]:
+    return [a for a in run_gh_calls
+            if a[:2] == ("api", "-X") and "/statuses/" in a[3]]
+
+
+def test_check_pr_posts_success_status_on_review_ok(monkeypatch, capsys):
+    pull = {"head": {"sha": "deadbeef"}, "labels": []}
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, [])
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "repos/o/r/statuses/deadbeef" in joined
+    assert f"context={rl.STATUS_REVIEW}" in joined
+    assert "state=success" in joined
+
+
+def test_check_pr_posts_failure_status_on_findings(monkeypatch, capsys):
+    # Неразрешённый конфликт-маркер в добавленной строке диффа — находка →
+    # review:changes-requested → статус обязан стать failure, не success,
+    # тем же порогом, что и метка. Маркер собран конкатенацией (не литералом
+    # в исходнике теста): собственный check_pr.py сканирует ЭТОТ файл в
+    # своём диффе на PR данной задачи — литеральный секрет/маркер здесь же
+    # сам стал бы находкой (живой урок #345: PR #346 словил ровно это на
+    # прежней версии теста с литеральным AKIA-ключом).
+    pull = {"head": {"sha": "cafef00d"}, "labels": []}
+    conflict_marker_line = "+" + ("<" * 7) + " HEAD\n"
+    rc, run_gh_calls = _run_check_pr_main(
+        monkeypatch, capsys, conflict_marker_line, pull, [])
+
+    assert rc == 1  # находка — шаг красный (fail loud), как и до этой правки
+    status_calls = _status_calls(run_gh_calls)
+    assert len(status_calls) == 1
+    joined = " ".join(status_calls[0])
+    assert "repos/o/r/statuses/cafef00d" in joined
+    assert "state=failure" in joined
+
+
+def test_check_pr_posts_status_through_review_labels_helper():
+    # Гвардия по исходнику (тот же класс, что test_check_pr_reads_files_through_paginated_helper):
+    # публикация статуса — через одно место правды review_labels, не второй
+    # прямой gh api-вызов рядом с меткой.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "review_labels.post_commit_status(" in source
+    assert "review_labels.STATUS_REVIEW" in source
+    assert "review_labels.review_status_state(verdict)" in source
+
+
+# Зеркало harness/ai-review на keep-пути (находка ai-ревью PR #346): чистое
+# подтягивание main сохраняет ai:*-метку (ai_verdict_keep), но ai-review.yml
+# сам эту ветку не проходит (should_run_ai_review отдаёт false, job verdict
+# скипается) — без публикации здесь статус на новом head не появился бы
+# НИКОГДА, и после включения required status checks PR застревал бы в
+# «Expected» без единого механизма его снять.
+
+def test_check_pr_mirrors_ai_status_on_keep_path(monkeypatch, capsys):
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    fp = rl.diff_fingerprint(files)
+    pull = {"head": {"sha": "newsha"}, "labels": [{"name": rl.AI_OK}]}
+    comments = [{
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: oldsha\nreviewer: approve\ndiff: {fp}\n\nпроза",
+    }]
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert len(ai_calls) == 1, run_gh_calls
+    joined = " ".join(ai_calls[0])
+    assert "repos/o/r/statuses/newsha" in joined
+    assert "state=success" in joined  # approve → success (ai_status_state)
+
+    # Метка ai:ok не снята — гейт сохранён (существующее поведение keep-пути).
+    label_deletes = [a for a in run_gh_calls
+                     if "DELETE" in a and "labels/ai:" in " ".join(a)]
+    assert label_deletes == []
+
+
+def test_check_pr_mirrors_ai_status_rework_on_keep_path(monkeypatch, capsys):
+    # Тот же путь, но сохранённый вердикт — rework: зеркало обязано отразить
+    # failure, не success, иначе required status check лгал бы об отклонённом коде.
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    fp = rl.diff_fingerprint(files)
+    pull = {"head": {"sha": "newsha2"}, "labels": [{"name": rl.AI_CHANGES}]}
+    comments = [{
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: oldsha\nreviewer: rework\ndiff: {fp}\n\nпроза",
+    }]
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert len(ai_calls) == 1, run_gh_calls
+    joined = " ".join(ai_calls[0])
+    assert "repos/o/r/statuses/newsha2" in joined
+    assert "state=failure" in joined  # rework → failure (ai_status_state)
+
+
+def test_check_pr_mutation_guard_no_mirror_without_keep(monkeypatch, capsys):
+    # Мутационная гвардия: без ai:*-метки на PR (первое ревью) keep-путь не
+    # исполняется вовсе — зеркало не публикуется, второй прогон ai-review сам
+    # поставит harness/ai-review после настоящего вердикта.
+    files = [{"filename": "foo.py", "status": "modified", "sha": "blob1", "additions": 1}]
+    pull = {"head": {"sha": "freshsha"}, "labels": []}
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, files, comments=None)
+
+    assert rc == 0
+    status_calls = _status_calls(run_gh_calls)
+    ai_calls = [a for a in status_calls
+                if any(part == f"context={rl.STATUS_AI_REVIEW}" for part in a)]
+    assert ai_calls == []
+
+
+# ── Гвардия молчаливого отката main (#217) ───────────────────────────────────
+#
+# Прод-форма — НАСТОЯЩИЙ дифф закрытого PR #164 (снят `gh pr diff 164`,
+# head fd10b3e1, 2026-09-06; PR не слит, возвращён автору на переработку).
+# Его 17 merge-коммитов main→ветка, разрешённых в пользу устаревшей стороны,
+# вынесли из dsh-edge/plugins.json записи работающих плагинов runner-bridge
+# и plugin-manager при стоящем review:ok. Синтетика для этого теста запрещена
+# самой задачей #217: гвардия обязана краснеть ровно на той форме, которую
+# поймал разбор, а не на её пересказе.
+#
+# Ложные срабатывания (критерий приёмки 3 #217) проверяются на реально
+# СЛИТЫХ PR, трогавших те же файлы:
+#   fixtures_pr343_manifest_bump.diff — #343, бамп версии записи манифеста
+#     (id остался в контексте, менялись release/asset/sha256);
+#   fixtures_pr96_manifest_add.diff   — #96, ДОБАВЛЕНИЕ записи runner-bridge;
+#   fixtures_pr191_patch_edit.diff    — #191, правка файла патч-серии
+#     (modified, не removed; внутри — дифф самого патча, «патч в патче»).
+
+FIXTURES_DIR = Path(__file__).parent
+
+PR164_DIFF = (FIXTURES_DIR / "fixtures_pr164_revert.diff").read_text(encoding="utf-8")
+
+
+def _fixture_diff(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+def _files_from_diff(diff_text: str) -> list[dict]:
+    """Прод-форма ответа pulls/{n}/files, восстановленная из прод-формы диффа:
+    та же проводка (list_pr_files), которую main() отдаёт в revert_guard."""
+    files = []
+    for n, section in enumerate(check_pr.diff_sections(diff_text)):
+        name = section["new"] or section["old"]
+        status = ("removed" if section["new"] is None
+                  else "added" if section["old"] is None else "modified")
+        files.append({
+            "filename": name,
+            "status": status,
+            "sha": f"blob{n:04d}",
+            "additions": len(section["added"]),
+            "deletions": len(section["removed"]),
+        })
+    return files
+
+
+def test_revert_guard_flags_removed_manifest_entries_on_real_pr164():
+    # Критерий приёмки 1 #217: находка обязана называть КОНКРЕТНУЮ удалённую
+    # запись прод-манифеста, а не «файл изменился». Мутационный якорь: снятие
+    # проверки в check_pr.main (или в revert_guard) краснит этот тест.
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(PR164_DIFF), _files_from_diff(PR164_DIFF), set(), None)
+    assert accepted == []
+    joined = "\n".join(findings)
+    assert "dsh-edge/plugins.json" in joined
+    assert "«runner-bridge»" in joined
+    assert "«plugin-manager»" in joined
+    assert "revert-ok" in joined  # газ назван в самом сообщении
+
+
+def test_revert_guard_accepts_real_pr164_with_gas_label_and_body():
+    # Критерий приёмки 2 #217: тот же дифф с меткой revert-ok И объяснением
+    # в теле PR проходит без находок, принятые удаления возвращаются списком
+    # (main() публикует их в PR — обход виден, а не спрятан в логе).
+    body = ("#164 PoC hello-world\n\n"
+            "revert-ok: записи runner-bridge/plugin-manager выпилены сознательно, "
+            "пока PoC несёт только hello-world.")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(PR164_DIFF), _files_from_diff(PR164_DIFF),
+        {rl.REVERT_OK}, body)
+    assert findings == []
+    joined = "\n".join(accepted)
+    assert "«runner-bridge»" in joined and "«plugin-manager»" in joined
+
+
+def test_revert_gas_rejected_without_label_names_reason():
+    findings, _ = check_pr.revert_guard(
+        check_pr.diff_sections(PR164_DIFF), _files_from_diff(PR164_DIFF), set(), None)
+    assert all("нет метки revert-ok" in f for f in findings)
+
+
+def test_revert_gas_label_without_body_explanation_still_red():
+    # Газ двухчастный: метка без объяснения в теле — забытая половина, гейт
+    # остаётся красным и называет, чего именно не хватает.
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(PR164_DIFF), _files_from_diff(PR164_DIFF),
+        [{"name": rl.REVERT_OK}], "Просто PoC, без объяснений.")
+    assert accepted == [] and findings
+    assert "в теле PR нет объяснения" in "\n".join(findings)
+
+
+def test_revert_guard_no_false_positive_on_merged_manifest_bump_pr343():
+    # #343 (слит): бамп версии записи интеграций — id в контексте, удаляемой
+    # записи нет. Гвардия обязана молчать.
+    diff_text = _fixture_diff("fixtures_pr343_manifest_bump.diff")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(diff_text), _files_from_diff(diff_text), set(), None)
+    assert findings == [] and accepted == []
+
+
+def test_revert_guard_no_false_positive_on_manifest_addition_pr96():
+    # #96 (слит): запись runner-bridge ДОБАВЛЕНА — добавление не удаление.
+    diff_text = _fixture_diff("fixtures_pr96_manifest_add.diff")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(diff_text), _files_from_diff(diff_text), set(), None)
+    assert findings == [] and accepted == []
+
+
+def test_revert_guard_no_false_positive_on_manifest_reformat():
+    # Переформат манифеста без изменения состава (реальный git-дифф перевода
+    # plugins.json в компактный JSON): все id по обе стороны каждой секции —
+    # перелицовка не есть удаление (критерий приёмки 3 #217).
+    diff_text = _fixture_diff("fixtures_manifest_reformat_compact.diff")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(diff_text), _files_from_diff(diff_text), set(), None)
+    assert findings == [] and accepted == []
+
+
+def test_revert_guard_flags_whole_manifest_file_deletion():
+    # Манифест удалён ЦЕЛИКОМ (реальный git-дифф `git rm dsh-edge/plugins.json`):
+    # все записи манифеста — удаляемые, каждая названа по имени.
+    diff_text = _fixture_diff("fixtures_manifest_deleted.diff")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(diff_text), _files_from_diff(diff_text), set(), None)
+    assert accepted == []
+    joined = "\n".join(findings)
+    for entry in ("hello", "runner-bridge", "plugin-manager", "integrations"):
+        assert f"«{entry}»" in joined
+
+
+def test_revert_guard_no_false_positive_on_patch_edit_pr191():
+    # #191 (слит): файл патч-серии ИЗМЕНЁН, не удалён; внутри диффа — строки
+    # самого патча («патч в патче»), разбор не должен сойти с ума.
+    diff_text = _fixture_diff("fixtures_pr191_patch_edit.diff")
+    findings, accepted = check_pr.revert_guard(
+        check_pr.diff_sections(diff_text), _files_from_diff(diff_text), set(), None)
+    assert findings == [] and accepted == []
+
+
+def test_removed_patch_files_sees_removed_and_renamed_out():
+    # Формы удаления из патч-серии: status removed и renamed НАРУЖУ каталога
+    # (файл, ушедший из каталога, apply по имени больше не находит). Правка
+    # на месте (modified) — не удаление. Прод-форма объектов pulls/{n}/files.
+    files = [
+        {"filename": "dsh-edge/patches/0004-harness-ingest.patch",
+         "status": "removed", "sha": "x", "additions": 0, "deletions": 120},
+        {"filename": "dsh-edge/other/0003-web-roster-manifest.patch",
+         "previous_filename": "dsh-edge/patches/0003-web-roster-manifest.patch",
+         "status": "renamed", "sha": "y", "additions": 0, "deletions": 0},
+        {"filename": "dsh-edge/patches/0001-alias-scope.patch",
+         "status": "modified", "sha": "z", "additions": 3, "deletions": 3},
+        {"filename": "docs/notes.md", "status": "removed", "sha": "w",
+         "additions": 0, "deletions": 5},
+    ]
+    gone = check_pr.removed_patch_files(files)
+    assert gone == [
+        "dsh-edge/patches/0003-web-roster-manifest.patch → "
+        "dsh-edge/other/0003-web-roster-manifest.patch",
+        "dsh-edge/patches/0004-harness-ingest.patch",
+    ]
+
+
+def test_check_pr_main_red_gate_on_real_pr164_diff(monkeypatch, capsys):
+    # Сквозной прогон main() на прод-форме диффа #164: вердикт обязан стать
+    # review:changes-requested (гейт красный), комментарий в PR — назвать
+    # удалённые записи. Мутационный якорь критерия приёмки 4 #217.
+    pull = {"head": {"sha": "pr164head"}, "labels": []}
+    rc, run_gh_calls = _run_check_pr_main(
+        monkeypatch, capsys, PR164_DIFF, pull, _files_from_diff(PR164_DIFF))
+
+    assert rc == 1
+    label_posts = [a for a in run_gh_calls
+                   if a[:2] == ("api", "-X") and "/labels" in a[3]]
+    assert any(f"labels[]={rl.REVIEW_CHANGES}" in " ".join(a) for a in label_posts)
+    comments = [a for a in run_gh_calls
+                if a[:2] == ("api", "-X") and "/comments" in a[3]]
+    assert comments and "«runner-bridge»" in " ".join(comments[0])
+    status_calls = _status_calls(run_gh_calls)
+    assert "state=failure" in " ".join(status_calls[0])
+
+
+def test_check_pr_main_green_with_gas_on_real_pr164_diff(monkeypatch, capsys):
+    # Тот же дифф с газом (метка + объяснение в теле): review:ok, гейт открыт,
+    # в PR опубликован комментарий о принятом удалении — осознанный обход виден.
+    body = ("PoC hello-world\n\nrevert-ok: вычистка чужих плагинов из ветки PoC, "
+            "осознанно, будут возвращены отдельным PR.")
+    pull = {"head": {"sha": "pr164gas"}, "labels": [{"name": rl.REVERT_OK}], "body": body}
+    rc, run_gh_calls = _run_check_pr_main(
+        monkeypatch, capsys, PR164_DIFF, pull, _files_from_diff(PR164_DIFF))
+
+    assert rc == 0
+    label_posts = [a for a in run_gh_calls
+                   if a[:2] == ("api", "-X") and "/labels" in a[3]]
+    assert any(f"labels[]={rl.REVIEW_OK}" in " ".join(a) for a in label_posts)
+    comments = [a for a in run_gh_calls
+                if a[:2] == ("api", "-X") and "/comments" in a[3]]
+    assert comments and "«runner-bridge»" in " ".join(comments[0])
+    status_calls = _status_calls(run_gh_calls)
+    assert "state=success" in " ".join(status_calls[0])
+
+
+def test_revert_guard_wired_into_main_before_verdict():
+    # Гвардия по исходнику: main() обязан скармливать revert_guard тот же дифф
+    # и тот же список файлов, из которых считается вердикт, — иначе гвардию
+    # можно обойти, не заметив этого в диффе самого check_pr.py.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "revert_guard(\n        diff_sections(diff), files, current, pull.get(\"body\"))" in source
+    assert "findings.extend(revert_findings)" in source

@@ -61,6 +61,7 @@ import re
 import string
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -70,6 +71,15 @@ _LIB = SCRIPT_DIR.parent / "lib" / "review_labels.py"
 _spec = importlib.util.spec_from_file_location("review_labels", _LIB)
 review_labels = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(review_labels)
+
+# Третья категория находок — чеклист некритичных замечаний в теле PR (#462):
+# парсинг блока ЗАМЕЧАНИЕ и слияние с телом PR — общее место правды с
+# after_merge в scheduler.py (тот же файл читает unresolved_items при
+# слиянии), поэтому живёт в lib, не дублируется здесь второй копией регэкспа.
+_rc_spec = importlib.util.spec_from_file_location(
+    "review_checklist", SCRIPT_DIR.parent / "lib" / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_rc_spec)
+_rc_spec.loader.exec_module(review_checklist)
 
 AI_OK = review_labels.AI_OK
 AI_CHANGES = review_labels.AI_CHANGES
@@ -116,6 +126,20 @@ VERDICT_RE = re.compile(r"^(\*\*|__|)ВЕРДИКТ:\s*(approve|rework)\s*\.?\1$
 # не принимается — тихо взять половину хуже, чем не взять совсем.
 TASK_OPEN_RE = re.compile(r"^ЗАДАЧА:\s*(\S.*)$")
 TASK_CLOSE = "КОНЕЦ ЗАДАЧИ"
+# Масштаб находки — обязательное второе поле блока задачи, сразу после
+# заголовка, критерий различения в ai_prompt.md. Замер по маркерам
+# `filed: #N` за реальные сутки (2026-09-05 03:37 → 2026-09-06 03:37 UTC,
+# PR #313/#395/#162/#173): 22 задачи заведено автоматом за сутки (не оценка —
+# прямой подсчёт по факту file_tasks.py). Из них 5/22 (23%) классифицированы
+# объективным прокси-критерием («все пути к файлам из тела задачи входят в
+# diff PR») как «хвост» — не были бы заведены новой логикой (см. PR #433,
+# раздел «Замер на реальных данных» — это НИЖНЯЯ оценка: семантический разбор
+# нескольких находок без явной ссылки на файл относит их к «хвосту» тоже).
+# Отсутствие поля НЕ трактуется молча как "отдельно" (fail loud, #426): смотри
+# partition_tasks ниже.
+SCOPE_RE = re.compile(r"^МАСШТАБ:\s*(хвост|отдельно)\.?\s*$")
+SCOPE_TAIL = "хвост"
+SCOPE_SEPARATE = "отдельно"
 # Блок-забор задачи в комментарии: строится только транспортом, парсится
 # file_tasks. ЧЕТЫРЕ бэктика: внутренний ```-фенс в теле задачи (пример
 # кода) не закрывает блок — иначе roundtrip молча обрезал бы тело.
@@ -189,12 +213,41 @@ def transport_failed(dsh_rc: str) -> bool:
         return False
 
 
-def error_reason(answer: str, dsh_rc: str) -> str:
-    """Причина verdict=error — три состояния, не смешиваемые в одно (класс
-    silent-wrong прогона 33572445063: ошибка провайдера читалась как «модель
-    нарушила контракт»). Порядок проверки важен: транспорт — раньше формата,
-    потому что при упавшем транспорте answer пуст и verdict_line_present
-    всё равно вернёт False — не значит «модель промолчала»."""
+def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
+    """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
+    (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
+    «модель нарушила контракт»; #419 добавил различение внутри самого
+    транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
+    что-то другое», правило AGENTS.md). Порядок проверки важен: failure_reason
+    (ai_dsh.sh уже решил за нас, что это лимит) — раньше generic-транспорта,
+    транспорт — раньше формата, потому что при упавшем транспорте answer пуст
+    и verdict_line_present всё равно вернёт False — не значит «модель
+    промолчала».
+
+    failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
+    ai_dsh.sh, #419), пробрасывается step-output'ами ai-review.yml в
+    verdict --failure-reason:
+      quota_exhausted                  — RATE_LIMIT: Weekly/Monthly Limit
+                                          Exhausted, сброс через дни — ждать
+                                          внутри прогона бессмысленно, ai_dsh.sh
+                                          не пытался.
+      rate_limit_retry_budget_exceeded — временный RATE_LIMIT не снялся за
+                                          отведённый бюджет ожидания.
+      "" (пусто)                       — старое поведение: либо обычный
+                                          транспортный сбой (rc≠0 без
+                                          RATE_LIMIT вовсе), либо контракт
+                                          ответа (rc=0, формат нарушен).
+    """
+    if failure_reason == "quota_exhausted":
+        return (f"ревью не состоялось — квота провайдера исчерпана надолго "
+                f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
+                f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
+                "ждать вне CI или сменить провайдера "
+                "(docs/runbooks/switch-llm-provider.md)")
+    if failure_reason == "rate_limit_retry_budget_exceeded":
+        return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
+                f"снялся за отведённый бюджет ожидания внутри прогона (код "
+                f"возврата {dsh_rc})")
     if transport_failed(dsh_rc):
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
     if verdict_line_present(answer):
@@ -254,6 +307,22 @@ def huge_diff_escalation_text(pr: int, added: int) -> str:
     )
 
 
+def _split_scope(body_lines: list[str]) -> tuple[str | None, list[str]]:
+    """МАСШТАБ — первая непустая строка тела блока задачи (сразу после
+    заголовка). Найден и снят — не попадает в текст тела ни находки, ни
+    комментария; не найден — scope=None (см. partition_tasks: отсутствие
+    поля не значит «отдельно» молча, #426)."""
+    for i, line in enumerate(body_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = SCOPE_RE.match(stripped)
+        if match:
+            return match.group(1), body_lines[:i] + body_lines[i + 1:]
+        break  # первая непустая строка не МАСШТАБ — поля нет вовсе
+    return None, body_lines
+
+
 def parse_tasks(answer: str) -> list[dict]:
     """Блоки ЗАДАЧА: … КОНЕЦ ЗАДАЧИ из ответа. Незакрытый/пустой блок
     отбрасывается целиком: полузадача в пуле хуже отсутствия задачи."""
@@ -268,20 +337,40 @@ def parse_tasks(answer: str) -> list[dict]:
                 title = match.group(1).strip()
                 body = []
         elif stripped == TASK_CLOSE:
-            tasks.append({"title": title, "body": "\n".join(body).strip()})
+            scope, rest = _split_scope(body)
+            tasks.append({"title": title, "body": "\n".join(rest).strip(), "scope": scope})
             title, body = None, []
         else:
             body.append(line.rstrip())
     return tasks
 
 
-def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
-    """Проза ответа без строк вердикта и блоков задач: маркер вердикта
-    отражается в reviewer:, задачи переезжают в канонические фенсы."""
+def partition_tasks(tasks: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Судьба находки по МАСШТАБ (#426): `отдельно` — в беклог (issue заведёт
+    file_tasks.py); `хвост` — дописать в этом же PR, issue не заводим;
+    отсутствие поля — НЕ трактуется молча как «отдельно» (fail loud): видимо
+    в комментарии отдельным разделом, но не заводится и не считается хвостом
+    без явного решения ревьюера."""
+    backlog = [t for t in tasks if t.get("scope") == SCOPE_SEPARATE]
+    tail = [t for t in tasks if t.get("scope") == SCOPE_TAIL]
+    unscoped = [t for t in tasks if t.get("scope") not in (SCOPE_SEPARATE, SCOPE_TAIL)]
+    return backlog, tail, unscoped
+
+
+def findings_of(answer: str, tasks: list[dict] | None = None,
+                 remarks: list[dict] | None = None) -> str:
+    """Проза ответа без строк вердикта, блоков задач И блоков замечаний
+    (#462): маркер вердикта отражается в reviewer:, задачи переезжают в
+    канонические фенсы, замечания — в чеклист тела PR (review_checklist).
+    Ничего из трёх категорий не должно задваиваться в свободной прозе
+    комментария."""
     tasks = tasks if tasks is not None else parse_tasks(answer)
-    titles = {t["title"] for t in tasks}
+    remarks = remarks if remarks is not None else review_checklist.parse_remarks(answer)
+    task_titles = {t["title"] for t in tasks}
+    remark_titles = {r["title"] for r in remarks}
     lines: list[str] = []
     in_task = False
+    in_remark = False
     for line in (answer or "").splitlines():
         stripped = line.strip()
         if VERDICT_RE.match(stripped):
@@ -290,16 +379,25 @@ def findings_of(answer: str, tasks: list[dict] | None = None) -> str:
             if stripped == TASK_CLOSE:
                 in_task = False
             continue
+        if in_remark:
+            if stripped == review_checklist.REMARK_CLOSE:
+                in_remark = False
+            continue
         match = TASK_OPEN_RE.match(stripped)
-        if match and match.group(1).strip() in titles:
+        if match and match.group(1).strip() in task_titles:
             in_task = True
+            continue
+        rmatch = review_checklist.REMARK_OPEN_RE.match(stripped)
+        if rmatch and rmatch.group(1).strip() in remark_titles:
+            in_remark = True
             continue
         lines.append(line.rstrip())
     return "\n".join(lines).strip("\n").strip()
 
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
-                  tasks: list[dict], diff_fp: str | None = None) -> str:
+                  tasks: list[dict], diff_fp: str | None = None,
+                  remarks: list[dict] | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -308,17 +406,54 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     diff_fingerprint, #252): check_pr.py читает его из поля `diff:` шапки,
     чтобы решить, сохранять ли ai:*-метку при следующем пуше. Необязателен
     (None не добавляет строку) — не ломает старые вызовы/тесты, которые
-    факта diff не ждут."""
+    факта diff не ждут.
+
+    tasks делится по МАСШТАБ (#426, partition_tasks): в фенсы (то, что
+    file_tasks.py читает и заводит issue'ами) попадают ТОЛЬКО `отдельно`.
+    `хвост` уходит прозой в раздел «доделай в этом PR» — содержимое не
+    теряется, issue не заводится. Без поля — тоже прозой, но с явным
+    предупреждением: отсутствие МАСШТАБ не трактуется молча как «отдельно»
+    (fail loud) — граница проведена здесь, а не в file_tasks.py, ОДНИМ
+    местом правды: file_tasks.py читает только фенсы, значит незафенсенное
+    физически не может быть заведено issue.
+
+    remarks — блоки ЗАМЕЧАНИЕ (#462, третья категория находок): сам чеклист
+    живёт в ТЕЛЕ PR (review_checklist.merge_checklist, отдельный PATCH), не
+    здесь — комментарий только указывает, что чеклист обновлён, чтобы автор
+    не искал замечания в прозе комментария, которую отсюда убрал findings_of."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
+    backlog, tail, unscoped = partition_tasks(tasks)
     body = findings.strip()
-    if tasks:
+    if tail:
+        tail_text = "\n\n".join(f"- **{t['title']}**\n  {t['body']}" for t in tail)
+        body += (
+            "\n\n### Доделай в этом PR (масштаб «хвост» — issue не заводится)\n\n"
+            f"{tail_text}"
+        )
+    if unscoped:
+        unscoped_text = "\n\n".join(f"- **{t['title']}**\n  {t['body']}" for t in unscoped)
+        body += (
+            "\n\n### ⚠️ Без объявленного МАСШТАБА — не заведено автоматически\n"
+            "Ревьюер не указал МАСШТАБ (хвост/отдельно) у находки ниже — контракт "
+            "не угадывает поле молча (fail loud, #426). Заведи issue вручную, если "
+            "это реально отдельная работа, либо допиши прямо здесь, если это хвост.\n\n"
+            f"{unscoped_text}"
+        )
+    if remarks:
+        titles = "\n".join(f"- {r['title']}" for r in remarks)
+        body += (
+            "\n\nНекритичные замечания (не блокируют мерж) — в чеклисте тела PR:\n"
+            f"{titles}"
+        )
+    if backlog:
         close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
         blocks = "\n\n".join(
-            f"{TASK_FENCE}\n{t['title']}\n{t['body']}\n{close}" for t in tasks
+            f"{TASK_FENCE}\n{t['title']}\nМАСШТАБ: {SCOPE_SEPARATE}\n{t['body']}\n{close}"
+            for t in backlog
         )
         body += (
             f"\n\nЗадачи в беклог из этого ревью — завести одной командой:\n"
@@ -342,9 +477,11 @@ def tasks_from_comment(comment_body: str) -> list[dict]:
                 block.append(lines[i].rstrip())
                 i += 1
             if block and i < len(lines):  # забор закрыт
+                scope, rest = _split_scope(block[1:])
                 tasks.append({
                     "title": block[0].strip(),
-                    "body": "\n".join(block[1:]).strip(),
+                    "body": "\n".join(rest).strip(),
+                    "scope": scope,
                 })
         i += 1
     return [t for t in tasks if t["title"]]
@@ -367,8 +504,9 @@ NO_TASK_MESSAGE = (
 
 def task_section(pull: dict, repo: str) -> str:
     """Задача пула, которую закрывает PR — резолвится ОДНИМ источником
-    правды `task_ref.resolve_pr_task` (#259): имя agent-ветки, затем
-    декларация первой строкой тела. Любое упоминание номера в прозе
+    правды `task_ref.resolve_pr_task` (#259, #394): единственный источник —
+    имя agent-ветки, тело PR не читается вовсе (решение владельца
+    2026-09-06). Любое упоминание номера в прозе
     (`task_ref.extract_task_refs`) сюда не годится — этим классом бага
     ai_review.py путал задачу PR с первым попавшимся числом в описании
     (живой замер #259: #253 судили по #120 из прозы вместо объявленного
@@ -456,20 +594,89 @@ def cmd_gather(args: argparse.Namespace) -> int:
 # (review_labels.should_run_ai_review — одно место правды, а не вторая копия
 # условия в YAML).
 #
-# --force (находка 1 вердикта ai-review PR #294): ручной workflow_dispatch —
-# единственный документированный путь повтора ревью (ADR 0007 п.4, шапка
-# ai-review.yml) и инструмент оркестратора для проводки PR через ревью.
-# Сверка отпечатка диффа здесь неуместна вовсе: она проверяет «AI уже видел
-# ровно этот код автоматически», а не «владелец согласен с прошлым вердиктом»
-# — и ручной запуск на PR с окончательным вердиктом (ai:ok/ai:changes) и
-# неизменным диффом (например пустой коммит) без --force превращался бы в
-# зелёный no-op без единой строчки ревью, снимая единственный газ пересмотра.
+# Утечка денег владельца (#399, аудит 197 платных прогонов за 2026-09-05/06):
+# 44 из них (22%) — ручные workflow_dispatch, дублирующие уже идущий или уже
+# завершённый прогон на том же PR, без ai:failed. До этой правки
+# ai-review.yml выставлял --force БЕЗУСЛОВНО для любого workflow_dispatch
+# (см. Дельта 2026-09-05 в docs/decisions/0007-ai-review-gate.md) — сверка
+# отпечатка не выполнялась вовсе, повод «владелец хочет пересмотра» не
+# отличался от «оркестратор нажал Run workflow по инерции».
+#
+# --force остаётся (владелец, не согласный с окончательным вердиктом на
+# неизменном диффе, теряет иначе единственный газ пересмотра — находка 1
+# вердикта ai-review PR #294), но теперь это ОТДЕЛЬНЫЙ, осознанный вход:
+# ai-review.yml просит --force, только если ручной запуск явно нёс
+# input force: true (default false) — не любой workflow_dispatch. Без него
+# ручной запуск проходит ТУ ЖЕ сверку, что и автоматический
+# (review_labels.should_run_ai_review), плюс дополнительную гонку «прогон
+# уже идёт прямо сейчас» (review_labels.other_active_ai_review_runs) — её
+# автоматический путь не нуждается в проверке (свой прогон на run_id
+# сериализован concurrency-группой), а ручной может выстрелить поверх уже
+# летящего.
+
+def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
+    """Текст отказа: на PR #pr уже идёт другой прогон ai-review.yml прямо
+    сейчас — второй одновременно бессмыслен, а не просто дорог."""
+    url = other_run.get("html_url")
+    where = f" ({url})" if url else ""
+    return (
+        f"::warning::ручной прогон PR #{pr} отклонён: уже идёт другой прогон "
+        f"ai-review.yml (run {other_run.get('id')}, статус "
+        f"{other_run.get('status', '?')}){where} — второй прогон параллельно "
+        "ничего не даст. Дождитесь его завершения; принудительно запустить "
+        "поверх летящего прогона нельзя даже через force: true."
+    )
+
+
+def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
+    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
+    сколько минут назад он вынесен, и что делать вместо ручного повтора
+    (правило репозитория: отказ без «что дальше» не принимается)."""
+    names = review_labels._names(current_labels)
+    verdict_label = next(
+        (label for label in (review_labels.AI_OK, review_labels.AI_CHANGES) if label in names),
+        "неизвестный вердикт")
+    age = "неизвестно когда"
+    created_at = (ai_comment or {}).get("created_at")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+            age = f"{minutes} мин назад"
+        except ValueError:
+            pass
+    return (
+        f"::notice::ручной прогон PR #{pr} отклонён: дифф не изменился с "
+        f"последнего вердикта {verdict_label} ({age}) — второй прогон на том "
+        "же коде ничего нового не покажет. Автоматический повтор придёт сам, "
+        "если дифф изменится; принудительный пересмотр ровно этого же "
+        "диффа — запуск с явным входом force: true."
+    )
+
 
 def cmd_should_run(args: argparse.Namespace) -> int:
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if manual:
+        # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО
+        # --force: второй одновременный прогон того же PR бессмыслен
+        # независимо от того, хочет ли владелец пересмотра того же диффа
+        # (manual_dispatch_busy_reason это и объявляет: force не пробивает
+        # занятость). Заодно ловит PR без вердикта (первое ревью) —
+        # should_run_ai_review ниже честно вернул бы True, хотя параллельный
+        # прогон того же PR уже летит (#399).
+        repo = os.environ["GITHUB_REPOSITORY"]
+        active = review_labels.other_active_ai_review_runs(
+            repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
+        if active:
+            print(manual_dispatch_busy_reason(args.pr, active[0]), file=sys.stderr)
+            print("false")
+            return 0
     if getattr(args, "force", False):
-        # Ручной повтор не заходит в сеть вообще: решение не зависит от
-        # состояния PR, а необращение к gh здесь же и доказывает мутацией
-        # (test_cmd_should_run_force_skips_check_no_network_call).
+        # Осознанный ручной повтор (не занят — проверено выше) не заходит в
+        # сеть дальше: решение не зависит от отпечатка диффа, а необращение к
+        # gh здесь же и доказывает мутацией
+        # (test_cmd_should_run_force_skips_fingerprint_check_no_network_call).
         print("true")
         return 0
     repo = os.environ["GITHUB_REPOSITORY"]
@@ -481,6 +688,8 @@ def cmd_should_run(args: argparse.Namespace) -> int:
     stored_fp = (review_labels.header_facts(ai_comment.get("body") or "").get("diff")
                  if ai_comment else None)
     run_needed = review_labels.should_run_ai_review(current_labels, stored_fp, current_fp)
+    if not run_needed and manual:
+        print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
     # Единственная строка на stdout — bash-шаг ai-review.yml читает её как
     # $(...), никакого другого вывода в этой команде быть не должно.
     print("true" if run_needed else "false")
@@ -513,15 +722,21 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
     verdict = parse_verdict(answer)
     tasks = parse_tasks(answer)
-    findings = redact(findings_of(answer, tasks))
-    tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip()}
+    remarks = review_checklist.parse_remarks(answer)
+    findings = redact(findings_of(answer, tasks, remarks))
+    tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip(),
+              "scope": t.get("scope")}
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
+    remarks = [{"title": redact(r["title"]).strip(), "body": redact(r["body"]).strip()}
+               for r in remarks]
+    remarks = [r for r in remarks if r["title"]]
 
-    # Причина «error» — вычисляется ДО комментария: три разных состояния не
-    # смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
-    # ошибка провайдера не должна выглядеть как «модель ответила криво»).
-    reason = error_reason(answer, args.dsh_rc) if verdict == "error" else None
+    # Причина «error» — вычисляется ДО комментария: четыре разных состояния
+    # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
+    # ошибка провайдера не должна выглядеть как «модель ответила криво», а
+    # временный RATE_LIMIT — как настоящая поломка, #419).
+    reason = error_reason(answer, args.dsh_rc, args.failure_reason) if verdict == "error" else None
     if reason and not findings.strip():
         findings = reason
 
@@ -559,6 +774,17 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
            "-f", f"labels[]={label}")
 
+    # Commit Status API — тот же вердикт вторым каналом, параллельно метке
+    # (#345): allow_auto_merge читает required status checks, не метки.
+    # error → pending, не failure (review_labels.ai_status_state): сбой
+    # провайдера/транспорта — не решение о коде, у него свой газ — автоповтор
+    # по таймеру (#196), failure держал бы проверку красной до нового пуша.
+    status_description = f"ai-review: error — {reason}" if verdict == "error" else f"ai-review: {verdict}"
+    review_labels.post_commit_status(
+        repo, args.head, review_labels.STATUS_AI_REVIEW,
+        review_labels.ai_status_state(verdict), status_description,
+        run_gh, review_labels.run_target_url(repo))
+
     # Газ к тормозу review:large (#204): подтверждение размера опирается на
     # состоявшийся вердикт AI, а не на факт запуска — added считается по
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
@@ -566,12 +792,23 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     added = sum(f["additions"] for f in files)
     apply_large_ok(repo, args.pr, added, current | {label}, verdict)
 
+    # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
+    # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
+    # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
+    # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
+    if remarks:
+        new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
+        if new_pr_body is not None:
+            run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
+                   "-f", "body=" + new_pr_body)
+            print(f"checklist: {len(remarks)} замечаний слито в тело PR")
+
     # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
     # следующем пуше мог сравнить и сохранить метку, если PR не изменился
     # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
     # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp, remarks=remarks)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
@@ -597,10 +834,11 @@ def main() -> int:
     should_run = sub.add_parser(
         "should-run", help="нужен ли дорогой прогон (печатает true/false, #294)")
     should_run.add_argument("--pr", type=int, required=True)
-    # Ручной workflow_dispatch (находка 1 вердикта ai-review PR #294):
-    # пропускает сверку отпечатка целиком, печатает true без обращения к сети.
+    # Осознанный ручной повтор (input force:true, #399, было — любой
+    # workflow_dispatch безусловно): пропускает сверку отпечатка целиком,
+    # печатает true без обращения к сети.
     should_run.add_argument("--force", action="store_true", default=False,
-                             help="ручной повтор (workflow_dispatch) — не сверять отпечаток диффа")
+                             help="явный вход force:true (workflow_dispatch) — не сверять отпечаток диффа")
     should_run.set_defaults(func=cmd_should_run)
 
     verdict = sub.add_parser("verdict", help="разбор ответа + комментарий + метка")
@@ -612,15 +850,33 @@ def main() -> int:
     # ручной запуск verdict без этого аргумента не должен падать — просто
     # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
     verdict.add_argument("--dsh-rc", default="")
+    # Тег причины из $AI_WORK/failure_reason.txt (ai_dsh.sh, #419): quota_exhausted
+    # | rate_limit_retry_budget_exceeded | пусто. Необязателен по той же причине,
+    # что и --dsh-rc — ручной запуск без него просто теряет уточнение.
+    verdict.add_argument("--failure-reason", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()
-    return args.func(args)
+    # RuntimeError (gh() — сеть/права/битый ответ API) ловится ЗДЕСЬ, внутри
+    # main(), а не в блоке if __name__ снаружи (было — регрессия #416/#399,
+    # живой прогон 34009775887, PR #333): should-run вызывается из
+    # ai-review.yml как `run_needed=$(python ... should-run ...)` — bash
+    # command substitution забирает ТОЛЬКО stdout процесса. print() без
+    # file=sys.stderr писал причину сбоя в stdout — она уезжала в
+    # переменную $run_needed и никогда не попадала в лог job'а: шаг падал
+    # (echo "::error::не смог решить...") без единой подсказки почему.
+    # Различие «решили не запускать» (false, exit 0 — все ветки
+    # cmd_should_run/cmd_verdict/cmd_gather явно возвращают 0) и «не смогли
+    # решить» (RuntimeError, exit 1) не терялось само по себе — терялось
+    # ТОЛЬКО видимое обоснование второго исхода. Тот же приём, что уже у
+    # scripts/lib/claim_task.py::main — try/except внутри функции, а не
+    # снаружи, потому и тестируем вызовом main() напрямую (test_ai_review.py).
+    try:
+        return args.func(args)
+    except RuntimeError as error:
+        print(f"::error::ai-review: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except RuntimeError as error:
-        print(f"::error::ai-review: {error}")
-        sys.exit(1)
+    sys.exit(main())

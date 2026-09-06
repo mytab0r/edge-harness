@@ -58,7 +58,7 @@ class FakeServer:
     def add_ref(self, ref):
         self.existing_refs.add(ref)
 
-    def run(self, args, capture_output=True, text=True, env=None):
+    def run(self, args, capture_output=True, text=True, encoding=None, env=None):
         joined = " ".join(args)
         self.calls.append(joined)
         if "-X" in args and "POST" in args and "git/refs" in joined and "matching-refs" not in joined:
@@ -88,6 +88,12 @@ BASE = {
         "sha": "locksha", "commit": {"committer": {"date": "2026-08-31T12:00:00Z"}}},
     "issues/5/assignees": ok_no_body(),
     "issues/5/comments": ok_no_body(),
+    # Проверка на входе (claim не выдаёт аренду на закрытую задачу): дефолт
+    # для всех тестов, использующих BASE, — задача открыта. Порядок ключей
+    # важен для FakeServer.run (substring-роутинг, первое совпадение
+    # выигрывает): этот ключ идёт ПОСЛЕ issues/5/assignees и issues/5/comments,
+    # иначе он перехватил бы их вызовы (обе строки содержат "issues/5").
+    "repos/o/r/issues/5": {"number": 5, "state": "open"},
 }
 
 
@@ -109,6 +115,23 @@ def test_gh_status_parsing_prod_form():
     assert ct.gh_status("gh: HTTP 422: Reference already exists [...]") == 422
     assert ct.gh_status("gh: HTTP 404: Not Found") == 404
     assert ct.gh_status("dial tcp: connectex failed") is None
+
+
+def test_gh_pins_utf8_encoding_not_console_codepage(monkeypatch):
+    # Находка ai-review PR #326: text=True без явного encoding декодирует
+    # чужой пайп кодовой страницей консоли (cp1251 на Windows), не UTF-8 —
+    # PYTHONIOENCODING на это не влияет (та переменная задаёт кодировку
+    # только собственных stdin/stdout/stderr процесса). Мутационная проверка:
+    # убери encoding="utf-8" в gh() — этот тест покраснеет.
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.gh("repos/o/r")
+    assert seen.get("encoding") == "utf-8"
 
 
 # ── TTL по дате коммита замка ────────────────────────────────────────────────────
@@ -138,6 +161,38 @@ def test_race_two_claims_one_wins_other_refused(monkeypatch):
     # ref создан один раз — серверное доказательство атомарности
     assert sum(1 for c in server.calls if "git/refs" in c and "-X" in c and "POST" in c) == 2
     assert server.existing_refs == {"refs/locks/task-5"}
+
+
+def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):
+    # Проверка на входе (не гвардия постфактум): приёмка уже закрыла задачу —
+    # воркер/hands не должны снова браться за неё через claim. Отказ обязан
+    # случиться ДО создания коммита/ref'а замка (дешёвый GET раньше дорогой
+    # записи), поэтому проверяем отсутствие POST git/commits и git/refs.
+    routes = dict(BASE)
+    routes["repos/o/r/issues/5"] = {"number": 5, "state": "closed"}
+    server = install(monkeypatch, FakeServer(routes))
+    result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+    assert result.claimed is False
+    assert "закрыта" in result.detail
+    assert not any("git/commits" in c for c in server.calls)
+    assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
+
+
+def test_claim_refuses_blocked_task_without_creating_lock(monkeypatch):
+    # Симметрично closed выше (#357): задача открыта, но несёт blocked —
+    # эскалация владельцу, hands (dsh_task.sh) идут мимо task-branch и
+    # единственные их ворота это claim. Мутация: закомментируй проверку
+    # blocked в claim() — этот тест краснеет (claimed становится True).
+    routes = dict(BASE)
+    routes["repos/o/r/issues/5"] = {
+        "number": 5, "state": "open", "labels": [{"name": "task"}, {"name": "blocked"}],
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+    assert result.claimed is False
+    assert "заблокирована" in result.detail
+    assert not any("git/commits" in c for c in server.calls)
+    assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
 
 
 def test_claim_success_visibility_after_lock(monkeypatch):
@@ -174,7 +229,10 @@ def test_claim_visibility_failure_does_not_break_ownership(monkeypatch):
 
 
 def test_claim_infra_failure_is_loud_not_busy(monkeypatch):
-    routes = {"repos/o/r/commits/main": fail(502, "Bad Gateway")}
+    routes = {
+        "repos/o/r/issues/5": {"number": 5, "state": "open"},
+        "repos/o/r/commits/main": fail(502, "Bad Gateway"),
+    }
     install(monkeypatch, FakeServer(routes))
     # «занято» и «сломано» — разные состояния: поломка не маскируется отказом
     with pytest.raises(RuntimeError):
@@ -186,10 +244,10 @@ def test_claim_unexpected_422_is_loud_not_busy(monkeypatch):
     # отказ аренды (зелёный), прочие validation-ошибки — поломка (громко).
     # Различение по тексту, симметрично _ref_missing() у release.
     class ValidationServer(FakeServer):
-        def run(self, args, capture_output=True, text=True, env=None):
+        def run(self, args, capture_output=True, text=True, encoding=None, env=None):
             if "-X" in args and "POST" in args and "git/refs" in " ".join(args):
                 return fail(422, "Validation Failed: tree sha wasn't found")
-            return super().run(args, capture_output=capture_output, text=text, env=env)
+            return super().run(args, capture_output=capture_output, text=text, encoding=encoding, env=env)
     install(monkeypatch, ValidationServer(dict(BASE)))
     with pytest.raises(RuntimeError):
         ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
@@ -271,6 +329,54 @@ def test_release_merged_is_idempotent_batch(monkeypatch):
     assert len(lines) == 2 and all("снят" in line or "отсутствовал" in line for line in lines)
 
 
+# ── release_full: и назначение, и замок (#422 — провайдер в лимите/квоте) ────────
+
+
+def test_release_full_removes_assignee_and_lock(monkeypatch):
+    # Живой случай #422: воркер узнал СРАЗУ, что дальше нет смысла (бюджет
+    # ретрая RATE_LIMIT исчерпан) — задача обязана вернуться в пул целиком,
+    # не дожидаясь 24-часового reap_stale.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5")
+    detail = ct.release_full("o/r", 5)
+    assert "назначение снято" in detail and "mytab0r" in detail
+    assert "снят" in detail  # часть release() тоже отражена в итоговой строке
+    assert any("DELETE" in c and "issues/5/assignees" in c and "mytab0r" in c
+               for c in server.calls)
+    assert any("DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
+def test_release_full_without_assignee_only_touches_lock(monkeypatch):
+    routes = {"repos/o/r/issues/7": {"number": 7, "assignees": []}}
+    server = install(monkeypatch, FakeServer(routes))
+    detail = ct.release_full("o/r", 7)
+    assert "назначения не было" in detail
+    assert not any("DELETE" in c and "issues/7/assignees" in c for c in server.calls)
+
+
+def test_release_full_assignee_removal_failure_does_not_block_lock_release(monkeypatch):
+    # Снятие assignee — видимость, не защита (симметрично claim._visibility):
+    # сбой не должен помешать снять замок — иначе задача осталась бы занятой
+    # ДВОЙНО (и assignee, и мёртвый замок) именно там, где нужно освободить её
+    # быстрее всего.
+    class ForbiddenAssignees(FakeServer):
+        def run(self, args, **kw):
+            joined = " ".join(args)
+            if "-X" in args and "DELETE" in args and "issues/5/assignees" in joined:
+                return fail(403, "Forbidden")
+            return super().run(args, **kw)
+    routes = {"repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]}}
+    server = install(monkeypatch, ForbiddenAssignees(routes))
+    server.add_ref("refs/locks/task-5")
+    detail = ct.release_full("o/r", 5)
+    assert "не снято" in detail
+    assert any("DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
 # ── Сборщик протухших замков ─────────────────────────────────────────────────────
 
 
@@ -286,9 +392,11 @@ def test_collect_stale_removes_only_expired_and_leaves_trace(monkeypatch):
         "issues/5/comments": ok_no_body(),
     }
     server = install(monkeypatch, FakeServer(routes))
-    lines = ct.collect_stale("o/r", utc(12, 0))
-    assert any("task-5" in line and "снят" in line for line in lines)
-    assert any("task-6" in line and "жив" in line for line in lines)
+    observations, actions = ct.collect_stale("o/r", utc(12, 0))
+    assert any("task-5" in line and "снят" in line for line in actions)
+    # #456: живой замок — наблюдение (ничего не изменилось), не действие
+    assert any("task-6" in line and "жив" in line for line in observations)
+    assert not any("task-6" in line for line in actions)
     assert any("DELETE" in c and "task-5" in c for c in server.calls)
     assert not any("DELETE" in c and "task-6" in c for c in server.calls)
     # след в задаче: комментарий с причиной и порогом
@@ -309,8 +417,8 @@ def test_collect_stale_delete_failure_is_loud_not_fatal(monkeypatch):
             return super().run(args, **kw)
 
     install(monkeypatch, DeleteBroken(routes))
-    lines = ct.collect_stale("o/r", utc(12, 0))
-    assert any("не снят" in line for line in lines)  # не уронил обход, но и не молчит
+    _, actions = ct.collect_stale("o/r", utc(12, 0))
+    assert any("не снят" in line for line in actions)  # не уронил обход, но и не молчит
 
 
 # ── CLI: контракт для каналов worker/hands ───────────────────────────────────────
@@ -353,6 +461,8 @@ def test_cli_exit_codes_contract(monkeypatch):
     assert ct.main(["x", "claim", "5"]) == ct.EXIT_BUSY  # зелёный no-op вызывающего
     monkeypatch.setattr(ct, "release", lambda *a, **kw: "снят")
     assert ct.main(["x", "release", "5"]) == ct.EXIT_OK
+    monkeypatch.setattr(ct, "release_full", lambda *a, **kw: "назначение снято; снят")
+    assert ct.main(["x", "release-full", "5"]) == ct.EXIT_OK
 
 
 def test_cli_requires_repo_and_valid_task(monkeypatch):

@@ -8,6 +8,24 @@
 # отчитаться (комментарий в задачу + Telegram). Работу над задачей делает
 # DSH — этот скрипт за него ничего не решает и не пишет.
 #
+# Ретрай временного RATE_LIMIT провайдера (#422, механизм #419/#421 —
+# dsh_run_with_retry в lib/dsh-ci.sh): живой факт — прогоны worker.yml
+# 34007508064/34006554580 упали с «dsh: RATE_LIMIT: Rate limit reached for
+# requests», раньше, чем ретрай вообще появился (тогда — только у ai-review).
+# Бюджет ожидания WORKER_RATE_LIMIT_MAX_WAIT_SECS (по умолчанию 1800с/30 мин —
+# та же длительность короткого окна провайдера, что и у ai-review: она не
+# зависит от вызывающего канала) подобран под ОДИН прогон DSH_TIMEOUT_SECS
+# (150 мин): реалистичный случай — первая попытка падает СРАЗУ (провайдер
+# отклоняет самый первый вызов модели), не после долгой работы, поэтому
+# бюджета хватает без риска упереться в 6-часовой потолок job'а (см.
+# worker.yml timeout-minutes). Патологический случай «упало после 140 минут
+# работы» теоретически возможен и не решён здесь (тот же непокрытый класс уже
+# принят в #421 для ai-review) — задокументирован, не тихо проигнорирован.
+# quota_exhausted (недельная/месячная квота) и rate_limit_retry_budget_exceeded
+# (бюджет короткого окна кончился) — обе причины возвращают задачу в пул СРАЗУ
+# (lease_cli release-full, #422), не дожидаясь 24-часового TTL-сборщика: вина
+# не в задаче, держать assignee до таймера — зря прятать её от других каналов.
+#
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
 #   task.sh --task 89     — выполнить конкретную задачу (если она открыта и свободна)
@@ -15,7 +33,9 @@
 #                           ничего не назначая, не запуская и не отправляя
 #
 # Итог запуска: PR открыт → job зелёный; эскалация (метка blocked) → зелёный;
-# иначе (нет PR) → job красный. Нет свободных задач → зелёный без действий.
+# провайдер в лимите/квоте надолго → job красный, но задача честно возвращена
+# в пул (не «воркер не справился» — вина не его); иначе (нет PR, реальный
+# сбой) → job красный. Нет свободных задач → зелёный без действий.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -33,6 +53,11 @@ source "$SCRIPT_DIR/../lib/lease.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-9000}"   # 150 минут на прогон DSH
+# Бюджет ретрая временного RATE_LIMIT (#422) — суммарно, не на попытку;
+# обоснование значений — комментарий в шапке файла.
+WORKER_RATE_LIMIT_MAX_WAIT_SECS="${WORKER_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+WORKER_RATE_LIMIT_INITIAL_DELAY_SECS="${WORKER_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
+WORKER_RATE_LIMIT_MAX_DELAY_SECS="${WORKER_RATE_LIMIT_MAX_DELAY_SECS:-300}"
 # Профиль headless — pnpm-workspace: инициализация делает pnpm add в корень
 # профиля. Без этого флага — ERR_PNPM_ADDING_TO_ROOT (#93/#94); фикс обязан
 # быть в ОБЕИХ транспортных обёртках (worker task.sh и hands dsh_task.sh):
@@ -101,7 +126,10 @@ fi
 
 # Отчёт в Telegram — best-effort: место правды всегда комментарий в задаче,
 # но промах кричит warning'ом в лог job'а, не молчит.
-telegram_report() { # $1 — текст
+# parse_mode=HTML — всегда (#170): без него Telegram рендерит plain text и
+# кликабельных ссылок не бывает. Второй отправитель репозитория —
+# pulse_guard.send_telegram; новых отправителей заводить нельзя, формат один.
+telegram_report() { # $1 — текст (динамические части — уже через tg_html)
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
@@ -109,10 +137,25 @@ telegram_report() { # $1 — текст
   if ! curl -fsS --max-time 30 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "parse_mode=HTML" \
       --data-urlencode "text=$1" >/dev/null; then
     echo "::warning::Telegram не принял отчёт — комментарий в задаче остаётся местом правды"
     return 1
   fi
+}
+
+# plain-текст → безопасный внутри Telegram-HTML (#170): при parse_mode=HTML
+# символы <, >, & управляющие — заголовок задачи с ними развалил бы доставку
+# всего сообщения (400 от Telegram). & первым, иначе задвоение.
+tg_html() { # $1 — plain-текст
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# «Заголовок задачи в двух словах» (#170): первые 6 слов, остальное молча
+# отбрасывается — сообщение обязано остаться коротким. Строго по пробелам,
+# не по позициям: байтовая обрезка режет кириллицу посреди символа в C-локали.
+short_title() { # $1 — заголовок
+  printf '%s' "$1" | tr -s '[:space:]' ' ' | cut -d' ' -f1-6
 }
 
 # Свободная задача: открыта, метка task, без assignee и без живой аренды
@@ -179,7 +222,8 @@ echo "Задача #$number: $title"
 # без исполнителя, но с уже открытым PR — сигнал «довести» (сценарий
 # scheduler.py::unhealthy_pulls, снявшего исполнителя с нездорового PR), не
 # «пропустить». Одно место правды на объявление PR задачи —
-# scripts/lib/task_ref.py::declared_tasks через scripts/lib/free_task.py,
+# scripts/lib/task_ref.py::task_from_branch (имя agent-ветки, единственный
+# источник, решение владельца 2026-09-06) через scripts/lib/free_task.py,
 # то же самое, что использует contract_check.py — симметрично для явного
 # входа --task и для авто-выбора free_task(). Атомарная защита от гонки
 # каналов на этот же PR — claim ниже (шаг 4), не эта проверка.
@@ -313,16 +357,46 @@ else
   echo "::warning::HANDS_TOKEN/HARNESS_URL не заданы — пульс живости выключен, зависание видно только по таймауту"
 fi
 
-# ── 5. Ветка: новая от свежего origin/main, либо чекаут существующего PR (#245) ──
+# ── 5. Ветка: новая от свежего origin/main, либо отдельный worktree на ветке PR (#245) ──
+# Trust-зона (#476, тот же принцип, что в ai-review.yml): доверенный
+# инструментарий этого job'а — scripts/* в $GITHUB_WORKSPACE, куда worker.yml
+# всегда чекаутит main (scheduler.py дисптатчит ровно с --ref main). Раньше
+# доводка PR делала `git checkout -B` ПРЯМО в $GITHUB_WORKSPACE — это подменяло
+# ВСЮ рабочую директорию, включая scripts/, деревом старой ветки PR. Любой
+# файл, добавленный в scripts/ после её ответвления (например
+# scripts/gh/infra_digest.sh), в этом дереве отсутствовал — живой отказ
+# «No such file or directory» (прогон worker.yml 34027035455, PR #408, #476).
+# Фикс — линкованный git worktree в отдельном каталоге: $SCRIPT_DIR (и всё,
+# что читается по пути из main-дерева — infra_digest.sh, dsh-hands-streamer)
+# остаётся main НЕЗАВИСИМО от того, какую ветку доводит DSH; ветка PR — только
+# рабочее дерево, куда DSH коммитит и пушит (cd в самом конце этого блока).
 if [ -n "$CONTINUE_PR_NUMBER" ]; then
   git fetch origin "$BRANCH"
-  git checkout -B "$BRANCH" "origin/$BRANCH"
-  git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
-  # Та же гвардия свежести, что ставит task-branch: следующий коммит на этой
+  PR_WORKTREE="$WORK/pr-worktree"
+  rm -rf "$PR_WORKTREE"
+  git worktree add -B "$BRANCH" "$PR_WORKTREE" "origin/$BRANCH"
+  git -C "$PR_WORKTREE" branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
+  # core.hooksPath — репозиторий-уровневый конфиг (общий .git на все worktree),
+  # не per-worktree: гвардия свежести действует в $PR_WORKTREE без отдельной
+  # установки. Та же гвардия, что ставит task-branch: следующий коммит на этой
   # ветке обязан быть впереди актуального origin/main, иначе pre-commit велит
   # git rebase origin/main — свежесть базы не предполагается, а доказывается.
   git config core.hooksPath .githooks
-  echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) чекаутнута для доводки: $(git rev-parse --short HEAD)"
+  echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) выделена отдельным worktree для доводки: $(git -C "$PR_WORKTREE" rev-parse --short HEAD) ($PR_WORKTREE)"
+  # Второй вход в agent-ветку (первый — task-branch ниже): доводка уже
+  # открытого PR не проходит через task-branch, поэтому дайджест граблей
+  # инфраструктуры печатается здесь явно — тем же общим модулем, не второй
+  # копией текста (#326 находка 1: свежий агент на доводке стартовал без
+  # дайджеста, хотя scripts/gh/* нужны там раньше всего). Печатается ИЗ
+  # main-дерева ($SCRIPT_DIR), а не из $PR_WORKTREE — см. обоснование выше.
+  source "$SCRIPT_DIR/../gh/infra_digest.sh"
+  print_infra_digest
+  # С этой строки и до конца скрипта cwd — рабочее дерево задачи ($PR_WORKTREE):
+  # DSH коммитит и пушит именно туда. $SCRIPT_DIR — абсолютный путь, вычисленный
+  # из BASH_SOURCE в начале скрипта, за cd не следует и продолжает указывать на
+  # main-дерево ($GITHUB_WORKSPACE) для всех последующих обращений по пути
+  # (npm pack scripts/dsh-hands-streamer и т.п., шаг 6b).
+  cd "$PR_WORKTREE"
 else
   "$SCRIPT_DIR/../git/task-branch" "$number-$slug"
 fi
@@ -372,11 +446,13 @@ SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (д�
 rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 export HANDS_SPOOL="$SPOOL_FILE"
 dsh_edge_start_drain
-set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$PROMPT_FILE")" \
-  >"$ANSWER_FILE" 2>"$ERR_FILE"
-rc=$?
-set -e
+WORKER_TASK_FAILURE_REASON=""
+DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
+DSH_RATE_LIMIT_MAX_DELAY_SECS="$WORKER_RATE_LIMIT_MAX_DELAY_SECS" \
+  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
+rc=$DSH_RUN_RC
+WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 echo "dsh завершился с кодом $rc"
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
@@ -421,7 +497,13 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number выполнена, PR открыт: $pr_url" || true
+  # «Выполнена» здесь НЕ звучит (#170): открытый PR — промежуточный шаг, а не
+  # сделанная задача; это слово в Telegram теперь значит только «слито в main»
+  # (scheduler.py::after_merge). Коротко, номера задачи и PR — кликабельные
+  # ссылки (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
+  # экранированные tg_html.
+  pr_number=${pr_url##*/}
+  telegram_report "🤖 worker: PR открыт — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
   echo "PR открыт: $pr_url — job зелёный"
   exit 0
 fi
@@ -453,6 +535,48 @@ COMMENT
   telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
+fi
+
+# Провайдер в лимите (#422) — не сбой агента: сообщение и Telegram обязаны
+# звучать иначе, чем «воркер не справился» (правило AGENTS.md — «возможности
+# нет» и «возможность есть, но сломана» лечатся по-разному), а задача обязана
+# вернуться в пул СРАЗУ (снять и замок, и назначение), не ждать 24-часовой
+# TTL-сборщик — вина не в задаче, держать её занятой зря.
+if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; then
+  if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ]; then
+    reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)"
+  else
+    reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)"
+  fi
+  release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
+  if [ "$release_rc" -eq 0 ]; then
+    echo "Провайдер в лимите — задача #$number возвращена в пул немедленно: $release_out"
+    release_note="Задача возвращена в пул немедленно — снят и замок, и назначение ($release_out)."
+  else
+    echo "::warning::задача #$number не возвращена в пул (rc=$release_rc): $release_out — снимет TTL-сборщик через 24 ч"
+    release_note="Возврат в пул не подтверждён (см. лог job'а) — снимет TTL-сборщик через 24 ч."
+  fi
+  comment=$(cat <<COMMENT
+🤖 Автономный воркер остановлен провайдером, не своей ошибкой: $reason.
+$release_note Хвосты логов ниже (секреты замаскированы).
+
+Хвост stderr DSH:
+
+~~~~
+$ERR_TAIL
+~~~~
+
+Хвост ответа DSH:
+
+~~~~
+$ANSWER_TAIL
+~~~~
+COMMENT
+  )
+  gh issue comment "$number" --body "$comment" >/dev/null
+  telegram_report "worker: задача #$number — провайдер в лимите, не сбой агента ($reason). Задача возвращена в пул" || true
+  die "Провайдер в лимите: $reason"
 fi
 
 reason="dsh завершился с кодом $rc без открытого PR"

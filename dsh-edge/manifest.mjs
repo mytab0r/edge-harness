@@ -79,6 +79,64 @@ export async function loadManifest(repoRoot) {
   return parseManifest(await readFile(join(repoRoot, 'plugins.json'), 'utf8'))
 }
 
+/**
+ * Читает манифест и, если задан env FORGE_EXTRA_PLUGIN (JSON вида
+ * { id, package, server, client }), добавляет в него плагин форжа — только в
+ * памяти, файл на диске не трогается. Нужно интеграционному дыму
+ * plugin-forge.yml: на момент дыма PR с обновлением dsh-edge/plugins.json ещё
+ * не создан (см. шаг «Подготовить PR с обновлением манифеста»), поэтому без
+ * этой подстановки кодогенерация и гвардия состава проверяют только старый
+ * состав, а новый плагин нигде не верифицируется (silent-wrong).
+ *
+ * source-поля (release/asset/sha256) кодогенератору и гвардии состава не
+ * нужны — они не используются в рендере/проверке артефактов — и на момент
+ * дыма релиз ещё не существует, так что подставляется валидная по форме
+ * заглушка.
+ */
+export async function loadManifestWithForgeExtra(repoRoot) {
+  const manifest = await loadManifest(repoRoot)
+  const extraRaw = process.env.FORGE_EXTRA_PLUGIN
+  if (!extraRaw) return manifest
+
+  let extra
+  try {
+    extra = JSON.parse(extraRaw)
+  } catch (error) {
+    throw new Error(`FORGE_EXTRA_PLUGIN is not valid JSON: ${error.message}`)
+  }
+  failUnless(objectShape(extra), 'FORGE_EXTRA_PLUGIN must be an object.')
+  failUnless(ID_PATTERN.test(extra.id), `FORGE_EXTRA_PLUGIN: id must match ${ID_PATTERN}.`)
+  failUnless(PACKAGE_PATTERN.test(extra.package), `FORGE_EXTRA_PLUGIN: package must match ${PACKAGE_PATTERN}.`)
+  failUnless(typeof extra.server === 'boolean' && typeof extra.client === 'boolean',
+    'FORGE_EXTRA_PLUGIN: server and client must be booleans.')
+  failUnless(extra.server || extra.client, 'FORGE_EXTRA_PLUGIN: at least one of server/client must be true.')
+
+  const entry = {
+    id: extra.id,
+    package: extra.package,
+    // Дым офлайн, релиз ещё не существует на этом шаге форжа — заглушка
+    // валидной формы, не используемая ни кодогенератором, ни гвардией.
+    source: { release: 'forge-smoke-placeholder', asset: 'forge-smoke-placeholder.tgz', sha256: '0'.repeat(64) },
+    server: extra.server,
+    client: extra.client,
+  }
+
+  // Бамп версии УЖЕ установленного плагина — главный цикл форжа, а не только
+  // добавление нового: id почти всегда уже есть в манифесте (hello,
+  // runner-bridge, plugin-manager, integrations — на момент этого коммита все
+  // четыре). Раньше повторный id тут бросал throw, дым красил job ДО шага PR,
+  // и весь апсерт-путь `MANIFEST |= {...}` в plugin-forge.yml оставался мёртвым
+  // кодом — до него ни разу не доезжали (находка AI-ревью PR #273). Апсерт
+  // зеркалит jq-логику PR-шага: существующая запись заменяется целиком, а не
+  // добавляется вторая с тем же id.
+  const existingIndex = manifest.plugins.findIndex(p => p.id === extra.id)
+  const plugins = existingIndex === -1
+    ? [...manifest.plugins, entry]
+    : manifest.plugins.map((p, i) => (i === existingIndex ? entry : p))
+
+  return { ...manifest, plugins }
+}
+
 const CATALOG_VERSION = 1
 const REPO_PATH_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9/._-]*$/
 
