@@ -56,6 +56,15 @@ jobs:
           console.log('--- nav-like elements (first 300) ---')
           console.log(JSON.stringify(navTexts, null, 2))
 
+          // Первый визит показывает оверлей-тур ("Continue") поверх шелла —
+          // маскирует клики, пока не закрыт.
+          const tourContinue = page.getByRole('button', { name: 'Continue' })
+          if (await tourContinue.count() > 0) {
+            console.log('--- закрываю оверлей-тур (Continue) ---')
+            await tourContinue.click({ timeout: 5000 }).catch(e => console.log('tour continue click failed:', e.message))
+            await page.waitForTimeout(1000)
+          }
+
           // Открыть Settings и снять разметку панели/вкладок.
           await page.getByRole('button', { name: 'Settings' }).click()
           await page.waitForTimeout(2000)
