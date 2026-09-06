@@ -425,15 +425,15 @@ def test_reap_stale_skips_task_covered_by_pr_branch_without_body_number(monkeypa
     # проходящий PR с телом без номера (ветка agent/256-…) был бы невидим,
     # и задача-«просрочена» снялась бы при живом PR.
     old_assigned = [{"event": "assigned", "created_at": "2026-08-01T00:00:00Z"}]
+    task = issue(256, assignees=("mytab0r",))
     fake = FakeGh({
-        "issues?state=open&labels=task": [issue(256, assignees=("mytab0r",))],
         "issues/256/timeline?per_page=100": old_assigned,
     })
     patch_gh(monkeypatch, fake)
     p = pull(500, ref="agent/256-fix-thing", pr_body="Просто описание, без номера.")
     now = datetime.now(timezone.utc)
 
-    lines = sch.reap_stale(REPO, now, [p])
+    lines = sch.reap_stale(REPO, now, [p], pool=[task])
 
     assert lines == []
     assert fake.mutating_calls() == []
@@ -665,7 +665,6 @@ def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch
     p = pull(221, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z",
               pr_body="Описание без номера задачи.", ref="agent/220-fix-thing")
     fake = FakeGh({
-        "issues?state=open&labels=task": [task],
         "commits/sha221/check-runs": CHECK_RUNS_RED,
         "issues/220/assignees": None,
     })
@@ -674,7 +673,7 @@ def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p])
+    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
 
     assert any("возвращена в пул" in line and "221" in line for line in lines)
 
