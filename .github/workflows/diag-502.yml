@@ -19,7 +19,7 @@ jobs:
         env:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: |
-          cat > /tmp/explore.mjs <<'NODE'
+          cat > explore.mjs <<'NODE'
           import { chromium } from 'playwright-core'
           import { writeFileSync } from 'node:fs'
           const base = 'https://dsh-edge.mytab0r.workers.dev'
@@ -57,4 +57,4 @@ jobs:
           console.log(JSON.stringify(navTexts, null, 2))
           await browser.close()
           NODE
-          node /tmp/explore.mjs 2>&1 | head -400
+          node explore.mjs 2>&1 | head -400
