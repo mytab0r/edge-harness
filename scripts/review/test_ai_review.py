@@ -158,6 +158,38 @@ def test_findings_of_strips_verdict_and_tasks():
     assert "Тело." not in findings
 
 
+# ── Третья категория находок: блок ЗАМЕЧАНИЕ (#462) ───────────────────────────
+
+def test_findings_of_strips_remark_blocks_too():
+    # Замечание (некритичная находка) не должно задваиваться свободной прозой
+    # комментария — оно уходит в чеклист тела PR (review_checklist), не сюда.
+    answer = (
+        "Основной вывод: всё хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: docs/foo.md устарел\nПоправь формулировку.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    findings = ai.findings_of(answer)
+    assert "Основной вывод: всё хорошо." in findings
+    assert "ЗАМЕЧАНИЕ" not in findings
+    assert "docs/foo.md устарел" not in findings
+    assert "Поправь формулировку." not in findings
+
+
+def test_build_comment_notes_remarks_moved_to_pr_body_checklist():
+    remarks = [{"title": "Замечание раз", "body": "Поправь X."}]
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [], remarks=remarks)
+    assert "Замечание раз" in body
+    assert "чеклист" in body.lower()
+    # Само тело ЗАМЕЧАНИЯ не дублируется в комментарий — оно живёт в PR body
+    # (review_checklist.merge_checklist), комментарий только ссылается на факт.
+    assert "Поправь X." not in body
+
+
+def test_build_comment_without_remarks_no_checklist_mention():
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [])
+    assert "чеклист" not in body.lower()
+
+
 # ── Канонический комментарий: шапка-факты + фенсы задач ──────────────────────
 
 def test_build_comment_facts_header_and_fences():
@@ -863,6 +895,104 @@ def test_cmd_verdict_race_mutation_guard_without_second_head_check(monkeypatch, 
     # именно это и не должно происходить в проде, что и доказывает предыдущий
     # тест на текущем (исправленном) cmd_verdict.
     assert run_gh_calls != []
+
+
+# ── cmd_verdict: третья категория находок — чеклист тела PR (#462) ───────────
+
+def _pr_patches(run_gh_calls: list[tuple], pr: int = 294) -> list[str]:
+    """PATCH-вызовы run_gh на тело именно этого PR — тело чеклиста лежит
+    последним элементом кортежа (см. вызов в cmd_verdict: -f body=...)."""
+    return [a[-1].split("body=", 1)[1] for a in run_gh_calls
+            if a[:3] == ("api", "-X", "PATCH") and a[3] == f"repos/o/r/pulls/{pr}"]
+
+
+def test_cmd_verdict_merges_remark_blocks_into_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Всё в целом хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: Мелкая неточность\nПоправь X.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "Мелкая неточность" in patches[0]
+    assert ai.review_checklist.CHECKLIST_BEGIN in patches[0]
+    assert "Описание PR." in patches[0]   # исходное тело PR не потеряно
+
+
+def test_cmd_verdict_without_remarks_does_not_patch_pr_body(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+    assert rc == 0
+    assert _pr_patches(run_gh_calls) == []
+
+
+def test_cmd_verdict_preserves_checked_checklist_items_on_new_round(monkeypatch, tmp_path):
+    # Раунд 2 ревью с новым замечанием не должен снимать отметку, которую
+    # автор уже поставил у пункта из раунда 1 (нативный чекбокс GitHub).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    existing_body = (
+        "Описание PR.\n\n"
+        f"{ai.review_checklist.CHECKLIST_BEGIN}\n{ai.review_checklist.CHECKLIST_TITLE}\n\n"
+        "- [x] **Старое замечание** — уже сделано\n"
+        f"{ai.review_checklist.CHECKLIST_END}\n"
+    )
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": existing_body}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = "ЗАМЕЧАНИЕ: Новое замечание\nПоправь Y.\nКОНЕЦ ЗАМЕЧАНИЯ\nВЕРДИКТ: approve"
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "- [x] **Старое замечание** — уже сделано" in patches[0]
+    assert "- [ ] **Новое замечание** — Поправь Y." in patches[0]
 
 
 # ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────

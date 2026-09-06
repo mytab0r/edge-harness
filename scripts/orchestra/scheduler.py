@@ -158,6 +158,14 @@ _rl_spec = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_rl_spec)
 _rl_spec.loader.exec_module(review_labels)
 
+# Чеклист некритичных замечаний ревью в теле PR (#462, третья категория
+# находок) — одно место правды в lib, общее с scripts/review/ai_review.py:
+# тот пишет пункты при вердикте, этот читает незакрытые при слиянии.
+_rc_spec = importlib.util.spec_from_file_location(
+    "review_checklist", Path(__file__).resolve().parents[1] / "lib" / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_rc_spec)
+_rc_spec.loader.exec_module(review_checklist)
+
 # Номер задачи из текста PR/issue — одно место правды (#187): границы числа
 # с обеих сторон, не подстрока (класс «#18 совпал с #180» на contract_check,
 # 33570081734).
@@ -1124,6 +1132,42 @@ def after_merge(
     if task_numbers:
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
+    # Чеклист некритичных замечаний ревью (#462, третья категория находок):
+    # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
+    # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
+    # что у review:large) и НЕ теряются молча — ОДНА задача-хвост со ссылкой
+    # на PR, не issue на каждый пункт. `pull.get("body")` (не отдельный
+    # перезапрос) — тело PR несёт чеклист уже с момента ai:ok (гейт слияния
+    # требует его до того, как PR вообще попадёт в очередь на слияние), а не
+    # изменяется в промежутке между списком PR и этим моментом.
+    try:
+        unresolved = review_checklist.unresolved_items(pull.get("body") or "")
+        if unresolved:
+            tail_title = review_checklist.tail_issue_title(number)
+            open_titles = {
+                issue["title"]
+                for issue in review_labels.list_pages(
+                    f"repos/{repo}/issues?state=open&labels=task&per_page=100", gh)
+                if "pull_request" not in issue
+            }
+            if tail_title in open_titles:
+                observations.append(
+                    f"ℹ️ хвост чеклиста PR #{number}: задача уже заведена (идемпотентность по заголовку)")
+            else:
+                created = gh(
+                    "-X", "POST", f"repos/{repo}/issues",
+                    "-f", f"title={tail_title}",
+                    "-f", "body=" + review_checklist.tail_issue_body(repo, number, unresolved),
+                    "-f", "labels[]=task",
+                )
+                actions.append(
+                    f"📋 хвост чеклиста PR #{number}: заведена #{created['number']} "
+                    f"({len(unresolved)} незакрытых пунктов)")
+    except RuntimeError as error:
+        # Мерж уже состоялся — недоступность GitHub здесь не откатывает его,
+        # но и не молчит: видимое ⚠️ в отчёте, тот же приём, что у release
+        # замка/напоминания выше в этой функции.
+        observations.append(f"⚠️ хвост чеклиста PR #{number} не заведён: {error}")
     remaining_observations, remaining_actions = update_remaining_pulls(repo, pull["number"], other_pulls or [])
     observations += remaining_observations
     actions += remaining_actions

@@ -1883,6 +1883,75 @@ def test_after_merge_wires_update_remaining_pulls(monkeypatch):
     assert calls == [(1, [other])]
 
 
+# ── Чеклист некритичных замечаний ревью — задача-хвост при слиянии (#462) ─────
+# Незакрытые пункты НЕ блокируют мерж (иначе некритичное стало бы критичным),
+# но и не теряются молча — одна задача-хвост со ссылкой на PR, не issue на
+# каждый пункт (scripts/lib/review_checklist.py).
+
+def _checklist_body(*, unchecked=("Не сделано",), checked=()):
+    lines = [sch.review_checklist.CHECKLIST_BEGIN, sch.review_checklist.CHECKLIST_TITLE, ""]
+    lines += [f"- [ ] **{t}**" for t in unchecked]
+    lines += [f"- [x] **{t}**" for t in checked]
+    lines.append(sch.review_checklist.CHECKLIST_END)
+    return "Описание PR.\n\n" + "\n".join(lines) + "\n"
+
+
+def test_after_merge_files_tail_issue_for_unresolved_checklist(monkeypatch):
+    merged = pull(163, pr_body=_checklist_body(unchecked=("Первое", "Второе"), checked=("Третье",)))
+    fake = FakeGh({
+        "pulls/163/files": [],
+        "issues?state=open&labels=task&per_page=100": [],
+        f"-X POST repos/{REPO}/issues -f title={sch.review_checklist.tail_issue_title(163)}": {"number": 900},
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert any("#900" in line and "2" in line for line in actions)
+    posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
+    assert len(posts) == 1
+    assert "Первое" in posts[0] and "Второе" in posts[0]
+    assert "Третье" not in posts[0]   # отмеченный пункт не попадает в хвост
+
+
+def test_after_merge_no_checklist_no_tail_issue(monkeypatch):
+    # Тело PR без секции чеклиста вовсе — unresolved_items пуст, ни списка
+    # открытых задач, ни POST issue не запрашивается (мутация: FakeGh упал бы
+    # AssertionError на непредусмотренном маршруте, если бы код всё равно лез
+    # в сеть).
+    merged = pull(163, pr_body="Обычное описание без чеклиста.")
+    fake = FakeGh({"pulls/163/files": []})
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any("хвост чеклиста" in line for line in observations + actions)
+
+
+def test_after_merge_tail_issue_idempotent_by_title(monkeypatch):
+    # Хвост уже заведён (открытая задача с тем же заголовком) — повторный
+    # прогон after_merge не плодит вторую issue.
+    merged = pull(163, pr_body=_checklist_body(unchecked=("Первое",)))
+    existing = {"title": sch.review_checklist.tail_issue_title(163), "number": 501}
+    fake = FakeGh({
+        "pulls/163/files": [],
+        "issues?state=open&labels=task&per_page=100": [existing],
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
+    assert posts == []
+    assert any("уже заведена" in line for line in observations)
+
+
 # ── Авто-возобновление предохранителя по мержу (#220) ────────────────────────────
 # Прод-форма снята живым API 2026-09-06: worker.yml run 34011108934 (failure,
 # 04:17:03Z) — реальный красный прогон; его след аренды в #217 — реальный
