@@ -9,8 +9,10 @@ conveyor_gate/heartbeat_check проверяется на моке gh — сет
 """
 
 import importlib.util
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -133,6 +135,68 @@ def test_heartbeat_alert_carries_marker_evidence_and_threshold():
     assert str(pg.HEARTBEAT_MAX_AGE_MINUTES) in text
     assert "actions/runs/7" in text
     assert "внешний монитор" in text  # честный пробел: полный охват отложен
+
+
+# ── Telegram-HTML (#170): parse_mode всегда, кликабельные номера, экранирование ──
+
+
+def test_send_telegram_always_sends_parse_mode_and_escapes_plain(monkeypatch):
+    # Класс #170: parse_mode не передавался нигде — Telegram рендерил plain text
+    # и кликабельных ссылок не бывало. Гвардия держит САМ вызов curl: снять
+    # "--data-urlencode parse_mode=HTML" или экранирование — тест краснеет.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    calls = []
+    monkeypatch.setattr(pg, "subprocess",
+                        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+                            returncode=0, stderr="")))
+    assert pg.send_telegram('причина: <упало> & "вышло"') is True
+    assert len(calls) == 1
+    argv = calls[0][0]
+    joined = " ".join(argv)
+    assert "parse_mode=HTML" in joined
+    # plain по умолчанию экранируется: случайные < и & не разваливают доставку
+    assert "text=причина: &lt;упало&gt; &amp; \"вышло\"" in joined
+
+
+def test_send_telegram_as_html_passes_markup_verbatim(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    calls = []
+    monkeypatch.setattr(pg, "subprocess",
+                        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+                            returncode=0, stderr="")))
+    markup = '<a href="https://github.com/o/r/issues/7">#7</a>'
+    assert pg.send_telegram(markup, as_html=True) is True
+    assert f"text={markup}" in " ".join(calls[0][0])  # повторное экранирование убило бы ссылку
+
+
+def test_merge_telegram_text_is_short_clickable_and_escaped():
+    text = pg.merge_telegram_text("mytab0r/edge-harness", 405, 170,
+                                  "Telegram: «задача выполнена» на открытый PR — врёт, а про слияние в main не сообщает")
+    assert "слито в main" in text                       # факт мержа назван своими словами
+    assert '<a href="https://github.com/mytab0r/edge-harness/issues/170">#170</a>' in text
+    assert '<a href="https://github.com/mytab0r/edge-harness/pull/405">#405</a>' in text
+    # «Короткое» — это то, что ВИДНО в чате: Telegram рендерит <a>-ссылки как
+    # #170/#405, пряча URL. Гвардия держит видимый размер, не байты разметки.
+    visible = re.sub(r"<[^>]+>", "", text)
+    assert len(visible) < 120, f"сообщение разрослось: {visible!r}"
+    assert pg.short_title("один два три четыре пять шесть семь восемь") == "один два три четыре пять шесть"
+
+
+def test_merge_telegram_text_escapes_hostile_title():
+    text = pg.merge_telegram_text("o/r", 1, 2, "a & b <c>")
+    assert "a &amp; b &lt;c&gt;" in text               # &/< от задачи не разваливают доставку
+    assert '<a href="https://github.com/o/r/issues/2">' in text
+
+
+def test_worker_telegram_report_sends_parse_mode_too():
+    # Второй отправитель репозитория (#170) — bash-овский telegram_report в
+    # task.sh: гвардия по исходнику, что он шлёт тот же parse_mode=HTML.
+    # Поведенческая проверка Python-отправителя — выше, send_telegram.
+    source = (Path(__file__).parent.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    assert '--data-urlencode "parse_mode=HTML"' in source
+    assert "выполнена, PR открыт" not in source  # слова «выполнена» в отчёте о PR больше нет
 
 
 # ── Причина последнего красного: прод-форма jobs ─────────────────────────────────

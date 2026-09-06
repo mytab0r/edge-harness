@@ -99,6 +99,11 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
           body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"smoke-no-stub\",\"message\":\"нет заглушки для $m\"}}}"
           code=400 ;;
       esac ;;
+    *api.telegram.org*)
+      # Telegram-отчёт воркера (#170): каптурируем ВЕСЬ вызов — по журналу
+      # ассерты держат и parse_mode=HTML, и экранирование заголовка (tg_html).
+      log_call "TG-SEND $*"
+      body='{"ok":true,"result":{"message_id":1}}' ;;
     *)
       echo "::error::SMOKE: curl-заглушка не знает URL: ${url:-<пусто>}" >&2
       return 99 ;;
@@ -414,7 +419,9 @@ WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
 RUNNER_TEMP="$TMP/rtw" \
 GH_TOKEN="smoke-pat-token" \
-GH_ISSUE_JSON='{"number":123,"title":"Smoke задача для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke задача & для гвардии класса","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
   run_client "worker" "$REPO/scripts/worker/task.sh"
 
 assert_log "MORDE-RPC session.create" "worker: сессия морды не создана"
@@ -423,6 +430,19 @@ assert_log "MORDE-INGEST" "worker: транскрипт не уехал в мо�
 assert_log "GH-COMMENT" "worker: нет отчёта в задачу"
 # Захват через аренду (#121): замок создан ДО сессии и работы.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "worker: аренда задачи 123 не взята"
+# Telegram-отчёт (#170): доставлен С parse_mode (иначе кликабельных ссылок
+# не бывает — plain text), и заголовок с «&» ушёл экранированным (иначе
+# Telegram отклонил бы всё сообщение целиком). Слово «выполнена» в отчёте
+# воркера запрещено: открытый PR ≠ сделанная задача, это слово теперь значит
+# только «слито в main» (scheduler.after_merge).
+tg_line=$(grep -F "TG-SEND" "$CALLLOG" | head -1)
+[ -n "$tg_line" ] || { echo "::error::SMOKE: worker: Telegram-отчёт не отправлен" >&2; exit 1; }
+grep -qF -- "parse_mode=HTML" <<<"$tg_line" \
+  || { echo "::error::SMOKE: worker: Telegram-отчёт без parse_mode=HTML: $tg_line" >&2; exit 1; }
+grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$tg_line" \
+  || { echo "::error::SMOKE: worker: заголовок ушёл в Telegram неэкранированным: $tg_line" >&2; exit 1; }
+grep -qF -- "выполнена" <<<"$tg_line" \
+  && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
 echo "SMOKE: worker — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────

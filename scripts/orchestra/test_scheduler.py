@@ -299,6 +299,17 @@ def patch_post_issue_comment(monkeypatch, fn):
     monkeypatch.setattr(pg, "post_issue_comment", fn)
 
 
+@pytest.fixture(autouse=True)
+def _no_telegram_env(monkeypatch):
+    """#170: after_merge шлёт Telegram «слито в main». Юнит-тесты не обязаны
+    зависеть от окружения раннера: без токена send_telegram честно молчит
+    (warning + False), а с заданным в среде токеном отправлял бы НАСТОЯЩИЕ
+    сообщения из тестов. Тесты самого сообщения патчат sch.send_telegram явно
+    (см. test_after_merge_notifies_telegram_about_merge_once)."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+
 def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
@@ -1510,6 +1521,79 @@ def test_after_merge_promises_auto_close_only_for_declared_task(monkeypatch):
     assert "стадия приёмки закроет её сама" in posted[78]
     assert "не объявил её" in posted[79]
     assert "стадия приёмки закроет её сама" not in posted[79]
+
+
+def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
+    """#170: слияние в main — единственный факт, на который Telegram говорит
+    «выполнена»; раньше этот канал молчал вовсе, и владелец узнавал о готовности
+    только руками. Один PR = ОДНО сообщение, даже когда в теле объявлена #78 и
+    рядом упомянута #79 (дубль на каждую задачу — спам). Номера задачи и PR —
+    кликабельные <a>-ссылки, заголовок задачи экранирован (мержится как HTML)."""
+    body = "#78\n\nОсновная реализация. Заодно поправил соседний баг из #79."
+    merged = pull(163, pr_body=body)
+    sent = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/163/files?per_page=100&page=1",
+                      "repos/o/r/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/78":
+            return {**issue(78, assignees=("mytab0r",), title="Отчёт врёт & <молчит>"),
+                    "state": "open"}
+        if joined == "repos/o/r/issues/79":
+            return {**issue(79, assignees=("mytab0r",), title="Другая задача"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(
+        sch, "send_telegram",
+        lambda text, as_html=False: sent.append((text, as_html)) or True)
+
+    lines, hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert len(sent) == 1, "один PR — одно сообщение, а не по одному на задачу"
+    text, as_html = sent[0]
+    assert as_html is True                                # без parse_mode ссылки мертвы
+    assert "слито в main" in text
+    assert '<a href="https://github.com/o/r/issues/78">#78</a>' in text
+    assert '<a href="https://github.com/o/r/pull/163">#163</a>' in text
+    assert "Отчёт врёт &amp; &lt;молчит&gt;" in text      # заголовок ушёл экранированным
+    assert hard_failure is False
+    assert any("Telegram" in line and "доставлено" in line for line in lines)
+
+
+def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
+    """#170: недоставленный Telegram не откатывает мерж и не роняет after_merge —
+    место правды (комментарий в задаче выше) уже оставлен; но и не молчит: ⚠️ в отчёте."""
+    body = "#78\n\nОсновная реализация."
+    merged = pull(163, pr_body=body)
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/163/files?per_page=100&page=1",
+                      "repos/o/r/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/78":
+            return {**issue(78, assignees=("mytab0r",), title="Любой заголовок"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: False)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: [])
+
+    lines, hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert hard_failure is False
+    assert any("⚠️" in line and "Telegram" in line for line in lines)
 
 
 def test_after_merge_wires_update_remaining_pulls(monkeypatch):

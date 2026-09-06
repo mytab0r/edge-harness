@@ -101,7 +101,10 @@ fi
 
 # Отчёт в Telegram — best-effort: место правды всегда комментарий в задаче,
 # но промах кричит warning'ом в лог job'а, не молчит.
-telegram_report() { # $1 — текст
+# parse_mode=HTML — всегда (#170): без него Telegram рендерит plain text и
+# кликабельных ссылок не бывает. Второй отправитель репозитория —
+# pulse_guard.send_telegram; новых отправителей заводить нельзя, формат один.
+telegram_report() { # $1 — текст (динамические части — уже через tg_html)
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
@@ -109,10 +112,25 @@ telegram_report() { # $1 — текст
   if ! curl -fsS --max-time 30 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "parse_mode=HTML" \
       --data-urlencode "text=$1" >/dev/null; then
     echo "::warning::Telegram не принял отчёт — комментарий в задаче остаётся местом правды"
     return 1
   fi
+}
+
+# plain-текст → безопасный внутри Telegram-HTML (#170): при parse_mode=HTML
+# символы <, >, & управляющие — заголовок задачи с ними развалил бы доставку
+# всего сообщения (400 от Telegram). & первым, иначе задвоение.
+tg_html() { # $1 — plain-текст
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# «Заголовок задачи в двух словах» (#170): первые 6 слов, остальное молча
+# отбрасывается — сообщение обязано остаться коротким. Строго по пробелам,
+# не по позициям: байтовая обрезка режет кириллицу посреди символа в C-локали.
+short_title() { # $1 — заголовок
+  printf '%s' "$1" | tr -s '[:space:]' ' ' | cut -d' ' -f1-6
 }
 
 # Свободная задача: открыта, метка task, без assignee и без живой аренды
@@ -412,7 +430,13 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number выполнена, PR открыт: $pr_url" || true
+  # «Выполнена» здесь НЕ звучит (#170): открытый PR — промежуточный шаг, а не
+  # сделанная задача; это слово в Telegram теперь значит только «слито в main»
+  # (scheduler.py::after_merge). Коротко, номера задачи и PR — кликабельные
+  # ссылки (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
+  # экранированные tg_html.
+  pr_number=${pr_url##*/}
+  telegram_report "🤖 worker: PR открыт — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
   echo "PR открыт: $pr_url — job зелёный"
   exit 0
 fi

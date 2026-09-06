@@ -27,6 +27,7 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import html
 import json
 import os
 import subprocess
@@ -291,6 +292,47 @@ def heartbeat_alert_text(age_minutes: float, run: dict | None) -> str:
     )
 
 
+# ── Telegram-HTML (#170): один формат сообщений на всех отправителей ──────────────
+# Класс #170: parse_mode не передавался нигде, Telegram рендерил plain text и
+# ссылки оставались голыми URL. Теперь parse_mode=HTML шлют ОБА отправителя
+# репозитория (send_telegram ниже и telegram_report в scripts/worker/task.sh) —
+# эти два места и есть весь список, новых отправителей заводить нельзя.
+
+
+SHORT_TITLE_WORDS = 6
+
+
+def tg_html(plain: str) -> str:
+    """Экранирование plain-текста до безопасного Telegram-HTML. При
+    parse_mode=HTML символы <, >, & управляющие: заголовок задачи или причина
+    сбоя с ними иначе развалили бы доставку всего сообщения (400 от Telegram).
+    Атрибутных значений из пользовательского текста мы не строим, кавычки
+    не трогаем (quote=False)."""
+    return html.escape(plain or "", quote=False)
+
+
+def short_title(title: str, words: int = SHORT_TITLE_WORDS) -> str:
+    """«Заголовок задачи в двух словах» (#170): первые SHORT_TITLE_WORDS слов,
+    остальное молча отбрасывается — сообщение обязано остаться коротким.
+    Разбивка строго по пробелам, не по позициям: байтовая обрезка режет
+    кириллицу посреди символа."""
+    return " ".join((title or "").split()[:words])
+
+
+def merge_telegram_text(repo: str, pr_number: int, task_number: int, task_title: str) -> str:
+    """Сообщение о слиянии (#170) — слово «выполнена» звучит ТОЛЬКО здесь, на факт
+    слияния в main. «PR открыт» воркера — другой факт и другой текст
+    (scripts/worker/task.sh). Номера задачи и PR — кликабельные ссылки, заголовок
+    экранирован. Ссылки строятся из repo+номера, а не из html_url ответа API:
+    источник детерминирован и не зависит от того, какие поля дошли в dict."""
+    return (
+        f"✅ задача <a href=\"https://github.com/{repo}/issues/{task_number}\">#{task_number}</a>"
+        f" выполнена — слито в main:"
+        f" <a href=\"https://github.com/{repo}/pull/{pr_number}\">#{pr_number}</a>"
+        f" «{tg_html(short_title(task_title))}»"
+    )
+
+
 # ── IO-обвязка: чтение прогонов, сигналы, след в задаче ──────────────────────────
 
 
@@ -371,21 +413,33 @@ def post_issue_comment(repo: str, issue_number: int, text: str) -> None:
     gh("-X", "POST", f"repos/{repo}/issues/{issue_number}/comments", "-f", "body=" + text)
 
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text: str, as_html: bool = False) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
-    канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK)."""
+    канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
+
+    Единственный Python-отправитель репозитория (#170; второй — bash-овский
+    telegram_report в scripts/worker/task.sh) и ВСЕГДА шлёт parse_mode=HTML:
+    без него Telegram трактует текст как plain text и кликабельных ссылок не
+    бывает. По умолчанию текст считается plain и экранируется (tg_html) —
+    сигнальные тексты выше не содержат разметки, а их динамические части
+    (заголовки прогонов, причины сбоев) больше не могут развалить доставку
+    случайным < или &. as_html=True — текст уже собран как Telegram-HTML
+    (merge_telegram_text): его динамические части обязаны были пройти tg_html
+    у сборщика, повторное экранирование убило бы ссылки."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сигнал не отправлен",
               file=sys.stderr)
         return False
+    payload_text = text if as_html else tg_html(text)
     try:
         result = subprocess.run(
             ["curl", "-fsS", "--max-time", "30", "-X", "POST",
              f"https://api.telegram.org/bot{token}/sendMessage",
              "--data-urlencode", f"chat_id={chat}",
-             "--data-urlencode", f"text={text}"],
+             "--data-urlencode", "parse_mode=HTML",
+             "--data-urlencode", f"text={payload_text}"],
             capture_output=True, text=True,
         )
     except OSError as error:
