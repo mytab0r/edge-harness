@@ -88,6 +88,12 @@ BASE = {
         "sha": "locksha", "commit": {"committer": {"date": "2026-08-31T12:00:00Z"}}},
     "issues/5/assignees": ok_no_body(),
     "issues/5/comments": ok_no_body(),
+    # Проверка на входе (claim не выдаёт аренду на закрытую задачу): дефолт
+    # для всех тестов, использующих BASE, — задача открыта. Порядок ключей
+    # важен для FakeServer.run (substring-роутинг, первое совпадение
+    # выигрывает): этот ключ идёт ПОСЛЕ issues/5/assignees и issues/5/comments,
+    # иначе он перехватил бы их вызовы (обе строки содержат "issues/5").
+    "repos/o/r/issues/5": {"number": 5, "state": "open"},
 }
 
 
@@ -140,6 +146,38 @@ def test_race_two_claims_one_wins_other_refused(monkeypatch):
     assert server.existing_refs == {"refs/locks/task-5"}
 
 
+def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):
+    # Проверка на входе (не гвардия постфактум): приёмка уже закрыла задачу —
+    # воркер/hands не должны снова браться за неё через claim. Отказ обязан
+    # случиться ДО создания коммита/ref'а замка (дешёвый GET раньше дорогой
+    # записи), поэтому проверяем отсутствие POST git/commits и git/refs.
+    routes = dict(BASE)
+    routes["repos/o/r/issues/5"] = {"number": 5, "state": "closed"}
+    server = install(monkeypatch, FakeServer(routes))
+    result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+    assert result.claimed is False
+    assert "закрыта" in result.detail
+    assert not any("git/commits" in c for c in server.calls)
+    assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
+
+
+def test_claim_refuses_blocked_task_without_creating_lock(monkeypatch):
+    # Симметрично closed выше (#357): задача открыта, но несёт blocked —
+    # эскалация владельцу, hands (dsh_task.sh) идут мимо task-branch и
+    # единственные их ворота это claim. Мутация: закомментируй проверку
+    # blocked в claim() — этот тест краснеет (claimed становится True).
+    routes = dict(BASE)
+    routes["repos/o/r/issues/5"] = {
+        "number": 5, "state": "open", "labels": [{"name": "task"}, {"name": "blocked"}],
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
+    assert result.claimed is False
+    assert "заблокирована" in result.detail
+    assert not any("git/commits" in c for c in server.calls)
+    assert not any("git/refs" in c and "matching-refs" not in c for c in server.calls)
+
+
 def test_claim_success_visibility_after_lock(monkeypatch):
     server = install(monkeypatch, FakeServer(dict(BASE)))
     result = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
@@ -174,7 +212,10 @@ def test_claim_visibility_failure_does_not_break_ownership(monkeypatch):
 
 
 def test_claim_infra_failure_is_loud_not_busy(monkeypatch):
-    routes = {"repos/o/r/commits/main": fail(502, "Bad Gateway")}
+    routes = {
+        "repos/o/r/issues/5": {"number": 5, "state": "open"},
+        "repos/o/r/commits/main": fail(502, "Bad Gateway"),
+    }
     install(monkeypatch, FakeServer(routes))
     # «занято» и «сломано» — разные состояния: поломка не маскируется отказом
     with pytest.raises(RuntimeError):

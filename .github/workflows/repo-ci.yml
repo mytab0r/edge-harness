@@ -113,6 +113,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_upstream_drift.py -q
 
+      # Сигнал ослабления защиты main событием branch_protection_rule (#370,
+      # #341): инвариант 6 не может опрашивать protection (GET требует
+      # administration, которого нет у GITHUB_TOKEN) — сигнал приходит вместе
+      # с самим фактом изменения через payload события, читать API не нужно.
+      # Прод-форма фикстур — вербатим примеры payload'ов GitHub (octokit/webhooks),
+      # проводка на моке pulse_guard.gh: согласованное состояние — ноль мутаций.
+      - name: Тесты сигнала ослабления защиты main (#370)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
+
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
       # обоими зелёными вердиктами или уже в конфликте, не всех открытых
@@ -292,10 +303,17 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/test/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
           echo "bash ok"
+
+      # Проверка на входе в task-branch (не гвардия постфактум): задача обязана
+      # существовать/быть открытой/нести task/не нести blocked до создания
+      # ветки — прогон на реальном git с фейковым gh, сеть не нужна.
+      - name: Smoke task-branch — проверка задачи на входе
+        run: bash scripts/git/test/task-branch.test.sh
 
       # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
       # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
