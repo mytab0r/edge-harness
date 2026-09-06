@@ -556,6 +556,20 @@ def dispatch_conflict_rework(
             continue
         attempts = conflict_rework_attempts(repo, number)
         if attempts >= CONFLICT_REWORK_MAX_ATTEMPTS:
+            # Гонка (найдена живым прогоном #474, PR #408: маркер попытки
+            # ставится СРАЗУ на dispatch, а сам worker.yml идёт до 280 мин) —
+            # без этой проверки следующий тик оркестратора (каждые 15 мин)
+            # увидел бы attempts >= порога ДО того, как единственная попытка
+            # вообще успела завершиться, и эскалировал бы «не сошлось», хотя
+            # прогон ещё идёт. worker_runs_active — тот же гейт, что ниже:
+            # пока прогон жив, эскалация ждёт, не дублирует dispatch и не
+            # торопится с вердиктом.
+            if dispatched or worker_runs_active(repo):
+                observations.append(
+                    f"⏸️ PR #{number}: авто-попытка ребейза ещё идёт (worker.yml активен) — "
+                    "решение об эскалации отложено"
+                )
+                continue
             marker = f"{CONFLICT_ESCALATION_MARKER} #{number}"
             try:
                 already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)

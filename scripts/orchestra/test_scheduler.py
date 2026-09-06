@@ -1694,6 +1694,10 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         "issues/120/comments?per_page=100": [],
         "pulls/560/files": files_payload(["a.py", "b.py"]),
         "compare/basesha...main": {"files": files_payload(["b.py", "c.py"])},
+        # Единственная попытка уже ЗАВЕРШИЛАСЬ (не в in_progress/queued) —
+        # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -1712,6 +1716,34 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert task["assignees"] != []  # эскалация не трогает задачу
 
 
+def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(monkeypatch):
+    # Живая находка #474 (PR #408, прогон 34027474271): маркер попытки
+    # ставится СРАЗУ на dispatch, а worker.yml идёт до 280 мин — без этой
+    # гвардии следующий тик планировщика (каждые 15 мин) эскалировал бы
+    # «не сошлось», пока единственная попытка ещё физически не завершилась.
+    task = issue(474, assignees=())  # уже освобождена предыдущим dispatch
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/comments": [
+            {"created_at": "2026-09-05T10:00:00Z",
+             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run(34027474271, "in_progress")]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("прогон ещё идёт — рано эскалировать"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("ещё идёт" in line and "#560" in line for line in observations)
+    # ждём результата попытки — ни файлы PR/main, ни маркер эскалации не читаем зря
+    assert not any("pulls/560/files" in c or "compare/" in c or "issues/120/comments" in c
+                   for c in fake.calls)
+
+
 def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
     marker = f"{sch.CONFLICT_ESCALATION_MARKER} #560"
     task = issue(474, assignees=("mytab0r",))
@@ -1721,6 +1753,8 @@ def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
             {"created_at": "2026-09-05T10:00:00Z",
              "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
         ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-05T11:00:00Z", "body": f"🚨 {marker} — уже сказано"},
         ],
