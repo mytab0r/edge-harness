@@ -1854,6 +1854,9 @@ def test_reject_reopened_tasks_closes_back_with_actionable_comment(monkeypatch):
     patch_gh(monkeypatch, fake)
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    released = []
+    monkeypatch.setattr(sch.claim_task, "release",
+                         lambda repo, n: released.append(n) or f"замок task-{n} снят")
 
     pool = [issue(111, assignees=(), state_reason="reopened")]
     lines = sch.reject_reopened_tasks(REPO, pool)
@@ -1863,8 +1866,10 @@ def test_reject_reopened_tasks_closes_back_with_actionable_comment(monkeypatch):
     assert sch.REOPEN_REJECTED_MARKER in posted[0][1]
     assert "новой" in posted[0][1].lower() and "related" in posted[0][1]
     assert any("111" in line and "закрыта обратно" in line for line in lines)
-    # ни assignee, ни lock трогать не за что — их не было
+    # ни assignee, ни lock трогать не за что — их не было (release этой
+    # веткой вызывается безусловно — замокан, чтобы не бить прод-API, #380 находка 1)
     assert not any("assignees" in call for call in fake.calls)
+    assert released == [111]
 
 
 def test_reject_reopened_tasks_releases_assignee_and_lock(monkeypatch):
@@ -1965,7 +1970,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
 
     accept_calls = []
 
-    def fake_accept(repo, pool, merged, now=None):
+    def fake_accept(repo, pool, merged, now=None, *, open_pulls_list=None):
         accept_calls.append([i["number"] for i in pool])
         return [], False
 

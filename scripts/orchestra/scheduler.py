@@ -1581,9 +1581,15 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
             lines.append(f"⚠️ #{number}: переоткрытие не отклонено — {error}")
             continue
         if issue["assignees"]:
-            who = ", ".join(a["login"] for a in issue["assignees"])
+            # По одному -f assignees[]=<login> на ассайни (gh api: массив — это
+            # повторный key[], а не запятая внутри одного значения) — при двух
+            # и более ассайни склейка через ", " ушла бы одной строкой и GitHub
+            # отклонил бы весь запрос как несуществующий логин.
+            assignee_args = [
+                arg for a in issue["assignees"] for arg in ("-f", f"assignees[]={a['login']}")
+            ]
             try:
-                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", "-f", f"assignees[]={who}")
+                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/assignees", *assignee_args)
             except RuntimeError as error:
                 lines.append(f"⚠️ #{number}: assignee не снят после отклонённого переоткрытия — {error}")
         try:
