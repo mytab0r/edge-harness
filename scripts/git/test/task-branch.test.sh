@@ -192,12 +192,28 @@ for _d in "${_dirs[@]}"; do
   fi
 done
 safe_path="${safe_path#:}"
+# Не фиксированный список имён инструментов — та копия зависимостей
+# task-branch неизбежно расходится с самим скриптом (реальный случай:
+# #386 добавил вызов dirname через source ../gh/infra_digest.sh, список
+# его не знал, случай 7 упал). Вместо списка — зеркалим КАЖДЫЙ каталог,
+# в котором нашёлся gh/gh.exe, целиком (кроме самого gh): любой инструмент,
+# который живёт рядом с gh на GitHub-раннере (общий /usr/bin), окажется
+# в шиме автоматически, а инструменты из каталогов без gh уже целы в
+# safe_path и шима не требуют.
 shim="$WORK/shim-no-gh"
 mkdir -p "$shim"
-for tool in git grep sed cut mktemp cat rm; do
-  tool_path="$(command -v "$tool" 2>/dev/null || true)"
-  [ -n "$tool_path" ] || { note "случай 7: инструмент $tool не найден в окружении теста — ОШИБКА"; fail=1; continue; }
-  ln -sf "$tool_path" "$shim/$tool"
+for _d in "${_dirs[@]}"; do
+  [ -n "$_d" ] || continue
+  if [ -e "$_d/gh" ] || [ -e "$_d/gh.exe" ]; then
+    for entry in "$_d"/*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      name="$(basename "$entry")"
+      case "$name" in
+        gh|gh.exe) continue ;;
+      esac
+      [ -e "$shim/$name" ] || ln -sf "$entry" "$shim/$name" 2>/dev/null || true
+    done
+  fi
 done
 
 make_tree "case7"
