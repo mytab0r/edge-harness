@@ -106,4 +106,45 @@ else
   note "OK случай 6: директива внутри inline-кода не триггерит отказ (семантика #423/#429)"
 fi
 
+# ── случай 7: тело не задано вовсе — подставляется .github/PULL_REQUEST_
+# TEMPLATE.md (агент физически не может открыть PR с пустым телом мимо
+# шаблона) ─────────────────────────────────────────────────────────────────
+rm -f "$MARKER"
+ARGS_FILE="$WORK/gh-args"
+cat >"$WORK/bin/gh" <<GHEOF
+#!/usr/bin/env bash
+if [ "\$1" = "pr" ] && [ "\$2" = "create" ]; then
+  echo called >"$MARKER"
+  printf '%s\n' "\$@" >"$ARGS_FILE"
+  echo "https://github.com/o/r/pull/1"
+  exit 0
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+GHEOF
+chmod +x "$WORK/bin/gh"
+if ! bash "$SCRIPT_SRC" --title t >"$WORK/out7" 2>"$WORK/err7"; then
+  note "FAIL случай 7: без --body/--body-file pr-create отказал вовсе"; cat "$WORK/err7"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 7: gh не вызван без --body/--body-file"; fail=1
+elif ! grep -qF "$REPO_ROOT/.github/PULL_REQUEST_TEMPLATE.md" "$ARGS_FILE"; then
+  note "FAIL случай 7: gh вызван без --body-file на шаблон"; cat "$ARGS_FILE"; fail=1
+elif ! grep -q "PULL_REQUEST_TEMPLATE.md" "$WORK/err7"; then
+  note "FAIL случай 7: нет уведомления о подстановке шаблона"; fail=1
+else
+  note "OK случай 7: пустое тело подставляет .github/PULL_REQUEST_TEMPLATE.md"
+fi
+
+# ── случай 8: --fill не подставляет шаблон поверх (осознанный выбор gh) ──────
+rm -f "$MARKER" "$ARGS_FILE"
+if ! bash "$SCRIPT_SRC" --title t --fill >"$WORK/out8" 2>"$WORK/err8"; then
+  note "FAIL случай 8: --fill отклонён"; cat "$WORK/err8"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 8: gh не вызван с --fill"; fail=1
+elif grep -qF "PULL_REQUEST_TEMPLATE.md" "$ARGS_FILE"; then
+  note "FAIL случай 8: шаблон подставлен поверх --fill"; cat "$ARGS_FILE"; fail=1
+else
+  note "OK случай 8: --fill не подменяется шаблоном"
+fi
+
 exit "$fail"

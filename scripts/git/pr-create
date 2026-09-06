@@ -24,13 +24,25 @@
 #
 # Использование: то же самое, что `gh pr create` — все аргументы
 # проксируются без изменений (--title, --body/--body-file, --base, --head, …).
+#
+# Тело не задано НИ ОДНИМ способом (нет --body/--body-file/--fill*/--editor/
+# --recover) — `gh pr create` в неинтерактивной среде (агент/CI, без TTY) на
+# это не подставляет `.github/PULL_REQUEST_TEMPLATE.md` сам (флаг `--template`
+# у gh — это только стартовый текст интерактивного промпта/редактора, здесь
+# его нет), а без него молча просит `--title`/`--body` заново или падает.
+# Явное требование задачи: шаблон обязан реально применяться в этом случае —
+# обёртка сама подставляет `--body-file .github/PULL_REQUEST_TEMPLATE.md`,
+# тот же файл, что видит человек через веб-форму GitHub.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TEMPLATE_FILE="$REPO_ROOT/.github/PULL_REQUEST_TEMPLATE.md"
 
 body=""
 args=()
 tmp_body_file=""
+has_body_source=false
 n=$#
 i=1
 while [ "$i" -le "$n" ]; do
@@ -40,16 +52,19 @@ while [ "$i" -le "$n" ]; do
       i=$((i + 1))
       val="${!i}"
       body="$val"
+      has_body_source=true
       args+=("--body" "$val")
       ;;
     --body=*)
       val="${arg#--body=}"
       body="$val"
+      has_body_source=true
       args+=("$arg")
       ;;
     --body-file)
       i=$((i + 1))
       file="${!i}"
+      has_body_source=true
       if [ "$file" = "-" ]; then
         tmp_body_file="$(mktemp)"
         cat >"$tmp_body_file"
@@ -62,6 +77,7 @@ while [ "$i" -le "$n" ]; do
       ;;
     --body-file=*)
       file="${arg#--body-file=}"
+      has_body_source=true
       if [ "$file" = "-" ]; then
         tmp_body_file="$(mktemp)"
         cat >"$tmp_body_file"
@@ -72,12 +88,36 @@ while [ "$i" -le "$n" ]; do
         args+=("$arg")
       fi
       ;;
+    --fill|-f|--fill-first|--fill-verbose|--editor|-e)
+      # gh сам соберёт тело (из коммитов или редактора) — шаблон здесь не
+      # подставляем поверх, это осознанный выбор вызывающего.
+      has_body_source=true
+      args+=("$arg")
+      ;;
+    --recover)
+      i=$((i + 1))
+      val="${!i}"
+      has_body_source=true
+      args+=("--recover" "$val")
+      ;;
+    --recover=*)
+      has_body_source=true
+      args+=("$arg")
+      ;;
     *)
       args+=("$arg")
       ;;
   esac
   i=$((i + 1))
 done
+
+if [ "$has_body_source" = false ]; then
+  if [ -f "$TEMPLATE_FILE" ]; then
+    echo "::notice::Тело PR не задано — подставляю .github/PULL_REQUEST_TEMPLATE.md (заполни разделы и первую строку #N перед мержем)." >&2
+    body="$(cat "$TEMPLATE_FILE")"
+    args+=("--body-file" "$TEMPLATE_FILE")
+  fi
+fi
 
 if [ -n "$body" ]; then
   # Один и тот же вызов, что contract_check.py — не второй regex рядом.
