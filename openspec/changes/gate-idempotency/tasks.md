@@ -29,10 +29,10 @@
       класс — `test_cmd_verdict_same_verdict_touches_no_labels`.
       Доказано 2026-09-06 прогоном.
 - [x] Дельта-спека `openspec/changes/gate-idempotency/specs/journal-tasks-hands/spec.md`
-      (п.40.4 — замена якоря таймеров #196/#269).
+      (п.41.4 — замена якоря таймеров #196/#269).
 - [x] `docs/agents/LABELS.md` — строки `contract:failed`, `review:ok`,
       `review:changes-requested`, `ai:failed` приведены к новому поведению.
-- [x] Находка ревью #424: идемпотентность 40.1 замораживала таймеры #196
+- [x] Находка ревью #424: идемпотентность 41.1 замораживала таймеры #196
       (`trigger_ai_review`)/#269 (`stale_ready_pulls`) на первой простановке
       вердикта, т.к. они отсчитывали от таймлайн-события `labeled`.
       `scripts/lib/review_labels.py::status_posted_at` — новый якорь, commit

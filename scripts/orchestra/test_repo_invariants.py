@@ -214,6 +214,17 @@ def gate1_status(when: str):
     return [{"context": ri.review_labels.STATUS_REVIEW, "created_at": when}]
 
 
+def timeline_with_review_ok(when: str):
+    return [{"event": "labeled", "label": {"name": "review:ok"}, "created_at": when}]
+
+
+def timeline_with_review_large(when: str):
+    """Прод-форма таймлайна крупного PR (#432): verdict_for ставит РОВНО одну
+    из двух меток гейта 1 — "labeled: review:ok" в таком таймлайне не
+    наступает никогда."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
+
+
 def retry_marker_comment(when: str, attempt: int):
     return {
         "created_at": when,
@@ -320,6 +331,7 @@ def test_stuck_gate_fact_pr387_never_had_a_verdict(monkeypatch):
     было ни разу за всю жизнь PR (не «был и протух», как у #329/#327ниже)."""
     pull = open_pr(387, labels=["review:ok", "review:large", "review:large-ok"])
     fake = FakeGh({
+        "commits/sha387/statuses": gate1_status("2026-09-06T03:13:09Z"),
         "issues/387/timeline": [
             {"event": "labeled", "label": {"name": "review:large"}, "created_at": "2026-09-05T23:02:59Z"},
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:13:09Z"},
@@ -352,6 +364,7 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
     pull = open_pr(329, labels=["review:ok"])
     fake = FakeGh({
+        "commits/sha329/statuses": gate1_status("2026-09-06T03:48:22Z"),
         "issues/329/timeline": [
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:05:20Z"},
             {"event": "labeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:13:07Z"},
@@ -392,6 +405,7 @@ def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
     ровно три, не четыре (мутация ниже это и доказывает)."""
     pull = open_pr(327, labels=["review:ok", "review:large", "review:large-ok"])
     fake = FakeGh({
+        "commits/sha327/statuses": gate1_status("2026-09-06T05:46:16Z"),
         "issues/327/timeline": [
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:09:50Z"},
             {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T04:10:03Z"},
