@@ -507,9 +507,49 @@ test('отказ журнала (401): громкая ошибка, а не пр
   sandbox.render()
   const strings = collectStrings(sandbox.tree)
   assert.ok(strings.includes('journalError'), 'ошибка журнала не показана')
-  assert.ok(strings.includes('HTTP 401'), 'код ответа не виден владельцу')
+  // #575: тело ответа {"error":{"message":"x"}} обязано быть показано целиком,
+  // а не отброшено ради голого кода — владелец видит причину, не "HTTP 401".
+  assert.ok(strings.includes('x'), 'сообщение из тела ответа не показано владельцу')
   assert.ok(strings.includes('retry'), 'нет кнопки повторить')
   assert.ok(!strings.includes('statusInstalled'), 'отказ журнала притворился «установлен» — silent-wrong')
+})
+
+test('#575: тело ответа журнала с причиной (storage_quota_exceeded) показывается целиком, не голый HTTP 500', async () => {
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub({
+      ok: false, status: 500, contentType: 'application/json',
+      body: { error: { code: 'storage_quota_exceeded', message: 'суточная квота хранилища исчерпана, сброс в 00:00 UTC' } },
+    }),
+    rpc: async () => NO_SESSION_HISTORY,
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(strings.includes('journalError'), 'ошибка журнала не показана')
+  assert.ok(strings.some((s) => s.includes('суточная квота хранилища исчерпана')),
+    'причина из тела ответа не видна владельцу — секция показала голый код вместо сообщения')
+  assert.ok(!strings.some((s) => s === 'HTTP 500'), 'секция показала голый "HTTP 500" вместо тела ответа')
+})
+
+test('#575: тело ответа RPC (session.history) с причиной показывается вместо голого HTTP', async () => {
+  const { sandbox } = loadBundle(routeFetch({
+    journal: async () => responseStub(EMPTY_JOURNAL),
+    rpc: async ({ method }) => (method === 'session.history'
+      ? responseStub({
+          ok: false, status: 500, contentType: 'application/json',
+          body: { error: { code: 'storage_quota_exceeded', message: 'суточная квота хранилища исчерпана, сброс в 00:00 UTC' } },
+        })
+      : rpcStub()),
+  }))
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const strings = collectStrings(sandbox.tree)
+  assert.ok(strings.includes('dedupError:'), 'отказ проверки заказов не показан')
+  assert.ok(strings.some((s) => s.includes('суточная квота хранилища исчерпана')),
+    'причина из тела ответа RPC не видна владельцу — показан голый код вместо сообщения')
+  assert.ok(!strings.some((s) => s === 'HTTP 500'), 'секция показала голый "HTTP 500" вместо тела ответа RPC')
 })
 
 test('чужой API на пути журнала (не JSON): форма ответа проверяется — громкая ошибка', async () => {

@@ -52,3 +52,7 @@ GET — список сообщений с фильтрами (status, kind, sen
 ## `POST /api/messages/process`
 
 Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — issue под GH_ISSUES_TOKEN (kind в теле issue; не задан токен или сеть — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен.
+
+## `GET /api/ready`
+
+Готовность хранилища DO SQLite (#575): реальный SQL-раундтрип (не /api/status — тот кэширован и не выполняет живой запрос на каждый вызов). 200 {ok:true} — хранилище отвечает; отказ (например, исчерпание суточной квоты rows_read/rows_written) — тот же storage_quota_exceeded/internal, что и storageErrorResponse на любом другом маршруте.

@@ -133,6 +133,21 @@ const SCHEMA = [
   // фильтрует по (status, processed_ts) — без индекса это была бы полная
   // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
   `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
+  // Готовность хранилища (#575, вторая половина «зелёный health при мёртвой
+  // морде»): одна строка (id=1) — исход ПОСЛЕДНЕГО живого SQL-раундтрипа,
+  // сделанного пульсом (см. #checkStorageReady/#tickStorageReadyAlert), и
+  // дедуп-флаг `alerted` для алертов перехода. Персистентно тем же приёмом,
+  // что pulse/retention_state выше (#269/#306): DO выгружается из памяти
+  // между тиками alarm чаще, чем сами тики случаются — счётчик «была ли уже
+  // эта авария замечена» обязан пережить пересоздание инстанса, иначе
+  // Telegram-алерт бил бы на каждый тик заново.
+  `CREATE TABLE IF NOT EXISTS storage_probe (
+     id      INTEGER PRIMARY KEY CHECK (id = 1),
+     ts      INTEGER NOT NULL,
+     ok      INTEGER NOT NULL,
+     detail  TEXT,
+     alerted INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 /**
@@ -732,6 +747,9 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "messagesProcess") {
       return this.#processMessages(request);
     }
+    if (route.name === "ready") {
+      return this.#getReady();
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
@@ -1215,6 +1233,13 @@ export class Harness extends DurableObject<Env> {
     // каждой таблицы: авария здесь не должна убить dispatch/self-update ниже.
     this.#pruneRetention(Date.now());
 
+    // Готовность хранилища (#575) — тоже сразу после успешного setAlarm, тем
+    // же доводом, что и ретеншн выше: единственный непрерывный монитор прода
+    // в этом DO не должен зависеть ни от GH_DISPATCH_TOKEN/GH_REPO, ни от
+    // TELEGRAM_BOT_TOKEN — при их отсутствии тик обязан продолжать замечать
+    // недоступность хранилища, а не молча пропускать эту гарантию.
+    this.#tickStorageReadyAlert();
+
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
     // GH_DISPATCH_TOKEN, ни от GH_REPO (п.33 спеки) — при пустом токене пульс
@@ -1457,6 +1482,93 @@ export class Harness extends DurableObject<Env> {
       },
     );
     if (!res.ok) throw new Error(`dispatch отклонён: ${res.status}`);
+  }
+
+  // ── Готовность хранилища (#575) ─────────────────────────────────────────────────────
+  //
+  // Диагноз #575: владелец видел голый HTTP 500 на журнале/плагинах, а
+  // /api/health морды (config.ts DSH_EDGE_UPDATE.healthUrl) отдавал только
+  // строку версии и хранилище вообще не трогал — оставался зелёным при
+  // мёртвой морде. #status() не годится замером готовности: он кэширован
+  // (#taskCountsCache) и не делает живой SQL-раундтрип на каждый вызов —
+  // отдельный маршрут /api/ready и делает ровно один дешёвый живой запрос.
+
+  /** Живой SQL-раундтрип: доказывает, что DO SQLite ПРЯМО СЕЙЧАС принимает
+   *  операции — то самое, что отказывает при исчерпании суточной квоты
+   *  rows_read/rows_written (classifyStorageError). `heartbeat` — всегда
+   *  существующая таблица (SCHEMA), запрос ограничен LIMIT 1 — не скан. */
+  #checkStorageReady(): { ok: boolean; detail: string | null } {
+    try {
+      this.#sql.exec("SELECT 1 FROM heartbeat LIMIT 1");
+      return { ok: true, detail: null };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`storage readiness: упал (${classifyStorageError(detail)}): ${detail}`);
+      return { ok: false, detail };
+    }
+  }
+
+  /** Маршрут GET /api/ready: тот же код ошибки хранилища (storageErrorResponse),
+   *  что и у остального API — единое место правды классификации, не вторая копия. */
+  #getReady(): Response {
+    const result = this.#checkStorageReady();
+    if (!result.ok) return storageErrorResponse(result.detail ?? "unknown");
+    return this.#json({ ok: true });
+  }
+
+  #getStorageProbe(): { ts: number; ok: boolean; detail: string | null } | null {
+    const row = this.#rows(this.#sql.exec("SELECT ts, ok, detail FROM storage_probe WHERE id = 1"))[0];
+    if (!row) return null;
+    return { ts: Number(row.ts), ok: Number(row.ok) === 1, detail: row.detail === null ? null : String(row.detail) };
+  }
+
+  #recordStorageProbe(ok: boolean, detail: string | null): void {
+    this.#sql.exec(
+      `INSERT INTO storage_probe (id, ts, ok, detail) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, ok = excluded.ok, detail = excluded.detail`,
+      Date.now(),
+      ok ? 1 : 0,
+      detail,
+    );
+  }
+
+  /**
+   * Пульс — единственный работающий 24/7 монитор готовности хранилища в этом
+   * DO (#575): деплойная канарейка (deploy-worker.yml, «Канарейка UI на
+   * проде») смотрит на живость только В МОМЕНТ деплоя, а исчерпание суточной
+   * квоты бьёт в середине дня без единого деплоя; failure-watch
+   * (scripts/orchestra/pulse_guard.py::failure_watch) смотрит на упавшие
+   * прогоны CI, а не на живой прод — квота может быть исчерпана без единого
+   * красного workflow. Алерт (best-effort, тем же #telegramApi, что решения
+   * владельца #470/#471 — новый канал не заводится) шлётся только на
+   * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам раз в 15 минут,
+   * пока квота не сбросится в 00:00 UTC.
+   */
+  #tickStorageReadyAlert(): void {
+    let previous: { ok: boolean } | null = null;
+    try {
+      previous = this.#getStorageProbe();
+    } catch (error) {
+      console.error(`storage readiness: чтение прошлого исхода упало: ${error instanceof Error ? error.message : error}`);
+    }
+    const result = this.#checkStorageReady();
+    try {
+      this.#recordStorageProbe(result.ok, result.detail);
+    } catch (error) {
+      console.error(`storage readiness: запись исхода упала: ${error instanceof Error ? error.message : error}`);
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    if (!result.ok && previous?.ok !== false) {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
+      });
+    } else if (result.ok && previous?.ok === false) {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ Хранилище журнала снова отвечает",
+      });
+    }
   }
 
   // ── Очередь задач ─────────────────────────────────────────────────────────────────
