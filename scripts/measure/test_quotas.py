@@ -243,6 +243,91 @@ def test_cf_storage_sums_stored_bytes_of_latest_date_across_namespaces(monkeypat
     assert storage_row.current == 350
 
 
+def test_cf_workers_invocations_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): CF режет group-ответы на
+    limit БЕЗ маркера обрезки (research/20) — ровно limit=10000 строк
+    неотличимо от «ровно столько и было». Мутация: убери
+    do_rows_read.check_not_truncated из этого блока в quotas.py — тест
+    покраснеет (status станет "ok" с заниженной суммой вместо "no-data")."""
+    groups = [{"sum": {"requests": 1}} for _ in range(10000)]  # ровно limit
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": groups}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "no-data"
+    assert "обрезк" in workers_row.note
+
+
+def test_cf_storage_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    groups = [{"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 1}} for _ in range(10000)]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": groups}]}}
+        return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    storage_row = next(r for r in rows if r.resource == "DO storage/аккаунт")
+    assert storage_row.status == "no-data"
+    assert "обрезк" in storage_row.note
+
+
+def test_cf_rows_metric_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        # DO rows_read data query: ровно limit=1000 строк.
+        rows_data = [{"sum": {"rowsRead": 1}} for _ in range(1000)]
+        return {"viewer": {"accounts": [{"durableObjectsPeriodicGroups": rows_data}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "обрезк" in rows_read_row.note
+
+
+def test_cf_rows_metric_query_uses_date_type_not_string(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): доказанный живым прогоном
+    do_rows_read.py шлёт `$start: Date`, не `$start: string` — тип
+    переменной здесь не был проверен ни разу. Мутация: верни `$start: string`
+    в quotas.py — этот тест покраснеет."""
+    seen = {"query": None}
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        seen["query"] = query
+        return {"viewer": {"accounts": [{"durableObjectsPeriodicGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    qz.collect_cloudflare("acct", "tok")
+    assert seen["query"] is not None
+    assert "$start: Date" in seen["query"]
+
+
 def test_cf_rows_metric_not_found_is_no_data_not_guess(monkeypatch):
     """Если интроспекция не находит поле rowsRead/rowsWritten ни в одном
     Sum/Max-типе Durable Objects — «нет данных», а не нулевая выдумка."""
@@ -477,3 +562,44 @@ def test_main_stays_green_when_escalation_reaches_at_least_one_channel(monkeypat
         lambda repo, issue, text: "Telegram: доставлен; след в #120: НЕ оставлен")
 
     assert qz.main() == 0
+
+
+def test_main_no_warning_when_only_by_design_no_data(monkeypatch, capsys):
+    """Находка AI-ревью PR #327 (третий раунд): «Actions минуты» и
+    «LLM-провайдер квота» — «нет данных» ПО ЗАМЫСЛУ на каждом прогоне, не
+    находка. Предупреждение, горящее всегда, перестаёт быть сигналом и
+    маскирует реальный «CF недоступен». Мутация: убери фильтр
+    BY_DESIGN_NO_DATA в main() — этот тест покраснеет."""
+    ok_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                     10, 5_000_000, "rows", "00:00 UTC", "ok")
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [ok_row])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [
+        qz.no_data("Actions минуты (billing)", "GitHub REST", None, "минут/мес", "безлимитно на public repo"),
+    ])
+    # collect_provider реальный — тоже by-design no-data («LLM-провайдер квота»).
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+    assert qz.main() == 0
+    captured = capsys.readouterr()
+    assert "источник(ов) без данных" not in captured.out
+
+
+def test_main_warns_on_unexpected_no_data_not_by_design(monkeypatch, capsys):
+    """Зеркало предыдущего теста: НЕОЖИДАННЫЙ no-data (например, CF схема
+    не отдала метрику) по-прежнему красит предупреждение — фильтр узкий,
+    не глушит реальные пропуски."""
+    unexpected_no_data = qz.no_data("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                                     5_000_000, "rows", "интроспекция не удалась")
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [unexpected_no_data])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [
+        qz.no_data("Actions минуты (billing)", "GitHub REST", None, "минут/мес", "безлимитно на public repo"),
+    ])
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+    assert qz.main() == 0
+    captured = capsys.readouterr()
+    assert "1 источник(ов) без данных" in captured.out

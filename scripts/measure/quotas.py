@@ -45,6 +45,16 @@ _pg_spec = importlib.util.spec_from_file_location("pulse_guard", _PG_PATH)
 pulse_guard = importlib.util.module_from_spec(_pg_spec)
 _pg_spec.loader.exec_module(pulse_guard)  # type: ignore[union-attr]
 
+# check_not_truncated — тот же класс труncации group-ответов Cloudflare, что
+# уже задокументирован и огорожен в do_rows_read.py (research/20, «Cloudflare
+# режет group-ответы на limit строк без явного маркера») — переиспользуем
+# готовую гвардию, не заводим второе место правды про тот же класс отказа
+# (находка AI-ревью PR #327, третий раунд).
+_DRR_PATH = Path(__file__).with_name("do_rows_read.py")
+_drr_spec = importlib.util.spec_from_file_location("do_rows_read", _DRR_PATH)
+do_rows_read = importlib.util.module_from_spec(_drr_spec)
+_drr_spec.loader.exec_module(do_rows_read)  # type: ignore[union-attr]
+
 CF_GRAPHQL_URL = "https://api.cloudflare.com/client/v4/graphql"
 THRESHOLD_PCT = 80.0
 
@@ -178,7 +188,11 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             {"accountTag": account_id, "start": day_start},
         )
         accounts = data["viewer"]["accounts"]
-        total = sum(item["sum"]["requests"] for acc in accounts for item in acc["workersInvocationsAdaptive"])
+        items = [item for acc in accounts for item in acc["workersInvocationsAdaptive"]]
+        # Гвардия обрезки (находка AI-ревью PR #327, третий раунд): CF режет
+        # group-ответы на limit БЕЗ маркера — see do_rows_read.check_not_truncated.
+        do_rows_read.check_not_truncated(items, limit=10000)
+        total = sum(item["sum"]["requests"] for item in items)
         rows.append(Row("Workers requests/сутки", source, total, LIMITS["cf_workers_requests_day"], "requests", reset, "ok"))
     except (RuntimeError, KeyError, TypeError) as error:
         rows.append(no_data("Workers requests/сутки", source, LIMITS["cf_workers_requests_day"], "requests", str(error)))
@@ -204,6 +218,7 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
         )
         accounts = data["viewer"]["accounts"]
         items = [item for acc in accounts for item in acc["durableObjectsStorageGroups"]]
+        do_rows_read.check_not_truncated(items, limit=10000)
         if items:
             latest_date = items[0]["dimensions"]["date"]  # orderBy date_DESC — первые строки самые свежие
             current = sum(item["max"]["storedBytes"] for item in items if item["dimensions"]["date"] == latest_date)
@@ -228,9 +243,12 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
                 rows.append(no_data(
                     label, source, LIMITS[limit_key], "rows",
                     f"поле, содержащее '{keyword}', не найдено ни в одном Sum/Max-типе "
-                    "датасетов Durable Objects через интроспекцию схемы — метрика, "
-                    "возможно, не экспонируется через GraphQL Analytics (инцидент "
-                    "#320 был замечен по письму Cloudflare, не по дашборду/API)",
+                    "датасетов Durable Objects через интроспекцию схемы В ЭТОМ ПРОГОНЕ "
+                    "(находка AI-ревью PR #327, третий раунд: метрика экспонируется — "
+                    "см. docs/research/20-cloudflare-free.md, «Замер факта: rows_read "
+                    "в проде», найдена интроспекцией и снята живым прогоном 2026-09-05 — "
+                    "если этот прогон её не находит, вероятнее временный сбой "
+                    "интроспекции или дрейф схемы, а не отсутствие метрики)",
                 ))
                 continue
             type_name, field_name = found
@@ -245,7 +263,12 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             )
             data = cf_query(
                 token,
-                f"""query($accountTag: string, $start: string) {{
+                # $start: Date — не string (находка AI-ревью PR #327, третий
+                # раунд): тот же фильтр date_geq, что и в живом проверенном
+                # do_rows_read.py::DoRowsReadRange (verbatim `$start: Date`),
+                # тип переменной там доказан живым прогоном, здесь — то же
+                # семейство датасетов Durable Objects, не гадаем заново.
+                f"""query($accountTag: string, $start: Date) {{
                     viewer {{ accounts(filter: {{accountTag: $accountTag}}) {{
                         {group_field}(limit: 1000, filter: {{date_geq: $start}}) {{
                             {agg} {{ {field_name} }}
@@ -255,7 +278,11 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
                 {"accountTag": account_id, "start": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
             )
             accounts = data["viewer"]["accounts"]
-            values = [item[agg][field_name] for acc in accounts for item in acc[group_field]]
+            items = [item for acc in accounts for item in acc[group_field]]
+            # Гвардия обрезки (та же находка): limit: 1000 может обрезаться
+            # молча так же, как limit: 10000 в остальных двух местах.
+            do_rows_read.check_not_truncated(items, limit=1000)
+            values = [item[agg][field_name] for item in items]
             total = max(values) if agg == "max" and values else sum(values)
             rows.append(Row(label, source, total, LIMITS[limit_key], "rows", reset, "ok", f"поле {field_name} в {type_name} (агрегат {agg})"))
         except (RuntimeError, KeyError, TypeError, StopIteration) as error:
@@ -412,7 +439,14 @@ def main() -> int:
     print()
 
     breached = over_threshold(rows)
-    no_data_rows = [r for r in rows if r.status == "no-data"]
+    # By-design no-data (находка AI-ревью PR #327, третий раунд): «Actions
+    # минуты» и «LLM-провайдер квота» — «нет данных» ВСЕГДА, не находка, а
+    # объявленный честный пробел (public repo безлимитен; провайдер не
+    # публикует API остатка квоты) — предупреждение, горящее на КАЖДОМ
+    # прогоне, перестаёт быть сигналом и маскирует реальный «CF недоступен».
+    # Считаем только НЕОЖИДАННЫЕ пропуски.
+    BY_DESIGN_NO_DATA = {"Actions минуты (billing)", "LLM-провайдер квота"}
+    no_data_rows = [r for r in rows if r.status == "no-data" and r.resource not in BY_DESIGN_NO_DATA]
     if no_data_rows:
         print(f"::warning::{len(no_data_rows)} источник(ов) без данных — см. колонку «Заметка» выше")
 
