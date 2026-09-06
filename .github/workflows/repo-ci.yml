@@ -500,7 +500,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/test/*.sh; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/worktree-gc scripts/git/test/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -527,6 +527,15 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pr_create_guard.py -q
+
+      # Правило удаления scripts/git/worktree-gc (#565): «живой агент» и
+      # «незакоммиченные изменения» обязаны перевешивать любые остальные
+      # факты (PR слит/закрыт, нет неотправленных коммитов) — юнит на
+      # чистой функции decide(), без git/gh (сеть не нужна).
+      - name: Тесты правила удаления scripts/git/worktree-gc (#565)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/git/test_worktree_gc.py -q
 
       # Гвардия класса #496 (статический скан «raw gh pr create вне обёртки»)
       # РАССМОТРЕНА и сознательно НЕ заведена: подстрока `gh pr create`

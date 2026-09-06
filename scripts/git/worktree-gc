@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Тонкая CLI-обёртка для единообразия с task-branch/pr-create (issue #565).
+# Вся логика — в scripts/git/worktree_gc.py (модуль, юнит-тестируется
+# напрямую импортом, см. scripts/git/test_worktree_gc.py). Использование:
+#   scripts/git/worktree-gc            # сухой прогон
+#   scripts/git/worktree-gc --apply    # реальное удаление
+set -euo pipefail
+exec python3 "$(dirname "${BASH_SOURCE[0]}")/worktree_gc.py" "$@"
