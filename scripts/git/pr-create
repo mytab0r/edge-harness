@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Единственный документированный путь открытия PR (issue #496,
+# docs/agents/PROTOCOL.md п.7) — обёртка над `gh pr create`, проксирующая
+# аргументы как есть. Читает тело (--body/--body-file, включая --body-file -
+# из stdin) и отказывает ДО вызова `gh pr create` (ничего не пушится в
+# GitHub, PR не открывается, CI не тратится), если находит директиву
+# GitHub Closes/Fixes/Resolves #N.
+#
+# Детектор — `task_ref.closing_keyword_refs` (scripts/lib/task_ref.py, #423/
+# #429): ОДНО МЕСТО ПРАВДЫ, тот же самый вызов, что и `contract_check.py`, —
+# не копия и не переизобретённый regex. Директива распознаётся семантически
+# (ключевое слово рядом с #N вне inline-код-спана/fenced-блока/HTML-
+# комментария), поэтому упоминание правила в обратных кавычках (`` `Closes
+# #413` ``) НЕ триггерит отказ — так же, как не триггерит контракт.
+#
+# Замер (2026-09-06, 06:00-12:00 UTC): 3 из 4 падений orchestra.yml (job
+# contract) — настоящие директивы («Closes #490.», «Closes #431» дважды),
+# написанные агентом по привычке из общей практики GitHub. Правило уже
+# задокументировано трижды (.github/PULL_REQUEST_TEMPLATE.md,
+# docs/agents/PROTOCOL.md п.7, промпт scripts/worker/task.sh) — и всё равно
+# нарушается, потому что агент узнаёт о запрете только из красного гейта
+# ПОСЛЕ пуша, а не в момент сборки тела PR. Эта обёртка двигает тот же
+# запрет на вход.
+#
+# Использование: то же самое, что `gh pr create` — все аргументы
+# проксируются без изменений (--title, --body/--body-file, --base, --head, …).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+body=""
+args=()
+tmp_body_file=""
+n=$#
+i=1
+while [ "$i" -le "$n" ]; do
+  arg="${!i}"
+  case "$arg" in
+    --body)
+      i=$((i + 1))
+      val="${!i}"
+      body="$val"
+      args+=("--body" "$val")
+      ;;
+    --body=*)
+      val="${arg#--body=}"
+      body="$val"
+      args+=("$arg")
+      ;;
+    --body-file)
+      i=$((i + 1))
+      file="${!i}"
+      if [ "$file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body="$(cat "$tmp_body_file")"
+        args+=("--body-file" "$tmp_body_file")
+      else
+        body="$(cat "$file")"
+        args+=("--body-file" "$file")
+      fi
+      ;;
+    --body-file=*)
+      file="${arg#--body-file=}"
+      if [ "$file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body="$(cat "$tmp_body_file")"
+        args+=("--body-file=$tmp_body_file")
+      else
+        body="$(cat "$file")"
+        args+=("$arg")
+      fi
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+if [ -n "$body" ]; then
+  # Один и тот же вызов, что contract_check.py — не второй regex рядом.
+  py_check='
+import sys
+import task_ref
+for ref in task_ref.closing_keyword_refs(sys.stdin.read()):
+    print(ref)
+'
+  offending=$(PYTHONPATH="$SCRIPT_DIR/../lib${PYTHONPATH:+:$PYTHONPATH}" python3 -c "$py_check" <<<"$body")
+  if [ -n "$offending" ]; then
+    first=$(printf '%s\n' "$offending" | head -1)
+    echo "::error::Не пиши Closes/Fixes/Resolves рядом с #N (нашёл: «$first»): задачу закрывает исполнитель ПОСЛЕ пост-мерж проверки (деплой/канарейка/E2E), приложив улики. Ссылайся на задачу просто #N." >&2
+    echo "PR НЕ создан, ничего не отправлено в GitHub." >&2
+    [ -z "$tmp_body_file" ] || rm -f "$tmp_body_file"
+    exit 1
+  fi
+fi
+
+exec gh pr create "${args[@]}"
