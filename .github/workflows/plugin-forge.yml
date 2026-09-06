@@ -350,7 +350,13 @@ jobs:
           # склонированного и запатченного файла на диске, а не дублируем.
           BUNDLE_BUDGET_SRC="apps/dsh-edge/standalone/scripts/bundle-standalone.mjs"
           [ -f "$BUNDLE_BUDGET_SRC" ] || { echo "::error::$BUNDLE_BUDGET_SRC не найден — гвардия бюджета не может прочитать порог"; exit 1; }
-          BUNDLE_BUDGET_EXPR=$(grep -oP 'DIRECT_GZIP_BUDGET_BYTES\s*=\s*\K[0-9 *_]+(?=;)' "$BUNDLE_BUDGET_SRC" | head -1)
+          # (?=;|$) — не только «;»: апстрим 0.11.1 объявляет константу без
+          # завершающей точки с запятой (`const X = 900 * 1024` + перенос
+          # строки, ASI), а прежний паттерн требовал «;» строго — гвардия
+          # слепла на КАЖДОМ прогоне форжа после бампа пина #505, хотя число
+          # читалось прежним способом на 0.8.0. Дальше по коду тот же exit 1,
+          # если апстрим когда-нибудь уберёт константу вовсе — это не снято.
+          BUNDLE_BUDGET_EXPR=$(grep -oP 'DIRECT_GZIP_BUDGET_BYTES\s*=\s*\K[0-9 *_]+(?=;|$)' "$BUNDLE_BUDGET_SRC" | head -1)
           [ -n "$BUNDLE_BUDGET_EXPR" ] || { echo "::error::не удалось прочитать DIRECT_GZIP_BUDGET_BYTES из $BUNDLE_BUDGET_SRC — апстрим переименовал/убрал константу, гвардия слепа"; exit 1; }
           BUNDLE_BUDGET_BYTES=$(( BUNDLE_BUDGET_EXPR ))
           DIRECT_WORKER="apps/dsh-edge/standalone/worker/direct/index.js"

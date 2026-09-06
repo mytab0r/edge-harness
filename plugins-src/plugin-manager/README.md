@@ -118,7 +118,11 @@ package.json не декларирует: в апстриме 0.11.1 серви�
 образцу ui-edge. Словари регистрируются в namespace `settings.harnessPlugins`
 (en/zh/ru, наборы ключей одинаковы) — не `settings.plugins`: апстрим 0.11.0
 занял это имя своим нативным плагином `dsh-client-ui-settings-plugins`
-(Plugin inventory, #518).
+(Plugin inventory, #518). Видимая метка вкладки (`nav`) — «Harness Plugins»/
+«harness 插件»/«Плагины харнеса», не просто «Plugins» (#547): апстримная
+вкладка Plugin inventory тоже подписана «Plugins», одинаковый текст на двух
+вкладках e2e-смоук (#502) не мог разобрать однозначно (Playwright strict
+mode).
 
 ## Пересборка tarball
 
