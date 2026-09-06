@@ -169,9 +169,10 @@ def main() -> int:
     # Директива — только там, где её реально распознаёт GitHub (#423, живой
     # ложноположительный случай PR #415: объяснение правила в теле красило
     # PR так же, как настоящая директива). task_ref.closing_keyword_refs —
-    # одно место правды, симметричное task_ref.declared_tasks/declares_task
-    # ниже: вырезает inline-код/fenced-код/HTML-комментарии, не привязано к
-    # началу строки (директива работает где угодно в теле).
+    # одно место правды рядом с extract_task_refs (#398: declared_tasks/
+    # declares_task удалены, номер задачи — только из имени ветки): вырезает
+    # inline-код/fenced-код/HTML-комментарии, не привязано к началу строки
+    # (директива работает где угодно в теле).
     close_refs = task_ref.closing_keyword_refs(body)
     if close_refs:
         problems.append(

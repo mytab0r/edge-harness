@@ -107,7 +107,6 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 # Значит директива = ключевое слово рядом с `#N` (через пробел/перенос
 # строки и необязательное `:`) ГДЕ УГОДНО в прозе тела, кроме inline-код-спана,
 # fenced-код-блока и HTML-комментария.
-_HTML_COMMENT_ONLY_RE = _HTML_COMMENT_RE  # тот же вырез, что и в declared_tasks
 # Fenced-блок: строка (после ≤3 пробелов отступа) из 3+ бэктиков/тильд,
 # всё до строки с ТЕМ ЖЕ (или длиннее) открывающим забором — вырезаем целиком,
 # включая примеры, которые случайно совпали бы с директивой внутри.
@@ -144,7 +143,7 @@ def closing_keyword_refs(text: str) -> list[str]:
     PR."""
     if not text:
         return []
-    prose = _HTML_COMMENT_ONLY_RE.sub("", text)
+    prose = _HTML_COMMENT_RE.sub("", text)
     prose = _FENCED_CODE_RE.sub("", prose)
     prose = _INLINE_CODE_RE.sub("", prose)
     return [" ".join(match.split()) for match in _CLOSING_KEYWORD_RE.findall(prose)]
