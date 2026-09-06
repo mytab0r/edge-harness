@@ -22,7 +22,20 @@ main — прямой пуш в main отклоняется защитой, AGEN
 Идемпотентно: второй прогон на уже причёсанной ветке не находит нарушений
 (check_unarchived_complete_changes) и ничего не коммитит.
 
-Запуск: python scripts/orchestra/archive_complete_changes.py
+Инструментарий (этот файл, repo_invariants.py) исполняется из main-дерева
+job'а — та же граблина, что #476 (`scripts/worker/task.sh`: доводка PR
+исполняет scripts/* из main, а не из ветки PR): ветка PR, созданная ДО
+появления этого файла, не содержит его вовсе, и `python scripts/orchestra/
+archive_complete_changes.py` из чекаута ветки PR упал бы «No such file or
+directory» (живой факт: прогон repo-ci.yml 34036104522 сразу после мержа
+#493/PR #500, issue #506). Поэтому REPO_ROOT — `Path.cwd()`, НЕ расположение
+этого файла: workflow обязан `cd` в linked git worktree ветки PR ПЕРЕД
+вызовом (см. .github/workflows/repo-ci.yml, job archive-fixup) и вызывать
+скрипт по абсолютному пути из main-дерева — ровно тот же приём, что
+`scripts/worker/task.sh` применяет для доводки PR (`$PR_WORKTREE`).
+
+Запуск (из целевого чекаута, cwd = дерево, которое нужно исправить):
+  cd <дерево ветки PR> && python <main>/scripts/orchestra/archive_complete_changes.py
 """
 
 import importlib.util
@@ -32,20 +45,25 @@ import sys
 from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent
-REPO_ROOT = _DIR.parents[1]
+# REPO_ROOT — cwd вызова, НЕ расположение этого файла (см. докстринг выше):
+# скрипт живёт в main-дереве job'а, а исправляет он дерево ветки PR, куда
+# workflow обязан cd'нуться перед вызовом (linked git worktree, класс #476).
+REPO_ROOT = Path.cwd()
 
 # repo_invariants.py — единственное место правды на критерий «полностью
-# отмечен и не заархивирован» (check_unarchived_complete_changes) и на путь
-# openspec/changes (OPENSPEC_CHANGES). importlib, не `import repo_invariants`
-# из sys.path — тот же приём, что использует сам repo_invariants.py для
-# pulse_guard/review_labels/task_ref/scheduler, и test_repo_invariants.py для
-# себя самого.
+# отмечен и не заархивирован» (check_unarchived_complete_changes). importlib
+# по АБСОЛЮТНОМУ пути расположения ЭТОГО файла (main-дерево, не REPO_ROOT) —
+# тот же приём, что использует сам repo_invariants.py для pulse_guard/
+# review_labels/task_ref/scheduler, и test_repo_invariants.py для себя самого.
+# OPENSPEC_CHANGES НЕ берём из repo_invariants (тот считает путь от СВОЕГО
+# расположения, т.е. main) — здесь он обязан указывать на REPO_ROOT (дерево
+# ветки PR), иначе автофикс проверял бы и правил не то дерево.
 _spec = importlib.util.spec_from_file_location("repo_invariants", _DIR / "repo_invariants.py")
 repo_invariants = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(repo_invariants)  # type: ignore[union-attr]
 
 check_unarchived_complete_changes = repo_invariants.check_unarchived_complete_changes
-OPENSPEC_CHANGES = repo_invariants.OPENSPEC_CHANGES
+OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
 _SKIP_DIRS = frozenset({".git", "node_modules"})
 
@@ -114,6 +132,14 @@ def configure_git_identity(repo_root: Path) -> None:
 
 
 def main() -> int:
+    # Регрессия #506: печатает разрешённый REPO_ROOT и выходит без git/gh —
+    # используется только тестом (см. test_repo_root_comes_from_cwd_not_
+    # from_script_location), доказывающим, что REPO_ROOT берётся из cwd
+    # вызова, а не из расположения этого файла.
+    if len(sys.argv) > 1 and sys.argv[1] == "--print-repo-root-for-test":
+        print(REPO_ROOT)
+        return 0
+
     violations = check_unarchived_complete_changes(OPENSPEC_CHANGES)
     if not violations:
         print("archive_complete_changes: нечего архивировать")

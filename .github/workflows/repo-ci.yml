@@ -628,6 +628,13 @@ jobs:
   # scripts/lib/test_dispatch_token_usage.py) пушит реальным аккаунтом —
   # required-проверки перезапускаются на свежем коммите штатно.
   archive-fixup:
+    # Гвардия класса #476/#506 (живой факт: прогон 34036104522, сразу после
+    # мержа #493, — «No such file or directory» на ветке PR старше появления
+    # archive_complete_changes.py): чекаут ЭТОГО job'а — main (инструментарий
+    # гарантированно свежий), ветка PR — отдельный linked git worktree, куда
+    # cd'аемся ПЕРЕД вызовом скрипта; сам скрипт вызывается по абсолютному
+    # пути из main-дерева ($GITHUB_WORKSPACE), а правит REPO_ROOT = cwd
+    # (см. докстринг archive_complete_changes.py) — дерево ветки PR.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -635,7 +642,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
           token: ${{ secrets.GH_PIPELINE_PAT }}
 
       - uses: actions/setup-python@v7
@@ -645,4 +651,13 @@ jobs:
       - name: Автоархивация openspec/changes с полностью выполненным tasks.md (#493)
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
-        run: python scripts/orchestra/archive_complete_changes.py
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          git fetch origin "$BRANCH"
+          PR_WORKTREE="$RUNNER_TEMP/pr-worktree"
+          rm -rf "$PR_WORKTREE"
+          git worktree add -B "$BRANCH" "$PR_WORKTREE" "origin/$BRANCH"
+          git -C "$PR_WORKTREE" branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
+          git config core.hooksPath .githooks
+          cd "$PR_WORKTREE"
+          python "$GITHUB_WORKSPACE/scripts/orchestra/archive_complete_changes.py"
