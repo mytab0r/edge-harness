@@ -280,7 +280,7 @@ function statusView(t, data, noEventsText) {
 // нибудь получит ru (каталог Language row сейчас en/zh).
 const dictionaries = {
   en: {
-    nav: "Plugins",
+    nav: "Harness Plugins",
     title: "Plugins",
     intro: "Harness plugins installed from the release manifest.",
     flagServer: "server",
@@ -307,7 +307,7 @@ const dictionaries = {
     dedupError: "Cannot check for duplicate orders",
   },
   zh: {
-    nav: "插件",
+    nav: "harness 插件",
     title: "插件",
     intro: "从发布清单安装的 harness 插件。",
     flagServer: "服务端",
@@ -334,7 +334,7 @@ const dictionaries = {
     dedupError: "无法检查重复订单",
   },
   ru: {
-    nav: "Плагины",
+    nav: "Плагины харнеса",
     title: "Плагины",
     intro: "Плагины харнеса, установленные из релизного манифеста.",
     flagServer: "сервер",
@@ -624,6 +624,15 @@ const inject = ["slots", "locale"];
 // шелла целиком (кнопка Settings переставала находиться вообще). Совпадение
 // имён — наше (плагин появился раньше апстримного одноимённого), апстрим не
 // виноват; уникальное имя снимает коллизию раз и навсегда.
+//
+// Видимая метка вкладки (dictionaries.*.nav) переименована из «Plugins» в
+// «Harness Plugins»/«harness 插件»/«Плагины харнеса» той же правкой (#547):
+// namespace-фикс убрал падение бута, но вкладка апстрима (Plugin inventory)
+// тоже называется «Plugins» — с одинаковым текстом e2e-смоук (#502) не мог
+// однозначно кликнуть нужную (Playwright strict mode: два элемента
+// getByRole('button', {name: 'Plugins'})), а владелец не отличил бы вкладки
+// на глаз. title внутри панели не трогаем — там уже ясно, что это манифест
+// харнеса (intro).
 function apply(ctx) {
   ctx.effect(
     () => ctx.locale.register("settings.harnessPlugins", dictionaries),
