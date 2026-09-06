@@ -258,7 +258,14 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             values = [item[agg][field_name] for acc in accounts for item in acc[group_field]]
             total = max(values) if agg == "max" and values else sum(values)
             rows.append(Row(label, source, total, LIMITS[limit_key], "rows", reset, "ok", f"поле {field_name} в {type_name} (агрегат {agg})"))
-        except (RuntimeError, KeyError, TypeError) as error:
+        except (RuntimeError, KeyError, TypeError, StopIteration) as error:
+            # StopIteration — находка AI-ревью PR #327: `next()` без дефолта
+            # выше бросает её, когда интроспекция нашла Sum/Max-тип с полем
+            # rowsread/rowswritten, но имя типа не содержит ни один из
+            # четырёх захардкоженных групп-датасетов — ровно момент, когда
+            # CF заведёт пятый DO-датасет и метрика появится в схеме, main()
+            # не должен падать целиком именно тогда, когда появились новые
+            # данные.
             rows.append(no_data(label, source, LIMITS[limit_key], "rows", f"интроспекция или запрос данных упали: {error}"))
 
     return rows
@@ -339,7 +346,11 @@ def collect_github(repo: str) -> list[Row]:
 
 
 def provider_no_quota_api_reason() -> str:
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "не задан в окружении")
+    # GitHub Actions кладёт в env ПУСТУЮ строку для незаданного `vars.*`, не
+    # отсутствие ключа — `.get(..., default)` тут не срабатывает никогда
+    # (находка AI-ревью PR #327): без `or` причина печаталась бы как
+    # «по vars.DEEPSEEK_BASE_URL ()» вместо честного «не задан в окружении».
+    base_url = os.environ.get("DEEPSEEK_BASE_URL") or "не задан в окружении"
     return (
         f"Провайдер по vars.DEEPSEEK_BASE_URL ({base_url}) не публикует "
         "документированный REST-эндпоинт остатка квоты (проверено 2026-09-05 "

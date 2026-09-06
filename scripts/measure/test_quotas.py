@@ -320,6 +320,33 @@ def test_cf_rows_metric_search_failure_is_no_data_not_crash(monkeypatch):
     assert "упали" in rows_read_row.note
 
 
+def test_cf_rows_metric_unknown_fifth_dataset_is_no_data_not_crash(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): find_row_metric находит поле
+    rowsRead в Sum/Max-типе, чьё имя содержит 'durableobjects' (проходит
+    фильтр find_row_metric), но НЕ содержит ни одно из четырёх захардкоженных
+    имён групп-датасетов, которые collect_cloudflare перечисляет для выбора
+    group_field — ровно момент, когда CF заведёт пятый DO-датасет. Раньше
+    `next()` без дефолта бросал StopIteration, не пойманную ни одним except,
+    и ронял collect_cloudflare целиком (доказано мутацией: убери StopIteration
+    из кортежа except — этот тест краснеет TypeError/StopIteration наружу)."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsFooBarGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": [{"sum": {"requests": 5}}]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")  # не должно бросить наружу
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "ok"  # строка выше по коду не потеряна
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "упали" in rows_read_row.note
+
+
 def test_cf_rows_metric_aggregation_picked_by_type_suffix(monkeypatch):
     """Находка 1: агрегация — по суффиксу типа (Sum→sum, Max→max), не
     захардкожена как "sum" — найденное в Max-типе поле иначе не пройдёт
@@ -362,6 +389,19 @@ def test_provider_reports_no_quota_api_with_reason():
     assert len(rows) == 1
     assert rows[0].status == "no-data"
     assert "RATE_LIMIT" in rows[0].note
+
+
+def test_provider_reason_handles_empty_string_var_not_just_missing_key(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): GitHub Actions кладёт в env
+    ПУСТУЮ СТРОКУ для незаданного `vars.*` (`DEEPSEEK_BASE_URL: ${{ vars.
+    DEEPSEEK_BASE_URL }}` в quotas.yml), а не отсутствие ключа —
+    `os.environ.get(key, default)` в этом случае возвращает "", не default.
+    Мутация: верни `.get("DEEPSEEK_BASE_URL", "не задан в окружении")` без
+    `or` — этот тест покраснеет (в note появятся пустые скобки)."""
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "")
+    reason = qz.provider_no_quota_api_reason()
+    assert "не задан в окружении" in reason
+    assert "()" not in reason
 
 
 # ── main(): связка «порог → эскалация» (находка 3, ревью PR #327) ───────────
