@@ -165,6 +165,22 @@ describe('provider-registry: добавление провайдера (как C
     assert.deepEqual(models.map((m) => m.id), ['glm-4.6']);
   });
 
+  it('partial-профиль catalog-маршрута без displayName зовётся ОДИНАКОВО в пикере и directory', async () => {
+    // Находка ревью PR #453, п.4: registerRoute (пикер) и directoryEntries
+    // (Settings) считали фолбэк имени независимо и расходились — profile
+    // без displayName для catalog-route (zhipu) давал «Z.ai (GLM)» в
+    // directory (из directory.json), но голый route «zhipu» в пикере.
+    const ctx = await mountMordre();
+    const { displayName: _omit, ...partial } = ZHIPU_PROFILE;
+    await ctx.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'zhipu'], value: partial },
+    ], undefined);
+    const group = ctx.llm.listProviders().find((p) => p.id === 'zhipu');
+    const entry = ctx.llm.listConfigurableProviders().find((e) => e.provider === 'zhipu');
+    assert.equal(group.name, 'Z.ai (GLM)', 'пикер обязан взять имя из directory.json, не голый route');
+    assert.equal(entry.displayName, group.name, 'directory и пикер обязаны звать маршрут одинаково');
+  });
+
   it('произвольный маршрут появляется в directory с declared (строка и Remove живы)', async () => {
     const ctx = await mountMordre();
     await ctx.settings.mutate('llm-pi-ai', [
@@ -207,17 +223,25 @@ describe('provider-registry: добавление провайдера (как C
 });
 
 describe('provider-registry: негатив — мусор не проходит и не роняет морду', () => {
-  const rejected = async (route, value) => {
+  // messagePattern сужает проверку до КОНКРЕТНОЙ причины отказа (по умолчанию —
+  // общий префикс модуля). Находка ревью PR #453, п.3: тестовый профиль ниже
+  // не несёт apiKeyEnv — общая `/provider-registry/` осталась бы зелёной и на
+  // СОВСЕМ ДРУГОМ отказе (отсутствие apiKeyEnv, тоже throw с этим префиксом),
+  // если гвардию коллизии с deepseek-official вообще убрать.
+  const rejected = async (route, value, messagePattern = /provider-registry/) => {
     const ctx = await mountMordre();
     await assert.rejects(
       () => ctx.settings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', route], value }], undefined),
-      (error) => error instanceof Error && error.message.includes('provider-registry'),
+      (error) => error instanceof Error && messagePattern.test(error.message),
     );
     return ctx;
   };
 
   it('маршрут deepseek-official занят штатным провайдером', async () => {
-    await rejected('deepseek-official', { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] });
+    await rejected(
+      'deepseek-official', { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] },
+      /занят штатным/,
+    );
   });
 
   it('baseURL не-http(s) отказан при записи (ошибка видна в Settings)', async () => {

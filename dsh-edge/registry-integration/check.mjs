@@ -211,7 +211,12 @@ const ZHIPU_PROFILE = {
       ops: [{ op: 'set', path: ['providers', 'deepseek-official'], value: { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] } }],
     })
     assert.equal(reserved.result.ok, false, 'маршрут deepseek-official занят — запись отказана')
-    assert.match(String(reserved.result.error?.message ?? ''), /provider-registry/)
+    // Находка ревью PR #453, п.3: тестовый профиль без apiKeyEnv — общая
+    // проверка `/provider-registry/` пройдёт зелёной и на СОВСЕМ ДРУГОМ отказе
+    // (отсутствие apiKeyEnv, тоже throw с этим префиксом), если гвардию
+    // коллизии с deepseek-official вообще убрать — точная подстрока доказывает,
+    // что отказала именно она.
+    assert.match(String(reserved.result.error?.message ?? ''), /занят штатным/)
 
     // Негатив при записи: кривой baseURL отказан, морда жива.
     const bad = await rpc('settings.mutate', {

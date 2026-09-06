@@ -49,6 +49,24 @@ const DEFAULT_CONTEXT_WINDOW = 262144
  * интеграционная проверка и канарейка деплоя (не дублируют список). */
 import DIRECTORY from '../directory.json' with { type: 'json' }
 
+const DIRECTORY_BY_ROUTE = new Map(DIRECTORY.map(item => [item.route, item]))
+
+/**
+ * Единственный резолвер отображаемого имени маршрута (находка ревью PR #453,
+ * п.4): раньше пикер моделей (registerRoute) и directory (directoryEntries)
+ * считали фолбэк независимо и расходились — частичный профиль catalog-маршрута
+ * без displayName давал имя из directory.json в Settings, но голый route в
+ * пикере (`zhipu` вместо «Z.ai (GLM)»). Порядок: явный displayName записи →
+ * displayName из directory.json (если маршрут — известный catalog-route) →
+ * сам route.
+ */
+function resolveDisplayName(route, source) {
+  if (typeof source?.displayName === 'string' && source.displayName.length > 0) return source.displayName
+  const catalogItem = DIRECTORY_BY_ROUTE.get(route)
+  if (catalogItem !== undefined) return catalogItem.displayName
+  return route
+}
+
 /** Единственный протокол, который реально говорит переиспользуемый транспорт. */
 const PROTOCOLS = ['openai-completions']
 
@@ -204,9 +222,7 @@ export default {
       const options = routeOptions(route)
       // Первый resolve обязан пройти: маршрут без baseURL не регистрируется.
       options()
-      const displayName = typeof source.displayName === 'string' && source.displayName.length > 0
-        ? source.displayName
-        : route
+      const displayName = resolveDisplayName(route, source)
       // Группа провайдера в пикере моделей зовётся именем записи, а не
       // «DeepSeek» (providerInfo апстримного класса зашит на своё имя).
       class RegistryAdapter extends DeepSeekAdapter {
@@ -250,9 +266,7 @@ export default {
         const source = providers[item.route]
         entries.set(item.route, {
           provider: item.route,
-          displayName: source !== undefined && typeof source.displayName === 'string' && source.displayName.length > 0
-            ? source.displayName
-            : item.displayName,
+          displayName: resolveDisplayName(item.route, source),
           settingsNs: NS,
           settingsPath: ['providers', item.route],
         })
@@ -261,7 +275,7 @@ export default {
         if (entries.has(route)) continue
         entries.set(route, {
           provider: route,
-          displayName: typeof source.displayName === 'string' && source.displayName.length > 0 ? source.displayName : route,
+          displayName: resolveDisplayName(route, source),
           settingsNs: NS,
           settingsPath: ['providers', route],
           declared: true,
