@@ -192,6 +192,23 @@ _tr_spec = importlib.util.spec_from_file_location(
 task_ref = importlib.util.module_from_spec(_tr_spec)
 _tr_spec.loader.exec_module(task_ref)
 
+# Приоритет выбора свободной задачи (#361) — одно место правды в
+# scripts/lib/free_task.py, ЧИТАЕТСЯ здесь, не переписывается локальной
+# сортировкой по номеру (та была вторым местом правды до этого change —
+# dispatch_worker ниже утверждал «та же задача, которую выберет oldest_free»,
+# сам сортируя по номеру мимо приоритета). task_deps — граф блокировок
+# (blockedBy/blocking), тот же источник, что использует
+# scripts/worker/task.sh при реальном выборе.
+_ft_spec = importlib.util.spec_from_file_location(
+    "free_task", Path(__file__).resolve().parents[1] / "lib" / "free_task.py")
+free_task = importlib.util.module_from_spec(_ft_spec)
+_ft_spec.loader.exec_module(free_task)
+
+_td_spec = importlib.util.spec_from_file_location(
+    "task_deps", Path(__file__).resolve().parents[1] / "lib" / "task_deps.py")
+task_deps = importlib.util.module_from_spec(_td_spec)
+_td_spec.loader.exec_module(task_deps)
+
 STALE_HOURS = 24
 TASK_LABEL = "task"
 # Одно место правды — review_labels.py (см. should_update_branch там же,
@@ -1618,30 +1635,40 @@ def dispatch_worker(repo: str, pool: list[dict]) -> tuple[list[str], list[str]]:
     действие этого прогона."""
     observations: list[str] = []
     actions: list[str] = []
-    # Старейшая свободная — та же, которую воркер выберет oldest_free
-    # (scripts/lib/free_task.py, #245): issues API отдаёт пул по убыванию
-    # новизны, и без сортировки строка отчёта называла бы свежайшую задачу,
-    # а не ту, которую воркер фактически возьмёт. Замки здесь не фильтруются —
-    # это делает сам воркер на claim'е (#121).
-    free = sorted(
-        (issue for issue in pool if not issue["assignees"]),
-        key=lambda issue: issue["number"],
-    )
-    if not free:
+    # Есть ли ХОТЬ ОДНА свободная — дешёвая проверка на уже полученном
+    # REST-пуле (assignees приходит с ним бесплатно, лишнего запроса не надо).
+    if not free_task.free_candidates(pool):
         return observations, actions
     try:
         if worker_runs_active(repo):
             observations.append("👷 воркер уже работает — dispatch не нужен")
             return observations, actions
+        # Имя задачи в отчёте — та же функция приоритета (#361), что реально
+        # использует scripts/worker/task.sh (scripts/lib/free_task.py), не
+        # локальная сортировка по номеру мимо неё (была вторым местом правды
+        # до этого change). Полный приоритет (мета → блокирует открытых →
+        # номер) требует графа блокировок — GraphQL, отдельный от REST-пула
+        # запрос; сбой ЭТОГО дополнительного запроса не должен останавливать
+        # сам dispatch — деградирует до приоритета по REST-пулу (мета+номер,
+        # без графа), видимым предупреждением, не молча и не падением.
+        try:
+            named_pool = task_deps.fetch_pool(repo, gh_call=gh)
+        except Exception as error:  # noqa: BLE001 — деградация к REST-пулу, не падение пульса
+            observations.append(f"⚠️ граф блокировок недоступен для отчёта (не критично): {error}")
+            named_pool = pool
+        candidates = free_task.prioritized_free(named_pool)
         gh(
             "-X", "POST",
             f"repos/{repo}/actions/workflows/worker.yml/dispatches",
             "-f", "ref=main",
         )
-        actions.append(
-            f"👷 свободная задача #{free[0]['number']} — worker.yml запущен "
-            "(воркер сам назначится и откроет PR)"
-        )
+        if candidates:
+            actions.append(
+                f"👷 свободная задача #{candidates[0]['number']} — worker.yml запущен "
+                "(воркер сам назначится и откроет PR)"
+            )
+        else:
+            actions.append("👷 worker.yml запущен (воркер сам назначится и откроет PR)")
     except RuntimeError as error:
         actions.append(f"⚠️ dispatch воркера не удался (не критично): {error}")
     return observations, actions

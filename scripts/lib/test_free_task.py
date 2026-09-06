@@ -37,11 +37,17 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("free_task.py")
 spec = importlib.util.spec_from_file_location("free_task", SCRIPT)
 free_task = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(free_task)  # type: ignore[union-attr]
+
+TASK_DEPS_SCRIPT = Path(__file__).with_name("task_deps.py")
+_td_spec = importlib.util.spec_from_file_location("task_deps", TASK_DEPS_SCRIPT)
+task_deps = importlib.util.module_from_spec(_td_spec)
+_td_spec.loader.exec_module(task_deps)  # type: ignore[union-attr]
 
 
 # ── Прод-форма: реальное тело PR #181 (gh pr view 181 --json body), ────────────────
@@ -73,8 +79,16 @@ PR_181_BODY = (
 PR_181 = {"number": 181, "headRefName": "agent/179-white-spot-in-pool", "body": PR_181_BODY}
 
 
-def issue(number, title="задача", assignees=None, labels=None):
-    result = {"number": number, "title": title, "assignees": [{"login": a} for a in (assignees or [])]}
+def issue(number, title="задача", assignees=None, labels=None, blocking_open=0):
+    # labels отсутствует в результате, когда не передан явно (не пустой
+    # список) — воспроизводит REST-форму без ключа labels вовсе, на которую
+    # опирается test_free_candidates_keeps_issue_without_labels_key.
+    result = {
+        "number": number,
+        "title": title,
+        "assignees": [{"login": a} for a in (assignees or [])],
+        "blocking_open": blocking_open,
+    }
     if labels is not None:
         result["labels"] = [{"name": name} for name in labels]
     return result
@@ -83,17 +97,154 @@ def issue(number, title="задача", assignees=None, labels=None):
 # ── free_candidates / oldest_free: assignees, замок, waiting:owner ─────────────────
 
 
-def test_free_candidates_excludes_assigned_and_sorts_by_number():
+def test_free_candidates_excludes_assigned_is_a_filter_not_a_sort():
+    # free_candidates — только фильтр (#361): сортировку по приоритету делает
+    # prioritized_free/oldest_free, не эта функция (иначе порядок задавался
+    # бы в двух местах).
     issues = [issue(233, assignees=[]), issue(90, assignees=["someone"]), issue(43, assignees=[])]
-    result = [i["number"] for i in free_task.free_candidates(issues)]
-    assert result == [43, 233]  # 90 исключена (есть исполнитель), сортировка по номеру
+    result = {i["number"] for i in free_task.free_candidates(issues)}
+    assert result == {43, 233}  # 90 исключена (есть исполнитель)
 
 
 def test_oldest_free_picks_lowest_number_not_newest():
     # issues API отдаёт по убыванию новизны — без сортировки воркер брал бы
-    # свежайшую задачу (косметику), а не старейшую в пуле.
+    # свежайшую задачу (косметику), а не старейшую в пуле. Без меты/графа
+    # (#361) уровень 3 (номер) — единственный отличающий уровень.
     issues = [issue(240, assignees=[]), issue(43, assignees=[]), issue(158, assignees=[])]
     assert free_task.oldest_free(issues)["number"] == 43
+
+
+# ── Приоритет #361: три уровня, в этом порядке ──────────────────────────────
+
+
+def test_level1_meta_label_wins_regardless_of_blocking_count():
+    meta = issue(100, labels=["area:process"], blocking_open=0)
+    applied = issue(50, blocking_open=10)  # блокирует больше, но не мета
+    result = free_task.prioritized_free([applied, meta])
+    assert [i["number"] for i in result] == [100, 50]
+
+
+def test_level2_blocking_count_orders_within_same_meta_level():
+    blocks_many = issue(200, blocking_open=5)
+    blocks_none = issue(150, blocking_open=0)
+    result = free_task.prioritized_free([blocks_none, blocks_many])
+    assert [i["number"] for i in result] == [200, 150]
+
+
+def test_level3_number_is_tiebreak_when_meta_and_blocking_tie():
+    older = issue(50, blocking_open=2)
+    newer = issue(90, blocking_open=2)
+    result = free_task.prioritized_free([newer, older])
+    assert [i["number"] for i in result] == [50, 90]
+
+
+def test_mixed_meta_with_one_blocked_beats_applied_with_ten():
+    # Ровно кейс, названный владельцем: мета с одним блокируемым обгоняет
+    # прикладную с десятью — мета-уровень решает раньше числа блокируемых.
+    meta_light = issue(300, labels=["area:process"], blocking_open=1)
+    applied_heavy = issue(10, blocking_open=10)
+    result = free_task.prioritized_free([applied_heavy, meta_light])
+    assert [i["number"] for i in result] == [300, 10]
+
+
+def test_graph_is_empty_true_when_nobody_blocks_and_nobody_is_meta():
+    issues = [issue(1), issue(2), issue(3)]
+    assert free_task.graph_is_empty(issues) is True
+
+
+def test_graph_is_empty_false_when_one_candidate_blocks_something():
+    issues = [issue(1, blocking_open=1), issue(2)]
+    assert free_task.graph_is_empty(issues) is False
+
+
+def test_graph_is_empty_false_when_one_candidate_is_meta():
+    issues = [issue(1, labels=["area:process"]), issue(2)]
+    assert free_task.graph_is_empty(issues) is False
+
+
+def test_cli_warns_on_stderr_when_graph_empty(tmp_path):
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text(json.dumps([issue(43, title="т")]), encoding="utf-8")
+    result = run_cli(["oldest-free", str(issues_file)])
+    assert result.returncode == 0
+    assert result.stdout.strip() == "43\tт"
+    assert "граф блокировок пуст" in result.stderr
+
+
+def test_cli_silent_when_graph_has_signal(tmp_path):
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text(
+        json.dumps([issue(43, title="т", blocking_open=1)]), encoding="utf-8",
+    )
+    result = run_cli(["oldest-free", str(issues_file)])
+    assert result.returncode == 0
+    assert "граф блокировок пуст" not in result.stderr
+
+
+def _pool_page(blocker_edges):
+    """Форма ответа GraphQL `task_deps._POOL_QUERY_TMPL` с двумя задачами:
+    #10 (блокирует узлы `blocker_edges`) и контрольная #20 (блокирует 2
+    открытых, не меняется по ходу теста)."""
+    return {
+        "repository": {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {
+                        "number": 10, "title": "блокирующая",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []},
+                        "blockedBy": {"totalCount": 0, "nodes": []},
+                        "blocking": {
+                            "totalCount": len(blocker_edges),
+                            "nodes": [{"number": n, "state": s} for n, s in blocker_edges],
+                        },
+                    },
+                    {
+                        "number": 20, "title": "контрольная",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []},
+                        "blockedBy": {"totalCount": 0, "nodes": []},
+                        "blocking": {"totalCount": 2, "nodes": [
+                            {"number": 200, "state": "OPEN"},
+                            {"number": 201, "state": "OPEN"},
+                        ]},
+                    },
+                ],
+            }
+        }
+    }
+
+
+def test_mutation_closing_blocked_issues_flips_priority_order_next_run():
+    # Авто-возврат (#361, п.5): "blocking_open" — живой пересчёт (сколько
+    # ОТКРЫТЫХ задач блокирует эта СЕЙЧАС), не кэш и не метка, которую надо
+    # снимать руками. Прогнано через прод-цепочку целиком: task_deps.fetch_pool
+    # (GraphQL, monkeypatch subprocess — тот же приём, что test_task_deps.py) ->
+    # free_task.prioritized_free, а не пересчёт локальной копией формулы.
+    edges_before = [(90, "OPEN"), (91, "OPEN"), (92, "OPEN")]
+    edges_after = [(90, "CLOSED"), (91, "CLOSED"), (92, "OPEN")]  # 2 из 3 закрылись
+
+    def gh_call_before(*args):
+        assert args[0] == "graphql"
+        return {"data": _pool_page(edges_before)}
+
+    def gh_call_after(*args):
+        assert args[0] == "graphql"
+        return {"data": _pool_page(edges_after)}
+
+    # ДО закрытия: #10 блокирует больше открытых (3 > 2) — выбирается первым.
+    pool_before = task_deps.fetch_pool("owner/repo", gh_call=gh_call_before)
+    assert [i["number"] for i in pool_before] == [10, 20]
+    assert pool_before[0]["blocking_open"] == 3
+    assert free_task.prioritized_free(pool_before)[0]["number"] == 10
+
+    # Мутация: две из трёх блокируемых задачами #10 закрылись — следующий
+    # прогон `fetch_pool` (не ручная правка поля) видит счётчик 1 < 2.
+    pool_after = task_deps.fetch_pool("owner/repo", gh_call=gh_call_after)
+    assert pool_after[0]["blocking_open"] == 1
+
+    # ПОСЛЕ: #10 блокирует меньше, чем #20 (1 < 2) — порядок ПЕРЕВОРАЧИВАЕТСЯ,
+    # без правки кода/метки/ручного вмешательства — только следующий пересчёт.
+    assert free_task.prioritized_free(pool_after)[0]["number"] == 20
 
 
 def test_oldest_free_empty_pool_is_none():
