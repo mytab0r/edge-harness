@@ -567,6 +567,29 @@ def post_commit_status(repo: str, sha: str, context: str, state: str,
     run_gh_func(*args)
 
 
+def status_posted_at(repo: str, sha: str, context: str, gh_func) -> str | None:
+    """Момент (сырая ISO-строка, парсинг — дело вызывающего кода: не заводим
+    здесь зависимость от pulse_guard.parse_time) последней публикации commit
+    status `context` на точном `sha` — якорь для таймеров #196/#269, который
+    НЕ зависит от идемпотентности меток (находка ревью #424): `check_pr.py`/
+    `ai_review.py` публикуют `harness/review`/`harness/ai-review` КАЖДЫМ
+    прогоном безусловно (#345, второй канал вердикта для required status
+    checks), даже когда вердикт не изменился и `labeled`-событие с #203 не
+    выбрасывается вовсе. Раньше scheduler.last_gate1_labeled_at и
+    repo_invariants.last_gate1_labeled_at (две независимые копии одной
+    логики, уже расходившиеся дважды — #303, #432) читали таймлайн на
+    `labeled`; тот сигнал заморожен на первой простановке метки после #203 —
+    один и тот же сигнал для обеих копий закрывает класс дупликации заодно
+    с классом протухшего якоря.
+
+    `GET /repos/{repo}/commits/{sha}/statuses` — короткий список (обычно
+    считаные context'ы на коммит), пагинация #308 избыточна.
+    None — этот context на этом sha не публиковался вовсе."""
+    statuses = gh_func(f"repos/{repo}/commits/{sha}/statuses?per_page=100")
+    posted = [s["created_at"] for s in statuses if s.get("context") == context]
+    return max(posted) if posted else None
+
+
 def review_status_state(verdict: str) -> str:
     """Состояние статуса гейта 1 по вердикт-метке (REVIEW_OK/REVIEW_CHANGES/
     REVIEW_LARGE) — success только при REVIEW_OK, ровно тот же порог, что

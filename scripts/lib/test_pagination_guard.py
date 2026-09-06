@@ -102,6 +102,12 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "check-runs ОДНОГО коммита (head_sha) — тот же контракт, что "
         "pr_check_runs выше: фиксированный малый список обязательных "
         "проверок этого репозитория, не растущий список.",
+    ("scripts/lib/review_labels.py", "status_posted_at"):
+        "commit status'ы ОДНОГО коммита (sha) — GitHub возвращает статусы "
+        "как отдельные записи по каждому POST на этот sha, но контекстов на "
+        "проект фиксированное малое число (harness/review, harness/ai-review, "
+        "#345) — тот же контракт, что pr_check_runs/script_evidence выше: не "
+        "растущий пользователем список.",
 }
 
 

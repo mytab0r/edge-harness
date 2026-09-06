@@ -8,12 +8,22 @@
 `orchestra.yml` (on: pull_request: [labeled]) = один прогон job'а contract.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
+
+# review_labels.list_pages/list_timeline — одно место правды для обхода
+# страниц GitHub API (#308): четвёртая копия того же цикла здесь была бы
+# рецидивом класса, который #308 уже закрыл (находка ревью #424).
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)
 
 
 def gh(url: str):
@@ -24,30 +34,16 @@ def gh(url: str):
     return json.loads(result.stdout)
 
 
-def paged(url: str):
-    page = 1
-    items = []
-    while True:
-        chunk = gh(f"{url}{'&' if '?' in url else '?'}per_page=100&page={page}")
-        if not isinstance(chunk, list) or not chunk:
-            break
-        items.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return items
-
-
 def main() -> int:
     since = datetime.fromisoformat(sys.argv[1]).replace(tzinfo=timezone.utc)
     until = datetime.fromisoformat(sys.argv[2]).replace(tzinfo=timezone.utc)
     repo = os.environ["GITHUB_REPOSITORY"]
-    pulls = paged(f"repos/{repo}/pulls?state=open")
+    pulls = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     print(f"открытых PR: {len(pulls)}", file=sys.stderr)
     labeled = Counter()
     unlabeled = Counter()
     for pull in pulls:
-        for event in paged(f"repos/{repo}/issues/{pull['number']}/timeline"):
+        for event in review_labels.list_timeline(repo, pull["number"], gh):
             if event.get("event") not in ("labeled", "unlabeled"):
                 continue
             created = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00"))

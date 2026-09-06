@@ -625,6 +625,37 @@ def test_post_commit_status_truncates_description_to_140_chars():
     assert len(description_arg) == len("description=") + 140
 
 
+def test_status_posted_at_returns_latest_created_at_for_context():
+    # Находка ревью #424: якорь таймеров #196/#269 переведён с таймлайн-
+    # события "labeled" (замороженного идемпотентностью #203) на commit
+    # status, публикуемый каждым прогоном безусловно.
+    statuses = [
+        {"context": "harness/ai-review", "created_at": "2026-09-01T00:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-02T10:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-01T09:00:00Z"},  # старее — не должен победить
+    ]
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_REVIEW, lambda url: statuses)
+    assert result == "2026-09-02T10:00:00Z"
+
+
+def test_status_posted_at_none_when_context_never_posted():
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_AI_REVIEW, lambda url: [])
+    assert result is None
+
+
+def test_status_posted_at_reads_exact_sha_url():
+    calls = []
+
+    def fake_gh(url):
+        calls.append(url)
+        return []
+
+    review_labels.status_posted_at("owner/repo", "deadbeef", review_labels.STATUS_REVIEW, fake_gh)
+    assert calls == ["repos/owner/repo/commits/deadbeef/statuses?per_page=100"]
+
+
 def test_run_target_url_none_without_actions_env(monkeypatch):
     monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)

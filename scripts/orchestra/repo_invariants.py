@@ -311,19 +311,6 @@ def check_reopened_after_merge(repo: str, open_tasks: list[dict], merged_pulls: 
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def gate1_anchor(timeline: list[dict]) -> datetime | None:
-    """Момент последней простановки вердикта гейта 1 (review:ok ИЛИ
-    review:large — review_labels.GATE1_LABELS, #432) из уже загруженного
-    таймлайна — чистая функция, чтобы last_ai_verdict_ever ниже читала ТОТ ЖЕ
-    таймлайн без второго запроса (#472)."""
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
-    ]
-    return parse_time(max(labeled_at)) if labeled_at else None
-
-
 def last_ai_verdict_ever(timeline: list[dict]) -> tuple[str, datetime] | None:
     """Последний по времени вердикт ai:* (labeled), КОГДА-ЛИБО поставленный на
     PR — может относиться к уже ЗАКРЫТОЙ эпохе гейта 1, если после него гейт 1
@@ -345,19 +332,22 @@ def last_ai_verdict_ever(timeline: list[dict]) -> tuple[str, datetime] | None:
     return name, parse_time(when)
 
 
-def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """IO-обвязка над gate1_anchor — весь таймлайн через
-    review_labels.list_timeline, не сырая первая страница `per_page=100`
-    (находка AI-ревью PR #249: у долгоживущего PR, который сам же разгоняют
-    авто-повторы #196, событие `labeled` уезжает за первую сотню — сырой
-    вызов возвращал None и застрявший гейт молча пропускался, ровно тот
-    класс, который #303 уже закрыл для scheduler.last_gate1_labeled_at той же
-    функцией; копия здесь была рассинхронизирована с исправлением — и снова
-    разошлась на #432, только на смотрящей метке, не на пагинации: старая
-    версия смотрела ТОЛЬКО на review:ok, поэтому PR с review:large и без
-    единой ai:*-метки был невидим этому инварианту тем же классом, каким
-    scheduler.trigger_ai_review был невидим PR #412)."""
-    return gate1_anchor(review_labels.list_timeline(repo, pr_number, gh))
+def last_gate1_labeled_at(repo: str, pull: dict) -> datetime | None:
+    """Момент публикации commit status `harness/review` на ТЕКУЩЕМ head PR
+    (review_labels.status_posted_at, #345) — одно место правды со
+    scheduler.last_gate1_labeled_at (находка ревью #424): эта функция раньше
+    была НЕЗАВИСИМОЙ копией той же логики на таймлайн-событии "labeled" и
+    уже расходилась с оригиналом дважды (#303 — пагинация, #432 — какая
+    метка гейта 1 смотрится); третье расхождение (идемпотентность меток
+    #203 заморозила "labeled" на первой простановке) чинится тем же
+    прод-сигналом для обеих сторон сразу, а не третьей копией фикса.
+    `check_pr.py` публикует `harness/review` каждым прогоном безусловно
+    (#345), поэтому сигнал не зависит от того, переставилась метка или нет.
+
+    None — статус `harness/review` на этом head не публиковался вовсе."""
+    posted = review_labels.status_posted_at(
+        repo, pull["head"]["sha"], review_labels.STATUS_REVIEW, gh)
+    return parse_time(posted) if posted else None
 
 
 def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
@@ -406,13 +396,13 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
         labels = {label["name"] for label in pull["labels"]}
         if not review_labels.gate1_decided(labels) or labels & ai_labels:
             continue
-        timeline = review_labels.list_timeline(repo, pull["number"], gh)
-        anchor = gate1_anchor(timeline)
+        anchor = last_gate1_labeled_at(repo, pull)
         if anchor is None:
             continue
         age = minutes_between(anchor, now)
         if age <= UNHEALTHY_PR_AFTER_MINUTES:
             continue
+        timeline = review_labels.list_timeline(repo, pull["number"], gh)
         verdict_ever = last_ai_verdict_ever(timeline)
         violations.append({
             "pr": pull["number"],
