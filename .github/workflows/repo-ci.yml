@@ -805,6 +805,13 @@ jobs:
       - name: Smoke issue-create — похожий заголовок отклоняется до вызова gh (#566)
         run: bash scripts/gh/test/issue-create-duplicate-guard.test.sh
 
+      # Проверка на входе в scripts/gh/issue-create (#570): улика дефекта в
+      # ТЕЛЕ новой issue (путь/номер прогона/ссылка/дословная цитата ```)
+      # совпадает с ОТКРЫТОЙ или ЗАКРЫТОЙ задачей пула — отклоняется ДО
+      # вызова `gh issue create`; тот же газ `--confirm-not-duplicate`.
+      - name: Smoke issue-create — дедупликация по уликам в теле (#570)
+        run: bash scripts/gh/test/issue-create-evidence-guard.test.sh
+
       # Третий тормоз того же issue-create (#695): решение о приоритете
       # (area:process) обязано быть явным — метка или --not-process-ack,
       # иначе отказ ДО вызова `gh issue create`; верх группы приоритета

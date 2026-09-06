@@ -122,6 +122,7 @@ class Candidate(TypedDict):
 
 class Match(Candidate):
     score: float
+    reason: str
 
 
 def find_similar_open_tasks(
@@ -136,7 +137,180 @@ def find_similar_open_tasks(
     for candidate in candidates:
         score = jaccard(query, tokenize(candidate.get("title", "")))
         if score >= threshold:
-            matches.append({**candidate, "score": score})  # type: ignore[typeddict-item]
+            matches.append({**candidate, "score": score, "reason": "похожесть заголовка"})  # type: ignore[typeddict-item]
+    return sorted(matches, key=lambda match: match["score"], reverse=True)
+
+
+# ── Второй слой (#570): улики в ТЕЛЕ issue, не в заголовке ───────────────────
+#
+# Идея: лексика заголовка ненадёжна (см. честный потолок выше — #518 vs #548,
+# score≈0.18), а УЛИКА дефекта в теле — надёжна: два агента, диагностирующих
+# один баг, почти всегда ссылаются на один и тот же артефакт — путь файла,
+# номер прогона Actions, номер issue/PR, дословную цитату из блока ```.
+#
+# Честная граница, измеренная на РЕАЛЬНОМ пуле репозитория (324 задачи с
+# меткой task, 2026-09-07, `gh issue list --state all`):
+#
+#   - Голое совпадение ссылок #N (одна задача упоминает номер другой) само по
+#     себе — ШУМ, не улика: почти каждая задача этого репозитория ссылается
+#     на 5-15 других номеров как на контекст/предысторию (пишем много прозы
+#     со ссылками). Не отфильтрованное самостоятельное совпадение по ссылкам
+#     дало 102 срабатывания из 138 открытых задач при пересчёте каждой как
+#     «новой» — практически любая задача цепляет что-то. Поэтому упоминание
+#     номера ОДНО не считается уликой — только в паре со второй уликой.
+#   - Дословная цитата из блока ``` (Jaccard по токенам ВНУТРИ ``` ... ```,
+#     не всего тела) — самая надёжная улика: разный перенос строк в
+#     обёрнутом логе не должен ронять совпадение (#562 body переносит текст
+#     иначе, чем #564, но это тот же самый лог wrangler), поэтому сравнение
+#     токенное, не строка-в-строку. Измерено: #562/#564 → score 0.50 (при 15
+#     общих токенах) — ловится; #518/#548 → 0.11 (всего 4 общих токена) — не
+#     ловится квотой вовсе, это ожидаемо (разные ошибки одного инцидента).
+#   - Путь файла — надёжная улика, ЕСЛИ он не common (см. ниже): частые пути
+#     вроде `docs/research/30-rejected-alternatives.md` (обязательная строка
+#     чеклиста, встречается в 42/324 задач), `AGENTS.md` (35/324),
+#     `deploy-dsh-edge.yml` (32/324) — общие для всего репозитория, не
+#     специфичны ни одному дефекту.
+#   - Частотный фильтр (генерический, не список хардкод-строк): путь/ссылка,
+#     встреченные больше чем в `EVIDENCE_COMMON_MAX_SHARE` пула (или больше
+#     `EVIDENCE_COMMON_MIN_ABS` штук, что больше) — считаются common и не
+#     участвуют в сравнении. Ниже `EVIDENCE_COMMON_MIN_POOL` кандидатов
+#     фильтр не включается вовсе (иначе на маленьких тестовых фикстурах он бы
+#     выбрасывал реальную улику просто потому, что в фикстуре 2-3 кандидата).
+#
+# Правило совпадения (что считается уликой дубля):
+#   (a) дословная цитата из ``` (Jaccard ≥ EVIDENCE_QUOTE_JACCARD_THRESHOLD И
+#       общих токенов ≥ EVIDENCE_QUOTE_MIN_SHARED_TOKENS) — САМОДОСТАТОЧНО;
+#   (b) общий номер прогона Actions (`actions/runs/<id>`) — САМОДОСТАТОЧНО
+#       (совпадение конкретного числа с прогоном практически невозможно
+#       случайно);
+#   (c) новое тело явно цитирует номер КОНКРЕТНОГО кандидата (`#N`) И у них
+#       есть ОБЩИЙ путь ИЛИ ОБЩАЯ (не common) ссылка на третью задачу — ни
+#       голая цитата номера, ни голое совпадение пути/ссылки поодиночке НЕ
+#       считаются уликой, только их пересечение.
+#
+# На этом правиле #518 vs #548 ловится через (c): #548 дословно содержит
+# «#518» И оба ссылаются на #505/#513 (бамп 0.11.1). #562 vs #564 ловится
+# через (a): дословная цитата ошибки wrangler.
+#
+# Контрольная выборка (все 138 открытых задач репозитория пересчитаны как
+# «новые» против всего пула 324): 28/138 дают хотя бы одно совпадение — само
+# по себе не ноль, но ручная проверка каждого совпадения не нашла ни одной
+# пары ЗАВЕДОМО РАЗНЫХ задач (все делят редкий путь/ссылку на тот же
+# конкретный трекер, не общий шаблонный файл) — граница честная, а не
+# подогнанная: см. отчёт агента, приложивший разбор конкретных 28 пар.
+#
+# Область (#570 vs #566): в отличие от первого слоя (только ОТКРЫТЫЕ, чтобы
+# не наказывать санкционированный паттерн «закрыли → завели новую, более
+# узкую, related»), этот слой сравнивает и с ЗАКРЫТЫМИ задачами тоже — сам
+# санкционированный паттерн не блокируется НАВСЕГДА, он просто проходит через
+# тот же газ `--confirm-not-duplicate`, что и обычный дубль.
+
+EVIDENCE_COMMON_MIN_POOL = 3
+EVIDENCE_COMMON_MAX_SHARE = 0.02
+EVIDENCE_COMMON_MIN_ABS = 3
+
+EVIDENCE_QUOTE_JACCARD_THRESHOLD = 0.4
+EVIDENCE_QUOTE_MIN_SHARED_TOKENS = 5
+
+CODE_FENCE_RE = re.compile(r"```(?:[^\n]*)\n(.*?)```", re.DOTALL)
+ISSUE_REF_RE = re.compile(r"#(\d{1,6})\b")
+RUN_URL_RE = re.compile(r"actions/runs/(\d+)")
+PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:mjs|jsx?|tsx?|py|sh|ya?ml|json|md)\b")
+
+
+class Evidence(TypedDict):
+    paths: set[str]
+    refs: set[str]
+    runs: set[str]
+    quote_tokens: set[str]
+
+
+class CandidateWithBody(Candidate):
+    body: str
+
+
+class EvidenceMatch(Candidate):
+    score: float
+    reason: str
+
+
+def extract_evidence(body: str) -> Evidence:
+    """Улики тела issue: пути файлов, ссылки на issue/PR (`#N`), номера
+    прогонов Actions (из URL `actions/runs/<id>`), значимые слова ВНУТРИ
+    блоков ``` ... ``` (не всего тела — вне кода текст сравнивает первый
+    слой через заголовок, здесь нужна именно дословная цитата ошибки)."""
+    body = body or ""
+    quoted = " ".join(match.group(1) for match in CODE_FENCE_RE.finditer(body))
+    return {
+        "paths": set(PATH_RE.findall(body)),
+        "refs": set(ISSUE_REF_RE.findall(body)),
+        "runs": set(RUN_URL_RE.findall(body)),
+        "quote_tokens": tokenize(quoted),
+    }
+
+
+def _common_items(key: str, pool: Sequence[Evidence]) -> set[str]:
+    """Пути/ссылки, встреченные в подозрительно большой доле пула — не
+    улика конкретного дефекта, а общая для репозитория деталь (чеклист,
+    имя воркфлоу, обязательный файл). Ниже `EVIDENCE_COMMON_MIN_POOL`
+    кандидатов фильтр не включается — на маленьком пуле частота ничего не
+    доказывает (см. докстринг раздела выше)."""
+    if len(pool) < EVIDENCE_COMMON_MIN_POOL:
+        return set()
+    counts: dict[str, int] = {}
+    for evidence in pool:
+        for item in evidence[key]:  # type: ignore[literal-required]
+            counts[item] = counts.get(item, 0) + 1
+    limit = max(EVIDENCE_COMMON_MIN_ABS, len(pool) * EVIDENCE_COMMON_MAX_SHARE)
+    return {item for item, count in counts.items() if count > limit}
+
+
+def find_evidence_matches(
+    body: str, candidates: Sequence[CandidateWithBody], number: int | None = None,
+) -> list[EvidenceMatch]:
+    """Кандидаты (ОТКРЫТЫЕ и ЗАКРЫТЫЕ — см. докстринг раздела), чьё тело
+    делит с `body` улику дефекта. Правило совпадения — САМОДОСТАТОЧНАЯ
+    дословная цитата ``` или общий прогон Actions, либо явная ссылка на
+    номер кандидата ВМЕСТЕ с общим (не common) путём/ссылкой — см. докстринг
+    раздела выше за измеренным обоснованием каждого условия. Отсортировано
+    по убыванию score (quote-score для (a), 1.0 для детерминированных (b)/(c)
+    — это не «схожесть», а бинарная улика)."""
+    new_evidence = extract_evidence(body)
+    pool_evidence = [extract_evidence(candidate.get("body", "")) for candidate in candidates]
+    common_paths = _common_items("paths", pool_evidence)
+    common_refs = _common_items("refs", pool_evidence)
+
+    matches: list[EvidenceMatch] = []
+    for candidate, cand_evidence in zip(candidates, pool_evidence):
+        if number is not None and candidate["number"] == number:
+            continue
+        self_cite = str(candidate["number"]) in new_evidence["refs"]
+        shared_paths = (new_evidence["paths"] & cand_evidence["paths"]) - common_paths
+        shared_runs = new_evidence["runs"] & cand_evidence["runs"]
+        shared_refs = (
+            (new_evidence["refs"] & cand_evidence["refs"])
+            - common_refs - {str(candidate["number"])} - ({str(number)} if number is not None else set())
+        )
+        quote_score = jaccard(new_evidence["quote_tokens"], cand_evidence["quote_tokens"])
+        shared_quote_tokens = new_evidence["quote_tokens"] & cand_evidence["quote_tokens"]
+
+        reasons: list[str] = []
+        score = 0.0
+        if quote_score >= EVIDENCE_QUOTE_JACCARD_THRESHOLD and len(shared_quote_tokens) >= EVIDENCE_QUOTE_MIN_SHARED_TOKENS:
+            reasons.append(f"дословная цитата из блока ``` (score {quote_score:.2f})")
+            score = max(score, quote_score)
+        if shared_runs:
+            reasons.append("общий прогон Actions #" + ", #".join(sorted(shared_runs)))
+            score = 1.0
+        if self_cite and (shared_paths or shared_refs):
+            reasons.append(f"новая задача ссылается на #{candidate['number']}")
+            if shared_paths:
+                reasons.append("общий путь: " + ", ".join(sorted(shared_paths)))
+            if shared_refs:
+                reasons.append("общая ссылка: #" + ", #".join(sorted(shared_refs)))
+            score = 1.0
+        if reasons:
+            matches.append({**candidate, "score": score, "reason": "; ".join(reasons)})  # type: ignore[typeddict-item]
     return sorted(matches, key=lambda match: match["score"], reverse=True)
 
 
@@ -170,28 +344,72 @@ def fetch_open_task_candidates(repo: str) -> list[Candidate]:
     return json.loads(result.stdout or "[]")
 
 
+def fetch_evidence_candidates(repo: str) -> list[CandidateWithBody]:
+    """Как `fetch_open_task_candidates`, но `--state all` (ОТКРЫТЫЕ И
+    ЗАКРЫТЫЕ — см. докстринг раздела «Второй слой» за обоснованием) и с
+    телом (`body`) — без него не из чего извлечь улики. `--limit` с запасом
+    над измеренным размером пула (324 задачи с меткой task, 2026-09-07).
+
+    Тестовый шов: `DUPLICATE_GUARD_EVIDENCE_FIXTURE=<путь>` — отдельная
+    переменная от `DUPLICATE_GUARD_FIXTURE` (та фикстура без `body`, не
+    годится для улик), тот же принцип (см. `fetch_open_task_candidates`)."""
+    fixture = os.environ.get("DUPLICATE_GUARD_EVIDENCE_FIXTURE")
+    if fixture:
+        return json.loads(Path(fixture).read_text(encoding="utf-8"))
+    result = subprocess.run(
+        ["gh", "issue", "list", "--repo", repo, "--state", "all", "--label", "task",
+         "--json", "number,title,url,body", "--limit", "1000"],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "gh issue list завершился с ошибкой")
+    return json.loads(result.stdout or "[]")
+
+
+def _print_matches(matches: Sequence[Match | EvidenceMatch]) -> None:
+    for match in matches:
+        print(f"{match['score']:.2f}\t{match['number']}\t{match['title']}\t{match['url']}\t{match['reason']}")
+
+
 def main(argv: list[str]) -> int:
-    """`check <repo> <title>` печатает совпадения (TSV: score\\tnumber\\ttitle\\turl,
+    """Две подкоманды, обе печатают TSV (score\\tnumber\\ttitle\\turl\\treason,
     одна строка на кандидата, пусто — совпадений нет) в stdout и ВСЕГДА
-    возвращает 0 — решение «блокировать/пропустить» принимает вызывающий
+    возвращают 0 — решение «блокировать/пропустить» принимает вызывающий
     (`scripts/gh/issue-create`) по содержимому stdout, не по коду возврата
     (симметрично task-branch: сбой ЭТОЙ, необязательной проверки — не повод
     ронять создание issue). Сбой сети/gh — предупреждение в stderr, пустой
     stdout (как будто совпадений нет): недоступность инструмента дедупликации
-    не должна блокировать реальную работу агента."""
-    if len(argv) != 4 or argv[1] != "check":
-        print("использование: duplicate_guard.py check <repo> <title>", file=sys.stderr)
-        return 2
-    _, _, repo, title = argv
-    try:
-        candidates = fetch_open_task_candidates(repo)
-    except Exception as error:  # noqa: BLE001 — сбой инструмента, не повод блокировать
-        print(f"WARN: duplicate_guard не смог получить открытый пул ({error}) — "
-              f"проверка похожести пропущена.", file=sys.stderr)
+    не должна блокировать реальную работу агента.
+
+    - `check <repo> <title>` — первый слой (похожесть заголовка, #566).
+    - `check-evidence <repo>` — второй слой (#570), тело новой issue читает
+      из STDIN (не argv — тело многострочное и содержит спецсимволы, argv
+      для этого не годится)."""
+    if len(argv) == 4 and argv[1] == "check":
+        _, _, repo, title = argv
+        try:
+            candidates = fetch_open_task_candidates(repo)
+        except Exception as error:  # noqa: BLE001 — сбой инструмента, не повод блокировать
+            print(f"WARN: duplicate_guard не смог получить открытый пул ({error}) — "
+                  f"проверка похожести пропущена.", file=sys.stderr)
+            return 0
+        _print_matches(find_similar_open_tasks(title, candidates))
         return 0
-    for match in find_similar_open_tasks(title, candidates):
-        print(f"{match['score']:.2f}\t{match['number']}\t{match['title']}\t{match['url']}")
-    return 0
+    if len(argv) == 3 and argv[1] == "check-evidence":
+        _, _, repo = argv
+        body = sys.stdin.read()
+        try:
+            candidates = fetch_evidence_candidates(repo)
+        except Exception as error:  # noqa: BLE001 — сбой инструмента, не повод блокировать
+            print(f"WARN: duplicate_guard не смог получить пул для улик ({error}) — "
+                  f"проверка улик пропущена.", file=sys.stderr)
+            return 0
+        _print_matches(find_evidence_matches(body, candidates))
+        return 0
+    print("использование: duplicate_guard.py check <repo> <title> | check-evidence <repo> (<STDIN: тело>)",
+          file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
