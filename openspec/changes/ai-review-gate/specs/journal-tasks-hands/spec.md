@@ -62,7 +62,7 @@ pull_request-контекста нет).
 (`review_labels.diff_fingerprint`/`diff_unchanged`), а не безусловным на
 каждый пуш; шапка ревью-комментария AI получила поле `diff:` для хранения
 этого отпечатка. См.
-`openspec/changes/ai-verdict-survives-merge/specs/journal-tasks-hands/spec.md`
+`openspec/changes/archive/ai-verdict-survives-merge/specs/journal-tasks-hands/spec.md`
 и `docs/decisions/0007-ai-review-gate.md` (раздел «Дельта 2026-09-05»). Текст
 требования выше не переписан — оставлен как принятый исходно.
 
