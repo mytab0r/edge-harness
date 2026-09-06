@@ -48,7 +48,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
@@ -202,13 +202,19 @@ INFRA_ERROR_SIGNATURES = (
 # наблюдение без задачи и без сигнала в #120 (не спамить тем, что уже лечится).
 STALE_BASE_SIGNATURES = (
     "main уехал вперёд",
-    "protected branch",
     "non-fast-forward",
     "failed to push some refs",
     "checks awaiting conflict resolution",
 )
 
 FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
+
+# Окно свежести провала (находка ревью PR #488): пульс ходит раз в 15 минут
+# (cron orchestra.yml), окно — двойной период с запасом на задержку раннера.
+# Без него `runs[0]` навсегда остаётся тем же старым красным прогоном после
+# закрытия задачи (отпечаток исчезает из открытых → следующий пульс заводит
+# задачу заново на уже почившую причину, бесконечный цикл).
+FAILURE_WATCH_WINDOW_MINUTES = 30
 
 
 def gh(*args: str) -> dict | list | None:
@@ -635,12 +641,28 @@ def last_failure_error(repo: str, run: dict) -> str:
     return "; ".join(bad)
 
 
+# Строки-boilerplate раннера, аннотированные ##[error] самим GitHub Actions,
+# а не причиной провала (находка ревью PR #488, живой замер на прогоне
+# 34027035455): «Process completed with exit code N» и завершающие строки
+# раннера идут ПОСЛЕ содержательной ::error::-строки (например, из die() в
+# task.sh) и раньше неё в списке "с конца" — если их не пропускать, отпечаток
+# схлопывает разные дефекты одного job'а в один класс по коду выхода.
+LAST_ERROR_LOG_BOILERPLATE = (
+    "process completed with exit code",
+    "the operation was canceled",
+    "the job running on runner",
+)
+
+
 def last_error_log_line(repo: str, job_id: int) -> str | None:
-    """Последняя строка `##[error]` из лога упавшего job'а — конкретный факт,
-    не гипотеза (правило AGENTS.md, PR #475): не заставляет человека открывать
-    Actions, чтобы увидеть, что именно сломалось. Best-effort: недоступность
-    лога (квота/права/раннер убит до записи) не роняет классификацию — просто
-    нет строки, вызывающий откатывается на имена упавших шагов."""
+    """Последняя СОДЕРЖАТЕЛЬНАЯ строка `##[error]` из лога упавшего job'а —
+    конкретный факт, не гипотеза (правило AGENTS.md, PR #475): не заставляет
+    человека открывать Actions, чтобы увидеть, что именно сломалось.
+    Boilerplate-строки самого раннера (LAST_ERROR_LOG_BOILERPLATE) —
+    не причина, пропускаются. Best-effort: недоступность лога (квота/права/
+    раннер убит до записи) или отсутствие содержательной строки не роняет
+    классификацию — просто нет строки, вызывающий откатывается на имена
+    упавших шагов."""
     try:
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}/logs"],
@@ -655,8 +677,13 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     marker = "##[error]"
     for line in reversed(result.stdout.splitlines()):
         idx = line.find(marker)
-        if idx != -1:
-            return line[idx:].strip()
+        if idx == -1:
+            continue
+        candidate = line[idx:].strip()
+        lowered = candidate.lower()
+        if any(pattern in lowered for pattern in LAST_ERROR_LOG_BOILERPLATE):
+            continue
+        return candidate
     return None
 
 
@@ -1114,9 +1141,15 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             observations.append(f"⚠️ failure-watch {workflow}: список провалов не прочитан ({error})")
             continue
         runs = payload.get("workflow_runs", [])
+        # Окно свежести (находка ревью PR #488): провал старше окна уже не
+        # актуален — задачу на него заводить поздно и незачем, `now` не
+        # декорация. Без фильтра `runs[0]` навсегда остаётся тем же старым
+        # красным прогоном после закрытия задачи по нему.
+        fresh_cutoff = now - timedelta(minutes=FAILURE_WATCH_WINDOW_MINUTES)
+        runs = [r for r in runs if parse_time(r["created_at"]) >= fresh_cutoff]
         if not runs:
             continue
-        run_item = runs[0]  # самый свежий провал этого workflow
+        run_item = runs[0]  # самый свежий провал этого workflow в пределах окна
         bad_jobs = failing_jobs(repo, run_item)
         if not bad_jobs:
             observations.append(
