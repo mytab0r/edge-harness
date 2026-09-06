@@ -81,6 +81,17 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       issue из пула с `state_reason == "reopened"` закрывается обратно с
       комментарием-отказом ДО того, как её увидит accept_merged_tasks (см.
       reject_reopened_tasks).
+  13. Видимость непринятых задач (#427): reap_stale (п.1) снимает только
+      заброшенные НАЗНАЧЕННЫЕ задачи — задача, которую никто не брал вовсе,
+      не отслеживалась ничем (замер 2026-09-06: 84 из 109 открытых без
+      исполнителя). mark_stale_unclaimed ставит метку `stale-unclaimed` на
+      задачу без исполнителя старше STALE_HOURS (тот же порог, что у п.1 —
+      второе число правды не заводится) и снимает её сама, как только задачу
+      берут. Это НЕ тормоз: ничего не закрывается и не переназначается —
+      только видимость; газ («взять/переформулировать/закрыть как отпавшую»)
+      — вручную, владелец или агент, наткнувшийся на метку (машина не умеет
+      отличить нужное от отпавшего). Использует уже прочитанный `pool` этого
+      же прогона — второго обхода Issues не заводится.
 """
 
 import http.cookiejar
@@ -169,6 +180,10 @@ CONFLICT_LABEL = review_labels.CONFLICT_LABEL
 # у самой метки (docs/agents/LABELS.md): владелец снимает `blocked` вручную.
 BLOCKED_LABEL = "blocked"
 MERGE_METHOD = "squash"
+# Видимость непринятых задач (#427) — метка, не тормоз (см. mark_stale_unclaimed
+# ниже и запись в docs/agents/LABELS.md). Порог — STALE_HOURS выше, то же число,
+# что у reap_stale: второй порог правды не заводится.
+STALE_UNCLAIMED_LABEL = "stale-unclaimed"
 
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
 # Было буквально «ровно один PR за запуск» (см. шапку модуля, пункт 3, и
@@ -328,6 +343,52 @@ def reap_stale(
             ),
         )
         lines.append(f"♻️ #{number} просрочена ({who}), возвращена в пул")
+    return lines
+
+
+def mark_stale_unclaimed(repo: str, now: datetime, pool: list[dict]) -> list[str]:
+    """Видимость «никто не взял» (#427): reap_stale выше снимает только
+    заброшенные НАЗНАЧЕННЫЕ задачи — задачу, которую вообще никто не брал,
+    не отслеживает ничто (замер 2026-09-06: 84 из 109 открытых без
+    исполнителя, 44/36/21 старше суток/двух/трёх). Метка `stale-unclaimed` —
+    не тормоз: ничего не закрывается и не переназначается автоматически,
+    она только делает факт видимым. Газ («взять / переформулировать /
+    закрыть как отпавшую») — вручную, владелец или агент, наткнувшийся на
+    метку: у машины нет признака «нужное или отпавшее», и это не
+    изображается автоматикой.
+
+    Порог — STALE_HOURS, тот же, что у reap_stale (не второй порог правды).
+    Возраст считается от `created_at` issue, а не от точного момента, когда
+    задача стала свободной: второе потребовало бы обхода timeline на каждую
+    свободную задачу пула (доп. запрос на issue) — сознательный отказ ради
+    нулевой цены: `pool` уже прочитан этим же прогоном main() для отчёта
+    «Пул задач», новый обход Issues здесь не заводится. Плата за упрощение:
+    задача, вернувшаяся в пул через reap_stale, помечается сразу (её
+    created_at уже старше порога), а не после нового отсчёта — это ближе
+    к цели механизма (видимость «висит без исполнителя»), чем к точному
+    таймеру.
+
+    Метка снимается сама, как только у задачи появляется исполнитель —
+    следующий прогон видит issue["assignees"] непустым и убирает её."""
+    lines = []
+    for issue in pool:
+        number = issue["number"]
+        has_label = STALE_UNCLAIMED_LABEL in {label["name"] for label in issue.get("labels") or []}
+        if issue["assignees"]:
+            if has_label:
+                gh("-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{STALE_UNCLAIMED_LABEL}")
+                lines.append(f"✅ #{number} взята в работу — {STALE_UNCLAIMED_LABEL} снята")
+            continue
+        if _issue_is_blocked(issue):
+            continue  # blocked уже сигнализирует владельцу отдельно, не дублируем
+        if has_label:
+            continue
+        age_hours = minutes_between(parse_time(issue["created_at"]), now) / 60
+        if age_hours < STALE_HOURS:
+            continue
+        gh("-X", "POST", f"repos/{repo}/issues/{number}/labels",
+           "-f", f"labels[]={STALE_UNCLAIMED_LABEL}")
+        lines.append(f"🏷️ #{number} без исполнителя {int(age_hours)}ч — {STALE_UNCLAIMED_LABEL}")
     return lines
 
 
@@ -2241,6 +2302,10 @@ def main() -> int:
     taken = len(pool) - free
     lines += ["", f"Пул задач: {free} свободно, {taken} в работе"]
 
+    # Видимость непринятых задач (#427) — метка, не тормоз; использует уже
+    # прочитанный `pool` этого прогона, второго обхода Issues не заводит.
+    stale_unclaimed_lines = mark_stale_unclaimed(repo, now, pool)
+
     # Предохранитель (#120) решает, разрешён ли диспатч воркера в этом пульсе.
     conveyor_observations, conveyor_actions, dispatch_allowed = conveyor_gate(repo, now)
     if dispatch_allowed:
@@ -2254,8 +2319,8 @@ def main() -> int:
     )
     actions = (
         stale_lines + lease_actions + conflict_lines + unhealthy_lines + merge_actions
-        + ai_actions + stale_ready_lines + reopen_lines + accept_actions + conveyor_actions
-        + worker_actions
+        + ai_actions + stale_ready_lines + reopen_lines + accept_actions
+        + stale_unclaimed_lines + conveyor_actions + worker_actions
     )
     lines += render_action_report(observations, actions)
 

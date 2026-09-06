@@ -335,7 +335,7 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
 
 
 def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_issues_summary=None,
-          state_reason=None):
+          state_reason=None, created_at="2026-09-01T00:00:00Z"):
     return {
         "number": number,
         "assignees": [{"login": a} for a in assignees],
@@ -348,6 +348,10 @@ def issue(number, *, assignees=("someone",), labels=("task",), title="", sub_iss
         # живых #111/#114/#115/#158, 2026-09-06). None — обычная (не
         # переоткрытая) задача, дефолт большинства существующих тестов.
         "state_reason": state_reason,
+        # created_at — прод-форма (Issues API отдаёт его всегда); используется
+        # mark_stale_unclaimed (#427) как проксирующий возраст задачи без
+        # исполнителя.
+        "created_at": created_at,
     }
 
 
@@ -437,6 +441,82 @@ def test_reap_stale_skips_task_covered_by_pr_branch_without_body_number(monkeypa
 
     assert lines == []
     assert fake.mutating_calls() == []
+
+
+# ── mark_stale_unclaimed (#427): видимость непринятых задач ─────────────────────
+
+
+def test_mark_stale_unclaimed_labels_old_unassigned_issue(monkeypatch):
+    task = issue(300, assignees=(), labels=["task"], created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({"issues/300/labels": None})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)  # 25ч > STALE_HOURS (24)
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert any("stale-unclaimed" in line and "300" in line for line in lines)
+    posts = [c for c in fake.calls if c.startswith("-X POST") and "300/labels" in c]
+    assert len(posts) == 1
+    assert f"labels[]={sch.STALE_UNCLAIMED_LABEL}" in posts[0]
+
+
+def test_mark_stale_unclaimed_skips_recent_unassigned_issue(monkeypatch):
+    task = issue(301, assignees=(), labels=["task"], created_at="2026-09-02T00:30:00Z")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)  # 30 мин < STALE_HOURS
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert lines == []
+    assert fake.calls == []  # холостой ход не делает НИ ОДНОГО вызова gh
+
+
+def test_mark_stale_unclaimed_skips_blocked_issue(monkeypatch):
+    # blocked уже сигнализирует владельцу отдельно (docs/agents/LABELS.md) —
+    # дублировать сигнал второй меткой не нужно.
+    task = issue(302, assignees=(), labels=["task", "blocked"], created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert lines == []
+    assert fake.calls == []
+
+
+def test_mark_stale_unclaimed_idempotent_when_already_labeled(monkeypatch):
+    task = issue(303, assignees=(), labels=["task", "stale-unclaimed"], created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert lines == []
+    assert fake.calls == []  # уже помечена — второй POST не идёт
+
+
+def test_mark_stale_unclaimed_removes_label_when_claimed(monkeypatch):
+    # Газ: задачу взяли (появился исполнитель) — метка обязана сняться сама,
+    # без ручного вмешательства (это НЕ тормоз).
+    task = issue(304, assignees=("someone",), labels=["task", "stale-unclaimed"],
+                 created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({"issues/304/labels/stale-unclaimed": None})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 2, 1, 0)
+    lines = sch.mark_stale_unclaimed(REPO, now, [task])
+    assert any("304" in line and "снята" in line for line in lines)
+    deletes = [c for c in fake.calls if c.startswith("-X DELETE") and "304/labels/stale-unclaimed" in c]
+    assert len(deletes) == 1
+
+
+def test_mark_stale_unclaimed_no_second_traversal_uses_passed_pool(monkeypatch):
+    # Цена лишнего обхода (задача #427): mark_stale_unclaimed обязана работать
+    # ТОЛЬКО с переданным pool — гвардия против регрессии «завёл свой
+    # open_task_issues внутри функции».
+    task = issue(305, assignees=(), labels=["task"], created_at="2026-09-01T00:00:00Z")
+    fake = FakeGh({"issues/305/labels": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(
+        sch, "open_task_issues",
+        lambda repo: (_ for _ in ()).throw(AssertionError("не должен вызываться — pool уже передан")))
+    now = utc(2026, 9, 2, 1, 0)
+    sch.mark_stale_unclaimed(REPO, now, [task])
+    assert not any("issues?state=open" in c for c in fake.calls)
 
 
 # ── Поведение 1: готовый PR без вердикта — дёрнуть гейт самому ───────────────────
