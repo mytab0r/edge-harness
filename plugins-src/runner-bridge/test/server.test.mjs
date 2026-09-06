@@ -15,7 +15,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-// Импортируем внутренние функции плагина для тестирования
+// Импортируем чистую логику плагина напрямую из core.js — без прохода
+// через defineTool()/../server/index.js: peer-зависимость `@deepseek-ai/
+// dsh-tools`, которую он импортирует, не установлена ни в workspace, ни в
+// repo-ci.yml (находка ревью PR #411, живой репро — ERR_MODULE_NOT_FOUND
+// на самой загрузке модуля). Конфиги инструментов (runnerTaskToolConfig/
+// runnerStatusToolConfig) — та же форма, что принимает defineTool(), но
+// без обёртки: `.execute(args, exec)` — тот же код, что реально исполняется
+// в проде (index.js оборачивает эти же функции в defineTool(...) без
+// изменений).
 import {
   readRepo,
   readToken,
@@ -24,11 +32,11 @@ import {
   describeFailure,
   configError,
   networkError,
-  defineRunnerTaskTool,
-  defineRunnerStatusTool,
+  runnerTaskToolConfig as defineRunnerTaskTool,
+  runnerStatusToolConfig as defineRunnerStatusTool,
   networkReason,
   collectPullRequests,
-} from '../server/index.js'
+} from '../server/core.js'
 
 // ── Утилиты тестов ────────────────────────────────────────────────────────────────
 
@@ -191,12 +199,17 @@ test('describeFailure: возвращает сообщение GitHub при JSO
 })
 
 test('describeFailure: возвращает только статус при JSON без message', async () => {
+  // Находка ревью PR #411 (тест никогда не запускался в CI, см. критерий
+  // приёмки): 403 сталкивается со специальной веткой егресс-блока
+  // (issue #133) — она перехватывает ЛЮБОЙ 403 без message, эта ветка уже
+  // отдельно доказана тестом ниже. Общий случай «статус без message»
+  // проверяем на статусе, где спецветки нет.
   const response = {
-    status: 403,
+    status: 500,
     json: async () => ({ other: 'field' }),
   }
   const result = await describeFailure(response)
-  assert.equal(result, 'HTTP 403')
+  assert.equal(result, 'HTTP 500')
 })
 
 // ── Тесты configError ────────────────────────────────────────────────────────────
@@ -805,12 +818,15 @@ test('collectPullRequests: ограничивает количество PR по
 test('runner_task: имеет правильную схему параметров', () => {
   const tool = defineRunnerTaskTool()
   assert.equal(tool.name, 'runner_task')
-  // parameters преобразуются в JSON Schema через parameterSchemaSpecToJsonSchema
-  assert.ok(tool.parameters.properties)
-  assert.ok(tool.parameters.properties.title)
-  assert.ok(tool.parameters.properties.body)
-  assert.ok(tool.parameters.required.includes('title'))
-  assert.ok(tool.parameters.required.includes('body'))
+  // Находка ревью PR #411: тест раньше проверял ПОСТ-трансформацию
+  // `parameterSchemaSpecToJsonSchema` (properties/required[]) — это логика
+  // самого `@deepseek-ai/dsh-tools`, не этого плагина, и без peer-пакета
+  // непроверяема. Здесь — исходная форма спецификации, которую пишет
+  // runner-bridge (index.js передаёт её в defineTool() без изменений).
+  assert.ok(tool.parameters.title)
+  assert.equal(tool.parameters.title.required, true)
+  assert.ok(tool.parameters.body)
+  assert.equal(tool.parameters.body.required, true)
 })
 
 test('runner_task: имеет правильную схему вывода', () => {
@@ -831,9 +847,9 @@ test('runner_task: timeoutMs = 45000', () => {
 test('runner_status: имеет правильную схему параметров', () => {
   const tool = defineRunnerStatusTool()
   assert.equal(tool.name, 'runner_status')
-  assert.ok(tool.parameters.properties)
-  assert.ok(tool.parameters.properties.issue)
-  assert.ok(tool.parameters.required.includes('issue'))
+  // См. комментарий в тесте runner_task выше — исходная форма спецификации.
+  assert.ok(tool.parameters.issue)
+  assert.equal(tool.parameters.issue.required, true)
 })
 
 test('runner_status: имеет правильную схему вывода', () => {

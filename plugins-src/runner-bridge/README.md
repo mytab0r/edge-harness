@@ -36,18 +36,37 @@
 
 ```bash
 cd plugins-src/runner-bridge
-node --check server/index.js            # синтаксис
-npm pack                                # edge-harness-dsh-plugin-runner-bridge-0.1.1.tgz
-sha256sum edge-harness-dsh-plugin-runner-bridge-0.1.1.tgz
+node --check server/index.js server/core.js   # синтаксис
+npm pack                                      # edge-harness-dsh-plugin-runner-bridge-0.1.2.tgz
+sha256sum edge-harness-dsh-plugin-runner-bridge-0.1.2.tgz
 ```
 
-Публикация: релиз **этого** репозитория с тегом `plugins-runner-v0.1.1` и
-asset'ом `runner-bridge-0.1.1.tgz` (то же содержимое, имя asset'а фиксирует
+Публикация: релиз **этого** репозитория с тегом `plugins-runner-v0.1.2` и
+asset'ом `runner-bridge-0.1.2.tgz` (то же содержимое, имя asset'а фиксирует
 манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
 merge = аппрув владельца.
 
+**Находка ревью PR #411**: пин 0.1.1 в `dsh-edge/plugins.json` не был
+подтверждён совпадением с реальным `npm pack` исходников (единственная
+содержательная сверка — `sha256sum -c` в `deploy-dsh-edge.yml` на деплое,
+`dsh-edge/manifest.mjs` проверяет только форму хеша, не совпадение). Бамп до
+0.1.2 (а не перезалив asset'а 0.1.1) — сознательный выбор: не переписывать
+уже опубликованный релиз. Sha256 в манифесте сейчас — реальный хеш
+`npm pack` ЭТОГО среза исходников (`git diff`-неверный, если разойдётся —
+пересобери и вставь актуальный); релиз `plugins-runner-v0.1.2` с
+asset'ом `runner-bridge-0.1.2.tgz` ещё предстоит опубликовать (конвейер
+#80, штатно — `plugin-forge.yml`) до ближайшего продового деплоя,
+иначе `sha256sum -c` в `deploy-dsh-edge.yml` откажет громко.
+
+`"files"` в `package.json` обязан перечислять и `server/core.js` — забытое
+поле молча упаковало бы tarball без файла, который `index.js` теперь
+импортирует (`import ... from './core.js'`), и деплой сломался бы
+`ERR_MODULE_NOT_FOUND` в проде, не в CI.
+
 Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
-(инструменты объявляются апстримным `defineTool`).
+(инструменты объявляются апстримным `defineTool`) — она нужна ТОЛЬКО
+`server/index.js`; вся логика без неё живёт в `server/core.js` и покрыта
+юнит-тестами (`test/server.test.mjs`, подключены в `repo-ci.yml`).
 
 ## Контракт cordis: inject
 
