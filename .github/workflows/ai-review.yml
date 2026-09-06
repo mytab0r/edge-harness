@@ -441,9 +441,12 @@ jobs:
       # (ai:failed), а дефолтный `if: success()` пропускал бы будильник
       # именно в этой ветке; сбой самого диспатча (сеть/лимит) тоже не
       # должен красить job verdict — расписание остаётся страховкой.
+      # scripts/gh/wake_orchestra.sh (#456) экономит диспатч, если orchestra.yml
+      # уже запущен/в очереди — см. комментарий в pr-review.yml, то же место
+      # правды, не копия логики.
       - name: "Разбудить оркестратор (#297): вердикт AI готов, не ждать расписания"
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run orchestra.yml --ref main
+        run: scripts/gh/wake_orchestra.sh "$GITHUB_REPOSITORY"
