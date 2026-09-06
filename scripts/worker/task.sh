@@ -363,23 +363,46 @@ else
   echo "::warning::HANDS_TOKEN/HARNESS_URL не заданы — пульс живости выключен, зависание видно только по таймауту"
 fi
 
-# ── 5. Ветка: новая от свежего origin/main, либо чекаут существующего PR (#245) ──
+# ── 5. Ветка: новая от свежего origin/main, либо отдельный worktree на ветке PR (#245) ──
+# Trust-зона (#476, тот же принцип, что в ai-review.yml): доверенный
+# инструментарий этого job'а — scripts/* в $GITHUB_WORKSPACE, куда worker.yml
+# всегда чекаутит main (scheduler.py дисптатчит ровно с --ref main). Раньше
+# доводка PR делала `git checkout -B` ПРЯМО в $GITHUB_WORKSPACE — это подменяло
+# ВСЮ рабочую директорию, включая scripts/, деревом старой ветки PR. Любой
+# файл, добавленный в scripts/ после её ответвления (например
+# scripts/gh/infra_digest.sh), в этом дереве отсутствовал — живой отказ
+# «No such file or directory» (прогон worker.yml 34027035455, PR #408, #476).
+# Фикс — линкованный git worktree в отдельном каталоге: $SCRIPT_DIR (и всё,
+# что читается по пути из main-дерева — infra_digest.sh, dsh-hands-streamer)
+# остаётся main НЕЗАВИСИМО от того, какую ветку доводит DSH; ветка PR — только
+# рабочее дерево, куда DSH коммитит и пушит (cd в самом конце этого блока).
 if [ -n "$CONTINUE_PR_NUMBER" ]; then
   git fetch origin "$BRANCH"
-  git checkout -B "$BRANCH" "origin/$BRANCH"
-  git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
-  # Та же гвардия свежести, что ставит task-branch: следующий коммит на этой
+  PR_WORKTREE="$WORK/pr-worktree"
+  rm -rf "$PR_WORKTREE"
+  git worktree add -B "$BRANCH" "$PR_WORKTREE" "origin/$BRANCH"
+  git -C "$PR_WORKTREE" branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
+  # core.hooksPath — репозиторий-уровневый конфиг (общий .git на все worktree),
+  # не per-worktree: гвардия свежести действует в $PR_WORKTREE без отдельной
+  # установки. Та же гвардия, что ставит task-branch: следующий коммит на этой
   # ветке обязан быть впереди актуального origin/main, иначе pre-commit велит
   # git rebase origin/main — свежесть базы не предполагается, а доказывается.
   git config core.hooksPath .githooks
-  echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) чекаутнута для доводки: $(git rev-parse --short HEAD)"
+  echo "Ветка $BRANCH (PR #$CONTINUE_PR_NUMBER) выделена отдельным worktree для доводки: $(git -C "$PR_WORKTREE" rev-parse --short HEAD) ($PR_WORKTREE)"
   # Второй вход в agent-ветку (первый — task-branch ниже): доводка уже
   # открытого PR не проходит через task-branch, поэтому дайджест граблей
   # инфраструктуры печатается здесь явно — тем же общим модулем, не второй
   # копией текста (#326 находка 1: свежий агент на доводке стартовал без
-  # дайджеста, хотя scripts/gh/* нужны там раньше всего).
+  # дайджеста, хотя scripts/gh/* нужны там раньше всего). Печатается ИЗ
+  # main-дерева ($SCRIPT_DIR), а не из $PR_WORKTREE — см. обоснование выше.
   source "$SCRIPT_DIR/../gh/infra_digest.sh"
   print_infra_digest
+  # С этой строки и до конца скрипта cwd — рабочее дерево задачи ($PR_WORKTREE):
+  # DSH коммитит и пушит именно туда. $SCRIPT_DIR — абсолютный путь, вычисленный
+  # из BASH_SOURCE в начале скрипта, за cd не следует и продолжает указывать на
+  # main-дерево ($GITHUB_WORKSPACE) для всех последующих обращений по пути
+  # (npm pack scripts/dsh-hands-streamer и т.п., шаг 6b).
+  cd "$PR_WORKTREE"
 else
   "$SCRIPT_DIR/../git/task-branch" "$number-$slug"
 fi
