@@ -272,7 +272,7 @@ test('статусы задач: последние системные собы�
   const calls = { github: 0, journal: 0 }
   const { sandbox } = loadBundle(async (url, init) => {
     const urlStr = String(url)
-    if (urlStr.startsWith('https://api.github.com')) {
+    if (urlStr.startsWith('https://api.github.com/')) {
       calls.github++
       return responseStub(githubResponse)
     }
@@ -329,7 +329,7 @@ test('session_event: think-блоки и tool-вызовы видны в раз�
   const calls = { github: 0, journal: 0 }
   const { sandbox } = loadBundle(async (url) => {
     const urlStr = String(url)
-    if (urlStr.startsWith('https://api.github.com')) {
+    if (urlStr.startsWith('https://api.github.com/')) {
       calls.github++
       return responseStub(githubResponse)
     }
@@ -396,7 +396,7 @@ test('пагинация журнала: свежайшие события до�
   const journalCalls = []
   const { sandbox } = loadBundle(async (url) => {
     const urlStr = String(url)
-    if (urlStr.startsWith('https://api.github.com')) return responseStub(githubResponse)
+    if (urlStr.startsWith('https://api.github.com/')) return responseStub(githubResponse)
     if (urlStr.includes('/api/events?task_id=')) {
       journalCalls.push(urlStr)
       const after = urlStr.split('after=')[1]?.split('&')[0] || '0'
@@ -440,7 +440,7 @@ test('ошибка журнала (не JSON): форма ответа пров�
   }
   const { sandbox } = loadBundle(async (url) => {
     const urlStr = String(url)
-    if (urlStr.startsWith('https://api.github.com')) return responseStub(githubResponse)
+    if (urlStr.startsWith('https://api.github.com/')) return responseStub(githubResponse)
     if (urlStr.includes('/api/events?task_id=')) return responseStub({
       ok: true, status: 200, contentType: 'text/html',
       body: '<html>не журнал</html>',
