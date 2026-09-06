@@ -127,3 +127,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/orchestra/stale_blocked_guard.py
+
+      # Гвардия «задача ждёт решения владельца» (waiting:owner, #470, слайс
+      # #254): авто-метка по блоку вариантов, снятие метки по маркеру ответа
+      # «РЕШЕНИЕ: N», эскалация в саму задачу + Telegram. continue-on-error —
+      # тот же приём, что у гвардии blocked выше: находка видна красным шагом
+      # (fail loud), но не гасит зелёный статус job'а, который читает пульс
+      # (heartbeat_check, #120).
+      - name: Гвардия waiting:owner — задача ждёт решения владельца (#470)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Тот же канал эскалации, что у шагов выше (#120) — без него
+          # pulse_guard.escalate всегда вернёт «НЕ доставлен» (нет токена/чата).
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/waiting_owner_guard.py

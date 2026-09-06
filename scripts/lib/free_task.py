@@ -27,6 +27,22 @@
 сам `claim` в task.sh. `locked` передаётся вызывающей стороной (task.sh знает
 про `lease_cli`, здесь — только фильтрация множества).
 
+Четвёртый фильтр (находка AI-ревью PR #471, #470): задача с меткой
+`waiting:owner` БЕЗ исполнителя (типичный случай — авто-метка свежей задачи
+или ручная разметка при заведении, до того как кто-то успел стать assignee)
+проходила бы фильтр «нет assignees» как свободная — `oldest_free` выбирал бы
+ровно её на каждом пульсе (она старейшая свободная), `claim()` отказывал бы
+(`scripts/lib/claim_task.py`), воркер выходил бы зелёным no-op, а задачи ЗА
+ней в очереди не брался бы вовсе: тормоз одной задачи останавливал бы весь
+диспатч, пока владелец не ответит (класс #255). У `blocked` этой дыры нет,
+потому что playbook эскалации (`task.sh`) оставляет assignee — задача и так
+невидима для `free_candidates` по первому критерию; `waiting:owner` assignee
+не гарантирует, поэтому фильтруется по метке явно, тем же местом правды, что
+и `claim()` (`scripts/lib/claim_task.py`) — второй копии строки `waiting:owner`
+не заводим, только по литералу, значение читается из `labels` — issues,
+переданные без этого поля (объект без ключа `labels`), считаются НЕ несущими
+метку (см. `_has_waiting_owner_label`).
+
 Импорт task_ref — importlib по файлу (тот же приём, что в contract_check.py):
 скрипты запускаются как файлы, не как пакет.
 
@@ -63,6 +79,21 @@ def _load_task_ref():
 
 task_ref = _load_task_ref()
 
+# Одно место правды на литерал — тот же, что claim_task.py::claim уже
+# использует для отказа в аренде (docs/agents/LABELS.md, строка waiting:owner).
+WAITING_OWNER_LABEL = "waiting:owner"
+
+
+def _has_waiting_owner_label(issue: dict[str, Any]) -> bool:
+    """`labels` — форма `gh issue list --json labels` ([{"name": ...}, ...]).
+    Issue без ключа `labels` вовсе (старые вызовы/фикстуры без этого поля)
+    считается НЕ несущей метку — то же допущение, что уже применяет
+    `assignees`."""
+    return any(
+        (label or {}).get("name") == WAITING_OWNER_LABEL
+        for label in (issue.get("labels") or [])
+    )
+
 
 def _load_json(path: Path) -> Any:
     try:
@@ -75,13 +106,18 @@ def _load_json(path: Path) -> Any:
 def free_candidates(
     issues: list[dict[str, Any]], locked: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Открытые задачи пула без исполнителя и без живого замка аренды (#121),
+    """Открытые задачи пула без исполнителя, без живого замка аренды (#121) и
+    без метки `waiting:owner` (находка AI-ревью PR #471, #470 — без этого
+    фильтра задача, ждущая владельца, но ещё без исполнителя, стопорила бы
+    весь диспатч как «старейшая свободная», см. докстринг модуля),
     отсортированные по номеру (старейшая первой — воркер не должен хватать
     самую свежую косметику)."""
     locked = locked or set()
     free = [
         issue for issue in issues
-        if not (issue.get("assignees") or []) and issue["number"] not in locked
+        if not (issue.get("assignees") or [])
+        and issue["number"] not in locked
+        and not _has_waiting_owner_label(issue)
     ]
     return sorted(free, key=lambda issue: issue["number"])
 

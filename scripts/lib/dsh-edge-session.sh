@@ -226,6 +226,32 @@ dsh_edge_stop_drain() {
   fi
 }
 
+dsh_edge_verify_transcript() { # SESSION_ID — прочитать события обратно и проверить рендер (#131)
+  # Структурная замена «визуальной проверки морды глазами» (пост-мерж пункт
+  # runner-sessions-in-dsh-morde/tasks.md): владелец на демо-сессии видел
+  # заглушки provider/model и «unavailable» в деталях тула (#131) — оба
+  # объясняются формой батча (research/12), а не сетью, и проверяются здесь
+  # на РЕАЛЬНО сохранённых событиях каждого прогона. Best-effort и
+  # ненулевой возврат при находках: вызывающий решает, warn или fail —
+  # сама проверка не должна ронять успешный прогон (не часть контракта
+  # ingest, тот уже проверен dsh_edge_ingest выше).
+  dsh_edge_init || return 1
+  local session_id=$1 events_file lib_dir
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  events_file="$WORK/dsh-edge.verify.events.json"
+  # Replay — SSE (`data: {...}` построчно, research/12): историческая часть
+  # отдаётся сразу, дальше соединение держится для живых событий — режем по
+  # --max-time и разбираем то, что успело прийти (curl пишет в stdout по мере
+  # получения, поэтому обрыв по таймауту не теряет уже присланные строки).
+  curl -sS --max-time 12 -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/sessions/$session_id/events" 2>/dev/null \
+    | sed -n 's/^data: //p' | jq -s '.' >"$events_file" 2>/dev/null
+  if [ ! -s "$events_file" ] || ! jq -e 'type == "array"' "$events_file" >/dev/null 2>&1; then
+    echo "::warning::Транскрипт-проверка (#131): replay сессии $session_id не разобран — проверка пропущена" >&2
+    return 1
+  fi
+  python3 "$lib_dir/verify_transcript.py" "$events_file"
+}
+
 dsh_edge_session_archive() { # SESSION_ID — архив; неизвестная сессия = норма (PR без раннера)
   dsh_edge_require_config || return 1
   dsh_edge_login || return 1
