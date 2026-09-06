@@ -1037,7 +1037,11 @@ def test_resume_alert_text_carries_marker_evidence():
     ("dial tcp: lookup api.github.com: no such host", "infra"),
     ("gh: 502 Bad Gateway", "infra"),
     ("ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.", "stale_base"),
-    ("! [remote rejected] agent/1-x -> agent/1-x (protected branch hook declined)", "stale_base"),
+    # Находка ревью PR #488: "protected branch hook declined" — НЕ признак
+    # протухшей базы (это отказ серверного хука по другой причине, обычно
+    # наш дефект workflow), сигнатуру убрали из STALE_BASE_SIGNATURES —
+    # такой текст обязан классифицироваться как defect, не тихо прощаться.
+    ("! [remote rejected] agent/1-x -> agent/1-x (protected branch hook declined)", "defect"),
     ("scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory", "defect"),
     ("AssertionError: expected 3 got 2", "defect"),
     ("что угодно нераспознанное", "defect"),  # fail loud: непонятное — дефект, не прощаем молча
@@ -1074,6 +1078,34 @@ FAILURE_WATCH_QUIET_ROUTES = {
 
 def _stdout_with_error(line: str):
     return SimpleNamespace(returncode=0, stdout=f"2026-09-06T10:18:00.0000000Z {line}\n")
+
+
+def test_last_error_log_line_skips_runner_boilerplate_finds_real_cause(monkeypatch):
+    # Находка ревью PR #488, живой замер на прогоне 34027035455: последняя
+    # ##[error]-строка сырого лога почти всегда boilerplate самого раннера
+    # ("Process completed with exit code N"), а реальная причина (наш die() в
+    # task.sh) идёт РАНЬШЕ неё. Без пропуска boilerplate отпечаток схлопывает
+    # разные дефекты одного job'а по одинаковому коду выхода.
+    log = (
+        "2026-09-06T10:17:58.0000000Z ##[error]scripts/worker/task.sh: line 375: "
+        ".../infra_digest.sh: No such file or directory\n"
+        "2026-09-06T10:17:59.0000000Z Cleaning up orphan processes\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "infra_digest.sh" in line
+    assert "exit code" not in line
+
+
+def test_last_error_log_line_only_boilerplate_returns_none(monkeypatch):
+    # Без содержательной строки — None, вызывающий откатывается на имена шагов
+    # (существующая ветка `fact = error_line or f"шаги: {step_names}"`).
+    log = "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    assert pg.last_error_log_line("mytab0r/edge-harness", 999) is None
 
 
 def test_failure_watch_quiet_when_no_failed_runs(monkeypatch):
@@ -1165,6 +1197,25 @@ def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
     observations2, _ = pg.failure_watch("mytab0r/edge-harness", NOW)
     assert posted == []
     assert any("уже сигналили" in line for line in observations2)
+
+
+def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
+    # Находка ревью PR #488: провал старше окна не заводит задачу заново на
+    # уже неактуальную причину — `now` обязан использоваться, не просто
+    # приниматься в сигнатуру. Прогон на 4 дня старше NOW заведомо за окном
+    # FAILURE_WATCH_WINDOW_MINUTES (30 мин).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=failure"] = {"workflow_runs": [
+        run("failure", "2026-08-27T11:50:00Z", 34027035455),
+    ]}
+
+    def boom(*a):
+        pytest.fail("прогон вне окна свежести не должен запрашивать детали job'ов")
+
+    monkeypatch.setattr(pg, "gh", FakeGh(routes))
+    monkeypatch.setattr(pg, "failing_jobs", boom)
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert observations == [] and actions == []
 
 
 def test_failure_watch_stale_base_neither_files_task_nor_signals(monkeypatch):
