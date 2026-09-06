@@ -55,6 +55,21 @@ jobs:
           )
           console.log('--- nav-like elements (first 300) ---')
           console.log(JSON.stringify(navTexts, null, 2))
+
+          // Открыть Settings и снять разметку панели/вкладок.
+          await page.getByRole('button', { name: 'Settings' }).click()
+          await page.waitForTimeout(2000)
+          console.log('--- URL after Settings click ---', page.url())
+          const settingsHtml = await page.content()
+          writeFileSync('/tmp/settings.html', settingsHtml)
+          console.log('--- settings html length ---', settingsHtml.length)
+          const settingsNav = await page.$$eval('a, button, [role="tab"], [role="link"], [role="menuitem"], [role="listitem"], li, [role="dialog"] *', els =>
+            els.slice(0, 400).map(e => ({ tag: e.tagName, text: (e.textContent||'').trim().slice(0,50), href: e.getAttribute('href'), role: e.getAttribute('role'), testid: e.getAttribute('data-testid'), cls: (e.getAttribute('class')||'').slice(0,70), ariaSelected: e.getAttribute('aria-selected') })).filter(e => e.text && e.text.length < 50)
+          )
+          console.log('--- settings panel elements (first 400) ---')
+          console.log(JSON.stringify(settingsNav, null, 2))
+          const dialogCount = await page.locator('[role="dialog"]').count()
+          console.log('--- [role=dialog] count ---', dialogCount)
           await browser.close()
           NODE
           node explore.mjs 2>&1 | head -400
