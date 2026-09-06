@@ -12,6 +12,7 @@ gh не вызывается ни одной тестируемой функци
 
 import argparse
 import importlib.util
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,8 @@ LABELS = Path(__file__).resolve().parents[1] / "lib" / "review_labels.py"
 rl_spec = importlib.util.spec_from_file_location("review_labels", LABELS)
 rl = importlib.util.module_from_spec(rl_spec)
 rl_spec.loader.exec_module(rl)  # type: ignore[union-attr]
+
+AI_REVIEW_YML = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ai-review.yml"
 
 
 # ── Контракт вердикта: неоднозначность никогда не одобряет ────────────────────
@@ -794,3 +797,269 @@ def test_ai_review_verdict_posts_status_through_review_labels_helper():
     assert "review_labels.post_commit_status(" in source
     assert "review_labels.STATUS_AI_REVIEW" in source
     assert "review_labels.ai_status_state(verdict)" in source
+
+
+# ── Ручной workflow_dispatch не дублирует прогон, который уже идёт или уже
+# вынес окончательный вердикт на этом же диффе (#399, аудит 197 платных
+# прогонов ai-review за 2026-09-05/06: 44 из них — ручные дубли без ai:failed,
+# 22% всех платных прогонов) ─────────────────────────────────────────────────
+
+def test_ai_review_run_name_matches_prefix_constant():
+    assert rl.ai_review_run_name(399) == "ai-review PR #399"
+    assert rl.ai_review_run_name(399) == f"{rl.AI_REVIEW_RUN_NAME_PREFIX}399"
+
+
+def test_ai_review_workflow_run_name_uses_review_labels_prefix():
+    # yml не читает python-константу (два языка) — префикс обязан совпадать
+    # ДОСЛОВНО в обеих ветках run-name (workflow_dispatch и workflow_run),
+    # иначе матч по display_title в other_active_ai_review_runs молча
+    # перестанет находить свои же прогоны.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    needle = f"format('{rl.AI_REVIEW_RUN_NAME_PREFIX}{{0}}'"
+    assert source.count(needle) == 2
+
+
+def test_other_active_ai_review_runs_filters_by_pr_and_status_excludes_self():
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress", "html_url": "u111"},
+                {"id": 222, "display_title": "ai-review PR #400", "status": "in_progress"},  # чужой PR
+            ]}
+        if "status=queued" in url:
+            return {"workflow_runs": [
+                {"id": 333, "display_title": "ai-review PR #399", "status": "queued"},
+                {"id": 444, "display_title": "ai-review PR #399", "status": "queued"},  # сам вызывающий прогон
+            ]}
+        raise AssertionError(f"неожиданный url: {url}")
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id=444, gh_func=fake_gh)
+
+    assert {m["id"] for m in matches} == {111, 333}
+
+
+def test_other_active_ai_review_runs_queries_both_statuses_with_per_page_100():
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        return {"workflow_runs": []}
+
+    assert rl.other_active_ai_review_runs("o/r", 399, "", fake_gh) == []
+    assert calls == [
+        "repos/o/r/actions/workflows/ai-review.yml/runs?status=in_progress&per_page=100",
+        "repos/o/r/actions/workflows/ai-review.yml/runs?status=queued&per_page=100",
+    ]
+
+
+def test_manual_dispatch_busy_reason_names_run_status_and_declares_force_cannot_bypass():
+    other_run = {"id": 555, "status": "in_progress", "html_url": "https://github.com/o/r/actions/runs/555"}
+    text = ai.manual_dispatch_busy_reason(399, other_run)
+    assert "PR #399" in text
+    assert "555" in text
+    assert "in_progress" in text
+    assert "https://github.com/o/r/actions/runs/555" in text
+    assert "force: true" in text  # владелец не может пробить занятость даже принудительно
+
+
+def test_manual_dispatch_skip_reason_names_verdict_and_age_and_force_escape_hatch():
+    created = datetime.now(timezone.utc) - timedelta(minutes=12)
+    ai_comment = {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "ai:ok" in text
+    assert "force: true" in text
+    minutes = int(text.split("(")[1].split(" мин назад")[0])
+    assert 11 <= minutes <= 13
+
+
+def test_manual_dispatch_skip_reason_prefers_ai_changes_label_when_present():
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:changes-requested"], None)
+    assert "ai:changes-requested" in text
+    assert "неизвестно когда" in text  # ai_comment=None — created_at недоступен
+
+
+def test_manual_dispatch_skip_reason_falls_back_when_no_verdict_label():
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok"], None)
+    assert "неизвестный вердикт" in text
+
+
+def _fake_gh_manual_dispatch(active_runs: dict, labels, comment_body, files):
+    """gh(url) прод-форма для ручного workflow_dispatch: объединяет эндпоинт
+    занятости (actions/workflows/.../runs) с прод-формой pulls/files/comments
+    из _fake_gh_should_run."""
+    should_run_gh = _fake_gh_should_run(labels, comment_body, files)
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        return should_run_gh(url)
+
+    return fake_gh
+
+
+def test_cmd_should_run_manual_dispatch_denied_when_run_already_active(monkeypatch, capsys):
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress", "html_url": "https://x/777"},
+    ], "queued": []}
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость решается раньше сверки отпечатка, лишний вызов: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")  # свой прогон, не 777
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    assert "уже идёт другой прогон" in out.err
+    assert "777" in out.err
+    # Сверка отпечатка (pulls/files/comments) вообще не запрашивается —
+    # занятость отклоняет прогон раньше.
+    assert all("actions/workflows" in c for c in calls)
+
+
+def test_cmd_should_run_manual_dispatch_force_does_not_bypass_busy_check(monkeypatch, capsys):
+    # #399: force:true — осознанный пересмотр ТОГО ЖЕ диффа, а не пропуск
+    # проверки «прогон уже летит прямо сейчас» — второй одновременный прогон
+    # бессмыслен независимо от намерения владельца (см. manual_dispatch_busy_reason).
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость решается раньше --force, лишний вызов: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_manual_dispatch_not_active_denies_on_unchanged_diff(monkeypatch, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    fake_gh = _fake_gh_manual_dispatch(
+        {"in_progress": [], "queued": []}, ["review:ok", "ai:ok"], comment, files)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    assert "дифф не изменился" in out.err
+    assert "ai:ok" in out.err
+    assert "force: true" in out.err
+
+
+def test_cmd_should_run_manual_dispatch_not_active_and_diff_changed_prints_true_silently(monkeypatch, capsys):
+    # Ручной запуск на изменившемся диффе (легитимный повтор без force) не
+    # должен печатать отказ в stderr вовсе — это не дубль.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    stale_fp = rl.diff_fingerprint([{"filename": "a.py", "status": "modified", "sha": "old"}])
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {stale_fp}\n\nОк.\n"
+    fake_gh = _fake_gh_manual_dispatch(
+        {"in_progress": [], "queued": []}, ["review:ok", "ai:ok"], comment, files)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=False))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "true"
+    assert out.err == ""
+
+
+def test_cmd_should_run_manual_dispatch_force_true_not_busy_skips_fingerprint_check(monkeypatch, capsys):
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            return {"workflow_runs": []}
+        raise AssertionError(f"force обязан пропускать сверку отпечатка без сети: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+    # Только проверка занятости (in_progress+queued) — сверки отпечатка нет.
+    assert len(calls) == 2
+
+
+def test_cmd_should_run_busy_check_before_force_mutation_guard(monkeypatch, capsys):
+    # Мутация #399: до фикса cmd_should_run проверял --force ПЕРВЫМ (до
+    # занятости) — ручной дубль поверх уже летящего прогона молча проходил
+    # бы через force:true. Воспроизводим старый порядок как отдельную
+    # функцию и показываем разницу с текущим (исправленным) поведением.
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(url)
+
+    def old_buggy_order(args):
+        if getattr(args, "force", False):
+            print("true")
+            return 0
+        repo = ai.os.environ["GITHUB_REPOSITORY"]
+        active = rl.other_active_ai_review_runs(
+            repo, args.pr, ai.os.environ.get("GITHUB_RUN_ID", ""), fake_gh)
+        print("false" if active else "true")
+        return 0
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+
+    old_buggy_order(argparse.Namespace(pr=294, force=True))
+    assert capsys.readouterr().out.strip() == "true"  # старый баг: дубль проходит
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294, force=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"  # текущий код отказывает
