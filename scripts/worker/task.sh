@@ -99,6 +99,18 @@ if [ "$DRY_RUN" != "1" ] && [ -z "${WORKER_SKIP_DUPGUARD:-}" ]; then
   fi
 fi
 
+# ── Изоляция адаптера модели (#140) — до выбора/захвата задачи: отказ изоляции
+# не должен оставлять живую аренду. dsh с ключом в env обязан пойти под
+# выделенным агент-юзером без группы docker, иначе model-shell читает ключ через
+# docker-эскейп (docs/research/40-model-shell-key-exposure.md). Отказ изоляции —
+# громкий красный job, а не запуск без защиты.
+AGENT_DIR="$WORK/agent"   # каталог агента: NDJSON-спул стрим-плагина пишет он сам
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson"
+# HANDS_SPOOL экспортируется ДО prepare: prepare доказывает проводку каждой
+# заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
+dsh_agent_isolation_prepare gh "$GITHUB_WORKSPACE" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
+
 # Отчёт в Telegram — best-effort: место правды всегда комментарий в задаче,
 # но промах кричит warning'ом в лог job'а, не молчит.
 telegram_report() { # $1 — текст
@@ -344,11 +356,18 @@ export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
 # ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
+# Изоляция уже установлена (блок после dupguard, #140); здесь только export
+# для env_keep и установка транспорта.
 export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 dsh_install "$WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
-dsh_patch_profile headless
+# Патч модели пишет транспорт в СВОЙ каталог, в дом агента его ставит агент:
+# у транспорта нет прав на запись в /home/<agent> (#140).
+dsh_patch_profile headless "$WORK/agent-headless.cordis.patch.yml"
+dsh_agent_run install -D -m 644 "$WORK/agent-headless.cordis.patch.yml" \
+  "$DSH_AGENT_HOME/.dsh/profiles/headless/cordis.patch.yml"
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
@@ -361,19 +380,25 @@ fi
 PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
 npm pack "$SCRIPT_DIR/../../scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
 mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
-dsh plugin --profile headless add "$PLUGIN_TGZ"
-dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+# Монтаж плагина и проверка конфига — под агент-юзером: профиль живёт в его
+# домашнем каталоге, и доказывать надо конфиг РОВНО того пользователя, с которым
+# стартует dsh (#140).
+dsh_agent_run dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh_agent_run dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
   || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался — транскрипт морды невозможен (#119)" >&2; exit 1; }
 
 # ── 7. Прогон: cwd до старта = корень воркспейса и после не меняется (контракт dsh)
-SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# Спул пишет сам dsh (агент-юзер) — путь обязан лежать в его каталоге (#140);
+# HANDS_SPOOL экспортирован до prepare. Файлы агента — снос тоже под агентом.
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
+# Передача воркспейса агенту — ПОСЛЕДНИЙ транспортный шаг: git-операции
+# (task-branch, config) выше исполнены транспортом в своём uid (#140).
+dsh_agent_handover
 set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$PROMPT_FILE")" \
+timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$(cat "$PROMPT_FILE")" \
   >"$ANSWER_FILE" 2>"$ERR_FILE"
 rc=$?
 set -e

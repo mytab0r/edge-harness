@@ -7,9 +7,12 @@
 # (checkout с persist-credentials: false). Агент физически не может
 # запостить комментарий/метку/пуш: его единственный выход — файл ответа,
 # который разбирает доверенный шаг verdict (ai_review.py verdict).
-# DEEPSEEK_API_KEY нужен самому DSH для вызова модели; DSH вырезает env
-# *TOKEN*/*KEY*/*SECRET* из model-shell вызовов — агент и его не видит
-# (проверено живым прогоном 2026-08-30, см. worker.yml).
+# DEEPSEEK_API_KEY нужен самому DSH для вызова модели. Вырезание env
+# *TOKEN*/*KEY*/*SECRET* из model-shell вызовов само по себе границей не
+# является (#140): ключ читается из environ родителя через docker-эскейп.
+# Здесь та же изоляция, что у worker/hands: dsh идёт под агент-юзером без
+# docker, в режиме nogh — без зеркала gh-конфига, его отсутствие проверяется
+# (docs/research/40-model-shell-key-exposure.md).
 #
 # Использование: AI_WORK=<каталог с prompt.md> bash scripts/review/ai_dsh.sh
 # Результат: $AI_WORK/answer.txt (ответ агента), $AI_WORK/stderr.txt,
@@ -33,13 +36,23 @@ export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"
 
 dsh_install "$AI_WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
-dsh_patch_profile headless
+
+# Изоляция #140, режим nogh: у ревью-агента не должно быть gh-авторизации
+# (граница #18) — подготовка сносит протухшее зеркало и проверяет отсутствие.
+AI_AGENT_DIR="$AI_WORK/agent"
+dsh_agent_isolation_prepare nogh "$(pwd)" "$AI_AGENT_DIR" "$AI_WORK/dsh-agent-launcher.sh"
+dsh_patch_profile headless "$AI_WORK/agent-headless.cordis.patch.yml"
+dsh_agent_run install -D -m 644 "$AI_WORK/agent-headless.cordis.patch.yml" \
+  "$DSH_AGENT_HOME/.dsh/profiles/headless/cordis.patch.yml"
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$(cat "$AI_WORK/prompt.md")" \
+timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$(cat "$AI_WORK/prompt.md")" \
   >"$AI_WORK/answer.txt" 2>"$AI_WORK/stderr.txt"
 rc=$?
 set -e

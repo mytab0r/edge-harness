@@ -46,9 +46,21 @@ ANSWER_FILE="$WORK/answer.txt"
 ERR_FILE="$WORK/stderr.txt"
 EVENTS_FILE="$WORK/events.jsonl"
 START_MARK="$WORK/.start-mark"
-SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина dsh-hands-streamer
+AGENT_DIR="$WORK/agent"                       # каталог агента: спул пишет он сам (#140)
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson" # NDJSON-спул плагина dsh-hands-streamer
+# HANDS_SPOOL экспортируется ДО prepare (#140): prepare доказывает проводку
+# каждой заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
+
+# ── Изоляция адаптера модели (#140) — сразу после проверки провайдера и ДО
+# аренды: отказ изоляции не должен оставлять живую аренду задачи. Руки — режим
+# nogh: пуш/PR рукам запрещены по дизайну (GH_RUN_TOKEN снимается до старта
+# DSH), gh-авторизации у агента нет и быть не должно; DSH_AGENT_PNPM=1 —
+# плагин стрима ставится под агентом (dsh plugin add), gh-зеркало не нужно.
+export DSH_AGENT_PNPM=1
+dsh_agent_isolation_prepare nogh "${GITHUB_WORKSPACE:-$REPO_DIR}" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
 
 api() {
   curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
@@ -220,6 +232,7 @@ export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
 dsh_install "$PKGS"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 
 # ── 3a. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
@@ -230,7 +243,10 @@ dsh --version || true
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
 # без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
 # maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
-dsh_patch_profile headless
+# Патч пишет транспорт в свой каталог, в дом агента ставит агент (#140).
+dsh_patch_profile headless "$WORK/agent-headless.cordis.patch.yml"
+dsh_agent_run install -D -m 644 "$WORK/agent-headless.cordis.patch.yml" \
+  "$DSH_AGENT_HOME/.dsh/profiles/headless/cordis.patch.yml"
 
 # ── 3b. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
 # (dsh-streaming, проверка допущений 0: `dsh plugin add` + `--dump-config`
@@ -245,8 +261,10 @@ command -v pnpm >/dev/null || { echo "::error::pnpm не найден — dsh pl
 PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
 npm pack "$REPO_DIR/scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
 mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
-dsh plugin --profile headless add "$PLUGIN_TGZ"
-dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+# Монтаж и доказательство конфига — под агент-юзером: профиль живёт в его доме,
+# доказывать надо конфиг ровно того пользователя, с которым стартует dsh (#140).
+dsh_agent_run dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh_agent_run dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
   || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался: --dump-config без его строки; стрим событий невозможен" >&2; exit 1; }
@@ -265,14 +283,17 @@ touch "$START_MARK"
 
 # Спул стрима: путь задаётся плагину через env до старта dsh; чистый прогон не
 # должен дочитывать старьё от предыдущей попытки. Курсор дрена — единственный
-# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от содержимого).
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от
+# содержимого). Файлы принадлежат агент-юзеру (#140) — снос тоже под агентом:
+# у транспорта нет права записи в каталог агента.
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 dsh_edge_start_drain
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 
 DSH_START_TS=$(date -u +%s)
 set +e
-timeout "$DSH_TIMEOUT_SECS" dsh --profile headless "$TASK_TEXT" >"$ANSWER_FILE" 2>"$ERR_FILE"
+timeout "$DSH_TIMEOUT_SECS" dsh_agent_run dsh --profile headless "$TASK_TEXT" >"$ANSWER_FILE" 2>"$ERR_FILE"
 rc=$?
 set -e
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))

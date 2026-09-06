@@ -105,5 +105,10 @@
 - headless: one-shot, exit 0 только при `turn/end completed`; аппрувы
   fail-closed — не формулируй задачи, требующие аппрува; cwd до старта = корень
   воркспейса, после не менять. [контракт headless](../research/10-dsh-architecture.md#дистрибуция-в-npm-подтверждено-замером-2026-08-2829)
+- Изоляция агента (#140): model-shell работает под выделенным юзером
+  **без docker** и без доступа к environ транспорта — иначе через
+  docker-эскейп читается ключ провайдера ([замер](../research/40-model-shell-key-exposure.md)).
+  Задача, которой нужен docker на раннере, — эскалация владельцу (blocked):
+  при ключе в env dsh это одно и то же.
 - Установка плагинов в headless-профиль: `dsh plugin --profile headless add <tgz>`
   + проверка `--dump-config` до прогона. [подтверждено](../research/10-dsh-architecture.md#12-как-подменить-провайдера-без-форка)
