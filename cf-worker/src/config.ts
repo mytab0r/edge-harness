@@ -110,6 +110,30 @@ export const GITHUB = {
   dispatchEventType: "harness-task",
 } as const;
 
+/** Инлайн-кнопки решения владельца в Telegram (#254). callback_data ограничен
+ *  64 байтами (лимит Bot API) — формат `{callbackPrefix}:<issue>:<option>`
+ *  укладывается с большим запасом даже при 10-значном номере issue и
+ *  двузначном номере варианта (не подтверждено больше пары цифр вариантов —
+ *  UI не предполагает десятки кнопок в одном сообщении). */
+export const TELEGRAM = {
+  apiBase: "https://api.telegram.org",
+  /** Заголовок вебхука Telegram (`setWebhook(secret_token=...)`), которым
+   *  морда отличает настоящий апдейт от чужого POST на тот же путь. */
+  webhookSecretHeader: "X-Telegram-Bot-Api-Secret-Token",
+  /** Префикс callback_data — не про секретность, а разбор формата. */
+  callbackPrefix: "wo",
+  /** event_type repository_dispatch, которым решение владельца уходит в
+   *  тонкий job (только issues:write, .github/workflows/owner-decision.yml) —
+   *  НЕ переиспользует GITHUB.dispatchEventType: тот поднимает полноценный
+   *  DSH-джоб hands.yml, здесь только один комментарий в issue. */
+  ownerDecisionDispatchType: "owner-decision",
+  /** Первая строка комментария — единственный формат, который (по решению
+   *  #470/#471) снимает метку waiting:owner; кнопка производит тот же
+   *  артефакт, что и ручной ответ владельца, второй способ применения не
+   *  заводится. */
+  decisionCommentPrefix: "РЕШЕНИЕ",
+} as const;
+
 /** Ретеншн DO SQLite (#306/#305): без него `events`/`tasks` растут вечно, и
  *  любой скан со временем дорожает — тот же класс, что подпалил суточную квоту
  *  rows_read (#320, docs/research/20-cloudflare-free.md, раздел «Инцидент:

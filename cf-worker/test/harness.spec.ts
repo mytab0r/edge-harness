@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { asString, classifyStorageError, handsAreAlive, messageStuck, storageErrorResponse } from "../src/harness";
+import { asString, classifyStorageError, handsAreAlive, messageStuck, parseOwnerDecisionCallback, storageErrorResponse } from "../src/harness";
 
 import { redact } from "../src/redact";
 import { LIMITS, RETENTION } from "../src/config";
@@ -23,6 +23,19 @@ async function postJson(path: string, body: unknown): Promise<Response> {
   return WORKER.fetch(`https://example.com${path}`, {
     method: "POST",
     headers: { ...AUTH, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// Вебхук Telegram (#254): реальный вызов не несёт ни Bearer, ни куки — только
+// секретный заголовок из setWebhook(secret_token=...). Тестовое значение — то
+// же, что в vitest.config.ts (TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret").
+async function postTelegramWebhook(body: unknown, secret: string | null = "test-webhook-secret"): Promise<Response> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (secret !== null) headers["X-Telegram-Bot-Api-Secret-Token"] = secret;
+  return WORKER.fetch("https://example.com/api/messages/ingest", {
+    method: "POST",
+    headers,
     body: JSON.stringify(body),
   });
 }
@@ -54,6 +67,27 @@ function isGitHubIssuesCall(input: string | URL | Request): boolean {
     return url.hostname === "api.github.com" && url.pathname.endsWith("/issues");
   } catch {
     return false;
+  }
+}
+
+// Тот же приём для repository_dispatch решения владельца (#254) и для
+// вызовов Bot API (host+хвост пути метода, не подстрокой).
+function isGitHubDispatchCall(input: string | URL | Request): boolean {
+  try {
+    const url = new URL(String(input));
+    return url.hostname === "api.github.com" && url.pathname.endsWith("/dispatches");
+  } catch {
+    return false;
+  }
+}
+
+function telegramApiMethod(input: string | URL | Request): string | null {
+  try {
+    const url = new URL(String(input));
+    if (url.hostname !== "api.telegram.org") return null;
+    return url.pathname.split("/").pop() ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -1443,6 +1477,233 @@ describe("inbox: сообщения владельца", () => {
   });
 });
 
+describe("Telegram: кнопки решения владельца (#254)", () => {
+  let seq = 0;
+  const updateId = () => 9_000_000_000 + Date.now() % 1_000_000 + seq++;
+
+  // Прод-форма callback_query (Bot API): message несёт СВОЮ же исходную
+  // клавиатуру обратно — метка нажатой кнопки читается из неё, второе
+  // хранилище подписей не заводится.
+  function callbackUpdate(opts: { data: string; messageText?: string; withKeyboard?: boolean }) {
+    return {
+      update_id: updateId(),
+      callback_query: {
+        id: `cbq-${Date.now()}-${Math.random()}`,
+        from: { id: 777000, is_bot: false, first_name: "Владелец", username: "owner" },
+        message: {
+          message_id: 555,
+          chat: { id: -1001234567890, type: "supergroup" },
+          date: 1756400000,
+          text: opts.messageText ?? "Нужно решение: вариант А или Б?",
+          ...(opts.withKeyboard === false
+            ? {}
+            : {
+                reply_markup: {
+                  inline_keyboard: [
+                    [
+                      { text: "Вариант А", callback_data: "wo:471:1" },
+                      { text: "Вариант Б", callback_data: "wo:471:2" },
+                    ],
+                  ],
+                },
+              }),
+        },
+        data: opts.data,
+      },
+    };
+  }
+
+  it("маршрут отклоняет вебхук без секретного заголовка и с чужим значением — тот же 401, что и у остального API", async () => {
+    const noHeader = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }), null);
+    expect(noHeader.status).toBe(401);
+    expect((await noHeader.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+
+    const wrongSecret = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }), "wrong-secret-value");
+    expect(wrongSecret.status).toBe(401);
+  });
+
+  it("обход секретом Telegram открывает ТОЛЬКО messagesIngest, не весь API (узость bypass'а)", async () => {
+    const res = await WORKER.fetch("https://example.com/api/status", {
+      headers: { "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret" },
+    });
+    expect(res.status).toBe(401); // валидный секрет вебхука не открывает /api/status
+  });
+
+  it("callback_query с правильным секретом принят, отвечает Telegram'у и уходит repository_dispatch с event_type owner-decision", async () => {
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    const dispatchCalls: Record<string, unknown>[] = [];
+    const telegramCalls: { method: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubDispatchCall(input)) {
+        dispatchCalls.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(null, { status: 204 });
+      }
+      const method = telegramApiMethod(input);
+      if (method) {
+        telegramCalls.push({ method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:2" }));
+      expect(res.status).toBe(200);
+      const body = await res.json<{ status: string }>();
+      expect(body.status).toBe("callback_processed");
+
+      expect(dispatchCalls).toHaveLength(1);
+      expect(dispatchCalls[0].event_type).toBe("owner-decision");
+      expect(dispatchCalls[0].client_payload).toEqual({ issue_number: 471, option: 2 });
+
+      const answer = telegramCalls.find((c) => c.method === "answerCallbackQuery");
+      expect(answer).toBeDefined();
+      expect(answer!.body.text).toContain("Вариант Б"); // подпись именно нажатой кнопки
+
+      const edit = telegramCalls.find((c) => c.method === "editMessageText");
+      expect(edit).toBeDefined();
+      expect(edit!.body.chat_id).toBe(-1001234567890);
+      expect(edit!.body.message_id).toBe(555);
+      expect(String(edit!.body.text)).toContain("Вариант Б");
+      expect(edit!.body.reply_markup).toEqual({ inline_keyboard: [] }); // кнопки сняты — повторное нажатие невозможно
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+      env.TELEGRAM_BOT_TOKEN = "";
+    }
+  });
+
+  it("повторная доставка того же update_id (ретрай Telegram) не дублирует dispatch, но снова отвечает владельцу", async () => {
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    let dispatchCount = 0;
+    let answerCount = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubDispatchCall(input)) {
+        dispatchCount++;
+        return new Response(null, { status: 204 });
+      }
+      if (telegramApiMethod(input) === "answerCallbackQuery") answerCount++;
+      if (telegramApiMethod(input)) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const update = callbackUpdate({ data: "wo:471:1" });
+      const first = await postTelegramWebhook(update);
+      expect((await first.json<{ status: string }>()).status).toBe("callback_processed");
+      const retry = await postTelegramWebhook(update); // тот же update_id — ретрай
+      expect((await retry.json<{ status: string }>()).status).toBe("callback_duplicate");
+
+      expect(dispatchCount).toBe(1); // побочный эффект в GitHub — ровно один раз
+      expect(answerCount).toBe(2); // владелец получает ответ на КАЖДУЮ доставку, кнопка не «висит»
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+      env.TELEGRAM_BOT_TOKEN = "";
+    }
+  });
+
+  it("кривой callback_data — честный callback_ignored, Telegram получает 200 (не 4xx, чтобы не ретраить бессмысленно)", async () => {
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    const realFetch = globalThis.fetch;
+    const telegramCalls: { method: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const method = telegramApiMethod(input);
+      if (method) {
+        telegramCalls.push({ method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      if (isGitHubDispatchCall(input)) throw new Error("dispatch не должен звониться на кривой callback_data");
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postTelegramWebhook(callbackUpdate({ data: "чужой-формат" }));
+      expect(res.status).toBe(200);
+      expect((await res.json<{ status: string }>()).status).toBe("callback_ignored");
+      const answer = telegramCalls.find((c) => c.method === "answerCallbackQuery");
+      expect(answer?.body.text).toContain("Не понял формат");
+    } finally {
+      vi.unstubAllGlobals();
+      env.TELEGRAM_BOT_TOKEN = "";
+    }
+  });
+
+  it("без GH_DISPATCH_TOKEN — честный текст «запись не ушла», кнопка всё равно отвечает и снимается (не тихая дыра)", async () => {
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    const realFetch = globalThis.fetch;
+    const telegramCalls: { method: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const method = telegramApiMethod(input);
+      if (method) {
+        telegramCalls.push({ method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }));
+      expect(res.status).toBe(200);
+      const answer = telegramCalls.find((c) => c.method === "answerCallbackQuery");
+      expect(answer?.body.text).toContain("запись в задачу не ушла");
+      const edit = telegramCalls.find((c) => c.method === "editMessageText");
+      expect(edit?.body.reply_markup).toEqual({ inline_keyboard: [] }); // кнопки сняты и без успешного dispatch
+    } finally {
+      vi.unstubAllGlobals();
+      env.TELEGRAM_BOT_TOKEN = "";
+    }
+  });
+
+  it("без TELEGRAM_BOT_TOKEN — ни один вызов Telegram не улетает, но dispatch и ответ вебхуку не падают", async () => {
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    const realFetch = globalThis.fetch;
+    let telegramCallsSeen = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (telegramApiMethod(input)) {
+        telegramCallsSeen++;
+        return new Response("не должен вызываться", { status: 500 });
+      }
+      if (isGitHubDispatchCall(input)) return new Response(null, { status: 204 });
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }));
+      expect(res.status).toBe(200);
+      expect((await res.json<{ status: string }>()).status).toBe("callback_processed");
+      expect(telegramCallsSeen).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
+  it("без reply_markup в исходном сообщении подпись падает на честный «вариант N», не на исключение", async () => {
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    const realFetch = globalThis.fetch;
+    const telegramCalls: { method: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const method = telegramApiMethod(input);
+      if (method) {
+        telegramCalls.push({ method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      if (isGitHubDispatchCall(input)) return new Response(null, { status: 204 });
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      await postTelegramWebhook(callbackUpdate({ data: "wo:471:3", withKeyboard: false }));
+      const answer = telegramCalls.find((c) => c.method === "answerCallbackQuery");
+      expect(answer?.body.text).toContain("вариант 3");
+    } finally {
+      vi.unstubAllGlobals();
+      env.TELEGRAM_BOT_TOKEN = "";
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+});
+
 describe("чистые функции инбокса", () => {
   const NOW = 1_800_000_000_000;
 
@@ -1464,6 +1725,35 @@ describe("чистые функции инбокса", () => {
 
   it("таймаут вызова GitHub заведомо меньше ватчдога — иначе висящий fetch доживёт до ретрая другой проходки (двойной issue)", () => {
     expect(LIMITS.messageIssueFetchTimeoutMs).toBeLessThan(LIMITS.messageStuckProcessingMs);
+  });
+
+  // ── callback_data инлайн-кнопки решения владельца (#254) ──────────────────────────
+  it("parseOwnerDecisionCallback: разбирает валидный формат wo:<issue>:<option>", () => {
+    expect(parseOwnerDecisionCallback("wo:471:2")).toEqual({ issue: 471, option: 2 });
+    // Номер issue в этом репозитории уже трёхзначный — граница на будущее:
+    // 6-значный issue + однозначный вариант всё равно укладывается в 64 байта.
+    expect(parseOwnerDecisionCallback("wo:999999:9")).toEqual({ issue: 999999, option: 9 });
+  });
+
+  it("parseOwnerDecisionCallback: чужой префикс, дробные/отрицательные/нечисловые части, пусто — null, а не угаданное значение", () => {
+    expect(parseOwnerDecisionCallback(null)).toBeNull();
+    expect(parseOwnerDecisionCallback(undefined)).toBeNull();
+    expect(parseOwnerDecisionCallback("")).toBeNull();
+    expect(parseOwnerDecisionCallback("other:471:2")).toBeNull(); // чужой bot/старый формат
+    expect(parseOwnerDecisionCallback("wo:471")).toBeNull(); // не хватает поля
+    expect(parseOwnerDecisionCallback("wo:471:2:extra")).toBeNull();
+    expect(parseOwnerDecisionCallback("wo:0:2")).toBeNull(); // issue #0 не существует
+    expect(parseOwnerDecisionCallback("wo:471:0")).toBeNull(); // варианты нумеруются с 1
+    expect(parseOwnerDecisionCallback("wo:-471:2")).toBeNull();
+    expect(parseOwnerDecisionCallback("wo:471.5:2")).toBeNull();
+    expect(parseOwnerDecisionCallback("wo:abc:2")).toBeNull();
+  });
+
+  it("callback_data формата wo:<issue>:<option> укладывается в лимит Bot API 64 байта даже на щедрой границе", () => {
+    // Щедрая граница: issue до 10 цифр (текущий номер трёхзначный, запас на годы
+    // вперёд), вариант до 2 цифр (UI не предполагает больше десятка кнопок).
+    const generous = `wo:${"9".repeat(10)}:${"9".repeat(2)}`;
+    expect(new TextEncoder().encode(generous).length).toBeLessThanOrEqual(64);
   });
 });
 

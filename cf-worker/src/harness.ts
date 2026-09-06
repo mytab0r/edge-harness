@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION } from "./config";
+import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION, TELEGRAM } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 import { redact } from "./redact";
@@ -486,6 +486,23 @@ export function asObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+/** Разбор callback_data инлайн-кнопки решения владельца (#254). Формат
+ *  `{TELEGRAM.callbackPrefix}:<issue>:<option>` — чистая функция, тестируется
+ *  без сети и без DO. Оба числа обязаны быть положительными целыми (issue —
+ *  номер существующей задачи, option — номер варианта, начиная с 1); любое
+ *  другое значение (чужой bot, старый формат, порча данных) — null, вызывающий
+ *  код обязан явно ответить владельцу «не понял», а не упасть неизвестно как. */
+export function parseOwnerDecisionCallback(data: string | null | undefined): { issue: number; option: number } | null {
+  if (!data) return null;
+  const parts = data.split(":");
+  if (parts.length !== 3 || parts[0] !== TELEGRAM.callbackPrefix) return null;
+  const issue = Number(parts[1]);
+  const option = Number(parts[2]);
+  if (!Number.isInteger(issue) || issue <= 0) return null;
+  if (!Number.isInteger(option) || option <= 0) return null;
+  return { issue, option };
+}
+
 /** Итог создания issue для директивы. retryable=false — повторять бессмысленно. */
 type IssueOutcome =
   | { ok: true; number: number; url: string; redacted: boolean }
@@ -603,17 +620,33 @@ export class Harness extends DurableObject<Env> {
     if (url.searchParams.has("token")) {
       throw new ApiError(400, "query_token_removed");
     }
-    if (!(await this.#authorized(request))) {
-      throw new ApiError(401, "unauthorized");
-    }
 
     // Роутинг табличный: метод+путь ищутся в api-spec.json. Добавить маршрут можно
     // только через спеку — «объявлен в спеке, но не подключён» и наоборот невозможны.
+    // Матчинг ДО общей авторизации (находка #254): единственному маршруту
+    // (messagesIngest) нужно решить, каким из ДВУХ способов проверять запрос —
+    // без имени маршрута это решить нельзя. Несуществующий путь при этом
+    // по-прежнему получает 401 раньше 404 (см. ниже) — неавторизованный
+    // вызывающий не узнаёт, существует ли маршрут, поведение не изменилось.
     const matched = matchRoute(request.method, url.pathname);
     if (!matched) {
+      if (!(await this.#authorized(request))) {
+        throw new ApiError(401, "unauthorized");
+      }
       throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
     }
     const { route } = matched;
+
+    // Единственное исключение из общей авторизации: вебхук Telegram не может
+    // прислать ни Bearer, ни сессионную куку — вместо этого штатный секретный
+    // заголовок вебхука (Telegram setWebhook(secret_token=…)), сверенный
+    // константным по времени сравнением (#254). Обход узкий — открывает
+    // только messagesIngest, не остальной API; секрет не задан — обхода нет
+    // вовсе («возможности нет», не тихая дыра).
+    const telegramAuthorized = route.name === "messagesIngest" && this.#telegramWebhookAuthorized(request);
+    if (!telegramAuthorized && !(await this.#authorized(request))) {
+      throw new ApiError(401, "unauthorized");
+    }
 
     if (route.name === "status") {
       return this.#json(this.#status());
@@ -685,6 +718,18 @@ export class Harness extends DurableObject<Env> {
     const header = request.headers.get("Authorization");
     if (header === `Bearer ${expected}`) return true;
     return this.#sessionValid(request);
+  }
+
+  /** Третий способ авторизации, узко для messagesIngest (#254): секретный
+   *  заголовок вебхука Telegram, а не Bearer/кука. Секрет не задан или
+   *  заголовок отсутствует/не совпал — обхода нет, это НЕ 401 caller'у
+   *  напрямую (решает вызывающий #route), а просто «нет», как у #authorized. */
+  #telegramWebhookAuthorized(request: Request): boolean {
+    const secret = this.env.TELEGRAM_WEBHOOK_SECRET;
+    if (!secret) return false;
+    const header = request.headers.get(TELEGRAM.webhookSecretHeader);
+    if (!header) return false;
+    return constantTimeEqual(header, secret);
   }
 
   async #hmac(payload: string): Promise<string> {
@@ -1748,13 +1793,20 @@ export class Harness extends DurableObject<Env> {
   }
 
   /**
-   * Приём сообщения владельца в инбокс. Авторизация — обычная (Bearer/кука):
-   * эндпоинт админско-релейный, прямая доставка вебхуком Telegram не подключена
-   * (для неё нужен свой секрет — отдельное решение). Понимает и плоскую форму
-   * (source, source_msg_id, …), и сырой Telegram update.
+   * Приём сообщения владельца в инбокс. Авторизация — Bearer/кука ИЛИ
+   * секретный заголовок вебхука Telegram (#254, проверен в #route ДО сюда).
+   * Понимает три формы тела: плоскую (source, source_msg_id, …), сырой
+   * Telegram update сообщения, и update с callback_query (нажатие инлайн-
+   * кнопки решения владельца, #470/#471) — у него нет общих полей с первыми
+   * двумя (нет message/text верхним уровнем), поэтому разбирается отдельной
+   * веткой ДО остального разбора, а не падает в need_text.
    */
   #postMessageIngest(request: Request): Promise<Response> {
     return this.#readJson(request).then((body) => {
+      const callbackQuery = asObject(body.callback_query);
+      if (callbackQuery) {
+        return this.#postOwnerDecisionCallback(body, callbackQuery);
+      }
       const message = asObject(body.message);
       const from = asObject(body.from) ?? asObject(message?.from);
       const chat = asObject(body.chat) ?? asObject(message?.chat);
@@ -1784,6 +1836,157 @@ export class Harness extends DurableObject<Env> {
       this.#broadcastStatus();
       return this.#json({ message_id: stored.id, status: "accepted" }, { status: 201 });
     });
+  }
+
+  /**
+   * Нажатие инлайн-кнопки решения владельца (#254): вебхук Telegram, апдейт
+   * с полем callback_query вместо message. Три обязанности:
+   *   1. answerCallbackQuery — без него кнопка «крутится» в клиенте владельца;
+   *   2. editMessageText — визуально видно, какой вариант выбран, кнопки сняты;
+   *   3. РОВНО ОДИН РАЗ (идемпотентность по update_id, тот же #putMessage, что
+   *      у сообщений) уходит repository_dispatch (event_type owner-decision,
+   *      GH_DISPATCH_TOKEN — тот же секрет и та же роль, что у dispatch задач,
+   *      ADR 0008: только Contents+Actions, Issues здесь не нужны) в тонкий
+   *      job (.github/workflows/owner-decision.yml, только issues:write),
+   *      который оставляет комментарий «РЕШЕНИЕ: N» — тот же артефакт, что и
+   *      ручной ответ владельца (#470/#471); снимает метку waiting:owner уже
+   *      существующая гвардия на следующем пульсе orchestra, второй "apply"
+   *      здесь не заводится.
+   * Отвечает Telegram'у 200 всегда (кроме полностью нечитаемого апдейта без
+   * единого идентификатора) — 4xx на кривой callback_data заставил бы
+   * Telegram ретраить апдейт, которому ретраи не помогут.
+   */
+  async #postOwnerDecisionCallback(body: Record<string, unknown>, callbackQuery: Record<string, unknown>): Promise<Response> {
+    const callbackId = asString(callbackQuery.id);
+    const sourceMsgId = asString(body.update_id) ?? callbackId;
+    if (!sourceMsgId) throw new ApiError(400, "need_source_msg_id");
+
+    const from = asObject(callbackQuery.from);
+    const message = asObject(callbackQuery.message);
+    const chat = asObject(message?.chat);
+    const chatId = asString(chat?.id);
+    const messageId = asString(message?.message_id);
+    const data = typeof callbackQuery.data === "string" ? callbackQuery.data : null;
+
+    const stored = this.#putMessage({
+      source: "telegram_callback",
+      sourceMsgId,
+      chatId,
+      senderId: asString(from?.id),
+      senderName: asString(from?.username) ?? asString(from?.first_name),
+      text: data ?? "",
+    });
+
+    const parsed = parseOwnerDecisionCallback(data);
+    // Подпись кнопки — из ЕЁ ЖЕ разметки в исходном сообщении (Telegram
+    // присылает reply_markup обратно внутри callback_query.message): второе
+    // хранилище подписей вариантов не заводим, оно и так лежит у Telegram.
+    const keyboard = asObject(message?.reply_markup)?.inline_keyboard;
+    const label = this.#ownerDecisionOptionLabel(keyboard, data);
+
+    let answerText: string;
+    if (!parsed) {
+      answerText = "Не понял формат ответа — сообщи, пожалуйста, текстом.";
+    } else if (!stored.fresh) {
+      answerText = `Уже учтено: ${label}`;
+    } else {
+      const dispatch = await this.#dispatchOwnerDecision(parsed.issue, parsed.option);
+      answerText = dispatch.ok
+        ? `Принято: ${label}`
+        : `Принято, но запись в задачу не ушла (${dispatch.error}) — ответь тем же текстом в issue.`;
+    }
+
+    if (callbackId) {
+      await this.#telegramApi("answerCallbackQuery", { callback_query_id: callbackId, text: answerText });
+    }
+    if (chatId && messageId) {
+      const originalText = asString(message?.text) ?? "";
+      await this.#telegramApi("editMessageText", {
+        chat_id: chat?.id, // числом, как прислал Telegram — editMessageText принимает и число, и строку
+        message_id: Number(messageId),
+        text: `${originalText}\n\n✅ ${answerText}`.trim(),
+        reply_markup: { inline_keyboard: [] },
+      });
+    }
+
+    this.#broadcastStatus();
+    return this.#json({
+      message_id: stored.id,
+      status: parsed ? (stored.fresh ? "callback_processed" : "callback_duplicate") : "callback_ignored",
+    });
+  }
+
+  /** Подпись варианта — берётся из подписи НАЖАТОЙ кнопки в исходной
+   *  клавиатуре (совпадение по callback_data), иначе честный номер варианта. */
+  #ownerDecisionOptionLabel(keyboard: unknown, data: string | null): string {
+    if (Array.isArray(keyboard)) {
+      for (const row of keyboard) {
+        if (!Array.isArray(row)) continue;
+        for (const button of row) {
+          const b = asObject(button);
+          if (b && b.callback_data === data && typeof b.text === "string") return b.text;
+        }
+      }
+    }
+    const parsed = parseOwnerDecisionCallback(data);
+    return parsed ? `вариант ${parsed.option}` : "не распознано";
+  }
+
+  /** Вызов Bot API (answerCallbackQuery/editMessageText). Best-effort, тот же
+   *  принцип, что у send_telegram (Python, scripts/orchestra/pulse_guard.py):
+   *  секрет не задан или сеть недоступна — громкий console.error, не throw
+   *  (ответ владельцу важнее, чем падение всего запроса из-за необязательного
+   *  внешнего звонка). */
+  async #telegramApi(method: string, payload: Record<string, unknown>): Promise<void> {
+    const token = this.env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      console.error(`telegramApi(${method}): TELEGRAM_BOT_TOKEN не задан — ответ владельцу не отправлен`);
+      return;
+    }
+    try {
+      const res = await fetch(`${TELEGRAM.apiBase}/bot${token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        console.error(`telegramApi(${method}): Telegram ответил ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      }
+    } catch (error) {
+      console.error(`telegramApi(${method}): сеть недоступна: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  /**
+   * repository_dispatch решения владельца (#254) — тот же токен и тот же
+   * эндпоинт, что у #postTask/alarm, другой event_type (не поднимает
+   * hands.yml). Секрет/репозиторий не заданы — честный «not_configured», как
+   * и у остальных dispatch-путей морды (alarm, #postTask).
+   */
+  async #dispatchOwnerDecision(issueNumber: number, option: number): Promise<{ ok: boolean; error?: string }> {
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) return { ok: false, error: "dispatch_not_configured" };
+    try {
+      const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({
+          event_type: TELEGRAM.ownerDecisionDispatchType,
+          client_payload: { issue_number: issueNumber, option },
+        }),
+      });
+      if (res.status !== 204) return { ok: false, error: `github_${res.status}` };
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /**

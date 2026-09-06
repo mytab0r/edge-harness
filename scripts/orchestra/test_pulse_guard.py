@@ -9,6 +9,7 @@ conveyor_gate/heartbeat_check проверяется на моке gh — сет
 """
 
 import importlib.util
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -172,6 +173,70 @@ def test_send_telegram_as_html_passes_markup_verbatim(monkeypatch):
     markup = '<a href="https://github.com/o/r/issues/7">#7</a>'
     assert pg.send_telegram(markup, as_html=True) is True
     assert f"text={markup}" in " ".join(calls[0][0])  # повторное экранирование убило бы ссылку
+
+
+def test_send_telegram_with_reply_markup_passes_json_keyboard(monkeypatch):
+    # #254: reply_markup — необязательный параметр, обычные вызовы (тесты выше)
+    # его не передают и не ломаются им; здесь проверяется, что переданный
+    # действительно уходит в тот же curl-запрос сериализованным JSON.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    calls = []
+    monkeypatch.setattr(pg, "subprocess",
+                        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+                            returncode=0, stderr="")))
+    keyboard = pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
+    assert pg.send_telegram("Нужно решение", reply_markup=keyboard) is True
+    joined = " ".join(calls[0][0])
+    assert f"reply_markup={json.dumps(keyboard)}" in joined
+
+
+def test_send_telegram_without_reply_markup_does_not_add_the_flag(monkeypatch):
+    # Мутация «reply_markup=None всегда сериализуется» красит этот тест: старые
+    # вызовы (escalate без options) не должны нести пустой/None reply_markup.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    calls = []
+    monkeypatch.setattr(pg, "subprocess",
+                        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+                            returncode=0, stderr="")))
+    assert pg.send_telegram("обычный алерт") is True
+    assert "reply_markup" not in " ".join(calls[0][0])
+
+
+def test_build_decision_keyboard_callback_data_matches_ts_format_and_byte_limit():
+    keyboard = pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б", "Обсудить"])
+    rows = keyboard["inline_keyboard"]
+    assert rows == [
+        [{"text": "Вариант А", "callback_data": "wo:471:1"}],
+        [{"text": "Вариант Б", "callback_data": "wo:471:2"}],
+        [{"text": "Обсудить", "callback_data": "wo:471:3"}],
+    ]
+    for row in rows:
+        assert len(row[0]["callback_data"].encode("utf-8")) <= 64
+
+
+def test_build_decision_keyboard_rejects_empty_options():
+    with pytest.raises(ValueError):
+        pg.build_decision_keyboard(471, [])
+
+
+def test_escalate_without_options_keeps_old_signature_behaviour(monkeypatch):
+    posted = []
+    sent = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
+    result = pg.escalate("o/r", 120, "обычная эскалация")
+    assert sent == [None]  # старые вызовы (без options) не порождают клавиатуру
+    assert "доставлен" in result
+
+
+def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
+    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
+    assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
 
 
 def test_merge_telegram_text_is_short_clickable_and_escaped():

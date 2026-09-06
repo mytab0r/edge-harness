@@ -1,0 +1,44 @@
+# Применение решения владельца, присланного нажатием инлайн-кнопки в Telegram
+# (#254). Морда шлёт repository_dispatch тем же узким GH_DISPATCH_TOKEN, что и
+# остальной dispatch-путь (ADR 0008: только Contents+Actions на этот
+# репозиторий) — этот job не получает НИКАКОГО нового секрета, только
+# issues:write из своих же permissions (github.token).
+#
+# Результат неотличим от ручного ответа владельца комментарием (#470/#471):
+# первая строка «РЕШЕНИЕ: N» — тот же артефакт, который снимает waiting:owner
+# существующая гвардия scripts/orchestra/waiting_owner_guard.py на следующем
+# пульсе orchestra. Второй "apply"-путь здесь НЕ заводится, только запись
+# комментария (apply_owner_decision.py переиспользует post_issue_comment).
+#
+# ⚠️ repository_dispatch запускает воркфлоу только с файла на default branch
+#    (docs/research/21-github-actions.md) — до мержа этого файла в main
+#    события owner-decision принимаются GitHub API (204), но job не стартует.
+name: owner-decision
+
+on:
+  repository_dispatch:
+    types: [owner-decision]
+
+permissions:
+  issues: write
+
+concurrency:
+  # Сериализация по задаче: два подряд нажатия на одну и ту же задачу (двойной
+  # тап, повтор доставки) не гонятся друг с другом за порядком комментариев.
+  group: owner-decision-${{ github.event.client_payload.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Комментарий с решением владельца
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/orchestra/apply_owner_decision.py \
+            --repo "${{ github.repository }}" \
+            --issue "${{ github.event.client_payload.issue_number }}" \
+            --option "${{ github.event.client_payload.option }}"

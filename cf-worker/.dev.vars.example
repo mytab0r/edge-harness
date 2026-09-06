@@ -8,3 +8,15 @@ GH_DISPATCH_TOKEN=
 # инбокс создаёт issue для директивы владельца. Пусто — директива повторяется
 # с честной ошибкой issues_not_configured, пока секрет не задан.
 GH_ISSUES_TOKEN=
+# Токен бота Telegram (тот же секрет репозитория TELEGRAM_BOT_TOKEN, что уже
+# использует pulse_guard.py для исходящих сообщений, #254): нужен, чтобы
+# морда сама отвечала на нажатие кнопки (answerCallbackQuery/editMessageText).
+# Пусто — callback_query честно логируется как telegram_bot_token_missing,
+# кнопка у владельца останется «крутиться».
+TELEGRAM_BOT_TOKEN=
+# Секрет вебхука Telegram (setWebhook(secret_token=...), #254): владелец
+# придумывает значение сам (любая случайная строка, только A-Z a-z 0-9 _ -,
+# 1-256 символов — ограничение самого Telegram) и передаёт РОВНО ТО ЖЕ
+# значение в вызов setWebhook. Пусто — вебхук-путь для callback_query закрыт
+# наглухо (никакой заголовок не пройдёт), это дыра, а не удобство.
+TELEGRAM_WEBHOOK_SECRET=
