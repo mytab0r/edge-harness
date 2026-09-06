@@ -40,6 +40,31 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/telegram/test_register_webhook.py -q
 
+      # Временная диагностика issue #524: зонд получает 403 при верном секрете.
+      # Нужно отличить платформенный отказ (Cloudflare edge перед воркером —
+      # HTML/`cf-ray`, не JSON ApiError) от отказа в коде воркера, и проверить
+      # гипотезу про User-Agent (снят перед мержем в PR).
+      - name: 'ВРЕМЕННО (#524): сырой ответ ingest с разными User-Agent'
+        env:
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+        run: |
+          set -x
+          for ua in "" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "TelegramBot (like TwitterBot)"; do
+            echo "::group::UA=[$ua]"
+            if [ -n "$ua" ]; then ua_args=(-A "$ua"); else ua_args=(); fi
+            curl -sS -D - -o /tmp/body.bin -w '\nHTTP_STATUS=%{http_code}\n' \
+              -X POST "${HARNESS_URL}/api/messages/ingest" \
+              -H "X-Telegram-Bot-Api-Secret-Token: ${TELEGRAM_WEBHOOK_SECRET}" \
+              -H "Content-Type: application/json" \
+              "${ua_args[@]}" \
+              --data '{}' || true
+            echo "--- body (first 500 bytes) ---"
+            head -c 500 /tmp/body.bin || true
+            echo
+            echo "::endgroup::"
+          done
+
       - name: Регистрация вебхука
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
