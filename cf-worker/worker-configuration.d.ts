@@ -10,6 +10,7 @@ interface __BaseEnv_Env {
 	GH_ISSUES_TOKEN: string;
 	TELEGRAM_BOT_TOKEN: string;
 	TELEGRAM_WEBHOOK_SECRET: string;
+	TELEGRAM_CHAT_ID: string;
 	HARNESS: DurableObjectNamespace<import("./src/index").Harness>;
 }
 declare namespace Cloudflare {
@@ -24,7 +25,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "GH_REPO" | "HANDS_TOKEN" | "SESSION_SECRET" | "GH_DISPATCH_TOKEN" | "GH_ISSUES_TOKEN" | "TELEGRAM_BOT_TOKEN" | "TELEGRAM_WEBHOOK_SECRET">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "GH_REPO" | "HANDS_TOKEN" | "SESSION_SECRET" | "GH_DISPATCH_TOKEN" | "GH_ISSUES_TOKEN" | "TELEGRAM_BOT_TOKEN" | "TELEGRAM_WEBHOOK_SECRET" | "TELEGRAM_CHAT_ID">> {}
 }
 
 // Begin runtime types

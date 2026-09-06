@@ -100,6 +100,20 @@ def test_variant_lines_stops_at_next_header():
     assert all("area:orchestra" not in line for line in lines)
 
 
+# ── variant_option_labels (#254, PR #486: подписи кнопок) ───────────────────
+
+
+def test_variant_option_labels_strips_numbering_and_consequence():
+    labels = wog.variant_option_labels(NEW_FORMAT_BODY)
+    assert labels == ["Секрет с правами администратора", "Оставить ручной инструмент"]
+
+
+def test_variant_option_labels_empty_without_variants_block():
+    """Тот же честный крайний случай, что variant_lines()/should_auto_label():
+    блока нет вовсе — пустой список, не исключение."""
+    assert wog.variant_option_labels(ISSUE_370_BODY) == []
+
+
 def test_should_auto_label_true_for_two_variants():
     assert wog.should_auto_label(NEW_FORMAT_BODY) is True
 
@@ -351,6 +365,63 @@ def test_waiting_owner_check_escalates_without_prior_marker(monkeypatch, offline
     assert commented, "эскалация обязана оставить след прямо в задаче"
     body_arg = next(a for a in commented[0] if a.startswith("body="))
     assert wog.WAITING_OWNER_ESCALATE_MARKER in body_arg
+
+
+def test_waiting_owner_check_passes_variant_labels_as_escalate_options(monkeypatch):
+    """Находка ревью PR #486 (доведено этим коммитом): машиночитаемый блок
+    вариантов — escalate() получает options, кнопочное сообщение реально
+    уходит, а не только helper существует непримененным."""
+    calls = []
+
+    def fake(*args):
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
+            return []
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+            return [{"number": 500, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
+                     "body": NEW_FORMAT_BODY, "title": "Нужно решение"}]
+        if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
+            return []
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
+    monkeypatch.setattr(
+        wog, "escalate",
+        lambda repo, number, text, options=None: calls.append(options) or "мок",
+    )
+    wog.waiting_owner_check(REPO, utc(12, 0))
+    assert calls == [["Секрет с правами администратора", "Оставить ручной инструмент"]]
+
+
+def test_waiting_owner_check_escalates_without_options_when_variants_not_machine_readable(monkeypatch):
+    """Прод-форма #370 (варианты прозой, без «—») — escalate() получает
+    options пустым, поведение остаётся текстовым алертом, как до кнопок."""
+    calls = []
+
+    def fake(*args):
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
+            return []
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+            return [{"number": 370, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
+                     "body": ISSUE_370_BODY, "title": "Нужно решение"}]
+        if url == f"repos/{REPO}/issues/370/comments?per_page=100&page=1":
+            return []
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
+    monkeypatch.setattr(
+        wog, "escalate",
+        lambda repo, number, text, options=None: calls.append(options) or "мок",
+    )
+    wog.waiting_owner_check(REPO, utc(12, 0))
+    assert calls == [[]]
 
 
 def test_waiting_owner_check_silent_channel_when_already_escalated_recently(monkeypatch, offline_telegram):

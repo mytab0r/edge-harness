@@ -618,23 +618,28 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     return True
 
 
-# Префикс callback_data, лимит байт и префикс комментария-решения совпадают с
-# cf-worker/src/config.ts::TELEGRAM (первое разбирает
-# cf-worker/src/harness.ts::parseOwnerDecisionCallback, второй пишет
-# apply_owner_decision.py) — два языка, одно место правды по формату,
-# расхождение ловится тестом обеих сторон по одному и тому же примеру.
+# Префикс комментария-решения — то же значение, что cf-worker/src/config.ts::
+# TELEGRAM.decisionCommentPrefix (пишет apply_owner_decision.py) и что разбирает
+# scripts/orchestra/waiting_owner_guard.py::DECISION_MARKER_RE (#471, слит) —
+# одно место правды по формату в Python-стороне этого модуля.
+DECISION_COMMENT_PREFIX = "РЕШЕНИЕ"
+
+# Префикс callback_data и лимит байт совпадают с cf-worker/src/config.ts::
+# TELEGRAM (первое разбирает cf-worker/src/harness.ts::parseOwnerDecisionCallback)
+# — два языка, одно место правды по формату, расхождение ловится тестом обеих
+# сторон по одному и тому же примеру (#254).
 OWNER_DECISION_CALLBACK_PREFIX = "wo"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
-DECISION_COMMENT_PREFIX = "РЕШЕНИЕ"
 
 
 def build_decision_keyboard(issue_number: int, options: list[str]) -> dict:
-    """Инлайн-клавиатура решения владельца (#254, #470/#471): одна кнопка на
-    вариант, подпись — сам текст варианта (владелец видит формулировку, не
-    номер), callback_data — `wo:<issue>:<option>` (1-based номер, тот же
-    формат разбирает cf-worker). Каждая кнопка — отдельная строка клавиатуры:
-    у Telegram узкий экран, а вариантов решения обычно 2-4, не про экономию
-    места в ряд."""
+    """Инлайн-клавиатура решения владельца (#254): одна кнопка на вариант,
+    подпись — сам текст варианта (владелец видит формулировку, не номер),
+    callback_data — `wo:<issue>:<option>` (1-based номер, тот же формат
+    разбирает cf-worker). Каждая кнопка — отдельная строка клавиатуры: у
+    Telegram узкий экран, а вариантов решения обычно 2-4, не про экономию
+    места в ряд. Вызывается из waiting_owner_guard.py (#470/#471) для задач с
+    машиночитаемым блоком «## Варианты владельца»."""
     if not options:
         raise ValueError("build_decision_keyboard: нужен хотя бы один вариант")
     keyboard = []
@@ -654,20 +659,16 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     #119/#174) — нельзя заводить второй канал для того же класса «поломка после
     мержа», один канал решения уже есть.
 
-    options (#254) — перечисленные варианты решения владельца: если заданы,
-    Telegram-сообщение уходит с инлайн-кнопками (build_decision_keyboard),
-    иначе поведение не меняется (обычный текстовый алерт, как раньше)."""
+    options (#254) — перечисленные варианты решения владельца (из блока
+    «## Варианты владельца», waiting_owner_guard.py): если заданы, Telegram-
+    сообщение уходит с инлайн-кнопками (build_decision_keyboard), иначе
+    поведение не меняется (обычный текстовый алерт, как раньше)."""
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
     except RuntimeError as error:
         print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
         posted = False
-    # reply_markup передаётся ТОЛЬКО когда есть options — существующие вызовы
-    # escalate() (без options) зовут send_telegram ровно как раньше, с той же
-    # сигнатурой из двух позиционных/keyword-аргументов (as_html не трогаем
-    # здесь вовсе): тестовые дублёры send_telegram по всему репозиторию,
-    # написанные до #254, не обязаны знать про новый параметр.
     delivered = (
         send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
         if options else send_telegram(text)

@@ -8,9 +8,9 @@ workflow'а (github.token).
 
 Пишет РОВНО ТОТ ЖЕ артефакт, что и ручной ответ владельца комментарием
 (#470/#471, PROTOCOL.md «Решение владельца как артефакт») — первая строка
-«РЕШЕНИЕ: N» в задаче issue_number. Дальше решение снимает waiting:owner уже
-существующая (по мержу #471) гвардия scripts/orchestra/waiting_owner_guard.py
-на следующем пульсе orchestra — второй путь применения здесь НЕ заводится,
+«РЕШЕНИЕ: N» в задаче issue_number. Дальше решение снимет waiting:owner
+гвардия scripts/orchestra/waiting_owner_guard.py (#470/#471, слит) на
+следующем пульсе orchestra. Второй путь применения здесь НЕ заводится,
 переиспользован post_issue_comment из pulse_guard.py без изменений.
 
 Запуск: python scripts/orchestra/apply_owner_decision.py --repo o/r --issue N --option M

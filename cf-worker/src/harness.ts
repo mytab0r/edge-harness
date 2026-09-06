@@ -685,7 +685,7 @@ export class Harness extends DurableObject<Env> {
       return this.#dropSession();
     }
     if (route.name === "messagesIngest") {
-      return this.#postMessageIngest(request);
+      return this.#postMessageIngest(request, telegramAuthorized);
     }
     if (route.name === "messages" && request.method === "GET") {
       return this.#getMessages(url);
@@ -730,6 +730,26 @@ export class Harness extends DurableObject<Env> {
     const header = request.headers.get(TELEGRAM.webhookSecretHeader);
     if (!header) return false;
     return constantTimeEqual(header, secret);
+  }
+
+  /**
+   * Привязка вебхука к владельцу по `chat_id` (находка ревью PR #486, ADR 0014
+   * шаг 1: «привязка к владельцу (chat_id + secret_token)»). Секрет вебхука
+   * аутентифицирует БОТА (что запрос действительно от Telegram на наш
+   * вебхук), а не отправителя: после setWebhook морда получает апдейты из
+   * ЛЮБОГО чата, где боту написали, — секрет у всех этих апдейтов один и тот
+   * же заголовок. Без этой проверки чужое сообщение ложится в инбокс как
+   * «сообщение владельца», а чужой callback уводит repository_dispatch в
+   * произвольную задачу. Секрет TELEGRAM_CHAT_ID не задан или chat не
+   * совпал — «путь закрыт», тот же приём, что у #telegramWebhookAuthorized
+   * (возможности нет, а не тихая дыра). Вызывается ТОЛЬКО для запросов,
+   * прошедших через вебхук-обход (viaTelegramWebhook) — вызывающий по
+   * Bearer/куке уже доверен и chat_id не сверяется.
+   */
+  #ownerChatAuthorized(chatId: string | null): boolean {
+    const expected = this.env.TELEGRAM_CHAT_ID;
+    if (!expected || !chatId) return false;
+    return constantTimeEqual(chatId, expected);
   }
 
   async #hmac(payload: string): Promise<string> {
@@ -1800,12 +1820,19 @@ export class Harness extends DurableObject<Env> {
    * кнопки решения владельца, #470/#471) — у него нет общих полей с первыми
    * двумя (нет message/text верхним уровнем), поэтому разбирается отдельной
    * веткой ДО остального разбора, а не падает в need_text.
+   *
+   * viaTelegramWebhook (находка ревью PR #486) — пришли через секретный
+   * заголовок вебхука (#telegramWebhookAuthorized), а не по Bearer/куке:
+   * секрет аутентифицирует бота, не отправителя, поэтому ТОЛЬКО в этой ветке
+   * дополнительно требуем совпадение chat_id (#ownerChatAuthorized) — иначе
+   * апдейт из чужого чата ляжет в инбокс как «сообщение владельца». Вызывающий
+   * по Bearer/куке уже доверен внутренним токеном — chat_id ему не навязываем.
    */
-  #postMessageIngest(request: Request): Promise<Response> {
+  #postMessageIngest(request: Request, viaTelegramWebhook: boolean): Promise<Response> {
     return this.#readJson(request).then((body) => {
       const callbackQuery = asObject(body.callback_query);
       if (callbackQuery) {
-        return this.#postOwnerDecisionCallback(body, callbackQuery);
+        return this.#postOwnerDecisionCallback(body, callbackQuery, viaTelegramWebhook);
       }
       const message = asObject(body.message);
       const from = asObject(body.from) ?? asObject(message?.from);
@@ -1823,6 +1850,9 @@ export class Harness extends DurableObject<Env> {
         throw new ApiError(413, "message_too_large", { limit: MESSAGE_MAX_CHARS });
       }
       const chatId = asString(body.chat_id) ?? asString(chat?.id);
+      if (viaTelegramWebhook && !this.#ownerChatAuthorized(chatId)) {
+        throw new ApiError(401, "unauthorized");
+      }
       const senderId = asString(body.sender_id) ?? asString(from?.id);
       const senderName =
         asString(body.sender_name) ?? asString(from?.username) ?? asString(from?.first_name);
@@ -1849,14 +1879,20 @@ export class Harness extends DurableObject<Env> {
    *      ADR 0008: только Contents+Actions, Issues здесь не нужны) в тонкий
    *      job (.github/workflows/owner-decision.yml, только issues:write),
    *      который оставляет комментарий «РЕШЕНИЕ: N» — тот же артефакт, что и
-   *      ручной ответ владельца (#470/#471); снимает метку waiting:owner уже
-   *      существующая гвардия на следующем пульсе orchestra, второй "apply"
-   *      здесь не заводится.
+   *      ручной ответ владельца (#470/#471); метку waiting:owner снимает
+   *      гвардия waiting_owner_guard.py (#470/#471, слит) на следующем
+   *      пульсе orchestra. Второй "apply" здесь не заводится.
    * Отвечает Telegram'у 200 всегда (кроме полностью нечитаемого апдейта без
    * единого идентификатора) — 4xx на кривой callback_data заставил бы
-   * Telegram ретраить апдейт, которому ретраи не помогут.
+   * Telegram ретраить апдейт, которому ретраи не помогут. Исключение — chat
+   * не владельца (viaTelegramWebhook, находка ревью PR #486): туда 4xx
+   * оправдан, это фактически неавторизованный вызов, а не кривые данные.
    */
-  async #postOwnerDecisionCallback(body: Record<string, unknown>, callbackQuery: Record<string, unknown>): Promise<Response> {
+  async #postOwnerDecisionCallback(
+    body: Record<string, unknown>,
+    callbackQuery: Record<string, unknown>,
+    viaTelegramWebhook: boolean,
+  ): Promise<Response> {
     const callbackId = asString(callbackQuery.id);
     const sourceMsgId = asString(body.update_id) ?? callbackId;
     if (!sourceMsgId) throw new ApiError(400, "need_source_msg_id");
@@ -1865,6 +1901,9 @@ export class Harness extends DurableObject<Env> {
     const message = asObject(callbackQuery.message);
     const chat = asObject(message?.chat);
     const chatId = asString(chat?.id);
+    if (viaTelegramWebhook && !this.#ownerChatAuthorized(chatId)) {
+      throw new ApiError(401, "unauthorized");
+    }
     const messageId = asString(message?.message_id);
     const data = typeof callbackQuery.data === "string" ? callbackQuery.data : null;
 

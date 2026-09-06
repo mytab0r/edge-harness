@@ -6,9 +6,9 @@
 #
 # Результат неотличим от ручного ответа владельца комментарием (#470/#471):
 # первая строка «РЕШЕНИЕ: N» — тот же артефакт, который снимает waiting:owner
-# существующая гвардия scripts/orchestra/waiting_owner_guard.py на следующем
-# пульсе orchestra. Второй "apply"-путь здесь НЕ заводится, только запись
-# комментария (apply_owner_decision.py переиспользует post_issue_comment).
+# гвардия scripts/orchestra/waiting_owner_guard.py (#470/#471, слит) на
+# следующем пульсе orchestra. Второй "apply"-путь здесь НЕ заводится, только
+# запись комментария (apply_owner_decision.py переиспользует post_issue_comment).
 #
 # ⚠️ repository_dispatch запускает воркфлоу только с файла на default branch
 #    (docs/research/21-github-actions.md) — до мержа этого файла в main
@@ -35,10 +35,17 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Комментарий с решением владельца
+        # client_payload — через env, не подставлен в shell напрямую (тот же
+        # приём, что hands.yml/dispatch-latency-probe.yml): единственный заслон
+        # от произвольного содержимого — numeric-валидация argparse на другом
+        # конце доверия (--issue/--option: type=int), не сам workflow.
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          OPTION: ${{ github.event.client_payload.option }}
         run: |
           python3 scripts/orchestra/apply_owner_decision.py \
-            --repo "${{ github.repository }}" \
-            --issue "${{ github.event.client_payload.issue_number }}" \
-            --option "${{ github.event.client_payload.option }}"
+            --repo "$REPO" \
+            --issue "$ISSUE_NUMBER" \
+            --option "$OPTION"

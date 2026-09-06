@@ -1484,7 +1484,7 @@ describe("Telegram: кнопки решения владельца (#254)", () =
   // Прод-форма callback_query (Bot API): message несёт СВОЮ же исходную
   // клавиатуру обратно — метка нажатой кнопки читается из неё, второе
   // хранилище подписей не заводится.
-  function callbackUpdate(opts: { data: string; messageText?: string; withKeyboard?: boolean }) {
+  function callbackUpdate(opts: { data: string; messageText?: string; withKeyboard?: boolean; chatId?: number }) {
     return {
       update_id: updateId(),
       callback_query: {
@@ -1492,7 +1492,7 @@ describe("Telegram: кнопки решения владельца (#254)", () =
         from: { id: 777000, is_bot: false, first_name: "Владелец", username: "owner" },
         message: {
           message_id: 555,
-          chat: { id: -1001234567890, type: "supergroup" },
+          chat: { id: opts.chatId ?? -1001234567890, type: "supergroup" },
           date: 1756400000,
           text: opts.messageText ?? "Нужно решение: вариант А или Б?",
           ...(opts.withKeyboard === false
@@ -1527,6 +1527,74 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       headers: { "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret" },
     });
     expect(res.status).toBe(401); // валидный секрет вебхука не открывает /api/status
+  });
+
+  // Находка ревью PR #486: секрет вебхука аутентифицирует БОТА, не отправителя —
+  // после setWebhook морда получает апдейты из ЛЮБОГО чата, где боту написали.
+  // Без сверки chat_id чужое сообщение легло бы в инбокс как «сообщение
+  // владельца», а чужой callback увёл бы repository_dispatch в произвольную
+  // задачу — ниже гвардируется оба пути.
+  describe("привязка вебхука к владельцу по chat_id (находка ревью PR #486)", () => {
+    it("callback_query из чужого чата — 401, dispatch и ответ Telegram не уходят", async () => {
+      const realFetch = globalThis.fetch;
+      env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+      env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+      vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+        if (isGitHubDispatchCall(input)) throw new Error("dispatch не должен звониться на чужой чат");
+        if (telegramApiMethod(input)) throw new Error("Telegram API не должен звониться на чужой чат");
+        return realFetch(input as RequestInfo, init);
+      }) as typeof fetch);
+      try {
+        const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1", chatId: -999 }));
+        expect(res.status).toBe(401);
+        expect((await res.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+      } finally {
+        vi.unstubAllGlobals();
+        env.GH_DISPATCH_TOKEN = "";
+        env.TELEGRAM_BOT_TOKEN = "";
+      }
+    });
+
+    it("сообщение (не callback) через вебхук из чужого чата — 401, в инбокс не попадает", async () => {
+      const res = await postTelegramWebhook({
+        update_id: updateId(),
+        message: {
+          message_id: 1,
+          from: { id: 1, is_bot: false, first_name: "Чужой" },
+          chat: { id: -999, type: "private" },
+          date: 1756400000,
+          text: "я не владелец",
+        },
+      });
+      expect(res.status).toBe(401);
+      expect((await res.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+    });
+
+    it("сообщение через вебхук из чата владельца — принято (положительная проверка того же пути)", async () => {
+      const res = await postTelegramWebhook({
+        update_id: updateId(),
+        message: {
+          message_id: 2,
+          from: { id: 777000, is_bot: false, first_name: "Владелец" },
+          chat: { id: -1001234567890, type: "supergroup" },
+          date: 1756400000,
+          text: "Привет от владельца через вебхук",
+        },
+      });
+      expect(res.status).toBe(201);
+      expect((await res.json<{ status: string }>()).status).toBe("accepted");
+    });
+
+    it("TELEGRAM_CHAT_ID не задан — вебхук-путь закрыт даже с верным секретом и чатом владельца", async () => {
+      const saved = env.TELEGRAM_CHAT_ID;
+      env.TELEGRAM_CHAT_ID = "";
+      try {
+        const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }));
+        expect(res.status).toBe(401);
+      } finally {
+        env.TELEGRAM_CHAT_ID = saved;
+      }
+    });
   });
 
   it("callback_query с правильным секретом принят, отвечает Telegram'у и уходит repository_dispatch с event_type owner-decision", async () => {
