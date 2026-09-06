@@ -115,6 +115,32 @@ def test_ai_review_restarts_second_gate_on_pr_review_completion():
         "ai:ok больше не восстанавливается автоматически (#208)")
 
 
+def test_ai_review_workflow_run_name_matches_pr_review_workflow_name():
+    # Находка ревью #442: GitHub матчит workflow_run.workflows по значению
+    # `name:` ПОРОДИВШЕГО workflow (pr-review.yml), не по имени файла — тест
+    # выше сравнивал литерал ai-review.yml с жёстко зашитой строкой "pr-review"
+    # с ОБЕИХ сторон и оставался зелёным, даже если реальный `name:` в
+    # pr-review.yml переименован (звено 2 при этом молча умирает: GitHub
+    # больше не находит workflow_run с этим именем). Читаем `name:` из уже
+    # разобранного pr-review.yml — единственное место правды (файл первого
+    # гейта), не второй литерал здесь.
+    pr_review_doc = _doc(PR_REVIEW)
+    pr_review_name = pr_review_doc.get("name")
+    assert isinstance(pr_review_name, str) and pr_review_name, (
+        "pr-review.yml: нет name: — workflow_run.workflows в ai-review.yml "
+        "матчится GitHub'ом по этому полю, без него звено 2 не проверяемо")
+
+    ai_review_doc = _doc(AI_REVIEW)
+    run_trigger = _triggers(ai_review_doc, AI_REVIEW).get("workflow_run")
+    entries = run_trigger if isinstance(run_trigger, list) else [run_trigger]
+    matching = [t for t in entries if pr_review_name in (t.get("workflows") or [])]
+    assert matching, (
+        f"ai-review.yml: workflow_run.workflows не содержит {pr_review_name!r} "
+        f"(реальный name: pr-review.yml) — GitHub сверяет по этому полю, "
+        "переименование pr-review.yml молча рвёт автоперезапуск второго "
+        "гейта (#208), даже если строковый литерал здесь совпадёт сам с собой")
+
+
 def test_ai_review_auto_start_requires_successful_pr_review():
     # Звено 3 (fail-closed в другую сторону): автозапуск дорогого второго
     # гейта — только после УСПЕШНОГО прогона первого. Прогон с находками
