@@ -128,6 +128,7 @@ def collect_labels() -> set[str]:
         review_labels.AI_OK,
         review_labels.AI_CHANGES,
         review_labels.AI_FAILED,
+        review_labels.REVERT_OK,
     }
     found |= _scan_py_files()
     found |= _scan_shell_files()
