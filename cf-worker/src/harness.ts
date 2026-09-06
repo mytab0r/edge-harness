@@ -1163,7 +1163,7 @@ export class Harness extends DurableObject<Env> {
    * #329): DO выгружается из памяти через ~10 с простоя, а alarm тикает раз в
    * ~15 мин — счётчик в памяти обнулялся бы почти на каждом тике, и
    * retentionBacklog() не срабатывал бы практически никогда (fail loud
-   * канал спеки 14.6 молча не работал бы). Тот же приём, что у pulse (#269).
+   * канал спеки 14.8 молча не работал бы). Тот же приём, что у pulse (#269).
    *
    * Чтение streak и финальная запись `retention_state` — тоже в своих
    * try/catch (находка ревью PR #329): это отдельные SQL-вызовы вне цикла по
@@ -1188,6 +1188,11 @@ export class Harness extends DurableObject<Env> {
         const cursor = this.#sql.exec(table.sql, now - table.maxAgeMs, RETENTION.batchSize);
         pruned[table.name] = cursor.rowsWritten;
         if (cursor.rowsWritten >= RETENTION.batchSize) full = true;
+        // Находка ревью PR #329: удаление строк tasks меняет tasks.done/failed
+        // так же, как dispatch/job_start/job_end — те места кэш сбрасывают,
+        // а чистка нет. Без сброса /api/status завышает done/failed до
+        // следующей записи задачи (на тёплом инстансе — надолго).
+        if (table.name === "tasks" && cursor.rowsWritten > 0) this.#taskCountsCache = null;
       } catch (error) {
         full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
         pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»

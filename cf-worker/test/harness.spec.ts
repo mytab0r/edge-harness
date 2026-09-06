@@ -728,6 +728,35 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     expect(afterEnd.tasks.running).toBe(afterStart.tasks.running - 1);
     expect(afterEnd.tasks.done).toBe(afterStart.tasks.done + 1);
   });
+
+  it("ретеншн сбрасывает кэш счётчиков так же, как dispatch/job_end (находка ревью PR #329)", async () => {
+    const created = await (await postJson("/api/tasks", {})).json<{ task_id: string }>();
+    const taskId = created.task_id;
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+    // Обычный путь до done (через #applySideEffects) — кэш честно инвалидируется
+    // и пересчитывается, как в соседнем тесте выше. afterDone — реальное число.
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 1, kind: "job_start" }] });
+    await postJson("/api/events", { task_id: taskId, events: [{ seq: 2, kind: "job_end", data: { result: "ok" } }] });
+    const afterDone = await getJson<{ tasks: Record<string, number> }>("/api/status");
+
+    // Состариваем ТОЛЬКО created_ts напрямую через SQL — статус уже done через
+    // штатный путь выше, это не новый переход и инвалидации кэша не касается.
+    const oldCreatedTs = Date.now() - (RETENTION.tasksMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE tasks SET created_ts = ? WHERE id = ?", oldCreatedTs, taskId);
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const after = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    // Ретеншн физически снёс эту done-строку. Без сброса #taskCountsCache в
+    // #pruneRetention кэш остался бы на значении afterDone (лишняя done-запись
+    // на бейдже до следующего перехода) — ровно та ложь, что нашёл ревьюер.
+    expect(after.tasks.done).toBe(afterDone.tasks.done - 1);
+  });
 });
 
 describe("inbox: сообщения владельца", () => {
