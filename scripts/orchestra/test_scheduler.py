@@ -503,14 +503,65 @@ def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
     assert any("нужен человек" in line for line in lines)
 
 
-# ── Мутация гвардии поведения 1: без гейта на review:ok — дёргает всё подряд ─────
+def timeline_with_review_large_only(when: str):
+    """Прод-форма таймлайна крупного PR (#412, #432): verdict_for ставит РОВНО
+    одну из двух меток гейта 1 — событие "labeled: review:ok" в таком
+    таймлайне не наступает НИКОГДА, только "labeled: review:large"."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
 
 
-def test_trigger_ai_review_mutation_without_review_ok_gate_would_fire_on_anything(monkeypatch):
-    # Доказательство того, что гейт "review:ok in labels" в проде необходим:
-    # PR без review:ok вообще не должен рассматриваться (иначе дёрнули бы
-    # ai-review на любом свежем PR, включая черновики и PR без ревью).
-    p = pull(555, labels=["review:large"])  # review:ok нет
+def test_trigger_ai_review_dispatches_for_review_large_ai_failed(monkeypatch):
+    # Живой случай PR #412 (задача #432): review:large + ai:failed, помечен
+    # 2026-09-06T02:34, автоповторов ноль спустя полтора часа при пороге
+    # 30 минут. До фикса #432 last_gate1_labeled_at (тогда ещё
+    # last_review_ok_labeled_at) искала ТОЛЬКО событие "labeled: review:ok",
+    # которого для review:large PR не бывает — anchor оставался None навсегда,
+    # и даже пропустив входной гейт, retry не смог бы посчитать возраст.
+    p = pull(412, labels=["review:large", "ai:failed"])
+    fake = FakeGh({
+        "issues/412/timeline": timeline_with_review_large_only("2026-09-06T02:34:00Z"),
+        "issues/412/comments": [],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 6, 4, 4)  # 90 мин > порог 30 (тот же разрыв, что в задаче)
+    lines = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert any("412" in line for line in lines)
+
+
+def test_trigger_ai_review_mutation_gate1_narrowed_to_review_ok_misses_review_large(monkeypatch):
+    # Мутация (#432): сузить предикат "гейт 1 отработал" обратно до одного
+    # review:ok (поведение ДО этого фикса) — PR #412-подобный (review:large +
+    # ai:failed) снова становится невидим автоповтору. Доказывает, что именно
+    # gate1_decided (не входной гейт по старинке) держит фикс живым: сними
+    # его — и этот тест покраснеет первым.
+    p = pull(412, labels=["review:large", "ai:failed"])
+    fake = FakeGh({})  # решение обязано быть принято ДО первого сетевого вызова
+    monkeypatch.setattr(
+        sch.review_labels, "gate1_decided",
+        lambda labels: sch.review_labels.REVIEW_OK in labels,
+    )
+    patch_gh(monkeypatch, fake)
+    lines = sch.trigger_ai_review(REPO, utc(2026, 9, 6, 4, 4), [p])
+    assert lines == []
+    assert fake.calls == []
+
+
+# ── Мутация гвардии поведения 1: без гейта на review_labels.gate1_decided ────
+# ── — дёргает всё подряд ──────────────────────────────────────────────────
+
+
+def test_trigger_ai_review_mutation_without_gate1_decided_gate_would_fire_on_anything(monkeypatch):
+    # Доказательство того, что гейт "review_labels.gate1_decided(labels)" в
+    # проде необходим: PR, который гейт 1 вообще ещё не тронул (ни review:ok,
+    # ни review:large), не должен рассматриваться (иначе дёрнули бы ai-review
+    # на любом свежем PR, включая черновики и PR без ревью). #432 расширил
+    # входной гейт до review:ok ИЛИ review:large — это не то же самое, что
+    # снять гейт вовсе: PR совсем без метки гейта 1 обязан остаться снаружи.
+    p = pull(555, labels=[])  # ни review:ok, ни review:large — гейт 1 молчит
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     lines = sch.trigger_ai_review(REPO, utc(2026, 9, 2, 12, 0), [p])
@@ -1373,12 +1424,12 @@ def test_after_merge_reads_files_through_paginated_helper():
 
 
 # ── Пагинация таймлайна: тот же класс, тесно в один хелпер (#303, находка
-# ревью) — last_review_ok_labeled_at и last_ready_labeled_at читали сырую
+# ревью) — last_gate1_labeled_at и last_ready_labeled_at читали сырую
 # первую страницу timeline?per_page=100 без обхода, событие 'labeled' за
 # первой сотней молча терялось на длинном таймлайне ────────────────────────
 
 
-def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
+def test_last_gate1_and_last_ready_read_timeline_through_paginated_helper():
     # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
     # выше): обе функции обязаны ходить через review_labels.list_timeline
     # (полный обход постранично), а не читать сырую первую страницу —
@@ -1397,7 +1448,7 @@ def test_last_review_ok_and_last_ready_read_timeline_through_paginated_helper():
 # отфильтровывается по ключу pull_request — замер 2026-09-05, живой
 # репозиторий) хвост за первой сотней был невидим воркеру и планировщику
 # без ошибки. reap_stale читал таймлайн issue той же сырой формой — тот же
-# класс, что last_review_ok_labeled_at/last_ready_labeled_at (#303), сюда не
+# класс, что last_gate1_labeled_at/last_ready_labeled_at (#303), сюда не
 # мигрировали. ─────────────────────────────────────────────────────────────
 
 
@@ -1416,7 +1467,7 @@ def test_open_task_issues_and_open_pulls_read_through_paginated_helper():
 
 def test_reap_stale_reads_timeline_through_paginated_helper():
     # reap_stale читал `gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")`
-    # без обхода — тот же класс, что last_review_ok_labeled_at/
+    # без обхода — тот же класс, что last_gate1_labeled_at/
     # last_ready_labeled_at (#303), не мигрировали сюда.
     source = SCRIPT.read_text(encoding="utf-8")
     assert source.count("review_labels.list_timeline(repo, number, gh)") == 1
