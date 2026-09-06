@@ -8,8 +8,9 @@ import {
   pulseHealthy,
   pulseNotConfigured,
   pulseStale,
+  retentionBacklog,
 } from "../src/harness";
-import { HEARTBEAT } from "../src/config";
+import { HEARTBEAT, RETENTION } from "../src/config";
 
 // Чистое решение самообновления морды (#73): все ветки логики без сети.
 // Проводка (fetch/storage/dispatch) тонкая и зеркалит уже доказанный
@@ -324,6 +325,25 @@ describe("бейдж пульса: ветка 'dispatch/run сломан' не �
 // `else if (status.pulse_stale) { … }` (оставь только `!status.pulse_healthy`
 // с сырым detail) — «сырой null (stale, без фикса)» ниже иллюстрирует ровно
 // то, что стало бы видно пользователю.
+// Ретеншн DO SQLite (#306/#305): «не успеваем» — чистая функция порога, тот же
+// приём, что pulseStale выше (проверяется отдельно от alarm()/#pruneRetention,
+// чтобы не гонять реальные тики ради граничного случая). Докажи мутацией:
+// замени `>=` на `>` в retentionBacklog — тест «ровно порог — уже backlog»
+// покраснеет.
+describe("ретеншн: retentionBacklog — «не успеваем», не разовый полный тик (#306/#305)", () => {
+  it("ни одного полного/упавшего тика подряд — не backlog", () => {
+    expect(retentionBacklog(0)).toBe(false);
+  });
+
+  it("на единицу меньше порога — ещё не backlog (один тик после большого бэклога — не тревога)", () => {
+    expect(retentionBacklog(RETENTION.backlogStreakThreshold - 1)).toBe(false);
+  });
+
+  it("ровно порог подряд идущих полных/упавших тиков — уже backlog", () => {
+    expect(retentionBacklog(RETENTION.backlogStreakThreshold)).toBe(true);
+  });
+});
+
 describe("бейдж пульса: ветка 'подвис alarm' (stale) не содержит null (issue #303, вторая находка ревью)", () => {
   it("stale-ветка: свой самодостаточный текст, detail вообще не участвует — бейдж без 'null'", () => {
     const rendered = renderPulseStale({ minutes: 35 });

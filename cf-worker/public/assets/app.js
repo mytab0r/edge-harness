@@ -198,6 +198,15 @@ function renderStatus(status) {
   } else {
     $("pulse").hidden = true;
   }
+  // Ретеншн DO SQLite (#306/#305): та же схема, что watchdog/pulse выше — сервер
+  // предвычисляет «не успеваем» (retentionBacklog в src/harness.ts), фронт
+  // только показывает готовый флаг, не сравнивает пороги сам.
+  if (status.retention?.backlog) {
+    $("retention").textContent = t("retention.backlog");
+    $("retention").hidden = false;
+  } else {
+    $("retention").hidden = true;
+  }
 }
 
 // ── Живой поток ───────────────────────────────────────────────────────────────────

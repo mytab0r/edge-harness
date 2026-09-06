@@ -32,6 +32,13 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      #432 — гейт 1 считается отработавшим и по review:large, не только по
      review:ok). Порог — существующее место
      правды pulse_guard.UNHEALTHY_PR_AFTER_MINUTES, своего числа не заводим.
+     #472 (живой алерт 2026-09-06 «либо исчерпал, либо не сработал» на
+     PR #387/#329/#327): каждое нарушение несёт ФАКТ по бюджету
+     авто-повтора #196 (сколько попыток из лимита израсходовано — та же
+     метрика, что видит scheduler.trigger_ai_review — и сколько из них в
+     ТЕКУЩЕЙ эпохе гейта 1, отдельно от перенесённых из старой, уже решённой
+     эпохи, класс #431/PR #439 не слит) и был ли вердикт ai:* хоть раз за
+     всю жизнь PR — не список гипотез.
   4. check_unarchived_complete_changes — openspec/changes/<id>/tasks.md
      полностью отмечен, а каталог не в openspec/changes/archive/.
   5. check_duplicate_evidence — два открытых task-issue ссылаются в теле на
@@ -46,6 +53,15 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      перечисляемый набор scope Actions) — включается только вручную
      (`--check-branch-protection`, admin-токен владельца), см. docstring
      build_report.
+  7. check_ambiguous_artifact_phrase (#219) — ни один *.md репозитория не
+     содержит двусмысленной формулы принадлежности плагина (читалась двумя
+     способами — «артефакт уже есть у владельца» против «наш, пишем мы»;
+     цена: готовая ротация учёток пять суток лежала неподключённой, #215).
+     Включён в CI_GATING сразу при создании: на момент включения ноль
+     нарушений — фраза вычищена тем же PR, что и правило (#219). Честная
+     граница: общий класс «утверждение о готовом артефакте без адреса»
+     статически не выразим и этой гвардией НЕ покрыт — правило держится на
+     ревью (AGENTS.md), инвариант закрывает только саму формулу.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -110,6 +126,11 @@ WATCHDOG_ISSUE = pulse_guard.WATCHDOG_ISSUE
 # держится слишком долго» (scheduler.py, #196). Инварианты 1 и 3 переиспользуют
 # его как порог эскалации, а не заводят своё число.
 UNHEALTHY_PR_AFTER_MINUTES = pulse_guard.UNHEALTHY_PR_AFTER_MINUTES
+# Бюджет авто-повтора #196 — те же константы, что читает
+# scheduler.trigger_ai_review/ai_review_retry_count, не второе число (#472:
+# факт по инварианту 3 обязан совпадать с тем, что реально видит газ #196).
+AI_REVIEW_MAX_ATTEMPTS = pulse_guard.AI_REVIEW_MAX_ATTEMPTS
+AI_REVIEW_RETRY_MARKER = pulse_guard.AI_REVIEW_RETRY_MARKER
 
 _RL_SPEC = importlib.util.spec_from_file_location(
     "review_labels", REPO_ROOT / "scripts" / "lib" / "review_labels.py")
@@ -169,7 +190,7 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # 1, 2, 5 остаются наблюдательными по исходному решению владельца (см.
 # docstring выше). Включение любого номера — явная правка этой константы
 # после проверки условия.
-CI_GATING: frozenset[int] = frozenset({4})
+CI_GATING: frozenset[int] = frozenset({4, 7})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -183,6 +204,11 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
     4: "перенеси openspec/changes/<id> в openspec/changes/archive/ (создай "
        "каталог, если его ещё нет) — раздел полностью выполнен, самое время "
        "заархивировать",
+    7: "переформулируй однозначно — «артефакт владельца по адресу X» либо "
+       "«наш плагин (пишем мы, не апстрим)»; правило — AGENTS.md, "
+       "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
+       "Если формулировка нужна как цитата самого инцидента — расширь паттерн "
+       "инварианта осознанно, с комментарием, почему цитата безопаснее",
 }
 
 
@@ -285,9 +311,42 @@ def check_reopened_after_merge(repo: str, open_tasks: list[dict], merged_pulls: 
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
+def gate1_anchor(timeline: list[dict]) -> datetime | None:
     """Момент последней простановки вердикта гейта 1 (review:ok ИЛИ
-    review:large — review_labels.GATE1_LABELS, #432) — весь таймлайн через
+    review:large — review_labels.GATE1_LABELS, #432) из уже загруженного
+    таймлайна — чистая функция, чтобы last_ai_verdict_ever ниже читала ТОТ ЖЕ
+    таймлайн без второго запроса (#472)."""
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
+    ]
+    return parse_time(max(labeled_at)) if labeled_at else None
+
+
+def last_ai_verdict_ever(timeline: list[dict]) -> tuple[str, datetime] | None:
+    """Последний по времени вердикт ai:* (labeled), КОГДА-ЛИБО поставленный на
+    PR — может относиться к уже ЗАКРЫТОЙ эпохе гейта 1, если после него гейт 1
+    переставлялся новым пушем (по построению check_stuck_review_gate ниже
+    зовёт эту функцию только когда СЕЙЧАС ни одной ai:*-метки нет, поэтому
+    найденный вердикт всегда старше anchor). None — вердикта не было НИ РАЗУ
+    за всю жизнь PR: другой факт, чем «был, но эпоха его стёрла» (#472,
+    живой случай #387 — там вердикта не было ни разу, в отличие от #329/#327,
+    где вердикт был, просто в предыдущей эпохе)."""
+    events = [
+        (event["created_at"], (event.get("label") or {}).get("name"))
+        for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") in review_labels.AI_VERDICTS
+    ]
+    if not events:
+        return None
+    when, name = max(events, key=lambda pair: pair[0])
+    return name, parse_time(when)
+
+
+def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """IO-обвязка над gate1_anchor — весь таймлайн через
     review_labels.list_timeline, не сырая первая страница `per_page=100`
     (находка AI-ревью PR #249: у долгоживущего PR, который сам же разгоняют
     авто-повторы #196, событие `labeled` уезжает за первую сотню — сырой
@@ -298,13 +357,30 @@ def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
     версия смотрела ТОЛЬКО на review:ok, поэтому PR с review:large и без
     единой ai:*-метки был невидим этому инварианту тем же классом, каким
     scheduler.trigger_ai_review был невидим PR #412)."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
-    ]
-    return parse_time(max(labeled_at)) if labeled_at else None
+    return gate1_anchor(review_labels.list_timeline(repo, pr_number, gh))
+
+
+def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
+    """Факт по бюджету авто-повтора #196 — считается ТЕМ ЖЕ вызовом
+    (issue_marker_times по AI_REVIEW_RETRY_MARKER), который использует
+    scheduler.ai_review_retry_count для решения «дёргать ли ai-review.yml
+    снова» — не гадаем, а читаем то же число, что видит газ.
+
+    attempts_total — за ВСЮ историю PR (так считает сегодняшний
+    scheduler.trigger_ai_review — без since, #431/PR #439 со scoping'ом по
+    эпохе ещё не слит в main). attempts_in_epoch — только попытки С МОМЕНТА
+    anchor (текущая эпоха гейта 1). Расхождение между ними — сам факт
+    переноса бюджета из старой, уже решённой эпохи (живой случай #329/#327,
+    2026-09-06, issue #472): total уже равен лимиту, а in_epoch — 0, потому
+    что все три маркера остались от эпохи, которая давно получила вердикт."""
+    attempt_times = sorted(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
+    attempts_in_epoch = sum(1 for moment in attempt_times if moment >= anchor)
+    return {
+        "attempts_total": len(attempt_times),
+        "attempts_in_epoch": attempts_in_epoch,
+        "attempts_limit": AI_REVIEW_MAX_ATTEMPTS,
+        "last_attempt_at": attempt_times[-1].isoformat() if attempt_times else None,
+    }
 
 
 def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) -> list[dict]:
@@ -313,27 +389,78 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     метки ещё нет. scheduler.trigger_ai_review (#196) уже пытается сам
     перезапустить ai-review.yml на меньшем пороге
     (AI_REVIEW_RETRY_AFTER_MINUTES) с ограничением попыток
-    (AI_REVIEW_MAX_ATTEMPTS) — этот инвариант ловит случай, когда газ #196
-    исчерпал попытки, не сработал вовсе (оркестратор не бежал) или ещё не
-    было задеплоено — застрявший гейт, класс #147 (сутки простоя)."""
+    (AI_REVIEW_MAX_ATTEMPTS) — этот инвариант ловит случай, когда PR застрял
+    несмотря на газ #196.
+
+    #472 (живой алерт 2026-09-06 «либо исчерпал попытки, либо не сработал»):
+    каждое нарушение несёт retry_budget_fact (сколько попыток из лимита
+    израсходовано всего и сколько в ТЕКУЩЕЙ эпохе — расхождение само
+    называет перенос бюджета из старой эпохи, класс #431/PR #439) и
+    last_ai_verdict_ever (был ли вердикт хоть раз за всю жизнь PR) — факт, не
+    гипотеза. Условие входа «гейт 1 не пускает» здесь физически невозможно:
+    и этот инвариант, и trigger_ai_review проверяют один и тот же
+    review_labels.gate1_decided — расходиться им не на чем."""
     ai_labels = set(review_labels.AI_VERDICTS)
     violations = []
     for pull in open_pulls:
         labels = {label["name"] for label in pull["labels"]}
         if not review_labels.gate1_decided(labels) or labels & ai_labels:
             continue
-        labeled_at = last_gate1_labeled_at(repo, pull["number"])
-        if labeled_at is None:
+        timeline = review_labels.list_timeline(repo, pull["number"], gh)
+        anchor = gate1_anchor(timeline)
+        if anchor is None:
             continue
-        age = minutes_between(labeled_at, now)
+        age = minutes_between(anchor, now)
         if age <= UNHEALTHY_PR_AFTER_MINUTES:
             continue
+        verdict_ever = last_ai_verdict_ever(timeline)
         violations.append({
             "pr": pull["number"],
             "age_minutes": round(age, 1),
-            "labeled_at": labeled_at.isoformat(),
+            "labeled_at": anchor.isoformat(),
+            "verdict_ever": None if verdict_ever is None else {
+                "label": verdict_ever[0], "at": verdict_ever[1].isoformat(),
+            },
+            **retry_budget_fact(repo, pull["number"], anchor),
         })
     return violations
+
+
+def stuck_gate_fact_line(item: dict) -> str:
+    """Строка факта по застрявшему PR (#472) — заменяет прежнее «либо
+    исчерпал попытки, либо не сработал». Три факта, каждый читается из уже
+    собранных данных: возраст текущей эпохи, бюджет авто-повтора (с явным
+    отличием «исчерпан в этой эпохе» от «перенёсся из старой, решённой» —
+    и не смешивая их со случаем «бюджет ещё есть»), был ли вердикт вообще.
+    Причину провала конкретной попытки (квота/транспорт/контракт) эта
+    строка не называет: она потребовала бы отдельного обращения к Actions
+    API (логи прогона) на КАЖДЫЙ застрявший PR каждые 15 минут — новый,
+    дорогой класс вызовов, который эта задача сознательно не заводит (см.
+    issue #472, экономия квоты GitHub API — она же сегодня отжирала себя у
+    чужих обязательных проверок)."""
+    total = item["attempts_total"]
+    in_epoch = item["attempts_in_epoch"]
+    limit = item["attempts_limit"]
+    if total < limit:
+        budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
+    elif in_epoch >= limit:
+        budget = f"исчерпан в этой же эпохе ({total}/{limit})"
+    else:
+        budget = (
+            f"исчерпан СТАРОЙ эпохой ({total}/{limit}, в текущей — {in_epoch}/{limit}) — "
+            "перенос бюджета между эпохами, класс #431/PR #439 (не слит)"
+        )
+    if item["last_attempt_at"]:
+        budget += f", последняя попытка {item['last_attempt_at']}"
+    verdict = item["verdict_ever"]
+    verdict_text = (
+        "вердикта ai:* не было НИ РАЗУ за всю жизнь PR" if verdict is None
+        else f"вердикт был — {verdict['label']} в {verdict['at']} (до текущей эпохи)"
+    )
+    return (
+        f"PR #{item['pr']} — {int(item['age_minutes'])} мин без вердикта в "
+        f"текущей эпохе (с {item['labeled_at']}); автоповтор: {budget}; {verdict_text}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -551,6 +678,52 @@ def check_branch_protection_drift(protection: dict) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 7: двусмысленная формула принадлежности плагина (#219)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Правило AGENTS.md «Утверждение о готовом артефакте обязано нести его адрес»
+# в общем виде статически НЕ выразимо — оно про смысл текста, и этот инвариант
+# не претендует на его покрытие (правило держится на ревью, честно). Гвардится
+# узкий класс, оплаченный задачей #219: формула принадлежности плагина вида
+# «плагин + словоформа + „владельца“», читавшаяся двумя способами — «артефакт
+# уже есть у владельца» против «наш, пишем мы». Из-за этого исполнители и
+# владелец одновременно ждали работу друг от друга, и готовая ротация учёток
+# пять суток лежала неподключённой (#215). Формула запрещена к употреблению
+# вовсе: вместо неё — «артефакт владельца по адресу X» либо «наш плагин
+# (пишем мы, не апстрим)». Паттерн объявлен один раз здесь; дословно формулу
+# нигде не пишем (включая этот файл), чтобы будущий рефакторинг сканера не
+# поймал инвариант на его собственном исходнике.
+_AMBIGUOUS_ARTIFACT_PHRASE = re.compile(r"плагин\w*\s+владельца", re.IGNORECASE)
+_SCAN_SKIP_DIRS = frozenset({".git", "node_modules"})
+
+
+def check_ambiguous_artifact_phrase(docs_root: Path) -> list[dict]:
+    """Инвариант 7: ни один markdown-документ репозитория не содержит
+    двусмысленной формулы принадлежности плагина (любые словоформы «плагин*»
+    с «владельца», регистр не важен). Сканируются ВСЕ *.md под корнем —
+    документ остаётся документом в любом каталоге, включая архив спек и
+    шаблоны .github. Замена — однозначная формулировка с адресом или
+    принадлежностью; правило — AGENTS.md, «Утверждение о готовом артефакте
+    обязано нести его адрес» (#219)."""
+    if not docs_root.is_dir():
+        return []
+    violations = []
+    for path in sorted(docs_root.rglob("*.md")):
+        if set(path.parts) & _SCAN_SKIP_DIRS:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            match = _AMBIGUOUS_ARTIFACT_PHRASE.search(line)
+            if match:
+                violations.append({
+                    "file": path.relative_to(docs_root).as_posix(),
+                    "line": lineno,
+                    "match": match.group(0),
+                })
+    return violations
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -642,7 +815,7 @@ def build_report(repo: str, now: datetime,
     if v3:
         lines.append(f"🚨 [3] {len(v3)} открытых PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:")
         for item in v3:
-            lines.append(f"   — PR #{item['pr']} — {int(item['age_minutes'])} мин без ai:*")
+            lines.append(f"   — {stuck_gate_fact_line(item)}")
     else:
         lines.append("💚 [3] нет застрявших PR с гейтом 1 без ai:*")
 
@@ -683,6 +856,15 @@ def build_report(repo: str, now: datetime,
         lines.append("⏭️ [6] защита main не проверена в этом прогоне (нужен токен с "
                       "правом administration — GITHUB_TOKEN его структурно не имеет; "
                       "запусти вручную: --check-branch-protection с admin-токеном)")
+
+    v7 = check_ambiguous_artifact_phrase(REPO_ROOT)
+    findings[7] = v7
+    if v7:
+        lines.append(f"🚨 [7] {len(v7)} мест называют принадлежность плагина двусмысленно (#219):")
+        for item in v7:
+            lines.append(f"   — {item['file']}:{item['line']} — «{item['match']}»")
+    else:
+        lines.append("💚 [7] двусмысленной формулы принадлежности плагина нет")
 
     return lines, findings
 
@@ -735,9 +917,9 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         key = ",".join(f"#{i['pr']}" for i in v3)
         text = (
             "🚨 edge-harness: инвариант 3 (застрявший гейт) — "
-            f"{len(v3)} PR с гейтом 1 (review:ok/review:large) без вердикта ai:* дольше "
-            f"{UNHEALTHY_PR_AFTER_MINUTES} мин: " + key + ". "
-            "Авто-повтор #196 либо исчерпал попытки, либо не сработал — нужен человек."
+            f"{len(v3)} PR с гейтом 1 (review:ok/review:large) без вердикта ai:* "
+            f"дольше {UNHEALTHY_PR_AFTER_MINUTES} мин:\n"
+            + "\n".join(f"— {stuck_gate_fact_line(item)}" for item in v3)
         )
         result = escalate_if_new(repo, 3, key, text)
         if result:
