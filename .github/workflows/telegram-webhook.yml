@@ -48,9 +48,20 @@ jobs:
           FAIL_ON_NOT_READY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python scripts/telegram/register_webhook.py
 
-      # ВРЕМЕННО (#524): сырой getWebhookInfo как доказательство видимого
-      # результата для приёмки — снять перед мержем.
-      - name: 'ВРЕМЕННО (#524): сырой getWebhookInfo'
+      # ВРЕМЕННО (#524): тестовое сообщение с инлайн-кнопкой для приёмки —
+      # владелец нажимает вручную, доказывая, что нажатие доходит до морды
+      # через настоящий вебхук Telegram (не эмуляция). callback_data ведёт на
+      # ЭТО ЖЕ issue (#524) — нажатие оставит комментарий «РЕШЕНИЕ: 1» там же.
+      # Снять шаг перед мержем.
+      - name: 'ВРЕМЕННО (#524): тестовая кнопка владельцу'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c 'import json,os; print(json.dumps({
+              "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+              "text": "Диагностика #524: проверка вебхука, нажми кнопку.",
+              "reply_markup": {"inline_keyboard": [[{"text": "Тест OK", "callback_data": "wo:524:1"}]]},
+            }))')"
