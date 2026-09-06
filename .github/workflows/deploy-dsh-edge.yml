@@ -223,15 +223,18 @@ jobs:
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
         run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
-      # Прокси статусов журнала (#105, патч 0005) обязан работать на СОБРАННОМ
-      # артефакте до деплоя — тем же способом, что и ingest-шов: unstable_dev
-      # поднимает direct-воркер, рядом заглушка журнала (node:http), и
-      # прогоняется контракт /api/harness/events: 401 без куки (журнал не
-      # дёргается), 403 кросс-origin, Bearer HANDS_TOKEN и параметры журнала
-      # на заглушке, прозрачный проход ответа (включая 401/500 журнала),
-      # 400 на кривые параметры, 503 при незаданном HARNESS_URL/HANDS_TOKEN.
+      # Прокси статусов журнала (#105/#501, патч 0005) обязан работать на
+      # СОБРАННОМ артефакте до деплоя — тем же способом, что и ingest-шов:
+      # unstable_dev поднимает direct-воркер, журнал мокается через мок
+      # service binding (та же механика, что и прод HARNESS_SERVICE — не
+      # HTTP-заглушка на localhost, см. check.mjs), и прогоняется контракт
+      # /api/harness/events: 401 без куки (журнал не дёргается), 403
+      # кросс-origin, Bearer HANDS_TOKEN и параметры журнала на заглушке,
+      # прозрачный проход ответа (включая 401/500 журнала), 400 на кривые
+      # параметры, 503 при незаданном HARNESS_SERVICE/HANDS_TOKEN.
       # Красный шаг — деплой не начинается: сломанный прокси = громко
-      # ошибающиеся статусы раздела «Плагины» на свежесобранной морде (#235).
+      # ошибающиеся статусы раздела «Интеграции» на свежесобранной морде
+      # (#235, живая поломка — #501).
       - name: Интеграция прокси статусов на собранном артефакте (#105)
         if: steps.route.outputs.plugins != '0'
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
@@ -449,14 +452,7 @@ jobs:
             "vars": {
               // Потолок GLM: дефолт адаптера 256000 отвергается (max 131072)
               "DEEPSEEK_MAX_OUTPUT_TOKENS": "131072",
-              "GH_RUNNER_REPO": "mytab0r/edge-harness",
-              // Куда прокси статусов (патч 0005, issue #105) ходит за журналом:
-              // GET {HARNESS_URL}/api/events с Bearer HANDS_TOKEN (секрет ниже).
-              // На префаб-маршруте var мёртв и безвреден: маршрута
-              // /api/harness/events в префаб-артефакте нет (патчи не применяются);
-              // секрет HANDS_TOKEN при этом на префаб не ставится — обещать
-              // возможность без артефакта нечестно, var без неё безопасен.
-              "HARNESS_URL": "${{ vars.HARNESS_URL }}"
+              "GH_RUNNER_REPO": "mytab0r/edge-harness"
             },
             "assets": {
               "binding": "ASSETS",
@@ -469,6 +465,19 @@ jobs:
                 { "name": "DSH_EDGE_INSTANCE", "class_name": "DshEdgeInstance" }
               ]
             },
+            // Прокси статусов журнала (патч 0005, issue #105/#501): HARNESS_SERVICE —
+            // service binding на воркер "edge-harness" (cf-worker/wrangler.jsonc,
+            // тот же Cloudflare-аккаунт), не публичный fetch по HARNESS_URL — обычный
+            // internet fetch() между двумя *.workers.dev воркерами одного аккаунта
+            // падает ошибкой Cloudflare 1042 (issue #501, воспроизведено живьём);
+            // binding идёт worker-to-worker мимо публичного DNS/HTTP и этого лимита
+            // не имеет. На префаб-маршруте binding мёртв и безвреден: маршрута
+            // /api/harness/events в префаб-артефакте нет (патчи не применяются);
+            // секрет HANDS_TOKEN при этом на префаб не ставится — обещать
+            // возможность без артефакта нечестно, binding без неё безопасен.
+            "services": [
+              { "binding": "HARNESS_SERVICE", "service": "edge-harness" }
+            ],
             "migrations": [
               { "tag": "v1", "new_sqlite_classes": ["DshEdgeInstance"] }
             ],
