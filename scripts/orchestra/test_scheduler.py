@@ -1200,11 +1200,12 @@ def _ai_rework_comment(created_at: str, comment_id: str, login: str = "github-ac
     }
 
 
-def _gate1_comment(created_at: str, comment_id: str, number: int = 451) -> dict:
+def _gate1_comment(created_at: str, comment_id: str, number: int = 451,
+                   login: str = "github-actions[bot]", user_type: str = "Bot") -> dict:
     return {
         "created_at": created_at,
         "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
-        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "user": {"login": login, "type": user_type},
         "body": "Ревью нашло замечания:\n- находка: пример гейта 1",
     }
 
@@ -1237,6 +1238,23 @@ def test_verdict_round_links_gate2_never_links_gate1_or_forged_comment():
                            login="random-reader", user_type="User"),
     ]
     assert sch.verdict_round_links(REPO, 451, events, comments) == [None]
+
+
+def test_gate1_verdict_forged_author_is_ignored_by_link_and_excerpt():
+    """Находка AI-ревью PR #408: маркер гейта 1 доверяет учётке так же, как
+    гейт 2 (#294: шапку подделать можно, учётку — нет) — check_pr.py пишет
+    от github-actions[bot]. Мутация: снять _is_trusted_verdict_author из
+    _is_gate1_verdict_comment — тест краснеет в обоих потребителях
+    (ссылка круга и выжимка эскалации берутся из подделки)."""
+    forged = _gate1_comment("2026-09-01T12:00:05Z", "forge",
+                            login="random-reader", user_type="User")
+    events = [{"event": "labeled", "created_at": "2026-09-01T12:00:00Z",
+               "label": {"name": "review:changes-requested"}}]
+    # Ссылка круга: пара не восстанавливается — честный промах, не выдуманная.
+    assert sch.verdict_round_links(REPO, 451, events, [forged]) == [None]
+    # Выжимка эскалации: подделка не «последнее требование ревью».
+    assert sch.last_verdict_excerpt(REPO, 451, comments=[forged]) == \
+        "текст вердикта недоступен"
 
 
 def test_verdict_round_links_consumes_comment_once_in_order():
