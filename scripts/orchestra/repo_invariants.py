@@ -130,6 +130,19 @@ _TR_SPEC = importlib.util.spec_from_file_location(
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
 _TR_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
 
+# ACCEPTANCE_PARTIAL_MARKER/ACCEPTANCE_FAIL_MARKER — только константы текста
+# маркера приёмки (не вызов её функций, circular import: scheduler.py не
+# импортирует repo_invariants, но держим импорт узким по духу остальных
+# ленивых importlib выше). Нужны инварианту 1 (#467, см.
+# check_reopened_after_merge) — приёмка (accept_merged_tasks) уже ставит
+# такой маркер на задачу, когда сама вынесла терминальный вердикт по
+# конкретному слитому PR; одно место правды на текст маркера, не вторая копия
+# строки здесь.
+_SCH_SPEC = importlib.util.spec_from_file_location(
+    "scheduler", REPO_ROOT / "scripts" / "orchestra" / "scheduler.py")
+scheduler = importlib.util.module_from_spec(_SCH_SPEC)
+_SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
@@ -179,7 +192,29 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
 
 
 
-def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
+def _acceptance_already_verdicted(repo: str, issue_number: int, pr_number: int) -> bool:
+    """Приёмка (scheduler.accept_merged_tasks) уже написала терминальный
+    вердикт по ИМЕННО ЭТОМУ слитому PR — ACCEPTANCE_PARTIAL_MARKER («требует
+    проверки человеком») или ACCEPTANCE_FAIL_MARKER («доработка»), оба вместе
+    со снятием assignee как часть штатного пути приёмки, а не как «никем не
+    замеченный пробел» (#467, см. check_reopened_after_merge). Текст маркера
+    строится тем же способом, что и сама приёмка (f"{MARKER} PR #{n}") — одно
+    место правды на форму строки, не вторая копия здесь.
+
+    RuntimeError (комментарии не прочитаны — сеть/права) не глотаем молча:
+    возвращаем False, чтобы инвариант сработал и не спрятал реальный сбой
+    чтения за тишиной "уже обработано"."""
+    for marker_const in (scheduler.ACCEPTANCE_PARTIAL_MARKER, scheduler.ACCEPTANCE_FAIL_MARKER):
+        marker = f"{marker_const} PR #{pr_number}"
+        try:
+            if issue_marker_times(repo, issue_number, marker):
+                return True
+        except RuntimeError:
+            return False
+    return False
+
+
+def check_reopened_after_merge(repo: str, open_tasks: list[dict], merged_pulls: list[dict]) -> list[dict]:
     """Открытая задача task без assignee, для которой уже есть слитый PR
     этой задачи (`task_ref.resolve_pr_task` по имени ветки). Механизм инцидента: reap_stale
     (scheduler.py) смотрит только ОТКРЫТЫЕ PR — если PR уже слит, «нет
@@ -187,8 +222,24 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
     assignee снимается ДАЖЕ когда работа честно завершена, просто исполнитель
     ещё не сделал пост-мерж проверку и не закрыл issue. Свободная задача с
     уже слитым PR — именно то состояние, в котором free_task()/
-    dispatch_worker выберут её заново (класс #18/#21/#78)."""
-    unassigned = {t["number"]: t for t in open_tasks if not t["assignees"]}
+    dispatch_worker выберут её заново (класс #18/#21/#78).
+
+    Два исключения (#467, живой случай: 6 задач в одном алерте, растёт без
+    возврата — «тормоз без газа»):
+
+    - WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача из пула;
+      accept_merged_tasks её тоже явно пропускает (см. её докстринг), эта
+      проверка не пропускала — сама WATCHDOG_ISSUE однажды оказалась в
+      списке нарушителей своего же канала эскалации.
+    - Задача, по которой приёмка УЖЕ вынесла терминальный вердикт для
+      именно этого слитого PR (см. _acceptance_already_verdicted) — это не
+      тихий пробел, который ловит инвариант 1, а уже озвученный исход:
+      либо ждёт решения человека (маркер называет причину прямо в этой же
+      задаче), либо ждёт НОВОГО PR от воркера (fail — штатный путь назад в
+      пул, не нарушение). Без этого исключения список нарушителей растёт
+      монотонно на каждый цикл приёмки без возврата."""
+    unassigned = {t["number"]: t for t in open_tasks
+                  if not t["assignees"] and t["number"] != WATCHDOG_ISSUE}
     by_task: dict[int, list[dict]] = {}
     for pull in merged_pulls:
         declared = task_ref.resolve_pr_task(pull)
@@ -200,6 +251,8 @@ def check_reopened_after_merge(open_tasks: list[dict], merged_pulls: list[dict])
         if number not in unassigned:
             continue
         newest = max(pulls, key=lambda p: p["merged_at"])
+        if _acceptance_already_verdicted(repo, number, newest["number"]):
+            continue
         violations.append({
             "issue": number,
             "title": unassigned[number]["title"],
@@ -570,7 +623,7 @@ def build_report(repo: str, now: datetime,
     findings: dict[int, list] = {}
     lines = ["## Инварианты состояния репозитория (#244)"]
 
-    v1 = check_reopened_after_merge(open_tasks, merged_pulls)
+    v1 = check_reopened_after_merge(repo, open_tasks, merged_pulls)
     findings[1] = v1
     if v1:
         lines.append(f"🚨 [1] {len(v1)} открытых задач без исполнителя с уже слитым PR:")

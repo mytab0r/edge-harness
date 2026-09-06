@@ -55,14 +55,19 @@ def open_pr(number, pr_body="", labels=()):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_reopened_after_merge_flags_free_task_with_merged_pr():
+REPO = "mytab0r/edge-harness"
+
+
+def test_reopened_after_merge_flags_free_task_with_merged_pr(monkeypatch):
     # #394: задача PR резолвится ТОЛЬКО по имени ветки, тело не читается —
     # оба PR названы agent/18-*, тела нет вовсе (штатный PR может быть слит
     # без единого номера в теле).
+    fake = FakeGh({"issues/18/comments": []})  # приёмка ещё не выносила вердикт
+    patch_gh(monkeypatch, fake)
     tasks = [task_issue(18, "AI-ревьюер диффа", assignees=())]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z"),
              merged_pr(138, "agent/18-second-pass", "2026-09-02T21:31:47Z")]
-    violations = ri.check_reopened_after_merge(tasks, pulls)
+    violations = ri.check_reopened_after_merge(REPO, tasks, pulls)
     assert len(violations) == 1
     assert violations[0]["issue"] == 18
     assert violations[0]["prs"] == [137, 138]
@@ -71,28 +76,87 @@ def test_reopened_after_merge_flags_free_task_with_merged_pr():
 
 def test_reopened_after_merge_silent_when_assigned():
     # тот же слитый PR, но задача СЕЙЧАС занята исполнителем — норма
-    # (пост-мерж проверка ещё не сделана, это не бросили)
+    # (пост-мерж проверка ещё не сделана, это не бросили). Без FakeGh-маршрута
+    # нарочно: маркер приёмки не должен даже спрашиваться (short-circuit по
+    # unassigned раньше).
     tasks = [task_issue(18, assignees=("mytab0r",))]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
 def test_reopened_after_merge_silent_without_merged_pr():
     tasks = [task_issue(18, assignees=())]
     pulls = [merged_pr(999, "agent/77-other-task", "2026-08-31T17:46:11Z")]  # чужая ветка
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
 
 
-def test_reopened_after_merge_mutation_guard():
+def test_reopened_after_merge_mutation_guard(monkeypatch):
     # Мутация: если бы проверка не сверялась с unassigned (снят фильтр по
     # исполнителю), КАЖДАЯ задача со слитым PR стала бы «нарушением» — на
     # живом репозитории это стандартный кратковременный путь после мержа,
     # а не баг. Тест доказывает, что фильтр обязателен.
     tasks = [task_issue(18, assignees=("mytab0r",))]
     pulls = [merged_pr(137, "agent/18-first-pass", "2026-08-31T17:46:11Z")]
-    assert ri.check_reopened_after_merge(tasks, pulls) == []
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+    fake = FakeGh({"issues/18/comments": []})
+    patch_gh(monkeypatch, fake)
     tasks_unassigned = [task_issue(18, assignees=())]
-    assert len(ri.check_reopened_after_merge(tasks_unassigned, pulls)) == 1
+    assert len(ri.check_reopened_after_merge(REPO, tasks_unassigned, pulls)) == 1
+
+
+def test_reopened_after_merge_excludes_watchdog_issue():
+    """#467: WATCHDOG_ISSUE (#120) — постоянный канал эскалации, не задача
+    из пула; accept_merged_tasks её тоже явно пропускает (см. её докстринг) —
+    эта проверка обязана делать то же самое, а не находить #120 в списке
+    нарушителей своего же канала (живой случай)."""
+    watchdog = ri.WATCHDOG_ISSUE
+    tasks = [task_issue(watchdog, "Предохранитель конвейера", assignees=())]
+    pulls = [merged_pr(126, f"agent/{watchdog}-pause", "2026-08-31T12:01:11Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_partial(monkeypatch):
+    """#467, живой случай PR #455/задача #454: приёмка уже вынесла терминальный
+    вердикт «требует проверки человеком» именно по этому слитому PR и сама
+    сняла исполнителя как часть штатного пути — не тихий пробел, инвариант 1
+    не должен пересчитывать эту задачу нарушителем снова и снова."""
+    fake = FakeGh({
+        "issues/454/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_PARTIAL_MARKER} PR #455 …",
+             "created_at": "2026-09-06T05:45:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(454, "ранний отказ по квоте", assignees=())]
+    pulls = [merged_pr(455, "agent/454-gh-quota-early-exit", "2026-09-06T05:43:14Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_excludes_task_already_verdicted_fail(monkeypatch):
+    """Тот же класс, второй терминальный маркер (#467, живой случай PR #437/
+    задача #432): «доработка» — штатный путь назад в пул для НОВОГО PR, не
+    нарушение инварианта 1."""
+    fake = FakeGh({
+        "issues/432/comments": [
+            {"body": f"{ri.scheduler.ACCEPTANCE_FAIL_MARKER} PR #437 — улика показала…",
+             "created_at": "2026-09-06T04:08:27Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(432, "review:large тоже гейт 1", assignees=())]
+    pulls = [merged_pr(437, "agent/432-gate1-decided", "2026-09-06T04:05:48Z")]
+    assert ri.check_reopened_after_merge(REPO, tasks, pulls) == []
+
+
+def test_reopened_after_merge_still_flags_task_never_verdicted(monkeypatch):
+    """Контроль: пустые комментарии (приёмка ещё не смотрела на эту пару
+    задача/PR) — инвариант 1 обязан сработать как раньше, различение не
+    глотает настоящий, ещё никем не замеченный пробел."""
+    fake = FakeGh({"issues/21/comments": []})
+    patch_gh(monkeypatch, fake)
+    tasks = [task_issue(21, "dev:docker", assignees=())]
+    pulls = [merged_pr(177, "agent/21-dev-docker", "2026-09-02T17:01:28Z")]
+    assert len(ri.check_reopened_after_merge(REPO, tasks, pulls)) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
