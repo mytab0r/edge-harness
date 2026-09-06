@@ -46,6 +46,21 @@
 # параллельные ревью одного PR возможны, и это осознанно: cancel-in-progress
 # НАМЕРЕННО выключен — отмена погасила бы летящее ревью без автоперезапуска,
 # а протухший вердикт и так не применяется (verdict сверяет head с gather).
+#
+# Полная сериализация ревью РАЗНЫХ PR в одну группу рассмотрена и ОТКЛОНЕНА
+# (#419, живой факт: 24 прогона/час, до 7 одновременно, четыре PR с ai:failed
+# от RATE_LIMIT). Причина отказа — не проверена числом, а опровергнута
+# механикой: у группы concurrency может быть только один ОЖИДАЮЩИЙ прогон —
+# при общей группе новый триггер (ЛЮБОГО PR) отменяет ЧУЖОЙ ожидающий прогон
+# (documented GitHub Actions concurrency queueing), а не только повторный
+# триггер того же PR, как сейчас. Отменённый прогон PR-A не оставляет ни
+# ai:*-метки, ни ai:failed — PR-A просто никогда не получает вердикт, и
+# ничего не просит его повторить (таймер #196 реагирует только на живой
+# ai:failed). Это ровно silent-wrong класс, который AGENTS.md запрещает:
+# «возможности нет» стало бы неотличимо от «забыли просмотреть». Настоящий
+# фикс перегрузки — ретрай временного RATE_LIMIT внутри dsh (ai_dsh.sh,
+# #419): проваленные ПОВТОРНЫМИ запросами прогоны переживают лимит сами, не
+# уменьшая число параллельных PR, которые смогут получить вердикт.
 name: ai-review
 
 # run-name зашивается из события ДО старта job'а (только github.event.*,
@@ -112,15 +127,25 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    # 60 мин — таймаут DSH (ai_dsh.sh) + установка и доверенный gather.
-    # Рабочий каталог — $RUNNER_TEMP/ai-review (шаги берут его из шелл-env
-    # раннера; job-level env не знает контекста runner — GitHub такой файл
-    # отклоняет целиком, поймано живым прогоном).
-    timeout-minutes: 70
+    # 130 мин (#419, было 70): один вызов dsh по-прежнему ограничен 60 мин
+    # (DSH_TIMEOUT_SECS ниже), но временный RATE_LIMIT теперь переживается
+    # ретраем внутри ai_dsh.sh — бюджет ожидания по умолчанию 30 мин
+    # (AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS), плюс до 60 мин на финальную
+    # успевшую попытку, плюс запас на установку/gather. Job живёт до 6 часов
+    # (docs/research/21-github-actions.md) — 130 мин оставляют большой запас,
+    # не подходя к жёсткому потолку. Рабочий каталог — $RUNNER_TEMP/ai-review
+    # (шаги берут его из шелл-env раннера; job-level env не знает контекста
+    # runner — GitHub такой файл отклоняет целиком, поймано живым прогоном).
+    timeout-minutes: 130
     outputs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
+      # failure_reason (#419): quota_exhausted | rate_limit_retry_budget_exceeded
+      # | пусто — пишет ai_dsh.sh в $AI_WORK/failure_reason.txt, различает в
+      # тексте вердикта «лимита нет вовсе» от «лимит есть, но что-то ещё
+      # сломано» (правило AGENTS.md, см. ai_review.py::error_reason).
+      failure_reason: ${{ steps.answer.outputs.failure_reason }}
       pr: ${{ steps.facts.outputs.pr }}
       # go — окончательное решение job'а: review:ok есть (facts) И дорогой
       # прогон оправдан (fingerprint, #294). Шаг fingerprint не выполняется,
@@ -329,6 +354,9 @@ jobs:
             # silent-wrong). Файла может не быть при экзотическом обрыве шага
             # (например SIGKILL раннера) — тогда пусто читается как «неизвестно».
             echo "dsh_rc=$(cat "$AI_WORK/dsh_rc.txt" 2>/dev/null || echo '')"
+            # failure_reason (#419): пусто на успехе/обычном транспортном
+            # отказе — тот же принцип "файла может не быть", что у dsh_rc.
+            echo "failure_reason=$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')"
             printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
             cat "$AI_WORK/answer.txt"
             printf 'AI_REVIEW_ANSWER_EOF_7f3a\n'
@@ -367,11 +395,14 @@ jobs:
           HEAD_REVIEWED: ${{ needs.review.outputs.head }}
           ANSWER: ${{ needs.review.outputs.answer }}
           DSH_RC: ${{ needs.review.outputs.dsh_rc }}
+          # #419: quota_exhausted | rate_limit_retry_budget_exceeded | пусто —
+          # см. ai_review.py::error_reason.
+          FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
         run: |
           printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
             --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED" \
-            --dsh-rc "$DSH_RC"
+            --dsh-rc "$DSH_RC" --failure-reason "$FAILURE_REASON"
 
       # Разбудить оркестратор (#297) сразу после вердикта, а не ждать
       # расписания: тот же приём, что в pr-review.yml (workflow_dispatch —

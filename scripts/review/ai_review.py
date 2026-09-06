@@ -190,12 +190,41 @@ def transport_failed(dsh_rc: str) -> bool:
         return False
 
 
-def error_reason(answer: str, dsh_rc: str) -> str:
-    """Причина verdict=error — три состояния, не смешиваемые в одно (класс
-    silent-wrong прогона 33572445063: ошибка провайдера читалась как «модель
-    нарушила контракт»). Порядок проверки важен: транспорт — раньше формата,
-    потому что при упавшем транспорте answer пуст и verdict_line_present
-    всё равно вернёт False — не значит «модель промолчала»."""
+def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
+    """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
+    (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
+    «модель нарушила контракт»; #419 добавил различение внутри самого
+    транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
+    что-то другое», правило AGENTS.md). Порядок проверки важен: failure_reason
+    (ai_dsh.sh уже решил за нас, что это лимит) — раньше generic-транспорта,
+    транспорт — раньше формата, потому что при упавшем транспорте answer пуст
+    и verdict_line_present всё равно вернёт False — не значит «модель
+    промолчала».
+
+    failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
+    ai_dsh.sh, #419), пробрасывается step-output'ами ai-review.yml в
+    verdict --failure-reason:
+      quota_exhausted                  — RATE_LIMIT: Weekly/Monthly Limit
+                                          Exhausted, сброс через дни — ждать
+                                          внутри прогона бессмысленно, ai_dsh.sh
+                                          не пытался.
+      rate_limit_retry_budget_exceeded — временный RATE_LIMIT не снялся за
+                                          отведённый бюджет ожидания.
+      "" (пусто)                       — старое поведение: либо обычный
+                                          транспортный сбой (rc≠0 без
+                                          RATE_LIMIT вовсе), либо контракт
+                                          ответа (rc=0, формат нарушен).
+    """
+    if failure_reason == "quota_exhausted":
+        return (f"ревью не состоялось — квота провайдера исчерпана надолго "
+                f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
+                f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
+                "ждать вне CI или сменить провайдера "
+                "(docs/runbooks/switch-llm-provider.md)")
+    if failure_reason == "rate_limit_retry_budget_exceeded":
+        return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
+                f"снялся за отведённый бюджет ожидания внутри прогона (код "
+                f"возврата {dsh_rc})")
     if transport_failed(dsh_rc):
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
     if verdict_line_present(answer):
@@ -590,10 +619,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
 
-    # Причина «error» — вычисляется ДО комментария: три разных состояния не
-    # смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
-    # ошибка провайдера не должна выглядеть как «модель ответила криво»).
-    reason = error_reason(answer, args.dsh_rc) if verdict == "error" else None
+    # Причина «error» — вычисляется ДО комментария: четыре разных состояния
+    # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
+    # ошибка провайдера не должна выглядеть как «модель ответила криво», а
+    # временный RATE_LIMIT — как настоящая поломка, #419).
+    reason = error_reason(answer, args.dsh_rc, args.failure_reason) if verdict == "error" else None
     if reason and not findings.strip():
         findings = reason
 
@@ -696,6 +726,10 @@ def main() -> int:
     # ручной запуск verdict без этого аргумента не должен падать — просто
     # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
     verdict.add_argument("--dsh-rc", default="")
+    # Тег причины из $AI_WORK/failure_reason.txt (ai_dsh.sh, #419): quota_exhausted
+    # | rate_limit_retry_budget_exceeded | пусто. Необязателен по той же причине,
+    # что и --dsh-rc — ручной запуск без него просто теряет уточнение.
+    verdict.add_argument("--failure-reason", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()
