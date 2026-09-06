@@ -27,9 +27,9 @@
       "id": "plugin-manager",
       "package": "@edge-harness/dsh-plugin-manager",
       "source": {
-        "release": "plugins-manager-v0.1.4",
-        "asset": "plugin-manager-0.1.4.tgz",
-        "sha256": "d8bf771ebcd52cbd483d234f35afce3f8eeeae4a2502c2e6489eda4a11a523e2"
+        "release": "plugins-manager-v0.1.6",
+        "asset": "plugin-manager-0.1.6.tgz",
+        "sha256": "8b64f3e4dbc3394b1682bf93064bb8c972363469edac90b5d08f68507453fa4e"
       },
       "server": false,
       "client": true
@@ -38,9 +38,9 @@
       "id": "integrations",
       "package": "@edge-harness/dsh-plugin-integrations",
       "source": {
-        "release": "plugins-integrations-v0.1.1",
-        "asset": "integrations-0.1.1.tgz",
-        "sha256": "700e0ee9822b5e635278c113cd520f8282c6b1039e83590bc0292977711df605"
+        "release": "plugins-integrations-v0.1.2",
+        "asset": "integrations-0.1.2.tgz",
+        "sha256": "2f35150d41f4903472bf3a2d2c035412e6e074fab23afff386e2b2bda1645dc6"
       },
       "server": true,
       "client": true
