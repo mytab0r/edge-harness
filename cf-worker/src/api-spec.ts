@@ -125,7 +125,7 @@ const spec = {
         "POST"
       ],
       "auth": true,
-      "summary": "Подтверждение job'а .github/workflows/inbox-issue.yml (Bearer HANDS_TOKEN — тот же канал, что heartbeat): repository_dispatch (204) не доказывает созданную issue (docs/research/21-github-actions.md), эта строка — единственное доказательство. Тело {message_id, issue_number, issue_url} — issue создана, сообщение → done; {message_id, error} — job сам сообщает об отказе, тот же кап попыток, что у ошибки dispatch'а. Не в processing (ватчдог уже вернул сообщение в очередь) — {accepted: false, reason: \"not_processing\"} без ошибки."
+      "summary": "Подтверждение job'а .github/workflows/inbox-issue.yml (Bearer HANDS_TOKEN — тот же канал, что heartbeat): repository_dispatch (204) не доказывает созданную issue (docs/research/21-github-actions.md), эта строка — единственное доказательство. Тело обязано нести claimed_ts (то же число, что #dispatchIssueCreation положил в client_payload, иначе 400 need_claimed_ts) плюс либо {message_id, claimed_ts, issue_number, issue_url} — issue создана, сообщение → done, возвращает {accepted, action: \"issue_created\", issue_number, issue_url}; либо {message_id, claimed_ts, error} — job сам сообщает об отказе (тот же кап попыток, что у ошибки dispatch'а), возвращает {accepted, action: \"issue_failed\"} при исчерпанном капе или {accepted, action: \"issue_retry\"} иначе. CAS по claimed_ts: запоздавшее подтверждение старой проходки (ватчдог уже увёл сообщение дальше) не находит совпадения — {accepted: false} с тем же action, без ошибки."
     }
   ]
 };
