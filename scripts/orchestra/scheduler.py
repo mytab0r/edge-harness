@@ -752,6 +752,24 @@ class UpdateBranchBudgetExhausted(RuntimeError):
     ошибками update-branch (конфликт, сеть)."""
 
 
+class AiReviewRunning(RuntimeError):
+    """update_branch отказался двигать head PR, потому что по этому же PR
+    прямо сейчас летит прогон ai-review.yml (in_progress/queued) — не
+    инфраструктурный сбой и не занятый слот прохода, вызывающий код обязан
+    поймать её отдельно и написать строку "подтянет следующий проход", а не
+    смешивать с реальными ошибками update-branch.
+
+    Живой инцидент (2026-09-06): оркестратор дёрнул update-branch на PR #488
+    в 18:50, пока с 18:38 по нему же считал платный прогон ai-review против
+    старого head — прогон досчитал впустую (verdict-шаг отбросил вердикт по
+    ADR 0007 п.5, «вердикт привязан к head»), а новый прогон стартовал сразу
+    вслед за подтягиванием. Тормоз без газа не годится (AGENTS.md): газ здесь
+    — то же самое чтение, что и тормоз, разнесённое по времени — как только
+    прогон, вызвавший отказ, закончится (success/failure/cancelled), то же
+    чтение other_active_ai_review_runs в следующем проходе отдаёт пустой
+    список, и update_branch пробует снова без ручного вмешательства."""
+
+
 # Слот на один ПРОХОД (merge_queue + update_remaining_pulls внутри одного его
 # вызова), не на точку вызова внутри прохода: если бы дисциплина «максимум
 # один успешно подтянутый update-branch за проход» жила локальной переменной
@@ -796,11 +814,28 @@ def update_branch(repo: str, pr_number: int) -> None:
     UpdateBranchBudgetExhausted вместо push'а. Успех отмечает слот занятым;
     неудачная попытка (RuntimeError/CalledProcessError, вероятный конфликт)
     слот не трогает — head не изменился, следующий кандидат в этом же
-    проходе ничем не рискует."""
+    проходе ничем не рискует.
+
+    Тормоз гонки «оркестратор двигает head, пока по нему летит ai-review»
+    (см. AiReviewRunning выше, живой инцидент 2026-09-06, PR #488): ПЕРЕД
+    самим push'ом (и до расхода слота — неудачная попытка слот не трогает)
+    проверяется, нет ли прогона ai-review.yml (in_progress/queued) для
+    именно этого PR. Один и тот же предикат, что уже отказывает ручному
+    workflow_dispatch того же PR (`review_labels.other_active_ai_review_runs`,
+    #399) — второй копии этой проверки не заводится, обе точки входа (ручной
+    повтор ревью и автоматическое подтягивание ветки) читают один и тот же
+    список активных прогонов."""
     global _update_branch_used_this_run
     if _update_branch_used_this_run:
         raise UpdateBranchBudgetExhausted(
             f"слот update_branch этого прогона уже занят до PR #{pr_number}"
+        )
+    running = review_labels.other_active_ai_review_runs(repo, pr_number, exclude_run_id=None, gh_func=gh)
+    if running:
+        run_ids = ", ".join(str(run.get("id")) for run in running)
+        raise AiReviewRunning(
+            f"по PR #{pr_number} прямо сейчас летит ai-review.yml (run {run_ids}) "
+            "— head не двигаю, пока прогон не закончится"
         )
     pat = os.environ.get("ORCHESTRA_PAT")
     if pat:
@@ -821,11 +856,13 @@ def update_branch_or_report(
     *,
     on_success: str,
     on_budget_exhausted: str,
+    on_ai_review_running: str,
     on_error: str,
 ) -> str:
-    """Единственное место, где разбираются три исхода update_branch — успех,
-    исчерпанный слот прогона (UpdateBranchBudgetExhausted), сетевой/иной сбой
-    (RuntimeError/subprocess.CalledProcessError). Закрывает класс "разная
+    """Единственное место, где разбираются четыре исхода update_branch —
+    успех, исчерпанный слот прогона (UpdateBranchBudgetExhausted), летящий
+    ai-review этого же PR (AiReviewRunning, см. update_branch), сетевой/иной
+    сбой (RuntimeError/subprocess.CalledProcessError). Закрывает класс "разная
     обработка ошибок update_branch в разных точках вызова" (PR #288): раньше
     behind-ветка merge_queue ловила только UpdateBranchBudgetExhausted, а
     update_remaining_pulls — оба исхода, из-за чего сетевой сбой в
@@ -834,11 +871,16 @@ def update_branch_or_report(
     ветки ok/fail без per-item try).
 
     Обе точки вызова обязаны идти через эту функцию, а не звать update_branch
-    напрямую и заводить свой try/except — три параметра-текста обязательные,
-    без значений по умолчанию, поэтому новая (третья) точка вызова, забывшая
-    текст на сетевой сбой, падает TypeError'ом сразу при вызове, а не тонет в
-    проде необработанным исключением. on_error форматируется через
-    .format(error=...).
+    напрямую и заводить свой try/except — четыре параметра-текста
+    обязательные, без значений по умолчанию, поэтому новая (третья) точка
+    вызова, забывшая текст на один из исходов, падает TypeError'ом сразу при
+    вызове, а не тонет в проде необработанным исключением. on_error
+    форматируется через .format(error=...).
+
+    AiReviewRunning разбирается ПЕРЕД RuntimeError (она — его подкласс):
+    иначе более общая ветка перехватила бы её первой и «летит ai-review»
+    ушло бы читателю отчёта как обычный сетевой сбой — тот же класс подмены
+    диагноза, что уже развели on_budget_exhausted/on_error.
 
     subprocess.CalledProcessError разбирается отдельно от RuntimeError
     (находка AI-ревью PR #288): в проде ORCHESTRA_PAT задан
@@ -851,6 +893,8 @@ def update_branch_or_report(
         update_branch(repo, pr_number)
     except UpdateBranchBudgetExhausted:
         return on_budget_exhausted
+    except AiReviewRunning:
+        return on_ai_review_running
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or str(error)).strip()
         return on_error.format(error=detail)
@@ -969,10 +1013,16 @@ def merge_queue(
                 f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
                 "этого прохода уже занят другим PR; подтянет следующая итерация цикла слияний (#252/#297)"
             )
+            ai_review_running_text = (
+                f"#{pull['number']} — behind main и близок к слиянию, но по нему прямо сейчас летит "
+                "ai-review.yml; head не трогаю, чтобы не сорвать прогон (тормоз гонки, живой инцидент "
+                "PR #488) — следующий проход подтянет, когда прогон закончится"
+            )
             result = update_branch_or_report(
                 repo, pull["number"],
                 on_success=success_text,
                 on_budget_exhausted=budget_exhausted_text,
+                on_ai_review_running=ai_review_running_text,
                 on_error=(
                     f"#{pull['number']} — behind main и близок к слиянию, но update_branch не удался "
                     "(вероятен конфликт — попадёт под mark_conflicts): {error}"
@@ -981,8 +1031,9 @@ def merge_queue(
             if result == success_text:
                 updated = True
                 actions.append(result)
-            elif result == budget_exhausted_text:
-                # Слот занят этим же прогоном — попытки push'а не было вовсе.
+            elif result in (budget_exhausted_text, ai_review_running_text):
+                # Слот занят этим же прогоном ИЛИ head намеренно не тронут
+                # из-за летящего ai-review — попытки push'а не было вовсе.
                 skipped.append(result)
             else:
                 # Сетевой/иной сбой реальной попытки push'а — действие с
@@ -1639,23 +1690,30 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
                 "— не близок к слиянию и не в конфликте (#252)"
             )
             continue
-        # Обработка всех трёх исходов — в update_branch_or_report (#288), не здесь.
+        # Обработка всех четырёх исходов — в update_branch_or_report (#288), не здесь.
         budget_exhausted_text = (
             f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
             "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
             "оркестратора (#252)"
         )
+        ai_review_running_text = (
+            f"⏸️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — по нему "
+            "прямо сейчас летит ai-review.yml; head не трогаю, чтобы не сорвать прогон (тормоз гонки, "
+            "живой инцидент PR #488) — подтянет следующий прогон, когда прогон закончится"
+        )
         result = update_branch_or_report(
             repo, other["number"],
             on_success=f"🔄 PR #{other['number']} обновлён из main после слияния #{merged_number}",
             on_budget_exhausted=budget_exhausted_text,
+            on_ai_review_running=ai_review_running_text,
             on_error=(
                 f"⚠️ PR #{other['number']} не обновлён из main после слияния #{merged_number} "
                 "(вероятен конфликт — попадёт под mark_conflicts): {error}"
             ),
         )
-        if result == budget_exhausted_text:
-            # Слот занят самим этим прогоном (не сеть/сервер) — попытки push'а
+        if result in (budget_exhausted_text, ai_review_running_text):
+            # Слот занят самим этим прогоном ИЛИ head намеренно не тронут
+            # из-за летящего ai-review (не сеть/сервер) — попытки push'а
             # не было вовсе, значит и наблюдение, не действие.
             observations.append(result)
         else:
