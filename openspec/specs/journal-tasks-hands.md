@@ -183,7 +183,7 @@
         `pin-not-tag`) пульс пытается сам открыть PR с поднятым пином —
         новая задача пула, ветка `agent/<N>-dsh-edge-upstream-bump`, коммит
         нового `dsh-edge/upstream.json` (sha — тег новейшего стабильного
-        релиза), `gh pr create` под PAT (`ORCHESTRA_PAT`, не `GITHUB_TOKEN` —
+        релиза), `scripts/git/pr-create` (обёртка над `gh pr create`, #496) под PAT (`ORCHESTRA_PAT`, не `GITHUB_TOKEN` —
         иначе `test`/`contract` не запустятся на этом PR). Патч-серия
         `dsh-edge/patches` этим коммитом не перебазируется — применимость
         доказывает пост-мерж шаг «Патч-серия» `deploy-dsh-edge.yml` (этот

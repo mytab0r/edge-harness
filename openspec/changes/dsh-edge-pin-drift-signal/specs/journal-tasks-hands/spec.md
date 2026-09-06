@@ -46,13 +46,13 @@ rc ядра, у которого вышел стабильный релиз, —
 `attempt_auto_bump` (`scripts/orchestra/upstream_drift.py`): заводит новую
 задачу пула (label `task`, `area:worker`), ветку `agent/<N>-dsh-edge-upstream-bump`
 от `origin/main`, коммит с новым `dsh-edge/upstream.json` (sha — тег
-новейшего стабильного релиза апстрима) и PR через `gh pr create`. Патч-серия
+новейшего стабильного релиза апстрима) и PR через `scripts/git/pr-create` (обёртка над `gh pr create`, #496). Патч-серия
 `dsh-edge/patches` этим коммитом НЕ перебазируется — решение, что в конфликте
 патча смысловое, а что структурное, требует суждения (см. живой случай #505:
 три минорных релиза апстрима сломали ровно те файлы, что трогают патчи
 0003/0004), а не regex.
 
-Требование: git-операции и `gh pr create` идут под PAT (`ORCHESTRA_PAT`), не
+Требование: git-операции и `scripts/git/pr-create` (обёртка над `gh pr create`, #496) идут под PAT (`ORCHESTRA_PAT`), не
 под `GITHUB_TOKEN` — события, вызванные `GITHUB_TOKEN`, не создают новых
 прогонов workflow (документированное ограничение GitHub), и `test`/`contract`
 никогда бы не сработали на таком PR. Нет `ORCHESTRA_PAT` в окружении — попытка

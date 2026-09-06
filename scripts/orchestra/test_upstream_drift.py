@@ -473,7 +473,8 @@ class FakeRun:
 
     def __call__(self, args, **kwargs):
         self.calls.append(list(args))
-        stdout = self.pr_url if args[:2] == ["gh", "pr"] else ""
+        is_pr_create = args and args[0].replace("\\", "/").endswith("scripts/git/pr-create")
+        stdout = self.pr_url if is_pr_create else ""
         return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
 
@@ -509,9 +510,9 @@ def test_attempt_auto_bump_happy_path_creates_issue_branch_and_pr(monkeypatch, t
     assert any(c[0] == "git" and "commit" in c for c in git_calls)
     push_call = next(c for c in git_calls if "push" in c)
     assert any("bearer test-pat-token" in part for part in push_call)
-    gh_pr_call = next(c for c in fake_run.calls if c[:2] == ["gh", "pr"])
-    assert "--title" in gh_pr_call
-    title = gh_pr_call[gh_pr_call.index("--title") + 1]
+    pr_create_call = next(c for c in fake_run.calls if c[0].replace("\\", "/").endswith("scripts/git/pr-create"))
+    assert "--title" in pr_create_call
+    title = pr_create_call[pr_create_call.index("--title") + 1]
     assert title == f"{ud.AUTO_BUMP_TITLE_PREFIX}dsh-edge-v0.8.0"
     # Файл пина реально переписан новым sha (PIN_080 — тег dsh-edge-v0.8.0)
     written = json.loads(pin_file.read_text(encoding="utf-8"))

@@ -411,13 +411,19 @@ def attempt_auto_bump(repo: str, decision: dict, tags: list[dict], *, pin_path: 
             "дефект. До мержа этот PR проходит только `test`/`contract` — ни один из них не "
             "проверяет применимость патчей, деплой на PR не гоняется."
         )
+        # Единственный документированный путь открытия PR (#496,
+        # docs/agents/PROTOCOL.md п.7) — обёртка над `gh pr create`, отказывает
+        # ДО открытия PR на директиву Closes/Fixes/Resolves. Тело этого PR
+        # такой директивы не несёт, но второй, необёрнутый путь открытия PR
+        # рядом с уже документированным был бы вторым местом правды.
+        pr_create = repo_root / "scripts" / "git" / "pr-create"
         result = subprocess.run(
-            ["gh", "pr", "create", "--repo", repo, "--base", "main", "--head", branch,
+            [str(pr_create), "--repo", repo, "--base", "main", "--head", branch,
              "--title", f"{AUTO_BUMP_TITLE_PREFIX}{decision['latest_tag']}", "--body", pr_body],
             capture_output=True, text=True, env={**os.environ, "GH_TOKEN": pat, "NO_COLOR": "1"},
         )
         if result.returncode != 0:
-            raise RuntimeError(f"gh pr create упал: {result.stderr.strip()}")
+            raise RuntimeError(f"scripts/git/pr-create упал: {result.stderr.strip()}")
         return f"🤖 авто-бамп: открыт PR на задачу #{issue_number} ({result.stdout.strip()})"
     except RuntimeError as error:
         return f"⚠️ авто-бамп не удался: {error}"
