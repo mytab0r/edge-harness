@@ -74,6 +74,24 @@ jobs:
           python -m pytest scripts/lib/test_declared_deps.py -q
           python scripts/lib/declared_deps.py check "$GITHUB_REPOSITORY"
 
+      # Гвардия класса #179/#526: программное заведение issue пула (POST
+      # repos/{repo}/issues) обязано идти через ЕДИНУЮ точку
+      # scripts/lib/pool_issue.py::create_pool_issue — она физически не даёт
+      # создать issue без метки `task` (RuntimeError до сетевого вызова).
+      # Живой случай, который это закрывает: до #526 три места
+      # (file_tasks.py/scheduler.py/stall_detector.py) собирали
+      # `-f labels[]=task` каждое само по себе — расхождение было лишь
+      # вопросом времени для следующего добавленного места (upstream_drift.py
+      # оказалось четвёртым при сплошном прочёсе, тоже мигрировано). Сырой
+      # POST на этот эндпоинт вне pool_issue.py — рецидив, красит CI.
+      - name: Заведение issue пула — только через pool_issue.create_pool_issue (класс #179/#526)
+        run: |
+          if grep -rn 'repos/{repo}/issues"' scripts/orchestra/ scripts/lib/ scripts/review/ --include=*.py | grep -v 'scripts/lib/pool_issue.py'; then
+            echo "::error::сырой POST repos/{repo}/issues вне pool_issue.py (класс #179/#526) — используй pool_issue.create_pool_issue, иначе task можно забыть"
+            exit 1
+          fi
+          echo "orchestra+lib+review: заведение issue пула только через pool_issue.create_pool_issue"
+
       # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
       # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
       # пока краш не заметил человек. Правильная форма: значение "-f", "body=…".
@@ -520,6 +538,29 @@ jobs:
       # Два реальных места вызова (scripts/worker/task.sh, plugin-forge.yml)
       # уже переведены на scripts/git/pr-create этим PR; страховка для новых
       # мест — ревью, не статический греп (честная граница, issue #496).
+
+      # Проверка на входе в scripts/gh/issue-create (#526, живые случаи —
+      # issue #523 заведена агентом `gh issue create --label white-spot` мимо
+      # шаблона, #425 — без единой метки): отказ ДО вызова `gh issue create`,
+      # если среди --label нет task и не дан явный --no-task-ack.
+      - name: Smoke issue-create — issue без task отклоняется до вызова gh (#526)
+        run: bash scripts/gh/test/issue-create.test.sh
+
+      # Гвардия класса #526 (статический скан «сырой gh issue create вне
+      # обёртки») РАССМОТРЕНА и сознательно НЕ заведена по ТОЙ ЖЕ причине,
+      # что и класс #496 выше: подстрока `gh issue create` легитимно
+      # встречается в комментариях/доках/тексте тестов (в т.ч. в этом же PR —
+      # комментарии выше, докстринг scripts/lib/pool_issue.py, сама обёртка,
+      # её тест), различить «упоминание» от «настоящий вызов» без
+      # полноценного парсера — та же неразрешимая в общем виде граница
+      # (AGENTS.md: «статически не выразим»). На момент этого PR ни одного
+      # реального вызова `gh issue create` мимо scripts/gh/issue-create в
+      # scripts//.github/workflows/ нет; страховка для новых мест — ревью, не
+      # статический греп (честная граница, issue #526). Канал промптов
+      # агентов («заведи issue» в задании, вне committed-кода репозитория)
+      # этой гвардией тоже не покрыт — это СОГЛАШЕНИЕ, зафиксированное в
+      # docs/agents/PROTOCOL.md, не механизм: ни один хук/CI не видит команду
+      # до того, как issue уже создана.
 
       # Гвардия класса #476 (живой прогон worker.yml 34027035455, PR #408):
       # доводка уже открытого PR обязана исполнять scripts/* (по пути, включая

@@ -65,6 +65,15 @@ _rl_spec = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_rl_spec)
 _rl_spec.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
+# Единственное место правды на заведение issue пула (#526): без него labels
+# без `task` собирались бы копией той же проверки, что уже есть у
+# file_tasks.py/scheduler.py/stall_detector.py — вместо этого все четверо
+# зовут одну функцию.
+_pi_spec = importlib.util.spec_from_file_location(
+    "pool_issue", Path(__file__).resolve().parents[1] / "lib" / "pool_issue.py")
+pool_issue = importlib.util.module_from_spec(_pi_spec)
+_pi_spec.loader.exec_module(pool_issue)  # type: ignore[union-attr]
+
 # gh зовётся через модуль (pulse_guard.gh), а не import-ом по имени: у
 # тестов проводки должен быть ОДИН пункт патча — pulse_guard.gh, как уже
 # устроено в test_scheduler.py (patch_gh). escalate/issue_markers_any внутри
@@ -365,11 +374,9 @@ def create_bump_issue(repo: str, decision: dict) -> int:
         "- [x] Я прочитал docs/research/30-rejected-alternatives.md и задача не из отвергнутых\n"
         "- [x] Критерий готовности проверяем по видимому результату\n"
     )
-    created = pulse_guard.gh(
-        "-X", "POST", f"repos/{repo}/issues",
-        "-f", f"title=dsh-edge: пин апстрима отстаёт от {tag_name}",
-        "-f", f"body={body}",
-        "-f", "labels[]=task", "-f", "labels[]=area:worker",
+    created = pool_issue.create_pool_issue(
+        pulse_guard.gh, repo, f"dsh-edge: пин апстрима отстаёт от {tag_name}", body,
+        ["task", "area:worker"],
     )
     return created["number"]
 
