@@ -3304,6 +3304,11 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         # Пин свеж → состояние ok → только чтение: гвардия внизу требует,
         # что и здесь не было ни одного POST/PUT/DELETE.
         "repos/pawaca/dsh-edge/tags?per_page=100": [
+            # sha первого тега = текущий пин dsh-edge/upstream.json (бамп #505,
+            # 2026-09-06): "ok" здесь держится на том, что этот тег — новейший
+            # стабильный в списке, а не на конкретном номере версии.
+            {"name": "dsh-edge-v0.11.1",
+             "commit": {"sha": "e1941bbcb7e2d5693df9fc278362f2c184963024", "url": "https://x"}},
             {"name": "dsh-edge-v0.8.0",
              "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
             {"name": "dsh-edge-v0.7.1",
@@ -3358,6 +3363,11 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
         "issues/120/comments?per_page=100": [],
         "repos/pawaca/dsh-edge/tags?per_page=100": [
+            # sha первого тега = текущий пин dsh-edge/upstream.json (бамп #505,
+            # 2026-09-06): "ok" здесь держится на том, что этот тег — новейший
+            # стабильный в списке, а не на конкретном номере версии.
+            {"name": "dsh-edge-v0.11.1",
+             "commit": {"sha": "e1941bbcb7e2d5693df9fc278362f2c184963024", "url": "https://x"}},
             {"name": "dsh-edge-v0.8.0",
              "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
             {"name": "dsh-edge-v0.7.1",

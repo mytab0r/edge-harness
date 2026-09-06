@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
-index 30c8dda..edbf612 100644
+index 972d344..9f6d849 100644
 --- a/apps/dsh-edge/src/http.ts
 +++ b/apps/dsh-edge/src/http.ts
 @@ -12,6 +12,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
@@ -11,43 +11,16 @@ index 30c8dda..edbf612 100644
 +export const MAX_HARNESS_INGEST_BODY_BYTES = 1_048_576
 +export const MAX_HARNESS_INGEST_EVENTS = 256
  
- /** Invalid caller input with an explicit HTTP response status. */
- export class EdgeHttpError extends Error {
-diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
-index a7749d5..bf1b380 100644
---- a/apps/dsh-edge/src/index.ts
-+++ b/apps/dsh-edge/src/index.ts
-@@ -10,6 +10,7 @@ import {
- } from './auth.ts'
- import {
-   EdgeHttpError,
-+  MAX_HARNESS_INGEST_BODY_BYTES,
-   MAX_MESSAGE_FEEDBACK_BODY_BYTES,
-   MAX_SESSION_CREATE_BODY_BYTES,
-   MAX_TURN_BODY_BYTES,
-@@ -167,13 +168,15 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
-   headers.set(OWNER_SESSION_EXPIRY_HEADER, String(ownerSessionExpiresAt))
-   if (request.body === null) return new Request(request, { headers })
-   const url = new URL(request.url)
--  const maxBytes = url.pathname === '/api/messageFeedback/put'
--    ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
--    : url.pathname.endsWith('/turn')
--      || url.pathname === '/api/session.prompt'
--      || url.pathname === '/api/session.updateQueue'
--      ? MAX_TURN_BODY_BYTES
--      : MAX_SESSION_CREATE_BODY_BYTES
-+  const maxBytes = url.pathname.endsWith('/ingest')
-+    ? MAX_HARNESS_INGEST_BODY_BYTES
-+    : url.pathname === '/api/messageFeedback/put'
-+      ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
-+      : url.pathname.endsWith('/turn')
-+        || url.pathname === '/api/session.prompt'
-+        || url.pathname === '/api/session.updateQueue'
-+        ? MAX_TURN_BODY_BYTES
-+        : MAX_SESSION_CREATE_BODY_BYTES
-   const body = await readBoundedBody(
-     request,
-     maxBytes,
+ /**
+  * Body limit for one Durable Object API request, selected before the entry
+@@ -21,6 +25,7 @@ export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
+  * data gets the turn budget whichever path the client uses.
+  */
+ export function instanceRequestBodyLimit(pathname: string): number {
++  if (pathname.endsWith('/ingest')) return MAX_HARNESS_INGEST_BODY_BYTES
+   if (pathname.endsWith('/turn') || pathname === '/api/skills') return MAX_TURN_BODY_BYTES
+   const route = /^\/api\/([a-zA-Z0-9_$-]+)[./]([a-zA-Z0-9_$-]+)$/.exec(pathname)
+   if (route === null) return MAX_SESSION_CREATE_BODY_BYTES
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
 index 9b15245..43f172f 100644
 --- a/apps/dsh-edge/src/instance.ts

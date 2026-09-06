@@ -13,6 +13,7 @@ upstream_drift_check — на моке pulse_guard.gh (единственный 
 """
 
 import importlib.util
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,9 +287,13 @@ def wired_fake(*, labels=(), comments=(), tags=TAGS):
 
 @pytest.fixture()
 def offline_telegram(monkeypatch):
-    """Без секретов Telegram честно «не доставлен» — сетью тест не ходит."""
+    """Без секретов Telegram честно «не доставлен» — сетью тест не ходит.
+    Заодно снимает ORCHESTRA_PAT (#505): без него авто-бамп честно
+    пропускает попытку вместо git/gh — тесты дрейфа не должны зависеть от
+    того, задан ли этот секрет в окружении, где реально гоняется pytest."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
 
 def patch_module_gh(monkeypatch, fake):
@@ -299,18 +304,26 @@ def patch_module_gh(monkeypatch, fake):
 
 
 def test_check_ok_on_fresh_pin_zero_mutations(monkeypatch, offline_telegram, tmp_path):
-    monkeypatch.chdir(tmp_path)  # пин читается по абсолютному PIN_PATH — не мешает
+    # Явный pin_path с sha PIN_080 (== "latest" в TAGS этого модуля) — тест не
+    # опирается на то, что реальный dsh-edge/upstream.json репозитория сейчас
+    # совпадает с фикстурой TAGS: бамп пина (#505) меняет прод-файл независимо
+    # от этого фикстурного набора тегов, и тест не имеет права зависеть от
+    # внешнего состояния репозитория.
+    pin_file = tmp_path / "upstream.json"
+    pin_file.write_text('{"repo": "pawaca/dsh-edge", "sha": "%s"}' % PIN_080, encoding="utf-8")
     fake = wired_fake(labels=[], comments=[])
     patch_module_gh(monkeypatch, fake)
-    lines = ud.upstream_drift_check("mytab0r/edge-harness")
+    lines = ud.upstream_drift_check("mytab0r/edge-harness", pin_path=pin_file)
     assert lines == ["💗 пин апстрима свеж: dsh-edge-v0.8.0 — новейший стабильный релиз pawaca/dsh-edge"]
     assert fake.mutating_calls() == [], f"свежий пин не имеет права менять что-либо: {fake.mutating_calls()}"
 
 
-def test_check_ok_drops_stale_label_automatic_gas(monkeypatch, offline_telegram):
+def test_check_ok_drops_stale_label_automatic_gas(monkeypatch, offline_telegram, tmp_path):
+    pin_file = tmp_path / "upstream.json"
+    pin_file.write_text('{"repo": "pawaca/dsh-edge", "sha": "%s"}' % PIN_080, encoding="utf-8")
     fake = wired_fake(labels=["update-available"], comments=[])
     patch_module_gh(monkeypatch, fake)
-    lines = ud.upstream_drift_check("mytab0r/edge-harness")
+    lines = ud.upstream_drift_check("mytab0r/edge-harness", pin_path=pin_file)
     assert lines and lines[0].startswith("💗")
     deletes = [c for c in fake.calls if "-X DELETE" in c]
     assert any("issues/134/labels/update-available" in c for c in deletes), \
@@ -384,6 +397,166 @@ def test_load_pin_broken_form_is_runtime_error_not_crash(tmp_path):
     bad.write_text("не json", encoding="utf-8")
     with pytest.raises(RuntimeError):
         ud.load_pin(bad)
+
+
+# ── Автоматический бамп (#505): дедуп, форма пина, газ по гвардиям ───────────────
+
+
+def pr(number, title, state="open"):
+    return {"number": number, "title": title, "state": state}
+
+
+def test_open_auto_bump_pr_finds_matching_title(monkeypatch):
+    fake = FakeGh({"pulls?state=open": [
+        pr(10, "какой-то другой PR"),
+        pr(11, f"{ud.AUTO_BUMP_TITLE_PREFIX}dsh-edge-v0.9.0"),
+    ]})
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake)
+    found = ud.open_auto_bump_pr("mytab0r/edge-harness")
+    assert found is not None and found["number"] == 11
+
+
+def test_open_auto_bump_pr_none_when_absent(monkeypatch):
+    fake = FakeGh({"pulls?state=open": [pr(10, "какой-то другой PR")]})
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake)
+    assert ud.open_auto_bump_pr("mytab0r/edge-harness") is None
+
+
+def test_bumped_pin_text_carries_sha_tag_and_issue(tmp_path):
+    text = ud.bumped_pin_text(pin(PIN_071), tag("dsh-edge-v0.9.0", "9" * 40), 999)
+    parsed = json.loads(text)
+    assert parsed["repo"] == "pawaca/dsh-edge"
+    assert parsed["sha"] == "9" * 40
+    assert "dsh-edge-v0.9.0" in parsed["note"] and "#999" in parsed["note"]
+    assert text.endswith("\n")  # файл с завершающим переводом строки, как прод upstream.json
+
+
+def test_attempt_auto_bump_skips_pin_not_tag(monkeypatch, tmp_path):
+    decision = ud.decide_drift(pin("c" * 40), TAGS)
+    assert decision["state"] == "pin-not-tag"
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
+    assert "вне его права" in result
+
+
+def test_attempt_auto_bump_skips_without_pat(monkeypatch, offline_telegram, tmp_path):
+    decision = ud.decide_drift(pin(PIN_071), TAGS)
+
+    def must_not_be_called(*args):
+        raise AssertionError(f"gh не должен вызываться без ORCHESTRA_PAT: {args}")
+    monkeypatch.setattr(ud.pulse_guard, "gh", must_not_be_called)
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
+    assert "ORCHESTRA_PAT не задан" in result
+
+
+def test_attempt_auto_bump_dedup_skips_when_pr_open(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    decision = ud.decide_drift(pin(PIN_071), TAGS)
+    fake = FakeGh({"pulls?state=open": [pr(42, f"{ud.AUTO_BUMP_TITLE_PREFIX}dsh-edge-v0.8.0")]})
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake)
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"git/gh не должны вызываться при дедупе: {args}")
+    monkeypatch.setattr(ud.subprocess, "run", boom)
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
+    assert "уже открыт" in result
+    assert fake.mutating_calls() == []
+
+
+class FakeRun:
+    """Recorder для subprocess.run: возвращает успех на всё, пишет вызовы —
+    авто-бамп проверяется по ПОСЛЕДОВАТЕЛЬНОСТИ git/gh команд, реальный git
+    в юнит-тесте не поднимается (сеть/бинарник — вне контракта этого теста)."""
+
+    def __init__(self, *, pr_url="https://github.com/mytab0r/edge-harness/pull/999"):
+        self.calls: list[list[str]] = []
+        self.pr_url = pr_url
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(list(args))
+        stdout = self.pr_url if args[:2] == ["gh", "pr"] else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+
+def test_attempt_auto_bump_happy_path_creates_issue_branch_and_pr(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    decision = ud.decide_drift(pin(PIN_071), TAGS)
+    gh_calls = []
+
+    def fake_gh(*args):
+        gh_calls.append(args)
+        joined = " ".join(args)
+        if "pulls?state=open" in joined:
+            return []
+        if joined.startswith("-X POST") and "/issues" in joined and "/labels" not in joined:
+            return {"number": 777}
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake_gh)
+    pin_file = tmp_path / "dsh-edge" / "upstream.json"
+    pin_file.parent.mkdir(parents=True)
+    pin_file.write_text('{"repo": "pawaca/dsh-edge", "sha": "%s"}' % PIN_071, encoding="utf-8")
+    fake_run = FakeRun()
+    monkeypatch.setattr(ud.subprocess, "run", fake_run)
+
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=pin_file)
+
+    assert result.startswith("🤖 авто-бамп: открыт PR на задачу #777")
+    git_calls = [c for c in fake_run.calls if c[0] == "git"]
+    assert git_calls[0][1:3] == ["fetch", "origin"]
+    assert git_calls[1][1:3] == ["checkout", "-B"]
+    assert git_calls[1][3] == "agent/777-dsh-edge-upstream-bump"
+    assert any(c[:2] == ["git", "add"] for c in git_calls)
+    assert any(c[0] == "git" and "commit" in c for c in git_calls)
+    push_call = next(c for c in git_calls if "push" in c)
+    assert any("bearer test-pat-token" in part for part in push_call)
+    gh_pr_call = next(c for c in fake_run.calls if c[:2] == ["gh", "pr"])
+    assert "--title" in gh_pr_call
+    title = gh_pr_call[gh_pr_call.index("--title") + 1]
+    assert title == f"{ud.AUTO_BUMP_TITLE_PREFIX}dsh-edge-v0.8.0"
+    # Файл пина реально переписан новым sha (PIN_080 — тег dsh-edge-v0.8.0)
+    written = json.loads(pin_file.read_text(encoding="utf-8"))
+    assert written["sha"] == PIN_080
+
+
+def test_attempt_auto_bump_git_failure_is_reported_not_raised(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    decision = ud.decide_drift(pin(PIN_071), TAGS)
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if "pulls?state=open" in joined:
+            return []
+        if "/issues" in joined:
+            return {"number": 778}
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake_gh)
+
+    def failing_run(args, **kwargs):
+        if args[:2] == ["git", "fetch"]:
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "network unreachable"})()
+        raise AssertionError(f"не должен дойти сюда: {args}")
+    monkeypatch.setattr(ud.subprocess, "run", failing_run)
+
+    pin_file = tmp_path / "dsh-edge" / "upstream.json"
+    pin_file.parent.mkdir(parents=True)
+    pin_file.write_text('{"repo": "pawaca/dsh-edge", "sha": "%s"}' % PIN_071, encoding="utf-8")
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=pin_file)
+    assert result.startswith("⚠️ авто-бамп не удался")
+    assert "network unreachable" in result
+
+
+def test_upstream_drift_check_appends_auto_bump_line(monkeypatch, offline_telegram, tmp_path):
+    """upstream_drift_check вызывает attempt_auto_bump на новом эпизоде дрейфа
+    и добавляет его строку отчёта второй — сама git/gh-проводка покрыта
+    отдельными тестами выше, здесь только факт вызова и порядок строк."""
+    pin_file = tmp_path / "upstream.json"
+    pin_file.write_text('{"repo": "pawaca/dsh-edge", "sha": "%s"}' % PIN_071, encoding="utf-8")
+    fake = wired_fake(labels=[], comments=[])
+    patch_module_gh(monkeypatch, fake)
+    monkeypatch.setattr(ud, "attempt_auto_bump", lambda *a, **kw: "🤖 стаб авто-бампа")
+    lines = ud.upstream_drift_check("mytab0r/edge-harness", pin_path=pin_file)
+    assert lines[0].startswith("🚨 дрейф пина")
+    assert lines[1] == "🤖 стаб авто-бампа"
 
 
 # ── Обёртка планировщика: сбой сверки не роняет пульс и не молчит ────────────────

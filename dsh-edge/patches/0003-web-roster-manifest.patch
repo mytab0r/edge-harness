@@ -1,8 +1,8 @@
 diff --git a/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs b/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
-index 7664fd5..4dc5923 100644
+index 6cea12a..bea8c34 100644
 --- a/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
 +++ b/apps/dsh-edge/standalone/scripts/assemble-standalone-web.mjs
-@@ -34,6 +34,36 @@ const edgeClientPackages = new Map([
+@@ -35,6 +35,36 @@ const edgeClientPackages = new Map([
      bundlePath: edgeClientBundlePath,
    }],
  ])
@@ -37,11 +37,11 @@ index 7664fd5..4dc5923 100644
 +  return parsed
 +}
  
- const edgeExcludedPackages = new Set([
-   '@deepseek-ai/dsh-client-hmr',
-@@ -169,15 +199,29 @@ async function main() {
-     declared.push(...deploymentPackageNames(await readFile(patchPath, 'utf8')))
+ // Upstream composes the browse picking face dynamically: the `-auto` chooser
+ // mounts it as a Loader entry at boot. The Edge has no Loader and always serves
+@@ -144,15 +174,29 @@ async function main() {
    }
+   declared.push(...edgeIncludedPackages)
    declared.push(...edgeClientPackages.keys())
 +  const manifestEntries = await manifestClientEntries()
 +  const manifestPackages = new Set(manifestEntries.map(entry => entry.package))
@@ -72,10 +72,10 @@ index 7664fd5..4dc5923 100644
      roster.push(name)
    }
 diff --git a/apps/dsh-edge/standalone/scripts/verify-standalone.mjs b/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
-index e73501d..112f1c9 100644
+index 1513840..27feb18 100644
 --- a/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
 +++ b/apps/dsh-edge/standalone/scripts/verify-standalone.mjs
-@@ -112,9 +112,19 @@ if (!index.includes('window.__ModuleLoader__=')) {
+@@ -115,9 +115,19 @@ if (!OWNER_HOST_DECLARATION.test(index)) {
  const bootMatch = index.match(/globalThis\["__DSH_BOOT__"\] = (\{.*?\})<\/script>/s)
  if (bootMatch === null) throw new Error('Standalone Web shell has no boot manifest.')
  const boot = JSON.parse(bootMatch[1])
@@ -97,7 +97,7 @@ index e73501d..112f1c9 100644
    )
  }
  const clientIds = new Set(boot.entries.map(entry => entry.id))
-@@ -133,7 +143,7 @@ for (const name of excludedClientPackages) {
+@@ -136,7 +146,7 @@ for (const name of excludedClientPackages) {
  for (const entry of boot.entries) {
    await access(join(webRoot, 'plugins', entry.id, 'client.js'))
  }
@@ -106,7 +106,7 @@ index e73501d..112f1c9 100644
    throw new Error(`Standalone Web boot graph differs from the reviewed ${targetVersion} contract.`)
  }
  const edgeClientBundle = await readFile(join(webRoot, 'plugins', 'dsh-edge-client-ui', 'client.js'), 'utf8')
-@@ -155,6 +165,20 @@ console.log(
+@@ -158,6 +168,20 @@ console.log(
    `Verified standalone Harness ${targetVersion}: ${patchAudit.length} patches, ${boot.entries.length} client plugins, and both Worker modes.`,
  )
  

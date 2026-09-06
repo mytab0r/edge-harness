@@ -45,13 +45,25 @@ deploy-dsh-edge.yml — который при непустом манифест�
 только здесь; gh/escalate — pulse_guard, второй реализации канала не заводим.
 """
 
+import importlib.util
 import json
+import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import pulse_guard
 from pulse_guard import escalate, issue_markers_any
+
+# Пагинация списков (#308) — одно место правды, тот же приём, что уже
+# использует scheduler.py (list_pages): review_labels.py лежит в scripts/lib,
+# соседнем каталоге, не на sys.path при прямом запуске файла из
+# scripts/orchestra — тот же явный file-spec импорт, не второй способ рядом.
+_rl_spec = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_rl_spec)
+_rl_spec.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
 # gh зовётся через модуль (pulse_guard.gh), а не import-ом по имени: у
 # тестов проводки должен быть ОДИН пункт патча — pulse_guard.gh, как уже
@@ -265,6 +277,152 @@ def _drop_drift_label(repo: str) -> None:
     pulse_guard.gh("-X", "DELETE", f"repos/{repo}/issues/{DRIFT_ISSUE}/labels/{DRIFT_LABEL}")
 
 
+# ── Автоматический бамп (#505): сигнал получает газ, не только предохранитель ────
+#
+# Дрейф кричал в #134 четыре эпизода подряд (0.9.0/0.10.0/0.11.0/0.11.1) без
+# единого действия — тормоз без газа (AGENTS.md). Газ здесь — МЕХАНИЧЕСКАЯ
+# половина бампа: поднять sha пина на тег новейшего стабильного релиза и
+# открыть PR. Патч-серия `dsh-edge/patches` НЕ перебазируется автоматически:
+# три минорных релиза апстрима меняли структуру ровно тех файлов, которые
+# патчи трогают (живой пример #505 — `assemble-standalone-web.mjs` получил
+# фазы boot-графа, `index.ts` лишился инлайн-выбора лимита тела запроса),
+# и решить, что в патче — конфликт формы, а что — смысловая правка апстрима,
+# может только суждение, не regex. Это ровно то, для чего задача #161 (умный
+# бамп по чейнджлогу) остаётся отдельной, более амбициозной работой.
+#
+# Ворота после автоматического PR — деплой, а не ревью: `deploy-dsh-edge.yml`
+# не гоняется на pull_request (dsh-edge/** триггерит его только push в main),
+# поэтому `test`/`contract` пропустят PR, даже если патч-серия сломана — это
+# честно названо в теле PR. Если апстрим сломал совместимость, деплой после
+# мержа откажет ГРОМКО (шаг «Патч-серия», git apply без --check), и пульс
+# отказов деплоя (#477) заведёт задачу на дефект — тот же класс сигнала, что
+# уже есть для любого красного deploy-dsh-edge.yml, второй канал не заводится.
+#
+# Дедуп — единственно открытый PR с фиксированным префиксом заголовка. Пока
+# такой PR открыт, новый не заводится («не плодить», требование задачи). Если
+# PR закрыт БЕЗ мержа (человек взял перебазировку патчей на себя под своей
+# задачей, как #505) — следующий пульс снова видит дрейф и откроет новую
+# попытку; названный компромисс: автоматика не отличает «закрыт, потому что
+# чинят руками» от «закрыт как неудачный», в обоих случаях путь свободен.
+AUTO_BUMP_TITLE_PREFIX = "dsh-edge: авто-бамп пина апстрима до "
+
+
+def open_auto_bump_pr(repo: str) -> dict | None:
+    """Открытый PR предыдущей автоматической попытки, если он ещё жив.
+    Пагинация (#308) через review_labels.list_pages — сырая первая страница
+    молча теряла бы хвост при большом открытом пуле PR (тот же класс, что
+    scheduler.py::open_pulls чинил тем же способом)."""
+    pulls = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", pulse_guard.gh)
+    for pull in pulls:
+        if (pull.get("title") or "").startswith(AUTO_BUMP_TITLE_PREFIX):
+            return pull
+    return None
+
+
+def bumped_pin_text(pin: dict, tag: dict, issue_number: int) -> str:
+    """Новое содержимое upstream.json. Автоматическое происхождение названо
+    прямо в note (человеческий бамп описывает перебазировку патчей — здесь
+    её нет, и это не скрывается)."""
+    return json.dumps({
+        "repo": pin["repo"],
+        "sha": tag["commit"]["sha"],
+        "note": (
+            f"Пин апстрима для source-build морды. Автоматический бамп (#{issue_number}, "
+            f"scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег {tag['name']} "
+            f"(repos/{pin['repo']}/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим "
+            "коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после "
+            "мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск "
+            "версии, дальше заводит задачу пульс отказов деплоя (#477)."
+        ),
+    }, indent=2, ensure_ascii=False) + "\n"
+
+
+def _run_git(args: list[str], *, cwd: Path) -> None:
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} упал: {result.stderr.strip()}")
+
+
+def create_bump_issue(repo: str, decision: dict) -> int:
+    """Заводит задачу пула под конкретный эпизод — контракт PR (branch
+    agent/<N>-slug) требует открытой задачи с меткой task."""
+    tag_name = decision["latest_tag"]
+    body = (
+        "## Цель\n"
+        f"Пин `dsh-edge/upstream.json` поднят до `{tag_name}` "
+        "(автоматически, scripts/orchestra/upstream_drift.py).\n\n"
+        "## Критерий готовности\n"
+        "- sha пина — коммит тега, патч-серия `dsh-edge/patches` накладывается подряд "
+        "`git apply` без единого хунка мимо (шаг «Патч-серия» deploy-dsh-edge.yml).\n"
+        "- Полный прогон deploy-dsh-edge.yml после мержа зелёный, `/api/health` отдаёт новую версию.\n\n"
+        "## Площадь\narea:worker\n\n"
+        "## Контекст и ссылки\n"
+        "Автоматический бамп поднимает только sha пина, патч-серию не трогает: перебазировка "
+        "патчей — суждение, не regex (см. докстринг attempt_auto_bump в upstream_drift.py). "
+        "Если деплой после мержа красный — доведи вручную (перебазируй dsh-edge/patches), "
+        "не подгоняй sha молча под то, что сходится.\n\n"
+        "## Правила\n"
+        "- [x] Я прочитал docs/research/30-rejected-alternatives.md и задача не из отвергнутых\n"
+        "- [x] Критерий готовности проверяем по видимому результату\n"
+    )
+    created = pulse_guard.gh(
+        "-X", "POST", f"repos/{repo}/issues",
+        "-f", f"title=dsh-edge: пин апстрима отстаёт от {tag_name}",
+        "-f", f"body={body}",
+        "-f", "labels[]=task", "-f", "labels[]=area:worker",
+    )
+    return created["number"]
+
+
+def attempt_auto_bump(repo: str, decision: dict, tags: list[dict], *, pin_path: Path) -> str:
+    """Одна попытка открыть авто-PR с поднятым пином. Никогда не бросает
+    наружу — вызывающий (upstream_drift_check) уже внутри try/except границы
+    сверки, но сбой ЗДЕСЬ не имеет права утопить уже отправленный сигнал
+    дрейфа (комментарий/метка/Telegram выше по функции уже сработали)."""
+    if decision["state"] != "drift":
+        return "⚠️ авто-бамп не пытается чинить pin-not-tag — это вне его права, доводи вручную"
+    pat = os.environ.get("ORCHESTRA_PAT")
+    if not pat:
+        return "⚠️ авто-бамп пропущен: ORCHESTRA_PAT не задан в окружении пульса"
+    try:
+        if open_auto_bump_pr(repo) is not None:
+            return "🔁 авто-PR бампа уже открыт — новый не заводится"
+        tag_obj = next((t for t in tags if t.get("name") == decision["latest_tag"]), None)
+        if tag_obj is None:
+            raise RuntimeError(f"тег {decision['latest_tag']} пропал из ответа /tags между решением и бампом")
+        issue_number = create_bump_issue(repo, decision)
+        branch = f"agent/{issue_number}-dsh-edge-upstream-bump"
+        repo_root = pin_path.resolve().parents[1]
+        _run_git(["fetch", "origin", "main"], cwd=repo_root)
+        _run_git(["checkout", "-B", branch, "origin/main"], cwd=repo_root)
+        pin_path.write_text(bumped_pin_text(load_pin(pin_path), tag_obj, issue_number), encoding="utf-8")
+        _run_git(["add", str(pin_path.relative_to(repo_root))], cwd=repo_root)
+        _run_git(["-c", "user.name=edge-harness-orchestra",
+                  "-c", "user.email=orchestra@users.noreply.github.com",
+                  "commit", "-m",
+                  f"dsh-edge: авто-бамп пина апстрима до {decision['latest_tag']} (#{issue_number})"],
+                 cwd=repo_root)
+        _run_git(["-c", f"http.extraheader=AUTHORIZATION: bearer {pat}",
+                  "push", "origin", f"HEAD:refs/heads/{branch}"], cwd=repo_root)
+        pr_body = (
+            f"Автоматический бамп пина апстрима (#{issue_number}). Патч-серия НЕ перебазирована "
+            "этим PR — `deploy-dsh-edge.yml` (шаг «Патч-серия», post-merge) откажет громко, если "
+            "форма апстрима поменялась; дальше пульс отказов деплоя (#477) заводит задачу на "
+            "дефект. До мержа этот PR проходит только `test`/`contract` — ни один из них не "
+            "проверяет применимость патчей, деплой на PR не гоняется."
+        )
+        result = subprocess.run(
+            ["gh", "pr", "create", "--repo", repo, "--base", "main", "--head", branch,
+             "--title", f"{AUTO_BUMP_TITLE_PREFIX}{decision['latest_tag']}", "--body", pr_body],
+            capture_output=True, text=True, env={**os.environ, "GH_TOKEN": pat, "NO_COLOR": "1"},
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"gh pr create упал: {result.stderr.strip()}")
+        return f"🤖 авто-бамп: открыт PR на задачу #{issue_number} ({result.stdout.strip()})"
+    except RuntimeError as error:
+        return f"⚠️ авто-бамп не удался: {error}"
+
+
 def upstream_drift_check(repo: str, pin_path: Path = PIN_PATH) -> list[str]:
     """Проводка: один вызов из scheduler.main(). Возвращает строки отчёта пульса.
 
@@ -296,6 +454,8 @@ def upstream_drift_check(repo: str, pin_path: Path = PIN_PATH) -> list[str]:
 
     _set_drift_label(repo)
     delivered = escalate(repo, DRIFT_ISSUE, drift_alert_text(decision))
-    return [f"🚨 дрейф пина: пин на {decision['pinned_tag'] or decision['sha'][:12]}, "
-            f"апстрим выпустил {decision['latest_tag']} — сигнал в #{DRIFT_ISSUE} "
-            f"+ метка {DRIFT_LABEL} ({delivered})"]
+    lines = [f"🚨 дрейф пина: пин на {decision['pinned_tag'] or decision['sha'][:12]}, "
+             f"апстрим выпустил {decision['latest_tag']} — сигнал в #{DRIFT_ISSUE} "
+             f"+ метка {DRIFT_LABEL} ({delivered})"]
+    lines.append(attempt_auto_bump(repo, decision, tags, pin_path=pin_path))
+    return lines
