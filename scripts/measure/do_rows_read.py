@@ -175,14 +175,22 @@ def group_rows_by_day(rows: list[dict]) -> dict[date, list[dict]]:
 
 def daily_totals_from_rows(rows: list[dict], sum_has: set[str], dim_has: set[str]) -> dict:
     """Суточный итог из списка строк (часовых или дневных) одного дня."""
+    has_written = "rowsWritten" in sum_has
     total_read = sum(r["sum"].get("rowsRead", 0) or 0 for r in rows)
-    total_written = sum(r["sum"].get("rowsWritten", 0) or 0 for r in rows) if "rowsWritten" in sum_has else 0
+    total_written = sum(r["sum"].get("rowsWritten", 0) or 0 for r in rows) if has_written else 0
     peak = max(rows, key=lambda r: r["sum"].get("rowsRead", 0) or 0, default=None)
-    by_namespace: dict[str, int] = {}
+    # by_namespace: и rows_read, и rows_written на один и тот же namespaceId —
+    # обе метрики приходят в ОДНОЙ и той же строке GraphQL-ответа (r["sum"]),
+    # но раньше разбивка по пространствам строилась только для rows_read, и
+    # куда уходят ЗАПИСИ можно было только гадать методом исключения (#678).
+    by_namespace: dict[str, dict[str, int]] = {}
     if "namespaceId" in dim_has:
         for r in rows:
             ns = r["dimensions"].get("namespaceId") or "?"
-            by_namespace[ns] = by_namespace.get(ns, 0) + (r["sum"].get("rowsRead", 0) or 0)
+            entry = by_namespace.setdefault(ns, {"rows_read": 0, "rows_written": 0})
+            entry["rows_read"] += r["sum"].get("rowsRead", 0) or 0
+            if has_written:
+                entry["rows_written"] += r["sum"].get("rowsWritten", 0) or 0
     peak_label = None
     if peak is not None:
         peak_label = peak["dimensions"].get("datetimeHour") or peak["dimensions"].get("date")
@@ -211,15 +219,24 @@ def format_table(days_summary: list[tuple[date, dict]]) -> str:
 
 
 def format_namespace_breakdown(days_summary: list[tuple[date, dict]]) -> str:
-    totals: dict[str, int] = {}
+    """Разбивка по namespaceId — и rows_read, и rows_written (#678: раньше
+    здесь была только колонка rows_read, rows_written агрегировался лишь
+    суммарно по ВСЕМ пространствам и никогда — по каждому отдельно)."""
+    totals: dict[str, dict[str, int]] = {}
     for _, summary in days_summary:
         for ns, val in summary["by_namespace"].items():
-            totals[ns] = totals.get(ns, 0) + val
+            entry = totals.setdefault(ns, {"rows_read": 0, "rows_written": 0})
+            entry["rows_read"] += val.get("rows_read", 0)
+            entry["rows_written"] += val.get("rows_written", 0)
     if not totals:
         return "разбивка по namespaceId недоступна в этом датасете"
-    lines = ["namespaceId | rows_read (сумма по всем снятым дням)", "---|---"]
-    for ns, val in sorted(totals.items(), key=lambda kv: -kv[1]):
-        lines.append(f"{ns} | {val:,}")
+    lines = [
+        "namespaceId | rows_read (сумма по всем снятым дням) | "
+        "rows_written (сумма по всем снятым дням)",
+        "---|---|---",
+    ]
+    for ns, val in sorted(totals.items(), key=lambda kv: -kv[1]["rows_read"]):
+        lines.append(f"{ns} | {val['rows_read']:,} | {val['rows_written']:,}")
     return "\n".join(lines)
 
 

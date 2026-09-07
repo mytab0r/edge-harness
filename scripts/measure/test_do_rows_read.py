@@ -156,7 +156,41 @@ def test_daily_totals_finds_peak_hour():
 def test_daily_totals_breaks_down_by_namespace():
     summary = mod.daily_totals_from_rows(ROWS_ONE_DAY, {"rowsRead", "rowsWritten"},
                                          {"datetimeHour", "namespaceId"})
-    assert summary["by_namespace"] == {"ns-a": 100 + 900000, "ns-b": 50}
+    assert summary["by_namespace"] == {
+        "ns-a": {"rows_read": 100 + 900000, "rows_written": 10 + 20},
+        "ns-b": {"rows_read": 50, "rows_written": 5},
+    }
+
+
+def test_daily_totals_breaks_down_rows_written_by_namespace_not_only_read():
+    # #678: разбивка по namespaceId должна доказывать НАПРЯМУЮ, в какое
+    # пространство идут ЗАПИСИ, а не только чтения — до этой правки
+    # rows_written никогда не раскладывался по namespaceId, только
+    # суммировался целиком по всем пространствам сразу.
+    rows = [
+        {"dimensions": {"datetimeHour": "2026-09-01T00:00:00Z", "namespaceId": "ns-harness"},
+         "sum": {"rowsRead": 5, "rowsWritten": 7}},
+        {"dimensions": {"datetimeHour": "2026-09-01T01:00:00Z", "namespaceId": "ns-dsh-edge"},
+         "sum": {"rowsRead": 3, "rowsWritten": 993}},
+    ]
+    summary = mod.daily_totals_from_rows(rows, {"rowsRead", "rowsWritten"},
+                                         {"datetimeHour", "namespaceId"})
+    assert summary["by_namespace"]["ns-harness"]["rows_written"] == 7
+    assert summary["by_namespace"]["ns-dsh-edge"]["rows_written"] == 993
+    # Суммарный rows_written по namespace обязан сходиться с total — иначе
+    # разбивка врёт про то, куда уходит бюджет, а не просто неполна.
+    total_by_ns = sum(v["rows_written"] for v in summary["by_namespace"].values())
+    assert total_by_ns == summary["rows_written"] == 1000
+
+
+def test_daily_totals_by_namespace_rows_written_zero_when_sum_lacks_field():
+    # Датасет без rowsWritten в sum (sum_has не содержит "rowsWritten") не
+    # должен падать при построении разбивки по namespace: rows_written там
+    # честный 0, не KeyError.
+    rows = [{"dimensions": {"datetimeHour": "2026-09-01T00:00:00Z", "namespaceId": "ns-a"},
+             "sum": {"rowsRead": 5}}]
+    summary = mod.daily_totals_from_rows(rows, {"rowsRead"}, {"datetimeHour", "namespaceId"})
+    assert summary["by_namespace"] == {"ns-a": {"rows_read": 5, "rows_written": 0}}
 
 
 def test_daily_totals_empty_rows():
@@ -186,9 +220,26 @@ def test_format_table_shows_percent_of_daily_limit():
 
 def test_format_namespace_breakdown_sorted_descending():
     day = date(2026, 9, 3)
-    summary_a = {"by_namespace": {"ns-a": 10, "ns-b": 999}}
+    summary_a = {"by_namespace": {
+        "ns-a": {"rows_read": 10, "rows_written": 1},
+        "ns-b": {"rows_read": 999, "rows_written": 2},
+    }}
     text = mod.format_namespace_breakdown([(day, summary_a)])
     assert text.index("ns-b") < text.index("ns-a")
+
+
+def test_format_namespace_breakdown_shows_rows_written_column():
+    # #678: подпись и данные обязаны говорить про rows_written тоже, не
+    # только про rows_read — иначе разбивка не доказывает, куда идут записи.
+    day = date(2026, 9, 3)
+    summary = {"by_namespace": {
+        "ns-harness": {"rows_read": 5, "rows_written": 7},
+        "ns-dsh-edge": {"rows_read": 3, "rows_written": 993},
+    }}
+    text = mod.format_namespace_breakdown([(day, summary)])
+    assert "rows_written" in text.splitlines()[0]
+    assert "993" in text
+    assert "7" in text
 
 
 def test_format_namespace_breakdown_empty_is_explicit():
