@@ -643,23 +643,28 @@ export class Harness extends DurableObject<Env> {
    * alarm() сначала перезакладывает следующий тик, потом дёргает workflow_dispatch:
    * падение dispatch не может убить цепочку. Alarm переживает гибернацию
    * и стоит 1 request — комфортный режим Free (docs/research/20).
+   *
+   * Вызывается из двух мест (issue #693, Cron Trigger): конструктор не может
+   * ждать промис (`void this.#ensureHeartbeat()` — фон, ошибка ловится и
+   * логируется здесь же); scheduledTick() ждёт (`await`) — детерминированно,
+   * тик cron видит результат ДО следующего шага, а не гоняется за фоновым
+   * промисом конструктора. Одно место правды вместо двух копий проверки
+   * getAlarm()/setAlarm.
    */
-  #ensureHeartbeat(): void {
-    this.ctx.storage
-      .getAlarm()
-      .then((scheduled) => {
-        if (scheduled === null) {
-          return this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
-        }
-      })
-      .catch((error) => {
-        // #320: единственная пересборка цепочки после гибели пульса (см. alarm()) —
-        // молчание здесь тот же класс «немое падение пульса», который PR закрывает
-        // в alarm(). Здесь падать некуда (конструктор не может ждать промис), но
-        // хотя бы громко в лог, тем же классификатором, что и alarm().
-        const detail = error instanceof Error ? error.message : String(error);
-        console.error(`ensureHeartbeat: упал (${classifyStorageError(detail)}): ${detail}`);
-      });
+  async #ensureHeartbeat(): Promise<void> {
+    try {
+      const scheduled = await this.ctx.storage.getAlarm();
+      if (scheduled === null) {
+        await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
+      }
+    } catch (error) {
+      // #320: единственная пересборка цепочки после гибели пульса (см. alarm()) —
+      // молчание здесь тот же класс «немое падение пульса», который PR закрывает
+      // в alarm(). Из конструктора падать некуда (он не может ждать промис), но
+      // хотя бы громко в лог, тем же классификатором, что и alarm().
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`ensureHeartbeat: упал (${classifyStorageError(detail)}): ${detail}`);
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -1217,6 +1222,103 @@ export class Harness extends DurableObject<Env> {
 
   override webSocketClose(): void {}
 
+  /**
+   * Один dispatch-тик оркестратора (issue #269, вынесено в общий метод #693):
+   * читает предыдущий пульс, дёргает workflow_dispatch, сверяет подтверждение
+   * ПРЕДЫДУЩЕГО принятого dispatch'а и пишет исход в pulse. Общий код для
+   * alarm() (основной путь, тикает каждые HEARTBEAT.selfOrchestrationMs) и
+   * scheduledTick() (страховка Cron Trigger — см. её docstring) — одно место
+   * правды вместо второй копии attemptOrchestraDispatch/
+   * fetchLatestOrchestraRunId/confirmPreviousRun/pulseDetailForRecord/
+   * #recordPulse. token/repo здесь уже гарантированно заданы (обе вызывающие
+   * стороны фильтруют «секретов нет» до вызова, каждая на свой лад).
+   */
+  async #dispatchOrchestraTick(token: string, repo: string): Promise<void> {
+    const previous = this.#getStoredPulse();
+    // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
+    // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
+    // baseline для следующего тика — и одновременно сверяем, появился ли новый
+    // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
+    // всегда на такт позже, а не блокирует этот тик).
+    const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
+    const runConfirmed =
+      previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
+    const result = await attemptOrchestraDispatch(token, repo, fetch);
+    // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
+    // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
+    const detail = pulseDetailForRecord(result, runConfirmed);
+    this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
+    if (!result.ok || runConfirmed === false) {
+      // Пульс не роняет объект: тик уже перезаложен (alarm()) либо вообще не
+      // ведёт будильник (scheduledTick()). Исход ещё и в durable-состоянии
+      // (#status().last_pulse) — раньше он тонул в console.log, который никто
+      // не смотрит между дедами (fail loud, issue #269).
+      console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
+    }
+  }
+
+  /**
+   * Cron Trigger (issue #693, cf-worker/src/index.ts::scheduled(), интервал —
+   * wrangler.jsonc `triggers.crons`, 5 мин). Внешние часы: не зависит ни от
+   * живости alarm() этого же DO, ни от GitHub `schedule` (~5-7% доставки на
+   * этом репозитории, docs/research/21-github-actions.md), потому что тикает
+   * из инфраструктуры Cloudflare, а не из активности самого объекта.
+   *
+   * СТРАХОВКА, НЕ ВТОРОЙ ОСНОВНОЙ ТИК: alarm() остаётся главным путём — тикает
+   * каждые HEARTBEAT.selfOrchestrationMs (15 мин) и делает всё (ретеншн,
+   * инбокс, dispatch, self-update dsh-edge). Этот метод в подавляющем
+   * большинстве вызовов не пишет НИ ОДНОЙ строки — читает только текущий
+   * pulse и решает через ТУ ЖЕ чистую функцию pulseStale(), что и бейдж
+   * /api/status: «alarm тикал недавно и успешно» → выходит немедленно, не
+   * дублируя workflow_dispatch в ту же минуту (issue #693, требование «не
+   * дублируй тики»). Единственный случай, когда этот метод реально дёргает
+   * dispatch, — ровно тот, что описан в issue #693: `alarm()` дважды не смог
+   * `setAlarm` и вернулся БЕЗ будильника (см. конец alarm() ниже).
+   * pulseStale() читает это как «последний тик был успешен, но случился давно»
+   * (>= 2×selfOrchestrationMs = 30 мин) — единственная ветка, которую эта
+   * страховка чинит; настоящий отказ dispatch'а (dispatch_ok=false) —
+   * по-прежнему забота обычного alarm() на его собственном тике, не этой
+   * страховки (pulseStale() нарочно возвращает false в этой ветке).
+   *
+   * Любой RPC-вызов стаба (в т.ч. этот) конструирует DO заново, если объект
+   * был выгружен из памяти (идле-порог ~10 с, интервал крона 5 мин — заведомо
+   * больше) — конструктор уже вызвал #ensureHeartbeat() к этому моменту.
+   * Повторный `await this.#ensureHeartbeat()` здесь — не дублирование
+   * дважды подряд одного и того же эффекта, а детерминированная гарантия и
+   * для тёплого объекта (не был выгружен, конструктор не перезапускался):
+   * единственный путь и тогда тоже перезаложить пропавший будильник, а не
+   * полагаться на побочный эффект конструктора (проверяется тестом «(a)»).
+   *
+   * Честная граница наблюдаемости отказа (issue #693, п.4): если
+   * fetchLatestOrchestraRunId/attemptOrchestraDispatch внутри
+   * #dispatchOrchestraTick упали — исход попадает в pulse тем же
+   * #recordPulse, что и у alarm(), и виден в /api/status. Если НЕВОЗМОЖНА уже
+   * сама запись пульса (например исчерпание суточной квоты rows_written,
+   * #320) — catch ниже логирует причину в Cloudflare Logs (`wrangler
+   * tail`/дашборд), но `/api/status` эту попытку не увидит вовсе: last_pulse
+   * останется на прежнем (устаревшем) значении. Это тот же честный потолок
+   * наблюдаемости, что уже есть у alarm() (см. его комментарий про #320 в
+   * catch ниже), не новый — просто названный вслух для cron-пути отдельно.
+   */
+  async scheduledTick(): Promise<void> {
+    await this.#ensureHeartbeat();
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) return; // «возможности нет» — alarm() уже сообщает это в пульсе на своём тике
+    try {
+      const previous = this.#getStoredPulse();
+      if (!pulseStale(Date.now(), previous)) return; // alarm жив — не дублируем dispatch
+      await this.#dispatchOrchestraTick(token, repo);
+      console.log("scheduledTick: alarm подвис (pulseStale) — dispatch выполнен страховкой Cron Trigger");
+    } catch (error) {
+      // См. докстринг выше, «Честная граница наблюдаемости отказа»: если
+      // сам #recordPulse тоже упал, /api/status этой попытки не увидит —
+      // единственный след здесь, в Cloudflare Logs.
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`scheduledTick: упал (${classifyStorageError(detail)}): ${detail}`);
+    }
+  }
+
   /** Пульс: следующим тиком гарантируем цепочку, потом дёргаем оркестратора
    *  и проверяем, не отстала ли морда dsh-edge от npm. */
 
@@ -1288,26 +1390,7 @@ export class Harness extends DurableObject<Env> {
         this.#recordPulse(false, HEARTBEAT.notConfiguredDetail, null, null);
         return;
       }
-      const previous = this.#getStoredPulse();
-      // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
-      // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
-      // baseline для следующего тика — и одновременно сверяем, появился ли новый
-      // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
-      // всегда на такт позже, а не блокирует этот alarm).
-      const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
-      const runConfirmed =
-        previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
-      const result = await attemptOrchestraDispatch(token, repo, fetch);
-      // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
-      // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
-      const detail = pulseDetailForRecord(result, runConfirmed);
-      this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
-      if (!result.ok || runConfirmed === false) {
-        // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
-        // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
-        // который никто не смотрит между дедами (fail loud, issue #269).
-        console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
-      }
+      await this.#dispatchOrchestraTick(token, repo);
     } catch (error) {
       // #320: похожая на исчерпание квоты storage (rows_read/rows_written) ошибка
       // здесь раньше уходила из alarm() непойманным — единственным следом оставалось
