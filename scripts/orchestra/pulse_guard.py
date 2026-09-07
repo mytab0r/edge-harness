@@ -804,6 +804,27 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\
 # чтение от маркера, у plain-строк его надо снять).
 LOG_TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
 
+# Заголовок автоматической секции teardown Actions (находка #610): каждый
+# job, успешный и упавший, заканчивается «Post <шаг>» блоками; чистка
+# checkout'ом credentials config/ssh command/http extra header печатается
+# группой с этим заголовком ПОСЛЕ фактической причины падения. Строка
+# внутри неё («Removing credentials config '<UUID>.config'») содержит
+# буквы и цифры и проходит все существующие фильтры LAST_ERROR_LOG_NON_FACTS
+# как «факт» — живой замер: runs 34061661136/34063041667/34063766663/
+# 34064823509 подхватывали её веткой 2 вместо настоящей причины
+# («HTTP Error 500: Internal Server Error» от архивации сессии раннера,
+# #119/#575), напечатанной раньше. UUID частично переживает нормализацию
+# digits/hex в failure_fingerprint (сегменты короче 6 символов, например
+# «bd3f»/«4668», не совпадают с `\b[0-9a-f]{6,}\b`) — КАЖДЫЙ прогон получал
+# свой уникальный «факт» и свой fingerprint на одну и ту же причину, а
+# заголовок заведённой issue (константный по workflow+job_name, см.
+# failure_watch) при этом совпадал — отсюда пять issue с одинаковым
+# заголовком «CI: orchestra.yml падает — orchestra» (#578/#580/#589/#592/#598).
+# Обрезаем лог по ПЕРВОМУ вхождению этого заголовка ДО обеих веток поиска:
+# вся секция после него — гарантированный teardown, не факт ни при каком
+# исходе job'а (не отдельная строка-исключение, а целая секция).
+POST_JOB_CLEANUP_MARKER = "post job cleanup."
+
 
 def last_error_log_line(repo: str, job_id: int) -> str | None:
     """Последняя СОДЕРЖАТЕЛЬНАЯ строка лога упавшего job'а — конкретный факт,
@@ -849,6 +870,12 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     if result.returncode != 0:
         return None
     lines = result.stdout.splitlines()
+
+    for cut_idx, raw_line in enumerate(lines):
+        cut_text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", raw_line)).strip()
+        if cut_text.lower() == POST_JOB_CLEANUP_MARKER:
+            lines = lines[:cut_idx]
+            break
 
     def is_non_fact(candidate: str) -> bool:
         lowered = candidate.lower()
@@ -1356,9 +1383,14 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
             False)
 
 
-def open_ci_failure_fingerprints(repo: str) -> set[str]:
-    """Отпечатки, уже заведённые задачами с меткой FAILURE_WATCH_LABEL —
-    дедуп «дефект этого класса уже в пуле» без второго обхода Issues.
+FAILURE_FINGERPRINT_MARKER = "<!-- failure-fingerprint: "
+
+
+def open_ci_failure_issues(repo: str) -> list[dict]:
+    """Открытые issues с меткой FAILURE_WATCH_LABEL — сырой список, единый
+    источник и для точного дедупа по fingerprint (open_ci_failure_fingerprints),
+    и для дедупа по похожести заголовка (#610, см. failure_watch): один обход
+    Issues на оба вопроса, не два отдельных запроса подряд.
 
     Листает страницы сама (класс #308, тот же приём, что all_issue_comments
     выше): список НЕ ограничен по природе — долгоживущие незакрытые дефекты
@@ -1366,8 +1398,7 @@ def open_ci_failure_fingerprints(repo: str) -> set[str]:
     страница молча потеряла бы хвост — та же ошибка дедупа, что и без него,
     просто отложенная во времени."""
     page = 1
-    found: set[str] = set()
-    marker = "<!-- failure-fingerprint: "
+    issues: list[dict] = []
     while True:
         chunk = gh(
             f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}"
@@ -1375,23 +1406,33 @@ def open_ci_failure_fingerprints(repo: str) -> set[str]:
         ) or []
         if not isinstance(chunk, list) or not chunk:
             break
-        for issue in chunk:
-            body = issue.get("body") or ""
-            idx = body.find(marker)
-            if idx == -1:
-                continue
-            rest = body[idx + len(marker):]
-            found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
+        issues.extend(chunk)
         if len(chunk) < 100:
             break
         page += 1
+    return issues
+
+
+def ci_failure_fingerprints(issues: list[dict]) -> set[str]:
+    """Отпечатки, уже заведённые задачами из open_ci_failure_issues — дедуп
+    «дефект этого КЛАССА уже в пуле» (точное совпадение нормализованного
+    факта). Чистая функция над уже прочитанным списком — второй обход Issues
+    здесь не заводится (см. open_ci_failure_issues)."""
+    found: set[str] = set()
+    for issue in issues:
+        body = issue.get("body") or ""
+        idx = body.find(FAILURE_FINGERPRINT_MARKER)
+        if idx == -1:
+            continue
+        rest = body[idx + len(FAILURE_FINGERPRINT_MARKER):]
+        found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
     return found
 
 
 def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str, steps: str) -> str:
     """Тело авто-заведённой задачи — тот же формат, что шаблон «📋 Задача в
     пул» (Цель/Критерий/Площадь), плюс отпечаток класса HTML-комментарием:
-    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
+    ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
     Упавшие шаги — рядом с фактом (критерий #477 называет «шаг + последняя
     ##[error]-строка»): их имена уже прочитаны из job'а, второй запрос не
     нужен (чеклист ревью PR #488)."""
@@ -1462,7 +1503,10 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
     причина снова красит свежий прогон, значит снова требует разбора."""
     observations: list[str] = []
     actions: list[str] = []
-    ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
+    # Ленивая инициализация — только если дошли до дефекта: оба читаются из
+    # одного обхода Issues (open_ci_failure_issues), второго запроса нет.
+    ci_issues: list[dict] | None = None
+    ci_fingerprints: set[str] | None = None
 
     for workflow in WATCHED_WORKFLOWS:
         try:
@@ -1582,19 +1626,60 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 continue
 
             # cause == "defect": заводим задачу, если класса ещё нет в пуле.
-            if ci_fingerprints is None:
+            if ci_issues is None:
                 try:
-                    ci_fingerprints = open_ci_failure_fingerprints(repo)
+                    ci_issues = open_ci_failure_issues(repo)
                 except RuntimeError as error:
                     observations.append(
                         f"⚠️ failure-watch {workflow}: список задач {FAILURE_WATCH_LABEL} не прочитан ({error})")
                     continue
+                ci_fingerprints = ci_failure_fingerprints(ci_issues)
             if fingerprint in ci_fingerprints:
                 observations.append(
                     f"🔁 failure-watch {workflow} (job «{job_name}»): дефект класса "
                     f"{fingerprint} уже в пуле — не дублируем")
                 continue
             title = f"CI: {workflow} падает — {job_name}"
+            # Дедуп по ТОЧНОМУ заголовку (#610) — ДО создания, поверх дедупа по
+            # fingerprint выше: заголовок детерминирован (workflow, job_name) —
+            # для одной и той же пары ВСЕГДА один и тот же байт-в-байт текст, а
+            # fingerprint чувствителен к точному тексту факта (см.
+            # last_error_log_line/POST_JOB_CLEANUP_MARKER — расходящийся факт
+            # при одной и той же причине порождал разные fingerprint при
+            # ОДИНАКОВОМ заголовке, живой случай #578/#580/#589/#592/#598).
+            # Нарочно точное совпадение, не Jaccard-схожесть duplicate_guard
+            # (см. scripts/gh/issue-create): у duplicate_guard заголовки
+            # придумывает человек/агент, здесь — фиксированный шаблон, где
+            # РАЗНЫЕ job_name обязаны оставаться РАЗНЫМИ классами (например
+            # «job-0» и «job-1» после токенизации по словам совпали бы
+            # Jaccard'ом в одно — regression test
+            # test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest —
+            # точное сравнение строк этого не путает.
+            existing_by_title = next(
+                (issue for issue in ci_issues
+                 if "pull_request" not in issue and issue.get("title") == title),
+                None,
+            )
+            if existing_by_title:
+                number = existing_by_title["number"]
+                comment = (
+                    f"{FAILURE_FINGERPRINT_MARKER}{fingerprint} -->\n"
+                    f"Новый прогон с тем же заголовком, другой отпечаток факта "
+                    f"(класс {fingerprint}) — комментарий вместо второй issue (#610):\n\n"
+                    f"Факт: {fact}\n{run_url}"
+                )
+                try:
+                    post_issue_comment(repo, number, comment)
+                    posted = True
+                except RuntimeError as error:
+                    posted = False
+                    print(f"::warning::след в #{number} не оставлен: {error}", file=sys.stderr)
+                ci_fingerprints.add(fingerprint)
+                observations.append(
+                    f"🔁 failure-watch {workflow} (job «{job_name}»): issue с тем же заголовком "
+                    f"уже открыта (#{number}) — "
+                    f"{'улика оставлена' if posted else 'улика НЕ оставлена'}, новую issue не завожу")
+                continue
             body = failure_watch_task_body(
                 workflow, job_name, fact, run_url, fingerprint, step_names)
             try:
@@ -1603,13 +1688,17 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 # сетевого вызова; CI-гвардия «сырой POST repos/{repo}/issues
                 # вне pool_issue.py» ловит обход — красный чек прогона
                 # 34049072989 на этом PR).
-                pool_issue.create_pool_issue(
+                created = pool_issue.create_pool_issue(
                     gh, repo, title, body, ["task", FAILURE_WATCH_LABEL])
             except RuntimeError as error:
                 observations.append(
                     f"⚠️ failure-watch {workflow} (job «{job_name}»): задача по дефекту не заведена ({error})")
                 continue
             ci_fingerprints.add(fingerprint)
+            ci_issues.append({
+                "number": created.get("number"), "title": title,
+                "html_url": created.get("html_url", ""), "body": body,
+            })
             actions.append(
                 f"🛠️ failure-watch {workflow}: заведена задача по дефекту "
                 f"(job «{job_name}», шаги: {step_names}, класс {fingerprint}) — {fact}")

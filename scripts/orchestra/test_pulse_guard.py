@@ -1394,6 +1394,63 @@ def test_last_error_log_line_passes_allow_escape_sequences():
         "last_error_log_line обязан звать gh api с --allow-escape-sequences")
 
 
+def test_last_error_log_line_ignores_post_job_cleanup_teardown(monkeypatch):
+    # Находка #610 — фикстура дословно повторяет реальный лог job'а orchestra
+    # (run 34069761104): checkout печатает секцию "Post job cleanup." (чистка
+    # ssh/http/credentials config) ПОСЛЕ настоящего последнего вывода job'а.
+    # "Removing credentials config '<UUID>.config'" содержит буквы и цифры и
+    # раньше проходила все фильтры как «факт» — реальный последний вывод
+    # («прогон окрашен красным») терялся за teardown-секцией.
+    log = (
+        "2026-09-07T00:27:52.8096896Z ### Детектор простоя (#201)\n"
+        "2026-09-07T00:27:52.8097925Z 🚨 потолок автозаведённых задач в сутки исчерпан "
+        "(5/5) — отпечаток gate:pipeline-paused НЕ заведён, нужен человек\n"
+        "2026-09-07T00:27:52.8101423Z 🚨 прогон окрашен красным (Telegram: доставлен; "
+        "след в #120: оставлен)\n"
+        "2026-09-07T00:27:52.8187273Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-07T00:27:52.8369619Z Post job cleanup.\n"
+        "2026-09-07T00:27:52.9162261Z Temporarily overriding HOME='/home/runner/work/_temp/"
+        "cfa9d952-f45c-49c0-9dae-0a4c5348684d' before making global git config changes\n"
+        "2026-09-07T00:27:53.0000000Z Removing credentials config "
+        "'/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'\n"
+        "2026-09-07T00:27:53.0100000Z Cleaning up orphan processes\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "прогон окрашен красным" in line
+    assert "credentials" not in line and "Post job cleanup" not in line
+
+
+def test_last_error_log_line_two_runs_same_cause_give_same_fingerprint_after_fix(monkeypatch):
+    # Мутационная проверка класса #610: два прогона с ОДНОЙ и той же причиной,
+    # но РАЗНЫМ UUID teardown-секции, обязаны дать ОДИН и тот же fingerprint —
+    # до фикса last_error_log_line подхватывал разный "Removing credentials
+    # config '<UUID>.config'" на каждый прогон и давал разные fingerprint при
+    # одинаковом заголовке issue (живой случай #578/#580/#589/#592/#598).
+    def log_with_uuid(uuid: str) -> str:
+        return (
+            "2026-09-06T21:40:24.4843425Z 🚨 #120: архив сессии не удался "
+            "(возможность сломана): HTTP Error 500: Internal Server Error\n"
+            "2026-09-06T21:40:24.4937977Z ##[error]Process completed with exit code 1.\n"
+            "2026-09-06T21:40:24.5134867Z Post job cleanup.\n"
+            f"2026-09-06T21:40:24.7336136Z Removing credentials config '/home/runner/work/_temp/git-credentials-{uuid}.config'\n"
+            "2026-09-06T21:40:24.7482979Z Cleaning up orphan processes\n"
+        )
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log_with_uuid("8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216"))))
+    line1 = pg.last_error_log_line("mytab0r/edge-harness", 1)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log_with_uuid("f42e2338-f7cb-4e6f-8022-328e66ce91b0"))))
+    line2 = pg.last_error_log_line("mytab0r/edge-harness", 2)
+    assert line1 == line2
+    fp1 = pg.failure_fingerprint("orchestra.yml", "orchestra", line1)
+    fp2 = pg.failure_fingerprint("orchestra.yml", "orchestra", line2)
+    assert fp1 == fp2
+
+
 def test_last_error_log_line_strips_ansi_escapes_from_fact(monkeypatch):
     # Факт уходит в тело задачи и след #120/Telegram — управляющие коды сырого
     # лога не должны попадать в текст сигнала.
@@ -1461,6 +1518,63 @@ def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
     assert actions2 == []
     assert any("не дублируем" in line for line in observations2)
     assert len(created) == 1  # вторая задача не заведена
+
+
+def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(monkeypatch):
+    # Мутационная проверка класса #610 (живой случай #578/#580/#589/#592/#598):
+    # заголовок failure_watch константный по (workflow, job_name) — «CI:
+    # orchestra.yml падает — orchestra» для ЛЮБОГО факта этого job'а. Открытая
+    # issue того же заголовка, но с ДРУГИМ fingerprint в теле (например,
+    # прошлый прогон поймал другой вариант того же боилерплейта) обязана
+    # остановить создание ВТОРОЙ issue — комментарий на существующую, не дубль.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34063041667, event="schedule"),
+    ]}
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 1, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    # Реальные UUID двух живых дублей (#578/#589) — сегменты короче 6 hex
+    # символов (например «bd3f», «4668») переживают нормализацию, поэтому эти
+    # два факта дают РАЗНЫЙ fingerprint при ОДИНАКОВОМ заголовке (та же
+    # причина, что и у живого случая — регресс без обрезки #578/#589 остался бы
+    # зелёным по этому тесту, если бы совпал и fingerprint).
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")))
+    new_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    assert new_fp != existing_fp  # предпосылка теста: РАЗНЫЙ fingerprint, ОДИНАКОВЫЙ заголовок
+    created = []
+    commented = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert created == []  # НЕ заведена вторая issue с тем же заголовком
+    assert actions == []  # это не «новая задача», см. #456
+    assert len(commented) == 1 and commented[0][0] == 578
+    assert any("тем же заголовком" in line and "#578" in line for line in observations)
 
 
 def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
