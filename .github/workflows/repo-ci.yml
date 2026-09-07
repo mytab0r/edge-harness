@@ -606,6 +606,17 @@ jobs:
       - name: Юнит-тесты общего разбора тела ошибки (plugins-src/shared)
         run: node --test plugins-src/shared/test/describe-response-error.test.mjs
 
+      # Инструменты runner_task/runner_status серверного плагина runner-bridge
+      # (#95): схема, конфигурационные и сетевые ошибки, формы ответов GitHub
+      # (201/204/404/4xx/5xx) — на моке fetch, без сети. Находка ревью PR #411:
+      # тест импортировал server/index.js, который тянет peer-зависимость
+      # `@deepseek-ai/dsh-tools` (не установлена нигде) — падал на загрузке
+      # модуля и никогда не запускался в CI (все тесты гнили молча). Логика
+      # вынесена в server/core.js без этой зависимости (по образцу
+      # integrations, #115) — тест импортирует оттуда напрямую.
+      - name: Юнит-тесты плагина runner-bridge
+        run: node --test plugins-src/runner-bridge/test/server.test.mjs
+
       # Интеграции внешних систем (#115): форма реестра + гвардия проводки
       # (каждый секрет реестра обязан быть упомянут в workflow'е своей
       # проводки — иначе интеграция молча вечно not_configured), чистая логика
