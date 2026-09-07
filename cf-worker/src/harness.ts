@@ -1870,11 +1870,15 @@ export class Harness extends DurableObject<Env> {
 
   /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в
    *  new с обнулёнными попытками (после устранения причины, например установки
-   *  GH_ISSUES_TOKEN). */
+   *  GH_ISSUES_TOKEN). processed_ts тоже чистится здесь (находка ревью PR #586):
+   *  без этого строка возвращалась в 'new' со старым processed_ts, и инвариант
+   *  «processed_ts ≠ NULL ⇒ терминальный статус» (на нём держится фильтр по
+   *  status в ретеншене, 14.10) переставал быть структурным — держался бы
+   *  только фильтром, без обнуления здесь. */
   async #processInbox(limit: number, retryFailed: boolean): Promise<MessageProcessResult[]> {
     if (retryFailed) {
       const cursor = this.#sql.exec(
-        "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL WHERE status = 'failed'",
+        "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL, processed_ts = NULL WHERE status = 'failed'",
       );
       // failed → new (bulk retry) — та же msgCounts-инвалидация, что у
       // одиночных переходов выше (#575).
