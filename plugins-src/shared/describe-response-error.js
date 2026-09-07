@@ -2,7 +2,7 @@
 // диагноза «зелёный health при мёртвой морде»): владелец видел голый «HTTP
 // 500» на журнале/плагинах/дедупе заказов, хотя воркер честно отдаёт причину
 // в теле — {"error":{"code","message"}} (конвенция ApiError, cf-worker/src/
-// harness.ts:533-539 + storageErrorResponse), которую прокси dsh-edge
+// harness.ts, storageErrorResponse + classifyStorageError), которую прокси dsh-edge
 // (patches/0005-harness-status-proxy.patch) проносит нетронутым. Три клиентских
 // точки (integrations, plugin-manager: журнал и rpcCall) отбрасывали тело ДО
 // попытки его прочитать — этот файл их единственная общая правда.
