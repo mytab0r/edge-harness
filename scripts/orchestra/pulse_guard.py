@@ -108,6 +108,47 @@ PROBE_MARKER = "[статус конвейера: проба"
 HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
 HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
 
+# ── Сторож живости: независимый DO-пульс оркестратора (issue #689) ──────────────
+# heartbeat_check выше видит «пульс жив», если сработал ЛЮБОЙ легитимный канал
+# orchestra.yml (schedule ИЛИ workflow_dispatch) — и слеп к случаю, когда ОДИН
+# канал маскирует смерть ДРУГОГО. Тот же класс силент-неправды уже случался
+# дважды на разных парах каналов: 2026-09-05 (см. docstring real_orchestra_ticks
+# выше) — `contract`-прогоны pull_request маскировали смерть job'а `orchestra`
+# целиком; 2026-09-07 (issue #689, замер по `triggering_actor.login` живым
+# запросом `gh api .../orchestra.yml/runs`) — ВНУТРИ одного и того же канала
+# workflow_dispatch два РАЗНЫХ источника дают один и тот же event: событийный
+# будильник (scripts/gh/wake_orchestra.sh, `pr-review.yml`/`ai-review.yml`,
+# GH_TOKEN=github.token → actor=EVENT_ACTOR_LOGIN) и независимый DO-пульс
+# (cf-worker/src/harness.ts::alarm()/attemptOrchestraDispatch, GH_DISPATCH_TOKEN
+# → actor — владелец токена). Замер: 71 диспатч от EVENT_ACTOR_LOGIN и 2 от
+# владельца токена за сутки при ожидаемых ~82 (тик раз в 15 мин,
+# HEARTBEAT.selfOrchestrationMs в cf-worker) — DO-пульс не работал ~20.5 часов
+# из ~24, конвейер держался только на событийном канале, и heartbeat_check
+# молчал: событийный канал исправно тикал. Причина (НЕ чинится этим сторожем,
+# только называется) — cf-worker/src/harness.ts::alarm(): если обе попытки
+# ctx.storage.setAlarm падают, функция выходит без нового будильника, и
+# восстановить цепочку может только внешний трафик к DO (#ensureHeartbeat в
+# конструкторе) — без трафика мертво неограниченно долго.
+#
+# Различитель — тот же признак, что предложило ревью PR #522 (находка №2) для
+# СИММЕТРИЧНОЙ проверки в обратную сторону (там: тикнул ли DO, пока проверяют
+# событийный канал; здесь: тикнул ли НЕ-бот, пока проверяют независимый канал).
+# Хардкодить логин владельца токена (сейчас mytab0r) нельзя — он может
+# смениться без изменения кода; признак устойчивее — «актор НЕ бот-событие».
+EVENT_ACTOR_LOGIN = "github-actions[bot]"
+
+# 4 пропущенных такта (15 мин цикл DO-пульса) — один пропуск штатный (сетевая
+# заминка/ретрай, тот же довод, что у HEARTBEAT_MAX_AGE_MINUTES = 3 такта), но
+# здесь порог взят на такт шире: цена ложной тревоги выше (некому её сверить
+# руками ночью, канал доставки — Telegram владельцу), а различить каналы можно
+# только когда событийный уже подтверждённо жив (см. decide_independent_pulse) —
+# лишний такт запаса не даёт спутать «различитель ещё не применим» с «канал и
+# правда мёртв».
+INDEPENDENT_PULSE_STALE_AFTER_MINUTES = 60
+
+DO_PULSE_MARKER = "[статус: независимый DO-пульс не приходил]"
+DO_PULSE_RESUMED_MARKER = "[статус: независимый DO-пульс снова работает]"
+
 # Success-маркер авто-возобновления (#220): scheduler.after_merge ставит его в
 # #120, когда слит PR задачи ветки, а последний красный прогон worker.yml
 # работал именно над этой задачей (след аренды «worker run <id>»). conveyor_gate
@@ -1086,6 +1127,112 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
             f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
             f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+
+
+def decide_independent_pulse(
+    dispatch_runs: list[dict], now: datetime,
+    stale_after_minutes: float = INDEPENDENT_PULSE_STALE_AFTER_MINUTES,
+) -> tuple[str, datetime | None, bool]:
+    """Чистое решение #689. dispatch_runs — прогоны orchestra.yml с
+    event=workflow_dispatch (прод-форма, поле triggering_actor.login читается
+    как есть от Actions API). Возвращает (состояние, anchor, exact):
+
+    'not_applicable' — событийный канал (EVENT_ACTOR_LOGIN) сам не подтверждён
+    живым в пределах stale_after_minutes — честная граница: если оркестратор
+    вообще не диспатчился недавно, отличить «независимый канал умер» от
+    «PR-активности просто нет» по этим данным нельзя, тревогу не заводим.
+
+    'ok'/'stale' — применимо (событийный канал жив): среди dispatch_runs есть
+    хотя бы один прогон НЕ от EVENT_ACTOR_LOGIN не старше порога — 'ok'. anchor
+    в этом случае — момент последнего независимого тика, exact=True (возраст
+    точный). Если независимых прогонов в выборке нет вовсе — 'stale', anchor —
+    самый старый прогон ВЫБОРКИ (нижняя граница возраста: провал не моложе
+    этого момента, но неизвестно насколько старше), exact=False — вызывающий
+    обязан назвать эту границу приблизительной, а не гадать точным числом."""
+    event_runs = [r for r in dispatch_runs
+                  if (r.get("triggering_actor") or {}).get("login") == EVENT_ACTOR_LOGIN]
+    if not event_runs:
+        return "not_applicable", None, True
+    newest_event_age = min(minutes_between(parse_time(r["created_at"]), now) for r in event_runs)
+    if newest_event_age > stale_after_minutes:
+        return "not_applicable", None, True
+    independent_runs = [r for r in dispatch_runs
+                        if (r.get("triggering_actor") or {}).get("login") != EVENT_ACTOR_LOGIN]
+    if not independent_runs:
+        oldest = min(parse_time(r["created_at"]) for r in dispatch_runs)
+        return "stale", oldest, False
+    newest_independent_at = max(parse_time(r["created_at"]) for r in independent_runs)
+    age = minutes_between(newest_independent_at, now)
+    return ("ok" if age <= stale_after_minutes else "stale"), newest_independent_at, True
+
+
+def independent_pulse_alert_text(age_minutes: float, exact: bool) -> str:
+    hours = age_minutes / 60
+    clause = (f"независимый пульс не приходил {hours:.1f} ч" if exact else
+              f"независимый пульс не приходил как минимум {hours:.1f} ч "
+              "(в изученной выборке дисптачей нет ни одного независимого тика)")
+    return (
+        f"🚨 edge-harness: {DO_PULSE_MARKER}\n"
+        f"{clause} — конвейер держится только на событийном канале "
+        "(scripts/gh/wake_orchestra.sh) и встанет, как только прекратится "
+        "активность PR: нет ревью → некому продиспатчить orchestra.yml. "
+        "Вероятная причина — cf-worker/src/harness.ts::alarm(): обе попытки "
+        "ctx.storage.setAlarm упали, и цепочка пульса встала до "
+        "пересоздания DO (issue #689); проверь rows_written квоту DO и "
+        "/api/status морды."
+    )
+
+
+def independent_pulse_check(repo: str, now: datetime) -> list[str]:
+    """Сторож живости #689 — ОБРАТНЫЙ по направлению класс к событийному
+    сторожу (#510/#519, если он уже слит в этом дереве): тот проверяет, что
+    событийный будильник (wake_orchestra.sh) сработал, этот — что независимый
+    DO-пульс (cf-worker alarm()) сработал, пока событийный маскирует его
+    смерть тем же трюком, каким schedule маскировал смерть job'а `orchestra`
+    2026-09-05 (см. docstring real_orchestra_ticks).
+
+    Применимость проверяется первой, дёшево (один recent_runs, per_page=100 —
+    тот же порядок цены, что уже платит heartbeat_check за оба легитимных
+    события): холостая очередь (событийный канал сам не подтверждён свежим)
+    не пишет ничего и не заводит эпизода — не мониторинг падений, граница
+    та же, что у failure_watch/event_wake_check."""
+    dispatch_runs = recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=100, event="workflow_dispatch")
+    state, anchor, exact = decide_independent_pulse(dispatch_runs, now)
+    if state == "not_applicable":
+        return []
+    age = minutes_between(anchor, now)
+
+    if state == "ok":
+        # Эпизод закрывается явно, как только независимый тик снова нашёлся —
+        # тот же приём, что у HEARTBEAT_NO_TICKS/HEARTBEAT_TICKS_RESUMED выше.
+        try:
+            open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_MARKER)
+            if open_times:
+                close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_RESUMED_MARKER)
+                if not close_times or max(open_times) > max(close_times):
+                    post_issue_comment(
+                        repo, WATCHDOG_ISSUE,
+                        f"✅ edge-harness: {DO_PULSE_RESUMED_MARKER}\n"
+                        "Прогон orchestra.yml с event=workflow_dispatch не от "
+                        f"{EVENT_ACTOR_LOGIN} снова найден — эпизод «независимый "
+                        "DO-пульс не приходил» закрыт.",
+                    )
+        except RuntimeError as error:
+            print(f"::warning::закрытие эпизода DO-пульса в #{WATCHDOG_ISSUE} не оставлено: {error}",
+                  file=sys.stderr)
+        return [f"💗 независимый DO-пульс оркестратора в норме "
+                f"(последний тик {int(age)} мин назад)"]
+
+    try:
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_MARKER)
+        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_RESUMED_MARKER)
+    except RuntimeError as error:
+        return [f"⚠️ не смог сверить маркеры независимого DO-пульса #{WATCHDOG_ISSUE}: {error}"]
+    if not episode_reopened(open_times, close_times):
+        return [f"🚨 независимый DO-пульс не приходил ({int(age)} мин назад, эпизод уже оповещён)"]
+    text = independent_pulse_alert_text(age, exact)
+    result = escalate(repo, WATCHDOG_ISSUE, text)
+    return [f"🚨 независимый DO-пульс не приходил {age / 60:.1f} ч ({result})"]
 
 
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]:
