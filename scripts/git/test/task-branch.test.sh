@@ -312,6 +312,7 @@ done
 make_tree "case7"
 if (
   cd "$WORK/case7"
+  unset GITHUB_ACTIONS
   PATH="$safe_path:$shim" "$bash_bin" "$SCRIPT_SRC" "67-no-gh"
 ) 2>"$WORK/case7.stderr"; then
   note "случай 7 (gh не найден): скрипт создал ветку — ОШИБКА, ожидался отказ гвардии эпика (офлайн-режима нет)"
