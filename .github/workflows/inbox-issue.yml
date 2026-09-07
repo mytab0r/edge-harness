@@ -47,6 +47,12 @@ jobs:
           BODY: ${{ github.event.client_payload.body }}
         run: |
           set -euo pipefail
+          # Четвёртая дверь issue-create (класс #611) — этот job не делает
+          # actions/checkout (репозиторий не нужен для одного вызова gh api),
+          # поэтому scripts/gh/issue-create физически недоступен; инвариант
+          # "labels содержит task" продублирован вручную (-f "labels[]=task"
+          # ниже), см. ADR 0015 и докстринг вверху файла.
+          # door-exception: четвёртая дверь issue-create, checkout репозитория для этого job не делается, инвариант task продублирован вручную выше
           created=$(gh api -X POST "repos/$REPO/issues" \
             -f "title=$TITLE" -f "body=$BODY" \
             -f "labels[]=task" -f "labels[]=source:inbox")
