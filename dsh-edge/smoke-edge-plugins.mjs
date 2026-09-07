@@ -32,41 +32,86 @@ import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-const cloneRoot = process.argv[2]
-if (!cloneRoot) {
-  process.stderr.write('Usage: node dsh-edge/smoke-edge-plugins.mjs <clone-root>\n')
-  process.exit(2)
+/**
+ * Чистый разбор текста сгенерированного модуля (без IO) — вынесен отдельно,
+ * чтобы юнит-тест (dsh-edge/test/smoke-edge-plugins.test.mjs) кормился
+ * реальным форматом кодогенератора без необходимости поднимать cordis/clone.
+ */
+export function parseGeneratedModule(generated) {
+  const imports = new Map()
+  for (const m of generated.matchAll(/^import (\w+) from '([^']+)'$/gmu)) imports.set(m[1], m[2])
+  const entries = [...generated.matchAll(/^\s*\{ id: '([^']+)', plugin: (\w+) \},?$/gmu)]
+    .map(m => ({ id: m[1], specifier: imports.get(m[2]) }))
+  return { imports, entries }
 }
 
-const standaloneDir = join(cloneRoot, 'apps', 'dsh-edge', 'standalone')
-const generatedPath = join(cloneRoot, 'apps', 'dsh-edge', 'src', 'edge-plugins.generated.ts')
-// Бутстрап живёт внутри standalone, чтобы голые спецификаторы
-// (@deepseek-ai/*, @edge-harness/*) резолвились из её node_modules. Сам
-// сгенерированный модуль бутстрап не импортирует: его импорты резолвятся
-// относительно src/ (в бандле их строит алиас патча 0001, голый Node их не
-// возьмёт). Состав читается из его текста — формат фиксирован кодогенератором
-// этого же репо (одно место правды о форме), пакеты импортирует бутстрап.
-const generated = readFileSync(generatedPath, 'utf8')
-const imports = new Map()
-for (const m of generated.matchAll(/^import (\w+) from '([^']+)'$/gmu)) imports.set(m[1], m[2])
-const entries = [...generated.matchAll(/^\s*\{ id: '([^']+)', plugin: (\w+) \},?$/gmu)]
-  .map(m => ({ id: m[1], specifier: imports.get(m[2]) }))
-if (imports.size === 0 || entries.length === 0) {
-  console.log('smoke-edge-plugins: серверных плагинов нет — деградация в апстримную сборку, дымить нечего')
-  process.exit(0)
-}
-const unknown = entries.filter(e => e.specifier === undefined)
-if (unknown.length > 0) {
-  process.stderr.write(`smoke-edge-plugins: сгенерированный модуль вне ожидаемой формы (импорт не найден для: ${unknown.map(e => e.id).join(', ')}) — кодогенератор менял форму? Бросить громко.\n`)
-  process.exit(2)
+/**
+ * Классифицирует результат parseGeneratedModule до любых дорогих шагов
+ * (запись бутстрапа, spawn cordis). Два РАЗНЫХ условия, не один OR (класс
+ * «тихий ноль», живая находка): реестр пуст (entries.length === 0) —
+ * легитимное состояние «плагинов нет», дымить действительно нечего.
+ * Импортов нет (imports.size === 0), но записи РЕЕСТРА ЕСТЬ — это НЕ
+ * «плагинов нет», а формат import-строки (`import X from '...'`) разошёлся
+ * с regex'ом: старый общий OR читал этот случай как первый и выходил ДО
+ * проверки unknown, которая именно этот случай и ловит — плагины молча
+ * пропадали бы из дыма при смене формы import-объявления, exit 0.
+ */
+export function classifyParsedModule({ imports, entries }) {
+  if (entries.length === 0) {
+    return { kind: 'no-plugins' }
+  }
+  if (imports.size === 0) {
+    return { kind: 'import-format-drift', entriesCount: entries.length }
+  }
+  const unknown = entries.filter(e => e.specifier === undefined)
+  if (unknown.length > 0) {
+    return { kind: 'unknown-specifier', unknownIds: unknown.map(e => e.id) }
+  }
+  return { kind: 'ok', entries }
 }
 
-const bootstrapPath = join(standaloneDir, 'smoke-edge-plugins.bootstrap.mjs')
-const registry = JSON.stringify(entries)
-// Стирание типов (import .ts) включено в Node по умолчанию с 23.6; CI и
-// локально — Node 24.
-const bootstrap = `
+// CLI-режим: только при прямом вызове `node dsh-edge/smoke-edge-plugins.mjs`,
+// не при импорте функций выше юнит-тестом (тот же приём, что integrations.mjs).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const cloneRoot = process.argv[2]
+  if (!cloneRoot) {
+    process.stderr.write('Usage: node dsh-edge/smoke-edge-plugins.mjs <clone-root>\n')
+    process.exit(2)
+  }
+
+  const standaloneDir = join(cloneRoot, 'apps', 'dsh-edge', 'standalone')
+  const generatedPath = join(cloneRoot, 'apps', 'dsh-edge', 'src', 'edge-plugins.generated.ts')
+  // Бутстрап живёт внутри standalone, чтобы голые спецификаторы
+  // (@deepseek-ai/*, @edge-harness/*) резолвились из её node_modules. Сам
+  // сгенерированный модуль бутстрап не импортирует: его импорты резолвятся
+  // относительно src/ (в бандле их строит алиас патча 0001, голый Node их не
+  // возьмёт). Состав читается из его текста — формат фиксирован кодогенератором
+  // этого же репо (одно место правды о форме), пакеты импортирует бутстрап.
+  const generated = readFileSync(generatedPath, 'utf8')
+  const parsed = parseGeneratedModule(generated)
+  const classified = classifyParsedModule(parsed)
+
+  if (classified.kind === 'no-plugins') {
+    console.log('smoke-edge-plugins: серверных плагинов нет — деградация в апстримную сборку, дымить нечего')
+    process.exit(0)
+  }
+  if (classified.kind === 'import-format-drift') {
+    process.stderr.write(`smoke-edge-plugins: сгенерированный модуль несёт ${classified.entriesCount} запись(ей) реестра, но НИ ОДНОГО import — форма 'import X from \\'...\\'' разошлась с regex'ом извлечения импортов, кодогенератор менял форму? Бросить громко.\n`)
+    process.exit(2)
+  }
+  if (classified.kind === 'unknown-specifier') {
+    process.stderr.write(`smoke-edge-plugins: сгенерированный модуль вне ожидаемой формы (импорт не найден для: ${classified.unknownIds.join(', ')}) — кодогенератор менял форму? Бросить громко.\n`)
+    process.exit(2)
+  }
+
+  const entries = classified.entries
+  const bootstrapPath = join(standaloneDir, 'smoke-edge-plugins.bootstrap.mjs')
+  const registry = JSON.stringify(entries)
+  // Стирание типов (import .ts) включено в Node по умолчанию с 23.6; CI и
+  // локально — Node 24.
+  const bootstrap = `
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -117,12 +162,13 @@ console.log('smoke-edge-plugins: ЗЕЛЁНЫЙ — все ' + entries.length + 
 process.exit(0)
 `
 
-await writeFile(bootstrapPath, bootstrap, 'utf8')
-try {
-  const run = spawnSync(process.execPath, [bootstrapPath], { cwd: standaloneDir, encoding: 'utf8' })
-  process.stdout.write(run.stdout ?? '')
-  process.stderr.write(run.stderr ?? '')
-  process.exit(run.status ?? 1)
-} finally {
-  await rm(bootstrapPath, { force: true })
+  await writeFile(bootstrapPath, bootstrap, 'utf8')
+  try {
+    const run = spawnSync(process.execPath, [bootstrapPath], { cwd: standaloneDir, encoding: 'utf8' })
+    process.stdout.write(run.stdout ?? '')
+    process.stderr.write(run.stderr ?? '')
+    process.exit(run.status ?? 1)
+  } finally {
+    await rm(bootstrapPath, { force: true })
+  }
 }
