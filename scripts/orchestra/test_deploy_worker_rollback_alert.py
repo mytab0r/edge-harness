@@ -10,10 +10,12 @@ Telegram честно «не доставлен», место правды — �
 """
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _DIR = Path(__file__).resolve().parent
 if str(_DIR) not in sys.path:
@@ -27,6 +29,8 @@ spec.loader.exec_module(dwra)  # type: ignore[union-attr]
 pg = sys.modules["pulse_guard"]
 
 REPO = "mytab0r/edge-harness"
+
+WORKFLOW = _DIR.parents[1] / ".github" / "workflows" / "deploy-worker.yml"
 
 
 class FakeGh:
@@ -172,3 +176,120 @@ def test_main_requires_github_repository_env(monkeypatch, offline_telegram):
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     with pytest.raises(KeyError):
         dwra.main()
+
+
+# ── Гвардия YAML: повторная канарейка ставит браузер сама, не полагаясь ──────
+# ── на то, что предыдущий шаг успел это сделать (находка второго гейта PR #617:
+# ── "Канарейка UI на проде" могла упасть до/во время playwright install, либо
+# ── шаг секретов после неё — в обоих случаях без переустановки здесь
+# ── chromium.launch() падает по средовой причине, и красная повторная
+# ── канарейка перестаёт отличаться от "версия не отвечает").
+#
+# Проверка по структуре YAML (шаг найден по id), не по подстроке всего файла —
+# подстрока прошла бы и от комментария, не только от реального run-блока.
+
+
+def _post_rollback_canary_step():
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["deploy"]["steps"]
+    matches = [s for s in steps if s.get("id") == "post_rollback_canary"]
+    assert len(matches) == 1, "шаг post_rollback_canary не найден или задвоен — структура workflow изменилась"
+    return matches[0]
+
+
+def test_post_rollback_canary_installs_playwright_browser_before_running():
+    step = _post_rollback_canary_step()
+    run = step.get("run") or ""
+    install_pos = run.find("playwright install")
+    canary_pos = run.find("scripts/canary-ui.mjs")
+    assert install_pos != -1, (
+        "шаг «Канарейка после автооткота» не переустанавливает браузер Playwright — "
+        "если предыдущая канарейка упала до/во время playwright install (или шаг "
+        "секретов упал раньше неё), повторный прогон падает на chromium.launch() по "
+        "средовой причине, а не по реальной недоступности откатанной версии"
+    )
+    assert canary_pos != -1, "шаг post_rollback_canary больше не запускает canary-ui.mjs"
+    assert install_pos < canary_pos, "playwright install обязан идти ДО запуска канарейки"
+
+
+def test_post_rollback_canary_stays_loud_no_continue_on_error():
+    # Задача #614, п.1: это худший случай, он обязан остаться громким —
+    # мутация могла бы тихо добавить continue-on-error вместе с фиксом выше.
+    step = _post_rollback_canary_step()
+    assert "continue-on-error" not in step
+
+
+# ── Гвардия проводки workflow↔скрипт (некритичное замечание второго гейта ────
+# ── PR #617): env-имена, которые задаёт шаг эскалации в deploy-worker.yml, и
+# ── env-имена, которые ЧИТАЕТ main() в deploy_worker_rollback_alert.py, живут
+# ── в двух файлах и ничем не связаны — переименование в одном месте молчит,
+# ── а не падает (пустая строка → parse_bool_env=False → «АВТООТКАТ НЕ
+# ── ПОДТВЕРЖДЁН» на каждый инцидент). Приём — тот же, что
+# ── test_telegram_callback_format_sync.py: читаем оба исходника РЕАЛЬНО, не
+# ── повторяем литерал в двух местах.
+
+
+def _escalation_step():
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["deploy"]["steps"]
+    matches = [
+        s for s in steps
+        if "deploy_worker_rollback_alert.py" in str(s.get("run") or "")
+    ]
+    assert len(matches) == 1, "шаг эскалации (запуск deploy_worker_rollback_alert.py) не найден или задвоен"
+    return matches[0]
+
+
+
+# GITHUB_REPOSITORY/GITHUB_RUN_ID/GITHUB_SERVER_URL — стандартные переменные,
+# которые раннер GitHub Actions прокидывает в КАЖДЫЙ шаг сам, без явного
+# `env:` (docs: "Default environment variables"). Их отсутствие в блоке
+# `env:` шага — не разрыв проводки, поэтому из проверки исключены; ровно
+# ROLLBACK_CONFIRMED/POST_ROLLBACK_OK — прикладные имена, которые шаг обязан
+# задать явно из outputs соседних шагов.
+_RUNNER_DEFAULT_ENV = {"GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_SERVER_URL"}
+
+
+def _main_env_keys() -> set[str]:
+    """Имена, которые реально читает main() через os.environ/.get — не список,
+    переписанный вручную рядом (тот класс расхождения и ловим)."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    keys = set(re.findall(r'os\.environ\.get\(\s*["\'](\w+)["\']', source))
+    keys |= set(re.findall(r'os\.environ\[\s*["\'](\w+)["\']\s*\]', source))
+    return keys - _RUNNER_DEFAULT_ENV
+
+
+def test_escalation_step_env_names_match_what_main_actually_reads():
+    step = _escalation_step()
+    env = step.get("env") or {}
+    required = _main_env_keys()
+    missing = required - set(env)
+    assert not missing, (
+        f"deploy-worker.yml: шаг эскалации не задаёт env {missing}, которые читает "
+        f"main() в {SCRIPT.name} — main() увидит пустую строку и тихо решит "
+        "'АВТООТКАТ НЕ ПОДТВЕРЖДЁН' вместо реального исхода"
+    )
+
+
+def test_rollback_confirmed_env_points_at_the_real_auto_rollback_step_id():
+    step = _escalation_step()
+    expr = str((step.get("env") or {}).get("ROLLBACK_CONFIRMED") or "")
+    assert "steps.auto_rollback.outputs.rolled_back" in expr, (
+        f"ROLLBACK_CONFIRMED больше не ссылается на steps.auto_rollback.outputs.rolled_back "
+        f"(нашли: {expr!r}) — переименование шага отката смолчится тем же путём"
+    )
+    step_ids = {
+        s.get("id")
+        for s in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]["steps"]
+        if s.get("id")
+    }
+    assert "auto_rollback" in step_ids, "шаг с id=auto_rollback пропал из workflow"
+
+
+def test_post_rollback_ok_env_points_at_the_real_post_rollback_canary_step_id():
+    step = _escalation_step()
+    expr = str((step.get("env") or {}).get("POST_ROLLBACK_OK") or "")
+    assert "steps.post_rollback_canary.outcome" in expr, (
+        f"POST_ROLLBACK_OK больше не ссылается на steps.post_rollback_canary.outcome "
+        f"(нашли: {expr!r}) — переименование шага повторной канарейки смолчится тем же путём"
+    )
