@@ -82,6 +82,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+AGENTS_FILE = REPO_ROOT / "AGENTS.md"
+PROTOCOL_FILE = REPO_ROOT / "docs" / "agents" / "PROTOCOL.md"
 
 # Метки-вердикты — одно место правды в lib (общее для check_pr/scheduler).
 _LIB = SCRIPT_DIR.parent / "lib" / "review_labels.py"
@@ -790,6 +793,29 @@ def task_section(pull: dict, repo: str) -> str:
     )
 
 
+def rules_section() -> str:
+    """Правила репозитория дословно — AGENTS.md + docs/agents/PROTOCOL.md, не
+    пересказ (раньше до ревьюера не доходило ни байта их содержимого, только
+    собственный короткий список правил ревью в ai_prompt.md).
+
+    Подставляется как ОДНО ЗНАЧЕНИЕ через `string.Template.safe_substitute`
+    (см. cmd_gather), а не встраивается в текст самого шаблона: Template
+    сканирует на `$`-плейсхолдеры только ТЕКСТ ШАБЛОНА при разборе, значения
+    подстановки в мэппинге не пересканируются — `$GITHUB_REPOSITORY` и
+    `${{ github.token }}`, которые постоянно встречаются в правилах
+    репозитория, доходят до модели неискажёнными (доказано мутацией в
+    test_ai_review.py::test_rules_section_dollar_survives_substitution).
+    """
+    agents = AGENTS_FILE.read_text(encoding="utf-8")
+    protocol = PROTOCOL_FILE.read_text(encoding="utf-8")
+    return (
+        "# Правила репозитория (AGENTS.md, дословно; обязательны, не пересказ)\n\n"
+        f"{agents}\n\n"
+        "# Протокол совместной работы агентов (docs/agents/PROTOCOL.md, дословно; обязателен)\n\n"
+        f"{protocol}"
+    )
+
+
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
@@ -887,6 +913,7 @@ def cmd_gather(args: argparse.Namespace) -> int:
         context_pack=pack,
         task_section=task_section(pull, repo),
         size_section=size_question_section(added),
+        rules_section=rules_section(),
     )
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
     # Переходная совместимость: bridge на main (до мержа этого PR) берёт head

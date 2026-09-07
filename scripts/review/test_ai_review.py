@@ -476,6 +476,58 @@ def test_task_section_bot_pr_has_no_task(monkeypatch):
     assert ai.task_section(pull, "o/r") == ai.NO_TASK_MESSAGE
 
 
+# ── Правила репозитория (AGENTS.md/PROTOCOL.md) доходят до промпта ревьюера,
+# не пересказом (класс: раньше ai_prompt.md не нёс ни байта их содержимого,
+# только собственный короткий список правил ревью). Прод-форма: реальные файлы
+# с диска, реальный ai_prompt.md, реальный string.Template.safe_substitute —
+# тот же вызов, что делает cmd_gather.
+
+def test_rules_section_contains_agents_and_protocol_verbatim():
+    section = ai.rules_section()
+    agents_text = ai.AGENTS_FILE.read_text(encoding="utf-8")
+    protocol_text = ai.PROTOCOL_FILE.read_text(encoding="utf-8")
+    assert agents_text in section
+    assert protocol_text in section
+
+
+def test_gather_prompt_template_delivers_rules_section():
+    # Тот же шаблон и та же подстановка, что cmd_gather — прод-форма файла,
+    # не пересказ его содержимого здесь.
+    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
+    prompt = template.safe_substitute(
+        pr=1, title="t", branch="b", author="a",
+        context_pack="pack.txt",
+        task_section="(без задачи)",
+        rules_section=ai.rules_section(),
+    )
+    assert "# Правила работы в этом репозитории" in prompt, \
+        "содержимое AGENTS.md не дошло до промпта ревьюера"
+    assert "# Протокол мультиагентной работы" in prompt, \
+        "содержимое PROTOCOL.md не дошло до промпта ревьюера"
+
+
+def test_rules_section_dollar_survives_substitution():
+    # Ловушка string.Template: $-паттерны реальных правил (`$GITHUB_REPOSITORY`,
+    # `${{ github.token }}`) не должны искажаться при safe_substitute — значения
+    # мэппинга не пересканируются на плейсхолдеры, только текст самого шаблона.
+    # Мутация класса: встраивание rules_section прямо В ТЕКСТ ШАБЛОНА (вместо
+    # передачи значением) была бы тем же классом уязвимости для будущих правок
+    # ai_prompt.md — тест ловит именно то, что $-текст доходит до модели как есть.
+    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
+    dollar_fragment = (
+        "Задача из пула ссылается на $GITHUB_REPOSITORY и на "
+        "${{ github.token }} — оба паттерна реальных правил репозитория."
+    )
+    prompt = template.safe_substitute(
+        pr=1, title="t", branch="b", author="a",
+        context_pack="pack.txt",
+        task_section=dollar_fragment,
+        rules_section=ai.rules_section(),
+    )
+    assert "$GITHUB_REPOSITORY" in prompt
+    assert "${{ github.token }}" in prompt
+
+
 # ── Ошибка провайдера/транспорта vs нарушение контракта моделью ──────────────
 # (класс silent-wrong прогона 33572445063, PR #190: dsh упал с HTTP_404,
 # answer.txt остался пустым, verdict написал «строки ВЕРДИКТ нет вообще» —
