@@ -1422,6 +1422,73 @@ def test_last_error_log_line_ignores_post_job_cleanup_teardown(monkeypatch):
     assert "credentials" not in line and "Post job cleanup" not in line
 
 
+def test_last_error_log_line_skip_teardown_cut_recovers_fact_inside_teardown(monkeypatch):
+    # Находка ревью PR #612: обрезка по POST_JOB_CLEANUP_MARKER верна только
+    # когда сам teardown НЕ падает. Если падает шаг «Post ...» (unset
+    # git config/ssh и т.п.), настоящая причина живёт ВНУТРИ секции — по
+    # умолчанию (skip_teardown_cut=False) обрезка вырезает её и подставляет
+    # случайную предшествующую строку; с skip_teardown_cut=True причина
+    # находится.
+    log = (
+        "2026-09-08T00:00:00.0000000Z содержательная строка ДО teardown — не факт\n"
+        "2026-09-08T00:00:01.0000000Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-08T00:00:02.0000000Z Post job cleanup.\n"
+        "2026-09-08T00:00:03.0000000Z ##[error]fatal: could not read Username for "
+        "'https://github.com/': terminal prompts disabled\n"
+        "2026-09-08T00:00:04.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    wrong = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert wrong is not None and "ДО teardown" in wrong  # без флага — неверный факт
+
+    correct = pg.last_error_log_line("mytab0r/edge-harness", 999, skip_teardown_cut=True)
+    assert correct is not None and "terminal prompts disabled" in correct
+
+
+def test_failure_watch_recovers_fact_when_post_step_itself_failed(monkeypatch):
+    # Интеграционная проверка находки ревью PR #612: failure_watch сам решает
+    # по conclusion шагов job'а, нужен ли skip_teardown_cut — упавший шаг
+    # «Post Checkout code» переключает разбор на непритуплённый лог.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34099999999, event="schedule"),
+    ]}
+    routes["runs/34099999999/jobs"] = {"jobs": [
+        {"id": 42, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Checkout code", "conclusion": "success"},
+            {"name": "Post Checkout code", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    log = (
+        "2026-09-08T00:00:00.0000000Z содержательная строка ДО teardown — не факт\n"
+        "2026-09-08T00:00:01.0000000Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-08T00:00:02.0000000Z Post job cleanup.\n"
+        "2026-09-08T00:00:03.0000000Z ##[error]fatal: could not read Username for "
+        "'https://github.com/': terminal prompts disabled\n"
+        "2026-09-08T00:00:04.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1
+    joined = " ".join(created[0])
+    assert "terminal prompts disabled" in joined
+    assert "ДО teardown" not in joined
+
+
 def test_last_error_log_line_two_runs_same_cause_give_same_fingerprint_after_fix(monkeypatch):
     # Мутационная проверка класса #610: два прогона с ОДНОЙ и той же причиной,
     # но РАЗНЫМ UUID teardown-секции, обязаны дать ОДИН и тот же fingerprint —
@@ -1576,6 +1643,54 @@ def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(
     assert actions == []  # это не «новая задача», см. #456
     assert len(commented) == 1 and commented[0][0] == 578
     assert any("тем же заголовком" in line and "#578" in line for line in observations)
+
+
+def test_failure_watch_title_dedup_targets_oldest_duplicate_not_freshest(monkeypatch):
+    # Мутационная проверка (находка ревью PR #612): open_ci_failure_issues
+    # отдаёт открытые issues новыми ВПЕРЁД (порядок GitHub API по умолчанию).
+    # Пока временные дубли того же заголовка (#580/#589/#598) ещё не закрыты
+    # руками, next(...) первого совпадения положил бы улику в САМЫЙ СВЕЖИЙ
+    # дубль — здесь #598, а не в старейшую каноническую issue #578. min по
+    # number обязан выбрать #578 независимо от порядка страницы.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34063041667, event="schedule"),
+    ]}
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 1, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    title = "CI: orchestra.yml падает — orchestra"
+    # Порядок страницы GitHub — новые впереди: #598 первый, #578 последний.
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 598, "title": title,
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/598",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+        {"number": 589, "title": title,
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/589",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+        {"number": 578, "title": title,
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    routes["issues/578/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "Removing credentials config '/home/runner/work/_temp/"
+            "git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")))
+    commented = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(commented) == 1
+    assert commented[0][0] == 578  # старейшая, не #598
 
 
 def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypatch):

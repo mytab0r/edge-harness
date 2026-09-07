@@ -820,13 +820,15 @@ LOG_TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
 # заголовок заведённой issue (константный по workflow+job_name, см.
 # failure_watch) при этом совпадал — отсюда пять issue с одинаковым
 # заголовком «CI: orchestra.yml падает — orchestra» (#578/#580/#589/#592/#598).
-# Обрезаем лог по ПЕРВОМУ вхождению этого заголовка ДО обеих веток поиска:
-# вся секция после него — гарантированный teardown, не факт ни при каком
-# исходе job'а (не отдельная строка-исключение, а целая секция).
+# Обрезаем лог по ПЕРВОМУ вхождению этого заголовка ДО обеих веток поиска —
+# КРОМЕ случая, когда сам teardown упал (см. skip_teardown_cut ниже, находка
+# ревью PR #612): тогда секция после маркера — не гарантированный boilerplate,
+# а место, где живёт настоящая причина (например, упавший "Post Checkout" —
+# unset git config/ssh), и обрезка спрятала бы именно её.
 POST_JOB_CLEANUP_MARKER = "post job cleanup."
 
 
-def last_error_log_line(repo: str, job_id: int) -> str | None:
+def last_error_log_line(repo: str, job_id: int, skip_teardown_cut: bool = False) -> str | None:
     """Последняя СОДЕРЖАТЕЛЬНАЯ строка лога упавшего job'а — конкретный факт,
     не гипотеза (правило AGENTS.md, PR #475): не заставляет человека открыть
     Actions, чтобы увидеть, что именно сломалось.
@@ -856,7 +858,17 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     sequences») — без флага факта не бывает НИКОГДА, весь failure_watch
     мёртв в проде при живых зелёных тестах на моках. Флаг безопасен здесь:
     лог нашего репозитория мы разбираем САМИ подстрочным поиском
-    `##[error]` и никогда не печатаем в терминал, где escape могли бы сыграть."""
+    `##[error]` и никогда не печатаем в терминал, где escape могли бы сыграть.
+
+    skip_teardown_cut (находка ревью PR #612): POST_JOB_CLEANUP_MARKER
+    называет секцию teardown «не фактом ни при каком исходе job'а» — это
+    неверно в краевом случае, когда падает сам teardown-шаг («Post <шаг>» в
+    Jobs API, например «Post Checkout code» на unset git config/ssh). Тогда
+    настоящая причина живёт ПОСЛЕ маркера, и безусловная обрезка вырезала бы
+    её, подставив случайную содержательную строку до teardown. Вызывающий
+    (failure_watch) решает по именам и conclusion шагов job'а (уже прочитаны,
+    второй запрос не нужен): есть упавший шаг с именем, начинающимся на
+    «Post » — обрезка не применяется вовсе для этого job'а."""
     try:
         result = subprocess.run(
             ["gh", "api", "--allow-escape-sequences",
@@ -871,11 +883,12 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         return None
     lines = result.stdout.splitlines()
 
-    for cut_idx, raw_line in enumerate(lines):
-        cut_text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", raw_line)).strip()
-        if cut_text.lower() == POST_JOB_CLEANUP_MARKER:
-            lines = lines[:cut_idx]
-            break
+    if not skip_teardown_cut:
+        for cut_idx, raw_line in enumerate(lines):
+            cut_text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", raw_line)).strip()
+            if cut_text.lower() == POST_JOB_CLEANUP_MARKER:
+                lines = lines[:cut_idx]
+                break
 
     def is_non_fact(candidate: str) -> bool:
         lowered = candidate.lower()
@@ -1566,7 +1579,16 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         # запрос, поэтому потолок FAILURE_WATCH_MAX_JOBS_PER_RUN; хвост НЕ
         # прячется — назван поимённо в наблюдении после цикла.
         for job in bad_jobs[:FAILURE_WATCH_MAX_JOBS_PER_RUN]:
-            error_line = last_error_log_line(repo, job["id"])
+            # Упавший teardown-шаг ("Post ...") — краевой случай (находка
+            # ревью PR #612): обрезка по POST_JOB_CLEANUP_MARKER не применима,
+            # настоящая причина может жить внутри самой teardown-секции (см.
+            # docstring last_error_log_line/skip_teardown_cut).
+            teardown_failed = any(
+                (step.get("name") or "").lower().startswith("post ")
+                and step.get("conclusion") in FAILURE_CONCLUSIONS
+                for step in job.get("steps", [])
+            )
+            error_line = last_error_log_line(repo, job["id"], skip_teardown_cut=teardown_failed)
             job_name = job.get("name", "?")
             step_names = ", ".join(
                 step["name"] for step in job.get("steps", [])
@@ -1655,11 +1677,20 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             # Jaccard'ом в одно — regression test
             # test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest —
             # точное сравнение строк этого не путает.
-            existing_by_title = next(
-                (issue for issue in ci_issues
-                 if "pull_request" not in issue and issue.get("title") == title),
-                None,
-            )
+            # min(..., key=number), не next(...) первого совпадения (находка
+            # ревью PR #612): open_ci_failure_issues отдаёт открытые issues
+            # новыми ВПЕРЁД (порядок GitHub API по умолчанию) — пока временные
+            # дубли того же заголовка ещё не закрыты руками, next() положил бы
+            # улику в САМЫЙ СВЕЖИЙ дубль, а не в старейшую канонiческую issue
+            # (живой случай: #578 старейшая из пяти, #580/#589/#592/#598 —
+            # более новые дубли). Номер issue — надёжный proxy даты создания
+            # (тот же приём, что #361 уже использует для приоритета задач) —
+            # порядок закрытия дублей на выбор канонической issue не влияет.
+            same_title = [
+                issue for issue in ci_issues
+                if "pull_request" not in issue and issue.get("title") == title
+            ]
+            existing_by_title = min(same_title, key=lambda issue: issue["number"]) if same_title else None
             if existing_by_title:
                 number = existing_by_title["number"]
                 # Дедуп комментария по КЛАССУ (тот же приём, что
