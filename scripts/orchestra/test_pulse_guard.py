@@ -1300,6 +1300,10 @@ FAILURE_WATCH_QUIET_ROUTES = {
     f"workflows/{wf}/runs?status=completed": {"workflow_runs": []}
     for wf in pg.WATCHED_WORKFLOWS
 }
+# Счётчик суточного потолка (FAILURE_WATCH_DAILY_CAP) — по умолчанию пусто
+# (потолок никогда не исчерпан), тесты, проверяющие сам потолок, переопределяют
+# этот маршрут явно.
+FAILURE_WATCH_QUIET_ROUTES["issues?state=all&labels=ci-failure"] = []
 
 
 def _stdout_with_error(line: str):
@@ -1662,6 +1666,156 @@ def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypa
     assert len(posted_comments) == 2  # новый класс — второй, НЕ дублирующий комментарий
     assert any("уже открыта (#578)" in line for line in observations3)
     assert "Новый прогон" not in posted_comments[1]["body"]
+
+
+# ── Суточный потолок автозаведения ci-failure (FAILURE_WATCH_DAILY_CAP) ──────────
+
+
+def _ci_failure_issue(number: int, created_at: str) -> dict:
+    return {
+        "number": number,
+        "title": f"CI: worker.yml падает — job-{number}",
+        "created_at": created_at,
+        "body": f"...<!-- failure-fingerprint: whatever-{number} -->\n",
+    }
+
+
+def test_failure_watch_daily_cap_blocks_new_class_signals_once_and_lists_skipped(monkeypatch):
+    # Мутационная проверка потолка: квота дня уже сожжена (FAILURE_WATCH_DAILY_CAP
+    # задач за последние 24ч) — новый, ещё НЕ заведённый класс НЕ становится
+    # задачей, а видимый сигнал (комментарий #120 + Telegram) уходит РОВНО один
+    # раз, при этом отсечённый класс всё равно перечислен (тихий след-комментарий).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []  # класса ещё нет в пуле
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")  # < 24ч до NOW
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/120/comments"] = []  # ни один маркер сегодня ещё не стоит
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: True)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+
+    assert created == []  # потолок исчерпан — новая задача НЕ заведена
+    fp = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    assert any("потолок" in line and "исчерпан" in line and fp in line for line in observations)
+    # Ровно один видимый сигнал (эскалация #120+Telegram) — не второй канал,
+    # тот же escalate(), что и остальные тревоги этого модуля.
+    escalation_posts = [text for _, text in posted if pg.FAILURE_WATCH_CAP_MARKER in text]
+    assert len(escalation_posts) == 1
+    assert NOW.date().isoformat() in escalation_posts[0]
+    assert fp in escalation_posts[0]  # отсечённый класс перечислен в самом сигнале
+    assert any("эскалация потолка" in line for line in actions)
+    # Плюс тихий след-комментарий с отпечатком отсечённого класса — не теряется
+    # (отличаем от эскалации: та тоже упоминает префикс маркера в тексте «что
+    # дальше», поэтому фильтруем именно комментарии БЕЗ FAILURE_WATCH_CAP_MARKER).
+    skip_posts = [
+        text for _, text in posted
+        if pg.FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX in text and pg.FAILURE_WATCH_CAP_MARKER not in text
+    ]
+    assert len(skip_posts) == 1 and fp in skip_posts[0]
+
+
+def test_failure_watch_daily_cap_escalation_deduped_once_per_day(monkeypatch):
+    # Второй пульс того же дня, потолок всё ещё исчерпан, класс тот же самый:
+    # ни повторной эскалации (#120+Telegram), ни повторного тихого следа —
+    # маркеры обоих уже стоят. Наблюдение о потолке при этом печатается каждый
+    # пульс (видно в GITHUB_STEP_SUMMARY), это не то же самое, что тревога.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    fp = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    cap_marker = f"{pg.FAILURE_WATCH_CAP_MARKER} {NOW.date().isoformat()}]"
+    skip_marker = f"{pg.FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX} {NOW.date().isoformat()} {fp}]"
+    routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:00:00Z", "body": f"🚨 {cap_marker}\n..."},
+        {"created_at": "2026-08-31T11:00:01Z", "body": f"{skip_marker}\n..."},
+    ]
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("маркер уже стоит — повтор не пишем"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("эскалация уже была сегодня"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+
+    assert any("потолок" in line and "исчерпан" in line for line in observations)
+    assert not any("эскалация потолка" in line for line in actions)
+
+
+def test_failure_watch_daily_cap_never_raises(monkeypatch):
+    # Прогон обязан остаться зелёным: исчерпание потолка — сигнал «нужен
+    # человек», не отказ (см. докстринг FAILURE_WATCH_CAP_MARKER). Отправка в
+    # Telegram/комментарий может упасть (сеть) — failure_watch не поднимает
+    # исключение наверх ни при одном исходе.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/120/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)  # не бросает исключение
+    assert any("потолок" in line and "исчерпан" in line for line in observations)
 
 
 def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
