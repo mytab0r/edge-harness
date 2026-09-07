@@ -32,7 +32,10 @@
 #          с командой синхронизации;
 #      13) то же на пути усыновления (дерево пропало с диска);
 #      14) свои незапушенные коммиты расхождением не считаются —
-#          переиспользование работает.
+#          переиспользование работает;
+#     15) ветка существует только на origin (чужой PR, дерево потеряно) —
+#          усыновляется СЕРВЕРНАЯ голова, а не тихо заводится одноимённая
+#          локальная от origin/main (класс #332, репро ревью #333).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -538,6 +541,48 @@ if (cd "$WORK/f-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCR
 else
   note "случай 14 (свои незапушенные коммиты): переиспользование отказало или путь потерян — ОШИБКА"
   cat "$WORK/f-run2.out" 2>/dev/null
+  fail=1
+fi
+
+# ── случай 15: ветка только на origin — усыновление серверной головы ────────
+# Чужой PR уже запушен, локальной ветки и дерева нет: молча завести
+# одноимённую локальную ветку от origin/main значило бы тихо подменить чужую
+# работу (находка ревью #333, живое репро). task-branch обязан усыновить
+# серверную голову и напомнить про ручную арену доводки.
+# Мутация: сними проверку `refs/remotes/origin/$branch` в scripts/git/task-branch
+# (не-CI fall-through) — случай 15 перестаёт падать на сверке голов, тест красный.
+new_origin "g"
+git clone -q --branch main "$WORK/g-origin.git" "$WORK/g-main" 2>/dev/null
+git clone -q "$WORK/g-origin.git" "$WORK/g-first" 2>/dev/null
+(
+  cd "$WORK/g-first"
+  git config user.email rival@example.com
+  git config user.name rival
+  git checkout -q -b agent/67-origin-adopt
+  echo "pushed work" >pushed.txt
+  git add pushed.txt
+  git commit -q -m "pushed work"
+  git push -q origin agent/67-origin-adopt
+)
+remote_head=$(git -C "$WORK/g-main" ls-remote origin refs/heads/agent/67-origin-adopt | cut -f1)
+if (cd "$WORK/g-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-origin-adopt) \
+  >"$WORK/g-run.out" 2>"$WORK/g-run.stderr"; then
+  adopt_wt=$(git -C "$WORK/g-main" worktree list --porcelain \
+    | awk '/^worktree /{p=$2} /^branch refs\/heads\/agent\/67-origin-adopt$/{print p}')
+  adopt_head=$(git -C "$WORK/g-main" rev-parse refs/heads/agent/67-origin-adopt 2>/dev/null || true)
+  if [ -n "$adopt_wt" ] && [ "$adopt_head" = "$remote_head" ] \
+     && git -C "$adopt_wt" ls-files --error-unmatch pushed.txt >/dev/null 2>&1 \
+     && grep -qF "$adopt_wt" "$WORK/g-run.out"; then
+    note "случай 15 (ветка только на origin): серверная голова усыновлена, путь напечатан — ОК"
+  else
+    note "случай 15: дерево не от серверной головы, чужой файл потерян или путь не напечатан — ОШИБКА"
+    fail=1
+  fi
+  grep -q "аренду здесь task-branch не берёт" "$WORK/g-run.stderr" \
+    || { note "случай 15: нет напоминания про ручную аренду доводки — ОШИБКА"; fail=1; }
+else
+  note "случай 15 (ветка только на origin): task-branch отказал — ОШИБКА, ожидалось усыновление"
+  cat "$WORK/g-run.stderr" >&2
   fail=1
 fi
 
