@@ -44,7 +44,9 @@ body:
       description: >-
         Номера issue через пробел (#123 #124) или «ничем» (эта запись тоже входит в
         пул воркера, метка task, #179 — граф зависимостей #361 её тоже касается).
-        Настоящая связь: python scripts/lib/task_deps.py block <эта#> <блокирующая#>.
+        Связь переносится в граф blockedBy автоматически ближайшим прогоном repo-ci
+        после мержа задачи (declared_deps.py wire); ручной запасной путь —
+        python scripts/lib/task_deps.py block <owner/repo> <эта#> <блокирующая#>.
       placeholder: "ничем"
     validations:
       required: true
