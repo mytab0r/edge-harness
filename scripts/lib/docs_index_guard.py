@@ -2,7 +2,7 @@
 """Гвардия «карта документации полна» (#670).
 
 Класс: `AGENTS.md` первым действием сессии предписывает читать `docs/INDEX.md`
-— «там карта всего, что уже исследовано» (docs/INDEX.md, строка 4). Документ
+— «там карта всего, что уже исследовано» (AGENTS.md, строка 7). Документ
 может физически лежать в репозитории и не быть достижим с карты — тогда
 агент, следующий этой инструкции, систематически не видит часть знания.
 Живой случай: ADR `docs/decisions/0015-clock-shift-freezegun.md` (PR #667) не
@@ -37,7 +37,11 @@
      файла где-то в тексте.
   2. Обратное: каждая локальная (не `http(s)://`, не якорь `#...`) ссылка
      `docs/INDEX.md` обязана резолвиться в существующий на диске файл —
-     битая карта хуже неполной.
+     битая карта хуже неполной. Ссылка, чей `..` уводит за пределы
+     репозитория (`../../GHOST-OUTSIDE.md`), тоже битая — файл внутри репо
+     там появиться не может; раньше такая ссылка тонула в том же `None`, что
+     честные внешние ссылки, и обратная проверка её не видела никогда
+     (живая улика второго гейта #673).
 
 Газ намеренного исключения — маркер `<!-- DOCS-INDEX-OK: <причина> -->`,
 начинающий строку файла документа (после пробелов). Пустая причина не
@@ -154,9 +158,16 @@ def _is_local_link(target: str) -> bool:
     return scheme in ("", "file")
 
 
-def _resolve_link(target: str, index_dir: Path = DOCS_DIR, repo_root: Path = REPO_ROOT) -> str | None:
-    """Ссылка `target` из docs/INDEX.md, резолвленная в repo-relative posix
-    путь. `None`, если ссылка внешняя/якорная (см. `_is_local_link`)."""
+def _resolve_link(target: str, index_dir: Path = DOCS_DIR, repo_root: Path = REPO_ROOT) -> tuple[str, bool] | None:
+    """Ссылка `target` из docs/INDEX.md. `None` — только для внешних
+    (http/https) и якорных ссылок (см. `_is_local_link`), они вне области
+    гвардии. Для остальных — `(display, resolves_in_repo)`: `display` —
+    repo-relative posix путь, если ссылка резолвится внутри `repo_root`;
+    иначе — исходный путь ссылки (после отбрасывания якоря), а
+    `resolves_in_repo` — `False`. Такая ссылка (`..` увела её за пределы
+    репозитория) битая всегда: файл внутри репо там появиться не может, и
+    раньше она терялась в том же `None`, что честные внешние ссылки — второй
+    гейт #673, живая улика `../../GHOST-OUTSIDE.md`."""
     if not _is_local_link(target):
         return None
     fragment_free = target.split("#", 1)[0]
@@ -164,21 +175,31 @@ def _resolve_link(target: str, index_dir: Path = DOCS_DIR, repo_root: Path = REP
         return None
     combined = (index_dir / fragment_free).resolve()
     try:
-        return combined.relative_to(repo_root.resolve()).as_posix()
+        return combined.relative_to(repo_root.resolve()).as_posix(), True
     except ValueError:
-        return None
+        return fragment_free, False
 
 
 def find_local_links(index_text: str) -> list[str]:
-    """Все локальные ссылки `docs/INDEX.md`, резолвленные в repo-relative
-    posix-пути (дубликаты сохраняются — вызывающему это не мешает, оба
-    потребителя работают с множествами/фильтрами)."""
-    resolved: list[str] = []
+    """Repo-relative posix-пути локальных ссылок `docs/INDEX.md`, резолвящихся
+    внутри репозитория (дубликаты сохраняются — вызывающему это не мешает,
+    оба потребителя работают с множествами/фильтрами). Ссылки, `..` которых
+    уводит за `repo_root`, сюда не входят — см. `find_escaped_links`."""
+    return [display for display, ok in _iter_resolved_links(index_text) if ok]
+
+
+def find_escaped_links(index_text: str) -> list[str]:
+    """Локальные ссылки `docs/INDEX.md`, чей `..` уводит за `repo_root` —
+    битые по определению (файл репозитория там появиться не может), не
+    пересекаются с `find_local_links` (второй гейт #673)."""
+    return [display for display, ok in _iter_resolved_links(index_text) if not ok]
+
+
+def _iter_resolved_links(index_text: str):
     for raw in _LINK_RE.findall(index_text):
-        target = _resolve_link(raw)
-        if target is not None:
-            resolved.append(target)
-    return resolved
+        resolved = _resolve_link(raw)
+        if resolved is not None:
+            yield resolved
 
 
 def build_report(repo_root: Path = REPO_ROOT, dirs: tuple[str, ...] = OBSERVED_DIRS,
@@ -219,9 +240,13 @@ def build_report(repo_root: Path = REPO_ROOT, dirs: tuple[str, ...] = OBSERVED_D
     # `../openspec/ghost/spec.md`) молча проходит зелёной, хотя докстринг
     # модуля обещает «каждая локальная ссылка обязана резолвиться в
     # существующий файл» без ограничения каталогами (второй гейт #673).
+    # Ссылки, `..` которых уводит за repo_root (`../../GHOST-OUTSIDE.md`),
+    # `find_local_links` не видит вовсе — они не репо-относительный путь, их
+    # обязан добавить find_escaped_links, иначе гвардия молча зеленеет на
+    # собственном отказе (тот же второй гейт #673).
     broken_links = sorted(
-        target for target in linked
-        if not (repo_root / target).is_file()
+        {target for target in linked if not (repo_root / target).is_file()}
+        | set(find_escaped_links(index_text))
     )
     return {
         "total": len(doc_files),

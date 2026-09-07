@@ -65,6 +65,24 @@ def test_find_local_links_strips_fragment_from_local_link():
     assert dig.find_local_links(text) == ["docs/decisions/0001-a.md"]
 
 
+def test_find_local_links_excludes_link_escaping_repo_root():
+    # Второй гейт #673, найденный после первого круга: ссылка, чей `..`
+    # уводит за repo_root, не репо-относительный путь — find_local_links её
+    # не должен возвращать (раньше терялась в одном `None` с внешними).
+    text = "- [Наружу](../../GHOST-OUTSIDE.md)\n"
+    assert dig.find_local_links(text) == []
+
+
+def test_find_escaped_links_reports_link_escaping_repo_root():
+    text = (
+        "- [ADR 1](decisions/0001-a.md)\n"
+        "- [Наружу](../../GHOST-OUTSIDE.md)\n"
+    )
+    assert dig.find_escaped_links(text) == ["../../GHOST-OUTSIDE.md"]
+    # Не пересекается с find_local_links.
+    assert "../../GHOST-OUTSIDE.md" not in dig.find_local_links(text)
+
+
 # ── Газ (легальные исключения) ─────────────────────────────────────────────
 
 def test_read_exemption_requires_non_empty_reason(tmp_path):
@@ -141,6 +159,22 @@ def test_build_report_flags_broken_link_outside_observed_dirs(tmp_path):
         "docs/api-ghost.md",
         "openspec/ghost/spec.md",
     ]
+
+
+def test_build_report_flags_link_escaping_repo_root(tmp_path):
+    # Второй гейт #673, найденный после первого круга: ссылка, чей `..`
+    # уводит за repo_root, раньше тонула в том же `None`, что честные внешние
+    # ссылки, и обратная проверка её не видела никогда (живая улика —
+    # `../../GHOST-OUTSIDE.md` на реальном docs/INDEX.md проходил exit 0).
+    index_md = _write_docs_fixture(
+        tmp_path,
+        "- [ADR 1](decisions/0001-a.md)\n"
+        "- [ADR 2](decisions/0002-b.md)\n"
+        "- [Наружу](../../GHOST-OUTSIDE.md)\n",
+    )
+    report = dig.build_report(tmp_path, ("docs/decisions",), index_md)
+    assert report["missing"] == []
+    assert report["broken_links"] == ["../../GHOST-OUTSIDE.md"]
 
 
 def test_build_report_exemption_suppresses_missing(tmp_path):
