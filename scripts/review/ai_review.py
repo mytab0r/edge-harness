@@ -248,8 +248,13 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
     промолчала».
 
     failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
-    ai_dsh.sh, #419), пробрасывается step-output'ами ai-review.yml в
-    verdict --failure-reason:
+    ai_dsh.sh, #419, либо cmd_gather при пустом диффе, #658), пробрасывается
+    step-output'ами ai-review.yml в verdict --failure-reason:
+      empty_diff                       — PR не несёт ни одного изменённого
+                                          файла (cmd_gather решил это ДО
+                                          вызова DSH вовсе, см. cmd_gather) —
+                                          сливать нечего, повтор на том же
+                                          head ничего не изменит.
       quota_exhausted                  — RATE_LIMIT: Weekly/Monthly Limit
                                           Exhausted, сброс через дни — ждать
                                           внутри прогона бессмысленно, ai_dsh.sh
@@ -261,6 +266,13 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
                                           RATE_LIMIT вовсе), либо контракт
                                           ответа (rc=0, формат нарушен).
     """
+    if failure_reason == "empty_diff":
+        return ("ревью не состоялось — дифф PR пуст (0 изменённых файлов), "
+                "сливать нечего: либо содержимое уже попало в main другим "
+                "путём (например update-branch подтянул main с идентичным "
+                "фиксом, живой случай #658), либо ветка отстала/совпала с "
+                "базой — повтор на этом же head ничего не изменит, нужно "
+                "либо закрыть PR, либо запушить реальные изменения")
     if failure_reason == "quota_exhausted":
         return (f"ревью не состоялось — квота провайдера исчерпана надолго "
                 f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
@@ -596,26 +608,55 @@ def task_section(pull: dict, repo: str) -> str:
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
+    # Постранично (#294): review_labels.list_pr_files — то же место правды,
+    # что и у check_pr.py; первая страница у PR за сотню файлов молча теряла
+    # хвост (недосчёт added, невидимая правка для diff_fingerprint в verdict).
+    # Проверяется ДО дорогого `gh pr diff`: список файлов — тот же признак
+    # «дифф пуст», что и пустой diff-пак, но дешевле (уже нужен ниже для
+    # added/listing) и не требует второго запроса.
+    files = review_labels.list_pr_files(repo, args.pr, gh)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if not files:
+        # Пустой дифф (живой факт #658, 2026-09-07: ветка forge/* слилась с
+        # main через update-branch ровно в момент, когда идентичный фикс уже
+        # попал в main другим PR — содержимое схлопнулось в ничто). Раньше
+        # здесь был RuntimeError: шаг падал красным ДО job'а verdict, тот
+        # никогда не запускался (needs job'а в статусе failure), PR оставался
+        # без единой ai:*-метки навсегда — и единственным газом было
+        # ограниченное число ручных/таймерных перезапусков (#196,
+        # AI_REVIEW_MAX_ATTEMPTS), каждый из которых падал ТЕМ ЖЕ образом
+        # (диагностировано: 4 прогона подряд, ни одного вердикта). Диагноз
+        # detected здесь никогда не изменится повторным прогоном — новый
+        # пуш в ветку сам заведёт свежее ревью, а таймерный повтор того же
+        # head бессмыслен. Терминальный исход — тот же файловый контракт,
+        # что уже использует ai_dsh.sh при транспортном отказе
+        # (failure_reason.txt/answer.txt, см. error_reason): job review
+        # остаётся зелёным, шаг «Ревью агентом (DSH)» ai-review.yml
+        # пропускается по этому же маркеру (steps.gather.outputs.empty_diff),
+        # a job verdict читает failure_reason=empty_diff и ставит ai:failed
+        # с ясной причиной — той же дорогой, которой уже идёт любой другой
+        # transport-отказ, без второй копии логики.
+        (out / "failure_reason.txt").write_text("empty_diff", encoding="utf-8")
+        (out / "answer.txt").write_text("", encoding="utf-8")
+        print(f"::warning::gather: PR #{args.pr} дифф пуст (0 изменённых файлов) — "
+              "сливать нечего, дорогой прогон DSH пропущен, вердикт уйдёт как "
+              "ai:failed с причиной empty_diff")
+        return 0
     diff_run = subprocess.run(
         ["gh", "pr", "diff", str(args.pr)],
         capture_output=True, text=True,
         env={**os.environ, "NO_COLOR": "1"},
     )
     if diff_run.returncode != 0 or not diff_run.stdout.strip():
-        # Пустой дифф-пак = ревью «ни о чём» с видом настоящего (silent wrong):
-        # отказ громкий, шаг красный.
+        # files непуст, а `gh pr diff` пуст/упал — это уже не «дифф пуст по
+        # факту», а отказ самого вызова (сеть/права): молчать тут нельзя.
         raise RuntimeError(f"gh pr diff {args.pr}: rc={diff_run.returncode}, "
-                           f"diff пуст: {diff_run.stderr.strip()[:200]}")
+                           f"diff пуст при непустом списке файлов: {diff_run.stderr.strip()[:200]}")
     diff = diff_run.stdout
-    # Постранично (#294): review_labels.list_pr_files — то же место правды,
-    # что и у check_pr.py; первая страница у PR за сотню файлов молча теряла
-    # хвост (недосчёт added, невидимая правка для diff_fingerprint в verdict).
-    files = review_labels.list_pr_files(repo, args.pr, gh)
     added = sum(f["additions"] for f in files)
     listing = "\n".join(f"{f['filename']} (+{f['additions']}/-{f['deletions']})" for f in files)
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     pack = out / "pack.txt"
     pack.write_text(f"FILES:\n{listing}\n\nADDITIONS: {added}\n\nDIFF:\n{diff}", encoding="utf-8")
 

@@ -329,6 +329,7 @@ jobs:
           node-version: 24
 
       - if: steps.fingerprint.outputs.go == 'true'
+        id: gather
         name: Сбор фактов и промпт (доверенный шаг)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -337,10 +338,20 @@ jobs:
           AI_WORK="$RUNNER_TEMP/ai-review"
           mkdir -p "$AI_WORK"
           python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
+          # Пустой дифф (#658): cmd_gather сам пишет failure_reason.txt=
+          # empty_diff и возвращает 0 (не падает) — этот шаг остаётся
+          # зелёным, а DSH-шаг ниже пропускается по этому же маркеру: дорогой
+          # вызов модели не имеет смысла звать на диффе, который никогда не
+          # станет непустым от повторного прогона.
+          if [ "$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')" = "empty_diff" ]; then
+            echo "empty_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty_diff=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # ── НЕдоверенный шаг: НИКАКОГО GitHub-токена в env ────────────────────
       # cwd = дерево PR (данные агента), сам транспорт — из main-чекаута.
-      - if: steps.fingerprint.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true' && steps.gather.outputs.empty_diff != 'true'
         name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

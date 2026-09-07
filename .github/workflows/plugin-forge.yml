@@ -517,6 +517,27 @@ jobs:
           # Валидируем манифест
           node dsh-edge/manifest.mjs >/dev/null || { echo "::error::Обновлённый манифест невалиден"; exit 1; }
 
+          # Гвардия пустого диффа (#658, живой факт 2026-09-07): между `git
+          # fetch origin main` выше и этим моментом окно гонки — секунды, не
+          # минуты, но не ноль: тот же фикс манифеста мог попасть в main
+          # ДРУГИМ путём (ручной PR, повторный форж того же плагина) буквально
+          # только что. Раньше PR открывался безусловно — живой итог (#658):
+          # авто-PR с содержимым, уже слитым в main через update-branch
+          # соседнего PR, `gh pr diff` пуст навсегда, ai-review.yml падал на
+          # пустом диффе четыре прогона подряд, а contract:failed (ветка
+          # forge/* не matчится agent/<N>-) не давал закрыть его штатно.
+          # Проверка на входе (AGENTS.md: «проверять на входе, а не
+          # постфактум»), а не в ai-review — не закрывает класс целиком (окно
+          # между этой строкой и push всё ещё секунды, не ноль), но резко
+          # сужает его: остаточную гонку добивает cmd_gather (empty_diff,
+          # scripts/review/ai_review.py).
+          if git diff --quiet -- dsh-edge/plugins.json; then
+            echo "Манифест уже содержит эту запись в main (id=$PLUGIN_ID v$PLUGIN_VERSION) — PR не нужен, пропускаю создание"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           git add dsh-edge/plugins.json
           # Многострочные тексты — через printf с явными \n, а не heredoc:
           # heredoc-тело без YAML-отступа обрывает блочный литерал run: | раньше
@@ -558,7 +579,11 @@ jobs:
           echo "✅ Форж завершён для плагина ${{ steps.validate.outputs.plugin_id }}"
           echo "Релиз: ${{ steps.release.outputs.release_tag }}"
           echo "Тарболл: ${{ steps.pack.outputs.asset }} (sha256: ${{ steps.pack.outputs.sha256 }})"
-          echo "PR: ${{ steps.pr.outputs.pr_url }}"
+          if [ -n "${{ steps.pr.outputs.pr_url }}" ]; then
+            echo "PR: ${{ steps.pr.outputs.pr_url }}"
+          else
+            echo "PR: не создан — манифест уже содержал эту запись в main (гвардия пустого диффа, #658)"
+          fi
           echo ""
           # Форж заканчивается на built (design.md, «Канал обновления и
           # статусы») — deploying/ready принадлежат каналу деплоя, а не

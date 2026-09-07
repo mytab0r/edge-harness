@@ -536,6 +536,55 @@ def test_error_reason_empty_failure_reason_keeps_old_behavior():
     assert "RATE_LIMIT" not in reason
 
 
+# ── Пустой дифф (#658, живой факт 2026-09-07): PR не несёт ни одного файла —
+# cmd_gather не должен падать RuntimeError'ом (job review красный, job
+# verdict никогда не запускается, PR остаётся без единой ai:*-метки навсегда,
+# живой прогон #658 упал так 4 раза подряд) — вместо этого терминальный исход
+# идёт тем же файловым контрактом, что и транспортный отказ DSH. ──────────────
+
+def test_error_reason_empty_diff_distinct_from_generic_transport():
+    reason = ai.error_reason("", "", "empty_diff")
+    assert "дифф PR пуст" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+    assert "исчерпана надолго" not in reason
+
+
+def test_cmd_gather_empty_diff_writes_terminal_failure_without_calling_gh_pr_diff(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def fake_gh(url: str):
+        assert url == "repos/o/r/pulls/658"
+        return {"title": "chore(plugins): обновить runner-bridge до v0.1.2",
+                "head": {"sha": "76913bd001", "ref": "forge/runner-bridge-v0.1.2"},
+                "user": {"login": "github-actions[bot]"}}
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: [])
+
+    def gh_pr_diff_must_not_run(*args, **kwargs):
+        raise AssertionError("gh pr diff не должен зваться на пустом списке файлов")
+
+    monkeypatch.setattr(ai.subprocess, "run", gh_pr_diff_must_not_run)
+
+    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    rc = ai.cmd_gather(args)
+
+    assert rc == 0
+    assert (tmp_path / "failure_reason.txt").read_text(encoding="utf-8") == "empty_diff"
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == ""
+    # Дорогой пак/промпт (то, что реально читает DSH) не строится вовсе —
+    # пустой дифф не доходит до промпта, только до терминального маркера.
+    assert not (tmp_path / "pack.txt").exists()
+    assert not (tmp_path / "prompt.md").exists()
+
+
+def test_ai_review_yml_skips_dsh_step_when_gather_reports_empty_diff():
+    # Мутация-гвардия: без этого условия DSH-шаг звался бы на пустом диффе
+    # каждый раз — терминальный маркер cmd_gather был бы бесполезен.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    assert "steps.gather.outputs.empty_diff != 'true'" in source
+
+
 def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
     # cmd_verdict считает reason только когда verdict == "error" (см. cmd_verdict) —
     # здесь фиксируем контракт самой функции error_reason: она не смотрит на
