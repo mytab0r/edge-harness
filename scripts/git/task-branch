@@ -139,6 +139,24 @@ print_digest() {
   print_infra_digest
 }
 
+# Сверка локальной ветки с origin/<branch> (находка ревью #333): локальная
+# голова могла отстать или разойтись с серверной — PR мог подвинуть другой
+# канал (оркестратор снимает исполнителя с конфликтного PR и диспатчит нового
+# воркера). Гвардия свежести в .githooks/pre-commit сверяет только origin/main
+# и этот стык не видит — коммит поверх чужой головы валился бы уже только на
+# пуше. Отказ — до работы, с командой синхронизации. Свои незапушенные коммиты
+# (origin — предок локальной головы) расхождением НЕ считаются: это штатная
+# середина работы держателя.
+branch_diverged_from_origin() {
+  git show-ref --verify -q "refs/remotes/origin/$branch" || return 1
+  local local_sha remote_sha
+  local_sha=$(git rev-parse "refs/heads/$branch")
+  remote_sha=$(git rev-parse "refs/remotes/origin/$branch")
+  [ "$local_sha" = "$remote_sha" ] && return 1
+  git merge-base --is-ancestor "$remote_sha" "$local_sha" && return 1
+  return 0
+}
+
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   # CI: одноразовый изолированный чекаут на прогон — worktree не нужен,
   # старое поведение (переключение в текущем каталоге) сохранено как есть.
@@ -187,6 +205,13 @@ else
 
   if [ -n "$existing_path" ]; then
     if [ -d "$existing_path" ]; then
+      if branch_diverged_from_origin; then
+        echo "ОШИБКА: локальная ветка $branch ($(git rev-parse --short "refs/heads/$branch")) разошлась с origin/$branch ($(git rev-parse --short "refs/remotes/origin/$branch"))." >&2
+        echo "  Её мог подвинуть другой канал — коммит поверх чужой головы не выдаю (класс #332/#333)." >&2
+        echo "  Синхронизируй дерево и повтори scripts/git/task-branch $task:" >&2
+        echo "    git -C \"$existing_path\" rebase origin/$branch" >&2
+        exit 1
+      fi
       echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
       echo "$existing_path"
       exit 0
@@ -217,6 +242,14 @@ else
       echo "Не переиспользую чужое место (класс #332) — перенеси ветку туда самостоятельно:" >&2
       echo "  git -C \"$checked_out_elsewhere\" switch - (вернуть исходную ветку)" >&2
       echo "  git worktree add \"$wt_dir\" $branch" >&2
+      exit 1
+    fi
+    if branch_diverged_from_origin; then
+      echo "ОШИБКА: локальная ветка $branch ($(git rev-parse --short "refs/heads/$branch")) разошлась с origin/$branch ($(git rev-parse --short "refs/remotes/origin/$branch"))." >&2
+      echo "  Её мог подвинуть другой канал — под дерево ставлю только свежую ветку (класс #332/#333)." >&2
+      echo "  Синхронизируйся и повтори scripts/git/task-branch $task:" >&2
+      echo "    git branch -f $branch origin/$branch   # своих коммитов на ветке нет/не нужны" >&2
+      echo "    git worktree add \"$wt_dir\" $branch && git -C \"$wt_dir\" rebase origin/$branch   # нужны — усынови сам и перенеси" >&2
       exit 1
     fi
     # Осиротела (нигде не зачекаучена) — заводим дерево на неё, не создавая

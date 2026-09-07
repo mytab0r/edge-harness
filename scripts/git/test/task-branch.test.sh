@@ -26,7 +26,13 @@
 #       без этого случая случай 10 (CI-режим task-branch) и
 #       worktree-guard.test.sh (гвардия вне CI) проверяют половины отдельно,
 #       а стык — коммит после CI-переключения под настоящим хуком — не
-#       покрывает никто.
+#       покрывает никто;
+#  12-14) сверка локальной ветки с origin/<branch> (находка ревью #333):
+#      12) ветку подвинул другой канал — переиспользование отказывает
+#          с командой синхронизации;
+#      13) то же на пути усыновления (дерево пропало с диска);
+#      14) свои незапушенные коммиты расхождением не считаются —
+#          переиспользование работает.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -445,7 +451,97 @@ else
   fail=1
 fi
 
+# ── сверка с origin/<branch> (находка ревью #333): ветку мог подвинуть другой ──
+# канал — оркестратор снимает исполнителя с конфликтного PR и диспатчит нового
+# воркера, локальная голова отстаёт от серверной. Гвардия свежести сверяет
+# только origin/main и этот стык не видит, коммит поверх чужой головы валился
+# бы уже на пуше — отказ обязан прозвучать ДО работы в дереве.
+# Мутация: сними сверку branch_diverged_from_origin в scripts/git/task-branch
+# (пути переиспользования и усыновления) — случаи 12/13 перестают отклоняться,
+# тест красный. Верни — снова зелёный. Случай 14 страхует обратное: свои
+# незапушенные коммиты (origin — предок локальной головы) отсекаться не должны.
+foreign_move() {
+  local clone="$1" branch="$2"
+  git clone -q "$WORK/$3" "$clone" 2>/dev/null
+  (
+    cd "$clone"
+    git config user.email rival@example.com
+    git config user.name rival
+    git checkout -q -b "$branch" "origin/$branch"
+    echo "rival move" >rival.txt
+    git add rival.txt
+    git commit -q -m "rival move"
+    git push -q origin "$branch"
+  )
+}
+
+# ── случай 12: подвинутая ветка — переиспользование отказывает ──────────────
+new_origin "d"
+git clone -q --branch main "$WORK/d-origin.git" "$WORK/d-main" 2>/dev/null
+(cd "$WORK/d-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
+  >"$WORK/d-run1.out" 2>&1 || { fail=1; note "случай 12: run1 упал:"; cat "$WORK/d-run1.out"; }
+git -C "$WORK/d-main" push -q origin agent/67-sync-reuse
+foreign_move "$WORK/d-rival" agent/67-sync-reuse "d-origin.git"
+git -C "$WORK/d-main" fetch -q origin
+if (cd "$WORK/d-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
+  >"$WORK/d-run2.out" 2>"$WORK/d-run2.stderr"; then
+  note "случай 12 (ветка подвинута другим каналом): переиспользование прошло — ОШИБКА, ожидался отказ"
+  fail=1
+else
+  case "$(cat "$WORK/d-run2.stderr")" in
+    *"разошлась"*) note "случай 12 (ветка подвинута другим каналом): отказ с командой синхронизации — ОК" ;;
+    *) note "случай 12: отказ без внятной причины — ОШИБКА ($(cat "$WORK/d-run2.stderr"))"; fail=1 ;;
+  esac
+fi
+
+# ── случай 13: та же сверка на пути усыновления (дерево пропало с диска) ────
+new_origin "e"
+git clone -q --branch main "$WORK/e-origin.git" "$WORK/e-main" 2>/dev/null
+(cd "$WORK/e-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
+  >"$WORK/e-run1.out" 2>&1 || { fail=1; note "случай 13: run1 упал:"; cat "$WORK/e-run1.out"; }
+git -C "$WORK/e-main" push -q origin agent/67-sync-adopt
+foreign_move "$WORK/e-rival" agent/67-sync-adopt "e-origin.git"
+# Дерево стёрто мимо `git worktree remove`: админ-запись чистится prune'ом
+# внутри скрипта, ветка остаётся — дальше путь усыновления.
+rm -rf "$WORK/e-main/.claude/worktrees/67-sync-adopt"
+git -C "$WORK/e-main" worktree prune
+git -C "$WORK/e-main" fetch -q origin
+if (cd "$WORK/e-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
+  >"$WORK/e-run2.out" 2>"$WORK/e-run2.stderr"; then
+  note "случай 13 (усыновление подвинутой ветки): прошло — ОШИБКА, ожидался отказ"
+  fail=1
+else
+  case "$(cat "$WORK/e-run2.stderr")" in
+    *"разошлась"*) note "случай 13 (усыновление подвинутой ветки): отказ с командой синхронизации — ОК" ;;
+    *) note "случай 13: отказ без внятной причины — ОШИБКА ($(cat "$WORK/e-run2.stderr"))"; fail=1 ;;
+  esac
+fi
+
+# ── случай 14: свои незапушенные коммиты — переиспользование работает ───────
+new_origin "f"
+git clone -q --branch main "$WORK/f-origin.git" "$WORK/f-main" 2>/dev/null
+(cd "$WORK/f-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
+  >"$WORK/f-run1.out" 2>&1 || { fail=1; note "случай 14: run1 упал:"; cat "$WORK/f-run1.out"; }
+ahead_wt=$(git -C "$WORK/f-main" worktree list --porcelain \
+  | awk '/^worktree /{p=$2} /^branch refs\/heads\/agent\/67-ahead$/{print p}')
+(
+  cd "$ahead_wt"
+  git config user.email test@example.com
+  git config user.name test
+  echo "own work" >own.txt
+  git add own.txt
+  env -u GITHUB_ACTIONS git commit -q -m "own unpushed work"
+)
+if (cd "$WORK/f-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
+  >"$WORK/f-run2.out" 2>&1 && grep -qF "$ahead_wt" "$WORK/f-run2.out"; then
+  note "случай 14 (свои незапушенные коммиты): дерево переиспользовано, путь напечатан — ОК"
+else
+  note "случай 14 (свои незапушенные коммиты): переиспользование отказало или путь потерян — ОШИБКА"
+  cat "$WORK/f-run2.out" 2>/dev/null
+  fail=1
+fi
+
 if [ "$fail" = 0 ]; then
-  echo "task-branch: все случаи входной проверки, работы с worktree и стыка с гвардией прошли как ожидалось"
+  echo "task-branch: все случаи входной проверки, работы с worktree, стыка с гвардией и сверки с origin прошли как ожидалось"
 fi
 exit "$fail"
