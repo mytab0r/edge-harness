@@ -666,13 +666,17 @@ bindings-значений и печатали их в лог — логи уда
   это архивация во внешнее хранилище, настраиваемая заранее, а не «покажи
   логи за последний час». Единственный способ увидеть логи в моменте —
   `wrangler tail` (WebSocket, интерактивно, не годится для CI).
-- **Живой расход по квотам простым GET не читается.** REST v4 отдаёт только
-  структуру ресурсов (bindings, деплои, namespaces), не счётчики
-  requests/duration/rows_read. Это отдельный GraphQL Analytics API
-  (`POST /client/v4/graphql`) с отдельным правом токена (Account Analytics);
-  схему намеренно не реализовывали вслепую — риск сломанного запроса дороже
-  пользы недоказанной абстракции. Статические лимиты плана — таблицы выше в
-  этом файле; факт исчерпания конкретной квоты (`rows_read` DO) — задача #320.
+- **Живой расход по квотам простым GET не читается — читается через GraphQL
+  Analytics тем же токеном.** REST v4 отдаёт только структуру ресурсов
+  (bindings, деплои, namespaces), не счётчики. Счётчики — `POST
+  /client/v4/graphql`, и право Account Analytics Read у
+  `CLOUDFLARE_API_TOKEN` уже есть: прогон 2026-09-05 доказал это живым
+  замером, а не допущением (`scripts/measure/do_rows_read.py` интроспекцией
+  нашёл датасет `durableObjectsPeriodicGroups` — раздел «Замер факта:
+  rows_read в проде» выше, run 33975023605). rows_read/rows_written DO
+  снимает этот скрипт (`python scripts/measure/do_rows_read.py --days N`);
+  не подтверждено: датасеты requests и GB-s duration — инструмента под них
+  ещё нет. Статические лимиты плана — таблицы выше в этом файле.
 - **`/accounts/{account_id}/workers/scripts/{name}/settings` — рабочий способ
   узнать имена bindings** без раскрытия значений: `type: "secret_text"` для
   секретов, `type: "plain_text"`/`"assets"`/`"durable_object_namespace"` для

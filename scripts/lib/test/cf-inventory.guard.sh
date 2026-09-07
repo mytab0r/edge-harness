@@ -185,6 +185,23 @@ else
   fi
 fi
 
+# 10: обход allowlist через dot-сегменты — отказ ДО сети (ревью PR #328:
+# curl схлопывает `../`, гейт по литеральной строке матчит наш воркер, а по
+# сети путь уходит account-wide, класс инцидента 2026-09-05). Команда здесь
+# может упасть только на гейте: дальше curl-стаб отвечает success:true, т.е.
+# дойди путь до cf_get — код возврата был бы нулевым.
+for traversal in \
+  "/accounts/test-acct/workers/scripts/edge-harness/../../zones" \
+  "/accounts/test-acct/workers/scripts/edge-harness//settings"; do
+  if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "$traversal" 2>&1); then
+    echo "::error::api.sh пропустил путь с dot-сегментами/двойным слешем (обход allowlist): $traversal"
+    fail=1
+  elif ! grep -q "ОТКАЗ" <<<"$out"; then
+    echo "::error::api.sh отказал на $traversal без внятной причины «ОТКАЗ»: $out"
+    fail=1
+  fi
+done
+
 rm -rf "$curl_stub_dir"
 
 # 9: status.sh не хардкодит имена воркеров вне цикла по $CF_OWN_WORKERS —
@@ -204,6 +221,6 @@ if [ -n "$hardcoded" ]; then
 fi
 
 if [ "$fail" = 0 ]; then
-  echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт и allowlist api.sh — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
+  echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт, allowlist api.sh и отказ на dot-сегментах — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
 fi
 exit "$fail"

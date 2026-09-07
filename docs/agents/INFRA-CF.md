@@ -50,13 +50,18 @@ plain_text bindings в лог — их логи удалены (ревью PR #3
 | Зоны/домены (`/zones`, не account-scoped) | проверено | **0 зон во всём аккаунте** — закрывает issue #289: своего домена у CF-аккаунта нет |
 | Logpush jobs (`/accounts/{account_id}/logpush/jobs`) | **нет доступа** | HTTP 403 "Authentication error" — токену не хватает права **Logs Read** |
 | Живые логи воркера в моменте | доступно вне API | `npx wrangler tail edge-harness` из `cf-worker/` — WebSocket, интерактивно, не для CI |
-| Расход по квотам (requests/duration/rows_read) | **не проверено намеренно** | простым GET не отдаётся; нужен GraphQL Analytics API (`POST /client/v4/graphql`, право **Account Analytics**) — схему вслепую не гадаем, см. ниже |
+| Расход DO rows_read/rows_written | проверено | простым GET не отдаётся — читается через GraphQL Analytics (`POST /client/v4/graphql`) тем же токеном: `python scripts/measure/do_rows_read.py --days N` (задача #320; прогоны 2026-09-05 — раздел «Замер факта: rows_read в проде» в [research/20](../research/20-cloudflare-free.md)) |
+| Расход requests/GB-s (duration) | **не подтверждено** | другим датасетом GraphQL инструмент ещё не написан; снимается интроспекцией схемы тем же методом, что в `scripts/measure/do_rows_read.py` (см. «не подтверждено» в research/20) |
 | Статические лимиты Free-плана | см. research | [docs/research/20-cloudflare-free.md](../research/20-cloudflare-free.md) |
 
 **Каких прав не хватает токену** (выдать владельцу, если понадобится):
 - **Logs Read** — чтобы видеть, настроен ли Logpush и куда льются логи.
-- **Account Analytics Read** — чтобы читать живой расход (requests, GB-s,
-  rows_read/written) через GraphQL, а не только статические лимиты плана.
+
+Право **Account Analytics Read** у токена уже есть — иначе не прошли бы живые
+замеры `scripts/measure/do_rows_read.py` (GraphQL Analytics тем же
+`CLOUDFLARE_API_TOKEN`, прогоны 2026-09-05 в research/20). Вносить его в
+«не хватает» — ошибка: агент уйдёт думать, что расход нечитаем, и
+переизобретёт готовое (находка ревью PR #328).
 
 ## Чем узнать состояние
 
