@@ -212,7 +212,12 @@ def test_archive_rpc_failure_is_hard_failure(monkeypatch):
     assert any("сломана" in line for line in lines)
 
 
-# ── append_session_notes (#480): заметки-итоги в сессии harness-<N> ──────────────
+# ── append_session_notes (#480/#629): заметки-итоги в сессии harness-<N> ─────────
+# #629: канал целиком best-effort — недоставленная заметка не красит вызывающую
+# стадию (мерж/приёмка/возврат в пул уже случились и не откатываются), только
+# ⚠️-строка в отчёте + best-effort эскалация через _report_session_note_loss
+# (см. отдельный блок тестов ниже). Сигнатура возвращает только list[str] —
+# никакого "жёсткого сбоя" из этой функции больше не существует вовсе.
 
 
 def test_append_session_notes_empty_list_makes_zero_network_calls(monkeypatch):
@@ -225,20 +230,21 @@ def test_append_session_notes_empty_list_makes_zero_network_calls(monkeypatch):
         raise AssertionError("не должно вызываться на пустом списке заметок")
 
     monkeypatch.setattr(sch, "_morde_opener", boom)
-    lines, hard = sch.append_session_notes([])
+    lines = sch.append_session_notes("o/r", [])
     assert lines == []
-    assert hard is False
 
 
-def test_append_session_notes_no_config_is_not_hard_failure(monkeypatch):
+def test_append_session_notes_no_config_returns_no_lines(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "")
-    lines, hard = sch.append_session_notes([(5, "заметка")])
+    lines = sch.append_session_notes("o/r", [(5, "заметка")])
     assert lines == []
-    assert hard is False
 
 
-def test_append_session_notes_login_failure_is_hard_failure(monkeypatch):
+def test_append_session_notes_login_failure_is_warning_not_hard_failure(monkeypatch):
+    # #629: раньше эта строка красила вызывающую стадию (🚨 + hard=True) —
+    # теперь best-effort: ⚠️ в отчёте, но никакого сигнала "жёстко" наружу
+    # (сигнатура вообще не возвращает такой сигнал).
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
 
@@ -246,14 +252,14 @@ def test_append_session_notes_login_failure_is_hard_failure(monkeypatch):
         raise RuntimeError("логин в морду не удался: HTTP 403")
 
     monkeypatch.setattr(sch, "_morde_login", broken_login)
-    lines, hard = sch.append_session_notes([(5, "заметка")])
-    assert hard is True
+    monkeypatch.setattr(sch, "_report_session_note_loss", lambda repo, failures: None)
+    lines = sch.append_session_notes("o/r", [(5, "заметка")])
     assert any("сломана" in line for line in lines)
+    assert all(line.startswith("⚠️") for line in lines)  # не 🚨
 
 
-def test_append_session_notes_session_not_found_is_not_hard_failure(monkeypatch):
-    # Задача без раннера (ручной PR) — норма, не ошибка: строка не появляется,
-    # прогон не красится.
+def test_append_session_notes_session_not_found_returns_no_lines(monkeypatch):
+    # Задача без раннера (ручной PR) — норма, не ошибка: строка не появляется.
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
@@ -261,12 +267,11 @@ def test_append_session_notes_session_not_found_is_not_hard_failure(monkeypatch)
         sch, "_morde_ingest",
         lambda opener, session_id, events: (_ for _ in ()).throw(RuntimeError("HTTP 404: Session not found.")),
     )
-    lines, hard = sch.append_session_notes([(5, "заметка")])
+    lines = sch.append_session_notes("o/r", [(5, "заметка")])
     assert lines == []
-    assert hard is False
 
 
-def test_append_session_notes_ingest_failure_is_hard_failure(monkeypatch):
+def test_append_session_notes_ingest_failure_is_warning_not_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
@@ -274,9 +279,39 @@ def test_append_session_notes_ingest_failure_is_hard_failure(monkeypatch):
         sch, "_morde_ingest",
         lambda opener, session_id, events: (_ for _ in ()).throw(RuntimeError("HTTP 400: unknown event type")),
     )
-    lines, hard = sch.append_session_notes([(5, "заметка")])
-    assert hard is True
+    monkeypatch.setattr(sch, "_report_session_note_loss", lambda repo, failures: None)
+    lines = sch.append_session_notes("o/r", [(5, "заметка")])
     assert any("сломана" in line for line in lines)
+    assert all(line.startswith("⚠️") for line in lines)
+
+
+def test_append_session_notes_ingest_failure_prod_form_500_is_best_effort(monkeypatch):
+    """#629: живая улика — прогон orchestra.yml
+    https://github.com/mytab0r/edge-harness/actions/runs/34121435493 упал на
+    этом самом теле ответа, дословно `HTTP 500: {"ok":false,"error":"Internal
+    runtime error."}`. Кормим ИМЕННО этим телом через настоящий _morde_ingest
+    (не через мок самой функции ingest) — доказывает разбор прод-формы, а не
+    наш пересказ. Мутация: верни append_session_notes к возврату
+    (lines, hard_failure) с hard=True здесь — тест не соберётся (сигнатура)
+    или, если сигнатуру сохранят, но добавят 🚨 — упадёт на assert ⚠️."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 500, "Internal Server Error", None,
+                io.BytesIO(b'{"ok":false,"error":"Internal runtime error."}'))
+
+    monkeypatch.setattr(sch, "_morde_opener", lambda: _FakeOpener())
+    reported = []
+    monkeypatch.setattr(sch, "_report_session_note_loss", lambda repo, failures: reported.append(failures))
+    lines = sch.append_session_notes("o/r", [(529, "заметка")])
+    assert lines  # предупреждение есть
+    assert all(line.startswith("⚠️") for line in lines)  # НЕ 🚨 — прогон не красится
+    assert any('Internal runtime error' in line for line in lines)
+    assert reported == [lines]  # улика ушла на дедуп-эскалацию
 
 
 def test_append_session_notes_one_login_for_several_notes(monkeypatch):
@@ -291,8 +326,7 @@ def test_append_session_notes_one_login_for_several_notes(monkeypatch):
         sch, "_morde_ingest",
         lambda opener, session_id, events: ingested.append((session_id, events)) or {"appended": 1, "lastSeq": 1},
     )
-    lines, hard = sch.append_session_notes([(5, "первая"), (7, "вторая")])
-    assert hard is False
+    lines = sch.append_session_notes("o/r", [(5, "первая"), (7, "вторая")])
     assert lines == []
     assert len(login_calls) == 1
     assert [sid for sid, _ in ingested] == ["harness-5", "harness-7"]
@@ -314,7 +348,7 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
         return {"appended": len(events), "lastSeq": len(events)}
 
     monkeypatch.setattr(sch, "_morde_ingest", fake_ingest)
-    sch.append_session_notes([(480, "🔀 PR #1 слит в main.")])
+    sch.append_session_notes("o/r", [(480, "🔀 PR #1 слит в main.")])
     assert captured["session_id"] == "harness-480"
     assert len(captured["events"]) == 1
     event = captured["events"][0]
@@ -370,6 +404,60 @@ def test_morde_ingest_http_error_is_loud_runtime_error(monkeypatch):
         sch._morde_ingest(_FakeOpener(), "harness-5", [{"type": "hacker/event", "data": {}}])
 
 
+# ── _report_session_note_loss (#629): улика потери, не тихий сток ────────────────
+# Требование задачи: недоставленная заметка обязана оставлять след, по
+# которому видно, сколько раз и по каким задачам лог не дописан — но НЕ ценой
+# спама на каждый пульс оркестратора (~раз в 10 минут) во время долгой
+# недоступности морды. Дедуп — один escalate() (комментарий #120 + Telegram)
+# за календарные UTC-сутки, тот же канал, что #119/#120/#174 (не второй сток).
+
+
+def test_report_session_note_loss_escalates_when_not_signalled_today(monkeypatch):
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": []}))
+    sch._report_session_note_loss("o/r", ["⚠️ #529: лог итогов не дописан в сессию harness-529: HTTP 500"])
+    assert len(escalated) == 1
+    repo, issue_n, text = escalated[0]
+    assert issue_n == sch.WATCHDOG_ISSUE
+    assert sch.SESSION_NOTE_LOSS_MARKER in text
+    assert "#529" in text
+
+
+def test_report_session_note_loss_does_not_spam_same_utc_day(monkeypatch):
+    # Уже кричали сегодня — второй раз в те же сутки не эскалируем (иначе
+    # долгая недоступность морды слала бы Telegram/комментарий на каждый
+    # пульс, не на эпизод).
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    comments = [{"created_at": now_iso, "body": f"⚠️ edge-harness: {sch.SESSION_NOTE_LOSS_MARKER}\nуже кричали"}]
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": comments}))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать повторно в те же сутки"))
+    sch._report_session_note_loss("o/r", ["⚠️ #1: ..."])
+
+
+def test_report_session_note_loss_escalates_again_next_utc_day(monkeypatch):
+    # Новые сутки — новый эпизод: маркер вчерашнего дня не должен глушить сигнал.
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    comments = [{"created_at": yesterday, "body": f"⚠️ edge-harness: {sch.SESSION_NOTE_LOSS_MARKER}\nвчера"}]
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": comments}))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append(text) or "ок")
+    sch._report_session_note_loss("o/r", ["⚠️ #1: ..."])
+    assert len(escalated) == 1
+
+
+def test_report_session_note_loss_does_not_raise_when_marker_history_unreadable(monkeypatch):
+    # Сбой чтения истории #120 (сеть/gh) не должен ронять вызывающую стадию —
+    # она и так уже best-effort; тихий warning в лог, без escalate вслепую.
+    def boom(*args):
+        raise AssertionError(f"gh не должен вызываться напрямую: {args}")
+
+    monkeypatch.setattr(sch, "issue_marker_times", lambda repo, n, marker: (_ for _ in ()).throw(
+        RuntimeError("gh api repos/o/r/issues/120/comments: HTTP 502")))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать вслепую при сбое чтения"))
+    sch._report_session_note_loss("o/r", ["⚠️ #1: ..."])  # не должен бросить исключение
+
+
 # ── after_merge/accept_merged_tasks/unhealthy_pulls: проводка заметок (#480) ─────
 
 
@@ -392,10 +480,12 @@ def test_after_merge_appends_session_note_for_each_declared_task(monkeypatch):
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        captured["notes"] = notes
+        return []
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
     sch.after_merge("o/r", merged, [])
     assert captured["notes"] == [(91, "🔀 PR #9 слит в main.")]
 
@@ -422,14 +512,17 @@ def test_after_merge_appends_session_note_before_archiving(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (order.append("note") and []) or ([], False),
-    )
-    monkeypatch.setattr(
-        sch, "archive_runner_sessions",
-        lambda numbers: (order.append("archive") and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        order.append("note")
+        return []
+
+    def fake_archive_runner_sessions(numbers):
+        order.append("archive")
+        return [], False
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
+    monkeypatch.setattr(sch, "archive_runner_sessions", fake_archive_runner_sessions)
     sch.after_merge("o/r", merged, [])
     assert order == ["note", "archive"]
 
@@ -450,8 +543,8 @@ def test_after_merge_skips_session_note_when_no_task_numbers(monkeypatch):
             return {"pull_request": {}, "state": "open", "labels": []}  # это PR, не задача пула
         raise AssertionError(f"нет маршрута для: {joined}")
 
-    def boom(notes):
-        raise AssertionError("append_session_notes не должен вызываться без task_numbers")
+    def boom(*args):
+        raise AssertionError("append_session_notes/archive_runner_sessions не должен вызываться без task_numbers")
 
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
@@ -461,16 +554,65 @@ def test_after_merge_skips_session_note_when_no_task_numbers(monkeypatch):
     sch.after_merge("o/r", merged, [])  # не должен упасть
 
 
+def test_after_merge_hard_failure_from_archive_survives_concurrent_note_failure(monkeypatch):
+    """#629 регресс-гвардия направления (б): настоящая поломка АРХИВАЦИИ
+    сессии обязана красить прогон, даже когда заметка-итог В ТУ ЖЕ МИНУТУ
+    тоже не доставлена (реалистичный случай — обе бьют в одну и ту же
+    морду). Кормим прод-формой 500 (см. append_session_notes) — доказывает,
+    что best-effort заметки не гасит и не подменяет настоящий hard_failure
+    архивации. Мутация: если кто-то сделает note-провал доминирующим (или
+    вернёт OR с note_hard_failure), этот тест либо перестанет собираться
+    (сигнатура append_session_notes), либо покраснеет на assert hard True."""
+    merged = pull(9, ref="agent/91-x", pr_body="#91")
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/9/files?per_page=100&page=1",
+                      "repos/o/r/pulls/9/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/91":
+            return {**issue(91, assignees=("mytab0r",), title="т"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(
+        sch, "archive_runner_sessions",
+        lambda numbers: (["🚨 #91: сессия не заархивирована (возможность сломана): HTTP 500"], True))
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 500, "Internal Server Error", None,
+                io.BytesIO(b'{"ok":false,"error":"Internal runtime error."}'))
+
+    monkeypatch.setattr(sch, "_morde_opener", lambda: _FakeOpener())
+    monkeypatch.setattr(sch, "_report_session_note_loss", lambda repo, failures: None)
+
+    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert hard_failure is True  # архив по-прежнему красит прогон
+    assert any(a.startswith("⚠️") and "Internal runtime error" in a for a in actions)  # заметка рядом — best-effort
+
+
 def test_accept_merged_tasks_ok_close_appends_session_note(monkeypatch):
     task = issue(320, title="т")
     merged_pr = pull(9, pr_body="#320")
     merged_pr["merged_at"] = "2026-09-01T00:00:00Z"
     merged_pr["head"] = {"sha": "deadbeef"}
     captured = {}
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        captured["notes"] = notes
+        return []
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
     monkeypatch.setattr(sch, "classify_acceptance", lambda filenames: sch.ACCEPT_SCRIPT)
     monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("ok", "тесты зелёные"))
     patch_gh(monkeypatch, FakeGh({
@@ -485,16 +627,59 @@ def test_accept_merged_tasks_ok_close_appends_session_note(monkeypatch):
     assert captured["notes"] == [(320, "✅ Задача #320 закрыта приёмкой (script): тесты зелёные.")]
 
 
+def test_accept_merged_tasks_ok_close_survives_prod_form_500_session_note_failure(monkeypatch):
+    """#629, доказательство направления (а): обход пула и очередь слияний
+    доходят до конца ДАЖЕ когда морда отвечает прод-формой 500 на дозапись
+    заметки-итога — задача закрывается приёмкой, прогон не красится,
+    предупреждение остаётся видимым в отчёте. Кормим настоящим телом
+    прод-500 (не мокаем append_session_notes целиком) — тот же live-факт,
+    что и в отдельном юнит-тесте append_session_notes, но здесь сквозь
+    реальную проводку accept_merged_tasks."""
+    task = issue(320, title="т")
+    merged_pr = pull(9, pr_body="#320")
+    merged_pr["merged_at"] = "2026-09-01T00:00:00Z"
+    merged_pr["head"] = {"sha": "deadbeef"}
+    monkeypatch.setattr(sch, "classify_acceptance", lambda filenames: sch.ACCEPT_SCRIPT)
+    monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("ok", "тесты зелёные"))
+    patch_gh(monkeypatch, FakeGh({
+        "repos/o/r/pulls/9/files": [],
+        "issues/320/comments": [],
+        "-X PATCH repos/o/r/issues/320": {},
+        "task-320": "🔓 замок task-320 снят",
+    }))
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 500, "Internal Server Error", None,
+                io.BytesIO(b'{"ok":false,"error":"Internal runtime error."}'))
+
+    monkeypatch.setattr(sch, "_morde_opener", lambda: _FakeOpener())
+    monkeypatch.setattr(sch, "_report_session_note_loss", lambda repo, failures: None)
+
+    observations, actions, hard = sch.accept_merged_tasks(
+        "o/r", [task], {320: merged_pr}, utc(2026, 9, 2, 0, 0), open_pulls_list=[])
+
+    assert hard is False  # приёмка закрыла задачу — прогон не покрашен
+    assert any("закрыта приёмкой" in a for a in actions)  # работа доведена до конца
+    assert any(a.startswith("⚠️") and "Internal runtime error" in a for a in actions)  # предупреждение есть
+
+
 def test_accept_merged_tasks_fail_appends_session_note(monkeypatch):
     task = issue(321, title="т")
     merged_pr = pull(9, pr_body="#321")
     merged_pr["merged_at"] = "2026-09-01T00:00:00Z"
     merged_pr["head"] = {"sha": "deadbeef"}
     captured = {}
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        captured["notes"] = notes
+        return []
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
     monkeypatch.setattr(sch, "classify_acceptance", lambda filenames: sch.ACCEPT_SCRIPT)
     monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("fail", "тест провален"))
     patch_gh(monkeypatch, FakeGh({
@@ -513,10 +698,12 @@ def test_unhealthy_pulls_appends_session_note(monkeypatch):
     task = issue(50)
     p = pull(9, labels=(sch.review_labels.AI_CHANGES,), updated_at="2026-09-02T00:00:00Z", pr_body="#50")
     captured = {}
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        captured["notes"] = notes
+        return []
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
     patch_gh(monkeypatch, FakeGh({
         "-X DELETE repos/o/r/issues/50/assignees": {},
         "-X POST repos/o/r/issues/50/comments": {},
@@ -532,10 +719,12 @@ def test_unhealthy_pulls_calls_append_session_notes_with_empty_list_when_queue_e
     # ходит в сеть на пустом списке (см. её отдельный тест), проверяем здесь
     # только то, что unhealthy_pulls не собрала ложных заметок.
     captured = {}
-    monkeypatch.setattr(
-        sch, "append_session_notes",
-        lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
-    )
+
+    def fake_append_session_notes(repo, notes):
+        captured["notes"] = notes
+        return []
+
+    monkeypatch.setattr(sch, "append_session_notes", fake_append_session_notes)
     lines = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [], pool=[])
     assert lines == []
     assert captured["notes"] == []

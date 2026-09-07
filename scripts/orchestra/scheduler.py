@@ -1436,29 +1436,73 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
 # намеренно вне скоупа: то и другое либо уже видно живым транскриптом (агент
 # сам вызывает `gh pr create` внутри хода), либо секунды спустя сменяется
 # слиянием — отдельное отслеживание потребовало бы нового маркера/опроса.
-def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]:
+#
+# Best-effort целиком (#629): морда здесь — сторонняя ручка НАБЛЮДАЕМОСТИ уже
+# сделанной работы (мерж/приёмка/возврат в пул случились и не откатываются),
+# не сама работа — дилеммы «сделано или нет» тут нет. До #629 недоставленная
+# заметка красила прогон (жёсткий сбой этой функции доезжал до archive_hard_failure
+# в after_merge и до accept_hard_failure в accept_merged_tasks) — сторонний
+# 500 от эндпоинта приёма (морда поднимает полноценного LLM-агента только
+# ради пассивной строки лога) вставал в обход пула и очередь слияний целиком:
+# 2026-09-07 74 слияния/сутки упали до 6 за то же время следующего дня.
+SESSION_NOTE_LOSS_MARKER = "[session-notes: доставка сломана]"
+
+
+def _report_session_note_loss(repo: str, failures: list[str]) -> None:
+    """Улика потери (не тихий сток в один только GITHUB_STEP_SUMMARY — тот
+    класс дефекта отдельно заведён, #610/#637): один комментарий+Telegram
+    (`escalate`, тот же канал, что #119/#120/#174) на календарные UTC-сутки —
+    без throttle'а долгая недоступность морды слала бы сигнал на каждый пульс
+    (~раз в 10 минут). `escalate` сама best-effort и не бросает исключений;
+    единственный сбой, который здесь может случиться — чтение истории #120
+    для дедупликации, и он тоже не должен ронять вызывающую стадию."""
+    today = datetime.now(timezone.utc).date()
+    try:
+        signalled_today = any(
+            when.date() == today
+            for when in issue_marker_times(repo, WATCHDOG_ISSUE, SESSION_NOTE_LOSS_MARKER)
+        )
+    except RuntimeError as error:
+        print(f"::warning::эскалация потери session-notes не проверена на повтор — {error}", file=sys.stderr)
+        return
+    if signalled_today:
+        return
+    escalate(
+        repo, WATCHDOG_ISSUE,
+        f"⚠️ edge-harness: {SESSION_NOTE_LOSS_MARKER}\n"
+        "Лог итогов сессии раннера не дописан в морду dsh-edge (best-effort, "
+        "#629) — мерж/приёмка/возврат в пул уже случились и не откатываются, "
+        "это только потеря наблюдаемости чужой работы. За этот прогон:\n"
+        + "\n".join(failures),
+    )
+
+
+def append_session_notes(repo: str, notes: list[tuple[int, str]]) -> list[str]:
     """notes — [(номер задачи, текст заметки), …], собранные вызывающей
     функцией за ОДИН проход (не по одной заметке): один логин в морду на весь
     вызов, а не на каждую задачу. Пустой список — ноль сетевых вызовов вовсе
     (гвардия холостого хода, тот же приём, что stale_ready_pulls).
 
-    Возвращает (строки отчёта, был_ли_жёсткий_сбой) — тот же контракт, что
-    archive_runner_sessions: сессии нет (задача без раннера, например
-    ручной PR) — норма, не ошибка; сама морда недоступна — возможность
-    сломана, сигнал громкий, но не валит вызывающую стадию (мерж/приёмка уже
-    состоялись и не откатываются)."""
+    Возвращает строки отчёта — БЕЗ жёсткого сбоя (#629, см. блок комментариев
+    выше): сессии нет (задача без раннера, например ручной PR) — норма, не
+    ошибка; сама морда недоступна или ingest упал (в т.ч. HTTP 500 от чужого
+    бутстрапа LLM-агента приёма) — возможность сломана, сигнал громкий
+    (⚠️ в отчёте + `_report_session_note_loss`), но вызывающую стадию не
+    красит: мерж/приёмка/возврат в пул уже состоялись и не откатываются."""
     if not notes:
-        return ([], False)
+        return []
     if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
-        return ([], False)  # см. archive_runner_sessions — конфигурации нет, канал просто пуст
+        return []  # см. archive_runner_sessions — конфигурации нет, канал просто пуст
     try:
         opener = _morde_opener()
         _morde_login(opener)
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
-        return ([f"🚨 морда dsh-edge недоступна для лога итогов сессии (возможность сломана, не отсутствует): {error}"],
-                True)
+        line = (f"⚠️ морда dsh-edge недоступна для лога итогов сессии "
+                f"(возможность сломана, best-effort — #629): {error}")
+        _report_session_note_loss(repo, [line])
+        return [line]
     lines: list[str] = []
-    hard_failure = False
+    failures: list[str] = []
     for number, text in notes:
         session_id = f"harness-{number}"
         event = {
@@ -1473,12 +1517,18 @@ def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]
         except RuntimeError as error:
             if "HTTP 404" in str(error):
                 continue  # сессии раннера в морде нет — писать некуда, это норма
-            lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
-            hard_failure = True
+            line = (f"⚠️ #{number}: лог итогов не дописан в сессию {session_id} "
+                    f"(возможность сломана, best-effort — #629): {error}")
+            lines.append(line)
+            failures.append(line)
         except (OSError, ValueError) as error:
-            lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
-            hard_failure = True
-    return lines, hard_failure
+            line = (f"⚠️ #{number}: лог итогов не дописан в сессию {session_id} "
+                    f"(возможность сломана, best-effort — #629): {error}")
+            lines.append(line)
+            failures.append(line)
+    if failures:
+        _report_session_note_loss(repo, failures)
+    return lines
 
 
 def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
@@ -1734,12 +1784,11 @@ def after_merge(
         # Дописывается ДО архива (находка ревью PR #489: обратный порядок
         # льёт заметку в уже заархивированную сессию — комбинацию, которую
         # design.md прямо называет непроверенной живьём).
-        note_lines, note_hard_failure = append_session_notes(
-            [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
+        note_lines = append_session_notes(
+            repo, [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
         actions += note_lines
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
-        hard_failure = hard_failure or note_hard_failure
     # Чеклист некритичных замечаний ревью (#462, третья категория находок):
     # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
     # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
@@ -2472,7 +2521,7 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
             session_notes.append(
                 (number, f"♻️ Задача #{number} возвращена в пул: PR #{pull['number']} нездоров ({reason})."))
             break  # одной причины на задачу достаточно — не дублируем комментарии
-    note_lines, _note_hard_failure = append_session_notes(session_notes)
+    note_lines = append_session_notes(repo, session_notes)
     lines += note_lines
     return lines
 
@@ -3514,9 +3563,8 @@ def accept_merged_tasks(
             actions.append(f"⚠️ замок task-{number} не снят: {error}")
         actions.append(f"♻️ #{number}: не закрыта, улика ({category}) провалена — {detail}")
         session_notes.append((number, f"♻️ Задача #{number} не закрыта приёмкой ({category}) — {detail}."))
-    note_lines, note_hard_failure = append_session_notes(session_notes)
+    note_lines = append_session_notes(repo, session_notes)
     actions += note_lines
-    hard_failure = hard_failure or note_hard_failure
     return observations, actions, hard_failure
 
 
