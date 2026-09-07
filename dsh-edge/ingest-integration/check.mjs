@@ -41,12 +41,23 @@ const { unstable_dev } = standaloneRequire('wrangler')
 // настоящих секретов нет (локальный unstable_dev).
 const AUTH_DUMMY = ['ingest-check', 'owner', 'access', 'key-0123456789abcdef'].join('-')
 const persistedState = mkdtempSync(join(tmpdir(), 'dsh-edge-ingest-check-'))
+// #572: DEEPSEEK_MODEL was absent here, so this check silently ran with
+// session-store.ts's own default id ('deepseek-v4-flash') everywhere the
+// deployment names a model — the one config drift that let a real prod
+// mismatch (deploy-dsh-edge.yml repoints the compiled model catalog to
+// vars.DSH_EDGE_MODEL_CATALOG, glm-* here, AFTER this literal is baked into
+// the bundle) go unnoticed by this test for the whole time #572 was live.
+// Pinned to the repo's actual `gh variable list` value so this check's
+// config shape matches what deploy-dsh-edge.yml actually ships, not a
+// same-as-upstream-default stand-in.
+const DEPLOYED_MODEL = 'glm-5.3-flash'
 const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
   config: writeConfig(persistedState),
   env: '',
   persistTo: persistedState,
   vars: {
     DEEPSEEK_API_KEY: 'ingest-check-unused',
+    DEEPSEEK_MODEL: DEPLOYED_MODEL,
     DSH_EDGE_ACCESS_KEY: AUTH_DUMMY,
   },
   // warn, не error: бут-ошибки wrangler/workerd обязаны быть видны в логе шага
@@ -180,6 +191,11 @@ try {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(batch1),
   })
+  // #572: this 200 is now asserted with vars.DEEPSEEK_MODEL set to the
+  // deployment's real model id (DEPLOYED_MODEL, not the upstream default) —
+  // appendHarnessEvents used to hand agent bootstrap the upstream literal
+  // regardless of what the deployment actually serves; it now resolves the
+  // session's own recorded model instead (session-store.ts::appendHarnessEvents).
   assert.equal(ing1.response.status, 200, 'ingest батча 1: HTTP 200')
   assert.equal(ing1.body.appended, 6, 'ingest батча 1: appended=6')
 
