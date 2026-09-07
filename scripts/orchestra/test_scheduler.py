@@ -314,6 +314,29 @@ def test_append_session_notes_ingest_failure_prod_form_500_is_best_effort(monkey
     assert reported == [lines]  # улика ушла на дедуп-эскалацию
 
 
+def test_append_session_notes_surfaces_escalation_post_failure(monkeypatch):
+    # Некритичное ревью-замечание к #629: если сам ПОСТ маркера в #120 не
+    # удался, дедуп на "раз в UTC-сутки" молча не сработает на следующем
+    # пульсе — но статус этой неудачи обязан быть виден в отчёте ЭТОГО
+    # пульса, не проглочен. Проверяем на настоящем _report_session_note_loss
+    # (не мокаем её целиком), кормим escalate() статусом "НЕ оставлен".
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: (_ for _ in ()).throw(RuntimeError("HTTP 500: Internal runtime error.")),
+    )
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": []}))
+    monkeypatch.setattr(
+        sch, "escalate",
+        lambda repo, issue_n, text: "Telegram: доставлен; след в #120: НЕ оставлен",
+    )
+    lines = sch.append_session_notes("o/r", [(5, "заметка")])
+    assert any("лог итогов не дописан" in line for line in lines)
+    assert any("эскалация потери session-notes" in line and "НЕ оставлен" in line for line in lines)
+
+
 def test_append_session_notes_one_login_for_several_notes(monkeypatch):
     # Мутация-гвардия: если кто-то перенесёт логин внутрь цикла по заметкам,
     # этот тест покраснеет — login_calls вырастет с 1 до len(notes).
@@ -456,6 +479,22 @@ def test_report_session_note_loss_does_not_raise_when_marker_history_unreadable(
         RuntimeError("gh api repos/o/r/issues/120/comments: HTTP 502")))
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать вслепую при сбое чтения"))
     sch._report_session_note_loss("o/r", ["⚠️ #1: ..."])  # не должен бросить исключение
+
+
+def test_report_session_note_loss_returns_escalate_delivery_status(monkeypatch):
+    # Неудача самого ПОСТА маркера в #120 (escalate best-effort, не бросает)
+    # не должна тонуть молча: статус доставки — возврат функции, не потерян.
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": []}))
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+    status = sch._report_session_note_loss("o/r", ["⚠️ #1: ..."])
+    assert status == "Telegram: доставлен; след в #120: НЕ оставлен"
+
+
+def test_report_session_note_loss_returns_none_when_deduped(monkeypatch):
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    comments = [{"created_at": now_iso, "body": f"⚠️ edge-harness: {sch.SESSION_NOTE_LOSS_MARKER}\nуже кричали"}]
+    patch_gh(monkeypatch, FakeGh({"issues/120/comments?per_page=100": comments}))
+    assert sch._report_session_note_loss("o/r", ["⚠️ #1: ..."]) is None
 
 
 # ── after_merge/accept_merged_tasks/unhealthy_pulls: проводка заметок (#480) ─────

@@ -1448,14 +1448,24 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
 SESSION_NOTE_LOSS_MARKER = "[session-notes: доставка сломана]"
 
 
-def _report_session_note_loss(repo: str, failures: list[str]) -> None:
+def _report_session_note_loss(repo: str, failures: list[str]) -> str | None:
     """Улика потери (не тихий сток в один только GITHUB_STEP_SUMMARY — тот
     класс дефекта отдельно заведён, #610/#637): один комментарий+Telegram
     (`escalate`, тот же канал, что #119/#120/#174) на календарные UTC-сутки —
     без throttle'а долгая недоступность морды слала бы сигнал на каждый пульс
     (~раз в 10 минут). `escalate` сама best-effort и не бросает исключений;
     единственный сбой, который здесь может случиться — чтение истории #120
-    для дедупликации, и он тоже не должен ронять вызывающую стадию."""
+    для дедупликации, и он тоже не должен ронять вызывающую стадию.
+
+    Возвращает статус доставки `escalate()` (см. её docstring) или `None`,
+    если эскалация не понадобилась (сегодня уже кричали) или история #120
+    нечитаема. Дедуп держится на маркере, который оставляет комментарий
+    `escalate` — если сам ПОСТ комментария не удался (redакт `escalate`
+    возвращает это в статусе, не бросает исключение), маркера в #120 не
+    появится и на следующем пульсе эскалация уйдёт снова: это НАМЕРЕННО
+    fail-open (лучше лишний Telegram, чем проглоченная потеря), но статус
+    доставки обязан остаться видимым вызывающей стороне, а не потеряться
+    молча — иначе неудача поста была бы не видна нигде."""
     today = datetime.now(timezone.utc).date()
     try:
         signalled_today = any(
@@ -1464,10 +1474,10 @@ def _report_session_note_loss(repo: str, failures: list[str]) -> None:
         )
     except RuntimeError as error:
         print(f"::warning::эскалация потери session-notes не проверена на повтор — {error}", file=sys.stderr)
-        return
+        return None
     if signalled_today:
-        return
-    escalate(
+        return None
+    return escalate(
         repo, WATCHDOG_ISSUE,
         f"⚠️ edge-harness: {SESSION_NOTE_LOSS_MARKER}\n"
         "Лог итогов сессии раннера не дописан в морду dsh-edge (best-effort, "
@@ -1488,7 +1498,10 @@ def append_session_notes(repo: str, notes: list[tuple[int, str]]) -> list[str]:
     ошибка; сама морда недоступна или ingest упал (в т.ч. HTTP 500 от чужого
     бутстрапа LLM-агента приёма) — возможность сломана, сигнал громкий
     (⚠️ в отчёте + `_report_session_note_loss`), но вызывающую стадию не
-    красит: мерж/приёмка/возврат в пул уже состоялись и не откатываются."""
+    красит: мерж/приёмка/возврат в пул уже состоялись и не откатываются. Если
+    сама эскалация состоялась (не проглочена дедупом суток), её статус
+    доставки (`escalate()`, комментарий/Telegram по отдельности) тоже попадает
+    отдельной строкой в возврат — неудача ПОСТА маркера в #120 не тонет молча."""
     if not notes:
         return []
     if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
@@ -1499,8 +1512,11 @@ def append_session_notes(repo: str, notes: list[tuple[int, str]]) -> list[str]:
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
         line = (f"⚠️ морда dsh-edge недоступна для лога итогов сессии "
                 f"(возможность сломана, best-effort — #629): {error}")
-        _report_session_note_loss(repo, [line])
-        return [line]
+        escalation = _report_session_note_loss(repo, [line])
+        result = [line]
+        if escalation:
+            result.append(f"⚠️ эскалация потери session-notes: {escalation}")
+        return result
     lines: list[str] = []
     failures: list[str] = []
     for number, text in notes:
@@ -1527,7 +1543,9 @@ def append_session_notes(repo: str, notes: list[tuple[int, str]]) -> list[str]:
             lines.append(line)
             failures.append(line)
     if failures:
-        _report_session_note_loss(repo, failures)
+        escalation = _report_session_note_loss(repo, failures)
+        if escalation:
+            lines.append(f"⚠️ эскалация потери session-notes: {escalation}")
     return lines
 
 
