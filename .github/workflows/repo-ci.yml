@@ -391,6 +391,18 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pagination_guard.py -q
 
+      # Класс «метку ставит событие A, снимает только событие B, не
+      # покрывающее способ реального исправления» (#599, живой случай PR
+      # #586: contract:failed висел вечно, потому что правка ТЕЛА PR не
+      # входила в pull_request.types job'а contract). Гвардия сканирует
+      # .github/workflows/*.yml на job'ы, читающие тело PR и удаляющие метку,
+      # без edited в pull_request.types — новый такой job красит CI, если не
+      # назван явно в ALLOWLIST с номером задачи.
+      - name: Гвардия «газ метки достижим правкой тела PR»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_body_label_release_reachable.py -q
+
       # Белое пятно #43 «второй пакетный менеджер поверх pnpm-дерева
       # standalone»: npm install поверх дерева с семью обязательными для
       # Workers pnpm-патчами пересобирает node_modules без патчей — зелёная
