@@ -232,6 +232,12 @@ jobs:
       - name: Интеграция ingest-шва на собранном артефакте (#119)
         if: steps.route.outputs.plugins != '0'
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
+        env:
+          # Одно место правды для модели, которой этот прогон проверяет
+          # ingest (check.mjs): та же vars.DEEPSEEK_MODEL, что уедет в
+          # деплой ниже (шаг «Секреты провайдера морды») — не вторая
+          # захардкоженная копия значения в самом check.mjs.
+          DSH_EDGE_CHECK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: node "$GITHUB_WORKSPACE/dsh-edge/ingest-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
       # Прокси статусов журнала (#105/#501, патч 0005) обязан работать на
