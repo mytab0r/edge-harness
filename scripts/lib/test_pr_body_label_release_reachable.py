@@ -63,9 +63,10 @@ BODY_READ_RE = re.compile(r'pull(?:_after_\w+)?(?:\[["\']body["\']\]|\.get\(["\'
 # contract_check.py разносит "-X", "DELETE" и f-строку по двум строкам.
 DELETE_LABEL_RE = re.compile(r'"-X",\s*"DELETE",?\s*f?"[^"]*/labels/', re.DOTALL)
 
-# Извлечение вызываемого .py из текста run: — все прод-примеры сегодня зовут
-# `python <путь> …` из корня репозитория (без cd/working-directory).
-PY_INVOCATION_RE = re.compile(r'\bpython\s+(\S+\.py)\b')
+# Извлечение вызываемого .py из текста run: — прод-примеры зовут скрипт из
+# корня репозитория (без cd/working-directory) либо как `python <путь>`,
+# либо как `python3 <путь>` (owner-decision.yml:56 уже так делает).
+PY_INVOCATION_RE = re.compile(r'\bpython3?\s+(\S+\.py)\b')
 
 # Уже найденный, ещё не починенный экземпляр этого класса (#601): оставлен
 # видимым с номером задачи, чтобы новый необъявленный экземпляр по-прежнему
@@ -94,11 +95,18 @@ def _on_block(doc: dict, path: Path) -> dict:
 
 def _pr_types(on_block: dict) -> list[str] | None:
     """Типы pull_request этого workflow'а, либо None — pull_request не триггер
-    вовсе. Явный `types:` — как есть; голый `pull_request:` (без types) —
-    дефолт GitHub (opened/synchronize/reopened, документировано в GH Actions)."""
-    pr_trigger = on_block.get("pull_request")
-    if pr_trigger is None:
+    вовсе (ключа `pull_request` нет в блоке `on:` совсем). Явный `types:` —
+    как есть; голый `pull_request:` без значения — YAML 1.1 парсит это как
+    None (ключ ЕСТЬ, значение null), что не отличить от True на уровне
+    `.get()` — оба случая означают дефолт GitHub (opened/synchronize/reopened,
+    документировано в GH Actions). Отсутствие ключа проверяем ДО `.get()`,
+    иначе многотриггерный workflow вида `on: {pull_request:, push: {...}}`
+    (repo-ci.yml, worker-ci.yml, codeql.yml — все с настоящим pull_request)
+    читался бы как «pull_request не триггер вовсе», и job'ы этих файлов
+    целиком выпадали бы из обхода."""
+    if "pull_request" not in on_block:
         return None
+    pr_trigger = on_block.get("pull_request")
     if pr_trigger is True or not pr_trigger:
         return list(GH_DEFAULT_PR_TYPES)
     return list(pr_trigger.get("types") or GH_DEFAULT_PR_TYPES)
@@ -106,9 +114,13 @@ def _pr_types(on_block: dict) -> list[str] | None:
 
 def _qualifying_jobs(doc: dict, on_block: dict) -> dict:
     """Job'ы, реально достижимые событием pull_request: единственный триггер
-    workflow'а — все job'ы; несколько триггеров — только job с явным
-    `if: github.event_name == 'pull_request'` (символично противоположному
-    `!= 'pull_request'`, см. orchestra.yml/scheduler.py)."""
+    workflow'а — все job'ы; несколько триггеров — все job'ы, КРОМЕ тех, чей
+    `if` явно исключает pull_request (`!= 'pull_request'`, см.
+    orchestra.yml/job orchestra). Job без `if` вовсе (как `test` в
+    repo-ci.yml, где живёт половина гвардий репозитория) запускается на
+    каждом триггере workflow'а, включая pull_request, — исключать его из
+    обхода только потому что `if` не назван явно, значит не видеть ровно те
+    job'ы, где новый такой скрипт вероятнее всего появится."""
     if _pr_types(on_block) is None:
         return {}
     jobs = doc.get("jobs") or {}
@@ -116,7 +128,8 @@ def _qualifying_jobs(doc: dict, on_block: dict) -> dict:
     result = {}
     for job_id, job in jobs.items():
         condition = job.get("if") or ""
-        if only_trigger or "event_name == 'pull_request'" in condition:
+        excludes_pr = "event_name != 'pull_request'" in condition
+        if only_trigger or not excludes_pr:
             result[job_id] = job
     return result
 
@@ -180,4 +193,57 @@ def test_no_new_body_gated_label_release_without_edited():
         "остальные job'ы того же workflow на лишние платные прогоны, как в "
         "#599), либо, если фикс отложен осознанно, назови номер задачи в "
         "ALLOWLIST этого файла."
+    )
+
+
+def test_pr_types_distinguishes_absent_key_from_null_value():
+    """Мутационная пара (находка AI-ревью PR #602): до фикса
+    `on_block.get("pull_request") is None` не отличал «ключа `pull_request` в
+    `on:` нет вовсе» от «ключ есть, значение null» — PyYAML именно так парсит
+    голый `pull_request:` без `types:` в многотриггерном `on:`. repo-ci.yml —
+    прод-форма обоих случаев разом: `pull_request:` без значения соседствует
+    с `push:`. Мутация: вернуть `if pr_trigger is None: return None` без
+    проверки `"pull_request" not in on_block` — этот тест красный, и
+    `_qualifying_jobs`/`test_no_new_body_gated_label_release_without_edited`
+    целиком теряют repo-ci.yml (и по той же причине worker-ci.yml, codeql.yml)."""
+    path = WORKFLOWS_DIR / "repo-ci.yml"
+    doc = _load(path)
+    on_block = _on_block(doc, path)
+    assert "pull_request" in on_block, (
+        "фикстура ожидает ключ pull_request в on: repo-ci.yml — иначе тест "
+        "не воспроизводит разбираемый случай"
+    )
+    assert on_block.get("pull_request") is None, (
+        "фикстура ожидает голый `pull_request:` без types — иначе тест не "
+        "воспроизводит случай «ключ есть, значение null»"
+    )
+    types = _pr_types(on_block)
+    assert types == GH_DEFAULT_PR_TYPES, (
+        f"repo-ci.yml: pull_request — настоящий триггер (соседствует с push "
+        f"в on:), обязан читаться как дефолтные типы {GH_DEFAULT_PR_TYPES}, "
+        f"получено {types!r} — «ключ есть с null» перепутан с «ключа нет»"
+    )
+
+
+def test_qualifying_jobs_includes_job_without_if():
+    """Мутационная пара (находка AI-ревью PR #602): до фикса job без `if` в
+    многотриггерном workflow не засчитывался достижимым (условие требовало
+    буквального `event_name == 'pull_request'`). repo-ci.yml::test — прод-
+    форма: без `if` вовсе, реально запускается на каждом pull_request, и
+    именно в нём живёт половина гвардий репозитория. Мутация: вернуть старое
+    условие `only_trigger or "event_name == 'pull_request'" in condition` —
+    этот тест красный, `test` пропадает из обхода телозависимых газов метки."""
+    path = WORKFLOWS_DIR / "repo-ci.yml"
+    doc = _load(path)
+    on_block = _on_block(doc, path)
+    assert doc["jobs"]["test"].get("if") is None, (
+        "фикстура ожидает job test без if — иначе тест не воспроизводит "
+        "разбираемый случай"
+    )
+    jobs = _qualifying_jobs(doc, on_block)
+    assert "test" in jobs, (
+        "repo-ci.yml::test запускается на pull_request (нет if, исключающего "
+        "его через event_name != 'pull_request') — обязан попасть в обход "
+        "телозависимых газов метки, а не только job'ы с явным == "
+        "'pull_request'"
     )
