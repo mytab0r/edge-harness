@@ -1818,6 +1818,77 @@ def test_failure_watch_daily_cap_never_raises(monkeypatch):
     assert any("потолок" in line and "исчерпан" in line for line in observations)
 
 
+def test_failure_watch_title_dedup_not_blocked_by_exhausted_daily_cap(monkeypatch):
+    # Мутационная проверка порядка проверок при ребейзе поверх #610/PR #612
+    # (комментарий по маркеру среди комментариев issue, не создание задачи):
+    # суточный потолок ci-failure УЖЕ исчерпан (5/5 за последние 24ч, реальная
+    # форма ответа gh api — те же поля, что и в остальных тестах потолка),
+    # но у нового класса причины УЖЕ есть открытая issue с тем же
+    # детерминированным заголовком (workflow+job_name, #578 — живой случай
+    # #578/#580/#589/#592/#598). Комментарий на существующую issue НЕ заводит
+    # задачу — сжигать суточную квоту тут нечего, а значит потолок не вправе
+    # его блокировать. До этой правки (потолок проверялся ДО дедупа по
+    # заголовку) один и тот же класс тут получал бы ложное «потолок исчерпан»
+    # вместо тихого комментария на #578, хотя пул при этом не растёт вовсе.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-09-06T22:08:03Z", 34063041667, event="schedule"),
+    ]}
+    # Реальные id job'а и шага прогона 34063041667 (`gh api
+    # repos/mytab0r/edge-harness/actions/runs/34063041667/jobs`), как и в
+    # test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment.
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 101566876955, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    # Потолок дня уже сожжён (state=all, реальная форма ответа gh api — та же,
+    # что и у остальных тестов потолка выше).
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(200 + i, "2026-09-06T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/578/comments"] = []  # маркера этого класса на #578 ещё нет
+    # Реальный хвост лога job'а 101566876955 (`gh api .../jobs/101566876955/logs`,
+    # снят 2026-09-08): «Removing credentials config '<UUID>.config'» — тот же
+    # боилерплейт teardown, что и в соседних тестах, другой UUID → новый класс.
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")))
+    new_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    assert new_fp != existing_fp  # предпосылка: РАЗНЫЙ fingerprint, ОДИНАКОВЫЙ заголовок
+
+    fake = FakeGh(routes)
+    created = []
+    commented = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("потолок не исчерпан для этого класса — эскалации быть не должно"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert created == []  # новая issue не заведена (ни потолком, ни дублем)
+    assert len(commented) == 1 and commented[0][0] == 578  # комментарий на существующую issue
+    assert not any("исчерпан" in line for line in observations)  # потолок тут не при чём
+    assert any("тем же заголовком" in line and "#578" in line for line in observations)
+
+
 def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
     routes = dict(FAILURE_WATCH_QUIET_ROUTES)
     routes["workflows/hands.yml/runs?status=completed"] = {"workflow_runs": [
