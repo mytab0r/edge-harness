@@ -411,6 +411,27 @@ def fetch_rows(token: str, account_id: str, query: str, shape: str, day: date,
 # ── Оркестрация ─────────────────────────────────────────────────────────────────
 
 
+def today_rows_read(token: str, account_id: str) -> int:
+    """Одно число — суммарный rowsRead за СЕГОДНЯ (UTC), без multi-day
+    таблицы `run()`/`format_table()` (#605: дешёвый частый сторож,
+    scripts/measure/quota_watch.py, спрашивает только текущий день).
+
+    Переиспользует ту же интроспекцию живой схемы, что и `run()` — не
+    угадывает и не хардкодит найденный датасет/поле (см. докстринг модуля,
+    «интроспекция, не угадка»): дешевизна частого вызова — в троттлинге на
+    стороне вызывающего, не в упрощении этой функции ценой угадки."""
+    info = discover_dataset(token)
+    dataset = info["dataset"]
+    sum_fields = sorted({"rowsRead", "rowsWritten"} & info["sum_field_names"])
+    dim_fields = sorted({"date", "datetimeHour", "namespaceId"} & info["dim_field_names"])
+    shape = choose_query_shape(info["filter_field_names"], info["dim_field_names"])
+    query = build_data_query(dataset, shape, sum_fields, dim_fields)
+    today = datetime.now(timezone.utc).date()
+    rows = fetch_rows(token, account_id, query, shape, today, today, today)
+    summary = daily_totals_from_rows(rows, info["sum_field_names"], info["dim_field_names"])
+    return summary["rows_read"]
+
+
 def run(token: str, account_id: str, days: int) -> str:
     info = discover_dataset(token)
     dataset = info["dataset"]

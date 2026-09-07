@@ -1,0 +1,58 @@
+# Непрерывный сторож квот харнеса (#605) — обоснование интервала, стоимости
+# и подстраховки ненадёжного `schedule` целиком в докстринге
+# scripts/measure/quota_watch.py, здесь — только проводка.
+#
+# Триггеры: `pull_request` — основной и надёжный носитель каденции (обычный
+# webhook, не `schedule`; в этом репозитории с его многоагентной работой
+# срабатывает практически постоянно — десятки открытых PR, синхронизация на
+# каждый пуш). `schedule` — только страховка «тихих часов», когда в
+# репозитории вообще нет активности (`*/15`, измеренная доставка на этом
+# репозитории ~6.7% — см. docs/research/21-github-actions.md, «Замер
+# schedule» — троттлинг внутри quota_watch.py всё равно ограничивает частоту
+# дорогого CF-запроса, лишние срабатывания cron не удваивают стоимость).
+#
+# permissions.actions:read — troттлинг (`recent_run_within`) читает историю
+# ПРОШЛЫХ прогонов этого же workflow, чтобы не звать Cloudflare чаще
+# CHECK_INTERVAL_MINUTES независимо от частоты pull_request. permissions.
+# issues:write — эскалация (Telegram + след в #120) и заведение задачи через
+# scripts/gh/issue-create при пробитии порога (см. quota_alert.py).
+name: quota-watch
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # Сдвинуто с четвертей часа — та же рекомендация GitHub на случай пиков
+    # нагрузки, что уже применена в dispatch-latency-probe.yml.
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Тесты сторожа квот
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py -q
+
+      - name: Дешёвая проверка + (раз в час) полный срез
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quota_watch.py
