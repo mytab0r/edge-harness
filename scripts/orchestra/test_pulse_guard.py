@@ -1549,6 +1549,7 @@ def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(
          "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
          "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
     ]
+    routes["issues/578/comments"] = []  # маркера этого класса на #578 ещё нет
     fake = FakeGh(routes)
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(
@@ -1575,6 +1576,92 @@ def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(
     assert actions == []  # это не «новая задача», см. #456
     assert len(commented) == 1 and commented[0][0] == 578
     assert any("тем же заголовком" in line and "#578" in line for line in observations)
+
+
+def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypatch):
+    # Мутационная проверка (находка ревью PR #612, живой прогон 34063041667 —
+    # реальные id job'а/шага и реальный хвост лога сняты `gh api` с прод): окно
+    # свежести FAILURE_WATCH_WINDOW_MINUTES=30 при пульсе раз в 15 мин держит
+    # ОДИН И ТОТ ЖЕ красный прогон «свежим» до трёх пульсов подряд. Без дедупа
+    # по комментариям (issue_marker_times — приём stall_detector.py, #248)
+    # каждый такой пульс писал бы БАЙТ-В-БАЙТ дубль на #578: тело issue не
+    # меняется (ci_failure_fingerprints парсит только тела), значит только
+    # чтение уже оставленных КОММЕНТАРИЕВ этой issue отличает «уже сигналили»
+    # от «новый класс причины».
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-09-06T22:08:03Z", 34063041667, event="schedule"),
+    ]}
+    # Реальные id job'а и шага прогона 34063041667 (`gh api
+    # repos/mytab0r/edge-harness/actions/runs/34063041667/jobs`).
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 101566876955, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    # Реальный хвост лога job'а 101566876955 (`gh api .../jobs/101566876955/logs`,
+    # снят 2026-09-08): «Removing credentials config '<UUID>.config'» —
+    # ровно боилерплейт teardown checkout, живая причина класса #578.
+    same_run_error = (
+        "Removing credentials config '/home/runner/work/_temp/"
+        "git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(same_run_error)))
+    same_run_fp = pg.failure_fingerprint("orchestra.yml", "orchestra", same_run_error)
+    assert same_run_fp != existing_fp  # предпосылка: класс новый для тела #578
+
+    fake = FakeGh(routes)
+    posted_comments: list[dict] = []  # эмулирует РЕАЛЬНУЮ issue #578 — комментарии копятся между пульсами
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues/578/comments":
+            body = args[-1].split("=", 1)[1]
+            posted_comments.append({"created_at": "2026-09-06T22:10:00Z", "body": body})
+            return None
+        joined = " ".join(args)
+        if "issues/578/comments" in joined and args[:2] != ("-X", "POST"):
+            return list(posted_comments)
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    # (б) Пульс 1: комментарий пишется (маркера этого класса на #578 ещё нет).
+    observations1, actions1 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions1 == []
+    assert len(posted_comments) == 1
+    assert any("уже открыта (#578)" in line for line in observations1)
+    # (г) текст не врёт: не называет прогон новым (он тот же, что и всегда был).
+    assert "Новый прогон" not in posted_comments[0]["body"]
+
+    # (а) Пульс 2 — ТОТ ЖЕ прогон и факт (следующий тик оркестратора, тот же
+    # прогон всё ещё «свежий» в окне FAILURE_WATCH_WINDOW_MINUTES): комментарий
+    # НЕ дублируется.
+    observations2, actions2 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions2 == []
+    assert len(posted_comments) == 1  # не выросло — снят фикс, здесь стало бы 2
+    assert any("уже прокомментирована" in line and "молчу" in line for line in observations2)
+
+    # (в) Пульс 3 — ДРУГОЙ прогон/причина (другой отпечаток факта под тем же
+    # заголовком): дедуп не склеивает разные причины — комментарий пишется.
+    different_run_error = "HTTP Error 500: Internal Server Error (archive session, #119/#575)"
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(different_run_error)))
+    different_fp = pg.failure_fingerprint("orchestra.yml", "orchestra", different_run_error)
+    assert different_fp not in (existing_fp, same_run_fp)
+    observations3, actions3 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions3 == []
+    assert len(posted_comments) == 2  # новый класс — второй, НЕ дублирующий комментарий
+    assert any("уже открыта (#578)" in line for line in observations3)
+    assert "Новый прогон" not in posted_comments[1]["body"]
 
 
 def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):

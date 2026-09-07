@@ -1388,7 +1388,7 @@ FAILURE_FINGERPRINT_MARKER = "<!-- failure-fingerprint: "
 
 def open_ci_failure_issues(repo: str) -> list[dict]:
     """Открытые issues с меткой FAILURE_WATCH_LABEL — сырой список, единый
-    источник и для точного дедупа по fingerprint (open_ci_failure_fingerprints),
+    источник и для точного дедупа по fingerprint (ci_failure_fingerprints),
     и для дедупа по похожести заголовка (#610, см. failure_watch): один обход
     Issues на оба вопроса, не два отдельных запроса подряд.
 
@@ -1662,10 +1662,38 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             )
             if existing_by_title:
                 number = existing_by_title["number"]
+                # Дедуп комментария по КЛАССУ (тот же приём, что
+                # stall_detector._evidence_marker/issue_marker_times, находка
+                # PR #248): свежий провал остаётся в окне FAILURE_WATCH_WINDOW_MINUTES
+                # несколько пульсов подряд (пульс — раз в 15 мин, окно — 30) — без
+                # этой проверки КАЖДЫЙ пульс писал бы БАЙТ-В-БАЙТ одинаковый
+                # комментарий на #578 (находка ревью PR #612: три пульса одного
+                # прогона на моках дали два дубля). ci_fingerprints выше не
+                # спасает: он парсит только ТЕЛА issues (open_ci_failure_issues/
+                # ci_failure_fingerprints), этот же класс комментарием, а не
+                # телом — маркер нужно искать среди комментариев ИМЕННО этой
+                # issue (issue_marker_times), не среди тел.
+                marker = f"{FAILURE_FINGERPRINT_MARKER}{fingerprint} -->"
+                try:
+                    already_commented = bool(issue_marker_times(repo, number, marker))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow} (job «{job_name}»): комментарии "
+                        f"#{number} не прочитаны ({error})")
+                    continue
+                if already_commented:
+                    observations.append(
+                        f"🔁 failure-watch {workflow} (job «{job_name}»): issue с тем же заголовком "
+                        f"и классом {fingerprint} уже прокомментирована (#{number}) — молчу")
+                    continue
+                # Текст не утверждает «новый прогон» (находка ревью PR #612: до
+                # дедупа выше это было буквально ложью на повторном пульсе того
+                # же прогона) — только факт, что у issue уже есть отпечаток
+                # ДРУГОГО класса причины под тем же заголовком.
                 comment = (
-                    f"{FAILURE_FINGERPRINT_MARKER}{fingerprint} -->\n"
-                    f"Новый прогон с тем же заголовком, другой отпечаток факта "
-                    f"(класс {fingerprint}) — комментарий вместо второй issue (#610):\n\n"
+                    f"{marker}\n"
+                    f"У issue с тем же заголовком уже записан другой отпечаток факта — "
+                    f"новый класс {fingerprint}, комментарий вместо второй issue (#610):\n\n"
                     f"Факт: {fact}\n{run_url}"
                 )
                 try:
