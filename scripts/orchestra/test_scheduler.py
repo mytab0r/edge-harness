@@ -1836,6 +1836,54 @@ def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
     assert actions == []
 
 
+def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
+    """Прод-форма PR #333 (2026-09-08, снято `gh api pulls/333` и
+    `commits/<sha>/check-runs` живого репозитория): `mergeable_state=unstable`,
+    метки `review:large`+`review:large-ok`+`ai:ok` (НЕ `review:ok` — большой
+    дифф, размер принят меткой, а не переносом на review:ok), 11 сырых
+    check-run'ов с дублями `contract`(x2)/`orchestra`(x2) (два pull_request-
+    триггера workflow orchestra.yml подряд), все success/skipped.
+
+    До фикса merge_label_gate (review_labels.py) этот PR стоял бы с этим же
+    набором меток НАВСЕГДА — apply_large_ok (ai_review.py) ставит
+    review:large-ok меткой, без нового пуша, а pr-review.yml (где
+    check_pr.py конвертировал бы review:large → review:ok) реагирует только
+    на opened/synchronize/reopened. Мутация: замени `gate1_ok = REVIEW_OK in
+    names or (...)` на `gate1_ok = REVIEW_OK in names` в review_labels.py —
+    тест обязан покраснеть (не появится -X PUT .../merge, останется
+    "нет вердикта review:ok" в observations)."""
+    pulls = [pull(333, labels=["review:large", "review:large-ok", "ai:ok"])]
+    fake = FakeGh({
+        "pulls/333": {"mergeable_state": "unstable"},
+        "commits/sha333/check-runs": {"check_runs": [
+            {"name": "CodeQL", "conclusion": "success", "started_at": "2026-09-07T21:58:40Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:58:05Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:58:06Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:57:48Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "review", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "canary", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "analyze", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "worker-test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "archive-fixup", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+        ]},
+        "pulls/333/merge": None,
+    })
+    patch_gh(monkeypatch, fake)
+    # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
+    # проводка after_merge (архив/deploy/release задачи) — та разобрана
+    # отдельными тестами after_merge_* ниже в этом файле.
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others: ([], [], False))
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number == 333
+    assert any(c.startswith("-X PUT") and "pulls/333/merge" in c for c in fake.calls)
+    assert any("слит" in line and "#333" in line for line in actions)
+
+
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
 # merge_loop оборачивает merge_queue повторными проходами — тесты ниже
 # подставляют свой merge_queue (не гоняют реальную логику готовности PR,

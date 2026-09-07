@@ -109,6 +109,30 @@ def test_gate1_decided_true_does_not_imply_merge_label_gate_open():
     assert review_labels.merge_label_gate(labels) is not None
 
 
+def test_merge_label_gate_opens_on_review_large_with_large_ok_and_ai_ok():
+    # Живой случай PR #333 (2026-09-08): «слияние ждёт review:large-ok» из
+    # докстринга/теста выше означает «ждёт», не «игнорирует навсегда» — до
+    # фикса merge_label_gate требовал буквально review:ok и не принимал
+    # review:large+review:large-ok как эквивалент, хотя check_pr.py::size_gate
+    # уже трактует review:large-ok как «размер принят» (is_large=False).
+    # Разрыв: review:large-ok ставится МЕТКОЙ (ai_review.py::apply_large_ok)
+    # без нового пуша, а check_pr.py (где формируется review:ok) реагирует
+    # только на opened/synchronize/reopened — без этой ветки условие никогда
+    # не перечитывается заново, и PR стоит с review:large+review:large-ok+
+    # ai:ok бесконечно (тормоз без газа).
+    labels = ["review:large", "review:large-ok", "ai:ok"]
+    assert review_labels.merge_label_gate(labels) is None
+
+
+def test_merge_label_gate_still_closed_on_large_ok_without_ai_ok():
+    # Гейт 2 (AI) по-прежнему обязателен — review:large-ok сам по себе не
+    # открывает слияние без ai:ok.
+    labels = ["review:large", "review:large-ok"]
+    reason = review_labels.merge_label_gate(labels)
+    assert reason is not None
+    assert "ai:ok" in reason
+
+
 def test_gate1_decided_accepts_label_name_set_and_dict_list():
     assert review_labels.gate1_decided([{"name": "review:large"}]) is True
     assert review_labels.gate1_decided({"review:ok"}) is True
