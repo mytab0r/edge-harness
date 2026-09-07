@@ -183,10 +183,18 @@ def is_us_business(moment: datetime) -> bool:
     return moment.weekday() < 5 and 13 <= moment.hour < 24
 
 
+def now_utc() -> datetime:
+    """Настенные часы кампании — единственное место правды. Тест подменяет через
+    monkeypatch.setattr(dt, "now_utc", ...), а не полагается на реальное время:
+    иначе поведение теста меняется с датой запуска (окно кампании MAX_CAMPAIGN_DAYS
+    истекает по календарю)."""
+    return datetime.now(timezone.utc)
+
+
 def coverage(rows: list[dict], now: datetime | None = None,
              max_days: int = MAX_CAMPAIGN_DAYS) -> dict:
     """Критерий задачи #4 по накопленным строкам. Чистая функция."""
-    now = now or datetime.now(timezone.utc)
+    now = now or now_utc()
     ok = [r for r in rows if r.get("status") == "ok"]
     starts = [sent_at_datetime(int(r["sent_at"])) for r in ok]
     span_h = 0.0
