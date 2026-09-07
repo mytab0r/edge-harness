@@ -1,5 +1,5 @@
 /**
- * Канарейка коллизии имён с апстримом pawaca/dsh-edge (issue: сам этот change).
+ * Канарейка коллизии имён с апстримом pawaca/dsh-edge (задача #581).
  *
  * ЗАЧЕМ: три раза одна и та же коллизия всплывала ПОСТФАКТУМ — красной сборкой
  * или жалобой владельца, — не проверкой:
@@ -16,7 +16,9 @@
  * Эта проверка читает РЕАЛЬНЫЙ апстримный артефакт на ТЕКУЩЕМ пине
  * (dsh-edge/upstream.json) — package.json пиновой @deepseek-ai/dsh-web-app,
  * npm-тарболы кандидатов, pnpm-lock.yaml апстримного standalone — и сверяет
- * его с тем, что регистрируют НАШИ клиентские плагины (plugins-src/*\/src/body.js).
+ * его с тем, что регистрируют НАШИ клиентские плагины (plugins-src/*, отбор —
+ * package.json#dsh.client.platform === "web", источник — src/body.js либо
+ * package.json#exports['./client']).
  * Список апстримных кандидатов НЕ захардкожен: он вычисляется из реальных
  * зависимостей пиновой версии dsh-web-app на каждом запуске, поэтому не
  * протухает к следующему бампу пина сам по себе.
@@ -43,14 +45,25 @@
  * другой, непохоже названный пакет). Список проверенных/непроверенных
  * кандидатов печатается в отчёт на каждом запуске — это не тихая неполнота.
  *
+ * ВТОРАЯ ГРАНИЦА (deploy-dsh-edge.yml): шаг там читает НАШУ сторону из
+ * plugins-src/* (исходники), а не из тарболов dsh-edge/plugins.json, которые
+ * реально уезжают в прод по sha256 (job, по собственному комментарию,
+ * исходники плагинов вовсе не читает). В окне «правка plugins-src смержена,
+ * sha256 в ростере ещё не поднят» канарейка в deploy проверяет сторону,
+ * которая не деплоится. Основной канал закрыт иначе: repo-ci.yml гоняет ЭТУ
+ * ЖЕ проверку против plugins-src на каждый PR (включая PR авто-бампа пина),
+ * так что рассинхрон между исходниками и живым апстримом ловится до мержа;
+ * узкое окно после мержа и до подъёма ростера — газ, названный здесь явно,
+ * не блокирует деплой (см. чеклист PR #582).
+ *
  * Использование: node dsh-edge/check-upstream-namespace-collision.mjs
  * (GH_TOKEN в окружении — опционально, поднимает лимит GitHub API).
  */
 
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = join(fileURLToPath(import.meta.url), '..', '..')
@@ -146,10 +159,17 @@ function extractLocaleNamespaces(source) {
   return [...namespaces]
 }
 
-/** Все значения ключа `nav:` в словарях локалей — видимая label вкладки. */
+/** Все значения ключа `nav:` в словарях локалей — видимая label вкладки.
+ * Две формы ключа замечены на живых тарболах апстрима: бесключевая
+ * `nav: "..."` (наш body.js и часть апстримных бандлов) и quoted-ключ
+ * `"xxx.nav": "..."` (@deepseek-ai/dsh-client-ui-settings-general@0.1.2-rc.1
+ * держит label под "general.nav" в том же словаре, на который смотрит
+ * слот-регистрация) — без второй формы general проходил канарейку с нулём
+ * извлечённых label и ложно зелёным результатом по пункту 2 задачи. */
 function extractNavLabels(source) {
   const labels = new Set()
   for (const m of source.matchAll(/\bnav:\s*"((?:\\.|[^"\\])*)"/g)) labels.add(m[1])
+  for (const m of source.matchAll(/"[^"]*\.nav"\s*:\s*"((?:\\.|[^"\\])*)"/g)) labels.add(m[1])
   return [...labels]
 }
 
@@ -165,20 +185,44 @@ function extractSettingsSectionSlots(source) {
 }
 
 /** Пакет упомянут в pnpm-lock.yaml — по имени с последующим `'` (форма
- * importers "'@scope/name':") или `@` (форма packages "'@scope/name@1.2.3':"). */
+ * importers "'@scope/name':") или `@` (форма packages "'@scope/name@1.2.3':").
+ * Левый якорь `['"]` — имя предваряется кавычкой в обеих формах лока, без
+ * якоря паттерн матчит имя и как суффикс более длинного пакета (например
+ * "react" внутри "preact@1.0.0"), что даёт ложный зелёный для не-scoped
+ * inject, который в лок-файле реально отсутствует. */
 function lockHasPackage(lockText, pkgName) {
-  return new RegExp(`${escapeRegExp(pkgName)}['@]`).test(lockText)
+  return new RegExp(`['"]${escapeRegExp(pkgName)}['@]`).test(lockText)
 }
 
+/** Клиентность и источник наших плагинов — ТО ЖЕ правило, что
+ * collectUpstreamCandidates применяет к апстримным кандидатам
+ * (package.json#dsh.client.platform === 'web'), а не наличие src/body.js:
+ * плагин без этой раскладки (например hello-world, чей клиентский код лежит
+ * в client/client.js) — веб-плагин, который раньше молча выпадал из
+ * канарейки как «серверные-только». Источник — src/body.js, если есть
+ * (сырое тело фабрики, как у plugin-manager/integrations), иначе
+ * package.json#exports['./client'] (как у апстримных кандидатов). Веб-плагин
+ * без проверяемого источника — громкая ошибка: это наш код, а не сетевой
+ * артефакт апстрима, тихий skip здесь недопустим. */
 function collectOurPlugins() {
   const pluginsDir = join(repoRoot, 'plugins-src')
   const result = []
   for (const name of readdirSync(pluginsDir)) {
-    const bodyPath = join(pluginsDir, name, 'src', 'body.js')
-    if (!existsSync(bodyPath)) continue // серверные-только плагины (hello-world/server, runner-bridge) не участвуют
-    const source = readFileSync(bodyPath, 'utf8')
-    const pkgPath = join(pluginsDir, name, 'package.json')
+    const pluginDir = join(pluginsDir, name)
+    const pkgPath = join(pluginDir, 'package.json')
     const pkg = existsSync(pkgPath) ? JSON.parse(readFileSync(pkgPath, 'utf8')) : {}
+    if (pkg?.dsh?.client?.platform !== 'web') continue // серверные-только плагины (runner-bridge и т.п.) не участвуют
+    const bodyPath = join(pluginDir, 'src', 'body.js')
+    let sourcePath = existsSync(bodyPath) ? bodyPath : null
+    if (!sourcePath) {
+      const clientExport = pkg.exports?.['./client']
+      const clientRel = typeof clientExport === 'string' ? clientExport : clientExport?.default
+      if (clientRel) sourcePath = join(pluginDir, clientRel)
+    }
+    if (!sourcePath || !existsSync(sourcePath)) {
+      throw new Error(`plugins-src/${name}: dsh.client.platform === "web", но проверяемый источник не найден (ни src/body.js, ни package.json#exports['./client']) — канарейка не может проверить веб-плагин`)
+    }
+    const source = readFileSync(sourcePath, 'utf8')
     result.push({
       name,
       namespaces: extractLocaleNamespaces(source),
@@ -257,13 +301,21 @@ async function main() {
   console.log(`upstream-namespace-collision: пин ${repo}@${sha}`)
 
   const ourPlugins = collectOurPlugins()
-  if (ourPlugins.length === 0) throw new Error('plugins-src/*/src/body.js: ни одного клиентского плагина не найдено — проверять нечего')
+  if (ourPlugins.length === 0) throw new Error('plugins-src/*: ни одного плагина с dsh.client.platform === "web" не найдено — проверять нечего')
   for (const p of ourPlugins) {
     console.log(`  наш плагин ${p.name}: namespaces=${JSON.stringify(p.namespaces)} nav=${JSON.stringify(p.navLabels)} slots=${JSON.stringify(p.slots)} inject=${JSON.stringify(p.inject)}`)
   }
 
   const tmpRoot = mkdtempSync(join(tmpdir(), 'upstream-collision-'))
   const { candidates, skipped, webAppVersion } = await collectUpstreamCandidates(repo, sha, tmpRoot)
+  // Ноль кандидатов — не «апстрим избавился от settings-раздела», а поломка
+  // эвристики (CANDIDATE_NAME_PATTERN протух на новом пине, апстрим сменил
+  // конвенцию имён): раздел настроек есть в любом релизе dsh-web-app.
+  // Молчаливый зелёный по пустому множеству сравнений маскирует ровно тот
+  // класс инцидентов, для которого канарейка построена — падать громко.
+  if (candidates.length === 0) {
+    throw new Error(`0 кандидат(ов) settings-раздела найдено в зависимостях @deepseek-ai/dsh-web-app@${webAppVersion} — CANDIDATE_NAME_PATTERN (${CANDIDATE_NAME_PATTERN}) не совпал ни с одной зависимостью; проверь конвенцию имён на новом пине, это не «коллизий нет»`)
+  }
   console.log(`  апстримная @deepseek-ai/dsh-web-app@${webAppVersion}: ${candidates.length} кандидат(ов) settings-раздела проверено, ${skipped.length} пропущено`)
   for (const c of candidates) {
     console.log(`  апстрим ${c.name}@${c.version}: namespaces=${JSON.stringify(c.namespaces)} nav=${JSON.stringify(c.navLabels)} slots=${JSON.stringify(c.slots)}`)
