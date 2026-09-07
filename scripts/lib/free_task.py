@@ -92,12 +92,26 @@ issue как proxy даты создания (монотонен по постр
 не стоит ни у кого — не молчаливое вырождение: `main()` печатает
 предупреждение в stderr при выборе (видимый сигнал, не тихий факт), выбор
 при этом не останавливается (вырождение в уровень 3 для всех — легитимно).
+
+Шестой потребитель (#695, живой случай 2026-09-07: задачи #684/#685/#689
+заведены с `area:orchestra` вместо `area:process` и встали в хвост очереди
+из 200 задач, при этом группа приоритета уже несла #194/#168/#226 про тот
+же дефект другими словами) — `scripts/gh/issue-create` обязан ПЕРЕД
+заведением новой задачи показать текущий верх группы приоритета, чтобы
+«та же проблема другими словами» ловилась глазами, раз дедуп по схожести
+заголовка (`duplicate_guard.py`) её не ловит и не может (честный потолок
+токенного сравнения). CLI-режимы `meta-label` (печатает `META_LABEL` —
+одно место правды на литерал для bash-обёртки, не вторая копия строки
+"area:process") и `priority-top <repo> [n]` (сеть — `task_deps.fetch_pool`,
+сортировка — тот же `issue_priority_key`, что и `prioritized_free`, не
+второй экземпляр сортировки) обслуживают именно этот путь.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -123,6 +137,10 @@ task_ref = _load_sibling("task_ref")
 # CONFLICT_LABEL — одно место правды scripts/lib/review_labels.py, не вторая
 # копия литерала "conflict" (тот же класс, что уже сводили #326/LABELS.md).
 review_labels = _load_sibling("review_labels")
+# fetch_pool — тот же GraphQL-обход, что уже читает task.sh для приоритета
+# (docstring выше) — CLI `priority-top` его переиспользует, не заводит
+# второй сетевой путь.
+task_deps = _load_sibling("task_deps")
 
 # Одно место правды на литерал — тот же, что claim_task.py::claim уже
 # использует для отказа в аренде (docs/agents/LABELS.md, строка waiting:owner).
@@ -190,6 +208,20 @@ def issue_priority_key(issue: dict[str, Any], meta_label: str = META_LABEL) -> t
         -int(issue.get("blocking_open") or 0),
         issue["number"],
     )
+
+
+def priority_top(
+    issues: list[dict[str, Any]], top_n: int = 15, meta_label: str = META_LABEL,
+) -> list[dict[str, Any]]:
+    """Верх группы приоритета (#695) — `issues` уже отфильтрованы по
+    `meta_label` вызывающей стороной (`task_deps.fetch_pool(repo, meta_label)`
+    сам фильтрует GraphQL-запросом), здесь только сортировка ТЕМ ЖЕ ключом,
+    что `prioritized_free` (`issue_priority_key`, не второй экземпляр), и
+    срез до `top_n`. Печать перед заведением новой задачи в
+    `scripts/gh/issue-create` (класс #695: «та же проблема другими словами»
+    не ловится дедупом по схожести заголовка, но ловится глазами, если верх
+    очереди виден в момент заведения)."""
+    return sorted(issues, key=lambda issue: issue_priority_key(issue, meta_label))[:top_n]
 
 
 def prioritized_free(
@@ -310,9 +342,49 @@ def main(argv: list[str]) -> int:
         prs = _load_json(Path(argv[1]))
         _print_numbers(conflict_declared_tasks(prs))
         return 0
+    if len(argv) == 1 and argv[0] == "meta-label":
+        # Одно место правды на литерал META_LABEL для bash-обёртки
+        # (scripts/gh/issue-create, #695) — не вторая копия строки.
+        print(META_LABEL)
+        return 0
+    if len(argv) in (2, 3) and argv[0] == "priority-top":
+        # Верх группы приоритета ПЕРЕД заведением новой задачи (#695): сеть —
+        # task_deps.fetch_pool (тот же путь, что task.sh), сортировка — тот
+        # же issue_priority_key, что prioritized_free. Информационная печать,
+        # не гейт — сбой сети предупреждает в stderr и возвращает 0 (как
+        # duplicate_guard.py check: недоступность инструмента не блокирует
+        # реальную работу агента).
+        #
+        # Тестовый шов: PRIORITY_TOP_FIXTURE=<путь> подменяет сетевой вызов
+        # чтением готового JSON пула (форма fetch_pool: number/title/labels/
+        # blocking_open/...) — тот же приём, что DUPLICATE_GUARD_FIXTURE в
+        # duplicate_guard.py, по той же причине (bash-обёртка зовёт этот CLI
+        # отдельным процессом python3, monkeypatch недоступен физически).
+        repo = argv[1]
+        try:
+            top_n = int(argv[2]) if len(argv) == 3 else 15
+        except ValueError:
+            print(f"free_task.py: priority-top: N обязан быть числом: {argv[2]!r}", file=sys.stderr)
+            return 2
+        fixture = os.environ.get("PRIORITY_TOP_FIXTURE")
+        if fixture:
+            issues = _load_json(Path(fixture))
+        else:
+            try:
+                issues = task_deps.fetch_pool(repo, META_LABEL)
+            except Exception as exc:  # noqa: BLE001 — диагностика, не повод блокировать
+                print(
+                    f"free_task.py: priority-top: не смог получить пул {META_LABEL} "
+                    f"({exc}) — верх приоритета не показан.", file=sys.stderr,
+                )
+                return 0
+        for candidate in priority_top(issues, top_n):
+            _print_issue_line(candidate)
+        return 0
     print(
         "использование: free_task.py oldest-free <issues.json> [<locked>] [<excluded>] "
-        "| declared-pr <N> <prs.json> | conflict-tasks <prs.json>",
+        "| declared-pr <N> <prs.json> | conflict-tasks <prs.json> "
+        "| meta-label | priority-top <owner/repo> [N]",
         file=sys.stderr,
     )
     return 2
