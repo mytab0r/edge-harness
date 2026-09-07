@@ -39,8 +39,22 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      ТЕКУЩЕЙ эпохе гейта 1, отдельно от перенесённых из старой, уже решённой
      эпохи, класс #431/PR #439 не слит) и был ли вердикт ai:* хоть раз за
      всю жизнь PR — не список гипотез.
-  4. check_unarchived_complete_changes — openspec/changes/<id>/tasks.md
-     полностью отмечен, а каталог не в openspec/changes/archive/.
+  4. check_unarchived_complete_changes — каталог openspec/changes/<id> не
+     заархивирован, хотя завершён. Завершённость — ЛЮБОЕ из двух независимых
+     условий (протокол: docs/agents/OPENSPEC-PROTOCOL.md): (a) быстрый путь
+     — tasks.md существует и в нём отмечен каждый чекбокс (нужен хотя бы
+     один); (b) второй путь, для 27 каталогов без tasks.md (созданы до того,
+     как файл стал обязателен, задним числом не дописываются) — proposal.md
+     декларирует задачу («Задача:»/«Задачи:» первым абзацем), эта задача
+     закрыта с state_reason=completed, и ни один открытый PR не ссылается на
+     путь этого change. Путь (b) НЕ применяется, если tasks.md вообще
+     существует (даже с незакрытыми чекбоксами) — иначе живая работа с
+     недоделанным чеклистом (например dsh-edge-plugin-system, 7 из 44
+     чекбоксов не отмечены) ложно проходила бы как готовая, потому что её
+     эпик-issue уже закрыт completed. Замер на живом репозитории 2026-09-07
+     (см. git-историю добавления пути (b)): 23 каталога без tasks.md
+     удовлетворяют пути (b) — реальный backlog, поэтому CI_GATING инвариант 4
+     временно наблюдательный (см. блок CI_GATING ниже), не гейтящий.
   5. check_duplicate_evidence — два открытых task-issue ссылаются в теле на
      один и тот же file:line (класс #202/#213/#212). Честный потолок ниже.
   6. check_branch_protection_drift (#341) — enforce_admins/required_status_
@@ -92,6 +106,19 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
 (#201/#243). Каждый включается отдельным шагом, привязанным к обнулению его
 счётчика (или, для 3 — к закрытию #269), правкой CI_GATING ниже — не
 разовым решением «включим всё позже».
+
+Инвариант 4 СУЖЕН обратно до наблюдательного той же процедурой, что и 3, —
+внешней находкой, а не пересмотром решения владельца о «4 гейтится сразу».
+Второй путь завершённости (proposal.md + состояние задачи + отсутствие
+открытого PR на путь change, см. docstring check_unarchived_complete_changes
+выше) нашёл на живом репозитории 23 каталога без tasks.md, которые ему
+удовлетворяют, — оставаясь в CI_GATING немедленно, инвариант 4 покрасил бы
+обязательную проверку `test` на каждом из ~30 открытых PR разом (тот же
+третий-по-счёту-тормоз-без-газа, от которого уже отказались для 1/5 выше).
+Условие обратного включения — то же самое, чем инвариант 4 гасится в
+GATING_RELEASE_CONDITION: разобрать backlog архивацией отдельными PR (план —
+docs/agents/OPENSPEC-PROTOCOL.md, раздел про массовую архивацию), затем
+вернуть 4 в CI_GATING этой же правкой константы.
 
 Запуск:
   python scripts/orchestra/repo_invariants.py             # печать отчёта (repo-ci.yml)
@@ -187,10 +214,25 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # идёт по кадансу, заявленному в cron, — тогда trigger_ai_review успевает
 # сработать раньше UNHEALTHY_PR_AFTER_MINUTES с тем же запасом, что заложен
 # числами AI_REVIEW_RETRY_AFTER_MINUTES=30 vs UNHEALTHY_PR_AFTER_MINUTES=120).
+#
+# Инвариант 4 СУЖЕН обратно до наблюдательного той же процедурой, что и 3 —
+# внешней находкой уже ПОСЛЕ решения владельца, не пересмотром самого
+# решения (см. докстринг модуля). Второй, независимый путь завершённости
+# (docs/agents/OPENSPEC-PROTOCOL.md) нашёл на живом репозитории 2026-09-07
+# реальный backlog — 23 каталога без tasks.md, чья задача из proposal.md уже
+# закрыта completed и на чей путь не ссылается ни один открытый PR. Оставить
+# 4 в CI_GATING немедленно означало бы покрасить обязательную проверку
+# `test` разом на ~30 открытых PR из-за чужого долга — тот же класс
+# нарушения «Тормоз без газа не принимается», от которого уже отказались
+# для 1/5. Условие обратного включения — ПРОВЕРЯЕМОЕ: backlog разобран
+# (каталоги перенесены в openspec/changes/archive/ отдельными PR, план —
+# OPENSPEC-PROTOCOL.md) до нуля нарушений по обоим путям, тогда 4
+# возвращается в CI_GATING той же правкой константы.
+#
 # 1, 2, 5 остаются наблюдательными по исходному решению владельца (см.
 # docstring выше). Включение любого номера — явная правка этой константы
 # после проверки условия.
-CI_GATING: frozenset[int] = frozenset({4, 7})
+CI_GATING: frozenset[int] = frozenset({7})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -203,7 +245,9 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "попытки — перезапусти ai-review.yml вручную или сними review:ok",
     4: "перенеси openspec/changes/<id> в openspec/changes/archive/ (создай "
        "каталог, если его ещё нет) — раздел полностью выполнен, самое время "
-       "заархивировать",
+       "заархивировать (ключ держим не в CI_GATING, см. комментарий выше "
+       "константы — как и у 3, это факт про газ, а не про то, гейтит ли "
+       "сейчас 4)",
     7: "переформулируй однозначно — «артефакт владельца по адресу X» либо "
        "«наш плагин (пишем мы, не апстрим)»; правило — AGENTS.md, "
        "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
@@ -459,11 +503,84 @@ def stuck_gate_fact_line(item: dict) -> str:
 
 _CHECKBOX_RE = re.compile(r"^\s*-\s*\[([ xX])\]", re.MULTILINE)
 
+# Абзац-декларация задачи в proposal.md — первая строка начинается с
+# «Задача»/«Задачи» (обе формы встречаются, docs/agents/OPENSPEC-PROTOCOL.md).
+# Абзац — до пустой строки, не вся страница: task-rework-loop проза НИЖЕ по
+# файлу упоминает #200/#245/#247 как чужой контекст (зависимости, история),
+# а собственной заведённой задачи ещё не имеет (proposal.md прямо говорит
+# «issue в пуле пока не заведена этим change») — взять первый `#N` по ВСЕМУ
+# файлу означало бы приписать change чужой номер и закрыть его по чужому
+# состоянию.
+_DECLARED_TASK_PARA_RE = re.compile(r"^Задач")
 
-def check_unarchived_complete_changes(changes_dir: Path) -> list[dict]:
-    """Каталог openspec/changes/<id>/tasks.md, где ВСЕ чекбоксы отмечены
-    (и их хотя бы один), а сам каталог лежит не под openspec/changes/archive/
-    (её пока не существует вовсе — задокументированный факт задачи #244)."""
+
+def declared_change_task(proposal_text: str) -> int | None:
+    """Первый номер задачи из абзаца-декларации, `None` — декларации нет
+    (change ещё не заведён в пуле, или вопрос завершённости решается только
+    через tasks.md). Переиспользует task_ref.extract_task_refs — то же
+    место правды на форму `#N` с границей числа, что и весь остальной
+    репозиторий (#187), не вторая копия регэкспа здесь."""
+    if not proposal_text:
+        return None
+    for para in re.split(r"\n\s*\n", proposal_text):
+        stripped = para.strip()
+        if not stripped or not _DECLARED_TASK_PARA_RE.match(stripped):
+            continue
+        refs = task_ref.extract_task_refs(para)
+        return refs[0] if refs else None
+    return None
+
+
+def fetch_task_states(repo: str, numbers: set[int]) -> dict[int, dict]:
+    """`{номер: {"state":.., "state_reason":..}}` для заданных issue —
+    точечные вызовы по номеру (не листинг): номеров мало (один на change,
+    ≤44 на сегодня), а закрытых issue в репозитории уже 200+ и растёт —
+    листинг задним числом расширялся бы бесконечно (см. fetch_merged_pulls
+    выше про тот же компромисс на стороне PR). RuntimeError (сеть/404) не
+    поднимаем — задача с этим номером просто не попадёт в словарь, и второй
+    путь check_unarchived_complete_changes честно её пропустит, не упав."""
+    states: dict[int, dict] = {}
+    for number in sorted(numbers):
+        try:
+            issue = gh(f"repos/{repo}/issues/{number}")
+        except RuntimeError:
+            continue
+        if issue:
+            states[number] = {
+                "state": issue.get("state"),
+                "state_reason": issue.get("state_reason"),
+            }
+    return states
+
+
+def check_unarchived_complete_changes(
+    changes_dir: Path,
+    task_states: dict[int, dict] | None = None,
+    open_pull_texts: list[str] | None = None,
+) -> list[dict]:
+    """Каталог openspec/changes/<id> завершён, но не лежит под
+    openspec/changes/archive/ (её пока не существует вовсе — задокументиро-
+    ванный факт задачи #244) — ЛЮБОЕ из двух НЕЗАВИСИМЫХ условий:
+
+    (a) быстрый путь — tasks.md существует, и в нём отмечен КАЖДЫЙ чекбокс
+        (и есть хотя бы один). Годится для change, заведённых после того,
+        как tasks.md стал обязателен.
+
+    (b) второй путь — применяется, ТОЛЬКО когда tasks.md вообще НЕ
+        существует (не «существует, но не всё отмечено» — незакрытый
+        чеклист это реальная незавершённая работа, второй путь не должен её
+        перебивать чужим фактом): proposal.md декларирует задачу
+        (declared_change_task), эта задача закрыта с state_reason=completed
+        (task_states — предзагруженный словарь, IO снаружи, см.
+        fetch_task_states), и ни один открытый PR не ссылается на путь
+        `openspec/changes/<id>` буквально (open_pull_texts — предзагруженные
+        title+body открытых PR, IO снаружи, см. fetch_open_pulls). Оба
+        аргумента `None` по умолчанию — путь (b) тогда просто не
+        применяется (существующие вызовы с одним `changes_dir` не меняют
+        поведения, см. тесты test_unarchived_complete_*).
+
+    Подробный протокол и цифры реального backlog —
+    docs/agents/OPENSPEC-PROTOCOL.md."""
     if not changes_dir.is_dir():
         return []
     violations = []
@@ -471,11 +588,26 @@ def check_unarchived_complete_changes(changes_dir: Path) -> list[dict]:
         if not entry.is_dir() or entry.name == "archive":
             continue
         tasks_md = entry / "tasks.md"
-        if not tasks_md.exists():
+        if tasks_md.exists():
+            boxes = _CHECKBOX_RE.findall(tasks_md.read_text(encoding="utf-8"))
+            if boxes and all(box.lower() == "x" for box in boxes):
+                violations.append({"change": entry.name, "checked": len(boxes)})
+            continue  # tasks.md существует — путь (b) не подменяет его сигнал
+        if task_states is None or open_pull_texts is None:
             continue
-        boxes = _CHECKBOX_RE.findall(tasks_md.read_text(encoding="utf-8"))
-        if boxes and all(box.lower() == "x" for box in boxes):
-            violations.append({"change": entry.name, "checked": len(boxes)})
+        proposal_md = entry / "proposal.md"
+        if not proposal_md.exists():
+            continue
+        task_number = declared_change_task(proposal_md.read_text(encoding="utf-8"))
+        if task_number is None:
+            continue
+        state = task_states.get(task_number)
+        if not state or state.get("state") != "closed" or state.get("state_reason") != "completed":
+            continue
+        needle = f"openspec/changes/{entry.name}"
+        if any(needle in text for text in open_pull_texts):
+            continue
+        violations.append({"change": entry.name, "task": task_number, "reason": "task-closed"})
     return violations
 
 
@@ -747,6 +879,29 @@ def fetch_merged_pulls(repo: str, max_pages: int = 5) -> list[dict]:
     return results
 
 
+def changes_without_tasks_md(changes_dir: Path) -> dict[str, int]:
+    """`{имя_change: номер_задачи}` для каталогов БЕЗ tasks.md, чей
+    proposal.md декларирует задачу (declared_change_task) — только эти
+    номера стоит спрашивать у fetch_task_states (второй путь
+    check_unarchived_complete_changes не смотрит дальше, см. её докстринг).
+    Чистая файловая функция (как и сам check_*), сетевой IO — отдельно."""
+    if not changes_dir.is_dir():
+        return {}
+    result: dict[str, int] = {}
+    for entry in sorted(changes_dir.iterdir()):
+        if not entry.is_dir() or entry.name == "archive":
+            continue
+        if (entry / "tasks.md").exists():
+            continue
+        proposal_md = entry / "proposal.md"
+        if not proposal_md.exists():
+            continue
+        task_number = declared_change_task(proposal_md.read_text(encoding="utf-8"))
+        if task_number is not None:
+            result[entry.name] = task_number
+    return result
+
+
 def fetch_open_pulls(repo: str) -> list[dict]:
     """Постранично (review_labels.list_pages, класс #308) — тот же приём, что
     fetch_open_task_issues выше."""
@@ -782,6 +937,11 @@ def build_report(repo: str, now: datetime,
     open_tasks = fetch_open_task_issues(repo)
     merged_pulls = fetch_merged_pulls(repo)
     open_pulls = fetch_open_pulls(repo)
+    declared_tasks = changes_without_tasks_md(OPENSPEC_CHANGES)
+    task_states = fetch_task_states(repo, set(declared_tasks.values()))
+    open_pull_texts = [
+        (pull.get("title") or "") + "\n" + (pull.get("body") or "") for pull in open_pulls
+    ]
 
     findings: dict[int, list] = {}
     lines = ["## Инварианты состояния репозитория (#244)"]
@@ -809,14 +969,20 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [3] нет застрявших PR с гейтом 1 без ai:*")
 
-    v4 = check_unarchived_complete_changes(OPENSPEC_CHANGES)
+    v4 = check_unarchived_complete_changes(OPENSPEC_CHANGES, task_states, open_pull_texts)
     findings[4] = v4
     if v4:
-        lines.append(f"🚨 [4] {len(v4)} openspec/changes полностью отмечены и не заархивированы:")
+        lines.append(f"🚨 [4] {len(v4)} openspec/changes завершены и не заархивированы:")
         for item in v4:
-            lines.append(f"   — openspec/changes/{item['change']} ({item['checked']} чекбоксов)")
+            if "checked" in item:
+                lines.append(f"   — openspec/changes/{item['change']} ({item['checked']} чекбоксов)")
+            else:
+                lines.append(
+                    f"   — openspec/changes/{item['change']} (задача #{item['task']} "
+                    "закрыта completed, нет tasks.md, нет открытого PR на этот путь)"
+                )
     else:
-        lines.append("💚 [4] нет полностью отмеченных незаархивированных change")
+        lines.append("💚 [4] нет завершённых незаархивированных change")
 
     v5 = check_duplicate_evidence(open_tasks)
     findings[5] = v5
