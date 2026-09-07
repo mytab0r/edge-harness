@@ -11,11 +11,17 @@
 # schedule» — троттлинг внутри quota_watch.py всё равно ограничивает частоту
 # дорогого CF-запроса, лишние срабатывания cron не удваивают стоимость).
 #
-# permissions.actions:read — troттлинг (`recent_run_within`) читает историю
-# ПРОШЛЫХ прогонов этого же workflow, чтобы не звать Cloudflare чаще
-# CHECK_INTERVAL_MINUTES независимо от частоты pull_request. permissions.
-# issues:write — эскалация (Telegram + след в #120) и заведение задачи через
-# scripts/gh/issue-create при пробитии порога (см. quota_alert.py).
+# permissions.actions:read — троттлинг (`last_real_measurement_age_minutes`,
+# gate_main ниже) читает историю ПРОШЛЫХ прогонов этого же workflow И их шаги (jobs API),
+# чтобы отличить прогон, реально выполнивший CF-замер, от завершённого
+# прогона, который замер не делал (упал раньше, холостой — гейт сам решил не
+# измерять): любой completed-прогон одинаково открывал троттлинг ДО этой
+# правки, слепя сторож именно в активные часы (found: ревью PR #607,
+# докстринг scripts/measure/quota_watch.py, «Троттлинг: только реальный
+# замер»). permissions.issues:write — эскалация (Telegram + след в #120) и
+# заведение задачи через scripts/gh/issue-create при пробитии порога (см.
+# quota_alert.py), а также сигнал «замер не выполнялся дольше порога»
+# (quota_watch.py::stale_alert).
 name: quota-watch
 
 on:
@@ -45,14 +51,33 @@ jobs:
 
       - name: Тесты сторожа квот
         run: |
-          pip install --quiet pytest
+          pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py -q
 
-      - name: Дешёвая проверка + (не чаще раза в час, best-effort) полный срез
+      # Гейт против шага замера ниже (found: ревью PR #607) — ИМЕНА шагов
+      # («id: gate» + `steps.gate.outputs.proceed`, и точный текст этого
+      # name:) читает scripts/measure/quota_watch.py::GATE_STEP_NAME/
+      # MEASURE_STEP_NAME при разборе jobs/steps API прошлых прогонов;
+      # синхронность имён с константами проверяет
+      # test_quota_watch.py::test_workflow_step_names_match_constants.
+      - name: "Гейт: нужен ли реальный замер"
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quota_watch.py gate
+
+      # `if:` условие — единственный способ получить conclusion=skipped в
+      # jobs/steps API, когда гейт решил не измерять (см. коммент выше):
+      # без него шаг всегда «success» и следующий тик снова не отличит
+      # «замерили» от «пропустили» (ровно дефект, который правит этот PR).
+      - name: Замер квоты (Cloudflare)
+        if: steps.gate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/measure/quota_watch.py
+        run: python scripts/measure/quota_watch.py measure

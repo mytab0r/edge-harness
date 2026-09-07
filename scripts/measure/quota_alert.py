@@ -76,6 +76,17 @@ _pg_spec.loader.exec_module(pulse_guard)  # type: ignore[union-attr]
 
 WATCHDOG_ISSUE = pulse_guard.WATCHDOG_ISSUE
 
+# Порог по умолчанию — ОДНО место правды (quotas.THRESHOLD_PCT), не второй
+# независимый литерал 80.0 (found: ревью PR #607, некритичное замечание):
+# оба вызывающих (quota_watch.py::cheap_check/full_sweep) уже передают
+# threshold=quotas.THRESHOLD_PCT явно, но дефолт этой сигнатуры (для прямых
+# вызовов/тестов) обязан отслеживать то же число, иначе правка одного не
+# долетела бы до другого молча.
+_QZ_PATH = Path(__file__).with_name("quotas.py")
+_qz_spec = importlib.util.spec_from_file_location("quotas", _QZ_PATH)
+quotas = importlib.util.module_from_spec(_qz_spec)
+_qz_spec.loader.exec_module(quotas)  # type: ignore[union-attr]
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ISSUE_CREATE = REPO_ROOT / "scripts" / "gh" / "issue-create"
 
@@ -192,7 +203,8 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
 
 
 def check_and_alert(repo: str, resource_key: str, resource_label: str,
-                     current: float, limit: float, pct: float, threshold: float = 80.0) -> str:
+                     current: float, limit: float, pct: float,
+                     threshold: float = quotas.THRESHOLD_PCT) -> str:
     """Единая точка входа обоих вызывающих (см. докстринг модуля). Возвращает
     строку для лога прогона — вызывающий печатает её и решает про exit code
     по той же подстроке "НЕ доставлен"/"НЕ оставлен", что и quotas.py.
