@@ -510,6 +510,208 @@ def test_unarchived_complete_mutation_guard(tmp_path):
     assert all(v["change"] != "archive" for v in violations)
 
 
+# ── Инвариант 4, второй путь: proposal.md + задача completed + нет PR ──────
+#
+# Прод-форма: реальный текст proposal.md двух каталогов этого репозитория
+# (openspec/changes/reopen-rejected, openspec/changes/task-rework-loop, сняты
+# 2026-09-07) и реальная форма ответа `gh api repos/.../issues/369`.
+
+REOPEN_REJECTED_PROPOSAL = """# reopen-rejected: закрытая задача не переоткрывается никогда (#369)
+
+Задача: #369. Дельта-спека:
+[specs/journal-tasks-hands/spec.md](specs/journal-tasks-hands/spec.md).
+Развилка вариантов и почему выбран текущий — [design.md](design.md).
+
+## Зачем
+
+Решение владельца.
+"""
+
+# Реальная проза task-rework-loop: собственной задачи ещё нет («issue в пуле
+# пока не заведена этим change»), а первый #N по всему файлу (#200, PR,
+# слитый до этого change) — чужой номер. declared_change_task обязан вернуть
+# None здесь, а не 200 (иначе второй путь закрыл бы change по состоянию
+# ЧУЖОЙ, уже решённой задачи — живая находка при замере на этом репозитории,
+# 2026-09-07: без абзацного якоря второй путь ошибочно считал бы завершённым
+# dsh-edge-plugin-system и подобные — не по этому фикстюру, но по тому же
+# классу «первый #N в файле — не то же самое, что декларация»).
+TASK_REWORK_LOOP_PROPOSAL = """# task-rework-loop: конечный цикл реворка — бюджет, needs-spec, а не беклог
+
+Задача владельца: сформулирована в чате 2026-09-03, issue в пуле пока не
+заведена этим change — заводится как часть tasks.md (п.0).
+
+## Класс проблемы
+
+scripts/orchestra/scheduler.py::unhealthy_pulls (слито PR #200) снимает
+исполнителя с задачи.
+"""
+
+ISSUE_369_COMPLETED = {"state": "closed", "state_reason": "completed"}
+
+# Реальный шаблон тела PR этого репозитория (буквальный пункт чек-листа,
+# скопирован из PR #261, `gh api repos/mytab0r/edge-harness/pulls/261`,
+# 2026-09-07) — «Дифф ограничен `openspec/changes/<id>/`» — тот случай, когда
+# открытый PR ссылается на путь change буквально.
+OPEN_PR_REFERENCING_PATH = (
+    "## Чек-лист\n\n- [x] Дифф ограничен `openspec/changes/reopen-rejected/`"
+)
+# Реальное тело другого открытого PR этого репозитория (#618, 2026-09-07),
+# упоминает "#477"/пулс-гвардию, но не путь reopen-rejected — контекст
+# соседней, не связанной задачи.
+OPEN_PR_UNRELATED = (
+    "Задача: #616.\n\n## Дефект\n\n"
+    "`scripts/orchestra/pulse_guard.py::failure_watch` (#477) заводил задачи "
+    "`task+ci-failure` БЕЗ какого-либо суточного потолка."
+)
+
+
+def test_declared_change_task_reads_declaration_paragraph():
+    assert ri.declared_change_task(REOPEN_REJECTED_PROPOSAL) == 369
+
+
+def test_declared_change_task_ignores_prose_before_declaration():
+    assert ri.declared_change_task(TASK_REWORK_LOOP_PROPOSAL) is None
+
+
+# Мутационная гвардия (ревью PR #663, некритичное замечание «якорь `^Задач`
+# слишком широкий — матчит и «Задача владельца:»»). Абзац ниже — та же чужая
+# декларация, что открывает реальный task-rework-loop/proposal.md, но с
+# добавленным чужим #999 в том же абзаце: со старым якорём `^Задач` (без
+# требования двоеточия сразу после слова) этот абзац матчился бы как
+# декларация и declared_change_task вернул бы 999 — чужой номер задачи,
+# который второй путь check_unarchived_complete_changes закрыл бы по чужому
+# состоянию. Снять `(?:а|и):` из _DECLARED_TASK_PARA_RE (вернуть `^Задач`) —
+# тест ниже покраснеет.
+OWNER_PROSE_WITH_STRAY_ISSUE_NUMBER = """# task-rework-loop: конечный цикл реворка
+
+Задача владельца: сформулирована в чате 2026-09-03, ссылается на #999 из
+истории обсуждения — issue в пуле пока не заведена этим change.
+
+## Класс проблемы
+
+Прочая проза.
+"""
+
+
+def test_declared_change_task_ignores_owner_prose_even_with_stray_issue_number():
+    assert ri.declared_change_task(OWNER_PROSE_WITH_STRAY_ISSUE_NUMBER) is None
+
+
+# ── fetch_task_states: 404 честно пропускается, любая другая ошибка — нет ──
+#
+# Некритичное замечание ревью PR #663: RuntimeError от gh() был неотличим от
+# 404 — сетевой сбой/квота молча превращали бы «нарушений нет» в ложно-зелёный
+# инвариант 4 ровно тогда, когда кто-то проверяет условие возврата в
+# CI_GATING. Прод-форма сообщения — реальный вывод `gh api` на несуществующий
+# issue этого репозитория (см. текст ниже, воспроизведён живым вызовом).
+REAL_GH_404_STDERR = (
+    'repos/mytab0r/edge-harness/issues/999999999: {"message":"Not Found",'
+    '"documentation_url":"https://docs.github.com/rest/issues/issues#get-an-issue",'
+    '"status":"404"} (HTTP 404)'
+)
+
+
+def test_fetch_task_states_skips_missing_issue_on_404(monkeypatch):
+    def fake(*args):
+        raise RuntimeError(REAL_GH_404_STDERR)
+
+    monkeypatch.setattr(ri, "gh", fake)
+    assert ri.fetch_task_states(REPO, {999999999}) == {}
+
+
+def test_fetch_task_states_raises_on_non_404_error(monkeypatch):
+    """Мутация: снять проверку `"HTTP 404" not in str(exc)` (вернуть голое
+    `except RuntimeError: continue`, как было до фикса #663) — этот тест
+    покраснеет, потому что сетевой сбой перестанет отличаться от 404 и
+    молча даст пустой словарь вместо честного падения."""
+
+    def fake(*args):
+        raise RuntimeError("repos/mytab0r/edge-harness/issues/369: "
+                            "API rate limit exceeded for installation")
+
+    monkeypatch.setattr(ri, "gh", fake)
+    with pytest.raises(RuntimeError, match="rate limit"):
+        ri.fetch_task_states(REPO, {369})
+
+
+def write_proposal(tmp_path, name, content):
+    change_dir = tmp_path / name
+    change_dir.mkdir(parents=True, exist_ok=True)
+    (change_dir / "proposal.md").write_text(content, encoding="utf-8")
+    return change_dir
+
+
+def test_unarchived_second_path_flags_closed_completed_no_open_pr(tmp_path):
+    write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    violations = ri.check_unarchived_complete_changes(
+        tmp_path, task_states={369: ISSUE_369_COMPLETED}, open_pull_texts=[OPEN_PR_UNRELATED]
+    )
+    assert violations == [{"change": "reopen-rejected", "task": 369, "reason": "task-closed"}]
+
+
+def test_unarchived_second_path_silent_when_no_data_passed(tmp_path):
+    # Обратная совместимость: старые вызовы (только changes_dir) не должны
+    # начать находить новые нарушения молча — их тут не с чем сравнить,
+    # второй путь просто не запускается без обоих аргументов.
+    write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    assert ri.check_unarchived_complete_changes(tmp_path) == []
+
+
+def test_unarchived_second_path_silent_when_task_not_completed(tmp_path):
+    write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    still_open = {369: {"state": "open", "state_reason": None}}
+    assert ri.check_unarchived_complete_changes(
+        tmp_path, task_states=still_open, open_pull_texts=[]
+    ) == []
+    not_planned = {369: {"state": "closed", "state_reason": "not_planned"}}
+    assert ri.check_unarchived_complete_changes(
+        tmp_path, task_states=not_planned, open_pull_texts=[]
+    ) == []
+
+
+def test_unarchived_second_path_silent_when_open_pr_references_path(tmp_path):
+    write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    violations = ri.check_unarchived_complete_changes(
+        tmp_path,
+        task_states={369: ISSUE_369_COMPLETED},
+        open_pull_texts=[OPEN_PR_UNRELATED, OPEN_PR_REFERENCING_PATH],
+    )
+    assert violations == []
+
+
+def test_unarchived_second_path_yields_to_tasks_md_even_if_unchecked(tmp_path):
+    # Живой случай, найденный замером на этом репозитории 2026-09-07:
+    # openspec/changes/dsh-edge-plugin-system несёт tasks.md с 7
+    # неотмеченными пунктами из 44 — реальная незавершённая работа, хотя
+    # эпик-issue (#78) давно закрыт completed. Второй путь обязан молчать
+    # везде, где tasks.md вообще существует, — не только там, где он
+    # полностью отмечен. Доказано мутацией (2026-09-07): убрать `continue`
+    # сразу после блока tasks.md в repo_invariants.py — этот тест краснеет
+    # (путь (b) начинает молча перебивать реальный незакрытый чеклист).
+    change_dir = write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    (change_dir / "tasks.md").write_text("- [x] один\n- [ ] два — ещё в работе\n", encoding="utf-8")
+    violations = ri.check_unarchived_complete_changes(
+        tmp_path, task_states={369: ISSUE_369_COMPLETED}, open_pull_texts=[]
+    )
+    assert violations == []
+
+
+def test_unarchived_second_path_mutation_guard(tmp_path):
+    """Докажи мутацией (AGENTS.md, «Починил случай — закрой класс»): убери
+    условие `state.get("state_reason") != "completed"` в
+    repo_invariants.py::check_unarchived_complete_changes (например, замени
+    на `not state`) — этот тест краснеет, потому что задача с
+    state_reason="not_planned" (интеграции, брошенные не как решённые)
+    начинает ложно закрывать change. Проверено вручную 2026-09-07: со снятым
+    условием test_unarchived_second_path_silent_when_task_not_completed
+    падает (violations непусты вместо []), с условием — проходит."""
+    write_proposal(tmp_path, "reopen-rejected", REOPEN_REJECTED_PROPOSAL)
+    not_planned = {369: {"state": "closed", "state_reason": "not_planned"}}
+    assert ri.check_unarchived_complete_changes(
+        tmp_path, task_states=not_planned, open_pull_texts=[]
+    ) == []
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 5: пересекающаяся улика file:line у двух открытых задач
 # ══════════════════════════════════════════════════════════════════════════

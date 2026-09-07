@@ -24,10 +24,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Файлы, где широкая семантика ОСОЗНАННА и заявлена в докстринге самого
 # места вызова — одно место правды списка исключений, не разбросано по коду.
-# Сейчас единственный: scripts/orchestra/scheduler.py — pr_references_issue
-# (reap_stale/unhealthy_pulls) и after_merge, см. их докстринги.
+# scripts/orchestra/scheduler.py — pr_references_issue (reap_stale/
+# unhealthy_pulls) и after_merge, см. их докстринги. scripts/orchestra/
+# repo_invariants.py — declared_change_task (инвариант 4, второй путь
+# завершённости, docs/agents/OPENSPEC-PROTOCOL.md): другой вопрос, чем
+# «какая задача у этого PR» (резолюция PR из #259 сюда не относится вовсе,
+# это proposal.md openspec change) — но всё равно широкая семантика
+# `#N`-паттерна, поэтому назван здесь явно. Безопасно уже потому, что вход
+# ОГРАНИЧЕН абзацем-декларацией («Задач…» первой строкой, см. докстринг
+# declared_change_task), а не всем файлом — ровно та защита, которой не
+# хватало `ai_review.py::task_section` в живом случае #259.
 ALLOWED_WIDE_USAGE = {
     Path("scripts/orchestra/scheduler.py"),
+    Path("scripts/orchestra/repo_invariants.py"),
 }
 
 WIDE_CALL_RE = re.compile(r"task_ref\.(extract_task_refs|references_task)\(")
