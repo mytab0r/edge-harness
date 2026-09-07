@@ -34,6 +34,11 @@ export const ID_PATTERN = new RegExp('^(?:' + ID_BODY_SOURCE + ')$')
 export const ID_PATTERN_SOURCE = ID_BODY_SOURCE
 const PACKAGE_PATTERN = /^@edge-harness\/[a-z0-9][a-z0-9.-]*$/
 const RELEASE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+// Тег релиза плагина — паттерн форжа «plugins-<id>-v<версия>» (semver):
+// plugin-forge.yml публикует релиз ровно с таким тегом, деплой скачивает
+// имя релиза из манифеста. Паттерн один здесь — и его же держит README
+// каждого плагина; вольное имя релиза по образцу соседа — класс #659.
+const RELEASE_TAG_PATTERN = /^plugins-([a-z][a-z0-9-]*)-v(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 
 export function parseManifest(source) {
@@ -67,6 +72,19 @@ export function parseManifest(source) {
       `${where}: source.asset must be a release asset name ending in .tgz, not a path or URL.`)
     failUnless(SHA256_PATTERN.test(plugin.source.sha256),
       `${where}: source.sha256 must be 64 lowercase hex characters.`)
+    // Связка release/asset/id (класс #659, инцидент оставляет инвариант):
+    // форж публикует тег «plugins-<id>-v<версия>», деплой берёт имя релиза
+    // из манифеста — расхождение раньше ловилось только красным деплоем на
+    // main после мержа (живой случай #659: «plugins-runner-v0.1.2» при id
+    // runner-bridge, форж дал plugins-runner-bridge-v0.1.2; сут красного
+    // прода и задача #659). Здесь расхождение умирает валидацией формы.
+    const releaseTag = RELEASE_TAG_PATTERN.exec(plugin.source.release)
+    failUnless(releaseTag,
+      `${where}: source.release ${JSON.stringify(plugin.source.release)} must be the forge tag "plugins-<id>-v<version>" (plugin-forge.yml publishes exactly that), not a free-form name.`)
+    failUnless(releaseTag[1] === plugin.id,
+      `${where}: source.release names plugin "${releaseTag[1]}" but the entry id is "${plugin.id}" — the manifest must pin the forge tag plugins-${plugin.id}-v<version>.`)
+    failUnless(plugin.source.asset.endsWith(`-${releaseTag[2]}.tgz`),
+      `${where}: source.asset ${JSON.stringify(plugin.source.asset)} must carry the release version (…-${releaseTag[2]}.tgz).`)
     failUnless(typeof plugin.server === 'boolean' && typeof plugin.client === 'boolean',
       `${where}: server and client must be booleans.`)
     failUnless(plugin.server || plugin.client, `${where}: at least one of server/client must be true.`)
