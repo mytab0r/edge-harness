@@ -122,6 +122,27 @@ def test_build_report_flags_broken_link(tmp_path):
     assert report["broken_links"] == ["docs/decisions/9999-ghost.md"]
 
 
+def test_build_report_flags_broken_link_outside_observed_dirs(tmp_path):
+    # Второй гейт #673: обратная проверка не должна быть сужена молча до
+    # наблюдаемых каталогов — ссылка на файл-призрак ЗА их пределами обязана
+    # красить отчёт так же, как призрак внутри них.
+    index_md = _write_docs_fixture(
+        tmp_path,
+        "- [ADR 1](decisions/0001-a.md)\n"
+        "- [ADR 2](decisions/0002-b.md)\n"
+        "- [Ghost sibling](api-ghost.md)\n"
+        "- [Ghost outside docs/](../GHOST.md)\n"
+        "- [Ghost nested elsewhere](../openspec/ghost/spec.md)\n",
+    )
+    report = dig.build_report(tmp_path, ("docs/decisions",), index_md)
+    assert report["missing"] == []
+    assert report["broken_links"] == [
+        "GHOST.md",
+        "docs/api-ghost.md",
+        "openspec/ghost/spec.md",
+    ]
+
+
 def test_build_report_exemption_suppresses_missing(tmp_path):
     docs = tmp_path / "docs"
     (docs / "decisions").mkdir(parents=True)
@@ -134,6 +155,37 @@ def test_build_report_exemption_suppresses_missing(tmp_path):
     report = dig.build_report(tmp_path, ("docs/decisions",), index_md)
     assert report["missing"] == []
     assert report["exemptions"] == {"docs/decisions/0002-draft.md": "черновик, ещё не готов к публикации"}
+
+
+def test_build_report_raises_loud_on_unlisted_docs_subdir(tmp_path):
+    # Доделка «хвоста» второго гейта #673: новый подкаталог docs/, не входящий
+    # ни в наблюдаемые, ни в явные исключения, не должен ускользать молча.
+    docs = tmp_path / "docs"
+    (docs / "decisions").mkdir(parents=True)
+    (docs / "decisions" / "0001-a.md").write_text("a", encoding="utf-8")
+    (docs / "design").mkdir()  # новый каталог, не заявленный нигде
+    (docs / "design" / "x.md").write_text("x", encoding="utf-8")
+    index_md = docs / "INDEX.md"
+    index_md.write_text("- [ADR 1](decisions/0001-a.md)\n", encoding="utf-8")
+    try:
+        dig.build_report(tmp_path, ("docs/decisions",), index_md)
+    except RuntimeError as exc:
+        assert "docs/design" in str(exc)
+    else:
+        raise AssertionError(
+            "build_report обязан падать громко на подкаталоге docs/, "
+            "не входящем ни в OBSERVED_DIRS, ни в EXCLUDED_TOP_LEVEL_DIRS"
+        )
+
+
+def test_find_unlisted_docs_dirs_respects_excluded_list(tmp_path):
+    docs = tmp_path / "docs"
+    (docs / "decisions").mkdir(parents=True)
+    (docs / "vendor").mkdir()
+    unlisted = dig.find_unlisted_docs_dirs(
+        tmp_path, docs, ("docs/decisions",), {"docs/vendor": "сторонний снапшот, не наша документация"}
+    )
+    assert unlisted == []
 
 
 def test_build_report_raises_loud_on_zero_files(tmp_path):

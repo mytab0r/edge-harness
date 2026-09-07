@@ -49,6 +49,12 @@
 отчёт по неверной причине (тот же класс, что и «список тестов внезапно
 пуст» у orphan_test_guard.py).
 
+OBSERVED_DIRS — ручная копия структуры `docs/`, а не производная от файловой
+системы: появление пятого подкаталога иначе ускользает молча (класс «скан по
+одному варианту», #635, тот же, что и «оба расширения» выше). Гвардия падает
+громко (`RuntimeError`), если прямой подкаталог `docs/` не входит ни в
+`OBSERVED_DIRS`, ни в явно поименованный `EXCLUDED_TOP_LEVEL_DIRS` с причиной.
+
 Запуск:
   python scripts/lib/docs_index_guard.py       # живой снимок, exit 1 при находках
   python -m pytest scripts/lib/test_docs_index_guard.py -q
@@ -68,6 +74,12 @@ INDEX_MD = DOCS_DIR / "INDEX.md"
 
 # Наблюдаемые каталоги — repo-relative posix, обоснование в докстринге модуля.
 OBSERVED_DIRS = ("docs/decisions", "docs/research", "docs/runbooks", "docs/agents")
+
+# Прямые подкаталоги docs/, намеренно вне OBSERVED_DIRS — с причиной, не
+# молча. Пусто сегодня: единственное текущее исключение из докстринга,
+# `docs/research/data/*.csv`, лежит ВНУТРИ уже наблюдаемого docs/research/,
+# а не рядом с ним, поэтому отдельной записи не требует.
+EXCLUDED_TOP_LEVEL_DIRS: dict[str, str] = {}
 
 # Оба markdown-расширения — см. докстринг («скан по одному суффиксу», #635).
 DOC_EXTENSIONS = {".md", ".markdown"}
@@ -98,6 +110,30 @@ def discover_doc_files(repo_root: Path = REPO_ROOT, dirs: tuple[str, ...] = OBSE
                 if Path(name).suffix.lower() in DOC_EXTENSIONS:
                     found.append(_relpath(Path(dirpath) / name, repo_root))
     return sorted(found)
+
+
+def list_docs_top_level_dirs(repo_root: Path = REPO_ROOT, docs_dir: Path = DOCS_DIR) -> list[str]:
+    """Прямые подкаталоги docs/, repo-relative posix, отсортированные."""
+    if not docs_dir.is_dir():
+        return []
+    return sorted(
+        _relpath(entry, repo_root)
+        for entry in docs_dir.iterdir()
+        if entry.is_dir()
+    )
+
+
+def find_unlisted_docs_dirs(
+    repo_root: Path = REPO_ROOT,
+    docs_dir: Path = DOCS_DIR,
+    observed: tuple[str, ...] = OBSERVED_DIRS,
+    excluded: dict[str, str] = EXCLUDED_TOP_LEVEL_DIRS,
+) -> list[str]:
+    """Прямые подкаталоги docs/, не входящие ни в OBSERVED_DIRS, ни в явно
+    поименованный EXCLUDED_TOP_LEVEL_DIRS — «новый подкаталог ускользает
+    молча» (второй гейт #673), тот же класс «скан по одному варианту» (#635)."""
+    known = set(observed) | set(excluded)
+    return [d for d in list_docs_top_level_dirs(repo_root, docs_dir) if d not in known]
 
 
 def read_exemption(path: Path) -> str | None:
@@ -155,6 +191,15 @@ def build_report(repo_root: Path = REPO_ROOT, dirs: tuple[str, ...] = OBSERVED_D
             "тихого зелёного отчёта)"
         )
 
+    unlisted_dirs = find_unlisted_docs_dirs(repo_root, repo_root / "docs", dirs)
+    if unlisted_dirs:
+        raise RuntimeError(
+            f"в docs/ появился подкаталог вне наблюдаемых {dirs} и вне явно "
+            f"поименованных исключений: {unlisted_dirs} — добавь его в "
+            "OBSERVED_DIRS (если это документация того же класса) или в "
+            "EXCLUDED_TOP_LEVEL_DIRS с причиной (scripts/lib/docs_index_guard.py)"
+        )
+
     index_text = index_md.read_text(encoding="utf-8")
     linked = set(find_local_links(index_text))
 
@@ -164,14 +209,19 @@ def build_report(repo_root: Path = REPO_ROOT, dirs: tuple[str, ...] = OBSERVED_D
         if reason:
             exemptions[rel] = reason
 
-    prefixes = tuple(d.rstrip("/") + "/" for d in dirs)
     missing = sorted(
         rel for rel in doc_files
         if rel not in linked and rel not in exemptions
     )
+    # Обратное направление проверяет ЛЮБУЮ локальную ссылку docs/INDEX.md, а
+    # не только те, что попадают в наблюдаемые каталоги (`dirs`/`prefixes`) —
+    # иначе ссылка на файл вне них (`docs/api-ghost.md`, `../GHOST.md`,
+    # `../openspec/ghost/spec.md`) молча проходит зелёной, хотя докстринг
+    # модуля обещает «каждая локальная ссылка обязана резолвиться в
+    # существующий файл» без ограничения каталогами (второй гейт #673).
     broken_links = sorted(
         target for target in linked
-        if target.startswith(prefixes) and not (repo_root / target).is_file()
+        if not (repo_root / target).is_file()
     )
     return {
         "total": len(doc_files),
