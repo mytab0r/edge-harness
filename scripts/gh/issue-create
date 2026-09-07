@@ -25,10 +25,25 @@
 # газ — явный `--confirm-not-duplicate "<почему не дубль>"`, причина попадает
 # в тело issue (не тонет в одном терминале). Совпадений нет — флаг не нужен.
 #
+# Третий тормоз (#695): решение о приоритете (`area:process`,
+# `scripts/lib/free_task.py::META_LABEL`) обязано быть явным — умолчание
+# «просто не поставил» запрещено. Живой случай 2026-09-07: #684/#685/#689
+# заведены с `area:orchestra` вместо `area:process` и встали в хвост очереди
+# из 200 задач как обычные новые, хотя #194/#168/#226 в приоритетной группе
+# уже несли ту же проблему другими словами — дедуп по схожести заголовка
+# (первый тормоз) её не поймал, потому что сравнивает СЛОВА заголовка, а
+# слова были разные (честный потолок метода, docstring duplicate_guard.py).
+# Метка `area:process` среди `--label` — сама по себе решение; если задача
+# НЕ про процесс — явно распишись `--not-process-ack "<причина>"`. Перед
+# созданием печатается текущий верх группы приоритета (открытые
+# `area:process`, тот же ключ сортировки, что `free_task.py::
+# issue_priority_key`, переиспользован, не продублирован) — случай «та же
+# проблема другими словами» ловится глазами в момент заведения.
+#
 # Использование: то же самое, что `gh issue create` — все аргументы
 # проксируются без изменений (--title, --body/--body-file, --label, …),
-# плюс свои --no-task-ack "<причина>" и --confirm-not-duplicate "<причина>"
-# (в gh не уходят).
+# плюс свои --no-task-ack "<причина>", --confirm-not-duplicate "<причина>"
+# и --not-process-ack "<причина>" (в gh не уходят).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +52,7 @@ labels=()
 args=()
 no_task_ack=""
 confirm_not_duplicate=""
+not_process_ack=""
 title=""
 body=""
 # body_slot_kind/body_slot_index — где в args лежит тело, чтобы позже (если
@@ -82,6 +98,13 @@ while [ "$i" -le "$n" ]; do
       ;;
     --confirm-not-duplicate=*)
       confirm_not_duplicate="${arg#--confirm-not-duplicate=}"
+      ;;
+    --not-process-ack)
+      i=$((i + 1))
+      not_process_ack="${!i}"
+      ;;
+    --not-process-ack=*)
+      not_process_ack="${arg#--not-process-ack=}"
       ;;
     --title)
       i=$((i + 1))
@@ -158,12 +181,65 @@ if [ "$has_task" -ne 1 ]; then
   fi
 fi
 
+# repo — нужен и приоритетной проверке ниже, и дедупу (#566): один вызов
+# gh repo view, не два (has_task=1 — единственный случай, где обе секции
+# вообще смотрят в сеть; --no-task-ack уже объявил «это не пул»).
+repo=""
+if [ "$has_task" -eq 1 ]; then
+  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+
+# Третий тормоз (#695): решение о приоритете обязано быть явным — метка
+# area:process среди --label САМА является решением (позитивным); её нет —
+# нужен явный --not-process-ack "<причина>". Только для реальных задач пула
+# (has_task=1) — --no-task-ack уже вывел issue из-под пула, приоритет внутри
+# пула к ней неприменим.
+if [ "$has_task" -eq 1 ]; then
+  meta_label="$(python3 "$SCRIPT_DIR/../lib/free_task.py" meta-label)"
+  has_meta=0
+  for l in "${labels[@]+"${labels[@]}"}"; do
+    IFS=',' read -ra parts <<<"$l"
+    for p in "${parts[@]}"; do
+      if [ "$p" = "$meta_label" ]; then
+        has_meta=1
+      fi
+    done
+  done
+
+  if [ "$has_meta" -ne 1 ] && [ -z "$not_process_ack" ]; then
+    echo "::error::issue-create: приоритет не объявлен явно — нет метки $meta_label среди --label и нет --not-process-ack. Добавь --label $meta_label, если задача про сам процесс работы (протокол/гвардии/CI-ворота), либо распишись --not-process-ack \"причина\", если нет (живой случай 2026-09-07: #684/#685/#689 без этого решения встали в хвост очереди из 200 задач, класс #695)." >&2
+    echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+    exit 1
+  fi
+  if [ -n "$not_process_ack" ]; then
+    echo "issue-create: заведено НЕ как $meta_label, осознанно (--not-process-ack): $not_process_ack" >&2
+  fi
+
+  # Верх группы приоритета ПЕРЕД созданием (#695) — случай «та же проблема
+  # другими словами» ловится глазами: дедуп по схожести заголовка (ниже)
+  # сравнивает слова заголовка и может не совпасть при разных формулировках
+  # одного и того же дефекта (см. duplicate_guard.py, честный потолок метода).
+  if [ -z "$repo" ]; then
+    echo "::warning::issue-create: не смог определить repo (gh repo view) — верх группы приоритета не показан." >&2
+  else
+    echo "issue-create: текущий верх группы приоритета ($meta_label) — сверься глазами, нет ли уже той же проблемы другими словами:" >&2
+    top_err_file="$(mktemp)"
+    top="$(python3 "$SCRIPT_DIR/../lib/free_task.py" priority-top "$repo" 2>"$top_err_file" || true)"
+    top_err="$(cat "$top_err_file" 2>/dev/null || true)"; rm -f "$top_err_file"
+    [ -z "$top_err" ] || echo "$top_err" >&2
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top" | awk -F'\t' '{printf "  #%s: %s\n", $1, $2}' >&2
+    else
+      echo "  (пусто — открытых задач с $meta_label нет)" >&2
+    fi
+  fi
+fi
+
 # Дедупликация по похожести заголовка (#566) — только для реальных задач
 # пула (has_task=1: --no-task-ack явно объявил «это не пул», сравнивать не с
 # чем сравнивать по смыслу) и только если заголовок вообще известен (пустой
 # --title — забота самого gh issue create, здесь просто нечего сравнивать).
 if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
-  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   if [ -z "$repo" ]; then
     echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести пропущена." >&2
   else
