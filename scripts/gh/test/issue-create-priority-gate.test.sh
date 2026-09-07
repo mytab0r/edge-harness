@@ -24,6 +24,12 @@
 # gh issue create, тест краснеет. Верни блок — тест снова зелёный.
 set -euo pipefail
 
+# PYTHONUTF8 — python3 в scripts/lib/*.py пишет кириллицу в stderr; на Windows
+# консольная кодовая страница (напр. 866) иначе коверкает байты ДО того, как
+# они попадут в файл, и случай 5 ниже (сверка текста предупреждения) читает
+# мусор вместо сообщения. Тот же флаг, что предписан для pytest в этом репо.
+export PYTHONUTF8=1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_SRC="$REPO_ROOT/scripts/gh/issue-create"
 
@@ -34,10 +40,13 @@ trap cleanup EXIT
 mkdir -p "$WORK/bin"
 MARKER="$WORK/gh-issue-create-called"
 
+REPO_VIEW_OUTPUT="$WORK/repo-view-output"
+echo "o/r" >"$REPO_VIEW_OUTPUT"
+
 cat >"$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
 if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
-  echo "o/r"
+  cat "$REPO_VIEW_OUTPUT"
   exit 0
 fi
 if [ "\$1" = "issue" ] && [ "\$2" = "create" ]; then
@@ -123,5 +132,31 @@ elif [ "$(grep -n '194' "$WORK/err4" | head -1 | cut -d: -f1)" -gt "$(grep -n '1
 else
   note "OK случай 4: верх группы приоритета показан ПЕРЕД созданием, в порядке issue_priority_key"
 fi
+
+# ── случай 5: сбой priority-top (не сеть, не пусто) — "пусто" НЕ печатается ──
+# Находка ревью PR #697: priority-top при сбое fetch_pool возвращает rc 0 и
+# пустой stdout (отличие только в stderr) — до правки обёртка релеила
+# предупреждение «верх приоритета не показан» и тут же печатала аффирмативное
+# «(пусто — открытых задач нет)» следом, хотя факт не установлен (класс
+# «сломано против пусто», docstring free_task.py, находка #247).
+# "not-a-repo" (без "/") валит task_deps.fetch_pool на _split_repo
+# детерминированно, без сети (тот же приём, что
+# test_cli_priority_top_network_failure_warns_but_does_not_block в
+# test_free_task.py) — фикстура здесь намеренно снята.
+rm -f "$MARKER"
+echo "not-a-repo" >"$REPO_VIEW_OUTPUT"
+if ! PRIORITY_TOP_FIXTURE= bash "$SCRIPT_SRC" --title "Совсем прикладная задача 3" --body b --label task \
+    --not-process-ack "тест сбоя печати верха приоритета" >"$WORK/out5" 2>"$WORK/err5"; then
+  note "FAIL случай 5: вызов отклонён при сбое priority-top (это не гейт)"; cat "$WORK/err5"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 5: gh issue create не вызван при сбое priority-top (это не гейт)"; fail=1
+elif ! grep -q "верх приоритета не показан" "$WORK/err5"; then
+  note "FAIL случай 5: нет предупреждения о сбое priority-top"; cat "$WORK/err5"; fail=1
+elif grep -q "пусто" "$WORK/err5"; then
+  note "FAIL случай 5: после сбоя priority-top всё равно напечатано «пусто» — сломано выдано за пусто (находка #697)"; cat "$WORK/err5"; fail=1
+else
+  note "OK случай 5: сбой priority-top предупреждён, «пусто» НЕ печатается вместо него"
+fi
+echo "o/r" >"$REPO_VIEW_OUTPUT"
 
 exit "$fail"
