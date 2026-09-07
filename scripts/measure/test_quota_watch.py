@@ -405,14 +405,15 @@ def test_gate_main_stays_silent_on_cold_start_never_measured(monkeypatch, tmp_pa
 
 
 def test_gate_main_escalates_true_transition_when_running_copy_matches_main(monkeypatch, tmp_path):
-    """Направление (б): замер БЫЛ (age=60 мин, старше STALE-порога 45) —
-    настоящий переход. Исполняемая копия совпадает с main — эскалация
-    уходит, с классифицированной причиной, не гипотезой."""
+    """Направление (а) мутационной проверки задачи #605-quota-continuous-watch:
+    замер БЫЛ (age=60 мин, старше STALE-порога 45) — настоящий переход.
+    Исполняемая копия совпадает с main — эскалация уходит, с классифицированной
+    причиной, не гипотезой, БЕЗ дополнительной пометки про версию."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
-    monkeypatch.setattr(qw, "running_workflow_matches_main", lambda repo: True)
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
     monkeypatch.setattr(
@@ -425,20 +426,49 @@ def test_gate_main_escalates_true_transition_when_running_copy_matches_main(monk
 
 
 def test_gate_main_suppresses_escalation_when_running_copy_differs_from_main(monkeypatch, tmp_path):
-    """Направление #1 задачи (неслитый код не может разбудить владельца):
-    переход есть (age=60 мин), но исполняемая копия НЕ совпадает с main
-    (неслитый PR/ветка правит именно этот workflow) — эскалация подавлена."""
+    """Направление (б) мутационной проверки: переход есть (age=60 мин), но
+    исполняемая копия ДОСТОВЕРНО НЕ совпадает с main (неслитый PR/ветка
+    правит именно этот workflow) — эскалация подавлена (защита «неслитый код
+    не может разбудить владельца» жива)."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
-    monkeypatch.setattr(qw, "running_workflow_matches_main", lambda repo: False)
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("differs", None))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
 
     assert qw.gate_main() == 0
 
     assert stale_calls == []
+
+
+def test_gate_main_escalates_with_honest_note_when_version_check_fails(monkeypatch, tmp_path):
+    """Направление (в) мутационной проверки, доп. цикл ревью PR #607: сетевой
+    сбой проверки версии (Contents API недоступен) НЕ должен трактоваться как
+    «версия отличается» — эскалация УХОДИТ, и её текст (через reason,
+    переданный в stale_alert) прямо называет, что версию подтвердить не
+    удалось и почему. Раньше `running_workflow_matches_main` возвращала тот
+    же False, что и при достоверном несовпадении, — эскалация тихо гасла
+    именно тогда, когда сеть встала одновременно с простоем замера."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("unknown", "dial tcp: timeout"))
+    monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
+    stale_calls = []
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now, age, reason: stale_calls.append((repo, age, reason)) or "замер простаивал — x")
+
+    assert qw.gate_main() == 0
+
+    assert len(stale_calls) == 1
+    _, _, reason = stale_calls[0]
+    assert "шаг упал (failure)" in reason
+    assert "версию исполняемого workflow подтвердить не удалось" in reason
+    assert "dial tcp: timeout" in reason
 
 
 def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsys):
@@ -484,6 +514,24 @@ def test_stale_alert_escalates_on_first_observation(monkeypatch):
     assert "доставлен" in result
 
 
+def test_stale_alert_text_names_version_check_failure_as_fact(monkeypatch):
+    """Текст эскалации в состоянии "unknown" называет ФАКТ («версию
+    исполняемого workflow подтвердить не удалось: <причина>»), а не молчит о
+    сетевом сбое и не подменяет его гипотезой."""
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker: [])
+    escalated = []
+    monkeypatch.setattr(qw.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+
+    reason = ("шаг упал (failure); кроме того, версию исполняемого workflow подтвердить не удалось: "
+              "dial tcp: timeout")
+    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, reason)
+
+    assert "версию исполняемого workflow подтвердить не удалось" in escalated[0]
+    assert "dial tcp: timeout" in escalated[0]
+    assert "доставлен" in result
+
+
 def test_stale_alert_dedupes_within_same_open_episode(monkeypatch):
     """Эпизод уже открыт (маркер новее любого закрывающего) — повторный вызов
     НЕ шлёт второй алерт (тот же приём, что pulse_guard.heartbeat_check)."""
@@ -499,6 +547,29 @@ def test_stale_alert_dedupes_within_same_open_episode(monkeypatch):
 
     assert escalated == []
     assert "дедуп" in result
+
+
+def test_stale_alert_dedupes_repeated_version_check_network_failure(monkeypatch):
+    """Направление (г) мутационной проверки задачи: сетевой сбой проверки
+    версии повторяется на следующем тике подряд — второе сообщение НЕ
+    уходит. Состояние "unknown" не заводит отдельный канал/маркер — оно
+    переиспользует ТОТ ЖЕ эпизодный дедуп STALE_MARKER/STALE_RESOLVED_MARKER,
+    что и обычный простой, поэтому дедуп работает без отдельного кода."""
+    open_time = datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc)
+
+    def fake_marker_times(repo, issue, marker):
+        return [open_time] if marker == qw.STALE_MARKER else []
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
+    escalated = []
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    reason = ("шаг упал (failure); кроме того, версию исполняемого workflow подтвердить не удалось: "
+              "dial tcp: timeout")
+    result_1 = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, reason)
+    result_2 = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 15, tzinfo=timezone.utc), 75.0, reason)
+
+    assert escalated == []
+    assert "дедуп" in result_1 and "дедуп" in result_2
 
 
 def test_stale_alert_reopens_after_episode_closed(monkeypatch):
@@ -573,11 +644,12 @@ def test_classify_measurement_absence_honest_when_jobs_api_unavailable(monkeypat
     assert "причину установить нельзя" in reason
 
 
-# ── running_workflow_matches_main: неслитый код не может разбудить владельца
-# (found: PR #607 разбудил владельца прогоном из своей же неслитой ветки) ────
+# ── workflow_version_check: три состояния, не два (found: доп. цикл ревью
+# PR #607) — неслитый код не будит владельца, но сетевой сбой проверки НЕ
+# равен «версия отличается» ─────────────────────────────────────────────────
 
 
-def test_running_workflow_matches_main_true_on_byte_identical_copy(monkeypatch, tmp_path):
+def test_workflow_version_check_matches_on_byte_identical_copy(monkeypatch, tmp_path):
     import base64
     content = b"name: quota-watch\n"
     local = tmp_path / "quota-watch.yml"
@@ -586,11 +658,12 @@ def test_running_workflow_matches_main_true_on_byte_identical_copy(monkeypatch, 
     payload = {"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"}
     monkeypatch.setattr(qw.pulse_guard, "gh", lambda *a: payload)
 
-    assert qw.running_workflow_matches_main(REPO) is True
+    assert qw.workflow_version_check(REPO) == ("matches", None)
 
 
-def test_running_workflow_matches_main_false_when_content_differs(monkeypatch, tmp_path):
-    """PR правит именно этот workflow — исполняемая копия отличается от main."""
+def test_workflow_version_check_differs_when_content_differs(monkeypatch, tmp_path):
+    """PR правит именно этот workflow — исполняемая копия отличается от main —
+    ДОСТОВЕРНОЕ несовпадение (Contents API ответил), не «unknown»."""
     import base64
     local = tmp_path / "quota-watch.yml"
     local.write_bytes(b"name: quota-watch  # changed in PR\n")
@@ -598,13 +671,13 @@ def test_running_workflow_matches_main_false_when_content_differs(monkeypatch, t
     payload = {"content": base64.b64encode(b"name: quota-watch\n").decode("ascii"), "encoding": "base64"}
     monkeypatch.setattr(qw.pulse_guard, "gh", lambda *a: payload)
 
-    assert qw.running_workflow_matches_main(REPO) is False
+    assert qw.workflow_version_check(REPO) == ("differs", None)
 
 
-def test_running_workflow_matches_main_false_when_file_absent_on_main(monkeypatch, tmp_path):
-    """Мутационная проверка направления #1 задачи: workflow ещё НЕ на main
-    (PR не слит, gh api отвечает 404) — считается несовпадением, эскалация
-    невозможна, а не гадает."""
+def test_workflow_version_check_differs_when_file_absent_on_main(monkeypatch, tmp_path):
+    """Мутационная проверка направления (б) задачи: workflow ещё НЕ на main
+    (PR не слит, gh api отвечает 404) — ДОСТОВЕРНОЕ несовпадение (Contents
+    API ответил «нет файла»), эскалация подавлена, а не гадает."""
     local = tmp_path / "quota-watch.yml"
     local.write_bytes(b"name: quota-watch\n")
     monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
@@ -613,12 +686,15 @@ def test_running_workflow_matches_main_false_when_file_absent_on_main(monkeypatc
         raise RuntimeError("gh: HTTP 404: Not Found")
     monkeypatch.setattr(qw.pulse_guard, "gh", not_found)
 
-    assert qw.running_workflow_matches_main(REPO) is False
+    assert qw.workflow_version_check(REPO) == ("differs", None)
 
 
-def test_running_workflow_matches_main_false_on_api_error(monkeypatch, tmp_path):
-    """Сеть/права недоступны — безопасный дефолт: НЕ подтверждено совпадение,
-    эскалация подавляется (не наоборот)."""
+def test_workflow_version_check_unknown_on_api_error_not_differs(monkeypatch, tmp_path):
+    """Мутационная проверка направления (в), доп. цикл ревью PR #607: сеть
+    недоступна — Contents API НЕ ОТВЕТИЛ вовсе, это НЕ «отличается», это
+    «проверить не удалось» — отдельное состояние с причиной дословно из
+    ошибки. Старая версия сливала этот исход с «differs» (оба давали False),
+    что гасило эскалацию простоя на транзитном сетевом сбое."""
     local = tmp_path / "quota-watch.yml"
     local.write_bytes(b"name: quota-watch\n")
     monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
@@ -627,7 +703,9 @@ def test_running_workflow_matches_main_false_on_api_error(monkeypatch, tmp_path)
         raise RuntimeError("dial tcp: timeout")
     monkeypatch.setattr(qw.pulse_guard, "gh", broken)
 
-    assert qw.running_workflow_matches_main(REPO) is False
+    verdict, note = qw.workflow_version_check(REPO)
+    assert verdict == "unknown"
+    assert "dial tcp: timeout" in note
 
 
 def test_close_stale_episode_posts_resolved_marker(monkeypatch):
