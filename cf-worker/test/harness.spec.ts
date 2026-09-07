@@ -1,7 +1,8 @@
-import { runInDurableObject } from "cloudflare:test";
+import { createScheduledController, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { asString, classifyStorageError, handsAreAlive, messageStuck, parseOwnerDecisionCallback, storageErrorResponse } from "../src/harness";
+import worker from "../src/index";
 
 import { redact } from "../src/redact";
 import { HEARTBEAT, LIMITS, RETENTION } from "../src/config";
@@ -895,6 +896,58 @@ describe("Cron Trigger: Harness#scheduledTick() — страховка, не в�
       });
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  // Последнее звено цепочки (находка ревью PR #696): до этого теста ни один
+  // тест не вызывал сам src/index.ts::scheduled() — только Harness#scheduledTick()
+  // напрямую. Докажи мутацией: замени тело scheduled() на пустую функцию (не
+  // вызывай env.HARNESS.get(id).scheduledTick() вовсе) — этот тест покраснеет,
+  // потому что dispatch не случится и pulse останется на STALE_TS.
+  it("scheduled(): index.ts дёргает тот же биндинг HARNESS и тот же scheduledTick()", async () => {
+    const stub = HARNESS_ID();
+    await seedPulse(stub, { ts: STALE_TS(), dispatch_ok: true, detail: null, last_run_id: 100, run_confirmed: true });
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    let dispatchCalls = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubRunsCall(input)) {
+        return new Response(JSON.stringify({ workflow_runs: [{ id: 101 }] }), { status: 200 });
+      }
+      if (isGitHubDispatchCall(input)) {
+        dispatchCalls++;
+        return new Response(null, { status: 204 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const controller = createScheduledController({ cron: "*/5 * * * *" });
+      await worker.scheduled!(controller, env);
+      expect(dispatchCalls).toBe(1);
+      const status = await getJson<{ last_pulse: { dispatch_ok: boolean; ts: number } | null }>("/api/status");
+      expect(status.last_pulse?.dispatch_ok).toBe(true);
+      expect(status.last_pulse!.ts).toBeGreaterThan(STALE_TS());
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
+  // Докажи мутацией: убери try/catch вокруг `env.HARNESS.get(id).scheduledTick()`
+  // в src/index.ts::scheduled() — этот тест покраснеет (необработанное исключение
+  // из RPC-вызова упадёт наружу вместо честного console.error).
+  it("scheduled(): падение RPC-вызова ловится, обработчик не роняется наружу", async () => {
+    const getSpy = vi.spyOn(env.HARNESS, "get").mockImplementation(() => {
+      throw new Error("boom: RPC-обвязка упала до scheduledTick()");
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const controller = createScheduledController({ cron: "*/5 * * * *" });
+      await expect(worker.scheduled!(controller, env)).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("scheduled: RPC scheduledTick упал"));
+    } finally {
+      getSpy.mockRestore();
+      errorSpy.mockRestore();
     }
   });
 });
