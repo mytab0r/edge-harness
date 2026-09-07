@@ -735,6 +735,15 @@ jobs:
       - name: Smoke issue-create — похожий заголовок отклоняется до вызова gh (#566)
         run: bash scripts/gh/test/issue-create-duplicate-guard.test.sh
 
+      # Третий тормоз того же issue-create (#695): решение о приоритете
+      # (area:process) обязано быть явным — метка или --not-process-ack,
+      # иначе отказ ДО вызова `gh issue create`; верх группы приоритета
+      # печатается перед созданием. Живой случай — #684/#685/#689 заведены с
+      # area:orchestra вместо area:process и встали в хвост очереди из 200
+      # задач, хотя #194/#168/#226 уже несли ту же проблему другими словами.
+      - name: Smoke issue-create — приоритет не объявлен явно отклоняется до вызова gh (#695)
+        run: bash scripts/gh/test/issue-create-priority-gate.test.sh
+
       # Гвардия класса #526 (статический скан «сырой gh issue create вне
       # обёртки») РАССМОТРЕНА и сознательно НЕ заведена по ТОЙ ЖЕ причине,
       # что и класс #496 выше: подстрока `gh issue create` легитимно
