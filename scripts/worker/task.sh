@@ -469,6 +469,20 @@ grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
 SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
 rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 export HANDS_SPOOL="$SPOOL_FILE"
+
+# Отметка «дошли до git-шага» (#588, scheduler.py::conflict_rework_attempts,
+# маркер WORKER_GIT_STEP_MARKER в pulse_guard.py — держи текст в синхроне):
+# всё ДО этой строки — инфраструктура (морда/деплой/сеть/плагин), не работа
+# агента; только с этой точки промпт (шаг 3 маршрута — git rebase origin/main
+# при дрейфе) вообще доходит до DSH. Комментарий — в ЗАДАЧУ (не в PR): тот же
+# носитель следа аренды, что "worker run N" в claim_task.claim (CLAIM_VIA),
+# та же граница по цифре нужна читателю на стороне scheduler.py, поэтому та
+# же подстрока "worker run N" — часть текста ниже. Best-effort: провал
+# постановки комментария не должен ронять сам прогон задачи.
+gh issue comment "$number" \
+  --body "🤖 [worker: git-шаг] worker run ${GITHUB_RUN_ID:-local}" >/dev/null \
+  || echo "::warning::маркер git-шага не отправлен в задачу #$number — оркестратор увидит эту попытку как инфраструктурный сбой"
+
 dsh_edge_start_drain
 WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
