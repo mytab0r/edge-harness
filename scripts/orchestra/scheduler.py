@@ -599,9 +599,10 @@ def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
     даёт старт ТЕКУЩЕГО эпизода — для сортировки очереди по возрасту).
 
     Это граница лифтайм-бюджета conflict_rework_attempts (находка ревью PR
-    #597): владелец решил (issue #474, зафиксировано в
-    openspec/changes/conflict-auto-rebase/specs/journal-tasks-hands/spec.md:20-22
-    и docs/agents/LABELS.md) — РОВНО одна авто-попытка ребейза на PR, счётчик
+    #597): владелец решил (issue #474, зафиксировано в дельта-спеке
+    openspec/changes/conflict-auto-rebase/specs/journal-tasks-hands/spec.md —
+    требование про бюджет попыток — и в docs/agents/LABELS.md, строка
+    `conflict`) — РОВНО одна авто-попытка ребейза на PR, счётчик
     НЕ сбрасывается по эпизодам конфликта (тот же компромисс, что уже принят
     для AI_REVIEW_MAX_ATTEMPTS). max() как граница обнулял бы бюджет каждый
     раз, когда mark_conflicts снимает метку и ставит её заново на новом
@@ -628,13 +629,29 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     отсутствующий скрипт), а бюджет CONFLICT_REWORK_MAX_ATTEMPTS=1 сгорал на
     инфраструктуре, ни разу не дойдя до git rebase.
 
-    Засчитывается только прогон worker.yml, который 1) атрибутирован этой
-    задаче (тот же приём, что run_claimed_task — след аренды «worker run N» в
-    комментариях ЗАДАЧИ) И 2) сам отметил, что дошёл до git-шага
-    (WORKER_GIT_STEP_MARKER, scripts/worker/task.sh, ставится непосредственно
-    перед прогоном DSH) — единственный устойчивый признак «агент реально
-    получил промпт и мог попытаться», не текст ошибки (тот протухнет при
-    первой смене формулировки).
+    Засчитывается только прогон, САМ отметивший, что дошёл до git-шага:
+    комментарий «WORKER_GIT_STEP_MARKER worker run N» в комментариях ЗАДАЧИ
+    (scripts/worker/task.sh, ставится непосредственно перед прогоном DSH —
+    единственный устойчивый признак «агент реально получил промпт и мог
+    попытаться», не текст ошибки, тот протухнет при первой смене
+    формулировки). Атрибуция задаче — самим носителем: комментарий живёт в
+    той задаче, которую воркер получил входом `task`, чужую он не
+    комментирует.
+
+    Читаются КОММЕНТАРИИ, а не окно recent_runs(per_page=10) (блокирующая
+    находка ревью PR #597): засчитанная попытка выпадала из топ-10 свежих
+    прогонов worker.yml уже через ~2–3 часа живой истории (~3.3 слияния/час,
+    плюс ретраи и доводки — каждый даёт свой прогон), а попытка легитимно
+    живёт до 280 минут. Потерянная засчитанная попытка возвращала бы
+    attempts=0 на каждом следующем тике: PR с несошедшейся попыткой
+    получал бы адресный диспатч бесконечно, ни разу не дойдя до эскалации, —
+    голодание #588 перестроилось бы, а не ушлило. Комментарий git-шага —
+    постоянный след (id прогона + created_at в одном комментарии), его и
+    читаем; с границей ниже сравнивается время КОММЕНТАРИЯ, а не начала
+    прогона — отметка ставится в начале DSH-шага, расхождение минутное
+    (честная цена: прогон, стартовавший ДО простановки метки, но дошедший
+    до git-шага ПОСЛЕ неё, засчитается; PR-открывающий прогон так попасть
+    не может — свою отметку он ставит раньше, чем создаёт сам PR).
 
     since = conflict_first_labeled_at(...), не conflict_labeled_at (находка
     ревью PR #597): граница обязана быть лифтайм-, не по-эпизодной — иначе
@@ -642,7 +659,9 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     засчитанные попытки в обход задокументированного решения владельца
     (#474). Без границы вовсе исходный прогон, ОТКРЫВШИЙ этот PR задолго до
     того, как main ушёл вперёд (тот прогон тоже дошёл до git-шага — он и есть
-    источник PR), был бы ошибочно засчитан как попытка авто-РЕБЕЙЗА. Нет
+    источник PR), был бы ошибочно засчитан как попытка авто-РЕБЕЙЗА: его
+    отметка всегда старше первой простановки метки (PR создаётся этим же
+    прогоном ПОЗЖЕ отметки, метка приходит снаружи и того позже). Нет
     метки/события — 0 (не «неизвестно считаем исчерпанным»: PR остаётся
     доступным для дальнейшей обработки, смотри также docstring
     dispatch_conflict_rework — ниже эта же величина участвует в решении на
@@ -650,22 +669,18 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     since = conflict_first_labeled_at(repo, pr_number)
     if since is None:
         return 0
-    comments = all_issue_comments(repo, task_number)
-    counted = 0
-    for run in recent_runs(repo, WORKER_WORKFLOW, per_page=10):
-        created_at = run.get("created_at")
+    git_step_run = re.compile(
+        rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
+    )
+    counted: set[str] = set()
+    for comment in all_issue_comments(repo, task_number):
+        created_at = comment.get("created_at")
         if not created_at or parse_time(created_at) < since:
             continue
-        run_id = run.get("id")
-        claimed = re.compile(rf"worker run {re.escape(str(run_id))}(?!\d)")
-        if not any(claimed.search(c.get("body") or "") for c in comments):
-            continue
-        reached_git_step = re.compile(
-            rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run {re.escape(str(run_id))}(?!\d)"
-        )
-        if any(reached_git_step.search(c.get("body") or "") for c in comments):
-            counted += 1
-    return counted
+        match = git_step_run.search(comment.get("body") or "")
+        if match:
+            counted.add(match.group(1))  # сет: повторная отметка того же прогона — не вторая попытка
+    return len(counted)
 
 
 def dispatch_conflict_rework(

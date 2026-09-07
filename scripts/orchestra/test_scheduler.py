@@ -2202,13 +2202,18 @@ def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_fail
 
 
 def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkeypatch):
-    # Находка ревью PR #478 (сохранена через ревью PR #597, spec.md:43): если
-    # след аренды засчитанного прогона (conflict_rework_attempts) к моменту
-    # эскалации уже выпал из окна recent_runs(per_page=10) — worker.yml не
-    # простаивает (другие задачи/PR дают собственные прогоны, а этот job живёт
-    # до 280 минут), окно между двумя вызовами вполне успевает сдвинуться —
-    # текст эскалации честно говорит "не атрибутирован", не подсовывает
-    # conclusion чужого прогона как диагноз ЭТОЙ попытки.
+    # Находка ревью PR #478 (сохранена через ревью PR #597, требование спеки
+    # «текст эскалации называет подтверждённый факт»): попытка ЗАСЧИТАНА по
+    # постоянному следу (отметка git-шага в комментариях задачи), но к моменту
+    # эскалации её прогон уже выпал из окна recent_runs(per_page=10) —
+    # worker.yml не простаивает (другие задачи/PR дают собственные прогоны,
+    # ~3.3 слияния/час), окно между засчитанной попыткой и эскалацией вполне
+    # успевает сдвинуться. conclusion этой попытки неоткуда взять — текст
+    # честно говорит "не атрибутирован", не подсовывает conclusion чужого
+    # прогона как диагноз ЭТОЙ попытки. После правки ревью PR #597 эта ветка
+    # не только достижима, но и ЕДИНСТВЕННАЯ честная: счётчик больше не
+    # зависит от окна (см. соседний тест на выпадение из окна), а вывод
+    # conclusion по-прежнему ограничен им.
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
     fake = FakeGh({
@@ -2221,23 +2226,16 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
         "pulls/560": {"mergeable_state": "dirty"},
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # В окне только чужой прогон 901: попытка (333→900) туда не попала.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 901, "conclusion": "success", "created_at": "2026-09-06T09:10:00Z"},
+        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z", "body": "Канал: worker run 900."},
             {"created_at": "2026-09-06T09:05:00Z", "body": "🤖 [worker: git-шаг] worker run 900"},
         ],
     })
     patch_gh(monkeypatch, fake)
-    # recent_runs вызывается дважды за проход: первый раз — conflict_rework_
-    # attempts (видит прогон 900, засчитывает попытку), второй — last_worker_
-    # run_conclusion перед текстом эскалации. Между ними окно сдвинулось —
-    # прогон 900 больше не в топ-10 (мутация: замени на общий список с 900 в
-    # обоих ответах — этот тест перестанет проверять то, ради чего заведён,
-    # хотя может остаться зелёным; смотри соседний тест на пере-атрибуцию).
-    run_windows = iter([
-        [{"id": 900, "conclusion": "success", "created_at": "2026-09-06T09:00:00Z"}],
-        [{"id": 901, "conclusion": "success", "created_at": "2026-09-06T09:10:00Z"}],
-    ])
-    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: next(run_windows))
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
@@ -2267,9 +2265,6 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 34011108934, "conclusion": "success", "created_at": "2026-09-06T09:00:00Z"},
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z",
              "body": "Канал: worker run 34011108934."},
@@ -2309,9 +2304,6 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
         # поэтому attempts может стать 1 ещё ПОКА прогон "in_progress" (тот
         # самый гоночный случай #474/PR #408, ради которого и нужен
         # worker_runs_active ниже как отдельная гвардия).
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 34027474271, "conclusion": None, "created_at": "2026-09-06T09:00:00Z"},
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z",
              "body": "Канал: worker run 34027474271."},
@@ -2342,9 +2334,6 @@ def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 34011108934, "conclusion": "success", "created_at": "2026-09-06T09:00:00Z"},
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z",
              "body": "Канал: worker run 34011108934."},
@@ -2511,7 +2500,8 @@ def test_conflict_first_labeled_at_none_when_never_labeled(monkeypatch):
 
 def test_conflict_rework_attempts_lifetime_survives_relabeling(monkeypatch):
     # Ядро находки ревью PR #597: владелец задокументировал лифтайм-счётчик
-    # (не сбрасывается по эпизодам конфликта, spec.md:20-22). Здесь PR словил
+    # (не сбрасывается по эпизодам конфликта, дельта-спека conflict-auto-rebase,
+    # требование про бюджет попыток). Здесь PR словил
     # первый конфликт 09-01, засчитанная попытка пришлась НА ТОТ эпизод
     # (09-01), метку сняли и поставили заново 09-05 (новый эпизод дрейфа).
     # Граница по conflict_labeled_at (max, текущий эпизод — 09-05) стёрла бы
@@ -2524,9 +2514,6 @@ def test_conflict_rework_attempts_lifetime_survives_relabeling(monkeypatch):
             {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
             {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 444, "conclusion": "success", "created_at": "2026-09-01T06:00:00Z"},
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-01T06:05:00Z", "body": "Канал: worker run 444."},
             {"created_at": "2026-09-01T06:10:00Z", "body": "🤖 [worker: git-шаг] worker run 444"},
@@ -2546,9 +2533,6 @@ def test_conflict_rework_attempts_ignores_run_before_conflict_episode(monkeypatc
         "issues/560/timeline?per_page=100": [
             {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 111, "conclusion": "success", "created_at": "2026-09-01T00:00:00Z"},  # ДО метки
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-01T00:05:00Z", "body": "Канал: worker run 111."},
             {"created_at": "2026-09-01T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 111"},
@@ -2569,9 +2553,6 @@ def test_conflict_rework_attempts_ignores_run_that_never_reached_git_step(monkey
         "issues/560/timeline?per_page=100": [
             {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 222, "conclusion": "failure", "created_at": "2026-09-06T00:00:00Z"},
-        ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 222."},
             # Нет отметки git-шага — воркер упал раньше, чем до неё дошёл.
@@ -2586,12 +2567,62 @@ def test_conflict_rework_attempts_counts_run_that_reached_git_step(monkeypatch):
         "issues/560/timeline?per_page=100": [
             {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 333."},
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_counts_run_that_fell_out_of_recent_runs_window(monkeypatch):
+    # Блокирующая находка ревью PR #597: счётчик читал окно
+    # recent_runs(per_page=10) — топ-10 свежих прогонов worker.yml, а живой
+    # репозиторий выдаёт прогон на каждое слияние/ретрай/доводку (~3.3/час),
+    # так что засчитанная попытка выпадала из окна уже через ~2–3 часа, сама
+    # оставаясь легитимной (прогон идёт до 280 минут). attempts возвращался
+    # к 0, PR с несошедшейся попыткой получал адресный диспатч бесконечно и
+    # никогда не доходил до эскалации — голодание #588 перестраивалось.
+    # Здесь прогон 333 дошёл до git-шага (комментарий в задаче — ПОСТОЯННЫЙ
+    # след), а в топ-10 свежих прогонов его НЕТ — одни чужие новее.
+    # Мутация: верни цикл по recent_runs (засчитывай только прогоны из окна)
+    # — attempts станет 0 вместо 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        # Десять ЧУЖИХ прогонов новее попытки 333 — ровно тот сдвиг окна,
+        # на котором старая логика теряла засчитанную попытку.
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 333, "conclusion": "success", "created_at": "2026-09-06T00:00:00Z"},
+            {"id": 1000 + i, "conclusion": "success", "created_at": f"2026-09-07T0{i % 10}:00:00Z"}
+            for i in range(10)
         ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 333."},
             {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+    # Прогоны Actions счётчиком вообще не читаются: постоянная сторона —
+    # комментарии задачи, окно в решении не участвует.
+    assert not any("runs?per_page=10" in c for c in fake.calls)
+
+
+def test_conflict_rework_attempts_counts_distinct_runs_not_marker_repeats(monkeypatch):
+    # Один прогон, отметившийся дважды (например, повтор шага после
+    # best-effort провала постановки комментария) — ОДНА попытка, не две:
+    # бюджет РОВНО одна попытка на PR, дубликат следа не должен её удвоить.
+    # Мутация: замени set на счётчик всех совпавших комментариев — attempts
+    # стал бы 2, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 555"},
+            {"created_at": "2026-09-06T00:20:00Z", "body": "🤖 [worker: git-шаг] worker run 555"},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -2605,6 +2636,27 @@ def test_conflict_rework_attempts_zero_when_never_labeled(monkeypatch):
     # Не тратим вызовы на прогоны/комментарии задачи — нет эпизода конфликта,
     # решать по нему нечего.
     assert not any("runs?per_page=10" in c or "474/comments" in c for c in fake.calls)
+
+
+def test_worker_git_step_marker_literal_in_task_sh_matches_pulse_guard():
+    # Блокирующая находка ревью PR #597: строка отметки git-шага захардкожена
+    # в scripts/worker/task.sh, а WORKER_GIT_STEP_MARKER объявлен в
+    # pulse_guard.py — синхронизация держалась только комментарием «держи
+    # текст в синхроне». Тесты сторонили лишь сторону планировщика, поэтому
+    # переформулировка в task.sh проходила CI зелёной, а отказ был тихим:
+    # attempts навсегда 0, бюджет не сгорает никогда, эскалация не наступает.
+    # Гвардия по исходнику (класс #259/#308): текст отметки обязан быть РОВНО
+    # таким, каким его ищет conflict_rework_attempts, — и обязан строиться в
+    # проверке из той же константы (переименование в pulse_guard тоже красит
+    # этот тест). Мутация: переформулируй --body в task.sh (например, убери
+    # «worker run») — тест покраснеет.
+    task_sh = (Path(__file__).resolve().parent.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    expected = f'🤖 {sch.WORKER_GIT_STEP_MARKER} worker run ${{GITHUB_RUN_ID:-local}}'
+    assert expected in task_sh, (
+        "scripts/worker/task.sh потерял точный текст отметки git-шага "
+        f"({expected!r}) — conflict_rework_attempts перестанет засчитывать "
+        "попытки, бюджет конфликта не будет сгорать никогда (тихий отказ)"
+    )
 
 
 def test_conflict_overlap_hint_intersects_pr_and_main_changed_files(monkeypatch):
