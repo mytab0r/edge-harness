@@ -243,9 +243,24 @@ mkdir -p "$TMP/bin"
 
 cat >"$TMP/bin/git" <<'GITSTUB'
 #!/usr/bin/env bash
+# Заглушка честна по форме ответа (тест кормится прод-формой, AGENTS.md):
+#   - ls-remote печатает строку ТОЛЬКО для запрошенного ref'а — task-branch
+#     (#356) решает «ветка уже существует» по НЕпустому выводу
+#     `git ls-remote --heads origin refs/heads/agent/<N>-<slug>`; грубая
+#     заглушка «всегда главная строка» делала существующей любую ветку и
+#     красила worker-сценарий отказом до аренды (живой прогон CI 34153826296);
+#   - show-ref с отсутствующей локальной веткой в реальном git — rc=1, здесь
+#     локальных agent-веток нет вовсе.
 case "${1:-}" in
-  ls-remote) printf '0000000000000000000000000000000000000000\trefs/heads/main\n' ;;
+  ls-remote)
+    for a in "$@"; do
+      case "$a" in
+        refs/heads/main) printf '0000000000000000000000000000000000000000\trefs/heads/main\n' ;;
+        refs/heads/*) : ;;
+      esac
+    done ;;
   rev-parse) printf '0000000000000000000000000000000000000000\n' ;;
+  show-ref) exit 1 ;;
   *) exit 0 ;;
 esac
 GITSTUB
