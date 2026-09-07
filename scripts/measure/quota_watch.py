@@ -239,6 +239,39 @@ PR (ветка `agent/605-quota-continuous-watch`, workflow ещё НЕ на `ma
    принцип теперь применён и к `workflow_version_check` выше: состояние
    «проверить не удалось» несёт причину дословно из ошибки, а не гипотезу.
 
+## Несостоявшийся замер обязан краснеть, не зеленеть (found: ревью PR #607)
+
+`measure_main` раньше печатал предупреждение и возвращал 0, когда реального
+замера не было вовсе (нет `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`, либо
+`cheap_check` поймал `RuntimeError` от Cloudflare и вернул пустую строку) —
+шаг `MEASURE_STEP_NAME` получал `success`, а `last_real_measurement_age_minutes`
+считает «реальным замером» ровно success/failure ЭТОГО шага (см. «Троттлинг:
+только реальный замер открывает окно» выше): протухший/переименованный
+CF-токен или сбой Cloudflare Analytics слепили бы сторож НАВСЕГДА — все
+прогоны зелёные, окно троттлинга и проверка простоя (`MEASUREMENT_STALE_MINUTES`)
+удовлетворены несуществующим замером, stale-эскалация не стреляет никогда
+(тот же класс, что постмортем #255 про сутки простоя при сплошь зелёных
+прогонах). Правка: оба случая теперь возвращают ненулевой код. Это НЕ создаёт
+ложной stale-эскалации — `failure` этого шага уже учитывается
+`last_real_measurement_age_minutes` как «реальный замер состоялся» по
+построению (направление (в) выше), значит красный прогон одновременно и
+виден человеку/пульсу конвейера, и корректно троттлит следующий тик.
+
+## Полный срез обязан покрывать ВСЕ эскалируемые метрики (found: ревью PR #607)
+
+`_RESOURCE_KEY_HINTS` не содержал ключей для строк «GitHub REST rate limit
+(PAT/GITHUB_TOKEN)» и «GitHub GraphQL rate limit» (`quotas.py::collect_github`)
+— `resource_key()` возвращал `None`, `full_sweep` пропускал обе строки как
+«вне списка эскалируемых метрик», хотя `quotas.py::main::over_threshold`
+эскалирует их наравне с остальными (честный `pct`, не `no-data`). Итог:
+непрерывный сторож «квот харнеса» (задача — во множественном числе) молчал
+об исчерпании REST-квоты PAT/GITHUB_TOKEN, хотя ручной срез `quotas.yml` её
+ловит. Правка: добавлены ключи `gh_rest_rate_limit_hour`/
+`gh_graphql_rate_limit_hour` — свои, не из `quotas.LIMITS` (эти два лимита
+приходят из самого ответа `gh api rate_limit`, у `quotas.py` для них никогда
+не было записи в `LIMITS`), дедуп `quota_alert` работает как есть по любому
+строковому ключу.
+
 Запуск тестов: python -m pytest scripts/measure/test_quota_watch.py -q
 """
 
@@ -327,6 +360,16 @@ ROWS_READ_LABEL = "DO rows_read/сутки"
 # GH-строки несут переменный поясняющий хвост в скобках (см. quotas.py::
 # collect_github), точное сравнение молча переставало бы находить ключ при
 # любой правке текста пояснения.
+#
+# GitHub REST/GraphQL rate limit — ключи здесь СВОИ (gh_rest_rate_limit_hour/
+# gh_graphql_rate_limit_hour), не из quotas.LIMITS: эти два лимита приходят из
+# самого ответа `gh api rate_limit` (core["limit"]/graphql["limit"]), у
+# quotas.py для них никогда не было отдельной записи в LIMITS (found: ревью
+# PR #607 — обе строки несли честный `pct` из quotas.py::collect_github и
+# эскалировались `quotas.py::main::over_threshold`, но full_sweep их молча
+# пропускал как «вне списка эскалируемых метрик», потому что resource_key()
+# для них возвращал None — континуальный сторож слеп именно к исчерпанию
+# REST-квоты PAT/GITHUB_TOKEN, хотя ручной срез её ловит).
 _RESOURCE_KEY_HINTS = (
     (ROWS_READ_LABEL, ROWS_READ_KEY),
     ("DO rows_written/сутки", "cf_do_rows_written_day"),
@@ -334,6 +377,8 @@ _RESOURCE_KEY_HINTS = (
     ("DO storage/аккаунт", "cf_do_storage_account_bytes"),
     ("Диспатчи этого репо/час", "gh_dispatch_hour"),
     ("In-progress workflow runs", "gh_concurrent_jobs"),
+    ("GitHub REST rate limit", "gh_rest_rate_limit_hour"),
+    ("GitHub GraphQL rate limit", "gh_graphql_rate_limit_hour"),
 )
 
 
@@ -702,7 +747,24 @@ def measure_main() -> int:
     """Шаг замера (`MEASURE_STEP_NAME` в quota-watch.yml, запускается только
     когда гейт выше решил `proceed=true`) — сама дешёвая проверка + (внутри
     первой четверти часа) полный срез. Троттлинг здесь больше не проверяется:
-    единственное место решения — gate_main(), see докстринг модуля."""
+    единственное место решения — gate_main(), see докстринг модуля.
+
+    Обязан завершаться НЕНУЛЕВЫМ кодом, если реальный замер не состоялся —
+    нет кредов CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID либо сам CF-вызов
+    упал (`cheap_check` ловит RuntimeError и возвращает пустую строку, см. её
+    докстринг) — (found: ревью PR #607). Раньше оба случая печатали
+    предупреждение и возвращали 0: шаг `MEASURE_STEP_NAME` получал `success`,
+    а `last_real_measurement_age_minutes` (см. её докстринг) считает
+    «реальным замером» ровно success/failure ЭТОГО шага — окно троттлинга
+    открывалось, а проверка простоя (`MEASUREMENT_STALE_MINUTES`) была
+    удовлетворена, хотя замера не было. Итог: протухший/переименованный
+    CF-токен или сбой Cloudflare Analytics слепили бы сторож НАВСЕГДА (все
+    прогоны зелёные, stale-эскалация не стреляет никогда) — тот же класс, что
+    постмортем #255 про сутки простоя при сплошь зелёных прогонах.
+    `failure` этого шага по построению УЖЕ учитывается
+    `last_real_measurement_age_minutes` как «реальный замер» (см. её
+    докстринг, направление (в)) — падение шага здесь НЕ создаёт ложного
+    срабатывания простоя, только красит прогон и делает сбой видимым."""
     repo = os.environ.get("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     now = datetime.now(timezone.utc)
     token = os.environ.get("CLOUDFLARE_API_TOKEN")
@@ -711,7 +773,9 @@ def measure_main() -> int:
     if not token or not account_id:
         print("quota_watch: CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID не заданы — "
               "наблюдение невозможно в этом прогоне")
-        return 0
+        print("::error::quota_watch: замер не состоялся (нет кредов) — прогон обязан "
+              "быть виден красным, иначе троттлинг/проверка простоя сочтут его реальным замером")
+        return 1
 
     exit_code = 0
     result = cheap_check(repo, token, account_id)
@@ -719,6 +783,11 @@ def measure_main() -> int:
         print(result)
         if _channel_failed(result):
             exit_code = 1
+    else:
+        print("::error::quota_watch: дешёвый замер rows_read не состоялся (см. предупреждение "
+              "cheap_check выше) — прогон обязан быть виден красным, иначе троттлинг/проверка "
+              "простоя сочтут его реальным замером")
+        exit_code = 1
 
     if now.minute < FULL_SWEEP_MINUTE_WINDOW:
         for r in full_sweep(repo, token, account_id):

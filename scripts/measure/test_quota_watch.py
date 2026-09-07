@@ -67,6 +67,8 @@ def _gh_router(runs_payload: dict, jobs_by_run: dict[int, dict]):
     ("DO storage/аккаунт", "cf_do_storage_account_bytes"),
     ("Диспатчи этого репо/час (приближение к вторичному лимиту 500/час, аккаунт-wide)", "gh_dispatch_hour"),
     ("In-progress workflow runs этого репо (приближение к concurrency 20, аккаунт-wide)", "gh_concurrent_jobs"),
+    ("GitHub REST rate limit (PAT/GITHUB_TOKEN)", "gh_rest_rate_limit_hour"),
+    ("GitHub GraphQL rate limit", "gh_graphql_rate_limit_hour"),
 ])
 def test_resource_key_matches_by_substring(label, expected):
     assert qw.resource_key(label) == expected
@@ -278,6 +280,28 @@ def test_full_sweep_noop_without_credentials():
     assert qw.full_sweep(REPO, "", "") == []
 
 
+def test_full_sweep_escalates_github_rest_and_graphql_rate_limit(monkeypatch):
+    """Мутационная проверка блокера ревью PR #607: `_RESOURCE_KEY_HINTS` не
+    покрывал строки «GitHub REST rate limit»/«GitHub GraphQL rate limit» —
+    resource_key() возвращал None, full_sweep их молча пропускал, хотя
+    quotas.py::main::over_threshold эти же строки эскалирует наравне с
+    остальными (честный pct, не no-data). Сними хинты — тест краснеет
+    (calls == []); верни — зеленеет (обе строки дошли до check_and_alert)."""
+    rest_row = qw.quotas.Row("GitHub REST rate limit (PAT/GITHUB_TOKEN)", "GitHub REST",
+                              4_900, 5_000, "requests/час", "2026-09-07T13:00:00+00:00", "ok")
+    graphql_row = qw.quotas.Row("GitHub GraphQL rate limit", "GitHub REST",
+                                 4_950, 5_000, "points/час", "2026-09-07T13:00:00+00:00", "ok")
+    monkeypatch.setattr(qw.quotas, "collect_cloudflare", lambda *a: [])
+    monkeypatch.setattr(qw.quotas, "collect_github", lambda *a: [rest_row, graphql_row])
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda repo, key, label, current, limit, pct, threshold=None: calls.append(key) or "ok")
+
+    qw.full_sweep(REPO, "tok", "acct")
+
+    assert calls == ["gh_rest_rate_limit_hour", "gh_graphql_rate_limit_hour"]
+
+
 # ── measure_main(): проводка дешёвой/полной проверки (троттлинг решает gate_main) ──
 
 
@@ -287,10 +311,33 @@ def _patch_env(monkeypatch):
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
 
 
-def test_measure_main_returns_0_without_credentials(monkeypatch):
+def test_measure_main_exits_nonzero_without_credentials(monkeypatch):
+    """Мутационная проверка блокера ревью PR #607: раньше возвращал 0 —
+    прогон без кредов зеленел, `last_real_measurement_age_minutes` (через
+    conclusion=success шага MEASURE_STEP_NAME) считал его РЕАЛЬНЫМ замером,
+    троттлинг и проверка простоя навсегда молчали при протухшем/переименованном
+    токене. Сними фикс (верни `return 0`) — тест краснеет; верни фикс —
+    зеленеет."""
     monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
-    assert qw.measure_main() == 0
+    assert qw.measure_main() == 1
+
+
+def test_measure_main_exits_nonzero_when_measurement_itself_fails(monkeypatch):
+    """Тот же блокер, второй путь: креды заданы, но cheap_check не смог
+    измерить (CF-вызов упал, do_rows_read.today_rows_read бросил RuntimeError,
+    cheap_check вернул '') — measure_main обязан вернуть ненулевой код, а не
+    молча зеленеть."""
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(qw, "cheap_check", lambda *a: "")
+
+    class _Now(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 7, 12, 30, tzinfo=timezone.utc)  # minute=30 — вне окна полного среза
+    monkeypatch.setattr(qw, "datetime", _Now)
+
+    assert qw.measure_main() == 1
 
 
 def test_measure_main_runs_cheap_check(monkeypatch):
@@ -310,9 +357,13 @@ def test_measure_main_runs_cheap_check(monkeypatch):
 
 def test_measure_main_also_runs_full_sweep_inside_first_quarter_hour(monkeypatch):
     """Полный срез — только внутри первой четверти часа (см. докстринг,
-    «Стоимость и троттлинг»): минута < FULL_SWEEP_MINUTE_WINDOW."""
+    «Стоимость и троттлинг»): минута < FULL_SWEEP_MINUTE_WINDOW. cheap_check
+    здесь возвращает валидный дедуп-результат (не '') — пустая строка теперь
+    означает «замер не состоялся» и красит прогон (см. тест выше), поэтому
+    стаб не должен путать этот сценарий с провалом измерения."""
     _patch_env(monkeypatch)
-    monkeypatch.setattr(qw, "cheap_check", lambda *a: "")
+    monkeypatch.setattr(qw, "cheap_check",
+                         lambda *a: "cf_do_rows_read_day: без изменений (ok, 1.0%) — сигнал не отправлен (дедуп)")
     sweep_calls = []
     monkeypatch.setattr(qw, "full_sweep", lambda *a: sweep_calls.append(1) or [])
 
