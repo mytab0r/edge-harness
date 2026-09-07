@@ -36,9 +36,10 @@
   хранилища, WebSocket в тестовой петле, rowsWritten, плейсхолдеры DO SQLite.
 - [23. Нативное vs своё](research/23-platform-native-vs-custom.md) — где мы написали
   своё, а платформа (GitHub/Cloudflare) даёт готовое: что взять, что не берём и почему
-  (auto-merge + метки-как-статусы, Cron Triggers vs alarm, git-ref-замок).
+  (вердикты-как-статусы и auto-merge — канал статусов уже взят #345, остаток по
+  required checks/auto-merge; Cron Triggers vs alarm, git-ref-замок).
 - [30. Отвергнутые варианты](research/30-rejected-alternatives.md) — **обязательно к прочтению
-  перед любым предложением по архитектуре.** Семнадцать вариантов с причиной отказа и
+  перед любым предложением по архитектуре.** Отвергнутые варианты с причиной отказа и
   условием, при котором к ним стоит вернуться.
 - [31. «Руки» персистентно или эфемерно](research/31-hands-layer-tradeoffs.md) — развилка
   по деньгам между текущим Actions, GitHub Codespaces, Cloudflare Containers и
