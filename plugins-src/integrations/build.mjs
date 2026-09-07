@@ -70,6 +70,13 @@ for (const match of serverSource.matchAll(/defineTool\(\{\s*\n\s*name: '([a-z0-9
 // ── 3. Тело бандла и его гвардии ──────────────────────────────────────────────
 const body = await readFile(join(pluginDir, 'src', 'body.js'), 'utf8')
 
+// Общий разбор тела ответа fetch (#575, вторая половина) — ОДНО место правды,
+// инлайнится в бандл тем же приёмом, что INTEGRATIONS ниже (независимый
+// npm-тарбол без общего рантайм-модуля с plugin-manager, require() сюда не
+// достаёт). Источник — plugins-src/shared/describe-response-error.js.
+const sharedResponseError = await readFile(
+  join(repoRoot, 'plugins-src', 'shared', 'describe-response-error.js'), 'utf8')
+
 // Seed-карта шелла (staticModules при boot) — та же, что у plugin-manager:
 // require чего-то ещё без декларации в dsh.client.inject = throw при
 // материализации в браузере; ловим на сборке, а не в консоли владельца.
@@ -93,7 +100,7 @@ failUnless(unseeded.length === 0,
 // присваивания — регэкс-гвард по определению неполон; достаточно, потому что
 // присваивание свободной переменной обёртки затирало бы её только внутри
 // фабрики и ловится синтаксической проверкой бандла при использовании.
-for (const reserved of ['module', 'exports', 'require', 'INTEGRATIONS']) {
+for (const reserved of ['module', 'exports', 'require', 'INTEGRATIONS', 'describeResponseError']) {
   failUnless(!new RegExp(`(?:var|let|const|function|class)\\s+${reserved}\\b`).test(body),
     `src/body.js: тело объявляет "${reserved}" — это свободная переменная обёртки, коллизия`)
 }
@@ -109,6 +116,8 @@ const bundle = [
   `\tvar module = { exports: {} }; var exports = module.exports;`,
   ``,
   `const INTEGRATIONS = ${JSON.stringify(registry.integrations, null, 2)};`,
+  ``,
+  sharedResponseError,
   ``,
   body,
   ``,

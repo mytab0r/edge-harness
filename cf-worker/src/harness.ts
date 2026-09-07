@@ -133,6 +133,21 @@ const SCHEMA = [
   // фильтрует по (status, processed_ts) — без индекса это была бы полная
   // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
   `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
+  // Готовность хранилища (#575, вторая половина «зелёный health при мёртвой
+  // морде»): одна строка (id=1) — исход ПОСЛЕДНЕГО живого SQL-раундтрипа,
+  // сделанного пульсом (см. #checkStorageReady/#tickStorageReadyAlert), и
+  // дедуп-флаг `alerted` для алертов перехода. Персистентно тем же приёмом,
+  // что pulse/retention_state выше (#269/#306): DO выгружается из памяти
+  // между тиками alarm чаще, чем сами тики случаются — счётчик «была ли уже
+  // эта авария замечена» обязан пережить пересоздание инстанса, иначе
+  // Telegram-алерт бил бы на каждый тик заново.
+  `CREATE TABLE IF NOT EXISTS storage_probe (
+     id      INTEGER PRIMARY KEY CHECK (id = 1),
+     ts      INTEGER NOT NULL,
+     ok      INTEGER NOT NULL,
+     detail  TEXT,
+     alerted INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 /**
@@ -552,6 +567,28 @@ export function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * Решение об алерте готовности хранилища (#575) — чистая функция, проверяется
+ * тестом отдельно от SQL (тот же приём, что pulseHealthy/retentionBacklog).
+ *
+ * Единственный вход решения — rowsWritten УСЛОВНОГО UPDATE дедуп-флага
+ * (#recordStorageProbe), а не прочитанное прошлое состояние: при исчерпании
+ * квоты rows_read (#320) падают все SELECT, включая чтение storage_probe, —
+ * дедуп на чтении спамил бы ⚠️ каждый тик ровно в том классе, ради которого
+ * алерт заведён (находка ревью PR #587). rowsWritten = 1 — флаг перевернулся,
+ * это первый тик перехода (авария при ok=false, восстановление при ok=true);
+ * 0 — переход уже замечен; null — сама запись флага не удалась (исчерпание
+ * rows_written, класс глубже): «шлём/не шлём» решать не по чему, алерт
+ * пропускается — первый удавшийся тик догонит (см. #recordStorageProbe).
+ */
+export function storageReadyAlertDecision(
+  ok: boolean,
+  dedupRowsWritten: number | null,
+): "incident" | "recovery" | null {
+  if (dedupRowsWritten === null || dedupRowsWritten <= 0) return null;
+  return ok ? "recovery" : "incident";
+}
+
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
@@ -731,6 +768,9 @@ export class Harness extends DurableObject<Env> {
     }
     if (route.name === "messagesProcess") {
       return this.#processMessages(request);
+    }
+    if (route.name === "ready") {
+      return this.#getReady();
     }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
@@ -1215,6 +1255,13 @@ export class Harness extends DurableObject<Env> {
     // каждой таблицы: авария здесь не должна убить dispatch/self-update ниже.
     this.#pruneRetention(Date.now());
 
+    // Готовность хранилища (#575) — тоже сразу после успешного setAlarm, тем
+    // же доводом, что и ретеншн выше: единственный непрерывный монитор прода
+    // в этом DO не должен зависеть ни от GH_DISPATCH_TOKEN/GH_REPO, ни от
+    // TELEGRAM_BOT_TOKEN — при их отсутствии тик обязан продолжать замечать
+    // недоступность хранилища, а не молча пропускать эту гарантию.
+    this.#tickStorageReadyAlert();
+
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
     // GH_DISPATCH_TOKEN, ни от GH_REPO (п.33 спеки) — при пустом токене пульс
@@ -1457,6 +1504,130 @@ export class Harness extends DurableObject<Env> {
       },
     );
     if (!res.ok) throw new Error(`dispatch отклонён: ${res.status}`);
+  }
+
+  // ── Готовность хранилища (#575) ─────────────────────────────────────────────────────
+  //
+  // Диагноз #575: владелец видел голый HTTP 500 на журнале/плагинах, а
+  // /api/health морды (config.ts DSH_EDGE_UPDATE.healthUrl) отдавал только
+  // строку версии и хранилище вообще не трогал — оставался зелёным при
+  // мёртвой морде. #status() замером готовности не годится не потому, что
+  // «не делает живых запросов» (делает: heartbeat, MAX(id) по events,
+  // счётчик stale, чтение pulse — и при отказе хранилища краснеет через
+  // общий catch в #fetch()), а потому, что это ПАЧКА SQL на каждый вызов
+  // (одна — MAX(id) по events, растущему с историей) и тяжёлый ответ
+  // состояния. Зонд готовности обязан быть одним дешёвым запросом со
+  // стабильным контрактом {ok:true} — это /api/ready (находка AI-ревью
+  // PR #587: прежняя формулировка «кэширован, живых запросов не делает»
+  // была неверной против #status()).
+
+  /** Живой SQL-раундтрип: доказывает, что DO SQLite ПРЯМО СЕЙЧАС принимает
+   *  операции — то самое, что отказывает при исчерпании суточной квоты
+   *  rows_read/rows_written (classifyStorageError). `heartbeat` — всегда
+   *  существующая таблица (SCHEMA), запрос ограничен LIMIT 1 — не скан. */
+  #checkStorageReady(): { ok: boolean; detail: string | null } {
+    try {
+      this.#sql.exec("SELECT 1 FROM heartbeat LIMIT 1");
+      return { ok: true, detail: null };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`storage readiness: упал (${classifyStorageError(detail)}): ${detail}`);
+      return { ok: false, detail };
+    }
+  }
+
+  /** Маршрут GET /api/ready: тот же код ошибки хранилища (storageErrorResponse),
+   *  что и у остального API — единое место правды классификации, не вторая копия. */
+  #getReady(): Response {
+    const result = this.#checkStorageReady();
+    if (!result.ok) return storageErrorResponse(result.detail ?? "unknown");
+    return this.#json({ ok: true });
+  }
+
+  /**
+   * Запись исхода тика + дедуп-флаг — БЕЗ ЕДИНОГО ЧТЕНИЯ прошлого состояния
+   * (находка ревью PR #587 к #575): SELECT по storage_probe падает ровно в
+   * том классе, ради которого алерт сделан — при исчерпании квоты rows_read
+   * отказывает «практически любой SELECT» (docs/research/20-cloudflare-free.md,
+   * #320), чтение прошлого исхода давало previous = null, и ⚠️-алерт уходил
+   * на КАЖДЫЙ тик до полуночного сброса — тот спам, который дедуп должен
+   * предотвращать. Поэтому решение о переходе несёт ИТОГ ЗАПИСИ: rowsWritten
+   * условного UPDATE (`WHERE alerted = 0` при аварии / `WHERE alerted = 1`
+   * при восстановлении) равен 1 только на ПЕРВОМ тике перехода, 0 — когда
+   * авария уже замечена (или не было). Возвращает rowsWritten этого UPDATE;
+   * «исход последнего тика» (ts/ok/detail) при этом свежий всегда.
+   *
+   * Честная оговорка: метринг rows_read у UPDATE Cloudflare не документирует
+   * (research/20 — не подтверждено). Если условный UPDATE тоже падает на
+   * исчерпании квоты, вызывающий (#tickStorageReadyAlert) получает исключение
+   * и пропускает алерт этого тика с громким логом — спамить нельзя, а догонит
+   * первый удавшийся тик: флаг останется 0, и тот тик увидит rowsWritten = 1.
+   */
+  #recordStorageProbe(ok: boolean, detail: string | null): number {
+    const now = Date.now();
+    // Строка обязана существовать ДО условного UPDATE: у него нет ветки INSERT,
+    // и на первом тике (пустая таблица) он иначе никогда не дал бы rowsWritten = 1.
+    this.#sql.exec(
+      `INSERT INTO storage_probe (id, ts, ok, detail, alerted) VALUES (1, ?, ?, ?, 0)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, ok = excluded.ok, detail = excluded.detail`,
+      now,
+      ok ? 1 : 0,
+      detail,
+    );
+    // Не трогает ts/ok/detail — их ведёт INSERT выше; меняет ТОЛЬКО дедуп-флаг,
+    // чтобы rowsWritten означал ровно «состояние флага перевернулось».
+    const cursor = ok
+      ? this.#sql.exec("UPDATE storage_probe SET alerted = 0 WHERE id = 1 AND alerted = 1")
+      : this.#sql.exec("UPDATE storage_probe SET alerted = 1 WHERE id = 1 AND alerted = 0");
+    return cursor.rowsWritten;
+  }
+
+  /**
+   * Пульс — единственный работающий 24/7 монитор готовности хранилища в этом
+   * DO (#575): деплойная канарейка (deploy-worker.yml, «Канарейка UI на
+   * проде») смотрит на живость только В МОМЕНТ деплоя, а исчерпание суточной
+   * квоты бьёт в середине дня без единого деплоя; failure-watch
+   * (scripts/orchestra/pulse_guard.py::failure_watch) смотрит на упавшие
+   * прогоны CI, а не на живой прод — квота может быть исчерпана без единого
+   * красного workflow. Алерт (best-effort, тем же #telegramApi, что решения
+   * владельца #470/#471 — новый канал не заводится) шлётся только на
+   * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам раз в 15 минут,
+   * пока квота не сбросится в 00:00 UTC.
+   *
+   * Дедуп перехода — по итогу ЗАПИСИ дедуп-флага (storageReadyAlertDecision),
+   * не по чтению прошлого исхода: при исчерпании rows_read (#320) падают
+   * все SELECT, включая чтение storage_probe — дедуп на чтении спамил бы
+   * каждый тик в том же предложении, которым обещает этого не делать
+   * (находка ревью PR #587). Если запись флага сама упала (класс deeper:
+   * исчерпание rows_written) — алерт этого тика пропускается с громким
+   * логом: без записанного флага «шлём/не шлём» решать не по чему, и молча
+   * пропустить один тик честнее, чем спамить; первый удавшийся тик догонит.
+   */
+  #tickStorageReadyAlert(): void {
+    const result = this.#checkStorageReady();
+    let dedupRowsWritten: number | null = null;
+    try {
+      dedupRowsWritten = this.#recordStorageProbe(result.ok, result.detail);
+    } catch (error) {
+      console.error(
+        `storage readiness: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    const decision = storageReadyAlertDecision(result.ok, dedupRowsWritten);
+    if (decision === "incident") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
+      });
+    } else if (decision === "recovery") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ Хранилище журнала снова отвечает",
+      });
+    }
   }
 
   // ── Очередь задач ─────────────────────────────────────────────────────────────────

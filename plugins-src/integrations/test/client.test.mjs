@@ -351,3 +351,18 @@ test('отказ журнала — громкая ошибка секции с 
   await third.sandbox.runEffectsAndSettle()
   assert.ok(collectStrings(third.sandbox.render()).includes('journalError'), 'ответ без массива events — ошибка, не «статусов нет»')
 })
+
+test('#575: тело ответа с причиной (storage_quota_exceeded) показывается целиком, не голый HTTP 500', async () => {
+  const failing = async () => responseStub({
+    ok: false, status: 500, contentType: 'application/json',
+    body: { error: { code: 'storage_quota_exceeded', message: 'суточная квота хранилища исчерпана, сброс в 00:00 UTC' } },
+  })
+  const { sandbox } = loadBundle(failing)
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  const strings = collectStrings(sandbox.render())
+  assert.ok(strings.includes('journalError'), 'ошибка журнала не показана')
+  assert.ok(strings.some((s) => s.includes('суточная квота хранилища исчерпана')),
+    'причина из тела ответа не видна владельцу — секция показала голый код вместо сообщения')
+  assert.ok(!strings.some((s) => s === 'HTTP 500'), 'секция показала голый "HTTP 500" вместо тела ответа')
+})

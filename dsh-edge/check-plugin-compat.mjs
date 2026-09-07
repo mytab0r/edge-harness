@@ -37,6 +37,20 @@ if (!existsSync(absPluginDir)) {
   process.exit(2)
 }
 
+// Каталог без package.json — не плагин, а общий каталог исходников
+// (живой случай plugins-src/shared, #575/PR #587: хелпер разбора тела
+// ошибки, инлайнимый сборкой соседних плагинов; сам пакетом не является).
+// Цикл-обходчик в repo-ci.yml («Совместимость плагинов») кормит скрипту
+// ВСЕ подкаталоги plugins-src/* подряд — раньше такой каталог падал
+// ENOENT'ом на чтении package.json и краснил весь job. Пропуск ГРОМКИЙ
+// (строка в логе, не тишина): потерю package.json у настоящего плагина
+// ловит обязательный гейт публикации — форж вызывает этот же скрипт перед
+// npm pack, и сборка без манифеста там падает сама.
+if (!existsSync(join(absPluginDir, 'package.json'))) {
+  console.log(`plugin-compat: ${pluginDir} — нет package.json: не плагин (общий каталог исходников), пропущено`)
+  process.exit(0)
+}
+
 async function main() {
   console.log(`plugin-compat: проверка ${pluginDir}${checkClient ? ' (client=true)' : ''}`)
 
