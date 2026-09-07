@@ -579,7 +579,11 @@ def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     конфликтов первыми в dispatch_conflict_rework): PR мог быть открыт неделю
     назад и стать dirty только сегодня — created_at PR тут соврал бы про
     голодание. None — событие не нашлось (таймлайн не отдал его / метки нет
-    вовсе)."""
+    вовсе).
+
+    Только для СОРТИРОВКИ очереди по возрасту — не путать с границей бюджета
+    conflict_rework_attempts (conflict_first_labeled_at ниже, min() вместо
+    max(): там нужна лифтайм-граница, не сбрасывающаяся по эпизодам)."""
     timeline = review_labels.list_timeline(repo, pr_number, gh)
     labeled_at = [
         event["created_at"] for event in timeline
@@ -589,14 +593,40 @@ def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     return parse_time(max(labeled_at)) if labeled_at else None
 
 
+def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент ПЕРВОЙ простановки метки CONFLICT_LABEL за всю историю PR —
+    min(), не max() (в отличие от conflict_labeled_at выше, который нарочно
+    даёт старт ТЕКУЩЕГО эпизода — для сортировки очереди по возрасту).
+
+    Это граница лифтайм-бюджета conflict_rework_attempts (находка ревью PR
+    #597): владелец решил (issue #474, зафиксировано в
+    openspec/changes/conflict-auto-rebase/specs/journal-tasks-hands/spec.md:20-22
+    и docs/agents/LABELS.md) — РОВНО одна авто-попытка ребейза на PR, счётчик
+    НЕ сбрасывается по эпизодам конфликта (тот же компромисс, что уже принят
+    для AI_REVIEW_MAX_ATTEMPTS). max() как граница обнулял бы бюджет каждый
+    раз, когда mark_conflicts снимает метку и ставит её заново на новом
+    дрейфе — min() лифтайм сохраняет. Защита от прогона-открывателя (см.
+    conflict_rework_attempts) при этом не теряется: даже первая простановка
+    метки случается уже ПОСЛЕ того, как PR создан и исходный прогон
+    завершился."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
+    ]
+    return parse_time(min(labeled_at)) if labeled_at else None
+
+
 def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int:
     """Число ЗАСЧИТАННЫХ попыток авто-ребейза (issue #588) — не сырых
     диспатчей. CONFLICT_REWORK_MARKER ставится СРАЗУ на dispatch (защита от
-    гонки, см. докстринг dispatch_conflict_rework), это момент диспатча, не
-    факт настоящей попытки: замер живых случаев (#567/#542/#408) — все три
-    упали ДО git-шага (сеть/деплой морды, отсутствующий скрипт), а бюджет
-    CONFLICT_REWORK_MAX_ATTEMPTS=1 сгорал на инфраструктуре, ни разу не дойдя
-    до git rebase.
+    гонки, см. докстринг dispatch_conflict_rework) как заметка для человека,
+    читающего PR, — это момент диспатча, не факт настоящей попытки, и она
+    больше не читается обратно этой функцией: замер живых случаев
+    (#567/#542/#408) — все три упали ДО git-шага (сеть/деплой морды,
+    отсутствующий скрипт), а бюджет CONFLICT_REWORK_MAX_ATTEMPTS=1 сгорал на
+    инфраструктуре, ни разу не дойдя до git rebase.
 
     Засчитывается только прогон worker.yml, который 1) атрибутирован этой
     задаче (тот же приём, что run_claimed_task — след аренды «worker run N» в
@@ -606,14 +636,18 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     получил промпт и мог попытаться», не текст ошибки (тот протухнет при
     первой смене формулировки).
 
-    since = conflict_labeled_at(...) — граница по времени: без неё исходный
-    прогон, ОТКРЫВШИЙ этот PR задолго до того, как main ушёл вперёд (тот
-    прогон тоже дошёл до git-шага — он и есть источник PR), был бы ошибочно
-    засчитан как попытка авто-РЕБЕЙЗА. Нет метки/события — 0 (не «неизвестно
-    считаем исчерпанным»: PR остаётся доступным для дальнейшей обработки,
-    смотри также docstring dispatch_conflict_rework — ниже эта же величина
-    участвует в решении на равных с worker_runs_active)."""
-    since = conflict_labeled_at(repo, pr_number)
+    since = conflict_first_labeled_at(...), не conflict_labeled_at (находка
+    ревью PR #597): граница обязана быть лифтайм-, не по-эпизодной — иначе
+    снятие+повторная простановка метки (новый эпизод дрейфа) обнуляла бы
+    засчитанные попытки в обход задокументированного решения владельца
+    (#474). Без границы вовсе исходный прогон, ОТКРЫВШИЙ этот PR задолго до
+    того, как main ушёл вперёд (тот прогон тоже дошёл до git-шага — он и есть
+    источник PR), был бы ошибочно засчитан как попытка авто-РЕБЕЙЗА. Нет
+    метки/события — 0 (не «неизвестно считаем исчерпанным»: PR остаётся
+    доступным для дальнейшей обработки, смотри также docstring
+    dispatch_conflict_rework — ниже эта же величина участвует в решении на
+    равных с worker_runs_active)."""
+    since = conflict_first_labeled_at(repo, pr_number)
     if since is None:
         return 0
     comments = all_issue_comments(repo, task_number)
@@ -653,9 +687,11 @@ def dispatch_conflict_rework(
     существует: GitHub REST отдаёт только mergeable_state, не конфликтующие
     ханки. Поэтому решение простое (владелец, issue #474): РОВНО одна
     авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1, лифтайм-
-    счётчик — маркер в комментариях PR, тот же приём, что
-    ai_review_retry_count, — НЕ сбрасывается по эпизодам конфликта, тот же
-    компромисс, что уже принят для AI_REVIEW_MAX_ATTEMPTS). Сошлось —
+    счётчик — conflict_rework_attempts выше, граница conflict_first_labeled_at,
+    — НЕ сбрасывается по эпизодам конфликта, тот же компромисс, что уже
+    принят для AI_REVIEW_MAX_ATTEMPTS; CONFLICT_REWORK_MARKER в комментарии
+    PR ниже — только заметка для человека на момент диспатча, счётчик её не
+    перечитывает). Сошлось —
     mark_conflicts снимет метку сама следующим проходом (это и есть признак
     «был дрейф», ПОСТфактум); не сошлось — эскалация владельцу (escalate,
     тот же канал, что предохранитель конвейера #120) с файлами-кандидатами

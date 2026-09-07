@@ -2201,6 +2201,54 @@ def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_fail
     assert any("#561" in line and "освобождена" in line for line in actions)
 
 
+def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkeypatch):
+    # Находка ревью PR #478 (сохранена через ревью PR #597, spec.md:43): если
+    # след аренды засчитанного прогона (conflict_rework_attempts) к моменту
+    # эскалации уже выпал из окна recent_runs(per_page=10) — worker.yml не
+    # простаивает (другие задачи/PR дают собственные прогоны, а этот job живёт
+    # до 280 минут), окно между двумя вызовами вполне успевает сдвинуться —
+    # текст эскалации честно говорит "не атрибутирован", не подсовывает
+    # conclusion чужого прогона как диагноз ЭТОЙ попытки.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/560/files": files_payload([]),
+        "compare/basesha...main": {"files": files_payload([])},
+        "pulls/560": {"mergeable_state": "dirty"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z", "body": "Канал: worker run 900."},
+            {"created_at": "2026-09-06T09:05:00Z", "body": "🤖 [worker: git-шаг] worker run 900"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    # recent_runs вызывается дважды за проход: первый раз — conflict_rework_
+    # attempts (видит прогон 900, засчитывает попытку), второй — last_worker_
+    # run_conclusion перед текстом эскалации. Между ними окно сдвинулось —
+    # прогон 900 больше не в топ-10 (мутация: замени на общий список с 900 в
+    # обоих ответах — этот тест перестанет проверять то, ради чего заведён,
+    # хотя может остаться зелёным; смотри соседний тест на пере-атрибуцию).
+    run_windows = iter([
+        [{"id": 900, "conclusion": "success", "created_at": "2026-09-06T09:00:00Z"}],
+        [{"id": 901, "conclusion": "success", "created_at": "2026-09-06T09:10:00Z"}],
+    ])
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: next(run_windows))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert escalated and "не атрибутирован" in escalated[0][2]
+    assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
+
+
 def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfirmed(monkeypatch):
     # Находка ревью PR #478 (блокирующая): метка `conflict` НАМЕРЕННО
     # переживает mergeable_state None/unknown (mark_conflicts — «"не знаю"
@@ -2435,6 +2483,57 @@ def test_conflict_labeled_at_none_when_never_labeled(monkeypatch):
     fake = FakeGh({"issues/560/timeline?per_page=100": []})
     patch_gh(monkeypatch, fake)
     assert sch.conflict_labeled_at(REPO, 560) is None
+
+
+def test_conflict_first_labeled_at_returns_earliest_labeling_episode(monkeypatch):
+    # Обратное conflict_labeled_at: min(), не max() — граница лифтайм-бюджета
+    # conflict_rework_attempts обязана указывать на ПЕРВЫЙ эпизод конфликта,
+    # не на текущий (находка ревью PR #597: max() тут обнулял бы засчитанные
+    # попытки при каждой повторной простановке метки). Мутация: замени min()
+    # на max() — тест вернул бы 09-05 вместо 09-01, покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_first_labeled_at(REPO, 560) == utc(2026, 9, 1, 0, 0)
+
+
+def test_conflict_first_labeled_at_none_when_never_labeled(monkeypatch):
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_first_labeled_at(REPO, 560) is None
+
+
+def test_conflict_rework_attempts_lifetime_survives_relabeling(monkeypatch):
+    # Ядро находки ревью PR #597: владелец задокументировал лифтайм-счётчик
+    # (не сбрасывается по эпизодам конфликта, spec.md:20-22). Здесь PR словил
+    # первый конфликт 09-01, засчитанная попытка пришлась НА ТОТ эпизод
+    # (09-01), метку сняли и поставили заново 09-05 (новый эпизод дрейфа).
+    # Граница по conflict_labeled_at (max, текущий эпизод — 09-05) стёрла бы
+    # засчитанную попытку из старого эпизода: attempts вернулся бы к 0, хотя
+    # бюджет уже потрачен. Мутация: верни since = conflict_labeled_at(...) —
+    # attempts станет 0 вместо 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 444, "conclusion": "success", "created_at": "2026-09-01T06:00:00Z"},
+        ]},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-01T06:05:00Z", "body": "Канал: worker run 444."},
+            {"created_at": "2026-09-01T06:10:00Z", "body": "🤖 [worker: git-шаг] worker run 444"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
 
 
 def test_conflict_rework_attempts_ignores_run_before_conflict_episode(monkeypatch):
@@ -2673,7 +2772,7 @@ def test_conflict_labeled_at_reads_timeline_through_paginated_helper():
     # (review_labels.status_posted_at) и таймлайн больше не читают — их
     # гвардии живут в соседних тестах выше.
     source = SCRIPT.read_text(encoding="utf-8")
-    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") >= 1
+    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
     assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
 
 
