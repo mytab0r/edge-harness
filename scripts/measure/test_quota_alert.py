@@ -141,6 +141,53 @@ def test_recovery_without_prior_issue_number_still_alerts(monkeypatch):
     assert "recovery" in result
 
 
+def test_first_observation_already_ok_does_not_send_false_recovery(monkeypatch):
+    """Ресурс впервые увиден в норме (prev_state=None, new_state=ok) — это НЕ
+    переход breach→ok, эскалации (Telegram + текст «квота вернулась ниже
+    порога») быть не должно, только тихий маркер (found: ревью PR #607)."""
+    _no_prior_state(monkeypatch)
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment",
+                         lambda repo, issue, text: posted.append(text))
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
+
+    assert escalated == []
+    assert len(posted) == 1
+    assert "= ok" in posted[0]
+    assert "первое наблюдение" in result
+
+
+def test_breach_without_created_task_does_not_write_state_marker(monkeypatch):
+    """create_or_note_task не смог завести/найти задачу (issue_number is None)
+    — маркер breach НЕ пишется, иначе следующий прогон увидел бы «без
+    изменений» и не повторил бы попытку заведения задачи (silent-wrong,
+    found: ревью PR #607)."""
+    _no_prior_state(monkeypatch)
+    monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (None, "issue-create отказал: сеть"))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
+                                 7_487_640, 5_000_000, 149.8)
+
+    assert len(escalated) == 1
+    assert "[quota: состояние" not in escalated[0]
+    assert "маркер состояния НЕ записан" in result
+
+    # Следующий прогон при той же метрике должен снова увидеть переход
+    # (никакого маркера не было записано, prev_state остаётся None) и
+    # повторить попытку заведения задачи.
+    create_calls = []
+    monkeypatch.setattr(qa, "create_or_note_task", lambda *a: create_calls.append(1) or (1234, "задача заведена"))
+    result2 = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
+                                  7_600_000, 5_000_000, 152.0)
+    assert create_calls == [1]
+    assert "breach" in result2
+
+
 # ── create_or_note_task: проводка на scripts/gh/issue-create ─────────────
 
 

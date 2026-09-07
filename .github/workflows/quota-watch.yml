@@ -48,7 +48,7 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py -q
 
-      - name: Дешёвая проверка + (раз в час) полный срез
+      - name: Дешёвая проверка + (не чаще раза в час, best-effort) полный срез
         env:
           GH_TOKEN: ${{ github.token }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

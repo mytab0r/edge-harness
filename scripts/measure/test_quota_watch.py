@@ -77,12 +77,30 @@ def test_cheap_check_computes_pct_and_calls_alert(monkeypatch):
     monkeypatch.setattr(qw.do_rows_read, "today_rows_read", lambda token, acct: 4_800_000)
     calls = []
     monkeypatch.setattr(qw.quota_alert, "check_and_alert",
-                         lambda repo, key, label, current, limit, pct: calls.append((key, label, current, limit, pct)) or "ok")
+                         lambda repo, key, label, current, limit, pct, threshold=None:
+                             calls.append((key, label, current, limit, pct, threshold)) or "ok")
 
     result = qw.cheap_check(REPO, "tok", "acct")
 
     assert result == "ok"
-    assert calls == [("cf_do_rows_read_day", "DO rows_read/сутки", 4_800_000, qw.do_rows_read.DAILY_LIMIT, 96.0)]
+    assert calls == [("cf_do_rows_read_day", "DO rows_read/сутки", 4_800_000, qw.do_rows_read.DAILY_LIMIT, 96.0,
+                       qw.quotas.THRESHOLD_PCT)]
+
+
+def test_cheap_check_threshold_tracks_quotas_single_source_of_truth(monkeypatch):
+    """Порог не второй независимый литерал: правка quotas.THRESHOLD_PCT
+    обязана долететь до вызова check_and_alert без правки quota_watch.py
+    (found: ревью PR #607 — раньше был захардкожен дефолт 80.0 отдельно)."""
+    monkeypatch.setattr(qw.do_rows_read, "today_rows_read", lambda token, acct: 4_800_000)
+    monkeypatch.setattr(qw.quotas, "THRESHOLD_PCT", 55.0)
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda repo, key, label, current, limit, pct, threshold=None:
+                             calls.append(threshold) or "ok")
+
+    qw.cheap_check(REPO, "tok", "acct")
+
+    assert calls == [55.0]
 
 
 def test_cheap_check_measurement_failure_is_not_fatal(monkeypatch):
@@ -106,7 +124,7 @@ def test_full_sweep_shares_resource_key_with_cheap_check(monkeypatch):
     monkeypatch.setattr(qw.quotas, "collect_github", lambda *a: [])
     calls = []
     monkeypatch.setattr(qw.quota_alert, "check_and_alert",
-                         lambda repo, key, label, current, limit, pct: calls.append(key) or "ok")
+                         lambda repo, key, label, current, limit, pct, threshold=None: calls.append(key) or "ok")
 
     qw.full_sweep(REPO, "tok", "acct")
 

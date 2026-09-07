@@ -42,6 +42,18 @@ over_threshold` + `pulse_guard.escalate`), но только по требова
      означает, что причина расхода понята и устранена. Переход breach→ok
      оставляет комментарий-уведомление (Telegram + след в #120), задача
      остаётся открытой до разбора человеком/агентом.
+  4. Два предохранителя от «дедуп по переходу» с ложным переходом (найдено
+     ревью PR #607, живой прогон): первое наблюдение ресурса, заставшее его
+     уже в норме (prev_state is None, new_state == "ok"), — НЕ переход
+     breach→ok, эскалации не было бы о чём сообщать, поэтому наружу тихо
+     уходит только маркер состояния, без Telegram/следа в #120. А если на
+     переходе ok→breach `create_or_note_task` не смог завести/найти задачу
+     (issue_number is None — сеть, отказ гвардии дублей без распознанного
+     кандидата, любая иная ошибка issue-create) — маркер breach НЕ пишется:
+     иначе следующий прогон увидел бы «без изменений» и промолчал бы по
+     дедупу до случайного breach→ok (для rows_read — сутки, для
+     storage-метрики — пока сама не упадёт), а действие («заводит задачу»,
+     суть #605) так и не повторилось бы.
 
 Запуск тестов: python -m pytest scripts/measure/test_quota_alert.py -q
 """
@@ -183,9 +195,24 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
                      current: float, limit: float, pct: float, threshold: float = 80.0) -> str:
     """Единая точка входа обоих вызывающих (см. докстринг модуля). Возвращает
     строку для лога прогона — вызывающий печатает её и решает про exit code
-    по той же подстроке "НЕ доставлен"/"НЕ оставлен", что и quotas.py."""
+    по той же подстроке "НЕ доставлен"/"НЕ оставлен", что и quotas.py.
+
+    Первое наблюдение ресурса (prev_state is None), заставшее его уже в
+    норме, — не переход breach→ok (события восстановления не было, эскалация
+    сообщила бы о факте, которого не было), поэтому наружу тихо уходит только
+    маркер состояния, без Telegram/следа-эскалации в #120 (найдено ревью
+    PR #607 — до этой правки такой прогон слал ложное «квота вернулась ниже
+    порога» на КАЖДЫЙ ресурс, впервые увиденный в норме)."""
     new_state = "breach" if pct >= threshold else "ok"
     prev_state, prev_issue = last_state(repo, resource_key)
+
+    if prev_state is None and new_state == "ok":
+        try:
+            pulse_guard.post_issue_comment(repo, WATCHDOG_ISSUE, state_marker(resource_key, "ok", None))
+        except RuntimeError as error:
+            return (f"{resource_key}: первое наблюдение (ok, {pct}%) — маркер НЕ записан: {error}")
+        return f"{resource_key}: первое наблюдение — состояние зафиксировано (ok, {pct}%)"
+
     if prev_state == new_state:
         return f"{resource_key}: без изменений ({new_state}, {pct}%) — сигнал не отправлен (дедуп)"
 
@@ -195,9 +222,17 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
         action = f"задача: #{issue_number}" if issue_number else f"задача НЕ заведена ({note})"
         text = (
             f"🚨 edge-harness: квота «{resource_label}» перевалила за {threshold}%: "
-            f"{_fmt(current)} / {_fmt(limit)} ({pct}%). {action}.\n"
-            + state_marker(resource_key, "breach", issue_number)
+            f"{_fmt(current)} / {_fmt(limit)} ({pct}%). {action}."
         )
+        if issue_number is None:
+            # Действие (заведение задачи) не состоялось — маркер состояния
+            # НЕ пишем: следующий прогон обязан снова увидеть переход
+            # (prev_state ≠ "breach") и повторить попытку, а не замолчать
+            # по дедупу до случайного breach→ok (found: ревью PR #607).
+            result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+            return (f"{resource_key}: breach — {result}; {note}; маркер состояния НЕ записан "
+                     "(действие не состоялось) — следующий прогон повторит попытку")
+        text += "\n" + state_marker(resource_key, "breach", issue_number)
         result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
         return f"{resource_key}: breach — {result}; {note}"
 
