@@ -303,6 +303,24 @@ def test_wire_dependencies_empty_input_no_calls():
     assert linked == []
 
 
+def test_wire_dependencies_deduplicates_input_single_mutation():
+    # Находка AI-ревью PR #537 (второй круг): повтор номера в ответе поля
+    # («#55 #55») не должен давать вторую мутацию addBlockedBy по тому же
+    # ребру — дедупликация в самом единственном цикле переноса, защищает
+    # оба пути (поле формы и строка «БЛОКИРУЕТСЯ:»).
+    calls = []
+    import unittest.mock as mock
+    with mock.patch.object(
+        td, "add_dependency",
+        lambda repo, blocked, blocking, gh_call=None: calls.append((blocked, blocking)),
+    ):
+        linked = td.wire_dependencies(
+            "owner/repo", 500, [55, 55, 60, 55], {55, 60}, log=lambda *a: None,
+        )
+    assert linked == [55, 60]
+    assert calls == [(500, 55), (500, 60)]
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
