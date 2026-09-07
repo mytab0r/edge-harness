@@ -9,8 +9,12 @@
 а «упадёт такого-то числа и заблокирует слияния» — AGENTS.md, «Алерт не
 гадает»).
 
-Горизонты (HORIZON_DAYS ниже — одно место правды, читает и workflow через
-`python -m clock_shift_suite --list-horizons`, и этот файл):
+Горизонты (HORIZON_DAYS ниже — одно место правды; синхронность с буквальной
+матрицей `.github/workflows/clock-shift-tests.yml` (GitHub Actions не умеет
+читать matrix из внешнего файла на этапе планирования job'ов) проверяет
+`test_clock_shift_suite.py::test_workflow_matrix_stays_in_sync_with_horizon_days`
+— читает workflow через `yaml.safe_load` и сверяет `matrix.horizon_days` с
+этим кортежем; рассинхрон красит тест, не остаётся тихой второй копией):
   +1   — быстрая проверка, что сам механизм сдвига жив (санити);
   +8   — обязательный (issue #649): переживает MAX_CAMPAIGN_DAYS=7
          (scripts/measure/dispatch_tail.py) — ровно порог, взорвавшийся

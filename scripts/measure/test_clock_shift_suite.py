@@ -14,10 +14,14 @@
 import importlib.util
 from pathlib import Path
 
+import yaml
+
 SCRIPT = Path(__file__).with_name("clock_shift_suite.py")
 spec = importlib.util.spec_from_file_location("clock_shift_suite", SCRIPT)
 css = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(css)  # type: ignore[union-attr]
+
+WORKFLOW = SCRIPT.parents[2] / ".github" / "workflows" / "clock-shift-tests.yml"
 
 
 # ── Прод-форма: живой красный вывод (снят до ребейза с фиксом #646) ──────────
@@ -128,3 +132,20 @@ def test_list_horizons_cli_prints_single_source_of_truth(capsys):
         _sys.argv = old_argv
     out = capsys.readouterr().out.strip()
     assert out == ",".join(str(d) for d in css.HORIZON_DAYS)
+
+
+def test_workflow_matrix_stays_in_sync_with_horizon_days():
+    """Находка второго гейта ревью PR #667: GitHub Actions не умеет читать
+    matrix из внешнего файла на этапе планирования job'ов — буквальный список
+    `[1, 8, 40, 400]` в clock-shift-tests.yml был ВТОРЫМ незащищённым местом
+    правды горизонтов рядом с HORIZON_DAYS, и рассинхрон (например забыли
+    докинуть +40/+400 при правке одного из файлов) не покрасил бы ни один
+    существующий чек — тихая потеря горизонта, ровно класс молчаливой
+    деградации носителя, против которого весь #649. Этот тест читает workflow
+    как данные (не текстом) и сверяет матрицу с HORIZON_DAYS напрямую."""
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    matrix_horizons = workflow["jobs"]["clock-shift"]["strategy"]["matrix"]["horizon_days"]
+    assert matrix_horizons == list(css.HORIZON_DAYS), (
+        f"матрица workflow {matrix_horizons} разошлась с HORIZON_DAYS "
+        f"{list(css.HORIZON_DAYS)} — второе место правды рассинхронизировано"
+    )

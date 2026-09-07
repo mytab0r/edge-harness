@@ -96,8 +96,12 @@ def test_missing_freezegun_fails_loud_not_silently_on_real_time(monkeypatch):
 
 
 def test_zero_or_unset_shift_is_a_noop_and_does_not_import_freezegun(monkeypatch):
+    """Имя обещало проверку отсутствия импорта freezegun — раньше здесь был
+    мёртвый assert (`"freezegun" not in sys.modules or True`, всегда True,
+    находка второго гейта ревью PR #667). freezegun мог быть уже импортирован
+    другим тестом сессии, поэтому честная проверка не «нет в sys.modules», а
+    «no-op не трогает _freezer» — это и есть предмет теста."""
     monkeypatch.delenv(conftest.CLOCK_SHIFT_DAYS_ENV, raising=False)
-    assert "freezegun" not in sys.modules or True  # не требуем отсутствия (могло быть импортировано ранее в сессии)
     conftest.pytest_configure(config=None)
     assert conftest._freezer is None
     conftest.pytest_unconfigure(config=None)  # не падает на пустом _freezer

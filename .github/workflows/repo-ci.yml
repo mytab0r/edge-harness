@@ -986,6 +986,18 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/lib/test_rate_guard.py -q
 
+      # Юнит-слой носителя «настенные часы» (#649) — БЕЗ сдвига (CLOCK_SHIFT_DAYS
+      # не задан, conftest.py — no-op). Полный прогон на горизонтах живёт только
+      # в clock-shift-tests.yml раз в сутки (находка второго гейта ревью PR #667):
+      # правка conftest.py/clock_shift_suite.py сама по себе проходила обязательный
+      # `test` без единой их проверки — поломку поймал бы только завтрашний
+      # красный прогон, уже после мержа. Этот шаг — копеечная (доли секунды)
+      # страховка на каждый PR; полный прогон на горизонтах остаётся отдельным.
+      - name: Тесты носителя «настенные часы» — без сдвига (#649)
+        run: |
+          pip install --quiet pytest pyyaml freezegun
+          python -m pytest scripts/measure/test_clock_shift_suite.py scripts/test_conftest_clock_shift.py -q
+
       # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
       # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
       # живого падения, что у PR #428 (оба обязательных гейта, `test` в том

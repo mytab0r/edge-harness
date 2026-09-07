@@ -45,7 +45,9 @@ jobs:
         # Одно место правды горизонтов — scripts/measure/clock_shift_suite.py
         # (HORIZON_DAYS); здесь буквальный список, потому что GitHub Actions
         # не умеет читать matrix из внешнего файла на этапе планирования job'ов
-        # (гвардия синхронности — тест ниже, test_clock_shift_suite.py).
+        # (гвардия синхронности — test_clock_shift_suite.py::
+        # test_workflow_matrix_stays_in_sync_with_horizon_days, читает этот
+        # файл через yaml.safe_load и сверяет со списком).
         horizon_days: [1, 8, 40, 400]
     steps:
       - uses: actions/checkout@v7
