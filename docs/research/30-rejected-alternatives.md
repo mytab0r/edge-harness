@@ -347,14 +347,19 @@ OpenAI-совместимый эндпоинт с осмысленной кво�
 ## 14. Секрет-сканирование: gitleaks vs trufflehog vs встроенный GitHub secret scanning
 
 **Что это.** Правило AGENTS.md:221-222 («секреты не попадают в репозиторий никогда, даже в
-примерах») не имело ни одного механического носителя (#634): грепом по
-`.github/workflows/*.yml` — ни gitleaks, ни trufflehog, ни detect-secrets. Проверка
-`security_and_analysis` через API репозитория показала: `secret_scanning` и
-`secret_scanning_push_protection` включены (партнёрские форматы токенов — например
-`ghp_…`/`AKIA…` — ловятся ещё до пуша), но `secret_scanning_non_provider_patterns`
-(общие эвристики вида «generic API key»/«generic password») — **выключены**. То есть
-произвольный секрет проекта в непартнёрском формате (Cloudflare API token, Telegram bot
-token, собственные прикладные ключи) сегодня не ловится вообще ничем.
+примерах») не имело носителя на два конкретных пробела (#634). Частичное покрытие УЖЕ
+было: `scripts/review/check_pr.py::SECRET_PATTERNS` красит `review:changes-requested`
+на нескольких форматах в ДОБАВЛЕННЫХ строках диффа PR (GitHub PAT, AWS access key, Slack
+token, приватный ключ, литерал `TOKEN/SECRET/KEY=…`), а `security_and_analysis` репозитория
+показывает встроенные `secret_scanning`/`secret_scanning_push_protection` — партнёрские
+форматы токенов (например `ghp_…`/`AKIA…`) ловятся ещё до пуша. Не было носителя у двух
+вещей, которые ни один из этих двух механизмов не закрывает: 1) полная история репозитория
+(check_pr.py видит только диапазон коммитов текущего PR, встроенный push protection —
+только новые пуши, коммиты ДО его включения не пересканируются); 2) секрет проекта в
+формате вне списка check_pr.py и вне партнёрских форматов (`secret_scanning_non_provider_patterns`
+— общие эвристики вида «generic API key»/«generic password» по энтропии — **выключены**),
+например Cloudflare API token, Telegram bot token (формат с двоеточием, не подходит под
+`KEY="…"`), собственные прикладные ключи.
 
 **Сравнение вариантов.**
 
