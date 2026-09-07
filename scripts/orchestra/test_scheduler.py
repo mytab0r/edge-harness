@@ -511,7 +511,8 @@ def test_accept_merged_tasks_fail_appends_session_note(monkeypatch):
 
 def test_unhealthy_pulls_appends_session_note(monkeypatch):
     task = issue(50)
-    p = pull(9, labels=(sch.review_labels.AI_CHANGES,), updated_at="2026-09-02T00:00:00Z", pr_body="#50")
+    p = pull(9, labels=(sch.review_labels.AI_CHANGES,), updated_at="2026-09-02T00:00:00Z",
+              pr_body="#50", ref="agent/50-x")
     captured = {}
     monkeypatch.setattr(
         sch, "append_session_notes",
@@ -1218,7 +1219,8 @@ CHECK_RUNS_EMPTY = {"check_runs": []}
 
 def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
     task = issue(200)
-    p = pull(201, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z", pr_body="#200")
+    p = pull(201, labels=["review:ok"], updated_at="2026-09-02T09:00:00Z", pr_body="#200",
+              ref="agent/200-x")
     fake = FakeGh({
         "commits/sha201/check-runs": CHECK_RUNS_RED,
         "issues/200/assignees": None,
@@ -1242,7 +1244,7 @@ def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
 def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
     task = issue(210)
     p = pull(211, labels=["review:ok", "ai:changes-requested"],
-              updated_at="2026-09-02T09:00:00Z", pr_body="#210")
+              updated_at="2026-09-02T09:00:00Z", pr_body="#210", ref="agent/210-x")
     fake = FakeGh({
         "commits/sha211/check-runs": CHECK_RUNS_GREEN,  # чек зелёный — причина не в нём
         "issues/210/assignees": None,
@@ -1279,7 +1281,8 @@ def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch
 
 def test_unhealthy_pulls_silent_before_threshold(monkeypatch):
     task = issue(220)
-    p = pull(221, labels=["review:ok"], updated_at="2026-09-02T11:30:00Z", pr_body="#220")
+    p = pull(221, labels=["review:ok"], updated_at="2026-09-02T11:30:00Z", pr_body="#220",
+              ref="agent/220-x")
     fake = FakeGh({
         "commits/sha221/check-runs": CHECK_RUNS_RED,
     })
@@ -1294,7 +1297,8 @@ def test_unhealthy_pulls_silent_before_threshold(monkeypatch):
 
 def test_unhealthy_pulls_silent_when_pr_green(monkeypatch):
     task = issue(230)
-    p = pull(231, labels=["review:ok"], updated_at="2026-09-02T08:00:00Z", pr_body="#230")
+    p = pull(231, labels=["review:ok"], updated_at="2026-09-02T08:00:00Z", pr_body="#230",
+              ref="agent/230-x")
     fake = FakeGh({
         "commits/sha231/check-runs": CHECK_RUNS_GREEN,
     })
@@ -1308,7 +1312,8 @@ def test_unhealthy_pulls_idempotent_after_release_no_assignee(monkeypatch):
     # После освобождения задачи assignees пуст — тот же приём, что у reap_stale:
     # follow-up вызов не действует повторно (не дублирует комментарий/снятие).
     task = issue(240, assignees=())
-    p = pull(241, labels=["review:ok"], updated_at="2026-09-02T08:00:00Z", pr_body="#240")
+    p = pull(241, labels=["review:ok"], updated_at="2026-09-02T08:00:00Z", pr_body="#240",
+              ref="agent/240-x")
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не назначена — не трогаем"))
@@ -1322,7 +1327,8 @@ def test_unhealthy_pulls_idempotent_after_release_no_assignee(monkeypatch):
 def test_unhealthy_pulls_skips_conflict_labeled_pr(monkeypatch):
     # conflict — отдельный класс (mark_conflicts), unhealthy_pulls не дублирует.
     task = issue(250)
-    p = pull(251, labels=["review:ok", "conflict"], updated_at="2026-09-02T08:00:00Z", pr_body="#250")
+    p = pull(251, labels=["review:ok", "conflict"], updated_at="2026-09-02T08:00:00Z", pr_body="#250",
+              ref="agent/250-x")
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("conflict — не наш класс"))
@@ -1339,13 +1345,88 @@ def test_unhealthy_pulls_skips_blocked_labeled_issue(monkeypatch):
     # починить чинит агент раз за разом.
     task = issue(270, labels=["task", "blocked"])
     p = pull(271, labels=["review:ok", "ai:changes-requested"],
-              updated_at="2026-09-02T08:00:00Z", pr_body="#270")
+              updated_at="2026-09-02T08:00:00Z", pr_body="#270", ref="agent/270-x")
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("blocked — газ только у владельца"))
     lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
+
+
+# ── #286: unhealthy_pulls не снимает ЧУЖУЮ задачу по упоминанию в прозе ──────────
+#
+# Прод-форма (снята `gh api repos/mytab0r/edge-harness/pulls/181` и
+# `.../issues/90`, 2026-09-08): тело PR #181 (ветка `agent/179-white-spot-in-pool`,
+# собственная задача #179) перечисляет примеры сирот-`white-spot` без метки
+# `task`, включая живую тогда задачу #90 — упоминание контекстом, не
+# декларацией. Живой случай: 2026-09-04 задача #90 дважды лишилась аренды,
+# потому что pr_references_issue (широкий матч по прозе) считал PR #181
+# «ссылающимся» на #90 и unhealthy_pulls снимал чужой замок.
+
+_PR_181_BODY = (
+    "#179\n\n## Проблема\n\n"
+    "`.github/ISSUE_TEMPLATE/white-spot.yml:3` ставил `labels: [white-spot]`, а пул задач\n"
+    "воркера — это issues строго с меткой `task` (`scripts/orchestra/scheduler.py`,\n"
+    "`scripts/orchestra/contract_check.py`). Белое пятно, заведённое по шаблону, метки\n"
+    "`task` не получало и физически не попадало в пул — из 7 открытых `white-spot` четыре\n"
+    "висели без `task` (#149, #90, #72, #43), в том числе #90 — сломанный гейт ревью\n"
+    "(`check_pr.py: NameError LARGE_OK`), который никто не подхватывал в работу неделями.\n"
+)
+
+
+def test_unhealthy_pulls_does_not_release_foreign_task_mentioned_in_prod_pr_body(monkeypatch):
+    # МУТАЦИЯ (сними фикс — верни referencing = [pull for pull in pulls if
+    # pr_references_issue(pull, number)] в unhealthy_pulls — этот тест
+    # покраснеет: pr_references_issue(PR_181, 90) is True через
+    # references_task(body, 90), и замок #90 будет снят).
+    task_90 = issue(90, assignees=("mytab0r",))
+    pr_181 = pull(181, labels=["review:ok", "ai:changes-requested"],
+                   updated_at="2026-09-02T09:00:00Z",
+                   pr_body=_PR_181_BODY, ref="agent/179-white-spot-in-pool")
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
+        "#90 чужая для PR #181 (собственная задача — #179 по ветке) — трогать нельзя"))
+    now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120 — было бы «нездоров достаточно долго»
+    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_90])
+    assert lines == []
+    assert not any("-X DELETE" in c for c in fake.calls)
+    assert task_90["assignees"] == [{"login": "mytab0r"}]  # аренда цела
+
+
+def test_unhealthy_pulls_releases_own_task_of_same_prod_pr_via_branch(monkeypatch):
+    # Здоровый путь не сломан той же прод-формой: собственная задача PR #181 —
+    # #179 (имя ветки agent/179-...), и её unhealthy_pulls обязан вернуть в пул
+    # как раньше, ai:changes-requested дольше порога.
+    task_179 = issue(179, assignees=("mytab0r",))
+    pr_181 = pull(181, labels=["review:ok", "ai:changes-requested"],
+                   updated_at="2026-09-02T09:00:00Z",
+                   pr_body=_PR_181_BODY, ref="agent/179-white-spot-in-pool")
+    fake = FakeGh({"issues/179/assignees": None})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_179])
+    assert any("возвращена в пул" in line and "179" in line for line in lines)
+    assert task_179["assignees"] == []
+
+
+def test_unhealthy_pulls_ignores_pr_without_agent_branch_even_with_prose_mention(monkeypatch):
+    # PR без ветки agent/N-... (ручной пуш/бот) — «задача не определена» для
+    # unhealthy_pulls, а не «наверное вот эта» по упоминанию в теле.
+    task_90 = issue(90, assignees=("mytab0r",))
+    pr_no_branch = pull(999, labels=["review:ok", "ai:changes-requested"],
+                         updated_at="2026-09-02T09:00:00Z", pr_body=_PR_181_BODY)  # ref=None
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
+        "PR без agent-ветки не сопоставлен ни с какой задачей — трогать нечего"))
+    now = utc(2026, 9, 2, 12, 0)
+    lines = sch.unhealthy_pulls(REPO, now, [pr_no_branch], pool=[task_90])
+    assert lines == []
+    assert task_90["assignees"] == [{"login": "mytab0r"}]
 
 
 # ── Мутация гвардии поведения 2: без возврата в пул задача осталась бы висеть ────
