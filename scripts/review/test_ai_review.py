@@ -1503,3 +1503,18 @@ def test_cmd_should_run_busy_check_before_force_mutation_guard(monkeypatch, caps
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "false"  # текущий код отказывает
+
+
+# ── Чек-лист ревью обязан спросить про отказ самого механизма (замер
+# 2026-09-07: семь независимых дефектов одного класса — «механизм есть, а
+# его собственный отказ/пустой вход/крайнее значение не рассмотрены» —
+# PR #646, #656 (дважды), харнес мутаций до кода, #642, docs/INDEX.md,
+# #635/#640). До этого теста ai_prompt.md не имел ни одного носителя,
+# проверяющего содержимое пунктов ревью, — правки списка утекали молча.
+
+def test_ai_prompt_checklist_asks_about_mechanisms_own_failure_mode():
+    prompt = (ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8")
+    assert "краснеет он тогда или молча зеленеет" in prompt, (
+        "ai_prompt.md потерял пункт чеклиста про собственный отказ "
+        "механизма/пустой вход/крайнее значение объекта"
+    )
