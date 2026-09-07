@@ -1,0 +1,51 @@
+# Конфиг gitleaks (docs/decisions — обоснование выбора инструмента в
+# docs/research/30-rejected-alternatives.md, раздел «14. Секрет-сканирование»).
+#
+# Наследуем встроенный набор правил gitleaks (провайдерные форматы токенов +
+# generic-api-key/generic-password по энтропии) и добавляем ТОЛЬКО точечные
+# исключения на подтверждённые ложные срабатывания — каждое со своей причиной,
+# не общее отключение правила и не общее отключение сканера.
+title = "edge-harness gitleaks config"
+
+[extend]
+useDefault = true
+
+# Найдено полным прогоном по истории (#634, 2026-09-07): мутационные тесты
+# нарочно шлют заведомо неверный токен/ключ, чтобы проверить, что харнес
+# честно отвечает 401/невалидный доступ, а не молча принимает. Формат
+# "definitely-wrong-*" специально нечитаем как настоящий секрет ни одним
+# провайдером — это и есть его смысл (canary, не значение).
+[[allowlists]]
+description = "Мутационные smoke/quotas-тесты: заведомо неверный токен/ключ (.github/workflows/quotas.yml, diag-integrations-journal.yml, diag-502.yml) — проверяется факт отказа доступа, не хранится настоящий секрет"
+regexes = ['''definitely-wrong-[a-z0-9-]+''']
+
+# scripts/review/test_check_pr.py кормит check_pr.py собственной находкой
+# (AWS-ключ по форме AKIA+16 симв.), чтобы доказать, что гвардия красит PR
+# при обнаружении секрета в диффе. Буквы идут по алфавиту — не валидный
+# формат AWS (реальный ключ так не выглядит), это тестовая строка.
+[[allowlists]]
+description = "scripts/review/test_check_pr.py: синтетический AWS-ключ (буквы по алфавиту) для проверки собственной гвардии check_pr.py на находку в диффе"
+regexes = ['''AKIAABCDEFGHIJKLMNOP''']
+
+# plugins-src/runner-bridge/test/server.test.mjs проверяет readToken() на
+# валидном/невалидном значении. Значение — словарная строка "abcdef123456",
+# не случайные символы: невозможный формат для настоящего PAT.
+[[allowlists]]
+description = "plugins-src/runner-bridge/test/server.test.mjs: синтетический GitHub PAT (словарная последовательность abcdef123456) для unit-теста readToken()"
+regexes = ['''ghp_abcdef123456''']
+
+# dsh-edge/*-integration/check.mjs (registry/proxy/pipeline/ingest — файл
+# копировался при добавлении новых интеграций) собирает заглушку конкатенацией
+# по частям specifically, чтобы не быть литералом с суффиксом *KEY/*TOKEN —
+# сам файл комментирует "настоящих секретов нет (локальный unstable_dev)".
+[[allowlists]]
+description = "dsh-edge/*-integration/check.mjs: AUTH_DUMMY — заглушка авторизации локального unstable_dev, не секрет (см. комментарий в файле)"
+regexes = ['''key-0123456789abcdef''']
+
+# Пример .dev.vars для локального wrangler dev: значения пустые или
+# буквально "dev-token"/"dev-session-secret" — не секреты, а подсказка
+# разработчику, какие переменные вообще существуют (AGENTS.md: «в
+# документации — только имена»).
+[[allowlists]]
+description = "cf-worker/.dev.vars.example: только имена переменных и placeholder-значения для локальной разработки, реальных секретов файл не содержит по своему назначению"
+paths = ['''cf-worker/\.dev\.vars\.example''']

@@ -80,6 +80,11 @@ EXPECTED_WORKFLOWS = frozenset({
     "pr-review.yml",
     "quotas.yml",
     "repo-ci.yml",
+    # #634: gitleaks-гейт PR + периодический полный прогон истории. Читает
+    # только github.token (issues:write в job full-history — эскалация
+    # находки в пул), ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не использует
+    # — тот же класс, что branch-protection-watch.yml/owner-decision.yml выше.
+    "secret-scan.yml",
     # #490: регистрация вебхука Telegram — только секреты TELEGRAM_BOT_TOKEN/
     # TELEGRAM_WEBHOOK_SECRET, ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
     # читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
