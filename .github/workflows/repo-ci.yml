@@ -591,6 +591,18 @@ jobs:
             node dsh-edge/check-plugin-compat.mjs "$dir"
           done
 
+      # Коллизия имён с апстримом (issue #518/#547/#551, класс PR #521): та же
+      # проверка, что и в deploy-dsh-edge.yml, но здесь она гоняется на КАЖДЫЙ
+      # PR (repo-ci.yml без path-фильтра) — включая PR авто-бампа пина
+      # (upstream_drift.py::attempt_auto_bump), который deploy-dsh-edge.yml не
+      # проверяет вовсе (деплой не гоняется на pull_request). Проверка читает
+      # реальный апстримный артефакт на пине из dsh-edge/upstream.json, а не
+      # захардкоженный список — так она не протухнет к следующему бампу.
+      - name: Коллизия имён с апстримом (namespace/label/inject/slot)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node dsh-edge/check-upstream-namespace-collision.mjs
+
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
