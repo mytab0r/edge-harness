@@ -262,6 +262,41 @@ def test_auto_wire_real_issue_529_body_yields_nothing():
     assert dd.form_field_numbers(ISSUE_529_BODY) == []
 
 
+def test_auto_wire_skips_closed_blocker_without_delegate_or_warning(monkeypatch):
+    # Находка AI-ревью PR #537: `blocked_by_open` содержит только ОТКРЫТЫХ
+    # блокеров, поэтому на push после закрытия #55 у задачи с полем «#55»
+    # каждый прогон снова давал missing=[55] и предупреждение «связь НЕ
+    # поставлена» — хотя связь стоит, а ссылка на закрытую «не влияет ни на
+    # что». Фильтр до делегирования: ни вызова wire_dependencies, ни лога.
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)  # пул не содержит #55 — она закрыта
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == []
+    assert fake.wire_calls == []
+
+
+def test_auto_wire_filters_closed_and_self_before_delegate_keeps_open(monkeypatch):
+    # Мутационная гвардия фильтра: из поля «#55 #56 #500» (55 закрыт, 500 —
+    # сама issue) до wire_dependencies доходит только открытый чужой #56 —
+    # тот же делегат, что и раньше, но без повторяемого шума.
+    issues = [
+        {
+            "number": 500,
+            "body": "### Чем блокируется\n\n#55 #56 #500\n",
+            "blocked_by_open": [],
+        },
+        {"number": 56, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 500, "linked": [56]}]
+    assert fake.wire_calls == [(500, [56])]
+
+
 # ── CLI wire ─────────────────────────────────────────────────────────────────
 
 
@@ -274,7 +309,13 @@ def test_cli_wire_reports_nothing_to_link(monkeypatch, capsys):
 
 
 def test_cli_wire_prints_linked_numbers(monkeypatch, capsys):
-    issues = [{"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []}]
+    # #55 в пуле (иначе фильтр auto_wire правильно не стал бы её линковать —
+    # фикстура раньше притворялась линкуемым закрытым номером, находка
+    # AI-ревью PR #537).
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []},
+        {"number": 55, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
+    ]
     fake = FakeTaskDeps(issues)
     monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
     rc = dd.main(["wire", "owner/repo"])
