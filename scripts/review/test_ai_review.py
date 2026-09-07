@@ -506,22 +506,42 @@ def test_gather_prompt_template_delivers_rules_section():
         "содержимое PROTOCOL.md не дошло до промпта ревьюера"
 
 
-def test_rules_section_dollar_survives_substitution():
-    # Ловушка string.Template: $-паттерны реальных правил (`$GITHUB_REPOSITORY`,
-    # `${{ github.token }}`) не должны искажаться при safe_substitute — значения
-    # мэппинга не пересканируются на плейсхолдеры, только текст самого шаблона.
-    # Мутация класса: встраивание rules_section прямо В ТЕКСТ ШАБЛОНА (вместо
-    # передачи значением) была бы тем же классом уязвимости для будущих правок
-    # ai_prompt.md — тест ловит именно то, что $-текст доходит до модели как есть.
-    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
-    dollar_fragment = (
-        "Задача из пула ссылается на $GITHUB_REPOSITORY и на "
-        "${{ github.token }} — оба паттерна реальных правил репозитория."
+def test_ai_prompt_rules_delivered_as_value_not_embedded():
+    # Класс мутации: если бы кто-то вписал rules_section (или его плейсхолдер)
+    # прямо В ТЕКСТ ШАБЛОНА ai_prompt.md, а не передавал его значением через
+    # safe_substitute, то будущие `$`-паттерны в правилах пересканировались бы
+    # Template как плейсхолдеры шаблона и искажались. Замер по прод-файлу:
+    # сырой ai_prompt.md несёт только плейсхолдер `$rules_section`, а не текст
+    # AGENTS.md — значит правила идут значением подстановки, не текстом шаблона.
+    raw_template = (ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8")
+    assert "$rules_section" in raw_template
+    agents_heading = ai.AGENTS_FILE.read_text(encoding="utf-8").splitlines()[0]
+    assert agents_heading not in raw_template
+
+
+def test_rules_section_dollar_survives_substitution(tmp_path, monkeypatch):
+    # Значения мэппинга в safe_substitute не пересканируются на `$`-плейсхолдеры
+    # (пересканируется только текст самого шаблона) — поэтому будущие `$` внутри
+    # AGENTS.md/PROTOCOL.md (сегодня их там нет, замерено отдельно) доедут до
+    # модели неискажёнными. Сегодняшний текст правил `$` не содержит, поэтому
+    # мутация подставляет синтетические правила с `$`, чтобы доказать именно
+    # свойство safe_substitute, а не текущее содержимое файлов.
+    agents_file = tmp_path / "AGENTS.md"
+    protocol_file = tmp_path / "PROTOCOL.md"
+    agents_file.write_text(
+        "# Правила\n\nСсылается на $GITHUB_REPOSITORY.\n", encoding="utf-8",
     )
+    protocol_file.write_text(
+        "# Протокол\n\nИспользует ${{ github.token }} в примере.\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(ai, "AGENTS_FILE", agents_file)
+    monkeypatch.setattr(ai, "PROTOCOL_FILE", protocol_file)
+
+    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
     prompt = template.safe_substitute(
         pr=1, title="t", branch="b", author="a",
         context_pack="pack.txt",
-        task_section=dollar_fragment,
+        task_section="(без задачи)",
         rules_section=ai.rules_section(),
     )
     assert "$GITHUB_REPOSITORY" in prompt

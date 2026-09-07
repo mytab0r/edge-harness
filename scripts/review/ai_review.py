@@ -801,10 +801,14 @@ def rules_section() -> str:
     Подставляется как ОДНО ЗНАЧЕНИЕ через `string.Template.safe_substitute`
     (см. cmd_gather), а не встраивается в текст самого шаблона: Template
     сканирует на `$`-плейсхолдеры только ТЕКСТ ШАБЛОНА при разборе, значения
-    подстановки в мэппинге не пересканируются — `$GITHUB_REPOSITORY` и
-    `${{ github.token }}`, которые постоянно встречаются в правилах
-    репозитория, доходят до модели неискажёнными (доказано мутацией в
-    test_ai_review.py::test_rules_section_dollar_survives_substitution).
+    подстановки в мэппинге не пересканируются — по той же причине, что и
+    diff-пак, и тело задачи (task_section), уже едущие значением. Сегодня
+    в AGENTS.md и docs/agents/PROTOCOL.md символа `$` нет вовсе (замерено),
+    но если он там появится (например, `$GITHUB_REPOSITORY` или
+    `${{ github.token }}` в примере из правил), он точно так же доедет до
+    модели неискажённым — это свойство safe_substitute, а не текущего
+    содержимого правил. Что именно ловит тест — см.
+    test_ai_review.py::test_ai_prompt_rules_delivered_as_value_not_embedded.
     """
     agents = AGENTS_FILE.read_text(encoding="utf-8")
     protocol = PROTOCOL_FILE.read_text(encoding="utf-8")

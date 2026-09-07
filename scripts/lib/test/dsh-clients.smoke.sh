@@ -121,6 +121,11 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
           # session.create выше, она не знает про эту переменную).
           local _rsid
           _rsid=$(printf '%s' "${data_str:-}" | command jq -r '.payload.sessionId // empty' 2>/dev/null)
+          # Каптурка РЕАЛЬНОГО заголовка, отправленного мордой (класс: правила
+          # репозитория, вклеенные в промпт до вычисления заголовка, могли бы
+          # исказить его на первую строку AGENTS.md вместо задачи) — сверяется
+          # ассертом assert_session_title ниже, не самим ответом заглушки.
+          log_call "MORDE-RPC-TITLE $(command jq -r '.payload.title // empty' <<<"$data_str" 2>/dev/null)"
           if [ -n "${SMOKE_CORRUPTED_RENAME_SESSION_ID:-}" ] && [ "$_rsid" = "$SMOKE_CORRUPTED_RENAME_SESSION_ID" ]; then
             body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"stored session \\\"$_rsid\\\" failed validation: Error: session event at seq 2833 lacks an identified message\"}}}"
           else
@@ -545,6 +550,14 @@ assert_rules_delivered() { # LABEL — промпт, ушедший к dsh, не
   echo "SMOKE: $label — правила репозитория (AGENTS.md + PROTOCOL.md) доходят до промпта dsh"
 }
 
+assert_session_title() { # LABEL EXPECTED — заголовок session.rename не искажён вклеенными правилами
+  local label=$1 expected=$2 got
+  got=$(grep -F "MORDE-RPC-TITLE " "$CALLLOG" | tail -1 | cut -d' ' -f2-)
+  [ "$got" = "$expected" ] \
+    || { echo "::error::SMOKE: $label: заголовок session.rename «$got», ожидали «$expected» (правила репозитория исказили заголовок?)" >&2; exit 1; }
+  echo "SMOKE: $label — заголовок сессии морды не искажён правилами репозитория"
+}
+
 assert_log() { # SUBSTR MESSAGE
   if ! grep -qF -- "$1" "$CALLLOG"; then
     echo "::error::SMOKE: не дождались «$1» в журнале вызовов — $2" >&2
@@ -641,6 +654,7 @@ grep -qE '"kind": *"job_end"' "$JOURNAL_CAPT" \
 grep -qE '"result": *"ok"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands: job_end не ok" >&2; exit 1; }
 assert_rules_delivered "hands"
+assert_session_title "hands" "Smoke задача: проверить гвардию класса"
 echo "SMOKE: hands — ок"
 
 # ── Клиент автономного воркера ────────────────────────────────────────────────────
@@ -674,6 +688,7 @@ grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$t
 grep -qF -- "выполнена" <<<"$tg_line" \
   && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
 assert_rules_delivered "worker"
+assert_session_title "worker" "#123: Smoke задача & для гвардии класса"
 echo "SMOKE: worker — ок"
 
 # ── Испорченная холодная загрузка сессии (#809) ────────────────────────────────────
