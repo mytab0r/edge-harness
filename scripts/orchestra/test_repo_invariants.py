@@ -573,6 +573,67 @@ def test_declared_change_task_ignores_prose_before_declaration():
     assert ri.declared_change_task(TASK_REWORK_LOOP_PROPOSAL) is None
 
 
+# Мутационная гвардия (ревью PR #663, некритичное замечание «якорь `^Задач`
+# слишком широкий — матчит и «Задача владельца:»»). Абзац ниже — та же чужая
+# декларация, что открывает реальный task-rework-loop/proposal.md, но с
+# добавленным чужим #999 в том же абзаце: со старым якорём `^Задач` (без
+# требования двоеточия сразу после слова) этот абзац матчился бы как
+# декларация и declared_change_task вернул бы 999 — чужой номер задачи,
+# который второй путь check_unarchived_complete_changes закрыл бы по чужому
+# состоянию. Снять `(?:а|и):` из _DECLARED_TASK_PARA_RE (вернуть `^Задач`) —
+# тест ниже покраснеет.
+OWNER_PROSE_WITH_STRAY_ISSUE_NUMBER = """# task-rework-loop: конечный цикл реворка
+
+Задача владельца: сформулирована в чате 2026-09-03, ссылается на #999 из
+истории обсуждения — issue в пуле пока не заведена этим change.
+
+## Класс проблемы
+
+Прочая проза.
+"""
+
+
+def test_declared_change_task_ignores_owner_prose_even_with_stray_issue_number():
+    assert ri.declared_change_task(OWNER_PROSE_WITH_STRAY_ISSUE_NUMBER) is None
+
+
+# ── fetch_task_states: 404 честно пропускается, любая другая ошибка — нет ──
+#
+# Некритичное замечание ревью PR #663: RuntimeError от gh() был неотличим от
+# 404 — сетевой сбой/квота молча превращали бы «нарушений нет» в ложно-зелёный
+# инвариант 4 ровно тогда, когда кто-то проверяет условие возврата в
+# CI_GATING. Прод-форма сообщения — реальный вывод `gh api` на несуществующий
+# issue этого репозитория (см. текст ниже, воспроизведён живым вызовом).
+REAL_GH_404_STDERR = (
+    'repos/mytab0r/edge-harness/issues/999999999: {"message":"Not Found",'
+    '"documentation_url":"https://docs.github.com/rest/issues/issues#get-an-issue",'
+    '"status":"404"} (HTTP 404)'
+)
+
+
+def test_fetch_task_states_skips_missing_issue_on_404(monkeypatch):
+    def fake(*args):
+        raise RuntimeError(REAL_GH_404_STDERR)
+
+    monkeypatch.setattr(ri, "gh", fake)
+    assert ri.fetch_task_states(REPO, {999999999}) == {}
+
+
+def test_fetch_task_states_raises_on_non_404_error(monkeypatch):
+    """Мутация: снять проверку `"HTTP 404" not in str(exc)` (вернуть голое
+    `except RuntimeError: continue`, как было до фикса #663) — этот тест
+    покраснеет, потому что сетевой сбой перестанет отличаться от 404 и
+    молча даст пустой словарь вместо честного падения."""
+
+    def fake(*args):
+        raise RuntimeError("repos/mytab0r/edge-harness/issues/369: "
+                            "API rate limit exceeded for installation")
+
+    monkeypatch.setattr(ri, "gh", fake)
+    with pytest.raises(RuntimeError, match="rate limit"):
+        ri.fetch_task_states(REPO, {369})
+
+
 def write_proposal(tmp_path, name, content):
     change_dir = tmp_path / name
     change_dir.mkdir(parents=True, exist_ok=True)
