@@ -76,6 +76,10 @@ EXPECTED_WORKFLOWS = frozenset({
     # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни
     # GH_PIPELINE_PAT не использует.
     "checklist-tail-triage.yml",
+    # #649: носитель класса «тест зависит от настенных часов» — только
+    # github.token (read) для checkout, репо-секретов не читает вовсе, поэтому
+    # не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "clock-shift-tests.yml",
     "codeql.yml",
     # #762: дешёвый механический ребейз PR с меткой conflict, без вызова
     # агента — читает secrets.GH_PIPELINE_PAT для push рёбейзнутой ветки
