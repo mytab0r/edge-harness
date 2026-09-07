@@ -59,17 +59,19 @@ def test_declared_candidates_no_trigger_no_candidates():
     assert dd.declared_candidates("Обычный текст с номером #55 без формулировки.") == set()
 
 
-def test_declared_candidates_finds_canonical_form_field_render():
-    # Находка AI-ревью PR #387: канонический рендер GitHub обязательного поля
-    # формы `### <label>\n\n<ответ>` (task.yml/white-spot.yml, id blocked_by)
-    # не пересекался окном _TRIGGER_RE (не проходит через пустую строку между
-    # заголовком и значением) — ровно тот путь, где перенос в граф ручной.
+def test_declared_candidates_form_only_body_yields_nothing():
+    # С #529 структурное поле формы — НЕ эвристика: его переносит
+    # детерминированный auto_wire, и предупреждение на него было бы шумом о
+    # том, что тот же прогон чинит (находка AI-ревью PR #537). Канонический
+    # рендер поля без прозаической формулировки — пустой набор кандидатов.
     body = (
         "### Цель\n\nСделать штуку.\n\n"
         "### Чем блокируется\n\n#123 #124\n\n"
         "### Контекст и ссылки\n\nпросто текст без формулировки зависимости"
     )
-    assert dd.declared_candidates(body) == {123, 124}
+    assert dd.declared_candidates(body) == set()
+    # Прозаическая формулировка рядом продолжает матчиться — эвристика жива.
+    assert dd.declared_candidates("### Чем блокируется\n\n#123\n\nзависит от #124") == {124}
 
 
 def test_declared_candidates_form_field_nichem_no_candidates():
@@ -126,6 +128,18 @@ def test_find_desync_ignores_false_positive_enumeration():
 def test_find_desync_ignores_self_reference():
     issues = [
         {"number": 5, "body": "После #5 ничего не меняется.", "blocked_by_open": []},
+    ]
+    assert dd.find_desync(issues) == []
+
+
+def test_find_desync_ignores_form_field_number_auto_wire_owns_it():
+    # Находка AI-ревью PR #537: номер из структурного поля формы, которого
+    # ещё нет в графе, НЕ находка детектора — тот же прогон repo-ci ставит
+    # связь через auto_wire (шаг ниже детектора), предупреждение было бы
+    # шумом о том, что этот же прогон чинит.
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\n#55\n", "blocked_by_open": []},
+        {"number": 55, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
     ]
     assert dd.find_desync(issues) == []
 
