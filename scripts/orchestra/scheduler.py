@@ -178,6 +178,7 @@ from pulse_guard import (
     RESUME_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
     WATCHDOG_ISSUE,
+    WORKER_GIT_STEP_MARKER,
     WORKER_WORKFLOW,
     all_issue_comments,
     conveyor_gate,
@@ -570,8 +571,116 @@ def conflict_overlap_hint(repo: str, pull: dict) -> str:
     return ", ".join(sorted(pr_files & main_files))
 
 
-def conflict_rework_attempts(repo: str, pr_number: int) -> int:
-    return len(issue_marker_times(repo, pr_number, CONFLICT_REWORK_MARKER))
+def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки метки CONFLICT_LABEL (тот же приём, что
+    last_gate1_labeled_at: max(), не min() — метка могла сниматься/ставиться
+    несколькими эпизодами конфликта, нас интересует начало ТЕКУЩЕГО). Возраст
+    ИМЕННО эпизода конфликта, не возраст PR (issue #588, обход старых
+    конфликтов первыми в dispatch_conflict_rework): PR мог быть открыт неделю
+    назад и стать dirty только сегодня — created_at PR тут соврал бы про
+    голодание. None — событие не нашлось (таймлайн не отдал его / метки нет
+    вовсе).
+
+    Только для СОРТИРОВКИ очереди по возрасту — не путать с границей бюджета
+    conflict_rework_attempts (conflict_first_labeled_at ниже, min() вместо
+    max(): там нужна лифтайм-граница, не сбрасывающаяся по эпизодам)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
+    ]
+    return parse_time(max(labeled_at)) if labeled_at else None
+
+
+def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент ПЕРВОЙ простановки метки CONFLICT_LABEL за всю историю PR —
+    min(), не max() (в отличие от conflict_labeled_at выше, который нарочно
+    даёт старт ТЕКУЩЕГО эпизода — для сортировки очереди по возрасту).
+
+    Это граница лифтайм-бюджета conflict_rework_attempts (находка ревью PR
+    #597): владелец решил (issue #474, зафиксировано в дельта-спеке
+    openspec/changes/conflict-auto-rebase/specs/journal-tasks-hands/spec.md —
+    требование про бюджет попыток — и в docs/agents/LABELS.md, строка
+    `conflict`) — РОВНО одна авто-попытка ребейза на PR, счётчик
+    НЕ сбрасывается по эпизодам конфликта (тот же компромисс, что уже принят
+    для AI_REVIEW_MAX_ATTEMPTS). max() как граница обнулял бы бюджет каждый
+    раз, когда mark_conflicts снимает метку и ставит её заново на новом
+    дрейфе — min() лифтайм сохраняет. Защита от прогона-открывателя (см.
+    conflict_rework_attempts) при этом не теряется: даже первая простановка
+    метки случается уже ПОСЛЕ того, как PR создан и исходный прогон
+    завершился."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
+    ]
+    return parse_time(min(labeled_at)) if labeled_at else None
+
+
+def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int:
+    """Число ЗАСЧИТАННЫХ попыток авто-ребейза (issue #588) — не сырых
+    диспатчей. CONFLICT_REWORK_MARKER ставится СРАЗУ на dispatch (защита от
+    гонки, см. докстринг dispatch_conflict_rework) как заметка для человека,
+    читающего PR, — это момент диспатча, не факт настоящей попытки, и она
+    больше не читается обратно этой функцией: замер живых случаев
+    (#567/#542/#408) — все три упали ДО git-шага (сеть/деплой морды,
+    отсутствующий скрипт), а бюджет CONFLICT_REWORK_MAX_ATTEMPTS=1 сгорал на
+    инфраструктуре, ни разу не дойдя до git rebase.
+
+    Засчитывается только прогон, САМ отметивший, что дошёл до git-шага:
+    комментарий «WORKER_GIT_STEP_MARKER worker run N» в комментариях ЗАДАЧИ
+    (scripts/worker/task.sh, ставится непосредственно перед прогоном DSH —
+    единственный устойчивый признак «агент реально получил промпт и мог
+    попытаться», не текст ошибки, тот протухнет при первой смене
+    формулировки). Атрибуция задаче — самим носителем: комментарий живёт в
+    той задаче, которую воркер получил входом `task`, чужую он не
+    комментирует.
+
+    Читаются КОММЕНТАРИИ, а не окно recent_runs(per_page=10) (блокирующая
+    находка ревью PR #597): засчитанная попытка выпадала из топ-10 свежих
+    прогонов worker.yml уже через ~2–3 часа живой истории (~3.3 слияния/час,
+    плюс ретраи и доводки — каждый даёт свой прогон), а попытка легитимно
+    живёт до 280 минут. Потерянная засчитанная попытка возвращала бы
+    attempts=0 на каждом следующем тике: PR с несошедшейся попыткой
+    получал бы адресный диспатч бесконечно, ни разу не дойдя до эскалации, —
+    голодание #588 перестроилось бы, а не ушлило. Комментарий git-шага —
+    постоянный след (id прогона + created_at в одном комментарии), его и
+    читаем; с границей ниже сравнивается время КОММЕНТАРИЯ, а не начала
+    прогона — отметка ставится в начале DSH-шага, расхождение минутное
+    (честная цена: прогон, стартовавший ДО простановки метки, но дошедший
+    до git-шага ПОСЛЕ неё, засчитается; PR-открывающий прогон так попасть
+    не может — свою отметку он ставит раньше, чем создаёт сам PR).
+
+    since = conflict_first_labeled_at(...), не conflict_labeled_at (находка
+    ревью PR #597): граница обязана быть лифтайм-, не по-эпизодной — иначе
+    снятие+повторная простановка метки (новый эпизод дрейфа) обнуляла бы
+    засчитанные попытки в обход задокументированного решения владельца
+    (#474). Без границы вовсе исходный прогон, ОТКРЫВШИЙ этот PR задолго до
+    того, как main ушёл вперёд (тот прогон тоже дошёл до git-шага — он и есть
+    источник PR), был бы ошибочно засчитан как попытка авто-РЕБЕЙЗА: его
+    отметка всегда старше первой простановки метки (PR создаётся этим же
+    прогоном ПОЗЖЕ отметки, метка приходит снаружи и того позже). Нет
+    метки/события — 0 (не «неизвестно считаем исчерпанным»: PR остаётся
+    доступным для дальнейшей обработки, смотри также docstring
+    dispatch_conflict_rework — ниже эта же величина участвует в решении на
+    равных с worker_runs_active)."""
+    since = conflict_first_labeled_at(repo, pr_number)
+    if since is None:
+        return 0
+    git_step_run = re.compile(
+        rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
+    )
+    counted: set[str] = set()
+    for comment in all_issue_comments(repo, task_number):
+        created_at = comment.get("created_at")
+        if not created_at or parse_time(created_at) < since:
+            continue
+        match = git_step_run.search(comment.get("body") or "")
+        if match:
+            counted.add(match.group(1))  # сет: повторная отметка того же прогона — не вторая попытка
+    return len(counted)
 
 
 def dispatch_conflict_rework(
@@ -593,9 +702,11 @@ def dispatch_conflict_rework(
     существует: GitHub REST отдаёт только mergeable_state, не конфликтующие
     ханки. Поэтому решение простое (владелец, issue #474): РОВНО одна
     авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1, лифтайм-
-    счётчик — маркер в комментариях PR, тот же приём, что
-    ai_review_retry_count, — НЕ сбрасывается по эпизодам конфликта, тот же
-    компромисс, что уже принят для AI_REVIEW_MAX_ATTEMPTS). Сошлось —
+    счётчик — conflict_rework_attempts выше, граница conflict_first_labeled_at,
+    — НЕ сбрасывается по эпизодам конфликта, тот же компромисс, что уже
+    принят для AI_REVIEW_MAX_ATTEMPTS; CONFLICT_REWORK_MARKER в комментарии
+    PR ниже — только заметка для человека на момент диспатча, счётчик её не
+    перечитывает). Сошлось —
     mark_conflicts снимет метку сама следующим проходом (это и есть признак
     «был дрейф», ПОСТфактум); не сошлось — эскалация владельцу (escalate,
     тот же канал, что предохранитель конвейера #120) с файлами-кандидатами
@@ -608,12 +719,40 @@ def dispatch_conflict_rework(
     dispatch_worker в этом же проходе: «ровно один workflow_dispatch воркера
     за пульс» не должно превратиться в два только из-за гонки — GitHub не
     гарантирует, что только что созданный прогон немедленно виден как
-    queued в следующем же запросе статуса."""
+    queued в следующем же запросе статуса.
+
+    Порядок обхода — от старейшего конфликта к новейшему (issue #588): сырой
+    порядок `pulls` (open_pulls(), `GET /pulls?state=open`) отдаёт НОВЫЕ PR
+    первыми, а один workflow_dispatch за проход (см. выше) раньше всегда
+    доставался самому свежему конфликту — замер живого репозитория: 10 из 14
+    конфликтных PR не получили ни одной попытки, возраст конфликта до 84
+    часов. conflict_labeled_at (момент простановки CONFLICT_LABEL), не
+    created_at PR: PR мог быть открыт неделю назад и стать dirty только
+    сегодня — возраст самого PR тут соврал бы про голодание, honest сигнал —
+    возраст ИМЕННО эпизода конфликта."""
     observations: list[str] = []
     actions: list[str] = []
     dispatched = False
     pool_by_number = {issue["number"]: issue for issue in pool}
-    for pull in pulls:
+    conflict_pulls = [
+        p for p in pulls
+        if CONFLICT_LABEL in {label["name"] for label in p["labels"]}
+    ]
+    # task_ref.resolve_pr_task — вычисление ЛОКАЛЬНОЕ (regex по имени ветки
+    # agent/N-slug), не HTTP-вызов: PR без объявленной задачи не может
+    # участвовать в дальнейшем цикле (ветка ниже сразу делает `continue`)
+    # — дешёвая фильтрация раньше дорогой (conflict_labeled_at — вызов
+    # timeline), а не только экономии ради: без неё PR, для которого нет
+    # смысла звать API вовсе, всё равно платил бы за сортировку.
+    schedulable, unscheduled = [], []
+    for p in conflict_pulls:
+        (schedulable if task_ref.resolve_pr_task(p) is not None else unscheduled).append(p)
+    schedulable.sort(
+        key=lambda p: conflict_labeled_at(repo, p["number"]) or parse_time(p["created_at"])
+    )
+    conflict_numbers = {p["number"] for p in conflict_pulls}
+    ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in conflict_numbers]
+    for pull in ordered_pulls:
         labels = {label["name"] for label in pull["labels"]}
         if CONFLICT_LABEL not in labels:
             continue
@@ -625,7 +764,7 @@ def dispatch_conflict_rework(
                 "(agent/N-slug) — авто-расшивка недоступна, нужен человек"
             )
             continue
-        attempts = conflict_rework_attempts(repo, number)
+        attempts = conflict_rework_attempts(repo, number, task_number)
         if attempts >= CONFLICT_REWORK_MAX_ATTEMPTS:
             # Гонка (найдена живым прогоном #474, PR #408: маркер попытки
             # ставится СРАЗУ на dispatch, а сам worker.yml идёт до 280 мин) —
@@ -673,13 +812,15 @@ def dispatch_conflict_rework(
             overlap_text = overlap or "не удалось определить (см. PR вручную)"
             # Находка ревью PR #478 ("алерт не гадает", AGENTS.md, тот же
             # класс, что инвариант 3/#472): единственный ПОДТВЕРЖДЁННЫЙ факт
-            # здесь — mergeable_state=dirty после одной попытки. Причину
-            # отсюда не различить: инфраструктурный сбой воркера (#476, живой
-            # прогон 34027035455 упал именно так — маркер попытки уже стоял
-            # бы, бюджет считался бы сгоревшим), квота, таймаут 280 минут,
-            # неудавшийся push дают тот же итог, что настоящий содержательный
-            # конфликт. Текст называет ФАКТ (conclusion последнего прогона,
-            # атрибутированного этой задаче), не утверждает причину.
+            # здесь — mergeable_state=dirty после одной ЗАСЧИТАННОЙ попытки
+            # (conflict_rework_attempts, #588: сбой ДО git-шага сюда уже не
+            # доходит — он не увеличивает attempts, PR получает новый
+            # адресный dispatch вместо эскалации). Причину отсюда всё ещё не
+            # различить: квота провайдера, таймаут 280 минут или неудавшийся
+            # push ПОСЛЕ того, как агент начал работу, дают тот же итог, что
+            # настоящий содержательный конфликт. Текст называет ФАКТ
+            # (conclusion последнего прогона, атрибутированного этой задаче),
+            # не утверждает причину.
             run_conclusion = last_worker_run_conclusion(repo, task_number)
             run_note = (
                 f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
