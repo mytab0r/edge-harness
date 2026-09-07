@@ -338,12 +338,16 @@ jobs:
           AI_WORK="$RUNNER_TEMP/ai-review"
           mkdir -p "$AI_WORK"
           python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
-          # Пустой дифф (#658): cmd_gather сам пишет failure_reason.txt=
-          # empty_diff и возвращает 0 (не падает) — этот шаг остаётся
-          # зелёным, а DSH-шаг ниже пропускается по этому же маркеру: дорогой
-          # вызов модели не имеет смысла звать на диффе, который никогда не
-          # станет непустым от повторного прогона.
-          if [ "$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')" = "empty_diff" ]; then
+          # Пустой дифф (#658) ИЛИ расхождение источников диффа (#687,
+          # diff_source_mismatch — список файлов пуст, а `gh pr diff` не
+          # пуст): cmd_gather сам пишет failure_reason.txt (rc=0, шаг
+          # остаётся зелёным), DSH-шаг ниже пропускается по ЛЮБОМУ значению
+          # этого файла — в обоих случаях дорогой вызов модели не имеет
+          # смысла (либо сливать нечего, либо данные для промпта уже
+          # недостоверны — список FILES пуст при непустом DIFF). На этом шаге
+          # (ДО запуска ai_dsh.sh, который сам перезатирает файл при старте)
+          # непустое содержимое может появиться только из cmd_gather.
+          if [ -n "$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')" ]; then
             echo "empty_diff=true" >> "$GITHUB_OUTPUT"
           else
             echo "empty_diff=false" >> "$GITHUB_OUTPUT"
