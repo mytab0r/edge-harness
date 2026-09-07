@@ -148,6 +148,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_do_rows_read.py -q
 
+      # Гвардия класса «неограниченный агрегат на горячем пути DO» (#320/#321/
+      # #575): #status() зовётся на каждый heartbeat/батч событий/сообщение
+      # инбокса/callback — GROUP BY по всей таблице там обязан идти только
+      # через кэш-геттер (#taskCounts/#msgCounts). Статический разбор
+      # cf-worker/src/harness.ts, не vitest — ловит регрессию до того, как она
+      # снова начнёт жечь rows_read на проде.
+      - name: "DO: агрегат на горячем пути только за кэшем (#320/#321/#575)"
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_do_hotpath_aggregate_guard.py -q
+
       # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
       # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
       - name: Тесты предохранителя конвейера orchestra

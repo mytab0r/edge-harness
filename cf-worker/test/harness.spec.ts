@@ -588,6 +588,118 @@ describe("ретеншн DO SQLite (#306/#305)", () => {
     expect(status.retention).not.toBeNull();
     expect(status.retention!.backlog).toBe(true);
   });
+
+  // #575: messages была единственной таблицей БЕЗ ретеншена вовсе (рядом с
+  // events/tasks выше) — росла вечно, полный скан #status() дорожал с каждым
+  // днём. ГЛАВНОЕ ОГРАНИЧЕНИЕ (#20/#173): непрочитанное/необработанное
+  // сообщение владельца ('new'/'processing') не трогается ни при каком
+  // возрасте — фильтр по статусу в RETENTION_TABLES[…].sql структурно не
+  // видит эти статусы, независимо от processed_ts/ts.
+  //
+  // 'processing' (не 'new') — намеренный выбор для этого теста: настоящий
+  // alarm() запускает не только ретеншн, но и водитель инбокса
+  // (#processInbox), который сам разбирает ВСЕ 'new' сообщения на каждом
+  // тике (это штатное поведение, не потеря данных) — тест на 'new' был бы
+  // ложноположительным на обычную работу драйвера, а не на регресс ретеншена.
+  // processing_ts — СВЕЖИЙ (не завис): ватчдог (#reclaimStuckMessages) тоже
+  // не должен трогать эту строку, изолируем именно ретеншн.
+  it("сообщение done старше RETENTION.messagesMaxAgeMs уходит; processing того же возраста — нет (#20/#173)", async () => {
+    const doneMsg = await (
+      await postJson("/api/messages", { text: "старое обработанное", source_msg_id: uniqueTaskId("ret-msg-done") })
+    ).json<{ message_id: number }>();
+    const processingMsg = await (
+      await postJson("/api/messages", { text: "старое в обработке", source_msg_id: uniqueTaskId("ret-msg-processing") })
+    ).json<{ message_id: number }>();
+    // #586, находка ревью: пара строк выше (processing/processed_ts=NULL) не
+    // проверяет нагрузку фильтра по status на самом деле — сравнение
+    // `processed_ts < ?` само отсеивает NULL, снятие фильтра тот случай не
+    // красит. Реальная нагрузка — непустой (протухший) processed_ts на
+    // НЕтерминальном статусе: ровно то, что оставляет за собой bulk
+    // retry_failed (`harness.ts:1877`), если не чистить processed_ts в самом
+    // UPDATE (см. отдельный тест ниже, что теперь чистит). Статус здесь —
+    // 'processing' (не 'new'), тем же приёмом, что и выше в этом тесте: 'new'
+    // забрал бы водитель инбокса в этом же alarm-тике (после ретеншена, но до
+    // конца alarm()) и сменил бы статус независимо от результата ретеншена —
+    // тест на 'new' был бы не про регресс ретеншена, а про обычную работу
+    // драйвера. processing_ts — СВЕЖИЙ, чтобы и ватчдог не тронул строку:
+    // изолируем именно чистку.
+    const staleProcessedMsg = await (
+      await postJson("/api/messages", { text: "в обработке с протухшим processed_ts", source_msg_id: uniqueTaskId("ret-msg-stale-processed") })
+    ).json<{ message_id: number }>();
+    const stub = HARNESS_ID();
+    const oldTs = Date.now() - (RETENTION.messagesMaxAgeMs + 60_000);
+    await runInDurableObject(stub, async (_instance, state) => {
+      // done со старым processed_ts — кандидат на чистку.
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'done', processed_ts = ? WHERE id = ?", oldTs, doneMsg.message_id,
+      );
+      // processing того же возраста ПО ts, но статус не терминальный — чистка
+      // не смотрит на этот возраст вовсе (processed_ts у processing — NULL).
+      state.storage.sql.exec(
+        "UPDATE messages SET ts = ?, status = 'processing', processing_ts = ? WHERE id = ?",
+        oldTs, Date.now(), processingMsg.message_id,
+      );
+      // processing с протухшим processed_ts — непрочитанное/необработанное
+      // сообщение владельца (#20/#173), не должно уйти НИ ПРИ КАКОМ возрасте,
+      // а `processed_ts < ?` само по себе его бы поймало без фильтра по status.
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', processing_ts = ?, processed_ts = ? WHERE id = ?",
+        Date.now(), oldTs, staleProcessedMsg.message_id,
+      );
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const doneRes = await WORKER.fetch(`https://example.com/api/messages/${doneMsg.message_id}`, { headers: AUTH });
+    expect(doneRes.status).toBe(404);
+    const processingRes = await getJson<{ message: { id: number; status: string } }>(
+      `/api/messages/${processingMsg.message_id}`,
+    );
+    expect(processingRes.message.status).toBe("processing");
+    const staleProcessedRes = await getJson<{ message: { id: number; status: string } }>(
+      `/api/messages/${staleProcessedMsg.message_id}`,
+    );
+    expect(staleProcessedRes.message.status).toBe("processing");
+  });
+
+  // #586: retry_failed теперь чистит и processed_ts (harness.ts:1877), не
+  // только status/attempts/processing_ts — иначе строка возвращалась в 'new'
+  // со старым processed_ts, и «processed_ts ≠ NULL ⇒ терминальный» держалось
+  // бы только фильтром по status в ретеншене, без структурной опоры в коде.
+  it("bulk retry_failed чистит processed_ts вместе со status/attempts/processing_ts (#586)", async () => {
+    const s = uniqueTaskId("retry-clean");
+    const created = await (
+      await postJson("/api/messages", {
+        source: "test-process",
+        source_msg_id: s,
+        sender_id: s,
+        text: "/task Доведись до конца",
+      })
+    ).json<{ message_id: number }>();
+
+    // Доводим до failed тремя прогонами — тем самым #finishMessage ставит
+    // processed_ts (терминальный переход, harness.ts:1751-1754).
+    for (let i = 0; i < 3; i++) await postJson("/api/messages/process", { limit: 100 });
+    const failed = await getJson<{ message: { status: string; processed_ts: number | null } }>(
+      `/api/messages/${created.message_id}`,
+    );
+    expect(failed.message.status).toBe("failed");
+    expect(failed.message.processed_ts).not.toBeNull();
+
+    // Газ: bulk retry_failed обязан обнулить processed_ts вместе с
+    // status/attempts/processing_ts — иначе строка вернулась бы в 'new' со
+    // старым (протухшим) processed_ts, ровно тот случай, который фильтр по
+    // status в ретеншене (14.10) прикрывает как последний рубеж, а не как
+    // единственную защиту.
+    await postJson("/api/messages/process", { limit: 1, retry_failed: true });
+    const retried = await getJson<{ message: { status: string; processed_ts: number | null } }>(
+      `/api/messages/${created.message_id}`,
+    );
+    expect(retried.message.status).toBe("new");
+    expect(retried.message.processed_ts).toBeNull();
+  });
 });
 
 // Гвардия issue #269: пульс оркестрации не должен молчать шестнадцать часов
@@ -742,6 +854,29 @@ describe("watchdog-запрос использует индекс tasks(status, 
   });
 });
 
+// #575 (инвентаризация всех SQL в harness.ts на предмет полного скана):
+// #recentTasks (GET /api/tasks) сортирует ORDER BY created_ts DESC LIMIT без
+// WHERE — без индекса, ведущего created_ts, план обязан SCAN TABLE + сортировку
+// в памяти на ВСЮ историю tasks. Докажи мутацией: убери строку
+// `CREATE INDEX tasks_by_created` из SCHEMA — тест покраснеет (план перейдёт
+// на SCAN TABLE tasks с USE TEMP B-TREE FOR ORDER BY).
+describe("список задач использует индекс tasks(created_ts DESC) (#575)", () => {
+  it("EXPLAIN QUERY PLAN ссылается на tasks_by_created", async () => {
+    const id = env.HARNESS.idFromName("owner");
+    const stub = env.HARNESS.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const plan = state.storage.sql
+        .exec(
+          "EXPLAIN QUERY PLAN SELECT id, created_ts, dispatch_ts, latency_ms, status FROM tasks ORDER BY created_ts DESC LIMIT ?",
+          LIMITS.tasksListMax,
+        )
+        .toArray() as Record<string, SqlStorageValue>[];
+      const detail = plan.map((row) => String(row.detail)).join(" | ");
+      expect(detail).toContain("tasks_by_created");
+    });
+  });
+});
+
 describe("кэш счётчиков задач по статусу (#320)", () => {
   // Регрессия на возврат полного GROUP BY в горячий путь: если инвалидация
   // кэша при записи в tasks пропадёт, счётчики застынут на значении первого
@@ -790,6 +925,60 @@ describe("кэш счётчиков задач по статусу (#320)", () =
     // #pruneRetention кэш остался бы на значении afterDone (лишняя done-запись
     // на бейдже до следующего перехода) — ровно та ложь, что нашёл ревьюер.
     expect(after.tasks.done).toBe(afterDone.tasks.done - 1);
+  });
+});
+
+// Тот же класс, что #320/#321 закрыли для tasks, теперь и для messages
+// (#575): #status() раньше делал полный GROUP BY по ВСЕЙ таблице messages на
+// каждый вызов — эта регрессия ловит именно возврат такого поведения, не
+// просто «счётчик корректен один раз». Докажи мутацией: убери
+// `this.#msgCountsCache = null;` внутри #finishMessage (src/harness.ts) —
+// тест ниже покраснеет: #status() продолжит отдавать messages.failed из
+// первого вызова, не заметив реальный переход processing → failed.
+describe("кэш счётчиков сообщений по статусу (#575)", () => {
+  it("watchdog processing→failed (капа попыток) отражается в /api/status.messages без задержки", async () => {
+    const sourceMsgId = `msgcounts-failed-${Date.now()}`;
+    const created = await (
+      await postJson("/api/messages", { text: "будет искусственно зависшим", source_msg_id: sourceMsgId })
+    ).json<{ message_id: number }>();
+
+    // #status() здесь — не просто чтение: он прогревает #msgCountsCache
+    // значением, где это сообщение ещё 'new' (то самое состояние, которое
+    // без инвалидации застыло бы навсегда).
+    const before = await getJson<{ messages: Record<string, number> }>("/api/status");
+
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+    // Раздельно от нормального пути (#processSingleMessage): напрямую в SQL
+    // переводим сообщение в processing с исчерпанным капом попыток — ватчдог
+    // (#reclaimStuckMessages) обязан честно завершить его как failed
+    // (stuck_reclaimed), а не вернуть в new (по образцу теста watchdog'а
+    // dispatched-задач выше в файле).
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET status = 'processing', attempts = ?, processing_ts = ? WHERE id = ?",
+        LIMITS.messageMaxAttempts,
+        Date.now() - LIMITS.messageStuckProcessingMs - 1,
+        created.message_id,
+      );
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    const after = await getJson<{ messages: Record<string, number> }>("/api/status");
+    // #586, находка ревью: строгое равенство по общему количеству строк
+    // хранилища нарушало собственное правило шапки файла («никогда по общему
+    // количеству строк») — чужая `new`-строка, исчерпавшая кап попыток в том
+    // же alarm-тике, законно добавила бы ещё один `failed` и уронила бы тест
+    // редко, но по делу. `>=` сохраняет мутационную силу (без инвалидации
+    // кэша прироста не будет вовсе — assertion эту красит), но не привязан к
+    // общему счёту строк.
+    expect(after.messages.failed).toBeGreaterThanOrEqual((before.messages.failed || 0) + 1);
+    // И собственная строка — по id, не по счётчику: ватчдог обязан был
+    // завершить именно её как failed (stuck_reclaimed).
+    const own = await getJson<{ message: { status: string } }>(`/api/messages/${created.message_id}`);
+    expect(own.message.status).toBe("failed");
   });
 });
 
