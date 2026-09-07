@@ -59,7 +59,13 @@ async function withEnv(env, fn) {
 
 function mockFetch(responses) {
   let callIndex = 0
-  return async (url, options) => {
+  // Находка ревью PR #411 (чеклист): мок раньше игнорировал (url, options) —
+  // регрессия вроде `labels: []`, смены пути диспетча или потери inputs.task
+  // оставалась зелёной. Теперь вызовы записываются: fetchMock.calls[i] —
+  // { url, options } i-го вызова, тесты assert'ят форму запроса.
+  const calls = []
+  const fetchMock = async (url, options) => {
+    calls.push({ url, options })
     const response = responses[callIndex] || responses[responses.length - 1]
     callIndex++
     return {
@@ -70,6 +76,8 @@ function mockFetch(responses) {
       text: async () => JSON.stringify(response.body),
     }
   }
+  fetchMock.calls = calls
+  return fetchMock
 }
 
 function createMockExec(signal = AbortSignal.timeout(1000)) {
@@ -171,11 +179,15 @@ test('callSignal: возвращает таймаут-сигнал без exec',
 })
 
 test('callSignal: объединяет exec.signal и таймаут', () => {
-  const execSignal = AbortSignal.timeout(5000)
-  const exec = { signal: execSignal }
-  const signal = callSignal(exec)
+  // Замечание ревью PR #411: раньше тест проверял только instanceof —
+  // теперь доказано, что отмена хода агента (exec.signal) отменяет
+  // объединённый сигнал, то есть fetch под ним реально срывается.
+  const exec = new AbortController()
+  const signal = callSignal({ signal: exec.signal })
   assert.ok(signal instanceof AbortSignal)
-  // AbortSignal.any создаёт новый сигнал, который отменяется, когда отменяется любой из входных
+  assert.equal(signal.aborted, false)
+  exec.abort()
+  assert.equal(signal.aborted, true)
 })
 
 // ── Тесты describeFailure ────────────────────────────────────────────────────────
@@ -210,6 +222,22 @@ test('describeFailure: возвращает только статус при JSO
   }
   const result = await describeFailure(response)
   assert.equal(result, 'HTTP 500')
+})
+
+test('describeFailure: 403 без сообщения — спецветка egress-блока (issue #133)', async () => {
+  // Находка ревью PR #411 (чеклист): это единственная нетривиальная ветка
+  // describeFailure — спецветка перехватывает ЛЮБОЙ 403 без сообщения
+  // (голый HTML egress-блока воркера морды, не ответ GitHub API) — и она не
+  // имела покрытия. Комментарий теста «возвращает только статус при JSON
+  // без message» выше ссылается именно на этот тест.
+  const response = {
+    status: 403,
+    json: async () => ({ other: 'field' }),
+  }
+  const result = await describeFailure(response)
+  assert.ok(result.includes('HTTP 403'))
+  assert.ok(result.includes('egress-IP'))
+  assert.ok(result.includes('#133'))
 })
 
 // ── Тесты configError ────────────────────────────────────────────────────────────
@@ -268,13 +296,20 @@ test('networkReason: обрабатывает не-Error', () => {
 // ── Тесты runner_task ────────────────────────────────────────────────────────────
 
 test('runner_task: возвращает ошибку конфигурации без токена', async () => {
-  const tool = defineRunnerTaskTool()
-  const result = await tool.execute(
-    { title: 'Test', body: 'Test body' },
-    createMockExec()
-  )
-  assert.equal(result.ok, false)
-  assert.ok(result.message.includes('GH_RUNNER_TOKEN'))
+  // Находка ревью PR #411 (чеклист): тест шёл без withEnv — на машине с
+  // выставленными GH_RUNNER_TOKEN/GH_RUNNER_REPO ушёл бы в реальный
+  // POST /repos/…/issues и создал настоящую задачу в живом пуле. withEnv
+  // подменяет ВЕСЬ env (неопределённые ключи пропускаются) — снаружи
+  // окружение теста не видно.
+  await withEnv({ GH_RUNNER_TOKEN: undefined, GH_RUNNER_REPO: undefined }, async () => {
+    const tool = defineRunnerTaskTool()
+    const result = await tool.execute(
+      { title: 'Test', body: 'Test body' },
+      createMockExec()
+    )
+    assert.equal(result.ok, false)
+    assert.ok(result.message.includes('GH_RUNNER_TOKEN'))
+  })
 })
 
 test('runner_task: возвращает ошибку конфигурации без repo', async () => {
@@ -311,6 +346,23 @@ test('runner_task: создаёт issue и диспетчит воркер (ус
         assert.equal(result.issue, 95)
         assert.ok(result.message.includes('#95'))
         assert.ok(result.message.includes('Раннер запущен'))
+        // Находка ревью PR #411 (чеклист): тест проверял только ответы.
+        // Форма ЗАПРОСОВ — прод-контракт: issue обязан создаваться с меткой
+        // `task` (без неё задача не попадёт в пул), диспетч — в worker.yml
+        // с inputs.task; регрессия в любом из них раньше осталась бы зелёной.
+        assert.equal(fetchMock.calls.length, 2)
+        const [issueCall, dispatchCall] = fetchMock.calls
+        assert.equal(issueCall.url, 'https://api.github.com/repos/mytab0r/edge-harness/issues')
+        assert.equal(issueCall.options.method, 'POST')
+        assert.equal(issueCall.options.headers.Authorization, 'Bearer ghp_test')
+        assert.deepEqual(JSON.parse(issueCall.options.body), {
+          title: 'Test task',
+          body: 'Full task description with criteria',
+          labels: ['task'],
+        })
+        assert.equal(dispatchCall.url, 'https://api.github.com/repos/mytab0r/edge-harness/actions/workflows/worker.yml/dispatches')
+        assert.equal(dispatchCall.options.method, 'POST')
+        assert.deepEqual(JSON.parse(dispatchCall.options.body), { ref: 'main', inputs: { task: '95' } })
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -436,10 +488,13 @@ test('runner_task: сетевая ошибка при создании issue', a
 // ── Тесты runner_status ──────────────────────────────────────────────────────────
 
 test('runner_status: возвращает ошибку конфигурации без токена', async () => {
-  const tool = defineRunnerStatusTool()
-  const result = await tool.execute({ issue: 95 }, createMockExec())
-  assert.equal(result.ok, false)
-  assert.ok(result.message.includes('GH_RUNNER_TOKEN'))
+  // Изоляция от окружения — как в тесте runner_task выше (чеклист ревью #411).
+  await withEnv({ GH_RUNNER_TOKEN: undefined, GH_RUNNER_REPO: undefined }, async () => {
+    const tool = defineRunnerStatusTool()
+    const result = await tool.execute({ issue: 95 }, createMockExec())
+    assert.equal(result.ok, false)
+    assert.ok(result.message.includes('GH_RUNNER_TOKEN'))
+  })
 })
 
 test('runner_status: возвращает ошибку конфигурации без repo', async () => {
@@ -884,5 +939,3 @@ test('runner_status: описание указывает когда вызыва
   assert.ok(desc.includes('прогрессе задачи'))
   assert.ok(desc.includes('runner_task'))
 })
-
-console.log('Все тесты runner-bridge пройдены')

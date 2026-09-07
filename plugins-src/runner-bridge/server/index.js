@@ -20,27 +20,18 @@
  * Чистая логика (fetch/error-handling/execute обоих инструментов) живёт в
  * ./core.js и покрыта поведенческими тестами без зависимости на
  * `@deepseek-ai/dsh-tools` (находка ревью PR #411 — по образцу integrations,
- * #115); здесь — только проводка defineTool.
+ * #115); здесь — только проводка defineTool. Ре-экспортов функций из core.js
+ * здесь намеренно нет (чеклист ревью PR #411): тест импортирует core.js
+ * напрямую, а строка ре-экспорта тянула бы peer-зависимость в каждого, кто
+ * импортирует readRepo и компанию из index.js (например тест) — ровно то,
+ * от чего расщепление избавило.
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import {
-  callSignal,
-  collectPullRequests,
-  configError,
-  describeFailure,
-  githubFetch,
-  networkError,
-  networkReason,
-  readRepo,
-  readToken,
-  runnerStatusToolConfig,
-  runnerTaskToolConfig,
-} from './core.js'
+import { runnerStatusToolConfig, runnerTaskToolConfig } from './core.js'
 
 const PLUGIN_VERSION = '0.1.2'
 
-export { readRepo, readToken, githubFetch, callSignal, describeFailure, configError, networkError, networkReason, collectPullRequests };
 export const defineRunnerTaskTool = () => defineTool(runnerTaskToolConfig())
 export const defineRunnerStatusTool = () => defineTool(runnerStatusToolConfig())
 
