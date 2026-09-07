@@ -367,6 +367,17 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
 
+      # Эскалация автооткота deploy-worker.yml (#614): красная канарейка UI на
+      # проде после успешного деплоя раньше красила прогон молча — ни отката,
+      # ни следа в Telegram/#120. Текст трёх исходов (откат не подтверждён /
+      # откат прошёл, но повторная канарейка красная — худший случай / откат
+      # прошёл и повторная канарейка зелёная) и проводка escalate_rollback на
+      # моке pulse_guard.gh — тем же приёмом, что test_branch_protection_watch.py.
+      - name: Тесты эскалации автооткота deploy-worker (#614)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_deploy_worker_rollback_alert.py -q
+
       # Гвардия «PR не заводится на эпик» (#376): task-branch отказывает на
       # номере эпика ДО git switch -c — признак эпика (is_epic_issue,
       # scripts/orchestra/scheduler.py) не дублируется вторым определением,

@@ -47,6 +47,15 @@ jobs:
   deploy:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.measure_rows_read_days == ''
     runs-on: ubuntu-latest
+    # issues: write — эскалация автооткота (#614, scripts/orchestra/
+    # deploy_worker_rollback_alert.py::escalate_rollback) пишет след в задачу
+    # #120 тем же токеном; contents: read обязателен рядом (находка ревью
+    # PR #486, тот же приём, что owner-decision.yml/branch-protection-watch.yml) —
+    # явный блок permissions обнуляет ВСЕ остальные скоупы токена, а
+    # actions/checkout@v7 ниже клонирует репозиторий этим же github.token.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v7
 
@@ -55,6 +64,10 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: cf-worker/package-lock.json
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       - run: npm ci
         working-directory: cf-worker
@@ -162,6 +175,7 @@ jobs:
           echo "GH_DISPATCH_TOKEN: fine-grained (X-OAuth-Scopes отсутствует), репозиторий читается — гвардия пройдена"
 
       - name: Деплой
+        id: deploy
         run: npx wrangler deploy
         working-directory: cf-worker
         env:
@@ -222,3 +236,79 @@ jobs:
         working-directory: cf-worker
         env:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+
+      # Тормоз без газа не принимается (задача #614, тот же класс, что issue
+      # #549 закрыл в deploy-dsh-edge.yml, — приём взят оттуда буквально):
+      # красная канарейка/шаг после деплоя оставляла прод на сломанной версии
+      # до ручного вмешательства, без единого следа в Telegram/#120. Условие —
+      # ровно то же, что у соседа: деплой обязан был пройти (steps.deploy.
+      # outcome == 'success', не откатываем то, чего не разворачивали, если
+      # упал сам `wrangler deploy`), а job красный (failure()) — неважно, упала
+      # ли именно канарейка или шаг синка секретов после неё (тот же охват,
+      # что у образца).
+      #
+      # `wrangler rollback` без явного version-id сам находит нужную версию
+      # (packages/wrangler/src/versions/rollback/index.ts::
+      # fetchDefaultRollbackVersionId апстрима cloudflare/workers-sdk):
+      # сортирует деплои по created_on, убирает текущий (только что раскатанный
+      # сломанный) и берёт первый с percentage:100. Наш путь деплоя всегда
+      # 100% (без gradual-сплита), так что «прошлая 100%-версия» = «прошлый
+      # деплой». `--message` заполняет confirm()/prompt() дефолтом без
+      # интерактива на не-TTY раннере — тот же паттерн, каким этот файл уже
+      # гоняет `wrangler deploy`/`wrangler secret put` без зависаний.
+      #
+      # Первый деплой воркера вообще (нет ни одной прежней 100%-версии) —
+      # апстрим бросает «Could not find stable Worker Version»; continue-on-error
+      # не даёт этому отказу потеряться поверх уже красной канарейки (исходный
+      # сигнал остаётся видимым, а не маскируется вторичным), а следующий шаг
+      # эскалации честно назовёт «автооткат не подтверждён».
+      - name: Автооткат прода при красной канарейке
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          npx wrangler rollback --yes \
+            --message "auto-rollback: канарейка красная, run ${{ github.run_id }}" \
+            2>&1 | tee rollback.log
+          grep -qi "has been deployed to 100% of traffic" rollback.log \
+            || { echo "::error::Автооткат не подтвердил успех — см. лог шага, прод может остаться на сломанной версии"; exit 1; }
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "🔙 Прод автоматически откачен на предыдущую 100%-версию"
+
+      # Газ обязан быть доказан, не заявлен (тот же приём, что deploy-dsh-edge.yml):
+      # после отката корень морды снова обязан отвечать полным циклом входа —
+      # той же канарейкой Playwright, что и выше (браузер уже установлен
+      # предыдущим шагом в этом же job'е, переустанавливать не нужно). Красная
+      # повторная канарейка — худший случай (задача #614, п.1) и обязана
+      # остаться громкой: continue-on-error здесь НЕТ нарочно.
+      - name: Канарейка после автооткота
+        id: post_rollback_canary
+        if: failure() && steps.deploy.outcome == 'success'
+        run: node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+        working-directory: cf-worker
+        env:
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+
+      # Эскалация (задача #614, п.2): тот же канал, что предохранитель
+      # конвейера — задача-статус #120 + Telegram (scripts/orchestra/
+      # pulse_guard.py::escalate, вызван через deploy_worker_rollback_alert.py).
+      # Второй канал для того же класса «поломка прода после деплоя» не
+      # заводим. continue-on-error: true — сама эскалация best-effort
+      # (см. pulse_guard.escalate) и не имеет права затенить собой исходный
+      # сигнал о красной канарейке/автооткате.
+      - name: Эскалация автооткота (#120/Telegram)
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ROLLBACK_CONFIRMED: ${{ steps.auto_rollback.outputs.rolled_back == 'true' }}
+          POST_ROLLBACK_OK: ${{ steps.post_rollback_canary.outcome == 'success' }}
+        run: python scripts/orchestra/deploy_worker_rollback_alert.py
