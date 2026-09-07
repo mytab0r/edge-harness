@@ -186,6 +186,7 @@ from pulse_guard import (
     failure_watch,
     gh,
     heartbeat_check,
+    independent_pulse_check,
     issue_marker_times,
     merge_telegram_text,
     minutes_between,
@@ -3554,6 +3555,14 @@ def main() -> int:
     # кричим о пропавших пульсах — остальная работа может не иметь смысла,
     # если конвейер стоял.
     lines += heartbeat_check(repo, now)
+
+    # Сторож независимого DO-пульса (#689): heartbeat_check выше видит «жив»,
+    # если сработал ЛЮБОЙ канал workflow_dispatch, а событийный (wake_orchestra.sh)
+    # и независимый (cf-worker alarm(), GH_DISPATCH_TOKEN) дают один и тот же
+    # event — маскировка возможна ВНУТРИ heartbeat_check, не только между
+    # schedule/workflow_dispatch. Рядом с heartbeat_check — тот же «до всей
+    # остальной работы» довод.
+    lines += independent_pulse_check(repo, now)
 
     # Гвардия непрочитанных провалов ключевых workflow (#477): рядом с
     # heartbeat_check — тот же «до всей остальной работы» довод, дешёвый

@@ -27,14 +27,18 @@ def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
 
-def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch", updated_at=None):
+def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch", updated_at=None, actor=None):
     """Прод-форма элемента workflow_runs (поля, которые читает модуль).
     event по умолчанию — workflow_dispatch (реальный тик), чтобы существующие
     тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать.
     updated_at по умолчанию = created_at: у короткого прогона моменты очереди
     и завершения совпадают; долгий прогон задаётся явно (см. регресс-тест
-    окна свежести на находку ревью PR #488, раунд 3)."""
-    return {
+    окна свежести на находку ревью PR #488, раунд 3). actor — login
+    triggering_actor (прод-форма Actions API, снято живым `gh api
+    .../orchestra.yml/runs` 2026-09-07, issue #689); по умолчанию None —
+    существующие тесты, которым различие каналов безразлично, не несут
+    лишнего поля."""
+    payload = {
         "id": run_id,
         "conclusion": conclusion,
         "created_at": created_at,
@@ -43,6 +47,9 @@ def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker r
         "display_title": title,
         "event": event,
     }
+    if actor is not None:
+        payload["triggering_actor"] = {"login": actor}
+    return payload
 
 
 # ── Серия красных: подсчёт подряд ────────────────────────────────────────────────
@@ -740,6 +747,186 @@ def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkey
 
     pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
     assert posted == []
+
+
+# ── Независимый DO-пульс (#689): различитель triggering_actor.login ──────────────
+#
+# Фикстуры ниже — реальные workflow_runs `orchestra.yml` с event=workflow_dispatch
+# (снято живым `gh api repos/mytab0r/edge-harness/actions/workflows/orchestra.yml/
+# runs?event=workflow_dispatch&per_page=100` 2026-09-07, issue #689): событийный
+# будильник (scripts/gh/wake_orchestra.sh, GH_TOKEN=github.token) даёт
+# triggering_actor.login=github-actions[bot]; независимый DO-пульс (cf-worker
+# alarm()::attemptOrchestraDispatch, GH_DISPATCH_TOKEN) — login владельца
+# токена. В это утро независимый канал не тикал с 04:51:45 до как минимум
+# 08:53:29 (событийный канал при этом тикал каждые 5-15 минут) — реальный,
+# не выдуманный эпизод direction (b) из issue #689.
+
+EVENT_RUNS_MORNING = [
+    run("success", "2026-09-07T08:53:29Z", 101, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:44:42Z", 102, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:26:16Z", 103, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:16:15Z", 104, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T04:26:32Z", 105, event="workflow_dispatch", actor="github-actions[bot]"),
+]
+INDEPENDENT_RUN_MORNING = run(
+    "success", "2026-09-07T04:51:45Z", 90, event="workflow_dispatch", actor="mytab0r")
+
+
+def test_decide_independent_pulse_not_applicable_when_event_channel_itself_silent():
+    # Событийный канал сам не тикал недавно — нечего сравнивать (честная
+    # граница ложного срабатывания из issue #689: «оркестратор вообще не
+    # запускался, некому и мерить»).
+    old_event = run("success", "2026-09-06T10:00:00Z", 1, actor="github-actions[bot]")
+    state, anchor, exact = pg.decide_independent_pulse([old_event], utc(2026, 9, 7, 9, 0))
+    assert state == "not_applicable" and anchor is None
+
+
+def test_decide_independent_pulse_ok_when_independent_tick_recent():
+    # 2026-09-07T04:55 — 04:51:45 (независимый) 3.25 мин назад, 04:26:32
+    # (событийный) 28.5 мин назад: оба в пределах порога — здоров.
+    runs = [EVENT_RUNS_MORNING[4], INDEPENDENT_RUN_MORNING]
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 4, 55, 0))
+    assert state == "ok" and exact is True
+    assert anchor.isoformat() == "2026-09-07T04:51:45+00:00"
+
+
+def test_decide_independent_pulse_stale_on_real_incident_morning_gap(monkeypatch=None):
+    # Прод-форма реального разрыва: событийный канал тикал в 08:16-08:53,
+    # независимый — молчал с 04:51:45 (4 ч 8 мин, порог 60 мин).
+    runs = EVENT_RUNS_MORNING + [INDEPENDENT_RUN_MORNING]
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 9, 0, 0))
+    assert state == "stale" and exact is True
+    assert anchor.isoformat() == "2026-09-07T04:51:45+00:00"
+    age = pg.minutes_between(anchor, utc(2026, 9, 7, 9, 0, 0))
+    assert age > pg.INDEPENDENT_PULSE_STALE_AFTER_MINUTES
+    assert round(age / 60, 1) == 4.1
+
+
+def test_decide_independent_pulse_mutation_guard_threshold_is_single_constant():
+    # Порог — аргумент по умолчанию из одной константы (тот же приём, что у
+    # test_decide_dispatch_threshold_is_single_constant): изменили константу —
+    # изменилось решение, второй копии порога в коде нет.
+    runs = [run("success", "2026-09-07T08:00:00Z", 1, actor="github-actions[bot]"),
+            run("success", "2026-09-07T07:00:00Z", 2, actor="mytab0r")]
+    now = utc(2026, 9, 7, 8, 0, 0)
+    assert pg.decide_independent_pulse(runs, now, stale_after_minutes=61)[0] == "ok"
+    assert pg.decide_independent_pulse(runs, now, stale_after_minutes=59)[0] == "stale"
+
+
+def test_decide_independent_pulse_stale_lower_bound_when_no_independent_in_sample():
+    # Ни одного независимого тика во всей изученной выборке — anchor берётся
+    # от самого старого прогона выборки (нижняя граница, exact=False):
+    # алерт не имеет права утверждать точное число часов, которого не измерял.
+    runs = EVENT_RUNS_MORNING
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 9, 0, 0))
+    assert state == "stale" and exact is False
+    assert anchor.isoformat() == "2026-09-07T04:26:32+00:00"
+
+
+def test_independent_pulse_alert_text_names_consequence_not_internal_state():
+    text = pg.independent_pulse_alert_text(248.25, exact=True)
+    assert "4.1 ч" in text
+    assert "конвейер держится только на событийном канале" in text
+    assert "встанет, как только прекратится активность PR" in text
+    assert "pulse_healthy" not in text  # алерт не гадает внутренним именем поля
+
+
+def test_independent_pulse_alert_text_marks_lower_bound_when_inexact():
+    text = pg.independent_pulse_alert_text(248.25, exact=False)
+    assert "как минимум" in text
+
+
+def _fake_gh_for_morning_gap(extra_comments=None):
+    return FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": EVENT_RUNS_MORNING + [INDEPENDENT_RUN_MORNING]},
+        "issues/120/comments": extra_comments or [],
+    })
+
+
+def test_independent_pulse_check_quiet_when_independent_tick_recent(monkeypatch):
+    # direction (a): независимый тик недавний — сигнала нет вовсе.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": [EVENT_RUNS_MORNING[4], INDEPENDENT_RUN_MORNING]},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)  # закрытие эпизода (нет открытого — не пишет)
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 4, 55, 0))
+    assert any("в норме" in line for line in lines)
+
+
+def test_independent_pulse_check_escalates_on_real_incident_and_names_hours(monkeypatch):
+    # direction (b): независимый канал молчал 4+ часа, событийный жив —
+    # сигнал уходит, текст называет факт числом часов.
+    fake = _fake_gh_for_morning_gap()
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1 and len(posted) == 1
+    assert pg.DO_PULSE_MARKER in sent[0] and "4.1 ч" in sent[0]
+    assert "встанет, как только прекратится активность PR" in sent[0]
+
+
+def test_independent_pulse_check_dedups_same_episode(monkeypatch):
+    # direction (c): маркер уже стоит для этого эпизода — повторный сигнал
+    # не плодится (тот же приём, что у event_wake/heartbeat episode_reopened).
+    fake = _fake_gh_for_morning_gap(extra_comments=[
+        {"created_at": "2026-09-07T08:55:00Z",
+         "body": f"🚨 edge-harness: {pg.DO_PULSE_MARKER}\nранее"}])
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать повторно"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать повторно"))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+    assert lines and "эпизод уже оповещён" in lines[0]
+
+
+def test_independent_pulse_check_closes_episode_when_ticks_resume(monkeypatch):
+    # direction (d): DO-дисптачи возобновились (реальный run 20:23:40Z того
+    # же дня) — эпизод закрывается сам, без внешнего вмешательства.
+    resumed_run = run("success", "2026-09-07T20:23:40Z", 200, actor="mytab0r")
+    # Событийный канал обязан быть подтверждён свежим и на этот якорь тоже
+    # (иначе not_applicable) — реальный тик github-actions[bot] того же вечера.
+    evening_event_run = run("success", "2026-09-07T19:48:04Z", 199, actor="github-actions[bot]")
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": EVENT_RUNS_MORNING + [resumed_run, evening_event_run]},
+        "issues/120/comments": [
+            {"created_at": "2026-09-07T09:00:00Z",
+             "body": f"🚨 edge-harness: {pg.DO_PULSE_MARKER}\nстарый эпизод"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 20, 30, 0))
+
+    assert any("в норме" in line for line in lines)
+    assert len(posted) == 1 and pg.DO_PULSE_RESUMED_MARKER in posted[0]
+
+
+def test_independent_pulse_check_no_calls_beyond_recent_runs_when_not_applicable(monkeypatch):
+    # Холостой ход (событийный канал сам не подтверждён свежим) — ровно один
+    # вызов gh (recent_runs), ни маркеров, ни Telegram, ни комментария.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": [run("success", "2026-09-05T10:00:00Z", 1, actor="github-actions[bot]")]},
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+    assert lines == []
+    assert len(fake.calls) == 1
 
 
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
