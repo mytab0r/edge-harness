@@ -47,7 +47,8 @@ def merged_pr(number, ref, merged_at):
 
 
 def open_pr(number, pr_body="", labels=()):
-    return {"number": number, "body": pr_body, "labels": [{"name": n} for n in labels]}
+    return {"number": number, "body": pr_body, "labels": [{"name": n} for n in labels],
+            "head": {"sha": f"sha{number}"}}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -206,8 +207,22 @@ def patch_gh(monkeypatch, fake):
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
 
 
+def gate1_status(when: str):
+    """Прод-форма commit status `harness/review` на текущем head PR (#345) —
+    якорь после находки ревью #424 (замена таймлайн-события 'labeled',
+    замороженного идемпотентностью #203)."""
+    return [{"context": ri.review_labels.STATUS_REVIEW, "created_at": when}]
+
+
 def timeline_with_review_ok(when: str):
     return [{"event": "labeled", "label": {"name": "review:ok"}, "created_at": when}]
+
+
+def timeline_with_review_large(when: str):
+    """Прод-форма таймлайна крупного PR (#432): verdict_for ставит РОВНО одну
+    из двух меток гейта 1 — "labeled: review:ok" в таком таймлайне не
+    наступает никогда."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
 
 
 def retry_marker_comment(when: str, attempt: int):
@@ -220,6 +235,7 @@ def retry_marker_comment(when: str, attempt: int):
 def test_stuck_review_gate_flags_after_threshold(monkeypatch):
     pull = open_pr(246, labels=["review:ok"])
     fake = FakeGh({
+        "commits/sha246/statuses": gate1_status("2026-09-01T10:00:00Z"),
         "issues/246/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
         "issues/246/comments": [],
     })
@@ -234,7 +250,7 @@ def test_stuck_review_gate_flags_after_threshold(monkeypatch):
 
 def test_stuck_review_gate_silent_within_threshold(monkeypatch):
     pull = open_pr(246, labels=["review:ok"])
-    fake = FakeGh({"issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z")})
+    fake = FakeGh({"commits/sha246/statuses": gate1_status("2026-09-03T14:07:04Z")})
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 13)  # 6 минут — живой случай PR #246 на 2026-09-03
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
@@ -242,27 +258,23 @@ def test_stuck_review_gate_silent_within_threshold(monkeypatch):
 
 def test_stuck_review_gate_silent_when_verdict_present(monkeypatch):
     pull = open_pr(163, labels=["review:ok", "ai:changes-requested"])
-    fake = FakeGh({})  # таймлайн даже не должен запрашиваться
+    fake = FakeGh({})  # статус даже не должен запрашиваться
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 3, 14, 0)
     assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
     assert fake.calls == []
 
 
-def timeline_with_review_large(when: str):
-    """Прод-форма таймлайна крупного PR (#432): verdict_for ставит РОВНО одну
-    из двух меток гейта 1 — "labeled: review:ok" в таком таймлайне не
-    наступает никогда."""
-    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
-
-
 def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch):
     # #432: review:large — тоже «гейт 1 отработал» (review_labels.gate1_decided).
     # До фикса эта проверка требовала ровно review:ok, и PR с review:large без
     # единой ai:*-метки был невидим инварианту тем же классом, каким
-    # scheduler.trigger_ai_review был невидим PR #412.
+    # scheduler.trigger_ai_review был невидим PR #412. Якорь — commit status
+    # `harness/review` (#345), единый для review:ok/review:large — различение
+    # по метке этому якорю не нужно вовсе (#424).
     pull = open_pr(432, labels=["review:large"])
     fake = FakeGh({
+        "commits/sha432/statuses": gate1_status("2026-09-01T10:00:00Z"),
         "issues/432/timeline": timeline_with_review_large("2026-09-01T10:00:00Z"),
         "issues/432/comments": [],
     })
@@ -289,6 +301,7 @@ def test_stuck_review_gate_mutation_guard(monkeypatch):
     # находка AI-ревью PR #249: старый вариант не краснел на снятии фикса).
     pull = open_pr(246, labels=["review:ok"])
     fake = FakeGh({
+        "commits/sha246/statuses": gate1_status("2026-09-03T14:07:04Z"),
         "issues/246/timeline": timeline_with_review_ok("2026-09-03T14:07:04Z"),
         "issues/246/comments": [],
     })
@@ -318,6 +331,7 @@ def test_stuck_gate_fact_pr387_never_had_a_verdict(monkeypatch):
     было ни разу за всю жизнь PR (не «был и протух», как у #329/#327ниже)."""
     pull = open_pr(387, labels=["review:ok", "review:large", "review:large-ok"])
     fake = FakeGh({
+        "commits/sha387/statuses": gate1_status("2026-09-06T03:13:09Z"),
         "issues/387/timeline": [
             {"event": "labeled", "label": {"name": "review:large"}, "created_at": "2026-09-05T23:02:59Z"},
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:13:09Z"},
@@ -350,6 +364,7 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
     pull = open_pr(329, labels=["review:ok"])
     fake = FakeGh({
+        "commits/sha329/statuses": gate1_status("2026-09-06T03:48:22Z"),
         "issues/329/timeline": [
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:05:20Z"},
             {"event": "labeled", "label": {"name": "ai:failed"}, "created_at": "2026-09-06T03:13:07Z"},
@@ -390,6 +405,7 @@ def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
     ровно три, не четыре (мутация ниже это и доказывает)."""
     pull = open_pr(327, labels=["review:ok", "review:large", "review:large-ok"])
     fake = FakeGh({
+        "commits/sha327/statuses": gate1_status("2026-09-06T05:46:16Z"),
         "issues/327/timeline": [
             {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T03:09:50Z"},
             {"event": "labeled", "label": {"name": "ai:changes-requested"}, "created_at": "2026-09-06T04:10:03Z"},

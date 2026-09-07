@@ -625,6 +625,37 @@ def test_post_commit_status_truncates_description_to_140_chars():
     assert len(description_arg) == len("description=") + 140
 
 
+def test_status_posted_at_returns_latest_created_at_for_context():
+    # Находка ревью #424: якорь таймеров #196/#269 переведён с таймлайн-
+    # события "labeled" (замороженного идемпотентностью #203) на commit
+    # status, публикуемый каждым прогоном безусловно.
+    statuses = [
+        {"context": "harness/ai-review", "created_at": "2026-09-01T00:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-02T10:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-01T09:00:00Z"},  # старее — не должен победить
+    ]
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_REVIEW, lambda url: statuses)
+    assert result == "2026-09-02T10:00:00Z"
+
+
+def test_status_posted_at_none_when_context_never_posted():
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_AI_REVIEW, lambda url: [])
+    assert result is None
+
+
+def test_status_posted_at_reads_exact_sha_url():
+    calls = []
+
+    def fake_gh(url):
+        calls.append(url)
+        return []
+
+    review_labels.status_posted_at("owner/repo", "deadbeef", review_labels.STATUS_REVIEW, fake_gh)
+    assert calls == ["repos/owner/repo/commits/deadbeef/statuses?per_page=100"]
+
+
 def test_run_target_url_none_without_actions_env(monkeypatch):
     monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
@@ -635,3 +666,75 @@ def test_run_target_url_built_from_actions_env(monkeypatch):
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     assert review_labels.run_target_url("o/r") == "https://github.com/o/r/actions/runs/123"
+
+
+# ── Идемпотентность: своп вердикт-меток и публикация комментариев (#203) ─────
+#
+# Оба гейта на каждом прогоне безусловно перевешивали то, что уже висит:
+# снимали и ставили вердикт-метку (unlabeled+labeled одного значения в
+# таймлайне PR — каждый labeled к тому же триггерит orchestra.yml), POST-ил
+# заново одинаковый комментарий провала. Решения вынесены в чистые функции
+# здесь; гвардии кормятся прод-формой имён меток этого же модуля.
+
+def test_verdict_label_changes_unchanged_verdict_is_full_noop():
+    # Факт 2 #203: вердикт тот же — ни удаления, ни постановки, вызовов нет.
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.REVIEW_OK}], review_labels.REVIEW_OK) == ([], False)
+
+
+def test_verdict_label_changes_swap_removes_only_other_verdicts():
+    # Смена вердикта: чужая вердикт-метка снимается, актуальная ставится;
+    # метки вне вердиктов гейта (ai:ok, conflict) решение не трогает.
+    current = [{"name": review_labels.REVIEW_OK}, {"name": review_labels.AI_OK},
+               {"name": "conflict"}]
+    assert review_labels.verdict_label_changes(
+        current, review_labels.REVIEW_CHANGES) == ([review_labels.REVIEW_OK], True)
+
+
+def test_verdict_label_changes_cleans_stale_large_but_not_large_ok():
+    # Дифф ужался ниже порога: протухший review:large снимается, но метка
+    # принятия размера review:large-ok остаётся — у неё свой газ (LABELS.md).
+    current = [{"name": review_labels.REVIEW_LARGE}, {"name": review_labels.LARGE_OK}]
+    assert review_labels.verdict_label_changes(
+        current, review_labels.REVIEW_OK) == ([review_labels.REVIEW_LARGE], True)
+
+
+def test_verdict_label_changes_ai_verdicts_share_the_same_decision():
+    # Тот же код для гейта 2: повторный ai:failed (автоповтор #196) — полный
+    # no-op; смена ai:failed → ai:ok — перестановка, молчанием не становится.
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.AI_FAILED}], review_labels.AI_FAILED,
+        review_labels.AI_VERDICTS) == ([], False)
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.AI_FAILED}], review_labels.AI_OK,
+        review_labels.AI_VERDICTS) == ([review_labels.AI_FAILED], True)
+
+
+def test_comment_update_action_three_outcomes():
+    existing = {"id": 1, "body": "Контракт PR ↔ задача нарушен:\n- x"}
+    assert review_labels.comment_update_action(None, "что угодно") == "post"
+    assert review_labels.comment_update_action(existing, existing["body"]) is None
+    assert review_labels.comment_update_action(existing, existing["body"] + "\n- y") == "patch"
+
+
+def test_latest_comment_by_header_finds_last_trusted_match():
+    # Шум + два своих + чужой с тем же заголовком в самом конце: обязан
+    # вернуться последний СВОЙ — чужой не выигрывает и заглушкой не служит
+    # (репозиторий публичный, класс подделки вердикта AI PR #294).
+    bot = {"login": "github-actions[bot]", "type": "Bot"}
+    first = {"user": bot, "body": review_labels.CONTRACT_FAIL_HEADER + "\n- первое"}
+    outsider = {"user": {"login": "random-outside-contributor", "type": "User"},
+                "body": review_labels.CONTRACT_FAIL_HEADER + "\n- подделка"}
+    last = {"user": bot, "body": review_labels.CONTRACT_FAIL_HEADER + "\n- второе"}
+    found = review_labels.latest_comment_by_header(
+        "o/r", 1, lambda url: [first, outsider, last] if "page=1" in url else [],
+        review_labels.CONTRACT_FAIL_HEADER)
+    assert found is last
+
+
+def test_latest_comment_by_header_none_when_no_trusted_match():
+    bot = {"login": "github-actions[bot]", "type": "Bot"}
+    found = review_labels.latest_comment_by_header(
+        "o/r", 1, lambda url: [{"user": bot, "body": "просто болтовня"}] if "page=1" in url else [],
+        review_labels.CONTRACT_FAIL_HEADER)
+    assert found is None

@@ -426,10 +426,20 @@ def main() -> int:
         for item in revert_accepted:
             print(f"review: {item} — принято меткой {REVERT_OK}")
 
-    # Вердикт-метка: старые вердикты снимаются, вешается актуальный.
-    for old in (REVIEW_OK, REVIEW_CHANGES):
-        if old in current:
-            run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+    # Вердикт-метка идемпотентна (#203): вердикт не изменился с прошлого
+    # прогона — ни одного изменяющего вызова (unlabeled+labeled одного и
+    # того же значения — шум в таймлайне PR и лишний прогон orchestra.yml,
+    # который слушает `labeled`; замер scripts/measure/label_churn_203.py:
+    # 88 labeled review:ok за сутки, из них 74 — чистая перестановка).
+    # Вердикт сменился — снимаются только ЧУЖИЕ вердикт-метки и ставится
+    # актуальная (обратная проверка: при смене решения метка обязана
+    # переставиться, критерий 4 #203). Решение — чистая функция
+    # verdict_label_changes, одно место правды, общее с ai_review.py
+    # (ai:*, тот же класс #203).
+    verdict = verdict_for(is_large, findings)
+    stale_verdicts, need_verdict_post = review_labels.verdict_label_changes(current, verdict)
+    for old in stale_verdicts:
+        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     # Вердикт AI-ревью (второй гейт, #18) привязан к head, который ревьюили:
     # этот скрипт выполняется на каждый пуш и обязан снять протухший ai:* ДО
     # нового AI-ревью — иначе оркестратор может слить PR по метке от старого
@@ -470,8 +480,8 @@ def main() -> int:
     else:
         for old in to_drop:
             run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
-    verdict = verdict_for(is_large, findings)
-    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
+    if need_verdict_post:
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels", "-f", f"labels[]={verdict}")
 
     # Commit Status API — тот же вердикт вторым каналом, параллельно метке
     # (#345): allow_auto_merge (уже включён на репозитории) читает required
@@ -484,8 +494,21 @@ def main() -> int:
         run_gh, review_labels.run_target_url(repo))
 
     if findings:
-        body = "Ревью нашло замечания:\n" + "\n".join(f"- {f}" for f in findings)
-        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")
+        body = review_labels.REVIEW_FINDINGS_HEADER + "\n" + "\n".join(f"- {f}" for f in findings)
+        # Тот же класс, что комментарий контракта (#203): повторный прогон с
+        # теми же находками не публикует второй одинаковый комментарий,
+        # изменившиеся находки обновляют существующий. Свой комментарий —
+        # только от доверенной учётки (github-actions[bot] — pr-review ходит
+        # под github.token): чужой текст-близнец заглушкой не служит.
+        existing = review_labels.latest_comment_by_header(
+            repo, args.pr, gh, review_labels.REVIEW_FINDINGS_HEADER)
+        action = review_labels.comment_update_action(existing, body)
+        if action == "post":
+            run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")
+        elif action == "patch":
+            run_gh("api", "-X", "PATCH",
+                   f"repos/{repo}/issues/{args.pr}/comments/{existing['id']}",
+                   "-f", f"body={body}")
         for f in findings:
             print(f"::error::{f}")
         print(f"review: FAIL ({verdict})")

@@ -100,14 +100,20 @@ class FakeGh:
         return [c for c in self.calls if c.startswith(("-X POST", "-X PUT", "-X DELETE", "-X PATCH"))]
 
 
-def _run_main(monkeypatch, fake, *, pr_number):
+def _run_main(monkeypatch, fake, *, pr_number, comments=()):
     """Прогоняет main() с подставным gh/run_gh и argv. Провал (fail())
     завершает процесс через sys.exit(1) — успех main() просто возвращает 0,
-    ничего не бросая; оба исхода нормализуются в код возврата."""
+    ничего не бросая; оба исхода нормализуются в код возврата.
+
+    `comments` — что отвечает список комментариев PR: fail() с #203 перед
+    публикацией ищет свой прошлый комментарий (чтение, не изменяющий вызов,
+    поэтому FakeGh.mutating_calls() ниже его не видит)."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(cc, "gh", fake)
     monkeypatch.setattr(cc, "run_gh", lambda *args: None)  # метки/комментарий провала — не предмет теста
     monkeypatch.setattr(sys, "argv", ["contract_check.py", "--pr", str(pr_number)])
+    if f"issues/{pr_number}/comments" not in fake.routes:
+        fake.routes[f"issues/{pr_number}/comments"] = list(comments)
     try:
         return cc.main()
     except SystemExit as exit_:
@@ -391,3 +397,91 @@ def test_duplicate_pr_detected_via_other_branch_ignores_body(monkeypatch):
         "чужой открытый PR #907 назвал ту же задачу #701 своей веткой — "
         "второй PR на задачу не проходит контракт, даже если тело называет другой номер"
     )
+
+
+# ── Идемпотентность комментария провала (#203, Факт 1) ──────────────────────
+#
+# Прод-форма: цепочки идентичных комментариев «Контракт PR ↔ задача
+# нарушен:» подряд на PR #162 (9 штук), #173/#191 (по 3) — fail() POST-ил
+# заново на каждом прогоне. Проверяются сами вызовы run_gh, а не «шаг
+# success»: имя операции и путь в записанном вызове.
+
+def _existing_comment(comment_id: int, body: str, *, login="github-actions[bot]",
+                      type_="Bot"):
+    return {"id": comment_id, "user": {"login": login, "type": type_}, "body": body}
+
+
+def _run_fail(monkeypatch, existing_comments, messages, *, pr_number=777):
+    """Прогоняет fail() с подставным gh (чтение комментариев — FakeGh) и
+    записывающим run_gh (изменяющие вызовы). fail() всегда завершается
+    sys.exit(1) — глотается, интересны только записанные вызовы."""
+    calls: list[str] = []
+    fake = FakeGh({f"issues/{pr_number}/comments": list(existing_comments)})
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(cc, "gh", fake)
+    monkeypatch.setattr(cc, "run_gh", lambda *args: calls.append(" ".join(args)))
+    with pytest.raises(SystemExit):
+        cc.fail(messages, REPO, pr_number)
+    return calls
+
+
+def test_fail_same_violation_posts_no_second_comment(monkeypatch):
+    """Факт 1 #203: повторный прогон с ТЕМ ЖЕ нарушением не публикует второй
+    одинаковый комментарий и не правит существующий — критерий приёмки
+    «второго комментария не появилось; существующий оставлен как есть».
+
+    Мутация: вернуть в fail() безусловный POST комментария — тест краснеет
+    (в записанных вызовах появляется POST .../comments)."""
+    messages = ["На задачу #77 уже есть открытый PR #164. "
+                "Второй PR на ту же задачу не проходит контракт."]
+    body = cc.review_labels.CONTRACT_FAIL_HEADER + "".join(f"\n- {m}" for m in messages)
+    existing = _existing_comment(555, body)
+    calls = _run_fail(monkeypatch, [existing], messages)
+
+    comment_calls = [c for c in calls if "/comments" in c]
+    assert comment_calls == [], f"дубликат/правка того же текста: {comment_calls}"
+    # Метка при этом ставится как раньше — её перестановка идемпотентна на
+    # стороне GitHub сама по себе.
+    assert any("labels[]=contract:failed" in c for c in calls)
+
+
+def test_fail_changed_violation_patches_existing_comment(monkeypatch):
+    """Обратная проверка (критерий 4 #203): текст нарушения изменился —
+    обновляется СУЩЕСТВУЮЩИЙ комментарий (PATCH по его id), новый не
+    плодится, идемпотентность не превратилась в молчание."""
+    stale = _existing_comment(
+        555, cc.review_labels.CONTRACT_FAIL_HEADER + "\n- старое нарушение")
+    messages = ["В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула."]
+    calls = _run_fail(monkeypatch, [stale], messages)
+
+    comment_calls = [c for c in calls if "/comments" in c]
+    assert len(comment_calls) == 1, comment_calls
+    assert "-X PATCH" in comment_calls[0]
+    assert "/comments/555" in comment_calls[0]
+    assert "нет ссылки на задачу" in comment_calls[0]
+
+
+def test_fail_first_violation_posts_comment_once(monkeypatch):
+    """Комментария ещё нет — ровно один POST: гейт обязан остаться громким."""
+    messages = ["В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула."]
+    calls = _run_fail(monkeypatch, [], messages)
+
+    comment_calls = [c for c in calls if "/comments" in c]
+    assert len(comment_calls) == 1
+    assert "-X POST" in comment_calls[0]
+    assert f"repos/{REPO}/issues/777/comments" in comment_calls[0]
+
+
+def test_fail_same_text_from_outsider_does_not_silence_gate(monkeypatch):
+    """Посторонний участник публичного репозитория опубликовал комментарий с
+    тем же текстом — публикация НЕ глушится: свой комментарий ищется только
+    среди доверенных (github-actions[bot]), чужой текст-близнец не может
+    заставить гейт молчать (тот же класс, что подделка вердикта AI PR #294)."""
+    messages = ["В теле PR нет ссылки на задачу (#N). Один PR — одна задача из пула."]
+    outsider = _existing_comment(
+        556, cc.review_labels.CONTRACT_FAIL_HEADER + "\n- " + messages[0],
+        login="random-outside-contributor", type_="User")
+    calls = _run_fail(monkeypatch, [outsider], messages)
+
+    comment_calls = [c for c in calls if "/comments" in c]
+    assert len(comment_calls) == 1 and "-X POST" in comment_calls[0]

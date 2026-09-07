@@ -1105,6 +1105,47 @@ def test_cmd_verdict_preserves_checked_checklist_items_on_new_round(monkeypatch,
     assert "- [ ] **Новое замечание** — Поправь Y." in patches[0]
 
 
+# ── Идемпотентность свопа ai:*-метки (#203, тот же класс, что review:*) ──────
+
+def test_cmd_verdict_same_verdict_touches_no_labels(monkeypatch, tmp_path):
+    """Класс #203 в гейте 2: повторный вердикт ТОГО ЖЕ значения (автоповтор
+    ai:failed по таймеру #196, повторный approve) не выполняет ни одного
+    изменяющего вызова с метками — никакого unlabeled+labeled того же
+    значения в таймлайне. Мутация: вернуть в cmd_verdict безусловные
+    DELETE+POST — тест краснеет."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [ai.AI_OK])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    assert label_calls == [], label_calls
+
+
+def test_cmd_verdict_changed_verdict_swaps_ai_label(monkeypatch, tmp_path):
+    """Обратная проверка (#203, критерий 4): вердикт сменился — прежняя
+    ai:*-метка снята, актуальная поставлена, своп не стал молчанием."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [ai.AI_CHANGES])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert joined.count("-X DELETE") == 1 and ai.AI_CHANGES in joined, joined
+    assert f"labels[]={ai.AI_OK}" in joined, joined
 # ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
 
 def _status_calls(run_gh_calls: list[tuple]) -> list[tuple]:

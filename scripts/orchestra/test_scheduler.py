@@ -944,17 +944,18 @@ def test_mark_stale_unclaimed_no_second_traversal_uses_passed_pool(monkeypatch):
 # ── Поведение 1: готовый PR без вердикта — дёрнуть гейт самому ───────────────────
 
 
-def timeline_with_review_ok(when: str):
-    return [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": when},
-        {"event": "labeled", "label": {"name": "review:large"}, "created_at": when},
-    ]
+def gate1_status(when: str):
+    """Прод-форма commit status `harness/review` на текущем head PR (#345) —
+    якорь таймера #196 после находки ревью #424 (замена таймлайн-события
+    'labeled', замороженного идемпотентностью #203: пуш с тем же вердиктом
+    не выбрасывает 'labeled', но статус публикуется безусловно)."""
+    return [{"context": sch.review_labels.STATUS_REVIEW, "created_at": when}]
 
 
 def test_trigger_ai_review_dispatches_after_threshold_no_verdict(monkeypatch):
     p = pull(163, labels=["review:ok"])
     fake = FakeGh({
-        "issues/163/timeline": timeline_with_review_ok("2026-09-02T11:00:00Z"),
+        "commits/sha163/statuses": gate1_status("2026-09-02T11:00:00Z"),
         "issues/163/comments": [],  # прод-форма: голый массив без маркеров попыток
         "ai-review.yml/dispatches": None,  # 204 без тела — прод-форма ответа dispatch
     })
@@ -976,7 +977,7 @@ def test_trigger_ai_review_dispatches_after_threshold_no_verdict(monkeypatch):
 def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     p = pull(178, labels=["review:ok", "ai:failed"])
     fake = FakeGh({
-        "issues/178/timeline": timeline_with_review_ok("2026-09-01T22:37:09Z"),
+        "commits/sha178/statuses": gate1_status("2026-09-01T22:37:09Z"),
         "issues/178/comments": [],
         "ai-review.yml/dispatches": None,
     })
@@ -991,7 +992,7 @@ def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
 
 def test_trigger_ai_review_silent_before_threshold(monkeypatch):
     p = pull(163, labels=["review:ok"])
-    fake = FakeGh({"issues/163/timeline": timeline_with_review_ok("2026-09-02T11, 40:00Z".replace(", ", ":"))})
+    fake = FakeGh({"commits/sha163/statuses": gate1_status("2026-09-02T11:40:00Z")})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не должен писать"))
 
@@ -1030,7 +1031,7 @@ def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
         for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
     ]
     fake = FakeGh({
-        "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
         "issues/163/comments": comments,
     })
     patch_gh(monkeypatch, fake)
@@ -1044,23 +1045,19 @@ def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
     assert actions == []
 
 
-def timeline_with_review_large_only(when: str):
-    """Прод-форма таймлайна крупного PR (#412, #432): verdict_for ставит РОВНО
-    одну из двух меток гейта 1 — событие "labeled: review:ok" в таком
-    таймлайне не наступает НИКОГДА, только "labeled: review:large"."""
-    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
-
-
 def test_trigger_ai_review_dispatches_for_review_large_ai_failed(monkeypatch):
     # Живой случай PR #412 (задача #432): review:large + ai:failed, помечен
     # 2026-09-06T02:34, автоповторов ноль спустя полтора часа при пороге
     # 30 минут. До фикса #432 last_gate1_labeled_at (тогда ещё
     # last_review_ok_labeled_at) искала ТОЛЬКО событие "labeled: review:ok",
     # которого для review:large PR не бывает — anchor оставался None навсегда,
-    # и даже пропустив входной гейт, retry не смог бы посчитать возраст.
+    # и даже пропустив входной гейт, retry не смог бы посчитать возраст. С
+    # #424 якорь — commit status `harness/review` (единый для review:ok/
+    # review:large/review:changes-requested), различение по метке этому
+    # якорю больше не нужно вовсе.
     p = pull(412, labels=["review:large", "ai:failed"])
     fake = FakeGh({
-        "issues/412/timeline": timeline_with_review_large_only("2026-09-06T02:34:00Z"),
+        "commits/sha412/statuses": gate1_status("2026-09-06T02:34:00Z"),
         "issues/412/comments": [],
         "ai-review.yml/dispatches": None,
     })
@@ -1289,13 +1286,15 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
 # ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
 # Противоположный класс unhealthy_pulls: PR ЗДОРОВ (обе метки-гейта, зелёные
 # проверки), но слияния не было дольше UNHEALTHY_PR_AFTER_MINUTES с момента
-# готовности (позже из двух событий 'labeled' review:ok/ai:ok в таймлайне).
+# готовности (позже из двух commit status'ов harness/review и harness/ai-review
+# на текущем head, #345 — якорь после находки ревью #424, замена таймлайн-
+# события 'labeled', замороженного идемпотентностью #203).
 
 
-def timeline_ready(review_at: str, ai_at: str):
+def statuses_ready(review_at: str, ai_at: str):
     return [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": review_at},
-        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": ai_at},
+        {"context": sch.review_labels.STATUS_REVIEW, "created_at": review_at},
+        {"context": sch.review_labels.STATUS_AI_REVIEW, "created_at": ai_at},
     ]
 
 
@@ -1304,7 +1303,7 @@ def test_stale_ready_pulls_escalates_when_ready_longer_than_threshold(monkeypatc
     fake = FakeGh({
         "pulls/301": {"mergeable_state": "clean"},
         "commits/sha301/check-runs": CHECK_RUNS_GREEN,
-        "issues/301/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha301/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
         "issues/120/comments?per_page=100": [],
     })
     patch_gh(monkeypatch, fake)
@@ -1325,7 +1324,7 @@ def test_stale_ready_pulls_silent_before_threshold(monkeypatch):
     fake = FakeGh({
         "pulls/302": {"mergeable_state": "clean"},
         "commits/sha302/check-runs": CHECK_RUNS_GREEN,
-        "issues/302/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha302/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
@@ -1344,7 +1343,7 @@ def test_stale_ready_pulls_silent_when_ai_gate_missing(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("гейта нет — не готов"))
     lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
     assert lines == []
-    assert not any("timeline" in c for c in fake.calls)  # готовность даже не проверяем
+    assert not any("statuses" in c for c in fake.calls)  # готовность даже не проверяем
 
 
 def test_stale_ready_pulls_silent_when_checks_red(monkeypatch):
@@ -1362,7 +1361,7 @@ def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
     fake = FakeGh({
         "pulls/305": {"mergeable_state": "clean"},
         "commits/sha305/check-runs": CHECK_RUNS_GREEN,
-        "issues/305/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha305/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #305\nPR #305 …"},
         ],
@@ -1387,8 +1386,8 @@ def test_stale_ready_pulls_signals_each_pr_independently(monkeypatch):
         "pulls/302": {"mergeable_state": "clean"},
         "commits/sha301/check-runs": CHECK_RUNS_GREEN,
         "commits/sha302/check-runs": CHECK_RUNS_GREEN,
-        "issues/301/timeline": timeline_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
-        "issues/302/timeline": timeline_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
+        "commits/sha301/statuses": statuses_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
+        "commits/sha302/statuses": statuses_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
         # #301 уже прокричал в 10:01 — маркер несёт свой номер.
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-02T10:01:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #301\nPR #301 …"},
@@ -2373,22 +2372,73 @@ def test_after_merge_reads_files_through_paginated_helper():
     assert 'gh(f"repos/{repo}/pulls/{number}/files?per_page=100")' not in source
 
 
-# ── Пагинация таймлайна: тот же класс, тесно в один хелпер (#303, находка
-# ревью) — last_gate1_labeled_at и last_ready_labeled_at читали сырую
-# первую страницу timeline?per_page=100 без обхода, событие 'labeled' за
-# первой сотней молча терялось на длинном таймлайне ────────────────────────
+# ── Якорь таймеров #196/#269: commit status, не таймлайн-событие (находка
+# ревью #424) — last_gate1_labeled_at/last_ready_labeled_at раньше читали
+# 'labeled' в таймлайне (#303: полная пагинация вместо сырой первой страницы),
+# но #203 сделал перестановку вердикт-меток идемпотентной — 'labeled' не
+# выбрасывается вовсе, если новый пуш подтвердил тот же вердикт, и якорь
+# замерзал бы навсегда. Оба якоря переведены на review_labels.status_posted_at
+# (commit status на текущем head, публикуется каждым прогоном безусловно) ──
 
 
-def test_last_gate1_and_last_ready_read_timeline_through_paginated_helper():
-    # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
-    # выше): обе функции обязаны ходить через review_labels.list_timeline
-    # (полный обход постранично), а не читать сырую первую страницу —
-    # поведенческая проверка самой пагинации живёт в
-    # scripts/lib/test_review_labels.py::test_list_timeline_paginates_finds_event_beyond_first_page
-    # (мутация доказана там: обход убран — тест краснеет).
+def test_last_gate1_and_last_ready_read_status_not_timeline():
+    # Гвардия по исходнику: обе функции обязаны ходить через
+    # review_labels.status_posted_at, не через список 'labeled' в таймлайне —
+    # поведенческие тесты ниже доказывают саму мутацию (пуш с тем же
+    # вердиктом всё равно двигает якорь вперёд).
     source = SCRIPT.read_text(encoding="utf-8")
-    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
-    assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
+    assert source.count("review_labels.status_posted_at(") >= 3  # оба якоря + trigger_ai_review не читает лишний раз
+    assert "def last_gate1_labeled_at(repo: str, pull: dict)" in source
+    assert "def last_ready_labeled_at(repo: str, pull: dict)" in source
+
+
+def test_last_gate1_labeled_at_mutation_push_with_same_verdict_moves_anchor(monkeypatch):
+    # Находка ревью #424: пуш с ТЕМ ЖЕ вердиктом не выбрасывает 'labeled'
+    # (идемпотентность #203), но commit status публикуется безусловно на
+    # НОВОМ head — якорь обязан сдвинуться вперёд вместе с пушем, а не
+    # замереть на первой простановке метки.
+    p = {"head": {"sha": "sha-after-second-push"}}
+    fake = FakeGh({
+        "commits/sha-after-second-push/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-02T11:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_gate1_labeled_at(REPO, p)
+    assert result == utc(2026, 9, 2, 11, 0), (
+        "якорь обязан отражать статус ТЕКУЩЕГО head, даже если вердикт не "
+        "изменился и метка не переставилась"
+    )
+
+
+def test_last_gate1_labeled_at_none_when_status_never_posted(monkeypatch):
+    fake = FakeGh({"commits/nostatussha/statuses": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.last_gate1_labeled_at(REPO, {"head": {"sha": "nostatussha"}}) is None
+
+
+def test_last_ready_labeled_at_uses_later_of_both_statuses_on_current_head(monkeypatch):
+    p = {"head": {"sha": "readysha"}}
+    fake = FakeGh({
+        "commits/readysha/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-01T00:00:00Z"},
+            {"context": sch.review_labels.STATUS_AI_REVIEW, "created_at": "2026-09-01T01:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_ready_labeled_at(REPO, p)
+    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух
+
+
+def test_last_ready_labeled_at_none_when_either_status_missing(monkeypatch):
+    p = {"head": {"sha": "onlyreviewsha"}}
+    fake = FakeGh({
+        "commits/onlyreviewsha/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-01T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.last_ready_labeled_at(REPO, p) is None
 
 
 # ── Пагинация пула задач/PR/таймлайна reap_stale: активный дефект в проде
@@ -2460,24 +2510,6 @@ def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
     assert len(issues) == 106
     assert 248 not in numbers  # #248 — настоящий PR (несёт "pull_request"), не задача
     assert 86 in numbers  # последняя запись второй страницы — обход не потерял хвост
-
-
-def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):
-    # Поведенческое доказательство на уровне вызывающей функции: labeled-события
-    # обеих меток-гейтов лежат за первой страницей (100 посторонних событий
-    # перед ними) — без полного обхода last_ready_labeled_at вернул бы None.
-    page1 = [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"} for _ in range(100)]
-    page2 = [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-01T00:00:00Z"},
-        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-01T01:00:00Z"},
-    ]
-    fake = FakeGh({
-        "timeline?per_page=100&page=1": page1,
-        "timeline?per_page=100&page=2": page2,
-    })
-    patch_gh(monkeypatch, fake)
-    result = sch.last_ready_labeled_at(REPO, 999)
-    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух — labeled ai:ok, найдено на второй странице
 
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────

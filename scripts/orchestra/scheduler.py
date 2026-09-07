@@ -2155,12 +2155,20 @@ def dispatch_worker(
 # ── #196, поведение 1: готовый PR без вердикта — дёрнуть гейт самому ─────────────
 # Триггер: гейт 1 отработал (review:ok ИЛИ review:large — review_labels.
 # gate1_decided, #432; или ai:failed — «ревью не состоялось ИЛИ провалено»,
-# ADR 0007) дольше AI_REVIEW_RETRY_AFTER_MINUTES с момента ПОСЛЕДНЕГО события
-# "labeled" по любой из этих двух меток в таймлайне PR (новый пуш переставляет
-# метку заново — см. review_labels.py, значит и таймер обязан отсчитывать от
-# последней перестановки, а не от первого появления PR). ai:changes-requested
-# и ai:ok сюда не попадают — это не «нет вердикта», это готовый вердикт
-# (обрабатывает unhealthy_pulls/merge_queue соответственно).
+# ADR 0007) дольше AI_REVIEW_RETRY_AFTER_MINUTES с момента публикации
+# commit status `harness/review` на ТЕКУЩЕМ head (review_labels.
+# status_posted_at). ai:changes-requested и ai:ok сюда не попадают — это не
+# «нет вердикта», это готовый вердикт (обрабатывает unhealthy_pulls/
+# merge_queue соответственно).
+#
+# Якорь — commit status, не таймлайн-событие "labeled" (находка ревью #424,
+# живой класс): #203 сделал перестановку вердикт-меток идемпотентной — новый
+# пуш с ТЕМ ЖЕ вердиктом больше не выбрасывает "labeled" вовсе, и таймер,
+# отсчитывающий от последней перестановки, замер бы навсегда на первой
+# простановке. `check_pr.py` публикует `harness/review` КАЖДЫМ прогоном
+# безусловно на точный head (#345, второй канал для required status
+# checks) — этот сигнал не зависит от идемпотентности метки и обновляется
+# при каждом пуше, даже без смены вердикта.
 #
 # Носитель счётчика попыток — комментарий-маркер AI_REVIEW_RETRY_MARKER в самом
 # PR (issues/{n}/comments — тот же endpoint, что и у задач, PR это issue).
@@ -2172,26 +2180,26 @@ def dispatch_worker(
 # reap_stale/mark_conflicts.
 
 
-def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент последней простановки вердикта гейта 1 — весь таймлайн (не
-    только первая страница, review_labels.list_timeline, #303: класс потери
-    хвоста на длинном таймлайне, тот же что list_pr_files/#294), None —
-    ни одна из меток гейта 1 не проставлялась вовсе.
+def last_gate1_labeled_at(repo: str, pull: dict) -> datetime | None:
+    """Момент публикации commit status `harness/review` на ТЕКУЩЕМ head PR
+    (review_labels.status_posted_at, #345) — якорь для таймера #196,
+    заменивший таймлайн-событие "labeled" (находка ревью #424): с #203
+    перестановка вердикт-меток идемпотентна, и `labeled` по гейту 1 не
+    выбрасывается вовсе, если новый пуш подтвердил ТОТ ЖЕ вердикт — старый
+    якорь замерзал на первой простановке метки навсегда. Commit status
+    публикуется `check_pr.py` каждым прогоном безусловно (второй канал
+    вердикта, #345), поэтому обновляется на каждом пуше, даже без смены
+    решения.
 
-    Смотрит на review:ok И на review:large (review_labels.GATE1_LABELS, #432)
-    — не только на review:ok, как было раньше (последнее событие «labeled:
-    review:ok» на PR #412 не наступает НИКОГДА, потому что verdict_for ставит
-    ровно одну из двух меток: PR с review:large никогда не получит review:ok,
-    и старая версия этой функции возвращала None навечно — trigger_ai_review
-    не мог посчитать возраст и не срабатывал вовсе, даже если сам входной
-    гейт (ниже) уже пропускал такой PR)."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
-    ]
-    return parse_time(max(labeled_at)) if labeled_at else None
+    Раньше эта же логика (таймлайн, review:ok/review:large, #432) была
+    задублирована в repo_invariants.py и уже расходилась дважды (#303,
+    #432) — теперь обе стороны читают один и тот же
+    review_labels.status_posted_at, третьего расхождения не заводим.
+
+    None — статус `harness/review` на этом head не публиковался вовсе."""
+    posted = review_labels.status_posted_at(
+        repo, pull["head"]["sha"], review_labels.STATUS_REVIEW, gh)
+    return parse_time(posted) if posted else None
 
 
 def ai_review_retry_count(repo: str, pr_number: int) -> int:
@@ -2212,7 +2220,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
         needs_retry = review_labels.AI_FAILED in labels
         if has_verdict and not needs_retry:
             continue  # ai:ok или ai:changes-requested — вердикт уже есть
-        anchor = last_gate1_labeled_at(repo, pull["number"])
+        anchor = last_gate1_labeled_at(repo, pull)
         if anchor is None:
             continue  # событие не нашлось — не на чем считать порог, не гадаем
         age = minutes_between(anchor, now)
@@ -2340,29 +2348,39 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
 # потолка/таймаута цикла, а не остаточный баг.
 
 
-def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент, когда PR стал полностью готов к слиянию: позже из двух событий
-    'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна
-    (весь таймлайн постранично, review_labels.list_timeline), что
-    last_gate1_labeled_at. None — событие по какой-то из меток не найдено
-    нигде в таймлайне (например, метка не проставлялась вовсе) — тогда
-    возраст не считаем, не гадаем по неполным данным.
+def last_ready_labeled_at(repo: str, pull: dict) -> datetime | None:
+    """Момент, когда PR стал полностью готов к слиянию: позже из двух commit
+    status'ов на ТЕКУЩЕМ head — `harness/review` и `harness/ai-review`
+    (review_labels.status_posted_at, #345). None — какой-то из двух статусов
+    на этом head не публиковался вовсе (например, гейт ещё не отработал) —
+    тогда возраст не считаем, не гадаем по неполным данным.
 
-    Намеренно ТОЛЬКО review:ok, не review_labels.gate1_decided (#432): готов к
-    СЛИЯНИЮ — это merge_label_gate, а он review:large не пропускает (блокирует
-    до review:large-ok) — «готовность» здесь про разрешение слияния, а не про
-    то, что гейт 1 вообще отработал."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    def labeled_at(label_name: str) -> list[str]:
-        return [
-            event["created_at"] for event in timeline
-            if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == label_name
-        ]
-    review_at = labeled_at(review_labels.REVIEW_OK)
-    ai_at = labeled_at(review_labels.AI_OK)
+    Якорь — commit status, не таймлайн-событие "labeled" (находка ревью
+    #424, тот же класс, что last_gate1_labeled_at): #203 сделал перестановку
+    ОБОИХ вердикт-меток идемпотентной (ai_review.py::cmd_verdict — тем же
+    классом, что check_pr.py), и "labeled: review:ok"/"labeled: ai:ok" не
+    выбрасываются вовсе, если очередной пуш подтвердил тот же вердикт —
+    старый якорь замерзал на первой обоюдной готовности навсегда,
+    `stale_ready_pulls` (#269) подавлял бы повторный сигнал условием
+    `marker_at > ready_since` бесконечно. Оба статуса публикуются каждым
+    прогоном безусловно (#345) — сигнал обновляется на каждом пуше.
+
+    Намеренно ТОЛЬКО review:ok (через STATUS_REVIEW == success, см.
+    review_status_state), не review_labels.gate1_decided (#432): готов к
+    СЛИЯНИЮ — это merge_label_gate, а он review:large не пропускает
+    (блокирует до review:large-ok) — «готовность» здесь про разрешение
+    слияния, а не про то, что гейт 1 вообще отработал. Сам commit status
+    `harness/review` публикуется при ЛЮБОМ вердикте (ok/changes-requested/
+    large), поэтому наличие статуса само по себе не значит «review:ok» —
+    вызывающий код (stale_ready_pulls) уже отфильтровал PR по
+    pr_is_merge_ready ДО вызова этой функции, здесь фильтрация не
+    дублируется."""
+    sha = pull["head"]["sha"]
+    review_at = review_labels.status_posted_at(repo, sha, review_labels.STATUS_REVIEW, gh)
+    ai_at = review_labels.status_posted_at(repo, sha, review_labels.STATUS_AI_REVIEW, gh)
     if not review_at or not ai_at:
         return None
-    return parse_time(max(max(review_at), max(ai_at)))
+    return parse_time(max(review_at, ai_at))
 
 
 def pr_is_merge_ready(repo: str, pull: dict) -> bool:
@@ -2414,7 +2432,7 @@ def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
         candidate = {**pull, "mergeable_state": single.get("mergeable_state")}
         if not pr_is_merge_ready(repo, candidate):
             continue
-        ready_since = last_ready_labeled_at(repo, pull["number"])
+        ready_since = last_ready_labeled_at(repo, candidate)
         if ready_since is None:
             continue
         age = minutes_between(ready_since, now)
