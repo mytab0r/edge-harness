@@ -567,6 +567,28 @@ export function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * Решение об алерте готовности хранилища (#575) — чистая функция, проверяется
+ * тестом отдельно от SQL (тот же приём, что pulseHealthy/retentionBacklog).
+ *
+ * Единственный вход решения — rowsWritten УСЛОВНОГО UPDATE дедуп-флага
+ * (#recordStorageProbe), а не прочитанное прошлое состояние: при исчерпании
+ * квоты rows_read (#320) падают все SELECT, включая чтение storage_probe, —
+ * дедуп на чтении спамил бы ⚠️ каждый тик ровно в том классе, ради которого
+ * алерт заведён (находка ревью PR #587). rowsWritten = 1 — флаг перевернулся,
+ * это первый тик перехода (авария при ok=false, восстановление при ok=true);
+ * 0 — переход уже замечен; null — сама запись флага не удалась (исчерпание
+ * rows_written, класс глубже): «шлём/не шлём» решать не по чему, алерт
+ * пропускается — первый удавшийся тик догонит (см. #recordStorageProbe).
+ */
+export function storageReadyAlertDecision(
+  ok: boolean,
+  dedupRowsWritten: number | null,
+): "incident" | "recovery" | null {
+  if (dedupRowsWritten === null || dedupRowsWritten <= 0) return null;
+  return ok ? "recovery" : "incident";
+}
+
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
@@ -1516,20 +1538,42 @@ export class Harness extends DurableObject<Env> {
     return this.#json({ ok: true });
   }
 
-  #getStorageProbe(): { ts: number; ok: boolean; detail: string | null } | null {
-    const row = this.#rows(this.#sql.exec("SELECT ts, ok, detail FROM storage_probe WHERE id = 1"))[0];
-    if (!row) return null;
-    return { ts: Number(row.ts), ok: Number(row.ok) === 1, detail: row.detail === null ? null : String(row.detail) };
-  }
-
-  #recordStorageProbe(ok: boolean, detail: string | null): void {
+  /**
+   * Запись исхода тика + дедуп-флаг — БЕЗ ЕДИНОГО ЧТЕНИЯ прошлого состояния
+   * (находка ревью PR #587 к #575): SELECT по storage_probe падает ровно в
+   * том классе, ради которого алерт сделан — при исчерпании квоты rows_read
+   * отказывает «практически любой SELECT» (docs/research/20-cloudflare-free.md,
+   * #320), чтение прошлого исхода давало previous = null, и ⚠️-алерт уходил
+   * на КАЖДЫЙ тик до полуночного сброса — тот спам, который дедуп должен
+   * предотвращать. Поэтому решение о переходе несёт ИТОГ ЗАПИСИ: rowsWritten
+   * условного UPDATE (`WHERE alerted = 0` при аварии / `WHERE alerted = 1`
+   * при восстановлении) равен 1 только на ПЕРВОМ тике перехода, 0 — когда
+   * авария уже замечена (или не было). Возвращает rowsWritten этого UPDATE;
+   * «исход последнего тика» (ts/ok/detail) при этом свежий всегда.
+   *
+   * Честная оговорка: метринг rows_read у UPDATE Cloudflare не документирует
+   * (research/20 — не подтверждено). Если условный UPDATE тоже падает на
+   * исчерпании квоты, вызывающий (#tickStorageReadyAlert) получает исключение
+   * и пропускает алерт этого тика с громким логом — спамить нельзя, а догонит
+   * первый удавшийся тик: флаг останется 0, и тот тик увидит rowsWritten = 1.
+   */
+  #recordStorageProbe(ok: boolean, detail: string | null): number {
+    const now = Date.now();
+    // Строка обязана существовать ДО условного UPDATE: у него нет ветки INSERT,
+    // и на первом тике (пустая таблица) он иначе никогда не дал бы rowsWritten = 1.
     this.#sql.exec(
-      `INSERT INTO storage_probe (id, ts, ok, detail) VALUES (1, ?, ?, ?)
+      `INSERT INTO storage_probe (id, ts, ok, detail, alerted) VALUES (1, ?, ?, ?, 0)
        ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, ok = excluded.ok, detail = excluded.detail`,
-      Date.now(),
+      now,
       ok ? 1 : 0,
       detail,
     );
+    // Не трогает ts/ok/detail — их ведёт INSERT выше; меняет ТОЛЬКО дедуп-флаг,
+    // чтобы rowsWritten означал ровно «состояние флага перевернулось».
+    const cursor = ok
+      ? this.#sql.exec("UPDATE storage_probe SET alerted = 0 WHERE id = 1 AND alerted = 1")
+      : this.#sql.exec("UPDATE storage_probe SET alerted = 1 WHERE id = 1 AND alerted = 0");
+    return cursor.rowsWritten;
   }
 
   /**
@@ -1543,27 +1587,36 @@ export class Harness extends DurableObject<Env> {
    * владельца #470/#471 — новый канал не заводится) шлётся только на
    * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам раз в 15 минут,
    * пока квота не сбросится в 00:00 UTC.
+   *
+   * Дедуп перехода — по итогу ЗАПИСИ дедуп-флага (storageReadyAlertDecision),
+   * не по чтению прошлого исхода: при исчерпании rows_read (#320) падают
+   * все SELECT, включая чтение storage_probe — дедуп на чтении спамил бы
+   * каждый тик в том же предложении, которым обещает этого не делать
+   * (находка ревью PR #587). Если запись флага сама упала (класс deeper:
+   * исчерпание rows_written) — алерт этого тика пропускается с громким
+   * логом: без записанного флага «шлём/не шлём» решать не по чему, и молча
+   * пропустить один тик честнее, чем спамить; первый удавшийся тик догонит.
    */
   #tickStorageReadyAlert(): void {
-    let previous: { ok: boolean } | null = null;
-    try {
-      previous = this.#getStorageProbe();
-    } catch (error) {
-      console.error(`storage readiness: чтение прошлого исхода упало: ${error instanceof Error ? error.message : error}`);
-    }
     const result = this.#checkStorageReady();
+    let dedupRowsWritten: number | null = null;
     try {
-      this.#recordStorageProbe(result.ok, result.detail);
+      dedupRowsWritten = this.#recordStorageProbe(result.ok, result.detail);
     } catch (error) {
-      console.error(`storage readiness: запись исхода упала: ${error instanceof Error ? error.message : error}`);
+      console.error(
+        `storage readiness: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
     }
     if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
-    if (!result.ok && previous?.ok !== false) {
+    const decision = storageReadyAlertDecision(result.ok, dedupRowsWritten);
+    if (decision === "incident") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
         text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
       });
-    } else if (result.ok && previous?.ok === false) {
+    } else if (decision === "recovery") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
         text: "✅ Хранилище журнала снова отвечает",
