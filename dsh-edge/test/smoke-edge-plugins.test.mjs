@@ -37,6 +37,21 @@ export const edgePlugins = [
 ]
 `
 
+// Зеркальная сторона того же класса: import-строки остались в прод-форме
+// (регэксп извлечения импортов матчит обе), а форма ЗАПИСИ реестра уехала
+// (двойные кавычки вместо одинарных — например codegen стал эмитить через
+// JSON.stringify, а не литералом). renderServerModule эмитит import и запись
+// в одном цикле, поэтому «импорты есть, записей нет» в проде значит именно
+// это — дрейф формата записи, не «плагинов нет».
+const GENERATED_REGISTRY_FORMAT_DRIFT = `import p0 from '@deepseek-ai/dsh-plugin-a/server'
+import p1 from '@edge-harness/plugin-b/server'
+
+export const edgePlugins = [
+  { id: "plugin-a", plugin: p0 },
+  { id: "plugin-b", plugin: p1 },
+]
+`
+
 test('parseGeneratedModule читает реальную форму (два плагина, два импорта)', () => {
   const { imports, entries } = parseGeneratedModule(REAL_GENERATED)
   assert.equal(imports.size, 2)
@@ -63,6 +78,19 @@ test('classifyParsedModule: import-формат уехал, но записи р
   const classified = classifyParsedModule(parsed)
   assert.equal(classified.kind, 'import-format-drift')
   assert.equal(classified.entriesCount, 2)
+})
+
+// Прямая проверка фикса второго гейта: до фикса единственная проверка
+// `entries.length === 0` уходила в 'no-plugins' и печатала «плагинов нет —
+// деградация в апстримную сборку», хотя оба импорта прод-формы целы — два
+// реально сгенерированных плагина молча пропадали бы из дыма, exit 0.
+test('classifyParsedModule: форма записи реестра уехала, но импорты ЕСТЬ — не no-plugins', () => {
+  const parsed = parseGeneratedModule(GENERATED_REGISTRY_FORMAT_DRIFT)
+  assert.equal(parsed.imports.size, 2, 'фикстура обязана воспроизводить целые импорты прод-формы')
+  assert.equal(parsed.entries.length, 0, 'записи реестра не матчатся — именно это раньше терялось как no-plugins')
+  const classified = classifyParsedModule(parsed)
+  assert.equal(classified.kind, 'registry-format-drift')
+  assert.equal(classified.importsCount, 2)
 })
 
 test('classifyParsedModule: специфайер не найден для части записей — unknown-specifier', () => {

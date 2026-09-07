@@ -49,16 +49,29 @@ export function parseGeneratedModule(generated) {
 
 /**
  * Классифицирует результат parseGeneratedModule до любых дорогих шагов
- * (запись бутстрапа, spawn cordis). Два РАЗНЫХ условия, не один OR (класс
- * «тихий ноль», живая находка): реестр пуст (entries.length === 0) —
- * легитимное состояние «плагинов нет», дымить действительно нечего.
+ * (запись бутстрапа, spawn cordis). РАЗНЫЕ условия, не один OR (класс
+ * «тихий ноль», живая находка): реестр пуст И импортов нет
+ * (entries.length === 0 && imports.size === 0) — легитимное состояние
+ * «плагинов нет», дымить действительно нечего.
  * Импортов нет (imports.size === 0), но записи РЕЕСТРА ЕСТЬ — это НЕ
  * «плагинов нет», а формат import-строки (`import X from '...'`) разошёлся
  * с regex'ом: старый общий OR читал этот случай как первый и выходил ДО
  * проверки unknown, которая именно этот случай и ловит — плагины молча
  * пропадали бы из дыма при смене формы import-объявления, exit 0.
+ * Зеркальная сторона того же класса: записей реестра нет (entries.length
+ * === 0), но импорты ЕСТЬ (imports.size > 0) — codegen-edge-plugins.mjs
+ * эмитит import и запись `{ id: '...', plugin: X }` в одном цикле
+ * (renderServerModule), поэтому такое расхождение в проде означает, что
+ * regex записи реестра разошёлся с реальной формой (кавычки, лишнее поле,
+ * перенос строки) — это НЕ «плагинов нет», а registry-format-drift. Старый
+ * код читал этот случай как no-plugins (первая же проверка entries.length
+ * === 0) и молча уходил в exit 0, теряя реально сгенерированные плагины из
+ * дыма.
  */
 export function classifyParsedModule({ imports, entries }) {
+  if (entries.length === 0 && imports.size > 0) {
+    return { kind: 'registry-format-drift', importsCount: imports.size }
+  }
   if (entries.length === 0) {
     return { kind: 'no-plugins' }
   }
@@ -96,6 +109,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (classified.kind === 'no-plugins') {
     console.log('smoke-edge-plugins: серверных плагинов нет — деградация в апстримную сборку, дымить нечего')
     process.exit(0)
+  }
+  if (classified.kind === 'registry-format-drift') {
+    process.stderr.write(`smoke-edge-plugins: сгенерированный модуль несёт ${classified.importsCount} import(ов), но НИ ОДНОЙ записи реестра — форма '{ id: \\'...\\', plugin: X }' разошлась с regex'ом извлечения записей, кодогенератор менял форму? Бросить громко.\n`)
+    process.exit(2)
   }
   if (classified.kind === 'import-format-drift') {
     process.stderr.write(`smoke-edge-plugins: сгенерированный модуль несёт ${classified.entriesCount} запись(ей) реестра, но НИ ОДНОГО import — форма 'import X from \\'...\\'' разошлась с regex'ом извлечения импортов, кодогенератор менял форму? Бросить громко.\n`)
