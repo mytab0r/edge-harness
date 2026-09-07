@@ -294,8 +294,15 @@ describe('provider-registry: негатив — мусор не проходит
     const ctx = new Context();
     await ctx.plugin(LlmRuntime);
     await ctx.plugin(MemorySettingsProvider);
+    // Стаб запоминает аргумент: контракт формата ссылки обязан быть закреплён
+    // тестом (находка ревью PR #453) — сервер зовёт resolve РОВНО с apiKeyEnv
+    // из профиля, никакой деривации имени ссылки на сервере нет.
+    const resolvedRefs = [];
     await ctx.effect(() => ctx.provide('credentials', {
-      resolve: async () => ({ value: 'stored-dummy-key-1234567890' }),
+      resolve: async (ref) => {
+        resolvedRefs.push(ref);
+        return { value: 'stored-dummy-key-1234567890' };
+      },
     }), 'fixture credentials');
     await ctx.plugin(plugin);
     await ctx.settings.mutate('llm-pi-ai', [
@@ -310,6 +317,8 @@ describe('provider-registry: негатив — мусор не проходит
     assert.equal(terminal.reason.kind, 'error');
     assert.notEqual(terminal.reason.failure.code, 'MISSING_CREDENTIAL');
     assert.doesNotMatch(terminal.reason.failure.message, /нет API-ключа/);
+    assert.deepEqual(resolvedRefs, ['ZHIPU_API_KEY'],
+      `credentials.resolve звали с ${JSON.stringify(resolvedRefs)} — ожидался ровно apiKeyEnv профиля без деривации`);
   });
 
   it('ход без ключа падает громко MISSING_CREDENTIAL, не молча (сеть не вызывается)', async () => {

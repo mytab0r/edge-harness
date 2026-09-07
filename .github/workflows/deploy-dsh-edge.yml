@@ -777,7 +777,10 @@ jobs:
           official_active=$(jq -r '.result.value.providers[] | select(.provider == "deepseek-official") | .active' \
             "$RUNNER_TEMP/registry-providers.json")
           [ "$official_active" = "true" ] || { echo "::error::Штатный провайдер deepseek-official не активен на проде — селектор моделей сломан"; exit 1; }
-          echo "✅ реестр #378 жив на проде: namespace llm-pi-ai смонтирован, directory содержит штатного и 4 готовых маршрута"
+          # Число маршрутов считается из той же переменной routes (штатный +
+          # каталог directory.json), не захардкожено: расширение каталога не
+          # должно заставить канарейку соврать в итоговой строке.
+          echo "✅ реестр #378 жив на проде: namespace llm-pi-ai смонтирован, directory содержит $(( $(wc -w <<<"$routes") )) маршрутов (штатный + готовые)"
 
       # e2e generic browser smoke (#502): владелец нашёл руками то, чего не
       # находит ни один прежний тест — раздел Settings → Integrations месяцами

@@ -4,6 +4,32 @@
 работающими кнопки добавления провайдера в штатном **Settings → Models**
 морды dsh-edge без десктопных конфиг-файлов и без передеплоя.
 
+## Пересборка tarball
+
+```bash
+cd plugins-src/provider-registry
+node --check server/index.js            # синтаксис
+node --test test/registry.test.mjs      # монтирование, негатив при записи, рестарт DO
+npm pack                                # edge-harness-dsh-plugin-provider-registry-0.1.1.tgz
+cp edge-harness-dsh-plugin-provider-registry-0.1.1.tgz provider-registry-0.1.1.tgz
+sha256sum provider-registry-0.1.1.tgz
+```
+
+Публикация (по образцу runner-bridge): релиз **этого** репозитория с тегом
+`plugins-registry-v0.1.1` и asset'ом `provider-registry-0.1.1.tgz` (то же
+содержимое, что у npm-pack'а, имя asset'а фиксирует манифест):
+
+```bash
+gh release create plugins-registry-v0.1.1 provider-registry-0.1.1.tgz \
+  --title "plugins-registry-v0.1.1 — provider-registry: реестр провайдеров морды (#378)" \
+  --notes "Серверный плагин реестра: settings-namespace llm-pi-ai со схемой providers.<route-id>, directory готовых OpenAI-compat маршрутов, один DeepSeekAdapter на настроенный маршрут; ключи — только именами credential-ссылок."
+```
+
+Новый sha256 вписывается в `dsh-edge/plugins.json` (запись
+`provider-registry`, поле `source`: `release`/`asset`/`sha256`) — только PR,
+merge = аппрув владельца. Бамп версии — правка `version` в package.json +
+новый тег/asset с той же цифрой в имени.
+
 ## Как это работает
 
 На десктопе управлением провайдерами занимается пакет `dsh-llm-pi-ai`, который
