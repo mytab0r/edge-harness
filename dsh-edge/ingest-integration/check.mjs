@@ -47,10 +47,15 @@ const persistedState = mkdtempSync(join(tmpdir(), 'dsh-edge-ingest-check-'))
 // mismatch (deploy-dsh-edge.yml repoints the compiled model catalog to
 // vars.DSH_EDGE_MODEL_CATALOG, glm-* here, AFTER this literal is baked into
 // the bundle) go unnoticed by this test for the whole time #572 was live.
-// Pinned to the repo's actual `gh variable list` value so this check's
-// config shape matches what deploy-dsh-edge.yml actually ships, not a
-// same-as-upstream-default stand-in.
-const DEPLOYED_MODEL = 'glm-5.3-flash'
+// One source of truth: the workflow step passes the repo's actual
+// vars.DEEPSEEK_MODEL through this env var (deploy-dsh-edge.yml, "Интеграция
+// ingest-шва на собранном артефакте"), so this file does not carry its own
+// hardcoded second copy of that value. The literal below is a fallback ONLY
+// for running this script directly (outside the workflow, e.g. locally
+// against a manual clone) — kept in sync with `gh variable list` by eye, not
+// by code, which is exactly the drift class this env var plumb-through avoids
+// for the path that actually gates a deploy.
+const DEPLOYED_MODEL = process.env.DSH_EDGE_CHECK_MODEL || 'glm-5.3-flash'
 const worker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
   config: writeConfig(persistedState),
   env: '',
@@ -192,10 +197,25 @@ try {
     body: JSON.stringify(batch1),
   })
   // #572: this 200 is now asserted with vars.DEEPSEEK_MODEL set to the
-  // deployment's real model id (DEPLOYED_MODEL, not the upstream default) —
-  // appendHarnessEvents used to hand agent bootstrap the upstream literal
-  // regardless of what the deployment actually serves; it now resolves the
-  // session's own recorded model instead (session-store.ts::appendHarnessEvents).
+  // deployment's real model id (DEPLOYED_MODEL, not the upstream default).
+  // Precisely what changed: appendHarnessEvents used to pass the upstream
+  // literal DEFAULT_EDGE_MODEL to modelSelection() regardless of deployment —
+  // for a fresh session (the case here) that literal reached
+  // defaultModelSelection() UNCHANGED (modelSelection()'s own pending/bridge/
+  // live-agent/logged chain never resolves anything for a session that never
+  // ran a native turn), so the literal WAS the bootstrap argument, a no-op
+  // fix. It now passes `agentDefaultModel.currentSelection().model` — the
+  // same deployment default the session store itself resolves at startup
+  // from DEEPSEEK_MODEL (session-store.ts::initialize) — so this 200 is
+  // reached with DEPLOYED_MODEL actually flowing into openAgentForTurn, not
+  // the stale upstream id. This assertion does NOT prove the #572 500's root
+  // cause was the model id: dsh-llm-deepseek's own modelInfoFor tolerates an
+  // unknown id by synthesizing a fallback ModelInfo (checked directly against
+  // the pinned 0.1.2-rc.1), and dsh-edge never passes a custom model catalog
+  // to that adapter in the first place — so a real deployed glm-* id and the
+  // stale deepseek-v4-flash literal are equally "unknown" to it. What this
+  // 200 DOES prove: ingest no longer bootstraps with an id that is wrong by
+  // construction for this deployment, whatever the actual #572 trigger was.
   assert.equal(ing1.response.status, 200, 'ingest батча 1: HTTP 200')
   assert.equal(ing1.body.appended, 6, 'ingest батча 1: appended=6')
 
@@ -255,4 +275,141 @@ try {
   console.log('INGEST-CHECK OK: батчи, перенумерация turn, 400 на чужой тип, replay, список, архив')
 } finally {
   await worker.stop()
+}
+
+// ── Сломанный бутстрап (М2, второй гейт PR #647) ────────────────────────────
+// Второй, независимый воркер: намеренно БЕЗ DEEPSEEK_API_KEY (не пустая
+// строка — переменная отсутствует целиком), чтобы явно проверить половину
+// требования, которую сценарий выше проверяет только неявно (dummy-ключ
+// 'ingest-check-unused' — тоже валидный непустой JS-string, формально не
+// доказывающий «сеть не нужна вообще»): appendHarnessEvents не должен
+// требовать провайдера по сети — ingest никогда не запускает агент-цикл
+// (session-store.ts::appendHarnessEvents, docblock «Ingest never runs the
+// agent»), поэтому даже полное отсутствие ключа не имеет права уронить его.
+//
+// Честная граница (М2 гейта: «зафиксируй как факт результата прогона, а не
+// предположение» — ниже как раз предположение, не прогон, и это прямо
+// сказано, а не выдано за то и другое разом): классифицирующие ветки самого
+// патча — 503 AGENT_UNAVAILABLE (session-store.ts::appendHarnessEvents catch)
+// и общий fallback `internal`+`detail` (http.ts::errorResponse) — этим файлом
+// НЕ упражняются ни одним сценарием. Обе кандидатные «сломать бутстрап»
+// ручки, что предлагает ревью, прослежены по исходнику апстрима на пине
+// 0.11.1 (не выполнено вживую — см. ниже) и НЕ доходят до этих веток:
+//   - отсутствующий/мусорный DEEPSEEK_API_KEY: readDeepSeekApiKey — ленивый
+//     геттер (instance.ts), резолвится только внутри реального сетевого
+//     вызова провайдера (dsh-llm-deepseek::resolveApiKey, вызывается из
+//     stream()/request()); ingest его не достигает — отсюда и это assert.
+//   - синтаксически валидный, но семантически левый DEEPSEEK_MODEL:
+//     resolveEdgeModel (deepseek.ts) не бросает ни на чём, что проходит
+//     MODEL_PATTERN; dsh-llm-deepseek::modelInfoFor тоже не бросает на
+//     неизвестном id (см. комментарий выше); а синтаксически НЕВАЛИДНЫЙ id
+//     (пробел, пустая строка) бросает СИНХРОННО в конструкторе DshEdgeInstance
+//     (instance.ts: `private readonly model = resolveEdgeModel(...)`) —
+//     роняя ЛЮБОЙ маршрут инстанса, не только ingest, и не через
+//     errorResponse вообще (исключение конструктора DO), так что это не
+//     проба классификации, а другой, более грубый баг.
+// Ни один найденный рычаг конфигурации не воспроизводит AGENT_UNAVAILABLE
+// без доступа к @deepseek-ai/dsh-agent-loop (не вендорится в этом репо).
+// Живой прогон этого файла на собранном артефакте (единственный способ
+// проверить факт, а не предположение) не выполнен в рамках этой правки —
+// см. отчёт агента при PR #647: сеть песочницы не доводит `pnpm add` этого
+// standalone-воркспейса до конца (устойчивый ETIMEDOUT на большинстве
+// @deepseek-ai/* таболов npm registry, два прогона подряд). Следующее
+// реальное свидетельство — первый прогон deploy-dsh-edge.yml после мержа
+// (тот же шаг «Интеграция ingest-шва на собранном артефакте», в CI с
+// нормальной пропускной способностью) — красный шаг там перед деплоем
+// не пропустит клейм этого комментария, если он неверен.
+{
+  const NO_KEY_ACCESS_KEY = ['ingest-check-nokey', 'owner', 'access', 'key-0123456789abcdef'].join('-')
+  const noKeyState = mkdtempSync(join(tmpdir(), 'dsh-edge-ingest-check-nokey-'))
+  const noKeyWorker = await unstable_dev(join(standaloneDir, 'worker', 'direct', 'index.js'), {
+    config: writeConfig(noKeyState),
+    env: '',
+    persistTo: noKeyState,
+    vars: {
+      // DEEPSEEK_API_KEY отсутствует НАМЕРЕННО — см. комментарий выше.
+      DEEPSEEK_MODEL: DEPLOYED_MODEL,
+      DSH_EDGE_ACCESS_KEY: NO_KEY_ACCESS_KEY,
+    },
+    logLevel: 'warn',
+    experimental: { disableExperimentalWarning: true, showInteractiveDevSession: false, watch: false },
+  })
+  try {
+    const origin = `http://${noKeyWorker.address}:${noKeyWorker.port}`
+    let noKeyReady = false
+    let noKeyHealthBody = ''
+    const startedAt = Date.now()
+    for (let attempt = 1; Date.now() - startedAt < READINESS_DEADLINE_MS; attempt += 1) {
+      try {
+        const probe = await fetch(`${origin}/api/health`, { signal: AbortSignal.timeout(5_000) })
+        noKeyHealthBody = (await probe.text()).slice(0, 400)
+        if (probe.status === 200 && JSON.parse(noKeyHealthBody || '{}').ok === true) { noKeyReady = true; break }
+      } catch (error) {
+        console.log(`ingest-check(no-key): попытка ${attempt}: /api/health недоступна (${error?.cause?.code ?? error?.message})`)
+      }
+      await new Promise(resolve => setTimeout(resolve, READINESS_STEP_MS))
+    }
+    assert.ok(noKeyReady, `воркер без DEEPSEEK_API_KEY не ответил 200 ok от /api/health; последний ответ: ${noKeyHealthBody}`)
+
+    let noKeyCookie
+    let login
+    for (let attempt = 1; ; attempt += 1) {
+      login = await fetch(`${origin}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ accessKey: NO_KEY_ACCESS_KEY }).toString(),
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (login.status === 303) break
+      if (attempt >= 3) break
+      await new Promise(resolve => setTimeout(resolve, 2_000))
+    }
+    assert.equal(login.status, 303, 'логин владельца (no-key воркер)')
+    noKeyCookie = login.headers.get('set-cookie')?.split(';', 1)[0]
+    const noKeyRequest = (path, init) => {
+      const headers = new Headers(init?.headers)
+      if (noKeyCookie !== undefined) headers.set('cookie', noKeyCookie)
+      return fetch(`${origin}${path}`, { ...init, headers })
+    }
+    const noKeyRpc = async (method, payload) => {
+      const response = await noKeyRequest(`/api/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method, payload }),
+      })
+      return (await response.json()).result
+    }
+
+    const ws = await noKeyRpc('workspace.create', { path: '/workspace/edge-harness' })
+    assert.equal(ws.ok, true, 'workspace.create (no-key воркер)')
+    const workspaceId = ws.value.workspace.workspaceId
+    const sid = 'ingest-check-nokey'
+    const created = await noKeyRpc('session.create', { workspaceId, sessionId: sid })
+    assert.equal(created.ok, true, 'session.create (no-key воркер)')
+
+    const batch = { events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'без ключа' }], source: { kind: 'user' } } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ] }
+    const ing = await noKeyRequest(`/api/sessions/${sid}/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(batch),
+    })
+    const ingBody = await ing.json()
+    // Факт, а не предположение, В ПРЕДЕЛАХ этого сценария: без единого
+    // байта ключа провайдера ingest всё равно принимает батч — «ingest не
+    // звонит провайдеру по сети» доказано сильнее, чем dummy-ключом выше.
+    assert.equal(
+      ing.status, 200,
+      `ingest без DEEPSEEK_API_KEY: ожидался HTTP 200 (ingest не должен требовать сеть) ` +
+      `— получено ${ing.status} ${JSON.stringify(ingBody)}`,
+    )
+    assert.equal(ingBody.appended, 3, 'ingest без DEEPSEEK_API_KEY: appended=3')
+    console.log('INGEST-CHECK(no-key) OK: ingest не требует DEEPSEEK_API_KEY — провайдер по сети не вызывается')
+  } finally {
+    await noKeyWorker.stop()
+  }
 }

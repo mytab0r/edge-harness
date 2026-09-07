@@ -140,7 +140,7 @@ index c9b5b95..3ee648d 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index cfff36a..9f69b19 100644
+index cfff36a..be11683 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
 @@ -19,7 +19,7 @@ import type {
@@ -172,7 +172,7 @@ index cfff36a..9f69b19 100644
      message: string,
    ) {
      super(message)
-@@ -1265,6 +1276,101 @@ export class EdgeSessionStore {
+@@ -1265,6 +1276,117 @@ export class EdgeSessionStore {
      }
    }
  
@@ -202,26 +202,42 @@ index cfff36a..9f69b19 100644
 +    // createSession/createBlankSession/renameSession above all go through the
 +    // same agents.create/resume; docs/research/12-dsh-edge-session-api.md
 +    // ("Чего в dsh-edge НЕТ") already found this. openAgentForTurn cannot be
-+    // dropped here. What CAN be fixed: this call used to pass the upstream
-+    // literal DEFAULT_EDGE_MODEL ('deepseek-v4-flash'). CONFIRMED stale in
-+    // this deployment: deploy-dsh-edge.yml ("Патч каталога моделей под
-+    // реального провайдера") rewrites the compiled @deepseek-ai/dsh-llm-deepseek
-+    // DEFAULT_MODELS array (source: that package's own catalog literal,
-+    // `[{id:"deepseek-v4-flash",...}]`) to the deployment's real glm-* catalog
-+    // AFTER build — DEFAULT_EDGE_MODEL is a source-level TypeScript constant,
-+    // untouched by that step, so it names a model id absent from the catalog
-+    // actually registered at runtime. NOT confirmed: whether that mismatch is
-+    // what throws during agents.resume — dsh-llm-deepseek's own modelInfoFor
-+    // (checked directly, npm 0.1.1-rc.2) tolerates an unknown id by
++    // dropped here. What CAN be fixed: the second argument here is not a
++    // fallback that only matters "if nothing else resolves" — for the common
++    // ingest case (a runner/harness-N session created fresh for this batch,
++    // never resumed for a native turn) modelSelection()'s own chain
++    // (agentPending → bridge → live-agent request/header → persisted log)
++    // finds nothing, because ingest never runs `selectModel` or a native turn
++    // that would populate any of those; it falls straight through to
++    // `persistence.readBlankSession(id) !== undefined` and returns
++    // `defaultModelSelection(defaultModel)` — this argument, verbatim. Passing
++    // the upstream literal DEFAULT_EDGE_MODEL ('deepseek-v4-flash') here was a
++    // no-op fix: it is byte-for-byte the same id the unpatched code already
++    // passed down this exact branch. CONFIRMED stale in this deployment:
++    // deploy-dsh-edge.yml ("Патч каталога моделей под реального провайдера")
++    // rewrites the compiled @deepseek-ai/dsh-llm-deepseek DEFAULT_MODELS array
++    // (source: that package's own catalog literal, `[{id:"deepseek-v4-flash",
++    // ...}]`) to the deployment's real glm-* catalog AFTER build —
++    // DEFAULT_EDGE_MODEL is a source-level TypeScript constant, untouched by
++    // that step, so it never names a model id present in the catalog actually
++    // registered at runtime, for ANY ingest session, blank or not. Use the
++    // deployment's real default instead: `agentDefaultModel` (registered a few
++    // hundred lines up in `initialize()`) already resolves it once at startup
++    // via `resolveEdgeModel(config.model)` off the deployed `DEEPSEEK_MODEL`
++    // (or a persisted settings override) — the same source upstream's own
++    // SessionController reads. NOT confirmed: whether the stale-catalog
++    // mismatch is what throws during agents.resume — dsh-llm-deepseek's own
++    // modelInfoFor (checked directly, npm 0.1.2-rc.1, the version actually
++    // pinned in apps/dsh-edge/package.json) tolerates an unknown id by
 +    // synthesizing a fallback ModelInfo instead of throwing, so the mismatch
 +    // alone may not be sufficient; the actual bootstrap factory
 +    // (@deepseek-ai/dsh-agent-loop, registered onto AgentRegistry) is not
 +    // vendored anywhere in this repo and was not available to inspect. Either
-+    // way this mismatch is real and worth not shipping: a target session that
-+    // already ran turns has its own resolved model on record, always a model
-+    // id present in the real deployed catalog — use that instead of the
-+    // stale literal.
-+    const selection = await this.modelSelection(id, DEFAULT_EDGE_MODEL)
++    // way this mismatch was real and is worth not shipping regardless of
++    // whether it is THE trigger: an id absent from the deployed catalog has no
++    // business being the thing ingest bootstraps with when a correct default
++    // is one property read away.
++    const selection = await this.modelSelection(id, this.context.agentDefaultModel.currentSelection().model)
 +    let handle: AgentHandle
 +    try {
 +      handle = await this.openAgentForTurn(id, selection.model)
@@ -274,7 +290,7 @@ index cfff36a..9f69b19 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1602,72 @@ export class EdgeSessionStore {
+@@ -1496,6 +1618,72 @@ export class EdgeSessionStore {
    }
  }
  
