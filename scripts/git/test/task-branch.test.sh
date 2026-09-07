@@ -146,7 +146,7 @@ run_task_branch() {
     # выполняется внутри настоящего GitHub Actions job, переменная
     # GITHUB_ACTIONS=true уже стоит в окружении и наследовалась бы сюда,
     # заставляя task-branch взять CI-ветку поведения по ошибочной причине.
-    env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" "$task"
+    env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" "$task"
   )
 }
 
@@ -369,7 +369,7 @@ new_origin() {
 new_origin "a"
 git clone -q --branch main "$WORK/a-origin.git" "$WORK/a-main" 2>/dev/null
 
-(cd "$WORK/a-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-demo-slug) \
+(cd "$WORK/a-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-demo-slug) \
   >"$WORK/a-run1.out" 2>&1 || { fail=1; note "run1 упал:"; cat "$WORK/a-run1.out"; }
 
 # Путь берём из самого git (worktree list), а не собираем строкой сами: на
@@ -400,7 +400,7 @@ else
 fi
 
 before_count=$(git -C "$WORK/a-main" worktree list --porcelain | grep -c '^worktree ')
-(cd "$WORK/a-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-demo-slug) \
+(cd "$WORK/a-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-demo-slug) \
   >"$WORK/a-run2.out" 2>&1 || { fail=1; note "run2 (повтор) упал:"; cat "$WORK/a-run2.out"; }
 after_count=$(git -C "$WORK/a-main" worktree list --porcelain | grep -c '^worktree ')
 if [ "$before_count" = "$after_count" ] && grep -qF "$expected_wt" "$WORK/a-run2.out"; then
@@ -481,12 +481,12 @@ foreign_move() {
 # ── случай 12: подвинутая ветка — переиспользование отказывает ──────────────
 new_origin "d"
 git clone -q --branch main "$WORK/d-origin.git" "$WORK/d-main" 2>/dev/null
-(cd "$WORK/d-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
+(cd "$WORK/d-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
   >"$WORK/d-run1.out" 2>&1 || { fail=1; note "случай 12: run1 упал:"; cat "$WORK/d-run1.out"; }
 git -C "$WORK/d-main" push -q origin agent/67-sync-reuse
 foreign_move "$WORK/d-rival" agent/67-sync-reuse "d-origin.git"
 git -C "$WORK/d-main" fetch -q origin
-if (cd "$WORK/d-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
+if (cd "$WORK/d-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-reuse) \
   >"$WORK/d-run2.out" 2>"$WORK/d-run2.stderr"; then
   note "случай 12 (ветка подвинута другим каналом): переиспользование прошло — ОШИБКА, ожидался отказ"
   fail=1
@@ -500,7 +500,7 @@ fi
 # ── случай 13: та же сверка на пути усыновления (дерево пропало с диска) ────
 new_origin "e"
 git clone -q --branch main "$WORK/e-origin.git" "$WORK/e-main" 2>/dev/null
-(cd "$WORK/e-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
+(cd "$WORK/e-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
   >"$WORK/e-run1.out" 2>&1 || { fail=1; note "случай 13: run1 упал:"; cat "$WORK/e-run1.out"; }
 git -C "$WORK/e-main" push -q origin agent/67-sync-adopt
 foreign_move "$WORK/e-rival" agent/67-sync-adopt "e-origin.git"
@@ -509,7 +509,7 @@ foreign_move "$WORK/e-rival" agent/67-sync-adopt "e-origin.git"
 rm -rf "$WORK/e-main/.claude/worktrees/67-sync-adopt"
 git -C "$WORK/e-main" worktree prune
 git -C "$WORK/e-main" fetch -q origin
-if (cd "$WORK/e-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
+if (cd "$WORK/e-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-sync-adopt) \
   >"$WORK/e-run2.out" 2>"$WORK/e-run2.stderr"; then
   note "случай 13 (усыновление подвинутой ветки): прошло — ОШИБКА, ожидался отказ"
   fail=1
@@ -523,7 +523,7 @@ fi
 # ── случай 14: свои незапушенные коммиты — переиспользование работает ───────
 new_origin "f"
 git clone -q --branch main "$WORK/f-origin.git" "$WORK/f-main" 2>/dev/null
-(cd "$WORK/f-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
+(cd "$WORK/f-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
   >"$WORK/f-run1.out" 2>&1 || { fail=1; note "случай 14: run1 упал:"; cat "$WORK/f-run1.out"; }
 ahead_wt=$(git -C "$WORK/f-main" worktree list --porcelain \
   | awk '/^worktree /{p=$2} /^branch refs\/heads\/agent\/67-ahead$/{print p}')
@@ -535,7 +535,7 @@ ahead_wt=$(git -C "$WORK/f-main" worktree list --porcelain \
   git add own.txt
   env -u GITHUB_ACTIONS git commit -q -m "own unpushed work"
 )
-if (cd "$WORK/f-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
+if (cd "$WORK/f-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-ahead) \
   >"$WORK/f-run2.out" 2>&1 && grep -qF "$ahead_wt" "$WORK/f-run2.out"; then
   note "случай 14 (свои незапушенные коммиты): дерево переиспользовано, путь напечатан — ОК"
 else
@@ -565,7 +565,7 @@ git clone -q "$WORK/g-origin.git" "$WORK/g-first" 2>/dev/null
   git push -q origin agent/67-origin-adopt
 )
 remote_head=$(git -C "$WORK/g-main" ls-remote origin refs/heads/agent/67-origin-adopt | cut -f1)
-if (cd "$WORK/g-main" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-origin-adopt) \
+if (cd "$WORK/g-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 67-origin-adopt) \
   >"$WORK/g-run.out" 2>"$WORK/g-run.stderr"; then
   adopt_wt=$(git -C "$WORK/g-main" worktree list --porcelain \
     | awk '/^worktree /{p=$2} /^branch refs\/heads\/agent\/67-origin-adopt$/{print p}')
@@ -584,6 +584,54 @@ else
   note "случай 15 (ветка только на origin): task-branch отказал — ОШИБКА, ожидалось усыновление"
   cat "$WORK/g-run.stderr" >&2
   fail=1
+fi
+
+# ── случай 16: легаси-имя дерева — отказ с переносом, не вечный цикл ────────
+# Дерево «246-legacy» закреплено за веткой agent/61-x: путь переиспользования,
+# не сверяющий имя с правилом <N>-, замыкает цикл «гвардия шлёт в task-branch,
+# task-branch печатает то же дерево, гвардия снова отклоняет» (находка ревью
+# #333, раунд 4, репро на состоянии из задачи: 246-lease-claim / agent/121).
+# Мутация: сними сверку имени в пути переиспользования — случай 16 перестаёт
+# отклоняться, тест красный.
+new_origin "h"
+git clone -q --branch main "$WORK/h-origin.git" "$WORK/h-main" 2>/dev/null
+mkdir -p "$WORK/h-main/.claude/worktrees"
+git -C "$WORK/h-main" worktree add -q -b agent/61-x "$WORK/h-main/.claude/worktrees/246-legacy" origin/main
+if (cd "$WORK/h-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 61-x) \
+  >"$WORK/h-run.out" 2>"$WORK/h-run.stderr"; then
+  note "случай 16 (легаси-имя дерева): путь напечатан — ОШИБКА, ожидался отказ с командой переноса"
+  fail=1
+else
+  case "$(cat "$WORK/h-run.stderr")" in
+    *"не начинается с «61-»"*"worktree move"*) note "случай 16 (легаси-имя дерева): отказ с рабочей командой git worktree move — ОК" ;;
+    *) note "случай 16: отказ без внятной причины или без команды переноса — ОШИБКА ($(cat "$WORK/h-run.stderr"))"; fail=1 ;;
+  esac
+fi
+
+# ── случай 17: путь дерева занят — отказ ДО claim'а, без осиротевшей ветки ──
+# Канонический путь .claude/worktrees/61-occupied занят деревом на чужой
+# ветке (легаси-имя с числовым префиксом делает такую коллизию вероятной),
+# ветки agent/61-occupied нет нигде: падение сквозь claim на сыром
+# `git worktree add` захватывало аренду и оставляло висеть свежесозданную
+# ветку (класс #360; находка ревью #333, раунд 4, живое репро). Мутация:
+# сними проверку [ -e "$wt_dir" ] — ветка agent/61-occupied появляется,
+# тест красный.
+new_origin "i"
+git clone -q --branch main "$WORK/i-origin.git" "$WORK/i-main" 2>/dev/null
+mkdir -p "$WORK/i-main/.claude/worktrees"
+git -C "$WORK/i-main" worktree add -q -b agent/121-other "$WORK/i-main/.claude/worktrees/61-occupied" origin/main
+(cd "$WORK/i-main" && env -u GITHUB_ACTIONS -u LEASE_ALREADY_CLAIMED PATH="$WORK/bin:$PATH" bash "$SCRIPT_SRC" 61-occupied) \
+  >"$WORK/i-run.out" 2>"$WORK/i-run.stderr" \
+  && { note "случай 17 (путь занят): скрипт прошёл — ОШИБКА, ожидался отказ"; fail=1; }
+case "$(cat "$WORK/i-run.stderr")" in
+  *"занят (не пуст)"*) note "случай 17 (путь занят): отказ с объяснением и лечением — ОК" ;;
+  *) note "случай 17: отказ без внятной причины — ОШИБКА ($(cat "$WORK/i-run.stderr"))"; fail=1 ;;
+esac
+if git -C "$WORK/i-main" show-ref --verify -q refs/heads/agent/61-occupied; then
+  note "случай 17: ветка всё же создана (осиротевшая, класс #360) — ОШИБКА"
+  fail=1
+else
+  note "случай 17: ветка не создавалась — осиротевших не осталось — ОК"
 fi
 
 if [ "$fail" = 0 ]; then
