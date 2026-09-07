@@ -139,12 +139,11 @@ issue #120), что и у остальных предохранителей ре
 уже заведена отдельная задача #637, здесь не решается).
 
 `gate_main()` при КАЖДОМ прогоне вызывает `last_real_measurement_age_minutes`
-с окном `MEASUREMENT_STALE_MINUTES` (45 = 3×`CHECK_INTERVAL_MINUTES`, тот
-же приём кратности, что `pulse_guard.HEARTBEAT_MAX_AGE_MINUTES` = 3×15 у
-пульса оркестратора). Не нашлось ни одного реального замера в этом окне —
-`stale_alert` шлёт сигнал, но не на каждый тик: дедуп — эпизодный, тот же
-приём (`STALE_MARKER`/`STALE_RESOLVED_MARKER` + `pulse_guard.
-episode_reopened`), что `pulse_guard.heartbeat_check` уже использует для
+с окном `HISTORY_LOOKBACK_MINUTES` (не `MEASUREMENT_STALE_MINUTES` — см.
+следующий раздел, «Простой vs холодный старт», found: PR #607 разбудил
+владельца ложным сигналом). Дедуп эскалации — эпизодный, тот же приём
+(`STALE_MARKER`/`STALE_RESOLVED_MARKER` + `pulse_guard.episode_reopened`),
+что `pulse_guard.heartbeat_check` уже использует для
 `HEARTBEAT_NO_TICKS_MARKER`/`HEARTBEAT_TICKS_RESUMED_MARKER` — один сигнал
 на эпизод простоя, не на каждые 15 минут, пока эпизод держится; явное
 закрытие эпизода (`close_stale_episode_if_needed`), как только замер снова
@@ -154,11 +153,78 @@ episode_reopened`), что `pulse_guard.heartbeat_check` уже использу
 транзитный сбой инструмента был бы хуже пропуска: сигнал в этом случае
 только предупреждение в лог прогона, а не эскалация.
 
+### Простой vs холодный старт, и неслитый код не будит владельца (found: ревью PR #607)
+
+PR #607 сам поймал живой дефект своего же первого варианта: свежеоткрытый
+PR (ветка `agent/605-quota-continuous-watch`, workflow ещё НЕ на `main`)
+разбудил владельца в Telegram сообщением, которое гадало о причине —
+«гейт троттлит без причины, workflow не запускается вовсе, либо шаг замера
+падает раньше вызова Cloudflare». Три отдельных дефекта, три отдельных фикса:
+
+1. **«Простаивает» ≠ «ни разу не запускался».** Старая проверка звала
+   `last_real_measurement_age_minutes` с окном `MEASUREMENT_STALE_MINUTES`
+   (45 мин) и трактовала ЛЮБОЙ `age is None` (реального замера в окне не
+   найдено) как простой — в том числе на САМОМ ПЕРВОМ прогоне НОВОГО
+   workflow, у которого просто ещё нет истории. Правильная семантика:
+   тревожить на ПЕРЕХОДЕ «измерял → перестал», не на отсутствии замера
+   вообще (тот же принцип, что `quota_alert.check_and_alert` уже применяет к
+   переходу ok/breach — первое наблюдение, заставшее ресурс уже в норме, не
+   генерирует ложное «восстановилось»). Реализация: `gate_main` зовёт
+   `last_real_measurement_age_minutes` с окном `HISTORY_LOOKBACK_MINUTES`
+   (7 дней, практически «вся видимая история» — реальный потолок всё равно
+   даёт `MEASUREMENT_SCAN_PER_PAGE`, одна страница прогонов) вместо 45 минут,
+   и различает ТРИ исхода по одному и тому же `age`:
+   - `age is None` — реального замера не было НИ РАЗУ в видимой истории —
+     ХОЛОДНЫЙ СТАРТ, не простой. Решение — МОЛЧАТЬ (не отдельное сообщение):
+     заводить третий канал/маркер под редкий и уже покрытый CI-тестом класс
+     («имена шагов разъехались» ловит `test_workflow_step_names_match_
+     constants` ДО мержа) избыточно по цене (Меньше кода); отдельно, гейт
+     сам работает без `if:` и обязан выполниться в КАЖДОМ прогоне — если
+     когда-нибудь мониторинг действительно не заработает НИ РАЗУ за 7 дней
+     видимой истории на `main`, это уже не «холодный старт», а `age`
+     перестаёт быть None (см. следующий пункт) и сигнал уйдёт как обычный
+     переход. Единственный процентно-непокрытый остаток — гипотетический
+     «замер никогда не проходил вообще, даже один раз, дольше 7 дней при
+     непрерывной активности репозитория» — не проверено живым инцидентом,
+     честно вынесено в раздел «Осталось непроверенным» тестового файла.
+   - `age < MEASUREMENT_STALE_MINUTES` — замер свежий, троттлинг делает своё
+     дело, `close_stale_episode_if_needed` закрывает эпизод, если он был
+     открыт.
+   - `age >= MEASUREMENT_STALE_MINUTES` — замер БЫЛ (найден где-то в
+     видимой истории), но давно — настоящий ПЕРЕХОД «измерял → перестал».
+     Именно этот и только этот случай — кандидат на эскалацию.
+2. **Неслитый код не может разбудить владельца.** Кандидат на эскалацию
+   (переход выше) уходит, только если `running_workflow_matches_main`
+   подтвердила: исполняемая ПРЯМО СЕЙЧАС копия `.github/workflows/
+   quota-watch.yml` побайтово совпадает с версией на `main`. Любой другой
+   исход (файла на `main` вовсе нет — PR не слит; содержимое отличается —
+   PR правит именно этот файл; сеть/права не позволили сравнить) —
+   консервативный дефолт «не эскалировать». Почему не проверка
+   `github.event.pull_request.head.repo.full_name != github.repository`
+   (форк): живой инцидент был прогоном ИЗ ВЕТКИ ТОГО ЖЕ репозитория, не
+   форка — эта проверка его не поймала бы вовсе. Почему не отключение
+   `pull_request` как триггера: он остаётся ОСНОВНЫМ носителем каденции
+   ПОСЛЕ слияния (см. «Почему `schedule` — не единственный носитель» выше) —
+   вопрос не «откуда пришёл прогон», а «та ли версия файла сейчас
+   исполняется, что лежит в `main`». Гвардия САМА перестаёт что-либо
+   блокировать в момент мержа (тогда локальная копия и `main` совпадают
+   побайтово по построению) и остаётся живой для ЛЮБОГО следующего PR,
+   вновь коснувшегося этого файла — не разовый костыль под один PR #607.
+3. **Алерт не гадает (AGENTS.md).** Раньше текст перечислял три гипотезы
+   через «либо». Тот же ответ GitHub Jobs API, что уже отличает
+   success/failure/skipped, различает причину САМ: `_classify_measurement_
+   absence` смотрит на шаг `MEASURE_STEP_NAME` самого свежего завершённого
+   прогона и называет ФАКТ — «прогонов не найдено вовсе», «шаг пропущен
+   (гейт не пустил)», «шаг упал (failure) до вызова Cloudflare», либо, если
+   даже это узнать не удалось (сеть/права), честно — «причину установить
+   нельзя, потому что …» — а не подменяет недостающий факт гипотезой.
+
 Запуск тестов: python -m pytest scripts/measure/test_quota_watch.py -q
 """
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import os
 import sys
@@ -215,6 +281,16 @@ MEASUREMENT_SCAN_PER_PAGE = 30
 # кратности, что pulse_guard.HEARTBEAT_MAX_AGE_MINUTES у пульса
 # оркестратора (см. докстринг модуля, «Простой замера»).
 MEASUREMENT_STALE_MINUTES = CHECK_INTERVAL_MINUTES * 3
+
+# Верхняя граница «видимой истории» для last_real_measurement_age_minutes в
+# gate_main — различает холодный старт (замера не было НИКОГДА) от настоящего
+# простоя (замер БЫЛ, потом прекратился), см. докстринг модуля «Простой vs
+# холодный старт» (found: ревью PR #607). Не буквальная бесконечность:
+# реальный потолок сканирования всё равно даёт MEASUREMENT_SCAN_PER_PAGE
+# (одна страница прогонов, без постраничного обхода) — 7 дней просто
+# гарантируют, что цикл не остановится РАНЬШЕ по возрасту прогона, не найдя
+# достаточно старый прогон в пределах этой страницы.
+HISTORY_LOOKBACK_MINUTES = 60.0 * 24 * 7  # 7 дней
 
 STALE_MARKER = "[quota: замер квоты простаивает]"
 STALE_RESOLVED_MARKER = "[quota: замер квоты возобновился]"
@@ -377,19 +453,104 @@ def _write_github_output(name: str, value: str) -> None:
         fh.write(f"{name}={value}\n")
 
 
-def stale_alert(repo: str, now: datetime) -> str:
-    """Реальный замер не найден за MEASUREMENT_STALE_MINUTES — сторож
-    зеленеет, когда сам не работает (found: ревью PR #607, см. докстринг
-    модуля «Простой замера»). Эпизодный дедуп — тот же приём, что
-    `pulse_guard.heartbeat_check` для HEARTBEAT_NO_TICKS_MARKER: один сигнал
-    на эпизод, не на каждый 15-минутный тик, пока эпизод держится."""
+def _local_workflow_path() -> Path:
+    """Путь к исполняемой ПРЯМО СЕЙЧАС копии quota-watch.yml — checkout этого
+    же прогона (см. running_workflow_matches_main)."""
+    return Path(__file__).resolve().parents[2] / ".github" / "workflows" / WORKFLOW_FILE
+
+
+def running_workflow_matches_main(repo: str) -> bool:
+    """True — ТОЛЬКО если удалось ПОЛОЖИТЕЛЬНО подтвердить побайтовое
+    совпадение исполняемой копии `.github/workflows/quota-watch.yml` с
+    версией на `main`. Любой другой исход (файла на `main` нет — PR не слит;
+    содержимое отличается — PR правит именно этот файл; сеть/права не дали
+    сравнить) — False, консервативный дефолт «не эскалировать простой, пока
+    не доказано, что это main» (found: PR #607 разбудил владельца в Telegram
+    прогоном из СВОЕЙ ЖЕ, ещё не слитой ветки — см. докстринг модуля, раздел
+    «Простой vs холодный старт»).
+
+    Почему не `github.event.pull_request.head.repo.full_name !=
+    github.repository` (сравнение с форком): живой инцидент — прогон ИЗ
+    ВЕТКИ ТОГО ЖЕ репозитория (не форк), эта проверка его не поймала бы
+    вовсе. Почему не отключение `pull_request` как триггера: он остаётся
+    ОСНОВНЫМ носителем каденции ПОСЛЕ слияния (см. докстринг модуля, «Почему
+    schedule — не единственный носитель») — вопрос не «откуда пришёл
+    прогон», а «та ли версия файла сейчас исполняется, что лежит в main».
+    Эта гвардия САМА перестаёт что-либо блокировать в момент мержа (тогда
+    локальная копия и main совпадают побайтово по построению) и остаётся
+    живой для ЛЮБОГО следующего PR, вновь коснувшегося этого файла — не
+    разовый костыль под один PR #607."""
+    try:
+        payload = pulse_guard.gh(f"repos/{repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref=main")
+    except RuntimeError as error:
+        print(f"::warning::quota_watch: версия {WORKFLOW_FILE} на main недоступна ({error}) — "
+              "считаю несовпадением (безопасный дефолт), эскалация простоя подавлена", file=sys.stderr)
+        return False
+    if not payload or "content" not in payload:
+        print(f"::warning::quota_watch: {WORKFLOW_FILE} не найден на main — эскалация простоя "
+              "подавлена (неслитый PR/ветка)", file=sys.stderr)
+        return False
+    main_bytes = base64.b64decode(payload["content"])
+    local_bytes = _local_workflow_path().read_bytes()
+    if main_bytes != local_bytes:
+        print(f"::notice::quota_watch: исполняемая копия {WORKFLOW_FILE} отличается от версии "
+              "на main — эскалация простоя подавлена, пока копии не совпадут", file=sys.stderr)
+        return False
+    return True
+
+
+def _classify_measurement_absence(repo: str) -> str:
+    """Факт, не гипотеза (AGENTS.md, «Алерт не гадает»; found: ревью PR
+    #607). Тот же ответ GitHub Jobs API, что уже отличает
+    success/failure/skipped, различает причину САМ — по самому свежему
+    завершённому прогону: (а) прогонов нет вовсе; (б) шаг замера `skipped`
+    (гейт не пустил); (в) шаг замера `failure` (упал до вызова Cloudflare).
+    Если даже это узнать не удалось (сеть/права) — честное «причину
+    установить нельзя, потому что …», а не подмена гипотезой."""
+    try:
+        data = pulse_guard.gh(
+            "--method", "GET", f"repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs",
+            "-f", "status=completed", "-f", "per_page=1",
+        )
+    except RuntimeError as error:
+        return f"причину установить нельзя — история прогонов {WORKFLOW_FILE} недоступна ({error})"
+    runs = (data or {}).get("workflow_runs") or []
+    if not runs:
+        return f"прогонов {WORKFLOW_FILE} не найдено вовсе"
+    run_id = runs[0]["id"]
+    try:
+        jobs_payload = pulse_guard.gh(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=20")
+    except RuntimeError as error:
+        return f"причину установить нельзя — шаги прогона {run_id} недоступны ({error})"
+    conclusion = _find_step_conclusion(jobs_payload, MEASURE_STEP_NAME)
+    if conclusion == "skipped":
+        return (f"самый свежий завершённый прогон пропустил шаг {MEASURE_STEP_NAME!r} — "
+                f"гейт {GATE_STEP_NAME!r} не пустил замер")
+    if conclusion == "failure":
+        return (f"шаг {MEASURE_STEP_NAME!r} самого свежего завершённого прогона упал (failure) "
+                "до вызова Cloudflare")
+    if conclusion is None:
+        return (f"шаг {MEASURE_STEP_NAME!r} не найден в самом свежем завершённом прогоне "
+                "(устаревший формат прогона)")
+    return (f"шаг {MEASURE_STEP_NAME!r} самого свежего завершённого прогона завершился success, "
+            "но вне окна проверки на момент сканирования (гонка между двумя тиками)")
+
+
+def stale_alert(repo: str, now: datetime, age_minutes: float, reason: str) -> str:
+    """Реальный замер БЫЛ (найден `age_minutes` назад где-то в видимой
+    истории), но давно — настоящий ПЕРЕХОД «измерял → перестал», не
+    холодный старт (см. докстринг модуля «Простой vs холодный старт»,
+    found: ревью PR #607). `reason` — уже классифицированный ФАКТ
+    (`_classify_measurement_absence`), не гипотеза. Эпизодный дедуп — тот же
+    приём, что `pulse_guard.heartbeat_check` для HEARTBEAT_NO_TICKS_MARKER:
+    один сигнал на эпизод, не на каждый 15-минутный тик, пока эпизод
+    держится."""
     text = (
         f"🚨 edge-harness: {STALE_MARKER}\n"
-        f"Реальный замер квоты (шаг {MEASURE_STEP_NAME!r} прогона {WORKFLOW_FILE}) не найден "
-        f"среди завершённых прогонов моложе {MEASUREMENT_STALE_MINUTES:.0f} мин (порог = "
-        f"3×{CHECK_INTERVAL_MINUTES:.0f}, тот же приём, что pulse_guard.HEARTBEAT_MAX_AGE_MINUTES). "
-        "Возможные причины: гейт троттлит без причины, workflow не запускается вовсе, либо "
-        "шаг замера падает раньше вызова Cloudflare."
+        f"Реальный замер квоты (шаг {MEASURE_STEP_NAME!r} прогона {WORKFLOW_FILE}) не выполнялся "
+        f"{age_minutes:.0f} мин (порог простоя {MEASUREMENT_STALE_MINUTES:.0f} = "
+        f"3×{CHECK_INTERVAL_MINUTES:.0f}) — до этого замер РАБОТАЛ, это переход, не холодный старт.\n"
+        f"Причина: {reason}."
     )
     try:
         open_times = pulse_guard.issue_marker_times(repo, pulse_guard.WATCHDOG_ISSUE, STALE_MARKER)
@@ -431,17 +592,23 @@ def gate_main() -> int:
     """Шаг-гейт (`GATE_STEP_NAME` в quota-watch.yml): решает, нужен ли
     реальный замер в этом прогоне (троттлинг, `proceed` в $GITHUB_OUTPUT для
     `if:` следующего шага), и отдельно — не простаивал ли реальный замер
-    дольше STALE-порога (см. докстринг модуля, «Простой замера»)."""
+    дольше STALE-порога (см. докстринг модуля, «Простой vs холодный старт»).
+
+    Лукбэк для `last_real_measurement_age_minutes` — `HISTORY_LOOKBACK_MINUTES`
+    (не `MEASUREMENT_STALE_MINUTES`): на троттлинг (`proceed`) это не влияет
+    (`age >= CHECK_INTERVAL_MINUTES` истинно что при 20, что при 200 минутах),
+    но даёт различить холодный старт (`age is None` во ВСЕЙ видимой истории)
+    от настоящего простоя (`age` найден, просто старше STALE-порога)."""
     repo = os.environ.get("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     now = datetime.now(timezone.utc)
     age, api_ok = last_real_measurement_age_minutes(
-        repo, WORKFLOW_FILE, MEASURE_STEP_NAME, now, MEASUREMENT_STALE_MINUTES,
+        repo, WORKFLOW_FILE, MEASURE_STEP_NAME, now, HISTORY_LOOKBACK_MINUTES,
     )
     proceed = age is None or age >= CHECK_INTERVAL_MINUTES
     _write_github_output("proceed", "true" if proceed else "false")
     if age is None:
         print(f"quota_watch: реального замера ({MEASURE_STEP_NAME!r}) не найдено среди прогонов "
-              f"{WORKFLOW_FILE} моложе {MEASUREMENT_STALE_MINUTES:.0f} мин — замер продолжится")
+              f"{WORKFLOW_FILE} за всю видимую историю — замер продолжится")
     else:
         verdict = "моложе окна троттлинга — пропуск" if not proceed else "старше окна троттлинга — замер продолжится"
         print(f"quota_watch: последний реальный замер {age:.1f} мин назад ({verdict}, "
@@ -450,10 +617,27 @@ def gate_main() -> int:
         print("::warning::quota_watch: история прогонов недоступна — проверка простоя замера "
               "пропущена в этом тике (троттлинг тоже не сработал — безопасный дефолт)", file=sys.stderr)
         return 0
+
     if age is None:
-        print(stale_alert(repo, now))
-    else:
+        # Замера не было НИ РАЗУ в видимой истории — холодный старт, не
+        # простой (см. докстринг модуля, «Простой vs холодный старт»):
+        # молчим, а не гадаем и не заводим третий канал сигнала.
+        print("quota_watch: холодный старт — реального замера не было НИ РАЗУ в видимой истории, "
+              "это не простой (см. quota_watch.py::gate_main); сигнал не уходит")
+        return 0
+    if age < MEASUREMENT_STALE_MINUTES:
         close_stale_episode_if_needed(repo)
+        return 0
+
+    # age >= MEASUREMENT_STALE_MINUTES: замер БЫЛ раньше, но давно —
+    # настоящий переход «измерял → перестал». Эскалация — только если
+    # исполняется ТА ЖЕ версия workflow, что на main (см.
+    # running_workflow_matches_main, «неслитый код не может разбудить
+    # владельца», found: PR #607).
+    if not running_workflow_matches_main(repo):
+        return 0
+    reason = _classify_measurement_absence(repo)
+    print(stale_alert(repo, now, age, reason))
     return 0
 
 

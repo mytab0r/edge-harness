@@ -21,7 +21,13 @@
 # замер»). permissions.issues:write — эскалация (Telegram + след в #120) и
 # заведение задачи через scripts/gh/issue-create при пробитии порога (см.
 # quota_alert.py), а также сигнал «замер не выполнялся дольше порога»
-# (quota_watch.py::stale_alert).
+# (quota_watch.py::stale_alert). permissions.contents:read — тем же токеном
+# `running_workflow_matches_main` читает Contents API (`.../contents/
+# .github/workflows/quota-watch.yml?ref=main`), чтобы сверить исполняемую
+# копию этого файла с версией на main ПЕРЕД эскалацией простоя (found:
+# ревью PR #607, живой инцидент — прогон из ещё не слитой ветки этого же PR
+# разбудил владельца в Telegram; см. докстринг scripts/measure/
+# quota_watch.py, «Простой vs холодный старт»).
 name: quota-watch
 
 on:

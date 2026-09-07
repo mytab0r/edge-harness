@@ -362,15 +362,16 @@ def test_gate_main_throttles_when_measured_recently(monkeypatch, tmp_path):
 
 
 def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_window(monkeypatch, tmp_path):
-    """Замер найден (age=20 мин), но старше окна троттлинга (15 мин) —
-    гейт пускает следующий замер (proceed=true) И считает систему живой
-    (закрывает эпизод простоя, если он был), а не эскалирует."""
+    """Замер найден (age=20 мин), старше окна троттлинга (15 мин), но моложе
+    STALE-порога (45 мин) — гейт пускает следующий замер (proceed=true) И
+    считает систему живой (закрывает эпизод простоя, если он был), а не
+    эскалирует."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (20.0, True))
     stale_calls = []
-    monkeypatch.setattr(qw, "stale_alert", lambda repo, now: stale_calls.append(repo) or "x")
+    monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
     closed = []
     monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
 
@@ -381,23 +382,63 @@ def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_w
     assert closed == [REPO]
 
 
-def test_gate_main_writes_proceed_true_when_no_recent_measurement(monkeypatch, tmp_path):
-    """Направление (а): нет реального замера в окне троттлинга — гейт
-    пропускает замер дальше (proceed=true), но это ЕЩЁ не значит простой
-    (age is None здесь трактуется гейтом и как «нужно измерить», и — ниже —
-    как повод проверить эпизод простоя; сам факт proceed=true не эскалирует
-    сам по себе, эскалирует именно stale_alert при отсутствии измерения)."""
+def test_gate_main_stays_silent_on_cold_start_never_measured(monkeypatch, tmp_path):
+    """Направление (а), мутационная проверка: замера не было НИ РАЗУ во всей
+    видимой истории (age=None) — холодный старт, НЕ простой (found: ревью PR
+    #607 — старая версия звала stale_alert прямо здесь, что и разбудило
+    владельца на самом первом прогоне ещё не слитого PR). Эскалация НЕ
+    уходит, close_stale_episode_if_needed тоже не зовётся (эпизода нет)."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, True))
     stale_calls = []
-    monkeypatch.setattr(qw, "stale_alert", lambda repo, now: stale_calls.append(repo) or "замер простаивал — x")
+    monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
+    closed = []
+    monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
 
     assert qw.gate_main() == 0
 
     assert output_file.read_text(encoding="utf-8").strip() == "proceed=true"
-    assert stale_calls == [REPO]
+    assert stale_calls == []
+    assert closed == []
+
+
+def test_gate_main_escalates_true_transition_when_running_copy_matches_main(monkeypatch, tmp_path):
+    """Направление (б): замер БЫЛ (age=60 мин, старше STALE-порога 45) —
+    настоящий переход. Исполняемая копия совпадает с main — эскалация
+    уходит, с классифицированной причиной, не гипотезой."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "running_workflow_matches_main", lambda repo: True)
+    monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
+    stale_calls = []
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now, age, reason: stale_calls.append((repo, age, reason)) or "замер простаивал — x")
+
+    assert qw.gate_main() == 0
+
+    assert stale_calls == [(REPO, 60.0, "шаг упал (failure)")]
+
+
+def test_gate_main_suppresses_escalation_when_running_copy_differs_from_main(monkeypatch, tmp_path):
+    """Направление #1 задачи (неслитый код не может разбудить владельца):
+    переход есть (age=60 мин), но исполняемая копия НЕ совпадает с main
+    (неслитый PR/ветка правит именно этот workflow) — эскалация подавлена."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "running_workflow_matches_main", lambda repo: False)
+    stale_calls = []
+    monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
+
+    assert qw.gate_main() == 0
+
+    assert stale_calls == []
 
 
 def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsys):
@@ -409,7 +450,7 @@ def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsy
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, False))
     stale_calls = []
-    monkeypatch.setattr(qw, "stale_alert", lambda repo, now: stale_calls.append(repo) or "x")
+    monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
 
     assert qw.gate_main() == 0
 
@@ -423,17 +464,23 @@ def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsy
 
 
 def test_stale_alert_escalates_on_first_observation(monkeypatch):
-    """Направление (б): реального замера нет — сигнал уходит в ДОСТАВЛЯЮЩИЙ
-    канал (pulse_guard.escalate: Telegram + след в #120), не только в лог."""
+    """Направление (б): реального замера нет в окне — сигнал уходит в
+    ДОСТАВЛЯЮЩИЙ канал (pulse_guard.escalate: Telegram + след в #120), не
+    только в лог, и называет ФАКТ причины (reason), не гипотезу."""
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker: [])
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
                          lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
 
-    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0,
+                             "шаг 'Замер квоты (Cloudflare)' самого свежего завершённого прогона упал (failure)")
 
     assert len(escalated) == 1
     assert qw.STALE_MARKER in escalated[0]
+    assert "упал (failure)" in escalated[0]
+    assert "60" in escalated[0]
+    # Текст называет факт, не гипотезу — старой фразы «возможные причины» нет.
+    assert "Возможные причины" not in escalated[0]
     assert "доставлен" in result
 
 
@@ -448,7 +495,7 @@ def test_stale_alert_dedupes_within_same_open_episode(monkeypatch):
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
 
-    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
 
     assert escalated == []
     assert "дедуп" in result
@@ -464,10 +511,123 @@ def test_stale_alert_reopens_after_episode_closed(monkeypatch):
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
 
-    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
 
     assert len(escalated) == 1
     assert "простаивал" in result
+
+
+# ── _classify_measurement_absence: факт, не гипотеза (found: ревью PR #607) ──
+
+
+def test_classify_measurement_absence_no_runs_at_all(monkeypatch):
+    """Направление (а): прогонов вовсе нет."""
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(_runs_response([]), {}))
+    assert qw._classify_measurement_absence(REPO) == f"прогонов {qw.WORKFLOW_FILE} не найдено вовсе"
+
+
+def test_classify_measurement_absence_measure_step_skipped(monkeypatch):
+    """Направление (г): прогоны есть, шаг замера skipped — гейт не пустил.
+    Текст называет ИМЕННО это, не «возможно, гейт троттлит»."""
+    runs = _runs_response([_run(9, _iso(datetime.now(timezone.utc)))])
+    jobs = {9: _jobs_response([_step(qw.GATE_STEP_NAME, "success"), _step(qw.MEASURE_STEP_NAME, "skipped")])}
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+    reason = qw._classify_measurement_absence(REPO)
+    assert "пропустил" in reason and qw.MEASURE_STEP_NAME in reason and qw.GATE_STEP_NAME in reason
+
+
+def test_classify_measurement_absence_measure_step_failure(monkeypatch):
+    """Направление (д): шаг замера failure."""
+    runs = _runs_response([_run(9, _iso(datetime.now(timezone.utc)))])
+    jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")])}
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+    reason = qw._classify_measurement_absence(REPO)
+    assert "упал (failure)" in reason and qw.MEASURE_STEP_NAME in reason
+
+
+def test_classify_measurement_absence_step_missing(monkeypatch):
+    runs = _runs_response([_run(9, _iso(datetime.now(timezone.utc)))])
+    jobs = {9: _jobs_response([_step("какой-то другой шаг", "success")])}
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+    reason = qw._classify_measurement_absence(REPO)
+    assert "не найден" in reason
+
+
+def test_classify_measurement_absence_honest_when_runs_api_unavailable(monkeypatch):
+    """Данных не хватает — сигнал обязан сказать это прямо, а не подсовывать
+    угадайку (правило AGENTS.md «Алерт не гадает»)."""
+    def broken(*a):
+        raise RuntimeError("HTTP 403")
+    monkeypatch.setattr(qw.pulse_guard, "gh", broken)
+    reason = qw._classify_measurement_absence(REPO)
+    assert "причину установить нельзя" in reason
+
+
+def test_classify_measurement_absence_honest_when_jobs_api_unavailable(monkeypatch):
+    def fake_gh(*args):
+        if args and args[0] == "--method":
+            return _runs_response([_run(9, _iso(datetime.now(timezone.utc)))])
+        raise RuntimeError("HTTP 403")
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    reason = qw._classify_measurement_absence(REPO)
+    assert "причину установить нельзя" in reason
+
+
+# ── running_workflow_matches_main: неслитый код не может разбудить владельца
+# (found: PR #607 разбудил владельца прогоном из своей же неслитой ветки) ────
+
+
+def test_running_workflow_matches_main_true_on_byte_identical_copy(monkeypatch, tmp_path):
+    import base64
+    content = b"name: quota-watch\n"
+    local = tmp_path / "quota-watch.yml"
+    local.write_bytes(content)
+    monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
+    payload = {"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"}
+    monkeypatch.setattr(qw.pulse_guard, "gh", lambda *a: payload)
+
+    assert qw.running_workflow_matches_main(REPO) is True
+
+
+def test_running_workflow_matches_main_false_when_content_differs(monkeypatch, tmp_path):
+    """PR правит именно этот workflow — исполняемая копия отличается от main."""
+    import base64
+    local = tmp_path / "quota-watch.yml"
+    local.write_bytes(b"name: quota-watch  # changed in PR\n")
+    monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
+    payload = {"content": base64.b64encode(b"name: quota-watch\n").decode("ascii"), "encoding": "base64"}
+    monkeypatch.setattr(qw.pulse_guard, "gh", lambda *a: payload)
+
+    assert qw.running_workflow_matches_main(REPO) is False
+
+
+def test_running_workflow_matches_main_false_when_file_absent_on_main(monkeypatch, tmp_path):
+    """Мутационная проверка направления #1 задачи: workflow ещё НЕ на main
+    (PR не слит, gh api отвечает 404) — считается несовпадением, эскалация
+    невозможна, а не гадает."""
+    local = tmp_path / "quota-watch.yml"
+    local.write_bytes(b"name: quota-watch\n")
+    monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
+
+    def not_found(*a):
+        raise RuntimeError("gh: HTTP 404: Not Found")
+    monkeypatch.setattr(qw.pulse_guard, "gh", not_found)
+
+    assert qw.running_workflow_matches_main(REPO) is False
+
+
+def test_running_workflow_matches_main_false_on_api_error(monkeypatch, tmp_path):
+    """Сеть/права недоступны — безопасный дефолт: НЕ подтверждено совпадение,
+    эскалация подавляется (не наоборот)."""
+    local = tmp_path / "quota-watch.yml"
+    local.write_bytes(b"name: quota-watch\n")
+    monkeypatch.setattr(qw, "_local_workflow_path", lambda: local)
+
+    def broken(*a):
+        raise RuntimeError("dial tcp: timeout")
+    monkeypatch.setattr(qw.pulse_guard, "gh", broken)
+
+    assert qw.running_workflow_matches_main(REPO) is False
 
 
 def test_close_stale_episode_posts_resolved_marker(monkeypatch):
