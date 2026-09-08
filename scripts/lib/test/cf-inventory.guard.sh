@@ -109,6 +109,15 @@ if [ -s /tmp/cf_guard_stderr ] && grep -q "ПРЕДУПРЕЖДЕНИЕ" /tmp/cf
   echo "::error::cf_workers_own: allowlist совпадает с фикстурой (2 своих), предупреждения о дрейфе быть не должно"
   fail=1
 fi
+# Позитив (некритичное замечание ревью PR #328): наши воркеры РЕАЛЬНО в выводе.
+# Негатив выше ловит утечку чужих, но не вымывание наших: регресс «фильтр
+# печатает пустой "свои"» проходит чужие-ассерты зелёно.
+for own_name in edge-harness dsh-edge; do
+  if ! grep -q "\"id\": *\"$own_name\"" <<<"$out"; then
+    echo "::error::cf_workers_own: свой воркер '$own_name' пропал из вывода — фильтр вымывает своих (не только чужих)"
+    fail=1
+  fi
+done
 
 # ── 3/4: cf_do_namespaces_own — чужой id/script не в stdout ───────────────
 out=$(cf_do_namespaces_own 2>/dev/null)
@@ -120,6 +129,13 @@ if ! grep -q '"всего_в_аккаунте": 3' <<<"$out"; then
   echo "::error::cf_do_namespaces_own: ожидался счётчик 'всего_в_аккаунте': 3, получено: $out"
   fail=1
 fi
+# Позитив (некритичное замечание ревью PR #328): оба своих namespace в выводе.
+for own_script in edge-harness dsh-edge; do
+  if ! grep -q "\"script\": *\"$own_script\"" <<<"$out"; then
+    echo "::error::cf_do_namespaces_own: свой namespace '$own_script' пропал из вывода — фильтр вымывает своих (не только чужих)"
+    fail=1
+  fi
+done
 
 # ── 5: cf_bindings_names — значение plain_text не в stdout, только имя/тип ─
 out=$(cf_bindings_names "/accounts/test-acct/workers/scripts/edge-harness/settings" 2>/dev/null)
