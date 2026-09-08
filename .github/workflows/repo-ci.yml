@@ -1051,6 +1051,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
+          # checkout@v7 без fetch-depth: 0 (строка выше) не создаёт
+          # refs/remotes/origin/main — .githooks/pre-commit (core.hooksPath
+          # ниже) требует именно этот ref для проверки свежести базы и
+          # падает «нет refs/remotes/origin/main», как только archive_
+          # complete_changes.py реально доходит до git commit (живой случай:
+          # PR #711, первый прогон job'а, чей change оказался полностью
+          # отмечен). worker.yml для той же доводки PR фетчит fetch-depth: 0
+          # целиком; здесь дешевле явный фетч одной ветки.
+          git fetch origin main
           BRANCH="${{ github.event.pull_request.head.ref }}"
           git fetch origin "$BRANCH"
           PR_WORKTREE="$RUNNER_TEMP/pr-worktree"

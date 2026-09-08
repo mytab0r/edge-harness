@@ -810,11 +810,15 @@ def graphql_pool_page(nodes=()):
     }}}}
 
 
-def graphql_issue_node(number, body="", blocked_by=(), blocking=()):
+def graphql_issue_node(number, issue_body="", blocked_by=(), blocking=()):
+    # Параметр НЕ называется body= — та же гвардия класса #124
+    # (grep ',\s*body=' в repo-ci.yml матчит и сигнатуру функции с дефолтом
+    # body="", не только вызов gh()) уже задокументирована у task_issue()
+    # выше в этом файле; здесь тот же приём.
     return {
         "number": number,
         "title": "",
-        "body": body,
+        "body": issue_body,
         "labels": {"nodes": []},
         "assignees": {"nodes": []},
         "blockedBy": {"totalCount": len(blocked_by),
@@ -1263,7 +1267,7 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # Инвариант 9 (#710): пул с телами через GraphQL — здоровое поле «ничем»
         # в обе стороны, нативных рёбер нет, расхождения тоже нет.
         "graphql": graphql_pool_page([
-            graphql_issue_node(1, body="## Чем блокируется\nничем\n\n## Что блокирует\nничем\n"),
+            graphql_issue_node(1, issue_body="## Чем блокируется\nничем\n\n## Что блокирует\nничем\n"),
         ]),
     })
     patch_gh(monkeypatch, fake)
