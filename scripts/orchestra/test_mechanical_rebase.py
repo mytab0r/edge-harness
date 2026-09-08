@@ -50,12 +50,16 @@ def label(name):
     return {"id": "LA_kwDOUHBaqc8AAAACypPLSQ", "name": name, "description": "", "color": "0E8A16"}
 
 
-def pull(number, *, ref, labels=("conflict",), created_at="2026-09-01T00:00:00Z"):
+def pull(number, *, ref, labels=("conflict",), created_at="2026-09-01T00:00:00Z", head_repo_full_name=REPO):
+    # head.repo.full_name по умолчанию = REPO (issue #764, находка ревью
+    # гейта, требование 4): прод-форма для ПОДАВЛЯЮЩЕГО большинства PR — своя
+    # ветка того же репозитория, не форк. Тесты фильтра ниже переопределяют
+    # это поле явно.
     return {
         "number": number,
         "labels": [label(n) for n in labels],
         "created_at": created_at,
-        "head": {"ref": ref},
+        "head": {"ref": ref, "repo": {"full_name": head_repo_full_name} if head_repo_full_name else None},
         "body": "",
     }
 
@@ -65,7 +69,15 @@ class FakeGh:
     оттуда (каждый тестовый файл в этом репозитории самодостаточен, тот же
     выбор, что у остальных test_*.py в scripts/orchestra/)."""
 
-    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
+    _DEFAULT_ROUTES = {
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        # По умолчанию воркер простаивает (issue #764, находка ревью гейта,
+        # требование 2: process_pull теперь спрашивает sch.worker_runs_active
+        # ПЕРЕД каждой попыткой) — тесты, для которых занятость воркера не
+        # предмет проверки, явно переопределяют этот маршрут или монки-патчат
+        # sch.worker_runs_active напрямую (см. тесты гейта ниже).
+        "actions/workflows/worker.yml/runs": {"workflow_runs": []},
+    }
 
     def __init__(self, routes: dict):
         self.routes = {**self._DEFAULT_ROUTES, **routes}
@@ -209,6 +221,47 @@ def test_conflict_queue_skips_pulls_without_conflict_label(monkeypatch):
     assert [p["number"] for p in queue] == [560]
 
 
+# ── Фильтр чужих/форкнутых веток (issue #764, находка ревью гейта, требование 4) ──
+
+
+def test_conflict_queue_skips_pull_from_a_fork_with_same_branch_name(monkeypatch):
+    """PR из форка с СОВПАДАЮЩИМ именем ветки не должен заставить механику
+    ребейзить и force-push'ить ЧУЖУЮ ветку origin этого репозитория."""
+    own = pull(560, ref="agent/474-x", head_repo_full_name=REPO)
+    fork = pull(562, ref="agent/474-x", head_repo_full_name="someone-else/edge-harness")
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+
+    queue = mr.conflict_queue(REPO, [own, fork])
+
+    assert [p["number"] for p in queue] == [560]
+
+
+def test_conflict_queue_skips_pull_without_agent_branch_prefix(monkeypatch):
+    """Ветка без префикса agent/ (в т.ч. main) — не кандидат механического
+    пути, тот же структурный признак, что task-branch/#356."""
+    not_agent = pull(563, ref="main", head_repo_full_name=REPO)
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+
+    queue = mr.conflict_queue(REPO, [not_agent])
+
+    assert queue == []
+
+
+def test_conflict_queue_skips_pull_with_missing_head_repo(monkeypatch):
+    """head.repo отсутствует (None) — GitHub отдаёт это, когда исходный
+    репозиторий PR удалён; тот же класс, что форк, не должен попасть в
+    очередь по недосмотру."""
+    orphaned = pull(564, ref="agent/474-x", head_repo_full_name=None)
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+
+    queue = mr.conflict_queue(REPO, [orphaned])
+
+    assert queue == []
+
+
 # ── Живой git: attempt_rebase/push_rebased по-настоящему ────────────────────
 
 
@@ -244,6 +297,296 @@ def test_attempt_rebase_raises_git_error_for_missing_branch(tmp_path):
 
     with pytest.raises(mr.GitError):
         mr.attempt_rebase(work, "agent/999-does-not-exist")
+
+
+# ── Идентичность git на раннере (issue #764, находка ревью гейта, требование 1) ──
+
+
+def test_attempt_rebase_reports_infra_error_not_conflict_when_git_identity_missing(tmp_path, monkeypatch):
+    """Прод-форма: свежий actions/checkout НЕ ставит user.name/user.email
+    (gh auth setup-git ставит только credential helper, не identity). PR
+    #601 просто отстал от main (см. build_origin) — БЕЗ единого текстового
+    конфликта, применяется чисто. Но `git commit` внутри `git rebase` падает
+    rc=128 «unable to auto-detect email address», каталог паузы рёбейза
+    заводится БЕЗ единого незаведённого пути.
+
+    Мутационное доказательство (issue #764, находка ревью гейта, требование 1):
+    откати проверку "unmerged" в attempt_rebase к старой версии (только факт
+    существования .git/rebase-merge/-apply, без git diff --diff-filter=U) —
+    этот тест и test_process_pull_reports_missing_identity_as_infra_error
+    краснеют, потому что старый код классифицировал бы это как "conflict"
+    вместо GitError (проверено вручную при подготовке этого PR: временный
+    откат блока attempt_rebase к версии без проверки unmerged даёт
+    `AssertionError: DID NOT RAISE mechanical_rebase.GitError` на обоих
+    тестах)."""
+    origin = build_origin(tmp_path)
+    work = tmp_path / "work_no_identity"
+    subprocess.run(["git", "clone", str(origin), str(work)], check=True, capture_output=True)
+    # НЕ вызываем `git config user.email/user.name` в work — намеренно:
+    # прод-форма свежего actions/checkout.
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    for var in (
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    # HOME/USERPROFILE — на пустой каталог: без ~/.gitconfig, который на
+    # машине разработчика/раннера может нести чужую identity и замаскировать
+    # именно ту находку, которую воспроизводит тест (AGENTS.md: «тест кормит
+    # прод-форму данных, а не пересказ» — тест обязан реально терять
+    # identity, не полагаться на то, что её нет случайно).
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.setenv("USERPROFILE", str(empty_home))
+
+    with pytest.raises(mr.GitError, match="identity"):
+        mr.attempt_rebase(work, "agent/601-drifted-a")
+
+    # attempt_rebase обязан отмыть working tree ПЕРЕД тем, как поднять
+    # исключение (см. attempt_rebase: git rebase --abort, check=False, до
+    # raise) — иначе следующий PR очереди наследует чужую паузу рёбейза
+    # (issue #764, находка 5, см. тест ensure_clean_repo ниже).
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=work, capture_output=True, text=True
+    )
+    assert status.stdout.strip() == ""
+    assert not (work / ".git" / "rebase-merge").exists()
+    assert not (work / ".git" / "rebase-apply").exists()
+
+
+def test_process_pull_reports_missing_identity_as_infra_error(tmp_path, monkeypatch):
+    """Тот же сценарий на уровне process_pull (что реально видит run()):
+    исход "infra-error: ...", НЕ "conflict" — иначе PR молча остался бы
+    ждать агента вместо того, чтобы прод-инфраструктура починилась (fail
+    loud, AGENTS.md)."""
+    origin = build_origin(tmp_path)
+    work = tmp_path / "work_no_identity_pp"
+    subprocess.run(["git", "clone", str(origin), str(work)], check=True, capture_output=True)
+    empty_home = tmp_path / "empty_home_pp"
+    empty_home.mkdir()
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.setenv("USERPROFILE", str(empty_home))
+    p = pull(601, ref="agent/601-drifted-a")
+    fake = FakeGh({"issues/601/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: False)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome.startswith("infra-error:")
+    assert outcome != "conflict"
+
+
+# ── Взаимное исключение с агентским путём (issue #764, находка ревью гейта, требование 2) ──
+
+
+def test_process_pull_defers_when_worker_is_active(tmp_path, monkeypatch):
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    original_tip = branch_tip(origin, "agent/601-drifted-a")
+    fake = FakeGh({"issues/601/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "worker-running"
+    assert branch_tip(origin, "agent/601-drifted-a") == original_tip  # head не тронут
+
+
+def test_run_reports_worker_running_and_skips_push(tmp_path, monkeypatch):
+    """Мутационное доказательство (issue #764, находка ревью гейта, требование 2):
+    без этого гейта (monkeypatch.setattr(sch, "worker_runs_active", lambda repo: False))
+    PR #601 получил бы "resolved" и запушенную ветку — тест ниже покраснел бы на
+    строке assert outcomes[601] == "resolved", доказывая, что гейт — не no-op."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    original_tip = branch_tip(origin, "agent/601-drifted-a")
+    fake = FakeGh({"pulls?state=open": [p], "issues/601/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
+
+    lines, outcomes = mr.run(REPO, work)
+
+    assert outcomes[601] == "worker-running"
+    assert branch_tip(origin, "agent/601-drifted-a") == original_tip
+    assert any("worker.yml" in line for line in lines)
+
+
+# ── Каскад после неудачного abort (issue #764, находка ревью гейта, требование 5) ──
+
+
+def test_ensure_clean_repo_recovers_leftover_rebase_state_for_next_pull(tmp_path, monkeypatch):
+    """Симулирует ровно найденный дефект: предыдущая итерация оставила
+    рабочее дерево с НЕЗАВЕРШЁННЫМ (не отменённым) рёбейзом — реальный
+    текстовый конфликт, `git rebase --abort` НЕ вызван (как если бы он сам
+    упал). Без ensure_clean_repo следующий PR очереди получил бы
+    "you need to resolve your current index first" при попытке checkout —
+    не потому, что у НЕГО есть конфликт."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+
+    # Заводим реальную паузу рёбейза руками (без abort) — воспроизводит
+    # состояние "предыдущая итерация не отмылась".
+    subprocess.run(["git", "fetch", "origin", "main", "agent/604-conflict-d"], cwd=work, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "checkout", "-B", "agent/604-conflict-d", "origin/agent/604-conflict-d"],
+        cwd=work, check=True, capture_output=True,
+    )
+    result = subprocess.run(["git", "rebase", "origin/main"], cwd=work, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert (work / ".git" / "rebase-merge").exists() or (work / ".git" / "rebase-apply").exists()
+
+    # Следующий PR очереди — реально резолвящийся (agent/601), но дерево
+    # ещё несёт чужую паузу рёбейза.
+    outcome = mr.attempt_rebase(work, "agent/601-drifted-a")
+
+    assert outcome == "resolved"
+    assert not (work / ".git" / "rebase-merge").exists()
+    assert not (work / ".git" / "rebase-apply").exists()
+
+
+# ── Полный отказ очереди — ненулевой исход (issue #764, находка ревью гейта, требование 5) ──
+
+
+def test_failed_count_counts_only_infra_error_outcomes():
+    outcomes = {601: "resolved", 604: "conflict", 609: "infra-error: boom", 610: "infra-error: boom2"}
+
+    assert mr.failed_count(outcomes) == 2
+
+
+def test_all_infra_error_outcomes_is_detectable_as_total_failure():
+    """Мутационное доказательство требования 5 (issue #762): main() читает
+    именно `failed_count(outcomes) == len(outcomes)` — если бы вместо этого
+    условие сравнивало с 0 (старое поведение, всегда `return 0`), этот тест
+    остался бы зелёным, но живой прогон main() — красным. Живой прогон
+    main() — см. test_main_returns_nonzero_when_all_outcomes_are_infra_error
+    ниже (issue #764, находка приёмки: требование выше проверяло только
+    failed_count() напрямую, ни разу не гоняя сам main())."""
+    outcomes = {609: "infra-error: a", 610: "infra-error: b"}
+
+    assert mr.failed_count(outcomes) == len(outcomes)
+
+
+# ── main(): живой прогон — исход не только failed_count() напрямую, но и код возврата ──
+# issue #764, находка приёмки: до этого раздела ни один тест не гонял main()
+# целиком, «живой прогон main() был проверен вручную» оставался утверждением
+# без носителя. run() подменяется monkeypatch — это уже отдельно проверенный
+# слой (тесты выше и test_run_* ниже), здесь предмет — именно условие
+# ненулевого выхода внутри main().
+
+
+def _patch_main_environment(monkeypatch, *, repo="o/r"):
+    """Общий каркас для тестов main(): CI-маркеры (см. _require_ci_environment
+    ниже) + гашение summary (побочный эффект печати в step summary — не
+    предмет этих тестов)."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "123456")
+    monkeypatch.setenv("GITHUB_REPOSITORY", repo)
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+
+
+def test_main_returns_nonzero_when_all_outcomes_are_infra_error(monkeypatch):
+    _patch_main_environment(monkeypatch)
+    monkeypatch.setattr(
+        mr, "run",
+        lambda repo, repo_dir: (["…"], {609: "infra-error: a", 610: "infra-error: b"}),
+    )
+
+    assert mr.main() == 1
+
+
+def test_main_returns_zero_on_mixed_outcomes(monkeypatch):
+    """Смесь resolved/infra-error — очередь не ПОЛНОСТЬЮ провалена, код 0."""
+    _patch_main_environment(monkeypatch)
+    monkeypatch.setattr(
+        mr, "run",
+        lambda repo, repo_dir: (["…"], {601: "resolved", 609: "infra-error: a"}),
+    )
+
+    assert mr.main() == 0
+
+
+def test_main_returns_zero_on_all_worker_running_queue(monkeypatch):
+    """Очередь целиком отложена (воркер занят) — не infra-error ни разу,
+    код 0: тормоз без газа здесь не про main(), это отдельный такт."""
+    _patch_main_environment(monkeypatch)
+    monkeypatch.setattr(
+        mr, "run",
+        lambda repo, repo_dir: (["…"], {601: "worker-running", 602: "worker-running"}),
+    )
+
+    assert mr.main() == 0
+
+
+def test_main_returns_zero_on_empty_queue(monkeypatch):
+    """Нет ни одного PR с меткой conflict — outcomes пуст, `outcomes and …`
+    короткозамыкает на False, код 0 (не 1 на пустой очереди)."""
+    _patch_main_environment(monkeypatch)
+    monkeypatch.setattr(mr, "run", lambda repo, repo_dir: (["…"], {}))
+
+    assert mr.main() == 0
+
+
+# ── main() отказывается работать вне CI (issue #764, находка приёмки) ───────
+# ensure_clean_repo безусловно сносит рабочее дерево (rebase --abort,
+# reset --hard, clean -fd) — приёмка воспроизвела живьём снос незакоммиченных
+# правок и незавершённого рёбейза человека при ручном запуске. `run()`
+# подменяется заглушкой, которая падает, если её вообще позвали — так тест
+# доказывает, что гвардия срабатывает ДО касания репозитория, а не просто
+# существует где-то рядом.
+
+
+def _run_must_not_be_called(repo, repo_dir):
+    raise AssertionError("run() не должен звонить — гвардия обязана остановить main() раньше")
+
+
+def test_main_refuses_outside_ci_when_both_markers_are_missing(monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(mr, "run", _run_must_not_be_called)
+
+    with pytest.raises(RuntimeError, match="GitHub Actions"):
+        mr.main()
+
+
+def test_main_refuses_when_only_github_actions_flag_is_set(monkeypatch):
+    """Единственный признак GITHUB_ACTIONS недостаточен: .githooks/pre-commit
+    использует ЭТУ ЖЕ переменную РОВНО НАОБОРОТ (её наличие ОТКЛЮЧАЕТ гвардию
+    хука) и сам называет риск, что она утечёт в локальное окружение
+    (например, при работе с `gh`/`act`). Без GITHUB_RUN_ID как второго,
+    независимого признака такая утечка обошла бы защиту этого модуля тоже."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(mr, "run", _run_must_not_be_called)
+
+    with pytest.raises(RuntimeError, match="GitHub Actions"):
+        mr.main()
+
+
+def test_main_refuses_when_only_github_run_id_is_set(monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("GITHUB_RUN_ID", "123456")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(mr, "run", _run_must_not_be_called)
+
+    with pytest.raises(RuntimeError, match="GitHub Actions"):
+        mr.main()
+
+
+def test_main_proceeds_when_both_ci_markers_are_present(monkeypatch):
+    """Позитивный полюс: оба признака выставлены (как их выставляет сам
+    раннер Actions на старте job'а) — гвардия не мешает нормальному ходу."""
+    _patch_main_environment(monkeypatch)
+    monkeypatch.setattr(mr, "run", lambda repo, repo_dir: (["…"], {}))
+
+    assert mr.main() == 0
 
 
 # ── run(): полный сценарий задачи #762 — 5 PR, 3 сходятся, 2 нет ────────────

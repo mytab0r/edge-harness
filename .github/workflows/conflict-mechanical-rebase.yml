@@ -72,6 +72,23 @@ jobs:
           printf '%s' "$token" | gh auth login --with-token
           unset token
           gh auth setup-git
+          # Identity для committer'а git rebase (issue #764, находка ревью
+          # гейта, требование 1): `actions/checkout` не ставит user.name/
+          # user.email, `gh auth setup-git` ставит только credential helper
+          # (push-авторизацию), не identity — без неё `git commit` внутри
+          # `git rebase` падает rc=128 «unable to auto-detect email address»,
+          # оставляя `.git/rebase-merge` НЕ через содержательный конфликт
+          # (живой прогон в прод-форме: mechanical_rebase.py::attempt_rebase
+          # возвращал бы "conflict" вместо "resolved" на чисто отставшей
+          # ветке без единого конфликтующего файла). Коммиты рёбейза не
+          # меняют содержимое — `git rebase` сохраняет АВТОРА исходных
+          # коммитов, меняется только committer — поэтому committer'а
+          # атрибутируем боту, не владельцу (та же пара значений, что уже
+          # использует .github/workflows/plugin-forge.yml для своих
+          # автоматических коммитов): это чисто механическая, не
+          # содержательная операция.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Механический ребейз конфликтных PR (issue #762)
         if: steps.quota.outputs.skip != 'true'
