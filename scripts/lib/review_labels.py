@@ -40,6 +40,7 @@ Commit Status API (#345, кандидат из docs/research/23-platform-native-
 import hashlib
 import os
 import re
+from datetime import datetime
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -57,6 +58,22 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # Любой момент времени на PR должен существовать не более чем один из этих
 # трёх; своп решает verdict_label_changes ниже.
 REVIEW_VERDICTS = (REVIEW_OK, REVIEW_CHANGES, REVIEW_LARGE)
+
+# ── Классификация причины verdict=error (#431) ───────────────────────────────
+# Четыре состояния transport_failed/error_reason различают уже с #419 —
+# reason_tag ниже даёт им короткие теги, чтобы их читал не только человек
+# (findings — проза), но и scheduler.trigger_ai_review (факт `reason:` в
+# шапке комментария, см. FACT_RE/header_facts): «квота исчерпана на неделю»
+# и «модель ответила криво» — разные вещи и заслуживают разного числа
+# автоповторов, а парсить прозу findings для этого решения нельзя — находка
+# #431 на PR #329: findings там оказался ПРОЗОЙ МОДЕЛИ ("Установка прошла
+# неполно..."), а не текстом error_reason, потому что reason подставляется в
+# findings, только если findings пуст (см. ai_review.cmd_verdict) — прод-
+# форма подтверждает: решение обязано читать структурный факт, не пересказ.
+FAILURE_REASON_QUOTA_EXHAUSTED = "quota_exhausted"
+FAILURE_REASON_RATE_LIMIT_BUDGET = "rate_limit_retry_budget_exceeded"
+FAILURE_REASON_TRANSPORT = "transport_error"
+FAILURE_REASON_CONTRACT = "contract_violation"
 
 # ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
 # Единственное определение (было задублировано локальной константой в
@@ -430,11 +447,46 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 # provider/reset-at — факты цепочки провайдеров (#727): имя провайдера,
 # фактически ответившего, и даты сброса опробованных — читает
 # scheduler.py::trigger_ai_review, чтобы не жечь авто-повтор (#196) вслепую
-# в ту же квоту. Разбор останавливается на первой пустой строке, чтобы
-# проза/фенсы ниже не притворялись фактами (см. header_facts). Одно место
-# правды — раньше жило только в ai_review.py, check_pr.py читало бы вторую
-# копию regex.
-FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at):\s*(.+)$")
+# в ту же квоту. reason — тег причины verdict=error (#431, см.
+# FAILURE_REASON_* выше). Разбор останавливается на первой пустой строке,
+# чтобы проза/фенсы ниже не притворялись фактами (см. header_facts). Одно
+# место правды — раньше жило только в ai_review.py, check_pr.py читало бы
+# вторую копию regex.
+FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at|reason):\s*(.+)$")
+
+
+def transport_failed(dsh_rc: str) -> bool:
+    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
+
+    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
+    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
+    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
+    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
+    точный «модель ответила не по контракту» в редком крайнем случае.
+
+    Одно место правды (#431): раньше жила только в ai_review.py — scheduler
+    (reason_tag ниже) теперь тоже классифицирует по ней, второй копии не
+    заводим (ai_review.transport_failed — реэкспорт отсюда, как и header_facts)."""
+    try:
+        return int(dsh_rc) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def reason_tag(dsh_rc: str, failure_reason: str = "") -> str:
+    """Короткий машиночитаемый тег причины verdict=error — одно из
+    FAILURE_REASON_* выше. Пара к ai_review.error_reason (тот же порядок
+    проверки и те же входы), но возвращает тег для шапки комментария
+    (`reason:`, см. FACT_RE), не текст для человека — scheduler.trigger_ai_review
+    (#431) решает по тегу, не по прозе findings (findings может оказаться
+    и текстом самой модели, см. FAILURE_REASON_* докстринг выше)."""
+    if failure_reason == FAILURE_REASON_QUOTA_EXHAUSTED:
+        return FAILURE_REASON_QUOTA_EXHAUSTED
+    if failure_reason == FAILURE_REASON_RATE_LIMIT_BUDGET:
+        return FAILURE_REASON_RATE_LIMIT_BUDGET
+    if transport_failed(dsh_rc):
+        return FAILURE_REASON_TRANSPORT
+    return FAILURE_REASON_CONTRACT
 
 # ── Автор вердикта — не любой комментатор (дыра, найдена вердиктом ai-review
 # PR #294, у неё выше приоритет, чем у самого #294) ──────────────────────────
@@ -483,7 +535,8 @@ def header_facts(comment_body: str) -> dict[str, str]:
     return facts
 
 
-def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches) -> dict | None:
+def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches,
+                           since: datetime | None = None) -> dict | None:
     """Последний комментарий ДОВЕРЕННОЙ сервисной учётки
     (_is_trusted_verdict_author), тело которого удовлетворяет
     `body_matches(body)` — общий обход «найти свой прошлый комментарий на PR».
@@ -497,11 +550,22 @@ def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches) -> dict | 
     участник может опубликовать любой текст (находка вердикта ai-review
     PR #294) — доверять телу можно только после проверки автора, не вместо
     неё. Порядок выдачи API сохраняется (extend по страницам подряд),
-    «последний по порядку среди доверенных» возвращается как есть."""
+    «последний по порядку среди доверенных» возвращается как есть.
+
+    `since` — необязательный якорь эпохи (находка ревью PR #439): без него
+    функция читает всю историю PR, что для check_pr.py/ai_review.py верно
+    (им нужен последний вердикт вообще, для сравнения отпечатка диффа), но
+    неверно там, где решение обязано различать «вердикт ЭТОЙ эпохи» от
+    «вердикт эпохи прошлой» (scheduler.latest_ai_failure_reason) — комментарии
+    с created_at <= since пропускаются целиком, как будто их не было."""
     latest = None
     for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
         if not _is_trusted_verdict_author(comment):
             continue
+        if since is not None:
+            created_at = comment.get("created_at")
+            if not created_at or datetime.fromisoformat(created_at.replace("Z", "+00:00")) <= since:
+                continue
         if body_matches(comment.get("body") or ""):
             latest = comment
     return latest
@@ -511,7 +575,7 @@ def _is_ai_verdict_body(body: str) -> bool:
     return header_facts(body).get("reviewer") in ("approve", "rework", "error")
 
 
-def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
+def latest_ai_comment(repo: str, pr: int, gh_func, since: datetime | None = None) -> dict | None:
     """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
     опубликованный доверенной учёткой — _is_trusted_verdict_author) —
     источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
@@ -520,9 +584,10 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     зашивается, чтобы функция оставалась инъекцией зависимости и её решение
     (diff_unchanged) проверялось без сети.
 
-    Обход и фильтр доверия — общий latest_trusted_comment выше (#294, #308):
-    матч по значению шапки `reviewer:` отделён в _is_ai_verdict_body."""
-    return latest_trusted_comment(repo, pr, gh_func, _is_ai_verdict_body)
+    Обход и фильтр доверия — общий latest_trusted_comment выше (#294, #308),
+    включая необязательный якорь эпохи `since` (#431/#439): матч по значению
+    шапки `reviewer:` отделён в _is_ai_verdict_body."""
+    return latest_trusted_comment(repo, pr, gh_func, _is_ai_verdict_body, since=since)
 
 
 # ── Идемпотентная публикация вердиктов и комментариев провала (#203) ─────────

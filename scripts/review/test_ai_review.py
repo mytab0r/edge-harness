@@ -737,6 +737,51 @@ def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
     assert "ошибка провайдера/транспорта DSH" in reason
 
 
+# ── reason_tag (#431): короткий тег для шапки комментария, читает scheduler ────
+# Пара к error_reason (тот же порядок проверки), но возвращает МАШИНОЧИТАЕМЫЙ
+# тег, не текст для человека — findings/reason могут оказаться прозой самой
+# модели (см. review_labels.FAILURE_REASON_* докстринг, живой случай PR #329),
+# решение о бюджете автоповторов обязано опираться на структурный факт.
+
+def test_reason_tag_quota_exhausted():
+    assert ai.reason_tag("1", "quota_exhausted") == rl.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_rate_limit_budget():
+    assert ai.reason_tag("1", "rate_limit_retry_budget_exceeded") == rl.FAILURE_REASON_RATE_LIMIT_BUDGET
+
+
+def test_reason_tag_transport_when_rc_nonzero_and_no_failure_reason():
+    assert ai.reason_tag("1", "") == rl.FAILURE_REASON_TRANSPORT
+
+
+def test_reason_tag_contract_when_rc_zero():
+    assert ai.reason_tag("0", "") == rl.FAILURE_REASON_CONTRACT
+
+
+def test_reason_tag_unknown_failure_reason_falls_back_like_error_reason():
+    # Тот же класс защиты, что test_error_reason_failure_reason_ignored_when_verdict_not_error_path:
+    # опечатка в теге не должна тихо стать другой классификацией.
+    assert ai.reason_tag("1", "какой-то незнакомый тег") == rl.FAILURE_REASON_TRANSPORT
+    assert ai.reason_tag("0", "какой-то незнакомый тег") == rl.FAILURE_REASON_CONTRACT
+
+
+def test_build_comment_includes_reason_fact_on_error():
+    body = ai.build_comment(163, "sha163", "error", "ревью не состоялось — ...", [],
+                             reason_tag_value=rl.FAILURE_REASON_TRANSPORT)
+    facts = ai.header_facts(body)
+    assert facts["reason"] == rl.FAILURE_REASON_TRANSPORT
+    assert facts["reviewer"] == "error"
+
+
+def test_build_comment_reason_fact_absent_when_not_error_backward_compat():
+    # Обратная совместимость (тот же приём, что diff_fp): approve/rework не
+    # передают reason_tag_value — старые вызовы/тесты без параметра не ломаются.
+    body = ai.build_comment(163, "sha163", "approve", "Ок.", [])
+    facts = ai.header_facts(body)
+    assert "reason" not in facts
+
+
 # ── Идемпотентность file_tasks: маркер filed: в ПОСЛЕДНЕЙ строке ───────────────
 
 FT = importlib.util.spec_from_file_location(
@@ -1402,6 +1447,76 @@ def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeyp
     joined = " ".join(status_calls[0])
     assert "state=pending" in joined
     assert "state=failure" not in joined
+
+
+def _comment_call(run_gh_calls: list[tuple]) -> str:
+    """Тело последнего POST issues/{n}/comments — прод-форма вызова run_gh
+    (см. cmd_verdict: `-f body=<текст>`)."""
+    for call in run_gh_calls:
+        if call[:2] == ("api", "-X") and "/comments" in call[3]:
+            for arg in call:
+                if isinstance(arg, str) and arg.startswith("body="):
+                    return arg[len("body="):]
+    raise AssertionError("комментарий не найден среди run_gh_calls")
+
+
+def test_cmd_verdict_wires_reason_tag_into_posted_comment_on_transport_error(monkeypatch, tmp_path):
+    # #431: cmd_verdict обязан прокинуть review_labels.reason_tag в
+    # build_comment — scheduler.trigger_ai_review читает именно этот факт.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")
+    args.dsh_rc = "1"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "error"
+    assert facts["reason"] == rl.FAILURE_REASON_TRANSPORT
+
+
+def test_cmd_verdict_wires_quota_reason_tag_from_failure_reason(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")
+    args.dsh_rc = "1"
+    args.failure_reason = "quota_exhausted"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reason"] == rl.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_cmd_verdict_no_reason_fact_on_approve(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert "reason" not in facts
 
 
 def test_ai_review_verdict_posts_status_through_review_labels_helper():

@@ -376,6 +376,42 @@ def test_header_facts_diff_optional_backward_compat():
     assert "diff" not in facts
 
 
+def test_header_facts_reads_reason_field():
+    # #431: reason — тег причины verdict=error, читаемый scheduler'ом.
+    body = "pr: 163\nhead: sha163\nreviewer: error\nreason: transport_error\n\nпроза\n"
+    facts = review_labels.header_facts(body)
+    assert facts["reason"] == "transport_error"
+
+
+# ── Классификация причины verdict=error (#431) ────────────────────────────────
+
+@pytest.mark.parametrize("dsh_rc,expected", [
+    ("0", False), ("1", True), ("", False), ("не-число", False),
+])
+def test_transport_failed(dsh_rc, expected):
+    assert review_labels.transport_failed(dsh_rc) is expected
+
+
+def test_reason_tag_quota_exhausted_beats_transport():
+    # failure_reason решает раньше dsh_rc — квота исчерпана надолго не должна
+    # спутаться с generic-транспортом даже при том же rc≠0.
+    assert review_labels.reason_tag("1", "quota_exhausted") == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_rate_limit_budget_distinct_from_quota():
+    tag = review_labels.reason_tag("1", "rate_limit_retry_budget_exceeded")
+    assert tag == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET
+    assert tag != review_labels.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_transport_when_rc_nonzero_no_failure_reason():
+    assert review_labels.reason_tag("1") == review_labels.FAILURE_REASON_TRANSPORT
+
+
+def test_reason_tag_contract_when_rc_zero_no_failure_reason():
+    assert review_labels.reason_tag("0") == review_labels.FAILURE_REASON_CONTRACT
+
+
 def test_latest_ai_comment_picks_last_reviewer_fact_paginated():
     # Две страницы, по 2 «факта-комментария» на страницу плюс шум без фактов —
     # latest_ai_comment обязан пролистать обе и вернуть последний по порядку

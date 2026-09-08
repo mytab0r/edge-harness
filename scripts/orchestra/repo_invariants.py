@@ -157,6 +157,7 @@ parse_time = pulse_guard.parse_time
 minutes_between = pulse_guard.minutes_between
 escalate = pulse_guard.escalate
 issue_marker_times = pulse_guard.issue_marker_times
+issue_markers_any = pulse_guard.issue_markers_any
 WATCHDOG_ISSUE = pulse_guard.WATCHDOG_ISSUE
 # «PR нездоров дольше этого — действуй» — уже объявленный порог для «состояние
 # держится слишком долго» (scheduler.py, #196). Инварианты 1 и 3 переиспользуют
@@ -409,13 +410,15 @@ def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
     scheduler.ai_review_retry_count для решения «дёргать ли ai-review.yml
     снова» — не гадаем, а читаем то же число, что видит газ.
 
-    attempts_total — за ВСЮ историю PR (так считает сегодняшний
-    scheduler.trigger_ai_review — без since, #431/PR #439 со scoping'ом по
-    эпохе ещё не слит в main). attempts_in_epoch — только попытки С МОМЕНТА
-    anchor (текущая эпоха гейта 1). Расхождение между ними — сам факт
-    переноса бюджета из старой, уже решённой эпохи (живой случай #329/#327,
-    2026-09-06, issue #472): total уже равен лимиту, а in_epoch — 0, потому
-    что все три маркера остались от эпохи, которая давно получила вердикт."""
+    attempts_total — за ВСЮ историю PR, чистая история для СРАВНЕНИЯ эпох, не
+    для решения: газ #196 (scheduler.trigger_ai_review, since=anchor, #431)
+    решает бюджет по attempts_in_epoch. attempts_in_epoch — только попытки С
+    МОМЕНТА anchor (текущая эпоха гейта 1). Расхождение между ними по
+    построению НЕ бюджет прошлой эпохи, перенесённый в текущую (после #431
+    это больше не бага) — total > in_epoch означает «часть попыток осталась в
+    архиве прошлых эпох, текущая эпоха их не наследует»: живой случай
+    #329/#327, 2026-09-06, issue #472, где total уже был равен лимиту, а
+    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет»."""
     attempt_times = sorted(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
     attempts_in_epoch = sum(1 for moment in attempt_times if moment >= anchor)
     return {
@@ -423,6 +426,51 @@ def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
         "attempts_in_epoch": attempts_in_epoch,
         "attempts_limit": AI_REVIEW_MAX_ATTEMPTS,
         "last_attempt_at": attempt_times[-1].isoformat() if attempt_times else None,
+    }
+
+
+def check_ai_failed_budget_exhausted(repo: str, now: datetime, pull: dict) -> dict | None:
+    """Класс #431 (находка ревью PR #439): PR застрял в `ai:failed` — газ
+    #196 (scheduler.trigger_ai_review) исчерпал бюджет автоповторов в этой
+    эпохе гейта 1 и должен был эскалировать в #120 сам (`AI_REVIEW_EXHAUSTED_
+    MARKER`), но раньше эта ветка была НЕВИДИМА check_stuck_review_gate
+    целиком: функция пропускала любой PR с ai:*-меткой, включая ai:failed —
+    тот самый случай, когда PR застрял НЕСМОТРЯ на газ #196, ровно то, что
+    докстринг check_stuck_review_gate обещал ловить. None — либо возраст
+    эпохи ещё в пределах порога, либо бюджет ещё не исчерпан (у #196 есть
+    шанс повторить сам), либо эскалация в этой эпохе уже стоит."""
+    anchor = last_gate1_labeled_at(repo, pull)
+    if anchor is None:
+        return None
+    age = minutes_between(anchor, now)
+    if age <= UNHEALTHY_PR_AFTER_MINUTES:
+        return None
+    budget = retry_budget_fact(repo, pull["number"], anchor)
+    if budget["attempts_in_epoch"] < AI_REVIEW_MAX_ATTEMPTS:
+        return None  # бюджет ещё не исчерпан в этой эпохе — #196 может повторить сам
+    marker = f"{pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #{pull['number']}"
+    # Находка ревью PR #439, вторая половина: газ #196 мог исчерпать бюджет
+    # ТРЕМЯ провалами, из которых последний — квота провайдера (ветка
+    # trigger_ai_review стоит РАНЬШЕ счётчика попыток и делает continue,
+    # эскалируя AI_REVIEW_QUOTA_MARKER, не AI_REVIEW_EXHAUSTED_MARKER).
+    # Инвариант обязан знать оба маркера — иначе он бьёт ложное
+    # «не эскалировано», хотя человек уже оповещён тем же каналом (#120),
+    # тот самый класс фолз-алерта, за который было стыдно в #472.
+    quota_marker = f"{pulse_guard.AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
+    already = issue_markers_any(repo, WATCHDOG_ISSUE, (marker, quota_marker))
+    if any(marker_at > anchor for marker_at, _ in already):
+        return None  # уже эскалировано в этой эпохе (любым из двух маркеров) — #196 справился сам
+    timeline = review_labels.list_timeline(repo, pull["number"], gh)
+    verdict_ever = last_ai_verdict_ever(timeline)  # сам ai:failed — тоже вердикт
+    return {
+        "pr": pull["number"],
+        "age_minutes": round(age, 1),
+        "labeled_at": anchor.isoformat(),
+        "verdict_ever": None if verdict_ever is None else {
+            "label": verdict_ever[0], "at": verdict_ever[1].isoformat(),
+        },
+        "reason": "ai_failed_budget_exhausted_not_escalated",
+        **budget,
     }
 
 
@@ -434,6 +482,12 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     (AI_REVIEW_RETRY_AFTER_MINUTES) с ограничением попыток
     (AI_REVIEW_MAX_ATTEMPTS) — этот инвариант ловит случай, когда PR застрял
     несмотря на газ #196.
+
+    `ai:failed` (газ #196 продолжает автоповторы или уже исчерпал бюджет) —
+    отдельная ветка, check_ai_failed_budget_exhausted (находка ревью #439):
+    здесь она НЕ решается по докстрингу «нет ai:*-метки», а обрабатывается
+    явно, иначе застрявший #431 навсегда остаётся невидим этому инварианту.
+    `ai:ok`/`ai:changes-requested` — вердикт гейта 2 уже есть, не застрял.
 
     #472 (живой алерт 2026-09-06 «либо исчерпал попытки, либо не сработал»):
     каждое нарушение несёт retry_budget_fact (сколько попыток из лимита
@@ -447,7 +501,14 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     violations = []
     for pull in open_pulls:
         labels = {label["name"] for label in pull["labels"]}
-        if not review_labels.gate1_decided(labels) or labels & ai_labels:
+        if not review_labels.gate1_decided(labels):
+            continue
+        if labels & ai_labels:
+            if review_labels.AI_FAILED not in labels:
+                continue  # ai:ok/ai:changes-requested — вердикт уже есть
+            violation = check_ai_failed_budget_exhausted(repo, now, pull)
+            if violation is not None:
+                violations.append(violation)
             continue
         anchor = last_gate1_labeled_at(repo, pull)
         if anchor is None:
@@ -489,17 +550,33 @@ def stuck_gate_fact_line(item: dict) -> str:
     elif in_epoch >= limit:
         budget = f"исчерпан в этой же эпохе ({total}/{limit})"
     else:
+        # total >= limit, но in_epoch < limit: попытки только в прошлых,
+        # уже решённых эпохах (#431 — бюджет НЕ переносится между эпохами по
+        # дизайну) — в текущей эпохе бюджет ещё есть, газ #196 обязан
+        # сработать сам на ближайшем тике; это НЕ причина застревания.
         budget = (
-            f"исчерпан СТАРОЙ эпохой ({total}/{limit}, в текущей — {in_epoch}/{limit}) — "
-            "перенос бюджета между эпохами, класс #431/PR #439 (не слит)"
+            f"попытки только в прошлых эпохах ({total}/{limit} за всю историю), "
+            f"в текущей бюджет есть ({in_epoch}/{limit}) — должен сработать сам"
         )
     if item["last_attempt_at"]:
         budget += f", последняя попытка {item['last_attempt_at']}"
-    verdict = item["verdict_ever"]
-    verdict_text = (
-        "вердикта ai:* не было НИ РАЗУ за всю жизнь PR" if verdict is None
-        else f"вердикт был — {verdict['label']} в {verdict['at']} (до текущей эпохи)"
-    )
+    verdict = item.get("verdict_ever")
+    if verdict is None:
+        verdict_text = "вердикта ai:* не было НИ РАЗУ за всю жизнь PR"
+    else:
+        # Находка ревью PR #439: check_ai_failed_budget_exhausted зовёт
+        # last_ai_verdict_ever, когда ai:failed УЖЕ висит — сам ai:failed
+        # тоже вердикт, и он может быть В ТЕКУЩЕЙ эпохе (проставлен после
+        # anchor), не обязательно в прошлой (это гарантировано только для
+        # ветки check_stuck_review_gate БЕЗ ai:*-меток вовсе — см. докстринг
+        # last_ai_verdict_ever). Фраза сравнивает факт, не гадает.
+        # Обе метки — isoformat() одного и того же tz-aware UTC datetime
+        # (parse_time/anchor.isoformat()), лексикографическое сравнение ISO
+        # 8601 строк одинаковой точности и зоны монотонно совпадает с
+        # сравнением времени — второго парсинга не заводим.
+        epoch_phrase = ("в текущей эпохе" if verdict["at"] >= item["labeled_at"]
+                         else "до текущей эпохи")
+        verdict_text = f"вердикт был — {verdict['label']} в {verdict['at']} ({epoch_phrase})"
     return (
         f"PR #{item['pr']} — {int(item['age_minutes'])} мин без вердикта в "
         f"текущей эпохе (с {item['labeled_at']}); автоповтор: {budget}; {verdict_text}"
