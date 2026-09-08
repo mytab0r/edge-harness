@@ -414,6 +414,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_task_ref.py -q
 
+      # Исход PR ветки задачи — один классификатор на все случаи (#413,
+      # живой случай PR #402/прогон 34002439672): слитый PR (даже уже
+      # закрытый к моменту проверки) — успех, не «нет открытого PR».
+      # Мутация «merged — это провал» красит гвардию.
+      - name: Тесты исхода PR ветки pr_outcome
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_outcome.py -q
+
       # Резолвер «PR → задача» (#259, #394): task_section обязан резолвить
       # задачу PR через resolve_pr_task (единственный источник — имя ветки,
       # тело PR не читается вовсе), а не «первое попавшееся число» из прозы

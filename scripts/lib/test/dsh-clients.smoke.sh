@@ -133,14 +133,19 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   elif [[ "$sig" == *"issue list"* ]]; then
     # Пул свободных задач для auto-сценария воркера (free_task).
     payload="${GH_ISSUE_LIST_JSON:-[]}"
-  elif [[ "$sig" == *"pr list"* && "$sig" == *"--json url"* ]]; then
+  elif [[ "$sig" == *"pr list"* && "$sig" == *"--json number,state,additions,deletions,changedFiles,url"* ]]; then
     # Переопределяемо сценарием (#422): провайдер в лимите — PR не открыт,
     # worker/task.sh обязан различить это от «PR уже есть». Дефолт — ОТДЕЛЬНОЙ
     # переменной, не буквальными скобками внутри ${VAR:-...}: непарная '}' в
     # литерале JSON преждевременно закрывает подстановку (bash: первая
     # НЕэкранированная '}' завершает ${...}, даже если это середина JSON) —
-    # живой прогон CI 34009616520, jq упал на «Unmatched ']'».
-    _default_pr_list_url='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
+    # живой прогон CI 34009616520, jq упал на «Unmatched ']'». Пост-обработка
+    # воркера (#413): PR ветки задачи, открыт и с диффом — успех. Сигнатура и
+    # canned-payload несут ВСЕ поля, что реально запрашивает task.sh —
+    # находка ревью PR #415: без changedFiles здесь заглушка не матчилась на
+    # реальный вызов и молча проваливалась в ветку "payload='[]'" ниже,
+    # happy-path смоук-сценарий красил ложным «PR не найден».
+    _default_pr_list_url='[{"number":9,"state":"OPEN","additions":3,"deletions":1,"changedFiles":1,"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
     payload="${GH_PR_LIST_URL_JSON:-$_default_pr_list_url}"
   elif [[ "$sig" == *"pr list"* ]]; then
     payload='[]'
