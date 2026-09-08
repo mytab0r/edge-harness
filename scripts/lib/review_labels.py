@@ -135,10 +135,30 @@ def merge_label_gate(labels) -> str | None:
     Единственное место, где гейт слияния формулируется словами: scheduler
     печатает причину в отчёт, тесты доказывают обе ветки. Порог «оба гейта
     зелёные» — здесь, а не в вызывающем коде.
-    """
+
+    Гейт 1 засчитан ЛИБО `review:ok`, ЛИБО связкой `review:large` +
+    `review:large-ok` (находка #702, живой случай PR #333) — тот же
+    порог, что `check_pr.py::size_gate` уже применяет НА МОМЕНТ простановки
+    метки (`is_large = size_overflow and LARGE_OK not in labels`, значит при
+    наличии `review:large-ok` очередной ЗАПУСК check_pr.py поставил бы
+    `review:ok`, не `review:large`). Разрыв был здесь: `apply_large_ok`
+    (`ai_review.py`) ставит `review:large-ok` МЕТКОЙ, без нового пуша — а
+    `pr-review.yml` (где живёт check_pr.py) реагирует только на
+    `opened/synchronize/reopened`, не на простановку своей же метки. Без
+    этой строки PR с одобренным размером и AI навсегда стоял бы с
+    `review:large`+`review:large-ok`+`ai:ok`, требуя ЕЩЁ одного, ничем не
+    мотивированного пуша, чтобы гейт заметил уже принятое решение — тормоз
+    без газа (AGENTS.md), хотя `test_gate1_decided_true_does_not_imply_merge_label_gate_open`
+    и докстринг `gate1_decided` уже называли `review:large-ok` условием
+    открытия («слияние ждёт review:large-ok» — ждёт, не игнорирует
+    навсегда)."""
     names = _names(labels)
-    if REVIEW_OK not in names:
-        return f"нет вердикта {REVIEW_OK} (ждёт детерминированное ревью или доработку)"
+    gate1_ok = REVIEW_OK in names or (REVIEW_LARGE in names and LARGE_OK in names)
+    if not gate1_ok:
+        return (
+            f"нет вердикта {REVIEW_OK} (ждёт детерминированное ревью, "
+            f"{LARGE_OK} для крупного диффа, или доработку)"
+        )
     if AI_OK not in names:
         return f"нет вердикта {AI_OK} (ждёт AI-ревью, доработку или повтор после сбоя)"
     return None
@@ -592,9 +612,20 @@ def status_posted_at(repo: str, sha: str, context: str, gh_func) -> str | None:
 
 def review_status_state(verdict: str) -> str:
     """Состояние статуса гейта 1 по вердикт-метке (REVIEW_OK/REVIEW_CHANGES/
-    REVIEW_LARGE) — success только при REVIEW_OK, ровно тот же порог, что
-    merge_label_gate. REVIEW_CHANGES и REVIEW_LARGE оба блокируют слияние —
-    оба дают failure, второго промежуточного состояния тут нет."""
+    REVIEW_LARGE) на МОМЕНТ ПОСЛЕДНЕГО ПУША — success только при REVIEW_OK.
+    REVIEW_CHANGES и REVIEW_LARGE оба блокируют слияние — оба дают failure,
+    второго промежуточного состояния тут нет.
+
+    ВНИМАНИЕ (#702, разошлось с merge_label_gate): этот порог — НЕ то же
+    самое, что открывает merge_label_gate. С #702 `merge_label_gate`
+    засчитывает гейт 1 также по связке REVIEW_LARGE+LARGE_OK, но
+    `review_status_state` вызывается только из `check_pr.py` на каждом
+    пуше, а `LARGE_OK` ставится отдельной меткой (`apply_large_ok`) БЕЗ
+    нового пуша — на PR с REVIEW_LARGE+LARGE_OK+ai:ok этот статус может
+    остаться `failure`, пока merge_label_gate уже открыт. Не чинится здесь
+    (нужна перепубликация статуса из apply_large_ok — заведено отдельной
+    задачей из ревью PR #704), только называется, чтобы вызывающий код не
+    полагался на равенство порогов, которое здесь описывалось раньше."""
     return "success" if verdict == REVIEW_OK else "failure"
 
 
