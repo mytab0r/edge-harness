@@ -187,6 +187,63 @@ def test_build_report_flags_unwired_file_as_orphan(tmp_path):
     assert report["orphans"] == ["scripts/lib/test_unwired.py"]
 
 
+# ── Каталог гвардий (#749): покрытие через опосредованный перебор ──────────
+
+def test_catalog_runner_not_wired_when_no_step_calls_it():
+    steps = [_step("python -m pytest scripts/lib/test_a.py -q")]
+    assert otg._catalog_runner_is_wired(steps) is False
+
+
+def test_catalog_runner_wired_when_bash_step_calls_it():
+    steps = [_step(f"bash {otg.GUARD_CATALOG_RUNNER}")]
+    assert otg._catalog_runner_is_wired(steps) is True
+
+
+def test_iter_guard_catalog_steps_reads_every_sh_file(tmp_path):
+    (tmp_path / "a.sh").write_text("python -m pytest scripts/lib/test_a.py -q\n", encoding="utf-8")
+    (tmp_path / "b.sh").write_text("node --test scripts/x/test/y.test.mjs\n", encoding="utf-8")
+    steps = otg.iter_guard_catalog_steps(tmp_path)
+    assert {s["step"] for s in steps} == {"a.sh", "b.sh"}
+
+
+def test_iter_guard_catalog_steps_empty_dir_returns_empty_list(tmp_path):
+    assert otg.iter_guard_catalog_steps(tmp_path / "does-not-exist") == []
+
+
+def test_build_report_covers_test_invoked_only_inside_catalog_file(tmp_path):
+    # Мутация, доказывающая класс #749: тест-файл, чей pytest-вызов лежит
+    # ТОЛЬКО внутри scripts/ci/guards/<имя>.sh (не в самом workflow), не
+    # считается осиротевшим — потому что каталог реально перебирается
+    # шагом workflow (bash scripts/ci/run_guards.sh).
+    lib = tmp_path / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "test_via_catalog.py").write_text("def test_x():\n    assert True\n")
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "fixture.yml").write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - name: perebor\n"
+        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n"
+    )
+
+    catalog = tmp_path / "scripts" / "ci" / "guards"
+    catalog.mkdir(parents=True)
+    (catalog / "via-catalog.sh").write_text(
+        "python -m pytest scripts/lib/test_via_catalog.py -q\n", encoding="utf-8"
+    )
+
+    report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows, catalog_dir=catalog)
+    assert report["orphans"] == []
+
+    # Убери перебор из workflow (никто больше не вызывает run_guards.sh) —
+    # тот же тест-файл снова осиротевший, а не молча остаётся зелёным по
+    # инерции старого прогона: catalog_dir существует, но не подключён.
+    (workflows / "fixture.yml").write_text("jobs:\n  test:\n    steps: []\n")
+    report_unwired = otg.build_report(repo_root=tmp_path, workflows_dir=workflows, catalog_dir=catalog)
+    assert report_unwired["orphans"] == ["scripts/lib/test_via_catalog.py"]
+
+
 # ── Живой снимок текущего репозитория — сама канарейка ─────────────────────
 
 def test_repo_has_no_orphan_tests():

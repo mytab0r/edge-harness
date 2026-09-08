@@ -50,6 +50,13 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
+# Каталог гвардий (#749): тесты, запускаемые ОПОСРЕДОВАННО через перебор
+# scripts/ci/run_guards.sh, а не напрямую из .github/workflows/*.yml —
+# миграция гвардии в каталог не должна порождать пачку осиротевших тестов
+# (см. iter_guard_catalog_steps/_catalog_runner_is_wired ниже).
+GUARD_CATALOG_DIR = REPO_ROOT / "scripts" / "ci" / "guards"
+GUARD_CATALOG_RUNNER = "scripts/ci/run_guards.sh"
+
 EXCLUDED_DIR_NAMES = {".git", "node_modules", "dist", ".claude", ".githooks"}
 
 # Расширения, которые реально встречаются в директориях `test/` этого
@@ -183,6 +190,43 @@ def iter_workflow_run_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[dict]:
     return steps
 
 
+def _catalog_runner_is_wired(steps: list[dict]) -> bool:
+    """Каталог гвардий засчитывается в покрытие, только если
+    `scripts/ci/run_guards.sh` реально вызван каким-то шагом workflow —
+    иначе файлы каталога не подключены к CI вовсе, и притворяться, что они
+    покрыты, было бы ложным зелёным (#749, тот же класс, который сама
+    канарейка ловит наоборот: «файл лежит, но не запускается»)."""
+    for step in steps:
+        for words in statement_tokens(step["run"]):
+            if not words:
+                continue
+            if words[0] in ("bash", "sh") and len(words) >= 2 and words[1] == GUARD_CATALOG_RUNNER:
+                return True
+            if words[0] == GUARD_CATALOG_RUNNER:
+                return True
+    return False
+
+
+def iter_guard_catalog_steps(catalog_dir: Path = GUARD_CATALOG_DIR) -> list[dict]:
+    """Каждый файл `scripts/ci/guards/*.sh` — псевдо-шаг с его содержимым как
+    run-текст (#749): перебор каталога исполняет их так же, как раньше
+    исполнял рукописный шаг repo-ci.yml, поэтому канарейка обязана видеть
+    команды pytest/node --test внутри них, не только внутри
+    `.github/workflows/*.yml`."""
+    steps: list[dict] = []
+    if not catalog_dir.is_dir():
+        return steps
+    for path in sorted(catalog_dir.glob("*.sh")):
+        steps.append({
+            "workflow": "scripts/ci/guards/" + path.name,
+            "job": "guard-catalog",
+            "step": path.name,
+            "cwd": None,
+            "run": path.read_text(encoding="utf-8", errors="ignore"),
+        })
+    return steps
+
+
 def _resolve(cwd: str | None, arg: str) -> str | None:
     """Путь `arg`, разрешённый относительно `cwd` (оба — repo-relative posix),
     в виде repo-relative posix-строки. `None`, если `cwd` содержит
@@ -290,10 +334,16 @@ def build_coverage(steps: list[dict], test_files: list[str]) -> set[str]:
     return covered
 
 
-def build_report(repo_root: Path = REPO_ROOT, workflows_dir: Path = WORKFLOWS_DIR) -> dict:
+def build_report(
+    repo_root: Path = REPO_ROOT,
+    workflows_dir: Path = WORKFLOWS_DIR,
+    catalog_dir: Path = GUARD_CATALOG_DIR,
+) -> dict:
     files = discover_test_files(repo_root)
     rel_files = [_relpath(f, repo_root) for f in files]
     steps = iter_workflow_run_steps(workflows_dir)
+    if _catalog_runner_is_wired(steps):
+        steps = steps + iter_guard_catalog_steps(catalog_dir)
     covered = build_coverage(steps, rel_files)
 
     exemptions: dict[str, str] = {}
