@@ -1074,7 +1074,19 @@ def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
     ад-хок заголовки без точного текста поля) сюда НЕ входит — та же
     граница, что и у `auto_wire`: ложная связь опаснее отсутствующей,
     эвристика прозы остаётся только предупреждением (`find_desync`,
-    инвариант в неё не входит)."""
+    инвариант в неё не входит).
+
+    Находка ревью PR #711: `blocked_by_open` (REST/GraphQL) содержит ЛЮБОГО
+    открытого блокера — `task_deps.py` фильтрует его только по state, не по
+    метке `task` (не в пуле этого инварианта). `declared_pairs` же строится
+    только из пар с ОБОИМИ концами в пуле (см. фильтр `n in open_numbers`
+    выше) — без симметричного фильтра на стороне `native` ребро на открытую
+    НЕ-task issue (ставится вручную — тот же ручной путь, что дал живой
+    #679→#605) навсегда числилось бы «stale», хотя текст и граф согласны и
+    `declared_deps.py` прямо говорит: ссылка на не-task issue — НЕ рассинхрон
+    (см. модульный докстринг). `native` поэтому фильтруется тем же
+    `open_numbers`, что и `expected` — судим только о паре, оба конца
+    которой видны этому инварианту."""
     open_numbers = {issue["number"] for issue in issues_with_body}
     by_number = {issue["number"]: issue for issue in issues_with_body}
 
@@ -1097,7 +1109,8 @@ def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
 
     violations: list[dict] = []
     for number in sorted(has_declaration):
-        native = {(number, n) for n in (by_number[number].get("blocked_by_open") or [])}
+        native = {(number, n) for n in (by_number[number].get("blocked_by_open") or [])
+                  if n in open_numbers}
         expected = {pair for pair in declared_pairs if pair[0] == number}
         for _, blocking in sorted(expected - native):
             violations.append({"issue": number, "kind": "missing", "number": blocking})

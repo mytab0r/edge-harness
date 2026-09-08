@@ -1217,6 +1217,19 @@ def test_declared_deps_mismatch_covers_reverse_blocking_field_target():
     assert violations == [{"issue": 56, "kind": "missing", "number": 500}]
 
 
+def test_declared_deps_mismatch_silent_when_native_edge_targets_non_pool_issue():
+    # Находка ревью PR #711 (живой прогон ревьюера на #700→#800): текст
+    # называет открытый #800, граф несёт #800 — согласовано. #800 просто НЕ
+    # в пуле (нет метки task, task_deps.py фильтрует его только по state,
+    # не по метке) — тот же класс, что declared_deps.py прямо называет
+    # НЕ рассинхроном (ссылка на не-task issue, см. модульный докстринг).
+    # Без симметричного фильтра native по open_numbers это ребро попадало бы
+    # в «stale» навечно — GATING_RELEASE_CONDITION[9] («0 нарушений») было
+    # бы физически недостижимо для любого пула, где такое ребро есть.
+    issues = [{"number": 700, "body": "## Чем блокируется\n#800\n", "blocked_by_open": [800]}]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
 def test_declared_deps_mismatch_not_in_ci_gating_but_has_release_condition():
     # Живой долг на день внедрения (#679) — гейтить нельзя (см. докстринг
     # check_declared_deps_mismatch и комментарий у CI_GATING), но газ назван
