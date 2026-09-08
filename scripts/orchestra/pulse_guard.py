@@ -428,7 +428,7 @@ FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пр�
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -946,7 +946,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         result = subprocess.run(
             ["gh", "api", "--allow-escape-sequences",
              f"repos/{repo}/actions/jobs/{job_id}/logs"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
             env={**os.environ, "NO_COLOR": "1"},
         )
     except OSError as error:
@@ -1085,7 +1085,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     if reply_markup is not None:
         args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
     except OSError as error:
         print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
         return False

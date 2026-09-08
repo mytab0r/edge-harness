@@ -226,7 +226,7 @@ def test_status_cli(tmp_path):
     csv.write_text(dt.rows_to_csv(summary_fixture()), encoding="utf-8")
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "status", "--csv", str(csv)],
-        capture_output=True, text=True, cwd=SCRIPT.parents[2])
+        capture_output=True, text=True, encoding="utf-8", cwd=SCRIPT.parents[2])
     assert proc.returncode == 0, proc.stderr
     assert "Кампания: 10/100 замеров" in proc.stdout
     assert "медиана **5.5 с**" in proc.stdout

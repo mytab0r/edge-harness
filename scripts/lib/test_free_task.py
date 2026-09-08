@@ -401,7 +401,7 @@ def run_cli(args, cwd=None, env=None):
     run_env = {**os.environ, **env} if env else None
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        capture_output=True, text=True, cwd=cwd, env=run_env,
+        capture_output=True, text=True, encoding="utf-8", cwd=cwd, env=run_env,
     )
 
 

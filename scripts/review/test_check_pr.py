@@ -46,7 +46,7 @@ rl_spec.loader.exec_module(rl)  # type: ignore[union-attr]
 def _run(*extra_args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--pr", "138", *extra_args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={"PATH": __import__("os").environ.get("PATH", "")},  # без GITHUB_REPOSITORY
     )
 
