@@ -6,7 +6,13 @@
 #   3) удаление файла каталога убирает соответствующую проверку из прогона
 #      (критерий приёмки #749 — «мутация: удалить элемент источника —
 #      проверка исчезает, а не остаётся исполняться из забытого места»);
-#   4) пустой каталог красит CI явно, а не молча проходит нулём проверок.
+#   4) пустой каталог красит CI явно, а не молча проходит нулём проверок;
+#   5) файл вне соглашения '*.sh' верхнего уровня (другое расширение/регистр,
+#      без расширения, поддиректория) не теряется молча (#749, ревью PR #771,
+#      блокирующая 3);
+#   6) файл-пустышка (0 байт или только шебанг/`set -euo pipefail`) не
+#      регистрируется как прошедшая проверка (та же блокирующая 3);
+#   7) отсутствующий каталог scripts/ci/guards красит CI явно (minor 12).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -50,20 +56,21 @@ echo "broken about to fail"
 exit 1
 EOF
 
-if (cd "$WORK" && bash scripts/ci/run_guards.sh) >/tmp/run-guards-broken.$$ 2>&1; then
+broken_out="$WORK/run-guards-broken.out"
+if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$broken_out" 2>&1; then
   note "FAIL: сломанная гвардия не уронила прогон"
-  cat /tmp/run-guards-broken.$$
+  cat "$broken_out"
   fail=1
 else
-  if grep -q "гвардия каталога 'broken'" /tmp/run-guards-broken.$$; then
+  if grep -q "гвардия каталога 'broken'" "$broken_out"; then
     note "OK: сломанная гвардия названа по имени и уронила весь прогон"
   else
     note "FAIL: прогон упал, но без явного указания, какая гвардия виновата"
-    cat /tmp/run-guards-broken.$$
+    cat "$broken_out"
     fail=1
   fi
 fi
-rm -f /tmp/run-guards-broken.$$
+rm -f "$broken_out"
 rm -f "$WORK/scripts/ci/guards/broken.sh"
 
 # ── случай 3: мутация — удаление файла каталога убирает проверку из прогона ─
@@ -79,21 +86,115 @@ else
   fail=1
 fi
 
-# ── случай 4: пустой каталог красит CI явно, не проходит нулём молча ───────
-rm -f "$WORK/scripts/ci/guards/alpha.sh"
-if (cd "$WORK" && bash scripts/ci/run_guards.sh) >/tmp/run-guards-empty.$$ 2>&1; then
-  note "FAIL: пустой каталог гвардий прошёл зелёным"
-  cat /tmp/run-guards-empty.$$
+# ── случай 5: записи вне соглашения '*.sh' верхнего уровня не теряются молча ─
+# Живые прогоны гейта (ревью PR #771, блокирующая 3): каждая из этих пяти
+# записей раньше давала EXIT=0 и заниженный счётчик «выполнено N» вместо
+# явного отказа. Проверяем каждую ПООЧЕРЕДНО (не все разом), чтобы отказ на
+# первой не маскировал остальные четыре.
+declare -a unexpected_cases=(
+  "important-guard.bash:#!/usr/bin/env bash\necho important\nexit 1\n"
+  "noext:#!/usr/bin/env bash\necho important\nexit 1\n"
+  "UPPER-GUARD.SH:#!/usr/bin/env bash\necho important\nexit 1\n"
+  "stray.py:print('not a bash guard')\n"
+)
+for case_entry in "${unexpected_cases[@]}"; do
+  case_name="${case_entry%%:*}"
+  case_body="${case_entry#*:}"
+  printf '%b' "$case_body" > "$WORK/scripts/ci/guards/$case_name"
+  case_out="$WORK/run-guards-unexpected.out"
+  if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$case_out" 2>&1; then
+    note "FAIL: запись вне соглашения '$case_name' прошла зелёным (молча не зарегистрирована)"
+    cat "$case_out"
+    fail=1
+  elif ! grep -q "вне соглашения" "$case_out"; then
+    note "FAIL: запись '$case_name' уронила прогон без объясняющего сообщения"
+    cat "$case_out"
+    fail=1
+  else
+    note "OK: запись вне соглашения '$case_name' красит CI явно, а не теряется молча"
+  fi
+  rm -f "$case_out" "$WORK/scripts/ci/guards/$case_name"
+done
+
+# Вложенная поддиректория с *.sh внутри — тоже запись верхнего уровня вне
+# соглашения (сама поддиректория не совпадает с шаблоном `*.sh`).
+mkdir -p "$WORK/scripts/ci/guards/orchestra"
+cat > "$WORK/scripts/ci/guards/orchestra/nested-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+echo important
+exit 1
+EOF
+nested_out="$WORK/run-guards-nested.out"
+if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$nested_out" 2>&1; then
+  note "FAIL: вложенная scripts/ci/guards/orchestra/nested-guard.sh прошла зелёным (молча не зарегистрирована)"
+  cat "$nested_out"
+  fail=1
+elif ! grep -q "вне соглашения" "$nested_out"; then
+  note "FAIL: вложенный каталог уронил прогон без объясняющего сообщения"
+  cat "$nested_out"
   fail=1
 else
-  if grep -q "scripts/ci/guards пуст" /tmp/run-guards-empty.$$; then
+  note "OK: вложенная поддиректория каталога красит CI явно, а не теряется молча"
+fi
+rm -f "$nested_out"
+rm -rf "$WORK/scripts/ci/guards/orchestra"
+
+# ── случай 6: файл-пустышка (0 байт / только шебанг+set) не регистрируется ──
+declare -a empty_cases=(
+  "zero-bytes.sh:"
+  "shebang-only.sh:#!/usr/bin/env bash\nset -euo pipefail\n"
+)
+for case_entry in "${empty_cases[@]}"; do
+  case_name="${case_entry%%:*}"
+  case_body="${case_entry#*:}"
+  printf '%b' "$case_body" > "$WORK/scripts/ci/guards/$case_name"
+  case_out="$WORK/run-guards-empty-file.out"
+  if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$case_out" 2>&1; then
+    note "FAIL: файл-пустышка '$case_name' прошёл зелёным как будто он гвардия"
+    cat "$case_out"
+    fail=1
+  elif ! grep -q "не несёт ни одной команды" "$case_out"; then
+    note "FAIL: файл-пустышка '$case_name' уронил прогон без объясняющего сообщения"
+    cat "$case_out"
+    fail=1
+  else
+    note "OK: файл-пустышка '$case_name' красит CI явно, а не считается прошедшей проверкой"
+  fi
+  rm -f "$case_out" "$WORK/scripts/ci/guards/$case_name"
+done
+
+# ── случай 4: пустой каталог красит CI явно, не проходит нулём молча ───────
+rm -f "$WORK/scripts/ci/guards/alpha.sh"
+empty_dir_out="$WORK/run-guards-empty.out"
+if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$empty_dir_out" 2>&1; then
+  note "FAIL: пустой каталог гвардий прошёл зелёным"
+  cat "$empty_dir_out"
+  fail=1
+else
+  if grep -q "scripts/ci/guards пуст" "$empty_dir_out"; then
     note "OK: пустой каталог красит CI явно"
   else
     note "FAIL: пустой каталог упал, но без объясняющего сообщения"
-    cat /tmp/run-guards-empty.$$
+    cat "$empty_dir_out"
     fail=1
   fi
 fi
-rm -f /tmp/run-guards-empty.$$
+rm -f "$empty_dir_out"
+
+# ── случай 7: каталог scripts/ci/guards вовсе не существует ────────────────
+rmdir "$WORK/scripts/ci/guards"
+missing_dir_out="$WORK/run-guards-missing-dir.out"
+if (cd "$WORK" && bash scripts/ci/run_guards.sh) >"$missing_dir_out" 2>&1; then
+  note "FAIL: отсутствующий каталог scripts/ci/guards прошёл зелёным"
+  cat "$missing_dir_out"
+  fail=1
+elif ! grep -q "scripts/ci/guards не существует" "$missing_dir_out"; then
+  note "FAIL: отсутствующий каталог упал без объясняющего сообщения"
+  cat "$missing_dir_out"
+  fail=1
+else
+  note "OK: отсутствующий каталог scripts/ci/guards красит CI явно"
+fi
+rm -f "$missing_dir_out"
 
 exit "$fail"
