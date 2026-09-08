@@ -2,13 +2,6 @@
   "version": 1,
   "plugins": [
     {
-      "id": "provider-registry",
-      "title": "provider-registry — реестр LLM-провайдеров в морде",
-      "summary": "Владелец добавляет провайдеров и ключи через Settings морды, без файлов хоста и без правки секретов воркера при каждой смене квоты.",
-      "brief": "Напиши серверный DSH-плагин provider-registry: пул выбора провайдеров в UI морды. Источник правды — change openspec/changes/dsh-edge-provider-registry (proposal, design, дельта-спека, задачи): носитель — серверный плагин по образцу runner-bridge (release + sha256 в dsh-edge/plugins.json, server: true), адаптеры через ctx.llm.registerAdapter(), settings-namespace llm-pi-ai. Детали и приёмка — там; этот заказ не заменяет спеку.",
-      "spec": "openspec/changes/dsh-edge-provider-registry"
-    },
-    {
       "id": "combo-auto",
       "title": "combo-auto — виртуальная модель combo/auto",
       "summary": "Автоматическая маршрутизация поверх подключённых провайдеров: failover по исчерпанной квоте, cooldown, заранее объявленный приоритет моделей.",

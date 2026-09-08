@@ -76,6 +76,15 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      граница: общий класс «утверждение о готовом артефакте без адреса»
      статически не выразим и этой гвардией НЕ покрыт — правило держится на
      ревью (AGENTS.md), инвариант закрывает только саму формулу.
+  8. check_wasted_ai_review_runs (#740) — PR несёт финальный ai:*-вердикт,
+     актуальный diff_fingerprint (patch, не sha блоба — #740) совпадает с
+     тем, что записан в шапке этого вердикта, но нашёлся прогон ai-review.yml,
+     стартовавший ПОСЛЕ публикации вердикта: `should_run_ai_review` при
+     таком совпадении обязан был отдать go=false. Живой случай — PR #333,
+     2026-09-08 (см. блок-комментарий у самой функции). Наблюдательный, не в
+     CI_GATING: измерение на живом репозитории до нуля нарушений ещё не
+     сделано (тот же порядок, что у 1/5 — включение отдельной правкой
+     константы после замера).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -495,6 +504,109 @@ def stuck_gate_fact_line(item: dict) -> str:
         f"PR #{item['pr']} — {int(item['age_minutes'])} мин без вердикта в "
         f"текущей эпохе (с {item['labeled_at']}); автоповтор: {budget}; {verdict_text}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 8 (#740): дорогой прогон ai-review стартовал ПОСЛЕ вердикта,
+# хотя отпечаток диффа с тем же вердиктом совпадает — прогон был не нужен
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой случай (issue #740, PR #333, 2026-09-08): вердикт `ai:ok` 06:08:55Z,
+# 06:10:42Z оркестратор подтянул main (merge-коммит, файлы PR — те же
+# патчи), 06:11:04Z стартовал прогон ai-review.yml (6 мин 48 с раннера + шаги
+# gather/DSH), хотя diff_fingerprint (после фикса #740, patch а не sha блоба)
+# доказывает: дифф не менялся. Это состояние держалось часами и не поймалось
+# ничем (см. AGENTS.md, «Инцидент оставляет инвариант»). Причина в конвейере
+# была одна (sha блоба на голове менялся при чужом пересечении, #740) — но
+# инвариант ниже не завязан на неё: он смотрит на НАБЛЮДАЕМЫЙ симптом
+# (прогон после вердикта при совпавшем — по актуальной формуле —
+# отпечатке), поэтому ловит и любой БУДУЩИЙ регресс того же класса, не
+# только повтор буквально этого бага.
+
+def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
+    """Прогоны `ai-review.yml` для PR #pr, СТАРТОВАВШИЕ ПОСЛЕ `since` (ISO,
+    момент публикации вердикта) — признак «этот прогон про PR N» тот же, что
+    у `other_active_ai_review_runs` (review_labels.ai_review_run_name), но
+    без фильтра по статусу: тот инвариант ловит гонку ПРЯМО СЕЙЧАС
+    (queued/in_progress), этот — уже случившийся дорогой прогон постфактум
+    (включая давно завершённые). Одна страница `per_page=100` — тот же
+    компромисс, что у other_active_ai_review_runs (единицы прогонов одного
+    PR, не сотни)."""
+    since_dt = pulse_guard.parse_time(since)
+    chunk = gh_func(
+        f"repos/{repo}/actions/workflows/{review_labels.AI_REVIEW_WORKFLOW_FILE}/runs"
+        f"?per_page=100")
+    runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
+    target = review_labels.ai_review_run_name(pr)
+    found = []
+    for run in runs:
+        if run.get("display_title") != target:
+            continue
+        created_at = run.get("created_at")
+        if not created_at:
+            continue
+        if pulse_guard.parse_time(created_at) > since_dt:
+            found.append({
+                "run_id": run.get("id"),
+                "created_at": created_at,
+                "conclusion": run.get("conclusion"),
+            })
+    return found
+
+
+def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]:
+    """PR несёт ФИНАЛЬНЫЙ вердикт (ai:ok/ai:changes-requested) — и хотя
+    актуальный `diff_fingerprint` (review_labels, #740) совпадает с тем, что
+    записан в шапке `diff:` этого самого вердикта (`diff_unchanged`), нашёлся
+    прогон `ai-review.yml` того же PR, стартовавший ПОСЛЕ публикации
+    вердикта. По контракту `should_run_ai_review` такого прогона быть не
+    должно (совпавший отпечаток при финальном вердикте — `go=false` до
+    чекаута/DSH) — сам факт его существования и есть нарушение, дороже
+    любой гипотезы о причине.
+
+    `ai:failed` НЕ входит в проверяемые лейблы (тот же газ #196, что и
+    `should_run_ai_review`, — автоповтор ПРАВОМЕРНО перезапускает прогон и
+    без изменения диффа, это не растрата, а собственный контракт).
+
+    Нет вердикта, нет сохранённого отпечатка в шапке, отпечаток разошёлся —
+    молчим: сравнивать не с чем или прогон обоснован реальной правкой.
+
+    Сеть — через модульный глобальный `gh` (не параметр по умолчанию!):
+    `gh_func=gh` защёлкнул бы РЕАЛЬНУЮ pulse_guard.gh на момент импорта
+    модуля — `monkeypatch.setattr(ri, "gh", fake)` в тестах меняет атрибут
+    `ri.gh`, но уже связанное значение параметра по умолчанию его не видит
+    (классическая ловушка поздней/ранней привязки в Python). Тот же приём,
+    что у check_stuck_review_gate/last_gate1_labeled_at выше — они читают
+    голое имя `gh` изнутри тела функции (динамический поиск в module dict
+    при каждом вызове), не берут его параметром со значением по умолчанию."""
+    ai_final = {review_labels.AI_OK, review_labels.AI_CHANGES}
+    violations = []
+    for pull in open_pulls:
+        number = pull["number"]
+        labels = {label["name"] for label in pull["labels"]}
+        if not (labels & ai_final):
+            continue
+        comment = review_labels.latest_ai_comment(repo, number, gh)
+        if comment is None:
+            continue
+        facts = review_labels.header_facts(comment.get("body") or "")
+        stored_fp = facts.get("diff")
+        comment_at = comment.get("created_at")
+        if not stored_fp or not comment_at:
+            continue
+        files = review_labels.list_pr_files(repo, number, gh)
+        current_fp = review_labels.diff_fingerprint(files)
+        if not review_labels.diff_unchanged(stored_fp, current_fp):
+            continue
+        wasted_runs = ai_review_runs_after(repo, number, comment_at, gh)
+        if wasted_runs:
+            violations.append({
+                "pr": number,
+                "verdict_at": comment_at,
+                "diff_fingerprint": current_fp,
+                "wasted_runs": wasted_runs,
+            })
+    return violations
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1035,6 +1147,19 @@ def build_report(repo: str, now: datetime,
             lines.append(f"   — {item['file']}:{item['line']} — «{item['match']}»")
     else:
         lines.append("💚 [7] двусмысленной формулы принадлежности плагина нет")
+
+    v8 = check_wasted_ai_review_runs(repo, open_pulls)
+    findings[8] = v8
+    if v8:
+        lines.append(f"🚨 [8] {len(v8)} PR получили дорогой прогон ai-review после вердикта при неизменном диффе (#740):")
+        for item in v8:
+            run_ids = ", ".join(f"#{r['run_id']}" for r in item["wasted_runs"])
+            lines.append(
+                f"   — PR #{item['pr']} — вердикт {item['verdict_at']}, "
+                f"отпечаток не менялся, но прогон(ы) {run_ids} стартовали позже"
+            )
+    else:
+        lines.append("💚 [8] нет дорогих прогонов ai-review после вердикта при неизменном диффе")
 
     return lines, findings
 

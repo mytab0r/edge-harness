@@ -1000,12 +1000,140 @@ def test_ambiguous_artifact_phrase_in_ci_gating_with_gas():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 8 (#740): дорогой прогон ai-review после вердикта при
+# неизменном отпечатке диффа — живой случай PR #333, 2026-09-08
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ai_run(...) — прод-форма записи `workflow_runs[]` эндпоинта
+# `actions/workflows/ai-review.yml/runs` (display_title/created_at/
+# conclusion — те же поля, что уже читает review_labels.
+# other_active_ai_review_runs).
+
+def ai_verdict_comment(pr: int, diff_fp: str, created_at: str, verdict: str = "approve"):
+    bot = {"login": "github-actions[bot]", "type": "Bot"}
+    return {
+        "user": bot, "created_at": created_at,
+        "body": f"pr: {pr}\nhead: deadbeef\nreviewer: {verdict}\ndiff: {diff_fp}\n\nOK\n",
+    }
+
+
+def ai_run(pr: int, created_at: str, run_id: int = 1, conclusion: str = "success"):
+    return {
+        "id": run_id,
+        "display_title": ri.review_labels.ai_review_run_name(pr),
+        "created_at": created_at,
+        "conclusion": conclusion,
+    }
+
+
+def pr_files(sha: str = "aaa111"):
+    return [{"filename": "f.py", "status": "modified", "sha": sha,
+              "patch": "@@ -1 +1 @@\n-a\n+b\n"}]
+
+
+def test_wasted_ai_review_flags_run_after_verdict_with_unchanged_fingerprint(monkeypatch):
+    # Живой случай PR #333: вердикт 06:08:55Z, дифф не менялся, но прогон
+    # стартовал 06:11:04Z — should_run_ai_review обязан был отдать go=false.
+    files = pr_files()
+    fp = ri.review_labels.diff_fingerprint(files)
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": files,
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [ai_run(333, "2026-09-08T06:11:04Z", run_id=34193569472)],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    violations = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 333
+    assert violations[0]["wasted_runs"][0]["run_id"] == 34193569472
+
+
+def test_wasted_ai_review_silent_when_no_run_after_verdict(monkeypatch):
+    # Тот же неизменный отпечаток, но прогонов после вердикта не было —
+    # ровно то, что должно быть в норме (should_run_ai_review сработал).
+    files = pr_files()
+    fp = ri.review_labels.diff_fingerprint(files)
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": files,
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [ai_run(333, "2026-09-08T06:00:00Z", run_id=1)],  # ДО вердикта
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+
+
+def test_wasted_ai_review_silent_when_fingerprint_actually_changed(monkeypatch):
+    # Отпечаток разошёлся — новый прогон после вердикта ОБОСНОВАН реальной
+    # правкой, не растрата. Инвариант не должен путать «прогон случился» с
+    # «прогон был не нужен».
+    stored_fp = "old-fingerprint-does-not-match"
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, stored_fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": pr_files(),  # реальный текущий отпечаток другой
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [ai_run(333, "2026-09-08T06:11:04Z", run_id=2)],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+
+
+def test_wasted_ai_review_silent_without_final_verdict_label():
+    # Нет ai:ok/ai:changes-requested — сравнивать не с чем, инвариант не
+    # обязан идти в сеть вовсе (нет маршрута в FakeGh — упадёт сам, если
+    # код полезет в comments без нужды).
+    fake = FakeGh({})
+    pull = open_pr(333, labels=["review:ok"])
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert fake.calls == []
+
+
+def test_wasted_ai_review_silent_when_ai_failed_not_final(monkeypatch):
+    # ai:failed — не финальный вердикт (газ #196, автоповтор), инвариант не
+    # трогает такой PR вовсе, даже если отпечаток совпал бы.
+    fake = FakeGh({})
+    pull = open_pr(333, labels=["review:ok", "ai:failed"])
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert fake.calls == []
+
+
+def test_wasted_ai_review_silent_without_verdict_comment(monkeypatch):
+    fake = FakeGh({"issues/333/comments": []})
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["ai:ok"])
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+
+
+def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
+    # Докажи мутацией: убрать фильтр «прогон СТАРТОВАЛ ПОСЛЕ вердикта» из
+    # ai_review_runs_after (взять все прогоны PR, не только поздние) — тест
+    # test_wasted_ai_review_silent_when_no_run_after_verdict выше обязан
+    # покраснеть. Здесь — прямая проверка самой функции-фильтра на
+    # прод-форме полей ("id"/"display_title"/"created_at"/"conclusion").
+    runs_response = {"workflow_runs": [
+        ai_run(333, "2026-09-08T06:00:00Z", run_id=1),  # до since — не считается
+        ai_run(333, "2026-09-08T07:00:00Z", run_id=2),  # после since — считается
+        ai_run(999, "2026-09-08T07:00:00Z", run_id=3),  # чужой PR — не считается
+    ]}
+    fake = FakeGh({"actions/workflows/ai-review.yml/runs": runs_response})
+    found = ri.ai_review_runs_after(REPO, 333, "2026-09-08T06:30:00Z", fake)
+    assert [r["run_id"] for r in found] == [2]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
 
 def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, monkeypatch):
-    """Мутация-доказательство холостого хода: здоровое состояние во ВСЕХ пяти
+    """Мутация-доказательство холостого хода: здоровое состояние во ВСЕХ
     инвариантах разом не должно вызвать ни одного -X POST/PUT/DELETE."""
     healthy_tasks = [task_issue(1, "здоровая задача", "нет ссылок", assignees=("someone",))]
     healthy_open_pulls = [open_pr(50, "#1", labels=["review:ok", "ai:ok"])]
@@ -1015,6 +1143,12 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         f"issues?state=open&labels={ri.TASK_LABEL}": healthy_tasks,
         "pulls?state=closed": [],
         "pulls?state=open": healthy_open_pulls,
+        # Инвариант 8 (#740): PR несёт ai:ok — читает последний AI-комментарий
+        # PR, чтобы сверить отпечаток. Пустой список — вердикта-комментария
+        # ещё нет (например, статус проведён вторым каналом, #345), инвариант
+        # молчит по построению (comment is None), не запрашивая ни файлы, ни
+        # прогоны workflow.
+        "issues/50/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")

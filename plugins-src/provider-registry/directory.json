@@ -1,0 +1,22 @@
+[
+  {
+    "route": "zhipu",
+    "displayName": "Z.ai (GLM)",
+    "baseURL": "https://open.bigmodel.cn/api/paas/v4"
+  },
+  {
+    "route": "nvidia-nim",
+    "displayName": "NVIDIA NIM",
+    "baseURL": "https://integrate.api.nvidia.com/v1"
+  },
+  {
+    "route": "openrouter",
+    "displayName": "OpenRouter",
+    "baseURL": "https://openrouter.ai/api/v1"
+  },
+  {
+    "route": "deepseek",
+    "displayName": "DeepSeek API",
+    "baseURL": "https://api.deepseek.com"
+  }
+]

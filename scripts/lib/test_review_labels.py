@@ -230,6 +230,116 @@ def test_diff_fingerprint_order_independent():
         list(reversed(files)))
 
 
+# ── #740: отпечаток считается от `patch` (содержимое относительно ЕГО
+# merge-base), не от `sha` блоба на голове — три сценария на прод-форме,
+# живая пара PR #333 (2026-09-08) плюс ещё один живой merge-коммит с
+# реальным пересечением строк ──────────────────────────────────────────────
+#
+# fixtures_pr333_pull_no_overlap.json — прод-форма (сужена до
+# filename/status/sha/patch через --jq, не пересказ): `gh api
+# repos/mytab0r/edge-harness/compare/<merge-base>...<head>` для PR #333, до
+# подтягивания main (голова 96e6e4fe, merge-base 4e3f8d6a — вердикт
+# ai:ok 06:08:56Z) и после (голова a05cc0c8 — сам merge-коммит, merge-base
+# d143507b). Ровно как назвала находка issue #740: `sha` разошёлся у ОДНОГО
+# файла из одиннадцати (.github/workflows/repo-ci.yml — main правил его в
+# PR #730), но `patch` у него и у остальных десяти — побайтово идентичен.
+#
+# fixtures_pr333_branch_edit.json — тот же PR #333, тот же merge-base
+# (4e3f8d6a), два РЕАЛЬНЫХ последовательных коммита автора на одной ветке
+# (399afce2 → f7847864, оба — раунд 3/4 доводки по ревью, без единого
+# подтягивания main между ними): три файла из одиннадцати меняют `patch`.
+#
+# fixtures_pull_overlap_index.json — прод-форма живого merge-коммита
+# 5813e67f (не PR #333: назвать нужен был реальный случай СОДЕРЖАТЕЛЬНОГО
+# пересечения, а не просто «main тронул тот же файл» — в PR #333 пересечения
+# не было). До подтягивания (голова 835c6f3a, merge-base a50a568b) PR
+# добавляет ссылку на INFRA-CF.md в docs/INDEX.md; main (09a61e2be1) СВОЕЙ
+# правкой того же файла вставляет два абзаца ВЫШЕ по файлу — три-точечный
+# дифф после слияния (голова 5813e67f, merge-base 09a61e2be1) у docs/
+# INDEX.md и docs/research/20-cloudflare-free.md меняет `patch` (сдвиг
+# номеров строк/контекста хайка), у остальных 11 файлов из 13 — нет.
+
+FIXTURE_PR333_NO_OVERLAP = _DIR / "fixtures_pr333_pull_no_overlap.json"
+FIXTURE_PR333_EDIT = _DIR / "fixtures_pr333_branch_edit.json"
+FIXTURE_PULL_OVERLAP = _DIR / "fixtures_pull_overlap_index.json"
+
+
+def test_diff_fingerprint_unchanged_by_pull_without_content_overlap_pr333():
+    # Сценарий (а): подтягивание main, файлы PR #333 пересеклись с main
+    # только там, где содержимое (patch) не поменялось — отпечаток обязан
+    # остаться прежним, как остаётся `ai:ok` и не запускается дорогой прогон
+    # (should_run_ai_review читает именно этот отпечаток — см. тест ниже).
+    before = _load(FIXTURE_PR333_NO_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PR333_NO_OVERLAP, "after_pull")
+    assert review_labels.diff_fingerprint(before) == review_labels.diff_fingerprint(after)
+    # should_run_ai_review видит совпавший отпечаток при уже выданном ai:ok —
+    # дорогой прогон пропускается, метка не трогается этой веткой решения.
+    fp_before = review_labels.diff_fingerprint(before)
+    fp_after = review_labels.diff_fingerprint(after)
+    assert review_labels.should_run_ai_review(
+        [{"name": "ai:ok"}], fp_before, fp_after) is False
+
+
+def test_diff_fingerprint_changes_on_real_branch_edit_pr333():
+    # Сценарий (б): правка автора (два реальных последовательных коммита той
+    # же ветки PR #333, без единого подтягивания main) — отпечаток обязан
+    # измениться, дорогой прогон обязан запуститься.
+    rev1 = _load(FIXTURE_PR333_EDIT, "rev1")
+    rev2 = _load(FIXTURE_PR333_EDIT, "rev2")
+    fp1 = review_labels.diff_fingerprint(rev1)
+    fp2 = review_labels.diff_fingerprint(rev2)
+    assert fp1 != fp2
+    assert review_labels.should_run_ai_review([{"name": "ai:ok"}], fp1, fp2) is True
+
+
+def test_diff_fingerprint_changes_on_pull_with_real_line_overlap():
+    # Сценарий (в): подтягивание main пересекается СОДЕРЖАТЕЛЬНО (main
+    # правит тот же файл рядом со строками PR, три-точечный дифф после
+    # слияния меняется) — отпечаток обязан измениться, дорогой прогон
+    # обязан запуститься на непроверенном содержимом.
+    before = _load(FIXTURE_PULL_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PULL_OVERLAP, "after_pull")
+    fp_before = review_labels.diff_fingerprint(before)
+    fp_after = review_labels.diff_fingerprint(after)
+    assert fp_before != fp_after
+    assert review_labels.should_run_ai_review(
+        [{"name": "ai:ok"}], fp_before, fp_after) is True
+
+
+def test_diff_fingerprint_mutation_guard_head_blob_sha_regresses_no_overlap_case():
+    # Докажи мутацией (AGENTS.md, #740): вернуть отпечаток к SHA блоба на
+    # голове (докод до этой правки) — сценарий (а) обязан покраснеть, ровно
+    # тем набором данных, на котором сломался прод (PR #333, issue #740).
+    before = _load(FIXTURE_PR333_NO_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PR333_NO_OVERLAP, "after_pull")
+
+    def head_blob_sha_fingerprint(files):
+        import hashlib as _hashlib
+        parts = sorted(
+            f"{f.get('filename', '')}:{f.get('status', '')}:{f.get('sha', '')}"
+            for f in files
+        )
+        return _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    # Текущая (исправленная) реализация — отпечаток не меняется.
+    assert review_labels.diff_fingerprint(before) == review_labels.diff_fingerprint(after)
+    # Старая (mutated) реализация на тех же данных — отпечаток МЕНЯЕТСЯ,
+    # то есть покраснела бы, если бы фикс откатили.
+    assert head_blob_sha_fingerprint(before) != head_blob_sha_fingerprint(after)
+
+
+def test_file_content_key_falls_back_to_sha_when_patch_missing():
+    # Честная граница (issue #740): бинарные файлы/файлы, обрезанные GitHub
+    # по размеру, не несут `patch` вовсе — фолбэк на `sha` (эта ветка ошибается
+    # в сторону «изменился» чаще настоящего дифф, что и требует AGENTS.md).
+    no_patch = {"filename": "f.bin", "status": "modified", "sha": "aaa111"}
+    assert review_labels._file_content_key(no_patch) == "sha:aaa111"
+    with_patch = {"filename": "f.py", "status": "modified", "sha": "aaa111",
+                  "patch": "@@ -1 +1 @@\n-a\n+b\n"}
+    assert review_labels._file_content_key(with_patch).startswith("patch:")
+    assert review_labels._file_content_key(with_patch) != "sha:aaa111"
+
+
 def test_diff_fingerprint_same_size_different_content_differs():
     # Класс, который явно назвала задача #252: разные правки одного размера
     # не должны случайно совпасть — blob-sha, не число строк, различает их.
