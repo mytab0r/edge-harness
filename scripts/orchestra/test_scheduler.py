@@ -815,9 +815,9 @@ REPO = "mytab0r/edge-harness"
 
 @pytest.fixture(autouse=True)
 def _reset_update_branch_budget():
-    """Слот update_branch (#252, третий заход) — module-level и общий на
-    прогон планировщика; без явного сброса перед каждым тестом состояние
-    "слот уже занят" утекало бы из одного теста в следующий в том же
+    """Бюджет update_branch (#252 третий заход, счётчик вместо слота — #761)
+    — module-level и общий на прогон планировщика; без явного сброса перед
+    каждым тестом счётчик утекал бы из одного теста в следующий в том же
     процессе pytest."""
     sch.reset_update_branch_budget()
     yield
@@ -1567,15 +1567,17 @@ def test_pr_is_merge_ready_false_on_empty_check_runs_same_as_merge_queue():
 # может его расшить).
 
 
-def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
-    # Второй заход #252: даже среди прошедших предикат кандидатов подтягиваем
-    # РОВНО одного за вызов — подтягивание первого (push, меняет head) само
-    # способно сбросить ai:ok второго тем же циклом, который эта задача и
-    # закрывает. Порядок и предикат не меняются: #2 и #3 оба проходят
-    # should_update_branch, подтянут только первый по порядку — #2.
+def test_update_remaining_pulls_pulls_all_eligible_candidates_within_budget(monkeypatch):
+    # #761: причина «максимум один за проход» (#252, второй заход) была
+    # починена #740 — подтягивание кандидата больше не сбрасывает его же
+    # ai:ok (diff_fingerprint по patch, не по sha блоба головы), поэтому в
+    # рамках бюджета UPDATE_BRANCH_BUDGET_PER_PASS (по умолчанию 50 — здесь
+    # заведомо больше числа кандидатов) подтягиваются ВСЕ прошедшие предикат,
+    # не только первый. #2 и #3 оба проходят should_update_branch и оба
+    # обязаны получить update-branch; #4/#5 предикат не проходят.
     others = [
-        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть первым
-        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат, но не в этом запуске
+        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта
+        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат
         pull(4, labels=["review:ok"]),                     # нет ai:ok — не трогать
         pull(5, labels=["review:ok", "ai:changes-requested"]),  # доработка — не трогать
     ]
@@ -1589,24 +1591,53 @@ def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
     observations, actions = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1
+    assert len(update_calls) == 2, "оба прошедших предикат кандидата обязаны быть подтянуты одним проходом (#761)"
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # слот уже занят #2
+    assert any("pulls/3/update-branch" in c for c in update_calls)
     updated_lines = [line for line in (observations + actions) if "обновлён из main" in line]
     not_close_lines = [line for line in (observations + actions) if "не подтянут" in line]
-    # Находка AI-ревью PR #288: строка обязана называть ПРИЧИНУ (слот занят
-    # другим PR), а не приписывать #3 несостоявшееся обновление — #3 сам не
-    # обновлён, слот занял #2.
-    slot_taken_lines = [
-        line for line in (observations + actions)
-        if "слот update_branch" in line and "занят другим PR" in line
-    ]
-    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
-    assert len(not_close_lines) == 3  # #3 (слот занят), #4, #5 — не близки к слиянию
+    assert len(updated_lines) == 2
+    assert any("#2" in line for line in updated_lines)
+    assert any("#3" in line for line in updated_lines)
+    assert len(not_close_lines) == 2  # только #4 и #5 — не близки к слиянию
     assert any("#4" in line for line in not_close_lines)
     assert any("#5" in line for line in not_close_lines)
-    assert len(slot_taken_lines) == 1 and "#3" in slot_taken_lines[0]  # не молчит, назван следующий прогон
-    assert "следующий прогон" in slot_taken_lines[0]
+    assert not any("бюджет update_branch" in line for line in (observations + actions))  # бюджет не исчерпан
+
+
+def test_update_remaining_pulls_stops_at_budget_exhausted(monkeypatch):
+    # Бюджет по-прежнему конечен (#761 подняло число, не убрало потолок):
+    # с бюджетом, искусственно опущенным до 1, #2 подтягивается, а #3
+    # (тоже проходит предикат) получает строку "бюджет исчерпан", а не
+    # молчаливый пропуск — та же дисциплина видимости, что раньше держал
+    # булев слот (находка AI-ревью PR #288).
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["conflict"]),
+    ]
+    fake = FakeGh({
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # бюджет уже исчерпан #2
+    updated_lines = [line for line in (observations + actions) if "обновлён из main" in line]
+    budget_exhausted_lines = [
+        line for line in (observations + actions)
+        if "бюджет update_branch" in line and "исчерпан" in line
+    ]
+    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
+    assert len(budget_exhausted_lines) == 1 and "#3" in budget_exhausted_lines[0]
+    assert "следующий прогон" in budget_exhausted_lines[0]
+    assert "(1)" in budget_exhausted_lines[0]  # называет само число, не только факт исчерпания
     assert not any("уже обновлён" in line for line in (observations + actions))  # #3 сам не обновлён
 
 
@@ -1626,25 +1657,25 @@ def test_update_remaining_pulls_pulls_large_ok_pr_prod_form(monkeypatch):
 
     Мутация: верни merge_label_gate к буквальному `REVIEW_OK in names` —
     update_calls ниже опустеет (ни #618, ни #333 не подтянутся), а #700
-    остаётся отсеянным в обоих случаях."""
+    остаётся отсеянным в обоих случаях.
+
+    #761: бюджет по умолчанию (50) — оба кандидата, прошедших предикат,
+    подтягиваются одним проходом, не только первый."""
     others = [
         pull(618, labels=["review:large", "review:large-ok", "ai:ok"]),
         pull(333, labels=["review:large", "review:large-ok", "ai:ok"]),
         pull(700, labels=["review:large", "ai:ok"]),  # размер не принят — контроль
     ]
-    fake = FakeGh({"pulls/618/update-branch": None})
+    fake = FakeGh({"pulls/618/update-branch": None, "pulls/333/update-branch": None})
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
     observations, actions = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1 and "pulls/618/update-branch" in update_calls[0]
-    slot_taken_lines = [
-        line for line in (observations + actions)
-        if "#333" in line and "слот update_branch" in line and "занят другим PR" in line
-    ]
-    assert len(slot_taken_lines) == 1, "#333 обязан пройти предикат — слот занял #618, не отсев"
+    assert len(update_calls) == 2, "#618 и #333 оба обязаны быть подтянуты одним проходом (#761)"
+    assert any("pulls/618/update-branch" in c for c in update_calls)
+    assert any("pulls/333/update-branch" in c for c in update_calls)
     not_close_lines = [
         line for line in (observations + actions)
         if "не подтянут" in line and "#700" in line and "не близок к слиянию" in line
@@ -1674,13 +1705,13 @@ def test_update_remaining_pulls_skip_is_not_silent(monkeypatch):
 
 
 def test_update_remaining_pulls_failed_attempt_does_not_consume_slot(monkeypatch):
-    # Находка AI-ревью PR #288: докстринг update_branch обещает "слот
-    # занимается только УСПЕХОМ" — это держится на честном слове, если слот
-    # можно пометить занятым ДО вызова gh (мутация: `pulled = True`/
-    # `_update_branch_used_this_run = True` раньше настоящего push'а). Первый
+    # Находка AI-ревью PR #288: докстринг update_branch обещает "счётчик
+    # увеличивается только УСПЕХОМ" — это держится на честном слове, если
+    # счётчик можно увеличить ДО вызова gh (мутация: `pulled = True`/
+    # `_update_branch_calls_this_pass += 1` раньше настоящего push'а). Первый
     # кандидат падает (не найдя настоящей ошибки — используем боевой
     # update_branch, не заглушку), второй ОБЯЗАН получить попытку тем же
-    # прогоном: неудача не должна расходовать общий слот.
+    # прогоном: неудача не должна расходовать общий бюджет.
     others = [
         pull(2, labels=["review:ok", "ai:ok"]),  # упадёт при update-branch
         pull(3, labels=["conflict"]),             # обязан получить попытку следом
@@ -1870,13 +1901,13 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     assert any("pulls/2/update-branch" in c for c in fake.calls)
 
 
-def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
-    # Находка AI-ревью PR #288 (главная): раньше дисциплина "максимум один
-    # успешно подтянутый за прогон" жила только внутри update_remaining_pulls
-    # — сама behind-ветка merge_queue могла подтянуть НЕСКОЛЬКО behind-PR за
-    # один свой проход по списку `pulls`, ничем не ограниченная. Два behind-PR
-    # с обоими зелёными вердиктами в одном вызове merge_queue обязаны дать
-    # РОВНО один update-branch, второй — отдельную строку "слот занят".
+def test_merge_queue_two_behind_prs_share_one_update_branch_budget(monkeypatch):
+    # Находка AI-ревью PR #288 (главная), потолок поднят #761: behind-ветка
+    # merge_queue и update_remaining_pulls делят ОДИН счётчик update_branch —
+    # два behind-PR с обоими зелёными вердиктами в одном вызове merge_queue
+    # обязаны дать ДВА update-branch в рамках бюджета по умолчанию (50, #740
+    # починил причину «максимум один», см. update_branch), не быть
+    # искусственно серилизованы до одного.
     pulls = [
         pull(2, labels=["review:ok", "ai:ok"]),
         pull(3, labels=["review:ok", "ai:ok"]),
@@ -1896,9 +1927,159 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
     assert merged_number is None
     assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1, "два behind-PR за один проход не должны дать два update-branch"
+    assert len(update_calls) == 2, "оба behind-PR за один проход обязаны подтянуться (#761)"
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert any("слот update_branch" in line and "#3" in line for line in (observations + actions))
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+
+
+def test_merge_queue_two_behind_prs_stop_at_budget_exhausted(monkeypatch):
+    # Бюджет остаётся конечным — с искусственно опущенным до 1 (тот же приём,
+    # что test_update_remaining_pulls_stops_at_budget_exhausted) второй
+    # behind-PR получает отдельную строку "бюджет исчерпан", не тихий пропуск.
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number is None
+    assert updated is True
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "бюджет=1 обязан ограничить подтягивание одним PR"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("бюджет update_branch" in line and "#3" in line for line in (observations + actions))
+
+
+# ── #761: снятие штучного бюджета не возвращает шторм ai-review (прод-форма) ──
+#
+# Фикстура — та же, что уже несёт #740 (не заводим свою, AGENTS.md): прод-
+# форма `gh api repos/mytab0r/edge-harness/compare/<merge-base>...<head>` для
+# реального PR #333 до и после подтягивания main, filename/status/sha/patch,
+# без пересказа (scripts/lib/fixtures_pr333_pull_no_overlap.json, докстринг —
+# scripts/lib/test_review_labels.py:233-245).
+_PR333_FIXTURE = Path(sch.__file__).resolve().parents[1] / "lib" / "fixtures_pr333_pull_no_overlap.json"
+
+
+def _load_pr333_pull_fixture():
+    with open(_PR333_FIXTURE, encoding="utf-8") as file:
+        payload = json.load(file)
+    return payload["before_pull"], payload["after_pull"]
+
+
+def test_update_branch_budget_raise_does_not_reopen_review_storm(monkeypatch):
+    """Требование 3 задачи #761: раз бюджет update_branch поднят настолько,
+    что оба готовых кандидата подтягиваются ОДНИМ проходом (не два
+    последовательных с паузой, как раньше при слоте «1»), это обязано
+    оставаться безопасным для ai:ok — иначе #761 тихо вернул бы шторм
+    ai-review.yml, который закрывал #252. Гарант — фикс #740 (diff_fingerprint
+    по patch, не по sha блоба головы): реальный дифф ДО/ПОСЛЕ подтягивания
+    main у PR #333 (фикстура выше) не пересекается построчно с правкой main,
+    поэтому отпечаток не меняется и `check_pr.ai_verdict_keep` держит ai:ok.
+
+    Сценарий: два PR (#2, #3) оба проходят should_update_branch (оба
+    вердикта зелёные) — update_remaining_pulls с бюджетом по умолчанию
+    (UPDATE_BRANCH_BUDGET_PER_PASS) обязан подтянуть ОБА одним вызовом (не
+    один, как при старом слоте). Для каждого — прод-форма diff_fingerprint
+    ДО/ПОСЛЕ реального подтягивания (фикстура PR #333) не меняется, значит
+    ai_verdict_keep (scripts/review/check_pr.py) держит ai:ok — второй,
+    дорогой гейт не перезапускается ни для одного из двух.
+    """
+    before, after = _load_pr333_pull_fixture()
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/3/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "оба кандидата обязаны подтянуться одним проходом (#761)"
+
+    fp_before = sch.review_labels.diff_fingerprint(before)
+    fp_after = sch.review_labels.diff_fingerprint(after)
+    check_pr = _load_check_pr_module()
+    for _ in others:  # каждый реально подтянутый PR — тот же прод-дифф, тот же вывод
+        assert check_pr.ai_verdict_keep(["ai:ok"], fp_before, fp_after) is True, \
+            "подтягивание в рамках нового бюджета не должно сбрасывать ai:ok на неизменном патче"
+
+
+def test_update_branch_budget_raise_mutation_guard_head_blob_sha_reopens_storm(monkeypatch):
+    """Мутация №1 (различает причину #740 от причины #761, требование 3):
+    верни diff_fingerprint к SHA блоба головы (докод до #740, живой прод-
+    случай PR #333/issue #740) — на этой же прод-форме отпечаток МЕНЯЕТСЯ
+    (main правил тот же файл, что и в head-blob сумме), значит
+    ai_verdict_keep обязан вернуть False — старая причина #252 (шторм)
+    вернулась бы, несмотря на поднятый бюджет. Отличает эту мутацию от
+    мутации №2 ниже (штучный бюджет): здесь update_remaining_pulls всё ещё
+    подтягивает ОБА PR (счётчик не тронут), но подтягивание каждого снова
+    стало бы опасным для его же ai:ok."""
+    before, after = _load_pr333_pull_fixture()
+
+    def head_blob_sha_fingerprint(files):
+        import hashlib as _hashlib
+        parts = sorted(
+            f"{f.get('filename', '')}:{f.get('status', '')}:{f.get('sha', '')}"
+            for f in files
+        )
+        return _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    fp_before = head_blob_sha_fingerprint(before)
+    fp_after = head_blob_sha_fingerprint(after)
+    assert fp_before != fp_after, "прод-форма #333 обязана показывать разошедшийся sha блоба головы"
+    check_pr = _load_check_pr_module()
+    assert check_pr.ai_verdict_keep(["ai:ok"], fp_before, fp_after) is False, \
+        "мутация на sha блоба головы обязана красить тест — причина #252 вернулась бы"
+
+
+def test_update_branch_budget_raise_mutation_guard_single_slot_blocks_second_pr(monkeypatch):
+    """Мутация №2 (различает причину #761 от причины #740, требование 3):
+    верни штучный бюджет к «1 успех за проход» (UPDATE_BRANCH_BUDGET_PER_PASS
+    = 1, докод до #761) — второй кандидат с тем же самым безопасным прод-
+    диффом (fingerprint не меняется, ai:ok не в опасности) всё равно НЕ
+    подтягивается в этом проходе, что и было исходным дефектом задачи #761
+    (25 проходов вместо одного). Отличает эту мутацию от мутации №1 выше
+    (sha блоба головы): здесь сам diff_fingerprint остаётся безопасным
+    (patch-based, #740 не откатывается), опасности для ai:ok нет — но
+    пропускная способность прохода искусственно урезана обратно."""
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/3/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "мутация на штучный бюджет обязана красить тест — второй PR не подтянут"
+    assert any("бюджет update_branch" in line and "#3" in line for line in (observations + actions))
+
+
+def _load_check_pr_module():
+    """check_pr.py — тот же приём загрузки по пути, что и review_labels
+    внутри scheduler.py (см. импорт sch выше): модуль не пакет, path-based
+    import — единственный способ переиспользовать ai_verdict_keep отсюда."""
+    check_pr_path = Path(sch.__file__).resolve().parents[1] / "review" / "check_pr.py"
+    spec = importlib.util.spec_from_file_location("check_pr", check_pr_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
 
 
 def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
