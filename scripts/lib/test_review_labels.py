@@ -582,8 +582,10 @@ def test_should_run_ai_review_mutation_guard_naive_any_verdict_check():
 # ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
 #
 # Класс, который эти тесты ловят: состояние статуса обязано совпадать с тем,
-# что решает метка (review_status_state — тот же порог, что merge_label_gate;
-# ai_status_state — сбой транспорта не должен блокировать слияние навсегда).
+# что решает метка НА МОМЕНТ ПУША (review_status_state; с #702 это уже не тот
+# же порог, что merge_label_gate целиком — см. докстринг review_status_state
+# и дельту #702 в docs/decisions/0007-ai-review-gate.md; ai_status_state —
+# сбой транспорта не должен блокировать слияние навсегда).
 # Докажи мутацией: замени `if verdict == "approve"` на `if verdict != "rework"`
 # в ai_status_state — тест test_ai_status_state_error_is_pending_not_failure
 # покраснеет (error перестанет отличаться от approve).

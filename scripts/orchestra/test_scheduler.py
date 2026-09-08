@@ -1520,6 +1520,48 @@ def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
     assert not any("уже обновлён" in line for line in (observations + actions))  # #3 сам не обновлён
 
 
+def test_update_remaining_pulls_pulls_large_ok_pr_prod_form(monkeypatch):
+    """Прод-форма #702: живые метки PR #618 и #333 (снято `gh api
+    pulls/618`/`pulls/333` 2026-09-08 — `{"labels": ["review:large",
+    "review:large-ok", "ai:ok"], "mergeable": true, "mergeable_state":
+    "behind"}` для обоих) — до фикса merge_label_gate ни один из них не
+    считался «близким к слиянию»: should_update_branch делегирует
+    merge_label_gate напрямую, а тот требовал буквальный review:ok, которого
+    у этой пары никогда бы не появилось без постороннего пуша (apply_large_ok
+    ставит review:large-ok меткой). Круг: PR остаётся BEHIND → strict branch
+    protection не даёт слить → «не близок к слиянию» → main не подтягивается
+    → PR остаётся BEHIND. Контрольный #700 несёт review:large БЕЗ
+    review:large-ok — размер ещё не принят, подтягивание по-прежнему
+    пропускается.
+
+    Мутация: верни merge_label_gate к буквальному `REVIEW_OK in names` —
+    update_calls ниже опустеет (ни #618, ни #333 не подтянутся), а #700
+    остаётся отсеянным в обоих случаях."""
+    others = [
+        pull(618, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(333, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(700, labels=["review:large", "ai:ok"]),  # размер не принят — контроль
+    ]
+    fake = FakeGh({"pulls/618/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1 and "pulls/618/update-branch" in update_calls[0]
+    slot_taken_lines = [
+        line for line in (observations + actions)
+        if "#333" in line and "слот update_branch" in line and "занят другим PR" in line
+    ]
+    assert len(slot_taken_lines) == 1, "#333 обязан пройти предикат — слот занял #618, не отсев"
+    not_close_lines = [
+        line for line in (observations + actions)
+        if "не подтянут" in line and "#700" in line and "не близок к слиянию" in line
+    ]
+    assert len(not_close_lines) == 1, "#700 без review:large-ok обязан остаться отсеянным предикатом"
+
+
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
     # Драфт отсеивается раньше should_update_branch — даже с зелёными
     # вердиктами его не трогаем (см. merge_queue: драфт не сливается никогда).
