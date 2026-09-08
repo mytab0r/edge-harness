@@ -378,9 +378,17 @@ def test_daily_cap_blocks_creation_loudly_once_exhausted(monkeypatch):
             {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
         ],
         "issues?state=all&labels=auto-detected": already_created,
+        # gate:pipeline-paused — не check:red:*, требуемые контексты тут ни при чём,
+        # но код всё равно читает защиту ветки лениво на пути исчерпания потолка (#637).
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    escalated = []
+    monkeypatch.setattr(
+        sd, "escalate",
+        lambda repo, n, text: escalated.append((n, text)) or "Telegram: доставлен; след в #120: оставлен",
+    )
 
     def fail_create(*a, **k):
         pytest.fail("потолок исчерпан — создание задачи запрещено")
@@ -388,6 +396,11 @@ def test_daily_cap_blocks_creation_loudly_once_exhausted(monkeypatch):
 
     result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
     assert any("потолок" in line and "исчерпан" in line for line in result)
+    # #610/#637: исчерпание потолка обязано уйти активным каналом, не только в report
+    assert len(escalated) == 1
+    assert escalated[0][0] == sd.WATCHDOG_ISSUE
+    assert "gate:pipeline-paused" in escalated[0][1]
+    assert any("эскалация потолка автозаведения" in line for line in result)
 
 
 def test_daily_cap_stops_creation_mid_pulse_across_many_new_fingerprints(monkeypatch):
@@ -408,9 +421,12 @@ def test_daily_cap_stops_creation_mid_pulse_across_many_new_fingerprints(monkeyp
             for name in names
         ],
         "issues?state=all&labels=auto-detected": [],  # created_today стартует с нуля
+        # ни один "fresh-i" не required-контекст — все сверх потолка остаются капнутыми (#637).
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: "ok")
 
     created = []
     def counting_create(repo, fingerprint, evidence, run_url):
@@ -422,9 +438,94 @@ def test_daily_cap_stops_creation_mid_pulse_across_many_new_fingerprints(monkeyp
     result = sd.detect_and_act(REPO, NOW, [report_line])
 
     assert len(created) == sd.STALL_DAILY_CAP
-    capped = [line for line in result if "потолок" in line and "исчерпан" in line]
+    capped = [line for line in result if "НЕ заведён" in line]
     assert len(capped) == 2  # ровно два отпечатка сверх потолка не заведены
 
+
+# ── Исключение из потолка для блокирующего класса (#637) ────────────────────
+
+def test_is_blocking_fingerprint_matches_only_required_context():
+    required = {"test", "contract"}
+    assert sd._is_blocking_fingerprint("check:red:test", required) is True
+    assert sd._is_blocking_fingerprint("check:red:contract", required) is True
+    assert sd._is_blocking_fingerprint("check:red:forge", required) is False  # не required (issue #120, 2026-09-06)
+    assert sd._is_blocking_fingerprint("gate:pipeline-paused", required) is False
+    assert sd._is_blocking_fingerprint("warn:что-то", required) is False
+
+
+def test_daily_cap_does_not_block_required_check_red_class(monkeypatch):
+    """Мутация (докажи по AGENTS.md «Починил случай — закрой класс»): убери
+    ветку `_is_blocking_fingerprint` в detect_and_act — этот тест покраснеет
+    (`create_task` не вызовется, потолок проглотит требуемую проверку).
+    Прод-форма: `gh api repos/mytab0r/edge-harness/branches/main/protection`
+    (снято 2026-09-07) — required_status_checks.contexts = ["test","contract"]."""
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    already_created = [
+        _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
+               created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        for i in range(sd.STALL_DAILY_CAP)
+    ]
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('check:red:test')}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": already_created,  # потолок уже 5/5
+        # снято реальным gh api repos/mytab0r/edge-harness/branches/main/protection (2026-09-07)
+        "branches/main/protection": {
+            "required_status_checks": {"strict": True, "contexts": ["test", "contract"]},
+        },
+        "POST repos/mytab0r/edge-harness/issues": {"number": 999},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: "ok")
+
+    result = sd.detect_and_act(REPO, NOW, ["⏸️ #205 — красные проверки: test"])
+
+    assert any("#999" in line and "заведена автодетектором" in line for line in result)
+    assert any("исключение из потолка" in line for line in result)
+    create_call = next(c for c in fake.calls if "POST" in c)
+    assert "check:red:test" in create_call
+
+
+def test_daily_cap_still_blocks_non_required_check_when_exhausted(monkeypatch):
+    """Зеркало предыдущего теста: рядовой (не required) отпечаток по-прежнему
+    НЕ заводится при исчерпанном потолке — исключение не открывает дорогу
+    спаму. `check:red:forge` — живой отпечаток issue #120 (2026-09-06),
+    `forge` не входит в required_status_checks этого репозитория."""
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    already_created = [
+        _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
+               created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        for i in range(sd.STALL_DAILY_CAP)
+    ]
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('check:red:forge')}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": already_created,
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: "ok")
+
+    def fail_create(*a, **k):
+        pytest.fail("forge не required — исключение из потолка не должно сработать")
+    monkeypatch.setattr(sd, "create_task", fail_create)
+
+    result = sd.detect_and_act(REPO, NOW, ["⏸️ #205 — красные проверки: forge"])
+    assert any("потолок" in line and "исчерпан" in line for line in result)
+
+
+# ── Эскалация исчерпания потолка держится на факте ДОСТАВКИ, не попытки
+#    (#610 — видимость эскалации; находка AI-ревью PR #656/#637 — дедуп по
+#    доставке, не по факту issue-комментария, который escalate() пишет
+#    безусловно) ──────────────────────────────────────────────────────────
 
 def test_cap_exhausted_escalates_visibly_without_raising(monkeypatch):
     # Мутационная проверка #610 (инвариант «наблюдатель провалов не реагирует
@@ -445,6 +546,9 @@ def test_cap_exhausted_escalates_visibly_without_raising(monkeypatch):
             {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
         ],
         "issues?state=all&labels=auto-detected": already_created,
+        # gate:pipeline-paused — не check:red:*, требуемые контексты тут ни при чём,
+        # но код всё равно читает защиту ветки лениво на пути исчерпания потолка (#637).
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
@@ -457,33 +561,37 @@ def test_cap_exhausted_escalates_visibly_without_raising(monkeypatch):
 
     assert any("потолок" in line and "исчерпан" in line for line in result)
     assert any("эскалация потолка" in line for line in result)
+    # Telegram доставлен (send_telegram → True) — эскалация запись в #120
+    # (posted[0] — сам алерт, изнутри escalate()).
     assert len(posted) == 1 and posted[0][0] == sd.WATCHDOG_ISSUE
     assert sd.CAP_EXHAUSTED_MARKER in posted[0][1]
     assert NOW.date().isoformat() in posted[0][1]
 
 
 def test_cap_exhausted_escalation_deduped_once_per_day(monkeypatch):
-    # Второй пульс того же дня, потолок всё ещё исчерпан — маркер сегодняшней
-    # эскалации уже стоит в #120: повторной эскалации/Telegram не шлём (не
-    # спамим весь день на один и тот же исчерпанный потолок).
+    # Второй пульс того же дня, потолок всё ещё исчерпан, и ДОСТАВКА уже
+    # ПОДТВЕРЖДЕНА (CAP_EXHAUSTED_DELIVERED_MARKER стоит в #120) — повторной
+    # эскалации/Telegram не шлём (не спамим весь день на один и тот же
+    # исчерпанный потолок).
     first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
     already_created = [
         _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
                created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
         for i in range(sd.STALL_DAILY_CAP)
     ]
-    cap_marker = f"{sd.CAP_EXHAUSTED_MARKER} {NOW.date().isoformat()}]"
+    delivered_marker = f"{sd.CAP_EXHAUSTED_DELIVERED_MARKER} {NOW.date().isoformat()}]"
     fake = FakeGh({
         "issues?state=open&labels=auto-detected": [],
         "issues?state=closed&labels=auto-detected": [],
         "issues/120/comments": [
             {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
-            {"created_at": NOW.isoformat().replace("+00:00", "Z"), "body": f"🚨 {cap_marker}\n..."},
+            {"created_at": NOW.isoformat().replace("+00:00", "Z"), "body": f"{delivered_marker}\nПодтверждение доставки: ..."},
         ],
         "issues?state=all&labels=auto-detected": already_created,
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("доставка уже подтверждена сегодня — второй раз не пишем"))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("эскалация уже была сегодня — второй раз не пишем"))
     monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("эскалация уже была сегодня — Telegram не шлём"))
     monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("потолок исчерпан — создание запрещено"))
@@ -491,6 +599,49 @@ def test_cap_exhausted_escalation_deduped_once_per_day(monkeypatch):
     result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
     assert any("потолок" in line and "исчерпан" in line for line in result)
     assert not any("эскалация потолка" in line for line in result)
+
+
+def test_cap_exhausted_escalation_not_delivered_is_not_deduped_same_day(monkeypatch):
+    """Находка AI-ревью PR #656: escalate() пишет issue-комментарий с
+    CAP_EXHAUSTED_MARKER БЕЗУСЛОВНО, до попытки Telegram — если бы дедуп
+    держался на этом комментарии (а не на CAP_EXHAUSTED_DELIVERED_MARKER),
+    недоставленный Telegram молча признавался бы «сигнализированным» на весь
+    остаток суток. Здесь Telegram НЕ доставляет (send_telegram → False) —
+    подтверждающий маркер не появляется, и следующий пульс (тот же
+    календарный день) повторяет попытку, а не молчит до завтра. Мутация:
+    замени `"Telegram: доставлен" in result` на `True` в detect_and_act —
+    этот тест покраснеет (telegram_calls == 1 вместо 2)."""
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    already_created = [
+        _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
+               created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        for i in range(sd.STALL_DAILY_CAP)
+    ]
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": already_created,
+        "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)  # сам алерт escalate() пишет best-effort
+    telegram_calls = []
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: telegram_calls.append(1) or False)
+    monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("потолок исчерпан — создание запрещено"))
+
+    result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    assert any("НЕ доставлен" in line for line in result)
+    assert len(telegram_calls) == 1
+
+    # Тот же календарный день, следующий пульс (~15 мин) — повтор, не
+    # молчание до завтра: подтверждающего маркера так и не появилось.
+    result_2 = sd.detect_and_act(REPO, NOW + timedelta(minutes=15), [REAL_PIPELINE_PAUSED])
+    assert any("НЕ доставлен" in line for line in result_2)
+    assert len(telegram_calls) == 2
 
 
 # ── Холостой ход: здоровый конвейер — ни одного вызова ─────────────────────

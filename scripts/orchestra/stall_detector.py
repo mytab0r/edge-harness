@@ -72,7 +72,15 @@ GitHub заново и не трогает scheduler.py дальше одной 
      (инвариант «наблюдатель провалов не реагирует на свою инфраструктуру
      мониторинга» — иначе failure_watch завёл бы задачу «CI: orchestra.yml
      падает» на эту же эскалацию, замкнутый цикл, живой случай
-     #578/#580/#589/#592/#598).
+     #578/#580/#589/#592/#598). Дедуп держится на ФАКТЕ доставки, не на
+     факте попытки (находка AI-ревью PR #656, #637): `escalate()` пишет
+     issue-комментарий БЕЗУСЛОВНО, до попытки Telegram — если считать
+     эпизод сигнализированным по одному этому комментарию, недоставленный
+     Telegram молча признаётся «сигнализированным» на весь остаток суток.
+     Подтверждающий маркер (CAP_EXHAUSTED_DELIVERED_MARKER) пишется
+     отдельным комментарием и только когда escalate() вернул "Telegram:
+     доставлен" — без подтверждения следующий пульс (~15 мин) повторяет
+     попытку в пределах тех же суток.
   4. Метка `auto-detected` — на каждой заведённой задаче (плюс обычная
      `task`, чтобы воркер мог её взять). Строка реестра — docs/agents/LABELS.md
      (#207).
@@ -80,6 +88,26 @@ GitHub заново и не трогает scheduler.py дальше одной 
      закрытая дольше ESCALATE_AFTER_HOURS уходит тем же каналом, что
      pulse_guard.escalate (issue-комментарий + Telegram), текст обязан
      заканчиваться разделом «что дальше» (#170).
+  6. Исключение из потолка для БЛОКИРУЮЩЕГО класса (#637, живой инцидент
+     2026-09-07: обязательная проверка `test` покраснела на всех открытых
+     PR — 31 PR, ни один не сливается, пока проверка красная). Потолок
+     существует против спама одним и тем же БЕЗОБИДНЫМ отпечатком
+     (флапающий тест, разовое предупреждение, дедуп по отпечатку и так не
+     даёт второй такой же задаче появиться при живом дубликате) — красный
+     ОБЯЗАТЕЛЬНЫЙ чек ветки main спамом не является по определению: он один,
+     и бездействие означает, что НИ ОДИН открытый PR не сольётся, пока
+     кто-то не увидит сигнал. `_is_blocking_fingerprint` сверяет отпечаток
+     `check:red:<имя>` с ФАКТОМ — списком required-контекстов из
+     `branches/main/protection` (`_required_check_slugs`), а не со списком,
+     зашитым в код: список контекстов иначе разойдётся с настоящей защитой
+     ветки при первом же её изменении. Такой отпечаток заводит задачу, даже
+     когда STALL_DAILY_CAP уже исчерпан, и не тратит саму квоту (не в счёт
+     `created_today` — исключение, а не единица потолка). Остальные
+     отпечатки (`warn:…`, `gate:no-ai-verdict`, `check:red:<чек,
+     НЕ входящий в required_status_checks>` — например `forge`/`CodeQL`,
+     они не required и слиянию не мешают) потолком по-прежнему глушатся как
+     раньше: исключение узкое (один прямо названный факт — «этот контекст
+     required прямо сейчас»), не «эта задача кажется важной».
 
 ## Честный потолок
 
@@ -103,6 +131,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import re
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -167,6 +196,14 @@ ESCALATION_MARKER = "[симптом: эскалация владельцу]"
 # упёршихся в один и тот же исчерпанный потолок за один день, шлют по
 # эскалации на каждый, хотя факт один («потолок сегодня исчерпан»).
 CAP_EXHAUSTED_MARKER = "[симптом: потолок автозаведения исчерпан"
+
+# Подтверждение ДОСТАВКИ того же эпизода (находка AI-ревью PR #656, #637):
+# CAP_EXHAUSTED_MARKER пишется в issue-комментарий БЕЗУСЛОВНО, внутри
+# escalate(), до попытки Telegram — дедуп выше не может держаться на нём,
+# иначе недоставленный Telegram молча дедуплицируется на весь день. Этот
+# маркер пишется ОТДЕЛЬНЫМ комментарием и только когда escalate() вернул
+# "Telegram: доставлен" — на нём и держится дедуп «раз в сутки».
+CAP_EXHAUSTED_DELIVERED_MARKER = "[потолок автозаведения: сигнал доставлен"
 
 
 # ── Извлечение отпечатков из уже готового отчёта пульса ───────────────────
@@ -380,6 +417,38 @@ def _closed_task_reset_times(repo: str) -> dict[str, datetime]:
     return resets
 
 
+# ── Класс «блокирует слияния всего репозитория» (#637, предохранитель 6) ──
+
+
+def _required_check_slugs(repo: str) -> set[str]:
+    """Слаги required-контекстов защиты `main` — читаются из GitHub КАЖДЫЙ
+    раз, когда нужны (см. вызывающий код: лениво, только на пути исчерпания
+    потолка), а не зашиты константой: список required-проверок меняется
+    независимо от этого модуля (branch protection settings), и вторая копия
+    списка здесь разошлась бы с настоящей защитой при первом же её
+    изменении — тот же класс, что предупреждает AGENTS.md про «одно место
+    правды». Сбой чтения — пустое множество: НИ ОДИН отпечаток в этом пульсе
+    не будет признан блокирующим (безопасный отказ в сторону старого
+    поведения — потолок работает как раньше), а не падение всего пульса."""
+    try:
+        protection = gh(f"repos/{repo}/branches/main/protection") or {}
+    except RuntimeError:
+        return set()
+    contexts = (protection.get("required_status_checks") or {}).get("contexts") or []
+    return {_slug(name) for name in contexts}
+
+
+def _is_blocking_fingerprint(fingerprint: str, required_slugs: set[str]) -> bool:
+    """Истина только для `check:red:<имя>`, где `<имя>` — слаг required-
+    контекста ветки main прямо сейчас (см. _required_check_slugs). Красный
+    НЕ-required чек (например `check:red:forge`/`check:red:codeql` — живые
+    отпечатки issue #120 от 2026-09-06) слиянию не мешает и в это исключение
+    не попадает — узкое условие, а не «этот отпечаток выглядит важным»."""
+    if not fingerprint.startswith("check:red:"):
+        return False
+    return fingerprint[len("check:red:"):] in required_slugs
+
+
 def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | None = None) -> list[str]:
     """Вызывается КАЖДЫМ пульсом оркестратора с уже готовым отчётом (тем же
     списком строк, что печатается в GITHUB_STEP_SUMMARY). Пустой вход
@@ -395,6 +464,7 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
     created_today: int | None = None  # считаем лениво — только если понадобится создание
     reset_times: dict[str, datetime] | None = None  # тоже лениво — только если есть что фильтровать
     cap_escalated_today: bool | None = None  # лениво — только при первом исчерпании потолка
+    required_slugs: set[str] | None = None  # тоже лениво — только на пути исчерпания потолка (#637)
 
     for fingerprint, evidence in grouped.items():
         existing = find_open_task(repo, fingerprint, open_auto)
@@ -441,6 +511,21 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
         if created_today is None:
             created_today = auto_tasks_created_since(repo, now - timedelta(hours=24))
         if created_today >= STALL_DAILY_CAP:
+            if required_slugs is None:
+                required_slugs = _required_check_slugs(repo)
+            if _is_blocking_fingerprint(fingerprint, required_slugs):
+                # Предохранитель 6 (см. докстринг модуля, #637): красный
+                # required-чек блокирует слияния всего репозитория — потолок
+                # против спама сюда не применяется, и задача не тратит саму
+                # квоту (created_today НЕ растёт — это исключение, не единица
+                # потолка).
+                number = create_task(repo, fingerprint, evidence, run_url)
+                report.append(
+                    f"🆕 задача #{number} заведена автодетектором по отпечатку {fingerprint} "
+                    f"— потолок {created_today}/{STALL_DAILY_CAP} исчерпан, но чек required "
+                    "для main, слияния блокированы целиком: исключение из потолка (#637)"
+                )
+                continue
             report.append(
                 f"🚨 потолок автозаведённых задач в сутки исчерпан ({created_today}/{STALL_DAILY_CAP}) "
                 f"— отпечаток {fingerprint} НЕ заведён, нужен человек"
@@ -453,14 +538,23 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
             # failure_watch (тот же пульс наблюдает orchestra.yml) завёл бы
             # задачу «CI: orchestra.yml падает» НА ЭТУ ЖЕ эскалацию — замкнутый
             # цикл, тот самый живой случай #578/#580/#589/#592/#598, который
-            # #610 закрывает). Дедуп — один раз в календарные сутки, не на
-            # каждый непринятый отпечаток этого же пульса (cap_escalated_today
-            # кэширует решение на весь этот вызов, второй проверки маркера
-            # в этом же цикле не заводим).
+            # #610 закрывает). Дедуп — по ФАКТУ ДОСТАВКИ (находка AI-ревью
+            # PR #656, #637), не по факту попытки: `cap_marker` пишется
+            # escalate()'ом в issue-комментарий БЕЗУСЛОВНО, до попытки
+            # Telegram — если бы дедуп держался на нём, недоставленный
+            # Telegram молча признавался бы «сигнализированным» на весь
+            # остаток суток. `cap_escalated_today` проверяет отдельный
+            # CAP_EXHAUSTED_DELIVERED_MARKER, который пишется ОТДЕЛЬНЫМ
+            # комментарием и только когда escalate() подтвердил "Telegram:
+            # доставлен"; без подтверждения следующий пульс (~15 мин)
+            # повторяет попытку в пределах тех же суток (кэш
+            # cap_escalated_today на этот вызов не мешает — False остаётся
+            # False, повтор произойдёт на СЛЕДУЮЩЕМ вызове detect_and_act).
             if cap_escalated_today is None:
                 cap_marker = f"{CAP_EXHAUSTED_MARKER} {now.date().isoformat()}]"
+                delivered_marker = f"{CAP_EXHAUSTED_DELIVERED_MARKER} {now.date().isoformat()}]"
                 try:
-                    cap_escalated_today = bool(issue_marker_times(repo, WATCHDOG_ISSUE, cap_marker))
+                    cap_escalated_today = bool(issue_marker_times(repo, WATCHDOG_ISSUE, delivered_marker))
                 except RuntimeError as error:
                     report.append(f"⚠️ эскалация потолка не проверена (маркеры #{WATCHDOG_ISSUE} недоступны): {error}")
                     cap_escalated_today = True  # не гадаем повторно на этом же пульсе
@@ -481,8 +575,22 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
                             "или поднять STALL_DAILY_CAP, если объём временный."
                         )
                         result = escalate(repo, WATCHDOG_ISSUE, text)
-                        report.append(f"🚨 эскалация потолка автозаведения ({result})")
-                        cap_escalated_today = True
+                        if "Telegram: доставлен" in result:
+                            try:
+                                post_issue_comment(
+                                    repo, WATCHDOG_ISSUE,
+                                    f"{delivered_marker}\nПодтверждение доставки: {result}",
+                                )
+                            except RuntimeError as error:
+                                # Доставлено, но подтверждение не записалось — не
+                                # тормоз: без маркера следующий пульс просто
+                                # повторит алерт (safe-повтор дешевле тихой дыры).
+                                print(f"::warning::подтверждение доставки потолка не записано в #{WATCHDOG_ISSUE} — {error}", file=sys.stderr)
+                            report.append(f"🚨 эскалация потолка автозаведения ({result})")
+                            cap_escalated_today = True
+                        else:
+                            report.append(f"⚠️ потолок автозаведения исчерпан, Telegram НЕ доставлен — повтор на следующем пульсе ({result})")
+                            cap_escalated_today = False
             continue
 
         number = create_task(repo, fingerprint, evidence, run_url)

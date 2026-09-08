@@ -1183,6 +1183,27 @@ def merge_queue(
                 actions.append(result)
             continue
         if state not in ("clean", "unstable", "has_hooks"):
+            if state == "blocked":
+                # Красный ОБЯЗАТЕЛЬНЫЙ чек тоже даёт mergeable_state=blocked
+                # (GitHub не различает в этом поле «чек красный» и «ревью не
+                # поставлено») — без явной проверки check-runs здесь имя
+                # красного required-контекста НИКОГДА не попадает в «красные
+                # проверки: …» этой функции, а значит и в отпечаток
+                # check:red:<имя> детектора простоя (#201/#637): живой
+                # инцидент 2026-09-07, обязательная проверка `test` красная
+                # на всех 31 открытых PR (mergeable_state=blocked у каждого,
+                # проверено `gh api repos/.../pulls/N`), при этом check:red:test
+                # ни разу не встречался в WATCHDOG_ISSUE (#120) за всю историю
+                # проекта — только check:red:forge/check:red:codeql (НЕ
+                # required-контексты, у них mergeable_state оказывается
+                # unstable, не blocked, и код ниже уже их ловил). Наблюдение
+                # ниже ничего не меняет в решении «сливать/не сливать» —
+                # чисто добавочная видимость причины.
+                blocked_checks = gh(f"repos/{repo}/commits/{pull['head']['sha']}/check-runs?per_page=100")
+                bad_blocked = bad_check_names(blocked_checks.get("check_runs", []))
+                if bad_blocked:
+                    skipped.append(f"#{pull['number']} — красные проверки: {', '.join(bad_blocked)}")
+                    continue
             skipped.append(f"#{pull['number']} — mergeable_state={state or 'не вычислен GitHub'}")
             continue
         checks = gh(f"repos/{repo}/commits/{pull['head']['sha']}/check-runs?per_page=100")

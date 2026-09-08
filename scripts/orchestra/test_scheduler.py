@@ -1942,6 +1942,55 @@ def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
     assert len(updated_lines) == 1 and "#3" in updated_lines[0]
 
 
+# ── mergeable_state=blocked с красным required-чеком тоже назван по имени (#637) ──
+
+
+def test_merge_queue_blocked_state_reports_red_check_name(monkeypatch):
+    """Живой инцидент 2026-09-07: обязательная проверка `test` красная на
+    ВСЕХ открытых PR — `gh api repos/.../pulls/N` реально отдаёт
+    `mergeable_state: "blocked"` (снято на PR #644/#641 в проде), а без этой
+    гвардии `mergeable_state not in (clean, unstable, has_hooks)` уводил
+    такой PR в generic-наблюдение «mergeable_state=blocked» БЕЗ имени чека —
+    строка «красные проверки: …», от которой зависит отпечаток
+    check:red:<имя> детектора простоя (#201), никогда не формировалась для
+    required-контекста (только для НЕ-required — mergeable_state там
+    unstable, не blocked). Мутация: убери ветку `if state == "blocked":` —
+    этот тест покраснеет (наблюдение вернётся к generic mergeable_state=…)."""
+    pulls = [pull(2, labels=["review:ok", "ai:ok"])]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "blocked"},
+        "commits/sha2/check-runs": {"check_runs": [{"name": "test", "conclusion": "failure"}]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number is None
+    assert updated is False
+    assert not any(c.startswith("-X PUT") and "/merge" in c for c in fake.calls)
+    assert any("красные проверки: test" in line for line in observations)
+    assert not any("mergeable_state=blocked" in line for line in observations)
+
+
+def test_merge_queue_blocked_state_without_bad_checks_falls_back_to_generic(monkeypatch):
+    """Зеркало предыдущего теста: `blocked` не ВСЕГДА означает красный чек
+    (например «review ещё не поставлен») — без единого красного check-run
+    наблюдение остаётся generic `mergeable_state=blocked`, как и раньше."""
+    pulls = [pull(2, labels=["review:ok", "ai:ok"])]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "blocked"},
+        "commits/sha2/check-runs": {"check_runs": [{"name": "test", "conclusion": "success"}]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert any("mergeable_state=blocked" in line for line in observations)
+    assert not any("красные проверки" in line for line in observations)
+
+
 # ── Гвардия clean-состояния: гейт слияния не обходится за пределами behind ──────
 
 
