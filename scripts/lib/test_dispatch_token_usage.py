@@ -70,6 +70,12 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
     "hands.yml",
+    # #716: проверка id модели у OpenAI-compatible эндпоинта (workflow_dispatch,
+    # secrets[inputs.secret_name] — динамическая индексация ИМЕНИ секрета
+    # провайдера). Репо-секретов GH_DISPATCH_TOKEN/GH_PIPELINE_PAT не читает
+    # вовсе (permissions: {}), тот же класс, что branch-protection-watch.yml
+    # выше — не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "llm-provider-models.yml",
     "orchestra.yml",
     # #254: repository_dispatch от морды (owner-decision), только github.token
     # (issues: write) — тот же класс, что branch-protection-watch.yml выше:
