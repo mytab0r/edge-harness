@@ -47,6 +47,12 @@
 #     только если задан секрет соответствующей учётки — молчаливый дефолт
 #     здесь невозможен по построению самого combo-router (пустой routes при
 #     enabled:true падает конструктором роутера).
+#   - scripts/lib/test_provider_secrets_import.py, фикстура DSH_CI_FIXTURE
+#     (#733): синтетический клон формата PLUGINS_SUITE_CANDIDATE_ROUTES с
+#     заменёнными на "model-a/b/c" именами моделей — но реальные URL
+#     (integrate.api.nvidia.com, api.z.ai) в фикстуре остаются буквальными,
+#     потому что тест разбирает реальный формат строки, не придуманный;
+#     это не фолбэк-дефолт, а тестовые данные.
 #   - этот файл (regex-литералы самой гвардии).
 set -euo pipefail
 
@@ -99,6 +105,9 @@ while IFS= read -r f; do
       esac
       if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
         case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
+      fi
+      if [ "$f" = "scripts/lib/test_provider_secrets_import.py" ]; then
+        case "$content" in *'"nvidia-nim-'*|*'"zai-'*) continue ;; esac
       fi
       if [ "$f" = ".github/workflows/deploy-dsh-edge.yml" ]; then
         case "$content" in *'deepseek-v4-flash"'*) continue ;; esac
