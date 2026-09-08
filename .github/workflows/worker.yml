@@ -84,7 +84,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
           WORKER_LOGIN: mytab0r
           WORKER_TASK: ${{ inputs.task }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Индексация secrets[vars.…] (#716) — имя секрета с ключом провайдера
+          # объявлено ОДНОЙ vars.DSH_PROVIDER_KEY_SECRET, смена провайдера не
+          # правит этот файл (см. ai-review.yml для полного обоснования).
+          DEEPSEEK_API_KEY: ${{ secrets[vars.DSH_PROVIDER_KEY_SECRET] }}
           # Пульс живости (#112-стопгэп): пока DSH работает, журнал принимает
           # /api/heartbeat — «жив/висит» видно без ожидания конца job'а.
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}

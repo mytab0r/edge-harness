@@ -35,6 +35,10 @@ dsh_require_provider_env() {
     missing=1
   fi
   if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+    # Значение сюда попадает из secrets[vars.DSH_PROVIDER_KEY_SECRET] на
+    # уровне workflow (#716, docs/runbooks/switch-llm-provider.md) — сама
+    # переменная окружения здесь не переименована, только источник значения
+    # у вызывающего workflow-файла.
     echo "::error::DEEPSEEK_API_KEY не задан — DSH не сможет вызвать модель" >&2
     missing=1
   fi

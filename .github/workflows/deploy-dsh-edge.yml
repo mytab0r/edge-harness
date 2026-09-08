@@ -569,12 +569,15 @@ jobs:
       # Проверка не дублирует dsh_require_provider_env своим текстом (#153,
       # находка 7) — репозиторий уже чекаутнут в github.workspace, зовём ту же
       # функцию, что и раннеры.
+      # Ключ — индексация secrets[vars.…] (#716), не жёстко secrets.DEEPSEEK_API_KEY:
+      # имя секрета объявлено ОДНОЙ vars.DSH_PROVIDER_KEY_SECRET (см. ai-review.yml
+      # для полного обоснования и живого доказательства механизма).
       - name: Секреты провайдера морды
         working-directory: ${{ github.workspace }}/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets[vars.DSH_PROVIDER_KEY_SECRET] }}
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
         run: |

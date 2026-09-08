@@ -358,7 +358,14 @@ jobs:
       - if: steps.fingerprint.outputs.go == 'true' && steps.gather.outputs.empty_diff != 'true'
         name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Ключ — НЕ жёстко secrets.DEEPSEEK_API_KEY (#716): имя секрета,
+          # который держит текущий ключ провайдера, само объявлено переменной
+          # репозитория (vars.DSH_PROVIDER_KEY_SECRET), а сюда попадает через
+          # индексацию контекста secrets[...] (документированный паттерн GitHub
+          # для матриц секретов, живой прогон подтверждён issue #716). Смена
+          # провайдера — смена ОДНОЙ vars.DSH_PROVIDER_KEY_SECRET, без правки
+          # этого или любого другого workflow-файла.
+          DEEPSEEK_API_KEY: ${{ secrets[vars.DSH_PROVIDER_KEY_SECRET] }}
           # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
           # Зашитого фолбэка здесь больше нет; пусто → dsh_require_provider_env
           # в review/ai_dsh.sh падает громко до какой-либо дорогой работы.

@@ -1,0 +1,49 @@
+# Проверка точного id модели у OpenAI-compatible эндпоинта провайдера — БЕЗ
+# экстраполяции (docs/runbooks/switch-llm-provider.md, шаг 1: id вида
+# "nvidia/nemotron-3-ultra-550b-a55b" по аналогии с уже известным — это
+# ДОГАДКА, не факт, сверяется буква в букву с живым ответом /v1/models).
+#
+# Ключ передаётся ИМЕНЕМ секрета (secret_name), не значением: индексация
+# контекста secrets[<expression>] (документированный паттерн GitHub для
+# матричного выбора секрета, живой прогон подтверждён issue #716) — значение
+# ключа никогда не попадает в inputs/логи этого workflow, только имя уже
+# существующего repo secret. Ключ НЕ печатается: только список моделей.
+name: llm-provider-models
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Базовый URL провайдера (без /models), например https://integrate.api.nvidia.com/v1"
+        required: true
+        type: string
+      secret_name:
+        description: "Имя GitHub Actions secret с ключом провайдера (например NVIDIA_API_KEY или DEEPSEEK_API_KEY)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  list-models:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Список моделей провайдера (ключ не печатается)
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          PROVIDER_KEY: ${{ secrets[inputs.secret_name] }}
+        run: |
+          if [ -z "$PROVIDER_KEY" ]; then
+            echo "::error::secrets[${{ inputs.secret_name }}] пуст или такого секрета нет в репозитории — проверь имя (регистр, опечатки)." >&2
+            exit 1
+          fi
+          echo "Провайдер: $BASE_URL (секрет: ${{ inputs.secret_name }})"
+          code=$(curl -sS -o /tmp/models.json -w '%{http_code}' \
+            "${BASE_URL%/}/models" -H "Authorization: Bearer $PROVIDER_KEY")
+          if [ "$code" != "200" ]; then
+            echo "::error::GET ${BASE_URL%/}/models вернул HTTP $code — провайдер недоступен или ключ неверный." >&2
+            cat /tmp/models.json >&2 || true
+            exit 1
+          fi
+          echo "Ответ /models (id моделей буква в букву, для сверки с раннбуком):"
+          python3 -m json.tool /tmp/models.json
