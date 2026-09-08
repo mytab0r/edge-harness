@@ -236,6 +236,20 @@ if [ -n "$hardcoded" ]; then
   fail=1
 fi
 
+# 11: каждое имя в CF_OWN_WORKERS обязано происходить из деплой-источников
+# проекта (некритичное замечание ревью PR #328): воркер проекта добавили или
+# переименовали, а allowlist не обновили — тогда own_count == expect,
+# предупреждения нет, и свой воркер навсегда числится «чужим, не показано»,
+# никто не обязан это заметить. Гвардия сверяет allowlist с теми же двумя
+# местами, из которых деплой берёт имена (cf-worker/wrangler.jsonc,
+# deploy-dsh-edge.yml).
+for own_name in $CF_OWN_WORKERS; do
+  if ! grep -q "\"$own_name\"" "$dir/../../cf-worker/wrangler.jsonc" "$dir/../../.github/workflows/deploy-dsh-edge.yml"; then
+    echo "::error::CF_OWN_WORKERS называет '$own_name', но его нет ни в cf-worker/wrangler.jsonc, ни в .github/workflows/deploy-dsh-edge.yml — allowlist разошёлся с деплой-источниками проекта (обнови CF_OWN_WORKERS в scripts/cf/lib.sh)"
+    fail=1
+  fi
+done
+
 if [ "$fail" = 0 ]; then
   echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт, allowlist api.sh и отказ на dot-сегментах — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
 fi
