@@ -457,7 +457,9 @@ export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 dsh_install "$WORK/pkgs"
 dsh --version || true
+dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
 dsh_patch_profile headless
+dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
