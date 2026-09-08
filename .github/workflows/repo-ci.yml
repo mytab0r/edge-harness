@@ -431,6 +431,19 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pagination_guard.py -q
 
+      # Утечка секрета (#743, живой случай — DSH_CHAIN_CLASS_NOTE,
+      # scripts/lib/dsh-ci.sh, до фикса): сырой stderr клиента модели уходил
+      # в публичный лог без redact() — GitHub маскирует только точное
+      # совпадение секрета, производное (эхо заголовка Authorization) не
+      # маскируется. Гвардия сканирует scripts/**/*.sh на команды-извлечения
+      # содержимого файла (cat/tr/cut/head/tail/sed/…), применённые к
+      # err_file/stderr.txt/answer_file/answer.txt, без redact в том же
+      # pipe-конвейере — новое такое место красит CI.
+      - name: Гвардия «сырой stderr клиента модели без redact» (#743)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dsh_stderr_redact_guard.py -q
+
       # Класс «метку ставит событие A, снимает только событие B, не
       # покрывающее способ реального исправления» (#599, живой случай PR
       # #586: contract:failed висел вечно, потому что правка ТЕЛА PR не
