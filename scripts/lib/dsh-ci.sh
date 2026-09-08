@@ -230,12 +230,39 @@ dsh_require_provider_chain() {
 # другая нераспознанная ошибка (ключ битый, DSH сам сломан, битый запрос) —
 # «stop», цепочка НЕ идёт дальше: следующий провайдер тем же кодом/запросом
 # не спасёт, а время/квоту потратит.
+#
+# #737 (живой случай — прогон 34188152283, NVIDIA rc=1, НИ ОДНОГО байта в
+# stderr): третий, отдельный признак — сигнала нет вообще (stderr пуст или
+# состоит только из пробелов). Заведомо-нелечимый сменой провайдера отказ
+# (битый ключ, нарушение контракта вердикта, битый аргумент запроса) ВСЕГДА
+# печатает диагностическую строку — тишина неотличима от временного
+# транспортного сбоя, ради которого цепочка и строилась (proposal.md,
+# «повторяемый транспортный отказ… переключают… без участия человека»). Цена
+# ошибки при выборе «переключаемый» здесь — потратить время следующего
+# провайдера; цена выбора «стоп» — молчать всю оставшуюся цепочку без единой
+# причины, как и случилось. По умолчанию — переключаемся.
+#
+# DSH_CHAIN_CLASS_NOTE (переменная, не возврат) — человекочитаемая причина
+# решения для сообщения вызывающего (правило AGENTS.md «Алерт не гадает»):
+# имя признанной причины, литеральный маркер stderr, факт «stderr пуст» или
+# первая строка нераспознанной диагностики (стоп-класс).
 dsh_chain_should_advance() { # err_file failure_reason
   local err_file=$1 reason=$2
   case "$reason" in
-    quota_exhausted|rate_limit_retry_budget_exceeded) return 0 ;;
+    quota_exhausted|rate_limit_retry_budget_exceeded)
+      DSH_CHAIN_CLASS_NOTE="$reason"
+      return 0 ;;
   esac
-  grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"
+  if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
+    return 0
+  fi
+  if [ ! -s "$err_file" ] || ! grep -qE '[^[:space:]]' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="stderr пуст — диагностику дать не может, класс не установить, консервативно пробую следующего"
+    return 0
+  fi
+  DSH_CHAIN_CLASS_NOTE="$(tr '\n' ' ' <"$err_file" | cut -c1-200)"
+  return 1
 }
 
 # Дата сброса квоты — прод-форма «Your limit will reset at 2026-09-10
@@ -250,6 +277,30 @@ dsh_extract_reset_hint() { # err_file
   line="${line%.}"
   line="${line% }"
   printf '%s' "$line"
+}
+
+# ── Реестр подтверждённых id моделей (#737) ──────────────────────────────────
+#
+# Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)
+# прямо запрещает экстраполяцию id и требует сверки буква-в-букву с ответом
+# `/v1/models` — правило было прозой без носителя. Живая цена: id
+# `nvidia/nemotron-3-super-120b-a12b` вписан в vars.DSH_PROVIDER_CHAIN
+# 2026-09-08T04:38:51Z без единой проверки и дал 37 минут молчания
+# (прогон 34188152283).
+#
+# Реестр хранит sha256 подтверждённой СТРОКИ id, не саму строку: провайдер-
+# дефолт-гвардия (scripts/lib/test/provider-default.guard.sh, класс #153)
+# сканирует scripts/**/docs/agents/** на литералы конкретных провайдеров/
+# моделей (glm-N, nemotron, …) — хэш ей не виден и не обязан быть, это не
+# второе место правды о ТЕКУЩЕМ провайдере (им остаётся vars.
+# DSH_PROVIDER_CHAIN), а список «эту строку кто-то сверил живым запросом».
+DSH_CONFIRMED_MODELS_FILE="${DSH_CONFIRMED_MODELS_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/confirmed-provider-models.json}"
+
+dsh_model_confirmed() { # model_id
+  local model=$1 hash
+  [ -f "$DSH_CONFIRMED_MODELS_FILE" ] || return 1
+  hash=$(printf '%s' "$model" | sha256sum | cut -d' ' -f1)
+  jq -e --arg h "$hash" 'any(.[]?; .model_sha256 == $h)' "$DSH_CONFIRMED_MODELS_FILE" >/dev/null 2>&1
 }
 
 # Прогон по цепочке: пробует провайдеров ПО ПОРЯДКУ, пока один не ответит
@@ -298,6 +349,11 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
       i=$((i + 1))
       continue
     fi
+    if ! dsh_model_confirmed "$model"; then
+      echo "::error::цепочка провайдеров: $name пропущен — id модели '$model' НЕ подтверждён живым запросом к /v1/models (реестр $DSH_CONFIRMED_MODELS_FILE не несёт его хэш). Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели») запрещает экстраполяцию — сверь буква-в-букву и допиши подтверждение в реестр." >&2
+      i=$((i + 1))
+      continue
+    fi
     echo "цепочка провайдеров: пробую $name ($base_url, $model)"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
@@ -311,11 +367,11 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     reset_hint=$(dsh_extract_reset_hint "$err_file")
     [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
     if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON"; then
-      echo "::warning::цепочка провайдеров: $name — отказ переключаемого класса (${DSH_RUN_FAILURE_REASON:-транспорт}) — пробую следующего" >&2
+      echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
       i=$((i + 1))
       continue
     fi
-    echo "::error::цепочка провайдеров: $name — отказ НЕпереключаемого класса, дальше по цепочке не иду (следующие провайдеры не тронуты)" >&2
+    echo "::error::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс НЕ переключаемый (stderr: $DSH_CHAIN_CLASS_NOTE), дальше по цепочке не иду (следующие провайдеры не тронуты)" >&2
     stop=1
   done
   if [ -z "$DSH_CHAIN_PROVIDER" ] && [ "$i" -ge "$count" ]; then
