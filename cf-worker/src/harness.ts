@@ -505,6 +505,56 @@ export function pulseStale(now: number, lastPulse: PulseStatus | null): boolean 
   if (lastPulse.run_confirmed === false) return false;
   return now - lastPulse.ts >= HEARTBEAT.selfOrchestrationMs * 2;
 }
+
+/**
+ * Вопрос страховки Cron Trigger (issue #693/#713), а не вопрос бейджа —
+ * НАРОЧНО не переиспользует pulseStale(): pulseStale() отвечает «как
+ * классифицировать last_pulse для /api/status» (дизъюнктные ветки бейджа —
+ * «возможности нет» / «dispatch/run сломан» / «alarm подвис», у каждой свой
+ * человекочитаемый detail, см. её докстринг) и по построению возвращает
+ * false для первых двух ветвей ДО проверки возраста — это верно для бейджа
+ * (у тех двух причин уже есть свой текст), но НЕ отвечает на вопрос
+ * scheduledTick(): «случился ли за последнее время хоть один ВИДИМЫЙ
+ * успешный такт, на который можно положиться, что alarm() сам разрулит
+ * ситуацию следующим тиком?».
+ *
+ * Разница ловится живым случаем issue #713: последний записанный пульс перед
+ * тем, как alarm() реально подвис (обе попытки ctx.storage.setAlarm упали,
+ * #320), был неудачным (dispatch_ok: false или run_confirmed: false).
+ * pulseStale() для такого пульса возвращает false НАВСЕГДА, независимо от
+ * возраста — возраст в этой ветке вообще не читается. Реальный alarm() эту
+ * ветку почти всегда чинит сам (harness.ts::alarm() дёргает
+ * #dispatchOrchestraTick безусловно на каждом собственном тике, независимо
+ * от исхода предыдущего) — но только пока сам alarm() жив; если он подвис
+ * именно в этот момент, резервный dispatch не наступит никогда.
+ *
+ * Поэтому здесь — БЕЗ короткого замыкания на dispatch_ok/run_confirmed:
+ * единственный порог — возраст последнего пульса, тот же
+ * 2×selfOrchestrationMs, что и у pulseStale() (одно место правды на порог,
+ * HEARTBEAT.*, без новой магической константы). pulseNotConfigured()
+ * остаётся отдельной веткой (false, не «нужен dispatch») по другой причине:
+ * без токена/репозитория сам dispatch не пройдёт, попытка страховки ничего
+ * не даст — но в проде эта ветка и так недостижима из scheduledTick(),
+ * которая уже вышла раньше по this.env.GH_DISPATCH_TOKEN/GH_REPO (см.
+ * докстринг scheduledTick()); учтена здесь только ради честного покрытия
+ * исторического (устаревшего) значения в хранилище.
+ *
+ * `lastPulse === null` (холодный старт, тика ещё не было вовсе) — тоже
+ * «нужен резервный dispatch», а не «здоров, подождём»: конструктор DO уже
+ * вызвал #ensureHeartbeat() и перезаложил будильник, но это гарантирует
+ * только САМ будильник, не то, что дозвон до GitHub когда-либо случится —
+ * если первый настоящий alarm-тик ещё не наступил (или уже подвис на первом
+ * же разе), null — неотличимо от «alarm подвис перед самым первым тиком».
+ * Цена ошибки в эту сторону — лишний (безвредный) workflow_dispatch поверх
+ * штатного первого тика; цена ошибки в другую — конвейер стоит неограниченно
+ * долго и незамеченно (issue #703). «Тормоз без газа не принимается»
+ * (AGENTS.md) — здесь газ выбран явно.
+ */
+export function pulseNeedsRecoveryDispatch(now: number, lastPulse: PulseStatus | null): boolean {
+  if (lastPulse === null) return true;
+  if (pulseNotConfigured(lastPulse)) return false;
+  return now - lastPulse.ts >= HEARTBEAT.selfOrchestrationMs * 2;
+}
 /** Чистое решение ватчдога инбокса: сообщение висит в processing дольше порога —
  *  изолят умер посреди внешнего вызова, пульс вернёт его в new. */
 export function messageStuck(processingTs: number | null, now: number): boolean {
@@ -1268,17 +1318,22 @@ export class Harness extends DurableObject<Env> {
    * каждые HEARTBEAT.selfOrchestrationMs (15 мин) и делает всё (ретеншн,
    * инбокс, dispatch, self-update dsh-edge). Этот метод в подавляющем
    * большинстве вызовов не пишет НИ ОДНОЙ строки — читает только текущий
-   * pulse и решает через ТУ ЖЕ чистую функцию pulseStale(), что и бейдж
-   * /api/status: «alarm тикал недавно и успешно» → выходит немедленно, не
-   * дублируя workflow_dispatch в ту же минуту (issue #693, требование «не
-   * дублируй тики»). Единственный случай, когда этот метод реально дёргает
-   * dispatch, — ровно тот, что описан в issue #693: `alarm()` дважды не смог
-   * `setAlarm` и вернулся БЕЗ будильника (см. конец alarm() ниже).
-   * pulseStale() читает это как «последний тик был успешен, но случился давно»
-   * (>= 2×selfOrchestrationMs = 30 мин) — единственная ветка, которую эта
-   * страховка чинит; настоящий отказ dispatch'а (dispatch_ok=false) —
-   * по-прежнему забота обычного alarm() на его собственном тике, не этой
-   * страховки (pulseStale() нарочно возвращает false в этой ветке).
+   * pulse и решает через pulseNeedsRecoveryDispatch() (НЕ pulseStale() — тот
+   * отвечает на другой вопрос, «как классифицировать пульс для бейджа
+   * /api/status», и по построению возвращает false для dispatch_ok=false и
+   * run_confirmed=false ДО проверки возраста; issue #713 — живой случай,
+   * когда именно поэтому страховка молчала неограниченно долго: последний
+   * записанный пульс перед тем, как alarm() реально подвис, был неудачным, и
+   * pulseStale() для такого пульса никогда не становится true, сколько бы
+   * времени ни прошло). «alarm тикал недавно и был виден» → выходит
+   * немедленно, не дублируя workflow_dispatch в ту же минуту (issue #693,
+   * требование «не дублируй тики»). Основной случай, когда этот метод реально
+   * дёргает dispatch, — тот, что описан в issue #693: `alarm()` дважды не смог
+   * `setAlarm` и вернулся БЕЗ будильника (см. конец alarm() ниже); второй,
+   * закрытый issue #713 — тот же исход, но последний пульс ДО подвисания уже
+   * несёт dispatch_ok=false/run_confirmed=false. pulseNeedsRecoveryDispatch()
+   * покрывает оба одним порогом возраста, без короткого замыкания на исход
+   * последней попытки — см. её докстринг.
    *
    * Любой RPC-вызов стаба (в т.ч. этот) конструирует DO заново, если объект
    * был выгружен из памяти (идле-порог ~10 с, интервал крона 5 мин — заведомо
@@ -1307,9 +1362,9 @@ export class Harness extends DurableObject<Env> {
     if (!token || !repo) return; // «возможности нет» — alarm() уже сообщает это в пульсе на своём тике
     try {
       const previous = this.#getStoredPulse();
-      if (!pulseStale(Date.now(), previous)) return; // alarm жив — не дублируем dispatch
+      if (!pulseNeedsRecoveryDispatch(Date.now(), previous)) return; // alarm жив и виден — не дублируем dispatch
       await this.#dispatchOrchestraTick(token, repo);
-      console.log("scheduledTick: alarm подвис (pulseStale) — dispatch выполнен страховкой Cron Trigger");
+      console.log("scheduledTick: alarm подвис (pulseNeedsRecoveryDispatch) — dispatch выполнен страховкой Cron Trigger");
     } catch (error) {
       // См. докстринг выше, «Честная граница наблюдаемости отказа»: если
       // сам #recordPulse тоже упал, /api/status этой попытки не увидит —
