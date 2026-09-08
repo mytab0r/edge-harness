@@ -420,6 +420,12 @@ export DEEPSEEK_API_KEY="smoke-deepseek-key"
 # правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
+# Цепочка провайдеров (#727): ai_dsh.sh (ревью) теперь требует
+# vars.DSH_PROVIDER_CHAIN, не одиночные DEEPSEEK_* напрямую — один фиктивный
+# провайдер, ссылающийся на ту же DEEPSEEK_API_KEY-фикстуру (worker/hands
+# по-прежнему читают DEEPSEEK_* напрямую через dsh_require_provider_env, не
+# тронуто этим change, см. tasks.md «Область»).
+export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
@@ -667,7 +673,12 @@ grep -qx "0" "$AI_RL1/dsh_rc.txt" \
 echo "SMOKE: ai-review-rate-limit-transient — ок"
 
 # 2) RATE_LIMIT: Weekly/Monthly Limit Exhausted — падаем СРАЗУ, без ретрая
-# (сброс через дни — ждать внутри прогона бессмысленно).
+# (сброс через дни — ждать внутри прогона бессмысленно). Фикстура цепочки
+# несёт РОВНО одного провайдера (#727) — переключаемый класс (quota_exhausted)
+# исчерпывает цепочку целиком в ОДИН шаг: чейн честно называет это
+# all_providers_exhausted (провайдеров для перехода больше нет), а не
+# quota_exhausted — конкретная причина последнего провайдера остаётся видна
+# в chain_reset_hint.txt (дата сброса), не в failure_reason.
 AI_RL2="$TMP/ai-rl-quota"
 mkdir -p "$AI_RL2"
 printf 'Промпт ревью (smoke): квота исчерпана надолго\n' >"$AI_RL2/prompt.md"
@@ -677,27 +688,33 @@ SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
   run_client "ai-review-rate-limit-quota" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL2/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-quota: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL2/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-grep -qx "quota_exhausted" "$AI_RL2/failure_reason.txt" \
-  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'quota_exhausted', получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL2/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'all_providers_exhausted' (#727, один провайдер в фикстуре), получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -q "2026-09-10" "$AI_RL2/chain_reset_hint.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: chain_reset_hint.txt потерял дату сброса, получено: $(cat "$AI_RL2/chain_reset_hint.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-quota — ок"
 
-# 3) Настоящая ошибка провайдера (нет строки RATE_LIMIT вовсе) — падаем
-# сразу, как и до #419: ретрай не должен трогать этот класс.
+# 3) HTTP_404 (перемежающийся транспортный отказ, класс #727 — живой случай
+# NVIDIA 2026-09-02, AGENTS.md) — тоже переключаемый класс, не «настоящая
+# ошибка, которую ретрай не трогает» (как было до #727): единственный
+# провайдер фикстуры исчерпывает цепочку тем же образом, что и quota выше.
 AI_RL3="$TMP/ai-rl-real-error"
 mkdir -p "$AI_RL3"
-printf 'Промпт ревью (smoke): настоящая ошибка\n' >"$AI_RL3/prompt.md"
+printf 'Промпт ревью (smoke): HTTP_404 — переключаемый транспортный класс\n' >"$AI_RL3/prompt.md"
 AI_WORK="$AI_RL3" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="real-error" \
   run_client "ai-review-rate-limit-real-error" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL3/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-real-error: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL3/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-[ -s "$AI_RL3/failure_reason.txt" ] \
-  && { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt обязан быть пуст на настоящей ошибке (не лимит), получено: $(cat "$AI_RL3/failure_reason.txt")" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL3/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt ожидал 'all_providers_exhausted' (HTTP_404 — переключаемый класс #727), получено: $(cat "$AI_RL3/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-real-error — ок"
 
 # 4) Временный RATE_LIMIT, который не снимается, — бюджет ожидания обязан
-# кончиться (не бесконечный ретрай, не занятый навечно job-слот).
+# кончиться (не бесконечный ретрай, не занятый навечно job-слот). Тот же
+# единственный провайдер фикстуры — бюджет исчерпан → переключаемый класс →
+# цепочка тоже закрывается как all_providers_exhausted (#727).
 AI_RL4="$TMP/ai-rl-budget"
 mkdir -p "$AI_RL4"
 printf 'Промпт ревью (smoke): бюджет ретрая исчерпан\n' >"$AI_RL4/prompt.md"
@@ -708,8 +725,8 @@ AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client "ai-review-rate-limit-budget" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL4/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-budget: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL4/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-grep -qx "rate_limit_retry_budget_exceeded" "$AI_RL4/failure_reason.txt" \
-  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'rate_limit_retry_budget_exceeded', получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL4/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'all_providers_exhausted' (#727, один провайдер в фикстуре), получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-budget — ок"
 
 # ── Тот же ретрай у worker/hands (#422 — раньше был только у ai-review) ──────────
