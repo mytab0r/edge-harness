@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Гвардия класса «цепочка провайдеров переключается по классу отказа, а не
+# по любой ошибке» (#727). Прогоняет dsh_run_with_provider_chain (lib/
+# dsh-ci.sh) ЦЕЛИКОМ — не bash -n, настоящее исполнение с заглушкой `dsh`,
+# роутящей ответ по модели (DEEPSEEK_MODEL, который chain выставляет на
+# каждую попытку) — тот же приём, что dsh-clients.smoke.sh уже применяет для
+# RATE_LIMIT (SMOKE_RATE_LIMIT_MODE), здесь на два провайдера сразу.
+#
+# Прод-форма отказов — дословно:
+#   RATE_LIMIT: Weekly/Monthly Limit Exhausted... run 34176910458
+#     (docs/runbooks/switch-llm-provider.md, ai-review PR #206 разбор)
+#   HTTP_404: modelCode does not exist... прогон 33572445063 (PR #190,
+#     scripts/lib/test/dsh-clients.smoke.sh:217, ai_review.py::test_ai_review)
+#
+# Запуск: bash scripts/lib/test/dsh-provider-chain.smoke.sh  (jq обязателен)
+set -euo pipefail
+
+SMOKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SMOKE_DIR/../../.." && pwd)"
+
+# shellcheck source=scripts/lib/dsh-ci.sh
+source "$REPO/scripts/lib/dsh-ci.sh"
+
+fail() { echo "::error::SMOKE(chain): $*" >&2; exit 1; }
+
+# ── Заглушки: dsh_install/dsh_patch_profile не нужны сети, но профиль пишется
+# на диск (HOME) — используем временный HOME, чтобы не мусорить и не зависеть
+# от состояния хоста. dsh() — единственная внешняя команда, которую видит
+# dsh_run_with_retry; timeout() пропускает вызов насквозь без реального sleep.
+export HOME="$(mktemp -d)"
+timeout() { shift; "$@"; }
+sleep() { :; }
+export -f timeout sleep
+
+# Заглушка dsh: маршрут по DEEPSEEK_MODEL (chain выставляет его на каждую
+# попытку ПЕРЕД вызовом dsh_patch_profile/dsh_run_with_retry — см.
+# dsh_run_with_provider_chain) — режим каждой модели читается из отдельной
+# переменной окружения (SMOKE_MODE_<MODEL>), не общего счётчика попыток:
+# сценарии этого файла не полагаются на порядок вызовов внутри ретрая
+# dsh_run_with_retry (короткий RATE_LIMIT здесь не участвует — это уже
+# доказано dsh-clients.smoke.sh, здесь предмет — переход МЕЖДУ провайдерами).
+dsh() {
+  case "${1:-}" in
+    --profile)
+      local mode_var="SMOKE_MODE_${DEEPSEEK_MODEL//-/_}"
+      local mode="${!mode_var:-ok}"
+      case "$mode" in
+        ok)
+          echo "smoke: ответ от $DEEPSEEK_MODEL"
+          return 0 ;;
+        quota)
+          echo "dsh: RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10 08:51:55" >&2
+          return 1 ;;
+        http404)
+          # Прод-форма прогона 33572445063 (PR #190) — не пересказ.
+          echo "dsh: HTTP_404: modelCode does not exist" >&2
+          return 1 ;;
+        real-error)
+          echo "dsh: INVALID_API_KEY: unauthorized" >&2
+          return 1 ;;
+        *)
+          echo "::error::SMOKE: неизвестный режим $mode для $mode_var" >&2
+          return 99 ;;
+      esac ;;
+    *)
+      echo "::error::SMOKE: dsh-заглушка не знает вызов: $*" >&2
+      return 99 ;;
+  esac
+}
+export -f dsh
+
+# Два фиктивных провайдера — имена/URL НЕ совпадают с реальными (api.z.ai,
+# integrate.api.nvidia.com, glm-*, nemotron*): гвардия класса #153
+# (provider-default.guard.sh) сканирует scripts/** на литералы прежних
+# дефолтов, реальные значения живут в vars.DSH_PROVIDER_CHAIN репозитория,
+# не здесь.
+export PRIMARY_KEY="primary-test-key"
+export SECONDARY_KEY="secondary-test-key"
+CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","model":"primary-model","secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096}
+]'
+export DSH_PROVIDER_CHAIN="$CHAIN"
+
+WORK="$(mktemp -d)"
+ANSWER="$WORK/answer.txt"
+ERR="$WORK/err.txt"
+
+reset_scenario() {
+  unset SMOKE_MODE_primary_model SMOKE_MODE_secondary_model 2>/dev/null || true
+  : >"$ANSWER"; : >"$ERR"
+}
+
+dsh_require_provider_chain || fail "dsh_require_provider_chain отказал на валидной цепочке"
+
+# ── 1) quota_exhausted у первого — автопереход на второго, который отвечает ──
+reset_scenario
+SMOKE_MODE_primary_model="quota"
+SMOKE_MODE_secondary_model="ok"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+[ "$DSH_RUN_RC" = "0" ] || fail "1) ожидался успех (rc=0), получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "1) ожидался переход на SECONDARY, получено '$DSH_CHAIN_PROVIDER'"
+grep -q "ответ от secondary-model" "$ANSWER" || fail "1) answer.txt не от второго провайдера"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "1) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы по порядку"
+[[ "$DSH_CHAIN_RESET_HINT" == *"PRIMARY: 2026-09-10 08:51:55"* ]] || fail "1) дата сброса PRIMARY потеряна: '$DSH_CHAIN_RESET_HINT'"
+echo "SMOKE(chain): 1) quota_exhausted -> автопереход — ок"
+
+# ── 2) HTTP_404 (транспорт, без единой строки RATE_LIMIT) — тоже автопереход ──
+reset_scenario
+SMOKE_MODE_primary_model="http404"
+SMOKE_MODE_secondary_model="ok"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+[ "$DSH_RUN_RC" = "0" ] || fail "2) ожидался успех после HTTP_404 у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "2) ожидался переход на SECONDARY при HTTP_404, получено '$DSH_CHAIN_PROVIDER'"
+echo "SMOKE(chain): 2) HTTP_404 -> автопереход — ок"
+
+# ── 3) Настоящая ошибка (ключ битый и т.п.) — цепочка НЕ идёт дальше ──────────
+# Мутация ключевого требования (#727, п.4): не любой отказ переключает.
+reset_scenario
+SMOKE_MODE_primary_model="real-error"
+SMOKE_MODE_secondary_model="ok"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+[ "$DSH_RUN_RC" != "0" ] || fail "3) настоящая ошибка не должна была дать успех"
+[ "$DSH_CHAIN_PROVIDER" = "" ] || fail "3) успешного провайдера быть не должно, получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "3) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — SECONDARY не должен был тронуться (не переключаемый класс)"
+[ "$DSH_RUN_FAILURE_REASON" != "all_providers_exhausted" ] || fail "3) причина не обязана звучать как 'все исчерпаны' — это НЕ переключаемый класс"
+echo "SMOKE(chain): 3) настоящая ошибка -> цепочка остановлена, второй провайдер не тронут — ок"
+
+# ── 4) Оба провайдера исчерпаны — честное 'все исчерпаны' + обе даты сброса ──
+reset_scenario
+SMOKE_MODE_primary_model="quota"
+SMOKE_MODE_secondary_model="quota"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+[ "$DSH_RUN_RC" != "0" ] || fail "4) оба исчерпаны — успеха быть не должно"
+[ "$DSH_RUN_FAILURE_REASON" = "all_providers_exhausted" ] || fail "4) ожидался all_providers_exhausted, получено '$DSH_RUN_FAILURE_REASON'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "4) оба провайдера обязаны быть опробованы"
+[[ "$DSH_CHAIN_RESET_HINT" == *"PRIMARY: 2026-09-10 08:51:55"* && "$DSH_CHAIN_RESET_HINT" == *"SECONDARY: 2026-09-10 08:51:55"* ]] \
+  || fail "4) обе даты сброса обязаны попасть в подсказку: '$DSH_CHAIN_RESET_HINT'"
+echo "SMOKE(chain): 4) все провайдеры исчерпаны — честное сообщение с датами — ок"
+
+# ── 5) Секрет второго провайдера не передан этим workflow — пропуск, не провал ─
+reset_scenario
+SMOKE_MODE_primary_model="quota"
+SMOKE_MODE_secondary_model="ok"
+( unset SECONDARY_KEY
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+  [ "$DSH_RUN_RC" != "0" ] || { echo "::error::5) без секрета SECONDARY успеха быть не должно" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || { echo "::error::5) SECONDARY обязан быть учтён как опробованный (пропущен, не потерян)" >&2; exit 1; }
+) || fail "5) сценарий с отсутствующим секретом провалился"
+echo "SMOKE(chain): 5) пропуск провайдера без секрета — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727 зелёная"

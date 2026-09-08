@@ -998,6 +998,96 @@ def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     assert any("178" in line for line in (observations + actions))
 
 
+def ai_failed_comment(reset_hint: str, verdict: str = "error"):
+    """Прод-форма комментария-вердикта AI-ревью (ai_review.build_comment,
+    #727) от доверенной учётки — шапка несёт `reviewer:`/`reset-at:`,
+    остальное — proза, latest_ai_comment её не читает."""
+    return {
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: sha1\nreviewer: {verdict}\nreset-at: {reset_hint}\n\nтело вердикта",
+    }
+
+
+def test_trigger_ai_review_holds_back_when_chain_exhausted_reset_in_future(monkeypatch):
+    # #727: ai:failed из-за all_providers_exhausted, дата сброса ещё не
+    # наступила — авто-повтор (#196) НЕ дёргает ai-review.yml вслепую в ту же
+    # квоту, эскалирует владельцу вместо этого (маркер идемпотентен на эпизод).
+    p = pull(700, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha700/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/700/comments": [ai_failed_comment("GLM: 2026-09-10 08:51:55")],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 8, 2, 0)  # порог (30 мин) прошёл, но сброс — 2026-09-10
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("dispatches" in c for c in fake.calls)  # квота не жжётся дальше
+    # escalate() пишет в #120 (watchdog) ПЕРВЫМ, наш же след в самом PR —
+    # второй пост тем же вызовом; оба используют один patched post_issue_comment.
+    pr_posts = [text for n, text in posted if n == 700]
+    assert pr_posts and "2026-09-10" in pr_posts[0]
+    assert any(n == sch.WATCHDOG_ISSUE for n, _ in posted)
+    assert any("700" in line and "эскалация" in line for line in (observations + actions))
+
+
+def test_trigger_ai_review_holds_back_idempotent_second_pulse(monkeypatch):
+    # Второй пульс в том же окне ожидания — маркер уже стоит, повторного
+    # Telegram/комментария нет (тот же принцип, что у остальных эскалаций —
+    # идемпотентно на эпизод, не на каждый 15-минутный пульс).
+    p = pull(701, labels=["review:ok", "ai:failed"])
+    marker = f"{sch.AI_REVIEW_CHAIN_COOLDOWN_MARKER} #701"
+    fake = FakeGh({
+        "commits/sha701/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/701/comments": [
+            ai_failed_comment("GLM: 2026-09-10 08:51:55"),
+            {"created_at": "2026-09-08T01:00:00Z", "body": f"🤖 {marker}\nуже эскалировано"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("повторная эскалация в том же окне — не должно быть"))
+
+    now = utc(2026, 9, 8, 2, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert any("701" in line and "придержан" in line for line in observations)
+
+
+def test_trigger_ai_review_dispatches_once_reset_date_passed(monkeypatch):
+    # Мутация обратного случая: дата сброса УЖЕ в прошлом — цепочка снова
+    # жива, авто-повтор идёт как обычно (доказывает, что гейт не держит
+    # ретрай вечно, только до даты).
+    p = pull(702, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha702/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/702/comments": [ai_failed_comment("GLM: 2026-09-01 00:00:00")],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 2, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+def test_parse_reset_hint_dates_prod_form():
+    # Прод-форма #727: реальный текст отказа из run 34176910458 — «Your
+    # limit will reset at 2026-09-10 08:51:55» (пространственная форма, без
+    # зоны) и ISO-форма смоук-фикстуры dsh-clients.smoke.sh — обе разбираются
+    # одной функцией.
+    dates = sch.parse_reset_hint_dates("GLM: 2026-09-10 08:51:55; NVIDIA: 2026-09-11T00:00:00Z")
+    assert len(dates) == 2
+    assert min(dates) == utc(2026, 9, 10, 8, 51, 55)
+
+
+def test_parse_reset_hint_dates_empty_or_garbage_is_no_dates():
+    assert sch.parse_reset_hint_dates("") == []
+    assert sch.parse_reset_hint_dates("не дата вовсе") == []
+
+
 def test_trigger_ai_review_silent_before_threshold(monkeypatch):
     p = pull(163, labels=["review:ok"])
     fake = FakeGh({"commits/sha163/statuses": gate1_status("2026-09-02T11:40:00Z")})

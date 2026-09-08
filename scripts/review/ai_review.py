@@ -249,7 +249,8 @@ def transport_failed(dsh_rc: str) -> bool:
         return False
 
 
-def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
+def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
+                  reset_hint: str = "") -> str:
     """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
@@ -287,10 +288,22 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
                                           не пытался.
       rate_limit_retry_budget_exceeded — временный RATE_LIMIT не снялся за
                                           отведённый бюджет ожидания.
+      all_providers_exhausted          — #727: цепочка провайдеров
+                                          (vars.DSH_PROVIDER_CHAIN) перебрана
+                                          целиком, ни один не ответил — не
+                                          автопереход спас (класс отказа у
+                                          КАЖДОГО был переключаемый), а вся
+                                          цепочка исчерпана/недоступна разом.
       "" (пусто)                       — старое поведение: либо обычный
                                           транспортный сбой (rc≠0 без
                                           RATE_LIMIT вовсе), либо контракт
                                           ответа (rc=0, формат нарушен).
+
+    reset_hint — «имя: дата; …» опробованных провайдеров с известной датой
+    сброса (dsh_extract_reset_hint, lib/dsh-ci.sh) — пусто, если ни один не
+    назвал дату. Используется только при all_providers_exhausted — без него
+    сообщение честно называет «дата неизвестна», не гадает (AGENTS.md,
+    «алерт не гадает»).
     """
     if failure_reason == "empty_diff":
         return ("ревью не состоялось — дифф PR пуст (0 изменённых файлов), "
@@ -319,6 +332,12 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
         return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
                 f"снялся за отведённый бюджет ожидания внутри прогона (код "
                 f"возврата {dsh_rc})")
+    if failure_reason == "all_providers_exhausted":
+        when = reset_hint.strip() if reset_hint else "дата неизвестна — ни один провайдер её не назвал"
+        return (f"ревью не состоялось — все провайдеры цепочки исчерпаны/недоступны "
+                f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
+                "ждать сброса вне CI, либо добавить нового провайдера в "
+                "vars.DSH_PROVIDER_CHAIN (docs/runbooks/switch-llm-provider.md)")
     if transport_failed(dsh_rc):
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
     if verdict_line_present(answer):
@@ -500,7 +519,9 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
                   tasks: list[dict], diff_fp: str | None = None,
-                  remarks: list[dict] | None = None) -> str:
+                  remarks: list[dict] | None = None,
+                  chain_provider: str | None = None,
+                  reset_hint: str | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -523,10 +544,20 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     remarks — блоки ЗАМЕЧАНИЕ (#462, третья категория находок): сам чеклист
     живёт в ТЕЛЕ PR (review_checklist.merge_checklist, отдельный PATCH), не
     здесь — комментарий только указывает, что чеклист обновлён, чтобы автор
-    не искал замечания в прозе комментария, которую отсюда убрал findings_of."""
+    не искал замечания в прозе комментария, которую отсюда убрал findings_of.
+
+    chain_provider/reset_hint (#727) — факты цепочки провайдеров: имя
+    провайдера, фактически ответившего (видимость «кто обслужил ход», не
+    только «какой провайдер настроен в vars»), и даты сброса опробованных —
+    читает scheduler.py::trigger_ai_review (header_facts), чтобы не жечь
+    авто-повтор (#196) вслепую в ту же квоту. Обе строки опциональны (пусто —
+    не добавлены вовсе), как diff_line выше."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
+    provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
+    reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
     head = (
-        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
+        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
+        f"{diff_line}{provider_line}{reset_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -925,7 +956,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
     # ошибка провайдера не должна выглядеть как «модель ответила криво», а
     # временный RATE_LIMIT — как настоящая поломка, #419).
-    reason = error_reason(answer, args.dsh_rc, args.failure_reason) if verdict == "error" else None
+    reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint)
+              if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason
 
@@ -1010,7 +1042,9 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
     # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp, remarks=remarks)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
+                          remarks=remarks, chain_provider=args.chain_provider,
+                          reset_hint=args.reset_hint)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
@@ -1053,9 +1087,15 @@ def main() -> int:
     # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
     verdict.add_argument("--dsh-rc", default="")
     # Тег причины из $AI_WORK/failure_reason.txt (ai_dsh.sh, #419): quota_exhausted
-    # | rate_limit_retry_budget_exceeded | пусто. Необязателен по той же причине,
-    # что и --dsh-rc — ручной запуск без него просто теряет уточнение.
+    # | rate_limit_retry_budget_exceeded | all_providers_exhausted (#727) | пусто.
+    # Необязателен по той же причине, что и --dsh-rc — ручной запуск без него
+    # просто теряет уточнение.
     verdict.add_argument("--failure-reason", default="")
+    # Цепочка провайдеров (#727): имя провайдера, фактически ответившего
+    # (пусто на отказе), и даты сброса опробованных ($AI_WORK/chain_provider.txt
+    # / chain_reset_hint.txt, ai_dsh.sh) — оба необязательны, тот же принцип.
+    verdict.add_argument("--chain-provider", default="")
+    verdict.add_argument("--reset-hint", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()
