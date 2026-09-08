@@ -24,8 +24,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Файлы, где широкая семантика ОСОЗНАННА и заявлена в докстринге самого
 # места вызова — одно место правды списка исключений, не разбросано по коду.
-# scripts/orchestra/scheduler.py — pr_references_issue (reap_stale/
-# unhealthy_pulls) и after_merge, см. их докстринги. scripts/orchestra/
+# scripts/orchestra/scheduler.py — pr_references_issue (reap_stale) и
+# after_merge, см. их докстринги. unhealthy_pulls (#286) сюда больше НЕ
+# входит — сопоставление PR → задача там сузилось до task_ref.resolve_pr_task
+# (не «не тронули вовремя», а «сняли аренду ЧУЖОЙ задачи» — цена той же
+# широты там другая, см. докстринг unhealthy_pulls). scripts/orchestra/
 # repo_invariants.py — declared_change_task (инвариант 4, второй путь
 # завершённости, docs/agents/OPENSPEC-PROTOCOL.md): другой вопрос, чем
 # «какая задача у этого PR» (резолюция PR из #259 сюда не относится вовсе,
@@ -67,8 +70,8 @@ def test_wide_task_ref_functions_only_used_where_allowed():
         f"{offenders}. Для вопроса «какая задача у этого PR» используй "
         "task_ref.resolve_pr_task (#259), а не упоминание в прозе. Если "
         "новое место действительно нуждается в широкой семантике осознанно "
-        "(как reap_stale/unhealthy_pulls/after_merge) — назови это в "
-        "докстринге места вызова и добавь его в ALLOWED_WIDE_USAGE явно."
+        "(как reap_stale/after_merge) — назови это в докстринге места "
+        "вызова и добавь его в ALLOWED_WIDE_USAGE явно."
     )
 
 
