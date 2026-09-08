@@ -75,6 +75,21 @@ jobs:
           # в dsh_task.sh падает громко до какой-либо дорогой работы.
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          # Ротация учёток (#215) — одно место правды: имя переменной и
+          # список секретов-кандидатов объявлены в scripts/lib/dsh-ci.sh
+          # (PLUGINS_SUITE_CANDIDATE_ROUTES), здесь только проводка. Пусто →
+          # dsh_install_plugins_suite печатает «не подключена» и job идёт как
+          # раньше (одиночный провайдер) — обратная совместимость, критерий 4
+          # приёмки #215.
+          PLUGINS_SUITE_URL: ${{ vars.PLUGINS_SUITE_URL }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
           # Аренда задачи (#121): claim_task.py создаёт refs/locks/task-N под
           # этим токеном; dsh_task.sh снимает переменную ИЗ ЭКСПОРТА до старта
           # DSH (копия остаётся в bash-переменной без export для release-full

@@ -378,6 +378,11 @@ jobs:
           # dsh_require_provider_chain в review/ai_dsh.sh падает громко до
           # какой-либо дорогой работы.
           DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          # Suite ротации учёток (#215) сюда НЕ прокидывается: этот шаг всегда
+          # идёт через цепочку провайдеров выше, а suite с ней конструктивно
+          # не совместим (design.md dsh-in-job, «Стык suite и цепочки
+          # провайдеров», scripts/review/ai_dsh.sh). Ротация учёток остаётся
+          # уделом worker.yml/hands.yml, где цепочки нет.
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"

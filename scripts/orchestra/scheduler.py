@@ -44,7 +44,12 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      только на факт создания/слияния PR, но и на его состояние в промежутке:
        a. review:ok без вердикта AI дольше порога (или ai:failed) — оркестратор
           сам дёргает ai-review.yml, с ограничением числа попыток на PR
-          (счётчик — маркер в комментариях PR, переживает перезапуск).
+          (счётчик — маркер в комментариях PR, переживает перезапуск), но
+          ТОЛЬКО за текущую эпоху review:ok — новый пуш даёт свежий бюджет
+          (#431). Исчерпание бюджета — не молчание: эскалация тем же каналом,
+          что предохранитель конвейера. quota_exhausted провайдера (#419) не
+          тратит автоповтор вовсе — сразу эскалация, ретраить его в CI
+          бессмысленно (docs/runbooks/switch-llm-provider.md).
        b. Красный обязательный чек или ai:changes-requested дольше порога —
           назначение снимается, задача возвращается в пул, PR не закрывается.
        c. После слияния — gh pr update-branch для остальных открытых PR,
@@ -167,7 +172,9 @@ from pathlib import Path
 # серия красных и её сброс мержем #220 — там же: WORKER_WORKFLOW,
 # FAILURE_CONCLUSIONS, recent_runs, RESUME_MARKER).
 from pulse_guard import (
+    AI_REVIEW_EXHAUSTED_MARKER,
     AI_REVIEW_MAX_ATTEMPTS,
+    AI_REVIEW_QUOTA_MARKER,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
     CONFLICT_ESCALATION_MARKER,
@@ -2365,6 +2372,16 @@ def dispatch_worker(
 # в namespace review_labels.py (там только вердикты, не попытки); 3) виден
 # человеку без доп. тулинга — то же качество, что у существующих следов
 # reap_stale/mark_conflicts.
+#
+# #431 (тормоз без газа, живой случай #367/#249): счётчик считался за ВСЮ
+# историю PR — после первых же AI_REVIEW_MAX_ATTEMPTS маркеров (пусть даже
+# растянутых на несколько РАЗНЫХ эпох review:ok) PR терял газ навсегда, а
+# исчерпание не вело ни к какому видимому действию. Теперь: 1) счётчик
+# считается только с якоря ТЕКУЩЕЙ эпохи (ai_review_retry_count(since=anchor)) —
+# новый пуш даёт свежий бюджет; 2) исчерпание эскалирует тем же каналом, что
+# предохранитель конвейера (issue #120 + Telegram), идемпотентно на PR+эпоху;
+# 3) quota_exhausted (провайдер, ai_dsh.sh/#419) не тратит автоповтор вовсе —
+# ретраить исчерпанную на неделю квоту внутри CI бессмысленно, эскалация сразу.
 
 
 def last_gate1_labeled_at(repo: str, pull: dict) -> datetime | None:
@@ -2389,8 +2406,43 @@ def last_gate1_labeled_at(repo: str, pull: dict) -> datetime | None:
     return parse_time(posted) if posted else None
 
 
-def ai_review_retry_count(repo: str, pr_number: int) -> int:
-    return len(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
+def ai_review_retry_count(repo: str, pr_number: int, since: datetime | None = None) -> int:
+    """Число уже потраченных автоповторов ai-review НА ЭТОМ PR — с момента
+    `since` (эпоха текущего review:ok, #431), либо за всю историю, если
+    since не задан (совместимость: last_gate1_labeled_at уже гарантирует
+    якорь для реальных вызовов trigger_ai_review, но функция остаётся
+    честной и без него)."""
+    times = issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER)
+    if since is not None:
+        times = [t for t in times if t > since]
+    return len(times)
+
+
+def latest_ai_failure_reason(repo: str, pr_number: int, anchor: datetime | None = None) -> str | None:
+    """Тег причины последнего вердикта error (review_labels.reason_tag,
+    ai_review.build_comment, #431) — факт `reason:` в шапке последнего
+    доверенного AI-комментария ЭТОЙ ЭПОХИ (созданного строго после `anchor`
+    — той же простановки review:ok/review:large, что уже скоупит
+    ai_review_retry_count). None — комментария нет, его вердикт не error,
+    тега ещё нет (комментарий написан до #431), либо единственный
+    подходящий комментарий старше anchor (эпоха прошлая — причина
+    неизвестна В ЭТОЙ эпохе) — тогда решение принимается по общему бюджету,
+    как раньше.
+
+    Находка ревью PR #439: без anchor функция читала последний доверенный
+    комментарий БЕЗ ограничения по эпохе — пуш с неизменным диффом
+    (подтягивание main) переставляет review:ok, открывая новую эпоху N+1, а
+    свежий прогон ai-review ещё не ответил (очередь раннеров — иногда часы,
+    docs/research/21); trigger_ai_review читал `reason: quota_exhausted` из
+    ПРОШЛОЙ эпохи N и закрывал автоповторы новой эпохи, не дав ей ни одной
+    попытки."""
+    comment = review_labels.latest_ai_comment(repo, pr_number, gh, since=anchor)
+    if comment is None:
+        return None
+    facts = review_labels.header_facts(comment.get("body") or "")
+    if facts.get("reviewer") != "error":
+        return None
+    return facts.get("reason")
 
 
 # ── #727: авто-повтор не жжётся вслепую в ту же квоту ────────────────────────
@@ -2448,11 +2500,18 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
         age = minutes_between(anchor, now)
         if age < AI_REVIEW_RETRY_AFTER_MINUTES:
             continue  # ещё не истёк порог ожидания вердикта
-        # Цепочка провайдеров исчерпана целиком (#727) и дата сброса известна
-        # и ещё не наступила — авто-повтор (#196) НЕ дёргает ai-review.yml
-        # вслепую в ту же квоту, эскалирует владельцу вместо этого (идемпотентно
-        # на эпизод — маркер держит один Telegram на всё окно ожидания).
+        # needs_retry — два НЕЗАВИСИМЫХ фильтра «не жечь автоповтор вслепую»,
+        # оба смотрят на прошлый вердикт ai:failed до общего бюджета ниже
+        # (#196/#431/#727 — три задачи, один и тот же принцип «холостой повтор
+        # хуже честной эскалации»), проверяются по очереди:
         if needs_retry:
+            # 1) Цепочка провайдеров исчерпана целиком (#727) и дата сброса
+            # известна и ещё не наступила — авто-повтор НЕ дёргает
+            # ai-review.yml вслепую в ту же квоту, эскалирует владельцу вместо
+            # этого (идемпотентно на эпизод — маркер держит один Telegram на
+            # всё окно ожидания). Сигнал — факт `reset-at` в шапке последнего
+            # комментария (может отсутствовать без anchor-скоупинга, читает
+            # всю историю PR: список дат сброса не зависит от эпохи review:ok).
             comment = review_labels.latest_ai_comment(repo, pull["number"], gh)
             facts = review_labels.header_facts(comment.get("body") or "") if comment else {}
             reset_dates = parse_reset_hint_dates(facts.get("reset-at", ""))
@@ -2484,13 +2543,71 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
                         f"— эскалация вместо авто-повтора ({escalation})"
                     )
                 continue
-        attempts = ai_review_retry_count(repo, pull["number"])
+            # 2) Квота провайдера исчерпана надолго (#431/#419), скоуплено ЭТОЙ
+            # эпохой (anchor) — тег причины `reason: quota_exhausted` в шапке,
+            # не требует известной даты сброса (в отличие от (1) выше): ждать
+            # квоту внутри CI бессмысленно в любом случае, эскалация с первого
+            # обнаружения, автоповтор не тратится вовсе.
+            reason = latest_ai_failure_reason(repo, pull["number"], anchor=anchor)
+            if reason == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
+                marker = f"{AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
+                try:
+                    already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ PR #{pull['number']}: не смог сверить эскалацию квоты "
+                        f"#{WATCHDOG_ISSUE}: {error}"
+                    )
+                    continue
+                if any(marker_at > anchor for marker_at in already):
+                    continue  # уже эскалировано в этой эпохе — молчим
+                text = (
+                    f"🚨 edge-harness: {marker}\n"
+                    f"PR #{pull['number']}: ai-review упал с {review_labels.AI_FAILED} "
+                    f"(квота провайдера исчерпана надолго, {int(age)} мин без вердикта) — "
+                    "повтор внутри CI бессмысленен (docs/runbooks/switch-llm-provider.md). "
+                    "Автоповтор не трачу: нужно сменить провайдера или дождаться сброса "
+                    "квоты, затем новый пуш заведёт ревью заново."
+                )
+                result = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 PR #{pull['number']}: квота провайдера исчерпана — эскалировано "
+                    f"({result}), автоповтор не трачу"
+                )
+                continue
+
+        attempts = ai_review_retry_count(repo, pull["number"], since=anchor)
         if attempts >= AI_REVIEW_MAX_ATTEMPTS:
-            observations.append(
-                f"⏸️ PR #{pull['number']} без вердикта AI {int(age)} мин, но "
-                f"авто-повторов уже {attempts}/{AI_REVIEW_MAX_ATTEMPTS} — не дёргаю снова, нужен человек"
+            marker = f"{AI_REVIEW_EXHAUSTED_MARKER} #{pull['number']}"
+            try:
+                already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ PR #{pull['number']}: не смог сверить эскалацию исчерпания "
+                    f"#{WATCHDOG_ISSUE}: {error}"
+                )
+                continue
+            if any(marker_at > anchor for marker_at in already):
+                observations.append(
+                    f"⏸️ PR #{pull['number']} без вердикта AI {int(age)} мин, но "
+                    f"авто-повторов уже {attempts}/{AI_REVIEW_MAX_ATTEMPTS} в этой эпохе — "
+                    "уже эскалировано"
+                )
+                continue
+            text = (
+                f"🚨 edge-harness: {marker}\n"
+                f"PR #{pull['number']}: авто-повторов ai-review уже "
+                f"{attempts}/{AI_REVIEW_MAX_ATTEMPTS} с последней простановки review:ok, "
+                f"вердикта нет {int(age)} мин — дальше нужен человек (новый пуш заведёт "
+                "свежий бюджет, ручной `gh workflow run ai-review.yml -f pr=N` тоже работает)."
+            )
+            result = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 PR #{pull['number']}: авто-повторы исчерпаны "
+                f"({attempts}/{AI_REVIEW_MAX_ATTEMPTS}) — эскалировано ({result})"
             )
             continue
+
         gh(
             "-X", "POST", f"repos/{repo}/actions/workflows/ai-review.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[pr]={pull['number']}",
