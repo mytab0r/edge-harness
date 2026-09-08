@@ -13,8 +13,12 @@ name: llm-provider-models
 on:
   workflow_dispatch:
     inputs:
+      # Пример значения (NVIDIA managed endpoint) — намеренно только в
+      # комментарии, не в description ниже: гвардия #153
+      # (scripts/lib/test/provider-default.guard.sh) считает литерал вида
+      # "integrate.api.nvidia.com" вне комментария стейл-дефолтом провайдера.
       base_url:
-        description: "Базовый URL провайдера (без /models), например https://integrate.api.nvidia.com/v1"
+        description: "Базовый URL провайдера (без /models) — см. пример в комментарии выше поля"
         required: true
         type: string
       secret_name:
