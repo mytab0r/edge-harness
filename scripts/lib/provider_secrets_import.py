@@ -31,6 +31,20 @@ Anthropic OAuth-пул (задача #216) — ДРУГОЙ механизм (и
   - дефолт — сухой прогон, запись только по --apply;
   - существующий секрет/переменная перезаписывается только явным флагом.
 
+СЕМАНТИКА isActive/testStatus — состояние ПРЕДОХРАНИТЕЛЯ, не факт о ключе
+(задача #777): роутер учёток (krouter) сам гасит учётку (isActive=False,
+testStatus=unavailable) при исчерпании квоты и включает её обратно, когда та
+восстановится — файл-экспорт лишь снимок на дату выгрузки (см. --export-file,
+дата печатается в отчёте). Ранжирование поэтому различает ДВЕ РАЗНЫЕ оси, а
+не одну: «квота временно исчерпана» (429/backoff — нормальное состояние
+ротации, НЕ дисквалификация) и «ключ неверен/доступ запрещён» (401/403 —
+настоящая дисквалификация). Источник факта для ранга — живая проба
+(--no-probe отключает), она пробует ТОЛЬКО кандидатов на слоты suite (не весь
+файл — из непричастных к suite учёток пробовать нечего, у них нет маршрута);
+когда пробы нет (сеть недоступна или --no-probe) — падаем на классификацию
+снимка по errorCode/backoffLevel. Источник ранга (проба/снимок) виден в
+отчёте отдельной пометкой у каждой строки.
+
 Использование:
   python3 scripts/lib/provider_secrets_import.py --export-file <путь> [--apply]
 """
@@ -38,6 +52,7 @@ Anthropic OAuth-пул (задача #216) — ДРУГОЙ механизм (и
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -72,8 +87,20 @@ KROUTER_PROVIDER_TO_SUITE_FAMILY: dict[str, str] = {
     "glm": "zai",  # GLM — тот же Z.ai coding plan, что маршрут zai-1 в PR #732
 }
 
-_TEST_STATUS_RANK = {"active": 0, "error": 1, "unavailable": 2}
 _PROBE_TIMEOUT_SECONDS = 10
+
+# Тир ранга (меньше — лучше слоту). ДВЕ РАЗНЫЕ оси, не смешиваются (задача
+# #777): TIER_TEMPORARY (квота/backoff) — нормальное состояние ротации, оно
+# ЛУЧШЕ TIER_DISQUALIFIED (ключ неверен) при любом источнике факта.
+_TIER_HEALTHY = 0
+_TIER_TEMPORARY = 1
+_TIER_UNKNOWN = 2
+_TIER_DISQUALIFIED = 3
+
+# HTTP-коды, которые и живая проба (probe_provider), и снимок (errorCode)
+# трактуют одинаково — «ключ неверен/доступ запрещён», настоящая
+# дисквалификация, не квота.
+_AUTH_INVALID_HTTP_CODES = (401, 403)
 
 
 class LoudError(RuntimeError):
@@ -183,6 +210,27 @@ def load_export(path_str: str) -> dict:
     return data
 
 
+_FILENAME_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def export_snapshot_date(path: Path) -> str:
+    """Дата снимка предохранителя (задача #777, критерий 4) — экспорт krouter
+    не несёт дату содержимым JSON (проверено на реальном файле владельца:
+    верхнеуровневые ключи не dict/list — settings/modelAliases/mitmAlias/
+    pricing, ни одного поля-даты), поэтому берём её из имени файла
+    (krouter-backup-<ISO-дата>...), а если экспортёр когда-нибудь переименует
+    файл — из mtime, явно пометив, что это mtime файла, а не факт о
+    содержимом."""
+    match = _FILENAME_DATE_RE.search(path.name)
+    if match:
+        return f"{match.group(1)} (дата из имени файла)"
+    mtime = path.stat().st_mtime
+    return (
+        datetime.datetime.fromtimestamp(mtime).date().isoformat()
+        + " (по mtime файла — имя файла даты не содержит)"
+    )
+
+
 @dataclass
 class Account:
     id: str
@@ -193,6 +241,7 @@ class Account:
     test_status: str
     backoff_level: int
     last_error: str
+    error_code: int | None
     api_key: str | None
     access_token: str | None
 
@@ -203,6 +252,7 @@ def accounts_from_export(data: dict) -> list[Account]:
         if not isinstance(raw, dict):
             continue
         priority_raw = raw.get("priority")
+        error_code_raw = raw.get("errorCode")
         accounts.append(
             Account(
                 id=str(raw.get("id", "")),
@@ -213,6 +263,7 @@ def accounts_from_export(data: dict) -> list[Account]:
                 test_status=str(raw.get("testStatus") or ""),
                 backoff_level=int(raw.get("backoffLevel") or 0),
                 last_error=str(raw.get("lastError") or ""),
+                error_code=int(error_code_raw) if isinstance(error_code_raw, (int, float)) else None,
                 api_key=(raw.get("apiKey") or None),
                 access_token=(raw.get("accessToken") or None),
             )
@@ -226,16 +277,60 @@ def secret_value(account: Account) -> str | None:
     return account.api_key or account.access_token or None
 
 
-def _rank_key(account: Account) -> tuple:
-    """Правило выбора слота (задача #733, критерий 7): isActive, затем
-    testStatus (active лучше error лучше unavailable), затем priority
-    (меньше — лучше), затем id для стабильности сортировки."""
+def classify_snapshot(account: Account) -> tuple[int, str]:
+    """Ранг по СНИМКУ файла-экспорта — только когда живой пробы нет (задача
+    #777). isActive/testStatus сами по себе НЕ дисквалифицируют (это
+    предохранитель на дату выгрузки, см. докстринг модуля) — единственное
+    основание дисквалификации по снимку — errorCode 401/403 (ключ
+    неверен/доступ запрещён). errorCode 429 или backoffLevel>0 — та же ось,
+    что и живая проба 429: квота, нормальное состояние ротации."""
+    if account.is_active and account.test_status == "active":
+        return _TIER_HEALTHY, "активна по снимку (testStatus=active) [источник: снимок]"
+    if account.error_code in _AUTH_INVALID_HTTP_CODES:
+        return (
+            _TIER_DISQUALIFIED,
+            f"ключ неверен по снимку (errorCode={account.error_code}) [источник: снимок]",
+        )
+    if account.error_code == 429 or account.backoff_level > 0:
+        return (
+            _TIER_TEMPORARY,
+            "квота/backoff по снимку — временное состояние ротации, не дисквалификация "
+            "[источник: снимок]",
+        )
     return (
-        0 if account.is_active else 1,
-        _TEST_STATUS_RANK.get(account.test_status, 3),
-        account.priority,
-        account.id,
+        _TIER_UNKNOWN,
+        "неопределённо по снимку (нет явной ошибки авторизации) [источник: снимок]",
     )
+
+
+def classify_probe(status: str) -> tuple[int, str] | None:
+    """Ранг по РЕЗУЛЬТАТУ живой пробы (probe_provider). None — проба не
+    получила ответа от сети (недоступна), вызывающий обязан упасть на
+    classify_snapshot и пометить это в отчёте."""
+    if status == "жива":
+        return _TIER_HEALTHY, "жива [источник: проба]"
+    if status == "квота исчерпана":
+        return _TIER_TEMPORARY, "квота исчерпана [источник: проба] — не дисквалификация"
+    if status == "ключ неверен":
+        return _TIER_DISQUALIFIED, "ключ неверен [источник: проба]"
+    if status.startswith("неизвестно (сеть:"):
+        return None
+    return _TIER_UNKNOWN, f"{status} [источник: проба]"
+
+
+def rank_account(account: Account, probe_status: str | None) -> tuple[int, str, str]:
+    """(tier, заметка, источник). Живая проба, если получила ответ по сети, —
+    авторитетный источник факта; иначе (проба выключена/недоступна по сети) —
+    снимок файла-экспорта."""
+    if probe_status is not None:
+        classified = classify_probe(probe_status)
+        if classified is not None:
+            tier, note = classified
+            return tier, note, "проба"
+        tier, note = classify_snapshot(account)
+        return tier, f"{note} (проба недоступна по сети)", "снимок"
+    tier, note = classify_snapshot(account)
+    return tier, note, "снимок"
 
 
 # ── Сопоставление слотов ──────────────────────────────────────────────────
@@ -245,6 +340,7 @@ def _rank_key(account: Account) -> tuple:
 class SlotAssignment:
     route: SuiteRoute
     account: Account | None
+    empty_reason: str | None = None
 
 
 @dataclass
@@ -252,15 +348,22 @@ class SelectionResult:
     assignments: list[SlotAssignment]
     overflow: list[Account]
     out_of_scope: list[Account]
+    probe_excluded: list[Account]
+    rank_by_id: dict[str, tuple[int, str, str]]
 
 
-def select_accounts(accounts: list[Account], routes: list[SuiteRoute]) -> SelectionResult:
+def group_routes_by_family(routes: list[SuiteRoute]) -> dict[str, list[SuiteRoute]]:
     routes_by_family: dict[str, list[SuiteRoute]] = {}
     for route in routes:
         routes_by_family.setdefault(route.family, []).append(route)
     for family_routes in routes_by_family.values():
         family_routes.sort(key=lambda r: r.slot)
+    return routes_by_family
 
+
+def group_candidates(
+    accounts: list[Account], routes_by_family: dict[str, list[SuiteRoute]]
+) -> tuple[dict[str, list[Account]], list[Account]]:
     candidates_by_family: dict[str, list[Account]] = {}
     out_of_scope: list[Account] = []
     for account in accounts:
@@ -269,18 +372,98 @@ def select_accounts(accounts: list[Account], routes: list[SuiteRoute]) -> Select
             out_of_scope.append(account)
             continue
         candidates_by_family.setdefault(family, []).append(account)
+    return candidates_by_family, out_of_scope
+
+
+def probe_candidates(
+    candidates_by_family: dict[str, list[Account]],
+    routes_by_family: dict[str, list[SuiteRoute]],
+) -> dict[str, str]:
+    """Живая проба ТОЛЬКО кандидатов на слоты suite (задача #777) — учётки вне
+    списка маршрутов (out_of_scope) пробовать бессмысленно, у них нет слота,
+    который проба могла бы переранжировать. На файле владельца это ~9
+    кандидатов из 46 учёток экспорта — пробовать все 46 значило бы тратить
+    сеть на 37 учёток, чей результат пробы ни на что не влияет."""
+    results: dict[str, str] = {}
+    for family, accounts in candidates_by_family.items():
+        family_routes = routes_by_family.get(family)
+        if not family_routes:
+            continue
+        base_url = family_routes[0].base_url
+        for account in accounts:
+            value = secret_value(account)
+            if value is None:
+                continue
+            results[account.id] = probe_provider(base_url, value)
+    return results
+
+
+def select_accounts(
+    accounts: list[Account],
+    routes: list[SuiteRoute],
+    probe_results: dict[str, str] | None = None,
+) -> SelectionResult:
+    probe_results = probe_results or {}
+    routes_by_family = group_routes_by_family(routes)
+    candidates_by_family, out_of_scope = group_candidates(accounts, routes_by_family)
+
+    rank_by_id: dict[str, tuple[int, str, str]] = {}
+    for family_accounts in candidates_by_family.values():
+        for account in family_accounts:
+            rank_by_id[account.id] = rank_account(account, probe_results.get(account.id))
 
     assignments: list[SlotAssignment] = []
     overflow: list[Account] = []
+    probe_excluded: list[Account] = []
     for family, family_routes in routes_by_family.items():
-        candidates = sorted(candidates_by_family.get(family, []), key=_rank_key)
+        ranked = sorted(
+            candidates_by_family.get(family, []),
+            key=lambda a: (rank_by_id[a.id][0], a.priority, a.id),
+        )
+        # Живая проба, подтвердившая «ключ неверен» (401/403) — настоящая
+        # дисквалификация (не снимок, который может быть двухнедельной
+        # давности): такого кандидата НЕ ставим в слот, честнее оставить его
+        # пустым с названной причиной (задача #777, критерий 5). Снимочная
+        # дисквалификация (нет живой пробы) кандидата не выбрасывает — только
+        # ранжирует его последним, он всё ещё может занять слот, если больше
+        # некому.
+        viable: list[Account] = []
+        dead_by_probe: list[Account] = []
+        for account in ranked:
+            tier, _note, source = rank_by_id[account.id]
+            if source == "проба" and tier == _TIER_DISQUALIFIED:
+                dead_by_probe.append(account)
+            else:
+                viable.append(account)
+
+        empty_reason = None
+        if dead_by_probe:
+            names = ", ".join(account.email or account.id for account in dead_by_probe)
+            empty_reason = (
+                f"{len(dead_by_probe)} кандидат(ов) исключены живой пробой "
+                f"(ключ неверен): {names}"
+            )
+
         for index, route in enumerate(family_routes):
-            account = candidates[index] if index < len(candidates) else None
-            assignments.append(SlotAssignment(route=route, account=account))
-        overflow.extend(candidates[len(family_routes):])
+            account = viable[index] if index < len(viable) else None
+            assignments.append(
+                SlotAssignment(
+                    route=route,
+                    account=account,
+                    empty_reason=(empty_reason if account is None and dead_by_probe else None),
+                )
+            )
+        overflow.extend(viable[len(family_routes):])
+        probe_excluded.extend(dead_by_probe)
 
     assignments.sort(key=lambda a: (a.route.family, a.route.slot))
-    return SelectionResult(assignments=assignments, overflow=overflow, out_of_scope=out_of_scope)
+    return SelectionResult(
+        assignments=assignments,
+        overflow=overflow,
+        out_of_scope=out_of_scope,
+        probe_excluded=probe_excluded,
+        rank_by_id=rank_by_id,
+    )
 
 
 # ── gh: секреты/переменные (значения только через stdin) ────────────────────
@@ -371,39 +554,58 @@ def probe_provider(base_url: str, api_key: str) -> str:
 def render_report(
     selection: SelectionResult,
     secret_status: dict[str, str],
-    probe_results: dict[str, str],
     suite_status: str,
     apply: bool,
+    export_date: str,
 ) -> str:
     lines: list[str] = []
+    lines.append(f"Снимок экспорта датирован: {export_date}.")
+    lines.append(
+        "`isActive`/`testStatus` в таблице ниже — состояние ПРЕДОХРАНИТЕЛЯ роутера учёток "
+        "на дату снимка (квота исчерпана → учётка гасится, квота вернулась → включается "
+        "обратно), а НЕ факт о текущей пригодности ключа. Колонка «ранг» называет "
+        "источник вывода: живая проба (текущий факт) либо снимок (когда пробы нет — "
+        "выключена флагом или недоступна по сети)."
+    )
+    lines.append("")
     lines.append("## Слоты combo-router (PR #732)\n")
-    lines.append("| секрет | провайдер | email | priority | isActive | testStatus | статус | проба |")
+    lines.append(
+        "| секрет | провайдер | email | priority | isActive (снимок) | testStatus (снимок) | ранг | статус секрета |"
+    )
     lines.append("|---|---|---|---|---|---|---|---|")
     assigned = 0
     empty = 0
     for slot in selection.assignments:
         name = slot.route.secret_env
         if slot.account is None:
-            lines.append(f"| {name} | — | — | — | — | — | нет кандидата | — |")
+            reason = slot.empty_reason or "нет кандидата"
+            lines.append(f"| {name} | — | — | — | — | — | пусто: {reason} | — |")
             empty += 1
             continue
         assigned += 1
         account = slot.account
         status = secret_status.get(name, "?")
-        probe = probe_results.get(name, "не проверялась" if not apply else "—")
+        _tier, note, _source = selection.rank_by_id.get(account.id, (None, "?", "?"))
         lines.append(
             f"| {name} | {account.provider} | {account.email} | {account.priority} | "
-            f"{account.is_active} | {account.test_status} | {status} | {probe} |"
+            f"{account.is_active} | {account.test_status} | {note} | {status} |"
         )
     lines.append("")
     lines.append(f"Слотов с кандидатом: {assigned}; слотов без кандидата: {empty}.")
     lines.append("")
+    if selection.probe_excluded:
+        lines.append("## Исключены живой пробой (подтверждено «ключ неверен»)\n")
+        for account in selection.probe_excluded:
+            _tier, note, _source = selection.rank_by_id.get(account.id, (None, "?", "?"))
+            lines.append(f"- {account.provider} — {account.email or account.id}: {note}")
+        lines.append("")
     if selection.overflow:
         lines.append("## Не влезли в слоты (тот же провайдер, слотов не хватило)\n")
         for account in selection.overflow:
+            _tier, note, _source = selection.rank_by_id.get(account.id, (None, "?", "?"))
             lines.append(
                 f"- {account.provider} — {account.email} (priority={account.priority}, "
-                f"isActive={account.is_active}, testStatus={account.test_status})"
+                f"isActive={account.is_active}, testStatus={account.test_status}, ранг: {note})"
             )
         lines.append("")
     if selection.out_of_scope:
@@ -452,7 +654,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite-tag", default=DEFAULT_SUITE_TAG, help=f"значение vars.{SUITE_URL_VAR} (дефолт {DEFAULT_SUITE_TAG})")
     parser.add_argument("--dsh-ci-path", default=str(DSH_CI_DEFAULT), help="путь к dsh-ci.sh для парсинга контракта имён (для тестов)")
     parser.add_argument("--repo", default=None, help="owner/repo (по умолчанию — GITHUB_REPOSITORY/gh repo view)")
-    parser.add_argument("--no-probe", action="store_true", help="не делать живые HTTP-запросы к эндпоинтам провайдеров")
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="не делать живые HTTP-запросы к эндпоинтам провайдеров (дефолт — пробовать "
+             "кандидатов на слоты suite ВСЕГДА, и в сухом прогоне тоже, задача #777: "
+             "проба ничего не пишет, а сеть и так дёргается при --apply)",
+    )
     return parser
 
 
@@ -467,7 +675,12 @@ def main(argv: list[str] | None = None) -> int:
         data = load_export(args.export_file)
         routes = parse_suite_routes(Path(args.dsh_ci_path))
         accounts = accounts_from_export(data)
-        selection = select_accounts(accounts, routes)
+        routes_by_family = group_routes_by_family(routes)
+        candidates_by_family, _out_of_scope = group_candidates(accounts, routes_by_family)
+        probe_results = (
+            {} if args.no_probe else probe_candidates(candidates_by_family, routes_by_family)
+        )
+        selection = select_accounts(accounts, routes, probe_results=probe_results)
         repo = gh_repo(args.repo)
         existing_secrets = existing_secret_names(repo)
         existing_vars = existing_variable_names(repo)
@@ -475,8 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"::error::{error}", file=sys.stderr)
         return 2
 
+    export_date = export_snapshot_date(Path(args.export_file))
     secret_status: dict[str, str] = {}
-    probe_results: dict[str, str] = {}
 
     for slot in selection.assignments:
         name = slot.route.secret_env
@@ -503,9 +716,6 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             secret_status[name] = "перезаписан" if already else "создан"
 
-        if args.apply and do_write and not args.no_probe:
-            probe_results[name] = probe_provider(slot.route.base_url, value)
-
     suite_already = SUITE_URL_VAR in existing_vars
     suite_do_write = args.apply and (not suite_already or args.force_vars)
     if not args.apply:
@@ -522,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
         except LoudError as error:
             suite_status = f"ОШИБКА записи: {error}"
 
-    print(render_report(selection, secret_status, probe_results, suite_status, args.apply))
+    print(render_report(selection, secret_status, suite_status, args.apply, export_date))
     return 0
 
 
