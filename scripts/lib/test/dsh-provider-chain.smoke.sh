@@ -74,6 +74,14 @@ dsh() {
         real-error)
           echo "dsh: INVALID_API_KEY: unauthorized" >&2
           return 1 ;;
+        leaky-error)
+          # #743, живая утечка: начало ответа 401 у провайдера типично несёт
+          # эхо заголовка Authorization — прод-форма, не выдумка (см.
+          # docs/runbooks/switch-llm-provider.md). Маркер синтетический
+          # (SMOKE-...), но лежит в позиции, где реальный производный
+          # DEEPSEEK_API_KEY оказался бы у настоящего провайдера.
+          echo "dsh: INVALID_API_KEY: unauthorized — received header Authorization: Bearer sk-SMOKE1EEDEDBEEFCAFEBABE1234567890abcdef" >&2
+          return 1 ;;
         silent)
           # #737, живой случай — прогон 34188152283: rc=1, НИ ОДНОГО байта в
           # stderr (не пересказ — воспроизводит ровно тот факт).
@@ -212,4 +220,22 @@ UNCONFIRMED_CHAIN='[
 ) || fail "7) сценарий с неподтверждённым id модели провалился"
 echo "SMOKE(chain): 7) неподтверждённый id модели -> пропуск с честным сообщением, время/квота не потрачены — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737 зелёная"
+# ── 8) Класс #743: стоп-класс кладёт сырой stderr в DSH_CHAIN_CLASS_NOTE —
+# маркер, похожий на эхо заголовка Authorization, ОБЯЗАН уйти замаскированным
+# и в переменную, и в лог (::error:: печатает её же). GITHUB_STEP_SUMMARY
+# этот путь не трогает вовсе (dsh-ci.sh нигде его не пишет — проверено
+# grep'ом по scripts/lib/dsh-ci.sh), поэтому здесь не проверяется отдельно.
+reset_scenario
+MARKER="sk-SMOKE1EEDEDBEEFCAFEBABE1234567890abcdef"
+SMOKE_MODE_primary_model="leaky-error"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log8.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" != "0" ] || fail "8) leaky-error не должен был дать успех"
+[[ "$OUT" != *"$MARKER"* ]] || fail "8) сырой маркер секрета уехал в лог (stdout/stderr шага): $OUT"
+[[ "$DSH_CHAIN_CLASS_NOTE" != *"$MARKER"* ]] || fail "8) сырой маркер секрета остался в DSH_CHAIN_CLASS_NOTE после формирования: $DSH_CHAIN_CLASS_NOTE"
+[[ "$OUT" == *"sk-[REDACTED]"* ]] || fail "8) redact() не отработал — в логе нет ожидаемой замены sk-[REDACTED]: $OUT"
+echo "SMOKE(chain): 8) сырой stderr стоп-класса маскируется redact() до печати и до записи в переменную — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743 зелёная"
