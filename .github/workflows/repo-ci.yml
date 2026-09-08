@@ -339,6 +339,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_stall_detector.py -q
 
+      # Гвардия по исходнику (#637, ревью PR #656): фраза класса «нужен
+      # человек»/«требуется решение»/«конвейер стоит» обязана либо доставляться
+      # (escalate/send_telegram) в той же функции, либо быть в явном WHITELIST
+      # с обоснованием — не тонуть молча в GITHUB_STEP_SUMMARY.
+      - name: Тесты гвардии класса «нужен человек без доставки» (#637)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_escalation_class_guard.py -q
+
       # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
       # source-build морды кричит в задачу #134 + метка update-available +
       # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
