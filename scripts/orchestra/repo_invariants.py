@@ -76,6 +76,24 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      граница: общий класс «утверждение о готовом артефакте без адреса»
      статически не выразим и этой гвардией НЕ покрыт — правило держится на
      ревью (AGENTS.md), инвариант закрывает только саму формулу.
+  9. check_stalled_review_without_signal (#637) — PR прошёл гейт 1, вердикта
+     ai:* нет дольше UNHEALTHY_PR_AFTER_MINUTES (то же подмножество, что уже
+     нашёл инвариант 3), автоповтор #196 исчерпан В ТЕКУЩЕЙ ЭПОХЕ (новый тик
+     оркестратора не поможет), и при этом НИ открытой автозадачи по
+     отпечатку `gate:no-ai-verdict` (stall_detector, #201) НЕТ, НИ
+     доставленного владельцу сигнала за сегодня (CAP_EXHAUSTED_DELIVERED_
+     MARKER, stall_detector, #637) не найдено. Живой замер (прогон
+     34194073339, 2026-09-08T06:20:31Z): 5 PR (#726/#721/#618/#453/#328)
+     провисели 155–296 мин без вердикта, суточный потолок автозаведения
+     исчерпан (5/5) чужими отпечатками — ни задачи, ни доставленного сигнала
+     об этих пяти PR не было почти пять часов, и ничто в репозитории этого
+     не поймало. Второй, независимый от stall_detector путь того же класса
+     (тот же приём, что второй путь завершённости у инварианта 4): не
+     разбирает текстовый отчёт пульса и не зависит от того, попал ли
+     конкретный симптом в его регэкспы — смотрит прямо на факт (гейт решён,
+     вердикта нет, бюджет исчерпан) и на факт присутствия сигнала (задача
+     или доставка). В ESCALATING_INVARIANTS — сам доставляет сигнал
+     (escalate, тот же канал, что 1/3), если найден.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -190,6 +208,16 @@ _SCH_SPEC = importlib.util.spec_from_file_location(
     "scheduler", REPO_ROOT / "scripts" / "orchestra" / "scheduler.py")
 scheduler = importlib.util.module_from_spec(_SCH_SPEC)
 _SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
+
+# find_open_task/CAP_EXHAUSTED_DELIVERED_MARKER — одно место правды на
+# отпечаток «gate:no-ai-verdict» и на маркер подтверждённой доставки потолка
+# (#637, инвариант 9): вторая копия строки маркера здесь разошлась бы с
+# stall_detector при первой же его правке, тот же класс, что предупреждает
+# AGENTS.md про «одно место правды».
+_SD_SPEC = importlib.util.spec_from_file_location(
+    "stall_detector", REPO_ROOT / "scripts" / "orchestra" / "stall_detector.py")
+stall_detector = importlib.util.module_from_spec(_SD_SPEC)
+_SD_SPEC.loader.exec_module(stall_detector)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
@@ -860,6 +888,53 @@ def check_ambiguous_artifact_phrase(docs_root: Path) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9 (#637): PR готов к слиянию, застрял без вердикта — и владелец
+# об этом НЕ узнал ни задачей, ни доставленным сигналом
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой замер (прогон 34194073339, шаг «Обход пула и очередь слияний»,
+# 2026-09-08T06:20:31Z): 5 PR без вердикта AI от 155 до 296 минут, у каждого
+# автоповторов 3/3 («не дёргаю снова, нужен человек»): #726 (225 мин), #721
+# (238), #618 (175), #453 (155), #328 (296). Последней строкой того же шага:
+# «🚨 потолок автозаведённых задач в сутки исчерпан (5/5) — отпечаток
+# gate:pipeline-paused НЕ заведён, нужен человек». Конвейер стоял, механизм
+# распознал это верно и не смог сообщить владельцу — сессия узнала о
+# простое только потому, что кто-то прочитал лог прогона руками. Этот
+# инвариант — второй, независимый от stall_detector канал того же класса:
+# не разбирает текст отчёта пульса (регэкспы stall_detector.extract_signals
+# могут не покрыть конкретную формулировку), а смотрит прямо на факт,
+# который уже вычисляет инвариант 3 (гейт 1 решён, вердикта нет), плюс факт
+# исчерпания бюджета автоповтора В ЭТОЙ ЖЕ ЭПОХЕ (новый тик оркестратора не
+# добавит попытки), плюс факт присутствия сигнала — задача класса
+# `gate:no-ai-verdict` (stall_detector.find_open_task) или подтверждённая
+# доставка потолка за сегодня (stall_detector.CAP_EXHAUSTED_DELIVERED_MARKER).
+# Ни того, ни другого — нарушение, даже если stall_detector в этом самом
+# пульсе почему-то не увидел сигнал вовсе.
+
+
+def check_stalled_review_without_signal(
+    stuck_violations: list[dict], has_open_signal_task: bool, delivered_today: bool,
+) -> list[dict]:
+    """Подмножество нарушений инварианта 3, чей бюджет автоповтора #196 уже
+    ИСЧЕРПАН В ТЕКУЩЕЙ ЭПОХЕ (`attempts_in_epoch >= attempts_limit` —
+    поэтому новый тик оркестратора точно не разрешит эпизод сам, в отличие
+    от «бюджет ещё не исчерпан», который стоит подождать), и при этом ни
+    открытой автозадачи (`has_open_signal_task`), ни доставленного сигнала
+    за сегодня (`delivered_today`) не найдено. Один и тот же
+    `has_open_signal_task`/`delivered_today` — на всю партию: оба факта
+    описывают состояние на уровне репозитория/дня, не конкретного PR (тот
+    же PR-независимый масштаб, что у CAP_EXHAUSTED_DELIVERED_MARKER в
+    stall_detector — потолок и его доставка считаются на СУТКИ, не на
+    отпечаток)."""
+    if has_open_signal_task or delivered_today:
+        return []
+    return [
+        item for item in stuck_violations
+        if item["attempts_in_epoch"] >= item["attempts_limit"]
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1036,6 +1111,32 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [7] двусмысленной формулы принадлежности плагина нет")
 
+    # Инвариант 9 (#637): ленивый — сеть только если ЕСТЬ кандидат
+    # (attempts_in_epoch >= attempts_limit хоть у одного PR из v3), тот же
+    # приём холостого хода, что у остальных инвариантов (гвардия
+    # test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls не
+    # должна ловить лишний вызов на здоровом снимке без застрявших PR).
+    any_exhausted = any(item["attempts_in_epoch"] >= item["attempts_limit"] for item in v3)
+    if any_exhausted:
+        has_open_signal_task = stall_detector.find_open_task(repo, "gate:no-ai-verdict") is not None
+        delivered_marker = f"{stall_detector.CAP_EXHAUSTED_DELIVERED_MARKER} {now.date().isoformat()}]"
+        delivered_today = bool(issue_marker_times(repo, WATCHDOG_ISSUE, delivered_marker))
+    else:
+        has_open_signal_task = False
+        delivered_today = False
+    v9 = check_stalled_review_without_signal(v3, has_open_signal_task, delivered_today)
+    findings[9] = v9
+    if v9:
+        lines.append(
+            f"🚨 [9] {len(v9)} PR готовы к слиянию, застряли без вердикта и БЕЗ "
+            "доставленного сигнала владельцу (ни задачи gate:no-ai-verdict, ни "
+            f"подтверждённой доставки потолка сегодня, #637):"
+        )
+        for item in v9:
+            lines.append(f"   — {stuck_gate_fact_line(item)}")
+    else:
+        lines.append("💚 [9] нет застрявших PR без доставленного сигнала владельцу")
+
     return lines, findings
 
 
@@ -1048,7 +1149,7 @@ def summary(lines: list[str]) -> None:
             file.write(text)
 
 
-ESCALATING_INVARIANTS = (1, 3)
+ESCALATING_INVARIANTS = (1, 3, 9)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -1094,6 +1195,22 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 3, key, text)
         if result:
             lines.append(f"📣 инвариант 3 эскалирован: {result}")
+    if findings.get(9):
+        v9 = findings[9]
+        key = ",".join(f"#{i['pr']}" for i in v9)
+        text = (
+            "🚨 edge-harness: инвариант 9 (застрял без сигнала владельцу, #637) — "
+            f"{len(v9)} PR готовы к слиянию, вердикта ai:* нет, автоповтор #196 "
+            "исчерпан в текущей эпохе, и ни задачи gate:no-ai-verdict, ни "
+            "доставленного сигнала за сегодня не найдено:\n"
+            + "\n".join(f"— {stuck_gate_fact_line(item)}" for item in v9)
+            + "\n\nЧто дальше: поставь вердикт ai:* вручную (issue-comment "
+            "ai-review.yml) или перезапусти прогон — тот же газ, что у "
+            "инварианта 3 (GATING_RELEASE_CONDITION[3])."
+        )
+        result = escalate_if_new(repo, 9, key, text)
+        if result:
+            lines.append(f"📣 инвариант 9 эскалирован: {result}")
     return lines
 
 

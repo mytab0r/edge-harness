@@ -202,9 +202,17 @@ def patch_gh(monkeypatch, fake):
     module-level `gh`, а не `ri.gh`). Патчить только `ri.gh` недостаточно —
     так один прогон реально ушёл в живой issue #120 (инцидент этой задачи,
     #244: очищено вручную, gh api -X DELETE .../comments/5527288512).
-    Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh."""
+    Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh.
+
+    Третье имя — `ri.stall_detector.gh` (инвариант 9, #637): stall_detector
+    импортирует `gh` через `from pulse_guard import gh` — своя копия имени в
+    СВОЁМ модульном пространстве (отдельный importlib-инстанс, не тот же
+    объект, что `ri.pulse_guard`), find_open_task/open_auto_tasks зовут
+    именно её. Без этого патча вызов реально ушёл бы в живой `gh api`
+    (найдено этим же тестом на живом прогоне — see test_build_report_v9_*)."""
     monkeypatch.setattr(ri, "gh", fake)
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
+    monkeypatch.setattr(ri.stall_detector, "gh", fake)
 
 
 def gate1_status(when: str):
@@ -997,6 +1005,143 @@ def test_ambiguous_artifact_phrase_in_ci_gating_with_gas():
     # если газ отберут, не назвав замену (AGENTS.md, «Тормоз без газа»).
     assert 7 in ri.CI_GATING
     assert 7 in ri.GATING_RELEASE_CONDITION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9 (#637): застрял без вердикта — и без доставленного сигнала
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _stuck_item(pr, attempts_in_epoch, attempts_limit=3):
+    return {
+        "pr": pr, "age_minutes": 250.0, "labeled_at": "2026-09-08T02:00:00+00:00",
+        "attempts_total": attempts_in_epoch, "attempts_in_epoch": attempts_in_epoch,
+        "attempts_limit": attempts_limit, "last_attempt_at": "2026-09-08T02:10:00+00:00",
+        "verdict_ever": None,
+    }
+
+
+def test_stalled_review_without_signal_flags_when_no_task_and_no_delivery():
+    # Прод-форма живого замера (#637, прогон 34194073339): бюджет исчерпан
+    # 3/3 в текущей эпохе, ни задачи, ни доставки.
+    stuck = [_stuck_item(726, 3), _stuck_item(721, 3)]
+    violations = ri.check_stalled_review_without_signal(stuck, has_open_signal_task=False, delivered_today=False)
+    assert {v["pr"] for v in violations} == {726, 721}
+
+
+def test_stalled_review_without_signal_silent_when_task_open():
+    stuck = [_stuck_item(726, 3)]
+    assert ri.check_stalled_review_without_signal(stuck, has_open_signal_task=True, delivered_today=False) == []
+
+
+def test_stalled_review_without_signal_silent_when_delivered_today():
+    stuck = [_stuck_item(726, 3)]
+    assert ri.check_stalled_review_without_signal(stuck, has_open_signal_task=False, delivered_today=True) == []
+
+
+def test_stalled_review_without_signal_ignores_budget_not_yet_exhausted():
+    # Бюджет ещё не исчерпан (2/3) — новый тик оркестратора ещё может
+    # разрешить эпизод сам, инвариант 9 не должен опережать газ #196.
+    stuck = [_stuck_item(453, 2)]
+    assert ri.check_stalled_review_without_signal(stuck, has_open_signal_task=False, delivered_today=False) == []
+
+
+def test_stalled_review_without_signal_mutation_guard():
+    # Мутация: снять фильтр по attempts_in_epoch >= attempts_limit (вернуть
+    # «все нарушения инварианта 3 без разбора») — тест обязан отличить эту
+    # мутацию: PR с неисчерпанным бюджетом попал бы в список.
+    stuck = [_stuck_item(453, 2), _stuck_item(726, 3)]
+    violations = ri.check_stalled_review_without_signal(stuck, has_open_signal_task=False, delivered_today=False)
+    assert {v["pr"] for v in violations} == {726}  # НЕ {453, 726}
+
+
+def watchdog_comment(when, marker):
+    return {"created_at": when, "body": marker}
+
+
+def test_build_report_v9_flags_live_incident_shape(monkeypatch):
+    # Прод-форма живого инцидента (#637, 2026-09-08T06:20:31Z): PR #726 —
+    # гейт 1 решён, вердикта нет 225 мин, автоповтор 3/3, потолок
+    # автозаведения исчерпан ЧУЖИМИ отпечатками (нет задачи gate:no-ai-verdict),
+    # доставленного сигнала за сегодня нет.
+    pull = open_pr(726, labels=["review:ok"])
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [pull],
+        "commits/sha726/statuses": gate1_status("2026-09-08T02:35:00Z"),
+        "issues/726/timeline": timeline_with_review_ok("2026-09-08T02:35:00Z"),
+        "issues/726/comments": [
+            retry_marker_comment("2026-09-08T02:45:00Z", 1),
+            retry_marker_comment("2026-09-08T02:50:00Z", 2),
+            retry_marker_comment("2026-09-08T02:55:00Z", 3),
+        ],
+        f"issues?state=open&labels={ri.stall_detector.AUTO_LABEL}": [],  # ни одной автозадачи
+        "issues/120/comments": [],  # ни одного доставленного маркера сегодня
+    })
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes-dir"))
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 8, 6, 20, 31)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[9]) == 1
+    assert findings[9][0]["pr"] == 726
+    assert any("🚨 [9]" in line for line in lines)
+
+
+def test_build_report_v9_silent_when_delivered_marker_present_today(monkeypatch):
+    pull = open_pr(726, labels=["review:ok"])
+    delivered_marker = f"{ri.stall_detector.CAP_EXHAUSTED_DELIVERED_MARKER} 2026-09-08]"
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [pull],
+        "commits/sha726/statuses": gate1_status("2026-09-08T02:35:00Z"),
+        "issues/726/timeline": timeline_with_review_ok("2026-09-08T02:35:00Z"),
+        "issues/726/comments": [
+            retry_marker_comment("2026-09-08T02:45:00Z", 1),
+            retry_marker_comment("2026-09-08T02:50:00Z", 2),
+            retry_marker_comment("2026-09-08T02:55:00Z", 3),
+        ],
+        f"issues?state=open&labels={ri.stall_detector.AUTO_LABEL}": [],
+        "issues/120/comments": [watchdog_comment("2026-09-08T05:00:00Z", delivered_marker)],
+    })
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes-dir"))
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 8, 6, 20, 31)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[9] == []
+    assert all("[9]" not in line or "💚" in line for line in lines)
+
+
+def test_build_report_v9_lazy_no_network_when_nothing_stuck(monkeypatch):
+    # Холостой ход именно инварианта 9: v3 пуст (PR уже несёт ai:ok) — ни
+    # find_open_task, ни issue_marker_times не должны вызываться вовсе.
+    pull = open_pr(50, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [pull],
+    })
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes-dir"))
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 8, 6, 20, 31)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[9] == []
+    assert not any("auto-detected" in call or "issues/120/comments" in call for call in fake.calls)
+
+
+def test_run_escalations_delivers_invariant_9(monkeypatch):
+    findings = {9: [_stuck_item(726, 3)]}
+    posted = []
+    monkeypatch.setattr(ri, "issue_marker_times", lambda *a: [])
+    monkeypatch.setattr(ri.pulse_guard, "post_issue_comment",
+                         lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(ri.pulse_guard, "send_telegram", lambda *a, **k: True)
+    lines = ri.run_escalations("mytab0r/edge-harness", findings)
+    assert any("инвариант 9" in line for line in lines)
+    assert len(posted) == 1 and posted[0][0] == ri.WATCHDOG_ISSUE
+    assert "#726" in posted[0][1]
+    assert "Что дальше" in posted[0][1]
 
 
 # ══════════════════════════════════════════════════════════════════════════

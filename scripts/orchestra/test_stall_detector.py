@@ -608,9 +608,23 @@ def test_cap_exhausted_escalation_not_delivered_is_not_deduped_same_day(monkeypa
     недоставленный Telegram молча признавался бы «сигнализированным» на весь
     остаток суток. Здесь Telegram НЕ доставляет (send_telegram → False) —
     подтверждающий маркер не появляется, и следующий пульс (тот же
-    календарный день) повторяет попытку, а не молчит до завтра. Мутация:
-    замени `"Telegram: доставлен" in result` на `True` в detect_and_act —
-    этот тест покраснеет (telegram_calls == 1 вместо 2)."""
+    календарный день) повторяет попытку, а не молчит до завтра.
+
+    Честно про докстринг предыдущей версии этого теста (проверено мутацией
+    руками, 2026-09-08): заявленная мутация `"Telegram: доставлен" in result`
+    → `True` НЕ красила тест только через `telegram_calls`/подстроку «НЕ
+    доставлен» — обе стороны `if` кладут в report СТРОКУ САМОГО `result`
+    (возврата `escalate()`), а `result` содержит «Telegram: НЕ доставлен»
+    независимо от того, какая ветка сработала (send_telegram в фикстуре
+    всё равно возвращает False) — подстрока совпадает в обоих случаях, и
+    telegram_calls растёт на пульс в обоих случаях тоже (второй пульс видит
+    в FakeGh тот же статичный список комментариев, раз sd.post_issue_comment
+    — no-op и ничего в него не пишет). Настоящая наблюдаемая разница мутации
+    — ПОДТВЕРЖДАЮЩИЙ маркер (CAP_EXHAUSTED_DELIVERED_MARKER) пишется, хотя
+    доставки не было; confirm_calls ниже — прямое наблюдение за этим фактом.
+    Мутация: замени `"Telegram: доставлен" in result` на `True` в
+    detect_and_act — confirm_calls перестанет быть пустым (доказано этим же
+    прогоном ниже, снятием фикса)."""
     first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
     already_created = [
         _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
@@ -627,7 +641,8 @@ def test_cap_exhausted_escalation_not_delivered_is_not_deduped_same_day(monkeypa
         "branches/main/protection": {"required_status_checks": {"contexts": ["test", "contract"]}},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    confirm_calls = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: confirm_calls.append(a))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)  # сам алерт escalate() пишет best-effort
     telegram_calls = []
     monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: telegram_calls.append(1) or False)
@@ -636,12 +651,16 @@ def test_cap_exhausted_escalation_not_delivered_is_not_deduped_same_day(monkeypa
     result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
     assert any("НЕ доставлен" in line for line in result)
     assert len(telegram_calls) == 1
+    # Доставки не было — подтверждающий маркер НЕ пишется (единственная
+    # наблюдаемая гарантия, из которой следует «следующий пульс повторит»).
+    assert confirm_calls == []
 
     # Тот же календарный день, следующий пульс (~15 мин) — повтор, не
     # молчание до завтра: подтверждающего маркера так и не появилось.
     result_2 = sd.detect_and_act(REPO, NOW + timedelta(minutes=15), [REAL_PIPELINE_PAUSED])
     assert any("НЕ доставлен" in line for line in result_2)
     assert len(telegram_calls) == 2
+    assert confirm_calls == []
 
 
 # ── Холостой ход: здоровый конвейер — ни одного вызова ─────────────────────
