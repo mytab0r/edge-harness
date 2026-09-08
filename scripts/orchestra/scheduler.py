@@ -2220,9 +2220,11 @@ def wip_gate(
 
 def declared_pr_task_numbers(pulls: list[dict]) -> set[int]:
     """Номера задач, у которых уже есть открытый PR — единственный источник
-    task_ref.resolve_pr_task (имя agent-ветки, #394), тот же, что использует
-    `pr_references_issue`/`scripts/lib/free_task.py::declared_pr_for_task` для
-    того же вопроса симметрично со стороны task.sh."""
+    task_ref.resolve_pr_task (имя agent-ветки, #394), тот же узкий источник
+    (`task_from_branch`), что использует `scripts/lib/free_task.py::
+    declared_pr_for_task` для того же вопроса симметрично со стороны task.sh.
+    Не `pr_references_issue` — та широкая (любое упоминание в прозе,
+    #286/#699) и для этого вопроса не годится."""
     numbers = set()
     for pull in pulls:
         number = task_ref.resolve_pr_task(pull)
@@ -2561,7 +2563,7 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
     прозу тела чужого PR легко упомянуть контекстом, не декларацией (живой
     случай 2026-09-04: тело PR #181 упомянуло #90, и #90 дважды лишилась
     аренды — PR #181 при этом был чужой, его собственная задача из имени
-    ветки была #181). Здесь шире — вреднее: PR без agent-ветки нужной формы
+    ветки была #179). Здесь шире — вреднее: PR без agent-ветки нужной формы
     не сопоставляется ни с одной задачей вовсе, «наверное эта» не выбираем."""
     lines = []
     # Заметки-итоги в сессии раннера (#480) — один логин на весь обход, см.

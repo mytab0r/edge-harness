@@ -1415,10 +1415,14 @@ def test_unhealthy_pulls_releases_own_task_of_same_prod_pr_via_branch(monkeypatc
 
 def test_unhealthy_pulls_ignores_pr_without_agent_branch_even_with_prose_mention(monkeypatch):
     # PR без ветки agent/N-... (ручной пуш/бот) — «задача не определена» для
-    # unhealthy_pulls, а не «наверное вот эта» по упоминанию в теле.
+    # unhealthy_pulls, а не «наверное вот эта» по упоминанию в теле. Прод-форма
+    # (#699, ревью): Pulls API всегда отдаёт head.ref (`patch-1`, `fix/...`) —
+    # ключ никогда не отсутствует, поэтому улика — форма ветки, не отсутствие
+    # ключа (ref=None у хелпера pull() его вовсе не кладёт, это не то же самое).
     task_90 = issue(90, assignees=("mytab0r",))
     pr_no_branch = pull(999, labels=["review:ok", "ai:changes-requested"],
-                         updated_at="2026-09-02T09:00:00Z", pr_body=_PR_181_BODY)  # ref=None
+                         updated_at="2026-09-02T09:00:00Z", pr_body=_PR_181_BODY,
+                         ref="fix/manual-push")
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
