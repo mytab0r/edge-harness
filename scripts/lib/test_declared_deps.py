@@ -271,6 +271,61 @@ def test_form_field_numbers_ignores_adhoc_heading_not_exact_field_text():
     assert dd.blocking_field_numbers(body) is None
 
 
+# ── #711 (блокирующая): голый номер, «форма не распознана», цитаты формы ────
+
+
+def test_form_field_numbers_reads_bare_number_without_hash():
+    # Живой прод-случай #757 (замер 2026-09-08): «### Что блокирует\n\n642»
+    # без `#` — раньше findall(r"#(\d+)") давал [], неотличимо от «ничем».
+    body = "### Что блокирует\n\n642"
+    assert dd.blocking_field_numbers(body) == [642]
+
+
+def test_form_field_numbers_reads_multiple_bare_numbers():
+    body = "### Чем блокируется\n\n434 642"
+    assert dd.form_field_numbers(body) == [434, 642]
+
+
+def test_form_field_numbers_unrecognized_form_is_not_nichem():
+    # Значение непусто, не «ничем», но НИ ОДНОГО числа — третий факт,
+    # раньше молча становился [] (то же значение, что явное «ничем»).
+    body = "### Чем блокируется\n\nне уверен, надо спросить владельца"
+    assert dd.form_field_numbers(body) is dd.UNRECOGNIZED_FORM
+    assert dd.form_field_numbers(body) != []
+    assert dd.form_field_numbers(body) is not None
+
+
+def test_form_field_numbers_ignores_fenced_code_block_example():
+    # Проба ревью PR #711: пример формы в ``` перед настоящим ответом.
+    body = (
+        "### Инструкция\n\n"
+        "```\n### Чем блокируется\n\n#605\n```\n\n"
+        "### Чем блокируется\n\nничем\n"
+    )
+    assert dd.form_field_numbers(body) == []
+
+
+def test_form_field_numbers_ignores_html_comment_example():
+    # Проба ревью PR #711: пример формы внутри HTML-комментария — заголовок
+    # на СВОЕЙ строке (иначе `^#{1,6}` не совпал бы даже без вырезания, тест
+    # не проверял бы вырезание вовсе).
+    body = (
+        "<!--\n### Чем блокируется\n\n#605\n-->\n\n"
+        "### Чем блокируется\n\nничем\n"
+    )
+    assert dd.form_field_numbers(body) == []
+
+
+def test_form_field_numbers_blank_answer_falls_through_to_next_nonempty_line():
+    # Граница разбора (замечание 3 ревью PR #711), зафиксирована как есть —
+    # НЕ регрессия: `\n+` после заголовка сознательно допускает пустую
+    # строку между заголовком и ответом (живой рендер `##` без пустой
+    # строки — тот же регэксп), значит первая НЕПУСТАЯ строка ниже
+    # заголовка и есть ответ поля, даже с пояснением рядом с номером.
+    body = "### Чем блокируется\n\nСмотри #605, там контекст."
+    assert dd.form_field_numbers(body) == [605]
+
+
 # ── declared_blocked_by: объединение заголовка и инлайн-конвенции ──────────
 
 
@@ -302,6 +357,13 @@ def test_declared_blocked_by_inline_nichem_is_explicit_empty_not_none():
 def test_declared_blocked_by_union_when_both_present():
     body = "## Чем блокируется\n#55\n\nБЛОКИРУЕТСЯ: #56"
     assert dd.declared_blocked_by(body) == [55, 56]
+
+
+def test_declared_blocked_by_propagates_unrecognized_form():
+    # #711: заголовочная форма не разбирается — не молча слить с инлайн-
+    # частью (которой тут и нет), а распространить сентинел вверх.
+    body = "## Чем блокируется\nне уверен\n"
+    assert dd.declared_blocked_by(body) is dd.UNRECOGNIZED_FORM
 
 
 # ── _load_ai_review: module-level memo (находка ревью PR #711) ─────────────
@@ -468,6 +530,38 @@ def test_auto_wire_reverse_blocking_field_idempotent_when_already_native(monkeyp
     report = dd.auto_wire("owner/repo")
     assert report == []
     assert fake.wire_calls == []
+
+
+def test_auto_wire_warns_and_skips_unrecognized_heading_form(monkeypatch):
+    # #711 (блокирующая): «форма не распознана» не должна тихо стать
+    # «перенести нечего» — видимое предупреждение, ноль сетевых вызовов
+    # (не гадаем номер), issue пропускается, не роняет прогон целиком.
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\nне уверен\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    warnings = []
+    report = dd.auto_wire("owner/repo", log=warnings.append)
+    assert report == []
+    assert fake.wire_calls == []
+    assert len(warnings) == 1
+    assert "не разбирается" in warnings[0]
+    assert "#500" in warnings[0]
+
+
+def test_auto_wire_warns_and_skips_unrecognized_reverse_field(monkeypatch):
+    issues = [
+        {"number": 500, "body": "### Что блокирует\n\nне уверен\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    warnings = []
+    report = dd.auto_wire("owner/repo", log=warnings.append)
+    assert report == []
+    assert fake.wire_calls == []
+    assert len(warnings) == 1
+    assert "Что блокирует" in warnings[0]
 
 
 def test_auto_wire_wires_inline_ai_review_convention_on_any_push_not_only_creation(monkeypatch):

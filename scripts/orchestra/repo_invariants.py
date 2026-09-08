@@ -308,7 +308,10 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
        "Если формулировка нужна как цитата самого инцидента — расширь паттерн "
        "инварианта осознанно, с комментарием, почему цитата безопаснее",
-    9: "для каждого «stale»: обнови текст поля («Чем блокируется»/«Что "
+    9: "для каждого «unrecognized»: поправь текст поля так, чтобы значение "
+       "читалось как список номеров (`#N`/голым `N`) или явное «ничем» — "
+       "формулировка не по одной из двух распознаваемых форм (#711); "
+       "для каждого «stale»: обнови текст поля («Чем блокируется»/«Что "
        "блокирует») под фактический граф, ЛИБО сними лишнее ребро "
        "(task_deps.py unblock), если оно ошибочно; для каждого «missing»: на "
        "push repo-ci — проверь, что declared_deps.py wire реально прогнан "
@@ -1058,6 +1061,14 @@ def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
         нативный `blockedBy` содержит #605 — текст лжёт о собственной
         зависимости). Связь стоит мимо текста задачи: поставлена вручную
         без обновления описания, или описание устарело после правки графа.
+      - «unrecognized» (задача #711, блокирующая находка ревью): поле
+        («Чем блокируется» или «Что блокирует») заполнено непустым ответом,
+        не «ничем», но текст не разбирается ни на один номер
+        (`declared_deps.UNRECOGNIZED_FORM`) — раньше это молча читалось как
+        «ничем» (валидный ответ), что прятало и заявленную связь, и
+        возможный «stale» одновременно. У находки нет поля `number` (не с
+        чем сравнивать граф) — только `issue`, видимый сигнал «поправь
+        формулировку», не оценка графа.
 
     Issue проверяется только если её СОБСТВЕННОЕ поле «Чем блокируется»/
     инлайн не `None` (`declared_deps.declared_blocked_by` вернул список,
@@ -1092,20 +1103,27 @@ def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
 
     declared_pairs: set[tuple[int, int]] = set()
     has_declaration: set[int] = set()
+    unrecognized: set[int] = set()
 
     for issue in issues_with_body:
         number = issue["number"]
         body = issue.get("body") or ""
         declared = declared_deps.declared_blocked_by(body)
-        if declared is not None:
+        if declared is declared_deps.UNRECOGNIZED_FORM:
+            unrecognized.add(number)
+        elif declared is not None:
             has_declaration.add(number)
             for n in declared:
                 if n in open_numbers and n != number:
                     declared_pairs.add((number, n))
-        for target in declared_deps.blocking_field_numbers(body) or []:
-            if target in open_numbers and target != number:
-                declared_pairs.add((target, number))
-                has_declaration.add(target)
+        reverse = declared_deps.blocking_field_numbers(body)
+        if reverse is declared_deps.UNRECOGNIZED_FORM:
+            unrecognized.add(number)
+        else:
+            for target in reverse or []:
+                if target in open_numbers and target != number:
+                    declared_pairs.add((target, number))
+                    has_declaration.add(target)
 
     violations: list[dict] = []
     for number in sorted(has_declaration):
@@ -1116,6 +1134,8 @@ def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
             violations.append({"issue": number, "kind": "missing", "number": blocking})
         for _, blocking in sorted(native - expected):
             violations.append({"issue": number, "kind": "stale", "number": blocking})
+    for number in sorted(unrecognized):
+        violations.append({"issue": number, "kind": "unrecognized"})
     return violations
 
 
@@ -1191,7 +1211,7 @@ def fetch_branch_protection(repo: str) -> dict:
 def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
     """Пул с телами и графом одним GraphQL-проходом (`task_deps.fetch_pool`,
     единственный источник, отдающий и то, и другое — REST для графа
-    недостаточен, см. docstring task_deps.py) — нужен ТОЛЬКО инварианту 8
+    недостаточен, см. docstring task_deps.py) — нужен ТОЛЬКО инварианту 9
     (check_declared_deps_mismatch): `fetch_open_task_issues` выше (REST,
     используется 1/4/5) тело/граф не тянет, не тянуть лишний трафик там, где
     он не читается."""
@@ -1199,10 +1219,17 @@ def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
 
 
 def build_report(repo: str, now: datetime,
-                  check_branch_protection: bool = False) -> tuple[list[str], dict[int, list]]:
+                  check_branch_protection: bool = False,
+                  check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
     """Возвращает (строки отчёта, {номер_инварианта: violations}). Чистых
     мутирующих вызовов здесь нет — только GET (см. gh()); гвардия холостого
     хода проверяет именно это.
+
+    check_declared_deps — инвариант 9 (#710/#711) по умолчанию включён
+    (repo-ci.yml `test`, на push И pull_request — то же решение, что уже
+    держит declared_deps.py wire/check), но `main()` выключает его на
+    периодическом пульсе (`--orchestra`) — замечание 1 ревью PR #711, см.
+    комментарий у соответствующей ветки ниже.
 
     check_branch_protection — инвариант 6 (#341) выключен по умолчанию:
     `GET /branches/main/protection` требует у токена право `administration`
@@ -1319,16 +1346,42 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [8] нет дорогих прогонов ai-review после вердикта при неизменном диффе")
 
-    open_tasks_with_body = fetch_open_task_issues_with_body(repo)
-    v9 = check_declared_deps_mismatch(open_tasks_with_body)
-    findings[9] = v9
-    if v9:
-        lines.append(f"🚨 [9] {len(v9)} расхождений тела задачи и графа blockedBy (#710):")
-        for item in v9:
-            verb = "не хватает ребра на" if item["kind"] == "missing" else "ребро есть, а поле не называет"
-            lines.append(f"   — #{item['issue']}: {verb} #{item['number']} ({item['kind']})")
+    if check_declared_deps:
+        try:
+            open_tasks_with_body = fetch_open_task_issues_with_body(repo)
+        except task_deps.TaskDepsError as error:
+            # Замечание 2 ревью PR #711: аномалия пула (>20 рёбер на issue,
+            # см. task_deps.py:165-180) не должна обрывать ВЕСЬ отчёт,
+            # включая гейтящий инвариант 7 — изолируем фетч именно этого
+            # инварианта, findings[9] остаётся пустым (не «согласовано» —
+            # видимая строка называет причину), остальные инварианты
+            # считаются как обычно.
+            findings[9] = []
+            lines.append(f"🚨 [9] фетч пула упал: {error} — инвариант пропущен на этом прогоне")
+        else:
+            v9 = check_declared_deps_mismatch(open_tasks_with_body)
+            findings[9] = v9
+            if v9:
+                lines.append(f"🚨 [9] {len(v9)} расхождений тела задачи и графа blockedBy (#710):")
+                for item in v9:
+                    if item["kind"] == "unrecognized":
+                        lines.append(f"   — #{item['issue']}: поле заполнено, форма ответа не распознана (unrecognized)")
+                        continue
+                    verb = "не хватает ребра на" if item["kind"] == "missing" else "ребро есть, а поле не называет"
+                    lines.append(f"   — #{item['issue']}: {verb} #{item['number']} ({item['kind']})")
+            else:
+                lines.append("💚 [9] тело задачи и граф blockedBy согласованы")
     else:
-        lines.append("💚 [9] тело задачи и граф blockedBy согласованы")
+        # Замечание 1 ревью PR #711: то же решение по цене, что уже держит
+        # declared_deps.py wire/check (repo-ci.yml, «пульс — самый дорогой
+        # потребитель квоты, #454») — на периодическом пульсе orchestra
+        # (--orchestra) пагинированный GraphQL с телами по всему пулу (233
+        # issue, 3 страницы) не гоняется; «missing» на пульсе всё равно
+        # недостоверен по докстрингу check_declared_deps_mismatch (wire
+        # запускается только push/merge в main).
+        findings[9] = []
+        lines.append("⏭️ [9] не проверено на периодическом пульсе (дорогой фетч тел пула "
+                      "прижат к push/PR, где уже стоят declared_deps wire/check — #454/#711)")
 
     return lines, findings
 
@@ -1405,7 +1458,8 @@ def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
     lines, findings = build_report(repo, now,
-                                    check_branch_protection=args.check_branch_protection)
+                                    check_branch_protection=args.check_branch_protection,
+                                    check_declared_deps=not args.orchestra)
 
     if args.orchestra:
         lines += run_escalations(repo, findings)

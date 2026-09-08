@@ -23,8 +23,10 @@
 
 - [x] `check_declared_deps_mismatch` — обе стороны (missing/stale), issue
       без поля не проверяется.
-- [x] Вписан в `build_report` (секция 8), не в CI_GATING (живой долг —
-      #679), `GATING_RELEASE_CONDITION[8]` назван.
+- [x] Вписан в `build_report` (секция 9 — исправлено ревью PR #711, major:
+      номер в этом файле изначально коллидировал с существующим инвариантом
+      8, `check_wasted_ai_review_runs`), не в CI_GATING (живой долг —
+      #679), `GATING_RELEASE_CONDITION[9]` назван.
 - [x] Тесты на прод-случай #679 (stale) и на реверс-направление (missing).
 
 ## Документация
