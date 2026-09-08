@@ -236,19 +236,24 @@ if [ -n "$hardcoded" ]; then
   fail=1
 fi
 
-# 11: каждое имя в CF_OWN_WORKERS обязано происходить из деплой-источников
-# проекта (некритичное замечание ревью PR #328): воркер проекта добавили или
-# переименовали, а allowlist не обновили — тогда own_count == expect,
-# предупреждения нет, и свой воркер навсегда числится «чужим, не показано»,
-# никто не обязан это заметить. Гвардия сверяет allowlist с теми же двумя
-# местами, из которых деплой берёт имена (cf-worker/wrangler.jsonc,
-# deploy-dsh-edge.yml).
-for own_name in $CF_OWN_WORKERS; do
-  if ! grep -q "\"$own_name\"" "$dir/../../cf-worker/wrangler.jsonc" "$dir/../../.github/workflows/deploy-dsh-edge.yml"; then
-    echo "::error::CF_OWN_WORKERS называет '$own_name', но его нет ни в cf-worker/wrangler.jsonc, ни в .github/workflows/deploy-dsh-edge.yml — allowlist разошёлся с деплой-источниками проекта (обнови CF_OWN_WORKERS в scripts/cf/lib.sh)"
-    fail=1
-  fi
-done
+# 11: CF_OWN_WORKERS ↔ деплой-источники — сверка МНОЖЕСТВ в обе стороны
+# (ревью PR #328, раунд head 6423e5b: односторонний grep «имя где-то
+# встречается» пропускал и третий свой воркер, добавленный в источник, и
+# переименование в одном файле — имя оставалось во втором). Канонические
+# объявления имён воркеров проекта: верхнеуровневый "name" cf-worker/
+# wrangler.jsonc (2-пробельный отступ — вложенные bindings глубже) и
+# "name": "<slug>" в deploy-dsh-edge.yml (DO-binding DSH_EDGE_INSTANCE
+# отсекается классом [a-z0-9-]). Расхождение множеств в любую сторону —
+# красное: и забытый в allowlist новый свой воркер, и мёртвое имя.
+jsonc="$dir/../../cf-worker/wrangler.jsonc"
+yml="$dir/../../.github/workflows/deploy-dsh-edge.yml"
+declared="$( { grep -hE '^  "name": *"[a-z0-9-]+"' "$jsonc" || true; grep -ohE '"name": *"[a-z0-9-]+"' "$yml" || true; } \
+  | sed -E 's/.*"name": *"([a-z0-9-]+)".*/\1/' | sort -u)"
+allow_sorted="$(printf '%s\n' $CF_OWN_WORKERS | sort -u)"
+if [ "$declared" != "$allow_sorted" ]; then
+  echo "::error::CF_OWN_WORKERS [$(echo "$allow_sorted" | tr '\n' ' ')] разошёлся с объявлениями воркеров в cf-worker/wrangler.jsonc и deploy-dsh-edge.yml [$(echo "$declared" | tr '\n' ' ')] — обнови CF_OWN_WORKERS в scripts/cf/lib.sh или объявления имён, иначе свой воркер молча числится «чужим, не показано»"
+  fail=1
+fi
 
 if [ "$fail" = 0 ]; then
   echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт, allowlist api.sh и отказ на dot-сегментах — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
