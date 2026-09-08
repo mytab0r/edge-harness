@@ -18,3 +18,16 @@
 - [x] Проверка регрессии: `scripts/orchestra/test_scheduler.py` зелёный без изменений
       (scheduler.py не тронут).
 - [x] PR открыт: #764.
+- [ ] Первый живой прогон `conflict-mechanical-rebase.yml` в проде после слияния —
+      наблюдать, что PR с меткой `conflict` реально сходятся (или содержательный
+      конфликт остаётся `conflict` и падает агенту), не только зелёный шаг job'а
+      (AGENTS.md, «Проверяй видимый результат, а не шаг»).
+- [ ] Дельта-спека `specs/journal-tasks-hands/spec.md` — перенос в
+      `openspec/specs/journal-tasks-hands.md` (OPENSPEC-PROTOCOL.md, «Что происходит с
+      дельта-спекой после завершения»): редакторская правка после того, как поведение
+      подтверждено живым прогоном выше, не выполняется этим PR.
+- [ ] Архивация `openspec/changes/mechanical-conflict-rebase` в `archive/` — наступает
+      после слияния этого PR (быстрый путь инварианта 4 сработает на смёрженном
+      main), не в ветке PR: `git mv` в ветке ломается гвардией свежести
+      `.githooks/pre-commit` (нет `refs/remotes/origin/main` в CI-чекауте автофикса —
+      см. заведённую задачу про archive-fixup ниже).

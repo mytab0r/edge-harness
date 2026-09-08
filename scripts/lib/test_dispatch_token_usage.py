@@ -47,7 +47,11 @@ DISPATCH_CONSUMER = "deploy-worker.yml"
 # repo-ci.yml (job archive-fixup, #493) — тот же класс: пуш автофикса
 # инварианта 4 обратно в ветку PR реальным аккаунтом, иначе github-actions[bot]
 # не зажжёт required-проверки заново на новом коммите (антирекурсия GitHub).
+# conflict-mechanical-rebase.yml (#762) — тот же класс: `git push` рёбейзнутой
+# ветки под github.token не зажигает downstream pr-review/ai-review
+# (антирекурсия GitHub), нужен PAT владельца.
 PIPELINE_CONSUMERS = [
+    "conflict-mechanical-rebase.yml",
     "deploy-dsh-edge.yml",
     "dispatch-latency-probe.yml",
     "orchestra.yml",
@@ -66,6 +70,10 @@ EXPECTED_WORKFLOWS = frozenset({
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
     "codeql.yml",
+    # #762: дешёвый механический ребейз PR с меткой conflict, без вызова
+    # агента — читает secrets.GH_PIPELINE_PAT для push рёбейзнутой ветки
+    # (см. PIPELINE_CONSUMERS).
+    "conflict-mechanical-rebase.yml",
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
