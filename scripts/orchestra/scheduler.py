@@ -2348,6 +2348,41 @@ def ai_review_retry_count(repo: str, pr_number: int) -> int:
     return len(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
 
 
+# ── #727: авто-повтор не жжётся вслепую в ту же квоту ────────────────────────
+# Фактическая причина ai:failed «all_providers_exhausted» несёт факт `reset-at`
+# в шапке комментария (ai_review.build_comment, header_facts) — «имя: дата;
+# имя2: дата2» для КАЖДОГО опробованного провайдера. Ближайший момент, когда
+# повтор МОЖЕТ иметь смысл, — минимум этих дат (первый освободившийся
+# провайдер), не максимум: как только освободится хотя бы один, цепочка
+# снова жива.
+AI_REVIEW_CHAIN_COOLDOWN_MARKER = "[цепочка провайдеров: авто-повтор придержан]"
+
+
+def parse_reset_hint_dates(reset_hint: str) -> list[datetime]:
+    """Разбирает «имя: дата; …» (ai_review.build_comment, #727) в список
+    дат — прод-форма встречается в ДВУХ видах: ISO («2026-09-10T00:00:00Z»,
+    смоук-фикстура dsh-clients.smoke.sh) и «YYYY-MM-DD HH:MM:SS» без зоны
+    (живой прогон 34176910458, «Your limit will reset at 2026-09-10
+    08:51:55») — вторая форма читается как UTC (dsh зону не называет, это
+    ближайшее разумное допущение, не факт). Строка, которая не разобралась
+    ни одним форматом, пропускается молча — вызывающий обязан трактовать
+    пустой результат как «даты нет», не как «дата в прошлом»."""
+    dates: list[datetime] = []
+    for chunk in (reset_hint or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        _, _, raw = chunk.partition(":")
+        raw = raw.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dates.append(datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc))
+                break
+            except ValueError:
+                continue
+    return dates
+
+
 def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list[str], list[str]]:
     """Возвращает (наблюдения, действия) — разведено по #456: «бюджет
     авто-повторов исчерпан, не дёргаю снова» ничего не меняет (диспатча не
@@ -2368,6 +2403,42 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
         age = minutes_between(anchor, now)
         if age < AI_REVIEW_RETRY_AFTER_MINUTES:
             continue  # ещё не истёк порог ожидания вердикта
+        # Цепочка провайдеров исчерпана целиком (#727) и дата сброса известна
+        # и ещё не наступила — авто-повтор (#196) НЕ дёргает ai-review.yml
+        # вслепую в ту же квоту, эскалирует владельцу вместо этого (идемпотентно
+        # на эпизод — маркер держит один Telegram на всё окно ожидания).
+        if needs_retry:
+            comment = review_labels.latest_ai_comment(repo, pull["number"], gh)
+            facts = review_labels.header_facts(comment.get("body") or "") if comment else {}
+            reset_dates = parse_reset_hint_dates(facts.get("reset-at", ""))
+            if reset_dates and now < min(reset_dates):
+                next_viable = min(reset_dates)
+                marker = f"{AI_REVIEW_CHAIN_COOLDOWN_MARKER} #{pull['number']}"
+                already = issue_marker_times(repo, pull["number"], marker)
+                if already:
+                    observations.append(
+                        f"⏳ PR #{pull['number']}: цепочка провайдеров исчерпана до "
+                        f"{next_viable.isoformat()} — авто-повтор придержан (уже "
+                        "эскалировано), жду сброса"
+                    )
+                else:
+                    text = (
+                        f"🚨 edge-harness: PR #{pull['number']} — все провайдеры цепочки "
+                        f"исчерпаны, ближайший сброс {next_viable.isoformat()} — авто-повтор "
+                        "(#196) не дёргаю вслепую в ту же квоту.\n\n"
+                        "Что дальше:\n"
+                        "- Действие по умолчанию: ждать — новый пуш в PR или ручной "
+                        "workflow_dispatch ai-review.yml после даты сброса пройдёт как обычно.\n"
+                        "- Ускорить: добавить провайдера в vars.DSH_PROVIDER_CHAIN "
+                        "(docs/runbooks/switch-llm-provider.md)."
+                    )
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    post_issue_comment(repo, pull["number"], f"🤖 {marker}\n{text}\n({escalation})")
+                    observations.append(
+                        f"🚨 PR #{pull['number']}: цепочка исчерпана до {next_viable.isoformat()} "
+                        f"— эскалация вместо авто-повтора ({escalation})"
+                    )
+                continue
         attempts = ai_review_retry_count(repo, pull["number"])
         if attempts >= AI_REVIEW_MAX_ATTEMPTS:
             observations.append(

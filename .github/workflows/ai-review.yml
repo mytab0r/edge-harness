@@ -141,11 +141,17 @@ jobs:
       answer: ${{ steps.answer.outputs.text }}
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
-      # failure_reason (#419): quota_exhausted | rate_limit_retry_budget_exceeded
-      # | пусто — пишет ai_dsh.sh в $AI_WORK/failure_reason.txt, различает в
-      # тексте вердикта «лимита нет вовсе» от «лимит есть, но что-то ещё
-      # сломано» (правило AGENTS.md, см. ai_review.py::error_reason).
+      # failure_reason (#419, расширено #727): quota_exhausted |
+      # rate_limit_retry_budget_exceeded | all_providers_exhausted | пусто —
+      # пишет ai_dsh.sh в $AI_WORK/failure_reason.txt, различает в тексте
+      # вердикта «лимита нет вовсе» от «лимит есть, но что-то ещё сломано»
+      # (правило AGENTS.md, см. ai_review.py::error_reason).
       failure_reason: ${{ steps.answer.outputs.failure_reason }}
+      # Цепочка провайдеров (#727): имя провайдера, ответившего успехом
+      # (пусто на отказе), и даты сброса опробованных провайдеров — обе
+      # пишет ai_dsh.sh, читает verdict для шапки-фактов комментария.
+      chain_provider: ${{ steps.answer.outputs.chain_provider }}
+      chain_reset_hint: ${{ steps.answer.outputs.chain_reset_hint }}
       pr: ${{ steps.facts.outputs.pr }}
       # go — окончательное решение job'а: review:ok есть (facts) И дорогой
       # прогон оправдан (fingerprint, #294). Шаг fingerprint не выполняется,
@@ -358,12 +364,20 @@ jobs:
       - if: steps.fingerprint.outputs.go == 'true' && steps.gather.outputs.empty_diff != 'true'
         name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
+          # Цепочка провайдеров (#727): ключи ВСЕХ провайдеров цепочки нужны
+          # одновременно (dsh_run_with_provider_chain перебирает их внутри
+          # ОДНОГО прогона) — literal-имена секретов, не индексация через
+          # vars.DSH_PROVIDER_KEY_SECRET (#716, тот механизм — про ОДИН
+          # активный секрет для ручного переключения, другая задача).
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
-          # Зашитого фолбэка здесь больше нет; пусто → dsh_require_provider_env
-          # в review/ai_dsh.sh падает громко до какой-либо дорогой работы.
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          # Упорядоченный список провайдеров — ОДНО место правды,
+          # vars.DSH_PROVIDER_CHAIN (JSON-массив, #727): base_url/model/
+          # secret_env выставляет dsh_run_with_provider_chain на каждую
+          # попытку, зашитого фолбэка здесь больше нет (#153) — пусто →
+          # dsh_require_provider_chain в review/ai_dsh.sh падает громко до
+          # какой-либо дорогой работы.
+          DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
@@ -397,6 +411,11 @@ jobs:
             # failure_reason (#419): пусто на успехе/обычном транспортном
             # отказе — тот же принцип "файла может не быть", что у dsh_rc.
             echo "failure_reason=$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')"
+            # Цепочка провайдеров (#727): имя успешного провайдера и даты
+            # сброса опробованных — однострочные факты, тот же принцип "файла
+            # может не быть".
+            echo "chain_provider=$(cat "$AI_WORK/chain_provider.txt" 2>/dev/null || echo '')"
+            echo "chain_reset_hint=$(cat "$AI_WORK/chain_reset_hint.txt" 2>/dev/null || echo '')"
             printf 'text<<AI_REVIEW_ANSWER_EOF_7f3a\n'
             cat "$AI_WORK/answer.txt"
             printf 'AI_REVIEW_ANSWER_EOF_7f3a\n'
@@ -435,14 +454,21 @@ jobs:
           HEAD_REVIEWED: ${{ needs.review.outputs.head }}
           ANSWER: ${{ needs.review.outputs.answer }}
           DSH_RC: ${{ needs.review.outputs.dsh_rc }}
-          # #419: quota_exhausted | rate_limit_retry_budget_exceeded | пусто —
-          # см. ai_review.py::error_reason.
+          # #419/#727: quota_exhausted | rate_limit_retry_budget_exceeded |
+          # all_providers_exhausted | пусто — см. ai_review.py::error_reason.
           FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
+          # Цепочка провайдеров (#727): имя успешного провайдера — в шапку
+          # комментария (человек видит, кто фактически ответил); даты сброса
+          # опробованных — тоже в шапку, читает scheduler.py::trigger_ai_review,
+          # чтобы не жечь авто-повтор (#196) вслепую в ту же квоту.
+          CHAIN_PROVIDER: ${{ needs.review.outputs.chain_provider }}
+          CHAIN_RESET_HINT: ${{ needs.review.outputs.chain_reset_hint }}
         run: |
           printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
             --pr "$PR_NUMBER" --answer "$RUNNER_TEMP/answer.txt" --head "$HEAD_REVIEWED" \
-            --dsh-rc "$DSH_RC" --failure-reason "$FAILURE_REASON"
+            --dsh-rc "$DSH_RC" --failure-reason "$FAILURE_REASON" \
+            --chain-provider "$CHAIN_PROVIDER" --reset-hint "$CHAIN_RESET_HINT"
 
       # Разбудить оркестратор (#297) сразу после вердикта, а не ждать
       # расписания: тот же приём, что в pr-review.yml (workflow_dispatch —
