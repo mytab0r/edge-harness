@@ -65,12 +65,14 @@ run cf_count_only "/zones"
 section "Расход по квотам"
 cat <<'EOF'
 Статические лимиты Free — docs/research/20-cloudflare-free.md.
-Живой расход DO (rows_read/rows_written) читается через GraphQL Analytics
-тем же секретом CLOUDFLARE_API_TOKEN: python scripts/measure/do_rows_read.py
---days N (задача #320; право Account Analytics Read у токена есть — доказано
-живыми прогонами 2026-09-05, раздел «Замер факта: rows_read в проде» там же).
-Не подтверждено: датасеты requests/GB-s duration — инструмента под них ещё
-нет (таблица «Что реально доступно» в docs/agents/INFRA-CF.md).
+Живой расход читается тем же секретом CLOUDFLARE_API_TOKEN через GraphQL:
+Workers requests/сутки — python scripts/measure/quotas.py (workflow
+quotas.yml, #324, workersInvocationsAdaptive); DO rows_read/rows_written —
+python scripts/measure/do_rows_read.py --days N (задача #320; право Account
+Analytics Read у токена есть — доказано живыми прогонами 2026-09-05, раздел
+«Замер факта: rows_read в проде» там же).
+Не подтверждено: датасет GB-s duration — инструмента под него ещё нет
+(таблица «Что реально доступно» в docs/agents/INFRA-CF.md).
 EOF
 
 echo

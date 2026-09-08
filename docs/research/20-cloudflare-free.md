@@ -680,8 +680,10 @@ PR #328, находка 1 предыдущего раунда). Инструме
   нашёл датасет `durableObjectsPeriodicGroups` — раздел «Замер факта:
   rows_read в проде» выше, run 33975023605). rows_read/rows_written DO
   снимает этот скрипт (`python scripts/measure/do_rows_read.py --days N`);
-  не подтверждено: датасеты requests и GB-s duration — инструмента под них
-  ещё нет. Статические лимиты плана — таблицы выше в этом файле.
+  Workers requests/сутки снимает `scripts/measure/quotas.py` (#324,
+  `workersInvocationsAdaptive` — раздел «Метрики использования» выше);
+  не подтверждено: только датасет GB-s duration — инструмента под него
+  нет. Статические лимиты плана — таблицы выше в этом файле.
 - **`/accounts/{account_id}/workers/scripts/{name}/settings` — рабочий способ
   узнать имена bindings** без раскрытия значений: `type: "secret_text"` для
   секретов, `type: "plain_text"`/`"assets"`/`"durable_object_namespace"` для
