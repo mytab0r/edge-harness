@@ -129,21 +129,31 @@ mode).
 ```bash
 cd plugins-src/plugin-manager
 node build.mjs          # сгенерирует client/client.js + manifest.json, прогонит гвардии
-npm pack                # edge-harness-dsh-plugin-manager-0.1.4.tgz
+npm pack                # edge-harness-dsh-plugin-manager-0.1.9.tgz
 ```
 
 Публикация (конвейер #80, по образцу hello-world): релиз **этого**
-репозитория с тегом `plugins-manager-v0.1.4`, asset
-`plugin-manager-0.1.4.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
+репозитория с тегом `plugins-plugin-manager-v0.1.9`, asset
+`plugin-manager-0.1.9.tgz` (то же содержимое, что у npm-pack'а, имя asset'а
 фиксирует манифест), затем sha256 — PR'ом в `dsh-edge/plugins.json`:
 
 ```bash
-cp edge-harness-dsh-plugin-manager-0.1.4.tgz plugin-manager-0.1.4.tgz
-sha256sum plugin-manager-0.1.4.tgz
-gh release create plugins-manager-v0.1.4 plugin-manager-0.1.4.tgz \
-  --title "plugins-manager-v0.1.4 — plugin-manager: каталог заказа и кнопка «Заказать»" \
-  --notes "Клиентский плагин #102/#113: список плагинов из манифеста, статусы из журнала, каталог доступных к заказу и заказ установки через RPC морды."
+cp edge-harness-dsh-plugin-manager-0.1.9.tgz plugin-manager-0.1.9.tgz
+sha256sum plugin-manager-0.1.9.tgz
+gh release create plugins-plugin-manager-v0.1.9 plugin-manager-0.1.9.tgz \
+  --title "plugins-plugin-manager-v0.1.9 — свежий срез MANIFEST/CATALOG после provider-registry (#378)" \
+  --notes "Пересборка (находка ревью PR #453, тот же класс среза): MANIFEST/CATALOG перевязаны на актуальные dsh-edge/plugins.json/plugins-catalog.json после появления provider-registry — без пересборки прод показал бы его одновременно установленным и доступным к заказу."
 ```
+
+Пересборки версий: **0.1.4** (#102/#113 — каталог заказа и кнопка
+«Заказать»), **0.1.5–0.1.8** (#453 — свежий срез после provider-registry;
+#518/#550/#556 — фиксы коллизии `settings.plugins`→`settings.harnessPlugins`
+и уход убранного апстримом `dsh-client-runtime`), **0.1.9** (#453 после
+ребейза на этот main — тот же срез класса #453 на исходниках 0.1.8: пин 0.1.5
+из ветки PR протух бы с регрессией фиксов #518/#547/#551/#575). Причина
+класса: MANIFEST/CATALOG вшиваются в бандл на момент сборки, любое
+последующее изменение `dsh-edge/plugins.json`/`plugins-catalog.json` без
+пересборки этого пакета протухает молча.
 
 Цикличность sha (принято, по образцу hello/runner): вшитая `manifest.json`
 в пакете содержит каталог с sha256 **этого же** пакета — финальной своей sha
