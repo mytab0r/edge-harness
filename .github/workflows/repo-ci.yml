@@ -317,6 +317,13 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
 
+      # Механический git rebase PR с меткой conflict без LLM-агента (#762) —
+      # прод-форма: настоящий git (bare-репозиторий), FakeGh для GitHub API.
+      - name: Тесты механического ребейза конфликтных PR
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_mechanical_rebase.py -q
+
       # Контракт PR ↔ задача (#394, находка при первом заходе на
       # pr_task_candidates: у этого теста не было ни одного шага в CI —
       # «файл гвардии лежал» не значило «красит CI», тот же класс, что уже

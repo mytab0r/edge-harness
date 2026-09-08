@@ -250,6 +250,14 @@ WORKER_GIT_STEP_MARKER = "[worker: git-шаг]"
 WATCHED_WORKFLOWS = (
     "worker.yml", "hands.yml", "orchestra.yml",
     "deploy-worker.yml", "deploy-dsh-edge.yml",
+    # conflict-mechanical-rebase.yml — дешёвый механический ребейз конфликтных
+    # PR (issue #762, отдельный файл, не job внутри orchestra.yml — см.
+    # докстринг самого workflow-файла: heartbeat_check не должен видеть его
+    # провалы). Их всё равно обязан кто-то заметить — тот же приём, что и для
+    # остальных пяти: failure_watch заводит ci-failure задачу по РЕАЛЬНОМУ
+    # дефекту (не по обычным per-PR infra-error строкам в его же отчёте — те
+    # уже видны в step summary, это catastrophic-случай уровня всего job'а).
+    "conflict-mechanical-rebase.yml",
 )
 
 # Метка авто-заведённых задач по дефектам CI — рядом с обязательной `task`
