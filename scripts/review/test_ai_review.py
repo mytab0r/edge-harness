@@ -526,6 +526,43 @@ def test_error_reason_rate_limit_variants_differ_from_each_other(failure_reason)
     assert quota != budget
 
 
+def test_error_reason_all_providers_exhausted_names_reset_date():
+    # #727: цепочка провайдеров (vars.DSH_PROVIDER_CHAIN) исчерпана целиком —
+    # сообщение обязано отличаться от одиночного quota_exhausted (другое
+    # действие: не «сменить провайдера», действие уже применено, следующий
+    # шаг — ждать или добавить ещё одного) и называть дату, а не гадать.
+    reason = ai.error_reason("", "1", "all_providers_exhausted", "GLM: 2026-09-10 08:51:55")
+    assert "все провайдеры" in reason
+    assert "2026-09-10 08:51:55" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+
+
+def test_error_reason_all_providers_exhausted_without_reset_hint_is_honest():
+    # Алерт не гадает (AGENTS.md): дата неизвестна — сообщение говорит это
+    # прямо, а не подставляет пустоту молча.
+    reason = ai.error_reason("", "1", "all_providers_exhausted", "")
+    assert "дата неизвестна" in reason
+
+
+def test_build_comment_chain_facts_in_header():
+    # #727: имя провайдера и дата сброса — факты ШАПКИ (до первой пустой
+    # строки), не прозы — их читает scheduler.py::header_facts.
+    body = ai.build_comment(1, "sha1", "error", "ревью не состоялось", [],
+                            chain_provider="NVIDIA", reset_hint="GLM: 2026-09-10 08:51:55")
+    facts = rl.header_facts(body)
+    assert facts.get("provider") == "NVIDIA"
+    assert facts.get("reset-at") == "GLM: 2026-09-10 08:51:55"
+
+
+def test_build_comment_chain_facts_absent_when_not_given():
+    # Обратная совместимость: без chain_provider/reset_hint шапка не несёт
+    # этих строк вовсе (как diff_line без diff_fp) — старые вызовы не ломаются.
+    body = ai.build_comment(1, "sha1", "approve", "", [])
+    facts = rl.header_facts(body)
+    assert "provider" not in facts
+    assert "reset-at" not in facts
+
+
 def test_error_reason_empty_failure_reason_keeps_old_behavior():
     # Обратная совместимость: вызов без failure_reason (как раньше, включая
     # ручной запуск verdict без --failure-reason) не должен внезапно решить,
@@ -1007,7 +1044,7 @@ def _verdict_args(tmp_path, body: str) -> argparse.Namespace:
     answer = tmp_path / "answer.txt"
     answer.write_text(body, encoding="utf-8")
     return argparse.Namespace(pr=294, answer=str(answer), head="deadbeef", dsh_rc="",
-                               failure_reason="")
+                               failure_reason="", chain_provider="", reset_hint="")
 
 
 def test_cmd_verdict_order_head_then_files_then_head_again(monkeypatch, tmp_path, capsys):

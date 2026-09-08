@@ -826,6 +826,13 @@ jobs:
       - name: Smoke bash-клиентов на заглушках (класс Б1 #119)
         run: bash scripts/lib/test/dsh-clients.smoke.sh
 
+      # Гвардия класса #727: цепочка провайдеров переключается по классу
+      # отказа (quota_exhausted/HTTP_404), а не по любой ошибке — настоящее
+      # исполнение dsh_run_with_provider_chain (не bash -n) на заглушке dsh,
+      # роутящей ответ по модели.
+      - name: Smoke цепочки LLM-провайдеров (#727)
+        run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
+
       # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
       # #128, М3): два списка без единого места правды — расхождение красит CI,
       # а не живой job 400-м или мёртвой поверхностью.

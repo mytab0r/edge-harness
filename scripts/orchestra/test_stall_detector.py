@@ -426,6 +426,73 @@ def test_daily_cap_stops_creation_mid_pulse_across_many_new_fingerprints(monkeyp
     assert len(capped) == 2  # ровно два отпечатка сверх потолка не заведены
 
 
+def test_cap_exhausted_escalates_visibly_without_raising(monkeypatch):
+    # Мутационная проверка #610 (инвариант «наблюдатель провалов не реагирует
+    # на свою инфраструктуру мониторинга»): исчерпание потолка обязано дать
+    # ВИДИМЫЙ сигнал (комментарий в #120 с CAP_EXHAUSTED_MARKER + Telegram),
+    # но НЕ бросить исключение — main() красит прогон только по RuntimeError
+    # из detect_and_act (stall_hard_failure), не по бизнес-исходу «потолок».
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    already_created = [
+        _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
+               created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        for i in range(sd.STALL_DAILY_CAP)
+    ]
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": already_created,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: True)
+    monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("потолок исчерпан — создание запрещено"))
+
+    result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])  # не бросает исключение
+
+    assert any("потолок" in line and "исчерпан" in line for line in result)
+    assert any("эскалация потолка" in line for line in result)
+    assert len(posted) == 1 and posted[0][0] == sd.WATCHDOG_ISSUE
+    assert sd.CAP_EXHAUSTED_MARKER in posted[0][1]
+    assert NOW.date().isoformat() in posted[0][1]
+
+
+def test_cap_exhausted_escalation_deduped_once_per_day(monkeypatch):
+    # Второй пульс того же дня, потолок всё ещё исчерпан — маркер сегодняшней
+    # эскалации уже стоит в #120: повторной эскалации/Telegram не шлём (не
+    # спамим весь день на один и тот же исчерпанный потолок).
+    first_seen = (NOW - timedelta(minutes=sd.STALL_PERSIST_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    already_created = [
+        _issue(100 + i, f"Отпечаток: `check:red:whatever-{i}`",
+               created_at=(NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        for i in range(sd.STALL_DAILY_CAP)
+    ]
+    cap_marker = f"{sd.CAP_EXHAUSTED_MARKER} {NOW.date().isoformat()}]"
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [],
+        "issues?state=closed&labels=auto-detected": [],
+        "issues/120/comments": [
+            {"created_at": first_seen, "body": f"👀 {sd._sighting_marker('gate:pipeline-paused')}\n..."},
+            {"created_at": NOW.isoformat().replace("+00:00", "Z"), "body": f"🚨 {cap_marker}\n..."},
+        ],
+        "issues?state=all&labels=auto-detected": already_created,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("эскалация уже была сегодня — второй раз не пишем"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("эскалация уже была сегодня — Telegram не шлём"))
+    monkeypatch.setattr(sd, "create_task", lambda *a, **k: pytest.fail("потолок исчерпан — создание запрещено"))
+
+    result = sd.detect_and_act(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    assert any("потолок" in line and "исчерпан" in line for line in result)
+    assert not any("эскалация потолка" in line for line in result)
+
+
 # ── Холостой ход: здоровый конвейер — ни одного вызова ─────────────────────
 
 def test_idle_conveyor_makes_zero_calls(monkeypatch):
