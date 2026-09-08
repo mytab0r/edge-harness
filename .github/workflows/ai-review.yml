@@ -329,6 +329,7 @@ jobs:
           node-version: 24
 
       - if: steps.fingerprint.outputs.go == 'true'
+        id: gather
         name: Сбор фактов и промпт (доверенный шаг)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -337,10 +338,24 @@ jobs:
           AI_WORK="$RUNNER_TEMP/ai-review"
           mkdir -p "$AI_WORK"
           python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
+          # Пустой дифф (#658) ИЛИ расхождение источников диффа (#687,
+          # diff_source_mismatch — список файлов пуст, а `gh pr diff` не
+          # пуст): cmd_gather сам пишет failure_reason.txt (rc=0, шаг
+          # остаётся зелёным), DSH-шаг ниже пропускается по ЛЮБОМУ значению
+          # этого файла — в обоих случаях дорогой вызов модели не имеет
+          # смысла (либо сливать нечего, либо данные для промпта уже
+          # недостоверны — список FILES пуст при непустом DIFF). На этом шаге
+          # (ДО запуска ai_dsh.sh, который сам перезатирает файл при старте)
+          # непустое содержимое может появиться только из cmd_gather.
+          if [ -n "$(cat "$AI_WORK/failure_reason.txt" 2>/dev/null || echo '')" ]; then
+            echo "empty_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty_diff=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # ── НЕдоверенный шаг: НИКАКОГО GitHub-токена в env ────────────────────
       # cwd = дерево PR (данные агента), сам транспорт — из main-чекаута.
-      - if: steps.fingerprint.outputs.go == 'true'
+      - if: steps.fingerprint.outputs.go == 'true' && steps.gather.outputs.empty_diff != 'true'
         name: Ревью агентом (DSH headless, без GitHub-токена)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

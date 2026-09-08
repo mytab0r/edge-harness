@@ -536,6 +536,159 @@ def test_error_reason_empty_failure_reason_keeps_old_behavior():
     assert "RATE_LIMIT" not in reason
 
 
+# ── Пустой дифф (#658, живой факт 2026-09-07): PR не несёт ни одного файла —
+# cmd_gather не должен падать RuntimeError'ом (job review красный, job
+# verdict никогда не запускается, PR остаётся без единой ai:*-метки навсегда,
+# живой прогон #658 упал так 4 раза подряд) — вместо этого терминальный исход
+# идёт тем же файловым контрактом, что и транспортный отказ DSH. ──────────────
+
+def test_error_reason_empty_diff_distinct_from_generic_transport():
+    reason = ai.error_reason("", "", "empty_diff")
+    assert "дифф PR пуст" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+    assert "исчерпана надолго" not in reason
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _fake_gh_pull(sha="76913bd001", ref="forge/runner-bridge-v0.1.2"):
+    def fake_gh(url: str):
+        assert url == "repos/o/r/pulls/658"
+        return {"title": "chore(plugins): обновить runner-bridge до v0.1.2",
+                "head": {"sha": sha, "ref": ref},
+                "user": {"login": "github-actions[bot]"}}
+    return fake_gh
+
+
+# ── Список файлов пуст сам по себе НЕ означает empty_diff (#687, находка
+# вердикта ai-review PR #686): требуется второе независимое подтверждение —
+# фактически пустой вывод `gh pr diff` (rc=0, пустой stdout). Оба источника
+# согласны → empty_diff, как раньше. ─────────────────────────────────────────
+
+def test_cmd_gather_empty_diff_confirmed_by_second_source_calls_gh_pr_diff_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(ai, "gh", _fake_gh_pull())
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: [])
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert cmd == ["gh", "pr", "diff", "658"]
+        return _FakeCompleted(0, stdout="")  # rc=0, пустой stdout — подтверждение
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+
+    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    rc = ai.cmd_gather(args)
+
+    assert rc == 0
+    assert len(calls) == 1  # второе подтверждение — ОДИН запрос, не больше
+    assert (tmp_path / "failure_reason.txt").read_text(encoding="utf-8") == "empty_diff"
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == ""
+    # Дорогой пак/промпт (то, что реально читает DSH) не строится вовсе —
+    # подтверждённый пустой дифф не доходит до промпта.
+    assert not (tmp_path / "pack.txt").exists()
+    assert not (tmp_path / "prompt.md").exists()
+
+
+def test_cmd_gather_empty_file_list_but_nonempty_diff_is_loud_mismatch_not_empty_diff(monkeypatch, tmp_path):
+    # Прод-форма живого дефекта: API отдал пустой список файлов (сетевой
+    # край/транзиентное состояние/ограничение выдачи), а фактический дифф —
+    # реальный, непустой патч. Раньше (до #687) это молча классифицировалось
+    # как empty_diff и дорогой прогон DSH пропускался НАВСЕГДА без следа.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(ai, "gh", _fake_gh_pull())
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: [])
+
+    real_diff = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"
+
+    def fake_run(cmd, **kwargs):
+        return _FakeCompleted(0, stdout=real_diff)
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+
+    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    rc = ai.cmd_gather(args)
+
+    assert rc == 0  # шаг остаётся зелёным — терминальный вердикт, не RuntimeError
+    reason = (tmp_path / "failure_reason.txt").read_text(encoding="utf-8")
+    assert reason == "diff_source_mismatch"
+    assert reason != "empty_diff"  # НЕ классифицируется как пустой дифф
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == ""
+    # Ревью не пропущено молча под видом «дифф пуст», но и не строится пак
+    # из недостоверных данных (FILES пуст при непустом DIFF).
+    assert not (tmp_path / "pack.txt").exists()
+    assert not (tmp_path / "prompt.md").exists()
+
+
+def test_cmd_gather_nonempty_files_normal_path_calls_gh_pr_diff_exactly_once(monkeypatch, tmp_path, tmpdir):
+    # Обычный путь (список файлов непуст) не должен приобрести лишних
+    # запросов из-за новой логики двойного подтверждения — она живёт ТОЛЬКО
+    # в ветке `if not files`, счётчик вызовов подтверждает это напрямую.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(ai, "gh", _fake_gh_pull())
+    files = [{"filename": "x.py", "additions": 3, "deletions": 1}]
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: files)
+
+    prompt_path = SCRIPT.with_name("ai_prompt.md")
+    assert prompt_path.exists()  # используется как есть, шаблон реальный
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeCompleted(0, stdout="diff --git a/x.py b/x.py\n+real\n")
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+
+    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    rc = ai.cmd_gather(args)
+
+    assert rc == 0
+    assert len(calls) == 1  # ровно столько же, сколько было ДО этой правки
+    assert not (tmp_path / "failure_reason.txt").exists()
+    assert (tmp_path / "pack.txt").exists()
+
+
+def test_cmd_gather_nonempty_files_diff_empty_or_failed_still_raises(monkeypatch, tmp_path):
+    # Существующее поведение (#687, п.4): список непуст, а `gh pr diff` пуст
+    # или упал — это отказ самого вызова (сеть/права), не «дифф пуст по
+    # факту» — остаётся RuntimeError, не превращается в терминальный вердикт.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(ai, "gh", _fake_gh_pull())
+    files = [{"filename": "x.py", "additions": 3, "deletions": 1}]
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: files)
+    monkeypatch.setattr(ai.subprocess, "run", lambda cmd, **kw: _FakeCompleted(1, stderr="boom"))
+
+    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    with pytest.raises(RuntimeError, match="diff пуст при непустом списке файлов"):
+        ai.cmd_gather(args)
+
+
+def test_error_reason_diff_source_mismatch_names_both_facts():
+    reason = ai.error_reason("", "", "diff_source_mismatch")
+    assert "источники диффа" in reason
+    assert "разошлись" in reason
+    assert "дифф PR пуст" not in reason  # не должно читаться как empty_diff
+    assert "исчерпана надолго" not in reason
+
+
+def test_ai_review_yml_skips_dsh_step_when_gather_reports_empty_diff():
+    # Мутация-гвардия: без этого условия DSH-шаг звался бы на пустом диффе
+    # каждый раз — терминальный маркер cmd_gather был бы бесполезен. Условие
+    # держится на непустом failure_reason.txt (любом — и empty_diff, и
+    # diff_source_mismatch, #687), не на буквальном сравнении с "empty_diff".
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    assert "steps.gather.outputs.empty_diff != 'true'" in source
+    assert 'if [ -n "$(cat "$AI_WORK/failure_reason.txt"' in source
+
+
 def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
     # cmd_verdict считает reason только когда verdict == "error" (см. cmd_verdict) —
     # здесь фиксируем контракт самой функции error_reason: она не смотрит на

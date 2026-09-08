@@ -231,7 +231,8 @@ PR порождает merge-коммит в каждой ветке и триг�
 
 Выяснил что-то новое о внешней системе → в `docs/research/`.
 Принял решение между вариантами → ADR в `docs/decisions/`.
-Меняешь поведение системы → дельта-спека в `openspec/changes/<change-id>/`.
+Меняешь поведение системы → дельта-спека в `openspec/changes/<change-id>/` — состав,
+критерий завершения и архивация: [`docs/agents/OPENSPEC-PROTOCOL.md`](docs/agents/OPENSPEC-PROTOCOL.md).
 
 ## Секреты
 
