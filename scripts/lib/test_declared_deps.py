@@ -211,6 +211,122 @@ def test_form_field_numbers_parses_canonical_render():
     assert dd.form_field_numbers(body) == [123, 124]
 
 
+# ── #710: живой рендер уровнем «##» и без пустой строки ─────────────────────
+
+# Прод-тело `gh api repos/mytab0r/edge-harness/issues/601 --jq .body` (замер
+# 2026-09-08, живой пул): заголовок уровнем `##`, БЕЗ пустой строки между
+# заголовком и ответом («## Чем блокируется\nничем\n\n## Что блокирует\n
+# ничем\n\n») — ровно тот рендер, который старый `_FORM_FIELD_RE` (жёстко
+# `###\n\s*\n`) не видел вовсе (8% покрытия живого пула, задача #710).
+ISSUE_601_BODY = (
+    "## Цель\n"
+    "Газ гвардии отката (`revert-ok`, #217) и вердикт ревью "
+    "(`review:changes-requested`/`review:ok`) достижимы без нового коммита.\n\n"
+    "## Критерий готовности\n"
+    "`scripts/review/check_pr.py` читает тело PR, но `pr-review.yml` слушает "
+    "только opened/synchronize/reopened.\n\n"
+    "## Площадь\narea:orchestra\n\n"
+    "## Чем блокируется\nничем\n\n"
+    "## Что блокирует\nничем\n\n"
+    "## Контекст и ссылки\nНайдено при разборе #599.\n"
+)
+
+
+def test_form_field_numbers_real_body_level2_no_blank_line_nichem():
+    # Прод-тело #601 без единой правки формата — уровень ## и без пустой
+    # строки: обязано разбираться так же, как канонический ### с пустой
+    # строкой (см. test_form_field_numbers_parses_canonical_render).
+    assert dd.form_field_numbers(ISSUE_601_BODY) == []
+    assert dd.blocking_field_numbers(ISSUE_601_BODY) == []
+
+
+def test_form_field_numbers_level2_no_blank_line_real_number():
+    # Мутация прод-формы #601: подставлен номер вместо «ничем» — доказывает,
+    # что разбор реально читает ЗНАЧЕНИЕ поля, а не просто узнаёт «ничем»
+    # как отдельный частный случай.
+    body = ISSUE_601_BODY.replace(
+        "## Чем блокируется\nничем", "## Чем блокируется\n#217 #599")
+    assert dd.form_field_numbers(body) == [217, 599]
+
+
+def test_blocking_field_numbers_level2_no_blank_line_real_number():
+    body = ISSUE_601_BODY.replace(
+        "## Что блокирует\nничем", "## Что блокирует\n#264")
+    assert dd.blocking_field_numbers(body) == [264]
+
+
+def test_form_field_numbers_ignores_adhoc_heading_not_exact_field_text():
+    # Прод-тело #373 (замер 2026-09-08, живой пул): заголовок «## Блокирует»
+    # — СВОБОДНАЯ формулировка того же смысла, но НЕ точный текст поля формы
+    # «Чем блокируется»/«Что блокирует». Разбор структурного поля обязан её
+    # игнорировать (иначе это уже не разбор схемы, а жадный греп по любому
+    # заголовку со словом «блокир*») — она остаётся в зоне прозаической
+    # эвристики (_TRIGGER_RE/find_desync), не автозаписи.
+    body = (
+        "## Цель\n\nГейт вклада плагина в серверный бандл.\n\n"
+        "## Блокирует\n\nБлокирует #347 («Откалибровать порог»).\n\n"
+        "## Площадь\n\narea:worker\n"
+    )
+    assert dd.form_field_numbers(body) is None
+    assert dd.blocking_field_numbers(body) is None
+
+
+# ── declared_blocked_by: объединение заголовка и инлайн-конвенции ──────────
+
+
+def test_declared_blocked_by_none_when_neither_form_present():
+    assert dd.declared_blocked_by("Обычное тело безо всякой формы.") is None
+
+
+def test_declared_blocked_by_reads_heading_form():
+    body = "## Чем блокируется\n#55 #56\n\n## Контекст\nтекст"
+    assert dd.declared_blocked_by(body) == [55, 56]
+
+
+def test_declared_blocked_by_reads_inline_ai_review_convention():
+    # Контракт `ai_review.blocked_by_numbers` — последняя непустая строка
+    # тела; прод-форма реальных тел #679/#626 (замер 2026-09-08): секция
+    # прозы, затем «БЛОКИРУЕТСЯ: …» последней строкой, без заголовков формы.
+    body = (
+        "Инцидент 2026-09-06 — класс «квота пробита, конвейер не заметил».\n"
+        "БЛОКИРУЕТСЯ: #605"
+    )
+    assert dd.declared_blocked_by(body) == [605]
+
+
+def test_declared_blocked_by_inline_nichem_is_explicit_empty_not_none():
+    body = "Текст задачи.\nБЛОКИРУЕТСЯ: ничем"
+    assert dd.declared_blocked_by(body) == []
+
+
+def test_declared_blocked_by_union_when_both_present():
+    body = "## Чем блокируется\n#55\n\nБЛОКИРУЕТСЯ: #56"
+    assert dd.declared_blocked_by(body) == [55, 56]
+
+
+# ── _load_ai_review: module-level memo (находка ревью PR #711) ─────────────
+
+
+def test_load_ai_review_memoized_across_calls(monkeypatch):
+    # Мутация: без memo (снять `if _ai_review_module is None:` — вернуть
+    # безусловное exec_module на каждый вызов) этот тест обязан покраснеть,
+    # потому что spec_from_file_location будет вызван дважды, не один раз.
+    monkeypatch.setattr(dd, "_ai_review_module", None)
+    calls = []
+    real_spec = importlib.util.spec_from_file_location
+
+    def counting_spec(name, *a, **k):
+        if name == "ai_review":
+            calls.append(name)
+        return real_spec(name, *a, **k)
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", counting_spec)
+    first = dd._load_ai_review()
+    second = dd._load_ai_review()
+    assert first is second
+    assert len(calls) == 1
+
+
 # ── auto_wire: единый перенос поля формы в граф (задача #529) ───────────────
 
 
@@ -303,6 +419,79 @@ def test_auto_wire_filters_closed_and_self_before_delegate_keeps_open(monkeypatc
             "blocked_by_open": [],
         },
         {"number": 56, "body": "### Чем блокируется\n\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 500, "linked": [56]}]
+    assert fake.wire_calls == [(500, [56])]
+
+
+def test_auto_wire_level2_no_blank_line_real_body_still_wires(monkeypatch):
+    # Мутация прод-тела #601 (задача #710): без фикса `_FORM_FIELD_RE`
+    # (уровень «##», без пустой строки) этот тест краснеет — auto_wire
+    # раньше вообще не видел такое поле.
+    body = ISSUE_601_BODY.replace(
+        "## Чем блокируется\nничем", "## Чем блокируется\n#217")
+    issues = [
+        {"number": 601, "body": body, "blocked_by_open": []},
+        {"number": 217, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 601, "linked": [217]}]
+
+
+def test_auto_wire_wires_reverse_blocking_field(monkeypatch):
+    # Задача #710: «Что блокирует» — обратное направление. #500 объявляет
+    # «Что блокирует: #56» → после прогона #56 должна получить blockedBy на
+    # #500, хотя #56 сама ничего о зависимости не говорит.
+    issues = [
+        {"number": 500, "body": "## Что блокирует\n#56\n", "blocked_by_open": []},
+        {"number": 56, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 56, "linked": [500]}]
+    assert fake.wire_calls == [(56, [500])]
+
+
+def test_auto_wire_reverse_blocking_field_idempotent_when_already_native(monkeypatch):
+    issues = [
+        {"number": 500, "body": "## Что блокирует\n#56\n", "blocked_by_open": []},
+        {"number": 56, "body": "## Чем блокируется\nничем\n", "blocked_by_open": [500]},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == []
+    assert fake.wire_calls == []
+
+
+def test_auto_wire_wires_inline_ai_review_convention_on_any_push_not_only_creation(monkeypatch):
+    # Задача #710: раньше инлайн «БЛОКИРУЕТСЯ: …» переносился ТОЛЬКО в момент
+    # заведения (file_tasks.py); задача, чья зависимость на момент заведения
+    # ещё не существовала (батч АИ-ревью), теряла связь навсегда. auto_wire
+    # теперь пересматривает и эту форму на каждом push.
+    issues = [
+        {"number": 500, "body": "Текст задачи.\nБЛОКИРУЕТСЯ: #55", "blocked_by_open": []},
+        {"number": 55, "body": "Текст.\nБЛОКИРУЕТСЯ: ничем", "blocked_by_open": []},
+    ]
+    fake = FakeTaskDeps(issues)
+    monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)
+    report = dd.auto_wire("owner/repo")
+    assert report == [{"issue": 500, "linked": [55]}]
+
+
+def test_auto_wire_no_duplicate_network_call_when_both_directions_declare_same_pair(monkeypatch):
+    # #500 объявляет «Чем блокируется: #56» И #56 отдельно объявляет «Что
+    # блокирует: #500» — та же пара с двух сторон, избыточно, но не
+    # запрещено. Обязан быть РОВНО один вызов wire_dependencies на пару.
+    issues = [
+        {"number": 500, "body": "## Чем блокируется\n#56\n", "blocked_by_open": []},
+        {"number": 56, "body": "## Что блокирует\n#500\n", "blocked_by_open": []},
     ]
     fake = FakeTaskDeps(issues)
     monkeypatch.setattr(dd, "_load_task_deps", lambda: fake)

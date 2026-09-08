@@ -85,6 +85,27 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      CI_GATING: измерение на живом репозитории до нуля нарушений ещё не
      сделано (тот же порядок, что у 1/5 — включение отдельной правкой
      константы после замера).
+  9. check_declared_deps_mismatch (#710, продолжение #371/#529) — расхождение
+     между структурно объявленной связью в теле задачи («Чем блокируется»/
+     «Что блокирует»/инлайн «БЛОКИРУЕТСЯ: …», разбор
+     `scripts/lib/declared_deps.py`) и нативным `blockedBy` — В ОБЕ СТОРОНЫ:
+     поле называет открытый номер без нативного ребра («missing») И нативное
+     ребро есть, а поле его не называет, включая явный ответ «ничем» при
+     непустом графе («stale» — связь поставлена мимо текста задачи, текст
+     лжёт о своей зависимости; живой случай на замере 2026-09-08: #679
+     отвечает «БЛОКИРУЕТСЯ: ничем», нативный `blockedBy` содержит #605).
+     «missing» на push repo-ci честно значит дефект переноса —
+     `declared_deps.py::auto_wire` уже отработал в том же push раньше этого
+     шага (см. repo-ci.yml, порядок шагов). На PR/пульсе orchestra (главный
+     канал по расписанию ниже) и сразу после правки поля руками на GitHub
+     это НЕ гарантировано: wire запускается только чужим push/merge в main,
+     а не по этим триггерам, поэтому «missing» в эти окна может значить
+     «ещё не доехал», а не дефект самого auto_wire — проверяй по газу
+     GATING_RELEASE_CONDITION[9], не по докстрингу отчёта. Issue без поля
+     вовсе (`declared_deps.declared_blocked_by` вернул `None`) не
+     проверяется — судить не о чем. Живой замер на день внедрения — 1
+     нарушение (#679, kind=stale) — поэтому наблюдательный, не гейтящий (см.
+     CI_GATING ниже и условие возврата в GATING_RELEASE_CONDITION[9]).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -200,6 +221,20 @@ _SCH_SPEC = importlib.util.spec_from_file_location(
 scheduler = importlib.util.module_from_spec(_SCH_SPEC)
 _SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
 
+# task_deps.fetch_pool(..., include_body=True) — тот же единственный источник
+# графа блокировок, что уже читает declared_deps.py (#361/#371); declared_deps
+# — разбор структурного поля («Чем блокируется»/«Что блокирует»/инлайн
+# «БЛОКИРУЕТСЯ:»), задача #710, инвариант 9 ниже (check_declared_deps_mismatch).
+_TD_SPEC = importlib.util.spec_from_file_location(
+    "task_deps", REPO_ROOT / "scripts" / "lib" / "task_deps.py")
+task_deps = importlib.util.module_from_spec(_TD_SPEC)
+_TD_SPEC.loader.exec_module(task_deps)  # type: ignore[union-attr]
+
+_DD_SPEC = importlib.util.spec_from_file_location(
+    "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
+declared_deps = importlib.util.module_from_spec(_DD_SPEC)
+_DD_SPEC.loader.exec_module(declared_deps)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
@@ -241,6 +276,17 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # 1, 2, 5 остаются наблюдательными по исходному решению владельца (см.
 # docstring выше). Включение любого номера — явная правка этой константы
 # после проверки условия.
+#
+# Инвариант 9 (#710) заведён СРАЗУ наблюдательным, не гейтящим: живой замер
+# на день внедрения (2026-09-08) — 1 нарушение (#679, kind=stale, см.
+# докстринг check_declared_deps_mismatch) — гейтить с ненулевым долгом
+# означало бы покрасить `test` за чужую задачу, тот же класс «тормоз без
+# газа», от которого уже отказались для 1/4/5. Условие возврата —
+# GATING_RELEASE_CONDITION[9] (машинно проверяемое: 0 нарушений инварианта на
+# живом пуле, не «когда починим руками»). НЕ повторяй судьбу #666
+# (наблюдательный инвариант с нулевым долгом сам не гейтится обратно —
+# возврат держится на памяти): газ здесь назван явно и заранее, не после
+# находки.
 CI_GATING: frozenset[int] = frozenset({7})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
@@ -262,6 +308,19 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
        "Если формулировка нужна как цитата самого инцидента — расширь паттерн "
        "инварианта осознанно, с комментарием, почему цитата безопаснее",
+    9: "для каждого «stale»: обнови текст поля («Чем блокируется»/«Что "
+       "блокирует») под фактический граф, ЛИБО сними лишнее ребро "
+       "(task_deps.py unblock), если оно ошибочно; для каждого «missing»: на "
+       "push repo-ci — проверь, что declared_deps.py wire реально прогнан "
+       "(см. repo-ci.yml) — если прогнан и всё равно missing, это дефект "
+       "самого auto_wire, не долг текста; на PR/пульсе orchestra или сразу "
+       "после ручной правки поля — это может значить «wire ещё не доехал» "
+       "(запускается только чужим push/merge в main), перепроверь после "
+       "следующего пульса, прежде чем считать дефектом. Ключ держим не в "
+       "CI_GATING (см. комментарий выше константы) — как и у 3/4, это факт "
+       "про газ, а не про то, гейтит ли сейчас 9. 0 нарушений на живом пуле "
+       "(python scripts/orchestra/repo_invariants.py, секция [9]) — машинно "
+       "проверяемое условие возврата",
 }
 
 
@@ -972,6 +1031,82 @@ def check_ambiguous_artifact_phrase(docs_root: Path) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9: тело задачи и нативный граф blockedBy расходятся (#710)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
+    """Инвариант 9 (задача #710, продолжение #371/#529): расхождение между
+    структурно объявленной связью в теле задачи и фактическим нативным
+    графом `blockedBy` — В ОБЕ СТОРОНЫ, по ВСЕМ трём формам записи
+    (`declared_deps.py`: заголовок «Чем блокируется», заголовок «Что
+    блокирует» — обратное направление, инлайн «БЛОКИРУЕТСЯ: …»):
+
+      - «missing»: пара (blocked, blocking) объявлена текстом, но нативного
+        ребра нет. На push repo-ci это честно значит дефект переноса —
+        `declared_deps.py::auto_wire` отрабатывает В ТОМ ЖЕ push, ДО этого
+        шага (см. .github/workflows/repo-ci.yml, порядок шагов), поэтому
+        находка здесь означает, что auto_wire не покрыл этот случай. На
+        pull_request и на периодическом пульсе orchestra.yml (главный канал
+        этого инварианта по расписанию модуля) это НЕ гарантировано: wire
+        запускается только чужим push/merge в main, не этими триггерами —
+        находка сразу после ручной правки поля тоже может значить «ещё не
+        доехал», а не дефект auto_wire (см. GATING_RELEASE_CONDITION[9]).
+      - «stale»: нативное ребро есть, а НИ ОДНА объявленная пара его не
+        называет — включая явный ответ «ничем» при непустом графе (живой
+        случай на замере 2026-09-08: #679 отвечает «БЛОКИРУЕТСЯ: ничем»,
+        нативный `blockedBy` содержит #605 — текст лжёт о собственной
+        зависимости). Связь стоит мимо текста задачи: поставлена вручную
+        без обновления описания, или описание устарело после правки графа.
+
+    Issue проверяется только если её СОБСТВЕННОЕ поле «Чем блокируется»/
+    инлайн не `None` (`declared_deps.declared_blocked_by` вернул список,
+    пусть и пустой) — issue не из этого шаблона (старая, до #387, или чужой
+    формат) не о чем судить, отсутствие поля — не нарушение. Обратное поле
+    «Что блокирует» ДРУГОЙ issue тоже засчитывается как объявление для ЦЕЛИ
+    (A говорит «Что блокирует: B» — это заявка о паре (B, A), даже если у B
+    самой нет своего поля) — иначе половина живого пула (issue без
+    собственного поля, но названные чужим «Что блокирует») были бы слепым
+    пятном для «stale».
+
+    `issues_with_body` — форма `task_deps.fetch_pool(..., include_body=True)`
+    (number, body, blocked_by_open). Свободная проза (`_TRIGGER_RE`,
+    ад-хок заголовки без точного текста поля) сюда НЕ входит — та же
+    граница, что и у `auto_wire`: ложная связь опаснее отсутствующей,
+    эвристика прозы остаётся только предупреждением (`find_desync`,
+    инвариант в неё не входит)."""
+    open_numbers = {issue["number"] for issue in issues_with_body}
+    by_number = {issue["number"]: issue for issue in issues_with_body}
+
+    declared_pairs: set[tuple[int, int]] = set()
+    has_declaration: set[int] = set()
+
+    for issue in issues_with_body:
+        number = issue["number"]
+        body = issue.get("body") or ""
+        declared = declared_deps.declared_blocked_by(body)
+        if declared is not None:
+            has_declaration.add(number)
+            for n in declared:
+                if n in open_numbers and n != number:
+                    declared_pairs.add((number, n))
+        for target in declared_deps.blocking_field_numbers(body) or []:
+            if target in open_numbers and target != number:
+                declared_pairs.add((target, number))
+                has_declaration.add(target)
+
+    violations: list[dict] = []
+    for number in sorted(has_declaration):
+        native = {(number, n) for n in (by_number[number].get("blocked_by_open") or [])}
+        expected = {pair for pair in declared_pairs if pair[0] == number}
+        for _, blocking in sorted(expected - native):
+            violations.append({"issue": number, "kind": "missing", "number": blocking})
+        for _, blocking in sorted(native - expected):
+            violations.append({"issue": number, "kind": "stale", "number": blocking})
+    return violations
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1038,6 +1173,16 @@ def fetch_branch_protection(repo: str) -> dict:
     """`GET /repos/{repo}/branches/main/protection` целиком — один запрос,
     не listing, страница не нужна (см. check_branch_protection_drift, #341)."""
     return gh(f"repos/{repo}/branches/main/protection")
+
+
+def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
+    """Пул с телами и графом одним GraphQL-проходом (`task_deps.fetch_pool`,
+    единственный источник, отдающий и то, и другое — REST для графа
+    недостаточен, см. docstring task_deps.py) — нужен ТОЛЬКО инварианту 8
+    (check_declared_deps_mismatch): `fetch_open_task_issues` выше (REST,
+    используется 1/4/5) тело/граф не тянет, не тянуть лишний трафик там, где
+    он не читается."""
+    return task_deps.fetch_pool(repo, label=TASK_LABEL, include_body=True, gh_call=gh)
 
 
 def build_report(repo: str, now: datetime,
@@ -1160,6 +1305,17 @@ def build_report(repo: str, now: datetime,
             )
     else:
         lines.append("💚 [8] нет дорогих прогонов ai-review после вердикта при неизменном диффе")
+
+    open_tasks_with_body = fetch_open_task_issues_with_body(repo)
+    v9 = check_declared_deps_mismatch(open_tasks_with_body)
+    findings[9] = v9
+    if v9:
+        lines.append(f"🚨 [9] {len(v9)} расхождений тела задачи и графа blockedBy (#710):")
+        for item in v9:
+            verb = "не хватает ребра на" if item["kind"] == "missing" else "ребро есть, а поле не называет"
+            lines.append(f"   — #{item['issue']}: {verb} #{item['number']} ({item['kind']})")
+    else:
+        lines.append("💚 [9] тело задачи и граф blockedBy согласованы")
 
     return lines, findings
 
