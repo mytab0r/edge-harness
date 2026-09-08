@@ -38,6 +38,15 @@
 #     "deepseek-v4-flash" в regex-паттерне — upstream-маркер бандла dsh-edge
 #     для замены, не наш CI-дефолт вызова LLM. Исключается ТОЧЕЧНО (по этой
 #     строке), а не файл целиком (находка 4).
+#   - scripts/lib/dsh-ci.sh, массив PLUGINS_SUITE_CANDIDATE_ROUTES (#215): не
+#     фолбэк-дефолт класса #153 (нет `${DEEPSEEK_*:-...}`, единственный
+#     обязательный провайдер по-прежнему только vars.DEEPSEEK_BASE_URL/MODEL)
+#     — явная, опционально подключаемая таблица маршрутов combo-router;
+#     значения взяты буквально из собственного примера suite
+#     (dsh-combo-router/examples/mytab0r.settings.yml). Маршрут активируется,
+#     только если задан секрет соответствующей учётки — молчаливый дефолт
+#     здесь невозможен по построению самого combo-router (пустой routes при
+#     enabled:true падает конструктором роутера).
 #   - этот файл (regex-литералы самой гвардии).
 set -euo pipefail
 
@@ -88,6 +97,9 @@ while IFS= read -r f; do
       case "$f:$lineno" in
         "scripts/lib/test/dsh-clients.smoke.sh:"*) continue ;;
       esac
+      if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
+        case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
+      fi
       if [ "$f" = ".github/workflows/deploy-dsh-edge.yml" ]; then
         case "$content" in *'deepseek-v4-flash"'*) continue ;; esac
       fi

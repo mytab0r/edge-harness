@@ -83,6 +83,17 @@ dsh_require_provider_chain || exit 1
 
 dsh_install "$AI_WORK/pkgs"
 dsh --version || true
+# Suite ротации учёток (#215, dsh-combo-router+anthropic-oauth-pool) здесь
+# НАМЕРЕННО не подключается: этот шаг всегда идёт через
+# dsh_run_with_provider_chain (#727 ниже), которая сама зовёт
+# dsh_patch_profile на КАЖДУЮ попытку — суть цепочки в том, что
+# DSH_CHAIN_PROVIDER/реестр подтверждённых моделей (#737) знают ТОЧНО, какого
+# провайдера пробуют. combo/auto suite решает тот же вопрос («кого пробовать
+# дальше») внутри себя и в обход этих проверок — комбинация не поддержана
+# конструктивно (design.md dsh-in-job, «Стык suite и цепочки провайдеров»).
+# dsh_require_provider_chain ниже уже откажет громко, если vars.PLUGINS_SUITE_URL
+# всё же попадёт в env этого шага — но ai-review.yml её сюда не прокидывает:
+# suite остаётся уделом worker.yml/hands.yml, где цепочки нет.
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
