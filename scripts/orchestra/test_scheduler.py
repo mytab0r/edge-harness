@@ -1520,6 +1520,48 @@ def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
     assert not any("уже обновлён" in line for line in (observations + actions))  # #3 сам не обновлён
 
 
+def test_update_remaining_pulls_pulls_large_ok_pr_prod_form(monkeypatch):
+    """Прод-форма #702: живые метки PR #618 и #333 (снято `gh api
+    pulls/618`/`pulls/333` 2026-09-08 — `{"labels": ["review:large",
+    "review:large-ok", "ai:ok"], "mergeable": true, "mergeable_state":
+    "behind"}` для обоих) — до фикса merge_label_gate ни один из них не
+    считался «близким к слиянию»: should_update_branch делегирует
+    merge_label_gate напрямую, а тот требовал буквальный review:ok, которого
+    у этой пары никогда бы не появилось без постороннего пуша (apply_large_ok
+    ставит review:large-ok меткой). Круг: PR остаётся BEHIND → strict branch
+    protection не даёт слить → «не близок к слиянию» → main не подтягивается
+    → PR остаётся BEHIND. Контрольный #700 несёт review:large БЕЗ
+    review:large-ok — размер ещё не принят, подтягивание по-прежнему
+    пропускается.
+
+    Мутация: верни merge_label_gate к буквальному `REVIEW_OK in names` —
+    update_calls ниже опустеет (ни #618, ни #333 не подтянутся), а #700
+    остаётся отсеянным в обоих случаях."""
+    others = [
+        pull(618, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(333, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(700, labels=["review:large", "ai:ok"]),  # размер не принят — контроль
+    ]
+    fake = FakeGh({"pulls/618/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1 and "pulls/618/update-branch" in update_calls[0]
+    slot_taken_lines = [
+        line for line in (observations + actions)
+        if "#333" in line and "слот update_branch" in line and "занят другим PR" in line
+    ]
+    assert len(slot_taken_lines) == 1, "#333 обязан пройти предикат — слот занял #618, не отсев"
+    not_close_lines = [
+        line for line in (observations + actions)
+        if "не подтянут" in line and "#700" in line and "не близок к слиянию" in line
+    ]
+    assert len(not_close_lines) == 1, "#700 без review:large-ok обязан остаться отсеянным предикатом"
+
+
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
     # Драфт отсеивается раньше should_update_branch — даже с зелёными
     # вердиктами его не трогаем (см. merge_queue: драфт не сливается никогда).
@@ -1834,6 +1876,54 @@ def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
     # #456: пропуск кандидата (гейт меток не пройден) — наблюдение, не действие.
     assert any("ai:ok" in line for line in observations)
     assert actions == []
+
+
+def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
+    """Прод-форма PR #333 (2026-09-08, снято `gh api pulls/333` и
+    `commits/<sha>/check-runs` живого репозитория): `mergeable_state=unstable`,
+    метки `review:large`+`review:large-ok`+`ai:ok` (НЕ `review:ok` — большой
+    дифф, размер принят меткой, а не переносом на review:ok), 11 сырых
+    check-run'ов с дублями `contract`(x2)/`orchestra`(x2) (два pull_request-
+    триггера workflow orchestra.yml подряд), все success/skipped.
+
+    До фикса merge_label_gate (review_labels.py) этот PR стоял бы с этим же
+    набором меток НАВСЕГДА — apply_large_ok (ai_review.py) ставит
+    review:large-ok меткой, без нового пуша, а pr-review.yml (где
+    check_pr.py конвертировал бы review:large → review:ok) реагирует только
+    на opened/synchronize/reopened. Мутация: замени `gate1_ok = REVIEW_OK in
+    names or (...)` на `gate1_ok = REVIEW_OK in names` в review_labels.py —
+    тест обязан покраснеть (не появится -X PUT .../merge, останется
+    "нет вердикта review:ok" в observations)."""
+    pulls = [pull(333, labels=["review:large", "review:large-ok", "ai:ok"])]
+    fake = FakeGh({
+        "pulls/333": {"mergeable_state": "unstable"},
+        "commits/sha333/check-runs": {"check_runs": [
+            {"name": "CodeQL", "conclusion": "success", "started_at": "2026-09-07T21:58:40Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:58:05Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:58:06Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:57:48Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "review", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "canary", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "analyze", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "worker-test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "archive-fixup", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+        ]},
+        "pulls/333/merge": None,
+    })
+    patch_gh(monkeypatch, fake)
+    # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
+    # проводка after_merge (архив/deploy/release задачи) — та разобрана
+    # отдельными тестами after_merge_* ниже в этом файле.
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others: ([], [], False))
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number == 333
+    assert any(c.startswith("-X PUT") and "pulls/333/merge" in c for c in fake.calls)
+    assert any("слит" in line and "#333" in line for line in actions)
 
 
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────

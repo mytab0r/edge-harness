@@ -12,12 +12,26 @@
     (`scripts/lib/review_labels.py::review_status_state`/`ai_status_state`).
 
     Состояния: гейт 1 — `success` только при `review:ok`, `failure` при
-    `review:changes-requested`/`review:large` (тот же порог, что
-    `merge_label_gate`). Гейт 2 — `approve` → `success`, `rework` →
-    `failure`, `error` → `pending` (не `failure`: сбой провайдера/транспорта
-    — не вердикт о коде, у него отдельный газ, автоповтор по таймеру п.
-    ai-review #196; required status check не пересчитывается сам, `failure`
-    держал бы его красным до нового пуша человеком).
+    `review:changes-requested`/`review:large` (порог этого статуса на момент
+    написания дельты совпадал с `merge_label_gate`). Гейт 2 — `approve` →
+    `success`, `rework` → `failure`, `error` → `pending` (не `failure`: сбой
+    провайдера/транспорта — не вердикт о коде, у него отдельный газ,
+    автоповтор по таймеру п. ai-review #196; required status check не
+    пересчитывается сам, `failure` держал бы его красным до нового пуша
+    человеком).
+
+    **Известное расхождение (#702, 2026-09-08):** `merge_label_gate` с #702
+    засчитывает гейт 1 также по связке `review:large`+`review:large-ok`
+    (метка `review:large-ok` ставится БЕЗ нового пуша — `apply_large_ok`),
+    но `review_status_state` вычисляет `harness/review` только из вердикт-
+    метки `check_pr.py` на МОМЕНТ ПОСЛЕДНЕГО ПУША и не перечитывается, когда
+    `review:large-ok` появляется отдельно — на таком PR статус остаётся
+    `failure`, хотя `merge_label_gate` уже открыт. Метки — единственное
+    место принятия решения о слиянии (см. следующий абзац), required status
+    checks на этот контекст пока не включены владельцем — расхождение не
+    блокирует слияние сегодня. Починка (перепубликация `harness/review` из
+    `apply_large_ok`) заведена отдельной задачей из ревью PR #704, не этой
+    дельтой.
 
     Skip-путь второго гейта (дифф PR не изменился с прошлого вердикта AI,
     #252/#294 — `check_pr.py::ai_verdict_keep`) сам `ai-review.yml` не
