@@ -426,6 +426,15 @@ export DEEPSEEK_MODEL="glm-5"
 # по-прежнему читают DEEPSEEK_* напрямую через dsh_require_provider_env, не
 # тронуто этим change, см. tasks.md «Область»).
 export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
+# Реестр подтверждённых id (#737): реальный реестр репозитория
+# (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель
+# "glm-5" этой фикстуры по построению — своя фикстура реестра, иначе
+# dsh_run_with_provider_chain честно пропустил бы SMOKE как неподтверждённый
+# и сценарии ниже (ожидающие реального вызова dsh) стали бы ложно-красными.
+CONFIRMED_MODELS_FIXTURE="$TMP/confirmed-models.json"
+printf '[{"name":"SMOKE","model_sha256":"%s","confirmed_at":"2026-09-08","evidence":"smoke fixture"}]' \
+  "$(printf '%s' 'glm-5' | sha256sum | cut -d' ' -f1)" >"$CONFIRMED_MODELS_FIXTURE"
+export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"

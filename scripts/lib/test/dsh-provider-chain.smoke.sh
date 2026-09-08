@@ -18,10 +18,26 @@ set -euo pipefail
 SMOKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SMOKE_DIR/../../.." && pwd)"
 
+fail() { echo "::error::SMOKE(chain): $*" >&2; exit 1; }
+
+# Реестр подтверждённых id (#737) — фикстура ДО source dsh-ci.sh, т.к.
+# DSH_CONFIRMED_MODELS_FILE резолвится на дефолт при загрузке файла:
+# реальный реестр (scripts/lib/confirmed-provider-models.json) не знает про
+# фиктивные модели этого смоука по построению (см. allowlist ниже про
+# фиктивные имена).
+WORK="$(mktemp -d)"
+hash_of() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+CONFIRMED_MODELS_FIXTURE="$WORK/confirmed-models.json"
+cat >"$CONFIRMED_MODELS_FIXTURE" <<JSON
+[
+  {"name":"PRIMARY","model_sha256":"$(hash_of primary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
+  {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"}
+]
+JSON
+export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
+
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$REPO/scripts/lib/dsh-ci.sh"
-
-fail() { echo "::error::SMOKE(chain): $*" >&2; exit 1; }
 
 # ── Заглушки: dsh_install/dsh_patch_profile не нужны сети, но профиль пишется
 # на диск (HOME) — используем временный HOME, чтобы не мусорить и не зависеть
@@ -58,6 +74,10 @@ dsh() {
         real-error)
           echo "dsh: INVALID_API_KEY: unauthorized" >&2
           return 1 ;;
+        silent)
+          # #737, живой случай — прогон 34188152283: rc=1, НИ ОДНОГО байта в
+          # stderr (не пересказ — воспроизводит ровно тот факт).
+          return 1 ;;
         *)
           echo "::error::SMOKE: неизвестный режим $mode для $mode_var" >&2
           return 99 ;;
@@ -82,7 +102,6 @@ CHAIN='[
 ]'
 export DSH_PROVIDER_CHAIN="$CHAIN"
 
-WORK="$(mktemp -d)"
 ANSWER="$WORK/answer.txt"
 ERR="$WORK/err.txt"
 
@@ -116,15 +135,23 @@ echo "SMOKE(chain): 2) HTTP_404 -> автопереход — ок"
 
 # ── 3) Настоящая ошибка (ключ битый и т.п.) — цепочка НЕ идёт дальше ──────────
 # Мутация ключевого требования (#727, п.4): не любой отказ переключает.
+# #737: сообщение обязано называть код возврата даже на остановке (Дефект 1).
+# ВАЖНО: вывод перехватывается редиректом в файл, НЕ через $(...) вокруг
+# самого вызова — command substitution породила бы subshell, и
+# DSH_RUN_RC/DSH_CHAIN_* из dsh_run_with_provider_chain потерялись бы
+# (живая находка мутационной проверки этого же PR).
 reset_scenario
 SMOKE_MODE_primary_model="real-error"
 SMOKE_MODE_secondary_model="ok"
-dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+LOG="$WORK/log.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
 [ "$DSH_RUN_RC" != "0" ] || fail "3) настоящая ошибка не должна была дать успех"
 [ "$DSH_CHAIN_PROVIDER" = "" ] || fail "3) успешного провайдера быть не должно, получено '$DSH_CHAIN_PROVIDER'"
 [ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "3) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — SECONDARY не должен был тронуться (не переключаемый класс)"
 [ "$DSH_RUN_FAILURE_REASON" != "all_providers_exhausted" ] || fail "3) причина не обязана звучать как 'все исчерпаны' — это НЕ переключаемый класс"
-echo "SMOKE(chain): 3) настоящая ошибка -> цепочка остановлена, второй провайдер не тронут — ок"
+[[ "$OUT" == *"rc="* ]] || fail "3) сообщение об остановке обязано называть код возврата: $OUT"
+echo "SMOKE(chain): 3) настоящая ошибка -> цепочка остановлена, второй провайдер не тронут, сообщение честное — ок"
 
 # ── 4) Оба провайдера исчерпаны — честное 'все исчерпаны' + обе даты сброса ──
 reset_scenario
@@ -149,4 +176,40 @@ SMOKE_MODE_secondary_model="ok"
 ) || fail "5) сценарий с отсутствующим секретом провалился"
 echo "SMOKE(chain): 5) пропуск провайдера без секрета — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727 зелёная"
+# ── 6) rc=1, ПУСТОЙ stderr (#737, живой случай — прогон 34188152283: NVIDIA
+# rc=1, ни одного байта в stderr) — недиагностируемый транспортный сбой по
+# умолчанию ПЕРЕКЛЮЧАЕТ (Дефект 2), сообщение обязано называть rc и факт
+# «stderr пуст» (Дефект 1), не утверждать распознанный класс, которого нет.
+reset_scenario
+SMOKE_MODE_primary_model="silent"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "6) ожидался успех после пустого stderr у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "6) ожидался переход на SECONDARY при пустом stderr, получено '$DSH_CHAIN_PROVIDER'"
+[ ! -s "$ERR" ] || fail "6) err.txt последней (успешной) попытки не должен быть пуст — фикстура сломана"
+[[ "$OUT" == *"rc="* ]] || fail "6) сообщение обязано называть код возврата: $OUT"
+[[ "$OUT" == *"stderr пуст"* ]] || fail "6) сообщение обязано называть факт «stderr пуст»: $OUT"
+echo "SMOKE(chain): 6) rc=1 без диагностики -> автопереход с честным сообщением — ок"
+
+# ── 7) Неподтверждённый id модели (#737, руnbook «Узнать точный id модели») —
+# провайдер пропущен ДО вызова dsh (не тратит попытку/время), следующий
+# пробуется как обычно, сообщение называет факт «id не подтверждён».
+reset_scenario
+UNCONFIRMED_CHAIN='[
+  {"name":"UNCONFIRMED","base_url":"https://unconfirmed.test/v1","model":"unconfirmed-model","secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096}
+]'
+( export DSH_PROVIDER_CHAIN="$UNCONFIRMED_CHAIN"
+  LOG="$WORK/log7.txt"
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::7) ожидался успех после пропуска неподтверждённого id, получено $DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || { echo "::error::7) ожидался переход на SECONDARY, получено '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "UNCONFIRMED, SECONDARY" ] || { echo "::error::7) UNCONFIRMED обязан быть учтён как опробованный (пропущен, не потерян): '$DSH_CHAIN_TRIED'" >&2; exit 1; }
+  [[ "$OUT" == *"НЕ подтверждён"* ]] || { echo "::error::7) сообщение обязано называть факт «id не подтверждён»: $OUT" >&2; exit 1; }
+) || fail "7) сценарий с неподтверждённым id модели провалился"
+echo "SMOKE(chain): 7) неподтверждённый id модели -> пропуск с честным сообщением, время/квота не потрачены — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737 зелёная"
