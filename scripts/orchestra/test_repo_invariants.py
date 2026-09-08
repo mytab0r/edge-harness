@@ -285,6 +285,116 @@ def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch
     assert violations[0]["pr"] == 432
 
 
+# ── ai:failed — газ #196 исчерпал бюджет, но не эскалировал (находка ревью
+# #439, класс #431): раньше check_stuck_review_gate пропускала ЛЮБОЙ PR с
+# ai:*-меткой, включая ai:failed, и это состояние было невидимо инварианту.
+
+
+def test_stuck_review_gate_flags_ai_failed_when_budget_exhausted_not_escalated(monkeypatch):
+    pull = open_pr(163, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/163/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/163/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],  # эскалации исчерпания ещё нет
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 163
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+    assert violations[0]["attempts_in_epoch"] == 3
+
+
+def test_stuck_review_gate_silent_ai_failed_budget_not_exhausted_yet(monkeypatch):
+    # Бюджет ещё не исчерпан в этой эпохе (2/3) — у #196 остаётся попытка,
+    # инвариант не должен опережать газ.
+    pull = open_pr(164, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha164/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/164/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_silent_ai_failed_already_escalated(monkeypatch):
+    # #196 сам эскалировал исчерпание в #120 в этой же эпохе — инвариант не
+    # дублирует сигнал.
+    pull = open_pr(165, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha165/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/165/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #165\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_silent_ai_failed_already_escalated_via_quota_marker(monkeypatch):
+    # Находка ревью PR #439: газ #196 мог исчерпать бюджет ТРЕМЯ провалами, из
+    # которых последний — quota_exhausted (ветка trigger_ai_review стоит
+    # раньше счётчика попыток и эскалирует AI_REVIEW_QUOTA_MARKER, не
+    # AI_REVIEW_EXHAUSTED_MARKER). До фикса инвариант знал только про
+    # EXHAUSTED_MARKER и бил ложное «не эскалировано», хотя человек уже
+    # оповещён тем же каналом #120.
+    pull = open_pr(167, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha167/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/167/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_QUOTA_MARKER} #167\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_ai_failed_mutation_guard(monkeypatch):
+    # Мутация: убрать вызов check_ai_failed_budget_exhausted из ветки
+    # ai:failed (вернуть "labels & ai_labels: continue" безусловно) — этот
+    # тест обязан покраснеть, реальная проверка, не > 0 без содержания.
+    pull = open_pr(166, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha166/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/166/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/166/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+
+
 def test_stuck_review_gate_silent_when_neither_gate1_label_present(monkeypatch):
     # Без review:ok И без review:large гейт 1 ещё не отработал вовсе — этот
     # инвариант обязан молчать (не путать «гейт молчит» с «гейт застрял»).
@@ -361,7 +471,9 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     since — та же метрика, что видит scheduler.trigger_ai_review) уже
     показывает 3/3, потому что все три маркера принадлежат СТАРОЙ эпохе
     (якорь 03:05:20), которая своё уже получила вердикт (ai:ok, 03:46:52).
-    Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
+    С #431 это больше не бага: газ считает бюджет по attempts_in_epoch, у
+    текущей эпохи свежие 0/3 — inline-текст называет это «должен сработать
+    сам», не «исчерпан»."""
     pull = open_pr(329, labels=["review:ok"])
     fake = FakeGh({
         "commits/sha329/statuses": gate1_status("2026-09-06T03:48:22Z"),
@@ -392,9 +504,10 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     assert item["attempts_in_epoch"] == 0  # ни одного автоповтора в ТЕКУЩЕЙ эпохе
     assert item["verdict_ever"] == {"label": "ai:ok", "at": "2026-09-06T03:46:52+00:00"}
     line = ri.stuck_gate_fact_line(item)
-    assert "исчерпан СТАРОЙ эпохой (3/3, в текущей — 0/3)" in line
-    assert "перенос бюджета между эпохами" in line
+    assert "попытки только в прошлых эпохах (3/3" in line
+    assert "в текущей бюджет есть (0/3)" in line
     assert "вердикт был — ai:ok" in line
+    assert "до текущей эпохи" in line  # вердикт (03:46:52) раньше anchor (03:48:22)
 
 
 def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
@@ -432,7 +545,7 @@ def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
     assert item["attempts_in_epoch"] == 0
     assert item["verdict_ever"] == {"label": "ai:changes-requested", "at": "2026-09-06T05:33:52+00:00"}
     line = ri.stuck_gate_fact_line(item)
-    assert "3/3, в текущей — 0/3" in line
+    assert "3/3" in line and "в текущей бюджет есть (0/3)" in line
 
 
 def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
@@ -449,8 +562,9 @@ def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
     line_same = ri.stuck_gate_fact_line(same_epoch)
     line_carried = ri.stuck_gate_fact_line(carried_over)
     assert line_same != line_carried
-    assert "СТАРОЙ эпохой" not in line_same
-    assert "СТАРОЙ эпохой" in line_carried
+    assert "исчерпан в этой же эпохе" in line_same
+    assert "попытки только в прошлых эпохах" in line_carried
+    assert "должен сработать сам" in line_carried
 
 
 def test_stuck_gate_fact_line_budget_not_exhausted():

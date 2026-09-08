@@ -173,6 +173,11 @@ FENCE_CLOSE_RE = re.compile(r"^`{4,}\s*$")
 # регэкспа, чтобы разбор поля diff не разошёлся между читателем и писателем.
 FACT_RE = review_labels.FACT_RE
 header_facts = review_labels.header_facts
+# transport_failed/reason_tag — одно место правды в review_labels.py (#431):
+# scheduler.trigger_ai_review читает тот же тег из шапки комментария
+# (facts["reason"]), второй копии классификации не заводим.
+transport_failed = review_labels.transport_failed
+reason_tag = review_labels.reason_tag
 
 
 def gh(*args: str) -> dict | list:
@@ -234,32 +239,23 @@ def parse_verdict(answer: str) -> str:
     return "error"
 
 
-def transport_failed(dsh_rc: str) -> bool:
-    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
-
-    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
-    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
-    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
-    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
-    точный «модель ответила не по контракту» в редком крайнем случае.
-    """
-    try:
-        return int(dsh_rc) != 0
-    except (TypeError, ValueError):
-        return False
-
-
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                   reset_hint: str = "") -> str:
     """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
     транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
-    что-то другое», правило AGENTS.md). Порядок проверки важен: failure_reason
-    (ai_dsh.sh уже решил за нас, что это лимит) — раньше generic-транспорта,
-    транспорт — раньше формата, потому что при упавшем транспорте answer пуст
-    и verdict_line_present всё равно вернёт False — не значит «модель
-    промолчала».
+    что-то другое», правило AGENTS.md).
+
+    Классификация (порядок проверки, приоритет между причинами) — ЕДИНСТВЕННО
+    в review_labels.reason_tag (находка ревью #439: раньше порядок был
+    продублирован здесь второй копией if/elif, связанной с оригиналом только
+    комментарием «тот же порядок» — разъехались бы молча, добавь кто-то
+    причину в одном месте и забудь про другое). Эта функция только рендерит
+    прозу для человека по уже вынесенному тегу; текст для FAILURE_REASON_
+    CONTRACT дополнительно различает две подпричины через verdict_line_present
+    (тег их не различает — обеим достаточно значения «формат ответа
+    нарушен», разница есть только в тексте для человека).
 
     failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
     ai_dsh.sh, #419, либо cmd_gather при пустом диффе, #658/#687), пробрасывается
@@ -305,6 +301,11 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
     сообщение честно называет «дата неизвестна», не гадает (AGENTS.md,
     «алерт не гадает»).
     """
+    # empty_diff/diff_source_mismatch/all_providers_exhausted (#658/#687/#727)
+    # — причины БЕЗ обращения к модели вовсе (cmd_gather решил их заранее) или
+    # вне оси quota/rate-limit/transport/contract, которую делит review_labels.
+    # reason_tag (#431) — тег их не различает и не обязан: остаются
+    # литералами failure_reason здесь, до делегирования тегу ниже.
     if failure_reason == "empty_diff":
         return ("ревью не состоялось — дифф PR пуст (0 изменённых файлов), "
                 "сливать нечего: либо содержимое уже попало в main другим "
@@ -322,24 +323,29 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                 "API) — повтор на этом же head (новый пуш или "
                 "workflow_dispatch force: true) может дать другой "
                 "результат")
-    if failure_reason == "quota_exhausted":
-        return (f"ревью не состоялось — квота провайдера исчерпана надолго "
-                f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
-                f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
-                "ждать вне CI или сменить провайдера "
-                "(docs/runbooks/switch-llm-provider.md)")
-    if failure_reason == "rate_limit_retry_budget_exceeded":
-        return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
-                f"снялся за отведённый бюджет ожидания внутри прогона (код "
-                f"возврата {dsh_rc})")
     if failure_reason == "all_providers_exhausted":
         when = reset_hint.strip() if reset_hint else "дата неизвестна — ни один провайдер её не назвал"
         return (f"ревью не состоялось — все провайдеры цепочки исчерпаны/недоступны "
                 f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
                 "ждать сброса вне CI, либо добавить нового провайдера в "
                 "vars.DSH_PROVIDER_CHAIN (docs/runbooks/switch-llm-provider.md)")
-    if transport_failed(dsh_rc):
+    # Оставшаяся ось (quota/rate-limit/transport/contract) — ЕДИНСТВЕННО
+    # через review_labels.reason_tag (находка ревью #439, см. докстринг выше).
+    tag = review_labels.reason_tag(dsh_rc, failure_reason)
+    if tag == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
+        return (f"ревью не состоялось — квота провайдера исчерпана надолго "
+                f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
+                f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
+                "ждать вне CI или сменить провайдера "
+                "(docs/runbooks/switch-llm-provider.md)")
+    if tag == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET:
+        return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
+                f"снялся за отведённый бюджет ожидания внутри прогона (код "
+                f"возврата {dsh_rc})")
+    if tag == review_labels.FAILURE_REASON_TRANSPORT:
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
+    # tag == FAILURE_REASON_CONTRACT — единственная причина, которую тег не
+    # делит на подпричины; текст для человека делит дальше.
     if verdict_line_present(answer):
         return "модель ответила, но строка «ВЕРДИКТ: …» есть, а не единственная и/или не последняя"
     return "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
@@ -521,7 +527,8 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
                   tasks: list[dict], diff_fp: str | None = None,
                   remarks: list[dict] | None = None,
                   chain_provider: str | None = None,
-                  reset_hint: str | None = None) -> str:
+                  reset_hint: str | None = None,
+                  reason_tag_value: str | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -551,13 +558,20 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     только «какой провайдер настроен в vars»), и даты сброса опробованных —
     читает scheduler.py::trigger_ai_review (header_facts), чтобы не жечь
     авто-повтор (#196) вслепую в ту же квоту. Обе строки опциональны (пусто —
-    не добавлены вовсе), как diff_line выше."""
+    не добавлены вовсе), как diff_line выше.
+
+    reason_tag_value — тег причины verdict=error (review_labels.reason_tag,
+    #431): факт `reason:` в шапке, который scheduler.trigger_ai_review читает
+    для решения о бюджете автоповторов ЭТОЙ эпохи. None (verdict != "error"
+    или вызов без классификации) не добавляет строку — та же обратная
+    совместимость, что у diff_fp."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
     reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
+    reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
-        f"{diff_line}{provider_line}{reset_line}\n"
+        f"{diff_line}{provider_line}{reset_line}{reason_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -960,6 +974,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
               if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason
+    # Тег для шапки комментария (#431) — независимо от findings/reason (та
+    # проза может оказаться текстом самой модели, а не error_reason, см.
+    # review_labels.FAILURE_REASON_* докстринг): scheduler.trigger_ai_review
+    # решает бюджет автоповторов по структурному факту `reason:`, не по
+    # пересказу.
+    reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason) if verdict == "error" else None
 
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     if pull["head"]["sha"] != args.head:
@@ -1044,7 +1064,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     diff_fp = review_labels.diff_fingerprint(files)
     body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
                           remarks=remarks, chain_provider=args.chain_provider,
-                          reset_hint=args.reset_hint)
+                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
