@@ -2906,6 +2906,57 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert task["assignees"] != []  # эскалация не трогает задачу
 
 
+def test_dispatch_conflict_rework_dispatches_again_after_budget_reset_marker(monkeypatch):
+    # Владелец (авария #794, 2026-09-08): единственная авто-попытка на этих
+    # PR провалилась по ИНФРЕ (воркер падал на журнале во время инцидента),
+    # не по сложности ребейза — честная повторная попытка через durable-маркер
+    # CONFLICT_BUDGET_RESET_MARKER (issue #822), не подъём
+    # CONFLICT_REWORK_MAX_ATTEMPTS и не ручная правка счётчика. Тот же сетап,
+    # что test_dispatch_conflict_rework_escalates_after_budget_exhausted (одна
+    # ЗАСЧИТАННАЯ попытка уже случилась), плюс маркер сброса ПОСЛЕ неё —
+    # dispatch снова доступен вместо эскалации.
+    # Мутация: убери учёт reset_times в conflict_rework_attempts — этот тест
+    # покраснеет (ушла бы эскалация вместо второго dispatch, escalate() упал
+    # бы через pytest.fail ниже).
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+        f"{REPO}/issues/474/comments?per_page": [
+            # Единственная попытка ДО аварии — дошла до git-шага, засчитана.
+            {"created_at": "2026-09-06T10:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
+            # Маркер сброса, опубликованный после разбора аварии #794 —
+            # причина после двоеточия, сам маркер ищется как префикс.
+            {"created_at": "2026-09-08T09:00:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage 2026-09-08: единственная попытка "
+                     "провалилась по инфре, не по сложности]"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет сброшен маркером — эскалации быть не должно"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert task["assignees"] == []
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=474" in dispatch_calls[0]
+    assert posted and posted[0][0] == 560
+    assert "попытка 1/1" in posted[0][1]  # счётчик после сброса снова 0, это первая попытка новой эпохи
+    assert any("#560" in line and "освобождена" in line for line in actions)
+
+
 def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_failure(monkeypatch):
     # Issue #588: живые случаи #567/#542/#408 — единственный прогон авто-
     # ребейза упал ДО git-шага (морда/деплой недоступны, отсутствующий
@@ -3407,6 +3458,95 @@ def test_conflict_rework_attempts_zero_when_never_labeled(monkeypatch):
     # Не тратим вызовы на прогоны/комментарии задачи — нет эпизода конфликта,
     # решать по нему нечего.
     assert not any("runs?per_page=10" in c or "474/comments" in c for c in fake.calls)
+
+
+def test_conflict_rework_attempts_reset_marker_excludes_prior_attempt(monkeypatch):
+    # Сброс бюджета (issue #822, авария #794/2026-09-08): CONFLICT_BUDGET_RESET_MARKER
+    # в комментариях ЗАДАЧИ выкидывает из подсчёта попытку, случившуюся ДО
+    # него, даже если она формально дошла до git-шага и была бы засчитана.
+    # Мутация: убери учёт reset_times в conflict_rework_attempts — attempts
+    # вернётся к 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+            {"created_at": "2026-09-08T12:00:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage 2026-09-08: единственная попытка "
+                     "провалилась по инфре, не по сложности]"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 0
+
+
+def test_conflict_rework_attempts_counts_attempt_after_reset_marker(monkeypatch):
+    # Честная повторная попытка ПОСЛЕ сброса засчитывается как обычно — сброс
+    # не даёт безлимит, а ровно одну новую попытку (реальная защита от
+    # бесконечного цикла держится: после этой попытки снова 1/1, следующий
+    # провал ведёт к обычной эскалации). Мутация: сравнивай created_at с
+    # исходным since вместо max(since, reset) — attempts останется 1 и после
+    # уже вычтенной старой попытки (должно быть тоже 1, не 2) — проверяем, что
+    # НЕ считается ни ноль, ни удвоенное значение.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+            {"created_at": "2026-09-08T12:00:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage 2026-09-08: единственная попытка "
+                     "провалилась по инфре, не по сложности]"},
+            {"created_at": "2026-09-08T13:00:00Z", "body": "🤖 [worker: git-шаг] worker run 999"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_reset_marker_idempotent_on_repeat(monkeypatch):
+    # Повторная публикация того же маркера не ломает счёт: несколько маркеров
+    # сброса берутся max()'ом времени последнего, не суммируются в
+    # накопленный сдвиг границы. Мутация: замени max(reset_times) на
+    # sum()-подобную логику (например, копи каждый маркер как отдельный
+    # сдвиг) — тест покраснеет на несовпадении с одиночным-маркерным сценарием
+    # (test_conflict_rework_attempts_counts_attempt_after_reset_marker) —
+    # оба обязаны давать одинаковый attempts == 1.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+            {"created_at": "2026-09-08T12:00:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage]"},
+            {"created_at": "2026-09-08T12:30:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage (повтор идемпотентен)]"},
+            {"created_at": "2026-09-08T13:00:00Z", "body": "🤖 [worker: git-шаг] worker run 999"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_ignores_reset_marker_without_git_step_after_it(monkeypatch):
+    # Маркер сам по себе не создаёт попытку — только выкидывает старые из
+    # окна отсчёта. Без нового прогона после маркера attempts обязан остаться
+    # 0 (бюджет свободен, но ничего ещё не потрачено). Мутация: засчитывай
+    # сам факт маркера как попытку — attempts стал бы 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+            {"created_at": "2026-09-08T12:00:00Z",
+             "body": "🤖 [conflict-budget-reset: #794-outage 2026-09-08]"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 0
 
 
 def test_worker_git_step_marker_literal_in_task_sh_matches_pulse_guard():
