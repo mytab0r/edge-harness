@@ -319,6 +319,58 @@ describe("пульс оркестрации: pulseNeedsRecoveryDispatch — ст
   });
 });
 
+// Issue #812: HEARTBEAT.selfOrchestrationMs понижен (15 мин → 10 мин) под
+// замер стоимости тика (docstring HEARTBEAT, src/config.ts). Порог резерва
+// (pulseNeedsRecoveryDispatch/pulseStale, 2×selfOrchestrationMs) масштабируется
+// автоматически — это уже доказано тестами выше (используют HEARTBEAT.* символьно,
+// не числами). Здесь — отдельный, явный инвариант КООРДИНАЦИИ с CRON_INTERVAL_MS
+// (wrangler.jsonc `triggers.crons: "*/5 * * * *"`, не импортируется как TS-константа,
+// поэтому продублирован здесь литералом с явной пометкой источника): при ЛЮБОМ
+// будущем пересмотре selfOrchestrationMs (issue #812 не последний) резерв обязан
+// (1) успевать проверить состояние минимум дважды за окно ожидания и (2) не
+// признавать пульс stale, пока живой alarm тикает штатно — иначе понижение
+// интервала alarm без синхронного пересмотра частоты cron превратило бы резерв
+// либо в слепой (проверяет реже, чем нужно), либо в спамящий (объявляет alarm
+// подвисшим, пока тот ещё укладывается в свой обычный цикл).
+//
+// Докажи мутацией: временно поставь CRON_INTERVAL_MS равным
+// HEARTBEAT.selfOrchestrationMs * 3 (резерв проверяет реже, чем разумно) — первый
+// тест ниже покраснеет; поставь HEARTBEAT.selfOrchestrationMs равным
+// CRON_INTERVAL_MS (10 → 5 мин, alarm тикает так же часто, как cron проверяет) —
+// второй тест (симуляция здорового пульса) покраснеет на каком-то из тиков cron.
+describe("пульс оркестрации: интервал alarm согласован с частотой резерва (issue #812)", () => {
+  // Источник: cf-worker/wrangler.jsonc, triggers.crons. Не импортируется — JSON,
+  // не TS-модуль; продублировано здесь сознательно, с явной пометкой, не тихо.
+  const CRON_INTERVAL_MS = 5 * 60_000;
+
+  it("резерв успевает проверить состояние минимум дважды до срабатывания порога", () => {
+    const recoveryThresholdMs = HEARTBEAT.selfOrchestrationMs * 2;
+    expect(recoveryThresholdMs / CRON_INTERVAL_MS).toBeGreaterThanOrEqual(2);
+  });
+
+  it("резерв не спамит до порога и ловит подвисший alarm не позже одного cron-тика после порога", () => {
+    // Симуляция реальной аварии: alarm умер, последний пульс заморожен на ts=0,
+    // cron проверяет каждые CRON_INTERVAL_MS. Ищем ПЕРВЫЙ момент, когда резерв
+    // решает, что dispatch нужен, — обе стороны важны: он не должен сработать
+    // РАНЬШЕ порога (2×selfOrchestrationMs, спам поверх ещё живого цикла alarm)
+    // и не должен опоздать больше чем на один cron-тик ПОСЛЕ порога (иначе
+    // 5-минутный резерв — просто украшение, а не настоящая страховка).
+    const deadPulse = { ts: 0, dispatch_ok: true, detail: null, run_confirmed: true };
+    const threshold = HEARTBEAT.selfOrchestrationMs * 2;
+    let firstDetectionAt: number | null = null;
+    for (let cronCheckAt = 0; cronCheckAt <= threshold + CRON_INTERVAL_MS * 2; cronCheckAt += CRON_INTERVAL_MS) {
+      const needsDispatch = pulseNeedsRecoveryDispatch(cronCheckAt, deadPulse);
+      if (cronCheckAt < threshold) {
+        expect(needsDispatch).toBe(false); // не спамит ДО порога
+      }
+      if (needsDispatch && firstDetectionAt === null) firstDetectionAt = cronCheckAt;
+    }
+    expect(firstDetectionAt).not.toBeNull();
+    expect(firstDetectionAt!).toBeGreaterThanOrEqual(threshold);
+    expect(firstDetectionAt! - threshold).toBeLessThan(CRON_INTERVAL_MS);
+  });
+});
+
 // НАХОДКА РЕВЬЮ (#303): главный сценарий этого фикса — dispatch ЭТОГО тика принят
 // (attemptOrchestraDispatch честно отдаёт detail: null, причины нет), но
 // run_confirmed о ПРЕДЫДУЩЕМ dispatch'е — false. Без подмены detail это null
