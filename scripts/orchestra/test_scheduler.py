@@ -604,6 +604,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     # только путь «жёсткий сбой архивации красит прогон», не его проводка.
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
     code = sch.main()
@@ -651,6 +652,8 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "detect_and_act", boom)
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: pytest.fail(
         "не должен вызываться — detect_and_act уже упал"))
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: pytest.fail(
+        "не должен вызываться — detect_and_act уже упал"))
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
     saved = []
@@ -691,6 +694,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать — сбоя не было"))
     assert sch.main() == 0
 
@@ -723,6 +727,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(sch, "escalate", lambda *a: "ок")
     assert sch.main() == 1
 
@@ -3628,6 +3633,7 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     # безобидным локально).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(
         sch, "dispatch_conflict_rework",
         lambda repo, pulls, *, pool: (["конфликт расшит"], ["🔧 расшивка ушла"], True),
@@ -5357,6 +5363,7 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     # main()-тесты.
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(
         sch, "wip_gate",
         lambda repo, now, pulls, pool, dispatch_allowed: (["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
@@ -5418,6 +5425,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     # публичный эндпоинт анонимно.
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
@@ -5980,6 +5988,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     # с реальным списком auto-detected issues, которого нет в FakeGh ниже).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     # Единственный сырой gh-вызов этого сценария — PATCH закрытия отклонённого
     # переоткрытия (post_issue_comment/claim_task.release уже замоканы выше).
     patch_gh(monkeypatch, FakeGh({"issues/131 -f state=closed": None}))
