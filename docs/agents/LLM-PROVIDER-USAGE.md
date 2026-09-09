@@ -31,9 +31,9 @@ white-spot #824); до его подключения файл правится �
 
 | Потребитель | Цепочка | Провайдеров | Механизм |
 |---|---|---|---|
-| `ai-review` | `default-chain` | 2 | dsh_run_with_provider_chain (scripts/review/ai_dsh.sh) — полный failover |
-| `worker` | `default-chain` | 2 | dsh_run_with_provider_chain (scripts/worker/task.sh) — полный failover |
-| `hands` | `default-chain` | 2 | dsh_run_with_provider_chain (scripts/hands/dsh_task.sh) — полный failover (#805) |
+| `ai-review` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/review/ai_dsh.sh) — полный failover |
+| `worker` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/worker/task.sh) — полный failover |
+| `hands` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/hands/dsh_task.sh) — полный failover (#805) |
 | `morda` | (вне манифеста) | — | 1 слот адаптера через Settings -> Models (plugins-src/provider-registry, #378) — failover туда не помещается, вне манифеста принципиально (docs/runbooks/switch-llm-provider.md, «Морда — вне цепочки принципиально») |
 
 Обнови эту таблицу той же командой, которой её сгенерировал сборщик —

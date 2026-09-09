@@ -36,6 +36,49 @@ permissions:
   contents: read
 
 jobs:
+  # Discovery живых model id (#848, доводка белого пятна #836): живой замер
+  # #836 (run 34406807344) упал 404/410 на трёх из четырёх новых провайдеров
+  # именно потому, что id в PLUGINS_SUITE_CANDIDATE_ROUTES (dsh-ci.sh) —
+  # буквальная копия примера combo-router, ни разу не сверенная с реальным
+  # `/v1/models` владельца (рунбук docs/runbooks/switch-llm-provider.md,
+  # «Узнать точный id модели»). Отдельный job (не шаг внутри bench) — эта
+  # проверка нужна и БЕЗ полного прогона латентности (например, при первой
+  # диагностике 404/410), а полный бенчмарк не должен ждать дискавери каждый
+  # раз, когда id уже подтверждён и не менялся.
+  discover-models:
+    runs-on: ubuntu-latest
+    # Худший случай — 7 аккаунтов (2 NVIDIA NIM + 3 Ollama Cloud +
+    # 2 OpenRouter) × до VERIFY_MAX_ATTEMPTS(8) попыток verify по
+    # VERIFY_TIMEOUT_SECS(30) = до 28 мин только на верификацию, плюс листинг
+    # (быстрее — по одному вызову на стратегию). 45 мин — запас на
+    # checkout/pytest/guard сверх худшего случая.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Тесты discovery (без сети, фейковые transport/measure)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/measure/test_provider_model_discovery.py -q
+
+      - name: Гвардия дефолта провайдера/модели (класс #153) на новых файлах
+        run: bash scripts/lib/test/provider-default.guard.sh
+
+      - name: Discovery живых model id (NVIDIA NIM / Ollama Cloud / OpenRouter)
+        env:
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+        run: python scripts/measure/provider_model_discovery.py
+
   bench:
     runs-on: ubuntu-latest
     # Худший случай — КАЖДЫЙ кандидат уходит в таймаут (DEFAULT_TIMEOUT_SECS

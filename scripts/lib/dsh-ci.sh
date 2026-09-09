@@ -71,14 +71,25 @@ dsh_require_plugins_suite_repo() {
 # владелец расширяет ротацию добавлением секрета с этим именем, без правки
 # кода (одно место правды — этот список).
 # Формат: "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName"
+# Model id ниже (кроме zai-1, не менялся) подтверждены ЖИВЫМ discovery
+# (scripts/measure/provider_model_discovery.py, #848) 2026-09-09: листинг
+# /v1/models + живая верификация chat/completions (HTTP 200) на прогоне
+# provider-latency-bench.yml (run 34415529070). Прежние значения
+# (anthropic/claude-sonnet-4.6 у OpenRouter — платная модель не того тарифа;
+# qwen3-coder:480b-cloud у Ollama Cloud — 410 Gone; deepseek-ai/deepseek-v3.2
+# у NVIDIA NIM — 404) не были сверены с реальным каталогом при заведении
+# (#215) и не отвечали на completions-пути (живой замер #836, run
+# 34406807344). Дрейф версии у вендора — ожидаемый класс (см. комментарий у
+# CODING_RANK_KEYWORDS в discovery-скрипте) — при повторном 404/410 сначала
+# пере-сверить discovery, не переписывать id по памяти/примеру.
 PLUGINS_SUITE_CANDIDATE_ROUTES=(
-  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 1"
-  "openrouter-2|https://openrouter.ai/api/v1|OPENROUTER_2_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 2"
-  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 1"
-  "ollama-cloud-2|https://ollama.com/v1|OLLAMA_CLOUD_2_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 2"
-  "ollama-cloud-3|https://ollama.com/v1|OLLAMA_CLOUD_3_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 3"
-  "nvidia-nim-1|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_1_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 1"
-  "nvidia-nim-2|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_2_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 2"
+  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|nvidia/nemotron-3-super-120b-a12b:free|262144|OpenRouter account 1"
+  "openrouter-2|https://openrouter.ai/api/v1|OPENROUTER_2_API_KEY|nvidia/nemotron-3-super-120b-a12b:free|262144|OpenRouter account 2"
+  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 1"
+  "ollama-cloud-2|https://ollama.com/v1|OLLAMA_CLOUD_2_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 2"
+  "ollama-cloud-3|https://ollama.com/v1|OLLAMA_CLOUD_3_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 3"
+  "nvidia-nim-1|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_1_API_KEY|deepseek-ai/deepseek-v4-pro-0813|131072|NVIDIA NIM account 1"
+  "nvidia-nim-2|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_2_API_KEY|deepseek-ai/deepseek-v4-pro-0813|131072|NVIDIA NIM account 2"
   "zai-1|https://api.z.ai/api/coding/paas/v4|ZAI_1_API_KEY|glm-5|202752|Z.AI Coding Plan"
 )
 

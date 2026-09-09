@@ -268,11 +268,13 @@ def test_build_candidates_dedupes_by_base_url_model_secret_env():
 def test_real_repo_candidates_cover_full_owner_set_without_codex():
     names = {c["name"] for c in pl.PROVIDER_LATENCY_CANDIDATES}
     assert not any("codex" in n.lower() for n in names)
-    # NVIDIA-nano ИЗМЕРЯЕТСЯ (находка ревью #837, постановка #836 явно
-    # перечисляет его кандидатом) — даже подтверждённо мёртвый на генерацию
-    # (#798/#834), его "error"/"timeout" в таблице сам по себе факт.
-    assert "NVIDIA-nano" in names
-    assert len(pl.PROVIDER_LATENCY_CANDIDATES) >= 9  # боевая цепочка (3) + вся suite-таблица (8)
+    # NVIDIA-nano убран из боевой цепочки config/provider-usage.json (#849/
+    # #850, повторно подтверждён мёртвым на генерацию — #798/#834/#836) — этот
+    # тест раньше требовал его в кандидатах бенчмарка (находка ревью #837,
+    # постановка #836), но #850 не обновил эту стороннюю проверку, и она
+    # красная на main с момента слияния #850 (найдено этим PR, #848). Боевая
+    # цепочка сегодня — NVIDIA + GLM (2), суммарно с suite-таблицей (8).
+    assert len(pl.PROVIDER_LATENCY_CANDIDATES) >= 8
 
 
 def test_real_repo_candidates_no_paid_openrouter_model():
