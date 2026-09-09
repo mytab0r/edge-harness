@@ -207,11 +207,11 @@ def test_no_marker_leak_in_dry_run(monkeypatch, export_path, dsh_ci_path, capsys
 
     def _fake_probe(base_url, api_key):
         probe_calls.append(api_key)
-        return "жива"
+        return psi.ProbeOutcome(status="жива")
 
     monkeypatch.setattr(psi, "set_secret", _forbidden)
     monkeypatch.setattr(psi, "set_variable", _forbidden)
-    monkeypatch.setattr(psi, "probe_provider", _fake_probe)
+    monkeypatch.setattr(psi, "probe_provider_full", _fake_probe)
 
     rc = psi.main([
         "--export-file", str(export_path),
@@ -245,7 +245,7 @@ def test_no_marker_leak_in_dry_run_no_probe_flag(monkeypatch, export_path, dsh_c
 
     monkeypatch.setattr(psi, "set_secret", _forbidden)
     monkeypatch.setattr(psi, "set_variable", _forbidden)
-    monkeypatch.setattr(psi, "probe_provider", _forbidden)
+    monkeypatch.setattr(psi, "probe_provider_full", _forbidden)
 
     rc = psi.main([
         "--export-file", str(export_path),
@@ -275,6 +275,138 @@ def test_probe_provider_never_leaks_key_on_http_error(monkeypatch):
     status = psi.probe_provider("https://example.test", FIXTURE_MARKER)
     assert status == "ключ неверен"
     assert FIXTURE_MARKER not in status
+
+
+# ── parse_model_ids / probe_provider_full: печать id моделей, не тела ────
+# Задача «импортёр печатает доступные id моделей» — формат подтверждён живым
+# запросом ко всем четырём провайдерам suite (nvidia-nim, zai, ollama-cloud,
+# openrouter, 2026-09-09): везде dict {"data": [{"id": ..., ...}, ...]}.
+
+
+def test_parse_model_ids_openai_format():
+    body = json.dumps({
+        "object": "list",
+        "data": [
+            {"id": "vendor-model-b", "created": 1, "object": "model", "owned_by": "vendor"},
+            {"id": "vendor-model-a", "created": 1, "object": "model", "owned_by": "vendor"},
+        ],
+    }).encode()
+    assert psi.parse_model_ids("https://example.test/v4", body) == ["vendor-model-a", "vendor-model-b"]
+
+
+def test_parse_model_ids_ignores_extra_fields_like_openrouter():
+    """openrouter несёt лишние поля (pricing/context_length/…) — парсер
+    использует только 'id', остальное не читает и не падает на него."""
+    body = json.dumps({
+        "data": [
+            {"id": "amazon/nova-pro-v1", "pricing": {"prompt": "0.0008"}, "context_length": 300000},
+        ],
+        "links": {}, "total_count": 1,
+    }).encode()
+    assert psi.parse_model_ids("https://openrouter.ai/api/v1", body) == ["amazon/nova-pro-v1"]
+
+
+def test_parse_model_ids_dedupes_and_sorts():
+    body = json.dumps({"data": [{"id": "b"}, {"id": "a"}, {"id": "a"}]}).encode()
+    assert psi.parse_model_ids("https://example.test", body) == ["a", "b"]
+
+
+def test_parse_model_ids_unrecognized_top_level_fails_loud_without_values():
+    """Неузнанная структура — сообщение называет ТИП/КЛЮЧИ, не значения.
+    Маркер вписан как ЗНАЧЕНИЕ (не как имя ключа) — не должен просочиться."""
+    body = json.dumps({"unexpected_field": FIXTURE_MARKER, "another": 1}).encode()
+    with pytest.raises(psi.ModelListError) as excinfo:
+        psi.parse_model_ids("https://example.test", body)
+    message = str(excinfo.value)
+    assert FIXTURE_MARKER not in message
+    assert "unexpected_field" in message  # имя ключа — это структура, не значение
+    assert "dict" in message
+
+
+def test_parse_model_ids_unrecognized_item_shape_fails_loud_without_values():
+    body = json.dumps({"data": [{"weird_field": FIXTURE_MARKER}]}).encode()
+    with pytest.raises(psi.ModelListError) as excinfo:
+        psi.parse_model_ids("https://example.test", body)
+    message = str(excinfo.value)
+    assert FIXTURE_MARKER not in message
+    assert "weird_field" in message
+
+
+def test_parse_model_ids_not_json_fails_loud():
+    with pytest.raises(psi.ModelListError):
+        psi.parse_model_ids("https://example.test", b"not json at all")
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_probe_provider_full_success_extracts_models_without_leaking_key(monkeypatch):
+    """Ответ несёт маркер как значение НЕ-'id' поля (гипотетическое эхо
+    запроса в постороннем поле) — модели содержат только настоящие id,
+    маркер нигде не всплывает."""
+    body = json.dumps({
+        "data": [
+            {"id": "model-a", "description": FIXTURE_MARKER},
+            {"id": "model-b"},
+        ],
+    }).encode()
+
+    def _fake_urlopen(request, timeout=None):
+        assert FIXTURE_MARKER not in request.full_url
+        return _FakeResponse(200, body)
+
+    monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
+    outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
+    assert outcome.status == "жива"
+    assert outcome.models == ("model-a", "model-b")
+    assert outcome.models_error is None
+    assert FIXTURE_MARKER not in outcome.models
+    assert FIXTURE_MARKER not in (outcome.models_error or "")
+
+
+def test_probe_provider_full_malformed_body_error_names_structure_not_values(monkeypatch):
+    body = json.dumps({"weird_top_level": FIXTURE_MARKER}).encode()
+
+    def _fake_urlopen(request, timeout=None):
+        return _FakeResponse(200, body)
+
+    monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
+    outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
+    assert outcome.status == "жива"  # HTTP 200 — статус жив, модели просто не разобрались
+    assert outcome.models is None
+    assert outcome.models_error is not None
+    assert FIXTURE_MARKER not in outcome.models_error
+    assert "weird_top_level" in outcome.models_error
+
+
+def test_probe_provider_full_never_leaks_key_or_auth_header_on_success(monkeypatch):
+    """Request собирается из base_url/api_key — сам ключ никогда не читается
+    обратно из request в вывод (ProbeOutcome не хранит ни headers, ни ключ)."""
+    body = json.dumps({"data": [{"id": "m"}]}).encode()
+    captured_requests: list = []
+
+    def _fake_urlopen(request, timeout=None):
+        captured_requests.append(request)
+        return _FakeResponse(200, body)
+
+    monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
+    outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
+    assert captured_requests[0].get_header("Authorization") == f"Bearer {FIXTURE_MARKER}"
+    # ProbeOutcome — единственное, что уходит наружу из этой функции.
+    rendered = f"{outcome.status} {outcome.models} {outcome.models_error}"
+    assert FIXTURE_MARKER not in rendered
 
 
 # ── Ранг: квота (429/backoff) — НЕ дисквалификация, ключ неверен — да ────
@@ -381,6 +513,27 @@ def test_render_report_shows_export_date_and_rank_source(monkeypatch, export_pat
     assert "источник: снимок" in report
 
 
+def test_render_report_shows_models_section_by_secret(monkeypatch, export_path, dsh_ci_path):
+    data = psi.load_export(str(export_path))
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    accounts = psi.accounts_from_export(data)
+    probe_results = {a.id: "жива" for a in accounts if a.provider in ("openrouter", "nvidia", "glm")}
+    selection = psi.select_accounts(accounts, routes, probe_results=probe_results)
+    probe_outcomes = {
+        a.id: psi.ProbeOutcome(status="жива", models=("model-x", "model-y"))
+        for a in accounts if a.id in probe_results
+    }
+    report = psi.render_report(
+        selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)", probe_outcomes,
+    )
+    assert "Доступные id моделей" in report
+    assert "NVIDIA_NIM_1_API_KEY" in report
+    assert "model-x" in report and "model-y" in report
+    for account in accounts:
+        if account.api_key:
+            assert account.api_key not in report
+
+
 # ── argv без значений (доказано мутацией на уровне вызова gh) ────────────
 
 
@@ -433,7 +586,7 @@ def test_idempotent_skip_existing_secret_without_force(monkeypatch, export_path,
     set_secret_calls = []
     monkeypatch.setattr(psi, "set_secret", lambda repo, name, value: set_secret_calls.append(name))
     monkeypatch.setattr(psi, "set_variable", lambda repo, name, value: None)
-    monkeypatch.setattr(psi, "probe_provider", lambda base_url, value: "жива")
+    monkeypatch.setattr(psi, "probe_provider_full", lambda base_url, value: psi.ProbeOutcome(status="жива"))
 
     rc = psi.main([
         "--export-file", str(export_path),
