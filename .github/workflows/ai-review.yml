@@ -455,7 +455,8 @@ jobs:
           # идёт через цепочку провайдеров выше, а suite с ней конструктивно
           # не совместим (design.md dsh-in-job, «Стык suite и цепочки
           # провайдеров», scripts/review/ai_dsh.sh). Ротация учёток остаётся
-          # уделом worker.yml/hands.yml, где цепочки нет.
+          # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
+          # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
