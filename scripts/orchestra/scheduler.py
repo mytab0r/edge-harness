@@ -186,6 +186,7 @@ from pulse_guard import (
     AI_REVIEW_QUOTA_MARKER,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
+    CONFLICT_BUDGET_RESET_MARKER,
     CONFLICT_ESCALATION_MARKER,
     CONFLICT_REWORK_MARKER,
     CONFLICT_REWORK_MAX_ATTEMPTS,
@@ -692,10 +693,27 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     метки/события — 0 (не «неизвестно считаем исчерпанным»: PR остаётся
     доступным для дальнейшей обработки, смотри также docstring
     dispatch_conflict_rework — ниже эта же величина участвует в решении на
-    равных с worker_runs_active)."""
+    равных с worker_runs_active).
+
+    Сброс бюджета (issue #822, авария #794): CONFLICT_BUDGET_RESET_MARKER в
+    комментариях той же ЗАДАЧИ (второй канал чтения не заводится — тот же
+    all_issue_comments(task_number), что уже читается ниже) сдвигает границу
+    отсчёта вперёд на момент своей последней публикации — max(), а не min()
+    (симметрично conflict_first_labeled_at выше: та граница лифтайм-, эта её
+    осознанно СМЕЩАЕТ по решению владельца, не отменяет). Маркера нет —
+    поведение не меняется вовсе (since остаётся conflict_first_labeled_at).
+    Идемпотентность — по конструкции issue_marker_times: несколько маркеров
+    сброса берутся max()'ом времени, не суммируются в накопленный сдвиг;
+    попытки ДО эффективной границы (в т.ч. настоящие пост-аварийные, если
+    маркер сброса опубликован задним числом ошибочно) этой функцией не
+    просто игнорируются — они и есть то, что маркер обязан выкинуть из
+    подсчёта, это и есть его смысл."""
     since = conflict_first_labeled_at(repo, pr_number)
     if since is None:
         return 0
+    reset_times = issue_marker_times(repo, task_number, CONFLICT_BUDGET_RESET_MARKER)
+    if reset_times:
+        since = max(since, max(reset_times))
     git_step_run = re.compile(
         rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
     )
