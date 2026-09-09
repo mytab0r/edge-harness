@@ -188,6 +188,20 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_do_rows_read.py -q
 
+      # Бенчмарк латентности провайдеров (#836) и discovery живых model id
+      # (#848) — раньше эти тесты гонял ТОЛЬКО ручной provider-latency-bench.yml
+      # (workflow_dispatch), ни один push/PR их не проверял: живая цена — #850
+      # изменил config/provider-usage.json и сломал
+      # test_real_repo_candidates_cover_full_owner_set_without_codex, но ни
+      # один обязательный гейт этого не заметил (найдено этим PR, #848).
+      # Добавлено сюда, чтобы дрейф между provider-usage.json/dsh-ci.sh и
+      # структурными тестами этих файлов был виден на каждом PR, не только
+      # при ручном запуске бенчмарка.
+      - name: Тесты бенчмарка латентности и discovery model id провайдеров
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_provider_latency.py scripts/measure/test_provider_model_discovery.py -q
+
       # Гвардия класса «неограниченный агрегат на горячем пути DO» (#320/#321/
       # #575): #status() зовётся на каждый heartbeat/батч событий/сообщение
       # инбокса/callback — GROUP BY по всей таблице там обязан идти только
@@ -562,6 +576,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
+      # Реестр использования LLM-провайдеров (#823, openspec/changes/
+      # llm-provider-usage-manifest): docs/agents/LLM-PROVIDER-USAGE.md не
+      # хардкодит назначения — scripts/lib/collect_provider_usage.py
+      # собирает их из config/provider-usage.json. Три мутации — пропавшая
+      # строка, лишняя строка, расхождение содержимого с генератором.
+      - name: Гвардия реестра использования LLM-провайдеров — таблица видимости
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_provider_usage_registry.py -q
+
       # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
       # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
       # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
@@ -571,6 +595,15 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_infra_gh_inventory.py -q
+
+      # Класс #83/#842: `dsh plugin add` без pnpm на PATH падает
+      # («pnpm not found on PATH»). Закрыт один раз для hands.yml (#83, PR
+      # #93/#94), не распространён на ai-review.yml, когда #838 добавил тот
+      # же вызов туда — ai-review.yml падал на КАЖДОМ прогоне (issue #842).
+      - name: Гвардия pnpm для dsh plugin add (класс #83/#842)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dsh_plugin_pnpm_guard.py -q
 
       # Канарейка класса «осиротевший тест» (#583): PR #568 слил
       # scripts/lib/test_duplicate_guard.py (семь тестов гвардии дублей issue)
@@ -931,6 +964,24 @@ jobs:
       # приоритет; внутри цикла цепочки suite всегда глушится плоским патчем.
       - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
         run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
+
+      # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — независимо от
+      # suite/PLUGINS_SUITE_URL: без секретов пул не подключается (сеть не
+      # трогается), импорт секрета прод-кодом плагина кладёт корректный файл
+      # аккаунта И вычищает секрет из окружения (доверенная граница ai-review,
+      # #18 — ANTHROPIC_OAUTH_1/2 не подпадают под паттерн вырезания *_KEY/
+      # *_TOKEN/*_SECRET), пул первым/цепочка фоллбэком не ломает атрибуцию.
+      - name: Гвардия быстрого провайдера Claude anthropic-oauth-pool (#838)
+        run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
+
+      # Манифест использования LLM-провайдеров (#823, openspec/changes/
+      # llm-provider-usage-manifest): dsh_require_provider_chain "<id>"
+      # резолвит цепочку из config/provider-usage.json по id потребителя
+      # приоритетнее vars.DSH_PROVIDER_CHAIN — файла нет вовсе, есть, но нет
+      # записи потребителя, ссылка на несуществующую/пустую цепочку — три
+      # разных сценария, каждый доказан отдельной мутацией.
+      - name: Гвардия манифеста использования LLM-провайдеров (#823)
+        run: bash scripts/lib/test/dsh-provider-usage-manifest.guard.sh
 
       # Гвардия #789: окно контекста env-provider-маршрута combo-router
       # обязано читаться из vars.DSH_EDGE_MODEL_CATALOG (реальное окно

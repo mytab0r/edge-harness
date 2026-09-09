@@ -407,6 +407,14 @@ jobs:
         with:
           node-version: 24
 
+      # pnpm нужен dsh plugin add (монтаж anthropic-oauth-pool, #838, тот же
+      # класс, что #83 — dsh plugin add без pnpm падает; шаг уже есть у
+      # worker.yml/hands.yml, здесь был пропущен — issue #842).
+      - if: steps.fingerprint.outputs.go == 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
       - if: steps.fingerprint.outputs.go == 'true'
         id: gather
         name: Сбор фактов и промпт (доверенный шаг)
@@ -444,6 +452,14 @@ jobs:
           # активный секрет для ручного переключения, другая задача).
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
           # Упорядоченный список провайдеров — ОДНО место правды,
           # vars.DSH_PROVIDER_CHAIN (JSON-массив, #727): base_url/model/
           # secret_env выставляет dsh_run_with_provider_chain на каждую
@@ -457,6 +473,17 @@ jobs:
           # провайдеров», scripts/review/ai_dsh.sh). Ротация учёток остаётся
           # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
           # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
+          #
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ
+          # от suite случай, протокольно не конфликтует с цепочкой (design.md
+          # anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»):
+          # пробуется ПОСЛЕДОВАТЕЛЬНО перед ней, не заменяя. JSON
+          # credentials.json целиком в значении секрета (AGENTS.md
+          # «Секреты» — значение никогда не печатается). Оба пусты →
+          # dsh_install_anthropic_pool печатает «не подключён», шаг идёт как
+          # раньше (только цепочка).
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"

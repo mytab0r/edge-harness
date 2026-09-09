@@ -10,5 +10,23 @@
     "model_sha256": "ad7decc9ae94df12e3be96dca0c8734cc7cde8fd5d70a2b94ab8ea6154959633",
     "confirmed_at": "2026-09-08",
     "evidence": "владелец подтвердил id провайдера NVIDIA живым запросом к каталогу моделей (см. docs/runbooks/switch-llm-provider.md, «Узнать точный id модели», #737) — заменяет неподтверждённый предыдущий id, вписанный 2026-09-08T04:38:51Z без сверки и давший 37 минут молчания (прогон 34188152283)."
+  },
+  {
+    "name": "NVIDIA NIM",
+    "model_sha256": "c7cbb1a7639bd2a6a40536dd1dad4d0f813342ef5bfabcf443beb677bf1a904c",
+    "confirmed_at": "2026-09-09",
+    "evidence": "deepseek-ai/deepseek-v4-pro-0813 — discovery #848 (scripts/measure/provider_model_discovery.py): найден листингом /v1/models на NVIDIA_NIM_1/2_API_KEY, подтверждён живым chat/completions (HTTP 200 на обоих ключах, run 34415529070). Прежний id (deepseek-ai/deepseek-v3.2, вписан при заведении #215 из примера combo-router без сверки) давал 404 (живой замер #836, run 34406807344)."
+  },
+  {
+    "name": "Ollama Cloud",
+    "model_sha256": "0b3a2f8a5a25e11f566638576dd40401c323213ab37684c552ddb80be177abd2",
+    "confirmed_at": "2026-09-09",
+    "evidence": "nemotron-3-ultra — discovery #848: листинг /v1/models на всех трёх OLLAMA_CLOUD_*_API_KEY, подтверждён живым chat/completions (HTTP 200 на всех трёх ключах, run 34415529070). Прежний id (qwen3-coder:480b-cloud, тот же класс — вписан из примера combo-router без сверки) давал 410 Gone (#836, run 34406807344)."
+  },
+  {
+    "name": "OpenRouter",
+    "model_sha256": "0436b9db204f5bf4b3d0be441d228026b9b537d6dcd53918718de727249ba465",
+    "confirmed_at": "2026-09-09",
+    "evidence": "nvidia/nemotron-3-super-120b-a12b:free — discovery #848: листинг публичного /v1/models OpenRouter, отфильтрован free-тариф (pricing.prompt==0 и completion==0), подтверждён живым chat/completions (HTTP 200 на обоих OPENROUTER_*_API_KEY, run 34415529070). Прежний id (deepseek/deepseek-r1:free — угадан по шаблону суффикса ':free', не сверен с каталогом) давал 404 (#836, run 34406807344)."
   }
 ]

@@ -107,13 +107,16 @@ if [ -n "$TASK_INPUT" ]; then
   case "$TASK_INPUT" in *[!0-9]*) die "номер задачи должен быть числом: '$TASK_INPUT'" ;; esac
 fi
 
-# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727/#797):
-# зашитого списка провайдеров в коде нет. Проверяем раньше дупгарда/
-# назначения/ветки/сессии морды — падать сразу, а не после дорогой
-# подготовительной работы. Пропускаем при --dry-run: самотест печатает выбор
-# и промпт без реального вызова модели, требовать цепочку здесь незачем.
+# Цепочка приходит из манифеста использования (openspec/changes/
+# llm-provider-usage-manifest, config/provider-usage.json, потребитель
+# "worker") — dsh_require_provider_chain резолвит её по id ПЕРЕД обычной
+# валидацией; манифеста нет вовсе — фоллбэк на vars.DSH_PROVIDER_CHAIN
+# (#727/#797) как раньше. Проверяем раньше дупгарда/назначения/ветки/сессии
+# морды — падать сразу, а не после дорогой подготовительной работы.
+# Пропускаем при --dry-run: самотест печатает выбор и промпт без реального
+# вызова модели, требовать цепочку здесь незачем.
 if [ "$DRY_RUN" != "1" ]; then
-  dsh_require_provider_chain || die "провайдер не сконфигурирован (см. ::error:: выше)"
+  dsh_require_provider_chain "worker" || die "провайдер не сконфигурирован (см. ::error:: выше)"
 fi
 
 # Гвардия дублей прогонов: если живёт ДРУГОЙ прогон воркера — активный или
@@ -469,6 +472,10 @@ echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 dsh_install "$WORK/pkgs"
 dsh --version || true
 dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
+# Быстрый провайдер Claude (#838) — независимо от suite выше, гейт: секреты
+# ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL. Импорт — до первого dsh.
+dsh_install_anthropic_pool "$WORK/anthropic-pool" || die "быстрый провайдер Claude не установился (см. ::error:: выше, #838)"
+dsh_import_anthropic_accounts || die "импорт аккаунтов Claude не удался (см. ::error:: выше, #838)"
 # Затравка профиля первым провайдером цепочки (chain[0]) — ОБЯЗАНА случиться
 # ДО первого `dsh` этого прогона (dsh plugin add, шаг 6b ниже): «initProfile
 # пишет package.json/cordis.patch.yml/pnpm-workspace.yaml только при
@@ -490,6 +497,7 @@ DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
 export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
 DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
 dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
+dsh_mount_anthropic_pool headless || die "быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)"
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
@@ -531,7 +539,7 @@ WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$WORKER_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_provider_chain "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
+  dsh_run_with_pool_then_chain "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
 rc=$DSH_RUN_RC
 WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
