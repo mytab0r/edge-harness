@@ -1,9 +1,11 @@
-"""Гвардия scripts/lib/provider_secrets_import.py (задача #733) — СИНТЕТИЧЕСКИЕ
-фикстуры, никаких настоящих кредов. Проверяет: разбор контракта имён (PR #732)
-из dsh-ci.sh, разбор формата экспорта, отказ при файле внутри рабочего дерева,
-отсутствие значений в выводе (маркер фикстуры не встречается нигде), выбор
-слотов по правилу isActive/testStatus/priority, идемпотентность, argv без
-значений секрета.
+"""Гвардия scripts/lib/provider_secrets_import.py (задача #733, #777) —
+СИНТЕТИЧЕСКИЕ фикстуры, никаких настоящих кредов. Проверяет: разбор контракта
+имён (PR #732) из dsh-ci.sh, разбор формата экспорта, отказ при файле внутри
+рабочего дерева, отсутствие значений в выводе (маркер фикстуры не встречается
+нигде — ни в stdout/stderr, ни в теле ошибки живой пробы), выбор слотов по
+ДВУМ РАЗНЫМ осям ранга (квота/backoff — не дисквалификация; ключ неверен —
+дисквалификация), живая проба доступна и в сухом прогоне, идемпотентность,
+argv без значений секрета.
 
 Запуск: python -m pytest scripts/lib/test_provider_secrets_import.py -q
 """
@@ -39,7 +41,10 @@ echo "нет никакого контракта имён здесь"
 """
 
 
-def _account(provider, priority, is_active, test_status, api_key, email="acct@example.test"):
+def _account(
+    provider, priority, is_active, test_status, api_key,
+    email="acct@example.test", error_code=None, backoff_level=0,
+):
     return {
         "id": f"{provider}-{priority}",
         "provider": provider,
@@ -48,8 +53,9 @@ def _account(provider, priority, is_active, test_status, api_key, email="acct@ex
         "priority": priority,
         "isActive": is_active,
         "testStatus": test_status,
-        "backoffLevel": 0,
+        "backoffLevel": backoff_level,
         "lastError": "",
+        "errorCode": error_code,
         "apiKey": api_key,
     }
 
@@ -187,12 +193,55 @@ def test_select_accounts_ranking_overflow_out_of_scope(export_path, dsh_ci_path)
 
 
 def test_no_marker_leak_in_dry_run(monkeypatch, export_path, dsh_ci_path, capsys):
+    """Задача #777: живая проба теперь ЗОВЁТСЯ и в сухом прогоне (кандидатов
+    на слоты suite) — но по-прежнему НИЧЕГО не пишет и не светит значение
+    (маркер) ни в stdout/stderr, ни в файлах."""
     monkeypatch.setattr(psi, "gh_repo", lambda explicit: "owner/repo")
     monkeypatch.setattr(psi, "existing_secret_names", lambda repo: set())
     monkeypatch.setattr(psi, "existing_variable_names", lambda repo: set())
 
     def _forbidden(*args, **kwargs):
-        raise AssertionError("сухой прогон не должен звать set_secret/set_variable/probe_provider")
+        raise AssertionError("сухой прогон не должен звать set_secret/set_variable")
+
+    probe_calls: list[str] = []
+
+    def _fake_probe(base_url, api_key):
+        probe_calls.append(api_key)
+        return "жива"
+
+    monkeypatch.setattr(psi, "set_secret", _forbidden)
+    monkeypatch.setattr(psi, "set_variable", _forbidden)
+    monkeypatch.setattr(psi, "probe_provider", _fake_probe)
+
+    rc = psi.main([
+        "--export-file", str(export_path),
+        "--dsh-ci-path", str(dsh_ci_path),
+    ])
+    assert rc == 0
+    # Проба реально позвана в сухом прогоне (задача #777, критерий 2) — иначе
+    # этот тест не отличил бы «пробу выключили» от «пробы нет вовсе».
+    assert probe_calls
+    captured = capsys.readouterr()
+    assert FIXTURE_MARKER not in captured.out
+    assert FIXTURE_MARKER not in captured.err
+    for marker_containing_call in probe_calls:
+        assert FIXTURE_MARKER in marker_containing_call  # проба реально получила ключ
+    # Ничего не записано ни в один файл — только в tmp_path созданное самим тестом.
+    for path in export_path.parent.rglob("*"):
+        if path in (export_path, dsh_ci_path) or path.is_dir():
+            continue
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        assert FIXTURE_MARKER not in content
+
+
+def test_no_marker_leak_in_dry_run_no_probe_flag(monkeypatch, export_path, dsh_ci_path, capsys):
+    """--no-probe по-прежнему отключает пробу целиком (не только запись)."""
+    monkeypatch.setattr(psi, "gh_repo", lambda explicit: "owner/repo")
+    monkeypatch.setattr(psi, "existing_secret_names", lambda repo: set())
+    monkeypatch.setattr(psi, "existing_variable_names", lambda repo: set())
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("--no-probe не должен звать ни set_secret/set_variable, ни probe_provider")
 
     monkeypatch.setattr(psi, "set_secret", _forbidden)
     monkeypatch.setattr(psi, "set_variable", _forbidden)
@@ -201,17 +250,135 @@ def test_no_marker_leak_in_dry_run(monkeypatch, export_path, dsh_ci_path, capsys
     rc = psi.main([
         "--export-file", str(export_path),
         "--dsh-ci-path", str(dsh_ci_path),
+        "--no-probe",
     ])
     assert rc == 0
     captured = capsys.readouterr()
     assert FIXTURE_MARKER not in captured.out
     assert FIXTURE_MARKER not in captured.err
-    # Ничего не записано ни в один файл — только в tmp_path созданное самим тестом.
-    for path in export_path.parent.rglob("*"):
-        if path in (export_path, dsh_ci_path) or path.is_dir():
-            continue
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        assert FIXTURE_MARKER not in content
+
+
+def test_probe_provider_never_leaks_key_on_http_error(monkeypatch):
+    """Задача #777, критерий 6: даже если провайдер вернёт ошибку, чьё тело
+    содержит подстроку ключа (гипотетическое эхо), probe_provider не читает
+    msg/тело — читает только error.code. Мутация: если когда-нибудь код
+    начнёт возвращать str(error) целиком, этот тест покраснеет."""
+    import urllib.error
+
+    def _raise_http_error(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://example.test/models", 401,
+            f"unauthorized: your key {FIXTURE_MARKER} is invalid", {}, None,
+        )
+
+    monkeypatch.setattr(psi.urllib.request, "urlopen", _raise_http_error)
+    status = psi.probe_provider("https://example.test", FIXTURE_MARKER)
+    assert status == "ключ неверен"
+    assert FIXTURE_MARKER not in status
+
+
+# ── Ранг: квота (429/backoff) — НЕ дисквалификация, ключ неверен — да ────
+# Задача #777, критерий 7 — все четыре сценария по мутации: закомментируй
+# приоритет tier снимка/пробы в rank_account/classify_* — эти тесты краснеют.
+
+
+def _accounts_from_dicts(dicts):
+    return psi.accounts_from_export({"providerConnections": dicts})
+
+
+def test_classify_snapshot_quota_not_worse_than_unknown_but_not_disqualified():
+    healthy = _accounts_from_dicts([
+        _account("openrouter", 1, True, "active", "k1"),
+    ])[0]
+    quota = _accounts_from_dicts([
+        _account("openrouter", 2, False, "unavailable", "k2", error_code=429),
+    ])[0]
+    invalid_key = _accounts_from_dicts([
+        _account("openrouter", 3, False, "unavailable", "k3", error_code=401),
+    ])[0]
+    tier_healthy, _ = psi.classify_snapshot(healthy)
+    tier_quota, note_quota = psi.classify_snapshot(quota)
+    tier_invalid, note_invalid = psi.classify_snapshot(invalid_key)
+    assert tier_healthy < tier_quota < tier_invalid
+    assert "дисквалификация" in note_quota or "не дисквалификация" in note_quota
+    assert "ключ неверен" in note_invalid
+
+
+def test_live_probe_alive_beats_snapshot_active_probed_401(dsh_ci_path):
+    """isActive=False/testStatus=unavailable, но живая проба 200 — обязана
+    подняться выше учётки с testStatus=active, чья живая проба даёт 401."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    stale_but_alive, confirmed_dead = _accounts_from_dicts([
+        _account("openrouter", 1, False, "unavailable", "k-stale", error_code=429),
+        _account("openrouter", 2, True, "active", "k-active"),
+    ])
+    probe_results = {
+        stale_but_alive.id: "жива",
+        confirmed_dead.id: "ключ неверен",
+    }
+    selection = psi.select_accounts(
+        [stale_but_alive, confirmed_dead], routes, probe_results=probe_results,
+    )
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["OPENROUTER_1_API_KEY"].account.api_key == "k-stale"
+    # confirmed_dead исключён живой пробой из слота, не занимает второй слот молча.
+    assert by_secret["OPENROUTER_2_API_KEY"].account is None
+    assert by_secret["OPENROUTER_2_API_KEY"].empty_reason is not None
+    assert "ключ неверен" in by_secret["OPENROUTER_2_API_KEY"].empty_reason
+
+
+def test_live_probe_quota_beats_live_probe_invalid_key(dsh_ci_path):
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    quota_acc, dead_acc = _accounts_from_dicts([
+        _account("openrouter", 1, True, "unavailable", "k-quota"),
+        _account("openrouter", 2, True, "unavailable", "k-dead"),
+    ])
+    probe_results = {quota_acc.id: "квота исчерпана", dead_acc.id: "ключ неверен"}
+    selection = psi.select_accounts([quota_acc, dead_acc], routes, probe_results=probe_results)
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["OPENROUTER_1_API_KEY"].account.api_key == "k-quota"
+    assert by_secret["OPENROUTER_2_API_KEY"].account is None
+    assert dead_acc in selection.probe_excluded
+
+
+def test_probe_unreachable_falls_back_to_snapshot_and_says_so(dsh_ci_path):
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    (acc,) = _accounts_from_dicts([
+        _account("openrouter", 1, True, "active", "k1"),
+    ])
+    probe_results = {acc.id: "неизвестно (сеть: [Errno -2] Name or service not known)"}
+    selection = psi.select_accounts([acc], routes, probe_results=probe_results)
+    tier, note, source = selection.rank_by_id[acc.id]
+    assert source == "снимок"
+    assert "проба недоступна по сети" in note
+    assert tier == psi._TIER_HEALTHY
+
+
+def test_all_candidates_dead_by_probe_leaves_slot_empty_with_reason(dsh_ci_path):
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    (glm_acc,) = _accounts_from_dicts([
+        _account("glm", 1, False, "unavailable", "k-dead-glm"),
+    ])
+    probe_results = {glm_acc.id: "ключ неверен"}
+    selection = psi.select_accounts([glm_acc], routes, probe_results=probe_results)
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["ZAI_1_API_KEY"].account is None
+    assert by_secret["ZAI_1_API_KEY"].empty_reason is not None
+    assert "1 кандидат" in by_secret["ZAI_1_API_KEY"].empty_reason
+    assert "ключ неверен" in by_secret["ZAI_1_API_KEY"].empty_reason
+    assert glm_acc in selection.probe_excluded
+    assert len(selection.overflow) == 0
+
+
+def test_render_report_shows_export_date_and_rank_source(monkeypatch, export_path, dsh_ci_path):
+    data = psi.load_export(str(export_path))
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    accounts = psi.accounts_from_export(data)
+    selection = psi.select_accounts(accounts, routes)
+    report = psi.render_report(selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)")
+    assert "2026-08-25" in report
+    assert "ПРЕДОХРАНИТЕЛЯ" in report
+    assert "источник: снимок" in report
 
 
 # ── argv без значений (доказано мутацией на уровне вызова gh) ────────────
@@ -236,6 +403,23 @@ def test_set_secret_value_never_in_argv(monkeypatch):
     assert FIXTURE_MARKER not in args
     assert stdin_value == FIXTURE_MARKER
     assert "--body-file" in args and "-" in args
+
+
+# ── export_snapshot_date: дата снимка предохранителя ─────────────────────
+
+
+def test_export_snapshot_date_from_filename(tmp_path):
+    path = tmp_path / "some-export-2026-08-25T12-48-15-414Z.json"
+    path.write_text("{}", encoding="utf-8")
+    assert "2026-08-25" in psi.export_snapshot_date(path)
+    assert "имени файла" in psi.export_snapshot_date(path)
+
+
+def test_export_snapshot_date_falls_back_to_mtime(tmp_path):
+    path = tmp_path / "export-without-date.json"
+    path.write_text("{}", encoding="utf-8")
+    result = psi.export_snapshot_date(path)
+    assert "mtime" in result
 
 
 # ── Идемпотентность: существующий секрет не перезаписывается без флага ──
