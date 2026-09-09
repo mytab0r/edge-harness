@@ -480,14 +480,29 @@ def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
     это больше не бага) — total > in_epoch означает «часть попыток осталась в
     архиве прошлых эпох, текущая эпоха их не наследует»: живой случай
     #329/#327, 2026-09-06, issue #472, где total уже был равен лимиту, а
-    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет»."""
+    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет».
+
+    held_back_by_run — третье состояние (#779, блокирующая 3): бюджет ещё
+    есть (attempts_in_epoch < лимита), но scheduler.trigger_ai_review САМ
+    придерживает автоповтор, потому что прогон ai-review.yml для этого PR
+    прямо сейчас летит (та же review_labels.other_active_ai_review_runs, что
+    читает газ #196 перед диспатчем, #779 разрыв 2 — третьей копии предиката
+    не заводим). До этого поля stuck_gate_fact_line писала «должен сработать
+    на ближайшем тике оркестратора» безусловно — после #779 это стало ложным
+    именно в этом состоянии: тик видит летящий прогон и делает continue, не
+    трогая бюджет, а инвариант 3 (единственная страховка, которая ещё
+    смотрит на это состояние) утверждал бы человеку неверное — тот самый
+    класс #472, который эта строка была написана закрыть."""
     attempt_times = sorted(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
     attempts_in_epoch = sum(1 for moment in attempt_times if moment >= anchor)
+    active = review_labels.other_active_ai_review_runs(
+        repo, pr_number, exclude_run_id=None, gh_func=gh)
     return {
         "attempts_total": len(attempt_times),
         "attempts_in_epoch": attempts_in_epoch,
         "attempts_limit": AI_REVIEW_MAX_ATTEMPTS,
         "last_attempt_at": attempt_times[-1].isoformat() if attempt_times else None,
+        "held_back_by_run": active[0]["id"] if active else None,
     }
 
 
@@ -603,14 +618,43 @@ def stuck_gate_fact_line(item: dict) -> str:
     API (логи прогона) на КАЖДЫЙ застрявший PR каждые 15 минут — новый,
     дорогой класс вызовов, который эта задача сознательно не заводит (см.
     issue #472, экономия квоты GitHub API — она же сегодня отжирала себя у
-    чужих обязательных проверок)."""
+    чужих обязательных проверок).
+
+    Третье состояние budget (#779, блокирующая 3): бюджет ещё есть, но
+    `held_back_by_run` (retry_budget_fact) называет прогон ai-review.yml,
+    который сейчас летит и придерживает автоповтор — «должен сработать на
+    ближайшем тике»/«должен сработать сам» здесь были бы неверны (тик видит
+    занятость и делает continue, не трогая бюджет). Проверка `held_back_by_run`
+    обязана стоять в ОБЕИХ ветках, где бюджет ещё не исчерпан — `total < limit`
+    и сестринской `total >= limit and in_epoch < limit` (перенос попыток из
+    прошлой, уже решённой эпохи, #431/issue #472) — иначе вторая ветка молча
+    остаётся с прежней ложью ровно того же класса #472, который эта строка
+    была написана закрыть (живой случай #472/#329/#327: total уже был равен
+    лимиту, in_epoch — 0)."""
     total = item["attempts_total"]
     in_epoch = item["attempts_in_epoch"]
     limit = item["attempts_limit"]
+    held_back_by_run = item.get("held_back_by_run")
     if total < limit:
-        budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
+        if held_back_by_run is not None:
+            budget = (
+                f"есть ({total}/{limit}), но автоповтор придержан летящим прогоном "
+                f"run {held_back_by_run} — сработает сам, когда тот освободится"
+            )
+        else:
+            budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
     elif in_epoch >= limit:
         budget = f"исчерпан в этой же эпохе ({total}/{limit})"
+    elif held_back_by_run is not None:
+        # total >= limit, in_epoch < limit, но летит прогон — тот же перенос
+        # бюджета из прошлой эпохи (см. else ниже), только с придержанным
+        # автоповтором: «должен сработать сам» здесь тоже было бы ложью.
+        budget = (
+            f"попытки только в прошлых эпохах ({total}/{limit} за всю историю), "
+            f"в текущей бюджет есть ({in_epoch}/{limit}), но автоповтор придержан "
+            f"летящим прогоном run {held_back_by_run} — сработает сам, когда тот "
+            "освободится"
+        )
     else:
         # total >= limit, но in_epoch < limit: попытки только в прошлых,
         # уже решённых эпохах (#431 — бюджет НЕ переносится между эпохами по

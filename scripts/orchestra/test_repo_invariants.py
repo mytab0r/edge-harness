@@ -175,10 +175,19 @@ def test_reopened_after_merge_still_flags_task_never_verdicted(monkeypatch):
 
 class FakeGh:
     """Тот же маршрутизатор, что test_scheduler.py::FakeGh — подстрока пути
-    → прод-форма ответа; фиксирует вызовы для гвардии холостого хода."""
+    → прод-форма ответа; фиксирует вызовы для гвардии холостого хода.
+
+    Запасной маршрут для занятости ai-review.yml (review_labels.other_active_
+    ai_review_runs, #779 блокирующая 3: retry_budget_fact теперь спрашивает
+    её же для held_back_by_run) — тот же приём, что test_scheduler.py::
+    FakeGh._DEFAULT_ROUTES: без него КАЖДЫЙ существующий тест
+    check_stuck_review_gate/check_ai_failed_budget_exhausted был бы обязан
+    завести собственную строку «нет активных прогонов», хотя сама занятость
+    ai-review.yml не их предмет."""
+    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
 
     def __init__(self, routes):
-        self.routes = routes
+        self.routes = {**self._DEFAULT_ROUTES, **routes}
         self.calls = []
 
     def __call__(self, *args):
@@ -576,6 +585,96 @@ def test_stuck_gate_fact_line_budget_not_exhausted():
     line = ri.stuck_gate_fact_line(item)
     assert "не исчерпан (1/3)" in line
     assert "ближайшем тике" in line
+
+
+# ── #779, блокирующая 3: третье состояние — бюджет есть, но летящий прогон
+# придерживает автоповтор (класс #472 — алерт не гадает и не утверждает
+# неверное) ──────────────────────────────────────────────────────────────
+
+def test_stuck_gate_fact_line_budget_held_back_by_active_run():
+    # Мутация: убери ветку held_back_by_run из stuck_gate_fact_line — этот
+    # тест обязан покраснеть (текст вернётся к «должен сработать на ближайшем
+    # тике», ложному в этом состоянии после #779).
+    item = {
+        "pr": 3, "age_minutes": 150.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 0, "attempts_in_epoch": 0, "attempts_limit": 3,
+        "last_attempt_at": None, "verdict_ever": None, "held_back_by_run": 34278765696,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "есть (0/3)" in line
+    assert "34278765696" in line
+    assert "придержан летящим прогоном" in line
+    assert "ближайшем тике" not in line  # не путать с безусловным «сработает сам»
+
+
+def test_stuck_gate_fact_line_budget_carried_over_and_held_back_by_active_run():
+    # Сестринская ветка (#472/#329/#327: total>=limit, in_epoch<limit —
+    # попытки только в прошлых эпохах, текущей эпохе есть свежий бюджет) с
+    # летящим прогоном одновременно. До фикса held_back_by_run проверялся
+    # ТОЛЬКО в ветке total<limit — здесь текст молча возвращался к «должен
+    # сработать сам», хотя тик увидит занятость и сделает continue, не трогая
+    # бюджет: та же ложь класса #472, только во второй ветке. Мутация: убери
+    # проверку held_back_by_run из этой ветки — тест обязан покраснеть.
+    item = {
+        "pr": 4, "age_minutes": 200.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 3, "attempts_in_epoch": 0, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+        "held_back_by_run": 34278765696,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "попытки только в прошлых эпохах (3/3" in line
+    assert "в текущей бюджет есть (0/3)" in line
+    assert "придержан летящим прогоном run 34278765696" in line
+    assert "должен сработать сам" not in line  # тот же класс #472 во второй ветке
+
+
+def test_retry_budget_fact_reports_held_back_run(monkeypatch):
+    # Прод-форма: retry_budget_fact спрашивает ТУ ЖЕ занятость, что и
+    # scheduler.trigger_ai_review перед диспатчем (review_labels.
+    # other_active_ai_review_runs) — третьей копии предиката не заводим.
+    fake = FakeGh({
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": [
+            {"id": 34278765696, "display_title": "ai-review PR #711", "status": "in_progress"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    anchor = utc(2026, 9, 8, 20, 30, 0)
+    fact = ri.retry_budget_fact("mytab0r/edge-harness", 711, anchor)
+    assert fact["held_back_by_run"] == 34278765696
+
+
+def test_retry_budget_fact_no_active_run_reports_none(monkeypatch):
+    # _DEFAULT_ROUTES отдаёт пустой список активных прогонов.
+    fake = FakeGh({"issues/712/comments": []})
+    patch_gh(monkeypatch, fake)
+    anchor = utc(2026, 9, 8, 20, 30, 0)
+    fact = ri.retry_budget_fact("mytab0r/edge-harness", 712, anchor)
+    assert fact["held_back_by_run"] is None
+
+
+def test_stuck_review_gate_reports_held_back_run_via_stuck_gate_fact_line(monkeypatch):
+    # Сквозной сценарий (не только unit на stuck_gate_fact_line): PR без
+    # ai:*-метки, гейт 1 отработал дольше порога, бюджет автоповтора ещё не
+    # исчерпан (0/3), но ai-review.yml для этого PR прямо сейчас летит —
+    # инвариант 3 обязан назвать ИМЕННО это, а не соврать «должен сработать
+    # на ближайшем тике» (класс #472).
+    pull = open_pr(711, labels=["review:ok"])
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/timeline": timeline_with_review_ok("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": [
+            {"id": 34278765696, "display_title": "ai-review PR #711", "status": "in_progress"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 8, 23, 0, 0)  # намного больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["held_back_by_run"] == 34278765696
+    line = ri.stuck_gate_fact_line(violations[0])
+    assert "придержан летящим прогоном run 34278765696" in line
 
 
 # ══════════════════════════════════════════════════════════════════════════
