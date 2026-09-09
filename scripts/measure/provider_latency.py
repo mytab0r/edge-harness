@@ -77,19 +77,22 @@ SAMPLE_DIFF_FIXTURE = Path(__file__).with_name("fixtures") / "sample_review_diff
 # финальную цепочку не брать» остаётся за человеком/агентом, читающим
 # результат таблицы (issue #836, шаг 4), не за фильтром на входе замера.
 
-# У OpenRouter в PLUGINS_SUITE_CANDIDATE_ROUTES (dsh-ci.sh) стоит платная
-# модель (contextWindow 200000, "anthropic/claude-sonnet-4.6") — у владельца
-# план OpenRouter только free-tier, платная модель на нём вернёт ошибку
-# оплаты, а не латентность. Дублировать вторую хардкод-таблицу под "модель
-# для бенчмарка" тоже не годится (класс "второе место правды") — вместо
-# этого бенчмарк подставляет НЕПОДТВЕРЖДЁННОГО кандидата на бесплатный тариф
-# (суффикс ":free") и живым вызовом решает, годится ли он: "не гадать" здесь
-# и означает измерить, а не поверить на слово источнику модели для другого
-# случая использования. Результат этого самого прогона — единственное
-# подтверждение; если ключ провайдера отсутствует, слот пропускается тем же
-# путём, что и любой другой candidate без секрета.
+# У OpenRouter в PLUGINS_SUITE_CANDIDATE_ROUTES (dsh-ci.sh) исторически стояла
+# платная модель ("anthropic/claude-sonnet-4.6") — у владельца план OpenRouter
+# только free-tier, платная модель на нём вернёт ошибку оплаты, а не
+# латентность. Override защищал бенчмарк от вызова платной модели чужим,
+# неподтверждённым кандидатом. С #848 (discovery живых id) сама запись
+# openrouter-* в dsh-ci.sh уже несёт ПОДТВЕРЖДЁННЫЙ живой free-кандидат
+# (nvidia/nemotron-3-super-120b-a12b:free — HTTP 200, run 34415529070) — этот
+# override оставлен НЕ потому что запись dsh-ci.sh снова расходится с ней (её
+# и держит текущее значение override синхронизированным), а как страховка на
+# случай, если владелец позже поставит в dsh-ci.sh платную модель ради
+# качества прод-роутинга: бенчмарк тогда всё равно измерит free-tier, а не
+# упадёт в ошибку оплаты. Значение НЕ синхронизируется автоматически с
+# dsh-ci.sh — при повторном discovery (#848) свериться и обновить оба места
+# вручную одним PR, как сделано здесь.
 OPENROUTER_ROUTE_ALIAS_PREFIX = "openrouter-"
-OPENROUTER_FREE_MODEL_OVERRIDE = "deepseek/deepseek-r1:free"
+OPENROUTER_FREE_MODEL_OVERRIDE = "nvidia/nemotron-3-super-120b-a12b:free"
 
 DEFAULT_TIMEOUT_SECS = 180
 
@@ -146,16 +149,15 @@ _ROUTE_ARRAY_RE = re.compile(r'PLUGINS_SUITE_CANDIDATE_ROUTES=\((.*?)\n\)', re.D
 _ROUTE_LINE_RE = re.compile(r'^"([^"]*)"\s*$')
 
 
-def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
-    """Непроверенная ёмкость — таблица `PLUGINS_SUITE_CANDIDATE_ROUTES` в
-    scripts/lib/dsh-ci.sh (#215), распарсенная, а не скопированная вторым
-    списком (находка ревью #837): каждая строка формата
-    "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName". Модель
-    OpenRouter-алиасов переопределяется на неподтверждённого free-tier
-    кандидата (см. OPENROUTER_FREE_MODEL_OVERRIDE выше) — источник несёт
-    платную модель для другого случая использования (комбо-роутер), не для
-    этого бенчмарка. Файла нет/формат не совпал — пустой список, fail loud
-    достаётся вызывающему по количеству кандидатов, не молчаливому [] здесь."""
+def parse_plugin_suite_routes(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
+    """Сырые записи таблицы `PLUGINS_SUITE_CANDIDATE_ROUTES` (dsh-ci.sh, #215)
+    — alias/base_url/secret_env/model/context_window/display_name, БЕЗ каких-
+    либо подмен модели (в отличие от build_plugin_suite_candidates() ниже,
+    которая уже подставляет OPENROUTER_FREE_MODEL_OVERRIDE для этого
+    бенчмарка). Общий парсер для этого модуля и
+    scripts/measure/provider_model_discovery.py (#848, discovery живых id) —
+    один регэксп на формат строки, не два расходящихся. Файла нет/формат не
+    совпал — пустой список, тем же контрактом, что и build_plugin_suite_candidates()."""
     try:
         text = dsh_ci_path.read_text(encoding="utf-8")
     except OSError:
@@ -171,10 +173,26 @@ def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
         parts = line_m.group(1).split("|")
         if len(parts) != 6:
             continue
-        alias, base_url, secret_env, model, _context_window, display_name = parts
-        if alias.startswith(OPENROUTER_ROUTE_ALIAS_PREFIX):
+        alias, base_url, secret_env, model, context_window, display_name = parts
+        out.append({"alias": alias, "base_url": base_url, "secret_env": secret_env,
+                     "model": model, "context_window": context_window, "display_name": display_name})
+    return out
+
+
+def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
+    """Непроверенная ёмкость — таблица `PLUGINS_SUITE_CANDIDATE_ROUTES` в
+    scripts/lib/dsh-ci.sh (#215), распарсенная, а не скопированная вторым
+    списком (находка ревью #837). Модель OpenRouter-алиасов переопределяется
+    на неподтверждённого free-tier кандидата (см. OPENROUTER_FREE_MODEL_OVERRIDE
+    выше) — источник несёт платную модель для другого случая использования
+    (комбо-роутер), не для этого бенчмарка."""
+    out = []
+    for route in parse_plugin_suite_routes(dsh_ci_path):
+        model = route["model"]
+        if route["alias"].startswith(OPENROUTER_ROUTE_ALIAS_PREFIX):
             model = OPENROUTER_FREE_MODEL_OVERRIDE
-        out.append({"name": display_name, "base_url": base_url, "model": model, "secret_env": secret_env})
+        out.append({"name": route["display_name"], "base_url": route["base_url"],
+                     "model": model, "secret_env": route["secret_env"]})
     return out
 
 
