@@ -150,6 +150,14 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       #431→#538), не только свои.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import http.cookiejar
 import importlib.util
 import json
@@ -1025,7 +1033,7 @@ def update_branch(repo: str, pr_number: int) -> None:
         subprocess.run(
             ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch",
              "-H", f"Authorization: Bearer {pat}"],
-            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+            capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
             check=True,
         )
     else:
@@ -1614,7 +1622,7 @@ def dispatch_deploy_on_merge(files: list[dict], prefix: str, workflow: str) -> b
         return False
     subprocess.run(
         ["gh", "workflow", "run", workflow, "--ref", "main"],
-        capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+        capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
         check=True,
     )
     return True

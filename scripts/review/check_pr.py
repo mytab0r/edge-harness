@@ -36,6 +36,14 @@
 Среда: runner с `gh`, GH_TOKEN с правами pull-requests: write.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import importlib.util
 import json
@@ -106,7 +114,7 @@ MANIFEST_ENTRY_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 def gh(*args: str) -> dict | list:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -117,7 +125,7 @@ def gh(*args: str) -> dict | list:
 def run_gh(*args: str) -> None:
     result = subprocess.run(
         ["gh", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -358,7 +366,7 @@ def main() -> int:
 
     diff = subprocess.run(
         ["gh", "pr", "diff", str(args.pr)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     ).stdout
 

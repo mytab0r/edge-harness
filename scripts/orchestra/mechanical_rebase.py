@@ -120,6 +120,14 @@ ensure_clean_repo безусловно делает `git rebase --abort`/`reset 
 Тесты: python -m pytest scripts/orchestra/test_mechanical_rebase.py -q
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import os
 import shutil
 import subprocess
@@ -144,7 +152,7 @@ class GitError(RuntimeError):
 
 def run_git(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True,
+        ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if check and result.returncode != 0:

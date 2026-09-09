@@ -387,6 +387,18 @@ jobs:
       - name: Smoke «task-branch отказывает на эпике»
         run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
 
+      # Класс «Windows-кодировка валит скрипт репозитория» (issue #723): print()
+      # в stdout без file=sys.stderr падает UnicodeEncodeError (эмодзи, cp1251);
+      # subprocess.run(text=True) без encoding="utf-8" падает UnicodeDecodeError
+      # в фоновом потоке на кириллице реального ответа gh (живой трейс: task-branch
+      # → epic_guard.py → scheduler.gh → pulse_guard.gh). Гвардия статическая
+      # (по исходнику, весь класс) + живая мутация pulse_guard.gh на прод-форме
+      # байта, ронявшего cp1251.
+      - name: Тесты гвардии кодировки stdout/subprocess (Windows)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_console_utf8_guard.py -q
+
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
       # обоими зелёными вердиктами или уже в конфликте, не всех открытых

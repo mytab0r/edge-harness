@@ -87,7 +87,7 @@ def run_wake(tmp_path: Path, *, active_status: str | None, api_fails: bool = Fal
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
     result = subprocess.run(
         [BASH, str(SCRIPT), REPO],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, encoding="utf-8", env=env,
     )
     result.dispatch_calls = dispatch_log.read_text(encoding="utf-8").splitlines() if dispatch_log.exists() else []
     return result

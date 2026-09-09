@@ -55,6 +55,14 @@ errorCode/backoffLevel. Источник ранга (проба/снимок) в
 
 from __future__ import annotations
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import datetime
 import http.client
@@ -601,7 +609,7 @@ def gh_repo(explicit: str | None) -> str:
         return repo
     result = subprocess.run(
         ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise LoudError(
@@ -614,7 +622,7 @@ def gh_repo(explicit: str | None) -> str:
 def existing_secret_names(repo: str) -> set[str]:
     result = subprocess.run(
         ["gh", "secret", "list", "--repo", repo, "--json", "name"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh secret list упал: {result.stderr.strip()}")
@@ -624,7 +632,7 @@ def existing_secret_names(repo: str) -> set[str]:
 def existing_variable_names(repo: str) -> set[str]:
     result = subprocess.run(
         ["gh", "variable", "list", "--repo", repo, "--json", "name"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh variable list упал: {result.stderr.strip()}")
@@ -635,7 +643,7 @@ def set_secret(repo: str, name: str, value: str) -> None:
     """Значение — ТОЛЬКО через stdin (--body-file -), никогда через argv."""
     result = subprocess.run(
         ["gh", "secret", "set", name, "--repo", repo, "--body-file", "-"],
-        input=value, text=True, capture_output=True,
+        input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh secret set {name} упал: {result.stderr.strip()}")
@@ -644,7 +652,7 @@ def set_secret(repo: str, name: str, value: str) -> None:
 def set_variable(repo: str, name: str, value: str) -> None:
     result = subprocess.run(
         ["gh", "variable", "set", name, "--repo", repo, "--body-file", "-"],
-        input=value, text=True, capture_output=True,
+        input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh variable set {name} упал: {result.stderr.strip()}")

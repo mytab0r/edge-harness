@@ -45,6 +45,14 @@ CLI:
 
 from __future__ import annotations
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import json
 import os
 import re
@@ -66,7 +74,7 @@ def _default_gh(*args: str) -> dict | list | None:
     мокать его в тестах тем же приёмом (`patch_gh`), не вторым мок-путём
     на `task_deps.subprocess`."""
     result = subprocess.run(
-        ["gh", "api", *args], capture_output=True, text=True,
+        ["gh", "api", *args], capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
