@@ -912,6 +912,42 @@ def test_duplicate_evidence_mutation_guard():
     assert ri._locators_overlap(("a.py", 10, 20), ("a.py", 15, 25)) is True
 
 
+# build_report() с #710 по умолчанию вызывает fetch_open_task_issues_with_body
+# (task_deps.fetch_pool через GraphQL) для инварианта 9 (ИСПРАВЛЕНО ревью PR
+# #711, major: комментарий раньше ошибочно называл «8» — коллизия с уже
+# существующим инвариантом 8, check_wasted_ai_review_runs, #740). Отключается
+# параметром check_declared_deps=False (замечание 1 ревью PR #711, main()
+# передаёт его на периодическом пульсе `--orchestra`) — FakeGh-фикстуры
+# build_report-тестов ниже, вызывающих build_report БЕЗ этого параметра
+# (то есть с фетчем инварианта 9 включённым по умолчанию), нуждаются в
+# маршруте "graphql", даже если сам инвариант 9 их не интересует (иначе
+# FakeGh падает AssertionError «нет маршрута»). Пустой пул — валидный ответ
+# (открытых task-issues нет).
+def graphql_pool_page(nodes=()):
+    return {"data": {"repository": {"issues": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": list(nodes),
+    }}}}
+
+
+def graphql_issue_node(number, issue_body="", blocked_by=(), blocking=()):
+    # Параметр НЕ называется body= — та же гвардия класса #124
+    # (grep ',\s*body=' в repo-ci.yml матчит и сигнатуру функции с дефолтом
+    # body="", не только вызов gh()) уже задокументирована у task_issue()
+    # выше в этом файле; здесь тот же приём.
+    return {
+        "number": number,
+        "title": "",
+        "body": issue_body,
+        "labels": {"nodes": []},
+        "assignees": {"nodes": []},
+        "blockedBy": {"totalCount": len(blocked_by),
+                      "nodes": [{"number": n, "state": "OPEN"} for n in blocked_by]},
+        "blocking": {"totalCount": len(blocking),
+                     "nodes": [{"number": n, "state": "OPEN"} for n in blocking]},
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 6: защита main-ветки не откатилась молча (#341)
 # ══════════════════════════════════════════════════════════════════════════
@@ -1014,6 +1050,7 @@ def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
         f"issues?state=open&labels={ri.TASK_LABEL}": [],
         "pulls?state=closed": [],
         "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1029,6 +1066,7 @@ def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
         "pulls?state=closed": [],
         "pulls?state=open": [],
         "branches/main/protection": HEALTHY_PROTECTION,
+        "graphql": graphql_pool_page(),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1043,6 +1081,46 @@ def test_branch_protection_not_in_ci_gating():
     # проверки для инварианта, которому GITHUB_TOKEN не может дать ответ,
     # красило бы main на КАЖДОМ прогоне — хуже отсутствия проверки.
     assert 6 not in ri.CI_GATING
+
+
+def test_declared_deps_opt_out_skips_expensive_graphql_fetch(monkeypatch):
+    # Замечание 1 ревью PR #711: на периодическом пульсе (`--orchestra`,
+    # main() передаёт check_declared_deps=False) дорогой пагинированный
+    # GraphQL-фетч тел не должен вызываться вовсе — FakeGh без маршрута
+    # "graphql" здесь и есть доказательство: был бы вызван — упал бы
+    # AssertionError самого FakeGh.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now, check_declared_deps=False)
+    assert findings[9] == []
+    assert any("⏭️" in line and "[9]" in line for line in lines)
+
+
+def test_declared_deps_fetch_error_isolated_does_not_abort_whole_report(monkeypatch):
+    # Замечание 2 ревью PR #711: TaskDepsError (пул-аномалия, >20 рёбер на
+    # issue, task_deps.py:165-180) из фетча инварианта 9 не должна ронять
+    # ВЕСЬ build_report — инвариант 7 (гейтящий) обязан по-прежнему
+    # посчитаться, а не пропасть вместе с исключением.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": ri.task_deps.TaskDepsError(
+            "issue #999: blockedBy усечён (20 из 41)"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[9] == []
+    assert 7 in findings  # инвариант 7 всё равно посчитан, не съеден исключением
+    assert any("🚨" in line and "[9]" in line and "фетч пула упал" in line for line in lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1242,6 +1320,111 @@ def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9: тело задачи и граф blockedBy расходятся (#710)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: реальный live-случай замера 2026-09-08 — #679 отвечает
+# «БЛОКИРУЕТСЯ: ничем», нативный blockedBy содержит #605 (ребро проставлено
+# вручную мимо текста). Не пересказ — воспроизведено дословно.
+ISSUE_679_BODY = (
+    "Инцидент 2026-09-06 — класс «квота пробита, конвейер не заметил», а "
+    "правило репозитория требует, чтобы инцидент оставил инвариант, а не "
+    "только фикс; лок-аут троттлинга выше показывает, что слепота сторожа "
+    "невидима (прогоны зелёные). Критерий готовности: в "
+    "scripts/orchestra/repo_invariants.py появляется проверка «последний "
+    "подтверждённый замер сторожа квот свежее N×CHECK_INTERVAL_MINUTES» с "
+    "эскалацией в общий канал; опирается на след реального замера, который "
+    "появится с починкой троттлинга.\nБЛОКИРУЕТСЯ: ничем"
+)
+
+
+def test_declared_deps_mismatch_flags_stale_edge_prod_case_679():
+    issues = [{"number": 679, "body": ISSUE_679_BODY, "blocked_by_open": [605]},
+              {"number": 605, "body": "", "blocked_by_open": []}]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 679, "kind": "stale", "number": 605}]
+
+
+def test_declared_deps_mismatch_flags_missing_edge():
+    issues = [
+        {"number": 500, "body": "## Чем блокируется\n#55\n", "blocked_by_open": []},
+        {"number": 55, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 500, "kind": "missing", "number": 55}]
+
+
+def test_declared_deps_mismatch_silent_when_graph_matches_declaration():
+    issues = [
+        {"number": 500, "body": "## Чем блокируется\n#55\n", "blocked_by_open": [55]},
+        {"number": 55, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_silent_when_no_field_at_all():
+    # Issue без поля вовсе (declared_blocked_by → None) — не о чем судить,
+    # ручное ребро мимо старого issue без шаблона не нарушение.
+    issues = [{"number": 500, "body": "Обычное тело без формы.", "blocked_by_open": [55]}]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_covers_reverse_blocking_field_target():
+    # #500 объявляет «Что блокирует: #56», у #56 своего поля нет вовсе, но
+    # граф её НЕ подтверждает — нарушение приписывается #56 (цели чужого
+    # объявления), не только #500.
+    issues = [
+        {"number": 500, "body": "## Что блокирует\n#56\n", "blocked_by_open": []},
+        {"number": 56, "body": "Обычное тело без формы.", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 56, "kind": "missing", "number": 500}]
+
+
+def test_declared_deps_mismatch_silent_when_native_edge_targets_non_pool_issue():
+    # Находка ревью PR #711 (живой прогон ревьюера на #700→#800): текст
+    # называет открытый #800, граф несёт #800 — согласовано. #800 просто НЕ
+    # в пуле (нет метки task, task_deps.py фильтрует его только по state,
+    # не по метке) — тот же класс, что declared_deps.py прямо называет
+    # НЕ рассинхроном (ссылка на не-task issue, см. модульный докстринг).
+    # Без симметричного фильтра native по open_numbers это ребро попадало бы
+    # в «stale» навечно — GATING_RELEASE_CONDITION[9] («0 нарушений») было
+    # бы физически недостижимо для любого пула, где такое ребро есть.
+    issues = [{"number": 700, "body": "## Чем блокируется\n#800\n", "blocked_by_open": [800]}]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_not_in_ci_gating_but_has_release_condition():
+    # Живой долг на день внедрения (#679) — гейтить нельзя (см. докстринг
+    # check_declared_deps_mismatch и комментарий у CI_GATING), но газ назван
+    # заранее (не повторяем #666 — «возврат держится на памяти»).
+    assert 9 not in ri.CI_GATING
+    assert 9 in ri.GATING_RELEASE_CONDITION
+
+
+def test_declared_deps_mismatch_flags_bare_number_not_silently_nichem():
+    # #711 (блокирующая): живой прод-случай #757 «### Что блокирует\n\n642»
+    # без `#` — до фикса читался как [] («ничем»), инвариант ЛОЖНО кричал
+    # «642: ребро есть, а поле не называет» (kind=stale), хотя поле называет
+    # ровно этот номер голым видом. После фикса — согласовано, 0 нарушений.
+    issues = [
+        {"number": 757, "body": "### Что блокирует\n\n642", "blocked_by_open": []},
+        {"number": 642, "body": "", "blocked_by_open": [757]},
+    ]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_reports_unrecognized_kind_not_silent_nichem():
+    # Поле заполнено, но текст не разбирается ни на один номер — третий вид
+    # нарушения, видимый, а не молча «поле согласовано / ничем».
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\nне уверен\n", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 500, "kind": "unrecognized"}]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1263,6 +1446,11 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # молчит по построению (comment is None), не запрашивая ни файлы, ни
         # прогоны workflow.
         "issues/50/comments": [],
+        # Инвариант 9 (#710): пул с телами через GraphQL — здоровое поле «ничем»
+        # в обе стороны, нативных рёбер нет, расхождения тоже нет.
+        "graphql": graphql_pool_page([
+            graphql_issue_node(1, issue_body="## Чем блокируется\nничем\n\n## Что блокирует\nничем\n"),
+        ]),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
