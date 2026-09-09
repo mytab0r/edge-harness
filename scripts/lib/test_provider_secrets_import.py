@@ -13,14 +13,71 @@ argv без значений секрета.
 from __future__ import annotations
 
 import json
+import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import provider_secrets_import as psi  # noqa: E402
+
+
+def _read_request(conn: socket.socket) -> bytes:
+    """Читает запрос до конца заголовков — минимально нужное, чтобы h.request()
+    в urllib успел уйти на сервер до того, как сервер сломает соединение."""
+    conn.settimeout(5)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+class _RawTcpServer:
+    """Сырой TCP-сервер (не мок) для веток probe_provider, которые urllib НЕ
+    оборачивает в URLError — обрыв/таймаут/мусор вместо статус-строки
+    (блокирующая 1 гейта PR #778): h.getresponse() внутри urlopen() их не
+    ловит, только h.request()."""
+
+    def __init__(self, handler):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, args=(handler,), daemon=True)
+        self._thread.start()
+
+    def _serve(self, handler):
+        self._sock.settimeout(5)
+        try:
+            conn, _addr = self._sock.accept()
+        except OSError:
+            return
+        try:
+            handler(conn)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self) -> None:
+        self._sock.close()
+        self._thread.join(timeout=3)
 
 # Маркер фикстуры — заведомо не похож на реальный секрет, но узнаваем в выводе,
 # если защита печати сломается (мутационная проба, см. test класса «маркер»).
@@ -207,7 +264,7 @@ def test_no_marker_leak_in_dry_run(monkeypatch, export_path, dsh_ci_path, capsys
 
     def _fake_probe(base_url, api_key):
         probe_calls.append(api_key)
-        return psi.ProbeOutcome(status="жива")
+        return psi.ProbeResult(psi.PROBE_ALIVE, "HTTP 200")
 
     monkeypatch.setattr(psi, "set_secret", _forbidden)
     monkeypatch.setattr(psi, "set_variable", _forbidden)
@@ -258,11 +315,14 @@ def test_no_marker_leak_in_dry_run_no_probe_flag(monkeypatch, export_path, dsh_c
     assert FIXTURE_MARKER not in captured.err
 
 
-def test_probe_provider_never_leaks_key_on_http_error(monkeypatch):
+def test_probe_provider_never_leaks_key_on_http_error(monkeypatch, capsys):
     """Задача #777, критерий 6: даже если провайдер вернёт ошибку, чьё тело
     содержит подстроку ключа (гипотетическое эхо), probe_provider не читает
     msg/тело — читает только error.code. Мутация: если когда-нибудь код
-    начнёт возвращать str(error) целиком, этот тест покраснеет."""
+    начнёт возвращать str(error) целиком, этот тест покраснеет. Блокирующая 2
+    гейта PR #778: гвардия теперь читает ещё и stdout/stderr (capsys) — три
+    естественные мутации (print(error), print(error.msg), запись в stderr)
+    красят её, хотя возвращаемое значение осталось прежним."""
     import urllib.error
 
     def _raise_http_error(*args, **kwargs):
@@ -272,9 +332,117 @@ def test_probe_provider_never_leaks_key_on_http_error(monkeypatch):
         )
 
     monkeypatch.setattr(psi.urllib.request, "urlopen", _raise_http_error)
-    status = psi.probe_provider("https://example.test", FIXTURE_MARKER)
-    assert status == "ключ неверен"
-    assert FIXTURE_MARKER not in status
+    result = psi.probe_provider("https://example.test", FIXTURE_MARKER)
+    assert result.outcome == psi.PROBE_INVALID_KEY
+    assert FIXTURE_MARKER not in result.detail
+    captured = capsys.readouterr()
+    assert FIXTURE_MARKER not in captured.out
+    assert FIXTURE_MARKER not in captured.err
+
+
+# ── Блокирующая 1 гейта PR #778: h.getresponse() кидает не-URLError ──────
+
+
+def test_probe_provider_connection_reset_is_classified_not_raised(capsys):
+    """Сервер принимает запрос и рвёт соединение RST'ом (SO_LINGER=0) —
+    h.getresponse() бросает ConnectionResetError, urllib его НЕ оборачивает
+    в URLError. Мутация: убери except (OSError, http.client.HTTPException) —
+    этот тест упадёт необработанным исключением, а не просто покраснеет на
+    assert."""
+    def handler(conn: socket.socket) -> None:
+        _read_request(conn)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+    server = _RawTcpServer(handler)
+    try:
+        result = psi.probe_provider(server.base_url, FIXTURE_MARKER)
+    finally:
+        server.close()
+    assert result.outcome == psi.PROBE_NETWORK_UNAVAILABLE
+    assert FIXTURE_MARKER not in result.detail
+    captured = capsys.readouterr()
+    assert FIXTURE_MARKER not in captured.out
+    assert FIXTURE_MARKER not in captured.err
+
+
+def test_probe_provider_timeout_is_classified_not_raised(monkeypatch, capsys):
+    """Сервер принимает запрос и молчит дольше таймаута пробы —
+    h.getresponse() бросает TimeoutError, urllib его НЕ оборачивает в
+    URLError. _PROBE_TIMEOUT_SECONDS уменьшен монкипатчем, чтобы тест не ждал
+    боевые 10 секунд."""
+    monkeypatch.setattr(psi, "_PROBE_TIMEOUT_SECONDS", 0.3)
+
+    def handler(conn: socket.socket) -> None:
+        _read_request(conn)
+        time.sleep(1.0)
+
+    server = _RawTcpServer(handler)
+    try:
+        result = psi.probe_provider(server.base_url, FIXTURE_MARKER)
+    finally:
+        server.close()
+    assert result.outcome == psi.PROBE_NETWORK_UNAVAILABLE
+    assert FIXTURE_MARKER not in result.detail
+    captured = capsys.readouterr()
+    assert FIXTURE_MARKER not in captured.out
+    assert FIXTURE_MARKER not in captured.err
+
+
+def test_probe_provider_bad_status_line_is_classified_not_raised(capsys):
+    """Сервер отвечает мусором вместо статус-строки (echo маркера в мусоре,
+    чтобы доказать, что даже если сервер отражает вход обратно,
+    probe_provider не пересказывает это в detail/печати) —
+    http.client.BadStatusLine, НЕ OSError, нужны оба класса в except."""
+    def handler(conn: socket.socket) -> None:
+        _read_request(conn)
+        conn.sendall(f"GARBAGE {FIXTURE_MARKER} NOT-A-STATUS-LINE\r\n\r\n".encode())
+
+    server = _RawTcpServer(handler)
+    try:
+        result = psi.probe_provider(server.base_url, FIXTURE_MARKER)
+    finally:
+        server.close()
+    assert result.outcome == psi.PROBE_NETWORK_UNAVAILABLE
+    assert FIXTURE_MARKER not in result.detail
+    captured = capsys.readouterr()
+    assert FIXTURE_MARKER not in captured.out
+    assert FIXTURE_MARKER not in captured.err
+
+
+def test_probe_candidates_survives_one_dead_gateway_among_many(dsh_ci_path):
+    """Регрессия ЭТОГО PR (блокирующая 1): один оборванный шлюз среди девяти
+    не валит весь probe_candidates/main() — остальные кандидаты пробуются и
+    классифицируются нормально."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    routes_by_family = psi.group_routes_by_family(routes)
+
+    def handler(conn: socket.socket) -> None:
+        _read_request(conn)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+    server = _RawTcpServer(handler)
+    try:
+        # Подменяем базовый URL первого маршрута openrouter на мёртвый сервер.
+        dead_route = routes_by_family["openrouter"][0]
+        routes_by_family["openrouter"][0] = psi.SuiteRoute(
+            alias=dead_route.alias, family=dead_route.family, slot=dead_route.slot,
+            base_url=server.base_url, secret_env=dead_route.secret_env,
+            display_name=dead_route.display_name,
+        )
+        candidates_by_family = {
+            "openrouter": _accounts_from_dicts([
+                _account("openrouter", 1, True, "unavailable", f"{FIXTURE_MARKER}-or1"),
+            ]),
+            "zai": _accounts_from_dicts([
+                _account("glm", 1, True, "unavailable", f"{FIXTURE_MARKER}-glm1"),
+            ]),
+        }
+        results = psi.probe_candidates(candidates_by_family, routes_by_family)
+    finally:
+        server.close()
+    assert len(results) == 2
+    or_result = next(v for k, v in results.items() if k.startswith("openrouter"))
+    assert or_result.outcome == psi.PROBE_NETWORK_UNAVAILABLE
 
 
 # ── parse_model_ids / probe_provider_full: печать id моделей, не тела ────
@@ -369,7 +537,7 @@ def test_probe_provider_full_success_extracts_models_without_leaking_key(monkeyp
 
     monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
     outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
-    assert outcome.status == "жива"
+    assert outcome.outcome == psi.PROBE_ALIVE
     assert outcome.models == ("model-a", "model-b")
     assert outcome.models_error is None
     assert FIXTURE_MARKER not in outcome.models
@@ -384,7 +552,7 @@ def test_probe_provider_full_malformed_body_error_names_structure_not_values(mon
 
     monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
     outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
-    assert outcome.status == "жива"  # HTTP 200 — статус жив, модели просто не разобрались
+    assert outcome.outcome == psi.PROBE_ALIVE  # HTTP 200 — статус жив, модели просто не разобрались
     assert outcome.models is None
     assert outcome.models_error is not None
     assert FIXTURE_MARKER not in outcome.models_error
@@ -393,7 +561,7 @@ def test_probe_provider_full_malformed_body_error_names_structure_not_values(mon
 
 def test_probe_provider_full_never_leaks_key_or_auth_header_on_success(monkeypatch):
     """Request собирается из base_url/api_key — сам ключ никогда не читается
-    обратно из request в вывод (ProbeOutcome не хранит ни headers, ни ключ)."""
+    обратно из request в вывод (ProbeResult не хранит ни headers, ни ключ)."""
     body = json.dumps({"data": [{"id": "m"}]}).encode()
     captured_requests: list = []
 
@@ -404,8 +572,8 @@ def test_probe_provider_full_never_leaks_key_or_auth_header_on_success(monkeypat
     monkeypatch.setattr(psi.urllib.request, "urlopen", _fake_urlopen)
     outcome = psi.probe_provider_full("https://example.test", FIXTURE_MARKER)
     assert captured_requests[0].get_header("Authorization") == f"Bearer {FIXTURE_MARKER}"
-    # ProbeOutcome — единственное, что уходит наружу из этой функции.
-    rendered = f"{outcome.status} {outcome.models} {outcome.models_error}"
+    # ProbeResult — единственное, что уходит наружу из этой функции.
+    rendered = f"{outcome.outcome} {outcome.detail} {outcome.models} {outcome.models_error}"
     assert FIXTURE_MARKER not in rendered
 
 
@@ -445,8 +613,8 @@ def test_live_probe_alive_beats_snapshot_active_probed_401(dsh_ci_path):
         _account("openrouter", 2, True, "active", "k-active"),
     ])
     probe_results = {
-        stale_but_alive.id: "жива",
-        confirmed_dead.id: "ключ неверен",
+        stale_but_alive.id: psi.ProbeResult(psi.PROBE_ALIVE, "HTTP 200"),
+        confirmed_dead.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401"),
     }
     selection = psi.select_accounts(
         [stale_but_alive, confirmed_dead], routes, probe_results=probe_results,
@@ -465,7 +633,10 @@ def test_live_probe_quota_beats_live_probe_invalid_key(dsh_ci_path):
         _account("openrouter", 1, True, "unavailable", "k-quota"),
         _account("openrouter", 2, True, "unavailable", "k-dead"),
     ])
-    probe_results = {quota_acc.id: "квота исчерпана", dead_acc.id: "ключ неверен"}
+    probe_results = {
+        quota_acc.id: psi.ProbeResult(psi.PROBE_QUOTA, "HTTP 429"),
+        dead_acc.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401"),
+    }
     selection = psi.select_accounts([quota_acc, dead_acc], routes, probe_results=probe_results)
     by_secret = {a.route.secret_env: a for a in selection.assignments}
     assert by_secret["OPENROUTER_1_API_KEY"].account.api_key == "k-quota"
@@ -478,7 +649,7 @@ def test_probe_unreachable_falls_back_to_snapshot_and_says_so(dsh_ci_path):
     (acc,) = _accounts_from_dicts([
         _account("openrouter", 1, True, "active", "k1"),
     ])
-    probe_results = {acc.id: "неизвестно (сеть: [Errno -2] Name or service not known)"}
+    probe_results = {acc.id: psi.ProbeResult(psi.PROBE_NETWORK_UNAVAILABLE, "сеть: [Errno -2] Name or service not known")}
     selection = psi.select_accounts([acc], routes, probe_results=probe_results)
     tier, note, source = selection.rank_by_id[acc.id]
     assert source == "снимок"
@@ -491,7 +662,7 @@ def test_all_candidates_dead_by_probe_leaves_slot_empty_with_reason(dsh_ci_path)
     (glm_acc,) = _accounts_from_dicts([
         _account("glm", 1, False, "unavailable", "k-dead-glm"),
     ])
-    probe_results = {glm_acc.id: "ключ неверен"}
+    probe_results = {glm_acc.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401")}
     selection = psi.select_accounts([glm_acc], routes, probe_results=probe_results)
     by_secret = {a.route.secret_env: a for a in selection.assignments}
     assert by_secret["ZAI_1_API_KEY"].account is None
@@ -502,12 +673,125 @@ def test_all_candidates_dead_by_probe_leaves_slot_empty_with_reason(dsh_ci_path)
     assert len(selection.overflow) == 0
 
 
+# ── Minor 7 гейта PR #778: снимок называет код, не сливает «есть, но не ────
+# 401/403/429» и «кода нет вовсе» в одну строку ─────────────────────────
+
+
+def test_classify_snapshot_distinguishes_unknown_code_from_missing_code():
+    unknown_code = _accounts_from_dicts([
+        _account("openrouter", 1, False, "unavailable", "k1", error_code=503),
+    ])[0]
+    missing_code = _accounts_from_dicts([
+        _account("openrouter", 2, False, "unavailable", "k2", error_code=None),
+    ])[0]
+    tier_unknown, note_unknown = psi.classify_snapshot(unknown_code)
+    tier_missing, note_missing = psi.classify_snapshot(missing_code)
+    assert tier_unknown == psi._TIER_UNKNOWN == tier_missing
+    assert "503" in note_unknown
+    assert "errorCode отсутствует" in note_missing
+    assert "503" not in note_missing
+
+
+def test_dead_by_probe_reason_only_on_first_empty_slot_not_every_empty_slot(dsh_ci_path):
+    """Minor 6 гейта PR #778: 2 слота nvidia-nim, 1 кандидат — и тот выброшен
+    живой пробой (ключ неверен). Пустых слотов 2, выброшенных пробой — 1:
+    причина «исключён пробой» обязана достаться ТОЛЬКО первому пустому
+    слоту, второй — «нет кандидата» (иначе читатель решит, что починка
+    одного ключа заполнит оба слота)."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    (dead_acc,) = _accounts_from_dicts([
+        _account("nvidia", 1, False, "unavailable", "k-dead-nv"),
+    ])
+    probe_results = {dead_acc.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401")}
+    selection = psi.select_accounts([dead_acc], routes, probe_results=probe_results)
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["NVIDIA_NIM_1_API_KEY"].account is None
+    assert by_secret["NVIDIA_NIM_1_API_KEY"].empty_reason is not None
+    assert "ключ неверен" in by_secret["NVIDIA_NIM_1_API_KEY"].empty_reason
+    assert by_secret["NVIDIA_NIM_2_API_KEY"].account is None
+    assert by_secret["NVIDIA_NIM_2_API_KEY"].empty_reason is None
+
+
+# ── Блокирующая 3 гейта PR #778: снимочная дисквалификация НЕ выбрасывает ─
+
+
+def test_snapshot_disqualified_without_probe_still_fills_slot(dsh_ci_path):
+    """Снимок с errorCode=401, единственный кандидат, живой пробы НЕ было
+    (probe_results={}) — слот ЗАНЯТ, probe_excluded пуст, у слота нет
+    empty_reason. Мутация :434 гейта PR #778 (снять условие «источник —
+    проба» из проверки дисквалификации) красит этот тест: без условия слот
+    опустеет и получит ложную причину «исключён живой пробой», хотя пробы
+    не было вовсе — регрессия ровно в дефект, ради которого заведена #777."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    (only_candidate,) = _accounts_from_dicts([
+        _account("glm", 1, False, "unavailable", "k-only", error_code=401),
+    ])
+    selection = psi.select_accounts([only_candidate], routes, probe_results={})
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["ZAI_1_API_KEY"].account is only_candidate
+    assert by_secret["ZAI_1_API_KEY"].empty_reason is None
+    assert selection.probe_excluded == []
+
+
+# ── Major 5 гейта PR #778: 403 — отдельный тир, БЕЗ выброса из слота ──────
+
+
+def test_probe_provider_403_is_suspect_not_invalid_key(monkeypatch):
+    """probe_provider сам обязан различать 401 и 403 (не только classify_*
+    на готовом ProbeResult) — иначе тесты выше проверяли бы контракт
+    classify_probe/classify_snapshot, но не сам probe_provider."""
+    import urllib.error
+
+    def _raise_403(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://example.test/models", 403, "forbidden", {}, None,
+        )
+
+    monkeypatch.setattr(psi.urllib.request, "urlopen", _raise_403)
+    result = psi.probe_provider("https://example.test", FIXTURE_MARKER)
+    assert result.outcome == psi.PROBE_SUSPECT_FORBIDDEN
+    assert result.outcome != psi.PROBE_INVALID_KEY
+
+
+def test_classify_snapshot_403_is_suspect_not_disqualified():
+    acc = _accounts_from_dicts([
+        _account("openrouter", 1, False, "unavailable", "k1", error_code=403),
+    ])[0]
+    tier, note = psi.classify_snapshot(acc)
+    assert tier == psi._TIER_SUSPECT
+    assert tier != psi._TIER_DISQUALIFIED
+    assert "403" in note
+
+
+def test_live_probe_403_ranks_worse_than_quota_but_does_not_exclude(dsh_ci_path):
+    """403 хуже квоты по рангу, но НЕ одноразово надёжен как факт
+    дисквалификации (гео-блок/WAF/лимит плана при годном ключе) — слот НЕ
+    пустеет, кандидат с 403 занимает второй слот, а не первый."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    quota_acc, suspect_acc = _accounts_from_dicts([
+        _account("openrouter", 1, True, "unavailable", "k-quota"),
+        _account("openrouter", 2, True, "unavailable", "k-403"),
+    ])
+    probe_results = {
+        quota_acc.id: psi.ProbeResult(psi.PROBE_QUOTA, "HTTP 429"),
+        suspect_acc.id: psi.ProbeResult(psi.PROBE_SUSPECT_FORBIDDEN, "HTTP 403"),
+    }
+    selection = psi.select_accounts([quota_acc, suspect_acc], routes, probe_results=probe_results)
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["OPENROUTER_1_API_KEY"].account.api_key == "k-quota"
+    assert by_secret["OPENROUTER_2_API_KEY"].account.api_key == "k-403"
+    assert suspect_acc not in selection.probe_excluded
+
+
 def test_render_report_shows_export_date_and_rank_source(monkeypatch, export_path, dsh_ci_path):
     data = psi.load_export(str(export_path))
     routes = psi.parse_suite_routes(dsh_ci_path)
     accounts = psi.accounts_from_export(data)
     selection = psi.select_accounts(accounts, routes)
-    report = psi.render_report(selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)")
+    report = psi.render_report(
+        selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)",
+        no_probe=True, probe_results={}, existing_secrets=set(),
+    )
     assert "2026-08-25" in report
     assert "ПРЕДОХРАНИТЕЛЯ" in report
     assert "источник: снимок" in report
@@ -517,14 +801,14 @@ def test_render_report_shows_models_section_by_secret(monkeypatch, export_path, 
     data = psi.load_export(str(export_path))
     routes = psi.parse_suite_routes(dsh_ci_path)
     accounts = psi.accounts_from_export(data)
-    probe_results = {a.id: "жива" for a in accounts if a.provider in ("openrouter", "nvidia", "glm")}
-    selection = psi.select_accounts(accounts, routes, probe_results=probe_results)
-    probe_outcomes = {
-        a.id: psi.ProbeOutcome(status="жива", models=("model-x", "model-y"))
-        for a in accounts if a.id in probe_results
+    probe_results = {
+        a.id: psi.ProbeResult(psi.PROBE_ALIVE, "HTTP 200", models=("model-x", "model-y"))
+        for a in accounts if a.provider in ("openrouter", "nvidia", "glm")
     }
+    selection = psi.select_accounts(accounts, routes, probe_results=probe_results)
     report = psi.render_report(
-        selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)", probe_outcomes,
+        selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)",
+        no_probe=False, probe_results=probe_results, existing_secrets=set(),
     )
     assert "Доступные id моделей" in report
     assert "NVIDIA_NIM_1_API_KEY" in report
@@ -532,6 +816,59 @@ def test_render_report_shows_models_section_by_secret(monkeypatch, export_path, 
     for account in accounts:
         if account.api_key:
             assert account.api_key not in report
+
+
+# ── Major 4 гейта PR #778: пустой слот с уже существующим секретом ───────
+
+
+def test_render_report_distinguishes_empty_slot_with_existing_secret(dsh_ci_path):
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    selection = psi.select_accounts([], routes, probe_results={})
+    report = psi.render_report(
+        selection, {}, "не проверялась", False, "дата", no_probe=True,
+        probe_results={}, existing_secrets={"OPENROUTER_1_API_KEY"},
+    )
+    lines_by_secret = {}
+    for line in report.splitlines():
+        if not line.startswith("| ") or "|---|" in line:
+            continue
+        first_cell = line.split("|")[1].strip()
+        if first_cell == "секрет":  # заголовок таблицы, не строка слота
+            continue
+        lines_by_secret[first_cell] = line
+    assert "НЕ будет удалён" in lines_by_secret["OPENROUTER_1_API_KEY"]
+    assert "gh secret delete" in lines_by_secret["OPENROUTER_1_API_KEY"]
+    # Слот без существующего секрета — формулировка другая, без газа удаления.
+    assert "нет кандидата" in lines_by_secret["OPENROUTER_2_API_KEY"]
+    assert "НЕ будет удалён" not in lines_by_secret["OPENROUTER_2_API_KEY"]
+
+
+# ── Minor 8 гейта PR #778: отчёт называет факт режима пробы, не гадает ───
+
+
+def test_render_report_names_probe_mode_as_fact_not_guess():
+    routes_fixture_selection = psi.SelectionResult(
+        assignments=[], overflow=[], out_of_scope=[], probe_excluded=[], rank_by_id={},
+    )
+    report_no_probe = psi.render_report(
+        routes_fixture_selection, {}, "не проверялась", False, "дата",
+        no_probe=True, probe_results={}, existing_secrets=set(),
+    )
+    assert "--no-probe" in report_no_probe
+
+    probe_results = {
+        "a": psi.ProbeResult(psi.PROBE_ALIVE, "HTTP 200"),
+        "b": psi.ProbeResult(psi.PROBE_QUOTA, "HTTP 429"),
+        "c": psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401"),
+    }
+    report_with_probe = psi.render_report(
+        routes_fixture_selection, {}, "не проверялась", False, "дата",
+        no_probe=False, probe_results=probe_results, existing_secrets=set(),
+    )
+    assert "3 кандидат" in report_with_probe
+    assert "жива 1" in report_with_probe
+    assert "квота 1" in report_with_probe
+    assert "ключ неверен 1" in report_with_probe
 
 
 # ── argv без значений (доказано мутацией на уровне вызова gh) ────────────
@@ -586,7 +923,10 @@ def test_idempotent_skip_existing_secret_without_force(monkeypatch, export_path,
     set_secret_calls = []
     monkeypatch.setattr(psi, "set_secret", lambda repo, name, value: set_secret_calls.append(name))
     monkeypatch.setattr(psi, "set_variable", lambda repo, name, value: None)
-    monkeypatch.setattr(psi, "probe_provider_full", lambda base_url, value: psi.ProbeOutcome(status="жива"))
+    monkeypatch.setattr(
+        psi, "probe_provider_full",
+        lambda base_url, value: psi.ProbeResult(psi.PROBE_ALIVE, "HTTP 200"),
+    )
 
     rc = psi.main([
         "--export-file", str(export_path),
