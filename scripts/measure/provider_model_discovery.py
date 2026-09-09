@@ -257,7 +257,7 @@ def discover_listing(route: dict, key: str, transport=None) -> dict:
             ids, context_by_id = [], {}
         if ids:
             return {"strategy": strategy, "url": url, "ids": ids,
-                     "context_by_id": context_by_id, "note": ""}
+                     "context_by_id": context_by_id, "note": "", "sample": ids[:25]}
         notes.append(f"{strategy} ({url}): листинг пуст")
     return {"strategy": None, "url": None, "ids": [], "context_by_id": {},
              "note": "; ".join(notes) if notes else "нет стратегий листинга для этого семейства"}
@@ -277,6 +277,8 @@ def verify_candidates(route: dict, ranked_ids: list[str], key: str,
                   "model": candidate, "secret_env": route["secret_env"]}
         row = measure(entry, prompt=VERIFY_PROMPT, timeout_secs=VERIFY_TIMEOUT_SECS, key=key)
         attempts.append({"candidate": candidate, "status": row["status"], "http": row["http"], "note": row["note"]})
+        print(f"  верификация {route['display_name']}: кандидат={candidate!r} "
+              f"статус={row['status']} http={row['http']} note={row['note']!r}")
         if row["status"] == "success":
             return {"verified_model": candidate, "verified": True, "attempts": attempts}
     return {"verified_model": None, "verified": False, "attempts": attempts}
@@ -301,6 +303,9 @@ def discover_route(route: dict, transport=None, measure=None) -> dict:
     listing = discover_listing(route, key, transport=transport)
     result["strategy"] = listing["strategy"]
     result["listing_count"] = len(listing["ids"])
+    result["listing_sample"] = listing.get("sample", listing["ids"][:25])
+    print(f"листинг {route['display_name']} ({result['strategy']}, {result['listing_count']} шт., "
+          f"первые 25): {result['listing_sample']}")
     if not listing["ids"]:
         result.update({"recommended": None, "verified_model": None, "verified": False,
                         "attempts": [], "note": listing["note"]})
