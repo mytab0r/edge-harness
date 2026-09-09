@@ -840,7 +840,32 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
 
     `now` — по умолчанию реальное время; параметр существует только для
     детерминированных тестов потолка (никто из шести вызывающих его не
-    передаёт)."""
+    передаёт).
+
+    Граница форк-PR (не блокирует, названо явно #779): у форк-PR
+    `pull_requests[0]` пуст, `ai_review_run_name`-фолбэк даёт голый
+    "ai-review" вместо "ai-review PR #N" (см. её докстринг) — тогда ЭТА
+    функция не находит своих же прогонов вовсе (`display_title != target`
+    для любого форк-прогона), то есть на форк-PR выключены ОБА тормоза
+    одновременно: и «прогон уже летит», и очередь concurrency-группы
+    ai-review.yml (та же деградация в fallback, тот же корень). Сегодня
+    форк-PR в репозитории нет (прочёс 1425 прогонов, #779: голые
+    display_title — все ДО внесения run-name, в свежих 600 аномалий ноль,
+    head_repository у всех свой) — граница не устранена, только названа.
+
+    Слепота к статусу `pending` (не блокирует, названо явно #779): Actions
+    API знает статусы `queued`/`in_progress`/`completed`/`waiting`/
+    `requested`/`pending` — эта функция опрашивает только первые два.
+    Concurrency-группа по номеру PR (эта же правка #779) ВПЕРВЫЕ в истории
+    репозитория создаёт `pending`-прогоны (второй триггер того же PR ждёт
+    своей очереди в группе). Для `cmd_should_run` слепота к `pending` делает
+    схему верной: летящий прогон не видит ждущего и спокойно публикует
+    вердикт, ждущий стартует уже в одиночку и отказывает дёшево по
+    отпечатку — на этом слепота и держится, а не вопреки ей. Для трёх
+    других вызывающих (`update_branch`, `mechanical_rebase.py`,
+    `trigger_ai_review`) это то же самое узкое окно, где тормоз не
+    срабатывает: они могут сдвинуть head/задиспатчить повтор, пока
+    `pending`-прогон ждёт своей очереди, невидимый им."""
     now = now or datetime.now(timezone.utc)
     target = ai_review_run_name(pr)
     matches: list[dict] = []
@@ -860,7 +885,15 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
                     created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                     if now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
                         continue  # старше потолка — GitHub оборвёт сам, не блокируем
-                except ValueError:
+                except (ValueError, TypeError):
+                    # ValueError — битая строка (не парсится вовсе).
+                    # TypeError — наивная метка времени без смещения (без
+                    # "Z"/"+HH:MM"): fromisoformat её ПАРСИТ (не кидает
+                    # ValueError), но `now - created` падает при вычитании
+                    # aware-naive. Прод-формой Actions API недостижимо (поле
+                    # `created_at` там всегда с "Z", #779, не блокирует) —
+                    # докстринг функции обещал «битую строку» шире, чем
+                    # покрывал один except ValueError.
                     pass
             matches.append(run)
     return matches

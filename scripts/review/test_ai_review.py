@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 SCRIPT = Path(__file__).with_name("ai_review.py")
 spec = importlib.util.spec_from_file_location("ai_review", SCRIPT)
@@ -947,13 +948,22 @@ def test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok(monkeypatch, caps
     comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
     monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # событийный путь (workflow_run)
 
     rc = ai.cmd_should_run(argparse.Namespace(pr=294))
 
     assert rc == 0
+    out = capsys.readouterr()
     # Прогон НЕ стартует: подкоманда сама отвечает "false", а не просто
     # «метка сохранилась бы» — именно это читает шаг fingerprint ai-review.yml.
-    assert capsys.readouterr().out.strip() == "false"
+    assert out.out.strip() == "false"
+    # #779, разрыв 2: событийный путь обязан печатать СВОЮ причину в stderr —
+    # ai-review.yml:365 утверждает читателю, что причина уже напечатана
+    # строкой выше; до фикса `if not run_needed and manual` запирало печать
+    # только ручным путём, и этот, самый частый путь (workflow_run), молчал.
+    assert "дифф не изменился" in out.err
+    assert "ai:ok" in out.err
+    assert "ручной" not in out.err  # этот прогон не ручной — текст не должен звать его так
 
 
 def test_cmd_should_run_prints_true_when_diff_changed_ai_ok(monkeypatch, capsys):
@@ -1803,10 +1813,15 @@ def test_other_active_ai_review_runs_queries_both_statuses_with_per_page_100():
 
 def test_ai_review_timeout_minutes_matches_review_labels_constant():
     # yml не читает python-константу (два языка, тот же приём, что и
-    # AI_REVIEW_RUN_NAME_PREFIX выше) — число обязано совпасть буквально,
-    # иначе потолок предиката и реальный обрыв job'а GitHub'ом разъедутся.
-    source = AI_REVIEW_YML.read_text(encoding="utf-8")
-    assert f"timeout-minutes: {rl.AI_REVIEW_TIMEOUT_MINUTES}" in source
+    # test_gate_triggers.py:50-66) — число обязано совпасть буквально с
+    # timeout-minutes ИМЕННО job'а `review`, иначе потолок предиката и
+    # реальный обрыв job'а GitHub'ом разъедутся. Подстроковая проверка
+    # (`f"timeout-minutes: {N}" in source`) не ловила ни смену числа на
+    # значение с тем же префиксом (1300 содержит подстроку "130"), ни перенос
+    # потолка на другой job (`verdict`) — yaml.safe_load и явный путь по
+    # ключу `jobs.review.timeout-minutes` делают обе мутации красными.
+    doc = yaml.safe_load(AI_REVIEW_YML.read_text(encoding="utf-8"))
+    assert doc["jobs"]["review"]["timeout-minutes"] == rl.AI_REVIEW_TIMEOUT_MINUTES
 
 
 def test_other_active_ai_review_runs_excludes_run_older_than_timeout_ceiling():
@@ -1851,6 +1866,26 @@ def test_other_active_ai_review_runs_missing_created_at_still_counts_as_active()
     assert {m["id"] for m in matches} == {111}
 
 
+def test_other_active_ai_review_runs_naive_created_at_does_not_crash():
+    # Не блокирует, названо в разборе #779: fromisoformat ПАРСИТ метку без
+    # смещения ("Z"/"+HH:MM") без ValueError, но `now - created` (aware -
+    # naive) кидает TypeError, не пойманный одним except ValueError — тик
+    # падал бы целиком. Прод-формой Actions API недостижимо (там всегда
+    # "Z"), но except обязан ловить оба класса, раз докстринг обещает
+    # «битую строку» шире одного ValueError.
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": "2026-09-09T03:00:00"},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh)
+
+    assert {m["id"] for m in matches} == {111}
+
+
 def test_manual_dispatch_busy_reason_names_run_status_and_declares_force_cannot_bypass():
     other_run = {"id": 555, "status": "in_progress", "html_url": "https://github.com/o/r/actions/runs/555"}
     text = ai.manual_dispatch_busy_reason(399, other_run)
@@ -1880,6 +1915,26 @@ def test_manual_dispatch_skip_reason_prefers_ai_changes_label_when_present():
 
 def test_manual_dispatch_skip_reason_falls_back_when_no_verdict_label():
     text = ai.manual_dispatch_skip_reason(399, ["review:ok"], None)
+    assert "неизвестный вердикт" in text
+
+
+# ── #779, разрыв 2: событийный путь (workflow_run) обязан печатать СВОЮ
+# причину отказа «дифф не изменился», а не молчать под условием `and manual`,
+# пока шаг ai-review.yml утверждает, что причина уже напечатана строкой выше
+def test_event_dispatch_skip_reason_names_verdict_and_age_no_manual_wording():
+    created = datetime.now(timezone.utc) - timedelta(minutes=12)
+    ai_comment = {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    text = ai.event_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "ai:ok" in text
+    minutes = int(text.split("(")[1].split(" мин назад")[0])
+    assert 11 <= minutes <= 13
+    assert "ручной" not in text  # этот путь не ручной — текст не должен звать его так
+    assert "force: true" not in text  # событийный путь не адресован владельцу с force-обходом
+
+
+def test_event_dispatch_skip_reason_falls_back_when_no_verdict_label():
+    text = ai.event_dispatch_skip_reason(399, ["review:ok"], None)
     assert "неизвестный вердикт" in text
 
 

@@ -141,6 +141,22 @@ def test_ai_review_workflow_run_name_matches_pr_review_workflow_name():
         "гейта (#208), даже если строковый литерал здесь совпадёт сам с собой")
 
 
+def test_ai_review_concurrency_does_not_cancel_in_progress():
+    # #779: весь аргумент «второй прогон отказывает дёшево, вердикт не
+    # теряется» (ai-review.yml:44-70) стоит ИМЕННО на cancel-in-progress:
+    # false — с true второй триггер отменял бы ПЕРВЫЙ уже летящий прогон
+    # (documented GitHub Actions concurrency semantics), тот самый
+    # silent-wrong класс, что отвергнут абзацем про общую группу (#419),
+    # только внутри одного PR вместо всех разом. Мутация: `true` красит
+    # этот тест.
+    doc = _doc(AI_REVIEW)
+    concurrency = doc.get("concurrency") or {}
+    assert concurrency.get("cancel-in-progress") is False, (
+        f"ai-review.yml: concurrency.cancel-in-progress={concurrency.get('cancel-in-progress')!r} "
+        "— второй триггер отменял бы летящий прогон вместо ожидания в очереди, "
+        "вердикт терялся бы (#779)")
+
+
 def test_ai_review_auto_start_requires_successful_pr_review():
     # Звено 3 (fail-closed в другую сторону): автозапуск дорогого второго
     # гейта — только после УСПЕШНОГО прогона первого. Прогон с находками

@@ -607,6 +607,27 @@ def test_stuck_gate_fact_line_budget_held_back_by_active_run():
     assert "ближайшем тике" not in line  # не путать с безусловным «сработает сам»
 
 
+def test_stuck_gate_fact_line_budget_carried_over_and_held_back_by_active_run():
+    # Сестринская ветка (#472/#329/#327: total>=limit, in_epoch<limit —
+    # попытки только в прошлых эпохах, текущей эпохе есть свежий бюджет) с
+    # летящим прогоном одновременно. До фикса held_back_by_run проверялся
+    # ТОЛЬКО в ветке total<limit — здесь текст молча возвращался к «должен
+    # сработать сам», хотя тик увидит занятость и сделает continue, не трогая
+    # бюджет: та же ложь класса #472, только во второй ветке. Мутация: убери
+    # проверку held_back_by_run из этой ветки — тест обязан покраснеть.
+    item = {
+        "pr": 4, "age_minutes": 200.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 3, "attempts_in_epoch": 0, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+        "held_back_by_run": 34278765696,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "попытки только в прошлых эпохах (3/3" in line
+    assert "в текущей бюджет есть (0/3)" in line
+    assert "придержан летящим прогоном run 34278765696" in line
+    assert "должен сработать сам" not in line  # тот же класс #472 во второй ветке
+
+
 def test_retry_budget_fact_reports_held_back_run(monkeypatch):
     # Прод-форма: retry_budget_fact спрашивает ТУ ЖЕ занятость, что и
     # scheduler.trigger_ai_review перед диспатчем (review_labels.

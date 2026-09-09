@@ -873,11 +873,10 @@ def event_dispatch_duplicate_reason(pr: int, other_run: dict) -> str:
     )
 
 
-def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
-    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
-    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
-    сколько минут назад он вынесен, и что делать вместо ручного повтора
-    (правило репозитория: отказ без «что дальше» не принимается)."""
+def _verdict_label_and_age(current_labels, ai_comment: dict | None) -> tuple[str, str]:
+    """Общая часть текста «дифф не изменился» для обоих путей триггера —
+    вердикт и его возраст, без адресата (тот разный у manual/event, см.
+    manual_dispatch_skip_reason и event_dispatch_skip_reason)."""
     names = review_labels._names(current_labels)
     verdict_label = next(
         (label for label in (review_labels.AI_OK, review_labels.AI_CHANGES) if label in names),
@@ -891,12 +890,40 @@ def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None
             age = f"{minutes} мин назад"
         except ValueError:
             pass
+    return verdict_label, age
+
+
+def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
+    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
+    сколько минут назад он вынесен, и что делать вместо ручного повтора
+    (правило репозитория: отказ без «что дальше» не принимается)."""
+    verdict_label, age = _verdict_label_and_age(current_labels, ai_comment)
     return (
         f"::notice::ручной прогон PR #{pr} отклонён: дифф не изменился с "
         f"последнего вердикта {verdict_label} ({age}) — второй прогон на том "
         "же коде ничего нового не покажет. Автоматический повтор придёт сам, "
         "если дифф изменится; принудительный пересмотр ровно этого же "
         "диффа — запуск с явным входом force: true."
+    )
+
+
+def event_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст события-пути (workflow_run от pr-review) на том же go=false, что
+    manual_dispatch_skip_reason, — «дифф не изменился с последнего вердикта».
+    Отдельная функция, не переиспользование manual_dispatch_skip_reason:
+    адресат другой (лог job'а, никто руками этот прогон не дёргал) и текст не
+    должен звать прогон «ручным», раз он им не является (#779, разрыв 2: до
+    этой правки печать была заперта условием `and manual` — событийный путь,
+    самый частый (68 из 134 прогонов, замер 2026-09-08), на этой ветке молчал
+    в stderr вовсе, хотя шаг ai-review.yml утверждает читателю, что точная
+    причина уже напечатана строкой выше)."""
+    verdict_label, age = _verdict_label_and_age(current_labels, ai_comment)
+    return (
+        f"::notice::прогон PR #{pr} останавливается без вызова модели: дифф "
+        f"не изменился с последнего вердикта {verdict_label} ({age}) — "
+        "повторный вызов модели на том же коде ничего нового не покажет. "
+        "Автоматический повтор придёт сам, если дифф изменится."
     )
 
 
@@ -956,8 +983,16 @@ def cmd_should_run(args: argparse.Namespace) -> int:
     stored_fp = (review_labels.header_facts(ai_comment.get("body") or "").get("diff")
                  if ai_comment else None)
     run_needed = review_labels.should_run_ai_review(current_labels, stored_fp, current_fp)
-    if not run_needed and manual:
-        print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
+    if not run_needed:
+        # Разрыв 2 (#779): печать была заперта условием `and manual` —
+        # событийный путь (самый частый, #779 разрыв 1) молчал в stderr, хотя
+        # шаг ai-review.yml утверждает читателю, что причина уже напечатана
+        # строкой выше. Оба пути обязаны печатать СВОЙ текст — читатель
+        # различает «ручной» от «событийный», не гадает (AGENTS.md).
+        if manual:
+            print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
+        else:
+            print(event_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
     # Единственная строка на stdout — bash-шаг ai-review.yml читает её как
     # $(...), никакого другого вывода в этой команде быть не должно.
     print("true" if run_needed else "false")
