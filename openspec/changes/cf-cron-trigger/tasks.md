@@ -43,6 +43,32 @@
       не должен нести опровергнутое самим PR утверждение. Переформулирован
       тем же текстом, что и `wrangler.jsonc`.
 
+## Исправление (issue #713): страховка молчала при dispatch_ok=false/run_confirmed=false
+
+- [x] Новый предикат `pulseNeedsRecoveryDispatch()` в `cf-worker/src/harness.ts`
+      — только возраст последнего пульса, без короткого замыкания на
+      `dispatch_ok`/`run_confirmed` (`pulseStale()` не тронута, остаётся
+      источником правды для бейджа `/api/status`).
+- [x] `scheduledTick()` использует `pulseNeedsRecoveryDispatch()` вместо
+      `pulseStale()`.
+- [x] Тесты прод-формы: `cf-worker/test/pulse.spec.ts` (юнит-предикат, 8
+      случаев, включая живые сценарии #713 — `dispatch_ok=false`+давно,
+      `run_confirmed=false`+давно) и `cf-worker/test/harness.spec.ts` (тест
+      (e) — интеграционный сценарий #713 через `scheduledTick()`, реальный
+      dispatch случается).
+- [x] Мутационное доказательство: возврат короткого замыкания
+      (`dispatch_ok`/`run_confirmed` до проверки возраста) красит оба живых
+      теста #713 в `pulse.spec.ts` и интеграционный тест (e) в
+      `harness.spec.ts`; восстановление зеленит все три.
+- [x] `proposal.md` — пересмотрен п.3 «Ключевой инвариант», добавлен раздел
+      «Проверяемый прод-критерий такта».
+- [x] `specs/journal-tasks-hands/spec.md` — п.46.2 переписан (было:
+      намеренное поведение; стало: пересмотрено и почему), добавлен п.46.5
+      (ссылка на прод-критерий).
+- [ ] Прод-критерий такта (proposal.md, «Проверяемый прод-критерий такта»)
+      проверен живым прогоном после деплоя фикса — задача:
+      [issue #717](https://github.com/mytab0r/edge-harness/issues/717).
+
 ## Вне рамок (см. proposal.md «Что вне рамок»)
 
 - [ ] Изменение интервала `HEARTBEAT.selfOrchestrationMs` самого `alarm()`.
