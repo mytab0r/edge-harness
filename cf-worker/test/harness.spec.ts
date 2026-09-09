@@ -884,6 +884,49 @@ describe("Cron Trigger: Harness#scheduledTick() — страховка, не в�
     }
   });
 
+  // Живой случай issue #713: последний ЗАПИСАННЫЙ пульс перед тем, как alarm()
+  // подвис, сам был неудачным (dispatch_ok: false) — pulseStale() для такого
+  // пульса навсегда возвращает false (не доходит до проверки возраста), и
+  // старый scheduledTick() молчал бы неограниченно долго, даже пройдя порог
+  // 2×selfOrchestrationMs. Докажи мутацией: замени в scheduledTick()
+  // `pulseNeedsRecoveryDispatch` обратно на `pulseStale` — этот тест
+  // покраснеет (dispatchCalls останется 0, pulse не обновится).
+  it("(e) пульс stale И последняя попытка провалилась (dispatch_ok=false) — резервный dispatch всё равно случается (issue #713)", async () => {
+    const stub = HARNESS_ID();
+    await seedPulse(stub, {
+      ts: STALE_TS(),
+      dispatch_ok: false,
+      detail: "dispatch отклонён: 403",
+      last_run_id: 100,
+      run_confirmed: null,
+    });
+    const realFetch = globalThis.fetch;
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    let dispatchCalls = 0;
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      if (isGitHubRunsCall(input)) {
+        return new Response(JSON.stringify({ workflow_runs: [{ id: 101 }] }), { status: 200 });
+      }
+      if (isGitHubDispatchCall(input)) {
+        dispatchCalls++;
+        return new Response(null, { status: 204 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await instance.scheduledTick();
+      });
+      expect(dispatchCalls).toBe(1);
+      const status = await getJson<{ last_pulse: { dispatch_ok: boolean; ts: number } | null }>("/api/status");
+      expect(status.last_pulse?.dispatch_ok).toBe(true);
+      expect(status.last_pulse!.ts).toBeGreaterThan(STALE_TS());
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
   it("возможности нет (GH_DISPATCH_TOKEN не задан) — scheduledTick тихо выходит, не звонит в GitHub", async () => {
     const stub = HARNESS_ID();
     await seedPulse(stub, { ts: STALE_TS(), dispatch_ok: true, detail: null, last_run_id: 100, run_confirmed: true });
