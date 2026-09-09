@@ -12,11 +12,17 @@ prompt_tokens/completion_tokens/total_tokens), не придумано с нул
 Запуск: python -m pytest scripts/measure/test_provider_latency.py -q
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
 import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import json
 import socket
 import urllib.error
-from pathlib import Path
 
 import pytest
 
