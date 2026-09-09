@@ -38,6 +38,35 @@ text=True)` без явного `encoding="utf-8"` в местах, вызыва
 
 import sys
 
+# ── Канонический текст bootstrap-блока (issue #723, доработка ревью PR #726,
+# блокирующая находка 3) ─────────────────────────────────────────────────────
+# Раньше гвардия (test_console_utf8_guard.py) проверяла только присутствие
+# ПОДСТРОКИ "console_utf8" где угодно в файле — докстринг, комментарий вида
+# «# TODO: подключить console_utf8 когда-нибудь» или блок со СКОПИРОВАННОЙ, но
+# неверной глубиной пути проходили гвардию, ничего не подключая (доказано
+# мутацией при ревью PR #726). Единственное место правды теперь — эти две
+# константы; гвардия требует их ДОСЛОВНОГО присутствия в файле, выбирая
+# ожидаемую форму по расположению файла: BOOTSTRAP_BLOCK_SAME_DIR — для точек
+# входа внутри scripts/lib/ (console_utf8.py лежит рядом), BOOTSTRAP_BLOCK_
+# PARENT_LIB — для всех остальных (scripts/<sub>/*.py, ровно один уровень
+# вложенности ниже scripts/ — других форм в дереве на 2026-09-09 нет).
+PATH_EXPR_SAME_DIR = 'parent / "console_utf8.py"'
+PATH_EXPR_PARENT_LIB = 'parent.parent / "lib" / "console_utf8.py"'
+
+_BOOTSTRAP_TEMPLATE = (
+    "# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding "
+    "на Windows, issue #723) ---\n"
+    "import importlib.util\n"
+    "from pathlib import Path\n"
+    "_console_utf8_spec = importlib.util.spec_from_file_location(\n"
+    '    "console_utf8", Path(__file__).resolve().{path_expr})\n'
+    "_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))\n"
+    "# --- конец console_utf8 bootstrap ---\n"
+)
+
+BOOTSTRAP_BLOCK_SAME_DIR = _BOOTSTRAP_TEMPLATE.format(path_expr=PATH_EXPR_SAME_DIR)
+BOOTSTRAP_BLOCK_PARENT_LIB = _BOOTSTRAP_TEMPLATE.format(path_expr=PATH_EXPR_PARENT_LIB)
+
 
 def ensure_utf8_stdio() -> None:
     """Переключить sys.stdout/sys.stderr на UTF-8. Безопасно вызывать
@@ -51,8 +80,18 @@ def ensure_utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except (ValueError, OSError):
             # Поток не поддерживает reconfigure в этом состоянии (уже закрыт,
-            # экзотическая обёртка) — не наше дело падать из-за косметики.
-            pass
+            # экзотическая обёртка) — не наше дело падать из-за косметики. Но
+            # молчать нельзя (находка ревью PR #726, Н2): без явного следа
+            # скрипт продолжит работу со strict-кодировкой локали, и «фикса
+            # нет» станет неотличимо от «фикс есть, но не сработал». ASCII-
+            # only — сам обработчик записи в этот поток, скорее всего, тоже
+            # неисправен, кириллица в сообщении об этом отказе не поможет.
+            print(
+                f"console_utf8: WARNING - reconfigure(encoding=utf-8) failed for sys.{name} "
+                "- this stream is still on the legacy locale codepage and may raise "
+                "UnicodeEncodeError/UnicodeDecodeError on non-ASCII text (issue #723)",
+                file=sys.__stderr__,
+            )
 
 
 ensure_utf8_stdio()

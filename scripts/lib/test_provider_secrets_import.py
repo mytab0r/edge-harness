@@ -1013,7 +1013,7 @@ def test_set_secret_value_never_in_argv(monkeypatch):
         returncode = 0
         stderr = ""
 
-    def fake_run(args, input=None, text=None, capture_output=None):
+    def fake_run(args, input=None, text=None, capture_output=None, **_kwargs):
         calls.append((list(args), input))
         return FakeCompleted()
 

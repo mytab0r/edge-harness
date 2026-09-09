@@ -4147,7 +4147,7 @@ def test_task_sh_composes_claim_via_worker_run_format():
     <id>», а пишет его task.sh (CLAIM_VIA). Переименование формата в одном
     месте без другого обязано краснить этот тест, а не молча сломать
     эвристику #220."""
-    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text()
+    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text(encoding="utf-8")
     assert 'CLAIM_VIA="worker run ${GITHUB_RUN_ID' in task_sh
 
 
