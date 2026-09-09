@@ -120,6 +120,13 @@ while IFS= read -r f; do
         # test_provider_latency.py выше: разбирают прод-форму URL/id этих же
         # провайдеров, не источник правды.
         "scripts/measure/test_provider_model_discovery.py:"*) continue ;;
+        # Реестр ПОДТВЕРЖДЁННЫХ живым запросом id (#737, #848) — по смыслу
+        # ФАЙЛА он обязан нести литеральные id прежних И текущих провайдеров
+        # (sha256 + прозовое evidence с id для читаемости), это не дефолт-
+        # провайдер класса #153: значение читается только через sha256-хэш
+        # (dsh_model_confirmed в dsh-ci.sh), сама строка id используется
+        # только в комментарии evidence для человека.
+        "scripts/lib/confirmed-provider-models.json:"*) continue ;;
       esac
       if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
         case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
@@ -131,7 +138,7 @@ while IFS= read -r f; do
         case "$content" in *'deepseek-v4-flash"'*) continue ;; esac
       fi
       if [ "$f" = "scripts/measure/provider_latency.py" ]; then
-        case "$content" in *'"NVIDIA-nano"'*|*'"NVIDIA-ultra"'*|*'"Ollama"'*|*'"OpenRouter"'*|*'"GLM"'*) continue ;; esac
+        case "$content" in *'"NVIDIA-nano"'*|*'"NVIDIA-ultra"'*|*'"Ollama"'*|*'"OpenRouter"'*|*'"GLM"'*|*OPENROUTER_FREE_MODEL_OVERRIDE*) continue ;; esac
       fi
       if [ "$f" = "scripts/measure/provider_model_discovery.py" ]; then
         # CODING_RANK_KEYWORDS (#848) — эвристика ранжирования СРЕДИ УЖЕ
