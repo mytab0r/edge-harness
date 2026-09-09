@@ -38,7 +38,7 @@ def test_repo_root_comes_from_cwd_not_from_script_location(tmp_path: Path):
     # и импорт не должен падать на отсутствии файла в cwd.
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--print-repo-root-for-test"],
-        cwd=tmp_path, capture_output=True, text=True,
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8",
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
     printed_root = Path(result.stdout.strip())

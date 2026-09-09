@@ -290,7 +290,7 @@ index cfff36a..be11683 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1618,72 @@ export class EdgeSessionStore {
+@@ -1496,6 +1618,107 @@ export class EdgeSessionStore {
    }
  }
  
@@ -349,12 +349,47 @@ index cfff36a..be11683 100644
 +      || typeof sourceField !== 'object' || typeof (sourceField as { kind?: unknown }).kind !== 'string') {
 +      throw fail('"user/message" requires role "user", content blocks, and a source')
 +    }
++    // #794: dsh-session::assertMessageEventShape (dsh-session/lib/index.js) is
++    // never called on THIS write path — only on the next cold load of this
++    // session (adoptStoredEvents) — so an event missing a non-empty string
++    // `id` here is accepted silently and only throws later, as "session event
++    // at seq <n> lacks an identified message", when the owner reopens the
++    // session. Reject it here instead, loud, before a single byte is stored.
++    if (typeof data.id !== 'string' || data.id === '') {
++      throw fail('"user/message" requires a non-empty string id')
++    }
 +  }
 +  if (type === 'assistant/message' || type === 'tool/result') {
 +    const message = data.message
 +    if (message === null || typeof message !== 'object' || Array.isArray(message)
 +      || !Array.isArray((message as { content?: unknown }).content)) {
 +      throw fail(`"${type}" requires a message object with content blocks`)
++    }
++    // Same #794 gap as user/message above, for the wrapped message shape.
++    const record = message as Record<string, unknown>
++    if (typeof record.id !== 'string' || record.id === '') {
++      throw fail(`"${type}" requires a non-empty string message.id`)
++    }
++    if (type === 'assistant/message') {
++      // assertMessageEventShape also requires role "assistant" and a model
++      // source with provider+model (dsh-session/lib/index.js::hasProviderModel)
++      // for this type specifically — an id alone is not sufficient to pass
++      // validation on the next cold load, only to move which field trips it.
++      // tool/result's own extra shape (source.kind "tool"/callId, single
++      // tool-result content block) is deliberately NOT mirrored here: nothing
++      // in this deployment produces a tool/result ingest event yet, and a
++      // check with no real producer to feed it prod-form data is exactly the
++      // "тест кормит прод-форму данных, а не пересказ" trap — left for
++      // whoever adds that writer next.
++      const sourceField = record.source
++      const sourceRecord = sourceField !== null && typeof sourceField === 'object' && !Array.isArray(sourceField)
++        ? (sourceField as Record<string, unknown>)
++        : undefined
++      if (record.role !== 'assistant' || sourceRecord === undefined || sourceRecord.kind !== 'model'
++        || typeof sourceRecord.provider !== 'string' || sourceRecord.provider === ''
++        || typeof sourceRecord.model !== 'string' || sourceRecord.model === '') {
++        throw fail('"assistant/message" requires role "assistant" and a model source with provider/model')
++      }
 +    }
 +  }
 +  return { type, data, surface: HARNESS_SURFACE_EVENT_TYPES.has(type) }

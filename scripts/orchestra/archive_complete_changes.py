@@ -49,6 +49,14 @@ directory» (живой факт: прогон repo-ci.yml 34036104522 сраз�
   cd <дерево ветки PR> && python <main>/scripts/orchestra/archive_complete_changes.py
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import importlib.util
 import re
 import subprocess
@@ -132,7 +140,7 @@ def configure_git_identity(repo_root: Path) -> None:
     единственный источник identity, второй копией здесь не заводим."""
     who = subprocess.run(
         ["gh", "api", "user", "--jq", "[.login, (.id|tostring)] | @tsv"],
-        cwd=repo_root, check=True, capture_output=True, text=True,
+        cwd=repo_root, check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout.strip()
     login, user_id = who.split("\t")
     subprocess.run(["git", "config", "user.name", login], cwd=repo_root, check=True)
@@ -163,7 +171,7 @@ def main() -> int:
     subprocess.run(["git", "add", "-A"], cwd=REPO_ROOT, check=True)
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=REPO_ROOT,
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout
     if not status.strip():
         print("archive_complete_changes: git mv не дал диффа (уже применено) — no-op")

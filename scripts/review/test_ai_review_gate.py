@@ -93,7 +93,7 @@ def run_facts(labels: str, tmp_path: Path) -> dict[str, str]:
         # разбором ветки/владельца головы.
     }
     result = subprocess.run([bash_executable(), "-c", script], env=env,
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, (
         f"facts-шаг упал (rc={result.returncode}): stdout={result.stdout!r} "
         f"stderr={result.stderr!r}")

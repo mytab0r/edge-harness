@@ -40,6 +40,7 @@ Commit Status API (#345, кандидат из docs/research/23-platform-native-
 import hashlib
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -57,6 +58,22 @@ AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 # Любой момент времени на PR должен существовать не более чем один из этих
 # трёх; своп решает verdict_label_changes ниже.
 REVIEW_VERDICTS = (REVIEW_OK, REVIEW_CHANGES, REVIEW_LARGE)
+
+# ── Классификация причины verdict=error (#431) ───────────────────────────────
+# Четыре состояния transport_failed/error_reason различают уже с #419 —
+# reason_tag ниже даёт им короткие теги, чтобы их читал не только человек
+# (findings — проза), но и scheduler.trigger_ai_review (факт `reason:` в
+# шапке комментария, см. FACT_RE/header_facts): «квота исчерпана на неделю»
+# и «модель ответила криво» — разные вещи и заслуживают разного числа
+# автоповторов, а парсить прозу findings для этого решения нельзя — находка
+# #431 на PR #329: findings там оказался ПРОЗОЙ МОДЕЛИ ("Установка прошла
+# неполно..."), а не текстом error_reason, потому что reason подставляется в
+# findings, только если findings пуст (см. ai_review.cmd_verdict) — прод-
+# форма подтверждает: решение обязано читать структурный факт, не пересказ.
+FAILURE_REASON_QUOTA_EXHAUSTED = "quota_exhausted"
+FAILURE_REASON_RATE_LIMIT_BUDGET = "rate_limit_retry_budget_exceeded"
+FAILURE_REASON_TRANSPORT = "transport_error"
+FAILURE_REASON_CONTRACT = "contract_violation"
 
 # ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
 # Единственное определение (было задублировано локальной константой в
@@ -416,7 +433,16 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
     должен отнимать этот газ, иначе повторная попытка после сбоя
     провайдера/транспорта молча перестанет случаться. Вердикта нет вовсе
     (первое ревью PR) — прогон тоже нужен, пропускать нечего.
-    """
+
+    Намеренно НЕ читает «летит ли прогон прямо сейчас» (#779, разрыв 4):
+    второй копии other_active_ai_review_runs здесь не заводим — эта функция
+    отвечает только на вопрос «этот код уже ревьюили», а «его ревьюят прямо
+    сейчас» решает other_active_ai_review_runs у ВСЕХ вызывающих (cmd_should_run
+    для обоих путей триггера, trigger_ai_review) ДО обращения сюда. С этой
+    проверкой выше по стеку у ai:failed эффективно получается «повтор нужен,
+    если прогона сейчас не летит» — один повтор на неизменившийся отпечаток,
+    а не столько, сколько раз сработает таймер, — без переписывания самого
+    предиката отпечатка."""
     names = _names(current_labels)
     if AI_FAILED in names:
         return True
@@ -430,11 +456,46 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 # provider/reset-at — факты цепочки провайдеров (#727): имя провайдера,
 # фактически ответившего, и даты сброса опробованных — читает
 # scheduler.py::trigger_ai_review, чтобы не жечь авто-повтор (#196) вслепую
-# в ту же квоту. Разбор останавливается на первой пустой строке, чтобы
-# проза/фенсы ниже не притворялись фактами (см. header_facts). Одно место
-# правды — раньше жило только в ai_review.py, check_pr.py читало бы вторую
-# копию regex.
-FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at):\s*(.+)$")
+# в ту же квоту. reason — тег причины verdict=error (#431, см.
+# FAILURE_REASON_* выше). Разбор останавливается на первой пустой строке,
+# чтобы проза/фенсы ниже не притворялись фактами (см. header_facts). Одно
+# место правды — раньше жило только в ai_review.py, check_pr.py читало бы
+# вторую копию regex.
+FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at|reason):\s*(.+)$")
+
+
+def transport_failed(dsh_rc: str) -> bool:
+    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
+
+    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
+    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
+    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
+    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
+    точный «модель ответила не по контракту» в редком крайнем случае.
+
+    Одно место правды (#431): раньше жила только в ai_review.py — scheduler
+    (reason_tag ниже) теперь тоже классифицирует по ней, второй копии не
+    заводим (ai_review.transport_failed — реэкспорт отсюда, как и header_facts)."""
+    try:
+        return int(dsh_rc) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def reason_tag(dsh_rc: str, failure_reason: str = "") -> str:
+    """Короткий машиночитаемый тег причины verdict=error — одно из
+    FAILURE_REASON_* выше. Пара к ai_review.error_reason (тот же порядок
+    проверки и те же входы), но возвращает тег для шапки комментария
+    (`reason:`, см. FACT_RE), не текст для человека — scheduler.trigger_ai_review
+    (#431) решает по тегу, не по прозе findings (findings может оказаться
+    и текстом самой модели, см. FAILURE_REASON_* докстринг выше)."""
+    if failure_reason == FAILURE_REASON_QUOTA_EXHAUSTED:
+        return FAILURE_REASON_QUOTA_EXHAUSTED
+    if failure_reason == FAILURE_REASON_RATE_LIMIT_BUDGET:
+        return FAILURE_REASON_RATE_LIMIT_BUDGET
+    if transport_failed(dsh_rc):
+        return FAILURE_REASON_TRANSPORT
+    return FAILURE_REASON_CONTRACT
 
 # ── Автор вердикта — не любой комментатор (дыра, найдена вердиктом ai-review
 # PR #294, у неё выше приоритет, чем у самого #294) ──────────────────────────
@@ -483,7 +544,8 @@ def header_facts(comment_body: str) -> dict[str, str]:
     return facts
 
 
-def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches) -> dict | None:
+def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches,
+                           since: datetime | None = None) -> dict | None:
     """Последний комментарий ДОВЕРЕННОЙ сервисной учётки
     (_is_trusted_verdict_author), тело которого удовлетворяет
     `body_matches(body)` — общий обход «найти свой прошлый комментарий на PR».
@@ -497,11 +559,22 @@ def latest_trusted_comment(repo: str, pr: int, gh_func, body_matches) -> dict | 
     участник может опубликовать любой текст (находка вердикта ai-review
     PR #294) — доверять телу можно только после проверки автора, не вместо
     неё. Порядок выдачи API сохраняется (extend по страницам подряд),
-    «последний по порядку среди доверенных» возвращается как есть."""
+    «последний по порядку среди доверенных» возвращается как есть.
+
+    `since` — необязательный якорь эпохи (находка ревью PR #439): без него
+    функция читает всю историю PR, что для check_pr.py/ai_review.py верно
+    (им нужен последний вердикт вообще, для сравнения отпечатка диффа), но
+    неверно там, где решение обязано различать «вердикт ЭТОЙ эпохи» от
+    «вердикт эпохи прошлой» (scheduler.latest_ai_failure_reason) — комментарии
+    с created_at <= since пропускаются целиком, как будто их не было."""
     latest = None
     for comment in list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh_func):
         if not _is_trusted_verdict_author(comment):
             continue
+        if since is not None:
+            created_at = comment.get("created_at")
+            if not created_at or datetime.fromisoformat(created_at.replace("Z", "+00:00")) <= since:
+                continue
         if body_matches(comment.get("body") or ""):
             latest = comment
     return latest
@@ -511,7 +584,7 @@ def _is_ai_verdict_body(body: str) -> bool:
     return header_facts(body).get("reviewer") in ("approve", "rework", "error")
 
 
-def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
+def latest_ai_comment(repo: str, pr: int, gh_func, since: datetime | None = None) -> dict | None:
     """Последний комментарий AI-ревью PR (шапка с решающим `reviewer:`,
     опубликованный доверенной учёткой — _is_trusted_verdict_author) —
     источник сохранённого отпечатка диффа для check_pr.py. `gh_func` —
@@ -520,9 +593,10 @@ def latest_ai_comment(repo: str, pr: int, gh_func) -> dict | None:
     зашивается, чтобы функция оставалась инъекцией зависимости и её решение
     (diff_unchanged) проверялось без сети.
 
-    Обход и фильтр доверия — общий latest_trusted_comment выше (#294, #308):
-    матч по значению шапки `reviewer:` отделён в _is_ai_verdict_body."""
-    return latest_trusted_comment(repo, pr, gh_func, _is_ai_verdict_body)
+    Обход и фильтр доверия — общий latest_trusted_comment выше (#294, #308),
+    включая необязательный якорь эпохи `since` (#431/#439): матч по значению
+    шапки `reviewer:` отделён в _is_ai_verdict_body."""
+    return latest_trusted_comment(repo, pr, gh_func, _is_ai_verdict_body, since=since)
 
 
 # ── Идемпотентная публикация вердиктов и комментариев провала (#203) ─────────
@@ -707,6 +781,47 @@ AI_REVIEW_WORKFLOW_FILE = "ai-review.yml"
 # разойтись молча (yml не читает эту константу — два языка).
 AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
 
+# Потолок возраста для «прогон ai-review.yml летит прямо сейчас» (#779,
+# блокирующая 2 второго гейта): то же число, что `timeout-minutes:` самого
+# job'а review в ai-review.yml — тест
+# test_ai_review_timeout_minutes_matches_review_labels_constant в
+# scripts/review/test_ai_review.py сверяет буквально (yml не читает эту
+# константу — два языка, как и AI_REVIEW_RUN_NAME_PREFIX выше). Без потолка
+# `queued`/`in_progress` читались бы как «летит» сколько угодно долго, хотя
+# GitHub сам оборвёт job по timeout-minutes — окно конечно, а предикат об
+# этом не знал: 40-часовой мнимый «летит» глушил бы разом занятость
+# (other_active_ai_review_runs) и автоповтор (trigger_ai_review), не тратя
+# бюджет попыток, и инвариант 3 (repo_invariants.retry_budget_fact) молчал
+# бы «бюджет ещё есть», хотя двигаться он не может.
+AI_REVIEW_TIMEOUT_MINUTES = 130
+
+
+def parse_github_timestamp(raw: str | None) -> datetime | None:
+    """Единственное место разбора метки времени формата Actions/Issues API
+    (`created_at`) в aware datetime UTC — не бросает исключений наружу
+    (#780, доводка #779). Класс: `datetime.fromisoformat(raw.replace("Z",
+    "+00:00"))` ПАРСИТ метку без offset ("Z"/"+HH:MM") как наивный datetime
+    без ValueError — падение приходит НИЖЕ по коду, на `aware - naive`
+    вычитании/сравнении. До этой правки класс был закрыт по одной копии
+    `except (ValueError, TypeError)` в каждом вызывающем месте
+    (`other_active_ai_review_runs` и `ai_review._verdict_label_and_age`) —
+    второе появилось в этом же PR #779 и сперва ловило только ValueError
+    (находка доводки #780). Копия try/except на каждое новое место —
+    отложенный рецидив (AGENTS.md «одно место правды»): эта функция вместо
+    этого нормализует наивный результат в aware (UTC — Actions/Issues API
+    прод-формой всегда её и подразумевает, #779) и возвращает None на любую
+    строку, которая не разбирается вовсе. Вызывающий трактует None как
+    «метки нет» — ровно то же решение, что раньше принимал `except`."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
 
 def ai_review_run_name(pr: int) -> str:
     """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
@@ -721,16 +836,80 @@ def ai_review_run_name(pr: int) -> str:
     return f"{AI_REVIEW_RUN_NAME_PREFIX}{pr}"
 
 
-def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> list[dict]:
+def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
+                                 now: datetime | None = None) -> list[dict]:
     """Прогоны `ai-review.yml` (`queued`/`in_progress`) для PR #pr, кроме
-    прогона `exclude_run_id` (себя) — читает ручной `workflow_dispatch`
-    (`ai_review.py::cmd_should_run`), чтобы отказать, если ревью этого PR уже
-    идёт прямо сейчас: второй одновременный прогон денег ждать не должен.
+    прогона `exclude_run_id` (себя) — единственное место правды на «летит ли
+    прогон этого PR прямо сейчас» (#779, критерий 4: третьей копии этой
+    проверки не заводим). Шесть точек вызова читают её же: ручной
+    workflow_dispatch И событийный workflow_run (`ai_review.py::cmd_should_run`,
+    #399 и #779 разрыв 1), `scheduler.py::trigger_ai_review` ПЕРЕД диспатчем
+    (#779 разрыв 2), `scheduler.py::update_branch` (#488),
+    `mechanical_rebase.py` (issue #764, тот же тормоз, что update_branch —
+    не двигаем head механическим рёбейзом, пока по PR летит ai-review.yml) и
+    `repo_invariants.py::retry_budget_fact` (#779, блокирующая 3 — держит ли
+    летящий прогон автоповтор, для инварианта 3) — второй одновременный
+    прогон денег ждать не должен, а подтягивание/рёбейз ветки не должны
+    двигать head из-под летящего ревью.
 
     Не листает глубже одной страницы на статус (`per_page=100`): одновременно
     активных прогонов одного workflow на масштабе этого репозитория ожидается
     единицы, не сотни — при реальном превышении это отдельная, более крупная
-    проблема, которую этот гейт не обязан решать."""
+    проблема, которую этот гейт не обязан решать.
+
+    Потолок возраста (#779, блокирующая 2): прогон старше
+    AI_REVIEW_TIMEOUT_MINUTES по `created_at` летящим не считается — GitHub
+    сам оборвёт такой job по `timeout-minutes` job'а `review` в
+    .github/workflows/ai-review.yml (число сверяется тестом
+    test_ai_review_timeout_minutes_matches_review_labels_constant, не
+    номером строки — тот протухает при вставке строк выше), а без
+    потолка он маскировал бы занятость бесконечно. Отсутствие/битый
+    `created_at` — не повод молча исключить прогон из списка активных (это
+    была бы деградация в обратную сторону, тише про реальную занятость);
+    такой прогон остаётся в списке как раньше.
+
+    `now` — по умолчанию реальное время; параметр существует только для
+    детерминированных тестов потолка (никто из шести вызывающих его не
+    передаёт).
+
+    Неточность потолка для `queued` (не блокирует, названо явно #780,
+    доводка #779): `timeout-minutes` GitHub применяет ко времени ИСПОЛНЕНИЯ
+    job'а (`in_progress`), а не ко времени ожидания в очереди — для
+    `queued`-прогона фраза «GitHub сам оборвёт по timeout-minutes» выше
+    буквально неверна: часы обрыва не идут, пока прогон не стартовал.
+    Практическое окно узкое (concurrency-группа по номеру PR, эта же правка
+    #779, не пускает второй `queued`-прогон дальше одного ждущего, а тот
+    стартует не позже, чем завершится/оборвётся летящий, ограниченный теми
+    же AI_REVIEW_TIMEOUT_MINUTES) — но это довод о практике, не о буквальном
+    смысле `timeout-minutes`, и подменять его текстом «GitHub оборвёт»
+    буквально для обоих статусов сразу — то же самое приближение, которое
+    эта функция обязана называть честно, а не молчать.
+
+    Граница форк-PR (не блокирует, названо явно #779): у форк-PR
+    `pull_requests[0]` пуст, `ai_review_run_name`-фолбэк даёт голый
+    "ai-review" вместо "ai-review PR #N" (см. её докстринг) — тогда ЭТА
+    функция не находит своих же прогонов вовсе (`display_title != target`
+    для любого форк-прогона), то есть на форк-PR выключены ОБА тормоза
+    одновременно: и «прогон уже летит», и очередь concurrency-группы
+    ai-review.yml (та же деградация в fallback, тот же корень). Сегодня
+    форк-PR в репозитории нет (прочёс 1425 прогонов, #779: голые
+    display_title — все ДО внесения run-name, в свежих 600 аномалий ноль,
+    head_repository у всех свой) — граница не устранена, только названа.
+
+    Слепота к статусу `pending` (не блокирует, названо явно #779): Actions
+    API знает статусы `queued`/`in_progress`/`completed`/`waiting`/
+    `requested`/`pending` — эта функция опрашивает только первые два.
+    Concurrency-группа по номеру PR (эта же правка #779) ВПЕРВЫЕ в истории
+    репозитория создаёт `pending`-прогоны (второй триггер того же PR ждёт
+    своей очереди в группе). Для `cmd_should_run` слепота к `pending` делает
+    схему верной: летящий прогон не видит ждущего и спокойно публикует
+    вердикт, ждущий стартует уже в одиночку и отказывает дёшево по
+    отпечатку — на этом слепота и держится, а не вопреки ей. Для трёх
+    других вызывающих (`update_branch`, `mechanical_rebase.py`,
+    `trigger_ai_review`) это то же самое узкое окно, где тормоз не
+    срабатывает: они могут сдвинуть head/задиспатчить повтор, пока
+    `pending`-прогон ждёт своей очереди, невидимый им."""
+    now = now or datetime.now(timezone.utc)
     target = ai_review_run_name(pr)
     matches: list[dict] = []
     for status in ("in_progress", "queued"):
@@ -738,11 +917,19 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> 
             f"repos/{repo}/actions/workflows/{AI_REVIEW_WORKFLOW_FILE}/runs"
             f"?status={status}&per_page=100")
         runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
-        matches.extend(
-            run for run in runs
-            if run.get("display_title") == target
-            and str(run.get("id")) != str(exclude_run_id)
-        )
+        for run in runs:
+            if run.get("display_title") != target:
+                continue
+            if str(run.get("id")) == str(exclude_run_id):
+                continue
+            created_at = run.get("created_at")
+            created = parse_github_timestamp(created_at)
+            # Битая/наивная строка (см. parse_github_timestamp) даёт None —
+            # прогон остаётся в списке активных как раньше, без ValueError/
+            # TypeError наружу (#780, доводка #779).
+            if created is not None and now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
+                continue  # старше потолка — GitHub оборвёт сам, не блокируем
+            matches.append(run)
     return matches
 
 

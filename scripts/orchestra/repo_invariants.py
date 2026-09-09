@@ -85,6 +85,36 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      CI_GATING: измерение на живом репозитории до нуля нарушений ещё не
      сделано (тот же порядок, что у 1/5 — включение отдельной правкой
      константы после замера).
+  9. check_declared_deps_mismatch (#710, продолжение #371/#529) — расхождение
+     между структурно объявленной связью в теле задачи («Чем блокируется»/
+     «Что блокирует»/инлайн «БЛОКИРУЕТСЯ: …», разбор
+     `scripts/lib/declared_deps.py`) и нативным `blockedBy` — В ОБЕ СТОРОНЫ:
+     поле называет открытый номер без нативного ребра («missing») И нативное
+     ребро есть, а поле его не называет, включая явный ответ «ничем» при
+     непустом графе («stale» — связь поставлена мимо текста задачи, текст
+     лжёт о своей зависимости; живой случай на замере 2026-09-08: #679
+     отвечает «БЛОКИРУЕТСЯ: ничем», нативный `blockedBy` содержит #605).
+     «missing» на push repo-ci честно значит дефект переноса —
+     `declared_deps.py::auto_wire` уже отработал в том же push раньше этого
+     шага (см. repo-ci.yml, порядок шагов). На PR/пульсе orchestra (главный
+     канал по расписанию ниже) и сразу после правки поля руками на GitHub
+     это НЕ гарантировано: wire запускается только чужим push/merge в main,
+     а не по этим триггерам, поэтому «missing» в эти окна может значить
+     «ещё не доехал», а не дефект самого auto_wire — проверяй по газу
+     GATING_RELEASE_CONDITION[9], не по докстрингу отчёта. Issue без поля
+     вовсе (`declared_deps.declared_blocked_by` вернул `None`) не
+     проверяется — судить не о чем. Живой замер на день внедрения — 1
+     нарушение (#679, kind=stale) — поэтому наблюдательный, не гейтящий (см.
+     CI_GATING ниже и условие возврата в GATING_RELEASE_CONDITION[9]).
+  10. check_recurring_worker_failure (#794) — N подряд прогонов worker.yml
+      упали с ОДНОЙ и той же классифицированной причиной (по факту лога,
+      pulse_guard.last_error_log_line, не по гипотезе). Класс, который
+      failure_watch не ловит по построению (окно свежести 30 минут и дедуп
+      «одна задача на класс», не «сколько раз подряд за много часов») —
+      живой случай: 9 прогонов подряд на сессии harness-257 за 18 часов
+      (порча записи журнала без message.id, #480/#794). Наблюдательный, не
+      гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
+      PR (см. блок-комментарий у самой функции).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -134,6 +164,14 @@ docs/agents/OPENSPEC-PROTOCOL.md, раздел про массовую архи�
   python scripts/orchestra/repo_invariants.py --orchestra  # печать + escalate (orchestra.yml)
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import importlib.util
 import os
@@ -157,6 +195,7 @@ parse_time = pulse_guard.parse_time
 minutes_between = pulse_guard.minutes_between
 escalate = pulse_guard.escalate
 issue_marker_times = pulse_guard.issue_marker_times
+issue_markers_any = pulse_guard.issue_markers_any
 WATCHDOG_ISSUE = pulse_guard.WATCHDOG_ISSUE
 # «PR нездоров дольше этого — действуй» — уже объявленный порог для «состояние
 # держится слишком долго» (scheduler.py, #196). Инварианты 1 и 3 переиспользуют
@@ -200,6 +239,20 @@ _SCH_SPEC = importlib.util.spec_from_file_location(
 scheduler = importlib.util.module_from_spec(_SCH_SPEC)
 _SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
 
+# task_deps.fetch_pool(..., include_body=True) — тот же единственный источник
+# графа блокировок, что уже читает declared_deps.py (#361/#371); declared_deps
+# — разбор структурного поля («Чем блокируется»/«Что блокирует»/инлайн
+# «БЛОКИРУЕТСЯ:»), задача #710, инвариант 9 ниже (check_declared_deps_mismatch).
+_TD_SPEC = importlib.util.spec_from_file_location(
+    "task_deps", REPO_ROOT / "scripts" / "lib" / "task_deps.py")
+task_deps = importlib.util.module_from_spec(_TD_SPEC)
+_TD_SPEC.loader.exec_module(task_deps)  # type: ignore[union-attr]
+
+_DD_SPEC = importlib.util.spec_from_file_location(
+    "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
+declared_deps = importlib.util.module_from_spec(_DD_SPEC)
+_DD_SPEC.loader.exec_module(declared_deps)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 
@@ -241,6 +294,17 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # 1, 2, 5 остаются наблюдательными по исходному решению владельца (см.
 # docstring выше). Включение любого номера — явная правка этой константы
 # после проверки условия.
+#
+# Инвариант 9 (#710) заведён СРАЗУ наблюдательным, не гейтящим: живой замер
+# на день внедрения (2026-09-08) — 1 нарушение (#679, kind=stale, см.
+# докстринг check_declared_deps_mismatch) — гейтить с ненулевым долгом
+# означало бы покрасить `test` за чужую задачу, тот же класс «тормоз без
+# газа», от которого уже отказались для 1/4/5. Условие возврата —
+# GATING_RELEASE_CONDITION[9] (машинно проверяемое: 0 нарушений инварианта на
+# живом пуле, не «когда починим руками»). НЕ повторяй судьбу #666
+# (наблюдательный инвариант с нулевым долгом сам не гейтится обратно —
+# возврат держится на памяти): газ здесь назван явно и заранее, не после
+# находки.
 CI_GATING: frozenset[int] = frozenset({7})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
@@ -262,6 +326,22 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
        "Если формулировка нужна как цитата самого инцидента — расширь паттерн "
        "инварианта осознанно, с комментарием, почему цитата безопаснее",
+    9: "для каждого «unrecognized»: поправь текст поля так, чтобы значение "
+       "читалось как список номеров (`#N`/голым `N`) или явное «ничем» — "
+       "формулировка не по одной из двух распознаваемых форм (#711); "
+       "для каждого «stale»: обнови текст поля («Чем блокируется»/«Что "
+       "блокирует») под фактический граф, ЛИБО сними лишнее ребро "
+       "(task_deps.py unblock), если оно ошибочно; для каждого «missing»: на "
+       "push repo-ci — проверь, что declared_deps.py wire реально прогнан "
+       "(см. repo-ci.yml) — если прогнан и всё равно missing, это дефект "
+       "самого auto_wire, не долг текста; на PR/пульсе orchestra или сразу "
+       "после ручной правки поля — это может значить «wire ещё не доехал» "
+       "(запускается только чужим push/merge в main), перепроверь после "
+       "следующего пульса, прежде чем считать дефектом. Ключ держим не в "
+       "CI_GATING (см. комментарий выше константы) — как и у 3/4, это факт "
+       "про газ, а не про то, гейтит ли сейчас 9. 0 нарушений на живом пуле "
+       "(python scripts/orchestra/repo_invariants.py, секция [9]) — машинно "
+       "проверяемое условие возврата",
 }
 
 
@@ -409,20 +489,82 @@ def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
     scheduler.ai_review_retry_count для решения «дёргать ли ai-review.yml
     снова» — не гадаем, а читаем то же число, что видит газ.
 
-    attempts_total — за ВСЮ историю PR (так считает сегодняшний
-    scheduler.trigger_ai_review — без since, #431/PR #439 со scoping'ом по
-    эпохе ещё не слит в main). attempts_in_epoch — только попытки С МОМЕНТА
-    anchor (текущая эпоха гейта 1). Расхождение между ними — сам факт
-    переноса бюджета из старой, уже решённой эпохи (живой случай #329/#327,
-    2026-09-06, issue #472): total уже равен лимиту, а in_epoch — 0, потому
-    что все три маркера остались от эпохи, которая давно получила вердикт."""
+    attempts_total — за ВСЮ историю PR, чистая история для СРАВНЕНИЯ эпох, не
+    для решения: газ #196 (scheduler.trigger_ai_review, since=anchor, #431)
+    решает бюджет по attempts_in_epoch. attempts_in_epoch — только попытки С
+    МОМЕНТА anchor (текущая эпоха гейта 1). Расхождение между ними по
+    построению НЕ бюджет прошлой эпохи, перенесённый в текущую (после #431
+    это больше не бага) — total > in_epoch означает «часть попыток осталась в
+    архиве прошлых эпох, текущая эпоха их не наследует»: живой случай
+    #329/#327, 2026-09-06, issue #472, где total уже был равен лимиту, а
+    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет».
+
+    held_back_by_run — третье состояние (#779, блокирующая 3): бюджет ещё
+    есть (attempts_in_epoch < лимита), но scheduler.trigger_ai_review САМ
+    придерживает автоповтор, потому что прогон ai-review.yml для этого PR
+    прямо сейчас летит (та же review_labels.other_active_ai_review_runs, что
+    читает газ #196 перед диспатчем, #779 разрыв 2 — третьей копии предиката
+    не заводим). До этого поля stuck_gate_fact_line писала «должен сработать
+    на ближайшем тике оркестратора» безусловно — после #779 это стало ложным
+    именно в этом состоянии: тик видит летящий прогон и делает continue, не
+    трогая бюджет, а инвариант 3 (единственная страховка, которая ещё
+    смотрит на это состояние) утверждал бы человеку неверное — тот самый
+    класс #472, который эта строка была написана закрыть."""
     attempt_times = sorted(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
     attempts_in_epoch = sum(1 for moment in attempt_times if moment >= anchor)
+    active = review_labels.other_active_ai_review_runs(
+        repo, pr_number, exclude_run_id=None, gh_func=gh)
     return {
         "attempts_total": len(attempt_times),
         "attempts_in_epoch": attempts_in_epoch,
         "attempts_limit": AI_REVIEW_MAX_ATTEMPTS,
         "last_attempt_at": attempt_times[-1].isoformat() if attempt_times else None,
+        "held_back_by_run": active[0]["id"] if active else None,
+    }
+
+
+def check_ai_failed_budget_exhausted(repo: str, now: datetime, pull: dict) -> dict | None:
+    """Класс #431 (находка ревью PR #439): PR застрял в `ai:failed` — газ
+    #196 (scheduler.trigger_ai_review) исчерпал бюджет автоповторов в этой
+    эпохе гейта 1 и должен был эскалировать в #120 сам (`AI_REVIEW_EXHAUSTED_
+    MARKER`), но раньше эта ветка была НЕВИДИМА check_stuck_review_gate
+    целиком: функция пропускала любой PR с ai:*-меткой, включая ai:failed —
+    тот самый случай, когда PR застрял НЕСМОТРЯ на газ #196, ровно то, что
+    докстринг check_stuck_review_gate обещал ловить. None — либо возраст
+    эпохи ещё в пределах порога, либо бюджет ещё не исчерпан (у #196 есть
+    шанс повторить сам), либо эскалация в этой эпохе уже стоит."""
+    anchor = last_gate1_labeled_at(repo, pull)
+    if anchor is None:
+        return None
+    age = minutes_between(anchor, now)
+    if age <= UNHEALTHY_PR_AFTER_MINUTES:
+        return None
+    budget = retry_budget_fact(repo, pull["number"], anchor)
+    if budget["attempts_in_epoch"] < AI_REVIEW_MAX_ATTEMPTS:
+        return None  # бюджет ещё не исчерпан в этой эпохе — #196 может повторить сам
+    marker = f"{pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #{pull['number']}"
+    # Находка ревью PR #439, вторая половина: газ #196 мог исчерпать бюджет
+    # ТРЕМЯ провалами, из которых последний — квота провайдера (ветка
+    # trigger_ai_review стоит РАНЬШЕ счётчика попыток и делает continue,
+    # эскалируя AI_REVIEW_QUOTA_MARKER, не AI_REVIEW_EXHAUSTED_MARKER).
+    # Инвариант обязан знать оба маркера — иначе он бьёт ложное
+    # «не эскалировано», хотя человек уже оповещён тем же каналом (#120),
+    # тот самый класс фолз-алерта, за который было стыдно в #472.
+    quota_marker = f"{pulse_guard.AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
+    already = issue_markers_any(repo, WATCHDOG_ISSUE, (marker, quota_marker))
+    if any(marker_at > anchor for marker_at, _ in already):
+        return None  # уже эскалировано в этой эпохе (любым из двух маркеров) — #196 справился сам
+    timeline = review_labels.list_timeline(repo, pull["number"], gh)
+    verdict_ever = last_ai_verdict_ever(timeline)  # сам ai:failed — тоже вердикт
+    return {
+        "pr": pull["number"],
+        "age_minutes": round(age, 1),
+        "labeled_at": anchor.isoformat(),
+        "verdict_ever": None if verdict_ever is None else {
+            "label": verdict_ever[0], "at": verdict_ever[1].isoformat(),
+        },
+        "reason": "ai_failed_budget_exhausted_not_escalated",
+        **budget,
     }
 
 
@@ -434,6 +576,12 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     (AI_REVIEW_RETRY_AFTER_MINUTES) с ограничением попыток
     (AI_REVIEW_MAX_ATTEMPTS) — этот инвариант ловит случай, когда PR застрял
     несмотря на газ #196.
+
+    `ai:failed` (газ #196 продолжает автоповторы или уже исчерпал бюджет) —
+    отдельная ветка, check_ai_failed_budget_exhausted (находка ревью #439):
+    здесь она НЕ решается по докстрингу «нет ai:*-метки», а обрабатывается
+    явно, иначе застрявший #431 навсегда остаётся невидим этому инварианту.
+    `ai:ok`/`ai:changes-requested` — вердикт гейта 2 уже есть, не застрял.
 
     #472 (живой алерт 2026-09-06 «либо исчерпал попытки, либо не сработал»):
     каждое нарушение несёт retry_budget_fact (сколько попыток из лимита
@@ -447,7 +595,14 @@ def check_stuck_review_gate(repo: str, now: datetime, open_pulls: list[dict]) ->
     violations = []
     for pull in open_pulls:
         labels = {label["name"] for label in pull["labels"]}
-        if not review_labels.gate1_decided(labels) or labels & ai_labels:
+        if not review_labels.gate1_decided(labels):
+            continue
+        if labels & ai_labels:
+            if review_labels.AI_FAILED not in labels:
+                continue  # ai:ok/ai:changes-requested — вердикт уже есть
+            violation = check_ai_failed_budget_exhausted(repo, now, pull)
+            if violation is not None:
+                violations.append(violation)
             continue
         anchor = last_gate1_labeled_at(repo, pull)
         if anchor is None:
@@ -480,26 +635,71 @@ def stuck_gate_fact_line(item: dict) -> str:
     API (логи прогона) на КАЖДЫЙ застрявший PR каждые 15 минут — новый,
     дорогой класс вызовов, который эта задача сознательно не заводит (см.
     issue #472, экономия квоты GitHub API — она же сегодня отжирала себя у
-    чужих обязательных проверок)."""
+    чужих обязательных проверок).
+
+    Третье состояние budget (#779, блокирующая 3): бюджет ещё есть, но
+    `held_back_by_run` (retry_budget_fact) называет прогон ai-review.yml,
+    который сейчас летит и придерживает автоповтор — «должен сработать на
+    ближайшем тике»/«должен сработать сам» здесь были бы неверны (тик видит
+    занятость и делает continue, не трогая бюджет). Проверка `held_back_by_run`
+    обязана стоять в ОБЕИХ ветках, где бюджет ещё не исчерпан — `total < limit`
+    и сестринской `total >= limit and in_epoch < limit` (перенос попыток из
+    прошлой, уже решённой эпохи, #431/issue #472) — иначе вторая ветка молча
+    остаётся с прежней ложью ровно того же класса #472, который эта строка
+    была написана закрыть (живой случай #472/#329/#327: total уже был равен
+    лимиту, in_epoch — 0)."""
     total = item["attempts_total"]
     in_epoch = item["attempts_in_epoch"]
     limit = item["attempts_limit"]
+    held_back_by_run = item.get("held_back_by_run")
     if total < limit:
-        budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
+        if held_back_by_run is not None:
+            budget = (
+                f"есть ({total}/{limit}), но автоповтор придержан летящим прогоном "
+                f"run {held_back_by_run} — сработает сам, когда тот освободится"
+            )
+        else:
+            budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
     elif in_epoch >= limit:
         budget = f"исчерпан в этой же эпохе ({total}/{limit})"
-    else:
+    elif held_back_by_run is not None:
+        # total >= limit, in_epoch < limit, но летит прогон — тот же перенос
+        # бюджета из прошлой эпохи (см. else ниже), только с придержанным
+        # автоповтором: «должен сработать сам» здесь тоже было бы ложью.
         budget = (
-            f"исчерпан СТАРОЙ эпохой ({total}/{limit}, в текущей — {in_epoch}/{limit}) — "
-            "перенос бюджета между эпохами, класс #431/PR #439 (не слит)"
+            f"попытки только в прошлых эпохах ({total}/{limit} за всю историю), "
+            f"в текущей бюджет есть ({in_epoch}/{limit}), но автоповтор придержан "
+            f"летящим прогоном run {held_back_by_run} — сработает сам, когда тот "
+            "освободится"
+        )
+    else:
+        # total >= limit, но in_epoch < limit: попытки только в прошлых,
+        # уже решённых эпохах (#431 — бюджет НЕ переносится между эпохами по
+        # дизайну) — в текущей эпохе бюджет ещё есть, газ #196 обязан
+        # сработать сам на ближайшем тике; это НЕ причина застревания.
+        budget = (
+            f"попытки только в прошлых эпохах ({total}/{limit} за всю историю), "
+            f"в текущей бюджет есть ({in_epoch}/{limit}) — должен сработать сам"
         )
     if item["last_attempt_at"]:
         budget += f", последняя попытка {item['last_attempt_at']}"
-    verdict = item["verdict_ever"]
-    verdict_text = (
-        "вердикта ai:* не было НИ РАЗУ за всю жизнь PR" if verdict is None
-        else f"вердикт был — {verdict['label']} в {verdict['at']} (до текущей эпохи)"
-    )
+    verdict = item.get("verdict_ever")
+    if verdict is None:
+        verdict_text = "вердикта ai:* не было НИ РАЗУ за всю жизнь PR"
+    else:
+        # Находка ревью PR #439: check_ai_failed_budget_exhausted зовёт
+        # last_ai_verdict_ever, когда ai:failed УЖЕ висит — сам ai:failed
+        # тоже вердикт, и он может быть В ТЕКУЩЕЙ эпохе (проставлен после
+        # anchor), не обязательно в прошлой (это гарантировано только для
+        # ветки check_stuck_review_gate БЕЗ ai:*-меток вовсе — см. докстринг
+        # last_ai_verdict_ever). Фраза сравнивает факт, не гадает.
+        # Обе метки — isoformat() одного и того же tz-aware UTC datetime
+        # (parse_time/anchor.isoformat()), лексикографическое сравнение ISO
+        # 8601 строк одинаковой точности и зоны монотонно совпадает с
+        # сравнением времени — второго парсинга не заводим.
+        epoch_phrase = ("в текущей эпохе" if verdict["at"] >= item["labeled_at"]
+                         else "до текущей эпохи")
+        verdict_text = f"вердикт был — {verdict['label']} в {verdict['at']} ({epoch_phrase})"
     return (
         f"PR #{item['pr']} — {int(item['age_minutes'])} мин без вердикта в "
         f"текущей эпохе (с {item['labeled_at']}); автоповтор: {budget}; {verdict_text}"
@@ -972,6 +1172,112 @@ def check_ambiguous_artifact_phrase(docs_root: Path) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9: тело задачи и нативный граф blockedBy расходятся (#710)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def check_declared_deps_mismatch(issues_with_body: list[dict]) -> list[dict]:
+    """Инвариант 9 (задача #710, продолжение #371/#529): расхождение между
+    структурно объявленной связью в теле задачи и фактическим нативным
+    графом `blockedBy` — В ОБЕ СТОРОНЫ, по ВСЕМ трём формам записи
+    (`declared_deps.py`: заголовок «Чем блокируется», заголовок «Что
+    блокирует» — обратное направление, инлайн «БЛОКИРУЕТСЯ: …»):
+
+      - «missing»: пара (blocked, blocking) объявлена текстом, но нативного
+        ребра нет. На push repo-ci это честно значит дефект переноса —
+        `declared_deps.py::auto_wire` отрабатывает В ТОМ ЖЕ push, ДО этого
+        шага (см. .github/workflows/repo-ci.yml, порядок шагов), поэтому
+        находка здесь означает, что auto_wire не покрыл этот случай. На
+        pull_request и на периодическом пульсе orchestra.yml (главный канал
+        этого инварианта по расписанию модуля) это НЕ гарантировано: wire
+        запускается только чужим push/merge в main, не этими триггерами —
+        находка сразу после ручной правки поля тоже может значить «ещё не
+        доехал», а не дефект auto_wire (см. GATING_RELEASE_CONDITION[9]).
+      - «stale»: нативное ребро есть, а НИ ОДНА объявленная пара его не
+        называет — включая явный ответ «ничем» при непустом графе (живой
+        случай на замере 2026-09-08: #679 отвечает «БЛОКИРУЕТСЯ: ничем»,
+        нативный `blockedBy` содержит #605 — текст лжёт о собственной
+        зависимости). Связь стоит мимо текста задачи: поставлена вручную
+        без обновления описания, или описание устарело после правки графа.
+      - «unrecognized» (задача #711, блокирующая находка ревью): поле
+        («Чем блокируется» или «Что блокирует») заполнено непустым ответом,
+        не «ничем», но текст не разбирается ни на один номер
+        (`declared_deps.UNRECOGNIZED_FORM`) — раньше это молча читалось как
+        «ничем» (валидный ответ), что прятало и заявленную связь, и
+        возможный «stale» одновременно. У находки нет поля `number` (не с
+        чем сравнивать граф) — только `issue`, видимый сигнал «поправь
+        формулировку», не оценка графа.
+
+    Issue проверяется только если её СОБСТВЕННОЕ поле «Чем блокируется»/
+    инлайн не `None` (`declared_deps.declared_blocked_by` вернул список,
+    пусть и пустой) — issue не из этого шаблона (старая, до #387, или чужой
+    формат) не о чем судить, отсутствие поля — не нарушение. Обратное поле
+    «Что блокирует» ДРУГОЙ issue тоже засчитывается как объявление для ЦЕЛИ
+    (A говорит «Что блокирует: B» — это заявка о паре (B, A), даже если у B
+    самой нет своего поля) — иначе половина живого пула (issue без
+    собственного поля, но названные чужим «Что блокирует») были бы слепым
+    пятном для «stale».
+
+    `issues_with_body` — форма `task_deps.fetch_pool(..., include_body=True)`
+    (number, body, blocked_by_open). Свободная проза (`_TRIGGER_RE`,
+    ад-хок заголовки без точного текста поля) сюда НЕ входит — та же
+    граница, что и у `auto_wire`: ложная связь опаснее отсутствующей,
+    эвристика прозы остаётся только предупреждением (`find_desync`,
+    инвариант в неё не входит).
+
+    Находка ревью PR #711: `blocked_by_open` (REST/GraphQL) содержит ЛЮБОГО
+    открытого блокера — `task_deps.py` фильтрует его только по state, не по
+    метке `task` (не в пуле этого инварианта). `declared_pairs` же строится
+    только из пар с ОБОИМИ концами в пуле (см. фильтр `n in open_numbers`
+    выше) — без симметричного фильтра на стороне `native` ребро на открытую
+    НЕ-task issue (ставится вручную — тот же ручной путь, что дал живой
+    #679→#605) навсегда числилось бы «stale», хотя текст и граф согласны и
+    `declared_deps.py` прямо говорит: ссылка на не-task issue — НЕ рассинхрон
+    (см. модульный докстринг). `native` поэтому фильтруется тем же
+    `open_numbers`, что и `expected` — судим только о паре, оба конца
+    которой видны этому инварианту."""
+    open_numbers = {issue["number"] for issue in issues_with_body}
+    by_number = {issue["number"]: issue for issue in issues_with_body}
+
+    declared_pairs: set[tuple[int, int]] = set()
+    has_declaration: set[int] = set()
+    unrecognized: set[int] = set()
+
+    for issue in issues_with_body:
+        number = issue["number"]
+        body = issue.get("body") or ""
+        declared = declared_deps.declared_blocked_by(body)
+        if declared is declared_deps.UNRECOGNIZED_FORM:
+            unrecognized.add(number)
+        elif declared is not None:
+            has_declaration.add(number)
+            for n in declared:
+                if n in open_numbers and n != number:
+                    declared_pairs.add((number, n))
+        reverse = declared_deps.blocking_field_numbers(body)
+        if reverse is declared_deps.UNRECOGNIZED_FORM:
+            unrecognized.add(number)
+        else:
+            for target in reverse or []:
+                if target in open_numbers and target != number:
+                    declared_pairs.add((target, number))
+                    has_declaration.add(target)
+
+    violations: list[dict] = []
+    for number in sorted(has_declaration):
+        native = {(number, n) for n in (by_number[number].get("blocked_by_open") or [])
+                  if n in open_numbers}
+        expected = {pair for pair in declared_pairs if pair[0] == number}
+        for _, blocking in sorted(expected - native):
+            violations.append({"issue": number, "kind": "missing", "number": blocking})
+        for _, blocking in sorted(native - expected):
+            violations.append({"issue": number, "kind": "stale", "number": blocking})
+    for number in sorted(unrecognized):
+        violations.append({"issue": number, "kind": "unrecognized"})
+    return violations
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # IO: сбор данных, отчёт, эскалация
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1040,11 +1346,131 @@ def fetch_branch_protection(repo: str) -> dict:
     return gh(f"repos/{repo}/branches/main/protection")
 
 
+def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
+    """Пул с телами и графом одним GraphQL-проходом (`task_deps.fetch_pool`,
+    единственный источник, отдающий и то, и другое — REST для графа
+    недостаточен, см. docstring task_deps.py) — нужен ТОЛЬКО инварианту 9
+    (check_declared_deps_mismatch): `fetch_open_task_issues` выше (REST,
+    используется 1/4/5) тело/граф не тянет, не тянуть лишний трафик там, где
+    он не читается."""
+    return task_deps.fetch_pool(repo, label=TASK_LABEL, include_body=True, gh_call=gh)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 10 (#794): N ПОДРЯД прогонов worker.yml провалились с ОДНОЙ и той
+# же классифицированной причиной — класс, который failure_watch (pulse_guard)
+# не ловит по построению: её окно свежести — FAILURE_WATCH_WINDOW_MINUTES (30
+# минут) и дедуп «одна задача на класс, пока не закрыта», а не «сколько раз
+# подряд повторилось за много часов». Дважды упавший предохранитель одного и
+# того же класса на живом инциденте (#794): worker.yml падал девять прогонов
+# подряд на сессии harness-257 с 2026-09-08 08:45Z по 2026-09-09 02:08Z
+# (18 часов) — «стороживший сторожа» pulse_guard.decide_gate_state сам ставит
+# паузу и шлёт первый алерт с фактом (last_failure_error) уже на третьем
+# провале (WORKER_FAILURE_PAUSE_AFTER), но дальше молчит между пробами с
+# растущей выдержкой (probe_backoff_minutes) — та же причина тянется часами
+# без НОВОГО, видимого в отчёте repo_invariants (репо-ci.yml/orchestra.yml)
+# факта «серия всё ещё не разобрана». Этот инвариант — не дублирует паузу
+# диспатча (decide_dispatch/decide_gate_state там же остаются единственным
+# местом правды на САМ подсчёт серии — count_consecutive_failures
+# переиспользуется, не копируется), а даёт этому же факту ВТОРУЮ поверхность,
+# не подверженную маркерному дедупу пульса: строку в build_report, которую
+# видит и repo-ci.yml на каждом PR, и периодический шаг orchestra.yml.
+#
+# Наблюдательный, не в CI_GATING: нарушение зависит от истории прогонов
+# worker.yml, не от диффа текущего PR — гейтить им PR означало бы красить
+# чужой PR за чужую, уже идущую серию (тот же класс «тормоз без газа», что
+# уже отвёл 1/4/5/9 от немедленного гейта, см. докстринг модуля).
+# ══════════════════════════════════════════════════════════════════════════
+
+RECURRING_FAILURE_WORKFLOW = pulse_guard.WORKER_WORKFLOW  # "worker.yml" — резюмирует сессию harness-<N>, не чужой workflow
+# Тот же порог, что уже красит предохранитель диспатча (pulse_guard.
+# WORKER_FAILURE_PAUSE_AFTER) — не новое число без прецедента: если
+# диспатч-фьюз уже решил, что серия достаточно длинна для паузы, этот
+# инвариант обязан согласиться, не спорить своим порогом.
+RECURRING_FAILURE_STREAK_THRESHOLD = pulse_guard.WORKER_FAILURE_PAUSE_AFTER
+# Одна страница с запасом над порогом — тот же компромисс по цене API, что
+# уже держат FAILURE_WATCH_PER_PAGE/recent_runs(per_page=10) у соседей; серия
+# #794 длиной 9 всё ещё влезает с запасом.
+RECURRING_FAILURE_RUNS_TO_SCAN = 20
+
+
+def check_recurring_worker_failure(repo: str) -> list[dict]:
+    """Нарушение — RECURRING_FAILURE_STREAK_THRESHOLD или больше самых свежих
+    завершённых прогонов RECURRING_FAILURE_WORKFLOW подряд провалились
+    (pulse_guard.FAILURE_CONCLUSIONS) с ОДНИМ И ТЕМ ЖЕ классифицированным
+    отпечатком причины (pulse_guard.failure_fingerprint по первому упавшему
+    job'у, pulse_guard.last_error_log_line — тот же факт, не гипотеза, что уже
+    несёт last_failure_error). Первый success, первый незавершённый прогон
+    ИЛИ смена отпечатка обрывают серию — считаем именно «сколько подряд с
+    ОДНОЙ причиной», не просто «сколько подряд красных» (это число уже
+    отдельно считает pulse_guard.count_consecutive_failures для паузы
+    диспатча).
+
+    Дешёвый путь в здоровом состоянии: один запрос списка прогонов; если
+    первый же прогон не упал (обычный случай), функция возвращает [] без
+    единого запроса лога/job'а. Сеть недоступна/квота — best-effort: [] (тот
+    же принцип, что last_failure_error/last_error_log_line — отсутствие
+    детали не должно ронять весь build_report ради инварианта, у которого и
+    так нет действия ЖЁСТЧЕ наблюдения)."""
+    try:
+        runs = pulse_guard.recent_runs(repo, RECURRING_FAILURE_WORKFLOW, per_page=RECURRING_FAILURE_RUNS_TO_SCAN)
+    except RuntimeError:
+        return []
+    runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
+
+    streak_fingerprint: str | None = None
+    streak_job_name: str | None = None
+    streak_error_text: str | None = None
+    streak_runs: list[dict] = []
+    for run in runs:
+        if run.get("conclusion") not in pulse_guard.FAILURE_CONCLUSIONS:
+            break  # success/None — серия «подряд» обрывается здесь, не позже
+        try:
+            bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
+        except RuntimeError:
+            break  # деталь недоступна — честнее оборвать серию, чем гадать
+        if not bad_jobs:
+            break
+        job = bad_jobs[0]
+        job_id = job.get("id")
+        error_text = pulse_guard.last_error_log_line(repo, job_id) if job_id else None
+        if not error_text:
+            break  # без факта — не классифицируем (тот же принцип, что failure_watch)
+        fingerprint = pulse_guard.failure_fingerprint(
+            RECURRING_FAILURE_WORKFLOW, job.get("name", ""), error_text)
+        if streak_fingerprint is None:
+            streak_fingerprint = fingerprint
+            streak_job_name = job.get("name", "")
+            streak_error_text = error_text
+        elif fingerprint != streak_fingerprint:
+            break  # причина сменилась — это уже другая серия
+        streak_runs.append(run)
+
+    if len(streak_runs) < RECURRING_FAILURE_STREAK_THRESHOLD:
+        return []
+    return [{
+        "workflow": RECURRING_FAILURE_WORKFLOW,
+        "job_name": streak_job_name,
+        "error_text": streak_error_text,
+        "streak": len(streak_runs),
+        "since": streak_runs[-1].get("created_at"),
+        "until": streak_runs[0].get("updated_at"),
+        "latest_run_url": streak_runs[0].get("html_url"),
+    }]
+
+
 def build_report(repo: str, now: datetime,
-                  check_branch_protection: bool = False) -> tuple[list[str], dict[int, list]]:
+                  check_branch_protection: bool = False,
+                  check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
     """Возвращает (строки отчёта, {номер_инварианта: violations}). Чистых
     мутирующих вызовов здесь нет — только GET (см. gh()); гвардия холостого
     хода проверяет именно это.
+
+    check_declared_deps — инвариант 9 (#710/#711) по умолчанию включён
+    (repo-ci.yml `test`, на push И pull_request — то же решение, что уже
+    держит declared_deps.py wire/check), но `main()` выключает его на
+    периодическом пульсе (`--orchestra`) — замечание 1 ревью PR #711, см.
+    комментарий у соответствующей ветки ниже.
 
     check_branch_protection — инвариант 6 (#341) выключен по умолчанию:
     `GET /branches/main/protection` требует у токена право `administration`
@@ -1161,6 +1587,57 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [8] нет дорогих прогонов ai-review после вердикта при неизменном диффе")
 
+    if check_declared_deps:
+        try:
+            open_tasks_with_body = fetch_open_task_issues_with_body(repo)
+        except task_deps.TaskDepsError as error:
+            # Замечание 2 ревью PR #711: аномалия пула (>20 рёбер на issue,
+            # см. task_deps.py:165-180) не должна обрывать ВЕСЬ отчёт,
+            # включая гейтящий инвариант 7 — изолируем фетч именно этого
+            # инварианта, findings[9] остаётся пустым (не «согласовано» —
+            # видимая строка называет причину), остальные инварианты
+            # считаются как обычно.
+            findings[9] = []
+            lines.append(f"🚨 [9] фетч пула упал: {error} — инвариант пропущен на этом прогоне")
+        else:
+            v9 = check_declared_deps_mismatch(open_tasks_with_body)
+            findings[9] = v9
+            if v9:
+                lines.append(f"🚨 [9] {len(v9)} расхождений тела задачи и графа blockedBy (#710):")
+                for item in v9:
+                    if item["kind"] == "unrecognized":
+                        lines.append(f"   — #{item['issue']}: поле заполнено, форма ответа не распознана (unrecognized)")
+                        continue
+                    verb = "не хватает ребра на" if item["kind"] == "missing" else "ребро есть, а поле не называет"
+                    lines.append(f"   — #{item['issue']}: {verb} #{item['number']} ({item['kind']})")
+            else:
+                lines.append("💚 [9] тело задачи и граф blockedBy согласованы")
+    else:
+        # Замечание 1 ревью PR #711: то же решение по цене, что уже держит
+        # declared_deps.py wire/check (repo-ci.yml, «пульс — самый дорогой
+        # потребитель квоты, #454») — на периодическом пульсе orchestra
+        # (--orchestra) пагинированный GraphQL с телами по всему пулу (233
+        # issue, 3 страницы) не гоняется; «missing» на пульсе всё равно
+        # недостоверен по докстрингу check_declared_deps_mismatch (wire
+        # запускается только push/merge в main).
+        findings[9] = []
+        lines.append("⏭️ [9] не проверено на периодическом пульсе (дорогой фетч тел пула "
+                      "прижат к push/PR, где уже стоят declared_deps wire/check — #454/#711)")
+
+    v10 = check_recurring_worker_failure(repo)
+    findings[10] = v10
+    if v10:
+        for item in v10:
+            lines.append(
+                f"🚨 [10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
+                f"одной причиной, с {item['since']} по {item['until']} (job "
+                f"«{item['job_name']}»): {item['error_text']} — последний прогон "
+                f"{item['latest_run_url']}"
+            )
+    else:
+        lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
+                      f"провалов {RECURRING_FAILURE_WORKFLOW} с одной причиной")
+
     return lines, findings
 
 
@@ -1236,7 +1713,8 @@ def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
     lines, findings = build_report(repo, now,
-                                    check_branch_protection=args.check_branch_protection)
+                                    check_branch_protection=args.check_branch_protection,
+                                    check_declared_deps=not args.orchestra)
 
     if args.orchestra:
         lines += run_escalations(repo, findings)

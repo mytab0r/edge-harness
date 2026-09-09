@@ -12,11 +12,13 @@ gh не вызывается ни одной тестируемой функци
 
 import argparse
 import importlib.util
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 SCRIPT = Path(__file__).with_name("ai_review.py")
 spec = importlib.util.spec_from_file_location("ai_review", SCRIPT)
@@ -107,6 +109,37 @@ def test_parse_verdict(answer, expected):
 ])
 def test_verdict_line_present_distinguishes_absent_from_ambiguous(answer, expected):
     assert ai.verdict_line_present(answer) is expected
+
+
+# ── rework без единой находки — нарушение контракта (#210) ───────────────────
+
+def test_rework_without_findings_true_when_all_three_categories_empty():
+    # прод-форма PR #206, run 33656180906: весь ответ модели — строка вердикта
+    assert ai.rework_without_findings("rework", "", [], []) is True
+
+
+def test_rework_without_findings_false_with_prose_finding():
+    assert ai.rework_without_findings("rework", "Находка одна: файл X.", [], []) is False
+
+
+def test_rework_without_findings_false_with_task_block():
+    tasks = [{"title": "Что-то", "body": "тело", "scope": "хвост"}]
+    assert ai.rework_without_findings("rework", "", tasks, []) is False
+
+
+def test_rework_without_findings_false_with_remark_block():
+    remarks = [{"title": "Замечание", "body": "тело"}]
+    assert ai.rework_without_findings("rework", "", [], remarks) is False
+
+
+def test_rework_without_findings_approve_never_flagged():
+    # Одобрение без замечаний — норма (#210, «Не задача этой issue»), не
+    # нарушение контракта, даже с пустыми findings/tasks/remarks.
+    assert ai.rework_without_findings("approve", "", [], []) is False
+
+
+def test_rework_without_findings_error_never_flagged():
+    assert ai.rework_without_findings("error", "", [], []) is False
 
 
 # ── Блоки задач в беклог ───────────────────────────────────────────────────────
@@ -491,6 +524,25 @@ def test_error_reason_transport_failure_wins_over_line_check():
     assert "ошибка провайдера" in reason
 
 
+def test_error_reason_empty_rework_names_the_contract_violation():
+    # #210, прод-форма PR #206/33656180906: rc=0, строка ВЕРДИКТ есть и
+    # однозначна — это НЕ «строки нет» и НЕ «не единственная/не последняя»,
+    # текст обязан называть настоящую причину, а не одну из двух других веток.
+    reason = ai.error_reason("ВЕРДИКТ: rework", "0", empty_rework=True)
+    assert "не привела ни одной находки" in reason
+    assert "не единственная" not in reason
+    assert "не последняя" not in reason
+    assert "нет вообще" not in reason
+
+
+def test_error_reason_empty_rework_takes_priority_over_line_present_branches():
+    # empty_rework=True обязан выигрывать даже если по какой-то причине вызван
+    # с ответом, где verdict_line_present вернул бы другое значение — источник
+    # истины про «была ли причина в ответе» здесь один параметр, не догадка.
+    reason = ai.error_reason("что угодно", "0", empty_rework=True)
+    assert "не привела ни одной находки" in reason
+
+
 # ── RATE_LIMIT: «лимита нет вовсе» vs «лимит есть, но что-то ещё сломано»
 # (#419, живой факт: worker.yml 34007508064 упал с «dsh: RATE_LIMIT: Rate
 # limit reached for requests» — квоту съело параллельное ai-review). Разные
@@ -737,6 +789,51 @@ def test_error_reason_failure_reason_ignored_when_verdict_not_error_path():
     assert "ошибка провайдера/транспорта DSH" in reason
 
 
+# ── reason_tag (#431): короткий тег для шапки комментария, читает scheduler ────
+# Пара к error_reason (тот же порядок проверки), но возвращает МАШИНОЧИТАЕМЫЙ
+# тег, не текст для человека — findings/reason могут оказаться прозой самой
+# модели (см. review_labels.FAILURE_REASON_* докстринг, живой случай PR #329),
+# решение о бюджете автоповторов обязано опираться на структурный факт.
+
+def test_reason_tag_quota_exhausted():
+    assert ai.reason_tag("1", "quota_exhausted") == rl.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_rate_limit_budget():
+    assert ai.reason_tag("1", "rate_limit_retry_budget_exceeded") == rl.FAILURE_REASON_RATE_LIMIT_BUDGET
+
+
+def test_reason_tag_transport_when_rc_nonzero_and_no_failure_reason():
+    assert ai.reason_tag("1", "") == rl.FAILURE_REASON_TRANSPORT
+
+
+def test_reason_tag_contract_when_rc_zero():
+    assert ai.reason_tag("0", "") == rl.FAILURE_REASON_CONTRACT
+
+
+def test_reason_tag_unknown_failure_reason_falls_back_like_error_reason():
+    # Тот же класс защиты, что test_error_reason_failure_reason_ignored_when_verdict_not_error_path:
+    # опечатка в теге не должна тихо стать другой классификацией.
+    assert ai.reason_tag("1", "какой-то незнакомый тег") == rl.FAILURE_REASON_TRANSPORT
+    assert ai.reason_tag("0", "какой-то незнакомый тег") == rl.FAILURE_REASON_CONTRACT
+
+
+def test_build_comment_includes_reason_fact_on_error():
+    body = ai.build_comment(163, "sha163", "error", "ревью не состоялось — ...", [],
+                             reason_tag_value=rl.FAILURE_REASON_TRANSPORT)
+    facts = ai.header_facts(body)
+    assert facts["reason"] == rl.FAILURE_REASON_TRANSPORT
+    assert facts["reviewer"] == "error"
+
+
+def test_build_comment_reason_fact_absent_when_not_error_backward_compat():
+    # Обратная совместимость (тот же приём, что diff_fp): approve/rework не
+    # передают reason_tag_value — старые вызовы/тесты без параметра не ломаются.
+    body = ai.build_comment(163, "sha163", "approve", "Ок.", [])
+    facts = ai.header_facts(body)
+    assert "reason" not in facts
+
+
 # ── Идемпотентность file_tasks: маркер filed: в ПОСЛЕДНЕЙ строке ───────────────
 
 FT = importlib.util.spec_from_file_location(
@@ -864,11 +961,21 @@ def test_ai_review_gather_and_verdict_read_files_through_paginated_helper():
 # диффе (находка 1 вердикта ai-review PR #294) — проверяется именно то, что
 # подкоманда отвечает go=false, а не только что метка бы сохранилась ────────
 
-def _fake_gh_should_run(labels, comment_body, files):
-    """gh(url) с прод-формой трёх эндпоинтов, которые дёргает cmd_should_run:
-    pulls/{pr} (labels), pulls/{pr}/files?...&page=N (постранично),
-    issues/{pr}/comments?...&page=N (постранично)."""
+def _fake_gh_should_run(labels, comment_body, files, active_runs=None):
+    """gh(url) с прод-формой эндпоинтов, которые дёргает cmd_should_run:
+    занятость (actions/workflows/ai-review.yml/runs, #779 — теперь спрашивается
+    БЕЗУСЛОВНО, не только при workflow_dispatch), pulls/{pr} (labels),
+    pulls/{pr}/files?...&page=N (постранично), issues/{pr}/comments?...&page=N
+    (постранично). `active_runs=None` — по умолчанию прогон никого не находит
+    (прежнее поведение тестов ниже, которым занятость не предмет)."""
+    active_runs = active_runs if active_runs is not None else {"in_progress": [], "queued": []}
+
     def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
         if url == "repos/o/r/pulls/294":
             return {"labels": [{"name": name} for name in labels]}
         if url.startswith("repos/o/r/pulls/294/files"):
@@ -891,13 +998,23 @@ def test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok(monkeypatch, caps
     comment = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
     monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment, files))
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # событийный путь (workflow_run)
 
     rc = ai.cmd_should_run(argparse.Namespace(pr=294))
 
     assert rc == 0
+    out = capsys.readouterr()
     # Прогон НЕ стартует: подкоманда сама отвечает "false", а не просто
     # «метка сохранилась бы» — именно это читает шаг fingerprint ai-review.yml.
-    assert capsys.readouterr().out.strip() == "false"
+    assert out.out.strip() == "false"
+    # #779, разрыв 2: событийный путь обязан печатать СВОЮ причину в stderr —
+    # шаг `id: fingerprint` (.github/workflows/ai-review.yml) утверждает
+    # читателю, что причина уже напечатана строкой выше; до фикса
+    # `if not run_needed and manual` запирало печать только ручным путём, и
+    # этот, самый частый путь (workflow_run), молчал.
+    assert "дифф не изменился" in out.err
+    assert "ai:ok" in out.err
+    assert "ручной" not in out.err  # этот прогон не ручной — текст не должен звать его так
 
 
 def test_cmd_should_run_prints_true_when_diff_changed_ai_ok(monkeypatch, capsys):
@@ -944,15 +1061,135 @@ def test_cmd_should_run_prints_true_for_ai_failed_even_with_matching_fingerprint
     assert capsys.readouterr().out.strip() == "true"
 
 
+# ── #779, разрыв 1: событийный путь (workflow_run от pr-review) обязан
+# спрашивать «летит ли прогон» так же, как ручной workflow_dispatch —
+# сценарии ниже прогоняются БЕЗ GITHUB_EVENT_NAME=workflow_dispatch, то есть
+# именно по событийному пути (manual=False внутри cmd_should_run) ───────────
+
+def test_cmd_should_run_event_path_denied_when_run_already_active(monkeypatch, capsys):
+    # До фикса (#779) событийный путь не спрашивал other_active_ai_review_runs
+    # вовсе — эта же занятость (найденная тестом манульного пути) молча
+    # проходила бы для workflow_run и дублировала дорогой прогон.
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            if "status=in_progress" in url:
+                return {"workflow_runs": [
+                    {"id": 888, "display_title": "ai-review PR #294",
+                     "status": "in_progress", "html_url": "https://x/888"},
+                ]}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость обязана отклонить дубль раньше сверки отпечатка: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # событийный путь
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    # Причина отказа — «дубль», не «дифф не изменился» и не текст ручного
+    # пути (нет упоминания force — событийный путь ничего не запускал руками).
+    assert "дубль" in out.err
+    assert "888" in out.err
+    assert "force" not in out.err
+    assert all("actions/workflows" in c for c in calls)
+
+
+def test_cmd_should_run_event_path_other_pr_active_run_does_not_block(monkeypatch, capsys):
+    # Летящий прогон ДРУГОГО PR не должен мешать этому — фильтр по PR уже
+    # доказан на уровне other_active_ai_review_runs, здесь — интеграционно.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    active_runs = {"in_progress": [
+        {"id": 999, "display_title": "ai-review PR #400", "status": "in_progress"},
+    ], "queued": []}
+    fake_gh = _fake_gh_should_run(["review:ok"], "", files, active_runs=active_runs)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_ai_failed_active_run_denied_no_model_call(monkeypatch, capsys):
+    # #779, разрыв 4: ai:failed + отпечаток совпал + прогон летит — повтор
+    # НЕ уходит (в отличие от test_cmd_should_run_prints_true_for_ai_failed_
+    # even_with_matching_fingerprint, где активных прогонов нет). Занятость
+    # проверяется раньше и независимо от should_run_ai_review — календарь
+    # звонков к pulls/files/comments не достигается вовсе.
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость обязана отказать раньше сверки ai:failed/отпечатка: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_ai_failed_previous_retry_finished_allows_new_attempt(monkeypatch, capsys):
+    # #779, разрыв 4 (обратная ветка мутации выше): ai:failed + отпечаток
+    # совпал, но летящих прогонов НЕТ (прошлый повтор уже завершился) —
+    # повтор ОБЯЗАН уйти, иначе восстановление после реального сбоя
+    # провайдера молча сломано.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: error\ndiff: {fp}\n\nошибка.\n"
+    fake_gh = _fake_gh_should_run(["review:ok", "ai:failed"], comment, files,
+                                   active_runs={"in_progress": [], "queued": []})
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_event_dispatch_duplicate_reason_names_run_and_does_not_mention_force():
+    other_run = {"id": 888, "status": "queued", "html_url": "https://x/888"}
+    text = ai.event_dispatch_duplicate_reason(294, other_run)
+    assert "PR #294" in text
+    assert "888" in text
+    assert "дубль" in text
+    assert "force" not in text  # событийный путь ничего не запускал руками
+
+
 # ── --force (workflow_dispatch, находка 1 вердикта ai-review PR #294):
 # ручной повтор не должен глохнуть на неизменном отпечатке диффа ────────────
 
 def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatch, capsys):
-    def gh_must_not_be_called(url: str):
+    # #779: занятость проверяется ДАЖЕ при --force (force не пробивает
+    # летящий прогон, см. test_cmd_should_run_manual_dispatch_force_does_not_
+    # bypass_busy_check) — единственный сетевой вызов, который --force
+    # обязан пропускать, это сверка ОТПЕЧАТКА, не проверка занятости.
+    def gh_only_busy_check(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            return {"workflow_runs": []}
         raise AssertionError(
             f"--force обязан пропускать сверку отпечатка без обращения к сети, а вызвал gh({url!r})")
 
-    monkeypatch.setattr(ai, "gh", gh_must_not_be_called)
+    monkeypatch.setattr(ai, "gh", gh_only_busy_check)
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
 
     # PR с окончательным вердиктом и неизменным отпечатком — без --force это
@@ -1380,6 +1617,62 @@ def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
     assert "state=failure" in " ".join(status_calls[0])
 
 
+def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):
+    """Гвардия #210: прод-форма PR #206, run 33656180906 — ответ модели
+    целиком `ВЕРДИКТ: rework\\n`, ни одной находки. Раньше это ставило
+    ai:changes-requested с пустым телом (автор не знает, что чинить); теперь
+    обязано уйти как ai:failed с причиной-контрактом, тем же путём, что и
+    любой другой формат-сбой (авто-повтор #196).
+
+    Мутация: убрать вызов rework_without_findings/строку `if empty_rework:
+    verdict = "error"` из cmd_verdict — тест краснеет (rc становится 0,
+    метка — ai:changes-requested)."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "ВЕРДИКТ: rework\n"))
+
+    assert rc == 1  # fail loud — тот же исход, что и любой другой contract-error
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert f"labels[]={ai.AI_CHANGES}" not in joined, joined
+    assert f"labels[]={ai.AI_FAILED}" in joined, joined
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "error"
+    assert facts["reason"] == rl.FAILURE_REASON_CONTRACT
+    assert "не привела ни одной находки" in body
+
+
+def test_cmd_verdict_rework_with_finding_stays_changes_requested(monkeypatch, tmp_path):
+    """Контроль к предыдущему тесту: rework С хотя бы одной находкой (прозой)
+    остаётся валидным ai:changes-requested, не становится error."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(
+        tmp_path, "Находка: файл a.py делает лишнее.\nВЕРДИКТ: rework"))
+
+    assert rc == 0
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert f"labels[]={ai.AI_CHANGES}" in joined, joined
+    assert f"labels[]={ai.AI_FAILED}" not in joined, joined
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "rework"
+
+
 def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeypatch, tmp_path):
     # Обоснование задачи #345: ошибка провайдера/транспорта (dsh_rc != 0) не
     # вердикт о коде — required status check не должен намертво краснеть до
@@ -1402,6 +1695,76 @@ def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeyp
     joined = " ".join(status_calls[0])
     assert "state=pending" in joined
     assert "state=failure" not in joined
+
+
+def _comment_call(run_gh_calls: list[tuple]) -> str:
+    """Тело последнего POST issues/{n}/comments — прод-форма вызова run_gh
+    (см. cmd_verdict: `-f body=<текст>`)."""
+    for call in run_gh_calls:
+        if call[:2] == ("api", "-X") and "/comments" in call[3]:
+            for arg in call:
+                if isinstance(arg, str) and arg.startswith("body="):
+                    return arg[len("body="):]
+    raise AssertionError("комментарий не найден среди run_gh_calls")
+
+
+def test_cmd_verdict_wires_reason_tag_into_posted_comment_on_transport_error(monkeypatch, tmp_path):
+    # #431: cmd_verdict обязан прокинуть review_labels.reason_tag в
+    # build_comment — scheduler.trigger_ai_review читает именно этот факт.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")
+    args.dsh_rc = "1"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "error"
+    assert facts["reason"] == rl.FAILURE_REASON_TRANSPORT
+
+
+def test_cmd_verdict_wires_quota_reason_tag_from_failure_reason(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")
+    args.dsh_rc = "1"
+    args.failure_reason = "quota_exhausted"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 1
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reason"] == rl.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_cmd_verdict_no_reason_fact_on_approve(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert "reason" not in facts
 
 
 def test_ai_review_verdict_posts_status_through_review_labels_helper():
@@ -1449,6 +1812,76 @@ def test_ai_review_workflow_gate1_case_matches_gate1_labels():
     )
 
 
+# ── #779, блокирующая 1: два триггера ОДНОГО PR не отказывают друг другу
+# одновременно — вердиктов не ноль, а ровно один ─────────────────────────────
+#
+# До фикса группа concurrency событийного пути ключевалась workflow_run.id
+# (уникален на КАЖДОЕ событие pr-review) — два разных pr-review-события
+# одного PR попадали каждое в свою группу и НЕ сериализовались вовсе, а
+# other_active_ai_review_runs спрашивался ТЕПЕРЬ обоими путями триггера
+# (#779, разрыв 1): оба прогона видели друг друга `in_progress`/`queued` и
+# оба отвечали false — вердиктов ноль (живой случай PR #725, 2026-09-08: run
+# 34183129865 workflow_run и run 34183131439 workflow_dispatch, Δ=2с). Фикс —
+# группа по НОМЕРУ PR для обоих путей (concurrency.group в ai-review.yml):
+# два триггера одного PR теперь физически не могут выполнять ЭТОТ шаг
+# одновременно — GitHub держит второго `queued`, пока первый не завершится,
+# и тот стартует уже В ОДИНОЧКУ.
+
+def test_ai_review_concurrency_group_keys_both_paths_by_pr_number():
+    # Мутация: верни group на "workflow_run.id || inputs.pr" (был до фикса) —
+    # этот тест обязан покраснеть, потому что workflow_run.id перестанет быть
+    # ПОСЛЕДНИМ (fallback) операндом, а номер PR из pull_requests[0] исчезнет
+    # из выражения вовсе.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    match = re.search(r"group:\s*>-\n(.*?)\n\s*cancel-in-progress:", source, re.DOTALL)
+    assert match, "не нашёл concurrency.group в ai-review.yml"
+    group_expr = " ".join(line.strip() for line in match.group(1).splitlines())
+    assert "github.event_name == 'workflow_dispatch' && github.event.inputs.pr" in group_expr
+    assert "github.event.workflow_run.pull_requests[0].number" in group_expr
+    # workflow_run.id — только fallback ПОСЛЕ номера PR (форк-PR, pull_requests
+    # пуст), не первый операнд — иначе группа снова уникальна на событие, а не
+    # на PR, и два триггера одного PR снова не сериализуются.
+    assert group_expr.rstrip().endswith("github.event.workflow_run.id }}")
+    assert group_expr.index("pull_requests[0].number") < group_expr.rindex("workflow_run.id")
+
+
+def test_cmd_should_run_two_triggers_of_same_pr_yield_exactly_one_verdict(monkeypatch, capsys):
+    # Сквозной сценарий вместо пары изолированных тестов: концурренси-группа
+    # по номеру PR (проверена статически тестом выше) гарантирует, что второй
+    # триггер стартует этот шаг только ПОСЛЕ того, как первый уже завершился
+    # — здесь это смоделировано двумя последовательными вызовами
+    # cmd_should_run на одних и тех же прод-данных. Первый (A, событийный
+    # путь) не видит второго (тот ещё не создан на момент его собственной
+    # проверки — активных прогонов нет вовсе) → идёт и публикует вердикт.
+    # Второй (B, ручной workflow_dispatch, тот самый Δ=2с триггер PR #725)
+    # стартует уже когда A завершился (активных прогонов снова нет — A
+    # completed, а не queued/in_progress) — но сверка ОТПЕЧАТКА находит
+    # только что опубликованный A вердикт на том же диффе → отказывает.
+    # Итог: ровно ОДНА публикация вердикта — не ноль (симметричный тормоз,
+    # блокирующая 1 до фикса) и не две (дубль дорогого вызова модели).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok"], "", files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # A — событийный путь (workflow_run)
+
+    rc_a = ai.cmd_should_run(argparse.Namespace(pr=294))
+    assert rc_a == 0
+    assert capsys.readouterr().out.strip() == "true"  # A публикует вердикт
+
+    comment_from_a = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    monkeypatch.setattr(
+        ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment_from_a, files))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")  # B — ручной путь, стартует позже
+
+    rc_b = ai.cmd_should_run(argparse.Namespace(pr=294))
+    assert rc_b == 0
+    # Не «занят» (A уже завершился) и не второй вердикт — честный отказ по
+    # неизменному отпечатку: ровно одна публикация на этот дифф, не две.
+    assert capsys.readouterr().out.strip() == "false"
+
+
 def test_other_active_ai_review_runs_filters_by_pr_and_status_excludes_self():
     def fake_gh(url: str):
         if "status=in_progress" in url:
@@ -1482,6 +1915,94 @@ def test_other_active_ai_review_runs_queries_both_statuses_with_per_page_100():
     ]
 
 
+# ── #779, блокирующая 2: потолок возраста — прогон старше timeout-minutes
+# самого job'а больше не читается как «летит» ни одним из трёх путей ────────
+
+def test_ai_review_timeout_minutes_matches_review_labels_constant():
+    # yml не читает python-константу (два языка, тот же приём, что и
+    # test_gate_triggers.py:50-66) — число обязано совпасть буквально с
+    # timeout-minutes ИМЕННО job'а `review`, иначе потолок предиката и
+    # реальный обрыв job'а GitHub'ом разъедутся. Подстроковая проверка
+    # (`f"timeout-minutes: {N}" in source`) не ловила ни смену числа на
+    # значение с тем же префиксом (1300 содержит подстроку "130"), ни перенос
+    # потолка на другой job (`verdict`) — yaml.safe_load и явный путь по
+    # ключу `jobs.review.timeout-minutes` делают обе мутации красными.
+    doc = yaml.safe_load(AI_REVIEW_YML.read_text(encoding="utf-8"))
+    assert doc["jobs"]["review"]["timeout-minutes"] == rl.AI_REVIEW_TIMEOUT_MINUTES
+
+
+def test_other_active_ai_review_runs_excludes_run_older_than_timeout_ceiling():
+    # Живой разбор issue #779: без потолка прогон возрастом 40 часов в
+    # queued/in_progress читался бы «летящим» вечно — эта проверка кладёт
+    # ОДИН прогон старше AI_REVIEW_TIMEOUT_MINUTES (GitHub сам оборвал бы его
+    # job по timeout-minutes) и ОДИН моложе, оба на том же PR: старший обязан
+    # исчезнуть из списка активных, младший — остаться.
+    now = datetime(2026, 9, 9, 12, 0, tzinfo=timezone.utc)
+    stale_created = (now - timedelta(minutes=rl.AI_REVIEW_TIMEOUT_MINUTES + 1)).isoformat().replace("+00:00", "Z")
+    fresh_created = (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": stale_created},
+                {"id": 222, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": fresh_created},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh, now=now)
+
+    assert {m["id"] for m in matches} == {222}
+
+
+def test_other_active_ai_review_runs_missing_created_at_still_counts_as_active():
+    # Отсутствие/битый created_at — деградация признака, не повод молча
+    # исключить прогон из занятости (обратный класс от «навсегда занят»):
+    # прод-форма ответа Actions API всегда несёт created_at, но предикат не
+    # обязан падать, если его вдруг нет.
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress"},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh)
+
+    assert {m["id"] for m in matches} == {111}
+
+
+def test_other_active_ai_review_runs_naive_created_at_does_not_crash():
+    # Не блокирует, названо в разборе #779: fromisoformat ПАРСИТ метку без
+    # смещения ("Z"/"+HH:MM") без ValueError, но `now - created` (aware -
+    # naive) кидает TypeError, не пойманный одним except ValueError — тик
+    # падал бы целиком. Прод-формой Actions API недостижимо (там всегда
+    # "Z"), но except обязан ловить оба класса, раз докстринг обещает
+    # «битую строку» шире одного ValueError.
+    #
+    # `now=` передан явно (класс #802, живая тест-бомба: без этого параметра
+    # предикат сравнивает литеральный `created_at` с РЕАЛЬНЫМ временем прогона
+    # — тест был зелёным только в узком окне AI_REVIEW_TIMEOUT_MINUTES после
+    # написания и стал НАВСЕГДА красным, как только настенное время ушло
+    # дальше; красный прогон — PR #799, job `test`, run 34317920333). Тот же
+    # паттерн, что уже использует сосед выше по файлу — фиксированный `now`,
+    # близкий к литералу `created_at`, а не время самого прогона.
+    now = datetime(2026, 9, 9, 3, 5, tzinfo=timezone.utc)
+
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": "2026-09-09T03:00:00"},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh, now=now)
+
+    assert {m["id"] for m in matches} == {111}
+
+
 def test_manual_dispatch_busy_reason_names_run_status_and_declares_force_cannot_bypass():
     other_run = {"id": 555, "status": "in_progress", "html_url": "https://github.com/o/r/actions/runs/555"}
     text = ai.manual_dispatch_busy_reason(399, other_run)
@@ -1512,6 +2033,52 @@ def test_manual_dispatch_skip_reason_prefers_ai_changes_label_when_present():
 def test_manual_dispatch_skip_reason_falls_back_when_no_verdict_label():
     text = ai.manual_dispatch_skip_reason(399, ["review:ok"], None)
     assert "неизвестный вердикт" in text
+
+
+def test_manual_dispatch_skip_reason_naive_created_at_does_not_crash():
+    # Мутационная проверка (#780, доводка #779): _verdict_label_and_age
+    # раньше ловил только except ValueError вокруг fromisoformat — строка
+    # БЕЗ offset ("Z"/"+HH:MM") парсится без ValueError, но следующее
+    # вычитание `datetime.now(timezone.utc) - created` (aware - naive)
+    # кидало TypeError, не пойманный этим except, и живой прогон приёмки
+    # ронял ИМЕННО этот путь (manual_dispatch_skip_reason). Прод-формой
+    # Issues API недостижимо (created_at там всегда с "Z"), но обещание
+    # «не падать на битой метке» обязано покрывать оба класса, как и
+    # сестринское место review_labels.other_active_ai_review_runs.
+    ai_comment = {"created_at": "2026-09-09T03:00:00"}
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "мин назад" in text
+
+
+# ── #779, разрыв 2: событийный путь (workflow_run) обязан печатать СВОЮ
+# причину отказа «дифф не изменился», а не молчать под условием `and manual`,
+# пока шаг ai-review.yml утверждает, что причина уже напечатана строкой выше
+def test_event_dispatch_skip_reason_names_verdict_and_age_no_manual_wording():
+    created = datetime.now(timezone.utc) - timedelta(minutes=12)
+    ai_comment = {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    text = ai.event_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "ai:ok" in text
+    minutes = int(text.split("(")[1].split(" мин назад")[0])
+    assert 11 <= minutes <= 13
+    assert "ручной" not in text  # этот путь не ручной — текст не должен звать его так
+    assert "force: true" not in text  # событийный путь не адресован владельцу с force-обходом
+
+
+def test_event_dispatch_skip_reason_falls_back_when_no_verdict_label():
+    text = ai.event_dispatch_skip_reason(399, ["review:ok"], None)
+    assert "неизвестный вердикт" in text
+
+
+def test_event_dispatch_skip_reason_naive_created_at_does_not_crash():
+    # Тот же мутационный класс, что test_manual_dispatch_skip_reason_naive_
+    # created_at_does_not_crash выше, на втором вызывающем той же
+    # _verdict_label_and_age — живой прогон приёмки ронял и этот путь тоже.
+    ai_comment = {"created_at": "2026-09-09T03:00:00"}
+    text = ai.event_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "мин назад" in text
 
 
 def _fake_gh_manual_dispatch(active_runs: dict, labels, comment_body, files):

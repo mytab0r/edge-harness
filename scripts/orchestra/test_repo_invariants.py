@@ -11,8 +11,10 @@
 """
 
 import importlib.util
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,10 +177,19 @@ def test_reopened_after_merge_still_flags_task_never_verdicted(monkeypatch):
 
 class FakeGh:
     """Тот же маршрутизатор, что test_scheduler.py::FakeGh — подстрока пути
-    → прод-форма ответа; фиксирует вызовы для гвардии холостого хода."""
+    → прод-форма ответа; фиксирует вызовы для гвардии холостого хода.
+
+    Запасной маршрут для занятости ai-review.yml (review_labels.other_active_
+    ai_review_runs, #779 блокирующая 3: retry_budget_fact теперь спрашивает
+    её же для held_back_by_run) — тот же приём, что test_scheduler.py::
+    FakeGh._DEFAULT_ROUTES: без него КАЖДЫЙ существующий тест
+    check_stuck_review_gate/check_ai_failed_budget_exhausted был бы обязан
+    завести собственную строку «нет активных прогонов», хотя сама занятость
+    ai-review.yml не их предмет."""
+    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
 
     def __init__(self, routes):
-        self.routes = routes
+        self.routes = {**self._DEFAULT_ROUTES, **routes}
         self.calls = []
 
     def __call__(self, *args):
@@ -285,6 +296,116 @@ def test_stuck_review_gate_flags_review_large_without_any_ai_verdict(monkeypatch
     assert violations[0]["pr"] == 432
 
 
+# ── ai:failed — газ #196 исчерпал бюджет, но не эскалировал (находка ревью
+# #439, класс #431): раньше check_stuck_review_gate пропускала ЛЮБОЙ PR с
+# ai:*-меткой, включая ai:failed, и это состояние было невидимо инварианту.
+
+
+def test_stuck_review_gate_flags_ai_failed_when_budget_exhausted_not_escalated(monkeypatch):
+    pull = open_pr(163, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/163/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/163/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],  # эскалации исчерпания ещё нет
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)  # заведомо больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 163
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+    assert violations[0]["attempts_in_epoch"] == 3
+
+
+def test_stuck_review_gate_silent_ai_failed_budget_not_exhausted_yet(monkeypatch):
+    # Бюджет ещё не исчерпан в этой эпохе (2/3) — у #196 остаётся попытка,
+    # инвариант не должен опережать газ.
+    pull = open_pr(164, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha164/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/164/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_silent_ai_failed_already_escalated(monkeypatch):
+    # #196 сам эскалировал исчерпание в #120 в этой же эпохе — инвариант не
+    # дублирует сигнал.
+    pull = open_pr(165, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha165/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/165/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_EXHAUSTED_MARKER} #165\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_silent_ai_failed_already_escalated_via_quota_marker(monkeypatch):
+    # Находка ревью PR #439: газ #196 мог исчерпать бюджет ТРЕМЯ провалами, из
+    # которых последний — quota_exhausted (ветка trigger_ai_review стоит
+    # раньше счётчика попыток и эскалирует AI_REVIEW_QUOTA_MARKER, не
+    # AI_REVIEW_EXHAUSTED_MARKER). До фикса инвариант знал только про
+    # EXHAUSTED_MARKER и бил ложное «не эскалировано», хотя человек уже
+    # оповещён тем же каналом #120.
+    pull = open_pr(167, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha167/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/167/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [
+            {"created_at": "2026-09-01T10:20:00Z",
+             "body": f"🚨 edge-harness: {ri.pulse_guard.AI_REVIEW_QUOTA_MARKER} #167\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    assert ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_stuck_review_gate_ai_failed_mutation_guard(monkeypatch):
+    # Мутация: убрать вызов check_ai_failed_budget_exhausted из ветки
+    # ai:failed (вернуть "labels & ai_labels: continue" безусловно) — этот
+    # тест обязан покраснеть, реальная проверка, не > 0 без содержания.
+    pull = open_pr(166, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha166/statuses": gate1_status("2026-09-01T10:00:00Z"),
+        "issues/166/timeline": timeline_with_review_ok("2026-09-01T10:00:00Z"),
+        "issues/166/comments": [
+            retry_marker_comment("2026-09-01T10:05:00Z", 1),
+            retry_marker_comment("2026-09-01T10:10:00Z", 2),
+            retry_marker_comment("2026-09-01T10:15:00Z", 3),
+        ],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 3, 14, 0)
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["reason"] == "ai_failed_budget_exhausted_not_escalated"
+
+
 def test_stuck_review_gate_silent_when_neither_gate1_label_present(monkeypatch):
     # Без review:ok И без review:large гейт 1 ещё не отработал вовсе — этот
     # инвариант обязан молчать (не путать «гейт молчит» с «гейт застрял»).
@@ -361,7 +482,9 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     since — та же метрика, что видит scheduler.trigger_ai_review) уже
     показывает 3/3, потому что все три маркера принадлежат СТАРОЙ эпохе
     (якорь 03:05:20), которая своё уже получила вердикт (ai:ok, 03:46:52).
-    Перенос бюджета между эпохами — класс #431/PR #439 (не слит)."""
+    С #431 это больше не бага: газ считает бюджет по attempts_in_epoch, у
+    текущей эпохи свежие 0/3 — inline-текст называет это «должен сработать
+    сам», не «исчерпан»."""
     pull = open_pr(329, labels=["review:ok"])
     fake = FakeGh({
         "commits/sha329/statuses": gate1_status("2026-09-06T03:48:22Z"),
@@ -392,9 +515,10 @@ def test_stuck_gate_fact_pr329_budget_carried_over_from_old_epoch(monkeypatch):
     assert item["attempts_in_epoch"] == 0  # ни одного автоповтора в ТЕКУЩЕЙ эпохе
     assert item["verdict_ever"] == {"label": "ai:ok", "at": "2026-09-06T03:46:52+00:00"}
     line = ri.stuck_gate_fact_line(item)
-    assert "исчерпан СТАРОЙ эпохой (3/3, в текущей — 0/3)" in line
-    assert "перенос бюджета между эпохами" in line
+    assert "попытки только в прошлых эпохах (3/3" in line
+    assert "в текущей бюджет есть (0/3)" in line
     assert "вердикт был — ai:ok" in line
+    assert "до текущей эпохи" in line  # вердикт (03:46:52) раньше anchor (03:48:22)
 
 
 def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
@@ -432,7 +556,7 @@ def test_stuck_gate_fact_pr327_budget_carried_over_and_not_four(monkeypatch):
     assert item["attempts_in_epoch"] == 0
     assert item["verdict_ever"] == {"label": "ai:changes-requested", "at": "2026-09-06T05:33:52+00:00"}
     line = ri.stuck_gate_fact_line(item)
-    assert "3/3, в текущей — 0/3" in line
+    assert "3/3" in line and "в текущей бюджет есть (0/3)" in line
 
 
 def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
@@ -449,8 +573,9 @@ def test_stuck_gate_fact_line_mutation_guard_epoch_vs_global():
     line_same = ri.stuck_gate_fact_line(same_epoch)
     line_carried = ri.stuck_gate_fact_line(carried_over)
     assert line_same != line_carried
-    assert "СТАРОЙ эпохой" not in line_same
-    assert "СТАРОЙ эпохой" in line_carried
+    assert "исчерпан в этой же эпохе" in line_same
+    assert "попытки только в прошлых эпохах" in line_carried
+    assert "должен сработать сам" in line_carried
 
 
 def test_stuck_gate_fact_line_budget_not_exhausted():
@@ -462,6 +587,96 @@ def test_stuck_gate_fact_line_budget_not_exhausted():
     line = ri.stuck_gate_fact_line(item)
     assert "не исчерпан (1/3)" in line
     assert "ближайшем тике" in line
+
+
+# ── #779, блокирующая 3: третье состояние — бюджет есть, но летящий прогон
+# придерживает автоповтор (класс #472 — алерт не гадает и не утверждает
+# неверное) ──────────────────────────────────────────────────────────────
+
+def test_stuck_gate_fact_line_budget_held_back_by_active_run():
+    # Мутация: убери ветку held_back_by_run из stuck_gate_fact_line — этот
+    # тест обязан покраснеть (текст вернётся к «должен сработать на ближайшем
+    # тике», ложному в этом состоянии после #779).
+    item = {
+        "pr": 3, "age_minutes": 150.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 0, "attempts_in_epoch": 0, "attempts_limit": 3,
+        "last_attempt_at": None, "verdict_ever": None, "held_back_by_run": 34278765696,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "есть (0/3)" in line
+    assert "34278765696" in line
+    assert "придержан летящим прогоном" in line
+    assert "ближайшем тике" not in line  # не путать с безусловным «сработает сам»
+
+
+def test_stuck_gate_fact_line_budget_carried_over_and_held_back_by_active_run():
+    # Сестринская ветка (#472/#329/#327: total>=limit, in_epoch<limit —
+    # попытки только в прошлых эпохах, текущей эпохе есть свежий бюджет) с
+    # летящим прогоном одновременно. До фикса held_back_by_run проверялся
+    # ТОЛЬКО в ветке total<limit — здесь текст молча возвращался к «должен
+    # сработать сам», хотя тик увидит занятость и сделает continue, не трогая
+    # бюджет: та же ложь класса #472, только во второй ветке. Мутация: убери
+    # проверку held_back_by_run из этой ветки — тест обязан покраснеть.
+    item = {
+        "pr": 4, "age_minutes": 200.0, "labeled_at": "2026-09-06T00:00:00+00:00",
+        "attempts_total": 3, "attempts_in_epoch": 0, "attempts_limit": 3,
+        "last_attempt_at": "2026-09-06T01:00:00+00:00", "verdict_ever": None,
+        "held_back_by_run": 34278765696,
+    }
+    line = ri.stuck_gate_fact_line(item)
+    assert "попытки только в прошлых эпохах (3/3" in line
+    assert "в текущей бюджет есть (0/3)" in line
+    assert "придержан летящим прогоном run 34278765696" in line
+    assert "должен сработать сам" not in line  # тот же класс #472 во второй ветке
+
+
+def test_retry_budget_fact_reports_held_back_run(monkeypatch):
+    # Прод-форма: retry_budget_fact спрашивает ТУ ЖЕ занятость, что и
+    # scheduler.trigger_ai_review перед диспатчем (review_labels.
+    # other_active_ai_review_runs) — третьей копии предиката не заводим.
+    fake = FakeGh({
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": [
+            {"id": 34278765696, "display_title": "ai-review PR #711", "status": "in_progress"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    anchor = utc(2026, 9, 8, 20, 30, 0)
+    fact = ri.retry_budget_fact("mytab0r/edge-harness", 711, anchor)
+    assert fact["held_back_by_run"] == 34278765696
+
+
+def test_retry_budget_fact_no_active_run_reports_none(monkeypatch):
+    # _DEFAULT_ROUTES отдаёт пустой список активных прогонов.
+    fake = FakeGh({"issues/712/comments": []})
+    patch_gh(monkeypatch, fake)
+    anchor = utc(2026, 9, 8, 20, 30, 0)
+    fact = ri.retry_budget_fact("mytab0r/edge-harness", 712, anchor)
+    assert fact["held_back_by_run"] is None
+
+
+def test_stuck_review_gate_reports_held_back_run_via_stuck_gate_fact_line(monkeypatch):
+    # Сквозной сценарий (не только unit на stuck_gate_fact_line): PR без
+    # ai:*-метки, гейт 1 отработал дольше порога, бюджет автоповтора ещё не
+    # исчерпан (0/3), но ai-review.yml для этого PR прямо сейчас летит —
+    # инвариант 3 обязан назвать ИМЕННО это, а не соврать «должен сработать
+    # на ближайшем тике» (класс #472).
+    pull = open_pr(711, labels=["review:ok"])
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/timeline": timeline_with_review_ok("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": [
+            {"id": 34278765696, "display_title": "ai-review PR #711", "status": "in_progress"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 8, 23, 0, 0)  # намного больше порога 120 мин
+    violations = ri.check_stuck_review_gate("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["held_back_by_run"] == 34278765696
+    line = ri.stuck_gate_fact_line(violations[0])
+    assert "придержан летящим прогоном run 34278765696" in line
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -798,6 +1013,42 @@ def test_duplicate_evidence_mutation_guard():
     assert ri._locators_overlap(("a.py", 10, 20), ("a.py", 15, 25)) is True
 
 
+# build_report() с #710 по умолчанию вызывает fetch_open_task_issues_with_body
+# (task_deps.fetch_pool через GraphQL) для инварианта 9 (ИСПРАВЛЕНО ревью PR
+# #711, major: комментарий раньше ошибочно называл «8» — коллизия с уже
+# существующим инвариантом 8, check_wasted_ai_review_runs, #740). Отключается
+# параметром check_declared_deps=False (замечание 1 ревью PR #711, main()
+# передаёт его на периодическом пульсе `--orchestra`) — FakeGh-фикстуры
+# build_report-тестов ниже, вызывающих build_report БЕЗ этого параметра
+# (то есть с фетчем инварианта 9 включённым по умолчанию), нуждаются в
+# маршруте "graphql", даже если сам инвариант 9 их не интересует (иначе
+# FakeGh падает AssertionError «нет маршрута»). Пустой пул — валидный ответ
+# (открытых task-issues нет).
+def graphql_pool_page(nodes=()):
+    return {"data": {"repository": {"issues": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": list(nodes),
+    }}}}
+
+
+def graphql_issue_node(number, issue_body="", blocked_by=(), blocking=()):
+    # Параметр НЕ называется body= — та же гвардия класса #124
+    # (grep ',\s*body=' в repo-ci.yml матчит и сигнатуру функции с дефолтом
+    # body="", не только вызов gh()) уже задокументирована у task_issue()
+    # выше в этом файле; здесь тот же приём.
+    return {
+        "number": number,
+        "title": "",
+        "body": issue_body,
+        "labels": {"nodes": []},
+        "assignees": {"nodes": []},
+        "blockedBy": {"totalCount": len(blocked_by),
+                      "nodes": [{"number": n, "state": "OPEN"} for n in blocked_by]},
+        "blocking": {"totalCount": len(blocking),
+                     "nodes": [{"number": n, "state": "OPEN"} for n in blocking]},
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 6: защита main-ветки не откатилась молча (#341)
 # ══════════════════════════════════════════════════════════════════════════
@@ -900,6 +1151,8 @@ def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
         f"issues?state=open&labels={ri.TASK_LABEL}": [],
         "pulls?state=closed": [],
         "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -915,6 +1168,8 @@ def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
         "pulls?state=closed": [],
         "pulls?state=open": [],
         "branches/main/protection": HEALTHY_PROTECTION,
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -929,6 +1184,48 @@ def test_branch_protection_not_in_ci_gating():
     # проверки для инварианта, которому GITHUB_TOKEN не может дать ответ,
     # красило бы main на КАЖДОМ прогоне — хуже отсутствия проверки.
     assert 6 not in ri.CI_GATING
+
+
+def test_declared_deps_opt_out_skips_expensive_graphql_fetch(monkeypatch):
+    # Замечание 1 ревью PR #711: на периодическом пульсе (`--orchestra`,
+    # main() передаёт check_declared_deps=False) дорогой пагинированный
+    # GraphQL-фетч тел не должен вызываться вовсе — FakeGh без маршрута
+    # "graphql" здесь и есть доказательство: был бы вызван — упал бы
+    # AssertionError самого FakeGh.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now, check_declared_deps=False)
+    assert findings[9] == []
+    assert any("⏭️" in line and "[9]" in line for line in lines)
+
+
+def test_declared_deps_fetch_error_isolated_does_not_abort_whole_report(monkeypatch):
+    # Замечание 2 ревью PR #711: TaskDepsError (пул-аномалия, >20 рёбер на
+    # issue, task_deps.py:165-180) из фетча инварианта 9 не должна ронять
+    # ВЕСЬ build_report — инвариант 7 (гейтящий) обязан по-прежнему
+    # посчитаться, а не пропасть вместе с исключением.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": ri.task_deps.TaskDepsError(
+            "issue #999: blockedBy усечён (20 из 41)"),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 6, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[9] == []
+    assert 7 in findings  # инвариант 7 всё равно посчитан, не съеден исключением
+    assert any("🚨" in line and "[9]" in line and "фетч пула упал" in line for line in lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1128,6 +1425,239 @@ def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 9: тело задачи и граф blockedBy расходятся (#710)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: реальный live-случай замера 2026-09-08 — #679 отвечает
+# «БЛОКИРУЕТСЯ: ничем», нативный blockedBy содержит #605 (ребро проставлено
+# вручную мимо текста). Не пересказ — воспроизведено дословно.
+ISSUE_679_BODY = (
+    "Инцидент 2026-09-06 — класс «квота пробита, конвейер не заметил», а "
+    "правило репозитория требует, чтобы инцидент оставил инвариант, а не "
+    "только фикс; лок-аут троттлинга выше показывает, что слепота сторожа "
+    "невидима (прогоны зелёные). Критерий готовности: в "
+    "scripts/orchestra/repo_invariants.py появляется проверка «последний "
+    "подтверждённый замер сторожа квот свежее N×CHECK_INTERVAL_MINUTES» с "
+    "эскалацией в общий канал; опирается на след реального замера, который "
+    "появится с починкой троттлинга.\nБЛОКИРУЕТСЯ: ничем"
+)
+
+
+def test_declared_deps_mismatch_flags_stale_edge_prod_case_679():
+    issues = [{"number": 679, "body": ISSUE_679_BODY, "blocked_by_open": [605]},
+              {"number": 605, "body": "", "blocked_by_open": []}]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 679, "kind": "stale", "number": 605}]
+
+
+def test_declared_deps_mismatch_flags_missing_edge():
+    issues = [
+        {"number": 500, "body": "## Чем блокируется\n#55\n", "blocked_by_open": []},
+        {"number": 55, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 500, "kind": "missing", "number": 55}]
+
+
+def test_declared_deps_mismatch_silent_when_graph_matches_declaration():
+    issues = [
+        {"number": 500, "body": "## Чем блокируется\n#55\n", "blocked_by_open": [55]},
+        {"number": 55, "body": "## Чем блокируется\nничем\n", "blocked_by_open": []},
+    ]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_silent_when_no_field_at_all():
+    # Issue без поля вовсе (declared_blocked_by → None) — не о чем судить,
+    # ручное ребро мимо старого issue без шаблона не нарушение.
+    issues = [{"number": 500, "body": "Обычное тело без формы.", "blocked_by_open": [55]}]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_covers_reverse_blocking_field_target():
+    # #500 объявляет «Что блокирует: #56», у #56 своего поля нет вовсе, но
+    # граф её НЕ подтверждает — нарушение приписывается #56 (цели чужого
+    # объявления), не только #500.
+    issues = [
+        {"number": 500, "body": "## Что блокирует\n#56\n", "blocked_by_open": []},
+        {"number": 56, "body": "Обычное тело без формы.", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 56, "kind": "missing", "number": 500}]
+
+
+def test_declared_deps_mismatch_silent_when_native_edge_targets_non_pool_issue():
+    # Находка ревью PR #711 (живой прогон ревьюера на #700→#800): текст
+    # называет открытый #800, граф несёт #800 — согласовано. #800 просто НЕ
+    # в пуле (нет метки task, task_deps.py фильтрует его только по state,
+    # не по метке) — тот же класс, что declared_deps.py прямо называет
+    # НЕ рассинхроном (ссылка на не-task issue, см. модульный докстринг).
+    # Без симметричного фильтра native по open_numbers это ребро попадало бы
+    # в «stale» навечно — GATING_RELEASE_CONDITION[9] («0 нарушений») было
+    # бы физически недостижимо для любого пула, где такое ребро есть.
+    issues = [{"number": 700, "body": "## Чем блокируется\n#800\n", "blocked_by_open": [800]}]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_not_in_ci_gating_but_has_release_condition():
+    # Живой долг на день внедрения (#679) — гейтить нельзя (см. докстринг
+    # check_declared_deps_mismatch и комментарий у CI_GATING), но газ назван
+    # заранее (не повторяем #666 — «возврат держится на памяти»).
+    assert 9 not in ri.CI_GATING
+    assert 9 in ri.GATING_RELEASE_CONDITION
+
+
+def test_declared_deps_mismatch_flags_bare_number_not_silently_nichem():
+    # #711 (блокирующая): живой прод-случай #757 «### Что блокирует\n\n642»
+    # без `#` — до фикса читался как [] («ничем»), инвариант ЛОЖНО кричал
+    # «642: ребро есть, а поле не называет» (kind=stale), хотя поле называет
+    # ровно этот номер голым видом. После фикса — согласовано, 0 нарушений.
+    issues = [
+        {"number": 757, "body": "### Что блокирует\n\n642", "blocked_by_open": []},
+        {"number": 642, "body": "", "blocked_by_open": [757]},
+    ]
+    assert ri.check_declared_deps_mismatch(issues) == []
+
+
+def test_declared_deps_mismatch_reports_unrecognized_kind_not_silent_nichem():
+    # Поле заполнено, но текст не разбирается ни на один номер — третий вид
+    # нарушения, видимый, а не молча «поле согласовано / ничем».
+    issues = [
+        {"number": 500, "body": "### Чем блокируется\n\nне уверен\n", "blocked_by_open": []},
+    ]
+    violations = ri.check_declared_deps_mismatch(issues)
+    assert violations == [{"issue": 500, "kind": "unrecognized"}]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 10 (#794): N подряд прогонов worker.yml с ОДНОЙ и той же причиной
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Прод-форма причины — дословно та, что даёт РЕАЛЬНЫЙ пинованный пакет
+# @deepseek-ai/dsh-session@0.1.2-rc.1 (проверено живым вызовом adoptSessionEvent
+# при разборе #794): "session event at seq 13 lacks an identified message".
+# worker.yml резюмирует сессию harness-<N> при повторном ходе по той же
+# задаче — холодная загрузка испорченной записи бросает эту ошибку и валит
+# job, вживую девять прогонов подряд на harness-257 (2026-09-08T08:45Z —
+# 2026-09-09T02:08Z).
+
+def worker_run(run_id, created_at, updated_at=None, conclusion="failure"):
+    return {
+        "id": run_id,
+        "conclusion": conclusion,
+        "created_at": created_at,
+        "updated_at": updated_at or created_at,
+        "html_url": f"https://github.com/{REPO}/actions/runs/{run_id}",
+    }
+
+
+def worker_jobs_payload(job_id, job_name="Прогон"):
+    return {"jobs": [{"id": job_id, "name": job_name, "conclusion": "failure", "steps": []}]}
+
+
+def fake_log_subprocess(logs_by_job_id):
+    """Мок pulse_guard.subprocess.run для last_error_log_line — она читает
+    лог job'а НАПРЯМУЮ subprocess.run(gh api ...), в обход gh() (см. её
+    докстринг), поэтому FakeGh/patch_gh её не перехватывают: нужен отдельный
+    маршрутизатор по job_id, вычитанному из URL."""
+    def run(args, **kwargs):
+        joined = " ".join(args)
+        match = re.search(r"actions/jobs/(\d+)/logs", joined)
+        job_id = int(match.group(1)) if match else None
+        line = logs_by_job_id.get(job_id)
+        stdout = f"2026-09-08T08:45:00.0000000Z ##[error]{line}\n" if line else ""
+        return SimpleNamespace(returncode=0, stdout=stdout)
+    return run
+
+
+SESSION_LACKS_ID_ERROR = "session event at seq 13 lacks an identified message"
+
+
+def test_recurring_worker_failure_flags_streak_with_same_cause(monkeypatch):
+    # Живой случай #794: три прогона подряд (порог
+    # RECURRING_FAILURE_STREAK_THRESHOLD == pulse_guard.WORKER_FAILURE_PAUSE_AFTER),
+    # самый свежий первым — одна и та же причина у всех.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/3/jobs": worker_jobs_payload(103),
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103: SESSION_LACKS_ID_ERROR, 102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
+    })))
+    violations = ri.check_recurring_worker_failure(REPO)
+    assert len(violations) == 1
+    assert violations[0]["streak"] == 3
+    assert violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
+    assert violations[0]["since"] == "2026-09-08T08:45:00Z"
+    assert violations[0]["until"] == "2026-09-09T00:00:00Z"
+
+
+def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
+    # Два прогона подряд — ниже порога, инвариант молчит (это разница между
+    # "уже пора паузу" и "серия только начинается", тот же порог, что и у
+    # предохранителя диспатча).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == []
+
+
+def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypatch):
+    # Три красных прогона подряд, но причина СМЕНИЛАСЬ на третьем (по времени)
+    # — это не одна и та же серия, инвариант не обязан путать «часто красный»
+    # с «застрял на одном и том же».
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/3/jobs": worker_jobs_payload(103),
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103: SESSION_LACKS_ID_ERROR,
+        102: SESSION_LACKS_ID_ERROR,
+        101: "No such file or directory",  # другая, старая причина — обрывает серию
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == []
+
+
+def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
+    # Дешёвый путь холостого хода: самый свежий прогон — success, серия
+    # обрывается СРАЗУ, ни один job/лог не запрашивается (см. докстринг —
+    # это и есть цена инварианта на здоровом репозитории).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-09T03:00:00Z", conclusion="success"),
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_recurring_worker_failure(REPO) == []
+    assert not any("actions/runs/3/jobs" in call or "actions/runs/2/jobs" in call for call in fake.calls)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1149,6 +1679,17 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # молчит по построению (comment is None), не запрашивая ни файлы, ни
         # прогоны workflow.
         "issues/50/comments": [],
+        # Инвариант 9 (#710): пул с телами через GraphQL — здоровое поле «ничем»
+        # в обе стороны, нативных рёбер нет, расхождения тоже нет.
+        "graphql": graphql_pool_page([
+            graphql_issue_node(1, issue_body="## Чем блокируется\nничем\n\n## Что блокирует\nничем\n"),
+        ]),
+        # Инвариант 10 (#794): самый свежий прогон worker.yml зелёный — серия
+        # обрывается на первом же прогоне, ни один job/лог не запрашивается.
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {
+            "workflow_runs": [{"conclusion": "success", "created_at": "2026-09-03T11:00:00Z",
+                                "updated_at": "2026-09-03T11:00:00Z", "html_url": "https://x/1"}],
+        },
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")

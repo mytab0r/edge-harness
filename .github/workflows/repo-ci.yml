@@ -387,6 +387,18 @@ jobs:
       - name: Smoke «task-branch отказывает на эпике»
         run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
 
+      # Класс «Windows-кодировка валит скрипт репозитория» (issue #723): print()
+      # в stdout без file=sys.stderr падает UnicodeEncodeError (эмодзи, cp1251);
+      # subprocess.run(text=True) без encoding="utf-8" падает UnicodeDecodeError
+      # в фоновом потоке на кириллице реального ответа gh (живой трейс: task-branch
+      # → epic_guard.py → scheduler.gh → pulse_guard.gh). Гвардия статическая
+      # (по исходнику, весь класс) + живая мутация pulse_guard.gh на прод-форме
+      # байта, ронявшего cp1251.
+      - name: Тесты гвардии кодировки stdout/subprocess (Windows)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_console_utf8_guard.py -q
+
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
       # обоими зелёными вердиктами или уже в конфликте, не всех открытых
@@ -446,6 +458,16 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pagination_guard.py -q
+
+      # Класс «TypeError на вычитании aware-naive datetime, пойманный только
+      # ValueError» (#780, доводка #779): второе место повторило узкую версию
+      # первого. review_labels.parse_github_timestamp — единственное место
+      # разбора такой метки; гвардия ловит новое сырое datetime.fromisoformat(
+      # в review_labels.py/ai_review.py, открытое в обход хелпера.
+      - name: Гвардия разбора метки времени — новое место мимо общего хелпера
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_timestamp_parse_guard.py -q
 
       # Утечка секрета (#743, живой случай — DSH_CHAIN_CLASS_NOTE,
       # scripts/lib/dsh-ci.sh, до фикса): сырой stderr клиента модели уходил
@@ -556,6 +578,17 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_redact_parity.py -q
+
+      # Задача #733: массовая установка секретов/переменной combo-router (PR
+      # #732) из файла-экспорта роутера учёток владельца. Синтетическая
+      # фикстура (без настоящих кредов) — разбор контракта имён из dsh-ci.sh,
+      # разбор формата экспорта, отказ при файле внутри рабочего дерева,
+      # отсутствие значений в выводе, выбор слотов, идемпотентность, argv
+      # без значений секрета.
+      - name: Гвардия массовой установки секретов combo-router (#733)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_provider_secrets_import.py -q
 
       # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
       # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
@@ -871,6 +904,20 @@ jobs:
       - name: Smoke цепочки LLM-провайдеров (#727)
         run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
 
+      # Гвардия стыка suite ротации учёток (#215) и цепочки провайдеров
+      # (#727/#737) — design.md dsh-in-job «Стык suite и цепочки
+      # провайдеров»: обе переменные разом — fail loud, не молчаливый
+      # приоритет; внутри цикла цепочки suite всегда глушится плоским патчем.
+      - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
+        run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
+
+      # Гвардия #789: окно контекста env-provider-маршрута combo-router
+      # обязано читаться из vars.DSH_EDGE_MODEL_CATALOG (реальное окно
+      # модели), не из DSH_MAX_TOKENS (потолок ДЛИНЫ ОТВЕТА) — смешение
+      # отбрасывало главного провайдера в разы раньше нужного.
+      - name: Гвардия окна контекста env-provider (#789)
+        run: bash scripts/lib/test/dsh-context-window.guard.sh
+
       # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
       # #128, М3): два списка без единого места правды — расхождение красит CI,
       # а не живой job 400-м или мёртвой поверхностью.
@@ -1060,6 +1107,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: |
+          # checkout@v7 без fetch-depth: 0 (строка выше) не создаёт
+          # refs/remotes/origin/main — .githooks/pre-commit (core.hooksPath
+          # ниже) требует именно этот ref для проверки свежести базы и
+          # падает «нет refs/remotes/origin/main», как только archive_
+          # complete_changes.py реально доходит до git commit (живой случай:
+          # PR #711, первый прогон job'а, чей change оказался полностью
+          # отмечен). worker.yml для той же доводки PR фетчит fetch-depth: 0
+          # целиком; здесь дешевле явный фетч одной ветки.
+          git fetch origin main
           BRANCH="${{ github.event.pull_request.head.ref }}"
           git fetch origin "$BRANCH"
           PR_WORKTREE="$RUNNER_TEMP/pr-worktree"

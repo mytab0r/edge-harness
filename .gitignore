@@ -24,3 +24,8 @@ __pycache__/
 # без этой строки `git add -A` в главном дереве затягивает их как embedded
 # gitlink).
 .claude/worktrees/
+
+# Файл-экспорт роутера учёток провайдеров (krouter/9router, задача #733) —
+# секреты живут только в GitHub Actions secrets/vars, никогда в репозитории.
+*krouter*backup*.json
+*provider*export*.json

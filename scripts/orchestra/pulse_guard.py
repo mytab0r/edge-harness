@@ -183,10 +183,31 @@ AI_REVIEW_RETRY_AFTER_MINUTES = 30
 # Верхняя граница авто-повторов ai-review на один PR: без неё сбойный провайдер
 # (или контрактная ошибка модели) жёг бы квоту в цикле каждые 15 минут.
 # Счётчик — по числу маркеров AI_REVIEW_RETRY_MARKER в комментариях PR (носитель
-# переживает перезапуск оркестратора, см. scheduler.ai_review_retry_count).
+# переживает перезапуск оркестратора, см. scheduler.ai_review_retry_count) —
+# С #431 считается только за ТЕКУЩУЮ эпоху review:ok (с момента последней
+# простановки метки, тот же якорь, что и age), не за всю историю PR: живой
+# случай #249 (2026-09-06) — маркеры двух РАЗНЫХ эпох (review:ok в 17:03 и
+# 20:02) суммировались в один общий счётчик, после чего PR не получил ни
+# одного автоповтора ни за один из четырёх последующих эпизодов ai:failed,
+# хотя дифф с тех пор менялся многократно — бюджет одной эпохи не должен
+# запирать все последующие.
 AI_REVIEW_MAX_ATTEMPTS = 3
 
 AI_REVIEW_RETRY_MARKER = "[ai-review: авто-повтор]"
+
+# Тормоз без газа (#431, AGENTS.md): исчерпание AI_REVIEW_MAX_ATTEMPTS раньше
+# вело только к строке в логе прогона планировщика, которую никто не читает —
+# PR стоял молча, пока кто-то не пушнет вручную. Эскалация — тот же канал
+# (issue #120 + Telegram), что у предохранителя конвейера/#269, идемпотентно
+# на PR+эпоху (номер PR — часть маркера, по образцу READY_STALL_MARKER).
+AI_REVIEW_EXHAUSTED_MARKER = "[ai-review: автоповторы исчерпаны]"
+
+# quota_exhausted (RATE_LIMIT: Weekly/Monthly Limit Exhausted, ai_dsh.sh/#419)
+# — отдельный класс: ждать внутри CI бессмысленно (сброс квоты — дни,
+# docs/runbooks/switch-llm-provider.md), поэтому автоповтор НЕ тратится
+# вовсе — сразу эскалация с первого же обнаружения в эпохе, без ожидания
+# AI_REVIEW_MAX_ATTEMPTS попыток впустую.
+AI_REVIEW_QUOTA_MARKER = "[ai-review: квота провайдера]"
 
 # Красный обязательный чек или ai:changes-requested дольше этого — задача
 # возвращается в пул (см. scheduler.unhealthy_pulls). Отсчёт — updated_at PR:
@@ -407,7 +428,7 @@ FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пр�
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -925,7 +946,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         result = subprocess.run(
             ["gh", "api", "--allow-escape-sequences",
              f"repos/{repo}/actions/jobs/{job_id}/logs"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
             env={**os.environ, "NO_COLOR": "1"},
         )
     except OSError as error:
@@ -993,12 +1014,25 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     return comments
 
 
+def _marker_present(marker: str, body: str) -> bool:
+    """Маркер найден в теле комментария как ЦЕЛОЕ число, не префикс чужого
+    (находка ревью #439): маркеры вида «... #16» и «... #163» — оба
+    заканчиваются числом, и голая подстрока `marker in body` считает «#16»
+    найденным внутри «... #163» (163 начинается с 16), потому что справа от
+    совпадения ничего не проверялось. Запрещаем цифре идти сразу за концом
+    маркера — если сам маркер кончается цифрой, а справа в теле стоит ещё
+    одна цифра, это другой номер, не совпадение. Маркеры, не кончающиеся
+    цифрой, ведут себя как раньше (граница всегда выполнена)."""
+    pattern = re.escape(marker) + (r"(?!\d)" if marker and marker[-1].isdigit() else "")
+    return re.search(pattern, body) is not None
+
+
 def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
     payload = all_issue_comments(repo, issue_number)
     return [
         parse_time(comment["created_at"])
         for comment in payload
-        if marker in (comment.get("body") or "")
+        if _marker_present(marker, comment.get("body") or "")
     ]
 
 
@@ -1010,7 +1044,7 @@ def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) ->
     result = []
     for comment in payload:
         body = comment.get("body") or ""
-        if any(marker in body for marker in markers):
+        if any(_marker_present(marker, body) for marker in markers):
             result.append((parse_time(comment["created_at"]), body))
     return result
 
@@ -1051,7 +1085,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     if reply_markup is not None:
         args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
     except OSError as error:
         print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
         return False

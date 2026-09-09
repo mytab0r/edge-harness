@@ -27,6 +27,14 @@ IO-обвязка одна: `git ls-tree -r HEAD -- scripts` (один вызо�
   python -m pytest scripts/lib/test_exec_bit_guard.py -q
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import re
 import subprocess
 import sys
@@ -154,7 +162,7 @@ def git_blob_modes(repo_root: Path = REPO_ROOT, ref: str = "HEAD") -> dict[str, 
     GitHub API, локальный git уже доступен в любом job'е с checkout."""
     result = subprocess.run(
         ["git", "ls-tree", "-r", ref, "--", "scripts"],
-        cwd=repo_root, capture_output=True, text=True, check=True,
+        cwd=repo_root, capture_output=True, text=True, encoding="utf-8", check=True,
     )
     modes: dict[str, str] = {}
     for line in result.stdout.splitlines():

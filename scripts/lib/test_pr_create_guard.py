@@ -64,7 +64,7 @@ def test_wrapper_is_executable_in_git_index():
     # проверка смотрит именно на то, что реально уедет в репозиторий.
     result = subprocess.run(
         ["git", "ls-files", "-s", "scripts/git/pr-create"],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", check=True,
     )
     mode = result.stdout.split()[0] if result.stdout.strip() else ""
     assert mode == "100755", (

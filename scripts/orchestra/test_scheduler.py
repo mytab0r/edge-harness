@@ -303,6 +303,17 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     # allowlist-типы с валидными turn/step/message.content — форма ниже снята
     # с dsh-edge/ingest-integration/check.mjs (реальный прод-контракт, не
     # наш пересказ).
+    #
+    # #794: message.id/role/source — тоже часть прод-контракта, не украшение.
+    # dsh-session::assertMessageEventShape (dsh-session/lib/index.js, пин
+    # 0.1.2-rc.1) не вызывается на записи вовсе — вызывается ТОЛЬКО на
+    # следующей холодной загрузке той же сессии (adoptStoredEvents) — и без
+    # этих полей валит её задним числом: «session event at seq N lacks an
+    # identified message» (без id) или «message has invalid source» (есть id,
+    # нет source) — оба текста воспроизведены дословно живым вызовом
+    # adoptSessionEvent из реального пакета при разборе #794, id один не
+    # спасает. Мутация: убери любое из полей ниже — этот тест обязан упасть
+    # раньше, чем сессия испортится в проде.
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
@@ -322,10 +333,31 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     assert isinstance(event["data"]["turn"], int) and event["data"]["turn"] >= 0
     assert isinstance(event["data"]["step"], int) and event["data"]["step"] >= 0
     message = event["data"]["message"]
+    assert isinstance(message["id"], str) and message["id"] != ""
     assert message["role"] == "assistant"
     assert isinstance(message["content"], list) and message["content"]
     assert message["content"][0]["type"] == "text"
     assert "PR #1 слит в main" in message["content"][0]["text"]
+    source = message["source"]
+    assert source["kind"] == "model"
+    assert isinstance(source["provider"], str) and source["provider"] != ""
+    assert isinstance(source["model"], str) and source["model"] != ""
+
+
+def test_append_session_notes_message_id_unique_per_note_in_one_call(monkeypatch):
+    # #794: два запуска main() за один пульс (after_merge/unhealthy_pulls/
+    # accept_merged_tasks) могут дописать заметку в одну и ту же сессию —
+    # одинаковый id второй заметки была бы новой миной того же класса.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    captured_events = []
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: captured_events.extend(events) or {"appended": len(events), "lastSeq": 0})
+    sch.append_session_notes([(480, "первая"), (480, "вторая")])
+    ids = [event["data"]["message"]["id"] for event in captured_events]
+    assert len(ids) == len(set(ids)), f"id заметок не уникальны: {ids}"
 
 
 def test_morde_ingest_posts_raw_events_body_and_surfaces_http_error(monkeypatch):
@@ -999,6 +1031,60 @@ def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     assert any("178" in line for line in (observations + actions))
 
 
+def test_trigger_ai_review_skips_dispatch_when_run_already_active_no_attempt_spent(monkeypatch):
+    # #779, разрыв 2 (самый дорогой из трёх — живой замер PR #711: три
+    # диспатча за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z, весь бюджет эпохи
+    # на одном отпечатке диффа). До этой правки trigger_ai_review проверял
+    # гейт 1, наличие вердикта, порог возраста, кулдаун цепочки, quota_exhausted
+    # и бюджет попыток — «летит ли прогон этого PR прямо сейчас» в списке не
+    # было. Диспатч не должен уходить, а АТТЕМПТ (маркер AI_REVIEW_RETRY_MARKER,
+    # который и считает ai_review_retry_count) не должен тратиться — иначе
+    # следующий проход увидел бы попытку исчерпанной за прогон, которого не было.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    running_title = sch.review_labels.ai_review_run_name(711)
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [{"id": 34278765696, "display_title": running_title, "status": "in_progress"}],
+        },
+        "ai-review.yml/dispatches": AssertionError("дубль не должен диспатчиться, пока прогон летит"),
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 8, 21, 10, 30)  # порог (30 мин) прошёл
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("ai-review.yml/dispatches" in c for c in fake.calls)
+    # Маркер попытки не публикуется — attempts не растёт для следующего прохода.
+    assert posted == []
+    assert not actions
+    assert any("711" in line and "летит" in line for line in observations)
+
+
+def test_trigger_ai_review_dispatches_when_no_active_run_mutation_companion(monkeypatch):
+    # Мутация к тесту выше: то же самое PR/состояние, но БЕЗ активного
+    # прогона — диспатч обязан уйти как раньше. Доказывает, что новая
+    # проверка не тормозит легитимный автоповтор, когда прогон реально не летит.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 21, 10, 30)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert any("711" in line for line in (observations + actions))
+
+
 def ai_failed_comment(reset_hint: str, verdict: str = "error"):
     """Прод-форма комментария-вердикта AI-ревью (ai_review.build_comment,
     #727) от доверенной учётки — шапка несёт `reviewer:`/`reset-at:`,
@@ -1121,10 +1207,14 @@ def test_trigger_ai_review_silent_when_changes_requested(monkeypatch):
     assert fake.calls == []
 
 
-def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
+def test_trigger_ai_review_stops_after_max_attempts_and_escalates(monkeypatch):
+    # #431: исчерпание бюджета — тормоз без газа, если молчит. Теперь
+    # эскалирует тем же каналом, что предохранитель конвейера, вместо тихой
+    # строки в отчёте, которую никто не читает.
     p = pull(163, labels=["review:ok"])
     # AI_REVIEW_MAX_ATTEMPTS маркеров уже стоит в комментариях — прод-форма
-    # ответа issues/{n}/comments (голый массив объектов с created_at/body).
+    # ответа issues/{n}/comments (голый массив объектов с created_at/body),
+    # все ПОСЛЕ якоря текущей эпохи (09:00) — считаются как есть.
     comments = [
         {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
         for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
@@ -1132,16 +1222,214 @@ def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
     fake = FakeGh({
         "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
         "issues/163/comments": comments,
+        "issues/120/comments": [],  # WATCHDOG_ISSUE — эскалации ещё не было
     })
     patch_gh(monkeypatch, fake)
-    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем в PR"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
     assert not any("dispatches" in c for c in fake.calls)  # квота не жжётся дальше
-    # #456: «не дёргаю снова» ничего не меняет — наблюдение, не действие.
-    assert any("нужен человек" in line for line in observations)
+    # #456: сама эскалация меняет состояние (issue-комментарий) — действие,
+    # а не наблюдение.
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and str(sch.AI_REVIEW_MAX_ATTEMPTS) in escalated[0][2]
+    assert any("эскалировано" in line for line in actions)
+    assert observations == []
+
+
+def test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Уже эскалировали в этой эпохе — второй раз молчим (идемпотентность по
+    # PR+эпоха, тот же приём, что READY_STALL_MARKER/#269).
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
+        for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
+    ]
+    marker = f"{sch.AI_REVIEW_EXHAUSTED_MARKER} #163"
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": comments,
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T11:30:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert any("уже эскалировано" in line for line in observations)
     assert actions == []
+
+
+def test_trigger_ai_review_resets_attempt_budget_on_new_epoch(monkeypatch):
+    # Мутация класса #431 (живой случай #249): без сброса по эпохе маркеры
+    # ДВУХ РАЗНЫХ эпох суммируются в один общий счётчик и запирают PR
+    # навсегда. Здесь 2 старых маркера — из ПРОШЛОЙ эпохи (якорь 09:00,
+    # PR ещё не был перелейблован), 1 — из ТЕКУЩЕЙ (якорь 15:00). Итого
+    # исторически 3 (= AI_REVIEW_MAX_ATTEMPTS), но в текущей эпохе — только 1:
+    # бюджет обязан позволить ещё один автоповтор.
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": "2026-09-02T09:30:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 0"},
+        {"created_at": "2026-09-02T09:45:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 1"},
+        {"created_at": "2026-09-02T15:20:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 2"},
+    ]
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T15:00:00Z"),
+        "issues/163/comments": comments,
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет этой эпохи не исчерпан — эскалации нет"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    sch.trigger_ai_review(REPO, now, [p])
+    dispatch_calls = [c for c in fake.calls if "ai-review.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert posted and "попытка 2/3" in posted[0][1]
+
+
+def test_trigger_ai_review_dispatches_on_ai_failed_without_reason_fact_backward_compat(monkeypatch):
+    # Комментарий до #431 не несёт факта reason: — latest_ai_failure_reason
+    # обязан вернуть None (не притвориться, что причина известна), решение
+    # принимается по общему бюджету, как раньше (никакой quota-эскалации).
+    p = pull(178, labels=["review:ok", "ai:failed"])
+    old_verdict_comment = {
+        "created_at": "2026-09-01T22:40:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "pr: 178\nhead: sha178\nreviewer: error\n\n🤖 AI-ревью — второй гейт (#18). Вердикт: error.",
+    }
+    fake = FakeGh({
+        "commits/sha178/statuses": gate1_status("2026-09-01T22:37:09Z"),
+        "issues/178/comments": [old_verdict_comment],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("причина неизвестна — не наш класс, обычный путь"))
+
+    now = utc(2026, 9, 1, 23, 30)
+    sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+def test_trigger_ai_review_quota_exhausted_escalates_without_spending_attempt(monkeypatch):
+    # quota_exhausted (#419/#431) — ждать внутри CI бессмысленно, автоповтор
+    # не тратится вовсе, эскалация с первого обнаружения в эпохе.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR — эскалация, не ретрай"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and "квота" in escalated[0][2]
+    assert any("квота провайдера исчерпана" in line for line in actions)
+
+
+def test_trigger_ai_review_quota_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Зеркало test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch
+    # для quota-ветки (находка ревью #439) — та же логика marker_at > anchor,
+    # уже эскалированная в этой эпохе квота не должна эскалироваться повторно
+    # на каждом тике оркестратора.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    marker = f"{sch.AI_REVIEW_QUOTA_MARKER} #163"
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T09:10:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert actions == []
+
+
+def test_trigger_ai_review_quota_reason_from_prior_epoch_is_not_used(monkeypatch):
+    # Находка ревью PR #439: reason: quota_exhausted из ПРОШЛОЙ эпохи (якорь
+    # 09:00) не должен управлять решением текущей эпохи (якорь 15:00, PR
+    # перелейблован новым пушем — свежий вердикт ai-review из-за очереди
+    # раннеров ещё не пришёл). Без якоря latest_ai_failure_reason нашёл бы
+    # старый quota-комментарий и эскалировал вместо того, чтобы дать эпохе
+    # автоповтор — ровно живой сценарий из ревью.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    old_quota_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha-old\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        # Якорь текущей эпохи — 15:00 (перелейбловка новым пушем), старше
+        # прошлой эпохи 09:00.
+        "commits/sha163/statuses": gate1_status("2026-09-02T15:00:00Z"),
+        "issues/163/comments": [old_quota_comment],  # единственный комментарий — из ПРОШЛОЙ эпохи
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(
+        sch, "escalate",
+        lambda *a: pytest.fail("причина из прошлой эпохи не должна закрывать автоповтор новой"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert posted and "попытка 1/3" in posted[0][1]
+
+
+def timeline_with_review_large_only(when: str):
+    """Прод-форма таймлайна крупного PR (#412, #432): verdict_for ставит РОВНО
+    одну из двух меток гейта 1 — событие "labeled: review:ok" в таком
+    таймлайне не наступает НИКОГДА, только "labeled: review:large"."""
+    return [{"event": "labeled", "label": {"name": "review:large"}, "created_at": when}]
 
 
 def test_trigger_ai_review_dispatches_for_review_large_ai_failed(monkeypatch):
@@ -3976,7 +4264,7 @@ def test_task_sh_composes_claim_via_worker_run_format():
     <id>», а пишет его task.sh (CLAIM_VIA). Переименование формата в одном
     месте без другого обязано краснить этот тест, а не молча сломать
     эвристику #220."""
-    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text()
+    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text(encoding="utf-8")
     assert 'CLAIM_VIA="worker run ${GITHUB_RUN_ID' in task_sh
 
 

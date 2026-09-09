@@ -22,11 +22,24 @@
 # worker.yml timeout-minutes). Патологический случай «упало после 140 минут
 # работы» теоретически возможен и не решён здесь (тот же непокрытый класс уже
 # принят в #421 для ai-review) — задокументирован, не тихо проигнорирован.
-# quota_exhausted (недельная/месячная квота) и rate_limit_retry_budget_exceeded
-# (бюджет короткого окна кончился) — обе причины возвращают задачу в пул СРАЗУ
+# quota_exhausted (недельная/месячная квота), rate_limit_retry_budget_exceeded
+# (бюджет короткого окна кончился) и all_providers_exhausted (цепочка ниже
+# исчерпана целиком) — все три причины возвращают задачу в пул СРАЗУ
 # (lease_cli release-full, #422), не дожидаясь 24-часового TTL-сборщика: вина
 # не в задаче, держать assignee до таймера — зря прятать её от других каналов.
 #
+# Цепочка провайдеров (#727, довод #797): dsh_require_provider_env/
+# dsh_run_with_retry заменены на dsh_require_provider_chain/
+# dsh_run_with_provider_chain (lib/dsh-ci.sh, тот же механизм, что уже несёт
+# ai-review.yml, scripts/review/ai_dsh.sh) — quota_exhausted и повторяемый
+# транспортный отказ (HTTP_404/EMPTY_RESPONSE) переключают на следующего
+# провайдера ВНУТРИ одного прогона, без ручной смены vars/секрета (иначе
+# недельная/месячная квота GLM держала бы воркер мёртвым до сброса, хотя
+# NVIDIA в цепочке рабочий). Порядок относительно монтажа плагина стрима
+# (dsh-hands-streamer, шаг 6b ниже) — см. комментарий у шага 6: профиль
+# затравлен ПЕРВЫМ провайдером цепочки ДО первого `dsh` (dsh plugin add),
+# цепочка перепатчивает профиль заново на каждую попытку внутри шага 7 — тот
+# же dsh_patch_profile, не второй механизм.
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
 #   task.sh --task 89     — выполнить конкретную задачу (если она открыта и свободна)
@@ -94,13 +107,13 @@ if [ -n "$TASK_INPUT" ]; then
   case "$TASK_INPUT" in *[!0-9]*) die "номер задачи должен быть числом: '$TASK_INPUT'" ;; esac
 fi
 
-# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
-# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
-# раньше дупгарда/назначения/ветки/сессии морды — падать сразу, а не после
-# дорогой подготовительной работы. Пропускаем при --dry-run: самотест печатает
-# выбор и промпт без реального вызова модели, требовать ключ здесь незачем.
+# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727/#797):
+# зашитого списка провайдеров в коде нет. Проверяем раньше дупгарда/
+# назначения/ветки/сессии морды — падать сразу, а не после дорогой
+# подготовительной работы. Пропускаем при --dry-run: самотест печатает выбор
+# и промпт без реального вызова модели, требовать цепочку здесь незачем.
 if [ "$DRY_RUN" != "1" ]; then
-  dsh_require_provider_env || die "провайдер не сконфигурирован (см. ::error:: выше)"
+  dsh_require_provider_chain || die "провайдер не сконфигурирован (см. ::error:: выше)"
 fi
 
 # Гвардия дублей прогонов: если живёт ДРУГОЙ прогон воркера — активный или
@@ -452,12 +465,31 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
-export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
-
+# ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
 dsh_install "$WORK/pkgs"
 dsh --version || true
-dsh_patch_profile headless
+dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
+# Затравка профиля первым провайдером цепочки (chain[0]) — ОБЯЗАНА случиться
+# ДО первого `dsh` этого прогона (dsh plugin add, шаг 6b ниже): «initProfile
+# пишет package.json/cordis.patch.yml/pnpm-workspace.yaml только при
+# отсутствии, ничего не перезаписывает» (research/10-dsh-architecture.md,
+# живой прогон 2026-08-30) — если cordis.patch.yml ещё не существует к
+# моменту plugin add, initProfile создаст файл сам, с содержимым, которое
+# отсюда не контролируется. Дальше, на шаге 7, dsh_run_with_provider_chain
+# перепатчивает профиль ЗАНОВО на каждую попытку (тот же dsh_patch_profile,
+# полная перезапись файла) — здесь важен только факт, что файл СУЩЕСТВУЕТ к
+# моменту первого `dsh`, не его точное содержимое; профиль на тот момент уже
+# инициализирован (package.json/pnpm-workspace.yaml созданы), поэтому
+# повторный патч не задевает монтаж плагина (bundles профиля — отдельный
+# слой, `dsh --dump-config`, «Порядок слоёв», research/10-dsh-architecture.md).
+_chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
+_chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
+DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
+DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
+export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
+dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
@@ -499,10 +531,13 @@ WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$WORKER_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
+  dsh_run_with_provider_chain "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
 rc=$DSH_RUN_RC
 WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
-echo "dsh завершился с кодом $rc"
+WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
+WORKER_CHAIN_TRIED="$DSH_CHAIN_TRIED"
+WORKER_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
+echo "dsh завершился с кодом $rc (провайдер: ${WORKER_CHAIN_PROVIDER:-нет успеха}, опробованы: ${WORKER_CHAIN_TRIED:-?})"
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
 dsh_edge_stop_drain
@@ -561,7 +596,7 @@ pr_url=${pr_line#*$'\t'}
 if [ "$pr_outcome_rc" -eq 0 ]; then
   verb="открыт"; [ "$pr_status" = "merged" ] && verb="слит"
   comment=$(cat <<COMMENT
-🤖 Автономный воркер справился. PR $verb: $pr_url
+🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER:-?}). PR $verb: $pr_url
 
 Финальный ответ DSH (хвост, секреты замаскированы):
 
@@ -613,18 +648,23 @@ COMMENT
   exit 0
 fi
 
-# Провайдер в лимите (#422) — не сбой агента: сообщение и Telegram обязаны
-# звучать иначе, чем «воркер не справился» (правило AGENTS.md — «возможности
-# нет» и «возможность есть, но сломана» лечатся по-разному), а задача обязана
-# вернуться в пул СРАЗУ (снять и замок, и назначение), не ждать 24-часовой
-# TTL-сборщик — вина не в задаче, держать её занятой зря.
+# Провайдер в лимите (#422) или вся цепочка исчерпана (#727/#797) — не сбой
+# агента: сообщение и Telegram обязаны звучать иначе, чем «воркер не
+# справился» (правило AGENTS.md — «возможности нет» и «возможность есть, но
+# сломана» лечатся по-разному), а задача обязана вернуться в пул СРАЗУ (снять
+# и замок, и назначение), не ждать 24-часовой TTL-сборщик — вина не в задаче,
+# держать её занятой зря.
 if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
-   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; then
-  if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ]; then
-    reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)"
-  else
-    reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)"
-  fi
+   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; then
+  case "$WORKER_TASK_FAILURE_REASON" in
+    quota_exhausted)
+      reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)" ;;
+    rate_limit_retry_budget_exceeded)
+      reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)" ;;
+    all_providers_exhausted)
+      reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" ;;
+  esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
     echo "Провайдер в лимите — задача #$number возвращена в пул немедленно: $release_out"
