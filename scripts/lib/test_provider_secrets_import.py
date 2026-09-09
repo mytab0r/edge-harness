@@ -402,7 +402,53 @@ def test_set_secret_value_never_in_argv(monkeypatch):
     args, stdin_value = calls[0]
     assert FIXTURE_MARKER not in args
     assert stdin_value == FIXTURE_MARKER
-    assert "--body-file" in args and "-" in args
+    # Задача #786: --body-file непортируем между версиями gh (2.85.0 не знает
+    # флаг у gh secret/variable set) — значение подаётся ТОЛЬКО через input=,
+    # argv не несёт ни значения, ни этого флага.
+    assert "--body-file" not in args
+
+
+# ── Гвардия класса «непортируемый флаг gh» (задача #786) ─────────────────
+#
+# gh secret set / gh variable set читают значение из stdin, когда --body/
+# --body-file не передан вовсе — добавлять --body-file было лишним и на
+# установленной у владельца версии gh (2.85.0) роняло вызов целиком
+# (`unknown flag: --body-file`), из-за чего НИ ОДИН секрет не записывался,
+# хотя код возврата ловился и печатался. Проверяем по ИСХОДНИКУ, что литерал
+# не вернётся тихо при будущей правке (по образцу test_pagination_guard.py).
+#
+# Мутация, которой доказана гвардия: верни в set_secret/set_variable
+# `"--body-file", "-"` в списке argv — этот тест краснеет; убери — снова
+# зелёный (проверено вручную при внедрении гвардии).
+
+
+def test_set_secret_and_set_variable_source_never_contains_body_file_flag():
+    """По AST, не по подстроке текста функции: докстринг обеих функций сам
+    объясняет, ПОЧЕМУ --body-file не добавлен (задача #786), и упоминает этот
+    литерал прозой — подстрочная проверка текста функции ловила бы и это
+    объяснение как нарушение. Признак настоящего нарушения — строковый
+    литерал `--body-file` в КОДЕ функции (argv списка gh), не в докстринге."""
+    import ast
+
+    source = Path(psi.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in ("set_secret", "set_variable"):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                body = body[1:]  # пропускаем докстринг — там литерал упомянут прозой, не кодом
+            for sub in body:
+                for inner in ast.walk(sub):
+                    if isinstance(inner, ast.Constant) and inner.value == "--body-file":
+                        offenders.append(node.name)
+    assert offenders == [], (
+        "непортируемый флаг gh (--body-file, задача #786, gh 2.85.0: "
+        f"'unknown flag') снова в коде функции: {offenders}. gh secret/variable "
+        "set читает значение из stdin без флага вовсе — не добавляй "
+        "--body-file обратно."
+    )
 
 
 # ── export_snapshot_date: дата снимка предохранителя ─────────────────────
