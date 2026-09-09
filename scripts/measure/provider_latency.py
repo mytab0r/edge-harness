@@ -62,14 +62,20 @@ DSH_CI_SH = REPO_ROOT / "scripts" / "lib" / "dsh-ci.sh"
 PROVIDER_USAGE_MANIFEST = REPO_ROOT / "config" / "provider-usage.json"
 SAMPLE_DIFF_FIXTURE = Path(__file__).with_name("fixtures") / "sample_review_diff.patch"
 
-# Провайдер, подтверждённо мёртвый на генерацию (не на листинг моделей —
-# разные эндпоинты, разные факты, issue #798): два живых замера отдали 404
-# на completion-пути, PR #834 (подтверждение id в реестре) закрыт как
-# not-planned именно по этой причине. Манифест (#823) сегодня всё ещё несёт
-# эту запись первым элементом — дрейф от факта закрытия #798/#834, который
-# этот бенчмарк не тиражирует: живой замер мёртвого провайдера — потраченный
-# впустую таймаут, не число.
-DEAD_CANDIDATE_NAMES = {"NVIDIA-nano"}
+# NVIDIA-nano подтверждённо мёртв на генерацию (не на листинг моделей —
+# разные эндпоинты, разные факты, issue #798): два живых замера ранее отдали
+# 404 на completion-пути, PR #834 (подтверждение id в реестре) закрыт как
+# not-planned именно по этой причине. НО находка ревью #837: постановка #836
+# явно перечисляет его кандидатом («NVIDIA-nano, NVIDIA-ultra, Ollama,
+# OpenRouter, GLM»), и молчаливое исключение мёртвого провайдера из ЗАМЕРА —
+# не то же самое, что исключение его из ФИНАЛЬНОЙ цепочки: живой прогон,
+# зафиксировавший "error"/"timeout" в таблице, — само по себе полезное
+# число (подтверждает или опровергает факт двухлетней давности), тогда как
+# тихое исчезновение строки из таблицы неотличимо от «его не было в
+# кандидатах вовсе» (AGENTS.md, «Fail loud, не silent-wrong»). Поэтому
+# build_manifest_candidates() НИЧЕГО не исключает — решение «мёртвых в
+# финальную цепочку не брать» остаётся за человеком/агентом, читающим
+# результат таблицы (issue #836, шаг 4), не за фильтром на входе замера.
 
 # У OpenRouter в PLUGINS_SUITE_CANDIDATE_ROUTES (dsh-ci.sh) стоит платная
 # модель (contextWindow 200000, "anthropic/claude-sonnet-4.6") — у владельца
@@ -130,8 +136,6 @@ def build_manifest_candidates(consumer: str = "ai-review",
         if not isinstance(entry, dict):
             continue
         if not {"name", "base_url", "model", "secret_env"} <= entry.keys():
-            continue
-        if entry["name"] in DEAD_CANDIDATE_NAMES:
             continue
         out.append({"name": entry["name"], "base_url": entry["base_url"],
                      "model": entry["model"], "secret_env": entry["secret_env"]})
@@ -313,7 +317,19 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    prompt = os.environ.get("PROVIDER_LATENCY_PROMPT") or DEFAULT_PROMPT
+    prompt_override = os.environ.get("PROVIDER_LATENCY_PROMPT")
+    if not prompt_override and not SAMPLE_DIFF_FIXTURE.exists():
+        # Находка ревью #837: раньше это место молча деградировало до
+        # promт'a на два слова (другой порядок латентности, невалидная
+        # таблица, rc=0) — AGENTS.md «Fail loud, не silent-wrong». Промпт
+        # ЗАДАН явно (workflow input) — фикстура не нужна вовсе, эта ветка
+        # не выполняется.
+        print(f"::error::фикстура {SAMPLE_DIFF_FIXTURE} не найдена — реалистичный промпт "
+              "недоступен, и молчаливая деградация до короткого промпта дала бы невалидную "
+              "таблицу латентности (другой порядок величины). Передай PROVIDER_LATENCY_PROMPT "
+              "явно, либо верни фикстуру.", file=sys.stderr)
+        return 1
+    prompt = prompt_override or DEFAULT_PROMPT
     timeout_secs = float(os.environ.get("PROVIDER_LATENCY_TIMEOUT_SECS") or DEFAULT_TIMEOUT_SECS)
     # Промпт — реалистичный дифф (~1.5-2к токенов), не короткая строка: в лог
     # уходит только длина и превью первой строки, не всё содержимое (шум,

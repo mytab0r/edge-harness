@@ -193,8 +193,12 @@ def test_build_manifest_candidates_from_fixture(tmp_path):
         "usage": {"ai-review": "default-chain"},
     }), encoding="utf-8")
     out = pl.build_manifest_candidates(manifest_path=manifest)
-    # NVIDIA-nano исключён (DEAD_CANDIDATE_NAMES, подтверждённый 404 #798/#834)
-    assert [c["name"] for c in out] == ["NVIDIA", "GLM"]
+    # NVIDIA-nano измеряется наравне с остальными (находка ревью #837): даже
+    # подтверждённо мёртвый провайдер (#798/#834) — часть постановки #836,
+    # его "error"/"timeout" в таблице сам по себе полезный факт; решение
+    # «не брать в финальную цепочку» принимается ПОСЛЕ замера, не фильтром
+    # на входе.
+    assert [c["name"] for c in out] == ["NVIDIA-nano", "NVIDIA", "GLM"]
 
 
 def test_build_manifest_candidates_missing_file_is_empty_not_error(tmp_path):
@@ -258,8 +262,11 @@ def test_build_candidates_dedupes_by_base_url_model_secret_env():
 def test_real_repo_candidates_cover_full_owner_set_without_codex():
     names = {c["name"] for c in pl.PROVIDER_LATENCY_CANDIDATES}
     assert not any("codex" in n.lower() for n in names)
-    assert "NVIDIA-nano" not in names  # исключён (#798/#834, 404 на генерацию)
-    assert len(pl.PROVIDER_LATENCY_CANDIDATES) >= 8  # боевая цепочка + вся suite-таблица
+    # NVIDIA-nano ИЗМЕРЯЕТСЯ (находка ревью #837, постановка #836 явно
+    # перечисляет его кандидатом) — даже подтверждённо мёртвый на генерацию
+    # (#798/#834), его "error"/"timeout" в таблице сам по себе факт.
+    assert "NVIDIA-nano" in names
+    assert len(pl.PROVIDER_LATENCY_CANDIDATES) >= 9  # боевая цепочка (3) + вся suite-таблица (8)
 
 
 def test_real_repo_candidates_no_paid_openrouter_model():
@@ -277,3 +284,29 @@ def test_default_prompt_is_realistic_not_trivial_greeting():
     # ~1.5-2к токенов реального диффа (постановка ревью #837), не "hi"
     assert len(pl.DEFAULT_PROMPT) > 2000
     assert "diff --git" in pl.DEFAULT_PROMPT
+
+
+# ── main(): fail loud, а не silent-wrong на пропавшей фикстуре (ревью #837) ─
+
+
+def test_main_fails_loud_when_fixture_missing_and_no_prompt_override(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("PROVIDER_LATENCY_PROMPT", raising=False)
+    monkeypatch.setattr(pl, "SAMPLE_DIFF_FIXTURE", tmp_path / "нет-такого-файла.patch")
+    rc = pl.main()
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "фикстура" in err
+    assert "не найдена" in err
+
+
+def test_main_ignores_missing_fixture_when_prompt_override_given(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROVIDER_LATENCY_PROMPT", "явный промпт из workflow input")
+    monkeypatch.setattr(pl, "SAMPLE_DIFF_FIXTURE", tmp_path / "нет-такого-файла.patch")
+
+    def fake_measure(entry, prompt=None, timeout_secs=None, **kw):
+        return {"name": entry["name"], "model": entry["model"], "latency_s": 0.1,
+                "status": "success", "http": 200, "tokens": "1", "note": ""}
+
+    monkeypatch.setattr(pl, "measure_provider", fake_measure)
+    rc = pl.main()
+    assert rc == 0
