@@ -95,7 +95,8 @@ const SCHEMA = [
      run_confirmed INTEGER
    )`,
   // Ретеншн (#306/#305, находка ревью): streak/last-исход обязаны пережить
-  // выгрузку DO из памяти (idle ~10 с) между тиками alarm (раз в ~15 мин) — на
+  // выгрузку DO из памяти (idle ~10 с) между тиками alarm (раз в
+  // HEARTBEAT.selfOrchestrationMs, config.ts) — на
   // проде объект почти всегда пересоздаётся между тиками, поэтому счётчик В
   // ПАМЯТИ обнулялся бы каждый раз и retentionBacklog() не срабатывал бы
   // практически никогда — тот же принцип персиста, что у pulse выше (#269).
@@ -1315,7 +1316,8 @@ export class Harness extends DurableObject<Env> {
    * из инфраструктуры Cloudflare, а не из активности самого объекта.
    *
    * СТРАХОВКА, НЕ ВТОРОЙ ОСНОВНОЙ ТИК: alarm() остаётся главным путём — тикает
-   * каждые HEARTBEAT.selfOrchestrationMs (15 мин) и делает всё (ретеншн,
+   * каждые HEARTBEAT.selfOrchestrationMs (config.ts — единственное место
+   * правды на число) и делает всё (ретеншн,
    * инбокс, dispatch, self-update dsh-edge). Этот метод в подавляющем
    * большинстве вызовов не пишет НИ ОДНОЙ строки — читает только текущий
    * pulse и решает через pulseNeedsRecoveryDispatch() (НЕ pulseStale() — тот
@@ -1475,7 +1477,8 @@ export class Harness extends DurableObject<Env> {
    * чистка сама не работает»; фиксируется как один тик в streak, который
    * ЖИВЁТ В SQL (retention_state), не в памяти объекта (находка ревью PR
    * #329): DO выгружается из памяти через ~10 с простоя, а alarm тикает раз в
-   * ~15 мин — счётчик в памяти обнулялся бы почти на каждом тике, и
+   * HEARTBEAT.selfOrchestrationMs (config.ts) — счётчик в памяти обнулялся бы
+   * почти на каждом тике, и
    * retentionBacklog() не срабатывал бы практически никогда (fail loud
    * канал спеки 14.8 молча не работал бы). Тот же приём, что у pulse (#269).
    *
@@ -1625,7 +1628,7 @@ export class Harness extends DurableObject<Env> {
     const decision = dshEdgeUpdateDecision(health.version, release.version, last, now);
     if (decision !== "dispatch") return;
     // Пометку попытки ставим ДО диспетча: упавший деплой не должен превратить
-    // пульс в штурм упавшего деплоя каждые 15 минут.
+    // пульс в штурм упавшего деплоя на каждом тике alarm (HEARTBEAT.selfOrchestrationMs).
     await this.ctx.storage.put(DSH_EDGE_UPDATE.lastAttemptKey, now);
     console.log(`dsh-edge update: deployed ${health.version} != npm ${release.version} — dispatch`);
     const res = await fetch(
@@ -1729,8 +1732,8 @@ export class Harness extends DurableObject<Env> {
    * прогоны CI, а не на живой прод — квота может быть исчерпана без единого
    * красного workflow. Алерт (best-effort, тем же #telegramApi, что решения
    * владельца #470/#471 — новый канал не заводится) шлётся только на
-   * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам раз в 15 минут,
-   * пока квота не сбросится в 00:00 UTC.
+   * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам на каждом тике alarm
+   * (HEARTBEAT.selfOrchestrationMs), пока квота не сбросится в 00:00 UTC.
    *
    * Дедуп перехода — по итогу ЗАПИСИ дедуп-флага (storageReadyAlertDecision),
    * не по чтению прошлого исхода: при исчерпании rows_read (#320) падают
