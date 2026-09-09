@@ -457,6 +457,17 @@ jobs:
           # провайдеров», scripts/review/ai_dsh.sh). Ротация учёток остаётся
           # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
           # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
+          #
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ
+          # от suite случай, протокольно не конфликтует с цепочкой (design.md
+          # anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»):
+          # пробуется ПОСЛЕДОВАТЕЛЬНО перед ней, не заменяя. JSON
+          # credentials.json целиком в значении секрета (AGENTS.md
+          # «Секреты» — значение никогда не печатается). Оба пусты →
+          # dsh_install_anthropic_pool печатает «не подключён», шаг идёт как
+          # раньше (только цепочка).
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
