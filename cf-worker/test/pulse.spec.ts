@@ -6,6 +6,7 @@ import {
   fetchLatestOrchestraRunId,
   pulseDetailForRecord,
   pulseHealthy,
+  pulseNeedsRecoveryDispatch,
   pulseNotConfigured,
   pulseStale,
   retentionBacklog,
@@ -245,6 +246,76 @@ describe("пульс оркестрации: pulseStale — unhealthy из-за 
 
   it("dispatch удался, но давно (alarm подвис) — stale, detail в хранилище честно null", () => {
     expect(pulseStale(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null, run_confirmed: true })).toBe(true);
+  });
+});
+
+// Гвардия issue #713: pulseStale() отвечает на вопрос БЕЙДЖА (как
+// классифицировать last_pulse для /api/status) и нарочно возвращает false
+// для dispatch_ok=false/run_confirmed=false ДО проверки возраста — это верно
+// для бейджа, но неверно для страховки Cron Trigger (scheduledTick()),
+// которой нужен другой вопрос: «нужен ли резервный dispatch сейчас».
+// pulseNeedsRecoveryDispatch() — второй, отдельный предикат ровно для этого
+// вопроса; pulseStale() он не трогает и не расширяет (см. докстринг обоих
+// в src/harness.ts).
+//
+// Докажи мутацией: верни pulseNeedsRecoveryDispatch() к семантике pulseStale()
+// (добавь `if (!lastPulse.dispatch_ok) return false;` и
+// `if (lastPulse.run_confirmed === false) return false;` перед проверкой
+// возраста) — тесты «dispatch_ok=false и давно» и «run_confirmed=false и
+// давно» ниже покраснеют.
+describe("пульс оркестрации: pulseNeedsRecoveryDispatch — страховка Cron Trigger (issue #693/#713)", () => {
+  const FRESH_MS = HEARTBEAT.selfOrchestrationMs * 2 - 1;
+  const STALE_MS = HEARTBEAT.selfOrchestrationMs * 2;
+
+  it("холодный старт (null) — нужен резервный dispatch: alarm мог подвиснуть на самом первом тике", () => {
+    expect(pulseNeedsRecoveryDispatch(NOW, null)).toBe(true);
+  });
+
+  it("возможности нет (секреты не заданы) — dispatch всё равно не пройдёт, резервный не нужен", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - STALE_MS, dispatch_ok: false, detail: "not_configured", run_confirmed: null }),
+    ).toBe(false);
+  });
+
+  it("dispatch удался и свежий — не нужен резервный", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - FRESH_MS, dispatch_ok: true, detail: null, run_confirmed: true }),
+    ).toBe(false);
+  });
+
+  it("dispatch удался, но давно (alarm подвис) — нужен резервный, как и pulseStale", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null, run_confirmed: true }),
+    ).toBe(true);
+  });
+
+  // Живой случай issue #713: последний записанный пульс до подвисания alarm()
+  // сам был неудачным (dispatch_ok=false) — pulseStale() здесь НАВСЕГДА false
+  // (не доходит до проверки возраста), а конвейер стоит незамеченно.
+  it("dispatch провалился И давно — нужен резервный (issue #713, pulseStale() здесь молчал бы навсегда)", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - STALE_MS, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null }),
+    ).toBe(true);
+  });
+
+  it("dispatch провалился, но свежо — рано для резервного, alarm сам повторит на следующем тике", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - FRESH_MS, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null }),
+    ).toBe(false);
+  });
+
+  // Симметричный живой случай: run_confirmed=false (204 принят, run не появился)
+  // на пульсе, после которого alarm() подвис.
+  it("run_confirmed=false И давно — нужен резервный (issue #713)", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - STALE_MS, dispatch_ok: true, detail: null, run_confirmed: false }),
+    ).toBe(true);
+  });
+
+  it("run_confirmed=false, но свежо — рано для резервного", () => {
+    expect(
+      pulseNeedsRecoveryDispatch(NOW, { ts: NOW - FRESH_MS, dispatch_ok: true, detail: null, run_confirmed: false }),
+    ).toBe(false);
   });
 });
 
