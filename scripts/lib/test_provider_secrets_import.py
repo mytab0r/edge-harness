@@ -409,25 +409,47 @@ def test_probe_provider_bad_status_line_is_classified_not_raised(capsys):
     assert FIXTURE_MARKER not in captured.err
 
 
-def test_probe_candidates_survives_one_dead_gateway_among_many(dsh_ci_path):
+def test_probe_candidates_survives_one_dead_gateway_among_many(dsh_ci_path, monkeypatch):
     """Регрессия ЭТОГО PR (блокирующая 1): один оборванный шлюз среди девяти
     не валит весь probe_candidates/main() — остальные кандидаты пробуются и
-    классифицируются нормально."""
+    классифицируются нормально.
+
+    Блокирующая 1 гейта PR #781: раньше второе семейство (zai) оставалось с
+    НАСТОЯЩИМ base_url из dsh-ci.sh (api.z.ai) — обязательный шаг CI слал
+    третьей стороне живой HTTP-запрос с ключом-маркером в заголовке
+    Authorization при каждом push/PR. Оба семейства теперь указывают на
+    синтетические локальные серверы (мёртвый — openrouter, живой — zai) —
+    никакого выхода в интернет, докстрин "остальные кандидаты пробуются и
+    классифицируются нормально" доказан фактическим PROBE_ALIVE, а не
+    угадан по len(results)."""
+    monkeypatch.setattr(psi, "_PROBE_TIMEOUT_SECONDS", 0.3)
     routes = psi.parse_suite_routes(dsh_ci_path)
     routes_by_family = psi.group_routes_by_family(routes)
 
-    def handler(conn: socket.socket) -> None:
+    def dead_handler(conn: socket.socket) -> None:
         _read_request(conn)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 
-    server = _RawTcpServer(handler)
+    def alive_handler(conn: socket.socket) -> None:
+        _read_request(conn)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+
+    dead_server = _RawTcpServer(dead_handler)
+    alive_server = _RawTcpServer(alive_handler)
     try:
-        # Подменяем базовый URL первого маршрута openrouter на мёртвый сервер.
+        # Подменяем базовый URL первого маршрута openrouter на мёртвый сервер
+        # и первого маршрута zai — на живой (оба синтетические, localhost).
         dead_route = routes_by_family["openrouter"][0]
         routes_by_family["openrouter"][0] = psi.SuiteRoute(
             alias=dead_route.alias, family=dead_route.family, slot=dead_route.slot,
-            base_url=server.base_url, secret_env=dead_route.secret_env,
+            base_url=dead_server.base_url, secret_env=dead_route.secret_env,
             display_name=dead_route.display_name,
+        )
+        zai_route = routes_by_family["zai"][0]
+        routes_by_family["zai"][0] = psi.SuiteRoute(
+            alias=zai_route.alias, family=zai_route.family, slot=zai_route.slot,
+            base_url=alive_server.base_url, secret_env=zai_route.secret_env,
+            display_name=zai_route.display_name,
         )
         candidates_by_family = {
             "openrouter": _accounts_from_dicts([
@@ -437,12 +459,30 @@ def test_probe_candidates_survives_one_dead_gateway_among_many(dsh_ci_path):
                 _account("glm", 1, True, "unavailable", f"{FIXTURE_MARKER}-glm1"),
             ]),
         }
+        # Трассировщик: доказывает, что probe_candidates не открывает НИ ОДНОГО
+        # сетевого сокета вне двух заведённых здесь локальных серверов.
+        opened_hosts: list[tuple[str, int]] = []
+        real_create_connection = socket.create_connection
+
+        def _tracing_create_connection(address, *args, **kwargs):
+            opened_hosts.append(address)
+            return real_create_connection(address, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "create_connection", _tracing_create_connection)
         results = psi.probe_candidates(candidates_by_family, routes_by_family)
     finally:
-        server.close()
+        dead_server.close()
+        alive_server.close()
     assert len(results) == 2
     or_result = next(v for k, v in results.items() if k.startswith("openrouter"))
+    zai_result = next(v for k, v in results.items() if k.startswith("glm"))
     assert or_result.outcome == psi.PROBE_NETWORK_UNAVAILABLE
+    assert zai_result.outcome == psi.PROBE_ALIVE
+    allowed_hosts = {("127.0.0.1", dead_server.port), ("127.0.0.1", alive_server.port)}
+    assert opened_hosts, "трассировщик не увидел ни одного открытого сокета"
+    assert set(opened_hosts) <= allowed_hosts, (
+        f"probe_candidates открыл сокет за пределами локальных фикстур: {opened_hosts}"
+    )
 
 
 # ── parse_model_ids / probe_provider_full: печать id моделей, не тела ────
@@ -712,6 +752,35 @@ def test_dead_by_probe_reason_only_on_first_empty_slot_not_every_empty_slot(dsh_
     assert by_secret["NVIDIA_NIM_2_API_KEY"].empty_reason is None
 
 
+def test_dead_by_probe_reason_not_duplicated_across_multiple_empty_slots(dsh_ci_path):
+    """Minor 3 гейта PR #781: 2 слота nvidia-nim, ОБА кандидата выброшены
+    живой пробой — 2 пустых слота, 2 выброшенных. Раньше
+    empty_reason_budget = len(dead_by_probe) отдавал ОДНУ И ТУ ЖЕ агрегатную
+    строку («2 кандидат(ов) исключены...») ОБОИМ пустым слотам — читатель,
+    суммирующий число исключённых по числу строк, получил бы 4 исключённых
+    при фактических 2-х. Мутация: верни `empty_reason_budget =
+    len(dead_by_probe)` — этот тест покраснеет на втором слоте."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    dead_acc_1, dead_acc_2 = _accounts_from_dicts([
+        _account("nvidia", 1, False, "unavailable", "k-dead-nv1"),
+        _account("nvidia", 2, False, "unavailable", "k-dead-nv2"),
+    ])
+    probe_results = {
+        dead_acc_1.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401"),
+        dead_acc_2.id: psi.ProbeResult(psi.PROBE_INVALID_KEY, "HTTP 401"),
+    }
+    selection = psi.select_accounts(
+        [dead_acc_1, dead_acc_2], routes, probe_results=probe_results,
+    )
+    by_secret = {a.route.secret_env: a for a in selection.assignments}
+    assert by_secret["NVIDIA_NIM_1_API_KEY"].account is None
+    assert by_secret["NVIDIA_NIM_1_API_KEY"].empty_reason is not None
+    assert "2 кандидат" in by_secret["NVIDIA_NIM_1_API_KEY"].empty_reason
+    # Только ПЕРВЫЙ пустой слот несёт причину — второй не повторяет её.
+    assert by_secret["NVIDIA_NIM_2_API_KEY"].account is None
+    assert by_secret["NVIDIA_NIM_2_API_KEY"].empty_reason is None
+
+
 # ── Блокирующая 3 гейта PR #778: снимочная дисквалификация НЕ выбрасывает ─
 
 
@@ -783,6 +852,32 @@ def test_live_probe_403_ranks_worse_than_quota_but_does_not_exclude(dsh_ci_path)
     assert suspect_acc not in selection.probe_excluded
 
 
+def test_render_report_names_gas_for_suspect_403_slot(dsh_ci_path):
+    """Minor 4 гейта PR #781: TIER_SUSPECT (403) занимает слот молча — текст
+    кончался перечнем гипотез без ответа на «что делать». Отчёт обязан
+    называть газ: что сделать, если 403 устойчив."""
+    routes = psi.parse_suite_routes(dsh_ci_path)
+    (suspect_acc,) = _accounts_from_dicts([
+        _account("openrouter", 1, True, "unavailable", "k-403"),
+    ])
+    probe_results = {suspect_acc.id: psi.ProbeResult(psi.PROBE_SUSPECT_FORBIDDEN, "HTTP 403")}
+    selection = psi.select_accounts([suspect_acc], routes, probe_results=probe_results)
+    report = psi.render_report(
+        selection, {"OPENROUTER_1_API_KEY": "создан"}, "не проверялась", True, "дата",
+        no_probe=False, probe_results=probe_results, existing_secrets=set(),
+        repo="owner/repo",
+    )
+    lines_by_secret = {}
+    for line in report.splitlines():
+        if not line.startswith("| ") or "|---|" in line:
+            continue
+        first_cell = line.split("|")[1].strip()
+        if first_cell == "секрет":
+            continue
+        lines_by_secret[first_cell] = line
+    assert "Газ при устойчивом 403" in lines_by_secret["OPENROUTER_1_API_KEY"]
+
+
 def test_render_report_shows_export_date_and_rank_source(monkeypatch, export_path, dsh_ci_path):
     data = psi.load_export(str(export_path))
     routes = psi.parse_suite_routes(dsh_ci_path)
@@ -790,7 +885,7 @@ def test_render_report_shows_export_date_and_rank_source(monkeypatch, export_pat
     selection = psi.select_accounts(accounts, routes)
     report = psi.render_report(
         selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)",
-        no_probe=True, probe_results={}, existing_secrets=set(),
+        no_probe=True, probe_results={}, existing_secrets=set(), repo="owner/repo",
     )
     assert "2026-08-25" in report
     assert "ПРЕДОХРАНИТЕЛЯ" in report
@@ -827,6 +922,9 @@ def test_render_report_distinguishes_empty_slot_with_existing_secret(dsh_ci_path
     report = psi.render_report(
         selection, {}, "не проверялась", False, "дата", no_probe=True,
         probe_results={}, existing_secrets={"OPENROUTER_1_API_KEY"},
+        # Minor 6 гейта PR #781: repo — не литерал-плейсхолдер, реальный
+        # owner/repo — команда газа обязана копипаститься без правки.
+        repo="acme-corp/edge-harness",
     )
     lines_by_secret = {}
     for line in report.splitlines():
@@ -838,6 +936,8 @@ def test_render_report_distinguishes_empty_slot_with_existing_secret(dsh_ci_path
         lines_by_secret[first_cell] = line
     assert "НЕ будет удалён" in lines_by_secret["OPENROUTER_1_API_KEY"]
     assert "gh secret delete" in lines_by_secret["OPENROUTER_1_API_KEY"]
+    assert "--repo acme-corp/edge-harness" in lines_by_secret["OPENROUTER_1_API_KEY"]
+    assert "<owner/repo>" not in lines_by_secret["OPENROUTER_1_API_KEY"]
     # Слот без существующего секрета — формулировка другая, без газа удаления.
     assert "нет кандидата" in lines_by_secret["OPENROUTER_2_API_KEY"]
     assert "НЕ будет удалён" not in lines_by_secret["OPENROUTER_2_API_KEY"]
@@ -852,7 +952,7 @@ def test_render_report_names_probe_mode_as_fact_not_guess():
     )
     report_no_probe = psi.render_report(
         routes_fixture_selection, {}, "не проверялась", False, "дата",
-        no_probe=True, probe_results={}, existing_secrets=set(),
+        no_probe=True, probe_results={}, existing_secrets=set(), repo="owner/repo",
     )
     assert "--no-probe" in report_no_probe
 
@@ -863,12 +963,44 @@ def test_render_report_names_probe_mode_as_fact_not_guess():
     }
     report_with_probe = psi.render_report(
         routes_fixture_selection, {}, "не проверялась", False, "дата",
-        no_probe=False, probe_results=probe_results, existing_secrets=set(),
+        no_probe=False, probe_results=probe_results, existing_secrets=set(), repo="owner/repo",
     )
     assert "3 кандидат" in report_with_probe
     assert "жива 1" in report_with_probe
     assert "квота 1" in report_with_probe
     assert "ключ неверен 1" in report_with_probe
+
+
+# ── Блокирующая 2 гейта PR #781: разбивка пробы — одно место правды ──────
+
+
+def test_render_report_probe_breakdown_covers_every_outcome_and_sums_to_total():
+    """Раньше `order` в render_report был ВТОРОЙ копией множества исходов
+    (первая — _PROBE_BUCKET_LABELS), и исход, присутствующий в
+    _PROBE_BUCKET_LABELS, но выпавший из литерала `order`, молча пропадал из
+    разбивки, хотя тотал (len(probe_results)) его всё равно считал. Мутация:
+    выкинь любую строку из `order` (верни литеральную копию списка) — этот
+    тест покраснеет, потому что каждая метка из _PROBE_BUCKET_LABELS обязана
+    появиться в отчёте ровно один раз, и сумма чисел разбивки обязана
+    сойтись с тоталом."""
+    routes_fixture_selection = psi.SelectionResult(
+        assignments=[], overflow=[], out_of_scope=[], probe_excluded=[], rank_by_id={},
+    )
+    outcomes = list(psi._PROBE_BUCKET_LABELS)
+    probe_results = {
+        f"acct-{i}": psi.ProbeResult(outcome, "detail")
+        for i, outcome in enumerate(outcomes)
+    }
+    report = psi.render_report(
+        routes_fixture_selection, {}, "не проверялась", False, "дата",
+        no_probe=False, probe_results=probe_results, existing_secrets=set(), repo="owner/repo",
+    )
+    assert f"{len(outcomes)} кандидат" in report
+    total_in_breakdown = 0
+    for label in psi._PROBE_BUCKET_LABELS.values():
+        assert f"{label} 1" in report, f"метка {label!r} пропала из разбивки пробы"
+        total_in_breakdown += 1
+    assert total_in_breakdown == len(probe_results)
 
 
 # ── argv без значений (доказано мутацией на уровне вызова gh) ────────────
