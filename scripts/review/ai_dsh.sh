@@ -82,6 +82,13 @@ AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS:-300}
 # каждую попытку внутри dsh_run_with_provider_chain.
 dsh_require_provider_chain "ai-review" || exit 1
 
+# `pnpm add` внутри профиля headless требует явного подтверждения root
+# (иначе ERR_PNPM_ADDING_TO_ROOT — тот же класс #83, что уже закрыт для
+# hands/dsh_task.sh и worker/task.sh, PR #94; здесь пропущен, когда #838
+# добавил dsh_mount_anthropic_pool в этот файл — issue #842, живой прогон
+# PR #837 2026-09-09T20:10:15Z).
+export npm_config_ignore_workspace_root_check=true
+
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"; : >"$AI_WORK/failure_reason.txt"
 
 dsh_install "$AI_WORK/pkgs"

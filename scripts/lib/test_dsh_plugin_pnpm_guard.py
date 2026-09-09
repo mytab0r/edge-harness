@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Гвардия класса #83/#842: `dsh plugin add` без `pnpm` на PATH падает
-("dsh: pnpm not found on PATH — install pnpm to manage profile plugins").
+"""Гвардия класса #83/#842: `dsh plugin add` в профиле headless требует ДВУХ
+предпосылок сразу, обе установлены один раз для hands/worker (#83, PR
+#93/#94) и обе были пропущены, когда #838 завёл ТОТ ЖЕ вызов
+(`dsh_mount_anthropic_oauth_pool`) в третьем файле (scripts/review/ai_dsh.sh):
 
-Живой случай (issue #842): #838 добавил вызов `dsh_mount_anthropic_oauth_pool`
-(монтаж anthropic-oauth-pool через `dsh plugin add`) в ТРИ скрипта —
-scripts/review/ai_dsh.sh, scripts/worker/task.sh, scripts/hands/dsh_task.sh —
-но шаг `pnpm/action-setup@v6` был добавлен только в workflow'ы двух из них
-(worker.yml, hands.yml); ai-review.yml остался без pnpm и падал на КАЖДОМ
-прогоне с 2026-09-09T18:32Z. Класс уже закрывался один раз (#83, PR #93/#94,
-hands.yml) — фикс не был распространён на новый вызов в третьем файле.
+1. `pnpm` на PATH workflow'а (`pnpm/action-setup@v6`) — без него
+   `dsh: pnpm not found on PATH`.
+2. `npm_config_ignore_workspace_root_check=true` в окружении скрипта — без
+   него `ERR_PNPM_ADDING_TO_ROOT` / `dsh: pnpm failed in profile directory`.
 
-Правило этой гвардии: КАЖДЫЙ workflow, чей `run:` шаг вызывает скрипт,
-упоминающий `dsh_mount_anthropic_oauth_pool` (или монтаж combo-suite,
+Живой случай (issue #842): ai-review.yml падал на КАЖДОМ прогоне с
+2026-09-09T18:32Z сначала на (1) — PR #843 закрыл её; фикс (1) продвинул
+прогон дальше и вскрыл (2) (живой прогон PR #837, workflow_dispatch
+34399331120, 2026-09-09T20:10:15Z) — тот же класс, вторая недостающая
+половина, закрыта здесь же.
+
+Правило этой гвардии: КАЖДЫЙ скрипт из SCRIPT_TO_WORKFLOW, упоминающий
+`dsh_mount_anthropic_oauth_pool` (или монтаж combo-suite,
 `dsh_ensure_plugins_suite`/`dsh plugin add` — тот же класс), обязан нести
-`pnpm/action-setup` где-то в файле. Не заменяет живой прогон (реального
-`dsh: pnpm not found` этот тест не воспроизводит — нужна сеть/DSH), но ловит
-регресс СТРУКТУРНО — до следующего живого прогона, который стоил бы гейта
-целиком.
+И `npm_config_ignore_workspace_root_check=true` сам, И вызываться из
+workflow, несущего `pnpm/action-setup`. Не заменяет живой прогон (сетевые
+коды ошибок pnpm этот тест не воспроизводит), но ловит регресс СТРУКТУРНО —
+до следующего живого прогона, который стоил бы гейта целиком.
 
 Запуск: python -m pytest scripts/lib/test_dsh_plugin_pnpm_guard.py -q
 """
@@ -83,6 +88,20 @@ def test_every_workflow_invoking_plugin_mount_script_has_pnpm_setup():
             missing.append(f"{wf.name} вызывает {script_rel} (монтирует плагин через "
                             "dsh plugin add), но не несёт шаг pnpm/action-setup — "
                             "класс #83/#842 повторится живым 'pnpm not found on PATH'")
+    assert not missing, "\n".join(missing)
+
+
+def test_every_plugin_mount_script_ignores_pnpm_workspace_root_check():
+    missing = []
+    for script in SCRIPT_TO_WORKFLOW:
+        if not _script_calls_plugin_mount(script):
+            continue
+        script_rel = str(script.relative_to(REPO_ROOT)).replace("\\", "/")
+        text = script.read_text(encoding="utf-8")
+        if "npm_config_ignore_workspace_root_check=true" not in text:
+            missing.append(f"{script_rel} монтирует плагин через dsh plugin add, но не "
+                            "экспортирует npm_config_ignore_workspace_root_check=true — "
+                            "класс #83/#842 повторится живым ERR_PNPM_ADDING_TO_ROOT")
     assert not missing, "\n".join(missing)
 
 
