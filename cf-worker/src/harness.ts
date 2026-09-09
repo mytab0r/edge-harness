@@ -63,6 +63,13 @@ const SCHEMA = [
   // разное назначение (watchdog по dispatch_ts, ретеншн по created_ts),
   // разный набор колонок — не задвоение.
   `CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_ts)`,
+  // #575 (инвентаризация всех SQL в #route на предмет полного скана): GET
+  // /api/tasks (#recentTasks) сортирует ORDER BY created_ts DESC LIMIT без
+  // WHERE — без индекса, ведущего created_ts, SQLite обязан прочитать и
+  // отсортировать ВСЮ историю tasks (до 30 суток, RETENTION.tasksMaxAgeMs),
+  // чтобы отдать последние 100 строк. Индекс сводит это к чтению LIMIT строк
+  // с конца индекса, без сортировки в памяти.
+  `CREATE INDEX IF NOT EXISTS tasks_by_created ON tasks(created_ts DESC)`,
   `CREATE TABLE IF NOT EXISTS heartbeat (
      id     INTEGER PRIMARY KEY CHECK (id = 1),
      ts     INTEGER NOT NULL,
@@ -121,6 +128,26 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS messages_by_status ON messages(status)`,
   `CREATE INDEX IF NOT EXISTS messages_by_kind ON messages(kind)`,
   `CREATE INDEX IF NOT EXISTS messages_by_group ON messages(grouped_with)`,
+  // Ретеншн (#575, по образцу tasks_status_created у #320/#305): пачечное
+  // удаление терминальных (done/failed/ignored) сообщений старше порога
+  // фильтрует по (status, processed_ts) — без индекса это была бы полная
+  // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
+  `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
+  // Готовность хранилища (#575, вторая половина «зелёный health при мёртвой
+  // морде»): одна строка (id=1) — исход ПОСЛЕДНЕГО живого SQL-раундтрипа,
+  // сделанного пульсом (см. #checkStorageReady/#tickStorageReadyAlert), и
+  // дедуп-флаг `alerted` для алертов перехода. Персистентно тем же приёмом,
+  // что pulse/retention_state выше (#269/#306): DO выгружается из памяти
+  // между тиками alarm чаще, чем сами тики случаются — счётчик «была ли уже
+  // эта авария замечена» обязан пережить пересоздание инстанса, иначе
+  // Telegram-алерт бил бы на каждый тик заново.
+  `CREATE TABLE IF NOT EXISTS storage_probe (
+     id      INTEGER PRIMARY KEY CHECK (id = 1),
+     ts      INTEGER NOT NULL,
+     ok      INTEGER NOT NULL,
+     detail  TEXT,
+     alerted INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 /**
@@ -144,6 +171,18 @@ const RETENTION_TABLES = [
     name: "tasks",
     maxAgeMs: RETENTION.tasksMaxAgeMs,
     sql: "DELETE FROM tasks WHERE id IN (SELECT id FROM tasks WHERE status IN ('done', 'failed') AND created_ts < ? LIMIT ?)",
+  },
+  // #575: messages росла вечно (единственная таблица без ретеншена, полный
+  // скан #status() дорожал с каждым днём). Терминальные статусы ТОЛЬКО:
+  // 'new'/'processing' (непрочитанное/необработанное сообщение владельца,
+  // #20/#173) не попадают под это условие ни при каком возрасте — фильтр по
+  // status здесь и есть носитель этого ограничения, не комментарий рядом.
+  // processed_ts — возраст решения (когда обработка закончилась), не ts
+  // (когда сообщение пришло): messagesMaxAgeMs см. RETENTION в config.ts.
+  {
+    name: "messages",
+    maxAgeMs: RETENTION.messagesMaxAgeMs,
+    sql: "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE status IN ('done', 'failed', 'ignored') AND processed_ts < ? LIMIT ?)",
   },
 ] as const;
 
@@ -528,6 +567,28 @@ export function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * Решение об алерте готовности хранилища (#575) — чистая функция, проверяется
+ * тестом отдельно от SQL (тот же приём, что pulseHealthy/retentionBacklog).
+ *
+ * Единственный вход решения — rowsWritten УСЛОВНОГО UPDATE дедуп-флага
+ * (#recordStorageProbe), а не прочитанное прошлое состояние: при исчерпании
+ * квоты rows_read (#320) падают все SELECT, включая чтение storage_probe, —
+ * дедуп на чтении спамил бы ⚠️ каждый тик ровно в том классе, ради которого
+ * алерт заведён (находка ревью PR #587). rowsWritten = 1 — флаг перевернулся,
+ * это первый тик перехода (авария при ok=false, восстановление при ok=true);
+ * 0 — переход уже замечен; null — сама запись флага не удалась (исчерпание
+ * rows_written, класс глубже): «шлём/не шлём» решать не по чему, алерт
+ * пропускается — первый удавшийся тик догонит (см. #recordStorageProbe).
+ */
+export function storageReadyAlertDecision(
+  ok: boolean,
+  dedupRowsWritten: number | null,
+): "incident" | "recovery" | null {
+  if (dedupRowsWritten === null || dedupRowsWritten <= 0) return null;
+  return ok ? "recovery" : "incident";
+}
+
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
@@ -564,6 +625,12 @@ export class Harness extends DurableObject<Env> {
   // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
   #taskCountsCache: Record<TaskRow["status"], number> | null = null;
 
+  // Тот же рецепт для messages (#575: инцидент #321 закрыл tasks, messages
+  // осталась с полным GROUP BY на каждый #status()). Ключ — реальный статус
+  // ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
+  // как у tasks — форма ответа /api/status.messages не менялась этим фиксом.
+  #msgCountsCache: Record<string, number> | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
@@ -576,23 +643,28 @@ export class Harness extends DurableObject<Env> {
    * alarm() сначала перезакладывает следующий тик, потом дёргает workflow_dispatch:
    * падение dispatch не может убить цепочку. Alarm переживает гибернацию
    * и стоит 1 request — комфортный режим Free (docs/research/20).
+   *
+   * Вызывается из двух мест (issue #693, Cron Trigger): конструктор не может
+   * ждать промис (`void this.#ensureHeartbeat()` — фон, ошибка ловится и
+   * логируется здесь же); scheduledTick() ждёт (`await`) — детерминированно,
+   * тик cron видит результат ДО следующего шага, а не гоняется за фоновым
+   * промисом конструктора. Одно место правды вместо двух копий проверки
+   * getAlarm()/setAlarm.
    */
-  #ensureHeartbeat(): void {
-    this.ctx.storage
-      .getAlarm()
-      .then((scheduled) => {
-        if (scheduled === null) {
-          return this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
-        }
-      })
-      .catch((error) => {
-        // #320: единственная пересборка цепочки после гибели пульса (см. alarm()) —
-        // молчание здесь тот же класс «немое падение пульса», который PR закрывает
-        // в alarm(). Здесь падать некуда (конструктор не может ждать промис), но
-        // хотя бы громко в лог, тем же классификатором, что и alarm().
-        const detail = error instanceof Error ? error.message : String(error);
-        console.error(`ensureHeartbeat: упал (${classifyStorageError(detail)}): ${detail}`);
-      });
+  async #ensureHeartbeat(): Promise<void> {
+    try {
+      const scheduled = await this.ctx.storage.getAlarm();
+      if (scheduled === null) {
+        await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT.selfOrchestrationFirstMs);
+      }
+    } catch (error) {
+      // #320: единственная пересборка цепочки после гибели пульса (см. alarm()) —
+      // молчание здесь тот же класс «немое падение пульса», который PR закрывает
+      // в alarm(). Из конструктора падать некуда (он не может ждать промис), но
+      // хотя бы громко в лог, тем же классификатором, что и alarm().
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`ensureHeartbeat: упал (${classifyStorageError(detail)}): ${detail}`);
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -701,6 +773,9 @@ export class Harness extends DurableObject<Env> {
     }
     if (route.name === "messagesProcess") {
       return this.#processMessages(request);
+    }
+    if (route.name === "ready") {
+      return this.#getReady();
     }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
@@ -873,6 +948,23 @@ export class Harness extends DurableObject<Env> {
     return this.#taskCountsCache;
   }
 
+  /** #msgCountsCache лениво (#575, тот же рецепт, что #taskCounts выше, #320):
+   *  GROUP BY по ВСЕЙ таблице messages — единственное место, где он вообще
+   *  выполняется, и то не чаще, чем реально меняется состав сообщений
+   *  (приём/захват в обработку/финал/ватчдог), а не каждый вызов #status().
+   *  До этой правки счётчик читался тут же инлайном на каждый вызов —
+   *  ровно тот класс, что #321 уже закрыл для tasks. */
+  #msgCounts(): Record<string, number> {
+    if (this.#msgCountsCache === null) {
+      const counts: Record<string, number> = {};
+      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
+        counts[String(row.status)] = Number(row.n);
+      }
+      this.#msgCountsCache = counts;
+    }
+    return this.#msgCountsCache;
+  }
+
   #status(): Status {
     const now = Date.now();
     const hb = this.#rows(this.#sql.exec("SELECT ts, job_id FROM heartbeat WHERE id = 1"))[0];
@@ -885,10 +977,7 @@ export class Harness extends DurableObject<Env> {
         now - LIMITS.staleDispatchMs,
       ),
     )[0];
-    const msgCounts: Record<string, number> = {};
-    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
-      msgCounts[String(row.status)] = Number(row.n);
-    }
+    const msgCounts = this.#msgCounts();
     const hbTs = hb ? Number(hb.ts) : null;
     const lastPulse = this.#getPulse();
     return {
@@ -1020,21 +1109,39 @@ export class Harness extends DurableObject<Env> {
 
     // Побочные эффекты — только для действительно новых событий: повторная доставка
     // батча не должна ни двоить журнал, ни перезапускать переходы статуса задачи.
-    for (const row of accepted) this.#applySideEffects(row);
+    // broadcastStatus() — ТОЛЬКО если батч реально сдвинул состояние задачи
+    // (#applySideEffects вернул true): #status() перестал быть бесплатным
+    // счётчиком-заглушкой (#575/#320), но каждый SQL внутри него всё ещё
+    // стоит рядов чтения, и обычный поток прогресс-событий job'а (без
+    // job_start/job_end) идёт через #postEvents гораздо чаще, чем реально
+    // меняется что-либо видимое на бейдже статуса. Событие само уже уходит
+    // подписчикам через #broadcastEvent ниже (WS «event»), фронт считает свой
+    // last_event_id из него — полный статус на пустой батч не нужен.
+    let stateChanged = false;
+    for (const row of accepted) {
+      if (this.#applySideEffects(row)) stateChanged = true;
+    }
     for (const row of accepted) this.#broadcastEvent(row);
-    if (accepted.length) this.#broadcastStatus();
+    if (stateChanged) this.#broadcastStatus();
 
     return this.#json({ accepted: accepted.length, duplicates, task_id: taskId });
   }
 
-  /** Переходы задач и сброс heartbeat живут здесь и нигде больше. */
-  #applySideEffects(row: EventRow): void {
+  /** Переходы задач и сброс heartbeat живут здесь и нигде больше.
+   *  Возвращает true, если состояние задачи (или heartbeat) реально
+   *  изменилось — вызывающий (#postEvents) решает по этому флагу, нужен ли
+   *  broadcastStatus() (#575). */
+  #applySideEffects(row: EventRow): boolean {
+    let changed = false;
     if (row.kind === "job_start") {
       const cursor = this.#sql.exec(
         "UPDATE tasks SET status = 'running' WHERE id = ? AND status NOT IN ('done', 'failed')",
         row.task_id,
       );
-      if (cursor.rowsWritten > 0) this.#taskCountsCache = null;
+      if (cursor.rowsWritten > 0) {
+        this.#taskCountsCache = null;
+        changed = true;
+      }
     }
     if (row.kind === "job_end") {
       const failed = (row.data as { result?: string } | null)?.result === "fail";
@@ -1042,7 +1149,9 @@ export class Harness extends DurableObject<Env> {
       this.#taskCountsCache = null;
       // Руки закончили — «руки живы» уходит сразу, а не через порог свежести.
       this.#sql.exec("DELETE FROM heartbeat WHERE id = 1");
+      changed = true;
     }
+    return changed;
   }
 
   // ── Журнал: replay ────────────────────────────────────────────────────────────────
@@ -1113,6 +1222,103 @@ export class Harness extends DurableObject<Env> {
 
   override webSocketClose(): void {}
 
+  /**
+   * Один dispatch-тик оркестратора (issue #269, вынесено в общий метод #693):
+   * читает предыдущий пульс, дёргает workflow_dispatch, сверяет подтверждение
+   * ПРЕДЫДУЩЕГО принятого dispatch'а и пишет исход в pulse. Общий код для
+   * alarm() (основной путь, тикает каждые HEARTBEAT.selfOrchestrationMs) и
+   * scheduledTick() (страховка Cron Trigger — см. её docstring) — одно место
+   * правды вместо второй копии attemptOrchestraDispatch/
+   * fetchLatestOrchestraRunId/confirmPreviousRun/pulseDetailForRecord/
+   * #recordPulse. token/repo здесь уже гарантированно заданы (обе вызывающие
+   * стороны фильтруют «секретов нет» до вызова, каждая на свой лад).
+   */
+  async #dispatchOrchestraTick(token: string, repo: string): Promise<void> {
+    const previous = this.#getStoredPulse();
+    // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
+    // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
+    // baseline для следующего тика — и одновременно сверяем, появился ли новый
+    // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
+    // всегда на такт позже, а не блокирует этот тик).
+    const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
+    const runConfirmed =
+      previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
+    const result = await attemptOrchestraDispatch(token, repo, fetch);
+    // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
+    // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
+    const detail = pulseDetailForRecord(result, runConfirmed);
+    this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
+    if (!result.ok || runConfirmed === false) {
+      // Пульс не роняет объект: тик уже перезаложен (alarm()) либо вообще не
+      // ведёт будильник (scheduledTick()). Исход ещё и в durable-состоянии
+      // (#status().last_pulse) — раньше он тонул в console.log, который никто
+      // не смотрит между дедами (fail loud, issue #269).
+      console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
+    }
+  }
+
+  /**
+   * Cron Trigger (issue #693, cf-worker/src/index.ts::scheduled(), интервал —
+   * wrangler.jsonc `triggers.crons`, 5 мин). Внешние часы: не зависит ни от
+   * живости alarm() этого же DO, ни от GitHub `schedule` (~5-7% доставки на
+   * этом репозитории, docs/research/21-github-actions.md), потому что тикает
+   * из инфраструктуры Cloudflare, а не из активности самого объекта.
+   *
+   * СТРАХОВКА, НЕ ВТОРОЙ ОСНОВНОЙ ТИК: alarm() остаётся главным путём — тикает
+   * каждые HEARTBEAT.selfOrchestrationMs (15 мин) и делает всё (ретеншн,
+   * инбокс, dispatch, self-update dsh-edge). Этот метод в подавляющем
+   * большинстве вызовов не пишет НИ ОДНОЙ строки — читает только текущий
+   * pulse и решает через ТУ ЖЕ чистую функцию pulseStale(), что и бейдж
+   * /api/status: «alarm тикал недавно и успешно» → выходит немедленно, не
+   * дублируя workflow_dispatch в ту же минуту (issue #693, требование «не
+   * дублируй тики»). Единственный случай, когда этот метод реально дёргает
+   * dispatch, — ровно тот, что описан в issue #693: `alarm()` дважды не смог
+   * `setAlarm` и вернулся БЕЗ будильника (см. конец alarm() ниже).
+   * pulseStale() читает это как «последний тик был успешен, но случился давно»
+   * (>= 2×selfOrchestrationMs = 30 мин) — единственная ветка, которую эта
+   * страховка чинит; настоящий отказ dispatch'а (dispatch_ok=false) —
+   * по-прежнему забота обычного alarm() на его собственном тике, не этой
+   * страховки (pulseStale() нарочно возвращает false в этой ветке).
+   *
+   * Любой RPC-вызов стаба (в т.ч. этот) конструирует DO заново, если объект
+   * был выгружен из памяти (идле-порог ~10 с, интервал крона 5 мин — заведомо
+   * больше) — конструктор уже вызвал #ensureHeartbeat() к этому моменту.
+   * Повторный `await this.#ensureHeartbeat()` здесь — не дублирование
+   * дважды подряд одного и того же эффекта, а детерминированная гарантия и
+   * для тёплого объекта (не был выгружен, конструктор не перезапускался):
+   * единственный путь и тогда тоже перезаложить пропавший будильник, а не
+   * полагаться на побочный эффект конструктора (проверяется тестом «(a)»).
+   *
+   * Честная граница наблюдаемости отказа (issue #693, п.4): если
+   * fetchLatestOrchestraRunId/attemptOrchestraDispatch внутри
+   * #dispatchOrchestraTick упали — исход попадает в pulse тем же
+   * #recordPulse, что и у alarm(), и виден в /api/status. Если НЕВОЗМОЖНА уже
+   * сама запись пульса (например исчерпание суточной квоты rows_written,
+   * #320) — catch ниже логирует причину в Cloudflare Logs (`wrangler
+   * tail`/дашборд), но `/api/status` эту попытку не увидит вовсе: last_pulse
+   * останется на прежнем (устаревшем) значении. Это тот же честный потолок
+   * наблюдаемости, что уже есть у alarm() (см. его комментарий про #320 в
+   * catch ниже), не новый — просто названный вслух для cron-пути отдельно.
+   */
+  async scheduledTick(): Promise<void> {
+    await this.#ensureHeartbeat();
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) return; // «возможности нет» — alarm() уже сообщает это в пульсе на своём тике
+    try {
+      const previous = this.#getStoredPulse();
+      if (!pulseStale(Date.now(), previous)) return; // alarm жив — не дублируем dispatch
+      await this.#dispatchOrchestraTick(token, repo);
+      console.log("scheduledTick: alarm подвис (pulseStale) — dispatch выполнен страховкой Cron Trigger");
+    } catch (error) {
+      // См. докстринг выше, «Честная граница наблюдаемости отказа»: если
+      // сам #recordPulse тоже упал, /api/status этой попытки не увидит —
+      // единственный след здесь, в Cloudflare Logs.
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`scheduledTick: упал (${classifyStorageError(detail)}): ${detail}`);
+    }
+  }
+
   /** Пульс: следующим тиком гарантируем цепочку, потом дёргаем оркестратора
    *  и проверяем, не отстала ли морда dsh-edge от npm. */
 
@@ -1151,6 +1357,13 @@ export class Harness extends DurableObject<Env> {
     // каждой таблицы: авария здесь не должна убить dispatch/self-update ниже.
     this.#pruneRetention(Date.now());
 
+    // Готовность хранилища (#575) — тоже сразу после успешного setAlarm, тем
+    // же доводом, что и ретеншн выше: единственный непрерывный монитор прода
+    // в этом DO не должен зависеть ни от GH_DISPATCH_TOKEN/GH_REPO, ни от
+    // TELEGRAM_BOT_TOKEN — при их отсутствии тик обязан продолжать замечать
+    // недоступность хранилища, а не молча пропускать эту гарантию.
+    this.#tickStorageReadyAlert();
+
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
     // GH_DISPATCH_TOKEN, ни от GH_REPO (п.33 спеки) — при пустом токене пульс
@@ -1177,26 +1390,7 @@ export class Harness extends DurableObject<Env> {
         this.#recordPulse(false, HEARTBEAT.notConfiguredDetail, null, null);
         return;
       }
-      const previous = this.#getStoredPulse();
-      // Подтверждение запуска (issue #269, находка ревью): 204 доказывает только
-      // приём, не запуск. Читаем id последнего run'а ДО нового dispatch'а — это
-      // baseline для следующего тика — и одновременно сверяем, появился ли новый
-      // run с baseline'а ПРЕДЫДУЩЕГО тика (без синхронного ожидания: подтверждение
-      // всегда на такт позже, а не блокирует этот alarm).
-      const latestRunId = await fetchLatestOrchestraRunId(token, repo, fetch);
-      const runConfirmed =
-        previous?.dispatch_ok ? confirmPreviousRun(previous.last_run_id, latestRunId) : null;
-      const result = await attemptOrchestraDispatch(token, repo, fetch);
-      // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
-      // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
-      const detail = pulseDetailForRecord(result, runConfirmed);
-      this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
-      if (!result.ok || runConfirmed === false) {
-        // Пульс не роняет объект: тик уже перезаложен. Теперь исход ещё и в
-        // durable-состоянии (#status().last_pulse) — раньше он тонул в console.log,
-        // который никто не смотрит между дедами (fail loud, issue #269).
-        console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
-      }
+      await this.#dispatchOrchestraTick(token, repo);
     } catch (error) {
       // #320: похожая на исчерпание квоты storage (rows_read/rows_written) ошибка
       // здесь раньше уходила из alarm() непойманным — единственным следом оставалось
@@ -1258,6 +1452,9 @@ export class Harness extends DurableObject<Env> {
         // а чистка нет. Без сброса /api/status завышает done/failed до
         // следующей записи задачи (на тёплом инстансе — надолго).
         if (table.name === "tasks" && cursor.rowsWritten > 0) this.#taskCountsCache = null;
+        // #575: тот же принцип для messages — чистка терминальных сообщений
+        // меняет msgCounts.done/failed/ignored так же, как finish/reclaim.
+        if (table.name === "messages" && cursor.rowsWritten > 0) this.#msgCountsCache = null;
       } catch (error) {
         full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
         pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»
@@ -1390,6 +1587,130 @@ export class Harness extends DurableObject<Env> {
       },
     );
     if (!res.ok) throw new Error(`dispatch отклонён: ${res.status}`);
+  }
+
+  // ── Готовность хранилища (#575) ─────────────────────────────────────────────────────
+  //
+  // Диагноз #575: владелец видел голый HTTP 500 на журнале/плагинах, а
+  // /api/health морды (config.ts DSH_EDGE_UPDATE.healthUrl) отдавал только
+  // строку версии и хранилище вообще не трогал — оставался зелёным при
+  // мёртвой морде. #status() замером готовности не годится не потому, что
+  // «не делает живых запросов» (делает: heartbeat, MAX(id) по events,
+  // счётчик stale, чтение pulse — и при отказе хранилища краснеет через
+  // общий catch в #fetch()), а потому, что это ПАЧКА SQL на каждый вызов
+  // (одна — MAX(id) по events, растущему с историей) и тяжёлый ответ
+  // состояния. Зонд готовности обязан быть одним дешёвым запросом со
+  // стабильным контрактом {ok:true} — это /api/ready (находка AI-ревью
+  // PR #587: прежняя формулировка «кэширован, живых запросов не делает»
+  // была неверной против #status()).
+
+  /** Живой SQL-раундтрип: доказывает, что DO SQLite ПРЯМО СЕЙЧАС принимает
+   *  операции — то самое, что отказывает при исчерпании суточной квоты
+   *  rows_read/rows_written (classifyStorageError). `heartbeat` — всегда
+   *  существующая таблица (SCHEMA), запрос ограничен LIMIT 1 — не скан. */
+  #checkStorageReady(): { ok: boolean; detail: string | null } {
+    try {
+      this.#sql.exec("SELECT 1 FROM heartbeat LIMIT 1");
+      return { ok: true, detail: null };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`storage readiness: упал (${classifyStorageError(detail)}): ${detail}`);
+      return { ok: false, detail };
+    }
+  }
+
+  /** Маршрут GET /api/ready: тот же код ошибки хранилища (storageErrorResponse),
+   *  что и у остального API — единое место правды классификации, не вторая копия. */
+  #getReady(): Response {
+    const result = this.#checkStorageReady();
+    if (!result.ok) return storageErrorResponse(result.detail ?? "unknown");
+    return this.#json({ ok: true });
+  }
+
+  /**
+   * Запись исхода тика + дедуп-флаг — БЕЗ ЕДИНОГО ЧТЕНИЯ прошлого состояния
+   * (находка ревью PR #587 к #575): SELECT по storage_probe падает ровно в
+   * том классе, ради которого алерт сделан — при исчерпании квоты rows_read
+   * отказывает «практически любой SELECT» (docs/research/20-cloudflare-free.md,
+   * #320), чтение прошлого исхода давало previous = null, и ⚠️-алерт уходил
+   * на КАЖДЫЙ тик до полуночного сброса — тот спам, который дедуп должен
+   * предотвращать. Поэтому решение о переходе несёт ИТОГ ЗАПИСИ: rowsWritten
+   * условного UPDATE (`WHERE alerted = 0` при аварии / `WHERE alerted = 1`
+   * при восстановлении) равен 1 только на ПЕРВОМ тике перехода, 0 — когда
+   * авария уже замечена (или не было). Возвращает rowsWritten этого UPDATE;
+   * «исход последнего тика» (ts/ok/detail) при этом свежий всегда.
+   *
+   * Честная оговорка: метринг rows_read у UPDATE Cloudflare не документирует
+   * (research/20 — не подтверждено). Если условный UPDATE тоже падает на
+   * исчерпании квоты, вызывающий (#tickStorageReadyAlert) получает исключение
+   * и пропускает алерт этого тика с громким логом — спамить нельзя, а догонит
+   * первый удавшийся тик: флаг останется 0, и тот тик увидит rowsWritten = 1.
+   */
+  #recordStorageProbe(ok: boolean, detail: string | null): number {
+    const now = Date.now();
+    // Строка обязана существовать ДО условного UPDATE: у него нет ветки INSERT,
+    // и на первом тике (пустая таблица) он иначе никогда не дал бы rowsWritten = 1.
+    this.#sql.exec(
+      `INSERT INTO storage_probe (id, ts, ok, detail, alerted) VALUES (1, ?, ?, ?, 0)
+       ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, ok = excluded.ok, detail = excluded.detail`,
+      now,
+      ok ? 1 : 0,
+      detail,
+    );
+    // Не трогает ts/ok/detail — их ведёт INSERT выше; меняет ТОЛЬКО дедуп-флаг,
+    // чтобы rowsWritten означал ровно «состояние флага перевернулось».
+    const cursor = ok
+      ? this.#sql.exec("UPDATE storage_probe SET alerted = 0 WHERE id = 1 AND alerted = 1")
+      : this.#sql.exec("UPDATE storage_probe SET alerted = 1 WHERE id = 1 AND alerted = 0");
+    return cursor.rowsWritten;
+  }
+
+  /**
+   * Пульс — единственный работающий 24/7 монитор готовности хранилища в этом
+   * DO (#575): деплойная канарейка (deploy-worker.yml, «Канарейка UI на
+   * проде») смотрит на живость только В МОМЕНТ деплоя, а исчерпание суточной
+   * квоты бьёт в середине дня без единого деплоя; failure-watch
+   * (scripts/orchestra/pulse_guard.py::failure_watch) смотрит на упавшие
+   * прогоны CI, а не на живой прод — квота может быть исчерпана без единого
+   * красного workflow. Алерт (best-effort, тем же #telegramApi, что решения
+   * владельца #470/#471 — новый канал не заводится) шлётся только на
+   * ПЕРЕХОД unhealthy↔healthy, не каждый тик: иначе спам раз в 15 минут,
+   * пока квота не сбросится в 00:00 UTC.
+   *
+   * Дедуп перехода — по итогу ЗАПИСИ дедуп-флага (storageReadyAlertDecision),
+   * не по чтению прошлого исхода: при исчерпании rows_read (#320) падают
+   * все SELECT, включая чтение storage_probe — дедуп на чтении спамил бы
+   * каждый тик в том же предложении, которым обещает этого не делать
+   * (находка ревью PR #587). Если запись флага сама упала (класс deeper:
+   * исчерпание rows_written) — алерт этого тика пропускается с громким
+   * логом: без записанного флага «шлём/не шлём» решать не по чему, и молча
+   * пропустить один тик честнее, чем спамить; первый удавшийся тик догонит.
+   */
+  #tickStorageReadyAlert(): void {
+    const result = this.#checkStorageReady();
+    let dedupRowsWritten: number | null = null;
+    try {
+      dedupRowsWritten = this.#recordStorageProbe(result.ok, result.detail);
+    } catch (error) {
+      console.error(
+        `storage readiness: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    const decision = storageReadyAlertDecision(result.ok, dedupRowsWritten);
+    if (decision === "incident") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
+      });
+    } else if (decision === "recovery") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ Хранилище журнала снова отвечает",
+      });
+    }
   }
 
   // ── Очередь задач ─────────────────────────────────────────────────────────────────
@@ -1686,7 +2007,14 @@ export class Harness extends DurableObject<Env> {
       "UPDATE messages SET status = ?, result = ?, processed_ts = ? WHERE id = ? AND status = 'processing' AND processing_ts = ?",
       status, JSON.stringify(result), Date.now(), messageId, claimedTs,
     );
-    return Number(cursor.rowsWritten) > 0;
+    // processing → терминальный статус — единственная точка финала (все вызовы
+    // #processSingleMessage/#reclaimStuckMessages идут через неё), поэтому
+    // единственная точка сброса msgCounts на терминальный переход (#575).
+    if (Number(cursor.rowsWritten) > 0) {
+      this.#msgCountsCache = null;
+      return true;
+    }
+    return false;
   }
 
   /** Обработка одного сообщения. Захват атомарный: ровно один обработчик уводит
@@ -1704,6 +2032,8 @@ export class Harness extends DurableObject<Env> {
       kind, priority, claimedTs, messageId,
     );
     if (claimed.rowsWritten === 0) return { action: "skipped" };
+    // new → processing — msgCounts сдвигается тем же переходом (#575).
+    this.#msgCountsCache = null;
     this.#groupMessages(messageId);
 
     // directive и doc_edit — оба получают issue-след: «у каждой директивы есть
@@ -1738,6 +2068,8 @@ export class Harness extends DurableObject<Env> {
         messageId, claimedTs,
       );
       if (Number(released.rowsWritten) === 0) return { action: "skipped" };
+      // processing → new (повторяемая ошибка) — тот же переход, что и захват выше (#575).
+      this.#msgCountsCache = null;
       return { action: "issue_retry", error: outcome.error, attempts };
     }
 
@@ -1779,24 +2111,32 @@ export class Harness extends DurableObject<Env> {
         this.#finishMessage(Number(row.id), "failed", { error: "stuck_reclaimed", attempts: Number(row.attempts) }, Number(row.processing_ts));
         continue;
       }
-      reclaimed += Number(
-        this.#sql.exec(
-          "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
-          Number(row.id),
-        ).rowsWritten,
-      );
+      const released = this.#sql.exec(
+        "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing'",
+        Number(row.id),
+      ).rowsWritten;
+      // processing → new (ватчдог) — тот же переход, что ручной release выше (#575).
+      if (released > 0) this.#msgCountsCache = null;
+      reclaimed += Number(released);
     }
     return reclaimed;
   }
 
   /** Разбор очереди новых сообщений. retry_failed — ручной газ: failed снова в
    *  new с обнулёнными попытками (после устранения причины, например установки
-   *  GH_ISSUES_TOKEN). */
+   *  GH_ISSUES_TOKEN). processed_ts тоже чистится здесь (находка ревью PR #586):
+   *  без этого строка возвращалась в 'new' со старым processed_ts, и инвариант
+   *  «processed_ts ≠ NULL ⇒ терминальный статус» (на нём держится фильтр по
+   *  status в ретеншене, 14.10) переставал быть структурным — держался бы
+   *  только фильтром, без обнуления здесь. */
   async #processInbox(limit: number, retryFailed: boolean): Promise<MessageProcessResult[]> {
     if (retryFailed) {
-      this.#sql.exec(
-        "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL WHERE status = 'failed'",
+      const cursor = this.#sql.exec(
+        "UPDATE messages SET status = 'new', attempts = 0, processing_ts = NULL, processed_ts = NULL WHERE status = 'failed'",
       );
+      // failed → new (bulk retry) — та же msgCounts-инвалидация, что у
+      // одиночных переходов выше (#575).
+      if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
     }
     const rows = this.#rows(
       this.#sql.exec(
@@ -1948,7 +2288,13 @@ export class Harness extends DurableObject<Env> {
       });
     }
 
-    this.#broadcastStatus();
+    // broadcastStatus() — только на реально НОВОЕ нажатие (stored.fresh):
+    // Telegram ретраит callback-апдейты так же, как обычные сообщения, и
+    // #postMessageIngest уже не шлёт статус на повтор (см. stored.fresh выше
+    // в ingest) — эта ветка была единственной, что делала это безусловно на
+    // каждое нажатие, включая дубли и чужие чаты (#575: избыточный вызов
+    // #status() там, где ничего не изменилось).
+    if (stored.fresh) this.#broadcastStatus();
     return this.#json({
       message_id: stored.id,
       status: parsed ? (stored.fresh ? "callback_processed" : "callback_duplicate") : "callback_ignored",
@@ -2049,6 +2395,13 @@ export class Harness extends DurableObject<Env> {
        ON CONFLICT(source, source_msg_id) DO NOTHING`,
       Date.now(), f.source, f.sourceMsgId, f.chatId, f.senderId, f.senderName, f.text,
     );
+    // Новая строка меняет msgCounts['new'] (#575, тот же принцип, что у
+    // #taskCountsCache при insert в tasks). Безусловно, НЕ по cursor.rowsWritten:
+    // докстринг выше уже объявляет этот сигнал ненадёжным в workerd после
+    // ON CONFLICT DO NOTHING, а пречтение (`existing` выше) уже гарантирует,
+    // что сюда доходит только настоящая новая строка — условие на негодном
+    // сигнале защищало бы случай, которого здесь нет.
+    this.#msgCountsCache = null;
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];

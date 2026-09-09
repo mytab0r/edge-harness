@@ -45,6 +45,14 @@ CSV живёт на ветке DATA_BRANCH и попадает в main фина�
 GITHUB_REPOSITORY; для record — PROBE_ID, SENT_AT_MS, GITHUB_RUN_ID.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import base64
 import csv
@@ -183,10 +191,18 @@ def is_us_business(moment: datetime) -> bool:
     return moment.weekday() < 5 and 13 <= moment.hour < 24
 
 
+def now_utc() -> datetime:
+    """Настенные часы кампании — единственное место правды. Тест подменяет через
+    monkeypatch.setattr(dt, "now_utc", ...), а не полагается на реальное время:
+    иначе поведение теста меняется с датой запуска (окно кампании MAX_CAMPAIGN_DAYS
+    истекает по календарю)."""
+    return datetime.now(timezone.utc)
+
+
 def coverage(rows: list[dict], now: datetime | None = None,
              max_days: int = MAX_CAMPAIGN_DAYS) -> dict:
     """Критерий задачи #4 по накопленным строкам. Чистая функция."""
-    now = now or datetime.now(timezone.utc)
+    now = now or now_utc()
     ok = [r for r in rows if r.get("status") == "ok"]
     starts = [sent_at_datetime(int(r["sent_at"])) for r in ok]
     span_h = 0.0
@@ -410,7 +426,7 @@ class Github:
 
 
 def git(*args: str, cwd: str, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:3])}: {proc.stderr.strip()[:300]}")
     return proc
@@ -673,7 +689,7 @@ def cmd_finalize(_args: argparse.Namespace) -> int:
     for pull in pulls:
         if pull.get("draft") and outcome["ready"]:
             ready = subprocess.run(["gh", "pr", "ready", str(pull["number"])],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, encoding="utf-8")
             if ready.returncode != 0:
                 print(f"::warning::gh pr ready упал: {ready.stderr.strip()[:200]} — "
                       "переведи PR в готовность руками")

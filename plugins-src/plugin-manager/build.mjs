@@ -74,6 +74,13 @@ for (const id of [...manifest.plugins.map((p) => p.id), ...catalog.plugins.map((
 // ── 3. Тело бандла и его гвардии ──────────────────────────────────────────────
 const body = await readFile(join(pluginDir, 'src', 'body.js'), 'utf8')
 
+// Общий разбор тела ответа fetch (#575, вторая половина) — ОДНО место правды,
+// инлайнится в бандл тем же приёмом, что MANIFEST/CATALOG ниже (независимый
+// npm-тарбол без общего рантайм-модуля с integrations, require() сюда не
+// достаёт). Источник — plugins-src/shared/describe-response-error.js.
+const sharedResponseError = await readFile(
+  join(repoRoot, 'plugins-src', 'shared', 'describe-response-error.js'), 'utf8')
+
 // Seed-карта шелла (staticModules при boot) — снята с продового бандла
 // dsh-edge 0.7.1 (assets/index-*.js). require чего-то ещё без декларации в
 // dsh.client.inject = throw при материализации в браузере: ловим на сборке,
@@ -100,7 +107,7 @@ failUnless(unseeded.length === 0,
 // неполон; достаточно, потому что присваивание свободной переменной обёртки
 // затирало бы её только внутри фабрики и ловится синтаксической проверкой
 // бандла при использовании.
-for (const reserved of ['module', 'exports', 'require', 'MANIFEST', 'CATALOG', 'ORDER_MARKER_SOURCE']) {
+for (const reserved of ['module', 'exports', 'require', 'MANIFEST', 'CATALOG', 'ORDER_MARKER_SOURCE', 'describeResponseError']) {
   failUnless(!new RegExp(`(?:var|let|const|function|class)\\s+${reserved}\\b`).test(body),
     `src/body.js: тело объявляет "${reserved}" — это свободная переменная обёртки, коллизия`)
 }
@@ -117,6 +124,8 @@ const bundle = [
   `const CATALOG = ${JSON.stringify(catalog.plugins, null, 2)};`,
   ``,
   `const ORDER_MARKER_SOURCE = ${JSON.stringify(orderMarkerPattern)};`,
+  ``,
+  sharedResponseError,
   ``,
   body,
   ``,

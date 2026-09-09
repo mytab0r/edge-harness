@@ -33,6 +33,13 @@
    Прогоны PR-событий не разбираются — красный обязательный чек на PR ведёт
    автодетектор простоя (stall_detector, #201, check:red:<имя>); исключение
    закрывает класс «один дефект — две задачи» (находка ревью PR #488).
+   Суточный потолок (FAILURE_WATCH_DAILY_CAP, свой счётчик — не общий со
+   STALL_DAILY_CAP детектора простоя, см. константу): без него дедуп по
+   отпечатку — единственный тормоз, и НЕСКОЛЬКО разных дефектов одновременно
+   (нестабильный провайдер/раннер) плодили бы задачи без ограничения сверху.
+   Исчерпание не красит прогон и не теряет отсечённый класс молча — тихий
+   след-комментарий на класс плюс видимая эскалация #120+Telegram раз в сутки
+   на переход (не на каждый пульс).
 
 Единственный канал решения — отчёт + задача #120 + Telegram; «метки-статуса на
 workflow» у GitHub нет, а commit-статусы живут на sha и умирают на squash-мерже.
@@ -108,6 +115,47 @@ PROBE_MARKER = "[статус конвейера: проба"
 HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
 HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
 
+# ── Сторож живости: независимый DO-пульс оркестратора (issue #689) ──────────────
+# heartbeat_check выше видит «пульс жив», если сработал ЛЮБОЙ легитимный канал
+# orchestra.yml (schedule ИЛИ workflow_dispatch) — и слеп к случаю, когда ОДИН
+# канал маскирует смерть ДРУГОГО. Тот же класс силент-неправды уже случался
+# дважды на разных парах каналов: 2026-09-05 (см. docstring real_orchestra_ticks
+# выше) — `contract`-прогоны pull_request маскировали смерть job'а `orchestra`
+# целиком; 2026-09-07 (issue #689, замер по `triggering_actor.login` живым
+# запросом `gh api .../orchestra.yml/runs`) — ВНУТРИ одного и того же канала
+# workflow_dispatch два РАЗНЫХ источника дают один и тот же event: событийный
+# будильник (scripts/gh/wake_orchestra.sh, `pr-review.yml`/`ai-review.yml`,
+# GH_TOKEN=github.token → actor=EVENT_ACTOR_LOGIN) и независимый DO-пульс
+# (cf-worker/src/harness.ts::alarm()/attemptOrchestraDispatch, GH_DISPATCH_TOKEN
+# → actor — владелец токена). Замер: 71 диспатч от EVENT_ACTOR_LOGIN и 2 от
+# владельца токена за сутки при ожидаемых ~82 (тик раз в 15 мин,
+# HEARTBEAT.selfOrchestrationMs в cf-worker) — DO-пульс не работал ~20.5 часов
+# из ~24, конвейер держался только на событийном канале, и heartbeat_check
+# молчал: событийный канал исправно тикал. Причина (НЕ чинится этим сторожем,
+# только называется) — cf-worker/src/harness.ts::alarm(): если обе попытки
+# ctx.storage.setAlarm падают, функция выходит без нового будильника, и
+# восстановить цепочку может только внешний трафик к DO (#ensureHeartbeat в
+# конструкторе) — без трафика мертво неограниченно долго.
+#
+# Различитель — тот же признак, что предложило ревью PR #522 (находка №2) для
+# СИММЕТРИЧНОЙ проверки в обратную сторону (там: тикнул ли DO, пока проверяют
+# событийный канал; здесь: тикнул ли НЕ-бот, пока проверяют независимый канал).
+# Хардкодить логин владельца токена (сейчас mytab0r) нельзя — он может
+# смениться без изменения кода; признак устойчивее — «актор НЕ бот-событие».
+EVENT_ACTOR_LOGIN = "github-actions[bot]"
+
+# 4 пропущенных такта (15 мин цикл DO-пульса) — один пропуск штатный (сетевая
+# заминка/ретрай, тот же довод, что у HEARTBEAT_MAX_AGE_MINUTES = 3 такта), но
+# здесь порог взят на такт шире: цена ложной тревоги выше (некому её сверить
+# руками ночью, канал доставки — Telegram владельцу), а различить каналы можно
+# только когда событийный уже подтверждённо жив (см. decide_independent_pulse) —
+# лишний такт запаса не даёт спутать «различитель ещё не применим» с «канал и
+# правда мёртв».
+INDEPENDENT_PULSE_STALE_AFTER_MINUTES = 60
+
+DO_PULSE_MARKER = "[статус: независимый DO-пульс не приходил]"
+DO_PULSE_RESUMED_MARKER = "[статус: независимый DO-пульс снова работает]"
+
 # Success-маркер авто-возобновления (#220): scheduler.after_merge ставит его в
 # #120, когда слит PR задачи ветки, а последний красный прогон worker.yml
 # работал именно над этой задачей (след аренды «worker run <id>»). conveyor_gate
@@ -122,18 +170,44 @@ RESUME_MARKER = "[статус конвейера: возобновлено по
 # предохранителя, одно место правды на весь конвейер.
 
 # review:ok стоит (или ai:failed) дольше этого — оркестратор сам дёргает
-# ai-review.yml. Якорь отсчёта — время ПОСЛЕДНЕГО события "labeled: review:ok"
-# в таймлайне PR: новый пуш переставляет review:ok заново (review_labels.py),
-# так что таймер не тикает на устаревшем ревью.
+# ai-review.yml. Якорь отсчёта — время публикации commit status
+# `harness/review` на ТЕКУЩЕМ head PR (review_labels.status_posted_at, #345),
+# не таймлайн-событие "labeled" (находка ревью #424): с #203 перестановка
+# вердикт-меток идемпотентна, "labeled: review:ok" не выбрасывается вовсе,
+# если новый пуш подтвердил тот же вердикт — якорь на событии заморозился
+# бы навсегда на первой простановке. Commit status публикуется каждым
+# прогоном безусловно, поэтому таймер не тикает на устаревшем ревью так же
+# надёжно, как раньше.
 AI_REVIEW_RETRY_AFTER_MINUTES = 30
 
 # Верхняя граница авто-повторов ai-review на один PR: без неё сбойный провайдер
 # (или контрактная ошибка модели) жёг бы квоту в цикле каждые 15 минут.
 # Счётчик — по числу маркеров AI_REVIEW_RETRY_MARKER в комментариях PR (носитель
-# переживает перезапуск оркестратора, см. scheduler.ai_review_retry_count).
+# переживает перезапуск оркестратора, см. scheduler.ai_review_retry_count) —
+# С #431 считается только за ТЕКУЩУЮ эпоху review:ok (с момента последней
+# простановки метки, тот же якорь, что и age), не за всю историю PR: живой
+# случай #249 (2026-09-06) — маркеры двух РАЗНЫХ эпох (review:ok в 17:03 и
+# 20:02) суммировались в один общий счётчик, после чего PR не получил ни
+# одного автоповтора ни за один из четырёх последующих эпизодов ai:failed,
+# хотя дифф с тех пор менялся многократно — бюджет одной эпохи не должен
+# запирать все последующие.
 AI_REVIEW_MAX_ATTEMPTS = 3
 
 AI_REVIEW_RETRY_MARKER = "[ai-review: авто-повтор]"
+
+# Тормоз без газа (#431, AGENTS.md): исчерпание AI_REVIEW_MAX_ATTEMPTS раньше
+# вело только к строке в логе прогона планировщика, которую никто не читает —
+# PR стоял молча, пока кто-то не пушнет вручную. Эскалация — тот же канал
+# (issue #120 + Telegram), что у предохранителя конвейера/#269, идемпотентно
+# на PR+эпоху (номер PR — часть маркера, по образцу READY_STALL_MARKER).
+AI_REVIEW_EXHAUSTED_MARKER = "[ai-review: автоповторы исчерпаны]"
+
+# quota_exhausted (RATE_LIMIT: Weekly/Monthly Limit Exhausted, ai_dsh.sh/#419)
+# — отдельный класс: ждать внутри CI бессмысленно (сброс квоты — дни,
+# docs/runbooks/switch-llm-provider.md), поэтому автоповтор НЕ тратится
+# вовсе — сразу эскалация с первого же обнаружения в эпохе, без ожидания
+# AI_REVIEW_MAX_ATTEMPTS попыток впустую.
+AI_REVIEW_QUOTA_MARKER = "[ai-review: квота провайдера]"
 
 # Красный обязательный чек или ai:changes-requested дольше этого — задача
 # возвращается в пул (см. scheduler.unhealthy_pulls). Отсчёт — updated_at PR:
@@ -172,6 +246,23 @@ CONFLICT_REWORK_MARKER = "[conflict: авто-ребейз]"
 # бы навсегда все PR, кроме первого просигналившего.
 CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
 
+# Устойчивый признак «дошли до git-шага» (issue #588): CONFLICT_REWORK_MARKER
+# выше ставится СРАЗУ на dispatch (защита от гонки, см. докстринг
+# scheduler.dispatch_conflict_rework) — это момент диспатча, не факт настоящей
+# попытки. Все 3 живых провала на замере (#567/#542/#408) упали ДО
+# git rebase (сеть/недоступность морды, отсутствующий скрипт
+# scripts/gh/infra_digest.sh) — ни разу механизм не дошёл до самого ребейза, а
+# единственный бюджет CONFLICT_REWORK_MAX_ATTEMPTS сгорал на инфраструктуре.
+# Текст ошибки — ненадёжный признак (протухнет при первой смене формулировки
+# сообщения), поэтому воркер сам отмечает этот факт явным комментарием в
+# задачу (scripts/worker/task.sh, непосредственно перед тем, как отдать
+# промпт DSH — только начиная с этого момента агент может выполнить
+# git rebase origin/main, см. шаг 3 промпта). Слабое место, названное прямо:
+# сам git rebase происходит ВНУТРИ хода DSH, не отдельным шагом task.sh —
+# эта отметка доказывает «агент получил промпт и мог начать», а не
+# «git rebase гарантированно запущен».
+WORKER_GIT_STEP_MARKER = "[worker: git-шаг]"
+
 # ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
 # worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
 # сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
@@ -180,6 +271,14 @@ CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
 WATCHED_WORKFLOWS = (
     "worker.yml", "hands.yml", "orchestra.yml",
     "deploy-worker.yml", "deploy-dsh-edge.yml",
+    # conflict-mechanical-rebase.yml — дешёвый механический ребейз конфликтных
+    # PR (issue #762, отдельный файл, не job внутри orchestra.yml — см.
+    # докстринг самого workflow-файла: heartbeat_check не должен видеть его
+    # провалы). Их всё равно обязан кто-то заметить — тот же приём, что и для
+    # остальных пяти: failure_watch заводит ci-failure задачу по РЕАЛЬНОМУ
+    # дефекту (не по обычным per-PR infra-error строкам в его же отчёте — те
+    # уже видны в step summary, это catastrophic-случай уровня всего job'а).
+    "conflict-mechanical-rebase.yml",
 )
 
 # Метка авто-заведённых задач по дефектам CI — рядом с обязательной `task`
@@ -276,11 +375,60 @@ FAILURE_WATCH_MAX_JOBS_PER_RUN = 3
 # workflow.
 FAILURE_WATCH_PER_PAGE = 100
 
+# ── Суточный потолок автозаведения (issue разбора петель, доклад #477) ───────
+# failure_watch заводил задачи ci-failure БЕЗ какого-либо суточного потолка —
+# единственный тормоз был дедуп по отпечатку КЛАССА причины (failure_fingerprint,
+# open_ci_failure_fingerprints). Нестабильный провайдер/раннер, породивший НЕСКОЛЬКО
+# РАЗНЫХ дефектов за короткое время (реалистичный сценарий, не гипотеза — тот же
+# класс, что уже дал пять дублей #578/#580/#589/#592/#598 на одну причину), плодил
+# бы задачи в пул без предохранителя: каждый новый класс — новая задача, без потолка.
+#
+# Свой счётчик, НЕ общий с stall_detector.STALL_DAILY_CAP — решение, не оплошность:
+#   1. Разные каналы дедупа с разными метками (see модульный докстринг, п.3): у
+#      stall_detector — `auto-detected` + slug-отпечаток из строк отчёта пульса,
+#      у failure_watch — `ci-failure` + sha256-отпечаток (workflow, job, строка
+#      лога). Общий счётчик означал бы читать ОБА набора issues на каждое решение
+#      «дать ли квоту» — второй сетевой обход там, где сейчас один (см.
+#      ci_failure_created_since ниже — уже платит отдельным обходом Issues).
+#   2. Разные предметные области: stall_detector видит симптом ЧЕРЕЗ отчёт пульса
+#      (косвенно — красный чек, просроченная задача, пауза предохранителя),
+#      failure_watch видит ПРЯМОЙ провал конкретного workflow-прогона. Общий
+#      бюджет означал бы, что пять стойких симптомов простоя (например, красные
+#      чеки пяти разных PR) выедают ВЕСЬ бюджет и на следующий реальный дефект
+#      CI (другого класса, другой воркфлоу) квоты уже нет — хотя это два никак
+#      не связанных факта, каждый заслуживает своей видимости.
+#   3. Оба потолка всё равно ограничивают суммарный прирост пула сверху
+#      (STALL_DAILY_CAP + FAILURE_WATCH_DAILY_CAP задач/сутки, конечное число) —
+#      унификация не даёт качественно другой защиты от «пул растёт без
+#      предохранителя», только объединяет две независимые причины в одну шкалу,
+#      где они друг другу мешают. Раздельные счётчики — по образцу
+#      STALL_DAILY_CAP (не изменяется этим файлом, свои тесты в
+#      test_stall_detector.py).
+FAILURE_WATCH_DAILY_CAP = 5
+
+# Маркер эскалации исчерпания потолка (#120 + Telegram) — сигнал «нужен
+# человек», НЕ отказ пульса: этот же пульс наблюдает orchestra.yml, и если бы
+# эскалация красила прогон, failure_watch завёл бы задачу «CI: orchestra.yml
+# падает» НА СВОЮ ЖЕ эскалацию (замкнутый цикл, тот же инвариант, что уже
+# требует докстринг stall_detector.CAP_EXHAUSTED_MARKER). Дата в маркере —
+# дедуп «один раз в календарные сутки на переход», не на каждый пульс, пока
+# потолок остаётся исчерпанным.
+FAILURE_WATCH_CAP_MARKER = "[failure-watch: потолок исчерпан"
+
+# Отсечённый потолком класс не должен теряться молча (иначе потолок хуже его
+# отсутствия — прячет поток, ничего не оставляя взамен): каждый НОВЫЙ
+# отпечаток, отсечённый в этот день, получает свой тихий след-комментарий в
+# WATCHDOG_ISSUE (без Telegram — это не вторая тревога, а дополняющая улика к
+# уже прозвучавшей). Дедуп — по (день, отпечаток): один и тот же класс,
+# отсекаемый повторно КАЖДЫЙ пульс, пока не решится человеком, не плодит
+# комментарий каждые 15 минут; новый класс в тот же день — новый комментарий.
+FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пропущен"
+
 
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -741,6 +889,27 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\
 # чтение от маркера, у plain-строк его надо снять).
 LOG_TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
 
+# Заголовок автоматической секции teardown Actions (находка #610): каждый
+# job, успешный и упавший, заканчивается «Post <шаг>» блоками; чистка
+# checkout'ом credentials config/ssh command/http extra header печатается
+# группой с этим заголовком ПОСЛЕ фактической причины падения. Строка
+# внутри неё («Removing credentials config '<UUID>.config'») содержит
+# буквы и цифры и проходит все существующие фильтры LAST_ERROR_LOG_NON_FACTS
+# как «факт» — живой замер: runs 34061661136/34063041667/34063766663/
+# 34064823509 подхватывали её веткой 2 вместо настоящей причины
+# («HTTP Error 500: Internal Server Error» от архивации сессии раннера,
+# #119/#575), напечатанной раньше. UUID частично переживает нормализацию
+# digits/hex в failure_fingerprint (сегменты короче 6 символов, например
+# «bd3f»/«4668», не совпадают с `\b[0-9a-f]{6,}\b`) — КАЖДЫЙ прогон получал
+# свой уникальный «факт» и свой fingerprint на одну и ту же причину, а
+# заголовок заведённой issue (константный по workflow+job_name, см.
+# failure_watch) при этом совпадал — отсюда пять issue с одинаковым
+# заголовком «CI: orchestra.yml падает — orchestra» (#578/#580/#589/#592/#598).
+# Обрезаем лог по ПЕРВОМУ вхождению этого заголовка ДО обеих веток поиска:
+# вся секция после него — гарантированный teardown, не факт ни при каком
+# исходе job'а (не отдельная строка-исключение, а целая секция).
+POST_JOB_CLEANUP_MARKER = "post job cleanup."
+
 
 def last_error_log_line(repo: str, job_id: int) -> str | None:
     """Последняя СОДЕРЖАТЕЛЬНАЯ строка лога упавшего job'а — конкретный факт,
@@ -777,7 +946,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         result = subprocess.run(
             ["gh", "api", "--allow-escape-sequences",
              f"repos/{repo}/actions/jobs/{job_id}/logs"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
             env={**os.environ, "NO_COLOR": "1"},
         )
     except OSError as error:
@@ -786,6 +955,12 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     if result.returncode != 0:
         return None
     lines = result.stdout.splitlines()
+
+    for cut_idx, raw_line in enumerate(lines):
+        cut_text = ANSI_ESCAPE_RE.sub("", LOG_TS_PREFIX_RE.sub("", raw_line)).strip()
+        if cut_text.lower() == POST_JOB_CLEANUP_MARKER:
+            lines = lines[:cut_idx]
+            break
 
     def is_non_fact(candidate: str) -> bool:
         lowered = candidate.lower()
@@ -839,12 +1014,25 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     return comments
 
 
+def _marker_present(marker: str, body: str) -> bool:
+    """Маркер найден в теле комментария как ЦЕЛОЕ число, не префикс чужого
+    (находка ревью #439): маркеры вида «... #16» и «... #163» — оба
+    заканчиваются числом, и голая подстрока `marker in body` считает «#16»
+    найденным внутри «... #163» (163 начинается с 16), потому что справа от
+    совпадения ничего не проверялось. Запрещаем цифре идти сразу за концом
+    маркера — если сам маркер кончается цифрой, а справа в теле стоит ещё
+    одна цифра, это другой номер, не совпадение. Маркеры, не кончающиеся
+    цифрой, ведут себя как раньше (граница всегда выполнена)."""
+    pattern = re.escape(marker) + (r"(?!\d)" if marker and marker[-1].isdigit() else "")
+    return re.search(pattern, body) is not None
+
+
 def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
     payload = all_issue_comments(repo, issue_number)
     return [
         parse_time(comment["created_at"])
         for comment in payload
-        if marker in (comment.get("body") or "")
+        if _marker_present(marker, comment.get("body") or "")
     ]
 
 
@@ -856,7 +1044,7 @@ def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) ->
     result = []
     for comment in payload:
         body = comment.get("body") or ""
-        if any(marker in body for marker in markers):
+        if any(_marker_present(marker, body) for marker in markers):
             result.append((parse_time(comment["created_at"]), body))
     return result
 
@@ -897,7 +1085,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     if reply_markup is not None:
         args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
     except OSError as error:
         print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
         return False
@@ -1066,6 +1254,112 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
             f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
 
 
+def decide_independent_pulse(
+    dispatch_runs: list[dict], now: datetime,
+    stale_after_minutes: float = INDEPENDENT_PULSE_STALE_AFTER_MINUTES,
+) -> tuple[str, datetime | None, bool]:
+    """Чистое решение #689. dispatch_runs — прогоны orchestra.yml с
+    event=workflow_dispatch (прод-форма, поле triggering_actor.login читается
+    как есть от Actions API). Возвращает (состояние, anchor, exact):
+
+    'not_applicable' — событийный канал (EVENT_ACTOR_LOGIN) сам не подтверждён
+    живым в пределах stale_after_minutes — честная граница: если оркестратор
+    вообще не диспатчился недавно, отличить «независимый канал умер» от
+    «PR-активности просто нет» по этим данным нельзя, тревогу не заводим.
+
+    'ok'/'stale' — применимо (событийный канал жив): среди dispatch_runs есть
+    хотя бы один прогон НЕ от EVENT_ACTOR_LOGIN не старше порога — 'ok'. anchor
+    в этом случае — момент последнего независимого тика, exact=True (возраст
+    точный). Если независимых прогонов в выборке нет вовсе — 'stale', anchor —
+    самый старый прогон ВЫБОРКИ (нижняя граница возраста: провал не моложе
+    этого момента, но неизвестно насколько старше), exact=False — вызывающий
+    обязан назвать эту границу приблизительной, а не гадать точным числом."""
+    event_runs = [r for r in dispatch_runs
+                  if (r.get("triggering_actor") or {}).get("login") == EVENT_ACTOR_LOGIN]
+    if not event_runs:
+        return "not_applicable", None, True
+    newest_event_age = min(minutes_between(parse_time(r["created_at"]), now) for r in event_runs)
+    if newest_event_age > stale_after_minutes:
+        return "not_applicable", None, True
+    independent_runs = [r for r in dispatch_runs
+                        if (r.get("triggering_actor") or {}).get("login") != EVENT_ACTOR_LOGIN]
+    if not independent_runs:
+        oldest = min(parse_time(r["created_at"]) for r in dispatch_runs)
+        return "stale", oldest, False
+    newest_independent_at = max(parse_time(r["created_at"]) for r in independent_runs)
+    age = minutes_between(newest_independent_at, now)
+    return ("ok" if age <= stale_after_minutes else "stale"), newest_independent_at, True
+
+
+def independent_pulse_alert_text(age_minutes: float, exact: bool) -> str:
+    hours = age_minutes / 60
+    clause = (f"независимый пульс не приходил {hours:.1f} ч" if exact else
+              f"независимый пульс не приходил как минимум {hours:.1f} ч "
+              "(в изученной выборке дисптачей нет ни одного независимого тика)")
+    return (
+        f"🚨 edge-harness: {DO_PULSE_MARKER}\n"
+        f"{clause} — конвейер держится только на событийном канале "
+        "(scripts/gh/wake_orchestra.sh) и встанет, как только прекратится "
+        "активность PR: нет ревью → некому продиспатчить orchestra.yml. "
+        "Вероятная причина — cf-worker/src/harness.ts::alarm(): обе попытки "
+        "ctx.storage.setAlarm упали, и цепочка пульса встала до "
+        "пересоздания DO (issue #689); проверь rows_written квоту DO и "
+        "/api/status морды."
+    )
+
+
+def independent_pulse_check(repo: str, now: datetime) -> list[str]:
+    """Сторож живости #689 — ОБРАТНЫЙ по направлению класс к событийному
+    сторожу (#510/#519, если он уже слит в этом дереве): тот проверяет, что
+    событийный будильник (wake_orchestra.sh) сработал, этот — что независимый
+    DO-пульс (cf-worker alarm()) сработал, пока событийный маскирует его
+    смерть тем же трюком, каким schedule маскировал смерть job'а `orchestra`
+    2026-09-05 (см. docstring real_orchestra_ticks).
+
+    Применимость проверяется первой, дёшево (один recent_runs, per_page=100 —
+    тот же порядок цены, что уже платит heartbeat_check за оба легитимных
+    события): холостая очередь (событийный канал сам не подтверждён свежим)
+    не пишет ничего и не заводит эпизода — не мониторинг падений, граница
+    та же, что у failure_watch/event_wake_check."""
+    dispatch_runs = recent_runs(repo, ORCHESTRA_WORKFLOW, per_page=100, event="workflow_dispatch")
+    state, anchor, exact = decide_independent_pulse(dispatch_runs, now)
+    if state == "not_applicable":
+        return []
+    age = minutes_between(anchor, now)
+
+    if state == "ok":
+        # Эпизод закрывается явно, как только независимый тик снова нашёлся —
+        # тот же приём, что у HEARTBEAT_NO_TICKS/HEARTBEAT_TICKS_RESUMED выше.
+        try:
+            open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_MARKER)
+            if open_times:
+                close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_RESUMED_MARKER)
+                if not close_times or max(open_times) > max(close_times):
+                    post_issue_comment(
+                        repo, WATCHDOG_ISSUE,
+                        f"✅ edge-harness: {DO_PULSE_RESUMED_MARKER}\n"
+                        "Прогон orchestra.yml с event=workflow_dispatch не от "
+                        f"{EVENT_ACTOR_LOGIN} снова найден — эпизод «независимый "
+                        "DO-пульс не приходил» закрыт.",
+                    )
+        except RuntimeError as error:
+            print(f"::warning::закрытие эпизода DO-пульса в #{WATCHDOG_ISSUE} не оставлено: {error}",
+                  file=sys.stderr)
+        return [f"💗 независимый DO-пульс оркестратора в норме "
+                f"(последний тик {int(age)} мин назад)"]
+
+    try:
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_MARKER)
+        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DO_PULSE_RESUMED_MARKER)
+    except RuntimeError as error:
+        return [f"⚠️ не смог сверить маркеры независимого DO-пульса #{WATCHDOG_ISSUE}: {error}"]
+    if not episode_reopened(open_times, close_times):
+        return [f"🚨 независимый DO-пульс не приходил ({int(age)} мин назад, эпизод уже оповещён)"]
+    text = independent_pulse_alert_text(age, exact)
+    result = escalate(repo, WATCHDOG_ISSUE, text)
+    return [f"🚨 независимый DO-пульс не приходил {age / 60:.1f} ч ({result})"]
+
+
 def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]:
     """Предохранитель: перед dispatch воркера. Возвращает (наблюдения,
     действия, разрешён_ли_диспетч) — разведено по #456: «диспатч разрешён» и
@@ -1187,9 +1481,14 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
             False)
 
 
-def open_ci_failure_fingerprints(repo: str) -> set[str]:
-    """Отпечатки, уже заведённые задачами с меткой FAILURE_WATCH_LABEL —
-    дедуп «дефект этого класса уже в пуле» без второго обхода Issues.
+FAILURE_FINGERPRINT_MARKER = "<!-- failure-fingerprint: "
+
+
+def open_ci_failure_issues(repo: str) -> list[dict]:
+    """Открытые issues с меткой FAILURE_WATCH_LABEL — сырой список, единый
+    источник и для точного дедупа по fingerprint (ci_failure_fingerprints),
+    и для дедупа по похожести заголовка (#610, см. failure_watch): один обход
+    Issues на оба вопроса, не два отдельных запроса подряд.
 
     Листает страницы сама (класс #308, тот же приём, что all_issue_comments
     выше): список НЕ ограничен по природе — долгоживущие незакрытые дефекты
@@ -1197,8 +1496,7 @@ def open_ci_failure_fingerprints(repo: str) -> set[str]:
     страница молча потеряла бы хвост — та же ошибка дедупа, что и без него,
     просто отложенная во времени."""
     page = 1
-    found: set[str] = set()
-    marker = "<!-- failure-fingerprint: "
+    issues: list[dict] = []
     while True:
         chunk = gh(
             f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}"
@@ -1206,23 +1504,97 @@ def open_ci_failure_fingerprints(repo: str) -> set[str]:
         ) or []
         if not isinstance(chunk, list) or not chunk:
             break
-        for issue in chunk:
-            body = issue.get("body") or ""
-            idx = body.find(marker)
-            if idx == -1:
-                continue
-            rest = body[idx + len(marker):]
-            found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
+        issues.extend(chunk)
         if len(chunk) < 100:
             break
         page += 1
+    return issues
+
+
+def ci_failure_fingerprints(issues: list[dict]) -> set[str]:
+    """Отпечатки, уже заведённые задачами из open_ci_failure_issues — дедуп
+    «дефект этого КЛАССА уже в пуле» (точное совпадение нормализованного
+    факта). Чистая функция над уже прочитанным списком — второй обход Issues
+    здесь не заводится (см. open_ci_failure_issues)."""
+    found: set[str] = set()
+    for issue in issues:
+        body = issue.get("body") or ""
+        idx = body.find(FAILURE_FINGERPRINT_MARKER)
+        if idx == -1:
+            continue
+        rest = body[idx + len(FAILURE_FINGERPRINT_MARKER):]
+        found.add(rest.split(" ", 1)[0].split("-->", 1)[0].strip())
     return found
+
+
+def ci_failure_created_since(repo: str, since: datetime) -> int:
+    """Сколько задач FAILURE_WATCH_LABEL заведено не раньше `since` — суточный
+    потолок считается по факту СОЗДАНИЯ, не по текущей открытости (закрытая
+    сегодня задача всё равно сожгла квоту дня) — тот же приём, что
+    stall_detector.auto_tasks_created_since (см. FAILURE_WATCH_DAILY_CAP: свой
+    счётчик, своя метка, не общий с auto-detected).
+
+    `state=all`, не `state=open` (в отличие от open_ci_failure_fingerprints
+    выше — тому дедупу закрытые не нужны, счётчику потолка — нужны). Листает
+    страницы сама (класс #308): сырая первая страница молча занижала бы
+    потолок после сотни ci-failure задач за всё время."""
+    page = 1
+    count = 0
+    while True:
+        chunk = gh(
+            f"repos/{repo}/issues?state=all&labels={FAILURE_WATCH_LABEL}"
+            f"&per_page=100&page={page}"
+        ) or []
+        if not isinstance(chunk, list) or not chunk:
+            break
+        count += sum(
+            1 for issue in chunk
+            if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
+        )
+        if len(chunk) < 100:
+            break
+        page += 1
+    return count
+
+
+def failure_watch_cap_exhausted(created_today: int, cap: int = FAILURE_WATCH_DAILY_CAP) -> bool:
+    """True — суточный потолок автозаведения ci-failure задач исчерпан, новый
+    класс задачей не заводится (см. FAILURE_WATCH_DAILY_CAP)."""
+    return created_today >= cap
+
+
+def failure_watch_cap_alert_text(cap_marker: str, created_today: int, skipped_today: list[str]) -> str:
+    """Текст видимого сигнала об исчерпании потолка (#120 + Telegram, один раз
+    на переход — см. FAILURE_WATCH_CAP_MARKER). `cap_marker` уже несёт дату
+    (issue_marker_times дедуплицирует по ТОЧНО этому маркеру). Перечисляет
+    отсечённые классы ЭТОГО пульса — не значит, что дальнейшие в этот же день
+    классы теряются: каждый новый класс получает свой тихий след-комментарий
+    (FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX, дедуп по (день, отпечаток)),
+    смотреть там."""
+    listed = "\n".join(f"- `{fp}`" for fp in skipped_today) or "- (список появится по мере отсечения новых классов)"
+    return (
+        f"🚨 edge-harness: {cap_marker}\n"
+        f"Суточный потолок автозаведения {FAILURE_WATCH_LABEL} задач "
+        f"({created_today}/{FAILURE_WATCH_DAILY_CAP}) исчерпан — "
+        "новые дефекты CI НЕ заводят задачу, нужен человек.\n\n"
+        f"Отсечённые классы этого пульса:\n{listed}\n\n"
+        "Это НЕ отказ пульса: failure_watch жив и продолжает наблюдать — прогон "
+        "нарочно НЕ покрашен красным (инвариант «наблюдатель провалов не "
+        "реагирует на свою инфраструктуру мониторинга»). Дальнейшие отсечённые "
+        f"классы этого дня — тихим следом в #{WATCHDOG_ISSUE} "
+        f"(маркер «{FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX}»), без повторной тревоги.\n\n"
+        "Что дальше: посмотреть открытые задачи с меткой "
+        f"{FAILURE_WATCH_LABEL} и след в #{WATCHDOG_ISSUE}, решить руками по "
+        "каждому отсечённому классу — приоритизировать, завести задачу вручную "
+        "(scripts/gh/issue-create) или поднять FAILURE_WATCH_DAILY_CAP, если "
+        "объём временный."
+    )
 
 
 def failure_watch_task_body(workflow: str, job_name: str, fact: str, run_url: str, fingerprint: str, steps: str) -> str:
     """Тело авто-заведённой задачи — тот же формат, что шаблон «📋 Задача в
     пул» (Цель/Критерий/Площадь), плюс отпечаток класса HTML-комментарием:
-    open_ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
+    ci_failure_fingerprints ищет именно эту строку, не парсит прозу.
     Упавшие шаги — рядом с фактом (критерий #477 называет «шаг + последняя
     ##[error]-строка»): их имена уже прочитаны из job'а, второй запрос не
     нужен (чеклист ревью PR #488)."""
@@ -1264,7 +1636,12 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                    это не тревога, требующая действия человека;
     'defect'     — наш дефект: задача в пул (label task + FAILURE_WATCH_LABEL)
                    с конкретным фактом, если такого класса ещё нет среди
-                   открытых issues с меткой FAILURE_WATCH_LABEL.
+                   открытых issues с меткой FAILURE_WATCH_LABEL и если суточный
+                   потолок FAILURE_WATCH_DAILY_CAP не исчерпан (см. константу и
+                   ci_failure_created_since) — исчерпание НЕ красит прогон и не
+                   теряет отсечённый класс молча: тихий след-комментарий на
+                   класс (дедуп по (день, отпечаток)) плюс видимая эскалация
+                   #120+Telegram раз в сутки на переход (FAILURE_WATCH_CAP_MARKER).
 
     Прогоны `event=pull_request` не разбираются (находка ревью PR #488,
     раунд 2): красный прогон PR-события — это красный обязательный чек на PR,
@@ -1293,7 +1670,12 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
     причина снова красит свежий прогон, значит снова требует разбора."""
     observations: list[str] = []
     actions: list[str] = []
-    ci_fingerprints: set[str] | None = None  # ленивая инициализация — только если дошли до дефекта
+    # Ленивая инициализация — только если дошли до дефекта: оба читаются из
+    # одного обхода Issues (open_ci_failure_issues), второго запроса нет.
+    ci_issues: list[dict] | None = None
+    ci_fingerprints: set[str] | None = None
+    ci_created_today: int | None = None  # тоже лениво — суточный потолок (FAILURE_WATCH_DAILY_CAP)
+    cap_skipped_this_pulse: list[str] = []  # классы, отсечённые потолком в ЭТОМ пульсе (см. цикл ниже)
 
     for workflow in WATCHED_WORKFLOWS:
         try:
@@ -1413,19 +1795,141 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 continue
 
             # cause == "defect": заводим задачу, если класса ещё нет в пуле.
-            if ci_fingerprints is None:
+            if ci_issues is None:
                 try:
-                    ci_fingerprints = open_ci_failure_fingerprints(repo)
+                    ci_issues = open_ci_failure_issues(repo)
                 except RuntimeError as error:
                     observations.append(
                         f"⚠️ failure-watch {workflow}: список задач {FAILURE_WATCH_LABEL} не прочитан ({error})")
                     continue
+                ci_fingerprints = ci_failure_fingerprints(ci_issues)
             if fingerprint in ci_fingerprints:
                 observations.append(
                     f"🔁 failure-watch {workflow} (job «{job_name}»): дефект класса "
                     f"{fingerprint} уже в пуле — не дублируем")
                 continue
+
             title = f"CI: {workflow} падает — {job_name}"
+            # Дедуп по ТОЧНОМУ заголовку (#610) — ДО потолка и ДО создания,
+            # поверх дедупа по fingerprint выше: заголовок детерминирован
+            # (workflow, job_name) — для одной и той же пары ВСЕГДА один и тот
+            # же байт-в-байт текст, а fingerprint чувствителен к точному
+            # тексту факта (см. last_error_log_line/POST_JOB_CLEANUP_MARKER —
+            # расходящийся факт при одной и той же причине порождал разные
+            # fingerprint при ОДИНАКОВОМ заголовке, живой случай
+            # #578/#580/#589/#592/#598). Нарочно точное совпадение, не
+            # Jaccard-схожесть duplicate_guard (см. scripts/gh/issue-create):
+            # у duplicate_guard заголовки придумывает человек/агент, здесь —
+            # фиксированный шаблон, где РАЗНЫЕ job_name обязаны оставаться
+            # РАЗНЫМИ классами (например «job-0» и «job-1» после токенизации
+            # по словам совпали бы Jaccard'ом в одно — regression test
+            # test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest —
+            # точное сравнение строк этого не путает.
+            # ДО потолка (не после): комментарий на уже существующую issue не
+            # заводит новую задачу и не должен сжигать суточную квоту
+            # FAILURE_WATCH_DAILY_CAP — иначе исчерпанный потолок молча
+            # блокировал бы даже улику к уже открытому дефекту, хотя пул при
+            # этом не растёт вовсе.
+            existing_by_title = next(
+                (issue for issue in ci_issues
+                 if "pull_request" not in issue and issue.get("title") == title),
+                None,
+            )
+            if existing_by_title:
+                number = existing_by_title["number"]
+                # Дедуп комментария по КЛАССУ (тот же приём, что
+                # stall_detector._evidence_marker/issue_marker_times, находка
+                # PR #248): свежий провал остаётся в окне FAILURE_WATCH_WINDOW_MINUTES
+                # несколько пульсов подряд (пульс — раз в 15 мин, окно — 30) — без
+                # этой проверки КАЖДЫЙ пульс писал бы БАЙТ-В-БАЙТ одинаковый
+                # комментарий на #578 (находка ревью PR #612: три пульса одного
+                # прогона на моках дали два дубля). ci_fingerprints выше не
+                # спасает: он парсит только ТЕЛА issues (open_ci_failure_issues/
+                # ci_failure_fingerprints), этот же класс комментарием, а не
+                # телом — маркер нужно искать среди комментариев ИМЕННО этой
+                # issue (issue_marker_times), не среди тел.
+                marker = f"{FAILURE_FINGERPRINT_MARKER}{fingerprint} -->"
+                try:
+                    already_commented = bool(issue_marker_times(repo, number, marker))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow} (job «{job_name}»): комментарии "
+                        f"#{number} не прочитаны ({error})")
+                    continue
+                if already_commented:
+                    observations.append(
+                        f"🔁 failure-watch {workflow} (job «{job_name}»): issue с тем же заголовком "
+                        f"и классом {fingerprint} уже прокомментирована (#{number}) — молчу")
+                    continue
+                # Текст не утверждает «новый прогон» (находка ревью PR #612: до
+                # дедупа выше это было буквально ложью на повторном пульсе того
+                # же прогона) — только факт, что у issue уже есть отпечаток
+                # ДРУГОГО класса причины под тем же заголовком.
+                comment = (
+                    f"{marker}\n"
+                    f"У issue с тем же заголовком уже записан другой отпечаток факта — "
+                    f"новый класс {fingerprint}, комментарий вместо второй issue (#610):\n\n"
+                    f"Факт: {fact}\n{run_url}"
+                )
+                try:
+                    post_issue_comment(repo, number, comment)
+                    posted = True
+                except RuntimeError as error:
+                    posted = False
+                    print(f"::warning::след в #{number} не оставлен: {error}", file=sys.stderr)
+                ci_fingerprints.add(fingerprint)
+                observations.append(
+                    f"🔁 failure-watch {workflow} (job «{job_name}»): issue с тем же заголовком "
+                    f"уже открыта (#{number}) — "
+                    f"{'улика оставлена' if posted else 'улика НЕ оставлена'}, новую issue не завожу")
+                continue
+
+            # Суточный потолок (FAILURE_WATCH_DAILY_CAP): класс новый, титул
+            # тоже новый (иначе выше уже вышли комментарием), но квота дня
+            # исчерпана — задача НЕ заводится. Отсечённый класс не теряется
+            # молча: тихий след-комментарий в WATCHDOG_ISSUE (дедуп по (день,
+            # отпечаток) — не на каждый пульс) плюс видимая эскалация раз в
+            # сутки на переход (после цикла по workflow, ниже).
+            if ci_created_today is None:
+                try:
+                    ci_created_today = ci_failure_created_since(repo, now - timedelta(hours=24))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow}: счётчик суточного потолка "
+                        f"{FAILURE_WATCH_LABEL} не прочитан ({error})")
+                    continue
+            if failure_watch_cap_exhausted(ci_created_today):
+                observations.append(
+                    f"🚨 failure-watch {workflow} (job «{job_name}»): суточный потолок "
+                    f"{FAILURE_WATCH_LABEL} ({ci_created_today}/{FAILURE_WATCH_DAILY_CAP}) "
+                    f"исчерпан — класс {fingerprint} НЕ заведён, нужен человек")
+                cap_skipped_this_pulse.append(fingerprint)
+                skip_marker = (f"{FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX} "
+                               f"{now.date().isoformat()} {fingerprint}]")
+                try:
+                    already_listed = bool(issue_marker_times(repo, WATCHDOG_ISSUE, skip_marker))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ failure-watch {workflow}: маркеры #{WATCHDOG_ISSUE} не прочитаны ({error})")
+                    already_listed = True  # не гадаем повторно на этом же пульсе
+                if not already_listed:
+                    try:
+                        post_issue_comment(
+                            repo, WATCHDOG_ISSUE,
+                            f"{skip_marker}\nfailure-watch: класс {fingerprint} ({workflow}, job "
+                            f"«{job_name}») отсечён суточным потолком {FAILURE_WATCH_LABEL} "
+                            f"({FAILURE_WATCH_DAILY_CAP}/сутки) — задача НЕ заведена:\n\n"
+                            f"Факт: {fact}\n{run_url}",
+                        )
+                        actions.append(
+                            f"📋 failure-watch {workflow} (job «{job_name}»): класс {fingerprint} "
+                            f"отсечён потолком — след в #{WATCHDOG_ISSUE} оставлен")
+                    except RuntimeError as error:
+                        observations.append(
+                            f"⚠️ failure-watch {workflow}: след об отсечённом классе {fingerprint} "
+                            f"в #{WATCHDOG_ISSUE} не оставлен ({error})")
+                continue
+
             body = failure_watch_task_body(
                 workflow, job_name, fact, run_url, fingerprint, step_names)
             try:
@@ -1434,13 +1938,18 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 # сетевого вызова; CI-гвардия «сырой POST repos/{repo}/issues
                 # вне pool_issue.py» ловит обход — красный чек прогона
                 # 34049072989 на этом PR).
-                pool_issue.create_pool_issue(
+                created = pool_issue.create_pool_issue(
                     gh, repo, title, body, ["task", FAILURE_WATCH_LABEL])
             except RuntimeError as error:
                 observations.append(
                     f"⚠️ failure-watch {workflow} (job «{job_name}»): задача по дефекту не заведена ({error})")
                 continue
             ci_fingerprints.add(fingerprint)
+            ci_issues.append({
+                "number": created.get("number"), "title": title,
+                "html_url": created.get("html_url", ""), "body": body,
+            })
+            ci_created_today += 1  # эта задача уже сожгла квоту дня — следующий кандидат этого же пульса обязан её увидеть
             actions.append(
                 f"🛠️ failure-watch {workflow}: заведена задача по дефекту "
                 f"(job «{job_name}», шаги: {step_names}, класс {fingerprint}) — {fact}")
@@ -1450,5 +1959,26 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 f"⚠️ failure-watch {workflow}: ещё {len(hidden)} упавших job'ов не разобраны "
                 f"(потолок {FAILURE_WATCH_MAX_JOBS_PER_RUN} логов на прогон): "
                 + ", ".join(f"«{j.get('name', '?')}»" for j in hidden))
+
+    # Видимая эскалация исчерпания потолка (см. FAILURE_WATCH_CAP_MARKER) —
+    # РОВНО один раз на переход в календарные сутки, не на каждый пульс, пока
+    # потолок остаётся исчерпанным (дедуп маркером с датой). Список классов в
+    # тексте — те, что отсечены ИМЕННО этим пульсом; классы, отсечённые позже
+    # в этот же день, получают свой тихий след-комментарий (см. цикл выше),
+    # не второй Telegram-сигнал.
+    if cap_skipped_this_pulse:
+        cap_marker = f"{FAILURE_WATCH_CAP_MARKER} {now.date().isoformat()}]"
+        try:
+            already_escalated_today = bool(issue_marker_times(repo, WATCHDOG_ISSUE, cap_marker))
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ failure-watch: маркеры #{WATCHDOG_ISSUE} не прочитаны ({error}) — "
+                "эскалация потолка не проверена")
+            already_escalated_today = True  # не гадаем повторно на этом же пульсе
+        if not already_escalated_today:
+            text = failure_watch_cap_alert_text(cap_marker, ci_created_today, cap_skipped_this_pulse)
+            result = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 failure-watch: эскалация потолка автозаведения {FAILURE_WATCH_LABEL} ({result})")
 
     return observations, actions

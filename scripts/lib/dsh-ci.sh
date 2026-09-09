@@ -19,6 +19,46 @@ DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXm
 DSH_HEADLESS_VERSION="0.1.1-rc.2"
 DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 
+# Ротация учёток — плагины владельца combo-router + anthropic-oauth-pool
+# (#215). Публикуются релизными ассетами ЭТОГО репозитория (как forge-плагины
+# — .github/workflows/plugin-forge.yml — tarball + .sha256, `gh release
+# upload --clobber`), имена файлов объявляются здесь один раз.
+PLUGINS_SUITE_COMBO_ASSET="dsh-combo-suite-0.1.0.tgz"
+PLUGINS_SUITE_OAUTH_ASSET="dsh-anthropic-oauth-pool-0.1.0.tgz"
+
+# vars.PLUGINS_SUITE_URL — имя переменной унаследовано от design.md/tasks.md
+# dsh-in-job (объявлено ещё до решения о механизме публикации), но её
+# ЗНАЧЕНИЕ — тег релиза ЭТОГО репозитория, не сырой URL: скачивание идёт
+# публичным HTTPS без токена (репозиторий публичный, AGENTS.md «Секреты»)
+# стабильным путём `releases/download/<тег>/<ассет>`, а не `gh release
+# download`/`gh api` — тот требует токен, которого нет у ai-review (шаг
+# «Ревью агентом» намеренно без GH_TOKEN, trust-zone задачи #18); голый HTTPS
+# работает одинаково во всех трёх зонах доверия (worker/hands с PAT,
+# ai-review без токена вовсе).
+dsh_require_plugins_suite_repo() {
+  : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY не задан — нужен для releases/download URL}"
+}
+
+# Провайдеры-кандидаты для маршрутов combo-router — alias/baseURL/имя
+# env-переменной ключа/модель/contextWindow ВЗЯТЫ БУКВАЛЬНО из примера,
+# который уже поставляется внутри самого suite
+# (dsh-combo-router/examples/mytab0r.settings.yml, прочитано и подтверждено
+# в #215) — не изобретены. Маршрут попадает в композицию, ТОЛЬКО если
+# соответствующая apiKeyEnv-переменная фактически непуста в окружении job'а:
+# владелец расширяет ротацию добавлением секрета с этим именем, без правки
+# кода (одно место правды — этот список).
+# Формат: "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName"
+PLUGINS_SUITE_CANDIDATE_ROUTES=(
+  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 1"
+  "openrouter-2|https://openrouter.ai/api/v1|OPENROUTER_2_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 2"
+  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 1"
+  "ollama-cloud-2|https://ollama.com/v1|OLLAMA_CLOUD_2_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 2"
+  "ollama-cloud-3|https://ollama.com/v1|OLLAMA_CLOUD_3_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 3"
+  "nvidia-nim-1|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_1_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 1"
+  "nvidia-nim-2|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_2_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 2"
+  "zai-1|https://api.z.ai/api/coding/paas/v4|ZAI_1_API_KEY|glm-5|202752|Z.AI Coding Plan"
+)
+
 # Провайдер и модель — ровно одно место правды: vars.DEEPSEEK_BASE_URL /
 # vars.DEEPSEEK_MODEL репозитория (#153). Зашитых фолбэков на конкретный
 # эндпоинт/модель в коде больше нет нигде — их отсутствие обязано падать
@@ -79,19 +119,137 @@ dsh_install() { # $1 — рабочий каталог для tarball'ов (со
   command -v dsh >/dev/null
 }
 
-# Выбор модели и лимит ответа — через родной settings-слой профиля, НЕ env:
-# адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
-# модель живёт в settings namespace agent-default-model (проверено живым прогоном:
-# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
-# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
-dsh_patch_profile() { # $1 — имя профиля (обычно headless); выставляет DSH_MODEL/DSH_MAX_TOKENS
+# Скачивание и проверка целостности suite ротации учёток (#215). Единственное
+# место правды: зовут worker/task.sh, hands/dsh_task.sh, review/ai_dsh.sh —
+# как и dsh_install/dsh_patch_profile. Вызывать ПОСЛЕ dsh_install (не строго
+# обязательно, но естественный порядок) и ДО dsh_patch_profile — та читает
+# DSH_PLUGINS_SUITE_ACTIVE, выставляемый здесь.
+#
+# ТОЛЬКО скачивание+проверка+распаковка — ни одной команды `dsh` в этой
+# функции. Монтаж (`dsh plugin add`) — отдельно, dsh_mount_plugins_suite,
+# и обязан вызываться ПОСЛЕ dsh_patch_profile: доказанный живым прогоном
+# порядок этого же репозитория (hands/dsh_task.sh, «Плагин стрима»,
+# 2026-08-30 — «initProfile пишет файлы профиля только при отсутствии — наш
+# патч при dsh plugin add не перезаписывается»), обратный порядок при
+# локальной проверке #215 не подтвердил активацию надёжно.
+#
+# vars.PLUGINS_SUITE_URL не задана → видимая строка «не подключена», return 0,
+# поведение как раньше (одиночный провайдер) — обратная совместимость,
+# критерий 4 приёмки #215.
+#
+# vars.PLUGINS_SUITE_URL задана → скачивание обоих ассетов + .sha256
+# (публичный HTTPS, см. комментарий у PLUGINS_SUITE_COMBO_ASSET выше), сверка
+# целостности, распаковка обёртки dsh-combo-suite. Любой сбой (сеть, sha256,
+# форма ассета) — громкий возврат 1: «suite не установился» из критерия 6
+# #215, вызывающий обязан упасть.
+dsh_install_plugins_suite() { # $1 — рабочий каталог
+  local dir=$1
+  DSH_PLUGINS_SUITE_ACTIVE=0
+  DSH_PLUGINS_SUITE_COMBO_PKG=""
+  DSH_PLUGINS_SUITE_OAUTH_PKG=""
+  if [ -z "${PLUGINS_SUITE_URL:-}" ]; then
+    echo "::notice::ротация учёток не подключена: vars.PLUGINS_SUITE_URL не задана — используется единственный провайдер из vars.DEEPSEEK_* (#215)"
+    return 0
+  fi
+  dsh_require_plugins_suite_repo
+  mkdir -p "$dir"
+  echo "::group::Скачивание suite ротации учёток (релиз ${PLUGINS_SUITE_URL})"
+  local base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${PLUGINS_SUITE_URL}"
+  local asset
+  for asset in "$PLUGINS_SUITE_COMBO_ASSET" "$PLUGINS_SUITE_OAUTH_ASSET"; do
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$asset" "$base/$asset"; then
+      echo "::error::vars.PLUGINS_SUITE_URL=${PLUGINS_SUITE_URL} задана, но ассет $asset недоступен ($base/$asset) — suite не установился (#215)"
+      echo "::endgroup::"; return 1
+    fi
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$asset.sha256" "$base/$asset.sha256"; then
+      echo "::error::vars.PLUGINS_SUITE_URL=${PLUGINS_SUITE_URL} — в релизе нет ${asset}.sha256, целостность не проверить — suite не установился (#215)"
+      echo "::endgroup::"; return 1
+    fi
+    if ! (cd "$dir" && sha256sum -c "$asset.sha256"); then
+      echo "::error::sha256 $asset не сошёлся с $asset.sha256 — возможна подмена релиза или неполная закачка — suite не установился (#215)"
+      echo "::endgroup::"; return 1
+    fi
+  done
+
+  # dsh-combo-suite-*.tgz — не npm-пакет сам по себе (нет package.json в
+  # корне), а обёртка: README + дубликат oauth-pool + вложенный
+  # dsh-combo-router-*.tgz внутри каталога dsh-combo-router/ (проверено
+  # распаковкой при подготовке #215). Реальный устанавливаемый пакет —
+  # вложенный tgz.
+  local combo_extract="$dir/combo-suite-extracted"
+  mkdir -p "$combo_extract"
+  tar -xzf "$dir/$PLUGINS_SUITE_COMBO_ASSET" -C "$combo_extract"
+  local combo_pkg
+  combo_pkg=$(find "$combo_extract" -name 'dsh-combo-router-*.tgz' | head -1)
+  if [ -z "$combo_pkg" ]; then
+    echo "::error::в $PLUGINS_SUITE_COMBO_ASSET не нашёлся вложенный dsh-combo-router-*.tgz — форма ассета изменилась, suite не установился (#215)"
+    echo "::endgroup::"; return 1
+  fi
+
+  DSH_PLUGINS_SUITE_COMBO_PKG="$combo_pkg"
+  DSH_PLUGINS_SUITE_OAUTH_PKG="$dir/$PLUGINS_SUITE_OAUTH_ASSET"
+  DSH_PLUGINS_SUITE_ACTIVE=1
+  echo "suite скачан и проверен (sha256 ок) — монтаж следующим шагом, после патча профиля"
+  echo "::endgroup::"
+}
+
+# Монтаж suite в профиль — ОБЯЗАН вызываться ПОСЛЕ dsh_patch_profile (см.
+# обоснование порядка в комментарии dsh_install_plugins_suite выше). Монтаж —
+# через официальный документированный `dsh plugin --profile <p> add <spec>`
+# (docs/research/10-dsh-architecture.md, «Монтаж плагина в профиль headless»
+# — spec принимает путь к tarball'у, живым прогоном подтверждено 2026-08-30 в
+# исследовании И повторно локально при подготовке #215). Факт монтажа
+# проверяется командой (`dsh --profile <p> --dump-config`), не предположением.
+#
+# Сбой install/mount (сеть, dsh plugin add, отсутствие id в dump-config) —
+# громкий возврат 1, критерий 6 #215. Отдельно от этого: если МОНТАЖ прошёл,
+# но dump-config не подтверждает активацию (agent-default-model = combo/auto)
+# — это НЕ критерий 6 (тот про install/mount), а мягкая деградация: откат на
+# безопасный одиночный провайдер тем же патчем, видимый предупреждением, а не
+# тихий возврат «как получилось».
+dsh_mount_plugins_suite() { # $1 — профиль (headless)
   local profile=$1
-  # Модель обязана прийти из окружения (vars.DEEPSEEK_MODEL, #153) — здесь
-  # больше нет зашитого дефолта. Вызывающий обязан вызвать
-  # dsh_require_provider_env раньше и упасть громко, если модель не задана.
-  : "${DEEPSEEK_MODEL:?DEEPSEEK_MODEL не задан — dsh_require_provider_env должен был отказать раньше}"
-  DSH_MODEL="$DEEPSEEK_MODEL"
-  DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
+  [ "${DSH_PLUGINS_SUITE_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Монтаж suite ротации учёток (профиль $profile)"
+  if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_COMBO_PKG"; then
+    echo "::error::dsh plugin add не смонтировал dsh-combo-router — suite не смонтировался (#215)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_OAUTH_PKG"; then
+    echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — suite не смонтировался (#215)"
+    echo "::endgroup::"; return 1
+  fi
+
+  local dump
+  if ! dump=$(dsh --profile "$profile" --dump-config 2>&1); then
+    echo "::error::dsh --dump-config упал после монтажа suite — монтаж не подтверждён (#215): $dump"
+    echo "::endgroup::"; return 1
+  fi
+  if ! grep -q '^- id: combo-router$' <<<"$dump"; then
+    echo "::error::combo-router не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#215)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! grep -q '^- id: anthropic-oauth-pool$' <<<"$dump"; then
+    echo "::error::anthropic-oauth-pool не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#215)"
+    echo "::endgroup::"; return 1
+  fi
+
+  if grep -q 'provider: combo' <<<"$dump" && grep -q 'model: auto' <<<"$dump"; then
+    echo "ротация подключена: combo-router + anthropic-oauth-pool смонтированы, agent-default-model=combo/auto подтверждён dump-config"
+  else
+    echo "::warning::suite смонтирован, но dsh --dump-config не подтвердил активацию provider:combo/model:auto — откат на одиночный провайдер, ротация не подключена в этом прогоне (#215)"
+    _dsh_patch_profile_plain "$profile"
+  fi
+  echo "::endgroup::"
+}
+
+# Плоский (без combo-router) патч профиля — поведение «как раньше», один
+# источник для ОБЕИХ ситуаций, где он нужен: suite не запрошен вовсе, и
+# suite смонтирован, но dump-config не подтвердил активацию (мягкий откат,
+# dsh_mount_plugins_suite). Не публичная функция первого выбора — дергать
+# напрямую нет смысла вне этих двух мест, но и не re-declare внутри каждого.
+_dsh_patch_profile_plain() { # $1 — профиль
+  local profile=$1
   local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
   mkdir -p "$(dirname "$patch")"
   cat >"$patch" <<PATCH
@@ -102,6 +260,180 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
 - id: llm-deepseek
   config:
     maxTokens: $DSH_MAX_TOKENS
+PATCH
+}
+
+# Окно контекста env-provider'а для combo-router — ОТДЕЛЬНАЯ величина от
+# DSH_MAX_TOKENS (тот — потолок ДЛИНЫ ОТВЕТА, adapter-конфиг llm-deepseek
+# maxTokens; #789, живой прогон: contextWindow=DSH_MAX_TOKENS=131072 у
+# glm-5.3-flash при реальном окне 1000000 отбрасывал маршрут вчетверо раньше
+# нужного — combo-router::compatible() кидает NO_COMBO_ROUTE при
+# contextTokens > contextWindow*0.92). Источник — vars.DSH_EDGE_MODEL_CATALOG:
+# та же переменная, которой уже требует присутствие vars.DEEPSEEK_MODEL
+# каталог морды (deploy-dsh-edge.yml, «Патч каталога моделей под реального
+# провайдера») — не второе место правды, то же самое значение. Модель вне
+# каталога (запись отсутствует, например при ручном тесте другой модели) —
+# консервативный фолбэк на DSH_MAX_TOKENS: не хуже прежнего поведения (оно и
+# было таким для всех моделей) и не занижает относительно старого поведения,
+# только не расширяет окно за пределы неподтверждённого значения.
+dsh_model_context_window() { # $1 — id модели
+  local model=$1 cw=""
+  if [ -n "${DSH_EDGE_MODEL_CATALOG:-}" ]; then
+    cw=$(jq -r --arg id "$model" \
+      '([.[]? | select(.id == $id) | .contextWindow][0]) // empty' \
+      <<<"$DSH_EDGE_MODEL_CATALOG" 2>/dev/null || true)
+  fi
+  if [ -z "$cw" ] || [ "$cw" = "null" ]; then
+    echo "::warning::окно контекста модели '$model' не найдено в vars.DSH_EDGE_MODEL_CATALOG — использую консервативный фолбэк $DSH_MAX_TOKENS (потолок вывода, может быть меньше реального окна контекста)" >&2
+    cw="$DSH_MAX_TOKENS"
+  fi
+  echo "$cw"
+}
+
+# Выбор модели и лимит ответа — через родной settings-слой профиля, НЕ env:
+# адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
+# модель живёт в settings namespace agent-default-model (проверено живым прогоном:
+# без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
+# maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
+#
+# Вызывать ДО dsh_mount_plugins_suite (порядок обоснован там) — сам патч
+# читает DSH_PLUGINS_SUITE_ACTIVE, выставляемый dsh_install_plugins_suite
+# (скачивание), который в свою очередь обязан отработать раньше.
+#
+# СТЫК с цепочкой провайдеров (#727/#737, dsh_run_with_provider_chain ниже):
+# та зовёт ЭТУ ЖЕ функцию НА КАЖДОЙ попытке провайдера, экспортировав перед
+# этим DEEPSEEK_BASE_URL/MODEL/API_KEY КОНКРЕТНОГО провайдера — ожидая, что
+# патч сконфигурирует именно его, а не какой-то другой. Suite (#215) решает
+# ТОТ ЖЕ вопрос («кого пробовать») на своём уровне — комбинировать их напрямую
+# нельзя: если бы combo/auto включался и внутри цепочки, DSH_CHAIN_PROVIDER/
+# DSH_CHAIN_TRIED атрибутировали бы попытку не тому провайдеру, который её
+# реально обслужил, а реестр подтверждённых моделей (#737, dsh_model_confirmed)
+# вообще не видит маршруты suite — то есть цепочка и suite решают одно и то
+# же на разных уровнях, и слепое объединение тихо ломает оба тормоза чейна.
+# Решение (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): ВНУТРИ
+# цепочки suite всегда глушится — dsh_run_with_provider_chain выставляет
+# DSH_CHAIN_ACTIVE=1 на время своего цикла, и эта функция читает его ниже,
+# независимо от DSH_PLUGINS_SUITE_ACTIVE. Вне цепочки (#797: сегодня это
+# только hands.yml — worker.yml с этой задачи тоже зовёт
+# dsh_run_with_provider_chain) suite работает как раньше.
+# Дополнительный тормоз — dsh_require_provider_chain отказывает громко, если
+# vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно: молчаливого
+# приоритета одной переменной над другой быть не должно.
+dsh_patch_profile() { # $1 — имя профиля (обычно headless); выставляет DSH_MODEL/DSH_MAX_TOKENS
+  local profile=$1
+  # Модель обязана прийти из окружения (vars.DEEPSEEK_MODEL, #153) — здесь
+  # больше нет зашитого дефолта. Вызывающий обязан вызвать
+  # dsh_require_provider_env раньше и упасть громко, если модель не задана.
+  : "${DEEPSEEK_MODEL:?DEEPSEEK_MODEL не задан — dsh_require_provider_env должен был отказать раньше}"
+  DSH_MODEL="$DEEPSEEK_MODEL"
+  DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
+  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  mkdir -p "$(dirname "$patch")"
+
+  if [ "${DSH_CHAIN_ACTIVE:-0}" = "1" ] && [ "${DSH_PLUGINS_SUITE_ACTIVE:-0}" = "1" ]; then
+    # Защитный, а не ожидаемый путь: dsh_require_provider_chain уже должен был
+    # отказать раньше, если обе переменные заданы разом (см. комментарий выше).
+    # Если сюда всё же дошли — не молчим о том, что suite для этой попытки
+    # игнорируется, а не тихо подменяет провайдера цепочки.
+    echo "::warning::цепочка провайдеров (#727) игнорирует suite ротации учёток (#215) внутри своего цикла — комбинация не поддержана конструктивно (design.md dsh-in-job, «Стык suite и цепочки провайдеров»), пишу плоский патч на $DSH_MODEL" >&2
+  fi
+
+  if [ "${DSH_PLUGINS_SUITE_ACTIVE:-0}" != "1" ] || [ "${DSH_CHAIN_ACTIVE:-0}" = "1" ]; then
+    # suite не скачан (переменная не задана либо dsh_install_plugins_suite
+    # ещё не вызывалась/не удался), ЛИБО эта попытка идёт внутри цепочки
+    # провайдеров — поведение как раньше, без combo-router.
+    _dsh_patch_profile_plain "$profile"
+    return 0
+  fi
+
+  # Suite скачан и проверен (dsh_install_plugins_suite отработал, монтаж
+  # dsh_mount_plugins_suite — следующим шагом, ПОСЛЕ этой функции). Контракт
+  # combo-router прочитан из его исходников (#215, не угадан):
+  # - виртуальная модель — provider: combo / model: auto
+  #   (dsh-combo-router/lib/index.js: ComboAdapter.providerInfo/resolveModel);
+  # - маршруты идут через дремлющий базовый сервис llm-pi-ai (id подтверждён
+  #   живым `dsh --dump-config`, не предположением) — providers.<id>.apiKeyEnv
+  #   называет ИМЯ переменной окружения, не значение;
+  # - `enabled: true` с пустым routes падает конструктором роутера
+  #   («combo-router: enabled router needs at least one route»,
+  #   dsh-combo-router/lib/router.js) — поэтому здесь ВСЕГДА есть маршрут
+  #   env-provider (переиспользует уже обязательные DEEPSEEK_*, см.
+  #   dsh_require_provider_env) плюс любые маршруты из
+  #   PLUGINS_SUITE_CANDIDATE_ROUTES, чей apiKeyEnv фактически задан —
+  #   владелец добавляет провайдера созданием секрета с этим именем, без
+  #   правки кода.
+  local providers_yaml routes_yaml entry alias url keyenv model ctx label keyval
+  local env_ctx_window
+  env_ctx_window=$(dsh_model_context_window "$DSH_MODEL")
+  providers_yaml="      env-provider:
+        displayName: \"vars.DEEPSEEK_BASE_URL (env-provider)\"
+        api: openai-completions
+        baseURL: $DEEPSEEK_BASE_URL
+        apiKeyEnv: DEEPSEEK_API_KEY
+        models:
+          - id: $DSH_MODEL
+            contextWindow: $env_ctx_window"
+  routes_yaml="      env-provider:
+        provider: env-provider
+        model: $DSH_MODEL
+        tasks: [general, coding, research, reasoning, simple, long-context]
+        quality: 80
+        cost: 0.3
+        latency: 0.4
+        contextWindow: $env_ctx_window
+        tools: true
+        group: env-provider"
+
+  for entry in "${PLUGINS_SUITE_CANDIDATE_ROUTES[@]}"; do
+    IFS='|' read -r alias url keyenv model ctx label <<<"$entry"
+    keyval="${!keyenv:-}"
+    [ -n "$keyval" ] || continue
+    providers_yaml="$providers_yaml
+      $alias:
+        displayName: \"$label\"
+        api: openai-completions
+        baseURL: $url
+        apiKeyEnv: $keyenv
+        models:
+          - id: $model
+            contextWindow: $ctx"
+    routes_yaml="$routes_yaml
+      $alias:
+        provider: $alias
+        model: $model
+        tasks: [general, coding, research, reasoning, simple, long-context]
+        quality: 80
+        cost: 0.3
+        latency: 0.4
+        contextWindow: $ctx
+        tools: true
+        group: $alias"
+  done
+
+  cat >"$patch" <<PATCH
+- id: agent-default-model
+  config:
+    provider: combo
+    model: auto
+- id: llm-deepseek
+  config:
+    maxTokens: $DSH_MAX_TOKENS
+- id: llm-pi-ai
+  config:
+    providers:
+$providers_yaml
+- id: combo-router
+  config:
+    enabled: true
+    mode: auto
+    virtualProvider: combo
+    virtualModel: auto
+    failureThreshold: 2
+    cooldownMs: 120000
+    authCooldownMs: 3600000
+    maxFallbacks: 9
+    routes:
+$routes_yaml
 PATCH
 }
 
@@ -178,4 +510,236 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
     attempt=$((attempt + 1))
   done
   DSH_RUN_RC=$rc
+}
+
+# ── Цепочка провайдеров (#727): автопереход по классу отказа ────────────────
+#
+# quota_exhausted (RATE_LIMIT: Weekly/Monthly Limit Exhausted, #422 выше) и
+# повторяемый транспортный сбой (HTTP_404/EMPTY_RESPONSE — класс, названный
+# AGENTS.md, живой случай — перемежающийся HTTP_404 NVIDIA NIM, уложивший
+# воркер и пять прогонов ai-review 2026-09-02) переключают на следующего
+# провайдера БЕЗ участия человека. Ошибка контракта вердикта (модель ответила
+# не по формату, rc=0) сюда не попадает вовсе — она решается выше по стеку
+# (ai_review.py::parse_verdict), чейн её не видит и не трогает: иначе цепочка
+# сожгла бы все учётки на одном сломанном PR (AGENTS.md, «квота — это ВОЗМОЖНОСТИ
+# нет, контракт — возможность есть, но сломана»).
+#
+# Одно место правды на упорядоченный список — vars.DSH_PROVIDER_CHAIN
+# репозитория (тот же принцип, что #153: провайдер объявляется в vars, не
+# зашитым фолбэком в коде — гвардия provider-default.guard.sh сканирует
+# scripts/**/docs/agents/** на литералы конкретных провайдеров, поэтому
+# список НЕ хранится файлом в дереве репозитория, а живёт переменной, как уже
+# делает vars.DSH_EDGE_MODEL_CATALOG для каталога морды). Формат — JSON-массив,
+# порядок = приоритет:
+#   [{"name":"GLM","base_url":"...","model":"...","secret_env":"DEEPSEEK_API_KEY",
+#     "max_output_tokens":131072}, {"name":"NVIDIA","base_url":"...", ...}]
+# secret_env — ИМЯ переменной окружения, в которую workflow уже положил ключ
+# этого провайдера (secrets.<X>, литеральным именем в workflow — не индексацией
+# через vars.DSH_PROVIDER_KEY_SECRET, #716: тому механизму нужен РОВНО один
+# активный секрет в её, этому — ключи ВСЕХ провайдеров цепочки одновременно,
+# разные задачи, не дублируют друг друга).
+dsh_require_provider_chain() {
+  # Стык с suite ротации учёток (#215, design.md dsh-in-job «Стык suite и
+  # цепочки провайдеров»): цепочка владеет провайдером КАЖДОЙ попытки
+  # (атрибуция DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED, реестр подтверждённых
+  # моделей #737), suite вращает УЧЁТКИ внутри одного провайдера через
+  # combo-router и не проходит через эти проверки. Включить оба сразу значило
+  # бы либо тихо игнорировать suite (сейчас так и сделано ниже по стеку,
+  # dsh_patch_profile), либо тихо обойти гейт подтверждённых моделей —
+  # запрещаем комбинацию явно, а не полагаемся на то, что ни один вызывающий
+  # не прокинет обе переменные разом.
+  if [ -n "${PLUGINS_SUITE_URL:-}" ]; then
+    echo "::error::vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно — комбинация не поддержана (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): цепочка (#727) сама решает, какого провайдера пробовать на каждой попытке, suite (#215) решает тот же вопрос на своём уровне — выбери одно. Сейчас suite нужен только hands.yml (там цепочки нет, #797) — ai-review и worker всегда идут цепочкой." >&2
+    return 1
+  fi
+  if [ -z "${DSH_PROVIDER_CHAIN:-}" ]; then
+    echo "::error::не задан vars.DSH_PROVIDER_CHAIN — цепочка провайдеров объявляется только в vars репозитория (#727), зашитого списка в коде нет" >&2
+    return 1
+  fi
+  local count
+  count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN" 2>/dev/null) || {
+    echo "::error::vars.DSH_PROVIDER_CHAIN не парсится как JSON-массив" >&2
+    return 1
+  }
+  if [ -z "$count" ] || [ "$count" -lt 1 ]; then
+    echo "::error::vars.DSH_PROVIDER_CHAIN пуст — нужен хотя бы один провайдер" >&2
+    return 1
+  fi
+}
+
+# Класс отказа → переход на следующего провайдера. failure_reason — уже
+# посчитанный dsh_run_with_retry (quota_exhausted/rate_limit_retry_budget_
+# exceeded/пусто); при пустом — второй, более грубый признак: буквальный
+# текст HTTP_404/EMPTY_RESPONSE в stderr (прод-форма — «dsh: HTTP_404:
+# modelCode does not exist», scripts/lib/test/dsh-clients.smoke.sh). Любая
+# другая нераспознанная ошибка (ключ битый, DSH сам сломан, битый запрос) —
+# «stop», цепочка НЕ идёт дальше: следующий провайдер тем же кодом/запросом
+# не спасёт, а время/квоту потратит.
+#
+# #737 (живой случай — прогон 34188152283, NVIDIA rc=1, НИ ОДНОГО байта в
+# stderr): третий, отдельный признак — сигнала нет вообще (stderr пуст или
+# состоит только из пробелов). Заведомо-нелечимый сменой провайдера отказ
+# (битый ключ, нарушение контракта вердикта, битый аргумент запроса) ВСЕГДА
+# печатает диагностическую строку — тишина неотличима от временного
+# транспортного сбоя, ради которого цепочка и строилась (proposal.md,
+# «повторяемый транспортный отказ… переключают… без участия человека»). Цена
+# ошибки при выборе «переключаемый» здесь — потратить время следующего
+# провайдера; цена выбора «стоп» — молчать всю оставшуюся цепочку без единой
+# причины, как и случилось. По умолчанию — переключаемся.
+#
+# DSH_CHAIN_CLASS_NOTE (переменная, не возврат) — человекочитаемая причина
+# решения для сообщения вызывающего (правило AGENTS.md «Алерт не гадает»):
+# имя признанной причины, литеральный маркер stderr, факт «stderr пуст» или
+# первая строка нераспознанной диагностики (стоп-класс).
+#
+# Ветка «стоп-класс» ниже — единственная, что кладёт в переменную СЫРОЙ
+# фрагмент stderr клиента модели, а не заранее известную безопасную строку
+# (имя причины/литеральный маркер/факт пустоты) — и именно она обязана идти
+# через redact() (#743): начало ответа 401 у провайдера типично содержит эхо
+# заголовка Authorization, GitHub маскирует только точное совпадение секрета,
+# производное (подстрока/префикс) — нет. Маскируем здесь, у источника, ОДИН
+# раз — оба места печати (::warning:: и ::error:: ниже) читают уже
+# замаскированную переменную, второй копии redact на каждую точку вывода не
+# нужно (то же место правды, что redact() выше в этом файле).
+dsh_chain_should_advance() { # err_file failure_reason
+  local err_file=$1 reason=$2
+  case "$reason" in
+    quota_exhausted|rate_limit_retry_budget_exceeded)
+      DSH_CHAIN_CLASS_NOTE="$reason"
+      return 0 ;;
+  esac
+  if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
+    return 0
+  fi
+  if [ ! -s "$err_file" ] || ! grep -qE '[^[:space:]]' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="stderr пуст — диагностику дать не может, класс не установить, консервативно пробую следующего"
+    return 0
+  fi
+  DSH_CHAIN_CLASS_NOTE="$(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)"
+  return 1
+}
+
+# Дата сброса квоты — прод-форма «Your limit will reset at 2026-09-10
+# 08:51:55» (run 34176910458) и ISO-форма «...reset at 2026-09-10T00:00:00Z»
+# (смоук-фикстура) — обе покрыты одним разбором: всё после "reset at" до
+# конца строки, минус хвостовые точки/пробелы. Пусто — дата не названа
+# (не quota_exhausted, либо провайдер сформулировал иначе).
+dsh_extract_reset_hint() { # err_file
+  local line
+  line=$(grep -oE 'reset at .*' "$1" 2>/dev/null | head -1) || true
+  line="${line#reset at }"
+  line="${line%.}"
+  line="${line% }"
+  printf '%s' "$line"
+}
+
+# ── Реестр подтверждённых id моделей (#737) ──────────────────────────────────
+#
+# Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)
+# прямо запрещает экстраполяцию id и требует сверки буква-в-букву с ответом
+# `/v1/models` — правило было прозой без носителя. Живая цена: id
+# `nvidia/nemotron-3-super-120b-a12b` вписан в vars.DSH_PROVIDER_CHAIN
+# 2026-09-08T04:38:51Z без единой проверки и дал 37 минут молчания
+# (прогон 34188152283).
+#
+# Реестр хранит sha256 подтверждённой СТРОКИ id, не саму строку: провайдер-
+# дефолт-гвардия (scripts/lib/test/provider-default.guard.sh, класс #153)
+# сканирует scripts/**/docs/agents/** на литералы конкретных провайдеров/
+# моделей (glm-N, nemotron, …) — хэш ей не виден и не обязан быть, это не
+# второе место правды о ТЕКУЩЕМ провайдере (им остаётся vars.
+# DSH_PROVIDER_CHAIN), а список «эту строку кто-то сверил живым запросом».
+DSH_CONFIRMED_MODELS_FILE="${DSH_CONFIRMED_MODELS_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/confirmed-provider-models.json}"
+
+dsh_model_confirmed() { # model_id
+  local model=$1 hash
+  [ -f "$DSH_CONFIRMED_MODELS_FILE" ] || return 1
+  hash=$(printf '%s' "$model" | sha256sum | cut -d' ' -f1)
+  jq -e --arg h "$hash" 'any(.[]?; .model_sha256 == $h)' "$DSH_CONFIRMED_MODELS_FILE" >/dev/null 2>&1
+}
+
+# Прогон по цепочке: пробует провайдеров ПО ПОРЯДКУ, пока один не ответит
+# (rc=0) или список не кончится. Ретрай короткого RATE_LIMIT ВНУТРИ одного
+# провайдера — не отменяется, остаётся заботой dsh_run_with_retry; чейн решает
+# только «пробовать ли СЛЕДУЮЩЕГО».
+#
+# Использование:
+#   dsh_run_with_provider_chain <answer_file> <err_file> <prompt_text>
+# (вызывающий обязан вызвать dsh_require_provider_chain раньше и упасть
+# громко, если vars.DSH_PROVIDER_CHAIN не задан — тот же контракт, что у
+# dsh_require_provider_env/dsh_run_with_retry.)
+#
+# Результат (переменные, вызывающий печатает свой отчёт):
+#   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки (как у dsh_run_with_retry)
+#   DSH_RUN_FAILURE_REASON  — "" на успехе | quota_exhausted/rate_limit_retry_budget_exceeded
+#                             последнего провайдера | all_providers_exhausted (список кончился)
+#   DSH_CHAIN_PROVIDER      — имя провайдера, ответившего успехом (пусто на отказе)
+#   DSH_CHAIN_TRIED         — имена всех опробованных провайдеров через ", "
+#   DSH_CHAIN_RESET_HINT    — "имя: дата" для каждого провайдера с известной датой
+#                             сброса, через "; " (пусто — ни один не назвал дату)
+dsh_run_with_provider_chain() { # answer_file err_file prompt_text
+  local answer_file=$1 err_file=$2 prompt_text=$3
+  local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint
+  count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
+  DSH_CHAIN_PROVIDER=""
+  DSH_CHAIN_TRIED=""
+  DSH_CHAIN_RESET_HINT=""
+  # Как и dsh_run_with_retry, эта функция НИКОГДА не возвращает ненулевой код
+  # сама (иначе `set -e` вызывающего оборвал бы скрипт ДО того, как он успеет
+  # прочитать DSH_RUN_RC/DSH_RUN_FAILURE_REASON и напечатать свой отчёт) —
+  # исход виден только через переменные, тот же контракт, что уже есть.
+  DSH_RUN_RC=1
+  DSH_RUN_FAILURE_REASON=""
+  # Тормоз стыка с suite (#215, см. комментарий над dsh_patch_profile): пока
+  # цикл цепочки идёт, dsh_patch_profile ВСЕГДА пишет плоский патч на
+  # конкретного провайдера этой попытки, независимо от DSH_PLUGINS_SUITE_ACTIVE.
+  # Восстанавливаем предыдущее значение на выходе — на случай, если эта
+  # функция когда-нибудь будет вызвана изнутри другого чейна (сейчас не
+  # вызывается, но не полагаемся на это).
+  local _prev_chain_active="${DSH_CHAIN_ACTIVE:-}"
+  DSH_CHAIN_ACTIVE=1
+  while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
+    entry=$(jq -c ".[$i]" <<<"$DSH_PROVIDER_CHAIN")
+    name=$(jq -r '.name' <<<"$entry")
+    base_url=$(jq -r '.base_url' <<<"$entry")
+    model=$(jq -r '.model' <<<"$entry")
+    secret_env=$(jq -r '.secret_env' <<<"$entry")
+    max_tokens=$(jq -r '.max_output_tokens // 131072' <<<"$entry")
+    DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name"
+    key="${!secret_env:-}"
+    if [ -z "$key" ]; then
+      echo "::warning::цепочка провайдеров: $name пропущен — секрет $secret_env не передан этим workflow'ом" >&2
+      i=$((i + 1))
+      continue
+    fi
+    if ! dsh_model_confirmed "$model"; then
+      echo "::error::цепочка провайдеров: $name пропущен — id модели '$model' НЕ подтверждён живым запросом к /v1/models (реестр $DSH_CONFIRMED_MODELS_FILE не несёт его хэш). Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели») запрещает экстраполяцию — сверь буква-в-букву и допиши подтверждение в реестр." >&2
+      i=$((i + 1))
+      continue
+    fi
+    echo "цепочка провайдеров: пробую $name ($base_url, $model)"
+    export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
+    DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
+    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    if [ "$DSH_RUN_RC" -eq 0 ]; then
+      DSH_CHAIN_PROVIDER="$name"
+      DSH_RUN_FAILURE_REASON=""
+      stop=1
+      continue
+    fi
+    reset_hint=$(dsh_extract_reset_hint "$err_file")
+    [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
+    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON"; then
+      echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
+      i=$((i + 1))
+      continue
+    fi
+    echo "::error::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс НЕ переключаемый (stderr: $DSH_CHAIN_CLASS_NOTE), дальше по цепочке не иду (следующие провайдеры не тронуты)" >&2
+    stop=1
+  done
+  if [ -z "$DSH_CHAIN_PROVIDER" ] && [ "$i" -ge "$count" ]; then
+    DSH_RUN_FAILURE_REASON="all_providers_exhausted"
+    echo "::error::цепочка провайдеров исчерпана целиком ($DSH_CHAIN_TRIED)${DSH_CHAIN_RESET_HINT:+ — сброс: $DSH_CHAIN_RESET_HINT}" >&2
+  fi
+  DSH_CHAIN_ACTIVE="$_prev_chain_active"
 }

@@ -45,6 +45,14 @@ CLI:
 
 from __future__ import annotations
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import json
 import os
 import re
@@ -66,7 +74,7 @@ def _default_gh(*args: str) -> dict | list | None:
     мокать его в тестах тем же приёмом (`patch_gh`), не вторым мок-путём
     на `task_deps.subprocess`."""
     result = subprocess.run(
-        ["gh", "api", *args], capture_output=True, text=True,
+        ["gh", "api", *args], capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -249,6 +257,40 @@ def remove_dependency(repo: str, blocked: int, blocking: int, gh_call=_default_g
     gh_graphql(
         _REMOVE_BLOCKED_BY, {"issueId": issue_id, "blockingIssueId": blocking_id}, gh_call=gh_call,
     )
+
+
+# ── Перенос объявленной зависимости в граф — одно место на все пути ──────────
+
+
+def wire_dependencies(
+    repo: str, blocked: int, blocking_numbers: list[int], open_numbers: set[int],
+    gh_call=_default_gh, log=print,
+) -> list[int]:
+    """Единственное место, переносящее «номера, объявленные структурным
+    полем/строкой» в нативный `blockedBy` — задача #529, продолжение #371:
+    до этой задачи цикл «пропустить номер вне открытого пула, иначе
+    `add_dependency` + лог» жил ТОЛЬКО в `file_tasks.py::wire_declared_dependency`
+    (путь АИ-ревью, строка «БЛОКИРУЕТСЯ:»). Второй вызывающий (авто-перенос
+    структурного поля формы «Чем блокируется», `declared_deps.py::auto_wire`)
+    переиспользует эту же функцию — третья копия одного цикла не заводится.
+
+    Номер вне ТЕКУЩЕГО открытого пула с меткой `task` (уже закрыт, не задача,
+    не существует) или ссылка на саму `blocked` — НЕ линкуется, печатается
+    предупреждение: ложная связь опаснее отсутствующей (то же правило, что
+    для ручной миграции #371). Повтор номера во входе (ответ поля
+    «#55 #55», находка AI-ревью PR #537) даёт ОДНУ мутацию — дедупликация
+    здесь, в единственном цикле переноса, закрывает случай для обоих путей
+    (поле формы, строка «БЛОКИРУЕТСЯ:»)."""
+    linked: list[int] = []
+    for n in dict.fromkeys(blocking_numbers):
+        if n == blocked or n not in open_numbers:
+            log(f"    ! #{blocked}: «#{n}» — не открытая задача пула с меткой "
+                f"task (или ссылка на себя) — связь НЕ поставлена")
+            continue
+        add_dependency(repo, blocked=blocked, blocking=n, gh_call=gh_call)
+        linked.append(n)
+        log(f"    -> #{blocked} заблокирована #{n} (нативный граф)")
+    return linked
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

@@ -27,14 +27,18 @@ def utc(*args):
     return datetime(*args, tzinfo=timezone.utc)
 
 
-def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch", updated_at=None):
+def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker run", event="workflow_dispatch", updated_at=None, actor=None):
     """Прод-форма элемента workflow_runs (поля, которые читает модуль).
     event по умолчанию — workflow_dispatch (реальный тик), чтобы существующие
     тесты, не заботящиеся о фильтре real_orchestra_ticks, не начали молчать.
     updated_at по умолчанию = created_at: у короткого прогона моменты очереди
     и завершения совпадают; долгий прогон задаётся явно (см. регресс-тест
-    окна свежести на находку ревью PR #488, раунд 3)."""
-    return {
+    окна свежести на находку ревью PR #488, раунд 3). actor — login
+    triggering_actor (прод-форма Actions API, снято живым `gh api
+    .../orchestra.yml/runs` 2026-09-07, issue #689); по умолчанию None —
+    существующие тесты, которым различие каналов безразлично, не несут
+    лишнего поля."""
+    payload = {
         "id": run_id,
         "conclusion": conclusion,
         "created_at": created_at,
@@ -43,6 +47,9 @@ def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker r
         "display_title": title,
         "event": event,
     }
+    if actor is not None:
+        payload["triggering_actor"] = {"login": actor}
+    return payload
 
 
 # ── Серия красных: подсчёт подряд ────────────────────────────────────────────────
@@ -367,6 +374,37 @@ RECENT_OK = {"workflow_runs": [
     run("failure", "2026-08-31T11:35:00Z", 3),
     run("failure", "2026-08-31T11:20:00Z", 2),
 ]}
+
+
+# ── issue_marker_times: маркер с номером PR — не подстрока чужого номера ────
+# (находка ревью #439): "... #16" — подстрока "... #163", голая проверка
+# `marker in body` считала эскалацию по PR #16 "уже случившейся" внутри
+# комментария про совсем другой PR #163.
+
+
+def test_issue_marker_times_does_not_match_longer_pr_number(monkeypatch):
+    marker = "[ai-review: автоповторы исчерпаны] #16"
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": "🚨 edge-harness: [ai-review: автоповторы исчерпаны] #163\nдругой PR"},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    assert pg.issue_marker_times("mytab0r/edge-harness", 120, marker) == []
+
+
+def test_issue_marker_times_matches_exact_pr_number(monkeypatch):
+    marker = "[ai-review: автоповторы исчерпаны] #163"
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-06T10:00:00Z",
+             "body": "🚨 edge-harness: [ai-review: автоповторы исчерпаны] #163\nтот самый PR"},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    times = pg.issue_marker_times("mytab0r/edge-harness", 120, marker)
+    assert times == [utc(2026, 9, 6, 10, 0)]
 
 
 def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
@@ -742,6 +780,186 @@ def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkey
     assert posted == []
 
 
+# ── Независимый DO-пульс (#689): различитель triggering_actor.login ──────────────
+#
+# Фикстуры ниже — реальные workflow_runs `orchestra.yml` с event=workflow_dispatch
+# (снято живым `gh api repos/mytab0r/edge-harness/actions/workflows/orchestra.yml/
+# runs?event=workflow_dispatch&per_page=100` 2026-09-07, issue #689): событийный
+# будильник (scripts/gh/wake_orchestra.sh, GH_TOKEN=github.token) даёт
+# triggering_actor.login=github-actions[bot]; независимый DO-пульс (cf-worker
+# alarm()::attemptOrchestraDispatch, GH_DISPATCH_TOKEN) — login владельца
+# токена. В это утро независимый канал не тикал с 04:51:45 до как минимум
+# 08:53:29 (событийный канал при этом тикал каждые 5-15 минут) — реальный,
+# не выдуманный эпизод direction (b) из issue #689.
+
+EVENT_RUNS_MORNING = [
+    run("success", "2026-09-07T08:53:29Z", 101, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:44:42Z", 102, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:26:16Z", 103, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T08:16:15Z", 104, event="workflow_dispatch", actor="github-actions[bot]"),
+    run("success", "2026-09-07T04:26:32Z", 105, event="workflow_dispatch", actor="github-actions[bot]"),
+]
+INDEPENDENT_RUN_MORNING = run(
+    "success", "2026-09-07T04:51:45Z", 90, event="workflow_dispatch", actor="mytab0r")
+
+
+def test_decide_independent_pulse_not_applicable_when_event_channel_itself_silent():
+    # Событийный канал сам не тикал недавно — нечего сравнивать (честная
+    # граница ложного срабатывания из issue #689: «оркестратор вообще не
+    # запускался, некому и мерить»).
+    old_event = run("success", "2026-09-06T10:00:00Z", 1, actor="github-actions[bot]")
+    state, anchor, exact = pg.decide_independent_pulse([old_event], utc(2026, 9, 7, 9, 0))
+    assert state == "not_applicable" and anchor is None
+
+
+def test_decide_independent_pulse_ok_when_independent_tick_recent():
+    # 2026-09-07T04:55 — 04:51:45 (независимый) 3.25 мин назад, 04:26:32
+    # (событийный) 28.5 мин назад: оба в пределах порога — здоров.
+    runs = [EVENT_RUNS_MORNING[4], INDEPENDENT_RUN_MORNING]
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 4, 55, 0))
+    assert state == "ok" and exact is True
+    assert anchor.isoformat() == "2026-09-07T04:51:45+00:00"
+
+
+def test_decide_independent_pulse_stale_on_real_incident_morning_gap(monkeypatch=None):
+    # Прод-форма реального разрыва: событийный канал тикал в 08:16-08:53,
+    # независимый — молчал с 04:51:45 (4 ч 8 мин, порог 60 мин).
+    runs = EVENT_RUNS_MORNING + [INDEPENDENT_RUN_MORNING]
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 9, 0, 0))
+    assert state == "stale" and exact is True
+    assert anchor.isoformat() == "2026-09-07T04:51:45+00:00"
+    age = pg.minutes_between(anchor, utc(2026, 9, 7, 9, 0, 0))
+    assert age > pg.INDEPENDENT_PULSE_STALE_AFTER_MINUTES
+    assert round(age / 60, 1) == 4.1
+
+
+def test_decide_independent_pulse_mutation_guard_threshold_is_single_constant():
+    # Порог — аргумент по умолчанию из одной константы (тот же приём, что у
+    # test_decide_dispatch_threshold_is_single_constant): изменили константу —
+    # изменилось решение, второй копии порога в коде нет.
+    runs = [run("success", "2026-09-07T08:00:00Z", 1, actor="github-actions[bot]"),
+            run("success", "2026-09-07T07:00:00Z", 2, actor="mytab0r")]
+    now = utc(2026, 9, 7, 8, 0, 0)
+    assert pg.decide_independent_pulse(runs, now, stale_after_minutes=61)[0] == "ok"
+    assert pg.decide_independent_pulse(runs, now, stale_after_minutes=59)[0] == "stale"
+
+
+def test_decide_independent_pulse_stale_lower_bound_when_no_independent_in_sample():
+    # Ни одного независимого тика во всей изученной выборке — anchor берётся
+    # от самого старого прогона выборки (нижняя граница, exact=False):
+    # алерт не имеет права утверждать точное число часов, которого не измерял.
+    runs = EVENT_RUNS_MORNING
+    state, anchor, exact = pg.decide_independent_pulse(runs, utc(2026, 9, 7, 9, 0, 0))
+    assert state == "stale" and exact is False
+    assert anchor.isoformat() == "2026-09-07T04:26:32+00:00"
+
+
+def test_independent_pulse_alert_text_names_consequence_not_internal_state():
+    text = pg.independent_pulse_alert_text(248.25, exact=True)
+    assert "4.1 ч" in text
+    assert "конвейер держится только на событийном канале" in text
+    assert "встанет, как только прекратится активность PR" in text
+    assert "pulse_healthy" not in text  # алерт не гадает внутренним именем поля
+
+
+def test_independent_pulse_alert_text_marks_lower_bound_when_inexact():
+    text = pg.independent_pulse_alert_text(248.25, exact=False)
+    assert "как минимум" in text
+
+
+def _fake_gh_for_morning_gap(extra_comments=None):
+    return FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": EVENT_RUNS_MORNING + [INDEPENDENT_RUN_MORNING]},
+        "issues/120/comments": extra_comments or [],
+    })
+
+
+def test_independent_pulse_check_quiet_when_independent_tick_recent(monkeypatch):
+    # direction (a): независимый тик недавний — сигнала нет вовсе.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": [EVENT_RUNS_MORNING[4], INDEPENDENT_RUN_MORNING]},
+        "issues/120/comments": [],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)  # закрытие эпизода (нет открытого — не пишет)
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 4, 55, 0))
+    assert any("в норме" in line for line in lines)
+
+
+def test_independent_pulse_check_escalates_on_real_incident_and_names_hours(monkeypatch):
+    # direction (b): независимый канал молчал 4+ часа, событийный жив —
+    # сигнал уходит, текст называет факт числом часов.
+    fake = _fake_gh_for_morning_gap()
+    monkeypatch.setattr(pg, "gh", fake)
+    sent, posted = [], []
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+
+    assert lines and lines[0].startswith("🚨")
+    assert len(sent) == 1 and len(posted) == 1
+    assert pg.DO_PULSE_MARKER in sent[0] and "4.1 ч" in sent[0]
+    assert "встанет, как только прекратится активность PR" in sent[0]
+
+
+def test_independent_pulse_check_dedups_same_episode(monkeypatch):
+    # direction (c): маркер уже стоит для этого эпизода — повторный сигнал
+    # не плодится (тот же приём, что у event_wake/heartbeat episode_reopened).
+    fake = _fake_gh_for_morning_gap(extra_comments=[
+        {"created_at": "2026-09-07T08:55:00Z",
+         "body": f"🚨 edge-harness: {pg.DO_PULSE_MARKER}\nранее"}])
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать повторно"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать повторно"))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+    assert lines and "эпизод уже оповещён" in lines[0]
+
+
+def test_independent_pulse_check_closes_episode_when_ticks_resume(monkeypatch):
+    # direction (d): DO-дисптачи возобновились (реальный run 20:23:40Z того
+    # же дня) — эпизод закрывается сам, без внешнего вмешательства.
+    resumed_run = run("success", "2026-09-07T20:23:40Z", 200, actor="mytab0r")
+    # Событийный канал обязан быть подтверждён свежим и на этот якорь тоже
+    # (иначе not_applicable) — реальный тик github-actions[bot] того же вечера.
+    evening_event_run = run("success", "2026-09-07T19:48:04Z", 199, actor="github-actions[bot]")
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": EVENT_RUNS_MORNING + [resumed_run, evening_event_run]},
+        "issues/120/comments": [
+            {"created_at": "2026-09-07T09:00:00Z",
+             "body": f"🚨 edge-harness: {pg.DO_PULSE_MARKER}\nстарый эпизод"}],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted = []
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: True)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 20, 30, 0))
+
+    assert any("в норме" in line for line in lines)
+    assert len(posted) == 1 and pg.DO_PULSE_RESUMED_MARKER in posted[0]
+
+
+def test_independent_pulse_check_no_calls_beyond_recent_runs_when_not_applicable(monkeypatch):
+    # Холостой ход (событийный канал сам не подтверждён свежим) — ровно один
+    # вызов gh (recent_runs), ни маркеров, ни Telegram, ни комментария.
+    fake = FakeGh({
+        "workflows/orchestra.yml/runs?per_page=100&event=workflow_dispatch": {
+            "workflow_runs": [run("success", "2026-09-05T10:00:00Z", 1, actor="github-actions[bot]")]},
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
+    lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
+    assert lines == []
+    assert len(fake.calls) == 1
+
+
 # ── Полуоткрытое состояние (#205): проводка conveyor_gate ─────────────────────────
 
 
@@ -1113,6 +1331,10 @@ FAILURE_WATCH_QUIET_ROUTES = {
     f"workflows/{wf}/runs?status=completed": {"workflow_runs": []}
     for wf in pg.WATCHED_WORKFLOWS
 }
+# Счётчик суточного потолка (FAILURE_WATCH_DAILY_CAP) — по умолчанию пусто
+# (потолок никогда не исчерпан), тесты, проверяющие сам потолок, переопределяют
+# этот маршрут явно.
+FAILURE_WATCH_QUIET_ROUTES["issues?state=all&labels=ci-failure"] = []
 
 
 def _stdout_with_error(line: str):
@@ -1207,6 +1429,63 @@ def test_last_error_log_line_passes_allow_escape_sequences():
         "last_error_log_line обязан звать gh api с --allow-escape-sequences")
 
 
+def test_last_error_log_line_ignores_post_job_cleanup_teardown(monkeypatch):
+    # Находка #610 — фикстура дословно повторяет реальный лог job'а orchestra
+    # (run 34069761104): checkout печатает секцию "Post job cleanup." (чистка
+    # ssh/http/credentials config) ПОСЛЕ настоящего последнего вывода job'а.
+    # "Removing credentials config '<UUID>.config'" содержит буквы и цифры и
+    # раньше проходила все фильтры как «факт» — реальный последний вывод
+    # («прогон окрашен красным») терялся за teardown-секцией.
+    log = (
+        "2026-09-07T00:27:52.8096896Z ### Детектор простоя (#201)\n"
+        "2026-09-07T00:27:52.8097925Z 🚨 потолок автозаведённых задач в сутки исчерпан "
+        "(5/5) — отпечаток gate:pipeline-paused НЕ заведён, нужен человек\n"
+        "2026-09-07T00:27:52.8101423Z 🚨 прогон окрашен красным (Telegram: доставлен; "
+        "след в #120: оставлен)\n"
+        "2026-09-07T00:27:52.8187273Z ##[error]Process completed with exit code 1.\n"
+        "2026-09-07T00:27:52.8369619Z Post job cleanup.\n"
+        "2026-09-07T00:27:52.9162261Z Temporarily overriding HOME='/home/runner/work/_temp/"
+        "cfa9d952-f45c-49c0-9dae-0a4c5348684d' before making global git config changes\n"
+        "2026-09-07T00:27:53.0000000Z Removing credentials config "
+        "'/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'\n"
+        "2026-09-07T00:27:53.0100000Z Cleaning up orphan processes\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "прогон окрашен красным" in line
+    assert "credentials" not in line and "Post job cleanup" not in line
+
+
+def test_last_error_log_line_two_runs_same_cause_give_same_fingerprint_after_fix(monkeypatch):
+    # Мутационная проверка класса #610: два прогона с ОДНОЙ и той же причиной,
+    # но РАЗНЫМ UUID teardown-секции, обязаны дать ОДИН и тот же fingerprint —
+    # до фикса last_error_log_line подхватывал разный "Removing credentials
+    # config '<UUID>.config'" на каждый прогон и давал разные fingerprint при
+    # одинаковом заголовке issue (живой случай #578/#580/#589/#592/#598).
+    def log_with_uuid(uuid: str) -> str:
+        return (
+            "2026-09-06T21:40:24.4843425Z 🚨 #120: архив сессии не удался "
+            "(возможность сломана): HTTP Error 500: Internal Server Error\n"
+            "2026-09-06T21:40:24.4937977Z ##[error]Process completed with exit code 1.\n"
+            "2026-09-06T21:40:24.5134867Z Post job cleanup.\n"
+            f"2026-09-06T21:40:24.7336136Z Removing credentials config '/home/runner/work/_temp/git-credentials-{uuid}.config'\n"
+            "2026-09-06T21:40:24.7482979Z Cleaning up orphan processes\n"
+        )
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log_with_uuid("8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216"))))
+    line1 = pg.last_error_log_line("mytab0r/edge-harness", 1)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log_with_uuid("f42e2338-f7cb-4e6f-8022-328e66ce91b0"))))
+    line2 = pg.last_error_log_line("mytab0r/edge-harness", 2)
+    assert line1 == line2
+    fp1 = pg.failure_fingerprint("orchestra.yml", "orchestra", line1)
+    fp2 = pg.failure_fingerprint("orchestra.yml", "orchestra", line2)
+    assert fp1 == fp2
+
+
 def test_last_error_log_line_strips_ansi_escapes_from_fact(monkeypatch):
     # Факт уходит в тело задачи и след #120/Telegram — управляющие коды сырого
     # лога не должны попадать в текст сигнала.
@@ -1274,6 +1553,371 @@ def test_failure_watch_defect_files_task_once_then_dedupes(monkeypatch):
     assert actions2 == []
     assert any("не дублируем" in line for line in observations2)
     assert len(created) == 1  # вторая задача не заведена
+
+
+def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(monkeypatch):
+    # Мутационная проверка класса #610 (живой случай #578/#580/#589/#592/#598):
+    # заголовок failure_watch константный по (workflow, job_name) — «CI:
+    # orchestra.yml падает — orchestra» для ЛЮБОГО факта этого job'а. Открытая
+    # issue того же заголовка, но с ДРУГИМ fingerprint в теле (например,
+    # прошлый прогон поймал другой вариант того же боилерплейта) обязана
+    # остановить создание ВТОРОЙ issue — комментарий на существующую, не дубль.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34063041667, event="schedule"),
+    ]}
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 1, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    # Реальные UUID двух живых дублей (#578/#589) — сегменты короче 6 hex
+    # символов (например «bd3f», «4668») переживают нормализацию, поэтому эти
+    # два факта дают РАЗНЫЙ fingerprint при ОДИНАКОВОМ заголовке (та же
+    # причина, что и у живого случая — регресс без обрезки #578/#589 остался бы
+    # зелёным по этому тесту, если бы совпал и fingerprint).
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    routes["issues/578/comments"] = []  # маркера этого класса на #578 ещё нет
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")))
+    new_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    assert new_fp != existing_fp  # предпосылка теста: РАЗНЫЙ fingerprint, ОДИНАКОВЫЙ заголовок
+    created = []
+    commented = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert created == []  # НЕ заведена вторая issue с тем же заголовком
+    assert actions == []  # это не «новая задача», см. #456
+    assert len(commented) == 1 and commented[0][0] == 578
+    assert any("тем же заголовком" in line and "#578" in line for line in observations)
+
+
+def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypatch):
+    # Мутационная проверка (находка ревью PR #612, живой прогон 34063041667 —
+    # реальные id job'а/шага и реальный хвост лога сняты `gh api` с прод): окно
+    # свежести FAILURE_WATCH_WINDOW_MINUTES=30 при пульсе раз в 15 мин держит
+    # ОДИН И ТОТ ЖЕ красный прогон «свежим» до трёх пульсов подряд. Без дедупа
+    # по комментариям (issue_marker_times — приём stall_detector.py, #248)
+    # каждый такой пульс писал бы БАЙТ-В-БАЙТ дубль на #578: тело issue не
+    # меняется (ci_failure_fingerprints парсит только тела), значит только
+    # чтение уже оставленных КОММЕНТАРИЕВ этой issue отличает «уже сигналили»
+    # от «новый класс причины».
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-09-06T22:08:03Z", 34063041667, event="schedule"),
+    ]}
+    # Реальные id job'а и шага прогона 34063041667 (`gh api
+    # repos/mytab0r/edge-harness/actions/runs/34063041667/jobs`).
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 101566876955, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    # Реальный хвост лога job'а 101566876955 (`gh api .../jobs/101566876955/logs`,
+    # снят 2026-09-08): «Removing credentials config '<UUID>.config'» —
+    # ровно боилерплейт teardown checkout, живая причина класса #578.
+    same_run_error = (
+        "Removing credentials config '/home/runner/work/_temp/"
+        "git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(same_run_error)))
+    same_run_fp = pg.failure_fingerprint("orchestra.yml", "orchestra", same_run_error)
+    assert same_run_fp != existing_fp  # предпосылка: класс новый для тела #578
+
+    fake = FakeGh(routes)
+    posted_comments: list[dict] = []  # эмулирует РЕАЛЬНУЮ issue #578 — комментарии копятся между пульсами
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues/578/comments":
+            body = args[-1].split("=", 1)[1]
+            posted_comments.append({"created_at": "2026-09-06T22:10:00Z", "body": body})
+            return None
+        joined = " ".join(args)
+        if "issues/578/comments" in joined and args[:2] != ("-X", "POST"):
+            return list(posted_comments)
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    # (б) Пульс 1: комментарий пишется (маркера этого класса на #578 ещё нет).
+    observations1, actions1 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions1 == []
+    assert len(posted_comments) == 1
+    assert any("уже открыта (#578)" in line for line in observations1)
+    # (г) текст не врёт: не называет прогон новым (он тот же, что и всегда был).
+    assert "Новый прогон" not in posted_comments[0]["body"]
+
+    # (а) Пульс 2 — ТОТ ЖЕ прогон и факт (следующий тик оркестратора, тот же
+    # прогон всё ещё «свежий» в окне FAILURE_WATCH_WINDOW_MINUTES): комментарий
+    # НЕ дублируется.
+    observations2, actions2 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions2 == []
+    assert len(posted_comments) == 1  # не выросло — снят фикс, здесь стало бы 2
+    assert any("уже прокомментирована" in line and "молчу" in line for line in observations2)
+
+    # (в) Пульс 3 — ДРУГОЙ прогон/причина (другой отпечаток факта под тем же
+    # заголовком): дедуп не склеивает разные причины — комментарий пишется.
+    different_run_error = "HTTP Error 500: Internal Server Error (archive session, #119/#575)"
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(different_run_error)))
+    different_fp = pg.failure_fingerprint("orchestra.yml", "orchestra", different_run_error)
+    assert different_fp not in (existing_fp, same_run_fp)
+    observations3, actions3 = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert actions3 == []
+    assert len(posted_comments) == 2  # новый класс — второй, НЕ дублирующий комментарий
+    assert any("уже открыта (#578)" in line for line in observations3)
+    assert "Новый прогон" not in posted_comments[1]["body"]
+
+
+# ── Суточный потолок автозаведения ci-failure (FAILURE_WATCH_DAILY_CAP) ──────────
+
+
+def _ci_failure_issue(number: int, created_at: str) -> dict:
+    return {
+        "number": number,
+        "title": f"CI: worker.yml падает — job-{number}",
+        "created_at": created_at,
+        "body": f"...<!-- failure-fingerprint: whatever-{number} -->\n",
+    }
+
+
+def test_failure_watch_daily_cap_blocks_new_class_signals_once_and_lists_skipped(monkeypatch):
+    # Мутационная проверка потолка: квота дня уже сожжена (FAILURE_WATCH_DAILY_CAP
+    # задач за последние 24ч) — новый, ещё НЕ заведённый класс НЕ становится
+    # задачей, а видимый сигнал (комментарий #120 + Telegram) уходит РОВНО один
+    # раз, при этом отсечённый класс всё равно перечислен (тихий след-комментарий).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []  # класса ещё нет в пуле
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")  # < 24ч до NOW
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/120/comments"] = []  # ни один маркер сегодня ещё не стоит
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    posted = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: True)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+
+    assert created == []  # потолок исчерпан — новая задача НЕ заведена
+    fp = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    assert any("потолок" in line and "исчерпан" in line and fp in line for line in observations)
+    # Ровно один видимый сигнал (эскалация #120+Telegram) — не второй канал,
+    # тот же escalate(), что и остальные тревоги этого модуля.
+    escalation_posts = [text for _, text in posted if pg.FAILURE_WATCH_CAP_MARKER in text]
+    assert len(escalation_posts) == 1
+    assert NOW.date().isoformat() in escalation_posts[0]
+    assert fp in escalation_posts[0]  # отсечённый класс перечислен в самом сигнале
+    assert any("эскалация потолка" in line for line in actions)
+    # Плюс тихий след-комментарий с отпечатком отсечённого класса — не теряется
+    # (отличаем от эскалации: та тоже упоминает префикс маркера в тексте «что
+    # дальше», поэтому фильтруем именно комментарии БЕЗ FAILURE_WATCH_CAP_MARKER).
+    skip_posts = [
+        text for _, text in posted
+        if pg.FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX in text and pg.FAILURE_WATCH_CAP_MARKER not in text
+    ]
+    assert len(skip_posts) == 1 and fp in skip_posts[0]
+
+
+def test_failure_watch_daily_cap_escalation_deduped_once_per_day(monkeypatch):
+    # Второй пульс того же дня, потолок всё ещё исчерпан, класс тот же самый:
+    # ни повторной эскалации (#120+Telegram), ни повторного тихого следа —
+    # маркеры обоих уже стоят. Наблюдение о потолке при этом печатается каждый
+    # пульс (видно в GITHUB_STEP_SUMMARY), это не то же самое, что тревога.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    fp = pg.failure_fingerprint(
+        "worker.yml", "task",
+        "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")
+    cap_marker = f"{pg.FAILURE_WATCH_CAP_MARKER} {NOW.date().isoformat()}]"
+    skip_marker = f"{pg.FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX} {NOW.date().isoformat()} {fp}]"
+    routes["issues/120/comments"] = [
+        {"created_at": "2026-08-31T11:00:00Z", "body": f"🚨 {cap_marker}\n..."},
+        {"created_at": "2026-08-31T11:00:01Z", "body": f"{skip_marker}\n..."},
+    ]
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("маркер уже стоит — повтор не пишем"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("эскалация уже была сегодня"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+
+    assert any("потолок" in line and "исчерпан" in line for line in observations)
+    assert not any("эскалация потолка" in line for line in actions)
+
+
+def test_failure_watch_daily_cap_never_raises(monkeypatch):
+    # Прогон обязан остаться зелёным: исчерпание потолка — сигнал «нужен
+    # человек», не отказ (см. докстринг FAILURE_WATCH_CAP_MARKER). Отправка в
+    # Telegram/комментарий может упасть (сеть) — failure_watch не поднимает
+    # исключение наверх ни при одном исходе.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34027035455),
+    ]}
+    routes["runs/34027035455/jobs"] = {"jobs": [
+        {"id": 999, "name": "task", "conclusion": "failure", "steps": [
+            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(100 + i, "2026-08-31T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/120/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)  # не бросает исключение
+    assert any("потолок" in line and "исчерпан" in line for line in observations)
+
+
+def test_failure_watch_title_dedup_not_blocked_by_exhausted_daily_cap(monkeypatch):
+    # Мутационная проверка порядка проверок при ребейзе поверх #610/PR #612
+    # (комментарий по маркеру среди комментариев issue, не создание задачи):
+    # суточный потолок ci-failure УЖЕ исчерпан (5/5 за последние 24ч, реальная
+    # форма ответа gh api — те же поля, что и в остальных тестах потолка),
+    # но у нового класса причины УЖЕ есть открытая issue с тем же
+    # детерминированным заголовком (workflow+job_name, #578 — живой случай
+    # #578/#580/#589/#592/#598). Комментарий на существующую issue НЕ заводит
+    # задачу — сжигать суточную квоту тут нечего, а значит потолок не вправе
+    # его блокировать. До этой правки (потолок проверялся ДО дедупа по
+    # заголовку) один и тот же класс тут получал бы ложное «потолок исчерпан»
+    # вместо тихого комментария на #578, хотя пул при этом не растёт вовсе.
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-09-06T22:08:03Z", 34063041667, event="schedule"),
+    ]}
+    # Реальные id job'а и шага прогона 34063041667 (`gh api
+    # repos/mytab0r/edge-harness/actions/runs/34063041667/jobs`), как и в
+    # test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment.
+    routes["runs/34063041667/jobs"] = {"jobs": [
+        {"id": 101566876955, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    existing_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-8a8eb9a3-bd3f-4668-8fdb-b30a4b91f216.config'")
+    routes["issues?state=open&labels=ci-failure"] = [
+        {"number": 578, "title": "CI: orchestra.yml падает — orchestra",
+         "html_url": "https://github.com/mytab0r/edge-harness/issues/578",
+         "body": f"...<!-- failure-fingerprint: {existing_fp} -->\n"},
+    ]
+    # Потолок дня уже сожжён (state=all, реальная форма ответа gh api — та же,
+    # что и у остальных тестов потолка выше).
+    routes["issues?state=all&labels=ci-failure"] = [
+        _ci_failure_issue(200 + i, "2026-09-06T06:00:00Z")
+        for i in range(pg.FAILURE_WATCH_DAILY_CAP)
+    ]
+    routes["issues/578/comments"] = []  # маркера этого класса на #578 ещё нет
+    # Реальный хвост лога job'а 101566876955 (`gh api .../jobs/101566876955/logs`,
+    # снят 2026-09-08): «Removing credentials config '<UUID>.config'» — тот же
+    # боилерплейт teardown, что и в соседних тестах, другой UUID → новый класс.
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")))
+    new_fp = pg.failure_fingerprint(
+        "orchestra.yml", "orchestra",
+        "Removing credentials config '/home/runner/work/_temp/git-credentials-f42e2338-f7cb-4e6f-8022-328e66ce91b0.config'")
+    assert new_fp != existing_fp  # предпосылка: РАЗНЫЙ fingerprint, ОДИНАКОВЫЙ заголовок
+
+    fake = FakeGh(routes)
+    created = []
+    commented = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: commented.append((n, text)))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: pytest.fail("потолок не исчерпан для этого класса — эскалации быть не должно"))
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert created == []  # новая issue не заведена (ни потолком, ни дублем)
+    assert len(commented) == 1 and commented[0][0] == 578  # комментарий на существующую issue
+    assert not any("исчерпан" in line for line in observations)  # потолок тут не при чём
+    assert any("тем же заголовком" in line and "#578" in line for line in observations)
 
 
 def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):

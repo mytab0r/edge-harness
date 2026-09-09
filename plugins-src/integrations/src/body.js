@@ -4,7 +4,9 @@
 // и константу INTEGRATIONS (вшитый dsh-edge/integrations.json ЦЕЛИКОМ —
 // id, title, summary, tools, имена секретов с описаниями, wired, docs)
 // дописывает build.mjs. Свободные переменные тела: require (параметр
-// фабрики), INTEGRATIONS, module/exports (обёртка).
+// фабрики), INTEGRATIONS, module/exports (обёртка), describeResponseError
+// (общий разбор тела ответа при !response.ok — #575, инлайнится сборкой из
+// plugins-src/shared/describe-response-error.js тем же приёмом, что INTEGRATIONS).
 //
 // Прецедент и приёмка формы — plugin-manager (#102): тот же списочный слот
 // settings.section, те же seed-модули (react, ui-primitives). ctx.locale
@@ -44,7 +46,7 @@ async function fetchStatusPage(id, after) {
     credentials: "include",
     headers: { accept: "application/json" },
   });
-  if (!response.ok) throw new Error("HTTP " + response.status);
+  if (!response.ok) throw new Error(await describeResponseError(response));
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("json")) {
     throw new Error("ответ не JSON (" + (contentType || "без content-type") + ") — это не журнал");

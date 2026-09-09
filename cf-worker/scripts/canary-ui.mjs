@@ -115,6 +115,20 @@ try {
   const badRequests = apiRequests.filter((url) => url.includes("/api/api/"));
   if (badRequests.length) fails.push(`обращения к несуществующим маршрутам: ${badRequests.join(", ")}`);
 
+  // 7. Готовность хранилища (#575): живой SQL-раундтрип DO SQLite, не только
+  // отрисовка страницы браузером выше. UI может «висеть живым» (шелл грузится,
+  // сокет коннектится), пока журнал/API уже 500'ят на исчерпании суточной
+  // квоты — этот запрос ловит именно тот класс, прямым HTTP, не через страницу.
+  try {
+    const readyRes = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!readyRes.ok) {
+      const body = await readyRes.text();
+      fails.push(`/api/ready вернул ${readyRes.status}: ${body.slice(0, 300)}`);
+    }
+  } catch (error) {
+    fails.push(`/api/ready недоступен: ${error instanceof Error ? error.message : error}`);
+  }
+
   if (fails.length) {
     for (const message of fails) console.error(`  ✗ ${message}`);
     console.error("canary-ui: FAIL");

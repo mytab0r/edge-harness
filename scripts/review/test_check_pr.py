@@ -46,7 +46,7 @@ rl_spec.loader.exec_module(rl)  # type: ignore[union-attr]
 def _run(*extra_args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--pr", "138", *extra_args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={"PATH": __import__("os").environ.get("PATH", "")},  # без GITHUB_REPOSITORY
     )
 
@@ -615,3 +615,83 @@ def test_revert_guard_wired_into_main_before_verdict():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "revert_guard(\n        diff_sections(diff), files, current, pull.get(\"body\"))" in source
     assert "findings.extend(revert_findings)" in source
+
+
+# ── Идемпотентность вердикт-метки и находок-комментария (#203) ───────────────
+#
+# Факт 2 #203: на PR #162 зафиксировано 11 циклов unlabeled+labeled за
+# 01.09–02.09 при неизменном вердикте — каждый цикл к тому же триггерит
+# orchestra.yml (on: pull_request: [labeled]). Проверяются записанные
+# вызовы run_gh (имя операции + путь), не «шаг success».
+
+def _label_calls(run_gh_calls: list[tuple]) -> list[tuple]:
+    return [c for c in run_gh_calls if any("/labels" in part for part in c)]
+
+
+def _comment_calls(run_gh_calls: list[tuple]) -> list[tuple]:
+    return [c for c in run_gh_calls if any(part.startswith("repos/") and "/comments" in part
+                                           for part in c)]
+
+
+def test_check_pr_unchanged_verdict_touches_no_labels(monkeypatch, capsys):
+    """Факт 2 #203, критерий приёмки 2: вердикт не изменился — ни одного
+    изменяющего вызова с метками (никаких unlabeled/labeled в таймлайне).
+
+    Мутация: вернуть в main() безусловные DELETE старых вердиктов + POST —
+    тест краснеет (появляется пара DELETE+POST того же значения)."""
+    pull = {"head": {"sha": "same-sha"}, "labels": [{"name": rl.REVIEW_OK}]}
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, [])
+
+    assert rc == 0
+    assert _label_calls(run_gh_calls) == [], run_gh_calls
+
+
+def test_check_pr_verdict_change_swaps_label(monkeypatch, capsys):
+    """Обратная проверка (критерий 4 #203): вердикт сменился (появился
+    конфликт-маркер) — review:ok снята, review:changes-requested поставлена:
+    идемпотентность не должна превратиться в молчание."""
+    pull = {"head": {"sha": "next-sha"}, "labels": [{"name": rl.REVIEW_OK}]}
+    conflict_marker_line = "+" + ("<" * 7) + " HEAD\n"
+    rc, run_gh_calls = _run_check_pr_main(
+        monkeypatch, capsys, conflict_marker_line, pull, [])
+
+    assert rc == 1
+    label_calls = _label_calls(run_gh_calls)
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert joined.count("-X DELETE") == 1 and rl.REVIEW_OK in joined, joined
+    assert f"labels[]={rl.REVIEW_CHANGES}" in joined, joined
+
+
+def test_check_pr_fresh_pr_posts_verdict_once(monkeypatch, capsys):
+    """Первое ревью: вердикт-метки не было — ровно один POST, снимать
+    нечего (условие «нет метки» не должно ломать публикацию)."""
+    pull = {"head": {"sha": "fresh-sha"}, "labels": []}
+    rc, run_gh_calls = _run_check_pr_main(monkeypatch, capsys, "", pull, [])
+
+    assert rc == 0
+    label_calls = _label_calls(run_gh_calls)
+    assert len(label_calls) == 1, label_calls
+    joined = " ".join(label_calls[0])
+    assert "-X POST" in joined and f"labels[]={rl.REVIEW_OK}" in joined
+
+
+def test_check_pr_same_findings_post_comment_only_once(monkeypatch, capsys):
+    """Тот же класс, что Факт 1 #203, во втором канале гейта 1: повторный
+    прогон с теми же находками не публикует второй одинаковый комментарий.
+    Доказательство на двух реальных прогонах main(): тело из первого прогона
+    подставляется второму как существующий доверенный комментарий."""
+    conflict_marker_line = "+" + ("<" * 7) + " HEAD\n"
+    pull = {"head": {"sha": "s1"}, "labels": []}
+
+    rc1, calls1 = _run_check_pr_main(monkeypatch, capsys, conflict_marker_line, pull, [])
+    assert rc1 == 1
+    posts = [c for c in _comment_calls(calls1) if "POST" in c]
+    assert len(posts) == 1, calls1
+    body = posts[0][-1][len("body="):]
+
+    bot_comment = {"user": {"login": "github-actions[bot]", "type": "Bot"}, "body": body}
+    pull2 = {"head": {"sha": "s1"}, "labels": [{"name": rl.REVIEW_CHANGES}]}
+    rc2, calls2 = _run_check_pr_main(
+        monkeypatch, capsys, conflict_marker_line, pull2, [], comments=[bot_comment])
+    assert rc2 == 1
+    assert _comment_calls(calls2) == [], calls2

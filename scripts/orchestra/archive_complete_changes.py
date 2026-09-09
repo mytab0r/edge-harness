@@ -22,6 +22,17 @@ main — прямой пуш в main отклоняется защитой, AGEN
 Идемпотентно: второй прогон на уже причёсанной ветке не находит нарушений
 (check_unarchived_complete_changes) и ничего не коммитит.
 
+Умышленно вызывает check_unarchived_complete_changes ТОЛЬКО с changes_dir
+(быстрый путь «tasks.md полностью отмечен») — второй, независимый путь
+завершённости (proposal.md + задача completed + нет открытого PR на путь,
+docs/agents/OPENSPEC-PROTOCOL.md) сюда не передаётся нарочно. Причина: на
+живом репозитории 2026-09-07 второй путь нашёл backlog в 23 каталога —
+подключить его здесь означало бы, что ближайший же pull_request-прогон
+archive-fixup молча закоммитит и запушит `git mv` по четверти всех change
+без единого ревью. Массовая архивация — решение, требующее просмотра по
+PR (план — OPENSPEC-PROTOCOL.md, раздел про backlog), не побочный эффект
+чужого PR, который просто задел этот файл.
+
 Инструментарий (этот файл, repo_invariants.py) исполняется из main-дерева
 job'а — та же граблина, что #476 (`scripts/worker/task.sh`: доводка PR
 исполняет scripts/* из main, а не из ветки PR): ветка PR, созданная ДО
@@ -37,6 +48,14 @@ directory» (живой факт: прогон repo-ci.yml 34036104522 сраз�
 Запуск (из целевого чекаута, cwd = дерево, которое нужно исправить):
   cd <дерево ветки PR> && python <main>/scripts/orchestra/archive_complete_changes.py
 """
+
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
 
 import importlib.util
 import re
@@ -121,7 +140,7 @@ def configure_git_identity(repo_root: Path) -> None:
     единственный источник identity, второй копией здесь не заводим."""
     who = subprocess.run(
         ["gh", "api", "user", "--jq", "[.login, (.id|tostring)] | @tsv"],
-        cwd=repo_root, check=True, capture_output=True, text=True,
+        cwd=repo_root, check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout.strip()
     login, user_id = who.split("\t")
     subprocess.run(["git", "config", "user.name", login], cwd=repo_root, check=True)
@@ -152,7 +171,7 @@ def main() -> int:
     subprocess.run(["git", "add", "-A"], cwd=REPO_ROOT, check=True)
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=REPO_ROOT,
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout
     if not status.strip():
         print("archive_complete_changes: git mv не дал диффа (уже применено) — no-op")

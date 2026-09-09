@@ -347,7 +347,7 @@ def bumped_pin_text(pin: dict, tag: dict, issue_number: int) -> str:
 
 
 def _run_git(args: list[str], *, cwd: Path) -> None:
-    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} упал: {result.stderr.strip()}")
 
@@ -427,7 +427,7 @@ def attempt_auto_bump(repo: str, decision: dict, tags: list[dict], *, pin_path: 
         result = subprocess.run(
             [str(pr_create), "--repo", repo, "--base", "main", "--head", branch,
              "--title", f"{AUTO_BUMP_TITLE_PREFIX}{decision['latest_tag']}", "--body", pr_body],
-            capture_output=True, text=True, env={**os.environ, "GH_TOKEN": pat, "NO_COLOR": "1"},
+            capture_output=True, text=True, encoding="utf-8", env={**os.environ, "GH_TOKEN": pat, "NO_COLOR": "1"},
         )
         if result.returncode != 0:
             raise RuntimeError(f"scripts/git/pr-create упал: {result.stderr.strip()}")

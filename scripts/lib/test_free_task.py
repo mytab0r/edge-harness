@@ -34,6 +34,7 @@ test_declared_pr_ignores_prose_mention_real_pr_181 — PR #181 начинает
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -396,10 +397,11 @@ def test_task_with_open_pr_and_assignee_is_not_selected():
 # ── CLI: контракт для task.sh (tsv на stdout, коды 0/1/2) ──────────────────────────
 
 
-def run_cli(args, cwd=None):
+def run_cli(args, cwd=None, env=None):
+    run_env = {**os.environ, **env} if env else None
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        capture_output=True, text=True, cwd=cwd,
+        capture_output=True, text=True, encoding="utf-8", cwd=cwd, env=run_env,
     )
 
 
@@ -509,5 +511,84 @@ def test_cli_declared_pr_broken_prs_file_is_rc2_not_rc1(tmp_path):
 def test_cli_oldest_free_missing_file_is_rc2(tmp_path):
     missing_file = tmp_path / "does-not-exist.json"
     result = run_cli(["oldest-free", str(missing_file)])
+    assert result.returncode == 2
+
+
+# ── meta-label / priority-top: верх группы приоритета для issue-create (#695) ──
+
+
+def test_priority_top_reuses_issue_priority_key_ordering():
+    # Функция — не второй экземпляр сортировки: доказано мутацией — подмени
+    # ключ на sorted(issues, key=lambda i: i["number"]) внутри priority_top и
+    # этот тест покраснеет (200 обгонит 100 по номеру, а не по blocking_open).
+    blocks_many = issue(200, title="блокирует много", labels=["area:process"], blocking_open=5)
+    blocks_none = issue(100, title="блокирует ноль", labels=["area:process"], blocking_open=0)
+    result = free_task.priority_top([blocks_none, blocks_many])
+    assert [i["number"] for i in result] == [200, 100]
+
+
+def test_priority_top_respects_limit():
+    issues = [issue(n, labels=["area:process"]) for n in range(1, 6)]
+    assert [i["number"] for i in free_task.priority_top(issues, top_n=2)] == [1, 2]
+
+
+def test_cli_meta_label_prints_the_one_true_constant():
+    # bash-обёртка (scripts/gh/issue-create) читает литерал ОТСЮДА, не
+    # держит вторую копию строки "area:process".
+    result = run_cli(["meta-label"])
+    assert result.returncode == 0
+    assert result.stdout.strip() == free_task.META_LABEL == "area:process"
+
+
+def test_cli_priority_top_uses_fixture_and_orders_by_priority_key(tmp_path):
+    # PRIORITY_TOP_FIXTURE — тот же приём, что DUPLICATE_GUARD_FIXTURE в
+    # duplicate_guard.py (см. docstring priority-top в free_task.py): CLI
+    # зовётся ИЗ bash отдельным процессом, monkeypatch недоступен физически.
+    fixture = tmp_path / "pool.json"
+    fixture.write_text(json.dumps([
+        issue(194, title="Сторож пропускной способности", labels=["area:process"], blocking_open=1),
+        issue(226, title="Воркер знает два исхода", labels=["area:process"], blocking_open=3),
+    ]), encoding="utf-8")
+    result = run_cli(["priority-top", "owner/repo"], env={"PRIORITY_TOP_FIXTURE": str(fixture)})
+    assert result.returncode == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines == [
+        "226\tВоркер знает два исхода",
+        "194\tСторож пропускной способности",
+    ]
+
+
+def test_cli_priority_top_respects_n_argument(tmp_path):
+    fixture = tmp_path / "pool.json"
+    fixture.write_text(json.dumps([
+        issue(n, title=f"т{n}", labels=["area:process"]) for n in (10, 20, 30)
+    ]), encoding="utf-8")
+    result = run_cli(["priority-top", "owner/repo", "2"], env={"PRIORITY_TOP_FIXTURE": str(fixture)})
+    assert result.returncode == 0
+    assert len(result.stdout.strip().splitlines()) == 2
+
+
+def test_cli_priority_top_empty_pool_prints_nothing(tmp_path):
+    fixture = tmp_path / "empty.json"
+    fixture.write_text("[]", encoding="utf-8")
+    result = run_cli(["priority-top", "owner/repo"], env={"PRIORITY_TOP_FIXTURE": str(fixture)})
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_cli_priority_top_network_failure_warns_but_does_not_block(tmp_path):
+    # Без сети: task_deps.fetch_pool падает на _split_repo (repo без "/")
+    # ДО какого-либо вызова gh — детерминированно, без реальной сети.
+    # Информационная печать не гейт: rc 0, предупреждение в stderr, не в
+    # stdout (тот же контракт, что duplicate_guard.py check).
+    result = run_cli(["priority-top", "not-a-repo"])
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "free_task.py" in result.stderr
+    assert "не смог получить пул" in result.stderr
+
+
+def test_cli_priority_top_rejects_non_integer_n():
+    result = run_cli(["priority-top", "owner/repo", "не-число"])
     assert result.returncode == 2
     assert result.stdout == ""

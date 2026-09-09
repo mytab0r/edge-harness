@@ -14,6 +14,14 @@
 Среда: gh с правами issues:write (GH_TOKEN или gh auth login).
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import importlib.util
 import os
@@ -125,28 +133,20 @@ def wire_declared_dependency(
     обходом-сканером — дешевле (без второго периодического прохода пула
     по расписанию) и без риска устаревания.
 
-    Номер, которого нет в ТЕКУЩЕМ открытом пуле с меткой `task`
-    (уже закрыт, не задача, не существует, модель ошиблась) — НЕ линкуется,
-    печатается предупреждение: ложная связь опаснее отсутствующей (то же
-    правило, что для ручной миграции #371). Отсутствие строки вовсе (`None`
-    — старый формат комментария, до этой задачи) не роняет заведение
-    задачи — деградирует молча в лог, не в исключение: комментарий мог
-    быть создан до деплоя этого контракта."""
+    Сам цикл «пропустить номер вне открытого пула, иначе `add_dependency` +
+    лог» — `task_deps.wire_dependencies` (задача #529): то же место правды,
+    что использует авто-перенос структурного поля формы «Чем блокируется»,
+    не вторая копия здесь.
+
+    Отсутствие строки вовсе (`None` — старый формат комментария, до этой
+    задачи) не роняет заведение задачи — деградирует молча в лог, не в
+    исключение: комментарий мог быть создан до деплоя этого контракта."""
     numbers = ai_review.blocked_by_numbers(body)
     if numbers is None:
         print(f"    ! #{new_number}: нет строки «БЛОКИРУЕТСЯ: …» в теле "
               f"(старый формат комментария) — граф не тронут")
         return []
-    linked: list[int] = []
-    for n in numbers:
-        if n not in open_numbers:
-            print(f"    ! #{new_number}: «БЛОКИРУЕТСЯ: #{n}» — #{n} не открытая "
-              f"задача пула с меткой task — связь НЕ поставлена")
-            continue
-        task_deps.add_dependency(repo, blocked=new_number, blocking=n, gh_call=gh)
-        linked.append(n)
-        print(f"    -> #{new_number} заблокирована #{n} (нативный граф)")
-    return linked
+    return task_deps.wire_dependencies(repo, new_number, numbers, open_numbers, gh_call=gh)
 
 
 def current_repo() -> str:
@@ -156,7 +156,7 @@ def current_repo() -> str:
         return os.environ["GITHUB_REPOSITORY"]
     result = subprocess.run(
         ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+        capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
         raise RuntimeError(f"gh repo view: {result.stderr.strip()}")

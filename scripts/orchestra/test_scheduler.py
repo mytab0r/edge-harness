@@ -303,6 +303,17 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     # allowlist-типы с валидными turn/step/message.content — форма ниже снята
     # с dsh-edge/ingest-integration/check.mjs (реальный прод-контракт, не
     # наш пересказ).
+    #
+    # #794: message.id/role/source — тоже часть прод-контракта, не украшение.
+    # dsh-session::assertMessageEventShape (dsh-session/lib/index.js, пин
+    # 0.1.2-rc.1) не вызывается на записи вовсе — вызывается ТОЛЬКО на
+    # следующей холодной загрузке той же сессии (adoptStoredEvents) — и без
+    # этих полей валит её задним числом: «session event at seq N lacks an
+    # identified message» (без id) или «message has invalid source» (есть id,
+    # нет source) — оба текста воспроизведены дословно живым вызовом
+    # adoptSessionEvent из реального пакета при разборе #794, id один не
+    # спасает. Мутация: убери любое из полей ниже — этот тест обязан упасть
+    # раньше, чем сессия испортится в проде.
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
@@ -322,10 +333,31 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     assert isinstance(event["data"]["turn"], int) and event["data"]["turn"] >= 0
     assert isinstance(event["data"]["step"], int) and event["data"]["step"] >= 0
     message = event["data"]["message"]
+    assert isinstance(message["id"], str) and message["id"] != ""
     assert message["role"] == "assistant"
     assert isinstance(message["content"], list) and message["content"]
     assert message["content"][0]["type"] == "text"
     assert "PR #1 слит в main" in message["content"][0]["text"]
+    source = message["source"]
+    assert source["kind"] == "model"
+    assert isinstance(source["provider"], str) and source["provider"] != ""
+    assert isinstance(source["model"], str) and source["model"] != ""
+
+
+def test_append_session_notes_message_id_unique_per_note_in_one_call(monkeypatch):
+    # #794: два запуска main() за один пульс (after_merge/unhealthy_pulls/
+    # accept_merged_tasks) могут дописать заметку в одну и ту же сессию —
+    # одинаковый id второй заметки была бы новой миной того же класса.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    captured_events = []
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: captured_events.extend(events) or {"appended": len(events), "lastSeq": 0})
+    sch.append_session_notes([(480, "первая"), (480, "вторая")])
+    ids = [event["data"]["message"]["id"] for event in captured_events]
+    assert len(ids) == len(set(ids)), f"id заметок не уникальны: {ids}"
 
 
 def test_morde_ingest_posts_raw_events_body_and_surfaces_http_error(monkeypatch):
@@ -547,6 +579,7 @@ def test_unhealthy_pulls_calls_append_session_notes_with_empty_list_when_queue_e
 def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -582,6 +615,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     включая уже сделанное слияние — тот же приём, что у archive_hard_failure."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -626,6 +660,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
 def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     # дрейф пина (#134) здесь не предмет теста — гасим, как остальные механизмы
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -652,6 +687,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     ветка, независимая от archive_hard_failure."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -722,7 +758,7 @@ def label(name):
 
 
 def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", pr_body="",
-         ref=None, base_sha=None, author_login="mytab0r"):
+         ref=None, base_sha=None, author_login="mytab0r", created_at="2026-09-01T00:00:00Z"):
     head = {"sha": f"sha{number}"}
     if ref is not None:
         head["ref"] = ref
@@ -731,6 +767,10 @@ def pull(number, *, labels=(), draft=False, updated_at="2026-09-02T12:00:00Z", p
         "draft": draft,
         "labels": [label(n) for n in labels],
         "updated_at": updated_at,
+        # created_at — прод-форма (Pulls API отдаёт его всегда); используется
+        # dispatch_conflict_rework как честный фолбэк возраста конфликта,
+        # когда conflict_labeled_at не нашёл момент простановки метки (#588).
+        "created_at": created_at,
         "body": pr_body,
         "head": head,
         "user": {"login": author_login},
@@ -807,9 +847,9 @@ REPO = "mytab0r/edge-harness"
 
 @pytest.fixture(autouse=True)
 def _reset_update_branch_budget():
-    """Слот update_branch (#252, третий заход) — module-level и общий на
-    прогон планировщика; без явного сброса перед каждым тестом состояние
-    "слот уже занят" утекало бы из одного теста в следующий в том же
+    """Бюджет update_branch (#252 третий заход, счётчик вместо слота — #761)
+    — module-level и общий на прогон планировщика; без явного сброса перед
+    каждым тестом счётчик утекал бы из одного теста в следующий в том же
     процессе pytest."""
     sch.reset_update_branch_budget()
     yield
@@ -944,17 +984,18 @@ def test_mark_stale_unclaimed_no_second_traversal_uses_passed_pool(monkeypatch):
 # ── Поведение 1: готовый PR без вердикта — дёрнуть гейт самому ───────────────────
 
 
-def timeline_with_review_ok(when: str):
-    return [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": when},
-        {"event": "labeled", "label": {"name": "review:large"}, "created_at": when},
-    ]
+def gate1_status(when: str):
+    """Прод-форма commit status `harness/review` на текущем head PR (#345) —
+    якорь таймера #196 после находки ревью #424 (замена таймлайн-события
+    'labeled', замороженного идемпотентностью #203: пуш с тем же вердиктом
+    не выбрасывает 'labeled', но статус публикуется безусловно)."""
+    return [{"context": sch.review_labels.STATUS_REVIEW, "created_at": when}]
 
 
 def test_trigger_ai_review_dispatches_after_threshold_no_verdict(monkeypatch):
     p = pull(163, labels=["review:ok"])
     fake = FakeGh({
-        "issues/163/timeline": timeline_with_review_ok("2026-09-02T11:00:00Z"),
+        "commits/sha163/statuses": gate1_status("2026-09-02T11:00:00Z"),
         "issues/163/comments": [],  # прод-форма: голый массив без маркеров попыток
         "ai-review.yml/dispatches": None,  # 204 без тела — прод-форма ответа dispatch
     })
@@ -976,7 +1017,7 @@ def test_trigger_ai_review_dispatches_after_threshold_no_verdict(monkeypatch):
 def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     p = pull(178, labels=["review:ok", "ai:failed"])
     fake = FakeGh({
-        "issues/178/timeline": timeline_with_review_ok("2026-09-01T22:37:09Z"),
+        "commits/sha178/statuses": gate1_status("2026-09-01T22:37:09Z"),
         "issues/178/comments": [],
         "ai-review.yml/dispatches": None,
     })
@@ -989,9 +1030,153 @@ def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     assert any("178" in line for line in (observations + actions))
 
 
+def test_trigger_ai_review_skips_dispatch_when_run_already_active_no_attempt_spent(monkeypatch):
+    # #779, разрыв 2 (самый дорогой из трёх — живой замер PR #711: три
+    # диспатча за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z, весь бюджет эпохи
+    # на одном отпечатке диффа). До этой правки trigger_ai_review проверял
+    # гейт 1, наличие вердикта, порог возраста, кулдаун цепочки, quota_exhausted
+    # и бюджет попыток — «летит ли прогон этого PR прямо сейчас» в списке не
+    # было. Диспатч не должен уходить, а АТТЕМПТ (маркер AI_REVIEW_RETRY_MARKER,
+    # который и считает ai_review_retry_count) не должен тратиться — иначе
+    # следующий проход увидел бы попытку исчерпанной за прогон, которого не было.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    running_title = sch.review_labels.ai_review_run_name(711)
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [{"id": 34278765696, "display_title": running_title, "status": "in_progress"}],
+        },
+        "ai-review.yml/dispatches": AssertionError("дубль не должен диспатчиться, пока прогон летит"),
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 8, 21, 10, 30)  # порог (30 мин) прошёл
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("ai-review.yml/dispatches" in c for c in fake.calls)
+    # Маркер попытки не публикуется — attempts не растёт для следующего прохода.
+    assert posted == []
+    assert not actions
+    assert any("711" in line and "летит" in line for line in observations)
+
+
+def test_trigger_ai_review_dispatches_when_no_active_run_mutation_companion(monkeypatch):
+    # Мутация к тесту выше: то же самое PR/состояние, но БЕЗ активного
+    # прогона — диспатч обязан уйти как раньше. Доказывает, что новая
+    # проверка не тормозит легитимный автоповтор, когда прогон реально не летит.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 21, 10, 30)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert any("711" in line for line in (observations + actions))
+
+
+def ai_failed_comment(reset_hint: str, verdict: str = "error"):
+    """Прод-форма комментария-вердикта AI-ревью (ai_review.build_comment,
+    #727) от доверенной учётки — шапка несёт `reviewer:`/`reset-at:`,
+    остальное — proза, latest_ai_comment её не читает."""
+    return {
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": f"pr: 1\nhead: sha1\nreviewer: {verdict}\nreset-at: {reset_hint}\n\nтело вердикта",
+    }
+
+
+def test_trigger_ai_review_holds_back_when_chain_exhausted_reset_in_future(monkeypatch):
+    # #727: ai:failed из-за all_providers_exhausted, дата сброса ещё не
+    # наступила — авто-повтор (#196) НЕ дёргает ai-review.yml вслепую в ту же
+    # квоту, эскалирует владельцу вместо этого (маркер идемпотентен на эпизод).
+    p = pull(700, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha700/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/700/comments": [ai_failed_comment("GLM: 2026-09-10 08:51:55")],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 8, 2, 0)  # порог (30 мин) прошёл, но сброс — 2026-09-10
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("dispatches" in c for c in fake.calls)  # квота не жжётся дальше
+    # escalate() пишет в #120 (watchdog) ПЕРВЫМ, наш же след в самом PR —
+    # второй пост тем же вызовом; оба используют один patched post_issue_comment.
+    pr_posts = [text for n, text in posted if n == 700]
+    assert pr_posts and "2026-09-10" in pr_posts[0]
+    assert any(n == sch.WATCHDOG_ISSUE for n, _ in posted)
+    assert any("700" in line and "эскалация" in line for line in (observations + actions))
+
+
+def test_trigger_ai_review_holds_back_idempotent_second_pulse(monkeypatch):
+    # Второй пульс в том же окне ожидания — маркер уже стоит, повторного
+    # Telegram/комментария нет (тот же принцип, что у остальных эскалаций —
+    # идемпотентно на эпизод, не на каждый 15-минутный пульс).
+    p = pull(701, labels=["review:ok", "ai:failed"])
+    marker = f"{sch.AI_REVIEW_CHAIN_COOLDOWN_MARKER} #701"
+    fake = FakeGh({
+        "commits/sha701/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/701/comments": [
+            ai_failed_comment("GLM: 2026-09-10 08:51:55"),
+            {"created_at": "2026-09-08T01:00:00Z", "body": f"🤖 {marker}\nуже эскалировано"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("повторная эскалация в том же окне — не должно быть"))
+
+    now = utc(2026, 9, 8, 2, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert any("701" in line and "придержан" in line for line in observations)
+
+
+def test_trigger_ai_review_dispatches_once_reset_date_passed(monkeypatch):
+    # Мутация обратного случая: дата сброса УЖЕ в прошлом — цепочка снова
+    # жива, авто-повтор идёт как обычно (доказывает, что гейт не держит
+    # ретрай вечно, только до даты).
+    p = pull(702, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha702/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/702/comments": [ai_failed_comment("GLM: 2026-09-01 00:00:00")],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 2, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+def test_parse_reset_hint_dates_prod_form():
+    # Прод-форма #727: реальный текст отказа из run 34176910458 — «Your
+    # limit will reset at 2026-09-10 08:51:55» (пространственная форма, без
+    # зоны) и ISO-форма смоук-фикстуры dsh-clients.smoke.sh — обе разбираются
+    # одной функцией.
+    dates = sch.parse_reset_hint_dates("GLM: 2026-09-10 08:51:55; NVIDIA: 2026-09-11T00:00:00Z")
+    assert len(dates) == 2
+    assert min(dates) == utc(2026, 9, 10, 8, 51, 55)
+
+
+def test_parse_reset_hint_dates_empty_or_garbage_is_no_dates():
+    assert sch.parse_reset_hint_dates("") == []
+    assert sch.parse_reset_hint_dates("не дата вовсе") == []
+
+
 def test_trigger_ai_review_silent_before_threshold(monkeypatch):
     p = pull(163, labels=["review:ok"])
-    fake = FakeGh({"issues/163/timeline": timeline_with_review_ok("2026-09-02T11, 40:00Z".replace(", ", ":"))})
+    fake = FakeGh({"commits/sha163/statuses": gate1_status("2026-09-02T11:40:00Z")})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не должен писать"))
 
@@ -1021,27 +1206,222 @@ def test_trigger_ai_review_silent_when_changes_requested(monkeypatch):
     assert fake.calls == []
 
 
-def test_trigger_ai_review_stops_after_max_attempts(monkeypatch):
+def test_trigger_ai_review_stops_after_max_attempts_and_escalates(monkeypatch):
+    # #431: исчерпание бюджета — тормоз без газа, если молчит. Теперь
+    # эскалирует тем же каналом, что предохранитель конвейера, вместо тихой
+    # строки в отчёте, которую никто не читает.
     p = pull(163, labels=["review:ok"])
     # AI_REVIEW_MAX_ATTEMPTS маркеров уже стоит в комментариях — прод-форма
-    # ответа issues/{n}/comments (голый массив объектов с created_at/body).
+    # ответа issues/{n}/comments (голый массив объектов с created_at/body),
+    # все ПОСЛЕ якоря текущей эпохи (09:00) — считаются как есть.
     comments = [
         {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
         for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
     ]
     fake = FakeGh({
-        "issues/163/timeline": timeline_with_review_ok("2026-09-02T09:00:00Z"),
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
         "issues/163/comments": comments,
+        "issues/120/comments": [],  # WATCHDOG_ISSUE — эскалации ещё не было
     })
     patch_gh(monkeypatch, fake)
-    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем в PR"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
     assert not any("dispatches" in c for c in fake.calls)  # квота не жжётся дальше
-    # #456: «не дёргаю снова» ничего не меняет — наблюдение, не действие.
-    assert any("нужен человек" in line for line in observations)
+    # #456: сама эскалация меняет состояние (issue-комментарий) — действие,
+    # а не наблюдение.
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and str(sch.AI_REVIEW_MAX_ATTEMPTS) in escalated[0][2]
+    assert any("эскалировано" in line for line in actions)
+    assert observations == []
+
+
+def test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Уже эскалировали в этой эпохе — второй раз молчим (идемпотентность по
+    # PR+эпоха, тот же приём, что READY_STALL_MARKER/#269).
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": f"2026-09-02T1{i}:00:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка {i}"}
+        for i in range(sch.AI_REVIEW_MAX_ATTEMPTS)
+    ]
+    marker = f"{sch.AI_REVIEW_EXHAUSTED_MARKER} #163"
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": comments,
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T11:30:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert any("уже эскалировано" in line for line in observations)
     assert actions == []
+
+
+def test_trigger_ai_review_resets_attempt_budget_on_new_epoch(monkeypatch):
+    # Мутация класса #431 (живой случай #249): без сброса по эпохе маркеры
+    # ДВУХ РАЗНЫХ эпох суммируются в один общий счётчик и запирают PR
+    # навсегда. Здесь 2 старых маркера — из ПРОШЛОЙ эпохи (якорь 09:00,
+    # PR ещё не был перелейблован), 1 — из ТЕКУЩЕЙ (якорь 15:00). Итого
+    # исторически 3 (= AI_REVIEW_MAX_ATTEMPTS), но в текущей эпохе — только 1:
+    # бюджет обязан позволить ещё один автоповтор.
+    p = pull(163, labels=["review:ok"])
+    comments = [
+        {"created_at": "2026-09-02T09:30:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 0"},
+        {"created_at": "2026-09-02T09:45:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 1"},
+        {"created_at": "2026-09-02T15:20:00Z", "body": f"🤖 {sch.AI_REVIEW_RETRY_MARKER} попытка 2"},
+    ]
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T15:00:00Z"),
+        "issues/163/comments": comments,
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет этой эпохи не исчерпан — эскалации нет"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    sch.trigger_ai_review(REPO, now, [p])
+    dispatch_calls = [c for c in fake.calls if "ai-review.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert posted and "попытка 2/3" in posted[0][1]
+
+
+def test_trigger_ai_review_dispatches_on_ai_failed_without_reason_fact_backward_compat(monkeypatch):
+    # Комментарий до #431 не несёт факта reason: — latest_ai_failure_reason
+    # обязан вернуть None (не притвориться, что причина известна), решение
+    # принимается по общему бюджету, как раньше (никакой quota-эскалации).
+    p = pull(178, labels=["review:ok", "ai:failed"])
+    old_verdict_comment = {
+        "created_at": "2026-09-01T22:40:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": "pr: 178\nhead: sha178\nreviewer: error\n\n🤖 AI-ревью — второй гейт (#18). Вердикт: error.",
+    }
+    fake = FakeGh({
+        "commits/sha178/statuses": gate1_status("2026-09-01T22:37:09Z"),
+        "issues/178/comments": [old_verdict_comment],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("причина неизвестна — не наш класс, обычный путь"))
+
+    now = utc(2026, 9, 1, 23, 30)
+    sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+def test_trigger_ai_review_quota_exhausted_escalates_without_spending_attempt(monkeypatch):
+    # quota_exhausted (#419/#431) — ждать внутри CI бессмысленно, автоповтор
+    # не тратится вовсе, эскалация с первого обнаружения в эпохе.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR — эскалация, не ретрай"))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "163" in escalated[0][2] and "квота" in escalated[0][2]
+    assert any("квота провайдера исчерпана" in line for line in actions)
+
+
+def test_trigger_ai_review_quota_exhausted_escalation_is_idempotent_per_epoch(monkeypatch):
+    # Зеркало test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch
+    # для quota-ветки (находка ревью #439) — та же логика marker_at > anchor,
+    # уже эскалированная в этой эпохе квота не должна эскалироваться повторно
+    # на каждом тике оркестратора.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    verdict_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha163\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    marker = f"{sch.AI_REVIEW_QUOTA_MARKER} #163"
+    fake = FakeGh({
+        "commits/sha163/statuses": gate1_status("2026-09-02T09:00:00Z"),
+        "issues/163/comments": [verdict_comment],
+        "issues/120/comments": [
+            {"created_at": "2026-09-02T09:10:00Z", "body": f"🚨 edge-harness: {marker}\nужe было"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+
+    now = utc(2026, 9, 2, 12, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert not any("dispatches" in c for c in fake.calls)
+    assert actions == []
+
+
+def test_trigger_ai_review_quota_reason_from_prior_epoch_is_not_used(monkeypatch):
+    # Находка ревью PR #439: reason: quota_exhausted из ПРОШЛОЙ эпохи (якорь
+    # 09:00) не должен управлять решением текущей эпохи (якорь 15:00, PR
+    # перелейблован новым пушем — свежий вердикт ai-review из-за очереди
+    # раннеров ещё не пришёл). Без якоря latest_ai_failure_reason нашёл бы
+    # старый quota-комментарий и эскалировал вместо того, чтобы дать эпохе
+    # автоповтор — ровно живой сценарий из ревью.
+    p = pull(163, labels=["review:ok", "ai:failed"])
+    old_quota_comment = {
+        "created_at": "2026-09-02T09:05:00Z",
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+        "body": (
+            "pr: 163\nhead: sha-old\nreviewer: error\n"
+            f"reason: {sch.review_labels.FAILURE_REASON_QUOTA_EXHAUSTED}\n\n"
+            "🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: error.\n\n"
+            "ревью не состоялось — квота провайдера исчерпана надолго"
+        ),
+    }
+    fake = FakeGh({
+        # Якорь текущей эпохи — 15:00 (перелейбловка новым пушем), старше
+        # прошлой эпохи 09:00.
+        "commits/sha163/statuses": gate1_status("2026-09-02T15:00:00Z"),
+        "issues/163/comments": [old_quota_comment],  # единственный комментарий — из ПРОШЛОЙ эпохи
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(
+        sch, "escalate",
+        lambda *a: pytest.fail("причина из прошлой эпохи не должна закрывать автоповтор новой"))
+
+    now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert posted and "попытка 1/3" in posted[0][1]
 
 
 def timeline_with_review_large_only(when: str):
@@ -1057,10 +1437,13 @@ def test_trigger_ai_review_dispatches_for_review_large_ai_failed(monkeypatch):
     # 30 минут. До фикса #432 last_gate1_labeled_at (тогда ещё
     # last_review_ok_labeled_at) искала ТОЛЬКО событие "labeled: review:ok",
     # которого для review:large PR не бывает — anchor оставался None навсегда,
-    # и даже пропустив входной гейт, retry не смог бы посчитать возраст.
+    # и даже пропустив входной гейт, retry не смог бы посчитать возраст. С
+    # #424 якорь — commit status `harness/review` (единый для review:ok/
+    # review:large/review:changes-requested), различение по метке этому
+    # якорю больше не нужно вовсе.
     p = pull(412, labels=["review:large", "ai:failed"])
     fake = FakeGh({
-        "issues/412/timeline": timeline_with_review_large_only("2026-09-06T02:34:00Z"),
+        "commits/sha412/statuses": gate1_status("2026-09-06T02:34:00Z"),
         "issues/412/comments": [],
         "ai-review.yml/dispatches": None,
     })
@@ -1289,13 +1672,15 @@ def test_pr_is_unhealthy_mutation_detects_reason_precisely():
 # ── Инвариант #269: готовый PR не должен ждать слияния ───────────────────────────
 # Противоположный класс unhealthy_pulls: PR ЗДОРОВ (обе метки-гейта, зелёные
 # проверки), но слияния не было дольше UNHEALTHY_PR_AFTER_MINUTES с момента
-# готовности (позже из двух событий 'labeled' review:ok/ai:ok в таймлайне).
+# готовности (позже из двух commit status'ов harness/review и harness/ai-review
+# на текущем head, #345 — якорь после находки ревью #424, замена таймлайн-
+# события 'labeled', замороженного идемпотентностью #203).
 
 
-def timeline_ready(review_at: str, ai_at: str):
+def statuses_ready(review_at: str, ai_at: str):
     return [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": review_at},
-        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": ai_at},
+        {"context": sch.review_labels.STATUS_REVIEW, "created_at": review_at},
+        {"context": sch.review_labels.STATUS_AI_REVIEW, "created_at": ai_at},
     ]
 
 
@@ -1304,7 +1689,7 @@ def test_stale_ready_pulls_escalates_when_ready_longer_than_threshold(monkeypatc
     fake = FakeGh({
         "pulls/301": {"mergeable_state": "clean"},
         "commits/sha301/check-runs": CHECK_RUNS_GREEN,
-        "issues/301/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha301/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
         "issues/120/comments?per_page=100": [],
     })
     patch_gh(monkeypatch, fake)
@@ -1325,7 +1710,7 @@ def test_stale_ready_pulls_silent_before_threshold(monkeypatch):
     fake = FakeGh({
         "pulls/302": {"mergeable_state": "clean"},
         "commits/sha302/check-runs": CHECK_RUNS_GREEN,
-        "issues/302/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha302/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
@@ -1344,7 +1729,7 @@ def test_stale_ready_pulls_silent_when_ai_gate_missing(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("гейта нет — не готов"))
     lines = sch.stale_ready_pulls(REPO, utc(2026, 9, 2, 12, 0), [p])
     assert lines == []
-    assert not any("timeline" in c for c in fake.calls)  # готовность даже не проверяем
+    assert not any("statuses" in c for c in fake.calls)  # готовность даже не проверяем
 
 
 def test_stale_ready_pulls_silent_when_checks_red(monkeypatch):
@@ -1362,7 +1747,7 @@ def test_stale_ready_pulls_idempotent_after_already_signalled(monkeypatch):
     fake = FakeGh({
         "pulls/305": {"mergeable_state": "clean"},
         "commits/sha305/check-runs": CHECK_RUNS_GREEN,
-        "issues/305/timeline": timeline_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
+        "commits/sha305/statuses": statuses_ready("2026-09-02T08:00:00Z", "2026-09-02T08:05:00Z"),
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-02T08:10:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #305\nPR #305 …"},
         ],
@@ -1387,8 +1772,8 @@ def test_stale_ready_pulls_signals_each_pr_independently(monkeypatch):
         "pulls/302": {"mergeable_state": "clean"},
         "commits/sha301/check-runs": CHECK_RUNS_GREEN,
         "commits/sha302/check-runs": CHECK_RUNS_GREEN,
-        "issues/301/timeline": timeline_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
-        "issues/302/timeline": timeline_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
+        "commits/sha301/statuses": statuses_ready("2026-09-02T06:00:00Z", "2026-09-02T06:00:00Z"),  # готов 08:00
+        "commits/sha302/statuses": statuses_ready("2026-09-02T06:30:00Z", "2026-09-02T06:30:00Z"),  # готов 08:30
         # #301 уже прокричал в 10:01 — маркер несёт свой номер.
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-02T10:01:00Z", "body": f"🚨 edge-harness: {sch.READY_STALL_MARKER} #301\nPR #301 …"},
@@ -1470,15 +1855,17 @@ def test_pr_is_merge_ready_false_on_empty_check_runs_same_as_merge_queue():
 # может его расшить).
 
 
-def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
-    # Второй заход #252: даже среди прошедших предикат кандидатов подтягиваем
-    # РОВНО одного за вызов — подтягивание первого (push, меняет head) само
-    # способно сбросить ai:ok второго тем же циклом, который эта задача и
-    # закрывает. Порядок и предикат не меняются: #2 и #3 оба проходят
-    # should_update_branch, подтянут только первый по порядку — #2.
+def test_update_remaining_pulls_pulls_all_eligible_candidates_within_budget(monkeypatch):
+    # #761: причина «максимум один за проход» (#252, второй заход) была
+    # починена #740 — подтягивание кандидата больше не сбрасывает его же
+    # ai:ok (diff_fingerprint по patch, не по sha блоба головы), поэтому в
+    # рамках бюджета UPDATE_BRANCH_BUDGET_PER_PASS (по умолчанию 50 — здесь
+    # заведомо больше числа кандидатов) подтягиваются ВСЕ прошедшие предикат,
+    # не только первый. #2 и #3 оба проходят should_update_branch и оба
+    # обязаны получить update-branch; #4/#5 предикат не проходят.
     others = [
-        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта — подтянуть первым
-        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат, но не в этом запуске
+        pull(2, labels=["review:ok", "ai:ok"]),         # оба вердикта
+        pull(3, labels=["conflict"]),                     # конфликт — тоже кандидат
         pull(4, labels=["review:ok"]),                     # нет ai:ok — не трогать
         pull(5, labels=["review:ok", "ai:changes-requested"]),  # доработка — не трогать
     ]
@@ -1492,25 +1879,96 @@ def test_update_remaining_pulls_pulls_only_one_candidate_per_merge(monkeypatch):
     observations, actions = sch.update_remaining_pulls(REPO, 1, others)
 
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1
+    assert len(update_calls) == 2, "оба прошедших предикат кандидата обязаны быть подтянуты одним проходом (#761)"
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # слот уже занят #2
+    assert any("pulls/3/update-branch" in c for c in update_calls)
     updated_lines = [line for line in (observations + actions) if "обновлён из main" in line]
     not_close_lines = [line for line in (observations + actions) if "не подтянут" in line]
-    # Находка AI-ревью PR #288: строка обязана называть ПРИЧИНУ (слот занят
-    # другим PR), а не приписывать #3 несостоявшееся обновление — #3 сам не
-    # обновлён, слот занял #2.
-    slot_taken_lines = [
-        line for line in (observations + actions)
-        if "слот update_branch" in line and "занят другим PR" in line
-    ]
-    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
-    assert len(not_close_lines) == 3  # #3 (слот занят), #4, #5 — не близки к слиянию
+    assert len(updated_lines) == 2
+    assert any("#2" in line for line in updated_lines)
+    assert any("#3" in line for line in updated_lines)
+    assert len(not_close_lines) == 2  # только #4 и #5 — не близки к слиянию
     assert any("#4" in line for line in not_close_lines)
     assert any("#5" in line for line in not_close_lines)
-    assert len(slot_taken_lines) == 1 and "#3" in slot_taken_lines[0]  # не молчит, назван следующий прогон
-    assert "следующий прогон" in slot_taken_lines[0]
+    assert not any("бюджет update_branch" in line for line in (observations + actions))  # бюджет не исчерпан
+
+
+def test_update_remaining_pulls_stops_at_budget_exhausted(monkeypatch):
+    # Бюджет по-прежнему конечен (#761 подняло число, не убрало потолок):
+    # с бюджетом, искусственно опущенным до 1, #2 подтягивается, а #3
+    # (тоже проходит предикат) получает строку "бюджет исчерпан", а не
+    # молчаливый пропуск — та же дисциплина видимости, что раньше держал
+    # булев слот (находка AI-ревью PR #288).
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["conflict"]),
+    ]
+    fake = FakeGh({
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert not any("pulls/3/update-branch" in c for c in fake.calls)  # бюджет уже исчерпан #2
+    updated_lines = [line for line in (observations + actions) if "обновлён из main" in line]
+    budget_exhausted_lines = [
+        line for line in (observations + actions)
+        if "бюджет update_branch" in line and "исчерпан" in line
+    ]
+    assert len(updated_lines) == 1 and "#2" in updated_lines[0]
+    assert len(budget_exhausted_lines) == 1 and "#3" in budget_exhausted_lines[0]
+    assert "следующий прогон" in budget_exhausted_lines[0]
+    assert "(1)" in budget_exhausted_lines[0]  # называет само число, не только факт исчерпания
     assert not any("уже обновлён" in line for line in (observations + actions))  # #3 сам не обновлён
+
+
+def test_update_remaining_pulls_pulls_large_ok_pr_prod_form(monkeypatch):
+    """Прод-форма #702: живые метки PR #618 и #333 (снято `gh api
+    pulls/618`/`pulls/333` 2026-09-08 — `{"labels": ["review:large",
+    "review:large-ok", "ai:ok"], "mergeable": true, "mergeable_state":
+    "behind"}` для обоих) — до фикса merge_label_gate ни один из них не
+    считался «близким к слиянию»: should_update_branch делегирует
+    merge_label_gate напрямую, а тот требовал буквальный review:ok, которого
+    у этой пары никогда бы не появилось без постороннего пуша (apply_large_ok
+    ставит review:large-ok меткой). Круг: PR остаётся BEHIND → strict branch
+    protection не даёт слить → «не близок к слиянию» → main не подтягивается
+    → PR остаётся BEHIND. Контрольный #700 несёт review:large БЕЗ
+    review:large-ok — размер ещё не принят, подтягивание по-прежнему
+    пропускается.
+
+    Мутация: верни merge_label_gate к буквальному `REVIEW_OK in names` —
+    update_calls ниже опустеет (ни #618, ни #333 не подтянутся), а #700
+    остаётся отсеянным в обоих случаях.
+
+    #761: бюджет по умолчанию (50) — оба кандидата, прошедших предикат,
+    подтягиваются одним проходом, не только первый."""
+    others = [
+        pull(618, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(333, labels=["review:large", "review:large-ok", "ai:ok"]),
+        pull(700, labels=["review:large", "ai:ok"]),  # размер не принят — контроль
+    ]
+    fake = FakeGh({"pulls/618/update-branch": None, "pulls/333/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "#618 и #333 оба обязаны быть подтянуты одним проходом (#761)"
+    assert any("pulls/618/update-branch" in c for c in update_calls)
+    assert any("pulls/333/update-branch" in c for c in update_calls)
+    not_close_lines = [
+        line for line in (observations + actions)
+        if "не подтянут" in line and "#700" in line and "не близок к слиянию" in line
+    ]
+    assert len(not_close_lines) == 1, "#700 без review:large-ok обязан остаться отсеянным предикатом"
 
 
 def test_update_remaining_pulls_draft_skipped_before_predicate(monkeypatch):
@@ -1535,13 +1993,13 @@ def test_update_remaining_pulls_skip_is_not_silent(monkeypatch):
 
 
 def test_update_remaining_pulls_failed_attempt_does_not_consume_slot(monkeypatch):
-    # Находка AI-ревью PR #288: докстринг update_branch обещает "слот
-    # занимается только УСПЕХОМ" — это держится на честном слове, если слот
-    # можно пометить занятым ДО вызова gh (мутация: `pulled = True`/
-    # `_update_branch_used_this_run = True` раньше настоящего push'а). Первый
+    # Находка AI-ревью PR #288: докстринг update_branch обещает "счётчик
+    # увеличивается только УСПЕХОМ" — это держится на честном слове, если
+    # счётчик можно увеличить ДО вызова gh (мутация: `pulled = True`/
+    # `_update_branch_calls_this_pass += 1` раньше настоящего push'а). Первый
     # кандидат падает (не найдя настоящей ошибки — используем боевой
     # update_branch, не заглушку), второй ОБЯЗАН получить попытку тем же
-    # прогоном: неудача не должна расходовать общий слот.
+    # прогоном: неудача не должна расходовать общий бюджет.
     others = [
         pull(2, labels=["review:ok", "ai:ok"]),  # упадёт при update-branch
         pull(3, labels=["conflict"]),             # обязан получить попытку следом
@@ -1731,13 +2189,13 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     assert any("pulls/2/update-branch" in c for c in fake.calls)
 
 
-def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
-    # Находка AI-ревью PR #288 (главная): раньше дисциплина "максимум один
-    # успешно подтянутый за прогон" жила только внутри update_remaining_pulls
-    # — сама behind-ветка merge_queue могла подтянуть НЕСКОЛЬКО behind-PR за
-    # один свой проход по списку `pulls`, ничем не ограниченная. Два behind-PR
-    # с обоими зелёными вердиктами в одном вызове merge_queue обязаны дать
-    # РОВНО один update-branch, второй — отдельную строку "слот занят".
+def test_merge_queue_two_behind_prs_share_one_update_branch_budget(monkeypatch):
+    # Находка AI-ревью PR #288 (главная), потолок поднят #761: behind-ветка
+    # merge_queue и update_remaining_pulls делят ОДИН счётчик update_branch —
+    # два behind-PR с обоими зелёными вердиктами в одном вызове merge_queue
+    # обязаны дать ДВА update-branch в рамках бюджета по умолчанию (50, #740
+    # починил причину «максимум один», см. update_branch), не быть
+    # искусственно серилизованы до одного.
     pulls = [
         pull(2, labels=["review:ok", "ai:ok"]),
         pull(3, labels=["review:ok", "ai:ok"]),
@@ -1757,9 +2215,159 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_slot(monkeypatch):
     assert merged_number is None
     assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
-    assert len(update_calls) == 1, "два behind-PR за один проход не должны дать два update-branch"
+    assert len(update_calls) == 2, "оба behind-PR за один проход обязаны подтянуться (#761)"
     assert any("pulls/2/update-branch" in c for c in update_calls)
-    assert any("слот update_branch" in line and "#3" in line for line in (observations + actions))
+    assert any("pulls/3/update-branch" in c for c in update_calls)
+
+
+def test_merge_queue_two_behind_prs_stop_at_budget_exhausted(monkeypatch):
+    # Бюджет остаётся конечным — с искусственно опущенным до 1 (тот же приём,
+    # что test_update_remaining_pulls_stops_at_budget_exhausted) второй
+    # behind-PR получает отдельную строку "бюджет исчерпан", не тихий пропуск.
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    pulls = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({
+        "pulls/2": {"mergeable_state": "behind"},
+        "pulls/3": {"mergeable_state": "behind"},
+        "pulls/2/update-branch": None,
+        "pulls/3/update-branch": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number is None
+    assert updated is True
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "бюджет=1 обязан ограничить подтягивание одним PR"
+    assert any("pulls/2/update-branch" in c for c in update_calls)
+    assert any("бюджет update_branch" in line and "#3" in line for line in (observations + actions))
+
+
+# ── #761: снятие штучного бюджета не возвращает шторм ai-review (прод-форма) ──
+#
+# Фикстура — та же, что уже несёт #740 (не заводим свою, AGENTS.md): прод-
+# форма `gh api repos/mytab0r/edge-harness/compare/<merge-base>...<head>` для
+# реального PR #333 до и после подтягивания main, filename/status/sha/patch,
+# без пересказа (scripts/lib/fixtures_pr333_pull_no_overlap.json, докстринг —
+# scripts/lib/test_review_labels.py:233-245).
+_PR333_FIXTURE = Path(sch.__file__).resolve().parents[1] / "lib" / "fixtures_pr333_pull_no_overlap.json"
+
+
+def _load_pr333_pull_fixture():
+    with open(_PR333_FIXTURE, encoding="utf-8") as file:
+        payload = json.load(file)
+    return payload["before_pull"], payload["after_pull"]
+
+
+def test_update_branch_budget_raise_does_not_reopen_review_storm(monkeypatch):
+    """Требование 3 задачи #761: раз бюджет update_branch поднят настолько,
+    что оба готовых кандидата подтягиваются ОДНИМ проходом (не два
+    последовательных с паузой, как раньше при слоте «1»), это обязано
+    оставаться безопасным для ai:ok — иначе #761 тихо вернул бы шторм
+    ai-review.yml, который закрывал #252. Гарант — фикс #740 (diff_fingerprint
+    по patch, не по sha блоба головы): реальный дифф ДО/ПОСЛЕ подтягивания
+    main у PR #333 (фикстура выше) не пересекается построчно с правкой main,
+    поэтому отпечаток не меняется и `check_pr.ai_verdict_keep` держит ai:ok.
+
+    Сценарий: два PR (#2, #3) оба проходят should_update_branch (оба
+    вердикта зелёные) — update_remaining_pulls с бюджетом по умолчанию
+    (UPDATE_BRANCH_BUDGET_PER_PASS) обязан подтянуть ОБА одним вызовом (не
+    один, как при старом слоте). Для каждого — прод-форма diff_fingerprint
+    ДО/ПОСЛЕ реального подтягивания (фикстура PR #333) не меняется, значит
+    ai_verdict_keep (scripts/review/check_pr.py) держит ai:ok — второй,
+    дорогой гейт не перезапускается ни для одного из двух.
+    """
+    before, after = _load_pr333_pull_fixture()
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/3/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 2, "оба кандидата обязаны подтянуться одним проходом (#761)"
+
+    fp_before = sch.review_labels.diff_fingerprint(before)
+    fp_after = sch.review_labels.diff_fingerprint(after)
+    check_pr = _load_check_pr_module()
+    for _ in others:  # каждый реально подтянутый PR — тот же прод-дифф, тот же вывод
+        assert check_pr.ai_verdict_keep(["ai:ok"], fp_before, fp_after) is True, \
+            "подтягивание в рамках нового бюджета не должно сбрасывать ai:ok на неизменном патче"
+
+
+def test_update_branch_budget_raise_mutation_guard_head_blob_sha_reopens_storm(monkeypatch):
+    """Мутация №1 (различает причину #740 от причины #761, требование 3):
+    верни diff_fingerprint к SHA блоба головы (докод до #740, живой прод-
+    случай PR #333/issue #740) — на этой же прод-форме отпечаток МЕНЯЕТСЯ
+    (main правил тот же файл, что и в head-blob сумме), значит
+    ai_verdict_keep обязан вернуть False — старая причина #252 (шторм)
+    вернулась бы, несмотря на поднятый бюджет. Отличает эту мутацию от
+    мутации №2 ниже (штучный бюджет): здесь update_remaining_pulls всё ещё
+    подтягивает ОБА PR (счётчик не тронут), но подтягивание каждого снова
+    стало бы опасным для его же ai:ok."""
+    before, after = _load_pr333_pull_fixture()
+
+    def head_blob_sha_fingerprint(files):
+        import hashlib as _hashlib
+        parts = sorted(
+            f"{f.get('filename', '')}:{f.get('status', '')}:{f.get('sha', '')}"
+            for f in files
+        )
+        return _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    fp_before = head_blob_sha_fingerprint(before)
+    fp_after = head_blob_sha_fingerprint(after)
+    assert fp_before != fp_after, "прод-форма #333 обязана показывать разошедшийся sha блоба головы"
+    check_pr = _load_check_pr_module()
+    assert check_pr.ai_verdict_keep(["ai:ok"], fp_before, fp_after) is False, \
+        "мутация на sha блоба головы обязана красить тест — причина #252 вернулась бы"
+
+
+def test_update_branch_budget_raise_mutation_guard_single_slot_blocks_second_pr(monkeypatch):
+    """Мутация №2 (различает причину #761 от причины #740, требование 3):
+    верни штучный бюджет к «1 успех за проход» (UPDATE_BRANCH_BUDGET_PER_PASS
+    = 1, докод до #761) — второй кандидат с тем же самым безопасным прод-
+    диффом (fingerprint не меняется, ai:ok не в опасности) всё равно НЕ
+    подтягивается в этом проходе, что и было исходным дефектом задачи #761
+    (25 проходов вместо одного). Отличает эту мутацию от мутации №1 выше
+    (sha блоба головы): здесь сам diff_fingerprint остаётся безопасным
+    (patch-based, #740 не откатывается), опасности для ai:ok нет — но
+    пропускная способность прохода искусственно урезана обратно."""
+    monkeypatch.setattr(sch, "UPDATE_BRANCH_BUDGET_PER_PASS", 1)
+    others = [
+        pull(2, labels=["review:ok", "ai:ok"]),
+        pull(3, labels=["review:ok", "ai:ok"]),
+    ]
+    fake = FakeGh({"pulls/2/update-branch": None, "pulls/3/update-branch": None})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
+
+    observations, actions = sch.update_remaining_pulls(REPO, 1, others)
+
+    update_calls = [c for c in fake.calls if "update-branch" in c]
+    assert len(update_calls) == 1, "мутация на штучный бюджет обязана красить тест — второй PR не подтянут"
+    assert any("бюджет update_branch" in line and "#3" in line for line in (observations + actions))
+
+
+def _load_check_pr_module():
+    """check_pr.py — тот же приём загрузки по пути, что и review_labels
+    внутри scheduler.py (см. импорт sch выше): модуль не пакет, path-based
+    import — единственный способ переиспользовать ai_verdict_keep отсюда."""
+    check_pr_path = Path(sch.__file__).resolve().parents[1] / "review" / "check_pr.py"
+    spec = importlib.util.spec_from_file_location("check_pr", check_pr_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
 
 
 def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
@@ -1827,6 +2435,54 @@ def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
     # #456: пропуск кандидата (гейт меток не пройден) — наблюдение, не действие.
     assert any("ai:ok" in line for line in observations)
     assert actions == []
+
+
+def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
+    """Прод-форма PR #333 (2026-09-08, снято `gh api pulls/333` и
+    `commits/<sha>/check-runs` живого репозитория): `mergeable_state=unstable`,
+    метки `review:large`+`review:large-ok`+`ai:ok` (НЕ `review:ok` — большой
+    дифф, размер принят меткой, а не переносом на review:ok), 11 сырых
+    check-run'ов с дублями `contract`(x2)/`orchestra`(x2) (два pull_request-
+    триггера workflow orchestra.yml подряд), все success/skipped.
+
+    До фикса merge_label_gate (review_labels.py) этот PR стоял бы с этим же
+    набором меток НАВСЕГДА — apply_large_ok (ai_review.py) ставит
+    review:large-ok меткой, без нового пуша, а pr-review.yml (где
+    check_pr.py конвертировал бы review:large → review:ok) реагирует только
+    на opened/synchronize/reopened. Мутация: замени `gate1_ok = REVIEW_OK in
+    names or (...)` на `gate1_ok = REVIEW_OK in names` в review_labels.py —
+    тест обязан покраснеть (не появится -X PUT .../merge, останется
+    "нет вердикта review:ok" в observations)."""
+    pulls = [pull(333, labels=["review:large", "review:large-ok", "ai:ok"])]
+    fake = FakeGh({
+        "pulls/333": {"mergeable_state": "unstable"},
+        "commits/sha333/check-runs": {"check_runs": [
+            {"name": "CodeQL", "conclusion": "success", "started_at": "2026-09-07T21:58:40Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:58:05Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:58:06Z"},
+            {"name": "orchestra", "conclusion": "skipped", "started_at": "2026-09-07T21:57:48Z"},
+            {"name": "contract", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "review", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+            {"name": "canary", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "analyze", "conclusion": "success", "started_at": "2026-09-07T21:57:49Z"},
+            {"name": "test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "worker-test", "conclusion": "success", "started_at": "2026-09-07T21:57:51Z"},
+            {"name": "archive-fixup", "conclusion": "success", "started_at": "2026-09-07T21:57:50Z"},
+        ]},
+        "pulls/333/merge": None,
+    })
+    patch_gh(monkeypatch, fake)
+    # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
+    # проводка after_merge (архив/deploy/release задачи) — та разобрана
+    # отдельными тестами after_merge_* ниже в этом файле.
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others: ([], [], False))
+
+    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+
+    assert not hard_failure
+    assert merged_number == 333
+    assert any(c.startswith("-X PUT") and "pulls/333/merge" in c for c in fake.calls)
+    assert any("слит" in line and "#333" in line for line in actions)
 
 
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
@@ -2024,7 +2680,7 @@ def test_dispatch_conflict_rework_releases_task_and_dispatches_targeted_worker(m
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
-        "issues/560/comments": [],  # ни одной авто-попытки ещё не было
+        "issues/560/timeline?per_page=100": [],  # метка ещё не проставлялась — ни одной авто-попытки
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "issues/474/assignees": None,
@@ -2053,7 +2709,7 @@ def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
-        "issues/560/comments": [],
+        "issues/560/timeline?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
     })
@@ -2078,9 +2734,10 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
     fake = FakeGh({
-        "issues/560/comments": [
-            {"created_at": "2026-09-05T10:00:00Z",
-             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        # Момент простановки CONFLICT_LABEL (issue #588) — граница, отделяющая
+        # прогон, который открыл этот PR, от прогона авто-ребейза.
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
         "issues/120/comments?per_page=100": [],
         # Порядок ключей важен (FakeGh матчит первую подстроку по вставке):
@@ -2097,14 +2754,19 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # Вторая находка ревью PR #478 ("алерт не гадает"): текст обязан
         # называть conclusion прогона, атрибутированного задаче, а не
-        # утверждать причину («содержательный конфликт») от себя.
+        # утверждать причину («содержательный конфликт») от себя. created_at
+        # позже метки conflict (#588) — иначе прогон не засчитался бы попыткой.
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": 34011108934, "conclusion": "success"},
+            {"id": 34011108934, "conclusion": "success", "created_at": "2026-09-06T09:00:00Z"},
         ]},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T10:00:00Z",
              "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-474` "
                      "(TTL 24 ч по коммиту замка). Канал: worker run 34011108934."},
+            # Отметка «дошли до git-шага» (#588) — без неё этот прогон не
+            # засчитался бы попыткой (см. соседний тест на инфра-сбой).
+            {"created_at": "2026-09-06T10:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -2127,30 +2789,110 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert task["assignees"] != []  # эскалация не трогает задачу
 
 
-def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkeypatch):
-    # Находка ревью PR #478: если след аренды не нашёлся (например, комментарий
-    # с "worker run <id>" ещё не появился/сгорел) — текст честно говорит "не
-    # атрибутирован", не выдумывает conclusion и не утверждает диагноз.
+def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_failure(monkeypatch):
+    # Issue #588: живые случаи #567/#542/#408 — единственный прогон авто-
+    # ребейза упал ДО git-шага (морда/деплой недоступны, отсутствующий
+    # скрипт). Раньше (маркер CONFLICT_REWORK_MARKER = сырой счётчик
+    # диспатчей) это НАВСЕГДА жгло единственный бюджет и вело к эскалации,
+    # хотя git rebase origin/main ни разу не запускался. Прогон атрибутирован
+    # задаче (след аренды "worker run N" есть), но БЕЗ отметки git-шага —
+    # попытка не должна засчитаться, PR обязан получить новый адресный
+    # dispatch, а не эскалацию.
+    #
+    # Мутация: верни conflict_rework_attempts к старой сигнатуре/логике (сырой
+    # подсчёт CONFLICT_REWORK_MARKER в комментариях САМОГО PR, без разбора
+    # git-шага) — фикстура "issues/561/comments" ниже даёт старому коду ровно
+    # то, что нужно, чтобы увидеть attempts=1 и покраснеть (dispatched
+    # остался бы False, ушла бы эскалация вместо повтора).
     task = issue(475, assignees=("mytab0r",))
     p = pull(561, labels=["conflict"], ref="agent/475-conflict-auto-rebase", base_sha="basesha")
     fake = FakeGh({
+        # Момент простановки CONFLICT_LABEL — граница отсчёта попыток (#588).
+        "issues/561/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        # Старая семантика читала ИМЕННО этот эндпоинт (комментарии PR) —
+        # оставлен намеренно, чтобы мутация (откат к старой сигнатуре)
+        # покраснела на данных, а не молча прошла из-за отсутствия маршрута.
         "issues/561/comments": [
             {"created_at": "2026-09-05T10:00:00Z",
              "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
         ],
-        "issues/120/comments?per_page=100": [],
-        "pulls/561/files": files_payload([]),
-        "compare/basesha...main": {"files": files_payload([])},
-        "pulls/561": {"mergeable_state": "dirty"},
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},  # атрибуции нет
+        # Единственный прогон существует и атрибутирован задаче #475, но упал
+        # ДО git-шага (живой случай #476/#567: недоступность морды).
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 34027035455, "conclusion": "failure", "created_at": "2026-09-06T09:00:00Z"},
+        ]},
+        f"{REPO}/issues/475/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-475` "
+                     "(TTL 24 ч по коммиту замка). Канал: worker run 34027035455."},
+            # Нет отметки [worker: git-шаг] — воркер упал раньше, чем до неё дошёл.
+        ],
+        "issues/475/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # инфра-сбой не эскалирует — бюджет не считается сгоревшим
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=475" in dispatch_calls[0]
+    assert posted and posted[0][0] == 561
+    assert "попытка 1/1" in posted[0][1]  # предыдущий незасчитанный прогон не сдвинул счётчик
+    assert task["assignees"] == []
+    assert any("#561" in line and "освобождена" in line for line in actions)
+
+
+def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkeypatch):
+    # Находка ревью PR #478 (сохранена через ревью PR #597, требование спеки
+    # «текст эскалации называет подтверждённый факт»): попытка ЗАСЧИТАНА по
+    # постоянному следу (отметка git-шага в комментариях задачи), но к моменту
+    # эскалации её прогон уже выпал из окна recent_runs(per_page=10) —
+    # worker.yml не простаивает (другие задачи/PR дают собственные прогоны,
+    # ~3.3 слияния/час), окно между засчитанной попыткой и эскалацией вполне
+    # успевает сдвинуться. conclusion этой попытки неоткуда взять — текст
+    # честно говорит "не атрибутирован", не подсовывает conclusion чужого
+    # прогона как диагноз ЭТОЙ попытки. После правки ревью PR #597 эта ветка
+    # не только достижима, но и ЕДИНСТВЕННАЯ честная: счётчик больше не
+    # зависит от окна (см. соседний тест на выпадение из окна), а вывод
+    # conclusion по-прежнему ограничен им.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/560/files": files_payload([]),
+        "compare/basesha...main": {"files": files_payload([])},
+        "pulls/560": {"mergeable_state": "dirty"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # В окне только чужой прогон 901: попытка (333→900) туда не попала.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 901, "conclusion": "success", "created_at": "2026-09-06T09:10:00Z"},
+        ]},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z", "body": "Канал: worker run 900."},
+            {"created_at": "2026-09-06T09:05:00Z", "body": "🤖 [worker: git-шаг] worker run 900"},
+        ],
     })
     patch_gh(monkeypatch, fake)
     escalated = []
     monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
-    patch_post_issue_comment(monkeypatch, lambda *a: None)
-    monkeypatch.setattr(sch.claim_task, "release", lambda *a: None)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
     sch.dispatch_conflict_rework(REPO, [p], pool=[task])
 
@@ -2171,12 +2913,17 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
     task = issue(474, assignees=())
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
-        "issues/560/comments": [
-            {"created_at": "2026-09-05T10:00:00Z",
-             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "Канал: worker run 34011108934."},
+            {"created_at": "2026-09-06T09:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
+        ],
         "issues/120/comments?per_page=100": [],
         "pulls/560": {"mergeable_state": None},
     })
@@ -2200,12 +2947,22 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
     task = issue(474, assignees=())  # уже освобождена предыдущим dispatch
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
-        "issues/560/comments": [
-            {"created_at": "2026-09-05T10:00:00Z",
-             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(34027474271, "in_progress")]},
+        # Отметка git-шага ставится РАНО в прогоне (перед dsh_run_with_retry,
+        # scripts/worker/task.sh) — задолго до конца 280-минутного job'а,
+        # поэтому attempts может стать 1 ещё ПОКА прогон "in_progress" (тот
+        # самый гоночный случай #474/PR #408, ради которого и нужен
+        # worker_runs_active ниже как отдельная гвардия).
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "Канал: worker run 34027474271."},
+            {"created_at": "2026-09-06T09:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34027474271"},
+        ],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("прогон ещё идёт — рано эскалировать"))
@@ -2225,12 +2982,17 @@ def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
-        "issues/560/comments": [
-            {"created_at": "2026-09-05T10:00:00Z",
-             "body": f"🤖 {sch.CONFLICT_REWORK_MARKER} попытка 1/1"},
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "Канал: worker run 34011108934."},
+            {"created_at": "2026-09-06T09:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
+        ],
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-05T11:00:00Z", "body": f"🚨 {marker} — уже сказано"},
         ],
@@ -2265,11 +3027,14 @@ def test_dispatch_conflict_rework_dispatches_only_one_pr_per_pass(monkeypatch):
     # нарушался бы уже внутри самой этой функции.
     task_a = issue(474, assignees=("mytab0r",))
     task_b = issue(475, assignees=("mytab0r",))
-    p_a = pull(560, labels=["conflict"], ref="agent/474-x")
-    p_b = pull(561, labels=["conflict"], ref="agent/475-y")
+    # created_at различаются (#588 — граница возраста конфликта): нет метки
+    # ни у одного (timeline пуст ниже), фолбэк — created_at PR, p_a старше —
+    # тот же кандидат, что и до сортировки по возрасту, идёт первым.
+    p_a = pull(560, labels=["conflict"], ref="agent/474-x", created_at="2026-09-01T00:00:00Z")
+    p_b = pull(561, labels=["conflict"], ref="agent/475-y", created_at="2026-09-02T00:00:00Z")
     fake = FakeGh({
-        "issues/560/comments": [],
-        "issues/561/comments": [],
+        "issues/560/timeline?per_page=100": [],
+        "issues/561/timeline?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "issues/474/assignees": None,
@@ -2287,6 +3052,264 @@ def test_dispatch_conflict_rework_dispatches_only_one_pr_per_pass(monkeypatch):
     assert "inputs[task]=474" in dispatch_calls[0]
     assert any("#561" in line and "занят" in line for line in observations)
     assert task_b["assignees"] != []  # вторая задача этим же проходом не тронута
+
+
+def test_dispatch_conflict_rework_processes_oldest_conflict_first(monkeypatch):
+    # Issue #588: open_pulls() (сырой `GET /pulls?state=open`) отдаёт НОВЫЕ PR
+    # первыми, а один workflow_dispatch за проход раньше всегда доставался
+    # самому свежему конфликту (замер живого репозитория: 10 из 14 конфликтных
+    # PR не получили ни одной попытки, возраст до 84 часов). Здесь входной
+    # порядок [p_new, p_old] намеренно "неправильный" (как отдаёт GitHub) —
+    # дождаться дожен СТАРЕЙШИЙ по conflict_labeled_at, не первый по списку.
+    #
+    # Мутация: убери сортировку conflict_pulls (верни `for pull in pulls:` без
+    # переупорядочивания) — этот тест покраснеет (inputs[task]=475, ветка
+    # p_new, вместо ожидаемого 474).
+    task_new = issue(475, assignees=("mytab0r",))
+    task_old = issue(474, assignees=("mytab0r",))
+    p_new = pull(561, labels=["conflict"], ref="agent/475-y")
+    p_old = pull(560, labels=["conflict"], ref="agent/474-x")
+    fake = FakeGh({
+        # Метка на p_new проставлена НЕДАВНО, на p_old — почти четверо суток
+        # назад: p_old обязан получить единственный слот этого прохода.
+        "issues/561/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-06T20:00:00Z"},
+        ],
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-03T00:00:00Z"},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [],
+        f"{REPO}/issues/475/comments?per_page": [],
+        "issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    # Вход НАРОЧНО в порядке "новый первым" — тот же порядок, что отдаёт
+    # open_pulls() на живом репозитории.
+    observations, actions, dispatched = sch.dispatch_conflict_rework(
+        REPO, [p_new, p_old], pool=[task_new, task_old])
+
+    assert dispatched is True
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=474" in dispatch_calls[0]  # старейший конфликт, не первый по списку
+    assert any("#561" in line and "занят" in line for line in observations)
+    assert task_new["assignees"] != []  # свежий конфликт этим проходом не тронут
+
+
+def test_conflict_labeled_at_returns_most_recent_labeling_episode(monkeypatch):
+    # Тот же приём, что last_gate1_labeled_at: max(), не min() — метка могла
+    # сниматься/ставиться несколькими эпизодами конфликта (mark_conflicts
+    # снимает при чистом mergeable_state), нас интересует начало ТЕКУЩЕГО.
+    # Мутация: замени max() на min() — тест вернул бы 09-01 вместо 09-05,
+    # покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_labeled_at(REPO, 560) == utc(2026, 9, 5, 0, 0)
+
+
+def test_conflict_labeled_at_none_when_never_labeled(monkeypatch):
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_labeled_at(REPO, 560) is None
+
+
+def test_conflict_first_labeled_at_returns_earliest_labeling_episode(monkeypatch):
+    # Обратное conflict_labeled_at: min(), не max() — граница лифтайм-бюджета
+    # conflict_rework_attempts обязана указывать на ПЕРВЫЙ эпизод конфликта,
+    # не на текущий (находка ревью PR #597: max() тут обнулял бы засчитанные
+    # попытки при каждой повторной простановке метки). Мутация: замени min()
+    # на max() — тест вернул бы 09-05 вместо 09-01, покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_first_labeled_at(REPO, 560) == utc(2026, 9, 1, 0, 0)
+
+
+def test_conflict_first_labeled_at_none_when_never_labeled(monkeypatch):
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_first_labeled_at(REPO, 560) is None
+
+
+def test_conflict_rework_attempts_lifetime_survives_relabeling(monkeypatch):
+    # Ядро находки ревью PR #597: владелец задокументировал лифтайм-счётчик
+    # (не сбрасывается по эпизодам конфликта, дельта-спека conflict-auto-rebase,
+    # требование про бюджет попыток). Здесь PR словил
+    # первый конфликт 09-01, засчитанная попытка пришлась НА ТОТ эпизод
+    # (09-01), метку сняли и поставили заново 09-05 (новый эпизод дрейфа).
+    # Граница по conflict_labeled_at (max, текущий эпизод — 09-05) стёрла бы
+    # засчитанную попытку из старого эпизода: attempts вернулся бы к 0, хотя
+    # бюджет уже потрачен. Мутация: верни since = conflict_labeled_at(...) —
+    # attempts станет 0 вместо 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "conflict"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-01T06:05:00Z", "body": "Канал: worker run 444."},
+            {"created_at": "2026-09-01T06:10:00Z", "body": "🤖 [worker: git-шаг] worker run 444"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_ignores_run_before_conflict_episode(monkeypatch):
+    # Прогон, который ОТКРЫЛ этот PR (задолго до того, как main ушёл вперёд),
+    # тоже дошёл бы до git-шага — он и есть источник PR. Без границы по
+    # conflict_labeled_at он был бы ошибочно засчитан как попытка авто-
+    # РЕБЕЙЗА. Мутация: убери фильтр `created_at < since` — attempts стал бы
+    # 1 вместо 0, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-01T00:05:00Z", "body": "Канал: worker run 111."},
+            {"created_at": "2026-09-01T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 111"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 0
+
+
+def test_conflict_rework_attempts_ignores_run_that_never_reached_git_step(monkeypatch):
+    # Ядро фикса #588: прогон атрибутирован задаче (след аренды "worker run
+    # N" есть) и стартовал ПОСЛЕ простановки конфликта, но упал ДО git-шага
+    # (живые случаи #567/#542/#408 — сеть/деплой морды, отсутствующий
+    # скрипт). Такая попытка не должна жечь единственный бюджет.
+    # Мутация: убери проверку WORKER_GIT_STEP_MARKER (засчитывай любой
+    # атрибутированный прогон) — attempts стал бы 1 вместо 0, покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 222."},
+            # Нет отметки git-шага — воркер упал раньше, чем до неё дошёл.
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 0
+
+
+def test_conflict_rework_attempts_counts_run_that_reached_git_step(monkeypatch):
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 333."},
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_counts_run_that_fell_out_of_recent_runs_window(monkeypatch):
+    # Блокирующая находка ревью PR #597: счётчик читал окно
+    # recent_runs(per_page=10) — топ-10 свежих прогонов worker.yml, а живой
+    # репозиторий выдаёт прогон на каждое слияние/ретрай/доводку (~3.3/час),
+    # так что засчитанная попытка выпадала из окна уже через ~2–3 часа, сама
+    # оставаясь легитимной (прогон идёт до 280 минут). attempts возвращался
+    # к 0, PR с несошедшейся попыткой получал адресный диспатч бесконечно и
+    # никогда не доходил до эскалации — голодание #588 перестраивалось.
+    # Здесь прогон 333 дошёл до git-шага (комментарий в задаче — ПОСТОЯННЫЙ
+    # след), а в топ-10 свежих прогонов его НЕТ — одни чужие новее.
+    # Мутация: верни цикл по recent_runs (засчитывай только прогоны из окна)
+    # — attempts станет 0 вместо 1, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        # Десять ЧУЖИХ прогонов новее попытки 333 — ровно тот сдвиг окна,
+        # на котором старая логика теряла засчитанную попытку.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 1000 + i, "conclusion": "success", "created_at": f"2026-09-07T0{i % 10}:00:00Z"}
+            for i in range(10)
+        ]},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 333."},
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+    # Прогоны Actions счётчиком вообще не читаются: постоянная сторона —
+    # комментарии задачи, окно в решении не участвует.
+    assert not any("runs?per_page=10" in c for c in fake.calls)
+
+
+def test_conflict_rework_attempts_counts_distinct_runs_not_marker_repeats(monkeypatch):
+    # Один прогон, отметившийся дважды (например, повтор шага после
+    # best-effort провала постановки комментария) — ОДНА попытка, не две:
+    # бюджет РОВНО одна попытка на PR, дубликат следа не должен её удвоить.
+    # Мутация: замени set на счётчик всех совпавших комментариев — attempts
+    # стал бы 2, тест покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 555"},
+            {"created_at": "2026-09-06T00:20:00Z", "body": "🤖 [worker: git-шаг] worker run 555"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 1
+
+
+def test_conflict_rework_attempts_zero_when_never_labeled(monkeypatch):
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.conflict_rework_attempts(REPO, 560, 474) == 0
+    # Не тратим вызовы на прогоны/комментарии задачи — нет эпизода конфликта,
+    # решать по нему нечего.
+    assert not any("runs?per_page=10" in c or "474/comments" in c for c in fake.calls)
+
+
+def test_worker_git_step_marker_literal_in_task_sh_matches_pulse_guard():
+    # Блокирующая находка ревью PR #597: строка отметки git-шага захардкожена
+    # в scripts/worker/task.sh, а WORKER_GIT_STEP_MARKER объявлен в
+    # pulse_guard.py — синхронизация держалась только комментарием «держи
+    # текст в синхроне». Тесты сторонили лишь сторону планировщика, поэтому
+    # переформулировка в task.sh проходила CI зелёной, а отказ был тихим:
+    # attempts навсегда 0, бюджет не сгорает никогда, эскалация не наступает.
+    # Гвардия по исходнику (класс #259/#308): текст отметки обязан быть РОВНО
+    # таким, каким его ищет conflict_rework_attempts, — и обязан строиться в
+    # проверке из той же константы (переименование в pulse_guard тоже красит
+    # этот тест). Мутация: переформулируй --body в task.sh (например, убери
+    # «worker run») — тест покраснеет.
+    task_sh = (Path(__file__).resolve().parent.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    expected = f'🤖 {sch.WORKER_GIT_STEP_MARKER} worker run ${{GITHUB_RUN_ID:-local}}'
+    assert expected in task_sh, (
+        "scripts/worker/task.sh потерял точный текст отметки git-шага "
+        f"({expected!r}) — conflict_rework_attempts перестанет засчитывать "
+        "попытки, бюджет конфликта не будет сгорать никогда (тихий отказ)"
+    )
 
 
 def test_conflict_overlap_hint_intersects_pr_and_main_changed_files(monkeypatch):
@@ -2322,6 +3345,7 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     dispatch_worker обязан промолчать."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -2373,19 +3397,86 @@ def test_after_merge_reads_files_through_paginated_helper():
     assert 'gh(f"repos/{repo}/pulls/{number}/files?per_page=100")' not in source
 
 
-# ── Пагинация таймлайна: тот же класс, тесно в один хелпер (#303, находка
-# ревью) — last_gate1_labeled_at и last_ready_labeled_at читали сырую
-# первую страницу timeline?per_page=100 без обхода, событие 'labeled' за
-# первой сотней молча терялось на длинном таймлайне ────────────────────────
+# ── Якорь таймеров #196/#269: commit status, не таймлайн-событие (находка
+# ревью #424) — last_gate1_labeled_at/last_ready_labeled_at раньше читали
+# 'labeled' в таймлайне (#303: полная пагинация вместо сырой первой страницы),
+# но #203 сделал перестановку вердикт-меток идемпотентной — 'labeled' не
+# выбрасывается вовсе, если новый пуш подтвердил тот же вердикт, и якорь
+# замерзал бы навсегда. Оба якоря переведены на review_labels.status_posted_at
+# (commit status на текущем head, публикуется каждым прогоном безусловно) ──
 
 
-def test_last_gate1_and_last_ready_read_timeline_through_paginated_helper():
+def test_last_gate1_and_last_ready_read_status_not_timeline():
+    # Гвардия по исходнику: обе функции обязаны ходить через
+    # review_labels.status_posted_at, не через список 'labeled' в таймлайне —
+    # поведенческие тесты ниже доказывают саму мутацию (пуш с тем же
+    # вердиктом всё равно двигает якорь вперёд).
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("review_labels.status_posted_at(") >= 3  # оба якоря + trigger_ai_review не читает лишний раз
+    assert "def last_gate1_labeled_at(repo: str, pull: dict)" in source
+    assert "def last_ready_labeled_at(repo: str, pull: dict)" in source
+
+
+def test_last_gate1_labeled_at_mutation_push_with_same_verdict_moves_anchor(monkeypatch):
+    # Находка ревью #424: пуш с ТЕМ ЖЕ вердиктом не выбрасывает 'labeled'
+    # (идемпотентность #203), но commit status публикуется безусловно на
+    # НОВОМ head — якорь обязан сдвинуться вперёд вместе с пушем, а не
+    # замереть на первой простановке метки.
+    p = {"head": {"sha": "sha-after-second-push"}}
+    fake = FakeGh({
+        "commits/sha-after-second-push/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-02T11:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_gate1_labeled_at(REPO, p)
+    assert result == utc(2026, 9, 2, 11, 0), (
+        "якорь обязан отражать статус ТЕКУЩЕГО head, даже если вердикт не "
+        "изменился и метка не переставилась"
+    )
+
+
+def test_last_gate1_labeled_at_none_when_status_never_posted(monkeypatch):
+    fake = FakeGh({"commits/nostatussha/statuses": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.last_gate1_labeled_at(REPO, {"head": {"sha": "nostatussha"}}) is None
+
+
+def test_last_ready_labeled_at_uses_later_of_both_statuses_on_current_head(monkeypatch):
+    p = {"head": {"sha": "readysha"}}
+    fake = FakeGh({
+        "commits/readysha/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-01T00:00:00Z"},
+            {"context": sch.review_labels.STATUS_AI_REVIEW, "created_at": "2026-09-01T01:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = sch.last_ready_labeled_at(REPO, p)
+    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух
+
+
+def test_last_ready_labeled_at_none_when_either_status_missing(monkeypatch):
+    p = {"head": {"sha": "onlyreviewsha"}}
+    fake = FakeGh({
+        "commits/onlyreviewsha/statuses": [
+            {"context": sch.review_labels.STATUS_REVIEW, "created_at": "2026-09-01T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.last_ready_labeled_at(REPO, p) is None
+
+
+def test_conflict_labeled_at_reads_timeline_through_paginated_helper():
     # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
-    # выше): обе функции обязаны ходить через review_labels.list_timeline
-    # (полный обход постранично), а не читать сырую первую страницу —
-    # поведенческая проверка самой пагинации живёт в
+    # выше): функции-читатели таймлайна конфликта (conflict_labeled_at и
+    # conflict_first_labeled_at, #588) обязаны ходить через
+    # review_labels.list_timeline (полный обход постранично), а не читать
+    # сырую первую страницу — поведенческая проверка самой пагинации живёт в
     # scripts/lib/test_review_labels.py::test_list_timeline_paginates_finds_event_beyond_first_page
-    # (мутация доказана там: обход убран — тест краснеет).
+    # (мутация доказана там: обход убран — тест краснеет). Сведение
+    # с main (#424): last_gate1/last_ready переведены на commit status
+    # (review_labels.status_posted_at) и таймлайн больше не читают — их
+    # гвардии живут в соседних тестах выше.
     source = SCRIPT.read_text(encoding="utf-8")
     assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
     assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
@@ -2460,24 +3551,6 @@ def test_open_task_issues_finds_all_beyond_first_page_real_form(monkeypatch):
     assert len(issues) == 106
     assert 248 not in numbers  # #248 — настоящий PR (несёт "pull_request"), не задача
     assert 86 in numbers  # последняя запись второй страницы — обход не потерял хвост
-
-
-def test_last_ready_labeled_at_finds_label_beyond_first_page_of_timeline(monkeypatch):
-    # Поведенческое доказательство на уровне вызывающей функции: labeled-события
-    # обеих меток-гейтов лежат за первой страницей (100 посторонних событий
-    # перед ними) — без полного обхода last_ready_labeled_at вернул бы None.
-    page1 = [{"event": "commented", "created_at": "2026-08-01T00:00:00Z"} for _ in range(100)]
-    page2 = [
-        {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-01T00:00:00Z"},
-        {"event": "labeled", "label": {"name": "ai:ok"}, "created_at": "2026-09-01T01:00:00Z"},
-    ]
-    fake = FakeGh({
-        "timeline?per_page=100&page=1": page1,
-        "timeline?per_page=100&page=2": page2,
-    })
-    patch_gh(monkeypatch, fake)
-    result = sch.last_ready_labeled_at(REPO, 999)
-    assert result == utc(2026, 9, 1, 1, 0)  # позже из двух — labeled ai:ok, найдено на второй странице
 
 
 # ── Мутация гвардии поведения 3: без вызова update-branch список пуст ────────────
@@ -3106,7 +4179,7 @@ def test_task_sh_composes_claim_via_worker_run_format():
     <id>», а пишет его task.sh (CLAIM_VIA). Переименование формата в одном
     месте без другого обязано краснить этот тест, а не молча сломать
     эвристику #220."""
-    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text()
+    task_sh = (Path(__file__).resolve().parents[1] / "worker" / "task.sh").read_text(encoding="utf-8")
     assert 'CLAIM_VIA="worker run ${GITHUB_RUN_ID' in task_sh
 
 
@@ -3832,6 +4905,7 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     покраснеет."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -3888,6 +4962,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     единственным, кто гасит dispatch_worker целиком."""
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
@@ -4445,6 +5520,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     с ещё открытой (на самом деле уже закрытой) issue и увидит её снова."""
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
     monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])

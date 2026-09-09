@@ -38,7 +38,7 @@ def test_repo_root_comes_from_cwd_not_from_script_location(tmp_path: Path):
     # и импорт не должен падать на отсутствии файла в cwd.
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--print-repo-root-for-test"],
-        cwd=tmp_path, capture_output=True, text=True,
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8",
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
     printed_root = Path(result.stdout.strip())
@@ -107,3 +107,24 @@ def test_idempotent_second_pass_finds_nothing(tmp_path: Path):
     second = acc.rewrite_inbound_links(tmp_path, "walking-skeleton")
 
     assert second == {}
+
+
+def test_main_calls_checker_with_fast_path_only():
+    # Умышленное ограничение области (см. докстринг модуля): main() обязан
+    # звать check_unarchived_complete_changes ТОЛЬКО с changes_dir — второй,
+    # независимый путь завершённости (proposal.md + задача completed + нет
+    # открытого PR) требует сетевых данных (task_states/open_pull_texts) и
+    # на живом репозитории 2026-09-07 нашёл backlog в 23 каталога. Подключить
+    # его сюда означало бы, что archive-fixup (job на КАЖДЫЙ pull_request)
+    # молча закоммитит и запушит git mv по четверти всех change без ревью —
+    # массовая архивация обязана идти отдельными просмотренными PR, не
+    # побочным эффектом чужого пуша. Мутация: допиши второй позиционный
+    # аргумент в вызове ниже в archive_complete_changes.py — тест краснеет.
+    source = (Path(__file__).resolve().parent / "archive_complete_changes.py").read_text(
+        encoding="utf-8"
+    )
+    assert "check_unarchived_complete_changes(OPENSPEC_CHANGES)" in source, (
+        "main() обязан звать check_unarchived_complete_changes с ОДНИМ аргументом "
+        "(changes_dir) — второй путь завершённости не должен молча запускать "
+        "автокоммит/пуш по backlog'у, см. докстринг archive_complete_changes.py"
+    )

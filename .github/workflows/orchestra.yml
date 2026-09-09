@@ -21,8 +21,24 @@
 name: orchestra
 
 on:
+  # `edited` — правка тела/заголовка/базовой ветки PR (#599): единственный
+  # способ снять contract:failed без нового коммита, если нарушение было в
+  # ТЕЛЕ PR (например, запрещённая директива Closes/Fixes/Resolves рядом с
+  # #N, contract_check.py:184-191) — до этой строки автор мог поправить
+  # текст сколько угодно, метка висела вечно (живой случай PR #586: метка
+  # поставлена, тело исправлено, ни одного unlabeled после). Дешёвый
+  # приёмник события — только job `contract` ниже (`if: github.event_name
+  # == 'pull_request'`); job `orchestra` явно исключает pull_request
+  # (`if: github.event_name != 'pull_request'`) и `edited` его не трогает —
+  # безопасно расширять типы события на уровне всего workflow, а не заводить
+  # отдельный триггер под один job. Сам job `contract` — только чтения через
+  # `gh api` и разбор текста, без платных вызовов модели и без будильника
+  # другого workflow, поэтому лишние прогоны от частых правок тела не стоят
+  # ничего дороже нескольких секунд раннера; concurrency-группа ниже
+  # (`cancel-in-progress: true`) схлопывает подряд идущие правки одного PR
+  # в последний прогон.
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, edited]
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:

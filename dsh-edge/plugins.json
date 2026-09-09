@@ -16,9 +16,9 @@
       "id": "runner-bridge",
       "package": "@edge-harness/dsh-plugin-runner-bridge",
       "source": {
-        "release": "plugins-runner-v0.1.1",
-        "asset": "runner-bridge-0.1.1.tgz",
-        "sha256": "8ed9b451ffa731f1427f3425e818325dc198425d7197d003bc26d4c092b01733"
+        "release": "plugins-runner-bridge-v0.1.2",
+        "asset": "runner-bridge-0.1.2.tgz",
+        "sha256": "a056f22756b713d0c942b41b66204af75a0b11ad0135934709db11a140667b3a"
       },
       "server": true,
       "client": false
@@ -27,9 +27,9 @@
       "id": "plugin-manager",
       "package": "@edge-harness/dsh-plugin-manager",
       "source": {
-        "release": "plugins-plugin-manager-v0.1.8",
-        "asset": "plugin-manager-0.1.8.tgz",
-        "sha256": "8debd8e429bb1b563ce893a9473cfa8404877856a3241a936ea54d8c78d0ee8d"
+        "release": "plugins-plugin-manager-v0.1.9",
+        "asset": "plugin-manager-0.1.9.tgz",
+        "sha256": "487d415b51decd7664c18738e6277bc8b136d9d4458da58e6c35e4e6956e2244"
       },
       "server": false,
       "client": true
@@ -44,6 +44,17 @@
       },
       "server": true,
       "client": true
+    },
+    {
+      "id": "provider-registry",
+      "package": "@edge-harness/dsh-plugin-provider-registry",
+      "source": {
+        "release": "plugins-provider-registry-v0.1.1",
+        "asset": "provider-registry-0.1.1.tgz",
+        "sha256": "2ad628c62b61168783d288c4d7cc74b0aefb4a1601344f51d6263fd73059d5a9"
+      },
+      "server": true,
+      "client": false
     }
   ]
 }

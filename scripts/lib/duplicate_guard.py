@@ -46,18 +46,32 @@ issue наказывало бы разрешённый паттерн, а не �
 Это вход из терминала/промпта агента (`scripts/gh/issue-create`) — ровно тот
 канал, которым были заведены #518/#547/#564. Программные создатели issue
 (`scripts/lib/pool_issue.py::create_pool_issue`, которую зовут
-`stall_detector.py`/`upstream_drift.py`/`file_tasks.py`/`scheduler.py::after_merge`)
-этим модулем НЕ покрыты: у `stall_detector`/`upstream_drift` уже есть своя,
-более точная дедупликация (машинный отпечаток/точное сравнение версий);
-`file_tasks.py` уже сравнивает заголовки точным совпадением. Если появится
-ЖИВОЙ случай дубля именно из программного пути — это отдельная, более узкая
-задача (подключить `find_similar_open_tasks` к `create_pool_issue` явным
-opt-in параметром), не расширение этой.
+`stall_detector.py`/`upstream_drift.py`/`file_tasks.py`/`scheduler.py::after_merge`/
+`pulse_guard.py::failure_watch`) этим модулем НЕ покрыты: у
+`stall_detector`/`upstream_drift` уже есть своя, более точная дедупликация
+(машинный отпечаток/точное сравнение версий); `file_tasks.py` уже сравнивает
+заголовки точным совпадением. ЖИВОЙ случай дубля из программного пути уже
+случился для `failure_watch` (#578/#580/#589/#592/#598, дефект #610) и закрыт
+НЕ подключением `find_similar_open_tasks` сюда, а точным (не Jaccard)
+сравнением заголовка в самом вызывающем — заголовок там шаблонный
+(`f"CI: {workflow} падает — {job_name}"`), и токенная схожесть эту опасность
+только создала бы: «job-0» и «job-1» после токенизации по словам совпадают
+Jaccard'ом в 1.0 (замер), а обязаны оставаться РАЗНЫМИ классами. Урок общий
+для следующего программного создателя: на шаблонных заголовках нужен точный
+compare в вызывающем, не opt-in подключение этого модуля.
 
 Запуск тестов: python -m pytest scripts/lib/test_duplicate_guard.py -q
 """
 
 from __future__ import annotations
+
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
 
 import json
 import os

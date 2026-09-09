@@ -47,6 +47,14 @@ cat >"$FIXTURE" <<FIXEOF
 FIXEOF
 export DUPLICATE_GUARD_FIXTURE="$FIXTURE"
 
+# Приоритетная печать (#695) — сеть подменена фикстурой (пустой пул), этот
+# файл тестирует ТОЛЬКО дедуп по заголовку, не приоритет (тот —
+# issue-create-priority-gate.test.sh); все вызовы ниже несут --not-process-ack,
+# чтобы не упереться в новый тормоз #695 раньше проверяемого здесь.
+export PRIORITY_TOP_FIXTURE="$WORK/priority-fixture.json"
+echo '[]' >"$PRIORITY_TOP_FIXTURE"
+NOT_PROCESS_ACK=(--not-process-ack "не про приоритет, тест дедупа #566")
+
 cat >"$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
 if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
@@ -87,7 +95,7 @@ note() { echo "$@"; }
 
 # ── случай 1: похожий заголовок, БЕЗ --confirm-not-duplicate — отказ ─────────
 rm -f "$MARKER" "$CREATED_BODY"
-if bash "$SCRIPT_SRC" --title "$TITLE_564" --body b --label task >"$WORK/out1" 2>"$WORK/err1"; then
+if bash "$SCRIPT_SRC" --title "$TITLE_564" --body b --label task "${NOT_PROCESS_ACK[@]}" >"$WORK/out1" 2>"$WORK/err1"; then
   note "FAIL случай 1: похожий заголовок принят без --confirm-not-duplicate"; fail=1
 elif [ -f "$MARKER" ]; then
   note "FAIL случай 1: gh issue create был вызван, хотя похожая задача есть"; fail=1
@@ -100,7 +108,7 @@ fi
 # ── случай 2: похожий заголовок + --confirm-not-duplicate — принято, причина в теле ──
 rm -f "$MARKER" "$CREATED_BODY"
 if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "исходное тело" --label task \
-    --confirm-not-duplicate "разные причины отказа, не дубль" >"$WORK/out2" 2>"$WORK/err2"; then
+    --confirm-not-duplicate "разные причины отказа, не дубль" "${NOT_PROCESS_ACK[@]}" >"$WORK/out2" 2>"$WORK/err2"; then
   note "FAIL случай 2: --confirm-not-duplicate отклонён"; cat "$WORK/err2"; fail=1
 elif [ ! -f "$MARKER" ]; then
   note "FAIL случай 2: gh issue create не вызван при явном --confirm-not-duplicate"; fail=1
@@ -117,7 +125,7 @@ fi
 # ── случай 3: непохожий заголовок — принято без всякого флага ───────────────
 rm -f "$MARKER" "$CREATED_BODY"
 if ! bash "$SCRIPT_SRC" --title "Совсем другая задача про докер-канарейку" --body b --label task \
-    >"$WORK/out3" 2>"$WORK/err3"; then
+    "${NOT_PROCESS_ACK[@]}" >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: непохожий заголовок отклонён"; cat "$WORK/err3"; fail=1
 elif [ ! -f "$MARKER" ]; then
   note "FAIL случай 3: gh issue create не вызван для непохожего заголовка"; fail=1

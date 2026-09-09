@@ -8,7 +8,17 @@
 #   1) fetch + авторитетная сверка ls-remote — тихо упавший fetch base не выдаёт;
 #   2) самовосстановление core.hooksPath — гвардия свежести обязательна всегда.
 #
-# Использование: scripts/git/task-branch <номер>-<slug>
+# Рабочее дерево (#332): агенты заводили `.claude/worktrees/<...>` вручную кто
+# как — разнобой имён стал причиной трижды за сутки (агент правил чужую ветку
+# в чужом дереве, дифф чужой задачи затирался). Здесь дерево заводится/
+# переиспользуется по одному правилу (`.githooks/pre-commit` его же и
+# проверяет): `<корень репозитория>/.claude/worktrees/<номер>-<slug>`. В CI
+# (GITHUB_ACTIONS=true) поведение старое — переключение ветки в текущем
+# каталоге: воркер (scripts/worker/task.sh) уже работает в одноразовом
+# изолированном чекауте на один прогон, заводить там ещё и worktree незачем
+# и меняло бы каталог работы у уже написанного пайплайна.
+#
+# Использование: scripts/git/task-branch <номер>-<slug>   (без изменений)
 set -euo pipefail
 
 task="${1:-}"
@@ -114,17 +124,306 @@ if [ -n "$epic_task_num" ]; then
   fi
 fi
 
-git switch -c "agent/$task" refs/remotes/origin/main
-
-# Гвардия свежести ставится каждым запуском: пересозданный клон защищён сразу.
-git config core.hooksPath .githooks
-
-echo "Ветка agent/$task от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+branch="agent/$task"
 
 # Печать ключевых граблей инфраструктуры в момент старта задачи, а не когда-нибудь
 # потом «если вспомнить прочитать» (задача #323): task-branch — один из ДВУХ
 # входов в agent-ветку (второй — доводка уже открытого PR в scripts/worker/task.sh,
 # он тоже зовёт print_infra_digest напрямую, минуя этот файл, — см. #326 находка 1).
 # Текст — одно место правды в scripts/gh/infra_digest.sh, не копия здесь.
-source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
-print_infra_digest
+# Функция, а не копии: стартов задачи три (усыновление осиротевшей ветки,
+# CI-переключение, новое дерево) — путь печатается последним в каждом, грабли
+# идут перед ними. На переиспользовании (повторный вызов держателем) дайджест
+# не повторяется: агент его уже видел при старте, ему нужен путь.
+print_digest() {
+  source "$(dirname "${BASH_SOURCE[0]}")/../gh/infra_digest.sh"
+  print_infra_digest
+}
+
+# Сверка локальной ветки с origin/<branch> (находка ревью #333): локальная
+# голова могла отстать или разойтись с серверной — PR мог подвинуть другой
+# канал (оркестратор снимает исполнителя с конфликтного PR и диспатчит нового
+# воркера). Гвардия свежести в .githooks/pre-commit сверяет только origin/main
+# и этот стык не видит — коммит поверх чужой головы валился бы уже только на
+# пуше. Отказ — до работы, с командой синхронизации. Свои незапушенные коммиты
+# (origin — предок локальной головы) расхождением НЕ считаются: это штатная
+# середина работы держателя.
+branch_diverged_from_origin() {
+  git show-ref --verify -q "refs/remotes/origin/$branch" || return 1
+  local local_sha remote_sha
+  local_sha=$(git rev-parse "refs/heads/$branch")
+  remote_sha=$(git rev-parse "refs/remotes/origin/$branch")
+  [ "$local_sha" = "$remote_sha" ] && return 1
+  git merge-base --is-ancestor "$remote_sha" "$local_sha" && return 1
+  return 0
+}
+
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  # CI: одноразовый изолированный чекаут на прогон — worktree не нужен,
+  # старое поведение (переключение в текущем каталоге) сохранено как есть.
+  # Отказ «ветка уже существует» (#360) живёт и здесь: иначе claim (ниже)
+  # проходит, а `git switch -c` (ниже) падает на существующем имени — замок
+  # остаётся висеть до TTL-сборщика (24 ч), ровно тот осиротевший замок,
+  # от которого отказ защищает. Проверка ДО claim'а и ДО флага транспорта:
+  # существующая ветка — это доводка, у неё другой вход.
+  if git show-ref --verify --quiet "refs/heads/$branch" \
+     || git ls-remote --heads origin "refs/heads/$branch" | grep -q .; then
+    echo "ОШИБКА: ветка $branch уже существует — task-branch заводит только НОВЫЕ ветки." >&2
+    echo "  Доводи существующую: git fetch origin $branch && git checkout -B $branch origin/$branch," >&2
+    echo "  аренду для доводки возьми вручную (python3 scripts/lib/claim_task.py claim $task_number) ДО чекаута." >&2
+    exit 1
+  fi
+else
+  # ── Рабочее дерево (#332) ──────────────────────────────────────────────────
+  # Разрешение дерева стоит ДО аренды: повторный запуск на той же задаче
+  # обязан напечатать путь, а не отвалиться о собственный замок (claim не
+  # идемпотентен по актору, #356), и не оставить осиротевший замок — оба
+  # выхода ниже стоят до claim'а и ничего не захватывают (класс #360).
+  main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+  wt_dir="$main_root/.claude/worktrees/$task"
+
+  # Уже есть worktree на эту ветку (повторный запуск на той же задаче) —
+  # переиспользуем его, а не пытаемся завести дубль (git worktree add откажет
+  # сам, но сообщение должно указывать путь, а не сырой git-эксепшн).
+  #
+  # Только под .claude/worktrees/ (находка ревью #333): главная запись
+  # `worktree list` (корень репозитория) не годится — это и есть инцидент
+  # #332 (ветка задачи зачекаучена в главном дереве). Легализовать его тут
+  # значило бы тут же противоречить .githooks/pre-commit, которая коммит из
+  # главного дерева на agent/<N>-* отклонит. Ветка вне .claude/worktrees/ —
+  # заводим отдельное дерево по правилу, а не переиспользуем чужое место.
+  existing_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) cur_path="${line#worktree }" ;;
+      branch\ refs/heads/"$branch")
+        case "$cur_path" in
+          "$main_root"/.claude/worktrees/*) existing_path="$cur_path" ;;
+        esac
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [ -n "$existing_path" ]; then
+    if [ -d "$existing_path" ]; then
+      # Имя дерева обязано отвечать тому же правилу <N>-, что проверяет
+      # гвардия (находка ревью #333, раунд 4): легаси-дерево (например
+      # «246-lease-claim» на agent/121-...) иначе замыкает цикл — лечащая
+      # команда из отказа хука вечно печатает то же дерево, хук вечно
+      # отклоняет коммит. Путь не выдаём: отказ с переносом дерева; сам
+      # перенос делает владелец — скрипт существующие деревья не двигает и
+      # не удаляет (критерий #332).
+      wt_name=$(basename "$existing_path")
+      if [[ ! "$wt_name" =~ ^${task_number}(-|$) ]]; then
+        echo "ОШИБКА: дерево $existing_path закреплено за веткой $branch, но имя дерева не начинается с «$task_number-» — гвардия (#332) коммит там отклонит." >&2
+        echo "  Перенеси дерево на каноническое имя и повтори scripts/git/task-branch $task:" >&2
+        echo "    git worktree move \"$existing_path\" \"$wt_dir\"" >&2
+        exit 1
+      fi
+      if branch_diverged_from_origin; then
+        echo "ОШИБКА: локальная ветка $branch ($(git rev-parse --short "refs/heads/$branch")) разошлась с origin/$branch ($(git rev-parse --short "refs/remotes/origin/$branch"))." >&2
+        echo "  Её мог подвинуть другой канал — коммит поверх чужой головы не выдаю (класс #332/#333)." >&2
+        echo "  Синхронизируй дерево и повтори scripts/git/task-branch $task:" >&2
+        echo "    git -C \"$existing_path\" rebase origin/$branch" >&2
+        exit 1
+      fi
+      echo "Ветка $branch уже заведена — переиспользую рабочее дерево:"
+      echo "Напоминание: аренду здесь task-branch не берёт — доводка берёт её вручную (python3 scripts/lib/claim_task.py claim $task_number), если ещё не держишь." >&2
+      echo "$existing_path"
+      exit 0
+    fi
+    # Протухшая запись (находка ревью #333): каталог стёрт мимо
+    # `git worktree remove` — не молчать и не выдавать путь в никуда, а
+    # вычистить запись и завести дерево заново.
+    echo "Рабочее дерево $existing_path пропало с диска — чищу протухшую запись и завожу заново." >&2
+    git worktree prune
+  fi
+
+  if git rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
+    # Ветка существует, но нужного дерева под .claude/worktrees/ нет. Если она
+    # при этом зачекаучена ГДЕ-ТО ещё (например прямо в главном дереве —
+    # инцидент #332) — не легализуем это молча (находка ревью #333):
+    # `git worktree add` на такую ветку упадёт сырым git-фаталом, здесь —
+    # понятная ошибка с указанием, где ветка застряла.
+    checked_out_elsewhere=""
+    while IFS= read -r line; do
+      case "$line" in
+        worktree\ *) cur_path="${line#worktree }" ;;
+        branch\ refs/heads/"$branch") checked_out_elsewhere="$cur_path" ;;
+      esac
+    done < <(git worktree list --porcelain)
+    if [ -n "$checked_out_elsewhere" ]; then
+      echo "ОШИБКА: ветка $branch уже зачекаучена вне .claude/worktrees/:" >&2
+      echo "  $checked_out_elsewhere" >&2
+      echo "Не переиспользую чужое место (класс #332) — перенеси ветку туда самостоятельно:" >&2
+      echo "  git -C \"$checked_out_elsewhere\" switch - (вернуть исходную ветку)" >&2
+      echo "  git worktree add \"$wt_dir\" $branch" >&2
+      exit 1
+    fi
+    if branch_diverged_from_origin; then
+      echo "ОШИБКА: локальная ветка $branch ($(git rev-parse --short "refs/heads/$branch")) разошлась с origin/$branch ($(git rev-parse --short "refs/remotes/origin/$branch"))." >&2
+      echo "  Её мог подвинуть другой канал — под дерево ставлю только свежую ветку (класс #332/#333)." >&2
+      echo "  Синхронизируйся и повтори scripts/git/task-branch $task:" >&2
+      echo "    git branch -f $branch origin/$branch   # своих коммитов на ветке нет/не нужны" >&2
+      echo "    git worktree add \"$wt_dir\" $branch && git -C \"$wt_dir\" rebase origin/$branch   # нужны — усынови сам и перенеси" >&2
+      exit 1
+    fi
+    # Осиротела (нигде не зачекаучена) — заводим дерево на неё, не создавая
+    # вторую ветку. Аренду task-branch на путях переиспользования/усыновления
+    # не берёт (выходы стоят до claim'а, класс #360) — доводка берёт её
+    # вручную (WORKER-PLAYBOOK, п. 2–3), поэтому напоминание в каждом выводе.
+    git worktree add "$wt_dir" "$branch"
+    git config core.hooksPath .githooks
+    echo "Напоминание: аренду здесь task-branch не берёт — доводка берёт её вручную (python3 scripts/lib/claim_task.py claim $task_number), если ещё не держишь." >&2
+    echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+    echo "$wt_dir"
+    print_digest
+    exit 0
+  fi
+
+  # Ветки локально нет, но на origin она есть (чужой PR или работа прежнего
+  # прогона, дерево потеряно): молча заводить одноимённую ветку от origin/main
+  # нельзя — `git worktree add -b` создал бы локальную голову поверх чужой
+  # базы, и коммиты агента тихо подменили бы работу другого канала (класс
+  # #332; живое репро — находка ревью #333). Усыновляем СЕРВЕРНУЮ голову —
+  # «найдёт/заведёт» из WORKER-PLAYBOOK становится правдой.
+  if git show-ref --verify -q "refs/remotes/origin/$branch"; then
+    mkdir -p "$(dirname "$wt_dir")"
+    git worktree add -b "$branch" "$wt_dir" "refs/remotes/origin/$branch"
+    git config core.hooksPath .githooks
+    echo "Ветка $branch существует на origin — усыновляю серверную голову ($(git rev-parse --short "refs/remotes/origin/$branch"))."
+    echo "Напоминание: аренду здесь task-branch не берёт — доводка берёт её вручную (python3 scripts/lib/claim_task.py claim $task_number), если ещё не держишь." >&2
+    echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+    echo "$wt_dir"
+    print_digest
+    exit 0
+  fi
+  # Путь дерева занят (зарегистрированное дерево на другой ветке — легаси
+  # имена с числовым префиксом делают коллизию вероятной, — или просто
+  # посторонняя папка): падать сквозь claim на сыром `git worktree add`
+  # нельзя — аренда уже взята и остаётся висеть до TTL-сборщика (класс
+  # #360), а ветка успевает создаться (находка ревью #333, раунд 4, живое
+  # репро). Отказ ДО claim'а: называем занятие и лечение; разбор пути —
+  # действие владельца дерева, скрипт существующие деревья не трогает.
+  if [ -e "$wt_dir" ]; then
+    echo "ОШИБКА: путь $wt_dir занят (не пуст) — завести туда дерево задачи нельзя." >&2
+    echo "  Разберись с путём вручную, затем повтори scripts/git/task-branch $task:" >&2
+    echo "    git worktree list   # найти, какое дерево занимает путь" >&2
+    echo "    git worktree remove \"\$путь\"   # если это дерево задачи и оно больше не нужно" >&2
+    exit 1
+  fi
+  # Ветки нет ни локально, ни в дереве, ни на origin — падаем сквозь: аренда
+  # ниже, затем создание ветки СРАЗУ в дереве (хвост файла).
+fi
+
+# Аренда задачи (#121, ADR 0006) — до сих пор её брал только облачный воркер
+# (scripts/worker/task.sh); внешние агенты создавали ветку в обход claim, и
+# free_task() (scripts/worker/task.sh) считал такую задачу свободной — облачный
+# воркер мог взять работу, которую прямо сейчас делает внешний агент (#356).
+# Ветка создаётся только этим скриптом — забыть аренду здесь стало невозможно.
+# Тот же вход, что у воркера/hands (lease_cli, scripts/lib/lease.sh) — второй
+# путь claim'а не заводим.
+#
+# LEASE_ALREADY_CLAIMED=<номер> — транспорт (task.sh, dsh_task.sh) арендует
+# задачу раньше (до старта агента, ради дешёвого fail-fast) и пробрасывает
+# НОМЕР арендованной задачи сюда через окружение процесса-агента: без него
+# второй claim того же номера тем же держателем отклонился бы как «занято»
+# (claim не идемпотентен по актору) и валил бы штатный путь транспорта.
+#
+# Флаг несёт номер, а не булев признак. Булев признак был дырой (#356-фоллоуап,
+# найдено ревью): за один прогон агент может создать ВТОРУЮ ветку на ДРУГУЮ
+# задачу (playbook это допускает, например для сопутствующей задачи) — с
+# булевым флагом task-branch молча пропускал бы аренду второй задачи, приняв
+# чужую (первую) аренду за свою. Здесь claim пропускается, только когда номер
+# во флаге совпадает с номером ветки; иначе аренда берётся как обычно — это и
+# есть правильное поведение для второй задачи.
+#
+# Замок канало-агностичен по дизайну (#121: refs/locks/task-N не хранит, кто
+# именно держит замок, кроме свободного текста коммита) — все каналы работают
+# под одним логином, поэтому «идемпотентный claim по держателю» здесь опасен:
+# он не отличил бы «этот же прогон уже взял это же N» от «другой прогон под
+# тем же логином только что взял то же N» и тихо съел бы настоящую гонку,
+# которую и защищает замок. Явный номер во флаге такой путаницы не создаёт.
+# Находка ревью PR #360: раньше здесь заново вычислялся `task_num` более
+# мягким регэкспом (`grep -oE '^[0-9]+'` на всей строке `$task`), чем уже
+# провалидированный выше `task_number` (`${task%%-*}` + строгие `^[0-9]+$`,
+# строка 29) — на входе вроде `61.a-slug` проверка GitHub (строки 29-70
+# выше) пропускалась с предупреждением (task_number="61.a" не проходит
+# `^[0-9]+$`), а аренда всё равно ставилась на "61" — другое значение, не
+# то, что не прошло проверку. Переиспользуем `task_number` и ЕГО ЖЕ критерий
+# валидности — если он не прошёл, аренда пропускается тем же путём, что и
+# проверка GitHub, вместо тихой подмены на более короткое число.
+task_num="$task_number"
+if ! printf '%s' "$task_num" | grep -qE '^[0-9]+$'; then
+  task_num=""
+fi
+lease_claimed="${LEASE_ALREADY_CLAIMED:-}"
+
+if [ -n "$lease_claimed" ] && ! printf '%s' "$lease_claimed" | grep -qE '^[0-9]+$'; then
+  echo "ОШИБКА: LEASE_ALREADY_CLAIMED=«$lease_claimed» — не номер задачи. Транспорт обязан передавать номер арендованной задачи (например LEASE_ALREADY_CLAIMED=356), не булев флаг «1»/«true» — почини producer, не глотай проверку." >&2
+  exit 1
+fi
+
+if [ -n "$lease_claimed" ] && [ -n "$task_num" ] && [ "$lease_claimed" = "$task_num" ]; then
+  echo "Аренда уже взята транспортом для #$task_num (LEASE_ALREADY_CLAIMED=$lease_claimed) — task-branch её не повторяет."
+else
+  if [ -n "$lease_claimed" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: LEASE_ALREADY_CLAIMED=$lease_claimed относится не к этой ветке (задача #${task_num:-?}) — арендую #${task_num:-?} отдельно, как будто флага не было." >&2
+  fi
+  if [ -z "$task_num" ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: «$task» не начинается с номера задачи — аренда пропущена (branch без claim)." >&2
+  elif ! command -v gh >/dev/null 2>&1; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: gh недоступен (офлайн?) — аренда задачи #$task_num пропущена, ветка создаётся без неё." >&2
+  else
+    # GITHUB_REPOSITORY: в CI уже задан; локально берём тем же способом, что
+    # scripts/review/file_tasks.py::current_repo — gh repo view.
+    repo="${GITHUB_REPOSITORY:-}"
+    if [ -z "$repo" ]; then
+      repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+    fi
+    if [ -z "$repo" ]; then
+      echo "ПРЕДУПРЕЖДЕНИЕ: не удалось определить репозиторий (gh repo view, офлайн?) — аренда #$task_num пропущена." >&2
+    else
+      export GITHUB_REPOSITORY="$repo"
+      export CLAIM_VIA="${CLAIM_VIA:-task-branch (local)}"
+      source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/lease.sh"
+      claim_out="$(lease_cli claim "$task_num" 2>&1)" && claim_rc=0 || claim_rc=$?
+      if [ "$claim_rc" -eq 1 ]; then
+        echo "ОШИБКА: задача #$task_num уже арендована другим исполнителем: $claim_out" >&2
+        echo "  Кто держит: assignee и комментарий 🔒 в issue #$task_num (там канал и время аренды)." >&2
+        echo "  Что делать: возьми другую свободную задачу — ветка не создаётся." >&2
+        # Замок не хранит держателя (#121) — «занята» может означать и СВОЙ
+        # замок с прошлого умершего прогона (находка ревью PR #360): без этой
+        # строки агент по правилу «отказ = другой канал» уходит, оставляя замок
+        # висеть до TTL. Чужой живой замок так снимать нельзя.
+        echo "  Если замок твой же с прошлого прогона (прогон умер после claim'а): сними СВОЙ замок" >&2
+        echo "  и повтори — python3 scripts/lib/claim_task.py release $task_num; чужой живой замок так снимать нельзя." >&2
+        exit 1
+      elif [ "$claim_rc" -ne 0 ]; then
+        echo "ПРЕДУПРЕЖДЕНИЕ: claim_task сломался (rc=$claim_rc) — аренда #$task_num пропущена, ветка создаётся без неё: $claim_out" >&2
+      else
+        echo "Аренда взята: $claim_out"
+      fi
+    fi
+  fi
+fi
+
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  git switch -c "$branch" refs/remotes/origin/main
+  git config core.hooksPath .githooks
+  echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+  print_digest
+  exit 0
+fi
+
+# Гвардия свежести ставится в общем конфиге репозитория (git config без
+# --worktree пишет в <git-common-dir>/config) — общий для ВСЕХ worktree,
+# ставить заново в каждом дереве не нужно, но лишним не будет.
+git config core.hooksPath .githooks
+
+mkdir -p "$(dirname "$wt_dir")"
+git worktree add -b "$branch" "$wt_dir" refs/remotes/origin/main
+echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
+echo "Рабочее дерево (иди туда, коммить оттуда — .githooks/pre-commit это проверяет, #332):"
+echo "$wt_dir"
+print_digest

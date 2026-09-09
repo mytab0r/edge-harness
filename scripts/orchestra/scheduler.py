@@ -44,7 +44,12 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      только на факт создания/слияния PR, но и на его состояние в промежутке:
        a. review:ok без вердикта AI дольше порога (или ai:failed) — оркестратор
           сам дёргает ai-review.yml, с ограничением числа попыток на PR
-          (счётчик — маркер в комментариях PR, переживает перезапуск).
+          (счётчик — маркер в комментариях PR, переживает перезапуск), но
+          ТОЛЬКО за текущую эпоху review:ok — новый пуш даёт свежий бюджет
+          (#431). Исчерпание бюджета — не молчание: эскалация тем же каналом,
+          что предохранитель конвейера. quota_exhausted провайдера (#419) не
+          тратит автоповтор вовсе — сразу эскалация, ретраить его в CI
+          бессмысленно (docs/runbooks/switch-llm-provider.md).
        b. Красный обязательный чек или ai:changes-requested дольше порога —
           назначение снимается, задача возвращается в пул, PR не закрывается.
        c. После слияния — gh pr update-branch для остальных открытых PR,
@@ -53,15 +58,15 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
           подтягивание синхронизирует pr-review.yml/ai-review.yml и снимает
           валидный ai:*-вердикт без пользы для PR, которому рано сливаться.
           Конфликт (DIRTY) не молчит: строка в отчёте + метка conflict.
-          И даже среди подходящих — не все разом (#252, третий заход):
-          максимум один УСПЕШНО подтянутый кандидат за ПРОХОД — слот общий
-          и живёт в update_branch (не по одному на каждую точку вызова),
-          поэтому та же дисциплина держит и behind-ветку merge_queue ниже.
-          Остальные получают строку и ждут следующего прохода цикла слияний
-          (merge_loop, #297) — иначе подтягивание первого кандидата может
-          сбросить ai:ok второго тем же проходом. Раньше «проход» и «прогон»
-          совпадали (один merge_queue на весь запуск); с #297 прогон — это
-          несколько проходов подряд (см. пункт 3), у каждого свой слот.
+          До UPDATE_BRANCH_BUDGET_PER_PASS подтянутых кандидатов за ПРОХОД
+          (#252 третий заход, потолок поднят #761 — было «максимум один») —
+          счётчик общий и живёт в update_branch (не по одному на каждую
+          точку вызова), поэтому та же дисциплина держит и behind-ветку
+          merge_queue ниже. Кандидаты сверх бюджета получают строку и ждут
+          следующего прохода цикла слияний (merge_loop, #297). Раньше
+          «проход» и «прогон» совпадали (один merge_queue на весь запуск);
+          с #297 прогон — это несколько проходов подряд (см. пункт 3), у
+          каждого свой бюджет.
      Пороги — AI_REVIEW_RETRY_AFTER_MINUTES / AI_REVIEW_MAX_ATTEMPTS /
      UNHEALTHY_PR_AFTER_MINUTES в pulse_guard.py, рядом с остальными порогами
      предохранителя (одно место правды).
@@ -145,8 +150,17 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       #431→#538), не только свои.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import http.cookiejar
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -167,7 +181,9 @@ from pathlib import Path
 # серия красных и её сброс мержем #220 — там же: WORKER_WORKFLOW,
 # FAILURE_CONCLUSIONS, recent_runs, RESUME_MARKER).
 from pulse_guard import (
+    AI_REVIEW_EXHAUSTED_MARKER,
     AI_REVIEW_MAX_ATTEMPTS,
+    AI_REVIEW_QUOTA_MARKER,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
     CONFLICT_ESCALATION_MARKER,
@@ -178,6 +194,7 @@ from pulse_guard import (
     RESUME_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
     WATCHDOG_ISSUE,
+    WORKER_GIT_STEP_MARKER,
     WORKER_WORKFLOW,
     all_issue_comments,
     conveyor_gate,
@@ -185,6 +202,7 @@ from pulse_guard import (
     failure_watch,
     gh,
     heartbeat_check,
+    independent_pulse_check,
     issue_marker_times,
     merge_telegram_text,
     minutes_between,
@@ -570,8 +588,116 @@ def conflict_overlap_hint(repo: str, pull: dict) -> str:
     return ", ".join(sorted(pr_files & main_files))
 
 
-def conflict_rework_attempts(repo: str, pr_number: int) -> int:
-    return len(issue_marker_times(repo, pr_number, CONFLICT_REWORK_MARKER))
+def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки метки CONFLICT_LABEL (тот же приём, что
+    last_gate1_labeled_at: max(), не min() — метка могла сниматься/ставиться
+    несколькими эпизодами конфликта, нас интересует начало ТЕКУЩЕГО). Возраст
+    ИМЕННО эпизода конфликта, не возраст PR (issue #588, обход старых
+    конфликтов первыми в dispatch_conflict_rework): PR мог быть открыт неделю
+    назад и стать dirty только сегодня — created_at PR тут соврал бы про
+    голодание. None — событие не нашлось (таймлайн не отдал его / метки нет
+    вовсе).
+
+    Только для СОРТИРОВКИ очереди по возрасту — не путать с границей бюджета
+    conflict_rework_attempts (conflict_first_labeled_at ниже, min() вместо
+    max(): там нужна лифтайм-граница, не сбрасывающаяся по эпизодам)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
+    ]
+    return parse_time(max(labeled_at)) if labeled_at else None
+
+
+def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент ПЕРВОЙ простановки метки CONFLICT_LABEL за всю историю PR —
+    min(), не max() (в отличие от conflict_labeled_at выше, который нарочно
+    даёт старт ТЕКУЩЕГО эпизода — для сортировки очереди по возрасту).
+
+    Это граница лифтайм-бюджета conflict_rework_attempts (находка ревью PR
+    #597): владелец решил (issue #474, зафиксировано в дельта-спеке
+    openspec/changes/conflict-auto-rebase/specs/journal-tasks-hands/spec.md —
+    требование про бюджет попыток — и в docs/agents/LABELS.md, строка
+    `conflict`) — РОВНО одна авто-попытка ребейза на PR, счётчик
+    НЕ сбрасывается по эпизодам конфликта (тот же компромисс, что уже принят
+    для AI_REVIEW_MAX_ATTEMPTS). max() как граница обнулял бы бюджет каждый
+    раз, когда mark_conflicts снимает метку и ставит её заново на новом
+    дрейфе — min() лифтайм сохраняет. Защита от прогона-открывателя (см.
+    conflict_rework_attempts) при этом не теряется: даже первая простановка
+    метки случается уже ПОСЛЕ того, как PR создан и исходный прогон
+    завершился."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    labeled_at = [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
+    ]
+    return parse_time(min(labeled_at)) if labeled_at else None
+
+
+def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int:
+    """Число ЗАСЧИТАННЫХ попыток авто-ребейза (issue #588) — не сырых
+    диспатчей. CONFLICT_REWORK_MARKER ставится СРАЗУ на dispatch (защита от
+    гонки, см. докстринг dispatch_conflict_rework) как заметка для человека,
+    читающего PR, — это момент диспатча, не факт настоящей попытки, и она
+    больше не читается обратно этой функцией: замер живых случаев
+    (#567/#542/#408) — все три упали ДО git-шага (сеть/деплой морды,
+    отсутствующий скрипт), а бюджет CONFLICT_REWORK_MAX_ATTEMPTS=1 сгорал на
+    инфраструктуре, ни разу не дойдя до git rebase.
+
+    Засчитывается только прогон, САМ отметивший, что дошёл до git-шага:
+    комментарий «WORKER_GIT_STEP_MARKER worker run N» в комментариях ЗАДАЧИ
+    (scripts/worker/task.sh, ставится непосредственно перед прогоном DSH —
+    единственный устойчивый признак «агент реально получил промпт и мог
+    попытаться», не текст ошибки, тот протухнет при первой смене
+    формулировки). Атрибуция задаче — самим носителем: комментарий живёт в
+    той задаче, которую воркер получил входом `task`, чужую он не
+    комментирует.
+
+    Читаются КОММЕНТАРИИ, а не окно recent_runs(per_page=10) (блокирующая
+    находка ревью PR #597): засчитанная попытка выпадала из топ-10 свежих
+    прогонов worker.yml уже через ~2–3 часа живой истории (~3.3 слияния/час,
+    плюс ретраи и доводки — каждый даёт свой прогон), а попытка легитимно
+    живёт до 280 минут. Потерянная засчитанная попытка возвращала бы
+    attempts=0 на каждом следующем тике: PR с несошедшейся попыткой
+    получал бы адресный диспатч бесконечно, ни разу не дойдя до эскалации, —
+    голодание #588 перестроилось бы, а не ушлило. Комментарий git-шага —
+    постоянный след (id прогона + created_at в одном комментарии), его и
+    читаем; с границей ниже сравнивается время КОММЕНТАРИЯ, а не начала
+    прогона — отметка ставится в начале DSH-шага, расхождение минутное
+    (честная цена: прогон, стартовавший ДО простановки метки, но дошедший
+    до git-шага ПОСЛЕ неё, засчитается; PR-открывающий прогон так попасть
+    не может — свою отметку он ставит раньше, чем создаёт сам PR).
+
+    since = conflict_first_labeled_at(...), не conflict_labeled_at (находка
+    ревью PR #597): граница обязана быть лифтайм-, не по-эпизодной — иначе
+    снятие+повторная простановка метки (новый эпизод дрейфа) обнуляла бы
+    засчитанные попытки в обход задокументированного решения владельца
+    (#474). Без границы вовсе исходный прогон, ОТКРЫВШИЙ этот PR задолго до
+    того, как main ушёл вперёд (тот прогон тоже дошёл до git-шага — он и есть
+    источник PR), был бы ошибочно засчитан как попытка авто-РЕБЕЙЗА: его
+    отметка всегда старше первой простановки метки (PR создаётся этим же
+    прогоном ПОЗЖЕ отметки, метка приходит снаружи и того позже). Нет
+    метки/события — 0 (не «неизвестно считаем исчерпанным»: PR остаётся
+    доступным для дальнейшей обработки, смотри также docstring
+    dispatch_conflict_rework — ниже эта же величина участвует в решении на
+    равных с worker_runs_active)."""
+    since = conflict_first_labeled_at(repo, pr_number)
+    if since is None:
+        return 0
+    git_step_run = re.compile(
+        rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
+    )
+    counted: set[str] = set()
+    for comment in all_issue_comments(repo, task_number):
+        created_at = comment.get("created_at")
+        if not created_at or parse_time(created_at) < since:
+            continue
+        match = git_step_run.search(comment.get("body") or "")
+        if match:
+            counted.add(match.group(1))  # сет: повторная отметка того же прогона — не вторая попытка
+    return len(counted)
 
 
 def dispatch_conflict_rework(
@@ -593,9 +719,11 @@ def dispatch_conflict_rework(
     существует: GitHub REST отдаёт только mergeable_state, не конфликтующие
     ханки. Поэтому решение простое (владелец, issue #474): РОВНО одна
     авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1, лифтайм-
-    счётчик — маркер в комментариях PR, тот же приём, что
-    ai_review_retry_count, — НЕ сбрасывается по эпизодам конфликта, тот же
-    компромисс, что уже принят для AI_REVIEW_MAX_ATTEMPTS). Сошлось —
+    счётчик — conflict_rework_attempts выше, граница conflict_first_labeled_at,
+    — НЕ сбрасывается по эпизодам конфликта, тот же компромисс, что уже
+    принят для AI_REVIEW_MAX_ATTEMPTS; CONFLICT_REWORK_MARKER в комментарии
+    PR ниже — только заметка для человека на момент диспатча, счётчик её не
+    перечитывает). Сошлось —
     mark_conflicts снимет метку сама следующим проходом (это и есть признак
     «был дрейф», ПОСТфактум); не сошлось — эскалация владельцу (escalate,
     тот же канал, что предохранитель конвейера #120) с файлами-кандидатами
@@ -608,12 +736,40 @@ def dispatch_conflict_rework(
     dispatch_worker в этом же проходе: «ровно один workflow_dispatch воркера
     за пульс» не должно превратиться в два только из-за гонки — GitHub не
     гарантирует, что только что созданный прогон немедленно виден как
-    queued в следующем же запросе статуса."""
+    queued в следующем же запросе статуса.
+
+    Порядок обхода — от старейшего конфликта к новейшему (issue #588): сырой
+    порядок `pulls` (open_pulls(), `GET /pulls?state=open`) отдаёт НОВЫЕ PR
+    первыми, а один workflow_dispatch за проход (см. выше) раньше всегда
+    доставался самому свежему конфликту — замер живого репозитория: 10 из 14
+    конфликтных PR не получили ни одной попытки, возраст конфликта до 84
+    часов. conflict_labeled_at (момент простановки CONFLICT_LABEL), не
+    created_at PR: PR мог быть открыт неделю назад и стать dirty только
+    сегодня — возраст самого PR тут соврал бы про голодание, honest сигнал —
+    возраст ИМЕННО эпизода конфликта."""
     observations: list[str] = []
     actions: list[str] = []
     dispatched = False
     pool_by_number = {issue["number"]: issue for issue in pool}
-    for pull in pulls:
+    conflict_pulls = [
+        p for p in pulls
+        if CONFLICT_LABEL in {label["name"] for label in p["labels"]}
+    ]
+    # task_ref.resolve_pr_task — вычисление ЛОКАЛЬНОЕ (regex по имени ветки
+    # agent/N-slug), не HTTP-вызов: PR без объявленной задачи не может
+    # участвовать в дальнейшем цикле (ветка ниже сразу делает `continue`)
+    # — дешёвая фильтрация раньше дорогой (conflict_labeled_at — вызов
+    # timeline), а не только экономии ради: без неё PR, для которого нет
+    # смысла звать API вовсе, всё равно платил бы за сортировку.
+    schedulable, unscheduled = [], []
+    for p in conflict_pulls:
+        (schedulable if task_ref.resolve_pr_task(p) is not None else unscheduled).append(p)
+    schedulable.sort(
+        key=lambda p: conflict_labeled_at(repo, p["number"]) or parse_time(p["created_at"])
+    )
+    conflict_numbers = {p["number"] for p in conflict_pulls}
+    ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in conflict_numbers]
+    for pull in ordered_pulls:
         labels = {label["name"] for label in pull["labels"]}
         if CONFLICT_LABEL not in labels:
             continue
@@ -625,7 +781,7 @@ def dispatch_conflict_rework(
                 "(agent/N-slug) — авто-расшивка недоступна, нужен человек"
             )
             continue
-        attempts = conflict_rework_attempts(repo, number)
+        attempts = conflict_rework_attempts(repo, number, task_number)
         if attempts >= CONFLICT_REWORK_MAX_ATTEMPTS:
             # Гонка (найдена живым прогоном #474, PR #408: маркер попытки
             # ставится СРАЗУ на dispatch, а сам worker.yml идёт до 280 мин) —
@@ -673,13 +829,15 @@ def dispatch_conflict_rework(
             overlap_text = overlap or "не удалось определить (см. PR вручную)"
             # Находка ревью PR #478 ("алерт не гадает", AGENTS.md, тот же
             # класс, что инвариант 3/#472): единственный ПОДТВЕРЖДЁННЫЙ факт
-            # здесь — mergeable_state=dirty после одной попытки. Причину
-            # отсюда не различить: инфраструктурный сбой воркера (#476, живой
-            # прогон 34027035455 упал именно так — маркер попытки уже стоял
-            # бы, бюджет считался бы сгоревшим), квота, таймаут 280 минут,
-            # неудавшийся push дают тот же итог, что настоящий содержательный
-            # конфликт. Текст называет ФАКТ (conclusion последнего прогона,
-            # атрибутированного этой задаче), не утверждает причину.
+            # здесь — mergeable_state=dirty после одной ЗАСЧИТАННОЙ попытки
+            # (conflict_rework_attempts, #588: сбой ДО git-шага сюда уже не
+            # доходит — он не увеличивает attempts, PR получает новый
+            # адресный dispatch вместо эскалации). Причину отсюда всё ещё не
+            # различить: квота провайдера, таймаут 280 минут или неудавшийся
+            # push ПОСЛЕ того, как агент начал работу, дают тот же итог, что
+            # настоящий содержательный конфликт. Текст называет ФАКТ
+            # (conclusion последнего прогона, атрибутированного этой задаче),
+            # не утверждает причину.
             run_conclusion = last_worker_run_conclusion(repo, task_number)
             run_note = (
                 f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
@@ -744,10 +902,11 @@ def dispatch_conflict_rework(
 
 
 class UpdateBranchBudgetExhausted(RuntimeError):
-    """Слот update_branch этого ПРОХОДА уже занят (см. update_branch, #252,
+    """Бюджет update_branch этого ПРОХОДА исчерпан (см. update_branch, #252,
     третий заход; терминология уточнена в #297 — прогон планировщика теперь
-    может состоять из нескольких проходов, см. merge_loop) — не
-    инфраструктурный сбой, вызывающий код обязан поймать её отдельно и
+    может состоять из нескольких проходов, см. merge_loop; #761 — потолок
+    поднят со «слот на один успех» до счётчика UPDATE_BRANCH_BUDGET_PER_PASS)
+    — не инфраструктурный сбой, вызывающий код обязан поймать её отдельно и
     написать строку "подтянет следующий проход", а не смешивать с реальными
     ошибками update-branch (конфликт, сеть)."""
 
@@ -770,35 +929,65 @@ class AiReviewRunning(RuntimeError):
     список, и update_branch пробует снова без ручного вмешательства."""
 
 
-# Слот на один ПРОХОД (merge_queue + update_remaining_pulls внутри одного его
-# вызова), не на точку вызова внутри прохода: если бы дисциплина «максимум
-# один успешно подтянутый update-branch за проход» жила локальной переменной
-# внутри update_remaining_pulls (как было раньше), вторая точка вызова —
-# behind-ветка merge_queue ниже — могла бы независимо подтянуть ещё один PR
-# тем же проходом и снова запустить цикл push → сброс ai:ok → pr-review →
-# ai-review, который эта задача (#252) и закрывает. Слот живёт здесь, в самой
-# функции, которую обе точки вызова обязаны использовать для настоящего
-# push'а — обойти его, не обходя update_branch, нельзя. Если появится третья
-# точка вызова, ей тоже придётся идти через update_branch: другого способа
-# дёрнуть PUT .../update-branch в этом файле нет.
+# Бюджет на один ПРОХОД (merge_queue + update_remaining_pulls внутри одного
+# его вызова), не на точку вызова внутри прохода: если бы счётчик жил
+# локальной переменной внутри update_remaining_pulls, вторая точка вызова —
+# behind-ветка merge_queue ниже — могла бы независимо подтянуть ещё
+# UPDATE_BRANCH_BUDGET_PER_PASS PR тем же проходом, удвоив фактический
+# потолок. Счётчик живёт здесь, в самой функции, которую обе точки вызова
+# обязаны использовать для настоящего push'а — обойти его, не обходя
+# update_branch, нельзя. Если появится третья точка вызова, ей тоже придётся
+# идти через update_branch: другого способа дёрнуть PUT .../update-branch в
+# этом файле нет.
 #
-# До #297 «проход» и «прогон» планировщика совпадали — слот сбрасывался один
-# раз в начале main(). Теперь прогон — это цикл проходов (merge_loop), и
-# каждый проход обнуляет слот заново (см. reset_update_branch_budget ниже и
-# её вызов внутри merge_loop) — иначе цикл, обязанный обновить НЕСКОЛЬКО
-# разных PR подряд по одному за проход, застревал бы на первом же после
-# первого успешного update-branch.
-_update_branch_used_this_run = False
+# До #297 «проход» и «прогон» планировщика совпадали — счётчик сбрасывался
+# один раз в начале main(). Теперь прогон — это цикл проходов (merge_loop), и
+# каждый проход обнуляет счётчик заново (см. reset_update_branch_budget ниже
+# и её вызов внутри merge_loop).
+#
+# #761 — потолок «один успешно подтянутый PR за проход» (#252, третий заход)
+# был защитой от дефекта, который к 2026-09-08 уже починен: причина слота —
+# diff_fingerprint считался по sha блоба ГОЛОВЫ PR (review_labels.py, до #740),
+# поэтому любое подтягивание main меняло отпечаток файла, даже если патч
+# автора не сдвинулся ни на байт, и сбрасывало ai:ok — второй, дорогой гейт
+# (ai-review.yml) перезапускался вхолостую (замер #252: 142 прогона за 14.5ч).
+# PR #753 (задача #740, слито 2026-09-08T07:52:53Z) переписал
+# review_labels._file_content_key/diff_fingerprint на sha256 трёхточечного
+# `patch` (относительно merge-base PR-ветки, не относительно головы) — чистое
+# подтягивание main, не пересекающееся построчно с патчем автора, отпечаток
+# больше не меняет (см. docstринг _file_content_key и тест
+# test_update_branch_budget_raise_does_not_reopen_review_storm ниже). Держать
+# потолок «один за проход» после этого — тормоз без причины (AGENTS.md).
+#
+# Число UPDATE_BRANCH_BUDGET_PER_PASS обосновано замером на живом
+# репозитории (2026-09-08): 38 открытых PR, 25 из них проходят
+# should_update_branch (5 — оба вердикта зелёные, 20 — метка conflict;
+# `gh api repos/mytab0r/edge-harness/pulls?state=open&per_page=100`) — то
+# есть при старом бюджете «1 за проход» этому конкретному состоянию
+# репозитория понадобилось бы 25 проходов цикла слияний (до 20 минут
+# MERGE_LOOP_TIMEOUT_SECONDS, MERGE_LOOP_POLL_SECONDS=30 между проходами —
+# 25×30с = 750с чистого сна, почти весь таймаут). Секундарный лимит GitHub
+# API — 80 content-generating запросов/мин и 500/час (docs/research/21) —
+# каждый успешный update_branch тратит РОВНО один content-generating запрос
+# (сам PUT; обе проверки AiReviewRunning — GET, в лимит не считаются),
+# значит даже верхняя граница 50 в один проход — 50/500 часового лимита,
+# 10-кратный запас, и на порядок ниже 80/мин при любой разумной длительности
+# прохода. 50 выбрано с запасом ×2 над сегодняшним измеренным пиком (25) —
+# не «без потолка» (защита от аномального всплеска, например бага, который
+# резко пометит сотни PR conflict), но достаточно, чтобы сегодняшний реальный
+# бэклог подтянулся ЗА ОДИН проход, а не за 25.
+UPDATE_BRANCH_BUDGET_PER_PASS = 50
+_update_branch_calls_this_pass = 0
 
 
 def reset_update_branch_budget() -> None:
-    """Обнуляет слот update_branch. merge_loop вызывает это в начале КАЖДОГО
-    своего прохода (до #297 — main() вызывал один раз в начале всего
-    прогона) — без явного сброса единожды потраченный слот остался бы
-    закрытым до следующего прохода. Тесты сбрасывают его тем же вызовом перед
-    каждым сценарием (см. autouse-фикстуру в test_scheduler.py)."""
-    global _update_branch_used_this_run
-    _update_branch_used_this_run = False
+    """Обнуляет счётчик update_branch. merge_loop вызывает это в начале
+    КАЖДОГО своего прохода (до #297 — main() вызывал один раз в начале всего
+    прогона) — без явного сброса исчерпанный счётчик остался бы закрытым до
+    следующего прохода. Тесты сбрасывают его тем же вызовом перед каждым
+    сценарием (см. autouse-фикстуру в test_scheduler.py)."""
+    global _update_branch_calls_this_pass
+    _update_branch_calls_this_pass = 0
 
 
 def update_branch(repo: str, pr_number: int) -> None:
@@ -808,27 +997,30 @@ def update_branch(repo: str, pr_number: int) -> None:
     after_merge → update_remaining_pulls (#196, поведение 3: подтянуть
     остальных после слияния).
 
-    Слот на проход (см. _update_branch_used_this_run выше; #297 разделило
-    понятия «проход» и «прогон» — см. merge_loop): вторая попытка подтянуть
-    ЛЮБОЙ PR этим же проходом — из любой точки вызова — кидает
-    UpdateBranchBudgetExhausted вместо push'а. Успех отмечает слот занятым;
-    неудачная попытка (RuntimeError/CalledProcessError, вероятный конфликт)
-    слот не трогает — head не изменился, следующий кандидат в этом же
-    проходе ничем не рискует.
+    Бюджет на проход (см. UPDATE_BRANCH_BUDGET_PER_PASS/
+    _update_branch_calls_this_pass выше; #297 разделило понятия «проход» и
+    «прогон» — см. merge_loop; #761 — счётчик вместо булева слота):
+    (UPDATE_BRANCH_BUDGET_PER_PASS + 1)-я попытка подтянуть ЛЮБОЙ PR этим же
+    проходом — из любой точки вызова — кидает UpdateBranchBudgetExhausted
+    вместо push'а. Успех увеличивает счётчик на 1; неудачная попытка
+    (RuntimeError/CalledProcessError, вероятный конфликт) счётчик не трогает
+    — head не изменился, следующий кандидат в этом же проходе ничем не
+    рискует.
 
     Тормоз гонки «оркестратор двигает head, пока по нему летит ai-review»
     (см. AiReviewRunning выше, живой инцидент 2026-09-06, PR #488): ПЕРЕД
-    самим push'ом (и до расхода слота — неудачная попытка слот не трогает)
+    самим push'ом (и до расхода бюджета — неудачная попытка его не трогает)
     проверяется, нет ли прогона ai-review.yml (in_progress/queued) для
     именно этого PR. Один и тот же предикат, что уже отказывает ручному
     workflow_dispatch того же PR (`review_labels.other_active_ai_review_runs`,
     #399) — второй копии этой проверки не заводится, обе точки входа (ручной
     повтор ревью и автоматическое подтягивание ветки) читают один и тот же
     список активных прогонов."""
-    global _update_branch_used_this_run
-    if _update_branch_used_this_run:
+    global _update_branch_calls_this_pass
+    if _update_branch_calls_this_pass >= UPDATE_BRANCH_BUDGET_PER_PASS:
         raise UpdateBranchBudgetExhausted(
-            f"слот update_branch этого прогона уже занят до PR #{pr_number}"
+            f"бюджет update_branch этого прохода ({UPDATE_BRANCH_BUDGET_PER_PASS}) "
+            f"исчерпан до PR #{pr_number}"
         )
     running = review_labels.other_active_ai_review_runs(repo, pr_number, exclude_run_id=None, gh_func=gh)
     if running:
@@ -842,12 +1034,12 @@ def update_branch(repo: str, pr_number: int) -> None:
         subprocess.run(
             ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch",
              "-H", f"Authorization: Bearer {pat}"],
-            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+            capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
             check=True,
         )
     else:
         gh("-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch")
-    _update_branch_used_this_run = True
+    _update_branch_calls_this_pass += 1
 
 
 def update_branch_or_report(
@@ -966,7 +1158,7 @@ def merge_queue(
 
     Наблюдения vs действия разведены по #456: причины ПРОПУСКА кандидата
     (черновик, не тот mergeable_state, проверки не готовы/красные, гейт меток
-    не пройден, слот update_branch уже занят этим же проходом) ничего не
+    не пройден, бюджет update_branch этого прохода исчерпан) ничего не
     меняют — раньше они попадали в тот же список, что реальное слияние или
     обновление ветки, и делали merge_lines непустым на каждом проходе с
     открытой, но не готовой очередью PR (обычное дело), заставляя main()
@@ -977,10 +1169,11 @@ def merge_queue(
     заново); признак обновления ветки решает, ждать ли следующую попытку
     (проверки только что перезапущены) или остановиться немедленно (эта
     попытка ничего не сдвинула, повтор без нового внешнего события даст тот
-    же результат). Один проход этой функции по-прежнему обновляет НЕ БОЛЬШЕ
-    ОДНОЙ ветки (сериализация #252/#288 не меняется) — цикл вокруг может
-    делать таких проходов несколько подряд, каждый со своим слотом
-    update_branch (см. merge_loop)."""
+    же результат). Один проход этой функции обновляет НЕ БОЛЬШЕ
+    UPDATE_BRANCH_BUDGET_PER_PASS веток (#761 — было «не больше одной»,
+    #252/#288; счётчик общий с update_remaining_pulls, см. update_branch) —
+    цикл вокруг может делать таких проходов несколько подряд, каждый со
+    своим бюджетом update_branch (см. merge_loop)."""
     actions: list[str] = []
     skipped = []
     updated = False
@@ -1003,15 +1196,16 @@ def merge_queue(
                     "подтягивание пропущено (#252)"
                 )
                 continue
-            # Слот update_branch — на этот ПРОХОД функции (см. merge_loop,
+            # Бюджет update_branch — на этот ПРОХОД функции (см. merge_loop,
             # #297): эта ветка и update_remaining_pulls после слияния делят
-            # один и тот же слот внутри update_branch, поэтому здесь тоже
+            # один и тот же счётчик внутри update_branch, поэтому здесь тоже
             # возможен UpdateBranchBudgetExhausted, а не только сетевой сбой.
             # Обработка обоих исходов — в update_branch_or_report (#288), не здесь.
             success_text = f"#{pull['number']} — обновлена из main, проверки пойдут заново"
             budget_exhausted_text = (
-                f"#{pull['number']} — behind main и близок к слиянию, но слот update_branch "
-                "этого прохода уже занят другим PR; подтянет следующая итерация цикла слияний (#252/#297)"
+                f"#{pull['number']} — behind main и близок к слиянию, но бюджет update_branch "
+                f"этого прохода ({UPDATE_BRANCH_BUDGET_PER_PASS}) исчерпан; подтянет следующая "
+                "итерация цикла слияний (#252/#297/#761)"
             )
             ai_review_running_text = (
                 f"#{pull['number']} — behind main и близок к слиянию, но по нему прямо сейчас летит "
@@ -1089,12 +1283,13 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool
     значение — тот же снимок, что дал бы свежий open_pulls(repo) в момент
     возврата, без отдельного HTTP-вызова.
 
-    Каждая итерация — один проход merge_queue (сериализация «одно слияние
-    или одно обновление ветки за проход» не меняется, #252/#288); слот
-    update_branch сбрасывается заново КАЖДУЮ итерацию (было — один раз на
-    весь прогон), поэтому цикл способен обновить несколько РАЗНЫХ PR подряд —
-    но не больше одного за проход, тот же тормоз, что раньше защищал ai:ok
-    от одновременного сброса у нескольких кандидатов сразу.
+    Каждая итерация — один проход merge_queue (сериализация «одно слияние за
+    проход» не меняется, #252/#288; «одно обновление ветки за проход» —
+    поднято до UPDATE_BRANCH_BUDGET_PER_PASS, #761); бюджет update_branch
+    сбрасывается заново КАЖДУЮ итерацию (было — один раз на весь прогон),
+    поэтому цикл способен обновить несколько РАЗНЫХ PR подряд — до
+    UPDATE_BRANCH_BUDGET_PER_PASS за проход (см. update_branch, почему это
+    больше не тормозит ai:ok — #740).
 
     Останов, любое из условий:
       - слито MERGE_LOOP_MAX_MERGES PR (потолок числа слияний за прогон);
@@ -1112,7 +1307,7 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool
     merged_count = 0
     deadline = time.monotonic() + MERGE_LOOP_TIMEOUT_SECONDS
     while merged_count < MERGE_LOOP_MAX_MERGES and time.monotonic() < deadline:
-        # Слот на ЭТОТ проход (см. merge_queue) — сбрасывается заново каждую
+        # Бюджет на ЭТОТ проход (см. merge_queue) — сбрасывается заново каждую
         # итерацию, не один раз на весь прогон (было так до #297).
         reset_update_branch_budget()
         iter_observations, iter_actions, iter_hard_failure, merged_number, updated = merge_queue(repo, pulls)
@@ -1295,6 +1490,41 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
 # намеренно вне скоупа: то и другое либо уже видно живым транскриптом (агент
 # сам вызывает `gh pr create` внутри хода), либо секунды спустя сменяется
 # слиянием — отдельное отслеживание потребовало бы нового маркера/опроса.
+# Счётчик процесса (#794): монотонно растёт на каждую заметку за весь прогон
+# scheduler.py, а не за один вызов append_session_notes — main() зовёт эту
+# функцию из трёх разных мест за один запуск (after_merge, unhealthy_pulls,
+# accept_merged_tasks), и одна и та же сессия harness-<N> может получить
+# заметку из более чем одного места за один пульс.
+_SESSION_NOTE_SEQ = itertools.count()
+
+
+def _session_note_message_id(session_id: str) -> str:
+    """Идентификатор message.id заметки-итога (#794).
+
+    dsh-session::assertMessageEventShape (dsh-session/lib/index.js, пин
+    0.1.2-rc.1 — proof в PR #794) валит холодную загрузку сессии без
+    непустой строки message.id: «session event at seq N lacks an identified
+    message». Проверено на самом пакете: без id — падает с этим текстом;
+    с id, но без остальной формы сообщения — падает на другом поле
+    («message has invalid source»), то есть один только id недостаточен
+    (см. append_session_notes ниже, там же остальная форма).
+
+    Формат id — тот же приём, что апстрим сам применяет при миграции старых
+    сообщений без identity (dsh-session-persistence/lib/index.js::legacyMessageId,
+    `legacy-message:${id}:${seq}`): составной, не случайный. Реальный seq
+    события здесь неизвестен — его назначает сервер внутри session.append,
+    писатель его не видит, поэтому вместо seq — счётчик процесса
+    (_SESSION_NOTE_SEQ), уникальный в пределах одного запуска scheduler.py.
+    Уникальность МЕЖДУ запусками даёт GITHUB_RUN_ID — эта функция вызывается
+    только изнутри workflow'а orchestra (переменная в GitHub Actions задана
+    всегда); Date.now-подобная случайность как единственный источник не
+    нужна и не используется — 'local' ниже это не тайбрейкер, а честная
+    метка «вызвано вне Actions» (локальный прогон/тест), где два запуска
+    подряд в пределах одной секунды и так не пишут в одну морду."""
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    return f"harness-note:{session_id}:{run_id}:{next(_SESSION_NOTE_SEQ)}"
+
+
 def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]:
     """notes — [(номер задачи, текст заметки), …], собранные вызывающей
     функцией за ОДИН проход (не по одной заметке): один логин в морду на весь
@@ -1324,7 +1554,16 @@ def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]
             "type": "assistant/message",
             "data": {
                 "turn": 1, "step": 1,
-                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                "message": {
+                    "id": _session_note_message_id(session_id),
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                    # kind обязан быть "model" (assertMessageEventShape) — эта
+                    # заметка не результат вызова модели, а системная запись
+                    # scheduler.py; provider/model называют это честно, а не
+                    # выдают заметку за настоящий ответ провайдера.
+                    "source": {"kind": "model", "provider": "orchestra-scheduler", "model": "session-note"},
+                },
             },
         }
         try:
@@ -1428,7 +1667,7 @@ def dispatch_deploy_on_merge(files: list[dict], prefix: str, workflow: str) -> b
         return False
     subprocess.run(
         ["gh", "workflow", "run", workflow, "--ref", "main"],
-        capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+        capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
         check=True,
     )
     return True
@@ -1655,30 +1894,38 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     близок к слиянию (оба вердикта зелёные) или уже в конфликте (подтягивание
     может его расшить).
 
-    Максимум один УСПЕШНО подтянутый кандидат за ПРОХОД, не за вызов этой
-    функции (#252, третий заход; терминология «проход» vs «прогон» уточнена
-    в #297 — см. merge_loop): подтягивание близких к слиянию PR меняет их
-    head — и само может сбросить их же `ai:ok` (pr-review.yml перезапускается
-    на пуш и снимает ai:*-метки, если дифф реально изменился — #294), то есть
-    тот кандидат, который секунду назад проходил предикат, после первого же
-    подтягивания может из него выпасть. Подтягивать сразу нескольких в одном
-    проходе — значит гонять этот цикл несколько раз без паузы на проверки.
-    Слот общий с behind-веткой merge_queue: обе точки вызова делят один и тот
-    же счётчик внутри update_branch (_update_branch_used_this_run), а не по
-    локальной переменной на каждую точку вызова — иначе поведение осталось
-    бы прежним, просто с двумя независимыми лимитами по одному вместо одного
-    общего. Слот считается занятым только УСПЕХОМ: неудачная попытка
+    Максимум UPDATE_BRANCH_BUDGET_PER_PASS успешно подтянутых кандидатов за
+    ПРОХОД, не за вызов этой функции (#252, третий заход, потолок поднят
+    #761; терминология «проход» vs «прогон» уточнена в #297 — см.
+    merge_loop). До #740 (PR #753, слито 2026-09-08) подтягивание кандидата
+    меняло его собственный head → `diff_fingerprint` (тогда — sha блоба
+    головы) менялся вслепую от чужого коммита → pr-review.yml перезапускался
+    на пуш и снимал `ai:ok` того же кандидата (#294), даже если патч автора
+    не сдвинулся ни на байт — тот кандидат, который секунду назад проходил
+    предикат, после собственного же подтягивания выпадал из него. Единый
+    слот «один за проход» был газом для этого узкого дефекта, не общим
+    правилом: после #740 diff_fingerprint считается по трёхточечному patch
+    (устойчив к чистому подтягиванию main без пересечения строк, см.
+    _file_content_key), собственный ai:ok кандидата чистое подтягивание
+    больше не сбрасывает — подтягивать несколько кандидатов подряд в одном
+    проходе теперь безопасно для их же вердиктов.
+    Бюджет общий с behind-веткой merge_queue: обе точки вызова делят один и
+    тот же счётчик внутри update_branch (_update_branch_calls_this_pass), а
+    не локальную переменную на каждую точку вызова — иначе поведение
+    осталось бы прежним, просто с двумя независимыми лимитами вместо одного
+    общего. Счётчик увеличивается только УСПЕХОМ: неудачная попытка
     (вероятный конфликт) не трогает head, значит следующий кандидат в этом
-    же вызове ничем не рискует. Пропущенные из-за уже занятого слота
-    кандидаты не молчат — они получают отдельную строку с указанием, что
-    подтянет их следующий проход цикла слияний (merge_loop, #297; слот
-    сбрасывается заново КАЖДЫЙ проход — reset_update_branch_budget внутри
-    merge_loop, не один раз на весь запуск, как было до #297).
+    же вызове ничем не рискует. Кандидаты, не уместившиеся в бюджет прохода,
+    не молчат — они получают отдельную строку с указанием, что подтянет их
+    следующий проход цикла слияний (merge_loop, #297; счётчик сбрасывается
+    заново КАЖДЫЙ проход — reset_update_branch_budget внутри merge_loop, не
+    один раз на весь запуск, как было до #297).
 
     Возвращает (наблюдения, действия) — разведено по #456: «не подтянут, не
-    близок к слиянию» и «слот уже занят другим PR» ничего не меняют (push не
-    делался вовсе); успешное обновление и сетевой сбой при реальной попытке
-    push'а — оба действия (второе — попытка с эффектом, пусть и неудачным)."""
+    близок к слиянию» и «бюджет update_branch этого прохода исчерпан» ничего
+    не меняют (push не делался вовсе); успешное обновление и сетевой сбой при
+    реальной попытке push'а — оба действия (второе — попытка с эффектом,
+    пусть и неудачным)."""
     observations: list[str] = []
     actions: list[str] = []
     for other in other_pulls:
@@ -1692,9 +1939,9 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
             continue
         # Обработка всех четырёх исходов — в update_branch_or_report (#288), не здесь.
         budget_exhausted_text = (
-            f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — слот "
-            "update_branch этого прогона уже занят другим PR; подтянет следующий прогон "
-            "оркестратора (#252)"
+            f"⏭️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — бюджет "
+            f"update_branch этого прохода ({UPDATE_BRANCH_BUDGET_PER_PASS}) исчерпан; подтянет "
+            "следующий прогон оркестратора (#252/#761)"
         )
         ai_review_running_text = (
             f"⏸️ PR #{other['number']} не подтянут из main после слияния #{merged_number} — по нему "
@@ -2155,12 +2402,20 @@ def dispatch_worker(
 # ── #196, поведение 1: готовый PR без вердикта — дёрнуть гейт самому ─────────────
 # Триггер: гейт 1 отработал (review:ok ИЛИ review:large — review_labels.
 # gate1_decided, #432; или ai:failed — «ревью не состоялось ИЛИ провалено»,
-# ADR 0007) дольше AI_REVIEW_RETRY_AFTER_MINUTES с момента ПОСЛЕДНЕГО события
-# "labeled" по любой из этих двух меток в таймлайне PR (новый пуш переставляет
-# метку заново — см. review_labels.py, значит и таймер обязан отсчитывать от
-# последней перестановки, а не от первого появления PR). ai:changes-requested
-# и ai:ok сюда не попадают — это не «нет вердикта», это готовый вердикт
-# (обрабатывает unhealthy_pulls/merge_queue соответственно).
+# ADR 0007) дольше AI_REVIEW_RETRY_AFTER_MINUTES с момента публикации
+# commit status `harness/review` на ТЕКУЩЕМ head (review_labels.
+# status_posted_at). ai:changes-requested и ai:ok сюда не попадают — это не
+# «нет вердикта», это готовый вердикт (обрабатывает unhealthy_pulls/
+# merge_queue соответственно).
+#
+# Якорь — commit status, не таймлайн-событие "labeled" (находка ревью #424,
+# живой класс): #203 сделал перестановку вердикт-меток идемпотентной — новый
+# пуш с ТЕМ ЖЕ вердиктом больше не выбрасывает "labeled" вовсе, и таймер,
+# отсчитывающий от последней перестановки, замер бы навсегда на первой
+# простановке. `check_pr.py` публикует `harness/review` КАЖДЫМ прогоном
+# безусловно на точный head (#345, второй канал для required status
+# checks) — этот сигнал не зависит от идемпотентности метки и обновляется
+# при каждом пуше, даже без смены вердикта.
 #
 # Носитель счётчика попыток — комментарий-маркер AI_REVIEW_RETRY_MARKER в самом
 # PR (issues/{n}/comments — тот же endpoint, что и у задач, PR это issue).
@@ -2170,32 +2425,112 @@ def dispatch_worker(
 # в namespace review_labels.py (там только вердикты, не попытки); 3) виден
 # человеку без доп. тулинга — то же качество, что у существующих следов
 # reap_stale/mark_conflicts.
+#
+# #431 (тормоз без газа, живой случай #367/#249): счётчик считался за ВСЮ
+# историю PR — после первых же AI_REVIEW_MAX_ATTEMPTS маркеров (пусть даже
+# растянутых на несколько РАЗНЫХ эпох review:ok) PR терял газ навсегда, а
+# исчерпание не вело ни к какому видимому действию. Теперь: 1) счётчик
+# считается только с якоря ТЕКУЩЕЙ эпохи (ai_review_retry_count(since=anchor)) —
+# новый пуш даёт свежий бюджет; 2) исчерпание эскалирует тем же каналом, что
+# предохранитель конвейера (issue #120 + Telegram), идемпотентно на PR+эпоху;
+# 3) quota_exhausted (провайдер, ai_dsh.sh/#419) не тратит автоповтор вовсе —
+# ретраить исчерпанную на неделю квоту внутри CI бессмысленно, эскалация сразу.
 
 
-def last_gate1_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент последней простановки вердикта гейта 1 — весь таймлайн (не
-    только первая страница, review_labels.list_timeline, #303: класс потери
-    хвоста на длинном таймлайне, тот же что list_pr_files/#294), None —
-    ни одна из меток гейта 1 не проставлялась вовсе.
+def last_gate1_labeled_at(repo: str, pull: dict) -> datetime | None:
+    """Момент публикации commit status `harness/review` на ТЕКУЩЕМ head PR
+    (review_labels.status_posted_at, #345) — якорь для таймера #196,
+    заменивший таймлайн-событие "labeled" (находка ревью #424): с #203
+    перестановка вердикт-меток идемпотентна, и `labeled` по гейту 1 не
+    выбрасывается вовсе, если новый пуш подтвердил ТОТ ЖЕ вердикт — старый
+    якорь замерзал на первой простановке метки навсегда. Commit status
+    публикуется `check_pr.py` каждым прогоном безусловно (второй канал
+    вердикта, #345), поэтому обновляется на каждом пуше, даже без смены
+    решения.
 
-    Смотрит на review:ok И на review:large (review_labels.GATE1_LABELS, #432)
-    — не только на review:ok, как было раньше (последнее событие «labeled:
-    review:ok» на PR #412 не наступает НИКОГДА, потому что verdict_for ставит
-    ровно одну из двух меток: PR с review:large никогда не получит review:ok,
-    и старая версия этой функции возвращала None навечно — trigger_ai_review
-    не мог посчитать возраст и не срабатывал вовсе, даже если сам входной
-    гейт (ниже) уже пропускал такой PR)."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") in review_labels.GATE1_LABELS
-    ]
-    return parse_time(max(labeled_at)) if labeled_at else None
+    Раньше эта же логика (таймлайн, review:ok/review:large, #432) была
+    задублирована в repo_invariants.py и уже расходилась дважды (#303,
+    #432) — теперь обе стороны читают один и тот же
+    review_labels.status_posted_at, третьего расхождения не заводим.
+
+    None — статус `harness/review` на этом head не публиковался вовсе."""
+    posted = review_labels.status_posted_at(
+        repo, pull["head"]["sha"], review_labels.STATUS_REVIEW, gh)
+    return parse_time(posted) if posted else None
 
 
-def ai_review_retry_count(repo: str, pr_number: int) -> int:
-    return len(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
+def ai_review_retry_count(repo: str, pr_number: int, since: datetime | None = None) -> int:
+    """Число уже потраченных автоповторов ai-review НА ЭТОМ PR — с момента
+    `since` (эпоха текущего review:ok, #431), либо за всю историю, если
+    since не задан (совместимость: last_gate1_labeled_at уже гарантирует
+    якорь для реальных вызовов trigger_ai_review, но функция остаётся
+    честной и без него)."""
+    times = issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER)
+    if since is not None:
+        times = [t for t in times if t > since]
+    return len(times)
+
+
+def latest_ai_failure_reason(repo: str, pr_number: int, anchor: datetime | None = None) -> str | None:
+    """Тег причины последнего вердикта error (review_labels.reason_tag,
+    ai_review.build_comment, #431) — факт `reason:` в шапке последнего
+    доверенного AI-комментария ЭТОЙ ЭПОХИ (созданного строго после `anchor`
+    — той же простановки review:ok/review:large, что уже скоупит
+    ai_review_retry_count). None — комментария нет, его вердикт не error,
+    тега ещё нет (комментарий написан до #431), либо единственный
+    подходящий комментарий старше anchor (эпоха прошлая — причина
+    неизвестна В ЭТОЙ эпохе) — тогда решение принимается по общему бюджету,
+    как раньше.
+
+    Находка ревью PR #439: без anchor функция читала последний доверенный
+    комментарий БЕЗ ограничения по эпохе — пуш с неизменным диффом
+    (подтягивание main) переставляет review:ok, открывая новую эпоху N+1, а
+    свежий прогон ai-review ещё не ответил (очередь раннеров — иногда часы,
+    docs/research/21); trigger_ai_review читал `reason: quota_exhausted` из
+    ПРОШЛОЙ эпохи N и закрывал автоповторы новой эпохи, не дав ей ни одной
+    попытки."""
+    comment = review_labels.latest_ai_comment(repo, pr_number, gh, since=anchor)
+    if comment is None:
+        return None
+    facts = review_labels.header_facts(comment.get("body") or "")
+    if facts.get("reviewer") != "error":
+        return None
+    return facts.get("reason")
+
+
+# ── #727: авто-повтор не жжётся вслепую в ту же квоту ────────────────────────
+# Фактическая причина ai:failed «all_providers_exhausted» несёт факт `reset-at`
+# в шапке комментария (ai_review.build_comment, header_facts) — «имя: дата;
+# имя2: дата2» для КАЖДОГО опробованного провайдера. Ближайший момент, когда
+# повтор МОЖЕТ иметь смысл, — минимум этих дат (первый освободившийся
+# провайдер), не максимум: как только освободится хотя бы один, цепочка
+# снова жива.
+AI_REVIEW_CHAIN_COOLDOWN_MARKER = "[цепочка провайдеров: авто-повтор придержан]"
+
+
+def parse_reset_hint_dates(reset_hint: str) -> list[datetime]:
+    """Разбирает «имя: дата; …» (ai_review.build_comment, #727) в список
+    дат — прод-форма встречается в ДВУХ видах: ISO («2026-09-10T00:00:00Z»,
+    смоук-фикстура dsh-clients.smoke.sh) и «YYYY-MM-DD HH:MM:SS» без зоны
+    (живой прогон 34176910458, «Your limit will reset at 2026-09-10
+    08:51:55») — вторая форма читается как UTC (dsh зону не называет, это
+    ближайшее разумное допущение, не факт). Строка, которая не разобралась
+    ни одним форматом, пропускается молча — вызывающий обязан трактовать
+    пустой результат как «даты нет», не как «дата в прошлом»."""
+    dates: list[datetime] = []
+    for chunk in (reset_hint or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        _, _, raw = chunk.partition(":")
+        raw = raw.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dates.append(datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc))
+                break
+            except ValueError:
+                continue
+    return dates
 
 
 def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list[str], list[str]]:
@@ -2212,19 +2547,145 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
         needs_retry = review_labels.AI_FAILED in labels
         if has_verdict and not needs_retry:
             continue  # ai:ok или ai:changes-requested — вердикт уже есть
-        anchor = last_gate1_labeled_at(repo, pull["number"])
+        anchor = last_gate1_labeled_at(repo, pull)
         if anchor is None:
             continue  # событие не нашлось — не на чем считать порог, не гадаем
         age = minutes_between(anchor, now)
         if age < AI_REVIEW_RETRY_AFTER_MINUTES:
             continue  # ещё не истёк порог ожидания вердикта
-        attempts = ai_review_retry_count(repo, pull["number"])
+        # needs_retry — два НЕЗАВИСИМЫХ фильтра «не жечь автоповтор вслепую»,
+        # оба смотрят на прошлый вердикт ai:failed до общего бюджета ниже
+        # (#196/#431/#727 — три задачи, один и тот же принцип «холостой повтор
+        # хуже честной эскалации»), проверяются по очереди:
+        if needs_retry:
+            # 1) Цепочка провайдеров исчерпана целиком (#727) и дата сброса
+            # известна и ещё не наступила — авто-повтор НЕ дёргает
+            # ai-review.yml вслепую в ту же квоту, эскалирует владельцу вместо
+            # этого (идемпотентно на эпизод — маркер держит один Telegram на
+            # всё окно ожидания). Сигнал — факт `reset-at` в шапке последнего
+            # комментария (может отсутствовать без anchor-скоупинга, читает
+            # всю историю PR: список дат сброса не зависит от эпохи review:ok).
+            comment = review_labels.latest_ai_comment(repo, pull["number"], gh)
+            facts = review_labels.header_facts(comment.get("body") or "") if comment else {}
+            reset_dates = parse_reset_hint_dates(facts.get("reset-at", ""))
+            if reset_dates and now < min(reset_dates):
+                next_viable = min(reset_dates)
+                marker = f"{AI_REVIEW_CHAIN_COOLDOWN_MARKER} #{pull['number']}"
+                already = issue_marker_times(repo, pull["number"], marker)
+                if already:
+                    observations.append(
+                        f"⏳ PR #{pull['number']}: цепочка провайдеров исчерпана до "
+                        f"{next_viable.isoformat()} — авто-повтор придержан (уже "
+                        "эскалировано), жду сброса"
+                    )
+                else:
+                    text = (
+                        f"🚨 edge-harness: PR #{pull['number']} — все провайдеры цепочки "
+                        f"исчерпаны, ближайший сброс {next_viable.isoformat()} — авто-повтор "
+                        "(#196) не дёргаю вслепую в ту же квоту.\n\n"
+                        "Что дальше:\n"
+                        "- Действие по умолчанию: ждать — новый пуш в PR или ручной "
+                        "workflow_dispatch ai-review.yml после даты сброса пройдёт как обычно.\n"
+                        "- Ускорить: добавить провайдера в vars.DSH_PROVIDER_CHAIN "
+                        "(docs/runbooks/switch-llm-provider.md)."
+                    )
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    post_issue_comment(repo, pull["number"], f"🤖 {marker}\n{text}\n({escalation})")
+                    observations.append(
+                        f"🚨 PR #{pull['number']}: цепочка исчерпана до {next_viable.isoformat()} "
+                        f"— эскалация вместо авто-повтора ({escalation})"
+                    )
+                continue
+            # 2) Квота провайдера исчерпана надолго (#431/#419), скоуплено ЭТОЙ
+            # эпохой (anchor) — тег причины `reason: quota_exhausted` в шапке,
+            # не требует известной даты сброса (в отличие от (1) выше): ждать
+            # квоту внутри CI бессмысленно в любом случае, эскалация с первого
+            # обнаружения, автоповтор не тратится вовсе.
+            reason = latest_ai_failure_reason(repo, pull["number"], anchor=anchor)
+            if reason == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
+                marker = f"{AI_REVIEW_QUOTA_MARKER} #{pull['number']}"
+                try:
+                    already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ PR #{pull['number']}: не смог сверить эскалацию квоты "
+                        f"#{WATCHDOG_ISSUE}: {error}"
+                    )
+                    continue
+                if any(marker_at > anchor for marker_at in already):
+                    continue  # уже эскалировано в этой эпохе — молчим
+                text = (
+                    f"🚨 edge-harness: {marker}\n"
+                    f"PR #{pull['number']}: ai-review упал с {review_labels.AI_FAILED} "
+                    f"(квота провайдера исчерпана надолго, {int(age)} мин без вердикта) — "
+                    "повтор внутри CI бессмысленен (docs/runbooks/switch-llm-provider.md). "
+                    "Автоповтор не трачу: нужно сменить провайдера или дождаться сброса "
+                    "квоты, затем новый пуш заведёт ревью заново."
+                )
+                result = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 PR #{pull['number']}: квота провайдера исчерпана — эскалировано "
+                    f"({result}), автоповтор не трачу"
+                )
+                continue
+
+        attempts = ai_review_retry_count(repo, pull["number"], since=anchor)
         if attempts >= AI_REVIEW_MAX_ATTEMPTS:
-            observations.append(
-                f"⏸️ PR #{pull['number']} без вердикта AI {int(age)} мин, но "
-                f"авто-повторов уже {attempts}/{AI_REVIEW_MAX_ATTEMPTS} — не дёргаю снова, нужен человек"
+            marker = f"{AI_REVIEW_EXHAUSTED_MARKER} #{pull['number']}"
+            try:
+                already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ PR #{pull['number']}: не смог сверить эскалацию исчерпания "
+                    f"#{WATCHDOG_ISSUE}: {error}"
+                )
+                continue
+            if any(marker_at > anchor for marker_at in already):
+                observations.append(
+                    f"⏸️ PR #{pull['number']} без вердикта AI {int(age)} мин, но "
+                    f"авто-повторов уже {attempts}/{AI_REVIEW_MAX_ATTEMPTS} в этой эпохе — "
+                    "уже эскалировано"
+                )
+                continue
+            text = (
+                f"🚨 edge-harness: {marker}\n"
+                f"PR #{pull['number']}: авто-повторов ai-review уже "
+                f"{attempts}/{AI_REVIEW_MAX_ATTEMPTS} с последней простановки review:ok, "
+                f"вердикта нет {int(age)} мин — дальше нужен человек (новый пуш заведёт "
+                "свежий бюджет, ручной `gh workflow run ai-review.yml -f pr=N` тоже работает)."
+            )
+            result = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 PR #{pull['number']}: авто-повторы исчерпаны "
+                f"({attempts}/{AI_REVIEW_MAX_ATTEMPTS}) — эскалировано ({result})"
             )
             continue
+
+        # Разрыв 2 (#779, самый дорогой из трёх — живой замер: три диспатча
+        # этой же функции по PR #711 за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z,
+        # весь бюджет эпохи на ОДНОМ отпечатке диффа): до этой строки функция
+        # проверяла гейт 1, наличие вердикта, порог возраста, кулдаун цепочки
+        # провайдеров, quota_exhausted и бюджет попыток — «летит ли прогон
+        # ЭТОГО PR прямо сейчас» в списке не было вовсе. Один и тот же
+        # предикат, что уже читают update_branch (AiReviewRunning выше) и
+        # ai_review.py::cmd_should_run (#399) — третьей копии не заводим.
+        # Проверка — ПЕРЕД самим диспатчем и ПЕРЕД маркер-комментарием
+        # AI_REVIEW_RETRY_MARKER: попытка (ai_review_retry_count) считается
+        # только по факту этого маркера, поэтому отказ здесь не тратит
+        # бюджет — следующий проход планировщика увидит тот же ai:failed и
+        # попробует снова, как только текущий прогон освободит счётчик
+        # активных (тот же газ, что у AiReviewRunning: чтение, разнесённое
+        # по времени).
+        active = review_labels.other_active_ai_review_runs(
+            repo, pull["number"], exclude_run_id=None, gh_func=gh)
+        if active:
+            run_ids = ", ".join(str(run.get("id")) for run in active)
+            observations.append(
+                f"⏳ PR #{pull['number']}: ai-review.yml уже летит (run {run_ids}) — "
+                "автоповтор не дублирую, попытка не потрачена"
+            )
+            continue
+
         gh(
             "-X", "POST", f"repos/{repo}/actions/workflows/ai-review.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[pr]={pull['number']}",
@@ -2340,29 +2801,39 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
 # потолка/таймаута цикла, а не остаточный баг.
 
 
-def last_ready_labeled_at(repo: str, pr_number: int) -> datetime | None:
-    """Момент, когда PR стал полностью готов к слиянию: позже из двух событий
-    'labeled' по обеим меткам-гейтам (review:ok, ai:ok) — тот же приём таймлайна
-    (весь таймлайн постранично, review_labels.list_timeline), что
-    last_gate1_labeled_at. None — событие по какой-то из меток не найдено
-    нигде в таймлайне (например, метка не проставлялась вовсе) — тогда
-    возраст не считаем, не гадаем по неполным данным.
+def last_ready_labeled_at(repo: str, pull: dict) -> datetime | None:
+    """Момент, когда PR стал полностью готов к слиянию: позже из двух commit
+    status'ов на ТЕКУЩЕМ head — `harness/review` и `harness/ai-review`
+    (review_labels.status_posted_at, #345). None — какой-то из двух статусов
+    на этом head не публиковался вовсе (например, гейт ещё не отработал) —
+    тогда возраст не считаем, не гадаем по неполным данным.
 
-    Намеренно ТОЛЬКО review:ok, не review_labels.gate1_decided (#432): готов к
-    СЛИЯНИЮ — это merge_label_gate, а он review:large не пропускает (блокирует
-    до review:large-ok) — «готовность» здесь про разрешение слияния, а не про
-    то, что гейт 1 вообще отработал."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    def labeled_at(label_name: str) -> list[str]:
-        return [
-            event["created_at"] for event in timeline
-            if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == label_name
-        ]
-    review_at = labeled_at(review_labels.REVIEW_OK)
-    ai_at = labeled_at(review_labels.AI_OK)
+    Якорь — commit status, не таймлайн-событие "labeled" (находка ревью
+    #424, тот же класс, что last_gate1_labeled_at): #203 сделал перестановку
+    ОБОИХ вердикт-меток идемпотентной (ai_review.py::cmd_verdict — тем же
+    классом, что check_pr.py), и "labeled: review:ok"/"labeled: ai:ok" не
+    выбрасываются вовсе, если очередной пуш подтвердил тот же вердикт —
+    старый якорь замерзал на первой обоюдной готовности навсегда,
+    `stale_ready_pulls` (#269) подавлял бы повторный сигнал условием
+    `marker_at > ready_since` бесконечно. Оба статуса публикуются каждым
+    прогоном безусловно (#345) — сигнал обновляется на каждом пуше.
+
+    Намеренно ТОЛЬКО review:ok (через STATUS_REVIEW == success, см.
+    review_status_state), не review_labels.gate1_decided (#432): готов к
+    СЛИЯНИЮ — это merge_label_gate, а он review:large не пропускает
+    (блокирует до review:large-ok) — «готовность» здесь про разрешение
+    слияния, а не про то, что гейт 1 вообще отработал. Сам commit status
+    `harness/review` публикуется при ЛЮБОМ вердикте (ok/changes-requested/
+    large), поэтому наличие статуса само по себе не значит «review:ok» —
+    вызывающий код (stale_ready_pulls) уже отфильтровал PR по
+    pr_is_merge_ready ДО вызова этой функции, здесь фильтрация не
+    дублируется."""
+    sha = pull["head"]["sha"]
+    review_at = review_labels.status_posted_at(repo, sha, review_labels.STATUS_REVIEW, gh)
+    ai_at = review_labels.status_posted_at(repo, sha, review_labels.STATUS_AI_REVIEW, gh)
     if not review_at or not ai_at:
         return None
-    return parse_time(max(max(review_at), max(ai_at)))
+    return parse_time(max(review_at, ai_at))
 
 
 def pr_is_merge_ready(repo: str, pull: dict) -> bool:
@@ -2414,7 +2885,7 @@ def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
         candidate = {**pull, "mergeable_state": single.get("mergeable_state")}
         if not pr_is_merge_ready(repo, candidate):
             continue
-        ready_since = last_ready_labeled_at(repo, pull["number"])
+        ready_since = last_ready_labeled_at(repo, candidate)
         if ready_since is None:
             continue
         age = minutes_between(ready_since, now)
@@ -3395,6 +3866,14 @@ def main() -> int:
     # кричим о пропавших пульсах — остальная работа может не иметь смысла,
     # если конвейер стоял.
     lines += heartbeat_check(repo, now)
+
+    # Сторож независимого DO-пульса (#689): heartbeat_check выше видит «жив»,
+    # если сработал ЛЮБОЙ канал workflow_dispatch, а событийный (wake_orchestra.sh)
+    # и независимый (cf-worker alarm(), GH_DISPATCH_TOKEN) дают один и тот же
+    # event — маскировка возможна ВНУТРИ heartbeat_check, не только между
+    # schedule/workflow_dispatch. Рядом с heartbeat_check — тот же «до всей
+    # остальной работы» довод.
+    lines += independent_pulse_check(repo, now)
 
     # Гвардия непрочитанных провалов ключевых workflow (#477): рядом с
     # heartbeat_check — тот же «до всей остальной работы» довод, дешёвый

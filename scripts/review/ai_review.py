@@ -53,6 +53,14 @@ error, неоднозначность никогда не одобряет.
 Среда: runner с gh, GH_TOKEN с правами pull-requests: write (gather/verdict).
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import argparse
 import importlib.util
 import json
@@ -173,12 +181,17 @@ FENCE_CLOSE_RE = re.compile(r"^`{4,}\s*$")
 # регэкспа, чтобы разбор поля diff не разошёлся между читателем и писателем.
 FACT_RE = review_labels.FACT_RE
 header_facts = review_labels.header_facts
+# transport_failed/reason_tag — одно место правды в review_labels.py (#431):
+# scheduler.trigger_ai_review читает тот же тег из шапки комментария
+# (facts["reason"]), второй копии классификации не заводим.
+transport_failed = review_labels.transport_failed
+reason_tag = review_labels.reason_tag
 
 
 def gh(*args: str) -> dict | list:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -189,11 +202,24 @@ def gh(*args: str) -> dict | list:
 def run_gh(*args: str) -> None:
     result = subprocess.run(
         ["gh", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:2])}: {result.stderr.strip()}")
+
+
+def pr_diff(pr: int) -> subprocess.CompletedProcess:
+    """`gh pr diff <pr>` как есть, без интерпретации rc/stdout — общий вызов
+    для ОБЕИХ веток cmd_gather (#687): список файлов непуст — единственный
+    источник диффа (обычный путь, как раньше); список пуст — второе
+    независимое подтверждение того, что дифф действительно пуст (список
+    файлов САМ ПО СЕБЕ недостаточен, см. cmd_gather)."""
+    return subprocess.run(
+        ["gh", "pr", "diff", str(pr)],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "NO_COLOR": "1"},
+    )
 
 
 def redact(text: str) -> str:
@@ -202,7 +228,7 @@ def redact(text: str) -> str:
     дублируются на второй язык), отказ громкий."""
     result = subprocess.run(
         ["bash", "-c", f'source "{_LIB.parent / "dsh-ci.sh"}"; redact'],
-        input=text, capture_output=True, text=True,
+        input=text, capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise RuntimeError(f"redact (dsh-ci.sh): {result.stderr.strip()}")
@@ -221,58 +247,135 @@ def parse_verdict(answer: str) -> str:
     return "error"
 
 
-def transport_failed(dsh_rc: str) -> bool:
-    """True — DSH не смог вызвать модель вовсе (rc≠0: сеть, 404, таймаут).
-
-    Единственный источник истины — код возврата dsh (ai_dsh.sh пишет его в
-    dsh_rc.txt, независимо от содержимого ответа). Пусто/не-число — код
-    неизвестен (экзотический обрыв шага раннера) и по умолчанию НЕ считается
-    транспортным сбоем: ложное «инфраструктура сломана» хуже, чем чуть менее
-    точный «модель ответила не по контракту» в редком крайнем случае.
-    """
-    try:
-        return int(dsh_rc) != 0
-    except (TypeError, ValueError):
-        return False
-
-
-def error_reason(answer: str, dsh_rc: str, failure_reason: str = "") -> str:
-    """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
+def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
+                  reset_hint: str = "", empty_rework: bool = False) -> str:
+    """Причина verdict=error — теперь ПЯТЬ состояний, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
     транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
-    что-то другое», правило AGENTS.md). Порядок проверки важен: failure_reason
-    (ai_dsh.sh уже решил за нас, что это лимит) — раньше generic-транспорта,
-    транспорт — раньше формата, потому что при упавшем транспорте answer пуст
-    и verdict_line_present всё равно вернёт False — не значит «модель
-    промолчала».
+    что-то другое», правило AGENTS.md).
+
+    empty_rework — #210: cmd_verdict уже определил (rework_without_findings),
+    что модель поставила ВЕРДИКТ: rework, но не привела НИ ОДНОЙ находки ни в
+    одной из трёх категорий (прозы, блока ЗАДАЧА, блока ЗАМЕЧАНИЕ) — живой
+    случай, PR #206, run 33656180906: весь ответ модели — `ВЕРДИКТ: rework\\n`.
+    Это ОТДЕЛЬНАЯ причина от двух веток verdict_line_present ниже: строка
+    «ВЕРДИКТ: …» здесь ЕСТЬ и однозначна (иначе parse_verdict вернул бы error
+    раньше и cmd_verdict не дошёл бы до этой проверки) — путать с «строки нет»
+    или «неоднозначна» значило бы соврать читателю о причине (AGENTS.md,
+    «алерт не гадает»).
+
+    Классификация (порядок проверки, приоритет между причинами) — ЕДИНСТВЕННО
+    в review_labels.reason_tag (находка ревью #439: раньше порядок был
+    продублирован здесь второй копией if/elif, связанной с оригиналом только
+    комментарием «тот же порядок» — разъехались бы молча, добавь кто-то
+    причину в одном месте и забудь про другое). Эта функция только рендерит
+    прозу для человека по уже вынесенному тегу; текст для FAILURE_REASON_
+    CONTRACT дополнительно различает две подпричины через verdict_line_present
+    (тег их не различает — обеим достаточно значения «формат ответа
+    нарушен», разница есть только в тексте для человека).
 
     failure_reason — тег из $AI_WORK/failure_reason.txt (пишет ретрай-цикл
-    ai_dsh.sh, #419), пробрасывается step-output'ами ai-review.yml в
-    verdict --failure-reason:
+    ai_dsh.sh, #419, либо cmd_gather при пустом диффе, #658/#687), пробрасывается
+    step-output'ами ai-review.yml в verdict --failure-reason:
+      empty_diff                       — PR не несёт ни одного изменённого
+                                          файла (cmd_gather решил это ДО
+                                          вызова DSH вовсе, см. cmd_gather),
+                                          подтверждено ДВУМЯ независимыми
+                                          источниками (список файлов И
+                                          `gh pr diff`, #687) — сливать
+                                          нечего, повтор на том же head
+                                          ничего не изменит.
+      diff_source_mismatch             — список файлов PR пуст, а `gh pr
+                                          diff` вернул непустой дифф (#687,
+                                          находка вердикта ai-review PR
+                                          #686): источники разошлись, это НЕ
+                                          empty_diff — ревью не пропущено
+                                          молча, но и не состоялось;
+                                          расхождение может быть
+                                          транзиентным (сеть, ограничение
+                                          выдачи API) — повтор на этом же
+                                          head может дать другой результат.
       quota_exhausted                  — RATE_LIMIT: Weekly/Monthly Limit
                                           Exhausted, сброс через дни — ждать
                                           внутри прогона бессмысленно, ai_dsh.sh
                                           не пытался.
       rate_limit_retry_budget_exceeded — временный RATE_LIMIT не снялся за
                                           отведённый бюджет ожидания.
+      all_providers_exhausted          — #727: цепочка провайдеров
+                                          (vars.DSH_PROVIDER_CHAIN) перебрана
+                                          целиком, ни один не ответил — не
+                                          автопереход спас (класс отказа у
+                                          КАЖДОГО был переключаемый), а вся
+                                          цепочка исчерпана/недоступна разом.
       "" (пусто)                       — старое поведение: либо обычный
                                           транспортный сбой (rc≠0 без
                                           RATE_LIMIT вовсе), либо контракт
                                           ответа (rc=0, формат нарушен).
+
+    reset_hint — «имя: дата; …» опробованных провайдеров с известной датой
+    сброса (dsh_extract_reset_hint, lib/dsh-ci.sh) — пусто, если ни один не
+    назвал дату. Используется только при all_providers_exhausted — без него
+    сообщение честно называет «дата неизвестна», не гадает (AGENTS.md,
+    «алерт не гадает»).
     """
-    if failure_reason == "quota_exhausted":
+    # empty_rework (#210) проверяется РАНЬШЕ всего остального: это причина,
+    # известная cmd_verdict ДО обращения к failure_reason/dsh_rc вовсе (в
+    # этом сценарии DSH успешно ответил, dsh_rc=0, failure_reason пуст) — не
+    # часть оси quota/rate-limit/transport/contract, которую делит
+    # review_labels.reason_tag ниже, а отдельная, более конкретная причина в
+    # рамках того же тега FAILURE_REASON_CONTRACT (см. докстринг).
+    if empty_rework:
+        return ("модель поставила ВЕРДИКТ: rework, но не привела ни одной "
+                "находки — ни прозой, ни блоком ЗАДАЧА, ни блоком ЗАМЕЧАНИЕ "
+                "(ai_prompt.md требует хотя бы одну причину при rework, иначе "
+                "ставь approve) — автор PR не получил бы ни одного сигнала, "
+                "что чинить (#210)")
+    # empty_diff/diff_source_mismatch/all_providers_exhausted (#658/#687/#727)
+    # — причины БЕЗ обращения к модели вовсе (cmd_gather решил их заранее) или
+    # вне оси quota/rate-limit/transport/contract, которую делит review_labels.
+    # reason_tag (#431) — тег их не различает и не обязан: остаются
+    # литералами failure_reason здесь, до делегирования тегу ниже.
+    if failure_reason == "empty_diff":
+        return ("ревью не состоялось — дифф PR пуст (0 изменённых файлов), "
+                "сливать нечего: либо содержимое уже попало в main другим "
+                "путём (например update-branch подтянул main с идентичным "
+                "фиксом, живой случай #658), либо ветка отстала/совпала с "
+                "базой — повтор на этом же head ничего не изменит, нужно "
+                "либо закрыть PR, либо запушить реальные изменения")
+    if failure_reason == "diff_source_mismatch":
+        return ("ревью не состоялось — источники диффа PR разошлись: gh "
+                "API вернул пустой список изменённых файлов, но `gh pr "
+                "diff` (второе независимое подтверждение) вернул непустой "
+                "дифф — это НЕ empty_diff, пропускать ревью по одному "
+                "пустому списку файлов нельзя (#687). Расхождение может "
+                "быть транзиентным (сетевой край, ограничение выдачи "
+                "API) — повтор на этом же head (новый пуш или "
+                "workflow_dispatch force: true) может дать другой "
+                "результат")
+    if failure_reason == "all_providers_exhausted":
+        when = reset_hint.strip() if reset_hint else "дата неизвестна — ни один провайдер её не назвал"
+        return (f"ревью не состоялось — все провайдеры цепочки исчерпаны/недоступны "
+                f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
+                "ждать сброса вне CI, либо добавить нового провайдера в "
+                "vars.DSH_PROVIDER_CHAIN (docs/runbooks/switch-llm-provider.md)")
+    # Оставшаяся ось (quota/rate-limit/transport/contract) — ЕДИНСТВЕННО
+    # через review_labels.reason_tag (находка ревью #439, см. докстринг выше).
+    tag = review_labels.reason_tag(dsh_rc, failure_reason)
+    if tag == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED:
         return (f"ревью не состоялось — квота провайдера исчерпана надолго "
                 f"(RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата "
                 f"{dsh_rc}) — повтор внутри этого прогона не поможет, нужно "
                 "ждать вне CI или сменить провайдера "
                 "(docs/runbooks/switch-llm-provider.md)")
-    if failure_reason == "rate_limit_retry_budget_exceeded":
+    if tag == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET:
         return (f"ревью не состоялось — временный RATE_LIMIT провайдера не "
                 f"снялся за отведённый бюджет ожидания внутри прогона (код "
                 f"возврата {dsh_rc})")
-    if transport_failed(dsh_rc):
+    if tag == review_labels.FAILURE_REASON_TRANSPORT:
         return f"ревью не состоялось — ошибка провайдера/транспорта DSH (код возврата {dsh_rc})"
+    # tag == FAILURE_REASON_CONTRACT — единственная причина, которую тег не
+    # делит на подпричины; текст для человека делит дальше.
     if verdict_line_present(answer):
         return "модель ответила, но строка «ВЕРДИКТ: …» есть, а не единственная и/или не последняя"
     return "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
@@ -286,6 +389,28 @@ def verdict_line_present(answer: str) -> bool:
     меняется, это чисто текст для человека."""
     lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
     return any(VERDICT_RE.match(line) for line in lines)
+
+
+def rework_without_findings(verdict: str, findings: str, tasks: list[dict],
+                             remarks: list[dict]) -> bool:
+    """rework без единой находки — нарушение контракта (#210), не валидный
+    `ai:changes-requested`. Живой случай: PR #206, run 33656180906 — весь
+    ответ модели `ВЕРДИКТ: rework\\n`, ни одной находки ни в одной из трёх
+    категорий, PR встал с пустым комментарием — ни автор, ни воркер не знали,
+    что чинить.
+
+    Проверяется здесь, а не внутри parse_verdict: та функция размечает
+    ТОЛЬКО машиночитаемую строку вердикта — свой узкий контракт (см. её
+    докстринг, «Единственный сигнал…»); полнота rework — другой вопрос,
+    зависящий от findings/tasks/remarks, которые cmd_verdict уже парсит
+    отдельно (parse_tasks/findings_of/review_checklist.parse_remarks) — второй
+    разбор answer здесь не нужен, одно место правды остаётся в cmd_verdict,
+    который вызывает эту функцию с уже готовыми тремя категориями.
+
+    approve с нулём находок НЕ считается нарушением — одобрение без замечаний
+    норма (issue #210, раздел «Не задача этой issue»): проверка условная на
+    verdict == "rework", approve сюда не попадает."""
+    return verdict == "rework" and not findings.strip() and not tasks and not remarks
 
 
 # ── Размерный гейт: газ к тормозу review:large (#204) ─────────────────────────
@@ -452,7 +577,10 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
 
 def build_comment(number: int, sha: str, verdict: str, findings: str,
                   tasks: list[dict], diff_fp: str | None = None,
-                  remarks: list[dict] | None = None) -> str:
+                  remarks: list[dict] | None = None,
+                  chain_provider: str | None = None,
+                  reset_hint: str | None = None,
+                  reason_tag_value: str | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -475,10 +603,27 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     remarks — блоки ЗАМЕЧАНИЕ (#462, третья категория находок): сам чеклист
     живёт в ТЕЛЕ PR (review_checklist.merge_checklist, отдельный PATCH), не
     здесь — комментарий только указывает, что чеклист обновлён, чтобы автор
-    не искал замечания в прозе комментария, которую отсюда убрал findings_of."""
+    не искал замечания в прозе комментария, которую отсюда убрал findings_of.
+
+    chain_provider/reset_hint (#727) — факты цепочки провайдеров: имя
+    провайдера, фактически ответившего (видимость «кто обслужил ход», не
+    только «какой провайдер настроен в vars»), и даты сброса опробованных —
+    читает scheduler.py::trigger_ai_review (header_facts), чтобы не жечь
+    авто-повтор (#196) вслепую в ту же квоту. Обе строки опциональны (пусто —
+    не добавлены вовсе), как diff_line выше.
+
+    reason_tag_value — тег причины verdict=error (review_labels.reason_tag,
+    #431): факт `reason:` в шапке, который scheduler.trigger_ai_review читает
+    для решения о бюджете автоповторов ЭТОЙ эпохи. None (verdict != "error"
+    или вызов без классификации) не добавляет строку — та же обратная
+    совместимость, что у diff_fp."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
+    provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
+    reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
+    reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
     head = (
-        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n{diff_line}\n"
+        f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
+        f"{diff_line}{provider_line}{reset_line}{reason_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -596,26 +741,88 @@ def task_section(pull: dict, repo: str) -> str:
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
-    diff_run = subprocess.run(
-        ["gh", "pr", "diff", str(args.pr)],
-        capture_output=True, text=True,
-        env={**os.environ, "NO_COLOR": "1"},
-    )
-    if diff_run.returncode != 0 or not diff_run.stdout.strip():
-        # Пустой дифф-пак = ревью «ни о чём» с видом настоящего (silent wrong):
-        # отказ громкий, шаг красный.
-        raise RuntimeError(f"gh pr diff {args.pr}: rc={diff_run.returncode}, "
-                           f"diff пуст: {diff_run.stderr.strip()[:200]}")
-    diff = diff_run.stdout
     # Постранично (#294): review_labels.list_pr_files — то же место правды,
     # что и у check_pr.py; первая страница у PR за сотню файлов молча теряла
     # хвост (недосчёт added, невидимая правка для diff_fingerprint в verdict).
     files = review_labels.list_pr_files(repo, args.pr, gh)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if not files:
+        # Пустой список файлов САМ ПО СЕБЕ — недостаточное основание объявить
+        # «дифф пуст» (#687, находка вердикта ai-review PR #686): список — тот
+        # же API-вызов, что молча терял хвосты пагинацией до #294, и пустой
+        # ответ при фактически непустом диффе (сетевой край, транзиентное
+        # состояние, обрезанная выдача) раньше приводил к тому же исходу, что
+        # настоящий пустой дифф — дорогой прогон DSH пропускался БЕЗ второго
+        # источника. Асимметрия: на обычном пути (files непуст, ниже) второго
+        # запроса не появилось — только здесь, в редкой ветке, где мы
+        # собираемся отказаться от ревью, второе независимое подтверждение
+        # обязательно.
+        diff_run = pr_diff(args.pr)
+        if diff_run.returncode == 0 and diff_run.stdout.strip():
+            # Источники разошлись: список файлов пуст, а фактический дифф —
+            # нет. Это НЕ empty_diff (там дифф пуст по ОБОИМ источникам) и НЕ
+            # тихое продолжение с доверием пустому списку (иначе ревью молча
+            # пропустилось бы на реальном изменении — направление отказа,
+            # которого этот гейт не имеет права допускать). Выбор между
+            # терминальным вердиктом и жёстким отказом шага (RuntimeError):
+            # терминальный вердикт — тот же принцип, что уже закрыл #658 для
+            # empty_diff — красный шаг ДО job'а verdict оставляет PR без
+            # единой ai:*-метки НАВСЕГДА (job verdict не запускается вовсе),
+            # а терминальный ai:failed с ясной причиной хотя бы виден и
+            # автоповтор по таймеру (#196) даёт второй шанс на случай, если
+            # расхождение было транзиентным. Оба факта — в лог (для
+            # диагностирующего) и в причину вердикта (для владельца, см.
+            # error_reason) — тихо мимо этого расхождения не проходим.
+            (out / "failure_reason.txt").write_text("diff_source_mismatch", encoding="utf-8")
+            (out / "answer.txt").write_text("", encoding="utf-8")
+            print(f"::error::gather: PR #{args.pr} источники диффа разошлись — "
+                  f"список файлов PR пуст (0), но `gh pr diff` вернул непустой "
+                  f"дифф ({len(diff_run.stdout)} байт) — ревью НЕ пропущено как "
+                  "empty_diff, вердикт уйдёт как ai:failed с причиной "
+                  "diff_source_mismatch")
+            return 0
+        if diff_run.returncode != 0:
+            # Не удалось даже подтвердить/опровергнуть: gh pr diff сам упал
+            # при пустом списке файлов. Тот же класс, что и симметричный
+            # отказ ниже (files непуст, diff упал) — молчать нельзя, а
+            # разница между «дифф пуст» и «сеть легла» здесь принципиальна:
+            # первое терминально (повтор бессмыслен), второе — транспортный
+            # отказ (повтор может помочь). Раз не смогли различить —
+            # RuntimeError, тем же путём, что и ниже.
+            raise RuntimeError(
+                f"gh pr diff {args.pr}: rc={diff_run.returncode} при пустом "
+                f"списке файлов — не удалось подтвердить, что дифф "
+                f"действительно пуст: {diff_run.stderr.strip()[:200]}")
+        # diff_run.returncode == 0 и stdout пуст — оба источника согласны:
+        # дифф действительно пуст (живой факт #658, 2026-09-07: ветка forge/*
+        # слилась с main через update-branch ровно в момент, когда идентичный
+        # фикс уже попал в main другим PR — содержимое схлопнулось в ничто).
+        # Терминальный исход — тот же файловый контракт, что уже использует
+        # ai_dsh.sh при транспортном отказе (failure_reason.txt/answer.txt,
+        # см. error_reason): job review остаётся зелёным, шаг «Ревью агентом
+        # (DSH)» ai-review.yml пропускается по этому же маркеру
+        # (steps.gather.outputs.empty_diff), a job verdict читает
+        # failure_reason=empty_diff и ставит ai:failed с ясной причиной —
+        # той же дорогой, которой уже идёт любой другой transport-отказ, без
+        # второй копии логики.
+        (out / "failure_reason.txt").write_text("empty_diff", encoding="utf-8")
+        (out / "answer.txt").write_text("", encoding="utf-8")
+        print(f"::warning::gather: PR #{args.pr} дифф пуст (0 изменённых файлов, "
+              "подтверждено вторым источником `gh pr diff`) — сливать нечего, "
+              "дорогой прогон DSH пропущен, вердикт уйдёт как ai:failed с "
+              "причиной empty_diff")
+        return 0
+    diff_run = pr_diff(args.pr)
+    if diff_run.returncode != 0 or not diff_run.stdout.strip():
+        # files непуст, а `gh pr diff` пуст/упал — это уже не «дифф пуст по
+        # факту», а отказ самого вызова (сеть/права): молчать тут нельзя.
+        raise RuntimeError(f"gh pr diff {args.pr}: rc={diff_run.returncode}, "
+                           f"diff пуст при непустом списке файлов: {diff_run.stderr.strip()[:200]}")
+    diff = diff_run.stdout
     added = sum(f["additions"] for f in files)
     listing = "\n".join(f"{f['filename']} (+{f['additions']}/-{f['deletions']})" for f in files)
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     pack = out / "pack.txt"
     pack.write_text(f"FILES:\n{listing}\n\nADDITIONS: {added}\n\nDIFF:\n{diff}", encoding="utf-8")
 
@@ -663,11 +870,18 @@ def cmd_gather(args: argparse.Namespace) -> int:
 # ai-review.yml просит --force, только если ручной запуск явно нёс
 # input force: true (default false) — не любой workflow_dispatch. Без него
 # ручной запуск проходит ТУ ЖЕ сверку, что и автоматический
-# (review_labels.should_run_ai_review), плюс дополнительную гонку «прогон
-# уже идёт прямо сейчас» (review_labels.other_active_ai_review_runs) — её
-# автоматический путь не нуждается в проверке (свой прогон на run_id
-# сериализован concurrency-группой), а ручной может выстрелить поверх уже
-# летящего.
+# (review_labels.should_run_ai_review), плюс гонку «прогон уже идёт прямо
+# сейчас» (review_labels.other_active_ai_review_runs) — теперь для ОБОИХ
+# путей триггера (#779, разрыв 1). Раньше эту гонку спрашивал только ручной
+# путь в предположении «автоматический прогон сериализован своей
+# concurrency-группой» — предположение оказалось неверным: группа событийного
+# пути — id породившего рана pr-review (github.event.workflow_run.id),
+# уникальный на КАЖДОЕ событие, значит два разных pr-review-события одного и
+# того же PR попадают каждое в свою группу и НЕ сериализуются вовсе (замер
+# issue #779: 20 событийных прогонов пересеклись по времени с другим
+# событийным прогоном того же PR за одни сутки). Правка ключа группы —
+# отдельный вопрос (issue #779 целиком, критерии 1-2: выбор между отменой и
+# очередью), эта правка про число прогонов, а не про их упорядочение.
 
 def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
     """Текст отказа: на PR #pr уже идёт другой прогон ai-review.yml прямо
@@ -683,24 +897,62 @@ def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
     )
 
 
-def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
-    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
-    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
-    сколько минут назад он вынесен, и что делать вместо ручного повтора
-    (правило репозитория: отказ без «что дальше» не принимается)."""
+def event_dispatch_duplicate_reason(pr: int, other_run: dict) -> str:
+    """Текст короткого замыкания событийного прогона (workflow_run от
+    pr-review) — не «отказ» владельцу (событийный путь никто не просил
+    руками), а факт в лог: этот прогон — ДУБЛЬ уже летящего прогона того же
+    PR, а не расхождение по содержимому диффа. Причина названа отдельным
+    текстом от manual_dispatch_busy_reason (адресат разный: там — предупреждение
+    тому, кто дёрнул workflow_dispatch, здесь — только след в логе job'а) и
+    отдельным от manual_dispatch_skip_reason (та — «дифф не изменился»,
+    другая причина того же go=false; AGENTS.md «алерт не гадает» — читатель
+    обязан отличить «дубль» от «код уже видели»).
+
+    Разрыв 1 (#779): до этой правки событийный путь (`workflow_run` от
+    pr-review) вообще не спрашивал `other_active_ai_review_runs` — только
+    workflow_dispatch. 68 из 134 прогонов ai-review.yml за сутки (замер
+    2026-09-08) шли именно этим путём и ни один дубль на нём не отклонялся.
+    Событийный прогон, в отличие от ручного, уже СОЗДАН GitHub'ом — отменить
+    его нельзя, можно только замкнуть коротко без вызова модели, ровно так
+    же, как cmd_should_run уже делает для ручного пути."""
+    url = other_run.get("html_url")
+    where = f" ({url})" if url else ""
+    return (
+        f"::notice::прогон PR #{pr} останавливается без вызова модели: другой "
+        f"прогон ai-review.yml для этого же PR уже идёт (run {other_run.get('id')}, "
+        f"статус {other_run.get('status', '?')}){where} — это дубль, а не "
+        "расхождение по содержимому диффа. Вердикт вынесет прогон, который уже летит."
+    )
+
+
+def _verdict_label_and_age(current_labels, ai_comment: dict | None) -> tuple[str, str]:
+    """Общая часть текста «дифф не изменился» для обоих путей триггера —
+    вердикт и его возраст, без адресата (тот разный у manual/event, см.
+    manual_dispatch_skip_reason и event_dispatch_skip_reason)."""
     names = review_labels._names(current_labels)
     verdict_label = next(
         (label for label in (review_labels.AI_OK, review_labels.AI_CHANGES) if label in names),
         "неизвестный вердикт")
     age = "неизвестно когда"
     created_at = (ai_comment or {}).get("created_at")
-    if created_at:
-        try:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
-            age = f"{minutes} мин назад"
-        except ValueError:
-            pass
+    # review_labels.parse_github_timestamp — единственное место разбора этой
+    # метки (#780, доводка #779): возвращает None на битую ИЛИ наивную (без
+    # "Z"/"+HH:MM") строку, не бросая ValueError/TypeError наружу — раньше
+    # этот except ловил только ValueError, и наивная строка падала на
+    # `now - created` (aware - naive) необработанной.
+    created = review_labels.parse_github_timestamp(created_at)
+    if created is not None:
+        minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+        age = f"{minutes} мин назад"
+    return verdict_label, age
+
+
+def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст отказа: на PR #pr уже стоит окончательный вердикт на этом же
+    диффе — повторный дорогой прогон денег не оправдывает. Называет вердикт,
+    сколько минут назад он вынесен, и что делать вместо ручного повтора
+    (правило репозитория: отказ без «что дальше» не принимается)."""
+    verdict_label, age = _verdict_label_and_age(current_labels, ai_comment)
     return (
         f"::notice::ручной прогон PR #{pr} отклонён: дифф не изменился с "
         f"последнего вердикта {verdict_label} ({age}) — второй прогон на том "
@@ -710,23 +962,66 @@ def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None
     )
 
 
+def event_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None) -> str:
+    """Текст события-пути (workflow_run от pr-review) на том же go=false, что
+    manual_dispatch_skip_reason, — «дифф не изменился с последнего вердикта».
+    Отдельная функция, не переиспользование manual_dispatch_skip_reason:
+    адресат другой (лог job'а, никто руками этот прогон не дёргал) и текст не
+    должен звать прогон «ручным», раз он им не является (#779, разрыв 2: до
+    этой правки печать была заперта условием `and manual` — событийный путь,
+    самый частый (68 из 134 прогонов, замер 2026-09-08), на этой ветке молчал
+    в stderr вовсе, хотя шаг ai-review.yml утверждает читателю, что точная
+    причина уже напечатана строкой выше)."""
+    verdict_label, age = _verdict_label_and_age(current_labels, ai_comment)
+    return (
+        f"::notice::прогон PR #{pr} останавливается без вызова модели: дифф "
+        f"не изменился с последнего вердикта {verdict_label} ({age}) — "
+        "повторный вызов модели на том же коде ничего нового не покажет. "
+        "Автоматический повтор придёт сам, если дифф изменится."
+    )
+
+
 def cmd_should_run(args: argparse.Namespace) -> int:
     manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-    if manual:
-        # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО
-        # --force: второй одновременный прогон того же PR бессмыслен
-        # независимо от того, хочет ли владелец пересмотра того же диффа
-        # (manual_dispatch_busy_reason это и объявляет: force не пробивает
-        # занятость). Заодно ловит PR без вердикта (первое ревью) —
-        # should_run_ai_review ниже честно вернул бы True, хотя параллельный
-        # прогон того же PR уже летит (#399).
-        repo = os.environ["GITHUB_REPOSITORY"]
-        active = review_labels.other_active_ai_review_runs(
-            repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
-        if active:
+    # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО --force
+    # и ДО сверки отпечатка, для ОБОИХ путей триггера (#779, разрыв 1: до
+    # этой правки предикат спрашивался только при workflow_dispatch —
+    # событийный путь, workflow_run от pr-review, 68 из 134 прогонов за
+    # сутки в замере 2026-09-08, не спрашивал его никогда). Один и тот же
+    # предикат (review_labels.other_active_ai_review_runs), что уже читают
+    # scheduler.update_branch и scheduler.trigger_ai_review — второй копии
+    # не заводим.
+    #
+    # Разница исходов между путями — не только текст лога: ручной путь ещё
+    # НЕ создал прогон, отказ здесь означает «не тратить деньги вовсе»
+    # (manual_dispatch_busy_reason). Событийный прогон GitHub уже СОЗДАЛ —
+    # отменить его нельзя, только замкнуть коротко без вызова модели
+    # (event_dispatch_duplicate_reason) — тот же газ, что и у ручного пути,
+    # но другая причина отказа: «дубль» (этот раздел), не «дифф не
+    # изменился» (manual_dispatch_skip_reason ниже, другая причина того же
+    # go=false — читатель обязан их различать, AGENTS.md «алерт не гадает»).
+    #
+    # Разрыв 4 (#779): для ai:failed should_run_ai_review ниже возвращает
+    # True БЕЗУСЛОВНО (газ автоповтора #196 не должен зависеть от того,
+    # менялся ли дифф) — именно поэтому активность прогона обязана
+    # проверяться РАНЬШЕ и НЕЗАВИСИМО от фингерпринта, а не встраиваться в
+    # саму функцию отпечатка (`should_run_ai_review` не принимает и не
+    # обязана принимать «летит ли прогон» — второй предикат внутри неё был
+    # бы третьей копией). С этой проверкой выше по стеку эффективное правило
+    # для ai:failed становится «нужен повтор, если прогона сейчас не летит»
+    # — один повтор на живой отпечаток, не три подряд (живой замер PR #711
+    # в issue #779): следующий повтор возможен, только когда текущий
+    # действительно завершился (успехом, ошибкой или отменой).
+    repo = os.environ["GITHUB_REPOSITORY"]
+    active = review_labels.other_active_ai_review_runs(
+        repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
+    if active:
+        if manual:
             print(manual_dispatch_busy_reason(args.pr, active[0]), file=sys.stderr)
-            print("false")
-            return 0
+        else:
+            print(event_dispatch_duplicate_reason(args.pr, active[0]), file=sys.stderr)
+        print("false")
+        return 0
     if getattr(args, "force", False):
         # Осознанный ручной повтор (не занят — проверено выше) не заходит в
         # сеть дальше: решение не зависит от отпечатка диффа, а необращение к
@@ -734,7 +1029,6 @@ def cmd_should_run(args: argparse.Namespace) -> int:
         # (test_cmd_should_run_force_skips_fingerprint_check_no_network_call).
         print("true")
         return 0
-    repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     current_labels = {label["name"] for label in pull["labels"]}
     files = review_labels.list_pr_files(repo, args.pr, gh)
@@ -743,8 +1037,16 @@ def cmd_should_run(args: argparse.Namespace) -> int:
     stored_fp = (review_labels.header_facts(ai_comment.get("body") or "").get("diff")
                  if ai_comment else None)
     run_needed = review_labels.should_run_ai_review(current_labels, stored_fp, current_fp)
-    if not run_needed and manual:
-        print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
+    if not run_needed:
+        # Разрыв 2 (#779): печать была заперта условием `and manual` —
+        # событийный путь (самый частый, #779 разрыв 1) молчал в stderr, хотя
+        # шаг ai-review.yml утверждает читателю, что причина уже напечатана
+        # строкой выше. Оба пути обязаны печатать СВОЙ текст — читатель
+        # различает «ручной» от «событийный», не гадает (AGENTS.md).
+        if manual:
+            print(manual_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
+        else:
+            print(event_dispatch_skip_reason(args.pr, current_labels, ai_comment), file=sys.stderr)
     # Единственная строка на stdout — bash-шаг ai-review.yml читает её как
     # $(...), никакого другого вывода в этой команде быть не должно.
     print("true" if run_needed else "false")
@@ -811,13 +1113,31 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
 
-    # Причина «error» — вычисляется ДО комментария: четыре разных состояния
+    # rework без единой находки — нарушение контракта (#210), не валидный
+    # ai:changes-requested: см. докстринг rework_without_findings. Проверяется
+    # ПОСЛЕ финальной фильтрации tasks/remarks (пустые заголовки уже отброшены
+    # выше) и ДО решения о причине error ниже — empty_rework прокидывается в
+    # error_reason как отдельная, более точная причина, а не через общую
+    # ветку verdict_line_present (строка вердикта здесь ЕСТЬ и однозначна).
+    empty_rework = rework_without_findings(verdict, findings, tasks, remarks)
+    if empty_rework:
+        verdict = "error"
+
+    # Причина «error» — вычисляется ДО комментария: пять разных состояний
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
     # ошибка провайдера не должна выглядеть как «модель ответила криво», а
     # временный RATE_LIMIT — как настоящая поломка, #419).
-    reason = error_reason(answer, args.dsh_rc, args.failure_reason) if verdict == "error" else None
+    reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint,
+                            empty_rework=empty_rework)
+              if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason
+    # Тег для шапки комментария (#431) — независимо от findings/reason (та
+    # проза может оказаться текстом самой модели, а не error_reason, см.
+    # review_labels.FAILURE_REASON_* докстринг): scheduler.trigger_ai_review
+    # решает бюджет автоповторов по структурному факту `reason:`, не по
+    # пересказу.
+    reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason) if verdict == "error" else None
 
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     if pull["head"]["sha"] != args.head:
@@ -848,12 +1168,23 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         return 0
 
     current = {label["name"] for label in pull["labels"]}
-    for old in AI_VERDICTS:
-        if old in current:
-            run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
     label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
-    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
-           "-f", f"labels[]={label}")
+    # Тот же класс идемпотентности, что вердикт-метка review:* в check_pr.py
+    # (#203): повторный вердикт ТОГО ЖЕ значения (автоповтор ai:failed по
+    # таймеру #196, повторный approve после подтягивания main) не выполняет
+    # ни одного изменяющего вызова — ни лишних unlabeled/labeled в таймлайне;
+    # смена вердикта переставляет метку как раньше (решение —
+    # verdict_label_changes, одно место правды с check_pr.py).
+    stale_verdicts, need_verdict_post = review_labels.verdict_label_changes(
+        current, label, AI_VERDICTS)
+    for old in stale_verdicts:
+        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+    if need_verdict_post:
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
+               "-f", f"labels[]={label}")
+    # Множество меток ПОСЛЕ свопа — то, что реально осталось на сервере
+    # (раньше сюда уходило current | {label} без снятых старых ai:*).
+    labels_after = (current - set(stale_verdicts)) | ({label} if need_verdict_post else set())
 
     # Commit Status API — тот же вердикт вторым каналом, параллельно метке
     # (#345): allow_auto_merge читает required status checks, не метки.
@@ -871,7 +1202,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
     # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
-    apply_large_ok(repo, args.pr, added, current | {label}, verdict)
+    apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
     # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
     # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
@@ -889,7 +1220,9 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
     # что уже сверены с головой выше.
     diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp, remarks=remarks)
+    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
+                          remarks=remarks, chain_provider=args.chain_provider,
+                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
@@ -932,9 +1265,15 @@ def main() -> int:
     # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
     verdict.add_argument("--dsh-rc", default="")
     # Тег причины из $AI_WORK/failure_reason.txt (ai_dsh.sh, #419): quota_exhausted
-    # | rate_limit_retry_budget_exceeded | пусто. Необязателен по той же причине,
-    # что и --dsh-rc — ручной запуск без него просто теряет уточнение.
+    # | rate_limit_retry_budget_exceeded | all_providers_exhausted (#727) | пусто.
+    # Необязателен по той же причине, что и --dsh-rc — ручной запуск без него
+    # просто теряет уточнение.
     verdict.add_argument("--failure-reason", default="")
+    # Цепочка провайдеров (#727): имя провайдера, фактически ответившего
+    # (пусто на отказе), и даты сброса опробованных ($AI_WORK/chain_provider.txt
+    # / chain_reset_hint.txt, ai_dsh.sh) — оба необязательны, тот же принцип.
+    verdict.add_argument("--chain-provider", default="")
+    verdict.add_argument("--reset-hint", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()

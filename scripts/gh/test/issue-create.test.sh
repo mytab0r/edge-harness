@@ -25,6 +25,10 @@ mkdir -p "$WORK/bin"
 MARKER="$WORK/gh-issue-create-called"
 cat >"$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
+if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
+  echo "o/r"
+  exit 0
+fi
 if [ "\$1" = "issue" ] && [ "\$2" = "create" ]; then
   echo called >"$MARKER"
   echo "https://github.com/o/r/issues/1"
@@ -35,6 +39,11 @@ exit 1
 GHEOF
 chmod +x "$WORK/bin/gh"
 export PATH="$WORK/bin:$PATH"
+
+# Приоритетная печать (#695) — сеть подменена фикстурой (пустой пул), этот
+# файл тестирует ТОЛЬКО метку task, не приоритет (тот — issue-create-priority-gate.test.sh).
+export PRIORITY_TOP_FIXTURE="$WORK/priority-fixture.json"
+echo '[]' >"$PRIORITY_TOP_FIXTURE"
 
 fail=0
 note() { echo "$@"; }
@@ -61,9 +70,10 @@ else
   note "OK случай 2: issue без меток отклонена (класс #425)"
 fi
 
-# ── случай 3: --label task — принимает и вызывает gh ──────────────────────────
+# ── случай 3: --label task — принимает и вызывает gh (приоритет явно снят #695) ─
 rm -f "$MARKER"
-if ! bash "$SCRIPT_SRC" --title t --body b --label task >"$WORK/out3" 2>"$WORK/err3"; then
+if ! bash "$SCRIPT_SRC" --title t --body b --label task \
+    --not-process-ack "не про приоритет, тест метки task (#526)" >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: --label task отклонён"; cat "$WORK/err3"; fail=1
 elif [ ! -f "$MARKER" ]; then
   note "FAIL случай 3: gh issue create не вызван при наличии task"; fail=1
@@ -73,7 +83,8 @@ fi
 
 # ── случай 4: --label task,white-spot одним значением — принимает ────────────
 rm -f "$MARKER"
-if ! bash "$SCRIPT_SRC" --title t --body b --label "task,white-spot" >"$WORK/out4" 2>"$WORK/err4"; then
+if ! bash "$SCRIPT_SRC" --title t --body b --label "task,white-spot" \
+    --not-process-ack "не про приоритет, тест метки task (#526)" >"$WORK/out4" 2>"$WORK/err4"; then
   note "FAIL случай 4: комбинированный --label с task отклонён"; cat "$WORK/err4"; fail=1
 elif [ ! -f "$MARKER" ]; then
   note "FAIL случай 4: gh не вызван для комбинированного --label с task"; fail=1

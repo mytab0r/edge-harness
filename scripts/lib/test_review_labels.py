@@ -109,6 +109,30 @@ def test_gate1_decided_true_does_not_imply_merge_label_gate_open():
     assert review_labels.merge_label_gate(labels) is not None
 
 
+def test_merge_label_gate_opens_on_review_large_with_large_ok_and_ai_ok():
+    # Живой случай PR #333 (2026-09-08): «слияние ждёт review:large-ok» из
+    # докстринга/теста выше означает «ждёт», не «игнорирует навсегда» — до
+    # фикса merge_label_gate требовал буквально review:ok и не принимал
+    # review:large+review:large-ok как эквивалент, хотя check_pr.py::size_gate
+    # уже трактует review:large-ok как «размер принят» (is_large=False).
+    # Разрыв: review:large-ok ставится МЕТКОЙ (ai_review.py::apply_large_ok)
+    # без нового пуша, а check_pr.py (где формируется review:ok) реагирует
+    # только на opened/synchronize/reopened — без этой ветки условие никогда
+    # не перечитывается заново, и PR стоит с review:large+review:large-ok+
+    # ai:ok бесконечно (тормоз без газа).
+    labels = ["review:large", "review:large-ok", "ai:ok"]
+    assert review_labels.merge_label_gate(labels) is None
+
+
+def test_merge_label_gate_still_closed_on_large_ok_without_ai_ok():
+    # Гейт 2 (AI) по-прежнему обязателен — review:large-ok сам по себе не
+    # открывает слияние без ai:ok.
+    labels = ["review:large", "review:large-ok"]
+    reason = review_labels.merge_label_gate(labels)
+    assert reason is not None
+    assert "ai:ok" in reason
+
+
 def test_gate1_decided_accepts_label_name_set_and_dict_list():
     assert review_labels.gate1_decided([{"name": "review:large"}]) is True
     assert review_labels.gate1_decided({"review:ok"}) is True
@@ -206,6 +230,116 @@ def test_diff_fingerprint_order_independent():
         list(reversed(files)))
 
 
+# ── #740: отпечаток считается от `patch` (содержимое относительно ЕГО
+# merge-base), не от `sha` блоба на голове — три сценария на прод-форме,
+# живая пара PR #333 (2026-09-08) плюс ещё один живой merge-коммит с
+# реальным пересечением строк ──────────────────────────────────────────────
+#
+# fixtures_pr333_pull_no_overlap.json — прод-форма (сужена до
+# filename/status/sha/patch через --jq, не пересказ): `gh api
+# repos/mytab0r/edge-harness/compare/<merge-base>...<head>` для PR #333, до
+# подтягивания main (голова 96e6e4fe, merge-base 4e3f8d6a — вердикт
+# ai:ok 06:08:56Z) и после (голова a05cc0c8 — сам merge-коммит, merge-base
+# d143507b). Ровно как назвала находка issue #740: `sha` разошёлся у ОДНОГО
+# файла из одиннадцати (.github/workflows/repo-ci.yml — main правил его в
+# PR #730), но `patch` у него и у остальных десяти — побайтово идентичен.
+#
+# fixtures_pr333_branch_edit.json — тот же PR #333, тот же merge-base
+# (4e3f8d6a), два РЕАЛЬНЫХ последовательных коммита автора на одной ветке
+# (399afce2 → f7847864, оба — раунд 3/4 доводки по ревью, без единого
+# подтягивания main между ними): три файла из одиннадцати меняют `patch`.
+#
+# fixtures_pull_overlap_index.json — прод-форма живого merge-коммита
+# 5813e67f (не PR #333: назвать нужен был реальный случай СОДЕРЖАТЕЛЬНОГО
+# пересечения, а не просто «main тронул тот же файл» — в PR #333 пересечения
+# не было). До подтягивания (голова 835c6f3a, merge-base a50a568b) PR
+# добавляет ссылку на INFRA-CF.md в docs/INDEX.md; main (09a61e2be1) СВОЕЙ
+# правкой того же файла вставляет два абзаца ВЫШЕ по файлу — три-точечный
+# дифф после слияния (голова 5813e67f, merge-base 09a61e2be1) у docs/
+# INDEX.md и docs/research/20-cloudflare-free.md меняет `patch` (сдвиг
+# номеров строк/контекста хайка), у остальных 11 файлов из 13 — нет.
+
+FIXTURE_PR333_NO_OVERLAP = _DIR / "fixtures_pr333_pull_no_overlap.json"
+FIXTURE_PR333_EDIT = _DIR / "fixtures_pr333_branch_edit.json"
+FIXTURE_PULL_OVERLAP = _DIR / "fixtures_pull_overlap_index.json"
+
+
+def test_diff_fingerprint_unchanged_by_pull_without_content_overlap_pr333():
+    # Сценарий (а): подтягивание main, файлы PR #333 пересеклись с main
+    # только там, где содержимое (patch) не поменялось — отпечаток обязан
+    # остаться прежним, как остаётся `ai:ok` и не запускается дорогой прогон
+    # (should_run_ai_review читает именно этот отпечаток — см. тест ниже).
+    before = _load(FIXTURE_PR333_NO_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PR333_NO_OVERLAP, "after_pull")
+    assert review_labels.diff_fingerprint(before) == review_labels.diff_fingerprint(after)
+    # should_run_ai_review видит совпавший отпечаток при уже выданном ai:ok —
+    # дорогой прогон пропускается, метка не трогается этой веткой решения.
+    fp_before = review_labels.diff_fingerprint(before)
+    fp_after = review_labels.diff_fingerprint(after)
+    assert review_labels.should_run_ai_review(
+        [{"name": "ai:ok"}], fp_before, fp_after) is False
+
+
+def test_diff_fingerprint_changes_on_real_branch_edit_pr333():
+    # Сценарий (б): правка автора (два реальных последовательных коммита той
+    # же ветки PR #333, без единого подтягивания main) — отпечаток обязан
+    # измениться, дорогой прогон обязан запуститься.
+    rev1 = _load(FIXTURE_PR333_EDIT, "rev1")
+    rev2 = _load(FIXTURE_PR333_EDIT, "rev2")
+    fp1 = review_labels.diff_fingerprint(rev1)
+    fp2 = review_labels.diff_fingerprint(rev2)
+    assert fp1 != fp2
+    assert review_labels.should_run_ai_review([{"name": "ai:ok"}], fp1, fp2) is True
+
+
+def test_diff_fingerprint_changes_on_pull_with_real_line_overlap():
+    # Сценарий (в): подтягивание main пересекается СОДЕРЖАТЕЛЬНО (main
+    # правит тот же файл рядом со строками PR, три-точечный дифф после
+    # слияния меняется) — отпечаток обязан измениться, дорогой прогон
+    # обязан запуститься на непроверенном содержимом.
+    before = _load(FIXTURE_PULL_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PULL_OVERLAP, "after_pull")
+    fp_before = review_labels.diff_fingerprint(before)
+    fp_after = review_labels.diff_fingerprint(after)
+    assert fp_before != fp_after
+    assert review_labels.should_run_ai_review(
+        [{"name": "ai:ok"}], fp_before, fp_after) is True
+
+
+def test_diff_fingerprint_mutation_guard_head_blob_sha_regresses_no_overlap_case():
+    # Докажи мутацией (AGENTS.md, #740): вернуть отпечаток к SHA блоба на
+    # голове (докод до этой правки) — сценарий (а) обязан покраснеть, ровно
+    # тем набором данных, на котором сломался прод (PR #333, issue #740).
+    before = _load(FIXTURE_PR333_NO_OVERLAP, "before_pull")
+    after = _load(FIXTURE_PR333_NO_OVERLAP, "after_pull")
+
+    def head_blob_sha_fingerprint(files):
+        import hashlib as _hashlib
+        parts = sorted(
+            f"{f.get('filename', '')}:{f.get('status', '')}:{f.get('sha', '')}"
+            for f in files
+        )
+        return _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    # Текущая (исправленная) реализация — отпечаток не меняется.
+    assert review_labels.diff_fingerprint(before) == review_labels.diff_fingerprint(after)
+    # Старая (mutated) реализация на тех же данных — отпечаток МЕНЯЕТСЯ,
+    # то есть покраснела бы, если бы фикс откатили.
+    assert head_blob_sha_fingerprint(before) != head_blob_sha_fingerprint(after)
+
+
+def test_file_content_key_falls_back_to_sha_when_patch_missing():
+    # Честная граница (issue #740): бинарные файлы/файлы, обрезанные GitHub
+    # по размеру, не несут `patch` вовсе — фолбэк на `sha` (эта ветка ошибается
+    # в сторону «изменился» чаще настоящего дифф, что и требует AGENTS.md).
+    no_patch = {"filename": "f.bin", "status": "modified", "sha": "aaa111"}
+    assert review_labels._file_content_key(no_patch) == "sha:aaa111"
+    with_patch = {"filename": "f.py", "status": "modified", "sha": "aaa111",
+                  "patch": "@@ -1 +1 @@\n-a\n+b\n"}
+    assert review_labels._file_content_key(with_patch).startswith("patch:")
+    assert review_labels._file_content_key(with_patch) != "sha:aaa111"
+
+
 def test_diff_fingerprint_same_size_different_content_differs():
     # Класс, который явно назвала задача #252: разные правки одного размера
     # не должны случайно совпасть — blob-sha, не число строк, различает их.
@@ -240,6 +374,42 @@ def test_header_facts_diff_optional_backward_compat():
     facts = review_labels.header_facts(body)
     assert facts == {"pr": "140", "head": "abc", "reviewer": "rework"}
     assert "diff" not in facts
+
+
+def test_header_facts_reads_reason_field():
+    # #431: reason — тег причины verdict=error, читаемый scheduler'ом.
+    body = "pr: 163\nhead: sha163\nreviewer: error\nreason: transport_error\n\nпроза\n"
+    facts = review_labels.header_facts(body)
+    assert facts["reason"] == "transport_error"
+
+
+# ── Классификация причины verdict=error (#431) ────────────────────────────────
+
+@pytest.mark.parametrize("dsh_rc,expected", [
+    ("0", False), ("1", True), ("", False), ("не-число", False),
+])
+def test_transport_failed(dsh_rc, expected):
+    assert review_labels.transport_failed(dsh_rc) is expected
+
+
+def test_reason_tag_quota_exhausted_beats_transport():
+    # failure_reason решает раньше dsh_rc — квота исчерпана надолго не должна
+    # спутаться с generic-транспортом даже при том же rc≠0.
+    assert review_labels.reason_tag("1", "quota_exhausted") == review_labels.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_rate_limit_budget_distinct_from_quota():
+    tag = review_labels.reason_tag("1", "rate_limit_retry_budget_exceeded")
+    assert tag == review_labels.FAILURE_REASON_RATE_LIMIT_BUDGET
+    assert tag != review_labels.FAILURE_REASON_QUOTA_EXHAUSTED
+
+
+def test_reason_tag_transport_when_rc_nonzero_no_failure_reason():
+    assert review_labels.reason_tag("1") == review_labels.FAILURE_REASON_TRANSPORT
+
+
+def test_reason_tag_contract_when_rc_zero_no_failure_reason():
+    assert review_labels.reason_tag("0") == review_labels.FAILURE_REASON_CONTRACT
 
 
 def test_latest_ai_comment_picks_last_reviewer_fact_paginated():
@@ -558,8 +728,10 @@ def test_should_run_ai_review_mutation_guard_naive_any_verdict_check():
 # ── Commit Status API: вердикт вторым каналом, параллельно метке (#345) ──────
 #
 # Класс, который эти тесты ловят: состояние статуса обязано совпадать с тем,
-# что решает метка (review_status_state — тот же порог, что merge_label_gate;
-# ai_status_state — сбой транспорта не должен блокировать слияние навсегда).
+# что решает метка НА МОМЕНТ ПУША (review_status_state; с #702 это уже не тот
+# же порог, что merge_label_gate целиком — см. докстринг review_status_state
+# и дельту #702 в docs/decisions/0007-ai-review-gate.md; ai_status_state —
+# сбой транспорта не должен блокировать слияние навсегда).
 # Докажи мутацией: замени `if verdict == "approve"` на `if verdict != "rework"`
 # в ai_status_state — тест test_ai_status_state_error_is_pending_not_failure
 # покраснеет (error перестанет отличаться от approve).
@@ -625,6 +797,37 @@ def test_post_commit_status_truncates_description_to_140_chars():
     assert len(description_arg) == len("description=") + 140
 
 
+def test_status_posted_at_returns_latest_created_at_for_context():
+    # Находка ревью #424: якорь таймеров #196/#269 переведён с таймлайн-
+    # события "labeled" (замороженного идемпотентностью #203) на commit
+    # status, публикуемый каждым прогоном безусловно.
+    statuses = [
+        {"context": "harness/ai-review", "created_at": "2026-09-01T00:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-02T10:00:00Z"},
+        {"context": "harness/review", "created_at": "2026-09-01T09:00:00Z"},  # старее — не должен победить
+    ]
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_REVIEW, lambda url: statuses)
+    assert result == "2026-09-02T10:00:00Z"
+
+
+def test_status_posted_at_none_when_context_never_posted():
+    result = review_labels.status_posted_at(
+        "o/r", "sha1", review_labels.STATUS_AI_REVIEW, lambda url: [])
+    assert result is None
+
+
+def test_status_posted_at_reads_exact_sha_url():
+    calls = []
+
+    def fake_gh(url):
+        calls.append(url)
+        return []
+
+    review_labels.status_posted_at("owner/repo", "deadbeef", review_labels.STATUS_REVIEW, fake_gh)
+    assert calls == ["repos/owner/repo/commits/deadbeef/statuses?per_page=100"]
+
+
 def test_run_target_url_none_without_actions_env(monkeypatch):
     monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
@@ -635,3 +838,75 @@ def test_run_target_url_built_from_actions_env(monkeypatch):
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     assert review_labels.run_target_url("o/r") == "https://github.com/o/r/actions/runs/123"
+
+
+# ── Идемпотентность: своп вердикт-меток и публикация комментариев (#203) ─────
+#
+# Оба гейта на каждом прогоне безусловно перевешивали то, что уже висит:
+# снимали и ставили вердикт-метку (unlabeled+labeled одного значения в
+# таймлайне PR — каждый labeled к тому же триггерит orchestra.yml), POST-ил
+# заново одинаковый комментарий провала. Решения вынесены в чистые функции
+# здесь; гвардии кормятся прод-формой имён меток этого же модуля.
+
+def test_verdict_label_changes_unchanged_verdict_is_full_noop():
+    # Факт 2 #203: вердикт тот же — ни удаления, ни постановки, вызовов нет.
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.REVIEW_OK}], review_labels.REVIEW_OK) == ([], False)
+
+
+def test_verdict_label_changes_swap_removes_only_other_verdicts():
+    # Смена вердикта: чужая вердикт-метка снимается, актуальная ставится;
+    # метки вне вердиктов гейта (ai:ok, conflict) решение не трогает.
+    current = [{"name": review_labels.REVIEW_OK}, {"name": review_labels.AI_OK},
+               {"name": "conflict"}]
+    assert review_labels.verdict_label_changes(
+        current, review_labels.REVIEW_CHANGES) == ([review_labels.REVIEW_OK], True)
+
+
+def test_verdict_label_changes_cleans_stale_large_but_not_large_ok():
+    # Дифф ужался ниже порога: протухший review:large снимается, но метка
+    # принятия размера review:large-ok остаётся — у неё свой газ (LABELS.md).
+    current = [{"name": review_labels.REVIEW_LARGE}, {"name": review_labels.LARGE_OK}]
+    assert review_labels.verdict_label_changes(
+        current, review_labels.REVIEW_OK) == ([review_labels.REVIEW_LARGE], True)
+
+
+def test_verdict_label_changes_ai_verdicts_share_the_same_decision():
+    # Тот же код для гейта 2: повторный ai:failed (автоповтор #196) — полный
+    # no-op; смена ai:failed → ai:ok — перестановка, молчанием не становится.
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.AI_FAILED}], review_labels.AI_FAILED,
+        review_labels.AI_VERDICTS) == ([], False)
+    assert review_labels.verdict_label_changes(
+        [{"name": review_labels.AI_FAILED}], review_labels.AI_OK,
+        review_labels.AI_VERDICTS) == ([review_labels.AI_FAILED], True)
+
+
+def test_comment_update_action_three_outcomes():
+    existing = {"id": 1, "body": "Контракт PR ↔ задача нарушен:\n- x"}
+    assert review_labels.comment_update_action(None, "что угодно") == "post"
+    assert review_labels.comment_update_action(existing, existing["body"]) is None
+    assert review_labels.comment_update_action(existing, existing["body"] + "\n- y") == "patch"
+
+
+def test_latest_comment_by_header_finds_last_trusted_match():
+    # Шум + два своих + чужой с тем же заголовком в самом конце: обязан
+    # вернуться последний СВОЙ — чужой не выигрывает и заглушкой не служит
+    # (репозиторий публичный, класс подделки вердикта AI PR #294).
+    bot = {"login": "github-actions[bot]", "type": "Bot"}
+    first = {"user": bot, "body": review_labels.CONTRACT_FAIL_HEADER + "\n- первое"}
+    outsider = {"user": {"login": "random-outside-contributor", "type": "User"},
+                "body": review_labels.CONTRACT_FAIL_HEADER + "\n- подделка"}
+    last = {"user": bot, "body": review_labels.CONTRACT_FAIL_HEADER + "\n- второе"}
+    found = review_labels.latest_comment_by_header(
+        "o/r", 1, lambda url: [first, outsider, last] if "page=1" in url else [],
+        review_labels.CONTRACT_FAIL_HEADER)
+    assert found is last
+
+
+def test_latest_comment_by_header_none_when_no_trusted_match():
+    bot = {"login": "github-actions[bot]", "type": "Bot"}
+    found = review_labels.latest_comment_by_header(
+        "o/r", 1, lambda url: [{"user": bot, "body": "просто болтовня"}] if "page=1" in url else [],
+        review_labels.CONTRACT_FAIL_HEADER)
+    assert found is None

@@ -37,13 +37,24 @@
 # просто транслируются в универсальные ручки dsh_run_with_retry ниже —
 # смена имени сломала бы внешний вызывающий тест, а не только внутренний код.
 #
+# Цепочка провайдеров (#727): quota_exhausted и повторяемый транспортный
+# отказ (HTTP_404/EMPTY_RESPONSE, тот же класс, что RATE_LIMIT выше) больше
+# не роняют ревью — dsh_run_with_provider_chain (lib/dsh-ci.sh) пробует
+# следующего провайдера из vars.DSH_PROVIDER_CHAIN САМ, без ручной смены
+# vars.DEEPSEEK_*/секрета. Ошибка контракта вердикта (модель ответила не по
+# формату) сюда не попадает вовсе — это решает ai_review.py::parse_verdict
+# выше по стеку, цепочка её не видит.
+#
 # Использование: AI_WORK=<каталог с prompt.md> bash scripts/review/ai_dsh.sh
 # Результат: $AI_WORK/answer.txt (ответ последней попытки), $AI_WORK/
 # stderr.txt (последней попытки), $AI_WORK/dsh_rc.txt (код возврата dsh
 # последней попытки — единственный сигнал, различающий «транспорт упал» от
 # «дсш вернул текст»; смотри verdict в ai_review.py), $AI_WORK/
 # failure_reason.txt (пусто на успехе/обычном транспортном отказе;
-# quota_exhausted | rate_limit_retry_budget_exceeded иначе).
+# quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted
+# иначе), $AI_WORK/chain_provider.txt (имя провайдера, ответившего успехом,
+# пусто на отказе), $AI_WORK/chain_reset_hint.txt (даты сброса опробованных
+# провайдеров, «имя: дата; …» — пусто, если ни один не назвал дату).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,27 +74,40 @@ AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="${AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
 AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
 AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS:-300}"
 [ -f "$AI_WORK/prompt.md" ] || { echo "::error::нет $AI_WORK/prompt.md — шаг gather не отработал" >&2; exit 1; }
-# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
-# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет.
-dsh_require_provider_env || exit 1
-export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
+# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727): зашитого
+# списка провайдеров в коде нет, dsh_patch_profile/DEEPSEEK_* выставляются
+# ПОСЛЕ, отдельно на каждую попытку внутри dsh_run_with_provider_chain.
+dsh_require_provider_chain || exit 1
 
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"; : >"$AI_WORK/failure_reason.txt"
 
 dsh_install "$AI_WORK/pkgs"
 dsh --version || true
-dsh_patch_profile headless
+# Suite ротации учёток (#215, dsh-combo-router+anthropic-oauth-pool) здесь
+# НАМЕРЕННО не подключается: этот шаг всегда идёт через
+# dsh_run_with_provider_chain (#727 ниже), которая сама зовёт
+# dsh_patch_profile на КАЖДУЮ попытку — суть цепочки в том, что
+# DSH_CHAIN_PROVIDER/реестр подтверждённых моделей (#737) знают ТОЧНО, какого
+# провайдера пробуют. combo/auto suite решает тот же вопрос («кого пробовать
+# дальше») внутри себя и в обход этих проверок — комбинация не поддержана
+# конструктивно (design.md dsh-in-job, «Стык suite и цепочки провайдеров»).
+# dsh_require_provider_chain ниже уже откажет громко, если vars.PLUGINS_SUITE_URL
+# всё же попадёт в env этого шага — но ai-review.yml её сюда не прокидывает:
+# suite остаётся уделом hands.yml (#797: worker.yml тоже подключён к цепочке,
+# там suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_retry "$AI_WORK/answer.txt" "$AI_WORK/stderr.txt" "$(cat "$AI_WORK/prompt.md")"
+  dsh_run_with_provider_chain "$AI_WORK/answer.txt" "$AI_WORK/stderr.txt" "$(cat "$AI_WORK/prompt.md")"
 rc=$DSH_RUN_RC
 if [ -n "$DSH_RUN_FAILURE_REASON" ]; then
   printf '%s' "$DSH_RUN_FAILURE_REASON" >"$AI_WORK/failure_reason.txt"
 fi
+printf '%s' "$DSH_CHAIN_PROVIDER" >"$AI_WORK/chain_provider.txt"
+printf '%s' "$DSH_CHAIN_RESET_HINT" >"$AI_WORK/chain_reset_hint.txt"
 
 printf '%s' "$rc" >"$AI_WORK/dsh_rc.txt"
 

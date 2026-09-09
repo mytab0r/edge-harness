@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
-index 972d344..9f6d849 100644
+index 972d344..83b1c33 100644
 --- a/apps/dsh-edge/src/http.ts
 +++ b/apps/dsh-edge/src/http.ts
 @@ -12,6 +12,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
@@ -21,11 +21,53 @@ index 972d344..9f6d849 100644
    if (pathname.endsWith('/turn') || pathname === '/api/skills') return MAX_TURN_BODY_BYTES
    const route = /^\/api\/([a-zA-Z0-9_$-]+)[./]([a-zA-Z0-9_$-]+)$/.exec(pathname)
    if (route === null) return MAX_SESSION_CREATE_BODY_BYTES
+@@ -187,7 +192,13 @@ export function errorResponse(error: unknown): Response {
+     return jsonResponse({ ok: false, error: error.message }, error.status)
+   }
+   if (error instanceof EdgeSessionStoreError) {
+-    const status = error.code === 'NOT_FOUND' ? 404 : error.code === 'BUSY' ? 409 : 500
++    // AGENT_UNAVAILABLE (#572): agent/provider bootstrap failed for a call that
++    // does not need the model itself (e.g. harness ingest, session-store.ts
++    // appendHarnessEvents) — retryable, distinct from a genuine data error.
++    const status = error.code === 'NOT_FOUND' ? 404
++      : error.code === 'BUSY' ? 409
++      : error.code === 'AGENT_UNAVAILABLE' ? 503
++      : 500
+     return jsonResponse({ ok: false, error: error.message, code: error.code }, status)
+   }
+   if (error instanceof LlmError) {
+@@ -207,7 +218,25 @@ export function errorResponse(error: unknown): Response {
+     return jsonResponse({ ok: false, error: 'Workspace entry not found.' }, 404)
+   }
+   console.error(error)
+-  return jsonResponse({ ok: false, error: 'Internal runtime error.' }, 500)
++  // #572: this fallback used to return the bare string below with no way to
++  // tell "which class of internal error" apart — the incident that hid a
++  // production-only agent-bootstrap failure behind "Internal runtime error."
++  // for 21h across every /ingest call (scheduler.py, task.sh both read this
++  // exact body). The literal `error` string stays byte-for-byte the same so
++  // existing fingerprint/dedup text keeps matching; `detail` is new and adds
++  // the one thing that was missing — a name+message a human or a dedup key
++  // can actually act on, still bounded so a runaway message can't blow up
++  // the response or leak more than upstream already put in `error.message`.
++  const detail = error instanceof Error
++    ? `${error.name}: ${truncateDetail(error.message)}`
++    : 'non-Error value thrown'
++  return jsonResponse({ ok: false, error: 'Internal runtime error.', code: 'internal', detail }, 500)
++}
++
++/** Bound an error detail string so one oversized message cannot balloon a response. */
++function truncateDetail(message: string): string {
++  const MAX = 300
++  return message.length > MAX ? `${message.slice(0, MAX)}…` : message
+ }
+ 
+ function llmHttpStatus(code: string): number {
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index 9b15245..43f172f 100644
+index c9b5b95..3ee648d 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
-@@ -39,6 +39,8 @@ import {
+@@ -38,6 +38,8 @@ import {
  } from './deployment.ts'
  import {
    EdgeHttpError,
@@ -34,7 +76,7 @@ index 9b15245..43f172f 100644
    MAX_SESSION_CREATE_BODY_BYTES,
    MAX_TURN_BODY_BYTES,
    corsHeaders,
-@@ -332,6 +334,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -366,6 +368,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
          return await this.startTurn(request, route.sessionId)
        } else if (route.action === 'cancel' && request.method === 'POST') {
          return this.cancelTurn(route.sessionId)
@@ -43,7 +85,7 @@ index 9b15245..43f172f 100644
        }
  
        throw new EdgeHttpError(404, 'Session route not found.')
-@@ -734,6 +738,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -961,6 +965,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
      })
    }
  
@@ -79,7 +121,7 @@ index 9b15245..43f172f 100644
    private async startTurn(request: Request, sessionId: SessionId): Promise<Response> {
      const body = await readJsonObject(request, MAX_TURN_BODY_BYTES)
      const message = requireBoundedUtf8String(body.message, 'message', MAX_MESSAGE_TEXT_BYTES)
-@@ -1090,7 +1123,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
+@@ -1319,7 +1352,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
  
  interface ParsedSessionRoute {
    sessionId?: SessionId
@@ -88,7 +130,7 @@ index 9b15245..43f172f 100644
  }
  
  function parseSessionRoute(pathname: string): ParsedSessionRoute {
-@@ -1111,7 +1144,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
+@@ -1340,7 +1373,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
    const id = SessionId(sessionId)
    if (parts.length === 3) return { sessionId: id }
    const action = parts[3]
@@ -98,10 +140,39 @@ index 9b15245..43f172f 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index d408d3f..02fb4f0 100644
+index cfff36a..be11683 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -1096,6 +1096,59 @@ export class EdgeSessionStore {
+@@ -19,7 +19,7 @@ import type {
+   ImageAttachmentRef,
+ } from '@deepseek-ai/dsh-attachment'
+ import { credentialRef, type CredentialInfo } from '@deepseek-ai/dsh-credentials'
+-import LlmRuntime, { ReasoningEffortId, createUserMessage } from '@deepseek-ai/dsh-llm'
++import LlmRuntime, { LlmError, ReasoningEffortId, createUserMessage } from '@deepseek-ai/dsh-llm'
+ import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
+ import MessageFeedbackService from '@deepseek-ai/dsh-message-feedback'
+ import {
+@@ -195,7 +195,18 @@ export type EdgeAgentPromptAdmitter = (input: EdgeAgentPromptAdmission) => Promi
+ 
+ export class EdgeSessionStoreError extends Error {
+   constructor(
+-    readonly code: 'NOT_FOUND' | 'BUSY' | 'INVALID_DATA' | 'TITLE_INVALID' | 'FORK_UNAVAILABLE',
++    readonly code:
++      | 'NOT_FOUND'
++      | 'BUSY'
++      | 'INVALID_DATA'
++      | 'TITLE_INVALID'
++      | 'FORK_UNAVAILABLE'
++      // #572: openAgentForTurn/agents.resume failed for a reason unrelated to
++      // the caller's data (cordis DI/tool bootstrap, workerd limits — anything
++      // that is neither LlmError nor one of the codes above). Distinct from
++      // INVALID_DATA/NOT_FOUND so http.ts::errorResponse can answer 503, not a
++      // blind 500, and the caller can tell "retry later" from "fix your input".
++      | 'AGENT_UNAVAILABLE',
+     message: string,
+   ) {
+     super(message)
+@@ -1265,6 +1276,117 @@ export class EdgeSessionStore {
      }
    }
  
@@ -127,7 +198,65 @@ index d408d3f..02fb4f0 100644
 +    if (!persistence.hasSession(id) && persistence.readBlankSession(id) === undefined) {
 +      throw new EdgeSessionStoreError('NOT_FOUND', 'Session not found.')
 +    }
-+    const handle = await this.openAgentForTurn(id, DEFAULT_EDGE_MODEL)
++    // #572: upstream has no lower-level "just append to the log" primitive —
++    // createSession/createBlankSession/renameSession above all go through the
++    // same agents.create/resume; docs/research/12-dsh-edge-session-api.md
++    // ("Чего в dsh-edge НЕТ") already found this. openAgentForTurn cannot be
++    // dropped here. What CAN be fixed: the second argument here is not a
++    // fallback that only matters "if nothing else resolves" — for the common
++    // ingest case (a runner/harness-N session created fresh for this batch,
++    // never resumed for a native turn) modelSelection()'s own chain
++    // (agentPending → bridge → live-agent request/header → persisted log)
++    // finds nothing, because ingest never runs `selectModel` or a native turn
++    // that would populate any of those; it falls straight through to
++    // `persistence.readBlankSession(id) !== undefined` and returns
++    // `defaultModelSelection(defaultModel)` — this argument, verbatim. Passing
++    // the upstream literal DEFAULT_EDGE_MODEL ('deepseek-v4-flash') here was a
++    // no-op fix: it is byte-for-byte the same id the unpatched code already
++    // passed down this exact branch. CONFIRMED stale in this deployment:
++    // deploy-dsh-edge.yml ("Патч каталога моделей под реального провайдера")
++    // rewrites the compiled @deepseek-ai/dsh-llm-deepseek DEFAULT_MODELS array
++    // (source: that package's own catalog literal, `[{id:"deepseek-v4-flash",
++    // ...}]`) to the deployment's real glm-* catalog AFTER build —
++    // DEFAULT_EDGE_MODEL is a source-level TypeScript constant, untouched by
++    // that step, so it never names a model id present in the catalog actually
++    // registered at runtime, for ANY ingest session, blank or not. Use the
++    // deployment's real default instead: `agentDefaultModel` (registered a few
++    // hundred lines up in `initialize()`) already resolves it once at startup
++    // via `resolveEdgeModel(config.model)` off the deployed `DEEPSEEK_MODEL`
++    // (or a persisted settings override) — the same source upstream's own
++    // SessionController reads. NOT confirmed: whether the stale-catalog
++    // mismatch is what throws during agents.resume — dsh-llm-deepseek's own
++    // modelInfoFor (checked directly, npm 0.1.2-rc.1, the version actually
++    // pinned in apps/dsh-edge/package.json) tolerates an unknown id by
++    // synthesizing a fallback ModelInfo instead of throwing, so the mismatch
++    // alone may not be sufficient; the actual bootstrap factory
++    // (@deepseek-ai/dsh-agent-loop, registered onto AgentRegistry) is not
++    // vendored anywhere in this repo and was not available to inspect. Either
++    // way this mismatch was real and is worth not shipping regardless of
++    // whether it is THE trigger: an id absent from the deployed catalog has no
++    // business being the thing ingest bootstraps with when a correct default
++    // is one property read away.
++    const selection = await this.modelSelection(id, this.context.agentDefaultModel.currentSelection().model)
++    let handle: AgentHandle
++    try {
++      handle = await this.openAgentForTurn(id, selection.model)
++    } catch (error) {
++      // LlmError and EdgeSessionStoreError are already classified correctly by
++      // http.ts::errorResponse (provider auth/quota, NOT_FOUND/BUSY/...) —
++      // rethrow those as-is so that classification is not lost. Anything else
++      // — cordis DI/tool-runtime/plan-mode bootstrap throwing a bare Error, a
++      // workerd runtime limit — is exactly what used to surface to callers as
++      // the opaque `{"ok":false,"error":"Internal runtime error."}` that hid
++      // this incident for 21h (scheduler.py::append_session_notes, task.sh
++      // both read that exact body). Classify it instead of masking it.
++      if (error instanceof LlmError || error instanceof EdgeSessionStoreError) throw error
++      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
++      throw new EdgeSessionStoreError(
++        'AGENT_UNAVAILABLE',
++        `Harness ingest could not open the target session (agent bootstrap failed): ${detail}`,
++      )
++    }
 +    try {
 +      const session = handle.agent.session
 +      let baseTurn = 0
@@ -161,7 +290,7 @@ index d408d3f..02fb4f0 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1299,6 +1352,72 @@ export class EdgeSessionStore {
+@@ -1496,6 +1618,107 @@ export class EdgeSessionStore {
    }
  }
  
@@ -220,12 +349,47 @@ index d408d3f..02fb4f0 100644
 +      || typeof sourceField !== 'object' || typeof (sourceField as { kind?: unknown }).kind !== 'string') {
 +      throw fail('"user/message" requires role "user", content blocks, and a source')
 +    }
++    // #794: dsh-session::assertMessageEventShape (dsh-session/lib/index.js) is
++    // never called on THIS write path — only on the next cold load of this
++    // session (adoptStoredEvents) — so an event missing a non-empty string
++    // `id` here is accepted silently and only throws later, as "session event
++    // at seq <n> lacks an identified message", when the owner reopens the
++    // session. Reject it here instead, loud, before a single byte is stored.
++    if (typeof data.id !== 'string' || data.id === '') {
++      throw fail('"user/message" requires a non-empty string id')
++    }
 +  }
 +  if (type === 'assistant/message' || type === 'tool/result') {
 +    const message = data.message
 +    if (message === null || typeof message !== 'object' || Array.isArray(message)
 +      || !Array.isArray((message as { content?: unknown }).content)) {
 +      throw fail(`"${type}" requires a message object with content blocks`)
++    }
++    // Same #794 gap as user/message above, for the wrapped message shape.
++    const record = message as Record<string, unknown>
++    if (typeof record.id !== 'string' || record.id === '') {
++      throw fail(`"${type}" requires a non-empty string message.id`)
++    }
++    if (type === 'assistant/message') {
++      // assertMessageEventShape also requires role "assistant" and a model
++      // source with provider+model (dsh-session/lib/index.js::hasProviderModel)
++      // for this type specifically — an id alone is not sufficient to pass
++      // validation on the next cold load, only to move which field trips it.
++      // tool/result's own extra shape (source.kind "tool"/callId, single
++      // tool-result content block) is deliberately NOT mirrored here: nothing
++      // in this deployment produces a tool/result ingest event yet, and a
++      // check with no real producer to feed it prod-form data is exactly the
++      // "тест кормит прод-форму данных, а не пересказ" trap — left for
++      // whoever adds that writer next.
++      const sourceField = record.source
++      const sourceRecord = sourceField !== null && typeof sourceField === 'object' && !Array.isArray(sourceField)
++        ? (sourceField as Record<string, unknown>)
++        : undefined
++      if (record.role !== 'assistant' || sourceRecord === undefined || sourceRecord.kind !== 'model'
++        || typeof sourceRecord.provider !== 'string' || sourceRecord.provider === ''
++        || typeof sourceRecord.model !== 'string' || sourceRecord.model === '') {
++        throw fail('"assistant/message" requires role "assistant" and a model source with provider/model')
++      }
 +    }
 +  }
 +  return { type, data, surface: HARNESS_SURFACE_EVENT_TYPES.has(type) }

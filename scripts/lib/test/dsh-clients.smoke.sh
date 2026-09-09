@@ -133,14 +133,19 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   elif [[ "$sig" == *"issue list"* ]]; then
     # Пул свободных задач для auto-сценария воркера (free_task).
     payload="${GH_ISSUE_LIST_JSON:-[]}"
-  elif [[ "$sig" == *"pr list"* && "$sig" == *"--json url"* ]]; then
+  elif [[ "$sig" == *"pr list"* && "$sig" == *"--json number,state,additions,deletions,changedFiles,url"* ]]; then
     # Переопределяемо сценарием (#422): провайдер в лимите — PR не открыт,
     # worker/task.sh обязан различить это от «PR уже есть». Дефолт — ОТДЕЛЬНОЙ
     # переменной, не буквальными скобками внутри ${VAR:-...}: непарная '}' в
     # литерале JSON преждевременно закрывает подстановку (bash: первая
     # НЕэкранированная '}' завершает ${...}, даже если это середина JSON) —
-    # живой прогон CI 34009616520, jq упал на «Unmatched ']'».
-    _default_pr_list_url='[{"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
+    # живой прогон CI 34009616520, jq упал на «Unmatched ']'». Пост-обработка
+    # воркера (#413): PR ветки задачи, открыт и с диффом — успех. Сигнатура и
+    # canned-payload несут ВСЕ поля, что реально запрашивает task.sh —
+    # находка ревью PR #415: без changedFiles здесь заглушка не матчилась на
+    # реальный вызов и молча проваливалась в ветку "payload='[]'" ниже,
+    # happy-path смоук-сценарий красил ложным «PR не найден».
+    _default_pr_list_url='[{"number":9,"state":"OPEN","additions":3,"deletions":1,"changedFiles":1,"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
     payload="${GH_PR_LIST_URL_JSON:-$_default_pr_list_url}"
   elif [[ "$sig" == *"pr list"* ]]; then
     payload='[]'
@@ -243,9 +248,24 @@ mkdir -p "$TMP/bin"
 
 cat >"$TMP/bin/git" <<'GITSTUB'
 #!/usr/bin/env bash
+# Заглушка честна по форме ответа (тест кормится прод-формой, AGENTS.md):
+#   - ls-remote печатает строку ТОЛЬКО для запрошенного ref'а — task-branch
+#     (#356) решает «ветка уже существует» по НЕпустому выводу
+#     `git ls-remote --heads origin refs/heads/agent/<N>-<slug>`; грубая
+#     заглушка «всегда главная строка» делала существующей любую ветку и
+#     красила worker-сценарий отказом до аренды (живой прогон CI 34153826296);
+#   - show-ref с отсутствующей локальной веткой в реальном git — rc=1, здесь
+#     локальных agent-веток нет вовсе.
 case "${1:-}" in
-  ls-remote) printf '0000000000000000000000000000000000000000\trefs/heads/main\n' ;;
+  ls-remote)
+    for a in "$@"; do
+      case "$a" in
+        refs/heads/main) printf '0000000000000000000000000000000000000000\trefs/heads/main\n' ;;
+        refs/heads/*) : ;;
+      esac
+    done ;;
   rev-parse) printf '0000000000000000000000000000000000000000\n' ;;
+  show-ref) exit 1 ;;
   *) exit 0 ;;
 esac
 GITSTUB
@@ -400,11 +420,31 @@ export HANDS_URL="https://journal.test"
 export HARNESS_URL="https://journal.test"
 export HANDS_TOKEN="smoke-hands-token"
 export DEEPSEEK_API_KEY="smoke-deepseek-key"
-# ФИКСТУРА теста, не дефолт прода (#153): dsh_require_provider_env требует
-# непустых значений, значение здесь произвольно и не читается как источник
-# правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
+# ФИКСТУРА теста, не дефолт прода (#153): DEEPSEEK_BASE_URL/DEEPSEEK_MODEL
+# здесь больше не читаются напрямую ни одним из трёх каналов (все три —
+# ai_dsh.sh/worker/task.sh/hands/dsh_task.sh — теперь требуют
+# vars.DSH_PROVIDER_CHAIN, #727/#797/#805); экспорт оставлен как безвредный
+# остаток на случай кода, который ещё их читает где-то в цепочке вызовов —
+# единственный источник правды для провайдера теперь DSH_PROVIDER_CHAIN ниже.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
+# Цепочка провайдеров (#727, доводы #797/#805): ai_dsh.sh (ревью), worker/task.sh
+# И hands/dsh_task.sh теперь требуют vars.DSH_PROVIDER_CHAIN, не одиночные
+# DEEPSEEK_* напрямую — один фиктивный провайдер, ссылающийся на ту же
+# DEEPSEEK_API_KEY-фикстуру. worker/task.sh и hands/dsh_task.sh оба сами
+# патчат профиль значениями chain[0] ДО первого `dsh` (плагин стрима) —
+# DEEPSEEK_BASE_URL/DEEPSEEK_MODEL, экспортированные прямо выше, оба клиента
+# перезаписывают своими же значениями, взятыми из этой же цепочки.
+export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
+# Реестр подтверждённых id (#737): реальный реестр репозитория
+# (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель
+# "glm-5" этой фикстуры по построению — своя фикстура реестра, иначе
+# dsh_run_with_provider_chain честно пропустил бы SMOKE как неподтверждённый
+# и сценарии ниже (ожидающие реального вызова dsh) стали бы ложно-красными.
+CONFIRMED_MODELS_FIXTURE="$TMP/confirmed-models.json"
+printf '[{"name":"SMOKE","model_sha256":"%s","confirmed_at":"2026-09-08","evidence":"smoke fixture"}]' \
+  "$(printf '%s' 'glm-5' | sha256sum | cut -d' ' -f1)" >"$CONFIRMED_MODELS_FIXTURE"
+export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
@@ -652,7 +692,12 @@ grep -qx "0" "$AI_RL1/dsh_rc.txt" \
 echo "SMOKE: ai-review-rate-limit-transient — ок"
 
 # 2) RATE_LIMIT: Weekly/Monthly Limit Exhausted — падаем СРАЗУ, без ретрая
-# (сброс через дни — ждать внутри прогона бессмысленно).
+# (сброс через дни — ждать внутри прогона бессмысленно). Фикстура цепочки
+# несёт РОВНО одного провайдера (#727) — переключаемый класс (quota_exhausted)
+# исчерпывает цепочку целиком в ОДИН шаг: чейн честно называет это
+# all_providers_exhausted (провайдеров для перехода больше нет), а не
+# quota_exhausted — конкретная причина последнего провайдера остаётся видна
+# в chain_reset_hint.txt (дата сброса), не в failure_reason.
 AI_RL2="$TMP/ai-rl-quota"
 mkdir -p "$AI_RL2"
 printf 'Промпт ревью (smoke): квота исчерпана надолго\n' >"$AI_RL2/prompt.md"
@@ -662,27 +707,33 @@ SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
   run_client "ai-review-rate-limit-quota" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL2/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-quota: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL2/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-grep -qx "quota_exhausted" "$AI_RL2/failure_reason.txt" \
-  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'quota_exhausted', получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL2/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: failure_reason.txt ожидал 'all_providers_exhausted' (#727, один провайдер в фикстуре), получено: $(cat "$AI_RL2/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -q "2026-09-10" "$AI_RL2/chain_reset_hint.txt" \
+  || { echo "::error::SMOKE: ai-review-quota: chain_reset_hint.txt потерял дату сброса, получено: $(cat "$AI_RL2/chain_reset_hint.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-quota — ок"
 
-# 3) Настоящая ошибка провайдера (нет строки RATE_LIMIT вовсе) — падаем
-# сразу, как и до #419: ретрай не должен трогать этот класс.
+# 3) HTTP_404 (перемежающийся транспортный отказ, класс #727 — живой случай
+# NVIDIA 2026-09-02, AGENTS.md) — тоже переключаемый класс, не «настоящая
+# ошибка, которую ретрай не трогает» (как было до #727): единственный
+# провайдер фикстуры исчерпывает цепочку тем же образом, что и quota выше.
 AI_RL3="$TMP/ai-rl-real-error"
 mkdir -p "$AI_RL3"
-printf 'Промпт ревью (smoke): настоящая ошибка\n' >"$AI_RL3/prompt.md"
+printf 'Промпт ревью (smoke): HTTP_404 — переключаемый транспортный класс\n' >"$AI_RL3/prompt.md"
 AI_WORK="$AI_RL3" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="real-error" \
   run_client "ai-review-rate-limit-real-error" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL3/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-real-error: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL3/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-[ -s "$AI_RL3/failure_reason.txt" ] \
-  && { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt обязан быть пуст на настоящей ошибке (не лимит), получено: $(cat "$AI_RL3/failure_reason.txt")" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL3/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-real-error: failure_reason.txt ожидал 'all_providers_exhausted' (HTTP_404 — переключаемый класс #727), получено: $(cat "$AI_RL3/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-real-error — ок"
 
 # 4) Временный RATE_LIMIT, который не снимается, — бюджет ожидания обязан
-# кончиться (не бесконечный ретрай, не занятый навечно job-слот).
+# кончиться (не бесконечный ретрай, не занятый навечно job-слот). Тот же
+# единственный провайдер фикстуры — бюджет исчерпан → переключаемый класс →
+# цепочка тоже закрывается как all_providers_exhausted (#727).
 AI_RL4="$TMP/ai-rl-budget"
 mkdir -p "$AI_RL4"
 printf 'Промпт ревью (smoke): бюджет ретрая исчерпан\n' >"$AI_RL4/prompt.md"
@@ -693,8 +744,8 @@ AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client "ai-review-rate-limit-budget" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL4/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-budget: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL4/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
-grep -qx "rate_limit_retry_budget_exceeded" "$AI_RL4/failure_reason.txt" \
-  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'rate_limit_retry_budget_exceeded', получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
+grep -qx "all_providers_exhausted" "$AI_RL4/failure_reason.txt" \
+  || { echo "::error::SMOKE: ai-review-budget: failure_reason.txt ожидал 'all_providers_exhausted' (#727, один провайдер в фикстуре), получено: $(cat "$AI_RL4/failure_reason.txt" 2>/dev/null)" >&2; exit 1; }
 echo "SMOKE: ai-review-rate-limit-budget — ок"
 
 # ── Тот же ретрай у worker/hands (#422 — раньше был только у ai-review) ──────────
@@ -749,6 +800,11 @@ echo "SMOKE: worker-rate-limit-quota — ок"
 # (issue-N) возвращается в пул ПОСЛЕ того, как GH_RUN_TOKEN уже снят из
 # экспорта (trust-zone, #121): release-full обязан пройти на СОХРАНЁННОЙ
 # копии токена (LEASE_RELEASE_TOKEN), не на переменной окружения.
+# Цепочка провайдеров (#727/#805): фикстура несёт РОВНО одного провайдера —
+# rate_limit_retry_budget_exceeded (переключаемый класс) исчерпывает цепочку
+# целиком в ОДИН шаг, тот же паттерн, что уже доказан для ai-review выше
+# (AI_RL4) — журнал получает all_providers_exhausted, не
+# rate_limit_retry_budget_exceeded напрямую.
 scenario_start
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke: бюджет ретрая рук исчерпан" \
@@ -759,8 +815,8 @@ HANDS_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client_expect_fail "hands-rate-limit-budget" "$REPO/scripts/hands/dsh_task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "hands-rate-limit-budget: замок не снят — задача осталась занятой"
 assert_log "GH-API-UNASSIGN issue-123" "hands-rate-limit-budget: назначение не снято — задача осталась занятой"
-grep -qF "rate_limit_retry_budget_exceeded" "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
+grep -qF "all_providers_exhausted" "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason all_providers_exhausted (#727/#805, один провайдер в фикстуре)" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
 grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands-rate-limit-budget: job_end не fail" >&2; exit 1; }
 echo "SMOKE: hands-rate-limit-budget — ок"

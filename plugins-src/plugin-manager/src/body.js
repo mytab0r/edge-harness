@@ -4,7 +4,9 @@
 // и константы MANIFEST (вшитый срез dsh-edge/plugins.json: id/server/client)
 // и CATALOG (вшитый каталог заказа dsh-edge/plugins-catalog.json целиком)
 // дописывает build.mjs. Свободные переменные тела: require (параметр
-// фабрики), MANIFEST, CATALOG, module/exports (обёртка).
+// фабрики), MANIFEST, CATALOG, module/exports (обёртка), describeResponseError
+// (общий разбор тела ответа при !response.ok — #575, инлайнится сборкой из
+// plugins-src/shared/describe-response-error.js тем же приёмом, что MANIFEST).
 //
 // Откуда модули:
 //  - react и @deepseek-ai/dsh-client-ui-primitives отдаёт seed-карта шелла
@@ -65,7 +67,7 @@ async function fetchStatusPage(id, after) {
     credentials: "include",
     headers: { accept: "application/json" },
   });
-  if (!response.ok) throw new Error("HTTP " + response.status);
+  if (!response.ok) throw new Error(await describeResponseError(response));
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("json")) {
     throw new Error("ответ не JSON (" + (contentType || "без content-type") + ") — это не журнал");
@@ -152,7 +154,7 @@ async function rpcCall(method, payload) {
       payload,
     }),
   });
-  if (!response.ok) throw new Error("HTTP " + response.status);
+  if (!response.ok) throw new Error(await describeResponseError(response));
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("json")) {
     throw new Error("ответ не JSON (" + (contentType || "без content-type") + ") — это не RPC морды");

@@ -70,11 +70,39 @@ jobs:
           # красного прогона.
           DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
-          # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
-          # Зашитого фолбэка здесь больше нет; пусто → dsh_require_provider_env
-          # в dsh_task.sh падает громко до какой-либо дорогой работы.
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          # Цепочка провайдеров (#727, довод #805) — одно место правды:
+          # vars.DSH_PROVIDER_CHAIN репозитория (JSON-массив, порядок =
+          # приоритет). Пусто → dsh_require_provider_chain в dsh_task.sh
+          # падает громко до какой-либо дорогой работы. Секреты ВСЕХ
+          # провайдеров цепочки нужны сразу (перебор внутри одного прогона,
+          # не переключение между прогонами, тот же принцип, что уже несёт
+          # ai-review.yml/worker.yml) — NVIDIA_API_KEY литеральным именем,
+          # наравне с уже переданным DEEPSEEK_API_KEY (секрет GLM/z.ai) выше.
+          # Статичные DEEPSEEK_BASE_URL/DEEPSEEK_MODEL убраны из env — их
+          # теперь выставляет сам dsh_task.sh из chain[0].
+          DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          # Окно контекста env-provider-маршрута combo-router (#789) — тот же
+          # источник, что уже требует присутствие DEEPSEEK_MODEL для каталога
+          # морды (deploy-dsh-edge.yml): dsh_model_context_window (dsh-ci.sh)
+          # ищет DSH_MODEL по id в этом JSON, не в DSH_MAX_TOKENS (тот —
+          # потолок вывода, другая величина).
+          DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
+          # Ротация учёток (#215) — одно место правды: имя переменной и
+          # список секретов-кандидатов объявлены в scripts/lib/dsh-ci.sh
+          # (PLUGINS_SUITE_CANDIDATE_ROUTES), здесь только проводка. Пусто →
+          # dsh_install_plugins_suite печатает «не подключена» и job идёт как
+          # раньше (одиночный провайдер) — обратная совместимость, критерий 4
+          # приёмки #215.
+          PLUGINS_SUITE_URL: ${{ vars.PLUGINS_SUITE_URL }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
           # Аренда задачи (#121): claim_task.py создаёт refs/locks/task-N под
           # этим токеном; dsh_task.sh снимает переменную ИЗ ЭКСПОРТА до старта
           # DSH (копия остаётся в bash-переменной без export для release-full

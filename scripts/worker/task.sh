@@ -4,9 +4,10 @@
 # её в атомарную аренду (claim_task, #121), создать ветку agent/N-slug (либо,
 # если на задачу уже открыт PR без исполнителя — #245, довести его: чекаут
 # существующей ветки, без второй ветки/PR), накормить DSH headless промптом
-# (тело задачи + playbook + критерий), проверить результат (открытый PR) и
-# отчитаться (комментарий в задачу + Telegram). Работу над задачей делает
-# DSH — этот скрипт за него ничего не решает и не пишет.
+# (тело задачи + playbook + критерий), проверить результат (PR по ветке
+# СУЩЕСТВУЕТ — открыт или уже слит, #413) и отчитаться (комментарий в задачу
+# + Telegram). Работу над задачей делает DSH — этот скрипт за него ничего не
+# решает и не пишет.
 #
 # Ретрай временного RATE_LIMIT провайдера (#422, механизм #419/#421 —
 # dsh_run_with_retry в lib/dsh-ci.sh): живой факт — прогоны worker.yml
@@ -21,21 +22,36 @@
 # worker.yml timeout-minutes). Патологический случай «упало после 140 минут
 # работы» теоретически возможен и не решён здесь (тот же непокрытый класс уже
 # принят в #421 для ai-review) — задокументирован, не тихо проигнорирован.
-# quota_exhausted (недельная/месячная квота) и rate_limit_retry_budget_exceeded
-# (бюджет короткого окна кончился) — обе причины возвращают задачу в пул СРАЗУ
+# quota_exhausted (недельная/месячная квота), rate_limit_retry_budget_exceeded
+# (бюджет короткого окна кончился) и all_providers_exhausted (цепочка ниже
+# исчерпана целиком) — все три причины возвращают задачу в пул СРАЗУ
 # (lease_cli release-full, #422), не дожидаясь 24-часового TTL-сборщика: вина
 # не в задаче, держать assignee до таймера — зря прятать её от других каналов.
 #
+# Цепочка провайдеров (#727, довод #797): dsh_require_provider_env/
+# dsh_run_with_retry заменены на dsh_require_provider_chain/
+# dsh_run_with_provider_chain (lib/dsh-ci.sh, тот же механизм, что уже несёт
+# ai-review.yml, scripts/review/ai_dsh.sh) — quota_exhausted и повторяемый
+# транспортный отказ (HTTP_404/EMPTY_RESPONSE) переключают на следующего
+# провайдера ВНУТРИ одного прогона, без ручной смены vars/секрета (иначе
+# недельная/месячная квота GLM держала бы воркер мёртвым до сброса, хотя
+# NVIDIA в цепочке рабочий). Порядок относительно монтажа плагина стрима
+# (dsh-hands-streamer, шаг 6b ниже) — см. комментарий у шага 6: профиль
+# затравлен ПЕРВЫМ провайдером цепочки ДО первого `dsh` (dsh plugin add),
+# цепочка перепатчивает профиль заново на каждую попытку внутри шага 7 — тот
+# же dsh_patch_profile, не второй механизм.
 # Использование:
 #   task.sh               — выбрать свободную задачу из пула и выполнить
 #   task.sh --task 89     — выполнить конкретную задачу (если она открыта и свободна)
 #   task.sh --dry-run     — самотест: напечатать выбранную задачу и промпт,
 #                           ничего не назначая, не запуская и не отправляя
 #
-# Итог запуска: PR открыт → job зелёный; эскалация (метка blocked) → зелёный;
-# провайдер в лимите/квоте надолго → job красный, но задача честно возвращена
-# в пул (не «воркер не справился» — вина не его); иначе (нет PR, реальный
-# сбой) → job красный. Нет свободных задач → зелёный без действий.
+# Итог запуска: PR открыт ИЛИ слит → job зелёный (#413: слитый PR — успех
+# более полный, чем открытый, не отсутствие результата); эскалация (метка
+# blocked) → зелёный; провайдер в лимите/квоте надолго → job красный, но
+# задача честно возвращена в пул (не «воркер не справился» — вина не его);
+# иначе (PR нет, закрыт без слияния или пуст без диффа, реальный сбой) →
+# job красный. Нет свободных задач → зелёный без действий.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -91,13 +107,13 @@ if [ -n "$TASK_INPUT" ]; then
   case "$TASK_INPUT" in *[!0-9]*) die "номер задачи должен быть числом: '$TASK_INPUT'" ;; esac
 fi
 
-# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
-# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
-# раньше дупгарда/назначения/ветки/сессии морды — падать сразу, а не после
-# дорогой подготовительной работы. Пропускаем при --dry-run: самотест печатает
-# выбор и промпт без реального вызова модели, требовать ключ здесь незачем.
+# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727/#797):
+# зашитого списка провайдеров в коде нет. Проверяем раньше дупгарда/
+# назначения/ветки/сессии морды — падать сразу, а не после дорогой
+# подготовительной работы. Пропускаем при --dry-run: самотест печатает выбор
+# и промпт без реального вызова модели, требовать цепочку здесь незачем.
 if [ "$DRY_RUN" != "1" ]; then
-  dsh_require_provider_env || die "провайдер не сконфигурирован (см. ::error:: выше)"
+  dsh_require_provider_chain || die "провайдер не сконфигурирован (см. ::error:: выше)"
 fi
 
 # Гвардия дублей прогонов: если живёт ДРУГОЙ прогон воркера — активный или
@@ -318,7 +334,7 @@ $criterion
 5. Упёрся в то, что есть только у владельца (секрет вне хранилища, доступ, деньги, необратимое внешнее действие), — единственная эскалация: комментарий в задачу #$number (что нужно и почему не сам) + метка blocked (gh issue edit $number --add-label blocked), PR не открывай, работу останови. Это законный исход запуска.
 6. Финальный ответ в stdout — краткий отчёт: ссылка на PR или причина отказа/эскалации.
 
-Открытый PR на задачу — обязательный результат: без него запуск считается провалом воркера.
+PR на задачу (открытый или уже слитый) — обязательный результат: без него запуск считается провалом воркера.
 
 # Правила работы (обязательны; дистилляция живой практики)
 
@@ -353,6 +369,14 @@ if [ "$claim_rc" -eq 1 ]; then
 fi
 [ "$claim_rc" -eq 0 ] || die "claim_task сломался (rc=$claim_rc): $claim_out"
 echo "Аренда взята: $claim_out"
+# task-branch (шаг 5) теперь тоже умеет арендовать (#356, внешний путь) — этот
+# флаг несёт НОМЕР арендованной задачи (не булев признак): task-branch сверяет
+# его с номером СВОЕЙ ветки и пропускает claim только при совпадении — иначе
+# повторный claim того же номера тем же держателем отклонился бы как «занято»
+# (claim неидемпотентен по актору). Булев признак здесь был бы дырой: если за
+# один прогон агент создаёт вторую ветку на ДРУГУЮ задачу (playbook это
+# допускает), «занято»-флаг молча пропустил бы аренду второй задачи.
+export LEASE_ALREADY_CLAIMED="$number"
 
 # ── 4b. Пульс живости: пока идёт работа, журнал знает, что воркер жив ────────────
 # Стопгэп наблюдаемости (#112): свежий /api/heartbeat — доказательство «агент
@@ -441,12 +465,31 @@ dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
 export DSH_EDGE_SESSION_ID="$HARNESS_SID"
 echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
 
-# ── 6. DSH: провайдер (проверен в начале скрипта), установка (lib), GLM-патч профиля
-export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
-
+# ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
 dsh_install "$WORK/pkgs"
 dsh --version || true
-dsh_patch_profile headless
+dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
+# Затравка профиля первым провайдером цепочки (chain[0]) — ОБЯЗАНА случиться
+# ДО первого `dsh` этого прогона (dsh plugin add, шаг 6b ниже): «initProfile
+# пишет package.json/cordis.patch.yml/pnpm-workspace.yaml только при
+# отсутствии, ничего не перезаписывает» (research/10-dsh-architecture.md,
+# живой прогон 2026-08-30) — если cordis.patch.yml ещё не существует к
+# моменту plugin add, initProfile создаст файл сам, с содержимым, которое
+# отсюда не контролируется. Дальше, на шаге 7, dsh_run_with_provider_chain
+# перепатчивает профиль ЗАНОВО на каждую попытку (тот же dsh_patch_profile,
+# полная перезапись файла) — здесь важен только факт, что файл СУЩЕСТВУЕТ к
+# моменту первого `dsh`, не его точное содержимое; профиль на тот момент уже
+# инициализирован (package.json/pnpm-workspace.yaml созданы), поэтому
+# повторный патч не задевает монтаж плагина (bundles профиля — отдельный
+# слой, `dsh --dump-config`, «Порядок слоёв», research/10-dsh-architecture.md).
+_chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
+_chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
+DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
+DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
+export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
+dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
@@ -469,15 +512,32 @@ grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
 SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
 rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 export HANDS_SPOOL="$SPOOL_FILE"
+
+# Отметка «дошли до git-шага» (#588, scheduler.py::conflict_rework_attempts,
+# маркер WORKER_GIT_STEP_MARKER в pulse_guard.py — держи текст в синхроне):
+# всё ДО этой строки — инфраструктура (морда/деплой/сеть/плагин), не работа
+# агента; только с этой точки промпт (шаг 3 маршрута — git rebase origin/main
+# при дрейфе) вообще доходит до DSH. Комментарий — в ЗАДАЧУ (не в PR): тот же
+# носитель следа аренды, что "worker run N" в claim_task.claim (CLAIM_VIA),
+# та же граница по цифре нужна читателю на стороне scheduler.py, поэтому та
+# же подстрока "worker run N" — часть текста ниже. Best-effort: провал
+# постановки комментария не должен ронять сам прогон задачи.
+gh issue comment "$number" \
+  --body "🤖 [worker: git-шаг] worker run ${GITHUB_RUN_ID:-local}" >/dev/null \
+  || echo "::warning::маркер git-шага не отправлен в задачу #$number — оркестратор увидит эту попытку как инфраструктурный сбой"
+
 dsh_edge_start_drain
 WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$WORKER_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
+  dsh_run_with_provider_chain "$ANSWER_FILE" "$ERR_FILE" "$(cat "$PROMPT_FILE")"
 rc=$DSH_RUN_RC
 WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
-echo "dsh завершился с кодом $rc"
+WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
+WORKER_CHAIN_TRIED="$DSH_CHAIN_TRIED"
+WORKER_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
+echo "dsh завершился с кодом $rc (провайдер: ${WORKER_CHAIN_PROVIDER:-нет успеха}, опробованы: ${WORKER_CHAIN_TRIED:-?})"
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
 dsh_edge_stop_drain
@@ -504,14 +564,39 @@ ERR_TAIL=$(tail -c 4000 "$ERR_FILE" | redact)
 echo "--- хвост ответа DSH ---"; [ -n "$ANSWER_TAIL" ] && printf '%s\n' "$ANSWER_TAIL"
 echo "--- хвост stderr DSH ---"; [ -n "$ERR_TAIL" ] && printf '%s\n' "$ERR_TAIL"
 
-# ── 8. Пост-обработка: видимый результат — открытый PR, а не код возврата ────────
-# exit 0 у headless = «turn/end completed», но промпт мог быть исполнен мимо PR —
-# поэтому проверяем артефакт, а не шаг.
-pr_url=$(gh pr list --head "$BRANCH" --state open --limit 1 --json url --jq '.[0].url // ""')
+# ── 8. Пост-обработка: видимый результат — PR по ветке СУЩЕСТВУЕТ (открыт ИЛИ
+# слит), а не код возврата и не «открыт» (#413). Слитый PR — успех более
+# полный, чем открытый: DSH мог за один вызов довести цикл до мержа (кейс
+# #170/PR #402 — старая проверка искала только открытый PR и считала уже
+# слитую работу провалом, потому что нашла её доведённой лучше ожидаемого).
+# Единственное место правды на это различение — pr_outcome.py: «PR нет
+# вообще», «закрыт без слияния» и «открыт без диффа» остаются провалом
+# (fail loud, тот же промпт мог быть исполнен мимо PR), «открыт с диффом» и
+# «слит» — оба успех.
+gh pr list --head "$BRANCH" --state all --limit 10 \
+    --json number,state,additions,deletions,changedFiles,url >"$WORK/branch-prs.json" \
+  || die "не смог прочитать PR ветки $BRANCH (gh/сеть)"
+set +e
+pr_line=$(python3 "$SCRIPT_DIR/../lib/pr_outcome.py" "$WORK/branch-prs.json")
+pr_outcome_rc=$?
+set -e
+# Находка ревью PR #415: только 0/1 — легитимные исходы (успех/провал).
+# Любой другой код (2 — контракт CLI сломан, 127 — python3 не найден,
+# необработанный трейсбек и т.п.) — поломка самой проверки, не «PR открыт,
+# но пуст»: смешивать их значило бы съедать сломанный tooling под видом
+# честного провала задачи (тот же принцип «пусто ≠ сломано», что уже
+# проводит pr_outcome.py и что закрывал #245 для free_task.py).
+case "$pr_outcome_rc" in
+  0|1) ;;
+  *) die "проверка PR ветки $BRANCH сломалась (rc=$pr_outcome_rc)" ;;
+esac
+pr_status=${pr_line%%$'\t'*}
+pr_url=${pr_line#*$'\t'}
 
-if [ -n "$pr_url" ]; then
+if [ "$pr_outcome_rc" -eq 0 ]; then
+  verb="открыт"; [ "$pr_status" = "merged" ] && verb="слит"
   comment=$(cat <<COMMENT
-🤖 Автономный воркер справился. PR: $pr_url
+🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER:-?}). PR $verb: $pr_url
 
 Финальный ответ DSH (хвост, секреты замаскированы):
 
@@ -521,14 +606,16 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  # «Выполнена» здесь НЕ звучит (#170): открытый PR — промежуточный шаг, а не
-  # сделанная задача; это слово в Telegram теперь значит только «слито в main»
-  # (scheduler.py::after_merge). Коротко, номера задачи и PR — кликабельные
-  # ссылки (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
+  # «Выполнена» здесь НЕ звучит (#170): даже слитый ветвью PR — это то, что
+  # воркер увидел ПОСТФАКТУМ в собственном прогоне, а не факт слияния,
+  # подтверждённый оркестратором; это слово в Telegram значит только «слито в
+  # main» от scheduler.py::after_merge — второй отправитель того же события
+  # не заводим. Коротко, номера задачи и PR — кликабельные ссылки
+  # (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
   # экранированные tg_html.
   pr_number=${pr_url##*/}
-  telegram_report "🤖 worker: PR открыт — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
-  echo "PR открыт: $pr_url — job зелёный"
+  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
+  echo "PR $verb: $pr_url — job зелёный"
   exit 0
 fi
 
@@ -561,18 +648,23 @@ COMMENT
   exit 0
 fi
 
-# Провайдер в лимите (#422) — не сбой агента: сообщение и Telegram обязаны
-# звучать иначе, чем «воркер не справился» (правило AGENTS.md — «возможности
-# нет» и «возможность есть, но сломана» лечатся по-разному), а задача обязана
-# вернуться в пул СРАЗУ (снять и замок, и назначение), не ждать 24-часовой
-# TTL-сборщик — вина не в задаче, держать её занятой зря.
+# Провайдер в лимите (#422) или вся цепочка исчерпана (#727/#797) — не сбой
+# агента: сообщение и Telegram обязаны звучать иначе, чем «воркер не
+# справился» (правило AGENTS.md — «возможности нет» и «возможность есть, но
+# сломана» лечатся по-разному), а задача обязана вернуться в пул СРАЗУ (снять
+# и замок, и назначение), не ждать 24-часовой TTL-сборщик — вина не в задаче,
+# держать её занятой зря.
 if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
-   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; then
-  if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ]; then
-    reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)"
-  else
-    reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)"
-  fi
+   [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; then
+  case "$WORKER_TASK_FAILURE_REASON" in
+    quota_exhausted)
+      reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)" ;;
+    rate_limit_retry_budget_exceeded)
+      reason="временный RATE_LIMIT провайдера не снялся за отведённый бюджет ожидания ${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc)" ;;
+    all_providers_exhausted)
+      reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" ;;
+  esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
     echo "Провайдер в лимите — задача #$number возвращена в пул немедленно: $release_out"
@@ -603,8 +695,12 @@ COMMENT
   die "Провайдер в лимите: $reason"
 fi
 
-reason="dsh завершился с кодом $rc без открытого PR"
-[ "$rc" = "124" ] && reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR не открыт"
+# pr_status здесь всегда "empty" или "absent" (0 и rc=2 обработаны выше) —
+# разные причины настоящего провала (#413): пустой PR — DSH создал
+# ветку/PR, но не поработал; отсутствие PR — работы не видно вовсе.
+reason="dsh завершился с кодом $rc без PR по ветке $BRANCH"
+[ "$pr_status" = "empty" ] && reason="dsh завершился с кодом $rc — PR $pr_url по ветке $BRANCH открыт, но пуст (без диффа)"
+[ "$rc" = "124" ] && reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR по ветке $BRANCH не найден"
 comment=$(cat <<COMMENT
 🤖 Автономный воркер не справился: $reason.
 Задача остаётся под арендой: оркестратор вернёт её в пул через 24 ч без PR

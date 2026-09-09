@@ -226,7 +226,7 @@ def test_status_cli(tmp_path):
     csv.write_text(dt.rows_to_csv(summary_fixture()), encoding="utf-8")
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "status", "--csv", str(csv)],
-        capture_output=True, text=True, cwd=SCRIPT.parents[2])
+        capture_output=True, text=True, encoding="utf-8", cwd=SCRIPT.parents[2])
     assert proc.returncode == 0, proc.stderr
     assert "Кампания: 10/100 замеров" in proc.stdout
     assert "медиана **5.5 с**" in proc.stdout
@@ -491,6 +491,15 @@ def test_dispatch_failure_writes_note_not_row(monkeypatch, tmp_path):
     monkeypatch.setattr(dt, "append_and_push",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("двойной след: dispatch не пишет строки")))
+    monkeypatch.setattr(dt, "clone_data_branch",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("cmd_dispatch не должен клонировать данные "
+                                           "на пути отказа диспатча — сеть недостижима "
+                                           "в песочнице и коду тут делать нечего")))
+    # Фиксированное «сейчас»: fixture дат 2026-08-31 не должна протухать по
+    # календарю запуска (MAX_CAMPAIGN_DAYS=7) и превращать этот тест в сетевой
+    # cmd_finalize — время подаётся явно, а не читается из настенных часов.
+    monkeypatch.setattr(dt, "now_utc", lambda: utc(2026, 9, 1, 0))
     out = tmp_path / "github_output.txt"
     out.write_text("", encoding="utf-8")
     monkeypatch.setenv("GH_PIPELINE_PAT", "t")
