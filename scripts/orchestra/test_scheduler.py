@@ -586,6 +586,10 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
@@ -621,6 +625,10 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
@@ -667,6 +675,10 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
@@ -693,6 +705,10 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
@@ -720,6 +736,21 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
 # самое разбиралось для scripts/orchestra/test_stall_detector.py).
 pg = sys.modules["pulse_guard"]
 sd = sys.modules["stall_detector"]
+
+
+def assume_worker_not_stalled(monkeypatch):
+    """Тесты про идемпотентность «воркер уже работает» (dispatch_worker/
+    dispatch_conflict_rework молчат, пока прогон активен) — не про
+    обнаружение зависания (#815): фиксируем «не завис» одной строкой вместо
+    подбора правдоподобной свежей даты под workflow_run() с фиксированным
+    created_at. Хардкод конкретной «свежей» даты был бы тем же классом
+    хрупкости, которого правило репозитория «тест кормится прод-формой»
+    просит избегать: дата фикстуры стареет сама по себе относительно
+    настоящих wall-clock часов прогона тестов (worker_runs_active без
+    явного `now` использует datetime.now())."""
+    monkeypatch.setattr(
+        sch, "_run_is_stalled",
+        lambda run, now, threshold_minutes=sch.WORKER_STALL_MINUTES: False)
 
 
 def patch_gh(monkeypatch, fake):
@@ -2799,6 +2830,7 @@ def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
     })
     patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("воркер занят — не пишем"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("воркер занят — не трогаем задачу"))
 
@@ -3050,6 +3082,7 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
         ],
     })
     patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("прогон ещё идёт — рано эскалировать"))
 
     observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
@@ -3436,6 +3469,10 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
@@ -4441,6 +4478,7 @@ def test_dispatch_worker_silent_while_worker_run_in_progress(monkeypatch):
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
     })
     patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
     observations, actions = sch.dispatch_worker(
         REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
     # #456: «воркер уже работает» ничего не меняет — наблюдение, не действие.
@@ -4466,6 +4504,68 @@ def test_dispatch_worker_silent_while_worker_queued(monkeypatch):
     assert fake.mutating_calls() == []
 
 
+# ── Зависший (но по GH ещё in_progress) прогон worker.yml не блокирует пул
+# вечно (#815, живой инцидент — прогон #34339807907 держал worker_runs_active
+# ==True ~3ч и блокировал одновременно обычный dispatch_worker,
+# dispatch_conflict_rework и восстановление предохранителя).
+
+
+def test_run_is_stalled_true_past_threshold_false_within_threshold():
+    now = utc(2026, 9, 9, 12, 0)
+    old = workflow_run(1, "in_progress")
+    old["run_started_at"] = "2026-09-09T08:00:00Z"  # 240 мин > порог (200)
+    fresh = workflow_run(2, "in_progress")
+    fresh["run_started_at"] = "2026-09-09T11:00:00Z"  # 60 мин < порог
+    assert sch._run_is_stalled(old, now) is True
+    assert sch._run_is_stalled(fresh, now) is False
+
+
+def test_worker_runs_active_treats_ancient_in_progress_run_as_not_blocking(monkeypatch):
+    # Прогон стартовал в 2020-м — хардкодим ЗАВЕДОМО древнюю дату, не
+    # «свежую»: правдоподобная «недавняя» дата стареет сама по себе
+    # относительно реальных wall-clock часов прогона тестов (тот же класс
+    # хрупкости, которого правило репозитория «тест кормится прод-формой»
+    # просит избегать), а древняя остаётся древней всегда.
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = "2020-01-01T00:00:00Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.worker_runs_active(REPO) is False
+
+
+def test_worker_runs_active_still_blocks_recent_in_progress_run(monkeypatch):
+    now = datetime.now(timezone.utc)
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = (now - timedelta(minutes=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    fake = FakeGh({"workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]}})
+    patch_gh(monkeypatch, fake)
+    assert sch.worker_runs_active(REPO) is True
+
+
+def test_dispatch_worker_dispatches_when_previous_run_is_stalled(monkeypatch):
+    # Мутация-доказательство (#815): убрать порог зависания в worker_runs_active
+    # (вернуть безусловный `return True` на найденный in_progress) красит этот
+    # тест — dispatch_worker навсегда остался бы молчать «воркер уже работает»,
+    # ровно живой инцидент (~3ч блокировки диспатча зависшим прогоном).
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = "2020-01-01T00:00:00Z"
+    pool = [issue(89, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[])
+    assert not any("уже работает" in line for line in observations)
+    assert any("worker.yml запущен" in line for line in actions)
+    assert any("dispatches" in c for c in fake.mutating_calls())
+
+
 def test_dispatch_worker_survives_dispatch_failure(monkeypatch):
     # Best-effort по построению: 403/сеть на диспатче не роняют планировщик —
     # слияния важнее подряда воркеру. Доведение функции до возврата и есть
@@ -4481,6 +4581,102 @@ def test_dispatch_worker_survives_dispatch_failure(monkeypatch):
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[])
     assert len((observations + actions)) == 1 and (observations + actions)[0].startswith("⚠️ dispatch воркера не удался")
+
+
+# ── reap_stalled_worker_run (#815): зависший прогон отменяется, а его задача
+# возвращается в пул СРАЗУ, не дожидаясь обычных 24ч reap_stale/collect_stale.
+
+
+def test_reap_stalled_worker_run_noop_when_run_not_stalled(monkeypatch):
+    now = datetime.now(timezone.utc)
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = (now - timedelta(minutes=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    fake = FakeGh({"workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]}})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[], pulls=[])
+    assert observations == []
+    assert actions == []
+    assert not any("cancel" in c for c in fake.calls)
+
+
+def test_reap_stalled_worker_run_cancels_and_releases_correlated_task(monkeypatch):
+    # Прод-форма живого инцидента (#815): run 34339807907 стартовал
+    # 2026-09-09T10:21:51Z, задача #815 арендована ЧЕРЕЗ 39с (assigned-событие
+    # 10:22:30Z, обычная скорость claim_task.claim в task.sh) — «now» ниже
+    # взят так, чтобы возраст прогона (218 мин) уверенно перевалил порог
+    # (200 мин), без гонки со временем прогона теста.
+    now = utc(2026, 9, 9, 14, 0, 0)
+    run = workflow_run(34339807907, "in_progress")
+    run["run_started_at"] = "2026-09-09T10:21:51Z"
+    task = issue(815, assignees=("mytab0r",))
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "actions/runs/34339807907/cancel": None,
+        "issues/815/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-09T10:22:30Z"},
+        ],
+        "issues/815/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release_full",
+                         lambda repo, n: f"назначение снято; замок task-{n} снят")
+
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[task], pulls=[])
+
+    assert observations == []
+    assert task["assignees"] == []  # мутация pool сразу, тот же приём, что reap_stale
+    assert any(c.startswith("-X POST") and "runs/34339807907/cancel" in c for c in fake.calls)
+    assert any(c.startswith("-X POST") and "issues/815/comments" in c for c in fake.calls)
+    assert len(actions) == 1
+    assert "34339807907" in actions[0] and "#815" in actions[0] and "освобождена" in actions[0]
+
+
+def test_reap_stalled_worker_run_reports_when_no_task_correlates(monkeypatch):
+    # Зависший прогон отменяется в любом случае (best-effort), даже если ни
+    # одна открытая задача не коррелирует с ним по времени аренды (адресный
+    # прогон на задачу с уже открытым PR, либо аренда сгорела до следа) —
+    # тормоз без газа здесь недопустим: сообщение обязано назвать факт «не
+    # определена», не молчать.
+    now = utc(2026, 9, 9, 14, 0, 0)
+    run = workflow_run(34339807907, "in_progress")
+    run["run_started_at"] = "2026-09-09T10:21:51Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "actions/runs/34339807907/cancel": None,
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[], pulls=[])
+
+    assert observations == []
+    assert len(actions) == 1
+    assert "34339807907" in actions[0] and "не определена" in actions[0]
+
+
+def test_reap_stalled_worker_run_skips_task_assigned_before_run_started(monkeypatch):
+    # Назначение СТАРШЕ старта зависшего прогона — не его аренда (например,
+    # предыдущая, уже нормально идущая задача с открытым PR ещё не появился
+    # по другой причине): корреляция обязана смотреть НАЗАД ложно-положительно,
+    # не привязывать первую попавшуюся занятую задачу.
+    now = utc(2026, 9, 9, 14, 0, 0)
+    run = workflow_run(34339807907, "in_progress")
+    run["run_started_at"] = "2026-09-09T10:21:51Z"
+    unrelated = issue(700, assignees=("mytab0r",))
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "actions/runs/34339807907/cancel": None,
+        "issues/700/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-08T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release_full",
+                         lambda *a: pytest.fail("не та задача — не трогаем"))
+
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[unrelated], pulls=[])
+
+    assert unrelated["assignees"] != []
+    assert "не определена" in actions[0]
 
 
 # ── dispatch_worker при закрытом WIP-гейте (#464, критическая находка ревью
@@ -4561,6 +4757,7 @@ def test_dispatch_worker_stays_silent_while_worker_active_even_when_rework_avail
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
     })
     patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
     pool = [issue(89, assignees=())]
     pulls = [pull(500, ref="agent/89-fix-thing", labels=["ai:changes-requested"])]
     observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=False, pulls=pulls)
@@ -4996,6 +5193,10 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     live_pulls = [{"marker": "same snapshot merge_loop produced"}]
@@ -5053,6 +5254,10 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {})
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
@@ -5611,6 +5816,10 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
     monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    # Зависший прогон worker.yml (#815) — не предмет этих тестов main(): без
+    # стаба реальная reap_stalled_worker_run бьёт настоящим gh api за
+    # маршрутом workflows/worker.yml/runs, которого нет в их FakeGh.
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     # unhealthy_pulls теперь получает pool параметром (#443, не опрашивает
