@@ -561,6 +561,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_infra_gh_inventory.py -q
 
+      # Класс #83/#842: `dsh plugin add` без pnpm на PATH падает
+      # («pnpm not found on PATH»). Закрыт один раз для hands.yml (#83, PR
+      # #93/#94), не распространён на ai-review.yml, когда #838 добавил тот
+      # же вызов туда — ai-review.yml падал на КАЖДОМ прогоне (issue #842).
+      - name: Гвардия pnpm для dsh plugin add (класс #83/#842)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dsh_plugin_pnpm_guard.py -q
+
       # Канарейка класса «осиротевший тест» (#583): PR #568 слил
       # scripts/lib/test_duplicate_guard.py (семь тестов гвардии дублей issue)
       # — файл НЕ БЫЛ подключён ни к одному workflow, ни разу не выполнялся.
