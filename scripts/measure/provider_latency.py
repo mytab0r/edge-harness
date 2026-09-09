@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
-"""Замер латентности живым вызовом по каждому провайдеру-кандидату цепочки
-ai-review (issue #836).
+"""Замер латентности живым вызовом по каждому провайдеру-кандидату (issue
+#836, доводка ревью #837).
 
 Повод: гейт ai-review держит вердикт 30+ минут, и очередь PR не сливается.
-Гипотеза владельца — первый провайдер `vars.DSH_PROVIDER_CHAIN` (см.
-docs/runbooks/switch-llm-provider.md) самый медленный из цепочки, а
-остальные могут отвечать быстрее. Порядок цепочки сегодня переставлен по
-доступности квоты (см. врез в раннбуке), не по латентности — этот скрипт
-снимает число, а не гадает.
+Гипотеза владельца — первый провайдер живой цепочки самый медленный, а
+остальные (включая непроверенную ёмкость в секретах — учётки, ни разу не
+вызванные живьём) могут отвечать быстрее. Порядок цепочки сегодня переставлен
+по доступности квоты, не по латентности — этот скрипт снимает число, а не
+гадает.
 
 Codex НАМЕРЕННО не включён — владельцу нужен отдельный детект квоты/сбросов/
 контекста для него, отдельная задача (не эта).
 
-Один и тот же маленький промпт на каждого кандидата, POST на
+Кандидаты собираются программой (не второй хардкод-таблицей — находка ревью
+#837, «Одно место правды», AGENTS.md) из ДВУХ уже существующих источников:
+
+1. `build_manifest_candidates()` — боевая цепочка `config/provider-usage.json`
+   (потребитель `ai-review`, #823) — те провайдеры, что УЖЕ пробует гейт.
+2. `build_plugin_suite_candidates()` — таблица
+   `PLUGINS_SUITE_CANDIDATE_ROUTES` в `scripts/lib/dsh-ci.sh` (#215) —
+   непроверенная ёмкость, для которой в окружении уже лежит секрет, но
+   цепочка её ни разу не вызывала.
+
+Один и тот же промпт на каждого кандидата (реалистичный дифф на ревью, не
+"hi" — гейт ревьюит диффы такого размера, и латентность на них решает
+порядок, см. `fixtures/sample_review_diff.patch`), POST на
 `<base_url>/chat/completions` (OpenAI-compatible форма, тот же контракт, что
 уже использует dsh_patch_profile в scripts/lib/dsh-ci.sh для этих же
 эндпоинтов). Таймаут на КАЖДЫЙ вызов — медленный провайдер не вешает весь
@@ -37,6 +49,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -44,27 +57,140 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-# Кандидаты бенчмарка — base_url/model/secret_env взяты БУКВАЛЬНО из
-# постановки задачи (issue #836): те же провайдеры, что уже фигурируют в
-# scripts/lib/dsh-ci.sh (PLUGINS_SUITE_CANDIDATE_ROUTES) и в
-# docs/runbooks/switch-llm-provider.md (vars.DSH_PROVIDER_CHAIN) — не второе
-# место правды о ТЕКУЩЕЙ цепочке (той остаётся vars.DSH_PROVIDER_CHAIN), а
-# отдельный список «кого мерить», аналогично PLUGINS_SUITE_CANDIDATE_ROUTES.
-# Литералы имён/URL/моделей здесь допущены гвардией provider-default.guard.sh
-# точечным allowlist по имени этого файла (тот же приём, что уже применён к
-# dsh-ci.sh) — это не зашитый ДЕФОЛТ провайдера (класс #153), а явная таблица
-# кандидатов для измерения, ключ отбора которых — фактическое наличие
-# секрета в окружении, как и у PLUGINS_SUITE_CANDIDATE_ROUTES.
-PROVIDER_LATENCY_CANDIDATES = [
-    {"name": "NVIDIA-nano", "base_url": "https://integrate.api.nvidia.com/v1", "model": "nvidia/nemotron-nano-3-30b-a3b", "secret_env": "NVIDIA_API_KEY"},
-    {"name": "NVIDIA-ultra", "base_url": "https://integrate.api.nvidia.com/v1", "model": "nvidia/nemotron-3-ultra-550b-a55b", "secret_env": "NVIDIA_API_KEY"},
-    {"name": "Ollama", "base_url": "https://ollama.com/v1", "model": "qwen3-coder:480b-cloud", "secret_env": "OLLAMA_CLOUD_1_API_KEY"},
-    {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "model": "anthropic/claude-sonnet-4.6", "secret_env": "OPENROUTER_1_API_KEY"},
-    {"name": "GLM", "base_url": "https://api.z.ai/api/coding/paas/v4", "model": "glm-5.3-flash", "secret_env": "DEEPSEEK_API_KEY"},
-]
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DSH_CI_SH = REPO_ROOT / "scripts" / "lib" / "dsh-ci.sh"
+PROVIDER_USAGE_MANIFEST = REPO_ROOT / "config" / "provider-usage.json"
+SAMPLE_DIFF_FIXTURE = Path(__file__).with_name("fixtures") / "sample_review_diff.patch"
 
-DEFAULT_PROMPT = "Ответь одним словом: OK"
+# Провайдер, подтверждённо мёртвый на генерацию (не на листинг моделей —
+# разные эндпоинты, разные факты, issue #798): два живых замера отдали 404
+# на completion-пути, PR #834 (подтверждение id в реестре) закрыт как
+# not-planned именно по этой причине. Манифест (#823) сегодня всё ещё несёт
+# эту запись первым элементом — дрейф от факта закрытия #798/#834, который
+# этот бенчмарк не тиражирует: живой замер мёртвого провайдера — потраченный
+# впустую таймаут, не число.
+DEAD_CANDIDATE_NAMES = {"NVIDIA-nano"}
+
+# У OpenRouter в PLUGINS_SUITE_CANDIDATE_ROUTES (dsh-ci.sh) стоит платная
+# модель (contextWindow 200000, "anthropic/claude-sonnet-4.6") — у владельца
+# план OpenRouter только free-tier, платная модель на нём вернёт ошибку
+# оплаты, а не латентность. Дублировать вторую хардкод-таблицу под "модель
+# для бенчмарка" тоже не годится (класс "второе место правды") — вместо
+# этого бенчмарк подставляет НЕПОДТВЕРЖДЁННОГО кандидата на бесплатный тариф
+# (суффикс ":free") и живым вызовом решает, годится ли он: "не гадать" здесь
+# и означает измерить, а не поверить на слово источнику модели для другого
+# случая использования. Результат этого самого прогона — единственное
+# подтверждение; если ключ провайдера отсутствует, слот пропускается тем же
+# путём, что и любой другой candidate без секрета.
+OPENROUTER_ROUTE_ALIAS_PREFIX = "openrouter-"
+OPENROUTER_FREE_MODEL_OVERRIDE = "deepseek/deepseek-r1:free"
+
 DEFAULT_TIMEOUT_SECS = 180
+
+
+_PROMPT_INSTRUCTION = "Прочитай дифф ниже и ответь одним словом: OK.\n\n"
+
+
+def _load_default_prompt() -> str:
+    """Реалистичный промпт — короткая инструкция + реальный дифф на ревью
+    (~1.5-2к токенов), не строка из двух слов: гейт ai-review ревьюит диффы
+    такого размера, и латентность решает порядок цепочки именно на них
+    (постановка ревью #837). Фикстуры нет физически (испорченный checkout) —
+    короткий промпт с явной пометкой, не молчаливая деградация до "hi"."""
+    try:
+        diff_text = SAMPLE_DIFF_FIXTURE.read_text(encoding="utf-8")
+    except OSError:
+        return ("[фикстура scripts/measure/fixtures/sample_review_diff.patch "
+                 "не найдена — короткий промпт вместо реалистичного] Ответь одним словом: OK")
+    return _PROMPT_INSTRUCTION + diff_text
+
+
+DEFAULT_PROMPT = _load_default_prompt()
+
+
+def build_manifest_candidates(consumer: str = "ai-review",
+                               manifest_path: Path = PROVIDER_USAGE_MANIFEST) -> list[dict]:
+    """Боевая цепочка потребителя `consumer` из манифеста использования
+    (config/provider-usage.json, #823) — единственное место правды для
+    ТЕКУЩЕЙ цепочки, та же форма {name, base_url, model, secret_env}, что
+    уже парсит dsh_load_provider_chain_from_manifest в scripts/lib/dsh-ci.sh.
+    Манифеста нет, JSON битый, потребитель/цепочка не найдены — пустой
+    список (вызывающий не падает: остальные источники кандидатов остаются),
+    а не второй фоллбэк-дефолт."""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    chain_name = manifest.get("usage", {}).get(consumer)
+    chain = manifest.get("chains", {}).get(chain_name) if chain_name else None
+    if not isinstance(chain, list):
+        return []
+    out = []
+    for entry in chain:
+        if not isinstance(entry, dict):
+            continue
+        if not {"name", "base_url", "model", "secret_env"} <= entry.keys():
+            continue
+        if entry["name"] in DEAD_CANDIDATE_NAMES:
+            continue
+        out.append({"name": entry["name"], "base_url": entry["base_url"],
+                     "model": entry["model"], "secret_env": entry["secret_env"]})
+    return out
+
+
+_ROUTE_ARRAY_RE = re.compile(r'PLUGINS_SUITE_CANDIDATE_ROUTES=\((.*?)\n\)', re.DOTALL)
+_ROUTE_LINE_RE = re.compile(r'^"([^"]*)"\s*$')
+
+
+def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
+    """Непроверенная ёмкость — таблица `PLUGINS_SUITE_CANDIDATE_ROUTES` в
+    scripts/lib/dsh-ci.sh (#215), распарсенная, а не скопированная вторым
+    списком (находка ревью #837): каждая строка формата
+    "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName". Модель
+    OpenRouter-алиасов переопределяется на неподтверждённого free-tier
+    кандидата (см. OPENROUTER_FREE_MODEL_OVERRIDE выше) — источник несёт
+    платную модель для другого случая использования (комбо-роутер), не для
+    этого бенчмарка. Файла нет/формат не совпал — пустой список, fail loud
+    достаётся вызывающему по количеству кандидатов, не молчаливому [] здесь."""
+    try:
+        text = dsh_ci_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    m = _ROUTE_ARRAY_RE.search(text)
+    if not m:
+        return []
+    out = []
+    for raw_line in m.group(1).splitlines():
+        line_m = _ROUTE_LINE_RE.match(raw_line.strip())
+        if not line_m:
+            continue
+        parts = line_m.group(1).split("|")
+        if len(parts) != 6:
+            continue
+        alias, base_url, secret_env, model, _context_window, display_name = parts
+        if alias.startswith(OPENROUTER_ROUTE_ALIAS_PREFIX):
+            model = OPENROUTER_FREE_MODEL_OVERRIDE
+        out.append({"name": display_name, "base_url": base_url, "model": model, "secret_env": secret_env})
+    return out
+
+
+def build_candidates() -> list[dict]:
+    """Полный список кандидатов бенчмарка — боевая цепочка + непроверенная
+    ёмкость, без дублей по (base_url, model, secret_env). Порядок:
+    боевая цепочка первой (уже подтверждённая рабочей), дальше — кандидаты
+    на расширение, в порядке появления в dsh-ci.sh."""
+    seen = set()
+    out = []
+    for entry in build_manifest_candidates() + build_plugin_suite_candidates():
+        key = (entry["base_url"], entry["model"], entry["secret_env"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
+    return out
+
+
+PROVIDER_LATENCY_CANDIDATES = build_candidates()
 
 
 def extract_usage_tokens(body: dict) -> str:
@@ -177,14 +303,30 @@ def run_benchmark(prompt: str = DEFAULT_PROMPT, timeout_secs: float = DEFAULT_TI
 
 
 def main() -> int:
+    if not PROVIDER_LATENCY_CANDIDATES:
+        # Оба источника кандидатов (манифест + suite-таблица) отдали пусто —
+        # это не «нечего мерить», это сломанный парсинг одного из них: fail
+        # loud вместо тихого зелёного прогона по нулю строк.
+        print("::error::PROVIDER_LATENCY_CANDIDATES пуст — build_manifest_candidates()/"
+              "build_plugin_suite_candidates() не нашли ни одного кандидата "
+              "(config/provider-usage.json или scripts/lib/dsh-ci.sh не читаются/не совпал формат)",
+              file=sys.stderr)
+        return 1
+
     prompt = os.environ.get("PROVIDER_LATENCY_PROMPT") or DEFAULT_PROMPT
     timeout_secs = float(os.environ.get("PROVIDER_LATENCY_TIMEOUT_SECS") or DEFAULT_TIMEOUT_SECS)
+    # Промпт — реалистичный дифф (~1.5-2к токенов), не короткая строка: в лог
+    # уходит только длина и превью первой строки, не всё содержимое (шум,
+    # AGENTS.md «Секреты» — тело чужого ответа не печатаем, свой длинный
+    # промпт по той же причине печатаем усечённым).
+    prompt_preview = prompt.splitlines()[0][:80] if prompt else ""
 
     rows = run_benchmark(prompt=prompt, timeout_secs=timeout_secs)
     table_md = format_markdown_table(rows)
 
     print(f"Замер латентности LLM-провайдеров ({datetime.now(timezone.utc).isoformat()}), "
-          f"промпт={prompt!r}, таймаут={timeout_secs:g}с")
+          f"промпт={len(prompt)} симв. ({prompt_preview!r}...), таймаут={timeout_secs:g}с, "
+          f"кандидатов={len(PROVIDER_LATENCY_CANDIDATES)}")
     print(table_md)
 
     # Провайдер без ответа/с ошибкой — «timeout»/«error» в таблице, не провал
@@ -193,8 +335,10 @@ def main() -> int:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as fh:
-            fh.write(f"## Латентность LLM-провайдеров (issue #836)\n\n")
-            fh.write(f"Промпт: `{prompt}`. Таймаут на вызов: {timeout_secs:g}с. "
+            fh.write("## Латентность LLM-провайдеров (issue #836)\n\n")
+            fh.write(f"Промпт: {len(prompt)} символов, начало `{prompt_preview}...` "
+                     f"(полный текст — scripts/measure/fixtures/sample_review_diff.patch). "
+                     f"Таймаут на вызов: {timeout_secs:g}с. "
                      f"Снято: {datetime.now(timezone.utc).isoformat()}.\n\n")
             fh.write(table_md + "\n")
     else:

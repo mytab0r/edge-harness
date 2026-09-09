@@ -13,6 +13,7 @@ prompt_tokens/completion_tokens/total_tokens), не придумано с нул
 """
 
 import importlib.util
+import json
 import socket
 import urllib.error
 from pathlib import Path
@@ -170,19 +171,109 @@ def test_format_markdown_table_contains_header_and_rows():
     assert "success" in table
 
 
-# ── Реестр кандидатов: пять провайдеров, без Codex (постановка #836) ─────
+# ── Реестр кандидатов — программа, не вторая хардкод-таблица (ревью #837) ──
+#
+# build_manifest_candidates()/build_plugin_suite_candidates() читают РЕАЛЬНЫЕ
+# файлы репозитория (config/provider-usage.json, scripts/lib/dsh-ci.sh) —
+# тестируются фикстурами (tmp_path, прод-форма содержимого) для устойчивости
+# к будущей эволюции реальных файлов, плюс структурные проверки на реальных
+# файлах репозитория (что парсинг вообще что-то находит, без Codex).
 
 
-def test_candidates_are_five_providers_without_codex():
-    names = [c["name"] for c in pl.PROVIDER_LATENCY_CANDIDATES]
-    assert names == ["NVIDIA-nano", "NVIDIA-ultra", "Ollama", "OpenRouter", "GLM"]
+def test_build_manifest_candidates_from_fixture(tmp_path):
+    manifest = tmp_path / "provider-usage.json"
+    manifest.write_text(json.dumps({
+        "chains": {
+            "default-chain": [
+                {"name": "NVIDIA-nano", "base_url": "https://x/v1", "model": "m-nano", "secret_env": "K_NANO"},
+                {"name": "NVIDIA", "base_url": "https://x/v1", "model": "m-ultra", "secret_env": "K1"},
+                {"name": "GLM", "base_url": "https://y/v4", "model": "m-glm", "secret_env": "K2"},
+            ]
+        },
+        "usage": {"ai-review": "default-chain"},
+    }), encoding="utf-8")
+    out = pl.build_manifest_candidates(manifest_path=manifest)
+    # NVIDIA-nano исключён (DEAD_CANDIDATE_NAMES, подтверждённый 404 #798/#834)
+    assert [c["name"] for c in out] == ["NVIDIA", "GLM"]
+
+
+def test_build_manifest_candidates_missing_file_is_empty_not_error(tmp_path):
+    assert pl.build_manifest_candidates(manifest_path=tmp_path / "нет-файла.json") == []
+
+
+def test_build_manifest_candidates_missing_consumer_is_empty(tmp_path):
+    manifest = tmp_path / "provider-usage.json"
+    manifest.write_text(json.dumps({"chains": {"default-chain": []}, "usage": {}}), encoding="utf-8")
+    assert pl.build_manifest_candidates(consumer="ai-review", manifest_path=manifest) == []
+
+
+def test_build_plugin_suite_candidates_from_fixture(tmp_path):
+    dsh_ci = tmp_path / "dsh-ci.sh"
+    dsh_ci.write_text(
+        'PLUGINS_SUITE_CANDIDATE_ROUTES=(\n'
+        '  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 1"\n'
+        '  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 1"\n'
+        ')\n',
+        encoding="utf-8",
+    )
+    out = pl.build_plugin_suite_candidates(dsh_ci_path=dsh_ci)
+    by_name = {c["name"]: c for c in out}
+    assert set(by_name) == {"OpenRouter account 1", "Ollama Cloud account 1"}
+    # OpenRouter — модель переопределена на free-кандидата, не платная из источника
+    assert by_name["OpenRouter account 1"]["model"] == pl.OPENROUTER_FREE_MODEL_OVERRIDE
+    assert by_name["OpenRouter account 1"]["model"] != "anthropic/claude-sonnet-4.6"
+    assert by_name["Ollama Cloud account 1"]["model"] == "qwen3-coder:480b-cloud"
+    assert by_name["Ollama Cloud account 1"]["secret_env"] == "OLLAMA_CLOUD_1_API_KEY"
+
+
+def test_build_plugin_suite_candidates_missing_file_is_empty_not_error(tmp_path):
+    assert pl.build_plugin_suite_candidates(dsh_ci_path=tmp_path / "нет-файла.sh") == []
+
+
+def test_build_plugin_suite_candidates_no_array_in_file_is_empty(tmp_path):
+    f = tmp_path / "dsh-ci.sh"
+    f.write_text("# пусто, массива нет\n", encoding="utf-8")
+    assert pl.build_plugin_suite_candidates(dsh_ci_path=f) == []
+
+
+def test_build_candidates_dedupes_by_base_url_model_secret_env():
+    dupes = [
+        {"name": "A", "base_url": "https://x", "model": "m", "secret_env": "K"},
+        {"name": "A-again", "base_url": "https://x", "model": "m", "secret_env": "K"},
+    ]
+    seen = set()
+    out = []
+    for entry in dupes:
+        key = (entry["base_url"], entry["model"], entry["secret_env"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
+    assert len(out) == 1
+
+
+# ── Структурные проверки на РЕАЛЬНЫХ файлах репозитория ──────────────────
+
+
+def test_real_repo_candidates_cover_full_owner_set_without_codex():
+    names = {c["name"] for c in pl.PROVIDER_LATENCY_CANDIDATES}
     assert not any("codex" in n.lower() for n in names)
+    assert "NVIDIA-nano" not in names  # исключён (#798/#834, 404 на генерацию)
+    assert len(pl.PROVIDER_LATENCY_CANDIDATES) >= 8  # боевая цепочка + вся suite-таблица
 
 
-def test_candidates_secret_env_matches_repo_convention():
-    by_name = {c["name"]: c["secret_env"] for c in pl.PROVIDER_LATENCY_CANDIDATES}
-    assert by_name["NVIDIA-nano"] == "NVIDIA_API_KEY"
-    assert by_name["NVIDIA-ultra"] == "NVIDIA_API_KEY"
-    assert by_name["Ollama"] == "OLLAMA_CLOUD_1_API_KEY"
-    assert by_name["OpenRouter"] == "OPENROUTER_1_API_KEY"
-    assert by_name["GLM"] == "DEEPSEEK_API_KEY"
+def test_real_repo_candidates_no_paid_openrouter_model():
+    for c in pl.PROVIDER_LATENCY_CANDIDATES:
+        if "openrouter" in c["secret_env"].lower() or "openrouter" in c["name"].lower():
+            assert c["model"] == pl.OPENROUTER_FREE_MODEL_OVERRIDE
+
+
+def test_real_repo_candidates_no_duplicate_keys():
+    keys = [(c["base_url"], c["model"], c["secret_env"]) for c in pl.PROVIDER_LATENCY_CANDIDATES]
+    assert len(keys) == len(set(keys))
+
+
+def test_default_prompt_is_realistic_not_trivial_greeting():
+    # ~1.5-2к токенов реального диффа (постановка ревью #837), не "hi"
+    assert len(pl.DEFAULT_PROMPT) > 2000
+    assert "diff --git" in pl.DEFAULT_PROMPT
