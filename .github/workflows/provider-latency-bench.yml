@@ -38,7 +38,13 @@ permissions:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Худший случай — КАЖДЫЙ кандидат уходит в таймаут (DEFAULT_TIMEOUT_SECS
+    # 180с) последовательно: 10 кандидатов × 180с = 1800с = 30 мин, что уже
+    # больше прежних 20 мин job'а (находка ревью #837) — GitHub убил бы
+    # прогон посередине, ни одной строки таблицы не сохранив (main() пишет
+    # step summary только ПОСЛЕ всех замеров). 35 мин — 30 мин худшего случая
+    # + запас на checkout/pytest/guard.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
 
