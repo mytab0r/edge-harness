@@ -346,6 +346,27 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_stall_detector.py -q
 
+      # Само-аудит здоровья конвейера (openspec/changes/pipeline-health-
+      # self-audit): снимок 6-7 дешёвых метрик (сборщик — прод-форма
+      # PR/issues/runs, git-транспорт на живом bare-репозитории), детектор
+      # регрессии (baseline/streak/честное «недостаточно данных», мутация
+      # границ), само-аудит (дедуп по отпечатку, свой суточный потолок,
+      # различение регрессия/пожар) — проводка на моке gh.
+      - name: Тесты сборщика снимка здоровья конвейера
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_pipeline_health.py -q
+
+      - name: Тесты детектора регрессии здоровья конвейера
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_health_regression.py -q
+
+      - name: Тесты само-аудита здоровья конвейера
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_health_audit.py -q
+
       # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
       # source-build морды кричит в задачу #134 + метка update-available +
       # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
