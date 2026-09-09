@@ -115,6 +115,18 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       (порча записи журнала без message.id, #480/#794). Наблюдательный, не
       гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
       PR (см. блок-комментарий у самой функции).
+  11. check_provider_usage_manifest (#823, openspec/changes/
+      llm-provider-usage-manifest) — канонический список потребителей
+      LLM-провайдеров (ai-review/worker/hands) обязан иметь в
+      config/provider-usage.json валидное назначение цепочки: запись в
+      .usage, ссылающуюся на непустую цепочку в .chains. Ровно класс,
+      который пропустили с воркером на 72 задачи (#727 -> #797): «у кого-то
+      нет валидного назначения» обязано быть видно раньше инцидента.
+      Гейтящий сразу — чистый файловый скан без сети, детерминированный,
+      ноль нарушений на момент внедрения (манифест только что создан
+      валидным этим же PR). Морда НЕ входит в канонический список
+      (design.md «Потребители»: один слот адаптера, без цепочки
+      принципиально) — её отсутствие в .usage не нарушение.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -305,7 +317,12 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # (наблюдательный инвариант с нулевым долгом сам не гейтится обратно —
 # возврат держится на памяти): газ здесь назван явно и заранее, не после
 # находки.
-CI_GATING: frozenset[int] = frozenset({7})
+# Инвариант 11 (#823) включён СРАЗУ, тем же доводом, что уже держит 7:
+# чистый файловый скан config/provider-usage.json, без сети, без зависимости
+# от чужого backlog'а — ноль нарушений на момент внедрения (манифест только
+# что создан валидным этим же PR, см. openspec/changes/
+# llm-provider-usage-manifest/tasks.md). Газ — GATING_RELEASE_CONDITION[11].
+CI_GATING: frozenset[int] = frozenset({7, 11})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -342,6 +359,12 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "про газ, а не про то, гейтит ли сейчас 9. 0 нарушений на живом пуле "
        "(python scripts/orchestra/repo_invariants.py, секция [9]) — машинно "
        "проверяемое условие возврата",
+    11: "допиши в config/provider-usage.json недостающую запись .usage.<consumer> "
+        "или почини битую ссылку на .chains — тот же ручной путь, которым "
+        "раньше правился vars.DSH_PROVIDER_CHAIN, до подключения Этапа 2 "
+        "(морда-push, openspec/changes/llm-provider-usage-manifest/tasks.md); "
+        "0 нарушений на живом файле (python scripts/orchestra/repo_invariants.py, "
+        "секция [11]) — машинно проверяемое условие возврата",
 }
 
 
@@ -1459,6 +1482,52 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
     }]
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 11: манифест использования LLM-провайдеров (#823)
+# ══════════════════════════════════════════════════════════════════════════
+
+_PU_SPEC = importlib.util.spec_from_file_location(
+    "collect_provider_usage", REPO_ROOT / "scripts" / "lib" / "collect_provider_usage.py")
+collect_provider_usage = importlib.util.module_from_spec(_PU_SPEC)
+_PU_SPEC.loader.exec_module(collect_provider_usage)  # type: ignore[union-attr]
+
+PROVIDER_USAGE_MANIFEST = REPO_ROOT / "config" / "provider-usage.json"
+
+
+def check_provider_usage_manifest(manifest_path: Path = PROVIDER_USAGE_MANIFEST) -> list[dict]:
+    """Инвариант 11 (задача #823, openspec/changes/llm-provider-usage-manifest):
+    каждый потребитель канонического списка (collect_provider_usage.CONSUMERS —
+    ai-review/worker/hands, ОДНО место правды со сборщиком таблицы видимости,
+    docs/agents/LLM-PROVIDER-USAGE.md) обязан иметь в config/provider-usage.json
+    валидное назначение: запись в .usage, ссылающуюся на непустую цепочку в
+    .chains. Ровно класс, который пропустили с воркером на 72 задачи
+    (#727 -> #797, proposal.md «Problem») — «у кого-то нет валидного
+    назначения» обязано быть видно здесь, не только когда сам job на прогоне
+    упадёт на dsh_require_provider_chain (scripts/lib/dsh-ci.sh — та же
+    проверка, но во время исполнения, не на push/pull_request).
+
+    Манифеста нет вовсе — это НЕ нарушение самого инварианта (переходный
+    период, design.md «Потребители»: файл может отсутствовать при частичном
+    внедрении/локальном клоне) — возвращает один синтетический элемент
+    kind="no_manifest", видимый в отчёте, но такой отчёт вызывающий обязан
+    решить, гейтить ли (см. build_report ниже — печатает как факт, не
+    прерывает остальные инварианты). Морда НЕ входит в канонический список
+    (design.md: один слот адаптера, без цепочки принципиально)."""
+    manifest = collect_provider_usage.load_manifest(manifest_path)
+    if manifest is None:
+        return [{"kind": "no_manifest", "path": str(manifest_path)}]
+    violations = []
+    for consumer in collect_provider_usage.CONSUMERS:
+        entry = collect_provider_usage.resolve_consumer(manifest, consumer)
+        if entry["state"] == "missing":
+            violations.append({"kind": "missing", "consumer": consumer})
+        elif entry["state"] == "dangling":
+            violations.append({
+                "kind": "dangling", "consumer": consumer, "chain_name": entry["chain_name"],
+            })
+    return violations
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -1637,6 +1706,23 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
                       f"провалов {RECURRING_FAILURE_WORKFLOW} с одной причиной")
+
+    v11 = check_provider_usage_manifest()
+    if v11 and v11[0].get("kind") == "no_manifest":
+        findings[11] = []
+        lines.append(f"⏭️ [11] {v11[0]['path']} не найден — манифест использования "
+                      f"провайдеров ещё не подключён на этом checkout'е (переходный период)")
+    else:
+        findings[11] = v11
+        if v11:
+            lines.append(f"🚨 [11] {len(v11)} потребителей LLM-провайдеров без валидного назначения (#823):")
+            for item in v11:
+                if item["kind"] == "missing":
+                    lines.append(f"   — {item['consumer']}: нет записи в .usage")
+                else:
+                    lines.append(f"   — {item['consumer']}: .usage ссылается на несуществующую/пустую цепочку '{item['chain_name']}'")
+        else:
+            lines.append("💚 [11] у всех потребителей манифеста (ai-review/worker/hands) есть валидное назначение цепочки")
 
     return lines, findings
 
