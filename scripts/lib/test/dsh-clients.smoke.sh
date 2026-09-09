@@ -425,11 +425,15 @@ export DEEPSEEK_API_KEY="smoke-deepseek-key"
 # правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
-# Цепочка провайдеров (#727): ai_dsh.sh (ревью) теперь требует
-# vars.DSH_PROVIDER_CHAIN, не одиночные DEEPSEEK_* напрямую — один фиктивный
-# провайдер, ссылающийся на ту же DEEPSEEK_API_KEY-фикстуру (worker/hands
-# по-прежнему читают DEEPSEEK_* напрямую через dsh_require_provider_env, не
-# тронуто этим change, см. tasks.md «Область»).
+# Цепочка провайдеров (#727, довод #797): ai_dsh.sh (ревью) И worker/task.sh
+# теперь требуют vars.DSH_PROVIDER_CHAIN, не одиночные DEEPSEEK_* напрямую —
+# один фиктивный провайдер, ссылающийся на ту же DEEPSEEK_API_KEY-фикстуру
+# (hands по-прежнему читает DEEPSEEK_* напрямую через dsh_require_provider_env
+# — не тронуто этим PR, см. openspec/changes/llm-provider-chain-failover/
+# tasks.md «Осталось»). worker/task.sh сам патчит профиль значениями chain[0]
+# ДО первого `dsh` (плагин стрима) — DEEPSEEK_BASE_URL/DEEPSEEK_MODEL,
+# экспортированные для hands прямо выше, воркер перезаписывает своими же
+# значениями, взятыми из этой же цепочки.
 export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
 # Реестр подтверждённых id (#737): реальный реестр репозитория
 # (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель

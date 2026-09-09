@@ -93,7 +93,8 @@ dsh --version || true
 # конструктивно (design.md dsh-in-job, «Стык suite и цепочки провайдеров»).
 # dsh_require_provider_chain ниже уже откажет громко, если vars.PLUGINS_SUITE_URL
 # всё же попадёт в env этого шага — но ai-review.yml её сюда не прокидывает:
-# suite остаётся уделом worker.yml/hands.yml, где цепочки нет.
+# suite остаётся уделом hands.yml (#797: worker.yml тоже подключён к цепочке,
+# там suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
