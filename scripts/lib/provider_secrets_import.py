@@ -378,13 +378,17 @@ def group_candidates(
 def probe_candidates(
     candidates_by_family: dict[str, list[Account]],
     routes_by_family: dict[str, list[SuiteRoute]],
-) -> dict[str, str]:
+) -> dict[str, ProbeOutcome]:
     """Живая проба ТОЛЬКО кандидатов на слоты suite (задача #777) — учётки вне
     списка маршрутов (out_of_scope) пробовать бессмысленно, у них нет слота,
     который проба могла бы переранжировать. На файле владельца это ~9
     кандидатов из 46 учёток экспорта — пробовать все 46 значило бы тратить
-    сеть на 37 учёток, чей результат пробы ни на что не влияет."""
-    results: dict[str, str] = {}
+    сеть на 37 учёток, чей результат пробы ни на что не влияет.
+
+    Возвращает ProbeOutcome (статус + разобранные id моделей), не голый
+    статус — вызывающий сам решает, что показывать в отчёте (см. main/
+    render_report), ранжирование по-прежнему смотрит только на .status."""
+    results: dict[str, ProbeOutcome] = {}
     for family, accounts in candidates_by_family.items():
         family_routes = routes_by_family.get(family)
         if not family_routes:
@@ -394,7 +398,7 @@ def probe_candidates(
             value = secret_value(account)
             if value is None:
                 continue
-            results[account.id] = probe_provider(base_url, value)
+            results[account.id] = probe_provider_full(base_url, value)
     return results
 
 
@@ -527,25 +531,100 @@ def set_variable(repo: str, name: str, value: str) -> None:
 # ── Живая проба ───────────────────────────────────────────────────────────
 
 
+class ModelListError(LoudError):
+    """Ответ /models пришёл в структуре, которую парсер не понимает."""
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """Результат живой пробы /models. Модели (models) заполняются ТОЛЬКО на
+    status == "жива" и только если тело ответа разобралось (иначе
+    models_error называет, что ожидалось и что пришло — по структуре, не по
+    значениям). Ключ/заголовок авторизации/тело запроса сюда не попадают
+    никогда — probe_provider_full их не сохраняет нигде за пределами самого
+    HTTP-запроса."""
+
+    status: str
+    models: tuple[str, ...] | None = None
+    models_error: str | None = None
+
+
+def parse_model_ids(base_url: str, body: bytes) -> list[str]:
+    """Разбор тела ответа /models — печатает ТОЛЬКО имена моделей (задача
+    «импортёр печатает доступные id моделей»), не всё тело.
+
+    Формат проверен живым запросом ко всем четырём провайдерам suite
+    (2026-09-09, задача) — у всех ОДИН И ТОТ ЖЕ top-level контракт,
+    OpenAI-совместимый: dict с ключом "data" — список объектов со строковым
+    полем "id". Различаются только ЛИШНИЕ поля элемента, которые эта функция
+    не использует:
+      - nvidia-nim, zai (GLM), ollama-cloud: created/id/object/owned_by;
+      - openrouter: вдобавок architecture/pricing/context_length/… (431
+        моделей на момент проверки — то же поле "id", просто больше шума).
+    Ни разного формата, ни отличного от OpenAI top-level контракта среди
+    четырёх проверенных провайдеров НЕ найдено — если он встретится у нового
+    провайдера, эта функция обязана упасть громко (см. ниже), а не угадать.
+    """
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise ModelListError(f"{base_url}: ответ /models не JSON: {error}") from error
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("data"), list):
+        top_keys = sorted(parsed.keys()) if isinstance(parsed, dict) else None
+        raise ModelListError(
+            "неузнанная структура ответа /models: ожидался dict с ключом "
+            "'data' (список объектов со строковым полем 'id'). Получено: "
+            f"top-level {type(parsed).__name__}"
+            + (f", ключи={top_keys}" if top_keys is not None else "")
+            + f" ({base_url}). Значения тела не печатаются."
+        )
+    ids: list[str] = []
+    for index, item in enumerate(parsed["data"]):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            item_keys = sorted(item.keys()) if isinstance(item, dict) else None
+            raise ModelListError(
+                f"неузнанная структура data[{index}] ответа /models: ожидался "
+                "объект со строковым полем 'id'. Получено: "
+                f"{type(item).__name__}"
+                + (f", ключи={item_keys}" if item_keys is not None else "")
+                + f" ({base_url}). Значения тела не печатаются."
+            )
+        ids.append(item["id"])
+    return sorted(set(ids))
+
+
 def probe_provider(base_url: str, api_key: str) -> str:
     """жива / квота исчерпана / ключ неверен / неизвестно — эвристика по HTTP-
     статусу общего для OpenAI-совместимых шлюзов эндпоинта /models. 401/403 —
-    ключ неверен, 429 — квота исчерпана (разное лечение, не смешиваем)."""
+    ключ неверен, 429 — квота исчерпана (разное лечение, не смешиваем).
+    Тонкая обёртка над probe_provider_full для обратной совместимости вызовов,
+    которым нужен только статус."""
+    return probe_provider_full(base_url, api_key).status
+
+
+def probe_provider_full(base_url: str, api_key: str) -> ProbeOutcome:
+    """То же, что probe_provider, но на успехе (200) заодно разбирает список
+    id моделей из уже полученного тела ответа — вместо того, чтобы, как
+    раньше, прочитать статус и выбросить тело. Один HTTP-запрос на оба факта."""
     url = base_url.rstrip("/") + "/models"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
     try:
         with urllib.request.urlopen(request, timeout=_PROBE_TIMEOUT_SECONDS) as response:
             if response.status == 200:
-                return "жива"
-            return f"неизвестно (HTTP {response.status})"
+                body = response.read()
+                try:
+                    return ProbeOutcome(status="жива", models=tuple(parse_model_ids(base_url, body)))
+                except ModelListError as error:
+                    return ProbeOutcome(status="жива", models_error=str(error))
+            return ProbeOutcome(status=f"неизвестно (HTTP {response.status})")
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
-            return "ключ неверен"
+            return ProbeOutcome(status="ключ неверен")
         if error.code == 429:
-            return "квота исчерпана"
-        return f"неизвестно (HTTP {error.code})"
+            return ProbeOutcome(status="квота исчерпана")
+        return ProbeOutcome(status=f"неизвестно (HTTP {error.code})")
     except urllib.error.URLError as error:
-        return f"неизвестно (сеть: {error.reason})"
+        return ProbeOutcome(status=f"неизвестно (сеть: {error.reason})")
 
 
 # ── Отчёт ─────────────────────────────────────────────────────────────────
@@ -557,6 +636,7 @@ def render_report(
     suite_status: str,
     apply: bool,
     export_date: str,
+    probe_outcomes: dict[str, "ProbeOutcome"] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"Снимок экспорта датирован: {export_date}.")
@@ -593,6 +673,41 @@ def render_report(
     lines.append("")
     lines.append(f"Слотов с кандидатом: {assigned}; слотов без кандидата: {empty}.")
     lines.append("")
+    probe_outcomes = probe_outcomes or {}
+    seen_secrets: set[str] = set()
+    model_slots = [
+        slot for slot in selection.assignments
+        if slot.account is not None and slot.account.id in probe_outcomes
+    ]
+    if model_slots:
+        lines.append("## Доступные id моделей провайдеров (живая проба, /models)\n")
+        lines.append(
+            "Тот же HTTP-запрос, что дал ранг выше — тело ответа больше не выбрасывается. "
+            "Список полный, без фильтрации (см. обоснование в задаче: цель — точный id для "
+            "`vars.DSH_PROVIDER_CHAIN`, а не сокращённая выборка на глаз); id ВСЁ РАВНО обязан "
+            "пройти реестр подтверждённых моделей (`scripts/lib/confirmed-provider-models.json`, "
+            "#737) до попадания в цепочку."
+        )
+        for slot in model_slots:
+            name = slot.route.secret_env
+            if name in seen_secrets:
+                continue
+            seen_secrets.add(name)
+            outcome = probe_outcomes[slot.account.id]
+            lines.append(f"\n### `{name}` — base_url `{slot.route.base_url}`\n")
+            if outcome.status != "жива":
+                lines.append(f"- проба: {outcome.status} — список моделей недоступен.")
+                continue
+            if outcome.models_error:
+                lines.append(f"- разбор тела ответа не удался: {outcome.models_error}")
+                continue
+            if not outcome.models:
+                lines.append("- проба не запрашивала модели (внутренняя ошибка — models пуст на статусе «жива»).")
+                continue
+            lines.append(f"- {len(outcome.models)} моделей:")
+            for model_id in outcome.models:
+                lines.append(f"  - `{model_id}`")
+        lines.append("")
     if selection.probe_excluded:
         lines.append("## Исключены живой пробой (подтверждено «ключ неверен»)\n")
         for account in selection.probe_excluded:
@@ -677,9 +792,10 @@ def main(argv: list[str] | None = None) -> int:
         accounts = accounts_from_export(data)
         routes_by_family = group_routes_by_family(routes)
         candidates_by_family, _out_of_scope = group_candidates(accounts, routes_by_family)
-        probe_results = (
+        probe_outcomes: dict[str, ProbeOutcome] = (
             {} if args.no_probe else probe_candidates(candidates_by_family, routes_by_family)
         )
+        probe_results = {account_id: outcome.status for account_id, outcome in probe_outcomes.items()}
         selection = select_accounts(accounts, routes, probe_results=probe_results)
         repo = gh_repo(args.repo)
         existing_secrets = existing_secret_names(repo)
@@ -732,7 +848,7 @@ def main(argv: list[str] | None = None) -> int:
         except LoudError as error:
             suite_status = f"ОШИБКА записи: {error}"
 
-    print(render_report(selection, secret_status, suite_status, args.apply, export_date))
+    print(render_report(selection, secret_status, suite_status, args.apply, export_date, probe_outcomes))
     return 0
 
 
