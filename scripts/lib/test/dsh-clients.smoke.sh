@@ -532,6 +532,8 @@ export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
+export HOME="$TMP/home"
+mkdir -p "$HOME"
 export PATH="$TMP/bin:$PATH"
 export -f curl gh dsh pnpm timeout log_call
 export CALLLOG
@@ -654,7 +656,8 @@ grep -qE '"kind": *"job_end"' "$JOURNAL_CAPT" \
 grep -qE '"result": *"ok"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands: job_end не ok" >&2; exit 1; }
 assert_rules_delivered "hands"
-assert_session_title "hands" "Smoke задача: проверить гвардию класса"
+# Канал рук при TASK_ID=issue-N сам ставит префикс "#N: " к заголовку
+  assert_session_title "hands" "#123: Smoke задача: проверить гвардию класса"
 echo "SMOKE: hands — ок"
 
 # ── Клиент автономного воркера ────────────────────────────────────────────────────

@@ -802,10 +802,10 @@ def rules_section() -> str:
     (см. cmd_gather), а не встраивается в текст самого шаблона: Template
     сканирует на `$`-плейсхолдеры только ТЕКСТ ШАБЛОНА при разборе, значения
     подстановки в мэппинге не пересканируются — по той же причине, что и
-    diff-пак, и тело задачи (task_section), уже едущие значением. Сегодня
-    в AGENTS.md и docs/agents/PROTOCOL.md символа `$` нет вовсе (замерено),
+    diff-пак, и тело задачи (task_section), уже едущие значением. В текущих
+    AGENTS.md и docs/agents/PROTOCOL.md символа `$` нет (замерено grep -F '$'),
     но если он там появится (например, `$GITHUB_REPOSITORY` или
-    `${{ github.token }}` в примере из правил), он точно так же доедет до
+    `${{ github.token }}` в будущем примере из правил), он точно так же доедет до
     модели неискажённым — это свойство safe_substitute, а не текущего
     содержимого правил. Что именно ловит тест — см.
     test_ai_review.py::test_ai_prompt_rules_delivered_as_value_not_embedded.
@@ -909,16 +909,27 @@ def cmd_gather(args: argparse.Namespace) -> int:
     pack.write_text(f"FILES:\n{listing}\n\nADDITIONS: {added}\n\nDIFF:\n{diff}", encoding="utf-8")
 
     template = string.Template((SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
-    prompt = template.safe_substitute(
-        pr=args.pr,
-        title=pull.get("title", ""),
-        branch=pull["head"]["ref"],
-        author=(pull.get("user") or {}).get("login", ""),
-        context_pack=pack,
-        task_section=task_section(pull, repo),
-        size_section=size_question_section(added),
-        rules_section=rules_section(),
-    )
+    mapping = {
+        "pr": str(args.pr),
+        "title": pull.get("title", ""),
+        "branch": pull["head"]["ref"],
+        "author": (pull.get("user") or {}).get("login", ""),
+        "context_pack": str(pack),
+        "task_section": task_section(pull, repo),
+        "size_section": size_question_section(added),
+        "rules_section": rules_section(),
+    }
+    # Гвардия silent-wrong: если какой-то плейсхолдер шаблона не попал в мэппинг
+    # (опечатка, переименование, удаление ключа) — safe_substitute молча оставит
+    # литерал '$placeholder' в промпте, модель его прочтёт, все тесты зелёные.
+    # Проверяем здесь: все идентификаторы шаблона обязаны быть в мэппинге.
+    missing = template.get_identifiers() - mapping.keys()
+    if missing:
+        raise RuntimeError(
+            f"ai_prompt.md содержит плейсхолдеры, которых нет в мэппинге gather: "
+            f"{', '.join(sorted(missing))}. Промпт не собран — отказ до DSH."
+        )
+    prompt = template.safe_substitute(mapping)
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
     # Переходная совместимость: bridge на main (до мержа этого PR) берёт head
     # для сверки из meta.json; НОВЫЙ bridge берёт step-output фактов, а файл

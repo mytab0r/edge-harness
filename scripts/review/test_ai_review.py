@@ -548,10 +548,72 @@ def test_rules_section_dollar_survives_substitution(tmp_path, monkeypatch):
     assert "${{ github.token }}" in prompt
 
 
+def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
+    # Гвардия silent-wrong: если cmd_gather не передаёт один из плейсхолдеров
+    # шаблона (опечатка/переименование ключа) — safe_substitute молча оставит
+    # '$placeholder' в промпте. Проверка в cmd_gather должна это ловить.
+    # Создаём временную директорию с поддельным ai_prompt.md и подменяем SCRIPT_DIR.
+    fake_script_dir = tmp_path / "fake_scripts"
+    fake_script_dir.mkdir()
+    fake_prompt = fake_script_dir / "ai_prompt.md"
+    fake_prompt.write_text(
+        "PR #$pr\n$title\n$branch\n$author\n$context_pack\n$task_section\n"
+        "$rules_section\n$MISSING_PLACEHOLDER\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ai, "SCRIPT_DIR", fake_script_dir)
+
+    # Подготавливаем минимальные моки для gh вызовов внутри cmd_gather
+    def fake_gh(path):
+        if path == "repos/o/r/pulls/1":
+            return {
+                "title": "Test PR",
+                "head": {"ref": "agent/1-test"},
+                "user": {"login": "test-user"},
+            }
+        if path.startswith("repos/o/r/pulls/1/files"):
+            # list_pr_files — возвращаем пустой список файлов
+            return []
+        if path.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
+            # other_active_ai_review_runs вызывает этот эндпоинт — возвращаем пустой список
+            return []
+        raise AssertionError(f"unexpected gh call: {path}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    # diff-пак — мокаем gh pr diff
+    import subprocess
+
+    def fake_subprocess_run(cmd, capture_output=True, text=True, env=None):
+        if cmd[:2] == ["gh", "pr"] and cmd[2] == "diff":
+            class Result:
+                returncode = 0
+                stdout = "diff --git a/file.py b/file.py\n+line"
+                stderr = ""
+            return Result()
+        # fallback to real subprocess for other calls (e.g., redact)
+        return subprocess.run(cmd, capture_output=capture_output, text=text, env=env)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    # task_section — мокаем чтобы не дергать gh для issue
+    def fake_task_section(pull, repo):
+        return "(без задачи)"
+
+    monkeypatch.setattr(ai, "task_section", fake_task_section)
+
+    # rules_section — используем настоящий, он читает файлы с диска
+    # но нам не важно содержимое, главное что он есть
+
+    args = argparse.Namespace(pr=1, out=str(tmp_path / "out"))
+    with pytest.raises(RuntimeError) as exc:
+        ai.cmd_gather(args)
+    assert "MISSING_PLACEHOLDER" in str(exc.value)
+    assert "плейсхолдеры, которых нет в мэппинге" in str(exc.value)
+
+
 # ── Ошибка провайдера/транспорта vs нарушение контракта моделью ──────────────
-# (класс silent-wrong прогона 33572445063, PR #190: dsh упал с HTTP_404,
-# answer.txt остался пустым, verdict написал «строки ВЕРДИКТ нет вообще» —
-# диагноз читался как «модель ошиблась», хотя вызова модели не было вовсе).
 
 @pytest.mark.parametrize("dsh_rc,expected", [
     ("1", True),
@@ -1142,6 +1204,9 @@ def _fake_gh_should_run(labels, comment_body, files, active_runs=None):
             page = url.split("page=")[-1]
             bot = {"login": "github-actions[bot]", "type": "Bot"}
             return [{"user": bot, "body": comment_body}] if page == "1" and comment_body else []
+        if url.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
+            # other_active_ai_review_runs — возвращаем пустой список (нет параллельных прогонов)
+            return []
         raise AssertionError(f"неожиданный вызов gh: {url}")
     return fake_gh
 
