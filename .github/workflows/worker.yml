@@ -101,6 +101,12 @@ jobs:
           # в worker/task.sh падает громко до какой-либо дорогой работы.
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          # Окно контекста env-provider-маршрута combo-router (#789) — тот же
+          # источник, что уже требует присутствие DEEPSEEK_MODEL для каталога
+          # морды (deploy-dsh-edge.yml): dsh_model_context_window (dsh-ci.sh)
+          # ищет DSH_MODEL по id в этом JSON, не в DSH_MAX_TOKENS (тот —
+          # потолок вывода, другая величина).
+          DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
           # Ротация учёток (#215) — одно место правды: имя переменной и
           # список секретов-кандидатов объявлены в scripts/lib/dsh-ci.sh
           # (PLUGINS_SUITE_CANDIDATE_ROUTES), здесь только проводка. Пусто →
