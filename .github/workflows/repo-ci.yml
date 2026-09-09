@@ -889,6 +889,13 @@ jobs:
       - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
         run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
 
+      # Гвардия #789: окно контекста env-provider-маршрута combo-router
+      # обязано читаться из vars.DSH_EDGE_MODEL_CATALOG (реальное окно
+      # модели), не из DSH_MAX_TOKENS (потолок ДЛИНЫ ОТВЕТА) — смешение
+      # отбрасывало главного провайдера в разы раньше нужного.
+      - name: Гвардия окна контекста env-provider (#789)
+        run: bash scripts/lib/test/dsh-context-window.guard.sh
+
       # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
       # #128, М3): два списка без единого места правды — расхождение красит CI,
       # а не живой job 400-м или мёртвой поверхностью.
