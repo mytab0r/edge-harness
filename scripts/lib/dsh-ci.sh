@@ -26,6 +26,29 @@ DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WO
 PLUGINS_SUITE_COMBO_ASSET="dsh-combo-suite-0.1.0.tgz"
 PLUGINS_SUITE_OAUTH_ASSET="dsh-anthropic-oauth-pool-0.1.0.tgz"
 
+# Быстрый провайдер Claude — anthropic-oauth-pool НЕЗАВИСИМО от suite (#838).
+# vars.PLUGINS_SUITE_URL снята вместе со сломанным combo-router (#790,
+# NO_COMBO_ROUTE без газа) — но dsh-anthropic-oauth-pool САМОДОСТАТОЧЕН (свой
+# loopback-прокси, свой failover между аккаунтами) и от combo-router не
+# зависит. Ассет — ТОТ ЖЕ tgz, что уже публикует suite
+# (PLUGINS_SUITE_OAUTH_ASSET выше, не дублируем имя файла); тег релиза —
+# отдельный литеральный пин, не vars.PLUGINS_SUITE_URL (та переменная вернула
+# бы в проводку сломанный combo-router). Пин версии — тот же ритуал, что
+# DSH_VERSION/DSH_HEADLESS_VERSION выше: правится здесь при следующей сборке
+# плагина владельцем.
+ANTHROPIC_OAUTH_POOL_RELEASE="dsh-plugins-suite-v1"
+
+# Секреты аккаунтов Claude — JSON ЦЕЛИКОМ в значении секрета, формат
+# ~/.claude/.credentials.json (lib/accounts.js::importAccount плагина):
+# {"claudeAiOauth": {"accessToken": "...", "refreshToken": "...", ...}}.
+# Список — одно место правды для id секретов и порождаемых id аккаунтов пула
+# (anthropic-1/anthropic-2, позиционно). Газ подключения пула — наличие ХОТЯ
+# БЫ ОДНОГО из этих секретов, не отдельная vars-переменная (design.md
+# anthropic-oauth-pool-standalone, «Гейт активации»): секрет уже несёт весь
+# нужный сигнал, второй переключатель поверх него дублировал бы факт и мог
+# рассинхрониться с ним.
+ANTHROPIC_OAUTH_ACCOUNT_SECRETS=(ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2)
+
 # vars.PLUGINS_SUITE_URL — имя переменной унаследовано от design.md/tasks.md
 # dsh-in-job (объявлено ещё до решения о механизме публикации), но её
 # ЗНАЧЕНИЕ — тег релиза ЭТОГО репозитория, не сырой URL: скачивание идёт
@@ -243,6 +266,153 @@ dsh_mount_plugins_suite() { # $1 — профиль (headless)
   echo "::endgroup::"
 }
 
+# ── Быстрый провайдер Claude: anthropic-oauth-pool, независимо от suite ─────
+# (#838, design.md anthropic-oauth-pool-standalone). НЕ читает
+# vars.PLUGINS_SUITE_URL и не трогает DSH_PLUGINS_SUITE_*-переменные —
+# отдельный набор DSH_ANTHROPIC_POOL_*, гейт — секреты аккаунтов, не vars.
+#
+# ТОЛЬКО скачивание+проверка+распаковка, ни одной команды `dsh` — тот же
+# принцип разделения, что у dsh_install_plugins_suite/dsh_mount_plugins_suite
+# выше. Ни один секрет ANTHROPIC_OAUTH_ACCOUNT_SECRETS не задан → notice,
+# return 0, DSH_ANTHROPIC_POOL_ACTIVE=0 — поведение как раньше (одиночный
+# провайдер/цепочка), симметрично критерию 4 #215, только газ — секрет.
+#
+# Распаковываем tgz В ДОПОЛНЕНИЕ к сохранению самого файла (для dsh plugin
+# add): импорт аккаунтов (dsh_import_anthropic_accounts ниже) зовёт
+# bin/dsh-anthropic-pool.js напрямую через node, а не через бинарник
+# dsh-anthropic-pool, который `dsh plugin add` может не выставить в PATH
+# (README плагина честно предупреждает об этом же).
+dsh_install_anthropic_pool() { # $1 — рабочий каталог
+  local dir=$1 secret_name has_secret=0
+  DSH_ANTHROPIC_POOL_ACTIVE=0
+  DSH_ANTHROPIC_POOL_PKG=""
+  DSH_ANTHROPIC_POOL_EXTRACTED=""
+  for secret_name in "${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[@]}"; do
+    [ -n "${!secret_name:-}" ] && has_secret=1
+  done
+  if [ "$has_secret" != 1 ]; then
+    echo "::notice::быстрый провайдер Claude (anthropic-oauth-pool) не подключён: ни один из секретов ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]} не задан — используется цепочка/одиночный провайдер как раньше (#838)"
+    return 0
+  fi
+  dsh_require_plugins_suite_repo
+  mkdir -p "$dir"
+  echo "::group::Скачивание dsh-anthropic-oauth-pool (релиз ${ANTHROPIC_OAUTH_POOL_RELEASE}, #838)"
+  local base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${ANTHROPIC_OAUTH_POOL_RELEASE}"
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$PLUGINS_SUITE_OAUTH_ASSET" "$base/$PLUGINS_SUITE_OAUTH_ASSET"; then
+    echo "::error::ассет $PLUGINS_SUITE_OAUTH_ASSET недоступен ($base/$PLUGINS_SUITE_OAUTH_ASSET) — быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$PLUGINS_SUITE_OAUTH_ASSET.sha256" "$base/$PLUGINS_SUITE_OAUTH_ASSET.sha256"; then
+    echo "::error::в релизе ${ANTHROPIC_OAUTH_POOL_RELEASE} нет ${PLUGINS_SUITE_OAUTH_ASSET}.sha256 — целостность не проверить, быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! (cd "$dir" && sha256sum -c "$PLUGINS_SUITE_OAUTH_ASSET.sha256"); then
+    echo "::error::sha256 $PLUGINS_SUITE_OAUTH_ASSET не сошёлся с $PLUGINS_SUITE_OAUTH_ASSET.sha256 — возможна подмена релиза или неполная закачка (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  local extract_dir="$dir/anthropic-oauth-pool-extracted"
+  mkdir -p "$extract_dir"
+  if ! tar -xzf "$dir/$PLUGINS_SUITE_OAUTH_ASSET" -C "$extract_dir"; then
+    echo "::error::tar не распаковал $PLUGINS_SUITE_OAUTH_ASSET (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if [ ! -f "$extract_dir/package/bin/dsh-anthropic-pool.js" ]; then
+    echo "::error::в $PLUGINS_SUITE_OAUTH_ASSET не нашёлся package/bin/dsh-anthropic-pool.js — форма ассета изменилась, быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  DSH_ANTHROPIC_POOL_PKG="$dir/$PLUGINS_SUITE_OAUTH_ASSET"
+  DSH_ANTHROPIC_POOL_EXTRACTED="$extract_dir/package"
+  DSH_ANTHROPIC_POOL_ACTIVE=1
+  echo "быстрый провайдер Claude (anthropic-oauth-pool) скачан и проверен (sha256 ок)"
+  echo "::endgroup::"
+}
+
+# Импорт аккаунтов из секретов (#838) — вызывать ПОСЛЕ dsh_install_anthropic_pool
+# (нужен DSH_ANTHROPIC_POOL_EXTRACTED), в любой момент до первого прогона dsh:
+# bin/dsh-anthropic-pool.js пишет напрямую в ~/.dsh/anthropic-accounts (lib/
+# accounts.js::poolDir, по умолчанию $HOME) — тот же $HOME, что видит
+# смонтированный плагин в этом job'е, порядок относительно монтажа не важен.
+#
+# Значение секрета НИКОГДА не печатается и не проходит через echo/интерполяцию
+# в аргументы команды — только файл mode 0600 (AGENTS.md, «Секреты»: репозиторий
+# публичный, производное секрета GitHub не маскирует). id аккаунта — позиционный
+# (anthropic-1 для ANTHROPIC_OAUTH_1, anthropic-2 для ANTHROPIC_OAUTH_2).
+#
+# unset КАЖДОГО секрета после использования — НЕ просто гигиена. Имена
+# ANTHROPIC_OAUTH_1/2 (заданы владельцем, не переименовываются здесь) не
+# содержат подстрок *_KEY/*_TOKEN/*_SECRET — паттерна, которым DSH вырезает
+# переменные из окружения ПОДПРОЦЕССОВ, запускаемых shell-тулом самой модели
+# (см. комментарий в scripts/review/ai_dsh.sh, «Доверенная граница задачи
+# #18»: DEEPSEEK_API_KEY УЖЕ полагается на этот паттерн, ANTHROPIC_OAUTH_1/2 —
+# НЕТ). ai-review запускает `dsh` над НЕДОВЕРЕННЫМ диффом PR без GH_TOKEN
+# ИМЕННО чтобы агент не мог ничего слить наружу через свой же shell-тул —
+# живой OAuth-JSON (accessToken/refreshToken) в этом окружении был бы
+# читаем `env`/`printenv` изнутри агента, если бы остался в процессе `dsh`
+# дольше момента импорта. Импорт (dsh-anthropic-pool add, отдельный
+# `node`-процесс) уже прочитал значение и записал его в файл на диске —
+# после этого секрет из окружения ЭТОГО bash-процесса (и, следовательно, из
+# окружения любого дочернего `dsh`, стартующего позже) больше не нужен.
+dsh_import_anthropic_accounts() {
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Импорт аккаунтов Anthropic OAuth pool (#838)"
+  local secret_name value creds_file imported=0 idx=0 account_id
+  for secret_name in "${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[@]}"; do
+    idx=$((idx + 1))
+    account_id="anthropic-$idx"
+    value="${!secret_name:-}"
+    if [ -z "$value" ]; then
+      continue
+    fi
+    creds_file=$(mktemp)
+    chmod 600 "$creds_file"
+    printf '%s' "$value" >"$creds_file"
+    if ! node "$DSH_ANTHROPIC_POOL_EXTRACTED/bin/dsh-anthropic-pool.js" add "$account_id" "$creds_file"; then
+      rm -f "$creds_file"
+      unset "$secret_name"
+      echo "::error::dsh-anthropic-pool add $account_id не смог импортировать секрет $secret_name — быстрый провайдер Claude не подключён (#838)"
+      echo "::endgroup::"; return 1
+    fi
+    rm -f "$creds_file"
+    unset "$secret_name"
+    imported=$((imported + 1))
+    echo "аккаунт $account_id импортирован из секрета $secret_name (значение удалено из окружения)"
+  done
+  if [ "$imported" = 0 ]; then
+    # Недостижимо в норме: dsh_install_anthropic_pool уже проверил has_secret
+    # ДО того, как выставил DSH_ANTHROPIC_POOL_ACTIVE=1. Fail loud на
+    # несоответствие инварианта, а не тихий проход с пустым пулом.
+    echo "::error::DSH_ANTHROPIC_POOL_ACTIVE=1, но ни один секрет не дал импортируемый аккаунт — рассинхрон инварианта (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  echo "::endgroup::"
+}
+
+# Монтаж — тот же паттерн, что dsh_mount_plugins_suite (структурная проверка
+# dsh --dump-config), НЕЗАВИСИМО от неё: своя переменная активации, свой tgz,
+# монтируется даже когда suite выключена целиком. Вызывать ПОСЛЕ первого
+# dsh_patch_profile этого job'а — то же обоснование порядка (initProfile
+# пишет файлы профиля только при отсутствии), что у dsh_mount_plugins_suite.
+dsh_mount_anthropic_pool() { # $1 — профиль (headless)
+  local profile=$1
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Монтаж быстрого провайдера Claude (профиль $profile, #838)"
+  if ! dsh plugin --profile "$profile" add "$DSH_ANTHROPIC_POOL_PKG"; then
+    echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — быстрый провайдер Claude не подключён (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  local dump
+  if ! dump=$(dsh --profile "$profile" --dump-config 2>&1); then
+    echo "::error::dsh --dump-config упал после монтажа anthropic-oauth-pool — монтаж не подтверждён (#838): $dump"
+    echo "::endgroup::"; return 1
+  fi
+  if ! grep -q '^- id: anthropic-oauth-pool$' <<<"$dump"; then
+    echo "::error::anthropic-oauth-pool не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  echo "быстрый провайдер Claude (anthropic-oauth-pool) смонтирован — структурная проверка dump-config подтверждена"
+  echo "::endgroup::"
+}
+
 # Плоский (без combo-router) патч профиля — поведение «как раньше», один
 # источник для ОБЕИХ ситуаций, где он нужен: suite не запрошен вовсе, и
 # suite смонтирован, но dump-config не подтвердил активацию (мягкий откат,
@@ -260,6 +430,29 @@ _dsh_patch_profile_plain() { # $1 — профиль
 - id: llm-deepseek
   config:
     maxTokens: $DSH_MAX_TOKENS
+PATCH
+}
+
+# Патч профиля под быстрый провайдер Claude (#838, design.md
+# anthropic-oauth-pool-standalone «Стык с цепочкой провайдеров»). НЕ
+# использует _dsh_patch_profile_plain/llm-deepseek вовсе — anthropic-pool
+# регистрирует себя отдельным провайдером в llm-pi-ai.providers.anthropic-pool
+# (lib/index.js::ensureProvider плагина, PROVIDER_KEY='anthropic-pool',
+# api: 'anthropic-messages' — другой протокольный путь, не openai-completions
+# llm-deepseek). "claude-sonnet-4-5" — статический дефолт из models плагина
+# (lib/index.js), используется как id модели для agent-default-model; живым
+# прогоном с реальными аккаунтами не подтверждено (design.md, «Не
+# подтверждено» — гонка ensureProvider()/discoverModels() относительно
+# резолва agent-default-model на первом реальном запросе).
+_dsh_patch_profile_anthropic_pool() { # $1 — профиль
+  local profile=$1
+  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  mkdir -p "$(dirname "$patch")"
+  cat >"$patch" <<PATCH
+- id: agent-default-model
+  config:
+    provider: anthropic-pool
+    model: claude-sonnet-4-5
 PATCH
 }
 
@@ -805,4 +998,44 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     echo "::error::цепочка провайдеров исчерпана целиком ($DSH_CHAIN_TRIED)${DSH_CHAIN_RESET_HINT:+ — сброс: $DSH_CHAIN_RESET_HINT}" >&2
   fi
   DSH_CHAIN_ACTIVE="$_prev_chain_active"
+}
+
+# ── Быстрый провайдер первым, цепочка — фоллбэком (#838) ────────────────────
+#
+# design.md anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»:
+# anthropic-oauth-pool и DSH_PROVIDER_CHAIN решают РАЗНЫЕ вопросы на разных
+# протокольных путях (llm-pi-ai/anthropic-messages против llm-deepseek/
+# openai-completions) — не комбинируются на одном уровне, как suite/цепочка
+# (dsh_patch_profile выше), а идут ПОСЛЕДОВАТЕЛЬНО: пул пробуется первым
+# ОДНИМ прогоном (сам пул уже перебирает все свои аккаунты на 429/401/403
+# внутри одного HTTP-вызова, lib/index.js::forward плагина — повторять этот
+# перебор снаружи циклом бессмысленно), при отказе — штатная
+# dsh_run_with_provider_chain вызывается КАК ЕСТЬ, без изменений.
+#
+# Пул неактивен (DSH_ANTHROPIC_POOL_ACTIVE=0, нет секретов) — сразу цепочка,
+# нулевое изменение поведения для конфигурации без пула.
+#
+# Использование и результат — тот же контракт, что у dsh_run_with_provider_chain
+# (DSH_RUN_RC/DSH_RUN_FAILURE_REASON/DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED/
+# DSH_CHAIN_RESET_HINT) — вызывающие (worker/hands/ai-review) читают ровно те
+# же переменные, что и раньше, независимо от того, ответил пул или цепочка.
+dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
+  local answer_file=$1 err_file=$2 prompt_text=$3
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
+    echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
+    _dsh_patch_profile_anthropic_pool headless
+    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    if [ "$DSH_RUN_RC" -eq 0 ]; then
+      DSH_CHAIN_PROVIDER="anthropic-oauth-pool"
+      DSH_CHAIN_TRIED="anthropic-oauth-pool"
+      DSH_CHAIN_RESET_HINT=""
+      DSH_RUN_FAILURE_REASON=""
+      return 0
+    fi
+    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC) — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+  fi
+  dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text"
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
+    DSH_CHAIN_TRIED="anthropic-oauth-pool, ${DSH_CHAIN_TRIED}"
+  fi
 }
