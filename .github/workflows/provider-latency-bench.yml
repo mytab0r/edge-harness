@@ -48,8 +48,8 @@ jobs:
   discover-models:
     runs-on: ubuntu-latest
     # Худший случай — 7 аккаунтов (2 NVIDIA NIM + 3 Ollama Cloud +
-    # 2 OpenRouter) × до VERIFY_MAX_ATTEMPTS(5) попыток verify по
-    # VERIFY_TIMEOUT_SECS(60) = до 35 мин только на верификацию, плюс листинг
+    # 2 OpenRouter) × до VERIFY_MAX_ATTEMPTS(8) попыток verify по
+    # VERIFY_TIMEOUT_SECS(30) = до 28 мин только на верификацию, плюс листинг
     # (быстрее — по одному вызову на стратегию). 45 мин — запас на
     # checkout/pytest/guard сверх худшего случая.
     timeout-minutes: 45

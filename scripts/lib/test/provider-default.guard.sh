@@ -138,7 +138,10 @@ while IFS= read -r f; do
         # ПОЛУЧЕННОГО живым /v1/models каталога, не дефолт-провайдер класса
         # #153: ничего из этого списка не подставляется как активный
         # провайдер/модель, список только выбирает лучший id из чужого ответа.
-        case "$content" in *'"deepseek-v3"'*|*'"nemotron-ultra"'*|*'"nemotron-super"'*) continue ;; esac
+        case "$content" in \
+          *'"nemotron-3-ultra"'*|*'"nemotron-ultra"'*|*'"nemotron-3-super"'*|*'"nemotron-super"'*| \
+          *'"glm-5"'*|*'"glm-4"'*) continue ;; \
+        esac
       fi
       literal_hits="$literal_hits$f:$line
 "

@@ -73,27 +73,54 @@ DSH_CI_SH = REPO_ROOT / "scripts" / "lib" / "dsh-ci.sh"
 # используется только внутри discover_route() ниже, ничего не патчит и не
 # подставляется как provider chain сам по себе). Аллоулист гвардии —
 # scripts/lib/test/provider-default.guard.sh, блок "provider_model_discovery.py".
+# Живой прогон #848 (run 34414822151) показал: НИ ОДНА строка вида
+# "deepseek-v3"/"nemotron-ultra" не встречается в реальных каталогах —
+# NVIDIA NIM и Ollama Cloud сегодня отдают "deepseek-v4-flash-0731",
+# "nemotron-3-ultra", "kimi-k2.7-code", "gpt-oss:120b", "glm-5.3" и т.п.:
+# версия в имени модели дрейфует у ВСЕХ вендоров, не только у нашего
+# провайдера (тот же класс, что и весь #848/#798). Ключи ниже НАМЕРЕННО
+# версионно-обобщённые там, где это возможно ("deepseek-v" без цифры — не
+# триггерит литеральный паттерн гвардии deepseek-v[0-9], и совпадает с v3/
+# v4/v5…), а не переиспользуют старые точные версии — но это ВСЁ РАВНО
+# только шорт-лист для живой верификации ниже, не источник истины.
 CODING_RANK_KEYWORDS = (
     "deepseek-r1",
-    "deepseek-v3",
+    "deepseek-v",
     "deepseek-chat",
     "deepseek-coder",
     "qwen3-coder",
+    "qwen3.5",
     "qwen3-235b",
     "qwen3-32b",
     "qwen2.5-coder",
+    "qwen3",
     "llama-3.3-70b",
     "llama-3.1-405b",
+    "nemotron-3-ultra",
     "nemotron-ultra",
+    "nemotron-3-super",
     "nemotron-super",
-    "kimi-k2",
     "gpt-oss-120b",
+    "gpt-oss:120b",
+    "gpt-oss",
+    "kimi-k3",
+    "kimi-k2",
+    "glm-5",
+    "glm-4",
+    "minimax-m3",
+    "minimax-m2",
+    "mistral-large",
     "mixtral-8x22b",
     "codestral",
 )
 
-VERIFY_MAX_ATTEMPTS = 5
-VERIFY_TIMEOUT_SECS = 60
+# Живая цена низкого VERIFY_MAX_ATTEMPTS=5 (найдено этим же прогоном): топ-5
+# ранжированных кандидатов NVIDIA NIM все дали 404 (каталог `/v1/models`
+# несёт модели, не все из которых реально обслуживаются на completions-пути
+# ЭТОГО ключа) — бюджет попыток поднят, чтобы верификация доходила до
+# рабочих моделей глубже в списке, а не сдавалась после первых неудачных.
+VERIFY_MAX_ATTEMPTS = 8
+VERIFY_TIMEOUT_SECS = 30
 VERIFY_PROMPT = "Ответь одним словом: OK."
 
 # Семейства, для которых discovery вообще имеет смысл (#848: NVIDIA-NIM,
@@ -257,7 +284,7 @@ def discover_listing(route: dict, key: str, transport=None) -> dict:
             ids, context_by_id = [], {}
         if ids:
             return {"strategy": strategy, "url": url, "ids": ids,
-                     "context_by_id": context_by_id, "note": "", "sample": ids[:25]}
+                     "context_by_id": context_by_id, "note": "", "sample": ids[:100]}
         notes.append(f"{strategy} ({url}): листинг пуст")
     return {"strategy": None, "url": None, "ids": [], "context_by_id": {},
              "note": "; ".join(notes) if notes else "нет стратегий листинга для этого семейства"}
@@ -305,7 +332,7 @@ def discover_route(route: dict, transport=None, measure=None) -> dict:
     result["listing_count"] = len(listing["ids"])
     result["listing_sample"] = listing.get("sample", listing["ids"][:25])
     print(f"листинг {route['display_name']} ({result['strategy']}, {result['listing_count']} шт., "
-          f"первые 25): {result['listing_sample']}")
+          f"первые 100): {result['listing_sample']}")
     if not listing["ids"]:
         result.update({"recommended": None, "verified_model": None, "verified": False,
                         "attempts": [], "note": listing["note"]})
