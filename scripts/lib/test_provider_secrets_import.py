@@ -903,7 +903,7 @@ def test_render_report_shows_models_section_by_secret(monkeypatch, export_path, 
     selection = psi.select_accounts(accounts, routes, probe_results=probe_results)
     report = psi.render_report(
         selection, {}, "не проверялась", False, "2026-08-25 (дата из имени файла)",
-        no_probe=False, probe_results=probe_results, existing_secrets=set(),
+        no_probe=False, probe_results=probe_results, existing_secrets=set(), repo="owner/repo",
     )
     assert "Доступные id моделей" in report
     assert "NVIDIA_NIM_1_API_KEY" in report
