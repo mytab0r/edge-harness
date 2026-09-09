@@ -2608,6 +2608,31 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
             )
             continue
 
+        # Разрыв 2 (#779, самый дорогой из трёх — живой замер: три диспатча
+        # этой же функции по PR #711 за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z,
+        # весь бюджет эпохи на ОДНОМ отпечатке диффа): до этой строки функция
+        # проверяла гейт 1, наличие вердикта, порог возраста, кулдаун цепочки
+        # провайдеров, quota_exhausted и бюджет попыток — «летит ли прогон
+        # ЭТОГО PR прямо сейчас» в списке не было вовсе. Один и тот же
+        # предикат, что уже читают update_branch (AiReviewRunning выше) и
+        # ai_review.py::cmd_should_run (#399) — третьей копии не заводим.
+        # Проверка — ПЕРЕД самим диспатчем и ПЕРЕД маркер-комментарием
+        # AI_REVIEW_RETRY_MARKER: попытка (ai_review_retry_count) считается
+        # только по факту этого маркера, поэтому отказ здесь не тратит
+        # бюджет — следующий проход планировщика увидит тот же ai:failed и
+        # попробует снова, как только текущий прогон освободит счётчик
+        # активных (тот же газ, что у AiReviewRunning: чтение, разнесённое
+        # по времени).
+        active = review_labels.other_active_ai_review_runs(
+            repo, pull["number"], exclude_run_id=None, gh_func=gh)
+        if active:
+            run_ids = ", ".join(str(run.get("id")) for run in active)
+            observations.append(
+                f"⏳ PR #{pull['number']}: ai-review.yml уже летит (run {run_ids}) — "
+                "автоповтор не дублирую, попытка не потрачена"
+            )
+            continue
+
         gh(
             "-X", "POST", f"repos/{repo}/actions/workflows/ai-review.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[pr]={pull['number']}",

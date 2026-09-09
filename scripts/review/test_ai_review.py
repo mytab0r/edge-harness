@@ -909,11 +909,21 @@ def test_ai_review_gather_and_verdict_read_files_through_paginated_helper():
 # диффе (находка 1 вердикта ai-review PR #294) — проверяется именно то, что
 # подкоманда отвечает go=false, а не только что метка бы сохранилась ────────
 
-def _fake_gh_should_run(labels, comment_body, files):
-    """gh(url) с прод-формой трёх эндпоинтов, которые дёргает cmd_should_run:
-    pulls/{pr} (labels), pulls/{pr}/files?...&page=N (постранично),
-    issues/{pr}/comments?...&page=N (постранично)."""
+def _fake_gh_should_run(labels, comment_body, files, active_runs=None):
+    """gh(url) с прод-формой эндпоинтов, которые дёргает cmd_should_run:
+    занятость (actions/workflows/ai-review.yml/runs, #779 — теперь спрашивается
+    БЕЗУСЛОВНО, не только при workflow_dispatch), pulls/{pr} (labels),
+    pulls/{pr}/files?...&page=N (постранично), issues/{pr}/comments?...&page=N
+    (постранично). `active_runs=None` — по умолчанию прогон никого не находит
+    (прежнее поведение тестов ниже, которым занятость не предмет)."""
+    active_runs = active_runs if active_runs is not None else {"in_progress": [], "queued": []}
+
     def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
         if url == "repos/o/r/pulls/294":
             return {"labels": [{"name": name} for name in labels]}
         if url.startswith("repos/o/r/pulls/294/files"):
@@ -989,15 +999,135 @@ def test_cmd_should_run_prints_true_for_ai_failed_even_with_matching_fingerprint
     assert capsys.readouterr().out.strip() == "true"
 
 
+# ── #779, разрыв 1: событийный путь (workflow_run от pr-review) обязан
+# спрашивать «летит ли прогон» так же, как ручной workflow_dispatch —
+# сценарии ниже прогоняются БЕЗ GITHUB_EVENT_NAME=workflow_dispatch, то есть
+# именно по событийному пути (manual=False внутри cmd_should_run) ───────────
+
+def test_cmd_should_run_event_path_denied_when_run_already_active(monkeypatch, capsys):
+    # До фикса (#779) событийный путь не спрашивал other_active_ai_review_runs
+    # вовсе — эта же занятость (найденная тестом манульного пути) молча
+    # проходила бы для workflow_run и дублировала дорогой прогон.
+    calls: list[str] = []
+
+    def fake_gh(url: str):
+        calls.append(url)
+        if "actions/workflows/ai-review.yml/runs" in url:
+            if "status=in_progress" in url:
+                return {"workflow_runs": [
+                    {"id": 888, "display_title": "ai-review PR #294",
+                     "status": "in_progress", "html_url": "https://x/888"},
+                ]}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость обязана отклонить дубль раньше сверки отпечатка: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # событийный путь
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "false"
+    # Причина отказа — «дубль», не «дифф не изменился» и не текст ручного
+    # пути (нет упоминания force — событийный путь ничего не запускал руками).
+    assert "дубль" in out.err
+    assert "888" in out.err
+    assert "force" not in out.err
+    assert all("actions/workflows" in c for c in calls)
+
+
+def test_cmd_should_run_event_path_other_pr_active_run_does_not_block(monkeypatch, capsys):
+    # Летящий прогон ДРУГОГО PR не должен мешать этому — фильтр по PR уже
+    # доказан на уровне other_active_ai_review_runs, здесь — интеграционно.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    active_runs = {"in_progress": [
+        {"id": 999, "display_title": "ai-review PR #400", "status": "in_progress"},
+    ], "queued": []}
+    fake_gh = _fake_gh_should_run(["review:ok"], "", files, active_runs=active_runs)
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_cmd_should_run_ai_failed_active_run_denied_no_model_call(monkeypatch, capsys):
+    # #779, разрыв 4: ai:failed + отпечаток совпал + прогон летит — повтор
+    # НЕ уходит (в отличие от test_cmd_should_run_prints_true_for_ai_failed_
+    # even_with_matching_fingerprint, где активных прогонов нет). Занятость
+    # проверяется раньше и независимо от should_run_ai_review — календарь
+    # звонков к pulls/files/comments не достигается вовсе.
+    active_runs = {"in_progress": [
+        {"id": 777, "display_title": "ai-review PR #294", "status": "in_progress"},
+    ], "queued": []}
+
+    def fake_gh(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            for status, runs in active_runs.items():
+                if f"status={status}" in url:
+                    return {"workflow_runs": runs}
+            return {"workflow_runs": []}
+        raise AssertionError(f"занятость обязана отказать раньше сверки ai:failed/отпечатка: {url}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "false"
+
+
+def test_cmd_should_run_ai_failed_previous_retry_finished_allows_new_attempt(monkeypatch, capsys):
+    # #779, разрыв 4 (обратная ветка мутации выше): ai:failed + отпечаток
+    # совпал, но летящих прогонов НЕТ (прошлый повтор уже завершился) —
+    # повтор ОБЯЗАН уйти, иначе восстановление после реального сбоя
+    # провайдера молча сломано.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+    comment = f"pr: 294\nhead: deadbeef\nreviewer: error\ndiff: {fp}\n\nошибка.\n"
+    fake_gh = _fake_gh_should_run(["review:ok", "ai:failed"], comment, files,
+                                   active_runs={"in_progress": [], "queued": []})
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    rc = ai.cmd_should_run(argparse.Namespace(pr=294))
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_event_dispatch_duplicate_reason_names_run_and_does_not_mention_force():
+    other_run = {"id": 888, "status": "queued", "html_url": "https://x/888"}
+    text = ai.event_dispatch_duplicate_reason(294, other_run)
+    assert "PR #294" in text
+    assert "888" in text
+    assert "дубль" in text
+    assert "force" not in text  # событийный путь ничего не запускал руками
+
+
 # ── --force (workflow_dispatch, находка 1 вердикта ai-review PR #294):
 # ручной повтор не должен глохнуть на неизменном отпечатке диффа ────────────
 
 def test_cmd_should_run_force_skips_fingerprint_check_no_network_call(monkeypatch, capsys):
-    def gh_must_not_be_called(url: str):
+    # #779: занятость проверяется ДАЖЕ при --force (force не пробивает
+    # летящий прогон, см. test_cmd_should_run_manual_dispatch_force_does_not_
+    # bypass_busy_check) — единственный сетевой вызов, который --force
+    # обязан пропускать, это сверка ОТПЕЧАТКА, не проверка занятости.
+    def gh_only_busy_check(url: str):
+        if "actions/workflows/ai-review.yml/runs" in url:
+            return {"workflow_runs": []}
         raise AssertionError(
             f"--force обязан пропускать сверку отпечатка без обращения к сети, а вызвал gh({url!r})")
 
-    monkeypatch.setattr(ai, "gh", gh_must_not_be_called)
+    monkeypatch.setattr(ai, "gh", gh_only_busy_check)
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
 
     # PR с окончательным вердиктом и неизменным отпечатком — без --force это

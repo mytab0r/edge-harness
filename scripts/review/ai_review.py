@@ -818,11 +818,18 @@ def cmd_gather(args: argparse.Namespace) -> int:
 # ai-review.yml просит --force, только если ручной запуск явно нёс
 # input force: true (default false) — не любой workflow_dispatch. Без него
 # ручной запуск проходит ТУ ЖЕ сверку, что и автоматический
-# (review_labels.should_run_ai_review), плюс дополнительную гонку «прогон
-# уже идёт прямо сейчас» (review_labels.other_active_ai_review_runs) — её
-# автоматический путь не нуждается в проверке (свой прогон на run_id
-# сериализован concurrency-группой), а ручной может выстрелить поверх уже
-# летящего.
+# (review_labels.should_run_ai_review), плюс гонку «прогон уже идёт прямо
+# сейчас» (review_labels.other_active_ai_review_runs) — теперь для ОБОИХ
+# путей триггера (#779, разрыв 1). Раньше эту гонку спрашивал только ручной
+# путь в предположении «автоматический прогон сериализован своей
+# concurrency-группой» — предположение оказалось неверным: группа событийного
+# пути — id породившего рана pr-review (github.event.workflow_run.id),
+# уникальный на КАЖДОЕ событие, значит два разных pr-review-события одного и
+# того же PR попадают каждое в свою группу и НЕ сериализуются вовсе (замер
+# issue #779: 20 событийных прогонов пересеклись по времени с другим
+# событийным прогоном того же PR за одни сутки). Правка ключа группы —
+# отдельный вопрос (issue #779 целиком, критерии 1-2: выбор между отменой и
+# очередью), эта правка про число прогонов, а не про их упорядочение.
 
 def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
     """Текст отказа: на PR #pr уже идёт другой прогон ai-review.yml прямо
@@ -835,6 +842,34 @@ def manual_dispatch_busy_reason(pr: int, other_run: dict) -> str:
         f"{other_run.get('status', '?')}){where} — второй прогон параллельно "
         "ничего не даст. Дождитесь его завершения; принудительно запустить "
         "поверх летящего прогона нельзя даже через force: true."
+    )
+
+
+def event_dispatch_duplicate_reason(pr: int, other_run: dict) -> str:
+    """Текст короткого замыкания событийного прогона (workflow_run от
+    pr-review) — не «отказ» владельцу (событийный путь никто не просил
+    руками), а факт в лог: этот прогон — ДУБЛЬ уже летящего прогона того же
+    PR, а не расхождение по содержимому диффа. Причина названа отдельным
+    текстом от manual_dispatch_busy_reason (адресат разный: там — предупреждение
+    тому, кто дёрнул workflow_dispatch, здесь — только след в логе job'а) и
+    отдельным от manual_dispatch_skip_reason (та — «дифф не изменился»,
+    другая причина того же go=false; AGENTS.md «алерт не гадает» — читатель
+    обязан отличить «дубль» от «код уже видели»).
+
+    Разрыв 1 (#779): до этой правки событийный путь (`workflow_run` от
+    pr-review) вообще не спрашивал `other_active_ai_review_runs` — только
+    workflow_dispatch. 68 из 134 прогонов ai-review.yml за сутки (замер
+    2026-09-08) шли именно этим путём и ни один дубль на нём не отклонялся.
+    Событийный прогон, в отличие от ручного, уже СОЗДАН GitHub'ом — отменить
+    его нельзя, можно только замкнуть коротко без вызова модели, ровно так
+    же, как cmd_should_run уже делает для ручного пути."""
+    url = other_run.get("html_url")
+    where = f" ({url})" if url else ""
+    return (
+        f"::notice::прогон PR #{pr} останавливается без вызова модели: другой "
+        f"прогон ai-review.yml для этого же PR уже идёт (run {other_run.get('id')}, "
+        f"статус {other_run.get('status', '?')}){where} — это дубль, а не "
+        "расхождение по содержимому диффа. Вердикт вынесет прогон, который уже летит."
     )
 
 
@@ -867,21 +902,45 @@ def manual_dispatch_skip_reason(pr: int, current_labels, ai_comment: dict | None
 
 def cmd_should_run(args: argparse.Namespace) -> int:
     manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-    if manual:
-        # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО
-        # --force: второй одновременный прогон того же PR бессмыслен
-        # независимо от того, хочет ли владелец пересмотра того же диффа
-        # (manual_dispatch_busy_reason это и объявляет: force не пробивает
-        # занятость). Заодно ловит PR без вердикта (первое ревью) —
-        # should_run_ai_review ниже честно вернул бы True, хотя параллельный
-        # прогон того же PR уже летит (#399).
-        repo = os.environ["GITHUB_REPOSITORY"]
-        active = review_labels.other_active_ai_review_runs(
-            repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
-        if active:
+    # Гонка «прогон уже идёт прямо сейчас» — проверяется ПЕРВОЙ, ДО --force
+    # и ДО сверки отпечатка, для ОБОИХ путей триггера (#779, разрыв 1: до
+    # этой правки предикат спрашивался только при workflow_dispatch —
+    # событийный путь, workflow_run от pr-review, 68 из 134 прогонов за
+    # сутки в замере 2026-09-08, не спрашивал его никогда). Один и тот же
+    # предикат (review_labels.other_active_ai_review_runs), что уже читают
+    # scheduler.update_branch и scheduler.trigger_ai_review — второй копии
+    # не заводим.
+    #
+    # Разница исходов между путями — не только текст лога: ручной путь ещё
+    # НЕ создал прогон, отказ здесь означает «не тратить деньги вовсе»
+    # (manual_dispatch_busy_reason). Событийный прогон GitHub уже СОЗДАЛ —
+    # отменить его нельзя, только замкнуть коротко без вызова модели
+    # (event_dispatch_duplicate_reason) — тот же газ, что и у ручного пути,
+    # но другая причина отказа: «дубль» (этот раздел), не «дифф не
+    # изменился» (manual_dispatch_skip_reason ниже, другая причина того же
+    # go=false — читатель обязан их различать, AGENTS.md «алерт не гадает»).
+    #
+    # Разрыв 4 (#779): для ai:failed should_run_ai_review ниже возвращает
+    # True БЕЗУСЛОВНО (газ автоповтора #196 не должен зависеть от того,
+    # менялся ли дифф) — именно поэтому активность прогона обязана
+    # проверяться РАНЬШЕ и НЕЗАВИСИМО от фингерпринта, а не встраиваться в
+    # саму функцию отпечатка (`should_run_ai_review` не принимает и не
+    # обязана принимать «летит ли прогон» — второй предикат внутри неё был
+    # бы третьей копией). С этой проверкой выше по стеку эффективное правило
+    # для ai:failed становится «нужен повтор, если прогона сейчас не летит»
+    # — один повтор на живой отпечаток, не три подряд (живой замер PR #711
+    # в issue #779): следующий повтор возможен, только когда текущий
+    # действительно завершился (успехом, ошибкой или отменой).
+    repo = os.environ["GITHUB_REPOSITORY"]
+    active = review_labels.other_active_ai_review_runs(
+        repo, args.pr, os.environ.get("GITHUB_RUN_ID", ""), gh)
+    if active:
+        if manual:
             print(manual_dispatch_busy_reason(args.pr, active[0]), file=sys.stderr)
-            print("false")
-            return 0
+        else:
+            print(event_dispatch_duplicate_reason(args.pr, active[0]), file=sys.stderr)
+        print("false")
+        return 0
     if getattr(args, "force", False):
         # Осознанный ручной повтор (не занят — проверено выше) не заходит в
         # сеть дальше: решение не зависит от отпечатка диффа, а необращение к
@@ -889,7 +948,6 @@ def cmd_should_run(args: argparse.Namespace) -> int:
         # (test_cmd_should_run_force_skips_fingerprint_check_no_network_call).
         print("true")
         return 0
-    repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
     current_labels = {label["name"] for label in pull["labels"]}
     files = review_labels.list_pr_files(repo, args.pr, gh)

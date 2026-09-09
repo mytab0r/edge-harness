@@ -998,6 +998,60 @@ def test_trigger_ai_review_dispatches_on_ai_failed(monkeypatch):
     assert any("178" in line for line in (observations + actions))
 
 
+def test_trigger_ai_review_skips_dispatch_when_run_already_active_no_attempt_spent(monkeypatch):
+    # #779, разрыв 2 (самый дорогой из трёх — живой замер PR #711: три
+    # диспатча за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z, весь бюджет эпохи
+    # на одном отпечатке диффа). До этой правки trigger_ai_review проверял
+    # гейт 1, наличие вердикта, порог возраста, кулдаун цепочки, quota_exhausted
+    # и бюджет попыток — «летит ли прогон этого PR прямо сейчас» в списке не
+    # было. Диспатч не должен уходить, а АТТЕМПТ (маркер AI_REVIEW_RETRY_MARKER,
+    # который и считает ai_review_retry_count) не должен тратиться — иначе
+    # следующий проход увидел бы попытку исчерпанной за прогон, которого не было.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    running_title = sch.review_labels.ai_review_run_name(711)
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [{"id": 34278765696, "display_title": running_title, "status": "in_progress"}],
+        },
+        "ai-review.yml/dispatches": AssertionError("дубль не должен диспатчиться, пока прогон летит"),
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    now = utc(2026, 9, 8, 21, 10, 30)  # порог (30 мин) прошёл
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("ai-review.yml/dispatches" in c for c in fake.calls)
+    # Маркер попытки не публикуется — attempts не растёт для следующего прохода.
+    assert posted == []
+    assert not actions
+    assert any("711" in line and "летит" in line for line in observations)
+
+
+def test_trigger_ai_review_dispatches_when_no_active_run_mutation_companion(monkeypatch):
+    # Мутация к тесту выше: то же самое PR/состояние, но БЕЗ активного
+    # прогона — диспатч обязан уйти как раньше. Доказывает, что новая
+    # проверка не тормозит легитимный автоповтор, когда прогон реально не летит.
+    p = pull(711, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha711/statuses": gate1_status("2026-09-08T20:30:00Z"),
+        "issues/711/comments": [],
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 21, 10, 30)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+    assert any("711" in line for line in (observations + actions))
+
+
 def ai_failed_comment(reset_hint: str, verdict: str = "error"):
     """Прод-форма комментария-вердикта AI-ревью (ai_review.build_comment,
     #727) от доверенной учётки — шапка несёт `reviewer:`/`reset-at:`,
