@@ -1874,6 +1874,16 @@ def test_other_active_ai_review_runs_naive_created_at_does_not_crash():
     # падал бы целиком. Прод-формой Actions API недостижимо (там всегда
     # "Z"), но except обязан ловить оба класса, раз докстринг обещает
     # «битую строку» шире одного ValueError.
+    #
+    # `now=` передан явно (класс #802, живая тест-бомба: без этого параметра
+    # предикат сравнивает литеральный `created_at` с РЕАЛЬНЫМ временем прогона
+    # — тест был зелёным только в узком окне AI_REVIEW_TIMEOUT_MINUTES после
+    # написания и стал НАВСЕГДА красным, как только настенное время ушло
+    # дальше; красный прогон — PR #799, job `test`, run 34317920333). Тот же
+    # паттерн, что уже использует сосед выше по файлу — фиксированный `now`,
+    # близкий к литералу `created_at`, а не время самого прогона.
+    now = datetime(2026, 9, 9, 3, 5, tzinfo=timezone.utc)
+
     def fake_gh(url: str):
         if "status=in_progress" in url:
             return {"workflow_runs": [
@@ -1882,7 +1892,7 @@ def test_other_active_ai_review_runs_naive_created_at_does_not_crash():
             ]}
         return {"workflow_runs": []}
 
-    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh)
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh, now=now)
 
     assert {m["id"] for m in matches} == {111}
 
