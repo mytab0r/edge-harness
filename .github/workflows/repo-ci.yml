@@ -921,6 +921,15 @@ jobs:
       - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
         run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
 
+      # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — независимо от
+      # suite/PLUGINS_SUITE_URL: без секретов пул не подключается (сеть не
+      # трогается), импорт секрета прод-кодом плагина кладёт корректный файл
+      # аккаунта И вычищает секрет из окружения (доверенная граница ai-review,
+      # #18 — ANTHROPIC_OAUTH_1/2 не подпадают под паттерн вырезания *_KEY/
+      # *_TOKEN/*_SECRET), пул первым/цепочка фоллбэком не ломает атрибуцию.
+      - name: Гвардия быстрого провайдера Claude anthropic-oauth-pool (#838)
+        run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
+
       # Манифест использования LLM-провайдеров (#823, openspec/changes/
       # llm-provider-usage-manifest): dsh_require_provider_chain "<id>"
       # резолвит цепочку из config/provider-usage.json по id потребителя
