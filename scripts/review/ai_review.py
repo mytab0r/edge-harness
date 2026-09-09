@@ -248,12 +248,22 @@ def parse_verdict(answer: str) -> str:
 
 
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
-                  reset_hint: str = "") -> str:
-    """Причина verdict=error — теперь ЧЕТЫРЕ состояния, не смешиваемые в одно
+                  reset_hint: str = "", empty_rework: bool = False) -> str:
+    """Причина verdict=error — теперь ПЯТЬ состояний, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
     транспортного отказа — «лимита нет вовсе» от «лимит есть, но сломано
     что-то другое», правило AGENTS.md).
+
+    empty_rework — #210: cmd_verdict уже определил (rework_without_findings),
+    что модель поставила ВЕРДИКТ: rework, но не привела НИ ОДНОЙ находки ни в
+    одной из трёх категорий (прозы, блока ЗАДАЧА, блока ЗАМЕЧАНИЕ) — живой
+    случай, PR #206, run 33656180906: весь ответ модели — `ВЕРДИКТ: rework\\n`.
+    Это ОТДЕЛЬНАЯ причина от двух веток verdict_line_present ниже: строка
+    «ВЕРДИКТ: …» здесь ЕСТЬ и однозначна (иначе parse_verdict вернул бы error
+    раньше и cmd_verdict не дошёл бы до этой проверки) — путать с «строки нет»
+    или «неоднозначна» значило бы соврать читателю о причине (AGENTS.md,
+    «алерт не гадает»).
 
     Классификация (порядок проверки, приоритет между причинами) — ЕДИНСТВЕННО
     в review_labels.reason_tag (находка ревью #439: раньше порядок был
@@ -309,6 +319,18 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
     сообщение честно называет «дата неизвестна», не гадает (AGENTS.md,
     «алерт не гадает»).
     """
+    # empty_rework (#210) проверяется РАНЬШЕ всего остального: это причина,
+    # известная cmd_verdict ДО обращения к failure_reason/dsh_rc вовсе (в
+    # этом сценарии DSH успешно ответил, dsh_rc=0, failure_reason пуст) — не
+    # часть оси quota/rate-limit/transport/contract, которую делит
+    # review_labels.reason_tag ниже, а отдельная, более конкретная причина в
+    # рамках того же тега FAILURE_REASON_CONTRACT (см. докстринг).
+    if empty_rework:
+        return ("модель поставила ВЕРДИКТ: rework, но не привела ни одной "
+                "находки — ни прозой, ни блоком ЗАДАЧА, ни блоком ЗАМЕЧАНИЕ "
+                "(ai_prompt.md требует хотя бы одну причину при rework, иначе "
+                "ставь approve) — автор PR не получил бы ни одного сигнала, "
+                "что чинить (#210)")
     # empty_diff/diff_source_mismatch/all_providers_exhausted (#658/#687/#727)
     # — причины БЕЗ обращения к модели вовсе (cmd_gather решил их заранее) или
     # вне оси quota/rate-limit/transport/contract, которую делит review_labels.
@@ -367,6 +389,28 @@ def verdict_line_present(answer: str) -> bool:
     меняется, это чисто текст для человека."""
     lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
     return any(VERDICT_RE.match(line) for line in lines)
+
+
+def rework_without_findings(verdict: str, findings: str, tasks: list[dict],
+                             remarks: list[dict]) -> bool:
+    """rework без единой находки — нарушение контракта (#210), не валидный
+    `ai:changes-requested`. Живой случай: PR #206, run 33656180906 — весь
+    ответ модели `ВЕРДИКТ: rework\\n`, ни одной находки ни в одной из трёх
+    категорий, PR встал с пустым комментарием — ни автор, ни воркер не знали,
+    что чинить.
+
+    Проверяется здесь, а не внутри parse_verdict: та функция размечает
+    ТОЛЬКО машиночитаемую строку вердикта — свой узкий контракт (см. её
+    докстринг, «Единственный сигнал…»); полнота rework — другой вопрос,
+    зависящий от findings/tasks/remarks, которые cmd_verdict уже парсит
+    отдельно (parse_tasks/findings_of/review_checklist.parse_remarks) — второй
+    разбор answer здесь не нужен, одно место правды остаётся в cmd_verdict,
+    который вызывает эту функцию с уже готовыми тремя категориями.
+
+    approve с нулём находок НЕ считается нарушением — одобрение без замечаний
+    норма (issue #210, раздел «Не задача этой issue»): проверка условная на
+    verdict == "rework", approve сюда не попадает."""
+    return verdict == "rework" and not findings.strip() and not tasks and not remarks
 
 
 # ── Размерный гейт: газ к тормозу review:large (#204) ─────────────────────────
@@ -1069,11 +1113,22 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
 
-    # Причина «error» — вычисляется ДО комментария: четыре разных состояния
+    # rework без единой находки — нарушение контракта (#210), не валидный
+    # ai:changes-requested: см. докстринг rework_without_findings. Проверяется
+    # ПОСЛЕ финальной фильтрации tasks/remarks (пустые заголовки уже отброшены
+    # выше) и ДО решения о причине error ниже — empty_rework прокидывается в
+    # error_reason как отдельная, более точная причина, а не через общую
+    # ветку verdict_line_present (строка вердикта здесь ЕСТЬ и однозначна).
+    empty_rework = rework_without_findings(verdict, findings, tasks, remarks)
+    if empty_rework:
+        verdict = "error"
+
+    # Причина «error» — вычисляется ДО комментария: пять разных состояний
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
     # ошибка провайдера не должна выглядеть как «модель ответила криво», а
     # временный RATE_LIMIT — как настоящая поломка, #419).
-    reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint)
+    reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint,
+                            empty_rework=empty_rework)
               if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason

@@ -111,6 +111,37 @@ def test_verdict_line_present_distinguishes_absent_from_ambiguous(answer, expect
     assert ai.verdict_line_present(answer) is expected
 
 
+# ── rework без единой находки — нарушение контракта (#210) ───────────────────
+
+def test_rework_without_findings_true_when_all_three_categories_empty():
+    # прод-форма PR #206, run 33656180906: весь ответ модели — строка вердикта
+    assert ai.rework_without_findings("rework", "", [], []) is True
+
+
+def test_rework_without_findings_false_with_prose_finding():
+    assert ai.rework_without_findings("rework", "Находка одна: файл X.", [], []) is False
+
+
+def test_rework_without_findings_false_with_task_block():
+    tasks = [{"title": "Что-то", "body": "тело", "scope": "хвост"}]
+    assert ai.rework_without_findings("rework", "", tasks, []) is False
+
+
+def test_rework_without_findings_false_with_remark_block():
+    remarks = [{"title": "Замечание", "body": "тело"}]
+    assert ai.rework_without_findings("rework", "", [], remarks) is False
+
+
+def test_rework_without_findings_approve_never_flagged():
+    # Одобрение без замечаний — норма (#210, «Не задача этой issue»), не
+    # нарушение контракта, даже с пустыми findings/tasks/remarks.
+    assert ai.rework_without_findings("approve", "", [], []) is False
+
+
+def test_rework_without_findings_error_never_flagged():
+    assert ai.rework_without_findings("error", "", [], []) is False
+
+
 # ── Блоки задач в беклог ───────────────────────────────────────────────────────
 
 def test_parse_tasks_two_blocks():
@@ -491,6 +522,25 @@ def test_error_reason_transport_failure_wins_over_line_check():
     # что-то похожее на строку вердикта — транспорт упал раньше любого текста.
     reason = ai.error_reason("ВЕРДИКТ: approve", "1")
     assert "ошибка провайдера" in reason
+
+
+def test_error_reason_empty_rework_names_the_contract_violation():
+    # #210, прод-форма PR #206/33656180906: rc=0, строка ВЕРДИКТ есть и
+    # однозначна — это НЕ «строки нет» и НЕ «не единственная/не последняя»,
+    # текст обязан называть настоящую причину, а не одну из двух других веток.
+    reason = ai.error_reason("ВЕРДИКТ: rework", "0", empty_rework=True)
+    assert "не привела ни одной находки" in reason
+    assert "не единственная" not in reason
+    assert "не последняя" not in reason
+    assert "нет вообще" not in reason
+
+
+def test_error_reason_empty_rework_takes_priority_over_line_present_branches():
+    # empty_rework=True обязан выигрывать даже если по какой-то причине вызван
+    # с ответом, где verdict_line_present вернул бы другое значение — источник
+    # истины про «была ли причина в ответе» здесь один параметр, не догадка.
+    reason = ai.error_reason("что угодно", "0", empty_rework=True)
+    assert "не привела ни одной находки" in reason
 
 
 # ── RATE_LIMIT: «лимита нет вовсе» vs «лимит есть, но что-то ещё сломано»
@@ -1565,6 +1615,62 @@ def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
     status_calls = _status_calls(run_gh_calls)
     assert len(status_calls) == 1
     assert "state=failure" in " ".join(status_calls[0])
+
+
+def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):
+    """Гвардия #210: прод-форма PR #206, run 33656180906 — ответ модели
+    целиком `ВЕРДИКТ: rework\\n`, ни одной находки. Раньше это ставило
+    ai:changes-requested с пустым телом (автор не знает, что чинить); теперь
+    обязано уйти как ai:failed с причиной-контрактом, тем же путём, что и
+    любой другой формат-сбой (авто-повтор #196).
+
+    Мутация: убрать вызов rework_without_findings/строку `if empty_rework:
+    verdict = "error"` из cmd_verdict — тест краснеет (rc становится 0,
+    метка — ai:changes-requested)."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "ВЕРДИКТ: rework\n"))
+
+    assert rc == 1  # fail loud — тот же исход, что и любой другой contract-error
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert f"labels[]={ai.AI_CHANGES}" not in joined, joined
+    assert f"labels[]={ai.AI_FAILED}" in joined, joined
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "error"
+    assert facts["reason"] == rl.FAILURE_REASON_CONTRACT
+    assert "не привела ни одной находки" in body
+
+
+def test_cmd_verdict_rework_with_finding_stays_changes_requested(monkeypatch, tmp_path):
+    """Контроль к предыдущему тесту: rework С хотя бы одной находкой (прозой)
+    остаётся валидным ai:changes-requested, не становится error."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(
+        tmp_path, "Находка: файл a.py делает лишнее.\nВЕРДИКТ: rework"))
+
+    assert rc == 0
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert f"labels[]={ai.AI_CHANGES}" in joined, joined
+    assert f"labels[]={ai.AI_FAILED}" not in joined, joined
+    body = _comment_call(run_gh_calls)
+    facts = ai.header_facts(body)
+    assert facts["reviewer"] == "rework"
 
 
 def test_cmd_verdict_posts_pending_status_on_transport_error_not_failure(monkeypatch, tmp_path):
