@@ -407,6 +407,14 @@ jobs:
         with:
           node-version: 24
 
+      # pnpm нужен dsh plugin add (монтаж anthropic-oauth-pool, #838, тот же
+      # класс, что #83 — dsh plugin add без pnpm падает; шаг уже есть у
+      # worker.yml/hands.yml, здесь был пропущен — issue #842).
+      - if: steps.fingerprint.outputs.go == 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
       - if: steps.fingerprint.outputs.go == 'true'
         id: gather
         name: Сбор фактов и промпт (доверенный шаг)
