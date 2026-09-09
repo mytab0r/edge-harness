@@ -1,0 +1,64 @@
+# Бенчмарк латентности провайдеров-кандидатов цепочки ai-review (issue #836).
+#
+# Повод: гейт ai-review держит вердикт 30+ минут, очередь PR не сливается.
+# Гипотеза владельца — первый провайдер vars.DSH_PROVIDER_CHAIN (см.
+# docs/runbooks/switch-llm-provider.md) самый медленный, остальные могут
+# отвечать быстрее. Порядок цепочки сегодня переставлен по доступности
+# квоты (см. врез в раннбуке), не по латентности — этот workflow снимает
+# число живым вызовом, а не гадает.
+#
+# Секреты нужны все сразу (как и у самой цепочки, dsh_run_with_provider_chain
+# в scripts/lib/dsh-ci.sh) — по одному замеру на каждого провайдера-кандидата
+# в один прогон, а не по одному прогону на провайдера. Значения ключей и
+# тела ответов провайдеров НИКОГДА не печатаются (scripts/measure/
+# provider_latency.py) — наружу уходят только числа/статусы.
+#
+# workflow_dispatch — повторно запускаемый вручную, без расписания:
+# by-demand замер (тот же принцип, что quotas.yml), а не постоянный
+# мониторинг — если понадобится регулярный прогон, добавить cron отдельным
+# решением, не тихой мутацией этого файла.
+name: provider-latency-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Промпт для замера (по умолчанию — короткий фиксированный)"
+        required: false
+        type: string
+      timeout_secs:
+        description: "Таймаут на КАЖДЫЙ вызов провайдера, секунд (по умолчанию 180)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Тесты разбора латентности/успеха/таймаута (без сети, фейковый transport)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/measure/test_provider_latency.py -q
+
+      - name: Гвардия дефолта провайдера/модели (класс #153) на новых файлах
+        run: bash scripts/lib/test/provider-default.guard.sh
+
+      - name: Замер латентности живым вызовом
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PROVIDER_LATENCY_PROMPT: ${{ github.event.inputs.prompt }}
+          PROVIDER_LATENCY_TIMEOUT_SECS: ${{ github.event.inputs.timeout_secs }}
+        run: python scripts/measure/provider_latency.py
