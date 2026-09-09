@@ -106,6 +106,15 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      проверяется — судить не о чем. Живой замер на день внедрения — 1
      нарушение (#679, kind=stale) — поэтому наблюдательный, не гейтящий (см.
      CI_GATING ниже и условие возврата в GATING_RELEASE_CONDITION[9]).
+  10. check_recurring_worker_failure (#794) — N подряд прогонов worker.yml
+      упали с ОДНОЙ и той же классифицированной причиной (по факту лога,
+      pulse_guard.last_error_log_line, не по гипотезе). Класс, который
+      failure_watch не ловит по построению (окно свежести 30 минут и дедуп
+      «одна задача на класс», не «сколько раз подряд за много часов») —
+      живой случай: 9 прогонов подряд на сессии harness-257 за 18 часов
+      (порча записи журнала без message.id, #480/#794). Наблюдательный, не
+      гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
+      PR (см. блок-комментарий у самой функции).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -1295,6 +1304,109 @@ def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
     return task_deps.fetch_pool(repo, label=TASK_LABEL, include_body=True, gh_call=gh)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 10 (#794): N ПОДРЯД прогонов worker.yml провалились с ОДНОЙ и той
+# же классифицированной причиной — класс, который failure_watch (pulse_guard)
+# не ловит по построению: её окно свежести — FAILURE_WATCH_WINDOW_MINUTES (30
+# минут) и дедуп «одна задача на класс, пока не закрыта», а не «сколько раз
+# подряд повторилось за много часов». Дважды упавший предохранитель одного и
+# того же класса на живом инциденте (#794): worker.yml падал девять прогонов
+# подряд на сессии harness-257 с 2026-09-08 08:45Z по 2026-09-09 02:08Z
+# (18 часов) — «стороживший сторожа» pulse_guard.decide_gate_state сам ставит
+# паузу и шлёт первый алерт с фактом (last_failure_error) уже на третьем
+# провале (WORKER_FAILURE_PAUSE_AFTER), но дальше молчит между пробами с
+# растущей выдержкой (probe_backoff_minutes) — та же причина тянется часами
+# без НОВОГО, видимого в отчёте repo_invariants (репо-ci.yml/orchestra.yml)
+# факта «серия всё ещё не разобрана». Этот инвариант — не дублирует паузу
+# диспатча (decide_dispatch/decide_gate_state там же остаются единственным
+# местом правды на САМ подсчёт серии — count_consecutive_failures
+# переиспользуется, не копируется), а даёт этому же факту ВТОРУЮ поверхность,
+# не подверженную маркерному дедупу пульса: строку в build_report, которую
+# видит и repo-ci.yml на каждом PR, и периодический шаг orchestra.yml.
+#
+# Наблюдательный, не в CI_GATING: нарушение зависит от истории прогонов
+# worker.yml, не от диффа текущего PR — гейтить им PR означало бы красить
+# чужой PR за чужую, уже идущую серию (тот же класс «тормоз без газа», что
+# уже отвёл 1/4/5/9 от немедленного гейта, см. докстринг модуля).
+# ══════════════════════════════════════════════════════════════════════════
+
+RECURRING_FAILURE_WORKFLOW = pulse_guard.WORKER_WORKFLOW  # "worker.yml" — резюмирует сессию harness-<N>, не чужой workflow
+# Тот же порог, что уже красит предохранитель диспатча (pulse_guard.
+# WORKER_FAILURE_PAUSE_AFTER) — не новое число без прецедента: если
+# диспатч-фьюз уже решил, что серия достаточно длинна для паузы, этот
+# инвариант обязан согласиться, не спорить своим порогом.
+RECURRING_FAILURE_STREAK_THRESHOLD = pulse_guard.WORKER_FAILURE_PAUSE_AFTER
+# Одна страница с запасом над порогом — тот же компромисс по цене API, что
+# уже держат FAILURE_WATCH_PER_PAGE/recent_runs(per_page=10) у соседей; серия
+# #794 длиной 9 всё ещё влезает с запасом.
+RECURRING_FAILURE_RUNS_TO_SCAN = 20
+
+
+def check_recurring_worker_failure(repo: str) -> list[dict]:
+    """Нарушение — RECURRING_FAILURE_STREAK_THRESHOLD или больше самых свежих
+    завершённых прогонов RECURRING_FAILURE_WORKFLOW подряд провалились
+    (pulse_guard.FAILURE_CONCLUSIONS) с ОДНИМ И ТЕМ ЖЕ классифицированным
+    отпечатком причины (pulse_guard.failure_fingerprint по первому упавшему
+    job'у, pulse_guard.last_error_log_line — тот же факт, не гипотеза, что уже
+    несёт last_failure_error). Первый success, первый незавершённый прогон
+    ИЛИ смена отпечатка обрывают серию — считаем именно «сколько подряд с
+    ОДНОЙ причиной», не просто «сколько подряд красных» (это число уже
+    отдельно считает pulse_guard.count_consecutive_failures для паузы
+    диспатча).
+
+    Дешёвый путь в здоровом состоянии: один запрос списка прогонов; если
+    первый же прогон не упал (обычный случай), функция возвращает [] без
+    единого запроса лога/job'а. Сеть недоступна/квота — best-effort: [] (тот
+    же принцип, что last_failure_error/last_error_log_line — отсутствие
+    детали не должно ронять весь build_report ради инварианта, у которого и
+    так нет действия ЖЁСТЧЕ наблюдения)."""
+    try:
+        runs = pulse_guard.recent_runs(repo, RECURRING_FAILURE_WORKFLOW, per_page=RECURRING_FAILURE_RUNS_TO_SCAN)
+    except RuntimeError:
+        return []
+    runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
+
+    streak_fingerprint: str | None = None
+    streak_job_name: str | None = None
+    streak_error_text: str | None = None
+    streak_runs: list[dict] = []
+    for run in runs:
+        if run.get("conclusion") not in pulse_guard.FAILURE_CONCLUSIONS:
+            break  # success/None — серия «подряд» обрывается здесь, не позже
+        try:
+            bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
+        except RuntimeError:
+            break  # деталь недоступна — честнее оборвать серию, чем гадать
+        if not bad_jobs:
+            break
+        job = bad_jobs[0]
+        job_id = job.get("id")
+        error_text = pulse_guard.last_error_log_line(repo, job_id) if job_id else None
+        if not error_text:
+            break  # без факта — не классифицируем (тот же принцип, что failure_watch)
+        fingerprint = pulse_guard.failure_fingerprint(
+            RECURRING_FAILURE_WORKFLOW, job.get("name", ""), error_text)
+        if streak_fingerprint is None:
+            streak_fingerprint = fingerprint
+            streak_job_name = job.get("name", "")
+            streak_error_text = error_text
+        elif fingerprint != streak_fingerprint:
+            break  # причина сменилась — это уже другая серия
+        streak_runs.append(run)
+
+    if len(streak_runs) < RECURRING_FAILURE_STREAK_THRESHOLD:
+        return []
+    return [{
+        "workflow": RECURRING_FAILURE_WORKFLOW,
+        "job_name": streak_job_name,
+        "error_text": streak_error_text,
+        "streak": len(streak_runs),
+        "since": streak_runs[-1].get("created_at"),
+        "until": streak_runs[0].get("updated_at"),
+        "latest_run_url": streak_runs[0].get("html_url"),
+    }]
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -1459,6 +1571,20 @@ def build_report(repo: str, now: datetime,
         findings[9] = []
         lines.append("⏭️ [9] не проверено на периодическом пульсе (дорогой фетч тел пула "
                       "прижат к push/PR, где уже стоят declared_deps wire/check — #454/#711)")
+
+    v10 = check_recurring_worker_failure(repo)
+    findings[10] = v10
+    if v10:
+        for item in v10:
+            lines.append(
+                f"🚨 [10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
+                f"одной причиной, с {item['since']} по {item['until']} (job "
+                f"«{item['job_name']}»): {item['error_text']} — последний прогон "
+                f"{item['latest_run_url']}"
+            )
+    else:
+        lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
+                      f"провалов {RECURRING_FAILURE_WORKFLOW} с одной причиной")
 
     return lines, findings
 

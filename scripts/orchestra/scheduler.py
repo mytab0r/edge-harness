@@ -152,6 +152,7 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
 
 import http.cookiejar
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -1481,6 +1482,41 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
 # намеренно вне скоупа: то и другое либо уже видно живым транскриптом (агент
 # сам вызывает `gh pr create` внутри хода), либо секунды спустя сменяется
 # слиянием — отдельное отслеживание потребовало бы нового маркера/опроса.
+# Счётчик процесса (#794): монотонно растёт на каждую заметку за весь прогон
+# scheduler.py, а не за один вызов append_session_notes — main() зовёт эту
+# функцию из трёх разных мест за один запуск (after_merge, unhealthy_pulls,
+# accept_merged_tasks), и одна и та же сессия harness-<N> может получить
+# заметку из более чем одного места за один пульс.
+_SESSION_NOTE_SEQ = itertools.count()
+
+
+def _session_note_message_id(session_id: str) -> str:
+    """Идентификатор message.id заметки-итога (#794).
+
+    dsh-session::assertMessageEventShape (dsh-session/lib/index.js, пин
+    0.1.2-rc.1 — proof в PR #794) валит холодную загрузку сессии без
+    непустой строки message.id: «session event at seq N lacks an identified
+    message». Проверено на самом пакете: без id — падает с этим текстом;
+    с id, но без остальной формы сообщения — падает на другом поле
+    («message has invalid source»), то есть один только id недостаточен
+    (см. append_session_notes ниже, там же остальная форма).
+
+    Формат id — тот же приём, что апстрим сам применяет при миграции старых
+    сообщений без identity (dsh-session-persistence/lib/index.js::legacyMessageId,
+    `legacy-message:${id}:${seq}`): составной, не случайный. Реальный seq
+    события здесь неизвестен — его назначает сервер внутри session.append,
+    писатель его не видит, поэтому вместо seq — счётчик процесса
+    (_SESSION_NOTE_SEQ), уникальный в пределах одного запуска scheduler.py.
+    Уникальность МЕЖДУ запусками даёт GITHUB_RUN_ID — эта функция вызывается
+    только изнутри workflow'а orchestra (переменная в GitHub Actions задана
+    всегда); Date.now-подобная случайность как единственный источник не
+    нужна и не используется — 'local' ниже это не тайбрейкер, а честная
+    метка «вызвано вне Actions» (локальный прогон/тест), где два запуска
+    подряд в пределах одной секунды и так не пишут в одну морду."""
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    return f"harness-note:{session_id}:{run_id}:{next(_SESSION_NOTE_SEQ)}"
+
+
 def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]:
     """notes — [(номер задачи, текст заметки), …], собранные вызывающей
     функцией за ОДИН проход (не по одной заметке): один логин в морду на весь
@@ -1510,7 +1546,16 @@ def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]
             "type": "assistant/message",
             "data": {
                 "turn": 1, "step": 1,
-                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                "message": {
+                    "id": _session_note_message_id(session_id),
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                    # kind обязан быть "model" (assertMessageEventShape) — эта
+                    # заметка не результат вызова модели, а системная запись
+                    # scheduler.py; provider/model называют это честно, а не
+                    # выдают заметку за настоящий ответ провайдера.
+                    "source": {"kind": "model", "provider": "orchestra-scheduler", "model": "session-note"},
+                },
             },
         }
         try:

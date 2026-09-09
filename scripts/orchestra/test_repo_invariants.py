@@ -11,8 +11,10 @@
 """
 
 import importlib.util
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1051,6 +1053,7 @@ def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
         "pulls?state=closed": [],
         "pulls?state=open": [],
         "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1067,6 +1070,7 @@ def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
         "pulls?state=open": [],
         "branches/main/protection": HEALTHY_PROTECTION,
         "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1093,6 +1097,7 @@ def test_declared_deps_opt_out_skips_expensive_graphql_fetch(monkeypatch):
         f"issues?state=open&labels={ri.TASK_LABEL}": [],
         "pulls?state=closed": [],
         "pulls?state=open": [],
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1113,6 +1118,7 @@ def test_declared_deps_fetch_error_isolated_does_not_abort_whole_report(monkeypa
         "pulls?state=open": [],
         "graphql": ri.task_deps.TaskDepsError(
             "issue #999: blockedBy усечён (20 из 41)"),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1425,6 +1431,134 @@ def test_declared_deps_mismatch_reports_unrecognized_kind_not_silent_nichem():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 10 (#794): N подряд прогонов worker.yml с ОДНОЙ и той же причиной
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Прод-форма причины — дословно та, что даёт РЕАЛЬНЫЙ пинованный пакет
+# @deepseek-ai/dsh-session@0.1.2-rc.1 (проверено живым вызовом adoptSessionEvent
+# при разборе #794): "session event at seq 13 lacks an identified message".
+# worker.yml резюмирует сессию harness-<N> при повторном ходе по той же
+# задаче — холодная загрузка испорченной записи бросает эту ошибку и валит
+# job, вживую девять прогонов подряд на harness-257 (2026-09-08T08:45Z —
+# 2026-09-09T02:08Z).
+
+def worker_run(run_id, created_at, updated_at=None, conclusion="failure"):
+    return {
+        "id": run_id,
+        "conclusion": conclusion,
+        "created_at": created_at,
+        "updated_at": updated_at or created_at,
+        "html_url": f"https://github.com/{REPO}/actions/runs/{run_id}",
+    }
+
+
+def worker_jobs_payload(job_id, job_name="Прогон"):
+    return {"jobs": [{"id": job_id, "name": job_name, "conclusion": "failure", "steps": []}]}
+
+
+def fake_log_subprocess(logs_by_job_id):
+    """Мок pulse_guard.subprocess.run для last_error_log_line — она читает
+    лог job'а НАПРЯМУЮ subprocess.run(gh api ...), в обход gh() (см. её
+    докстринг), поэтому FakeGh/patch_gh её не перехватывают: нужен отдельный
+    маршрутизатор по job_id, вычитанному из URL."""
+    def run(args, **kwargs):
+        joined = " ".join(args)
+        match = re.search(r"actions/jobs/(\d+)/logs", joined)
+        job_id = int(match.group(1)) if match else None
+        line = logs_by_job_id.get(job_id)
+        stdout = f"2026-09-08T08:45:00.0000000Z ##[error]{line}\n" if line else ""
+        return SimpleNamespace(returncode=0, stdout=stdout)
+    return run
+
+
+SESSION_LACKS_ID_ERROR = "session event at seq 13 lacks an identified message"
+
+
+def test_recurring_worker_failure_flags_streak_with_same_cause(monkeypatch):
+    # Живой случай #794: три прогона подряд (порог
+    # RECURRING_FAILURE_STREAK_THRESHOLD == pulse_guard.WORKER_FAILURE_PAUSE_AFTER),
+    # самый свежий первым — одна и та же причина у всех.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/3/jobs": worker_jobs_payload(103),
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103: SESSION_LACKS_ID_ERROR, 102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
+    })))
+    violations = ri.check_recurring_worker_failure(REPO)
+    assert len(violations) == 1
+    assert violations[0]["streak"] == 3
+    assert violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
+    assert violations[0]["since"] == "2026-09-08T08:45:00Z"
+    assert violations[0]["until"] == "2026-09-09T00:00:00Z"
+
+
+def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
+    # Два прогона подряд — ниже порога, инвариант молчит (это разница между
+    # "уже пора паузу" и "серия только начинается", тот же порог, что и у
+    # предохранителя диспатча).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == []
+
+
+def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypatch):
+    # Три красных прогона подряд, но причина СМЕНИЛАСЬ на третьем (по времени)
+    # — это не одна и та же серия, инвариант не обязан путать «часто красный»
+    # с «застрял на одном и том же».
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/3/jobs": worker_jobs_payload(103),
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": worker_jobs_payload(101),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103: SESSION_LACKS_ID_ERROR,
+        102: SESSION_LACKS_ID_ERROR,
+        101: "No such file or directory",  # другая, старая причина — обрывает серию
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == []
+
+
+def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
+    # Дешёвый путь холостого хода: самый свежий прогон — success, серия
+    # обрывается СРАЗУ, ни один job/лог не запрашивается (см. докстринг —
+    # это и есть цена инварианта на здоровом репозитории).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-09T03:00:00Z", conclusion="success"),
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_recurring_worker_failure(REPO) == []
+    assert not any("actions/runs/3/jobs" in call or "actions/runs/2/jobs" in call for call in fake.calls)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1451,6 +1585,12 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         "graphql": graphql_pool_page([
             graphql_issue_node(1, issue_body="## Чем блокируется\nничем\n\n## Что блокирует\nничем\n"),
         ]),
+        # Инвариант 10 (#794): самый свежий прогон worker.yml зелёный — серия
+        # обрывается на первом же прогоне, ни один job/лог не запрашивается.
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {
+            "workflow_runs": [{"conclusion": "success", "created_at": "2026-09-03T11:00:00Z",
+                                "updated_at": "2026-09-03T11:00:00Z", "html_url": "https://x/1"}],
+        },
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
