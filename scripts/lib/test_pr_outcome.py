@@ -133,7 +133,7 @@ def test_mutation_state_all_vs_open_only():
 def run_cli(args):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
 
 

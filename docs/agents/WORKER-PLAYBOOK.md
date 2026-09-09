@@ -147,9 +147,11 @@
 
 - Пакеты `@deepseek-ai/dsh-*` ставятся ТОЛЬКО tarball'ами: `npm pack <pkg>@<ver>`
   → установка из локальных tgz (`npm install` даёт 404). [подтверждено замером](../research/10-dsh-architecture.md#дистрибуция-в-npm-подтверждено-замером-2026-08-2829)
-- Провайдер и модель приезжают в env раннера из `vars`/`secrets` репозитория
-  (`DEEPSEEK_BASE_URL`, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`) — единственное
-  место правды (#153). Локально не угадывай конкретный эндпоинт/модель;
+- Провайдер и модель приезжают в env раннера, выставленные транспортом
+  (`scripts/worker/task.sh`) из `vars.DSH_PROVIDER_CHAIN` (#727/#797,
+  единственное место правды на упорядоченный список провайдеров) — не из
+  статичных `vars.DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` (#153, они и не заданы
+  этим workflow'ом больше). Локально не угадывай конкретный эндпоинт/модель;
   процедура смены — `docs/runbooks/switch-llm-provider.md`. Модель — НЕ env
   для самого DSH, а патч профиля `~/.dsh/profiles/<профиль>/cordis.patch.yml`:
   `agent-default-model` → `{provider: deepseek-official, model: <DEEPSEEK_MODEL>}` +

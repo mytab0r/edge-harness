@@ -8,6 +8,14 @@
 `orchestra.yml` (on: pull_request: [labeled]) = один прогон job'а contract.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import importlib.util
 import json
 import os
@@ -27,7 +35,7 @@ _RL_SPEC.loader.exec_module(review_labels)
 
 
 def gh(url: str):
-    result = subprocess.run(["gh", "api", url], capture_output=True, text=True,
+    result = subprocess.run(["gh", "api", url], capture_output=True, text=True, encoding="utf-8",
                             env={**os.environ, "NO_COLOR": "1"})
     if result.returncode != 0:
         raise RuntimeError(f"gh api {url}: {result.stderr.strip()}")

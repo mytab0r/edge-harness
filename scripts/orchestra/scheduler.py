@@ -150,6 +150,14 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       #431→#538), не только свои.
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import http.cookiejar
 import importlib.util
 import itertools
@@ -1026,7 +1034,7 @@ def update_branch(repo: str, pr_number: int) -> None:
         subprocess.run(
             ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch",
              "-H", f"Authorization: Bearer {pat}"],
-            capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+            capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
             check=True,
         )
     else:
@@ -1659,7 +1667,7 @@ def dispatch_deploy_on_merge(files: list[dict], prefix: str, workflow: str) -> b
         return False
     subprocess.run(
         ["gh", "workflow", "run", workflow, "--ref", "main"],
-        capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1"},
+        capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
         check=True,
     )
     return True
@@ -2650,6 +2658,31 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
             actions.append(
                 f"🚨 PR #{pull['number']}: авто-повторы исчерпаны "
                 f"({attempts}/{AI_REVIEW_MAX_ATTEMPTS}) — эскалировано ({result})"
+            )
+            continue
+
+        # Разрыв 2 (#779, самый дорогой из трёх — живой замер: три диспатча
+        # этой же функции по PR #711 за 7 минут, 21:03:44Z/21:07:23Z/21:10:30Z,
+        # весь бюджет эпохи на ОДНОМ отпечатке диффа): до этой строки функция
+        # проверяла гейт 1, наличие вердикта, порог возраста, кулдаун цепочки
+        # провайдеров, quota_exhausted и бюджет попыток — «летит ли прогон
+        # ЭТОГО PR прямо сейчас» в списке не было вовсе. Один и тот же
+        # предикат, что уже читают update_branch (AiReviewRunning выше) и
+        # ai_review.py::cmd_should_run (#399) — третьей копии не заводим.
+        # Проверка — ПЕРЕД самим диспатчем и ПЕРЕД маркер-комментарием
+        # AI_REVIEW_RETRY_MARKER: попытка (ai_review_retry_count) считается
+        # только по факту этого маркера, поэтому отказ здесь не тратит
+        # бюджет — следующий проход планировщика увидит тот же ai:failed и
+        # попробует снова, как только текущий прогон освободит счётчик
+        # активных (тот же газ, что у AiReviewRunning: чтение, разнесённое
+        # по времени).
+        active = review_labels.other_active_ai_review_runs(
+            repo, pull["number"], exclude_run_id=None, gh_func=gh)
+        if active:
+            run_ids = ", ".join(str(run.get("id")) for run in active)
+            observations.append(
+                f"⏳ PR #{pull['number']}: ai-review.yml уже летит (run {run_ids}) — "
+                "автоповтор не дублирую, попытка не потрачена"
             )
             continue
 

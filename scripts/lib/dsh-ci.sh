@@ -313,8 +313,9 @@ dsh_model_context_window() { # $1 — id модели
 # Решение (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): ВНУТРИ
 # цепочки suite всегда глушится — dsh_run_with_provider_chain выставляет
 # DSH_CHAIN_ACTIVE=1 на время своего цикла, и эта функция читает его ниже,
-# независимо от DSH_PLUGINS_SUITE_ACTIVE. Вне цепочки (worker.yml/hands.yml,
-# где dsh_run_with_provider_chain не вызывается) suite работает как раньше.
+# независимо от DSH_PLUGINS_SUITE_ACTIVE. Вне цепочки (#797: сегодня это
+# только hands.yml — worker.yml с этой задачи тоже зовёт
+# dsh_run_with_provider_chain) suite работает как раньше.
 # Дополнительный тормоз — dsh_require_provider_chain отказывает громко, если
 # vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно: молчаливого
 # приоритета одной переменной над другой быть не должно.
@@ -548,7 +549,7 @@ dsh_require_provider_chain() {
   # запрещаем комбинацию явно, а не полагаемся на то, что ни один вызывающий
   # не прокинет обе переменные разом.
   if [ -n "${PLUGINS_SUITE_URL:-}" ]; then
-    echo "::error::vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно — комбинация не поддержана (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): цепочка (#727) сама решает, какого провайдера пробовать на каждой попытке, suite (#215) решает тот же вопрос на своём уровне — выбери одно. Сейчас suite нужен только worker.yml/hands.yml (там цепочки нет), а ai-review всегда идёт цепочкой." >&2
+    echo "::error::vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно — комбинация не поддержана (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): цепочка (#727) сама решает, какого провайдера пробовать на каждой попытке, suite (#215) решает тот же вопрос на своём уровне — выбери одно. Сейчас suite нужен только hands.yml (там цепочки нет, #797) — ai-review и worker всегда идут цепочкой." >&2
     return 1
   fi
   if [ -z "${DSH_PROVIDER_CHAIN:-}" ]; then
