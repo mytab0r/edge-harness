@@ -263,6 +263,33 @@ _dsh_patch_profile_plain() { # $1 — профиль
 PATCH
 }
 
+# Окно контекста env-provider'а для combo-router — ОТДЕЛЬНАЯ величина от
+# DSH_MAX_TOKENS (тот — потолок ДЛИНЫ ОТВЕТА, adapter-конфиг llm-deepseek
+# maxTokens; #789, живой прогон: contextWindow=DSH_MAX_TOKENS=131072 у
+# glm-5.3-flash при реальном окне 1000000 отбрасывал маршрут вчетверо раньше
+# нужного — combo-router::compatible() кидает NO_COMBO_ROUTE при
+# contextTokens > contextWindow*0.92). Источник — vars.DSH_EDGE_MODEL_CATALOG:
+# та же переменная, которой уже требует присутствие vars.DEEPSEEK_MODEL
+# каталог морды (deploy-dsh-edge.yml, «Патч каталога моделей под реального
+# провайдера») — не второе место правды, то же самое значение. Модель вне
+# каталога (запись отсутствует, например при ручном тесте другой модели) —
+# консервативный фолбэк на DSH_MAX_TOKENS: не хуже прежнего поведения (оно и
+# было таким для всех моделей) и не занижает относительно старого поведения,
+# только не расширяет окно за пределы неподтверждённого значения.
+dsh_model_context_window() { # $1 — id модели
+  local model=$1 cw=""
+  if [ -n "${DSH_EDGE_MODEL_CATALOG:-}" ]; then
+    cw=$(jq -r --arg id "$model" \
+      '([.[]? | select(.id == $id) | .contextWindow][0]) // empty' \
+      <<<"$DSH_EDGE_MODEL_CATALOG" 2>/dev/null || true)
+  fi
+  if [ -z "$cw" ] || [ "$cw" = "null" ]; then
+    echo "::warning::окно контекста модели '$model' не найдено в vars.DSH_EDGE_MODEL_CATALOG — использую консервативный фолбэк $DSH_MAX_TOKENS (потолок вывода, может быть меньше реального окна контекста)" >&2
+    cw="$DSH_MAX_TOKENS"
+  fi
+  echo "$cw"
+}
+
 # Выбор модели и лимит ответа — через родной settings-слой профиля, НЕ env:
 # адаптер dsh-llm-deepseek читает из env только DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY,
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
@@ -335,6 +362,8 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
   #   владелец добавляет провайдера созданием секрета с этим именем, без
   #   правки кода.
   local providers_yaml routes_yaml entry alias url keyenv model ctx label keyval
+  local env_ctx_window
+  env_ctx_window=$(dsh_model_context_window "$DSH_MODEL")
   providers_yaml="      env-provider:
         displayName: \"vars.DEEPSEEK_BASE_URL (env-provider)\"
         api: openai-completions
@@ -342,7 +371,7 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
         apiKeyEnv: DEEPSEEK_API_KEY
         models:
           - id: $DSH_MODEL
-            contextWindow: $DSH_MAX_TOKENS"
+            contextWindow: $env_ctx_window"
   routes_yaml="      env-provider:
         provider: env-provider
         model: $DSH_MODEL
@@ -350,7 +379,7 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
         quality: 80
         cost: 0.3
         latency: 0.4
-        contextWindow: $DSH_MAX_TOKENS
+        contextWindow: $env_ctx_window
         tools: true
         group: env-provider"
 

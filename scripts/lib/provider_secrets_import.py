@@ -35,15 +35,19 @@ Anthropic OAuth-пул (задача #216) — ДРУГОЙ механизм (и
 (задача #777): роутер учёток (krouter) сам гасит учётку (isActive=False,
 testStatus=unavailable) при исчерпании квоты и включает её обратно, когда та
 восстановится — файл-экспорт лишь снимок на дату выгрузки (см. --export-file,
-дата печатается в отчёте). Ранжирование поэтому различает ДВЕ РАЗНЫЕ оси, а
+дата печатается в отчёте). Ранжирование поэтому различает ТРИ РАЗНЫЕ оси, а
 не одну: «квота временно исчерпана» (429/backoff — нормальное состояние
-ротации, НЕ дисквалификация) и «ключ неверен/доступ запрещён» (401/403 —
-настоящая дисквалификация). Источник факта для ранга — живая проба
-(--no-probe отключает), она пробует ТОЛЬКО кандидатов на слоты suite (не весь
-файл — из непричастных к suite учёток пробовать нечего, у них нет маршрута);
-когда пробы нет (сеть недоступна или --no-probe) — падаем на классификацию
-снимка по errorCode/backoffLevel. Источник ранга (проба/снимок) виден в
-отчёте отдельной пометкой у каждой строки.
+ротации, НЕ дисквалификация); «доступ запрещён» (403 — неоднозначный сигнал,
+может быть гео-блок/WAF/лимит плана при годном ключе, ранг хуже квоты, но БЕЗ
+выброса из слота — 403 не одноразово надёжен, задача #777 major 5 гейта
+PR #778); «ключ неверен» (401 — единственный код настоящей дисквалификации,
+выброс из слота, и то лишь когда источник факта — живая проба, не снимок).
+Источник факта для ранга — живая проба (--no-probe отключает), она пробует
+ТОЛЬКО кандидатов на слоты suite (не весь файл — из непричастных к suite
+учёток пробовать нечего, у них нет маршрута); когда пробы нет (сеть
+недоступна или --no-probe) — падаем на классификацию снимка по
+errorCode/backoffLevel. Источник ранга (проба/снимок) виден в отчёте
+отдельной пометкой у каждой строки.
 
 Использование:
   python3 scripts/lib/provider_secrets_import.py --export-file <путь> [--apply]
@@ -53,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import http.client
 import json
 import os
 import re
@@ -89,18 +94,52 @@ KROUTER_PROVIDER_TO_SUITE_FAMILY: dict[str, str] = {
 
 _PROBE_TIMEOUT_SECONDS = 10
 
-# Тир ранга (меньше — лучше слоту). ДВЕ РАЗНЫЕ оси, не смешиваются (задача
-# #777): TIER_TEMPORARY (квота/backoff) — нормальное состояние ротации, оно
-# ЛУЧШЕ TIER_DISQUALIFIED (ключ неверен) при любом источнике факта.
+# Тир ранга (меньше — лучше слоту). ТРИ РАЗНЫЕ оси, не смешиваются (задача
+# #777, major 5 гейта PR #778): TIER_TEMPORARY (квота/backoff) — нормальное
+# состояние ротации, оно ЛУЧШЕ TIER_SUSPECT и TIER_DISQUALIFIED при любом
+# источнике факта. TIER_SUSPECT (HTTP 403) хуже TIER_UNKNOWN, но НЕ выбрасывает
+# кандидата из слота — только TIER_DISQUALIFIED (HTTP 401) это делает, и то
+# лишь когда источник факта — живая проба (см. select_accounts).
 _TIER_HEALTHY = 0
 _TIER_TEMPORARY = 1
 _TIER_UNKNOWN = 2
-_TIER_DISQUALIFIED = 3
+_TIER_SUSPECT = 3
+_TIER_DISQUALIFIED = 4
 
-# HTTP-коды, которые и живая проба (probe_provider), и снимок (errorCode)
-# трактуют одинаково — «ключ неверен/доступ запрещён», настоящая
-# дисквалификация, не квота.
-_AUTH_INVALID_HTTP_CODES = (401, 403)
+# HTTP 401 — единственный код, которым и живая проба (probe_provider), и
+# снимок (errorCode) выбрасывают кандидата из слота ("ключ неверен",
+# настоящая дисквалификация). HTTP 403 у OpenAI-совместимых шлюзов — НЕ то же
+# самое: это ещё и гео-блок/WAF/политика организации/лимит плана при годном
+# ключе. Поэтому 403 — ХУЖЕ ранг (TIER_SUSPECT), но НЕ выброс из слота; выброс
+# остаётся только за подтверждённым 401.
+#
+# НЕ ПОДТВЕРЖДЕНО (минор 5 гейта PR #781): для самого HTTP 403 отдельного
+# замера нестабильности нет. Единственное живое наблюдение задачи #777 (один
+# и тот же шлюз вернул 451 автору находки и 200 гейту минутами позже, проба
+# одноразовая, повторов нет) относится к HTTP 451, который этот код
+# классифицирует как PROBE_UNKNOWN (см. probe_provider), а не
+# PROBE_SUSPECT_FORBIDDEN — оно доказывает нестабильность ответа шлюза
+# ВООБЩЕ, но не обосновывает политику именно для кода 403. Осторожность
+# (ранжировать хуже, но не выбрасывать) принята по общей репутации
+# гео-блок/WAF/лимит плана у OpenAI-совместимых шлюзов, а не по измерению
+# для 403 конкретно.
+_AUTH_INVALID_HTTP_CODES = (401,)
+_AUTH_SUSPECT_HTTP_CODES = (403,)
+
+# Контракт между probe_provider и classify_probe — сентинел-константы, НЕ
+# русская проза (minor 9 гейта PR #778): раньше classify_probe распознавал
+# результат пробы по строковому совпадению/префиксу человеческого текста —
+# правка формулировки в probe_provider молча меняла бы классификацию (пример
+# в находке: детальный текст сетевой ошибки менялся, а префикс "неизвестно
+# (сеть:" был единственным, что отличало "сеть недоступна" от "факт получен").
+# ProbeResult.detail остаётся человеко-читаемым и безопасным (без ключа/тела
+# ответа) только для отчёта; классификация читает исключительно .outcome.
+PROBE_ALIVE = "alive"
+PROBE_QUOTA = "quota"
+PROBE_INVALID_KEY = "invalid_key"
+PROBE_SUSPECT_FORBIDDEN = "suspect_forbidden"
+PROBE_NETWORK_UNAVAILABLE = "network_unavailable"
+PROBE_UNKNOWN = "unknown"
 
 
 class LoudError(RuntimeError):
@@ -281,9 +320,24 @@ def classify_snapshot(account: Account) -> tuple[int, str]:
     """Ранг по СНИМКУ файла-экспорта — только когда живой пробы нет (задача
     #777). isActive/testStatus сами по себе НЕ дисквалифицируют (это
     предохранитель на дату выгрузки, см. докстринг модуля) — единственное
-    основание дисквалификации по снимку — errorCode 401/403 (ключ
-    неверен/доступ запрещён). errorCode 429 или backoffLevel>0 — та же ось,
-    что и живая проба 429: квота, нормальное состояние ротации."""
+    основание ВЫБРОСА по снимку — errorCode 401 (ключ неверен). errorCode 403
+    (доступ запрещён) — неоднозначный сигнал (может быть гео-блок/WAF/лимит
+    плана при годном ключе, см. major 5 гейта PR #778) — ранжируется хуже
+    квоты, но кандидата НЕ выбрасывает. errorCode 429 или backoffLevel>0 — та
+    же ось, что и живая проба 429: квота, нормальное состояние ротации.
+
+    Порядок проверок НАМЕРЕННЫЙ (minor 7 гейта PR #778): testStatus=active
+    проверяется ПЕРВЫМ, раньше errorCode. Обоснование ограничено тем, что
+    видно в файле-снимке владельца (2026-08-25, 47 учёток): у всех троих
+    записей с одновременно isActive=True/testStatus=active И непустым
+    errorCode код — 429 или 503 (квота/перегрузка), ни разу 401/403 — то есть
+    на доступных данных конфликта "активна, но код говорит про неверный ключ"
+    не наблюдалось. Обнуляет ли krouter errorCode при возврате
+    учётки в строй — НЕ ПОДТВЕРЖДЕНО (внутренности krouter не в этой
+    задаче); если такой конфликт когда-нибудь появится в реальном экспорте,
+    testStatus=active сейчас победит errorCode=401/403 молча — это осознанно
+    принятый риск, не оплошность, и первое, что проверить, если слот займёт
+    учётка с застрявшим кодом дисквалификации."""
     if account.is_active and account.test_status == "active":
         return _TIER_HEALTHY, "активна по снимку (testStatus=active) [источник: снимок]"
     if account.error_code in _AUTH_INVALID_HTTP_CODES:
@@ -291,39 +345,83 @@ def classify_snapshot(account: Account) -> tuple[int, str]:
             _TIER_DISQUALIFIED,
             f"ключ неверен по снимку (errorCode={account.error_code}) [источник: снимок]",
         )
+    if account.error_code in _AUTH_SUSPECT_HTTP_CODES:
+        return (
+            _TIER_SUSPECT,
+            f"доступ запрещён по снимку (errorCode={account.error_code}) — неоднозначный "
+            "сигнал (гео-блок/WAF/лимит плана, не обязательно неверный ключ), тир ниже "
+            "квоты, слот не освобождается [источник: снимок]",
+        )
     if account.error_code == 429 or account.backoff_level > 0:
         return (
             _TIER_TEMPORARY,
             "квота/backoff по снимку — временное состояние ротации, не дисквалификация "
             "[источник: снимок]",
         )
+    if account.error_code is None:
+        return (
+            _TIER_UNKNOWN,
+            "неопределённо по снимку (errorCode отсутствует) [источник: снимок]",
+        )
+    # last_error — сырое эхо ответа krouter, уже присутствует в файле-экспорте
+    # (значит и так в руках оператора, не сетевой вызов) — до этой правки поле
+    # не читал никто (minor 9 гейта PR #778): здесь единственное место, где
+    # оно даёт контекст к "неопределённо", вместо того чтобы простаивать.
+    detail = f", lastError={account.last_error!r}" if account.last_error else ""
     return (
         _TIER_UNKNOWN,
-        "неопределённо по снимку (нет явной ошибки авторизации) [источник: снимок]",
+        f"неопределённо по снимку (errorCode={account.error_code}, не 401/403/429{detail}) "
+        "[источник: снимок]",
     )
 
 
-def classify_probe(status: str) -> tuple[int, str] | None:
+@dataclass(frozen=True)
+class ProbeResult:
+    """Возврат живой пробы (probe_provider/probe_provider_full) — см.
+    контракт-константы PROBE_* выше. detail — только для отчёта человеку,
+    никогда не несёт ключ/заголовок/тело ответа целиком (задача #777,
+    критерий 6). models/models_error заполняются ТОЛЬКО когда
+    outcome == PROBE_ALIVE и только если тело ответа /models разобралось
+    (иначе models_error называет, что ожидалось и что пришло — по структуре,
+    не по значениям; задача #783/PR #785 — импортёр раньше на неузнанной
+    структуре ответа выбрасывал необработанный трейсбек с телом ответа
+    сервера в выводе, вместо печати только id моделей)."""
+    outcome: str
+    detail: str
+    models: tuple[str, ...] | None = None
+    models_error: str | None = None
+
+
+def classify_probe(result: ProbeResult) -> tuple[int, str] | None:
     """Ранг по РЕЗУЛЬТАТУ живой пробы (probe_provider). None — проба не
     получила ответа от сети (недоступна), вызывающий обязан упасть на
-    classify_snapshot и пометить это в отчёте."""
-    if status == "жива":
-        return _TIER_HEALTHY, "жива [источник: проба]"
-    if status == "квота исчерпана":
-        return _TIER_TEMPORARY, "квота исчерпана [источник: проба] — не дисквалификация"
-    if status == "ключ неверен":
-        return _TIER_DISQUALIFIED, "ключ неверен [источник: проба]"
-    if status.startswith("неизвестно (сеть:"):
+    classify_snapshot и пометить это в отчёте. Читает только result.outcome
+    (сентинел-константа), не человеческий текст result.detail (minor 9
+    гейта PR #778)."""
+    if result.outcome == PROBE_NETWORK_UNAVAILABLE:
         return None
-    return _TIER_UNKNOWN, f"{status} [источник: проба]"
+    if result.outcome == PROBE_ALIVE:
+        return _TIER_HEALTHY, "жива [источник: проба]"
+    if result.outcome == PROBE_QUOTA:
+        return _TIER_TEMPORARY, "квота исчерпана [источник: проба] — не дисквалификация"
+    if result.outcome == PROBE_INVALID_KEY:
+        return _TIER_DISQUALIFIED, "ключ неверен [источник: проба]"
+    if result.outcome == PROBE_SUSPECT_FORBIDDEN:
+        return (
+            _TIER_SUSPECT,
+            "доступ запрещён по пробе (HTTP 403) — неоднозначный сигнал (гео-блок/WAF/"
+            "лимит плана, не обязательно неверный ключ), тир ниже квоты, слот НЕ "
+            "выбрасывается [источник: проба]",
+        )
+    return _TIER_UNKNOWN, f"неизвестно ({result.detail}) [источник: проба]"
 
 
-def rank_account(account: Account, probe_status: str | None) -> tuple[int, str, str]:
+def rank_account(account: Account, probe_result: ProbeResult | None) -> tuple[int, str, str]:
     """(tier, заметка, источник). Живая проба, если получила ответ по сети, —
     авторитетный источник факта; иначе (проба выключена/недоступна по сети) —
     снимок файла-экспорта."""
-    if probe_status is not None:
-        classified = classify_probe(probe_status)
+    if probe_result is not None:
+        classified = classify_probe(probe_result)
         if classified is not None:
             tier, note = classified
             return tier, note, "проба"
@@ -378,13 +476,21 @@ def group_candidates(
 def probe_candidates(
     candidates_by_family: dict[str, list[Account]],
     routes_by_family: dict[str, list[SuiteRoute]],
-) -> dict[str, str]:
+) -> dict[str, ProbeResult]:
     """Живая проба ТОЛЬКО кандидатов на слоты suite (задача #777) — учётки вне
     списка маршрутов (out_of_scope) пробовать бессмысленно, у них нет слота,
-    который проба могла бы переранжировать. На файле владельца это ~9
-    кандидатов из 46 учёток экспорта — пробовать все 46 значило бы тратить
-    сеть на 37 учёток, чей результат пробы ни на что не влияет."""
-    results: dict[str, str] = {}
+    который проба могла бы переранжировать. На файле владельца (2026-08-25,
+    47 учёток — тот же замер, что и в classify_snapshot выше) это 9
+    кандидатов — пробовать все 47 значило бы тратить сеть на 38 учёток, чей
+    результат пробы ни на что не влияет (минор 7 гейта PR #781: раньше
+    здесь жил второй, разошедшийся замер — 46/37 — того же файла).
+
+    Возвращает ProbeResult (классификация + разобранные id моделей, задача
+    #783/PR #785 — probe_provider_full больше не выбрасывает тело ответа,
+    а разбирает id моделей из него), не голый статус — вызывающий сам
+    решает, что показывать в отчёте (см. main/render_report), ранжирование
+    по-прежнему смотрит только на .outcome."""
+    results: dict[str, ProbeResult] = {}
     for family, accounts in candidates_by_family.items():
         family_routes = routes_by_family.get(family)
         if not family_routes:
@@ -394,14 +500,14 @@ def probe_candidates(
             value = secret_value(account)
             if value is None:
                 continue
-            results[account.id] = probe_provider(base_url, value)
+            results[account.id] = probe_provider_full(base_url, value)
     return results
 
 
 def select_accounts(
     accounts: list[Account],
     routes: list[SuiteRoute],
-    probe_results: dict[str, str] | None = None,
+    probe_results: dict[str, ProbeResult] | None = None,
 ) -> SelectionResult:
     probe_results = probe_results or {}
     routes_by_family = group_routes_by_family(routes)
@@ -436,6 +542,13 @@ def select_accounts(
             else:
                 viable.append(account)
 
+        # Minor 6 гейта PR #778: причина пустоты по пробе — не факт о семье
+        # маршрутов целиком, а факт про КОНКРЕТНОЕ число пустых слотов.
+        # 3 слота с 1 выброшенным пробой кандидатом и без других кандидатов
+        # (пример: ollama, задача #777) — пустых 3, а живо-исключён 1: только
+        # ПЕРВЫЙ пустой слот получает причину «исключён пробой», остальные —
+        # «нет кандидата» (иначе читатель решит, что починка одного ключа
+        # заполнит все три).
         empty_reason = None
         if dead_by_probe:
             names = ", ".join(account.email or account.id for account in dead_by_probe)
@@ -443,14 +556,27 @@ def select_accounts(
                 f"{len(dead_by_probe)} кандидат(ов) исключены живой пробой "
                 f"(ключ неверен): {names}"
             )
+        # Minor 3 гейта PR #781: код теперь делает то, что уже обещал
+        # комментарий выше — ТОЛЬКО первый пустой слот несёт агрегатную
+        # причину, остальные пустые слоты семьи получают «нет кандидата».
+        # Раньше budget = len(dead_by_probe) отдавал ОДНУ И ТУ ЖЕ агрегатную
+        # строку первым N пустым слотам (N = число выброшенных) — при 2
+        # выброшенных и 3 слотах строка повторялась в двух слотах, и
+        # читатель, складывающий числа из повторов, получал 4 исключённых
+        # при фактических 2-х.
+        empty_reason_budget = 1 if dead_by_probe else 0
 
         for index, route in enumerate(family_routes):
             account = viable[index] if index < len(viable) else None
+            slot_empty_reason = None
+            if account is None and empty_reason_budget > 0:
+                slot_empty_reason = empty_reason
+                empty_reason_budget -= 1
             assignments.append(
                 SlotAssignment(
                     route=route,
                     account=account,
-                    empty_reason=(empty_reason if account is None and dead_by_probe else None),
+                    empty_reason=slot_empty_reason,
                 )
             )
         overflow.extend(viable[len(family_routes):])
@@ -527,28 +653,137 @@ def set_variable(repo: str, name: str, value: str) -> None:
 # ── Живая проба ───────────────────────────────────────────────────────────
 
 
-def probe_provider(base_url: str, api_key: str) -> str:
-    """жива / квота исчерпана / ключ неверен / неизвестно — эвристика по HTTP-
-    статусу общего для OpenAI-совместимых шлюзов эндпоинта /models. 401/403 —
-    ключ неверен, 429 — квота исчерпана (разное лечение, не смешиваем)."""
+class ModelListError(LoudError):
+    """Ответ /models пришёл в структуре, которую парсер не понимает."""
+
+
+def parse_model_ids(base_url: str, body: bytes) -> list[str]:
+    """Разбор тела ответа /models — печатает ТОЛЬКО имена моделей (задача
+    «импортёр печатает доступные id моделей», #783/PR #785), не всё тело.
+
+    Формат проверен живым запросом ко всем четырём провайдерам suite
+    (2026-09-09, задача) — у всех ОДИН И ТОТ ЖЕ top-level контракт,
+    OpenAI-совместимый: dict с ключом "data" — список объектов со строковым
+    полем "id". Различаются только ЛИШНИЕ поля элемента, которые эта функция
+    не использует:
+      - nvidia-nim, zai (GLM), ollama-cloud: created/id/object/owned_by;
+      - openrouter: вдобавок architecture/pricing/context_length/… (431
+        моделей на момент проверки — то же поле "id", просто больше шума).
+    Ни разного формата, ни отличного от OpenAI top-level контракта среди
+    четырёх проверенных провайдеров НЕ найдено — если он встретится у нового
+    провайдера, эта функция обязана упасть громко (см. ниже), а не угадать.
+    """
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise ModelListError(f"{base_url}: ответ /models не JSON: {error}") from error
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("data"), list):
+        top_keys = sorted(parsed.keys()) if isinstance(parsed, dict) else None
+        raise ModelListError(
+            "неузнанная структура ответа /models: ожидался dict с ключом "
+            "'data' (список объектов со строковым полем 'id'). Получено: "
+            f"top-level {type(parsed).__name__}"
+            + (f", ключи={top_keys}" if top_keys is not None else "")
+            + f" ({base_url}). Значения тела не печатаются."
+        )
+    ids: list[str] = []
+    for index, item in enumerate(parsed["data"]):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            item_keys = sorted(item.keys()) if isinstance(item, dict) else None
+            raise ModelListError(
+                f"неузнанная структура data[{index}] ответа /models: ожидался "
+                "объект со строковым полем 'id'. Получено: "
+                f"{type(item).__name__}"
+                + (f", ключи={item_keys}" if item_keys is not None else "")
+                + f" ({base_url}). Значения тела не печатаются."
+            )
+        ids.append(item["id"])
+    return sorted(set(ids))
+
+
+def probe_provider_full(base_url: str, api_key: str) -> ProbeResult:
+    """ProbeResult(outcome, detail, models, models_error) — эвристика по
+    HTTP-статусу общего для OpenAI-совместимых шлюзов эндпоинта /models.
+    401 — ключ неверен (тир дисквалификации), 403 — доступ запрещён, но НЕ то
+    же самое (гео-блок/WAF/лимит плана при годном ключе — major 5 гейта
+    PR #778, отдельный тир БЕЗ выброса из слота), 429 — квота исчерпана
+    (разное лечение, не смешиваем). outcome — сентинел-константа PROBE_*
+    (контракт с classify_probe, minor 9 гейта PR #778), detail — только для
+    отчёта человеку.
+
+    На успехе (200) заодно разбирает список id моделей из уже полученного
+    тела ответа (задача #783/PR #785 — раньше при неузнанной структуре тела
+    падал необработанный трейсбек с телом ответа сервера в выводе): models
+    заполняется только если тело разобралось, иначе models_error называет
+    структуру ожидаемого/полученного, не значения. Один HTTP-запрос на оба
+    факта (классификация + модели).
+
+    Ни при какой ветке функция не печатает и не возвращает тело ответа/
+    сообщение исключения целиком — только классификацию по коду/типу
+    исключения (задача #777, критерий 6; блокирующая 2 гейта PR #778:
+    печать str(error) или error.msg — тот же класс утечки, что печать
+    значения ключа, если сервер эхом отражает что-то из запроса в тексте
+    ошибки).
+
+    Блокирующая 1 гейта PR #778: h.getresponse() внутри urlopen() может
+    выбросить исключения, которые urllib НЕ оборачивает в URLError —
+    ConnectionResetError/TimeoutError (оба OSError) и http.client.
+    BadStatusLine и другие http.client.HTTPException (обрыв/таймаут/мусор
+    вместо статус-строки). Раньше это падало необработанным трейсбеком и
+    валило весь импортёр (probe_candidates — первый шаг main()) из-за
+    ОДНОГО медленного/нестабильного шлюза среди девяти. Тот же тир, что и
+    URLError, — «недоступна по сети», без данных для дисквалификации."""
     url = base_url.rstrip("/") + "/models"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
     try:
         with urllib.request.urlopen(request, timeout=_PROBE_TIMEOUT_SECONDS) as response:
             if response.status == 200:
-                return "жива"
-            return f"неизвестно (HTTP {response.status})"
+                body = response.read()
+                try:
+                    return ProbeResult(PROBE_ALIVE, "HTTP 200", models=tuple(parse_model_ids(base_url, body)))
+                except ModelListError as error:
+                    return ProbeResult(PROBE_ALIVE, "HTTP 200", models_error=str(error))
+            return ProbeResult(PROBE_UNKNOWN, f"HTTP {response.status}")
     except urllib.error.HTTPError as error:
-        if error.code in (401, 403):
-            return "ключ неверен"
+        if error.code == 401:
+            return ProbeResult(PROBE_INVALID_KEY, "HTTP 401")
+        if error.code == 403:
+            return ProbeResult(PROBE_SUSPECT_FORBIDDEN, "HTTP 403")
         if error.code == 429:
-            return "квота исчерпана"
-        return f"неизвестно (HTTP {error.code})"
+            return ProbeResult(PROBE_QUOTA, "HTTP 429")
+        return ProbeResult(PROBE_UNKNOWN, f"HTTP {error.code}")
     except urllib.error.URLError as error:
-        return f"неизвестно (сеть: {error.reason})"
+        return ProbeResult(PROBE_NETWORK_UNAVAILABLE, f"сеть: {error.reason}")
+    except (OSError, http.client.HTTPException) as error:
+        return ProbeResult(PROBE_NETWORK_UNAVAILABLE, f"сеть: {type(error).__name__}")
+
+
+# Alias — оставлен ради обратной совместимости вызовов/тестов, которым нужна
+# только классификация (probe_provider), без явного упоминания разбора
+# моделей: probe_provider_full — единственная реализация живой пробы (задача
+# #777/#781 не делит её на "статус" и "статус+модели", один HTTP-запрос даёт
+# оба факта сразу — см. probe_provider_full).
+probe_provider = probe_provider_full
 
 
 # ── Отчёт ─────────────────────────────────────────────────────────────────
+
+
+# Категории для агрегатной строки пробы (minor 8 гейта PR #778) — читают
+# result.outcome (сентинел-константу), не текст, тот же контракт, что
+# classify_probe (minor 9).
+_PROBE_BUCKET_LABELS: dict[str, str] = {
+    PROBE_ALIVE: "жива",
+    PROBE_QUOTA: "квота",
+    PROBE_INVALID_KEY: "ключ неверен",
+    PROBE_SUSPECT_FORBIDDEN: "доступ запрещён (403)",
+    PROBE_NETWORK_UNAVAILABLE: "сеть недоступна",
+    PROBE_UNKNOWN: "неизвестно",
+}
+
+
+def _probe_bucket(result: ProbeResult) -> str:
+    return _PROBE_BUCKET_LABELS.get(result.outcome, "неизвестно")
 
 
 def render_report(
@@ -557,6 +792,10 @@ def render_report(
     suite_status: str,
     apply: bool,
     export_date: str,
+    no_probe: bool,
+    probe_results: dict[str, ProbeResult],
+    existing_secrets: set[str],
+    repo: str,
 ) -> str:
     lines: list[str] = []
     lines.append(f"Снимок экспорта датирован: {export_date}.")
@@ -564,9 +803,30 @@ def render_report(
         "`isActive`/`testStatus` в таблице ниже — состояние ПРЕДОХРАНИТЕЛЯ роутера учёток "
         "на дату снимка (квота исчерпана → учётка гасится, квота вернулась → включается "
         "обратно), а НЕ факт о текущей пригодности ключа. Колонка «ранг» называет "
-        "источник вывода: живая проба (текущий факт) либо снимок (когда пробы нет — "
-        "выключена флагом или недоступна по сети)."
+        "источник вывода: живая проба (текущий факт) либо снимок."
     )
+    # Minor 8 гейта PR #778: режим пробы — это факт из аргументов CLI, а не
+    # догадка по отсутствию результата у конкретной строки. Печатаем прямо,
+    # плюс агрегат по всем пробованным кандидатам, чтобы числа из PR можно
+    # было прочитать в самом выводе инструмента, а не пересчитывать руками.
+    if no_probe:
+        lines.append("Проба: выключена флагом `--no-probe` — весь ранг ниже взят из снимка.")
+    else:
+        buckets: dict[str, int] = {}
+        for status in probe_results.values():
+            bucket = _probe_bucket(status)
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        # Блокирующая 2 гейта PR #781: порядок берётся из _PROBE_BUCKET_LABELS
+        # (единственное место правды, объявлено рядом с PROBE_*) — раньше
+        # здесь жила ВТОРАЯ копия множества исходов литералом; исход,
+        # присутствующий в buckets, но отсутствующий в этой копии, молча
+        # выпадал из разбивки, хотя влиял на len(probe_results) в тотале.
+        order = list(_PROBE_BUCKET_LABELS.values())
+        parts = [f"{label} {buckets[label]}" for label in order if buckets.get(label)]
+        assert sum(buckets.values()) == len(probe_results)
+        lines.append(
+            f"Проба: {len(probe_results)} кандидат(ов) пробовано — " + (", ".join(parts) if parts else "нет данных") + "."
+        )
     lines.append("")
     lines.append("## Слоты combo-router (PR #732)\n")
     lines.append(
@@ -579,13 +839,39 @@ def render_report(
         name = slot.route.secret_env
         if slot.account is None:
             reason = slot.empty_reason or "нет кандидата"
+            # Major 4 гейта PR #778: «пусто» неоднозначно, если секрет уже
+            # существует — этот скрипт секреты не удаляет, значит маршрут в
+            # suite остаётся ВКЛЮЧЁН с ключом, который проба/снимок только что
+            # признали мёртвым/сомнительным. Различаем две ситуации явно.
+            if name in existing_secrets:
+                reason = (
+                    f"{reason} — секрет {name} уже существует и НЕ будет удалён (скрипт "
+                    "секреты не удаляет), маршрут в suite останется включён со старым "
+                    # Minor 6 гейта PR #781: repo уже известен вызывающему (main())
+                    # и уже передаётся в render_report для остального отчёта — команда
+                    # обязана копипаститься без правки владельцем, не носить плейсхолдер.
+                    f"ключом. Газ: `gh secret delete {name} --repo {repo}` вручную "
+                    "либо замени ключ на живой в экспорте и повтори прогон с --apply"
+                )
             lines.append(f"| {name} | — | — | — | — | — | пусто: {reason} | — |")
             empty += 1
             continue
         assigned += 1
         account = slot.account
         status = secret_status.get(name, "?")
-        _tier, note, _source = selection.rank_by_id.get(account.id, (None, "?", "?"))
+        tier, note, _source = selection.rank_by_id.get(account.id, (None, "?", "?"))
+        # Minor 4 гейта PR #781: TIER_SUSPECT (403) занимает слот, ключ будет
+        # записан при --apply, маршрут включён в suite — раньше единственным
+        # текстом был перечень гипотез (гео-блок/WAF/лимит плана), без ответа
+        # на «что делать». Сравнимо с пустым слотом при существующем секрете
+        # (:762 выше), где газ назван прямо.
+        if tier == _TIER_SUSPECT:
+            note = (
+                f"{note}. Газ при устойчивом 403: если несколько прогонов подряд дают тот "
+                "же 403 для этой учётки, считай ключ вероятно мёртвым и либо замени его в "
+                "роутере учёток, либо погаси учётку вручную (isActive=False), прежде чем "
+                "давать ей слот следующим прогоном"
+            )
         lines.append(
             f"| {name} | {account.provider} | {account.email} | {account.priority} | "
             f"{account.is_active} | {account.test_status} | {note} | {status} |"
@@ -593,6 +879,40 @@ def render_report(
     lines.append("")
     lines.append(f"Слотов с кандидатом: {assigned}; слотов без кандидата: {empty}.")
     lines.append("")
+    seen_secrets: set[str] = set()
+    model_slots = [
+        slot for slot in selection.assignments
+        if slot.account is not None and slot.account.id in probe_results
+    ]
+    if model_slots:
+        lines.append("## Доступные id моделей провайдеров (живая проба, /models)\n")
+        lines.append(
+            "Тот же HTTP-запрос, что дал ранг выше — тело ответа больше не выбрасывается. "
+            "Список полный, без фильтрации (см. обоснование в задаче: цель — точный id для "
+            "`vars.DSH_PROVIDER_CHAIN`, а не сокращённая выборка на глаз); id ВСЁ РАВНО обязан "
+            "пройти реестр подтверждённых моделей (`scripts/lib/confirmed-provider-models.json`, "
+            "#737) до попадания в цепочку."
+        )
+        for slot in model_slots:
+            name = slot.route.secret_env
+            if name in seen_secrets:
+                continue
+            seen_secrets.add(name)
+            result = probe_results[slot.account.id]
+            lines.append(f"\n### `{name}` — base_url `{slot.route.base_url}`\n")
+            if result.outcome != PROBE_ALIVE:
+                lines.append(f"- проба: {_probe_bucket(result)} — список моделей недоступен.")
+                continue
+            if result.models_error:
+                lines.append(f"- разбор тела ответа не удался: {result.models_error}")
+                continue
+            if not result.models:
+                lines.append("- проба не запрашивала модели (внутренняя ошибка — models пуст на статусе «жива»).")
+                continue
+            lines.append(f"- {len(result.models)} моделей:")
+            for model_id in result.models:
+                lines.append(f"  - `{model_id}`")
+        lines.append("")
     if selection.probe_excluded:
         lines.append("## Исключены живой пробой (подтверждено «ключ неверен»)\n")
         for account in selection.probe_excluded:
@@ -677,7 +997,7 @@ def main(argv: list[str] | None = None) -> int:
         accounts = accounts_from_export(data)
         routes_by_family = group_routes_by_family(routes)
         candidates_by_family, _out_of_scope = group_candidates(accounts, routes_by_family)
-        probe_results = (
+        probe_results: dict[str, ProbeResult] = (
             {} if args.no_probe else probe_candidates(candidates_by_family, routes_by_family)
         )
         selection = select_accounts(accounts, routes, probe_results=probe_results)
@@ -732,7 +1052,13 @@ def main(argv: list[str] | None = None) -> int:
         except LoudError as error:
             suite_status = f"ОШИБКА записи: {error}"
 
-    print(render_report(selection, secret_status, suite_status, args.apply, export_date))
+    print(
+        render_report(
+            selection, secret_status, suite_status, args.apply, export_date,
+            no_probe=args.no_probe, probe_results=probe_results, existing_secrets=existing_secrets,
+            repo=repo,
+        )
+    )
     return 0
 
 
