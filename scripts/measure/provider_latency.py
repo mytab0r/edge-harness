@@ -146,16 +146,15 @@ _ROUTE_ARRAY_RE = re.compile(r'PLUGINS_SUITE_CANDIDATE_ROUTES=\((.*?)\n\)', re.D
 _ROUTE_LINE_RE = re.compile(r'^"([^"]*)"\s*$')
 
 
-def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
-    """Непроверенная ёмкость — таблица `PLUGINS_SUITE_CANDIDATE_ROUTES` в
-    scripts/lib/dsh-ci.sh (#215), распарсенная, а не скопированная вторым
-    списком (находка ревью #837): каждая строка формата
-    "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName". Модель
-    OpenRouter-алиасов переопределяется на неподтверждённого free-tier
-    кандидата (см. OPENROUTER_FREE_MODEL_OVERRIDE выше) — источник несёт
-    платную модель для другого случая использования (комбо-роутер), не для
-    этого бенчмарка. Файла нет/формат не совпал — пустой список, fail loud
-    достаётся вызывающему по количеству кандидатов, не молчаливому [] здесь."""
+def parse_plugin_suite_routes(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
+    """Сырые записи таблицы `PLUGINS_SUITE_CANDIDATE_ROUTES` (dsh-ci.sh, #215)
+    — alias/base_url/secret_env/model/context_window/display_name, БЕЗ каких-
+    либо подмен модели (в отличие от build_plugin_suite_candidates() ниже,
+    которая уже подставляет OPENROUTER_FREE_MODEL_OVERRIDE для этого
+    бенчмарка). Общий парсер для этого модуля и
+    scripts/measure/provider_model_discovery.py (#848, discovery живых id) —
+    один регэксп на формат строки, не два расходящихся. Файла нет/формат не
+    совпал — пустой список, тем же контрактом, что и build_plugin_suite_candidates()."""
     try:
         text = dsh_ci_path.read_text(encoding="utf-8")
     except OSError:
@@ -171,10 +170,26 @@ def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
         parts = line_m.group(1).split("|")
         if len(parts) != 6:
             continue
-        alias, base_url, secret_env, model, _context_window, display_name = parts
-        if alias.startswith(OPENROUTER_ROUTE_ALIAS_PREFIX):
+        alias, base_url, secret_env, model, context_window, display_name = parts
+        out.append({"alias": alias, "base_url": base_url, "secret_env": secret_env,
+                     "model": model, "context_window": context_window, "display_name": display_name})
+    return out
+
+
+def build_plugin_suite_candidates(dsh_ci_path: Path = DSH_CI_SH) -> list[dict]:
+    """Непроверенная ёмкость — таблица `PLUGINS_SUITE_CANDIDATE_ROUTES` в
+    scripts/lib/dsh-ci.sh (#215), распарсенная, а не скопированная вторым
+    списком (находка ревью #837). Модель OpenRouter-алиасов переопределяется
+    на неподтверждённого free-tier кандидата (см. OPENROUTER_FREE_MODEL_OVERRIDE
+    выше) — источник несёт платную модель для другого случая использования
+    (комбо-роутер), не для этого бенчмарка."""
+    out = []
+    for route in parse_plugin_suite_routes(dsh_ci_path):
+        model = route["model"]
+        if route["alias"].startswith(OPENROUTER_ROUTE_ALIAS_PREFIX):
             model = OPENROUTER_FREE_MODEL_OVERRIDE
-        out.append({"name": display_name, "base_url": base_url, "model": model, "secret_env": secret_env})
+        out.append({"name": route["display_name"], "base_url": route["base_url"],
+                     "model": model, "secret_env": route["secret_env"]})
     return out
 
 

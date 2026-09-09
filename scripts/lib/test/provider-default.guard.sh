@@ -116,6 +116,10 @@ while IFS= read -r f; do
         # у смоук-фикстуры выше: файл целиком существует ради разбора
         # прод-формы URL/модели этих же провайдеров, не источник правды.
         "scripts/measure/test_provider_latency.py:"*) continue ;;
+        # Тесты discovery живых model id (#848) — та же причина, что у
+        # test_provider_latency.py выше: разбирают прод-форму URL/id этих же
+        # провайдеров, не источник правды.
+        "scripts/measure/test_provider_model_discovery.py:"*) continue ;;
       esac
       if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
         case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
@@ -128,6 +132,13 @@ while IFS= read -r f; do
       fi
       if [ "$f" = "scripts/measure/provider_latency.py" ]; then
         case "$content" in *'"NVIDIA-nano"'*|*'"NVIDIA-ultra"'*|*'"Ollama"'*|*'"OpenRouter"'*|*'"GLM"'*) continue ;; esac
+      fi
+      if [ "$f" = "scripts/measure/provider_model_discovery.py" ]; then
+        # CODING_RANK_KEYWORDS (#848) — эвристика ранжирования СРЕДИ УЖЕ
+        # ПОЛУЧЕННОГО живым /v1/models каталога, не дефолт-провайдер класса
+        # #153: ничего из этого списка не подставляется как активный
+        # провайдер/модель, список только выбирает лучший id из чужого ответа.
+        case "$content" in *'"deepseek-v3"'*|*'"nemotron-ultra"'*|*'"nemotron-super"'*) continue ;; esac
       fi
       literal_hits="$literal_hits$f:$line
 "
