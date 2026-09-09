@@ -99,14 +99,17 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "проверок этого репозитория, не растущий список.",
     ("scripts/orchestra/scheduler.py", "merge_queue"):
         "тот же check-runs, что pr_check_runs — тело инлайн внутри merge_queue.",
-    ("scripts/orchestra/scheduler.py", "worker_runs_active"):
-        "явный `per_page=1` — запрошен только последний прогон, не список.",
-    ("scripts/orchestra/scheduler.py", "stalled_worker_run"):
-        "тот же контракт, что worker_runs_active выше (#815, тот же запрос "
-        "`?status=in_progress&per_page=1`, вынесенный в отдельную функцию, "
-        "чтобы reap_stalled_worker_run мог переиспользовать решение "
-        "«зависший ли этот прогон» без второго обхода) — явный `per_page=1`, "
-        "запрошен только последний прогон, не список.",
+    ("scripts/orchestra/scheduler.py", "stalled_worker_runs"):
+        "до двух воркеров параллельно (#827, WORKER_MAX_CONCURRENCY): "
+        "`per_page=WORKER_MAX_CONCURRENCY+1` — запрошено ровно на один "
+        "прогон больше, чем слотов, тот же контракт «дай N последних», что "
+        "у recent_runs (сама природа списка ограничена числом слотов "
+        "параллельности, не растёт).",
+    ("scripts/orchestra/scheduler.py", "active_worker_runs"):
+        "тот же контракт, что stalled_worker_runs выше (#827) — единый "
+        "источник занятости слотов для worker_runs_active/free_worker_slot, "
+        "запрос на in_progress И queued с тем же `per_page=WORKER_MAX_"
+        "CONCURRENCY+1`, список по природе не превышает число слотов.",
     # Появились с #253 (стадия приёмки, слито после этой гвардии, #308/#309) —
     # не находка PR #311, добавлены здесь только чтобы гвардия оставалась
     # зелёной после ребейза на main; классификация та же, что у соседних

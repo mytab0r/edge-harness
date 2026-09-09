@@ -3141,13 +3141,19 @@ def test_dispatch_conflict_rework_releases_task_and_dispatches_targeted_worker(m
     assert observations == []
 
 
-def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
+def test_dispatch_conflict_rework_silent_while_both_worker_slots_busy(monkeypatch):
+    # #827: молчание требует ОБА слота занятыми, не один — сюда переехал
+    # прежний test_dispatch_conflict_rework_silent_while_worker_active.
     task = issue(474, assignees=("mytab0r",))
     p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
     fake = FakeGh({
         "issues/560/timeline?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {
-            "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+            "workflow_runs": [
+                workflow_run_at_slot(33814313381, "in_progress", 1),
+                workflow_run_at_slot(33814313382, "in_progress", 2),
+            ]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
@@ -3158,9 +3164,38 @@ def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
 
     assert dispatched is False
     assert actions == []
-    assert any("занят" in line and "#560" in line for line in observations)
+    assert any("заняты" in line and "#560" in line for line in observations)
     assert task["assignees"] != []  # задача не тронута
     assert not any(c.startswith("-X DELETE") for c in fake.calls)
+
+
+def test_dispatch_conflict_rework_uses_free_slot_when_one_worker_slot_busy(monkeypatch):
+    # #827: один занятый слот больше не молчит целиком расшивку — dispatch
+    # уходит во второй, свободный слот.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run_at_slot(33814313381, "in_progress", 1)]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "-X DELETE repos/mytab0r/edge-harness/issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "замок снят")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert any("#560" in line and "worker.yml запущен адресно" in line for line in actions)
+    assert any(
+        c == (f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches "
+              "-f ref=main -f inputs[task]=474 -f inputs[slot]=2")
+        for c in fake.mutating_calls()
+    )
 
 
 def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
@@ -3440,6 +3475,7 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
         ],
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(34027474271, "in_progress")]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # Отметка git-шага ставится РАНО в прогоне (перед dsh_run_with_retry,
         # scripts/worker/task.sh) — задолго до конца 280-минутного job'а,
         # поэтому attempts может стать 1 ещё ПОКА прогон "in_progress" (тот
@@ -4959,6 +4995,15 @@ def workflow_run(run_id, status):
     }
 
 
+def workflow_run_at_slot(run_id, status, slot):
+    """Тот же прод-снимок, что workflow_run, но с номером слота (#827) в
+    run-name — ровно то, что worker.yml пишет через свой `run-name:` для
+    прогонов, диспетчированных явно в конкретный слот параллельности."""
+    run = workflow_run(run_id, status)
+    run["display_title"] = f"worker (slot {slot})"
+    return run
+
+
 def graphql_pool_response(issues_list):
     """Ответ `gh api graphql` (уже распарсенный JSON, как его отдаёт
     `_default_gh`/`gh(*args)`) на запрос `task_deps.fetch_pool` — один
@@ -4996,7 +5041,7 @@ def test_dispatch_worker_fires_once_for_idle_worker_and_free_pool(monkeypatch):
         "(воркер сам назначится и откроет PR)"
     ]
     assert fake.mutating_calls() == [
-        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main"
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[slot]=1"
     ]
 
 
@@ -5055,7 +5100,7 @@ def test_dispatch_worker_degrades_to_rest_pool_when_graph_unavailable(monkeypatc
     assert any("граф блокировок недоступен" in line for line in lines)
     assert any(line.startswith("👷 свободная задача #89 ") for line in lines)
     assert fake.mutating_calls() == [
-        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main"
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[slot]=1"
     ]
 
 
@@ -5066,34 +5111,83 @@ def test_dispatch_worker_silent_when_pool_has_no_free_task(monkeypatch):
     assert fake.calls == []  # ноль вызовов вовсе: на занятый пул даже статусы не смотрим
 
 
-def test_dispatch_worker_silent_while_worker_run_in_progress(monkeypatch):
+def test_dispatch_worker_targets_free_slot_when_one_worker_run_in_progress(monkeypatch):
+    # До #827 один активный прогон молчал весь dispatch_worker — с двумя
+    # слотами параллельности он занимает только слот 1, dispatch уходит в
+    # свободный слот 2.
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response([issue(89, assignees=())]),
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    observations, actions = sch.dispatch_worker(
+        REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
+    assert not any("уже работает" in line for line in observations)
+    assert any("worker.yml запущен" in line for line in actions)
+    assert fake.mutating_calls() == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[slot]=2"
+    ]
+
+
+def test_dispatch_worker_silent_while_both_worker_slots_busy(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [
+                workflow_run_at_slot(33814313381, "in_progress", 1),
+                workflow_run_at_slot(33814313382, "in_progress", 2),
+            ]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
     observations, actions = sch.dispatch_worker(
         REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
     # #456: «воркер уже работает» ничего не меняет — наблюдение, не действие.
-    assert observations == ["👷 воркер уже работает — dispatch не нужен"]
+    assert observations == [
+        f"👷 все {sch.WORKER_MAX_CONCURRENCY} слота воркера заняты — dispatch не нужен"]
     assert actions == []
     assert fake.mutating_calls() == []
 
 
-def test_dispatch_worker_silent_while_worker_queued(monkeypatch):
+def test_dispatch_worker_targets_free_slot_while_other_slot_queued(monkeypatch):
     # queued считается активным так же, как in_progress: concurrency worker
-    # поставит второй прогон в очередь, и он выгорит только после текущего.
+    # поставит второй прогон в ту же группу-слот в очередь. С двумя слотами
+    # (#827) занятый слотом 1 queued-прогон не молчит весь dispatch — второй
+    # слот свободен.
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {
             "workflow_runs": [workflow_run(33814313390, "queued")]},
+        "graphql": graphql_pool_response([issue(89, assignees=())]),
+        "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_worker(
         REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
-    # #456: «воркер уже работает» ничего не меняет — наблюдение, не действие.
-    assert observations == ["👷 воркер уже работает — dispatch не нужен"]
+    assert not any("уже работает" in line or "заняты" in line for line in observations)
+    assert any("worker.yml запущен" in line for line in actions)
+    assert fake.mutating_calls() == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[slot]=2"
+    ]
+
+
+def test_dispatch_worker_silent_while_both_slots_queued_or_running(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run_at_slot(33814313381, "in_progress", 1)]},
+        "workflows/worker.yml/runs?status=queued": {
+            "workflow_runs": [workflow_run_at_slot(33814313390, "queued", 2)]},
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    observations, actions = sch.dispatch_worker(
+        REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
+    assert observations == [
+        f"👷 все {sch.WORKER_MAX_CONCURRENCY} слота воркера заняты — dispatch не нужен"]
     assert actions == []
     assert fake.mutating_calls() == []
 
@@ -5139,9 +5233,69 @@ def test_worker_runs_active_still_blocks_recent_in_progress_run(monkeypatch):
     now = datetime.now(timezone.utc)
     run = workflow_run(1, "in_progress")
     run["run_started_at"] = (now - timedelta(minutes=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
-    fake = FakeGh({"workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]}})
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
     patch_gh(monkeypatch, fake)
+    # worker_runs_active — «хотя бы один активен» (#827): значение не
+    # изменилось с введением второго слота, второй слот свободен — сам факт
+    # свободного слота проверяет free_worker_slot ниже, отдельным тестом.
     assert sch.worker_runs_active(REPO) is True
+
+
+# ── free_worker_slot (#827): до WORKER_MAX_CONCURRENCY воркеров параллельно ──
+
+
+def test_free_worker_slot_returns_second_slot_when_first_busy(monkeypatch):
+    run = workflow_run_at_slot(1, "in_progress", 1)  # прогон без явного тега
+    run["run_started_at"] = "2026-09-09T11:55:00Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.free_worker_slot(REPO, utc(2026, 9, 9, 12, 0)) == 2
+
+
+def test_free_worker_slot_untagged_run_occupies_slot_one(monkeypatch):
+    # Ручной запуск (или прогон до #827) без inputs.slot — run-name «worker»
+    # без «(slot N)»: консервативно занимает слот 1, не третий свободный.
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = "2026-09-09T11:55:00Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.free_worker_slot(REPO, utc(2026, 9, 9, 12, 0)) == 2
+
+
+def test_free_worker_slot_none_when_both_slots_busy(monkeypatch):
+    run1 = workflow_run_at_slot(1, "in_progress", 1)
+    run1["run_started_at"] = "2026-09-09T11:55:00Z"
+    run2 = workflow_run_at_slot(2, "in_progress", 2)
+    run2["run_started_at"] = "2026-09-09T11:50:00Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run1, run2]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.free_worker_slot(REPO, utc(2026, 9, 9, 12, 0)) is None
+
+
+def test_free_worker_slot_ignores_stalled_run_in_that_slot(monkeypatch):
+    # Мутация-доказательство (#815 + #827): убрать фильтр зависших прогонов в
+    # active_worker_runs красит этот тест — слот 1 остался бы занят навечно
+    # зависшим прогоном.
+    stalled = workflow_run_at_slot(1, "in_progress", 1)
+    stalled["run_started_at"] = "2020-01-01T00:00:00Z"
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [stalled]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.free_worker_slot(REPO, utc(2026, 9, 9, 12, 0)) == 1
 
 
 def test_dispatch_worker_dispatches_when_previous_run_is_stalled(monkeypatch):
@@ -5280,6 +5434,47 @@ def test_reap_stalled_worker_run_skips_task_assigned_before_run_started(monkeypa
     assert "не определена" in actions[0]
 
 
+def test_reap_stalled_worker_run_handles_both_slots_independently(monkeypatch):
+    # #827: два слота параллельности могут зависнуть независимо — до этой
+    # правки reap_stalled_worker_run смотрел только на первый в списке
+    # (per_page=1) и никогда не увидел бы второй зависший прогон.
+    now = utc(2026, 9, 9, 14, 0, 0)
+    run1 = workflow_run_at_slot(34339807907, "in_progress", 1)
+    run1["run_started_at"] = "2026-09-09T10:21:51Z"
+    run2 = workflow_run_at_slot(34339807999, "in_progress", 2)
+    run2["run_started_at"] = "2026-09-09T10:00:00Z"
+    task1 = issue(815, assignees=("mytab0r",))
+    task2 = issue(820, assignees=("mytab0r",))
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run1, run2]},
+        "actions/runs/34339807907/cancel": None,
+        "actions/runs/34339807999/cancel": None,
+        "issues/815/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-09T10:22:30Z"},
+        ],
+        "issues/820/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-09T10:01:00Z"},
+        ],
+        "issues/815/comments": None,
+        "issues/820/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release_full",
+                         lambda repo, n: f"назначение снято; замок task-{n} снят")
+
+    observations, actions = sch.reap_stalled_worker_run(
+        REPO, now, pool=[task1, task2], pulls=[])
+
+    assert observations == []
+    assert task1["assignees"] == []
+    assert task2["assignees"] == []
+    assert any(c.startswith("-X POST") and "runs/34339807907/cancel" in c for c in fake.calls)
+    assert any(c.startswith("-X POST") and "runs/34339807999/cancel" in c for c in fake.calls)
+    assert len(actions) == 2
+    assert any("#815" in a for a in actions)
+    assert any("#820" in a for a in actions)
+
+
 # ── dispatch_worker при закрытом WIP-гейте (#464, критическая находка ревью
 # PR #466): гейт держит только НОВЫЕ задачи, доводка уже открытых PR обязана
 # идти — иначе тормоз без газа (AGENTS.md), очередь не разгребается сама.
@@ -5304,7 +5499,7 @@ def test_dispatch_worker_targets_declared_pr_task_when_wip_gate_closed(monkeypat
     ]
     assert fake.mutating_calls() == [
         f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches "
-        "-f ref=main -f inputs[task]=89"
+        "-f ref=main -f inputs[task]=89 -f inputs[slot]=1"
     ]
 
 
@@ -5349,22 +5544,49 @@ def test_dispatch_worker_blocks_new_task_when_wip_gate_closed_and_no_pr_yet(monk
     assert not any("dispatches" in call for call in fake.mutating_calls())
 
 
-def test_dispatch_worker_stays_silent_while_worker_active_even_when_rework_available(monkeypatch):
-    # Активный прогон воркера блокирует диспатч раньше, чем эта функция вообще
-    # смотрит на declared_pr_task_numbers — тот же порядок проверок, что и при
-    # разрешённом гейте.
+def test_dispatch_worker_stays_silent_while_both_worker_slots_busy_even_when_rework_available(monkeypatch):
+    # Оба слота воркера заняты — dispatch отложен раньше, чем эта функция
+    # вообще смотрит на declared_pr_task_numbers, тот же порядок проверок,
+    # что и при разрешённом гейте.
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {
-            "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+            "workflow_runs": [
+                workflow_run_at_slot(33814313381, "in_progress", 1),
+                workflow_run_at_slot(33814313382, "in_progress", 2),
+            ]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
     pool = [issue(89, assignees=())]
     pulls = [pull(500, ref="agent/89-fix-thing", labels=["ai:changes-requested"])]
     observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=False, pulls=pulls)
-    assert observations == ["👷 воркер уже работает — dispatch не нужен"]
+    assert observations == [
+        f"👷 все {sch.WORKER_MAX_CONCURRENCY} слота воркера заняты — dispatch не нужен"]
     assert actions == []
     assert fake.mutating_calls() == []
+
+
+def test_dispatch_worker_targets_rework_in_free_slot_when_one_slot_busy(monkeypatch):
+    # #827: один занятый слот больше не молчит целиком dispatch_worker — при
+    # закрытом WIP-гейте доводка уходит во второй, свободный слот.
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run_at_slot(33814313381, "in_progress", 1)]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    pool = [issue(89, assignees=())]
+    pulls = [pull(500, ref="agent/89-fix-thing", labels=["ai:changes-requested"])]
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=False, pulls=pulls)
+    assert not any("уже работает" in line or "заняты" in line for line in observations)
+    assert any("#89" in line and "worker.yml запущен" in line for line in actions)
+    assert fake.mutating_calls() == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches "
+        "-f ref=main -f inputs[task]=89 -f inputs[slot]=2"
+    ]
 
 
 # ── Наблюдения vs действия в отчёте (#456) ───────────────────────────────────────
@@ -5569,7 +5791,7 @@ def test_integration_gate_closed_dispatches_rework_not_new_task(monkeypatch):
     assert any("#89" in line for line in combined)
     assert not any("#95" in line for line in combined)  # новая задача НЕ взята
     assert any(
-        call.endswith("-f ref=main -f inputs[task]=89") for call in fake.mutating_calls()
+        call.endswith("-f ref=main -f inputs[task]=89 -f inputs[slot]=1") for call in fake.mutating_calls()
     )
 
 
@@ -5593,7 +5815,7 @@ def test_integration_gate_open_dispatches_oldest_free_task_as_before(monkeypatch
     combined = d_observations + d_actions
     assert any("#89" in line for line in combined)  # старейшая свободная, не #95
     assert fake.mutating_calls()[-1] == (
-        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main"
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[slot]=1"
     )  # без inputs[task] — воркер выбирает сам, как до #464
 
 

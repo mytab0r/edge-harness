@@ -22,8 +22,9 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
      MERGE_LOOP_TIMEOUT_SECONDS. Раньше цикл ограничивался внешней периодикой
      (schedule доставляет ~7% тиков, docs/research/21) — теперь запуск сам
      проводит всю очередь, какая накопилась к моменту события.
-  4. Пульс конвейера: если в пуле есть свободная задача и активного worker-рана
-     нет — ровно один `workflow_dispatch` воркера (scripts/worker/task.sh,
+  4. Пульс конвейера: если в пуле есть свободная задача и есть свободный слот
+     параллельности воркера (до WORKER_MAX_CONCURRENCY, #827) — ровно один
+     `workflow_dispatch` воркера за пульс в этот слот (scripts/worker/task.sh,
      docs/agents/WORKER-PLAYBOOK.md). Best-effort: сбой диспатча не роняет
      планировщик.
   5. Предохранитель конвейера (#120): WORKER_FAILURE_PAUSE_AFTER красных прогонов
@@ -862,9 +863,10 @@ def dispatch_conflict_rework(
     тот же канал, что предохранитель конвейера #120) с файлами-кандидатами
     (conflict_overlap_hint — эвристика, честно помечена как таковая).
 
-    Идемпотентность — worker_runs_active (тот же гейт, что dispatch_worker):
-    воркер один на репозиторий, пока прошлый прогон жив (in_progress/
-    queued), второй dispatch не уходит. Третий элемент возвращаемого
+    Идемпотентность — free_worker_slot (тот же выбор слота, что dispatch_worker,
+    #827): до WORKER_MAX_CONCURRENCY прогонов одновременно, пока свободен хотя
+    бы один слот (in_progress/queued другого не считается тем же прогоном),
+    dispatch уходит; все заняты — откладывается. Третий элемент возвращаемого
     кортежа (dispatched) — сигнал main() не звать следом обычный
     dispatch_worker в этом же проходе: «ровно один workflow_dispatch воркера
     за пульс» не должно превратиться в два только из-за гонки — GitHub не
@@ -921,9 +923,14 @@ def dispatch_conflict_rework(
             # без этой проверки следующий тик оркестратора (каждые 15 мин)
             # увидел бы attempts >= порога ДО того, как единственная попытка
             # вообще успела завершиться, и эскалировал бы «не сошлось», хотя
-            # прогон ещё идёт. worker_runs_active — тот же гейт, что ниже:
-            # пока прогон жив, эскалация ждёт, не дублирует dispatch и не
-            # торопится с вердиктом.
+            # прогон ещё идёт. Здесь нарочно worker_runs_active («хотя бы один
+            # активен»), не free_worker_slot (#827, гейт самого dispatch ниже):
+            # эскалация обязана ждать, пока жив ЛЮБОЙ прогон воркера, даже
+            # если это не он сам, а сосед в другом слоте, — иначе с двумя
+            # слотами свободный второй слот сделал бы free_worker_slot
+            # неверным (не тем же) прокси для «эта попытка ещё идёт», и
+            # эскалация могла бы уйти раньше, чем реально закончился прогон,
+            # который она разбирает.
             if dispatched or worker_runs_active(repo):
                 observations.append(
                     f"⏸️ PR #{number}: авто-попытка ребейза ещё идёт (worker.yml активен) — "
@@ -1001,8 +1008,18 @@ def dispatch_conflict_rework(
             continue
         if _issue_is_blocked(issue):
             continue  # эскалация playbook уже идёт своим путём — не мешаем ей
-        if dispatched or worker_runs_active(repo):
+        if dispatched:
             observations.append(f"⏸️ PR #{number} в конфликте, но воркер занят — расшивка отложена")
+            continue
+        # Слот параллельности (#827), не бинарный «занят/свободен»: при одном
+        # занятом слоте расшивка уходит во второй, при обоих занятых — как
+        # раньше, откладывается.
+        slot = free_worker_slot(repo)
+        if slot is None:
+            observations.append(
+                f"⏸️ PR #{number} в конфликте, но все {WORKER_MAX_CONCURRENCY} слота воркера "
+                "заняты — расшивка отложена"
+            )
             continue
         if issue["assignees"]:
             who = ", ".join(a["login"] for a in issue["assignees"])
@@ -1017,7 +1034,7 @@ def dispatch_conflict_rework(
             release_note = f"замок не снят: {error}"
         gh(
             "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
-            "-f", "ref=main", "-f", f"inputs[task]={task_number}",
+            "-f", "ref=main", "-f", f"inputs[task]={task_number}", "-f", f"inputs[slot]={slot}",
         )
         post_issue_comment(
             repo, number,
@@ -2395,6 +2412,45 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
 # задачу сразу, а не стена, после которой задача ждёт TTL.
 WORKER_STALL_MINUTES = 255
 
+# ── До двух воркеров параллельно (#827) ──────────────────────────────────────
+# Владелец, 2026-09-09: серийная расшивка бэклога (18 сброшенных конфликтных
+# PR + новые задачи, «⏸️ воркер занят» на несколько PR за проход) слишком
+# медленная при ОДНОМ воркере на репозиторий. Замер риска перед подъёмом:
+#   - GitHub Actions: 20 одновременных job'ов на Free-план (docs/research/21,
+#     раздел «Лимиты, которые остаются») — 2 не приближается к потолку;
+#     GITHUB_TOKEN живьём отдаёт 5000 запросов/час на этот репозиторий (то же
+#     research, живой замер 2026-09-09) — heartbeat/gh-вызовы двух воркеров
+#     не создают риска этого класса;
+#   - провайдер-квота (NVIDIA/GLM, DSH_PROVIDER_CHAIN, docs/runbooks/
+#     switch-llm-provider.md) — ГЛАВНЫЙ риск: репозиторий НЕ хранит числа
+#     RPM/квоты NVIDIA ни в одном research-документе (проверено при этой
+#     задаче) — есть только форма отказа («RATE_LIMIT: Weekly/Monthly Limit
+#     Exhausted»), не порог. Без этого числа посчитать, выдержит ли NVIDIA
+#     двух конкурентных воркеров, честно нельзя — решение сделано
+#     консервативным, не «подобрано под лимит»: N=2, не 3+, с готовностью
+#     откатить назад, если исчерпание квоты начнёт коррелировать с
+#     параллельными прогонами (dsh_run_with_provider_chain уже переключает
+#     провайдера при quota_exhausted, откат — снижение этой константы, не
+#     новый код).
+# Каждый слот — своя concurrency-группа worker.yml (`worker-<slot>`, файл
+# workflow) — GitHub concurrency сама сериализует прогоны ВНУТРИ слота, как
+# раньше сериализовала все прогоны репозитория в одну группу.
+WORKER_MAX_CONCURRENCY = 2
+
+# run-name worker.yml несёт номер слота как есть (`worker (slot N)...`) —
+# REST-объект прогона не отдаёт workflow_dispatch inputs ни в каком поле
+# (только `display_title`, вычисленный из `run-name`), поэтому слот читается
+# оттуда. Прогон без распознанного номера (ручной запуск до этого change,
+# сторонний триггер) — считается слотом 1 консервативно: тот же слот, что
+# был единственным до #827, не третий свободный по умолчанию.
+_SLOT_PATTERN = re.compile(r"\(slot (\d+)\)")
+
+
+def _run_slot(run: dict) -> int:
+    title = run.get("display_title") or run.get("name") or ""
+    match = _SLOT_PATTERN.search(title)
+    return int(match.group(1)) if match else 1
+
 
 def _run_age_minutes(run: dict, now: datetime) -> float | None:
     """Возраст прогона в минутах от `run_started_at` (когда GitHub его знает)
@@ -2418,67 +2474,94 @@ def _run_is_stalled(run: dict, now: datetime,
     return age is not None and age >= threshold_minutes
 
 
-def stalled_worker_run(repo: str, now: datetime) -> dict | None:
-    """Прогон worker.yml, который GitHub всё ещё числит `in_progress`, но
-    который идёт дольше WORKER_STALL_MINUTES — выше арифметического максимума
-    легитимного прогона по действующему бюджету (см. обоснование порога
-    выше). Признак свежести
-    heartbeat (HANDS_TOKEN + HARNESS_URL/api/status, cf-worker/src/
-    harness.ts::handsAreAlive) сюда НЕ подключён: оркестратор (orchestra.yml)
-    не получает эти секреты/vars в своём окружении — добавление живого
-    сетевого вызова в этот гейт (используется несколькими диспетчерами за
-    пульс, см. вызовы ниже) вне рамок этого фикса, отдельное решение
-    владельца. Деградация честная и единственный сигнал сегодня —
-    длительность `in_progress`, признак грубее heartbeat (не отличает
-    «завис» от «просто редкая долгая легитимная работа за порогом»), но не
-    молчит: сообщение действия ниже (main()) прямо называет длительность и
-    порог, а не гадает."""
+def stalled_worker_runs(repo: str, now: datetime) -> list[dict]:
+    """Прогоны worker.yml, которые GitHub всё ещё числит `in_progress`, но
+    которые идут дольше WORKER_STALL_MINUTES — сильнее наблюдаемого максимума
+    легитимного success (см. обоснование порога выше). До WORKER_MAX_CONCURRENCY
+    прогонов могут висеть одновременно, в разных слотах (#827) — проверяются
+    ВСЕ активные in_progress-прогоны, не только первый (было до #827, когда
+    воркер был один на репозиторий): зависание в одном слоте не должно
+    маскироваться живым прогоном в другом. Признак свежести heartbeat
+    (HANDS_TOKEN + HARNESS_URL/api/status, cf-worker/src/harness.ts::
+    handsAreAlive) сюда НЕ подключён: оркестратор (orchestra.yml) не получает
+    эти секреты/vars в своём окружении — добавление живого сетевого вызова в
+    этот гейт (используется несколькими диспетчерами за пульс, см. вызовы
+    ниже) вне рамок этого фикса, отдельное решение владельца. Деградация
+    честная и единственный сигнал сегодня — длительность `in_progress`,
+    признак грубее heartbeat (не отличает «завис» от «просто редкая долгая
+    легитимная работа за порогом»), но не молчит: сообщение действия ниже
+    (main()) прямо называет длительность и порог, а не гадает."""
     payload = gh(
-        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=in_progress&per_page=1"
+        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=in_progress&per_page={WORKER_MAX_CONCURRENCY + 1}"
     ) or {}
     runs = payload.get("workflow_runs") or []
-    if not runs:
-        return None
-    run = runs[0]
-    return run if _run_is_stalled(run, now) else None
+    return [run for run in runs if _run_is_stalled(run, now)]
+
+
+def active_worker_runs(repo: str, now: datetime | None = None) -> list[dict]:
+    """Прогоны worker.yml, реально занимающие слот параллельности (#827):
+    in_progress (кроме зависших, см. stalled_worker_runs) + queued. Один
+    источник для всех потребителей занятости (worker_runs_active,
+    free_worker_slot) — второе место правды не заводится."""
+    now = now or datetime.now(timezone.utc)
+    active: list[dict] = []
+    for status in ("in_progress", "queued"):
+        payload = gh(
+            f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status={status}&per_page={WORKER_MAX_CONCURRENCY + 1}"
+        ) or {}
+        for run in payload.get("workflow_runs") or []:
+            if status == "in_progress" and _run_is_stalled(run, now):
+                continue  # завис — не блокирует, см. stalled_worker_runs
+            active.append(run)
+    return active
 
 
 def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
-    """Активный воркер = есть worker-ран в статусе in_progress или queued.
-    Завершённые (в т.ч. упавшие) не считаются: упавший воркер при свободных
-    задачах получит новый запуск — но пока задача назначена, пул свободных пуст
-    и штурма не будет (возврат в пул только через stale-окно reap_stale).
+    """Активный воркер = есть ХОТЯ БЫ ОДИН worker-ран в статусе in_progress
+    или queued (не «все слоты заняты» — для этого вопроса своя функция,
+    free_worker_slot). Завершённые (в т.ч. упавшие) не считаются: упавший
+    воркер при свободных задачах получит новый запуск — но пока задача
+    назначена, пул свободных пуст и штурма не будет (возврат в пул только
+    через stale-окно reap_stale).
 
-    Зависший in_progress (#815, stalled_worker_run выше) — ИСКЛЮЧЕНИЕ: дольше
+    Зависший in_progress (#815, stalled_worker_runs выше) — ИСКЛЮЧЕНИЕ: дольше
     WORKER_STALL_MINUTES без завершения не блокирует ни один из трёх
-    диспетчеров, читающих эту функцию (dispatch_worker, dispatch_conflict_rework,
-    проба предохранителя — она тоже уходит через dispatch_worker, отдельного
-    гейта у неё нет). Сама отмена зависшего прогона и освобождение его задачи —
-    отдельный шаг main() (reap_stalled_worker_run), не побочный эффект этой
-    read-only проверки: функцию читают несколько мест за один пульс, мутировать
-    GitHub при каждом чтении было бы сюрпризом и лишними вызовами."""
-    now = now or datetime.now(timezone.utc)
-    for status in ("in_progress", "queued"):
-        payload = gh(
-            f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status={status}&per_page=1"
-        ) or {}
-        runs = payload.get("workflow_runs") or []
-        if not runs:
-            continue
-        if status == "in_progress" and _run_is_stalled(runs[0], now):
-            continue  # завис — не блокирует, см. докстринг
-        return True
-    return False
+    диспетчеров, читающих эту функцию (dispatch_conflict_rework — обе точки
+    чтения ниже используют её как консервативный признак «расшивка/попытка,
+    вероятно, ещё идёт», не как гейт для самого dispatch; сам выбор слота под
+    dispatch — free_worker_slot, #827). Сама отмена зависшего прогона и
+    освобождение его задачи — отдельный шаг main() (reap_stalled_worker_run),
+    не побочный эффект этой read-only проверки: функцию читают несколько мест
+    за один пульс, мутировать GitHub при каждом чтении было бы сюрпризом и
+    лишними вызовами."""
+    return bool(active_worker_runs(repo, now))
+
+
+def free_worker_slot(repo: str, now: datetime | None = None) -> int | None:
+    """Номер свободного слота параллельности (1..WORKER_MAX_CONCURRENCY, #827)
+    для следующего dispatch worker.yml, либо None — все заняты. Слот уже
+    занятого прогона читается из run-name (_run_slot) — прогон без
+    распознанного слота (ручной запуск, сторонний триггер) занимает слот 1
+    консервативно. Единственное место, откуда dispatch_worker/
+    dispatch_conflict_rework узнают, в какой слот адресовать `-f
+    inputs[slot]=`, — второе место правды не заводится."""
+    busy = {_run_slot(run) for run in active_worker_runs(repo, now)}
+    for slot in range(1, WORKER_MAX_CONCURRENCY + 1):
+        if slot not in busy:
+            return slot
+    return None
 
 
 def reap_stalled_worker_run(
     repo: str, now: datetime, pool: list[dict], pulls: list[dict],
 ) -> tuple[list[str], list[str]]:
-    """Разряжает находку stalled_worker_run (#815): отменяет зависший прогон
-    (best-effort — сам гейт worker_runs_active уже не блокирует диспатч
-    независимо от исхода отмены) и освобождает его задачу СРАЗУ, не дожидаясь
-    обычных 24ч reap_stale/claim_task.collect_stale — иначе задача осталась бы
-    занятой почти сутки после того, как сам факт зависания уже установлен.
+    """Разряжает находки stalled_worker_runs (#815, до WORKER_MAX_CONCURRENCY
+    штук одновременно с #827 — два слота могут зависнуть независимо):
+    отменяет каждый зависший прогон (best-effort — сам гейт worker_runs_active
+    уже не блокирует диспатч независимо от исхода отмены) и освобождает его
+    задачу СРАЗУ, не дожидаясь обычных 24ч reap_stale/claim_task.collect_stale
+    — иначе задача осталась бы занятой почти сутки после того, как сам факт
+    зависания уже установлен.
 
     Задача, арендованная зависшим прогоном, определяется структурным
     признаком (не парсингом прозы, класс которого запрещён AGENTS.md): среди
@@ -2488,62 +2571,68 @@ def reap_stalled_worker_run(
     первые секунды job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы.
     Совпадений может не быть (адресный прогон на задачу с уже открытым PR —
     её reap_stale не тронул бы; либо аренда не найдена вовсе) — тогда отмена
-    прогона всё равно происходит, задача остаётся на обычном пути."""
+    прогона всё равно происходит, задача остаётся на обычном пути. Несколько
+    зависших прогонов не конкурируют за одну задачу — уже сопоставленный
+    номер (`used_task_numbers`) исключается из поиска для следующего прогона
+    в этом же вызове."""
     observations: list[str] = []
     actions: list[str] = []
-    run = stalled_worker_run(repo, now)
-    if run is None:
-        return observations, actions
-    run_id = run["id"]
-    started = run.get("run_started_at") or run.get("created_at")
-    start = parse_time(started)
-    age_minutes = minutes_between(start, now)
-    try:
-        gh("-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
-        cancel_note = "отменён"
-    except RuntimeError as error:
-        cancel_note = f"отменить не удалось: {error}"
-    task_number = None
-    for issue in pool:
-        if not issue["assignees"] or _issue_is_blocked(issue):
-            continue
-        number = issue["number"]
-        if any(pr_references_issue(pull, number) for pull in pulls):
-            continue
-        last = last_assigned_at(repo, number)
-        if last is not None and last >= start:
-            task_number = number
-            break
-    if task_number is not None:
-        release_note = claim_task.release_full(repo, task_number)
-        pool_issue = next((i for i in pool if i["number"] == task_number), None)
-        if pool_issue is not None:
-            pool_issue["assignees"] = []
+    runs = stalled_worker_runs(repo, now)
+    used_task_numbers: set[int] = set()
+    for run in runs:
+        run_id = run["id"]
+        started = run.get("run_started_at") or run.get("created_at")
+        start = parse_time(started)
+        age_minutes = minutes_between(start, now)
         try:
-            gh(
-                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
-                "-f", "body=" + (
-                    f"♻️ Прогон worker.yml (run {run_id}) завис {int(age_minutes)} мин "
-                    f"без завершения (порог {WORKER_STALL_MINUTES} мин) — оркестратор счёл его "
-                    f"зависшим, отменил ({cancel_note}) и снял аренду ({release_note}). Задача "
-                    "возвращена в пул: python3 scripts/lib/claim_task.py claim "
-                    f"{task_number} (#121, #815)."
-                ),
-            )
+            gh("-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
+            cancel_note = "отменён"
         except RuntimeError as error:
-            print(f"::warning::след о снятии аренды #{task_number} не оставлен: {error}",
-                  file=sys.stderr)
-        actions.append(
-            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
-            f"{WORKER_STALL_MINUTES}) — {cancel_note}; задача #{task_number} освобождена "
-            f"({release_note})"
-        )
-    else:
-        actions.append(
-            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
-            f"{WORKER_STALL_MINUTES}) — {cancel_note}; арендованная им задача не определена "
-            "(см. лог прогона вручную)"
-        )
+            cancel_note = f"отменить не удалось: {error}"
+        task_number = None
+        for issue in pool:
+            number = issue["number"]
+            if number in used_task_numbers:
+                continue
+            if not issue["assignees"] or _issue_is_blocked(issue):
+                continue
+            if any(pr_references_issue(pull, number) for pull in pulls):
+                continue
+            last = last_assigned_at(repo, number)
+            if last is not None and last >= start:
+                task_number = number
+                break
+        if task_number is not None:
+            used_task_numbers.add(task_number)
+            release_note = claim_task.release_full(repo, task_number)
+            pool_issue = next((i for i in pool if i["number"] == task_number), None)
+            if pool_issue is not None:
+                pool_issue["assignees"] = []
+            try:
+                gh(
+                    "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
+                    "-f", "body=" + (
+                        f"♻️ Прогон worker.yml (run {run_id}) завис {int(age_minutes)} мин "
+                        f"без завершения (порог {WORKER_STALL_MINUTES} мин) — оркестратор счёл его "
+                        f"зависшим, отменил ({cancel_note}) и снял аренду ({release_note}). Задача "
+                        "возвращена в пул: python3 scripts/lib/claim_task.py claim "
+                        f"{task_number} (#121, #815)."
+                    ),
+                )
+            except RuntimeError as error:
+                print(f"::warning::след о снятии аренды #{task_number} не оставлен: {error}",
+                      file=sys.stderr)
+            actions.append(
+                f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
+                f"{WORKER_STALL_MINUTES}) — {cancel_note}; задача #{task_number} освобождена "
+                f"({release_note})"
+            )
+        else:
+            actions.append(
+                f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
+                f"{WORKER_STALL_MINUTES}) — {cancel_note}; арендованная им задача не определена "
+                "(см. лог прогона вручную)"
+            )
     return observations, actions
 
 
@@ -2892,7 +2981,12 @@ def dispatch_worker(
 
     Возвращает (наблюдения, действия) — разведено по #456: «воркер уже
     работает — dispatch не нужен» ничего не меняет, это факт состояния, а не
-    действие этого прогона."""
+    действие этого прогона.
+
+    Слот параллельности (#827): вместо бинарного «воркер занят/свободен»
+    выбирается свободный слот (free_worker_slot, 1..WORKER_MAX_CONCURRENCY) —
+    dispatch уходит в него через input `slot`; заняты оба — прежнее поведение
+    (наблюдение «dispatch не нужен», без действия)."""
     observations: list[str] = []
     actions: list[str] = []
     # Есть ли ХОТЬ ОДНА свободная — дешёвая проверка на уже полученном
@@ -2900,8 +2994,10 @@ def dispatch_worker(
     if not free_task.free_candidates(pool):
         return observations, actions
     try:
-        if worker_runs_active(repo):
-            observations.append("👷 воркер уже работает — dispatch не нужен")
+        slot = free_worker_slot(repo)
+        if slot is None:
+            observations.append(
+                f"👷 все {WORKER_MAX_CONCURRENCY} слота воркера заняты — dispatch не нужен")
             return observations, actions
         if not wip_allowed:
             # WIP-гейт закрыл взятие новых задач — только доводка уже открытых
@@ -2928,7 +3024,7 @@ def dispatch_worker(
             gh(
                 "-X", "POST",
                 f"repos/{repo}/actions/workflows/worker.yml/dispatches",
-                "-f", "ref=main", "-f", f"inputs[task]={target}",
+                "-f", "ref=main", "-f", f"inputs[task]={target}", "-f", f"inputs[slot]={slot}",
             )
             actions.append(
                 f"👷 WIP-лимит закрыл новые задачи, но задача #{target} уже с открытым PR — "
@@ -2952,7 +3048,7 @@ def dispatch_worker(
         gh(
             "-X", "POST",
             f"repos/{repo}/actions/workflows/worker.yml/dispatches",
-            "-f", "ref=main",
+            "-f", "ref=main", "-f", f"inputs[slot]={slot}",
         )
         if candidates:
             actions.append(
