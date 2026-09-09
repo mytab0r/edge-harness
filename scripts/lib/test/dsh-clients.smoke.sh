@@ -420,20 +420,21 @@ export HANDS_URL="https://journal.test"
 export HARNESS_URL="https://journal.test"
 export HANDS_TOKEN="smoke-hands-token"
 export DEEPSEEK_API_KEY="smoke-deepseek-key"
-# ФИКСТУРА теста, не дефолт прода (#153): dsh_require_provider_env требует
-# непустых значений, значение здесь произвольно и не читается как источник
-# правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
+# ФИКСТУРА теста, не дефолт прода (#153): DEEPSEEK_BASE_URL/DEEPSEEK_MODEL
+# здесь больше не читаются напрямую ни одним из трёх каналов (все три —
+# ai_dsh.sh/worker/task.sh/hands/dsh_task.sh — теперь требуют
+# vars.DSH_PROVIDER_CHAIN, #727/#797/#805); экспорт оставлен как безвредный
+# остаток на случай кода, который ещё их читает где-то в цепочке вызовов —
+# единственный источник правды для провайдера теперь DSH_PROVIDER_CHAIN ниже.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
-# Цепочка провайдеров (#727, довод #797): ai_dsh.sh (ревью) И worker/task.sh
-# теперь требуют vars.DSH_PROVIDER_CHAIN, не одиночные DEEPSEEK_* напрямую —
-# один фиктивный провайдер, ссылающийся на ту же DEEPSEEK_API_KEY-фикстуру
-# (hands по-прежнему читает DEEPSEEK_* напрямую через dsh_require_provider_env
-# — не тронуто этим PR, см. openspec/changes/llm-provider-chain-failover/
-# tasks.md «Осталось»). worker/task.sh сам патчит профиль значениями chain[0]
-# ДО первого `dsh` (плагин стрима) — DEEPSEEK_BASE_URL/DEEPSEEK_MODEL,
-# экспортированные для hands прямо выше, воркер перезаписывает своими же
-# значениями, взятыми из этой же цепочки.
+# Цепочка провайдеров (#727, доводы #797/#805): ai_dsh.sh (ревью), worker/task.sh
+# И hands/dsh_task.sh теперь требуют vars.DSH_PROVIDER_CHAIN, не одиночные
+# DEEPSEEK_* напрямую — один фиктивный провайдер, ссылающийся на ту же
+# DEEPSEEK_API_KEY-фикстуру. worker/task.sh и hands/dsh_task.sh оба сами
+# патчат профиль значениями chain[0] ДО первого `dsh` (плагин стрима) —
+# DEEPSEEK_BASE_URL/DEEPSEEK_MODEL, экспортированные прямо выше, оба клиента
+# перезаписывают своими же значениями, взятыми из этой же цепочки.
 export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
 # Реестр подтверждённых id (#737): реальный реестр репозитория
 # (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель
@@ -799,6 +800,11 @@ echo "SMOKE: worker-rate-limit-quota — ок"
 # (issue-N) возвращается в пул ПОСЛЕ того, как GH_RUN_TOKEN уже снят из
 # экспорта (trust-zone, #121): release-full обязан пройти на СОХРАНЁННОЙ
 # копии токена (LEASE_RELEASE_TOKEN), не на переменной окружения.
+# Цепочка провайдеров (#727/#805): фикстура несёт РОВНО одного провайдера —
+# rate_limit_retry_budget_exceeded (переключаемый класс) исчерпывает цепочку
+# целиком в ОДИН шаг, тот же паттерн, что уже доказан для ai-review выше
+# (AI_RL4) — журнал получает all_providers_exhausted, не
+# rate_limit_retry_budget_exceeded напрямую.
 scenario_start
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke: бюджет ретрая рук исчерпан" \
@@ -809,8 +815,8 @@ HANDS_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client_expect_fail "hands-rate-limit-budget" "$REPO/scripts/hands/dsh_task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "hands-rate-limit-budget: замок не снят — задача осталась занятой"
 assert_log "GH-API-UNASSIGN issue-123" "hands-rate-limit-budget: назначение не снято — задача осталась занятой"
-grep -qF "rate_limit_retry_budget_exceeded" "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
+grep -qF "all_providers_exhausted" "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason all_providers_exhausted (#727/#805, один провайдер в фикстуре)" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
 grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands-rate-limit-budget: job_end не fail" >&2; exit 1; }
 echo "SMOKE: hands-rate-limit-budget — ок"

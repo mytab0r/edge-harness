@@ -67,16 +67,47 @@
       предсуществующее ограничение среды, не регрессия этого PR. Смоук
       обязан быть прогнан в CI (Ubuntu) как обычно.
 
-## Осталось (не в этом PR)
+## Гейт 4 — hands.yml (#805, сделано этим PR)
 
-- [ ] `hands.yml`/`scripts/hands/dsh_task.sh` — та же цепочка; дополнительно
-      затронут bootstrap-event журнала (`$DSH_MODEL`/`$DSH_MAX_TOKENS` в
-      теле события) — модель на момент bootstrap известна только как
-      `chain[0]`, если чейн переключится, событие будет называть не тот
-      провайдер, который в итоге отработал; решить, приемлемо ли это или
-      нужен апдейт события после факта.
+- [x] `scripts/hands/dsh_task.sh` вызывает `dsh_require_provider_chain`/
+      `dsh_run_with_provider_chain` вместо `dsh_require_provider_env`/
+      `dsh_run_with_retry`. Профиль затравлен ПЕРВЫМ провайдером цепочки
+      (`chain[0]`) ДО первого `dsh` этого прогона (`dsh plugin add`,
+      hands-streamer) — тот же приём, что уже доказан у `worker.yml` (#797).
+- [x] `hands.yml` передаёт `DSH_PROVIDER_CHAIN`+`NVIDIA_API_KEY`; статичные
+      `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` убраны из `env:` шага (их теперь
+      выставляет сам `dsh_task.sh` из цепочки).
+- [x] `all_providers_exhausted` в `dsh_task.sh` обрабатывается тем же путём,
+      что `quota_exhausted`/`rate_limit_retry_budget_exceeded` (release-full,
+      честное сообщение в журнал задачи).
+- [x] Особый риск рук (bootstrap-событие журнала называет модель ДО первой
+      попытки цепочки) — решён, не задокументирован как неустранимый:
+      `bootstrap` теперь называет `chain[0]` ЯВНО как первого кандидата
+      (`provider_chain.head_model`/`provider_chain.candidates`), не как факт
+      «эта модель ответила»; факт, какой провайдер реально обслужил вызов,
+      уходит уже существующим безусловным событием `agent_answer` новыми
+      полями `provider`/`model`/`provider_chain_tried` (значение `$DSH_MODEL`/
+      `$DSH_CHAIN_PROVIDER` после возврата `dsh_run_with_provider_chain` —
+      эта функция перепатчивает профиль на КАЖДОЙ попытке, поэтому оба
+      значения отражают именно последнего опробованного/успешного
+      провайдера). Рассинхрон закрыт механизмом, не только прозой.
+- [x] `scripts/lib/test/dsh-clients.smoke.sh` — сценарий `hands-rate-limit-budget`
+      переведён на ожидание `all_providers_exhausted` (фикстура несёт РОВНО
+      одного провайдера — тот же паттерн, что уже доказан для ai-review-сценариев
+      этого файла); happy-path сценарий `hands` не тронут по ассертам
+      (провайдер добавляет поля в `agent_answer`, не убирает существующие).
+      Живой прогон смоука в среде разработки этого PR (Windows, git-bash)
+      упирается в ТУ ЖЕ независимую от диффа проблему, что уже
+      задокументирована для #797: `claim_task.py` (нативный Windows-
+      интерпретатор Python) резолвит системный `gh.exe`, не POSIX-стиля
+      `$TMP/bin` заглушку — воспроизведено на НЕИЗМЕНЁННОМ `main` тем же
+      прогоном. Смоук обязан быть прогнан в CI (Ubuntu) как обычно.
+- [x] `docs/agents/INFRA-GH.md` — строка инвентаря `hands.yml` обновлена
+      (секреты/vars, `#727/#805`), `scripts/lib/test_infra_gh_inventory.py`
+      зелёный.
+
 Не пункт этого change (отдельная задача, не блокирует его завершение): белое
 пятно #798 — первый элемент живого `vars.DSH_PROVIDER_CHAIN` (`NVIDIA-nano`)
 не подтверждён реестром `confirmed-provider-models.json` (#737) — цепочка
-молча пропускает его на каждом прогоне, включая уже работающий `ai-review.yml`
-и теперь `worker.yml`.
+молча пропускает его на каждом прогоне, включая `ai-review.yml`, `worker.yml`
+и теперь `hands.yml`.
