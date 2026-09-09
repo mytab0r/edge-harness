@@ -436,6 +436,16 @@ export DEEPSEEK_MODEL="glm-5"
 # DEEPSEEK_BASE_URL/DEEPSEEK_MODEL, экспортированные прямо выше, оба клиента
 # перезаписывают своими же значениями, взятыми из этой же цепочки.
 export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
+# Изоляция от РЕАЛЬНОГО config/provider-usage.json репозитория (openspec/
+# changes/llm-provider-usage-manifest): все три канала теперь вызывают
+# dsh_require_provider_chain с СВОИМ id потребителя, и та резолвит цепочку из
+# манифеста ПРИОРИТЕТНЕЕ фикстуры DSH_PROVIDER_CHAIN выше, если файл манифеста
+# физически существует — а он существует в этом checkout'е. Без этой изоляции
+# фикстура (модель "glm-5", свой CONFIRMED_MODELS_FIXTURE ниже) была бы молча
+# подменена реальными провайдерами манифеста, для которых confirmed-реестра
+# фикстуры не подтверждён — тот же приём, что уже применяет
+# DSH_CONFIRMED_MODELS_FILE ниже к другому реальному файлу репозитория.
+export DSH_PROVIDER_USAGE_MANIFEST="$TMP/no-such-provider-usage-manifest.json"
 # Реестр подтверждённых id (#737): реальный реестр репозитория
 # (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель
 # "glm-5" этой фикстуры по построению — своя фикстура реестра, иначе

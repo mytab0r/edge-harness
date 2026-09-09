@@ -74,10 +74,13 @@ AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="${AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
 AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
 AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS:-300}"
 [ -f "$AI_WORK/prompt.md" ] || { echo "::error::нет $AI_WORK/prompt.md — шаг gather не отработал" >&2; exit 1; }
-# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727): зашитого
-# списка провайдеров в коде нет, dsh_patch_profile/DEEPSEEK_* выставляются
-# ПОСЛЕ, отдельно на каждую попытку внутри dsh_run_with_provider_chain.
-dsh_require_provider_chain || exit 1
+# Цепочка приходит из манифеста использования (openspec/changes/
+# llm-provider-usage-manifest, config/provider-usage.json, потребитель
+# "ai-review") — dsh_require_provider_chain резолвит её по id ПЕРЕД обычной
+# валидацией; манифеста нет вовсе — фоллбэк на vars.DSH_PROVIDER_CHAIN (#727)
+# как раньше. dsh_patch_profile/DEEPSEEK_* выставляются ПОСЛЕ, отдельно на
+# каждую попытку внутри dsh_run_with_provider_chain.
+dsh_require_provider_chain "ai-review" || exit 1
 
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"; : >"$AI_WORK/failure_reason.txt"
 

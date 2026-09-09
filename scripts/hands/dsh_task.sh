@@ -74,12 +74,15 @@ CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле веш
 : "${HANDS_URL:?HANDS_URL не задан}"
 : "${HANDS_TOKEN:?HANDS_TOKEN не задан}"
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или manual-<run_id>)}"
-# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727/#805):
-# зашитого списка провайдеров в коде нет. Проверяем в блоке обязательных
-# переменных — ДО heartbeat, dsh_edge_login и создания сессии в морде: иначе
-# конфиг-ошибка даёт пустую сессию в UI морды и задачу, помеченную провалом,
-# вместо честного «не сконфигурировано».
-dsh_require_provider_chain || exit 1
+# Цепочка приходит из манифеста использования (openspec/changes/
+# llm-provider-usage-manifest, config/provider-usage.json, потребитель
+# "hands") — dsh_require_provider_chain резолвит её по id ПЕРЕД обычной
+# валидацией; манифеста нет вовсе — фоллбэк на vars.DSH_PROVIDER_CHAIN
+# (#727/#805) как раньше. Проверяем в блоке обязательных переменных — ДО
+# heartbeat, dsh_edge_login и создания сессии в морде: иначе конфиг-ошибка
+# даёт пустую сессию в UI морды и задачу, помеченную провалом, вместо
+# честного «не сконфигурировано».
+dsh_require_provider_chain "hands" || exit 1
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
 WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"

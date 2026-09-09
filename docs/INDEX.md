@@ -81,6 +81,9 @@
   (GraphQL, heredoc) и границы того, что агент не делает сам.
 - [Реестр меток](agents/LABELS.md) — тормоза конвейера и газы их снятия: это место правды,
   а не примеры.
+- [Реестр использования LLM-провайдеров](agents/LLM-PROVIDER-USAGE.md) — кто (ai-review/
+  worker/hands/морда) какой именованной цепочкой пользуется, генерируется из
+  `config/provider-usage.json` (openspec/changes/llm-provider-usage-manifest, #823).
 - [Roadmap потоков работ](agents/ROADMAP.md) — живая карта параллельных потоков и
   зависимостей (mermaid-гант); детали задач — в пуле Issues.
 
