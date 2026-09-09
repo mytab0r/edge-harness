@@ -130,9 +130,9 @@ name: ai-review
 # блокирующая 1) — построчно НЕ идентична (там нужен голый номер, здесь —
 # форматированная строка), сверять дословно нечем. Обе НАМЕРЕНЫ деградировать
 # на форк-PR в один и тот же fallback (голый run.id и голая строка "ai-review"
-# соответственно) — тест ниже (test_ai_review_workflow_run_name_uses_review_
-# labels_prefix, scripts/review/test_ai_review.py:1673) проверяет только
-# число вхождений префикса run-name, про эту деградацию и про concurrency.
+# соответственно) — тест test_ai_review_workflow_run_name_uses_review_labels_
+# prefix (scripts/review/test_ai_review.py) проверяет только число вхождений
+# префикса run-name, про эту деградацию и про concurrency.
 # group ничего не знает; см. границу форк-PR в review_labels.py::
 # other_active_ai_review_runs — на форк-PR оба тормоза (занятость и очередь)
 # выключены одновременно этим же fallback'ом.
@@ -380,11 +380,13 @@ jobs:
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            # AGENTS.md «алерт не гадает»: причин теперь три (дифф не изменился /
-            # уже летит другой прогон этого PR — ручной путь / уже летит другой
-            # прогон этого PR — событийный дубль, #779), различать их здесь
-            # угадыванием НЕ нужно — should-run уже напечатал ТОЧНУЮ причину
-            # своей строкой в stderr выше (manual_dispatch_skip_reason/
+            # AGENTS.md «алерт не гадает»: причин теперь четыре (дифф не
+            # изменился — ручной путь / дифф не изменился — событийный путь /
+            # уже летит другой прогон этого PR — ручной путь / уже летит
+            # другой прогон этого PR — событийный дубль, #779/#780),
+            # различать их здесь угадыванием НЕ нужно — should-run уже
+            # напечатал ТОЧНУЮ причину своей строкой в stderr выше
+            # (manual_dispatch_skip_reason/event_dispatch_skip_reason/
             # manual_dispatch_busy_reason/event_dispatch_duplicate_reason).
             echo "PR #$PR_NUMBER: дорогой прогон не нужен — точная причина уже напечатана строкой выше."
           fi

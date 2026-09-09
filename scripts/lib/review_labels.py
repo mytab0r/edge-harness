@@ -796,6 +796,33 @@ AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
 AI_REVIEW_TIMEOUT_MINUTES = 130
 
 
+def parse_github_timestamp(raw: str | None) -> datetime | None:
+    """Единственное место разбора метки времени формата Actions/Issues API
+    (`created_at`) в aware datetime UTC — не бросает исключений наружу
+    (#780, доводка #779). Класс: `datetime.fromisoformat(raw.replace("Z",
+    "+00:00"))` ПАРСИТ метку без offset ("Z"/"+HH:MM") как наивный datetime
+    без ValueError — падение приходит НИЖЕ по коду, на `aware - naive`
+    вычитании/сравнении. До этой правки класс был закрыт по одной копии
+    `except (ValueError, TypeError)` в каждом вызывающем месте
+    (`other_active_ai_review_runs` и `ai_review._verdict_label_and_age`) —
+    второе появилось в этом же PR #779 и сперва ловило только ValueError
+    (находка доводки #780). Копия try/except на каждое новое место —
+    отложенный рецидив (AGENTS.md «одно место правды»): эта функция вместо
+    этого нормализует наивный результат в aware (UTC — Actions/Issues API
+    прод-формой всегда её и подразумевает, #779) и возвращает None на любую
+    строку, которая не разбирается вовсе. Вызывающий трактует None как
+    «метки нет» — ровно то же решение, что раньше принимал `except`."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def ai_review_run_name(pr: int) -> str:
     """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
     ДО старта job'а (workflow-level `run-name:`, вычисляется из события: у
@@ -832,7 +859,10 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
 
     Потолок возраста (#779, блокирующая 2): прогон старше
     AI_REVIEW_TIMEOUT_MINUTES по `created_at` летящим не считается — GitHub
-    сам оборвёт такой job по `timeout-minutes` (ai-review.yml:139), а без
+    сам оборвёт такой job по `timeout-minutes` job'а `review` в
+    .github/workflows/ai-review.yml (число сверяется тестом
+    test_ai_review_timeout_minutes_matches_review_labels_constant, не
+    номером строки — тот протухает при вставке строк выше), а без
     потолка он маскировал бы занятость бесконечно. Отсутствие/битый
     `created_at` — не повод молча исключить прогон из списка активных (это
     была бы деградация в обратную сторону, тише про реальную занятость);
@@ -841,6 +871,19 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
     `now` — по умолчанию реальное время; параметр существует только для
     детерминированных тестов потолка (никто из шести вызывающих его не
     передаёт).
+
+    Неточность потолка для `queued` (не блокирует, названо явно #780,
+    доводка #779): `timeout-minutes` GitHub применяет ко времени ИСПОЛНЕНИЯ
+    job'а (`in_progress`), а не ко времени ожидания в очереди — для
+    `queued`-прогона фраза «GitHub сам оборвёт по timeout-minutes» выше
+    буквально неверна: часы обрыва не идут, пока прогон не стартовал.
+    Практическое окно узкое (concurrency-группа по номеру PR, эта же правка
+    #779, не пускает второй `queued`-прогон дальше одного ждущего, а тот
+    стартует не позже, чем завершится/оборвётся летящий, ограниченный теми
+    же AI_REVIEW_TIMEOUT_MINUTES) — но это довод о практике, не о буквальном
+    смысле `timeout-minutes`, и подменять его текстом «GitHub оборвёт»
+    буквально для обоих статусов сразу — то же самое приближение, которое
+    эта функция обязана называть честно, а не молчать.
 
     Граница форк-PR (не блокирует, названо явно #779): у форк-PR
     `pull_requests[0]` пуст, `ai_review_run_name`-фолбэк даёт голый
@@ -880,21 +923,12 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
             if str(run.get("id")) == str(exclude_run_id):
                 continue
             created_at = run.get("created_at")
-            if created_at:
-                try:
-                    created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                    if now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
-                        continue  # старше потолка — GitHub оборвёт сам, не блокируем
-                except (ValueError, TypeError):
-                    # ValueError — битая строка (не парсится вовсе).
-                    # TypeError — наивная метка времени без смещения (без
-                    # "Z"/"+HH:MM"): fromisoformat её ПАРСИТ (не кидает
-                    # ValueError), но `now - created` падает при вычитании
-                    # aware-naive. Прод-формой Actions API недостижимо (поле
-                    # `created_at` там всегда с "Z", #779, не блокирует) —
-                    # докстринг функции обещал «битую строку» шире, чем
-                    # покрывал один except ValueError.
-                    pass
+            created = parse_github_timestamp(created_at)
+            # Битая/наивная строка (см. parse_github_timestamp) даёт None —
+            # прогон остаётся в списке активных как раньше, без ValueError/
+            # TypeError наружу (#780, доводка #779).
+            if created is not None and now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
+                continue  # старше потолка — GitHub оборвёт сам, не блокируем
             matches.append(run)
     return matches
 

@@ -447,6 +447,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pagination_guard.py -q
 
+      # Класс «TypeError на вычитании aware-naive datetime, пойманный только
+      # ValueError» (#780, доводка #779): второе место повторило узкую версию
+      # первого. review_labels.parse_github_timestamp — единственное место
+      # разбора такой метки; гвардия ловит новое сырое datetime.fromisoformat(
+      # в review_labels.py/ai_review.py, открытое в обход хелпера.
+      - name: Гвардия разбора метки времени — новое место мимо общего хелпера
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_timestamp_parse_guard.py -q
+
       # Утечка секрета (#743, живой случай — DSH_CHAIN_CLASS_NOTE,
       # scripts/lib/dsh-ci.sh, до фикса): сырой stderr клиента модели уходил
       # в публичный лог без redact() — GitHub маскирует только точное

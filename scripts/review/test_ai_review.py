@@ -958,9 +958,10 @@ def test_cmd_should_run_prints_false_when_diff_unchanged_ai_ok(monkeypatch, caps
     # «метка сохранилась бы» — именно это читает шаг fingerprint ai-review.yml.
     assert out.out.strip() == "false"
     # #779, разрыв 2: событийный путь обязан печатать СВОЮ причину в stderr —
-    # ai-review.yml:365 утверждает читателю, что причина уже напечатана
-    # строкой выше; до фикса `if not run_needed and manual` запирало печать
-    # только ручным путём, и этот, самый частый путь (workflow_run), молчал.
+    # шаг `id: fingerprint` (.github/workflows/ai-review.yml) утверждает
+    # читателю, что причина уже напечатана строкой выше; до фикса
+    # `if not run_needed and manual` запирало печать только ручным путём, и
+    # этот, самый частый путь (workflow_run), молчал.
     assert "дифф не изменился" in out.err
     assert "ai:ok" in out.err
     assert "ручной" not in out.err  # этот прогон не ручной — текст не должен звать его так
@@ -1918,6 +1919,22 @@ def test_manual_dispatch_skip_reason_falls_back_when_no_verdict_label():
     assert "неизвестный вердикт" in text
 
 
+def test_manual_dispatch_skip_reason_naive_created_at_does_not_crash():
+    # Мутационная проверка (#780, доводка #779): _verdict_label_and_age
+    # раньше ловил только except ValueError вокруг fromisoformat — строка
+    # БЕЗ offset ("Z"/"+HH:MM") парсится без ValueError, но следующее
+    # вычитание `datetime.now(timezone.utc) - created` (aware - naive)
+    # кидало TypeError, не пойманный этим except, и живой прогон приёмки
+    # ронял ИМЕННО этот путь (manual_dispatch_skip_reason). Прод-формой
+    # Issues API недостижимо (created_at там всегда с "Z"), но обещание
+    # «не падать на битой метке» обязано покрывать оба класса, как и
+    # сестринское место review_labels.other_active_ai_review_runs.
+    ai_comment = {"created_at": "2026-09-09T03:00:00"}
+    text = ai.manual_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "мин назад" in text
+
+
 # ── #779, разрыв 2: событийный путь (workflow_run) обязан печатать СВОЮ
 # причину отказа «дифф не изменился», а не молчать под условием `and manual`,
 # пока шаг ai-review.yml утверждает, что причина уже напечатана строкой выше
@@ -1936,6 +1953,16 @@ def test_event_dispatch_skip_reason_names_verdict_and_age_no_manual_wording():
 def test_event_dispatch_skip_reason_falls_back_when_no_verdict_label():
     text = ai.event_dispatch_skip_reason(399, ["review:ok"], None)
     assert "неизвестный вердикт" in text
+
+
+def test_event_dispatch_skip_reason_naive_created_at_does_not_crash():
+    # Тот же мутационный класс, что test_manual_dispatch_skip_reason_naive_
+    # created_at_does_not_crash выше, на втором вызывающем той же
+    # _verdict_label_and_age — живой прогон приёмки ронял и этот путь тоже.
+    ai_comment = {"created_at": "2026-09-09T03:00:00"}
+    text = ai.event_dispatch_skip_reason(399, ["review:ok", "ai:ok"], ai_comment)
+    assert "PR #399" in text
+    assert "мин назад" in text
 
 
 def _fake_gh_manual_dispatch(active_runs: dict, labels, comment_body, files):

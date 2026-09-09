@@ -883,13 +883,15 @@ def _verdict_label_and_age(current_labels, ai_comment: dict | None) -> tuple[str
         "неизвестный вердикт")
     age = "неизвестно когда"
     created_at = (ai_comment or {}).get("created_at")
-    if created_at:
-        try:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
-            age = f"{minutes} мин назад"
-        except ValueError:
-            pass
+    # review_labels.parse_github_timestamp — единственное место разбора этой
+    # метки (#780, доводка #779): возвращает None на битую ИЛИ наивную (без
+    # "Z"/"+HH:MM") строку, не бросая ValueError/TypeError наружу — раньше
+    # этот except ловил только ValueError, и наивная строка падала на
+    # `now - created` (aware - naive) необработанной.
+    created = review_labels.parse_github_timestamp(created_at)
+    if created is not None:
+        minutes = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+        age = f"{minutes} мин назад"
     return verdict_label, age
 
 
