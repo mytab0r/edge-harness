@@ -303,6 +303,17 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     # allowlist-типы с валидными turn/step/message.content — форма ниже снята
     # с dsh-edge/ingest-integration/check.mjs (реальный прод-контракт, не
     # наш пересказ).
+    #
+    # #794: message.id/role/source — тоже часть прод-контракта, не украшение.
+    # dsh-session::assertMessageEventShape (dsh-session/lib/index.js, пин
+    # 0.1.2-rc.1) не вызывается на записи вовсе — вызывается ТОЛЬКО на
+    # следующей холодной загрузке той же сессии (adoptStoredEvents) — и без
+    # этих полей валит её задним числом: «session event at seq N lacks an
+    # identified message» (без id) или «message has invalid source» (есть id,
+    # нет source) — оба текста воспроизведены дословно живым вызовом
+    # adoptSessionEvent из реального пакета при разборе #794, id один не
+    # спасает. Мутация: убери любое из полей ниже — этот тест обязан упасть
+    # раньше, чем сессия испортится в проде.
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
@@ -322,10 +333,31 @@ def test_append_session_notes_event_shape_is_allowlisted_assistant_message(monke
     assert isinstance(event["data"]["turn"], int) and event["data"]["turn"] >= 0
     assert isinstance(event["data"]["step"], int) and event["data"]["step"] >= 0
     message = event["data"]["message"]
+    assert isinstance(message["id"], str) and message["id"] != ""
     assert message["role"] == "assistant"
     assert isinstance(message["content"], list) and message["content"]
     assert message["content"][0]["type"] == "text"
     assert "PR #1 слит в main" in message["content"][0]["text"]
+    source = message["source"]
+    assert source["kind"] == "model"
+    assert isinstance(source["provider"], str) and source["provider"] != ""
+    assert isinstance(source["model"], str) and source["model"] != ""
+
+
+def test_append_session_notes_message_id_unique_per_note_in_one_call(monkeypatch):
+    # #794: два запуска main() за один пульс (after_merge/unhealthy_pulls/
+    # accept_merged_tasks) могут дописать заметку в одну и ту же сессию —
+    # одинаковый id второй заметки была бы новой миной того же класса.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    captured_events = []
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: captured_events.extend(events) or {"appended": len(events), "lastSeq": 0})
+    sch.append_session_notes([(480, "первая"), (480, "вторая")])
+    ids = [event["data"]["message"]["id"] for event in captured_events]
+    assert len(ids) == len(set(ids)), f"id заметок не уникальны: {ids}"
 
 
 def test_morde_ingest_posts_raw_events_body_and_surfaces_http_error(monkeypatch):
