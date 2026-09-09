@@ -1712,3 +1712,80 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
     escalation_lines = ri.run_escalations("mytab0r/edge-harness", findings)
     assert escalation_lines == []
     assert fake.mutating_calls() == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 11: манифест использования LLM-провайдеров (#823)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма: та же двухуровневая схема {chains, usage}, что реально живёт в
+# config/provider-usage.json (openspec/changes/llm-provider-usage-manifest,
+# design.md «Схема манифеста») — не пересказ, буквальная форма.
+
+
+def write_manifest(tmp_path, chains, usage):
+    path = tmp_path / "provider-usage.json"
+    import json
+    path.write_text(json.dumps({"chains": chains, "usage": usage}), encoding="utf-8")
+    return path
+
+
+def test_provider_usage_manifest_healthy_snapshot(tmp_path):
+    # Модель/URL — синтетическая фикстура (класс #153: гвардия
+    # provider-default.guard.sh ловит стейл-литералы прежнего дефолта в
+    # scripts/** буквальным текстом) — тест проверяет ФОРМУ манифеста, не
+    # конкретного провайдера, реальные значения не нужны.
+    path = write_manifest(
+        tmp_path,
+        chains={"default-chain": [{"name": "TEST-PROVIDER", "base_url": "https://provider.example/v1",
+                                    "model": "test-model-x", "secret_env": "TEST_API_KEY",
+                                    "max_output_tokens": 131072}]},
+        usage={"ai-review": "default-chain", "worker": "default-chain", "hands": "default-chain"},
+    )
+    assert ri.check_provider_usage_manifest(path) == []
+
+
+def test_provider_usage_manifest_missing_consumer_mutation_guard(tmp_path):
+    """Мутация (класс #727 -> #797): потребитель без записи в .usage — красный."""
+    path = write_manifest(
+        tmp_path,
+        chains={"default-chain": [{"name": "GLM"}]},
+        usage={"ai-review": "default-chain", "worker": "default-chain"},  # hands забыт
+    )
+    violations = ri.check_provider_usage_manifest(path)
+    assert violations == [{"kind": "missing", "consumer": "hands"}]
+
+
+def test_provider_usage_manifest_dangling_chain_mutation_guard(tmp_path):
+    """Мутация: .usage ссылается на цепочку, которой нет в .chains — красный."""
+    path = write_manifest(
+        tmp_path,
+        chains={"default-chain": [{"name": "GLM"}]},
+        usage={"ai-review": "default-chain", "worker": "ghost-chain", "hands": "default-chain"},
+    )
+    violations = ri.check_provider_usage_manifest(path)
+    assert violations == [{"kind": "dangling", "consumer": "worker", "chain_name": "ghost-chain"}]
+
+
+def test_provider_usage_manifest_empty_chain_is_dangling(tmp_path):
+    path = write_manifest(
+        tmp_path,
+        chains={"default-chain": [{"name": "GLM"}], "empty-chain": []},
+        usage={"ai-review": "default-chain", "worker": "empty-chain", "hands": "default-chain"},
+    )
+    violations = ri.check_provider_usage_manifest(path)
+    assert violations == [{"kind": "dangling", "consumer": "worker", "chain_name": "empty-chain"}]
+
+
+def test_provider_usage_manifest_missing_file_is_transitional_not_a_violation(tmp_path):
+    """Манифеста нет вовсе — переходный период (design.md «Потребители»), не
+    сам по себе провал инварианта; вызывающий (build_report) решает, как это
+    показать — здесь проверяется только форма ответа check_*."""
+    path = tmp_path / "does-not-exist.json"
+    violations = ri.check_provider_usage_manifest(path)
+    assert violations == [{"kind": "no_manifest", "path": str(path)}]
+
+
+def test_provider_usage_manifest_in_ci_gating_with_gas():
+    assert 11 in ri.CI_GATING
+    assert 11 in ri.GATING_RELEASE_CONDITION

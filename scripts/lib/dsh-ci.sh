@@ -538,7 +538,70 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
 # через vars.DSH_PROVIDER_KEY_SECRET, #716: тому механизму нужен РОВНО один
 # активный секрет в её, этому — ключи ВСЕХ провайдеров цепочки одновременно,
 # разные задачи, не дублируют друг друга).
-dsh_require_provider_chain() {
+
+# ── Манифест использования (openspec/changes/llm-provider-usage-manifest) ──
+#
+# Одно место конфигурации «кто каким комбо провайдеров пользуется» —
+# config/provider-usage.json репозитория (вне scripts/**, .github/workflows/**,
+# docs/agents/** — гвардия provider-default.guard.sh, класс #153, эти пути не
+# сканирует). Источник правды на его СОДЕРЖИМОЕ по design.md этого change —
+# Settings морды dsh-edge (пуш при изменении настройки, Этап 2 tasks.md, ещё
+# не подключён); эта функция только ЧИТАЕТ файл из уже сделанного checkout'а —
+# сети не трогает, правило владельца «не дёргать морду на каждый прогон
+# пайплайна» (proposal.md, Scope/Out).
+#
+# Манифест ПРИОРИТЕТНЕЕ vars.DSH_PROVIDER_CHAIN, если файл присутствует:
+# присутствует, но нет записи потребителя (или запись ссылается на
+# несуществующую/пустую цепочку) — fail loud, а не тихий фоллбэк на vars.
+# Ровно класс, который пропустили с воркером на 72 задачи (#727 -> #797,
+# proposal.md «Problem») — «у кого-то нет валидного назначения» обязано
+# падать здесь же, на прогоне, не только в CI-инварианте репозитория
+# (repo_invariants.py::check_provider_usage_manifest — та же проверка над
+# статичным файлом, без сети).
+#
+# Файла нет вовсе (старый checkout без него, локальный запуск смок-теста без
+# манифеста) — тихий проход, вызывающий использует свой прежний
+# vars.DSH_PROVIDER_CHAIN как есть (design.md «Потребители»: выбор между
+# «манифест — единственный источник» и «фоллбэк на переходный период» здесь
+# решён в пользу фоллбэка ТОЛЬКО на случай отсутствия файла, не на случай его
+# неполноты — иначе манифест с дырой в usage был бы неотличим от манифеста,
+# который ещё не появился).
+DSH_PROVIDER_USAGE_MANIFEST="${DSH_PROVIDER_USAGE_MANIFEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/config/provider-usage.json}"
+
+dsh_load_provider_chain_from_manifest() { # consumer_id
+  local consumer=$1 manifest="$DSH_PROVIDER_USAGE_MANIFEST" raw chain_name chain count
+  [ -f "$manifest" ] || return 0
+  raw=$(cat "$manifest") || {
+    echo "::error::манифест использования провайдеров $manifest не читается" >&2
+    return 1
+  }
+  if ! jq -e . >/dev/null 2>&1 <<<"$raw"; then
+    echo "::error::манифест использования провайдеров $manifest — невалидный JSON" >&2
+    return 1
+  fi
+  chain_name=$(jq -r --arg id "$consumer" '.usage[$id] // empty' <<<"$raw")
+  if [ -z "$chain_name" ]; then
+    echo "::error::манифест $manifest не назначает цепочку потребителю '$consumer' (ключ .usage[\"$consumer\"] отсутствует) — назначь цепочку в манифесте (Settings морды dsh-edge, когда Этап 2 подключён; сейчас — правкой файла), openspec/changes/llm-provider-usage-manifest" >&2
+    return 1
+  fi
+  chain=$(jq -c --arg name "$chain_name" '.chains[$name] // empty' <<<"$raw")
+  if [ -z "$chain" ] || [ "$chain" = "null" ]; then
+    echo "::error::манифест $manifest: usage[\"$consumer\"] ссылается на несуществующую цепочку '$chain_name' в .chains" >&2
+    return 1
+  fi
+  count=$(jq 'length' <<<"$chain" 2>/dev/null) || count=0
+  if [ -z "$count" ] || [ "$count" -lt 1 ]; then
+    echo "::error::манифест $manifest: цепочка '$chain_name' (потребитель '$consumer') пуста" >&2
+    return 1
+  fi
+  export DSH_PROVIDER_CHAIN="$chain"
+  echo "манифест использования провайдеров: '$consumer' -> цепочка '$chain_name' ($count провайдер(ов)), источник $manifest"
+}
+
+dsh_require_provider_chain() { # [consumer_id]
+  if [ -n "${1:-}" ]; then
+    dsh_load_provider_chain_from_manifest "$1" || return 1
+  fi
   # Стык с suite ротации учёток (#215, design.md dsh-in-job «Стык suite и
   # цепочки провайдеров»): цепочка владеет провайдером КАЖДОЙ попытки
   # (атрибуция DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED, реестр подтверждённых

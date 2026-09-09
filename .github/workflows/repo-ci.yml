@@ -541,6 +541,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
+      # Реестр использования LLM-провайдеров (#823, openspec/changes/
+      # llm-provider-usage-manifest): docs/agents/LLM-PROVIDER-USAGE.md не
+      # хардкодит назначения — scripts/lib/collect_provider_usage.py
+      # собирает их из config/provider-usage.json. Три мутации — пропавшая
+      # строка, лишняя строка, расхождение содержимого с генератором.
+      - name: Гвардия реестра использования LLM-провайдеров — таблица видимости
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_provider_usage_registry.py -q
+
       # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
       # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
       # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
@@ -910,6 +920,15 @@ jobs:
       # приоритет; внутри цикла цепочки suite всегда глушится плоским патчем.
       - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
         run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
+
+      # Манифест использования LLM-провайдеров (#823, openspec/changes/
+      # llm-provider-usage-manifest): dsh_require_provider_chain "<id>"
+      # резолвит цепочку из config/provider-usage.json по id потребителя
+      # приоритетнее vars.DSH_PROVIDER_CHAIN — файла нет вовсе, есть, но нет
+      # записи потребителя, ссылка на несуществующую/пустую цепочку — три
+      # разных сценария, каждый доказан отдельной мутацией.
+      - name: Гвардия манифеста использования LLM-провайдеров (#823)
+        run: bash scripts/lib/test/dsh-provider-usage-manifest.guard.sh
 
       # Гвардия #789: окно контекста env-provider-маршрута combo-router
       # обязано читаться из vars.DSH_EDGE_MODEL_CATALOG (реальное окно

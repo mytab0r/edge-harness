@@ -1,0 +1,35 @@
+{
+  "$comment": "Манифест использования LLM-провайдеров (openspec/changes/llm-provider-usage-manifest). Источник правды по design.md — Settings морды dsh-edge (пуш при изменении, Этап 2, ещё не подключён); до его подключения файл правится вручную тем же путём, что раньше правился vars.DSH_PROVIDER_CHAIN. Единица цепочки не новая — та же форма {name, base_url, model, secret_env, max_output_tokens}, что уже парсит scripts/lib/dsh-ci.sh. Место вне scripts/, .github/workflows/, docs/agents/ — гвардия provider-default.guard.sh (класс #153) их не сканирует.",
+  "chains": {
+    "default-chain": [
+      {
+        "name": "NVIDIA-nano",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "nvidia/nemotron-nano-3-30b-a3b",
+        "secret_env": "NVIDIA_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "NVIDIA",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "secret_env": "NVIDIA_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "GLM",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "model": "glm-5.3-flash",
+        "secret_env": "DEEPSEEK_API_KEY",
+        "max_output_tokens": 131072
+      }
+    ]
+  },
+  "usage": {
+    "ai-review": "default-chain",
+    "worker": "default-chain",
+    "hands": "default-chain"
+  },
+  "generated_at": "2026-09-09T15:15:43Z",
+  "generated_by": "apply-agent (#823), сид из живого vars.DSH_PROVIDER_CHAIN на момент миграции — нулевое изменение поведения; Этап 2 (морда-push) заменит ручную правку автоматической"
+}
