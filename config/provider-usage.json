@@ -3,13 +3,6 @@
   "chains": {
     "default-chain": [
       {
-        "name": "NVIDIA-nano",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "nvidia/nemotron-nano-3-30b-a3b",
-        "secret_env": "NVIDIA_API_KEY",
-        "max_output_tokens": 131072
-      },
-      {
         "name": "NVIDIA",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": "nvidia/nemotron-3-ultra-550b-a55b",
@@ -30,6 +23,6 @@
     "worker": "default-chain",
     "hands": "default-chain"
   },
-  "generated_at": "2026-09-09T15:15:43Z",
-  "generated_by": "apply-agent (#823), сид из живого vars.DSH_PROVIDER_CHAIN на момент миграции — нулевое изменение поведения; Этап 2 (морда-push) заменит ручную правку автоматической"
+  "generated_at": "2026-09-09T21:30:00Z",
+  "generated_by": "apply-agent (#849): убран NVIDIA-nano из default-chain — дрейф от vars.DSH_PROVIDER_CHAIN (тот уже не нёс nano), подтверждён мёртвым повторно живым замером #836 (run 34406807344, HTTP 404 на completions-пути). Исходный сид #823 (апрель-агент, #823) снял снимок ДО решения #798 исключить nano."
 }
