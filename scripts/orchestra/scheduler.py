@@ -395,6 +395,22 @@ def pr_references_issue(pull: dict, issue_number: int) -> bool:
     )
 
 
+def last_assigned_at(repo: str, number: int) -> datetime | None:
+    """Момент последнего события `assigned` в таймлайне issue — `None`, если
+    задачу никогда не назначали. Одно место правды (#815): reap_stale ниже и
+    reap_stalled_worker_run (гвардия test_reap_stale_reads_timeline_through_
+    paginated_helper требует РОВНО ОДНО вхождение review_labels.list_timeline
+    в исходнике) читают один и тот же признак «когда взяли аренду» — второй
+    независимый обход того же таймлайна не заводим.
+
+    Пагинация (#308, тот же класс, что last_gate1_labeled_at/
+    last_ready_labeled_at, #303): сырая первая страница таймлайна молча
+    теряла событие assigned за первой сотней записей на длинном таймлайне."""
+    timeline = review_labels.list_timeline(repo, number, gh)
+    assigned_at = [event["created_at"] for event in timeline if event.get("event") == "assigned"]
+    return parse_time(max(assigned_at)) if assigned_at else None
+
+
 def reap_stale(
     repo: str, now: datetime, pulls: list[dict], merged: dict[int, dict] | None = None,
     *, pool: list[dict],
@@ -420,18 +436,9 @@ def reap_stale(
         number = issue["number"]
         if any(pr_references_issue(pull, number) for pull in pulls):
             continue
-        # Пагинация (#308, тот же класс, что last_gate1_labeled_at/
-        # last_ready_labeled_at ниже, #303): сырая первая страница таймлайна
-        # молча теряла событие assigned за первой сотней записей на длинном
-        # таймлайне — сюда фикс #303 не мигрировали.
-        timeline = review_labels.list_timeline(repo, number, gh)
-        assigned_at = [
-            event["created_at"] for event in timeline
-            if event.get("event") == "assigned"
-        ]
-        if not assigned_at:
+        last = last_assigned_at(repo, number)
+        if last is None:
             continue
-        last = parse_time(max(assigned_at))
         merged_pull = merged.get(number)
         if merged_pull is not None and last <= parse_time(merged_pull["merged_at"]):
             # Работа уже слита — приёмку (#227, accept_merged_tasks ниже) ведёт
@@ -1996,18 +2003,185 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
     return observations, actions
 
 
-def worker_runs_active(repo: str) -> bool:
+# ── Зависший (но по GH ещё in_progress) прогон worker.yml (#815) ────────────
+# Живой инцидент 2026-09-09: прогон #34339807907 (проба предохранителя,
+# стартовала ДО фикса #795, застряла на баге #794) провисела in_progress ~3ч
+# и concurrency-группой worker.yml (group: worker, cancel-in-progress: false,
+# worker.yml:26-29 — один воркер на репозиторий) блокировала ОДНОВРЕМЕННО
+# обычный dispatch_worker, dispatch_conflict_rework И восстановление
+# предохранителя (пробы 2/3 из #120 анонсированы, но не стартовали —
+# worker_runs_active видел «занято»). Единственной границей была жёсткая
+# 280-минутная стенка job'а (worker.yml:41) — до неё прогон держал ВЕСЬ пул.
+#
+# Порог обоснован замером живых длительностей worker.yml (100 последних
+# прогонов, gh run list --workflow=worker.yml, снято 2026-09-09):
+#   - success с реальной DSH-работой (длительность > 5 мин, 24 прогона):
+#     медиана ≈ 73 мин, p75 ≈ 140 мин, МАКСИМУМ 151.1 мин — легитимный
+#     success достигает этого значения РОВНО ПЯТЬ РАЗ (~20% выборки), что
+#     соответствует комментарию task.sh о 150-минутном таймауте DSH за
+#     попытку (worker.yml:34-40) — успешный прогон честно донашивает работу
+#     почти до этой границы;
+#   - остальные success (без реальной работы — "свободных задач нет",
+#     no-op) укладываются в 0.3–1.7 мин;
+#   - failure почти все короткие (30–90с — ранний отказ до тяжёлой работы).
+# Порог из диагноза инцидента (60–90 мин, по трём прогонам 06:14/06:33/06:37)
+# НЕ подтвердился при замере на большей выборке: два из тех трёх были
+# no-op-возвратами (~90с), а третий (69 мин) — обычный рабочий прогон внутри
+# наблюдаемого разброса легитимных success (16.6–151.1 мин) — порог 60–90 мин
+# отменял бы примерно 40% реально работающих прогонов. WORKER_STALL_MINUTES
+# обязан быть заметно ВЫШЕ максимума легитимного success (151.1), а не его
+# медианы, и заметно ниже 280-минутного жёсткого таймаута:
+WORKER_STALL_MINUTES = 200
+
+
+def _run_age_minutes(run: dict, now: datetime) -> float | None:
+    """Возраст прогона в минутах от `run_started_at` (когда GitHub его знает)
+    или `created_at` (queued/раннее, пока job ещё не подхватил раннер) —
+    `None`, если ни одного поля нет вовсе (не прод-форма ответа)."""
+    started = run.get("run_started_at") or run.get("created_at")
+    return minutes_between(parse_time(started), now) if started else None
+
+
+def _run_is_stalled(run: dict, now: datetime,
+                     threshold_minutes: float = WORKER_STALL_MINUTES) -> bool:
+    """Чистое решение по уже полученному прогону (без сетевого вызова) —
+    вынесено отдельно от stalled_worker_run/worker_runs_active, чтобы тесты,
+    не относящиеся к обнаружению зависания, могли зафиксировать «прогон не
+    завис» одной строкой monkeypatch, не подбирая правдоподобный recent
+    timestamp под реальные wall-clock часы прогона тестов (тот же класс
+    хрупкости, которого правило репозитория «тест кормится прод-формой»
+    требует избегать: фиксированная дата фикстуры неизбежно «стареет» по
+    календарю сама по себе)."""
+    age = _run_age_minutes(run, now)
+    return age is not None and age >= threshold_minutes
+
+
+def stalled_worker_run(repo: str, now: datetime) -> dict | None:
+    """Прогон worker.yml, который GitHub всё ещё числит `in_progress`, но
+    который идёт дольше WORKER_STALL_MINUTES — сильнее наблюдаемого максимума
+    легитимного success (см. обоснование порога выше). Признак свежести
+    heartbeat (HANDS_TOKEN + HARNESS_URL/api/status, cf-worker/src/
+    harness.ts::handsAreAlive) сюда НЕ подключён: оркестратор (orchestra.yml)
+    не получает эти секреты/vars в своём окружении — добавление живого
+    сетевого вызова в этот гейт (используется несколькими диспетчерами за
+    пульс, см. вызовы ниже) вне рамок этого фикса, отдельное решение
+    владельца. Деградация честная и единственный сигнал сегодня —
+    длительность `in_progress`, признак грубее heartbeat (не отличает
+    «завис» от «просто редкая долгая легитимная работа за порогом»), но не
+    молчит: сообщение действия ниже (main()) прямо называет длительность и
+    порог, а не гадает."""
+    payload = gh(
+        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=in_progress&per_page=1"
+    ) or {}
+    runs = payload.get("workflow_runs") or []
+    if not runs:
+        return None
+    run = runs[0]
+    return run if _run_is_stalled(run, now) else None
+
+
+def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
     """Активный воркер = есть worker-ран в статусе in_progress или queued.
     Завершённые (в т.ч. упавшие) не считаются: упавший воркер при свободных
     задачах получит новый запуск — но пока задача назначена, пул свободных пуст
-    и штурма не будет (возврат в пул только через stale-окно reap_stale)."""
+    и штурма не будет (возврат в пул только через stale-окно reap_stale).
+
+    Зависший in_progress (#815, stalled_worker_run выше) — ИСКЛЮЧЕНИЕ: дольше
+    WORKER_STALL_MINUTES без завершения не блокирует ни один из трёх
+    диспетчеров, читающих эту функцию (dispatch_worker, dispatch_conflict_rework,
+    проба предохранителя — она тоже уходит через dispatch_worker, отдельного
+    гейта у неё нет). Сама отмена зависшего прогона и освобождение его задачи —
+    отдельный шаг main() (reap_stalled_worker_run), не побочный эффект этой
+    read-only проверки: функцию читают несколько мест за один пульс, мутировать
+    GitHub при каждом чтении было бы сюрпризом и лишними вызовами."""
+    now = now or datetime.now(timezone.utc)
     for status in ("in_progress", "queued"):
         payload = gh(
-            f"repos/{repo}/actions/workflows/worker.yml/runs?status={status}&per_page=1"
+            f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status={status}&per_page=1"
         ) or {}
-        if payload.get("workflow_runs"):
-            return True
+        runs = payload.get("workflow_runs") or []
+        if not runs:
+            continue
+        if status == "in_progress" and _run_is_stalled(runs[0], now):
+            continue  # завис — не блокирует, см. докстринг
+        return True
     return False
+
+
+def reap_stalled_worker_run(
+    repo: str, now: datetime, pool: list[dict], pulls: list[dict],
+) -> tuple[list[str], list[str]]:
+    """Разряжает находку stalled_worker_run (#815): отменяет зависший прогон
+    (best-effort — сам гейт worker_runs_active уже не блокирует диспатч
+    независимо от исхода отмены) и освобождает его задачу СРАЗУ, не дожидаясь
+    обычных 24ч reap_stale/claim_task.collect_stale — иначе задача осталась бы
+    занятой почти сутки после того, как сам факт зависания уже установлен.
+
+    Задача, арендованная зависшим прогоном, определяется структурным
+    признаком (не парсингом прозы, класс которого запрещён AGENTS.md): среди
+    открытых незаблокированных назначенных задач без открытого PR (тот же
+    критерий, что уже применяет reap_stale) берётся та, чьё событие timeline
+    `assigned` не старше момента старта прогона — task.sh берёт аренду в
+    первые секунды job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы.
+    Совпадений может не быть (адресный прогон на задачу с уже открытым PR —
+    её reap_stale не тронул бы; либо аренда не найдена вовсе) — тогда отмена
+    прогона всё равно происходит, задача остаётся на обычном пути."""
+    observations: list[str] = []
+    actions: list[str] = []
+    run = stalled_worker_run(repo, now)
+    if run is None:
+        return observations, actions
+    run_id = run["id"]
+    started = run.get("run_started_at") or run.get("created_at")
+    start = parse_time(started)
+    age_minutes = minutes_between(start, now)
+    try:
+        gh("-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
+        cancel_note = "отменён"
+    except RuntimeError as error:
+        cancel_note = f"отменить не удалось: {error}"
+    task_number = None
+    for issue in pool:
+        if not issue["assignees"] or _issue_is_blocked(issue):
+            continue
+        number = issue["number"]
+        if any(pr_references_issue(pull, number) for pull in pulls):
+            continue
+        last = last_assigned_at(repo, number)
+        if last is not None and last >= start:
+            task_number = number
+            break
+    if task_number is not None:
+        release_note = claim_task.release_full(repo, task_number)
+        pool_issue = next((i for i in pool if i["number"] == task_number), None)
+        if pool_issue is not None:
+            pool_issue["assignees"] = []
+        try:
+            gh(
+                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
+                "-f", "body=" + (
+                    f"♻️ Прогон worker.yml (run {run_id}) завис {int(age_minutes)} мин "
+                    f"без завершения (порог {WORKER_STALL_MINUTES} мин) — оркестратор счёл его "
+                    f"зависшим, отменил ({cancel_note}) и снял аренду ({release_note}). Задача "
+                    "возвращена в пул: python3 scripts/lib/claim_task.py claim "
+                    f"{task_number} (#121, #815)."
+                ),
+            )
+        except RuntimeError as error:
+            print(f"::warning::след о снятии аренды #{task_number} не оставлен: {error}",
+                  file=sys.stderr)
+        actions.append(
+            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
+            f"{WORKER_STALL_MINUTES}) — {cancel_note}; задача #{task_number} освобождена "
+            f"({release_note})"
+        )
+    else:
+        actions.append(
+            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
+            f"{WORKER_STALL_MINUTES}) — {cancel_note}; арендованная им задача не определена "
+            "(см. лог прогона вручную)"
+        )
+    return observations, actions
 
 
 # ── WIP-лимит перед взятием НОВОЙ задачи (issue #464) ────────────────────────
@@ -3960,6 +4134,14 @@ def main() -> int:
     # строка появляется, только если состояние реально изменилось), список
     # идёт прямо в actions без переклассификации.
     stale_lines = reap_stale(repo, now, pulls, merged, pool=pool)
+    # Зависший (но по GH ещё in_progress) прогон worker.yml (#815) — рядом с
+    # reap_stale/collect_stale: та же роль («аренда, которую пора вернуть в
+    # пул раньше обычного таймера»), только признак другой (длительность
+    # in_progress, не возраст назначения/замка). worker_runs_active сам уже
+    # не блокирует диспатч на зависший прогон независимо от исхода отмены
+    # здесь — этот шаг только доводит дело до конца (отмена + освобождение
+    # задачи), best-effort.
+    stalled_observations, stalled_actions = reap_stalled_worker_run(repo, now, pool, pulls)
     try:
         lease_observations, lease_actions = claim_task.collect_stale(repo, now)
     except RuntimeError as error:
@@ -4052,12 +4234,13 @@ def main() -> int:
         lease_observations + merge_observations + ai_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
         + wip_observations + worker_observations + failure_watch_observations
+        + stalled_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
         + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
-        + wip_actions + worker_actions + failure_watch_actions
+        + wip_actions + worker_actions + failure_watch_actions + stalled_actions
     )
     lines += render_action_report(observations, actions)
 
