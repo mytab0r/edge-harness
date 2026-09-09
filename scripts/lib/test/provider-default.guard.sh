@@ -53,6 +53,16 @@
 #     (integrate.api.nvidia.com, api.z.ai) в фикстуре остаются буквальными,
 #     потому что тест разбирает реальный формат строки, не придуманный;
 #     это не фолбэк-дефолт, а тестовые данные.
+#   - scripts/measure/provider_latency.py, таблица PROVIDER_LATENCY_CANDIDATES
+#     (#836): тот же приём, что PLUGINS_SUITE_CANDIDATE_ROUTES выше — явная
+#     таблица провайдеров-кандидатов для ЖИВОГО замера латентности, не
+#     фолбэк-дефолт класса #153 (нет `${DEEPSEEK_*:-...}`, единственный
+#     обязательный провайдер по-прежнему только vars.DEEPSEEK_BASE_URL/MODEL).
+#     Литералы взяты буквально из постановки задачи #836; каждая строка
+#     списка отличима именем провайдера ("NVIDIA-nano" и т.д.).
+#   - scripts/measure/test_provider_latency.py — файл целиком (тот же приём,
+#     что у смоук-фикстуры dsh-clients.smoke.sh выше): существует ради
+#     разбора прод-формы URL/модели этих же провайдеров, не источник правды.
 #   - этот файл (regex-литералы самой гвардии).
 set -euo pipefail
 
@@ -102,6 +112,10 @@ while IFS= read -r f; do
       # allowlist точечных легитимных не-комментарийных литералов
       case "$f:$lineno" in
         "scripts/lib/test/dsh-clients.smoke.sh:"*) continue ;;
+        # Тестовые данные бенчмарка латентности (#836) — тот же приём, что
+        # у смоук-фикстуры выше: файл целиком существует ради разбора
+        # прод-формы URL/модели этих же провайдеров, не источник правды.
+        "scripts/measure/test_provider_latency.py:"*) continue ;;
       esac
       if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
         case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
@@ -111,6 +125,9 @@ while IFS= read -r f; do
       fi
       if [ "$f" = ".github/workflows/deploy-dsh-edge.yml" ]; then
         case "$content" in *'deepseek-v4-flash"'*) continue ;; esac
+      fi
+      if [ "$f" = "scripts/measure/provider_latency.py" ]; then
+        case "$content" in *'"NVIDIA-nano"'*|*'"NVIDIA-ultra"'*|*'"Ollama"'*|*'"OpenRouter"'*|*'"GLM"'*) continue ;; esac
       fi
       literal_hits="$literal_hits$f:$line
 "
