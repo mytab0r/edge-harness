@@ -558,3 +558,251 @@ def test_escalate_stale_auto_task_not_repeated(monkeypatch):
 
     result = sd.escalate_stale_auto_tasks(REPO, NOW)
     assert result == []
+
+
+# ── PM-груминг перед эскалацией (#830) ──────────────────────────────────────
+
+def test_groom_closes_task_when_fingerprint_silent_long_enough(monkeypatch):
+    task = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    old_silence = (NOW - timedelta(minutes=sd.RESOLVE_QUIET_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [
+            {"created_at": old_silence, "body": f"🤫 {sd._silence_marker('check:red:foo')}\n..."},
+        ],
+        "issues/300/comments": [],
+        "PATCH repos/mytab0r/edge-harness/issues/300": {},
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])  # отпечаток отсутствует этим пульсом
+    assert any("#300" in line and "закрыт грумом" in line for line in result)
+    assert any(n == 300 and "не воспроизводится" in text for n, text in posted)
+    close_calls = [c for c in fake.calls if "PATCH" in c and "issues/300" in c and "state=closed" in c]
+    assert len(close_calls) == 1
+
+
+def test_groom_does_not_close_before_quiet_threshold(monkeypatch):
+    task = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    recent_silence = (NOW - timedelta(minutes=sd.RESOLVE_QUIET_MINUTES - 5)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [
+            {"created_at": recent_silence, "body": f"🤫 {sd._silence_marker('check:red:foo')}\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("порог тишины ещё не истёк — рано писать/закрывать"))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])
+    assert any("тих" in line for line in result)
+    assert not any("PATCH" in c for c in fake.calls)
+
+
+def test_groom_marks_first_silence_without_closing(monkeypatch):
+    task = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [],  # тишина ещё не замечена ни разу
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])
+    assert len(posted) == 1
+    assert posted[0][0] == sd.WATCHDOG_ISSUE
+    assert sd._silence_marker("check:red:foo") in posted[0][1]
+    assert any("впервые тих" in line for line in result)
+    assert not any("PATCH" in c for c in fake.calls)
+
+
+def test_groom_does_not_touch_task_whose_fingerprint_still_reproduces(monkeypatch):
+    """Мутационная гвардия отвергнутого варианта из proposal.md: «жив ли
+    отпечаток» — ВСЕГДА прямой пересчёт extract_signals(lines) этого пульса,
+    не производная от комментариев-улик detect_and_act (которые молчат на
+    идентичной улике, #248). Отпечаток присутствует в lines каждый вызов —
+    задача не должна закрываться и не должна получать маркер тишины, сколько
+    бы пульсов подряд ни повторялась ИДЕНТИЧНАЯ улика."""
+    task = _issue(300, "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [],  # эпизода тишины никогда не было
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("отпечаток жив — груминг не пишет и не закрывает"))
+
+    for _ in range(5):  # пять пульсов подряд с ОДНОЙ и той же уликой
+        result = sd.groom_auto_tasks(REPO, NOW, [REAL_PIPELINE_PAUSED])
+        assert result == []
+    assert not any("PATCH" in c for c in fake.calls)
+
+
+def test_groom_posts_revival_marker_when_fingerprint_reappears(monkeypatch):
+    task = _issue(300, "тело\n\nОтпечаток: `gate:pipeline-paused`\n\nостальное")
+    old_silence = (NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [
+            {"created_at": old_silence, "body": f"🤫 {sd._silence_marker('gate:pipeline-paused')}\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [REAL_PIPELINE_PAUSED])
+    assert len(posted) == 1
+    assert posted[0][0] == sd.WATCHDOG_ISSUE
+    assert sd._revival_marker("gate:pipeline-paused") in posted[0][1]
+    assert any("снова жив" in line for line in result)
+
+
+def test_groom_resets_silence_episode_after_reappearance(monkeypatch):
+    """Мутационная гвардия класса #248 (сброс устойчивости), симметрично для
+    тишины: старый маркер тишины (8 дней назад) стоит на WATCHDOG_ISSUE, но
+    ПОСЛЕ него был маркер «снова жив» (1 день назад) — эпизода тишины СЕЙЧАС
+    нет. Новое отсутствие отпечатка этим пульсом обязано считаться ПЕРВЫМ
+    наблюдением НОВОГО эпизода (жди RESOLVE_QUIET_MINUTES заново), а не
+    находить старый маркер и закрывать задачу мгновенно. Мутация: убери
+    сравнение с revival в _silence_episode_start (всегда возвращай
+    max(silence)) — этот тест покраснеет (задача закроется вместо повторной
+    отметки первого наблюдения)."""
+    task = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    old_silence = (NOW - timedelta(days=8)).isoformat().replace("+00:00", "Z")
+    newer_revival = (NOW - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [
+            {"created_at": old_silence, "body": f"🤫 {sd._silence_marker('check:red:foo')}\n..."},
+            {"created_at": newer_revival, "body": f"👀 {sd._revival_marker('check:red:foo')}\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])  # отпечаток снова отсутствует
+    assert not any("PATCH" in c for c in fake.calls)  # НЕ закрыт мгновенно
+    assert len(posted) == 1 and posted[0][0] == sd.WATCHDOG_ISSUE
+    assert sd._silence_marker("check:red:foo") in posted[0][1]
+    assert any("впервые тих" in line for line in result)
+
+
+ACTIVE_CHECK_RED_FOO = "⏸️ #205 — красные проверки: foo"  # держит fp check:red:foo активным
+
+
+def test_groom_closes_duplicate_fingerprint_keeping_oldest(monkeypatch):
+    older = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    newer = _issue(301, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [older, newer],
+        "issues/120/comments": [],
+        "PATCH repos/mytab0r/edge-harness/issues/301": {},
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    monkeypatch.setattr(sd, "post_issue_comment", lambda repo, n, text: posted.append((n, text)))
+
+    # fp активен этим пульсом — переживший (#300) не должен уйти по ветке (а),
+    # тест проверяет только дедуп дубликата (б).
+    result = sd.groom_auto_tasks(REPO, NOW, [ACTIVE_CHECK_RED_FOO])
+    assert any(n == 301 and "300" in text for n, text in posted)
+    close_calls = [c for c in fake.calls if "PATCH" in c and "issues/301" in c and "state=closed" in c]
+    assert len(close_calls) == 1
+    assert not any("issues/300" in c and "PATCH" in c for c in fake.calls)
+    assert any("#301" in line and "дубликат" in line and "#300" in line for line in result)
+
+
+def test_groom_keeps_duplicate_if_already_assigned(monkeypatch):
+    older = _issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное")
+    newer = dict(_issue(301, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное"))
+    newer["assignees"] = [{"login": "alice"}]
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [older, newer],
+        "issues/120/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("дубликат уже в работе — не трогаю"))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [ACTIVE_CHECK_RED_FOO])
+    assert not any("PATCH" in c for c in fake.calls)
+    assert any("#301" in line and "уже в работе" in line for line in result)
+
+
+def test_groom_skips_assigned_task_even_when_silent_past_threshold(monkeypatch):
+    task = dict(_issue(300, "тело\n\nОтпечаток: `check:red:foo`\n\nостальное"))
+    task["assignees"] = [{"login": "alice"}]
+    old_silence = (NOW - timedelta(minutes=sd.RESOLVE_QUIET_MINUTES + 30)).isoformat().replace("+00:00", "Z")
+    fake = FakeGh({
+        "issues?state=open&labels=auto-detected": [task],
+        "issues/120/comments": [
+            {"created_at": old_silence, "body": f"🤫 {sd._silence_marker('check:red:foo')}\n..."},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("задача в работе — груминг не трогает"))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])
+    assert result == []
+    assert not any("PATCH" in c for c in fake.calls)
+
+
+def test_groom_idle_when_no_open_auto_tasks(monkeypatch):
+    fake = FakeGh({"issues?state=open&labels=auto-detected": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sd, "post_issue_comment", lambda *a: pytest.fail("пустой пул — грумить нечего"))
+
+    result = sd.groom_auto_tasks(REPO, NOW, [])
+    assert result == []
+    assert all("-X" not in c for c in fake.calls)
+
+
+def test_groom_runs_before_escalation_so_resolved_task_never_escalates(monkeypatch):
+    """Владелец: эскалация владельцу должна происходить только после того,
+    как груминг отработал на этом же пульсе (тот же порядок вызова, что
+    scheduler.py: groom_auto_tasks ПЕРЕД escalate_stale_auto_tasks). Задача
+    одновременно (а) старше ESCALATE_AFTER_HOURS и (б) не воспроизводится
+    дольше RESOLVE_QUIET_MINUTES обязана быть закрыта грумом раньше, чем до
+    неё дойдёт эскалация — эскалации по ней не должно быть вовсе. Мутация:
+    поменяй порядок двух вызовов в этом тесте (как в scheduler.py) — либо
+    подмени groom_auto_tasks на no-op — эскалация уйдёт на уже
+    закрываемую грумом задачу."""
+    old_silence = (NOW - timedelta(minutes=sd.RESOLVE_QUIET_MINUTES + 5)).isoformat().replace("+00:00", "Z")
+    old_created = (NOW - timedelta(hours=sd.ESCALATE_AFTER_HOURS + 1)).isoformat().replace("+00:00", "Z")
+    task = _issue(555, "тело\n\nОтпечаток: `check:red:old`\n\nостальное", created_at=old_created)
+    state = {"open": [task], "watchdog_comments": [
+        {"created_at": old_silence, "body": f"🤫 {sd._silence_marker('check:red:old')}\n..."},
+    ], "task_comments": {555: []}}
+
+    def fake(*args):
+        joined = " ".join(args)
+        if "issues?state=open&labels=auto-detected" in joined:
+            return list(state["open"])
+        if "-X" in args and "PATCH" in args and "issues/555" in joined and "state=closed" in joined:
+            state["open"] = [i for i in state["open"] if i["number"] != 555]
+            return {}
+        if "issues/120/comments" in joined:
+            return state["watchdog_comments"]
+        if "issues/555/comments" in joined:
+            return state["task_comments"][555]
+        raise AssertionError(f"нет маршрута: {joined}")
+
+    patch_gh(monkeypatch, fake)
+
+    def record_comment(repo, n, text):
+        target = state["watchdog_comments"] if n == sd.WATCHDOG_ISSUE else state["task_comments"].setdefault(n, [])
+        target.append({"created_at": NOW.isoformat().replace("+00:00", "Z"), "body": text})
+    monkeypatch.setattr(sd, "post_issue_comment", record_comment)
+    monkeypatch.setattr(pg, "post_issue_comment", record_comment)
+    escalate_calls = []
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: escalate_calls.append(n) or "ok")
+
+    groom_result = sd.groom_auto_tasks(REPO, NOW, [])          # порядок как в scheduler.py:
+    escalate_result = sd.escalate_stale_auto_tasks(REPO, NOW)  # groom_auto_tasks ПЕРЕД escalate
+
+    assert any("#555" in line and "закрыт грумом" in line for line in groom_result)
+    assert escalate_calls == []
+    assert escalate_result == []

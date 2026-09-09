@@ -3,17 +3,52 @@
   "chains": {
     "default-chain": [
       {
-        "name": "NVIDIA-nano",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "nvidia/nemotron-nano-3-30b-a3b",
-        "secret_env": "NVIDIA_API_KEY",
+        "name": "OpenRouter-2",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "secret_env": "OPENROUTER_2_API_KEY",
         "max_output_tokens": 131072
       },
       {
-        "name": "NVIDIA",
+        "name": "Ollama-2",
+        "base_url": "https://ollama.com/v1",
+        "model": "nemotron-3-ultra",
+        "secret_env": "OLLAMA_CLOUD_2_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "Ollama-3",
+        "base_url": "https://ollama.com/v1",
+        "model": "nemotron-3-ultra",
+        "secret_env": "OLLAMA_CLOUD_3_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "Ollama-1",
+        "base_url": "https://ollama.com/v1",
+        "model": "nemotron-3-ultra",
+        "secret_env": "OLLAMA_CLOUD_1_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "NVIDIA-NIM-1",
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b",
-        "secret_env": "NVIDIA_API_KEY",
+        "model": "deepseek-ai/deepseek-v4-pro-0813",
+        "secret_env": "NVIDIA_NIM_1_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "OpenRouter-1",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "secret_env": "OPENROUTER_1_API_KEY",
+        "max_output_tokens": 131072
+      },
+      {
+        "name": "NVIDIA-NIM-2",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "deepseek-ai/deepseek-v4-pro-0813",
+        "secret_env": "NVIDIA_NIM_2_API_KEY",
         "max_output_tokens": 131072
       },
       {
@@ -30,6 +65,6 @@
     "worker": "default-chain",
     "hands": "default-chain"
   },
-  "generated_at": "2026-09-09T15:15:43Z",
-  "generated_by": "apply-agent (#823), сид из живого vars.DSH_PROVIDER_CHAIN на момент миграции — нулевое изменение поведения; Этап 2 (морда-push) заменит ручную правку автоматической"
+  "generated_at": "2026-09-09T23:19:00Z",
+  "generated_by": "apply-agent (#848): робастная цепочка из discovery живых model id (scripts/measure/provider_model_discovery.py) + повторного прогона provider-latency-bench.yml (run 34416264082, 2026-09-09T23:18:59Z) — порядок по возрастанию измеренной латентности РЕАЛЬНОГО диффа-промпта (5638 симв.), не короткой строки. Прежние два элемента (NVIDIA generic/NVIDIA_API_KEY, GLM/DEEPSEEK_API_KEY) убраны из цепочки, НЕ удалены как факт: на этом же прогоне NVIDIA (nvidia/nemotron-3-ultra-550b-a55b) вернул 404 (флаки — тот же id подтверждён #737 и успешно отвечал в прошлых прогонах, #836), GLM/Z.AI — 429 (квота, срок сброса называет docs/runbooks/switch-llm-provider.md, ещё не наступил на момент прогона). GLM оставлен ПОСЛЕДНИМ элементом цепочки (исторически надёжен вне квоты) для автовозврата после сброса; NVIDIA (generic) исключён вовсе — при повторном подтверждении живым прогоном вернуть отдельным PR, не молча. Латентность (успех, реалистичный промпт): OpenRouter-2 0.54с, Ollama-2 1.53с, Ollama-3 2.64с, Ollama-1 2.96с, NVIDIA-NIM-1 4.55с, OpenRouter-1 21.61с, NVIDIA-NIM-2 36.86с. Семь провайдеров из ТРЁХ разных семей (openrouter/ollama-cloud/nvidia-nim) — не единая точка отказа: исчерпание квоты/сбой ОДНОЙ семьи оставляет минимум четыре рабочих слота в двух других."
 }

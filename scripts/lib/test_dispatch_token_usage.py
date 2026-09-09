@@ -86,6 +86,11 @@ EXPECTED_WORKFLOWS = frozenset({
     "owner-decision.yml",
     "plugin-forge.yml",
     "pr-review.yml",
+    # #836: бенчмарк латентности провайдеров-кандидатов, workflow_dispatch
+    # вручную. Читает только secrets.<PROVIDER>_API_KEY (значения ключей
+    # LLM-провайдеров) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
+    # использует, тот же класс, что secret-scan.yml/worker-ci.yml выше.
+    "provider-latency-bench.yml",
     "quotas.yml",
     "repo-ci.yml",
     # #634: gitleaks-гейт PR + периодический полный прогон истории. Читает

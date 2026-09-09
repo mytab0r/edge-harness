@@ -286,6 +286,12 @@ dsh --version || true
 # обоснования порядка, тот же приём, что уже доказан ниже для hands-streamer).
 dsh_install_plugins_suite "$WORK/plugins-suite" \
   || { echo "::error::suite ротации учёток не установился (см. ::error:: выше, #215)" >&2; exit 1; }
+# Быстрый провайдер Claude (#838) — независимо от suite выше, гейт: секреты
+# ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL.
+dsh_install_anthropic_pool "$WORK/anthropic-pool" \
+  || { echo "::error::быстрый провайдер Claude не установился (см. ::error:: выше, #838)" >&2; exit 1; }
+dsh_import_anthropic_accounts \
+  || { echo "::error::импорт аккаунтов Claude не удался (см. ::error:: выше, #838)" >&2; exit 1; }
 
 # ── 3b. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
 # Порядок важен: --dump-config в 3d обязан доказывать монтаж плагина поверх
@@ -319,6 +325,8 @@ DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_pat
 # hands-streamer в 3d ниже) ────────────────────────────────────────────────────
 dsh_mount_plugins_suite headless \
   || { echo "::error::suite ротации учёток не смонтировался (см. ::error:: выше, #215)" >&2; exit 1; }
+dsh_mount_anthropic_pool headless \
+  || { echo "::error::быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)" >&2; exit 1; }
 
 # ── 3d. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
 # (dsh-streaming, проверка допущений 0: `dsh plugin add` + `--dump-config`
@@ -373,7 +381,7 @@ HANDS_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$HANDS_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$HANDS_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$HANDS_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_provider_chain "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
+  dsh_run_with_pool_then_chain "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
 rc=$DSH_RUN_RC
 HANDS_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 HANDS_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"

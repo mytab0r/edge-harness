@@ -95,6 +95,13 @@ jobs:
           # раньше (одиночный провайдер) — обратная совместимость, критерий 4
           # приёмки #215.
           PLUGINS_SUITE_URL: ${{ vars.PLUGINS_SUITE_URL }}
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) —
+          # НЕЗАВИСИМО от PLUGINS_SUITE_URL выше: JSON credentials.json
+          # целиком в значении секрета (AGENTS.md «Секреты» — значение
+          # никогда не печатается). Оба пусты → dsh_install_anthropic_pool
+          # печатает «не подключён», job идёт как раньше.
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
           OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
           OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
           OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
