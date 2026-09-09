@@ -551,6 +551,17 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/lib/test_provider_usage_registry.py -q
 
+      # Реестр подтверждённых id моделей (#737/#798): каждая модель из цепочек
+      # config/provider-usage.json обязана быть подтверждена реестром
+      # confirmed-provider-models.json — иначе dsh_run_with_provider_chain
+      # молча пропускает её на каждом прогоне (живой случай #798 —
+      # NVIDIA-nano простаивал мёртвым грузом, пока цепочка каждый раз
+      # переходила сразу к медленному следующему элементу).
+      - name: Гвардия реестра подтверждённых id моделей — #798
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_confirmed_provider_models.py -q
+
       # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
       # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
       # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
