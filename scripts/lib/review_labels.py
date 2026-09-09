@@ -40,7 +40,7 @@ Commit Status API (#345, кандидат из docs/research/23-platform-native-
 import hashlib
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -781,6 +781,20 @@ AI_REVIEW_WORKFLOW_FILE = "ai-review.yml"
 # разойтись молча (yml не читает эту константу — два языка).
 AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
 
+# Потолок возраста для «прогон ai-review.yml летит прямо сейчас» (#779,
+# блокирующая 2 второго гейта): то же число, что `timeout-minutes:` самого
+# job'а review в ai-review.yml — тест
+# test_ai_review_timeout_minutes_matches_review_labels_constant в
+# scripts/review/test_ai_review.py сверяет буквально (yml не читает эту
+# константу — два языка, как и AI_REVIEW_RUN_NAME_PREFIX выше). Без потолка
+# `queued`/`in_progress` читались бы как «летит» сколько угодно долго, хотя
+# GitHub сам оборвёт job по timeout-minutes — окно конечно, а предикат об
+# этом не знал: 40-часовой мнимый «летит» глушил бы разом занятость
+# (other_active_ai_review_runs) и автоповтор (trigger_ai_review), не тратя
+# бюджет попыток, и инвариант 3 (repo_invariants.retry_budget_fact) молчал
+# бы «бюджет ещё есть», хотя двигаться он не может.
+AI_REVIEW_TIMEOUT_MINUTES = 130
+
 
 def ai_review_run_name(pr: int) -> str:
     """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
@@ -795,21 +809,39 @@ def ai_review_run_name(pr: int) -> str:
     return f"{AI_REVIEW_RUN_NAME_PREFIX}{pr}"
 
 
-def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> list[dict]:
+def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
+                                 now: datetime | None = None) -> list[dict]:
     """Прогоны `ai-review.yml` (`queued`/`in_progress`) для PR #pr, кроме
     прогона `exclude_run_id` (себя) — единственное место правды на «летит ли
     прогон этого PR прямо сейчас» (#779, критерий 4: третьей копии этой
-    проверки не заводим). Четыре точки вызова читают её же: ручной
+    проверки не заводим). Шесть точек вызова читают её же: ручной
     workflow_dispatch И событийный workflow_run (`ai_review.py::cmd_should_run`,
     #399 и #779 разрыв 1), `scheduler.py::trigger_ai_review` ПЕРЕД диспатчем
-    (#779 разрыв 2) и `scheduler.py::update_branch` (#488) — второй одновременный
-    прогон денег ждать не должен, а подтягивание ветки не должно двигать head
-    из-под летящего ревью.
+    (#779 разрыв 2), `scheduler.py::update_branch` (#488),
+    `mechanical_rebase.py` (issue #764, тот же тормоз, что update_branch —
+    не двигаем head механическим рёбейзом, пока по PR летит ai-review.yml) и
+    `repo_invariants.py::retry_budget_fact` (#779, блокирующая 3 — держит ли
+    летящий прогон автоповтор, для инварианта 3) — второй одновременный
+    прогон денег ждать не должен, а подтягивание/рёбейз ветки не должны
+    двигать head из-под летящего ревью.
 
     Не листает глубже одной страницы на статус (`per_page=100`): одновременно
     активных прогонов одного workflow на масштабе этого репозитория ожидается
     единицы, не сотни — при реальном превышении это отдельная, более крупная
-    проблема, которую этот гейт не обязан решать."""
+    проблема, которую этот гейт не обязан решать.
+
+    Потолок возраста (#779, блокирующая 2): прогон старше
+    AI_REVIEW_TIMEOUT_MINUTES по `created_at` летящим не считается — GitHub
+    сам оборвёт такой job по `timeout-minutes` (ai-review.yml:139), а без
+    потолка он маскировал бы занятость бесконечно. Отсутствие/битый
+    `created_at` — не повод молча исключить прогон из списка активных (это
+    была бы деградация в обратную сторону, тише про реальную занятость);
+    такой прогон остаётся в списке как раньше.
+
+    `now` — по умолчанию реальное время; параметр существует только для
+    детерминированных тестов потолка (никто из шести вызывающих его не
+    передаёт)."""
+    now = now or datetime.now(timezone.utc)
     target = ai_review_run_name(pr)
     matches: list[dict] = []
     for status in ("in_progress", "queued"):
@@ -817,11 +849,20 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> 
             f"repos/{repo}/actions/workflows/{AI_REVIEW_WORKFLOW_FILE}/runs"
             f"?status={status}&per_page=100")
         runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
-        matches.extend(
-            run for run in runs
-            if run.get("display_title") == target
-            and str(run.get("id")) != str(exclude_run_id)
-        )
+        for run in runs:
+            if run.get("display_title") != target:
+                continue
+            if str(run.get("id")) == str(exclude_run_id):
+                continue
+            created_at = run.get("created_at")
+            if created_at:
+                try:
+                    created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
+                        continue  # старше потолка — GitHub оборвёт сам, не блокируем
+                except ValueError:
+                    pass
+            matches.append(run)
     return matches
 
 

@@ -12,6 +12,7 @@ gh не вызывается ни одной тестируемой функци
 
 import argparse
 import importlib.util
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1694,6 +1695,76 @@ def test_ai_review_workflow_gate1_case_matches_gate1_labels():
     )
 
 
+# ── #779, блокирующая 1: два триггера ОДНОГО PR не отказывают друг другу
+# одновременно — вердиктов не ноль, а ровно один ─────────────────────────────
+#
+# До фикса группа concurrency событийного пути ключевалась workflow_run.id
+# (уникален на КАЖДОЕ событие pr-review) — два разных pr-review-события
+# одного PR попадали каждое в свою группу и НЕ сериализовались вовсе, а
+# other_active_ai_review_runs спрашивался ТЕПЕРЬ обоими путями триггера
+# (#779, разрыв 1): оба прогона видели друг друга `in_progress`/`queued` и
+# оба отвечали false — вердиктов ноль (живой случай PR #725, 2026-09-08: run
+# 34183129865 workflow_run и run 34183131439 workflow_dispatch, Δ=2с). Фикс —
+# группа по НОМЕРУ PR для обоих путей (concurrency.group в ai-review.yml):
+# два триггера одного PR теперь физически не могут выполнять ЭТОТ шаг
+# одновременно — GitHub держит второго `queued`, пока первый не завершится,
+# и тот стартует уже В ОДИНОЧКУ.
+
+def test_ai_review_concurrency_group_keys_both_paths_by_pr_number():
+    # Мутация: верни group на "workflow_run.id || inputs.pr" (был до фикса) —
+    # этот тест обязан покраснеть, потому что workflow_run.id перестанет быть
+    # ПОСЛЕДНИМ (fallback) операндом, а номер PR из pull_requests[0] исчезнет
+    # из выражения вовсе.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    match = re.search(r"group:\s*>-\n(.*?)\n\s*cancel-in-progress:", source, re.DOTALL)
+    assert match, "не нашёл concurrency.group в ai-review.yml"
+    group_expr = " ".join(line.strip() for line in match.group(1).splitlines())
+    assert "github.event_name == 'workflow_dispatch' && github.event.inputs.pr" in group_expr
+    assert "github.event.workflow_run.pull_requests[0].number" in group_expr
+    # workflow_run.id — только fallback ПОСЛЕ номера PR (форк-PR, pull_requests
+    # пуст), не первый операнд — иначе группа снова уникальна на событие, а не
+    # на PR, и два триггера одного PR снова не сериализуются.
+    assert group_expr.rstrip().endswith("github.event.workflow_run.id }}")
+    assert group_expr.index("pull_requests[0].number") < group_expr.rindex("workflow_run.id")
+
+
+def test_cmd_should_run_two_triggers_of_same_pr_yield_exactly_one_verdict(monkeypatch, capsys):
+    # Сквозной сценарий вместо пары изолированных тестов: концурренси-группа
+    # по номеру PR (проверена статически тестом выше) гарантирует, что второй
+    # триггер стартует этот шаг только ПОСЛЕ того, как первый уже завершился
+    # — здесь это смоделировано двумя последовательными вызовами
+    # cmd_should_run на одних и тех же прод-данных. Первый (A, событийный
+    # путь) не видит второго (тот ещё не создан на момент его собственной
+    # проверки — активных прогонов нет вовсе) → идёт и публикует вердикт.
+    # Второй (B, ручной workflow_dispatch, тот самый Δ=2с триггер PR #725)
+    # стартует уже когда A завершился (активных прогонов снова нет — A
+    # completed, а не queued/in_progress) — но сверка ОТПЕЧАТКА находит
+    # только что опубликованный A вердикт на том же диффе → отказывает.
+    # Итог: ровно ОДНА публикация вердикта — не ноль (симметричный тормоз,
+    # блокирующая 1 до фикса) и не две (дубль дорогого вызова модели).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111"}]
+    fp = rl.diff_fingerprint(files)
+
+    monkeypatch.setattr(ai, "gh", _fake_gh_should_run(["review:ok"], "", files))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)  # A — событийный путь (workflow_run)
+
+    rc_a = ai.cmd_should_run(argparse.Namespace(pr=294))
+    assert rc_a == 0
+    assert capsys.readouterr().out.strip() == "true"  # A публикует вердикт
+
+    comment_from_a = f"pr: 294\nhead: deadbeef\nreviewer: approve\ndiff: {fp}\n\nОк.\n"
+    monkeypatch.setattr(
+        ai, "gh", _fake_gh_should_run(["review:ok", "ai:ok"], comment_from_a, files))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")  # B — ручной путь, стартует позже
+
+    rc_b = ai.cmd_should_run(argparse.Namespace(pr=294))
+    assert rc_b == 0
+    # Не «занят» (A уже завершился) и не второй вердикт — честный отказ по
+    # неизменному отпечатку: ровно одна публикация на этот дифф, не две.
+    assert capsys.readouterr().out.strip() == "false"
+
+
 def test_other_active_ai_review_runs_filters_by_pr_and_status_excludes_self():
     def fake_gh(url: str):
         if "status=in_progress" in url:
@@ -1725,6 +1796,59 @@ def test_other_active_ai_review_runs_queries_both_statuses_with_per_page_100():
         "repos/o/r/actions/workflows/ai-review.yml/runs?status=in_progress&per_page=100",
         "repos/o/r/actions/workflows/ai-review.yml/runs?status=queued&per_page=100",
     ]
+
+
+# ── #779, блокирующая 2: потолок возраста — прогон старше timeout-minutes
+# самого job'а больше не читается как «летит» ни одним из трёх путей ────────
+
+def test_ai_review_timeout_minutes_matches_review_labels_constant():
+    # yml не читает python-константу (два языка, тот же приём, что и
+    # AI_REVIEW_RUN_NAME_PREFIX выше) — число обязано совпасть буквально,
+    # иначе потолок предиката и реальный обрыв job'а GitHub'ом разъедутся.
+    source = AI_REVIEW_YML.read_text(encoding="utf-8")
+    assert f"timeout-minutes: {rl.AI_REVIEW_TIMEOUT_MINUTES}" in source
+
+
+def test_other_active_ai_review_runs_excludes_run_older_than_timeout_ceiling():
+    # Живой разбор issue #779: без потолка прогон возрастом 40 часов в
+    # queued/in_progress читался бы «летящим» вечно — эта проверка кладёт
+    # ОДИН прогон старше AI_REVIEW_TIMEOUT_MINUTES (GitHub сам оборвал бы его
+    # job по timeout-minutes) и ОДИН моложе, оба на том же PR: старший обязан
+    # исчезнуть из списка активных, младший — остаться.
+    now = datetime(2026, 9, 9, 12, 0, tzinfo=timezone.utc)
+    stale_created = (now - timedelta(minutes=rl.AI_REVIEW_TIMEOUT_MINUTES + 1)).isoformat().replace("+00:00", "Z")
+    fresh_created = (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": stale_created},
+                {"id": 222, "display_title": "ai-review PR #399", "status": "in_progress",
+                 "created_at": fresh_created},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh, now=now)
+
+    assert {m["id"] for m in matches} == {222}
+
+
+def test_other_active_ai_review_runs_missing_created_at_still_counts_as_active():
+    # Отсутствие/битый created_at — деградация признака, не повод молча
+    # исключить прогон из занятости (обратный класс от «навсегда занят»):
+    # прод-форма ответа Actions API всегда несёт created_at, но предикат не
+    # обязан падать, если его вдруг нет.
+    def fake_gh(url: str):
+        if "status=in_progress" in url:
+            return {"workflow_runs": [
+                {"id": 111, "display_title": "ai-review PR #399", "status": "in_progress"},
+            ]}
+        return {"workflow_runs": []}
+
+    matches = rl.other_active_ai_review_runs("o/r", 399, exclude_run_id="", gh_func=fake_gh)
+
+    assert {m["id"] for m in matches} == {111}
 
 
 def test_manual_dispatch_busy_reason_names_run_status_and_declares_force_cannot_bypass():
