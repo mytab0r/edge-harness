@@ -223,7 +223,7 @@ from upstream_drift import upstream_drift_check
 # AUTO_LABEL (#543) — та же метка происхождения «заведено автоматикой»,
 # переиспользуется replace_closed_task_prs ниже: второй одноимённой константы
 # не заводим.
-from stall_detector import AUTO_LABEL, detect_and_act, escalate_stale_auto_tasks
+from stall_detector import AUTO_LABEL, detect_and_act, escalate_stale_auto_tasks, groom_auto_tasks
 
 # claim_task живёт в scripts/lib (общее место для всех каналов): TTL замка —
 # одна константа LOCK_TTL_HOURS там, сюда не дублируется.
@@ -4264,10 +4264,16 @@ def main() -> int:
     # что у archive_hard_failure ниже: отчёт сохраняется, прогон красится
     # ПОСЛЕ summary(lines), не вместо него (находка ревью PR #248: без этого
     # RuntimeError внутри детектора терял отчёт целиком до записи в
-    # GITHUB_STEP_SUMMARY).
+    # GITHUB_STEP_SUMMARY). groom_auto_tasks (#830) — ПОСЛЕ detect_and_act
+    # (задача, только что заведённая этим же пульсом, не должна тут же
+    # считаться «отпечаток не воспроизводится») и ДО escalate_stale_auto_tasks
+    # (задача, закрытая грумом на этом пульсе, никогда не доживает до
+    # эскалации владельцу) — детерминированный груминг пула (закрытие
+    # неактуальных/дублирующих стоп-задач), см. docstring stall_detector.py.
     stall_hard_failure = False
     try:
         stall_lines = detect_and_act(repo, now, lines, run_url)
+        stall_lines += groom_auto_tasks(repo, now, lines)
         stall_lines += escalate_stale_auto_tasks(repo, now)
     except RuntimeError as error:
         stall_lines = [f"🚨 детектор простоя (#201) не отработал (возможность сломана, не отсутствует): {error}"]

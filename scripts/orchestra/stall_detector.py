@@ -80,6 +80,17 @@ GitHub заново и не трогает scheduler.py дальше одной 
      закрытая дольше ESCALATE_AFTER_HOURS уходит тем же каналом, что
      pulse_guard.escalate (issue-комментарий + Telegram), текст обязан
      заканчиваться разделом «что дальше» (#170).
+  6. Груминг перед эскалацией (groom_auto_tasks, #830) — вызывается между
+     detect_and_act (выше) и escalate_stale_auto_tasks (п.5 выше) на том же
+     снимке отчёта пульса, закрывает машинно-бесспорное ДО того, как задача
+     доживёт до порога эскалации: (а) отпечаток стоп-задачи устойчиво не
+     воспроизводится (симметрично STALL_PERSIST_MINUTES появления, см. её
+     докстринг); (б) дубль по отпечатку среди открытых `auto-detected`
+     (защита от исторических/ручных случаев — `find_open_task` и так не
+     даёт создать дубль при заведении). Задачи с назначенным исполнителем не
+     трогает. Это ТОЛЬКО детерминированный груминг — судейские решения
+     (устарела ли по существу, семантический дубль, приоритет) — этап 2,
+     отдельная задача (см. openspec/changes/pm-pool-groom-deterministic/).
 
 ## Честный потолок
 
@@ -149,6 +160,13 @@ STALL_DAILY_CAP = 5
 # Автозадача, не закрытая дольше этого — эскалация владельцу (см. модульный
 # docstring, «Честный потолок»): воркеры сами не справились.
 ESCALATE_AFTER_HOURS = 48
+
+# Груминг (#830, предохранитель 6 модульного docstring): отпечаток обязан
+# ОТСУТСТВОВАТЬ этот срок подряд, прежде чем задача закроется автоматически —
+# то же значение, что STALL_PERSIST_MINUTES появления: порог, доказывающий
+# появление отпечатка, симметрично доказывает и его исчезновение (одно место
+# правды для обоих направлений одного и того же вопроса «отпечаток жив?»).
+RESOLVE_QUIET_MINUTES = STALL_PERSIST_MINUTES
 
 TASK_LABEL = "task"
 # Метка происхождения — строка реестра docs/agents/LABELS.md (#207).
@@ -521,4 +539,157 @@ def escalate_stale_auto_tasks(repo: str, now: datetime) -> list[str]:
         )
         result = escalate(repo, number, text)
         report.append(f"🚨 #{number}: эскалация по затянувшейся автозадаче ({result})")
+    return report
+
+
+# ── Груминг перед эскалацией (#830) ────────────────────────────────────────
+#
+# Детерминированный, без LLM, вызывается КАЖДЫМ пульсом между detect_and_act
+# (выше) и escalate_stale_auto_tasks (выше) — закрывает машинно-бесспорное,
+# чтобы стоп-задача, чья причина уже исчезла, не доживала до эскалации
+# владельцу (#427, живой триггер #677 — владелец: «я просил PM, который
+# будет сам это делать»). Судейские решения (устарела ли по существу,
+# семантический дубль, приоритет) — этап 2, отдельная задача (proposal.md
+# openspec/changes/pm-pool-groom-deterministic/).
+
+
+def _silence_marker(fingerprint: str) -> str:
+    return f"[симптом-тишина: {fingerprint}]"
+
+
+def _revival_marker(fingerprint: str) -> str:
+    return f"[симптом-снова-жив: {fingerprint}]"
+
+
+def _silence_episode_start(repo: str, fingerprint: str) -> datetime | None:
+    """Момент начала ТЕКУЩЕГО эпизода тишины отпечатка, или None, если
+    эпизода сейчас нет (тишина ещё не замечена ни разу, либо последний
+    переходный маркер — «снова жив»). Симметрично `_closed_task_reset_times`
+    (сброс устойчивости появления, #248): самый свежий из двух переходных
+    маркеров решает, идёт ли эпизод СЕЙЧАС — а не факт, что маркер тишины
+    вообще когда-то был."""
+    silence = issue_marker_times(repo, WATCHDOG_ISSUE, _silence_marker(fingerprint))
+    if not silence:
+        return None
+    revival = issue_marker_times(repo, WATCHDOG_ISSUE, _revival_marker(fingerprint))
+    last_silence = max(silence)
+    if revival and max(revival) > last_silence:
+        return None
+    return last_silence
+
+
+def groom_auto_tasks(repo: str, now: datetime, lines: list[str]) -> list[str]:
+    """PM-груминг пула автозадач ДО эскалации владельцу (#830) — см. блок
+    комментариев выше и docstring модуля, предохранитель 6.
+
+    (а) Отпечаток стоп-задачи, отсутствующий в `extract_signals(lines)` ЭТОГО
+    пульса, запускает/продолжает эпизод тишины (переходные маркеры на
+    WATCHDOG_ISSUE, тот же канал, что `_sighting_marker`). «Отпечаток жив
+    сейчас» — ВСЕГДА прямой пересчёт этого пульса, никогда производная от
+    того, постился ли комментарий-улика в detect_and_act (тот антиспам-канал
+    молчит на идентичной улике, #248, и потому непригоден как признак
+    «жив», см. proposal.md «Отвергнутые варианты»). Эпизод, продержавшийся
+    RESOLVE_QUIET_MINUTES без единого повторного появления, — задача
+    закрывается с уликой-комментарием.
+
+    (б) Два и более открытых `auto-detected` с ОДНИМ отпечатком (защита от
+    исторических/ручных дублей — `find_open_task` и так не даёт создать
+    дубль при заведении) — оставляет открытой задачу с наименьшим номером,
+    остальные закрывает как дубликат.
+
+    Задачи с назначенным исполнителем (`assignees` не пуст) груминг не
+    трогает вовсе (ни (а), ни (б)) — воркер уже взял её в работу.
+
+    Задачи без метки `auto-detected` физически не видны этой функции —
+    единственный источник, `open_auto_tasks`, читает только эту метку."""
+    report: list[str] = []
+    active = {s.fingerprint for s in extract_signals(lines)}
+    open_tasks = open_auto_tasks(repo)
+
+    # (б) дубликаты по отпечатку — раньше (а), чтобы не гонять логику
+    # тишины на задаче, которая всё равно закрывается сейчас как дубликат.
+    by_fingerprint: dict[str, list[dict]] = {}
+    for issue in open_tasks:
+        match = _FINGERPRINT_BODY_RE.search(issue.get("body") or "")
+        if match:
+            by_fingerprint.setdefault(match.group(1), []).append(issue)
+    closed_numbers: set[int] = set()
+    for fingerprint, issues in by_fingerprint.items():
+        if len(issues) < 2:
+            continue
+        survivor, *duplicates = sorted(issues, key=lambda i: i["number"])
+        for dup in duplicates:
+            if dup.get("assignees"):
+                report.append(f"👤 #{dup['number']}: дубль по {fingerprint}, но уже в работе — не трогаю")
+                continue
+            text = (
+                f"🧹 PM-груминг (#830): дубликат отпечатка `{fingerprint}` — уже открыта "
+                f"#{survivor['number']} с тем же отпечатком. Закрываю как дубликат, дальнейшие "
+                f"улики копятся там."
+            )
+            try:
+                post_issue_comment(repo, dup["number"], text)
+                gh("-X", "PATCH", f"repos/{repo}/issues/{dup['number']}", "-f", "state=closed")
+            except RuntimeError as error:
+                report.append(f"⚠️ #{dup['number']}: дубль не закрыт грумом — {error}")
+                continue
+            closed_numbers.add(dup["number"])
+            report.append(f"🧹 #{dup['number']}: закрыт грумом как дубликат #{survivor['number']}")
+
+    # (а) отпечаток больше не воспроизводится
+    for issue in open_tasks:
+        number = issue["number"]
+        if number in closed_numbers or issue.get("assignees"):
+            continue
+        match = _FINGERPRINT_BODY_RE.search(issue.get("body") or "")
+        if not match:
+            continue
+        fingerprint = match.group(1)
+
+        if fingerprint in active:
+            if _silence_episode_start(repo, fingerprint) is not None:
+                post_issue_comment(
+                    repo, WATCHDOG_ISSUE,
+                    f"👀 {_revival_marker(fingerprint)}\nОтпечаток `{fingerprint}` снова "
+                    f"наблюдается (задача #{number}) — эпизод тишины прерван.",
+                )
+                report.append(f"👀 отпечаток {fingerprint} снова жив — эпизод тишины прерван")
+            continue
+
+        start = _silence_episode_start(repo, fingerprint)
+        if start is None:
+            post_issue_comment(
+                repo, WATCHDOG_ISSUE,
+                f"🤫 {_silence_marker(fingerprint)}\nОтпечаток `{fingerprint}` впервые не "
+                f"воспроизведён этим пульсом (задача #{number}). Продержится тишина дольше "
+                f"{RESOLVE_QUIET_MINUTES} мин — закрою автогрумом.",
+            )
+            report.append(f"🤫 отпечаток {fingerprint} впервые тих — жду устойчивости тишины")
+            continue
+
+        quiet_minutes = minutes_between(start, now)
+        if quiet_minutes < RESOLVE_QUIET_MINUTES:
+            report.append(
+                f"🤫 отпечаток {fingerprint} тих {int(quiet_minutes)} мин "
+                f"(< {RESOLVE_QUIET_MINUTES}) — жду"
+            )
+            continue
+
+        text = (
+            f"🧹 PM-груминг (#830): отпечаток `{fingerprint}` не воспроизводится "
+            f"{int(quiet_minutes)} мин подряд (порог {RESOLVE_QUIET_MINUTES}) — причина "
+            "простоя устранена. Закрываю автоматически (детерминированный груминг перед "
+            "эскалацией владельцу)."
+        )
+        try:
+            post_issue_comment(repo, number, text)
+            gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
+        except RuntimeError as error:
+            report.append(f"⚠️ #{number}: не закрыт грумом — {error}")
+            continue
+        report.append(
+            f"✅ #{number}: закрыт грумом — отпечаток {fingerprint} не воспроизводится "
+            f"{int(quiet_minutes)} мин"
+        )
+
     return report
