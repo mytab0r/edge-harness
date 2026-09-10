@@ -13,9 +13,16 @@ run` — ни один паттерн `_extract_run_targets` их не лови�
 
 Мутация, доказывающая класс: убери проверку `extra_keys` в
 translate_repo_ci — test_translate_repo_ci_raises_on_unsupported_env_key
-покраснеет (шаг с `env:` тихо мигрирует, теряя переменную окружения вместо
-громкого отказа). Убери проверку `targets` — покраснеет
+покраснеет (проверено живьём: с фикстурой, где `run:` несёт распознаваемую
+pytest-цель, а не голый `echo`, отсутствие проверки топит вызов в
+`_step_signature`/`Counter` на нехешируемом значении `env:` — `TypeError:
+unhashable type: 'dict'`, не тихая успешная миграция — но и не громкий
+`UnsupportedStepError`, а именно ЭТУ регрессию проверка `extra_keys`
+предотвращает). Убери проверку `targets` — покраснеет
 test_translate_repo_ci_raises_when_no_extractable_target тем же способом.
+Убери `_verify_removal` (issue #897, находка ревью PR #902) — краснеют
+test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor и
+test_translate_repo_ci_raises_on_duplicate_step_name.
 
 Запуск: python -m pytest scripts/lib/test_guard_step_translator.py -q
 """
@@ -214,6 +221,13 @@ def test_translate_repo_ci_migrates_multiple_steps_in_one_call(tmp_path):
 
 
 def test_translate_repo_ci_raises_on_unsupported_env_key(tmp_path):
+    """Прод-форма НАРОЧНО несёт распознаваемую pytest-цель в `run:` (находка
+    ревью PR #902): фикстура с `run: echo ${GH_TOKEN}` без узнаваемого
+    файла и так падает громко через ДРУГУЮ проверку (`targets`), мутация
+    (снятие проверки `extra_keys`) на ней ничего не доказывает — тест
+    остался бы зелёным по случайной причине. С pytest-целью снятие
+    `extra_keys` даёт РОВНО обещанный докстрингом модуля тихий класс: шаг
+    мигрирует, `GH_TOKEN` в файле каталога отсутствует."""
     text = (
         "jobs:\n"
         "  test:\n"
@@ -224,7 +238,9 @@ def test_translate_repo_ci_raises_on_unsupported_env_key(tmp_path):
         "      - name: Гвардия с переменной окружения\n"
         "        env:\n"
         "          GH_TOKEN: ${{ github.token }}\n"
-        "        run: echo ${GH_TOKEN}\n"
+        "        run: |\n"
+        "          pip install --quiet pytest\n"
+        "          python -m pytest scripts/lib/test_env_dependent.py -q\n"
     )
     repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
     original = repo_ci.read_text(encoding="utf-8")
@@ -295,6 +311,76 @@ def test_translate_repo_ci_raises_on_filename_collision(tmp_path):
         )
 
     assert repo_ci.read_text(encoding="utf-8") == original
+
+
+# ── Самопроверка после удаления (находка ревью PR #902) ──────────────────────
+
+
+def test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor(tmp_path):
+    """`_find_step_line_range` резал диапазон удаления «до первой пустой
+    строки» — пустая строка ВНУТРИ блока `run: |` (обычный стиль этого
+    репозитория) обрывала диапазон раньше конца переносимого шага, а хвост
+    его `run:`-блока молча приклеивался к `run:` СОСЕДНЕГО шага («База»
+    начинала выполнять чужой pytest). YAML при этом синтаксически валиден
+    (многострочный скаляр) — только структурная самопроверка ловит это."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Гвардия с пустой строкой в run\n"
+        "        run: |\n"
+        "          pip install --quiet pytest\n"
+        "\n"
+        "          python -m pytest scripts/lib/test_something.py -q\n"
+        "\n"
+        '      - name: "Хвост"\n'
+        "        run: echo tail\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+    original = repo_ci.read_text(encoding="utf-8")
+
+    with pytest.raises(gst.UnsupportedStepError, match="самопроверка"):
+        gst.translate_repo_ci(
+            repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir,
+            allowlist=frozenset({"База", "Хвост"}),
+        )
+
+    # Атомарность: ни repo-ci.yml, ни каталог не тронуты найденной порчей.
+    assert repo_ci.read_text(encoding="utf-8") == original
+    assert list(catalog_dir.glob("*.sh")) == []
+
+
+def test_translate_repo_ci_raises_on_duplicate_step_name(tmp_path):
+    """Дублирующееся имя шага: `added` — множество, `_find_step_dict`/
+    `_find_step_line_range` берут только ПЕРВОЕ текстовое вхождение — второй
+    одноимённый шаг остался бы в файле нетронутым, но с тем же именем,
+    которое считается перенесённым. Самопроверка ловит это по имени."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Гвардия дубликата\n"
+        "        run: python -m pytest scripts/lib/test_dup_a.py -q\n"
+        "\n"
+        "      - name: Гвардия дубликата\n"
+        "        run: python -m pytest scripts/lib/test_dup_b.py -q\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+    original = repo_ci.read_text(encoding="utf-8")
+
+    with pytest.raises(gst.UnsupportedStepError, match="самопроверка"):
+        gst.translate_repo_ci(
+            repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
+        )
+
+    assert repo_ci.read_text(encoding="utf-8") == original
+    assert list(catalog_dir.glob("*.sh")) == []
 
 
 # ── _slug_from_target: правило именования детерминировано ───────────────────

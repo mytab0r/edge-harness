@@ -371,6 +371,36 @@ def test_migrate_guard_steps_if_needed_returns_warning_without_crashing_on_unsup
     assert status.strip() == ""  # ничего не изменено — коммитить нечего
 
 
+def test_migrate_guard_steps_if_needed_returns_warning_without_crashing_on_yaml_error(tmp_path):
+    """Находка ревью PR #902: `translate_repo_ci` может упасть НЕ через
+    `UnsupportedStepError`, а через `yaml.YAMLError` (repo-ci.yml повреждён
+    текстуальным ребейзом до синтаксически невалидного YAML) — до этой
+    правки такое исключение пролетало сквозь `migrate_guard_steps_if_needed`
+    и process_pull, убивая весь проход `run()` целиком (докстринг обещает
+    обратное: перенос не может ухудшить исход "resolved")."""
+    work = _init_bare_git_repo(tmp_path, "guard_migrate_broken_yaml")
+    repo_ci = work / ".github" / "workflows" / "repo-ci.yml"
+    repo_ci.parent.mkdir(parents=True)
+    repo_ci.write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - name: Гвардия с испорченным YAML\n"
+        "        run: |\n"
+        "  этот отступ не согласован — синтаксическая ошибка YAML\n",
+        encoding="utf-8",
+    )
+    git("add", "-A", cwd=work)
+    git("commit", "-m", "fixture: repo-ci.yml с невалидным YAML", cwd=work)
+    original = repo_ci.read_text(encoding="utf-8")
+
+    warning = mr.migrate_guard_steps_if_needed(work)
+
+    assert warning is not None
+    assert "YAML" in warning or "Scanner" in warning or "Parser" in warning
+    assert repo_ci.read_text(encoding="utf-8") == original
+    status = git("status", "--porcelain", cwd=work)
+    assert status.strip() == ""  # ничего не изменено — коммитить нечего
+
+
 def test_migrate_guard_steps_if_needed_is_noop_when_repo_ci_is_absent(tmp_path):
     """Дерево без .github/workflows/repo-ci.yml вовсе (класс, который реально
     ломал этот же тестовый файл до фикса: build_origin() ниже не несёт этот

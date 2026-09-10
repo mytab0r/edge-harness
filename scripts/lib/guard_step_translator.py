@@ -56,6 +56,18 @@
   6. Удаляет комментарий и сам шаг из текста `repo-ci.yml` (ALLOWLIST не
      трогает — новые шаги в неё никогда не попадали) и схлопывает
      образовавшиеся задвоенные пустые строки.
+  7. `_verify_removal` — самопроверка ПЕРЕД записью на диск (находка ревью
+     PR #902): пустая строка внутри блока `run: |` (обычный стиль этого
+     репозитория) обрывает диапазон удаления раньше конца шага, и хвост
+     `run:`-блока молча приклеивается к `run:` СОСЕДНЕГО шага — итог
+     синтаксически ВАЛИДНЫЙ YAML (многострочный скаляр), `yaml.safe_load`
+     эту порчу не ловит. Проверка перепарсивает `new_text` и сверяет
+     структурно: (а) ни одно перенесённое имя не осталось в файле — заодно
+     закрывает дублирующееся имя шага (переносится только ПЕРВОЕ текстовое
+     вхождение, второе осталось бы видно этой проверкой); (б) множество
+     оставшихся шагов (по содержимому, не только имени) равно «старые шаги
+     минус перенесённые». Расхождение — `UnsupportedStepError` до единой
+     записи файла, тот же принцип атомарности, что и остальной модуль.
 
 Возвращает `TranslationResult(migrated=[...], changed_paths=[...])` —
 `changed_paths` включает и переписанный `repo-ci.yml`, и все новые файлы
@@ -77,6 +89,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 import re
 import shlex
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 
 import yaml
@@ -128,6 +141,7 @@ class _StepPlan:
     working_directory: str | None
     comment_lines: list[str]
     line_range: tuple[int, int]
+    raw_step: dict
 
 
 _STEP_START_RE = re.compile(r"^(\s+)- name:(.*)$")
@@ -216,6 +230,72 @@ def _remove_ranges(lines: list[str], ranges: list[tuple[int, int]]) -> list[str]
                 )
             to_skip.add(i)
     return [line for i, line in enumerate(lines) if i not in to_skip]
+
+
+def _step_signature(step: object) -> tuple:
+    """Представление шага для структурного сравнения «до»/«после» —
+    `sorted(items)` даёт устойчивый (не зависящий от порядка ключей в YAML)
+    хеш содержимого, не только имени."""
+    if not isinstance(step, dict):
+        return ("<non-dict>", repr(step))
+    return tuple(sorted((key, step.get(key)) for key in step))
+
+
+def _verify_removal(new_text: str, steps: list[dict], plans: list["_StepPlan"]) -> None:
+    """Самопроверка ПЕРЕД записью файлов (issue #897, находка ревью PR #902):
+    `_find_step_line_range` режет диапазон удаления «до первой пустой строки
+    или отступа ≤ шага» — пустая строка ВНУТРИ блока `run: |` (обычный стиль
+    этого репозитория: 54 таких строк в самом repo-ci.yml на дату находки)
+    обрывает диапазон раньше конца шага. Хвост `run:`-блока остаётся в
+    файле и молча приклеивается к `run:` СОСЕДНЕГО шага, из-за чего тот
+    начинает исполнять чужое тело — YAML при этом остаётся синтаксически
+    ВАЛИДНЫМ (многострочный скаляр), `yaml.safe_load` эту порчу не ловит,
+    воспроизведено мутацией живым текстом (см. test_guard_step_translator.py,
+    `test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor`).
+    Проверяем структурно, а не только «файл парсится»:
+      1. ни одно из перенесённых имён шага не осталось в новом тексте —
+         закрывает и порчу, и дублирующееся имя шага (`added` — множество,
+         `_find_step_dict`/`_find_step_line_range` берут только ПЕРВОЕ
+         текстовое вхождение — второй одноимённый шаг остаётся нетронутым и
+         был бы виден как «имя всё ещё присутствует»);
+      2. множество ОСТАВШИХСЯ шагов (по содержимому, не только имени) равно
+         множеству «старые шаги минус перенесённые» — ловит именно утечку
+         содержимого между соседними шагами, которую проверка (1) сама по
+         себе не видит (имя соседа не совпадает с перенесённым именем).
+    Расхождение любого рода — `UnsupportedStepError` ДО единой записи на
+    диск: перенос не может опубликовать порченный repo-ci.yml (то же
+    «атомарно по вызову», что и остальной модуль)."""
+    try:
+        new_doc = yaml.safe_load(new_text) or {}
+    except yaml.YAMLError as exc:
+        raise UnsupportedStepError(
+            "самопроверка переноса: repo-ci.yml после удаления перенесённых "
+            f"шагов не разбирается как YAML ({exc}) — перенос отменён, "
+            "перенеси шаги вручную"
+        ) from exc
+    new_steps = ((new_doc.get("jobs") or {}).get("test") or {}).get("steps") or []
+
+    migrated_names = {p.name for p in plans}
+    remaining_names = {s.get("name") for s in new_steps if isinstance(s, dict)}
+    leftover_names = sorted(migrated_names & remaining_names)
+    if leftover_names:
+        raise UnsupportedStepError(
+            f"самопроверка переноса: имя шага {leftover_names} всё ещё "
+            "присутствует в repo-ci.yml после удаления (дублирующееся имя "
+            "шага или порча удаления) — перенос отменён, перенеси вручную"
+        )
+
+    expected_remaining = Counter(_step_signature(s) for s in steps)
+    expected_remaining.subtract(_step_signature(p.raw_step) for p in plans)
+    actual_remaining = Counter(_step_signature(s) for s in new_steps)
+    if +expected_remaining != actual_remaining:
+        raise UnsupportedStepError(
+            "самопроверка переноса: множество оставшихся шагов job `test` "
+            "после удаления не равно «старые шаги минус перенесённые» — "
+            "похоже, удаление задело чужой шаг (частая причина — пустая "
+            "строка внутри run: блока перенесённого шага) — перенос "
+            "отменён, перенеси вручную"
+        )
 
 
 def _collapse_blank_runs(lines: list[str]) -> list[str]:
@@ -337,11 +417,13 @@ def translate_repo_ci(
             working_directory=step.get("working-directory"),
             comment_lines=comment_lines,
             line_range=(start, end),
+            raw_step=step,
         ))
 
     delete_ranges = sorted((p.line_range for p in plans), key=lambda r: r[0])
     kept_lines = _collapse_blank_runs(_remove_ranges(lines, delete_ranges))
     new_text = "\n".join(kept_lines)
+    _verify_removal(new_text, steps, plans)
 
     catalog_dir.mkdir(parents=True, exist_ok=True)
     migrated: list[Migration] = []
