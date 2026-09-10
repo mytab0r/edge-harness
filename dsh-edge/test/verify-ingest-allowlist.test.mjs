@@ -1,9 +1,19 @@
 // Юнит-тесты чистых экстракторов dsh-edge/verify-ingest-allowlist.mjs (класс
 // «тихий ноль»: маркер найден, но regex-извлечение типов даёт пустое
 // множество — обе стороны читаются как «типов нет», расхождений «нет»,
-// exit 0, хотя сверка не состоялась). Фикстуры — прод-форма: реальный
-// синтаксис патча 0004 (unified diff, строки с `+`) и реального core.js
-// (Object.freeze-массив), не абстрактный пересказ.
+// exit 0, хотя сверка не состоялась). Фикстуры — прод-форма ДОСЛОВНО
+// (правило «тест кормит прод-форму данных, а не пересказ», AGENTS.md;
+// находка ревью PR #640: пересказанный фрагмент патча тест заметить не
+// способен — regex кавычек и indexOf маркёра не чувствительны к сдвигу
+// формы):
+//   - REAL_PATCH_FRAGMENT — дословные строки 293-302 файла
+//     dsh-edge/patches/0004-harness-ingest.patch (hunk-заголовок, контекст,
+//     блок HARNESS_INGEST_EVENT_TYPES с одинарным плюсом добавленных строк);
+//   - REAL_STREAMER_FRAGMENT — дословный блок ALLOWED_EVENT_TYPES из
+//     scripts/dsh-hands-streamer/lib/core.js (строки 20-29).
+// Оба источника несут СЕЙЧАС 8 типов — при расхождении живая канарейка
+// (verify-ingest-allowlist.mjs) краснеет, и эти фикстуры обязаны правиться
+// вместе с ней, а не жить собственной жизнью.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { extractPatchTypes, extractStreamerTypes, assertNonEmptyAllowlists } from '../verify-ingest-allowlist.mjs'
@@ -11,35 +21,44 @@ import { extractPatchTypes, extractStreamerTypes, assertNonEmptyAllowlists } fro
 const PATCH_MARKER = '+const HARNESS_INGEST_EVENT_TYPES = new Set(['
 const STREAMER_MARKER = 'export const ALLOWED_EVENT_TYPES = Object.freeze(['
 
-// Прод-форма (реальный фрагмент unified diff патча 0004).
-const REAL_PATCH_FRAGMENT = `--- a/apps/dsh-edge/src/session-store.ts
-+++ b/apps/dsh-edge/src/session-store.ts
-@@
+const REAL_PATCH_FRAGMENT = `@@ -1496,6 +1618,107 @@ export class EdgeSessionStore {
+   }
+ }
+ 
++/** Canonical event types harness ingest accepts — the runner spool allowlist. */
 +const HARNESS_INGEST_EVENT_TYPES = new Set([
-+  'user/message',
-+  'assistant/message',
-+  'tool/call',
++  'turn/start', 'turn/end', 'step/start', 'step/end',
++  'user/message', 'assistant/message', 'tool/call', 'tool/result',
 +])
-+const OTHER = 1
++/** Ingest events carrying a turn number, renumbered onto the stored log. */
 `
 
-// Прод-форма (реальный фрагмент scripts/dsh-hands-streamer/lib/core.js).
-const REAL_STREAMER_FRAGMENT = `
-export const ALLOWED_EVENT_TYPES = Object.freeze([
+const REAL_STREAMER_FRAGMENT = `export const ALLOWED_EVENT_TYPES = Object.freeze([
+  'turn/start',
+  'turn/end',
+  'step/start',
+  'step/end',
   'user/message',
   'assistant/message',
   'tool/call',
-])
+  'tool/result',
+]);
 `
 
 test('extractPatchTypes читает реальный набор типов из unified diff', () => {
   const types = extractPatchTypes(REAL_PATCH_FRAGMENT, PATCH_MARKER)
-  assert.deepEqual([...types].sort(), ['assistant/message', 'tool/call', 'user/message'])
+  assert.deepEqual([...types].sort(), [
+    'assistant/message', 'step/end', 'step/start', 'tool/call',
+    'tool/result', 'turn/end', 'turn/start', 'user/message',
+  ])
 })
 
 test('extractStreamerTypes читает реальный набор типов из Object.freeze-массива', () => {
   const types = extractStreamerTypes(REAL_STREAMER_FRAGMENT, STREAMER_MARKER)
-  assert.deepEqual([...types].sort(), ['assistant/message', 'tool/call', 'user/message'])
+  assert.deepEqual([...types].sort(), [
+    'assistant/message', 'step/end', 'step/start', 'tool/call',
+    'tool/result', 'turn/end', 'turn/start', 'user/message',
+  ])
 })
 
 test('extractPatchTypes бросает громко, если маркер не найден (не тихий ноль)', () => {

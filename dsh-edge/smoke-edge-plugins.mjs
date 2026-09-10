@@ -35,6 +35,26 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /**
+ * Тело массива edgePlugins — текст между строкой объявления
+ * `export const edgePlugins… = [` и закрывающей `]` (обрезанный по краям).
+ * codegen-edge-plugins.mjs::renderServerModule эмитит объявление и закрывающую
+ * скобку БЕЗУСЛОВНО, даже при нуле серверных плагинов (обе строки —
+ * безусловные `lines.push`), поэтому по телу различимо «плагинов нет»
+ * (тело пусто) и «записи в тексте есть, но regex их не видит» (тело непусто)
+ * — без тела совместный дрейф обоих regex'ов извлечения неотличим от
+ * легитимного нуля. null — объявление или закрывающая скобка не найдены:
+ * форма модуля уехала целиком, о «плагинах нет» говорить нельзя.
+ */
+export function extractRegistryBody(generated) {
+  const lines = generated.split('\n')
+  const open = lines.findIndex(l => /^export const edgePlugins\b.*= \[\s*$/.test(l))
+  if (open === -1) return null
+  const close = lines.findIndex((l, i) => i > open && l.trim() === ']')
+  if (close === -1) return null
+  return lines.slice(open + 1, close).join('\n').trim()
+}
+
+/**
  * Чистый разбор текста сгенерированного модуля (без IO) — вынесен отдельно,
  * чтобы юнит-тест (dsh-edge/test/smoke-edge-plugins.test.mjs) кормился
  * реальным форматом кодогенератора без необходимости поднимать cordis/clone.
@@ -44,36 +64,41 @@ export function parseGeneratedModule(generated) {
   for (const m of generated.matchAll(/^import (\w+) from '([^']+)'$/gmu)) imports.set(m[1], m[2])
   const entries = [...generated.matchAll(/^\s*\{ id: '([^']+)', plugin: (\w+) \},?$/gmu)]
     .map(m => ({ id: m[1], specifier: imports.get(m[2]) }))
-  return { imports, entries }
+  return { imports, entries, registryBody: extractRegistryBody(generated) }
 }
 
 /**
  * Классифицирует результат parseGeneratedModule до любых дорогих шагов
  * (запись бутстрапа, spawn cordis). РАЗНЫЕ условия, не один OR (класс
- * «тихий ноль», живая находка): реестр пуст И импортов нет
- * (entries.length === 0 && imports.size === 0) — легитимное состояние
- * «плагинов нет», дымить действительно нечего.
- * Импортов нет (imports.size === 0), но записи РЕЕСТРА ЕСТЬ — это НЕ
- * «плагинов нет», а формат import-строки (`import X from '...'`) разошёлся
- * с regex'ом: старый общий OR читал этот случай как первый и выходил ДО
- * проверки unknown, которая именно этот случай и ловит — плагины молча
- * пропадали бы из дыма при смене формы import-объявления, exit 0.
- * Зеркальная сторона того же класса: записей реестра нет (entries.length
- * === 0), но импорты ЕСТЬ (imports.size > 0) — codegen-edge-plugins.mjs
- * эмитит import и запись `{ id: '...', plugin: X }` в одном цикле
- * (renderServerModule), поэтому такое расхождение в проде означает, что
- * regex записи реестра разошёлся с реальной формой (кавычки, лишнее поле,
- * перенос строки) — это НЕ «плагинов нет», а registry-format-drift. Старый
- * код читал этот случай как no-plugins (первая же проверка entries.length
- * === 0) и молча уходил в exit 0, теряя реально сгенерированные плагины из
- * дыма.
+ * «тихий ноль», живая находка): «плагинов нет» — это записей нет И тело
+ * массива пусто И импортов нет. renderServerModule эмитит import-строку,
+ * запись реестра, объявление массива и закрывающую скобку согласованным
+ * способом (записи и импорты — из одного цикла одним стилем, объявление и
+ * скобка — безусловно), поэтому любое отклонение от «тело пусто, импортов
+ * нет» при нуле сматченных записей — дрейф формы, а не ноль плагинов:
+ *   - тело непусто (записи в тексте ЕСТЬ, regex их не видит) — покрывает и
+ *     односторонний дрейф формы записи, и СОВМЕСТНЫЙ дрейф обоих regex'ов
+ *     (одно изменение стиля эмита, например кавычки, ломает оба разом —
+ *     это наиболее вероятная форма дрейфа, а не экзотика);
+ *   - объявление/скобка не найдены (registryBody === null) — форма модуля
+ *     уехала целиком;
+ *   - тело пусто, но импорты есть — в прод-форме невозможно.
+ * Старый код сваливал все эти состояния в ветку «обе-нуля» → no-plugins →
+ * exit 0 — реально сгенерированные плагины молча выпадали из дыма.
+ * Импортов нет, но записи реестра ЕСТЬ — дрейф формы import-строки
+ * (`import X from '...'`): старый общий OR читал этот случай как первый и
+ * выходил ДО проверки unknown, которая именно этот случай и ловит.
  */
-export function classifyParsedModule({ imports, entries }) {
-  if (entries.length === 0 && imports.size > 0) {
-    return { kind: 'registry-format-drift', importsCount: imports.size }
-  }
+export function classifyParsedModule({ imports, entries, registryBody }) {
   if (entries.length === 0) {
-    return { kind: 'no-plugins' }
+    if (registryBody === '' && imports.size === 0) {
+      return { kind: 'no-plugins' }
+    }
+    return {
+      kind: 'registry-format-drift',
+      importsCount: imports.size,
+      registryBody: registryBody === null ? 'missing' : 'non-empty',
+    }
   }
   if (imports.size === 0) {
     return { kind: 'import-format-drift', entriesCount: entries.length }
@@ -111,7 +136,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(0)
   }
   if (classified.kind === 'registry-format-drift') {
-    process.stderr.write(`smoke-edge-plugins: сгенерированный модуль несёт ${classified.importsCount} import(ов), но НИ ОДНОЙ записи реестра — форма '{ id: \\'...\\', plugin: X }' разошлась с regex'ом извлечения записей, кодогенератор менял форму? Бросить громко.\n`)
+    const bodyState = classified.registryBody === 'missing'
+      ? 'объявление массива edgePlugins не найдено вовсе'
+      : 'тело массива edgePlugins НЕПУСТО (записи в тексте есть, regex их не видит)'
+    process.stderr.write(`smoke-edge-plugins: сгенерированный модуль дал 0 сматченных записей реестра при ${classified.importsCount} сматченном(ых) импорте(ах), ${bodyState} — форма записей и/или всего модуля разошлась с regex'ами извлечения, кодогенератор менял форму? Бросить громко, а не читать как «плагинов нет».\n`)
     process.exit(2)
   }
   if (classified.kind === 'import-format-drift') {
