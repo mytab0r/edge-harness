@@ -331,6 +331,15 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
 
+      # Персистентное состояние квоты провайдеров (#857, openspec/changes/
+      # provider-quota-gating): чистые функции parse/merge/expire + IO на
+      # фейковом gh_func. Мутация — сломать любую из трёх функций красит
+      # соответствующий тест по отдельности.
+      - name: Тесты персистентного состояния квоты провайдеров
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/orchestra/test_provider_quota_state.py -q
+
       # Механический git rebase PR с меткой conflict без LLM-агента (#762) —
       # прод-форма: настоящий git (bare-репозиторий), FakeGh для GitHub API.
       - name: Тесты механического ребейза конфликтных PR
@@ -585,6 +594,17 @@ jobs:
         run: |
           pip install --quiet pytest
           python -m pytest scripts/lib/test_provider_usage_registry.py -q
+
+      # Граница доверия персистентной квоты провайдеров (#857, openspec/
+      # changes/provider-quota-gating): чейн-раннер (в т.ч. недоверенный
+      # ai-review.yml, #18) только читает vars.DSH_PROVIDER_QUOTA_UNTIL,
+      # пишет исключительно код пульса (scripts/orchestra/**). Мутация —
+      # добавить `gh variable set DSH_PROVIDER_QUOTA_UNTIL` в любой workflow
+      # или вызвать save_quota_state вне scripts/orchestra/ — краснеет.
+      - name: Гвардия границы доверия — персистентная квота провайдеров
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_provider_quota_state_guard.py -q
 
       # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
       # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой

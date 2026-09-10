@@ -1,7 +1,23 @@
 {
-  "$comment": "Манифест использования LLM-провайдеров (openspec/changes/llm-provider-usage-manifest). Источник правды по design.md — Settings морды dsh-edge (пуш при изменении, Этап 2, ещё не подключён); до его подключения файл правится вручную тем же путём, что раньше правился vars.DSH_PROVIDER_CHAIN. Единица цепочки не новая — та же форма {name, base_url, model, secret_env, max_output_tokens}, что уже парсит scripts/lib/dsh-ci.sh. Место вне scripts/, .github/workflows/, docs/agents/ — гвардия provider-default.guard.sh (класс #153) их не сканирует.",
+  "$comment": "Манифест использования LLM-провайдеров (openspec/changes/llm-provider-usage-manifest, порядок скорректирован openspec/changes/provider-quota-gating, #857). Источник правды по design.md — Settings морды dsh-edge (пуш при изменении, Этап 2, ещё не подключён); до его подключения файл правится вручную тем же путём, что раньше правился vars.DSH_PROVIDER_CHAIN. Единица цепочки не новая — та же форма {name, base_url, model, secret_env, max_output_tokens}, что уже парсит scripts/lib/dsh-ci.sh. Место вне scripts/, .github/workflows/, docs/agents/ — гвардия provider-default.guard.sh (класс #153) их не сканирует.",
   "chains": {
     "default-chain": [
+      {
+        "name": "GLM",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "model": "glm-5.3-flash",
+        "secret_env": "DEEPSEEK_API_KEY",
+        "max_output_tokens": 131072,
+        "$comment": "#857: первый в цепочке (владелец — лучшее качество, долгая квота). Раньше (#848) стоял последним из-за квоты 429 на момент того замера латентности — с #857 квота отслеживается персистентно (vars.DSH_PROVIDER_QUOTA_UNTIL, scripts/lib/dsh-ci.sh::dsh_provider_quota_gate_skip), поэтому первым безопасно: пока квота не сброшена, чейн-раннер пропускает GLM ДО попытки, не тратя вызов. Id подтверждён (confirmed-provider-models.json, запись 'GLM')."
+      },
+      {
+        "name": "ZAI",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "model": "glm-5",
+        "secret_env": "ZAI_1_API_KEY",
+        "max_output_tokens": 131072,
+        "$comment": "#857: второй z.ai-аккаунт (ZAI_1_API_KEY — отдельный ключ от DEEPSEEK_API_KEY, заведён #732/#733 для combo-router). НЕ подтверждён живым /v1/models (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели», класс #737) — dsh_model_confirmed пропустит эту запись безопасным no-op'ом, пока кто-то с доступом к ZAI_1_API_KEY не подтвердит id тем же способом, что discovery #848 подтвердил OpenRouter/Ollama/NVIDIA-NIM ниже, и не допишет hash в confirmed-provider-models.json."
+      },
       {
         "name": "OpenRouter-2",
         "base_url": "https://openrouter.ai/api/v1",
@@ -50,13 +66,6 @@
         "model": "deepseek-ai/deepseek-v4-pro-0813",
         "secret_env": "NVIDIA_NIM_2_API_KEY",
         "max_output_tokens": 131072
-      },
-      {
-        "name": "GLM",
-        "base_url": "https://api.z.ai/api/coding/paas/v4",
-        "model": "glm-5.3-flash",
-        "secret_env": "DEEPSEEK_API_KEY",
-        "max_output_tokens": 131072
       }
     ]
   },
@@ -65,6 +74,6 @@
     "worker": "default-chain",
     "hands": "default-chain"
   },
-  "generated_at": "2026-09-09T23:19:00Z",
-  "generated_by": "apply-agent (#848): робастная цепочка из discovery живых model id (scripts/measure/provider_model_discovery.py) + повторного прогона provider-latency-bench.yml (run 34416264082, 2026-09-09T23:18:59Z) — порядок по возрастанию измеренной латентности РЕАЛЬНОГО диффа-промпта (5638 симв.), не короткой строки. Прежние два элемента (NVIDIA generic/NVIDIA_API_KEY, GLM/DEEPSEEK_API_KEY) убраны из цепочки, НЕ удалены как факт: на этом же прогоне NVIDIA (nvidia/nemotron-3-ultra-550b-a55b) вернул 404 (флаки — тот же id подтверждён #737 и успешно отвечал в прошлых прогонах, #836), GLM/Z.AI — 429 (квота, срок сброса называет docs/runbooks/switch-llm-provider.md, ещё не наступил на момент прогона). GLM оставлен ПОСЛЕДНИМ элементом цепочки (исторически надёжен вне квоты) для автовозврата после сброса; NVIDIA (generic) исключён вовсе — при повторном подтверждении живым прогоном вернуть отдельным PR, не молча. Латентность (успех, реалистичный промпт): OpenRouter-2 0.54с, Ollama-2 1.53с, Ollama-3 2.64с, Ollama-1 2.96с, NVIDIA-NIM-1 4.55с, OpenRouter-1 21.61с, NVIDIA-NIM-2 36.86с. Семь провайдеров из ТРЁХ разных семей (openrouter/ollama-cloud/nvidia-nim) — не единая точка отказа: исчерпание квоты/сбой ОДНОЙ семьи оставляет минимум четыре рабочих слота в двух других."
+  "generated_at": "2026-09-10T00:00:00Z",
+  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857."
 }
