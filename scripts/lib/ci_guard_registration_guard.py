@@ -434,6 +434,66 @@ def guard_step_names(repo_ci: Path = REPO_CI) -> set[str]:
     return names
 
 
+def _step_run_text(repo_ci: Path, name: str) -> str | None:
+    """`run:` шага `name` job `test` — или None, если шаг не найден/`run:` не
+    строка. Нужно только для газа сообщения ниже (_suggest_guard_filename),
+    второй копии этого разбора translate_repo_ci не заводит: этот геттер живёт
+    здесь, а не в guard_step_translator.py, чтобы не тянуть его модуль на
+    каждый вызов guard_step_names (см. _suggest_guard_filename — переносчик
+    загружается лениво, только когда находка уже есть)."""
+    doc = yaml.safe_load(repo_ci.read_text(encoding="utf-8")) or {}
+    steps = ((doc.get("jobs") or {}).get("test") or {}).get("steps") or []
+    for step in steps:
+        if isinstance(step, dict) and step.get("name") == name:
+            run_text = step.get("run")
+            return run_text if isinstance(run_text, str) else None
+    return None
+
+
+def _load_guard_step_translator():
+    """Ленивая загрузка guard_step_translator.py ТОЛЬКО ради имени файла в
+    газе сообщения ниже (issue #897) — по пути файла, тот же приём, что этот
+    модуль уже применяет для orphan_test_guard.py. Ленивая (внутри функции,
+    не на уровне модуля): guard_step_translator.py САМ грузит свежую копию
+    ЭТОГО модуля на своём уровне модуля — если бы эта загрузка тоже была на
+    уровне модуля, оба файла грузили бы друг друга при каждом импорте.
+    Отложенный вызов (только когда уже есть находка — редкий путь) разрывает
+    цикл: к моменту, когда этот модуль просит guard_step_translator, тот уже
+    может спокойно догрузить свежую копию ЭТОГО файла (её код на своём
+    уровне модуля саму функцию ниже не вызывает — рекурсии нет)."""
+    spec = importlib.util.spec_from_file_location(
+        "guard_step_translator", Path(__file__).resolve().parent / "guard_step_translator.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    # Регистрация в sys.modules ДО exec_module: guard_step_translator.py несёт
+    # `@dataclass` на классах с отложенными аннотациями — без регистрации
+    # сам импорт падает AttributeError на Python 3.11 (см. докстринг
+    # guard_step_translator.py::_load_sibling, тот же класс).
+    sys.modules["guard_step_translator"] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def _suggest_guard_filename(repo_ci: Path, name: str) -> str | None:
+    """Точное имя файла каталога тем же способом, что реальный перенос
+    (guard_step_translator.py::_slug_from_target) — одно место правды для
+    «как называть», вторая копия наименования не заводится. Не удалось
+    определить (в `run:` нет pytest/node --test/guard-файла, или модуль
+    переноса недоступен) — None, сообщение тогда падает на общее текстовое
+    правило (см. check_no_undeclared_step)."""
+    run_text = _step_run_text(repo_ci, name)
+    if not run_text:
+        return None
+    targets = _extract_run_targets(run_text)
+    if not targets:
+        return None
+    try:
+        translator = _load_guard_step_translator()
+    except Exception:
+        return None
+    return f"{translator._slug_from_target(sorted(targets)[0])}.sh"
+
+
 def check_no_undeclared_step(
     repo_ci: Path = REPO_CI,
     allowlist: frozenset[str] = ALLOWLIST,
@@ -445,11 +505,30 @@ def check_no_undeclared_step(
     problems: list[str] = []
     problems.extend(check_catalog_handwritten_overlap(repo_ci, catalog_dir))
     for name in added:
+        guard_hint = _suggest_guard_filename(repo_ci, name)
+        if guard_hint:
+            howto = (
+                f"создай scripts/ci/guards/{guard_hint} (имя вычислено тем же "
+                "способом, что и сам перенос — см. guard_step_translator.py"
+                "::_slug_from_target)"
+            )
+        else:
+            howto = (
+                "создай scripts/ci/guards/<имя>-guard.sh (имя обычно берётся от "
+                "файла теста/гвардии, который вызывает run: этого шага: "
+                "test_foo.py → foo-guard.sh, foo.smoke.sh → foo-guard.sh)"
+            )
         problems.append(
             f"новый рукописный шаг гвардии в repo-ci.yml: {name!r} — перенеси в "
-            "scripts/ci/guards/<имя>.sh (#749), не дописывай шаг в общий файл "
-            "(ALLOWLIST — не самообслуживаемый обход: ratchet "
-            f"ALLOWLIST_RATCHET_MAX={ALLOWLIST_RATCHET_MAX} не даёт списку расти)"
+            f"scripts/ci/guards/ (#749): 1) {howto}; 2) шебанг "
+            "#!/usr/bin/env bash + `set -euo pipefail` + дословное тело `run:` "
+            "этого шага (бит исполнения не нужен — run_guards.sh зовёт файл "
+            "через `bash \"$script\"`, не напрямую); 3) удали из repo-ci.yml "
+            "сам шаг целиком (строку `- name: …` и весь блок `run:` под ней), "
+            "не оставляя его под другим именем (двойная регистрация); не "
+            "дописывай шаг в общий файл (ALLOWLIST — не самообслуживаемый "
+            f"обход: ratchet ALLOWLIST_RATCHET_MAX={ALLOWLIST_RATCHET_MAX} не "
+            "даёт списку расти)"
         )
     for name in removed:
         problems.append(

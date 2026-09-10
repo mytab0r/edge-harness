@@ -142,6 +142,18 @@ import scheduler as sch  # noqa: E402 — после sys.path выше, тот �
 
 review_labels = sch.review_labels  # уже загруженный scheduler'ом модуль — не грузим второй раз
 
+# Загрузка по пути файла (issue #897) — тот же приём, что console_utf8 bootstrap
+# выше и сам guard_step_translator.py уже применяют (в scripts/lib нет
+# __init__.py). Регистрация в sys.modules ДО exec_module: модуль несёт
+# @dataclass на отложенных аннотациях (см. его же докстринг _load_sibling) —
+# без регистрации импорт падает AttributeError на Python 3.11.
+_gst_spec = importlib.util.spec_from_file_location(
+    "guard_step_translator", _DIR.parent / "lib" / "guard_step_translator.py"
+)
+guard_step_translator = importlib.util.module_from_spec(_gst_spec)
+sys.modules["guard_step_translator"] = guard_step_translator
+_gst_spec.loader.exec_module(guard_step_translator)  # type: ignore[union-attr]
+
 
 class GitError(RuntimeError):
     """Сбой git-операции (сеть, права, отсутствующая ветка, force-with-lease
@@ -235,6 +247,51 @@ def push_rebased(repo_dir: Path, head_ref: str) -> None:
     run_git(["push", "--force-with-lease", "origin", f"{head_ref}:{head_ref}"], repo_dir)
 
 
+def migrate_guard_steps_if_needed(repo_dir: Path) -> str | None:
+    """После УСПЕШНОГО механического ребейза (attempt_rebase → "resolved"),
+    ДО push_rebased (issue #897): git применяет патч контекстно и ничего не
+    знает про каталог гвардий `scripts/ci/guards/` (#749/#771) — PR,
+    добавивший рукописный шаг ДО #771, сводится без конфликта, но
+    `ci_guard_registration_guard.py` красит CI этого же PR сразу после
+    ребейза (живой замер issue #897: PR #890/#895, 14 открытых PR/20 шагов
+    на дату замера). `guard_step_translator.translate_repo_ci` переносит всё,
+    что умеет, детерминированно; результат коммитится ОТДЕЛЬНЫМ коммитом
+    поверх уже перебазированной ветки — `push_rebased` пушит его вместе с
+    остальными.
+
+    Не блокирует push резолвнутого PR: перенос — УЛУЧШЕНИЕ, не условие
+    "resolved" (attempt_rebase уже решил структурный вопрос конфликта).
+    Ничего не нашлось — None, тихо (не находка, TranslationResult.migrated
+    пуст — не тормоз без газа, это норма для подавляющего большинства PR).
+    Нашёлся неразбираемый шаг — предупреждение (не исключение): PR всё
+    равно пушится КАК ЕСТЬ (тот же исход, что и до этой правки), CI после
+    push покажет ту же красную гвардию, но уже с точной инструкцией газа
+    (см. ci_guard_registration_guard.py::check_no_undeclared_step) — фикс
+    ухудшить исход "resolved" не может, только упростить его для человека.
+
+    Ветка/дерево без `.github/workflows/repo-ci.yml` вовсе (например,
+    синтетические git-фикстуры тестов этого модуля, которым файл гвардий не
+    предмет проверки) — None БЕЗ вызова translate_repo_ci: физически нечего
+    переносить, это не находка транслятора (guard_step_names читает файл
+    безусловно и бросил бы FileNotFoundError, если бы не эта проверка)."""
+    if not (repo_dir / ".github" / "workflows" / "repo-ci.yml").exists():
+        return None
+    try:
+        result = guard_step_translator.translate_repo_ci(repo_dir)
+    except guard_step_translator.UnsupportedStepError as error:
+        return f"перенос рукописных шагов гвардии в каталог не выполнен: {error}"
+    if not result.migrated:
+        return None
+    rel_paths = [str(p.relative_to(repo_dir)) for p in result.changed_paths]
+    run_git(["add", "--", *rel_paths], repo_dir)
+    names = ", ".join(m.step_name for m in result.migrated)
+    run_git(
+        ["commit", "-m", f"перенос рукописных шагов гвардии в каталог (#897): {names}"],
+        repo_dir,
+    )
+    return None
+
+
 def _same_repo_agent_branch(repo: str, pull: dict) -> bool:
     """issue #764, находка ревью, требование 4: репозиторий публичный, PR из
     форка возможен — `head.ref` без проверки `head.repo.full_name` может
@@ -305,6 +362,9 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
         outcome = attempt_rebase(repo_dir, head_ref)
         if outcome == "conflict":
             return "conflict"
+        warning = migrate_guard_steps_if_needed(repo_dir)
+        if warning:
+            print(f"::warning::PR #{number}: {warning}")
         push_rebased(repo_dir, head_ref)
         return "resolved"
     except RuntimeError as error:

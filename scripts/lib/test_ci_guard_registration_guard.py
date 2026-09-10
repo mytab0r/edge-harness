@@ -267,6 +267,43 @@ def test_check_reports_both_directions_at_once(tmp_path):
     assert "Тесты старая" in joined
 
 
+# ── Газ (issue #897): сообщение называет точный файл/шаблон/что удалить ─────
+
+
+def test_check_message_names_exact_guard_filename_when_derivable(tmp_path):
+    """Правило AGENTS.md «Тормоз без газа не принимается»: находка обязана
+    называть, КУДА именно переносить, а не только сам факт нарушения —
+    имя вычислено тем же способом, что реальный перенос
+    (guard_step_translator.py::_slug_from_target), одно место правды."""
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {
+            "name": "Смоук новой находки (#901)",
+            "run": "pip install --quiet pytest\npython -m pytest scripts/lib/test_scratch_thing.py -q\n",
+        },
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    assert len(problems) == 1
+    assert "scripts/ci/guards/scratch-thing-guard.sh" in problems[0]
+    assert "set -euo pipefail" in problems[0]
+    assert "удали из repo-ci.yml сам шаг целиком" in problems[0]
+
+
+def test_check_message_falls_back_to_generic_rule_when_target_not_extractable(tmp_path):
+    """`run:` без распознаваемого файла (grep/echo-проверка, класс шага PR
+    #241 «Тесты DO журнала») — точное имя вычислить нельзя (честная граница,
+    см. guard_step_translator.py), сообщение всё равно называет ПРАВИЛО
+    именования, не молчит про «как переносить»."""
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {"name": "Гвардия новая инлайн-проверка", "run": "grep -rn foo scripts/ || exit 1"},
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    assert len(problems) == 1
+    assert "scripts/ci/guards/<имя>-guard.sh" in problems[0]
+    assert "test_foo.py" in problems[0]  # правило именования объяснено примером
+
+
 # ── Живой снимок: сама гвардия на реальном repo-ci.yml ──────────────────────
 
 def test_live_repo_ci_matches_frozen_allowlist():
