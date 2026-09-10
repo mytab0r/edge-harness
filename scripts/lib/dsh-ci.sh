@@ -901,6 +901,63 @@ dsh_extract_reset_hint() { # err_file
   printf '%s' "$line"
 }
 
+# ── Персистентное состояние квоты провайдеров (#857) ─────────────────────────
+#
+# Класс: dsh_extract_reset_hint выше ловит дату сброса из ответа провайдера
+# ВНУТРИ одного прогона, но это знание не переживает конец эфемерной джобы
+# (ai-review.yml/worker.yml/hands.yml — все три живут только на время job'а).
+# Следующий прогон, стартовавший минутой позже, снова тратит первую попытку
+# на провайдера, чью квоту предыдущий прогон УЖЕ видел исчерпанной с
+# известной датой сброса — тормоз без газа (AGENTS.md): знание есть, а
+# перенести его в следующий job нечем.
+#
+# Носитель — vars.DSH_PROVIDER_QUOTA_UNTIL (JSON {provider_name: reset_iso}),
+# design.md openspec/changes/provider-quota-gating обосновывает выбор: та же
+# репо-переменная, что читается контекстом workflow (`${{ vars.X }}`) БЕЗ
+# токена — тот же путь, что уже несёт vars.DSH_PROVIDER_CHAIN, включая
+# недоверенный DSH-шаг ai-review.yml (#18), у которого GitHub-токена нет
+# вовсе. ЭТА функция и весь bash-слой — ТОЛЬКО ЧТЕНИЕ: пишет состояние
+# исключительно пульс оркестратора (scripts/orchestra/provider_quota_state.py,
+# вызывается из scheduler.py::sync_provider_quota_state) — гвардия границы
+# доверия в scripts/lib/test_provider_quota_state_guard.py.
+#
+# Разбирает состояние ОДИН раз за весь прогон цепочки (не на каждой
+# итерации): переменная не задана — гейт не срабатывает никогда (обратная
+# совместимость); задана, но не JSON-объект — ::warning:: и фейл-открыто
+# (работоспособность цепочки важнее гейта квоты, сломанное персистентное
+# состояние не должно ронять прод).
+dsh_quota_state_validate() { # -> печатает в stdout валидный JSON-объект или пусто
+  local raw="${DSH_PROVIDER_QUOTA_UNTIL:-}"
+  [ -n "$raw" ] || return 0
+  if jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw"; then
+    printf '%s' "$raw"
+  else
+    echo "::warning::vars.DSH_PROVIDER_QUOTA_UNTIL задана, но не JSON-объект — гейтирование по персистентной квоте пропущено в этом прогоне (фейл-открыто, #857)" >&2
+  fi
+}
+
+# $1 — имя провайдера, $2 — валидированный JSON-объект состояния (может быть
+# пустой строкой). Возврат 0 — провайдера следует ПРОПУСТИТЬ (квота ещё не
+# сброшена), DSH_QUOTA_GATE_RESET несёт дату; возврат 1 — пробовать как
+# обычно (нет записи, дата нераспознана, либо срок уже прошёл).
+dsh_provider_quota_gate_skip() { # name state_json
+  local name=$1 state_json=$2 reset_iso reset_epoch now_epoch
+  DSH_QUOTA_GATE_RESET=""
+  [ -n "$state_json" ] || return 1
+  reset_iso=$(jq -r --arg n "$name" '.[$n] // empty' <<<"$state_json" 2>/dev/null) || return 1
+  [ -n "$reset_iso" ] || return 1
+  reset_epoch=$(date -u -d "$reset_iso" +%s 2>/dev/null) || {
+    echo "::warning::цепочка провайдеров: quota-состояние '$name' содержит нераспознанную дату '$reset_iso' (vars.DSH_PROVIDER_QUOTA_UNTIL) — гейт пропущен для этого провайдера, пробую как обычно" >&2
+    return 1
+  }
+  now_epoch=$(date -u +%s)
+  if [ "$now_epoch" -lt "$reset_epoch" ]; then
+    DSH_QUOTA_GATE_RESET="$reset_iso"
+    return 0
+  fi
+  return 1
+}
+
 # ── Реестр подтверждённых id моделей (#737) ──────────────────────────────────
 #
 # Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)
@@ -947,10 +1004,14 @@ dsh_model_confirmed() { # model_id
 dsh_run_with_provider_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint
+  local quota_state_json
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
   DSH_CHAIN_TRIED=""
   DSH_CHAIN_RESET_HINT=""
+  # #857: персистентное состояние квоты, разобрано ОДИН раз за весь прогон
+  # цепочки (не на каждой итерации) — см. dsh_quota_state_validate выше.
+  quota_state_json=$(dsh_quota_state_validate)
   # Как и dsh_run_with_retry, эта функция НИКОГДА не возвращает ненулевой код
   # сама (иначе `set -e` вызывающего оборвал бы скрипт ДО того, как он успеет
   # прочитать DSH_RUN_RC/DSH_RUN_FAILURE_REASON и напечатать свой отчёт) —
@@ -972,6 +1033,19 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     model=$(jq -r '.model' <<<"$entry")
     secret_env=$(jq -r '.secret_env' <<<"$entry")
     max_tokens=$(jq -r '.max_output_tokens // 131072' <<<"$entry")
+    # #857: персистентная квота ДО секрета/подтверждения модели — самый
+    # дешёвый гейт первым, не тратит jq-разбор на провайдера, который всё
+    # равно будет пропущен. continue (не stop=1) — "all_providers_exhausted"
+    # по-прежнему считается только когда i>=count, весь список пройден
+    # (включая пропущенных гейтом) — правило AGENTS.md «Алерт не гадает»
+    # держится тем же кодом, что и раньше (design.md, «Алерт уже не гадает»).
+    if dsh_provider_quota_gate_skip "$name" "$quota_state_json"; then
+      echo "::notice::цепочка провайдеров: $name пропущен — квота до $DSH_QUOTA_GATE_RESET (vars.DSH_PROVIDER_QUOTA_UNTIL, #857)" >&2
+      DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name (пропущен: квота до $DSH_QUOTA_GATE_RESET)"
+      DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $DSH_QUOTA_GATE_RESET"
+      i=$((i + 1))
+      continue
+    fi
     DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name"
     key="${!secret_env:-}"
     if [ -z "$key" ]; then

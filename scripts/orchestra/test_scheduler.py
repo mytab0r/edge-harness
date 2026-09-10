@@ -856,7 +856,26 @@ class FakeGh:
     # уже отвергнут для остальной инфраструктуры моков (routes уже позволяет
     # тесту переопределить конкретный fragment явно, если гонка — его предмет,
     # см. test_update_branch_skips_when_ai_review_running_for_pr ниже).
-    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
+    # #857: sync_provider_quota_state читает/пишет vars.DSH_PROVIDER_QUOTA_UNTIL
+    # ВНУТРИ trigger_ai_review, когда PR несёт непустой reset-at факт — те же
+    # тесты, что уже существовали ДО #857 для этой ветки, не обязаны заводить
+    # свой маршрут ради второстепенного механизма (тот же приём, что для
+    # ai-review.yml/runs выше). GET по умолчанию — «переменная ещё не
+    # заведена» (404), PATCH по умолчанию — тихий успех (без тела, как и
+    # реальный ответ GitHub на успешный PATCH переменной).
+    # Порядок ключей важен (__call__ ниже матчит первый подходящий по
+    # вставке): PATCH-фрагмент — подстрока GET-фрагмента ("actions/
+    # variables/DSH_PROVIDER_QUOTA_UNTIL" входит в обе строки вызова), более
+    # специфичный маршрут обязан идти РАНЬШЕ общего, иначе PATCH подхватит
+    # 404-заглушку GET и save_quota_state пойдёт по ложному пути на POST.
+    _DEFAULT_ROUTES = {
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "-X PATCH repos/mytab0r/edge-harness/actions/variables/DSH_PROVIDER_QUOTA_UNTIL": None,
+        "actions/variables/DSH_PROVIDER_QUOTA_UNTIL": RuntimeError(
+            "gh api repos/.../actions/variables/DSH_PROVIDER_QUOTA_UNTIL: "
+            "HTTP 404: Not Found (https://api.github.com/...)"
+        ),
+    }
 
     def __init__(self, routes: dict):
         self.routes = {**self._DEFAULT_ROUTES, **routes}
@@ -1194,6 +1213,87 @@ def test_trigger_ai_review_dispatches_once_reset_date_passed(monkeypatch):
     now = utc(2026, 9, 8, 2, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
     assert any("ai-review.yml/dispatches" in c for c in fake.calls)
+
+
+# ── #857: персистентное состояние квоты провайдеров ──────────────────────────
+
+
+def test_trigger_ai_review_persists_provider_quota_state_from_reset_at(monkeypatch):
+    # Живой мотив #857: сброс известен (GLM: 2026-09-10 08:51:55) — состояние
+    # обязано быть записано в vars.DSH_PROVIDER_QUOTA_UNTIL, чтобы СЛЕДУЮЩИЙ,
+    # уже другой job (worker/hands/новый прогон ai-review) не тратил первую
+    # попытку на заведомо исчерпанный GLM.
+    p = pull(703, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha703/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/703/comments": [ai_failed_comment("GLM: 2026-09-10 08:51:55")],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 2, 0)  # сброс ещё не наступил — эскалация, не dispatch
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    patch_calls = [c for c in fake.calls if c.startswith("-X PATCH") and "DSH_PROVIDER_QUOTA_UNTIL" in c]
+    assert len(patch_calls) == 1
+    assert 'value={"GLM": "2026-09-10T08:51:55Z"}' in patch_calls[0]
+    assert any("квота провайдеров" in line and "GLM" in line for line in observations)
+
+
+def test_trigger_ai_review_expires_stale_provider_quota_state(monkeypatch):
+    # Состояние уже несёт протухшую запись NVIDIA (срок прошёл) — газ «срок
+    # прошёл» из AGENTS.md «Тормоз без газа» обязан снять её тем же
+    # обновлением, что записывает свежий факт GLM.
+    p = pull(704, labels=["review:ok", "ai:failed"])
+    existing_state = '{"NVIDIA": "2026-09-01T00:00:00Z"}'
+    fake = FakeGh({
+        "commits/sha704/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/704/comments": [ai_failed_comment("GLM: 2026-09-10 08:51:55")],
+        "actions/variables/DSH_PROVIDER_QUOTA_UNTIL": {
+            "name": "DSH_PROVIDER_QUOTA_UNTIL", "value": existing_state,
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 2, 0)
+    observations, actions = sch.trigger_ai_review(REPO, now, [p])
+
+    patch_calls = [c for c in fake.calls if c.startswith("-X PATCH") and "DSH_PROVIDER_QUOTA_UNTIL" in c]
+    assert len(patch_calls) == 1
+    assert "NVIDIA" not in patch_calls[0]  # протухшая запись снята
+    assert 'value={"GLM": "2026-09-10T08:51:55Z"}' in patch_calls[0]
+    assert any("сняты протухшие" in line and "NVIDIA" in line for line in observations)
+
+
+def test_trigger_ai_review_no_quota_state_call_when_reset_at_absent(monkeypatch):
+    # ai:failed БЕЗ reset-at факта (обычный ai_review_retry_count путь) —
+    # второстепенный механизм квоты не должен трогать сеть вовсе.
+    p = pull(705, labels=["review:ok", "ai:failed"])
+    fake = FakeGh({
+        "commits/sha705/statuses": gate1_status("2026-09-08T00:00:00Z"),
+        "issues/705/comments": [],
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+
+    now = utc(2026, 9, 8, 1, 0)
+    sch.trigger_ai_review(REPO, now, [p])
+
+    assert not any("DSH_PROVIDER_QUOTA_UNTIL" in c for c in fake.calls)
+
+
+def test_sync_provider_quota_state_reports_gh_failure_without_raising(monkeypatch):
+    # Best-effort (design.md): сбой gh api не должен ронять весь тик пульса —
+    # только наблюдение с причиной.
+    def broken_gh(*args):
+        raise RuntimeError("gh api ...: HTTP 500: Internal Server Error")
+    monkeypatch.setattr(sch, "gh", broken_gh)
+
+    note = sch.sync_provider_quota_state(REPO, "GLM: 2026-09-10 08:51:55", utc(2026, 9, 8, 2, 0))
+    assert note is not None
+    assert "не удалось обновить" in note and "500" in note
 
 
 def test_parse_reset_hint_dates_prod_form():
