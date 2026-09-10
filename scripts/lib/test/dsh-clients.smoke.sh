@@ -634,7 +634,10 @@ GH_ISSUE_JSON='{"number":123,"title":"Smoke задача: испорченная
 # Обе попытки session.create видны в журнале: первая (harness-123) отказана,
 # вторая (harness-123-r<run_id>, фоллбэк) принята — задача всё равно доведена
 # до DSH и до отчёта, job зелёный.
-create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG")
+# grep -c возвращает rc=1 при нуле совпадений (нет матча — не ошибка здесь,
+# число 0 и так печатается) — под set -e это оборвало бы скрипт ДО
+# диагностического ::error:: ниже; || true отдаёт решение проверке ниже.
+create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG" || true)
 [ "$create_calls" -ge 2 ] \
   || { echo "::error::SMOKE: worker-corrupted-session: ожидалось ≥2 вызова session.create (отказ + фоллбэк), получено $create_calls" >&2
        cat "$CALLLOG" >&2; exit 1; }
@@ -662,7 +665,7 @@ GH_ISSUE_JSON='{"number":124,"title":"Smoke задача: испорченная
 # Обе попытки session.rename видны в журнале: первая (harness-124) отказана,
 # вторая (harness-124-r<run_id>, фоллбэк) принята — задача всё равно доведена
 # до DSH и до отчёта, job зелёный.
-rename_calls=$(grep -cF "MORDE-RPC session.rename" "$CALLLOG")
+rename_calls=$(grep -cF "MORDE-RPC session.rename" "$CALLLOG" || true)
 [ "$rename_calls" -ge 2 ] \
   || { echo "::error::SMOKE: worker-corrupted-session-rename: ожидалось ≥2 вызова session.rename (отказ + фоллбэк), получено $rename_calls" >&2
        cat "$CALLLOG" >&2; exit 1; }
