@@ -41,6 +41,10 @@
   по деньгам между текущим Actions, GitHub Codespaces, Cloudflare Containers и
   self-hosted runner'ом; какие живые механизмы (детектор зависания, предохранитель)
   каждый вариант убирает, а какие остаются в любом случае.
+- [32. Claude OAuth access-токен как провайдер](research/32-claude-oauth-provider.md) —
+  `llm-pi-ai` детектит `sk-ant-oat` в `apiKey` и сам переключает на Bearer + беты, без
+  loopback-прокси; плагин `dsh-anthropic-oauth-pool` нужен только ради ротации/cooldown
+  нескольких аккаунтов, не ради самого моста.
 - [99. Известные неизвестные](research/99-open-questions.md) — вопросы, на которые ответа нет
   и не будет из документации. Не тратить время на поиск; выяснять замером.
 
