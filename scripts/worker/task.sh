@@ -457,6 +457,15 @@ gh_user_id=$(gh api "users/$WORKER_LOGIN" --jq .id)
 git config user.name "$WORKER_LOGIN"
 git config user.email "${gh_user_id}+${WORKER_LOGIN}@users.noreply.github.com"
 
+# Отпечаток HEAD ветки ДО прогона DSH (issue #876, живой случай — прогон
+# 34498185823 отрапортовал успех по PR #395, существовавшему с прошлого
+# прогона, без единого нового коммита в этом): единственный дешёвый признак
+# «в РАБОЧЕМ ДЕРЕВЕ появилась работа этого прогона», не зависящий от того,
+# успел ли push дойти до origin. dsh_worker_run_is_success (dsh-ci.sh) сверяет
+# его с WORKER_BRANCH_END_SHA на шаге 8 — предсуществующая ветка сама по себе
+# больше не проходит как доказательство.
+WORKER_BRANCH_START_SHA=$(git rev-parse HEAD)
+
 # ── 5b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ────────
 # Имя сессии = «#N: название задачи», воркспейс edge-harness. Отказ громкий:
 # без сессии ход работы владельцу не виден — job красный (критерий #119).
@@ -549,6 +558,9 @@ WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
 WORKER_CHAIN_TRIED="$DSH_CHAIN_TRIED"
 WORKER_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
 echo "dsh завершился с кодом $rc (провайдер: ${WORKER_CHAIN_PROVIDER:-нет успеха}, опробованы: ${WORKER_CHAIN_TRIED:-?})"
+# Отпечаток HEAD ветки ПОСЛЕ прогона — сравнивается с WORKER_BRANCH_START_SHA
+# на шаге 8 (dsh_worker_run_is_success, issue #876).
+WORKER_BRANCH_END_SHA=$(git rev-parse HEAD)
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
 dsh_edge_stop_drain
@@ -576,14 +588,18 @@ echo "--- хвост ответа DSH ---"; [ -n "$ANSWER_TAIL" ] && printf '%s\
 echo "--- хвост stderr DSH ---"; [ -n "$ERR_TAIL" ] && printf '%s\n' "$ERR_TAIL"
 
 # ── 8. Пост-обработка: видимый результат — PR по ветке СУЩЕСТВУЕТ (открыт ИЛИ
-# слит), а не код возврата и не «открыт» (#413). Слитый PR — успех более
-# полный, чем открытый: DSH мог за один вызов довести цикл до мержа (кейс
-# #170/PR #402 — старая проверка искала только открытый PR и считала уже
-# слитую работу провалом, потому что нашла её доведённой лучше ожидаемого).
-# Единственное место правды на это различение — pr_outcome.py: «PR нет
-# вообще», «закрыт без слияния» и «открыт без диффа» остаются провалом
-# (fail loud, тот же промпт мог быть исполнен мимо PR), «открыт с диффом» и
-# «слит» — оба успех.
+# слит) И работа доказана В ЭТОМ ПРОГОНЕ (#876) — ни то, ни другое поодиночке
+# не гейт успеха. «PR существует» — pr_outcome.py: «PR нет вообще», «закрыт
+# без слияния» и «открыт без диффа» остаются провалом (fail loud, тот же
+# промпт мог быть исполнен мимо PR), «открыт с диффом» и «слит» проходят
+# дальше. «Работа этого прогона» — dsh_worker_run_is_success (dsh-ci.sh, #876,
+# живой случай — прогон 34498185823 отрапортовал успех по PR #395,
+# существовавшему с прошлого прогона, при rc=1 и пустом WORKER_CHAIN_PROVIDER
+# в ЭТОМ прогоне): rc dsh этого прогона, непустой провайдер, новый коммит в
+# ветке относительно WORKER_BRANCH_START_SHA. Слитый PR — успех более полный,
+# чем открытый: DSH мог за один вызов довести цикл до мержа (кейс #170/PR
+# #402 — старая проверка искала только открытый PR и считала уже слитую
+# работу провалом, потому что нашла её доведённой лучше ожидаемого).
 gh pr list --head "$BRANCH" --state all --limit 10 \
     --json number,state,additions,deletions,changedFiles,url >"$WORK/branch-prs.json" \
   || die "не смог прочитать PR ветки $BRANCH (gh/сеть)"
@@ -604,12 +620,25 @@ esac
 pr_status=${pr_line%%$'\t'*}
 pr_url=${pr_line#*$'\t'}
 
-if [ "$pr_outcome_rc" -eq 0 ]; then
+run_is_success=0
+if [ "$pr_outcome_rc" -eq 0 ] && dsh_worker_run_is_success \
+    "$rc" "$WORKER_CHAIN_PROVIDER" "$WORKER_BRANCH_START_SHA" "$WORKER_BRANCH_END_SHA"; then
+  run_is_success=1
+fi
+
+if [ "$run_is_success" -eq 1 ]; then
+  # Гейт уже потребовал непустой WORKER_CHAIN_PROVIDER (dsh_worker_run_is_success) —
+  # фолбэк "?" здесь был бы ровно тем литералом, что печатает противоречие
+  # инцидента #876, если гейт когда-нибудь разъедется с этим местом. Падаем
+  # громко, а не молча подставляем «?» (находка ai-review PR #880).
+  [ -n "$WORKER_CHAIN_PROVIDER" ] \
+    || die "гейт успеха пройден, но WORKER_CHAIN_PROVIDER пуст — рассинхрон с dsh_worker_run_is_success (#876/#880), это баг гейта"
   verb="открыт"; [ "$pr_status" = "merged" ] && verb="слит"
   comment=$(cat <<COMMENT
-🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER:-?}). PR $verb: $pr_url
+🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER}). PR $verb: $pr_url
 
-Финальный ответ DSH (хвост, секреты замаскированы):
+Хвост stdout DSH (секреты замаскированы; это не обязательно «финальный
+ответ» — содержимое не проверяется структурно, #876):
 
 ~~~~
 $ANSWER_TAIL
@@ -706,12 +735,33 @@ COMMENT
   die "Провайдер в лимите: $reason"
 fi
 
-# pr_status здесь всегда "empty" или "absent" (0 и rc=2 обработаны выше) —
-# разные причины настоящего провала (#413): пустой PR — DSH создал
-# ветку/PR, но не поработал; отсутствие PR — работы не видно вовсе.
+# pr_status здесь бывает двух родов (#876): "empty"/"absent" (pr_outcome_rc=1)
+# — настоящий провал по факту PR, пустой PR — DSH создал ветку/PR, но не
+# поработал; отсутствие PR — работы не видно вовсе. "open"/"merged"
+# (pr_outcome_rc=0) — PR СУЩЕСТВУЕТ, но dsh_worker_run_is_success выше
+# отказал — живой случай #876 (PR #395 существовал с прошлого прогона), но
+# НЕ единственный: rc!=0 с уже сделанными коммитами (попытка закоммитила и
+# упала позже) или rc=0 без единого нового коммита — тоже сюда. Сообщение
+# обязано называть КОНКРЕТНО несработавший конъюнкт (находка ai-review PR
+# #880 «алерт не гадает» AGENTS.md), не один и тот же текст для всех причин.
 reason="dsh завершился с кодом $rc без PR по ветке $BRANCH"
-[ "$pr_status" = "empty" ] && reason="dsh завершился с кодом $rc — PR $pr_url по ветке $BRANCH открыт, но пуст (без диффа)"
-[ "$rc" = "124" ] && reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR по ветке $BRANCH не найден"
+if [ "$pr_outcome_rc" -eq 0 ]; then
+  # DSH_WORKER_RUN_GATE_GAPS — уже посчитан вызовом dsh_worker_run_is_success
+  # выше (шаг 8, та же ветка `[ "$pr_outcome_rc" -eq 0 ] && dsh_worker_run_is_success`) —
+  # одно место правды на текст несработавшего конъюнкта, не вторая копия тех
+  # же трёх условий (находка ai-review PR #880: было — task.sh пересчитывал
+  # их сам, и при эволюции гейта список мог молча разойтись).
+  reason="PR $pr_url по ветке $BRANCH ($pr_status) существует, но не доказывает работу этого прогона: ${DSH_WORKER_RUN_GATE_GAPS:-неизвестная причина (DSH_WORKER_RUN_GATE_GAPS пуст — баг проводки гейта)}"
+elif [ "$pr_status" = "empty" ]; then
+  reason="dsh завершился с кодом $rc — PR $pr_url по ветке $BRANCH открыт, но пуст (без диффа)"
+fi
+if [ "$rc" = "124" ]; then
+  if [ "$pr_outcome_rc" -eq 0 ]; then
+    reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с; PR $pr_url по ветке $BRANCH ($pr_status) существует, ${DSH_WORKER_RUN_GATE_GAPS:-неизвестная причина (DSH_WORKER_RUN_GATE_GAPS пуст — баг проводки гейта)}"
+  else
+    reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR по ветке $BRANCH не найден"
+  fi
+fi
 comment=$(cat <<COMMENT
 🤖 Автономный воркер не справился: $reason.
 Задача остаётся под арендой: оркестратор вернёт её в пул через 24 ч без PR
