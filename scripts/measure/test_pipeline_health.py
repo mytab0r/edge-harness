@@ -314,3 +314,39 @@ def test_append_snapshot_and_push_survives_concurrent_writer(tmp_path):
                     str(tmp_path / "check")], check=True)
     rows = ph.read_rows((tmp_path / "check" / ph.SNAPSHOT_PATH).read_text(encoding="utf-8"))
     assert [r["date"] for r in rows] == ["2026-09-08", "2026-09-09", "2026-09-10"]
+
+
+# ── Гвардия workflow: git-авторизация ДО push снимка здоровья (issue #882) ───
+
+
+def test_orchestra_health_audit_step_authorizes_git_before_push():
+    """Живой корень инцидента #882: `orchestra.yml` вызывал health_audit.py
+    (который пушит на data/pipeline-health) БЕЗ `gh auth setup-git` —
+    свежий клон в $RUNNER_TEMP не наследует креды `actions/checkout`, push
+    падал 403. `dispatch-latency-probe.yml` уже несёт этот шаг перед КАЖДЫМ
+    git-пишущим шагом (тот же секрет GH_PIPELINE_PAT) — orchestra.yml обязан
+    держать то же самое перед своим единственным git-пишущим шагом."""
+    import yaml
+    workflow_path = (Path(__file__).parents[2] / ".github" / "workflows" / "orchestra.yml")
+    data = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = data["jobs"]["orchestra"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    audit_idx = next((i for i, n in enumerate(names) if "Само-аудит здоровья" in n), None)
+    assert audit_idx is not None, "шаг само-аудита исчез из orchestra.yml — гвардия ослепла"
+
+    auth_idx = next(
+        (i for i, s in enumerate(steps)
+         if "gh auth setup-git" in (s.get("run") or "") and i < audit_idx),
+        None,
+    )
+    assert auth_idx is not None, (
+        "перед шагом само-аудита здоровья нет `gh auth setup-git` — свежий клон "
+        "pipeline_health.clone_data_branch не унаследует креды actions/checkout, "
+        "push на data/pipeline-health упадёт 403 (issue #882)"
+    )
+    auth_env = steps[auth_idx].get("env") or {}
+    assert "GH_PIPELINE_PAT" in str(auth_env.get("GH_TOKEN", "")), (
+        "gh auth setup-git перед само-аудитом обязан авторизоваться широким "
+        "GH_PIPELINE_PAT (тем же секретом, что читает pipeline_health.py для push), "
+        f"а не {auth_env.get('GH_TOKEN')!r}"
+    )
