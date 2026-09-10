@@ -54,9 +54,12 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      эпик-issue уже закрыт completed. Замер на живом репозитории 2026-09-07
      (см. git-историю добавления пути (b)): 23 каталога без tasks.md
      удовлетворяют пути (b) — реальный backlog, поэтому CI_GATING инвариант 4
-     временно наблюдательный (см. блок CI_GATING ниже), не гейтящий.
+     временно наблюдательный (см. блок CI_GATING ниже), не гейтящий. Читатель
+     числа долга — дайджест DEBT_DIGEST_INVARIANTS (#888), не голый step
+     summary (см. докстринг у DEBT_DIGEST_INVARIANTS ниже).
   5. check_duplicate_evidence — два открытых task-issue ссылаются в теле на
      один и тот же file:line (класс #202/#213/#212). Честный потолок ниже.
+     Читатель — тот же дайджест долга (#888), что у 4/8/10.
   6. check_branch_protection_drift (#341) — enforce_admins/required_status_
      checks.strict/.contexts/allow_force_pushes/allow_deletions защиты
      main разошлись с EXPECTED_* (класс: admin-токен сливал мимо всех
@@ -84,7 +87,10 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      2026-09-08 (см. блок-комментарий у самой функции). Наблюдательный, не в
      CI_GATING: измерение на живом репозитории до нуля нарушений ещё не
      сделано (тот же порядок, что у 1/5 — включение отдельной правкой
-     константы после замера).
+     константы после замера). Читатель — дайджест долга (#888); живой,
+     ПРОДОЛЖАЮЩИЙСЯ на 2026-09-10 случай на PR #811 (17 прогонов после
+     финального вердикта при неизменном отпечатке) — issue #892, отдельный от
+     самого дайджеста разбор источника растраты.
   9. check_declared_deps_mismatch (#710, продолжение #371/#529) — расхождение
      между структурно объявленной связью в теле задачи («Чем блокируется»/
      «Что блокирует»/инлайн «БЛОКИРУЕТСЯ: …», разбор
@@ -114,7 +120,8 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       живой случай: 9 прогонов подряд на сессии harness-257 за 18 часов
       (порча записи журнала без message.id, #480/#794). Наблюдательный, не
       гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
-      PR (см. блок-комментарий у самой функции).
+      PR (см. блок-комментарий у самой функции). Читатель — тот же дайджест
+      долга (#888), что у 4/5/8.
   11. check_provider_usage_manifest (#823, openspec/changes/
       llm-provider-usage-manifest) — канонический список потребителей
       LLM-провайдеров (ai-review/worker/hands) обязан иметь в
@@ -2052,6 +2059,42 @@ def summary(lines: list[str]) -> None:
 
 ESCALATING_INVARIANTS = (1, 3, 12)
 
+# Дайджест долга наблюдательных инвариантов без собственного эскалатора
+# (#888): решение владельца по CI_GATING (PR #249, комментарий 2026-09-03)
+# — «инвариант наблюдательный, пока не измерен долг» — допустимо, но требует,
+# чтобы ЧИСЛО долга кто-то видел. Раньше 🚨-строки 4/5/8/10 уходили ТОЛЬКО в
+# GITHUB_STEP_SUMMARY (repo-ci.yml/orchestra.yml) — канал без постоянного
+# читателя (живой замер 2026-09-10, прогон 34506949025, conclusion=success:
+# 32 незаархивированных change, 20 пар дублирующей улики, 1 растрата
+# ai-review — не увидел никто). 1 и 3 сюда не входят — у них уже есть
+# ESCALATING_INVARIANTS выше; 7/11 — в CI_GATING (это уже читатель — красный
+# `test`); 9 намеренно не считается на периодическом пульсе вовсе (см.
+# check_declared_deps=False у вызова build_report в main()) — цифры для него
+# на этом канале просто нет, дайджестить нечего.
+DEBT_DIGEST_INVARIANTS = (4, 5, 8, 10)
+
+
+def debt_digest_snapshot(findings: dict[int, list]) -> dict[int, int]:
+    """Чистая функция: findings -> {номер инварианта: количество нарушений}.
+    Инвариант, не посчитанный на этом прогоне (ключа нет в findings) — 0, а
+    не пропуск: честный «на этом заходе нарушений не найдено», не гадание."""
+    return {n: len(findings.get(n) or []) for n in DEBT_DIGEST_INVARIANTS}
+
+
+def debt_digest_marker_key(snapshot: dict[int, int]) -> str:
+    return ",".join(f"{n}={snapshot[n]}" for n in DEBT_DIGEST_INVARIANTS)
+
+
+def debt_digest_text(snapshot: dict[int, int]) -> str:
+    parts = "; ".join(f"[{n}] {snapshot[n]}" for n in DEBT_DIGEST_INVARIANTS)
+    return (
+        "📊 edge-harness: дайджест долга наблюдательных инвариантов "
+        "repo_invariants.py (не гейтят обязательную проверку — условия "
+        "снятия у каждого см. GATING_RELEASE_CONDITION/докстринг модуля): "
+        f"{parts}. Снимок изменился с прошлой записи — полный список каждого "
+        "нарушения: python scripts/orchestra/repo_invariants.py."
+    )
+
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
     """Эскалация «один раз на состояние»: маркер кодирует конкретный набор
@@ -2117,6 +2160,18 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 12, key, text)
         if result:
             lines.append(f"📣 инвариант 12 эскалирован: {result}")
+
+    # Дайджест долга 4/5/8/10 (#888) — только когда есть хоть какой-то долг:
+    # снимок «всё по нулям» не эскалируем (тот же приём, что у 1/3 —
+    # `if findings.get(N):` выше), иначе первый же прогон на здоровом
+    # репозитории слал бы пустой отчёт и ломал бы ожидание «нет нарушений —
+    # нет мутирующих вызовов» (test_repo_invariants.py, здоровый снимок).
+    debt_snapshot = debt_digest_snapshot(findings)
+    if any(debt_snapshot.values()):
+        key = debt_digest_marker_key(debt_snapshot)
+        result = escalate_if_new(repo, "долг-дайджест", key, debt_digest_text(debt_snapshot))
+        if result:
+            lines.append(f"📣 дайджест долга (инварианты 4/5/8/10) обновлён: {result}")
     return lines
 
 
