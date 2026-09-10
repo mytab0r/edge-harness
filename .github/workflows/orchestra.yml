@@ -159,3 +159,28 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/orchestra/waiting_owner_guard.py
+
+      # Само-аудит здоровья конвейера (openspec/changes/pipeline-health-
+      # self-audit): снимок 6-7 дешёвых метрик раз в календарные сутки
+      # (гейт внутри pipeline_health.snapshot_and_store — ветка данных
+      # data/pipeline-health, не main), затем детектор регрессии
+      # (health_regression.py) и, если найдена устойчивая деградация,
+      # само-аудит заводит задачу пула (health_audit.py, метка self-audit,
+      # свой дедуп/потолок — docs/agents/LABELS.md). continue-on-error —
+      # тот же приём, что у гвардий blocked/waiting:owner выше: находка
+      # видна красным шагом (fail loud), но не гасит зелёный статус job'а,
+      # который читает пульс (heartbeat_check, #120). GH_TOKEN — широкий
+      # GH_PIPELINE_PAT (не github.token), как у dispatch_tail.py: нужен
+      # для git push на ветку данных, не только для чтения issues/PR/runs.
+      - name: Само-аудит здоровья конвейера (снимок + регрессия + задачи)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Опциональны (design.md §1): без них DO cost — честное «нет
+          # данных», остальные метрики снимаются как обычно.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python scripts/orchestra/health_audit.py run
