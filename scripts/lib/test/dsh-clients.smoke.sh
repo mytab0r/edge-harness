@@ -238,6 +238,14 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
                 '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
             fi
             echo "smoke: работа сделана после ретрая"
+            # #876: маркер «в ветке появился новый коммит этой попытки» —
+            # читает git-заглушка (rev-parse HEAD) ниже. Без него
+            # WORKER_BRANCH_START_SHA/END_SHA в worker/task.sh совпали бы
+            # ВСЕГДА (обе точки читают ту же самую константу stub'а) и
+            # dsh_worker_run_is_success отказывал бы каждому «успешному»
+            # сценарию этого smoke — работу симулирует именно ЭТА точка,
+            # там, где заглушка утверждает, что DSH реально что-то сделал.
+            : >"${SMOKE_STATE:?}/git-head-seq"
             return 0 ;;
           always-transient)
             echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
@@ -259,6 +267,8 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
         '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
         '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
       echo "smoke: работа сделана"
+      # #876 — тот же маркер, что у ветки «после ретрая» выше.
+      : >"${SMOKE_STATE:?}/git-head-seq"
       return 0 ;;
     *)
       echo "::error::SMOKE: dsh-заглушка не знает вызов: $*" >&2
@@ -282,7 +292,17 @@ cat >"$TMP/bin/git" <<'GITSTUB'
 #     заглушка «всегда главная строка» делала существующей любую ветку и
 #     красила worker-сценарий отказом до аренды (живой прогон CI 34153826296);
 #   - show-ref с отсутствующей локальной веткой в реальном git — rc=1, здесь
-#     локальных agent-веток нет вовсе.
+#     локальных agent-веток нет вовсе;
+#   - rev-parse HEAD (#876, worker/task.sh::WORKER_BRANCH_START_SHA/
+#     WORKER_BRANCH_END_SHA) ОТДЕЛЬНО от любого другого rev-parse: любой
+#     ДРУГОЙ аргумент по-прежнему получает ту же константу (task-branch
+#     сравнивает local_sha/remote_sha и полагается на их равенство здесь) —
+#     только голое "HEAD" читает $SMOKE_STATE/git-head-seq, который bump'ит
+#     dsh()-заглушка на каждом «успешном» прогоне (симуляция реального
+#     коммита ЭТОЙ попытки). Без разделения WORKER_BRANCH_START_SHA всегда
+#     равнялся бы WORKER_BRANCH_END_SHA (обе точки читали бы одну и ту же
+#     константу) и dsh_worker_run_is_success (#876) отказывал бы каждому
+#     успешному сценарию этого smoke.
 case "${1:-}" in
   ls-remote)
     for a in "$@"; do
@@ -291,7 +311,12 @@ case "${1:-}" in
         refs/heads/*) : ;;
       esac
     done ;;
-  rev-parse) printf '0000000000000000000000000000000000000000\n' ;;
+  rev-parse)
+    if [ "${2:-}" = "HEAD" ] && [ -f "${SMOKE_STATE:-/nonexistent}/git-head-seq" ]; then
+      printf '1111111111111111111111111111111111111111\n'
+    else
+      printf '0000000000000000000000000000000000000000\n'
+    fi ;;
   show-ref) exit 1 ;;
   *) exit 0 ;;
 esac
@@ -513,6 +538,10 @@ scenario_start() { # [SEED_REF...] — замки, живые ДО запуск�
   : >"$CALLLOG"
   rm -f "$JOURNAL_CAPT"
   : >"$SMOKE_STATE/locks"
+  # #876: маркер «новый коммит этой попытки» (см. dsh()/git-заглушку) не
+  # должен пережить сценарий — иначе сценарий, где dsh честно проваливается,
+  # унаследовал бы «успешную» git-историю ПРЕДЫДУЩЕГО сценария.
+  rm -f "$SMOKE_STATE/git-head-seq"
   for ref in "$@"; do printf '%s\n' "$ref" >>"$SMOKE_STATE/locks"; done
 }
 
