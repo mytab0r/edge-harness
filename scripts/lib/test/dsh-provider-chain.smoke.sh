@@ -309,11 +309,17 @@ echo "SMOKE(chain): 11) повреждённое состояние квоты -
 # ── 12) #877: rc=124 (наш таймаут) ОТЛИЧАЕТСЯ от "silent" (#737, rc=1, тоже
 # пустой stderr) — оба переключают на следующего провайдера (решение то же),
 # но сообщение обязано честно называть НАШ таймаут, не «класс не установить».
+# #880 (некритичная находка ai-review): «наш нож» утверждается только когда
+# попытка реально длилась не меньше своего таймаута — `timeout()` в этом
+# смоуке пропускает вызов насквозь без сна (заголовок файла), реального
+# зависания не воспроизвести, поэтому DSH_TIMEOUT_SECS=0 делает elapsed(0
+# или доли секунды)>=timeout(0) тривиально истинным — граничный, но честный
+# случай той же проверки dsh_chain_should_advance.
 reset_scenario
 SMOKE_MODE_primary_model="timeoutkill"
 SMOKE_MODE_secondary_model="ok"
 LOG="$WORK/log12.txt"
-dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+DSH_TIMEOUT_SECS=0 dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
 OUT="$(cat "$LOG")"
 [ "$DSH_RUN_RC" = "0" ] || fail "12) ожидался успех после таймаута у первого, получено $DSH_RUN_RC"
 [ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "12) ожидался переход на SECONDARY при таймауте PRIMARY, получено '$DSH_CHAIN_PROVIDER'"
@@ -347,4 +353,49 @@ secondary_attempts=$(grep -c 'dsh: попытка' <(sed -n '/пробую SECON
   || fail "13) SECONDARY сделал $secondary_attempts попыток — с нулевым остатком бюджета обязана быть ровно одна (бюджет исчерпан ДО первого ретрая): $OUT"
 echo "SMOKE(chain): 13) общий бюджет RATE_LIMIT на весь прогон цепочки, не на каждого провайдера заново — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877 зелёная"
+# ── 14) #877/#880 (находка ai-review PR #880 на первой версии фикса стыка):
+# бюджет RATE_LIMIT, потраченный ПУЛОМ (dsh_run_with_pool_then_chain пробует
+# anthropic-oauth-pool ДО цепочки), обязан вычитаться из общего бюджета
+# цепочки — пул это 1-я из 10 попыток прогона, не отдельная ось. Без
+# передачи DSH_RUN_WAITED_SECS пула цепочка получала бы полный бюджет
+# заново (ровно тот баг, который эта проверка ловит мутацией).
+reset_scenario
+export DSH_ANTHROPIC_POOL_ACTIVE=1
+DEEPSEEK_MODEL="pool-model"
+SMOKE_MODE_pool_model="always-rate-limit"
+SMOKE_MODE_primary_model="ok"
+LOG="$WORK/log14.txt"
+DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS=30 \
+DSH_RATE_LIMIT_MAX_DELAY_SECS=30 \
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+unset DSH_ANTHROPIC_POOL_ACTIVE
+[ "$DSH_RUN_RC" = "0" ] || fail "14) PRIMARY отвечает успехом после отказа пула, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || fail "14) ожидался переход на PRIMARY после отказа пула, получено '$DSH_CHAIN_PROVIDER'"
+[[ "$OUT" == *"остаток общего бюджета RATE_LIMIT: 0с из 60с"* ]] \
+  || fail "14) PRIMARY обязан получить остаток ПОСЛЕ пула (0с из 60с), не полный бюджет заново: $OUT"
+echo "SMOKE(chain): 14) бюджет RATE_LIMIT пула вычитается из общего бюджета цепочки — ок"
+
+# ── 15) #880 (некритичная находка ai-review): rc=124, но попытка длилась
+# МЕНЬШЕ своего таймаута — ребёнок сам вышел с 124 по собственной причине,
+# `timeout` его не убивал. «Наш нож» здесь утверждать НЕЛЬЗЯ (мы не можем
+# это доказать) — DSH_TIMEOUT_SECS заведомо больше реальной (нулевой)
+# длительности фиктивного вызова, elapsed(0) < timeout(3600) — сообщение
+# обязано остаться в общей недиагностируемой ветке («стдерр пуст»), не
+# заявлять факт, который не проверялся.
+reset_scenario
+SMOKE_MODE_primary_model="timeoutkill"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log15.txt"
+DSH_TIMEOUT_SECS=3600 dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "15) ожидался успех после rc=124 у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "15) ожидался переход на SECONDARY, получено '$DSH_CHAIN_PROVIDER'"
+[[ "$OUT" != *"наш таймаут"* ]] \
+  || fail "15) elapsed < timeout — «наш нож» не доказан замером, но сообщение его утверждает: $OUT"
+[[ "$OUT" == *"stderr пуст"* ]] \
+  || fail "15) недоказанный rc=124 обязан остаться в общей недиагностируемой ветке: $OUT"
+echo "SMOKE(chain): 15) rc=124 без подтверждения elapsed>=timeout -> не приписывается «нашему ножу» без доказательства (#880) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880 зелёная"
