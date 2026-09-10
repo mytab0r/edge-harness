@@ -115,6 +115,19 @@ PROBE_MARKER = "[статус конвейера: проба"
 HEARTBEAT_NO_TICKS_MARKER = "[статус пульса: тиков нет]"
 HEARTBEAT_TICKS_RESUMED_MARKER = "[статус пульса: тики вернулись]"
 
+# Напоминание о длящейся паузе (issue #899): нарочно НЕ содержит подстроку
+# PAUSE_MARKER — issue_markers_any(PAUSE_MARKER, RESUME_MARKER) не должен
+# подхватывать его как маркер серии, иначе last_marker_at сдвигался бы каждым
+# напоминанием и откладывал бы реальную пробу навсегда (тот же класс гонки,
+# что чинит #899, только наоборот — маркер обязан НЕ участвовать в решении).
+PAUSE_REMINDER_MARKER = "[статус конвейера: пауза продолжается]"
+# Throttle отдельный от PROBE_BACKOFF_MAX_MINUTES (issue #899, п.4): проба —
+# газ автосброса, напоминание — просто видимость. Без него state=="open"
+# может молчать до 240 минут (потолок пробы) ни разу не оставив след в #120 —
+# ровно то, что случилось 2026-09-10 (см. issue #899). 60 минут — заметно
+# меньше потолка пробы, но не спамит на каждый 15-минутный пульс.
+PAUSE_REMINDER_INTERVAL_MINUTES = 60
+
 # ── Сторож живости: независимый DO-пульс оркестратора (issue #689) ──────────────
 # heartbeat_check выше видит «пульс жив», если сработал ЛЮБОЙ легитимный канал
 # orchestra.yml (schedule ИЛИ workflow_dispatch) — и слеп к случаю, когда ОДИН
@@ -572,10 +585,39 @@ def decide_gate_state(
     return "probe" if minutes_between(last_marker_at, now) >= backoff else "open"
 
 
+def pause_reminder_due(last_signal_at: datetime | None, now: datetime,
+                        interval: float = PAUSE_REMINDER_INTERVAL_MINUTES) -> bool:
+    """#899, п.4: длящаяся пауза (state=='open') сама по себе не пишет в
+    #120/Telegram — до этой правки видна была только внутри step summary
+    ОДНОГО прогона orchestra, который никто построчно не читает часами.
+    Не на каждый 15-минутный пульс (спам) — throttle: следующее письменное
+    напоминание не раньше `interval` минут с последнего сигнала серии
+    (маркера паузы/пробы ИЛИ прошлого напоминания, что новее). last_signal_at
+    is None — сигналов ещё не было вовсе, напомнить сразу же (честнее, чем
+    молчать неопределённо)."""
+    if last_signal_at is None:
+        return True
+    return minutes_between(last_signal_at, now) >= interval
+
+
 def series_anchor(last_success_at: datetime | None, resume_at: datetime | None) -> datetime | None:
     """#220: точка, левее которой серия не существует — последний реальный
     success ИЛИ success-маркер возобновления (сброс мержем), что новее.
-    None, когда нет ни того, ни другого: серия бесконечна, в счёт всё."""
+    None, когда нет ни того, ни другого: серия бесконечна, в счёт всё.
+
+    last_success_at ОБЯЗАН быть моментом ЗАВЕРШЕНИЯ прогона (`updated_at`),
+    не постановки в очередь (`created_at`) — находка инцидента #899: маркер
+    паузы/пробы сравнивается с этим якорем как «маркер старше success →
+    серия закрыта». created_at — момент старта, у долгого прогона (worker.yml
+    может идти часами) он МЕНЬШЕ времени, когда маркер реально был поставлен
+    посреди этого же прогона, хотя сам прогон в итоге закрыл серию успехом.
+    Итог живого случая: success worker.yml 34498185823 стартовал 15:49:42,
+    завершился успехом 18:53:38; маркер «проба 4» поставлен 17:06:17 —
+    ПОСРЕДИ прогона. По created_at (15:49) маркер (17:06) «новее» — остаётся
+    в серии навсегда, хотя объективно этот же прогон её уже закрыл. По
+    updated_at (18:53) маркер (17:06) старше — корректно вычёркивается.
+    resume_at не подвержен этому классу (маркер возобновления — момент
+    ПУБЛИКАЦИИ комментария, а не старта чего-либо, что может идти часами)."""
     times = [t for t in (last_success_at, resume_at) if t is not None]
     return max(times) if times else None
 
@@ -584,10 +626,17 @@ def runs_after(runs: list[dict], anchor: datetime | None) -> list[dict]:
     """Прогоны новее якоря серии. Красные прогоны старше якоря объяснены
     (закрыты success'ом или сброшены мержем, #220) и подсчёт серии не кормят:
     series_anchor + эта фильтрация вместе дают ровно семантику «виртуального
-    success», вставленного в момент якоря."""
+    success», вставленного в момент якоря.
+
+    Сравнение — по `updated_at` (моменту ЗАВЕРШЕНИЯ), не `created_at`
+    (постановке в очередь), тем же основанием, что у якоря выше (#899): якорь
+    теперь сам построен на completion-времени, сравнивать его с created_at
+    прогона — смешивать разные единицы измерения и воскрешать тот же класс
+    гонки с другой стороны (свежий провал, стартовавший ДО якоря, но
+    завершившийся ПОСЛЕ него, молча выпадал бы из серии)."""
     if anchor is None:
         return runs
-    return [r for r in runs if parse_time(r["created_at"]) > anchor]
+    return [r for r in runs if parse_time(r["updated_at"]) > anchor]
 
 
 def probe_marker_attempts(markers: list[tuple[datetime, str]]) -> int:
@@ -751,6 +800,26 @@ def probe_alert_text(attempt: int, backoff_minutes: float, run: dict | None, err
         f"Ошибка последнего прогона: {error}\n"
         "Зелёная проба замкнёт предохранитель; красная — выдержка вырастет "
         "экспоненциально и уйдёт следующая проба."
+    )
+
+
+def pause_reminder_text(failures: int, remaining_minutes: float, run: dict | None) -> str:
+    """#899, п.4: throttled напоминание о ДЛЯЩЕЙСЯ паузе — не новая серия, не
+    проба. Нарочно без PAUSE_MARKER/PROBE_MARKER в теле (только
+    PAUSE_REMINDER_MARKER, см. его докстринг) — иначе issue_markers_any
+    подхватил бы это как маркер серии и сдвинул last_marker_at, отодвигая
+    настоящую пробу."""
+    run_line = ""
+    if run:
+        run_line = f"\nПоследний красный: {run.get('display_title') or run.get('name') or 'run'} — {run.get('html_url', 'без ссылки')}"
+    return (
+        f"⏳ edge-harness: {PAUSE_REMINDER_MARKER}\n"
+        f"Конвейер всё ещё на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
+        f"подряд (порог {WORKER_FAILURE_PAUSE_AFTER}); следующая проба не раньше "
+        f"чем через {int(remaining_minutes)} мин."
+        f"{run_line}\n"
+        "Это напоминание о ТОЙ ЖЕ паузе (см. первый сигнал выше в этой задаче), "
+        "не новая серия и не проба."
     )
 
 
@@ -1433,12 +1502,23 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     ломается, если 0 означает «идёт проба текущей красной серии»: диспатч
     воркера на предыдущем пульсе ещё выполняется. Поэтому маркеры активной
     серии читаются ДО решения по failures — если маркер есть, failures=0 не
-    может означать «closed», решение отдаётся decide_gate_state."""
+    может означать «closed», решение отдаётся decide_gate_state.
+
+    Якорь серии — по completion-времени (`updated_at`), не по постановке в
+    очередь (`created_at`), см. докстринг series_anchor/runs_after (#899):
+    иначе успех, случившийся ПОСЛЕ того, как посреди него был поставлен
+    маркер паузы/пробы, не может этот маркер снять — предохранитель стоит,
+    пока не истечёт backoff, хотя причина уже давно чинилась.
+
+    Ещё идущий прогон (conclusion=None) на голове списка при активной серии —
+    отдельный класс (#899, п.2), не по этой же причине: судить, что делать
+    ДАЛЬШЕ (новая проба, новый маркер), по прогону, чей исход ещё не известен,
+    нельзя — сначала он должен завершиться."""
     runs = recent_runs(repo, WORKER_WORKFLOW, per_page=10)
     failures = count_consecutive_failures([r.get("conclusion") for r in runs])
 
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
-    last_ok_at = parse_time(last_ok["created_at"]) if last_ok else None
+    last_ok_at = parse_time(last_ok["updated_at"]) if last_ok else None
     try:
         all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER))
     except RuntimeError as error:
@@ -1476,6 +1556,24 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     marker_times = [t for t, _ in markers]
     last_marker_at = max(marker_times) if marker_times else None
     probe_attempts = probe_marker_attempts(markers)
+
+    # #899, п.2: голова списка ещё выполняется (conclusion=None) при активной
+    # серии — исход неизвестен, новую пробу/маркер заводить рано. Без этой
+    # проверки decide_gate_state видит только «выдержка истекла» и штампует
+    # ВТОРУЮ пробу поверх ещё бегущей первой (второй одновременный
+    # workflow_dispatch воркера), а last_failure_error(runs[0]) на ещё не
+    # завершённом прогоне возвращает «упавшие job'ы не найдены (conclusion
+    # прогона: None)» — эта бессмыслица уходит в тело НОВОГО маркера, как
+    # будто это и есть причина паузы (живая цитата — маркер «проба 4» в #120,
+    # 2026-09-10T17:06:17Z, посреди прогона 34498185823). Ничего не пишем —
+    # это наблюдение, а не действие: маркер серии уже стоит, ждём исход.
+    if runs and runs[0].get("conclusion") is None and markers:
+        return ([f"⏳ конвейер на паузе: прогон "
+                 f"{runs[0].get('html_url', 'без ссылки')} ещё выполняется — исход "
+                 f"неизвестен, новую пробу не начинаем, диспатч остановлен "
+                 f"(маркер серии уже стоит, см. #{WATCHDOG_ISSUE})"], [],
+                False)
+
     # Маркер активной серии уже доказывает, что порог был достигнут раньше —
     # даже если сейчас failures=0 из-за незавершённой пробы (conclusion=None
     # останавливает count_consecutive_failures на 0, но это не значит «серия
@@ -1484,11 +1582,47 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     state = decide_gate_state(effective_failures, probe_attempts, last_marker_at, now)
 
     if state == "open":
-        # Уже оповещено раньше этим же прогоном серии — второй раз ничего не
-        # пишем, значит это наблюдение, не действие.
-        return ([f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
-                 f"подряд — диспатч остановлен (уже оповещено, см. #{WATCHDOG_ISSUE})"], [],
-                False)
+        # effective_failures, не failures (#899, п.3): failures — пересчёт
+        # ПОСЛЕ якоря, он может быть 0, если маркер серии всё ещё в счёте, а
+        # ни одного нового прогона после якоря не было — печатать в этом
+        # случае «0 красных подряд — диспатч остановлен» самоопровергающе
+        # (живая цитата инцидента). effective_failures — то число, которым
+        # реально принято решение, текст обязан называть именно его.
+        #
+        # Уже оповещено раньше этим же прогоном серии — второй раз в #120 не
+        # пишем В ЭТОМ ЖЕ забеге алгоритма (probe/first уже случились); но
+        # длящаяся пауза сама по себе обязана быть видна без спама на каждый
+        # 15-минутный пульс (#899, п.4) — до этой правки backoff-потолок в
+        # 240 минут мог держать эпизод БЕЗ единого следа в #120 (живой
+        # случай: ни одного нового комментария с 17:06 по 20:54). Throttle —
+        # отдельный маркер PAUSE_REMINDER_MARKER, не участвующий в подсчёте
+        # backoff (см. его докстринг), интервал PAUSE_REMINDER_INTERVAL_MINUTES.
+        backoff = probe_backoff_minutes(probe_attempts + 1)
+        remaining = max(0.0, backoff - minutes_between(last_marker_at, now))
+        line = (f"🚨 конвейер на паузе: {effective_failures} красных прогонов "
+                f"{WORKER_WORKFLOW} подряд (порог {WORKER_FAILURE_PAUSE_AFTER}) — "
+                f"диспатч остановлен, следующая проба не раньше чем через "
+                f"{int(remaining)} мин (маркер серии #{WATCHDOG_ISSUE} уже стоит)")
+        try:
+            reminder_times = issue_marker_times(repo, WATCHDOG_ISSUE, PAUSE_REMINDER_MARKER)
+        except RuntimeError as error:
+            print(f"::warning::напоминания #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
+            reminder_times = []
+        last_reminder_at = max(reminder_times, default=None)
+        last_signal_times = [t for t in (last_marker_at, last_reminder_at) if t is not None]
+        last_signal_at = max(last_signal_times) if last_signal_times else None
+        if pause_reminder_due(last_signal_at, now):
+            text = pause_reminder_text(effective_failures, remaining, runs[0] if runs else None)
+            try:
+                post_issue_comment(repo, WATCHDOG_ISSUE, text)
+            except RuntimeError as err:
+                print(f"::warning::напоминание в #{WATCHDOG_ISSUE} не доставлено: {err}", file=sys.stderr)
+            delivered = send_telegram(text)
+            return ([line], [f"⏳ напоминание о длящейся паузе: следующая проба через "
+                     f"{int(remaining)} мин (Telegram: "
+                     f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"],
+                    False)
+        return ([line], [], False)
 
     error = last_failure_error(repo, runs[0]) if runs else "прогонов не найдено"
     if state == "probe":
