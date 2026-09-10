@@ -263,10 +263,13 @@ else
   HARNESS_TITLE="$(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
 fi
 dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
-dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
+# Реально использованный id может отличаться от HARNESS_SID (#809: фоллбэк
+# на испорченной холодной загрузке) — читаем возврат функции, не подставляем
+# исходный HARNESS_SID вручную.
+HARNESS_SID_ACTUAL=$(dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE") \
   || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
-export DSH_EDGE_SESSION_ID="$HARNESS_SID"
-echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
+export DSH_EDGE_SESSION_ID="$HARNESS_SID_ACTUAL"
+echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
 
 # ── 2. Профиль headless — pnpm-workspace ──────────────────────────────────────────
 # `pnpm add` внутри требует явного подтверждения root (иначе
