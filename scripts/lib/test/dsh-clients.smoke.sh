@@ -96,7 +96,19 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
         workspace.create)
           body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"workspace":{"workspaceId":"ws-smoke"},"created":true}}}' ;;
         session.create)
-          body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"sessionId":"smoke","agentPreset":"dsh-edge"}}}' ;;
+          # Класс #809 (живые прогоны worker.yml 34455120330/harness-716,
+          # 34441499974/harness-140): SMOKE_CORRUPTED_SESSION_ID делает ОДНУ
+          # конкретную сессию навсегда испорченной — прод-форма ошибки
+          # (текст скопирован из лога живого прогона, не пересказ), любой
+          # ДРУГОЙ sessionId (фоллбэк dsh_edge_session_begin) проходит как
+          # обычно.
+          local _sid
+          _sid=$(printf '%s' "${data_str:-}" | command jq -r '.payload.sessionId // empty' 2>/dev/null)
+          if [ -n "${SMOKE_CORRUPTED_SESSION_ID:-}" ] && [ "$_sid" = "$SMOKE_CORRUPTED_SESSION_ID" ]; then
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"stored session \\\"$_sid\\\" failed validation: Error: session event at seq 13 lacks an identified message\"}}}"
+          else
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":true,\"value\":{\"sessionId\":\"$_sid\",\"agentPreset\":\"dsh-edge\"}}}"
+          fi ;;
         session.rename)
           body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"title":"smoke","seq":1}}}' ;;
         workspace.archiveSession)
@@ -585,6 +597,35 @@ grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$t
 grep -qF -- "выполнена" <<<"$tg_line" \
   && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
 echo "SMOKE: worker — ок"
+
+# ── Испорченная холодная загрузка сессии (#809) ────────────────────────────────────
+# Прод-форма отказа — дословно из живых прогонов worker.yml 34455120330
+# (harness-716) и 34441499974 (harness-140): «Морда отклонила internal:
+# stored session "harness-<N>" failed validation: Error: session event at
+# seq N lacks an identified message» — до фикса ЛЮБОЙ последующий воркер на
+# ЭТОЙ задаче падал на этом шаге, не доходя до dsh/провайдера. Дока-класс:
+# dsh_edge_session_begin обязан пережить эту ошибку фоллбэком на новый id, а
+# не бричить задачу (класс #809, дизайн session-note-identified-message).
+scenario_start
+SMOKE_CORRUPTED_SESSION_ID="harness-123" \
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-corrupted" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke задача: испорченная сессия","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-corrupted-session" "$REPO/scripts/worker/task.sh"
+# Обе попытки session.create видны в журнале: первая (harness-123) отказана,
+# вторая (harness-123-r<run_id>, фоллбэк) принята — задача всё равно доведена
+# до DSH и до отчёта, job зелёный.
+create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG")
+[ "$create_calls" -ge 2 ] \
+  || { echo "::error::SMOKE: worker-corrupted-session: ожидалось ≥2 вызова session.create (отказ + фоллбэк), получено $create_calls" >&2
+       cat "$CALLLOG" >&2; exit 1; }
+assert_log "MORDE-INGEST" "worker-corrupted-session: транскрипт не уехал в морду после фоллбэка на новый id"
+assert_log "GH-COMMENT" "worker-corrupted-session: нет отчёта в задачу после фоллбэка"
+echo "SMOKE: worker-corrupted-session — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
 # Отказ claim = зелёный no-op: job завершается 0, работы НЕТ (нет сессии в
