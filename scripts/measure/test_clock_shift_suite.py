@@ -14,6 +14,7 @@
 """
 
 import importlib.util
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -156,3 +157,60 @@ def test_workflow_matrix_stays_in_sync_with_horizon_days():
         f"матрица workflow {matrix_horizons} разошлась с HORIZON_DAYS "
         f"{list(css.HORIZON_DAYS)} — второе место правды рассинхронизировано"
     )
+
+
+# ── Верификация применённого сдвига (находка второго гейта, раунд 2) ─────────
+
+_MARKER_NOW = datetime(2026, 9, 10, 22, 0, tzinfo=timezone.utc)
+_MARKER_WINDOW = (_MARKER_NOW, _MARKER_NOW + timedelta(minutes=5))
+
+
+def _marker_output(days: int = 8, base: datetime = _MARKER_NOW) -> str:
+    """Прод-форма маркера наблюдаемости — строка из scripts/conftest.py::
+    pytest_configure (печатается только после реального start() freezer'а)."""
+    target = (base + timedelta(days=days)).isoformat()
+    return f"::notice::CLOCK_SHIFT_DAYS={days} — часы сдвинуты на {target}\n"
+
+
+def test_green_without_shift_marker_is_harness_broken_not_green():
+    """Тот же вывод, что раньше читался как green, но без маркера conftest:
+    сдвиг мог молча не примениться (conftest не загружен, freezegun перестал
+    патчить) — исход «не доказан», не «зелёный»."""
+    result = css.run_verdict(8, 0, REAL_GREEN_OUTPUT, *_MARKER_WINDOW)
+    assert result["outcome"] == "harness_broken"
+    assert "нет маркера" in result["detail"]
+    assert "CLOCK_SHIFT_DAYS" in result["detail"]
+
+
+def test_red_without_shift_marker_is_harness_broken_too():
+    """Красный без доказанного сдвига так же неинтерпретируем: это может быть
+    обычная поломка по настоящему времени, а не бомба класса."""
+    result = css.run_verdict(8, 1, REAL_RED_OUTPUT, *_MARKER_WINDOW)
+    assert result["outcome"] == "harness_broken"
+
+
+def test_run_verdict_classifies_when_marker_proves_the_shift():
+    out = _marker_output() + REAL_GREEN_OUTPUT
+    result = css.run_verdict(8, 0, out, *_MARKER_WINDOW)
+    assert result["outcome"] == "green"
+    assert result["collected"] == 1233
+
+    red_out = _marker_output() + "3 failed, 1230 passed in 330.27s\n"
+    result = css.run_verdict(8, 1, red_out, *_MARKER_WINDOW)
+    assert result["outcome"] == "red"
+
+
+def test_run_verdict_rejects_marker_with_foreign_horizon():
+    out = _marker_output(days=1) + REAL_GREEN_OUTPUT
+    result = css.run_verdict(8, 0, out, *_MARKER_WINDOW)
+    assert result["outcome"] == "harness_broken"
+    assert "+1д" in result["detail"] and "+8д" in result["detail"]
+
+
+def test_run_verdict_rejects_marker_base_outside_parent_real_window():
+    """Маркер ставит базовое «сейчас» за месяц до реального старта прогона:
+    часы шли не от заявленного сдвига — исход не имеет силы."""
+    out = _marker_output(base=_MARKER_NOW - timedelta(days=30)) + REAL_GREEN_OUTPUT
+    result = css.run_verdict(8, 0, out, *_MARKER_WINDOW)
+    assert result["outcome"] == "harness_broken"
+    assert "вне окна" in result["detail"]

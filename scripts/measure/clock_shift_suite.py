@@ -55,6 +55,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -170,6 +171,65 @@ def run_pytest_with_shift(horizon_days: int, paths: list[str]) -> tuple[int, str
     return proc.returncode, output
 
 
+# Маркер наблюдаемости сдвига — строку печатает scripts/conftest.py в
+# pytest_configure, ТОЛЬКО после реального start() freezer'а. Формулировка
+# живёт в conftest, здесь только разбор; смена формулировки в conftest
+# красит ежедневный прогон громко (harness_broken, «маркера нет»), а не
+# оставляет зелёный по настоящему времени — fail-loud по умолчанию.
+_SHIFT_MARKER_RE = re.compile(
+    r"::notice::CLOCK_SHIFT_DAYS=(\d+).*часы сдвинуты на (\S+)")
+# Допуск на старт процесса pytest (между замером now_before и start() freezer'а).
+_SHIFT_MARKER_MAX_START_DELAY_SECONDS = 60
+
+
+def verify_shift_applied(horizon_days: int, stdout: str,
+                         now_before: datetime, now_after: datetime) -> str | None:
+    """Доказывает по выводу прогона, что сдвиг РЕАЛЬНО применён: маркер
+    conftest найден, горизонт тот же, а базовое «сейчас» маркера лежит в
+    окне реального времени родителя [now_before…now_after] (родитель не
+    заморожен — freeze живёт только в подпроцессе pytest). None — доказан;
+    строка-причина — исход прогона неинтерпретируем В ОБЕ стороны: и
+    зелёный, и красный могли быть получены по настоящему времени
+    (находка второго гейта ревью PR #667: без этой проверки незагрузившийся
+    conftest или переставший патчить freezegun зеленели бы все четыре
+    горизонта ежедневно, носитель молча выродился бы в пустой прогон)."""
+    matches = _SHIFT_MARKER_RE.findall(stdout)
+    if not matches:
+        return (
+            "в выводе прогона нет маркера conftest «::notice::CLOCK_SHIFT_DAYS=… "
+            "— часы сдвинуты на …» — сдвиг не применён или не наблюдаем, "
+            "зелёный/красный этого прогона получены не сдвинутыми часами"
+        )
+    marker_days, marker_target = matches[-1]
+    if int(marker_days) != horizon_days:
+        return (f"маркер conftest отчитался о сдвиге +{marker_days}д, "
+                f"а прогон запрошен на +{horizon_days}д")
+    marker_base = datetime.fromisoformat(marker_target) - timedelta(days=horizon_days)
+    skew = timedelta(seconds=_SHIFT_MARKER_MAX_START_DELAY_SECONDS)
+    if not (now_before - skew <= marker_base <= now_after + skew):
+        return (f"маркер conftest ставит базовое «сейчас» на "
+                f"{marker_base.isoformat()}, это вне окна реального времени "
+                f"родителя [{now_before.isoformat()}…{now_after.isoformat()}] — "
+                "часы прогона шли не от заявленного сдвига")
+    return None
+
+
+def run_verdict(horizon_days: int, returncode: int, stdout: str,
+                now_before: datetime, now_after: datetime) -> dict:
+    """Вердикт прогона: СНАЧАЛА доказательство применённого сдвига
+    (verify_shift_applied), потом классификация исхода. Без первого второе
+    не имеет силы."""
+    problem = verify_shift_applied(horizon_days, stdout, now_before, now_after)
+    if problem is not None:
+        return {
+            "outcome": "harness_broken",
+            "collected": parse_collected_total(stdout),
+            "failed_nodes": parse_failed_node_ids(stdout),
+            "detail": problem,
+        }
+    return classify_result(returncode, stdout)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -188,8 +248,10 @@ def main() -> int:
     if args.horizon_days is None:
         parser.error("--horizon-days обязателен (или --list-horizons)")
 
+    now_before = datetime.now(timezone.utc)
     returncode, stdout = run_pytest_with_shift(args.horizon_days, args.paths)
-    result = classify_result(returncode, stdout)
+    now_after = datetime.now(timezone.utc)
+    result = run_verdict(args.horizon_days, returncode, stdout, now_before, now_after)
     print(f"горизонт +{args.horizon_days}д: {result['outcome']} — {result['detail']}")
 
     if result["outcome"] != "green":
