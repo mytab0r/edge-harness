@@ -158,6 +158,65 @@ def test_double_registration_handwritten_and_catalog_both_run_same_guard(tmp_pat
     assert any("Проверка X — дубль каталога" in p for p in problems)
 
 
+# ── check_catalog_handwritten_overlap: сверка ПО СОДЕРЖИМОМУ (ревью PR #771, ─
+# ── блокирующая 1) ───────────────────────────────────────────────────────────
+
+def test_catalog_and_handwritten_step_running_same_target_is_flagged(tmp_path):
+    # Блокирующая 1(а): частичный перенос — файл гвардии уже лежит в
+    # каталоге, но старый рукописный шаг (и его запись ALLOWLIST) не убрали.
+    # Раньше это проходило мимо ВСЕГО механизма: шаг в ALLOWLIST — не «новый
+    # незарегистрированный», гвардия каталога про рукописные шаги не знает
+    # вовсе. Мутация-критерий #749 (удалить файл каталога → должно
+    # покраснеть) при этом молча не срабатывала бы: тест продолжал бы
+    # гоняться из забытого рукописного шага.
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "x-guard.sh").write_text(
+        "set -euo pipefail\npytest scripts/lib/test_x.py -q\n", encoding="utf-8"
+    )
+    repo_ci = _write_repo_ci_full(
+        tmp_path,
+        [{"name": "Тесты X", "run": "pip install --quiet pytest\npytest scripts/lib/test_x.py -q"}],
+    )
+    problems = crg.check_catalog_handwritten_overlap(repo_ci, catalog_dir)
+    assert any("scripts/lib/test_x.py" in p and "x-guard.sh" in p and "Тесты X" in p for p in problems), problems
+
+    # То же самое видно и через полный вход check_no_undeclared_step, даже
+    # когда имя шага УЖЕ в ALLOWLIST (частичный перенос не «новый шаг»).
+    problems_full = crg.check_no_undeclared_step(
+        repo_ci, frozenset({"Тесты X"}), catalog_dir=catalog_dir
+    )
+    assert any("scripts/lib/test_x.py" in p for p in problems_full), problems_full
+
+
+def test_catalog_handwritten_overlap_clean_when_no_shared_target(tmp_path):
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "x-guard.sh").write_text(
+        "set -euo pipefail\npytest scripts/lib/test_x.py -q\n", encoding="utf-8"
+    )
+    repo_ci = _write_repo_ci_full(
+        tmp_path,
+        [{"name": "Тесты Y", "run": "pip install --quiet pytest\npytest scripts/lib/test_y.py -q"}],
+    )
+    assert crg.check_catalog_handwritten_overlap(repo_ci, catalog_dir) == []
+
+
+def test_handwritten_step_invoking_catalog_path_is_content_registration(tmp_path):
+    # Блокирующая 1(б): рукописный шаг под НЕЙТРАЛЬНЫМ именем (вне
+    # соглашения Тест/Гвардия/Smoke/Юнит-тест) напрямую вызывает файл
+    # каталога — `_is_guard_file_path` путь `scripts/ci/guards/` не ловит
+    # (критерий «файл в директории test/» не выполняется). Живая мутация
+    # ревью: полный repo-ci.yml с дописанным таким шагом давал
+    # `check_no_undeclared_step` → 0 проблем, EXIT=0.
+    path = _write_repo_ci_full(
+        tmp_path, [{"name": "Проверка окружения", "run": "bash scripts/ci/guards/x-guard.sh"}]
+    )
+    assert crg.guard_step_names(path) == {"Проверка окружения"}
+    problems = crg.check_no_undeclared_step(path, frozenset())
+    assert any("Проверка окружения" in p for p in problems), problems
+
+
 # ── ALLOWLIST_RATCHET_MAX: только вниз (ревью PR #771, major 5) ─────────────
 
 def test_ratchet_flags_allowlist_grown_past_ceiling(tmp_path):

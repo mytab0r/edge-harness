@@ -52,6 +52,24 @@ issue #749: 17 из 40 открытых PR правили один файл ра
          (шаг мигрирован/переименован/удалён) — тоже красный, чтобы
          ALLOWLIST не тащил мёртвые записи молча (тот же приём, что у
          `test_infra_gh_inventory.py`: мёртвая строка — тоже находка).
+  4. `check_catalog_handwritten_overlap` (ревью PR #771, блокирующая 1) —
+     сверка ПО СОДЕРЖИМОМУ, а не по имени: пункты 1–3 выше ловят только
+     новый/устаревший рукописный шаг по имени/содержимому конкретного шага.
+     Живой обход этого: (а) частичный перенос — файл гвардии кладут в
+     `scripts/ci/guards/`, а старый рукописный шаг и его запись ALLOWLIST не
+     трогают, гвардия исполняется дважды, и мутация-критерий #749 (удалить
+     файл каталога → должно покраснеть) молча не срабатывает, потому что
+     забытый рукописный шаг продолжает её гонять; (б) рукописный шаг под
+     нейтральным именем прямо вызывает файл каталога
+     (`run: bash scripts/ci/guards/<имя>.sh`) — `_is_guard_file_path` этот
+     путь не ловит. `_extract_run_targets` вытаскивает из `run:` реально
+     исполняемые файлы (аргументы pytest/`_guard.py`/`node --test`, файл
+     `bash`/`sh`) — множество из каталога не должно пересекаться с
+     множеством из ЛЮБОГО шага job `test` (включая ALLOWLIST-шаги: дубль
+     может остаться именно под уже занесённым именем). `_is_guard_catalog_
+     invocation` закрывает (б) отдельно — путь `scripts/ci/guards/` в `run:`
+     рукописного шага считается регистрацией по содержимому вне зависимости
+     от имени шага.
 
 Запуск:
   python scripts/lib/ci_guard_registration_guard.py
@@ -76,6 +94,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_CI = REPO_ROOT / ".github" / "workflows" / "repo-ci.yml"
+GUARD_CATALOG_DIR = REPO_ROOT / "scripts" / "ci" / "guards"
 
 # Тот же разбор run:-текста на shell-statement'ы, что уже доказал себя в
 # orphan_test_guard.py (покрытие тестов workflow-шагами) — импорт по пути
@@ -108,6 +127,18 @@ def _is_guard_file_path(arg: str) -> bool:
     return False
 
 
+def _is_guard_catalog_invocation(arg: str) -> bool:
+    """`arg` указывает на файл каталога гвардий `scripts/ci/guards/`
+    (ревью PR #771, блокирующая 1(б)): рукописный шаг под нейтральным
+    именем, вызывающий файл каталога напрямую (`run: bash
+    scripts/ci/guards/<имя>.sh`), — тоже регистрация по содержимому.
+    `_is_guard_file_path` этот путь не ловит: критерий «файл в директории
+    `test/`» не выполняется для `scripts/ci/guards/` (живая мутация ревью:
+    полный repo-ci.yml с дописанным таким шагом под именем «Проверка
+    окружения» давал `check_no_undeclared_step` → 0 проблем, EXIT=0)."""
+    return "scripts/ci/guards/" in arg.replace("\\", "/")
+
+
 def _is_guard_registration_run(run_text: str) -> bool:
     """Содержимое `run:` реально регистрирует гвардию — pytest/`node
     --test`/тестовый-или-guard-файл, — вне зависимости от имени шага
@@ -125,9 +156,94 @@ def _is_guard_registration_run(run_text: str) -> bool:
                 return True
         elif head == "node" and "--test" in words:
             return True
-        elif head in ("bash", "sh") and len(words) >= 2 and _is_guard_file_path(words[1]):
+        elif head in ("bash", "sh") and len(words) >= 2 and (
+            _is_guard_file_path(words[1]) or _is_guard_catalog_invocation(words[1])
+        ):
             return True
     return False
+
+
+def _extract_run_targets(run_text: str) -> set[str]:
+    """Реальные файлы, которые исполняет `run_text` (аргументы pytest,
+    `_guard.py`-аргументы, файл `bash`/`sh`, аргументы `node --test`) — «что
+    физически исполняется», не имя шага. Нужно для перекрёстной сверки
+    каталог↔рукописный шаг (ревью PR #771, блокирующая 1(а)): два места,
+    исполняющие один и тот же файл, — двойная регистрация, даже если ни то
+    ни другое не поймано детекцией имени/содержимого шага — например,
+    рукописный шаг остался в ALLOWLIST под старым именем после частичного
+    переноса той же гвардии в каталог."""
+    targets: set[str] = set()
+    for words in _otg.statement_tokens(run_text):
+        if not words:
+            continue
+        head = words[0]
+        if head == "pytest":
+            targets.update(arg for arg in words[1:] if not arg.startswith("-"))
+        elif head in ("python", "python3"):
+            if len(words) >= 3 and words[1] == "-m" and words[2] == "pytest":
+                targets.update(arg for arg in words[3:] if not arg.startswith("-"))
+            else:
+                targets.update(arg for arg in words[1:] if arg.endswith("_guard.py"))
+        elif head == "node" and "--test" in words:
+            idx = words.index("--test")
+            targets.update(arg for arg in words[idx + 1:] if not arg.startswith("-"))
+        elif head in ("bash", "sh") and len(words) >= 2:
+            targets.add(words[1])
+    return targets
+
+
+def _catalog_targets(catalog_dir: Path = GUARD_CATALOG_DIR) -> dict[str, str]:
+    """Отображение «исполняемый файл → имя файла каталога, его
+    исполняющего», построенное по СОДЕРЖИМОМУ `scripts/ci/guards/*.sh»."""
+    targets: dict[str, str] = {}
+    if not catalog_dir.is_dir():
+        return targets
+    for path in sorted(catalog_dir.glob("*.sh")):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for target in _extract_run_targets(text):
+            targets.setdefault(target, path.name)
+    return targets
+
+
+def _handwritten_targets(repo_ci: Path = REPO_CI) -> dict[str, str]:
+    """Отображение «исполняемый файл → имя рукописного шага», построенное по
+    СОДЕРЖИМОМУ ЛЮБОГО шага job `test` — не только распознанного как гвардия
+    по имени/содержимому: дубль может остаться под именем, уже занесённым в
+    ALLOWLIST, сверка обязана включать и такие шаги тоже (ревью PR #771,
+    блокирующая 1(а))."""
+    doc = yaml.safe_load(repo_ci.read_text(encoding="utf-8")) or {}
+    job = (doc.get("jobs") or {}).get("test") or {}
+    targets: dict[str, str] = {}
+    for step in job.get("steps") or []:
+        run_text = step.get("run")
+        if not isinstance(run_text, str):
+            continue
+        name = step.get("name") or "(без имени)"
+        for target in _extract_run_targets(run_text):
+            targets.setdefault(target, name)
+    return targets
+
+
+def check_catalog_handwritten_overlap(
+    repo_ci: Path = REPO_CI, catalog_dir: Path = GUARD_CATALOG_DIR
+) -> list[str]:
+    """Множество файлов, исполняемых каталогом, не должно пересекаться с
+    множеством, исполняемым рукописными шагами job `test` (ревью PR #771,
+    блокирующая 1(а)): пересечение — частичный перенос, гвардия исполняется
+    дважды, и удаление файла каталога (мутация-критерий #749) не красит
+    ничего, потому что забытый рукописный шаг продолжает её гонять."""
+    catalog = _catalog_targets(catalog_dir)
+    handwritten = _handwritten_targets(repo_ci)
+    problems: list[str] = []
+    for target in sorted(set(catalog) & set(handwritten)):
+        problems.append(
+            f"двойная регистрация: {target!r} исполняется и каталогом "
+            f"(scripts/ci/guards/{catalog[target]}), и рукописным шагом "
+            f"{handwritten[target]!r} .github/workflows/repo-ci.yml — частичный "
+            "перенос: убери рукописный шаг (и его запись ALLOWLIST, если есть), "
+            "гвардия должна остаться только в каталоге"
+        )
+    return problems
 
 # Замороженный список имён шагов job `test` .github/workflows/repo-ci.yml,
 # остающихся рукописными на момент #749 (миграция механизма каталога +
@@ -319,12 +435,15 @@ def guard_step_names(repo_ci: Path = REPO_CI) -> set[str]:
 
 
 def check_no_undeclared_step(
-    repo_ci: Path = REPO_CI, allowlist: frozenset[str] = ALLOWLIST
+    repo_ci: Path = REPO_CI,
+    allowlist: frozenset[str] = ALLOWLIST,
+    catalog_dir: Path = GUARD_CATALOG_DIR,
 ) -> list[str]:
     found = guard_step_names(repo_ci)
     added = sorted(found - allowlist)
     removed = sorted(allowlist - found)
     problems: list[str] = []
+    problems.extend(check_catalog_handwritten_overlap(repo_ci, catalog_dir))
     for name in added:
         problems.append(
             f"новый рукописный шаг гвардии в repo-ci.yml: {name!r} — перенеси в "

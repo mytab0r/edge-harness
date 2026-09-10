@@ -17,12 +17,28 @@
 
 - [x] `scripts/ci/guards/stale-blocked-guard.sh` — перенесена гвардия
   протухшей метки `blocked` (#334), старый рукописный шаг убран из
-  `repo-ci.yml`.
+  `repo-ci.yml` (первая миграция, на момент открытия PR).
 - [x] `scripts/ci/guards/ci-guard-registration.sh` — добавлена без единой
-  правки `repo-ci.yml` (криterion приёмки, коммит проверен `git show
+  правки `repo-ci.yml` (критерий приёмки, коммит проверен `git show
   --stat`).
 - [x] `scripts/ci/guards/run-guards-mechanism.sh` — добавлена без единой
   правки `repo-ci.yml` (второе доказательство).
+- [x] Доводка (доказано мутацией живого прогона `ci_guard_registration_
+  guard.py`, не рассуждением): пока PR стоял открытым, main накопил ещё
+  двенадцать рукописных шагов тем же способом, который #749 закрывает —
+  каждый перенесён в свой файл каталога вместо роста `ALLOWLIST`/
+  `ALLOWLIST_RATCHET_MAX` (полный список см. `ci_guard_registration_guard.py`,
+  комментарий у `ALLOWLIST_RATCHET_MAX`):
+  `provider-secrets-import-guard.sh` (#733/#734),
+  `context-window-env-provider-guard.sh` (#789/#792),
+  `anthropic-oauth-pool-guard.sh`, `console-utf8-guard.sh`,
+  `dsh-plugin-pnpm-guard.sh`, `llm-provider-usage-manifest-guard.sh`,
+  `pipeline-health-guard.sh` (объединяет три исходных шага),
+  `provider-latency-model-discovery-guard.sh`,
+  `provider-quota-state-guard.sh`, `provider-quota-trust-boundary-guard.sh`,
+  `provider-usage-registry-guard.sh`, `timestamp-parse-guard.sh`. Итог: 13
+  файлов каталога перенесены (15 рукописных шагов), 2 новых — 15 файлов
+  всего в `scripts/ci/guards/`.
 
 ## Гвардия на рецидив
 
