@@ -1185,6 +1185,8 @@ def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
         "graphql": graphql_pool_page(),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
+        # Инвариант 15 (#869) — свой обход комментариев WATCHDOG_ISSUE.
+        "issues/120/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1203,6 +1205,8 @@ def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
         "graphql": graphql_pool_page(),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
+        # Инвариант 15 (#869) — свой обход комментариев WATCHDOG_ISSUE.
+        "issues/120/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1231,6 +1235,8 @@ def test_declared_deps_opt_out_skips_expensive_graphql_fetch(monkeypatch):
         "pulls?state=open": [],
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
+        # Инвариант 15 (#869) — свой обход комментариев WATCHDOG_ISSUE.
+        "issues/120/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1253,6 +1259,8 @@ def test_declared_deps_fetch_error_isolated_does_not_abort_whole_report(monkeypa
             "issue #999: blockedBy усечён (20 из 41)"),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
+        # Инвариант 15 (#869) — свой обход комментариев WATCHDOG_ISSUE.
+        "issues/120/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1730,9 +1738,14 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # остался про ДРУГИЕ инварианты, а не про историю снимков.
         "contents/docs/research/data/pipeline-health.jsonl":
             health_snapshot_contents_response([{"date": "2026-09-03", "merge_throughput": 1}]),
-        # Инвариант 12 (#876): полнотекстовый поиск не находит ни одного
+        # Инвариант 14 (#876): полнотекстовый поиск не находит ни одного
         # комментария с противоречивой фразой — здоровое состояние.
         "search/issues": {"items": []},
+        # Инвариант 15 (#869): нет ни одного слитого PR вовсе (healthy_merged
+        # пуст) — «никогда не сливали» не этот класс нарушения (см. docstring
+        # check_drain_stalled_without_signal), маршрут комментариев всё равно
+        # нужен — fetch_watchdog_comments вызывается безусловно.
+        "issues/120/comments": [],
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
@@ -2214,3 +2227,70 @@ def test_worker_false_success_comment_not_in_ci_gating():
     # Наблюдательный: доступность стороннего Search API не должна красить
     # обязательную проверку `test` (см. докстринг check_worker_false_success_comment).
     assert 14 not in ri.CI_GATING
+
+
+# Инвариант 15 (#869): «дренаж стоял, а сигнала нет» — независимая проверка,
+# чистая функция (свои три источника уже переданы вызывающей стороной).
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def open_pull(number, *, draft=False, author_login="mytab0r"):
+    return {"number": number, "draft": draft, "user": {"login": author_login}}
+
+
+def test_drain_stalled_flags_stale_merge_with_candidates_and_no_marker():
+    merged = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]  # 8ч назад > DRAIN_STALL_HOURS(4)
+    violations = ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged, [open_pull(9)], watchdog_comments=[])
+    assert len(violations) == 1
+    assert violations[0]["hours_since_merge"] == 8
+    assert violations[0]["candidates"] == 1
+
+
+def test_drain_stalled_silent_when_no_merge_queue_candidates():
+    """Находка ревью PR #870, блокирующая: кандидатов нет — не тревога,
+    НЕЗАВИСИМО от возраста последнего слияния (та же норма, что держит
+    scheduler.drain_gate). Мутация: убери ранний `if not candidates: return
+    []` — этот тест покраснеет."""
+    merged = [{"number": 1, "merged_at": "2020-01-01T00:00:00Z"}]  # очень старое
+    assert ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged, open_pulls=[], watchdog_comments=[]) == []
+    # Кандидатов тоже нет, если единственный открытый PR — черновик/бот.
+    assert ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged,
+        open_pulls=[open_pull(9, draft=True), open_pull(10, author_login="dependabot[bot]")],
+        watchdog_comments=[]) == []
+
+
+def test_drain_stalled_silent_when_merge_is_recent():
+    merged = [{"number": 1, "merged_at": "2026-09-09T10:00:00Z"}]  # 2ч назад
+    assert ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged, [open_pull(9)], watchdog_comments=[]) == []
+
+
+def test_drain_stalled_silent_when_never_merged_anything():
+    assert ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged_pulls=[], open_pulls=[open_pull(9)], watchdog_comments=[]) == []
+
+
+def test_drain_stalled_silent_when_marker_present_since_last_merge():
+    merged = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]
+    comments = [{"created_at": "2026-09-09T05:00:00Z", "body": ri.scheduler.DRAIN_GATE_OPEN_MARKER}]
+    assert ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged, [open_pull(9)], watchdog_comments=comments) == []
+
+
+def test_drain_stalled_flags_when_marker_is_older_than_last_merge():
+    """Маркер существует, но из ПРОШЛОГО эпизода (старше текущего последнего
+    слияния) — не защищает текущий простой, инвариант обязан сработать."""
+    merged = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]
+    comments = [{"created_at": "2026-09-08T00:00:00Z", "body": ri.scheduler.DRAIN_GATE_OPEN_MARKER}]
+    violations = ri.check_drain_stalled_without_signal(
+        utc(2026, 9, 9, 12, 0), merged, [open_pull(9)], watchdog_comments=comments)
+    assert len(violations) == 1
+
+
+def test_drain_stalled_not_in_ci_gating():
+    # Наблюдательный на старте (design.md §4) — тот же порядок включения,
+    # что у инвариантов 8/9/10, замер на живом репозитории до включения.
+    assert 15 not in ri.CI_GATING

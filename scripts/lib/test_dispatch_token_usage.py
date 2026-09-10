@@ -51,12 +51,16 @@ DISPATCH_CONSUMER = "deploy-worker.yml"
 # conflict-mechanical-rebase.yml (#762) — тот же класс: `git push` рёбейзнутой
 # ветки под github.token не зажигает downstream pr-review/ai-review
 # (антирекурсия GitHub), нужен PAT владельца.
+# pm.yml (#869) — closes-only триаж чужих issue/PR требует того же широкого
+# PAT, что worker.yml (issues:write из github.token достаточен только для
+# СВОИХ действий, не для close произвольного чужого issue/PR).
 PIPELINE_CONSUMERS = [
     "conflict-mechanical-rebase.yml",
     "deploy-dsh-edge.yml",
     "dispatch-latency-probe.yml",
     "orchestra.yml",
     "plugin-forge.yml",
+    "pm.yml",
     "repo-ci.yml",
     "worker.yml",
 ]
@@ -91,6 +95,11 @@ EXPECTED_WORKFLOWS = frozenset({
     # workflow), ни GH_PIPELINE_PAT здесь не используются.
     "owner-decision.yml",
     "plugin-forge.yml",
+    # #869 (drain-health-curator, Требование B): авто-диспетч роли pm на
+    # PR-беклог — читает secrets.GH_PIPELINE_PAT (см. PIPELINE_CONSUMERS),
+    # тот же класс, что worker.yml/hands.yml (DSH headless через
+    # scripts/hands/dsh_task.sh, не второй механизм запуска агента).
+    "pm.yml",
     "pr-review.yml",
     # #836: бенчмарк латентности провайдеров-кандидатов, workflow_dispatch
     # вручную. Читает только secrets.<PROVIDER>_API_KEY (значения ключей

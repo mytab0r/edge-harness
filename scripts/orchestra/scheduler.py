@@ -743,6 +743,25 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     return len(counted)
 
 
+def conflict_exhausted_count(repo: str, pulls: list[dict]) -> int:
+    """Сколько открытых конфликтных PR исчерпали бюджет авто-ребейза
+    (CONFLICT_REWORK_MAX_ATTEMPTS) — тот же критерий, что dispatch_conflict_rework
+    применяет к решению «эскалировать» (issue #869, drain_gate, design.md
+    §1.4). Сетевые вызовы ограничены числом ТЕКУЩИХ конфликтных PR (обычно
+    единицы) — тот же conflict_rework_attempts, что уже вызывает
+    dispatch_conflict_rework, не новый класс обхода."""
+    count = 0
+    for pull in pulls:
+        if CONFLICT_LABEL not in {label["name"] for label in (pull.get("labels") or [])}:
+            continue
+        task_number = task_ref.resolve_pr_task(pull)
+        if task_number is None:
+            continue
+        if conflict_rework_attempts(repo, pull["number"], task_number) >= CONFLICT_REWORK_MAX_ATTEMPTS:
+            count += 1
+    return count
+
+
 def dispatch_conflict_rework(
     repo: str, pulls: list[dict], *, pool: list[dict],
 ) -> tuple[list[str], list[str], bool]:
@@ -2253,6 +2272,240 @@ WIP_GATE_STUCK_MARKER_PREFIX = "[статус: WIP-лимит держит но�
 # в wip_gate ниже.
 WIP_GATE_STUCK_HOURS = 8
 
+# ── drain_gate (#869) — композитный сигнал «время с последнего слияния» ─────
+# Отдельный от wip_gate/conveyor_gate тормоз: находка design.md
+# drain-health-curator §1.1 — wip_gate ОБНУЛЯЕТ свой счётчик, когда
+# действующим тормозом становится предохранитель (2335-2363 выше,
+# сознательное решение #466 — не гадать между причинами). При ЧЕРЕДОВАНИИ
+# предохранитель/WIP ни один локальный таймер не доходит до своего порога,
+# хотя видимый исход (слияний нет) не прерывался. drain_gate мерит ИМЕННО
+# видимый исход — часы с последнего слияния по max(merged_at) уже
+# полученного all_merged_pulls (main(), без нового сетевого вызова, см.
+# design.md §1.2) — независимо от того, какой тормоз сейчас активен, и
+# называет ВСЕ верные в этом прогоне причины (AGENTS.md, «алерт не гадает»),
+# не выбирает одну.
+DRAIN_GATE_OPEN_MARKER = "[статус конвейера: дренаж встал]"
+DRAIN_GATE_CLOSE_MARKER = "[статус конвейера: дренаж снова идёт]"
+
+# Не выведено из данных этого репозитория (design.md «Не подтверждено», п.1)
+# — proposal.md называет ориентир «эскалирует раньше 6ч» (живой случай
+# #869 — очередь стояла ~6ч при зелёных пульсах). 4 — меньше живого случая с
+# запасом, того же порядка, что WIP_GATE_STUCK_HOURS/WORKER_FAILURE_PAUSE_AFTER
+# по соседству (честная аналогия, не измерение).
+DRAIN_STALL_HOURS = 4
+
+
+def merge_queue_candidates(pulls: list[dict]) -> list[dict]:
+    """PR, которые вообще МОГУТ попасть в merge_queue — не черновики и не
+    боты (тот же фильтр, что pr_needs_rework уже применяет к другому
+    вопросу). Не гарантирует, что PR готов слиться прямо сейчас (это решает
+    merge_queue полным набором сетевых проверок) — только то, что очередь не
+    пуста в принципе. Дешёвая, локальная проверка (без сетевых вызовов) —
+    переиспользуется drain_gate (норма «нечего сливать», design.md §1.5) и
+    независимо — repo_invariants.py::check_drain_stalled_without_signal
+    (третий источник, находка ревью PR #870: без него инвариант красил бы
+    здоровый простой, который эта же норма объявляет нормой)."""
+    result = []
+    for pull in pulls:
+        if pull.get("draft"):
+            continue
+        login = (pull.get("user") or {}).get("login") or ""
+        if login.endswith("[bot]"):
+            continue
+        result.append(pull)
+    return result
+
+
+def drain_gate(
+    repo: str, now: datetime, pulls: list[dict], merged_pulls: list[dict], *,
+    dispatch_allowed: bool, wip_count: int, conflict_exhausted: int,
+    contract_failed_count: int,
+) -> tuple[list[str], list[str], bool]:
+    """Композитный сигнал «дренаж встал» (issue #869) — часы с последнего
+    слияния по `merged_pulls` (тот же снимок all_merged_pulls(repo), что
+    main() уже получил для merged_pr_map, второго сетевого вызова нет).
+    `pulls` — открытые PR этого прогона (merge_loop уже довёл до актуального
+    состояния). `wip_count`/`conflict_exhausted`/`contract_failed_count` —
+    уже посчитанные другими функциями ЭТОГО ЖЕ прогона факты (wip_gate/
+    dispatch_conflict_rework/mark_conflicts): drain_gate их не пересчитывает
+    и не интерпретирует заново (design.md §1.4), только перечисляет истинные.
+
+    Возвращает (наблюдения, действия, ok) — тот же контракт, что wip_gate/
+    conveyor_gate; `ok=True` — нет активной тревоги дренажа (используется и
+    Требованием B: drain_gate держит тревогу дольше PM_DISPATCH_AFTER_HOURS)."""
+    observations: list[str] = []
+    actions: list[str] = []
+    candidates = merge_queue_candidates(pulls)
+
+    try:
+        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_OPEN_MARKER)
+        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_CLOSE_MARKER)
+    except RuntimeError as error:
+        print(f"::warning::маркеры drain_gate в #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
+        return observations, actions, True  # не гадаем при недоступности маркеров
+    last_close = max(close_times) if close_times else None
+    episode_opens = [t for t in open_times if last_close is None or t > last_close]
+
+    merged_ats = [parse_time(p["merged_at"]) for p in merged_pulls if p.get("merged_at")]
+    last_merge_at = max(merged_ats) if merged_ats else None
+    hours_since_merge = minutes_between(last_merge_at, now) / 60 if last_merge_at else None
+
+    # Норма (design.md §1.5, копия критерия приёмки #194): открытых
+    # PR-кандидатов нет ИЛИ последнее слияние свежее порога — не тревога.
+    # Закрываем эпизод, если он был открыт (причина исчезла сама).
+    if not candidates or hours_since_merge is None or hours_since_merge <= DRAIN_STALL_HOURS:
+        if episode_opens:
+            reason = "открытых PR-кандидатов к слиянию больше нет" if not candidates else \
+                f"слияние прошло меньше {DRAIN_STALL_HOURS}ч назад"
+            try:
+                post_issue_comment(
+                    repo, WATCHDOG_ISSUE,
+                    f"✅ {DRAIN_GATE_CLOSE_MARKER}\n{reason} — дренаж-эпизод закрыт.",
+                )
+                actions.append(f"✅ drain_gate: {reason} — эпизод в #{WATCHDOG_ISSUE} закрыт")
+            except RuntimeError as error:
+                actions.append(f"⚠️ закрытие drain-эпизода в #{WATCHDOG_ISSUE} не оставлено: {error}")
+        elif not candidates:
+            observations.append("🟢 drain_gate: открытых PR-кандидатов к слиянию нет — норма")
+        else:
+            observations.append(
+                f"🟢 drain_gate: последнее слияние {int(hours_since_merge)}ч назад "
+                f"(порог {DRAIN_STALL_HOURS}ч), {len(candidates)} кандидатов ждут")
+        return observations, actions, True
+
+    # Тревога — часов больше порога, кандидаты есть. Причины — перечисление
+    # ИСТИННЫХ фактов этого прогона, не гипотеза (AGENTS.md «алерт не гадает»).
+    causes = []
+    if not dispatch_allowed:
+        causes.append("предохранитель конвейера (#120) держит диспатч на паузе")
+    if wip_count >= WIP_LIMIT:
+        causes.append(f"WIP-лимит держит диспатч новых задач ({wip_count} ≥ {WIP_LIMIT})")
+    if conflict_exhausted:
+        causes.append(f"{conflict_exhausted} конфликтных PR исчерпали бюджет авто-ребейза")
+    if contract_failed_count:
+        causes.append(f"{contract_failed_count} открытых PR несут `{CONTRACT_FAILED_LABEL}`")
+    cause_text = "; ".join(causes) if causes else "причина не установлена по доступным данным этого прогона"
+
+    observations.append(
+        f"⏸️ drain: последнее слияние {int(hours_since_merge)}ч назад (порог {DRAIN_STALL_HOURS}ч), "
+        f"{len(candidates)} PR-кандидатов ждут — {cause_text}"
+    )
+    if not episode_opens:
+        text = (
+            f"🚨 edge-harness: {DRAIN_GATE_OPEN_MARKER}\n"
+            f"Последнее слияние в main {int(hours_since_merge)}ч назад (порог {DRAIN_STALL_HOURS}ч), "
+            f"{len(candidates)} открытых PR-кандидатов ждут слияния. Причины этого прогона: "
+            f"{cause_text}. Газ: слияние любого кандидата или устранение названной причины "
+            "закрывает эпизод автоматически следующим прогоном."
+        )
+        escalation = escalate(repo, WATCHDOG_ISSUE, text)
+        actions.append(
+            f"🚨 drain_gate: дренаж встал {int(hours_since_merge)}ч > {DRAIN_STALL_HOURS}ч ({escalation})")
+    return observations, actions, False
+
+
+# ── Требование B (#869) — автоматический диспетч роли pm на PR-беклог ───────
+# Условие (design.md §2.1): drain_gate держит тревогу дольше
+# PM_DISPATCH_AFTER_HOURS ИЛИ wip_gate держит свой stuck-эпизод дольше
+# СВОЕГО порога (WIP_GATE_STUCK_HOURS) — оба случая означают одно и то же по
+# существу: беклог, не приток, требует разбора, которым занимается pm, а не
+# воркер. Форма исполнения (design.md §2.2, решение — tasks.md B) — отдельный
+# workflow pm.yml (аналог hands.yml/worker.yml), диспетчится тем же приёмом,
+# что dispatch_conflict_rework уже диспетчит worker.yml адресно.
+PM_DISPATCH_AFTER_HOURS = 8  # тот же порядок, что WIP_GATE_STUCK_HOURS — не выведено из данных (design.md «Не подтверждено»).
+PM_GROOM_DISPATCH_MARKER_PREFIX = "[статус: авто-диспетч pm на эпизод "
+# Тот же явный потолок, что ~/.claude/agents/pm.md уже объявляет для СЕБЯ
+# (design.md §2.1) — не второе место правды, второй читатель того же числа
+# (pm.yml, шаг механической проверки после прогона).
+PM_MAX_CLOSURES_PER_RUN = 25
+
+
+def dispatch_pm_groom(repo: str, now: datetime, *, drain_ok: bool) -> tuple[list[str], list[str]]:
+    """Идемпотентный (один прогон на ЭПИЗОД, не на пульс — маркер несёт
+    момент открытия эпизода-триггера) авто-диспетч pm.yml. `drain_ok`
+    принят в сигнатуру для симметрии с остальными gate-функциями main()
+    (design.md §2.1 формулирует условие через drain_gate/wip_gate целиком),
+    но решение здесь читает маркеры WATCHDOG_ISSUE заново (те же источники,
+    что drain_gate/wip_gate уже писали этим же прогоном) — эпизодные времена
+    (когда ИМЕННО открылся эпизод) нужны для идемпотентности, а не только
+    текущий булев вердикт."""
+    observations: list[str] = []
+    actions: list[str] = []
+
+    try:
+        drain_open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_OPEN_MARKER)
+        drain_close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_CLOSE_MARKER)
+        wip_stuck_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_STUCK_MARKER_PREFIX)
+        wip_open_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_OPEN_MARKER)
+        wip_close_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_CLOSE_MARKER)
+    except RuntimeError as error:
+        observations.append(f"⚠️ pm-диспетч: маркеры в #{WATCHDOG_ISSUE} не прочитаны: {error}")
+        return observations, actions
+
+    drain_last_close = max(drain_close_times) if drain_close_times else None
+    drain_episode_opens = [t for t in drain_open_times if drain_last_close is None or t > drain_last_close]
+    drain_episode_start = min(drain_episode_opens) if drain_episode_opens else None
+    drain_triggered = bool(
+        drain_episode_start is not None
+        and minutes_between(drain_episode_start, now) / 60 > PM_DISPATCH_AFTER_HOURS
+    )
+
+    wip_last_close = max(wip_close_times) if wip_close_times else None
+    wip_episode_opens = [t for t in wip_open_times if wip_last_close is None or t > wip_last_close]
+    wip_episode_start = min(wip_episode_opens) if wip_episode_opens else None
+    wip_stuck_in_episode = [
+        t for t in wip_stuck_times if wip_episode_start is not None and t >= wip_episode_start
+    ]
+    wip_triggered = bool(wip_stuck_in_episode)
+
+    if not drain_triggered and not wip_triggered:
+        return observations, actions
+
+    candidates = [
+        t for t in (
+            drain_episode_start if drain_triggered else None,
+            wip_episode_start if wip_triggered else None,
+        ) if t is not None
+    ]
+    episode_key = min(candidates).isoformat(timespec="seconds")
+    marker = f"{PM_GROOM_DISPATCH_MARKER_PREFIX}{episode_key}]"
+    try:
+        already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+    except RuntimeError as error:
+        observations.append(f"⚠️ pm-диспетч: маркер идемпотентности не проверен: {error}")
+        return observations, actions
+    if already:
+        observations.append("👤 pm-диспетч уже запущен на этот эпизод — повтор не нужен")
+        return observations, actions
+
+    reasons = []
+    if drain_triggered:
+        reasons.append(f"drain_gate держит тревогу дольше {PM_DISPATCH_AFTER_HOURS}ч")
+    if wip_triggered:
+        reasons.append(f"WIP-лимит держит взятие новых задач дольше {WIP_GATE_STUCK_HOURS}ч")
+    reason_text = "; ".join(reasons)
+
+    try:
+        gh(
+            "-X", "POST", f"repos/{repo}/actions/workflows/pm.yml/dispatches",
+            "-f", "ref=main", "-f", f"inputs[reason]={reason_text}",
+        )
+    except RuntimeError as error:
+        actions.append(f"⚠️ pm-диспетч не удался: {error}")
+        return observations, actions
+    try:
+        post_issue_comment(
+            repo, WATCHDOG_ISSUE,
+            f"👤 {marker}\nАвто-диспетч pm.yml на триаж PR-беклога: {reason_text}. "
+            f"Потолок закрытий за прогон — PM_MAX_CLOSURES_PER_RUN ({PM_MAX_CLOSURES_PER_RUN}), "
+            "проверяется механически по факту gh issue/pr close после прогона, не по "
+            "декларации модели.",
+        )
+    except RuntimeError as error:
+        actions.append(f"⚠️ маркер pm-диспетча в #{WATCHDOG_ISSUE} не оставлен: {error}")
+    actions.append(f"👤 pm.yml запущен на триаж PR-беклога ({reason_text})")
+    return observations, actions
+
 
 def pr_needs_rework(pull: dict) -> bool:
     """True — PR реально ждёт чужого труда (см. REWORK_LABELS), не движется
@@ -2512,8 +2765,137 @@ def rework_target_numbers(pulls: list[dict], pool: list[dict]) -> set[int]:
     return {issue["number"] for issue in pool if not issue["assignees"]} & declared
 
 
+# ── Требование C (#869) — карантин задачи, роняющей worker.yml N раз подряд ──
+# Живой повод: задача #140 роняла worker.yml на КАЖДОМ диспатче (испорченная
+# сессия harness-140, #794/#809/#868) — generic-отбор брал её снова и снова,
+# конвейер стоял. check_recurring_worker_failure (инвариант 10,
+# repo_invariants.py) уже находит такую серию, но только ЗАМЕЧАЕТ — критерий
+# 3 issue #794 требует действие в отборе, это оно (тот же класс решения, что
+# уже применён к предохранителю #205: полуоткрытое состояние с растущей
+# выдержкой, но per-ЗАДАЧА, не per-воркер — #257/#215/#710/#716/#140 несли
+# РАЗНЫЕ номера задач при ОДНОЙ причине порчи, design.md §3.2).
+QUARANTINE_AFTER = 3  # тот же порядок, что WORKER_FAILURE_PAUSE_AFTER (#205) — не выведено из данных.
+QUARANTINE_PROBE_BASE_MINUTES = 15.0  # форма pulse_guard.probe_backoff_minutes, свой счётчик (design.md §3.2)
+QUARANTINE_PROBE_MAX_MINUTES = 240.0
+QUARANTINE_RUNS_TO_SCAN = 20  # тот же компромисс цены, что RECURRING_FAILURE_RUNS_TO_SCAN (repo_invariants.py)
+
+# scripts/worker/task.sh:374 (см. также scripts/hands/dsh_task.sh,
+# scripts/git/task-branch) печатает эту строку сразу после успешного claim —
+# design.md §3.1: тот же лог job'а, что pulse_guard.last_error_log_line уже
+# читает для причины падения, читается ещё раз для номера задачи.
+LEASE_CLAIMED_RE = re.compile(r"Аренда взята:.*refs/locks/task-(\d+) установлен")
+
+
+def quarantine_backoff_minutes(streak: int) -> float:
+    """Та же ФОРМА, что pulse_guard.probe_backoff_minutes (design.md §3.2:
+    переиспользуется форма решения, не общая переменная — у задачи-карантина
+    СВОЙ счётчик). attempt=1 при streak==QUARANTINE_AFTER — первая выдержка
+    сразу по достижении порога, дальше растёт экспоненциально с потолком."""
+    attempt = max(1, streak - QUARANTINE_AFTER + 1)
+    return min(QUARANTINE_PROBE_BASE_MINUTES * (2 ** (attempt - 1)), QUARANTINE_PROBE_MAX_MINUTES)
+
+
+def quarantine_streaks(runs: list[tuple[int | None, bool, datetime]]) -> dict[int, tuple[int, datetime]]:
+    """`runs` — (номер_задачи|None, фатален_ли, created_at) уже ЗАВЕРШЁННЫХ
+    прогонов worker.yml, от НОВОГО к СТАРОМУ. Возвращает {номер: (стрик,
+    самый_свежий_фатальный_created_at)}. Считает ТОЛЬКО ведущий префикс
+    подряд фатальных прогонов — первый success или первый прогон с
+    неатрибутированным номером задачи останавливает подсчёт ЦЕЛИКОМ (честная
+    граница, design.md «Не подтверждено» п.3: атрибуция может быть неполной,
+    если job упал ДО строки «Аренда взята» — карантин по этой конкретной
+    задаче тогда просто не срабатывает, не гадаем дальше вглубь истории).
+    Внутри этого префикса счёт — ПО КАЖДОМУ номеру задачи отдельно (карантин
+    про конкретную задачу, не про класс причины — design.md §3.2)."""
+    streaks: dict[int, int] = {}
+    latest_fatal_at: dict[int, datetime] = {}
+    for task_number, fatal, created_at in runs:
+        if not fatal or task_number is None:
+            break
+        streaks[task_number] = streaks.get(task_number, 0) + 1
+        latest_fatal_at.setdefault(task_number, created_at)  # первый встреченный — самый свежий
+    return {n: (count, latest_fatal_at[n]) for n, count in streaks.items()}
+
+
+def quarantined_task_numbers_from_streaks(
+    streaks: dict[int, tuple[int, datetime]], now: datetime,
+) -> set[int]:
+    """Задача в карантине, если её стрик >= QUARANTINE_AFTER И с последнего
+    фатального прогона не прошла выдержка (растущая с числом попыток) —
+    полуоткрытое состояние БЕЗ отдельного маркера (design.md §3.2/§3.3):
+    следующая пригодная попытка — это просто следующий реальный дисп после
+    истечения выдержки; успех сам обрывает серию следующим прогоном (streak
+    считается заново с чистого листа), провал продлевает выдержку."""
+    result = set()
+    for number, (streak, latest_fatal_at) in streaks.items():
+        if streak < QUARANTINE_AFTER:
+            continue
+        if minutes_between(latest_fatal_at, now) < quarantine_backoff_minutes(streak):
+            result.add(number)
+    return result
+
+
+def worker_lease_task_number(repo: str, run: dict) -> int | None:
+    """Номер задачи, под которую взята аренда за этот прогон worker.yml —
+    парсер LEASE_CLAIMED_RE по сырому логу того же job'а, что
+    pulse_guard.last_error_log_line уже читает для причины падения (тот же
+    subprocess-контракт --allow-escape-sequences, другая строка, второй
+    HTTP-вызов логов — job'ов у worker.yml один). None — строка не найдена
+    (сбой до простановки лога аренды — честная граница, design.md «Не
+    подтверждено» п.3)."""
+    payload = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=20") or {}
+    jobs = payload.get("jobs", [])
+    if not jobs:
+        return None
+    job_id = jobs[0]["id"]
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs"],
+            capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for raw_line in result.stdout.splitlines():
+        match = LEASE_CLAIMED_RE.search(raw_line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def quarantined_task_numbers(repo: str, now: datetime) -> set[int]:
+    """Best-effort (issue #869): сеть недоступна/квота — тихо пустое
+    множество (никого не карантинит вслепую), не роняет dispatch_worker.
+    Дешёвый путь в здоровом состоянии — тот же приём, что
+    repo_invariants.check_recurring_worker_failure: самый свежий прогон
+    success обрывает счёт СРАЗУ, ни один job/лог не запрашивается."""
+    try:
+        runs = recent_runs(repo, WORKER_WORKFLOW, per_page=QUARANTINE_RUNS_TO_SCAN)
+    except RuntimeError:
+        return set()
+    runs = [r for r in runs if r.get("status") == "completed" and r.get("created_at")]
+    runs.sort(key=lambda r: r["created_at"], reverse=True)
+    outcomes: list[tuple[int | None, bool, datetime]] = []
+    for run in runs:
+        fatal = run.get("conclusion") in FAILURE_CONCLUSIONS
+        created_at = parse_time(run["created_at"])
+        if not fatal:
+            outcomes.append((None, False, created_at))
+            break
+        try:
+            task_number = worker_lease_task_number(repo, run)
+        except RuntimeError:
+            task_number = None
+        outcomes.append((task_number, True, created_at))
+        if task_number is None:
+            break
+    return quarantined_task_numbers_from_streaks(quarantine_streaks(outcomes), now)
+
+
 def dispatch_worker(
     repo: str, pool: list[dict], *, wip_allowed: bool, pulls: list[dict],
+    now: datetime | None = None,
 ) -> tuple[list[str], list[str]]:
     """Пульс конвейера: свободная задача есть, воркер простаивает → ровно один
     dispatch worker.yml за запуск оркестратора. Best-effort по построению:
@@ -2594,6 +2976,36 @@ def dispatch_worker(
             observations.append(f"⚠️ граф блокировок недоступен для отчёта (не критично): {error}")
             named_pool = pool
         candidates = free_task.prioritized_free(named_pool)
+        # Карантин (#869, Требование C) — задача, роняющая worker.yml
+        # QUARANTINE_AFTER+ раз подряд, не должна выбираться снова тем же
+        # bare-диспатчем (task.sh выбирает САМ, независимо, внутри job'а —
+        # без адресного input`а он снова возьмёт ровно ту же задачу). Best-
+        # effort: сбой сети не блокирует обычный диспатч, просто без учёта
+        # карантина этим разом.
+        try:
+            quarantined = quarantined_task_numbers(repo, now or datetime.now(timezone.utc))
+        except RuntimeError as error:
+            observations.append(f"⚠️ карантин задачи-отравы не проверен (не критично): {error}")
+            quarantined = set()
+        if quarantined and candidates and candidates[0]["number"] in quarantined:
+            safe_candidates = free_task.prioritized_free(named_pool, excluded=quarantined)
+            if safe_candidates:
+                target = safe_candidates[0]["number"]
+                gh(
+                    "-X", "POST",
+                    f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+                    "-f", "ref=main", "-f", f"inputs[task]={target}",
+                )
+                actions.append(
+                    f"🧯 задача #{candidates[0]['number']} в карантине ({QUARANTINE_AFTER}+ падений "
+                    f"worker.yml подряд) — worker.yml запущен адресно на #{target}, минуя её"
+                )
+            else:
+                observations.append(
+                    "⏸️ все свободные задачи в карантине (#869) — dispatch не запущен, "
+                    "выдержка снимет карантин автоматически"
+                )
+            return observations, actions
         gh(
             "-X", "POST",
             f"repos/{repo}/actions/workflows/worker.yml/dispatches",
@@ -4161,7 +4573,11 @@ def main() -> int:
     # Одна карта Task#N → слитый PR на весь прогон (#227) — reap_stale
     # (не путать слитый-но-непринятый PR с «PR не появился») и accept_merged_tasks
     # ниже читают её из одного источника, без второго обхода закрытых PR.
-    merged = merged_pr_map(all_merged_pulls(repo))
+    # Сырой список (#869) держим отдельно — merged_pr_map сама его не
+    # сохраняет, а drain_gate ниже считает max(merged_at) по нему же, без
+    # второго сетевого вызова (design.md §1.2).
+    all_merged_pulls_snapshot = all_merged_pulls(repo)
+    merged = merged_pr_map(all_merged_pulls_snapshot)
 
     # Один снимок открытых задач на большую часть прогона (#443): раньше
     # reap_stale и unhealthy_pulls каждая сама опрашивала open_task_issues(repo)
@@ -4276,27 +4692,66 @@ def main() -> int:
     # о сломанном самом конвейере, а не о размере очереди доработки.
     wip_observations, wip_actions, wip_allowed = wip_gate(
         repo, now, pulls, pool, dispatch_allowed=dispatch_allowed)
+
+    # drain_gate (#869) — композитный сигнал «дренаж встал», ПОСЛЕ
+    # conveyor_gate/wip_gate/mark_conflicts этого же прогона (design.md
+    # §1.4: причины должны быть уже посчитаны). wip_count — тот же локальный
+    # подсчёт, что wip_gate уже делает внутри себя (без сетевого вызова);
+    # conflict_exhausted_count — сетевые вызовы ограничены числом текущих
+    # конфликтных PR; contract_failed_count — из уже прочитанного `pulls`,
+    # без сетевого вызова.
+    wip_count = len([pull for pull in pulls if pr_needs_rework(pull)])
+    try:
+        conflict_exhausted = conflict_exhausted_count(repo, pulls)
+    except RuntimeError as error:
+        drain_gate_observations_conflict_warning = (
+            f"⚠️ drain_gate: бюджет авто-ребейза конфликтов не проверен: {error}")
+        conflict_exhausted = 0
+    else:
+        drain_gate_observations_conflict_warning = None
+    contract_failed_count = sum(
+        1 for pull in pulls
+        if CONTRACT_FAILED_LABEL in {label["name"] for label in (pull.get("labels") or [])}
+    )
+    drain_observations, drain_actions, drain_ok = drain_gate(
+        repo, now, pulls, all_merged_pulls_snapshot,
+        dispatch_allowed=dispatch_allowed, wip_count=wip_count,
+        conflict_exhausted=conflict_exhausted,
+        contract_failed_count=contract_failed_count,
+    )
+    if drain_gate_observations_conflict_warning:
+        drain_observations.append(drain_gate_observations_conflict_warning)
+
+    # Требование B (#869): диспетч роли pm на PR-беклог, когда drain_gate
+    # держит тревогу дольше PM_DISPATCH_AFTER_HOURS ИЛИ wip_gate держит свой
+    # stuck-эпизод дольше своего порога (#464, уже готовое условие,
+    # переиспользуется — design.md §2.1). pm.yml — отдельный workflow
+    # (design.md §2.2, решение записано в tasks.md B), диспетч идемпотентен
+    # по маркеру на эпизод (см. docstring dispatch_pm_groom).
+    pm_observations, pm_actions = dispatch_pm_groom(repo, now, drain_ok=drain_ok)
+
     # dispatch_worker пропускается этим проходом, если расшивка конфликта уже
     # ушла: «ровно один workflow_dispatch воркера за пульс» (докстринг модуля,
     # п.4) не должен превратиться в два только из-за гонки worker_runs_active
     # (только что созданный прогон не обязан быть виден как queued немедленно).
     if dispatch_allowed and not conflict_rework_dispatched:
         worker_observations, worker_actions = dispatch_worker(
-            repo, pool, wip_allowed=wip_allowed, pulls=pulls)
+            repo, pool, wip_allowed=wip_allowed, pulls=pulls, now=now)
     else:
         worker_observations, worker_actions = [], []
 
     observations = (
         lease_observations + merge_observations + ai_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
-        + wip_observations + worker_observations + failure_watch_observations
-        + stalled_observations
+        + wip_observations + drain_observations + pm_observations + worker_observations
+        + failure_watch_observations + stalled_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
         + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
-        + wip_actions + worker_actions + failure_watch_actions + stalled_actions
+        + wip_actions + drain_actions + pm_actions + worker_actions
+        + failure_watch_actions + stalled_actions
     )
     lines += render_action_report(observations, actions)
 

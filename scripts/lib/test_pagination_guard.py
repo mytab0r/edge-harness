@@ -108,6 +108,10 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "check-runs ОДНОГО коммита (head_sha) — тот же контракт, что "
         "pr_check_runs выше: фиксированный малый список обязательных "
         "проверок этого репозитория, не растущий список.",
+    ("scripts/orchestra/scheduler.py", "worker_lease_task_number"):
+        "job'ы ОДНОГО прогона worker.yml (#869, карантин задачи-отравы) — тот "
+        "же контракт, что pulse_guard.failing_jobs: фиксированное малое число "
+        "job'ов конвейера на один прогон, не растущий список.",
     ("scripts/lib/review_labels.py", "status_posted_at"):
         "commit status'ы ОДНОГО коммита (sha) — GitHub возвращает статусы "
         "как отдельные записи по каждому POST на этот sha, но контекстов на "
