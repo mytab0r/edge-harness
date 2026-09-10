@@ -421,6 +421,15 @@ fi
 # ставить заново в каждом дереве не нужно, но лишним не будет.
 git config core.hooksPath .githooks
 
+# Уборка мёртвых worktree'ов (#891): дешёвый самоподдерживающийся момент —
+# каждая НОВАЯ задача добавляет дерево на диск, здесь же и снимаем то, что
+# больше не нужно (уборка обязательна только на этом пути — "рабочее дерево
+# уже точно новое", а не на путях переиспользования/усыновления выше, где
+# агент вот-вот сам продолжит работать именно в этом дереве). Best-effort:
+# сбой уборки (сеть/gh недоступен) не блокирует создание НОВОЙ ветки задачи —
+# это maintenance, не гейт; свой вывод печатает сам скрипт.
+python3 "$(dirname "${BASH_SOURCE[0]}")/worktree-cleanup.py" || true
+
 mkdir -p "$(dirname "$wt_dir")"
 git worktree add -b "$branch" "$wt_dir" refs/remotes/origin/main
 echo "Ветка $branch от origin/main $(git rev-parse --short origin/main) ($(git log -1 --format=%cd --date=iso origin/main))"
