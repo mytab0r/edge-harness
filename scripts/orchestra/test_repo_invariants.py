@@ -2126,13 +2126,19 @@ def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
 
 def test_worker_false_success_comment_flags_live_incident_form(monkeypatch):
     # Прод-форма самого инцидента (#876, прогон worker.yml 34498185823,
-    # задача #140): Search API вернул бы этот комментарий, если бы фраза
-    # снова появилась — не пересказ, дословный ответ формы items[].
+    # задача #140): Search API вернул бы этот комментарий-кандидат, если бы
+    # фраза снова появилась, И локальная сверка тела комментария (находка
+    # ai-review PR #880 — см. докстринг check_worker_false_success_comment)
+    # подтверждает буквальный текст — дословный отказ живого инцидента.
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 140, "html_url": "https://github.com/mytab0r/edge-harness/issues/140",
              "title": "какая-то задача"},
         ]},
+        "issues/140/comments": [
+            {"created_at": "2026-09-10T18:53:32Z",
+             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/395"},
+        ],
     })
     patch_gh(monkeypatch, fake)
     violations = ri.check_worker_false_success_comment(REPO)
@@ -2141,6 +2147,28 @@ def test_worker_false_success_comment_flags_live_incident_form(monkeypatch):
         "url": "https://github.com/mytab0r/edge-harness/issues/140",
         "title": "какая-то задача",
     }]
+
+
+def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
+    # Находка ai-review PR #880: GitHub Search отбрасывает пунктуацию —
+    # фразовый запрос на «справился (провайдер: ?)» вырождается в поиск
+    # голых слов «справился»+«провайдер», которые соседствуют в КАЖДОМ
+    # ЗДОРОВОМ успехе воркера («справился (провайдер: GLM)»). Search вернул
+    # бы такую задачу кандидатом, но локальная сверка (буквальная подстрока
+    # в реально скачанном теле) обязана её ОТКЛОНИТЬ — иначе гвардия красит
+    # каждый настоящий успех, противореча собственному докстрингу.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 200, "html_url": "https://github.com/mytab0r/edge-harness/issues/200",
+             "title": "здоровая задача"},
+        ]},
+        "issues/200/comments": [
+            {"created_at": "2026-09-10T12:00:00Z",
+             "body": "🤖 Автономный воркер справился (провайдер: GLM). PR открыт: .../pull/500"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == []
 
 
 def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):

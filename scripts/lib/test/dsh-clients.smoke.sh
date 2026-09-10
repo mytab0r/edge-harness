@@ -217,6 +217,19 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
         printf -- '- id: hands-streamer\n'
         return 0
       fi
+      # #876: настоящий, НЕ переключаемый отказ (не RATE_LIMIT/HTTP_404/
+      # EMPTY_RESPONSE/пустой stderr) — dsh_chain_should_advance решает
+      # «стоп», цепочка (единственный провайдер фикстуры) останавливается с
+      # ПУСТЫМ DSH_RUN_FAILURE_REASON, не all_providers_exhausted. Нужен
+      # отдельно от SMOKE_RATE_LIMIT_MODE ниже: та ветка либо не финиширует
+      # (transient-then-ok), либо намеренно ПЕРЕКЛЮЧАЕМАЯ (quota/HTTP_404) —
+      # ни один существующий режим не воспроизводит живую форму инцидента
+      # «PR по ветке уже существует + dsh честно отказал в ЭТОМ прогоне»
+      # (worker-false-success-gate ниже).
+      if [ -n "${SMOKE_DSH_STOP_ERROR:-}" ]; then
+        echo "dsh: $SMOKE_DSH_STOP_ERROR" >&2
+        return 1
+      fi
       # Ретрай RATE_LIMIT в ai-review (#419): режим задаёт сценарий через
       # SMOKE_RATE_LIMIT_MODE, попытки считает переменная процесса — эта
       # заглушка живёт в одном bash-процессе ai_dsh.sh на весь ретрай-цикл
@@ -757,6 +770,26 @@ assert_not_log "refs/locks/task-200" "worker-auto: задача под живы�
 assert_log "MORDE-RPC session.create" "worker-auto: сессия морды не создана"
 assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
 echo "SMOKE: worker-auto — ок"
+
+# ── Живая форма инцидента #876: PR по ветке УЖЕ существует (дефолтный
+# GH_PR_LIST_URL_JSON, открыт с диффом), dsh честно отказывает В ЭТОМ
+# прогоне — job ОБЯЗАН быть красным, а не «справился» по факту одного
+# существования PR (находка ai-review PR #880: проводка гейта в task.sh не
+# была покрыта мутацией — оба смока оставались зелёными, если бы call-site
+# в task.sh вернули старый критерий «только pr_outcome_rc»).
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-false-success" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke живая форма инцидента #876","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
+  run_client_expect_fail "worker-false-success-gate" "$REPO/scripts/worker/task.sh"
+assert_log "не доказывает работу этого прогона" "worker-false-success-gate: сообщение обязано назвать причину #876, не «справился»"
+assert_not_log "Автономный воркер справился" "worker-false-success-gate: живой класс #876 — PR-по-ветке-существует не должен маскировать честный отказ dsh"
+echo "SMOKE: worker-false-success-gate — ок (#876)"
 
 # ── Клиент AI-ревью (второй гейт #18) ────────────────────────────────────────
 # Транспорт ревьюера: без GitHub-токена по построению, поэтому smoke проверяет
