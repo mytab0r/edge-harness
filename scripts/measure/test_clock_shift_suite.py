@@ -1,11 +1,13 @@
 """Тесты классификатора прогона со сдвинутыми часами (issue #649).
 
-Фикстуры — вербатим срезы РЕАЛЬНОГО вывода `python -m pytest scripts/ -q` на
+Фикстуры — срезы РЕАЛЬНОГО вывода `python -m pytest scripts/ -q` на
 этом репозитории (не пересказ формата pytest): красный кусок снят живым
 прогоном 2026-09-07 на дереве ДО ребейза с фиксом #646 (тест
 `test_dispatch_failure_writes_note_not_row` объяснимо падал реальным
 `git clone` — тот самый живой случай, который #649 обязана ловить
-механически). Зелёный и harness_broken куски — по документированной форме
+механически); пути в нём приведены к форме CI-раннера ubuntu-latest
+(разделитель `/`) — прод-форма этого прогона, не той платформы, где
+снимался срез. Зелёный и harness_broken куски — по документированной форме
 финальной строки pytest (`N passed`/`N failed .. in Ns`, `no tests ran`).
 
 Запуск: python -m pytest scripts/measure/test_clock_shift_suite.py -q
@@ -29,7 +31,7 @@ WORKFLOW = SCRIPT.parents[2] / ".github" / "workflows" / "clock-shift-tests.yml"
 REAL_RED_OUTPUT = """\
 E           fatal: repository 'https://github.com/o/r.git/' not found
 
-scripts\\measure\\dispatch_tail.py:415: RuntimeError
+scripts/measure/dispatch_tail.py:415: RuntimeError
 ---------------------------- Captured stdout call -----------------------------
 Кампания: 10/100 замеров
 =========================== short test summary info ===========================
@@ -104,7 +106,12 @@ def test_consequence_message_names_facts_not_internal_state():
     text = css.consequence_message(8, result)
     assert "::error::" in text
     assert "test_dispatch_failure_writes_note_not_row" in text
-    assert "8 календарных дней" in text
+    assert "сдвинутых на 8 дней" in text
+    # Различение бомбы класса от обычной поломки названо действием (прогон
+    # узла без сдвига), не предсказанием будущего — находка второго гейта
+    # ревью PR #667: «переживёт N дней и станет обязательным красным» было
+    # гипотезой, выданной за факт.
+    assert "без CLOCK_SHIFT_DAYS" in text
     assert "#643" in text and "#649" in text
 
 
