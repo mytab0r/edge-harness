@@ -147,17 +147,17 @@ def test_own_marker_literal_is_not_self_exempting(tmp_path):
     # без анкера на начало строки канарейка на первом же прогоне против самой
     # себя молча объявляла себя «в газе».
     path = tmp_path / "test_looks_like_fixture.py"
-    path.write_text('    with_reason.write_text("# ORPHAN-TEST-OK: чужая причина")\n')
+    path.write_text('    with_reason.write_text("# ORPHAN-TEST-OK: чужая причина")\n', encoding="utf-8")
     assert otg.read_exemption(path) is None
 
 
 def test_read_exemption_requires_non_empty_reason(tmp_path):
     with_reason = tmp_path / "test_with_reason.py"
-    with_reason.write_text("# ORPHAN-TEST-OK: требует боевого секрета, гоняется вручную\n")
+    with_reason.write_text("# ORPHAN-TEST-OK: требует боевого секрета, гоняется вручную\n", encoding="utf-8")
     assert otg.read_exemption(with_reason) == "требует боевого секрета, гоняется вручную"
 
     without_marker = tmp_path / "test_without_marker.py"
-    without_marker.write_text("# обычный комментарий\n")
+    without_marker.write_text("# обычный комментарий\n", encoding="utf-8")
     assert otg.read_exemption(without_marker) is None
 
 
@@ -165,10 +165,10 @@ def test_build_report_excludes_exempted_file_from_orphans(tmp_path, monkeypatch)
     exempt = tmp_path / "scripts" / "lib"
     exempt.mkdir(parents=True)
     test_file = exempt / "test_exempt_example.py"
-    test_file.write_text("# ORPHAN-TEST-OK: живой пример газа для теста канарейки\n")
+    test_file.write_text("# ORPHAN-TEST-OK: живой пример газа для теста канарейки\n", encoding="utf-8")
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
-    (workflows / "fixture.yml").write_text("jobs:\n  test:\n    steps: []\n")
+    (workflows / "fixture.yml").write_text("jobs:\n  test:\n    steps: []\n", encoding="utf-8")
 
     report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows)
     assert report["orphans"] == []
@@ -210,10 +210,10 @@ def test_suggest_mentions_guard_catalog_alternative_for_py_mjs_sh():
 def test_build_report_flags_unwired_file_as_orphan(tmp_path):
     lib = tmp_path / "scripts" / "lib"
     lib.mkdir(parents=True)
-    (lib / "test_unwired.py").write_text("def test_x():\n    assert True\n")
+    (lib / "test_unwired.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
-    (workflows / "fixture.yml").write_text("jobs:\n  test:\n    steps: []\n")
+    (workflows / "fixture.yml").write_text("jobs:\n  test:\n    steps: []\n", encoding="utf-8")
 
     report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows)
     assert report["orphans"] == ["scripts/lib/test_unwired.py"]

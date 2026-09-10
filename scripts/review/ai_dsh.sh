@@ -74,10 +74,20 @@ AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="${AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
 AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
 AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS:-300}"
 [ -f "$AI_WORK/prompt.md" ] || { echo "::error::нет $AI_WORK/prompt.md — шаг gather не отработал" >&2; exit 1; }
-# Одно место правды — vars.DSH_PROVIDER_CHAIN репозитория (#727): зашитого
-# списка провайдеров в коде нет, dsh_patch_profile/DEEPSEEK_* выставляются
-# ПОСЛЕ, отдельно на каждую попытку внутри dsh_run_with_provider_chain.
-dsh_require_provider_chain || exit 1
+# Цепочка приходит из манифеста использования (openspec/changes/
+# llm-provider-usage-manifest, config/provider-usage.json, потребитель
+# "ai-review") — dsh_require_provider_chain резолвит её по id ПЕРЕД обычной
+# валидацией; манифеста нет вовсе — фоллбэк на vars.DSH_PROVIDER_CHAIN (#727)
+# как раньше. dsh_patch_profile/DEEPSEEK_* выставляются ПОСЛЕ, отдельно на
+# каждую попытку внутри dsh_run_with_provider_chain.
+dsh_require_provider_chain "ai-review" || exit 1
+
+# `pnpm add` внутри профиля headless требует явного подтверждения root
+# (иначе ERR_PNPM_ADDING_TO_ROOT — тот же класс #83, что уже закрыт для
+# hands/dsh_task.sh и worker/task.sh, PR #94; здесь пропущен, когда #838
+# добавил dsh_mount_anthropic_pool в этот файл — issue #842, живой прогон
+# PR #837 2026-09-09T20:10:15Z).
+export npm_config_ignore_workspace_root_check=true
 
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"; : >"$AI_WORK/failure_reason.txt"
 
@@ -93,14 +103,35 @@ dsh --version || true
 # конструктивно (design.md dsh-in-job, «Стык suite и цепочки провайдеров»).
 # dsh_require_provider_chain ниже уже откажет громко, если vars.PLUGINS_SUITE_URL
 # всё же попадёт в env этого шага — но ai-review.yml её сюда не прокидывает:
-# suite остаётся уделом worker.yml/hands.yml, где цепочки нет.
+# suite остаётся уделом hands.yml (#797: worker.yml тоже подключён к цепочке,
+# там suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
+#
+# Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ от suite
+# случай: не combo-router, протокольно не конфликтует с цепочкой (design.md
+# anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров») — идёт
+# ПОСЛЕДОВАТЕЛЬНО перед ней (dsh_run_with_pool_then_chain ниже), атрибуция
+# DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED остаётся честной в обоих случаях. Гейт —
+# секреты ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL.
+dsh_install_anthropic_pool "$AI_WORK/anthropic-pool" || exit 1
+dsh_import_anthropic_accounts || exit 1
+# Bootstrap-патч ДО первого `dsh plugin add` этого профиля (ai-review иначе
+# не пишет cordis.patch.yml вовсе до самой цепочки) — тот же приём, что
+# worker.yml/hands.yml применяют перед dsh_mount_plugins_suite: initProfile
+# пишет файлы профиля только при отсутствии, порядок важен только для
+# ПЕРВОГО `dsh` этого прогона. Пул неактивен → dsh_mount_anthropic_pool сам
+# no-op, ни один `dsh` здесь не вызывается — поведение ai-review без пула не
+# меняется вовсе.
+if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
+  _dsh_patch_profile_anthropic_pool headless
+fi
+dsh_mount_anthropic_pool headless || exit 1
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_provider_chain "$AI_WORK/answer.txt" "$AI_WORK/stderr.txt" "$(cat "$AI_WORK/prompt.md")"
+  dsh_run_with_pool_then_chain "$AI_WORK/answer.txt" "$AI_WORK/stderr.txt" "$(cat "$AI_WORK/prompt.md")"
 rc=$DSH_RUN_RC
 if [ -n "$DSH_RUN_FAILURE_REASON" ]; then
   printf '%s' "$DSH_RUN_FAILURE_REASON" >"$AI_WORK/failure_reason.txt"

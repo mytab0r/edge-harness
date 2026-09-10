@@ -41,11 +41,59 @@
 # доверенного шага (данные, не код); head для сверки — step-output фактов,
 # закрытый до недоверенного шага: файлы $AI_WORK агенту принадлежат.
 #
-# Concurrency: группа = породивший pr-review-ран (workflow_run.id) или номер
-# PR из dispatch. Новый пуш того же PR = НОВЫЙ pr-review-ран = своя группа —
-# параллельные ревью одного PR возможны, и это осознанно: cancel-in-progress
-# НАМЕРЕННО выключен — отмена погасила бы летящее ревью без автоперезапуска,
-# а протухший вердикт и так не применяется (verdict сверяет head с gather).
+# Concurrency: группа = номер PR (единый признак для ОБОИХ путей триггера,
+# #779 блокирующая 1 — до этой правки событийный путь ключевался
+# workflow_run.id, УНИКАЛЬНЫМ на каждое событие, поэтому два разных
+# pr-review-события одного PR попадали каждое в свою группу и не
+# сериализовались вовсе). Номер PR извлекается той же парой выражений, что
+# уже вычисляет run-name чуть ниже (workflow_dispatch — inputs.pr,
+# workflow_run — github.event.workflow_run.pull_requests[0].number,
+# доступный в событии без похода в API) — фолбэк на workflow_run.id остаётся
+# только на случай форк-PR (pull_requests пуст, документированное
+# ограничение GitHub), где и сам run-name деградирует тем же способом.
+#
+# Симметричный тормоз, который эта группа закрывает: `ai_review.py::
+# cmd_should_run` спрашивает review_labels.other_active_ai_review_runs ДЛЯ
+# ОБОИХ путей (#779, разрыв 1) — эта проверка безопасна ровно тогда, когда
+# два прогона одного PR не могут задать её ОДНОВРЕМЕННО; без общей группы оба
+# видят друг друга летящим и оба отвечают false (живой случай PR #725,
+# 2026-09-08: run 34183129865 workflow_run и run 34183131439
+# workflow_dispatch, created Δ=2с — вердиктов ноль). С группой на номер PR
+# второй триггер уходит в ОЖИДАНИЕ (cancel-in-progress: false ниже — очередь,
+# не отмена), стартует только когда первый уже завершился, и на своей
+# сверке отпечатка видит уже опубликованный вердикт с тем же diff — отказ
+# дешёвый (не «занят», а «дифф не изменился»), ничей вердикт не теряется.
+# Новый пуш того же PR = новый диффа-отпечаток = следующий триггер этого же
+# PR ждёт в той же группе, но, дождавшись своей очереди, проходит сверку
+# отпечатка честно — параллельные ревью одного PR по-прежнему невозможны
+# (см. issue #779 целиком, критерии 1-2), но это и есть цель: не более
+# ОДНОГО реального вызова модели на один и тот же дифф одновременно.
+# cancel-in-progress НАМЕРЕННО выключен — отмена погасила бы летящее ревью
+# без автоперезапуска, а протухший вердикт и так не применяется (verdict
+# сверяет head с gather); третий триггер того же PR отменит только ВТОРОЙ,
+# ещё не стартовавший ожидающий прогон — тот вердикта не терял (не
+# считался), а актуальный дифф всё равно вынесет прогон, который уже летит
+# или встанет следующим в очередь. Весь аргумент «вердикт не теряется» стоит
+# ИМЕННО на этом значении: с cancel-in-progress: true второй триггер отменял
+# бы ПЕРВЫЙ летящий прогон (documented GitHub Actions semantics — не
+# «ставит третий в очередь», а «отменяет второй, если такой уже ждёт»),
+# ровно тот silent-wrong класс, что отвергнут абзацем ниже про общую группу
+# — только внутри одного PR вместо всех разом. Гвардия по исходнику —
+# scripts/review/test_gate_triggers.py (мутация `true` красит один из тестов
+# в этом файле).
+#
+# У per-PR группы своя, поимённо не бесплатная цена, не упомянутая нигде до
+# этой строки: GitHub держит только ОДИН ожидающий прогон на группу
+# (`queue: max` растягивает это разве что до 100 в Enterprise — здесь план
+# бесплатный, опция не в игре); третий триггер того же PR, пока второй ещё
+# ждёт, отменяет именно этот второй (см. абзац выше), а не встаёт третьим в
+# очередь. Выбор «ожидающий один, третий гасит второго» — решение этой
+# правки (#779), а не свойство GitHub, которое подразумевается само собой.
+#
+# Это НЕ тот вариант, что отвергнут ниже (#419): там — ОБЩАЯ группа на ВСЕ
+# PR разом (один ожидающий слот на весь репозиторий, чужой триггер отменяет
+# чужой PR); здесь группа — per-PR, отменить может только СВОЙ ЖЕ более новый
+# триггер того же PR.
 #
 # Полная сериализация ревью РАЗНЫХ PR в одну группу рассмотрена и ОТКЛОНЕНА
 # (#419, живой факт: 24 прогона/час, до 7 одновременно, четыре PR с ai:failed
@@ -76,7 +124,18 @@ name: ai-review
 # Префикс "ai-review PR #" продублирован в
 # scripts/lib/review_labels.py::AI_REVIEW_RUN_NAME_PREFIX — тест
 # test_ai_review_workflow_run_name_uses_review_labels_prefix сверяет
-# буквально, чтобы стороны не разошлись молча.
+# буквально, чтобы стороны не разошлись молча. Та же пара выражений
+# (workflow_dispatch → inputs.pr, workflow_run →
+# pull_requests[0].number) вычисляет и `concurrency.group` выше (#779
+# блокирующая 1) — построчно НЕ идентична (там нужен голый номер, здесь —
+# форматированная строка), сверять дословно нечем. Обе НАМЕРЕНЫ деградировать
+# на форк-PR в один и тот же fallback (голый run.id и голая строка "ai-review"
+# соответственно) — тест test_ai_review_workflow_run_name_uses_review_labels_
+# prefix (scripts/review/test_ai_review.py) проверяет только число вхождений
+# префикса run-name, про эту деградацию и про concurrency.
+# group ничего не знает; см. границу форк-PR в review_labels.py::
+# other_active_ai_review_runs — на форк-PR оба тормоза (занятость и очередь)
+# выключены одновременно этим же fallback'ом.
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('ai-review PR #{0}', github.event.inputs.pr)
    || (github.event.workflow_run.pull_requests[0] && format('ai-review PR #{0}', github.event.workflow_run.pull_requests[0].number))
@@ -114,10 +173,16 @@ permissions:
   actions: read
 
 concurrency:
-  # Группа = породивший run pr-review (уникален) либо номер PR из dispatch:
-  # ревью разных PR не сериализуются, у одного PR новый пуш = новый pr-review
-  # run = своя группа; протухший вердикт всё равно не применяется (head-check).
-  group: ai-review-${{ github.event.workflow_run.id || github.event.inputs.pr }}
+  # Группа = номер PR — единственное выражение, дословно то же, что вычисляет
+  # run-name ниже (#779 блокирующая 1, см. блок-комментарий выше): ревью
+  # разных PR по-прежнему НЕ сериализуются (группа привязана к номеру), а два
+  # триггера ОДНОГО PR (workflow_run от pr-review и ручной workflow_dispatch,
+  # или два разных pr-review-события) теперь встают в одну очередь вместо
+  # гонки друг с другом.
+  group: >-
+    ai-review-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr
+     || (github.event.workflow_run.pull_requests[0] && github.event.workflow_run.pull_requests[0].number)
+     || github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
@@ -315,7 +380,15 @@ jobs:
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "PR #$PR_NUMBER: дорогой прогон не нужен (причина — в stderr выше: дифф не изменился, либо уже идёт другой прогон этого PR)."
+            # AGENTS.md «алерт не гадает»: причин теперь четыре (дифф не
+            # изменился — ручной путь / дифф не изменился — событийный путь /
+            # уже летит другой прогон этого PR — ручной путь / уже летит
+            # другой прогон этого PR — событийный дубль, #779/#780),
+            # различать их здесь угадыванием НЕ нужно — should-run уже
+            # напечатал ТОЧНУЮ причину своей строкой в stderr выше
+            # (manual_dispatch_skip_reason/event_dispatch_skip_reason/
+            # manual_dispatch_busy_reason/event_dispatch_duplicate_reason).
+            echo "PR #$PR_NUMBER: дорогой прогон не нужен — точная причина уже напечатана строкой выше."
           fi
 
       # Дерево PR — только ДАННЫЕ для агента: агент читает репозиторий в
@@ -333,6 +406,14 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+
+      # pnpm нужен dsh plugin add (монтаж anthropic-oauth-pool, #838, тот же
+      # класс, что #83 — dsh plugin add без pnpm падает; шаг уже есть у
+      # worker.yml/hands.yml, здесь был пропущен — issue #842).
+      - if: steps.fingerprint.outputs.go == 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
 
       - if: steps.fingerprint.outputs.go == 'true'
         id: gather
@@ -371,6 +452,14 @@ jobs:
           # активный секрет для ручного переключения, другая задача).
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
           # Упорядоченный список провайдеров — ОДНО место правды,
           # vars.DSH_PROVIDER_CHAIN (JSON-массив, #727): base_url/model/
           # secret_env выставляет dsh_run_with_provider_chain на каждую
@@ -378,11 +467,29 @@ jobs:
           # dsh_require_provider_chain в review/ai_dsh.sh падает громко до
           # какой-либо дорогой работы.
           DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          # Персистентное состояние квоты (#857, JSON {provider: reset_iso})
+          # — читается контекстом workflow БЕЗ токена, тем же путём, что
+          # DSH_PROVIDER_CHAIN выше: пишет ТОЛЬКО пульс оркестратора
+          # (scripts/orchestra/provider_quota_state.py), этот недоверенный
+          # шаг только читает vars.* и не получает никакого нового права.
+          DSH_PROVIDER_QUOTA_UNTIL: ${{ vars.DSH_PROVIDER_QUOTA_UNTIL }}
           # Suite ротации учёток (#215) сюда НЕ прокидывается: этот шаг всегда
           # идёт через цепочку провайдеров выше, а suite с ней конструктивно
           # не совместим (design.md dsh-in-job, «Стык suite и цепочки
           # провайдеров», scripts/review/ai_dsh.sh). Ротация учёток остаётся
-          # уделом worker.yml/hands.yml, где цепочки нет.
+          # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
+          # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
+          #
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ
+          # от suite случай, протокольно не конфликтует с цепочкой (design.md
+          # anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»):
+          # пробуется ПОСЛЕДОВАТЕЛЬНО перед ней, не заменяя. JSON
+          # credentials.json целиком в значении секрета (AGENTS.md
+          # «Секреты» — значение никогда не печатается). Оба пусты →
+          # dsh_install_anthropic_pool печатает «не подключён», шаг идёт как
+          # раньше (только цепочка).
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"

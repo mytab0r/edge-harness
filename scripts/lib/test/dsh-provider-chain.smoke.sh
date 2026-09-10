@@ -238,4 +238,50 @@ OUT="$(cat "$LOG")"
 [[ "$OUT" == *"sk-[REDACTED]"* ]] || fail "8) redact() не отработал — в логе нет ожидаемой замены sk-[REDACTED]: $OUT"
 echo "SMOKE(chain): 8) сырой stderr стоп-класса маскируется redact() до печати и до записи в переменную — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743 зелёная"
+# ── 9) #857: персистентная квота — провайдер с БУДУЩИМ reset_iso пропущен
+# ДО попытки, реальный dsh() для него не вызывается. Доказательство: режим
+# primary_model НЕ выставлен (дефолт "ok" — если бы гейт не сработал,
+# PRIMARY ответил бы успехом сам) — единственная причина, по которой
+# DSH_CHAIN_PROVIDER окажется SECONDARY, это сам гейт.
+reset_scenario
+SMOKE_MODE_secondary_model="ok"
+export DSH_PROVIDER_QUOTA_UNTIL='{"PRIMARY":"2099-01-01T00:00:00Z"}'
+LOG="$WORK/log9.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+unset DSH_PROVIDER_QUOTA_UNTIL
+[ "$DSH_RUN_RC" = "0" ] || fail "9) ожидался успех после пропуска квотированного PRIMARY, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "9) ожидался переход на SECONDARY (PRIMARY квотирован), получено '$DSH_CHAIN_PROVIDER' — если PRIMARY, гейт не сработал"
+[[ "$DSH_CHAIN_TRIED" == "PRIMARY (пропущен: квота до 2099-01-01T00:00:00Z), SECONDARY" ]] \
+  || fail "9) DSH_CHAIN_TRIED обязан назвать пропуск и дату: '$DSH_CHAIN_TRIED'"
+[[ "$DSH_CHAIN_RESET_HINT" == *"PRIMARY: 2099-01-01T00:00:00Z"* ]] || fail "9) дата возврата PRIMARY обязана попасть в подсказку: '$DSH_CHAIN_RESET_HINT'"
+[[ "$OUT" == *"пропущен — квота до 2099-01-01T00:00:00Z"* ]] || fail "9) сообщение обязано называть факт пропуска и дату: $OUT"
+echo "SMOKE(chain): 9) персистентная квота с будущим reset -> пропуск ДО попытки, dsh() не вызван — ок"
+
+# ── 10) Мутация обратного случая: reset_iso УЖЕ в прошлом — провайдер
+# пробуется как обычно (гейт не держит вечно, только до даты).
+reset_scenario
+SMOKE_MODE_primary_model="ok"
+export DSH_PROVIDER_QUOTA_UNTIL='{"PRIMARY":"2020-01-01T00:00:00Z"}'
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
+unset DSH_PROVIDER_QUOTA_UNTIL
+[ "$DSH_RUN_RC" = "0" ] || fail "10) ожидался успех — PRIMARY, дата сброса в прошлом"
+[ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || fail "10) ожидался PRIMARY (квота уже прошла), получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "10) PRIMARY обязан быть опробован без пометки пропуска: '$DSH_CHAIN_TRIED'"
+echo "SMOKE(chain): 10) персистентная квота с прошедшим reset -> пробуется как обычно — ок"
+
+# ── 11) Повреждённое состояние (не JSON-объект) — фейл-открыто: гейт
+# пропущен целиком, цепочка не падает, PRIMARY пробуется как обычно.
+reset_scenario
+SMOKE_MODE_primary_model="ok"
+export DSH_PROVIDER_QUOTA_UNTIL='не json вовсе'
+LOG="$WORK/log11.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+unset DSH_PROVIDER_QUOTA_UNTIL
+[ "$DSH_RUN_RC" = "0" ] || fail "11) повреждённое состояние не должно ронять цепочку, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || fail "11) ожидался PRIMARY (гейт фейл-открыт), получено '$DSH_CHAIN_PROVIDER'"
+[[ "$OUT" == *"не JSON-объект"* ]] || fail "11) сообщение обязано называть факт повреждённого состояния: $OUT"
+echo "SMOKE(chain): 11) повреждённое состояние квоты -> фейл-открыто, цепочка не падает — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857 зелёная"

@@ -96,9 +96,36 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
         workspace.create)
           body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"workspace":{"workspaceId":"ws-smoke"},"created":true}}}' ;;
         session.create)
-          body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"sessionId":"smoke","agentPreset":"dsh-edge"}}}' ;;
+          # Класс #809 (живые прогоны worker.yml 34455120330/harness-716,
+          # 34441499974/harness-140): SMOKE_CORRUPTED_SESSION_ID делает ОДНУ
+          # конкретную сессию навсегда испорченной — прод-форма ошибки
+          # (текст скопирован из лога живого прогона, не пересказ), любой
+          # ДРУГОЙ sessionId (фоллбэк dsh_edge_session_begin) проходит как
+          # обычно.
+          local _sid
+          _sid=$(printf '%s' "${data_str:-}" | command jq -r '.payload.sessionId // empty' 2>/dev/null)
+          if [ -n "${SMOKE_CORRUPTED_SESSION_ID:-}" ] && [ "$_sid" = "$SMOKE_CORRUPTED_SESSION_ID" ]; then
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"stored session \\\"$_sid\\\" failed validation: Error: session event at seq 13 lacks an identified message\"}}}"
+          else
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":true,\"value\":{\"sessionId\":\"$_sid\",\"agentPreset\":\"dsh-edge\"}}}"
+          fi ;;
         session.rename)
-          body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"title":"smoke","seq":1}}}' ;;
+          # #871: прод-случай harness-140 (run 34471287514, 2026-09-10) —
+          # холодная загрузка проваливает валидацию НЕ на session.create
+          # (он прошёл идемпотентным no-op), а на session.rename (сервер
+          # грузит и валидирует весь сохранённый объект сессии, чтобы
+          # переписать title). SMOKE_CORRUPTED_RENAME_SESSION_ID делает
+          # rename ОДНОЙ конкретной сессии навсегда испорченным тем же
+          # прод-текстом, что и session.create выше (класс общий, RPC разный)
+          # — create для того же id должен пройти нормально (см. ветку
+          # session.create выше, она не знает про эту переменную).
+          local _rsid
+          _rsid=$(printf '%s' "${data_str:-}" | command jq -r '.payload.sessionId // empty' 2>/dev/null)
+          if [ -n "${SMOKE_CORRUPTED_RENAME_SESSION_ID:-}" ] && [ "$_rsid" = "$SMOKE_CORRUPTED_RENAME_SESSION_ID" ]; then
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"stored session \\\"$_rsid\\\" failed validation: Error: session event at seq 2833 lacks an identified message\"}}}"
+          else
+            body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"title":"smoke","seq":1}}}'
+          fi ;;
         workspace.archiveSession)
           body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"archivedSessionIds":[]}}}' ;;
         *)
@@ -420,17 +447,32 @@ export HANDS_URL="https://journal.test"
 export HARNESS_URL="https://journal.test"
 export HANDS_TOKEN="smoke-hands-token"
 export DEEPSEEK_API_KEY="smoke-deepseek-key"
-# ФИКСТУРА теста, не дефолт прода (#153): dsh_require_provider_env требует
-# непустых значений, значение здесь произвольно и не читается как источник
-# правды — им остаются только vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория.
+# ФИКСТУРА теста, не дефолт прода (#153): DEEPSEEK_BASE_URL/DEEPSEEK_MODEL
+# здесь больше не читаются напрямую ни одним из трёх каналов (все три —
+# ai_dsh.sh/worker/task.sh/hands/dsh_task.sh — теперь требуют
+# vars.DSH_PROVIDER_CHAIN, #727/#797/#805); экспорт оставлен как безвредный
+# остаток на случай кода, который ещё их читает где-то в цепочке вызовов —
+# единственный источник правды для провайдера теперь DSH_PROVIDER_CHAIN ниже.
 export DEEPSEEK_BASE_URL="https://llm.test"
 export DEEPSEEK_MODEL="glm-5"
-# Цепочка провайдеров (#727): ai_dsh.sh (ревью) теперь требует
-# vars.DSH_PROVIDER_CHAIN, не одиночные DEEPSEEK_* напрямую — один фиктивный
-# провайдер, ссылающийся на ту же DEEPSEEK_API_KEY-фикстуру (worker/hands
-# по-прежнему читают DEEPSEEK_* напрямую через dsh_require_provider_env, не
-# тронуто этим change, см. tasks.md «Область»).
+# Цепочка провайдеров (#727, доводы #797/#805): ai_dsh.sh (ревью), worker/task.sh
+# И hands/dsh_task.sh теперь требуют vars.DSH_PROVIDER_CHAIN, не одиночные
+# DEEPSEEK_* напрямую — один фиктивный провайдер, ссылающийся на ту же
+# DEEPSEEK_API_KEY-фикстуру. worker/task.sh и hands/dsh_task.sh оба сами
+# патчат профиль значениями chain[0] ДО первого `dsh` (плагин стрима) —
+# DEEPSEEK_BASE_URL/DEEPSEEK_MODEL, экспортированные прямо выше, оба клиента
+# перезаписывают своими же значениями, взятыми из этой же цепочки.
 export DSH_PROVIDER_CHAIN='[{"name":"SMOKE","base_url":"https://llm.test","model":"glm-5","secret_env":"DEEPSEEK_API_KEY","max_output_tokens":131072}]'
+# Изоляция от РЕАЛЬНОГО config/provider-usage.json репозитория (openspec/
+# changes/llm-provider-usage-manifest): все три канала теперь вызывают
+# dsh_require_provider_chain с СВОИМ id потребителя, и та резолвит цепочку из
+# манифеста ПРИОРИТЕТНЕЕ фикстуры DSH_PROVIDER_CHAIN выше, если файл манифеста
+# физически существует — а он существует в этом checkout'е. Без этой изоляции
+# фикстура (модель "glm-5", свой CONFIRMED_MODELS_FIXTURE ниже) была бы молча
+# подменена реальными провайдерами манифеста, для которых confirmed-реестра
+# фикстуры не подтверждён — тот же приём, что уже применяет
+# DSH_CONFIRMED_MODELS_FILE ниже к другому реальному файлу репозитория.
+export DSH_PROVIDER_USAGE_MANIFEST="$TMP/no-such-provider-usage-manifest.json"
 # Реестр подтверждённых id (#737): реальный реестр репозитория
 # (scripts/lib/confirmed-provider-models.json) не знает фиктивную модель
 # "glm-5" этой фикстуры по построению — своя фикстура реестра, иначе
@@ -570,6 +612,66 @@ grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$t
 grep -qF -- "выполнена" <<<"$tg_line" \
   && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
 echo "SMOKE: worker — ок"
+
+# ── Испорченная холодная загрузка сессии (#809) ────────────────────────────────────
+# Прод-форма отказа — дословно из живых прогонов worker.yml 34455120330
+# (harness-716) и 34441499974 (harness-140): «Морда отклонила internal:
+# stored session "harness-<N>" failed validation: Error: session event at
+# seq N lacks an identified message» — до фикса ЛЮБОЙ последующий воркер на
+# ЭТОЙ задаче падал на этом шаге, не доходя до dsh/провайдера. Дока-класс:
+# dsh_edge_session_begin обязан пережить эту ошибку фоллбэком на новый id, а
+# не бричить задачу (класс #809, дизайн session-note-identified-message).
+scenario_start
+SMOKE_CORRUPTED_SESSION_ID="harness-123" \
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-corrupted" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke задача: испорченная сессия","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-corrupted-session" "$REPO/scripts/worker/task.sh"
+# Обе попытки session.create видны в журнале: первая (harness-123) отказана,
+# вторая (harness-123-r<run_id>, фоллбэк) принята — задача всё равно доведена
+# до DSH и до отчёта, job зелёный.
+# grep -c возвращает rc=1 при нуле совпадений (нет матча — не ошибка здесь,
+# число 0 и так печатается) — под set -e это оборвало бы скрипт ДО
+# диагностического ::error:: ниже; || true отдаёт решение проверке ниже.
+create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG" || true)
+[ "$create_calls" -ge 2 ] \
+  || { echo "::error::SMOKE: worker-corrupted-session: ожидалось ≥2 вызова session.create (отказ + фоллбэк), получено $create_calls" >&2
+       cat "$CALLLOG" >&2; exit 1; }
+assert_log "MORDE-INGEST" "worker-corrupted-session: транскрипт не уехал в морду после фоллбэка на новый id"
+assert_log "GH-COMMENT" "worker-corrupted-session: нет отчёта в задачу после фоллбэка"
+echo "SMOKE: worker-corrupted-session — ок"
+
+# ── Испорченная холодная загрузка ИМЕННО на session.rename (#871) ─────────────────
+# Прод-форма — дословно из живого прогона worker.yml 34471287514 (2026-09-10,
+# harness-140): session.create для УЖЕ СОХРАНЁННОЙ сессии прошёл (идемпотентный
+# no-op), а session.rename отказал тем же текстом «failed validation» — фикс
+# #809/PR #868 держал фоллбэк только вокруг session.create, поэтому этот класс
+# бричил задачу заново ПОСЛЕ мержа #868. dsh_edge_session_begin обязан
+# пережить отказ на любом из двух RPC одним и тем же фоллбэком.
+scenario_start
+SMOKE_CORRUPTED_RENAME_SESSION_ID="harness-124" \
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="124" \
+RUNNER_TEMP="$TMP/rt-w-corrupted-rename" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":124,"title":"Smoke задача: испорченная сессия на rename","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-corrupted-session-rename" "$REPO/scripts/worker/task.sh"
+# Обе попытки session.rename видны в журнале: первая (harness-124) отказана,
+# вторая (harness-124-r<run_id>, фоллбэк) принята — задача всё равно доведена
+# до DSH и до отчёта, job зелёный.
+rename_calls=$(grep -cF "MORDE-RPC session.rename" "$CALLLOG" || true)
+[ "$rename_calls" -ge 2 ] \
+  || { echo "::error::SMOKE: worker-corrupted-session-rename: ожидалось ≥2 вызова session.rename (отказ + фоллбэк), получено $rename_calls" >&2
+       cat "$CALLLOG" >&2; exit 1; }
+assert_log "MORDE-INGEST" "worker-corrupted-session-rename: транскрипт не уехал в морду после фоллбэка на новый id"
+assert_log "GH-COMMENT" "worker-corrupted-session-rename: нет отчёта в задачу после фоллбэка"
+echo "SMOKE: worker-corrupted-session-rename — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
 # Отказ claim = зелёный no-op: job завершается 0, работы НЕТ (нет сессии в
@@ -795,6 +897,11 @@ echo "SMOKE: worker-rate-limit-quota — ок"
 # (issue-N) возвращается в пул ПОСЛЕ того, как GH_RUN_TOKEN уже снят из
 # экспорта (trust-zone, #121): release-full обязан пройти на СОХРАНЁННОЙ
 # копии токена (LEASE_RELEASE_TOKEN), не на переменной окружения.
+# Цепочка провайдеров (#727/#805): фикстура несёт РОВНО одного провайдера —
+# rate_limit_retry_budget_exceeded (переключаемый класс) исчерпывает цепочку
+# целиком в ОДИН шаг, тот же паттерн, что уже доказан для ai-review выше
+# (AI_RL4) — журнал получает all_providers_exhausted, не
+# rate_limit_retry_budget_exceeded напрямую.
 scenario_start
 TASK_ID="issue-123" \
 TASK_TEXT="Smoke: бюджет ретрая рук исчерпан" \
@@ -805,8 +912,8 @@ HANDS_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client_expect_fail "hands-rate-limit-budget" "$REPO/scripts/hands/dsh_task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "hands-rate-limit-budget: замок не снят — задача осталась занятой"
 assert_log "GH-API-UNASSIGN issue-123" "hands-rate-limit-budget: назначение не снято — задача осталась занятой"
-grep -qF "rate_limit_retry_budget_exceeded" "$JOURNAL_CAPT" \
-  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
+grep -qF "all_providers_exhausted" "$JOURNAL_CAPT" \
+  || { echo "::error::SMOKE: hands-rate-limit-budget: журнал не получил failure_reason all_providers_exhausted (#727/#805, один провайдер в фикстуре)" >&2; cat "$JOURNAL_CAPT" >&2; exit 1; }
 grep -qE '"result": *"fail"' "$JOURNAL_CAPT" \
   || { echo "::error::SMOKE: hands-rate-limit-budget: job_end не fail" >&2; exit 1; }
 echo "SMOKE: hands-rate-limit-budget — ок"

@@ -40,7 +40,7 @@ Commit Status API (#345, кандидат из docs/research/23-platform-native-
 import hashlib
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -433,7 +433,16 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
     должен отнимать этот газ, иначе повторная попытка после сбоя
     провайдера/транспорта молча перестанет случаться. Вердикта нет вовсе
     (первое ревью PR) — прогон тоже нужен, пропускать нечего.
-    """
+
+    Намеренно НЕ читает «летит ли прогон прямо сейчас» (#779, разрыв 4):
+    второй копии other_active_ai_review_runs здесь не заводим — эта функция
+    отвечает только на вопрос «этот код уже ревьюили», а «его ревьюят прямо
+    сейчас» решает other_active_ai_review_runs у ВСЕХ вызывающих (cmd_should_run
+    для обоих путей триггера, trigger_ai_review) ДО обращения сюда. С этой
+    проверкой выше по стеку у ai:failed эффективно получается «повтор нужен,
+    если прогона сейчас не летит» — один повтор на неизменившийся отпечаток,
+    а не столько, сколько раз сработает таймер, — без переписывания самого
+    предиката отпечатка."""
     names = _names(current_labels)
     if AI_FAILED in names:
         return True
@@ -511,6 +520,33 @@ def reason_tag(dsh_rc: str, failure_reason: str = "") -> str:
 # имени GITHUB_TOKEN. user.login/user.type в ответе GitHub API — это факт
 # об АВТОРЕ комментария в базе GitHub, не текст, который пишет автор, и
 # подделать его публикацией нового комментария нельзя.
+#
+# ── Следствие для «гейт медленный, поставлю ai:ok вручную» (#828) ───────────
+#
+# Живой случай: PR #818/#819/#826 (2026-09-09) — владелец вручную ставил
+# ai:ok вместе с самодельным комментарием, имитирующим формат вердикта
+# ("pr: N | reviewer: approve\n\n## Вердикт второго гейта — bootstrap..."),
+# в обход настоящего прогона ai-review.yml. Следующий же пуш (даже чистое
+# подтягивание main, дифф не менялся) снимал ai:ok — не потому, что
+# diff_fingerprint ошибся (он трёхточечный и устойчив к подтягиванию, #740),
+# а потому что _is_trusted_verdict_author отвергает автора-человека:
+# latest_ai_comment не находит НИ ОДНОГО доверенного вердикта на PR вообще,
+# ai_verdict_keep получает stored_fp=None и обязан снять метку (по контракту
+# diff_unchanged: «нет отпечатка — считаем изменившимся», как и должно быть
+# при сомнении, AGENTS.md). Разбор — issue #828, регресс-тест на буквальном
+# тексте комментария PR #818 — scripts/review/test_check_pr.py
+# (test_ai_ok_from_bootstrap_comment_never_survives_next_push_even_unchanged_diff).
+#
+# Это НЕ баг и чинить его смягчением проверки автора нельзя — тогда снова
+# открылась бы дыра #294 (любой участник публичного репозитория подделывает
+# approve). Метка, поставленная в обход ai-review.yml, физически не может
+# получить устойчивый к пушам отпечаток, потому что отпечаток живёт только в
+# комментарии ДОВЕРЕННОЙ учётки. Если ai-review.yml реально не отвечает
+# (квота/сбой провайдера) — газ уже есть и назван в LABELS.md (`ai:failed`):
+# `gh workflow run ai-review.yml -f pr=N -f force=true` заводит настоящий
+# прогон, который публикует комментарий от github-actions[bot] с реальным
+# отпечатком — тогда keep-путь #252 сработает как задумано на следующем
+# чистом подтягивании. Хендрафченный комментарий этого не даёт никогда.
 TRUSTED_VERDICT_LOGIN = "github-actions[bot]"
 
 
@@ -772,6 +808,47 @@ AI_REVIEW_WORKFLOW_FILE = "ai-review.yml"
 # разойтись молча (yml не читает эту константу — два языка).
 AI_REVIEW_RUN_NAME_PREFIX = "ai-review PR #"
 
+# Потолок возраста для «прогон ai-review.yml летит прямо сейчас» (#779,
+# блокирующая 2 второго гейта): то же число, что `timeout-minutes:` самого
+# job'а review в ai-review.yml — тест
+# test_ai_review_timeout_minutes_matches_review_labels_constant в
+# scripts/review/test_ai_review.py сверяет буквально (yml не читает эту
+# константу — два языка, как и AI_REVIEW_RUN_NAME_PREFIX выше). Без потолка
+# `queued`/`in_progress` читались бы как «летит» сколько угодно долго, хотя
+# GitHub сам оборвёт job по timeout-minutes — окно конечно, а предикат об
+# этом не знал: 40-часовой мнимый «летит» глушил бы разом занятость
+# (other_active_ai_review_runs) и автоповтор (trigger_ai_review), не тратя
+# бюджет попыток, и инвариант 3 (repo_invariants.retry_budget_fact) молчал
+# бы «бюджет ещё есть», хотя двигаться он не может.
+AI_REVIEW_TIMEOUT_MINUTES = 130
+
+
+def parse_github_timestamp(raw: str | None) -> datetime | None:
+    """Единственное место разбора метки времени формата Actions/Issues API
+    (`created_at`) в aware datetime UTC — не бросает исключений наружу
+    (#780, доводка #779). Класс: `datetime.fromisoformat(raw.replace("Z",
+    "+00:00"))` ПАРСИТ метку без offset ("Z"/"+HH:MM") как наивный datetime
+    без ValueError — падение приходит НИЖЕ по коду, на `aware - naive`
+    вычитании/сравнении. До этой правки класс был закрыт по одной копии
+    `except (ValueError, TypeError)` в каждом вызывающем месте
+    (`other_active_ai_review_runs` и `ai_review._verdict_label_and_age`) —
+    второе появилось в этом же PR #779 и сперва ловило только ValueError
+    (находка доводки #780). Копия try/except на каждое новое место —
+    отложенный рецидив (AGENTS.md «одно место правды»): эта функция вместо
+    этого нормализует наивный результат в aware (UTC — Actions/Issues API
+    прод-формой всегда её и подразумевает, #779) и возвращает None на любую
+    строку, которая не разбирается вовсе. Вызывающий трактует None как
+    «метки нет» — ровно то же решение, что раньше принимал `except`."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
 
 def ai_review_run_name(pr: int) -> str:
     """run-name прогона ai-review.yml на PR #pr — зашивается в сам прогон
@@ -786,16 +863,80 @@ def ai_review_run_name(pr: int) -> str:
     return f"{AI_REVIEW_RUN_NAME_PREFIX}{pr}"
 
 
-def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> list[dict]:
+def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func,
+                                 now: datetime | None = None) -> list[dict]:
     """Прогоны `ai-review.yml` (`queued`/`in_progress`) для PR #pr, кроме
-    прогона `exclude_run_id` (себя) — читает ручной `workflow_dispatch`
-    (`ai_review.py::cmd_should_run`), чтобы отказать, если ревью этого PR уже
-    идёт прямо сейчас: второй одновременный прогон денег ждать не должен.
+    прогона `exclude_run_id` (себя) — единственное место правды на «летит ли
+    прогон этого PR прямо сейчас» (#779, критерий 4: третьей копии этой
+    проверки не заводим). Шесть точек вызова читают её же: ручной
+    workflow_dispatch И событийный workflow_run (`ai_review.py::cmd_should_run`,
+    #399 и #779 разрыв 1), `scheduler.py::trigger_ai_review` ПЕРЕД диспатчем
+    (#779 разрыв 2), `scheduler.py::update_branch` (#488),
+    `mechanical_rebase.py` (issue #764, тот же тормоз, что update_branch —
+    не двигаем head механическим рёбейзом, пока по PR летит ai-review.yml) и
+    `repo_invariants.py::retry_budget_fact` (#779, блокирующая 3 — держит ли
+    летящий прогон автоповтор, для инварианта 3) — второй одновременный
+    прогон денег ждать не должен, а подтягивание/рёбейз ветки не должны
+    двигать head из-под летящего ревью.
 
     Не листает глубже одной страницы на статус (`per_page=100`): одновременно
     активных прогонов одного workflow на масштабе этого репозитория ожидается
     единицы, не сотни — при реальном превышении это отдельная, более крупная
-    проблема, которую этот гейт не обязан решать."""
+    проблема, которую этот гейт не обязан решать.
+
+    Потолок возраста (#779, блокирующая 2): прогон старше
+    AI_REVIEW_TIMEOUT_MINUTES по `created_at` летящим не считается — GitHub
+    сам оборвёт такой job по `timeout-minutes` job'а `review` в
+    .github/workflows/ai-review.yml (число сверяется тестом
+    test_ai_review_timeout_minutes_matches_review_labels_constant, не
+    номером строки — тот протухает при вставке строк выше), а без
+    потолка он маскировал бы занятость бесконечно. Отсутствие/битый
+    `created_at` — не повод молча исключить прогон из списка активных (это
+    была бы деградация в обратную сторону, тише про реальную занятость);
+    такой прогон остаётся в списке как раньше.
+
+    `now` — по умолчанию реальное время; параметр существует только для
+    детерминированных тестов потолка (никто из шести вызывающих его не
+    передаёт).
+
+    Неточность потолка для `queued` (не блокирует, названо явно #780,
+    доводка #779): `timeout-minutes` GitHub применяет ко времени ИСПОЛНЕНИЯ
+    job'а (`in_progress`), а не ко времени ожидания в очереди — для
+    `queued`-прогона фраза «GitHub сам оборвёт по timeout-minutes» выше
+    буквально неверна: часы обрыва не идут, пока прогон не стартовал.
+    Практическое окно узкое (concurrency-группа по номеру PR, эта же правка
+    #779, не пускает второй `queued`-прогон дальше одного ждущего, а тот
+    стартует не позже, чем завершится/оборвётся летящий, ограниченный теми
+    же AI_REVIEW_TIMEOUT_MINUTES) — но это довод о практике, не о буквальном
+    смысле `timeout-minutes`, и подменять его текстом «GitHub оборвёт»
+    буквально для обоих статусов сразу — то же самое приближение, которое
+    эта функция обязана называть честно, а не молчать.
+
+    Граница форк-PR (не блокирует, названо явно #779): у форк-PR
+    `pull_requests[0]` пуст, `ai_review_run_name`-фолбэк даёт голый
+    "ai-review" вместо "ai-review PR #N" (см. её докстринг) — тогда ЭТА
+    функция не находит своих же прогонов вовсе (`display_title != target`
+    для любого форк-прогона), то есть на форк-PR выключены ОБА тормоза
+    одновременно: и «прогон уже летит», и очередь concurrency-группы
+    ai-review.yml (та же деградация в fallback, тот же корень). Сегодня
+    форк-PR в репозитории нет (прочёс 1425 прогонов, #779: голые
+    display_title — все ДО внесения run-name, в свежих 600 аномалий ноль,
+    head_repository у всех свой) — граница не устранена, только названа.
+
+    Слепота к статусу `pending` (не блокирует, названо явно #779): Actions
+    API знает статусы `queued`/`in_progress`/`completed`/`waiting`/
+    `requested`/`pending` — эта функция опрашивает только первые два.
+    Concurrency-группа по номеру PR (эта же правка #779) ВПЕРВЫЕ в истории
+    репозитория создаёт `pending`-прогоны (второй триггер того же PR ждёт
+    своей очереди в группе). Для `cmd_should_run` слепота к `pending` делает
+    схему верной: летящий прогон не видит ждущего и спокойно публикует
+    вердикт, ждущий стартует уже в одиночку и отказывает дёшево по
+    отпечатку — на этом слепота и держится, а не вопреки ей. Для трёх
+    других вызывающих (`update_branch`, `mechanical_rebase.py`,
+    `trigger_ai_review`) это то же самое узкое окно, где тормоз не
+    срабатывает: они могут сдвинуть head/задиспатчить повтор, пока
+    `pending`-прогон ждёт своей очереди, невидимый им."""
+    now = now or datetime.now(timezone.utc)
     target = ai_review_run_name(pr)
     matches: list[dict] = []
     for status in ("in_progress", "queued"):
@@ -803,11 +944,19 @@ def other_active_ai_review_runs(repo: str, pr: int, exclude_run_id, gh_func) -> 
             f"repos/{repo}/actions/workflows/{AI_REVIEW_WORKFLOW_FILE}/runs"
             f"?status={status}&per_page=100")
         runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
-        matches.extend(
-            run for run in runs
-            if run.get("display_title") == target
-            and str(run.get("id")) != str(exclude_run_id)
-        )
+        for run in runs:
+            if run.get("display_title") != target:
+                continue
+            if str(run.get("id")) == str(exclude_run_id):
+                continue
+            created_at = run.get("created_at")
+            created = parse_github_timestamp(created_at)
+            # Битая/наивная строка (см. parse_github_timestamp) даёт None —
+            # прогон остаётся в списке активных как раньше, без ValueError/
+            # TypeError наружу (#780, доводка #779).
+            if created is not None and now - created > timedelta(minutes=AI_REVIEW_TIMEOUT_MINUTES):
+                continue  # старше потолка — GitHub оборвёт сам, не блокируем
+            matches.append(run)
     return matches
 
 

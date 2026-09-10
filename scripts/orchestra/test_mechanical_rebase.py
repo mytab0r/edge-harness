@@ -108,7 +108,7 @@ def patch_gh(monkeypatch, fake):
 
 
 def git(*args, cwd):
-    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, f"git {args} упал в {cwd}: {result.stderr}"
     return result.stdout
 
@@ -177,7 +177,7 @@ def clone_workdir(origin: Path, tmp_path: Path) -> Path:
 def branch_tip(origin: Path, branch: str) -> str:
     out = subprocess.run(
         ["git", "rev-parse", f"refs/heads/{branch}"], cwd=origin,
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, encoding="utf-8",
     )
     return out.stdout.strip()
 
@@ -188,7 +188,7 @@ def main_contains(origin: Path, branch: str) -> bool:
     случайно."""
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", "refs/heads/main", f"refs/heads/{branch}"],
-        cwd=origin, capture_output=True, text=True,
+        cwd=origin, capture_output=True, text=True, encoding="utf-8",
     )
     return result.returncode == 0
 
@@ -347,7 +347,7 @@ def test_attempt_rebase_reports_infra_error_not_conflict_when_git_identity_missi
     # raise) — иначе следующий PR очереди наследует чужую паузу рёбейза
     # (issue #764, находка 5, см. тест ensure_clean_repo ниже).
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=work, capture_output=True, text=True
+        ["git", "status", "--porcelain"], cwd=work, capture_output=True, text=True, encoding="utf-8"
     )
     assert status.stdout.strip() == ""
     assert not (work / ".git" / "rebase-merge").exists()
@@ -437,7 +437,7 @@ def test_ensure_clean_repo_recovers_leftover_rebase_state_for_next_pull(tmp_path
         ["git", "checkout", "-B", "agent/604-conflict-d", "origin/agent/604-conflict-d"],
         cwd=work, check=True, capture_output=True,
     )
-    result = subprocess.run(["git", "rebase", "origin/main"], cwd=work, capture_output=True, text=True)
+    result = subprocess.run(["git", "rebase", "origin/main"], cwd=work, capture_output=True, text=True, encoding="utf-8")
     assert result.returncode != 0
     assert (work / ".git" / "rebase-merge").exists() or (work / ".git" / "rebase-apply").exists()
 

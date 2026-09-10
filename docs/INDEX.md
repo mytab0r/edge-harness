@@ -35,8 +35,16 @@
 - [22. Тестовый стек CF](research/22-cf-testing-toolchain.md) — vitest-plugin: изоляция
   хранилища, WebSocket в тестовой петле, rowsWritten, плейсхолдеры DO SQLite.
 - [30. Отвергнутые варианты](research/30-rejected-alternatives.md) — **обязательно к прочтению
-  перед любым предложением по архитектуре.** Двенадцать вариантов с причиной отказа и
+  перед любым предложением по архитектуре.** Семнадцать вариантов с причиной отказа и
   условием, при котором к ним стоит вернуться.
+- [31. «Руки» персистентно или эфемерно](research/31-hands-layer-tradeoffs.md) — развилка
+  по деньгам между текущим Actions, GitHub Codespaces, Cloudflare Containers и
+  self-hosted runner'ом; какие живые механизмы (детектор зависания, предохранитель)
+  каждый вариант убирает, а какие остаются в любом случае.
+- [32. Claude OAuth access-токен как провайдер](research/32-claude-oauth-provider.md) —
+  `llm-pi-ai` детектит `sk-ant-oat` в `apiKey` и сам переключает на Bearer + беты, без
+  loopback-прокси; плагин `dsh-anthropic-oauth-pool` нужен только ради ротации/cooldown
+  нескольких аккаунтов, не ради самого моста.
 - [99. Известные неизвестные](research/99-open-questions.md) — вопросы, на которые ответа нет
   и не будет из документации. Не тратить время на поиск; выяснять замером.
 
@@ -81,6 +89,9 @@
   (GraphQL, heredoc) и границы того, что агент не делает сам.
 - [Реестр меток](agents/LABELS.md) — тормоза конвейера и газы их снятия: это место правды,
   а не примеры.
+- [Реестр использования LLM-провайдеров](agents/LLM-PROVIDER-USAGE.md) — кто (ai-review/
+  worker/hands/морда) какой именованной цепочкой пользуется, генерируется из
+  `config/provider-usage.json` (openspec/changes/llm-provider-usage-manifest, #823).
 - [Roadmap потоков работ](agents/ROADMAP.md) — живая карта параллельных потоков и
   зависимостей (mermaid-гант); детали задач — в пуле Issues.
 

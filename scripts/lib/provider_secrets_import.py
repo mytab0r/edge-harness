@@ -55,6 +55,28 @@ errorCode/backoffLevel. Источник ранга (проба/снимок) в
 
 from __future__ import annotations
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
+# Бутстрап выше настраивает stdout/stderr ОДИН раз, в момент импорта этого
+# файла — для обычного запуска этого достаточно (sys.stdout уже финальный к
+# моменту старта процесса). Но main() держит явный, повторный доступ к тому
+# же ensure_utf8_stdio() (не вторую реализацию — тот же _console_utf8_spec,
+# просто новый экземпляр модуля) и зовёт его ещё раз ПЕРВОЙ строкой main():
+# нужно для случая, когда sys.stdout подменяют ПОСЛЕ импорта (issue #791,
+# тест test_print_report_reconfigures_stdout_to_utf8_on_cp1251_console —
+# прод-форма перехваченного stdout собирается уже после того, как модуль
+# импортирован). Раньше это делала приватная _ensure_utf8_stdout() — теперь
+# тот же эффект даёт повторный вызов канонического хелпера, без второго
+# источника правды на сам механизм reconfigure.
+console_utf8 = importlib.util.module_from_spec(_console_utf8_spec)
+_console_utf8_spec.loader.exec_module(console_utf8)
+
 import argparse
 import datetime
 import http.client
@@ -601,7 +623,7 @@ def gh_repo(explicit: str | None) -> str:
         return repo
     result = subprocess.run(
         ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise LoudError(
@@ -614,7 +636,7 @@ def gh_repo(explicit: str | None) -> str:
 def existing_secret_names(repo: str) -> set[str]:
     result = subprocess.run(
         ["gh", "secret", "list", "--repo", repo, "--json", "name"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh secret list упал: {result.stderr.strip()}")
@@ -624,7 +646,7 @@ def existing_secret_names(repo: str) -> set[str]:
 def existing_variable_names(repo: str) -> set[str]:
     result = subprocess.run(
         ["gh", "variable", "list", "--repo", repo, "--json", "name"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh variable list упал: {result.stderr.strip()}")
@@ -635,7 +657,7 @@ def set_secret(repo: str, name: str, value: str) -> None:
     """Значение — ТОЛЬКО через stdin (--body-file -), никогда через argv."""
     result = subprocess.run(
         ["gh", "secret", "set", name, "--repo", repo, "--body-file", "-"],
-        input=value, text=True, capture_output=True,
+        input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh secret set {name} упал: {result.stderr.strip()}")
@@ -644,7 +666,7 @@ def set_secret(repo: str, name: str, value: str) -> None:
 def set_variable(repo: str, name: str, value: str) -> None:
     result = subprocess.run(
         ["gh", "variable", "set", name, "--repo", repo, "--body-file", "-"],
-        input=value, text=True, capture_output=True,
+        input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise LoudError(f"gh variable set {name} упал: {result.stderr.strip()}")
@@ -985,6 +1007,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Повторный явный вызов (issue #723/#791) — см. комментарий у bootstrap-блока
+    # выше: подхватывает sys.stdout, даже если он был подменён ПОСЛЕ импорта.
+    console_utf8.ensure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if not args.export_file:
@@ -1052,13 +1077,33 @@ def main(argv: list[str] | None = None) -> int:
         except LoudError as error:
             suite_status = f"ОШИБКА записи: {error}"
 
-    print(
-        render_report(
-            selection, secret_status, suite_status, args.apply, export_date,
-            no_probe=args.no_probe, probe_results=probe_results, existing_secrets=existing_secrets,
-            repo=repo,
-        )
+    report = render_report(
+        selection, secret_status, suite_status, args.apply, export_date,
+        no_probe=args.no_probe, probe_results=probe_results, existing_secrets=existing_secrets,
+        repo=repo,
     )
+    try:
+        print(report)
+    except UnicodeEncodeError as error:
+        # Необратимые действия выше (set_secret/set_variable при --apply) УЖЕ
+        # выполнены к этому моменту — сбой ИМЕННО печати отчёта не имеет права
+        # превратить успешную запись в exit 1 (AGENTS.md, «Fail loud, не
+        # silent-wrong»: «работа не выполнена» и «работа выполнена, но отчёт не
+        # показан» — разные факты, лечатся по-разному, подменять один другим
+        # нельзя). console_utf8.ensure_utf8_stdio() выше должен был предотвратить
+        # это на практике (issue #723/#791) — этот except остаётся как гарантия
+        # атомарности кода возврата на случай, если reconfigure недоступен/не
+        # сработал (см. её докстринг), а не как основной путь.
+        #
+        # stderr в CPython по умолчанию errors="backslashreplace" (никогда не
+        # падает на не-ASCII) — сюда уходит и громкое сообщение о сбое печати, и
+        # сам текст отчёта, чтобы факт не потерялся молча.
+        print(
+            f"::error::отчёт не напечатан в stdout ({error}) — секреты/переменная "
+            "выше уже записаны (если был --apply); текст отчёта ниже:",
+            file=sys.stderr,
+        )
+        print(report, file=sys.stderr)
     return 0
 
 

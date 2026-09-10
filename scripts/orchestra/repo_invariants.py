@@ -106,6 +106,27 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      проверяется — судить не о чем. Живой замер на день внедрения — 1
      нарушение (#679, kind=stale) — поэтому наблюдательный, не гейтящий (см.
      CI_GATING ниже и условие возврата в GATING_RELEASE_CONDITION[9]).
+  10. check_recurring_worker_failure (#794) — N подряд прогонов worker.yml
+      упали с ОДНОЙ и той же классифицированной причиной (по факту лога,
+      pulse_guard.last_error_log_line, не по гипотезе). Класс, который
+      failure_watch не ловит по построению (окно свежести 30 минут и дедуп
+      «одна задача на класс», не «сколько раз подряд за много часов») —
+      живой случай: 9 прогонов подряд на сессии harness-257 за 18 часов
+      (порча записи журнала без message.id, #480/#794). Наблюдательный, не
+      гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
+      PR (см. блок-комментарий у самой функции).
+  11. check_provider_usage_manifest (#823, openspec/changes/
+      llm-provider-usage-manifest) — канонический список потребителей
+      LLM-провайдеров (ai-review/worker/hands) обязан иметь в
+      config/provider-usage.json валидное назначение цепочки: запись в
+      .usage, ссылающуюся на непустую цепочку в .chains. Ровно класс,
+      который пропустили с воркером на 72 задачи (#727 -> #797): «у кого-то
+      нет валидного назначения» обязано быть видно раньше инцидента.
+      Гейтящий сразу — чистый файловый скан без сети, детерминированный,
+      ноль нарушений на момент внедрения (манифест только что создан
+      валидным этим же PR). Морда НЕ входит в канонический список
+      (design.md «Потребители»: один слот адаптера, без цепочки
+      принципиально) — её отсутствие в .usage не нарушение.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -154,6 +175,14 @@ docs/agents/OPENSPEC-PROTOCOL.md, раздел про массовую архи�
   python scripts/orchestra/repo_invariants.py             # печать отчёта (repo-ci.yml)
   python scripts/orchestra/repo_invariants.py --orchestra  # печать + escalate (orchestra.yml)
 """
+
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
 
 import argparse
 import importlib.util
@@ -288,7 +317,12 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # (наблюдательный инвариант с нулевым долгом сам не гейтится обратно —
 # возврат держится на памяти): газ здесь назван явно и заранее, не после
 # находки.
-CI_GATING: frozenset[int] = frozenset({7})
+# Инвариант 11 (#823) включён СРАЗУ, тем же доводом, что уже держит 7:
+# чистый файловый скан config/provider-usage.json, без сети, без зависимости
+# от чужого backlog'а — ноль нарушений на момент внедрения (манифест только
+# что создан валидным этим же PR, см. openspec/changes/
+# llm-provider-usage-manifest/tasks.md). Газ — GATING_RELEASE_CONDITION[11].
+CI_GATING: frozenset[int] = frozenset({7, 11})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -325,6 +359,12 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "про газ, а не про то, гейтит ли сейчас 9. 0 нарушений на живом пуле "
        "(python scripts/orchestra/repo_invariants.py, секция [9]) — машинно "
        "проверяемое условие возврата",
+    11: "допиши в config/provider-usage.json недостающую запись .usage.<consumer> "
+        "или почини битую ссылку на .chains — тот же ручной путь, которым "
+        "раньше правился vars.DSH_PROVIDER_CHAIN, до подключения Этапа 2 "
+        "(морда-push, openspec/changes/llm-provider-usage-manifest/tasks.md); "
+        "0 нарушений на живом файле (python scripts/orchestra/repo_invariants.py, "
+        "секция [11]) — машинно проверяемое условие возврата",
 }
 
 
@@ -480,14 +520,29 @@ def retry_budget_fact(repo: str, pr_number: int, anchor: datetime) -> dict:
     это больше не бага) — total > in_epoch означает «часть попыток осталась в
     архиве прошлых эпох, текущая эпоха их не наследует»: живой случай
     #329/#327, 2026-09-06, issue #472, где total уже был равен лимиту, а
-    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет»."""
+    in_epoch — 0, читается теперь как «текущей эпохе есть свежий бюджет».
+
+    held_back_by_run — третье состояние (#779, блокирующая 3): бюджет ещё
+    есть (attempts_in_epoch < лимита), но scheduler.trigger_ai_review САМ
+    придерживает автоповтор, потому что прогон ai-review.yml для этого PR
+    прямо сейчас летит (та же review_labels.other_active_ai_review_runs, что
+    читает газ #196 перед диспатчем, #779 разрыв 2 — третьей копии предиката
+    не заводим). До этого поля stuck_gate_fact_line писала «должен сработать
+    на ближайшем тике оркестратора» безусловно — после #779 это стало ложным
+    именно в этом состоянии: тик видит летящий прогон и делает continue, не
+    трогая бюджет, а инвариант 3 (единственная страховка, которая ещё
+    смотрит на это состояние) утверждал бы человеку неверное — тот самый
+    класс #472, который эта строка была написана закрыть."""
     attempt_times = sorted(issue_marker_times(repo, pr_number, AI_REVIEW_RETRY_MARKER))
     attempts_in_epoch = sum(1 for moment in attempt_times if moment >= anchor)
+    active = review_labels.other_active_ai_review_runs(
+        repo, pr_number, exclude_run_id=None, gh_func=gh)
     return {
         "attempts_total": len(attempt_times),
         "attempts_in_epoch": attempts_in_epoch,
         "attempts_limit": AI_REVIEW_MAX_ATTEMPTS,
         "last_attempt_at": attempt_times[-1].isoformat() if attempt_times else None,
+        "held_back_by_run": active[0]["id"] if active else None,
     }
 
 
@@ -603,14 +658,43 @@ def stuck_gate_fact_line(item: dict) -> str:
     API (логи прогона) на КАЖДЫЙ застрявший PR каждые 15 минут — новый,
     дорогой класс вызовов, который эта задача сознательно не заводит (см.
     issue #472, экономия квоты GitHub API — она же сегодня отжирала себя у
-    чужих обязательных проверок)."""
+    чужих обязательных проверок).
+
+    Третье состояние budget (#779, блокирующая 3): бюджет ещё есть, но
+    `held_back_by_run` (retry_budget_fact) называет прогон ai-review.yml,
+    который сейчас летит и придерживает автоповтор — «должен сработать на
+    ближайшем тике»/«должен сработать сам» здесь были бы неверны (тик видит
+    занятость и делает continue, не трогая бюджет). Проверка `held_back_by_run`
+    обязана стоять в ОБЕИХ ветках, где бюджет ещё не исчерпан — `total < limit`
+    и сестринской `total >= limit and in_epoch < limit` (перенос попыток из
+    прошлой, уже решённой эпохи, #431/issue #472) — иначе вторая ветка молча
+    остаётся с прежней ложью ровно того же класса #472, который эта строка
+    была написана закрыть (живой случай #472/#329/#327: total уже был равен
+    лимиту, in_epoch — 0)."""
     total = item["attempts_total"]
     in_epoch = item["attempts_in_epoch"]
     limit = item["attempts_limit"]
+    held_back_by_run = item.get("held_back_by_run")
     if total < limit:
-        budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
+        if held_back_by_run is not None:
+            budget = (
+                f"есть ({total}/{limit}), но автоповтор придержан летящим прогоном "
+                f"run {held_back_by_run} — сработает сам, когда тот освободится"
+            )
+        else:
+            budget = f"не исчерпан ({total}/{limit}) — должен сработать на ближайшем тике оркестратора"
     elif in_epoch >= limit:
         budget = f"исчерпан в этой же эпохе ({total}/{limit})"
+    elif held_back_by_run is not None:
+        # total >= limit, in_epoch < limit, но летит прогон — тот же перенос
+        # бюджета из прошлой эпохи (см. else ниже), только с придержанным
+        # автоповтором: «должен сработать сам» здесь тоже было бы ложью.
+        budget = (
+            f"попытки только в прошлых эпохах ({total}/{limit} за всю историю), "
+            f"в текущей бюджет есть ({in_epoch}/{limit}), но автоповтор придержан "
+            f"летящим прогоном run {held_back_by_run} — сработает сам, когда тот "
+            "освободится"
+        )
     else:
         # total >= limit, но in_epoch < limit: попытки только в прошлых,
         # уже решённых эпохах (#431 — бюджет НЕ переносится между эпохами по
@@ -1295,6 +1379,155 @@ def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
     return task_deps.fetch_pool(repo, label=TASK_LABEL, include_body=True, gh_call=gh)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 10 (#794): N ПОДРЯД прогонов worker.yml провалились с ОДНОЙ и той
+# же классифицированной причиной — класс, который failure_watch (pulse_guard)
+# не ловит по построению: её окно свежести — FAILURE_WATCH_WINDOW_MINUTES (30
+# минут) и дедуп «одна задача на класс, пока не закрыта», а не «сколько раз
+# подряд повторилось за много часов». Дважды упавший предохранитель одного и
+# того же класса на живом инциденте (#794): worker.yml падал девять прогонов
+# подряд на сессии harness-257 с 2026-09-08 08:45Z по 2026-09-09 02:08Z
+# (18 часов) — «стороживший сторожа» pulse_guard.decide_gate_state сам ставит
+# паузу и шлёт первый алерт с фактом (last_failure_error) уже на третьем
+# провале (WORKER_FAILURE_PAUSE_AFTER), но дальше молчит между пробами с
+# растущей выдержкой (probe_backoff_minutes) — та же причина тянется часами
+# без НОВОГО, видимого в отчёте repo_invariants (репо-ci.yml/orchestra.yml)
+# факта «серия всё ещё не разобрана». Этот инвариант — не дублирует паузу
+# диспатча (decide_dispatch/decide_gate_state там же остаются единственным
+# местом правды на САМ подсчёт серии — count_consecutive_failures
+# переиспользуется, не копируется), а даёт этому же факту ВТОРУЮ поверхность,
+# не подверженную маркерному дедупу пульса: строку в build_report, которую
+# видит и repo-ci.yml на каждом PR, и периодический шаг orchestra.yml.
+#
+# Наблюдательный, не в CI_GATING: нарушение зависит от истории прогонов
+# worker.yml, не от диффа текущего PR — гейтить им PR означало бы красить
+# чужой PR за чужую, уже идущую серию (тот же класс «тормоз без газа», что
+# уже отвёл 1/4/5/9 от немедленного гейта, см. докстринг модуля).
+# ══════════════════════════════════════════════════════════════════════════
+
+RECURRING_FAILURE_WORKFLOW = pulse_guard.WORKER_WORKFLOW  # "worker.yml" — резюмирует сессию harness-<N>, не чужой workflow
+# Тот же порог, что уже красит предохранитель диспатча (pulse_guard.
+# WORKER_FAILURE_PAUSE_AFTER) — не новое число без прецедента: если
+# диспатч-фьюз уже решил, что серия достаточно длинна для паузы, этот
+# инвариант обязан согласиться, не спорить своим порогом.
+RECURRING_FAILURE_STREAK_THRESHOLD = pulse_guard.WORKER_FAILURE_PAUSE_AFTER
+# Одна страница с запасом над порогом — тот же компромисс по цене API, что
+# уже держат FAILURE_WATCH_PER_PAGE/recent_runs(per_page=10) у соседей; серия
+# #794 длиной 9 всё ещё влезает с запасом.
+RECURRING_FAILURE_RUNS_TO_SCAN = 20
+
+
+def check_recurring_worker_failure(repo: str) -> list[dict]:
+    """Нарушение — RECURRING_FAILURE_STREAK_THRESHOLD или больше самых свежих
+    завершённых прогонов RECURRING_FAILURE_WORKFLOW подряд провалились
+    (pulse_guard.FAILURE_CONCLUSIONS) с ОДНИМ И ТЕМ ЖЕ классифицированным
+    отпечатком причины (pulse_guard.failure_fingerprint по первому упавшему
+    job'у, pulse_guard.last_error_log_line — тот же факт, не гипотеза, что уже
+    несёт last_failure_error). Первый success, первый незавершённый прогон
+    ИЛИ смена отпечатка обрывают серию — считаем именно «сколько подряд с
+    ОДНОЙ причиной», не просто «сколько подряд красных» (это число уже
+    отдельно считает pulse_guard.count_consecutive_failures для паузы
+    диспатча).
+
+    Дешёвый путь в здоровом состоянии: один запрос списка прогонов; если
+    первый же прогон не упал (обычный случай), функция возвращает [] без
+    единого запроса лога/job'а. Сеть недоступна/квота — best-effort: [] (тот
+    же принцип, что last_failure_error/last_error_log_line — отсутствие
+    детали не должно ронять весь build_report ради инварианта, у которого и
+    так нет действия ЖЁСТЧЕ наблюдения)."""
+    try:
+        runs = pulse_guard.recent_runs(repo, RECURRING_FAILURE_WORKFLOW, per_page=RECURRING_FAILURE_RUNS_TO_SCAN)
+    except RuntimeError:
+        return []
+    runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
+
+    streak_fingerprint: str | None = None
+    streak_job_name: str | None = None
+    streak_error_text: str | None = None
+    streak_runs: list[dict] = []
+    for run in runs:
+        if run.get("conclusion") not in pulse_guard.FAILURE_CONCLUSIONS:
+            break  # success/None — серия «подряд» обрывается здесь, не позже
+        try:
+            bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
+        except RuntimeError:
+            break  # деталь недоступна — честнее оборвать серию, чем гадать
+        if not bad_jobs:
+            break
+        job = bad_jobs[0]
+        job_id = job.get("id")
+        error_text = pulse_guard.last_error_log_line(repo, job_id) if job_id else None
+        if not error_text:
+            break  # без факта — не классифицируем (тот же принцип, что failure_watch)
+        fingerprint = pulse_guard.failure_fingerprint(
+            RECURRING_FAILURE_WORKFLOW, job.get("name", ""), error_text)
+        if streak_fingerprint is None:
+            streak_fingerprint = fingerprint
+            streak_job_name = job.get("name", "")
+            streak_error_text = error_text
+        elif fingerprint != streak_fingerprint:
+            break  # причина сменилась — это уже другая серия
+        streak_runs.append(run)
+
+    if len(streak_runs) < RECURRING_FAILURE_STREAK_THRESHOLD:
+        return []
+    return [{
+        "workflow": RECURRING_FAILURE_WORKFLOW,
+        "job_name": streak_job_name,
+        "error_text": streak_error_text,
+        "streak": len(streak_runs),
+        "since": streak_runs[-1].get("created_at"),
+        "until": streak_runs[0].get("updated_at"),
+        "latest_run_url": streak_runs[0].get("html_url"),
+    }]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 11: манифест использования LLM-провайдеров (#823)
+# ══════════════════════════════════════════════════════════════════════════
+
+_PU_SPEC = importlib.util.spec_from_file_location(
+    "collect_provider_usage", REPO_ROOT / "scripts" / "lib" / "collect_provider_usage.py")
+collect_provider_usage = importlib.util.module_from_spec(_PU_SPEC)
+_PU_SPEC.loader.exec_module(collect_provider_usage)  # type: ignore[union-attr]
+
+PROVIDER_USAGE_MANIFEST = REPO_ROOT / "config" / "provider-usage.json"
+
+
+def check_provider_usage_manifest(manifest_path: Path = PROVIDER_USAGE_MANIFEST) -> list[dict]:
+    """Инвариант 11 (задача #823, openspec/changes/llm-provider-usage-manifest):
+    каждый потребитель канонического списка (collect_provider_usage.CONSUMERS —
+    ai-review/worker/hands, ОДНО место правды со сборщиком таблицы видимости,
+    docs/agents/LLM-PROVIDER-USAGE.md) обязан иметь в config/provider-usage.json
+    валидное назначение: запись в .usage, ссылающуюся на непустую цепочку в
+    .chains. Ровно класс, который пропустили с воркером на 72 задачи
+    (#727 -> #797, proposal.md «Problem») — «у кого-то нет валидного
+    назначения» обязано быть видно здесь, не только когда сам job на прогоне
+    упадёт на dsh_require_provider_chain (scripts/lib/dsh-ci.sh — та же
+    проверка, но во время исполнения, не на push/pull_request).
+
+    Манифеста нет вовсе — это НЕ нарушение самого инварианта (переходный
+    период, design.md «Потребители»: файл может отсутствовать при частичном
+    внедрении/локальном клоне) — возвращает один синтетический элемент
+    kind="no_manifest", видимый в отчёте, но такой отчёт вызывающий обязан
+    решить, гейтить ли (см. build_report ниже — печатает как факт, не
+    прерывает остальные инварианты). Морда НЕ входит в канонический список
+    (design.md: один слот адаптера, без цепочки принципиально)."""
+    manifest = collect_provider_usage.load_manifest(manifest_path)
+    if manifest is None:
+        return [{"kind": "no_manifest", "path": str(manifest_path)}]
+    violations = []
+    for consumer in collect_provider_usage.CONSUMERS:
+        entry = collect_provider_usage.resolve_consumer(manifest, consumer)
+        if entry["state"] == "missing":
+            violations.append({"kind": "missing", "consumer": consumer})
+        elif entry["state"] == "dangling":
+            violations.append({
+                "kind": "dangling", "consumer": consumer, "chain_name": entry["chain_name"],
+            })
+    return violations
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -1459,6 +1692,37 @@ def build_report(repo: str, now: datetime,
         findings[9] = []
         lines.append("⏭️ [9] не проверено на периодическом пульсе (дорогой фетч тел пула "
                       "прижат к push/PR, где уже стоят declared_deps wire/check — #454/#711)")
+
+    v10 = check_recurring_worker_failure(repo)
+    findings[10] = v10
+    if v10:
+        for item in v10:
+            lines.append(
+                f"🚨 [10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
+                f"одной причиной, с {item['since']} по {item['until']} (job "
+                f"«{item['job_name']}»): {item['error_text']} — последний прогон "
+                f"{item['latest_run_url']}"
+            )
+    else:
+        lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
+                      f"провалов {RECURRING_FAILURE_WORKFLOW} с одной причиной")
+
+    v11 = check_provider_usage_manifest()
+    if v11 and v11[0].get("kind") == "no_manifest":
+        findings[11] = []
+        lines.append(f"⏭️ [11] {v11[0]['path']} не найден — манифест использования "
+                      f"провайдеров ещё не подключён на этом checkout'е (переходный период)")
+    else:
+        findings[11] = v11
+        if v11:
+            lines.append(f"🚨 [11] {len(v11)} потребителей LLM-провайдеров без валидного назначения (#823):")
+            for item in v11:
+                if item["kind"] == "missing":
+                    lines.append(f"   — {item['consumer']}: нет записи в .usage")
+                else:
+                    lines.append(f"   — {item['consumer']}: .usage ссылается на несуществующую/пустую цепочку '{item['chain_name']}'")
+        else:
+            lines.append("💚 [11] у всех потребителей манифеста (ai-review/worker/hands) есть валидное назначение цепочки")
 
     return lines, findings
 

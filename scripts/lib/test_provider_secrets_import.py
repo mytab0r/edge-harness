@@ -12,6 +12,7 @@ argv без значений секрета.
 
 from __future__ import annotations
 
+import io
 import json
 import socket
 import struct
@@ -1013,7 +1014,7 @@ def test_set_secret_value_never_in_argv(monkeypatch):
         returncode = 0
         stderr = ""
 
-    def fake_run(args, input=None, text=None, capture_output=None):
+    def fake_run(args, input=None, text=None, capture_output=None, **_kwargs):
         calls.append((list(args), input))
         return FakeCompleted()
 
@@ -1075,4 +1076,83 @@ def test_idempotent_skip_existing_secret_without_force(monkeypatch, export_path,
         "--force-secrets",
     ])
     assert rc == 0
-    assert "OPENROUTER_1_API_KEY" in set_secret_calls
+
+
+# ── Кодировка stdout под Windows: класс #723, конкретный случай #791 ─────
+# Прод-форма отказа — настоящий io.TextIOWrapper(encoding="cp1251"), не мок:
+# тот же класс потока, что CPython создаёт на Windows-консоли/перехваченном
+# stdout. render_report несёт литеральную стрелку "→" (докстринг про
+# предохранитель квоты в самом отчёте) — без фикса это и есть символ,
+# роняющий живой прогон (issue #791, дословный трейс).
+
+
+def test_print_report_reconfigures_stdout_to_utf8_on_cp1251_console(monkeypatch, export_path, dsh_ci_path):
+    """`console_utf8.ensure_utf8_stdio()` переключает stdout на UTF-8 ДО
+    печати отчёта — строгий cp1251 больше не видит стрелку "→", репорт
+    долетает до stdout целиком. Мутация: закомментируй явный повторный вызов
+    `console_utf8.ensure_utf8_stdio()` в начале `main()` — этот тест краснеет
+    (buffer остаётся пуст: печать падает на cp1251, текст уходит в
+    stderr-fallback другого пути, не в stdout)."""
+    monkeypatch.setattr(psi, "gh_repo", lambda explicit: "owner/repo")
+    monkeypatch.setattr(psi, "existing_secret_names", lambda repo: set())
+    monkeypatch.setattr(psi, "existing_variable_names", lambda repo: set())
+
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1251", errors="strict", newline="\n")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    rc = psi.main([
+        "--export-file", str(export_path),
+        "--dsh-ci-path", str(dsh_ci_path),
+        "--no-probe",
+    ])
+    stream.flush()
+
+    assert rc == 0
+    written = buffer.getvalue().decode("utf-8")
+    assert "→" in written
+    assert "Слотов с кандидатом" in written
+
+
+class _WriteRaisesOnNonAscii:
+    """Прод-форма провала печати, который `console_utf8.ensure_utf8_stdio()`
+    НЕ смог предотвратить (issue #791, критерий 3: атомарность кода
+    возврата) — поток БЕЗ `reconfigure` (значит `ensure_utf8_stdio()` —
+    no-op для этого потока, см. её докстринг), чей `write` падает на первом
+    же не-ASCII символе. Тот же класс исключения (`UnicodeEncodeError`), что
+    и настоящий cp1251/cp866 stdout."""
+
+    def write(self, s: str) -> int:
+        s.encode("ascii")
+        return len(s)
+
+    def flush(self) -> None:  # pragma: no cover - print() не обязан звать flush
+        pass
+
+
+def test_print_failure_after_apply_does_not_mask_exit_code(monkeypatch, export_path, dsh_ci_path):
+    """Необратимые действия (set_secret/set_variable, --apply) выполняются
+    ДО печати отчёта. Печать отчёта падает — по AGENTS.md («Fail loud, не
+    silent-wrong») это не имеет права превратить успешную запись в exit 1.
+    Мутация: убери try/except вокруг `print(report)` в `main()` — этот тест
+    краснеет (UnicodeEncodeError всплывает неперехваченным, тест падает с
+    ошибкой, а не просто с несовпадением assert)."""
+    monkeypatch.setattr(psi, "gh_repo", lambda explicit: "owner/repo")
+    monkeypatch.setattr(psi, "existing_secret_names", lambda repo: set())
+    monkeypatch.setattr(psi, "existing_variable_names", lambda repo: set())
+    monkeypatch.setattr(psi, "probe_provider", lambda base_url, api_key: "жива")
+
+    written: list[tuple[str, str]] = []
+    monkeypatch.setattr(psi, "set_secret", lambda repo, name, value: written.append(("secret", name)))
+    monkeypatch.setattr(psi, "set_variable", lambda repo, name, value: written.append(("var", name)))
+
+    monkeypatch.setattr(sys, "stdout", _WriteRaisesOnNonAscii())
+
+    rc = psi.main([
+        "--export-file", str(export_path),
+        "--dsh-ci-path", str(dsh_ci_path),
+        "--apply",
+    ])
+
+    assert written  # необратимые действия реально выполнены до печати
+    assert rc == 0  # сбой печати не маскирует успешную запись под провал

@@ -26,6 +26,29 @@ DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WO
 PLUGINS_SUITE_COMBO_ASSET="dsh-combo-suite-0.1.0.tgz"
 PLUGINS_SUITE_OAUTH_ASSET="dsh-anthropic-oauth-pool-0.1.0.tgz"
 
+# Быстрый провайдер Claude — anthropic-oauth-pool НЕЗАВИСИМО от suite (#838).
+# vars.PLUGINS_SUITE_URL снята вместе со сломанным combo-router (#790,
+# NO_COMBO_ROUTE без газа) — но dsh-anthropic-oauth-pool САМОДОСТАТОЧЕН (свой
+# loopback-прокси, свой failover между аккаунтами) и от combo-router не
+# зависит. Ассет — ТОТ ЖЕ tgz, что уже публикует suite
+# (PLUGINS_SUITE_OAUTH_ASSET выше, не дублируем имя файла); тег релиза —
+# отдельный литеральный пин, не vars.PLUGINS_SUITE_URL (та переменная вернула
+# бы в проводку сломанный combo-router). Пин версии — тот же ритуал, что
+# DSH_VERSION/DSH_HEADLESS_VERSION выше: правится здесь при следующей сборке
+# плагина владельцем.
+ANTHROPIC_OAUTH_POOL_RELEASE="dsh-plugins-suite-v1"
+
+# Секреты аккаунтов Claude — JSON ЦЕЛИКОМ в значении секрета, формат
+# ~/.claude/.credentials.json (lib/accounts.js::importAccount плагина):
+# {"claudeAiOauth": {"accessToken": "...", "refreshToken": "...", ...}}.
+# Список — одно место правды для id секретов и порождаемых id аккаунтов пула
+# (anthropic-1/anthropic-2, позиционно). Газ подключения пула — наличие ХОТЯ
+# БЫ ОДНОГО из этих секретов, не отдельная vars-переменная (design.md
+# anthropic-oauth-pool-standalone, «Гейт активации»): секрет уже несёт весь
+# нужный сигнал, второй переключатель поверх него дублировал бы факт и мог
+# рассинхрониться с ним.
+ANTHROPIC_OAUTH_ACCOUNT_SECRETS=(ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2)
+
 # vars.PLUGINS_SUITE_URL — имя переменной унаследовано от design.md/tasks.md
 # dsh-in-job (объявлено ещё до решения о механизме публикации), но её
 # ЗНАЧЕНИЕ — тег релиза ЭТОГО репозитория, не сырой URL: скачивание идёт
@@ -48,14 +71,25 @@ dsh_require_plugins_suite_repo() {
 # владелец расширяет ротацию добавлением секрета с этим именем, без правки
 # кода (одно место правды — этот список).
 # Формат: "alias|baseURL|apiKeyEnvVar|model|contextWindow|displayName"
+# Model id ниже (кроме zai-1, не менялся) подтверждены ЖИВЫМ discovery
+# (scripts/measure/provider_model_discovery.py, #848) 2026-09-09: листинг
+# /v1/models + живая верификация chat/completions (HTTP 200) на прогоне
+# provider-latency-bench.yml (run 34415529070). Прежние значения
+# (anthropic/claude-sonnet-4.6 у OpenRouter — платная модель не того тарифа;
+# qwen3-coder:480b-cloud у Ollama Cloud — 410 Gone; deepseek-ai/deepseek-v3.2
+# у NVIDIA NIM — 404) не были сверены с реальным каталогом при заведении
+# (#215) и не отвечали на completions-пути (живой замер #836, run
+# 34406807344). Дрейф версии у вендора — ожидаемый класс (см. комментарий у
+# CODING_RANK_KEYWORDS в discovery-скрипте) — при повторном 404/410 сначала
+# пере-сверить discovery, не переписывать id по памяти/примеру.
 PLUGINS_SUITE_CANDIDATE_ROUTES=(
-  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 1"
-  "openrouter-2|https://openrouter.ai/api/v1|OPENROUTER_2_API_KEY|anthropic/claude-sonnet-4.6|200000|OpenRouter account 2"
-  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 1"
-  "ollama-cloud-2|https://ollama.com/v1|OLLAMA_CLOUD_2_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 2"
-  "ollama-cloud-3|https://ollama.com/v1|OLLAMA_CLOUD_3_API_KEY|qwen3-coder:480b-cloud|262144|Ollama Cloud account 3"
-  "nvidia-nim-1|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_1_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 1"
-  "nvidia-nim-2|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_2_API_KEY|deepseek-ai/deepseek-v3.2|131072|NVIDIA NIM account 2"
+  "openrouter-1|https://openrouter.ai/api/v1|OPENROUTER_1_API_KEY|nvidia/nemotron-3-super-120b-a12b:free|262144|OpenRouter account 1"
+  "openrouter-2|https://openrouter.ai/api/v1|OPENROUTER_2_API_KEY|nvidia/nemotron-3-super-120b-a12b:free|262144|OpenRouter account 2"
+  "ollama-cloud-1|https://ollama.com/v1|OLLAMA_CLOUD_1_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 1"
+  "ollama-cloud-2|https://ollama.com/v1|OLLAMA_CLOUD_2_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 2"
+  "ollama-cloud-3|https://ollama.com/v1|OLLAMA_CLOUD_3_API_KEY|nemotron-3-ultra|262144|Ollama Cloud account 3"
+  "nvidia-nim-1|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_1_API_KEY|deepseek-ai/deepseek-v4-pro-0813|131072|NVIDIA NIM account 1"
+  "nvidia-nim-2|https://integrate.api.nvidia.com/v1|NVIDIA_NIM_2_API_KEY|deepseek-ai/deepseek-v4-pro-0813|131072|NVIDIA NIM account 2"
   "zai-1|https://api.z.ai/api/coding/paas/v4|ZAI_1_API_KEY|glm-5|202752|Z.AI Coding Plan"
 )
 
@@ -243,6 +277,191 @@ dsh_mount_plugins_suite() { # $1 — профиль (headless)
   echo "::endgroup::"
 }
 
+# ── Быстрый провайдер Claude: anthropic-oauth-pool, независимо от suite ─────
+# (#838, design.md anthropic-oauth-pool-standalone). НЕ читает
+# vars.PLUGINS_SUITE_URL и не трогает DSH_PLUGINS_SUITE_*-переменные —
+# отдельный набор DSH_ANTHROPIC_POOL_*, гейт — секреты аккаунтов, не vars.
+#
+# ТОЛЬКО скачивание+проверка+распаковка, ни одной команды `dsh` — тот же
+# принцип разделения, что у dsh_install_plugins_suite/dsh_mount_plugins_suite
+# выше. Ни один секрет ANTHROPIC_OAUTH_ACCOUNT_SECRETS не задан → notice,
+# return 0, DSH_ANTHROPIC_POOL_ACTIVE=0 — поведение как раньше (одиночный
+# провайдер/цепочка), симметрично критерию 4 #215, только газ — секрет.
+#
+# Распаковываем tgz В ДОПОЛНЕНИЕ к сохранению самого файла (для dsh plugin
+# add): импорт аккаунтов (dsh_import_anthropic_accounts ниже) зовёт
+# bin/dsh-anthropic-pool.js напрямую через node, а не через бинарник
+# dsh-anthropic-pool, который `dsh plugin add` может не выставить в PATH
+# (README плагина честно предупреждает об этом же).
+dsh_install_anthropic_pool() { # $1 — рабочий каталог
+  local dir=$1 secret_name has_secret=0
+  DSH_ANTHROPIC_POOL_ACTIVE=0
+  DSH_ANTHROPIC_POOL_PKG=""
+  DSH_ANTHROPIC_POOL_EXTRACTED=""
+  for secret_name in "${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[@]}"; do
+    [ -n "${!secret_name:-}" ] && has_secret=1
+  done
+  if [ "$has_secret" != 1 ]; then
+    echo "::notice::быстрый провайдер Claude (anthropic-oauth-pool) не подключён: ни один из секретов ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]} не задан — используется цепочка/одиночный провайдер как раньше (#838)"
+    return 0
+  fi
+  dsh_require_plugins_suite_repo
+  mkdir -p "$dir"
+  echo "::group::Скачивание dsh-anthropic-oauth-pool (релиз ${ANTHROPIC_OAUTH_POOL_RELEASE}, #838)"
+  local base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${ANTHROPIC_OAUTH_POOL_RELEASE}"
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$PLUGINS_SUITE_OAUTH_ASSET" "$base/$PLUGINS_SUITE_OAUTH_ASSET"; then
+    echo "::error::ассет $PLUGINS_SUITE_OAUTH_ASSET недоступен ($base/$PLUGINS_SUITE_OAUTH_ASSET) — быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dir/$PLUGINS_SUITE_OAUTH_ASSET.sha256" "$base/$PLUGINS_SUITE_OAUTH_ASSET.sha256"; then
+    echo "::error::в релизе ${ANTHROPIC_OAUTH_POOL_RELEASE} нет ${PLUGINS_SUITE_OAUTH_ASSET}.sha256 — целостность не проверить, быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! (cd "$dir" && sha256sum -c "$PLUGINS_SUITE_OAUTH_ASSET.sha256"); then
+    echo "::error::sha256 $PLUGINS_SUITE_OAUTH_ASSET не сошёлся с $PLUGINS_SUITE_OAUTH_ASSET.sha256 — возможна подмена релиза или неполная закачка (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  local extract_dir="$dir/anthropic-oauth-pool-extracted"
+  mkdir -p "$extract_dir"
+  if ! tar -xzf "$dir/$PLUGINS_SUITE_OAUTH_ASSET" -C "$extract_dir"; then
+    echo "::error::tar не распаковал $PLUGINS_SUITE_OAUTH_ASSET (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  if [ ! -f "$extract_dir/package/bin/dsh-anthropic-pool.js" ]; then
+    echo "::error::в $PLUGINS_SUITE_OAUTH_ASSET не нашёлся package/bin/dsh-anthropic-pool.js — форма ассета изменилась, быстрый провайдер Claude не установился (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  DSH_ANTHROPIC_POOL_PKG="$dir/$PLUGINS_SUITE_OAUTH_ASSET"
+  DSH_ANTHROPIC_POOL_EXTRACTED="$extract_dir/package"
+  DSH_ANTHROPIC_POOL_ACTIVE=1
+  echo "быстрый провайдер Claude (anthropic-oauth-pool) скачан и проверен (sha256 ок)"
+  echo "::endgroup::"
+}
+
+# Импорт аккаунтов из секретов (#838) — вызывать ПОСЛЕ dsh_install_anthropic_pool
+# (нужен DSH_ANTHROPIC_POOL_EXTRACTED), в любой момент до первого прогона dsh:
+# bin/dsh-anthropic-pool.js пишет напрямую в ~/.dsh/anthropic-accounts (lib/
+# accounts.js::poolDir, по умолчанию $HOME) — тот же $HOME, что видит
+# смонтированный плагин в этом job'е, порядок относительно монтажа не важен.
+#
+# Значение секрета НИКОГДА не печатается и не проходит через echo/интерполяцию
+# в аргументы команды — только файл mode 0600 (AGENTS.md, «Секреты»: репозиторий
+# публичный, производное секрета GitHub не маскирует). id аккаунта — позиционный
+# (anthropic-1 для ANTHROPIC_OAUTH_1, anthropic-2 для ANTHROPIC_OAUTH_2).
+#
+# unset КАЖДОГО секрета после использования — НЕ просто гигиена. Имена
+# ANTHROPIC_OAUTH_1/2 (заданы владельцем, не переименовываются здесь) не
+# содержат подстрок *_KEY/*_TOKEN/*_SECRET — паттерна, которым DSH вырезает
+# переменные из окружения ПОДПРОЦЕССОВ, запускаемых shell-тулом самой модели
+# (см. комментарий в scripts/review/ai_dsh.sh, «Доверенная граница задачи
+# #18»: DEEPSEEK_API_KEY УЖЕ полагается на этот паттерн, ANTHROPIC_OAUTH_1/2 —
+# НЕТ). ai-review запускает `dsh` над НЕДОВЕРЕННЫМ диффом PR без GH_TOKEN
+# ИМЕННО чтобы агент не мог ничего слить наружу через свой же shell-тул —
+# живой OAuth-JSON (accessToken/refreshToken) в этом окружении был бы
+# читаем `env`/`printenv` изнутри агента, если бы остался в процессе `dsh`
+# дольше момента импорта. Импорт (dsh-anthropic-pool add, отдельный
+# `node`-процесс) уже прочитал значение и записал его в файл на диске —
+# после этого секрет из окружения ЭТОГО bash-процесса (и, следовательно, из
+# окружения любого дочернего `dsh`, стартующего позже) больше не нужен.
+#
+# Изоляция битого аккаунта (#859, живой инцидент PR #858, 2026-09-10): в
+# ANTHROPIC_OAUTH_1 попал ведущий UTF-8 BOM (EF BB BF) — `node ... add`
+# падал SyntaxError ДО того, как строка дошла до JSON.parse, старая версия
+# этой функции отвечала return 1 и роняла ВЕСЬ шаг ai-review дважды подряд,
+# хотя цепочка из 7 живых провайдеров (config/provider-usage.json) рядом и
+# рабочая. Пул — НЕ критичный провайдер (design.md
+# anthropic-oauth-pool-standalone): один битый секрет обязан быть пропущен с
+# внятным ::warning::, а не ронять потребителя. BOM снимается здесь же, у
+# единственного места, где секрет читается как JSON. Разбор/валидация идут
+# через jq ЗДЕСЬ, в bash, а не полагаются на текст stderr node — так лог не
+# рискует напечатать производное секрета (AGENTS.md «Секреты»: GitHub
+# маскирует только точное совпадение значения).
+dsh_import_anthropic_accounts() {
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Импорт аккаунтов Anthropic OAuth pool (#838)"
+  local secret_name value creds_file imported=0 skipped=0 idx=0 account_id
+  for secret_name in "${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[@]}"; do
+    idx=$((idx + 1))
+    account_id="anthropic-$idx"
+    value="${!secret_name:-}"
+    if [ -z "$value" ]; then
+      continue
+    fi
+    # Снять ведущий UTF-8 BOM (EF BB BF), если он есть — живая форма
+    # инцидента #859. Байтовый префикс, не зависит от locale.
+    value="${value#$'\xef\xbb\xbf'}"
+
+    if ! jq -e . >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — невалидный JSON (даже после снятия BOM), аккаунт $account_id пропущен, пул продолжает с остальными аккаунтами/цепочкой (#859)"
+      unset "$secret_name"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | (($o.accessToken // "") | length > 0) and (($o.refreshToken // "") | length > 0)' >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken/refreshToken, аккаунт $account_id пропущен (#859)"
+      unset "$secret_name"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    creds_file=$(mktemp)
+    chmod 600 "$creds_file"
+    printf '%s' "$value" >"$creds_file"
+    if ! node "$DSH_ANTHROPIC_POOL_EXTRACTED/bin/dsh-anthropic-pool.js" add "$account_id" "$creds_file" >/dev/null 2>&1; then
+      # Защитная ветка: базовая проверка выше уже отсекла BOM/невалидный
+      # JSON/отсутствующие поля — сюда попадает то, что jq не проверяет
+      # (например safeId плагина). Тот же приём: пропустить, не падать.
+      rm -f "$creds_file"
+      unset "$secret_name"
+      echo "::warning::dsh-anthropic-pool add $account_id отказал, хотя секрет $secret_name прошёл базовую проверку — аккаунт пропущен, пул продолжает (#859)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    rm -f "$creds_file"
+    unset "$secret_name"
+    imported=$((imported + 1))
+    echo "аккаунт $account_id импортирован из секрета $secret_name (значение удалено из окружения)"
+  done
+  if [ "$imported" = 0 ]; then
+    # Раньше считалось недостижимым (dsh_install_anthropic_pool уже проверил
+    # has_secret) — теперь достижимо: has_secret проверяет только непустоту,
+    # не валидность. Все секреты оказались битыми (skipped>0) — пул тихо
+    # отключается для ЭТОГО прогона, потребитель уходит на цепочку/одиночный
+    # провайдер как раньше, не падает (#859).
+    echo "::warning::ни один секрет ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]} не дал импортируемый аккаунт ($skipped пропущено) — быстрый провайдер Claude отключается для этого прогона, используется цепочка/одиночный провайдер (#838, #859)"
+    DSH_ANTHROPIC_POOL_ACTIVE=0
+    echo "::endgroup::"
+    return 0
+  fi
+  echo "::endgroup::"
+}
+
+# Монтаж — тот же паттерн, что dsh_mount_plugins_suite (структурная проверка
+# dsh --dump-config), НЕЗАВИСИМО от неё: своя переменная активации, свой tgz,
+# монтируется даже когда suite выключена целиком. Вызывать ПОСЛЕ первого
+# dsh_patch_profile этого job'а — то же обоснование порядка (initProfile
+# пишет файлы профиля только при отсутствии), что у dsh_mount_plugins_suite.
+dsh_mount_anthropic_pool() { # $1 — профиль (headless)
+  local profile=$1
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Монтаж быстрого провайдера Claude (профиль $profile, #838)"
+  if ! dsh plugin --profile "$profile" add "$DSH_ANTHROPIC_POOL_PKG"; then
+    echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — быстрый провайдер Claude не подключён (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  local dump
+  if ! dump=$(dsh --profile "$profile" --dump-config 2>&1); then
+    echo "::error::dsh --dump-config упал после монтажа anthropic-oauth-pool — монтаж не подтверждён (#838): $dump"
+    echo "::endgroup::"; return 1
+  fi
+  if ! grep -q '^- id: anthropic-oauth-pool$' <<<"$dump"; then
+    echo "::error::anthropic-oauth-pool не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#838)"
+    echo "::endgroup::"; return 1
+  fi
+  echo "быстрый провайдер Claude (anthropic-oauth-pool) смонтирован — структурная проверка dump-config подтверждена"
+  echo "::endgroup::"
+}
+
 # Плоский (без combo-router) патч профиля — поведение «как раньше», один
 # источник для ОБЕИХ ситуаций, где он нужен: suite не запрошен вовсе, и
 # suite смонтирован, но dump-config не подтвердил активацию (мягкий откат,
@@ -260,6 +479,29 @@ _dsh_patch_profile_plain() { # $1 — профиль
 - id: llm-deepseek
   config:
     maxTokens: $DSH_MAX_TOKENS
+PATCH
+}
+
+# Патч профиля под быстрый провайдер Claude (#838, design.md
+# anthropic-oauth-pool-standalone «Стык с цепочкой провайдеров»). НЕ
+# использует _dsh_patch_profile_plain/llm-deepseek вовсе — anthropic-pool
+# регистрирует себя отдельным провайдером в llm-pi-ai.providers.anthropic-pool
+# (lib/index.js::ensureProvider плагина, PROVIDER_KEY='anthropic-pool',
+# api: 'anthropic-messages' — другой протокольный путь, не openai-completions
+# llm-deepseek). "claude-sonnet-4-5" — статический дефолт из models плагина
+# (lib/index.js), используется как id модели для agent-default-model; живым
+# прогоном с реальными аккаунтами не подтверждено (design.md, «Не
+# подтверждено» — гонка ensureProvider()/discoverModels() относительно
+# резолва agent-default-model на первом реальном запросе).
+_dsh_patch_profile_anthropic_pool() { # $1 — профиль
+  local profile=$1
+  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  mkdir -p "$(dirname "$patch")"
+  cat >"$patch" <<PATCH
+- id: agent-default-model
+  config:
+    provider: anthropic-pool
+    model: claude-sonnet-4-5
 PATCH
 }
 
@@ -313,8 +555,9 @@ dsh_model_context_window() { # $1 — id модели
 # Решение (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): ВНУТРИ
 # цепочки suite всегда глушится — dsh_run_with_provider_chain выставляет
 # DSH_CHAIN_ACTIVE=1 на время своего цикла, и эта функция читает его ниже,
-# независимо от DSH_PLUGINS_SUITE_ACTIVE. Вне цепочки (worker.yml/hands.yml,
-# где dsh_run_with_provider_chain не вызывается) suite работает как раньше.
+# независимо от DSH_PLUGINS_SUITE_ACTIVE. Вне цепочки (#797: сегодня это
+# только hands.yml — worker.yml с этой задачи тоже зовёт
+# dsh_run_with_provider_chain) suite работает как раньше.
 # Дополнительный тормоз — dsh_require_provider_chain отказывает громко, если
 # vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно: молчаливого
 # приоритета одной переменной над другой быть не должно.
@@ -537,7 +780,70 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
 # через vars.DSH_PROVIDER_KEY_SECRET, #716: тому механизму нужен РОВНО один
 # активный секрет в её, этому — ключи ВСЕХ провайдеров цепочки одновременно,
 # разные задачи, не дублируют друг друга).
-dsh_require_provider_chain() {
+
+# ── Манифест использования (openspec/changes/llm-provider-usage-manifest) ──
+#
+# Одно место конфигурации «кто каким комбо провайдеров пользуется» —
+# config/provider-usage.json репозитория (вне scripts/**, .github/workflows/**,
+# docs/agents/** — гвардия provider-default.guard.sh, класс #153, эти пути не
+# сканирует). Источник правды на его СОДЕРЖИМОЕ по design.md этого change —
+# Settings морды dsh-edge (пуш при изменении настройки, Этап 2 tasks.md, ещё
+# не подключён); эта функция только ЧИТАЕТ файл из уже сделанного checkout'а —
+# сети не трогает, правило владельца «не дёргать морду на каждый прогон
+# пайплайна» (proposal.md, Scope/Out).
+#
+# Манифест ПРИОРИТЕТНЕЕ vars.DSH_PROVIDER_CHAIN, если файл присутствует:
+# присутствует, но нет записи потребителя (или запись ссылается на
+# несуществующую/пустую цепочку) — fail loud, а не тихий фоллбэк на vars.
+# Ровно класс, который пропустили с воркером на 72 задачи (#727 -> #797,
+# proposal.md «Problem») — «у кого-то нет валидного назначения» обязано
+# падать здесь же, на прогоне, не только в CI-инварианте репозитория
+# (repo_invariants.py::check_provider_usage_manifest — та же проверка над
+# статичным файлом, без сети).
+#
+# Файла нет вовсе (старый checkout без него, локальный запуск смок-теста без
+# манифеста) — тихий проход, вызывающий использует свой прежний
+# vars.DSH_PROVIDER_CHAIN как есть (design.md «Потребители»: выбор между
+# «манифест — единственный источник» и «фоллбэк на переходный период» здесь
+# решён в пользу фоллбэка ТОЛЬКО на случай отсутствия файла, не на случай его
+# неполноты — иначе манифест с дырой в usage был бы неотличим от манифеста,
+# который ещё не появился).
+DSH_PROVIDER_USAGE_MANIFEST="${DSH_PROVIDER_USAGE_MANIFEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/config/provider-usage.json}"
+
+dsh_load_provider_chain_from_manifest() { # consumer_id
+  local consumer=$1 manifest="$DSH_PROVIDER_USAGE_MANIFEST" raw chain_name chain count
+  [ -f "$manifest" ] || return 0
+  raw=$(cat "$manifest") || {
+    echo "::error::манифест использования провайдеров $manifest не читается" >&2
+    return 1
+  }
+  if ! jq -e . >/dev/null 2>&1 <<<"$raw"; then
+    echo "::error::манифест использования провайдеров $manifest — невалидный JSON" >&2
+    return 1
+  fi
+  chain_name=$(jq -r --arg id "$consumer" '.usage[$id] // empty' <<<"$raw")
+  if [ -z "$chain_name" ]; then
+    echo "::error::манифест $manifest не назначает цепочку потребителю '$consumer' (ключ .usage[\"$consumer\"] отсутствует) — назначь цепочку в манифесте (Settings морды dsh-edge, когда Этап 2 подключён; сейчас — правкой файла), openspec/changes/llm-provider-usage-manifest" >&2
+    return 1
+  fi
+  chain=$(jq -c --arg name "$chain_name" '.chains[$name] // empty' <<<"$raw")
+  if [ -z "$chain" ] || [ "$chain" = "null" ]; then
+    echo "::error::манифест $manifest: usage[\"$consumer\"] ссылается на несуществующую цепочку '$chain_name' в .chains" >&2
+    return 1
+  fi
+  count=$(jq 'length' <<<"$chain" 2>/dev/null) || count=0
+  if [ -z "$count" ] || [ "$count" -lt 1 ]; then
+    echo "::error::манифест $manifest: цепочка '$chain_name' (потребитель '$consumer') пуста" >&2
+    return 1
+  fi
+  export DSH_PROVIDER_CHAIN="$chain"
+  echo "манифест использования провайдеров: '$consumer' -> цепочка '$chain_name' ($count провайдер(ов)), источник $manifest"
+}
+
+dsh_require_provider_chain() { # [consumer_id]
+  if [ -n "${1:-}" ]; then
+    dsh_load_provider_chain_from_manifest "$1" || return 1
+  fi
   # Стык с suite ротации учёток (#215, design.md dsh-in-job «Стык suite и
   # цепочки провайдеров»): цепочка владеет провайдером КАЖДОЙ попытки
   # (атрибуция DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED, реестр подтверждённых
@@ -548,7 +854,7 @@ dsh_require_provider_chain() {
   # запрещаем комбинацию явно, а не полагаемся на то, что ни один вызывающий
   # не прокинет обе переменные разом.
   if [ -n "${PLUGINS_SUITE_URL:-}" ]; then
-    echo "::error::vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно — комбинация не поддержана (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): цепочка (#727) сама решает, какого провайдера пробовать на каждой попытке, suite (#215) решает тот же вопрос на своём уровне — выбери одно. Сейчас suite нужен только worker.yml/hands.yml (там цепочки нет), а ai-review всегда идёт цепочкой." >&2
+    echo "::error::vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно — комбинация не поддержана (design.md dsh-in-job, «Стык suite и цепочки провайдеров»): цепочка (#727) сама решает, какого провайдера пробовать на каждой попытке, suite (#215) решает тот же вопрос на своём уровне — выбери одно. Сейчас suite нужен только hands.yml (там цепочки нет, #797) — ai-review и worker всегда идут цепочкой." >&2
     return 1
   fi
   if [ -z "${DSH_PROVIDER_CHAIN:-}" ]; then
@@ -633,6 +939,63 @@ dsh_extract_reset_hint() { # err_file
   printf '%s' "$line"
 }
 
+# ── Персистентное состояние квоты провайдеров (#857) ─────────────────────────
+#
+# Класс: dsh_extract_reset_hint выше ловит дату сброса из ответа провайдера
+# ВНУТРИ одного прогона, но это знание не переживает конец эфемерной джобы
+# (ai-review.yml/worker.yml/hands.yml — все три живут только на время job'а).
+# Следующий прогон, стартовавший минутой позже, снова тратит первую попытку
+# на провайдера, чью квоту предыдущий прогон УЖЕ видел исчерпанной с
+# известной датой сброса — тормоз без газа (AGENTS.md): знание есть, а
+# перенести его в следующий job нечем.
+#
+# Носитель — vars.DSH_PROVIDER_QUOTA_UNTIL (JSON {provider_name: reset_iso}),
+# design.md openspec/changes/provider-quota-gating обосновывает выбор: та же
+# репо-переменная, что читается контекстом workflow (`${{ vars.X }}`) БЕЗ
+# токена — тот же путь, что уже несёт vars.DSH_PROVIDER_CHAIN, включая
+# недоверенный DSH-шаг ai-review.yml (#18), у которого GitHub-токена нет
+# вовсе. ЭТА функция и весь bash-слой — ТОЛЬКО ЧТЕНИЕ: пишет состояние
+# исключительно пульс оркестратора (scripts/orchestra/provider_quota_state.py,
+# вызывается из scheduler.py::sync_provider_quota_state) — гвардия границы
+# доверия в scripts/lib/test_provider_quota_state_guard.py.
+#
+# Разбирает состояние ОДИН раз за весь прогон цепочки (не на каждой
+# итерации): переменная не задана — гейт не срабатывает никогда (обратная
+# совместимость); задана, но не JSON-объект — ::warning:: и фейл-открыто
+# (работоспособность цепочки важнее гейта квоты, сломанное персистентное
+# состояние не должно ронять прод).
+dsh_quota_state_validate() { # -> печатает в stdout валидный JSON-объект или пусто
+  local raw="${DSH_PROVIDER_QUOTA_UNTIL:-}"
+  [ -n "$raw" ] || return 0
+  if jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw"; then
+    printf '%s' "$raw"
+  else
+    echo "::warning::vars.DSH_PROVIDER_QUOTA_UNTIL задана, но не JSON-объект — гейтирование по персистентной квоте пропущено в этом прогоне (фейл-открыто, #857)" >&2
+  fi
+}
+
+# $1 — имя провайдера, $2 — валидированный JSON-объект состояния (может быть
+# пустой строкой). Возврат 0 — провайдера следует ПРОПУСТИТЬ (квота ещё не
+# сброшена), DSH_QUOTA_GATE_RESET несёт дату; возврат 1 — пробовать как
+# обычно (нет записи, дата нераспознана, либо срок уже прошёл).
+dsh_provider_quota_gate_skip() { # name state_json
+  local name=$1 state_json=$2 reset_iso reset_epoch now_epoch
+  DSH_QUOTA_GATE_RESET=""
+  [ -n "$state_json" ] || return 1
+  reset_iso=$(jq -r --arg n "$name" '.[$n] // empty' <<<"$state_json" 2>/dev/null) || return 1
+  [ -n "$reset_iso" ] || return 1
+  reset_epoch=$(date -u -d "$reset_iso" +%s 2>/dev/null) || {
+    echo "::warning::цепочка провайдеров: quota-состояние '$name' содержит нераспознанную дату '$reset_iso' (vars.DSH_PROVIDER_QUOTA_UNTIL) — гейт пропущен для этого провайдера, пробую как обычно" >&2
+    return 1
+  }
+  now_epoch=$(date -u +%s)
+  if [ "$now_epoch" -lt "$reset_epoch" ]; then
+    DSH_QUOTA_GATE_RESET="$reset_iso"
+    return 0
+  fi
+  return 1
+}
+
 # ── Реестр подтверждённых id моделей (#737) ──────────────────────────────────
 #
 # Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)
@@ -679,10 +1042,14 @@ dsh_model_confirmed() { # model_id
 dsh_run_with_provider_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint
+  local quota_state_json
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
   DSH_CHAIN_TRIED=""
   DSH_CHAIN_RESET_HINT=""
+  # #857: персистентное состояние квоты, разобрано ОДИН раз за весь прогон
+  # цепочки (не на каждой итерации) — см. dsh_quota_state_validate выше.
+  quota_state_json=$(dsh_quota_state_validate)
   # Как и dsh_run_with_retry, эта функция НИКОГДА не возвращает ненулевой код
   # сама (иначе `set -e` вызывающего оборвал бы скрипт ДО того, как он успеет
   # прочитать DSH_RUN_RC/DSH_RUN_FAILURE_REASON и напечатать свой отчёт) —
@@ -704,6 +1071,19 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     model=$(jq -r '.model' <<<"$entry")
     secret_env=$(jq -r '.secret_env' <<<"$entry")
     max_tokens=$(jq -r '.max_output_tokens // 131072' <<<"$entry")
+    # #857: персистентная квота ДО секрета/подтверждения модели — самый
+    # дешёвый гейт первым, не тратит jq-разбор на провайдера, который всё
+    # равно будет пропущен. continue (не stop=1) — "all_providers_exhausted"
+    # по-прежнему считается только когда i>=count, весь список пройден
+    # (включая пропущенных гейтом) — правило AGENTS.md «Алерт не гадает»
+    # держится тем же кодом, что и раньше (design.md, «Алерт уже не гадает»).
+    if dsh_provider_quota_gate_skip "$name" "$quota_state_json"; then
+      echo "::notice::цепочка провайдеров: $name пропущен — квота до $DSH_QUOTA_GATE_RESET (vars.DSH_PROVIDER_QUOTA_UNTIL, #857)" >&2
+      DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name (пропущен: квота до $DSH_QUOTA_GATE_RESET)"
+      DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $DSH_QUOTA_GATE_RESET"
+      i=$((i + 1))
+      continue
+    fi
     DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name"
     key="${!secret_env:-}"
     if [ -z "$key" ]; then
@@ -741,4 +1121,44 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     echo "::error::цепочка провайдеров исчерпана целиком ($DSH_CHAIN_TRIED)${DSH_CHAIN_RESET_HINT:+ — сброс: $DSH_CHAIN_RESET_HINT}" >&2
   fi
   DSH_CHAIN_ACTIVE="$_prev_chain_active"
+}
+
+# ── Быстрый провайдер первым, цепочка — фоллбэком (#838) ────────────────────
+#
+# design.md anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»:
+# anthropic-oauth-pool и DSH_PROVIDER_CHAIN решают РАЗНЫЕ вопросы на разных
+# протокольных путях (llm-pi-ai/anthropic-messages против llm-deepseek/
+# openai-completions) — не комбинируются на одном уровне, как suite/цепочка
+# (dsh_patch_profile выше), а идут ПОСЛЕДОВАТЕЛЬНО: пул пробуется первым
+# ОДНИМ прогоном (сам пул уже перебирает все свои аккаунты на 429/401/403
+# внутри одного HTTP-вызова, lib/index.js::forward плагина — повторять этот
+# перебор снаружи циклом бессмысленно), при отказе — штатная
+# dsh_run_with_provider_chain вызывается КАК ЕСТЬ, без изменений.
+#
+# Пул неактивен (DSH_ANTHROPIC_POOL_ACTIVE=0, нет секретов) — сразу цепочка,
+# нулевое изменение поведения для конфигурации без пула.
+#
+# Использование и результат — тот же контракт, что у dsh_run_with_provider_chain
+# (DSH_RUN_RC/DSH_RUN_FAILURE_REASON/DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED/
+# DSH_CHAIN_RESET_HINT) — вызывающие (worker/hands/ai-review) читают ровно те
+# же переменные, что и раньше, независимо от того, ответил пул или цепочка.
+dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
+  local answer_file=$1 err_file=$2 prompt_text=$3
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
+    echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
+    _dsh_patch_profile_anthropic_pool headless
+    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    if [ "$DSH_RUN_RC" -eq 0 ]; then
+      DSH_CHAIN_PROVIDER="anthropic-oauth-pool"
+      DSH_CHAIN_TRIED="anthropic-oauth-pool"
+      DSH_CHAIN_RESET_HINT=""
+      DSH_RUN_FAILURE_REASON=""
+      return 0
+    fi
+    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC) — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+  fi
+  dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text"
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
+    DSH_CHAIN_TRIED="anthropic-oauth-pool, ${DSH_CHAIN_TRIED}"
+  fi
 }

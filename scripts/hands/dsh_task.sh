@@ -10,16 +10,41 @@
 # больше не получает — только жизненный цикл job (замещает стрим #112).
 #
 # Ретрай временного RATE_LIMIT провайдера (#422, механизм #419/#421 —
-# dsh_run_with_retry в lib/dsh-ci.sh). Бюджет ожидания HANDS_RATE_LIMIT_MAX_WAIT_SECS
-# (по умолчанию 600с/10 мин) короче, чем у ai-review/воркера (30 мин)
-# нарочно: канал рук — интерактивный (репозиторный dispatch из морды или
-# ручной запуск), собственный job живёт всего 30 мин (timeout-minutes), и
-# держать раннер занятым треть часа ради окна, которое обычно снимается
-# секундами (docs/runbooks/switch-llm-provider.md), не оправдано — короче
-# отказать и вернуть задачу в пул, чем занимать редкий Free-план слот. При
-# исчерпании бюджета (или недельной/месячной квоте) задача (issue-N, если
-# была аренда) возвращается в пул СРАЗУ: lease_cli release-full, не
-# 24-часовой TTL-сборщик — вина не в задаче.
+# dsh_run_with_retry в lib/dsh-ci.sh, остаётся заботой КАЖДОЙ попытки цепочки
+# ниже). Бюджет ожидания HANDS_RATE_LIMIT_MAX_WAIT_SECS (по умолчанию
+# 600с/10 мин) короче, чем у ai-review/воркера (30 мин) нарочно: канал рук —
+# интерактивный (репозиторный dispatch из морды или ручной запуск),
+# собственный job живёт всего 30 мин (timeout-minutes), и держать раннер
+# занятым треть часа ради окна, которое обычно снимается секундами
+# (docs/runbooks/switch-llm-provider.md), не оправдано — короче отказать и
+# вернуть задачу в пул, чем занимать редкий Free-план слот. При исчерпании
+# бюджета, недельной/месячной квоте ОДНОГО провайдера, или исчерпании ВСЕЙ
+# цепочки (#727/#805) задача (issue-N, если была аренда) возвращается в пул
+# СРАЗУ: lease_cli release-full, не 24-часовой TTL-сборщик — вина не в задаче.
+#
+# Цепочка провайдеров (#727, довод #805 — тот же механизм, что уже несёт
+# ai-review.yml и worker.yml, #797): dsh_require_provider_env/
+# dsh_run_with_retry заменены на dsh_require_provider_chain/
+# dsh_run_with_provider_chain (lib/dsh-ci.sh). Профиль затравлен ПЕРВЫМ
+# провайдером цепочки (chain[0]) ДО первого `dsh` этого прогона (dsh plugin
+# add, шаг 3d) — тот же приём, что у worker.yml (initProfile не перезаписывает
+# уже существующий cordis.patch.yml дефолтом); цепочка перепатчивает профиль
+# заново на каждую попытку внутри шага 4 — тот же dsh_patch_profile, не
+# второй механизм.
+#
+# Особый риск рук, которого нет у worker.yml (тот не пишет в журнал вовсе):
+# событие `bootstrap` ниже (шаг 3d) уходит в журнал ДО первой попытки
+# цепочки — на тот момент известен только `chain[0]`, не тот провайдер,
+# который в итоге ответит. Решение (не молчаливый пропуск, #805): `bootstrap`
+# называет `chain[0]` явно как ПЕРВОГО КАНДИДАТА (`provider_chain.head_model`/
+# `provider_chain.candidates`), не как факт «эта модель ответила»; факт
+# определяется ПОСЛЕ прогона (шаг 4/5) и уходит уже существующим,
+# безусловным событием `agent_answer` новыми полями `provider`/`model`
+# (значение `$DSH_MODEL`/`$DSH_CHAIN_PROVIDER` после
+# `dsh_run_with_provider_chain` — эта функция перепатчивает профиль на
+# КАЖДОЙ попытке, поэтому оба глобальных значения после её возврата
+# отражают именно последнего опробованного/успешного провайдера, тот же,
+# что и реально обслужил вызов при rc=0).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,12 +74,15 @@ CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле веш
 : "${HANDS_URL:?HANDS_URL не задан}"
 : "${HANDS_TOKEN:?HANDS_TOKEN не задан}"
 : "${TASK_ID:?TASK_ID не задан (repository_dispatch payload или manual-<run_id>)}"
-# Одно место правды — vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория (#153):
-# зашитых фолбэков на конкретный эндпоинт/модель здесь больше нет. Проверяем
-# в блоке обязательных переменных — ДО heartbeat, dsh_edge_login и создания
-# сессии в морде: иначе конфиг-ошибка даёт пустую сессию в UI морды и задачу,
-# помеченную провалом, вместо честного «не сконфигурировано».
-dsh_require_provider_env || exit 1
+# Цепочка приходит из манифеста использования (openspec/changes/
+# llm-provider-usage-manifest, config/provider-usage.json, потребитель
+# "hands") — dsh_require_provider_chain резолвит её по id ПЕРЕД обычной
+# валидацией; манифеста нет вовсе — фоллбэк на vars.DSH_PROVIDER_CHAIN
+# (#727/#805) как раньше. Проверяем в блоке обязательных переменных — ДО
+# heartbeat, dsh_edge_login и создания сессии в морде: иначе конфиг-ошибка
+# даёт пустую сессию в UI морды и задачу, помеченную провалом, вместо
+# честного «не сконфигурировано».
+dsh_require_provider_chain "hands" || exit 1
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
 WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"
@@ -235,16 +263,21 @@ else
   HARNESS_TITLE="$(head -n1 <<<"$TASK_TEXT" | cut -c1-160)"
 fi
 dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
-dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE" >/dev/null \
+# Реально использованный id может отличаться от HARNESS_SID (#809: фоллбэк
+# на испорченной холодной загрузке) — читаем возврат функции, не подставляем
+# исходный HARNESS_SID вручную.
+HARNESS_SID_ACTUAL=$(dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE") \
   || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
-export DSH_EDGE_SESSION_ID="$HARNESS_SID"
-echo "Сессия морды: $HARNESS_SID — «$HARNESS_TITLE»"
+export DSH_EDGE_SESSION_ID="$HARNESS_SID_ACTUAL"
+echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
 
-# ── 2. Провайдер: проверка выше (блок обязательных переменных) — здесь только export ──
-# Профиль headless — pnpm-workspace: `pnpm add` внутри требует явного
-# подтверждения root (иначе ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30).
+# ── 2. Профиль headless — pnpm-workspace ──────────────────────────────────────────
+# `pnpm add` внутри требует явного подтверждения root (иначе
+# ERR_PNPM_ADDING_TO_ROOT, живой прогон 2026-08-30). Провайдер (DEEPSEEK_*)
+# экспортируется ниже, на шаге 3b, из ПЕРВОГО элемента цепочки — не здесь:
+# цепочка проверена выше (dsh_require_provider_chain), но конкретные
+# значения известны только после разбора vars.DSH_PROVIDER_CHAIN.
 export npm_config_ignore_workspace_root_check=true
-export DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL
 
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
@@ -256,6 +289,12 @@ dsh --version || true
 # обоснования порядка, тот же приём, что уже доказан ниже для hands-streamer).
 dsh_install_plugins_suite "$WORK/plugins-suite" \
   || { echo "::error::suite ротации учёток не установился (см. ::error:: выше, #215)" >&2; exit 1; }
+# Быстрый провайдер Claude (#838) — независимо от suite выше, гейт: секреты
+# ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL.
+dsh_install_anthropic_pool "$WORK/anthropic-pool" \
+  || { echo "::error::быстрый провайдер Claude не установился (см. ::error:: выше, #838)" >&2; exit 1; }
+dsh_import_anthropic_accounts \
+  || { echo "::error::импорт аккаунтов Claude не удался (см. ::error:: выше, #838)" >&2; exit 1; }
 
 # ── 3b. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
 # Порядок важен: --dump-config в 3d обязан доказывать монтаж плагина поверх
@@ -265,12 +304,32 @@ dsh_install_plugins_suite "$WORK/plugins-suite" \
 # модель живёт в settings namespace agent-default-model (проверено живым прогоном:
 # без патча уходит deepseek-v4-flash, GLM отвечает modelCode does not exist;
 # maxTokens-дефолт адаптера 256000 выше потолка GLM 131072 → INVALID_REQUEST).
-dsh_patch_profile headless
+#
+# Затравка профиля ПЕРВЫМ провайдером цепочки (chain[0]) — тот же приём, что
+# worker.yml/task.sh (#797): ОБЯЗАНА случиться ДО первого `dsh` этого прогона
+# (dsh plugin add, шаг 3d) — «initProfile пишет package.json/cordis.patch.yml/
+# pnpm-workspace.yaml только при отсутствии, ничего не перезаписывает»
+# (research/10-dsh-architecture.md) — если файл патча ещё не существует к
+# моменту plugin add, initProfile создаст его сам с содержимым, которое
+# отсюда не контролируется. На шаге 4 dsh_run_with_provider_chain
+# перепатчивает профиль ЗАНОВО на каждую попытку (тот же dsh_patch_profile,
+# полная перезапись файла) — здесь важен только факт, что файл СУЩЕСТВУЕТ к
+# моменту первого `dsh`, монтаж плагина (отдельный слой bundles) этим не
+# затрагивается.
+_chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
+_chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
+DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
+DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
+export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
 
 # ── 3c. Монтаж suite (после патча — тот же порядок, что доказан для
 # hands-streamer в 3d ниже) ────────────────────────────────────────────────────
 dsh_mount_plugins_suite headless \
   || { echo "::error::suite ротации учёток не смонтировался (см. ::error:: выше, #215)" >&2; exit 1; }
+dsh_mount_anthropic_pool headless \
+  || { echo "::error::быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)" >&2; exit 1; }
 
 # ── 3d. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
 # (dsh-streaming, проверка допущений 0: `dsh plugin add` + `--dump-config`
@@ -291,11 +350,21 @@ dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался: --dump-config без его строки; стрим событий невозможен" >&2; exit 1; }
 echo "Плагин hands-streamer смонтирован в профиль headless (вместе с модельным патчем)"
+# bootstrap уходит ДО первой попытки цепочки (#727/#805) — на этот момент
+# известен только `chain[0]` (уже засеянный в профиль на шаге 3b), а не тот
+# провайдер, который в итоге ответит на вызов. Событие называет его ЯВНО как
+# первого кандидата (provider_chain.head/candidates), не как факт «эта модель
+# ответила» — иначе рассинхрон «bootstrap называет одну модель, ответила
+# другая» был бы silent-wrong. Факт, какой провайдер реально обслужил вызов,
+# появляется ПОСЛЕ прогона в agent_answer (шаг 5, поля provider/model).
 add_event "bootstrap" "$(jq -n \
   --arg dsh "$DSH_VERSION" --arg hl "$DSH_HEADLESS_VERSION" \
-  --arg node "$(node --version)" --arg model "$DSH_MODEL" \
+  --arg node "$(node --version)" --arg head "$DSH_MODEL" \
   --argjson mt "$DSH_MAX_TOKENS" \
-  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified", model: $model, max_tokens: $mt, stream_plugin: "hands-streamer"}')"
+  --argjson candidates "$(jq -c '[.[].name]' <<<"$DSH_PROVIDER_CHAIN")" \
+  '{dsh: $dsh, dsh_headless: $hl, node: $node, integrity: "verified",
+    provider_chain: {head_model: $head, candidates: $candidates},
+    max_tokens: $mt, stream_plugin: "hands-streamer"}')"
 flush_events
 
 # ── 4. Прогон: one-shot dsh-headless над этим репозиторием ────────────────────────
@@ -315,10 +384,14 @@ HANDS_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$HANDS_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$HANDS_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$HANDS_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_retry "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
+  dsh_run_with_pool_then_chain "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
 rc=$DSH_RUN_RC
 HANDS_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
+HANDS_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
+HANDS_CHAIN_TRIED="$DSH_CHAIN_TRIED"
+HANDS_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
+echo "dsh завершился с кодом $rc (провайдер: ${HANDS_CHAIN_PROVIDER:-нет успеха}, опробованы: ${HANDS_CHAIN_TRIED:-?})"
 
 # Финальный drain — жёсткий и ДО ответа: транскрипт сессии в морде обязан
 # обгонять финальный статус job в журнале.
@@ -327,9 +400,24 @@ dsh_edge_drain_spool hard || { echo "::error::Хвост транскрипта 
 drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
 
 # ── 5. Журнал: ответ и улики ───────────────────────────────────────────────────────
+# provider/model — ФАКТ по итогу цепочки (#727/#805), не затравка bootstrap:
+# dsh_run_with_provider_chain перепатчивает профиль (dsh_patch_profile) на
+# КАЖДОЙ попытке, поэтому $DSH_MODEL после её возврата — модель ПОСЛЕДНЕГО
+# опробованного провайдера (успешного при rc=0, последнего при отказе/
+# исчерпании цепочки целиком) — тот же провайдер, что реально принял вызов.
+# Это безусловное событие (уходит и на успехе, и на провале) — единственное
+# место, где рассинхрон bootstrap/факт закрывается: bootstrap выше называет
+# только первого кандидата (provider_chain.head_model), это событие — то,
+# что случилось на самом деле.
 ANSWER=$(tail -c 60000 "$ANSWER_FILE" | redact)
 add_event "agent_answer" \
-  "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" '{text: $t, elapsed_s: $secs}')"
+  "$(jq -n --arg t "$ANSWER" --argjson secs "$DSH_SECS" \
+      --arg provider "${HANDS_CHAIN_PROVIDER:-}" --arg model "${DSH_MODEL:-}" \
+      --arg tried "${HANDS_CHAIN_TRIED:-}" \
+      '{text: $t, elapsed_s: $secs,
+        provider: (if $provider == "" then null else $provider end),
+        model: (if $model == "" then null else $model end),
+        provider_chain_tried: (if $tried == "" then null else $tried end)}')"
 
 # Громкий отказ «стрим не доставил»: успешный прогон с пустым транскриптом
 # морды — молчаливая деградация слоя доказательств, job обязан краснеть.
@@ -387,13 +475,18 @@ else
   # «возможности нет» и «возможность есть, но сломана» лечатся по-разному).
   add_event "agent_error" \
     "$(jq -n --arg t "$ERRTEXT" --argjson code "$rc" --arg reason "$HANDS_TASK_FAILURE_REASON" \
-        '{stderr: $t, exit_code: $code, failure_reason: (if $reason == "" then null else $reason end)}')"
+        --arg tried "${HANDS_CHAIN_TRIED:-}" --arg reset "${HANDS_CHAIN_RESET_HINT:-}" \
+        '{stderr: $t, exit_code: $code, failure_reason: (if $reason == "" then null else $reason end),
+          provider_chain_tried: (if $tried == "" then null else $tried end),
+          provider_chain_reset_hint: (if $reset == "" then null else $reset end)}')"
   flush_events
-  # Провайдер в лимите/квоте надолго — вина не в задаче: возвращаем её в пул
-  # СРАЗУ (замок + назначение), не дожидаясь 24-часового TTL-сборщика.
-  # Только для задач issue-N: manual-* аренды не имеют, снимать нечего.
+  # Провайдер в лимите/квоте надолго ИЛИ цепочка исчерпана целиком (#727/#805)
+  # — вина не в задаче: возвращаем её в пул СРАЗУ (замок + назначение), не
+  # дожидаясь 24-часового TTL-сборщика. Только для задач issue-N: manual-*
+  # аренды не имеют, снимать нечего.
   if [ -n "$ISSUE_NUMBER" ] && { [ "$HANDS_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
-      [ "$HANDS_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ]; }; then
+      [ "$HANDS_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
+      [ "$HANDS_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; }; then
     release_out="$(GH_RUN_TOKEN="$LEASE_RELEASE_TOKEN" lease_cli release-full "$ISSUE_NUMBER" 2>&1)" \
       && release_rc=0 || release_rc=$?
     if [ "$release_rc" -eq 0 ]; then
@@ -409,6 +502,9 @@ else
       ;;
     rate_limit_retry_budget_exceeded)
       echo "::error::провайдер: временный RATE_LIMIT не снялся за бюджет ожидания ${HANDS_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc) — не сбой агента" >&2
+      ;;
+    all_providers_exhausted)
+      echo "::error::цепочка провайдеров исчерпана целиком (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" >&2
       ;;
     *)
       echo "::error::dsh завершился с кодом $rc" >&2

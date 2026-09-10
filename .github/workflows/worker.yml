@@ -96,11 +96,21 @@ jobs:
           # красного прогона.
           DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
-          # Провайдер и модель — ровно одно место правды: vars репозитория (#153).
-          # Зашитого фолбэка здесь больше нет; пусто → dsh_require_provider_env
-          # в worker/task.sh падает громко до какой-либо дорогой работы.
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          # Цепочка провайдеров (#727, довод #797) — одно место правды:
+          # vars.DSH_PROVIDER_CHAIN репозитория (JSON-массив, порядок =
+          # приоритет). Пусто → dsh_require_provider_chain в worker/task.sh
+          # падает громко до какой-либо дорогой работы. Секреты ВСЕХ
+          # провайдеров цепочки нужны сразу (перебор внутри одного прогона,
+          # не переключение между прогонами, тот же принцип, что уже несёт
+          # ai-review.yml) — NVIDIA_API_KEY литеральным именем, наравне с уже
+          # переданным DEEPSEEK_API_KEY (секрет GLM/z.ai) выше.
+          DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          # Персистентное состояние квоты (#857, JSON {provider: reset_iso})
+          # — читается контекстом workflow БЕЗ токена, тем же путём, что
+          # DSH_PROVIDER_CHAIN выше; пишет ТОЛЬКО пульс оркестратора
+          # (scripts/orchestra/provider_quota_state.py).
+          DSH_PROVIDER_QUOTA_UNTIL: ${{ vars.DSH_PROVIDER_QUOTA_UNTIL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           # Окно контекста env-provider-маршрута combo-router (#789) — тот же
           # источник, что уже требует присутствие DEEPSEEK_MODEL для каталога
           # морды (deploy-dsh-edge.yml): dsh_model_context_window (dsh-ci.sh)
@@ -115,6 +125,13 @@ jobs:
           # приёмки #215. Секреты-кандидаты не обязаны существовать: пустой
           # секрет просто не даёт маршрута (dsh_patch_profile пропускает его).
           PLUGINS_SUITE_URL: ${{ vars.PLUGINS_SUITE_URL }}
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) —
+          # НЕЗАВИСИМО от PLUGINS_SUITE_URL выше: JSON credentials.json
+          # целиком в значении секрета (AGENTS.md «Секреты» — значение
+          # никогда не печатается). Оба пусты → dsh_install_anthropic_pool
+          # печатает «не подключён», job идёт как раньше.
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
           OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
           OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
           OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}

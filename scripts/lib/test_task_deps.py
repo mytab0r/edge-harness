@@ -68,7 +68,7 @@ class FakeGraphQL:
         self.single = single
         self.calls: list[list[str]] = []
 
-    def run(self, args, capture_output=True, text=True, env=None):
+    def run(self, args, capture_output=True, text=True, env=None, encoding=None):
         self.calls.append(args)
         if self.single is not None:
             return out({"data": self.single})
@@ -241,7 +241,7 @@ def test_gh_graphql_surfaces_graphql_errors_field_loudly():
 
 
 def test_add_dependency_resolves_ids_then_mutates():
-    def run(args, capture_output=True, text=True, env=None):
+    def run(args, capture_output=True, text=True, env=None, encoding=None):
         joined = " ".join(args)
         if "addBlockedBy" in joined:
             assert "issueId=ID_43" in joined
@@ -260,7 +260,7 @@ def test_add_dependency_resolves_ids_then_mutates():
 
 
 def test_issue_node_id_missing_issue_is_loud():
-    def run(args, capture_output=True, text=True, env=None):
+    def run(args, capture_output=True, text=True, env=None, encoding=None):
         return out({"data": {"repository": {"issue": None}}})
 
     import unittest.mock as mock

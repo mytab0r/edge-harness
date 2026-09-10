@@ -24,8 +24,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Файлы, где широкая семантика ОСОЗНАННА и заявлена в докстринге самого
 # места вызова — одно место правды списка исключений, не разбросано по коду.
-# scripts/orchestra/scheduler.py — pr_references_issue (reap_stale/
-# unhealthy_pulls) и after_merge, см. их докстринги. scripts/orchestra/
+# scripts/orchestra/scheduler.py — pr_references_issue (reap_stale),
+# after_merge и partial_disclaimer, см. их докстринги. unhealthy_pulls
+# (#286) сюда больше НЕ входит — сопоставление PR → задача там сузилось до task_ref.resolve_pr_task
+# (не «не тронули вовремя», а «сняли аренду ЧУЖОЙ задачи» — цена той же
+# широты там другая, см. докстринг unhealthy_pulls). scripts/orchestra/
 # repo_invariants.py — declared_change_task (инвариант 4, второй путь
 # завершённости, docs/agents/OPENSPEC-PROTOCOL.md): другой вопрос, чем
 # «какая задача у этого PR» (резолюция PR из #259 сюда не относится вовсе,
@@ -34,6 +37,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # ОГРАНИЧЕН абзацем-декларацией («Задач…» первой строкой, см. докстринг
 # declared_change_task), а не всем файлом — ровно та защита, которой не
 # хватало `ai_review.py::task_section` в живом случае #259.
+#
+# Честно про границу этого списка (#699 code review): узость unhealthy_pulls
+# выше — заявление в комментарии и в докстринге функции, эта гвардия его
+# НЕ проверяет и проверить не может. WIDE_CALL_RE ловит только прямой вызов
+# task_ref.extract_task_refs/references_task; unhealthy_pulls, вернись она к
+# широкой семантике через локальную обёртку pr_references_issue (тоже в
+# scheduler.py), останется невидима гвардии — весь файл scheduler.py в
+# ALLOWED_WIDE_USAGE целиком, а не построчно (доказано мутацией при ревью
+# PR #699: возврат pr_references_issue в unhealthy_pulls тест
+# test_wide_task_ref_functions_only_used_where_allowed НЕ красит). Носитель
+# правила «unhealthy_pulls узкая» — три юнит-теста в
+# scripts/orchestra/test_scheduler.py (see docstring unhealthy_pulls),
+# не эта гвардия. Пофайловый механизм здесь не заводим — отдельная работа.
 ALLOWED_WIDE_USAGE = {
     Path("scripts/orchestra/scheduler.py"),
     Path("scripts/orchestra/repo_invariants.py"),
@@ -67,7 +83,8 @@ def test_wide_task_ref_functions_only_used_where_allowed():
         f"{offenders}. Для вопроса «какая задача у этого PR» используй "
         "task_ref.resolve_pr_task (#259), а не упоминание в прозе. Если "
         "новое место действительно нуждается в широкой семантике осознанно "
-        "(как reap_stale/unhealthy_pulls/after_merge) — назови это в "
+        "(как reap_stale/after_merge/partial_disclaimer в scheduler.py или "
+        "declared_change_task в repo_invariants.py) — назови это в "
         "докстринге места вызова и добавь его в ALLOWED_WIDE_USAGE явно."
     )
 

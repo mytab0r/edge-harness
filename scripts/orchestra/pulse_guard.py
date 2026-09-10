@@ -263,6 +263,35 @@ CONFLICT_ESCALATION_MARKER = "[conflict: эскалация]"
 # «git rebase гарантированно запущен».
 WORKER_GIT_STEP_MARKER = "[worker: git-шаг]"
 
+# Сброс лифтайм-бюджета conflict_rework_attempts (issue #822, авария #794,
+# 2026-09-08): CONFLICT_REWORK_MAX_ATTEMPTS=1 — лифтайм на PR, но живой
+# случай показал класс, который сам бюджет не различает — попытка провалилась
+# по ИНФРАСТРУКТУРЕ, известной и разобранной (авария оркестратора/журнала во
+# время инцидента #794), а не по сложности самого ребейза. Без механизма
+# сброса единственная попытка сгорала бы навсегда, хотя PR ни разу не получил
+# честного шанса на git rebase в здоровой инфраструктуре — тот же класс
+# потери, что уже решён для сбоёв ДО git-шага (WORKER_GIT_STEP_MARKER выше),
+# только здесь сбой происходит ПОСЛЕ git-шага (сам ребейз стартовал, но
+# инфраструктура вокруг него была недоступна).
+#
+# Маркер — первоклассная операция, не разовая правка счётчика руками: любая
+# следующая известная инфра-авария использует тот же приём. Публикуется
+# комментарием в ЗАДАЧУ (тот же issue, чьи комментарии conflict_rework_attempts
+# уже читает — не заводится второй канал чтения) с причиной после двоеточия,
+# например: `[conflict-budget-reset: #794-outage 2026-09-08: единственная
+# попытка провалилась по инфре, не по сложности]`. Маркер — ПРЕФИКС (без
+# закрывающей скобки): issue_marker_times ищет его как подстроку, конкретная
+# причина в текст маркера не входит — один и тот же приём для любой причины.
+#
+# conflict_rework_attempts берёт MAX(conflict_first_labeled_at, время
+# ПОСЛЕДНЕГО маркера сброса) как эффективную границу отсчёта — идемпотентно
+# (issue_marker_times уже дедуплицирует по факту публикации, повторный маркер
+# не увеличивает бюджет дважды, дальнейший расчёт берёт max() одной точки, а
+# не сумму) и НЕ обходит саму защиту от бесконечного цикла: после сброса
+# по-прежнему считается только 1 попытка ПОСЛЕ маркера, следующий провал снова
+# ведёт к эскалации — сброс даёт честную повторную попытку, не безлимит.
+CONFLICT_BUDGET_RESET_MARKER = "[conflict-budget-reset:"
+
 # ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
 # worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
 # сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
@@ -428,7 +457,7 @@ FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пр�
 def gh(*args: str) -> dict | list | None:
     result = subprocess.run(
         ["gh", "api", *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
@@ -956,7 +985,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
         result = subprocess.run(
             ["gh", "api", "--allow-escape-sequences",
              f"repos/{repo}/actions/jobs/{job_id}/logs"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
             env={**os.environ, "NO_COLOR": "1"},
         )
     except OSError as error:
@@ -1095,7 +1124,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     if reply_markup is not None:
         args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
     except OSError as error:
         print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
         return False

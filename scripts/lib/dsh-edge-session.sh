@@ -110,14 +110,56 @@ dsh_edge_harness_workspace() { # stdout: workspaceId воркспейса edge-h
 }
 
 dsh_edge_session_begin() { # SESSION_ID TITLE — создать/переиспользовать и назвать; идемпотентно
+  # stdout при успехе — РЕАЛЬНО использованный session_id: он может отличаться
+  # от запрошенного (см. фоллбэк ниже, #809) — вызывающий обязан читать вывод,
+  # не подставлять свой исходный SESSION_ID вручную (класс #809: task.sh/
+  # dsh_task.sh раньше делали именно так через >/dev/null).
   dsh_edge_require_config || return 1
-  local session_id=$1 title=$2 payload ws
+  local session_id=$1 title=$2 payload ws try_id op_err op_name
   ws=$(dsh_edge_harness_workspace) || return 1
-  payload=$(jq -n --arg wid "$ws" --arg sid "$session_id" '{workspaceId:$wid, sessionId:$sid}')
-  dsh_edge_rpc session.create "$payload" >/dev/null || return 1
-  payload=$(jq -n --arg sid "$session_id" --arg title "$title" '{sessionId:$sid, title:$title}')
-  dsh_edge_rpc session.rename "$payload" >/dev/null || return 1
-  printf '%s\n' "$session_id"
+  try_id="$session_id"
+  local attempt
+  # #871: холодная загрузка УЖЕ СОХРАНЁННОЙ сессии может провалить валидацию
+  # НЕ на session.create, а на session.rename — сервер грузит и валидирует
+  # весь сохранённый объект сессии, чтобы переписать title, ровно так же, как
+  # при create (прод-форма 2026-09-10, run 34471287514/harness-140: create
+  # прошёл идемпотентным no-op, rename отказал текстом «failed validation»,
+  # старая ветка фоллбэка вокруг create одна не сработала ни разу). Обе RPC —
+  # ОДНО место правды на фоллбэк, не два разных дерева обработки ошибки.
+  for attempt in 1 2; do
+    op_err="$WORK/dsh-edge.session-begin.err"
+    payload=$(jq -n --arg wid "$ws" --arg sid "$try_id" '{workspaceId:$wid, sessionId:$sid}')
+    op_name=session.create
+    if dsh_edge_rpc session.create "$payload" >/dev/null 2>"$op_err"; then
+      payload=$(jq -n --arg sid "$try_id" --arg title "$title" '{sessionId:$sid, title:$title}')
+      op_name=session.rename
+      if dsh_edge_rpc session.rename "$payload" >/dev/null 2>"$op_err"; then
+        printf '%s\n' "$try_id"
+        return 0
+      fi
+    fi
+    cat "$op_err" >&2
+    # Класс #809/#871: холодная загрузка испорченной сессии (событие без
+    # полной формы — «lacks an identified message» / «invalid source», обёртка
+    # морды всегда несёт текст «failed validation», прод-форма — живые
+    # прогоны worker.yml 34455120330/harness-716, 34441499974 и
+    # 34471287514/harness-140), может провалиться на ЛЮБОЙ из двух RPC —
+    # кидает при КАЖДОЙ попытке переиспользовать этот session_id, не
+    # временный сбой, ретрай тем же id никогда не поможет. Единственный путь
+    # вперёд без доступа к хранилищу DO (design.md
+    # session-note-identified-message: прямая правка JSONL — вне рамок
+    # агента) — начать НОВУЮ сессию под другим id один раз; если и она не
+    # проходит (ни create, ни rename) — это уже не класс #809/#871
+    # (сеть/деплой морды), второй фоллбэк не даём, чтобы не маскировать
+    # настоящий сбой бесконечным ретраем.
+    if [ "$attempt" -eq 1 ] && grep -q 'failed validation' "$op_err"; then
+      echo "::warning::Сессия $try_id испорчена (холодная загрузка не проходит валидацию хранилища на $op_name, #809/#871) — начинаю новую под другим id, старая остаётся сиротой" >&2
+      try_id="${session_id}-r${GITHUB_RUN_ID:-$$}"
+      continue
+    fi
+    return 1
+  done
+  return 1
 }
 
 dsh_edge_ingest() { # SESSION_ID SPOOL_LINES_FILE — батч строк спула → события морды

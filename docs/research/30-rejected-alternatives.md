@@ -28,6 +28,7 @@
 | 14 | trufflehog вместо gitleaks | Технически сопоставим (Apache 2.0, верификация находок живым API — сильнее gitleaks), но verification-режим по умолчанию делает исходящие запросы к провайдерам с найденной строкой — лишний сетевой вызов с чужими данными без нужды на КАЖДОМ PR | Понадобится верификация «жив ли ключ ещё» как отдельная задача — тогда как опциональный шаг поверх gitleaks, не замена |
 | 15 | Только встроенный GitHub secret scanning + push protection, без Actions-сканера | Уже включён и бесплатен на публичном репо, но ловит только партнёрские форматы (провайдерные regex GitHub'а); `non_provider_patterns` (общие эвристики вида generic-password/generic-api-key) выключены организацией — простая проверка `security_and_analysis` API это подтверждает | Включить `secret_scanning_non_provider_patterns` (настройка UI, не код) — дополняет, не заменяет: он не смотрит историю по требованию/по расписанию отдельно от push, и не даёт локально воспроизводимого прогона |
 | 16 | Кастомные regex-паттерны GitHub secret scanning (`custom patterns`) | Работает похоже на non-provider patterns, но правила живут в настройках репозитория (UI/API), не в git — тот же класс проблемы, что «Решение — это механизм, а не текст» (AGENTS.md): не ревьюится в PR, не версионируется, не виден агенту, читающему дерево | Если понадобится проектно-специфичный паттерн (например, формат `DSH_EDGE_ACCESS_KEY`) — добавить как **правило gitleaks** в `.gitleaks.toml` (версионируется, ревьюится), не как custom pattern GitHub |
+| 17 | GitHub Codespaces как «руки» | Free-тариф — 60 core-h/мес (2 ядра), НЕ безлимитен для public repo как у Actions; расход одного `worker.yml` (замер 2026-09-09) экстраполируется в ~609 core-h/мес — 10x свободного лимита; нет REST-эндпоинта «выполнить команду», только lifecycle | Согласимся платить >=$50/мес за этот слой ИЛИ построится poll-агент в devcontainer, снимающий задачи из очереди DO по HTTPS |
 
 ---
 
@@ -209,6 +210,10 @@ VM. Это не «сложно настроить», это несовмести
 
 **Вернуться если.** Появится контейнер, в котором LiteLLM и так живёт (то есть п.4 или п.11
 уже принят). Отдельно ради LiteLLM контейнер заводить не стоит — это хвост, а не голова.
+
+**Уточнение (2026-09-10).** Живой код LiteLLM не содержит обработки Claude OAuth
+access-токена (`sk-ant-oat`) — для этого конкретного случая замена и не нужна, `llm-pi-ai`
+детектит его нативно сам. Подробности — [research/32](32-claude-oauth-provider.md).
 
 ## 8. Portkey AI Gateway на Workers
 
@@ -413,6 +418,82 @@ gitleaks-detect-live как ОПЦИОНАЛЬНЫЙ второй шаг пов�
 него. Появится причина завести проектно-специфичный паттерн (свой формат ключа) — писать
 правилом в `.gitleaks.toml` (версионируется), не custom pattern в настройках GitHub.
 
+## 17. GitHub Codespaces как «руки»
+
+**Что это.** Полноценная облачная Linux-VM с постоянным диском, привязанная к
+конкретному репозиторию и devcontainer'у, управляемая через веб/VS Code/CLI/REST.
+Не рассматривался ни разу до вопроса владельца 2026-09-09 (белое пятно —
+`docs/research/10-dsh-architecture.md:476` фиксирует «совсем пусто» только для
+поиска СТОРОННИХ dsh-плагинов под GitHub Actions/devcontainer, но не для самого
+Codespaces как варианта инфраструктуры «рук»; в этом файле вариант просто
+отсутствовал.)
+
+**Чем привлекало.** Настоящий Linux (не `just-bash`, не Workers-песочница) —
+DSH встал бы без шимминга под Node/git/PTY, которого требует dsh-edge (см. выше).
+Персистентный диск между `stop`/`start` (подтверждено докой: «Any changes you
+make inside `/workspaces`... are preserved when you stop and start the
+codespace») — снимает ровно ту засаду, которую CF Containers (п.4) называет
+главной («all disk is ephemeral... fresh disk... when it goes to sleep»): не
+нужно выгружать worktree в git перед каждым сном. Автостоп по простою (дефолт
+30 мин, настраиваемо 5-240 мин) — встроенный, а не самодельный, watchdog.
+
+**Почему отвергнуто.**
+
+**(а) Экономика — свободный тариф на порядок меньше и НЕ зависит от видимости
+репозитория.** В отличие от Actions (`standard` раннеры бесплатны и безлимитны
+именно потому, что репозиторий публичный), у Codespaces такого исключения нет:
+«Free hours are assigned to personal accounts» — единый потолок **120 core-hours
+и 15 GB-month хранилища в месяц на аккаунт**, публичность репозитория роли не
+играет. На 2-ядерной машине это **60 часов в месяц**, на 4-ядерной — 30.
+
+Живой замер 2026-09-09 (`gh api .../workflows/worker.yml/runs`, 185 завершённых
+прогонов за 10.1 суток, 2026-08-30...2026-09-09): суммарно **6124 минуты
+раннер-времени**, то есть примерно 10.15 часа/сутки. Экстраполяция на месяц при
+2-ядерном эквиваленте — **примерно 609 core-hours/мес**, и это только один
+`worker.yml` (без `hands.yml`, без CI-workflow'ов). Против свободных 60
+core-hours/мес — превышение **в 10 раз**. По тарифу сверх бесплатного лимита
+($0.18/час за 2-ядерную машину = $0.09/core-hour) это **примерно $49/мес**
+только за эквивалент сегодняшней нагрузки `worker.yml`, притом что сегодня она
+бесплатна и безлимитна на Actions. Дороже уже отвергнутого по цене варианта п.4
+($5/мес) примерно в 10 раз.
+
+**(б) Нет API «выполнить команду».** REST-поверхность Codespaces
+(`docs.github.com/en/rest/codespaces/codespaces`) покрывает только жизненный
+цикл — `POST /repos/{owner}/{repo}/codespaces` (создать), `POST
+/user/codespaces/{name}/start`, `.../stop`, `GET` списком. **Эндпоинта
+«выполнить команду и вернуть результат» нет.** Единственные пути внутрь —
+SSH (`gh codespace ssh`, требует SSH-клиента; из Durable Object/Worker
+недоступно без отдельной обвязки) или собственный poll-агент в
+`postStartCommand`/`postAttachCommand` devcontainer'а, который на старте сам
+тянет задачу по HTTPS из очереди DO — то есть переизобретение pull-модели
+self-hosted runner'а внутри Codespaces, а не замена `repository_dispatch` одной
+строкой конфига. Это отдельный, не измеренный объём работы, а не готовый шов.
+
+**(в) ToS — тот же класс запрета, что у Actions, не мягче.** Секция Codespaces
+в GitHub Terms for Additional Products несёт дословно те же две оговорки, что и
+секция Actions: «any activity that places a burden on our servers, where that
+burden is disproportionate to the benefits provided to users (for example,
+don't use Codespaces... as part of a serverless application)» и «any other
+activity unrelated to the development or testing of the software project
+associated with the repository where GitHub Codespaces is initiated». Держать
+Codespace постоянно разбуженным в ожидании команд — тот же паттерн, что уже
+отклонён в п.3 (WS-туннель); push-модель «поднялся -> отработал -> уснул сам по
+idle-timeout» по смыслу легальна так же, как принятая push-модель на Actions —
+но именно ЭТУ модель ещё предстоит построить (см. (б)), она не дана готовой.
+
+**Что забрать, если решим когда-нибудь строить.** Персистентный диск —
+единственное реальное структурное преимущество перед Actions И перед CF
+Containers одновременно (у обоих — свежее состояние на каждый подъём). Если
+объём работы вырастет настолько, что заводить и переиспользовать один
+долгоживущий воркер станет дешевле, чем клонировать репозиторий заново на
+каждый запуск, это единственный из рассмотренных вариантов, где это дано
+бесплатно (в смысле «не надо самим пилить R2/git push перед сном»).
+
+**Вернуться если.** (1) Согласимся платить сопоставимо с VPS/CF Containers
+($40-60/мес при нынешней нагрузке) — тогда сравнивать нужно против них по
+деньгам, а не против бесплатного Actions; **и** (2) построен poll-агент внутри
+devcontainer'а, снимающий эту задачу с несуществующего сегодня API «выполнить
+команду».
 ## Что выбрано в итоге
 
 Морда — **Workers Assets**: статика всегда жива, ничего не стоит и не зависит от того, есть
@@ -448,6 +529,14 @@ job'а, **не в DO** — из-за 10 ms CPU на invocation на Free (п.6):
 5. **Может ли Model-нода в Dynamic Routing (CF AI Gateway) пришпилить конкретный
    BYOK-алиас.** Единственная известная лазейка к автоматической ротации учёток на CF;
    если подтвердится — вывод п.9 подлежит пересмотру.
+6. **Время cold-start/resume Codespaces (первое создание vs возобновление
+   остановленного).** Официальная документация числа не даёт ни в каком виде;
+   структурно резервуар (персистентный диск) обещает более быстрый повторный
+   старт, чем у Actions/Containers, но это не измерено живым прогоном.
+7. **Проекция ~609 core-hours/мес для `worker.yml` на Codespaces — экстраполяция
+   10.1-суточного окна, не годовой замер.** Нагрузка конвейера меняется по мере
+   роста числа задач в пуле; число показывает порядок величины (кратно выше
+   свободного лимита), а не точный будущий счёт.
 
 ## Источники
 
@@ -463,3 +552,9 @@ job'а, **не в DO** — из-за 10 ms CPU на invocation на Free (п.6):
 - [Helicone ai-gateway — LICENSE (GPL-3.0)](https://github.com/Helicone/ai-gateway/blob/main/LICENSE)
 - [Helicone monorepo — LICENSE (Apache 2.0, для контраста)](https://github.com/Helicone/helicone/blob/main/LICENSE)
 - [Hetzner Cloud — тарифы](https://www.hetzner.com/cloud/)
+- [GitHub Codespaces — billing concepts (free tier 120 core-hours/15GB, per-core-hour цены)](https://docs.github.com/en/billing/concepts/product-billing/github-codespaces)
+- [GitHub pricing — Codespaces free hours per personal account, не по видимости репо](https://github.com/pricing)
+- [GitHub Terms for Additional Products — секция Codespaces (burden/unrelated activity)](https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features)
+- [Codespaces — timeout period (default 30 мин, 5-240 мин)](https://docs.github.com/en/codespaces/setting-your-user-preferences/setting-your-timeout-period-for-github-codespaces)
+- [Codespaces — persistence через rebuild (`/workspaces` переживает stop/start)](https://docs.github.com/en/codespaces/developing-in-a-codespace/rebuilding-the-container-in-a-codespace)
+- [REST API — Codespaces (только lifecycle, нет «выполнить команду»)](https://docs.github.com/en/rest/codespaces/codespaces)
