@@ -92,6 +92,14 @@ dsh() {
           # #737, живой случай — прогон 34188152283: rc=1, НИ ОДНОГО байта в
           # stderr (не пересказ — воспроизводит ровно тот факт).
           return 1 ;;
+        always-rate-limit)
+          # #877: короткое окно RATE_LIMIT, которое НИКОГДА не снимается —
+          # dsh_run_with_retry ретраит, пока не кончится бюджет ожидания
+          # (DSH_RATE_LIMIT_MAX_WAIT_SECS), а не таймаут/квота. Прод-форма
+          # строки — та же, что уже используют dsh-clients.smoke.sh и
+          # dsh_run_with_retry сам ищет («RATE_LIMIT:» без «Weekly/Monthly»).
+          echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+          return 1 ;;
         timeoutkill)
           # #877, живой случай — прогон worker.yml 34498185823: `timeout`
           # убивает процесс SIGTERM без единой строки в stderr — та же
@@ -313,5 +321,30 @@ OUT="$(cat "$LOG")"
 [[ "$OUT" == *"наш таймаут"* ]] || fail "12) сообщение обязано честно называть НАШ таймаут, не «класс не установить»: $OUT"
 [[ "$OUT" != *"стдерр пуст"* && "$OUT" != *"stderr пуст"* ]] || fail "12) rc=124 не должен маскироваться под «стдерр пуст» (#737) — это другая причина: $OUT"
 echo "SMOKE(chain): 12) rc=124 (наш таймаут) -> автопереход с честным сообщением, не спутан с молчанием провайдера (#737) — ок"
+
+# ── 13) #877 (находка ai-review PR #880): бюджет ожидания RATE_LIMIT ОБЩИЙ
+# на весь прогон цепочки, не полный заново на каждого провайдера. PRIMARY
+# никогда не снимает короткий RATE_LIMIT — выжигает ВЕСЬ общий бюджет (60с)
+# сам; SECONDARY получает то, что осталось (0с) и обязан сдаться на ПЕРВОЙ
+# же попытке, не получив собственных полных 60с заново.
+reset_scenario
+SMOKE_MODE_primary_model="always-rate-limit"
+SMOKE_MODE_secondary_model="always-rate-limit"
+LOG="$WORK/log13.txt"
+DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS=30 \
+DSH_RATE_LIMIT_MAX_DELAY_SECS=30 \
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" != "0" ] || fail "13) оба провайдера в вечном RATE_LIMIT — успеха быть не должно"
+[ "$DSH_RUN_FAILURE_REASON" = "all_providers_exhausted" ] || fail "13) ожидался all_providers_exhausted, получено '$DSH_RUN_FAILURE_REASON'"
+[[ "$OUT" == *"остаток общего бюджета RATE_LIMIT: 60с из 60с"* ]] \
+  || fail "13) PRIMARY обязан стартовать с полного общего бюджета (60с): $OUT"
+[[ "$OUT" == *"остаток общего бюджета RATE_LIMIT: 0с из 60с"* ]] \
+  || fail "13) SECONDARY обязан получить то, что осталось от бюджета PRIMARY (0с), а не полные 60с заново: $OUT"
+secondary_attempts=$(grep -c 'dsh: попытка' <(sed -n '/пробую SECONDARY/,$p' "$LOG")) || true
+[ "$secondary_attempts" -le 1 ] \
+  || fail "13) SECONDARY сделал $secondary_attempts попыток — с нулевым остатком бюджета обязана быть ровно одна (бюджет исчерпан ДО первого ретрая): $OUT"
+echo "SMOKE(chain): 13) общий бюджет RATE_LIMIT на весь прогон цепочки, не на каждого провайдера заново — ок"
 
 echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877 зелёная"

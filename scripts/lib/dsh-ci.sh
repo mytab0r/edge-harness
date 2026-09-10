@@ -706,6 +706,11 @@ PATCH
 #   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки dsh
 #   DSH_RUN_FAILURE_REASON  — "" (успех/обычный транспортный отказ) |
 #                             quota_exhausted | rate_limit_retry_budget_exceeded
+#   DSH_RUN_WAITED_SECS     — суммарно проспано в ретрае RATE_LIMIT за ЭТОТ
+#                             вызов (#877): цепочка провайдеров читает его,
+#                             чтобы уменьшать ОБЩИЙ бюджет ожидания на
+#                             следующего провайдера, а не выдавать каждому
+#                             полный бюджет заново (см. dsh_run_with_provider_chain)
 dsh_run_with_retry() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local max_wait="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
@@ -752,6 +757,7 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
     attempt=$((attempt + 1))
   done
   DSH_RUN_RC=$rc
+  DSH_RUN_WAITED_SECS=$waited
 }
 
 # ── Цепочка провайдеров (#727): автопереход по классу отказа ────────────────
@@ -1041,6 +1047,20 @@ dsh_model_confirmed() { # model_id
 # провайдера — не отменяется, остаётся заботой dsh_run_with_retry; чейн решает
 # только «пробовать ли СЛЕДУЮЩЕГО».
 #
+# #877 (находка ai-review PR #880): DSH_RATE_LIMIT_MAX_WAIT_SECS — ОБЩИЙ
+# бюджет ожидания на ВЕСЬ прогон цепочки, не полный бюджет заново на КАЖДОГО
+# провайдера. Без этого арифметика бюджета таймаута (10 попыток × 20 мин
+# укладываются в 280-минутный job) не учитывала бы, что застрявший в коротком
+# RATE_LIMIT провайдер способен добавить к своему таймауту ещё до
+# DSH_RATE_LIMIT_MAX_WAIT_SECS (по умолчанию 1800с/30 мин) ожидания — 10
+# провайдеров × (20 мин таймаут + 30 мин ретрая) = 500 мин ≫ 280-минутного
+# бюджета. Общий бюджет читается ОДИН раз в начале прогона цепочки (значение
+# вызывающего), дальше расходуется по факту (DSH_RUN_WAITED_SECS от каждой
+# попытки), не восстанавливается для следующего провайдера — «не начинать
+# следующего провайдера с нуля впустую» в терминах ожидания RATE_LIMIT.
+# Собственный таймаут КАЖДОГО провайдера (DSH_TIMEOUT_SECS, зависание) этим
+# общим бюджетом не ограничен — это отдельная, независимая ось отказа.
+#
 # Использование:
 #   dsh_run_with_provider_chain <answer_file> <err_file> <prompt_text>
 # (вызывающий обязан вызвать dsh_require_provider_chain раньше и упасть
@@ -1080,6 +1100,11 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
   # вызывается, но не полагаемся на это).
   local _prev_chain_active="${DSH_CHAIN_ACTIVE:-}"
   DSH_CHAIN_ACTIVE=1
+  # #877: общий бюджет ожидания RATE_LIMIT на весь прогон цепочки — см.
+  # комментарий выше у объявления функции. Значение вызывающего читается
+  # РОВНО один раз здесь, до цикла; rl_remaining ниже — то, что осталось.
+  local chain_rl_budget="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+  local chain_rl_used=0 rl_remaining
   while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
     entry=$(jq -c ".[$i]" <<<"$DSH_PROVIDER_CHAIN")
     name=$(jq -r '.name' <<<"$entry")
@@ -1112,10 +1137,13 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
       i=$((i + 1))
       continue
     fi
-    echo "цепочка провайдеров: пробую $name ($base_url, $model)"
+    rl_remaining=$((chain_rl_budget - chain_rl_used))
+    [ "$rl_remaining" -lt 0 ] && rl_remaining=0
+    echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_remaining}с из ${chain_rl_budget}с (#877)"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
-    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
     if [ "$DSH_RUN_RC" -eq 0 ]; then
       DSH_CHAIN_PROVIDER="$name"
       DSH_RUN_FAILURE_REASON=""
