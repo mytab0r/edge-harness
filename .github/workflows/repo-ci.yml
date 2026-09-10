@@ -500,6 +500,16 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_dispatch_token_usage.py -q
 
+      # Класс «job-level permissions заменяет workflow-level целиком, issues:
+      # write теряется молча» (#884, живой прогон 34520146758, PR #870, job
+      # `verdict` — комментарий в WATCHDOG_ISSUE #120 упал 403 при зелёном
+      # job'е). Мутация: убрать issues: write из permissions job'а `verdict`
+      # в ai-review.yml — тест краснеет с именем job'а.
+      - name: Гвардия прав — job, пишущий в Issues API, обязан issues:write в СВОЁМ permissions
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_job_permissions_issues_write_guard.py -q
+
       # Реестр меток «тормоз → газ» (задача #207): docs/agents/LABELS.md не
       # хардкодит список меток — scripts/lib/collect_labels.py собирает их
       # сканированием scripts/, .github/workflows/, .github/ISSUE_TEMPLATE/.

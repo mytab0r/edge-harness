@@ -48,7 +48,9 @@ error, неоднозначность никогда не одобряет.
 автоматически ставит review:large-ok (см. apply_large_ok/large_ok_decision) —
 взгляд человека делегирован состоявшемуся вердикту AI, а не факту запуска.
 Диффы длиннее check_pr.LARGE_DIFF_HUGE_LINES автоматика не подтверждает —
-эскалирует владельцу через pulse_guard.escalate.
+эскалирует владельцу через pulse_guard.escalate. Недоставленная ни одним
+каналом эскалация (#884) — не warning в зелёном job'е: cmd_verdict красит job
+(exit 1), см. apply_large_ok/escalation_fully_failed.
 
 Среда: runner с gh, GH_TOKEN с правами pull-requests: write (gather/verdict).
 """
@@ -1055,23 +1057,54 @@ def cmd_should_run(args: argparse.Namespace) -> int:
 
 # ── verdict: разбор ответа, комментарий, метка ────────────────────────────────
 
-def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str) -> None:
+# Класс «недоставленная эскалация молчит» (#884, живой прогон 34520146758,
+# PR #870): pulse_guard.escalate — best-effort по КАЖДОМУ каналу (issue-
+# комментарий + Telegram), поэтому её отказ сам по себе не красит ничего —
+# ровно то, что запрещает AGENTS.md «fail loud, не silent-wrong». Функция ниже
+# читает СТРОГО тот текст, который escalate() обещает в своём докстринге
+# (scripts/orchestra/pulse_guard.py::escalate, файл вне области этой правки):
+# f"Telegram: {доставлен|НЕ доставлен}; след в #<N>: {оставлен|НЕ оставлен}".
+# Не пересказ формата, а прямое чтение поля результата — синхронность с
+# реальной функцией pulse_guard.escalate проверяет
+# test_ai_review.py::test_escalation_fully_failed_matches_pulse_guard_escalate_format,
+# который вызывает НАСТОЯЩИЙ escalate() с замоканными сетевыми примитивами
+# (тест кормит прод-форму, не наш пересказ).
+def escalation_fully_failed(result: str) -> bool:
+    """True — НИ ОДИН канал эскалации (pulse_guard.escalate) не доставил
+    сигнал: ни issue-комментарий, ни Telegram. Такую эскалацию считать
+    состоявшейся нельзя — владелец физически не узнал о решении, которое
+    от него ждут."""
+    return "НЕ доставлен" in result and "НЕ оставлен" in result
+
+
+def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str) -> bool:
     """Проводка чистого large_ok_decision: ставит review:large-ok сама, либо
     эскалирует владельцу по каналу pulse_guard.escalate (#204, п.3). Молчит
-    на «skip» — дифф не review:large или AI не одобрил, ничего не меняется."""
+    на «skip» — дифф не review:large или AI не одобрил, ничего не меняется.
+
+    Возвращает False ровно тогда, когда эскалация была НУЖНА (decision ==
+    "escalate") и НЕ ДОСТАВЛЕНА ни одним каналом (#884) — вызывающая сторона
+    (cmd_verdict) обязана превратить это в красный job, а не в ::warning::,
+    который никто не читает без повода."""
     decision = large_ok_decision(added, current_labels, verdict)
     if decision == "skip":
-        return
+        return True
     if decision == "ok":
         run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
                "-f", f"labels[]={review_labels.LARGE_OK}")
         print(f"large-ok: +{added} строк ≤ {check_pr.LARGE_DIFF_HUGE_LINES} — "
               f"{review_labels.LARGE_OK} поставлена автоматически")
-        return
+        return True
     text = huge_diff_escalation_text(pr, added)
     result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+    if escalation_fully_failed(result):
+        print(f"::error::large-ok: +{added} строк > {check_pr.LARGE_DIFF_HUGE_LINES} — "
+              f"эскалация владельцу НЕ ДОСТАВЛЕНА ни одним каналом ({result}) — "
+              "владелец не узнал, что PR ждёт его решения (AGENTS.md «fail loud»)")
+        return False
     print(f"::warning::large-ok: +{added} строк > {check_pr.LARGE_DIFF_HUGE_LINES} — "
           f"эскалация владельцу ({result})")
+    return True
 
 
 def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head: str) -> None:
@@ -1202,7 +1235,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
     # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
-    apply_large_ok(repo, args.pr, added, labels_after, verdict)
+    # escalation_delivered — считается ДО остальных side-effect'ов ниже
+    # (чеклист, комментарий), но решение по нему принимается в самом конце
+    # функции (#884): недоставленная эскалация не должна стоить владельцу
+    # собственно комментария/чеклиста ревью — те обязаны уйти в любом случае,
+    # красным становится только КОД ВОЗВРАТА (падает job, не теряется вердикт).
+    escalation_delivered = apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
     # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
     # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
@@ -1231,6 +1269,14 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"::error::ответ не соответствует контракту вердикта ({reason}) "
               f"— ai:failed, ревью повторится")
         print(f"хвост ответа:\n{tail}")
+        return 1
+    if not escalation_delivered:
+        # #884: комментарий/метка/чеклист уже ушли (см. код выше) — вердикт
+        # НЕ теряется, но job обязан быть красным: единственный признак, что
+        # PR ждёт решения владельца, который его не получил ни одним каналом.
+        # ::error:: уже напечатан внутри apply_large_ok с деталями каналов.
+        print(f"verdict: {verdict} — {label}, но эскалация large-ok владельцу "
+              "не доставлена ни одним каналом — job красный (AGENTS.md «fail loud»)")
         return 1
     print(f"verdict: {verdict} — {label}")
     return 0
