@@ -363,10 +363,23 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 # `node`-процесс) уже прочитал значение и записал его в файл на диске —
 # после этого секрет из окружения ЭТОГО bash-процесса (и, следовательно, из
 # окружения любого дочернего `dsh`, стартующего позже) больше не нужен.
+#
+# Изоляция битого аккаунта (#859, живой инцидент PR #858, 2026-09-10): в
+# ANTHROPIC_OAUTH_1 попал ведущий UTF-8 BOM (EF BB BF) — `node ... add`
+# падал SyntaxError ДО того, как строка дошла до JSON.parse, старая версия
+# этой функции отвечала return 1 и роняла ВЕСЬ шаг ai-review дважды подряд,
+# хотя цепочка из 7 живых провайдеров (config/provider-usage.json) рядом и
+# рабочая. Пул — НЕ критичный провайдер (design.md
+# anthropic-oauth-pool-standalone): один битый секрет обязан быть пропущен с
+# внятным ::warning::, а не ронять потребителя. BOM снимается здесь же, у
+# единственного места, где секрет читается как JSON. Разбор/валидация идут
+# через jq ЗДЕСЬ, в bash, а не полагаются на текст stderr node — так лог не
+# рискует напечатать производное секрета (AGENTS.md «Секреты»: GitHub
+# маскирует только точное совпадение значения).
 dsh_import_anthropic_accounts() {
   [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
   echo "::group::Импорт аккаунтов Anthropic OAuth pool (#838)"
-  local secret_name value creds_file imported=0 idx=0 account_id
+  local secret_name value creds_file imported=0 skipped=0 idx=0 account_id
   for secret_name in "${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[@]}"; do
     idx=$((idx + 1))
     account_id="anthropic-$idx"
@@ -374,14 +387,35 @@ dsh_import_anthropic_accounts() {
     if [ -z "$value" ]; then
       continue
     fi
+    # Снять ведущий UTF-8 BOM (EF BB BF), если он есть — живая форма
+    # инцидента #859. Байтовый префикс, не зависит от locale.
+    value="${value#$'\xef\xbb\xbf'}"
+
+    if ! jq -e . >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — невалидный JSON (даже после снятия BOM), аккаунт $account_id пропущен, пул продолжает с остальными аккаунтами/цепочкой (#859)"
+      unset "$secret_name"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | (($o.accessToken // "") | length > 0) and (($o.refreshToken // "") | length > 0)' >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken/refreshToken, аккаунт $account_id пропущен (#859)"
+      unset "$secret_name"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
     creds_file=$(mktemp)
     chmod 600 "$creds_file"
     printf '%s' "$value" >"$creds_file"
-    if ! node "$DSH_ANTHROPIC_POOL_EXTRACTED/bin/dsh-anthropic-pool.js" add "$account_id" "$creds_file"; then
+    if ! node "$DSH_ANTHROPIC_POOL_EXTRACTED/bin/dsh-anthropic-pool.js" add "$account_id" "$creds_file" >/dev/null 2>&1; then
+      # Защитная ветка: базовая проверка выше уже отсекла BOM/невалидный
+      # JSON/отсутствующие поля — сюда попадает то, что jq не проверяет
+      # (например safeId плагина). Тот же приём: пропустить, не падать.
       rm -f "$creds_file"
       unset "$secret_name"
-      echo "::error::dsh-anthropic-pool add $account_id не смог импортировать секрет $secret_name — быстрый провайдер Claude не подключён (#838)"
-      echo "::endgroup::"; return 1
+      echo "::warning::dsh-anthropic-pool add $account_id отказал, хотя секрет $secret_name прошёл базовую проверку — аккаунт пропущен, пул продолжает (#859)"
+      skipped=$((skipped + 1))
+      continue
     fi
     rm -f "$creds_file"
     unset "$secret_name"
@@ -389,11 +423,15 @@ dsh_import_anthropic_accounts() {
     echo "аккаунт $account_id импортирован из секрета $secret_name (значение удалено из окружения)"
   done
   if [ "$imported" = 0 ]; then
-    # Недостижимо в норме: dsh_install_anthropic_pool уже проверил has_secret
-    # ДО того, как выставил DSH_ANTHROPIC_POOL_ACTIVE=1. Fail loud на
-    # несоответствие инварианта, а не тихий проход с пустым пулом.
-    echo "::error::DSH_ANTHROPIC_POOL_ACTIVE=1, но ни один секрет не дал импортируемый аккаунт — рассинхрон инварианта (#838)"
-    echo "::endgroup::"; return 1
+    # Раньше считалось недостижимым (dsh_install_anthropic_pool уже проверил
+    # has_secret) — теперь достижимо: has_secret проверяет только непустоту,
+    # не валидность. Все секреты оказались битыми (skipped>0) — пул тихо
+    # отключается для ЭТОГО прогона, потребитель уходит на цепочку/одиночный
+    # провайдер как раньше, не падает (#859).
+    echo "::warning::ни один секрет ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]} не дал импортируемый аккаунт ($skipped пропущено) — быстрый провайдер Claude отключается для этого прогона, используется цепочка/одиночный провайдер (#838, #859)"
+    DSH_ANTHROPIC_POOL_ACTIVE=0
+    echo "::endgroup::"
+    return 0
   fi
   echo "::endgroup::"
 }
