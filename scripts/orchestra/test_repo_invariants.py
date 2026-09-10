@@ -53,6 +53,16 @@ def open_pr(number, pr_body="", labels=()):
             "head": {"sha": f"sha{number}"}}
 
 
+def health_snapshot_contents_response(rows: list[dict]) -> dict:
+    """Прод-форма ответа `GET /repos/{repo}/contents/{path}` (GitHub Contents
+    API — base64 в поле `content`), какую реально отдаёт эндпоинт, что читает
+    `repo_invariants.fetch_pipeline_health_history` (инвариант 12, #882)."""
+    import base64
+    import json
+    text = "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n"
+    return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 1: задача открыта без исполнителя, PR уже слит
 # ══════════════════════════════════════════════════════════════════════════
@@ -185,8 +195,21 @@ class FakeGh:
     FakeGh._DEFAULT_ROUTES: без него КАЖДЫЙ существующий тест
     check_stuck_review_gate/check_ai_failed_budget_exhausted был бы обязан
     завести собственную строку «нет активных прогонов», хотя сама занятость
-    ai-review.yml не их предмет."""
-    _DEFAULT_ROUTES = {"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}
+    ai-review.yml не их предмет.
+
+    Запасной маршрут для истории снимков здоровья конвейера (инвариант 12,
+    #882): реалистичный дефолт — 404 (ветки data/pipeline-health на живом
+    репозитории на момент этого фикса ещё не существует вовсе, ровно предмет
+    инцидента). Тест, которому нужен ЗДОРОВЫЙ снимок, переопределяет этот
+    маршрут явно (см. test_pipeline_health_snapshot_stale_* ниже) — без этого
+    дефолта КАЖДЫЙ существующий тест build_report был бы обязан завести
+    собственный маршрут contents/pipeline-health.jsonl, хотя история снимков
+    не их предмет."""
+    _DEFAULT_ROUTES = {
+        "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
+        "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
+            "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
+    }
 
     def __init__(self, routes):
         self.routes = {**self._DEFAULT_ROUTES, **routes}
@@ -1690,6 +1713,11 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
             "workflow_runs": [{"conclusion": "success", "created_at": "2026-09-03T11:00:00Z",
                                 "updated_at": "2026-09-03T11:00:00Z", "html_url": "https://x/1"}],
         },
+        # Инвариант 12 (#882): свежий снимок здоровья того же дня — переопределяет
+        # реалистичный дефолт FakeGh._DEFAULT_ROUTES (404), чтобы этот тест
+        # остался про ДРУГИЕ инварианты, а не про историю снимков.
+        "contents/docs/research/data/pipeline-health.jsonl":
+            health_snapshot_contents_response([{"date": "2026-09-03", "merge_throughput": 1}]),
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
@@ -1789,3 +1817,141 @@ def test_provider_usage_manifest_missing_file_is_transitional_not_a_violation(tm
 def test_provider_usage_manifest_in_ci_gating_with_gas():
     assert 11 in ri.CI_GATING
     assert 11 in ri.GATING_RELEASE_CONDITION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 12 (#882): механизм снимков здоровья конвейера заявляет успех,
+# а снимков за N суток нет
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой инцидент: `data/pipeline-health` не существовала вовсе, шаг orchestra.yml
+# «Само-аудит здоровья конвейера» рапортовал conclusion=success ~96 раз в сутки.
+# `check_pipeline_health_snapshot_stale` — чистая функция, `now` инъекцией (не
+# `datetime.now()`, класс «тесты-бомбы» здесь недопустим).
+
+
+def test_pipeline_health_snapshot_stale_empty_history_is_never_written():
+    now = utc(2026, 9, 10, 12, 0)
+    violations = ri.check_pipeline_health_snapshot_stale([], now)
+    assert violations == [{"last_date": None, "age_days": None}]
+
+
+def test_pipeline_health_snapshot_stale_fresh_snapshot_is_silent():
+    history = [{"date": "2026-09-09", "merge_throughput": 1}]
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_pipeline_health_snapshot_stale(history, now) == []
+
+
+def test_pipeline_health_snapshot_stale_boundary_at_threshold_is_silent():
+    """Ровно на пороге (age_days == max_age_days) — ещё не нарушение, тот же
+    приём «строго после порога», что у остальных age-based инвариантов этого
+    файла (UNHEALTHY_PR_AFTER_MINUTES: `age <= порог` — здорово)."""
+    history = [{"date": "2026-09-08", "merge_throughput": 1}]
+    now = utc(2026, 9, 10, 12, 0)  # age_days == 2 == PIPELINE_HEALTH_STALE_AFTER_DAYS
+    assert ri.check_pipeline_health_snapshot_stale(history, now) == []
+
+
+def test_pipeline_health_snapshot_stale_old_snapshot_flags_with_age():
+    history = [{"date": "2026-09-05", "merge_throughput": 1}]
+    now = utc(2026, 9, 10, 12, 0)
+    violations = ri.check_pipeline_health_snapshot_stale(history, now)
+    assert violations == [{"last_date": "2026-09-05", "age_days": 5}]
+
+
+def test_pipeline_health_snapshot_stale_mutation_guard():
+    """Мутация-доказательство: без порога любая история старше 0 дней уже
+    нарушение — снимок «вчера» ложно краснел бы каждый день. Тест ловит
+    регресс «порог убрали/занулили»."""
+    history = [{"date": "2026-09-09", "merge_throughput": 1}]
+    now_next_day = utc(2026, 9, 10, 12, 0)  # age_days == 1, в пределах порога 2
+    assert ri.check_pipeline_health_snapshot_stale(history, now_next_day) == []
+
+
+def test_pipeline_health_snapshot_stale_not_in_ci_gating():
+    # Наблюдательный по построению (см. докстринг инварианта 12 в
+    # repo_invariants.py) — сразу после включения фикса история ещё пуста,
+    # гейтить с ходу означало бы красить `test` за собственный переходный
+    # период (тот же класс «тормоз без газа», от которого уже отказались
+    # для 1/4/5/9).
+    assert 12 not in ri.CI_GATING
+
+
+def test_pipeline_health_snapshot_stale_is_escalating():
+    assert 12 in ri.ESCALATING_INVARIANTS
+
+
+def test_fetch_pipeline_health_history_uses_mockable_transport(monkeypatch):
+    """Регрессия-класс (docstring patch_gh выше, живой случай issue #120):
+    fetch_pipeline_health_history обязана идти через `gh()` этого модуля
+    (мокаемый в тестах и патчащий `ri.gh`/`ri.pulse_guard.gh` разом), а не
+    через собственный subprocess.run — иначе тест build_report реально ушёл
+    бы в сеть."""
+    fake = FakeGh({
+        "contents/docs/research/data/pipeline-health.jsonl":
+            health_snapshot_contents_response([{"date": "2026-09-01", "merge_throughput": 3}]),
+    })
+    patch_gh(monkeypatch, fake)
+    history = ri.fetch_pipeline_health_history("mytab0r/edge-harness")
+    assert history == [{"date": "2026-09-01", "merge_throughput": 3}]
+
+
+def test_fetch_pipeline_health_history_404_is_empty_history_not_error(monkeypatch):
+    fake = FakeGh({})  # только дефолтный маршрут — 404 (см. FakeGh._DEFAULT_ROUTES)
+    patch_gh(monkeypatch, fake)
+    assert ri.fetch_pipeline_health_history("mytab0r/edge-harness") == []
+
+
+def test_fetch_pipeline_health_history_other_error_is_loud(monkeypatch):
+    fake = FakeGh({
+        "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
+            "gh api repos/o/r/contents/...: HTTP 403: rate limit"),
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="403"):
+        ri.fetch_pipeline_health_history("mytab0r/edge-harness")
+
+
+def test_build_report_flags_never_written_snapshot(monkeypatch):
+    """Живой инцидент #882 воспроизведён целиком через build_report: история
+    снимков здоровья пуста (дефолтный маршрут FakeGh — 404, тот же факт, что
+    ветки data/pipeline-health на живом репозитории не существовало)."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[12] == [{"last_date": None, "age_days": None}]
+    assert any("🚨" in line and "[12]" in line and "НИ РАЗУ" in line for line in lines)
+
+
+def test_run_escalations_pipeline_health_dedupes_by_last_date(monkeypatch):
+    """Эскалация «раз на состояние» (тот же приём, что у 1/3): тот же
+    last_date не эскалируется второй раз подряд, смена last_date — новая
+    эскалация (штатный повтор при устаревании ещё на день не должен спамить
+    Telegram на каждом 15-минутном пульсе)."""
+    calls = []
+
+    def fake_issue_marker_times(repo, issue, marker):
+        return [utc(2026, 9, 10, 0, 0)] if "2026-09-05" in marker else []
+
+    def fake_escalate(repo, issue, text):
+        calls.append(text)
+        return "отправлено"
+
+    monkeypatch.setattr(ri, "issue_marker_times", fake_issue_marker_times)
+    monkeypatch.setattr(ri, "escalate", fake_escalate)
+
+    already_escalated = {12: [{"last_date": "2026-09-05", "age_days": 5}]}
+    assert ri.run_escalations("mytab0r/edge-harness", already_escalated) == []
+    assert calls == []
+
+    new_state = {12: [{"last_date": "2026-09-06", "age_days": 4}]}
+    lines = ri.run_escalations("mytab0r/edge-harness", new_state)
+    assert len(calls) == 1 and "2026-09-06" in calls[0]
+    assert any("инвариант 12" in line for line in lines)
