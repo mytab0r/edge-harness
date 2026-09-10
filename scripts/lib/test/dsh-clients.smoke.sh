@@ -110,7 +110,22 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
             body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":true,\"value\":{\"sessionId\":\"$_sid\",\"agentPreset\":\"dsh-edge\"}}}"
           fi ;;
         session.rename)
-          body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"title":"smoke","seq":1}}}' ;;
+          # #871: прод-случай harness-140 (run 34471287514, 2026-09-10) —
+          # холодная загрузка проваливает валидацию НЕ на session.create
+          # (он прошёл идемпотентным no-op), а на session.rename (сервер
+          # грузит и валидирует весь сохранённый объект сессии, чтобы
+          # переписать title). SMOKE_CORRUPTED_RENAME_SESSION_ID делает
+          # rename ОДНОЙ конкретной сессии навсегда испорченным тем же
+          # прод-текстом, что и session.create выше (класс общий, RPC разный)
+          # — create для того же id должен пройти нормально (см. ветку
+          # session.create выше, она не знает про эту переменную).
+          local _rsid
+          _rsid=$(printf '%s' "${data_str:-}" | command jq -r '.payload.sessionId // empty' 2>/dev/null)
+          if [ -n "${SMOKE_CORRUPTED_RENAME_SESSION_ID:-}" ] && [ "$_rsid" = "$SMOKE_CORRUPTED_RENAME_SESSION_ID" ]; then
+            body="{\"type\":\"server-response\",\"rpcId\":\"s\",\"result\":{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"stored session \\\"$_rsid\\\" failed validation: Error: session event at seq 2833 lacks an identified message\"}}}"
+          else
+            body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"title":"smoke","seq":1}}}'
+          fi ;;
         workspace.archiveSession)
           body='{"type":"server-response","rpcId":"s","result":{"ok":true,"value":{"archivedSessionIds":[]}}}' ;;
         *)
@@ -619,13 +634,44 @@ GH_ISSUE_JSON='{"number":123,"title":"Smoke задача: испорченная
 # Обе попытки session.create видны в журнале: первая (harness-123) отказана,
 # вторая (harness-123-r<run_id>, фоллбэк) принята — задача всё равно доведена
 # до DSH и до отчёта, job зелёный.
-create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG")
+# grep -c возвращает rc=1 при нуле совпадений (нет матча — не ошибка здесь,
+# число 0 и так печатается) — под set -e это оборвало бы скрипт ДО
+# диагностического ::error:: ниже; || true отдаёт решение проверке ниже.
+create_calls=$(grep -cF "MORDE-RPC session.create" "$CALLLOG" || true)
 [ "$create_calls" -ge 2 ] \
   || { echo "::error::SMOKE: worker-corrupted-session: ожидалось ≥2 вызова session.create (отказ + фоллбэк), получено $create_calls" >&2
        cat "$CALLLOG" >&2; exit 1; }
 assert_log "MORDE-INGEST" "worker-corrupted-session: транскрипт не уехал в морду после фоллбэка на новый id"
 assert_log "GH-COMMENT" "worker-corrupted-session: нет отчёта в задачу после фоллбэка"
 echo "SMOKE: worker-corrupted-session — ок"
+
+# ── Испорченная холодная загрузка ИМЕННО на session.rename (#871) ─────────────────
+# Прод-форма — дословно из живого прогона worker.yml 34471287514 (2026-09-10,
+# harness-140): session.create для УЖЕ СОХРАНЁННОЙ сессии прошёл (идемпотентный
+# no-op), а session.rename отказал тем же текстом «failed validation» — фикс
+# #809/PR #868 держал фоллбэк только вокруг session.create, поэтому этот класс
+# бричил задачу заново ПОСЛЕ мержа #868. dsh_edge_session_begin обязан
+# пережить отказ на любом из двух RPC одним и тем же фоллбэком.
+scenario_start
+SMOKE_CORRUPTED_RENAME_SESSION_ID="harness-124" \
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="124" \
+RUNNER_TEMP="$TMP/rt-w-corrupted-rename" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":124,"title":"Smoke задача: испорченная сессия на rename","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия в морде","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+  run_client "worker-corrupted-session-rename" "$REPO/scripts/worker/task.sh"
+# Обе попытки session.rename видны в журнале: первая (harness-124) отказана,
+# вторая (harness-124-r<run_id>, фоллбэк) принята — задача всё равно доведена
+# до DSH и до отчёта, job зелёный.
+rename_calls=$(grep -cF "MORDE-RPC session.rename" "$CALLLOG" || true)
+[ "$rename_calls" -ge 2 ] \
+  || { echo "::error::SMOKE: worker-corrupted-session-rename: ожидалось ≥2 вызова session.rename (отказ + фоллбэк), получено $rename_calls" >&2
+       cat "$CALLLOG" >&2; exit 1; }
+assert_log "MORDE-INGEST" "worker-corrupted-session-rename: транскрипт не уехал в морду после фоллбэка на новый id"
+assert_log "GH-COMMENT" "worker-corrupted-session-rename: нет отчёта в задачу после фоллбэка"
+echo "SMOKE: worker-corrupted-session-rename — ок"
 
 # ── Сценарии аренды (#121): занято/свободно на мини-сервере замков ────────────────
 # Отказ claim = зелёный no-op: job завершается 0, работы НЕТ (нет сессии в
