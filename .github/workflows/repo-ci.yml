@@ -864,6 +864,11 @@ jobs:
       - name: Smoke цепочки LLM-провайдеров (#727)
         run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
 
+      # Гвардия критерия успеха воркера (#876) — в каталоге гвардий (#749):
+      # scripts/ci/guards/worker-success-gate-guard.sh, не рукописный шаг
+      # здесь (ALLOWLIST-ratchet ci_guard_registration_guard.py не даёт
+      # новым шагам попадать в этот файл).
+
       # Гвардия стыка suite ротации учёток (#215) и цепочки провайдеров
       # (#727/#737) — design.md dsh-in-job «Стык suite и цепочки
       # провайдеров»: обе переменные разом — fail loud, не молчаливый
