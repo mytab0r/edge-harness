@@ -5928,6 +5928,35 @@ def test_dispatch_worker_holds_off_when_all_free_candidates_quarantined(monkeypa
     assert fake.mutating_calls() == []
 
 
+def test_dispatch_worker_bypasses_quarantined_task_when_not_first_candidate(monkeypatch):
+    """Мутация (находка ревью PR #870, блокирующая): верни проверку
+    `candidates[0]["number"] in quarantined` вместо пересечения по ВСЕМУ
+    списку — этот тест покраснеет. Карантинная #140 здесь НЕ первая
+    (#90 младше по номеру и не в карантине), поэтому старое условие молчало
+    и уходило bare-диспатчем, где task.sh мог по своему снимку выбрать
+    именно #140."""
+    pool = [issue(90, assignees=()), issue(140, assignees=()), issue(200, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
+        "workflows/worker.yml/dispatches": None,
+        **_QUARANTINE_LIVE_140_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        903: _QUARANTINE_LIVE_140_LOG, 902: _QUARANTINE_LIVE_140_LOG, 901: _QUARANTINE_LIVE_140_LOG,
+    })))
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[], now=utc(2026, 9, 9, 13, 5))
+    assert any("карантине" in line for line in observations + actions)
+    dispatches = [c for c in fake.mutating_calls() if "worker.yml/dispatches" in c]
+    # Адресный диспатч (inputs[task]=...), не bare — иначе task.sh сам
+    # выбирает свободную задачу и может взять карантинную #140.
+    assert dispatches == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[task]=90"
+    ]
+
+
 def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatch):
     """Проводка в main() (не внутри dispatch_worker) — мутация-гвардия для
     критической находки ревью PR #466: верни `if dispatch_allowed and

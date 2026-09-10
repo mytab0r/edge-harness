@@ -35,6 +35,12 @@ on:
         default: ""
 
 permissions:
+  # contents: read — не задавать permissions: неявно "все none" (находка
+  # ревью PR #870, блокирующая): при явном блоке permissions незаданные
+  # скоупы становятся none, а actions/checkout (первый шаг) требует
+  # contents:read даже без persist-credentials — без этой строки job не
+  # доживает до DSH ни разу. Тот же скоуп, что worker.yml/hands.yml.
+  contents: read
   issues: write
   pull-requests: write
 
@@ -66,6 +72,27 @@ jobs:
       - name: Зафиксировать начало окна прогона
         id: window
         run: echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Находка ревью PR #870 (блокирующая): без этого шага у DSH-агента нет
+      # НИ ОДНОГО рабочего gh-креденшела — `gh issue close`/`gh pr close`
+      # внутри headless-сессии падают с «authentication required», потолок
+      # закрытий честно насчитает 0, drain-эпизод не закроется, а
+      # dispatch_pm_groom идемпотентен на эпизод — повторной попытки не
+      # будет (тихий no-op вместо автоматики). GH_RUN_TOKEN в env шага ниже
+      # не спасает: DSH вырезает из вызовов модель-шелла все env-переменные
+      # с именами *TOKEN*/*KEY*/*SECRET (проверено живым прогоном
+      # 2026-08-30, тот же класс, что уже описан в worker.yml). Login кладёт
+      # креды в hosts.yml — файл, не env, — DSH-скраб его не касается,
+      # ровно тот же приём, что worker.yml уже использует для git push.
+      - name: gh-авторизация под PAT владельца
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: |
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
+          gh auth status 2>&1 | grep -E 'Logged in|account' || true
 
       - name: Триаж PR-беклога через DSH headless
         env:

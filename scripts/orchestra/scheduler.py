@@ -2987,7 +2987,14 @@ def dispatch_worker(
         except RuntimeError as error:
             observations.append(f"⚠️ карантин задачи-отравы не проверен (не критично): {error}")
             quarantined = set()
-        if quarantined and candidates and candidates[0]["number"] in quarantined:
+        # Находка ревью PR #870 (блокирующая): проверять только candidates[0]
+        # недостаточно — карантинная задача может стоять не первой в этом
+        # (возможно деградировавшем к REST-снимку, см. try/except graph выше)
+        # списке, при этом task.sh внутри bare-диспатча выбирает ПО СВОЕМУ
+        # свежему GraphQL-снимку и может взять именно её. Пересечение с ЛЮБЫМ
+        # кандидатом, не только первым, — иначе карантин тихо обходится.
+        quarantined_candidates = [c["number"] for c in candidates if c["number"] in quarantined]
+        if quarantined_candidates:
             safe_candidates = free_task.prioritized_free(named_pool, excluded=quarantined)
             if safe_candidates:
                 target = safe_candidates[0]["number"]
@@ -2996,8 +3003,9 @@ def dispatch_worker(
                     f"repos/{repo}/actions/workflows/worker.yml/dispatches",
                     "-f", "ref=main", "-f", f"inputs[task]={target}",
                 )
+                quarantined_names = ", ".join(f"#{n}" for n in quarantined_candidates)
                 actions.append(
-                    f"🧯 задача #{candidates[0]['number']} в карантине ({QUARANTINE_AFTER}+ падений "
+                    f"🧯 задача(и) {quarantined_names} в карантине ({QUARANTINE_AFTER}+ падений "
                     f"worker.yml подряд) — worker.yml запущен адресно на #{target}, минуя её"
                 )
             else:
