@@ -282,6 +282,14 @@ _td_spec = importlib.util.spec_from_file_location(
 task_deps = importlib.util.module_from_spec(_td_spec)
 _td_spec.loader.exec_module(task_deps)
 
+# Персистентное состояние квоты провайдеров (#857, openspec/changes/
+# provider-quota-gating) — одно место правды на формат reset-хинта и на
+# носитель (vars.DSH_PROVIDER_QUOTA_UNTIL), design.md там же.
+_pqs_spec = importlib.util.spec_from_file_location(
+    "provider_quota_state", Path(__file__).resolve().parent / "provider_quota_state.py")
+provider_quota_state = importlib.util.module_from_spec(_pqs_spec)
+_pqs_spec.loader.exec_module(provider_quota_state)
+
 STALE_HOURS = 24
 TASK_LABEL = "task"
 # Одно место правды — review_labels.py (см. should_update_branch там же,
@@ -2720,21 +2728,59 @@ def parse_reset_hint_dates(reset_hint: str) -> list[datetime]:
     08:51:55») — вторая форма читается как UTC (dsh зону не называет, это
     ближайшее разумное допущение, не факт). Строка, которая не разобралась
     ни одним форматом, пропускается молча — вызывающий обязан трактовать
-    пустой результат как «даты нет», не как «дата в прошлом»."""
-    dates: list[datetime] = []
-    for chunk in (reset_hint or "").split(";"):
-        chunk = chunk.strip()
-        if not chunk or ":" not in chunk:
-            continue
-        _, _, raw = chunk.partition(":")
-        raw = raw.strip()
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                dates.append(datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc))
-                break
-            except ValueError:
-                continue
-    return dates
+    пустой результат как «даты нет», не как «дата в прошлом».
+
+    С #857 разбор дат делегирован provider_quota_state.parse_reset_hint_pairs
+    (одно место правды на формат — тот же самый парсер теперь пишет
+    персистентное состояние квоты, см. sync_provider_quota_state ниже).
+    Список (не словарь) сохранён ради обратной совместимости вызывающих,
+    которым важен только набор дат (min(reset_dates) и т.п.), не имя."""
+    return list(provider_quota_state.parse_reset_hint_pairs(reset_hint).values())
+
+
+def sync_provider_quota_state(repo: str, reset_hint: str, now: datetime) -> str | None:
+    """Персистентное состояние квоты провайдеров (vars.DSH_PROVIDER_QUOTA_UNTIL,
+    {provider: reset_iso}, design.md provider-quota-gating, #857) — газ
+    «провайдер снова успешен ИЛИ срок прошёл» из AGENTS.md «Тормоз без газа
+    не принимается»: протухшие записи (`now` перевалил за `reset_iso`)
+    снимаются здесь же, попутно с записью нового `reset_hint`. Чейн-раннер
+    (`dsh_run_with_provider_chain`, scripts/lib/dsh-ci.sh) читает эту же
+    переменную ДО попытки провайдера и пропускает его, не тратя вызов —
+    вот для чего пишется состояние.
+
+    Вызывается ИЗ trigger_ai_review там, где уже вычисляется reset-at факт
+    последнего комментария ai-review (не заводит второй сетевой обход PR
+    ради этого механизма). Пустой reset_hint — вызывающий обязан не звать
+    эту функцию вовсе (нечего мержить, а expire_stale без свежего факта не
+    даёт достаточного повода тратить сетевой раунд-трип на каждый PR/тик —
+    протухание всё равно снимется, когда придёт следующий реальный факт,
+    ЛИБО не аффектит корректность гейта: чтение в dsh-ci.sh само сравнивает
+    reset_iso с текущим временем).
+
+    Best-effort: сбой чтения/записи переменной не должен ронять остальной
+    тик пульса — сюда уже дошли после успешного гейта 1, падать здесь
+    значило бы терять остальную работу trigger_ai_review из-за
+    второстепенного механизма. Возвращает строку-наблюдение или None
+    (состояние не поменялось — не льём дополнительный шум в отчёт)."""
+    try:
+        state = provider_quota_state.load_quota_state(repo, gh)
+        state, expired = provider_quota_state.expire_stale(state, now)
+        state, changed = provider_quota_state.merge_reset_hints(state, reset_hint, now)
+        if expired or changed:
+            provider_quota_state.save_quota_state(repo, state, gh)
+    except RuntimeError as error:
+        return (
+            f"⚠️ квота провайдеров: не удалось обновить vars.{provider_quota_state.QUOTA_VAR_NAME}: "
+            f"{error}"
+        )
+    if not (expired or changed):
+        return None
+    bits = []
+    if changed:
+        bits.append(f"обновлено из reset-at ({reset_hint})")
+    if expired:
+        bits.append(f"сняты протухшие: {', '.join(sorted(expired))}")
+    return f"💾 квота провайдеров: {'; '.join(bits)}"
 
 
 def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list[str], list[str]]:
@@ -2771,7 +2817,17 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
             # всю историю PR: список дат сброса не зависит от эпохи review:ok).
             comment = review_labels.latest_ai_comment(repo, pull["number"], gh)
             facts = review_labels.header_facts(comment.get("body") or "") if comment else {}
-            reset_dates = parse_reset_hint_dates(facts.get("reset-at", ""))
+            reset_hint = facts.get("reset-at", "")
+            # #857: персистентное состояние квоты (vars.DSH_PROVIDER_QUOTA_UNTIL)
+            # — пишется здесь же, где reset-at факт уже вычислен (не заводит
+            # второй сетевой обход ради этого механизма). Пустой факт — нечего
+            # мержить, вызов пропускается вовсе (см. sync_provider_quota_state
+            # докстринг).
+            if reset_hint:
+                quota_note = sync_provider_quota_state(repo, reset_hint, now)
+                if quota_note:
+                    observations.append(quota_note)
+            reset_dates = parse_reset_hint_dates(reset_hint)
             if reset_dates and now < min(reset_dates):
                 next_viable = min(reset_dates)
                 marker = f"{AI_REVIEW_CHAIN_COOLDOWN_MARKER} #{pull['number']}"

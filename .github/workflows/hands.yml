@@ -81,6 +81,11 @@ jobs:
           # Статичные DEEPSEEK_BASE_URL/DEEPSEEK_MODEL убраны из env — их
           # теперь выставляет сам dsh_task.sh из chain[0].
           DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          # Персистентное состояние квоты (#857, JSON {provider: reset_iso})
+          # — читается контекстом workflow БЕЗ токена, тем же путём, что
+          # DSH_PROVIDER_CHAIN выше; пишет ТОЛЬКО пульс оркестратора
+          # (scripts/orchestra/provider_quota_state.py).
+          DSH_PROVIDER_QUOTA_UNTIL: ${{ vars.DSH_PROVIDER_QUOTA_UNTIL }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           # Окно контекста env-provider-маршрута combo-router (#789) — тот же
           # источник, что уже требует присутствие DEEPSEEK_MODEL для каталога

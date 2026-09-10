@@ -467,6 +467,12 @@ jobs:
           # dsh_require_provider_chain в review/ai_dsh.sh падает громко до
           # какой-либо дорогой работы.
           DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          # Персистентное состояние квоты (#857, JSON {provider: reset_iso})
+          # — читается контекстом workflow БЕЗ токена, тем же путём, что
+          # DSH_PROVIDER_CHAIN выше: пишет ТОЛЬКО пульс оркестратора
+          # (scripts/orchestra/provider_quota_state.py), этот недоверенный
+          # шаг только читает vars.* и не получает никакого нового права.
+          DSH_PROVIDER_QUOTA_UNTIL: ${{ vars.DSH_PROVIDER_QUOTA_UNTIL }}
           # Suite ротации учёток (#215) сюда НЕ прокидывается: этот шаг всегда
           # идёт через цепочку провайдеров выше, а suite с ней конструктивно
           # не совместим (design.md dsh-in-job, «Стык suite и цепочки

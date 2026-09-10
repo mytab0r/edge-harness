@@ -31,10 +31,24 @@ white-spot #824); до его подключения файл правится �
 
 | Потребитель | Цепочка | Провайдеров | Механизм |
 |---|---|---|---|
-| `ai-review` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/review/ai_dsh.sh) — полный failover |
-| `worker` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/worker/task.sh) — полный failover |
-| `hands` | `default-chain` | 8 | dsh_run_with_provider_chain (scripts/hands/dsh_task.sh) — полный failover (#805) |
+| `ai-review` | `default-chain` | 9 | dsh_run_with_provider_chain (scripts/review/ai_dsh.sh) — полный failover |
+| `worker` | `default-chain` | 9 | dsh_run_with_provider_chain (scripts/worker/task.sh) — полный failover |
+| `hands` | `default-chain` | 9 | dsh_run_with_provider_chain (scripts/hands/dsh_task.sh) — полный failover (#805) |
 | `morda` | (вне манифеста) | — | 1 слот адаптера через Settings -> Models (plugins-src/provider-registry, #378) — failover туда не помещается, вне манифеста принципиально (docs/runbooks/switch-llm-provider.md, «Морда — вне цепочки принципиально») |
+
+С #857 (`openspec/changes/provider-quota-gating`) запись `GLM` переставлена
+из хвоста цепочки (где её держал #848 из-за живой квоты на момент замера
+латентности) в начало, за ней добавлена запись `ZAI` (второй z.ai-аккаунт)
+— безопасно только вместе с персистентным квота-гейтом
+(`scripts/lib/dsh-ci.sh::dsh_provider_quota_gate_skip`,
+`vars.DSH_PROVIDER_QUOTA_UNTIL`): пока квота этих двух записей не сброшена,
+чейн-раннер пропускает их ДО попытки, не тратя вызов на заведомо
+исчерпанный провайдер. Запись `ZAI` не подтверждена реестром #737 (см.
+`$comment` записи в `config/provider-usage.json` — конкретные id моделей
+литералом не приводятся здесь: класс #153, этот файл конкатенируется прямо
+в промпт агента) — безопасный no-op до живой сверки `/v1/models`. Остаток
+цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок не менялись —
+унаследованы от #848 (discovery по измеренной латентности).
 
 Обнови эту таблицу той же командой, которой её сгенерировал сборщик —
 гвардия сверит буквально:
