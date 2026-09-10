@@ -1184,6 +1184,7 @@ def test_branch_protection_opt_in_disabled_by_default(monkeypatch):
         "pulls?state=open": [],
         "graphql": graphql_pool_page(),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1201,6 +1202,7 @@ def test_branch_protection_opt_in_enabled_reads_and_reports(monkeypatch):
         "branches/main/protection": HEALTHY_PROTECTION,
         "graphql": graphql_pool_page(),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1228,6 +1230,7 @@ def test_declared_deps_opt_out_skips_expensive_graphql_fetch(monkeypatch):
         "pulls?state=closed": [],
         "pulls?state=open": [],
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1249,6 +1252,7 @@ def test_declared_deps_fetch_error_isolated_does_not_abort_whole_report(monkeypa
         "graphql": ri.task_deps.TaskDepsError(
             "issue #999: blockedBy усечён (20 из 41)"),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -1726,6 +1730,9 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # остался про ДРУГИЕ инварианты, а не про историю снимков.
         "contents/docs/research/data/pipeline-health.jsonl":
             health_snapshot_contents_response([{"date": "2026-09-03", "merge_throughput": 1}]),
+        # Инвариант 12 (#876): полнотекстовый поиск не находит ни одного
+        # комментария с противоречивой фразой — здоровое состояние.
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", tmp_path / "changes-empty")
@@ -1929,6 +1936,7 @@ def test_build_report_flags_never_written_snapshot(monkeypatch):
         "pulls?state=open": [],
         "graphql": graphql_pool_page(),
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -2098,6 +2106,7 @@ def test_build_report_wires_invariant_13(monkeypatch):
             worker_run(1, "2026-09-10T11:20:00Z"),
         ]},
         "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
+        "search/issues": {"items": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -2105,3 +2114,57 @@ def test_build_report_wires_invariant_13(monkeypatch):
     lines, findings = ri.build_report("mytab0r/edge-harness", now)
     assert len(findings[13]) == 1
     assert any("🚨" in line and "[13]" in line and "0 реальных" in line for line in lines)
+# Инвариант 14: воркер не рапортует успех при пустом провайдере (#876)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
+    fake = FakeGh({"search/issues": {"items": []}})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == []
+
+
+def test_worker_false_success_comment_flags_live_incident_form(monkeypatch):
+    # Прод-форма самого инцидента (#876, прогон worker.yml 34498185823,
+    # задача #140): Search API вернул бы этот комментарий, если бы фраза
+    # снова появилась — не пересказ, дословный ответ формы items[].
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 140, "html_url": "https://github.com/mytab0r/edge-harness/issues/140",
+             "title": "какая-то задача"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_worker_false_success_comment(REPO)
+    assert violations == [{
+        "issue": 140,
+        "url": "https://github.com/mytab0r/edge-harness/issues/140",
+        "title": "какая-то задача",
+    }]
+
+
+def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):
+    # Мутация: если запрос когда-нибудь начнёт искать другую фразу (например
+    # обобщённое «справился» без «провайдер: ?») — это либо ложные
+    # срабатывания на КАЖДЫЙ настоящий успех, либо тихая потеря сигнала.
+    # Литерал ЗАШИТ здесь буквально (не через ri.WORKER_FALSE_SUCCESS_MARKER):
+    # если бы тест сверял константу саму с собой, мутация значения константы
+    # прошла бы мимо теста — проверяем дословный прод-текст шаблона task.sh.
+    fake = FakeGh({"search/issues": {"items": []}})
+    patch_gh(monkeypatch, fake)
+    ri.check_worker_false_success_comment(REPO)
+    assert any("справился (провайдер: ?)" in call for call in fake.calls), (
+        f"запрос обязан нести точный маркер противоречия: {fake.calls}"
+    )
+
+
+def test_worker_false_success_comment_best_effort_on_network_failure(monkeypatch):
+    fake = FakeGh({"search/issues": RuntimeError("gh api: rate limited")})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == []
+
+
+def test_worker_false_success_comment_not_in_ci_gating():
+    # Наблюдательный: доступность стороннего Search API не должна красить
+    # обязательную проверку `test` (см. докстринг check_worker_false_success_comment).
+    assert 14 not in ri.CI_GATING

@@ -159,6 +159,16 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       count_consecutive_failures), которые conveyor_gate и так использует
       внутри себя. Наблюдательный, не гейтящий: живой замер долга на момент
       внедрения ещё не сделан (тот же порядок, что у 1/5/9/10/12).
+  14. check_worker_false_success_comment (#876) — комментарий воркера несёт
+      противоречивую фразу «справился (провайдер: ?)» (живой инцидент —
+      прогон worker.yml 34498185823, задача #140, 2026-09-10: dsh упал на
+      всех провайдерах, а воркер отрапортовал успех по PR, существовавшему с
+      прошлого прогона). После фикса #876 (dsh_worker_run_is_success,
+      scripts/lib/dsh-ci.sh) фраза структурно не может родиться заново —
+      появление снова значит регресс самого фикса. Наблюдательный, не в
+      CI_GATING: полнотекстовый поиск (Search API) сам по себе может быть
+      недоступен best-effort, гейтить обязательную проверку доступностью
+      стороннего API было бы новым тормозом без содержательного смысла.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -1699,6 +1709,42 @@ def check_conveyor_gate_phantom_pause(repo: str) -> list[dict]:
         "last_marker_at": max(t for t, _ in markers).isoformat(),
         "latest_run_url": runs[0].get("html_url"),
     }]
+# Инвариант 14: воркер не рапортует успех при пустом провайдере (#876)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Дословный фрагмент шаблона scripts/worker/task.sh (до фикса #876): пустой
+# WORKER_CHAIN_PROVIDER рендерится в буквальный «?» — сообщение об успехе,
+# ссылающееся на неизвестного провайдера, само себе противоречит (dsh не
+# ответил успехом ни разу, если провайдер неизвестен). После фикса #876
+# (dsh_worker_run_is_success в scripts/lib/dsh-ci.sh) успех структурно
+# требует непустого провайдера — эта строка не может родиться заново, кроме
+# как регрессом самого фикса.
+WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
+
+
+def check_worker_false_success_comment(repo: str) -> list[dict]:
+    """Инвариант 14 (issue #876, живой инцидент — прогон worker.yml
+    34498185823, задача #140, 2026-09-10): комментарий «Автономный воркер
+    справился (провайдер: ?)» — противоречие само себе, после фикса #876
+    структурно невозможно (см. WORKER_FALSE_SUCCESS_MARKER выше). Полнотекстовый
+    поиск по комментариям задач (Search API — тот же эндпоинт и тот же
+    отдельный бюджет 30 запросов/мин, что уже использует scheduler.py::
+    _existing_task_replacement, основной core-бюджет не трогает, #454) — если
+    маркер снова где-то появится, это регресс класса, а не гипотеза.
+
+    Best-effort, как и check_recurring_worker_failure выше: сеть/квота
+    недоступна -> [] — у наблюдательного инварианта нет действия жёстче
+    наблюдения, а состояние перепроверится на следующем прогоне."""
+    query = f'repo:{repo} in:comments "{WORKER_FALSE_SUCCESS_MARKER}"'
+    try:
+        result = gh("-X", "GET", "search/issues", "-f", f"q={query}")
+    except RuntimeError:
+        return []
+    items = (result or {}).get("items") or []
+    return [
+        {"issue": item.get("number"), "url": item.get("html_url"), "title": item.get("title")}
+        for item in items
+    ]
 
 
 def build_report(repo: str, now: datetime,
@@ -1934,6 +1980,14 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [13] нет фантомной паузы конвейера "
                       "(маркер серии без реальных подряд-провалов, issue #899)")
+    v14 = check_worker_false_success_comment(repo)
+    findings[14] = v14
+    if v14:
+        lines.append(f"🚨 [14] {len(v14)} комментариев несут противоречие «справился (провайдер: ?)» (#876):")
+        for item in v14:
+            lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
+    else:
+        lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
 
     return lines, findings
 
