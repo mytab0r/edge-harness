@@ -204,11 +204,19 @@ class FakeGh:
     маршрут явно (см. test_pipeline_health_snapshot_stale_* ниже) — без этого
     дефолта КАЖДЫЙ существующий тест build_report был бы обязан завести
     собственный маршрут contents/pipeline-health.jsonl, хотя история снимков
-    не их предмет."""
+    не их предмет.
+
+    Запасной маршрут для комментариев #120 (инвариант 13, #899): здоровый
+    дефолт — пустой список (маркеров серии конвейера нет). Без него КАЖДЫЙ
+    существующий тест build_report был бы обязан завести собственный
+    маршрут issues/120/comments, хотя фантомная пауза конвейера — не их
+    предмет; тест, которому нужны конкретные маркеры, переопределяет этот
+    маршрут явно (уже так делают тесты #196/#220 выше)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
+        "issues/120/comments": [],
     }
 
     def __init__(self, routes):
@@ -1955,3 +1963,145 @@ def test_run_escalations_pipeline_health_dedupes_by_last_date(monkeypatch):
     lines = ri.run_escalations("mytab0r/edge-harness", new_state)
     assert len(calls) == 1 and "2026-09-06" in calls[0]
     assert any("инвариант 12" in line for line in lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 13: фантомная пауза конвейера (issue #899)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def pause_marker_comment(when: str) -> dict:
+    return {"created_at": when, "body": ri.pulse_guard.PAUSE_MARKER}
+
+
+def probe_marker_comment(when: str, attempt: int) -> dict:
+    return {"created_at": when,
+            "body": ri.pulse_guard.probe_alert_text(
+                attempt, ri.pulse_guard.probe_backoff_minutes(attempt), None, "err")}
+
+
+def test_phantom_pause_flags_active_marker_with_zero_real_failures(monkeypatch):
+    """Живой класс инцидента 2026-09-10 (issue #899): маркер серии активен
+    (новее анкера), самый свежий прогон ЗАВЕРШЁН (conclusion='skipped' —
+    не провал и не success, count_consecutive_failures останавливается на
+    нём и вернёт 0), а держать паузу нечем."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_conveyor_gate_phantom_pause(REPO)
+    assert len(violations) == 1
+    assert violations[0]["failures"] == 0
+    assert violations[0]["threshold"] == ri.pulse_guard.WORKER_FAILURE_PAUSE_AFTER
+    assert violations[0]["last_marker_at"] == "2026-09-10T11:45:00+00:00"
+    assert violations[0]["latest_run_url"] == f"https://github.com/{REPO}/actions/runs/5"
+
+
+def test_phantom_pause_silent_when_no_marker(monkeypatch):
+    """Здоровое состояние: серии нет вовсе (нет маркеров) — паузе неоткуда
+    взяться."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(1, "2026-09-10T11:00:00Z", conclusion="success"),
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+
+
+def test_phantom_pause_silent_when_real_failures_meet_threshold(monkeypatch):
+    """Здоровое состояние: реальных подряд-провалов ровно порог (или больше)
+    — пауза оправдана, не фантомная."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(3, "2026-09-10T11:50:00Z"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+
+
+def test_phantom_pause_silent_when_head_run_still_in_progress(monkeypatch):
+    """Здоровое состояние (issue #899, п.2): голова списка ещё выполняется
+    (conclusion=None) — законное объяснение неопределённости, не фантом."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-10T11:55:00Z", conclusion=None),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            pause_marker_comment("2026-09-10T11:45:00Z"),
+            probe_marker_comment("2026-09-10T11:55:00Z", 1),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+
+
+def test_phantom_pause_completion_time_anchor_clears_stale_marker(monkeypatch):
+    """Мутационное доказательство — тот же сценарий, что чинит conveyor_gate
+    (issue #899): успешный прогон стартовал T0, маркер поставлен посреди
+    него (T0+80мин), завершился успехом в T0+180мин. Анкер серии строится по
+    updated_at успеха (см. pulse_guard.series_anchor) — маркер посреди
+    прогона старше анкера и вычёркивается, инвариант молчит."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(9, "2026-09-10T15:49:00Z", updated_at="2026-09-10T18:49:00Z",
+                       conclusion="success"),
+            worker_run(8, "2026-09-10T14:00:00Z"),
+            worker_run(7, "2026-09-10T13:00:00Z"),
+            worker_run(6, "2026-09-10T12:00:00Z"),
+        ]},
+        "issues/120/comments": [probe_marker_comment("2026-09-10T17:09:00Z", 4)],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+
+
+def test_phantom_pause_best_effort_on_network_failure(monkeypatch):
+    """Сеть недоступна — best-effort [] (тот же принцип, что у 10/12): отказ
+    инфраструктуры не должен ронять весь build_report ради инварианта, у
+    которого и так нет действия жёстче наблюдения."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": RuntimeError("gh api: 502"),
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+
+
+def test_phantom_pause_not_in_ci_gating():
+    """Долг на живом репозитории ещё не измерен (тот же порядок, что у
+    1/5/9/10/12) — наблюдательный, не гейтящий."""
+    assert 13 not in ri.CI_GATING
+
+
+def test_build_report_wires_invariant_13(monkeypatch):
+    """Проводка build_report: фантомная пауза видна строкой [13] с фактом
+    (не гипотезой) — числом реальных провалов и порогом."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[13]) == 1
+    assert any("🚨" in line and "[13]" in line and "0 реальных" in line for line in lines)
