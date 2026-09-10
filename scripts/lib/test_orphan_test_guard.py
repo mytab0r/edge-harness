@@ -185,13 +185,16 @@ def test_build_report_default_catalog_dir_resolves_from_repo_root_not_live_catal
     # схлопнуться в 0 по инерции живого каталога.
     lib = tmp_path / "scripts" / "lib"
     lib.mkdir(parents=True)
-    (lib / "test_default_catalog.py").write_text("def test_x():\n    assert True\n")
+    (lib / "test_default_catalog.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
     (workflows / "repo-ci.yml").write_text(
         "jobs:\n  test:\n    steps:\n"
         "      - name: perebor\n"
-        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n"
+        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n",
+        encoding="utf-8",
     )
     report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows)
     assert report["orphans"] == ["scripts/lib/test_default_catalog.py"]
@@ -265,7 +268,9 @@ def test_build_report_covers_test_invoked_only_inside_catalog_file(tmp_path):
     # шагом workflow (bash scripts/ci/run_guards.sh).
     lib = tmp_path / "scripts" / "lib"
     lib.mkdir(parents=True)
-    (lib / "test_via_catalog.py").write_text("def test_x():\n    assert True\n")
+    (lib / "test_via_catalog.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
 
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
@@ -274,7 +279,8 @@ def test_build_report_covers_test_invoked_only_inside_catalog_file(tmp_path):
     (workflows / "repo-ci.yml").write_text(
         "jobs:\n  test:\n    steps:\n"
         "      - name: perebor\n"
-        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n"
+        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n",
+        encoding="utf-8",
     )
 
     catalog = tmp_path / "scripts" / "ci" / "guards"
@@ -289,7 +295,9 @@ def test_build_report_covers_test_invoked_only_inside_catalog_file(tmp_path):
     # Убери перебор из workflow (никто больше не вызывает run_guards.sh) —
     # тот же тест-файл снова осиротевший, а не молча остаётся зелёным по
     # инерции старого прогона: catalog_dir существует, но не подключён.
-    (workflows / "repo-ci.yml").write_text("jobs:\n  test:\n    steps: []\n")
+    (workflows / "repo-ci.yml").write_text(
+        "jobs:\n  test:\n    steps: []\n", encoding="utf-8"
+    )
     report_unwired = otg.build_report(repo_root=tmp_path, workflows_dir=workflows, catalog_dir=catalog)
     assert report_unwired["orphans"] == ["scripts/lib/test_via_catalog.py"]
 
