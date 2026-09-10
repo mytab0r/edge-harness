@@ -5,6 +5,10 @@
 # (не пересказом), и не ломает атрибуцию существующей цепочки провайдеров
 # при отказе/отсутствии.
 #
+# Секции 6-8 — класс #859 (живой инцидент PR #858, 2026-09-10): BOM/битый
+# JSON в ОДНОМ секрете пула не роняет весь шаг, аккаунт пропускается, пул
+# продолжает с остальными аккаунтами/цепочкой.
+#
 # Запуск: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
 set -euo pipefail
 
@@ -152,6 +156,52 @@ command -v node >/dev/null || fail "node не найден — гвардия т
 ) || fail "2) импорт аккаунта прод-кодом плагина сломан"
 echo "GUARD(anthropic-pool): 2) импорт секрета прод-кодом плагина -> файл создан верно, секрет вычищен из окружения — ок"
 
+# ── 6) BOM в начале ИНАЧЕ валидного секрета -> BOM снимается, аккаунт
+#      импортируется как обычно (не пропускается) — прод-форма живого
+#      инцидента (#859: ANTHROPIC_OAUTH_1 с ведущим EF BB BF). Второй секрет
+#      в этом же прогоне — намеренно битый JSON -> пропущен с warning, но
+#      функция НЕ падает и первый (валидный после BOM-strip) всё равно
+#      импортирован. ─────────────────────────────────────────────────────
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$FIXTURE_PKG"
+  export DSH_ANTHROPIC_POOL_DIR="$WORK/anthropic-accounts-bom"
+  # BOM (EF BB BF) перед иначе валидным JSON — прод-форма инцидента PR #858.
+  export ANTHROPIC_OAUTH_1=$'\xef\xbb\xbf{"claudeAiOauth":{"accessToken":"bom-access-token","refreshToken":"bom-refresh-token"}}'
+  # Битый JSON — второй секрет в этом же прогоне, не должен утянуть за собой первый.
+  export ANTHROPIC_OAUTH_2='{"claudeAiOauth": not valid json'
+  LOG="$WORK/log6.txt"
+  dsh_import_anthropic_accounts >"$LOG" 2>&1 || { echo "::error::6) dsh_import_anthropic_accounts НЕ ДОЛЖЕН падать на BOM/битом JSON: $(cat "$LOG")" >&2; exit 1; }
+  [ "$DSH_ANTHROPIC_POOL_ACTIVE" = "1" ] || { echo "::error::6) есть один валидный аккаунт (после BOM-strip) — пул обязан остаться активным" >&2; exit 1; }
+  ACCOUNT_FILE="$DSH_ANTHROPIC_POOL_DIR/anthropic-1.json"
+  [ -f "$ACCOUNT_FILE" ] || { echo "::error::6) $ACCOUNT_FILE не создан — секрет с BOM обязан восстановиться и импортироваться: $(cat "$LOG")" >&2; exit 1; }
+  got_access=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).claudeAiOauth.accessToken)" "$ACCOUNT_FILE")
+  [ "$got_access" = "bom-access-token" ] || { echo "::error::6) accessToken не перенесён верно после BOM-strip: '$got_access'" >&2; exit 1; }
+  [ ! -f "$DSH_ANTHROPIC_POOL_DIR/anthropic-2.json" ] || { echo "::error::6) битый JSON (ANTHROPIC_OAUTH_2) не должен был импортироваться" >&2; exit 1; }
+  grep -qi "невалидный JSON" "$LOG" || { echo "::error::6) лог обязан назвать причину пропуска аккаунта 2: $(cat "$LOG")" >&2; exit 1; }
+  [ -z "${ANTHROPIC_OAUTH_1:-}" ] || { echo "::error::6) ANTHROPIC_OAUTH_1 обязан быть unset после обработки" >&2; exit 1; }
+  [ -z "${ANTHROPIC_OAUTH_2:-}" ] || { echo "::error::6) ANTHROPIC_OAUTH_2 обязан быть unset даже при пропуске (секрет уже прочитан)" >&2; exit 1; }
+) || fail "6) BOM/битый JSON рядом с валидным секретом сломаны"
+echo "GUARD(anthropic-pool): 6) BOM восстановлен и импортирован, соседний битый JSON пропущен, шаг не падает — ок"
+
+# ── 7) ОБА секрета битые (без единого валидного аккаунта) -> функция НЕ
+#      падает, пул сам себя отключает (DSH_ANTHROPIC_POOL_ACTIVE=0) —
+#      живая форма «плохой секрет пула не роняет гейт» (#859) в
+#      максимальном виде: без единого рабочего аккаунта пул тихо выходит
+#      из игры вместо ::error::+return 1 (старое поведение до #859). ───────
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$FIXTURE_PKG"
+  export DSH_ANTHROPIC_POOL_DIR="$WORK/anthropic-accounts-allbad"
+  export ANTHROPIC_OAUTH_1='{not valid json at all'
+  export ANTHROPIC_OAUTH_2='{"claudeAiOauth":{"accessToken":"","refreshToken":""}}'
+  LOG="$WORK/log7.txt"
+  dsh_import_anthropic_accounts >"$LOG" 2>&1 || { echo "::error::7) dsh_import_anthropic_accounts НЕ ДОЛЖЕН падать, даже если ВСЕ секреты биты: $(cat "$LOG")" >&2; exit 1; }
+  [ "$DSH_ANTHROPIC_POOL_ACTIVE" = "0" ] || { echo "::error::7) без единого валидного аккаунта пул обязан себя отключить (получено '$DSH_ANTHROPIC_POOL_ACTIVE'): $(cat "$LOG")" >&2; exit 1; }
+  [ ! -d "$DSH_ANTHROPIC_POOL_DIR" ] || [ -z "$(ls -A "$DSH_ANTHROPIC_POOL_DIR" 2>/dev/null)" ] || { echo "::error::7) ни один файл аккаунта не должен был появиться" >&2; exit 1; }
+) || fail "7) все секреты биты — пул обязан тихо отключиться, а не падать"
+echo "GUARD(anthropic-pool): 7) все секреты пула биты -> пул сам отключается, шаг не падает — ок"
+
 # ── 3) dsh_run_with_pool_then_chain: пул отвечает успехом -> цепочка НЕ
 #      запускается вовсе, атрибуция называет пул. ───────────────────────────
 export DSH_CONFIRMED_MODELS_FILE="$WORK/confirmed-models.json"
@@ -231,5 +281,29 @@ echo "GUARD(anthropic-pool): 4) пул отказывает -> честный о
   [ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || { echo "::error::5) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — пул неактивен, не должен упоминаться" >&2; exit 1; }
 ) || fail "5) поведение без пула изменилось относительно состояния ДО этого change"
 echo "GUARD(anthropic-pool): 5) пул неактивен -> нулевое изменение поведения цепочки — ок"
+
+# ── 8) Сквозной путь: dsh_install_anthropic_pool видит секреты (активирует
+#      пул) -> dsh_import_anthropic_accounts не находит ни одного валидного
+#      аккаунта (оба секрета биты) -> пул сам себя отключает ->
+#      dsh_run_with_pool_then_chain идёт СРАЗУ на цепочку, не пытаясь
+#      смонтировать пустой пул (#859: живой инцидент — именно так должен
+#      был вести себя PR #858 вместо падения ДО цепочки). ─────────────────
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$FIXTURE_PKG"
+  export DSH_ANTHROPIC_POOL_DIR="$WORK/anthropic-accounts-e2e"
+  export ANTHROPIC_OAUTH_1=$'\xef\xbb\xbf{invalid json with bom'
+  export ANTHROPIC_OAUTH_2=''
+  export SMOKE_MODE_primary_model=ok
+  LOG="$WORK/log8.txt"
+  dsh_import_anthropic_accounts >"$LOG" 2>&1 || { echo "::error::8) dsh_import_anthropic_accounts НЕ ДОЛЖЕН падать: $(cat "$LOG")" >&2; exit 1; }
+  [ "$DSH_ANTHROPIC_POOL_ACTIVE" = "0" ] || { echo "::error::8) пул обязан себя отключить после нуля валидных аккаунтов" >&2; exit 1; }
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::8) ожидался успех цепочки, получено rc=$DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::8) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || { echo "::error::8) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — самоотключившийся пул не должен упоминаться" >&2; exit 1; }
+) || fail "8) сквозной путь «все секреты пула биты -> сразу цепочка» сломан"
+echo "GUARD(anthropic-pool): 8) все секреты пула биты сквозным путём -> шаг доходит до цепочки, не падает — ок (класс #859)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838) — гвардия зелёная"
