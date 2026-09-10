@@ -1,6 +1,6 @@
 # GitHub Actions как «руки»: лимиты, бесплатность и границы правил
 
-> Исследовано 2026-08-28; дополнено 2026-08-31 (блок GitHub API из egress CF, живой замер). Смежное: [Cloudflare Free](20-cloudflare-free.md), [отвергнутое](30-rejected-alternatives.md)
+> Исследовано 2026-08-28; дополнено 2026-08-31 (блок GitHub API из egress CF, живой замер), 2026-09-10/11 (job-level permissions, gh pr list). Смежное: [Cloudflare Free](20-cloudflare-free.md), [отвергнутое](30-rejected-alternatives.md)
 
 ## TL;DR
 
@@ -205,6 +205,33 @@ PAT несёт заголовок `X-OAuth-Scopes` со списком скоу�
 
 Практическое следствие всё равно одно: всё, что должно зажечь проверки (push ветки PR, создание PR, synchronize), делается под PAT (`GH_PIPELINE_PAT`; до задачи #6 эту роль молча выполнял широкий PAT из `GH_DISPATCH_TOKEN`) — иначе CI тихо не просыпается. Кампания замера задержки ([ADR 0005](../decisions/0005-dispatch-tail-campaign.md)) использует PAT на всём пути — и для диспатча в том числе, чтобы не зависеть от непроверенного исключения. В связке с ловушкой default-branch выше: «диспатч ушёл, run'а нет» — проверять обе причины: файл на main и токен-источник события.
 
+### 🔴 Job-level `permissions:` ПОЛНОСТЬЮ ЗАМЕНЯЕТ workflow-level (2026-09-10, #884/#890)
+
+Живой инцидент и причина: job `verdict` в `ai-review.yml` не имел `issues: write` в объявлении `permissions:`, хотя workflow-level это право имел. Результат: комментарий в issue #120 падал с `403 Resource not accessible by integration` (эскалация владельцу не доходила), а метка на сам PR проходила успешно — создал иллюзию, что права в порядке.
+
+**Правило:** в GitHub Actions job-level `permissions:` — это не дополнение к workflow-level, а ПОЛНАЯ замена. Workflow-level игнорируется, если job явно переоъявляет права. Если job не объявляет `permissions:` вообще — тогда наследует от workflow-level (по умолчанию — `contents: read`).
+
+```yaml
+# ❌ Неправильно: думаем, что наследуем workflow-level
+jobs:
+  my-job:
+    permissions:
+      pull-requests: write    # только это право, issues НЕ будет!
+    runs-on: ubuntu-latest
+```
+
+```yaml
+# ✅ Правильно: явно перечисляем все нужные права
+jobs:
+  my-job:
+    permissions:
+      pull-requests: write
+      issues: write           # обязательно добавить
+    runs-on: ubuntu-latest
+```
+
+Гвардия `scripts/lib/test_job_permissions_issues_write_guard.py` (задача #884, PR #890, коммит aa357d58) ловит этот класс ошибок для `issues: write` — проверяет, что если job пишет в issue/PR, то этот раздел присутствует и явен.
+
 ### 🔴 GitHub API из egress Cloudflare Workers: измеренный блок 403
 
 Замерено живым прогоном 2026-08-31 (приёмка эпика #17, первый живой тест
@@ -272,6 +299,20 @@ runs workflow `dispatch-latency-probe` (31 schedule-ран против ~465 о�
 > "In a public repository, scheduled workflows are automatically disabled when no repository activity has occurred in 60 days."
 
 Расписание на публичном репозитории само себя выключит через 60 дней тишины. Схема, где cron — единственная живая часть, деградирует молча.
+
+---
+
+## GitHub CLI `gh pr list`: семантика `--search` vs `--head` (2026-09-10, #891/#893)
+
+**Ловушка:** `gh pr list --search "head:<ветка>"` и `gh pr list --head <ветка>` **матчат по-разному**.
+
+- **`--search "head:<ветка>"`** — подстрока. На живом прогоне поиск по одной ветке вернул 30 посторонних PR вместо 1-2 ожидаемых. Пример: поиск по `head:task-branch` вернёт и `task-branch`, и `main-task-branch-fix`, и `my-task-branch-v2`, и всё, в чём есть substring `task-branch`.
+
+- **`gh pr list --head <ветка>`** — точное совпадение имени ветки. Это то, что нужно для проверки «существует ли PR с этой веткой». Гарантирует ровно одно совпадение (если PR есть) или ноль (если нет).
+
+**Живой случай:** скрипт `scripts/git/worktree-cleanup.py` (#891, PR #893, коммит a14deb87) изначально использовал `--search` для проверки, была ли ветка смержена. Замер репозитория показал: из 128 мёртвых деревьев 127 имели живую ветку на origin (оркестратор не удаляет ветки после слияния), и все 127 были отклонены как «ещё можно не удалять» — даже слитые месяцами ранее. Переход на `--head` с точным совпадением исправил распознание статуса PR.
+
+Правило: для проверки, слита ли ветка, используй `gh pr list --head <ветка>` и читай статус PR (`merged`, `closed`, `open`). Это точно и быстро (один запрос). `--search` подходит только для неточных поисков, например подстроки в названии PR, но не для проверок статуса по имени ветки.
 
 ---
 
