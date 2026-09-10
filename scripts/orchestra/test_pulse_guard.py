@@ -1144,6 +1144,221 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     assert probes == 2, f"гвардия частоты нарушена: проб за час {probes}, ожидалось 2"
 
 
+# ── Гонка created_at/completion в анкере серии (issue #899) ──────────────────────
+
+
+def test_runs_after_uses_completion_time_not_start_time():
+    """#899: раньше runs_after сравнивал по created_at (старт) — долгий
+    прогон, стартовавший ДО якоря, но завершившийся ПОСЛЕ него, молча выпадал
+    бы из серии (свежий провал терялся). Сравнение — по updated_at
+    (завершению), тем же основанием, что и у якоря (series_anchor)."""
+    long_run = run("failure", created_at="2026-08-31T09:00:00Z", run_id=1,
+                    updated_at="2026-08-31T12:30:00Z")
+    anchor = utc(2026, 8, 31, 12, 0)
+    assert pg.runs_after([long_run], anchor) == [long_run]
+    # мутация: сравнение по created_at исключило бы этот прогон (09:00 < 12:00)
+    assert pg.parse_time(long_run["created_at"]) < anchor
+
+
+def test_gate_completion_time_anchor_fixes_stale_marker_race(monkeypatch):
+    """Мутационное доказательство (issue #899, воспроизводит живую цитату):
+    успешный прогон worker.yml 34498185823 стартовал 2026-09-10T15:49:42Z,
+    посреди него (17:06:17Z, T0+80мин) поставлен маркер «проба 4», а сам
+    прогон завершился успехом только в 18:53:38Z (T0+180мин).
+
+    ДО фикса анкер серии брался по created_at успеха (T0) — маркер (T0+80)
+    «новее» анкера, остаётся в серии, backoff отсчитывается от него, и
+    диспатч остаётся заперт ДАЖЕ ПОСЛЕ того, как та же серия закрылась
+    успехом. ПОСЛЕ фикса анкер — completion успеха (T0+180) — маркер (T0+80)
+    старше анкера и вычёркивается, серия закрыта сразу после успеха."""
+    from datetime import timedelta
+    T0 = utc(2026, 9, 10, 15, 49)
+    completed_at = T0 + timedelta(minutes=180)
+    marker_at = T0 + timedelta(minutes=80)
+    now = completed_at + timedelta(minutes=5)
+
+    def iso(dt):
+        return dt.isoformat().replace("+00:00", "Z")
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run("success", created_at=iso(T0), run_id=9, updated_at=iso(completed_at)),
+            run("failure", "2026-09-10T14:00:00Z", 8),
+            run("failure", "2026-09-10T13:00:00Z", 7),
+            run("failure", "2026-09-10T12:00:00Z", 6),
+        ]},
+        "issues/120/comments": [
+            {"created_at": iso(marker_at),
+             "body": pg.probe_alert_text(4, pg.probe_backoff_minutes(4), None, "err")},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment",
+                         lambda *a: pytest.fail("серия закрыта success'ом — новых сигналов быть не должно"))
+    monkeypatch.setattr(pg, "send_telegram",
+                         lambda *a: pytest.fail("серия закрыта success'ом — новых сигналов быть не должно"))
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", now)
+    assert allowed is True, (
+        "ПОСЛЕ фикса (анкер = updated_at успеха): маркер посреди прогона старше "
+        "анкера, не держит гейт — диспатч разрешён сразу после успеха")
+    assert any("разрешён" in line for line in observations)
+    assert actions == []
+
+    # Доказательство мутацией (для отчёта — что именно сломалось бы): по
+    # created_at (старая логика) маркер оказывается НОВЕЕ анкера.
+    broken_anchor = T0
+    assert marker_at > broken_anchor, (
+        "ДО фикса анкер = created_at успеха — маркер посреди прогона «новее» "
+        "анкера, остаётся в серии, backoff держит gate открытым")
+
+
+# ── Прогон ещё идёт при активной серии (issue #899, п.2) ─────────────────────────
+
+
+def test_gate_does_not_stack_new_probe_while_previous_probe_still_running(monkeypatch):
+    """#899, п.2: backoff после «проба 1» (30 мин) уже истёк, но сам прогон
+    этой пробы всё ещё in_progress (conclusion=None) — заводить пробу 2
+    нельзя: это второй одновременный workflow_dispatch воркера на одну и ту
+    же паузу, а последующий маркер описал бы ещё бегущий прогон как
+    «упавшие job'ы не найдены (conclusion прогона: None)», будто это и есть
+    причина (живая цитата инцидента — маркер «проба 4» в #120, 17:06:17Z,
+    посреди прогона 34498185823)."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run(None, "2026-08-31T11:10:00Z", 4),          # проба 1 всё ещё бежит
+            run("failure", "2026-08-31T10:00:00Z", 2),
+            run("failure", "2026-08-31T09:45:00Z", 1),
+        ]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T10:15:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T11:10:00Z", "body": probe_body(1)},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment",
+                         lambda *a: pytest.fail("не должен писать вторую пробу поверх ещё бегущей"))
+    monkeypatch.setattr(pg, "send_telegram",
+                         lambda *a: pytest.fail("не должен слать вторую пробу поверх ещё бегущей"))
+
+    # 40 минут с маркера пробы 1 (11:10 -> 11:50) — больше выдержки попытки 2 (30 мин)
+    later = utc(2026, 8, 31, 11, 50)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", later)
+    assert allowed is False
+    assert any("ещё выполняется" in line for line in observations)
+    assert actions == []
+
+    # доказательство мутацией: без этой проверки backoff действительно истёк бы
+    # к этому моменту, и decide_gate_state вернул бы "probe" — вторую пробу
+    would_have_probed = pg.minutes_between(utc(2026, 8, 31, 11, 10), later) >= pg.probe_backoff_minutes(2)
+    assert would_have_probed is True
+
+
+# ── Честный текст «на паузе» (issue #899, п.3) ────────────────────────────────────
+
+
+def test_gate_open_text_names_effective_failures_not_raw_zero(monkeypatch):
+    """#899, п.3: голова списка завершилась НЕ провалом и НЕ успехом
+    (например 'skipped') — count_consecutive_failures останавливается на ней
+    и вернёт 0, но маркер серии уже доказывает, что порог был достигнут
+    раньше. Текст обязан называть ЧИСЛО, которым реально принято решение
+    (effective_failures), а не самоопровергающееся «0 красных подряд —
+    диспатч остановлен» (живая цитата инцидента, issue #899)."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": {"workflow_runs": [
+            run("skipped", "2026-08-31T11:55:00Z", 5),
+            run("failure", "2026-08-31T11:35:00Z", 2),
+            run("failure", "2026-08-31T11:20:00Z", 1),
+        ]},
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать — throttle не истёк"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать — throttle не истёк"))
+
+    # 10 минут с маркера паузы — меньше выдержки первой попытки (15 мин): open
+    now = utc(2026, 8, 31, 12, 0)
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", now)
+    assert allowed is False
+    assert any("3 красных прогонов" in line for line in observations), observations
+    assert not any("0 красных прогонов" in line for line in observations), (
+        "самоопровергающийся текст: «0 красных подряд — диспатч остановлен» "
+        "(живая цитата инцидента)")
+
+
+# ── Видимость длящейся паузы (issue #899, п.4) ────────────────────────────────────
+
+
+@pytest.mark.parametrize("elapsed_minutes,expected", [(0, False), (59, False), (60, True), (120, True)])
+def test_pause_reminder_due_throttles_by_interval(elapsed_minutes, expected):
+    from datetime import timedelta
+    last = utc(2026, 8, 31, 10, 0)
+    now = last + timedelta(minutes=elapsed_minutes)
+    assert pg.pause_reminder_due(last, now) is expected
+
+
+def test_pause_reminder_due_without_prior_signal_is_immediate():
+    assert pg.pause_reminder_due(None, NOW) is True
+
+
+def test_pause_reminder_marker_is_excluded_from_series_markers(monkeypatch):
+    """#899, п.4: напоминание — НЕ маркер серии. issue_markers_any(PAUSE_MARKER,
+    RESUME_MARKER) не должен его подхватывать, иначе last_marker_at сдвигался
+    бы каждым напоминанием и откладывал бы реальную пробу навсегда."""
+    reminder = pg.pause_reminder_text(3, 42.0, None)
+    assert pg.PAUSE_MARKER not in reminder
+    assert pg.RESUME_MARKER not in reminder
+    assert pg.PROBE_MARKER not in reminder
+    fake = FakeGh({"issues/120/comments": [
+        {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER},
+        {"created_at": "2026-08-31T13:00:00Z", "body": reminder},
+    ]})
+    monkeypatch.setattr(pg, "gh", fake)
+    markers = pg.issue_markers_any("mytab0r/edge-harness", 120, (pg.PAUSE_MARKER, pg.RESUME_MARKER))
+    assert markers == [(utc(2026, 8, 31, 10, 0), pg.PAUSE_MARKER)]
+
+
+def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
+    """#899, п.4: до этой правки state=='open' молчал в #120 сколько угодно
+    долго (backoff-потолок — 240 минут) — живой случай: 4 часа простоя, ни
+    одного нового комментария. Напоминание срабатывает раз в
+    PAUSE_REMINDER_INTERVAL_MINUTES, не на каждый 15-минутный пульс."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER},
+            {"created_at": "2026-08-31T10:01:00Z", "body": probe_body(4)},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    # +30 минут с последнего маркера — меньше и throttle (60), и backoff (240): тихо
+    _, actions1, allowed1 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 10, 31))
+    assert allowed1 is False and posted == [] and sent == [] and actions1 == []
+
+    # +90 минут — throttle истёк, backoff ещё нет: одно напоминание, не серийный маркер
+    _, actions2, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 31))
+    assert allowed2 is False
+    assert len(posted) == 1 and len(sent) == 1
+    assert pg.PAUSE_REMINDER_MARKER in posted[0]
+    assert pg.PAUSE_MARKER not in posted[0] and pg.PROBE_MARKER not in posted[0]
+    assert any("напоминание" in line for line in actions2)
+
+    # тот же пульс ещё раз почти сразу (напоминание уже отправлено) — тихо
+    fake.routes["issues/120/comments"] = fake.routes["issues/120/comments"] + [
+        {"created_at": "2026-08-31T11:31:00Z", "body": posted[0]}]
+    posted.clear()
+    sent.clear()
+    _, actions3, allowed3 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 35))
+    assert allowed3 is False and posted == [] and sent == [] and actions3 == []
+
+
 # ── Авто-возобновление по мержу (#220): success-маркер — виртуальный success ──────
 
 

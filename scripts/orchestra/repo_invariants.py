@@ -142,6 +142,23 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       история ещё пуста (первый снимок ещё не написан), гейтить с ходу
       означало бы красить `test` за собственный переходный период — тот же
       класс «тормоз без газа», от которого уже отказались для 1/4/5/9.
+  13. check_conveyor_gate_phantom_pause (issue #899) — предохранитель
+      pulse_guard.conveyor_gate держит диспатч воркера остановленным
+      (маркер серии активен), хотя реально пересчитанные подряд-провалы
+      ПОСЛЕ якоря серии — 0 (или меньше WORKER_FAILURE_PAUSE_AFTER), а
+      голова списка прогонов ЗАВЕРШЕНА (не in_progress — у in_progress есть
+      законное объяснение, issue #899 п.2). Ровно класс живого инцидента
+      2026-09-10: диспатч воркера стоял ~4 часа при 0 реальных провалов,
+      потому что pulse_guard сравнивал created_at маркера с created_at
+      успеха вместо completion-времени — теперь исправлено в самом
+      conveyor_gate, но состояние обязано быть невозможным СИСТЕМНО, не
+      только в одном исправленном месте (AGENTS.md, «Инцидент оставляет
+      инвариант»). READ-ONLY: инвариант НЕ вызывает conveyor_gate() (он
+      умеет писать в #120/Telegram) — независимо пересобирает то же решение
+      из чистых функций pulse_guard (series_anchor/runs_after/
+      count_consecutive_failures), которые conveyor_gate и так использует
+      внутри себя. Наблюдательный, не гейтящий: живой замер долга на момент
+      внедрения ещё не сделан (тот же порядок, что у 1/5/9/10/12).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -1615,6 +1632,75 @@ def fetch_pipeline_health_history(repo: str) -> list[dict]:
     return pipeline_health.read_rows(base64.b64decode(blob["content"]).decode())
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 13: фантомная пауза конвейера (issue #899)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой инцидент 2026-09-10: pulse_guard.conveyor_gate держал диспатч
+# воркера остановленным ~4 часа, хотя реальных подряд-провалов было 0 —
+# series_anchor сравнивал created_at маркера серии с created_at успешного
+# прогона вместо completion-времени (updated_at). Успех, случившийся ПОСЛЕ
+# того, как посреди него был поставлен маркер, не мог этот маркер снять.
+# Фикс — в самом conveyor_gate (см. его докстринг и докстринг series_anchor/
+# runs_after), но AGENTS.md («Инцидент оставляет инвариант») требует
+# СИСТЕМНОЙ проверки: класс обязан быть невозможен, не только починен в
+# одном месте, которое завтра может регрессировать.
+#
+# READ-ONLY (гвардия холостого хода build_report это проверяет): инвариант
+# НЕ вызывает pulse_guard.conveyor_gate() — та функция умеет мутировать
+# сервер (post_issue_comment/send_telegram). Вместо этого он независимо
+# пересобирает ТО ЖЕ решение из чистых функций pulse_guard
+# (series_anchor/runs_after/count_consecutive_failures), которые
+# conveyor_gate и так использует внутри себя — единственный общий источник
+# правды на сам алгоритм, не вторая копия.
+def check_conveyor_gate_phantom_pause(repo: str) -> list[dict]:
+    """Нарушение: маркер серии (PAUSE_MARKER/PROBE_MARKER) активен (новее
+    якоря серии), голова списка прогонов ЗАВЕРШЕНА (conclusion не None — у
+    ещё идущего прогона есть законное объяснение неопределённости, issue
+    #899 п.2), но реально пересчитанные подряд-провалы ПОСЛЕ якоря — меньше
+    WORKER_FAILURE_PAUSE_AFTER. Держать паузу в этом случае нечем: она может
+    существовать только за счёт эффекта, который в conveyor_gate объясняет
+    незавершённый прогон (issue #899, докстринг conveyor_gate,
+    `effective_failures`), а голова списка завершена.
+
+    Best-effort: сеть недоступна/квота — [] (тот же принцип, что у 10/12 —
+    отсутствие данных не должно ронять весь build_report ради инварианта, у
+    которого и так нет действия жёстче наблюдения)."""
+    try:
+        runs = pulse_guard.recent_runs(repo, pulse_guard.WORKER_WORKFLOW, per_page=10)
+        all_markers = pulse_guard.issue_markers_any(
+            repo, pulse_guard.WATCHDOG_ISSUE,
+            (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
+    except RuntimeError:
+        return []
+    if not runs:
+        return []
+
+    last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
+    last_ok_at = pulse_guard.parse_time(last_ok["updated_at"]) if last_ok else None
+    resume_at = max(
+        (t for t, body in all_markers if pulse_guard.RESUME_MARKER in body), default=None)
+    anchor = pulse_guard.series_anchor(last_ok_at, resume_at)
+    markers = [(t, body) for t, body in all_markers if anchor is None or t > anchor]
+    if not markers:
+        return []  # серии нет — паузе неоткуда взяться, здоровое состояние
+
+    if runs[0].get("conclusion") is None:
+        return []  # прогон ещё идёт — законное объяснение (issue #899, п.2)
+
+    failures = pulse_guard.count_consecutive_failures(
+        [r.get("conclusion") for r in pulse_guard.runs_after(runs, anchor)])
+    if failures >= pulse_guard.WORKER_FAILURE_PAUSE_AFTER:
+        return []  # реальных провалов достаточно — пауза оправдана
+
+    return [{
+        "failures": failures,
+        "threshold": pulse_guard.WORKER_FAILURE_PAUSE_AFTER,
+        "last_marker_at": max(t for t, _ in markers).isoformat(),
+        "latest_run_url": runs[0].get("html_url"),
+    }]
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -1833,6 +1919,21 @@ def build_report(repo: str, now: datetime,
         else:
             lines.append(f"💚 [12] снимок здоровья конвейера на {pipeline_health.DATA_BRANCH} "
                           f"не старше {PIPELINE_HEALTH_STALE_AFTER_DAYS} суток")
+
+    v13 = check_conveyor_gate_phantom_pause(repo)
+    findings[13] = v13
+    if v13:
+        item = v13[0]
+        lines.append(
+            f"🚨 [13] конвейер держит паузу диспатча worker.yml при "
+            f"{item['failures']} реальных подряд-провалах (порог "
+            f"{item['threshold']}) — маркер серии активен с "
+            f"{item['last_marker_at']}, хотя её нечем объяснить (issue #899): "
+            f"{item['latest_run_url']}"
+        )
+    else:
+        lines.append("💚 [13] нет фантомной паузы конвейера "
+                      "(маркер серии без реальных подряд-провалов, issue #899)")
 
     return lines, findings
 
