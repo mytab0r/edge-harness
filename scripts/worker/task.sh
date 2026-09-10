@@ -627,9 +627,15 @@ if [ "$pr_outcome_rc" -eq 0 ] && dsh_worker_run_is_success \
 fi
 
 if [ "$run_is_success" -eq 1 ]; then
+  # Гейт уже потребовал непустой WORKER_CHAIN_PROVIDER (dsh_worker_run_is_success) —
+  # фолбэк "?" здесь был бы ровно тем литералом, что печатает противоречие
+  # инцидента #876, если гейт когда-нибудь разъедется с этим местом. Падаем
+  # громко, а не молча подставляем «?» (находка ai-review PR #880).
+  [ -n "$WORKER_CHAIN_PROVIDER" ] \
+    || die "гейт успеха пройден, но WORKER_CHAIN_PROVIDER пуст — рассинхрон с dsh_worker_run_is_success (#876/#880), это баг гейта"
   verb="открыт"; [ "$pr_status" = "merged" ] && verb="слит"
   comment=$(cat <<COMMENT
-🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER:-?}). PR $verb: $pr_url
+🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER}). PR $verb: $pr_url
 
 Хвост stdout DSH (секреты замаскированы; это не обязательно «финальный
 ответ» — содержимое не проверяется структурно, #876):
@@ -740,20 +746,18 @@ fi
 # #880 «алерт не гадает» AGENTS.md), не один и тот же текст для всех причин.
 reason="dsh завершился с кодом $rc без PR по ветке $BRANCH"
 if [ "$pr_outcome_rc" -eq 0 ]; then
-  gate_gap=""
-  [ "$rc" -eq 0 ] \
-    || gate_gap="${gate_gap:+$gate_gap, }dsh этого прогона завершился кодом $rc (не 0)"
-  [ -n "$WORKER_CHAIN_PROVIDER" ] \
-    || gate_gap="${gate_gap:+$gate_gap, }ни один провайдер не ответил успехом"
-  [ "$WORKER_BRANCH_START_SHA" != "$WORKER_BRANCH_END_SHA" ] \
-    || gate_gap="${gate_gap:+$gate_gap, }новых коммитов в ветке за этот прогон нет"
-  reason="PR $pr_url по ветке $BRANCH ($pr_status) существует, но не доказывает работу этого прогона: $gate_gap"
+  # DSH_WORKER_RUN_GATE_GAPS — уже посчитан вызовом dsh_worker_run_is_success
+  # выше (шаг 8, та же ветка `[ "$pr_outcome_rc" -eq 0 ] && dsh_worker_run_is_success`) —
+  # одно место правды на текст несработавшего конъюнкта, не вторая копия тех
+  # же трёх условий (находка ai-review PR #880: было — task.sh пересчитывал
+  # их сам, и при эволюции гейта список мог молча разойтись).
+  reason="PR $pr_url по ветке $BRANCH ($pr_status) существует, но не доказывает работу этого прогона: ${DSH_WORKER_RUN_GATE_GAPS:-неизвестная причина (DSH_WORKER_RUN_GATE_GAPS пуст — баг проводки гейта)}"
 elif [ "$pr_status" = "empty" ]; then
   reason="dsh завершился с кодом $rc — PR $pr_url по ветке $BRANCH открыт, но пуст (без диффа)"
 fi
 if [ "$rc" = "124" ]; then
   if [ "$pr_outcome_rc" -eq 0 ]; then
-    reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с; PR $pr_url по ветке $BRANCH ($pr_status) существует, $gate_gap"
+    reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с; PR $pr_url по ветке $BRANCH ($pr_status) существует, ${DSH_WORKER_RUN_GATE_GAPS:-неизвестная причина (DSH_WORKER_RUN_GATE_GAPS пуст — баг проводки гейта)}"
   else
     reason="DSH уложился в таймаут ${DSH_TIMEOUT_SECS}с, PR по ветке $BRANCH не найден"
   fi

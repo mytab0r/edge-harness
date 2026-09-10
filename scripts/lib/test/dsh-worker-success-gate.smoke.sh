@@ -69,4 +69,20 @@ else
   echo "SMOKE(worker-success-gate): 5) rc!=0 -> провал гейта независимо от провайдера — ок"
 fi
 
+# ── 6) #880: DSH_WORKER_RUN_GATE_GAPS — одно место правды на текст причины,
+# не вторая копия трёх условий в task.sh. Живая форма инцидента #876
+# (сценарий 2) обязана назвать ВСЕ три несработавших конъюнкта; успех —
+# оставить переменную пустой.
+dsh_worker_run_is_success 1 "" "$SAME_SHA" "$SAME_SHA" || true
+case "$DSH_WORKER_RUN_GATE_GAPS" in
+  *"кодом 1"*"ни один провайдер"*"новых коммитов"*) ;;
+  *) fail "6) DSH_WORKER_RUN_GATE_GAPS обязан назвать все три несработавших конъюнкта живого инцидента: '$DSH_WORKER_RUN_GATE_GAPS'" ;;
+esac
+echo "SMOKE(worker-success-gate): 6) DSH_WORKER_RUN_GATE_GAPS называет все несработавшие конъюнкты — ок"
+
+dsh_worker_run_is_success 0 "GLM" "$SAME_SHA" "$NEW_SHA" || true
+[ -z "$DSH_WORKER_RUN_GATE_GAPS" ] \
+  || fail "6) успех обязан оставить DSH_WORKER_RUN_GATE_GAPS пустым, получено: '$DSH_WORKER_RUN_GATE_GAPS'"
+echo "SMOKE(worker-success-gate): 6b) успех оставляет DSH_WORKER_RUN_GATE_GAPS пустым — ок"
+
 echo "SMOKE(worker-success-gate): критерий успеха воркера (#876) держит все пять сценариев — гвардия зелёная"

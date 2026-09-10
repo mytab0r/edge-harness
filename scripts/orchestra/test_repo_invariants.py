@@ -2124,12 +2124,35 @@ def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
     assert ri.check_worker_false_success_comment(REPO) == []
 
 
-def test_worker_false_success_comment_flags_live_incident_form(monkeypatch):
-    # Прод-форма самого инцидента (#876, прогон worker.yml 34498185823,
-    # задача #140): Search API вернул бы этот комментарий-кандидат, если бы
-    # фраза снова появилась, И локальная сверка тела комментария (находка
-    # ai-review PR #880 — см. докстринг check_worker_false_success_comment)
-    # подтверждает буквальный текст — дословный отказ живого инцидента.
+def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeypatch):
+    # Настоящий регресс: комментарий с точным маркером ПОЗЖЕ даты приземления
+    # фикса #876 (WORKER_FALSE_SUCCESS_FIX_LANDED_AT) — единственный случай,
+    # когда фраза структурно не должна была родиться заново.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 900, "html_url": "https://github.com/mytab0r/edge-harness/issues/900",
+             "title": "какая-то задача"},
+        ]},
+        "issues/900/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_worker_false_success_comment(REPO)
+    assert violations == [{
+        "issue": 900,
+        "url": "https://github.com/mytab0r/edge-harness/issues/900",
+        "title": "какая-то задача",
+    }]
+
+
+def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatch):
+    # Находка ai-review PR #880 (второй раунд): дословный ИСТОРИЧЕСКИЙ
+    # комментарий самого инцидента (issue #140, 2026-09-10T18:53:32Z — живой
+    # случай, ради которого #876 и написан) остаётся в теле issue навсегда.
+    # Без отсечки по дате инвариант был бы красным с первого пульса после
+    # мержа — первое появление ДО фикса не регресс, а его причина.
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 140, "html_url": "https://github.com/mytab0r/edge-harness/issues/140",
@@ -2141,12 +2164,7 @@ def test_worker_false_success_comment_flags_live_incident_form(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_worker_false_success_comment(REPO)
-    assert violations == [{
-        "issue": 140,
-        "url": "https://github.com/mytab0r/edge-harness/issues/140",
-        "title": "какая-то задача",
-    }]
+    assert ri.check_worker_false_success_comment(REPO) == []
 
 
 def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
