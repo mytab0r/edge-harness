@@ -892,10 +892,22 @@ dsh_require_provider_chain() { # [consumer_id]
 # провайдера; цена выбора «стоп» — молчать всю оставшуюся цепочку без единой
 # причины, как и случилось. По умолчанию — переключаемся.
 #
+# #877 (живой инцидент — прогон worker.yml 34498185823, задача #140): rc=124
+# (`timeout` в dsh_run_with_retry убил процесс SIGTERM) раньше проходил через
+# ТУ ЖЕ ветку «stderr пуст» выше — `timeout` не пишет в stderr ни строки,
+# поэтому наш собственный нож (DSH_TIMEOUT_SECS истёк) был неотличим от
+# настоящего молчания провайдера (#737). AGENTS.md, «Fail loud, не
+# silent-wrong»: убийство ПО НАШЕМУ таймауту — не отказ провайдера, сообщение
+# обязано называть это прямо, а не растворяться в «класс не установить».
+# Решение «переключаемся» остаётся тем же (следующий провайдер всё равно
+# стоит попробовать) — меняется только текст причины, RC проверяется ДО
+# ветки «stderr пуст», чтобы не спутать эти два разных факта.
+#
 # DSH_CHAIN_CLASS_NOTE (переменная, не возврат) — человекочитаемая причина
 # решения для сообщения вызывающего (правило AGENTS.md «Алерт не гадает»):
-# имя признанной причины, литеральный маркер stderr, факт «stderr пуст» или
-# первая строка нераспознанной диагностики (стоп-класс).
+# имя признанной причины, литеральный маркер stderr, факт «stderr пуст»,
+# факт «наш таймаут» или первая строка нераспознанной диагностики
+# (стоп-класс).
 #
 # Ветка «стоп-класс» ниже — единственная, что кладёт в переменную СЫРОЙ
 # фрагмент stderr клиента модели, а не заранее известную безопасную строку
@@ -906,13 +918,17 @@ dsh_require_provider_chain() { # [consumer_id]
 # раз — оба места печати (::warning:: и ::error:: ниже) читают уже
 # замаскированную переменную, второй копии redact на каждую точку вывода не
 # нужно (то же место правды, что redact() выше в этом файле).
-dsh_chain_should_advance() { # err_file failure_reason
-  local err_file=$1 reason=$2
+dsh_chain_should_advance() { # err_file failure_reason rc
+  local err_file=$1 reason=$2 rc=$3
   case "$reason" in
     quota_exhausted|rate_limit_retry_budget_exceeded)
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
   esac
+  if [ "$rc" = "124" ]; then
+    DSH_CHAIN_CLASS_NOTE="наш таймаут (DSH_TIMEOUT_SECS=${DSH_TIMEOUT_SECS:-?}с истёк) — НЕ отказ провайдера, убит по времени (#877)"
+    return 0
+  fi
   if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
     DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
     return 0
@@ -1108,7 +1124,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     fi
     reset_hint=$(dsh_extract_reset_hint "$err_file")
     [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
-    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON"; then
+    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
       echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
       i=$((i + 1))
       continue
