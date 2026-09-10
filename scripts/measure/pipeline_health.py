@@ -93,6 +93,16 @@ _QZ_SPEC = importlib.util.spec_from_file_location(
 quotas = importlib.util.module_from_spec(_QZ_SPEC)
 _QZ_SPEC.loader.exec_module(quotas)  # type: ignore[union-attr]
 
+# data_branch_writer — одно место правды на «append + push с ретраем на
+# data-ветку» (issue #882): раньше эта логика была независимой копией здесь
+# и в dispatch_tail.py, обе с одним и тем же дефектом (тихий check=False на
+# восстановлении после отказа push маскировал отказ авторизации под
+# безобидную гонку параллельного писателя) — см. докстринг data_branch_writer.py.
+_DBW_SPEC = importlib.util.spec_from_file_location(
+    "data_branch_writer", Path(__file__).resolve().parents[1] / "lib" / "data_branch_writer.py")
+data_branch_writer = importlib.util.module_from_spec(_DBW_SPEC)
+_DBW_SPEC.loader.exec_module(data_branch_writer)  # type: ignore[union-attr]
+
 # ── Одно место правды: пути и пороги кампании снимка ──────────────────────
 
 DATA_BRANCH = "data/pipeline-health"
@@ -327,56 +337,47 @@ def collect(repo: str, gh: GhFn, now: datetime) -> dict:
     )
 
 
-# ── Git-транспорт (тот же паттерн, что dispatch_tail.py — своя, более
-# простая копия: одна строка/сутки, без гонки за probe_id) ────────────────
-
-
-def git(*args: str, cwd: str, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
-    if check and proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:3])}: {proc.stderr.strip()[:300]}")
-    return proc
+# ── Git-транспорт: делегирован data_branch_writer.py (issue #882, одно место
+# правды на append+push с ретраем — см. докстринг там) ─────────────────────
 
 
 def origin_url() -> str:
-    return f"https://github.com/{os.environ['GITHUB_REPOSITORY']}.git"
+    return data_branch_writer.origin_url()
 
 
 def clone_data_branch(workdir: str) -> None:
-    git("clone", "--quiet", "--no-tags", origin_url(), workdir, cwd=".")
-    git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir, check=False)
-    exists = git("rev-parse", "--verify", "--quiet", f"origin/{DATA_BRANCH}",
-                 cwd=workdir, check=False).returncode == 0
-    base = f"origin/{DATA_BRANCH}" if exists else "origin/main"
-    git("checkout", "--quiet", "-B", DATA_BRANCH, base, cwd=workdir)
+    data_branch_writer.clone_data_branch(origin_url(), workdir, DATA_BRANCH)
+
+
+def _snapshot_is_duplicate(date_str: str):
+    def check(current_text: str) -> bool:
+        rows = read_rows(current_text)
+        is_dup = bool(rows) and rows[-1].get("date") == date_str
+        if is_dup:
+            print(f"снимок за {date_str} уже на {DATA_BRANCH} — не дублирую")
+        return is_dup
+    return check
 
 
 def append_snapshot_and_push(workdir: str, snapshot: dict) -> bool:
-    """Строка снимка + push. Гонка за ветку — сброс на свежую и повтор (до
-    5 раз, тот же приём, что dispatch_tail.append_and_push). Дубль того же
-    дня не пишется — гейт `should_snapshot` уже проверил ДО клона, но
-    гонка двух параллельных пультов в одну минуту всё же возможна: второй
-    писатель перечитывает файл ПОСЛЕ fetch/checkout и видит уже записанный
-    день."""
-    path = Path(workdir) / SNAPSHOT_PATH
-    for _ in range(5):
-        rows = read_rows(path.read_text(encoding="utf-8")) if path.exists() else []
-        if rows and rows[-1].get("date") == snapshot["date"]:
-            print(f"снимок за {snapshot['date']} уже на {DATA_BRANCH} — не дублирую")
-            return False
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8", newline="\n") as file:
-            file.write(json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n")
-        git(*COMMIT_IDENTITY, "add", SNAPSHOT_PATH, cwd=workdir)
-        git(*COMMIT_IDENTITY, "commit", "--quiet", "-m",
-           f"health snapshot {snapshot['date']}", cwd=workdir)
-        if git("push", "--quiet", "origin", f"HEAD:{DATA_BRANCH}", cwd=workdir,
-               check=False).returncode == 0:
-            return True
-        git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir, check=False)
-        git("checkout", "--quiet", "-B", DATA_BRANCH, f"origin/{DATA_BRANCH}", cwd=workdir,
-           check=False)
-    raise RuntimeError(f"не удалось записать снимок {snapshot['date']} на {DATA_BRANCH} за 5 попыток")
+    """Строка снимка + push через data_branch_writer.append_and_push (issue
+    #882): гонка за ветку — свежий, ГРОМКО подтверждённый с сервера, fetch/
+    checkout и повтор (до 5 раз); отказ авторизации — красный шаг немедленно,
+    не тихий повтор (см. докстринг data_branch_writer.py). Дубль того же дня
+    не пишется — гейт `should_snapshot` уже проверил ДО клона, но гонка двух
+    параллельных пультов в одну минуту всё же возможна: `_snapshot_is_duplicate`
+    перечитывает файл ПОСЛЕ громкого fetch/checkout и видит уже записанный
+    день — это факт с сервера, не устаревшая локальная копия."""
+    return data_branch_writer.append_and_push(
+        workdir=workdir,
+        data_branch=DATA_BRANCH,
+        rel_path=SNAPSHOT_PATH,
+        commit_identity=COMMIT_IDENTITY,
+        commit_message=f"health snapshot {snapshot['date']}",
+        is_duplicate=_snapshot_is_duplicate(snapshot["date"]),
+        render_next=lambda current: current + json.dumps(
+            snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+    )
 
 
 def fetch_history(repo: str) -> list[dict]:

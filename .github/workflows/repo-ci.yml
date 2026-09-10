@@ -180,6 +180,18 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_dispatch_tail.py -q
 
+      # Одно место правды на append+push с ретраем на data-ветку (#882): раньше
+      # эта логика была независимой копией в pipeline_health.py/dispatch_tail.py
+      # с одним и тем же дефектом (тихий check=False маскировал отказ
+      # авторизации push под безобидную гонку параллельного писателя — живой
+      # инцидент, снимки здоровья конвейера не записывались НИ РАЗУ). Реальный
+      # git, локальный bare-репозиторий: гонка, отказ авторизации (pre-receive
+      # хук с текстом, похожим на GitHub 403), первое создание ветки.
+      - name: Тесты data_branch_writer — гонка/авторизация/первое создание ветки
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_data_branch_writer.py -q
+
       # Замер факта rows_read Durable Objects (задача #320): арифметика суточного
       # итога, разбор GraphQL introspection, выбор формы запроса по факту схемы —
       # кормится прод-формой ответов Cloudflare, сеть не трогаем.
