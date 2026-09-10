@@ -2,25 +2,43 @@
 """
 Автоуборка мёртвых worktree'ов (слитые/закрытые PR без работы).
 
-Retention story: worktree живёт до 24 часов после слияния PR, затем снимается.
+Retention story (находка ревью PR #893, второй раунд: докстринг раньше
+обещал «24 часа после слияния PR», а код держал другое число и мерил
+другое событие — три разных ответа на один вопрос): worktree удаляется не
+раньше `retention_hours` (по умолчанию 1 час, `WorktreeAnalyzer.__init__`)
+С МОМЕНТА ПОСЛЕДНЕГО ИЗМЕНЕНИЯ КОРНЕВОГО КАТАЛОГА дерева (`os.stat(...)
+.st_mtime` в `get_worktree_age_hours`) — не с момента слияния PR (это
+событие здесь не читается вовсе, у него нет отдельного часового пояса
+проверки). Честно: это прокси, не точное время слияния, и он может
+отставать или опережать реальный мерж на часы — единственная причина, по
+которой он безопасен, это то, что retention НЕ единственный гейт: дерево
+всё равно не снимется, пока PR не перестанет быть `open` (см. условие 3
+ниже) — то есть retention отсекает только «слишком свежее», финальное
+решение «уже можно» несёт статус PR, не mtime.
 Цель: освободить диск, не потеряв активную работу.
 
 Безопасность:
+  - Никогда не удаляет дерево с файлом-маркером `.worktree-keep`
   - Никогда не удаляет дерево с незакоммиченными изменениями
   - Никогда не удаляет дерево с локальными коммитами
   - Никогда не удаляет дерево открытого PR
   - Fail loud вместо молчаливого удаления
 
 Условия удаления (ВСЕ должны быть выполнены):
+  0. Нет файла-маркера `.worktree-keep` в корне дерева — объявленный ручной
+     способ защитить конкретное дерево (не хардкод имени/номера, см.
+     `WorktreeAnalyzer.KEEP_MARKER_NAME`); --force НЕ отменяет
   1. Нет незакоммиченных изменений (git status --porcelain пусто)
   2. Нет локальных коммитов, которых нет больше нигде (git rev-list --count
      @{u}.., с запасным путём через origin/main, если апстрим-ветка уже
      упразднена на origin и вычищена локальным fetch --prune)
   3. Associated PR не в статусе open (см. ниже про сигнал "жива ли ветка")
-  4. Дерево старше retention_hours (по умолчанию 1 час, инъекция параметром —
-     не жёсткая константа, чтобы тесты не зависели от системных часов)
+  4. Дерево старше retention_hours (по умолчанию 1 час, мерится по mtime
+     КОРНЕВОГО каталога дерева — прокси, не точное время слияния PR, см.
+     Retention story ниже; инъекция параметром — не жёсткая константа,
+     чтобы тесты не зависели от системных часов)
   5. По опции --force пропускается ТОЛЬКО проверка 3 (статус PR, debug-путь);
-     пункты 1, 2, 4 обязательны всегда, --force их не отменяет
+     пункты 0, 1, 2, 4 обязательны всегда, --force их не отменяет
 
 Почему сигнал не "ветка удалена на origin" (замер #891, живой прогон на
 edge-harness): в этом репозитории оркестратор сливает PR, но НЕ удаляет
@@ -181,13 +199,28 @@ class WorktreeAnalyzer:
         except:
             return 0
 
+    # Приоритет статуса при нескольких PR на одну ветку (находка ревью PR
+    # #893, второй раунд): ветка `agent/<N>-<slug>` в этом репозитории
+    # детерминирована номером задачи и переиспользуется при перезапуске
+    # задачи после закрытого PR — на одну ветку может существовать и старый
+    # closed/merged PR, и новый open. `gh pr list` отдаёт записи по created
+    # desc, без гарантии порядка для нашей цели; "кто последний в JSON
+    # выигрывает" молча пропускал гейт "PR открыт", когда open была НЕ
+    # последней записью. `open` обязан побеждать любой другой статус —
+    # ветка с хоть одним живым PR не мертва, независимо от того, сколько
+    # закрытых/слитых PR на неё было раньше.
+    _PR_STATUS_PRIORITY = {'open': 2, 'merged': 1, 'closed': 1}
+
     def _load_pr_status_cache(self) -> None:
         """Один пакетный `gh pr list --state all` на весь прогон (не на
         дерево) — см. комментарий в __init__. `--json headRefName,state`,
         сверка ТОЧНЫМ именем ветки (не `--search "head:<префикс>"`: GitHub
         `head:` в `--search` матчит ПОДСТРОКОЙ — живой замер #891, `--search
         "head:agent/1"` вернул 30 посторонних веток agent/170-…/agent/140-…/
-        agent/131-… и т. д., ни одна не agent/1-*)."""
+        agent/131-… и т. д., ни одна не agent/1-*).
+
+        Агрегация по ветке — приоритет `open` (см. `_PR_STATUS_PRIORITY`), не
+        порядок записи в ответе API."""
         cmd = 'gh pr list --state all --json headRefName,state --limit 2000'
         output, rc = run_cmd(cmd, cwd=self.repo_root)
         cache: dict = {}
@@ -197,8 +230,14 @@ class WorktreeAnalyzer:
                 for item in json.loads(output):
                     ref = item.get('headRefName')
                     state = item.get('state')
-                    if ref and state:
-                        cache[ref] = state.lower()
+                    if not ref or not state:
+                        continue
+                    state = state.lower()
+                    existing = cache.get(ref)
+                    if existing is None or self._PR_STATUS_PRIORITY.get(
+                        state, 0
+                    ) > self._PR_STATUS_PRIORITY.get(existing, 0):
+                        cache[ref] = state
                 ok = True
             except (ValueError, TypeError, AttributeError):
                 ok = False
@@ -219,6 +258,27 @@ class WorktreeAnalyzer:
             return None
         return self._pr_status_cache.get(branch)
 
+    # Файл-маркер ручной защиты (известный хвост #891, живой случай: при
+    # прогоне-замере на 133 деревьях пришлось РУКАМИ исключить
+    # `749-ci-guard-catalog` и собственное рабочее дерево агента —
+    # продакшн-скрипт не нёс механизма исключения вовсе). Объявленный
+    # способ, не хардкод имени/номера дерева: любой оператор (человек или
+    # агент), знающий, что дерево используется прямо сейчас, несмотря на то
+    # что PR уже смёржен/закрыт (пример: доводка после мержа, общая
+    # инфраструктура, на которую ссылаются другие незавершённые PR), кладёт
+    # пустой файл `.worktree-keep` в КОРЕНЬ дерева — снимается тем же
+    # оператором вручную, когда защита больше не нужна. Не gitignore'ится
+    # намеренно НЕ проверяется (файл живёт вне git commit'а дерева, не
+    # мешает check_dirty: сам факт наличия untracked-файла уже считается
+    # "грязным" проверкой 1 ниже, так что маркер и без этой проверки уже
+    # защищает дерево, — но это ПОБОЧНЫЙ эффект, не контракт: команда для
+    # снятия защиты хочет и коммитить чистое дерево, и не терять защиту,
+    # поэтому маркер проверяется явным отдельным условием ДО check_dirty).
+    KEEP_MARKER_NAME = ".worktree-keep"
+
+    def has_keep_marker(self, worktree_path: str) -> bool:
+        return (Path(worktree_path) / self.KEEP_MARKER_NAME).exists()
+
     def can_remove_worktree(self, worktree_info: dict) -> Tuple[bool, str]:
         """
         Проверить, безопасно ли удалять worktree.
@@ -226,6 +286,12 @@ class WorktreeAnalyzer:
         """
         path = worktree_info['path']
         branch = self.branch_name(worktree_info.get('branch', 'unknown'))
+
+        # Проверка 0: ручная защита файлом-маркером — --force НЕ отменяет,
+        # ровно как и остальные проверки безопасности ниже (--force снимает
+        # ТОЛЬКО проверку статуса PR, см. проверку 3).
+        if self.has_keep_marker(path):
+            return False, f"Protected by {self.KEEP_MARKER_NAME} marker"
 
         # Проверка 1: наличие незакоммиченных изменений — --force НЕ отменяет
         if self.check_dirty(path):
@@ -275,6 +341,7 @@ class WorktreeAnalyzer:
             'total': len(worktrees),
             'removed': 0,
             'kept': 0,
+            'protected': [],
             'dirty': [],
             'young': [],
             'unknown_pr_status': [],
@@ -302,7 +369,9 @@ class WorktreeAnalyzer:
                     print(f"Keeping: {branch} ({reason})")
 
                 # Categorize the reason
-                if "uncommitted" in reason:
+                if "Protected by" in reason:
+                    stats['protected'].append(branch)
+                elif "uncommitted" in reason:
                     stats['dirty'].append(branch)
                 elif "unpushed" in reason:
                     stats['unpushed'].append(branch)
@@ -321,6 +390,13 @@ class WorktreeAnalyzer:
         print(f"Total worktrees: {stats['total']}")
         print(f"Removed: {stats['removed']}")
         print(f"Kept: {stats['kept']}")
+
+        if stats['protected']:
+            print(f"\nProtected ({WorktreeAnalyzer.KEEP_MARKER_NAME}): {len(stats['protected'])}")
+            for b in stats['protected'][:5]:
+                print(f"  - {b}")
+            if len(stats['protected']) > 5:
+                print(f"  ... and {len(stats['protected']) - 5} more")
 
         if stats['dirty']:
             print(f"\nDirty (uncommitted): {len(stats['dirty'])}")

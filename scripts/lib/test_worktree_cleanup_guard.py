@@ -25,25 +25,51 @@ git-репозитории (tempfile + `git init` + реальный `git worktr
      и физически исчезает с диска.
   6. Не удалось определить статус PR (gh недоступен/PR не найден) —
      ОТКАЗАНО (fail loud, не молчаливое разрешение).
+  7. Два PR на одну ветку (closed/merged старый + open новый, живой сценарий
+     этого репозитория — ветка `agent/<N>-<slug>` переиспользуется при
+     перезапуске задачи) — `open` обязан побеждать вне зависимости от
+     порядка записей в ответе `gh pr list` (находка ревью PR #893, второй
+     раунд). Реальный сетевой вызов через фейковый `gh` на PATH
+     (`_install_fake_gh`), не монкипатч `get_pr_status` целиком — единственный
+     сетевой компонент сигнала (`_load_pr_status_cache`) иначе не тестируется
+     вообще.
+  8. Файл-маркер `.worktree-keep` в корне дерева — снятие ОТКАЗАНО даже для
+     иначе безопасного к удалению дерева, и с --force тоже (известный хвост
+     #891: ручное исключение защищённых деревьев при живом прогоне-замере
+     не имело объявленного механизма).
 
-get_pr_status монкипатчится на уровне класса для сценариев 1/2/4/5 (сетевой
+get_pr_status монкипатчится на уровне класса для сценариев 1/2/4/5/8 (сетевой
 `gh`-вызов не имеет отношения к тому, что эти сценарии проверяют, и не может
 быть детерминирован без реального GitHub-репозитория); сценарии 3 и 6 тоже
-монкипатчат/используют реальный вызов сознательно — см. комментарии внутри.
+монкипатчат/используют реальный вызов сознательно, сценарий 7 использует
+фейковый `gh` на PATH — см. комментарии внутри.
 
 Retention/«текущее время» инъецируются параметром (`retention_hours`,
 `now_ts`) — тесты не зависят от системных часов и скорости выполнения
 (класс «тесты-бомбы», AGENTS.md).
 
 Доказательство мутацией (ручной прогон, не часть автоматического набора —
-дословный вывод живёт в отчёте PR #893): закомментировать тело проверки
-`check_dirty` внутри `can_remove_worktree` (оставив имя функции нетронутым)
-красит `test_dirty_worktree_is_refused_even_with_force` в RED; вернуть тело —
-GREEN.
+дословный вывод живёт в отчёте PR #893):
+  - закомментировать тело проверки `check_dirty` внутри `can_remove_worktree`
+    (оставив имя функции нетронутым) красит
+    `test_dirty_worktree_is_refused_even_with_force` в RED; вернуть тело —
+    GREEN.
+  - заменить агрегацию `_load_pr_status_cache` на "последний в JSON
+    выигрывает" (`cache[ref] = state.lower()` без сверки приоритета) красит
+    `test_duplicate_pr_per_branch_open_wins_open_listed_first` в RED (кэш
+    даёт `closed` вместо `open`, когда open — НЕ последняя запись); вернуть
+    приоритет — GREEN.
+  - заменить тело `has_keep_marker` на `return False` красит
+    `test_keep_marker_protects_otherwise_removable_worktree` в RED (дерево с
+    маркером отказывается не по причине "protected", а падает в
+    `check_dirty`, потому что сам untracked-маркер и есть незакоммиченное
+    изменение, — но проверка ловит ИМЕННО заявленную причину отказа, не
+    любой отказ); вернуть тело — GREEN.
 
 Запуск: python -m pytest scripts/lib/test_worktree_cleanup_guard.py -q
 """
 
+import os
 import subprocess
 import sys
 
@@ -137,6 +163,59 @@ def _patch_pr_status(monkeypatch, value):
     gh-вызов) — монкипатчим на уровне класса там, где сценарий проверяет НЕ
     его, а другой гейт (dirty/unpushed/retention)."""
     monkeypatch.setattr(WorktreeAnalyzer, "get_pr_status", lambda self, branch: value)
+
+
+def _install_fake_gh(monkeypatch, tmp_path: Path, pr_list_json: str) -> None:
+    """Подложить фейковый `gh`, отвечающий на `gh pr list --state all
+    --json headRefName,state --limit 2000` заданным JSON — прод-форма
+    ответа `gh pr list`, не пересказ (AGENTS.md «Тест кормит прод-форму
+    данных»). Проверяет РЕАЛЬНЫЙ сетевой путь `_load_pr_status_cache`
+    (находка ревью PR #893, второй раунд: «единственный сетевой компонент
+    сигнала не тестируется ничем» — раньше все сценарии монкипатчили
+    `get_pr_status` целиком).
+
+    Два файла, не один — тот же класс, что уже ловил этот репозиторий
+    (issue упомянута в задании #891): `run_cmd` вызывает `gh` через
+    `subprocess.run(..., shell=True)`, на Windows это cmd.exe, который
+    резолвит PATH по PATHEXT (нужен `.cmd`/`.exe`/`.bat`, голый `gh` без
+    расширения не находится); на POSIX shell=True это `/bin/sh`, резолвящий
+    по биту исполнения независимо от расширения. `gh` (POSIX, exec-бит) и
+    `gh.cmd` (Windows) — два тонких враппера ОДНОГО python-скрипта, чтобы
+    логика ответа жила в одном месте."""
+    bin_dir = tmp_path / "fake-gh-bin"
+    bin_dir.mkdir(exist_ok=True)
+
+    payload_file = bin_dir / "pr_list_payload.json"
+    payload_file.write_text(pr_list_json, encoding="utf-8")
+
+    responder = bin_dir / "fake_gh_responder.py"
+    responder.write_text(
+        "import sys, pathlib\n"
+        "payload = pathlib.Path(__file__).with_name('pr_list_payload.json')\n"
+        "if 'pr' in sys.argv and 'list' in sys.argv:\n"
+        "    sys.stdout.write(payload.read_text(encoding='utf-8'))\n"
+        "    sys.exit(0)\n"
+        "sys.stderr.write('fake gh: неизвестная команда ' + ' '.join(sys.argv[1:]))\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+
+    fake_gh_posix = bin_dir / "gh"
+    fake_gh_posix.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, pathlib, runpy\n"
+        "runpy.run_path(str(pathlib.Path(__file__).with_name('fake_gh_responder.py')), run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    fake_gh_posix.chmod(fake_gh_posix.stat().st_mode | 0o111)
+
+    fake_gh_cmd = bin_dir / "gh.cmd"
+    fake_gh_cmd.write_text(
+        f'@echo off\r\n{sys.executable} "%~dp0fake_gh_responder.py" %*\r\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 # ── Сценарий 1: незакоммиченные изменения ──────────────────────────────────
@@ -290,6 +369,99 @@ def test_unknown_pr_status_is_refused(tmp_path):
     stats = analyzer.analyze_and_cleanup()
     assert stats["removed"] == 0
     assert wt_dir.exists(), "при неопределённом статусе PR дерево не должно исчезать"
+
+
+# ── Сценарий 7: дубль PR на одну ветку — open обязан побеждать ─────────────
+# Живой сценарий этого репозитория (не гипотетический, находка ревью PR
+# #893, второй раунд): ветка `agent/<N>-<slug>` детерминирована номером
+# задачи и переиспользуется при перезапуске задачи после закрытого PR —
+# `gh pr list` может вернуть на одну ветку и старый closed, и новый open PR.
+# Реальный сетевой вызов (фейковый `gh` на PATH), не монкипатч
+# `get_pr_status` целиком — единственный сетевой компонент сигнала обязан
+# быть покрыт хоть одним тестом (находка ревью).
+
+def test_duplicate_pr_per_branch_open_wins_closed_listed_first(tmp_path, monkeypatch):
+    _install_fake_gh(
+        monkeypatch,
+        tmp_path,
+        '[{"headRefName": "agent/7-dup", "state": "CLOSED"},'
+        ' {"headRefName": "agent/7-dup", "state": "OPEN"}]',
+    )
+    analyzer = WorktreeAnalyzer(str(tmp_path))
+    assert analyzer.get_pr_status("agent/7-dup") == "open"
+
+
+def test_duplicate_pr_per_branch_open_wins_open_listed_first(tmp_path, monkeypatch):
+    """Тот же дубль, обратный порядок записей — доказывает, что победа
+    open не завязана на позицию в JSON (не "последний в списке", а
+    приоритет статуса)."""
+    _install_fake_gh(
+        monkeypatch,
+        tmp_path,
+        '[{"headRefName": "agent/7-dup", "state": "OPEN"},'
+        ' {"headRefName": "agent/7-dup", "state": "CLOSED"}]',
+    )
+    analyzer = WorktreeAnalyzer(str(tmp_path))
+    assert analyzer.get_pr_status("agent/7-dup") == "open"
+
+
+def test_open_pr_duplicate_keeps_worktree_end_to_end(tmp_path, monkeypatch):
+    """Сквозной прогон сценария 3, но статус берётся РЕАЛЬНЫМ вызовом
+    (фейковый gh), а не монкипатчем `get_pr_status` — дерево с дублем PR
+    (closed + open) на одну ветку обязано остаться на диске."""
+    _install_fake_gh(
+        monkeypatch,
+        tmp_path,
+        '[{"headRefName": "agent/7-dup", "state": "CLOSED"},'
+        ' {"headRefName": "agent/7-dup", "state": "OPEN"}]',
+    )
+    work = _setup_repo(tmp_path)
+    branch = "agent/7-dup"
+    wt_dir = _add_worktree(work, "7-dup", branch)
+
+    now_ts = _mtime_now_ts(wt_dir, RETENTION_HOURS * 10)
+    info = _worktree_info(work, branch)
+
+    analyzer = WorktreeAnalyzer(str(work), retention_hours=RETENTION_HOURS, now_ts=now_ts)
+    can, reason = analyzer.can_remove_worktree(info)
+    assert can is False, reason
+    assert "open" in reason.lower()
+
+    stats = analyzer.analyze_and_cleanup()
+    assert stats["removed"] == 0
+    assert wt_dir.exists(), "дерево с дублем PR (closed+open) не должно исчезать с диска"
+
+
+# ── Сценарий 8: файл-маркер защищает дерево, которое иначе снялось бы ─────
+# Известный хвост #891 (не находка ревью, отдельно названный в задаче):
+# при живом прогоне-замере оператору пришлось РУКАМИ исключить деревья
+# 749-ci-guard-catalog и собственное дерево агента — продакшн-скрипт не
+# нёс объявленного способа исключения вовсе. `.worktree-keep` — тот способ.
+
+def test_keep_marker_protects_otherwise_removable_worktree(tmp_path, monkeypatch):
+    _patch_pr_status(monkeypatch, "merged")
+    work = _setup_repo(tmp_path)
+    branch = "agent/8-protected"
+    wt_dir = _add_worktree(work, "8-protected", branch)
+    (wt_dir / ".worktree-keep").write_text("", encoding="utf-8")
+    _delete_remote_branch(work, branch)
+
+    now_ts = _mtime_now_ts(wt_dir, RETENTION_HOURS * 10)
+    info = _worktree_info(work, branch)
+
+    analyzer = WorktreeAnalyzer(str(work), retention_hours=RETENTION_HOURS, now_ts=now_ts)
+    can, reason = analyzer.can_remove_worktree(info)
+    assert can is False, reason
+    assert "protected" in reason.lower()
+
+    analyzer_force = WorktreeAnalyzer(str(work), force=True, retention_hours=RETENTION_HOURS, now_ts=now_ts)
+    can_force, reason_force = analyzer_force.can_remove_worktree(info)
+    assert can_force is False, f"--force не обязан снимать маркер защиты: {reason_force}"
+
+    stats = analyzer.analyze_and_cleanup()
+    assert stats["removed"] == 0
+    assert stats["protected"] == [branch]
+    assert wt_dir.exists(), "дерево с маркером .worktree-keep не должно исчезать с диска"
 
 
 # ── Здоровье скрипта: синтаксис и CLI --dry-run ────────────────────────────
