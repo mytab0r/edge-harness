@@ -443,6 +443,30 @@ FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 # момент провала; «30 минут после провала» — ровно заявленная семантика.
 FAILURE_WATCH_WINDOW_MINUTES = 30
 
+# Индивидуальные окна свежести по workflow (находка второго гейта ревью
+# PR #667, задача #649). Дефолтные 30 минут калиброваны на такт пульса
+# «раз в 15 минут» и часовых продюсеров (worker/hands). Суточный
+# clock-shift-tests.yml краснеет раз в сутки (~03:29 UTC) — при замеренном
+# такте пульса на этом репозитории (7 прогонов/сутки, интервалы до 4.5 ч,
+# замер #269) попадание пульса в 30-минутное окно после провала — лотерея
+# (~15%/день): красный чаще всего вообще не становится задачей, тот же
+# класс «красный без единого алерта», ради которого #649. Окно ≥26 часов
+# накрывает суточный такт продюсера с запасом на задержку пульса; защита от
+# «runs[0] навсегда один и тот же старый красный» сохраняется: окно конечное,
+# а дедуп по отпечатку среди открытых задач не заводит вторую задачу по тому
+# же красному (см. ci_failure_fingerprints).
+FAILURE_WATCH_WINDOW_OVERRIDES_MINUTES = {
+    "clock-shift-tests.yml": 26 * 60,
+}
+
+
+def failure_watch_window_minutes(workflow: str) -> int:
+    """Окно свежести провала для конкретного workflow: переопределение из
+    FAILURE_WATCH_WINDOW_OVERRIDES_MINUTES либо дефолтные
+    FAILURE_WATCH_WINDOW_MINUTES."""
+    return FAILURE_WATCH_WINDOW_OVERRIDES_MINUTES.get(
+        workflow, FAILURE_WATCH_WINDOW_MINUTES)
+
 # Выводы ЗАВЕРШЁННЫХ прогонов, которые failure_watch разбирает как провал.
 # Отдельный именованный набор, не общий FAILURE_CONCLUSIONS — судьба крайних
 # случаев решена здесь явно (находка ревью PR #488, раунд 3; серверный фильтр
@@ -2128,8 +2152,10 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         # декорация. Без фильтра `runs[0]` навсегда остаётся тем же старым
         # красным прогоном после закрытия задачи по нему. Якорь — updated_at
         # (момент провала), не created_at (момент постановки в очередь):
-        # см. комментарий у FAILURE_WATCH_WINDOW_MINUTES.
-        fresh_cutoff = now - timedelta(minutes=FAILURE_WATCH_WINDOW_MINUTES)
+        # см. комментарий у FAILURE_WATCH_WINDOW_MINUTES. Размер окна —
+        # по workflow (failure_watch_window_minutes): суточный продюсер
+        # не выживает в 30-минутном окне, откалиброванном на часовых.
+        fresh_cutoff = now - timedelta(minutes=failure_watch_window_minutes(workflow))
         runs = [r for r in runs if parse_time(r["updated_at"]) >= fresh_cutoff]
         if not runs:
             continue

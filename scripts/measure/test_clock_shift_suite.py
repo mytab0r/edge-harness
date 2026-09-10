@@ -214,3 +214,24 @@ def test_run_verdict_rejects_marker_base_outside_parent_real_window():
     result = css.run_verdict(8, 0, out, *_MARKER_WINDOW)
     assert result["outcome"] == "harness_broken"
     assert "вне окна" in result["detail"]
+
+
+def test_shift_marker_decided_by_first_occurrence_not_captured_echo():
+    """Находка ревью PR #667 (раунд 3, некритичная): stdout УПАВШЕГО теста
+    попадает в вывод прогона как captured output и может эхом нести ЧУЖУЮ
+    строку маркера (например, отснятую фикстурой от другого прогона).
+    Настоящий маркер conftest печатается ПЕРВЫМ (pytest_configure, до любого
+    тестового вывода) — решение обязан нести он, не эхо."""
+    genuine = _marker_output()
+    stale_echo = _marker_output(base=_MARKER_NOW - timedelta(days=30))
+    out = genuine + "3 failed, 1230 passed in 330.27s\n" + stale_echo
+    result = css.run_verdict(8, 1, out, *_MARKER_WINDOW)
+    assert result["outcome"] == "red", (
+        "эхо-строка в captured output не должна подменять настоящий маркер "
+        "conftest и перевирать вердикт горизонта")
+
+    # Обратный случай: настоящего маркера нет, есть только эхо — эхо не
+    # засчитывается доказательством сдвига (база эха вне окна).
+    echo_only = "3 failed, 1230 passed in 330.27s\n" + stale_echo
+    result = css.run_verdict(8, 1, echo_only, *_MARKER_WINDOW)
+    assert result["outcome"] == "harness_broken"

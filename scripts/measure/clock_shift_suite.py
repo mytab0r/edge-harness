@@ -172,12 +172,16 @@ def run_pytest_with_shift(horizon_days: int, paths: list[str]) -> tuple[int, str
 
 
 # Маркер наблюдаемости сдвига — строку печатает scripts/conftest.py в
-# pytest_configure, ТОЛЬКО после реального start() freezer'а. Формулировка
-# живёт в conftest, здесь только разбор; смена формулировки в conftest
-# красит ежедневный прогон громко (harness_broken, «маркера нет»), а не
-# оставляет зелёный по настоящему времени — fail-loud по умолчанию.
+# pytest_configure, ТОЛЬКО после реального start() freezer'а, и печатает
+# ПЕРВОЙ (до любого тестового вывода). Формулировка живёт в conftest, здесь
+# только разбор; смена формулировки в conftest красит ежедневный прогон
+# громко (harness_broken, «маркера нет»), а не оставляет зелёный по
+# настоящему времени — fail-loud по умолчанию. Якорь ^…$ и разбор ПЕРВОГО
+# вхождения: stdout УПАВШЕГО теста попадает в вывод как captured output и
+# может эхом повторить чужую/старую строку маркера — решение обязан нести
+# маркер самого conftest, не эхо (находка ревью PR #667, раунд 3).
 _SHIFT_MARKER_RE = re.compile(
-    r"::notice::CLOCK_SHIFT_DAYS=(\d+).*часы сдвинуты на (\S+)")
+    r"^::notice::CLOCK_SHIFT_DAYS=(\d+).*часы сдвинуты на (\S+)$", re.MULTILINE)
 # Допуск на старт процесса pytest (между замером now_before и start() freezer'а).
 _SHIFT_MARKER_MAX_START_DELAY_SECONDS = 60
 
@@ -200,7 +204,7 @@ def verify_shift_applied(horizon_days: int, stdout: str,
             "— часы сдвинуты на …» — сдвиг не применён или не наблюдаем, "
             "зелёный/красный этого прогона получены не сдвинутыми часами"
         )
-    marker_days, marker_target = matches[-1]
+    marker_days, marker_target = matches[0]
     if int(marker_days) != horizon_days:
         return (f"маркер conftest отчитался о сдвиге +{marker_days}д, "
                 f"а прогон запрошен на +{horizon_days}д")

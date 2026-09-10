@@ -2436,6 +2436,57 @@ def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
     assert observations == [] and actions == []
 
 
+def test_failure_watch_daily_producer_red_survives_longer_window(monkeypatch):
+    # Находка второго гейта ревью PR #667 (задача #649): дефолтное окно
+    # 30 минут калибровано на часовых продюсеров (worker/hands) и такт пульса
+    # «раз в 15 минут». Суточный clock-shift-tests.yml краснеет раз в сутки
+    # (~03:29 UTC) — при замеренном такте пульса на этом репозитории (7
+    # прогонов/сутки, интервалы до 4.5 ч, замер #269) пульс попадает в
+    # 30-минутное окно после провала с вероятностью ~15%/день: красный
+    # чаще всего вообще не становится задачей — тот же класс «красный без
+    # единого алерта», ради которого #649. Переопределение окна
+    # (FAILURE_WATCH_WINDOW_OVERRIDES_MINUTES, ≥26 ч) обязано давать задачу
+    # по красному 20-часовой давности, который дефолтное окно похоронило бы.
+    assert pg.failure_watch_window_minutes("clock-shift-tests.yml") > 20 * 60
+    assert pg.failure_watch_window_minutes("worker.yml") == pg.FAILURE_WATCH_WINDOW_MINUTES
+
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/clock-shift-tests.yml/runs?status=completed"] = {"workflow_runs": [
+        # Красный 20 часов до NOW (2026-08-31 12:00 UTC): дефолтные 30 минут
+        # такой прогон отфильтровали бы ещё до запроса деталей job'ов.
+        run("failure", "2026-08-30T15:55:00Z", 341234567890,
+            updated_at="2026-08-30T16:00:00Z"),
+    ]}
+    routes["runs/341234567890/jobs"] = {"jobs": [
+        {"id": 888, "name": "clock-shift", "conclusion": "failure", "steps": [
+            {"name": "Полный набор тестов со сдвигом +8д", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues?state=open&labels=ci-failure"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "горизонт +8д: scripts/measure/test_example.py::test_x — красные при "
+            "часах, сдвинутых на 8 дней вперёд")))
+    created = []
+
+    def fake_gh_dispatch(*args):
+        if args[:2] == ("-X", "POST") and args[2] == "repos/mytab0r/edge-harness/issues":
+            created.append(args)
+            return {"number": 999}
+        return fake(*args)
+    monkeypatch.setattr(pg, "gh", fake_gh_dispatch)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(created) == 1, (
+        "красный суточного продюсера 20-часовой давности обязан становиться "
+        "задачей — 30-минутное окно, откалиброванное на часовых, оставляло "
+        "бы его без алерта (класс #643)")
+    assert any("заведена задача" in line for line in actions)
+
+
 def test_failure_watch_window_anchor_is_failure_moment_not_queue_time(monkeypatch):
     # Находка ревью PR #488 (раунд 3, блокирующая): created_at у GitHub —
     # момент ПОСТАНОВКИ В ОЧЕРЕДЬ, не провала. Воркер по замыслу пашет десятки
