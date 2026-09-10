@@ -480,16 +480,15 @@ jobs:
           # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
           # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
           #
-          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ
-          # от suite случай, протокольно не конфликтует с цепочкой (design.md
-          # anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»):
-          # пробуется ПОСЛЕДОВАТЕЛЬНО перед ней, не заменяя. JSON
-          # credentials.json целиком в значении секрета (AGENTS.md
-          # «Секреты» — значение никогда не печатается). Оба пусты →
-          # dsh_install_anthropic_pool печатает «не подключён», шаг идёт как
-          # раньше (только цепочка).
-          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
-          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) ТОЖЕ сюда
+          # НЕ прокидывается (#860, решение владельца 2026-09-10): недельная
+          # квота Claude нужна разработке (worker.yml/hands.yml), а ревью
+          # идёт дневной цепочкой GLM/ZAI (config/provider-usage.json,
+          # default-chain, #857) — общий потребитель жёг бы обе квоты одним
+          # и тем же трафиком. scripts/review/ai_dsh.sh больше не зовёт
+          # dsh_install_anthropic_pool/dsh_import_anthropic_accounts/
+          # dsh_mount_anthropic_pool вовсе (не «пул неактивен из-за
+          # отсутствия секрета» — пула здесь нет структурно).
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
