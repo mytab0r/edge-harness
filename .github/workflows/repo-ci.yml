@@ -864,13 +864,10 @@ jobs:
       - name: Smoke цепочки LLM-провайдеров (#727)
         run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
 
-      # Гвардия класса #876 (живой инцидент — прогон worker.yml 34498185823,
-      # задача #140): успех воркера обязан требовать rc dsh этого прогона,
-      # непустого WORKER_CHAIN_PROVIDER и нового коммита в ветке, не только
-      # факта «PR по ветке существует» (предсуществующий PR — не результат
-      # этого прогона). Доказано мутацией — см. заголовок файла теста.
-      - name: Smoke критерия успеха воркера — работа доказана этим прогоном (#876)
-        run: bash scripts/lib/test/dsh-worker-success-gate.smoke.sh
+      # Гвардия критерия успеха воркера (#876) — в каталоге гвардий (#749):
+      # scripts/ci/guards/worker-success-gate-guard.sh, не рукописный шаг
+      # здесь (ALLOWLIST-ratchet ci_guard_registration_guard.py не даёт
+      # новым шагам попадать в этот файл).
 
       # Гвардия стыка suite ротации учёток (#215) и цепочки провайдеров
       # (#727/#737) — design.md dsh-in-job «Стык suite и цепочки
