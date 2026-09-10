@@ -2436,6 +2436,62 @@ def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
     assert observations == [] and actions == []
 
 
+def test_failure_watch_fresh_green_suppresses_stale_red(monkeypatch):
+    # Находка ревью PR #667 (раунд 4, некритичная): последний завершённый
+    # исход workflow — success; прежний красный исправлен, и длинное окно
+    # суточного продюсера не должно держать его «действующим» до суток после
+    # фикса (тревога о починенном — не сигнал, а шум).
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/clock-shift-tests.yml/runs?status=completed"] = {"workflow_runs": [
+        # Прод-форма: список от нового к старому — зелёный фикс СТОИТ ПЕРВЫМ.
+        run("success", "2026-08-30T18:00:00Z", 341234567891,
+            updated_at="2026-08-30T18:05:00Z"),
+        run("failure", "2026-08-30T15:55:00Z", 341234567890,
+            updated_at="2026-08-30T16:00:00Z"),
+    ]}
+
+    def boom(*a):
+        pytest.fail("свежий зелёный вытесняет старый красный — детали job'ов запрашивать не для чего")
+
+    monkeypatch.setattr(pg, "gh", FakeGh(routes))
+    monkeypatch.setattr(pg, "failing_jobs", boom)
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert observations == [] and actions == []
+
+
+def test_failure_watch_window_overrides_carry_schedule_link():
+    """Связь «окно ≥26 ч ↔ суточный cron» — данными, не прозой (находка ревью
+    PR #667, раунд 4): переопределение окна обязано указывать на
+    schedule-продюсера, и суточному крону обязан соответствовать запас,
+    накрывающий сутки плюс задержку пульса. Без этой связи перевод cron'а
+    (например с суточного на часовой) оставил бы окно 26 ч молча: красный
+    часового продюсера разбирался бы с опозданием до суток."""
+
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[2]
+    daily_cron = lambda expr: len(expr.split()) == 5 and expr.split()[2:] == ["*"] * 3
+
+    overrides = pg.FAILURE_WATCH_WINDOW_OVERRIDES_MINUTES
+    assert overrides, "переопределений окна нет — суточный продюсер #649 остался на дефолтных 30 минутах"
+    for workflow, minutes in overrides.items():
+        path = repo_root / ".github" / "workflows" / workflow
+        assert path.exists(), f"{workflow}: переопределение окна для несуществующего workflow"
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        triggers = doc.get("on", doc.get(True)) or {}
+        schedules = [s.get("cron") for s in (triggers.get("schedule") or [])]
+        assert schedules, (
+            f"{workflow}: окно переопределено, но workflow не имеет schedule-триггера — "
+            "связь «длинное окно = медленный продюсер» держится на прозе")
+        crons = [c for pair in schedules for c in (pair if isinstance(pair, list) else [pair])]
+        for expr in crons:
+            if daily_cron(expr):
+                assert minutes >= 26 * 60, (
+                    f"{workflow}: суточный cron («{expr}») с окном {minutes} мин — "
+                    "запас меньше суток плюс задержка пульса")
+                break
+
+
 def test_failure_watch_daily_producer_red_survives_longer_window(monkeypatch):
     # Находка второго гейта ревью PR #667 (задача #649): дефолтное окно
     # 30 минут калибровано на часовых продюсеров (worker/hands) и такт пульса
