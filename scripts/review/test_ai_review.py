@@ -944,6 +944,69 @@ def test_huge_diff_escalation_text_ends_with_next_steps_section():
     assert "владелец" in text.lower()
 
 
+# ── Класс «недоставленная эскалация молчит» (#884, живой прогон 34520146758,
+# PR #870) — большой-диффа-эскалация без единого доставленного канала обязана
+# краснить job, а не оставаться ::warning:: в зелёном логе ────────────────────
+
+def test_escalation_fully_failed_matches_pulse_guard_escalate_format(monkeypatch):
+    """Тест кормит прод-форму: реальный pulse_guard.escalate() с замоканными
+    сетевыми примитивами (post_issue_comment/send_telegram), не наш пересказ
+    строки формата. Из четырёх комбинаций «доставлен/не»x«оставлен/не»
+    только полный отказ ОБОИХ каналов считается undelivered."""
+    combos = [
+        (True, True, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ]
+    for posted_ok, delivered_ok, expected in combos:
+        def fake_post(repo, issue_number, text, _ok=posted_ok):
+            if not _ok:
+                raise RuntimeError("boom")
+
+        def fake_send(text, as_html=False, reply_markup=None, _ok=delivered_ok):
+            return _ok
+
+        monkeypatch.setattr(ai.pulse_guard, "post_issue_comment", fake_post)
+        monkeypatch.setattr(ai.pulse_guard, "send_telegram", fake_send)
+        result = ai.pulse_guard.escalate("o/r", 120, "text")
+        assert ai.escalation_fully_failed(result) is expected, (posted_ok, delivered_ok, result)
+
+
+def test_apply_large_ok_returns_false_and_errors_when_escalation_undelivered(monkeypatch, capsys):
+    added = ai.check_pr.LARGE_DIFF_HUGE_LINES + 1
+    labels = [{"name": "review:large"}, {"name": "ai:ok"}]
+    monkeypatch.setattr(
+        ai.pulse_guard, "escalate",
+        lambda repo, issue, text, options=None: "Telegram: НЕ доставлен; след в #120: НЕ оставлен",
+    )
+
+    ok = ai.apply_large_ok("o/r", 294, added, labels, "approve")
+
+    assert ok is False
+    out = capsys.readouterr().out
+    assert "::error::" in out
+    assert "НЕ ДОСТАВЛЕНА" in out
+
+
+def test_apply_large_ok_returns_true_when_escalation_partially_delivered(monkeypatch, capsys):
+    # Хотя бы один канал доставил — прежнее поведение (::warning::, ok=True):
+    # не заводим вторую тревогу там, где владелец уже увидел сигнал.
+    added = ai.check_pr.LARGE_DIFF_HUGE_LINES + 1
+    labels = [{"name": "review:large"}, {"name": "ai:ok"}]
+    monkeypatch.setattr(
+        ai.pulse_guard, "escalate",
+        lambda repo, issue, text, options=None: "Telegram: доставлен; след в #120: НЕ оставлен",
+    )
+
+    ok = ai.apply_large_ok("o/r", 294, added, labels, "approve")
+
+    assert ok is True
+    out = capsys.readouterr().out
+    assert "::error::" not in out
+    assert "::warning::" in out
+
+
 # ── Классификация 404: точная форма gh, не подстрока ──────────────────────────
 
 # ── Пагинация файлов PR: класс «первая страница молча теряет хвосты»
@@ -1615,6 +1678,38 @@ def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
     status_calls = _status_calls(run_gh_calls)
     assert len(status_calls) == 1
     assert "state=failure" in " ".join(status_calls[0])
+
+
+def test_cmd_verdict_fails_loud_when_large_ok_escalation_undelivered(monkeypatch, tmp_path):
+    """#884: эскалация большого диффа, недоставленная ни одним каналом, обязана
+    красить job (rc == 1) — но комментарий ревью и метка ai:ok всё равно
+    уходят: недоставленная эскалация не должна стоить владельцу собственно
+    вердикта. review:large-ok НЕ ставится (эскалация была нужна и не решена).
+
+    Мутация: вернуть `apply_large_ok(...)` без учёта возврата (как до фикса) —
+    тест краснеет обратно (rc становится 0)."""
+    added = ai.check_pr.LARGE_DIFF_HUGE_LINES + 1
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": added}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, ["review:large"])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setattr(
+        ai.pulse_guard, "escalate",
+        lambda repo, issue, text, options=None: "Telegram: НЕ доставлен; след в #120: НЕ оставлен",
+    )
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 1
+    body = _comment_call(run_gh_calls)  # комментарий ревью УШЁЛ несмотря на красный job
+    assert body
+    label_calls = [c for c in run_gh_calls if any("/labels" in part for part in c)]
+    joined = " | ".join(" ".join(c) for c in label_calls)
+    assert f"labels[]={ai.AI_OK}" in joined  # вердикт применён как обычно
+    assert f"labels[]={rl.LARGE_OK}" not in joined  # large-ok не ставится — эскалация не решена
 
 
 def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):

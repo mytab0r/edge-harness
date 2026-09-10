@@ -544,6 +544,17 @@ jobs:
       pull-requests: write
       actions: write
       statuses: write
+      # issues: write (#884) — job-level permissions ПОЛНОСТЬЮ ЗАМЕНЯЕТ
+      # workflow-level набор (issues: read выше, строка ~167), а не мёржится
+      # с ним: без своей строки токен этого job'а не может писать в Issues
+      # API вовсе. Метка/комментарий на сам PR проходят по pull-requests:
+      # write (PR обслуживается как issue), но apply_large_ok/ai_review.py
+      # verdict эскалирует гигантский дифф в НАСТОЯЩИЙ Issue (WATCHDOG_ISSUE
+      # #120, pulse_guard.escalate) — тому нужен именно issues: write. Живой
+      # прогон 34520146758, PR #870: «след в #120 не оставлен: gh: Resource
+      # not accessible by integration (HTTP 403)» при зелёном job'е. Гвардия
+      # класса — scripts/lib/test_job_permissions_issues_write_guard.py.
+      issues: write
     steps:
       # Доверенный инструментарий — из main; ревьюимое дерево тут не нужно:
       # verdict парсит ответ и ходит в API, текущий head он сверяет сам.
@@ -575,6 +586,12 @@ jobs:
           # чтобы не жечь авто-повтор (#196) вслепую в ту же квоту.
           CHAIN_PROVIDER: ${{ needs.review.outputs.chain_provider }}
           CHAIN_RESET_HINT: ${{ needs.review.outputs.chain_reset_hint }}
+          # Второй канал эскалации large-ok (#884, pulse_guard.send_telegram):
+          # без этих двух секретов канал молча отказывает («TELEGRAM_BOT_TOKEN/
+          # TELEGRAM_CHAT_ID не заданы») даже при исправленных правах Issues
+          # API выше — тот же секрет, что уже пробрасывается в orchestra.yml.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           printf '%s\n' "$ANSWER" > "$RUNNER_TEMP/answer.txt"
           python scripts/review/ai_review.py verdict \
