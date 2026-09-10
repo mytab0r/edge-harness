@@ -188,20 +188,6 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_do_rows_read.py -q
 
-      # Бенчмарк латентности провайдеров (#836) и discovery живых model id
-      # (#848) — раньше эти тесты гонял ТОЛЬКО ручной provider-latency-bench.yml
-      # (workflow_dispatch), ни один push/PR их не проверял: живая цена — #850
-      # изменил config/provider-usage.json и сломал
-      # test_real_repo_candidates_cover_full_owner_set_without_codex, но ни
-      # один обязательный гейт этого не заметил (найдено этим PR, #848).
-      # Добавлено сюда, чтобы дрейф между provider-usage.json/dsh-ci.sh и
-      # структурными тестами этих файлов был виден на каждом PR, не только
-      # при ручном запуске бенчмарка.
-      - name: Тесты бенчмарка латентности и discovery model id провайдеров
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/measure/test_provider_latency.py scripts/measure/test_provider_model_discovery.py -q
-
       # Гвардия класса «неограниченный агрегат на горячем пути DO» (#320/#321/
       # #575): #status() зовётся на каждый heartbeat/батч событий/сообщение
       # инбокса/callback — GROUP BY по всей таблице там обязан идти только
@@ -297,18 +283,11 @@ jobs:
           pip install --quiet pytest
           python -m pytest scripts/gh/test_wake_orchestra.py -q
 
-      # Гвардия протухшей метки blocked (#334): без этого шага тесты
-      # гвардии живут только текстом файла — по собственному правилу
-      # этого же PR («решение — это механизм, а не текст») это ровно тот
-      # класс, который PR закрывает для остальных, но сам изначально
-      # не подключал себе (находка AI-ревью PR #336, третий раунд):
-      # continue-on-error в orchestra.yml держит job зелёным при любой
-      # поломке STALE_MARKER_RE/find_stale_blocked, и без обязательного
-      # прогона тестов здесь это никто не заметит.
-      - name: Тесты гвардии протухшей метки blocked
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/orchestra/test_stale_blocked_guard.py -q
+      # Гвардия протухшей метки blocked (#334) мигрирована в каталог гвардий
+      # (#749, класс «repo-ci.yml — генератор конфликтов»): шаг больше не
+      # рукописный здесь, тестируется через scripts/ci/guards/
+      # stale-blocked-guard.sh, который перебирает шаг «Каталог гвардий»
+      # ниже по файлу.
 
       # Сборщик квот харнеса (#324): Cloudflare/GitHub/LLM в одну таблицу.
       # Кормится реальными фикстурами (gh api rate_limit, пример из доков CF).
@@ -330,15 +309,6 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
-
-      # Персистентное состояние квоты провайдеров (#857, openspec/changes/
-      # provider-quota-gating): чистые функции parse/merge/expire + IO на
-      # фейковом gh_func. Мутация — сломать любую из трёх функций красит
-      # соответствующий тест по отдельности.
-      - name: Тесты персистентного состояния квоты провайдеров
-        run: |
-          pip install --quiet pytest
-          python -m pytest scripts/orchestra/test_provider_quota_state.py -q
 
       # Механический git rebase PR с меткой conflict без LLM-агента (#762) —
       # прод-форма: настоящий git (bare-репозиторий), FakeGh для GitHub API.
@@ -368,27 +338,6 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_stall_detector.py -q
-
-      # Само-аудит здоровья конвейера (openspec/changes/pipeline-health-
-      # self-audit): снимок 6-7 дешёвых метрик (сборщик — прод-форма
-      # PR/issues/runs, git-транспорт на живом bare-репозитории), детектор
-      # регрессии (baseline/streak/честное «недостаточно данных», мутация
-      # границ), само-аудит (дедуп по отпечатку, свой суточный потолок,
-      # различение регрессия/пожар) — проводка на моке gh.
-      - name: Тесты сборщика снимка здоровья конвейера
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/measure/test_pipeline_health.py -q
-
-      - name: Тесты детектора регрессии здоровья конвейера
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/orchestra/test_health_regression.py -q
-
-      - name: Тесты само-аудита здоровья конвейера
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/orchestra/test_health_audit.py -q
 
       # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
       # source-build морды кричит в задачу #134 + метка update-available +
@@ -430,18 +379,6 @@ jobs:
       # ветку, привязанную к эпику #77).
       - name: Smoke «task-branch отказывает на эпике»
         run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
-
-      # Класс «Windows-кодировка валит скрипт репозитория» (issue #723): print()
-      # в stdout без file=sys.stderr падает UnicodeEncodeError (эмодзи, cp1251);
-      # subprocess.run(text=True) без encoding="utf-8" падает UnicodeDecodeError
-      # в фоновом потоке на кириллице реального ответа gh (живой трейс: task-branch
-      # → epic_guard.py → scheduler.gh → pulse_guard.gh). Гвардия статическая
-      # (по исходнику, весь класс) + живая мутация pulse_guard.gh на прод-форме
-      # байта, ронявшего cp1251.
-      - name: Тесты гвардии кодировки stdout/subprocess (Windows)
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/lib/test_console_utf8_guard.py -q
 
       # Гейт слияния и выборочное подтягивание веток (#252): одно место
       # правды review_labels.should_update_branch — подтягивать только PR с
@@ -502,16 +439,6 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pagination_guard.py -q
-
-      # Класс «TypeError на вычитании aware-naive datetime, пойманный только
-      # ValueError» (#780, доводка #779): второе место повторило узкую версию
-      # первого. review_labels.parse_github_timestamp — единственное место
-      # разбора такой метки; гвардия ловит новое сырое datetime.fromisoformat(
-      # в review_labels.py/ai_review.py, открытое в обход хелпера.
-      - name: Гвардия разбора метки времени — новое место мимо общего хелпера
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/lib/test_timestamp_parse_guard.py -q
 
       # Утечка секрета (#743, живой случай — DSH_CHAIN_CLASS_NOTE,
       # scripts/lib/dsh-ci.sh, до фикса): сырой stderr клиента модели уходил
@@ -585,27 +512,6 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_label_registry.py -q
 
-      # Реестр использования LLM-провайдеров (#823, openspec/changes/
-      # llm-provider-usage-manifest): docs/agents/LLM-PROVIDER-USAGE.md не
-      # хардкодит назначения — scripts/lib/collect_provider_usage.py
-      # собирает их из config/provider-usage.json. Три мутации — пропавшая
-      # строка, лишняя строка, расхождение содержимого с генератором.
-      - name: Гвардия реестра использования LLM-провайдеров — таблица видимости
-        run: |
-          pip install --quiet pytest
-          python -m pytest scripts/lib/test_provider_usage_registry.py -q
-
-      # Граница доверия персистентной квоты провайдеров (#857, openspec/
-      # changes/provider-quota-gating): чейн-раннер (в т.ч. недоверенный
-      # ai-review.yml, #18) только читает vars.DSH_PROVIDER_QUOTA_UNTIL,
-      # пишет исключительно код пульса (scripts/orchestra/**). Мутация —
-      # добавить `gh variable set DSH_PROVIDER_QUOTA_UNTIL` в любой workflow
-      # или вызвать save_quota_state вне scripts/orchestra/ — краснеет.
-      - name: Гвардия границы доверия — персистентная квота провайдеров
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/lib/test_provider_quota_state_guard.py -q
-
       # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
       # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
       # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
@@ -615,15 +521,6 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_infra_gh_inventory.py -q
-
-      # Класс #83/#842: `dsh plugin add` без pnpm на PATH падает
-      # («pnpm not found on PATH»). Закрыт один раз для hands.yml (#83, PR
-      # #93/#94), не распространён на ai-review.yml, когда #838 добавил тот
-      # же вызов туда — ai-review.yml падал на КАЖДОМ прогоне (issue #842).
-      - name: Гвардия pnpm для dsh plugin add (класс #83/#842)
-        run: |
-          pip install --quiet pytest pyyaml
-          python -m pytest scripts/lib/test_dsh_plugin_pnpm_guard.py -q
 
       # Канарейка класса «осиротевший тест» (#583): PR #568 слил
       # scripts/lib/test_duplicate_guard.py (семь тестов гвардии дублей issue)
@@ -652,17 +549,6 @@ jobs:
         run: |
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_redact_parity.py -q
-
-      # Задача #733: массовая установка секретов/переменной combo-router (PR
-      # #732) из файла-экспорта роутера учёток владельца. Синтетическая
-      # фикстура (без настоящих кредов) — разбор контракта имён из dsh-ci.sh,
-      # разбор формата экспорта, отказ при файле внутри рабочего дерева,
-      # отсутствие значений в выводе, выбор слотов, идемпотентность, argv
-      # без значений секрета.
-      - name: Гвардия массовой установки секретов combo-router (#733)
-        run: |
-          pip install --quiet pytest
-          python -m pytest scripts/lib/test_provider_secrets_import.py -q
 
       # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
       # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
@@ -840,7 +726,7 @@ jobs:
       - name: Bash-скрипты валидны
         run: |
           shopt -s nullglob
-          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/test/*.sh .githooks/*; do
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/test/*.sh scripts/ci/*.sh scripts/ci/guards/*.sh scripts/ci/test/*.sh .githooks/*; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -984,31 +870,6 @@ jobs:
       # приоритет; внутри цикла цепочки suite всегда глушится плоским патчем.
       - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
         run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
-
-      # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — независимо от
-      # suite/PLUGINS_SUITE_URL: без секретов пул не подключается (сеть не
-      # трогается), импорт секрета прод-кодом плагина кладёт корректный файл
-      # аккаунта И вычищает секрет из окружения (доверенная граница ai-review,
-      # #18 — ANTHROPIC_OAUTH_1/2 не подпадают под паттерн вырезания *_KEY/
-      # *_TOKEN/*_SECRET), пул первым/цепочка фоллбэком не ломает атрибуцию.
-      - name: Гвардия быстрого провайдера Claude anthropic-oauth-pool (#838)
-        run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
-
-      # Манифест использования LLM-провайдеров (#823, openspec/changes/
-      # llm-provider-usage-manifest): dsh_require_provider_chain "<id>"
-      # резолвит цепочку из config/provider-usage.json по id потребителя
-      # приоритетнее vars.DSH_PROVIDER_CHAIN — файла нет вовсе, есть, но нет
-      # записи потребителя, ссылка на несуществующую/пустую цепочку — три
-      # разных сценария, каждый доказан отдельной мутацией.
-      - name: Гвардия манифеста использования LLM-провайдеров (#823)
-        run: bash scripts/lib/test/dsh-provider-usage-manifest.guard.sh
-
-      # Гвардия #789: окно контекста env-provider-маршрута combo-router
-      # обязано читаться из vars.DSH_EDGE_MODEL_CATALOG (реальное окно
-      # модели), не из DSH_MAX_TOKENS (потолок ДЛИНЫ ОТВЕТА) — смешение
-      # отбрасывало главного провайдера в разы раньше нужного.
-      - name: Гвардия окна контекста env-provider (#789)
-        run: bash scripts/lib/test/dsh-context-window.guard.sh
 
       # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
       # #128, М3): два списка без единого места правды — расхождение красит CI,
@@ -1159,6 +1020,31 @@ jobs:
           python -m pytest scripts/lib/test_docs_index_guard.py -q
       - name: Гвардия полноты карты документации — живой снимок (#670)
         run: python scripts/lib/docs_index_guard.py
+
+      # Каталог гвардий (#749): регистрация гвардии — данные (файл
+      # scripts/ci/guards/<имя>.sh), не рукописный шаг здесь. Этот ОДИН шаг
+      # перебирает каталог и исполняет каждый файл целиком (свои
+      # pip/pytest/node внутри) — добавление новой гвардии = новый файл в
+      # scripts/ci/guards/, без единой правки этого workflow. Стоит
+      # последним шагом job `test`, после setup-python и setup-node выше —
+      # каталог может нести как python/pytest-, так и node/bash-гвардии без
+      # дополнительного setup. Имя шага НЕ начинается с
+      # Тест/Гвардия/Smoke/Юнит-тест намеренно — scripts/lib/
+      # ci_guard_registration_guard.py не должен путать этот перебор с
+      # рукописной регистрацией, которую он же и запрещает.
+      #
+      # GH_TOKEN — на уровне ЭТОГО шага, не job (ревью PR #771, minor 6):
+      # ни одна гвардия каталога на момент этого PR не читает `gh api`, и
+      # job-level `env:` расширял бы радиус до всех 94 шагов job (каждый
+      # pytest-прогон) без единого потребителя. `bash "$script"` внутри
+      # scripts/ci/run_guards.sh — дочерний процесс ЭТОГО шага, поэтому
+      # переменная окружения step-уровня доходит до любого файла каталога
+      # без per-файловой проводки — то же обоснование, что design.md
+      # называл для job-level, просто на меньшем радиусе.
+      - name: Каталог гвардий scripts/ci/guards — перебор (#749)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/run_guards.sh
 
   # Инвариант 4 (#244) — автофикс НА ВХОДЕ, не гейт постфактум (issue #493).
   # Замер 2026-09-06 06:00-12:00 UTC: 5 падений job `test` подряд красили

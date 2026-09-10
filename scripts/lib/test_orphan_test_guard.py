@@ -93,8 +93,8 @@ def test_is_dir_like_true_for_trailing_slash_and_extensionless():
 
 # ── Чистая логика: build_coverage ───────────────────────────────────────────
 
-def _step(run_text: str, cwd: str | None = None) -> dict:
-    return {"workflow": "fixture.yml", "job": "test", "step": "fixture", "cwd": cwd, "run": run_text}
+def _step(run_text: str, cwd: str | None = None, workflow: str = "repo-ci.yml", job: str = "test") -> dict:
+    return {"workflow": workflow, "job": job, "step": "fixture", "cwd": cwd, "run": run_text}
 
 
 def test_build_coverage_exact_pytest_file():
@@ -175,6 +175,41 @@ def test_build_report_excludes_exempted_file_from_orphans(tmp_path, monkeypatch)
     assert report["exemptions"] == {"scripts/lib/test_exempt_example.py": "живой пример газа для теста канарейки"}
 
 
+def test_build_report_default_catalog_dir_resolves_from_repo_root_not_live_catalog(tmp_path):
+    # Ревью PR #771, minor 10: `catalog_dir` по умолчанию раньше был
+    # захардкоженной константой GUARD_CATALOG_DIR (живой каталог ЭТОГО
+    # репозитория), а не производной от repo_root вызова — build_report на
+    # синтетической фикстуре без явного catalog_dir тихо читал бы файлы
+    # scripts/ci/guards/ настоящего репозитория. Здесь repo_root — tmp_path,
+    # где каталога scripts/ci/guards/ вовсе нет — orphans не должен
+    # схлопнуться в 0 по инерции живого каталога.
+    lib = tmp_path / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "test_default_catalog.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "repo-ci.yml").write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - name: perebor\n"
+        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n",
+        encoding="utf-8",
+    )
+    report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows)
+    assert report["orphans"] == ["scripts/lib/test_default_catalog.py"]
+
+
+def test_suggest_mentions_guard_catalog_alternative_for_py_mjs_sh():
+    # Ревью PR #771, minor 8: раньше единственная подсказка сироте была
+    # «допиши рукописный шаг в repo-ci.yml» — ровно то, за что краснеет
+    # гвардия рецидива (#749, ci_guard_registration_guard.py). Обе гвардии
+    # одного PR не должны давать взаимоисключающие инструкции.
+    assert "scripts/ci/guards/" in otg._suggest("scripts/lib/test_x.py")
+    assert "scripts/ci/guards/" in otg._suggest("scripts/lib/test/x.test.mjs")
+    assert "scripts/ci/guards/" in otg._suggest("scripts/lib/test/x.test.sh")
+
+
 def test_build_report_flags_unwired_file_as_orphan(tmp_path):
     lib = tmp_path / "scripts" / "lib"
     lib.mkdir(parents=True)
@@ -185,6 +220,86 @@ def test_build_report_flags_unwired_file_as_orphan(tmp_path):
 
     report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows)
     assert report["orphans"] == ["scripts/lib/test_unwired.py"]
+
+
+# ── Каталог гвардий (#749): покрытие через опосредованный перебор ──────────
+
+def test_catalog_runner_not_wired_when_no_step_calls_it():
+    steps = [_step("python -m pytest scripts/lib/test_a.py -q")]
+    assert otg._catalog_runner_is_wired(steps) is False
+
+
+def test_catalog_runner_wired_when_bash_step_calls_it():
+    steps = [_step(f"bash {otg.GUARD_CATALOG_RUNNER}")]
+    assert otg._catalog_runner_is_wired(steps) is True
+
+
+def test_catalog_runner_not_wired_when_called_from_wrong_workflow():
+    # Ревью PR #771, minor 7 — комбинированная мутация: шаг-перебор убран из
+    # required repo-ci.yml и добавлен в НЕОБЯЗАТЕЛЬНЫЙ workflow (например
+    # deploy-dsh-edge.yml с continue-on-error) — required-гейт каталог вообще
+    # не исполняет, поэтому это НЕ должно засчитываться как «подключено».
+    steps = [_step(f"bash {otg.GUARD_CATALOG_RUNNER}", workflow="deploy-dsh-edge.yml", job="deploy")]
+    assert otg._catalog_runner_is_wired(steps) is False
+
+
+def test_catalog_runner_not_wired_when_called_from_wrong_job():
+    # Тот же класс минор 7 — тот же файл repo-ci.yml, но другой job (не
+    # `test`, required-контекст защиты ветки) тоже не должен засчитываться.
+    steps = [_step(f"bash {otg.GUARD_CATALOG_RUNNER}", job="lint")]
+    assert otg._catalog_runner_is_wired(steps) is False
+
+
+def test_iter_guard_catalog_steps_reads_every_sh_file(tmp_path):
+    (tmp_path / "a.sh").write_text("python -m pytest scripts/lib/test_a.py -q\n", encoding="utf-8")
+    (tmp_path / "b.sh").write_text("node --test scripts/x/test/y.test.mjs\n", encoding="utf-8")
+    steps = otg.iter_guard_catalog_steps(tmp_path)
+    assert {s["step"] for s in steps} == {"a.sh", "b.sh"}
+
+
+def test_iter_guard_catalog_steps_empty_dir_returns_empty_list(tmp_path):
+    assert otg.iter_guard_catalog_steps(tmp_path / "does-not-exist") == []
+
+
+def test_build_report_covers_test_invoked_only_inside_catalog_file(tmp_path):
+    # Мутация, доказывающая класс #749: тест-файл, чей pytest-вызов лежит
+    # ТОЛЬКО внутри scripts/ci/guards/<имя>.sh (не в самом workflow), не
+    # считается осиротевшим — потому что каталог реально перебирается
+    # шагом workflow (bash scripts/ci/run_guards.sh).
+    lib = tmp_path / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "test_via_catalog.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    # Имя файла и job — ИМЕННО `repo-ci.yml`/`test` (ревью PR #771, minor 7):
+    # только этот workflow+job считается required-подключением перебора.
+    (workflows / "repo-ci.yml").write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - name: perebor\n"
+        f"        run: bash {otg.GUARD_CATALOG_RUNNER}\n",
+        encoding="utf-8",
+    )
+
+    catalog = tmp_path / "scripts" / "ci" / "guards"
+    catalog.mkdir(parents=True)
+    (catalog / "via-catalog.sh").write_text(
+        "python -m pytest scripts/lib/test_via_catalog.py -q\n", encoding="utf-8"
+    )
+
+    report = otg.build_report(repo_root=tmp_path, workflows_dir=workflows, catalog_dir=catalog)
+    assert report["orphans"] == []
+
+    # Убери перебор из workflow (никто больше не вызывает run_guards.sh) —
+    # тот же тест-файл снова осиротевший, а не молча остаётся зелёным по
+    # инерции старого прогона: catalog_dir существует, но не подключён.
+    (workflows / "repo-ci.yml").write_text(
+        "jobs:\n  test:\n    steps: []\n", encoding="utf-8"
+    )
+    report_unwired = otg.build_report(repo_root=tmp_path, workflows_dir=workflows, catalog_dir=catalog)
+    assert report_unwired["orphans"] == ["scripts/lib/test_via_catalog.py"]
 
 
 # ── Живой снимок текущего репозитория — сама канарейка ─────────────────────
