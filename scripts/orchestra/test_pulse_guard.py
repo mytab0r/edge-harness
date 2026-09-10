@@ -1395,6 +1395,28 @@ def test_last_error_log_line_worker_wrapper_is_not_a_fact(monkeypatch):
     assert "Воркер не справился" not in line
 
 
+def test_last_error_log_line_guard_catalog_wrapper_is_not_a_fact(monkeypatch):
+    # PR #771 ревью, блокирующая 1: `scripts/ci/run_guards.sh:42` эмитит
+    # «::error::гвардия каталога '<имя>' … провалилась» как последняя
+    # аннотированная строка перед «Process completed» — то же самое, что и
+    # «Воркер не справился» выше: факт падения ОБЁРТКИ переборщика, а не
+    # причины упавшей гвардии. Прод-форма: причина живёт как WARNING pip
+    # retry в plain-хвосте лога.
+    log = (
+        "2026-09-06T10:17:55.0000000Z WARNING: Retrying (Retry(total=4, connect=None, "
+        "read=None, redirect=None, status=None)) after connection reset by peer: "
+        "'https://pypi.org/simple/pyyaml/'\n"
+        "2026-09-06T10:17:58.0000000Z ##[error]гвардия каталога 'stale-blocked-guard' "
+        "(scripts/ci/guards/stale-blocked-guard.sh) провалилась\n"
+        "2026-09-06T10:18:00.0000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    monkeypatch.setattr(
+        pg, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=log)))
+    line = pg.last_error_log_line("mytab0r/edge-harness", 999)
+    assert line is not None and "pypi.org" in line
+    assert "гвардия каталога" not in line
+
+
 def test_last_error_log_line_wrapper_without_tail_returns_none(monkeypatch):
     # Обёртка без содержательного хвоста — не превращается в «факт с ложной
     # точностью»: нет строки → вызывающий уходит в громкое наблюдение, задачу

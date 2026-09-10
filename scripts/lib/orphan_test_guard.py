@@ -58,6 +58,25 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
+# Каталог гвардий (#749): тесты, запускаемые ОПОСРЕДОВАННО через перебор
+# scripts/ci/run_guards.sh, а не напрямую из .github/workflows/*.yml —
+# миграция гвардии в каталог не должна порождать пачку осиротевших тестов
+# (см. iter_guard_catalog_steps/_catalog_runner_is_wired ниже).
+GUARD_CATALOG_DIR = REPO_ROOT / "scripts" / "ci" / "guards"
+GUARD_CATALOG_RUNNER = "scripts/ci/run_guards.sh"
+
+# Только этот workflow+job засчитывает подключение перебора (ревью PR #771,
+# minor 7): required-проверка ветки main — job `test` файла `repo-ci.yml`
+# (см. комментарий вверху repo-ci.yml, «Job id обязан быть ровно test»).
+# Вызов run_guards.sh из ЛЮБОГО другого workflow/job (например
+# необязательного deploy-dsh-edge.yml с continue-on-error) не должен
+# засчитываться как «каталог подключён» — иначе комбинированная мутация
+# «убрать шаг-перебор из repo-ci.yml, добавить в необязательный workflow»
+# проходила бы канарейку молча, при том что required-гейт каталог вообще не
+# исполняет.
+GUARD_CATALOG_REQUIRED_WORKFLOW = "repo-ci.yml"
+GUARD_CATALOG_REQUIRED_JOB = "test"
+
 EXCLUDED_DIR_NAMES = {".git", "node_modules", "dist", ".claude", ".githooks"}
 
 # Расширения, которые реально встречаются в директориях `test/` этого
@@ -191,6 +210,52 @@ def iter_workflow_run_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[dict]:
     return steps
 
 
+def _catalog_runner_is_wired(steps: list[dict]) -> bool:
+    """Каталог гвардий засчитывается в покрытие, только если
+    `scripts/ci/run_guards.sh` реально вызван шагом ИМЕННО job
+    `GUARD_CATALOG_REQUIRED_JOB` файла `GUARD_CATALOG_REQUIRED_WORKFLOW` —
+    иначе файлы каталога не подключены к required-CI вовсе, и притворяться,
+    что они покрыты, было бы ложным зелёным (#749, тот же класс, который
+    сама канарейка ловит наоборот: «файл лежит, но не запускается»).
+    Вызов из другого workflow/job (ревью PR #771, minor 7) не засчитывается —
+    комбинированная мутация «убрать шаг из repo-ci.yml, добавить в
+    необязательный workflow с continue-on-error» проходила бы это раньше."""
+    for step in steps:
+        if (
+            step.get("workflow") != GUARD_CATALOG_REQUIRED_WORKFLOW
+            or step.get("job") != GUARD_CATALOG_REQUIRED_JOB
+        ):
+            continue
+        for words in statement_tokens(step["run"]):
+            if not words:
+                continue
+            if words[0] in ("bash", "sh") and len(words) >= 2 and words[1] == GUARD_CATALOG_RUNNER:
+                return True
+            if words[0] == GUARD_CATALOG_RUNNER:
+                return True
+    return False
+
+
+def iter_guard_catalog_steps(catalog_dir: Path = GUARD_CATALOG_DIR) -> list[dict]:
+    """Каждый файл `scripts/ci/guards/*.sh` — псевдо-шаг с его содержимым как
+    run-текст (#749): перебор каталога исполняет их так же, как раньше
+    исполнял рукописный шаг repo-ci.yml, поэтому канарейка обязана видеть
+    команды pytest/node --test внутри них, не только внутри
+    `.github/workflows/*.yml`."""
+    steps: list[dict] = []
+    if not catalog_dir.is_dir():
+        return steps
+    for path in sorted(catalog_dir.glob("*.sh")):
+        steps.append({
+            "workflow": "scripts/ci/guards/" + path.name,
+            "job": "guard-catalog",
+            "step": path.name,
+            "cwd": None,
+            "run": path.read_text(encoding="utf-8", errors="ignore"),
+        })
+    return steps
+
+
 def _resolve(cwd: str | None, arg: str) -> str | None:
     """Путь `arg`, разрешённый относительно `cwd` (оба — repo-relative posix),
     в виде repo-relative posix-строки. `None`, если `cwd` содержит
@@ -298,10 +363,23 @@ def build_coverage(steps: list[dict], test_files: list[str]) -> set[str]:
     return covered
 
 
-def build_report(repo_root: Path = REPO_ROOT, workflows_dir: Path = WORKFLOWS_DIR) -> dict:
+def build_report(
+    repo_root: Path = REPO_ROOT,
+    workflows_dir: Path = WORKFLOWS_DIR,
+    catalog_dir: Path | None = None,
+) -> dict:
+    # `catalog_dir` по умолчанию — `None`, резолвится ОТ `repo_root` вызова
+    # (не от захардкоженной константы GUARD_CATALOG_DIR модуля): вызов
+    # `build_report(repo_root=tmp_path)` без явного `catalog_dir` иначе тихо
+    # читал бы ЖИВОЙ каталог `scripts/ci/guards/` этого репозитория мимо
+    # синтетической фикстуры `tmp_path` (ревью PR #771, minor 10).
+    if catalog_dir is None:
+        catalog_dir = repo_root / "scripts" / "ci" / "guards"
     files = discover_test_files(repo_root)
     rel_files = [_relpath(f, repo_root) for f in files]
     steps = iter_workflow_run_steps(workflows_dir)
+    if _catalog_runner_is_wired(steps):
+        steps = steps + iter_guard_catalog_steps(catalog_dir)
     covered = build_coverage(steps, rel_files)
 
     exemptions: dict[str, str] = {}
@@ -323,14 +401,31 @@ def build_report(repo_root: Path = REPO_ROOT, workflows_dir: Path = WORKFLOWS_DI
 
 
 def _suggest(path: str) -> str:
+    # Ревью PR #771, minor 8: раньше единственная подсказка была «допиши
+    # рукописный шаг в repo-ci.yml» — ровно то, за что краснеет гвардия
+    # рецидива scripts/lib/ci_guard_registration_guard.py (#749). Каталог
+    # scripts/ci/guards/<имя>.sh — равноценная (и предпочтительная для
+    # новых проверок) альтернатива, названа явно, а не молчит.
     if path.startswith("cf-worker/"):
         return "добавь в job `worker-test` .github/workflows/worker-ci.yml (npm test уже покрывает cf-worker/test/, проверь, что файл под этой директорией)"
     if path.endswith(".py"):
-        return f"добавь шаг `python -m pytest {path} -q` в job `test` .github/workflows/repo-ci.yml"
+        return (
+            f"добавь шаг `python -m pytest {path} -q` в job `test` "
+            ".github/workflows/repo-ci.yml, или файл `scripts/ci/guards/<имя>.sh` "
+            "с той же командой внутри (#749) — каталог, не рукописный шаг"
+        )
     if path.endswith((".mjs", ".js", ".cjs", ".ts", ".tsx")):
-        return f"добавь шаг `node --test {path}` в job `test` .github/workflows/repo-ci.yml"
+        return (
+            f"добавь шаг `node --test {path}` в job `test` "
+            ".github/workflows/repo-ci.yml, или файл `scripts/ci/guards/<имя>.sh` "
+            "с той же командой внутри (#749) — каталог, не рукописный шаг"
+        )
     if path.endswith(".sh"):
-        return f"добавь шаг `bash {path}` в job `test` .github/workflows/repo-ci.yml"
+        return (
+            f"добавь шаг `bash {path}` в job `test` .github/workflows/repo-ci.yml, "
+            "или файл `scripts/ci/guards/<имя>.sh` с той же командой внутри (#749) — "
+            "каталог, не рукописный шаг"
+        )
     return f"подключи {path} к шагу подходящего workflow — сейчас не запускается нигде"
 
 
