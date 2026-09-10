@@ -34,6 +34,7 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 # GitHub Actions грузит workflows из .yml И .yaml — гвардия обязана видеть оба
 # (находка AI-ревью #146: файл evil.yaml со скваттером проходил все тесты зелёно).
+# Класс держит гвардия scripts/lib/workflow_glob_suffix_guard.py (#635).
 DISPATCH_SECRET_RE = r"secrets[.\[]\s*['\"]?GH_DISPATCH_TOKEN\b"
 PIPELINE_SECRET = "secrets.GH_PIPELINE_PAT"
 

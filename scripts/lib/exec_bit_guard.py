@@ -123,9 +123,13 @@ def direct_script_invocations(run_text: str) -> list[str]:
 
 def iter_workflow_run_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[tuple[str, str, str]]:
     """IO: (имя файла workflow, имя шага, текст run:) для каждого шага с run:.
-    uses:-шаги (actions/checkout и т.п.) не несут shell-команд — пропускаются."""
+    uses:-шаги (actions/checkout и т.п.) не несут shell-команд — пропускаются.
+    `.yml` И `.yaml` — GitHub Actions грузит оба (находка AI-ревью #146),
+    класс односуффиксного скана каталога workflow держит гвардия
+    scripts/lib/workflow_glob_suffix_guard.py; тот же приём, что
+    scripts/lib/collect_labels.py::_scan_workflow_files."""
     steps = []
-    for path in sorted(workflows_dir.glob("*.yml")):
+    for path in sorted(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml"))):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for job in (doc.get("jobs") or {}).values():
             for step in job.get("steps") or []:

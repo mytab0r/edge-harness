@@ -183,9 +183,12 @@ def iter_workflow_run_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[dict]:
     cwd, run_text). `cwd` — working-directory шага/джоба/файла (без
     подстановки динамических `${{ }}`-выражений: такие пути не резолвятся в
     файл репозитория, поэтому просто не участвуют в покрытии — это безопасная
-    сторона ошибки, ложноположительных «покрыт» она не даёт)."""
+    сторона ошибки, ложноположительных «покрыт» она не даёт).
+    `.yml` И `.yaml` (GitHub Actions грузит оба, находка AI-ревью #146,
+    класс держит гвардия scripts/lib/workflow_glob_suffix_guard.py) — тот же
+    приём, что scripts/lib/collect_labels.py::_scan_workflow_files."""
     steps = []
-    for path in sorted(workflows_dir.glob("*.yml")):
+    for path in sorted(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml"))):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         wf_default_cwd = (
             ((doc.get("defaults") or {}).get("run") or {}).get("working-directory")

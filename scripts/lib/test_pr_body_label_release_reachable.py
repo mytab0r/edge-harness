@@ -165,8 +165,11 @@ def test_orchestra_contract_reacts_to_pr_body_edits():
 
 
 def test_no_new_body_gated_label_release_without_edited():
+    # `.yml` И `.yaml` (GitHub Actions грузит оба, находка AI-ревью #146,
+    # класс держит гвардия scripts/lib/workflow_glob_suffix_guard.py) — тот
+    # же приём, что scripts/lib/collect_labels.py::_scan_workflow_files.
     offenders = []
-    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+    for path in sorted(list(WORKFLOWS_DIR.glob("*.yml")) + list(WORKFLOWS_DIR.glob("*.yaml"))):
         doc = _load(path)
         on_block = _on_block(doc, path)
         types = _pr_types(on_block)
