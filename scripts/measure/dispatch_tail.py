@@ -56,6 +56,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 import argparse
 import base64
 import csv
+import io
 import json
 import os
 import statistics
@@ -67,6 +68,16 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# data_branch_writer — одно место правды на «append + push с ретраем на
+# data-ветку» (issue #882): раньше эта логика была независимой копией здесь
+# и в pipeline_health.py, обе с одним и тем же дефектом (тихий check=False на
+# восстановлении после отказа push маскировал отказ авторизации под
+# безобидную гонку параллельного писателя) — см. докстринг data_branch_writer.py.
+_DBW_SPEC = importlib.util.spec_from_file_location(
+    "data_branch_writer", Path(__file__).resolve().parents[1] / "lib" / "data_branch_writer.py")
+data_branch_writer = importlib.util.module_from_spec(_DBW_SPEC)
+_DBW_SPEC.loader.exec_module(data_branch_writer)  # type: ignore[union-attr]
 
 # ── Единственное место правды кампании ────────────────────────────────────────────
 
@@ -422,65 +433,65 @@ class Github:
         return payload or []
 
 
-# ── Git-транспорт записи CSV (push с перезапуском на гонку ветки) ─────────────────
-
-
-def git(*args: str, cwd: str, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
-    if check and proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:3])}: {proc.stderr.strip()[:300]}")
-    return proc
+# ── Git-транспорт записи CSV: делегирован data_branch_writer.py (issue #882,
+# одно место правды на append+push с ретраем — см. докстринг там). `git`
+# остаётся здесь алиасом: cmd_finalize ниже вызывает его напрямую для своего
+# отдельного, уже громкого (fetch/rebase без check=False) push-цикла по
+# сводке кампании — второй копии append+push там нет, унифицировать нечего.
+git = data_branch_writer.git
 
 
 def clone_data_branch(workdir: str) -> None:
     """Свежий клон под данные: main + ветка данных (клон job'а не трогаем)."""
-    origin = origin_url()
-    git("clone", "--quiet", "--no-tags", origin, workdir, cwd=".")
-    git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir, check=False)
-    exists = git("rev-parse", "--verify", "--quiet", f"origin/{DATA_BRANCH}",
-                 cwd=workdir, check=False).returncode == 0
-    base = f"origin/{DATA_BRANCH}" if exists else "origin/main"
-    git("checkout", "--quiet", "-B", DATA_BRANCH, base, cwd=workdir)
+    data_branch_writer.clone_data_branch(origin_url(), workdir, DATA_BRANCH)
+
+
+def _csv_row_is_duplicate(probe_id: str):
+    def check(current_text: str) -> bool:
+        rows = read_rows(current_text)
+        is_dup = any(r.get("probe_id") == probe_id for r in rows)
+        if is_dup:
+            print(f"probe_id {probe_id} уже в CSV — строка не дублируется")
+        return is_dup
+    return check
+
+
+def _render_csv_row(row: dict):
+    def render(current_text: str) -> str:
+        buffer = io.StringIO()
+        # lineterminator — общее место правды с rows_to_csv: иначе append-строки
+        # получаются CRLF, а файл с main — LF.
+        writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS, lineterminator="\n")
+        if not current_text:
+            writer.writeheader()
+        writer.writerow(row)
+        return current_text + buffer.getvalue()
+    return render
 
 
 def append_and_push(workdir: str, row: dict, commit_message: str) -> bool:
-    """Строка в CSV + push. Гонка за ветку — сброс на свежую и повтор (до 5 раз).
+    """Строка в CSV + push через data_branch_writer.append_and_push (issue
+    #882): гонка за ветку — свежий, ГРОМКО подтверждённый с сервера, fetch/
+    checkout и повтор (до 5 раз); отказ авторизации — красный шаг немедленно,
+    не тихий повтор (см. докстринг data_branch_writer.py).
 
     Возвращает True если строка записана; False если probe_id уже есть — дубль не
     пишется (таймаут-строка диспетчера опередила опоздавший job: старт позже
     TIMEOUT_S уже зафиксирован, тихое задвоение хуже).
     """
-    csv_file = Path(workdir) / CSV_PATH
     # Граница формата: перенос строки внутри поля ломает read_rows при разборе.
     # Чистится здесь, у писателя, а не в call site'ах.
     row = {key: str(value).replace("\r", " ").replace("\n", " ")
            for key, value in row.items()}
-    for _ in range(5):
-        rows = read_rows(csv_file.read_text(encoding="utf-8")) if csv_file.exists() else []
-        if any(r.get("probe_id") == row["probe_id"] for r in rows):
-            print(f"probe_id {row['probe_id']} уже в CSV — строка не дублируется")
-            return False
-        csv_file.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not csv_file.exists()
-        with open(csv_file, "a", newline="", encoding="utf-8") as file:
-            # lineterminator — общее место правды с rows_to_csv: иначе append-строки
-            # получаются CRLF, а файл с main — LF.
-            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, lineterminator="\n")
-            if new_file:
-                writer.writeheader()
-            writer.writerow(row)
-        git(*COMMIT_IDENTITY, "add", CSV_PATH, cwd=workdir)
-        git(*COMMIT_IDENTITY, "commit", "--quiet", "-m", commit_message, cwd=workdir)
-        if git("push", "--quiet", "origin", f"HEAD:{DATA_BRANCH}", cwd=workdir,
-               check=False).returncode == 0:
-            return True
-        # Кто-то успел раньше: сбрасываемся на его версию и пробуем снова.
-        git("rebase", "--abort", cwd=workdir, check=False)
-        git("fetch", "--quiet", "origin", DATA_BRANCH, cwd=workdir, check=False)
-        git("checkout", "--quiet", "-B", DATA_BRANCH, f"origin/{DATA_BRANCH}", cwd=workdir,
-            check=False)
-    raise RuntimeError(f"не удалось записать строку {row['probe_id']} на {DATA_BRANCH} "
-                       "за 5 попыток")
+    return data_branch_writer.append_and_push(
+        workdir=workdir,
+        data_branch=DATA_BRANCH,
+        rel_path=CSV_PATH,
+        commit_identity=COMMIT_IDENTITY,
+        commit_message=commit_message,
+        is_duplicate=_csv_row_is_duplicate(row["probe_id"]),
+        render_next=_render_csv_row(row),
+    )
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────────

@@ -127,6 +127,21 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       валидным этим же PR). Морда НЕ входит в канонический список
       (design.md «Потребители»: один слот адаптера, без цепочки
       принципиально) — её отсутствие в .usage не нарушение.
+  12. check_pipeline_health_snapshot_stale (#882) — механизм снимков
+      здоровья конвейера (health_audit.py run → pipeline_health.
+      snapshot_and_store, ветка данных data/pipeline-health) обязан класть
+      снимок не реже раза в календарные сутки; нарушение — либо снимков не
+      было НИ РАЗУ, либо последний старше PIPELINE_HEALTH_STALE_AFTER_DAYS
+      суток. Живой случай, ради которого этот инвариант написан: шаг
+      orchestra.yml «Само-аудит здоровья конвейера» рапортовал
+      conclusion=success ~96 раз в сутки, не записав НИ ОДНОГО снимка за всё
+      время жизни механизма — гонка параллельного писателя была
+      неотличима от отказа авторизации push (git_transport,
+      `check=False` глотал отказ, см. `scripts/lib/data_branch_writer.py`).
+      Наблюдательный, не гейтящий: сразу после включения этого фикса
+      история ещё пуста (первый снимок ещё не написан), гейтить с ходу
+      означало бы красить `test` за собственный переходный период — тот же
+      класс «тормоз без газа», от которого уже отказались для 1/4/5/9.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -259,6 +274,14 @@ _TD_SPEC = importlib.util.spec_from_file_location(
     "task_deps", REPO_ROOT / "scripts" / "lib" / "task_deps.py")
 task_deps = importlib.util.module_from_spec(_TD_SPEC)
 _TD_SPEC.loader.exec_module(task_deps)  # type: ignore[union-attr]
+
+# pipeline_health.fetch_history/last_snapshot_date — тот же единственный
+# источник истории снимков здоровья, что уже читает health_audit.py (#882,
+# инвариант 12 ниже) — второй сборщик того же факта не заводим.
+_PH_SPEC = importlib.util.spec_from_file_location(
+    "pipeline_health", REPO_ROOT / "scripts" / "measure" / "pipeline_health.py")
+pipeline_health = importlib.util.module_from_spec(_PH_SPEC)
+_PH_SPEC.loader.exec_module(pipeline_health)  # type: ignore[union-attr]
 
 _DD_SPEC = importlib.util.spec_from_file_location(
     "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
@@ -1528,6 +1551,70 @@ def check_provider_usage_manifest(manifest_path: Path = PROVIDER_USAGE_MANIFEST)
     return violations
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 12 (#882): механизм снимков здоровья конвейера заявляет успех,
+# а снимков за N суток нет
+# ══════════════════════════════════════════════════════════════════════════
+
+# «Раз в календарные сутки» (design.md §2.2, pipeline_health.should_snapshot)
+# плюс запас на один пропущенный день (транзиентный сбой сети/квоты) — тревога
+# не на первом же пропуске, а когда пропуск держится дольше одного дня сверху.
+PIPELINE_HEALTH_STALE_AFTER_DAYS = 2
+
+
+def check_pipeline_health_snapshot_stale(
+    history: list[dict], now: datetime,
+    max_age_days: int = PIPELINE_HEALTH_STALE_AFTER_DAYS,
+) -> list[dict]:
+    """Чистая функция (без сети — `history` уже прочитана
+    `pipeline_health.fetch_history`, `now` — инъекция, не `datetime.now()`,
+    класс «тесты-бомбы» здесь недопустим). Живой инцидент #882: шаг
+    orchestra.yml «Само-аудит здоровья конвейера» рапортовал
+    `conclusion=success` ~96 раз в сутки, не записав НИ ОДНОГО снимка за всё
+    время жизни механизма (`data/pipeline-health` не существовала вовсе) —
+    гонка параллельного писателя была неотличима от отказа авторизации push
+    (`git fetch`/`checkout` восстановления шли с `check=False`, см.
+    `scripts/lib/data_branch_writer.py`).
+
+    Пустая история («снимков не было НИ РАЗУ») и «снимок был, но устарел» —
+    РАЗНЫЕ факты (fail loud, не гадание): `last_date=None` отличает первый
+    случай от второго, а не молчит под общим «нарушение», как это было бы
+    при substring-проверке."""
+    last = pipeline_health.last_snapshot_date(history)
+    if last is None:
+        return [{"last_date": None, "age_days": None}]
+    age_days = (now.date() - last).days
+    if age_days <= max_age_days:
+        return []
+    return [{"last_date": last.isoformat(), "age_days": age_days}]
+
+
+def fetch_pipeline_health_history(repo: str) -> list[dict]:
+    """История снимков здоровья через уже мокаемый транспорт `gh()` этого
+    файла — НЕ `pipeline_health.fetch_history` напрямую: та функция делает
+    свой собственный `subprocess.run(["gh", "api", ...])` в обход единой
+    точки патча repo_invariants.py (`patch_gh`/`FakeGh` в тестах) — ровно тот
+    класс, из-за которого непропатченный вызов однажды реально ушёл в живой
+    issue #120 (см. докстринг `patch_gh` в test_repo_invariants.py). 404
+    (ветки/файла данных ещё нет) — штатное «снимков не было», не ошибка.
+
+    RuntimeError любой другой природы (сеть/квота) не тонет молча: вызывающая
+    сторона (build_report) обязана отличать «история пуста — механизм
+    молчит» от «прочитать историю не удалось сейчас», не путать сетевой сбой
+    со здоровым состоянием."""
+    try:
+        blob = gh(f"repos/{repo}/contents/{pipeline_health.SNAPSHOT_PATH}"
+                  f"?ref={pipeline_health.DATA_BRANCH}")
+    except RuntimeError as error:
+        if "404" in str(error) or "Not Found" in str(error):
+            return []
+        raise
+    if not blob:
+        return []
+    import base64
+    return pipeline_health.read_rows(base64.b64decode(blob["content"]).decode())
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -1724,6 +1811,29 @@ def build_report(repo: str, now: datetime,
         else:
             lines.append("💚 [11] у всех потребителей манифеста (ai-review/worker/hands) есть валидное назначение цепочки")
 
+    try:
+        health_history = fetch_pipeline_health_history(repo)
+    except RuntimeError as error:
+        findings[12] = []
+        lines.append(f"🚨 [12] история снимков здоровья конвейера недоступна: {error} — "
+                      "инвариант пропущен на этом прогоне (это НЕ «снимков нет»)")
+    else:
+        v12 = check_pipeline_health_snapshot_stale(health_history, now)
+        findings[12] = v12
+        if v12:
+            item = v12[0]
+            if item["last_date"] is None:
+                lines.append(f"🚨 [12] {pipeline_health.DATA_BRANCH}: снимков здоровья конвейера "
+                              "не было НИ РАЗУ — механизм (health_audit.py) рапортует успех, "
+                              "ничего не записав (issue #882)")
+            else:
+                lines.append(f"🚨 [12] {pipeline_health.DATA_BRANCH}: последний снимок здоровья "
+                              f"конвейера — {item['last_date']} ({item['age_days']} дн. назад, "
+                              f"порог {PIPELINE_HEALTH_STALE_AFTER_DAYS})")
+        else:
+            lines.append(f"💚 [12] снимок здоровья конвейера на {pipeline_health.DATA_BRANCH} "
+                          f"не старше {PIPELINE_HEALTH_STALE_AFTER_DAYS} суток")
+
     return lines, findings
 
 
@@ -1736,7 +1846,7 @@ def summary(lines: list[str]) -> None:
             file.write(text)
 
 
-ESCALATING_INVARIANTS = (1, 3)
+ESCALATING_INVARIANTS = (1, 3, 12)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -1782,6 +1892,27 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 3, key, text)
         if result:
             lines.append(f"📣 инвариант 3 эскалирован: {result}")
+    if findings.get(12):
+        item = findings[12][0]
+        key = f"{item['last_date']}"
+        if item["last_date"] is None:
+            text = (
+                "🚨 edge-harness: инвариант 12 (снимок здоровья конвейера, #882) — "
+                f"{pipeline_health.DATA_BRANCH}: снимков не было НИ РАЗУ. Механизм "
+                "health_audit.py рапортует успех, ничего не записав — проверь "
+                "git-авторизацию push (gh auth setup-git) в orchestra.yml перед "
+                "шагом «Само-аудит здоровья конвейера»."
+            )
+        else:
+            text = (
+                "🚨 edge-harness: инвариант 12 (снимок здоровья конвейера, #882) — "
+                f"последний снимок на {pipeline_health.DATA_BRANCH} — {item['last_date']} "
+                f"({item['age_days']} дн. назад, порог {PIPELINE_HEALTH_STALE_AFTER_DAYS}) — "
+                "механизм снимков молчит."
+            )
+        result = escalate_if_new(repo, 12, key, text)
+        if result:
+            lines.append(f"📣 инвариант 12 эскалирован: {result}")
     return lines
 
 

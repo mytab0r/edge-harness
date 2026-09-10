@@ -172,6 +172,18 @@ jobs:
       # который читает пульс (heartbeat_check, #120). GH_TOKEN — широкий
       # GH_PIPELINE_PAT (не github.token), как у dispatch_tail.py: нужен
       # для git push на ветку данных, не только для чтения issues/PR/runs.
+      #
+      # Git-авторизация под PAT (issue #882 — корень живого инцидента): без
+      # неё свежий клон в $RUNNER_TEMP (pipeline_health.clone_data_branch)
+      # не наследует креды actions/checkout, push на data/pipeline-health
+      # падает 403, а старый код молча трактовал этот отказ как «уже
+      # записано параллельным прогоном» — тот же шаг, что уже стоит в
+      # dispatch-latency-probe.yml перед каждым git-пишущим шагом.
+      - name: Git-авторизация под PAT (push снимка здоровья на data-ветку)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: gh auth setup-git
       - name: Само-аудит здоровья конвейера (снимок + регрессия + задачи)
         continue-on-error: true
         env:
