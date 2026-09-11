@@ -22,9 +22,16 @@
    содержит «has been deployed to 100% of traffic», тот же критерий, что
    у dsh-edge) — прод, возможно, всё ещё на сломанной версии.
 3. rollback_confirmed=True, post_rollback_ok=False — откат прошёл, но
-   ПОВТОРНАЯ канарейка после него тоже красная: откатанная версия не
-   отвечает — худший случай (владелец, задача #614, п.1), обязан быть
+   ПОВТОРНАЯ проверка после него красная: живость откатанной версии не
+   подтверждена — худший случай (владелец, задача #614, п.1), обязан быть
    самым громким.
+
+Кроме исхода, текст называет ТРИГГЕР честно (`canary_ran`, находка
+четвёртого гейта PR #617, правило «Алерт не гадает»): шаги отката/эскалации
+срабатывают при ЛЮБОМ провале после деплоя, включая «Секреты воркера», после
+которого канарейка не выполнялась вовсе, — данные шага различают «покраснел
+шаг канарейки» и «канарейка не добежала», поэтому текст обязан различать их
+сам, а не утверждать «канарейка красная» безусловно.
 
 Вызывается ТОЛЬКО когда деплой прошёл и что-то после него упало (тот же
 guard `if: failure() && steps.deploy.outcome == 'success'`, что у самого
@@ -61,38 +68,56 @@ def parse_bool_env(value: str | None) -> bool:
     return (value or "").strip().lower() == "true"
 
 
+def trigger_clause(canary_ran: bool) -> str:
+    """Честное название триггера («Алерт не гадает», AGENTS.md): факт
+    формулируется на той гранулярности, которую дают данные шага —
+    «шаг канарейки покраснел», а не «сценарий канарейки красный» (внутри
+    шага может упасть и восстановление окружения)."""
+    if canary_ran:
+        return "триггер: покраснел ШАГ «Канарейка UI на проде»"
+    return (
+        "триггер: упали шаги ДО канарейки UI (например, «Секреты воркера») — "
+        "канарейка не выполнялась"
+    )
+
+
 def rollback_alert_text(
     repo: str,
     run_id: str,
     rollback_confirmed: bool,
     post_rollback_ok: bool,
+    canary_ran: bool,
     server_url: str = "https://github.com",
 ) -> str:
     run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id else "без ссылки"
+    clause = trigger_clause(canary_ran)
     if not rollback_confirmed:
         return (
             f"🚨 edge-harness: {MARKER}\n"
-            "Канарейка UI cf-worker на проде красная, деплой прошёл, но АВТООТКАТ "
+            "Деплой cf-worker прошёл, но job после него покраснел, АВТООТКАТ "
             "НЕ ПОДТВЕРЖДЁН (`wrangler rollback` не отчитался успехом в логе шага) "
             "— прод, возможно, остался на сломанной версии. Нужно РУЧНОЕ "
             "ВМЕШАТЕЛЬСТВО НЕМЕДЛЕННО: см. лог job'а, шаг «Автооткат прода при "
             "красной канарейке».\n"
+            f"{clause}\n"
             f"Прогон: {run_url}"
         )
     if not post_rollback_ok:
         return (
             f"🚨 edge-harness: {MARKER}\n"
-            "Канарейка UI cf-worker на проде была красной, автооткат выполнен "
-            "(`wrangler rollback` подтвердил 100% трафика), но ПОВТОРНАЯ канарейка "
-            "ПОСЛЕ отката ТОЖЕ красная — откатанная версия не отвечает. Худший "
-            "случай: нужно РУЧНОЕ ВМЕШАТЕЛЬСТВО НЕМЕДЛЕННО.\n"
+            "Автооткат cf-worker выполнен (`wrangler rollback` подтвердил 100% "
+            "трафика), но ПОВТОРНАЯ проверка ПОСЛЕ отката покраснела — живость "
+            "откатанной версии НЕ подтверждена. Худший случай: нужно РУЧНОЕ "
+            "ВМЕШАТЕЛЬСТВО НЕМЕДЛЕННО.\n"
+            f"{clause}\n"
             f"Прогон: {run_url}"
         )
     return (
         f"🔙 edge-harness: {MARKER}\n"
-        "Канарейка UI cf-worker на проде была красной — прод автоматически "
+        "Job деплоя cf-worker покраснел после деплоя — прод автоматически "
         "откачен на предыдущую 100%-версию, повторная канарейка после отката "
         "прошла.\n"
+        f"{clause}\n"
         f"Прогон: {run_url}"
     )
 
@@ -102,11 +127,14 @@ def escalate_rollback(
     run_id: str,
     rollback_confirmed: bool,
     post_rollback_ok: bool,
+    canary_ran: bool,
     server_url: str = "https://github.com",
 ) -> str:
     """Канал — тот же, что предохранитель конвейера (#120 + Telegram,
     `pulse_guard.escalate`), см. докстринг модуля."""
-    text = rollback_alert_text(repo, run_id, rollback_confirmed, post_rollback_ok, server_url)
+    text = rollback_alert_text(
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+    )
     return escalate(repo, WATCHDOG_ISSUE, text)
 
 
@@ -116,7 +144,10 @@ def main() -> int:
     server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     rollback_confirmed = parse_bool_env(os.environ.get("ROLLBACK_CONFIRMED"))
     post_rollback_ok = parse_bool_env(os.environ.get("POST_ROLLBACK_OK"))
-    result = escalate_rollback(repo, run_id, rollback_confirmed, post_rollback_ok, server_url)
+    canary_ran = parse_bool_env(os.environ.get("CANARY_RAN"))
+    result = escalate_rollback(
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+    )
     print(f"Эскалация автооткота deploy-worker: {result}")
     return 0
 

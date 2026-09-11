@@ -68,28 +68,28 @@ def test_parse_bool_env_false_and_missing_default_to_false():
 
 
 def test_rollback_not_confirmed_is_the_loudest_case():
-    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=False, post_rollback_ok=False)
+    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=False, post_rollback_ok=False, canary_ran=True)
     assert "НЕМЕДЛЕННО" in text
     assert "АВТООТКАТ НЕ ПОДТВЕРЖДЁН" in text
 
 
 def test_rollback_confirmed_but_post_check_still_red_is_the_worst_case():
     # Задача #614, п.1: "если и она красная — это худший случай, он обязан быть громким".
-    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=True, post_rollback_ok=False)
+    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=True, post_rollback_ok=False, canary_ran=True)
     assert "НЕМЕДЛЕННО" in text
-    assert "откатанная версия не отвечает" in text
+    assert "живость откатанной версии НЕ подтверждена" in text
 
 
 def test_rollback_confirmed_and_post_check_green_is_informational_not_alarming():
-    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=True, post_rollback_ok=True)
+    text = dwra.rollback_alert_text(REPO, "123", rollback_confirmed=True, post_rollback_ok=True, canary_ran=True)
     assert "НЕМЕДЛЕННО" not in text
     assert text.startswith("🔙")
 
 
 def test_two_loud_outcomes_both_carry_the_siren_and_the_same_marker():
-    loud_a = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=False, post_rollback_ok=False)
-    loud_b = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=True, post_rollback_ok=False)
-    quiet = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=True, post_rollback_ok=True)
+    loud_a = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=False, post_rollback_ok=False, canary_ran=False)
+    loud_b = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=True, post_rollback_ok=False, canary_ran=False)
+    quiet = dwra.rollback_alert_text(REPO, "1", rollback_confirmed=True, post_rollback_ok=True, canary_ran=False)
     for text in (loud_a, loud_b, quiet):
         assert dwra.MARKER in text
     assert loud_a.startswith("🚨")
@@ -99,15 +99,47 @@ def test_two_loud_outcomes_both_carry_the_siren_and_the_same_marker():
 
 def test_alert_text_carries_run_link_built_from_server_url_repo_and_run_id():
     text = dwra.rollback_alert_text(
-        REPO, "999", rollback_confirmed=True, post_rollback_ok=True,
+        REPO, "999", rollback_confirmed=True, post_rollback_ok=True, canary_ran=True,
         server_url="https://github.example",
     )
     assert "https://github.example/mytab0r/edge-harness/actions/runs/999" in text
 
 
 def test_alert_text_without_run_id_is_honest_not_a_broken_link():
-    text = dwra.rollback_alert_text(REPO, "", rollback_confirmed=True, post_rollback_ok=True)
+    text = dwra.rollback_alert_text(REPO, "", rollback_confirmed=True, post_rollback_ok=True, canary_ran=True)
     assert "без ссылки" in text
+
+
+# ── Триггер называется честно («Алерт не гадает», находка четвёртого гейта ───
+# ── PR #617): откат срабатывает при ЛЮБОМ провале после деплоя, включая
+# ── «Секреты воркера», после которого канарейка не выполнялась вовсе, —
+# ─​ данные шага различают триггеры, значит текст обязан различать их сам.
+
+
+def test_trigger_clause_names_the_canary_step_when_it_ran():
+    clause = dwra.trigger_clause(True)
+    assert "Канарейка UI" in clause
+    assert "не выполнялась" not in clause
+
+
+def test_trigger_clause_names_skipped_canary_when_steps_before_it_failed():
+    clause = dwra.trigger_clause(False)
+    assert "не выполнялась" in clause
+    assert "Секреты воркера" in clause
+
+
+def test_all_outcomes_carry_the_honest_trigger_never_the_unconditional_guess():
+    for canary_ran in (True, False):
+        for rb in (True, False):
+            for po in (True, False):
+                text = dwra.rollback_alert_text(
+                    REPO, "1", rollback_confirmed=rb, post_rollback_ok=po, canary_ran=canary_ran
+                )
+                assert dwra.trigger_clause(canary_ran) in text, (rb, po, canary_ran)
+                # безусловное «канарейка была красной/красная» — ровно тот класс
+                # гадания, который четвёртый гейт запретил
+                assert "была красной" not in text
+                assert "на проде красная" not in text
 
 
 # ── Проводка: escalate_rollback идёт тем же каналом, что предохранитель (#120) ──
@@ -116,7 +148,7 @@ def test_alert_text_without_run_id_is_honest_not_a_broken_link():
 def test_escalate_rollback_posts_to_watchdog_issue(monkeypatch, offline_telegram):
     fake = FakeGh()
     monkeypatch.setattr(pg, "gh", fake)
-    result = dwra.escalate_rollback(REPO, "42", rollback_confirmed=True, post_rollback_ok=False)
+    result = dwra.escalate_rollback(REPO, "42", rollback_confirmed=True, post_rollback_ok=False, canary_ran=False)
     posted = [c for c in fake.calls if "-X POST" in c and "comments" in c]
     assert any(f"repos/{REPO}/issues/{pg.WATCHDOG_ISSUE}/comments" in c for c in posted), \
         f"место правды сигнала — комментарий в #{pg.WATCHDOG_ISSUE}: {fake.calls}"
@@ -127,7 +159,7 @@ def test_escalate_rollback_posts_to_watchdog_issue(monkeypatch, offline_telegram
 def test_escalate_rollback_comment_body_names_the_actual_verdict(monkeypatch, offline_telegram):
     fake = FakeGh()
     monkeypatch.setattr(pg, "gh", fake)
-    dwra.escalate_rollback(REPO, "42", rollback_confirmed=False, post_rollback_ok=False)
+    dwra.escalate_rollback(REPO, "42", rollback_confirmed=False, post_rollback_ok=False, canary_ran=True)
     posted = [c for c in fake.calls if "-X POST" in c and "comments" in c]
     assert any("НЕ ПОДТВЕРЖДЁН" in c for c in posted)
 
@@ -135,7 +167,7 @@ def test_escalate_rollback_comment_body_names_the_actual_verdict(monkeypatch, of
 def test_escalate_rollback_does_not_mutate_anything_besides_the_comment(monkeypatch, offline_telegram):
     fake = FakeGh()
     monkeypatch.setattr(pg, "gh", fake)
-    dwra.escalate_rollback(REPO, "42", rollback_confirmed=True, post_rollback_ok=True)
+    dwra.escalate_rollback(REPO, "42", rollback_confirmed=True, post_rollback_ok=True, canary_ran=True)
     non_comment_mutations = [
         c for c in fake.calls
         if c.startswith(("-X POST", "-X PUT", "-X DELETE", "-X PATCH")) and "comments" not in c
@@ -154,9 +186,10 @@ def test_main_reads_env_and_escalates_the_worst_case(monkeypatch, offline_telegr
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
     monkeypatch.setenv("ROLLBACK_CONFIRMED", "true")
     monkeypatch.setenv("POST_ROLLBACK_OK", "false")
+    monkeypatch.setenv("CANARY_RAN", "true")
     assert dwra.main() == 0
     posted = [c for c in fake.calls if "-X POST" in c and "comments" in c]
-    assert any("откатанная версия не отвечает" in c for c in posted)
+    assert any("живость откатанной версии НЕ подтверждена" in c for c in posted)
 
 
 def test_main_reads_env_and_escalates_the_recovered_case(monkeypatch, offline_telegram):
@@ -167,9 +200,10 @@ def test_main_reads_env_and_escalates_the_recovered_case(monkeypatch, offline_te
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
     monkeypatch.setenv("ROLLBACK_CONFIRMED", "true")
     monkeypatch.setenv("POST_ROLLBACK_OK", "true")
+    monkeypatch.setenv("CANARY_RAN", "false")
     assert dwra.main() == 0
     posted = [c for c in fake.calls if "-X POST" in c and "comments" in c]
-    assert any("🔙" in c for c in posted)
+    assert any("канарейка не выполнялась" in c for c in posted)
 
 
 def test_main_requires_github_repository_env(monkeypatch, offline_telegram):
@@ -267,19 +301,50 @@ def test_prod_deploy_scanner_still_sees_the_known_deploys():
     )
 
 
+def _wrangler_deploy_job_names(doc: dict) -> list[str]:
+    names = []
+    for name, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        runs = [
+            s.get("run") for s in (job.get("steps") or []) if isinstance(s, dict)
+        ]
+        if any(isinstance(r, str) and "wrangler deploy" in r for r in runs):
+            names.append(name)
+    return names
+
+
+def _effective_concurrency(doc: dict, job_name: str):
+    """Concurrency, реально сериализующая джоб: его собственная, а при её
+    отсутствии файловая — но файловая допустима ТОЛЬКО у одноджобового файла
+    (класс #189, обязательная гвардия repo-ci: статическая файловая группа
+    в многоджобовом файле сериализует между собой разные джобы)."""
+    job = (doc.get("jobs") or {})[job_name]
+    if isinstance(job.get("concurrency"), dict):
+        return job["concurrency"]
+    if len(doc.get("jobs") or {}) == 1:
+        conc = doc.get("concurrency")
+        return conc if isinstance(conc, dict) else None
+    return None
+
+
 @pytest.mark.parametrize("workflow_name", _prod_deploy_workflow_names())
 def test_prod_deploy_workflows_serialize_with_concurrency(workflow_name):
     doc = yaml.safe_load((WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8"))
-    conc = doc.get("concurrency")
-    assert isinstance(conc, dict) and conc.get("group"), (
-        f"{workflow_name}: прод-деплой без concurrency — два перекрывающихся "
-        f"прогона деплоя мутируют прод одновременно (находка второго гейта PR #617)"
-    )
-    assert conc.get("cancel-in-progress") is False, (
-        f"{workflow_name}: cancel-in-progress обязан быть false — обрыв уже идущего "
-        f"деплоя оставляет частично применённые секреты/версии (тот же приём, что "
-        f"у deploy-dsh-edge.yml)"
-    )
+    deploy_jobs = _wrangler_deploy_job_names(doc)
+    assert deploy_jobs, f"{workflow_name}: сканер нашёл файл, но не нашёл в нём джоб с wrangler deploy"
+    for job_name in deploy_jobs:
+        conc = _effective_concurrency(doc, job_name)
+        assert isinstance(conc, dict) and conc.get("group"), (
+            f"{workflow_name}:{job_name}: прод-деплой без concurrency — два "
+            f"перекрывающихся прогона деплоя мутируют прод одновременно "
+            f"(находка второго гейта PR #617)"
+        )
+        assert conc.get("cancel-in-progress") is False, (
+            f"{workflow_name}:{job_name}: cancel-in-progress обязан быть false — "
+            f"обрыв уже идущего деплоя оставляет частично применённые "
+            f"секреты/версии (тот же приём, что у deploy-dsh-edge.yml)"
+        )
 
 
 def test_post_rollback_canary_stays_loud_no_continue_on_error():
@@ -354,6 +419,42 @@ def test_rollback_confirmed_env_points_at_the_real_auto_rollback_step_id():
         if s.get("id")
     }
     assert "auto_rollback" in step_ids, "шаг с id=auto_rollback пропал из workflow"
+
+
+def test_canary_ran_env_points_at_the_real_canary_step_id():
+    # «Алерт не гадает»: триггер обязан приходить из данных РЕАЛЬНОГО шага
+    # канарейки, а не догадкой (находка четвёртого гейта PR #617)
+    step = _escalation_step()
+    expr = str((step.get("env") or {}).get("CANARY_RAN") or "")
+    assert "steps.canary_ui.outcome" in expr, (
+        f"CANARY_RAN больше не ссылается на steps.canary_ui.outcome (нашли: {expr!r}) — "
+        f"текст алерта не сможет различить «шаг канарейки красный» и «канарейка не выполнялась»"
+    )
+    step_ids = {
+        s.get("id")
+        for s in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]["steps"]
+        if s.get("id")
+    }
+    assert "canary_ui" in step_ids, "шаг с id=canary_ui пропал из workflow"
+
+
+def test_rollback_gates_only_on_post_deploy_failures():
+    # Условие — часть контракта из задачи #614: откатываем только то, что
+    # реально разворачилось (деплой прошёл), и только при красном job'е после
+    # него. Условие не покрыто гвардией (чеклист четвёртого гейта PR #617) —
+    # молчаливая правка `if:` уводит весь механизм: без `steps.deploy.outcome`
+    # откатывается НЕУДАВШИЙСЯ деплой, без `failure()` откат гоняется на зелёном.
+    expected = "failure() && steps.deploy.outcome == 'success'"
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    by_id = {s.get("id"): s for s in doc["jobs"]["deploy"]["steps"] if s.get("id")}
+    assert "deploy" in by_id, "шаг с id=deploy пропал из workflow"
+    for sid in ("auto_rollback", "post_rollback_canary"):
+        assert by_id[sid].get("if") == expected, (
+            f"условие шага {sid} изменилось ({by_id[sid].get('if')!r} вместо {expected!r})"
+        )
+    assert _escalation_step().get("if") == expected, (
+        "шаг эскалации обязан срабатывать при том же условии, что откат"
+    )
 
 
 def test_post_rollback_ok_env_points_at_the_real_post_rollback_canary_step_id():
