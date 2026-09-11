@@ -47,6 +47,32 @@ jobs:
   deploy:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.measure_rows_read_days == ''
     runs-on: ubuntu-latest
+    # issues: write — эскалация автооткота (#614, scripts/orchestra/
+    # deploy_worker_rollback_alert.py::escalate_rollback) пишет след в задачу
+    # #120 тем же токеном; contents: read обязателен рядом (находка ревью
+    # PR #486, тот же приём, что owner-decision.yml/branch-protection-watch.yml) —
+    # явный блок permissions обнуляет ВСЕ остальные скоупы токена, а
+    # actions/checkout@v7 ниже клонирует репозиторий этим же github.token.
+    permissions:
+      contents: read
+      issues: write
+    # Сериализация деплоя (находка второго гейта PR #617), приём соседа
+    # deploy-dsh-edge.yml. На уровне ДЖОБА, не файла (класс #189, обязательная
+    # гвардия repo-ci): в файле два джоба (диагностический measure-rows-read
+    # прод не мутирует и в очереди не нужен), статическая файловая группа
+    # сериализовала бы их между собой. Смысл тот же: серия быстрых мержей в
+    # main — штатный сценарий (orchestra сливает несколько PR за проход,
+    # #297), а два перекрывающихся прогона деплоя мутируют прод одновременно;
+    # после #614 в гонке появился третий мутирующий игрок — wrangler rollback
+    # прогона A с красной канарейкой может откатить свежую хорошую версию
+    # прогона B, и сломанная вернётся на 100% без единого сигнала.
+    # cancel-in-progress: false — уже идущий деплой не обрывается (частично
+    # применённые секреты середины прогона опаснее лишних минут CI); GitHub
+    # сам отменяет предыдущий ОЖИДАЮЩИЙ прогон той же группы, очередь не
+    # растёт бесконечно.
+    concurrency:
+      group: deploy-worker
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
@@ -55,6 +81,10 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: cf-worker/package-lock.json
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       - run: npm ci
         working-directory: cf-worker
@@ -162,6 +192,7 @@ jobs:
           echo "GH_DISPATCH_TOKEN: fine-grained (X-OAuth-Scopes отсутствует), репозиторий читается — гвардия пройдена"
 
       - name: Деплой
+        id: deploy
         run: npx wrangler deploy
         working-directory: cf-worker
         env:
@@ -215,6 +246,7 @@ jobs:
 
       # Канарейка на проде: вход в морду реальным браузером. Упала — деплой красный.
       - name: Канарейка UI на проде
+        id: canary_ui
         run: |
           npm ci
           npx playwright install --with-deps chromium
@@ -222,3 +254,96 @@ jobs:
         working-directory: cf-worker
         env:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+
+      # Тормоз без газа не принимается (задача #614, тот же класс, что issue
+      # #549 закрыл в deploy-dsh-edge.yml, — приём взят оттуда буквально):
+      # красная канарейка/шаг после деплоя оставляла прод на сломанной версии
+      # до ручного вмешательства, без единого следа в Telegram/#120. Условие —
+      # ровно то же, что у соседа: деплой обязан был пройти (steps.deploy.
+      # outcome == 'success', не откатываем то, чего не разворачивали, если
+      # упал сам `wrangler deploy`), а job красный (failure()) — неважно, упала
+      # ли именно канарейка или шаг синка секретов после неё (тот же охват,
+      # что у образца).
+      #
+      # `wrangler rollback` без явного version-id сам находит нужную версию
+      # (packages/wrangler/src/versions/rollback/index.ts::
+      # fetchDefaultRollbackVersionId апстрима cloudflare/workers-sdk):
+      # сортирует деплои по created_on, убирает текущий (только что раскатанный
+      # сломанный) и берёт первый с percentage:100. Наш путь деплоя всегда
+      # 100% (без gradual-сплита), так что «прошлая 100%-версия» = «прошлый
+      # деплой». `--message` заполняет confirm()/prompt() дефолтом без
+      # интерактива на не-TTY раннере — тот же паттерн, каким этот файл уже
+      # гоняет `wrangler deploy`/`wrangler secret put` без зависаний.
+      #
+      # Первый деплой воркера вообще (нет ни одной прежней 100%-версии) —
+      # апстрим бросает «Could not find stable Worker Version»; continue-on-error
+      # не даёт этому отказу потеряться поверх уже красной канарейки (исходный
+      # сигнал остаётся видимым, а не маскируется вторичным), а следующий шаг
+      # эскалации честно назовёт «автооткат не подтверждён».
+      - name: Автооткат прода при красной канарейке
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        working-directory: cf-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          npx wrangler rollback --yes \
+            --message "auto-rollback: канарейка красная, run ${{ github.run_id }}" \
+            2>&1 | tee rollback.log
+          grep -qi "has been deployed to 100% of traffic" rollback.log \
+            || { echo "::error::Автооткат не подтвердил успех — см. лог шага, прод может остаться на сломанной версии"; exit 1; }
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "🔙 Прод автоматически откачен на предыдущую 100%-версию"
+
+      # Газ обязан быть доказан, не заявлен (тот же приём, что deploy-dsh-edge.yml):
+      # после отката корень морды снова обязан отвечать полным циклом входа —
+      # той же канарейкой Playwright, что и выше. Шаг самодостаточен: npm ci
+      # и браузер восстанавливаются здесь, а не полагаются на предыдущий шаг
+      # (находки второго гейта PR #617): охват "неважно, упала ли канарейка
+      # или шаг синка секретов после неё" буквально означает, что шаг
+      # "Канарейка UI на проде" мог упасть на собственном npm ci/playwright
+      # install — или не выполниться вовсе (секреты упали раньше него), —
+      # тогда без восстановления зависимостей здесь `import "playwright"`
+      # падает по средовой причине, и красная повторная канарейка перестаёт
+      # отличаться от "версия не отвечает" (ровно тот сигнал, ради которого
+      # шаг существует). npm ci/playwright install идемпотентны: на уже
+      # восстановленном окружении это секунды. Красная
+      # повторная канарейка — худший случай (задача #614, п.1) и обязана
+      # остаться громкой: continue-on-error здесь НЕТ нарочно.
+      - name: Канарейка после автооткота
+        id: post_rollback_canary
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+        working-directory: cf-worker
+        env:
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+
+      # Эскалация (задача #614, п.2): тот же канал, что предохранитель
+      # конвейера — задача-статус #120 + Telegram (scripts/orchestra/
+      # pulse_guard.py::escalate, вызван через deploy_worker_rollback_alert.py).
+      # Второй канал для того же класса «поломка прода после деплоя» не
+      # заводим. continue-on-error: true — сама эскалация best-effort
+      # (см. pulse_guard.escalate) и не имеет права затенить собой исходный
+      # сигнал о красной канарейке/автооткате.
+      - name: Эскалация автооткота (#120/Telegram)
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ROLLBACK_CONFIRMED: ${{ steps.auto_rollback.outputs.rolled_back == 'true' }}
+          POST_ROLLBACK_OK: ${{ steps.post_rollback_canary.outcome == 'success' }}
+          # «Алерт не гадает» (находка четвёртого гейта PR #617): шаги выше
+          # срабатывают при ЛЮБОМ провале после деплоя, включая «Секреты
+          # воркера», после которого канарейка не выполнялась вовсе. Различить
+          # триггеры позволяют данные шага — передаём факт, а не догадку.
+          CANARY_RAN: ${{ steps.canary_ui.outcome != 'skipped' }}
+        run: python scripts/orchestra/deploy_worker_rollback_alert.py
