@@ -76,6 +76,10 @@
   `deepseek-official` сидят на одном слоте деплоя, смена там = замена. В морде (Settings →
   Models) второй провайдер добавляется без передеплоя через плагин `provider-registry`
   (#378). Шаги, проверка видимого результата, откат, и почему потолок ответа зашит под GLM.
+- [Обновить учётки пула Claude из krouter-экспорта](runbooks/refresh-anthropic-pool.md) —
+  `dsh-anthropic-oauth-pool` (#838), секреты `ANTHROPIC_OAUTH_1/2`, импорт из
+  krouter-бэкапа или одиночного credentials.json (`scripts/lib/anthropic_oauth_import.py`),
+  почему истёкший accessToken из бэкапа — это нормально (пул рефрешит по refreshToken).
 
 ## Мультиагентная работа
 
