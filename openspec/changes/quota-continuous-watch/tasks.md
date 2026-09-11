@@ -21,9 +21,9 @@
       `success`/`failure` шага замера, `skipped` окно не открывает.
       Критерий: `test_workflow_step_names_match_constants` (синхронность
       имён шагов YAML ↔ констант), тесты
-      `test_last_real_measurement_age_minutes_*` (мутационные: skipped-прогоны
+      `test_scan_measurement_history_*` (мутационные: skipped-прогоны
       не троттлят, полный-без-замера лист → `SCAN_CEILING`, а не холодный
-      старт).
+      старт; failure-прогон троттлит, но не доказывает успех).
 
 ## Алерт, дедуп, автозадача
 
@@ -37,6 +37,15 @@
       заведение не пишет маркер (повтор попытки следующим прогоном).
       Критерий: тесты `create_or_note_task`/`check_and_alert` на отказ
       issue-create; метка `quota-breach` существует в репозитории.
+- [x] Кандидаты гвардии дублей различаются по ресурсу: улика уходит
+      только в задачу про ТОТ ЖЕ ресурс (метка ресурса в заголовке),
+      похожие задачи других ресурсов заводят свою задачу с
+      `--confirm-not-duplicate`. Критерий:
+      `test_create_task_other_resource_candidates_confirmed_not_duplicate`
+      (мутационный), `test_create_task_mixed_candidates_prefers_same_
+      resource`; метка `quota-breach` существует в репозитории
+      (проверено `gh label list` 2026-09-11, цвет B60205; создана в раннем
+      раунде этого PR — до первого реального breach, а не на нём).
 - [x] Полный срез покрывает все эскалируемые строки `quotas.py`, включая
       GitHub REST/GraphQL rate limit; пропуски — громкие.
       Критерий: `test_full_sweep_escalates_github_rest_and_graphql_rate_limit`
@@ -44,19 +53,30 @@
 
 ## Самонаблюдение сторожа
 
-- [x] Простой реального замера — громкий сигнал с эпизодным дедупом
-      (`STALE_MARKER`/`STALE_RESOLVED_MARKER`), закрытием эпизода при
-      возобновлении и классифицированной причиной (не гипотезы).
-      Критерий: тесты `test_stale_alert_*`, `test_classify_measurement_
-      absence_*`, `test_gate_main_escalates_true_transition_*`.
+- [x] Простой УСПЕШНОГО замера — громкий сигнал с эпизодным дедупом
+      (`STALE_MARKER`/`STALE_RESOLVED_MARKER`), закрытием эпизода ТОЛЬКО
+      точным свежим успехом и классифицированной причиной (не гипотезы);
+      троттлинг и простой — два возраста одного скана (`MeasurementScan`):
+      устойчивый отказ замера (протухший CF-токен) даёт сигнал через
+      `MEASUREMENT_STALE_MINUTES`, а не гасится свежими failure-прогонами
+      (found: ревью PR #607, head eae35fc). Критерий: тесты
+      `test_stale_alert_*`, `test_classify_measurement_absence_*`,
+      `test_gate_main_escalates_true_transition_*`,
+      `test_scan_measurement_history_sustained_failure_*`,
+      `test_gate_main_escalates_during_sustained_measurement_failure`
+      (мутационно: кормление канала простоя attempt_age краснит их).
 - [x] Слепая зона одной страницы скана — исходы `SCAN_*` с нижней
       границей простоя и честной формулировкой; нижняя граница ниже
       порога не закрывает эпизод; неосмотренные шаги прогонов = 
       «история недоступна». Критерий:
-      `test_last_real_measurement_age_minutes_ceiling_when_page_full_
-      within_lookback` (мутационно доказан: возврат `None, True` краснит
-      два теста), `test_gate_main_escalates_ceiling_bound_with_honest_
-      wording`, `test_gate_main_ceiling_bound_below_stale_threshold_...`.
+      `test_scan_measurement_history_ceiling_when_page_full_below_stale_
+      threshold` (мутационно доказан: возврат `None, True` краснит
+      тесты), `test_gate_main_escalates_ceiling_bound_with_honest_
+      wording`, `test_gate_main_ceiling_bound_below_stale_threshold_...`,
+      `test_scan_measurement_history_stale_proven_stops_before_inspecting_
+      boundary_run`, `test_scan_measurement_history_early_stop_bounds_
+      jobs_calls_by_stale_window` (стоимость тика ограничена окном
+      простоя, не страницей).
 - [x] Неслитый код не будит владельца: сверка исполняемой копии workflow
       с `main` в трёх состояниях (matches/differs/unknown), `unknown`
       не глушит сигнал. Критерий: `test_workflow_version_check_*`,

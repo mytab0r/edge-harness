@@ -44,7 +44,7 @@ def _step(name: str, conclusion: str | None) -> dict:
 
 def _gh_router(runs_payload: dict, jobs_by_run: dict[int, dict]):
     """Фейковый pulse_guard.gh, различающий два реальных вызова
-    last_real_measurement_age_minutes по форме аргументов, как это делает
+    scan_measurement_history по форме аргументов, как это делает
     настоящий `gh api` CLI (первый аргумент "--method" — список прогонов;
     иначе — эндпоинт .../jobs с id прогона в пути)."""
     def fake_gh(*args):
@@ -78,55 +78,145 @@ def test_resource_key_none_for_unknown_label():
     assert qw.resource_key("Actions минуты (billing)") is None
 
 
-# ── last_real_measurement_age_minutes: троттлинг + простой замера,
-# только реальный замер открывает окно (found: ревью PR #607) ──────────────
+# ── scan_measurement_history: два возраста одного скана (троттлинг по
+# attempt_age, простой по success_age — found: ревью PR #607, head eae35fc) ──
 
 
-def test_last_real_measurement_age_minutes_finds_real_recent_measurement(monkeypatch):
-    """Направление (в) мутационной проверки: только что выполнившийся
-    РЕАЛЬНЫЙ замер по-прежнему обнаруживается — иначе фикс сломал бы защиту
-    от лишних CF-вызовов, которую и вводит троттлинг (gate_main проверяет
-    `age < CHECK_INTERVAL_MINUTES` на этом же результате). Возраст — точный
-    (SCAN_EXACT), не нижняя граница."""
+def test_scan_measurement_history_finds_real_recent_measurement(monkeypatch):
+    """Успешный замер 3 мин назад — оба возраста точные и одинаковые,
+    SCAN_EXACT: троттлинг держит окно закрытым, канал простоя видит свежий
+    успех. Возраст — точный (SCAN_EXACT), не нижняя граница."""
     now = datetime.now(timezone.utc)
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=3)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert api_ok is True
-    assert scan == qw.SCAN_EXACT
-    assert age is not None and age < 15.0
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert ms.api_ok is True
+    assert ms.scan == qw.SCAN_EXACT
+    assert ms.success_age is not None and ms.success_age < 15.0
+    assert ms.attempt_age is not None and ms.attempt_age < 15.0
 
 
-def test_last_real_measurement_age_minutes_counts_failed_measurement_step(monkeypatch):
+def test_scan_measurement_history_failed_step_throttles_but_does_not_prove_success(monkeypatch):
     """Замер, упавший ПОСЛЕ вызова Cloudflare (например, эскалация breach не
-    доставлена), всё равно потратил CF-запрос — обязан троттлить так же, как
-    успешный (см. докстринг модуля)."""
+    доставлена), всё равно потратил CF-запрос — attempt_age мал, троттлинг
+    жив (proceed=false). Но success_age из него НЕ следует: успех не
+    доказан, канал простоя не должен считать такой прогон замером
+    (found: ревью PR #607, head eae35fc)."""
     now = datetime.now(timezone.utc)
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=3)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (api_ok, scan, age is not None) == (True, qw.SCAN_EXACT, True)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert ms.attempt_age is not None and ms.attempt_age < 15.0  # троттлинг жив
+    assert ms.api_ok is True
+    assert ms.scan == qw.SCAN_ALL_WINDOW          # успех не найден — нижняя граница
+    assert ms.success_age is not None and ms.success_age < qw.MEASUREMENT_STALE_MINUTES
 
 
-def test_last_real_measurement_age_minutes_cold_start_when_only_run_outside_lookback(monkeypatch):
+def test_scan_measurement_history_sustained_failure_failure_throttles_success_escalates(monkeypatch):
+    """БЛОКЕР ревью PR #607 (head eae35fc), сценарий «протухший CF-токен»:
+    шаг замера честно краснеет на каждом тике — свежие failure дают малый
+    attempt_age (троттлинг работает), а последний УСПЕШНЫЙ замер 50 мин
+    назад. Мутация: скорми каналу простоя attempt_age вместо success_age —
+    (50 >= 45) превратится в (3 < 45), эскалация не уйдёт НИКОГДА, а
+    открытый эпизод простоя будет закрываться каждым свежим красным
+    прогоном."""
+    now = datetime.now(timezone.utc)
+    runs = _runs_response([
+        _run(3, _iso(now - timedelta(minutes=3))),
+        _run(2, _iso(now - timedelta(minutes=18))),
+        _run(1, _iso(now - timedelta(minutes=50))),
+    ])
+    jobs = {
+        3: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]),
+        2: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]),
+        1: _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")]),
+    }
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.api_ok is True
+    assert ms.attempt_age is not None and ms.attempt_age < 15.0      # троттлинг жив
+    assert ms.success_age >= qw.MEASUREMENT_STALE_MINUTES            # канал простоя стреляет
+
+
+def test_scan_measurement_history_stale_proven_stops_before_inspecting_boundary_run(monkeypatch):
+    """Досрочная остановка (SCAN_STALE_PROVEN, found: ревью PR #607, «цена
+    гейта»): новейший прогон уже старше порога простоя — эскалация доказана
+    БЕЗ единого jobs-вызова (содержимое пограничного и всех более старых
+    прогонов не влияет ни на один исход: attempt там заведомо не свежее
+    окна троттлинга, успеха заведомо нет среди более свежих — их нет вовсе).
+    Мутация прежнего класса: верни «замера нет → холодный старт» (return
+    None) — тест краснеет, «измерял → перестал» снова невидимо."""
+    now = datetime.now(timezone.utc)
+    runs = _runs_response([
+        _run(7, _iso(now - timedelta(minutes=60))),
+        _run(6, _iso(now - timedelta(minutes=80))),
+    ])
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args[0] if args[0] != "--method" else "list")
+        if args and args[0] == "--method":
+            return runs
+        raise AssertionError("пограничный прогон не должен запрашиваться в jobs API")
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.scan == qw.SCAN_STALE_PROVEN
+    assert ms.success_age >= qw.MEASUREMENT_STALE_MINUTES
+    assert ms.attempt_age is None
+    assert calls == ["list"]  # ни одного вызова jobs API
+
+
+def test_scan_measurement_history_early_stop_bounds_jobs_calls_by_stale_window(monkeypatch):
+    """Стоимость тика против бюджета github.token (1000 запросов/час,
+    found: ревью PR #607, «цена гейта»): страница полна failure-прогонов
+    каждые 2 минуты, но jobs API запрашивается только для прогонов НОВЕЕ
+    порога простоя — при каденции 15 мин это константа, не вся страница и
+    не 7-дневный лукбек."""
+    now = datetime.now(timezone.utc)
+    ages = list(range(2, 61, 2))  # 30 прогонов: 2, 4, ..., 60 мин назад
+    runs = _runs_response([_run(i, _iso(now - timedelta(minutes=a))) for i, a in enumerate(ages, 1)])
+    jobs = {i: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")])
+            for i in range(1, len(ages) + 1)}
+    requested = []
+
+    def fake_gh(*args):
+        if args and args[0] == "--method":
+            return runs
+        m = re.search(r"/actions/runs/(\d+)/jobs", args[0])
+        requested.append(int(m.group(1)))
+        return jobs[int(m.group(1))]
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.scan == qw.SCAN_STALE_PROVEN
+    # Осмотрены только прогоны 2..44 мин (22 шт); пограничный (46 мин) — нет.
+    assert ms.inspected == 22 and len(requested) == 22
+    assert ms.success_age >= qw.MEASUREMENT_STALE_MINUTES
+
+
+def test_scan_measurement_history_cold_start_when_only_run_outside_lookback(monkeypatch):
     now = datetime.now(timezone.utc)
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=30)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (ms.success_age, ms.attempt_age, ms.api_ok, ms.scan) == (None, None, True, qw.SCAN_COLD_START)
 
 
-def test_last_real_measurement_age_minutes_cold_start_when_no_runs(monkeypatch):
+def test_scan_measurement_history_cold_start_when_no_runs(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(_runs_response([]), {}))
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+    ms = qw.scan_measurement_history(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, datetime.now(timezone.utc), 15.0)
-    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
+    assert (ms.success_age, ms.api_ok, ms.scan) == (None, True, qw.SCAN_COLD_START)
 
 
-def test_last_real_measurement_age_minutes_mutation_guard_failure_reports_api_not_ok(monkeypatch):
+def test_scan_measurement_history_mutation_guard_failure_reports_api_not_ok(monkeypatch):
     """Сбой самой проверки истории — не повод молчать о квоте (троттлинг), но
     и не повод трактовать как «замер простаивал» (см. gate_main). Мутация:
     сделай эту функцию возвращать api_ok=True при исключении — gate_main
@@ -135,20 +225,20 @@ def test_last_real_measurement_age_minutes_mutation_guard_failure_reports_api_no
     def broken(*a):
         raise RuntimeError("HTTP 403")
     monkeypatch.setattr(qw.pulse_guard, "gh", broken)
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+    ms = qw.scan_measurement_history(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, datetime.now(timezone.utc), 15.0)
-    assert (age, api_ok) == (None, False)
+    assert (ms.success_age, ms.api_ok) == (None, False)
 
 
-def test_last_real_measurement_age_minutes_all_window_scan_when_page_not_full(monkeypatch):
+def test_scan_measurement_history_all_window_scan_when_page_not_full(monkeypatch):
     """Мутационная проверка направления (а), находка ревью PR #607: череда
     ЗАВЕРШЁННЫХ прогонов — упавший ДО замера (тесты красные, гейт и замер
     оба skipped) и холостые (гейт сам решил не измерять, замер skipped) —
-    НЕ должна открывать окно троттлинга как «реальный замер». Старый
-    `recent_run_within` смотрел только на факт «есть свежий completed-прогон»
-    и в этом сценарии вернул бы True (слепой троттлинг именно в активные
-    часы). Страница НЕ полна и оборвалась по lookback'у — это SCAN_ALL_
-    WINDOW: все прогоны окна просмотрены, замера нет ни в одном, возраст —
+    НЕ должна открывать окно троттлинга как «реальный замер» (attempt_age
+    остаётся None → proceed=true). Старый `recent_run_within` смотрел только
+    на факт «есть свежий completed-прогон» и в этом сценарии вернул бы True.
+    Страница НЕ полна и оборвалась по lookback'у — это SCAN_ALL_WINDOW:
+    все прогоны окна просмотрены, успешного замера нет ни в одном, возраст —
     нижняя граница простоя (самый старый просмотренный прогон, 10 мин), не
     None и не «холодный старт» (found: ревью PR #607, head 29debcd)."""
     now = datetime.now(timezone.utc)
@@ -176,22 +266,21 @@ def test_last_real_measurement_age_minutes_all_window_scan_when_page_not_full(mo
     }
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
 
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok, scan) == (pytest.approx(10.0, abs=0.1), True, qw.SCAN_ALL_WINDOW)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (ms.success_age, ms.api_ok, ms.scan) == (pytest.approx(10.0, abs=0.1), True, qw.SCAN_ALL_WINDOW)
+    assert ms.attempt_age is None
 
 
-def test_last_real_measurement_age_minutes_ceiling_when_page_full_within_lookback(monkeypatch):
-    """ГЛАВНАЯ находка ревью PR #607 (head 29debcd), мутационная проверка:
-    страница ПОЛНА (30 прогонов) и целиком внутри лукбека, реального замера
-    нет ни в одном — это НЕ холодный старт («никогда не измерял»), а
-    SCAN_CEILING с нижней границей простоя = возраст старейшего прогона
-    страницы. Старое поведение возвращало (None, True): «измерял → перестал»
-    классифицировалось как «никогда не измерял», эскалация не уходила никогда
-    при сплошь зелёных прогонах. Сними фикс (верни `return None, True` после
-    цикла сканирования) — тест краснеет; верни — зеленеет."""
+def test_scan_measurement_history_ceiling_when_page_full_below_stale_threshold(monkeypatch):
+    """SCAN_CEILING: страница ПОЛНА (30 прогонов) и целиком внутри окна
+    простоя, успешного замера нет ни в одном — нижняя граница простоя =
+    возраст старейшего прогона страницы, ещё НИЖЕ порога (тихий тик, эпизод
+    не закрывается). Мутация прежнего класса: верни «страница без замера →
+    холодный старт» (return None) — тест краснеет, «измерял → перестал»
+    снова невидимо (found: ревью PR #607, head 29debcd)."""
     now = datetime.now(timezone.utc)
-    # 30 прогонов, от 1 часа до 30 часов назад (≈1.25 суток < лукбека 7 дней).
-    runs = _runs_response([_run(i, _iso(now - timedelta(hours=i))) for i in range(1, 31)])
+    # 30 прогонов, от 1 до 30 минут назад — вся страница внутри порога 45 мин.
+    runs = _runs_response([_run(i, _iso(now - timedelta(minutes=i))) for i in range(1, 31)])
     jobs = {i: _jobs_response([
         _step("Тесты сторожа квот", "success"),
         _step(qw.GATE_STEP_NAME, "success"),
@@ -199,18 +288,20 @@ def test_last_real_measurement_age_minutes_ceiling_when_page_full_within_lookbac
     ]) for i in range(1, 31)}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
 
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+    ms = qw.scan_measurement_history(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, qw.HISTORY_LOOKBACK_MINUTES)
-    assert (api_ok, scan) == (True, qw.SCAN_CEILING)
-    assert age == pytest.approx(30 * 60.0, abs=0.1)  # 30 часов в минутах: возраст старейшего прогона страницы
+    assert (ms.api_ok, ms.scan) == (True, qw.SCAN_CEILING)
+    assert ms.success_age == pytest.approx(30.0, abs=0.1)
+    assert ms.success_age < qw.MEASUREMENT_STALE_MINUTES
+    assert ms.attempt_age is None
 
 
-def test_last_real_measurement_age_minutes_uninspected_runs_report_api_not_ok(monkeypatch):
+def test_scan_measurement_history_uninspected_runs_report_api_not_ok(monkeypatch):
     """Шаги части прогонов окна недоступны (Jobs API упал по отдельным
-    прогонам), замера среди осмотренных нет — нижняя граница простоя
-    недоказуема (пропущенный прогон мог оказаться самым свежим замерившим):
-    api_ok=False, безопасные дефолты вызывающего. Раньше такие прогоны молча
-    пропускались (`continue`) и могли дать ложное «замера нет»."""
+    прогонам), успешного замера среди осмотренных нет — нижняя граница
+    простоя недоказуема (пропущенный прогон мог оказаться самым свежим
+    замерившим): api_ok=False, безопасные дефолты вызывающего. Раньше такие
+    прогоны молча пропускались (`continue`) и могли дать ложное «замера нет»."""
     now = datetime.now(timezone.utc)
     runs = _runs_response([
         _run(2, _iso(now - timedelta(minutes=2))),
@@ -223,12 +314,12 @@ def test_last_real_measurement_age_minutes_uninspected_runs_report_api_not_ok(mo
         raise RuntimeError("HTTP 502")
 
     monkeypatch.setattr(qw.pulse_guard, "gh", jobs_fail)
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+    ms = qw.scan_measurement_history(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok) == (None, False)
+    assert (ms.success_age, ms.api_ok) == (None, False)
 
 
-def test_last_real_measurement_age_minutes_stops_scanning_past_lookback(monkeypatch):
+def test_scan_measurement_history_stops_scanning_past_lookback(monkeypatch):
     """Сканирование останавливается на первом прогоне старше lookback —
     прогон ДО него (даже если реально измерил) не должен запрашиваться:
     экономия REST-вызовов при частых холостых прогонах."""
@@ -246,8 +337,8 @@ def test_last_real_measurement_age_minutes_stops_scanning_past_lookback(monkeypa
         raise AssertionError("jobs прогона старше lookback не должны запрашиваться")
 
     monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
-    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (ms.success_age, ms.api_ok, ms.scan) == (None, True, qw.SCAN_COLD_START)
     assert calls == []
 
 
@@ -290,6 +381,21 @@ def test_cheap_check_measurement_failure_is_not_fatal(monkeypatch):
     monkeypatch.setattr(qw.do_rows_read, "today_rows_read", broken)
     result = qw.cheap_check(REPO, "tok", "acct")
     assert result == ""
+
+
+def test_channel_failed_criterion_single_source():
+    """Критерий «оба канала эскалации молчат» — ОДНО место правды:
+    pulse_guard.escalation_channel_failed рядом с самим escalate, чьим
+    return'ом эти литералы рождаются. _channel_failed (quota_watch) и
+    проверка в quotas.py::main обязаны сводиться к нему; вторые копии
+    литералов «НЕ доставлен»/«НЕ оставлен» в вызывающих гасли бы молча при
+    смене формата строки (found: ревью PR #607, некритичное замечание).
+    Гвардия по исходнику: литералы живут только в pulse_guard.py."""
+    root = SCRIPT.parent.parent.parent
+    for rel in ("scripts/measure/quota_watch.py", "scripts/measure/quotas.py"):
+        assert '"НЕ доставлен"' not in (root / rel).read_text(encoding="utf-8"), \
+            f"{rel}: вторая копия разбора строки escalate — сведи к pulse_guard.escalation_channel_failed"
+    assert '"НЕ доставлен"' in (root / "scripts/orchestra/pulse_guard.py").read_text(encoding="utf-8")
 
 
 # ── full_sweep: переиспользует collect_cloudflare/collect_github, дедуп общий ──
@@ -367,7 +473,7 @@ def _patch_env(monkeypatch):
 
 def test_measure_main_exits_nonzero_without_credentials(monkeypatch):
     """Мутационная проверка блокера ревью PR #607: раньше возвращал 0 —
-    прогон без кредов зеленел, `last_real_measurement_age_minutes` (через
+    прогон без кредов зеленел, скан истории (через
     conclusion=success шага MEASURE_STEP_NAME) считал его РЕАЛЬНЫМ замером,
     троттлинг и проверка простоя навсегда молчали при протухшем/переименованном
     токене. Сними фикс (верни `return 0`) — тест краснеет; верни фикс —
@@ -448,12 +554,35 @@ def test_measure_main_exits_nonzero_when_alert_channel_fails(monkeypatch):
 
 
 def test_gate_main_throttles_when_measured_recently(monkeypatch, tmp_path):
-    """Направление (в): недавний реальный замер — гейт троттлит (proceed=false),
+    """Направление (в): недавний успешный замер — гейт троттлит (proceed=false),
     закрывает эпизод простоя (система жива), не эскалирует."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (3.0, True, qw.SCAN_EXACT))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(3.0, 3.0, True, qw.SCAN_EXACT, 1))
+    escalated = []
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a: escalated.append(a) or "x")
+    closed = []
+    monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
+
+    assert qw.gate_main() == 0
+
+    assert output_file.read_text(encoding="utf-8").strip() == "proceed=false"
+    assert escalated == []
+    assert closed == [REPO]
+
+
+def test_gate_main_failure_attempt_throttles_and_fresh_success_closes_episode(monkeypatch, tmp_path):
+    """Свежий failure-прогон (эскалация breach не доставлена) троттлит
+    следующий замер (attempt_age < окна), но свежий УСПЕШНЫЙ замер закрывает
+    эпизод простоя — редкий случай, когда оба возраста различаются и оба
+    решения принимаются в одном тике (found: ревью PR #607, head eae35fc)."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(3.0, 12.0, True, qw.SCAN_EXACT, 2))
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a: escalated.append(a) or "x")
     closed = []
@@ -467,14 +596,15 @@ def test_gate_main_throttles_when_measured_recently(monkeypatch, tmp_path):
 
 
 def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_window(monkeypatch, tmp_path):
-    """Замер найден (age=20 мин), старше окна троттлинга (15 мин), но моложе
-    STALE-порога (45 мин) — гейт пускает следующий замер (proceed=true) И
+    """Замер найден (success_age=20 мин), старше окна троттлинга (15 мин), но
+    моложе STALE-порога (45 мин) — гейт пускает следующий замер (proceed=true) И
     считает систему живой (закрывает эпизод простоя, если он был), а не
     эскалирует."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (20.0, True, qw.SCAN_EXACT))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(20.0, 20.0, True, qw.SCAN_EXACT, 1))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
     closed = []
@@ -487,16 +617,52 @@ def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_w
     assert closed == [REPO]
 
 
+def test_gate_main_escalates_during_sustained_measurement_failure(monkeypatch, tmp_path):
+    """БЛОКЕР ревью PR #607 (head eae35fc), гейт-уровень: устойчивый отказ
+    замера (протухший CF-токен) — свежие failure держат attempt_age малым
+    (троттлинг жив, proceed=false), а success_age вырос за порог простоя —
+    эскалация УХОДИТ с нижней границей и честной формулировкой досрочной
+    остановки скана. Мутация: верни gate_main попытку кормить канал простоя
+    attempt_age (общий failure-инклюзивный возраст) — тест краснеет
+    (молчание + ложное закрытие эпизода), ровно дефект, найденный ревью."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(3.0, 50.0, True, qw.SCAN_STALE_PROVEN, 2))
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
+    monkeypatch.setattr(qw, "_classify_measurement_absence",
+                         lambda repo: "шаг 'Замер квоты (Cloudflare)' самого свежего завершённого прогона упал (failure)")
+    stale_calls = []
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now, age, reason, scan=qw.SCAN_EXACT: stale_calls.append((repo, age, reason, scan)) or "x")
+    closed = []
+    monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
+
+    assert qw.gate_main() == 0
+
+    assert output_file.read_text(encoding="utf-8").strip() == "proceed=false"  # троттлинг жив
+    assert len(stale_calls) == 1                                               # но эскалация ушла
+    _, age, reason, scan = stale_calls[0]
+    assert (age, scan) == (50.0, qw.SCAN_STALE_PROVEN)
+    assert "упал (failure)" in reason                       # факт причины, не гипотеза
+    assert "успешного замера нет ни в одном из 2 осмотренных" in reason
+    assert "точный возраст последнего успеха не установлен" in reason
+    assert closed == []  # failure-прогоны эпизод простоя НЕ закрывают
+
+
 def test_gate_main_stays_silent_on_cold_start_never_measured(monkeypatch, tmp_path):
     """Направление (а), мутационная проверка: замера не было НИ РАЗУ во всей
-    видимой истории (age=None) — холодный старт, НЕ простой (found: ревью PR
+    видимой истории (success_age=None) — холодный старт, НЕ простой (found: ревью PR
     #607 — старая версия звала stale_alert прямо здесь, что и разбудило
     владельца на самом первом прогоне ещё не слитого PR). Эскалация НЕ
     уходит, close_stale_episode_if_needed тоже не зовётся (эпизода нет)."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, True, qw.SCAN_COLD_START))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(None, None, True, qw.SCAN_COLD_START, 0))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
     closed = []
@@ -517,7 +683,8 @@ def test_gate_main_escalates_true_transition_when_running_copy_matches_main(monk
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(60.0, 60.0, True, qw.SCAN_EXACT, 1))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
@@ -538,7 +705,8 @@ def test_gate_main_suppresses_escalation_when_running_copy_differs_from_main(mon
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(60.0, 60.0, True, qw.SCAN_EXACT, 1))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("differs", None))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
@@ -559,7 +727,8 @@ def test_gate_main_escalates_with_honest_note_when_version_check_fails(monkeypat
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(60.0, 60.0, True, qw.SCAN_EXACT, 1))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("unknown", "dial tcp: timeout"))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
@@ -583,7 +752,8 @@ def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsy
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, False, qw.SCAN_COLD_START))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(None, None, False, qw.SCAN_COLD_START, 0))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
 
@@ -605,8 +775,8 @@ def test_gate_main_escalates_ceiling_bound_with_honest_wording(monkeypatch, tmp_
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes",
-                         lambda *a, **k: (90.0, True, qw.SCAN_CEILING))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(20.0, 90.0, True, qw.SCAN_CEILING, 30))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
@@ -622,7 +792,7 @@ def test_gate_main_escalates_ceiling_bound_with_honest_wording(monkeypatch, tmp_
     assert len(stale_calls) == 1
     _, age, reason, scan = stale_calls[0]
     assert (age, scan) == (90.0, qw.SCAN_CEILING)
-    assert "точный возраст последнего реального замера не установлен" in reason
+    assert "успешного замера нет среди последних" in reason
     assert "история продолжается" in reason
     assert closed == []
 
@@ -636,8 +806,8 @@ def test_gate_main_ceiling_bound_below_stale_threshold_stays_silent_and_keeps_ep
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes",
-                         lambda *a, **k: (20.0, True, qw.SCAN_CEILING))
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(20.0, 20.0, True, qw.SCAN_CEILING, 30))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda *a, **k: stale_calls.append(a) or "x")
     closed = []
@@ -1011,7 +1181,7 @@ def test_main_unknown_command_fails_loud():
 
 def test_workflow_step_names_match_constants():
     """Имена шагов в quota-watch.yml — единственный носитель, по которому
-    last_real_measurement_age_minutes распознаёт «замер состоялся» через
+    scan_measurement_history распознаёт «замер состоялся» через
     Jobs API (REST не отдаёт YAML `id:`, только `name`). Рассинхрон текста
     между YAML и Python-константами молча ослепил бы распознавание."""
     import yaml  # в repo-ci ставится рядом с pytest (см. quota-watch.yml)
