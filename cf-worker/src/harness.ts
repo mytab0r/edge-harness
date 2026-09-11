@@ -1628,8 +1628,13 @@ export class Harness extends DurableObject<Env> {
     const now = Date.now();
     const last = await this.ctx.storage.get<number>(DSH_EDGE_UPDATE.lastAttemptKey);
     const [healthRes, registryRes] = await Promise.all([
-      fetch(DSH_EDGE_UPDATE.healthUrl),
-      fetch(DSH_EDGE_UPDATE.registryUrl),
+      // Тот же класс, что GitHub/Telegram ниже (issue #133): Workers' fetch()
+      // User-Agent сам не подставляет, а запрос К морде без этого заголовка
+      // Cloudflare режет по подписи UA (эксперимент #225, docs/research/12) —
+      // сегодняшняя живость этих вызовов без заголовка была «пока проходит»,
+      // не гарантия.
+      fetch(DSH_EDGE_UPDATE.healthUrl, { headers: { "User-Agent": EGRESS_USER_AGENT } }),
+      fetch(DSH_EDGE_UPDATE.registryUrl, { headers: { "User-Agent": EGRESS_USER_AGENT } }),
     ]);
     if (!healthRes.ok || !registryRes.ok) {
       throw new Error(`health=${healthRes.status} registry=${registryRes.status}`);
