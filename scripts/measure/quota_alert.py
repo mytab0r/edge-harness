@@ -60,6 +60,14 @@ over_threshold` + `pulse_guard.escalate`), но только по требова
 
 from __future__ import annotations
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import importlib.util
 import re
 import subprocess
@@ -173,7 +181,7 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
         [str(ISSUE_CREATE), "--title", title, "--body", body,
          "--label", TASK_LABEL, "--label", AREA_PROCESS_LABEL,
          "--label", AUTO_LABEL, "--label", QUOTA_BREACH_LABEL],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode == 0:
         m = re.search(r"/issues/(\d+)\s*$", result.stdout.strip())
