@@ -12,12 +12,19 @@
 //    @deepseek-ai/dsh-client-ui-primitives) — любой бандл ростера может их
 //    require без деклараций. Снято с продового бандла dsh-edge 0.7.1
 //    (assets/index-*.js, карта staticModules) и проверяется build.mjs.
-//  - ctx.slots приносит клиентский плагин @deepseek-ai/dsh-client-runtime
-//    (сервис "slots"), ctx.locale — @deepseek-ai/dsh-client-locale. Оба
-//    объявлены в dsh.client.inject package.json: assemble-standalone-web.mjs
+//  - ctx.locale приносит клиентский плагин @deepseek-ai/dsh-client-locale,
+//    объявленный в dsh.client.inject package.json: assemble-standalone-web.mjs
 //    проверяет этот список по ростеру (неизвестный пакет = красная сборка),
-//    а порядок загрузки строит orderByModuleGraph — сервисы уже на месте к
-//    моменту apply.
+//    а порядок загрузки строит orderByModuleGraph. ctx.slots (сервис "slots")
+//    приносит @deepseek-ai/dsh-client-ui-renderer — тот же пакет, что у
+//    апстримного ui-edge (packages/client/ui-edge), который тоже использует
+//    ctx.slots и тоже НЕ объявляет его package.json-инъекцию: renderer
+//    всегда в ростере (часть reviewed-состава dsh-base/dsh-web-app),
+//    объявлять его дополнительно не нужно. До 0.10.0 этот сервис приносил
+//    @deepseek-ai/dsh-client-runtime — апстрим убрал пакет в 0.10.0, сборка
+//    красилась «injects missing @deepseek-ai/dsh-client-runtime» (issue #518,
+//    класс дефекта PR #521, гвардия dsh-edge/check-upstream-namespace-
+//    collision.mjs) — inject-декларация здесь снята по образцу plugin-manager.
 //
 // Форма монтажа списочного слота — по образцу ui-edge (пин 0.7.1):
 // ctx.slots.inject(слот, () => ctx.slots.register({name, id, order, label,

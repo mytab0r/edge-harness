@@ -61,10 +61,14 @@
 (`window.__ModuleLoader__.load({ id: "<package>", factory })`, у фабрики
 экспортируются `inject` и `apply`). Модули берутся из seed-карты шелла
 (`react`, `@deepseek-ai/dsh-client-ui-primitives` — список зашит в
-`build.mjs` и проверяется при сборке), сервисы `ctx.slots`/`ctx.locale`
-приносят пакеты из `dsh.client.inject` (`dsh-client-runtime`,
-`dsh-client-locale`) — их assemble-standalone-web.mjs проверяет по ростеру
-и строит порядок загрузки.
+`build.mjs` и проверяется при сборке). `ctx.locale` приносит
+`@deepseek-ai/dsh-client-locale` — единственная пакет-инъекция в
+`dsh.client.inject`; её assemble-standalone-web.mjs проверяет по ростеру
+и строит порядок загрузки. `ctx.slots` приносит
+`@deepseek-ai/dsh-client-ui-renderer`, он всегда в ростере шелла и НЕ
+декларируется (апстрим убрал `@deepseek-ai/dsh-client-runtime` в 0.10.0 —
+инъекция несуществующего пакета красит гвардию
+`check-upstream-namespace-collision.mjs` и деплой, класс #518).
 
 Слоты:
 - `sidebar.section` — основной слот для задачи #111 (order 10, вверху сайдбара)
@@ -78,8 +82,8 @@
 запускает) требует, чтобы пакет уже был объявлен записью в
 `dsh-edge/plugins.json`, — релиз нельзя собрать из среза каталога, где
 пакета нет. Плагин зарегистрирован записью, указывающей на релиз
-[`plugins-agents-tasks-v0.1.1`](https://github.com/mytab0r/edge-harness/releases/tag/plugins-agents-tasks-v0.1.1)
-(ассет `edge-harness-dsh-agents-tasks-0.1.1.tgz`, sha256 в записи).
+[`plugins-agents-tasks-v0.1.2`](https://github.com/mytab0r/edge-harness/releases/tag/plugins-agents-tasks-v0.1.2)
+(ассет `edge-harness-dsh-agents-tasks-0.1.2.tgz`, sha256 в записи).
 
 Конвейер обновления версии (тот же, что у соседних плагинов, #80):
 
@@ -98,8 +102,10 @@
 регистрацию плагина** — форж собирает бандл до своего PR с манифестом, а
 гвардия каталога в `build.mjs` без записи падает (`FORGE_EXTRA_PLUGIN`
 подставляется только в дым, не в сборку). Релиз v0.1.1 собран с временной
-локальной записью, как описано выше; бутстрап форжа — задача из ревью
-PR #412.
+локальной записью, как описано выше; бутстрап форжа — задача #914.
+(Релиз v0.1.1 протух: собран до снятия inject-декларации
+`@deepseek-ai/dsh-client-runtime`, на деплое упал бы на assemble, #518 —
+живет только в истории, запись манифеста на него не смотрит.)
 
 Сгенерированное (`client/`, `manifest.json`) в git не хранится: манифест
 меняется — пересборка перед каждым `npm pack` обязательна, иначе в бандл
