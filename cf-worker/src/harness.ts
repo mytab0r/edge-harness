@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DSH_EDGE_UPDATE, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION, TELEGRAM } from "./config";
+import { DSH_EDGE_UPDATE, EGRESS_USER_AGENT, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION, TELEGRAM } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 import { redact } from "./redact";
@@ -2497,7 +2497,7 @@ export class Harness extends DurableObject<Env> {
     try {
       const res = await fetch(`${TELEGRAM.apiBase}/bot${token}/${method}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "User-Agent": EGRESS_USER_AGENT },
         body: JSON.stringify(payload),
       });
       if (!res.ok) {

@@ -143,10 +143,19 @@ export const DSH_EDGE_UPDATE = {
   lastAttemptKey: "dsh-edge-update:last-dispatch-ts",
 } as const;
 
+/** Идентификатор воркера в исходящих запросах — одно место правды на все
+ *  внешние API (issue #133: GitHub REST отвечает 403 без JSON-тела на запрос
+ *  БЕЗ User-Agent, подтверждено живым curl 2026-09-11; Cloudflare Workers'
+ *  `fetch()`, в отличие от Node/undici, не подставляет заголовок сам). Для
+ *  Telegram Bot API требование не подтверждено документацией — заголовок
+ *  ставится для консистентности класса «внешний вызов несёт identity», не
+ *  как фикс наблюдённого отказа. */
+export const EGRESS_USER_AGENT = "edge-harness-do";
+
 export const GITHUB = {
   apiBase: "https://api.github.com",
   apiVersion: "2022-11-28",
-  userAgent: "edge-harness-do",
+  userAgent: EGRESS_USER_AGENT,
   /** event_type для repository_dispatch (очередь задач → hands.yml). */
   dispatchEventType: "harness-task",
   /** event_type для repository_dispatch директивы инбокса → создание issue

@@ -232,7 +232,7 @@ jobs:
 
 Гвардия `scripts/lib/test_job_permissions_issues_write_guard.py` (задача #884, PR #890 — слит squash'ем 9745e02) ловит этот класс ошибок для `issues: write` — проверяет, что если job пишет в issue/PR, то этот раздел присутствует и явен.
 
-### 🔴 GitHub API из egress Cloudflare Workers: измеренный блок 403
+### GitHub API из egress Cloudflare Workers: 403 2026-08-31 был запросом без User-Agent (причина установлена 2026-09-11)
 
 Замерено живым прогоном 2026-08-31 (приёмка эпика #17, первый живой тест
 runner-bridge; задача #133): из воркера dsh-edge **все** вызовы
@@ -247,13 +247,22 @@ runner-bridge; задача #133): из воркера dsh-edge **все** вы�
 - контроль: тот же PAT из job'а GitHub Actions → POST `/issues/17/labels`
   отвечает 200 — токен и права ни при чём.
 
-Гипотеза (не подтверждена): GitHub отклоняет запросы с общих egress-IP
-Cloudflare Workers (datacenter-абьюз-фильтр). Важная оговорка: skeleton-воркер
-edge-harness успешно делал `repository_dispatch` из CF 2026-08-30 (прогоны
-33301581080, 33296416354, form-task_id из морды) — блок либо IP/colo-зависим
-и мигрирует, либо egress двух воркеров различается. Проектное следствие: любой
-план «Cloudflare → GitHub API» обязан иметь контроль живости egress и честный
-отказ; рабочим маршрутом сегодня остаётся «GitHub-раннер → CF» (наш push-контур).
+**Причина установлена 2026-09-11, гипотеза про блок egress-IP снята.** Живой
+curl без секретов и без прохода через Cloudflare воспроизводит тот же класс
+403 напрямую: `curl -H "User-Agent:" https://api.github.com/repos/mytab0r/
+edge-harness/issues/133` → 403, тело «Request forbidden by administrative
+rules... make sure your request has a User-Agent header»; тот же curl с
+непустым `User-Agent` → 200. `plugins-src/runner-bridge/server/core.js::
+githubFetch()` заголовок `User-Agent` не ставил вовсе — Cloudflare Workers'
+`fetch()`, в отличие от Node/undici, не подставляет его сам. Оговорка про
+«egress двух воркеров различается» из прежней версии этого раздела оказалась
+верна ровно в этом: skeleton-воркер (`cf-worker/src/harness.ts`) всегда нёс
+`"User-Agent": GITHUB.userAgent` на вызовах `repository_dispatch` — потому и
+работал 2026-08-30; egress был один и тот же, отличался только код вызова.
+Подробности и фикс — `docs/research/12-dsh-edge-session-api.md`, раздел
+«Причина 403 задачи #133 установлена». Проектное следствие снято: план
+«Cloudflare → GitHub API» рабочий без обхода, достаточно всегда ставить
+`User-Agent` на исходящий `fetch()`.
 
 ### Задержка старта — не документирована
 
@@ -639,7 +648,7 @@ Sub-issues (декомпозиция, эпик → подзадачи) — от�
 | «GITHUB_TOKEN read-only в PR из форка» | на странице use-secrets не найдено; относится к документации по permissions `GITHUB_TOKEN` |
 | 24 часа в очереди для GitHub-hosted | ⚠️ **опровергнуто**: лимит стоит в разделе self-hosted. Для GitHub-hosted аналога нет — только 35 дней на весь run |
 | `client_payload` «< 64KB» | ⚠️ **уточнено**: доки говорят 65 535 **символов**, не байт |
-| Причина 403 GitHub API из egress CF Workers (замер 2026-08-31, см. раздел выше) | тело ответа не прочитано (нужен observability воркера); масштаб блока — IP/colo/аккаунт — не определён; влияет ли на skeleton-диспетч сегодня — не проверено |
+| ~~Причина 403 GitHub API из egress CF Workers (замер 2026-08-31)~~ | **установлено 2026-09-11** (живой curl, см. раздел выше): отсутствие `User-Agent`, не блок egress-IP — снято из «не подтверждено» |
 
 ---
 
