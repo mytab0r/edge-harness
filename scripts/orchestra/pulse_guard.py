@@ -1252,7 +1252,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     return None
 
 
-def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
+def all_issue_comments(repo: str, issue_number: int, max_pages: int | None = None) -> list[dict]:
     """Все комментарии issue постранично, не только первая страница
     `per_page=100` (#276, тот же класс, что review_labels.list_pr_files/
     list_timeline и #294/#303: молчаливая обрезка на самом длинном обсуждении
@@ -1267,8 +1267,15 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     Обход — review_labels.list_pages (одно место правды на пагинацию и на
     fail loud при неожиданной форме ответа, класс #308/дефект A #120: см.
     комментарий у импорта review_labels выше — эта функция раньше несла
-    свою копию того же цикла с тем же силент-дефектом)."""
-    return review_labels.list_pages(f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh)
+    свою копию того же цикла с тем же силент-дефектом).
+
+    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — как
+    раньше, вся история); проброшен в `list_pages` (#607: гейт сторожа квот
+    тикает на каждое PR-событие и по cron, а #120 копит сотни комментариев;
+    стоимость одного тика не должна расти с историей задачи)."""
+    return review_labels.list_pages(
+        f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh, max_pages=max_pages,
+    )
 
 
 def _marker_present(marker: str, body: str) -> bool:
@@ -1284,8 +1291,9 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
-def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
-    payload = all_issue_comments(repo, issue_number)
+def issue_marker_times(repo: str, issue_number: int, marker: str,
+                       max_pages: int | None = None) -> list[datetime]:
+    payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     return [
         parse_time(comment["created_at"])
         for comment in payload

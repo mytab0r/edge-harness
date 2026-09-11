@@ -86,13 +86,15 @@ def test_last_real_measurement_age_minutes_finds_real_recent_measurement(monkeyp
     """Направление (в) мутационной проверки: только что выполнившийся
     РЕАЛЬНЫЙ замер по-прежнему обнаруживается — иначе фикс сломал бы защиту
     от лишних CF-вызовов, которую и вводит троттлинг (gate_main проверяет
-    `age < CHECK_INTERVAL_MINUTES` на этом же результате)."""
+    `age < CHECK_INTERVAL_MINUTES` на этом же результате). Возраст — точный
+    (SCAN_EXACT), не нижняя граница."""
     now = datetime.now(timezone.utc)
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=3)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
     assert api_ok is True
+    assert scan == qw.SCAN_EXACT
     assert age is not None and age < 15.0
 
 
@@ -104,24 +106,24 @@ def test_last_real_measurement_age_minutes_counts_failed_measurement_step(monkey
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=3)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (api_ok, age is not None) == (True, True)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (api_ok, scan, age is not None) == (True, qw.SCAN_EXACT, True)
 
 
-def test_last_real_measurement_age_minutes_none_for_measurement_outside_lookback(monkeypatch):
+def test_last_real_measurement_age_minutes_cold_start_when_only_run_outside_lookback(monkeypatch):
     now = datetime.now(timezone.utc)
     runs = _runs_response([_run(9, _iso(now - timedelta(minutes=30)))])
     jobs = {9: _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])}
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
-    age, api_ok = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok) == (None, True)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
 
 
-def test_last_real_measurement_age_minutes_none_when_no_runs(monkeypatch):
+def test_last_real_measurement_age_minutes_cold_start_when_no_runs(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(_runs_response([]), {}))
-    age, api_ok = qw.last_real_measurement_age_minutes(
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, datetime.now(timezone.utc), 15.0)
-    assert (age, api_ok) == (None, True)
+    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
 
 
 def test_last_real_measurement_age_minutes_mutation_guard_failure_reports_api_not_ok(monkeypatch):
@@ -133,18 +135,22 @@ def test_last_real_measurement_age_minutes_mutation_guard_failure_reports_api_no
     def broken(*a):
         raise RuntimeError("HTTP 403")
     monkeypatch.setattr(qw.pulse_guard, "gh", broken)
-    age, api_ok = qw.last_real_measurement_age_minutes(
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(
         REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, datetime.now(timezone.utc), 15.0)
     assert (age, api_ok) == (None, False)
 
 
-def test_last_real_measurement_age_minutes_none_despite_constant_activity_without_real_measurement(monkeypatch):
+def test_last_real_measurement_age_minutes_all_window_scan_when_page_not_full(monkeypatch):
     """Мутационная проверка направления (а), находка ревью PR #607: череда
     ЗАВЕРШЁННЫХ прогонов — упавший ДО замера (тесты красные, гейт и замер
     оба skipped) и холостые (гейт сам решил не измерять, замер skipped) —
-    НЕ должна открывать окно троттлинга. Старый `recent_run_within` смотрел
-    только на факт «есть свежий completed-прогон» и в этом сценарии вернул
-    бы True (слепой троттлинг именно в активные часы)."""
+    НЕ должна открывать окно троттлинга как «реальный замер». Старый
+    `recent_run_within` смотрел только на факт «есть свежий completed-прогон»
+    и в этом сценарии вернул бы True (слепой троттлинг именно в активные
+    часы). Страница НЕ полна и оборвалась по lookback'у — это SCAN_ALL_
+    WINDOW: все прогоны окна просмотрены, замера нет ни в одном, возраст —
+    нижняя граница простоя (самый старый просмотренный прогон, 10 мин), не
+    None и не «холодный старт» (found: ревью PR #607, head 29debcd)."""
     now = datetime.now(timezone.utc)
     runs = _runs_response([
         _run(3, _iso(now - timedelta(minutes=1))),   # холостой: гейт сказал "нет"
@@ -170,8 +176,56 @@ def test_last_real_measurement_age_minutes_none_despite_constant_activity_withou
     }
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
 
-    age, api_ok = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok) == (None, True)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (age, api_ok, scan) == (pytest.approx(10.0, abs=0.1), True, qw.SCAN_ALL_WINDOW)
+
+
+def test_last_real_measurement_age_minutes_ceiling_when_page_full_within_lookback(monkeypatch):
+    """ГЛАВНАЯ находка ревью PR #607 (head 29debcd), мутационная проверка:
+    страница ПОЛНА (30 прогонов) и целиком внутри лукбека, реального замера
+    нет ни в одном — это НЕ холодный старт («никогда не измерял»), а
+    SCAN_CEILING с нижней границей простоя = возраст старейшего прогона
+    страницы. Старое поведение возвращало (None, True): «измерял → перестал»
+    классифицировалось как «никогда не измерял», эскалация не уходила никогда
+    при сплошь зелёных прогонах. Сними фикс (верни `return None, True` после
+    цикла сканирования) — тест краснеет; верни — зеленеет."""
+    now = datetime.now(timezone.utc)
+    # 30 прогонов, от 1 часа до 30 часов назад (≈1.25 суток < лукбека 7 дней).
+    runs = _runs_response([_run(i, _iso(now - timedelta(hours=i))) for i in range(1, 31)])
+    jobs = {i: _jobs_response([
+        _step("Тесты сторожа квот", "success"),
+        _step(qw.GATE_STEP_NAME, "success"),
+        _step(qw.MEASURE_STEP_NAME, "skipped"),
+    ]) for i in range(1, 31)}
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+        REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, qw.HISTORY_LOOKBACK_MINUTES)
+    assert (api_ok, scan) == (True, qw.SCAN_CEILING)
+    assert age == pytest.approx(30 * 60.0, abs=0.1)  # 30 часов в минутах: возраст старейшего прогона страницы
+
+
+def test_last_real_measurement_age_minutes_uninspected_runs_report_api_not_ok(monkeypatch):
+    """Шаги части прогонов окна недоступны (Jobs API упал по отдельным
+    прогонам), замера среди осмотренных нет — нижняя граница простоя
+    недоказуема (пропущенный прогон мог оказаться самым свежим замерившим):
+    api_ok=False, безопасные дефолты вызывающего. Раньше такие прогоны молча
+    пропускались (`continue`) и могли дать ложное «замера нет»."""
+    now = datetime.now(timezone.utc)
+    runs = _runs_response([
+        _run(2, _iso(now - timedelta(minutes=2))),
+        _run(1, _iso(now - timedelta(minutes=8))),
+    ])
+
+    def jobs_fail(*args):
+        if args and args[0] == "--method":
+            return runs
+        raise RuntimeError("HTTP 502")
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", jobs_fail)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(
+        REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (age, api_ok) == (None, False)
 
 
 def test_last_real_measurement_age_minutes_stops_scanning_past_lookback(monkeypatch):
@@ -192,8 +246,8 @@ def test_last_real_measurement_age_minutes_stops_scanning_past_lookback(monkeypa
         raise AssertionError("jobs прогона старше lookback не должны запрашиваться")
 
     monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
-    age, api_ok = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
-    assert (age, api_ok) == (None, True)
+    age, api_ok, scan = qw.last_real_measurement_age_minutes(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now, 15.0)
+    assert (age, api_ok, scan) == (None, True, qw.SCAN_COLD_START)
     assert calls == []
 
 
@@ -399,7 +453,7 @@ def test_gate_main_throttles_when_measured_recently(monkeypatch, tmp_path):
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (3.0, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (3.0, True, qw.SCAN_EXACT))
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a: escalated.append(a) or "x")
     closed = []
@@ -420,7 +474,7 @@ def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_w
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (20.0, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (20.0, True, qw.SCAN_EXACT))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
     closed = []
@@ -442,7 +496,7 @@ def test_gate_main_stays_silent_on_cold_start_never_measured(monkeypatch, tmp_pa
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, True, qw.SCAN_COLD_START))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
     closed = []
@@ -463,17 +517,17 @@ def test_gate_main_escalates_true_transition_when_running_copy_matches_main(monk
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
     monkeypatch.setattr(
         qw, "stale_alert",
-        lambda repo, now, age, reason: stale_calls.append((repo, age, reason)) or "замер простаивал — x")
+        lambda repo, now, age, reason, scan=qw.SCAN_EXACT: stale_calls.append((repo, age, reason, scan)) or "замер простаивал — x")
 
     assert qw.gate_main() == 0
 
-    assert stale_calls == [(REPO, 60.0, "шаг упал (failure)")]
+    assert stale_calls == [(REPO, 60.0, "шаг упал (failure)", qw.SCAN_EXACT)]
 
 
 def test_gate_main_suppresses_escalation_when_running_copy_differs_from_main(monkeypatch, tmp_path):
@@ -484,7 +538,7 @@ def test_gate_main_suppresses_escalation_when_running_copy_differs_from_main(mon
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("differs", None))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
@@ -505,18 +559,18 @@ def test_gate_main_escalates_with_honest_note_when_version_check_fails(monkeypat
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (60.0, True, qw.SCAN_EXACT))
     monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("unknown", "dial tcp: timeout"))
     monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
     stale_calls = []
     monkeypatch.setattr(
         qw, "stale_alert",
-        lambda repo, now, age, reason: stale_calls.append((repo, age, reason)) or "замер простаивал — x")
+        lambda repo, now, age, reason, scan=qw.SCAN_EXACT: stale_calls.append((repo, age, reason, scan)) or "замер простаивал — x")
 
     assert qw.gate_main() == 0
 
     assert len(stale_calls) == 1
-    _, _, reason = stale_calls[0]
+    _, _, reason, _scan = stale_calls[0]
     assert "шаг упал (failure)" in reason
     assert "версию исполняемого workflow подтвердить не удалось" in reason
     assert "dial tcp: timeout" in reason
@@ -529,7 +583,7 @@ def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsy
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
-    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, False))
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes", lambda *a, **k: (None, False, qw.SCAN_COLD_START))
     stale_calls = []
     monkeypatch.setattr(qw, "stale_alert", lambda repo, now, age, reason: stale_calls.append(repo) or "x")
 
@@ -540,6 +594,62 @@ def test_gate_main_skips_stale_check_on_api_failure(monkeypatch, tmp_path, capsy
     assert "история прогонов недоступна" in capsys.readouterr().err
 
 
+def test_gate_main_escalates_ceiling_bound_with_honest_wording(monkeypatch, tmp_path):
+    """SCAN_CEILING с нижней границей возраста ≥ порога простоя — эскалация
+    уходит, reason честно называет, что точный возраст последнего замера не
+    установлен (страница полна, история продолжается). ГЛАВНАЯ находка ревью
+    PR #607 (head 29debcd): старое поведение молчало в этом состоянии
+    навсегда — «измерял → перестал» выглядело как «никогда не измерял».
+    Мутация: верни трактовку нижней границы как холодного старта — тест
+    краснеет (stale_calls пуст)."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes",
+                         lambda *a, **k: (90.0, True, qw.SCAN_CEILING))
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
+    monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
+    stale_calls = []
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now, age, reason, scan=qw.SCAN_EXACT:
+            stale_calls.append((repo, age, reason, scan)) or "замер простаивал — x")
+    closed = []
+    monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
+
+    assert qw.gate_main() == 0
+
+    assert len(stale_calls) == 1
+    _, age, reason, scan = stale_calls[0]
+    assert (age, scan) == (90.0, qw.SCAN_CEILING)
+    assert "точный возраст последнего реального замера не установлен" in reason
+    assert "история продолжается" in reason
+    assert closed == []
+
+
+def test_gate_main_ceiling_bound_below_stale_threshold_stays_silent_and_keeps_episode(monkeypatch, tmp_path):
+    """Нижняя граница возраста НИЖЕ порога простоя: свежесть замера не
+    доказана (замер мог случиться и за пределами просмотренных прогонов) —
+    ни эскалации, ни закрытия эпизода. Закрыв эпизод по недоказанной
+    свежести, следующий тик при продолжающемся простое послал бы повторный
+    алерт (reopen) — шум, который эпизодный дедуп и должен гасить."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "last_real_measurement_age_minutes",
+                         lambda *a, **k: (20.0, True, qw.SCAN_CEILING))
+    stale_calls = []
+    monkeypatch.setattr(qw, "stale_alert", lambda *a, **k: stale_calls.append(a) or "x")
+    closed = []
+    monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
+
+    assert qw.gate_main() == 0
+
+    assert output_file.read_text(encoding="utf-8").strip() == "proceed=true"
+    assert stale_calls == []
+    assert closed == []
+
+
 # ── stale_alert / close_stale_episode_if_needed: громкий канал простоя,
 # эпизодный дедуп (found: ревью PR #607) ────────────────────────────────────
 
@@ -548,7 +658,7 @@ def test_stale_alert_escalates_on_first_observation(monkeypatch):
     """Направление (б): реального замера нет в окне — сигнал уходит в
     ДОСТАВЛЯЮЩИЙ канал (pulse_guard.escalate: Telegram + след в #120), не
     только в лог, и называет ФАКТ причины (reason), не гипотезу."""
-    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker: [])
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker, **_kw: [])
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
                          lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
@@ -569,7 +679,7 @@ def test_stale_alert_text_names_version_check_failure_as_fact(monkeypatch):
     """Текст эскалации в состоянии "unknown" называет ФАКТ («версию
     исполняемого workflow подтвердить не удалось: <причина>»), а не молчит о
     сетевом сбое и не подменяет его гипотезой."""
-    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker: [])
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker, **_kw: [])
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
                          lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
@@ -588,7 +698,7 @@ def test_stale_alert_dedupes_within_same_open_episode(monkeypatch):
     НЕ шлёт второй алерт (тот же приём, что pulse_guard.heartbeat_check)."""
     open_time = datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc)
 
-    def fake_marker_times(repo, issue, marker):
+    def fake_marker_times(repo, issue, marker, **_kw):
         return [open_time] if marker == qw.STALE_MARKER else []
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
     escalated = []
@@ -608,7 +718,7 @@ def test_stale_alert_dedupes_repeated_version_check_network_failure(monkeypatch)
     что и обычный простой, поэтому дедуп работает без отдельного кода."""
     open_time = datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc)
 
-    def fake_marker_times(repo, issue, marker):
+    def fake_marker_times(repo, issue, marker, **_kw):
         return [open_time] if marker == qw.STALE_MARKER else []
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
     escalated = []
@@ -625,7 +735,7 @@ def test_stale_alert_dedupes_repeated_version_check_network_failure(monkeypatch)
 
 def test_stale_alert_reopens_after_episode_closed(monkeypatch):
     """Эпизод был закрыт (close новее open) — новый простой снова алертит."""
-    def fake_marker_times(repo, issue, marker):
+    def fake_marker_times(repo, issue, marker, **_kw):
         if marker == qw.STALE_MARKER:
             return [datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)]
         return [datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)]
@@ -656,6 +766,24 @@ def test_classify_measurement_absence_measure_step_skipped(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
     reason = qw._classify_measurement_absence(REPO)
     assert "пропустил" in reason and qw.MEASURE_STEP_NAME in reason and qw.GATE_STEP_NAME in reason
+
+
+def test_classify_measurement_absence_gate_step_skipped_names_early_failure(monkeypatch):
+    """Гейт skipped ВМЕСТЕ с шагом замера — прогон упал РАНЬШЕ гейта (обычно
+    красный шаг тестов, решение о замере не принималось). Те же данные Jobs
+    API различают это сами — текст называет факт, а не «гейт не пустил»
+    (AGENTS.md, «Алерт не гадает»; канонический сценарий слепой зоны —
+    красные тесты на main, found: ревью PR #607, head 29debcd)."""
+    runs = _runs_response([_run(9, _iso(datetime.now(timezone.utc)))])
+    jobs = {9: _jobs_response([
+        _step("Тесты сторожа квот", "failure"),
+        _step(qw.GATE_STEP_NAME, "skipped"),
+        _step(qw.MEASURE_STEP_NAME, "skipped"),
+    ])}
+    monkeypatch.setattr(qw.pulse_guard, "gh", _gh_router(runs, jobs))
+    reason = qw._classify_measurement_absence(REPO)
+    assert "упал раньше гейта" in reason and qw.GATE_STEP_NAME in reason
+    assert "не пустил" not in reason
 
 
 def test_classify_measurement_absence_measure_step_failure(monkeypatch):
@@ -761,7 +889,7 @@ def test_workflow_version_check_unknown_on_api_error_not_differs(monkeypatch, tm
 
 def test_close_stale_episode_posts_resolved_marker(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times",
-                         lambda repo, issue, marker: [datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)]
+                         lambda repo, issue, marker, **_kw: [datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)]
                          if marker == qw.STALE_MARKER else [])
     posted = []
     monkeypatch.setattr(qw.pulse_guard, "post_issue_comment", lambda repo, issue, text: posted.append(text))
@@ -773,13 +901,87 @@ def test_close_stale_episode_posts_resolved_marker(monkeypatch):
 
 
 def test_close_stale_episode_noop_when_no_open_episode(monkeypatch):
-    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker: [])
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker, **_kw: [])
     posted = []
     monkeypatch.setattr(qw.pulse_guard, "post_issue_comment", lambda repo, issue, text: posted.append(text))
 
     qw.close_stale_episode_if_needed(REPO)
 
     assert posted == []
+
+
+# ── Стоимость тика гейта не растёт с историей #120: маркеры эпизодного
+# дедупа читаются только со СВЕЖИХ страниц (found: ревью PR #607, «хвост») ──
+
+
+def test_all_issue_comments_max_pages_bounds_traversal(monkeypatch):
+    """Прямая мутационная проверка `max_pages`: полная страница (len==100)
+    сама по себе обход НЕ останавливает (иначе #276 сломан), останавливает
+    только лимит страниц."""
+    requested = []
+
+    def fake_gh(*args):
+        requested.append(args[0])
+        return [{"id": 1, "body": "x", "created_at": "2026-09-10T00:00:00Z"}] * 100
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    one_page = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=1)
+    assert len(one_page) == 100 and len(requested) == 1
+    two_pages = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=2)
+    assert len(two_pages) == 200 and len(requested) == 3
+
+
+def test_stale_alert_reads_only_fresh_page_of_watchdog_history(monkeypatch):
+    """Тик гейта не обязан обходить ВСЮ историю #120 (замер 2026-09-10:
+    больше 550 комментариев и растёт) — маркеры эпизодного дедупа читаются
+    только со СВЕЖЕЙ страницы (MARKER_SCAN_PAGES). Гвардия: запрос страницы
+    2 — громкое падение. Сними `max_pages=` из stale_alert — тест краснеет."""
+    requested = []
+
+    def fake_gh(*args):
+        endpoint = args[0]
+        assert isinstance(endpoint, str) and "/comments?" in endpoint, endpoint
+        page = int(endpoint.split("&page=")[1])
+        requested.append(page)
+        assert page == 1, f"тик гейта читает только свежую страницу, запрошена {page}"
+        # Полная страница БЕЗ маркеров: дедуп решает «эпизода нет», алерт
+        # уходит — и это ровно один обход свежей страницы на маркер.
+        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
+                for i in range(100)]
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    escalated = []
+    monkeypatch.setattr(qw.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен")
+
+    result = qw.stale_alert(REPO, datetime.now(timezone.utc), 60.0, "шаг упал (failure)")
+
+    assert escalated and "доставлен" in result
+    assert requested == [1, 1]  # открытый и закрывающий маркеры — по одной странице каждый
+
+
+def test_close_stale_episode_reads_only_fresh_page(monkeypatch):
+    """Здоровый тик (закрытие эпизода) — ровно ОДИН запрос комментариев:
+    открытого маркера простоя на свежей странице нет — до закрывающих
+    маркеров дело не доходит, никакой второй обход истории не начинается."""
+    requested = []
+
+    def fake_gh(*args):
+        endpoint = args[0]
+        page = int(endpoint.split("&page=")[1])
+        requested.append(page)
+        assert page == 1, f"тик гейта читает только свежую страницу, запрошена {page}"
+        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
+                for i in range(100)]
+
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    posted = []
+    monkeypatch.setattr(qw.pulse_guard, "post_issue_comment", lambda *a: posted.append(a))
+
+    qw.close_stale_episode_if_needed(REPO)
+
+    assert posted == []
+    assert requested == [1]
 
 
 # ── main(): CLI-диспетчер gate|measure ──────────────────────────────────────
