@@ -1,7 +1,7 @@
 # Дельта-спека: журнал (journal-tasks-hands) — PR-гейт морды dsh-edge
 
-Расширяет `openspec/specs/journal-tasks-hands.md`, раздел «Самообновление
-морды»: новый подраздел «PR-гейт морды dsh-edge (#600)» (п.26). Сложен в
+Расширяет `openspec/specs/journal-tasks-hands.md` новым разделом верхнего
+уровня «PR-гейт морды dsh-edge (#600)» (пп. 38–41). Сложен в
 базовую спеку одновременно с реализацией (issue #600, ADR 0016).
 
 ## ADDED: PR-гейт морды dsh-edge (#600)
