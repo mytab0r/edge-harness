@@ -51,12 +51,16 @@ DISPATCH_CONSUMER = "deploy-worker.yml"
 # conflict-mechanical-rebase.yml (#762) — тот же класс: `git push` рёбейзнутой
 # ветки под github.token не зажигает downstream pr-review/ai-review
 # (антирекурсия GitHub), нужен PAT владельца.
+# pm.yml (#869) — closes-only триаж чужих issue/PR требует того же широкого
+# PAT, что worker.yml (issues:write из github.token достаточен только для
+# СВОИХ действий, не для close произвольного чужого issue/PR).
 PIPELINE_CONSUMERS = [
     "conflict-mechanical-rebase.yml",
     "deploy-dsh-edge.yml",
     "dispatch-latency-probe.yml",
     "orchestra.yml",
     "plugin-forge.yml",
+    "pm.yml",
     "repo-ci.yml",
     "worker.yml",
 ]
@@ -91,6 +95,11 @@ EXPECTED_WORKFLOWS = frozenset({
     # workflow), ни GH_PIPELINE_PAT здесь не используются.
     "owner-decision.yml",
     "plugin-forge.yml",
+    # #869 (drain-health-curator, Требование B): авто-диспетч роли pm на
+    # PR-беклог — читает secrets.GH_PIPELINE_PAT (см. PIPELINE_CONSUMERS),
+    # тот же класс, что worker.yml/hands.yml (DSH headless через
+    # scripts/hands/dsh_task.sh, не второй механизм запуска агента).
+    "pm.yml",
     "pr-review.yml",
     # #836: бенчмарк латентности провайдеров-кандидатов, workflow_dispatch
     # вручную. Читает только secrets.<PROVIDER>_API_KEY (значения ключей
@@ -198,6 +207,88 @@ def test_hands_lease_visibility_needs_issues_write():
     assert re.search(r"^\s*issues:\s*write\s*$", text, re.M), (
         "hands.yml: нет issues: write — назначение и след аренды (#121) получат "
         "403, аренда станет невидимой в задаче при зелёном job'е"
+    )
+
+
+# ── Явный permissions-блок без contents: (находка ревью PR #870, класс) ──────────
+# GitHub: при явно заданном permissions: все НЕперечисленные скоупы становятся
+# `none` (не «дефолт репозитория»). actions/checkout — первый шаг почти
+# каждого job'а — требует contents:read даже без persist-credentials; job с
+# явным permissions:, но без ключа contents, не доживает до своей полезной
+# нагрузки НИ РАЗУ (падает на самом первом шаге). Живой случай — pm.yml
+# (issues/pull-requests заданы явно, contents забыт вовсе).
+
+
+def _jobs_with_checkout_and_explicit_permissions() -> list[tuple[str, str, dict]]:
+    found = []
+    for name in ALL_WORKFLOWS:
+        doc = yaml.safe_load(workflow_text(name))
+        top_perms = doc.get("permissions")
+        for job_name, job in (doc.get("jobs") or {}).items():
+            steps = job.get("steps") or []
+            has_checkout = any(
+                str(step.get("uses") or "").startswith("actions/checkout") for step in steps
+            )
+            if not has_checkout:
+                continue
+            perms = job.get("permissions", top_perms)
+            if isinstance(perms, dict):
+                found.append((name, job_name, perms))
+    return found
+
+
+def test_workflows_with_checkout_and_explicit_permissions_declare_contents():
+    """Мутация (находка ревью PR #870): убери `contents: read` из pm.yml —
+    этот тест покраснеет. Правило общее (любой job с checkout + явным
+    permissions:), не разовая заплатка на один файл — следующий workflow с
+    той же забывчивостью ловится здесь же, а не новым инцидентом."""
+    offenders = [
+        f"{name}:{job_name} (permissions={perms})"
+        for name, job_name, perms in _jobs_with_checkout_and_explicit_permissions()
+        if "contents" not in perms
+    ]
+    assert not offenders, (
+        "job с actions/checkout и явным permissions: без ключа contents — "
+        f"незаданные скоупы GitHub трактует как none, checkout падает: {offenders}"
+    )
+
+
+# ── pm.yml: gh-креды для closes-only триажа (находка ревью PR #870) ──────────────
+# Класс: closes-only workflow, где саму работу (`gh issue close`/`gh pr close`)
+# делает LLM внутри DSH headless-сессии, а не сам workflow-шаг. DSH вырезает
+# из вызовов модель-шелла env-переменные *TOKEN*/*KEY*/*SECRET (см. worker.yml
+# docstring, живой прогон 2026-08-30) — просто передать секрет в env шага
+# недостаточно, нужен явный login-шаг ДО запуска dsh_task.sh, кладущий
+# креды в файл (hosts.yml), а не в env.
+
+
+def test_pm_authenticates_gh_before_dsh_task():
+    """Мутация (находка ревью PR #870, блокирующая): убери шаг gh auth login
+    (или переставь его ПОСЛЕ запуска dsh_task.sh) — этот тест покраснеет.
+    Без явного login DSH-агент не может закрыть ни одного issue/PR
+    («authentication required»), потолок закрытий насчитает 0, и это
+    зелёный no-op вместо автоматики (тихий обход, найденный ревью)."""
+    doc = yaml.safe_load(workflow_text("pm.yml"))
+    steps = (doc.get("jobs") or {}).get("pm-groom", {}).get("steps") or []
+    dsh_index = next(
+        (i for i, step in enumerate(steps) if "dsh_task.sh" in str(step.get("run") or "")),
+        None,
+    )
+    assert dsh_index is not None, "pm.yml: не найден шаг, запускающий dsh_task.sh"
+    login_index = next(
+        (
+            i for i, step in enumerate(steps)
+            if "gh auth login" in str(step.get("run") or "")
+        ),
+        None,
+    )
+    assert login_index is not None, (
+        "pm.yml: нет шага gh auth login — DSH-агент не сможет закрыть ни один "
+        "issue/PR, gh-вызовы внутри headless-сессии упадут authentication required"
+    )
+    assert login_index < dsh_index, (
+        "pm.yml: gh auth login идёт ПОСЛЕ dsh_task.sh — креды не готовы к моменту, "
+        "когда агент начинает closes-only триаж"
     )
 
 

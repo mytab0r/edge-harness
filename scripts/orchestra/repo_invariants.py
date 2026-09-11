@@ -179,6 +179,20 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       не в CI_GATING: Search API сам по себе может быть недоступен
       best-effort, гейтить обязательную проверку доступностью стороннего API
       было бы новым тормозом без содержательного смысла.
+  15. check_drain_stalled_without_signal (#869, openspec/changes/
+      drain-health-curator) — часы с последнего слияния превышают
+      DRAIN_STALL_HOURS (scheduler.py), среди открытых PR есть хотя бы один
+      кандидат к merge_queue (не черновик, не бот — та же норма, что держит
+      scheduler.drain_gate: кандидатов нет — не тревога, инвариант молчит
+      независимо от возраста последнего слияния, находка ревью PR #870), а
+      среди комментариев WATCHDOG_ISSUE за это же окно нет ни одного
+      маркера drain_gate (DRAIN_GATE_OPEN_MARKER). Пересчитывает НЕЗАВИСИМО
+      от scheduler.py (свой обход слитых PR, свой обход открытых PR, свой
+      обход комментариев #120) — ловит класс, для которого и заведён этот
+      файл (#244): сам drain_gate упал молча ДО публикации маркера.
+      Наблюдательный на старте — тот же порядок включения, что у
+      инвариантов 8/9/10 (замер на живом репозитории до нуля/объяснённых
+      нарушений, потом отдельная правка CI_GATING).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -1796,6 +1810,65 @@ def check_worker_false_success_comment(repo: str) -> list[dict]:
     return violations
 
 
+# Инвариант 15 (#869, openspec/changes/drain-health-curator): «дренаж стоял,
+# а сигнала нет» — независимая проверка, не через внутреннее состояние
+# scheduler.py (постмортем #255, «Проверяй видимый результат, а не шаг»:
+# сам scheduler.drain_gate мог упасть с необработанным исключением ДО
+# публикации маркера, и это не должно быть видно только по внутреннему
+# состоянию, которое и сломалось).
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def fetch_watchdog_comments(repo: str) -> list[dict]:
+    """Свой обход комментариев WATCHDOG_ISSUE (#120) — тот же REST-вызов, что
+    issue_marker_times уже делает изнутри (pulse_guard.all_issue_comments),
+    но вызванный НЕЗАВИСИМО этим же прогоном repo_invariants.py, не
+    переиспользующий состояние процесса scheduler.py (у него его и нет —
+    отдельный запуск)."""
+    return pulse_guard.all_issue_comments(repo, WATCHDOG_ISSUE)
+
+
+def check_drain_stalled_without_signal(
+    now: datetime, merged_pulls: list[dict], open_pulls: list[dict],
+    watchdog_comments: list[dict],
+) -> list[dict]:
+    """Нарушение: часы с последнего слияния (по `merged_pulls`, свой обход,
+    не то же чтение, что уже сделал scheduler.py в СВОЁМ прогоне) превышают
+    scheduler.DRAIN_STALL_HOURS, среди `open_pulls` есть хотя бы один
+    кандидат к merge_queue (scheduler.merge_queue_candidates — не черновик,
+    не бот), а среди `watchdog_comments` за окно (с момента последнего
+    слияния) нет ни одного маркера scheduler.DRAIN_GATE_OPEN_MARKER.
+
+    Норма (находка ревью PR #870, блокирующая): открытых PR-кандидатов
+    нет — инвариант молчит НЕЗАВИСИМО от возраста последнего слияния, та же
+    ветка, что уже держит сам scheduler.drain_gate (design.md §1.5) — без
+    неё инвариант красил бы здоровый простой «беклог вычерпан, сливать
+    нечего», который Требование A этой же дельты явно объявляет нормой:
+    ложные срабатывания на КАЖДОМ пульсе и КАЖДОМ PR, а не редкий сигнал."""
+    candidates = scheduler.merge_queue_candidates(open_pulls)
+    if not candidates:
+        return []
+    merged_ats = [parse_time(p["merged_at"]) for p in merged_pulls if p.get("merged_at")]
+    if not merged_ats:
+        return []  # никогда не сливали — не этот класс нарушения
+    last_merge_at = max(merged_ats)
+    hours_since_merge = minutes_between(last_merge_at, now) / 60
+    if hours_since_merge <= scheduler.DRAIN_STALL_HOURS:
+        return []
+    has_marker = any(
+        pulse_guard._marker_present(scheduler.DRAIN_GATE_OPEN_MARKER, comment.get("body") or "")
+        for comment in watchdog_comments
+        if comment.get("created_at") and parse_time(comment["created_at"]) >= last_merge_at
+    )
+    if has_marker:
+        return []
+    return [{
+        "hours_since_merge": int(hours_since_merge),
+        "candidates": len(candidates),
+        "since": last_merge_at.isoformat(),
+    }]
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2037,6 +2110,19 @@ def build_report(repo: str, now: datetime,
             lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
     else:
         lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
+
+    watchdog_comments = fetch_watchdog_comments(repo)
+    v15 = check_drain_stalled_without_signal(now, merged_pulls, open_pulls, watchdog_comments)
+    findings[15] = v15
+    if v15:
+        for item in v15:
+            lines.append(
+                f"🚨 [15] дренаж стоит {item['hours_since_merge']}ч (с {item['since']}), "
+                f"{item['candidates']} PR-кандидатов ждут слияния, но #{WATCHDOG_ISSUE} не несёт "
+                "ни одного маркера drain_gate за это окно — сигнал #869 не сработал или упал молча"
+            )
+    else:
+        lines.append("💚 [15] дренаж не стоит без сигнала (drain_gate, #869)")
 
     return lines, findings
 

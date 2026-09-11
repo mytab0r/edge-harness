@@ -1,0 +1,164 @@
+# Автодиспетч роли pm на PR-беклог (issue #869, Требование B,
+# openspec/changes/drain-health-curator). Триггер — scheduler.py::
+# dispatch_pm_groom (drain_gate держит тревогу дольше PM_DISPATCH_AFTER_HOURS
+# ИЛИ wip_gate держит stuck-эпизод дольше своего порога, design.md §2.1),
+# тем же приёмом, каким dispatch_conflict_rework уже диспетчит worker.yml
+# адресно (`gh -X POST .../dispatches`). Ручной прогон (workflow_dispatch без
+# inputs.reason) допустим — тот же путь, что уже был у ручного вызова роли pm
+# человеком, теперь дополнительно проверяемый механически (см. шаг ниже).
+#
+# Развилка design.md §2.2 решена в пользу отдельного workflow (не расширения
+# dispatch_conflict_rework): изолирует дорогой LLM-вызов от orchestra.yml —
+# тот же принцип, что уже применён к ai-review.yml. Транспорт до DSH headless
+# — тот же scripts/hands/dsh_task.sh, что уже несёт hands.yml (не второй
+# механизм запуска агента), только TASK_TEXT свой — граница триажа PR-беклога,
+# не задача пула.
+#
+# Честная граница (design.md «Не подтверждено», п.2): перенос промпта/границ
+# ~/.claude/agents/pm.md (файл ЛОКАЛЬНЫЙ, живёт на машине владельца, не в
+# этом репозитории) в CI-контекст DSH headless не проверен живым прогоном —
+# TASK_TEXT ниже пересказывает объявленные словом границы pm.md (дубль/
+# устарело/битая связь/приоритет, потолок 25, не трогает исполнителя/
+# waiting:owner/blocked, улика в комментарии, closes only — never merges), но
+# фактическое поведение агента внутри headless-сессии этим файлом не
+# гарантируется — гарантирован только МЕХАНИЧЕСКИЙ потолок закрытий (шаг
+# «Механический потолок закрытий», ниже), который не доверяет самоотчёту.
+name: pm
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Почему сработал авто-диспетч (drain_gate/wip_gate) — для следа в логе, необязательно"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  # contents: read — не задавать permissions: неявно "все none" (находка
+  # ревью PR #870, блокирующая): при явном блоке permissions незаданные
+  # скоупы становятся none, а actions/checkout (первый шаг) требует
+  # contents:read даже без persist-credentials — без этой строки job не
+  # доживает до DSH ни разу. Тот же скоуп, что worker.yml/hands.yml.
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pm
+  cancel-in-progress: false
+
+jobs:
+  pm-groom:
+    runs-on: ubuntu-latest
+    # Тот же порядок таймаута, что hands.yml (25 мин DSH + ретрай + запас) —
+    # триаж беклога дешевле кода, но не мгновенен (десятки PR/задач читать).
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      # Момент ДО DSH-прогона — левая граница окна для механического
+      # подсчёта закрытий ниже (pm_dispatch.py::count_closures_in_window).
+      - name: Зафиксировать начало окна прогона
+        id: window
+        run: echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Находка ревью PR #870 (блокирующая): без этого шага у DSH-агента нет
+      # НИ ОДНОГО рабочего gh-креденшела — `gh issue close`/`gh pr close`
+      # внутри headless-сессии падают с «authentication required», потолок
+      # закрытий честно насчитает 0, drain-эпизод не закроется, а
+      # dispatch_pm_groom идемпотентен на эпизод — повторной попытки не
+      # будет (тихий no-op вместо автоматики). GH_RUN_TOKEN в env шага ниже
+      # не спасает: DSH вырезает из вызовов модель-шелла все env-переменные
+      # с именами *TOKEN*/*KEY*/*SECRET (проверено живым прогоном
+      # 2026-08-30, тот же класс, что уже описан в worker.yml). Login кладёт
+      # креды в hosts.yml — файл, не env, — DSH-скраб его не касается,
+      # ровно тот же приём, что worker.yml уже использует для git push.
+      - name: gh-авторизация под PAT владельца
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: |
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
+          gh auth status 2>&1 | grep -E 'Logged in|account' || true
+
+      - name: Триаж PR-беклога через DSH headless
+        env:
+          HANDS_URL: ${{ vars.HARNESS_URL }}
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+          TASK_ID: pm-${{ github.run_id }}
+          # Границы — пересказ словом ~/.claude/agents/pm.md (файл не в
+          # репозитории, честная граница выше). reason — факт из scheduler.py
+          # (drain_gate/wip_gate), не гипотеза: агент видит, ПОЧЕМУ его позвали.
+          TASK_TEXT: |
+            Роль pm: детерминированный триаж открытого PR-беклога и пула
+            задач edge-harness. Причина авто-диспетча: ${{ inputs.reason }}
+
+            Закрывай ТОЛЬКО бесспорное, с уликой (file:line/номер PR/ссылка)
+            в комментарии к закрываемому issue/PR:
+              - дубликат уже слитого/закрытого PR по тому же файлу-адресу;
+              - задача/PR явно устарели (описанная проблема уже решена в main);
+              - PR/задача ссылается на битую (несуществующую/неверную) связь.
+            НЕ закрывай (граница pm.md, здесь механически неприкосновенна):
+              - issue/PR с назначенным исполнителем;
+              - issue/PR с меткой waiting:owner;
+              - issue/PR с меткой blocked без протухшей по #334/#336 ссылки.
+            Потолок — не более 25 закрытий за этот прогон (проверяется
+            механически шагом workflow ПОСЛЕ этого, не твоим самоотчётом).
+            Семантическое сравнение диффов «дублирует по содержанию» — твоё
+            суждение с уликой в комментарии, не автоматика (design.md §5.2).
+            НИКОГДА не сливай и не мержи чужой PR — только closes, never
+            merges (design.md §5.2, «Admin-merge — за владельцем»).
+            Не чини найденные дефекты, не заводи новые задачи — только
+            триаж существующего беклога (та же граница, что pm.md).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
+          DSH_PROVIDER_QUOTA_UNTIL: ${{ vars.DSH_PROVIDER_QUOTA_UNTIL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DSH_EDGE_MODEL_CATALOG: ${{ vars.DSH_EDGE_MODEL_CATALOG }}
+          PLUGINS_SUITE_URL: ${{ vars.PLUGINS_SUITE_URL }}
+          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
+          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
+          # closes-only: та же широкая учётка, что worker.yml (GH_PIPELINE_PAT)
+          # использует для gh-операций от имени владельца — issues:write из
+          # permissions: выше достаточен для github.token, но close ЧУЖОГО
+          # issue/PR (не только своего) требует того же PAT, что уже несёт
+          # весь остальной конвейер (docs/agents/INFRA-GH.md).
+          GH_RUN_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: bash scripts/hands/dsh_task.sh
+
+      # Требование B, design.md §2.3: механический потолок — считает ФАКТ
+      # (сколько issue/PR реально закрыто за окно этого прогона по событиям
+      # issues/events), не декларацию модели о числе закрытий. Красит шаг
+      # (не просто печатает предупреждение), если факт превышает
+      # PM_MAX_CLOSURES_PER_RUN (scheduler.py, одно место правды).
+      - name: Механический потолок закрытий
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: |
+          python3 scripts/orchestra/pm_dispatch.py check-closures \
+            "${{ github.repository }}" "${{ github.repository_owner }}" \
+            "${{ steps.window.outputs.since }}"

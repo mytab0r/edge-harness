@@ -28,6 +28,7 @@ import http.server
 import importlib.util
 import io
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -37,6 +38,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -598,7 +600,12 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    # drain_gate/dispatch_pm_groom (#869) — не предмет этих main()-тестов;
+    # без стаба реальные функции бьют настоящим gh api за маршрутом
+    # issues/120/comments, которого нет в этих FakeGh-less стабах.
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls, now=None: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия; здесь важен
     # только путь «жёсткий сбой архивации красит прогон», не его проводка.
@@ -644,7 +651,12 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    # drain_gate/dispatch_pm_groom (#869) — не предмет этих main()-тестов;
+    # без стаба реальные функции бьют настоящим gh api за маршрутом
+    # issues/120/comments, которого нет в этих FakeGh-less стабах.
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls, now=None: ([], []))
 
     def boom(repo, now, lines, run_url=None):
         raise RuntimeError("gh api issues?labels=auto-detected: authentication required")
@@ -689,7 +701,12 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    # drain_gate/dispatch_pm_groom (#869) — не предмет этих main()-тестов;
+    # без стаба реальные функции бьют настоящим gh api за маршрутом
+    # issues/120/comments, которого нет в этих FakeGh-less стабах.
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls, now=None: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
@@ -722,7 +739,12 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], ["🚨 #227: улика не проверена"], True))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    # drain_gate/dispatch_pm_groom (#869) — не предмет этих main()-тестов;
+    # без стаба реальные функции бьют настоящим gh api за маршрутом
+    # issues/120/comments, которого нет в этих FakeGh-less стабах.
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls, now=None: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     # Детектор простоя (#201) — отдельная забота, не эта гвардия (см. соседний тест).
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
@@ -2904,6 +2926,10 @@ def test_dispatch_conflict_rework_releases_task_and_dispatches_targeted_worker(m
         "issues/560/timeline?per_page=100": [],  # метка ещё не проставлялась — ни одной авто-попытки
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "issues/474/assignees": None,
         "workflows/worker.yml/dispatches": None,  # 204 без тела — прод-форма успеха
     })
@@ -2974,6 +3000,10 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         # Вторая находка ревью PR #478 ("алерт не гадает"): текст обязан
         # называть conclusion прогона, атрибутированного задаче, а не
         # утверждать причину («содержательный конфликт») от себя. created_at
@@ -3031,6 +3061,10 @@ def test_dispatch_conflict_rework_dispatches_again_after_budget_reset_marker(mon
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "issues/474/assignees": None,
         "workflows/worker.yml/dispatches": None,
         f"{REPO}/issues/474/comments?per_page": [
@@ -3093,6 +3127,10 @@ def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_fail
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         # Единственный прогон существует и атрибутирован задаче #475, но упал
         # ДО git-шага (живой случай #476/#567: недоступность морды).
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
@@ -3152,6 +3190,10 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
         "pulls/560": {"mergeable_state": "dirty"},
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         # В окне только чужой прогон 901: попытка (333→900) туда не попала.
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
             {"id": 901, "conclusion": "success", "created_at": "2026-09-06T09:10:00Z"},
@@ -3191,6 +3233,10 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z",
              "body": "Канал: worker run 34011108934."},
@@ -3261,6 +3307,10 @@ def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         f"{REPO}/issues/474/comments?per_page": [
             {"created_at": "2026-09-06T09:01:00Z",
              "body": "Канал: worker run 34011108934."},
@@ -3311,6 +3361,10 @@ def test_dispatch_conflict_rework_dispatches_only_one_pr_per_pass(monkeypatch):
         "issues/561/timeline?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "issues/474/assignees": None,
         "workflows/worker.yml/dispatches": None,
     })
@@ -3354,6 +3408,10 @@ def test_dispatch_conflict_rework_processes_oldest_conflict_first(monkeypatch):
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
         f"{REPO}/issues/474/comments?per_page": [],
         f"{REPO}/issues/475/comments?per_page": [],
@@ -3725,6 +3783,15 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     monkeypatch.setattr(sch, "accept_merged_tasks",
                          lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    # wip_gate/drain_gate/dispatch_pm_groom не патчились здесь исторически
+    # (реальный wip_gate деградировал к RuntimeError-ветке на непропатченном
+    # gh — медленно, но проходил); drain_gate/dispatch_pm_groom (#869) той же
+    # деградации не имеют (issue_marker_times поднимает наружу без try/except
+    # у dispatch_pm_groom при недоступности маркеров — как раз наблюдение, не
+    # сбой), стабим все три явно, не полагаясь на медленный сетевой таймаут.
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     # Детектор простоя (#201) — не предмет этого теста, но main() зовёт его
     # безусловно; без мока непатченный detect_and_act/escalate_stale_auto_tasks
@@ -4637,6 +4704,10 @@ def test_dispatch_worker_fires_once_for_idle_worker_and_free_pool(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": graphql_pool_response(pool),
         # POST .../dispatches отвечает 204 без тела — прод-форма «успех» есть None.
         "workflows/worker.yml/dispatches": None,
@@ -4660,6 +4731,10 @@ def test_dispatch_worker_names_oldest_free_task_like_worker_will_pick(monkeypatc
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": graphql_pool_response(pool),
         "workflows/worker.yml/dispatches": None,
     })
@@ -4682,6 +4757,10 @@ def test_dispatch_worker_names_task_with_more_blocking_over_older_number(monkeyp
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": graphql_response,
         "workflows/worker.yml/dispatches": None,
     })
@@ -4698,6 +4777,10 @@ def test_dispatch_worker_degrades_to_rest_pool_when_graph_unavailable(monkeypatc
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": RuntimeError("gh: HTTP 401: Bad credentials"),
         "workflows/worker.yml/dispatches": None,
     })
@@ -4777,6 +4860,10 @@ def test_worker_runs_active_treats_ancient_in_progress_run_as_not_blocking(monke
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assert sch.worker_runs_active(REPO) is False
@@ -4802,6 +4889,10 @@ def test_dispatch_worker_dispatches_when_previous_run_is_stalled(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": graphql_pool_response(pool),
         "workflows/worker.yml/dispatches": None,
     })
@@ -4820,6 +4911,10 @@ def test_dispatch_worker_survives_dispatch_failure(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "graphql": graphql_pool_response(pool),
         "workflows/worker.yml/dispatches": RuntimeError(
             "gh api repos/o/r/actions/workflows/worker.yml/dispatches: HTTP 403"),
@@ -4934,6 +5029,10 @@ def test_dispatch_worker_targets_declared_pr_task_when_wip_gate_closed(monkeypat
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
@@ -4962,6 +5061,10 @@ def test_dispatch_worker_prefers_oldest_declared_pr_task_when_wip_gate_closed(mo
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
@@ -4981,6 +5084,10 @@ def test_dispatch_worker_blocks_new_task_when_wip_gate_closed_and_no_pr_yet(monk
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     pool = [issue(95, assignees=())]
@@ -5153,6 +5260,10 @@ def test_integration_gate_closed_dispatches_rework_not_new_task(monkeypatch):
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
@@ -5178,6 +5289,10 @@ def test_integration_gate_open_dispatches_oldest_free_task_as_before(monkeypatch
         "issues/120/comments?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/dispatches": None,
     })
     patch_gh(monkeypatch, fake)
@@ -5376,6 +5491,10 @@ def test_dispatch_worker_skips_conflict_declared_task_when_wip_gate_closed(monke
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=False, pulls=pulls)
@@ -5424,6 +5543,493 @@ def test_wip_gate_does_not_escalate_blindly_when_stuck_markers_unreadable(monkey
     assert any("не прочитаны" in line for line in actions)
 
 
+# ── drain_gate (#869): композитный сигнал «дренаж встал» ────────────────────
+
+
+def test_merge_queue_candidates_excludes_drafts_and_bots():
+    pulls = [
+        pull(1, labels=[]),
+        pull(2, labels=[], draft=True),
+        pull(3, labels=[], author_login="dependabot[bot]"),
+    ]
+    candidates = sch.merge_queue_candidates(pulls)
+    assert [p["number"] for p in candidates] == [1]
+
+
+def test_drain_gate_is_norm_when_no_merge_queue_candidates(monkeypatch):
+    """design.md §1.5 (копия критерия приёмки #194): открытых PR-кандидатов
+    нет — не тревога, даже при старом последнем слиянии."""
+    fake = FakeGh({"issues/120/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("нет кандидатов — тревоги быть не должно"))
+    merged_old = [{"number": 1, "merged_at": "2020-01-01T00:00:00Z"}]
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[], merged_pulls=merged_old,
+        dispatch_allowed=True, wip_count=0, conflict_exhausted=0, contract_failed_count=0,
+    )
+    assert ok is True
+    assert any("кандидатов" in line for line in observations)
+    assert fake.mutating_calls() == []
+
+
+def test_drain_gate_is_norm_when_recent_merge(monkeypatch):
+    fake = FakeGh({"issues/120/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("свежее слияние — тревоги быть не должно"))
+    merged_recent = [{"number": 1, "merged_at": "2026-09-09T10:00:00Z"}]  # 2ч назад
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[pull(9, labels=[])], merged_pulls=merged_recent,
+        dispatch_allowed=True, wip_count=0, conflict_exhausted=0, contract_failed_count=0,
+    )
+    assert ok is True
+
+
+def test_drain_gate_escalates_and_names_all_true_causes(monkeypatch):
+    """Мутация: убери хотя бы один if-блок причин в drain_gate — этот тест
+    покраснеет (недостающая причина не попадёт в текст эскалации,
+    AGENTS.md «алерт не гадает»)."""
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": [],
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    merged_old = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]  # 8ч назад > DRAIN_STALL_HOURS(4)
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[pull(9, labels=[])], merged_pulls=merged_old,
+        dispatch_allowed=False, wip_count=sch.WIP_LIMIT, conflict_exhausted=2, contract_failed_count=3,
+    )
+    assert ok is False
+    assert escalated
+    text = escalated[0]
+    assert "предохранитель" in text
+    assert "WIP-лимит" in text
+    assert "2 конфликтных" in text
+    assert "3 открытых PR несут" in text
+    assert sch.DRAIN_GATE_OPEN_MARKER in text
+
+
+def test_drain_gate_honest_about_unknown_cause_when_none_true(monkeypatch):
+    """AGENTS.md «алерт не гадает»: ни одна из посчитанных причин не верна —
+    drain_gate обязан сказать это честно, не подставлять любую по умолчанию."""
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": [],
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    merged_old = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[pull(9, labels=[])], merged_pulls=merged_old,
+        dispatch_allowed=True, wip_count=0, conflict_exhausted=0, contract_failed_count=0,
+    )
+    assert ok is False
+    assert "причина не установлена" in escalated[0]
+
+
+def test_drain_gate_does_not_repost_open_marker_while_episode_active(monkeypatch):
+    comments = [{"created_at": "2026-09-09T04:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не дублируем"))
+    merged_old = [{"number": 1, "merged_at": "2026-09-09T04:00:00Z"}]
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[pull(9, labels=[])], merged_pulls=merged_old,
+        dispatch_allowed=False, wip_count=0, conflict_exhausted=0, contract_failed_count=0,
+    )
+    assert ok is False
+    assert fake.mutating_calls() == []
+
+
+def test_drain_gate_closes_episode_when_queue_drains(monkeypatch):
+    comments = [{"created_at": "2026-09-09T04:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    merged_recent = [{"number": 1, "merged_at": "2026-09-09T11:50:00Z"}]  # 10 минут назад
+    observations, actions, ok = sch.drain_gate(
+        REPO, utc(2026, 9, 9, 12, 0), pulls=[pull(9, labels=[])], merged_pulls=merged_recent,
+        dispatch_allowed=True, wip_count=0, conflict_exhausted=0, contract_failed_count=0,
+    )
+    assert ok is True
+    posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
+    assert len(posts) == 1
+    assert sch.DRAIN_GATE_CLOSE_MARKER in posts[0]
+
+
+def test_conflict_exhausted_count_counts_prs_with_budget_used_up(monkeypatch):
+    # Тот же фикстурный PR #560/задача #474, что уже доказывает
+    # conflict_rework_attempts == 1 (test_conflict_rework_attempts_counts_run_that_reached_git_step) —
+    # одно место правды на форму фикстуры прод-таймлайна/комментариев.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T00:05:00Z", "body": "Канал: worker run 333."},
+            {"created_at": "2026-09-06T00:10:00Z", "body": "🤖 [worker: git-шаг] worker run 333"},
+        ],
+        "issues/561/timeline?per_page=100": [],
+    })
+    patch_gh(monkeypatch, fake)
+    pulls = [
+        pull(560, labels=["conflict"], ref="agent/474-fix"),
+        pull(561, labels=["conflict"], ref="agent/475-fix"),  # бюджет ещё не тронут — attempts=0
+        pull(562, labels=[]),  # не в конфликте вовсе — не считается
+    ]
+    assert sch.conflict_exhausted_count(REPO, pulls) == 1
+
+
+# ── dispatch_pm_groom (#869, Требование B): автодиспетч роли pm ─────────────
+
+
+def test_dispatch_pm_groom_silent_when_neither_condition_met(monkeypatch):
+    fake = FakeGh({"issues/120/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=True)
+    assert observations == [] and actions == []
+    assert fake.mutating_calls() == []
+
+
+def test_dispatch_pm_groom_dispatches_when_drain_episode_older_than_threshold(monkeypatch):
+    # 10ч назад > PM_DISPATCH_AFTER_HOURS (8).
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/dispatches": None,
+        # Гвардия повторного диспатча (ревью PR #870): пустой список прогонов —
+        # недавнего pm.yml нет, диспатч разрешён.
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert any("pm.yml запущен" in line for line in actions)
+    dispatches = [c for c in fake.mutating_calls() if "workflows/pm.yml/dispatches" in c]
+    assert len(dispatches) == 1
+
+
+def test_dispatch_pm_groom_drain_ok_true_skips_drain_markers(monkeypatch):
+    """Быстрый выход drain_ok (ревью PR #870, замечание 6): тревоги дренажа
+    в ЭТОМ пульсе нет — drain-маркеры не читаются вовсе. Мутация: убери
+    быстрый выход (читай drain-маркеры всегда) — старый open-маркер в
+    комментариях сделает drain_triggered=True, диспетч пойдёт в
+    pm_groom_run_started_after, у fake нет маршрута runs — AssertionError,
+    тест покраснеет."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=True)
+    assert observations == [] and actions == []
+    assert fake.mutating_calls() == []
+    reads = [c for c in fake.calls if "issues/120/comments" in c]
+    # 3 чтения: wip_stuck, wip_open, wip_close — drain-пара не читается.
+    assert len(reads) == 3
+
+
+def test_dispatch_pm_groom_dispatches_when_wip_stuck_marker_present(monkeypatch):
+    stuck_marker = f"{sch.WIP_GATE_STUCK_MARKER_PREFIX}{sch.WIP_GATE_STUCK_HOURS}ч]"
+    comments = [
+        {"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER},
+        {"created_at": "2026-09-06T08:10:00Z", "body": f"🚨 edge-harness: {stuck_marker}\nуже кричали"},
+    ]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 6, 9, 5), drain_ok=True)
+    assert any("WIP-лимит держит" in line for line in actions)
+
+
+def test_dispatch_pm_groom_is_idempotent_per_episode(monkeypatch):
+    drain_opened_iso = "2026-09-09T02:00:00Z"
+    episode_key = sch.parse_time(drain_opened_iso).isoformat(timespec="seconds")
+    marker = f"{sch.PM_GROOM_DISPATCH_MARKER_PREFIX}{episode_key}]"
+    comments = [
+        {"created_at": drain_opened_iso, "body": sch.DRAIN_GATE_OPEN_MARKER},
+        {"created_at": "2026-09-09T02:05:00Z", "body": f"👤 {marker}\nуже диспетчировано"},
+    ]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert actions == []
+    assert any("уже запущен" in line for line in observations)
+    assert fake.mutating_calls() == []
+
+
+def test_dispatch_pm_groom_names_both_reasons_when_both_true(monkeypatch):
+    """Мутация: убери один из двух if-блоков reasons в dispatch_pm_groom —
+    этот тест покраснеет (недостающая причина не попадёт в текст диспетча)."""
+    stuck_marker = f"{sch.WIP_GATE_STUCK_MARKER_PREFIX}{sch.WIP_GATE_STUCK_HOURS}ч]"
+    comments = [
+        {"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER},
+        {"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER},
+        {"created_at": "2026-09-06T08:10:00Z", "body": f"🚨 edge-harness: {stuck_marker}\nуже кричали"},
+    ]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    combined = "\n".join(actions)
+    assert "drain_gate держит тревогу" in combined
+    assert "WIP-лимит держит взятие" in combined
+
+
+def test_dispatch_pm_groom_skips_when_run_already_started_after_episode(monkeypatch):
+    """Гвардия повторного диспатча (ревью PR #870, замечание 7): маркера
+    эпизода нет (сбой поста маркера ПОСЛЕ успешного POST диспатча), но pm.yml
+    стартовал позже открытия эпизода — повторный диспатч не выполняется,
+    маркер восстанавливается (самолечение идемпотентности). Мутация: убери
+    гвардию — диспетч пойдёт, у fake нет маршрута dispatches, AssertionError,
+    тест покраснеет."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/runs?per_page=10": {
+            "workflow_runs": [
+                # создан 03:00 — ПОЗЖЕ открытия эпизода (02:00), но сам маркер
+                # того диспатча не сохранился
+                {"created_at": "2026-09-09T03:00:00Z"},
+            ]
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert any("повтор не нужен" in line for line in observations)
+    assert all("pm.yml запущен" not in line for line in actions)
+    dispatches = [c for c in fake.mutating_calls() if "dispatches" in c]
+    assert dispatches == []
+    # Маркер идемпотентности восстановлен — следующие пульсы эпизода не
+    # пойдут в чтение прогонов снова.
+    assert any("issues/120/comments" in c for c in fake.mutating_calls())
+
+
+def test_dispatch_pm_groom_dispatches_when_recent_run_predates_episode(monkeypatch):
+    """Гвардия не путает прогон ДРУГОГО (более раннего) эпизода с этим:
+    единственный pm.yml-прогон стартовал ДО открытия текущего эпизода —
+    диспатч выполняется как обычно."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {
+            "workflow_runs": [{"created_at": "2026-09-08T12:00:00Z"}],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert any("pm.yml запущен" in line for line in actions)
+    dispatches = [c for c in fake.mutating_calls() if "workflows/pm.yml/dispatches" in c]
+    assert len(dispatches) == 1
+
+
+# ── Карантин задачи-отравы (#869, Требование C) ──────────────────────────────
+
+
+def fake_worker_log_subprocess(logs_by_job_id):
+    """Мок sch.subprocess.run для worker_lease_task_number — та же форма,
+    что test_repo_invariants.py::fake_log_subprocess для last_error_log_line
+    (разный формат строки лога — своя копия, не общий импорт между тестовыми
+    модулями двух разных пакетов)."""
+    def run(args, **kwargs):
+        joined = " ".join(args)
+        match = re.search(r"actions/jobs/(\d+)/logs", joined)
+        job_id = int(match.group(1)) if match else None
+        return SimpleNamespace(returncode=0, stdout=logs_by_job_id.get(job_id, ""))
+    return run
+
+
+def test_quarantine_backoff_minutes_grows_and_caps():
+    assert sch.quarantine_backoff_minutes(sch.QUARANTINE_AFTER) == sch.QUARANTINE_PROBE_BASE_MINUTES
+    assert sch.quarantine_backoff_minutes(sch.QUARANTINE_AFTER + 1) == sch.QUARANTINE_PROBE_BASE_MINUTES * 2
+    assert sch.quarantine_backoff_minutes(sch.QUARANTINE_AFTER + 20) == sch.QUARANTINE_PROBE_MAX_MINUTES
+
+
+def test_quarantine_streaks_counts_leading_prefix_per_task():
+    runs = [
+        (140, True, utc(2026, 9, 9, 13, 3)),
+        (140, True, utc(2026, 9, 9, 12, 18)),
+        (140, True, utc(2026, 9, 9, 11, 0)),
+    ]
+    assert sch.quarantine_streaks(runs) == {140: (3, utc(2026, 9, 9, 13, 3))}
+
+
+def test_quarantine_streaks_stops_at_first_success():
+    runs = [
+        (140, True, utc(2026, 9, 9, 13, 0)),
+        (140, False, utc(2026, 9, 9, 12, 0)),  # success — обрывает подсчёт
+        (140, True, utc(2026, 9, 9, 11, 0)),
+    ]
+    assert sch.quarantine_streaks(runs) == {140: (1, utc(2026, 9, 9, 13, 0))}
+
+
+def test_quarantine_streaks_stops_at_first_unattributed_run():
+    """design.md «Не подтверждено» п.3: атрибуция может быть неполной (сбой
+    ДО строки «Аренда взята») — неатрибутированный фатальный прогон обрывает
+    подсчёт ЦЕЛИКОМ, не гадаем дальше вглубь истории."""
+    runs = [
+        (140, True, utc(2026, 9, 9, 13, 0)),
+        (None, True, utc(2026, 9, 9, 12, 0)),
+        (140, True, utc(2026, 9, 9, 11, 0)),
+    ]
+    assert sch.quarantine_streaks(runs) == {140: (1, utc(2026, 9, 9, 13, 0))}
+
+
+def test_quarantined_task_numbers_from_streaks_respects_backoff():
+    streaks = {140: (sch.QUARANTINE_AFTER, utc(2026, 9, 9, 12, 0))}
+    assert sch.quarantined_task_numbers_from_streaks(streaks, utc(2026, 9, 9, 12, 0)) == {140}
+    after = utc(2026, 9, 9, 12, 0) + timedelta(minutes=sch.QUARANTINE_PROBE_BASE_MINUTES + 1)
+    assert sch.quarantined_task_numbers_from_streaks(streaks, after) == set()
+
+
+def test_quarantined_task_numbers_from_streaks_silent_below_threshold():
+    streaks = {140: (sch.QUARANTINE_AFTER - 1, utc(2026, 9, 9, 12, 0))}
+    assert sch.quarantined_task_numbers_from_streaks(streaks, utc(2026, 9, 9, 12, 0)) == set()
+
+
+def test_worker_lease_task_number_parses_lease_line(monkeypatch):
+    fake = FakeGh({"actions/runs/1/jobs?per_page=20": {"jobs": [{"id": 501}]}})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        501: "2026-09-09T00:00:00.0000000Z Аренда взята: замок refs/locks/task-140 установлен\n",
+    })))
+    assert sch.worker_lease_task_number(REPO, {"id": 1}) == 140
+
+
+def test_worker_lease_task_number_none_when_line_absent(monkeypatch):
+    fake = FakeGh({"actions/runs/1/jobs?per_page=20": {"jobs": [{"id": 501}]}})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        501: "2026-09-09T00:00:00.0000000Z сбой до простановки лога аренды\n",
+    })))
+    assert sch.worker_lease_task_number(REPO, {"id": 1}) is None
+
+
+_QUARANTINE_LIVE_140_RUNS = {
+    "workflows/worker.yml/runs?per_page=20": {"workflow_runs": [
+        {"id": 3, "status": "completed", "conclusion": "failure", "created_at": "2026-09-09T13:03:00Z"},
+        {"id": 2, "status": "completed", "conclusion": "failure", "created_at": "2026-09-09T12:18:00Z"},
+        {"id": 1, "status": "completed", "conclusion": "failure", "created_at": "2026-09-09T11:00:00Z"},
+    ]},
+    "actions/runs/3/jobs?per_page=20": {"jobs": [{"id": 903}]},
+    "actions/runs/2/jobs?per_page=20": {"jobs": [{"id": 902}]},
+    "actions/runs/1/jobs?per_page=20": {"jobs": [{"id": 901}]},
+}
+_QUARANTINE_LIVE_140_LOG = "Аренда взята: замок refs/locks/task-140 установлен\n"
+
+
+def test_quarantined_task_numbers_flags_repeated_fatal_task_live_case_140(monkeypatch):
+    """Живой повод (issue #869, «Контекст и ссылки»): задача #140 роняла
+    worker.yml на КАЖДОМ диспатче (испорченная сессия harness-140, runs
+    34484847840/13:03/12:18) — QUARANTINE_AFTER подряд фатальных прогонов с
+    ОДНИМ номером задачи выводит её из отбора."""
+    fake = FakeGh(dict(_QUARANTINE_LIVE_140_RUNS))
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        903: _QUARANTINE_LIVE_140_LOG, 902: _QUARANTINE_LIVE_140_LOG, 901: _QUARANTINE_LIVE_140_LOG,
+    })))
+    assert sch.quarantined_task_numbers(REPO, utc(2026, 9, 9, 13, 5)) == {140}
+
+
+def test_quarantined_task_numbers_cheap_path_on_green_history(monkeypatch):
+    fake = FakeGh({
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": [
+            {"id": 1, "status": "completed", "conclusion": "success", "created_at": "2026-09-09T13:00:00Z"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.quarantined_task_numbers(REPO, utc(2026, 9, 9, 13, 5)) == set()
+    assert not any("jobs" in c for c in fake.calls)  # дешёвый путь — ни одного лишнего запроса
+
+
+def test_quarantined_task_numbers_silent_on_network_failure(monkeypatch):
+    monkeypatch.setattr(sch, "gh", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gh api: HTTP 503")))
+    assert sch.quarantined_task_numbers(REPO, utc(2026, 9, 9, 13, 5)) == set()
+
+
+def test_dispatch_worker_bypasses_quarantined_task_with_addressed_dispatch(monkeypatch):
+    """Мутация (tasks.md C, критерий приёмки): убери фильтр карантина в
+    dispatch_worker (верни безусловный bare-диспатч) — этот тест покраснеет,
+    задача #140 продолжит выбираться (bare-диспатч вместо адресного на #200)."""
+    pool = [issue(140, assignees=()), issue(200, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
+        "workflows/worker.yml/dispatches": None,
+        **_QUARANTINE_LIVE_140_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        903: _QUARANTINE_LIVE_140_LOG, 902: _QUARANTINE_LIVE_140_LOG, 901: _QUARANTINE_LIVE_140_LOG,
+    })))
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[], now=utc(2026, 9, 9, 13, 5))
+    assert any("карантине" in line for line in observations + actions)
+    dispatches = [c for c in fake.mutating_calls() if "worker.yml/dispatches" in c]
+    assert dispatches == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[task]=200"
+    ]
+
+
+def test_dispatch_worker_holds_off_when_all_free_candidates_quarantined(monkeypatch):
+    pool = [issue(140, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
+        **_QUARANTINE_LIVE_140_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        903: _QUARANTINE_LIVE_140_LOG, 902: _QUARANTINE_LIVE_140_LOG, 901: _QUARANTINE_LIVE_140_LOG,
+    })))
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[], now=utc(2026, 9, 9, 13, 5))
+    assert any("все свободные задачи в карантине" in line for line in observations)
+    assert fake.mutating_calls() == []
+
+
+def test_dispatch_worker_bypasses_quarantined_task_when_not_first_candidate(monkeypatch):
+    """Мутация (находка ревью PR #870, блокирующая): верни проверку
+    `candidates[0]["number"] in quarantined` вместо пересечения по ВСЕМУ
+    списку — этот тест покраснеет. Карантинная #140 здесь НЕ первая
+    (#90 младше по номеру и не в карантине), поэтому старое условие молчало
+    и уходило bare-диспатчем, где task.sh мог по своему снимку выбрать
+    именно #140."""
+    pool = [issue(90, assignees=()), issue(140, assignees=()), issue(200, assignees=())]
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "graphql": graphql_pool_response(pool),
+        "workflows/worker.yml/dispatches": None,
+        **_QUARANTINE_LIVE_140_RUNS,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "subprocess", SimpleNamespace(run=fake_worker_log_subprocess({
+        903: _QUARANTINE_LIVE_140_LOG, 902: _QUARANTINE_LIVE_140_LOG, 901: _QUARANTINE_LIVE_140_LOG,
+    })))
+    observations, actions = sch.dispatch_worker(REPO, pool, wip_allowed=True, pulls=[], now=utc(2026, 9, 9, 13, 5))
+    assert any("карантине" in line for line in observations + actions)
+    dispatches = [c for c in fake.mutating_calls() if "worker.yml/dispatches" in c]
+    # Адресный диспатч (inputs[task]=...), не bare — иначе task.sh сам
+    # выбирает свободную задачу и может взять карантинную #140.
+    assert dispatches == [
+        f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches -f ref=main -f inputs[task]=90"
+    ]
+
+
 def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatch):
     """Проводка в main() (не внутри dispatch_worker) — мутация-гвардия для
     критической находки ревью PR #466: верни `if dispatch_allowed and
@@ -5467,10 +6073,12 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     monkeypatch.setattr(
         sch, "wip_gate",
         lambda repo, now, pulls, pool, dispatch_allowed: (["⏸️ новые задачи не берутся: 25 открытых PR ждут доработки при лимите 12"], [], False))
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
-        lambda repo, pool, *, wip_allowed, pulls: dispatched.append((repo, pool, wip_allowed, pulls)) or (
+        lambda repo, pool, *, wip_allowed, pulls, now=None: dispatched.append((repo, pool, wip_allowed, pulls)) or (
             ["👷 доводка PR по задаче #89 диспетчирована"], []))
     reports = []
     monkeypatch.setattr(sch, "summary", lambda lines: reports.append(lines))
@@ -5515,6 +6123,8 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(
         sch, "wip_gate",
         lambda repo, now, pulls, pool, dispatch_allowed: wip_seen.append(dispatch_allowed) or ([], [], True))
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
     # Не предмет этого теста (#427) — issue(89) без исполнителя и старым
     # дефолтным created_at реально старее STALE_HOURS к моменту прогона:
     # непатченный mark_stale_unclaimed бил бы по настоящему gh (нашла CI, не я).
@@ -5529,7 +6139,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     dispatched = []
     monkeypatch.setattr(
         sch, "dispatch_worker",
-        lambda repo, pool, *, wip_allowed, pulls: dispatched.append((repo, pool)) or [],
+        lambda repo, pool, *, wip_allowed, pulls, now=None: dispatched.append((repo, pool)) or [],
     )
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     assert sch.main() == 0
@@ -5574,6 +6184,10 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         "pulls?state=closed&per_page=100&page=1": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         # conveyor_gate читает историю worker.yml без фильтра status — отдельный
         # маршрут от worker_runs_active (?status=in_progress/queued выше).
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
@@ -5648,6 +6262,10 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         "pulls?state=closed&per_page=100&page=1": [],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Карантин (#869, Требование C) — dispatch_worker проверяет серию
+        # подряд-фатальных прогонов ПЕРЕД bare-диспатчем; пустая история —
+        # дешёвый путь без job/лога, но сам запрос уходит всегда.
+        "workflows/worker.yml/runs?per_page=20": {"workflow_runs": []},
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
         "issues/120/comments?per_page=100": [],
         "repos/pawaca/dsh-edge/tags?per_page=100": [
@@ -6080,7 +6698,12 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
-    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    # drain_gate/dispatch_pm_groom (#869) — не предмет этих main()-тестов;
+    # без стаба реальные функции бьют настоящим gh api за маршрутом
+    # issues/120/comments, которого нет в этих FakeGh-less стабах.
+    monkeypatch.setattr(sch, "drain_gate", lambda *a, **k: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_pm_groom", lambda *a, **k: ([], []))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls, now=None: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сбоя тут нет"))
     # Детектор устойчивого простоя (#201) — не предмет этого теста, гасим

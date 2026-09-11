@@ -248,6 +248,14 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_repo_invariants.py -q
 
+      # Требование B (#869, drain-health-curator): механический потолок
+      # закрытий за авто-pm-прогон считает ФАКТ по issues/events, не
+      # декларацию модели (design.md §2.3) — см. .github/workflows/pm.yml.
+      # Тесты зарегистрированы файлом каталога (#749):
+      # scripts/ci/guards/pm-dispatch-closures-guard.sh, не рукописным шагом
+      # здесь (ALLOWLIST-ratchet ci_guard_registration_guard.py не даёт
+      # новым шагам попадать в этот файл).
+
       # Автофикс инварианта 4 (#493, job archive-fixup ниже): чистая часть
       # rewrite_inbound_links (переписывание входящих markdown-ссылок при
       # переносе openspec/changes/<id> в archive/) плюс регресс #506

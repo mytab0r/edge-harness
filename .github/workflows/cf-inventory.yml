@@ -6,14 +6,20 @@ name: cf-inventory
 on:
   workflow_dispatch:
 
-# github.token этой работе не нужен вовсе (только CLOUDFLARE_*, ниже) — без
-# явного permissions: {} он получает дефолтные права репозитория (тот же
-# класс, с которым борется ADR 0008). Находка ревью PR #328, п.3.
+# github.token этой работе нужен ТОЛЬКО на чтение (checkout) — без явного
+# permissions: {} он получает дефолтные права репозитория (тот же класс, с
+# которым борется ADR 0008). Находка ревью PR #328, п.3. contents: read
+# объявлен ЯВНО на job'е — checkout без него делает шаг зависимым от того,
+# как GitHub трактует незаданные скоупы; гвардия
+# scripts/lib/test_dispatch_token_usage.py красит job с checkout без
+# явного contents (класс закрыт в #869, поймано на ребейзе 2026-09-11).
 permissions: {}
 
 jobs:
   inventory:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:

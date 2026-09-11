@@ -108,6 +108,17 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "check-runs ОДНОГО коммита (head_sha) — тот же контракт, что "
         "pr_check_runs выше: фиксированный малый список обязательных "
         "проверок этого репозитория, не растущий список.",
+    ("scripts/orchestra/scheduler.py", "worker_lease_task_number"):
+        "job'ы ОДНОГО прогона worker.yml (#869, карантин задачи-отравы) — тот "
+        "же контракт, что pulse_guard.failing_jobs: фиксированное малое число "
+        "job'ов конвейера на один прогон, не растущий список.",
+    ("scripts/orchestra/scheduler.py", "pm_groom_run_started_after"):
+        "`per_page=10` — запрошены последние N прогонов ОДНОГО workflow "
+        "(pm.yml, #869, авто-диспетч pm): вопрос функции «стартовал ли "
+        "pm.yml ПОЗЖЕ момента X» отвечает САМЫЙ СВЕЖИЙ прогон — усечение "
+        "хвоста не меняет ответ, тот же контракт «дай N последних», что у "
+        "pulse_guard.recent_runs/deploy_evidence выше; читается только на "
+        "пути диспатча (маркер эпизода не найден), не на каждом пульсе.",
     ("scripts/lib/review_labels.py", "status_posted_at"):
         "commit status'ы ОДНОГО коммита (sha) — GitHub возвращает статусы "
         "как отдельные записи по каждому POST на этот sha, но контекстов на "
