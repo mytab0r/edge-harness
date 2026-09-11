@@ -2754,3 +2754,20 @@ def test_stale_base_signatures_no_dead_strings():
         "awaiting conflict" not in signature
         for signature in pg.STALE_BASE_SIGNATURES
     )
+
+
+def test_issue_marker_times_from_comments_same_semantics_no_refetch():
+    """Чистая половина issue_marker_times (находка ревью PR #883): фильтрует
+    УЖЕ скачанные комментарии с ТОЙ ЖЕ семантикой совпадения (_marker_present,
+    включая границу «#16 не совпадает внутри #163»), без единого сетевого
+    вызова — читатель, которому один issue нужен по нескольким маркерам,
+    вычитывает его один раз и фильтрует локально."""
+    comments = [
+        {"created_at": "2026-09-06T10:00:00Z",
+         "body": "🚨 edge-harness: [conflict: эскалация] #701\nтот самый PR"},
+        {"created_at": "2026-09-06T11:00:00Z",
+         "body": "🚨 edge-harness: [conflict: эскалация] #70\nчужой номер — голая подстрока нашла бы"},
+        {"created_at": "2026-09-06T12:00:00Z", "body": "обычный комментарий"},
+    ]
+    times = pg.issue_marker_times_from_comments(comments, "[conflict: эскалация] #701")
+    assert times == [utc(2026, 9, 6, 10, 0)]

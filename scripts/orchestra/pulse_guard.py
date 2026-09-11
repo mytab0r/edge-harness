@@ -1291,20 +1291,39 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
-def issue_marker_times(
-    repo: str, issue_number: int, marker: str, max_pages: int | None = None, *,
-    trusted_login: str | None = None,
+def issue_marker_times_from_comments(
+    comments: list[dict], marker: str, *, trusted_login: str | None = None,
 ) -> list[datetime]:
-    """`trusted_login` (#1027, живой случай watchdog-issue #120 2026-09-12) —
+    """Чистая половина issue_marker_times: фильтрация УЖЕ скачанных
+    комментариев (all_issue_comments) по маркеру. Выделена, чтобы читатель,
+    которому один и тот же issue нужен по НЕСКОЛЬКИМ маркерам за прогон
+    (инвариант 18 repo_invariants.py: N застрявших PR × полная история #120),
+    вычитывал issue ОДИН раз, а фильтровал локально по собранному payload
+    (#875, находка ревью PR #883 — класс расходов, от которого репо уже
+    отказывался: #472, rate_guard). Семантика совпадения — та же
+    _marker_present, второй копии нет.
+
+    `trusted_login` (#1027, живой случай watchdog-issue #120 2026-09-12) —
     фильтр по логину АВТОРА комментария, не по факту «человек/агент»
     (см. AGENTS.md, «Атрибуция событий»: логин не различает оркестратор и
     агента, но различение по ТОКЕНУ — `github-actions[bot]` (GITHUB_TOKEN
     job'а) против личного PAT — разрешено явной оговоркой правила, тот же
     приём, что уже применяет `decide_independent_pulse`). По умолчанию
     (`None`) поведение не меняется — остальные потребители маркеров
-    (conflict/ai-rework/stall/heartbeat) фильтр не запрашивают.
+    (conflict/ai-rework/stall/heartbeat) фильтр не запрашивают."""
+    return [
+        parse_time(comment["created_at"])
+        for comment in comments
+        if _marker_present(marker, comment.get("body") or "")
+        and (trusted_login is None or (comment.get("user") or {}).get("login") == trusted_login)
+    ]
 
-    Найдено на живом репозитории: маркер WIP-гейта (`scheduler.WIP_GATE_
+
+def issue_marker_times(
+    repo: str, issue_number: int, marker: str, max_pages: int | None = None, *,
+    trusted_login: str | None = None,
+) -> list[datetime]:
+    """Найдено на живом репозитории: маркер WIP-гейта (`scheduler.WIP_GATE_
     CLOSE_MARKER`) в #120 был оставлен НЕ прогоном `orchestra.yml`, а
     прогоном `scheduler.py` вне GitHub Actions (`SCHEDULER_ALLOW_PROD_
     WRITES=1`, `pulse_guard.prod_writes_allowed`, — та же лазейка для
@@ -1321,12 +1340,7 @@ def issue_marker_times(
     история), проброшен в `all_issue_comments` (#607): стоимость одного тика
     читателя не должна расти с историей задачи."""
     payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
-    return [
-        parse_time(comment["created_at"])
-        for comment in payload
-        if _marker_present(marker, comment.get("body") or "")
-        and (trusted_login is None or (comment.get("user") or {}).get("login") == trusted_login)
-    ]
+    return issue_marker_times_from_comments(payload, marker, trusted_login=trusted_login)
 
 
 def issue_markers_any(

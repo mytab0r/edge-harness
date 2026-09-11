@@ -12,6 +12,7 @@
 
 import importlib.util
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2655,3 +2656,385 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
     # чужой PR за чужое искажение снимка.
     assert 16 not in ri.CI_GATING
     assert 16 in ri.ESCALATING_INVARIANTS
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 18 (#875; номер 17 занят #940 на момент ребейза): PR conflict с
+# исчерпанным бюджетом авто-ребейза стоит без сброса дольше порога после
+# эскалации в #120
+# ══════════════════════════════════════════════════════════════════════════
+#
+# patch_gh (выше) патчит ri.gh/ri.pulse_guard.gh, но scheduler.conflict_
+# rework_attempts/conflict_first_labeled_at/conflict_overlap_hint читают бару
+# `gh`, связанную ПРИ ИМПОРТЕ scheduler.py (`from pulse_guard import gh` —
+# раннее связывание в scheduler.__dict__, не то же самое имя, что
+# ri.pulse_guard.gh) — без отдельного патча эти вызовы ушли бы в РЕАЛЬНЫЙ
+# `gh api` при каждом прогоне теста. patch_gh_with_scheduler ниже — локальное
+# расширение, не правка общего patch_gh (остальные тесты этого файла не
+# трогают ветку scheduler, требующую сети, лишний патч им не нужен).
+
+
+def patch_gh_with_scheduler(monkeypatch, fake):
+    """patch_gh (выше) недостаточен для функций scheduler.py, которые сами
+    делают сеть (conflict_rework_attempts/conflict_first_labeled_at/
+    conflict_overlap_hint) — найдено при написании этого набора тестов:
+    `scheduler.py` резолвит `from pulse_guard import (...)` ОБЫЧНЫМ импортом
+    (sys.path), а не через importlib.module_from_spec, которым repo_
+    invariants.py грузит СВОЙ `ri.pulse_guard` — это ДВА разных объекта
+    модуля. Функции, ОПРЕДЕЛЁННЫЕ в scheduler.py (conflict_first_labeled_at,
+    conflict_overlap_hint), читают бару `gh` из ГЛОБАЛЬНОГО словаря
+    scheduler.py — патчим `ri.scheduler.gh` напрямую. Функции, определённые в
+    pulse_guard.py (all_issue_comments/issue_marker_times/escalate),
+    вызываемые ИЗ scheduler.py по имени, импортированному оттуда же, всё
+    равно резолвят СВОЙ бару `gh` через ГЛОБАЛЬНЫЙ словарь НАСТОЯЩЕГО
+    pulse_guard (sys.modules['pulse_guard'], не ri.pulse_guard) — без этой
+    патчи ушёл бы РЕАЛЬНЫЙ `gh api` вызов в сеть (живая находка при первом
+    прогоне этого набора: RuntimeError с реальным `unexpected EOF` от
+    api.github.com)."""
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.scheduler, "gh", fake)
+    real_pulse_guard = sys.modules.get("pulse_guard")
+    if real_pulse_guard is not None and real_pulse_guard is not ri.pulse_guard:
+        monkeypatch.setattr(real_pulse_guard, "gh", fake)
+
+
+def conflict_pr(number, task_number, labels=("conflict",)):
+    """Прод-форма PR из `GET /pulls?state=open` — только поля, которые
+    реально читает check_conflict_budget_stuck/conflict_rework_attempts
+    (labels, head.ref для task_ref.resolve_pr_task). Без `base` — conflict_
+    overlap_hint(base_sha="") коротким путём возвращает "" без единого
+    сетевого вызова (см. её докстринг в scheduler.py)."""
+    return {
+        "number": number,
+        "labels": [{"name": n} for n in labels],
+        "head": {"ref": f"agent/{task_number}-conflict-fix", "sha": f"sha{number}"},
+    }
+
+
+def conflict_labeled_timeline(when):
+    return [{"event": "labeled", "label": {"name": "conflict"}, "created_at": when}]
+
+
+def git_step_comment(when, run_id):
+    """Прод-форма отметки «дошёл до git-шага» (scripts/worker/task.sh) —
+    единственный устойчивый признак засчитанной попытки авто-ребейза
+    (scheduler.conflict_rework_attempts)."""
+    return {"created_at": when, "body": f"🤖 {ri.pulse_guard.WORKER_GIT_STEP_MARKER} worker run {run_id}"}
+
+
+def escalation_comment(when, pr_number):
+    return {
+        "created_at": when,
+        "body": f"🚨 {ri.pulse_guard.CONFLICT_ESCALATION_MARKER} #{pr_number}\n"
+                f"PR #{pr_number} остаётся dirty после 1 авто-попытки ребейза worker.yml.",
+    }
+
+
+def reset_comment(when, reason="разбор инцидента"):
+    return {"created_at": when, "body": f"{ri.pulse_guard.CONFLICT_BUDGET_RESET_MARKER} {reason}"}
+
+
+def stuck_routes(pr_number=701, task_number=700, *, escalated="2026-09-06T00:00:00Z",
+                 git_step="2026-09-05T01:00:00Z", task_comments=None, watchdog=None):
+    """Маршруты FakeGh для ОДНОГО застрявшего PR (прод-форма комментариев:
+    таймлайн метки, комментарии задачи, история #120)."""
+    return {
+        f"issues/{pr_number}/timeline": conflict_labeled_timeline("2026-09-05T00:00:00Z"),
+        f"issues/{task_number}/comments": (
+            [git_step_comment(git_step, 501)] if task_comments is None else task_comments
+        ),
+        f"issues/{ri.WATCHDOG_ISSUE}/comments": (
+            [escalation_comment(escalated, pr_number)] if watchdog is None else watchdog
+        ),
+    }
+
+
+def test_conflict_budget_stuck_flags_after_threshold_without_reset(monkeypatch):
+    """Живой случай задачи #875: попытка засчитана (git-шаг), эскалация в
+    #120 уже стоит, маркера сброса не было — 25 часов после эскалации (порог
+    24) обязаны дать нарушение с полным набором фактов."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes())
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)  # 25 ч после эскалации
+    violations = ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700})
+    assert len(violations) == 1
+    item = violations[0]
+    assert item["pr"] == 701
+    assert item["task"] == 700
+    assert item["attempts"] == 1
+    assert item["limit"] == ri.pulse_guard.CONFLICT_REWORK_MAX_ATTEMPTS
+    assert item["escalated_at"] == "2026-09-06T00:00:00+00:00"
+    assert item["age_hours"] == 25.0
+    assert item["overlap"] == ""
+    assert item["task_open"] is True
+
+
+def test_conflict_budget_stuck_silent_before_threshold(monkeypatch):
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes())
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 6, 1, 0)  # 1 ч после эскалации — заведомо меньше порога
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700}) == []
+
+
+def test_conflict_budget_stuck_mutation_guard_attempts_not_exhausted(monkeypatch):
+    """Мутация: без git-шага (attempts=0) бюджет не исчерпан — инвариант
+    обязан молчать сам, не полагаясь на то, что эскалация в реальности не
+    случилась бы без исчерпанного бюджета. Снятая проверка attempts (мутация)
+    красит этот тест."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes(task_comments=[]))  # ни одной засчитанной попытки
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700}) == []
+
+
+def test_conflict_budget_stuck_silent_when_not_yet_escalated(monkeypatch):
+    """Бюджет исчерпан, но dispatch_conflict_rework ещё не подтвердил dirty/
+    ещё не решил (worker.yml мог быть активен, см. docstring dispatch_
+    conflict_rework) — эскалации в #120 ещё нет, значит и этому инварианту
+    рано срабатывать."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes(watchdog=[]))  # эскалации нет вовсе
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 8, 1, 0)
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700}) == []
+
+
+def test_conflict_budget_stuck_silent_when_reset_after_escalation(monkeypatch):
+    """Газ применён (маркер сброса ПОСЛЕ эскалации) — движение есть, тишина,
+    даже спустя много часов."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes(task_comments=[
+        git_step_comment("2026-09-05T01:00:00Z", 501),
+        reset_comment("2026-09-06T02:00:00Z"),  # через 2ч ПОСЛЕ эскалации
+    ]))
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 9, 1, 0)  # больше суток после эскалации
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700}) == []
+
+
+def test_conflict_budget_stuck_still_flags_when_reset_predates_escalation(monkeypatch):
+    """Мутация: маркер сброса существует, но ДО этой эскалации (сброс
+    прошлого эпизода, например той самой сессии, что и сожгла попытку) — он
+    не доказывает движения ПОСЛЕ текущей эскалации. Без строгого сравнения
+    времени (`reset_at > escalated_at`) этот тест красит любую версию,
+    которая проверяет только «маркер есть» без времени."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh(stuck_routes(task_comments=[
+        reset_comment("2026-09-04T00:00:00Z"),  # ДО простановки метки конфликта вообще
+        git_step_comment("2026-09-05T01:00:00Z", 501),
+    ]))
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)
+    violations = ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700})
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 701
+
+
+def test_conflict_budget_stuck_ignores_pr_without_conflict_label():
+    pull = conflict_pr(701, 700, labels=("review:ok",))
+    now = utc(2026, 9, 9, 0, 0)
+    # без FakeGh — не должно спрашивать сеть вовсе
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700}) == []
+
+
+def test_conflict_budget_stuck_ignores_pr_without_resolvable_task():
+    pull = {"number": 701, "labels": [{"name": "conflict"}], "head": {"ref": "manual-push", "sha": "shaX"}}
+    now = utc(2026, 9, 9, 0, 0)
+    # без FakeGh — не должно спрашивать сеть вовсе
+    assert ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers=set()) == []
+
+
+def test_conflict_budget_stuck_unverified_when_read_fails_not_crash_not_silent(monkeypatch):
+    """Блокирующая находка ai-review PR #883: сбой собственного инструмента
+    (сеть/квота/EOF — живой `unexpected EOF` от api.github.com случался уже
+    на этом самом PR) — это НЕ крэш всего build_report (красил бы обязательную
+    проверку `test` на чужом пуше) и НЕ молчаливый []: PR с нечитаемой
+    историей даёт {"kind": "unverified", ...}, отчёт обязан сказать «не
+    подтверждено» (конвенция инварианта 10 + «не знаешь — пиши не
+    подтверждено»). Мутация: снять try/except RuntimeError — тест краснеет
+    поднятием исключения."""
+    pull = conflict_pr(701, 700)
+    fake = FakeGh({
+        "issues/701/timeline": conflict_labeled_timeline("2026-09-05T00:00:00Z"),
+        "issues/700/comments": RuntimeError("gh api: unexpected EOF"),
+    })
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)
+    raw = ri.check_conflict_budget_stuck(REPO, now, [pull], open_task_numbers={700})
+    assert len(raw) == 1
+    item = raw[0]
+    assert item["kind"] == "unverified"
+    assert item["pr"] == 701
+    assert item["task"] == 700
+    assert "unexpected EOF" in item["error"]
+
+
+def test_conflict_budget_stuck_watchdog_history_fetched_once_for_all_prs(monkeypatch):
+    """Находка ai-review PR #883 (цена квоты): полная пагинированная история
+    #120 — самой длинной задачи репозитория — вычитывается ОДИН РАЗ за прогон
+    на весь список застрявших PR, а не по разу на каждый PR (19 PR × каждые
+    15 минут — ровно класс расходов, от которого репо уже отказывался,
+    #472/rate_guard). Мутация: вернуть per-PR `issue_marker_times(repo,
+    WATCHDOG_ISSUE, ...)` — второй GET истории красит этот тест."""
+    pulls = [conflict_pr(701, 700), conflict_pr(702, 703)]
+    routes = stuck_routes()
+    routes.update(stuck_routes(pr_number=702, task_number=703,
+                               git_step="2026-09-05T02:00:00Z"))
+    # одна история #120 несёт эскалации ОБОИХ PR — как в живом #120
+    # (00:30 для 702, не 01:00: now - 01:00 = ровно 24.0 ч — граница порога,
+    # «<= порога» — ещё не застрял, тест должен сидеть строго внутри семантики)
+    routes[f"issues/{ri.WATCHDOG_ISSUE}/comments"] = [
+        escalation_comment("2026-09-06T00:00:00Z", 701),
+        escalation_comment("2026-09-06T00:30:00Z", 702),
+    ]
+    fake = FakeGh(routes)
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)
+    violations = ri.check_conflict_budget_stuck(
+        REPO, now, pulls, open_task_numbers={700, 703})
+    assert sorted(v["pr"] for v in violations) == [701, 702]
+    watchdog_reads = [c for c in fake.calls if f"issues/{ri.WATCHDOG_ISSUE}/comments" in c]
+    assert len(watchdog_reads) == 1, (
+        f"история #120 обязана читаться ОДИН раз за прогон, прочитано {len(watchdog_reads)}: "
+        f"{watchdog_reads}"
+    )
+
+
+def test_conflict_budget_stuck_watchdog_failure_marks_every_pr_unverified_once(monkeypatch):
+    """История #120 нечитаема — ОБА застрявших PR получают unverified, но
+    падающий fetch выполняется РОВНО ОДИН РАЗ: N повторов заведомо падающего
+    запроса — та же трата квоты, против которой fetch-once и вводился."""
+    pulls = [conflict_pr(701, 700), conflict_pr(702, 703)]
+    routes = stuck_routes()
+    routes.update(stuck_routes(pr_number=702, task_number=703))
+    routes[f"issues/{ri.WATCHDOG_ISSUE}/comments"] = RuntimeError("gh api: rate limited")
+    fake = FakeGh(routes)
+    patch_gh_with_scheduler(monkeypatch, fake)
+    now = utc(2026, 9, 7, 1, 0)
+    raw = ri.check_conflict_budget_stuck(REPO, now, pulls, open_task_numbers={700, 703})
+    assert [item["kind"] for item in raw] == ["unverified", "unverified"]
+    watchdog_reads = [c for c in fake.calls if f"issues/{ri.WATCHDOG_ISSUE}/comments" in c]
+    assert len(watchdog_reads) == 1
+
+
+def test_conflict_budget_stuck_fact_line_names_the_gas():
+    """AGENTS.md, «Алерт не гадает»: строка обязана называть факт (сколько
+    попыток, с какого момента) и ЯВНО назвать газ — дословный текст маркера
+    сброса и номер задачи, куда его писать."""
+    item = {
+        "pr": 701, "task": 700, "attempts": 1, "limit": 1,
+        "escalated_at": "2026-09-06T00:00:00+00:00", "age_hours": 25.0, "overlap": "",
+        "task_open": True,
+    }
+    line = ri.conflict_budget_stuck_fact_line(item)
+    assert "#701" in line
+    assert "#700" in line
+    assert "1/1" in line
+    assert ri.pulse_guard.CONFLICT_BUDGET_RESET_MARKER in line
+    # CONFLICT_BUDGET_RESET_MARKER сам по себе префикс без "]" (issue_marker_
+    # times ищет подстроку) — человеку в алерте обязана достаться СИНТАКСИЧЕСКИ
+    # ЗАКРЫТАЯ конструкция, живая находка при дневном прогоне на #654/#644.
+    assert f"{ri.pulse_guard.CONFLICT_BUDGET_RESET_MARKER} <причина>]" in line
+    assert "git rebase origin/main" in line
+
+
+def test_conflict_budget_stuck_fact_line_closed_task_names_manual_path():
+    """Находка ai-review PR #883: для ЗАКРЫТОЙ задачи обещание «маркер сброса
+    даст ещё одну попытку» — ложь (пул диспатча собирается только из открытых
+    задач, scheduler.main): алерт обязан назвать реальный путь (ручной ребейз,
+    слить/закрыть PR), а не газ, который ничего не сделает."""
+    item = {
+        "pr": 701, "task": 700, "attempts": 1, "limit": 1,
+        "escalated_at": "2026-09-06T00:00:00+00:00", "age_hours": 25.0, "overlap": "",
+        "task_open": False,
+    }
+    line = ri.conflict_budget_stuck_fact_line(item)
+    assert "ЗАКРЫТА" in line
+    assert "слей/закрой PR" in line
+    assert "git rebase origin/main" in line
+    assert ri.pulse_guard.CONFLICT_BUDGET_RESET_MARKER not in line
+
+
+def test_conflict_budget_stuck_not_in_ci_gating():
+    """Наблюдательный (см. блок-комментарий у самой функции) — зависит от
+    истории эскалаций, не от диффа текущего пуша, тот же класс «тормоз без
+    газа», от которого уже отказались для 1/4/5/9/10."""
+    assert 18 not in ri.CI_GATING
+
+
+def test_conflict_budget_stuck_is_escalating():
+    assert 18 in ri.ESCALATING_INVARIANTS
+
+
+def test_conflict_budget_stuck_escalation_is_single_aggregated_comment(monkeypatch):
+    """Задача #875, пункт 3: НЕ по одному комментарию на PR (класс — 27
+    отдельных эскалаций в #120 по одной причине утопили друг друга в
+    истории) — один агрегированный комментарий на весь список сразу."""
+    findings = {18: [
+        {"pr": 701, "task": 700, "attempts": 1, "limit": 1,
+         "escalated_at": "2026-09-06T00:00:00+00:00", "age_hours": 25.0, "overlap": "",
+         "task_open": True},
+        {"pr": 702, "task": 703, "attempts": 1, "limit": 1,
+         "escalated_at": "2026-09-06T01:00:00+00:00", "age_hours": 24.5, "overlap": "",
+         "task_open": True},
+    ]}
+    fake = FakeGh({f"issues/{ri.WATCHDOG_ISSUE}/comments": []})
+    patch_gh(monkeypatch, fake)
+    # Герметичность: без токена/чата send_telegram сама делает best-effort
+    # no-op (см. её докстринг) — на всякий случай убираем оба из окружения,
+    # чтобы тест не зависел от того, что просочилось в процесс pytest.
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    lines = ri.run_escalations(REPO, findings)
+    assert len(lines) == 1
+    posts = fake.mutating_calls()
+    assert len(posts) == 1  # ровно один POST в #120, не два (пункт 3 задачи #875)
+    assert f"issues/{ri.WATCHDOG_ISSUE}/comments" in posts[0]
+    assert "#701" in posts[0]
+    assert "#702" in posts[0]
+
+
+def test_build_report_invariant_18_green_when_no_conflict_pulls(monkeypatch):
+    """Проводка build_report: без конфликтных PR инвариант 18 отчитывается
+    зелёной строкой [18] (живой снимок repo-ci печатает его на каждый пуш)."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "issues/120/comments": [],
+        "search/issues": {"items": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, utc(2026, 9, 10, 12, 0))
+    assert findings[18] == []
+    assert any("💚 [18]" in line for line in lines)
+
+
+def test_build_report_invariant_18_unverified_is_not_green(monkeypatch):
+    """Проводка build_report, доводка ai-review PR #883: сбой чтения виден
+    строкой «не подтверждено», а НЕ зелёным «нет застрявших» — молчаливое
+    «здорово» при нечитаемых данных ровно тот silent-wrong, ради которого
+    unverified и введён."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [conflict_pr(701, 700)],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "issues/701/timeline": conflict_labeled_timeline("2026-09-05T00:00:00Z"),
+        "issues/700/comments": RuntimeError("gh api: unexpected EOF"),
+        "issues/120/comments": [],
+        "search/issues": {"items": []},
+    })
+    patch_gh_with_scheduler(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, utc(2026, 9, 10, 12, 0))
+    assert findings[18] == []  # непроверенное — НЕ нарушение, в эскалацию не попадает
+    assert any("⚠️" in line and "[18]" in line and "не подтверждены" in line for line in lines)
+    assert not any("💚 [18]" in line for line in lines)
