@@ -59,6 +59,31 @@ ISSUE_268_ESCALATION_COMMENT = (
     "через `gh issue view 265 --json state`."
 )
 
+# Прод-форма: комментарий #215/#258 (сняты живым `gh issue view 215/258
+# --comments` при разборе issue #938, дословно) — вторая живая формулировка
+# маркера, «Причина блокировки: #N» вместо «Блокирована: #N». #809 закрыт
+# 2026-09-09; метка `blocked` на #215/#258 не снята никем, потому что старый
+# STALE_MARKER_RE эту формулировку не узнавал.
+ISSUE_215_ESCALATION_COMMENT = (
+    "🔒 Выведена из ротации (blocked): сессия `harness-215` испорчена багом "
+    "#794 (событие журнала без message.id → морда роняет холодную загрузку). "
+    "PR #795 остановил порчу НОВЫХ сессий, но эту не воскрешает — воркер "
+    "падал бы на ней при каждом ходе и крутил предохранитель диспатча. Газ: "
+    "снять blocked, когда закрыт класс-фикс #809 (воркер/морда "
+    "восстанавливаются при битой загрузке) или сессия восстановлена. "
+    "Причина блокировки: #809."
+)
+
+
+def issue_215(labels=("task", "white-spot", "blocked", "stale-unclaimed")):
+    return {
+        "number": 215,
+        "labels": [{"name": name} for name in labels],
+        "body": "тело #215 не участвует в этом тесте",
+        "comments_text": [ISSUE_215_ESCALATION_COMMENT],
+    }
+
+
 # Прод-форма: тело issue #216 (сняты 2026-09-05 живым gh) — три номера союзом
 # «И», БЕЗ маркера «Блокирована: #N». #162 открыт, #163/#164 закрыты на
 # момент снятия — легитимный «живой» кандидат на ложное срабатывание.
@@ -129,6 +154,24 @@ def test_stale_marker_targets_ignores_marker_inside_word():
     слова, не начало строки) не считается названной причиной."""
     texts = ["задача заблокирована: #164"]
     assert sbg.stale_marker_targets(268, texts) == []
+
+
+def test_stale_marker_targets_finds_marker_in_alternate_prichina_blokirovki_form():
+    """Живой случай #215/#258 (issue #938): «Причина блокировки: #N» — вторая
+    формулировка того же маркера, не только «Блокирована: #N»."""
+    assert sbg.stale_marker_targets(215, [ISSUE_215_ESCALATION_COMMENT]) == [809]
+
+
+def test_find_stale_blocked_flags_215_on_prod_form_with_809_closed():
+    """Мутация: #809 закрыт (прод-факт, issue #938) — #215 обязана попасть в
+    отчёт, несмотря на альтернативную формулировку маркера."""
+    violations = sbg.find_stale_blocked([issue_215()], closed_numbers={809})
+    assert violations == [{"number": 215, "stale_refs": [809]}]
+
+
+def test_find_stale_blocked_silent_while_809_still_open():
+    violations = sbg.find_stale_blocked([issue_215()], closed_numbers=set())
+    assert violations == []
 
 
 def test_find_stale_blocked_flags_268_on_prod_form_with_265_closed():

@@ -41,6 +41,7 @@ import hashlib
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 # ── Гейт 1: детерминированное ревью ──────────────────────────────────────────
 REVIEW_OK = "review:ok"
@@ -365,6 +366,44 @@ def list_pages(url: str, gh_func) -> list[dict]:
             break
         page += 1
     return items
+
+
+# ── Кодирование значения метки в query GitHub API (issue #938) ──────────────
+#
+# Класс инцидента: значение метки/query-параметра, подставленное в URL
+# f-строкой БЕЗ кодирования, ломается молча (пустой список вместо ошибки),
+# как только значение несёт символ, значимый для URL-синтаксиса — двоеточие
+# прежде всего, живые метки этого репозитория несут его массово (`waiting:
+# owner`, `review:ok`, `review:large`, `review:large-ok`, `review:changes-
+# requested`, `ai:ok`, `ai:changes-requested`, `ai:failed`, `contract:failed`,
+# `area:*`). Живой случай — `waiting_owner_guard.open_waiting_owner_issues`
+# строил `labels={WAITING_OWNER_LABEL}` (WAITING_OWNER_LABEL = "waiting:owner")
+# без кодирования: GitHub интерпретирует некодированное `:` как часть
+# URL-синтаксиса запроса, а не байт значения фильтра, и тихо не находит
+# совпадений — сервер отвечает `200 []`, не ошибкой. Доказано напрямую API
+# (issue #938): `gh api ".../issues?state=open&labels=waiting:owner"` → `[]`;
+# тот же запрос с `%3A` вместо `:` → список задач. Итог — двое суток детектор
+# ответа владельца не видел НИ ОДНОЙ задачи с меткой `waiting:owner`.
+#
+# Одно место правды на кодирование (не расставлять `quote()` по вызовам):
+# каждый f-string, подставляющий ПЕРЕМЕННОЕ значение метки в query-параметр
+# GitHub API (`labels=`, `q=label:...`, …), обязан пропускать его через
+# label_query_value ниже — гвардия по исходнику
+# (scripts/lib/test_label_query_encoding_guard.py) красит CI на новом месте,
+# забывшем это сделать.
+
+
+def label_query_value(label: str) -> str:
+    """URL-кодирует значение метки для query-параметра GitHub API.
+
+    `quote(label, safe="")` — пустой `safe` кодирует ВСЕ символы вне
+    unreserved-набора RFC 3986 (буквы/цифры/`-`/`_`/`.`/`~`), включая
+    двоеточие и слэш: дефолт `quote()` считает `/` safe, что здесь не
+    годится — имя метки не иерархический путь, а непрозрачное значение
+    (метка вида `type/bug`, которой сегодня в этом репозитории нет, но
+    формат её не запрещает, закодировалась бы наполовину при дефолтном
+    `safe`)."""
+    return quote(label, safe="")
 
 
 def list_timeline(repo: str, number: int, gh_func) -> list[dict]:

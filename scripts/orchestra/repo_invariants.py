@@ -1435,7 +1435,8 @@ def fetch_open_task_issues(repo: str) -> list[dict]:
     вызов молча терял бы задачи за первой сотней открытых issues с меткой task
     (находка гвардии scripts/lib/test_pagination_guard.py на этом же PR)."""
     payload = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(TASK_LABEL)}"
+        "&per_page=100", gh)
     return [issue for issue in payload if "pull_request" not in issue]
 
 

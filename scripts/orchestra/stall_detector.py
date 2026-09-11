@@ -283,7 +283,8 @@ def open_auto_tasks(repo: str) -> list[dict]:
     одностраничный вызов молча терял бы автозадачи за первой сотней открытых
     issues с меткой auto-detected (находка гвардии test_pagination_guard.py)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={AUTO_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(AUTO_LABEL)}"
+        "&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
@@ -351,7 +352,8 @@ def auto_tasks_created_since(repo: str, since: datetime) -> int:
     Постранично (review_labels.list_pages, класс #308) — сырой одностраничный
     вызов молча занижал бы потолок после сотни автозадач за всё время."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=all&labels={AUTO_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=all&labels={review_labels.label_query_value(AUTO_LABEL)}"
+        "&per_page=100", gh)
     return sum(
         1 for issue in issues
         if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
@@ -383,7 +385,8 @@ def _closed_task_reset_times(repo: str) -> dict[str, datetime]:
     (review_labels.list_pages, класс #308) — сырой одностраничный вызов молча
     терял бы точки сброса за первой сотней закрытых автозадач."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=closed&labels={AUTO_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=closed&labels={review_labels.label_query_value(AUTO_LABEL)}"
+        "&per_page=100", gh)
     resets: dict[str, datetime] = {}
     for issue in issues:
         if "pull_request" in issue or not issue.get("closed_at"):

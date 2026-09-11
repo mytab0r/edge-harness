@@ -438,7 +438,8 @@ def open_task_issues(repo: str) -> list[dict]:
     # воркер и планировщик не видели последние 7, без ошибки и без
     # предупреждения.
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(TASK_LABEL)}"
+        "&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 

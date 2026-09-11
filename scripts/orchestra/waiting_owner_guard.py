@@ -269,9 +269,16 @@ def open_task_issues(repo: str) -> list[dict]:
 
 
 def open_waiting_owner_issues(repo: str) -> list[dict]:
-    """Открытые issues (не PR) с меткой `waiting:owner`."""
+    """Открытые issues (не PR) с меткой `waiting:owner`.
+
+    Значение метки идёт через review_labels.label_query_value (issue #938):
+    двоеточие в `waiting:owner`, подставленное в query без кодирования, GitHub
+    молча трактует как синтаксис URL, не байт значения фильтра, — сервер
+    отвечает пустым списком, а не ошибкой (живой инцидент: детектор ответа
+    владельца не видел ни одной задачи двое суток)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={WAITING_OWNER_LABEL}&per_page=100",
+        f"repos/{repo}/issues?state=open&labels="
+        f"{review_labels.label_query_value(WAITING_OWNER_LABEL)}&per_page=100",
         pulse_guard.gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
