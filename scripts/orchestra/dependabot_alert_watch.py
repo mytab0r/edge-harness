@@ -25,10 +25,15 @@ secret scanning алерты не читаются `security-events`, нужен
 PAT» относится к permission `security-events` (код-сканирование), не к
 отдельному `vulnerability-alerts`, который появился позже именно для этого
 случая. `.github/workflows/dependabot-alert-watch.yml` объявляет это право
-явно на уровне job — без него `gh api .../dependabot/alerts` под
-`GITHUB_TOKEN` отвечает 403, что и стало бы видимым fail-loud сигналом
-(`observations`, ниже), если предположение о праве окажется неверным на
-практике.
+явно на уровне job. Живого замера права под `GITHUB_TOKEN` НЕТ (честно, не
+подтверждено): `workflow_dispatch` с ветки PR GitHub не даёт, а прогон с
+default-ветки возможен только ПОСЛЕ мержа — см. пост-мерж проверку в теле
+PR #964. Если предположение неверно, `gh api .../dependabot/alerts` отвечает
+403 — `open_dependabot_alerts` НЕ ловит эту ошибку (см. докстринг
+`dependabot_alert_watch` ниже), она уходит до `main()`, который красит сам
+прогон workflow ненулевым кодом возврата: 403 не может стать тихим ⚠️ в
+зелёном step summary (находка ревью PR #964, критик, блокер 3 — до этой
+правки `main()` возвращал `0` всегда, независимо от исхода).
 
 ## Устройство (тот же скелет, что pulse_guard.failure_watch, #477)
 
@@ -249,15 +254,23 @@ def close_resolved_alert_tasks(repo: str, tracked: dict, open_numbers: set) -> t
 
 def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
     """Один пульс: закрыть решённые, завести новые (в пределах потолка,
-    эскалируя исчерпание раз в календарный день)."""
+    эскалируя исчерпание раз в календарный день).
+
+    `open_dependabot_alerts(repo)` НЕ оборачивается try/except здесь
+    (находка ревью PR #964, критик, блокер 3): это ровно тот запрос, для
+    которого заведено право `vulnerability-alerts: read` — единственный
+    живой способ узнать, что право не работает (403) или транспорт мёртв,
+    это дать вызову упасть. RuntimeError уходит наверх, main() красит
+    прогон ненулевым кодом — без этого 403 стал бы тихим ⚠️ в зелёном
+    step summary НАВСЕГДА (workflow_dispatch с ветки PR недоступен, прогон
+    на default-ветке возможен только ПОСЛЕ мержа — постфактум замер живым
+    правом до мержа никто не проводил, см. тело PR #964/пост-мерж проверку).
+    Постмортем #255 (AGENTS.md): «конвейер простоял сутки при сплошь
+    зелёных прогонах» — тот же класс."""
     observations: list = []
     actions: list = []
 
-    try:
-        alerts = open_dependabot_alerts(repo)
-    except RuntimeError as error:
-        observations.append(f"⚠️ dependabot-alert-watch: список алертов не прочитан ({error})")
-        return observations, actions
+    alerts = open_dependabot_alerts(repo)
     open_numbers = {a["number"] for a in alerts if isinstance(a.get("number"), int)}
 
     try:
@@ -335,11 +348,24 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
-    observations, actions = dependabot_alert_watch(repo, now)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    try:
+        observations, actions = dependabot_alert_watch(repo, now)
+    except RuntimeError as error:
+        text = (
+            f"🚨 dependabot-alert-watch: список алертов не прочитан ({error}) — "
+            "право vulnerability-alerts: read отсутствует или транспорт "
+            "сломан, прогон красный (fail loud, не тихий пропуск, см. "
+            "докстринг dependabot_alert_watch)."
+        )
+        print(text, file=sys.stderr)
+        if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as file:
+                file.write("## dependabot-alert-watch\n\n" + text + "\n")
+        return 1
     lines = ["## dependabot-alert-watch", ""] + observations + actions
     text = "\n".join(lines) + "\n"
     print(text)
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write(text)

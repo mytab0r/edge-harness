@@ -278,5 +278,38 @@ def test_tracked_alert_numbers_ignores_issue_without_marker():
     assert daw.tracked_alert_numbers([plain]) == {}
 
 
+# ── Право/транспорт: 403 на списке алертов обязан красить прогон ───────────
+# (находка ревью PR #964, критик, блокер 3: main() раньше возвращал 0 всегда,
+# независимо от исхода — 403 тонул тихим ⚠️ в зелёном step summary).
+
+def test_dependabot_alert_watch_propagates_alert_list_read_failure(monkeypatch):
+    fake = FakeGh({"dependabot/alerts?state=open": RuntimeError("gh api dependabot/alerts: HTTP 403")})
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="403"):
+        daw.dependabot_alert_watch(REPO, NOW)
+
+
+def test_main_returns_nonzero_when_alert_list_read_fails(monkeypatch):
+    fake = FakeGh({"dependabot/alerts?state=open": RuntimeError("gh api dependabot/alerts: HTTP 403")})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert daw.main() == 1
+
+
+def test_main_returns_zero_on_healthy_run(monkeypatch):
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [],
+        "issues?state=open&labels=dependabot-alert": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert daw.main() == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

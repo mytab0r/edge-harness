@@ -2,9 +2,13 @@
 """Хвост чеклиста ревью наследует область родившего PR — на деле не наследует
 (сирота A, аудит владельца 2026-09-11).
 
-Факт (замер 2026-09-11): за 5 дней `after_merge` (scripts/orchestra/
-scheduler.py) завела 46 задач «Хвост чеклиста ревью PR #N», закрыто — 0.
-Прочитано 7 из 46 целиком: содержимое настоящее (конкретные file:line,
+Факт (замер владельца 2026-09-11, начало аудита): за 5 дней `after_merge`
+(scripts/orchestra/scheduler.py) завела 46 задач «Хвост чеклиста ревью PR
+#N», закрыто — 0. Число растёт с каждым слитым PR, у которого остался
+незакрытый пункт чеклиста — к моменту разбора этого модуля (тот же день,
+несколько часов спустя) было уже 48 открытых, к моменту исполнения
+backfill'а против живого репозитория (см. тело PR #964) — снова другое
+число: снимок, не константа. Прочитано 7 из 46 целиком: содержимое настоящее (конкретные file:line,
 проверяемые находки), не мусор и не дубли — так что дело не в ценности, а
 в приоритете выбора. Тело каждой такой задачи (`review_checklist.
 tail_issue_body`) прямо заявляет:
@@ -207,10 +211,18 @@ def apply_inherited_labels(repo: str, tail_issue: dict):
 
 
 def checklist_tail_labels(repo: str) -> list:
-    try:
-        tails = open_tail_issues(repo)
-    except RuntimeError as error:
-        return [f"⚠️ checklist-tail-labels: список хвостов не прочитан ({error})"]
+    """Список открытых хвостов НЕ оборачивается try/except здесь (находка
+    ревью PR #964, критик, блокер 3): это единственный запрос, отвечающий
+    на вопрос «жив ли механизм вообще» (право issues/pull-requests read у
+    GITHUB_TOKEN, транспорт до GitHub API). RuntimeError уходит наверх,
+    main() красит прогон ненулевым кодом — 403/сеть здесь не может стать
+    тихим ⚠️ в зелёном отчёте (постмортем #255, AGENTS.md: «конвейер простоял
+    сутки при сплошь зелёных прогонах»). Сбой ПО ОДНОМУ хвосту
+    (apply_inherited_labels — PR/задача этого конкретного хвоста не
+    прочитались) остаётся мягким наблюдением: соседние хвосты в том же
+    пульсе читаются независимо, единичный сбой не означает смерть всего
+    механизма."""
+    tails = open_tail_issues(repo)
     lines = []
     for tail in tails:
         try:
@@ -226,10 +238,22 @@ def checklist_tail_labels(repo: str) -> list:
 
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
-    lines = checklist_tail_labels(repo)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    try:
+        lines = checklist_tail_labels(repo)
+    except RuntimeError as error:
+        text = (
+            f"🚨 checklist-tail-labels: список хвостов не прочитан ({error}) — "
+            "право/транспорт сломаны, прогон красный (fail loud, не тихий "
+            "пропуск, см. докстринг checklist_tail_labels)."
+        )
+        print(text, file=sys.stderr)
+        if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as file:
+                file.write("## checklist-tail-labels\n" + text + "\n")
+        return 1
     text = "\n".join(lines) + "\n"
     print(text)
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write("## checklist-tail-labels\n" + text)

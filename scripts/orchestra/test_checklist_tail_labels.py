@@ -214,15 +214,36 @@ def test_checklist_tail_labels_processes_each_open_tail_once(monkeypatch):
     assert any("#928" in line and "нет area" in line for line in lines)
 
 
-def test_checklist_tail_labels_reports_pool_read_failure_loud(monkeypatch):
+def test_checklist_tail_labels_propagates_pool_read_failure(monkeypatch):
+    """Находка ревью PR #964 (критик, блокер 3): чтение списка хвостов —
+    единственный сигнал «жив ли механизм» (право issues read, транспорт) —
+    обязано падать наверх, а не превращаться в мягкое наблюдение. main()
+    (тест ниже) ловит это и красит прогон ненулевым кодом."""
     fake = FakeGh({"issues?state=open&labels=task": RuntimeError("gh api issues: HTTP 503")})
     patch_gh(monkeypatch, fake)
 
-    lines = ctl.checklist_tail_labels(REPO)
+    with pytest.raises(RuntimeError, match="503"):
+        ctl.checklist_tail_labels(REPO)
 
-    assert len(lines) == 1
-    assert "не прочитан" in lines[0]
-    assert "503" in lines[0]
+
+# ── main(): фактический код возврата (мутация — доказывает блокер 3 закрыт) ──
+
+def test_main_returns_nonzero_when_pool_read_fails(monkeypatch):
+    fake = FakeGh({"issues?state=open&labels=task": RuntimeError("gh api issues: HTTP 403")})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert ctl.main() == 1
+
+
+def test_main_returns_zero_on_healthy_run(monkeypatch):
+    fake = FakeGh({"issues?state=open&labels=task": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert ctl.main() == 0
 
 
 if __name__ == "__main__":
