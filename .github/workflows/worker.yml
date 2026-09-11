@@ -19,7 +19,10 @@ on:
           (free_worker_slot), ручной запуск без этого входа занимает слот 1
           по умолчанию (тот же слот, что раньше был единственным).
         required: false
-        type: string
+        type: choice
+        options:
+          - "1"
+          - "2"
         default: "1"
 
 permissions:
