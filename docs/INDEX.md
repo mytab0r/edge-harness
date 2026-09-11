@@ -99,6 +99,9 @@
   `config/provider-usage.json` (openspec/changes/llm-provider-usage-manifest, #823).
 - [Roadmap потоков работ](agents/ROADMAP.md) — живая карта параллельных потоков и
   зависимостей (mermaid-гант); детали задач — в пуле Issues.
+- [Инфраструктура Cloudflare](agents/INFRA-CF.md) — что доступно токену, чем
+  узнать состояние (`scripts/cf/`), что нельзя трогать. Читать до любой работы
+  с CF API/wrangler.
 
 ## Быстрые ответы на частые вопросы
 
