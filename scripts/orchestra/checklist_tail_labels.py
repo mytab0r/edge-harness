@@ -164,12 +164,18 @@ def open_tail_issues(repo: str) -> list:
 def resolve_parent_task(repo: str, pr_number: int):
     """PR #pr_number → номер задачи из пула, тем же единственным источником,
     что везде в репозитории (имя agent-ветки, `task_ref.resolve_pr_task`) —
-    тело PR не читается. `None` — PR не резолвится (ветка не agent-формы,
-    PR не прочитан)."""
-    try:
-        pull = gh(f"repos/{repo}/pulls/{pr_number}")
-    except RuntimeError:
-        return None
+    тело PR не читается. `None` — PR прочитан, но честно не резолвится
+    (ветка не agent-формы). RuntimeError чтения PR (502/503/лимит) НЕ
+    ловится здесь и уходит вызывающему (находка живого AI-ревью PR #964,
+    rework, head bcaf99c4): раньше оба случая — «транспорт сломан» и
+    «ветка не agent-формы» — схлопывались в один и тот же `None`, и
+    `apply_inherited_labels` ставил `INHERITED_MARKER_LABEL` навсегда по
+    транзиентному сбою, а строка отчёта лгала «не agent-ветка», хотя код
+    этого не знал ("Алерт не гадает", AGENTS.md). `apply_inherited_labels`
+    не оборачивает этот вызов, RuntimeError долетает до `checklist_tail_labels`,
+    которая уже репортит ⚠️ по конкретному хвосту БЕЗ маркера — следующий
+    пульс попробует снова."""
+    pull = gh(f"repos/{repo}/pulls/{pr_number}")
     if not pull:
         return None
     return task_ref.resolve_pr_task(pull)

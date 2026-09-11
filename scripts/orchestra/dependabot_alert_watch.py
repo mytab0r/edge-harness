@@ -207,9 +207,12 @@ def alert_task_body(alert: dict) -> str:
     html_url = alert.get("html_url", "")
     return (
         f"## Цель\n"
-        f"Алерт безопасности Dependabot #{alert['number']} по пакету "
-        f"`{_package_name(alert)}` больше не в состоянии `open` (пофикшен, "
-        "задизмиссен вручную или устарел).\n\n"
+        f"Пока алерт безопасности Dependabot #{alert['number']} по пакету "
+        f"`{_package_name(alert)}` в состоянии `open` — эта задача ждёт "
+        "(находка ai-review PR #964: тело не должно лгать в настоящем "
+        "времени, что алерт уже пофикшен, — на момент создания задачи он "
+        "ещё open). Как только он станет `fixed`/`dismissed`/устареет — "
+        "задача закроется сама.\n\n"
         "## Критерий готовности\n"
         f"Алерт #{alert['number']} не `open` — эта задача закрывается "
         "автоматически тем же наблюдателем (dependabot_alert_watch.py), "
@@ -276,9 +279,19 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
     try:
         pool_issues = open_dependabot_task_issues(repo)
     except RuntimeError as error:
+        # Находка живого AI-ревью PR #964 (rework, head bcaf99c4): подмена
+        # сбоя чтения пустым списком (`pool_issues = []`) обнуляла дедуп
+        # (`tracked`), и цикл заведения ниже продолжал работать как будто
+        # ни один алерт ещё не отслежен — транзиентный 503 на списке задач
+        # заводил дубль уже существующей задачи. Тот же приём, что
+        # pulse_guard.failure_watch на сбое чтения списка прогонов workflow
+        # (see `except RuntimeError: ... continue`): не знаем состав
+        # tracked — не гадаем, что он пуст, пропускаем весь пульс заведения/
+        # закрытия целиком ("Алерт не гадает", AGENTS.md).
         observations.append(
-            f"⚠️ dependabot-alert-watch: список задач {DEPENDABOT_ALERT_LABEL} не прочитан ({error})")
-        pool_issues = []
+            f"⚠️ dependabot-alert-watch: список задач {DEPENDABOT_ALERT_LABEL} не прочитан ({error}) — "
+            "дедуп недоступен, этот пульс не заводит и не закрывает задачи")
+        return observations, actions
     tracked = tracked_alert_numbers(pool_issues)
 
     close_obs, close_actions = close_resolved_alert_tasks(repo, tracked, open_numbers)

@@ -155,6 +155,27 @@ def test_dependabot_alert_watch_does_not_duplicate_tracked_alert(monkeypatch):
                    for c in fake.calls)
 
 
+def test_dependabot_alert_watch_skips_pulse_when_pool_read_fails(monkeypatch):
+    """Находка живого AI-ревью PR #964 (rework, head bcaf99c4): раньше сбой
+    чтения списка задач `pool_issues = []` подменял пустым списком — дедуп
+    `tracked` обнулялся, и уже отслеженный алерт #1 (задача #500) получал
+    ДУБЛЬ. Правильное поведение — тот же приём, что pulse_guard.failure_watch
+    на сбое чтения списка прогонов: не знаем tracked — не заводим и не
+    закрываем ничего в этом пульсе."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [REAL_SHARP_ALERT],  # алерт #1 уже открыт и уже отслежен
+        "issues?state=open&labels=dependabot-alert": RuntimeError("gh api issues: HTTP 503"),
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []
+    assert any("503" in o for o in observations)
+    assert not any("POST" in c and "repos/mytab0r/edge-harness/issues" in c and "labels" not in c
+                   for c in fake.calls)
+
+
 def test_dependabot_alert_watch_creates_task_for_new_alert(monkeypatch):
     created = {"number": 700}
     fake = FakeGh({

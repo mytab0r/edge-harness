@@ -182,6 +182,40 @@ def test_apply_inherited_labels_pr_not_agent_branch_marks_without_area(monkeypat
     assert f"labels[]={ctl.INHERITED_MARKER_LABEL}" in label_calls[0]
 
 
+def test_apply_inherited_labels_transient_pr_read_failure_does_not_mark(monkeypatch):
+    """Находка живого AI-ревью PR #964 (rework, head bcaf99c4): 502/503 на
+    чтении PR раньше схлопывался в тот же `None`, что и «ветка не
+    agent-формы» — хвост получал INHERITED_MARKER_LABEL НАВСЕГДА по
+    транзиентному сбою. Правильное поведение — RuntimeError долетает до
+    checklist_tail_labels() как мягкое наблюдение по этому хвосту, БЕЗ
+    маркера, чтобы следующий пульс попробовал снова."""
+    tail = tail_issue(903, 942)
+    fake = FakeGh({"pulls/942": RuntimeError("gh api pulls/942: HTTP 502")})
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="502"):
+        ctl.apply_inherited_labels(REPO, tail)
+
+    label_calls = [c for c in fake.calls if "issues/903/labels" in c]
+    assert label_calls == []  # ни разу не поставлен маркер по сбою чтения
+
+
+def test_checklist_tail_labels_reports_transient_pr_read_failure_without_marking(monkeypatch):
+    tail = tail_issue(903, 942)
+    fake = FakeGh({
+        "issues?state=open&labels=task": [tail],
+        "pulls/942": RuntimeError("gh api pulls/942: HTTP 502"),
+    })
+    patch_gh(monkeypatch, fake)
+
+    lines = ctl.checklist_tail_labels(REPO)
+
+    assert len(lines) == 1
+    assert "#903" in lines[0] and "502" in lines[0]
+    label_calls = [c for c in fake.calls if "issues/903/labels" in c]
+    assert label_calls == []
+
+
 # ── Мутация, доказывающая гвардию: без фильтра NON_INHERITABLE_LABELS/
 # отбора по префиксу area: сервисные метки родителя (review:ok, blocked,
 # auto-detected) утекли бы в хвост как «область» — снять фильтр (заменить
