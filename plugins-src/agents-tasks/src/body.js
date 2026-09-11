@@ -39,6 +39,7 @@ const { Button, StateDot, IconExternalLink, IconRefreshCw, IconChevronDown, Icon
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_REPO = "mytab0r/edge-harness"; // TODO: сделать настраиваемым через env или манифест
 const TASK_LABEL = "task";
+const GITHUB_PAGE_SIZE = 100; // максимум issues за один запрос; упор в него = «показана свежая часть пула»
 
 const JOURNAL_PAGE_SIZE = 20;
 // Путь — ПРОКСИ СТОРОНЫ МОРДЫ (/api/harness/* → журнал edge-harness, белое
@@ -94,14 +95,6 @@ const POLL_INTERVAL_MS = 90000;
 
 // ── Утилиты ────────────────────────────────────────────────────────────────────
 
-function formatRelativeTime(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 60000) return "только что";
-  if (diff < 3600000) return Math.floor(diff / 60000) + " мин назад";
-  if (diff < 86400000) return Math.floor(diff / 3600000) + " ч назад";
-  return Math.floor(diff / 86400000) + " дн назад";
-}
-
 function formatTimestamp(ts) {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
@@ -137,7 +130,7 @@ async function fetchGitHubIssues() {
   const params = new URLSearchParams({
     state: 'all',
     labels: TASK_LABEL,
-    per_page: '30',
+    per_page: String(GITHUB_PAGE_SIZE),
     sort: 'updated',
     direction: 'desc',
   });
@@ -409,24 +402,28 @@ function AgentsTasksSection(props) {
   // эффект автозагрузки ниже) — переживает ре-рендер, не зависит от `tasks`.
   const attemptedRef = useRef(new Set());
 
-  // Внутренняя функция загрузки событий для задачи (возвращает события и
-  // статус). Единственная каноническая форма task_id продюсера —
-  // `issue-<N>` (дефис, без двоеточия/решётки): scripts/worker/task.sh:370
-  // (`"task_id":"issue-$number"`), scripts/hands/dsh_task.sh:183 матчит
-  // ровно `^issue-([0-9]+)$`. Находка ревью PR #412: четыре угаданные формы
-  // (`issue:#N`, `task:#N`, `#N`, голое число) не совпадают с продюсером
-  // НИ ОДНА — молчаливое «Событий пока нет» на реальной задаче.
-  //
-  // Честный предел (пока не закрыт отдельной задачей из ревью): под
-  // `issue-<N>` воркер пишет события job'а (job_start/job_end — статусы
-  // running/done/failed), но НЕ task_queued/task_dispatched — их пишет
-  // только UUID-очередь морды, поэтому статус «queued» для issue-задач
-  // не появится. Пул задач, ещё не взятых воркером, честно показывает
-  // `unknown`.
+  // Честная раскладка продюсеров под `issue-<N>` (сверено с источниками,
+  // находка ревью PR #412, раунд 3 — предыдущая формулировка «воркер пишет
+  // job-события» была ВЕРНОЙ ТОЛЬКО ДЛЯ HANDS-КАНАЛА и вводила в заблуждение):
+  //  - hands-канал — заказ «поработай над issue-N» (TASK_ID=issue-N,
+  //    scripts/hands/dsh_task.sh:211) — пишет под `issue-<N>` весь батч
+  //    job'а (add_event/flush_events): job_start/session_event/job_end.
+  //    Для этих задач running/done/failed работают;
+  //  - воркерский канал (scripts/worker/task.sh) в журнал не пишет ВОВСЕ —
+  //    только heartbeat на /api/heartbeat; first_heartbeat журналируется
+  //    лишь для задач мордочной очереди (строку в tasks создаёт
+  //    POST /api/tasks с UUID-ключом), под `issue-<N>` его не бывает.
+  //  Итог: для основного потока пула — задач, взятых автономным воркером, —
+  //  здесь честно возвращается пустой список, и секция показывает
+  //  `unknown`/«Событий пока нет». Продюсер job_start/job_end для воркера —
+  //  задача #916, не этот PR.
   const loadTaskEventsInternal = useCallback(async (taskNumber) => {
     const events = await fetchAllJournalEvents(`issue-${taskNumber}`);
 
-    // Определяем статус из последних событий задачи
+    // Определяем статус из последних системных событий (ветки reachable
+    // только для hands-канала, см. раскладку продюсеров выше;
+    // task_queued/task_dispatched/first_heartbeat под `issue-<N>` не
+    // встречаются — рендерятся как события, статус не меняют).
     let status = 'unknown';
     const taskEvents = events.filter(e => e.kind !== 'session_event' && e.kind !== 'plugin_status');
     if (taskEvents.length > 0) {
@@ -590,7 +587,13 @@ function AgentsTasksSection(props) {
       h(IconMessageSquare, { size: 32, style: { opacity: 0.4 } }),
       t('noTasks'),
       h('p', { style: { margin: 0, fontSize: '12px' } }, t('noTasksHint'))
-    ) : h('ul', { style: styles.list, 'aria-label': t('title') },
+    ) : h('div', null,
+      // Список режется одной страницей GitHub API (GITHUB_PAGE_SIZE):
+      // упор в неё = показана самая свежая часть пула, не весь пул —
+      // говорим это вслух, а не молча обрезаем (находка ревью PR #412).
+      tasks.length >= GITHUB_PAGE_SIZE && h('div',
+        { style: { fontSize: '11px', color: 'var(--dsh-text-3, #6b6b6b)' } }, t('listCapped')),
+      h('ul', { style: styles.list, 'aria-label': t('title') },
       tasks.map(task => h(TaskRow, {
         key: task.issue.number,
         task,
@@ -600,6 +603,7 @@ function AgentsTasksSection(props) {
         onToggleExpand: handleToggleExpand,
         t,
       }))
+      )
     )
   );
 }
@@ -656,6 +660,7 @@ const dictionaries = {
     loadingEvents: 'Loading events…',
     noTasks: 'No tasks found',
     noTasksHint: 'Issues with label "task" will appear here',
+    listCapped: 'Showing the most recently updated part of the pool — the full list lives on GitHub',
     noEvents: 'No events yet',
     expand: 'Expand',
     collapse: 'Collapse',
@@ -692,6 +697,7 @@ const dictionaries = {
     loadingEvents: '加载事件中…',
     noTasks: '未找到任务',
     noTasksHint: '带有 "task" 标签的 Issue 将显示在这里',
+    listCapped: '显示的是最近更新的部分任务 — 完整列表见 GitHub',
     noEvents: '暂无事件',
     expand: '展开',
     collapse: '折叠',
@@ -728,6 +734,7 @@ const dictionaries = {
     loadingEvents: 'Загрузка событий…',
     noTasks: 'Задачи не найдены',
     noTasksHint: 'Issue с меткой "task" появятся здесь',
+    listCapped: 'Показана самая свежая часть пула — весь список в GitHub',
     noEvents: 'Событий пока нет',
     expand: 'Развернуть',
     collapse: 'Свернуть',

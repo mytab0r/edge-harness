@@ -9,16 +9,18 @@
 - **Список задач из GitHub Issues** — запрос
   `GET /repos/{owner}/{repo}/issues?labels=task` (без токена). Показываются:
   номер, заголовок, статус (из журнала), исполнитель, ссылки на Issue/PR.
+  Одна страница на запрос (100, максимум GitHub): упор в неё = показана
+  самая свежая часть пула, и секция говорит это подсказкой, а не молчит.
 - **Лента событий журнала** — по клику на задачу раскрывается лента
   `GET /api/harness/events?task_id=issue-{number}&limit=20&after=...` с проходом
   до конца выборки (`has_more`/`next_after`). `issue-{number}` — ЕДИНСТВЕННАЯ
   каноническая форма task_id продюсера (`scripts/worker/task.sh`,
   `scripts/hands/dsh_task.sh`), без вариантов. Путь — прокси стороны морды
   (патч 0005), same-origin `/api/events` — чужой API морды, не журнал.
-  - Системные события: `job_start`, `job_end`, `first_heartbeat`,
-    `dispatch_failed` — определяют статус задачи; `task_queued`/
-    `task_dispatched` в словаре есть, но под `issue-<N>` не пишутся
-    (см. «Честные пробелы»).
+  - Системные события: `job_start`, `job_end`, `dispatch_failed` —
+    определяют статус задачи; `task_queued`/`task_dispatched`/
+    `first_heartbeat` рендерятся как события, статус не меняют — и под
+    `issue-<N>` не встречаются (см. «Честные пробелы»).
   - События `session_event` (от `dsh-hands-streamer`, задача #69) парсятся как чат:
     `think` (agent/request), `tool/call`, `tool/result`, `assistant/message`.
 - **Поллинг** — один цикл, каждые 90 с: и список задач (GitHub API), и журнал
@@ -38,14 +40,21 @@
   `GET /api/harness/events`) закрывает белое пятно #105 только для REST —
   WebSocket-путь им не покрыт вовсе. Продюсер живого стрима через прокси
   морды — отдельная задача из ревью PR #412; сейчас всё живёт на поллинге 90 с.
-- **Статус `queued`/`dispatched` для issue-задач не появится.** Под `issue-<N>`
-  пишется весь батч job'а (`job_start`/`session_event`/`job_end` —
-  `scripts/hands/dsh_task.sh::flush_events`, задача воркера бьётся heartbeat'ом
-  `scripts/worker/task.sh`), поэтому `running`/`done`/`failed` работают. Но
-  `task_queued`/`task_dispatched` пишет только UUID-очередь морды
-  (`cf-worker/src/harness.ts`) — эти статусы относятся к задачам мордочной
-  очереди, не к issue. Пул задач, ещё не взятых воркером, честно показывает
-  `unknown`.
+- **Журнал для задач, взятых автономным воркером, пуст — статусы
+  running/done/failed работают только для hands-канала.** Два канала
+  исполнителей пишут в журнал по-разному. Hands-канал — заказ «поработай
+  над issue-N» (`TASK_ID=issue-N`, `scripts/hands/dsh_task.sh:211`) —
+  пишет под `issue-<N>` весь батч job'а (`add_event`/`flush_events`:
+  job_start/session_event/job_end), для него статусы работают. Воркерский
+  канал (`scripts/worker/task.sh`) в журнал не пишет ВОВСЕ — только
+  heartbeat (`/api/heartbeat`); `first_heartbeat` журналируется только для
+  задач мордочной очереди (строку в таблице `tasks` создаёт
+  `POST /api/tasks` с UUID-ключом, `cf-worker/src/harness.ts`), под
+  `issue-<N>` его не бывает. Итог: для основного потока пула — задач,
+  взятых воркером, — секция честно показывает `unknown` и «Событий пока
+  нет». Продюсер job_start/job_end для воркера — задача #916 (из ревью
+  PR #412), не этот плагин; `queued`/`dispatched` под `issue-<N>` не
+  встречаются вовсе — их пишет только UUID-очередь морды.
 - **Двойная регистрация слота — не fallback.** Секция регистрируется
   безусловно в оба слота (`sidebar.section` и `settings.section`): клиентский
   API не позволяет проверить наличие слота перед регистрацией, а
@@ -103,7 +112,7 @@
 гвардия каталога в `build.mjs` без записи падает (`FORGE_EXTRA_PLUGIN`
 подставляется только в дым, не в сборку). Релиз v0.1.1 собран с временной
 локальной записью, как описано выше; бутстрап форжа — задача #914.
-(Релиз v0.1.1 протух: собран до снятия inject-декларации
+(Релизы v0.1.1/v0.1.2 протухли: v0.1.1 собрана до снятия inject-декларации
 `@deepseek-ai/dsh-client-runtime`, на деплое упал бы на assemble, #518 —
 живет только в истории, запись манифеста на него не смотрит.)
 
@@ -118,8 +127,11 @@
 node --test plugins-src/agents-tasks/test/client.test.mjs
 ```
 
-Шаг подключён в `.github/workflows/repo-ci.yml` рядом с plugin-manager —
-критерий #407 «клиентские тесты зелёные в repo-ci» выполняется этим шагом.
+Шаг зарегистрирован каталогом гвардий — файл
+`scripts/ci/guards/agents-tasks-client-tests.sh` (#749), исполняется
+перебором `scripts/ci/run_guards.sh` в repo-ci: критерий #407 «клиентские
+тесты зелёные в repo-ci» выполняется этим шагом (рукописные шаги в
+repo-ci.yml заморожены — механизм #749).
 
 Поведенческая гвардия (`test/client.test.mjs`, `node --test`, без
 зависимостей): обёртка бандла, монтаж в ОБОИХ слотах (потеря
