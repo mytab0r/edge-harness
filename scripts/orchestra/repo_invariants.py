@@ -204,6 +204,37 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       второй ручной тормоз. Наблюдательный, не в CI_GATING: замер долга на
       живом репозитории на момент внедрения ещё не сделан (тот же порядок,
       что у 1/5/9/10/12/13/14).
+  16. check_wip_gate_false_zero (дефект A, watchdog-issue #120, 2026-09-11):
+      WIP-гейт (scheduler.wip_gate) объявил в #120 состояние «доработки
+      нет/меньше лимита», хотя независимый пересчёт ТЕМ ЖЕ критерием
+      (scheduler.pr_needs_rework) по свежему снимку открытых PR даёт число,
+      которое перевернуло бы решение допуска на противоположное. Живой
+      случай: `⏸️ ... 25 ≥ лимита 12` в 10:02:44Z → `✅ ... 0 < 12` в
+      10:25:27Z в комментариях #120, при этом живой пересчёт тем же
+      критерием в тот же день дал 27, не 0 — гейт пропустил диспатч новой
+      задачи на ложном нуле. Корень (review_labels.list_pages молча
+      трактовал не-list ответ GitHub как честную короткую страницу, класс
+      #308) починен отдельно — list_pages теперь fail loud. Этот инвариант
+      ловит РЕЦИДИВ того же наблюдаемого симптома независимо от причины —
+      тот же принцип, что уже применён в инварианте 8. Freshness-окно
+      (WIP_GATE_FALSE_ZERO_WINDOW_MINUTES) — маркер несёт число, актуальное
+      на момент своей публикации, сравнение с произвольно старым маркером
+      было бы гаданием (AGENTS.md «алерт не гадает»), не фактом.
+      Наблюдательный, не в CI_GATING: тот же порядок, что у 8/9/10/12/14 —
+      измерение долга на живом репозитории ещё не сделано отдельно от
+      самого факта внедрения.
+
+      Формула — буква ТЗ #948 п.4 (находка ревью PR #950, третий проход):
+      кроме переворота решения допуска (claimed_closes_gate !=
+      actual_closes_gate — гейт открылся/закрылся не тем решением, что дал
+      бы независимый пересчёт), отдельная ветка ловит буквальный «ложный
+      ноль» — claimed == 0, actual > 0 — даже когда оба числа лежат ниже
+      лимита и решение допуска СОВПАДАЕТ (гейт остаётся открыт в обоих
+      случаях). Раньше это молчало: claimed=0/actual=1..11 не переворачивает
+      допуск, но маркер «доработки нет» при живых PR в доработке — тот же
+      симптом из названия дефекта, просто не докатившийся до лимита. Оба
+      числа — факты одного и того же прогона (маркер + independent
+      пересчёт), не гипотезы — «алерт не гадает» не нарушается.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -1911,6 +1942,92 @@ def check_merge_reaction_gaps(
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 16 (дефект A, watchdog-issue #120, 2026-09-11): WIP-гейт
+# заявил в #120 состояние, перевёрнутое относительно независимого пересчёта
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой случай: `⏸️ ... 25 ≥ лимита 12` в 10:02:44Z → `✅ ... 0 < 12` в
+# 10:25:27Z в комментариях #120, при этом живой пересчёт тем же критерием в
+# тот же день дал 27, не 0 — гейт пропустил диспатч новой задачи на ложном
+# нуле. Корень (review_labels.list_pages молча трактовал не-list ответ
+# GitHub как честную короткую страницу, класс #308) починен отдельно (см.
+# scripts/lib/review_labels.py) — list_pages теперь fail loud. Этот
+# инвариант ловит РЕЦИДИВ того же НАБЛЮДАЕМОГО симптома независимо от
+# причины (не только list_pages: любой будущий источник искажённого снимка
+# PR дал бы то же расхождение между заявленным и пересчитанным count) — тот
+# же принцип, что уже применён в инварианте 8 (check_wasted_ai_review_runs).
+#
+# Freshness-окно, не сравнение с произвольно старым маркером: маркер несёт
+# число, актуальное НА МОМЕНТ своей публикации, а открытые PR естественно
+# мержатся/появляются между пульсами (~1.6-1.8 PR/час, см. докстринг
+# scheduler.WIP_LIMIT) — сравнение старого маркера с текущим снимком было бы
+# гаданием (AGENTS.md «алерт не гадает»), не фактом. Окно — 2 такта cron
+# orchestra.yml (15 мин) с запасом: маркер этого или прошлого пульса всё ещё
+# описывает состояние, которое НЕ должно было успеть измениться настолько,
+# чтобы перевернуть решение допуска (13 PR не мержатся/не открываются за
+# 30 минут при наблюдаемом темпе).
+WIP_GATE_FALSE_ZERO_WINDOW_MINUTES = 30
+
+_WIP_GATE_COUNT_RE = re.compile(r"ждущих доработки:\s*(\d+)")
+
+
+def check_wip_gate_false_zero(now: datetime, wip_markers: list[tuple[datetime, str]],
+                               open_pulls: list[dict]) -> list[dict]:
+    """Чистая функция (без сети — `wip_markers`/`open_pulls` уже прочитаны IO
+    ниже, `now` — инъекция, не `datetime.now()`).
+
+    `wip_markers` — (время, тело) комментариев #120 с маркером
+    scheduler.WIP_GATE_OPEN_MARKER ИЛИ scheduler.WIP_GATE_CLOSE_MARKER
+    (issue_markers_any); берём только САМЫЙ СВЕЖИЙ (`max` по времени) — это
+    и есть текущее заявленное состояние гейта, более старые — уже закрытые
+    эпизоды. Маркер старше WIP_GATE_FALSE_ZERO_WINDOW_MINUTES не
+    сравнивается вовсе (см. блок-комментарий выше — сравнение с устаревшим
+    числом было бы гаданием).
+
+    `open_pulls` — независимый снимок (fetch_open_pulls этого же прогона,
+    отдельный HTTP-обход от того, что видел scheduler в момент публикации
+    маркера) — именно НЕЗАВИСИМОСТЬ обхода делает эту проверку кросс-
+    проверкой класса, а не пересказом одного и того же вызова.
+
+    Формула ловит ДВА разных наблюдаемых симптома одного дефекта (буква ТЗ
+    #948 п.4, находка ревью PR #950 третий проход, см. блок-комментарий у
+    инварианта 16 выше): (а) переворот решения допуска — маркер и независимый
+    пересчёт расходятся в том, закрывает ли число гейт; (б) буквальный
+    «ложный ноль» — маркер объявил claimed=0, а пересчёт нашёл живые PR в
+    доработке (actual>0), даже если оба числа ниже лимита и решение допуска
+    формально совпадает."""
+    if not wip_markers:
+        return []
+    latest_at, latest_body = max(wip_markers, key=lambda item: item[0])
+    if minutes_between(latest_at, now) > WIP_GATE_FALSE_ZERO_WINDOW_MINUTES:
+        return []  # маркер не про текущее состояние — сравнивать не с чем
+    match = _WIP_GATE_COUNT_RE.search(latest_body)
+    if not match:
+        return []
+    claimed = int(match.group(1))
+    actual = sum(1 for pull in open_pulls if scheduler.pr_needs_rework(pull))
+    claimed_closes_gate = claimed >= scheduler.WIP_LIMIT
+    actual_closes_gate = actual >= scheduler.WIP_LIMIT
+    literal_false_zero = claimed == 0 and actual > 0
+    if claimed_closes_gate == actual_closes_gate and not literal_false_zero:
+        return []
+    return [{
+        "marker_at": latest_at.isoformat(),
+        "claimed_count": claimed,
+        "actual_count": actual,
+        "limit": scheduler.WIP_LIMIT,
+    }]
+
+
+def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
+    """(время, тело) всех комментариев #120 с любым из двух маркеров
+    WIP-гейта (issue_markers_any, #308-обход внутри) — один обход на оба
+    маркера, не два отдельных запроса."""
+    return issue_markers_any(
+        repo, WATCHDOG_ISSUE, (scheduler.WIP_GATE_OPEN_MARKER, scheduler.WIP_GATE_CLOSE_MARKER))
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2189,6 +2306,20 @@ def build_report(repo: str, now: datetime,
                 target = item["workflow"] or "файлы PR (fetch)"
                 lines.append(f"   — PR #{item['pr']}: {target} — {item['error']}")
 
+    wip_markers = fetch_wip_gate_markers(repo)
+    v16 = check_wip_gate_false_zero(now, wip_markers, open_pulls)
+    findings[16] = v16
+    if v16:
+        item = v16[0]
+        lines.append(
+            f"🚨 [16] WIP-гейт (#120, {item['marker_at']}) заявил {item['claimed_count']} PR "
+            f"в доработке, независимый пересчёт по текущим открытым PR даёт "
+            f"{item['actual_count']} (лимит {item['limit']}) — решения о допуске "
+            "диспатча расходятся (класс watchdog-issue #120, живой случай 2026-09-11)"
+        )
+    else:
+        lines.append("💚 [16] заявленное и пересчитанное число PR, ждущих доработки, согласованы")
+
     return lines, findings
 
 
@@ -2201,7 +2332,7 @@ def summary(lines: list[str]) -> None:
             file.write(text)
 
 
-ESCALATING_INVARIANTS = (1, 3, 12, 15)
+ESCALATING_INVARIANTS = (1, 3, 12, 15, 16)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -2287,6 +2418,22 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 15, key, text)
         if result:
             lines.append(f"📣 инвариант 15 эскалирован: {result}")
+    if findings.get(16):
+        item = findings[16][0]
+        key = f"{item['marker_at']}:{item['claimed_count']}:{item['actual_count']}"
+        text = (
+            "🚨 edge-harness: инвариант 16 (WIP-гейт объявил ложное состояние, "
+            f"класс watchdog-issue #120) — маркер #120 от {item['marker_at']} заявил "
+            f"{item['claimed_count']} PR в доработке, независимый пересчёт по текущим "
+            f"открытым PR даёт {item['actual_count']} (лимит {item['limit']}) — "
+            "решения о допуске диспатча новых задач расходятся. Живой случай "
+            "2026-09-11: корень (review_labels.list_pages молча трактовал не-list "
+            "ответ GitHub как честную короткую страницу) починен, это — детектор "
+            "рецидива того же наблюдаемого симптома по любой причине."
+        )
+        result = escalate_if_new(repo, 16, key, text)
+        if result:
+            lines.append(f"📣 инвариант 16 эскалирован: {result}")
     return lines
 
 

@@ -161,6 +161,10 @@ def test_send_telegram_always_sends_parse_mode_and_escapes_plain(monkeypatch):
     # "--data-urlencode parse_mode=HTML" или экранирование — тест краснеет.
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    # Дефект «прод-запись только внутри GitHub Actions» (2026-09-11): вне CI
+    # send_telegram теперь дефолтно DRY-RUN — эти тесты проверяют транспорт
+    # (curl/HTML-экранирование), не режим записи, поэтому явно поднимают флаг.
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
@@ -177,6 +181,10 @@ def test_send_telegram_always_sends_parse_mode_and_escapes_plain(monkeypatch):
 def test_send_telegram_as_html_passes_markup_verbatim(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    # Дефект «прод-запись только внутри GitHub Actions» (2026-09-11): вне CI
+    # send_telegram теперь дефолтно DRY-RUN — эти тесты проверяют транспорт
+    # (curl/HTML-экранирование), не режим записи, поэтому явно поднимают флаг.
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
@@ -192,6 +200,10 @@ def test_send_telegram_with_reply_markup_passes_json_keyboard(monkeypatch):
     # действительно уходит в тот же curl-запрос сериализованным JSON.
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    # Дефект «прод-запись только внутри GitHub Actions» (2026-09-11): вне CI
+    # send_telegram теперь дефолтно DRY-RUN — эти тесты проверяют транспорт
+    # (curl/HTML-экранирование), не режим записи, поэтому явно поднимают флаг.
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
@@ -207,12 +219,158 @@ def test_send_telegram_without_reply_markup_does_not_add_the_flag(monkeypatch):
     # вызовы (escalate без options) не должны нести пустой/None reply_markup.
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    # Дефект «прод-запись только внутри GitHub Actions» (2026-09-11): вне CI
+    # send_telegram теперь дефолтно DRY-RUN — эти тесты проверяют транспорт
+    # (curl/HTML-экранирование), не режим записи, поэтому явно поднимают флаг.
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
                             returncode=0, stderr="")))
     assert pg.send_telegram("обычный алерт") is True
     assert "reply_markup" not in " ".join(calls[0][0])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Прод-запись только внутри GitHub Actions (2026-09-11, находка владельца)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Замер: watchdog-issue #120 несёт 112 из 573 комментариев (19.5%) от логина
+# mytab0r, не github-actions[bot] — единственный документированный путь
+# вызова scheduler.py (orchestra.yml) держит GH_TOKEN=github.token весь
+# процесс, который ВСЕГДА атрибутируется как github-actions[bot]. Комментарий
+# от mytab0r значит: чей-то `python scheduler.py` запущен вне этого workflow,
+# личным токеном владельца, способным слить PR/задиспетчить воркера в обход
+# `concurrency: group: orchestra`. Живая гонка: в 10:57:29Z 2026-09-11 шёл
+# настоящий прогон orchestra (run 34591704645, actor github-actions[bot]), и
+# в 10:57:56Z — пока он ЕЩЁ ВЫПОЛНЯЛСЯ — инстанс от mytab0r написал маркер
+# закрытия WIP-эпизода.
+#
+# Тесты ниже зовут РЕАЛЬНЫЕ pg.gh/pg.send_telegram (не FakeGh-подмену) — это
+# единственный способ проверить сам гейт, а не логику решений поверх него
+# (для той логики FakeGh уже используется везде в остальном файле).
+
+
+def _clear_ci_env(monkeypatch):
+    """Явно снимает ВСЕ три сигнала независимо от окружения, в котором
+    реально гоняются тесты (в т.ч. когда pytest сам запущен ВНУТРИ
+    GitHub Actions, repo-ci.yml — тогда GITHUB_ACTIONS/GITHUB_RUN_ID УЖЕ
+    стоят в окружении раннера, и тест без явного delenv тестировал бы не то,
+    что заявляет)."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(pg.ALLOW_PROD_WRITES_ENV, raising=False)
+
+
+def test_in_github_actions_requires_both_signals(monkeypatch):
+    _clear_ci_env(monkeypatch)
+    assert pg.in_github_actions() is False
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert pg.in_github_actions() is False  # один признак недостаточен (см. докстринг)
+    monkeypatch.setenv("GITHUB_RUN_ID", "123456")
+    assert pg.in_github_actions() is True
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert pg.in_github_actions() is False  # GITHUB_RUN_ID один тоже недостаточен
+
+
+def test_prod_writes_allowed_matrix(monkeypatch):
+    _clear_ci_env(monkeypatch)
+    assert pg.prod_writes_allowed() is False  # вне CI, без явного флага — заблокировано
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
+    assert pg.prod_writes_allowed() is True  # явный локальный прогон
+    monkeypatch.delenv(pg.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    assert pg.prod_writes_allowed() is True  # легитимный CI-прогон (событие ИЛИ DO-диспатч)
+
+
+def test_gh_dry_run_skips_write_call_outside_ci(monkeypatch):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (часть 1 — «без газа не уходит»): мок
+    HTTP-слоя (subprocess.run) не получает НИ ОДНОГО вызова — изменяющий
+    `gh()` вне CI не касается сети вовсе, не просто «возвращает пусто» после
+    настоящего запроса.
+
+    До находки ревью PR #950 (третий проход) отказ гейта возвращал None —
+    неотличимо от честного пустого ответа сервера, поэтому escalate()/
+    post_issue_comment() рапортовали успех, ничего не отправив. Теперь отказ
+    наблюдаем: WriteGateSkipped, не немой None."""
+    _clear_ci_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+            returncode=0, stdout="{}", stderr="")))
+    with pytest.raises(pg.WriteGateSkipped):
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+    assert calls == []  # subprocess.run НЕ вызван вовсе
+
+
+def test_gh_executes_write_call_inside_ci(monkeypatch):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (часть 2 — «с газом уходит»): тот же вызов
+    внутри GitHub Actions реально доходит до subprocess.run."""
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "34591704645")
+    calls = []
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+            returncode=0, stdout="{}", stderr="")))
+    result = pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+    assert len(calls) == 1
+    assert result == {}
+
+
+def test_gh_executes_write_call_with_explicit_local_override(monkeypatch):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (часть 3 — «явный флаг-исключение»): вне CI,
+    но с ALLOW_PROD_WRITES_ENV=1, вызов уходит И печатает предупреждение о
+    намеренном локальном прогоне (не молчит о своём режиме)."""
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
+    calls = []
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+            returncode=0, stdout="{}", stderr="")))
+    result = pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+    assert len(calls) == 1
+    assert result == {}
+    assert "ВНЕ GitHub Actions" in pg.announce_write_mode()
+    assert pg.ALLOW_PROD_WRITES_ENV in pg.announce_write_mode()
+
+
+def test_gh_read_call_never_gated_even_outside_ci(monkeypatch):
+    """Чтение (без `-X` МЕТОД-записи) не тормозится вовсе — иначе локальная
+    диагностика планировщика (`gh()` для отчёта) стала бы невозможна без
+    прод-флага, хотя GET ничего не мутирует."""
+    _clear_ci_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+            returncode=0, stdout="[]", stderr="")))
+    result = pg.gh("repos/o/r/pulls?state=open&per_page=100")
+    assert len(calls) == 1
+    assert result == []
+
+
+def test_gh_explicit_get_method_is_not_a_write(monkeypatch):
+    """`-X GET` (используется в паре мест репозитория, например поиск issues)
+    остаётся чтением — не должен матчить _gh_call_is_write."""
+    assert pg._gh_call_is_write(("-X", "GET", "search/issues")) is False
+    assert pg._gh_call_is_write(("-X", "POST", "repos/o/r/issues/1/comments")) is True
+    assert pg._gh_call_is_write(("repos/o/r/pulls",)) is False
+
+
+def test_announce_write_mode_names_all_three_states(monkeypatch):
+    _clear_ci_env(monkeypatch)
+    assert "DRY-RUN" in pg.announce_write_mode()
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
+    assert "ЯВНЫМ решением" in pg.announce_write_mode()
+    monkeypatch.delenv(pg.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    assert "GitHub Actions" in pg.announce_write_mode() and "DRY-RUN" not in pg.announce_write_mode()
 
 
 def test_build_decision_keyboard_callback_data_matches_ts_format_and_byte_limit():
@@ -248,6 +406,21 @@ def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
     pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
     assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
+
+
+def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch):
+    """Находка ревью PR #950 (третий проход): escalate() рапортовал «след в
+    #N: оставлен», хотя `post_issue_comment` внутри gh() тихо не отправил
+    ничего (гейт DRY-RUN вернул None). Мутация: замени `except
+    WriteGateSkipped` на общий `except RuntimeError` без различения —
+    сообщение потеряет слово «пропущен», станет неотличимо от реального
+    сетевого сбоя (тоже нарушение, но другого класса)."""
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setattr(pg, "subprocess", SimpleNamespace(
+        run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess.run не должен вызываться"))))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
+    result = pg.escalate("o/r", 120, "текст эскалации")
+    assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
 def test_merge_telegram_text_is_short_clickable_and_escaped():
