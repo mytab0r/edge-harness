@@ -136,7 +136,18 @@ def react_to_merge(
     `head_sha` обязателен (не Optional): без него дедуп невозможен по
     построению — вызывающая сторона обязана взять `sha` из ответа `PUT
     .../pulls/{n}/merge` (класс #929, ревью: раньше pull-словарь ДО мержа не
-    нёс актуальный merge_commit_sha)."""
+    нёс актуальный merge_commit_sha).
+
+    Каждый workflow реестра обрабатывается НЕЗАВИСИМО (находка ревью PR
+    #956): сетевой сбой на одном workflow (has_run_for_sha/dispatch_workflow
+    подняли RuntimeError) не должен обрывать диспатч ОСТАЛЬНЫХ, у которых
+    сбоя нет — сбой конкретного workflow превращается в строку-наблюдение
+    (⚠️), а цикл продолжается со следующим. Раньше (до этого фикса)
+    исключение одного workflow пробрасывалось наружу необработанным,
+    вызывающая сторона (after_merge) ловила его ОДНИМ общим `try` вокруг
+    всего вызова — и сбой, скажем, `repo-ci.yml` (первый в реестре) молча
+    отменял диспатч `deploy-worker.yml`/`deploy-dsh-edge.yml`, у которых
+    сети вполне могло хватить."""
     if not head_sha:
         raise RuntimeError(
             "react_to_merge: head_sha пуст — дедуп по коммиту невозможен, "
@@ -145,11 +156,24 @@ def react_to_merge(
     registry = registry if registry is not None else load_registry()
     actions: list[str] = []
     for workflow in matching_workflows(files, registry):
-        if has_run_for_sha(gh_func, repo, workflow, head_sha):
+        try:
+            exists = has_run_for_sha(gh_func, repo, workflow, head_sha)
+        except RuntimeError as error:
+            actions.append(
+                f"⚠️ {workflow}: проверка существующего прогона на {head_sha[:8]} "
+                f"не удалась ({error}) — диспатч НЕ сделан (безопасный отказ, "
+                "не гадаем, дублировать или нет)"
+            )
+            continue
+        if exists:
             actions.append(
                 f"⏭️ {workflow} уже имеет прогон на {head_sha[:8]} — диспатч пропущен (дедуп, #929)"
             )
             continue
-        dispatch_workflow(gh_func, repo, workflow, ref=ref)
+        try:
+            dispatch_workflow(gh_func, repo, workflow, ref=ref)
+        except RuntimeError as error:
+            actions.append(f"⚠️ {workflow}: диспатч не удался ({error})")
+            continue
         actions.append(f"🚀 {workflow} запущен (push от GITHUB_TOKEN триггеры не создаёт, #929)")
     return actions

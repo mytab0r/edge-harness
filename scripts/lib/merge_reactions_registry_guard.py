@@ -10,8 +10,15 @@ codeql.yml, worker-ci.yml без явного диспатча на мерже �
   1. `push_main_workflows` — скан `.github/workflows/*.yml`: у каждого файла
      смотрим `on.push`, распознавая готчу PyYAML (YAML 1.1: незакавыченный
      ключ `on:` парсится как булево `True`, не строка `'on'` — доказано
-     живым прогоном `yaml.safe_load` на repo-ci.yml, issue #955). Покрывает
-     main — либо `push:` вовсе без `branches` (матчит все ветки), либо
+     живым прогоном `yaml.safe_load` на repo-ci.yml, issue #955). `on:` сам
+     может быть словарём (`{push: {...}}`), списком коротких имён событий
+     (`[push, pull_request]`) или одиночной строкой (`push`) — все три формы
+     валидны для GitHub Actions и распознаются `_extract_push_trigger`
+     единообразно (находка ревью PR #956: раньше только dict-форма
+     проверялась, `on: [push]`/`on: push` молча проходили гвардию мимо, хотя
+     оба безусловно триггерят push по ВСЕМ веткам, включая main). Покрывает
+     main — либо `push:` вовсе без `branches` (матчит все ветки, включая
+     list-/строчную форму, где фильтрации по branches в принципе нет), либо
      `branches` явно содержит `'main'`.
   2. `registered_workflows` — объединение `reactions[].workflow` (реестр,
      `merge_reactions.load_registry`) и `excluded[].workflow` (осознанные
@@ -56,10 +63,11 @@ _MR_SPEC.loader.exec_module(merge_reactions)  # type: ignore[union-attr]
 
 
 def _push_covers_main(push_value) -> bool:
-    """`push_value` — значение ключа `push` внутри `on:` workflow'а. `None`
-    (голый `push:` без вложенного отображения) и словарь без ключа
-    `branches` матчат ЛЮБУЮ ветку, включая `main` — только явный список
-    `branches`, из которого `main` исключён, не покрывает main."""
+    """`push_value` — значение ключа `push` внутри `on:` workflow'а (только
+    когда `on:` — словарь, dict-форма). `None` (голый `push:` без вложенного
+    отображения) и словарь без ключа `branches` матчат ЛЮБУЮ ветку, включая
+    `main` — только явный список `branches`, из которого `main` исключён, не
+    покрывает main."""
     if push_value is None:
         return True
     if isinstance(push_value, dict):
@@ -73,18 +81,54 @@ def _push_covers_main(push_value) -> bool:
     return True
 
 
+def _extract_push_trigger(on_value) -> tuple[bool, object]:
+    """(есть_ли_push_триггер, значение_push_для_фильтра_веток) — единообразно
+    для ВСЕХ трёх валидных форм `on:` GitHub Actions (находка ревью PR #956,
+    живая мутация критика: `zz-fake-push.yml` с `on: [push]` или `on: push`
+    давал `exit=0` — гвардия молчала ровно там, где должна была закраснеть):
+
+      а) словарь `{push: {...}}` / `{push: null}` — есть ключ `push`, его
+         значение идёт в `_push_covers_main` как обычно (там же живёт логика
+         `branches`);
+      б) список `[push, pull_request]` (короткая форма перечисления событий
+         без доп. конфигурации КАЖДОГО) — `push` есть, если строка `"push"`
+         входит в список; список НЕ умеет фильтровать по `branches` вовсе —
+         триггер безусловно покрывает все ветки, включая main (возвращаем
+         `None` — тот же сентинел, что «голый push: без отображения» в
+         `_push_covers_main`);
+      в) строка `"push"` (единственное событие без доп. конфигурации) — та
+         же безусловная форма, что и (б).
+
+    Незнакомая форма (не dict/list/str/None) — не молчим (fail loud,
+    AGENTS.md): считаем, что push ЕСТЬ и покрывает main, а не тихо
+    пропускаем файл мимо проверки."""
+    if on_value is None:
+        return False, None
+    if isinstance(on_value, dict):
+        if "push" not in on_value:
+            return False, None
+        return True, on_value["push"]
+    if isinstance(on_value, list):
+        return ("push" in on_value), None
+    if isinstance(on_value, str):
+        return (on_value == "push"), None
+    return True, None
+
+
 def push_main_workflows(workflows_dir: Path = WORKFLOWS_DIR) -> set[str]:
     """Имена файлов (`repo-ci.yml`, не путь) всех workflow с `on.push`,
-    покрывающим `main`."""
+    покрывающим `main` — по ЛЮБОЙ из трёх форм `on:` (dict/list/строка,
+    см. `_extract_push_trigger`)."""
     result: set[str] = set()
     for path in sorted(workflows_dir.glob("*.y*ml")):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         # YAML 1.1: незакавыченный ключ `on:` — булево True, не строка 'on'
         # (проверено живым yaml.safe_load, issue #955) — берём ЛЮБОЙ ключ.
         on_value = doc.get("on", doc.get(True))
-        if not isinstance(on_value, dict) or "push" not in on_value:
+        has_push, push_value = _extract_push_trigger(on_value)
+        if not has_push:
             continue
-        if _push_covers_main(on_value["push"]):
+        if _push_covers_main(push_value):
             result.add(path.name)
     return result
 

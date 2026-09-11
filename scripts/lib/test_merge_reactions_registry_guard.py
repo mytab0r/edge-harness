@@ -30,6 +30,14 @@ def write_registry(path: Path, reactions, excluded=()) -> None:
     path.write_text(json.dumps({"reactions": list(reactions), "excluded": list(excluded)}), encoding="utf-8")
 
 
+def write_workflow_on_raw(path: Path, on_line: str) -> None:
+    """Пишет `on:` НЕ как вложенный блок словаря (`write_workflow` выше
+    годится только для dict-формы) — для list-/строчной формы (`on: [push]`,
+    `on: push`) сама строка `on:` уже несёт значение целиком."""
+    path.write_text(f"name: test\n\n{on_line}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n",
+                     encoding="utf-8")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # push_main_workflows — распознавание on.push по main (включая готчу PyYAML)
 # ══════════════════════════════════════════════════════════════════════════
@@ -56,6 +64,48 @@ def test_push_main_workflows_excludes_branch_filtered_without_main(tmp_path):
 def test_push_main_workflows_ignores_workflow_dispatch_only(tmp_path):
     write_workflow(tmp_path / "d.yml", "  workflow_dispatch:\n")
     assert grd.push_main_workflows(tmp_path) == set()
+
+
+def test_push_main_workflows_detects_list_form_on_push(tmp_path):
+    # Находка ревью PR #956 (критик, живая мутация zz-fake-push.yml):
+    # `on: [push, pull_request]` — короткая форма перечисления событий БЕЗ
+    # вложенного `push:` вовсе. Список не умеет фильтровать по branches —
+    # триггер безусловно покрывает main. До фикса `_extract_push_trigger`
+    # это давало exit=0 («новых незарегистрированных нет») — молчаливый
+    # пропуск ровно того класса, ради которого гвардия написана.
+    write_workflow_on_raw(tmp_path / "list-form.yml", "on: [push, pull_request]")
+    assert grd.push_main_workflows(tmp_path) == {"list-form.yml"}
+
+
+def test_push_main_workflows_detects_string_form_on_push(tmp_path):
+    # `on: push` — единственное событие без доп. конфигурации, тоже валидная
+    # форма GitHub Actions (находка ревью PR #956, тот же класс, что list-форма).
+    write_workflow_on_raw(tmp_path / "string-form.yml", "on: push")
+    assert grd.push_main_workflows(tmp_path) == {"string-form.yml"}
+
+
+def test_push_main_workflows_list_form_without_push_is_not_flagged(tmp_path):
+    write_workflow_on_raw(tmp_path / "list-no-push.yml", "on: [pull_request]")
+    assert grd.push_main_workflows(tmp_path) == set()
+
+
+def test_push_main_workflows_string_form_other_event_is_not_flagged(tmp_path):
+    write_workflow_on_raw(tmp_path / "string-other.yml", "on: workflow_dispatch")
+    assert grd.push_main_workflows(tmp_path) == set()
+
+
+def test_check_registry_completeness_flags_list_form_push_workflow(tmp_path):
+    # Полный путь критика: файл дерева PR с `on: [push]`, не зарегистрированный
+    # нигде — гвардия обязана краснеть на уровне check_registry_completeness,
+    # не только на уровне push_main_workflows.
+    workflows_dir = tmp_path / "workflows"
+    workflows_dir.mkdir()
+    write_workflow_on_raw(workflows_dir / "zz-fake-push.yml", "on: [push]")
+    write_workflow(workflows_dir / "other.yml", "  workflow_dispatch:\n")
+    registry_path = tmp_path / "merge-reactions.json"
+    write_registry(registry_path, reactions=[{"prefix": "", "workflow": "other.yml"}])
+    problems = grd.check_registry_completeness(workflows_dir, registry_path)
+    assert any("zz-fake-push.yml" in p and "не зарегистрирован" in p for p in problems)
 
 
 def test_push_main_workflows_real_repo_ci_yml_detected():

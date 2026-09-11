@@ -192,7 +192,11 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       которого совпавший workflow реестра НЕ имеет ни одного прогона на этот
       `head_sha` — сам диспатч не сработал (упал шаг оркестратора, сеть,
       квота) или сработал МИМО этого коммита. Best-effort (как 10/12/13):
-      сетевой сбой на кандидате не роняет остальные, RuntimeError самого
+      сетевой сбой на кандидате не роняет остальные — но и не читается как
+      «этот кандидат здоров» (находка ревью PR #956): каждый элемент несёт
+      `status` — `"missing"` (настоящее нарушение) или `"unchecked"`
+      (проверить не удалось), build_report показывает второе ОТДЕЛЬНОЙ
+      строкой ⚠️, не молчит о нём и не подмешивает в 💚. RuntimeError самого
       реестра (config/merge-reactions.json сломан/отсутствует) поднимается
       как отдельная строка отчёта, не проглатывается тихо. Эскалирующий
       (ESCALATING_INVARIANTS) — газ есть: диспатч уже автоматический
@@ -1848,23 +1852,29 @@ def check_merge_reaction_gaps(
     repo: str, now: datetime, merged_pulls: list[dict],
     registry: list[dict] | None = None,
 ) -> list[dict]:
-    """Нарушение — слитый PR (merged_at в окне [GRACE; WINDOW] от `now`)
-    тронул путь, покрытый записью реестра `config/merge-reactions.json`, но
-    Actions API не отдаёт НИ ОДНОГО прогона этого workflow на `merge_commit_
-    sha` этого PR. Установленный факт (#929, доказано `timeline` PR
-    #868/#872/#878): мерж через GITHUB_TOKEN не создаёт push-событие — без
-    явного диспатча (react_to_merge) workflow с `on.push` попросту не
-    запустится, и если диспатч почему-то не сработал (упавший шаг
-    оркестратора, сетевой сбой, квота), main остаётся непроверенным молча,
-    пока это не найдёт человек — ровно класс, который этот инвариант
+    """Каждый элемент результата несёт `status`: `"missing"` (настоящее
+    нарушение — Actions API не отдаёт НИ ОДНОГО прогона этого workflow на
+    `merge_commit_sha` этого PR, слитого в окне [GRACE; WINDOW] от `now`) или
+    `"unchecked"` (проверить не удалось — сетевой сбой/квота на фетче файлов
+    PR или на самом запросе прогонов). Установленный факт (#929, доказано
+    `timeline` PR #868/#872/#878): мерж через GITHUB_TOKEN не создаёт
+    push-событие — без явного диспатча (react_to_merge) workflow с `on.push`
+    попросту не запустится, и если диспатч почему-то не сработал (упавший
+    шаг оркестратора, сетевой сбой, квота), main остаётся непроверенным
+    молча, пока это не найдёт человек — ровно класс, который этот инвариант
     закрывает машиной.
 
-    Best-effort по КАЖДОМУ кандидату независимо (как 10/12/13/14): сбой сети
-    на одном PR/workflow не должен скрывать находку по другому — RuntimeError
-    самого реестра (файл сломан/отсутствует) — другое дело, поднимается
-    вызывающей стороне (build_report), не проглатывается здесь тихо."""
+    `"unchecked"` — НЕ то же самое, что «нарушений нет» (находка ревью PR
+    #956): прежняя версия глотала RuntimeError через голый `continue`, и
+    сбой сети на фетче файлов/прогонов молча превращался в 💚 «всё
+    проверено, нарушений нет» — ровно класс silent-wrong, который AGENTS.md
+    прямо запрещает («возможности нет» и «возможность есть, но сломана» —
+    разные сообщения). Вызывающая сторона (build_report) обязана показать
+    `unchecked` отдельной строкой, не молчать о них и не путать с здоровым
+    состоянием. RuntimeError самого реестра (файл сломан/отсутствует) —
+    другое дело, поднимается вызывающей стороне, не проглатывается здесь."""
     registry = registry if registry is not None else merge_reactions.load_registry()
-    violations: list[dict] = []
+    results: list[dict] = []
     for pull in merged_pulls:
         merged_at_raw = pull.get("merged_at")
         sha = pull.get("merge_commit_sha")
@@ -1875,19 +1885,30 @@ def check_merge_reaction_gaps(
             continue
         try:
             files = review_labels.list_pr_files(repo, pull["number"], gh)
-        except RuntimeError:
+        except RuntimeError as error:
+            results.append({
+                "pr": pull["number"], "sha": sha, "workflow": None,
+                "merged_at": merged_at_raw, "age_minutes": round(age_minutes, 1),
+                "status": "unchecked", "error": str(error),
+            })
             continue
         for workflow in merge_reactions.matching_workflows(files, registry):
             try:
                 exists = merge_reactions.has_run_for_sha(gh, repo, workflow, sha)
-            except RuntimeError:
-                continue
-            if not exists:
-                violations.append({
+            except RuntimeError as error:
+                results.append({
                     "pr": pull["number"], "sha": sha, "workflow": workflow,
                     "merged_at": merged_at_raw, "age_minutes": round(age_minutes, 1),
+                    "status": "unchecked", "error": str(error),
                 })
-    return violations
+                continue
+            if not exists:
+                results.append({
+                    "pr": pull["number"], "sha": sha, "workflow": workflow,
+                    "merged_at": merged_at_raw, "age_minutes": round(age_minutes, 1),
+                    "status": "missing",
+                })
+    return results
 
 
 def build_report(repo: str, now: datetime,
@@ -2133,12 +2154,20 @@ def build_report(repo: str, now: datetime,
         lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
 
     try:
-        v15 = check_merge_reaction_gaps(repo, now, merged_pulls)
+        v15_all = check_merge_reaction_gaps(repo, now, merged_pulls)
     except RuntimeError as error:
         findings[15] = []
         lines.append(f"🚨 [15] проверка реакции на мерж недоступна: {error} — "
                       "инвариант пропущен на этом прогоне (это НЕ «нарушений нет»)")
     else:
+        # Разделение missing/unchecked (находка ревью PR #956): сбой сети на
+        # ОДНОМ кандидате не должен молча читаться как «этот кандидат
+        # здоров» — прежде голый `continue` внутри check_merge_reaction_gaps
+        # делал именно это. Отчёт обязан назвать непроверенное непроверенным
+        # (AGENTS.md, «возможности нет» и «возможность есть, но сломана» —
+        # разные сообщения), а не подмешивать его в 💚.
+        v15 = [item for item in v15_all if item["status"] == "missing"]
+        unchecked15 = [item for item in v15_all if item["status"] == "unchecked"]
         findings[15] = v15
         if v15:
             lines.append(f"🚨 [15] {len(v15)} несостоявшихся push-реакций на слитый коммит (#929/#955):")
@@ -2148,9 +2177,17 @@ def build_report(repo: str, now: datetime,
                     f"head_sha={item['sha'][:8]} спустя {item['age_minutes']} мин "
                     f"(мерж {item['merged_at']})"
                 )
-        else:
+        elif not unchecked15:
             lines.append("💚 [15] у всех недавних слияний есть прогон каждого "
                           "затронутого workflow из config/merge-reactions.json")
+        if unchecked15:
+            lines.append(
+                f"⚠️ [15] {len(unchecked15)} кандидат(ов) не удалось проверить "
+                "(сеть/квота) — статус НЕИЗВЕСТЕН, это не подтверждение здоровья:"
+            )
+            for item in unchecked15:
+                target = item["workflow"] or "файлы PR (fetch)"
+                lines.append(f"   — PR #{item['pr']}: {target} — {item['error']}")
 
     return lines, findings
 

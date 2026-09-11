@@ -208,3 +208,30 @@ def test_react_to_merge_no_matched_workflow_makes_no_network_call():
         registry=[{"prefix": "cf-worker/", "workflow": "deploy-worker.yml"}])
     assert actions == []
     assert fake.calls == []
+
+
+def test_react_to_merge_one_workflow_failure_does_not_abort_the_rest():
+    # Найдено ревью PR #956: раньше вся функция обрывалась ПЕРВЫМ же
+    # RuntimeError (has_run_for_sha), и caller (after_merge) ловил его ОДНИМ
+    # общим try вокруг всего вызова — сбой сети на repo-ci.yml (первый в
+    # реестре) молча отменял диспатч worker-ci.yml/deploy-worker.yml, у
+    # которых сети вполне могло хватить. Порядок реестра — repo-ci.yml,
+    # codeql.yml, worker-ci.yml, deploy-worker.yml (см. REGISTRY выше):
+    # первый матчащий cf-worker/ workflow с ошибкой — repo-ci.yml.
+    fake = FakeGh({
+        "workflows/repo-ci.yml/runs?head_sha=abc123": RuntimeError("gh api: rate limited"),
+        "workflows/codeql.yml/runs?head_sha=abc123": {"workflow_runs": []},
+        "workflows/worker-ci.yml/runs?head_sha=abc123": {"workflow_runs": []},
+        "workflows/deploy-worker.yml/runs?head_sha=abc123": {"workflow_runs": []},
+        "-X POST": None,
+    })
+    actions = mr.react_to_merge(
+        fake, "o/r", files("cf-worker/src/config.ts"), "abc123", registry=REGISTRY)
+    assert any("⚠️" in a and "repo-ci.yml" in a and "rate limited" in a for a in actions)
+    posts = [c for c in fake.calls if c.startswith("-X POST")]
+    # Остальные три workflow — БЕЗ сбоя — обязаны быть продиспатчены, сбой
+    # первого их не заблокировал.
+    assert any("codeql.yml/dispatches" in c for c in posts)
+    assert any("worker-ci.yml/dispatches" in c for c in posts)
+    assert any("deploy-worker.yml/dispatches" in c for c in posts)
+    assert not any("repo-ci.yml/dispatches" in c for c in posts)  # сбой — не дублируем гаданием

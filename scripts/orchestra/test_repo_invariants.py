@@ -2243,11 +2243,11 @@ def test_merge_reaction_gaps_flags_missing_run_within_window(monkeypatch):
         "workflows/deploy-worker.yml/runs?head_sha=dbe8c9956d": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
-    assert len(violations) == 1
-    assert violations[0] == {
+    results = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    assert len(results) == 1
+    assert results[0] == {
         "pr": 900, "sha": "dbe8c9956d", "workflow": "deploy-worker.yml",
-        "merged_at": "2026-09-10T11:50:00Z", "age_minutes": 10.0,
+        "merged_at": "2026-09-10T11:50:00Z", "age_minutes": 10.0, "status": "missing",
     }
 
 
@@ -2295,8 +2295,8 @@ def test_merge_reaction_gaps_ignores_path_with_no_matching_registry_entry(monkey
     # прогон на этом sha ДОЛЖЕН считаться нарушением; проверяем отдельно, что
     # cf-worker/dsh-edge записи НЕ добавили лишних нарушений для пути вне их
     # префикса (единственное нарушение — repo-ci.yml).
-    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
-    assert [v["workflow"] for v in violations] == ["repo-ci.yml"]
+    results = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    assert [(r["workflow"], r["status"]) for r in results] == [("repo-ci.yml", "missing")]
 
 
 def test_merge_reaction_gaps_skips_pull_without_merge_commit_sha(monkeypatch):
@@ -2311,6 +2311,11 @@ def test_merge_reaction_gaps_skips_pull_without_merge_commit_sha(monkeypatch):
 
 
 def test_merge_reaction_gaps_best_effort_on_files_fetch_failure(monkeypatch):
+    """Найдено ревью PR #956: сбой сети на ОДНОМ кандидате раньше глотался
+    голым `continue` — 906 просто исчезал из результата, и build_report
+    молча читал это как «906 здоров». Теперь 906 присутствует в результате
+    со `status: "unchecked"` (видимо, не молча) — 907 (без сбоя) разбирается
+    как обычно и даёт `status: "missing"`."""
     now = utc(2026, 9, 10, 12, 0)
     merged = [
         merged_pull_with_sha(906, "2026-09-10T11:50:00Z", "sha906"),
@@ -2323,9 +2328,30 @@ def test_merge_reaction_gaps_best_effort_on_files_fetch_failure(monkeypatch):
         "workflows/deploy-worker.yml/runs?head_sha=sha907": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
-    # 906 недоступен (сбой сети) — пропущен молча; 907 разобран как обычно.
-    assert [v["pr"] for v in violations] == [907]
+    results = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    by_pr = {r["pr"]: r["status"] for r in results}
+    assert by_pr[906] == "unchecked"
+    assert by_pr[907] == "missing"
+    unchecked_906 = next(r for r in results if r["pr"] == 906)
+    assert unchecked_906["workflow"] is None  # сбой на уровне ФЕТЧА ФАЙЛОВ — до резолва workflow
+    assert "rate limited" in unchecked_906["error"]
+
+
+def test_merge_reaction_gaps_unchecked_on_run_lookup_failure(monkeypatch):
+    """Тот же класс, что фетч файлов выше, но сбой на втором сетевом вызове
+    (has_run_for_sha) — тоже 'unchecked', не силентная пропажа."""
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(920, "2026-09-10T11:50:00Z", "sha920")]
+    fake = FakeGh({
+        "pulls/920/files": [{"filename": "cf-worker/x"}],
+        "workflows/repo-ci.yml/runs?head_sha=sha920": RuntimeError("gh api: rate limited"),
+        "workflows/deploy-worker.yml/runs?head_sha=sha920": {"workflow_runs": [{"id": 1}]},
+    })
+    patch_gh(monkeypatch, fake)
+    results = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    by_workflow = {r["workflow"]: r["status"] for r in results}
+    assert by_workflow["repo-ci.yml"] == "unchecked"
+    assert "deploy-worker.yml" not in by_workflow  # у него был реальный прогон — здоров, не в списке
 
 
 def test_merge_reaction_gaps_uses_real_registry_by_default(monkeypatch):
@@ -2368,6 +2394,28 @@ def test_build_report_wires_invariant_15(monkeypatch):
     assert len(findings[15]) >= 1
     assert any("🚨" in line and "[15]" in line for line in lines)
     assert any("sha909"[:8] in line for line in lines)  # короткий sha в отчёте
+
+
+def test_build_report_never_claims_healthy_on_unchecked_only(monkeypatch):
+    """Находка ревью PR #956: сбой сети на ЕДИНСТВЕННОМ кандидате не должен
+    рендериться как 💚 «нарушений нет» — build_report обязан явно сказать
+    «не удалось проверить», не молчать о невозможности проверки."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [merged_pull_with_sha(911, "2026-09-10T11:50:00Z", "sha911")],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "pulls/911/files": RuntimeError("gh api: rate limited"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[15] == []  # нет ПОДТВЕРЖДЁННЫХ нарушений — но это не то же самое, что здоровье
+    assert not any("💚" in line and "[15]" in line for line in lines)
+    assert any("⚠️" in line and "[15]" in line and "не удалось проверить" in line for line in lines)
 
 
 def test_run_escalations_wires_invariant_15_with_fact_not_guess(monkeypatch):
