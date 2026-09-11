@@ -204,6 +204,30 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       второй ручной тормоз. Наблюдательный, не в CI_GATING: замер долга на
       живом репозитории на момент внедрения ещё не сделан (тот же порядок,
       что у 1/5/9/10/12/13/14).
+  17. check_ghost_actions_workflows (#940; номер 15 занят #956, 16 занят
+      #950 на момент ребейза этого PR, #904) — запись `GET .../actions/
+      workflows` ссылается на `.github/workflows/<файл>`, которого нет на
+      `main`, всё ещё `active` (не отключена вручную), И файл не живёт в
+      ветке ЕЩЁ ОТКРЫТОГО PR (различитель — ветка последнего прогона,
+      `fetch_latest_run_branch`). Живой замер 2026-09-11 нашёл 5 кандидатов
+      (diag-501, diag-501-verify, diag-502, dsh-edge-pr-smoke, quota-watch),
+      но ВТОРОЙ раунд того же замера показал: 2 из 5 (dsh-edge-pr-smoke,
+      quota-watch) — файлы предложенной, но НЕ смёрженной работы (открытые
+      PR #603/#607) — отключить их через API было ошибкой первого раунда,
+      исправлено (`PUT .../enable` тем же PR, что добавил инвариант).
+      Настоящих призраков — 3 (diag-501, diag-501-verify, diag-502: ветки их
+      последних прогонов несли уже СМЁРЖЕННЫЕ PR #509/#512, файл убран
+      отдельным коммитом-удалением) — они и остаются отключены
+      (`PUT .../disable`, `DELETE` отвечает 404 Not Found — GitHub не даёт
+      удалить запись, у которой был хоть один запуск). Нулевой замер на
+      момент включения — гейтящий сразу (тот же довод, что у 7/11): уже
+      отключённые призраки не флагуются снова (`state != "active"` отсекает
+      их), красит только НОВЫЙ, ещё не замеченный И доказанно брошенный
+      призрак. Тот же приём best-effort/unchecked, что у 15 (находка ревью
+      PR #944): сбой `fetch_latest_run_branch` на ОДНОМ кандидате (сеть/квота)
+      не читается как «доказанный призрак» — кандидат остаётся `unchecked`,
+      build_report показывает это отдельной строкой ⚠️, не молчит и не
+      подмешивает в 💚/🚨.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -416,7 +440,11 @@ OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
 # от чужого backlog'а — ноль нарушений на момент внедрения (манифест только
 # что создан валидным этим же PR, см. openspec/changes/
 # llm-provider-usage-manifest/tasks.md). Газ — GATING_RELEASE_CONDITION[11].
-CI_GATING: frozenset[int] = frozenset({7, 11})
+# Инвариант 17 (#940; номер 15 занят #956, 16 занят #950 на момент ребейза
+# этого PR, #904) включён СРАЗУ тем же доводом: пять известных призраков
+# отключены этим же PR (state != "active" их больше не считает), ноль
+# нарушений на момент внедрения. Газ — GATING_RELEASE_CONDITION[17].
+CI_GATING: frozenset[int] = frozenset({7, 11, 17})
 
 # Единое место правды: что снимает блокировку каждого инварианта из
 # CI_GATING (AGENTS.md, «Тормоз без газа не принимается» — сообщение об
@@ -459,6 +487,12 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
         "(морда-push, openspec/changes/llm-provider-usage-manifest/tasks.md); "
         "0 нарушений на живом файле (python scripts/orchestra/repo_invariants.py, "
         "секция [11]) — машинно проверяемое условие возврата",
+    17: "отключи новый призрачный workflow: `gh api -X PUT repos/{repo}/actions/"
+        "workflows/{id}/disable` (удалить запись API нельзя — 404 Not Found, "
+        "см. докстринг check_ghost_actions_workflows) — ЛИБО верни файл на "
+        "main в `.github/workflows/`, если удаление было ошибкой; 0 активных "
+        "призраков (python scripts/orchestra/repo_invariants.py, секция [17]) "
+        "— машинно проверяемое условие возврата",
 }
 
 
@@ -1911,6 +1945,142 @@ def check_merge_reaction_gaps(
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 17: призрачные workflow в Actions API (#940, #904)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def fetch_actions_workflows(repo: str) -> list[dict]:
+    """`GET /repos/{repo}/actions/workflows` — реестр workflow, известных
+    Actions API. Одна страница (`per_page=100`, без пагинации) — на замер
+    #940 в репозитории 27 записей; GitHub не даёт удалить запись, у которой
+    хоть раз был запуск, даже после удаления файла с main (`DELETE
+    .../actions/workflows/{id}` отвечает 404 Not Found, проверено живым
+    вызовом 2026-09-11) — рост списка МОНОТОННЫЙ И БЕЗ ВЕРХНЕЙ ГРАНИЦЫ по
+    самой природе реестра (уточнено после находки ревью PR #944, второй
+    раунд: раньше докстринг ошибочно называл список ограниченным). Полная
+    страница (100 записей) — не молчаливая обрезка (AGENTS.md «fail loud»,
+    тот же приём, что `upstream_drift.upstream_drift_check`), а громкий
+    RuntimeError: листать страницы здесь осознанно не стали, потерянный
+    хвост не должен молча читаться как «призраков нет»."""
+    result = gh(f"repos/{repo}/actions/workflows?per_page=100")
+    workflows = (result or {}).get("workflows", [])
+    if len(workflows) >= 100:
+        raise RuntimeError(
+            f"repos/{repo}/actions/workflows: {len(workflows)} записей на одной "
+            "странице (per_page=100) — реестр растёт без верхней границы "
+            "(GitHub не даёт удалить запись с историей запусков), хвост за "
+            "страницей потерялся бы молча, не листаем вслепую")
+    return workflows
+
+
+def workflow_files_on_main(repo: str) -> set[str]:
+    """Имена файлов `.github/workflows/*.yml`/`*.yaml` на default-ветке
+    (`main`) — через Contents API (`?ref=main`), а НЕ по дереву чекаута:
+    на `pull_request`-прогоне repo-ci чекаут — merge-дерево PR, и чтение
+    диска означало бы ложного призрака для ЛЮБОГО PR, удаляющего или
+    переименовывающего `.github/workflows/*.yml` (запись API жива, файл
+    есть на main, в дереве PR-чекаута его нет) — находка ревью PR #944,
+    второй раунд. orchestra-прогон (чекаут main) этим же вызовом сводится
+    к одному источнику правды вместо двух, зависящих от контекста.
+    Газ на неожиданной форме ответа — RuntimeError (вызывающий build_report
+    печатает 🚨 и пропускает инвариант), не молчаливая пустота."""
+    entries = gh(f"repos/{repo}/contents/.github/workflows?ref=main")
+    if not isinstance(entries, list):
+        raise RuntimeError(
+            "неожиданная форма ответа Contents API для .github/workflows "
+            f"(ожидали список, получили {type(entries).__name__})")
+    names = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        name = entry.get("name", "")
+        if name.endswith(".yml") or name.endswith(".yaml"):
+            names.add(name)
+    return names
+
+
+def check_ghost_actions_workflows(
+    workflows_api: list[dict],
+    main_names: set[str],
+    latest_run_branch: dict,
+    open_pr_branches: set[str],
+) -> list[dict]:
+    """Инвариант 17 (#940; номер 15 занят #956, 16 занят #950 на момент
+    ребейза этого PR, #904): запись Actions API ссылается на файл в
+    `.github/workflows/`, которого нет на `main`, И запись ещё `active` —
+    но «нет на main» само по себе НЕ значит «призрак»: находка живого замера
+    #940 (второй раунд) — из первых 5 диагностированных записей 2 оказались
+    файлами, живущими ТОЛЬКО в ветке ещё ОТКРЫТОГО PR (dsh-edge-pr-smoke —
+    PR #603/#600, quota-watch — PR #607/#605): предложенная, но ещё не
+    смёрженная работа, не брошенный мусор. Отключение таких через API ломает
+    их собственный CI. Различитель — ветка ПОСЛЕДНЕГО прогона этого workflow
+    (`latest_run_branch[id]`, IO — `GET .../workflows/{id}/runs?per_page=1`):
+    если эта ветка всё ещё несёт ОТКРЫТЫЙ PR (`open_pr_branches`), файл
+    считается живой предложенной работой, не призраком, — только 3 из 5
+    (diag-501, diag-501-verify, diag-502) прошли обе проверки: ветки их
+    последних прогонов (`agent/501-journal-proxy-404`, `agent/502-dsh-edge-e2e-smoke`)
+    несли уже СМЁРЖЕННЫЕ PR (#509, #512), а сам файл убран отдельным
+    коммитом (`git log --diff-filter=D`) — то есть путь и правда пуст
+    ВЕЗДЕ, не только на main.
+
+    Не флагуем повторно уже отключённые (`disabled_manually`/
+    `disabled_inactivity`/…): разово починенный призрак не должен красить
+    инвариант вечно — GitHub не даёт удалить саму запись API (см.
+    `fetch_actions_workflows`), ноль реально достижим только для «активных,
+    ещё не замеченных» призраков, не для «когда-либо существовавших».
+
+    Записи вне `.github/workflows/` (например `dynamic/dependabot/
+    dependabot-updates` — синтетический workflow Dependabot, не файл
+    репозитория) не проверяются — им нечему соответствовать среди файлов
+    на main."""
+    prefix = ".github/workflows/"
+    violations = []
+    for wf in workflows_api:
+        path = wf.get("path") or ""
+        if not path.startswith(prefix):
+            continue
+        name = path[len(prefix):]
+        if name in main_names:
+            continue
+        if wf.get("state") != "active":
+            continue
+        wf_id = wf.get("id")
+        branch = latest_run_branch.get(wf_id)
+        if branch is not None and branch in open_pr_branches:
+            continue
+        violations.append({
+            "id": wf_id,
+            "name": wf.get("name"),
+            "path": path,
+            "state": wf.get("state"),
+        })
+    return violations
+
+
+def fetch_latest_run_branch(repo: str, workflow_id) -> str | None:
+    """Ветка ПОСЛЕДНЕГО прогона workflow — единственный дешёвый сигнал
+    отличить «файл убран отовсюду» от «файл живёт в ветке открытого PR»
+    (см. докстринг check_ghost_actions_workflows). Вызывается ТОЛЬКО для
+    кандидатов, уже прошедших фильтр path/state (штучные вызовы, не на
+    каждую из ~27 записей реестра). Нет ни одного прогона — легитимный
+    None, вызывающий код обязан трактовать это как «не смогли оправдать»
+    (violation остаётся, fail loud — не молчаливое оправдание).
+
+    Сбой самого запроса (сеть/квота, живой класс #454) НЕ превращается в то
+    же None, что «прогонов нет» (находка ревью PR #944): RuntimeError
+    пробрасывается вызывающей стороне, которая обязана считать кандидата
+    `unchecked`, не молча «доказанным призраком» — смешение сбоя инструмента
+    с легитимным «прогонов нет» красило бы CI_GATING на транзиентном сетевом
+    сбое и советовало бы отключить живой workflow открытого PR (AGENTS.md,
+    «возможности нет» и «возможность есть, но сломана» — разные сообщения)."""
+    result = gh(f"repos/{repo}/actions/workflows/{workflow_id}/runs?per_page=1")
+    runs = (result or {}).get("workflow_runs") or []
+    if not runs:
+        return None
+    return runs[0].get("head_branch")
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2188,6 +2358,58 @@ def build_report(repo: str, now: datetime,
             for item in unchecked15:
                 target = item["workflow"] or "файлы PR (fetch)"
                 lines.append(f"   — PR #{item['pr']}: {target} — {item['error']}")
+
+    try:
+        workflows_api = fetch_actions_workflows(repo)
+        # Имена workflow-файлов — с default-ветки через Contents API, не по
+        # дереву чекаута: на pull_request-прогоне repo-ci чекаут — merge-
+        # дерево PR, и чтение диска красило бы ЛЮБОЙ PR, удаляющий или
+        # переименовывающий workflow, ложным призраком (находка ревью
+        # PR #944) — и советовала бы его газу «отключи workflow через API»,
+        # то есть отключить живой workflow main'а до смержа.
+        main_names = workflow_files_on_main(repo)
+    except RuntimeError as error:
+        findings[17] = []
+        lines.append(f"🚨 [17] реестр Actions workflows недоступен: {error} — инвариант пропущен на этом прогоне")
+    else:
+        # Ветку последнего прогона запрашиваем ТОЛЬКО для кандидатов, уже не
+        # прошедших дешёвый фильтр path/state (штучные вызовы, не на каждую
+        # из ~27 записей реестра) — см. докстринг check_ghost_actions_workflows.
+        prefix = ".github/workflows/"
+        latest_run_branch: dict = {}
+        unchecked17 = []
+        for wf in workflows_api:
+            path = wf.get("path") or ""
+            if not path.startswith(prefix) or path[len(prefix):] in main_names or wf.get("state") != "active":
+                continue
+            try:
+                latest_run_branch[wf.get("id")] = fetch_latest_run_branch(repo, wf.get("id"))
+            except RuntimeError as error:
+                # Сбой сети/квоты на ОДНОМ кандидате — не то же самое, что
+                # «прогонов нет» (находка ревью PR #944): кандидат остаётся
+                # unchecked, не молча становится «доказанным призраком».
+                unchecked17.append({"id": wf.get("id"), "name": wf.get("name"), "path": path, "error": str(error)})
+        open_pr_branches = {
+            p.get("head", {}).get("ref") for p in open_pulls if p.get("head", {}).get("ref")
+        }
+        v17_all = check_ghost_actions_workflows(workflows_api, main_names, latest_run_branch, open_pr_branches)
+        unchecked17_ids = {item["id"] for item in unchecked17}
+        v17 = [item for item in v17_all if item["id"] not in unchecked17_ids]
+        findings[17] = v17
+        if v17:
+            lines.append(f"🚨 [17] {len(v17)} активных workflow в Actions API без файла на main (#940):")
+            for item in v17:
+                lines.append(f"   — {item['name']} ({item['path']}, id={item['id']})")
+        elif not unchecked17:
+            lines.append("💚 [17] нет активных «призрачных» workflow (в API есть, на main нет)")
+        if unchecked17:
+            lines.append(
+                f"⚠️ [17] {len(unchecked17)} кандидат(ов) не удалось проверить "
+                "(сеть/квота на ветке последнего прогона) — статус НЕИЗВЕСТЕН, "
+                "это не подтверждение здоровья:"
+            )
+            for item in unchecked17:
+                lines.append(f"   — {item['name']} ({item['path']}) — {item['error']}")
 
     return lines, findings
 

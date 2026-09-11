@@ -24,6 +24,10 @@ permissions:
   # читают открытые issues/PR живым gh api — read достаточно, шаг ниже не пишет.
   issues: read
   pull-requests: read
+  # Инвариант 15 (#940, check_ghost_actions_workflows) читает
+  # GET /repos/{repo}/actions/workflows — этому REST-эндпоинту нужен явный
+  # scope actions:read на токене, contents/issues/pull-requests его не несут.
+  actions: read
 
 jobs:
   test:
@@ -39,6 +43,14 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
+      # Job-level блок ЗАМЕНЯЕТ файловый целиком (класс #884) — скоуп
+      # actions: read из файла сюда сам не доезжает. Инвариант 17 (#940,
+      # check_ghost_actions_workflows; номер 15 занят #956, 16 занят #950)
+      # читает GET /repos/{repo}/actions/workflows из этого job'а: без
+      # явного скоупа вызов ловит 403, build_report глотает его как
+      # «инвариант пропущен», и гейтящий инвариант молча не гейтит ни на
+      # одном прогоне repo-ci (находка ревью PR #944, второй раунд).
+      actions: read
     steps:
       - uses: actions/checkout@v7
 

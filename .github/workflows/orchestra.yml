@@ -108,6 +108,25 @@ jobs:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: python scripts/orchestra/scheduler.py
 
+      # Sweep осиротевших сессий морды (#940): archive_runner_sessions выше
+      # архивирует ТОЛЬКО harness-{number} по номерам задач из тела слитого
+      # PR — сессию с суффиксом `-r<run_id>` (заведённую dsh-edge-session.sh
+      # при испорченной холодной загрузке, #809/#871) она не находит никогда.
+      # Этот шаг наоборот: перечисляет ВСЕ сессии морды (session.list) и для
+      # каждой harness-* сам смотрит статус её задачи — не зависит от того,
+      # что видел merge-обработчик выше. continue-on-error — тот же приём,
+      # что у гвардий ниже: отказ виден красным шагом (fail loud), не гасит
+      # зелёный статус job'а, который читает пульс (heartbeat_check, #120).
+      - name: Sweep осиротевших сессий морды (#940)
+        id: session_orphan_sweep
+        if: steps.quota.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: python scripts/orchestra/session_orphan_sweep.py
+
       # Инварианты состояния репозитория (#244): состояние дрейфует БЕЗ
       # коммитов (задачу закрыли, PR слили, метку снял бот) — repo-ci.yml
       # реагирует только на push/PR, здесь тот же отчёт бежит по расписанию
@@ -134,6 +153,23 @@ jobs:
       # другой механизм, находка AI-ревью PR #336, третий раунд), и ложный
       # «пульс пропал» от находки на живых issue дороже задержанного
       # обнаружения протухшей метки.
+      # Отложенная уборка веток agent/* после слияния/закрытия PR (#940):
+      # delete_branch_on_merge на репозитории остаётся false (PR #937 сравнивает
+      # два локальных снимка git rev-parse HEAD в пределах своего же job'а,
+      # scripts/lib/dsh-ci.sh:1212 — снятие ветки СРАЗУ при мерже рвало бы её
+      # из-под ещё выполняющегося job'а, см. ADR 0017), поэтому ветка снимается
+      # здесь отдельно, не раньше 24ч после merged/closed (см. докстринг
+      # scripts/git/merged-branch-cleanup.py). continue-on-error — тот же
+      # приём, что у гвардий ниже: находка/отказ виден красным шагом
+      # (fail loud), но не гасит зелёный статус job'а, который читает пульс
+      # (heartbeat_check, #120).
+      - name: Уборка веток agent/* после слияния (#940)
+        id: merged_branch_cleanup
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/git/merged-branch-cleanup.py
+
       - name: Гвардия протухшей метки blocked (#334)
         continue-on-error: true
         env:
