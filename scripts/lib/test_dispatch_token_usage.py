@@ -34,7 +34,6 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 # GitHub Actions грузит workflows из .yml И .yaml — гвардия обязана видеть оба
 # (находка AI-ревью #146: файл evil.yaml со скваттером проходил все тесты зелёно).
-# Класс держит гвардия scripts/lib/workflow_glob_suffix_guard.py (#635).
 DISPATCH_SECRET_RE = r"secrets[.\[]\s*['\"]?GH_DISPATCH_TOKEN\b"
 PIPELINE_SECRET = "secrets.GH_PIPELINE_PAT"
 
@@ -70,19 +69,38 @@ EXPECTED_WORKFLOWS = frozenset({
     # write) + секреты TELEGRAM_* — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
+    # Сирота A аудита 2026-09-11 (scripts/orchestra/checklist_tail_labels.py):
+    # читает только github.token (issues: write, pull-requests: read) — тот
+    # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни
+    # GH_PIPELINE_PAT не использует.
+    # #322: инвентарь возможностей Cloudflare, workflow_dispatch вручную.
+    # `permissions: {}` явно — читает только CLOUDFLARE_*, ни github.token
+    # (кроме дефолтного read на checkout), ни GH_DISPATCH_TOKEN/GH_PIPELINE_PAT
+    # не использует. Найден белым пятном 2026-09-11 (см. #961): смёржен в
+    # main без правки этого списка — репо-ci ещё не перезапускался на main с
+    # момента слияния, регрессия не была видна ни на одном прогоне.
     "cf-inventory.yml",
+    "checklist-tail-triage.yml",
     "codeql.yml",
     # #762: дешёвый механический ребейз PR с меткой conflict, без вызова
     # агента — читает secrets.GH_PIPELINE_PAT для push рёбейзнутой ветки
     # (см. PIPELINE_CONSUMERS).
     "conflict-mechanical-rebase.yml",
+    # Сирота B аудита 2026-09-11 (scripts/orchestra/dependabot_alert_watch.py):
+    # читает только github.token (issues: write, vulnerability-alerts: read)
+    # + опциональные секреты TELEGRAM_* для эскалации — тот же класс, что
+    # branch-protection-watch.yml/owner-decision.yml ниже, ни GH_DISPATCH_TOKEN,
+    # ни GH_PIPELINE_PAT не использует.
+    "dependabot-alert-watch.yml",
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
     "hands.yml",
-    # Job для директив инбокса (#20, ADR 0015): repository_dispatch из DO под
-    # GH_DISPATCH_TOKEN (значение читает только сам DO как секрет воркера —
-    # этот workflow токена НЕ читает, создаёт issue штатным github.token).
+    # #389: инбокс владельца создаёт issue из repository_dispatch морды
+    # (event_type inbox-issue). Читает только github.token (issues: write,
+    # ADR 0015 — заменяет отдельный секрет GH_ISSUES_TOKEN, ADR 0011) — тот
+    # же класс, что owner-decision.yml ниже. Найден белым пятном 2026-09-11
+    # вместе с cf-inventory.yml выше (см. #961) — тот же класс пропуска.
     "inbox-issue.yml",
     # Issue #967: детектор регрессии worker_success_rate, привязанный к
     # слиянию (часовой cron). Только чтение Actions/Issues/Search API +
