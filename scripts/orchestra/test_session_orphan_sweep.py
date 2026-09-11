@@ -29,6 +29,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import yaml
 
 _DIR = Path(__file__).resolve().parent
 SCRIPT = _DIR / "session_orphan_sweep.py"
@@ -99,6 +100,102 @@ def test_id_field_fallback_when_session_id_absent():
     items = [_item(id_="harness-11", title="#11: X")]
     stats = sweep.classify_sessions(items, lambda n: "CLOSED")
     assert stats["orphans"] == [("harness-11", 11)]
+
+
+# ── orchestra.yml: шаг sweep гейтится тем же quota-skip, что соседи ──────────
+# (находка ревью PR #944: шаг стоял БЕЗ `if: steps.quota.outputs.skip !=
+# 'true'`, в отличие от двух соседних шагов той же job — при исчерпанной
+# квоте sweep всё равно запускался бы и тратил остаток лимита).
+
+
+def test_orchestra_yml_gates_orphan_sweep_step_on_quota_skip():
+    """Мутация: убери `if:` у шага «Sweep осиротевших сессий морды» в
+    orchestra.yml (или измени условие) — тест краснеет."""
+    workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "orchestra.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+    steps = None
+    for job in jobs.values():
+        candidate = [s for s in job.get("steps", []) if s.get("id") == "session_orphan_sweep"]
+        if candidate:
+            steps = job["steps"]
+            break
+    assert steps is not None, "шаг session_orphan_sweep не найден в orchestra.yml"
+    sweep_step = next(s for s in steps if s.get("id") == "session_orphan_sweep")
+    assert sweep_step.get("if") == "steps.quota.outputs.skip != 'true'"
+
+
+# ── run_sweep: квота/сломанный gh не маскируется под честное «сирот нет» ─────
+# (находка ревью PR #944: issue_state молчит None на КАЖДЫЙ номер при
+# исчерпанной квоте — без отдельного счётчика прогон печатал бы "0 сирот"
+# неотличимо от честной пустой очереди).
+
+
+def test_run_sweep_distinguishes_undetermined_status_from_no_orphans(monkeypatch, capsys):
+    monkeypatch.setattr(sweep, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sweep, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sweep, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sweep, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sweep, "fetch_session_list",
+        lambda opener: [_item(session_id="harness-42", title="#42: X")],
+    )
+
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        # rc!=0 — тот же признак, что живой gh при исчерпанной квоте/сети.
+        return type("R", (), {"returncode": 1, "stdout": ""})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rc = sweep.run_sweep(dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0  # ничего не сломалось явно — но и не честное "сирот нет"
+    assert "0 сирот" in out
+    assert "1 статус не определён" in out
+
+
+def test_run_sweep_warns_loudly_when_no_harness_status_resolved(monkeypatch, capsys):
+    """Мутация: убери условие `undetermined == harness_count` (замени на
+    `False`) — предупреждение не печатается, тест краснеет."""
+    monkeypatch.setattr(sweep, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sweep, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sweep, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sweep, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sweep, "fetch_session_list",
+        lambda opener: [
+            _item(session_id="harness-1", title="#1: X"),
+            _item(session_id="harness-2", title="#2: X"),
+        ],
+    )
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 1, "stdout": ""})())
+    sweep.run_sweep(dry_run=True)
+    err = capsys.readouterr().err
+    assert "НИ ОДНОЙ harness-сессии не определился" in err
+
+
+def test_run_sweep_no_false_warning_when_orphans_genuinely_found(monkeypatch, capsys):
+    monkeypatch.setattr(sweep, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sweep, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sweep, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sweep, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sweep, "fetch_session_list",
+        lambda opener: [_item(session_id="harness-42", title="#42: X")],
+    )
+
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        return type("R", (), {"returncode": 0, "stdout": "CLOSED"})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    sweep.run_sweep(dry_run=True)
+    err = capsys.readouterr().err
+    assert "НИ ОДНОЙ harness-сессии не определился" not in err
 
 
 # ── archive_session: мягкий успех на session-not-found ───────────────────────

@@ -42,9 +42,15 @@ scheduler.py вне рамок этой задачи). Место будущег
 
 Счётчик (видимость роста сирот, #940 п.2): каждый прогон печатает (сколько
 сессий `harness-*` увидел `session.list`, сколько распознано как сироты,
-сколько заархивировано, сколько ошибок, сколько элементов нечитаемой формы)
-— в step summary orchestra.yml (cron */15 мин) рост виден без отдельной
-инфраструктуры хранения счётчика.
+сколько заархивировано, сколько ошибок, сколько элементов нечитаемой формы,
+сколько со статусом «не определён») — в ЛОГ шага orchestra.yml (cron */15
+мин, не `$GITHUB_STEP_SUMMARY` — этот шаг его не пишет, в отличие от
+`repo_invariants.summary()`), рост виден без отдельной инфраструктуры
+хранения счётчика. Шаг гейтится тем же `steps.quota.outputs.skip`, что и
+соседние (находка ревью PR #944): при исчерпанной квоте `issue_state` молчал
+бы `None` на каждый номер — счётчик «статус не определён» ниже отдельно
+отличает этот случай от честного «сирот нет», даже если шаг всё же
+запустится при частично исчерпанной квоте.
 """
 
 import http.cookiejar
@@ -227,11 +233,24 @@ def run_sweep(dry_run: bool = False) -> int:
         return 1
 
     stats = classify_sessions(items, issue_state)
+    # Статус не определён (issue_state вернул None — сеть/квота/gh сломан) —
+    # ОТДЕЛЬНЫЙ счётчик от «сирот нет» (находка ревью PR #944): при
+    # исчерпанной квоте issue_state молчит None на КАЖДЫЙ номер, и без этого
+    # счётчика прогон печатал бы «0 сирот» неотличимо от честной пустой
+    # очереди — тот же класс, что «Fail loud, не silent-wrong» (AGENTS.md).
+    undetermined = sum(
+        1 for _, _, reason in stats["kept"] if reason == "статус задачи не определён — не трогаем"
+    )
+    harness_count = stats["total_items"] - stats["unparseable"] - stats["not_harness"]
     print(f"session.list (первая страница — пагинация метода НЕ ПОДТВЕРЖДЕНА, "
           f"см. докстринг): {stats['total_items']} элементов, "
-          f"{stats['total_items'] - stats['unparseable'] - stats['not_harness']} узнано как harness-*, "
+          f"{harness_count} узнано как harness-*, "
           f"{stats['unparseable']} нечитаемой формы (см. «НЕ ПОДТВЕРЖДЕНО» в докстринге), "
-          f"{len(stats['orphans'])} сирот (задача закрыта)")
+          f"{len(stats['orphans'])} сирот (задача закрыта), "
+          f"{undetermined} статус не определён (сеть/квота — не трогаем, не «сирот нет»)")
+    if harness_count and undetermined == harness_count:
+        print("⚠️ статус НИ ОДНОЙ harness-сессии не определился — похоже на "
+              "исчерпанную квоту/сломанный gh, а не на честное «сирот нет»", file=sys.stderr)
 
     errors = 0
     for sid, number in stats["orphans"]:

@@ -119,6 +119,7 @@ jobs:
       # зелёный статус job'а, который читает пульс (heartbeat_check, #120).
       - name: Sweep осиротевших сессий морды (#940)
         id: session_orphan_sweep
+        if: steps.quota.outputs.skip != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
