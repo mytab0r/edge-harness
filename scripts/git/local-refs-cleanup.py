@@ -37,11 +37,16 @@
 
 Fail loud: не удалось определить безопасность (сеть недоступна для gh pr
 list, `git rev-parse` не резолвится) — ref остаётся, скрипт печатает причину,
-не гадает. То же для Самих git-листингов (находка ревью PR #944, второй
+не гадает. То же для самих git-листингов (находка ревью PR #944, второй
 раунд): отказ `git branch`/`git worktree list`/`for-each-ref` — сбой
 инструмента, а не пустой список — GitListingError, причина в stderr,
 код выхода 1, ничего не удалено; молчаливая пустота печатала бы
 «Итого: веток 0 …» с кодом 0, отдавая сбой тем же сигналом, что успех.
+Симметрично — отказ `gh pr list` (секции 1–2 зависят от него) обрывает
+main() кодом 1 ДО печати «Итого» (находка ревью PR #944, третий раунд:
+раньше при этом отказе секции 1–2 молча пропускались, но «Итого: веток 0…»
+всё равно печаталось с кодом 0 — тот же класс лжи, что и с GitListingError,
+не закрытый в первый заход).
 
 Запуск (только вручную, на машине разработчика — не часть CI, эти refs в
 свежем чекауте CI не существуют): `python scripts/git/local-refs-cleanup.py
@@ -113,16 +118,27 @@ def worktree_checked_out_branches(repo_root: str) -> set[str]:
 
 def branch_content_is_preserved(repo_root: str, branch: str) -> bool:
     """Содержимое локальной ветки доказуемо сохранено где-то ещё: либо
-    origin/<branch> ещё жив и указывает на тот же коммит, либо origin/<branch>
-    уже снят (наша же отложенная уборка, #940), но коммит — предок
-    origin/main. Ни то ни другое не доказано — False (не трогаем, класс
-    «локальный коммит без копии — не мусор»)."""
+    origin/<branch> ещё жив НА GITHUB и указывает на тот же коммит, либо
+    origin/<branch> уже снят (наша же отложенная уборка, #940), но коммит —
+    предок origin/main. Ни то ни другое не доказано — False (не трогаем,
+    класс «локальный коммит без копии — не мусор»).
+
+    Живость origin/<branch> проверяется напрямую на GitHub (`git ls-remote
+    --heads origin`), НЕ по локальному remote-tracking рефу
+    `refs/remotes/origin/<branch>`: тот не обновляется без `fetch --prune` и
+    может остаться в клоне разработчика после того, как ветка снята на
+    GitHub — совпадение с протухшим кэшем ложно засчитывало бы сохранность
+    (находка ревью PR #944, третий раунд, живое репро: PR закрыт без мержа,
+    origin-ветка снята, `refs/remotes/origin/<branch>` остался от старого
+    fetch — `git rev-parse` по нему успешен и врёт, что ветка ещё на origin)."""
     local_sha, rc = run_cmd(["git", "rev-parse", branch], cwd=repo_root)
     if rc != 0:
         return False
-    origin_sha, rc_origin = run_cmd(["git", "rev-parse", f"origin/{branch}"], cwd=repo_root)
-    if rc_origin == 0:
-        return origin_sha == local_sha
+    remote_out, rc_remote = run_cmd(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"], cwd=repo_root)
+    if rc_remote == 0 and remote_out.strip():
+        remote_sha = remote_out.split()[0]
+        return remote_sha == local_sha
     _, rc_anc = run_cmd(["git", "merge-base", "--is-ancestor", branch, "origin/main"], cwd=repo_root)
     return rc_anc == 0
 
@@ -152,14 +168,24 @@ def local_pr_cache_refs(repo_root: str) -> dict[int, str]:
 
 def sha_preserved_elsewhere(repo_root: str, sha: str) -> bool:
     """SHA доказуемо жив в другом месте: предок origin/main ИЛИ достижим
-    хотя бы с одной ветки origin/*. Второе нужно отдельно от merge-base
-    --is-ancestor origin/main, потому что squash-merge не делает голову PR
-    предком main — единственное надёжное «жив» для НЕ смёрженной (closed)
-    ветки — она всё ещё существует на origin."""
+    хотя бы с одной ЖИВОЙ ветки origin/*. Второе нужно отдельно от
+    merge-base --is-ancestor origin/main, потому что squash-merge не делает
+    голову PR предком main — единственное надёжное «жив» для НЕ смёрженной
+    (closed) ветки — она всё ещё существует на origin.
+
+    Проверка ограничена поддеревом `refs/remotes/origin` (`git for-each-ref
+    --contains`), НЕ общим `git branch -r --contains`/`refs/remotes/*`:
+    последний видит и сам проверяемый `refs/remotes/pr/<N>` — тот указывает
+    на этот же sha, поэтому «--contains» тривиально находит его самого, и
+    проверка вырождалась в «всегда True» для любого закрытого PR (находка
+    ревью PR #944, второй раунд). `refs/remotes/pr/*` — наш собственный кэш,
+    не вторая копия «где-то ещё»."""
     _, rc = run_cmd(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root)
     if rc == 0:
         return True
-    out, rc_branch = run_cmd(["git", "branch", "-r", "--contains", sha], cwd=repo_root)
+    out, rc_branch = run_cmd(
+        ["git", "for-each-ref", "--contains", sha, "--format=%(refname)", "refs/remotes/origin"],
+        cwd=repo_root)
     return rc_branch == 0 and bool(out.strip())
 
 
@@ -224,48 +250,49 @@ def main() -> int:
 
     pr_records = merged_branch_cleanup.fetch_pr_records()
     if pr_records is None:
+        # Симметрично merged-branch-cleanup.py::main и GitListingError ниже:
+        # секции 1–2 не оценены вовсе, «Итого: веток 0 …» с кодом 0 отдавало
+        # бы этот отказ инструмента тем же сигналом, что честный пустой
+        # список (находка ревью PR #944, третий раунд) — выходим сразу, не
+        # печатая «Итого».
         print("🚨 gh pr list не удался — уборка веток/pr-кэша пропущена (fail loud)", file=sys.stderr)
-        pr_records = []
-        pr_status_ok = False
-    else:
-        pr_status_ok = True
+        return 1
 
     removed = {"branches": 0, "pr_refs": 0, "tmp_refs": 0}
 
     try:
         # 1. Локальные ветки agent/*
-        if pr_status_ok:
-            checked_out = worktree_checked_out_branches(repo_root)
-            local_branches = [b for b in local_agent_branches(repo_root) if b not in checked_out]
-            import datetime
-            now = datetime.datetime.now(datetime.timezone.utc)
-            deletable, _kept = merged_branch_cleanup.branch_deletion_candidates(local_branches, pr_records, now)
-            for branch in deletable:
-                if not branch_content_is_preserved(repo_root, branch):
-                    print(f"ОСТАВЛЕНА {branch}: содержимое не доказано сохранённым нигде ещё")
-                    continue
-                if args.dry_run:
-                    print(f"DRY-RUN: удалил бы локальную ветку {branch}")
-                    removed["branches"] += 1
-                    continue
-                if delete_local_branch(repo_root, branch):
-                    print(f"Удалена локальная ветка: {branch}")
-                    removed["branches"] += 1
-                else:
-                    print(f"ОШИБКА: не удалось удалить ветку {branch}", file=sys.stderr)
+        checked_out = worktree_checked_out_branches(repo_root)
+        local_branches = [b for b in local_agent_branches(repo_root) if b not in checked_out]
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        deletable, _kept = merged_branch_cleanup.branch_deletion_candidates(local_branches, pr_records, now)
+        for branch in deletable:
+            if not branch_content_is_preserved(repo_root, branch):
+                print(f"ОСТАВЛЕНА {branch}: содержимое не доказано сохранённым нигде ещё")
+                continue
+            if args.dry_run:
+                print(f"DRY-RUN: удалил бы локальную ветку {branch}")
+                removed["branches"] += 1
+                continue
+            if delete_local_branch(repo_root, branch):
+                print(f"Удалена локальная ветка: {branch}")
+                removed["branches"] += 1
+            else:
+                print(f"ОШИБКА: не удалось удалить ветку {branch}", file=sys.stderr)
 
-            # 2. Кэш-ссылки ревью refs/remotes/pr/<N>
-            pr_status_by_number = {p["number"]: p["state"] for p in pr_records if "number" in p}
-            pr_cache = local_pr_cache_refs(repo_root)
-            deletable_pr_refs, _kept_pr = pr_cache_refs_to_prune(repo_root, pr_cache, pr_status_by_number)
-            for number in deletable_pr_refs:
-                if args.dry_run:
-                    print(f"DRY-RUN: удалил бы refs/remotes/pr/{number}")
-                    removed["pr_refs"] += 1
-                    continue
-                if delete_pr_cache_ref(repo_root, number):
-                    print(f"Удалена refs/remotes/pr/{number}")
-                    removed["pr_refs"] += 1
+        # 2. Кэш-ссылки ревью refs/remotes/pr/<N>
+        pr_status_by_number = {p["number"]: p["state"] for p in pr_records if "number" in p}
+        pr_cache = local_pr_cache_refs(repo_root)
+        deletable_pr_refs, _kept_pr = pr_cache_refs_to_prune(repo_root, pr_cache, pr_status_by_number)
+        for number in deletable_pr_refs:
+            if args.dry_run:
+                print(f"DRY-RUN: удалил бы refs/remotes/pr/{number}")
+                removed["pr_refs"] += 1
+                continue
+            if delete_pr_cache_ref(repo_root, number):
+                print(f"Удалена refs/remotes/pr/{number}")
+                removed["pr_refs"] += 1
 
         # 3. refs/tmp/* — только опознанные lock-огрызки
         for ref in tmp_lock_refs(repo_root):

@@ -12,11 +12,23 @@
      точному сообщению коммита lock-объекта claim_task.py, не любой refs/tmp/*.
 
 Доказательство мутацией (ручной прогон, дословный вывод — в отчёте):
-  - в `branch_content_is_preserved` заменить `return origin_sha == local_sha`
+  - в `branch_content_is_preserved` заменить `return remote_sha == local_sha`
     на `return True` — `test_branch_with_unique_local_commit_is_not_preserved`
     красный: ветка с уникальным локальным коммитом считается сохранённой.
+  - в `branch_content_is_preserved` вернуть проверку по локальному кэшу
+    (`git rev-parse origin/<branch>` вместо `git ls-remote --heads origin`,
+    находка ревью PR #944, третий раунд) —
+    `test_branch_with_stale_origin_tracking_ref_after_deletion_is_not_preserved`
+    красный: протухший `refs/remotes/origin/<branch>` снова засчитывает
+    снятую на GitHub ветку сохранённой.
   - в `pr_cache_refs_to_prune` убрать проверку `status == "OPEN"` —
     `test_open_pr_cache_ref_is_kept` красный.
+  - в `sha_preserved_elsewhere` заменить `git for-each-ref --contains …
+    refs/remotes/origin` обратно на общий `git branch -r --contains`
+    (находка ревью PR #944, второй раунд: видит и сам `refs/remotes/pr/<N>`,
+    поэтому «--contains» тривиально находит его самого) —
+    `test_closed_pr_cache_ref_with_unpreserved_sha_is_kept` красный: закрытый
+    PR без второй копии снова признаётся «сохранённым».
   - в `is_stray_lock_ref` заменить `LOCK_REF_MESSAGE_RE.match(subject)` на
     `True` — `test_unrelated_tmp_ref_is_not_touched` красный: любой чужой
     `refs/tmp/*` начинает считаться lock-огрызком.
@@ -25,6 +37,11 @@
     `test_git_listing_failure_raises_not_empty` и
     `test_main_returns_1_when_git_listing_fails` красные: отказ листинга
     снова пустой список и «Итого: 0» с кодом 0.
+  - в `main()` вернуть `pr_records = []` вместо `return 1` при
+    `fetch_pr_records() is None` (находка ревью PR #944, третий раунд) —
+    `test_main_returns_1_and_no_itogo_when_gh_pr_list_fails` красный: код
+    возврата снова 0 и «Итого: веток 0 …» печатается, хотя секции 1–2 не
+    оценивались.
 
 Запуск: python -m pytest scripts/lib/test_local_refs_cleanup_guard.py -q
 """
@@ -111,6 +128,31 @@ def test_branch_with_unique_local_commit_is_not_preserved(tmp_path):
     assert lrc.branch_content_is_preserved(str(work), "agent/3-x") is False
 
 
+def test_branch_with_stale_origin_tracking_ref_after_deletion_is_not_preserved(tmp_path, monkeypatch):
+    # Живое репро находки ревью PR #944 (третий раунд): ветку сняли на
+    # GitHub из другого места (не через этот клон — `git push --delete`
+    # из ЭТОГО клона сам обновил бы локальный tracking-реф, маскируя баг),
+    # локальный remote-tracking реф `refs/remotes/origin/<branch>` в этом
+    # клоне остаётся живым (fetch --prune не запускали) и указывает на тот
+    # же коммит — совпадение с ним не должно засчитываться сохранностью,
+    # потому что живой проверки на GitHub (`ls-remote`) при этом нет.
+    bare = tmp_path / "origin.git"
+    work = _setup_repo(tmp_path)
+    _git(work, "checkout", "-b", "agent/5-stale")
+    (work / "u.txt").write_text("не смёржено и не сохранено\n", encoding="utf-8")
+    _git(work, "add", "u.txt")
+    _git(work, "commit", "-m", "непринятая работа")
+    _git(work, "push", "origin", "agent/5-stale")
+    _git(work, "fetch", "origin")  # заводит refs/remotes/origin/agent/5-stale локально
+    # Ветку снимают на GitHub НЕ через этот клон (имитация: другой агент,
+    # оркестратор, веб-интерфейс) — локальный tracking-реф клона не узнаёт
+    # об этом без отдельного fetch --prune.
+    _git(Path(str(bare)), "update-ref", "-d", "refs/heads/agent/5-stale")
+    cache_check = _git(work, "rev-parse", "origin/agent/5-stale")
+    assert cache_check.returncode == 0, "тест несостоятелен без живого локального кэша"
+    assert lrc.branch_content_is_preserved(str(work), "agent/5-stale") is False
+
+
 # ── 2. pr_cache_refs_to_prune ─────────────────────────────────────────────────
 
 
@@ -131,6 +173,10 @@ def test_merged_pr_cache_ref_with_sha_preserved_is_deletable(tmp_path):
 
 
 def test_closed_pr_cache_ref_with_unpreserved_sha_is_kept(tmp_path):
+    # Прод-форма входа (находка ревью PR #944, второй раунд): реальный
+    # refs/remotes/pr/7 создан в репозитории, не только передан словарём —
+    # раньше `git branch -r --contains sha` видел ЭТОТ ЖЕ реф и признавал
+    # sha «сохранённым в другом месте», хотя другого места не было.
     work = _setup_repo(tmp_path)
     _git(work, "checkout", "-b", "agent/7-x")
     (work / "u.txt").write_text("x\n", encoding="utf-8")
@@ -138,6 +184,7 @@ def test_closed_pr_cache_ref_with_unpreserved_sha_is_kept(tmp_path):
     _git(work, "commit", "-m", "не смёржено никуда")
     sha = _git(work, "rev-parse", "HEAD").stdout.strip()
     _git(work, "checkout", "main")
+    _git(work, "update-ref", "refs/remotes/pr/7", sha)
     deletable, kept = lrc.pr_cache_refs_to_prune(str(work), {7: sha}, {7: "CLOSED"})
     assert deletable == []
     assert "не доказано" in kept[7]
@@ -194,6 +241,23 @@ def test_git_listing_success_with_empty_output_is_honest_empty(tmp_path):
     assert lrc.local_pr_cache_refs(str(work)) == {}
     assert lrc.tmp_lock_refs(str(work)) == []
     assert lrc.local_agent_branches(str(work)) == []
+
+
+def test_main_returns_1_and_no_itogo_when_gh_pr_list_fails(tmp_path, monkeypatch, capsys):
+    # Симметрично GitListingError: отказ `gh pr list` (секции 1–2 от него
+    # зависят) обязан оборвать main() кодом 1 ДО печати «Итого» — находка
+    # ревью PR #944, третий раунд (раньше секции 1–2 молча пропускались, но
+    # «Итого: веток 0 …» с кодом 0 всё равно печаталось).
+    work = _setup_repo(tmp_path)
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(sys, "argv", ["local-refs-cleanup.py", "--dry-run"])
+    monkeypatch.setattr(lrc.merged_branch_cleanup, "fetch_pr_records", lambda: None)
+    rc = lrc.main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "gh pr list" in captured.err
+    assert "Итого" not in captured.out
+    assert "Итого" not in captured.err
 
 
 def test_main_returns_1_when_git_listing_fails(tmp_path, monkeypatch, capsys):

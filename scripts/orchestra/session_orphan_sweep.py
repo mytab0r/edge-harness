@@ -245,8 +245,8 @@ def run_sweep(dry_run: bool = False) -> int:
             print(f"🚨 {sid} (#{number}): не заархивирована (возможность сломана): {message}", file=sys.stderr)
             errors += 1
 
-    for sid, number, reason in stats["kept"]:
-        pass  # не трогаем — причина уже есть в stats, в лог не льём построчно (шум на десятки живых задач)
+    # stats["kept"] сознательно не льём построчно в лог (шум на десятки живых
+    # задач) — причина по каждой сессии уже накоплена в stats для отчёта/теста.
 
     return 1 if errors else 0
 
