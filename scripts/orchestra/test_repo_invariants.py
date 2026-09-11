@@ -218,13 +218,21 @@ class FakeGh:
     существующий тест build_report был бы обязан завести собственный
     маршрут actions/workflows, хотя призрачные workflow — не их предмет;
     тест, которому нужны конкретные записи API, переопределяет маршрут явно
-    (см. test_ghost_actions_workflows_* ниже)."""
+    (см. test_ghost_actions_workflows_* ниже).
+
+    Тот же приём для имён workflow-файлов на main (инвариант 15, #940,
+    `workflow_files_on_main`): здоровый дефолт — пустой список. Имена
+    читаются Contents API с `ref=main`, а НЕ по дереву чекаута: на
+    pull_request-прогоне repo-ci чекаут — merge-дерево PR, и чтение диска
+    красило бы любой PR, удаляющий/переименовывающий workflow, ложным
+    призраком (находка ревью PR #944, второй раунд)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
         "actions/workflows?per_page=100": {"workflows": []},
+        "contents/.github/workflows?ref=main": [],
     }
 
     def __init__(self, routes):
@@ -2456,7 +2464,7 @@ def test_escalating_invariants_includes_15():
 
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 17 (#940; номер 15 занят #956, 16 занят #950 на момент ребейза
-# этого PR, #904): «призрачный» workflow — в Actions API есть, на диске нет
+# этого PR, #904): «призрачный» workflow — в Actions API есть, на main нет
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Живой замер 2026-09-11 (второй раунд): из 5 кандидатов API без файла на
@@ -2466,26 +2474,32 @@ def test_escalating_invariants_includes_15():
 # если она несёт ещё открытый PR, это предложенная работа, не призрак.
 # Настоящих призраков — 3 (diag-501, diag-501-verify, diag-502): ветки их
 # последних прогонов несли уже смёрженные PR, файл убран отдельным коммитом.
+#
+# Второй раунд ревью PR #944: имена файлов читаются Contents API с ref=main,
+# не деревом чекаута — на pull_request-прогоне repo-ci чекаут — merge-дерево
+# PR, и чтение диска красило бы ЛЮБОЙ PR, удаляющий/переименовывающий
+# workflow, ложным призраком (а газ советовал бы отключить живой workflow
+# main'а до смержа).
 
 
 def _wf(name, path, state="active", id_=1):
     return {"id": id_, "name": name, "path": path, "state": state}
 
 
-def test_ghost_workflow_active_without_disk_file_and_no_open_pr_is_flagged():
+def test_ghost_workflow_active_without_main_file_and_no_open_pr_is_flagged():
     violations = ri.check_ghost_actions_workflows(
         [_wf("quota-watch", ".github/workflows/quota-watch.yml")],
-        disk_names=set(),
+        main_names=set(),
         latest_run_branch={1: "agent/605-quota-continuous-watch"},
         open_pr_branches=set(),  # PR по этой ветке уже не открыт (смёржен/закрыт)
     )
     assert violations == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
 
 
-def test_ghost_workflow_present_on_disk_is_not_flagged():
+def test_ghost_workflow_present_on_main_is_not_flagged():
     violations = ri.check_ghost_actions_workflows(
         [_wf("orchestra", ".github/workflows/orchestra.yml")],
-        disk_names={"orchestra.yml"},
+        main_names={"orchestra.yml"},
         latest_run_branch={},
         open_pr_branches=set(),
     )
@@ -2498,7 +2512,7 @@ def test_ghost_workflow_already_disabled_is_not_flagged_again():
     # GitHub физически не даёт снять саму запись API.
     violations = ri.check_ghost_actions_workflows(
         [_wf("diag-501", ".github/workflows/diag-501.yml", state="disabled_manually")],
-        disk_names=set(),
+        main_names=set(),
         latest_run_branch={},
         open_pr_branches=set(),
     )
@@ -2507,10 +2521,10 @@ def test_ghost_workflow_already_disabled_is_not_flagged_again():
 
 def test_ghost_workflow_dependabot_dynamic_path_is_not_a_ghost():
     # dynamic/dependabot/dependabot-updates — синтетическая запись Dependabot,
-    # не файл этого репозитория, нечему соответствовать на диске.
+    # не файл этого репозитория, нечему соответствовать среди файлов на main.
     violations = ri.check_ghost_actions_workflows(
         [_wf("Dependabot Updates", "dynamic/dependabot/dependabot-updates")],
-        disk_names=set(),
+        main_names=set(),
         latest_run_branch={},
         open_pr_branches=set(),
     )
@@ -2523,7 +2537,7 @@ def test_ghost_workflow_file_only_on_open_pr_branch_is_not_a_ghost():
     # смёрженная работа, не брошенный мусор.
     violations = ri.check_ghost_actions_workflows(
         [_wf("dsh-edge-pr-smoke", ".github/workflows/dsh-edge-pr-smoke.yml", id_=7)],
-        disk_names=set(),
+        main_names=set(),
         latest_run_branch={7: "agent/600-dsh-edge-pr-smoke"},
         open_pr_branches={"agent/600-dsh-edge-pr-smoke"},
     )
@@ -2535,7 +2549,7 @@ def test_ghost_workflow_mutation_guard_open_pr_check_removed():
     # предложенная работа в открытом PR снова считалась бы призраком.
     violations = ri.check_ghost_actions_workflows(
         [_wf("dsh-edge-pr-smoke", ".github/workflows/dsh-edge-pr-smoke.yml", id_=7)],
-        disk_names=set(),
+        main_names=set(),
         latest_run_branch={7: "agent/600-dsh-edge-pr-smoke"},
         open_pr_branches={"agent/600-dsh-edge-pr-smoke"},
     )
@@ -2585,17 +2599,30 @@ def test_fetch_latest_run_branch_network_failure_raises_loud(monkeypatch):
         ri.fetch_latest_run_branch(REPO, 7)
 
 
-def test_workflow_files_on_disk_reads_real_directory(tmp_path):
-    wf_dir = tmp_path / ".github" / "workflows"
-    wf_dir.mkdir(parents=True)
-    (wf_dir / "orchestra.yml").write_text("name: x\n", encoding="utf-8")
-    (wf_dir / "worker.yaml").write_text("name: y\n", encoding="utf-8")
-    (wf_dir / "README.md").write_text("не workflow\n", encoding="utf-8")
-    assert ri.workflow_files_on_disk(wf_dir) == {"orchestra.yml", "worker.yaml"}
+def test_workflow_files_on_main_reads_contents_api_with_ref_main(monkeypatch):
+    # Прод-форма ответа Contents API для каталога: список записей с type/name.
+    # Маршрут сшит на `ref=main` — вызов без него не сматчится (AssertionError),
+    # так тест красит откат к чтению любого другого дерева.
+    fake = FakeGh({
+        "contents/.github/workflows?ref=main": [
+            {"type": "file", "name": "orchestra.yml"},
+            {"type": "file", "name": "worker.yaml"},
+            {"type": "file", "name": "README.md"},        # не workflow
+            {"type": "dir", "name": "notes.yml"},         # подкаталог — не файл workflow
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.workflow_files_on_main(REPO) == {"orchestra.yml", "worker.yaml"}
 
 
-def test_workflow_files_on_disk_missing_directory_is_empty_not_error(tmp_path):
-    assert ri.workflow_files_on_disk(tmp_path / "no-such-dir") == set()
+def test_workflow_files_on_main_unexpected_shape_is_loud_not_empty(monkeypatch):
+    # Contents API вернул не список (контракт нарушен) — RuntimeError наверх
+    # (build_report печатает 🚨 и пропускает инвариант), не молчаливая пустота,
+    # которая превратила бы ВСЕ main-файлы в призраков.
+    fake = FakeGh({"contents/.github/workflows?ref=main": {"unexpected": "dict"}})
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="неожиданная форма"):
+        ri.workflow_files_on_main(REPO)
 
 
 def test_build_report_flags_ghost_workflow(monkeypatch):
@@ -2608,14 +2635,64 @@ def test_build_report_flags_ghost_workflow(monkeypatch):
         "search/issues": {"items": []},
         "actions/workflows?per_page=100": {"workflows": [_wf("quota-watch", ".github/workflows/quota-watch.yml")]},
         "actions/workflows/1/runs?per_page=1": {"workflow_runs": []},
+        # quota-watch.yml на main НЕТ (настоящий призрак) — дефолтный пустой
+        # маршрут FakeGh подходит, отдельный не заводим.
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
-    monkeypatch.setattr(ri, "workflow_files_on_disk", lambda _dir: set())
     now = utc(2026, 9, 10, 12, 0)
     lines, findings = ri.build_report(REPO, now)
     assert findings[17] == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
     assert any("🚨" in line and "[17]" in line for line in lines)
+
+
+def test_build_report_reads_main_names_not_checkout_tree(monkeypatch):
+    # Мутация-доказательство отката фикса ревью PR #944 (чтение диска чекаута
+    # вместо main): файл ЕСТЬ на main (Contents API), но его НЕТ в дереве
+    # этого чекаута — как у PR, удаляющего workflow. Чтение диска сочло бы
+    # его призраком ложно; чтение main — не сочтёт.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "actions/workflows?per_page=100": {"workflows": [
+            _wf("removed-on-branch", ".github/workflows/removed-on-branch.yml", id_=9),
+        ]},
+        "contents/.github/workflows?ref=main": [{"type": "file", "name": "removed-on-branch.yml"}],
+        "actions/workflows/9/runs?per_page=1": {"workflow_runs": [{"head_branch": "main"}]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == []
+    assert any("💚" in line and "[17]" in line for line in lines)
+
+
+def test_build_report_contents_api_failure_skips_invariant_loudly(monkeypatch):
+    # Сбой Contents API (сеть/квота/неожиданная форма) — инвариант пропущен
+    # с 🚨-строкой (видимо, отличимо от зелёного «нет призраков»), а не
+    # молчаливый зелёный и не обвал всего отчёта.
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "actions/workflows?per_page=100": {"workflows": []},
+        "contents/.github/workflows?ref=main": RuntimeError(
+            "gh api repos/o/r/contents/.github/workflows: HTTP 403"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == []
+    assert any("🚨" in line and "[17]" in line and "недоступен" in line for line in lines)
 
 
 def test_build_report_does_not_flag_open_pr_workflow(monkeypatch):
@@ -2633,7 +2710,6 @@ def test_build_report_does_not_flag_open_pr_workflow(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
-    monkeypatch.setattr(ri, "workflow_files_on_disk", lambda _dir: set())
     now = utc(2026, 9, 10, 12, 0)
     lines, findings = ri.build_report(REPO, now)
     assert findings[17] == []

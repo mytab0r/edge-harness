@@ -490,7 +490,7 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
     17: "отключи новый призрачный workflow: `gh api -X PUT repos/{repo}/actions/"
         "workflows/{id}/disable` (удалить запись API нельзя — 404 Not Found, "
         "см. докстринг check_ghost_actions_workflows) — ЛИБО верни файл на "
-        "диск в `.github/workflows/`, если удаление было ошибкой; 0 активных "
+        "main в `.github/workflows/`, если удаление было ошибкой; 0 активных "
         "призраков (python scripts/orchestra/repo_invariants.py, секция [17]) "
         "— машинно проверяемое условие возврата",
 }
@@ -1954,7 +1954,7 @@ def fetch_actions_workflows(repo: str) -> list[dict]:
     """`GET /repos/{repo}/actions/workflows` — реестр workflow, известных
     Actions API. Одна страница (`per_page=100`, без пагинации) — на замер
     #940 в репозитории 27 записей; GitHub не даёт удалить запись, у которой
-    хоть раз был запуск, даже после удаления файла с диска (`DELETE
+    хоть раз был запуск, даже после удаления файла с main (`DELETE
     .../actions/workflows/{id}` отвечает 404 Not Found, проверено живым
     вызовом 2026-09-11) — рост списка МОНОТОННЫЙ И БЕЗ ВЕРХНЕЙ ГРАНИЦЫ по
     самой природе реестра (уточнено после находки ревью PR #944, второй
@@ -1974,17 +1974,35 @@ def fetch_actions_workflows(repo: str) -> list[dict]:
     return workflows
 
 
-def workflow_files_on_disk(workflows_dir: Path) -> set[str]:
-    """Имена файлов `.github/workflows/*.yml`/`*.yaml`, реально лежащих на
-    диске — то же дерево, что видит любой чекаут этого репозитория."""
-    if not workflows_dir.is_dir():
-        return set()
-    return {p.name for p in workflows_dir.glob("*.yml")} | {p.name for p in workflows_dir.glob("*.yaml")}
+def workflow_files_on_main(repo: str) -> set[str]:
+    """Имена файлов `.github/workflows/*.yml`/`*.yaml` на default-ветке
+    (`main`) — через Contents API (`?ref=main`), а НЕ по дереву чекаута:
+    на `pull_request`-прогоне repo-ci чекаут — merge-дерево PR, и чтение
+    диска означало бы ложного призрака для ЛЮБОГО PR, удаляющего или
+    переименовывающего `.github/workflows/*.yml` (запись API жива, файл
+    есть на main, в дереве PR-чекаута его нет) — находка ревью PR #944,
+    второй раунд. orchestra-прогон (чекаут main) этим же вызовом сводится
+    к одному источнику правды вместо двух, зависящих от контекста.
+    Газ на неожиданной форме ответа — RuntimeError (вызывающий build_report
+    печатает 🚨 и пропускает инвариант), не молчаливая пустота."""
+    entries = gh(f"repos/{repo}/contents/.github/workflows?ref=main")
+    if not isinstance(entries, list):
+        raise RuntimeError(
+            "неожиданная форма ответа Contents API для .github/workflows "
+            f"(ожидали список, получили {type(entries).__name__})")
+    names = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        name = entry.get("name", "")
+        if name.endswith(".yml") or name.endswith(".yaml"):
+            names.add(name)
+    return names
 
 
 def check_ghost_actions_workflows(
     workflows_api: list[dict],
-    disk_names: set[str],
+    main_names: set[str],
     latest_run_branch: dict,
     open_pr_branches: set[str],
 ) -> list[dict]:
@@ -2014,7 +2032,8 @@ def check_ghost_actions_workflows(
 
     Записи вне `.github/workflows/` (например `dynamic/dependabot/
     dependabot-updates` — синтетический workflow Dependabot, не файл
-    репозитория) не проверяются — им нечему соответствовать на диске."""
+    репозитория) не проверяются — им нечему соответствовать среди файлов
+    на main."""
     prefix = ".github/workflows/"
     violations = []
     for wf in workflows_api:
@@ -2022,7 +2041,7 @@ def check_ghost_actions_workflows(
         if not path.startswith(prefix):
             continue
         name = path[len(prefix):]
-        if name in disk_names:
+        if name in main_names:
             continue
         if wf.get("state") != "active":
             continue
@@ -2044,9 +2063,9 @@ def fetch_latest_run_branch(repo: str, workflow_id) -> str | None:
     отличить «файл убран отовсюду» от «файл живёт в ветке открытого PR»
     (см. докстринг check_ghost_actions_workflows). Вызывается ТОЛЬКО для
     кандидатов, уже прошедших фильтр path/state (штучные вызовы, не на
-    каждую из ~27 записей реестра). Нет ни одного прогона или сеть
-    недоступна — None, вызывающий код обязан трактовать это как «не смогли
-    оправдать» (violation остаётся, fail loud — не молчаливое оправдание).
+    каждую из ~27 записей реестра). Нет ни одного прогона — легитимный
+    None, вызывающий код обязан трактовать это как «не смогли оправдать»
+    (violation остаётся, fail loud — не молчаливое оправдание).
 
     Сбой самого запроса (сеть/квота, живой класс #454) НЕ превращается в то
     же None, что «прогонов нет» (находка ревью PR #944): RuntimeError
@@ -2342,12 +2361,18 @@ def build_report(repo: str, now: datetime,
 
     try:
         workflows_api = fetch_actions_workflows(repo)
+        # Имена workflow-файлов — с default-ветки через Contents API, не по
+        # дереву чекаута: на pull_request-прогоне repo-ci чекаут — merge-
+        # дерево PR, и чтение диска красило бы ЛЮБОЙ PR, удаляющий или
+        # переименовывающий workflow, ложным призраком (находка ревью
+        # PR #944) — и советовала бы его газу «отключи workflow через API»,
+        # то есть отключить живой workflow main'а до смержа.
+        main_names = workflow_files_on_main(repo)
     except RuntimeError as error:
         findings[17] = []
         lines.append(f"🚨 [17] реестр Actions workflows недоступен: {error} — инвариант пропущен на этом прогоне")
     else:
-        disk_names = workflow_files_on_disk(REPO_ROOT / ".github" / "workflows")
-        # Ветку последнего прогона запрашиваем ТОЛЬКО для кандидатов, уже
+        # Ветку последнего прогона запрашиваем ТОЛЬКО для кандидатов, уже не
         # прошедших дешёвый фильтр path/state (штучные вызовы, не на каждую
         # из ~27 записей реестра) — см. докстринг check_ghost_actions_workflows.
         prefix = ".github/workflows/"
@@ -2355,7 +2380,7 @@ def build_report(repo: str, now: datetime,
         unchecked17 = []
         for wf in workflows_api:
             path = wf.get("path") or ""
-            if not path.startswith(prefix) or path[len(prefix):] in disk_names or wf.get("state") != "active":
+            if not path.startswith(prefix) or path[len(prefix):] in main_names or wf.get("state") != "active":
                 continue
             try:
                 latest_run_branch[wf.get("id")] = fetch_latest_run_branch(repo, wf.get("id"))
@@ -2367,16 +2392,16 @@ def build_report(repo: str, now: datetime,
         open_pr_branches = {
             p.get("head", {}).get("ref") for p in open_pulls if p.get("head", {}).get("ref")
         }
-        v17_all = check_ghost_actions_workflows(workflows_api, disk_names, latest_run_branch, open_pr_branches)
+        v17_all = check_ghost_actions_workflows(workflows_api, main_names, latest_run_branch, open_pr_branches)
         unchecked17_ids = {item["id"] for item in unchecked17}
         v17 = [item for item in v17_all if item["id"] not in unchecked17_ids]
         findings[17] = v17
         if v17:
-            lines.append(f"🚨 [17] {len(v17)} активных workflow в Actions API без файла на диске (#940):")
+            lines.append(f"🚨 [17] {len(v17)} активных workflow в Actions API без файла на main (#940):")
             for item in v17:
                 lines.append(f"   — {item['name']} ({item['path']}, id={item['id']})")
         elif not unchecked17:
-            lines.append("💚 [17] нет активных «призрачных» workflow (в API есть, на диске нет)")
+            lines.append("💚 [17] нет активных «призрачных» workflow (в API есть, на main нет)")
         if unchecked17:
             lines.append(
                 f"⚠️ [17] {len(unchecked17)} кандидат(ов) не удалось проверить "
