@@ -51,8 +51,12 @@ GET — список сообщений с фильтрами (status, kind, sen
 
 ## `POST /api/messages/process`
 
-Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — issue под GH_ISSUES_TOKEN (kind в теле issue; не задан токен или сеть — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен.
+Разбор новых сообщений: классификация (directive/chat/doc_edit/raw), группировка; для директив и doc_edit — repository_dispatch (event_type inbox-issue) под GH_DISPATCH_TOKEN (kind в теле issue; не задан токен, сеть или отказ job'а — повтор до LIMITS.messageMaxAttempts, потом честный failed; raw уходит в ignored на ручной триаж). 204 dispatch'а — не доказательство созданной issue, сообщение остаётся processing до подтверждения job'ом (messagesIssueCreated) либо возврата ватчдогом. Тело {limit, retry_failed: true} — вернуть failed в new с обнулёнными попытками. Возвращает {processed, results}. Тот же разбор ведёт пульс DO (alarm) — ручной вызов не обязателен.
 
 ## `GET /api/ready`
 
 Готовность хранилища DO SQLite (#575): ровно один дешёвый живой SQL-раундтрип со стабильным контрактом {ok:true} — узкий зонд, а не /api/status: тот тоже выполняет живые запросы и тоже краснеет при отказе хранилища, но гоняет несколько SQL на каждый вызов (включая MAX(id) по events, растущему с историей) и отдаёт тяжёлый ответ состояния. 200 {ok:true} — хранилище отвечает; отказ (например, исчерпание суточной квоты rows_read/rows_written) — тот же storage_quota_exceeded/internal, что и storageErrorResponse на любом другом маршруте.
+
+## `POST /api/messages/issue-created`
+
+Подтверждение job'а .github/workflows/inbox-issue.yml (Bearer HANDS_TOKEN — тот же канал, что heartbeat): repository_dispatch (204) не доказывает созданную issue (docs/research/21-github-actions.md), эта строка — единственное доказательство. Тело обязано нести claimed_ts (то же число, что #dispatchIssueCreation положил в client_payload, иначе 400 need_claimed_ts) плюс либо {message_id, claimed_ts, issue_number, issue_url} — issue создана, сообщение → done, возвращает {accepted, action: "issue_created", issue_number, issue_url}; либо {message_id, claimed_ts, error} — job сам сообщает об отказе (тот же кап попыток, что у ошибки dispatch'а), возвращает {accepted, action: "issue_failed"} при исчерпанном капе или {accepted, action: "issue_retry"} иначе. CAS по claimed_ts: запоздавшее подтверждение старой проходки (ватчдог уже увёл сообщение дальше) не находит совпадения — {accepted: false} с тем же action, без ошибки.
