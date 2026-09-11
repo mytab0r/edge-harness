@@ -179,6 +179,27 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       не в CI_GATING: Search API сам по себе может быть недоступен
       best-effort, гейтить обязательную проверку доступностью стороннего API
       было бы новым тормозом без содержательного смысла.
+  15. check_merge_reaction_gaps (#955, следствие #929) — слияние PR через
+      GITHUB_TOKEN НЕ создаёт push-событие (защита GitHub от рекурсии,
+      доказано живым `timeline` PR #868/#872/#878: последний push-прогон
+      repo-ci/codeql — 2026-09-10T10:46:32Z, ровно момент, когда слияния
+      стали полностью автономными). Реестр `config/merge-reactions.json`
+      (тот же, что читает `scheduler.py::after_merge` через
+      `merge_reactions.react_to_merge`) называет, какой workflow обязан
+      получить прогон на `head_sha` слитого коммита для каждого затронутого
+      пути; нарушение — слияние внутри окна
+      [MERGE_REACTION_GRACE_MINUTES; MERGE_REACTION_WINDOW_MINUTES] назад, у
+      которого совпавший workflow реестра НЕ имеет ни одного прогона на этот
+      `head_sha` — сам диспатч не сработал (упал шаг оркестратора, сеть,
+      квота) или сработал МИМО этого коммита. Best-effort (как 10/12/13):
+      сетевой сбой на кандидате не роняет остальные, RuntimeError самого
+      реестра (config/merge-reactions.json сломан/отсутствует) поднимается
+      как отдельная строка отчёта, не проглатывается тихо. Эскалирующий
+      (ESCALATING_INVARIANTS) — газ есть: диспатч уже автоматический
+      (react_to_merge), это чистый сторож «диспатч реально сработал», не
+      второй ручной тормоз. Наблюдательный, не в CI_GATING: замер долга на
+      живом репозитории на момент внедрения ещё не сделан (тот же порядок,
+      что у 1/5/9/10/12/13/14).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
@@ -324,6 +345,15 @@ _DD_SPEC = importlib.util.spec_from_file_location(
     "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
 declared_deps = importlib.util.module_from_spec(_DD_SPEC)
 _DD_SPEC.loader.exec_module(declared_deps)  # type: ignore[union-attr]
+
+# Реестр «слитый путь → workflow, реагирующий на push по main» (#955,
+# следствие #929) — тот же единственный источник, что читает диспетчер
+# scheduler.py::after_merge (merge_reactions.react_to_merge); инвариант 15
+# ниже проверяет, что диспатч реально дал прогон, не второй копией реестра.
+_MR_SPEC = importlib.util.spec_from_file_location(
+    "merge_reactions", REPO_ROOT / "scripts" / "lib" / "merge_reactions.py")
+merge_reactions = importlib.util.module_from_spec(_MR_SPEC)
+_MR_SPEC.loader.exec_module(merge_reactions)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
@@ -1796,6 +1826,70 @@ def check_worker_false_success_comment(repo: str) -> list[dict]:
     return violations
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 15: мерж без реакции push-триггера (#955, следствие #929)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Даём диспатчу (scheduler.py::after_merge → merge_reactions.react_to_merge)
+# время реально появиться в Actions API до того, как отсутствие прогона
+# считается нарушением — иначе инвариант красил бы КАЖДОЕ свежее слияние в
+# первые секунды после мержа, пока прогон ещё только создаётся.
+MERGE_REACTION_GRACE_MINUTES = 5
+# Верхняя граница окна — ограничивает цену проверки (по файлам PR + по
+# прогонам на head_sha, оба запроса на каждого кандидата): слияния старше
+# этого порога либо уже разобраны предыдущими пульсами (главный канал —
+# periodic orchestra.yml, */15 мин), либо настолько старые, что находка не
+# несёт оперативной ценности — не бесконечный переразбор всей истории
+# fetch_merged_pulls (до 500 PR).
+MERGE_REACTION_WINDOW_MINUTES = 240
+
+
+def check_merge_reaction_gaps(
+    repo: str, now: datetime, merged_pulls: list[dict],
+    registry: list[dict] | None = None,
+) -> list[dict]:
+    """Нарушение — слитый PR (merged_at в окне [GRACE; WINDOW] от `now`)
+    тронул путь, покрытый записью реестра `config/merge-reactions.json`, но
+    Actions API не отдаёт НИ ОДНОГО прогона этого workflow на `merge_commit_
+    sha` этого PR. Установленный факт (#929, доказано `timeline` PR
+    #868/#872/#878): мерж через GITHUB_TOKEN не создаёт push-событие — без
+    явного диспатча (react_to_merge) workflow с `on.push` попросту не
+    запустится, и если диспатч почему-то не сработал (упавший шаг
+    оркестратора, сетевой сбой, квота), main остаётся непроверенным молча,
+    пока это не найдёт человек — ровно класс, который этот инвариант
+    закрывает машиной.
+
+    Best-effort по КАЖДОМУ кандидату независимо (как 10/12/13/14): сбой сети
+    на одном PR/workflow не должен скрывать находку по другому — RuntimeError
+    самого реестра (файл сломан/отсутствует) — другое дело, поднимается
+    вызывающей стороне (build_report), не проглатывается здесь тихо."""
+    registry = registry if registry is not None else merge_reactions.load_registry()
+    violations: list[dict] = []
+    for pull in merged_pulls:
+        merged_at_raw = pull.get("merged_at")
+        sha = pull.get("merge_commit_sha")
+        if not merged_at_raw or not sha:
+            continue
+        age_minutes = minutes_between(parse_time(merged_at_raw), now)
+        if age_minutes < MERGE_REACTION_GRACE_MINUTES or age_minutes > MERGE_REACTION_WINDOW_MINUTES:
+            continue
+        try:
+            files = review_labels.list_pr_files(repo, pull["number"], gh)
+        except RuntimeError:
+            continue
+        for workflow in merge_reactions.matching_workflows(files, registry):
+            try:
+                exists = merge_reactions.has_run_for_sha(gh, repo, workflow, sha)
+            except RuntimeError:
+                continue
+            if not exists:
+                violations.append({
+                    "pr": pull["number"], "sha": sha, "workflow": workflow,
+                    "merged_at": merged_at_raw, "age_minutes": round(age_minutes, 1),
+                })
+    return violations
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2038,6 +2132,26 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
 
+    try:
+        v15 = check_merge_reaction_gaps(repo, now, merged_pulls)
+    except RuntimeError as error:
+        findings[15] = []
+        lines.append(f"🚨 [15] проверка реакции на мерж недоступна: {error} — "
+                      "инвариант пропущен на этом прогоне (это НЕ «нарушений нет»)")
+    else:
+        findings[15] = v15
+        if v15:
+            lines.append(f"🚨 [15] {len(v15)} несостоявшихся push-реакций на слитый коммит (#929/#955):")
+            for item in v15:
+                lines.append(
+                    f"   — PR #{item['pr']}: {item['workflow']} нет прогона на "
+                    f"head_sha={item['sha'][:8]} спустя {item['age_minutes']} мин "
+                    f"(мерж {item['merged_at']})"
+                )
+        else:
+            lines.append("💚 [15] у всех недавних слияний есть прогон каждого "
+                          "затронутого workflow из config/merge-reactions.json")
+
     return lines, findings
 
 
@@ -2050,7 +2164,7 @@ def summary(lines: list[str]) -> None:
             file.write(text)
 
 
-ESCALATING_INVARIANTS = (1, 3, 12)
+ESCALATING_INVARIANTS = (1, 3, 12, 15)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -2117,6 +2231,25 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 12, key, text)
         if result:
             lines.append(f"📣 инвариант 12 эскалирован: {result}")
+    if findings.get(15):
+        v15 = findings[15]
+        key = ",".join(f"{i['workflow']}@{i['sha'][:8]}" for i in v15)
+        details = "\n".join(
+            f"— PR #{i['pr']}: {i['workflow']} нет прогона на head_sha={i['sha'][:8]} "
+            f"спустя {i['age_minutes']} мин (мерж {i['merged_at']})"
+            for i in v15
+        )
+        text = (
+            "🚨 edge-harness: инвариант 15 (мерж без реакции push-триггера, #929/#955) — "
+            f"{len(v15)} несостоявшихся push-реакций на слитый коммит:\n{details}\n"
+            "Мерж через GITHUB_TOKEN не создаёт push-событие (доказано #929) — явный "
+            "диспатч должен был сработать в scheduler.py::after_merge через "
+            "merge_reactions.react_to_merge; проверь прогон orchestra.yml на предмет "
+            "упавшего диспатча этого workflow."
+        )
+        result = escalate_if_new(repo, 15, key, text)
+        if result:
+            lines.append(f"📣 инвариант 15 эскалирован: {result}")
     return lines
 
 

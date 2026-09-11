@@ -2214,3 +2214,185 @@ def test_worker_false_success_comment_not_in_ci_gating():
     # Наблюдательный: доступность стороннего Search API не должна красить
     # обязательную проверку `test` (см. докстринг check_worker_false_success_comment).
     assert 14 not in ri.CI_GATING
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 15: мерж без реакции push-триггера (#955, следствие #929)
+# ══════════════════════════════════════════════════════════════════════════
+
+MERGE_REACTION_REGISTRY = [
+    {"prefix": "", "workflow": "repo-ci.yml"},
+    {"prefix": "cf-worker/", "workflow": "deploy-worker.yml"},
+    {"prefix": "dsh-edge/", "workflow": "deploy-dsh-edge.yml"},
+]
+
+
+def merged_pull_with_sha(number, merged_at, sha):
+    return {"number": number, "merged_at": merged_at, "merge_commit_sha": sha}
+
+
+def test_merge_reaction_gaps_flags_missing_run_within_window(monkeypatch):
+    """Живой класс #929: слияние тронуло cf-worker/, но deploy-worker.yml не
+    имеет ни одного прогона на его head_sha спустя 10 минут (>GRACE, <WINDOW)
+    — диспатч либо не сработал, либо промахнулся мимо этого коммита."""
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(900, "2026-09-10T11:50:00Z", "dbe8c9956d")]
+    fake = FakeGh({
+        "pulls/900/files": [{"filename": "cf-worker/src/config.ts"}],
+        "workflows/repo-ci.yml/runs?head_sha=dbe8c9956d": {"workflow_runs": [{"id": 1}]},
+        "workflows/deploy-worker.yml/runs?head_sha=dbe8c9956d": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    assert len(violations) == 1
+    assert violations[0] == {
+        "pr": 900, "sha": "dbe8c9956d", "workflow": "deploy-worker.yml",
+        "merged_at": "2026-09-10T11:50:00Z", "age_minutes": 10.0,
+    }
+
+
+def test_merge_reaction_gaps_silent_when_run_exists(monkeypatch):
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(901, "2026-09-10T11:50:00Z", "abc123")]
+    fake = FakeGh({
+        "pulls/901/files": [{"filename": "cf-worker/src/config.ts"}],
+        "workflows/repo-ci.yml/runs?head_sha=abc123": {"workflow_runs": [{"id": 1}]},
+        "workflows/deploy-worker.yml/runs?head_sha=abc123": {"workflow_runs": [{"id": 2}]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY) == []
+
+
+def test_merge_reaction_gaps_ignores_merge_within_grace_period(monkeypatch):
+    # 2 минуты < MERGE_REACTION_GRACE_MINUTES (5) — диспатчу ещё не дали
+    # время появиться в Actions API, судить рано.
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(902, "2026-09-10T11:58:00Z", "sha902")]
+    fake = FakeGh({})  # ни одного вызова gh() не ожидается вовсе
+    patch_gh(monkeypatch, fake)
+    assert ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY) == []
+    assert fake.calls == []
+
+
+def test_merge_reaction_gaps_ignores_merge_older_than_window(monkeypatch):
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(903, "2026-09-10T07:00:00Z", "sha903")]  # 300 мин назад
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY) == []
+    assert fake.calls == []
+
+
+def test_merge_reaction_gaps_ignores_path_with_no_matching_registry_entry(monkeypatch):
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(904, "2026-09-10T11:50:00Z", "sha904")]
+    fake = FakeGh({
+        "pulls/904/files": [{"filename": "docs/README.md"}],
+        "workflows/repo-ci.yml/runs?head_sha=sha904": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    # Префикс "" реестра всё равно матчит ЛЮБОЙ путь (repo-ci.yml) — пустой
+    # прогон на этом sha ДОЛЖЕН считаться нарушением; проверяем отдельно, что
+    # cf-worker/dsh-edge записи НЕ добавили лишних нарушений для пути вне их
+    # префикса (единственное нарушение — repo-ci.yml).
+    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    assert [v["workflow"] for v in violations] == ["repo-ci.yml"]
+
+
+def test_merge_reaction_gaps_skips_pull_without_merge_commit_sha(monkeypatch):
+    # merge_commit_sha отсутствует (пул мог не успеть заполнить поле) — не
+    # с чем сверять head_sha, кандидат честно пропускается, не гадаем.
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [{"number": 905, "merged_at": "2026-09-10T11:50:00Z"}]
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    assert ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY) == []
+    assert fake.calls == []
+
+
+def test_merge_reaction_gaps_best_effort_on_files_fetch_failure(monkeypatch):
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [
+        merged_pull_with_sha(906, "2026-09-10T11:50:00Z", "sha906"),
+        merged_pull_with_sha(907, "2026-09-10T11:50:00Z", "sha907"),
+    ]
+    fake = FakeGh({
+        "pulls/906/files": RuntimeError("gh api: rate limited"),
+        "pulls/907/files": [{"filename": "cf-worker/x"}],
+        "workflows/repo-ci.yml/runs?head_sha=sha907": {"workflow_runs": [{"id": 1}]},
+        "workflows/deploy-worker.yml/runs?head_sha=sha907": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_merge_reaction_gaps(REPO, now, merged, registry=MERGE_REACTION_REGISTRY)
+    # 906 недоступен (сбой сети) — пропущен молча; 907 разобран как обычно.
+    assert [v["pr"] for v in violations] == [907]
+
+
+def test_merge_reaction_gaps_uses_real_registry_by_default(monkeypatch):
+    """Без явного `registry=` читает config/merge-reactions.json — реальный
+    файл репозитория, не тестовую подмену (иначе мутация файла реестра не
+    ловится этим тестом)."""
+    now = utc(2026, 9, 10, 12, 0)
+    merged = [merged_pull_with_sha(908, "2026-09-10T11:50:00Z", "sha908")]
+    fake = FakeGh({
+        "pulls/908/files": [{"filename": "cf-worker/src/config.ts"}],
+        "runs?head_sha=sha908": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    violations = ri.check_merge_reaction_gaps(REPO, now, merged)
+    workflows = {v["workflow"] for v in violations}
+    assert "repo-ci.yml" in workflows and "deploy-worker.yml" in workflows
+
+
+def test_merge_reaction_gaps_not_in_ci_gating():
+    # Наблюдательный (тот же порядок, что у 1/5/9/10/12/13/14): замер долга
+    # на живом репозитории на момент внедрения ещё не сделан.
+    assert 15 not in ri.CI_GATING
+
+
+def test_build_report_wires_invariant_15(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [merged_pull_with_sha(909, "2026-09-10T11:50:00Z", "sha909")],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "pulls/909/files": [{"filename": "cf-worker/src/config.ts"}],
+        "runs?head_sha=sha909": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[15]) >= 1
+    assert any("🚨" in line and "[15]" in line for line in lines)
+    assert any("sha909"[:8] in line for line in lines)  # короткий sha в отчёте
+
+
+def test_run_escalations_wires_invariant_15_with_fact_not_guess(monkeypatch):
+    calls = []
+
+    def fake_issue_marker_times(repo, issue_number, marker):
+        return []
+
+    def fake_escalate(repo, issue_number, text):
+        calls.append(text)
+        return "отправлено"
+
+    monkeypatch.setattr(ri, "issue_marker_times", fake_issue_marker_times)
+    monkeypatch.setattr(ri, "escalate", fake_escalate)
+
+    findings = {15: [{"pr": 910, "sha": "deadbeefcafe", "workflow": "deploy-worker.yml",
+                       "merged_at": "2026-09-10T11:50:00Z", "age_minutes": 15.0}]}
+    lines = ri.run_escalations("mytab0r/edge-harness", findings)
+    assert len(calls) == 1
+    text = calls[0]
+    # Алерт называет ФАКТ (workflow, sha, время) — не гипотезу (AGENTS.md,
+    # «Алерт не гадает»).
+    assert "deploy-worker.yml" in text and "deadbeef" in text and "15.0" in text
+    assert any("инвариант 15" in line for line in lines)
+
+
+def test_escalating_invariants_includes_15():
+    assert 15 in ri.ESCALATING_INVARIANTS

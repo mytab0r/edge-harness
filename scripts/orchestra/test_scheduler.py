@@ -2789,7 +2789,7 @@ def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
     # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
     # проводка after_merge (архив/deploy/release задачи) — та разобрана
     # отдельными тестами after_merge_* ниже в этом файле.
-    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others: ([], [], False))
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others, merge_sha=None: ([], [], False))
 
     observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
@@ -4233,59 +4233,86 @@ def test_after_merge_wires_update_remaining_pulls(monkeypatch):
 
 
 def test_after_merge_dispatches_dsh_edge_deploy(monkeypatch):
+    # #955: диспатч теперь идёт единой функцией реестра (merge_reactions.
+    # react_to_merge) через gh() — не отдельным subprocess.run(["gh",
+    # "workflow", "run", ...]). Реестр (config/merge-reactions.json) реагирует
+    # на dsh-edge/** ТРЕМЯ workflow (deploy-dsh-edge.yml + repo-ci.yml/
+    # codeql.yml — эти два матчят пустым префиксом ЛЮБОЙ путь), но не
+    # cf-worker'ными (worker-ci.yml/deploy-worker.yml).
     merged = pull(77)
-    dispatches = []
-
-    def fake_run(cmd, **_kwargs):
-        dispatches.append(cmd)
-        return None
-
-    monkeypatch.setattr(sch, "gh", FakeGh({
+    fake = FakeGh({
         "pulls/77/files?per_page=100&page=1": [{"filename": "dsh-edge/plugins.json"}],
         "pulls/77/files?per_page=100&page=2": [],
-    }))
-    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+        "runs?head_sha=": {"workflow_runs": []},
+        "-X POST": None,
+    })
+    monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="dbe8c9956d")
 
     assert hard_failure is False
-    assert ["gh", "workflow", "run", "deploy-dsh-edge.yml", "--ref", "main"] in dispatches
-    assert any("deploy-dsh-edge запущен" in line for line in (observations + actions))
+    dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
+    assert any("deploy-dsh-edge.yml/dispatches" in c for c in dispatched)
+    assert any("repo-ci.yml/dispatches" in c for c in dispatched)
+    assert any("codeql.yml/dispatches" in c for c in dispatched)
+    assert not any("deploy-worker.yml/dispatches" in c for c in dispatched)
+    assert not any("worker-ci.yml/dispatches" in c for c in dispatched)
+    assert any("deploy-dsh-edge.yml запущен" in line for line in (observations + actions))
 
 
 def test_after_merge_skips_dsh_edge_deploy_for_other_paths(monkeypatch):
+    # Путь не тронул dsh-edge/** — deploy-dsh-edge.yml (и cf-worker'ные
+    # worker-ci.yml/deploy-worker.yml) не диспатчатся, но repo-ci.yml/
+    # codeql.yml всё равно диспатчатся (пустой префикс — «весь main», #955).
     merged = pull(78)
-    dispatches = []
-
-    def fake_run(cmd, **_kwargs):
-        dispatches.append(cmd)
-        return None
-
-    monkeypatch.setattr(sch, "gh", FakeGh({
+    fake = FakeGh({
         "pulls/78/files?per_page=100&page=1": [{"filename": "scripts/orchestra/scheduler.py"}],
         "pulls/78/files?per_page=100&page=2": [],
-    }))
-    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+        "runs?head_sha=": {"workflow_runs": []},
+        "-X POST": None,
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="sha78merge")
+
+    assert hard_failure is False
+    dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
+    assert not any("deploy-dsh-edge.yml/dispatches" in c for c in dispatched)
+    assert not any("deploy-worker.yml/dispatches" in c for c in dispatched)
+    assert not any("worker-ci.yml/dispatches" in c for c in dispatched)
+    assert any("repo-ci.yml/dispatches" in c for c in dispatched)
+    assert not any("deploy-dsh-edge" in line for line in (observations + actions))
+
+
+def test_after_merge_uses_unified_merge_reactions_dispatch():
+    # Гвардия класса (issue #955): диспатч на мерж обязан идти ЧЕРЕЗ единую
+    # функцию реестра (merge_reactions.react_to_merge), а не собственной
+    # копией subprocess.run/gh() per-target — иначе новый деплой-таргет снова
+    # плодит третью копию того же класса, который #929 уже нашёл живьём.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "merge_reactions.react_to_merge(gh, repo, files, merge_sha)" in source
+    assert "def dispatch_deploy_on_merge" not in source
+    assert 'subprocess.run(\n            ["gh", "workflow", "run"' not in source
+
+
+def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
+    # merge_sha не передан (например, PUT .../merge не отдал 'sha' по
+    # какой-то причине) — react_to_merge отказывает RuntimeError, но мерж УЖЕ
+    # состоялся: after_merge обязан продолжить (закрытие задач/Telegram/архив
+    # ниже), а не уронить всю функцию — RuntimeError превращается в
+    # наблюдение, не пробрасывается наружу.
+    merged = pull(79)
+    fake = FakeGh({
+        "pulls/79/files?per_page=100&page=1": [],
+        "pulls/79/files?per_page=100&page=2": [],
+    })
+    monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert dispatches == []
-    assert not any("deploy-dsh-edge" in line for line in (observations + actions))
-
-
-def test_deploy_on_merge_class_covers_both_deployables():
-    # Гвардия класса (один хелпер на оба деплоя): снимать диспатч cf-worker или
-    # dsh-edge из after_merge — красный тест; новый деплой-таргет добавляется
-    # строкой того же вида, а не своей копией subprocess.run.
-    source = SCRIPT.read_text(encoding="utf-8")
-    assert 'dispatch_deploy_on_merge(files, "cf-worker/", "deploy-worker.yml")' in source
-    assert 'dispatch_deploy_on_merge(files, "dsh-edge/", "deploy-dsh-edge.yml")' in source
-    # В after_merge не осталось инлайновых копий диспатча мимо хелпера: старая
-    # копия была `subprocess.run(` + `["gh", "workflow", "run"` с отступом
-    # 12 пробелов (внутри if); у хелпера — 4/8. Снятие любого из двух вызовов
-    # хелпера выше красит этот тест, новая копия — последний assert.
-    assert 'subprocess.run(\n            ["gh", "workflow", "run"' not in source
+    assert any("реакция на мерж" in line and "не выполнена" in line for line in observations)
+    assert not any(c.startswith("-X POST") and "/dispatches" in c for c in fake.calls)
 
 
 # ── Чеклист некритичных замечаний ревью — задача-хвост при слиянии (#462) ─────

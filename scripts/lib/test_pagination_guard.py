@@ -114,6 +114,11 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "проект фиксированное малое число (harness/review, harness/ai-review, "
         "#345) — тот же контракт, что pr_check_runs/script_evidence выше: не "
         "растущий пользователем список.",
+    ("scripts/lib/merge_reactions.py", "has_run_for_sha"):
+        "явный `per_page=1` — тот же контракт, что "
+        "scheduler.worker_runs_active/stalled_worker_run выше (#955): вопрос "
+        "«есть ли ХОТЯ БЫ ОДИН прогон на этот head_sha», не список, серверный "
+        "фильтр `head_sha=` уже сужает выборку до прогонов одного коммита.",
 }
 
 
