@@ -478,7 +478,8 @@ WORKER_BRANCH_START_SHA=$(git rev-parse HEAD)
 # песочницу, поэтому именно он, а не только локальный чекаут, доказывает
 # работу этого прогона (см. dsh_worker_run_is_success). Пустая строка —
 # ветки на origin ещё нет (обычный случай для новой задачи до первого пуша).
-WORKER_BRANCH_ORIGIN_START_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
+WORKER_BRANCH_ORIGIN_START_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1) \
+  || die "не смог снять снимок головы ветки $BRANCH на origin (git/сеть)"
 
 # ── 5b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ────────
 # Имя сессии = «#N: название задачи», воркспейс edge-harness. Отказ громкий:
@@ -575,10 +576,6 @@ echo "dsh завершился с кодом $rc (провайдер: ${WORKER_C
 # Отпечаток HEAD ветки ПОСЛЕ прогона — сравнивается с WORKER_BRANCH_START_SHA
 # на шаге 8 (dsh_worker_run_is_success, issue #876).
 WORKER_BRANCH_END_SHA=$(git rev-parse HEAD)
-# Отпечаток головы ветки на origin ПОСЛЕ прогона — сравнивается с
-# WORKER_BRANCH_ORIGIN_START_SHA на шаге 8 (регрессия #878/#935, см.
-# комментарий у WORKER_BRANCH_ORIGIN_START_SHA выше).
-WORKER_BRANCH_ORIGIN_END_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
 dsh_edge_stop_drain
@@ -599,6 +596,20 @@ if [ "$drained_lines" -gt 0 ]; then
   dsh_edge_verify_transcript "$DSH_EDGE_SESSION_ID" \
     || echo "::warning::Транскрипт-проверка (#131) нашла расхождения — см. warning'и выше" >&2
 fi
+
+# Отпечаток головы ветки на origin ПОСЛЕ прогона — сравнивается с
+# WORKER_BRANCH_ORIGIN_START_SHA на шаге 8 (регрессия #878/#935, см.
+# комментарий у WORKER_BRANCH_ORIGIN_START_SHA выше). Снят ЗДЕСЬ, а не сразу
+# после dsh (находка ai-review PR #937): это тоже сетевое чтение под
+# `set -euo pipefail`, и при отказе сети `die` роняет job — если снимать его
+# ДО слива транскрипта в морду, отказ сети сжирает вообще весь отчёт о
+# прогоне (транскрипт так и не долетает до морды). Здесь транскрипт уже
+# доставлен и проверен — при отказе сети теряется только гейт успеха/шаг 8
+# с комментарием в задачу, ход работы в морде уже виден. Момент измерения
+# (голова ветки на origin) от переноса не меняется: между концом dsh и этой
+# строкой в ветку никто не пишет.
+WORKER_BRANCH_ORIGIN_END_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1) \
+  || die "не смог снять снимок головы ветки $BRANCH на origin (git/сеть)"
 
 ANSWER_TAIL=$(tail -c 4000 "$ANSWER_FILE" | redact)
 ERR_TAIL=$(tail -c 4000 "$ERR_FILE" | redact)
