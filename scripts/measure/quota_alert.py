@@ -126,6 +126,14 @@ def _state_marker_prefix(resource_key: str) -> str:
 
 _STATE_RE = re.compile(r"= (breach|ok)(?: issue=#(\d+))?\]")
 
+# Строка кандидата гвардии дублей в stderr issue-create — буквально
+# `  #<num> (score <s>): <title> — <url>` (scripts/gh/issue-create, awk-строка
+# после дедупликации #566); голый "#(\d+)" ловил бы и номер класса дефекта
+# в описании ошибки ("класс #566, живой случай #518/…") ВМЕСТО номера
+# кандидата (found: ревью PR #607).
+_CANDIDATE_LINE_RE = re.compile(r"#(\d+) \(score [0-9.]+\): (.+?) — (?:https?://\S+)\s*$",
+                                re.MULTILINE)
+
 
 # Сколько СВЕЖИХ страниц комментариев #120 читать для дедупа состояния
 # ресурса — одно место правды для всей семьи сторожа квот (quota_watch.py
@@ -166,12 +174,31 @@ def state_marker(resource_key: str, state: str, issue_number: int | None) -> str
     return f"{_state_marker_prefix(resource_key)}{state}{suffix}]"
 
 
+def _same_resource_candidates(stderr: str, resource_label: str) -> list[int]:
+    """Номера кандидатов гвардии дублей, в чьих ЗАГОЛОВКАХ упомянут этот же
+    ресурс (found: ревью PR #607, некритичное замечание «гвардия дублей
+    смешивает ресурсы квот»): шаблонные заголовки «Квота харнеса перевалила
+    за 80.0%: <ресурс>» дают jaccard 0.38–0.50 между РАЗНЫМИ ресурсами при
+    пороге 0.3 — без этой проверки улика по пробитию одного ресурса уходила
+    бы комментарием в чужую задачу, а своя не заводилась вовсе (в день
+    инцидента #324 повышены были сразу несколько CF-метрик, сценарий
+    типовой)."""
+    numbers = []
+    for num, title in _CANDIDATE_LINE_RE.findall(stderr):
+        if resource_label in title:
+            numbers.append(int(num))
+    return numbers
+
+
 def create_or_note_task(repo: str, resource_label: str, resource_key: str,
                          current: float, limit: float, pct: float, threshold: float) -> tuple[int | None, str]:
     """Заводит задачу через scripts/gh/issue-create (гвардия `task`-метки +
     гвардия похожести заголовка #566). Если гвардия дублей нашла уже
     открытую задачу — задача НЕ дублируется, найденная получает комментарий
-    с новой уликой (см. докстринг модуля, «действие, не констатация»).
+    с новой уликой (см. докстринг модуля, «действие, не констатация»);
+    «найденной» считается только задача ТОГО ЖЕ ресурса (метка ресурса в
+    заголовке кандидата), похожие задачи других ресурсов не глотают улику —
+    заводим свою с --confirm-not-duplicate (см. _same_resource_candidates).
     Возвращает (номер задачи или None, диагностика)."""
     title = f"Квота харнеса перевалила за {threshold}%: {resource_label}"
     now = datetime.now(timezone.utc).isoformat()
@@ -192,10 +219,11 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
         "НЕ автоматически по возврату метрики ниже порога: суточный счётчик Cloudflare "
         "сбрасывается в 00:00 UTC сам по себе, это не равно «причина устранена»."
     )
+    args = [str(ISSUE_CREATE), "--title", title, "--body", body,
+            "--label", TASK_LABEL, "--label", AREA_PROCESS_LABEL,
+            "--label", AUTO_LABEL, "--label", QUOTA_BREACH_LABEL]
     result = subprocess.run(
-        [str(ISSUE_CREATE), "--title", title, "--body", body,
-         "--label", TASK_LABEL, "--label", AREA_PROCESS_LABEL,
-         "--label", AUTO_LABEL, "--label", QUOTA_BREACH_LABEL],
+        args,
         capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode == 0:
@@ -204,24 +232,38 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
         return issue_number, (f"задача заведена ({result.stdout.strip()})" if issue_number else
                                f"issue-create завершился успешно, но номер не распознан из вывода: {result.stdout.strip()!r}")
     # Гвардия дублей (#566) отказывает ИМЕННО так, когда похожая ОТКРЫТАЯ
-    # задача уже есть — это не сбой, а сигнал «уже разбирается», найденный
-    # номер получает комментарий вместо второй задачи того же класса.
+    # задача уже есть. Похожая ≠ та же: улика уходит в найденную задачу
+    # только если это задача ПРО ЭТОТ ЖЕ ресурс (метка ресурса в заголовке);
+    # похожие задачи других ресурсов — не получатель чужой улики, своя
+    # задача заводится с --confirm-not-duplicate (found: ревью PR #607 —
+    # jaccard шаблонных заголовков разных ресурсов 0.38–0.50 при пороге 0.3).
     if "похожие ОТКРЫТЫЕ задачи пула уже есть" in result.stderr:
-        # Формат кандидата — буквально `#<num> (score <s>): <title> — <url>`
-        # (scripts/gh/issue-create, awk-строка после дедупликации #566);
-        # голый "#(\d+)" ловил бы и номер класса дефекта в описании ошибки
-        # ("класс #566, живой случай #518/…") ВМЕСТО номера кандидата.
-        numbers = re.findall(r"#(\d+)\s*\(score", result.stderr)
-        if numbers:
-            existing = int(numbers[0])
+        same_resource = _same_resource_candidates(result.stderr, resource_label)
+        if same_resource:
+            existing = same_resource[0]
             note = (f"Новая улика (без второй задачи — гвардия дублей #566 нашла эту "
-                     f"открытой): «{resource_label}» снова {_fmt(current)}/{_fmt(limit)} "
-                     f"({pct}%), {now}")
+                     f"открытой, тот же ресурс «{resource_label}»): «{resource_label}» снова "
+                     f"{_fmt(current)}/{_fmt(limit)} ({pct}%), {now}")
             try:
                 pulse_guard.post_issue_comment(repo, existing, note)
             except RuntimeError as error:
                 return existing, f"задача #{existing} уже открыта, комментарий НЕ оставлен: {error}"
             return existing, f"задача #{existing} уже открыта — добавлена новая улика"
+        confirm = (f"другой ресурс квоты: порог пробил «{resource_label}», а в заголовках похожих "
+                    "открытых задач этот ресурс не упомянут — улика другого ресурса не может "
+                    "заменить задачу на разбор этого (ревью PR #607)")
+        retry = subprocess.run(
+            args + ["--confirm-not-duplicate", confirm],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        if retry.returncode == 0:
+            m = re.search(r"/issues/(\d+)\s*$", retry.stdout.strip())
+            if m:
+                return int(m.group(1)), (f"задача заведена с --confirm-not-duplicate "
+                                          f"(похожие задачи — другие ресурсы квоты): {retry.stdout.strip()}")
+            return None, (f"issue-create завершился успешно с --confirm-not-duplicate, но номер не "
+                           f"распознан из вывода: {retry.stdout.strip()!r}")
+        return None, f"issue-create отказал повторно (с --confirm-not-duplicate): {retry.stderr.strip()[:400]}"
     return None, f"issue-create отказал: {result.stderr.strip()[:400]}"
 
 

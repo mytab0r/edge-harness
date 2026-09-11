@@ -423,6 +423,17 @@ def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch)
     assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
+def test_escalation_channel_failed_is_the_single_verdict_of_both_channels_silent():
+    """«Оба канала молчат» — критерий живёт рядом с escalate (found: ревью
+    PR #607, некритичное замечание: у критерия были вторые копии в
+    quotas.py::main и quota_watch._channel_failed). Мутация: переименуй или
+    измени формат возврата escalate так, что «НЕ доставлен»/«НЕ оставлен»
+    разошлись с предикатом — тест краснеет вместе с вызывающими."""
+    assert pg.escalation_channel_failed("Telegram: НЕ доставлен; след в #120: НЕ оставлен") is True
+    assert pg.escalation_channel_failed("Telegram: доставлен; след в #120: НЕ оставлен") is False
+    assert pg.escalation_channel_failed("Telegram: НЕ доставлен; след в #120: оставлен") is False
+
+
 def test_merge_telegram_text_is_short_clickable_and_escaped():
     text = pg.merge_telegram_text("mytab0r/edge-harness", 405, 170,
                                   "Telegram: «задача выполнена» на открытый PR — врёт, а про слияние в main не сообщает")

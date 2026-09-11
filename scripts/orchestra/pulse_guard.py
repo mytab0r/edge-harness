@@ -1444,6 +1444,17 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
             f"след в #{issue_number}: {comment_note}")
 
 
+def escalation_channel_failed(result: str) -> bool:
+    """«Оба канала эскалации молчат» — единственное место разбора строки,
+    которую возвращает escalate() выше: оба литерала рождаются там же,
+    соседним return'ом. Вызывающие (quotas.py::main,
+    quota_watch.measure_main) обязаны красить прогон только по этому
+    предикату: вторая независимая копия разбора молча погасла бы при смене
+    формата строки (found: ревью PR #607, некритичное замечание —
+    дубликат в quota_watch._channel_failed и инлайн в quotas.py::main)."""
+    return "НЕ доставлен" in result and "НЕ оставлен" in result
+
+
 # ── Сценарии, вызываемые scheduler.py ────────────────────────────────────────────
 
 

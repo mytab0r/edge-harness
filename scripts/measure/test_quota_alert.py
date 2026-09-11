@@ -257,3 +257,68 @@ def test_create_task_unrelated_failure_reports_none(monkeypatch):
     number, note = qa.create_or_note_task(REPO, "x", "k", 1, 2, 50.0, 80.0)
     assert number is None
     assert "отказал" in note
+
+
+def test_create_task_other_resource_candidates_confirmed_not_duplicate(monkeypatch):
+    """Блокер-замечание ревью PR #607 («гвардия дублей смешивает ресурсы
+    квот»): похожие кандидаты — задачи ПРО ДРУГОЙ ресурс (storage вместо
+    rows_read, jaccard шаблонных заголовков 0.38–0.50 при пороге 0.3).
+    Улика чужой задачей не глотается: issue-create вызывается ПОВТОРНО с
+    --confirm-not-duplicate, своя задача заводится. Мутация: верни прежнее
+    «первый кандидат = получатель улики» — тест краснеет (второго вызова
+    нет, задача не заведена)."""
+    storage_stderr = (
+        "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть "
+        "(класс #566, живой случай #518/#547/#564):\n"
+        "  #778 (score 0.44): Квота харнеса перевалила за 80.0%: DO storage/аккаунт — https://...\n"
+    )
+    calls = []
+
+    def fake_run(args, **_kw):
+        calls.append(list(args))
+        if "--confirm-not-duplicate" in args:
+            assert calls[0] is not None
+            return _FakeResult(0, "https://github.com/mytab0r/edge-harness/issues/4243\n")
+        return _FakeResult(1, "", storage_stderr)
+
+    monkeypatch.setattr(qa.subprocess, "run", fake_run)
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment",
+                         lambda repo, issue, text: posted.append((issue, text)))
+
+    number, note = qa.create_or_note_task(REPO, "DO rows_read/сутки", "cf_do_rows_read_day",
+                                           7_600_000, 5_000_000, 152.0, 80.0)
+
+    assert number == 4243
+    assert "заведена" in note and "--confirm-not-duplicate" in note and "другие ресурсы квоты" in note
+    assert posted == []  # чужой задаче улика НЕ ушла
+    assert len(calls) == 2
+    assert "--confirm-not-duplicate" in calls[1]
+    assert "DO rows_read/сутки" in calls[1][calls[1].index("--confirm-not-duplicate") + 1]
+
+
+def test_create_task_mixed_candidates_prefers_same_resource(monkeypatch):
+    """Среди похожих кандидатов есть задача ТОГО ЖЕ ресурса — улика уходит
+    в неё (вторая задача не заводится), задача другого ресурса игнорируется."""
+    mixed_stderr = (
+        "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть "
+        "(класс #566, живой случай #518/#547/#564):\n"
+        "  #778 (score 0.50): Квота харнеса перевалила за 80.0%: DO storage/аккаунт — https://...\n"
+        "  #777 (score 0.91): Квота харнеса перевалила за 80.0%: DO rows_read/сутки — https://...\n"
+    )
+
+    def fake_run(args, **_kw):
+        assert "--confirm-not-duplicate" not in args, "свой кандидат найден — повторного вызова быть не должно"
+        return _FakeResult(1, "", mixed_stderr)
+
+    monkeypatch.setattr(qa.subprocess, "run", fake_run)
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment",
+                         lambda repo, issue, text: posted.append((issue, text)))
+
+    number, note = qa.create_or_note_task(REPO, "DO rows_read/сутки", "cf_do_rows_read_day",
+                                           7_600_000, 5_000_000, 152.0, 80.0)
+
+    assert number == 777
+    assert len(posted) == 1
+    assert "тот же ресурс" in posted[0][1]  # улика называет, почему получатель — своя задача
