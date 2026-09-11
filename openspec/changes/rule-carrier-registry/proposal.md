@@ -1,7 +1,7 @@
 # rule-carrier-registry: правило → носитель → доказательство (ходячий скелет)
 
-Задача пула — issue #648, ветка `agent/648-rule-carrier-registry-v2`,
-владелец открывает PR сам. Это третья версия (v3) этого change: первая
+Задача: #648. Ветка `agent/648-rule-carrier-registry-v2`. Это третья
+версия (v3) этого change: первая
 (ветка `design/rule-carrier-registry`, без задачи пула — нарушение
 контракта, найдено первым разбором) и вторая (design v2, эта же ветка)
 получили от враждебного разбора вердикт «переделывать» дважды подряд
@@ -78,14 +78,20 @@ list[dict]`) и гвардии по исходному коду
 
 1. **Инвентарь.** Файл-на-правило `docs/agents/rules/<id>.md` (YAML-шапка
    + тело). Обязательные поля шапки: `id`, `statement`, `carrier`,
-   `proof_test`, `status` (`proven`/`unproven`/`none`). Валидатор схемы
+   `proof_test`, `status` (`proven`/`unproven`/`none`); поле вне пяти
+   известных — отказ. Валидатор схемы
    (`scripts/lib/rule_registry.py` + `test_rule_registry.py`):
    обязательность полей, `id` = имя файла, резолвимость `carrier` (Python
    `file::symbol` через `ast`) и `proof_test` (pytest node id, РОВНО один
-   собранный тест), согласованность полей со `status` — design.md,
+   собранный тест), согласованность полей со `status`, существование
+   `docs/agents/rules/mutants/<id>.diff` для каждой proven-записи,
+   громкая ошибка с именем файла на каждый нераспарсившийся
+   файл-кандидат — design.md,
    раздел A.
 2. **Мутационная проверка одного правила.** `scripts/lib/
-   mutation_harness.py`, режим `--rule <id>`: здоровье носителя на
+   mutation_harness.py`, режимы `--rule <id>` (одно правило; для
+   записи не-`proven` — явная ошибка) и `--all-proven` (перебор всех
+   proven-записей — его зовёт CI): здоровье носителя на
    немутированном дереве, проверка адресата мутанта, применение мутанта,
    повторный прогон, разбор кода выхода pytest, откат по флагу
    «патч применён» (отказ отката — отдельный громкий исход) —
@@ -94,8 +100,8 @@ list[dict]`) и гвардии по исходному коду
    правила для скелета»).
 3. **Один файл каталога гвардий.** `scripts/ci/guards/
    rule-carrier-registry.sh` с тремя командами — оба новых test-файла,
-   `rule_registry.py --check` и `mutation_harness.py --rule
-   rule-registry-requires-core-fields` — созданный ТЕМ ЖЕ пунктом
+   `rule_registry.py --check` и `mutation_harness.py --all-proven` —
+   созданный ТЕМ ЖЕ пунктом
    tasks.md, что создаёт код (не отдельным последним пунктом плана).
    Рукописный шаг в repo-ci.yml не вариант: гвардия регистрации (#749,
    `scripts/lib/ci_guard_registration_guard.py`) красит новый рукописный
@@ -178,6 +184,11 @@ test_scheduler.py` — 249 тестов, до 19.4 с на один).
   repo-ci.yml исполняет каждый файл каталога сам, рукописная правка
   workflow не нужна, а гвардия её регистрации запрещает;
   `.github/workflows/repo-ci.yml` этим change не изменяется.
+- `docs/INDEX.md` — три ссылки в раздел «Мультиагентная работа»
+  (README каталога правил и обе записи): гвардия полноты карты
+  документации (`scripts/lib/docs_index_guard.py`) рекурсивно обходит
+  `docs/agents/` и красит каждый `.md` без ссылки из INDEX.md без
+  маркера `DOCS-INDEX-OK`.
 - `openspec/specs/journal-tasks-hands.md` — новый раздел (дельта в
   `specs/journal-tasks-hands/spec.md` этого change, номер 47 — см.
   «Риски», нумерация).
@@ -185,8 +196,9 @@ test_scheduler.py` — 249 тестов, до 19.4 с на один).
 ## Acceptance criteria
 
 1. `docs/agents/rules/README.md` и `scripts/lib/rule_registry.py`
-   называют и проверяют ровно 5 обязательных полей шапки и таблицу
-   согласованности со `status`.
+   называют и проверяют ровно 5 обязательных полей шапки (поле вне пяти
+   известных — отказ), таблицу согласованности со `status` и существование
+   `mutants/<id>.diff` для proven-записей.
 2. `mutation_harness.py --rule rule-registry-requires-core-fields`
    на живом дереве: код 0, вывод содержит «доказано»; временная порча
    мутанта (no-op) даёт код ≠0 и текст «мутант выжил»; временное
@@ -196,8 +208,8 @@ test_scheduler.py` — 249 тестов, до 19.4 с на один).
    не тихий успех и не «доказано».
 3. Файл каталога `scripts/ci/guards/rule-carrier-registry.sh` содержит
    ровно три команды (оба новых test-файла, `rule_registry.py --check`,
-   мутация одного правила) и исполняется шагом-перебором «Каталог
-   гвардий» — живой прогон CI на PR этого change зелёный,
+   `mutation_harness.py --all-proven`) и исполняется шагом-перебором
+   «Каталог гвардий» — живой прогон CI на PR этого change зелёный,
    `.github/workflows/repo-ci.yml` не изменён, маркер `ORPHAN-TEST-OK`
    не используется.
 4. Ни один файл вне `openspec/changes/rule-carrier-registry/` (кроме
