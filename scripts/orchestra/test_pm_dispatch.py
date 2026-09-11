@@ -126,8 +126,115 @@ def test_fetch_issue_events_paginates_until_short_page(monkeypatch):
         "issues/events?per_page=100&page=2": page2,
     })
     patch_gh(monkeypatch, fake)
-    events = pd.fetch_issue_events(REPO)
+    events, truncated = pd.fetch_issue_events(REPO)
     assert len(events) == 103
+    assert truncated is False
+
+
+def test_fetch_issue_events_reports_truncation_when_pages_exhausted(monkeypatch):
+    """Десяток полных страниц (лимит max_pages) — events прочитаны, но за
+    срезом МОГУТ быть ещё: truncated=True — то, что проверяет громкая
+    гвардия усечения в cmd_check_closures."""
+    full = [closed_event(ACTOR, "2026-09-09T10:00:00Z") for _ in range(100)]
+    fake = FakeGh({
+        f"issues/events?per_page=100&page={page}": list(full) for page in range(1, 11)
+    })
+    patch_gh(monkeypatch, fake)
+    events, truncated = pd.fetch_issue_events(REPO)
+    assert len(events) == 1000
+    assert truncated is True
+
+
+def test_check_closures_loud_when_window_truncated(monkeypatch):
+    """Громкая гвардия усечения (ревью PR #870, замечание 5): события идут
+    newest-first; если лимит страниц исчерпан, а самый старый ПРОЧИТАННЫЙ
+    всё ещё новее начала окна — за срезом могут быть события окна, счётчик
+    занижен, и зелёный шаг был бы ложью. Мутация: сними гвардию
+    (`truncated and oldest > since` → False) — rc станет 0, тест покраснеет."""
+    in_window = [closed_event(ACTOR, "2026-09-09T10:00:00Z") for _ in range(100)]
+    fake = FakeGh({
+        f"issues/events?per_page=100&page={page}": list(in_window) for page in range(1, 11)
+    })
+    patch_gh(monkeypatch, fake)
+    rc = pd.cmd_check_closures([REPO, ACTOR, "2026-09-09T09:00:00Z"])
+    assert rc == 2  # «проверка не состоялась», не «нарушение» — код другой
+
+
+def test_check_closures_complete_when_oldest_event_predates_window(monkeypatch):
+    """Гвардия усечения НЕ сигналит зря: усечение есть, но самый старый
+    прочитанный старше начала окна — события окна не могли остаться за
+    срезом, обычная проверка продолжается (закрытия до окна чужим актёром:
+    0 в счёте, rc=0). Все страницы одного содержимого — маршруты
+    `page=1`…`page=9` являются подстроками `page=10`, разный контент на
+    десятой странице фейк-роутером не выражается."""
+    old_other_actor = [closed_event("someone-else", "2026-09-09T08:00:00Z") for _ in range(100)]
+    fake = FakeGh({
+        f"issues/events?per_page=100&page={page}": list(old_other_actor) for page in range(1, 11)
+    })
+    patch_gh(monkeypatch, fake)
+    rc = pd.cmd_check_closures([REPO, ACTOR, "2026-09-09T09:00:00Z"])
+    assert rc == 0
+
+
+# ── Границы pm.md по факту закрытий: исполнитель / waiting:owner ────────────
+
+
+def issue_event(actor, created_at, number, *, assignees=None, labels=None, is_pr=False):
+    """closed-событие с встроенным issue — форма живого ответа
+    `issues/events`: payload item'а несёт состояние на момент чтения."""
+    return {
+        "event": "closed",
+        "actor": {"login": actor},
+        "created_at": created_at,
+        "issue": {
+            "number": number,
+            "pull_request": {"url": "https://api.github.com/…"} if is_pr else None,
+            "assignees": [{"login": login} for login in (assignees or [])],
+            "labels": [{"name": name} for name in (labels or [])],
+        },
+    }
+
+
+def test_find_boundary_violations_flags_assignee_and_owner_label():
+    events = [
+        issue_event(ACTOR, "2026-09-09T10:00:00Z", 841, assignees=["mytab0r"], is_pr=True),
+        issue_event(ACTOR, "2026-09-09T10:05:00Z", 842, labels=["waiting:owner"]),
+        issue_event(ACTOR, "2026-09-09T10:10:00Z", 843),  # чистое закрытие — не нарушение
+        issue_event("someone-else", "2026-09-09T10:15:00Z", 844, assignees=["mytab0r"]),
+        issue_event(ACTOR, "2026-09-09T08:00:00Z", 845, assignees=["mytab0r"]),  # до окна
+    ]
+    violations = pd.find_boundary_violations(events, ACTOR, since=utc(2026, 9, 9, 9, 30))
+    assert [v["number"] for v in violations] == [841, 842]
+    assert violations[0]["is_pr"] is True
+    assert violations[1]["is_pr"] is False
+    assert any("waiting:owner" in reason for reason in violations[1]["reasons"])
+
+
+def test_find_boundary_violations_ignores_events_without_issue_payload():
+    events = [closed_event(ACTOR, "2026-09-09T10:00:00Z")]  # issue нет — не падаем
+    assert pd.find_boundary_violations(events, ACTOR, since=utc(2026, 9, 9, 9, 30)) == []
+
+
+def test_check_closures_flags_boundary_violation(monkeypatch, capsys):
+    """Мутация: убери цикл violations в cmd_check_closures — rc останется 0
+    при закрытии item'а с исполнителем, тест покраснеет."""
+    events = [issue_event(ACTOR, "2026-09-09T10:00:00Z", 841, assignees=["mytab0r"])]
+    fake = FakeGh({"issues/events?per_page=100&page=1": events})
+    patch_gh(monkeypatch, fake)
+    rc = pd.cmd_check_closures([REPO, ACTOR, "2026-09-09T09:00:00Z"])
+    assert rc == 1
+    assert "#841" in capsys.readouterr().out
+
+
+def test_check_closures_boundary_stays_green_for_clean_closures(monkeypatch):
+    events = [
+        issue_event(ACTOR, "2026-09-09T10:00:00Z", 841),
+        issue_event(ACTOR, "2026-09-09T10:05:00Z", 842, is_pr=True),
+    ]
+    fake = FakeGh({"issues/events?per_page=100&page=1": events})
+    patch_gh(monkeypatch, fake)
+    rc = pd.cmd_check_closures([REPO, ACTOR, "2026-09-09T09:00:00Z"])
+    assert rc == 0
 
 
 def test_main_dispatches_check_closures_subcommand():

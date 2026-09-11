@@ -2418,37 +2418,74 @@ PM_GROOM_DISPATCH_MARKER_PREFIX = "[статус: авто-диспетч pm н�
 # (design.md §2.1) — не второе место правды, второй читатель того же числа
 # (pm.yml, шаг механической проверки после прогона).
 PM_MAX_CLOSURES_PER_RUN = 25
+# Имя workflow одно для двух вызовов (POST dispatch ниже и чтение свежих
+# прогонов в pm_groom_run_started_after) — не вторая копия строки.
+PM_WORKFLOW_FILENAME = "pm.yml"
+
+
+def pm_groom_run_started_after(repo: str, after: datetime) -> datetime | None:
+    """Момент старта самого свежего прогона pm.yml позже `after` — или None.
+    Один GET списка прогонов (тот же приём, что worker_runs_active); нужен
+    dispatch_pm_groom как гвардия повторного диспатча: маркер идемпотентности
+    ставится ПОСЛЕ успешного POST, и при сбое поста маркера (secondary rate
+    limit на комментариях — реальный режим) следующий пульс без этой гвардии
+    запускал бы pm.yml каждые 15 минут до конца эпизода — очередь дорогих
+    LLM-прогонов по 70 минут из-за одной упавшей записи (находка ревью
+    PR #870, некритичное замечание 7). Читается только на пути диспатча,
+    не на каждом пульсе."""
+    payload = gh(
+        f"repos/{repo}/actions/workflows/{PM_WORKFLOW_FILENAME}/runs?per_page=10"
+    ) or {}
+    newest: datetime | None = None
+    for run in payload.get("workflow_runs") or []:
+        created_at = run.get("created_at")
+        if not created_at:
+            continue
+        started = parse_time(created_at)
+        if started > after and (newest is None or started > newest):
+            newest = started
+    return newest
 
 
 def dispatch_pm_groom(repo: str, now: datetime, *, drain_ok: bool) -> tuple[list[str], list[str]]:
     """Идемпотентный (один прогон на ЭПИЗОД, не на пульс — маркер несёт
-    момент открытия эпизода-триггера) авто-диспетч pm.yml. `drain_ok`
-    принят в сигнатуру для симметрии с остальными gate-функциями main()
-    (design.md §2.1 формулирует условие через drain_gate/wip_gate целиком),
-    но решение здесь читает маркеры WATCHDOG_ISSUE заново (те же источники,
-    что drain_gate/wip_gate уже писали этим же прогоном) — эпизодные времена
-    (когда ИМЕННО открылся эпизод) нужны для идемпотентности, а не только
-    текущий булев вердикт."""
+    момент открытия эпизода-триггера) авто-диспетч pm.yml. `drain_ok` —
+    вердикт drain_gate ЭТОГО ЖЕ пульса (main() вызывает gate раньше диспетча)
+    и быстрый выход его drain-ветви: True — активной тревоги дренажа нет,
+    drain-маркеры не читаются вовсе (минус два сетевых вызова на каждый
+    здоровый пульс); эпизодные времена всё равно читаются из маркеров, когда
+    тревога возможна, — момент открытия эпизода нужен для идемпотентности, а
+    не только текущий булев вердикт. WIP-ветка от `drain_ok` не зависит и
+    маркеры WIP читает всегда (находка ревью PR #870, некритичное замечание 6:
+    параметр без работы не держится)."""
     observations: list[str] = []
     actions: list[str] = []
 
+    drain_episode_start = None
+    if not drain_ok:
+        try:
+            drain_open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_OPEN_MARKER)
+            drain_close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_CLOSE_MARKER)
+        except RuntimeError as error:
+            observations.append(f"⚠️ pm-диспетч: маркеры в #{WATCHDOG_ISSUE} не прочитаны: {error}")
+            return observations, actions
+        drain_last_close = max(drain_close_times) if drain_close_times else None
+        drain_episode_opens = [
+            t for t in drain_open_times if drain_last_close is None or t > drain_last_close
+        ]
+        drain_episode_start = min(drain_episode_opens) if drain_episode_opens else None
+    drain_triggered = bool(
+        drain_episode_start is not None
+        and minutes_between(drain_episode_start, now) / 60 > PM_DISPATCH_AFTER_HOURS
+    )
+
     try:
-        drain_open_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_OPEN_MARKER)
-        drain_close_times = issue_marker_times(repo, WATCHDOG_ISSUE, DRAIN_GATE_CLOSE_MARKER)
         wip_stuck_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_STUCK_MARKER_PREFIX)
         wip_open_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_OPEN_MARKER)
         wip_close_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_CLOSE_MARKER)
     except RuntimeError as error:
         observations.append(f"⚠️ pm-диспетч: маркеры в #{WATCHDOG_ISSUE} не прочитаны: {error}")
         return observations, actions
-
-    drain_last_close = max(drain_close_times) if drain_close_times else None
-    drain_episode_opens = [t for t in drain_open_times if drain_last_close is None or t > drain_last_close]
-    drain_episode_start = min(drain_episode_opens) if drain_episode_opens else None
-    drain_triggered = bool(
-        drain_episode_start is not None
-        and minutes_between(drain_episode_start, now) / 60 > PM_DISPATCH_AFTER_HOURS
-    )
 
     wip_last_close = max(wip_close_times) if wip_close_times else None
     wip_episode_opens = [t for t in wip_open_times if wip_last_close is None or t > wip_last_close]
@@ -2478,6 +2515,31 @@ def dispatch_pm_groom(repo: str, now: datetime, *, drain_ok: bool) -> tuple[list
         observations.append("👤 pm-диспетч уже запущен на этот эпизод — повтор не нужен")
         return observations, actions
 
+    # Гвардия повторного диспатча: маркера нет, но pm.yml уже стартовал ПОСЛЕ
+    # открытия этого эпизода — значит, прошлый диспатч состоялся, а его
+    # маркер-комментарий не сохранился (сбой поста после успешного POST).
+    # Повтор не нужен; маркер ставим сами, чтобы следующие пульсы эпизода не
+    # ходили сюда снова (самолечение идемпотентности).
+    episode_start = min(candidates)
+    recent_run = pm_groom_run_started_after(repo, episode_start)
+    if recent_run is not None:
+        observations.append(
+            f"👤 pm-диспетч: маркера эпизода нет, но pm.yml уже стартовал "
+            f"{recent_run.isoformat(timespec='seconds')} (после открытия эпизода "
+            f"{episode_key}) — повтор не нужен: маркер прошлого диспатча не сохранился"
+        )
+        try:
+            post_issue_comment(
+                repo, WATCHDOG_ISSUE,
+                f"👤 {marker}\npm.yml уже запущен на этот эпизод "
+                f"({recent_run.isoformat(timespec='seconds')}) — маркер того диспатча не "
+                "сохранился (сбой поста после успешного запуска); этот комментарий "
+                "восстанавливает идемпотентность, повторный диспатч не выполнялся.",
+            )
+        except RuntimeError as error:
+            actions.append(f"⚠️ маркер pm-диспетча в #{WATCHDOG_ISSUE} не оставлен: {error}")
+        return observations, actions
+
     reasons = []
     if drain_triggered:
         reasons.append(f"drain_gate держит тревогу дольше {PM_DISPATCH_AFTER_HOURS}ч")
@@ -2487,7 +2549,7 @@ def dispatch_pm_groom(repo: str, now: datetime, *, drain_ok: bool) -> tuple[list
 
     try:
         gh(
-            "-X", "POST", f"repos/{repo}/actions/workflows/pm.yml/dispatches",
+            "-X", "POST", f"repos/{repo}/actions/workflows/{PM_WORKFLOW_FILENAME}/dispatches",
             "-f", "ref=main", "-f", f"inputs[reason]={reason_text}",
         )
     except RuntimeError as error:

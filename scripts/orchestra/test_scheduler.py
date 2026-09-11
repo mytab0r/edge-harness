@@ -5702,12 +5702,33 @@ def test_dispatch_pm_groom_dispatches_when_drain_episode_older_than_threshold(mo
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "workflows/pm.yml/dispatches": None,
+        # Гвардия повторного диспатча (ревью PR #870): пустой список прогонов —
+        # недавнего pm.yml нет, диспатч разрешён.
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
     assert any("pm.yml запущен" in line for line in actions)
     dispatches = [c for c in fake.mutating_calls() if "workflows/pm.yml/dispatches" in c]
     assert len(dispatches) == 1
+
+
+def test_dispatch_pm_groom_drain_ok_true_skips_drain_markers(monkeypatch):
+    """Быстрый выход drain_ok (ревью PR #870, замечание 6): тревоги дренажа
+    в ЭТОМ пульсе нет — drain-маркеры не читаются вовсе. Мутация: убери
+    быстрый выход (читай drain-маркеры всегда) — старый open-маркер в
+    комментариях сделает drain_triggered=True, диспетч пойдёт в
+    pm_groom_run_started_after, у fake нет маршрута runs — AssertionError,
+    тест покраснеет."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=True)
+    assert observations == [] and actions == []
+    assert fake.mutating_calls() == []
+    reads = [c for c in fake.calls if "issues/120/comments" in c]
+    # 3 чтения: wip_stuck, wip_open, wip_close — drain-пара не читается.
+    assert len(reads) == 3
 
 
 def test_dispatch_pm_groom_dispatches_when_wip_stuck_marker_present(monkeypatch):
@@ -5720,6 +5741,7 @@ def test_dispatch_pm_groom_dispatches_when_wip_stuck_marker_present(monkeypatch)
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 6, 9, 5), drain_ok=True)
@@ -5755,12 +5777,63 @@ def test_dispatch_pm_groom_names_both_reasons_when_both_true(monkeypatch):
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
     combined = "\n".join(actions)
     assert "drain_gate держит тревогу" in combined
     assert "WIP-лимит держит взятие" in combined
+
+
+def test_dispatch_pm_groom_skips_when_run_already_started_after_episode(monkeypatch):
+    """Гвардия повторного диспатча (ревью PR #870, замечание 7): маркера
+    эпизода нет (сбой поста маркера ПОСЛЕ успешного POST диспатча), но pm.yml
+    стартовал позже открытия эпизода — повторный диспатч не выполняется,
+    маркер восстанавливается (самолечение идемпотентности). Мутация: убери
+    гвардию — диспетч пойдёт, у fake нет маршрута dispatches, AssertionError,
+    тест покраснеет."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/runs?per_page=10": {
+            "workflow_runs": [
+                # создан 03:00 — ПОЗЖЕ открытия эпизода (02:00), но сам маркер
+                # того диспатча не сохранился
+                {"created_at": "2026-09-09T03:00:00Z"},
+            ]
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert any("повтор не нужен" in line for line in observations)
+    assert all("pm.yml запущен" not in line for line in actions)
+    dispatches = [c for c in fake.mutating_calls() if "dispatches" in c]
+    assert dispatches == []
+    # Маркер идемпотентности восстановлен — следующие пульсы эпизода не
+    # пойдут в чтение прогонов снова.
+    assert any("issues/120/comments" in c for c in fake.mutating_calls())
+
+
+def test_dispatch_pm_groom_dispatches_when_recent_run_predates_episode(monkeypatch):
+    """Гвардия не путает прогон ДРУГОГО (более раннего) эпизода с этим:
+    единственный pm.yml-прогон стартовал ДО открытия текущего эпизода —
+    диспатч выполняется как обычно."""
+    comments = [{"created_at": "2026-09-09T02:00:00Z", "body": sch.DRAIN_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "workflows/pm.yml/dispatches": None,
+        "workflows/pm.yml/runs?per_page=10": {
+            "workflow_runs": [{"created_at": "2026-09-08T12:00:00Z"}],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_pm_groom(REPO, utc(2026, 9, 9, 12, 0), drain_ok=False)
+    assert any("pm.yml запущен" in line for line in actions)
+    dispatches = [c for c in fake.mutating_calls() if "workflows/pm.yml/dispatches" in c]
+    assert len(dispatches) == 1
 
 
 # ── Карантин задачи-отравы (#869, Требование C) ──────────────────────────────

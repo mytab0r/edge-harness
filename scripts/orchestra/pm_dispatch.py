@@ -20,8 +20,12 @@ AGENTS.md), created_at внутри окна прогона [since, until).
 Запуск (шаг workflow, после DSH-прогона pm.yml):
   python scripts/orchestra/pm_dispatch.py check-closures <repo> <actor> \
       <since_iso> [<until_iso>]
-Код возврата: 0 — в пределах PM_MAX_CLOSURES_PER_RUN; 1 — превышение
-(печатает ::error:: с фактическим числом, не полагается на самоотчёт модели).
+Код возврата: 0 — в пределах PM_MAX_CLOSURES_PER_RUN и границы pm.md
+(исполнитель/`waiting:owner`, design.md §2.3) не нарушены; 1 — превышение
+или нарушенная граница (печатает ::error:: с фактическими числами/номерами,
+не полагается на самоотчёт модели); 2 — проверка НЕ СОСТОЯЛАСЬ (события не
+прочитаны или окно усечено — громкая гвардия усечения в cmd_check_closures,
+иначе счётчик занижал бы молча).
 
 Честная граница (находка ревью PR #870, некритичная): счётчик мерит ВСЕ
 `closed`-события `actor_login` за окно, не только те, что сделал именно
@@ -66,21 +70,49 @@ _SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
 PM_MAX_CLOSURES_PER_RUN = scheduler.PM_MAX_CLOSURES_PER_RUN
 
 
-def fetch_issue_events(repo: str, per_page: int = 100, max_pages: int = 10) -> list[dict]:
-    """Постранично, от новых к старым (GitHub отдаёт issues/events в порядке
-    возрастания id — старые первыми; здесь достаточно последних max_pages
-    страниц для окна одного прогона pm.yml, не всей истории репозитория)."""
+def fetch_issue_events(repo: str, per_page: int = 100, max_pages: int = 10) -> tuple[list[dict], bool]:
+    """Постранично, ОТ НОВЫХ К СТАРЫМ (репозиторий-эндпоинт
+    `GET /repos/{repo}/issues/events` отдаёт события newest-first — замер
+    2026-09-10 по api.github.com, находка ревью PR #870: page 1 —
+    created_at 19:31:23Z, page 2 — 19:30:22Z; листать надо С page 1, не с
+    последней). Возвращает (events, truncated): `truncated=True` — лимит
+    max_pages страниц исчерпан, последняя прочитанная страница полная, и за
+    ней МОГУТ быть ещё события; достаточно последних max_pages страниц для
+    окна одного прогона pm.yml, не всей истории репозитория. Полноту окна
+    проверяет cmd_check_closures (громкая гвардия усечения): truncated при
+    непроверенной полноте — то же «шаг молча зелёный», что и неверный счёт."""
     events: list[dict] = []
     page = 1
+    truncated = False
     while page <= max_pages:
         batch = gh(f"repos/{repo}/issues/events?per_page={per_page}&page={page}") or []
         if not batch:
-            break
+            return events, truncated
         events.extend(batch)
         if len(batch) < per_page:
-            break
+            return events, truncated
         page += 1
-    return events
+    return events, True
+
+
+def _closed_in_window(
+    event: dict, actor_login: str, since: datetime, until: datetime | None,
+) -> bool:
+    """Единое правило попадания события в подсчёт (одно место правды для
+    count_closures_in_window и find_boundary_violations): `closed`, тот же
+    актёр, created_at в [since, until); `until=None` — открытый конец."""
+    if event.get("event") != "closed":
+        return False
+    actor = (event.get("actor") or {}).get("login")
+    if actor != actor_login:
+        return False
+    created_at = event.get("created_at")
+    if not created_at:
+        return False
+    when = parse_time(created_at)
+    if when < since:
+        return False
+    return not (until is not None and when >= until)
 
 
 def count_closures_in_window(
@@ -89,23 +121,55 @@ def count_closures_in_window(
     """Чистая функция (issue #869): сколько событий `closed`, атрибутированных
     `actor_login`, попадают в [since, until). `until=None` — открытый конец
     (до текущего момента вызова, обычно момент запуска этой проверки)."""
-    count = 0
+    return sum(
+        1 for event in events if _closed_in_window(event, actor_login, since, until)
+    )
+
+
+# Метка «ждёт решения владельца» — граница pm.md («не трогает waiting:owner»),
+# та же, что waiting_owner_guard.py снимает по решению владельца (#471).
+PM_FORBIDDEN_OWNER_LABEL = "waiting:owner"
+
+
+def find_boundary_violations(
+    events: list[dict], actor_login: str, since: datetime, until: datetime | None = None,
+) -> list[dict]:
+    """Чистая функция (находка ревью PR #870, некритичное замечание 8):
+    закрытые `actor_login`'ом в окне [since, until) items, нарушающие границы
+    pm.md — у закрытого есть исполнитель или метка `waiting:owner`. Тот же
+    класс «факт по событиям, не декларация модели», что потолок закрытий:
+    механически гарантировать можно только посчитанное.
+
+    Известная граница (fail-loud, названа честно): `issue` внутри события
+    несёт СОСТОЯНИЕ НА МОМЕНТ ЧТЕНИЯ, не на момент закрытия — исполнитель,
+    добавленный после закрытия, попадёт в флаг (лишняя тревога, не пропуск);
+    приёмка/мержи закрываются под `github-actions[bot]` (замер 2026-09-11 по
+    issues/events: closed-события задач после приёмки и слитых PR), а не под
+    актёра pm (`GH_PIPELINE_PAT`, `github.repository_owner`) — классов не
+    пересекаются; закрытия воркером под тем же логином возможны — номера
+    называются поимённо, разбор окна вручную отличает."""
+    violations: list[dict] = []
     for event in events:
-        if event.get("event") != "closed":
+        if not _closed_in_window(event, actor_login, since, until):
             continue
-        actor = (event.get("actor") or {}).get("login")
-        if actor != actor_login:
+        issue = event.get("issue") or {}
+        number = issue.get("number")
+        if number is None:
             continue
-        created_at = event.get("created_at")
-        if not created_at:
-            continue
-        when = parse_time(created_at)
-        if when < since:
-            continue
-        if until is not None and when >= until:
-            continue
-        count += 1
-    return count
+        reasons: list[str] = []
+        assignees = [a.get("login", "") for a in issue.get("assignees") or []]
+        if assignees:
+            reasons.append("есть исполнитель: " + ", ".join(login for login in assignees if login))
+        labels = {label.get("name") for label in issue.get("labels") or []}
+        if PM_FORBIDDEN_OWNER_LABEL in labels:
+            reasons.append(f"метка `{PM_FORBIDDEN_OWNER_LABEL}`")
+        if reasons:
+            violations.append({
+                "number": number,
+                "is_pr": bool(issue.get("pull_request")),
+                "reasons": reasons,
+            })
+    return violations
 
 
 def cmd_check_closures(argv: list[str]) -> int:
@@ -119,19 +183,52 @@ def cmd_check_closures(argv: list[str]) -> int:
     until = parse_time(argv[3]) if len(argv) == 4 else None
     try:
         since = parse_time(since_iso)
-        events = fetch_issue_events(repo)
+        events, truncated = fetch_issue_events(repo)
     except RuntimeError as error:
         print(f"::error::pm_dispatch: не смог прочитать issues/events: {error}")
         return 2
+    # Громкая гвардия усечения (находка ревью PR #870, некритичное замечание 5):
+    # события приходят newest-first; если лимит страниц исчерпан, а самый
+    # старый из ПРОЧИТАННЫХ всё ещё новее `since`, за срезом МОГУТ быть
+    # события окна — счётчик занижен, и зелёный шаг здесь был бы ложью
+    # (единственный fail-silent ход этой проверки). Код 2 — «проверка не
+    # состоялась», не «нарушение»: лечится перезапуском/увеличением max_pages,
+    # не разбором поведения pm.
+    oldest = min(
+        (parse_time(event["created_at"]) for event in events if event.get("created_at")),
+        default=None,
+    )
+    if truncated and oldest is not None and oldest > since:
+        print(
+            "::error::pm_dispatch: окно усечено — прочитаны не все события issues/events "
+            f"(самый старый прочитанный {oldest.isoformat(timespec='seconds')} новее "
+            f"начала окна {since.isoformat(timespec='seconds')}); счёт закрытий и границы "
+            "ненадёжны, проверка не состоялась"
+        )
+        return 2
     closures = count_closures_in_window(events, actor, since, until)
+    violations = find_boundary_violations(events, actor, since, until)
+    failed = False
     if closures > PM_MAX_CLOSURES_PER_RUN:
         print(
             f"::error::pm-прогон закрыл {closures} issue/PR — превышен потолок "
             f"PM_MAX_CLOSURES_PER_RUN ({PM_MAX_CLOSURES_PER_RUN}); факт по событиям "
             f"issues/events, не по декларации модели (design.md §2.3)"
         )
+        failed = True
+    for violation in violations:
+        kind = "PR" if violation["is_pr"] else "issue"
+        print(
+            f"::error::pm-прогон закрыл {kind} #{violation['number']} — нарушена граница "
+            f"pm.md (design.md §2.3): {'; '.join(violation['reasons'])}. Разбор окна "
+            "вручную отличает pm-закрытие от чужого под тем же логином (docstring "
+            "find_boundary_violations)"
+        )
+        failed = True
+    if failed:
         return 1
-    print(f"pm_dispatch: {closures} закрытий за прогон (потолок {PM_MAX_CLOSURES_PER_RUN}) — в пределах")
+    print(f"pm_dispatch: {closures} закрытий за прогон (потолок {PM_MAX_CLOSURES_PER_RUN}), "
+          f"границы исполнителя/`{PM_FORBIDDEN_OWNER_LABEL}` не нарушены — в пределах")
     return 0
 
 
