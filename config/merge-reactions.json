@@ -1,0 +1,36 @@
+{
+  "$comment": "Единый реестр «слитый путь → workflow, реагирующий на push по main» (issue #955, следствие #929). Место правды читают И диспетчер (scripts/orchestra/scheduler.py::after_merge через scripts/lib/merge_reactions.py::react_to_merge), И инвариант репозитория (scripts/orchestra/repo_invariants.py, инвариант 15). Мерж PR через GITHUB_TOKEN НЕ создаёт push-событие (GitHub, защита от рекурсии) — ни один из перечисленных ниже workflow не запустится сам собой после автономного слияния оркестратором, только явным диспатчем.",
+  "reactions": [
+    {
+      "prefix": "",
+      "workflow": "repo-ci.yml",
+      "note": "обязательный гейт test (инварианты и гвардии репозитория, #244) — обязан прогоняться на самом main, не только на ветке PR до мержа"
+    },
+    {
+      "prefix": "",
+      "workflow": "codeql.yml",
+      "note": "security-скан слитого дерева — без явного диспатча идёт только раз в неделю по schedule (понедельник 04:17)"
+    },
+    {
+      "prefix": "cf-worker/",
+      "workflow": "worker-ci.yml",
+      "note": "ворота морды (typecheck/vitest/канарейка UI) на слитом дереве cf-worker/**"
+    },
+    {
+      "prefix": "cf-worker/",
+      "workflow": "deploy-worker.yml",
+      "note": "деплой морды Cloudflare Workers (push-триггер по cf-worker/**)"
+    },
+    {
+      "prefix": "dsh-edge/",
+      "workflow": "deploy-dsh-edge.yml",
+      "note": "деплой dsh-edge — канал обновления морды (#77/#374, push-триггер по dsh-edge/**)"
+    }
+  ],
+  "excluded": [
+    {
+      "workflow": "plugin-forge.yml",
+      "reason": "push-триггер по plugins-src/** есть (#945/PR #952) + почасовая schedule-страховка, но явный диспатч на мерже требует ДИНАМИЧЕСКИХ входов (plugin_path на каждый затронутый plugins-src/<id>, task_issue слитого PR) — статическая запись реестра prefix→workflow это не выражает. Отдельная узкая задача — issue #946, не дублируется этим реестром."
+    }
+  ]
+}
