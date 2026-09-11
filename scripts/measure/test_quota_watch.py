@@ -386,16 +386,20 @@ def test_cheap_check_measurement_failure_is_not_fatal(monkeypatch):
 def test_channel_failed_criterion_single_source():
     """Критерии разбора строки escalate — ОДНО место правды:
     pulse_guard.escalation_channel_failed («оба канала молчат») и
-    pulse_guard.escalation_dedup_carrier_failed («сигнал ушёл, носитель
-    дедупа нет») живут рядом с самим escalate, чьим return'ом эти литералы
-    рождаются. _channel_failed/_dedup_carrier_failed (quota_watch) и проверка
-    в quotas.py::main обязаны сводиться к ним; вторые копии литералов
-    «НЕ доставлен»/«НЕ оставлен» в вызывающих гасли бы молча при смене
-    формата строки (found: ревью PR #607, некритичное замечание; второй
-    предикат — ревью того же PR, head 5824e75). Гвардия по исходнику:
-    литералы живут только в pulse_guard.py."""
+    pulse_guard.escalation_dedup_carrier_failed («носитель дедупа не
+    записан») живут рядом с самим escalate и carrier_write_verdict, чьими
+    return'ами эти литералы рождаются. _channel_failed/_dedup_carrier_failed
+    (quota_watch), проверка в quotas.py::main и тихая запись маркера
+    (quota_alert.check_and_alert → carrier_write_verdict) обязаны сводиться
+    к ним; вторые копии литералов «НЕ доставлен»/«НЕ оставлен» в вызывающих
+    гасли бы молча при смене формата строки (found: ревью PR #607,
+    некритичное замечание; второй предикат — ревью head 5824e75; расширение
+    на quota_alert.py — ревью head 345a64f, тихая запись маркера вернула бы
+    строку с «НЕ оставлен» мимо единственного места рождения). Гвардия по
+    исходнику: литералы живут только в pulse_guard.py."""
     root = SCRIPT.parent.parent.parent
-    for rel in ("scripts/measure/quota_watch.py", "scripts/measure/quotas.py"):
+    for rel in ("scripts/measure/quota_watch.py", "scripts/measure/quotas.py",
+                "scripts/measure/quota_alert.py"):
         for literal in ('"НЕ доставлен"', '"НЕ оставлен"'):
             assert literal not in (root / rel).read_text(encoding="utf-8"), \
                 f"{rel}: вторая копия разбора строки escalate ({literal}) — сведи к предикатам pulse_guard"
@@ -554,6 +558,79 @@ def test_measure_main_exits_nonzero_when_alert_channel_fails(monkeypatch):
     monkeypatch.setattr(qw, "datetime", _Now)
 
     assert qw.measure_main() == 1
+
+
+def test_measure_main_exits_nonzero_when_dedup_carrier_fails(monkeypatch, capsys):
+    """БЛОКЕР ревью PR #607 (head 345a64f), форма «сигнал ушёл, носитель
+    дедупа нет»: breach-канал применял только предикат «оба канала молчат» —
+    при живом Telegram и персистентно падающем следе в #120 (залоченная
+    задача-статус, secondary rate limit на POST при живых GET-чтениях)
+    маркер состояния ресурса не записывался, last_state возвращал (None,
+    None) на каждом тике, и каждый 15-минутный тик заново заходил в
+    breach-ветку: повторная Telegram-страница и улика в задачу-пул на каждом
+    тике при ЗЕЛЁНОМ шаге (ревью проверило живым кодом: три тика — три
+    страницы, exit 0 на каждом, escalation_dedup_carrier_failed=True).
+    Мутация: верни в measure_main `_channel_failed` вместо
+    `_delivery_exit_failed` — тест краснеет. Текст ошибки РАЗЛИЧАЕТ форму
+    отказа от «оба канала молчат» (AGENTS.md «Алерт не гадает»)."""
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(qw, "cheap_check",
+                         lambda *a: "cf_do_rows_read_day: breach — Telegram: доставлен; "
+                                    "след в #120: НЕ оставлен; маркер состояния НЕ записан")
+
+    class _Now(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 7, 12, 30, tzinfo=timezone.utc)  # вне окна полного среза
+    monkeypatch.setattr(qw, "datetime", _Now)
+
+    assert qw.measure_main() == 1
+    err = capsys.readouterr().err
+    assert "::error::" in err
+    assert "повторит страницу" in err        # следствие для следующего тика названо
+    assert "ни по одному" not in err         # это НЕ форма «оба канала молчат»
+
+
+def test_measure_main_exits_nonzero_when_full_sweep_dedup_carrier_fails(monkeypatch, capsys):
+    """Тот же блокер, второй путь: строка вердикта из full_sweep (тик внутри
+    первой четверти часа) тоже обязана красить прогон — дедуп-носитель
+    остальных метрик среза ломается так же, как rows_read."""
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(qw, "cheap_check",
+                         lambda *a: "cf_do_rows_read_day: без изменений (ok, 2.0%) — сигнал не отправлен (дедуп)")
+    monkeypatch.setattr(qw, "full_sweep", lambda *a: [
+        "gh_rest_rate_limit_hour: breach — Telegram: доставлен; след в #120: НЕ оставлен; маркер состояния НЕ записан",
+    ])
+
+    class _Now(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 7, 12, 5, tzinfo=timezone.utc)  # minute=5 — внутри окна полного среза
+    monkeypatch.setattr(qw, "datetime", _Now)
+
+    assert qw.measure_main() == 1
+    err = capsys.readouterr().err
+    assert "::error::" in err
+    assert "повторит страницу" in err
+
+
+def test_measure_main_stays_green_when_breach_delivered_with_trace(monkeypatch, capsys):
+    """Здоровый breach-вердикт (Telegram доставлен, след с маркером оставлен)
+    — зелёный: красим отказ доставки/носителя, а не сам факт пробития
+    порога."""
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(qw, "cheap_check",
+                         lambda *a: "cf_do_rows_read_day: breach — Telegram: доставлен; "
+                                    "след в #120: оставлен; задача заведена")
+
+    class _Now(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 7, 12, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(qw, "datetime", _Now)
+
+    assert qw.measure_main() == 0
+    assert "::error::" not in capsys.readouterr().err
 
 
 # ── gate_main(): троттлинг + громкий сигнал простоя замера ─────────────────
@@ -983,6 +1060,31 @@ def test_stale_alert_dedupes_repeated_version_check_network_failure(monkeypatch)
 
     assert escalated == []
     assert "дедуп" in result_1 and "дедуп" in result_2
+
+
+def test_stale_alert_dedup_skip_note_travels_in_escalation_text(monkeypatch):
+    """Чеклист ревью PR #607 («при недоступном чтении дедупа текст алерта не
+    знает, что дедуп пропущен»): пока чтение комментариев #120 лежит, а POST
+    жив, страница повторяется владельцу на каждом тике — сам текст эскалации
+    обязан нести пометку о пропущенном дедупе с причиной, а не только лог
+    прогона (тот же приём честной приписки, что у unknown-состояния
+    workflow_version_check). Мутация: убери дописку `text +=` в ветке
+    RuntimeError — тест краснеет."""
+    def broken_markers(repo, issue, marker, **_kw):
+        raise RuntimeError("Server Error")
+    monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", broken_markers)
+    escalated = []
+    monkeypatch.setattr(qw.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append(text)
+                         or "Telegram: доставлен; след в #120: оставлен")
+
+    result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
+
+    assert len(escalated) == 1
+    assert "Дедуп эпизода пропущен" in escalated[0]
+    assert "Server Error" in escalated[0]                 # причина дословно, не гипотеза
+    assert "повторится на следующем тике" in escalated[0]  # следствие названо
+    assert "дедуп пропущен" in result
 
 
 def test_stale_alert_reopens_after_episode_closed(monkeypatch):

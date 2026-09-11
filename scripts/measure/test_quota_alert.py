@@ -184,6 +184,70 @@ def test_first_observation_already_ok_does_not_send_false_recovery(monkeypatch):
     assert "первое наблюдение" in result
 
 
+def test_first_observation_marker_write_failure_is_predicate_visible(monkeypatch):
+    """БЛОКЕР ревью PR #607 (head 345a64f), второе место: отказ тихой записи
+    носителя дедупа обязан быть различим вызывающему ПРЕДИКАТОМ, а не только
+    строкой лога — вердикт строит pulse_guard.carrier_write_verdict, строку
+    отказа ловит pulse_guard.escalation_dedup_carrier_failed, и
+    measure_main краснит по ней прогон. Иначе носитель дедупа мог стоять
+    сломанным неограниченно долго при зелёных прогонах (последующий breach
+    при сломанном носителе повторял бы Telegram-страницу каждый тик, и ни
+    один прогон не говорил бы об этом заранее). Мутация: верни в
+    check_and_alert немаркированную строку «маркер НЕ записан: …» — тест
+    краснеет."""
+    _no_prior_state(monkeypatch)
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    def broken_post(repo, issue, text):
+        raise RuntimeError("HTTP 403: Not Have Write Access To Repository")
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", broken_post)
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
+
+    assert escalated == []                                   # тихая ветка: эскалации нет
+    assert "первое наблюдение" in result
+    assert "HTTP 403" in result                              # причина дословно, не гипотеза
+    assert qa.pulse_guard.escalation_dedup_carrier_failed(result) is True
+    assert qa.pulse_guard.escalation_channel_failed(result) is False
+
+
+def test_first_observation_marker_write_success_does_not_trip_predicates(monkeypatch):
+    """Здоровая тихая запись — зелёная: предикат носителя дедупа не должен
+    принимать успешный вердикт за отказ (иначе каждый первый тик нового
+    ресурса красил бы прогон ложным разбором)."""
+    _no_prior_state(monkeypatch)
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda repo, issue, text: None)
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
+
+    assert qa.pulse_guard.escalation_dedup_carrier_failed(result) is False
+    assert qa.pulse_guard.escalation_channel_failed(result) is False
+
+
+def test_lost_evidence_note_is_not_mistaken_for_broken_dedup_carrier(monkeypatch):
+    """Потерянная улика (комментарий в найденную задачу не добавлен) при
+    записанном маркере и доставленном Telegram — НЕ отказ носителя дедупа:
+    предикат не должен давать ложного красного (маркер записан, повторной
+    страницы не будет). Формулировка note нарочно без литералов вердикта
+    escalate — литералы рождаются только в pulse_guard (source-гвардия
+    test_channel_failed_criterion_single_source)."""
+    _no_prior_state(monkeypatch)
+    monkeypatch.setattr(qa, "create_or_note_task",
+                         lambda *a: (1234, "задача #1234 уже открыта, комментарий с уликой не добавлен: сеть"))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append(text)
+                         or "Telegram: доставлен; след в #120: оставлен")
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
+                                 7_487_640, 5_000_000, 149.8)
+
+    assert "комментарий с уликой не добавлен" in result
+    assert qa.pulse_guard.escalation_dedup_carrier_failed(result) is False
+    assert qa.pulse_guard.escalation_channel_failed(result) is False
+
+
 def test_breach_without_created_task_does_not_write_state_marker(monkeypatch):
     """create_or_note_task не смог завести/найти задачу (issue_number is None)
     — маркер breach НЕ пишется, иначе следующий прогон увидел бы «без

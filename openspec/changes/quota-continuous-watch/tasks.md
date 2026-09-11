@@ -84,6 +84,21 @@
 - [x] Несостоявшийся замер краснит прогон. Критерий:
       `test_measure_main_exits_nonzero_without_credentials`,
       `test_measure_main_exits_nonzero_when_measurement_itself_fails`.
+- [x] Вердикт доставки не выбрасывается ни одним каналом (found: ревью PR
+      #607, heads 5824e75/345a64f): гейт применяет оба предиката
+      (`escalation_channel_failed`/`escalation_dedup_carrier_failed`) к
+      `stale_alert`; `measure_main` — к результатам `cheap_check` и
+      `full_sweep` (`_delivery_exit_failed`, тексты ошибок различают формы
+      отказа); тихая запись маркера (первое наблюдение в норме) возвращает
+      вердикт `pulse_guard.carrier_write_verdict` и ловится предикатом
+      носителя дедупа, source-гвардия литералов расширена на
+      `quota_alert.py`. Критерий:
+      `test_gate_main_exits_nonzero_*` (гейт),
+      `test_measure_main_exits_nonzero_when_dedup_carrier_fails`,
+      `test_measure_main_exits_nonzero_when_full_sweep_dedup_carrier_fails`
+      (мутационно: возврат к `_channel_failed` краснит),
+      `test_first_observation_marker_write_failure_is_predicate_visible`
+      (мутационно: немаркированная строка отказа краснит).
 - [x] Чтение маркеров #120 ограничено свежей страницей
       (`MARKER_SCAN_PAGES`, одно место правды в `quota_alert.py`): и
       stale-эпизоды, и дедуп состояния ресурса. Критерий:

@@ -17,7 +17,7 @@ over_threshold` + `pulse_guard.escalate`), но только по требова
 квоты пробила порог», а не два независимых, которые светили бы дублирующими
 алертами на один и тот же ресурс просто потому, что его увидели оба сборщика.
 
-Четыре предохранителя:
+Пять предохранителей:
 
   1. Дедупликация по ПЕРЕХОДУ состояния (issue #120: pulse_guard.WATCHDOG_ISSUE,
      тот же канал, что у предохранителя конвейера и пульса — второй не
@@ -54,6 +54,16 @@ over_threshold` + `pulse_guard.escalate`), но только по требова
      дедупу до случайного breach→ok (для rows_read — сутки, для
      storage-метрики — пока сама не упадёт), а действие («заводит задачу»,
      суть #605) так и не повторилось бы.
+  5. Отказ носителя дедупа различим вызывающим, а не только строкой лога
+     (found: ревью PR #607, head 345a64f): тихая запись маркера (первое
+     наблюдение в норме) возвращает вердикт `pulse_guard.carrier_write_
+     verdict` — той же лексикой, что `escalate`, — и вызывающий
+     (`quota_watch.measure_main::_delivery_exit_failed`) краснит его
+     предикатом `pulse_guard.escalation_dedup_carrier_failed`; breach-переход
+     проходит через сам `escalate`, и его вердикт краснится теми же
+     предикатами. Иначе носитель дедупа мог стоять сломанным неограниченно
+     долго при зелёных прогонах: каждый тик повторял бы страницу/попытку
+     действия, и ни один прогон не говорил бы об этом.
 
 Запуск тестов: python -m pytest scripts/measure/test_quota_alert.py -q
 """
@@ -247,7 +257,16 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
             try:
                 pulse_guard.post_issue_comment(repo, existing, note)
             except RuntimeError as error:
-                return existing, f"задача #{existing} уже открыта, комментарий НЕ оставлен: {error}"
+                # Формулировка НАРОЧНО не содержит литералов вердикта
+                # escalate («НЕ оставлен»): маркер состояния здесь УЖЕ
+                # записан escalate'ом (носитель дедупа цел, повторной
+                # страницы не будет), и предикат
+                # pulse_guard.escalation_dedup_carrier_failed не должен
+                # принимать потерянную улику за сломанный носитель — иначе
+                # measure_main краснил бы прогон ложным разбором (found:
+                # ревью PR #607, head 345a64f — source-гвардия запрещает
+                # вторые копии литералов вне pulse_guard).
+                return existing, f"задача #{existing} уже открыта, комментарий с уликой не добавлен: {error}"
             return existing, f"задача #{existing} уже открыта — добавлена новая улика"
         confirm = (f"другой ресурс квоты: порог пробил «{resource_label}», а в заголовках похожих "
                     "открытых задач этот ресурс не упомянут — улика другого ресурса не может "
@@ -272,7 +291,10 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
                      threshold: float = quotas.THRESHOLD_PCT) -> str:
     """Единая точка входа обоих вызывающих (см. докстринг модуля). Возвращает
     строку для лога прогона — вызывающий печатает её и решает про exit code
-    по той же подстроке "НЕ доставлен"/"НЕ оставлен", что и quotas.py.
+    предикатами pulse_guard (escalation_channel_failed /
+    escalation_dedup_carrier_failed) через quota_watch._delivery_exit_failed;
+    отказ тихой записи маркера (первое наблюдение в норме) приходит вердиктом
+    carrier_write_verdict и ловится тем же вторым предикатом.
 
     Первое наблюдение ресурса (prev_state is None), заставшее его уже в
     норме, — не переход breach→ok (события восстановления не было, эскалация
@@ -284,11 +306,24 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     prev_state, prev_issue = last_state(repo, resource_key)
 
     if prev_state is None and new_state == "ok":
+        # Носитель дедупа пишется напрямую (post_issue_comment, без
+        # эскалации — см. предохранитель 4 в докстринге модуля), поэтому
+        # отказ здесь не проходит через вердикт escalate и обязан быть
+        # различим вызывающему отдельно (found: ревью PR #607, head 345a64f
+        # — раньше отказ возвращался строкой «маркер НЕ записан», которую
+        # вызывающий не прогонял ни через один предикат: носитель дедупа
+        # мог стоять сломанным неограниченно долго при зелёных прогонах).
+        # Вердикт строит pulse_guard.carrier_write_verdict — той же лексикой,
+        # что escalate, литералы рождаются там же, рядом с предикатами; строку
+        # отказа ловит pulse_guard.escalation_dedup_carrier_failed, и
+        # вызывающий (quota_watch.measure_main:: _delivery_exit_failed)
+        # краснит по ней прогон.
         try:
             pulse_guard.post_issue_comment(repo, WATCHDOG_ISSUE, state_marker(resource_key, "ok", None))
+            verdict = pulse_guard.carrier_write_verdict(WATCHDOG_ISSUE, True)
         except RuntimeError as error:
-            return (f"{resource_key}: первое наблюдение (ok, {pct}%) — маркер НЕ записан: {error}")
-        return f"{resource_key}: первое наблюдение — состояние зафиксировано (ok, {pct}%)"
+            verdict = pulse_guard.carrier_write_verdict(WATCHDOG_ISSUE, False, str(error))
+        return f"{resource_key}: первое наблюдение (ok, {pct}%) — {verdict}"
 
     if prev_state == new_state:
         return f"{resource_key}: без изменений ({new_state}, {pct}%) — сигнал не отправлен (дедуп)"
