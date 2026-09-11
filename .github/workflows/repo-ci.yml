@@ -24,6 +24,10 @@ permissions:
   # читают открытые issues/PR живым gh api — read достаточно, шаг ниже не пишет.
   issues: read
   pull-requests: read
+  # Инвариант 15 (#940, check_ghost_actions_workflows) читает
+  # GET /repos/{repo}/actions/workflows — этому REST-эндпоинту нужен явный
+  # scope actions:read на токене, contents/issues/pull-requests его не несут.
+  actions: read
 
 jobs:
   test:

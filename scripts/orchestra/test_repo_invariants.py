@@ -211,12 +211,20 @@ class FakeGh:
     существующий тест build_report был бы обязан завести собственный
     маршрут issues/120/comments, хотя фантомная пауза конвейера — не их
     предмет; тест, которому нужны конкретные маркеры, переопределяет этот
-    маршрут явно (уже так делают тесты #196/#220 выше)."""
+    маршрут явно (уже так делают тесты #196/#220 выше).
+
+    Запасной маршрут для реестра workflow (инвариант 17, #940): здоровый
+    дефолт — пустой список (призрачных workflow нет). Без него КАЖДЫЙ
+    существующий тест build_report был бы обязан завести собственный
+    маршрут actions/workflows, хотя призрачные workflow — не их предмет;
+    тест, которому нужны конкретные записи API, переопределяет маршрут явно
+    (см. test_ghost_actions_workflows_* ниже)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
+        "actions/workflows?per_page=100": {"workflows": []},
     }
 
     def __init__(self, routes):
@@ -2444,3 +2452,111 @@ def test_run_escalations_wires_invariant_15_with_fact_not_guess(monkeypatch):
 
 def test_escalating_invariants_includes_15():
     assert 15 in ri.ESCALATING_INVARIANTS
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 17 (#940; номер 15 занят #956, 16 занят #950 на момент ребейза
+# этого PR, #904): «призрачный» workflow — в Actions API есть, на диске нет
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой замер 2026-09-11: 5 записей API (diag-501, diag-501-verify, diag-502,
+# dsh-edge-pr-smoke, quota-watch) без файла в .github/workflows/ — все 5
+# отключены (state disabled_manually) тем же PR, что добавил инвариант;
+# GitHub не даёт удалить саму запись (DELETE .../actions/workflows/{id} —
+# 404 Not Found, проверено живым вызовом), поэтому «нарушение» — активная
+# (ещё не отключённая), не любая когда-либо существовавшая.
+
+
+def _wf(name, path, state="active", id_=1):
+    return {"id": id_, "name": name, "path": path, "state": state}
+
+
+def test_ghost_workflow_active_without_disk_file_is_flagged():
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("quota-watch", ".github/workflows/quota-watch.yml")],
+        disk_names=set(),
+    )
+    assert violations == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
+
+
+def test_ghost_workflow_present_on_disk_is_not_flagged():
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("orchestra", ".github/workflows/orchestra.yml")],
+        disk_names={"orchestra.yml"},
+    )
+    assert violations == []
+
+
+def test_ghost_workflow_already_disabled_is_not_flagged_again():
+    # Мутация-доказательство: убрать проверку state != "active" — красит
+    # уже отключённые призраки (5 живых из замера #940) вечно, хотя
+    # GitHub физически не даёт снять саму запись API.
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("quota-watch", ".github/workflows/quota-watch.yml", state="disabled_manually")],
+        disk_names=set(),
+    )
+    assert violations == []
+
+
+def test_ghost_workflow_dependabot_dynamic_path_is_not_a_ghost():
+    # dynamic/dependabot/dependabot-updates — синтетическая запись Dependabot,
+    # не файл этого репозитория, нечему соответствовать на диске.
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("Dependabot Updates", "dynamic/dependabot/dependabot-updates")],
+        disk_names=set(),
+    )
+    assert violations == []
+
+
+def test_fetch_actions_workflows_uses_mockable_transport(monkeypatch):
+    fake = FakeGh({"actions/workflows?per_page=100": {"workflows": [_wf("orchestra", ".github/workflows/orchestra.yml")]}})
+    patch_gh(monkeypatch, fake)
+    assert ri.fetch_actions_workflows(REPO) == [_wf("orchestra", ".github/workflows/orchestra.yml")]
+
+
+def test_fetch_actions_workflows_full_page_raises_loud(monkeypatch):
+    # Находка ревью PR #944, второй раунд: реестр растёт монотонно и без
+    # верхней границы (GitHub не даёт удалить запись с историей запусков) —
+    # полная страница обязана падать громко, не молчать о потерянном хвосте.
+    fake = FakeGh({"actions/workflows?per_page=100": {
+        "workflows": [_wf(f"wf-{i}", f".github/workflows/wf-{i}.yml", id_=i) for i in range(100)]}})
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="100"):
+        ri.fetch_actions_workflows(REPO)
+
+
+def test_workflow_files_on_disk_reads_real_directory(tmp_path):
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "orchestra.yml").write_text("name: x\n", encoding="utf-8")
+    (wf_dir / "worker.yaml").write_text("name: y\n", encoding="utf-8")
+    (wf_dir / "README.md").write_text("не workflow\n", encoding="utf-8")
+    assert ri.workflow_files_on_disk(wf_dir) == {"orchestra.yml", "worker.yaml"}
+
+
+def test_workflow_files_on_disk_missing_directory_is_empty_not_error(tmp_path):
+    assert ri.workflow_files_on_disk(tmp_path / "no-such-dir") == set()
+
+
+def test_build_report_flags_ghost_workflow(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "actions/workflows?per_page=100": {"workflows": [_wf("quota-watch", ".github/workflows/quota-watch.yml")]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    monkeypatch.setattr(ri, "workflow_files_on_disk", lambda _dir: set())
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
+    assert any("🚨" in line and "[17]" in line for line in lines)
+
+
+def test_ghost_actions_workflows_in_ci_gating_with_gas():
+    assert 17 in ri.CI_GATING
+    assert 17 in ri.GATING_RELEASE_CONDITION
