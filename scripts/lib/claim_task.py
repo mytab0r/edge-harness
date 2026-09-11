@@ -25,7 +25,14 @@ no-op с честным task_busy в журнале). Другого пути н
 обоснование): каждый скрипт — самостоятельная точка входа без пакетной
 системы. Гвардия класса #124 (keyword body= в gh-вызове) распространена
 шагом repo-ci и на scripts/lib.
-"""
+
+Прод-запись только в CI (#951, доводка PR #950): claim_task обслуживает
+каналы, которым запись ВНЕ CI — штатный режим (task-branch/task.sh/
+dsh_task.sh claim'ят локально), поэтому gh() здесь не гейтит себя сама
+безусловно, в отличие от pulse_guard.gh(). Вместо этого — set_write_guard():
+единственный текущий подписчик, scheduler.py, подключает свой предикат
+«писать можно только в CI» (_guard_raw_subprocess_write) один раз при
+загрузке модуля; остальные каналы хук не трогают и пишут как раньше."""
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
 import importlib.util
@@ -54,8 +61,42 @@ EXIT_OK = 0
 EXIT_BUSY = 1
 EXIT_ERROR = 2
 
+_GH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _is_write(args: tuple[str, ...]) -> bool:
+    """Тот же признак, что pulse_guard._gh_call_is_write — `-X МЕТОД`
+    где-либо в аргументах."""
+    for i, arg in enumerate(args):
+        if arg == "-X" and i + 1 < len(args):
+            return args[i + 1].upper() in _GH_WRITE_METHODS
+    return False
+
+
+# Инъецируемый хук перед КАЖДЫМ изменяющим вызовом gh() этого модуля (#951,
+# доводка PR #950). По умолчанию None — claim_task пишет как раньше: этот
+# модуль общий для МНОГИХ каналов (task-branch/task.sh/dsh_task.sh claim'ят
+# ЛОКАЛЬНО и по замыслу — это не «запись в прод из неконтролируемого места»,
+# а сам штатный способ взять задачу), безусловный гейт здесь сломал бы
+# легитимный локальный claim. `scheduler.py` — единственный из каналов, кому
+# нужно решение «писать только в CI»: он подключает СВОЙ уже существующий
+# предикат (_guard_raw_subprocess_write → pulse_guard.prod_writes_allowed)
+# через set_write_guard ниже, а не заводит здесь вторую копию сигналов
+# GITHUB_ACTIONS/GITHUB_RUN_ID/ALLOW_PROD_WRITES_ENV.
+_write_guard = None
+
+
+def set_write_guard(guard) -> None:
+    """guard(description: str) -> bool — True разрешает реальный вызов,
+    False просит gh() молча (с warning'ом внутри guard) вернуть None вместо
+    похода в сеть. guard=None (по умолчанию) отключает проверку целиком."""
+    global _write_guard
+    _write_guard = guard
+
 
 def gh(*args: str) -> dict | list | None:
+    if _write_guard is not None and _is_write(args) and not _write_guard(f"gh api {' '.join(args)}"):
+        return None
     result = subprocess.run(
         ["gh", "api", *args],
         capture_output=True, text=True, encoding="utf-8",

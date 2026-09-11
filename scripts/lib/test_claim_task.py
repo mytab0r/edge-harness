@@ -134,6 +134,95 @@ def test_gh_pins_utf8_encoding_not_console_codepage(monkeypatch):
     assert seen.get("encoding") == "utf-8"
 
 
+# ── Инъецируемый гейт записи (#951, доводка PR #950) ─────────────────────────────
+# claim_task обслуживает МНОГО каналов (task-branch/task.sh/dsh_task.sh пишут
+# ЛОКАЛЬНО и это штатно) — set_write_guard(None) по умолчанию обязан оставить
+# поведение прежним для всех, кто хук не подключает; только вызвавший
+# set_write_guard(...) получает решение.
+
+
+@pytest.fixture(autouse=True)
+def _reset_write_guard():
+    """set_write_guard — module-level состояние: тест, забывший его снять,
+    красил бы все следующие — сброс на None (штатное поведение) до и после
+    каждого теста."""
+    ct.set_write_guard(None)
+    yield
+    ct.set_write_guard(None)
+
+
+def test_write_guard_default_none_does_not_change_behavior(monkeypatch):
+    seen = []
+
+    def fake_run(args, **kwargs):
+        seen.append(" ".join(args))
+        return ok_no_body()
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.gh("-X", "DELETE", "repos/o/r/git/refs/locks/task-5")
+    assert seen  # вызов реально ушёл — хук не подключён, ничего не изменилось
+
+
+def test_write_guard_false_skips_the_real_call_and_returns_none(monkeypatch):
+    # Мутационное доказательство: сними проверку `_write_guard is not None and
+    # _is_write(args) and not _write_guard(...)` в gh() (например, замени на
+    # `if False:`) — этот тест покраснеет: subprocess.run окажется вызван.
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return ok_no_body()
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.set_write_guard(lambda description: False)
+    result = ct.gh("-X", "DELETE", "repos/o/r/git/refs/locks/task-5")
+    assert result is None
+    assert calls == []  # DRY-RUN — реального похода в сеть не было
+
+
+def test_write_guard_true_lets_the_real_call_through(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return ok_no_body()
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.set_write_guard(lambda description: True)
+    ct.gh("-X", "DELETE", "repos/o/r/git/refs/locks/task-5")
+    assert len(calls) == 1
+
+
+def test_write_guard_does_not_gate_reads(monkeypatch):
+    # GET не несёт -X МЕТОД из _GH_WRITE_METHODS — гейту нечего проверять,
+    # чтение обязано идти всегда, даже если хук стоит и всегда отвечает False
+    # (иначе claim() не смог бы прочитать даже состояние задачи вне CI).
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return out({"number": 5, "state": "open"})
+
+    monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
+    ct.set_write_guard(lambda description: False)
+    result = ct.gh("repos/o/r/issues/5")
+    assert result == {"number": 5, "state": "open"}
+    assert len(calls) == 1
+
+
+def test_write_guard_gates_release_end_to_end(monkeypatch):
+    """Живая находка ревью PR #950: claim_task.release шёл в обход
+    scheduler._guard_raw_subprocess_write целиком. С подключённым хуком
+    release() обязан молчать (DRY-RUN), а не реально снимать замок."""
+    server = install(monkeypatch, FakeServer({}))
+    server.add_ref("refs/locks/task-5")
+    ct.set_write_guard(lambda description: False)
+    detail = ct.release("o/r", 5)
+    assert "task-5" in detail
+    assert not any("DELETE" in c for c in server.calls)  # DRY-RUN — DELETE не ушёл
+    assert "refs/locks/task-5" in server.existing_refs  # замок реально жив
+
+
 # ── TTL по дате коммита замка ────────────────────────────────────────────────────
 
 

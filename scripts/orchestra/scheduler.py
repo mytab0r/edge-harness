@@ -356,7 +356,18 @@ def _guard_raw_subprocess_write(description: str) -> bool:
     (сырой `subprocess.run` — ORCHESTRA_PAT-путь update_branch, `gh workflow
     run` в dispatch_deploy_on_merge): точечный if внутри main() их не поймал
     бы (класс, не случай) — обе точки читают ЭТУ ЖЕ функцию prod_writes_
-    allowed, что и gh(), а не заводят свою копию решения."""
+    allowed, что и gh(), а не заводят свою копию решения.
+
+    ТРЕТЬЯ поверхность (находка AI-ревью PR #950): claim_task.release/
+    release_full/collect_stale (`scripts/lib/claim_task.py`) несут СВОЙ gh() с
+    собственным subprocess.run — тот же класс обхода, что и два места выше,
+    только не в этом файле. claim_task — общая библиотека МНОГИХ каналов
+    (task-branch/task.sh/dsh_task.sh claim'ят ЛОКАЛЬНО и по замыслу), поэтому
+    её gh() не гейтится безусловно (это сломало бы штатный локальный claim) —
+    вместо второй копии предиката claim_task.gh() получает ИНЪЕЦИРУЕМЫЙ хук
+    (claim_task.set_write_guard), который ниже подключается именно к этой
+    функции: единственная точка, где планировщик решает писать вне CI, и
+    единственный потребитель хука."""
     if prod_writes_allowed():
         return True
     print(
@@ -365,6 +376,12 @@ def _guard_raw_subprocess_write(description: str) -> bool:
         file=sys.stderr,
     )
     return False
+
+
+# claim_task — общая библиотека (см. её собственный gh(), докстринг
+# set_write_guard) — гейт подключается ЗДЕСЬ ОДИН РАЗ, тем же предикатом, что
+# использует остальной scheduler.py, а не второй копией.
+claim_task.set_write_guard(_guard_raw_subprocess_write)
 
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
 # Было буквально «ровно один PR за запуск» (см. шапку модуля, пункт 3, и

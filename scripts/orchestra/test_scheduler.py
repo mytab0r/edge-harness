@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,6 +49,16 @@ SCRIPT = _DIR / "scheduler.py"
 spec = importlib.util.spec_from_file_location("scheduler", SCRIPT)
 sch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sch)  # type: ignore[union-attr]
+
+# Только ради _WIP_GATE_COUNT_RE (замечание ревью PR #950: маркеры WIP-гейта
+# ниже обязаны матчиться ИМЕННО этим regex'ом инварианта 15, не его
+# пересказом) — отдельный экземпляр модуля, тот же приём, что уже использует
+# test_repo_invariants.py для scheduler в обратную сторону. Сеть не нужна:
+# в этом файле читаются только определения, gh() не вызывается на импорте.
+_RI_SCRIPT = _DIR / "repo_invariants.py"
+_ri_spec = importlib.util.spec_from_file_location("repo_invariants_for_wip_gate_regex", _RI_SCRIPT)
+_ri_for_regex = importlib.util.module_from_spec(_ri_spec)
+_ri_spec.loader.exec_module(_ri_for_regex)  # type: ignore[union-attr]
 
 
 # ── Живой HTTP-сервер: контракт логина морды (303 + Set-Cookie) ──────────────────
@@ -4416,6 +4427,58 @@ def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
     assert not any(c.startswith("-X POST") and "/dispatches" in c for c in fake.calls)
 
 
+# ── claim_task пишет только через тот же гейт, что и остальной scheduler.py
+# (#951, доводка PR #950: находка ai-review — claim_task.release/release_full/
+# collect_stale несли СВОЙ subprocess.run в обход _guard_raw_subprocess_write
+# целиком) ─────────────────────────────────────────────────────────────────
+
+def test_claim_task_write_guard_wired_to_scheduler_predicate():
+    """Единственная точка починки: claim_task получает module-level хук
+    (claim_task.set_write_guard), scheduler подключает к нему СВОЙ уже
+    существующий предикат при загрузке модуля — не вторую копию решения.
+    Мутация: закомментируй `claim_task.set_write_guard(_guard_raw_subprocess_
+    write)` в scheduler.py — красный."""
+    assert sch.claim_task._write_guard is sch._guard_raw_subprocess_write
+
+
+def test_claim_task_release_is_dry_run_outside_ci_via_wired_guard(monkeypatch):
+    """Живой сценарий инцидента #951: `python scheduler.py` вне CI без
+    SCHEDULER_ALLOW_PROD_WRITES=1 — claim_task.release не уходит в сеть
+    DELETE'ом, хотя сам claim_task ничего не знает про CI/окружение (гейт
+    подключён снаружи, через wiring выше)."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sch.claim_task, "subprocess", SimpleNamespace(run=fake_run))
+    detail = sch.claim_task.release("o/r", 5)
+    assert "task-5" in detail
+    assert calls == []  # DRY-RUN — DELETE не ушёл в сеть
+
+
+def test_claim_task_release_writes_for_real_in_ci_via_wired_guard(monkeypatch):
+    """Симметричная проверка: в CI (dual-signal in_github_actions) тот же
+    вызов реально уходит — гейт не глушит claim_task насовсем, только вне CI
+    без явного разрешения."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "12345")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sch.claim_task, "subprocess", SimpleNamespace(run=fake_run))
+    sch.claim_task.release("o/r", 5)
+    assert len(calls) == 1
+    assert "DELETE" in calls[0] and "task-5" in calls[0]
+
+
 # ── Чеклист некритичных замечаний ревью — задача-хвост при слиянии (#462) ─────
 # Незакрытые пункты НЕ блокируют мерж (иначе некритичное стало бы критичным),
 # но и не теряются молча — одна задача-хвост со ссылкой на PR, не issue на
@@ -5516,6 +5579,43 @@ def test_wip_gate_reopens_dispatch_and_posts_close_marker_when_queue_drains(monk
     posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
     assert len(posts) == 1
     assert sch.WIP_GATE_CLOSE_MARKER in posts[0]
+
+
+def test_wip_gate_open_marker_body_matches_invariant_15_regex(monkeypatch):
+    """Замечание ревью PR #950 (некритично, но проверяемо): тело, которое
+    wip_gate РЕАЛЬНО публикует при открытии эпизода, обязано матчиться
+    repo_invariants._WIP_GATE_COUNT_RE — иначе правка формулировки здесь без
+    синхронной правки regex'а там красит инвариант 15 молча (он просто
+    перестанет находить count в новом тексте и решит, что маркеров нет)."""
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": [],
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
+    sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[], dispatch_allowed=True)
+    posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
+    assert len(posts) == 1
+    match = _ri_for_regex._WIP_GATE_COUNT_RE.search(posts[0])
+    assert match is not None, f"тело маркера не матчится _WIP_GATE_COUNT_RE: {posts[0]!r}"
+    assert int(match.group(1)) == len(pulls)
+
+
+def test_wip_gate_close_marker_body_matches_invariant_15_regex(monkeypatch):
+    """Та же гвардия дрейфа, что выше, для CLOSE-маркера (снятие лимита)."""
+    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pulls = [pull(1, labels=["ai:changes-requested"])]  # очередь поредела ниже лимита
+    sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[], dispatch_allowed=True)
+    posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
+    assert len(posts) == 1
+    match = _ri_for_regex._WIP_GATE_COUNT_RE.search(posts[0])
+    assert match is not None, f"тело маркера не матчится _WIP_GATE_COUNT_RE: {posts[0]!r}"
+    assert int(match.group(1)) == len(pulls)
 
 
 def test_wip_gate_escalates_when_episode_older_than_stuck_threshold(monkeypatch):
