@@ -30,6 +30,22 @@ job — новый `continue-on-error` шаг подхватывается са�
 `scripts/lib/test_orchestra_workflow_lint.py` требует `id:` у каждого
 `continue-on-error` шага orchestra.yml, чтобы это условие не нарушили молча.
 
+Сама проводка читателя охраняется той же гвардией по исходнику workflow
+(шаг-свод обязан стоять после последнего continue-on-error шага, с
+`if: always()` и `STEPS_JSON: ${{ toJSON(steps) }}`), а здесь, в рантайме,
+дублируется fail loud: нет `STEPS_JSON` вовсе, снимок не разобрался, пуст
+или не словарь — exit 1 с `::error`, а НЕ «💚 провалов не найдено».
+Сломанный читатель обязан отличаться от «провалов нет» — иначе отпавшая
+проводка (`env` переименовали, шаг перетащили в другой job) отдает тот же
+зелёный сигнал, что и здоровье, и весь класс «невидимый провал» (#887)
+возвращается молча. В job orchestra контекст `steps` никогда не пуст
+(там есть `id: quota`), так что пустой снимок — всегда сломанная проводка,
+а не здоровое состояние. Этот exit 1 красит job orchestra НАРОЧНО: это не
+находка best-effort гвардии (та не красит job — heartbeat не должен видеть
+«пульс пропал» из-за неё), а поломка самого механизма чтения, и «пульс
+пропал» — честный сигнал именно для неё (без читателя исходы всё равно
+никто не читает).
+
 Дедуп — тот же приём, что у DEBT_DIGEST/ESCALATING_INVARIANTS
 (`repo_invariants.escalate_if_new`): маркер кодирует ТЕКУЩИЙ набор реально
 провалившихся id — тот же набор, тот же прогон подряд — тишина, набор
@@ -81,11 +97,28 @@ def find_masked_failures(steps: dict) -> list[str]:
 
 def main() -> int:
     repo = os.environ.get("GITHUB_REPOSITORY", "mytab0r/edge-harness")
-    raw = os.environ.get("STEPS_JSON", "{}")
+    raw = os.environ.get("STEPS_JSON")
+    if raw is None:
+        print(
+            "::error::best_effort_outcome_guard: STEPS_JSON не задан — проводка "
+            "читателя сломана (шаг «Свод реальных исходов» обязан нести "
+            "env STEPS_JSON: ${{ toJSON(steps) }}). Молчать здесь значило бы, "
+            "что сломанный читатель неотличим от «провалов нет» (#887)"
+        )
+        return 1
     try:
         steps = json.loads(raw)
     except json.JSONDecodeError as error:
         print(f"::error::best_effort_outcome_guard: STEPS_JSON не разобран: {error}")
+        return 1
+    if not isinstance(steps, dict) or not steps:
+        print(
+            "::error::best_effort_outcome_guard: снимок steps пустой или "
+            f"не-словарь ({type(steps).__name__}) — в job orchestra контекст "
+            "steps никогда не пуст (там есть шаг id: quota), значит "
+            "toJSON(steps) не доехал до гвардии; молчать = тот же «зелёный "
+            "сигнал при сломанной проводке» (#887)"
+        )
         return 1
 
     masked = find_masked_failures(steps)

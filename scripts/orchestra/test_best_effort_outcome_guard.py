@@ -92,3 +92,45 @@ def test_main_bad_json_fails_loud(monkeypatch, capsys):
     monkeypatch.setenv("STEPS_JSON", "{not json")
     assert beog.main() == 1
     assert "не разобран" in capsys.readouterr().out
+
+
+def test_main_missing_steps_json_fails_loud(monkeypatch, capsys):
+    # Находка AI-ревью PR #888: отсутствующая переменная раньше молча
+    # парсилась в "{}" и отдавала «💚 провалов не найдено» — сломанная
+    # проводка читателя была неотличима от здоровья. Теперь — fail loud.
+    monkeypatch.delenv("STEPS_JSON", raising=False)
+    assert beog.main() == 1
+    out = capsys.readouterr().out
+    assert "::error" in out
+    assert "не задан" in out
+    assert "провалов не найдено" not in out  # не тот же сигнал, что успех
+
+
+def test_main_empty_steps_snapshot_fails_loud(monkeypatch, capsys):
+    # В job orchestra контекст steps никогда не пуст (там есть id: quota) —
+    # пустой снимок возможен только при сломанной проводке toJSON(steps).
+    monkeypatch.setenv("STEPS_JSON", "{}")
+    assert beog.main() == 1
+    out = capsys.readouterr().out
+    assert "::error" in out
+    assert "пустой" in out
+    assert "провалов не найдено" not in out
+
+
+def test_main_non_dict_steps_snapshot_fails_loud(monkeypatch, capsys):
+    for raw in ('["quota"]', '"quota"', "3"):
+        monkeypatch.setenv("STEPS_JSON", raw)
+        assert beog.main() == 1, raw
+        assert "::error" in capsys.readouterr().out
+
+
+def test_main_broken_wiring_does_not_escalate(monkeypatch):
+    # fail loud — сигнал человеку в логе job'а, не «находка» в канал #120:
+    # факта о реальном провале шага при сломанной проводке НЕТ, гадать
+    # каналом эскалации нельзя.
+    called = []
+    monkeypatch.setattr(beog.repo_invariants, "escalate_if_new",
+                        lambda *a, **k: called.append(a) or None)
+    monkeypatch.delenv("STEPS_JSON", raising=False)
+    assert beog.main() == 1
+    assert called == []

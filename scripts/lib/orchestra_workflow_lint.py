@@ -16,6 +16,24 @@
 шагов job `orchestra`, у которых `continue-on-error: true`, но нет `id`.
 Пустой список — здоровое состояние.
 
+`summary_step_violations` — вторая половина того же класса: сам читатель
+реальных outcome (`best_effort_outcome_guard.py`) обязан быть ПРОВЕДЁН в
+job — после последнего `continue-on-error` шага стоит шаг, чей `run` зовёт
+его, с `if: always()` и `env STEPS_JSON: ${{ toJSON(steps) }}`. Без этой
+проверки снятие проводки (удалили шаг, переименовали env, перетащили в
+другой job) неотличимо от «провалов нет» — гвардия рантайма отвечает на это
+fail loud'ом (нет STEPS_JSON/пустой снимок = exit 1), но лучше ловить то же
+нарушение по исходнику в CI, до живого прогона. Шаг-свод не должен нести
+`continue-on-error` вовсе: с ним он сам становится «последним
+continue-on-error шагом», кандидаты после него исчезают, и линт краснеет
+«шаг-свод не найден» — замаскированный провал читателя снова был бы невидим
+(его собственный outcome в его же снимок не попадает).
+
+`job_missing` — гвардия обязана отличать «нарушений нет» от «объекта
+гвардии нет»: переименованный/удалённый job `orchestra` раньше читался как
+здоровое состояние (пустой steps → []), при этом отсутствие ФАЙЛА падало
+громко — несимметрично (находка ревью PR #888).
+
 Запуск:
   python scripts/lib/orchestra_workflow_lint.py         # печать отчёта, exit 1 при нарушении
   python -m pytest scripts/lib/test_orchestra_workflow_lint.py -q
@@ -29,6 +47,7 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import re
 import sys
 from pathlib import Path
 
@@ -45,6 +64,14 @@ ORCHESTRA_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "orchestra.yml"
 # уведомления не про этот же механизм) — расширять охват по факту нового
 # outcome-guard'а, не заранее.
 WATCHED_JOB = "orchestra"
+
+# Проводка читателя реальных outcome (класс #887): шаг-свод обязан звать
+# именно этот скрипт и получать снимок контекста `steps` именно этой формой —
+# любое другое значение env (переименовали, поменяли выражение) делает снимок
+# пустым/чужим, а рантайм-гвардия отвечает на это exit 1.
+SUMMARY_STEP_RUN_SUBSTRING = "best_effort_outcome_guard.py"
+SUMMARY_STEP_ENV_VAR = "STEPS_JSON"
+SUMMARY_STEP_ENV_VALUE = "${{ toJSON(steps) }}"
 
 
 def continue_on_error_steps_without_id(doc: dict) -> list[str]:
@@ -63,21 +90,92 @@ def continue_on_error_steps_without_id(doc: dict) -> list[str]:
     return violations
 
 
+def _canonical_expr(value: object) -> str:
+    """Форма GitHub-выражения без пробелов: `${{ toJSON(steps) }}` и
+    `${{toJSON(steps)}}` — одно и то же выражение, гвардия не должна
+    краснеть от форматирования, но обязана — от другого выражения."""
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def job_missing(doc: dict) -> bool:
+    """True — job `orchestra` исчез из workflow (удалён или переименован):
+    тогда проверять нечего, и молчаливое «здоров» здесь — та же ложь, что и
+    пустой снимок в рантайме."""
+    return WATCHED_JOB not in ((doc or {}).get("jobs") or {})
+
+
+def summary_step_violations(doc: dict) -> list[str]:
+    """Проводка читателя реальных outcome по исходнику workflow (класс #887):
+    после ПОСЛЕДНЕГО `continue-on-error` шага job `orchestra` обязан стоять
+    шаг, чей `run` зовёт `best_effort_outcome_guard.py`, с `if: always()`
+    (отработать даже при провале предыдущих) и
+    `env STEPS_JSON: ${{ toJSON(steps) }}` (снимок исходов до завершения
+    job). Позиция «после последнего» существенна: контекст `steps` шага
+    содержит только УЖЕ завершившиеся шаги — стоящий раньше шаг-свод часть
+    исходов не увидит. Если шаг-свод сам несёт `continue-on-error`, он
+    становится последним таким шагом и кандидаты после него исчезают —
+    нарушение поймано тем же сообщением (см. докстринг модуля)."""
+    job = ((doc or {}).get("jobs") or {}).get(WATCHED_JOB) or {}
+    steps = job.get("steps") or []
+    last_coe = None
+    for index, step in enumerate(steps):
+        if isinstance(step, dict) and step.get("continue-on-error") is True:
+            last_coe = index
+    if last_coe is None:
+        return []  # нет continue-on-error шагов — нет и читателя, которого обязаны проводить
+    after = [s for s in steps[last_coe + 1:] if isinstance(s, dict)]
+    candidates = [
+        step for step in after
+        if SUMMARY_STEP_RUN_SUBSTRING in str(step.get("run") or "")
+    ]
+    if not candidates:
+        return [
+            f"после последнего continue-on-error шага (#{last_coe}) нет шага, "
+            f"заводящего {SUMMARY_STEP_RUN_SUBSTRING} — реальные outcome "
+            "continue-on-error шагов никем не читаются, их провал снова "
+            "невидим (#887)"
+        ]
+    violations = []
+    expected = _canonical_expr(SUMMARY_STEP_ENV_VALUE)
+    for step in candidates:
+        name = step.get("name") or "шаг-свод"
+        if "always()" not in str(step.get("if") or ""):
+            violations.append(
+                f"«{name}»: нет if: always() — при провале предыдущего шага "
+                "свод не отработает и реальный исход останется непрочитанным (#887)"
+            )
+        env = step.get("env") or {}
+        if _canonical_expr(env.get(SUMMARY_STEP_ENV_VAR)) != expected:
+            violations.append(
+                f"«{name}»: env {SUMMARY_STEP_ENV_VAR} != "
+                f"{SUMMARY_STEP_ENV_VALUE} — снимок исходов не доехал до "
+                "гвардии, она ответит fail loud'ом уже в живом прогоне (#887)"
+            )
+    return violations
+
+
 def main() -> int:
     if not ORCHESTRA_WORKFLOW_PATH.is_file():
         print(f"::error::orchestra_workflow_lint: файл не найден: {ORCHESTRA_WORKFLOW_PATH}")
         return 1
     doc = yaml.safe_load(ORCHESTRA_WORKFLOW_PATH.read_text(encoding="utf-8"))
-    violations = continue_on_error_steps_without_id(doc)
-    if not violations:
-        print(f"💚 все continue-on-error шаги job '{WATCHED_JOB}' имеют id")
-        return 0
-    for name in violations:
+    if job_missing(doc):
         print(
-            f"::error::orchestra.yml: continue-on-error шаг «{name}» без id — "
-            "best_effort_outcome_guard.py его не увидит в toJSON(steps), "
-            "реальный провал снова станет невидимым (#887)"
+            f"::error::orchestra_workflow_lint: job '{WATCHED_JOB}' не найден "
+            f"в {ORCHESTRA_WORKFLOW_PATH.name} — объект гвардии исчез, "
+            "«здоров» здесь было бы молчаливой ложью (#887)"
         )
+        return 1
+    violations = continue_on_error_steps_without_id(doc) + summary_step_violations(doc)
+    if not violations:
+        print(
+            f"💚 все continue-on-error шаги job '{WATCHED_JOB}' имеют id, "
+            f"читатель {SUMMARY_STEP_RUN_SUBSTRING} проведён (после последнего "
+            "из них, if: always(), STEPS_JSON: toJSON(steps))"
+        )
+        return 0
+    for message in violations:
+        print(f"::error::orchestra.yml: {message}")
     return 1
 
 
