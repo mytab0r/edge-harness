@@ -2,8 +2,7 @@
 
 - **Дата:** 2026-09-10
 - **Статус:** принято (по замерам задач #879, #904)
-- **Смежное:** [ADR 0001](0001-push-model-not-tunnel.md) (п. "Не чини затычку" из AGENTS.md),
-  [задача #749](https://github.com/mytab0r/edge-harness/issues/749) (регистрация как данные),
+- **Смежное:** [задача #749](https://github.com/mytab0r/edge-harness/issues/749) (регистрация как данные),
   [задача #879](https://github.com/mytab0r/edge-harness/issues/879) (конкуренция за scheduler.py)
 
 ## Контекст
