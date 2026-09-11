@@ -127,13 +127,28 @@ def _state_marker_prefix(resource_key: str) -> str:
 _STATE_RE = re.compile(r"= (breach|ok)(?: issue=#(\d+))?\]")
 
 
+# Сколько СВЕЖИХ страниц комментариев #120 читать для дедупа состояния
+# ресурса — одно место правды для всей семьи сторожа квот (quota_watch.py
+# берёт тем же именем для своих stale-маркеров). Обоснование и честная цена
+# деградации — в докстринге pulse_guard.all_issue_comments и у константы
+# в quota_watch.py (found: ревью PR #607 — некритичное замечание «last_state
+# читает #120 без ограничения страниц» = тот же «хвост», что уже закрыт для
+# stale-маркеров простоя; замер 2026-09-10: в #120 больше 550 комментариев).
+MARKER_SCAN_PAGES = 1
+
+
 def last_state(repo: str, resource_key: str) -> tuple[str | None, int | None]:
     """Последнее записанное состояние КОНКРЕТНОГО ресурса и номер связанной
     задачи (если он был в маркере) — по самому свежему из подходящих
-    комментариев #120. Нет ни одного маркера — состояние не известно
-    (None, None), первое наблюдение breach тоже должно алертить."""
+    комментариев #120 СВЕЖЕЙ СТРАНИЦЫ (MARKER_SCAN_PAGES): самый свежий
+    маркер ключа лежит на первой странице, пока после него не накопилось
+    100 более новых комментариев; деградация — тот же самозаживающийся
+    повторный сигнал раз в ~сутки затяжного эпизода, не тишина (первое
+    наблюдение breach тоже алертит). Нет ни одного маркера на странице —
+    состояние не известно (None, None)."""
     prefix = _state_marker_prefix(resource_key)
-    matches = pulse_guard.issue_markers_any(repo, WATCHDOG_ISSUE, (prefix,))
+    matches = pulse_guard.issue_markers_any(repo, WATCHDOG_ISSUE, (prefix,),
+                                            max_pages=MARKER_SCAN_PAGES)
     if not matches:
         return None, None
     _, body = max(matches, key=lambda pair: pair[0])
@@ -259,7 +274,8 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     text = (
         f"✅ edge-harness: квота «{resource_label}» вернулась ниже {threshold}% "
         f"({_fmt(current)} / {_fmt(limit)}, {pct}%). "
-        + (f"Задача на разбор причины остаётся открытой: #{prev_issue}." if prev_issue
+        + (f"Задача на разбор по маркеру: #{prev_issue} (текущее её состояние здесь "
+           "не проверялось)." if prev_issue
            else "Прежней задачи на разбор в маркере не найдено.")
         + "\n" + state_marker(resource_key, "ok", prev_issue)
     )

@@ -34,6 +34,30 @@ def test_last_state_none_when_no_marker(monkeypatch):
     assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
 
 
+def test_last_state_reads_only_fresh_page_of_watchdog_history(monkeypatch):
+    """Тот же «хвост», что PR закрыл для stale-маркеров простоя (found: ревью
+    PR #607, некритичное замечание): дедуп состояния ресурса тикает на каждый
+    прогон сторожа и читает только СВЕЖУЮ страницу #120 (551+ комментариев и
+    растёт). Гвардия: запрос страницы 2 — громкое падение. Сними
+    `max_pages=` из last_state — тест краснеет."""
+    requested = []
+
+    def fake_gh(*args):
+        endpoint = args[0]
+        assert isinstance(endpoint, str) and "/comments?" in endpoint, endpoint
+        page = int(endpoint.split("&page=")[1])
+        requested.append(page)
+        assert page == 1, f"дедуп состояния читает только свежую страницу, запрошена {page}"
+        # Полная страница БЕЗ маркеров состояния — дедуп честно отвечает
+        # «состояние не известно», не обходя всю историю задачи.
+        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
+                for i in range(100)]
+
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
+    assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
+    assert requested == [1]
+
+
 def test_last_state_reads_breach_with_issue_number(monkeypatch):
     marker = qa.state_marker("cf_do_rows_read_day", "breach", 999)
     monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [_comment(f"текст\n{marker}")])

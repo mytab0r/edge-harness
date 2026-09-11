@@ -450,7 +450,10 @@ SCAN_CEILING = "scan-ceiling"
 # ПОВТОР алерта, но каждый алерт сам несёт свежий STALE_MARKER и тем самым
 # возвращает дедуп на первую страницу (самозаживление, один лишний сигнал
 # на ~сутки затяжного простоя, не на каждый тик).
-MARKER_SCAN_PAGES = 1
+# Одно место правды — quota_alert.MARKER_SCAN_PAGES (тот же дедуп #120 у
+# дешёвой проверки и у stale-маркеров простоя; quota_alert — нижележащий
+# модуль, загружен выше).
+MARKER_SCAN_PAGES = quota_alert.MARKER_SCAN_PAGES
 
 # Порог «замер простаивал» — 3×CHECK_INTERVAL_MINUTES, тот же приём
 # кратности, что pulse_guard.HEARTBEAT_MAX_AGE_MINUTES у пульса

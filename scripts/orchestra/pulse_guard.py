@@ -1301,11 +1301,15 @@ def issue_marker_times(repo: str, issue_number: int, marker: str,
     ]
 
 
-def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) -> list[tuple[datetime, str]]:
+def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...],
+                      max_pages: int | None = None) -> list[tuple[datetime, str]]:
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
-    но и от его содержимого (номер попытки пробы, #205)."""
-    payload = all_issue_comments(repo, issue_number)
+    но и от его содержимого (номер попытки пробы, #205). `max_pages` — тот
+    же ограничитель свежими страницами, что у all_issue_comments (found:
+    ревью PR #607 — последний_state-дедуп quota_alert тикает на каждый
+    прогон сторожа и не обязан обходить всю копящуюся историю #120)."""
+    payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     result = []
     for comment in payload:
         body = comment.get("body") or ""
