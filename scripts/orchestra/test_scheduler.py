@@ -5581,11 +5581,11 @@ def test_wip_gate_reopens_dispatch_and_posts_close_marker_when_queue_drains(monk
     assert sch.WIP_GATE_CLOSE_MARKER in posts[0]
 
 
-def test_wip_gate_open_marker_body_matches_invariant_15_regex(monkeypatch):
+def test_wip_gate_open_marker_body_matches_invariant_16_regex(monkeypatch):
     """Замечание ревью PR #950 (некритично, но проверяемо): тело, которое
     wip_gate РЕАЛЬНО публикует при открытии эпизода, обязано матчиться
     repo_invariants._WIP_GATE_COUNT_RE — иначе правка формулировки здесь без
-    синхронной правки regex'а там красит инвариант 15 молча (он просто
+    синхронной правки regex'а там красит инвариант 16 молча (он просто
     перестанет находить count в новом тексте и решит, что маркеров нет)."""
     fake = FakeGh({
         "issues/120/comments?per_page=100": [],
