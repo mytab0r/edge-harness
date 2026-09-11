@@ -197,11 +197,18 @@ def _post_rollback_canary_step():
     return matches[0]
 
 
-def test_post_rollback_canary_installs_playwright_browser_before_running():
+def test_post_rollback_canary_restores_deps_browser_then_runs():
     step = _post_rollback_canary_step()
     run = step.get("run") or ""
+    npm_ci_pos = run.find("npm ci")
     install_pos = run.find("playwright install")
     canary_pos = run.find("scripts/canary-ui.mjs")
+    assert npm_ci_pos != -1, (
+        "шаг «Канарейка после автооткота» не восстанавливает node_modules (npm ci) — "
+        "если канарейка выше упала на собственном npm ci (он сносит node_modules до "
+        "установки), повторный прогон падает на import \"playwright\" по средовой "
+        "причине, а не по реальной недоступности откатанной версии"
+    )
     assert install_pos != -1, (
         "шаг «Канарейка после автооткота» не переустанавливает браузер Playwright — "
         "если предыдущая канарейка упала до/во время playwright install (или шаг "
@@ -209,7 +216,43 @@ def test_post_rollback_canary_installs_playwright_browser_before_running():
         "средовой причине, а не по реальной недоступности откатанной версии"
     )
     assert canary_pos != -1, "шаг post_rollback_canary больше не запускает canary-ui.mjs"
-    assert install_pos < canary_pos, "playwright install обязан идти ДО запуска канарейки"
+    assert npm_ci_pos < install_pos < canary_pos, (
+        "порядок шага обязан быть: npm ci → playwright install → запуск канарейки"
+    )
+
+
+# ── Гвардия сериализации прод-деплоев (блокирующая находка второго гейта ─────
+# ── PR #617): класс «прод-деплой без concurrency» — два перекрывающихся
+# ── прогона мутируют прод одновременно; после #614 в deploy-worker.yml есть
+# ── третий мутирующий игрок (wrangler rollback при красной канарейке), который
+# ── на гонке может откатить свежую хорошую версию другого прогона. Оба
+# ── прод-деплоя репозитория (wrangler deploy: deploy-worker.yml,
+# ── deploy-dsh-edge.yml) обязаны нести сериализацию с cancel-in-progress: false.
+
+DEPLOY_WORKFLOWS = {
+    "deploy-worker.yml",
+    "deploy-dsh-edge.yml",
+}
+
+
+def _workflow_doc(name: str) -> dict:
+    path = _DIR.parents[1] / ".github" / "workflows" / name
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("workflow_name", sorted(DEPLOY_WORKFLOWS))
+def test_prod_deploy_workflows_serialize_with_concurrency(workflow_name):
+    doc = _workflow_doc(workflow_name)
+    conc = doc.get("concurrency")
+    assert isinstance(conc, dict) and conc.get("group"), (
+        f"{workflow_name}: прод-деплой без concurrency — два перекрывающихся "
+        f"прогона деплоя мутируют прод одновременно (находка второго гейта PR #617)"
+    )
+    assert conc.get("cancel-in-progress") is False, (
+        f"{workflow_name}: cancel-in-progress обязан быть false — обрыв уже идущего "
+        f"деплоя оставляет частично применённые секреты/версии (тот же приём, что "
+        f"у deploy-dsh-edge.yml)"
+    )
 
 
 def test_post_rollback_canary_stays_loud_no_continue_on_error():
