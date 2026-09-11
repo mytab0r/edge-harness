@@ -155,6 +155,47 @@ PR #263, п.4). Блокер задачи #133 — не отсутствие п�
 натолкнулась на отсутствие хранилища (решение требует #119 + новая
 инфраструктура), а не на отсутствие места в облаке.
 
+### Причина 403 задачи #133 установлена (2026-09-11)
+
+Гипотеза «блок egress-IP датацентра Cloudflare» (см. выше и запись 2026-08-31
+в PROTOCOL.md) **не подтвердилась**. Живой curl без секретов, без прохода
+через Cloudflare, воспроизводит тот же класс отказа напрямую:
+
+```
+curl -H "User-Agent:" https://api.github.com/repos/mytab0r/edge-harness/issues/133
+→ HTTP 403, тело: "Request forbidden by administrative rules. Please make
+   sure your request has a User-Agent header (...)"
+
+curl -H "User-Agent: edge-harness-test" https://api.github.com/repos/mytab0r/edge-harness/issues/133
+→ HTTP 200
+```
+
+GitHub REST API безусловно отклоняет запрос без заголовка `User-Agent`
+кодом 403 без JSON-тела — ровно та форма ответа (403, тело без `message`),
+что наблюдал агент морды 2026-08-31. `plugins-src/runner-bridge/server/
+core.js::githubFetch()` этот заголовок не ставил вовсе (`Accept`,
+`X-GitHub-Api-Version`, `Authorization`, опционально `Content-Type` — и
+всё), хотя рабочий образец рядом (`cf-worker/src/harness.ts`, вызовы
+`repository_dispatch`) всегда нёс `"User-Agent": GITHUB.userAgent`
+(`cf-worker/src/config.ts`) — потому и работал в проде. Cloudflare Workers'
+`fetch()`, в отличие от Node/undici, не подставляет `User-Agent` сам —
+поэтому один и тот же класс сработал асимметрично: у cf-worker заголовок
+был явно прописан с самого начала, у runner-bridge — нет.
+
+Фикс — `plugins-src/runner-bridge/server/core.js` теперь всегда ставит
+`User-Agent` в `githubFetch()` (issue #133 закрыт этим PR). Никакой смены
+маршрута («морда → cf-worker → GitHub» вместо прямых вызовов) не
+потребовалось — вопрос владельца между вариантами а/б/в снят, потому что
+предпосылка (IP-зависимый блок) оказалась неверной.
+
+**Симметрия с #225.** Класс тот же, что уже был закрыт в ОБРАТНОМ
+направлении: `scripts/orchestra/scheduler.py` ставит `User-Agent` на запросы
+К морде dsh-edge, потому что Cloudflare (там — фильтр перед мордой, не сам
+egress) резал запросы без этого заголовка (эксперимент #225, раздел выше
+«Не путать с `error code: 1010`»). Симметрия направления «морда → внешний
+API без User-Agent» не была применена вовремя — тот же урок, что и там,
+не был перенесён в код на десять дней раньше.
+
 ## Не подтверждено
 
 - Прокси статусов `/api/harness/*` на воркере морды (закрытие белого пятна

@@ -63,9 +63,24 @@ function mockFetch(responses) {
   // регрессия вроде `labels: []`, смены пути диспетча или потери inputs.task
   // оставалась зелёной. Теперь вызовы записываются: fetchMock.calls[i] —
   // { url, options } i-го вызова, тесты assert'ят форму запроса.
+  //
+  // Гвардия класса #133 (GitHub REST отклоняет 403 запрос без User-Agent —
+  // подтверждено живым curl 2026-09-11): КАЖДЫЙ исходящий вызов githubFetch()
+  // обязан нести непустой User-Agent, здесь же — до чтения ответа, чтобы
+  // регрессия падала на месте вызова, а не терялась среди assert'ов
+  // конкретного теста. Мутация-доказательство (см. server.test.mjs commit
+  // message / PR-описание): снять `'User-Agent': GITHUB_USER_AGENT` из
+  // githubFetch() в core.js — красит ВСЕ тесты, использующие mockFetch, а не
+  // один точечный.
   const calls = []
   const fetchMock = async (url, options) => {
     calls.push({ url, options })
+    const headers = options?.headers ?? {}
+    const userAgent = headers['User-Agent'] ?? headers['user-agent']
+    assert.ok(
+      typeof userAgent === 'string' && userAgent.trim() !== '',
+      `githubFetch(${url}) отправлен без непустого User-Agent — GitHub REST отвечает 403 (issue #133)`,
+    )
     const response = responses[callIndex] || responses[responses.length - 1]
     callIndex++
     return {
@@ -212,9 +227,9 @@ test('describeFailure: возвращает сообщение GitHub при JSO
 
 test('describeFailure: возвращает только статус при JSON без message', async () => {
   // Находка ревью PR #411 (тест никогда не запускался в CI, см. критерий
-  // приёмки): 403 сталкивается со специальной веткой егресс-блока
-  // (issue #133) — она перехватывает ЛЮБОЙ 403 без message, эта ветка уже
-  // отдельно доказана тестом ниже. Общий случай «статус без message»
+  // приёмки): 403 сталкивается со специальной веткой (issue #133, закрыта
+  // фиксом User-Agent) — она перехватывает ЛЮБОЙ 403 без message, эта ветка
+  // уже отдельно доказана тестом ниже. Общий случай «статус без message»
   // проверяем на статусе, где спецветки нет.
   const response = {
     status: 500,
@@ -224,20 +239,19 @@ test('describeFailure: возвращает только статус при JSO
   assert.equal(result, 'HTTP 500')
 })
 
-test('describeFailure: 403 без сообщения — спецветка egress-блока (issue #133)', async () => {
+test('describeFailure: 403 без сообщения — спецветка (issue #133 закрыт, текст обновлён)', async () => {
   // Находка ревью PR #411 (чеклист): это единственная нетривиальная ветка
-  // describeFailure — спецветка перехватывает ЛЮБОЙ 403 без сообщения
-  // (голый HTML egress-блока воркера морды, не ответ GitHub API) — и она не
-  // имела покрытия. Комментарий теста «возвращает только статус при JSON
-  // без message» выше ссылается именно на этот тест.
+  // describeFailure — спецветка перехватывает ЛЮБОЙ 403 без сообщения. После
+  // фикса #133 (githubFetch всегда ставит User-Agent) причина такого 403 —
+  // уже НЕ известный класс egress-блока, текст ветки честно говорит это.
   const response = {
     status: 403,
     json: async () => ({ other: 'field' }),
   }
   const result = await describeFailure(response)
   assert.ok(result.includes('HTTP 403'))
-  assert.ok(result.includes('egress-IP'))
   assert.ok(result.includes('#133'))
+  assert.ok(!result.includes('egress-IP'), 'после фикса #133 нельзя снова называть 403 блоком egress-IP')
 })
 
 // ── Тесты configError ────────────────────────────────────────────────────────────

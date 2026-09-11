@@ -5,7 +5,7 @@ import { asString, classifyStorageError, handsAreAlive, messageStuck, parseOwner
 import worker from "../src/index";
 
 import { redact } from "../src/redact";
-import { HEARTBEAT, LIMITS, RETENTION } from "../src/config";
+import { DSH_EDGE_UPDATE, HEARTBEAT, LIMITS, RETENTION } from "../src/config";
 
 // ВАЖНО: vitest-плагин Cloudflare НЕ изолирует хранилище DO между тестами одного файла
 // (проверено пробами). Поэтому каждый тест работает только со своими task_id (uuid) и
@@ -925,6 +925,56 @@ describe("Cron Trigger: Harness#scheduledTick() — страховка, не в�
       const status = await getJson<{ last_pulse: { dispatch_ok: boolean; ts: number } | null }>("/api/status");
       expect(status.last_pulse?.dispatch_ok).toBe(true);
       expect(status.last_pulse!.ts).toBeGreaterThan(STALE_TS());
+    } finally {
+      vi.unstubAllGlobals();
+      env.GH_DISPATCH_TOKEN = "";
+    }
+  });
+
+  // Гвардия класса #133 на стороне cf-worker (находка AI-ревью PR #943):
+  // Cloudflare Workers' fetch() User-Agent сам не подставляет, GitHub REST
+  // отвечает 403 без JSON-тела на запрос без заголовка, а Cloudflare перед
+  // мордой dsh-edge режет такие запросы по подписи UA (эксперимент #225,
+  // docs/research/12). Проверяется ВЕСЬ исходящий путь alarm(): пульс
+  // (runs/dispatch) и self-update dsh-edge (health/registry) — каждый вызов
+  // обязан нести непустой User-Agent. Мутация-доказательство: сними заголовок
+  // в ЛЮБОМ из мест harness.ts (fetchLatestOrchestraRunId,
+  // attemptOrchestraDispatch, #checkDshEdgeUpdate → health/registry) —
+  // этот тест краснеет.
+  it("исходящие вызовы тика alarm() несут User-Agent — класс #133 (внешние API отвечают 403 без заголовка)", async () => {
+    const stub = HARNESS_ID();
+    env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+    const realFetch = globalThis.fetch;
+    const calls: Array<{ url: URL; userAgent: string | null }> = [];
+    vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({ url, userAgent: new Headers(init?.headers).get("user-agent") });
+      if (isGitHubRunsCall(input)) {
+        return new Response(JSON.stringify({ workflow_runs: [{ id: 101 }] }), { status: 200 });
+      }
+      if (isGitHubDispatchCall(input)) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.href === DSH_EDGE_UPDATE.healthUrl) {
+        return new Response(JSON.stringify({ version: "9.9.9-test" }), { status: 200 });
+      }
+      if (url.href === DSH_EDGE_UPDATE.registryUrl) {
+        return new Response(JSON.stringify({ version: "9.9.9-test" }), { status: 200 });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      await runInDurableObject(stub, async (instance) => {
+        await instance.alarm();
+      });
+      // Обе ветки self-update дошли до сети: гвардия проверяет реальный путь,
+      // а не пустой набор вызовов.
+      const hrefs = calls.map((c) => c.url.href);
+      expect(hrefs).toContain(DSH_EDGE_UPDATE.healthUrl);
+      expect(hrefs).toContain(DSH_EDGE_UPDATE.registryUrl);
+      for (const { url, userAgent } of calls) {
+        expect(userAgent, `fetch(${url.href}) без User-Agent — внешние API отвечают 403 (класс #133)`).toBeTruthy();
+      }
     } finally {
       vi.unstubAllGlobals();
       env.GH_DISPATCH_TOKEN = "";
