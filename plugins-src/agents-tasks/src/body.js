@@ -25,7 +25,7 @@
 // и рендерит только активную секцию, передавая ей { close } и t (переводчик
 // пространства имён из поля locale декларации).
 const { useState, useEffect, useCallback, useRef, createElement: h } = require("react");
-const { Button, StateDot, Pill, IconCopy, IconExternalLink, IconRefreshCw, IconChevronDown, IconChevronRight, IconMessageSquare, IconTerminal, IconBrain, IconTool, IconX } = require("@deepseek-ai/dsh-client-ui-primitives");
+const { Button, StateDot, IconExternalLink, IconRefreshCw, IconChevronDown, IconChevronRight, IconMessageSquare, IconTerminal, IconBrain, IconTool } = require("@deepseek-ai/dsh-client-ui-primitives");
 
 // ── Константы и конфигурация ────────────────────────────────────────────────────
 
@@ -40,8 +40,15 @@ const JOURNAL_PAGE_SIZE = 20;
 // самой морды (401/HTML), не журнал: находка ревью PR #412.
 const JOURNAL_QUERY = "/api/harness/events?task_id=";
 
-const POLL_INTERVAL_MS = 5000; // поллинг статусов задач и журнала
-const TASKS_POLL_INTERVAL_MS = 15000; // поллинг списка задач (GitHub API)
+// Один цикл опроса: и списка задач, и журнала. 90 с, не 15: список ходит в
+// api.github.com БЕЗ токена — анонимный лимит 60 req/h на IP, 15-с интервал
+// вырабатывал его за ~15 минут открытой вкладки, дальше до конца часа секция
+// висела в 403 (находка ревью PR #412). 90 с — 40 req/h с запасом; при 403
+// автопроллинг дополнительно встаёт на паузу (см. loadTasks). Журнал — свой
+// прокси морды, лимит GitHub не тратит, но живёт в том же цикле; вынести его
+// в более частый/пушевой канал — задача «живой стрим журнала» из ревью
+// PR #412, не сделано в этом PR.
+const POLL_INTERVAL_MS = 90000;
 
 // ── Типы данных (JSDoc для документации) ────────────────────────────────────────
 
@@ -119,7 +126,7 @@ function getEventKindDisplay(t, kind) {
 
 // ── API: GitHub Issues ────────────────────────────────────────────────────────
 
-async function fetchGitHubIssues(afterCursor = null) {
+async function fetchGitHubIssues() {
   const params = new URLSearchParams({
     state: 'all',
     labels: TASK_LABEL,
@@ -127,7 +134,6 @@ async function fetchGitHubIssues(afterCursor = null) {
     sort: 'updated',
     direction: 'desc',
   });
-  if (afterCursor) params.set('after', afterCursor);
 
   const url = `${GITHUB_API_BASE}/repos/${GITHUB_REPO}/issues?${params.toString()}`;
   const response = await fetch(url, {
@@ -377,46 +383,24 @@ function AgentsTasksSection(props) {
   const [error, setError] = useState(null);
   const [selectedTaskNumber, setSelectedTaskNumber] = useState(null);
   const [expandedTasks, setExpandedTasks] = useState(new Set());
-  const pollTimersRef = useRef({ tasks: null, journal: null });
+  // Пауза автопроллинга после упора в rate limit GitHub (см. catch в
+  // loadTasks). Два носителя: ref — для тиков интервала (эффект поллинга
+  // стартует один раз, его замыкание state не увидит), state — для рендера
+  // подсказки. Газ паузы — кнопки Refresh/Retry (обычный loadTasks:
+  // успешный прогон снимает паузу, повторный 403 ставит снова).
+  const [pollPaused, setPollPaused] = useState(false);
+  const pollPausedRef = useRef(false);
+  const setPollPause = useCallback((value) => {
+    pollPausedRef.current = value;
+    setPollPaused(value);
+  }, []);
+  // Гвардия гонки (находка ревью PR #412): второй цикл loadTasks не
+  // стартует, пока идёт первый — интервал не обязан дожидаться пагинации
+  // всех журналов, и два параллельных цикла писали бы результаты вперемешку.
+  const loadTasksInFlightRef = useRef(false);
   // Задачи, для которых автозагрузка журнала уже пыталась сработать (см.
   // эффект автозагрузки ниже) — переживает ре-рендер, не зависит от `tasks`.
   const attemptedRef = useRef(new Set());
-
-  const loadTasks = useCallback(async () => {
-    try {
-      setError(null);
-      const issues = await fetchGitHubIssues();
-      const taskList = issues.map(issue => ({
-        issue,
-        status: 'unknown',
-        events: [],
-        loading: true, // Начинаем загрузку событий сразу
-        error: null,
-      }));
-      setTasks(taskList);
-      setLoading(false);
-
-      // Загружаем события журнала для всех задач параллельно (как plugin-manager)
-      const settled = await Promise.allSettled(
-        taskList.map(task => loadTaskEventsInternal(task.issue.number))
-      );
-      settled.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          const { events, status } = result.value;
-          setTasks(prev => prev.map((t, i) =>
-            i === index ? { ...t, events, status, loading: false } : t
-          ));
-        } else {
-          setTasks(prev => prev.map((t, i) =>
-            i === index ? { ...t, loading: false, error: result.reason?.message } : t
-          ));
-        }
-      });
-    } catch (err) {
-      setError(err.message);
-      setLoading(false);
-    }
-  }, []);
 
   // Внутренняя функция загрузки событий для задачи (возвращает события и
   // статус). Единственная каноническая форма task_id продюсера —
@@ -426,11 +410,12 @@ function AgentsTasksSection(props) {
   // (`issue:#N`, `task:#N`, `#N`, голое число) не совпадают с продюсером
   // НИ ОДНА — молчаливое «Событий пока нет» на реальной задаче.
   //
-  // Честный предел (пока не закрыт отдельной задачей из ревью): воркер
-  // сегодня пишет под `issue-<N>` только heartbeat — `job_start`/`job_end`
-  // живут под UUID задач мордочной очереди, не под id issue. Статус пула
-  // до появления такого продюсера остаётся 'unknown' даже при свежем
-  // heartbeat — это честный пробел, не регресс этого PR.
+  // Честный предел (пока не закрыт отдельной задачей из ревью): под
+  // `issue-<N>` воркер пишет события job'а (job_start/job_end — статусы
+  // running/done/failed), но НЕ task_queued/task_dispatched — их пишет
+  // только UUID-очередь морды, поэтому статус «queued» для issue-задач
+  // не появится. Пул задач, ещё не взятых воркером, честно показывает
+  // `unknown`.
   const loadTaskEventsInternal = useCallback(async (taskNumber) => {
     const events = await fetchAllJournalEvents(`issue-${taskNumber}`);
 
@@ -450,6 +435,56 @@ function AgentsTasksSection(props) {
 
     return { events, status };
   }, []);
+
+  const loadTasks = useCallback(async () => {
+    if (loadTasksInFlightRef.current) return;
+    loadTasksInFlightRef.current = true;
+    try {
+      setError(null);
+      const issues = await fetchGitHubIssues();
+      const taskList = issues.map(issue => ({
+        issue,
+        status: 'unknown',
+        events: [],
+        loading: true, // Начинаем загрузку событий сразу
+        error: null,
+      }));
+      setTasks(taskList);
+      setLoading(false);
+
+      // Загружаем события журнала для всех задач параллельно (как plugin-manager)
+      const settled = await Promise.allSettled(
+        taskList.map(task => loadTaskEventsInternal(task.issue.number))
+      );
+      // Матч результата по номеру issue, не по индексу (находка ревью
+      // PR #412): индекс в freshly отсортированном «sort=updated» списке
+      // молча ложил события на чужую задачу, если список перечитался.
+      settled.forEach((result, index) => {
+        const number = taskList[index].issue.number;
+        if (result.status === 'fulfilled') {
+          const { events, status } = result.value;
+          setTasks(prev => prev.map(t =>
+            t.issue.number === number ? { ...t, events, status, loading: false } : t
+          ));
+        } else {
+          setTasks(prev => prev.map(t =>
+            t.issue.number === number ? { ...t, loading: false, error: result.reason?.message } : t
+          ));
+        }
+      });
+      setPollPause(false);
+    } catch (err) {
+      // Сюда падает только СПИСОК (fetchGitHubIssues): чаще всего 403 rate
+      // limit GitHub — автопроллинг встаёт на паузу, тики интервала
+      // пропускаются, долбить лимитированный API нельзя. Ошибки журнала —
+      // per-задача через allSettled выше и паузу не поднимают.
+      setError(err.message);
+      setLoading(false);
+      setPollPause(true);
+    } finally {
+      loadTasksInFlightRef.current = false;
+    }
+  }, [loadTaskEventsInternal, setPollPause]);
 
   const loadTaskEvents = useCallback(async (taskNumber) => {
     setTasks(prev => prev.map(task =>
@@ -496,8 +531,10 @@ function AgentsTasksSection(props) {
   // сейчас статусы обновляются поллингом TASKS_POLL_INTERVAL_MS.
   useEffect(() => {
     loadTasks();
-    const timer = setInterval(loadTasks, TASKS_POLL_INTERVAL_MS);
-    pollTimersRef.current.tasks = timer;
+    const timer = setInterval(() => {
+      if (pollPausedRef.current) return; // пауза после 403 — газ: Refresh/Retry
+      loadTasks();
+    }, POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [loadTasks]);
 
@@ -525,6 +562,7 @@ function AgentsTasksSection(props) {
     return h('div', { style: styles.section },
       h('div', { style: styles.errorBanner },
         t('loadError') + ': ' + error,
+        pollPaused && h('div', { style: { flexBasis: '100%' } }, t('pollPaused')),
         h(Button, { variant: 'outline', size: 'sm', onClick: loadTasks }, h(IconRefreshCw, { size: 12 }), t('retry'))
       )
     );
@@ -536,7 +574,8 @@ function AgentsTasksSection(props) {
         h(IconTerminal, { size: 16 }), t('title')
       ),
       h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-        error && h('span', { style: { fontSize: '11px', color: 'var(--dsh-error, #ef4444)' } }, error),
+        error && h('span', { style: { fontSize: '11px', color: 'var(--dsh-error, #ef4444)' } },
+          pollPaused ? `${error} — ${t('pollPaused')}` : error),
         h(Button, { variant: 'outline', size: 'sm', onClick: loadTasks }, h(IconRefreshCw, { size: 12 }), t('refresh'))
       )
     ),
@@ -560,7 +599,15 @@ function AgentsTasksSection(props) {
 
 // ── Монтаж ────────────────────────────────────────────────────────────────────
 
-// Пробуем разные слоты: sidebar.section (если есть), settings.section (fallback)
+// Секция регистрируется СОЗНАТЕЛЬНО в оба слота, безусловно: sidebar.section
+// — основной вход для задачи #111, settings.section — второй вход (как у
+// plugin-manager). Никакого «fallback» тут нет: проверять наличие слота
+// перед регистрацией клиентский API секций не даёт, а существование
+// sidebar.section в собранной морде не подтверждено (в
+// docs/research/11-dsh-edge.md описан только settings.section) — до снятия
+// факта с деплоя владельца (задача «сверить слот sidebar.section» из ревью
+// PR #412) оба входа дешевле одного тихо пустого; цена — дублирование секции
+// в настройках при живом сайдбаре, это осознанный компромисс, а не авария.
 const SIDEBAR_SLOT = 'sidebar.section';
 const SETTINGS_SLOT = 'settings.section';
 
@@ -581,7 +628,8 @@ function apply(ctx) {
     locale: 'agents.tasks',
   }, AgentsTasksSection));
 
-  // Fallback: также регистрируем в settings.section (как plugin-manager)
+  // Второй вход — settings.section (см. коммент выше: это не fallback,
+  // регистрация безусловная и осознанная).
   ctx.slots.inject(SETTINGS_SLOT, () => ctx.slots.register({
     name: SETTINGS_SLOT,
     id: 'agents-tasks',
@@ -626,6 +674,7 @@ const dictionaries = {
     toolCallLabel: 'Tool Call: ',
     toolResultLabel: 'Tool Result: ',
     loadError: 'Failed to load',
+    pollPaused: 'Auto-refresh paused (GitHub API rate limit) — press Refresh',
     journalError: 'Journal unavailable',
     emptySessionEvent: 'Empty session event',
   },
@@ -661,6 +710,7 @@ const dictionaries = {
     toolCallLabel: '工具调用: ',
     toolResultLabel: '工具结果: ',
     loadError: '加载失败',
+    pollPaused: '自动刷新已暂停（GitHub API 速率限制）— 请点击「刷新」',
     journalError: '日志不可用',
     emptySessionEvent: '空会话事件',
   },
@@ -696,6 +746,7 @@ const dictionaries = {
     toolCallLabel: 'Вызов инструмента: ',
     toolResultLabel: 'Результат инструмента: ',
     loadError: 'Ошибка загрузки',
+    pollPaused: 'Автообновление на паузе (лимит GitHub API) — нажмите «Обновить»',
     journalError: 'Журнал недоступен',
     emptySessionEvent: 'Пустое событие сессии',
   },

@@ -12,9 +12,9 @@
  * react и ui-primitives здесь — стабы: настоящий react приезжает в браузере
  * из seed-карты шелла; стаб покрывает только контракт, который бандл
  * использует (createElement/useState/useCallback/useEffect/useRef + StateDot
- * + Button + Pill + IconCopy + IconExternalLink + IconRefreshCw +
+ * + Button + IconExternalLink + IconRefreshCw +
  * IconChevronDown + IconChevronRight + IconMessageSquare + IconTerminal +
- * IconBrain + IconTool + IconX).
+ * IconBrain + IconTool).
  */
 
 import test from 'node:test'
@@ -97,8 +97,6 @@ function loadBundle(fetchStub) {
   sandbox.primitives = {
     StateDot: function StateDot(props) { return { type: 'StateDot', props: { ...props }, children: [] } },
     Button: function Button(props) { return { type: 'Button', props: { ...props }, children: [props.children] } },
-    Pill: function Pill(props) { return { type: 'Pill', props: { ...props }, children: [props.children] } },
-    IconCopy: function IconCopy(props) { return { type: 'IconCopy', props: { ...props }, children: [] } },
     IconExternalLink: function IconExternalLink(props) { return { type: 'IconExternalLink', props: { ...props }, children: [] } },
     IconRefreshCw: function IconRefreshCw(props) { return { type: 'IconRefreshCw', props: { ...props }, children: [] } },
     IconChevronDown: function IconChevronDown(props) { return { type: 'IconChevronDown', props: { ...props }, children: [] } },
@@ -107,7 +105,6 @@ function loadBundle(fetchStub) {
     IconTerminal: function IconTerminal(props) { return { type: 'IconTerminal', props: { ...props }, children: [] } },
     IconBrain: function IconBrain(props) { return { type: 'IconBrain', props: { ...props }, children: [] } },
     IconTool: function IconTool(props) { return { type: 'IconTool', props: { ...props }, children: [] } },
-    IconX: function IconX(props) { return { type: 'IconX', props: { ...props }, children: [] } },
   }
   sandbox.require = (specifier) => {
     if (specifier === 'react') return sandbox.react
@@ -134,7 +131,8 @@ function loadBundle(fetchStub) {
   assert.ok(sandbox.registered, 'бандл не зарегистрировал фабрику в __ModuleLoader__')
   const exports = sandbox.registered.factory(sandbox.require)
 
-  const mount = { slot: null, declaration: null, component: null, dictionaries: {} }
+  const mount = { injections: [], dictionaries: {} }
+  let current = null
   const ctx = {
     effect(fn) { fn() },
     locale: {
@@ -142,22 +140,37 @@ function loadBundle(fetchStub) {
       bind: (ns) => (key) => `${ns}:${key}`,
     },
     slots: {
-      inject: (slot, callback) => { mount.slot = slot; mount.callback = callback },
-      register: (declaration, component) => { mount.declaration = declaration; mount.component = component },
+      // Собираем ВСЕ регистрации, а не только последнюю: ассерт «любой из
+      // двух слотов» пропускал потерю sidebar.section при живом settings
+      // (находка ревью PR #412 — критерий #407 ломался незаметно).
+      inject: (slot, callback) => {
+        const injection = { slot, declaration: null, component: null, callback: null }
+        // register обязан спариваться с той инъекцией, чей callback вызван,
+        // а не с последней push'нутой (обе push'аются до первого вызова).
+        injection.callback = () => { current = injection; callback() }
+        mount.injections.push(injection)
+      },
+      register: (declaration, component) => {
+        current.declaration = declaration
+        current.component = component
+      },
     },
   }
   exports.apply(ctx)
-  // Принимаем любой из двух слотов
-  assert.ok(mount.slot === 'sidebar.section' || mount.slot === 'settings.section',
-    `apply смонтировал не sidebar.section и не settings.section, а ${mount.slot}`)
-  mount.callback()
-  assert.ok(mount.component, 'колбэк слота не зарегистрировал компонент')
+  // Оба входа обязательны: sidebar.section — критерий #407 («вкладка в
+  // морде»), settings.section — осознанный второй вход (см. body.js).
+  const sidebar = mount.injections.find((injection) => injection.slot === 'sidebar.section')
+  assert.ok(sidebar, 'apply не смонтировал секцию в sidebar.section — ростер морды её не покажет')
+  assert.ok(mount.injections.some((injection) => injection.slot === 'settings.section'),
+    'apply не смонтировал секцию в settings.section')
+  for (const injection of mount.injections) injection.callback()
+  assert.ok(sidebar.component, 'колбэк слота не зарегистрировал компонент')
 
   /** Ре-рендер: ячейки состояния живут в sandbox между рендерами. */
   sandbox.render = () => {
     sandbox.cursor = 0
     sandbox.effects = []
-    sandbox.tree = mount.component({ t: (key) => key })
+    sandbox.tree = sidebar.component({ t: (key) => key })
     return sandbox.tree
   }
   sandbox.runEffectsAndSettle = async () => {
@@ -213,13 +226,16 @@ test('manifest.json пакета = текущему каталогу репоз�
     'пакет собран из устаревшего среза каталога — прогони build.mjs перед npm pack')
 })
 
-test('монтаж: декларация в sidebar.section ИЛИ settings.section с id agents-tasks; словари в одном наборе ключей', () => {
+test('монтаж: декларации в sidebar.section и settings.section с id agents-tasks; словари в одном наборе ключей', () => {
   const { mount } = loadBundle(async () => { throw new Error('fetch не ожидается') })
-  assert.ok(mount.declaration.name === 'sidebar.section' || mount.declaration.name === 'settings.section',
-    'слот должен быть sidebar.section или settings.section')
-  assert.equal(mount.declaration.id, 'agents-tasks')
-  assert.equal(mount.declaration.locale, 'agents.tasks')
-  assert.equal(typeof mount.declaration.label, 'function')
+  for (const slot of ['sidebar.section', 'settings.section']) {
+    const injection = mount.injections.find((i) => i.slot === slot)
+    assert.ok(injection && injection.declaration, `нет декларации в ${slot}`)
+    assert.equal(injection.declaration.name, slot)
+    assert.equal(injection.declaration.id, 'agents-tasks')
+    assert.equal(injection.declaration.locale, 'agents.tasks')
+    assert.equal(typeof injection.declaration.label, 'function')
+  }
   const dicts = mount.dictionaries['agents.tasks']
   assert.ok(dicts, 'словари agents.tasks не зарегистрированы')
   const keySet = (dict) => Object.keys(dict).sort().join(',')
@@ -418,17 +434,64 @@ test('пагинация журнала: свежайшие события до�
   assert.ok(taskCalls.some(u => u.includes('after=20')), 'вторая страница не запрошена')
 })
 
-test('ошибка GitHub API: громкая ошибка, а не пустой список', async () => {
-  const { sandbox } = loadBundle(async () => responseStub({
-    ok: false, status: 403, contentType: 'application/json',
-    body: { message: 'API rate limit exceeded' },
-  }))
+test('ошибка GitHub API (403): громкая ошибка + пауза автопроллинга, тики не долбят лимит', async () => {
+  let calls = 0
+  const { sandbox } = loadBundle(async () => {
+    calls += 1
+    return responseStub({
+      ok: false, status: 403, contentType: 'application/json',
+      body: { message: 'API rate limit exceeded' },
+    })
+  })
   sandbox.render()
-  await sandbox.runEffectsAndSettle()
+  await sandbox.runEffectsAndSettle() // стартовый loadTasks: 1 вызов, 403 → пауза
   sandbox.render()
   const strings = collectStrings(sandbox.tree)
   assert.ok(strings.some(s => s.includes('loadError') || s.includes('Ошибка загрузки') || s.includes('Failed to load')), 'ошибка загрузки не показана')
   assert.ok(strings.some(s => s.includes('403') || s.includes('rate limit')), 'детали ошибки не показаны')
+  assert.ok(strings.includes('pollPaused'), 'подсказка о паузе автопроллинга не показана (газ — кнопка Refresh)')
+  // Тик интервала в паузе не делает ни одного запроса к лимитированному API.
+  const before = calls
+  await sandbox.intervals[0]()
+  await flush()
+  assert.equal(calls, before, 'тик интервала сходил в GitHub вопреки паузе после 403')
+})
+
+test('поллинг: успешный тик интервала перечитывает список и журнал', async () => {
+  const githubResponse = {
+    ok: true, status: 200, contentType: 'application/json',
+    body: [
+      { number: 500, title: 'Poll test', state: 'open', html_url: 'https://github.com/test/500', assignees: [], labels: [{name: 'task'}], created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-02T00:00:00Z' },
+    ],
+  }
+  const journalResponse = {
+    ok: true, status: 200, contentType: 'application/json',
+    body: { events: [
+      { id: 1, task_id: 'issue-500', seq: 1, ts: Date.now(), source: 'system', kind: 'first_heartbeat', data: {} },
+    ], has_more: false, next_after: 1 },
+  }
+  const calls = { github: 0, journal: 0 }
+  const { sandbox } = loadBundle(async (url) => {
+    const urlStr = String(url)
+    if (urlStr.startsWith('https://api.github.com/')) {
+      calls.github += 1
+      return responseStub(githubResponse)
+    }
+    if (urlStr.includes('/api/harness/events?task_id=')) {
+      calls.journal += 1
+      return responseStub(journalResponse)
+    }
+    throw new Error('неожиданный запрос: ' + urlStr)
+  })
+  sandbox.render()
+  await sandbox.runEffectsAndSettle()
+  sandbox.render()
+  const githubBefore = calls.github
+  const journalBefore = calls.journal
+  await sandbox.intervals[0]()
+  await flush()
+  assert.equal(calls.github, githubBefore + 1, 'тик интервала не перечитал список задач')
+  assert.ok(calls.journal > journalBefore, 'тик интервала не перечитал журнал')
 })
 
 test('ошибка журнала (не JSON): форма ответа проверяется — громкая ошибка', async () => {
