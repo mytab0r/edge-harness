@@ -51,9 +51,11 @@ export function isExpected(finding) {
  * Прогоняет смоук против одного воркера (прод ИЛИ локальный unstable_dev —
  * вызывающий код решает, чем является baseUrl). Не вызывает process.exit —
  * возвращает { findings, elapsedMs } при штатном завершении обхода; при
- * структурном отказе (логин не удался, вкладок не нашлось) бросает Error с
- * полем `.findings`, чтобы накопленные до отказа находки не терялись (класс
- * #518 — диагностика при отказе клика «Settings»/боте шелла).
+ * ЛЮБОМ отказе бросает Error с полем `.findings`, чтобы накопленные до
+ * отказа находки не терялись (класс #518 — диагностика при отказе клика
+ * «Settings»/боте шелла): падение таймаутом ожидания инпута — типичная форма
+ * мёртвого бута шелла, консольные/pageerror-находки к этому моменту УЖЕ
+ * собраны слушателями, и оба вызывающих смоука печатают их из `error?.findings`.
  *
  * @param {object} opts
  * @param {import('playwright-core').Browser} opts.browser — уже запущенный браузер (вызывающий код отвечает за launch/close)
@@ -198,6 +200,14 @@ export async function runBrowserSmoke({ browser, baseUrl, accessKey }) {
     currentSection = 'settings:close'
     await page.getByRole('button', { name: 'Close' }).click({ timeout: 10_000 }).catch(() => {})
     await page.waitForTimeout(500)
+  } catch (error) {
+    // Любой путь отказа несёт накопленное (не только throwWithFindings выше):
+    // таймаут page.goto/accessInput.waitFor/dialog.waitFor при мёртвом буте
+    // шелла (класс #518) бросает ГОЛУЮ ошибку — без этой обёртки уже собранные
+    // консольные/pageerror-находки пропадали бы, и смоук печатал бы голый
+    // таймаут вместо точной причины.
+    if (error?.findings) throw error
+    throwWithFindings(error.message, error)
   } finally {
     await context.close()
   }
