@@ -143,12 +143,22 @@ tasks.md`, «Гейт 4».
 
 Плагин `dsh-anthropic-oauth-pool` (подписка Claude владельца) монтируется
 НЕЗАВИСИМО от suite ротации учёток (`vars.PLUGINS_SUITE_URL`, снята вместе
-со сломанным combo-router — #790/#216) во всех трёх каналах
-(`worker.yml`/`hands.yml`/`ai-review.yml`), гейт — секреты
+со сломанным combo-router — #790/#216), гейт — секреты
 `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` (JSON `~/.claude/.credentials.json`
 целиком: `{"claudeAiOauth": {"accessToken", "refreshToken", ...}}`). Ни один
 секрет не задан → пул не подключается, поведение (цепочка/одиночный
 провайдер) не меняется.
+
+**Только `worker.yml`/`hands.yml`, НЕ `ai-review.yml` (#860, решение
+владельца 2026-09-10).** Недельная квота Claude — ресурс разработки, дневная
+квота GLM/ZAI (`config/provider-usage.json`, `default-chain`, GLM/ZAI
+первыми, #857) — ресурс ревью; общий потребитель жёг бы обе разными по
+периоду квотами одним и тем же трафиком. `ai-review.yml`/`scripts/review/
+ai_dsh.sh` не получают секреты `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` в env
+и не вызывают ни `dsh_install_anthropic_pool`, ни
+`dsh_import_anthropic_accounts`, ни `dsh_mount_anthropic_pool` — ревью идёт
+напрямую `dsh_run_with_provider_chain`, пула там нет структурно (не
+«отключён отсутствием секрета»).
 
 **Не элемент `DSH_PROVIDER_CHAIN`.** Пул регистрирует себя в
 `llm-pi-ai.providers` с `api: anthropic-messages` — другим протокольным

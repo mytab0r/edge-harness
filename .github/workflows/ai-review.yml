@@ -407,13 +407,12 @@ jobs:
         with:
           node-version: 24
 
-      # pnpm нужен dsh plugin add (монтаж anthropic-oauth-pool, #838, тот же
-      # класс, что #83 — dsh plugin add без pnpm падает; шаг уже есть у
-      # worker.yml/hands.yml, здесь был пропущен — issue #842).
-      - if: steps.fingerprint.outputs.go == 'true'
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
+      # pnpm/action-setup сюда НЕ ставится (#860): ни suite, ни
+      # anthropic-oauth-pool в ai-review не монтируются — `dsh plugin add`
+      # здесь не зовётся никем (dsh ставится npm, профиль патчится записью
+      # cordis.patch.yml); pnpm остаётся уделом worker.yml/hands.yml
+      # (гвардия scripts/lib/test_dsh_plugin_pnpm_guard.py считает вызовы
+      # кодом, не комментариями).
 
       - if: steps.fingerprint.outputs.go == 'true'
         id: gather
@@ -480,16 +479,15 @@ jobs:
           # уделом hands.yml (#797: worker.yml теперь тоже идёт цепочкой, там
           # suite сегодня и так неактивен — vars.PLUGINS_SUITE_URL пуста).
           #
-          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) — ОТДЕЛЬНЫЙ
-          # от suite случай, протокольно не конфликтует с цепочкой (design.md
-          # anthropic-oauth-pool-standalone, «Стык с цепочкой провайдеров»):
-          # пробуется ПОСЛЕДОВАТЕЛЬНО перед ней, не заменяя. JSON
-          # credentials.json целиком в значении секрета (AGENTS.md
-          # «Секреты» — значение никогда не печатается). Оба пусты →
-          # dsh_install_anthropic_pool печатает «не подключён», шаг идёт как
-          # раньше (только цепочка).
-          ANTHROPIC_OAUTH_1: ${{ secrets.ANTHROPIC_OAUTH_1 }}
-          ANTHROPIC_OAUTH_2: ${{ secrets.ANTHROPIC_OAUTH_2 }}
+          # Быстрый провайдер Claude (#838, anthropic-oauth-pool) ТОЖЕ сюда
+          # НЕ прокидывается (#860, решение владельца 2026-09-10): недельная
+          # квота Claude нужна разработке (worker.yml/hands.yml), а ревью
+          # идёт дневной цепочкой GLM/ZAI (config/provider-usage.json,
+          # default-chain, #857) — общий потребитель жёг бы обе квоты одним
+          # и тем же трафиком. scripts/review/ai_dsh.sh больше не зовёт
+          # dsh_install_anthropic_pool/dsh_import_anthropic_accounts/
+          # dsh_mount_anthropic_pool вовсе (не «пул неактивен из-за
+          # отсутствия секрета» — пула здесь нет структурно).
           DSH_TIMEOUT_SECS: "3600"
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"

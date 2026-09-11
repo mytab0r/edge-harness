@@ -32,11 +32,24 @@ add anthropic-N <файл>` (прод-код плагина, не перепис
 использования, ДО первого запуска `dsh` в этом job'е. Причина: имена
 `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` не подпадают под паттерн
 `*_KEY`/`*_TOKEN`/`*_SECRET`, которым DSH вырезает переменные окружения из
-подпроцессов, запускаемых shell-тулом модели — без явного `unset` живой
-OAuth JSON был бы виден агенту `ai-review`, работающему над недоверенным
-диффом PR без `GH_TOKEN` (доверенная граница задачи #18).
+подпроцессов, запускаемых shell-тулом модели.
+
+Оговорка (#860, решение владельца 2026-09-10): после сплита потребителей
+квоты это требование защищает ТОЛЬКО `worker.yml`/`hands.yml` — только там
+секрет проходит через окружение job'а, в котором работает shell-тул агента.
+Канал `ai-review` секрет не получает вовсе: `ai-review.yml` не прокидывает
+`ANTHROPIC_OAUTH_*` в env шага, а `scripts/review/ai_dsh.sh` не зовёт
+импорт (см. «MODIFIED: Проводка секретов» ниже) — unset там нечему
+выполнять, и мотивация «виден агенту ai-review» из первой версии этого
+change больше не действует.
 
 ## ADDED: Выбор провайдера — пул первым, цепочка фоллбэком
+
+Область действия: `worker.yml`/`scripts/worker/task.sh` и `hands.yml`/
+`scripts/hands/dsh_task.sh` — единственные вызывающие
+`dsh_run_with_pool_then_chain` (#860: `ai-review.yml`/`scripts/review/
+ai_dsh.sh` зовёт `dsh_run_with_provider_chain` напрямую, минуя пул, см.
+«MODIFIED: Проводка секретов» ниже).
 
 Требование: `dsh_run_with_pool_then_chain` — при активном пуле патчит
 профиль (`agent-default-model: {provider: anthropic-pool, model:
@@ -76,7 +89,17 @@ JSON/обязательные поля (`claudeAiOauth.accessToken`/`refreshToke
 
 ## ADDED: Проводка секретов в трёх каналах
 
-Требование: `.github/workflows/worker.yml`, `hands.yml`, `ai-review.yml`
-передают `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` из `secrets.*` в env шага,
-вызывающего DSH — тем же местом, где уже проброшены `PLUGINS_SUITE_URL` и
-ключи `DSH_PROVIDER_CHAIN`.
+
+Было (первая версия этого change): `.github/workflows/worker.yml`, `hands.yml`,
+`ai-review.yml` передавали `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` из
+`secrets.*` в env шага, вызывающего DSH, во всех трёх каналах.
+
+Стало (решение владельца, 2026-09-10, #860): секреты пула проброшены ТОЛЬКО
+в `.github/workflows/worker.yml` и `hands.yml` — недельная квота Claude
+нужна разработке. `.github/workflows/ai-review.yml` секреты
+`ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2` в env шага НЕ получает, и
+`scripts/review/ai_dsh.sh` не вызывает `dsh_install_anthropic_pool`/
+`dsh_import_anthropic_accounts`/`dsh_mount_anthropic_pool` вовсе — ревью
+идёт напрямую `dsh_run_with_provider_chain` дневной цепочкой GLM/ZAI
+(`config/provider-usage.json`, `default-chain`, #857), не разделяя трафик с
+разработкой на один и тот же лимит.
