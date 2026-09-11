@@ -62,7 +62,7 @@
       "source": {
         "release": "plugins-agents-tasks-v0.1.1",
         "asset": "edge-harness-dsh-agents-tasks-0.1.1.tgz",
-        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        "sha256": "d1b87ef38c2325fbabe64876ec82a3c45a18051867137a7ba25a229b5a089550"
       },
       "server": false,
       "client": true
