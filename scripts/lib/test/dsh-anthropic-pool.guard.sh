@@ -306,4 +306,29 @@ echo "GUARD(anthropic-pool): 5) пул неактивен -> нулевое из
 ) || fail "8) сквозной путь «все секреты пула биты -> сразу цепочка» сломан"
 echo "GUARD(anthropic-pool): 8) все секреты пула биты сквозным путём -> шаг доходит до цепочки, не падает — ок (класс #859)"
 
-echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838) — гвардия зелёная"
+# ── 9) Инвариант #860 «пул только в worker/hands»: канал ai-review не
+#      потребляет пул ВООБЩЕ — вне комментариев ai_dsh.sh нет ни одного
+#      вызова пула (dsh_install_anthropic_pool/dsh_import_anthropic_accounts/
+#      dsh_mount_anthropic_pool/dsh_run_with_pool_then_chain), а в
+#      ai-review.yml вне комментариев нет проводки ANTHROPIC_OAUTH*. Гейт
+#      «секрета нет -> пул неактивен» (секции 1-8) такой регресс НЕ ловит:
+#      вернуть env/вызовы можно, не покрасив ни одной из них, — и недельная
+#      квота Claude снова жглась бы ревью (вред, который закрывает #860).
+#      Комментарии вырезаются до матчинга (sed 's/#.*$//'): поясняющие
+#      блоки ОБЯЗАНЫ называть отсутствующий механизм, код — нет; реальные
+#      вызовы стоят на отдельных строках, эвристика им ничего не прячет.
+# ─────────────────────────────────────────────────────────────────────
+AI_DSH="$REPO/scripts/review/ai_dsh.sh"
+AI_REVIEW_WF="$REPO/.github/workflows/ai-review.yml"
+[ -f "$AI_DSH" ] || fail "9) не найден $AI_DSH"
+[ -f "$AI_REVIEW_WF" ] || fail "9) не найден $AI_REVIEW_WF"
+POOL_CALL_RE='dsh_install_anthropic_pool|dsh_import_anthropic_accounts|dsh_mount_anthropic_pool|dsh_run_with_pool_then_chain'
+if sed -e 's/#.*$//' "$AI_DSH" | grep -En "$POOL_CALL_RE"; then
+  fail "9) scripts/review/ai_dsh.sh вне комментариев зовёт пул (#860: ревью идёт ТОЛЬКО цепочкой GLM/ZAI, напрямую dsh_run_with_provider_chain) — строки выше"
+fi
+if sed -e 's/#.*$//' "$AI_REVIEW_WF" | grep -En 'ANTHROPIC_OAUTH'; then
+  fail "9) ai-review.yml вне комментариев содержит ANTHROPIC_OAUTH* (#860: секреты пула — только worker.yml/hands.yml) — строки выше"
+fi
+echo "GUARD(anthropic-pool): 9) ai-review не потребляет пул ни кодом, ни env-проводкой (#860) — ок"
+
+echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
