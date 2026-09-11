@@ -1576,6 +1576,19 @@ describe("inbox: сообщения владельца", () => {
     }
   });
 
+  it("подтверждение без claimed_ts (тело без поля, null, 0, отрицательное) — 400 need_claimed_ts, а не молчаливое «accepted: false» устаревшей проходки (fail loud, спека п. 34)", async () => {
+    for (const claimed_ts of [undefined, null, 0, -5]) {
+      const confirm = await postJson("/api/messages/issue-created", {
+        message_id: 1,
+        claimed_ts,
+        issue_number: 4242,
+        issue_url: "https://github.com/mytab0r/edge-harness/issues/4242",
+      });
+      expect(confirm.status).toBe(400);
+      expect((await confirm.json<{ error: { code: string } }>()).error.code).toBe("need_claimed_ts");
+    }
+  });
+
   it("job сообщает явный error через issue-created — тот же кап попыток, что у ошибки dispatch'а, не бесконечный штурм", async () => {
     const s = sender();
     const created = await (

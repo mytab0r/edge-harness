@@ -2213,7 +2213,11 @@ export class Harness extends DurableObject<Env> {
       throw new ApiError(400, "need_message_id");
     }
     const claimedTs = typeof body.claimed_ts === "number" ? body.claimed_ts : Number(asString(body.claimed_ts));
-    if (!Number.isInteger(claimedTs)) {
+    // `<= 0` обязателен: тела без claimed_ts (или с null) превращаются в
+    // Number(null) = 0, и без него кривой запрос получил бы «accepted: false»
+    // — ответ, зарезервированный за ожидаемой гонкой устаревшей проходки,
+    // вместо честного «ты сломан» (fail loud, спека п. 34).
+    if (!Number.isInteger(claimedTs) || claimedTs <= 0) {
       throw new ApiError(400, "need_claimed_ts");
     }
     const row = this.#rows(this.#sql.exec("SELECT text, attempts FROM messages WHERE id = ?", messageId))[0];

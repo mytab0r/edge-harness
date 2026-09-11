@@ -29,12 +29,19 @@
     /api/messages/issue-created` (Bearer `HANDS_TOKEN` — тот же канал, что
     heartbeat) с `{message_id, claimed_ts, issue_number, issue_url}` (issue
     создана) либо `{message_id, claimed_ts, error}` (job сам сообщает об
-    отказе). `claimed_ts` — эхо значения из `client_payload` dispatch'а;
-    подтверждение — CAS по этому значению (тот же инвариант, что у
+    отказе). `claimed_ts` — эхо значения из `client_payload` dispatch'а; тело
+    без `claimed_ts` (или с нулём/отрицательным) — 400 `need_claimed_ts`, а
+    не «устаревшая проходка». Подтверждение — CAS по этому значению (тот же
+    инвариант, что у
     `#finishMessage`): запоздавшее подтверждение проходки, которую ватчдог
     уже увёл дальше (reclaim → повторный dispatch с новым `claimed_ts`), не
-    совпадает и не перезаписывает чужой результат — issue не задваивается
-    молча.
+    совпадает и не перезаписывает чужой результат. Граница обещания: CAS
+    защищает журнал DO, а не факт создания issue — старт job'а верхней
+    границей не ограничен (хвост очереди Actions,
+    `docs/research/21-github-actions.md`); если ватчдог уведёл сообщение, а
+    первый job всё же запустился и создал issue, ретрай создаст вторую —
+    задвоение в этом окне возможно, след дубля только `accepted: false`
+    в логе старого job'а.
 
     Не заданный `GH_DISPATCH_TOKEN`/`GH_REPO`, сетевая ошибка dispatch'а,
     5xx/429 от GitHub на сам dispatch, либо явный `error` от job'а —
