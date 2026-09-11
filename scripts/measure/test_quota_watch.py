@@ -272,12 +272,15 @@ def test_scan_measurement_history_all_window_scan_when_page_not_full(monkeypatch
 
 
 def test_scan_measurement_history_ceiling_when_page_full_below_stale_threshold(monkeypatch):
-    """SCAN_CEILING: страница ПОЛНА (30 прогонов) и целиком внутри окна
-    простоя, успешного замера нет ни в одном — нижняя граница простоя =
-    возраст старейшего прогона страницы, ещё НИЖЕ порога (тихий тик, эпизод
-    не закрывается). Мутация прежнего класса: верни «страница без замера →
-    холодный старт» (return None) — тест краснеет, «измерял → перестал»
-    снова невидимо (found: ревью PR #607, head 29debcd)."""
+    """SCAN_CEILING: страницы исчерпаны (потолок MAX_PAGES), все прогоны
+    моложе порога простоя, успешного замера нет ни в одном — нижняя граница
+    простоя = возраст старейшего просмотренного прогона, ещё НИЖЕ порога
+    (тихий тик, эпизод не закрывается; честный остаток потолка страниц —
+    устойчивый шторм плотнее ~2 прогонов/мин, см. константу). Мутации:
+    верни «страница без замера → холодный старт» (return None) — тест
+    краснеет; поставь MEASUREMENT_SCAN_MAX_PAGES = 1 — краснеет по
+    success_age (found: ревью PR #607, head 29debcd; пагинация — ревью
+    head 345a64f)."""
     now = datetime.now(timezone.utc)
     # 30 прогонов, от 1 до 30 минут назад — вся страница внутри порога 45 мин.
     runs = _runs_response([_run(i, _iso(now - timedelta(minutes=i))) for i in range(1, 31)])
@@ -294,6 +297,143 @@ def test_scan_measurement_history_ceiling_when_page_full_below_stale_threshold(m
     assert ms.success_age == pytest.approx(30.0, abs=0.1)
     assert ms.success_age < qw.MEASUREMENT_STALE_MINUTES
     assert ms.attempt_age is None
+
+
+def _paged_runs_response(pages: list[list[dict]]) -> dict:
+    """Полный список прогонов, нарезанный по страницам — форма ответа
+    GitHub Jobs API `?page=N` (скан пагинирует, found: ревью PR #607, head
+    345a64f)."""
+    return {"workflow_runs": [r for page in pages for r in page]}
+
+
+def _paged_gh(pages: list[list[dict]], jobs_by_run: dict[int, dict],
+              list_calls: list[int], jobs_requested: list[int]):
+    """Фейковый pulse_guard.gh, разбирающий `page=N` списка прогонов и
+    считающий вызовы обоих видов (как настоящий `gh api` CLI)."""
+    def fake_gh(*args):
+        if args and args[0] == "--method":
+            page = 1
+            for i, a in enumerate(args):
+                if a == "-f" and i + 1 < len(args) and args[i + 1].startswith("page="):
+                    page = int(args[i + 1].split("=")[1])
+            list_calls.append(page)
+            return {"workflow_runs": pages[page - 1]}
+        m = re.search(r"/actions/runs/(\d+)/jobs", args[0])
+        assert m, f"неожиданный вызов gh(): {args!r}"
+        run_id = int(m.group(1))
+        jobs_requested.append(run_id)
+        return jobs_by_run[run_id]
+    return fake_gh
+
+
+def test_scan_measurement_history_paginates_and_finds_success_on_second_page(monkeypatch):
+    """БЛОКЕР ревью PR #607 (head 345a64f), «шторм держит страницу
+    скользящей»: страница 30 прогонов при шторме PR-событий ~1 прогон/мин
+    покрывает ~15–30 минут истории и скользит — порог простоя (45 мин)
+    нижней границей не достигался НИКОГДА, успех за 30-й позицией был
+    невидим навсегда. Скан обязан листать страницы, пока не найдёт успех /
+    не пересечёт порог простоя / история не кончится. Мутация: поставь
+    MEASUREMENT_SCAN_MAX_PAGES = 1 — тест краснеет (блокер воспроизводится)."""
+    now = datetime.now(timezone.utc)
+    page1 = [_run(i, _iso(now - timedelta(minutes=i))) for i in range(1, 31)]       # 1..30 мин, failure
+    page2_ids = range(31, 61)
+    page2 = []
+    for i in page2_ids:
+        age = 30 + (i - 30)  # 31..60 мин
+        page2.append(_run(i, _iso(now - timedelta(minutes=age))))
+    jobs = {i: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]) for i in range(1, 61)}
+    jobs[40] = _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])  # успех 40 мин назад
+    list_calls, jobs_requested = [], []
+    monkeypatch.setattr(qw.pulse_guard, "gh",
+                         _paged_gh([page1, page2], jobs, list_calls, jobs_requested))
+
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.scan == qw.SCAN_EXACT
+    assert ms.success_age == pytest.approx(40.0, abs=0.1)
+    assert ms.api_ok is True
+    assert list_calls == [1, 2]
+    assert 40 in jobs_requested
+
+
+def test_scan_measurement_history_stale_proven_on_second_page_without_inspecting_boundary_run(monkeypatch):
+    """Тот же блокер, второй исход: успеха нет вовсе, но на второй странице
+    скан ДОХОДИТ до прогона старше порога простоя — SCAN_STALE_PROVEN,
+    эскалация доказана, пограничный прогон (и всё старше) шагами даже не
+    запрашиваются, следующей страницы нет. Раньше страница 30 прогонов
+    держала нижнюю границу ~30 мин < порога — тихий тик весь эпизод."""
+    now = datetime.now(timezone.utc)
+    page1 = [_run(i, _iso(now - timedelta(minutes=i))) for i in range(1, 31)]       # 1..30
+    page2 = [_run(i, _iso(now - timedelta(minutes=30 + (i - 30)))) for i in range(31, 61)]  # 31..60
+    jobs = {i: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]) for i in range(1, 61)}
+    list_calls, jobs_requested = [], []
+    monkeypatch.setattr(qw.pulse_guard, "gh",
+                         _paged_gh([page1, page2], jobs, list_calls, jobs_requested))
+
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.scan == qw.SCAN_STALE_PROVEN
+    assert ms.success_age >= qw.MEASUREMENT_STALE_MINUTES
+    assert ms.api_ok is True
+    assert list_calls == [1, 2]
+    # Возраст прогона здесь равен его id (минуты): осмотрены только прогоны
+    # моложе порога простоя (id/возраст 1..44), пограничный 45 и старше —
+    # их шаги даже не запрашивались.
+    assert jobs_requested and all(i < 45 for i in jobs_requested)
+    assert 44 in jobs_requested
+
+
+def test_scan_measurement_history_ceiling_only_after_page_cap(monkeypatch):
+    """SCAN_CEILING теперь означает исчерпанный потолок страниц, а не одну
+    страницу: три полные страницы прогонов моложе порога простоя (шторм
+    плотнее ~2 прогонов/мин) — тихий тик с нижней границей, честно названный
+    остаток потолка (см. константу). Мутация: MEASUREMENT_SCAN_MAX_PAGES = 1
+    — тест краснеет по success_age (блокер «скользящая страница»)."""
+    now = datetime.now(timezone.utc)
+    pages = []
+    for p in range(3):
+        pages.append([_run(p * 30 + i, _iso(now - timedelta(minutes=0.4 * (p * 30 + i))))
+                      for i in range(1, 31)])  # 0.4..36 мин, всё < 45
+    jobs = {i: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]) for i in range(1, 91)}
+    list_calls, jobs_requested = [], []
+    monkeypatch.setattr(qw.pulse_guard, "gh",
+                         _paged_gh(pages, jobs, list_calls, jobs_requested))
+
+    ms = qw.scan_measurement_history(REPO, "quota-watch.yml", qw.MEASURE_STEP_NAME, now,
+                                     qw.HISTORY_LOOKBACK_MINUTES)
+    assert ms.scan == qw.SCAN_CEILING
+    assert ms.success_age == pytest.approx(36.0, abs=0.1)
+    assert ms.success_age < qw.MEASUREMENT_STALE_MINUTES
+    assert ms.api_ok is True
+    assert list_calls == [1, 2, 3]
+
+
+def test_gate_main_escalates_when_storm_keeps_pages_sliding(monkeypatch, tmp_path):
+    """Мутационная проверка блокера head 345a64f на уровне ГЕЙТА: шторм
+    PR-событий (30 failure-прогонов на страницу), последний успешный замер
+    50 мин назад (вторая страница) — гейт обязан ЭСКАЛИРОВАТЬ простой.
+    На прежнем однопейджном скане success_age≈30 < порога — тихий return 0,
+    и test был бы красным вместе с блокером."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    now = datetime.now(timezone.utc)
+    page1 = [_run(i, _iso(now - timedelta(minutes=i))) for i in range(1, 31)]
+    page2 = [_run(i, _iso(now - timedelta(minutes=30 + (i - 30)))) for i in range(31, 61)]
+    page2[19] = _run(50, _iso(now - timedelta(minutes=50)))  # 50 мин назад — успех
+    jobs = {i: _jobs_response([_step(qw.MEASURE_STEP_NAME, "failure")]) for i in range(1, 61)}
+    jobs[50] = _jobs_response([_step(qw.MEASURE_STEP_NAME, "success")])
+    monkeypatch.setattr(qw.pulse_guard, "gh", _paged_gh([page1, page2], jobs, [], []))
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
+    monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
+    stale_calls = []
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now_, age, reason, scan=qw.SCAN_EXACT: stale_calls.append((repo, age)) or
+        "Telegram: доставлен; след в #120: оставлен")
+
+    assert qw.gate_main() == 0            # сигнал доставлен — шаг зелёный
+    assert stale_calls and stale_calls[0][1] >= qw.MEASUREMENT_STALE_MINUTES
 
 
 def test_scan_measurement_history_uninspected_runs_report_api_not_ok(monkeypatch):
@@ -875,7 +1015,10 @@ def test_gate_main_escalates_ceiling_bound_with_honest_wording(monkeypatch, tmp_
     assert len(stale_calls) == 1
     _, age, reason, scan = stale_calls[0]
     assert (age, scan) == (90.0, qw.SCAN_CEILING)
-    assert "успешного замера нет среди последних" in reason
+    # Формулировка пагинационного потолка (found: ревью PR #607, head
+    # 345a64f): потолок страниц назван числом, не «последние 30 прогонов».
+    assert "успешного замера нет ни в одном из 30 осмотренных прогонов" in reason
+    assert "потолок 3 страниц" in reason
     assert "история продолжается" in reason
     assert closed == []
 

@@ -65,7 +65,12 @@
       `test_scan_measurement_history_sustained_failure_*`,
       `test_gate_main_escalates_during_sustained_measurement_failure`
       (мутационно: кормление канала простоя attempt_age краснит их).
-- [x] Слепая зона одной страницы скана — исходы `SCAN_*` с нижней
+- [x] Слепая зона одной страницы скана — пагинация до порога простоя
+      с жёстким потолком `MEASUREMENT_SCAN_MAX_PAGES` (found: ревью PR
+      #607, head 345a64f — в шторме PR-событий ~1 прогон/мин страница 30
+      покрывает ~15–30 минут и скользит, порог 45 мин нижней границей не
+      достигался никогда: устойчивый отказ замера оставался тихим) —
+      исходы `SCAN_*` с нижней
       границей простоя и честной формулировкой; нижняя граница ниже
       порога не закрывает эпизод; неосмотренные шаги прогонов = 
       «история недоступна». Критерий:
@@ -76,7 +81,13 @@
       `test_scan_measurement_history_stale_proven_stops_before_inspecting_
       boundary_run`, `test_scan_measurement_history_early_stop_bounds_
       jobs_calls_by_stale_window` (стоимость тика ограничена окном
-      простоя, не страницей).
+      простоя, не страницей), пагинация: `test_scan_measurement_history_
+      paginates_and_finds_success_on_second_page`,
+      `test_scan_measurement_history_stale_proven_on_second_page_without_
+      inspecting_boundary_run`,
+      `test_scan_measurement_history_ceiling_only_after_page_cap`
+      (мутационно: потолок страниц = 1 краснит тесты пагинации — блокер
+      «шторм держит страницу скользящей» воспроизводится).
 - [x] Неслитый код не будит владельца: сверка исполняемой копии workflow
       с `main` в трёх состояниях (matches/differs/unknown), `unknown`
       не глушит сигнал. Критерий: `test_workflow_version_check_*`,

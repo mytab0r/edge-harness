@@ -225,13 +225,16 @@ def test_first_observation_marker_write_success_does_not_trip_predicates(monkeyp
     assert qa.pulse_guard.escalation_channel_failed(result) is False
 
 
-def test_lost_evidence_note_is_not_mistaken_for_broken_dedup_carrier(monkeypatch):
+def test_lost_evidence_note_is_not_mistaken_for_broken_dedup_carrier(monkeypatch, capsys):
     """Потерянная улика (комментарий в найденную задачу не добавлен) при
     записанном маркере и доставленном Telegram — НЕ отказ носителя дедупа:
     предикат не должен давать ложного красного (маркер записан, повторной
     страницы не будет). Формулировка note нарочно без литералов вердикта
     escalate — литералы рождаются только в pulse_guard (source-гвардия
-    test_channel_failed_criterion_single_source)."""
+    test_channel_failed_criterion_single_source). Потеря при этом не должна
+    пройти невидимой: улика добавляется ОДИН раз на переход — носитель
+    видимости ::warning::-аннотация, а не только строка лога (чеклист ревью
+    PR #607, head 345a64f)."""
     _no_prior_state(monkeypatch)
     monkeypatch.setattr(qa, "create_or_note_task",
                          lambda *a: (1234, "задача #1234 уже открыта, комментарий с уликой не добавлен: сеть"))
@@ -246,6 +249,32 @@ def test_lost_evidence_note_is_not_mistaken_for_broken_dedup_carrier(monkeypatch
     assert "комментарий с уликой не добавлен" in result
     assert qa.pulse_guard.escalation_dedup_carrier_failed(result) is False
     assert qa.pulse_guard.escalation_channel_failed(result) is False
+
+
+def test_lost_evidence_annotation_is_emitted_by_create_or_note_task(monkeypatch, capsys):
+    """::warning::-аннотация — носитель видимости потерянной улики вне сырого
+    лога (чеклист ревью PR #607, head 345a64f): улика добавляется ОДИН раз
+    на переход, маркер уже записан — повторной попытки не будет, потеря не
+    должна пройти невидимой; GitHub показывает аннотации в списке аннотаций
+    проверки. Мутация: сними print("::warning::улика...") в
+    create_or_note_task — тест краснеет."""
+    candidates = ("похожие ОТКРЫТЫЕ задачи пула уже есть:\n"
+                  "  #77 (score 0.9): Квота харнеса перевалила за 80.0%: DO rows_read/сутки — "
+                  "https://github.com/mytab0r/edge-harness/issues/77\n")
+    monkeypatch.setattr(qa.subprocess, "run",
+                         lambda *a, **k: _FakeResult(1, stderr=candidates))
+
+    def broken_post(repo, issue, text):
+        raise RuntimeError("сеть")
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", broken_post)
+
+    number, note = qa.create_or_note_task(REPO, "DO rows_read/сутки", "cf_do_rows_read_day",
+                                           7_487_640, 5_000_000, 149.8, 80.0)
+
+    assert number == 77
+    assert "комментарий с уликой не добавлен" in note
+    err = capsys.readouterr().err
+    assert "::warning::" in err and "улика" in err and "#77" in err
 
 
 def test_breach_without_created_task_does_not_write_state_marker(monkeypatch):
