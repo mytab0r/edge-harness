@@ -551,11 +551,15 @@ def in_github_actions() -> bool:
 
 def prod_writes_allowed() -> bool:
     """True — изменяющим сетевым вызовам (`gh()` -X POST/PUT/PATCH/DELETE,
-    ORCHESTRA_PAT-путь scheduler.update_branch, `gh workflow run` в
-    scheduler.dispatch_deploy_on_merge, RPC морды dsh-edge, а также
+    ORCHESTRA_PAT-путь scheduler.update_branch, RPC морды dsh-edge, а также
     scheduler.claim_task.release/release_full/collect_stale — через
     claim_task.set_write_guard(_guard_raw_subprocess_write), см. докстринг
-    scheduler._guard_raw_subprocess_write, находка AI-ревью PR #950)
+    scheduler._guard_raw_subprocess_write, находка AI-ревью PR #950, и
+    upstream_drift.attempt_auto_bump — git push/scripts/git/pr-create в обход
+    gh(), находка AI-ревью PR #950 вторым проходом; диспатч деплоя на мерж
+    больше не отдельная поверхность — #956 перевёл его на `gh()` -X POST
+    .../dispatches внутри scripts/lib/merge_reactions.py, снятый ранее
+    `gh workflow run` через голый subprocess.run был последней такой точкой)
     разрешено реально уйти в сеть. В GitHub Actions (in_github_actions()) —
     всегда True. Вне CI — только по явному ALLOW_PROD_WRITES_ENV=1
     (намеренный локальный прогон человеком, отлаживающим планировщик) —

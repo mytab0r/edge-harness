@@ -285,6 +285,20 @@ def wired_fake(*, labels=(), comments=(), tags=TAGS):
     })
 
 
+@pytest.fixture(autouse=True)
+def _allow_prod_writes_in_tests(monkeypatch):
+    """Прод-запись только в CI (находка ai-review PR #950, второй проход):
+    attempt_auto_bump теперь гейтится pulse_guard.prod_writes_allowed(), тем
+    же приёмом, что и scheduler.py (test_scheduler.py::
+    _allow_prod_writes_in_tests). Этот файл тестирует ЛОГИКУ авто-бампа
+    (issue/branch/commit/PR), а не сам режим записи — без автофикстуры
+    happy-path тесты ниже наблюдали бы DRY-RUN вместо своего предмета. Сам
+    DRY-RUN тестируется отдельно и явно (см.
+    test_attempt_auto_bump_dry_run_outside_ci_never_calls_gh_or_git ниже) —
+    там же фикстура переопределяется delenv."""
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
+
+
 @pytest.fixture()
 def offline_telegram(monkeypatch):
     """Без секретов Telegram честно «не доставлен» — сетью тест не ходит.
@@ -436,6 +450,28 @@ def test_attempt_auto_bump_skips_pin_not_tag(monkeypatch, tmp_path):
     assert decision["state"] == "pin-not-tag"
     result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
     assert "вне его права" in result
+
+
+def test_attempt_auto_bump_dry_run_outside_ci_never_calls_gh_or_git(monkeypatch, tmp_path):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (класс «прод-запись только в GitHub Actions»,
+    находка ai-review PR #950 вторым проходом): вне CI, без
+    SCHEDULER_ALLOW_PROD_WRITES, ORCHESTRA_PAT сам по себе не должен
+    доводить авто-бамп до gh()/git — иначе `created["number"]` на честном
+    DRY-RUN None из pulse_guard.gh рвётся TypeError'ом (живой баг до фикса)."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(pg.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    decision = ud.decide_drift(pin(PIN_071), TAGS)
+
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError(f"gh/git не должны вызываться в DRY-RUN вне CI: {args}")
+    monkeypatch.setattr(ud.pulse_guard, "gh", must_not_be_called)
+    monkeypatch.setattr(ud.subprocess, "run", must_not_be_called)
+
+    result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
+    assert "DRY-RUN" in result
+    assert pg.ALLOW_PROD_WRITES_ENV in result
 
 
 def test_attempt_auto_bump_skips_without_pat(monkeypatch, offline_telegram, tmp_path):

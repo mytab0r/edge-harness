@@ -4355,23 +4355,6 @@ def test_after_merge_dispatches_dsh_edge_deploy(monkeypatch):
     assert any("deploy-dsh-edge.yml запущен" in line for line in (observations + actions))
 
 
-def test_dispatch_deploy_on_merge_dry_run_outside_ci_never_calls_subprocess(monkeypatch):
-    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (класс «прод-запись только в GitHub Actions»,
-    2026-09-11): `gh workflow run` — сырой subprocess.run в обход gh(), тот
-    же гейт prod_writes_allowed(), что и ORCHESTRA_PAT-путь update_branch."""
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
-    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
-    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
-    calls = []
-    monkeypatch.setattr(sch.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
-
-    dispatched = sch.dispatch_deploy_on_merge(
-        [{"filename": "dsh-edge/plugins.json"}], "dsh-edge/", "deploy-dsh-edge.yml")
-
-    assert calls == []  # мок HTTP-слоя не получил ни одного вызова
-    assert dispatched is True  # находка совпадения ещё случилась — только реальный запуск пропущен
-
-
 def test_after_merge_skips_dsh_edge_deploy_for_other_paths(monkeypatch):
     # Путь не тронул dsh-edge/** — deploy-dsh-edge.yml (и cf-worker'ные
     # worker-ci.yml/deploy-worker.yml) не диспатчатся, но repo-ci.yml/
@@ -4425,6 +4408,51 @@ def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
     assert hard_failure is False
     assert any("реакция на мерж" in line and "не выполнена" in line for line in observations)
     assert not any(c.startswith("-X POST") and "/dispatches" in c for c in fake.calls)
+
+
+# ── перепись сырых транспортов записи в трёх файлах пульса (хвост находки
+# ai-review PR #950, второй проход): prod_writes_allowed() перечисляет
+# сегодняшние поверхности прод-записи текстом в докстринге — этот тест держит
+# перечень числом. Появление НОВОГО сырого транспорта (subprocess.run/
+# urllib.request с методом записи) в одном из трёх файлов меняет счёт —
+# офендер, пока рядом не добавлена проверка того же предиката
+# (prod_writes_allowed/_guard_raw_subprocess_write) и не обновлена запись
+# здесь (тот же приём, что test_deploy_on_merge_class_covers_both_deployables
+# выше для `["gh", "workflow", "run"`, расширенный на upstream_drift.py и
+# pulse_guard.py по прямой находке ревью). Учёт по литералу, не по функции —
+# как и выше, устойчивее к переносу отступа при добавлении гейта рядом.
+
+RAW_WRITE_CENSUS = (
+    # (файл относительно scripts/orchestra, литерал маркера, ожидаемое число
+    # вхождений, литерал гейта, который обязан стоять в том же файле).
+    # `["gh", "workflow", "run"` (диспатч деплоя) сюда не входит: #956 вынес
+    # его в scripts/lib/merge_reactions.py (единый реестр реакций на мерж) —
+    # вне территории этой доводки (не трогаем scripts/lib/merge_reactions*).
+    ("scheduler.py", '["gh", "api", "-X", "PUT"', 1, "_guard_raw_subprocess_write"),
+    ("scheduler.py", "data=body, method=\"POST\",", 2, "_guard_raw_subprocess_write"),
+    ("upstream_drift.py", '"push", "origin"', 1, "prod_writes_allowed"),
+    ("upstream_drift.py", "str(pr_create)", 1, "prod_writes_allowed"),
+)
+
+
+def test_raw_write_transport_census_stays_gated():
+    for filename, marker, expected_count, gate_literal in RAW_WRITE_CENSUS:
+        source = (_DIR / filename).read_text(encoding="utf-8")
+        actual_count = source.count(marker)
+        assert actual_count == expected_count, (
+            f"scripts/orchestra/{filename}: маркер сырой записи {marker!r} "
+            f"встречается {actual_count} раз(а), в переписи ожидалось "
+            f"{expected_count} (класс — находка ai-review PR #950, хвост "
+            "второго прохода). Новый экземпляр без гейта прод-записи рядом "
+            "— это регрессия класса; если добавление намеренное и уже "
+            f"гейтится {gate_literal}, обнови RAW_WRITE_CENSUS в "
+            "test_scheduler.py."
+        )
+        assert gate_literal in source, (
+            f"scripts/orchestra/{filename}: маркер {marker!r} есть, а вызова "
+            f"гейта {gate_literal!r} в файле нет — прод-запись мимо "
+            "prod_writes_allowed (класс — находка ai-review PR #950)."
+        )
 
 
 # ── claim_task пишет только через тот же гейт, что и остальной scheduler.py
