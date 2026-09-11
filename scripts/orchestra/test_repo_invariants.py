@@ -206,12 +206,14 @@ class FakeGh:
     собственный маршрут contents/pipeline-health.jsonl, хотя история снимков
     не их предмет.
 
-    Запасной маршрут для комментариев #120 (инвариант 13, #899): здоровый
-    дефолт — пустой список (маркеров серии конвейера нет). Без него КАЖДЫЙ
-    существующий тест build_report был бы обязан завести собственный
-    маршрут issues/120/comments, хотя фантомная пауза конвейера — не их
-    предмет; тест, которому нужны конкретные маркеры, переопределяет этот
-    маршрут явно (уже так делают тесты #196/#220 выше)."""
+    Запасной маршрут для комментариев #120 (инвариант 13, #899, и инвариант
+    15, дефект A watchdog-issue #120 — оба читают комментарии #120, один
+    общий дефолт на оба): здоровый дефолт — пустой список (маркеров серии
+    конвейера/WIP-гейта нет). Без него КАЖДЫЙ существующий тест build_report
+    был бы обязан завести собственный маршрут issues/120/comments, хотя ни
+    фантомная пауза конвейера, ни WIP-гейт — не их предмет; тест, которому
+    нужны конкретные маркеры, переопределяет этот маршрут явно (уже так
+    делают тесты #196/#220 выше)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
@@ -2444,3 +2446,147 @@ def test_run_escalations_wires_invariant_15_with_fact_not_guess(monkeypatch):
 
 def test_escalating_invariants_includes_15():
     assert 15 in ri.ESCALATING_INVARIANTS
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 16 (дефект A, watchdog-issue #120, 2026-09-11): WIP-гейт объявил
+# ложное «0 PR ждут доработки» — независимый пересчёт по открытым PR
+# расходится с заявленным count и переворачивает решение допуска диспатча
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Тела маркеров ниже — БУКВАЛЬНО тот же шаблон, что публикует
+# scheduler.wip_gate (WIP_GATE_CLOSE_MARKER/WIP_GATE_OPEN_MARKER, не
+# пересказ формата) — прод-форма проверена по исходнику scheduler.py.
+
+def _close_marker_body(count: int, limit: int) -> str:
+    return (f"✅ {ri.scheduler.WIP_GATE_CLOSE_MARKER}\n"
+            f"Открытых PR, ждущих доработки: {count} < {limit} — WIP-лимит снят, "
+            "новые задачи снова диспетчируются.")
+
+
+def _open_marker_body(count: int, limit: int) -> str:
+    return (f"⏸️ {ri.scheduler.WIP_GATE_OPEN_MARKER}\n"
+            f"Открытых PR, ждущих доработки: {count} ≥ лимита {limit}. Новые задачи не "
+            "диспетчируются, пока очередь не поредеет.")
+
+
+def test_check_wip_gate_false_zero_flags_live_incident_2026_09_11():
+    """Живой случай: маркер CLOSE заявил 0 (в 10:25:27Z), реальных открытых
+    PR с REWORK_LABELS на тот же момент — 27 (WIP_LIMIT=12) — решения
+    расходятся: 0 < 12 (пропускает новые задачи), 27 >= 12 (должен держать)."""
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 10, 25, 27)
+    markers = [(marker_at, _close_marker_body(0, limit))]
+    pulls = [open_pr(900 + n, labels=["conflict"]) for n in range(27)]
+    violations = ri.check_wip_gate_false_zero(marker_at, markers, pulls)
+    assert len(violations) == 1
+    assert violations[0] == {
+        "marker_at": marker_at.isoformat(),
+        "claimed_count": 0,
+        "actual_count": 27,
+        "limit": limit,
+    }
+
+
+def test_check_wip_gate_false_zero_silent_when_consistent():
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 10, 2, 44)
+    markers = [(marker_at, _open_marker_body(25, limit))]
+    pulls = [open_pr(900 + n, labels=["conflict"]) for n in range(25)]
+    assert ri.check_wip_gate_false_zero(marker_at, markers, pulls) == []
+
+
+def test_check_wip_gate_false_zero_silent_when_both_agree_gate_open():
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 8, 0)
+    markers = [(marker_at, _close_marker_body(3, limit))]
+    pulls = [open_pr(1, labels=["conflict"])]
+    assert ri.check_wip_gate_false_zero(marker_at, markers, pulls) == []
+
+
+def test_check_wip_gate_false_zero_ignores_stale_marker_outside_window():
+    """Маркер старше WIP_GATE_FALSE_ZERO_WINDOW_MINUTES не сравнивается с
+    текущим снимком — естественный дрейф числа открытых PR между пульсами не
+    должен читаться как расхождение (AGENTS.md «алерт не гадает»)."""
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 9, 0)
+    now = utc(2026, 9, 11, 12, 0)  # 3 часа спустя — далеко за окном (30 мин)
+    markers = [(marker_at, _close_marker_body(0, limit))]
+    pulls = [open_pr(900 + n, labels=["conflict"]) for n in range(27)]
+    assert ri.check_wip_gate_false_zero(now, markers, pulls) == []
+
+
+def test_check_wip_gate_false_zero_silent_when_no_markers():
+    assert ri.check_wip_gate_false_zero(utc(2026, 9, 11, 12, 0), [], []) == []
+
+
+def test_check_wip_gate_false_zero_uses_latest_marker_not_oldest():
+    limit = ri.scheduler.WIP_LIMIT
+    older = utc(2026, 9, 11, 10, 0)
+    newer = utc(2026, 9, 11, 10, 20)
+    markers = [
+        (older, _open_marker_body(25, limit)),   # эпизод открыт
+        (newer, _close_marker_body(0, limit)),   # тот же эпизод только что закрыт
+    ]
+    pulls = [open_pr(900 + n, labels=["conflict"]) for n in range(27)]
+    violations = ri.check_wip_gate_false_zero(newer, markers, pulls)
+    assert len(violations) == 1
+    assert violations[0]["claimed_count"] == 0  # берётся САМЫЙ свежий маркер, не старый
+
+
+def test_fetch_wip_gate_markers_reads_both_marker_kinds(monkeypatch):
+    limit = ri.scheduler.WIP_LIMIT
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-11T10:02:44Z", "body": _open_marker_body(25, limit)},
+            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit)},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    markers = ri.fetch_wip_gate_markers("mytab0r/edge-harness")
+    assert len(markers) == 2
+    assert {body for _, body in markers} == {
+        _open_marker_body(25, limit), _close_marker_body(0, limit),
+    }
+
+
+def test_build_report_flags_wip_gate_false_zero_live_incident(monkeypatch):
+    """Сквозная проверка через build_report (не только unit на чистой
+    функции) — воспроизводит #120 2026-09-11 целиком: маркер CLOSE(0) в
+    комментариях #120, 27 реально открытых PR ждут доработки."""
+    limit = ri.scheduler.WIP_LIMIT
+    now = utc(2026, 9, 11, 10, 26)
+    # `conflict`, не `ai:changes-requested` (тоже входит в REWORK_LABELS,
+    # scheduler.REWORK_LABELS): последний — ФИНАЛЬНЫЙ вердикт ai-гейта, и
+    # завёл бы сюда ещё и дорогой обход инварианта 8 (check_wasted_ai_review_
+    # runs — latest_ai_comment на каждый PR), не предмет этого теста.
+    pulls = [open_pr(900 + n, labels=["conflict"]) for n in range(27)]
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": pulls,
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit)},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[16] == [{
+        "marker_at": "2026-09-11T10:25:27+00:00",
+        "claimed_count": 0,
+        "actual_count": 27,
+        "limit": limit,
+    }]
+    assert any("🚨" in line and "[16]" in line and "27" in line for line in lines)
+
+
+def test_wip_gate_false_zero_is_escalating_not_gating():
+    # Наблюдательный по построению (тот же принцип, что 8/10/12/14): нарушение
+    # зависит от истории маркеров #120, гейтить им PR означало бы красить
+    # чужой PR за чужое искажение снимка.
+    assert 16 not in ri.CI_GATING
+    assert 16 in ri.ESCALATING_INVARIANTS

@@ -684,6 +684,68 @@ def test_list_pages_raises_on_foreign_per_page():
         review_labels.list_pages("repos/o/r/issues?state=open&per_page=50", fake_gh)
 
 
+# ── list_pages: пустой/некорректный снимок не равен «доработки нет» ──────────
+#
+# Дефект A (watchdog-issue #120, живой случай 2026-09-11): `if not
+# isinstance(chunk, list) or not chunk: break` трактовал НЕ-list ответ ТАК
+# ЖЕ, как честную короткую страницу — обрыв обхода, возврат уже накопленного
+# (возможно нулевого) списка молча. `open_pulls` шёл через эту же функцию;
+# `wip_gate` считал пустой снимок за «доработки нет» и открывал диспатч
+# новых задач, хотя реально открытых PR, ждущих доработки, было 27.
+#
+# Прод-форма для dict-ветки — документированный формат ответа GitHub на
+# вторичный рейт-лимит (https://docs.github.com/rest/overview/rate-limits-
+# for-the-rest-api#about-secondary-rate-limits), не наш пересказ: `gh api`
+# при HTTP 200 с таким телом (случается на отдельных прокси/кэширующих
+# прослойках) отдаёт этот dict как результат `json.loads`.
+_SECONDARY_RATE_LIMIT_BODY = {
+    "message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+    "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits",
+}
+
+
+def test_list_pages_raises_loud_on_non_list_chunk_instead_of_silent_empty():
+    # Докажи мутацией: верни `if not isinstance(chunk, list) or not chunk:
+    # break` — этот тест покраснеет (RuntimeError не поднимется, функция
+    # тихо вернёт [] вместо того, чтобы упасть).
+    def fake_gh(url: str):
+        return _SECONDARY_RATE_LIMIT_BODY
+
+    with pytest.raises(RuntimeError, match="неожиданный ответ"):
+        review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", fake_gh)
+
+
+def test_list_pages_raises_loud_on_none_chunk():
+    # None — прод-форма пустого тела (`gh()` в pulse_guard.py/scheduler.py
+    # возвращает None на 204/пустой stdout) — тоже НЕ «страниц больше нет».
+    def fake_gh(url: str):
+        return None
+
+    with pytest.raises(RuntimeError, match="неожиданный ответ"):
+        review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", fake_gh)
+
+
+def test_list_pages_still_stops_normally_on_genuinely_empty_page():
+    # Честная короткая (нулевая) страница — валидный список, не ошибка формы:
+    # первая же страница пуста — это правда «элементов нет вовсе», не отказ.
+    assert review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", lambda url: []) == []
+
+
+def test_list_pages_raises_on_non_list_after_real_first_page():
+    # Гонка/деградация ПОСЛЕ честной первой страницы (например вторичный
+    # рейт-лимит настиг обход на второй странице) — тоже обязана падать
+    # громко, а не тихо вернуть только то, что успела накопить.
+    fake_gh = _paged_gh({"1": [{"number": n} for n in range(100)]})
+
+    def flaky_gh(url: str):
+        if "page=2" in url:
+            return _SECONDARY_RATE_LIMIT_BODY
+        return fake_gh(url)
+
+    with pytest.raises(RuntimeError, match="неожиданный ответ"):
+        review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", flaky_gh)
+
+
 # ── should_run_ai_review: дорогой прогон второго гейта переживает
 # подтягивание main, но не отнимает газ #196 у ai:failed (находка вердикта
 # ai-review PR #294) ─────────────────────────────────────────────────────────
