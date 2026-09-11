@@ -288,16 +288,21 @@ def test_gh_dry_run_skips_write_call_outside_ci(monkeypatch):
     """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (часть 1 — «без газа не уходит»): мок
     HTTP-слоя (subprocess.run) не получает НИ ОДНОГО вызова — изменяющий
     `gh()` вне CI не касается сети вовсе, не просто «возвращает пусто» после
-    настоящего запроса."""
+    настоящего запроса.
+
+    До находки ревью PR #950 (третий проход) отказ гейта возвращал None —
+    неотличимо от честного пустого ответа сервера, поэтому escalate()/
+    post_issue_comment() рапортовали успех, ничего не отправив. Теперь отказ
+    наблюдаем: WriteGateSkipped, не немой None."""
     _clear_ci_env(monkeypatch)
     calls = []
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
             returncode=0, stdout="{}", stderr="")))
-    result = pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+    with pytest.raises(pg.WriteGateSkipped):
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
     assert calls == []  # subprocess.run НЕ вызван вовсе
-    assert result is None
 
 
 def test_gh_executes_write_call_inside_ci(monkeypatch):
@@ -401,6 +406,21 @@ def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
     pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
     assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
+
+
+def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch):
+    """Находка ревью PR #950 (третий проход): escalate() рапортовал «след в
+    #N: оставлен», хотя `post_issue_comment` внутри gh() тихо не отправил
+    ничего (гейт DRY-RUN вернул None). Мутация: замени `except
+    WriteGateSkipped` на общий `except RuntimeError` без различения —
+    сообщение потеряет слово «пропущен», станет неотличимо от реального
+    сетевого сбоя (тоже нарушение, но другого класса)."""
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setattr(pg, "subprocess", SimpleNamespace(
+        run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess.run не должен вызываться"))))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
+    result = pg.escalate("o/r", 120, "текст эскалации")
+    assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
 def test_merge_telegram_text_is_short_clickable_and_escaped():

@@ -49,6 +49,16 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+# Признак изменяющего вызова `gh api` — одно место правды (review_labels.
+# GH_WRITE_METHODS/is_write_call, находка ревью PR #950, третий проход: эта
+# копия и pulse_guard._gh_call_is_write были ПОБАЙТОВО идентичны, второй
+# метод, добавленный в одну, молча не попал бы во вторую).
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parent / "review_labels.py")
+_review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(_review_labels)  # type: ignore[union-attr]
+_is_write = _review_labels.is_write_call
+
 # Один порог с оркестраторским окном просрочки назначений (scheduler.STALE_HOURS):
 # замок и назначение протухают в одном такте, задача возвращается в пул целиком.
 LOCK_TTL_HOURS = 24
@@ -60,17 +70,6 @@ LOCK_REF_PREFIX = "refs/locks/task-"
 EXIT_OK = 0
 EXIT_BUSY = 1
 EXIT_ERROR = 2
-
-_GH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-
-
-def _is_write(args: tuple[str, ...]) -> bool:
-    """Тот же признак, что pulse_guard._gh_call_is_write — `-X МЕТОД`
-    где-либо в аргументах."""
-    for i, arg in enumerate(args):
-        if arg == "-X" and i + 1 < len(args):
-            return args[i + 1].upper() in _GH_WRITE_METHODS
-    return False
 
 
 # Инъецируемый хук перед КАЖДЫМ изменяющим вызовом gh() этого модуля (#951,
@@ -94,9 +93,22 @@ def set_write_guard(guard) -> None:
     _write_guard = guard
 
 
+class WriteGateSkipped(RuntimeError):
+    """Гейт прод-записи (set_write_guard) отказал: вызов НЕ ушёл ни в сеть, ни
+    к «серверу» мока (находка ai-review PR #950, третий проход). Отдельный
+    класс, не GhError — вызывающий код (release/release_full/collect_stale)
+    обязан отличать «операция реально не удалась на сервере» (GhError, отчёт
+    должен признать провал) от «операция даже не была предпринята — DRY-RUN»
+    (WriteGateSkipped, отчёт обязан сказать «пропущено», не «сделано»): до
+    этой находки gh() тихо возвращал None при отказе гейта, а release()/
+    release_full()/collect_stale() не проверяли его и рапортовали успех —
+    ровно тот сценарий, ради которого гейт заведён (mytab0r, локальный прогон
+    вне CI), врал в отчёте."""
+
+
 def gh(*args: str) -> dict | list | None:
     if _write_guard is not None and _is_write(args) and not _write_guard(f"gh api {' '.join(args)}"):
-        return None
+        raise WriteGateSkipped(f"DRY-RUN: gh api {' '.join(args)} пропущен")
     result = subprocess.run(
         ["gh", "api", *args],
         capture_output=True, text=True, encoding="utf-8",
@@ -253,6 +265,8 @@ def release(repo: str, task: int) -> str:
     403/500 и прочие статусы — настоящая поломка, пробрасываются дальше."""
     try:
         gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{task}")
+    except WriteGateSkipped:
+        return f"замок task-{task}: DELETE пропущен (DRY-RUN, замок реально жив)"
     except GhError as error:
         if _ref_missing(error):
             return f"замок task-{task} отсутствовал (уже свободна)"
@@ -288,6 +302,8 @@ def release_full(repo: str, task: int) -> str:
         try:
             gh("-X", "DELETE", f"repos/{repo}/issues/{task}/assignees", *args)
             lines.append(f"назначение снято ({who})")
+        except WriteGateSkipped:
+            lines.append(f"назначение НЕ снято ({who}): пропущено (DRY-RUN)")
         except GhError as error:
             lines.append(f"⚠️ назначение не снято ({who}): {error}")
     else:
@@ -347,6 +363,9 @@ def collect_stale(
             continue
         try:
             gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{lock['task']}")
+        except WriteGateSkipped:
+            actions.append(f"⏸️ замок task-{lock['task']} протух, но снятие пропущено (DRY-RUN)")
+            continue
         except GhError as error:
             actions.append(f"⚠️ замок task-{lock['task']} не снят: {error}")
             continue

@@ -54,6 +54,25 @@ AI_CHANGES = "ai:changes-requested"
 AI_FAILED = "ai:failed"
 AI_VERDICTS = (AI_OK, AI_CHANGES, AI_FAILED)
 
+# ── Признак изменяющего вызова `gh api` ──────────────────────────────────────
+# Одно место правды (находка ревью PR #950, третий проход): claim_task.gh и
+# pulse_guard.gh несли ДВЕ побайтово идентичные копии этого множества и
+# предиката (`claim_task._is_write`/`pulse_guard._gh_call_is_write`) — второй
+# метод, добавленный в одну копию, молча не попал бы во вторую. `-X GET`
+# (используется в паре мест репозитория, например search/issues) остаётся
+# чтением — не в GH_WRITE_METHODS.
+GH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def is_write_call(args: tuple[str, ...]) -> bool:
+    """`-X МЕТОД`, где МЕТОД — не GET, где-либо в аргументах `gh api ...`
+    (порядок гейта — `-X МЕТОД путь ...`, но ищем по всей команде, не только
+    по первым двум аргументам — устойчивее к перестановке)."""
+    for i, arg in enumerate(args):
+        if arg == "-X" and i + 1 < len(args):
+            return args[i + 1].upper() in GH_WRITE_METHODS
+    return False
+
 # ── Вердикт-метки гейта 1 одним кортежем (#203) ──────────────────────────────
 # Любой момент времени на PR должен существовать не более чем один из этих
 # трёх; своп решает verdict_label_changes ниже.

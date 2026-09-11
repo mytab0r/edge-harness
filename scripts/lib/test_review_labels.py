@@ -972,3 +972,27 @@ def test_latest_comment_by_header_none_when_no_trusted_match():
         "o/r", 1, lambda url: [{"user": bot, "body": "просто болтовня"}] if "page=1" in url else [],
         review_labels.CONTRACT_FAIL_HEADER)
     assert found is None
+
+
+# ── is_write_call: одно место правды (находка ревью PR #950, третий проход) ──
+# для claim_task._is_write и pulse_guard._gh_call_is_write — раньше это были
+# ДВЕ побайтово идентичные копии, второй метод в одну молча не попал бы во
+# вторую.
+
+
+def test_is_write_call_true_for_write_methods():
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        assert review_labels.is_write_call(("-X", method, "repos/o/r/issues/1")) is True
+        assert review_labels.is_write_call(("-X", method.lower(), "repos/o/r/issues/1")) is True
+
+
+def test_is_write_call_false_for_explicit_get_and_plain_reads():
+    assert review_labels.is_write_call(("-X", "GET", "search/issues")) is False
+    assert review_labels.is_write_call(("repos/o/r/pulls",)) is False
+
+
+def test_is_write_call_finds_dash_x_anywhere_in_args():
+    # Порядок гейта — `-X МЕТОД путь ...`, но признак ищет по всей команде,
+    # не только по первым двум аргументам — устойчивее к перестановке.
+    assert review_labels.is_write_call(
+        ("repos/o/r/issues/1/comments", "-f", "body=x", "-X", "POST")) is True

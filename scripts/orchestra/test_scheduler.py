@@ -51,7 +51,7 @@ sch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sch)  # type: ignore[union-attr]
 
 # Только ради _WIP_GATE_COUNT_RE (замечание ревью PR #950: маркеры WIP-гейта
-# ниже обязаны матчиться ИМЕННО этим regex'ом инварианта 15, не его
+# ниже обязаны матчиться ИМЕННО этим regex'ом инварианта 16, не его
 # пересказом) — отдельный экземпляр модуля, тот же приём, что уже использует
 # test_repo_invariants.py для scheduler в обратную сторону. Сеть не нужна:
 # в этом файле читаются только определения, gh() не вызывается на импорте.
@@ -5629,7 +5629,7 @@ def test_wip_gate_open_marker_body_matches_invariant_16_regex(monkeypatch):
     assert int(match.group(1)) == len(pulls)
 
 
-def test_wip_gate_close_marker_body_matches_invariant_15_regex(monkeypatch):
+def test_wip_gate_close_marker_body_matches_invariant_16_regex(monkeypatch):
     """Та же гвардия дрейфа, что выше, для CLOSE-маркера (снятие лимита)."""
     comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
     fake = FakeGh({

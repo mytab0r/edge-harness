@@ -224,6 +224,18 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       измерение долга на живом репозитории ещё не сделано отдельно от
       самого факта внедрения.
 
+      Формула — буква ТЗ #948 п.4 (находка ревью PR #950, третий проход):
+      кроме переворота решения допуска (claimed_closes_gate !=
+      actual_closes_gate — гейт открылся/закрылся не тем решением, что дал
+      бы независимый пересчёт), отдельная ветка ловит буквальный «ложный
+      ноль» — claimed == 0, actual > 0 — даже когда оба числа лежат ниже
+      лимита и решение допуска СОВПАДАЕТ (гейт остаётся открыт в обоих
+      случаях). Раньше это молчало: claimed=0/actual=1..11 не переворачивает
+      допуск, но маркер «доработки нет» при живых PR в доработке — тот же
+      симптом из названия дефекта, просто не докатившийся до лимита. Оба
+      числа — факты одного и того же прогона (маркер + independent
+      пересчёт), не гипотезы — «алерт не гадает» не нарушается.
+
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
 Дополнительно repo-ci.yml печатает тот же отчёт на каждый push/PR (видимость
@@ -1976,7 +1988,15 @@ def check_wip_gate_false_zero(now: datetime, wip_markers: list[tuple[datetime, s
     `open_pulls` — независимый снимок (fetch_open_pulls этого же прогона,
     отдельный HTTP-обход от того, что видел scheduler в момент публикации
     маркера) — именно НЕЗАВИСИМОСТЬ обхода делает эту проверку кросс-
-    проверкой класса, а не пересказом одного и того же вызова."""
+    проверкой класса, а не пересказом одного и того же вызова.
+
+    Формула ловит ДВА разных наблюдаемых симптома одного дефекта (буква ТЗ
+    #948 п.4, находка ревью PR #950 третий проход, см. блок-комментарий у
+    инварианта 16 выше): (а) переворот решения допуска — маркер и независимый
+    пересчёт расходятся в том, закрывает ли число гейт; (б) буквальный
+    «ложный ноль» — маркер объявил claimed=0, а пересчёт нашёл живые PR в
+    доработке (actual>0), даже если оба числа ниже лимита и решение допуска
+    формально совпадает."""
     if not wip_markers:
         return []
     latest_at, latest_body = max(wip_markers, key=lambda item: item[0])
@@ -1989,7 +2009,8 @@ def check_wip_gate_false_zero(now: datetime, wip_markers: list[tuple[datetime, s
     actual = sum(1 for pull in open_pulls if scheduler.pr_needs_rework(pull))
     claimed_closes_gate = claimed >= scheduler.WIP_LIMIT
     actual_closes_gate = actual >= scheduler.WIP_LIMIT
-    if claimed_closes_gate == actual_closes_gate:
+    literal_false_zero = claimed == 0 and actual > 0
+    if claimed_closes_gate == actual_closes_gate and not literal_false_zero:
         return []
     return [{
         "marker_at": latest_at.isoformat(),

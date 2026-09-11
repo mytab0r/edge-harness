@@ -581,19 +581,22 @@ def announce_write_mode() -> str:
             f"пропускаются (задай {ALLOW_PROD_WRITES_ENV}=1 для намеренного прод-прогона)")
 
 
-_GH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Признак изменяющего вызова `gh api` — одно место правды (review_labels.
+# GH_WRITE_METHODS/is_write_call, находка ревью PR #950, третий проход: эта
+# копия и claim_task._is_write были ПОБАЙТОВО идентичны, второй метод,
+# добавленный в одну, молча не попал бы во вторую).
+_gh_call_is_write = review_labels.is_write_call
 
 
-def _gh_call_is_write(args: tuple[str, ...]) -> bool:
-    """`-X МЕТОД`, где МЕТОД — не GET, где-либо в аргументах (порядок гейта
-    `gh api` — `-X МЕТОД путь ...` — но ищем по всей команде, не только по
-    первым двум аргументам, устойчивее к перестановке). Явный `-X GET`
-    (используется в паре мест репозитория, например search/issues) остаётся
-    чтением — не в `_GH_WRITE_METHODS`."""
-    for i, arg in enumerate(args):
-        if arg == "-X" and i + 1 < len(args):
-            return args[i + 1].upper() in _GH_WRITE_METHODS
-    return False
+class WriteGateSkipped(RuntimeError):
+    """Гейт прод-записи (prod_writes_allowed) отказал: вызов НЕ ушёл в сеть
+    (находка ai-review PR #950, третий проход, тот же класс, что claim_task.
+    WriteGateSkipped). До этой находки gh() тихо возвращал None при отказе
+    гейта — escalate()/post_issue_comment() не проверяли его: `posted = True`
+    печаталось про комментарий, которого не было. Отдельный класс от
+    обычного RuntimeError сетевого сбоя: вызывающий код обязан различать
+    «пропущено (DRY-RUN)» и «попытка была и провалилась» — это разные факты,
+    их нельзя терять за одним сообщением."""
 
 
 def gh(*args: str) -> dict | list | None:
@@ -603,7 +606,7 @@ def gh(*args: str) -> dict | list | None:
             f"изменяющий вызов пропущен: gh api {' '.join(args)}",
             file=sys.stderr,
         )
-        return None
+        raise WriteGateSkipped(f"DRY-RUN: gh api {' '.join(args)} пропущен")
     result = subprocess.run(
         ["gh", "api", *args],
         capture_output=True, text=True, encoding="utf-8",
@@ -1396,15 +1399,22 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
+        skipped = False
+    except WriteGateSkipped as error:
+        print(f"::warning::след в #{issue_number} пропущен (DRY-RUN): {error}", file=sys.stderr)
+        posted = False
+        skipped = True
     except RuntimeError as error:
         print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
         posted = False
+        skipped = False
     delivered = (
         send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
         if options else send_telegram(text)
     )
+    comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
-            f"след в #{issue_number}: {'оставлен' if posted else 'НЕ оставлен'}")
+            f"след в #{issue_number}: {comment_note}")
 
 
 # ── Сценарии, вызываемые scheduler.py ────────────────────────────────────────────

@@ -207,7 +207,7 @@ class FakeGh:
     не их предмет.
 
     Запасной маршрут для комментариев #120 (инвариант 13, #899, и инвариант
-    15, дефект A watchdog-issue #120 — оба читают комментарии #120, один
+    16, дефект A watchdog-issue #120 — оба читают комментарии #120, один
     общий дефолт на оба): здоровый дефолт — пустой список (маркеров серии
     конвейера/WIP-гейта нет). Без него КАЖДЫЙ существующий тест build_report
     был бы обязан завести собственный маршрут issues/120/comments, хотя ни
@@ -2502,6 +2502,34 @@ def test_check_wip_gate_false_zero_silent_when_both_agree_gate_open():
     markers = [(marker_at, _close_marker_body(3, limit))]
     pulls = [open_pr(1, labels=["conflict"])]
     assert ri.check_wip_gate_false_zero(marker_at, markers, pulls) == []
+
+
+def test_check_wip_gate_false_zero_flags_literal_zero_below_limit():
+    """Буква ТЗ #948 п.4 (находка ревью PR #950, третий проход): claimed=0,
+    actual=1..11 (лимит не перейдён ни там, ни там, решение допуска
+    формально совпадает — гейт остаётся открыт) раньше молчало, хотя маркер
+    буквально соврал «доработки нет» при живом PR в доработке. Мутация:
+    убери ветку `literal_false_zero` (верни `if claimed_closes_gate ==
+    actual_closes_gate: return []` без второго условия) — тест покраснеет."""
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 8, 0)
+    markers = [(marker_at, _close_marker_body(0, limit))]
+    pulls = [open_pr(1, labels=["conflict"])]  # 1 PR в доработке, лимит не перейдён
+    violations = ri.check_wip_gate_false_zero(marker_at, markers, pulls)
+    assert violations == [{
+        "marker_at": marker_at.isoformat(),
+        "claimed_count": 0,
+        "actual_count": 1,
+        "limit": limit,
+    }]
+
+
+def test_check_wip_gate_false_zero_silent_when_claimed_zero_and_actual_zero():
+    """Честный ноль (claimed=0, actual=0) — не находка: маркер не соврал."""
+    limit = ri.scheduler.WIP_LIMIT
+    marker_at = utc(2026, 9, 11, 8, 0)
+    markers = [(marker_at, _close_marker_body(0, limit))]
+    assert ri.check_wip_gate_false_zero(marker_at, markers, []) == []
 
 
 def test_check_wip_gate_false_zero_ignores_stale_marker_outside_window():

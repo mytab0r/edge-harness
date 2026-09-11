@@ -163,10 +163,15 @@ def test_write_guard_default_none_does_not_change_behavior(monkeypatch):
     assert seen  # вызов реально ушёл — хук не подключён, ничего не изменилось
 
 
-def test_write_guard_false_skips_the_real_call_and_returns_none(monkeypatch):
+def test_write_guard_false_skips_the_real_call_and_raises(monkeypatch):
     # Мутационное доказательство: сними проверку `_write_guard is not None and
     # _is_write(args) and not _write_guard(...)` в gh() (например, замени на
     # `if False:`) — этот тест покраснеет: subprocess.run окажется вызван.
+    #
+    # До находки ревью PR #950 (третий проход) gh() тихо возвращал None —
+    # вызывающий код (release/release_full/collect_stale) не проверял его и
+    # рапортовал успех, хотя запись не уходила вовсе. Теперь отказ гейта
+    # наблюдаем: WriteGateSkipped, а не немой None.
     calls = []
 
     def fake_run(args, **kwargs):
@@ -175,8 +180,8 @@ def test_write_guard_false_skips_the_real_call_and_returns_none(monkeypatch):
 
     monkeypatch.setattr(ct, "subprocess", SimpleNamespace(run=fake_run))
     ct.set_write_guard(lambda description: False)
-    result = ct.gh("-X", "DELETE", "repos/o/r/git/refs/locks/task-5")
-    assert result is None
+    with pytest.raises(ct.WriteGateSkipped):
+        ct.gh("-X", "DELETE", "repos/o/r/git/refs/locks/task-5")
     assert calls == []  # DRY-RUN — реального похода в сеть не было
 
 
@@ -213,12 +218,19 @@ def test_write_guard_does_not_gate_reads(monkeypatch):
 def test_write_guard_gates_release_end_to_end(monkeypatch):
     """Живая находка ревью PR #950: claim_task.release шёл в обход
     scheduler._guard_raw_subprocess_write целиком. С подключённым хуком
-    release() обязан молчать (DRY-RUN), а не реально снимать замок."""
+    release() обязан молчать (DRY-RUN), а не реально снимать замок.
+
+    Усилено находкой третьего прохода ревью: `detail` раньше говорил «замок
+    ... снят» даже когда DELETE не уходил вовсе (gh() тихо возвращал None) —
+    отчёт врал об исходе. Теперь ассерт бьёт именно по этой лжи: «снят» без
+    «пропущено» в detail означает регресс на старое поведение."""
     server = install(monkeypatch, FakeServer({}))
     server.add_ref("refs/locks/task-5")
     ct.set_write_guard(lambda description: False)
     detail = ct.release("o/r", 5)
     assert "task-5" in detail
+    assert "пропущен" in detail  # честно назвал DRY-RUN, не соврал про «снят»
+    assert "снят" not in detail  # ключевая проверка находки: раньше здесь было "замок ... снят"
     assert not any("DELETE" in c for c in server.calls)  # DRY-RUN — DELETE не ушёл
     assert "refs/locks/task-5" in server.existing_refs  # замок реально жив
 
@@ -482,6 +494,36 @@ def test_release_full_assignee_removal_failure_does_not_block_lock_release(monke
     detail = ct.release_full("o/r", 5)
     assert "не снято" in detail
     assert any("DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
+def test_release_full_assignee_removal_is_dry_run_via_write_guard(monkeypatch):
+    """Находка ревью PR #950 (третий проход): release_full раньше рапортовал
+    «назначение снято» даже когда гейт заблокировал DELETE (gh() тихо
+    возвращал None). Мутация: замени `except WriteGateSkipped` обратно на
+    неотличимый успех — detail снова солжёт «снято»."""
+    routes = {"repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]}}
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5")
+    ct.set_write_guard(lambda description: False)
+    detail = ct.release_full("o/r", 5)
+    assert "НЕ снято" in detail
+    assert not any("DELETE" in c and "issues/5/assignees" in c for c in server.calls)
+
+
+def test_collect_stale_expired_lock_is_dry_run_via_write_guard(monkeypatch):
+    """Тот же класс для collect_stale: протухший замок под гейтом обязан
+    остаться нетронутым, а действие — честно назвать DRY-RUN, не «снят»."""
+    routes = {
+        "git/matching-refs/locks/": [
+            {"ref": "refs/locks/task-5", "object": {"sha": "oldsha"}},
+        ],
+        "commits/oldsha": {"commit": {"committer": {"date": "2026-08-30T00:00:00Z"}}},  # 48 ч
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    ct.set_write_guard(lambda description: False)
+    _, actions = ct.collect_stale("o/r", utc(12, 0))
+    assert any("task-5" in line and "пропущено" in line for line in actions)
+    assert not any("DELETE" in c and "task-5" in c for c in server.calls)
 
 
 # ── Сборщик протухших замков ─────────────────────────────────────────────────────
