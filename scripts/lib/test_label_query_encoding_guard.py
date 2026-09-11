@@ -30,14 +30,22 @@ GitHub интерпретирует его как часть URL-синтакс�
 f-string (`ast.JoinedStr`, включая неявную конкатенацию соседних строковых
 литералов — Python склеивает их в один узел на этапе разбора, поэтому перенос
 `f"...labels="` + `f"{label_query_value(...)}"` на две строки исходника не
-уходит от проверки) константный кусок, заканчивающийся на `&labels=` или
-`?labels=` (признак «это позиция query-параметра», не любое упоминание слова
-«labels» — находка живой прогонки: `pool_issue.py` несёт `f"...: labels="` в
-тексте ОШИБКИ, не в URL, и не должен считаться нарушением), обязан быть
-немедленно продолжен `FormattedValue`, чьё выражение — вызов
-`review_labels.label_query_value(...)` (или `label_query_value(...)`, если
-модуль импортирован без префикса). Голый литерал `labels=task` (без `{}`
-вовсе) — не мишень: тут нечего кодировать, значение не переменное.
+уходит от проверки) константный кусок, заканчивающийся на `&labels=`, `?labels=`
+или `label:` (два признака «это позиция значения метки в query-параметре» —
+`labels=` для `issues?labels=...`, `label:` для `search/issues?q=label:...`;
+не любое упоминание слова «labels»/«label» — находка живой прогонки:
+`pool_issue.py` несёт `f"...: labels="` в тексте ОШИБКИ, не в URL, и не должен
+считаться нарушением), обязан быть немедленно продолжен `FormattedValue`, чьё
+выражение — вызов `review_labels.label_query_value(...)` (или
+`label_query_value(...)`, если модуль импортирован без префикса). Голый
+литерал `labels=task` (без `{}` вовсе) — не мишень: тут нечего кодировать,
+значение не переменное.
+
+Честный потолок (по образцу `stale_blocked_guard.STALE_MARKER_RE`, который сам
+называет свою узкую форму маркера): признак — ровно эти два суффикса. Третья
+форма запроса с меткой в значении, придуманная позже без одного из этих
+суффиксов константы перед подстановкой, гвардией не покрыта — она обязана
+получить собственный суффиксный признак здесь же, не тихо остаться дырой.
 
 Запуск: python -m pytest scripts/lib/test_label_query_encoding_guard.py -q
 """
@@ -89,11 +97,12 @@ def _unencoded_labels_offenders(path: Path) -> list[str]:
         for i, part in enumerate(values):
             if not (isinstance(part, ast.Constant) and isinstance(part.value, str)):
                 continue
-            if not (part.value.endswith("&labels=") or part.value.endswith("?labels=")):
+            if not (part.value.endswith("&labels=") or part.value.endswith("?labels=")
+                    or part.value.endswith("label:")):
                 continue
-            # 'labels=' — последний кусок f-строки целиком (константа без
-            # подстановки следом, например голый литерал 'labels=task') —
-            # кодировать нечего.
+            # 'labels=' / 'label:' — последний кусок f-строки целиком
+            # (константа без подстановки следом, например голый литерал
+            # 'labels=task') — кодировать нечего.
             if i + 1 >= len(values):
                 continue
             nxt = values[i + 1]
@@ -117,21 +126,90 @@ def test_every_labels_query_substitution_is_url_encoded():
     )
 
 
+# ── Признак 'label:' (q=label:...) — доказательство на изолированной пробе ───
+#
+# Живого места с этой формой запроса сегодня в дереве нет (только 'labels='
+# в open_waiting_owner_issues/open_task_issues), поэтому саму гвардию нельзя
+# доказать прогоном по scripts/ — она просто ничего не найдёт. Проба ниже
+# кормит _unencoded_labels_offenders изолированным файлом, а не дереву
+# scripts/, ровно затем, чтобы доказать признак «label:» независимо от того,
+# появится ли когда-нибудь живой q=label:-вызов (находка ревью PR #941:
+# докстринг обещал покрытие 'q=label:...', которого признак не ловил).
+
+
+def test_unencoded_offenders_flags_q_label_colon_form():
+    # Файл обязан жить ВНУТРИ REPO_ROOT — _unencoded_labels_offenders строит
+    # offender-строку через path.relative_to(REPO_ROOT), pytest'овский
+    # tmp_path снаружи репозитория уронил бы это ValueError'ом, а не честным
+    # результатом. Убирается в finally, что бы ни случилось в теле теста.
+    probe = REPO_ROOT / "scripts" / "lib" / "_probe_q_label_colon_unencoded.py"
+    probe.write_text(
+        'def f(repo, label):\n'
+        '    return f"repos/{repo}/search/issues?q=label:{label}"\n',
+        encoding="utf-8",
+    )
+    try:
+        offenders = _unencoded_labels_offenders(probe)
+    finally:
+        probe.unlink()
+    assert offenders == [f"{probe.relative_to(REPO_ROOT)}:2"]
+
+
+def test_unencoded_offenders_accepts_q_label_colon_form_when_encoded():
+    probe = REPO_ROOT / "scripts" / "lib" / "_probe_q_label_colon_encoded.py"
+    probe.write_text(
+        'from review_labels import label_query_value\n'
+        'def f(repo, label):\n'
+        '    return f"repos/{repo}/search/issues?q=label:{label_query_value(label)}"\n',
+        encoding="utf-8",
+    )
+    try:
+        offenders = _unencoded_labels_offenders(probe)
+    finally:
+        probe.unlink()
+    assert offenders == []
+
+
 # ── Поведенческий тест на прод-форме значения ────────────────────────────────
 
 
-def test_label_query_value_encodes_colon_like_prod_waiting_owner_label():
+def _load_review_labels():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
         "review_labels_encoding_check", REPO_ROOT / "scripts" / "lib" / "review_labels.py")
-    review_labels = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(review_labels)  # type: ignore[union-attr]
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
 
-    # Прод-форма — буквальное значение WAITING_OWNER_LABEL из
-    # waiting_owner_guard.py, не пересказ (AGENTS.md, «тест кормит прод-форму
-    # данных»).
-    assert review_labels.label_query_value("waiting:owner") == "waiting%3Aowner"
+
+def _load_waiting_owner_guard():
+    """Тот же importlib-приём, каким test_waiting_owner_guard.py уже грузит
+    модуль (доказанно дёшево там) — `scripts/orchestra` идёт в sys.path
+    первым, потому что waiting_owner_guard.py делает голый `import
+    pulse_guard`, рассчитывая на путь по каталогу, а не на пакет."""
+    import importlib.util
+    import sys
+
+    orchestra_dir = REPO_ROOT / "scripts" / "orchestra"
+    if str(orchestra_dir) not in sys.path:
+        sys.path.insert(0, str(orchestra_dir))
+    spec = importlib.util.spec_from_file_location(
+        "waiting_owner_guard_encoding_check", orchestra_dir / "waiting_owner_guard.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def test_label_query_value_encodes_colon_like_prod_waiting_owner_label():
+    review_labels = _load_review_labels()
+
+    # Прод-форма — WAITING_OWNER_LABEL, прочитанная из живого исходника
+    # waiting_owner_guard.py, не вписанная копия (AGENTS.md, «тест кормит
+    # прод-форму данных», находка ревью PR #941: переименование метки не
+    # должно молча оставить тест проверяющим мёртвое значение).
+    wog = _load_waiting_owner_guard()
+    assert review_labels.label_query_value(wog.WAITING_OWNER_LABEL) == "waiting%3Aowner"
     # Живые метки этого репозитория с тем же символом класса — та же
     # кодировка, не частный случай одной метки.
     assert review_labels.label_query_value("review:large-ok") == "review%3Alarge-ok"
