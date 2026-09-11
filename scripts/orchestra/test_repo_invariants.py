@@ -2459,22 +2459,25 @@ def test_escalating_invariants_includes_15():
 # этого PR, #904): «призрачный» workflow — в Actions API есть, на диске нет
 # ══════════════════════════════════════════════════════════════════════════
 #
-# Живой замер 2026-09-11: 5 записей API (diag-501, diag-501-verify, diag-502,
-# dsh-edge-pr-smoke, quota-watch) без файла в .github/workflows/ — все 5
-# отключены (state disabled_manually) тем же PR, что добавил инвариант;
-# GitHub не даёт удалить саму запись (DELETE .../actions/workflows/{id} —
-# 404 Not Found, проверено живым вызовом), поэтому «нарушение» — активная
-# (ещё не отключённая), не любая когда-либо существовавшая.
+# Живой замер 2026-09-11 (второй раунд): из 5 кандидатов API без файла на
+# main 2 (dsh-edge-pr-smoke, quota-watch) оказались файлами ЕЩЁ ОТКРЫТЫХ PR
+# (#603, #607) — отключение их через API в первом раунде было ошибкой,
+# исправлено `PUT .../enable`. Различитель — ветка последнего прогона:
+# если она несёт ещё открытый PR, это предложенная работа, не призрак.
+# Настоящих призраков — 3 (diag-501, diag-501-verify, diag-502): ветки их
+# последних прогонов несли уже смёрженные PR, файл убран отдельным коммитом.
 
 
 def _wf(name, path, state="active", id_=1):
     return {"id": id_, "name": name, "path": path, "state": state}
 
 
-def test_ghost_workflow_active_without_disk_file_is_flagged():
+def test_ghost_workflow_active_without_disk_file_and_no_open_pr_is_flagged():
     violations = ri.check_ghost_actions_workflows(
         [_wf("quota-watch", ".github/workflows/quota-watch.yml")],
         disk_names=set(),
+        latest_run_branch={1: "agent/605-quota-continuous-watch"},
+        open_pr_branches=set(),  # PR по этой ветке уже не открыт (смёржен/закрыт)
     )
     assert violations == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
 
@@ -2483,17 +2486,21 @@ def test_ghost_workflow_present_on_disk_is_not_flagged():
     violations = ri.check_ghost_actions_workflows(
         [_wf("orchestra", ".github/workflows/orchestra.yml")],
         disk_names={"orchestra.yml"},
+        latest_run_branch={},
+        open_pr_branches=set(),
     )
     assert violations == []
 
 
 def test_ghost_workflow_already_disabled_is_not_flagged_again():
     # Мутация-доказательство: убрать проверку state != "active" — красит
-    # уже отключённые призраки (5 живых из замера #940) вечно, хотя
+    # уже отключённые призраки (3 живых из замера #940) вечно, хотя
     # GitHub физически не даёт снять саму запись API.
     violations = ri.check_ghost_actions_workflows(
-        [_wf("quota-watch", ".github/workflows/quota-watch.yml", state="disabled_manually")],
+        [_wf("diag-501", ".github/workflows/diag-501.yml", state="disabled_manually")],
         disk_names=set(),
+        latest_run_branch={},
+        open_pr_branches=set(),
     )
     assert violations == []
 
@@ -2504,8 +2511,35 @@ def test_ghost_workflow_dependabot_dynamic_path_is_not_a_ghost():
     violations = ri.check_ghost_actions_workflows(
         [_wf("Dependabot Updates", "dynamic/dependabot/dependabot-updates")],
         disk_names=set(),
+        latest_run_branch={},
+        open_pr_branches=set(),
     )
     assert violations == []
+
+
+def test_ghost_workflow_file_only_on_open_pr_branch_is_not_a_ghost():
+    # Живой случай #603/#600 (dsh-edge-pr-smoke) и #607/#605 (quota-watch):
+    # файл существует ТОЛЬКО в ветке ещё открытого PR — предложенная, не
+    # смёрженная работа, не брошенный мусор.
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("dsh-edge-pr-smoke", ".github/workflows/dsh-edge-pr-smoke.yml", id_=7)],
+        disk_names=set(),
+        latest_run_branch={7: "agent/600-dsh-edge-pr-smoke"},
+        open_pr_branches={"agent/600-dsh-edge-pr-smoke"},
+    )
+    assert violations == []
+
+
+def test_ghost_workflow_mutation_guard_open_pr_check_removed():
+    # Мутация-доказательство: убрать проверку open_pr_branches целиком —
+    # предложенная работа в открытом PR снова считалась бы призраком.
+    violations = ri.check_ghost_actions_workflows(
+        [_wf("dsh-edge-pr-smoke", ".github/workflows/dsh-edge-pr-smoke.yml", id_=7)],
+        disk_names=set(),
+        latest_run_branch={7: "agent/600-dsh-edge-pr-smoke"},
+        open_pr_branches={"agent/600-dsh-edge-pr-smoke"},
+    )
+    assert violations == [], "файл открытого PR не должен считаться призраком"
 
 
 def test_fetch_actions_workflows_uses_mockable_transport(monkeypatch):
@@ -2523,6 +2557,32 @@ def test_fetch_actions_workflows_full_page_raises_loud(monkeypatch):
     patch_gh(monkeypatch, fake)
     with pytest.raises(RuntimeError, match="100"):
         ri.fetch_actions_workflows(REPO)
+
+
+def test_fetch_latest_run_branch_uses_mockable_transport(monkeypatch):
+    fake = FakeGh({
+        "actions/workflows/7/runs?per_page=1": {"workflow_runs": [{"head_branch": "agent/600-dsh-edge-pr-smoke"}]},
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.fetch_latest_run_branch(REPO, 7) == "agent/600-dsh-edge-pr-smoke"
+
+
+def test_fetch_latest_run_branch_no_runs_is_none(monkeypatch):
+    fake = FakeGh({"actions/workflows/7/runs?per_page=1": {"workflow_runs": []}})
+    patch_gh(monkeypatch, fake)
+    assert ri.fetch_latest_run_branch(REPO, 7) is None
+
+
+def test_fetch_latest_run_branch_network_failure_raises_loud(monkeypatch):
+    # Находка ревью PR #944, третий раунд: сбой сети/квоты — не то же самое,
+    # что «прогонов нет» — раньше оба случая молча сливались в None, и
+    # сбой инструмента красил бы CI_GATING на транзиентном сетевом сбое,
+    # советуя отключить живой workflow открытого PR. Теперь пробрасывается
+    # вызывающей стороне (build_report помечает кандидата unchecked).
+    fake = FakeGh({"actions/workflows/7/runs?per_page=1": RuntimeError("gh api: rate limited")})
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="rate limited"):
+        ri.fetch_latest_run_branch(REPO, 7)
 
 
 def test_workflow_files_on_disk_reads_real_directory(tmp_path):
@@ -2547,6 +2607,7 @@ def test_build_report_flags_ghost_workflow(monkeypatch):
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
         "actions/workflows?per_page=100": {"workflows": [_wf("quota-watch", ".github/workflows/quota-watch.yml")]},
+        "actions/workflows/1/runs?per_page=1": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
@@ -2555,6 +2616,28 @@ def test_build_report_flags_ghost_workflow(monkeypatch):
     lines, findings = ri.build_report(REPO, now)
     assert findings[17] == [{"id": 1, "name": "quota-watch", "path": ".github/workflows/quota-watch.yml", "state": "active"}]
     assert any("🚨" in line and "[17]" in line for line in lines)
+
+
+def test_build_report_does_not_flag_open_pr_workflow(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [{"number": 603, "head": {"ref": "agent/600-dsh-edge-pr-smoke"}, "labels": []}],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "actions/workflows?per_page=100": {"workflows": [
+            _wf("dsh-edge-pr-smoke", ".github/workflows/dsh-edge-pr-smoke.yml", id_=7)
+        ]},
+        "actions/workflows/7/runs?per_page=1": {"workflow_runs": [{"head_branch": "agent/600-dsh-edge-pr-smoke"}]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    monkeypatch.setattr(ri, "workflow_files_on_disk", lambda _dir: set())
+    now = utc(2026, 9, 10, 12, 0)
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == []
+    assert any("💚" in line and "[17]" in line for line in lines)
 
 
 def test_ghost_actions_workflows_in_ci_gating_with_gas():

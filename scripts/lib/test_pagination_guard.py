@@ -128,6 +128,11 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "5 призраков) — при упоре в per_page=100 функция сама громко падает "
         "(RuntimeError, тот же приём, что upstream_drift), не молчит о "
         "потерянном хвосте за страницей.",
+    ("scripts/orchestra/repo_invariants.py", "fetch_latest_run_branch"):
+        "явный `per_page=1` — запрошен только ПОСЛЕДНИЙ прогон ОДНОГО "
+        "workflow (#940, инвариант 17: различить «файл живёт в открытом PR» "
+        "от «файл убран отовсюду»), тот же контракт «дай N последних», что "
+        "pulse_guard.recent_runs выше, не полный список.",
 }
 
 
