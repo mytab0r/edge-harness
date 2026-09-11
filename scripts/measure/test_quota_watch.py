@@ -384,18 +384,24 @@ def test_cheap_check_measurement_failure_is_not_fatal(monkeypatch):
 
 
 def test_channel_failed_criterion_single_source():
-    """Критерий «оба канала эскалации молчат» — ОДНО место правды:
-    pulse_guard.escalation_channel_failed рядом с самим escalate, чьим
-    return'ом эти литералы рождаются. _channel_failed (quota_watch) и
-    проверка в quotas.py::main обязаны сводиться к нему; вторые копии
-    литералов «НЕ доставлен»/«НЕ оставлен» в вызывающих гасли бы молча при
-    смене формата строки (found: ревью PR #607, некритичное замечание).
-    Гвардия по исходнику: литералы живут только в pulse_guard.py."""
+    """Критерии разбора строки escalate — ОДНО место правды:
+    pulse_guard.escalation_channel_failed («оба канала молчат») и
+    pulse_guard.escalation_dedup_carrier_failed («сигнал ушёл, носитель
+    дедупа нет») живут рядом с самим escalate, чьим return'ом эти литералы
+    рождаются. _channel_failed/_dedup_carrier_failed (quota_watch) и проверка
+    в quotas.py::main обязаны сводиться к ним; вторые копии литералов
+    «НЕ доставлен»/«НЕ оставлен» в вызывающих гасли бы молча при смене
+    формата строки (found: ревью PR #607, некритичное замечание; второй
+    предикат — ревью того же PR, head 5824e75). Гвардия по исходнику:
+    литералы живут только в pulse_guard.py."""
     root = SCRIPT.parent.parent.parent
     for rel in ("scripts/measure/quota_watch.py", "scripts/measure/quotas.py"):
-        assert '"НЕ доставлен"' not in (root / rel).read_text(encoding="utf-8"), \
-            f"{rel}: вторая копия разбора строки escalate — сведи к pulse_guard.escalation_channel_failed"
-    assert '"НЕ доставлен"' in (root / "scripts/orchestra/pulse_guard.py").read_text(encoding="utf-8")
+        for literal in ('"НЕ доставлен"', '"НЕ оставлен"'):
+            assert literal not in (root / rel).read_text(encoding="utf-8"), \
+                f"{rel}: вторая копия разбора строки escalate ({literal}) — сведи к предикатам pulse_guard"
+    pulse_guard_source = (root / "scripts/orchestra/pulse_guard.py").read_text(encoding="utf-8")
+    assert '"НЕ доставлен"' in pulse_guard_source
+    assert '"НЕ оставлен"' in pulse_guard_source
 
 
 # ── full_sweep: переиспользует collect_cloudflare/collect_github, дедуп общий ──
@@ -818,6 +824,82 @@ def test_gate_main_ceiling_bound_below_stale_threshold_stays_silent_and_keeps_ep
     assert output_file.read_text(encoding="utf-8").strip() == "proceed=true"
     assert stale_calls == []
     assert closed == []
+
+
+# ── gate_main применяет вердикт доставки stale_alert (found: ревью PR #607,
+#    head 5824e75 — гейт выбрасывал строку escalate и зеленел при отказе
+#    громкого канала) ────────────────────────────────────────────────────────
+
+
+def _gate_main_stale_branch(monkeypatch, tmp_path, stale_alert_result):
+    """Общая обстановка тестов ветки простоя: success_age за порогом (60 ≥ 45),
+    версия совпадает, stale_alert возвращает заданную строку вердикта доставки."""
+    output_file = tmp_path / "gh_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setattr(qw, "scan_measurement_history",
+                         lambda *a, **k: qw.MeasurementScan(60.0, 60.0, True, qw.SCAN_EXACT, 1))
+    monkeypatch.setattr(qw, "workflow_version_check", lambda repo: ("matches", None))
+    monkeypatch.setattr(qw, "_classify_measurement_absence", lambda repo: "шаг упал (failure)")
+    monkeypatch.setattr(
+        qw, "stale_alert",
+        lambda repo, now, age, reason, scan=qw.SCAN_EXACT: stale_alert_result)
+    return output_file
+
+
+def test_gate_main_exits_nonzero_when_stale_alert_fails_on_both_channels(monkeypatch, tmp_path, capsys):
+    """БЛОКЕР ревью PR #607 (head 5824e75), форма (а): гейт не выбрасывает
+    вердикт доставки stale_alert — escalate никогда не бросает исключений,
+    отказ обоих каналов приходит подстроками возвращённой строки; раньше гейт
+    печатал её и возвращал 0: Telegram молчал и след в #120 падал одновременно
+    (secondary rate limit на POST при живых GET-чтениях, залоченная #120) —
+    громкий сигнал вырождался в строку лога при зелёном прогоне. Мутация:
+    верни в gate_main `print(stale_alert(...))` без разбора вердикта — тест
+    краснеет."""
+    _gate_main_stale_branch(monkeypatch, tmp_path,
+                            "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+
+    assert qw.gate_main() == 1
+    err = capsys.readouterr().err
+    assert "::error::" in err
+    assert "ни по одному" in err            # форма (а) названа своей формулировкой
+
+
+def test_gate_main_exits_nonzero_and_names_dedup_carrier_when_marker_not_left(monkeypatch, tmp_path, capsys):
+    """Форма (б), хуже (а): Telegram доставлен, а след в #120 персистентно не
+    пишется — открывающий маркер эпизода не появляется, каждый следующий тик
+    повторяет страницу, и весь эпизод не краснеет ни один прогон. Текст
+    ошибки обязан РАЗЛИЧАТЬ эту форму от «оба канала молчат», чтобы следующий
+    разбор не гадал, почему страница ушла повторно (AGENTS.md «Алерт не
+    гадает»)."""
+    _gate_main_stale_branch(monkeypatch, tmp_path,
+                            "Telegram: доставлен; след в #120: НЕ оставлен")
+
+    assert qw.gate_main() == 1
+    err = capsys.readouterr().err
+    assert "::error::" in err
+    assert "повторит страницу" in err       # следствие для следующего тика названо
+    assert "ни по одному" not in err        # это НЕ форма (а) — формулировки различимы
+
+
+def test_gate_main_stays_green_when_stale_alert_delivered(monkeypatch, tmp_path):
+    """Здоровый громкий канал (Telegram доставлен, след оставлен) — прогон
+    остаётся зелёным: красим отказ доставки, а не сам факт простоя."""
+    _gate_main_stale_branch(monkeypatch, tmp_path,
+                            "Telegram: доставлен; след в #120: оставлен")
+
+    assert qw.gate_main() == 0
+
+
+def test_gate_main_stays_green_when_telegram_lost_but_trace_left(monkeypatch, tmp_path):
+    """«Telegram не доставлен, след оставлен» — зелёный намеренно: маркер
+    эпизода записан (повторной страницы не будет), мгновенный пуш
+    продублирован постоянным следом в #120; критерий красного — общий с
+    measure_main/quotas.py предикат «оба канала молчат»."""
+    _gate_main_stale_branch(monkeypatch, tmp_path,
+                            "Telegram: НЕ доставлен; след в #120: оставлен")
+
+    assert qw.gate_main() == 0
 
 
 # ── stale_alert / close_stale_episode_if_needed: громкий канал простоя,

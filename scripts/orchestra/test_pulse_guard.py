@@ -434,6 +434,19 @@ def test_escalation_channel_failed_is_the_single_verdict_of_both_channels_silent
     assert pg.escalation_channel_failed("Telegram: НЕ доставлен; след в #120: оставлен") is False
 
 
+def test_escalation_dedup_carrier_failed_is_the_single_verdict_of_dedup_carrier_lost():
+    """«Сигнал ушёл, а носитель дедупа нет» — пара к escalation_channel_failed
+    (found: ревью PR #607, head 5824e75: гейт сторожа квот выбрасывал вердикт
+    доставки stale_alert — при живом Telegram и персистентно падающем следе в
+    #120 страница повторялась бы каждый тик, и ни один прогон не краснел).
+    Мутация: переименуй предикат или разойди его с форматом возврата escalate
+    — тест краснеет вместе с вызывающими."""
+    assert pg.escalation_dedup_carrier_failed("Telegram: доставлен; след в #120: НЕ оставлен") is True
+    assert pg.escalation_dedup_carrier_failed("Telegram: НЕ доставлен; след в #120: НЕ оставлен") is False
+    assert pg.escalation_dedup_carrier_failed("Telegram: доставлен; след в #120: оставлен") is False
+    assert pg.escalation_dedup_carrier_failed("Telegram: НЕ доставлен; след в #120: оставлен") is False
+
+
 def test_merge_telegram_text_is_short_clickable_and_escaped():
     text = pg.merge_telegram_text("mytab0r/edge-harness", 405, 170,
                                   "Telegram: «задача выполнена» на открытый PR — врёт, а про слияние в main не сообщает")
