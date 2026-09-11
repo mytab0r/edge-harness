@@ -453,7 +453,11 @@ else
 fi
 
 # Коммиты агента атрибутируются владельцу: noreply-адрес привязан к аккаунту.
-gh_user_id=$(gh api "users/$WORKER_LOGIN" --jq .id)
+# `|| die` — тот же класс, что у git ls-remote ниже (находка ai-review PR #937,
+# второй проход): голая сетевая подстановка под `set -euo pipefail` без
+# явной обработки отказа роняет job тихой bash-ошибкой строки.
+gh_user_id=$(gh api "users/$WORKER_LOGIN" --jq .id) \
+  || die "не смог прочитать id $WORKER_LOGIN (gh/сеть)"
 git config user.name "$WORKER_LOGIN"
 git config user.email "${gh_user_id}+${WORKER_LOGIN}@users.noreply.github.com"
 
