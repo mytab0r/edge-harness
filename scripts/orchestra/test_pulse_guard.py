@@ -1542,6 +1542,66 @@ def test_failure_fingerprint_distinguishes_workflow_and_job():
     assert len({base, other_workflow, other_job, other_text}) == 4
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# WATCHED_WORKFLOWS — авто-обнаружение, не ручной реестр (#887)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_watched_workflows_covers_every_workflow_file():
+    """Класс «реестр руками» (тот же, что вскрылся на repo-ci.yml, #749):
+    каждый файл `.github/workflows/*.yml` обязан быть либо в WATCHED_WORKFLOWS,
+    либо явно назван в WATCHED_WORKFLOWS_EXCLUDED с причиной — молчаливое
+    выпадение (новый workflow добавлен, никто не вспомнил про наблюдение)
+    невозможно по построению. Живой случай, который это ловит: до фикса
+    telegram-webhook.yml был красным пять суток незамеченным (issue #887)."""
+    on_disk = {p.name for p in pg._WORKFLOWS_DIR.glob("*.yml")}
+    on_disk |= {p.name for p in pg._WORKFLOWS_DIR.glob("*.yaml")}
+    assert on_disk, "каталог .github/workflows пуст — тест сам ничего не проверяет"
+    covered = set(pg.WATCHED_WORKFLOWS) | set(pg.WATCHED_WORKFLOWS_EXCLUDED)
+    missing = on_disk - covered
+    assert not missing, (
+        f"workflow без наблюдения и без объявленного исключения: {sorted(missing)}"
+    )
+    for name, reason in pg.WATCHED_WORKFLOWS_EXCLUDED.items():
+        assert reason.strip(), f"исключение {name} без причины — тормоз без газа"
+
+
+def test_watched_workflows_new_file_is_watched_by_default(tmp_path, monkeypatch):
+    """Мутация класса: добавь новый workflow-файл на диск — он обязан попасть
+    в список без правки константы. Доказывает, что механизм — авто-
+    обнаружение, а не переименованный тот же ручной список."""
+    (tmp_path / "brand-new-workflow.yml").write_text("on: push\njobs: {}\n", encoding="utf-8")
+    (tmp_path / "old.yaml").write_text("on: push\njobs: {}\n", encoding="utf-8")
+    monkeypatch.setattr(pg, "_WORKFLOWS_DIR", tmp_path)
+    monkeypatch.setattr(pg, "WATCHED_WORKFLOWS_EXCLUDED", {})
+    discovered = pg._discover_watched_workflows()
+    assert discovered == ("brand-new-workflow.yml", "old.yaml")
+
+
+def test_watched_workflows_excluded_file_is_skipped(tmp_path, monkeypatch):
+    (tmp_path / "watched.yml").write_text("on: push\njobs: {}\n", encoding="utf-8")
+    (tmp_path / "excluded.yml").write_text("on: push\njobs: {}\n", encoding="utf-8")
+    monkeypatch.setattr(pg, "_WORKFLOWS_DIR", tmp_path)
+    monkeypatch.setattr(pg, "WATCHED_WORKFLOWS_EXCLUDED", {"excluded.yml": "тестовая причина"})
+    assert pg._discover_watched_workflows() == ("watched.yml",)
+
+
+def test_watched_workflows_empty_directory_fails_loud(tmp_path, monkeypatch):
+    """Пустой каталог — не легитимное «наблюдать нечего», а сломанный
+    checkout: список наблюдаемых workflow не может тихо схлопнуться в
+    пустой кортеж (fail loud, AGENTS.md)."""
+    monkeypatch.setattr(pg, "_WORKFLOWS_DIR", tmp_path)
+    monkeypatch.setattr(pg, "WATCHED_WORKFLOWS_EXCLUDED", {})
+    with pytest.raises(RuntimeError):
+        pg._discover_watched_workflows()
+
+
+def test_watched_workflows_missing_directory_fails_loud(tmp_path, monkeypatch):
+    monkeypatch.setattr(pg, "_WORKFLOWS_DIR", tmp_path / "no-such-dir")
+    with pytest.raises(RuntimeError):
+        pg._discover_watched_workflows()
+
+
 FAILURE_WATCH_QUIET_ROUTES = {
     f"workflows/{wf}/runs?status=completed": {"workflow_runs": []}
     for wf in pg.WATCHED_WORKFLOWS

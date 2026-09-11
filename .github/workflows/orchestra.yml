@@ -127,14 +127,20 @@ jobs:
 
       # Гвардия «протухшей» метки blocked (#334): чисто читающий шаг, ничего
       # не блокирует и не решает вместо владельца (снятие метки — по-прежнему
-      # ручное, docs/agents/LABELS.md). continue-on-error нарочно: красный шаг
-      # виден в логе (fail loud), но не гасит зелёный статус всего job'а — сам
-      # пульс (heartbeat_check, #120) читает историю ИМЕННО этого job'а
-      # orchestra (не предохранитель конвейера — тот читает worker.yml, это
-      # другой механизм, находка AI-ревью PR #336, третий раунд), и ложный
-      # «пульс пропал» от находки на живых issue дороже задержанного
-      # обнаружения протухшей метки.
+      # ручное, docs/agents/LABELS.md). continue-on-error нарочно: не гасит
+      # зелёный статус всего job'а — сам пульс (heartbeat_check, #120) читает
+      # историю ИМЕННО этого job'а orchestra (не предохранитель конвейера —
+      # тот читает worker.yml, это другой механизм, находка AI-ревью PR #336,
+      # третий раунд), и ложный «пульс пропал» от находки на живых issue
+      # дороже задержанного обнаружения протухшей метки. Реальный провал
+      # (а не просто находка) в логе НЕ считается видимым сам по себе (#887,
+      # живой прогон 34506949025: Jobs API отдал success при
+      # `##[error]Process completed with exit code 1` в логе, никто это не
+      # прочитал) — id обязателен, чтобы шаг «Свод реальных исходов»
+      # в конце job'а увидел его через `toJSON(steps)` и эскалировал по
+      # факту, не по логу, который никто не открывает регулярно.
       - name: Гвардия протухшей метки blocked (#334)
+        id: stale_blocked
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -147,10 +153,10 @@ jobs:
       # Гвардия «задача ждёт решения владельца» (waiting:owner, #470, слайс
       # #254): авто-метка по блоку вариантов, снятие метки по маркеру ответа
       # «РЕШЕНИЕ: N», эскалация в саму задачу + Telegram. continue-on-error —
-      # тот же приём, что у гвардии blocked выше: находка видна красным шагом
-      # (fail loud), но не гасит зелёный статус job'а, который читает пульс
-      # (heartbeat_check, #120).
+      # тот же приём, что у гвардии blocked выше, тот же газ на реальный
+      # провал — id + «Свод реальных исходов» ниже (#887).
       - name: Гвардия waiting:owner — задача ждёт решения владельца (#470)
+        id: waiting_owner
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,11 +173,10 @@ jobs:
       # (health_regression.py) и, если найдена устойчивая деградация,
       # само-аудит заводит задачу пула (health_audit.py, метка self-audit,
       # свой дедуп/потолок — docs/agents/LABELS.md). continue-on-error —
-      # тот же приём, что у гвардий blocked/waiting:owner выше: находка
-      # видна красным шагом (fail loud), но не гасит зелёный статус job'а,
-      # который читает пульс (heartbeat_check, #120). GH_TOKEN — широкий
-      # GH_PIPELINE_PAT (не github.token), как у dispatch_tail.py: нужен
-      # для git push на ветку данных, не только для чтения issues/PR/runs.
+      # тот же приём, что у гвардий blocked/waiting:owner выше, тот же газ на
+      # реальный провал — id + «Свод реальных исходов» ниже (#887). GH_TOKEN —
+      # широкий GH_PIPELINE_PAT (не github.token), как у dispatch_tail.py:
+      # нужен для git push на ветку данных, не только для чтения issues/PR/runs.
       #
       # Git-авторизация под PAT (issue #882 — корень живого инцидента): без
       # неё свежий клон в $RUNNER_TEMP (pipeline_health.clone_data_branch)
@@ -179,12 +184,17 @@ jobs:
       # падает 403, а старый код молча трактовал этот отказ как «уже
       # записано параллельным прогоном» — тот же шаг, что уже стоит в
       # dispatch-latency-probe.yml перед каждым git-пишущим шагом.
+      # id обязателен (#887, гвардия orchestra_workflow_lint): continue-on-error
+      # шаг без id не попадает в toJSON(steps) — его реальный провал снова
+      # стал бы невидимым; «Свод реальных исходов» в конце job'а прочитает его.
       - name: Git-авторизация под PAT (push снимка здоровья на data-ветку)
+        id: git_auth_setup
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
         run: gh auth setup-git
       - name: Само-аудит здоровья конвейера (снимок + регрессия + задачи)
+        id: health_audit
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
@@ -196,3 +206,33 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: python scripts/orchestra/health_audit.py run
+
+      # Свод РЕАЛЬНЫХ исходов continue-on-error шагов (#887): Jobs API после
+      # завершения прогона отдаёт `steps[].conclusion` — значение уже ПОСЛЕ
+      # маскировки continue-on-error (всегда success), не `outcome`
+      # (реальный результат, виден только контекстом `steps` ВНУТРИ ещё
+      # идущего job). `if: always()` — шаг обязан отработать даже если один
+      # из предыдущих шагов вообще упал бы без continue-on-error. Сам этот
+      # шаг НЕ несёт continue-on-error и потому НЕ проверяется на id: его
+      # собственный провал без маскировки виден везде как обычный красный
+      # шаг. Провал этот возможен ровно одного класса — СЛОМАННАЯ ПРОВОДКА
+      # читателя (STEPS_JSON не задан/пуст/не разобрался: находка AI-ревью
+      # PR #888): тогда «провалов нет» было бы ложью, и гвардия выходит 1 с
+      # ::error. Красный job здесь — честный сигнал «пульсу верить нельзя,
+      # читатель исходов сломан», НЕ ложное «пульс пропал» от находки
+      # best-effort гвардии (та красить job не может — escalate глотает
+      # сетевые ошибки). Проводка дополнительно охраняется по ИСХОДНИКУ
+      # (scripts/lib/orchestra_workflow_lint.py: шаг-свод после последнего
+      # continue-on-error шага, if: always(), STEPS_JSON: toJSON(steps)) —
+      # то же нарушение ловится в CI до живого прогона; поставь этому шагу
+      # continue-on-error — линт краснеет «шаг-свод не найден» (шаг сам
+      # стал последним continue-on-error шагом), и его замаскированный
+      # провал снова был бы невидим.
+      - name: Свод реальных исходов best-effort шагов (не путать conclusion с outcome, #887)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: python scripts/orchestra/best_effort_outcome_guard.py

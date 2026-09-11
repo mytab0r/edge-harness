@@ -310,18 +310,55 @@ CONFLICT_BUDGET_RESET_MARKER = "[conflict-budget-reset:"
 # сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
 # а failure_watch — на другой вопрос («кто-нибудь разберёт ПРИЧИНУ и заведёт
 # задачу на дефект»); это разные обязанности одного и того же провала.
-WATCHED_WORKFLOWS = (
-    "worker.yml", "hands.yml", "orchestra.yml",
-    "deploy-worker.yml", "deploy-dsh-edge.yml",
-    # conflict-mechanical-rebase.yml — дешёвый механический ребейз конфликтных
-    # PR (issue #762, отдельный файл, не job внутри orchestra.yml — см.
-    # докстринг самого workflow-файла: heartbeat_check не должен видеть его
-    # провалы). Их всё равно обязан кто-то заметить — тот же приём, что и для
-    # остальных пяти: failure_watch заводит ci-failure задачу по РЕАЛЬНОМУ
-    # дефекту (не по обычным per-PR infra-error строкам в его же отчёте — те
-    # уже видны в step summary, это catastrophic-случай уровня всего job'а).
-    "conflict-mechanical-rebase.yml",
-)
+#
+# WATCHED_WORKFLOWS раньше был ручным кортежем из 6 имён — тот же класс
+# «реестр руками», что уже вскрылся на repo-ci.yml (#749): новый workflow не
+# попадал под наблюдение, пока кто-то не вспоминал дописать его сюда. Живой
+# счёт цены (#887): `.github/workflows/telegram-webhook.yml` был красным с
+# 2026-09-06 (прогон 34061911867) и никто не заметил — файла не было в
+# списке; тем же пробелом не были покрыты ещё 12 из 19 workflow-файлов
+# репозитория. Теперь список СЧИТЫВАЕТСЯ из `.github/workflows/*.yml` на
+# диске — новый workflow подхватывается сам, без правки этого файла.
+# Исключение — WATCHED_WORKFLOWS_EXCLUDED, явная пара имя->причина; тест
+# test_watched_workflows_covers_every_workflow_file (test_pulse_guard.py)
+# сверяет ОБА списка с содержимым каталога — молчаливое выпадение
+# невозможно: файл либо наблюдается, либо назван в исключениях с причиной.
+_WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+
+# Пока пусто: замер (#887) не нашёл ни одного workflow, чей провал был бы
+# НЕактуален failure_watch — у всех 19 файлов есть хотя бы одно не-PR
+# событие (schedule/workflow_dispatch/push/workflow_run/repository_dispatch/
+# branch_protection_rule), а PR-прогоны и так отфильтровываются внутри
+# failure_watch (`event != "pull_request"`) независимо от присутствия имени
+# здесь. Появится причина реально исключить файл — впиши сюда явно (имя ->
+# причина), гвардия ниже не даст пропуску остаться молчаливым.
+WATCHED_WORKFLOWS_EXCLUDED: dict[str, str] = {}
+
+
+def _discover_watched_workflows() -> tuple[str, ...]:
+    """Список имён файлов `.github/workflows/*.yml`/`*.yaml`, кроме
+    WATCHED_WORKFLOWS_EXCLUDED — читает диск при импорте модуля (тот же
+    момент, что раньше фиксировал ручной кортеж), поэтому падает громко ДО
+    первого использования, а не тихо возвращает пустой список: пустой
+    каталог workflow в этом репозитории всегда означает сломанный checkout,
+    не легитимное состояние."""
+    if not _WORKFLOWS_DIR.is_dir():
+        raise RuntimeError(f"каталог workflow не найден: {_WORKFLOWS_DIR}")
+    names = sorted(
+        path.name
+        for pattern in ("*.yml", "*.yaml")
+        for path in _WORKFLOWS_DIR.glob(pattern)
+        if path.name not in WATCHED_WORKFLOWS_EXCLUDED
+    )
+    if not names:
+        raise RuntimeError(
+            f"{_WORKFLOWS_DIR} не содержит ни одного .yml/.yaml вне исключений "
+            "— список наблюдаемых workflow не может быть пустым"
+        )
+    return tuple(names)
+
+
+WATCHED_WORKFLOWS = _discover_watched_workflows()
 
 # Метка авто-заведённых задач по дефектам CI — рядом с обязательной `task`
 # (пул), чтобы дедуп искал ТОЛЬКО среди них, не среди всего пула.

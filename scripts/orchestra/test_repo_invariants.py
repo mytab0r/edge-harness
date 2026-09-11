@@ -1758,6 +1758,88 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Дайджест долга наблюдательных инвариантов 4/5/8/10 (#888)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_debt_digest_snapshot_counts_only_declared_invariants():
+    findings = {1: ["x"], 4: ["a", "b"], 5: [], 8: ["c"], 9: ["ignored"]}
+    snapshot = ri.debt_digest_snapshot(findings)
+    assert snapshot == {4: 2, 5: 0, 8: 1, 10: 0}
+
+
+def test_debt_digest_snapshot_missing_key_is_honest_zero():
+    # Инвариант не посчитан на этом прогоне (ключа нет вовсе, не пустой
+    # список) — снимок обязан читать это как 0, не бросать KeyError.
+    assert ri.debt_digest_snapshot({}) == {4: 0, 5: 0, 8: 0, 10: 0}
+
+
+def test_debt_digest_marker_key_is_stable_and_ordered():
+    snapshot = {4: 32, 5: 20, 8: 1, 10: 0}
+    assert ri.debt_digest_marker_key(snapshot) == "4=32,5=20,8=1,10=0"
+
+
+def test_run_escalations_posts_debt_digest_when_debt_present(monkeypatch):
+    """Живой замер 2026-09-10 (прогон 34506949025): 32/20/1/0 не увидел
+    никто, кроме голого step summary — доказываем, что теперь долг уходит в
+    канал WATCHDOG_ISSUE + Telegram, как 1 и 3."""
+    fake = FakeGh({f"issues/{ri.WATCHDOG_ISSUE}/comments": []})
+    patch_gh(monkeypatch, fake)
+    findings = {1: [], 3: [], 4: [{"change": "x"}] * 32, 5: [{"issues": (1, 2)}] * 20,
+                8: [{"pr": 811}], 10: []}
+    lines = ri.run_escalations(REPO, findings)
+    assert any("дайджест долга" in line for line in lines), lines
+    posts = [c for c in fake.calls if c.startswith("-X POST") and f"issues/{ri.WATCHDOG_ISSUE}/comments" in c]
+    assert len(posts) == 1
+    assert "4=32,5=20,8=1,10=0" in posts[0]
+
+
+def test_run_escalations_debt_digest_silent_on_unchanged_snapshot(monkeypatch):
+    """Тот же снимок долга, что уже эскалирован раньше (маркер найден в
+    истории #120) — тишина, не спам каждые 15 минут одним и тем же числом."""
+    marker = "[инвариант долг-дайджест: 4=5,5=0,8=0,10=0]"
+    fake = FakeGh({
+        f"issues/{ri.WATCHDOG_ISSUE}/comments": [
+            {"body": marker, "created_at": "2026-09-10T10:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    findings = {1: [], 3: [], 4: [{"x": 1}] * 5, 5: [], 8: [], 10: []}
+    lines = ri.run_escalations(REPO, findings)
+    assert lines == []
+    assert fake.mutating_calls() == []
+
+
+def test_run_escalations_debt_digest_reescalates_on_growth(monkeypatch):
+    """Снимок изменился (долг вырос) — новая запись, старый маркер её не
+    глушит (разные маркеры — issue_marker_times ищет ТОЧНУЮ подстроку)."""
+    old_marker = "[инвариант долг-дайджест: 4=5,5=0,8=0,10=0]"
+    fake = FakeGh({
+        f"issues/{ri.WATCHDOG_ISSUE}/comments": [
+            {"body": old_marker, "created_at": "2026-09-10T10:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    findings = {1: [], 3: [], 4: [{"x": 1}] * 6, 5: [], 8: [], 10: []}
+    lines = ri.run_escalations(REPO, findings)
+    assert any("дайджест долга" in line for line in lines), lines
+    posts = [c for c in fake.calls if c.startswith("-X POST") and f"issues/{ri.WATCHDOG_ISSUE}/comments" in c]
+    assert len(posts) == 1
+    assert "4=6,5=0,8=0,10=0" in posts[0]
+
+
+def test_run_escalations_no_debt_digest_when_all_zero(monkeypatch):
+    """Здоровый снимок (все четыре — 0) не эскалируется вовсе: тот же приём,
+    что уже держат 1 и 3 (`if findings.get(N):`) — не шлём пустые отчёты."""
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    findings = {1: [], 3: [], 4: [], 5: [], 8: [], 10: []}
+    lines = ri.run_escalations(REPO, findings)
+    assert lines == []
+    assert fake.calls == []  # ни один маршрут даже не спрошен
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Инвариант 11: манифест использования LLM-провайдеров (#823)
 # ══════════════════════════════════════════════════════════════════════════
 
