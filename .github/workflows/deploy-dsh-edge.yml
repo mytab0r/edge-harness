@@ -844,18 +844,45 @@ jobs:
           # Опрос с таймаутом: сам тул runner_status несёт timeoutMs 60000 в
           # dsh-tools, плюс задержка ответа модели до решения вызвать тул —
           # 24×5с = 120с общего бюджета.
+          #
+          # Сравнение — по текстовым значениям, извлечённым jq, не по сырому
+          # JSON истории (находка ревью PR #952, п.4): заголовок issue #2
+          # может нести кавычку или бэкслеш, которые сырая JSON-строка несёт
+          # экранированными, а `$expect` — нет; `grep -F` по сырому JSON искал
+          # бы уже заэкранированную форму и не совпал бы никогда, тихо и
+          # бессрочно. `jq -r '[.. | strings] | .[]'` разворачивает ВСЕ
+          # строковые значения истории (включая вложенные в content-блоки)
+          # уже раскавыченными — то же значение, что видел бы человек в чате.
           found=""
+          last_history=""
           for _ in $(seq 1 24); do
             sleep 5
             history=$(rpc session.history '{"type":"client-request","rpcId":"canary-rb","method":"session.history","payload":{"sessionId":"'"$sid"'"}}' || true)
-            if grep -qF "$expect" <<<"$history"; then
+            last_history="$history"
+            texts=$(jq -r '[.. | strings] | .[]' <<<"$history" 2>/dev/null || true)
+            if grep -qF "$expect" <<<"$texts"; then
               found="1"
               break
             fi
           done
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary-rb","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null || true
-          [ -n "$found" ] \
-            || { echo "::error::За 120с runner_status не отчитался по issue #2 реальным ответом GitHub REST (ожидали фрагмент: $expect) — плагин runner-bridge не работает в чате морды (не HTTP 403 и не «морда жива» — сам инструмент); либо агент не вызвал тул (нельзя исключить нестабильность самого session.prompt/session.history — первый живой прогон)"; exit 1; }
+          if [ -z "$found" ]; then
+            # Алерт не гадает (класс #472, находка ревью PR #952, п.3): три
+            # причины различимы по фактам, которые `last_history` и так несёт
+            # (raw-события `{type, data}`, research/12 «Форма канонических
+            # событий») — не список гипотез читателю.
+            has_assistant=$(jq '[.result.value.events[]? | select(.type == "assistant/message")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
+            has_toolcall=$(jq '[.result.value.events[]? | select(.type == "tool/call" and (.data.name // "") == "runner_status")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
+            if [ "$has_assistant" != "true" ]; then
+              cause="за 120с в истории сессии нет ни одного assistant/message — модель не сделала ни одного хода (сбой провайдера/LLM, не плагина)"
+            elif [ "$has_toolcall" != "true" ]; then
+              cause="ход состоялся (assistant/message есть), но модель не вызвала инструмент runner_status (tool/call с этим именем в истории нет) — промпт не выполнен агентом"
+            else
+              cause="инструмент runner_status был вызван (tool/call в истории есть), но ожидаемый фрагмент ответа GitHub REST за 120с не появился — тул вызван, результата с нужными данными нет"
+            fi
+            echo "::error::runner_status не отчитался по issue #2 реальным ответом GitHub REST (ожидали фрагмент: $expect) — $cause"
+            exit 1
+          fi
           echo "✅ runner-bridge жив на проде: runner_status(issue=2) вернул реальные данные GitHub REST («$expect»)"
 
       # e2e generic browser smoke (#502): владелец нашёл руками то, чего не

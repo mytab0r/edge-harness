@@ -55,10 +55,16 @@ on:
 
 permissions:
   contents: write       # для создания релиза и PR
-  pull-requests: write  # для scripts/git/pr-create
+  pull-requests: write  # для scripts/git/pr-create и дедупа по открытым PR
+  issues: read          # prepare сверяет пригодность task_issue (открыта,
+                         # метка task) тем же контрактом, что contract_check.py
+                         # (находка ревью PR #952, п.1) — без этого scope
+                         # `gh api issues/N` вернул бы 403: непоименованный
+                         # scope в явном permissions-блоке — none, не дефолт.
   # issues: write не нужен — статусы уходят по HTTP в журнал (POST /api/events,
   # scripts/plugins/plugin_status.sh), PR создаётся под GH_PIPELINE_PAT, к
-  # GitHub Issues API/CLI этот workflow не обращается (находка AI-ревью PR #273).
+  # GitHub Issues API/CLI на запись этот workflow не обращается (находка
+  # AI-ревью PR #273).
 
 jobs:
   # Единственное место, определяющее СОСТАВ форжа (какие плагины, с каким
@@ -122,6 +128,45 @@ jobs:
             printf '%s' "$task_issue"
           }
 
+          # Пригодность задачи для авто-форжа push/schedule — тот же критерий,
+          # что contract_check.py::task_eligibility_problems (issue открыта,
+          # несёт метку `task`), плюс дедуп по уже открытому PR того же
+          # дрейфа. Без этой проверки push/schedule открывал PR на задачу,
+          # которую приёмка (`accept_merged_tasks`, 15-минутный цикл) успевает
+          # закрыть, пока форж собирается (~20-60 минут) — такой PR навсегда
+          # висит `contract:failed` (живой класс #320/#325), релиз идемпотентен
+          # (clobber), а часовой крон плодил бы новый мёртвый PR каждый час
+          # (находка ревью PR #952, п.1). Возвращает 1 (пропустить ТОЛЬКО этот
+          # элемент состава, не весь prepare) — остальные плагины/дрейфы того
+          # же прогона обрабатываются штатно; какой открытой задачей владеет
+          # застрявший дрейф — отдельное решение владельца (беклог-задача из
+          # ревью PR #952).
+          task_issue_ready() {
+            local task_issue="$1" context="$2" issue_json issue_state existing
+            issue_json=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${task_issue}" -H "Accept: application/vnd.github+json") \
+              || { echo "::error::${context}: не удалось прочитать issue #$task_issue — пропускаю, не проверив пригодность задачи" >&2; return 1; }
+            if jq -e 'has("pull_request")' <<<"$issue_json" >/dev/null 2>&1; then
+              echo "::error::${context}: #$task_issue — это PR, а не задача из пула, пропускаю" >&2
+              return 1
+            fi
+            issue_state=$(jq -r '.state' <<<"$issue_json")
+            if [ "$issue_state" != "open" ]; then
+              echo "::error::${context}: задача #$task_issue уже закрыта (приёмка закрывает её раньше, чем форж успевает собраться, класс #320/#325) — пропускаю, не открываю PR на закрытую задачу" >&2
+              return 1
+            fi
+            if ! jq -e '[.labels[].name] | index("task") != null' <<<"$issue_json" >/dev/null 2>&1; then
+              echo "::error::${context}: на задаче #$task_issue нет метки \`task\` — пропускаю" >&2
+              return 1
+            fi
+            existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json headRefName -q '.[].headRefName' \
+              | grep -c "^agent/${task_issue}-forge-" || true)
+            if [ "${existing:-0}" -gt 0 ]; then
+              echo "::notice::${context}: уже есть открытый PR форжа для задачи #$task_issue (agent/${task_issue}-forge-*) — пропускаю повтор, пока он не закрылся" >&2
+              return 1
+            fi
+            return 0
+          }
+
           items="[]"
 
           case "$EVENT_NAME" in
@@ -144,17 +189,25 @@ jobs:
                 echo "::error::push задел paths plugins-src/** (иначе job бы не запустился), но diff $BEFORE_SHA..$AFTER_SHA не нашёл ни одного каталога plugins-src/<имя> — несовпадение триггера и вычисления, чинить здесь"
                 exit 1
               fi
-              task_issue=""
+              plugin_dirs=()
               for d in "${dirs[@]}"; do
                 if [ ! -f "$d/package.json" ]; then
                   echo "::notice::$d изменён, но package.json нет — не плагин форжа (например, shared/), пропускаю"
                   continue
                 fi
-                if [ -z "$task_issue" ]; then
-                  task_issue=$(resolve_task_issue_from_sha "$AFTER_SHA" "push $AFTER_SHA") || exit 1
-                fi
-                items=$(jq -c --arg p "$d" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
+                plugin_dirs+=("$d")
               done
+              if [ "${#plugin_dirs[@]}" -gt 0 ]; then
+                # Один task_issue на весь пуш (все каталоги — из одного
+                # коммита слияния) — пригодность проверяется РАЗ, не на
+                # каждый каталог: результат одинаков для всех.
+                task_issue=$(resolve_task_issue_from_sha "$AFTER_SHA" "push $AFTER_SHA") || exit 1
+                if task_issue_ready "$task_issue" "push $AFTER_SHA"; then
+                  for d in "${plugin_dirs[@]}"; do
+                    items=$(jq -c --arg p "$d" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
+                  done
+                fi
+              fi
               ;;
 
             schedule)
@@ -183,6 +236,7 @@ jobs:
                 last_sha=$(git log -1 --format=%H -- "$src_dir/package.json")
                 [ -n "$last_sha" ] || { echo "::error::дрейф найден ($src_dir: исходники v$src_version, манифест v$asset_version), но не нашёл коммит, менявший $src_dir/package.json — резолвить задачу не от чего"; exit 1; }
                 task_issue=$(resolve_task_issue_from_sha "$last_sha" "schedule-дрейф $src_dir") || exit 1
+                task_issue_ready "$task_issue" "schedule-дрейф $src_dir" || continue
                 items=$(jq -c --arg p "$src_dir" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
                 echo "Дрейф: $src_dir исходники v$src_version ≠ манифест v$asset_version (id $manifest_id) — форжу под задачу #$task_issue"
               done < <(jq -r '.plugins[] | [.id, .package, .source.asset] | @tsv' dsh-edge/plugins.json)

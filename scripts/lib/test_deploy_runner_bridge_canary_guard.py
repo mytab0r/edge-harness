@@ -27,6 +27,11 @@ docs/research/12-dsh-edge-session-api.md, namespace tools.* отсутствуе
      цель без завода новой canary-задачи под каждый прогон.
   5. Канарейка падает громко, если за отведённое время не нашла реальный
      ответ инструмента.
+  6. Финальный алерт называет причину отсутствия улики фактом (был ли ход,
+     был ли tool/call runner_status), не списком гипотез «либо/либо»
+     (класс «алерт не гадает», #472, находка ревью PR #952 п.3).
+  7. Сравнение ожидаемого фрагмента идёт по текстовым значениям, извлечённым
+     jq из истории, не по сырому JSON (находка ревью PR #952 п.4).
 
 Запуск: python -m pytest scripts/lib/test_deploy_runner_bridge_canary_guard.py -q
 """
@@ -90,12 +95,61 @@ def test_canary_targets_permanently_closed_issue_dynamically():
     )
 
 
+def _missing_evidence_branch(text: str) -> str:
+    """Тело `if [ -z "$found" ]; then … fi` — блок, исполняемый ТОЛЬКО когда
+    канарейка не нашла улику за отведённое время (общий носитель правил 5 и 6:
+    без него незачем проверять, что внутри)."""
+    assert 'if [ -z "$found" ]; then' in text, (
+        "канарейка обязана явной веткой проверять отсутствие улики "
+        "(found пуст) — не проходить дальше тихо"
+    )
+    after = text.split('if [ -z "$found" ]; then', 1)[1]
+    return after.split('\n          fi\n', 1)[0]
+
+
 def test_canary_fails_loud_on_missing_evidence():
     """Правило 5."""
+    branch = _missing_evidence_branch(_text())
+    assert "::error::" in branch and "exit 1" in branch, (
+        "канарейка обязана падать громко (::error:: + exit 1), если "
+        "runner_status не отчитался реальным ответом за отведённое время"
+    )
+
+
+def test_canary_diagnoses_missing_evidence_by_fact_not_by_guessing():
+    """Правило 6 (класс «алерт не гадает», #472, находка ревью PR #952, п.3):
+    причина отсутствия улики называется фактом (assistant/message и tool/call
+    runner_status уже прочитаны в history), не списком гипотез «либо A, либо
+    B» в тексте финального алерта."""
+    branch = _missing_evidence_branch(_text())
+    assert 'type == "assistant/message"' in branch, (
+        "алерт обязан различать «модель не сделала ни одного хода» фактом "
+        "наличия assistant/message в history, не гадать"
+    )
+    assert 'type == "tool/call"' in branch and "runner_status" in branch, (
+        "алерт обязан различать «ход был, тул не позван» фактом наличия "
+        "tool/call с именем runner_status в history"
+    )
+    assert "либо" not in branch.lower(), (
+        "финальный алерт канарейки не должен подсовывать гадание «либо A, "
+        "либо B» вместо установленной причины"
+    )
+
+
+def test_canary_compares_history_by_extracted_text_not_raw_json():
+    """Правило 7 (находка ревью PR #952, п.4): сравнение ожидаемого
+    фрагмента идёт по текстовым значениям, извлечённым jq, а не по сырому
+    JSON истории — кавычка/бэкслеш в заголовке issue #2 экранируются в сырой
+    JSON-строке и никогда не совпали бы с `$expect` через `grep -F` по
+    сырому JSON, тихо и бессрочно."""
     text = _text()
-    assert re.search(r'\[\s*-n\s*"\$found"\s*\](?:\s*\\)?\s*\n?\s*\|\|\s*\{\s*echo\s+"::error::', text), (
-        "канарейка обязана падать громко, если runner_status не отчитался "
-        "реальным ответом за отведённое время — не проходить дальше тихо"
+    assert re.search(r"jq -r '\[\.\. \| strings\] \| \.\[\]'", text), (
+        "канарейка обязана разворачивать текстовые значения истории через "
+        "jq ('[.. | strings]'), не сравнивать expect с сырым JSON"
+    )
+    assert 'grep -qF "$expect" <<<"$texts"' in text, (
+        "сравнение ожидаемого фрагмента обязано идти по извлечённым jq "
+        "текстам ($texts), не по сырой переменной $history"
     )
 
 
@@ -110,5 +164,9 @@ def test_canary_fails_loud_on_missing_evidence():
 #     test_canary_does_not_prompt_runner_task_automatically.
 #   М4 (правило 4): заменить `issues/2` на хардкод-номер в другом месте
 #     (issues/1) — красен test_canary_targets_permanently_closed_issue_dynamically.
-#   М5 (правило 5): убрать fail-loud строку `[ -n "$found" ] || { echo
-#     "::error::...` — красен test_canary_fails_loud_on_missing_evidence.
+#   М5 (правило 5): убрать `exit 1` из ветки `if [ -z "$found" ]; then` —
+#     красен test_canary_fails_loud_on_missing_evidence.
+#   М6 (правило 6): заменить причину на «либо модель не ответила, либо тул
+#     не вызван» — красен test_canary_diagnoses_missing_evidence_by_fact_not_by_guessing.
+#   М7 (правило 7): сравнить `$expect` с `$history` напрямую вместо
+#     `$texts` — красен test_canary_compares_history_by_extracted_text_not_raw_json.

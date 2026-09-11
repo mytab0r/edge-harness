@@ -265,14 +265,19 @@ Forge обязан гонять чеклист на каждом tarball и кл
 ## Канал обновления и статусы
 
 ```
-форж (workflow_dispatch, job):                    деплой (build-dsh-edge.yml):
- checkout → чеклист совместимости                  триггер: dispatch после merge PR
- → сборка tarball → интеграционный smoke             с правкой манифеста (или вручную)
- → релиз plugins-vN (тарболл + checksums)          … схема «Сборка» выше …
- → событие plugin_status {state:"built"}           → события deploying → ready/failed
- → PR с правкой plugins.json (sha256, версия)      → канарейка прода как улика
- └── владелец ревьюит и мержит ──┘                 → морда перезапущена, ростер
-                                                      показывает плагин после reload
+форж (plugin-forge.yml, job forge):                деплой (deploy-dsh-edge.yml):
+ триггер: workflow_dispatch (task_issue ОБЯЗАТЕЛЕН)  триггер: push по dsh-edge/** ИЛИ явный
+   ИЛИ push по plugins-src/** (task_issue —             диспатч scheduler.py::after_merge на
+   из PR коммита слияния) ИЛИ schedule раз в час        мерже (мерж под GITHUB_TOKEN push не
+   (страховка дрейфа исходники/манифест)                создаёт, #945/#946) ИЛИ суточный
+ → чеклист совместимости → сборка tarball             schedule как финальная страховка
+   → интеграционный smoke                            … схема «Сборка» выше …
+ → релиз plugins-vN (тарболл + checksums)           → события deploying → ready/failed
+ → событие plugin_status {state:"built"}            → канарейка прода как улика (включая
+ → PR из ветки agent/<task_issue>-forge-<id>-<ts>      канарейку runner-bridge, #390/#945)
+   (контракт PR↔задача, #661) с правкой              → морда перезапущена, ростер
+   plugins.json (sha256, версия)                        показывает плагин после reload
+ └── владелец ревьюит и мержит ──┘
 ```
 
 **Статусы — события журнала (`kind: plugin_status`), не отдельная KV-запись.**

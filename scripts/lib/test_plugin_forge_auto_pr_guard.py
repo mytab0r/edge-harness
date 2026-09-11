@@ -31,6 +31,16 @@ push-триггер по `dsh-edge/**` есть с #374.
      это прямо; push-триггер п.5 НЕ сработает для большинства мержей).
   7. Текст авто-PR (#664) не утверждает, что деплой не триггерится на push —
      `deploy-dsh-edge.yml` имеет push-триггер по `dsh-edge/**` с #374.
+  8. push/schedule проверяют пригодность task_issue (issue открыта, метка
+     `task`) тем же контрактом, что `contract_check.py::
+     task_eligibility_problems`, ДО сборки — иначе задача, закрытая приёмкой
+     (`accept_merged_tasks`) быстрее, чем форж успевает собраться (~20-60
+     минут), навсегда вешает `contract:failed` на авто-PR, а часовой крон
+     плодит новый мёртвый PR каждый час (класс #320/#325, находка ревью
+     PR #952, п.1).
+  9. push/schedule пропускают элемент состава, если для той же задачи уже
+     есть открытый PR форжа (`agent/<N>-forge-*`) — дедуп, не второй мёртвый
+     релиз на тот же дрейф (находка ревью PR #952, п.1).
 
 Запуск: python -m pytest scripts/lib/test_plugin_forge_auto_pr_guard.py -q
 """
@@ -138,6 +148,43 @@ def test_pr_body_deploy_trigger_claim_is_accurate():
     )
 
 
+def test_prepare_checks_task_eligibility_before_build():
+    """Правило 8 (находка ревью PR #952, п.1)."""
+    text = _text()
+    assert "task_issue_ready" in text, (
+        "prepare обязан проверять пригодность task_issue (issue открыта, "
+        "метка task) ДО сборки — без этого push/schedule форжит на задачу, "
+        "которую приёмка успела закрыть, и авто-PR вешает contract:failed "
+        "навсегда (класс #320/#325)"
+    )
+    assert re.search(r'\$issue_state"\s*!=\s*"open"', text), (
+        "проверка пригодности обязана отвергать закрытую задачу"
+    )
+    assert re.search(r'index\("task"\)', text), (
+        "проверка пригодности обязана требовать метку `task` на задаче "
+        "(тот же критерий, что contract_check.py::task_eligibility_problems)"
+    )
+    assert "task_issue_ready \"$task_issue\" \"push $AFTER_SHA\"" in text, (
+        "push-ветка prepare обязана вызывать проверку пригодности перед "
+        "тем, как класть элементы состава в матрицу"
+    )
+    assert 'task_issue_ready "$task_issue" "schedule-дрейф $src_dir" || continue' in text, (
+        "schedule-ветка prepare обязана пропускать (continue) конкретный "
+        "дрейф при непригодной задаче, не валить весь прогон"
+    )
+
+
+def test_prepare_dedupes_against_open_forge_pr():
+    """Правило 9 (находка ревью PR #952, п.1)."""
+    text = _text()
+    assert re.search(r'grep -c "\^agent/\$\{task_issue\}-forge-"', text), (
+        "проверка пригодности обязана искать уже открытый PR форжа этой же "
+        "задачи (agent/<N>-forge-*) и пропускать повтор — иначе схема "
+        "«крон открывает новый PR каждый час, пока предыдущий не слился» "
+        "плодит мёртвые релизы (находка ревью PR #952, п.1)"
+    )
+
+
 # Мутации, которыми доказана гвардия (каждая — красный тест, откат — зелёный):
 #
 #   М1 (правило 1): заменить `required: true` у task_issue на `required: false`
@@ -156,3 +203,7 @@ def test_pr_body_deploy_trigger_claim_is_accurate():
 #     test_schedule_fallback_present.
 #   М7 (правило 7): вернуть строку «deploy-dsh-edge.yml НЕ триггерится на
 #     push в main» в PR_BODY — красен test_pr_body_deploy_trigger_claim_is_accurate.
+#   М8 (правило 8): убрать вызов `task_issue_ready` из push- или
+#     schedule-ветки prepare — красен test_prepare_checks_task_eligibility_before_build.
+#   М9 (правило 9): убрать блок дедупа (`grep -c "^agent/${task_issue}-forge-"`)
+#     из `task_issue_ready` — красен test_prepare_dedupes_against_open_forge_pr.
