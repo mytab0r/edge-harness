@@ -149,12 +149,19 @@
       scripts/ci/guards» исполняет каждый файл каталога сам — repo-ci.yml
       ЭТИМ change не правится вовсе. Содержимое — те же три команды:
       ```sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       pip install --quiet pytest pyyaml
       python -m pytest scripts/lib/test_rule_registry.py scripts/lib/test_mutation_harness.py -q
       python scripts/lib/rule_registry.py --check
       python scripts/lib/mutation_harness.py --all-proven
       ```
-      Файл несёт свои зависимости сам (контракт run_guards.sh — каждая
+      Шебанг и `set -euo pipefail` — не украшение: без `set -e` код
+      возврата файла определяет последняя команда, и упавший pytest
+      молча проглатывается зелёными `--check`/`--all-proven` — красный
+      тест новой гвардии доезжает до run_guards.sh как успех (у всех
+      существующих файлов каталога `set -e` стоит). Файл несёт свои
+      зависимости сам (контракт run_guards.sh — каждая
       существующая гвардия каталога предваряет pytest своим pip install)
       и проходит общий lint-цикл репозитория (`bash -n` по
       `scripts/ci/guards/*.sh` в repo-ci.yml). Оба новых test-файла и

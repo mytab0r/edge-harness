@@ -124,8 +124,9 @@ scripts/lib/test_rule_registry.py::test_validate_rejects_missing_statement`
 зависимостей, без сканирования всего `scripts/`) и заведомо живой —
 он пишется и сразу проверяется в рамках той же задачи, а не унаследован
 от чужого, потенциально дрейфующего файла с сотнями посторонних тестов
-(антипаттерн, замеренный design.md на `scripts/orchestra/
-test_scheduler.py` — 249 тестов, до 19.4 с на один).
+(антипаттерн, замеренный при v2 этого change 2026-09-07 на
+`scripts/orchestra/test_scheduler.py` — тогда 249 тестов, до 19.4 с на
+один; на 2026-09-11 в файле уже 310 `def test_`).
 
 **Второй иллюстративный файл** — `relative-markdown-links`
 (AGENTS.md, «Работа с документацией», `status: none`,
