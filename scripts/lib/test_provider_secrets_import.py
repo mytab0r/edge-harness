@@ -1025,7 +1025,31 @@ def test_set_secret_value_never_in_argv(monkeypatch):
     args, stdin_value = calls[0]
     assert FIXTURE_MARKER not in args
     assert stdin_value == FIXTURE_MARKER
-    assert "--body-file" in args and "-" in args
+    # gh 2.85 не знает --body-file у gh secret set (unknown flag, #786) — значение
+    # идёт ТОЛЬКО через stdin, --body-file в argv быть не должно.
+    assert "--body-file" not in args
+
+
+def test_set_variable_value_never_in_argv(monkeypatch):
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(args, input=None, text=None, capture_output=None, **_kwargs):
+        calls.append((list(args), input))
+        return FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    psi.set_variable("owner/repo", "SOME_VAR", FIXTURE_MARKER)
+
+    assert len(calls) == 1
+    args, stdin_value = calls[0]
+    assert FIXTURE_MARKER not in args
+    assert stdin_value == FIXTURE_MARKER
+    # Тот же класс (#786): gh variable set тоже не знает --body-file на gh 2.85.
+    assert "--body-file" not in args
 
 
 # ── export_snapshot_date: дата снимка предохранителя ─────────────────────

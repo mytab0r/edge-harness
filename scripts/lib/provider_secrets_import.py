@@ -24,7 +24,9 @@ Anthropic OAuth-пул (задача #216) — ДРУГОЙ механизм (и
 Требования безопасности (AGENTS.md, раздел «Секреты» — репозиторий публичный):
   - путь к файлу-экспорту — только --export-file/переменная окружения
     PROVIDER_EXPORT_FILE, никогда литерал в коде/тестах/докстрингах;
-  - значения не проходят через argv — gh кормится через stdin (--body-file -);
+  - значения не проходят через argv — gh кормится через stdin (gh secret set/
+    variable set читают значение из stdin, когда --body/--body-file не заданы;
+    --body-file непортируем на gh 2.85 — unknown flag, #786);
   - значения никогда не печатаются (целиком/частично/как подстрока);
   - никакой записи значений в файлы;
   - файл-экспорт внутри рабочего дерева репозитория — громкий отказ;
@@ -654,9 +656,13 @@ def existing_variable_names(repo: str) -> set[str]:
 
 
 def set_secret(repo: str, name: str, value: str) -> None:
-    """Значение — ТОЛЬКО через stdin (--body-file -), никогда через argv."""
+    """Значение — ТОЛЬКО через stdin, никогда через argv.
+
+    gh secret set читает значение из stdin, когда не задан --body/--body-file.
+    Флаг --body-file в gh 2.85 отсутствует (unknown flag, #786) — не передаём его.
+    """
     result = subprocess.run(
-        ["gh", "secret", "set", name, "--repo", repo, "--body-file", "-"],
+        ["gh", "secret", "set", name, "--repo", repo],
         input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
@@ -664,8 +670,9 @@ def set_secret(repo: str, name: str, value: str) -> None:
 
 
 def set_variable(repo: str, name: str, value: str) -> None:
+    """Значение — ТОЛЬКО через stdin, никогда через argv (см. set_secret, #786)."""
     result = subprocess.run(
-        ["gh", "variable", "set", name, "--repo", repo, "--body-file", "-"],
+        ["gh", "variable", "set", name, "--repo", repo],
         input=value, text=True, capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:

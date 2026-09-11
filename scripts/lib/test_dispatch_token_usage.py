@@ -70,6 +70,7 @@ EXPECTED_WORKFLOWS = frozenset({
     # write) + секреты TELEGRAM_* — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
+    "cf-inventory.yml",
     "codeql.yml",
     # #762: дешёвый механический ребейз PR с меткой conflict, без вызова
     # агента — читает secrets.GH_PIPELINE_PAT для push рёбейзнутой ветки

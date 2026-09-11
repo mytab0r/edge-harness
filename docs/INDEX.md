@@ -76,6 +76,10 @@
   `deepseek-official` сидят на одном слоте деплоя, смена там = замена. В морде (Settings →
   Models) второй провайдер добавляется без передеплоя через плагин `provider-registry`
   (#378). Шаги, проверка видимого результата, откат, и почему потолок ответа зашит под GLM.
+- [Обновить учётки пула Claude из krouter-экспорта](runbooks/refresh-anthropic-pool.md) —
+  `dsh-anthropic-oauth-pool` (#838), секреты `ANTHROPIC_OAUTH_1/2`, импорт из
+  krouter-бэкапа или одиночного credentials.json (`scripts/lib/anthropic_oauth_import.py`),
+  почему истёкший accessToken из бэкапа — это нормально (пул рефрешит по refreshToken).
 
 ## Мультиагентная работа
 
@@ -99,6 +103,9 @@
   `config/provider-usage.json` (openspec/changes/llm-provider-usage-manifest, #823).
 - [Roadmap потоков работ](agents/ROADMAP.md) — живая карта параллельных потоков и
   зависимостей (mermaid-гант); детали задач — в пуле Issues.
+- [Инфраструктура Cloudflare](agents/INFRA-CF.md) — что доступно токену, чем
+  узнать состояние (`scripts/cf/`), что нельзя трогать. Читать до любой работы
+  с CF API/wrangler.
 
 ## Быстрые ответы на частые вопросы
 
