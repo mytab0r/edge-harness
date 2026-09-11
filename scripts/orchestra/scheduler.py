@@ -148,6 +148,22 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       конвенции `Related: #<старая>` (Search API, отдельный бюджет 30/мин,
       не общий core 5000/час, #454) — ловит и ручные замены (живой случай
       #431→#538), не только свои.
+  17. Доводка PR по находкам AI-ревью (дефект B watchdog-issue #120: 23
+      открытых PR с ai:changes-requested, старейшие #241/#261/#262 висят с
+      2026-09-03 — восемь суток, потому что находки читает только человек,
+      случайно открывший PR). dispatch_ai_review_rework — по образцу
+      dispatch_conflict_rework (п.2, issue #474): адресный worker.yml
+      (снятие assignee+замка, task.sh режим доводки #245, второй промпт не
+      заводится), бюджет AI_REWORK_MAX_ATTEMPTS попыток НА ОТПЕЧАТОК диффа
+      (review_labels.diff_fingerprint — дедуп «тот же head, тот же
+      отпечаток находок», не лифтайм на PR: новый отпечаток — новая, ещё не
+      пробованная задача), исчерпание эскалирует тем же каналом (#120), что
+      и предохранитель конвейера. Порядок в main() — после dispatch_
+      conflict_rework, до wip_gate/dispatch_worker: доводка существующих PR
+      обязана иметь приоритет перед взятием НОВЫХ задач (прямая связь с
+      п.15 — WIP-гейт душит новые задачи именно потому, что открытых PR,
+      ждущих доработки, много). PR с меткой `conflict` исключены — их ведёт
+      п.2, второго диспатча на тот же PR за пульс это не даёт.
 """
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
@@ -186,6 +202,10 @@ from pulse_guard import (
     AI_REVIEW_QUOTA_MARKER,
     AI_REVIEW_RETRY_AFTER_MINUTES,
     AI_REVIEW_RETRY_MARKER,
+    AI_REWORK_ESCALATION_MARKER,
+    AI_REWORK_MARKER,
+    AI_REWORK_MAX_ATTEMPTS,
+    ALLOW_PROD_WRITES_ENV,
     CONFLICT_BUDGET_RESET_MARKER,
     CONFLICT_ESCALATION_MARKER,
     CONFLICT_REWORK_MARKER,
@@ -198,6 +218,7 @@ from pulse_guard import (
     WORKER_GIT_STEP_MARKER,
     WORKER_WORKFLOW,
     all_issue_comments,
+    announce_write_mode,
     conveyor_gate,
     escalate,
     failure_watch,
@@ -209,6 +230,7 @@ from pulse_guard import (
     minutes_between,
     parse_time,
     post_issue_comment,
+    prod_writes_allowed,
     recent_runs,
     resume_alert_text,
     send_telegram,
@@ -319,6 +341,48 @@ MERGE_METHOD = "squash"
 # что у reap_stale: второй порог правды не заводится.
 STALE_UNCLAIMED_LABEL = "stale-unclaimed"
 
+
+def _guard_raw_subprocess_write(description: str) -> bool:
+    """True — вызывающий обязан выполнить реальный изменяющий вызов; False —
+    пропустить его (описание уже напечатано warning'ом).
+
+    Тот же класс и та же функция решения, что pulse_guard.gh()/send_telegram
+    (2026-09-11, находка владельца: watchdog-issue #120 несёт 112 из 573
+    комментариев от логина `mytab0r`, не `github-actions[bot]` — доказательство,
+    что `python scheduler.py` реально запускается вне GitHub Actions личным
+    токеном и способен слить PR/задиспетчить воркера в обход `concurrency:
+    group: orchestra`). `gh()` гейтит СВОИ вызовы сама (класс закрыт там), но в
+    scheduler.py есть ДВА места, где изменяющий вызов идёт В ОБХОД gh()
+    (сырой `subprocess.run` — ORCHESTRA_PAT-путь update_branch, `gh workflow
+    run` в dispatch_deploy_on_merge): точечный if внутри main() их не поймал
+    бы (класс, не случай) — обе точки читают ЭТУ ЖЕ функцию prod_writes_
+    allowed, что и gh(), а не заводят свою копию решения.
+
+    ТРЕТЬЯ поверхность (находка AI-ревью PR #950): claim_task.release/
+    release_full/collect_stale (`scripts/lib/claim_task.py`) несут СВОЙ gh() с
+    собственным subprocess.run — тот же класс обхода, что и два места выше,
+    только не в этом файле. claim_task — общая библиотека МНОГИХ каналов
+    (task-branch/task.sh/dsh_task.sh claim'ят ЛОКАЛЬНО и по замыслу), поэтому
+    её gh() не гейтится безусловно (это сломало бы штатный локальный claim) —
+    вместо второй копии предиката claim_task.gh() получает ИНЪЕЦИРУЕМЫЙ хук
+    (claim_task.set_write_guard), который ниже подключается именно к этой
+    функции: единственная точка, где планировщик решает писать вне CI, и
+    единственный потребитель хука."""
+    if prod_writes_allowed():
+        return True
+    print(
+        f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
+        f"изменяющий вызов пропущен: {description}",
+        file=sys.stderr,
+    )
+    return False
+
+
+# claim_task — общая библиотека (см. её собственный gh(), докстринг
+# set_write_guard) — гейт подключается ЗДЕСЬ ОДИН РАЗ, тем же предикатом, что
+# использует остальной scheduler.py, а не второй копией.
+claim_task.set_write_guard(_guard_raw_subprocess_write)
+
 # ── Цикл слияний внутри одного прогона (#297) ────────────────────────────────
 # Было буквально «ровно один PR за запуск» (см. шапку модуля, пункт 3, и
 # merge_queue): расписание, на которое рассчитывал следующий запуск,
@@ -381,6 +445,21 @@ def open_task_issues(repo: str) -> list[dict]:
 def open_pulls(repo: str) -> list[dict]:
     # Тот же класс #308: список PR растёт тем же темпом, что и пул задач —
     # первая страница молча теряла бы хвост тем же образом.
+    #
+    # Дефект A (watchdog-issue #120, 2026-09-11): раньше list_pages на
+    # неожиданной форме ответа (не-list — например тело вторичного
+    # рейт-лимита GitHub) тихо возвращал уже накопленное (здесь — пустой
+    # список на первой же странице), и wip_gate ниже по main() читал это как
+    # «доработки нет», открывая диспатч новых задач на 27 реально открытых
+    # PR, ждущих доработки. Теперь list_pages поднимает RuntimeError в этом
+    # случае — main() (см. `if __name__ == "__main__"`) красит прогон и
+    # выходит ДО того, как wip_gate/dispatch_worker увидят искажённый
+    # снимок: пустой/некорректный список PR либо честная пустота (state=open
+    # и правда даёт []), либо явный сбой — третьего («тихо открыть гейт») не
+    # остаётся. Газ: orchestra.yml — в WATCHED_WORKFLOWS failure_watch
+    # (#477), красный прогон сам заметен следующим успешным пульсом, а
+    # транзиентный сбой (сеть/рейт-лимит) самолечится следующим прогоном
+    # через 15 минут без ручного участия.
     return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
 
 
@@ -954,6 +1033,215 @@ def dispatch_conflict_rework(
     return observations, actions, dispatched
 
 
+# ── Дефект B: доводка PR по находкам AI-ревью (по образцу dispatch_conflict_
+# rework выше, тот же механизм — не второй канал) ────────────────────────────
+#
+# Диагноз: `ai:changes-requested` производится самым дорогим циклом
+# репозитория (~50 прогонов ai-review.yml/сутки, живой вызов модели), гейт
+# слияния читает только МЕТКУ (review_labels.merge_label_gate), а прозу
+# находок не читает никто — PR ждёт человека или агента, который случайно
+# откроет именно этот PR. Живой замер: 23 открытых PR с ai:changes-requested,
+# старейшие #241/#261/#262 висят с 2026-09-03 (восемь суток на момент задачи).
+#
+# Порядок в main() (см. вызов ниже): ПОСЛЕ dispatch_conflict_rework, ДО
+# wip_gate/dispatch_worker — доводка уже открытых PR обязана иметь приоритет
+# перед взятием НОВЫХ задач (это прямо связано с дефектом A: WIP-гейт душит
+# новые задачи именно потому, что открытых PR, ждущих доработки, много —
+# нет смысла плодить тридцать первую, пока не разгребается существующая
+# очередь). Conflict — раньше ai-rework: PR с ОБЕИМИ метками (conflict И
+# ai:changes-requested) обслуживает только dispatch_conflict_rework в этом
+# пульсе — расшивка дрейфа main могла бы сама изменить дифф и снять
+# ai:changes-requested следующим прогоном ревью, а task.sh (режим доводки
+# #245) в любом случае даёт агенту команду прочитать ПОСЛЕДНИЙ вердикт PR
+# (`gh pr view --comments`), не привязан к тому, ЧЕМ именно был вызван —
+# второго диспатча на тот же PR за тот же пульс это не требует.
+
+def ai_rework_dispatched_at(repo: str, pr_number: int, fingerprint: str) -> datetime | None:
+    """Момент, когда авто-доводка по находкам ai-review уже запускалась НА
+    ЭТОМ ТОЧНОМ отпечатке диффа (AI_REWORK_MARKER + `fp:{fingerprint}` в
+    комментариях PR — тот же канал, что CONFLICT_REWORK_MARKER, только ключ
+    не время, а отпечаток). None — на этом отпечатке ещё не пробовали
+    (новый пуш с реальной правкой даёт новый отпечаток и чистый бюджет —
+    см. блок-комментарий выше про отличие от conflict_first_labeled_at)."""
+    marker = f"{AI_REWORK_MARKER} fp:{fingerprint}"
+    times = issue_marker_times(repo, pr_number, marker)
+    return max(times) if times else None
+
+
+def ai_rework_attempts(repo: str, pr_number: int, task_number: int, fingerprint: str) -> int:
+    """Число ЗАСЧИТАННЫХ попыток авто-доводки НА ЭТОМ ОТПЕЧАТКЕ — тот же
+    приём защиты от гонки/инфраслучайных провалов, что
+    conflict_rework_attempts выше: засчитывается только прогон, САМ
+    отметивший, что дошёл до git-шага (WORKER_GIT_STEP_MARKER в комментариях
+    ЗАДАЧИ), не сам факт диспатча (тот ставится сразу, до всякой реальной
+    попытки — заметка для человека, не источник счётчика)."""
+    since = ai_rework_dispatched_at(repo, pr_number, fingerprint)
+    if since is None:
+        return 0
+    git_step_run = re.compile(
+        rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
+    )
+    counted: set[str] = set()
+    for comment in all_issue_comments(repo, task_number):
+        created_at = comment.get("created_at")
+        if not created_at or parse_time(created_at) < since:
+            continue
+        match = git_step_run.search(comment.get("body") or "")
+        if match:
+            counted.add(match.group(1))
+    return len(counted)
+
+
+def dispatch_ai_review_rework(
+    repo: str, pulls: list[dict], *, pool: list[dict],
+) -> tuple[list[str], list[str], bool]:
+    """Адресный диспатч worker.yml на доводку PR по находкам ai-review —
+    по образцу dispatch_conflict_rework (issue #474): снятие assignee+замка
+    задачи, worker.yml с input `task` (task.sh режим доводки #245, тот же
+    промпт, что уже используют conflict/красный чек), бюджет попыток +
+    эскалация владельцу тем же каналом (#120), что и предохранитель
+    конвейера.
+
+    Бюджет — AI_REWORK_MAX_ATTEMPTS попыток НА ОТПЕЧАТОК диффа
+    (ai_rework_attempts), не лифтайм на PR: изменившийся отпечаток — это
+    новая, ещё не пробованная задача (агент реально что-то поменял), сгоревшая
+    попытка на СТАРОМ отпечатке не должна её блокировать. Исчерпание бюджета
+    на текущем отпечатке (диспатч не сдвинул код — тот же класс инфрасбоя,
+    что #588 у conflict) эскалирует, не диспетчит второй раз вслепую.
+
+    Дедуп «тот же head, тот же отпечаток находок» — ai_rework_dispatched_at:
+    неизменный отпечаток при уже висящем маркере не даёт второй, дублирующий
+    dispatch за тот же пульс/следующие пульсы, пока не исчерпан бюджет.
+
+    Conflict-PR исключены (см. блок-комментарий у модуля выше) —
+    dispatch_conflict_rework уже обслуживает их, второго диспатча на тот же
+    PR за пульс это не даёт.
+
+    Идемпотентность — worker_runs_active, тот же гейт, что и у
+    dispatch_conflict_rework/dispatch_worker: воркер один на репозиторий,
+    пока прошлый прогон жив. Третий элемент кортежа (dispatched) — сигнал
+    main() не звать следом dispatch_worker в этом же проходе."""
+    observations: list[str] = []
+    actions: list[str] = []
+    dispatched = False
+    pool_by_number = {issue["number"]: issue for issue in pool}
+    for pull in pulls:
+        labels = {label["name"] for label in pull["labels"]}
+        if review_labels.AI_CHANGES not in labels:
+            continue
+        if CONFLICT_LABEL in labels:
+            continue  # своя очередь — dispatch_conflict_rework (см. блок-комментарий выше)
+        number = pull["number"]
+        task_number = task_ref.resolve_pr_task(pull)
+        if task_number is None:
+            observations.append(
+                f"⚠️ PR #{number} несёт ai:changes-requested, но ветка не называет "
+                "задачу (agent/N-slug) — авто-доводка недоступна, нужен человек"
+            )
+            continue
+        try:
+            files = review_labels.list_pr_files(repo, number, gh)
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ PR #{number}: не удалось прочитать файлы для отпечатка находок: {error}"
+            )
+            continue
+        fingerprint = review_labels.diff_fingerprint(files)
+        try:
+            attempts = ai_rework_attempts(repo, number, task_number, fingerprint)
+        except RuntimeError as error:
+            observations.append(f"⚠️ PR #{number}: не удалось сверить бюджет авто-доводки: {error}")
+            continue
+        if attempts >= AI_REWORK_MAX_ATTEMPTS:
+            if dispatched or worker_runs_active(repo):
+                observations.append(
+                    f"⏸️ PR #{number}: авто-доводка по находкам ai-review ещё идёт "
+                    "(worker.yml активен) — решение об эскалации отложено"
+                )
+                continue
+            marker = f"{AI_REWORK_ESCALATION_MARKER} #{number} fp:{fingerprint[:12]}"
+            try:
+                already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
+            except RuntimeError as error:
+                observations.append(f"⚠️ не смог сверить маркер эскалации доводки #{number}: {error}")
+                continue
+            if already:
+                continue  # уже эскалировано на этом отпечатке — не спамим, ждём владельца
+            # Перепроверка (тот же приём, что dispatch_conflict_rework перед
+            # эскалацией конфликта): метка могла уже смениться между снимком
+            # `pulls` и этим моментом — эскалировать «застрял» на PR, который
+            # ai-review уже одобрил, было бы ложью.
+            single = gh(f"repos/{repo}/pulls/{number}")
+            current_labels = {label["name"] for label in single.get("labels") or []}
+            if review_labels.AI_CHANGES not in current_labels:
+                observations.append(
+                    f"⏸️ PR #{number}: ai:changes-requested уже снят — эскалация не нужна"
+                )
+                continue
+            run_conclusion = last_worker_run_conclusion(repo, task_number)
+            run_note = (
+                f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
+                if run_conclusion is not None
+                else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?) — см. лог worker.yml вручную"
+            )
+            text = (
+                f"🚨 edge-harness: {marker}\n"
+                f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
+                f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
+                f"worker.yml ({run_note}). Причина отсюда не различается (инфраструктурный "
+                "сбой воркера/квота/таймаут дают тот же итог, что незакрытые находки) — "
+                "нужно решение владельца: посмотреть лог последнего прогона и находки "
+                "ai-review (gh pr view --comments) и разобраться руками."
+            )
+            escalation = escalate(repo, WATCHDOG_ISSUE, text)
+            actions.append(
+                f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
+                f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
+                f"владельцу ({escalation})"
+            )
+            continue
+        issue = pool_by_number.get(task_number)
+        if issue is None:
+            observations.append(
+                f"⚠️ PR #{number}: задача #{task_number} не найдена в открытом пуле — "
+                "авто-доводка недоступна"
+            )
+            continue
+        if _issue_is_blocked(issue):
+            continue  # эскалация playbook уже идёт своим путём — не мешаем ей
+        if dispatched or worker_runs_active(repo):
+            observations.append(
+                f"⏸️ PR #{number} ждёт доводки по находкам ai-review, но воркер занят — отложено"
+            )
+            continue
+        if issue["assignees"]:
+            who = ", ".join(a["login"] for a in issue["assignees"])
+            gh("-X", "DELETE", f"repos/{repo}/issues/{task_number}/assignees", "-f", f"assignees[]={who}")
+            issue["assignees"] = []
+        try:
+            release_note = claim_task.release(repo, int(task_number))
+        except RuntimeError as error:
+            release_note = f"замок не снят: {error}"
+        gh(
+            "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
+            "-f", "ref=main", "-f", f"inputs[task]={task_number}",
+        )
+        post_issue_comment(
+            repo, number,
+            f"🤖 {AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение с задачи "
+            f"#{task_number} и запустил worker.yml адресно (попытка {attempts + 1}/"
+            f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке диффа) на доводку по находкам "
+            "ai-review — см. gh pr view --comments.",
+        )
+        actions.append(
+            f"🔧 PR #{number} с ai:changes-requested — задача #{task_number} освобождена "
+            f"({release_note}), worker.yml запущен адресно на доводку (попытка "
+            f"{attempts + 1}/{AI_REWORK_MAX_ATTEMPTS})"
+        )
+        dispatched = True
+    return observations, actions, dispatched
+
+
 class UpdateBranchBudgetExhausted(RuntimeError):
     """Бюджет update_branch этого ПРОХОДА исчерпан (см. update_branch, #252,
     третий заход; терминология уточнена в #297 — прогон планировщика теперь
@@ -1083,15 +1371,17 @@ def update_branch(repo: str, pr_number: int) -> None:
             "— head не двигаю, пока прогон не закончится"
         )
     pat = os.environ.get("ORCHESTRA_PAT")
-    if pat:
-        subprocess.run(
-            ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch",
-             "-H", f"Authorization: Bearer {pat}"],
-            capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
-            check=True,
-        )
-    else:
-        gh("-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch")
+    description = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/update-branch"
+    if _guard_raw_subprocess_write(description):
+        if pat:
+            subprocess.run(
+                ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch",
+                 "-H", f"Authorization: Bearer {pat}"],
+                capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
+                check=True,
+            )
+        else:
+            gh("-X", "PUT", f"repos/{repo}/pulls/{pr_number}/update-branch")
     _update_branch_calls_this_pass += 1
 
 
@@ -1463,6 +1753,14 @@ def _morde_login(opener: urllib.request.OpenerDirector) -> None:
 
 
 def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict) -> dict:
+    """Мутирующий RPC морды (workspace.archiveSession и т.п.) — третий,
+    отдельный от gh()/subprocess транспорт, тот же класс прод-записи вне
+    GitHub Actions (2026-09-11): гейтится ТОЙ ЖЕ prod_writes_allowed, что и
+    gh()/send_telegram/_guard_raw_subprocess_write — второй копии решения не
+    заводим. Оба вызывающих (archive_runner_sessions) игнорируют возвращаемое
+    значение — `{}` безопасен как заглушка dry-run."""
+    if not _guard_raw_subprocess_write(f"POST /api/{method} (морда dsh-edge) payload={payload}"):
+        return {}
     body = json.dumps({
         "type": "client-request",
         "rpcId": "orchestra",
@@ -1488,7 +1786,12 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
     `{"events":[...]}` БЕЗ обёртки client-request, успех — сырой JSON
     `{appended,lastSeq}`, отказ — обычный HTTP-код (400 allowlist/форма, 404
     нет сессии, 413 потолки), а не `{result:{ok:false}}` (docs/research/12,
-    dsh-edge/patches/0004-harness-ingest.patch)."""
+    dsh-edge/patches/0004-harness-ingest.patch).
+
+    Тот же гейт прод-записи, что _morde_rpc выше (2026-09-11) — единственный
+    вызывающий (append_session_notes) игнорирует возвращаемое значение."""
+    if not _guard_raw_subprocess_write(f"POST /api/sessions/{session_id}/ingest (морда dsh-edge)"):
+        return {}
     body = json.dumps({"events": events}).encode()
     req = urllib.request.Request(
         DSH_EDGE_URL.rstrip("/") + f"/api/sessions/{session_id}/ingest",
@@ -4212,6 +4515,18 @@ def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
     lines = [f"## Отчёт оркестратора {now.isoformat(timespec='seconds')}", ""]
+    # Прод-запись только внутри GitHub Actions (2026-09-11) — режим
+    # объявляется ГРОМКО и ПЕРВЫМ, до единого изменяющего вызова (тормоз не
+    # молчит о своём режиме, AGENTS.md). См. pulse_guard.prod_writes_allowed
+    # и блок-комментарий там же — живое доказательство: watchdog-issue #120
+    # несёт 112 из 573 комментариев от логина mytab0r, не github-actions[bot].
+    # Печатается в лог прогона (stdout), НЕ в `lines` отчёта: `lines` читает
+    # stall_detector.detect_and_act как источник симптомов простоя (⚠️/🚨-
+    # строки), и ежепрогонная строка режима записи (⚠️ вне CI в юнит-тестах,
+    # где ALLOW_PROD_WRITES_ENV поднят фикстурой) ложно матчила бы её как
+    # новый, ничем не примечательный симптом на каждом прогоне — режим записи
+    # не про здоровье конвейера, отдельная забота.
+    print(announce_write_mode())
     # Слот update_branch раньше обнулялся один раз здесь на весь прогон
     # (#252, третий заход). С #297 прогон — это цикл из нескольких проходов
     # (merge_loop), и каждый проход обнуляет свой собственный слот сам — см.
@@ -4353,6 +4668,19 @@ def main() -> int:
         )
     else:
         conflict_rework_observations, conflict_rework_actions, conflict_rework_dispatched = [], [], False
+    # Доводка по находкам AI-ревью (дефект B) — тем же порядком, что конфликты:
+    # доводка уже открытых PR обязана иметь приоритет перед взятием НОВЫХ задач
+    # (см. блок-комментарий у dispatch_ai_review_rework — это прямо связано с
+    # дефектом A: WIP-гейт душит новые задачи именно потому, что открытых PR,
+    # ждущих доработки, много). `not conflict_rework_dispatched` — та же
+    # дисциплина «ровно один workflow_dispatch воркера за пульс», что уже
+    # применяется ниже к dispatch_worker.
+    if dispatch_allowed and not conflict_rework_dispatched:
+        ai_rework_observations, ai_rework_actions, ai_rework_dispatched = (
+            dispatch_ai_review_rework(repo, pulls, pool=pool)
+        )
+    else:
+        ai_rework_observations, ai_rework_actions, ai_rework_dispatched = [], [], False
     # WIP-лимит (#464) — второй, независимый тормоз, но только на НОВЫЕ
     # задачи: пока открытых PR, реально ждущих доработки, больше или равно
     # WIP_LIMIT (см. wip_gate), dispatch_worker не берёт задачу без открытого
@@ -4368,7 +4696,7 @@ def main() -> int:
     # ушла: «ровно один workflow_dispatch воркера за пульс» (докстринг модуля,
     # п.4) не должен превратиться в два только из-за гонки worker_runs_active
     # (только что созданный прогон не обязан быть виден как queued немедленно).
-    if dispatch_allowed and not conflict_rework_dispatched:
+    if dispatch_allowed and not conflict_rework_dispatched and not ai_rework_dispatched:
         worker_observations, worker_actions = dispatch_worker(
             repo, pool, wip_allowed=wip_allowed, pulls=pulls)
     else:
@@ -4377,15 +4705,16 @@ def main() -> int:
     observations = (
         lease_observations + merge_observations + ai_observations + stuck_large_ok_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
-        + wip_observations + worker_observations + failure_watch_observations
-        + stalled_observations
+        + ai_rework_observations + wip_observations + worker_observations
+        + failure_watch_observations + stalled_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
         + merge_actions + ai_actions + stuck_large_ok_actions + stale_ready_lines + reopen_lines
         + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
-        + wip_actions + worker_actions + failure_watch_actions + stalled_actions
+        + ai_rework_actions + wip_actions + worker_actions + failure_watch_actions
+        + stalled_actions
     )
     lines += render_action_report(observations, actions)
 

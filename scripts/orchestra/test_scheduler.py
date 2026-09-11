@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,6 +49,16 @@ SCRIPT = _DIR / "scheduler.py"
 spec = importlib.util.spec_from_file_location("scheduler", SCRIPT)
 sch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sch)  # type: ignore[union-attr]
+
+# Только ради _WIP_GATE_COUNT_RE (замечание ревью PR #950: маркеры WIP-гейта
+# ниже обязаны матчиться ИМЕННО этим regex'ом инварианта 16, не его
+# пересказом) — отдельный экземпляр модуля, тот же приём, что уже использует
+# test_repo_invariants.py для scheduler в обратную сторону. Сеть не нужна:
+# в этом файле читаются только определения, gh() не вызывается на импорте.
+_RI_SCRIPT = _DIR / "repo_invariants.py"
+_ri_spec = importlib.util.spec_from_file_location("repo_invariants_for_wip_gate_regex", _RI_SCRIPT)
+_ri_for_regex = importlib.util.module_from_spec(_ri_spec)
+_ri_spec.loader.exec_module(_ri_for_regex)  # type: ignore[union-attr]
 
 
 # ── Живой HTTP-сервер: контракт логина морды (303 + Set-Cookie) ──────────────────
@@ -400,6 +411,35 @@ def test_morde_ingest_http_error_is_loud_runtime_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="HTTP 400"):
         sch._morde_ingest(_FakeOpener(), "harness-5", [{"type": "hacker/event", "data": {}}])
+
+
+def test_morde_ingest_dry_run_outside_ci_never_opens_connection(monkeypatch):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (класс «прод-запись только в GitHub Actions»,
+    2026-09-11): третий, отдельный от gh()/subprocess транспорт (морда
+    dsh-edge) — тот же гейт prod_writes_allowed()."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+
+    class _BoomOpener:
+        def open(self, req, timeout=None):
+            raise AssertionError("opener.open не должен вызываться вовсе — DRY-RUN")
+
+    result = sch._morde_ingest(_BoomOpener(), "harness-5", [{"type": "assistant/message", "data": {}}])
+    assert result == {}
+
+
+def test_morde_rpc_dry_run_outside_ci_never_opens_connection(monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+
+    class _BoomOpener:
+        def open(self, req, timeout=None):
+            raise AssertionError("opener.open не должен вызываться вовсе — DRY-RUN")
+
+    result = sch._morde_rpc(_BoomOpener(), "workspace.archiveSession", {"sessionId": "harness-5"})
+    assert result == {}
 
 
 # ── after_merge/accept_merged_tasks/unhealthy_pulls: проводка заметок (#480) ─────
@@ -783,6 +823,21 @@ def _no_telegram_env(monkeypatch):
     (см. test_after_merge_notifies_telegram_about_merge_once)."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _allow_prod_writes_in_tests(monkeypatch):
+    """Прод-запись только внутри GitHub Actions (2026-09-11): по умолчанию вне
+    CI изменяющие вызовы (gh() -X POST/PUT/PATCH/DELETE, ORCHESTRA_PAT-путь
+    update_branch, `gh workflow run`, RPC морды) — DRY-RUN. Этот файл тестирует
+    ЛОГИКУ решений (что и когда диспетчится), а не сам режим записи — почти
+    все тесты уже подменяют транспорт (FakeGh/monkeypatch subprocess.run) и
+    ожидают, что вызов реально дойдёт до их фейка. Без этой автофикстуры 17
+    тестов, exercising update_branch/dispatch_deploy_on_merge/_morde_ingest
+    напрямую (не через FakeGh), стали бы наблюдать DRY-RUN вместо своего
+    предмета. Сам режим DRY-RUN тестируется отдельно и явно (см.
+    test_prod_writes_gate_* ниже) — там же фикстура переопределяется delenv."""
+    monkeypatch.setenv(sch.ALLOW_PROD_WRITES_ENV, "1")
 
 
 def utc(*args):
@@ -2455,6 +2510,46 @@ def test_update_branch_or_report_pat_set_success_uses_subprocess(monkeypatch):
     assert len(calls) == 1
     assert any("update-branch" in str(part) for part in calls[0])
     assert any("Bearer test-pat-token" in str(part) for part in calls[0])
+
+
+def test_update_branch_pat_path_dry_run_outside_ci_never_calls_subprocess(monkeypatch):
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ, класс «прод-запись только в GitHub Actions»
+    (2026-09-11): ORCHESTRA_PAT-путь update_branch — сырой subprocess.run В
+    ОБХОД gh() (gh()'ин собственный гейт его не видит вовсе) — обязан читать
+    ТУ ЖЕ prod_writes_allowed(). Снимает автофикстуру _allow_prod_writes_in_
+    tests намеренно (delenv), чтобы проверить реальный дефолт вне CI."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    patch_gh(monkeypatch, FakeGh({"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}))
+    calls = []
+    monkeypatch.setattr(sch.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+
+    sch.update_branch(REPO, 2)
+
+    assert calls == []  # мок HTTP-слоя не получил ни одного вызова
+
+
+def test_update_branch_pat_path_executes_inside_ci(monkeypatch):
+    """Тот же вызов внутри GitHub Actions реально доходит до subprocess.run."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
+    patch_gh(monkeypatch, FakeGh({"actions/workflows/ai-review.yml/runs": {"workflow_runs": []}}))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        class _Result:
+            returncode = 0
+        return _Result()
+
+    monkeypatch.setattr(sch.subprocess, "run", fake_run)
+
+    sch.update_branch(REPO, 2)
+
+    assert len(calls) == 1
 
 
 # ── Тот же предикат — behind-ветка merge_queue (#252, пункт 3 задачи) ────────────
@@ -4315,6 +4410,103 @@ def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
     assert not any(c.startswith("-X POST") and "/dispatches" in c for c in fake.calls)
 
 
+# ── перепись сырых транспортов записи в трёх файлах пульса (хвост находки
+# ai-review PR #950, второй проход): prod_writes_allowed() перечисляет
+# сегодняшние поверхности прод-записи текстом в докстринге — этот тест держит
+# перечень числом. Появление НОВОГО сырого транспорта (subprocess.run/
+# urllib.request с методом записи) в одном из трёх файлов меняет счёт —
+# офендер, пока рядом не добавлена проверка того же предиката
+# (prod_writes_allowed/_guard_raw_subprocess_write) и не обновлена запись
+# здесь (тот же приём, что test_deploy_on_merge_class_covers_both_deployables
+# выше для `["gh", "workflow", "run"`, расширенный на upstream_drift.py и
+# pulse_guard.py по прямой находке ревью). Учёт по литералу, не по функции —
+# как и выше, устойчивее к переносу отступа при добавлении гейта рядом.
+
+RAW_WRITE_CENSUS = (
+    # (файл относительно scripts/orchestra, литерал маркера, ожидаемое число
+    # вхождений, литерал гейта, который обязан стоять в том же файле).
+    # `["gh", "workflow", "run"` (диспатч деплоя) сюда не входит: #956 вынес
+    # его в scripts/lib/merge_reactions.py (единый реестр реакций на мерж) —
+    # вне территории этой доводки (не трогаем scripts/lib/merge_reactions*).
+    ("scheduler.py", '["gh", "api", "-X", "PUT"', 1, "_guard_raw_subprocess_write"),
+    ("scheduler.py", "data=body, method=\"POST\",", 2, "_guard_raw_subprocess_write"),
+    ("upstream_drift.py", '"push", "origin"', 1, "prod_writes_allowed"),
+    ("upstream_drift.py", "str(pr_create)", 1, "prod_writes_allowed"),
+)
+
+
+def test_raw_write_transport_census_stays_gated():
+    for filename, marker, expected_count, gate_literal in RAW_WRITE_CENSUS:
+        source = (_DIR / filename).read_text(encoding="utf-8")
+        actual_count = source.count(marker)
+        assert actual_count == expected_count, (
+            f"scripts/orchestra/{filename}: маркер сырой записи {marker!r} "
+            f"встречается {actual_count} раз(а), в переписи ожидалось "
+            f"{expected_count} (класс — находка ai-review PR #950, хвост "
+            "второго прохода). Новый экземпляр без гейта прод-записи рядом "
+            "— это регрессия класса; если добавление намеренное и уже "
+            f"гейтится {gate_literal}, обнови RAW_WRITE_CENSUS в "
+            "test_scheduler.py."
+        )
+        assert gate_literal in source, (
+            f"scripts/orchestra/{filename}: маркер {marker!r} есть, а вызова "
+            f"гейта {gate_literal!r} в файле нет — прод-запись мимо "
+            "prod_writes_allowed (класс — находка ai-review PR #950)."
+        )
+
+
+# ── claim_task пишет только через тот же гейт, что и остальной scheduler.py
+# (#951, доводка PR #950: находка ai-review — claim_task.release/release_full/
+# collect_stale несли СВОЙ subprocess.run в обход _guard_raw_subprocess_write
+# целиком) ─────────────────────────────────────────────────────────────────
+
+def test_claim_task_write_guard_wired_to_scheduler_predicate():
+    """Единственная точка починки: claim_task получает module-level хук
+    (claim_task.set_write_guard), scheduler подключает к нему СВОЙ уже
+    существующий предикат при загрузке модуля — не вторую копию решения.
+    Мутация: закомментируй `claim_task.set_write_guard(_guard_raw_subprocess_
+    write)` в scheduler.py — красный."""
+    assert sch.claim_task._write_guard is sch._guard_raw_subprocess_write
+
+
+def test_claim_task_release_is_dry_run_outside_ci_via_wired_guard(monkeypatch):
+    """Живой сценарий инцидента #951: `python scheduler.py` вне CI без
+    SCHEDULER_ALLOW_PROD_WRITES=1 — claim_task.release не уходит в сеть
+    DELETE'ом, хотя сам claim_task ничего не знает про CI/окружение (гейт
+    подключён снаружи, через wiring выше)."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sch.claim_task, "subprocess", SimpleNamespace(run=fake_run))
+    detail = sch.claim_task.release("o/r", 5)
+    assert "task-5" in detail
+    assert calls == []  # DRY-RUN — DELETE не ушёл в сеть
+
+
+def test_claim_task_release_writes_for_real_in_ci_via_wired_guard(monkeypatch):
+    """Симметричная проверка: в CI (dual-signal in_github_actions) тот же
+    вызов реально уходит — гейт не глушит claim_task насовсем, только вне CI
+    без явного разрешения."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "12345")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sch.claim_task, "subprocess", SimpleNamespace(run=fake_run))
+    sch.claim_task.release("o/r", 5)
+    assert len(calls) == 1
+    assert "DELETE" in calls[0] and "task-5" in calls[0]
+
+
 # ── Чеклист некритичных замечаний ревью — задача-хвост при слиянии (#462) ─────
 # Незакрытые пункты НЕ блокируют мерж (иначе некритичное стало бы критичным),
 # но и не теряются молча — одна задача-хвост со ссылкой на PR, не issue на
@@ -5202,6 +5394,55 @@ def test_pr_needs_rework_false_for_bot_author():
         pull(8, labels=["ai:changes-requested"], author_login="dependabot[bot]"))
 
 
+# ── Дефект A (watchdog-issue #120, 2026-09-11): пустой/некорректный снимок
+# открытых PR не должен молча открывать WIP-гейт ─────────────────────────────
+#
+# Живой случай: `⏸️ ... 25 ≥ лимита 12` в 10:02:44Z → `✅ ... 0 < 12` в
+# 10:25:27Z, при живом пересчёте тем же критерием в тот же день — 27, не 0.
+# Корень — review_labels.list_pages (scheduler.open_pulls идёт через неё):
+# не-list ответ (dict с телом вторичного рейт-лимита GitHub, None — пустое
+# тело) трактовался так же, как честная короткая последняя страница, и
+# open_pulls тихо возвращал [] вместо того, чтобы упасть. Сам фикс
+# list_pages и его unit-тесты — scripts/lib/test_review_labels.py; эти два
+# теста доказывают, что фикс действительно доходит до open_pulls/wip_gate,
+# а не гасится по дороге вторым слоем обработки ошибок.
+
+def test_open_pulls_raises_loud_on_corrupted_snapshot_not_silent_empty(monkeypatch):
+    """Докажи мутацией: верни в review_labels.list_pages старое поведение
+    (`if not isinstance(chunk, list) or not chunk: break`) — этот тест
+    покраснеет (RuntimeError не поднимется, open_pulls тихо вернёт [])."""
+    fake = FakeGh({
+        "pulls?state=open&per_page=100": {
+            "message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits",
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="неожиданный ответ"):
+        sch.open_pulls(REPO)
+
+
+def test_open_pulls_corrupted_snapshot_never_reaches_wip_gate_as_false_zero(monkeypatch):
+    """Сквозное доказательство причинно-следственной связи, не только unit на
+    list_pages изолированно: ДО фикса `open_pulls` вернул бы `[]` на таком же
+    ответе, и `wip_gate([], ...)` открыл бы диспатч (allowed=True) — именно
+    так вёл себя #120 2026-09-11. Теперь open_pulls падает раньше, чем этот
+    искажённый снимок вообще мог бы дойти до wip_gate; вторая часть теста —
+    контрольный факт (не гипотеза): будь снимок и правда пуст (`[]`, честная
+    короткая страница), wip_gate действительно открыл бы гейт — в этом и
+    состояла уязвимость до фикса list_pages."""
+    fake = FakeGh({"pulls?state=open&per_page=100": None})  # прод-форма пустого тела
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError):
+        sch.open_pulls(REPO)
+
+    fake_ok = FakeGh({"issues/120/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake_ok)
+    _observations, _actions, allowed = sch.wip_gate(
+        REPO, utc(2026, 9, 11, 10, 25), [], pool=[], dispatch_allowed=True)
+    assert allowed is True  # честно пустой снимок — единственный случай, где 0 допустим
+
+
 def test_wip_gate_matches_live_repository_snapshot_2026_09_06(monkeypatch):
     """Живые данные (замер 2026-09-06, `gh pr list --state open`, 29 открытых
     PR этого репозитория): ровно 25 реально ждут доработки. WIP_LIMIT=12 —
@@ -5366,6 +5607,43 @@ def test_wip_gate_reopens_dispatch_and_posts_close_marker_when_queue_drains(monk
     posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
     assert len(posts) == 1
     assert sch.WIP_GATE_CLOSE_MARKER in posts[0]
+
+
+def test_wip_gate_open_marker_body_matches_invariant_16_regex(monkeypatch):
+    """Замечание ревью PR #950 (некритично, но проверяемо): тело, которое
+    wip_gate РЕАЛЬНО публикует при открытии эпизода, обязано матчиться
+    repo_invariants._WIP_GATE_COUNT_RE — иначе правка формулировки здесь без
+    синхронной правки regex'а там красит инвариант 16 молча (он просто
+    перестанет находить count в новом тексте и решит, что маркеров нет)."""
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": [],
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
+    sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[], dispatch_allowed=True)
+    posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
+    assert len(posts) == 1
+    match = _ri_for_regex._WIP_GATE_COUNT_RE.search(posts[0])
+    assert match is not None, f"тело маркера не матчится _WIP_GATE_COUNT_RE: {posts[0]!r}"
+    assert int(match.group(1)) == len(pulls)
+
+
+def test_wip_gate_close_marker_body_matches_invariant_16_regex(monkeypatch):
+    """Та же гвардия дрейфа, что выше, для CLOSE-маркера (снятие лимита)."""
+    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": comments,
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    pulls = [pull(1, labels=["ai:changes-requested"])]  # очередь поредела ниже лимита
+    sch.wip_gate(REPO, utc(2026, 9, 6, 8, 0), pulls, pool=[], dispatch_allowed=True)
+    posts = [c for c in fake.mutating_calls() if "issues/120/comments" in c]
+    assert len(posts) == 1
+    match = _ri_for_regex._WIP_GATE_COUNT_RE.search(posts[0])
+    assert match is not None, f"тело маркера не матчится _WIP_GATE_COUNT_RE: {posts[0]!r}"
+    assert int(match.group(1)) == len(pulls)
 
 
 def test_wip_gate_escalates_when_episode_older_than_stuck_threshold(monkeypatch):
@@ -5579,6 +5857,10 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     # Расшивка конфликтов (#474) — не предмет теста: её цикл читает labels[]
     # каждого PR, а здесь снимок — маркер-заглушка без полей.
     monkeypatch.setattr(sch, "dispatch_conflict_rework", lambda repo, pulls, pool: ([], [], False))
+    # Доводка по находкам ai-review (дефект B) — та же причина изоляции, что
+    # и у dispatch_conflict_rework строкой выше: её цикл тоже читает labels[]
+    # каждого PR.
+    monkeypatch.setattr(sch, "dispatch_ai_review_rework", lambda repo, pulls, pool: ([], [], False))
     # Детектор простоя (#201) — не предмет теста: он читает строки отчёта
     # (включая здешнюю «новые задачи не берутся»), сверяет отпечаток по сети
     # и в среде без gh-токена падает RuntimeError'ом, крася прогон (return 1),

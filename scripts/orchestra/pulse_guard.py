@@ -73,6 +73,21 @@ _PI_SPEC = importlib.util.spec_from_file_location(
 pool_issue = importlib.util.module_from_spec(_PI_SPEC)
 _PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 
+# Пагинация — одно место правды (review_labels.list_pages, класс #308):
+# три постраничных обхода ниже (all_issue_comments/open_ci_failure_issues/
+# ci_failure_created_since) раньше несли СВОИ копии одного и того же цикла
+# `while True: chunk = gh(...); if not isinstance(chunk, list) or not chunk:
+# break` — дефект A watchdog-issue #120 (не-list ответ, например тело
+# вторичного рейт-лимита GitHub, тратился как честная короткая страница и
+# терял хвост молча) был задублирован здесь трижды, не только в
+# review_labels.list_pages, где его нашли и починили первым. Обход и fail
+# loud на неожиданной форме ответа теперь в одном месте — второй копии не
+# заводим (тот же приём, что уже применили contract_check._all_open_pulls).
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
+
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
 
@@ -305,6 +320,32 @@ WORKER_GIT_STEP_MARKER = "[worker: git-шаг]"
 # ведёт к эскалации — сброс даёт честную повторную попытку, не безлимит.
 CONFLICT_BUDGET_RESET_MARKER = "[conflict-budget-reset:"
 
+# ── Доводка PR по находкам AI-ревью (дефект B, живой замер: 23 открытых PR с
+# ai:changes-requested, старейшие #241/#261/#262 висят с 2026-09-03 — восемь
+# суток) ──────────────────────────────────────────────────────────────────
+# Проза вердикта — самый дорогой цикл репозитория (~50 прогонов ai-review.yml/
+# сутки, живой вызов модели), а гейт слияния читает только МЕТКУ
+# `ai:changes-requested` — сам текст находок не читает никто, PR ждёт, пока
+# человек/агент случайно не наткнётся. По образцу dispatch_conflict_rework
+# (issue #474) — тот же механизм адресного диспатча worker.yml (снятие
+# assignee+замка, task.sh уже умеет режим доводки #245: `gh pr view --comments`
+# + последний вердикт `ai:changes-requested`, второй промпт не заводим), не
+# второй канал. РОВНО одна авто-попытка НА ОТПЕЧАТОК диффа (не лифтайм PR —
+# новый пуш с реальной правкой даёт новый отпечаток и полный новый бюджет;
+# в отличие от CONFLICT_REWORK_MAX_ATTEMPTS — там лифтайм на PR, потому что
+# «дрейф main» повторяется без изменения диффа PR; здесь застревание на ТОМ
+# ЖЕ отпечатке значит «попытка не сдвинула код», а изменившийся отпечаток —
+# уже другая, ещё не пробованная задача): дедуп «тот же head, тот же
+# отпечаток находок» — review_labels.diff_fingerprint, уже считается для
+# обоих гейтов, второго отпечатка не заводим.
+AI_REWORK_MAX_ATTEMPTS = 1
+
+AI_REWORK_MARKER = "[ai-rework: авто-доводка]"
+
+# Номер PR — часть маркера (по образцу CONFLICT_ESCALATION_MARKER выше):
+# эскалация решается по каждому PR отдельно.
+AI_REWORK_ESCALATION_MARKER = "[ai-rework: эскалация]"
+
 # ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
 # worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
 # сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
@@ -467,7 +508,105 @@ FAILURE_WATCH_CAP_MARKER = "[failure-watch: потолок исчерпан"
 FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пропущен"
 
 
+# ── Прод-запись только внутри GitHub Actions (2026-09-11, находка владельца) ─
+#
+# Замер: watchdog-issue #120 несёт 112 из 573 комментариев (19.5%) от логина
+# `mytab0r`, не `github-actions[bot]` — единственный документированный путь
+# вызова scheduler.py (.github/workflows/orchestra.yml:109) держит
+# `GH_TOKEN: ${{ github.token }}` на весь процесс, а вызов под `github.token`
+# ВСЕГДА атрибутируется как `github-actions[bot]` (антипод той же функции,
+# `⏸️ WIP-лимит закрыл диспатч`, приходит от бота в 100% случаев). Комментарий
+# от `mytab0r` означает: чей-то `python scheduler.py` запущен вне этого
+# workflow, личным токеном владельца — тот же процесс способен слить PR
+# (`PUT .../merge`, до MERGE_LOOP_MAX_MERGES за прогон), задиспетчить воркера
+# и архивировать сессию морды, в обход `concurrency: group: orchestra`
+# (тот замок применим только к прогонам САМОГО workflow, не к голому
+# `python scheduler.py`). Живая гонка: в 10:57:29Z 2026-09-11 шёл настоящий
+# прогон orchestra (run 34591704645, actor github-actions[bot]), и в 10:57:56Z
+# — пока он ЕЩЁ ВЫПОЛНЯЛСЯ — инстанс от `mytab0r` написал маркер закрытия
+# WIP-эпизода: два независимых исполнения над одним прод-состоянием
+# одновременно, вопреки заявленному в docs/agents/PROTOCOL.md инварианту
+# «оркестратор сериализован» (см. issue белого пятна, заведённую этой же
+# правкой).
+#
+# Легитимный канал, который эта проверка обязана ПРОПУСКАТЬ: DO-морда дёргает
+# `workflow_dispatch` под `GH_DISPATCH_TOKEN` (fine-grained PAT владельца,
+# ADR 0008) — actor такого прогона законно `mytab0r`, но САМ ПРОГОН исполняется
+# в GitHub Actions (тот же job orchestra.yml, тот же `github.token` внутри
+# процесса) — in_github_actions() ниже смотрит только «где физически
+# исполняется код», не «кто нажал кнопку», поэтому не путает эти два случая.
+ALLOW_PROD_WRITES_ENV = "SCHEDULER_ALLOW_PROD_WRITES"
+
+
+def in_github_actions() -> bool:
+    """Dual-signal (тот же приём, что mechanical_rebase.py::
+    _require_ci_environment, issue #764 — не второй класс, тот же самый):
+    `GITHUB_ACTIONS=true` САМ ПО СЕБЕ ненадёжен — тот же докстринг там
+    называет живой риск утечки переменной в локальное окружение при работе с
+    `gh`/`act`. `GITHUB_RUN_ID` — второй, независимый признак: его
+    выставляет только сам раннер Actions на старте job'а, руками его никто
+    не экспортирует."""
+    return os.environ.get("GITHUB_ACTIONS") == "true" and bool(os.environ.get("GITHUB_RUN_ID"))
+
+
+def prod_writes_allowed() -> bool:
+    """True — изменяющим сетевым вызовам (`gh()` -X POST/PUT/PATCH/DELETE,
+    ORCHESTRA_PAT-путь scheduler.update_branch, RPC морды dsh-edge, а также
+    scheduler.claim_task.release/release_full/collect_stale — через
+    claim_task.set_write_guard(_guard_raw_subprocess_write), см. докстринг
+    scheduler._guard_raw_subprocess_write, находка AI-ревью PR #950, и
+    upstream_drift.attempt_auto_bump — git push/scripts/git/pr-create в обход
+    gh(), находка AI-ревью PR #950 вторым проходом; диспатч деплоя на мерж
+    больше не отдельная поверхность — #956 перевёл его на `gh()` -X POST
+    .../dispatches внутри scripts/lib/merge_reactions.py, снятый ранее
+    `gh workflow run` через голый subprocess.run был последней такой точкой)
+    разрешено реально уйти в сеть. В GitHub Actions (in_github_actions()) —
+    всегда True. Вне CI — только по явному ALLOW_PROD_WRITES_ENV=1
+    (намеренный локальный прогон человеком, отлаживающим планировщик) —
+    announce_write_mode ниже обязан быть напечатан ДО первого решения, тормоз
+    не молчит о своём режиме."""
+    return in_github_actions() or os.environ.get(ALLOW_PROD_WRITES_ENV) == "1"
+
+
+def announce_write_mode() -> str:
+    """Строка для печати в самом начале прогона (main()), раньше первого
+    изменяющего вызова — режим объявляется, а не обнаруживается постфактум
+    по факту молчания."""
+    if in_github_actions():
+        return "режим записи: GitHub Actions — изменяющие вызовы разрешены"
+    if os.environ.get(ALLOW_PROD_WRITES_ENV) == "1":
+        return (f"⚠️ режим записи: ВНЕ GitHub Actions, {ALLOW_PROD_WRITES_ENV}=1 — "
+                "изменяющие вызовы разрешены ЯВНЫМ решением локального прогона")
+    return (f"режим записи: ВНЕ GitHub Actions — DRY-RUN, изменяющие вызовы "
+            f"пропускаются (задай {ALLOW_PROD_WRITES_ENV}=1 для намеренного прод-прогона)")
+
+
+# Признак изменяющего вызова `gh api` — одно место правды (review_labels.
+# GH_WRITE_METHODS/is_write_call, находка ревью PR #950, третий проход: эта
+# копия и claim_task._is_write были ПОБАЙТОВО идентичны, второй метод,
+# добавленный в одну, молча не попал бы во вторую).
+_gh_call_is_write = review_labels.is_write_call
+
+
+class WriteGateSkipped(RuntimeError):
+    """Гейт прод-записи (prod_writes_allowed) отказал: вызов НЕ ушёл в сеть
+    (находка ai-review PR #950, третий проход, тот же класс, что claim_task.
+    WriteGateSkipped). До этой находки gh() тихо возвращал None при отказе
+    гейта — escalate()/post_issue_comment() не проверяли его: `posted = True`
+    печаталось про комментарий, которого не было. Отдельный класс от
+    обычного RuntimeError сетевого сбоя: вызывающий код обязан различать
+    «пропущено (DRY-RUN)» и «попытка была и провалилась» — это разные факты,
+    их нельзя терять за одним сообщением."""
+
+
 def gh(*args: str) -> dict | list | None:
+    if _gh_call_is_write(args) and not prod_writes_allowed():
+        print(
+            f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
+            f"изменяющий вызов пропущен: gh api {' '.join(args)}",
+            file=sys.stderr,
+        )
+        raise WriteGateSkipped(f"DRY-RUN: gh api {' '.join(args)} пропущен")
     result = subprocess.run(
         ["gh", "api", *args],
         capture_output=True, text=True, encoding="utf-8",
@@ -1108,18 +1247,13 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     первой теряла бы хвост). Листание — та же форма: короткая страница
     (`len(chunk) < 100`) значит «дальше страниц нет». Публичная (без
     подчёркивания), потому что читается и вне пары «предохранитель/пульс» —
-    scheduler.resume_series_by_merge ищет в задачах след аренды (#220)."""
-    page = 1
-    comments: list[dict] = []
-    while True:
-        chunk = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100&page={page}") or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        comments.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return comments
+    scheduler.resume_series_by_merge ищет в задачах след аренды (#220).
+
+    Обход — review_labels.list_pages (одно место правды на пагинацию и на
+    fail loud при неожиданной форме ответа, класс #308/дефект A #120: см.
+    комментарий у импорта review_labels выше — эта функция раньше несла
+    свою копию того же цикла с тем же силент-дефектом)."""
+    return review_labels.list_pages(f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh)
 
 
 def _marker_present(marker: str, body: str) -> bool:
@@ -1178,6 +1312,14 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     reply_markup (#254) — инлайн-клавиатура решения владельца (см.
     build_decision_keyboard); необязательна, обычные алерты её не передают —
     сигнатура обратно совместима, поведение существующих вызовов не меняется."""
+    if not prod_writes_allowed():
+        # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11): вне
+        # GitHub Actions без явного ALLOW_PROD_WRITES_ENV=1 реальный алерт
+        # владельцу молчит — дублирующий локальный прогон не должен слать
+        # ложные срабатывания в тот же чат, что и настоящий пульс.
+        print(f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
+              "Telegram-сигнал пропущен", file=sys.stderr)
+        return False
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
@@ -1257,15 +1399,22 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
+        skipped = False
+    except WriteGateSkipped as error:
+        print(f"::warning::след в #{issue_number} пропущен (DRY-RUN): {error}", file=sys.stderr)
+        posted = False
+        skipped = True
     except RuntimeError as error:
         print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
         posted = False
+        skipped = False
     delivered = (
         send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
         if options else send_telegram(text)
     )
+    comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
-            f"след в #{issue_number}: {'оставлен' if posted else 'НЕ оставлен'}")
+            f"след в #{issue_number}: {comment_note}")
 
 
 # ── Сценарии, вызываемые scheduler.py ────────────────────────────────────────────
@@ -1663,25 +1812,15 @@ def open_ci_failure_issues(repo: str) -> list[dict]:
     и для дедупа по похожести заголовка (#610, см. failure_watch): один обход
     Issues на оба вопроса, не два отдельных запроса подряд.
 
-    Листает страницы сама (класс #308, тот же приём, что all_issue_comments
-    выше): список НЕ ограничен по природе — долгоживущие незакрытые дефекты
-    CI со временем накопятся так же, как обычный пул задач, а сырая первая
-    страница молча потеряла бы хвост — та же ошибка дедупа, что и без него,
-    просто отложенная во времени."""
-    page = 1
-    issues: list[dict] = []
-    while True:
-        chunk = gh(
-            f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}"
-            f"&per_page=100&page={page}"
-        ) or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        issues.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return issues
+    Листает страницы через review_labels.list_pages (класс #308, тот же
+    приём, что all_issue_comments выше — одно место правды на обход и на
+    fail loud при неожиданной форме ответа, дефект A #120): список НЕ
+    ограничен по природе — долгоживущие незакрытые дефекты CI со временем
+    накопятся так же, как обычный пул задач, а сырая первая страница молча
+    потеряла бы хвост — та же ошибка дедупа, что и без него, просто
+    отложенная во времени."""
+    return review_labels.list_pages(
+        f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}&per_page=100", gh)
 
 
 def ci_failure_fingerprints(issues: list[dict]) -> set[str]:
@@ -1709,25 +1848,16 @@ def ci_failure_created_since(repo: str, since: datetime) -> int:
 
     `state=all`, не `state=open` (в отличие от open_ci_failure_fingerprints
     выше — тому дедупу закрытые не нужны, счётчику потолка — нужны). Листает
-    страницы сама (класс #308): сырая первая страница молча занижала бы
-    потолок после сотни ci-failure задач за всё время."""
-    page = 1
-    count = 0
-    while True:
-        chunk = gh(
-            f"repos/{repo}/issues?state=all&labels={FAILURE_WATCH_LABEL}"
-            f"&per_page=100&page={page}"
-        ) or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        count += sum(
-            1 for issue in chunk
-            if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
-        )
-        if len(chunk) < 100:
-            break
-        page += 1
-    return count
+    страницы через review_labels.list_pages (класс #308, дефект A #120):
+    сырая первая страница молча занижала бы потолок после сотни ci-failure
+    задач за всё время; не-list ответ раньше давал то же самое молча —
+    теперь падает громко, вместо заниженного потолка."""
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=all&labels={FAILURE_WATCH_LABEL}&per_page=100", gh)
+    return sum(
+        1 for issue in issues
+        if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
+    )
 
 
 def failure_watch_cap_exhausted(created_today: int, cap: int = FAILURE_WATCH_DAILY_CAP) -> bool:

@@ -96,19 +96,15 @@ def _all_open_pulls(repo: str) -> list[dict]:
     молча теряет хвост — на репозитории за сотню открытых PR второй PR на ту
     же задачу за первой сотней не находился бы, и контракт «одна задача — один
     PR» тихо переставал бы работать именно там, где список самый длинный).
-    Листание — та же форма, что review_labels.list_pr_files/list_timeline:
-    короткая страница (`len(chunk) < 100`) значит «дальше страниц нет»."""
-    page = 1
-    pulls: list[dict] = []
-    while True:
-        chunk = gh(f"repos/{repo}/pulls?state=open&per_page=100&page={page}")
-        if not isinstance(chunk, list) or not chunk:
-            break
-        pulls.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return pulls
+
+    Обход — review_labels.list_pages (класс #308, дефект A watchdog-issue
+    #120): раньше здесь жила СВОЯ копия того же цикла с тем же дефектом
+    (`if not isinstance(chunk, list) or not chunk: break` — не-list ответ,
+    например тело вторичного рейт-лимита GitHub, тратился как честная
+    короткая страница, контракт тихо проверял бы неполный список открытых
+    PR). Одно место правды на пагинацию + на fail loud при неожиданной форме
+    ответа — вторая копия здесь не заводится."""
+    return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
 
 
 def task_eligibility_problems(issue: dict, issue_number: int) -> list[str]:
