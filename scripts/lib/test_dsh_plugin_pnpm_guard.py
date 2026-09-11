@@ -2,7 +2,7 @@
 """Гвардия класса #83/#842: `dsh plugin add` в профиле headless требует ДВУХ
 предпосылок сразу, обе установлены один раз для hands/worker (#83, PR
 #93/#94) и обе были пропущены, когда #838 завёл ТОТ ЖЕ вызов
-(`dsh_mount_anthropic_oauth_pool`) в третьем файле (scripts/review/ai_dsh.sh):
+(`dsh_mount_anthropic_pool`) в третьем файле (scripts/review/ai_dsh.sh):
 
 1. `pnpm` на PATH workflow'а (`pnpm/action-setup@v6`) — без него
    `dsh: pnpm not found on PATH`.
@@ -15,8 +15,11 @@
 34399331120, 2026-09-09T20:10:15Z) — тот же класс, вторая недостающая
 половина, закрыта здесь же.
 
-Правило этой гвардии: КАЖДЫЙ скрипт из SCRIPT_TO_WORKFLOW, упоминающий
-`dsh_mount_anthropic_oauth_pool` (или монтаж combo-suite,
+Правило этой гвардии: КАЖДЫЙ скрипт из SCRIPT_TO_WORKFLOW, зовущий (кодом,
+не комментарием — находка ревью #862: маркер `dsh_mount_anthropic_oauth_pool`
+не совпадал с реальным именем `dsh_mount_anthropic_pool`, и worker/hands
+матчились лишь строками комментариев/ошибок)
+`dsh_mount_anthropic_pool` (или монтаж combo-suite,
 `dsh_ensure_plugins_suite`/`dsh plugin add` — тот же класс), обязан нести
 И `npm_config_ignore_workspace_root_check=true` сам, И вызываться из
 workflow, несущего `pnpm/action-setup`. Не заменяет живой прогон (сетевые
@@ -33,9 +36,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
 # Скрипт -> маркер, что он ЗОВЁТ dsh plugin add (прямо или через
-# dsh_mount_anthropic_oauth_pool/dsh_ensure_plugins_suite в dsh-ci.sh).
+# dsh_mount_anthropic_pool/dsh_ensure_plugins_suite в dsh-ci.sh). Имена —
+# реальные функции dsh-ci.sh; был вписан несуществующий
+# `dsh_mount_anthropic_oauth_pool`, и ветка никогда не матчила (находка
+# ревью #862).
 PLUGIN_MOUNT_MARKER_RE = re.compile(
-    r"dsh_mount_anthropic_oauth_pool|dsh_ensure_plugins_suite|dsh plugin add"
+    r"dsh_install_anthropic_pool|dsh_import_anthropic_accounts"
+    r"|dsh_mount_anthropic_pool|dsh_ensure_plugins_suite|dsh plugin add"
 )
 
 # scripts/**.sh, которые ЗАПУСКАЮТ dsh headless (и потому МОГУТ дойти до
@@ -56,7 +63,13 @@ def _script_calls_plugin_mount(script: Path) -> bool:
     if not script.exists():
         return False
     text = script.read_text(encoding="utf-8")
-    return bool(PLUGIN_MOUNT_MARKER_RE.search(text))
+    # Комментарий — не вызов: поясняющий блок ОБЯЗАН называть механизм,
+    # который не используется (#860: ai_dsh.sh объясняет ОТСУТСТВИЕ монтажа
+    # пула, и по такому комментарию гвардия снова требовала бы pnpm/action-setup
+    # в ai-review.yml). Хвост от # вырезается до матчинга — та же эвристика
+    # sed 's/#.*$//', что в dsh-anthropic-pool.guard.sh секции 6; целевые
+    # вызовы стоят на отдельных строках, эвристика им ничего не прячет.
+    return bool(PLUGIN_MOUNT_MARKER_RE.search(re.sub(r"(?m)#.*$", "", text)))
 
 
 def test_workflow_actually_runs_its_mapped_script():
