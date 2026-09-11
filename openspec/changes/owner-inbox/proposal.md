@@ -6,7 +6,7 @@
 
 > **Пункт 3 «Директива → issue» ниже (и пункт 34 базовой спеки
 > `journal-tasks-hands.md`, под `GH_ISSUES_TOKEN`) устарел.** Актуальное
-> поведение — `openspec/changes/inbox-native-issue-dispatch/` (ADR 0015,
+> поведение — `openspec/changes/archive/inbox-native-issue-dispatch/` (ADR 0015,
 > заменяет ADR 0011 из этого предложения): issue создаёт
 > `repository_dispatch` в отдельный job под уже существующим
 > `GH_DISPATCH_TOKEN`, без нового секрета. Остальные пункты (30–33, 35–37) —

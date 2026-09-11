@@ -7,7 +7,7 @@
   решение), [задача #20](https://github.com/mytab0r/edge-harness/issues/20),
   `docs/research/21-github-actions.md` («Успешный HTTP-код здесь не является
   доказательством запуска»), спека `openspec/specs/journal-tasks-hands.md`
-  (п. 34), `openspec/changes/inbox-native-issue-dispatch/`
+  (п. 34), `openspec/changes/archive/inbox-native-issue-dispatch/`
 
 ## Контекст
 
