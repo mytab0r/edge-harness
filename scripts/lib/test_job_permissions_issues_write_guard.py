@@ -39,6 +39,14 @@ test_dispatch_token_usage.py: новый источник, способный п
 Мутация: убрать `issues: write` из permissions job'а `verdict` в
 ai-review.yml — тест краснеет с именем этого job'а в сообщении.
 
+Дельта 2026-09-11 (#939, мандат владельца): `ai_review.py verdict` убран из
+ESCALATION_ENTRY_PATTERNS — apply_large_ok больше не эскалирует гигантский
+дифф в WATCHDOG_ISSUE (huge_diff_size_gate передал решение о размере
+модели, не владельцу, #204 п.«escalate»/#901 отменены), job `verdict`
+ai-review.yml больше не пишет ни в один НАСТОЯЩИЙ Issue и `issues: write`
+из его permissions снят той же правкой — живой случай #884 остаётся
+документированным здесь, но перестал быть текущим состоянием кода.
+
 Запуск: python -m pytest scripts/lib/test_job_permissions_issues_write_guard.py -q
 """
 
@@ -53,8 +61,11 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 # \b работает и на "_" (word-char) — "test_scheduler.py"/"test_pulse_guard.py"
 # (гвардийные же вызовы pytest, не сама эскалация) НЕ матчатся, потому что
 # перед именем стоит "_", а не граница слова.
+#
+# ai_review.py verdict исключён отсюда #939 (2026-09-11): apply_large_ok
+# больше не вызывает pulse_guard.escalate(WATCHDOG_ISSUE) — единственный
+# путь, ради которого этот паттерн был здесь (см. докстринг выше).
 ESCALATION_ENTRY_PATTERNS = (
-    re.compile(r"ai_review\.py\s+verdict"),   # apply_large_ok -> pulse_guard.escalate(WATCHDOG_ISSUE)
     re.compile(r"\bpulse_guard\.py\b"),        # прямой запуск модуля предохранителя
     re.compile(r"\bscheduler\.py\b"),          # оркестратор — эскалации через pulse_guard.escalate
     re.compile(r"scripts/gh/issue-create\b"),  # создание задач напрямую в Issues API
@@ -107,19 +118,24 @@ def test_jobs_that_escalate_to_issues_keep_issues_write_in_own_permissions():
     )
 
 
-def test_ai_review_verdict_job_is_the_documented_live_case():
-    """Живой случай (#884) обязан быть виден этой гвардии без вспомогательных
-    условий — если ai-review.yml перестанет матчить маркер/токен, проверка
-    выше может замолчать по неверной причине (не «фикс держится», а «условие
-    матчинга сломалось»). Позитивный тест ловит именно это расхождение."""
+def test_ai_review_verdict_job_no_longer_escalates_to_issues():
+    """#939 (2026-09-11): исходный живой случай #884 (ai-review.yml::verdict)
+    закрыт по существу, не просто выведен из-под гвардии — apply_large_ok
+    больше не пишет ни в один НАСТОЯЩИЙ Issue (huge_diff_size_gate заменил
+    эскалацию владельцу суждением модели), поэтому ни один ESCALATION_ENTRY_
+    PATTERNS не обязан матчить этот job, а issues: write в его permissions —
+    не требуется. Если это перестанет быть так (кто-то вернёт эскалацию в
+    Issues API), test_jobs_that_escalate_to_issues_keep_issues_write_in_own_
+    permissions выше поймает пропавшую issues: write."""
     doc = yaml.safe_load((WORKFLOWS_DIR / "ai-review.yml").read_text(encoding="utf-8"))
     verdict_job = doc["jobs"]["verdict"]
     text = _job_text(verdict_job)
-    assert any(p.search(text) for p in ESCALATION_ENTRY_PATTERNS), (
-        "ai-review.yml::verdict больше не матчит ни один ESCALATION_ENTRY_PATTERNS — "
-        "гвардия перестала видеть исходный живой случай #884"
+    assert not any(p.search(text) for p in ESCALATION_ENTRY_PATTERNS), (
+        "ai-review.yml::verdict снова матчит ESCALATION_ENTRY_PATTERNS — если "
+        "эскалация в Issues API вернулась, permissions обязаны нести "
+        "issues: write (см. тест выше)"
     )
-    assert any(marker in text for marker in GITHUB_TOKEN_MARKERS)
-    assert verdict_job["permissions"]["issues"] == "write", (
-        "ai-review.yml::verdict потерял issues: write — регресс #884"
+    assert verdict_job["permissions"].get("issues") != "write", (
+        "issues: write в ai-review.yml::verdict больше не нужен (#939) — "
+        "мёртвая привилегия, оставленная после удаления эскалации"
     )

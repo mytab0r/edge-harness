@@ -2967,6 +2967,81 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
     return observations, actions
 
 
+# ── Разблокировка уже застрявших ai:ok+review:large без large-ok (#939) ──────
+#
+# Мандат владельца 2026-09-11: эскалация владельцу по причине размера
+# (review:large сверх check_pr.LARGE_DIFF_HUGE_LINES, старое поведение
+# large_ok_decision.'escalate', #204/#901) убрана из ai_review.py целиком —
+# huge_diff_size_gate теперь читает ОТДЕЛЬНОЕ суждение модели о размере из
+# КАЖДОГО НОВОГО вердикта. Но у PR, получивших ai:ok ДО этой правки (живые
+# случаи — #870 +2472, #408 +3548), вердикт уже вынесен: should_run_ai_review
+# не назначит новый прогон, пока дифф PR не изменится (issue #901,
+# «нового вердикта не будет, пока не сдвинется голова PR») — фикс политики
+# сам по себе НЕ разблокирует уже стоящие PR, это отдельный, известный класс
+# тормоза без газа (AGENTS.md).
+#
+# Газ — тот же путь, что уже даёт владельцу ai-review.yml для пересмотра
+# НЕИЗМЕНИВШЕГОСЯ диффа (#294, workflow_dispatch с input force: true,
+# cmd_should_run обходит сверку отпечатка): пульс форсирует ОДИН такой
+# прогон на каждый застрявший PR — свежий ответ модели пройдёт через уже
+# исправленный huge_diff_size_gate и либо получит review:large-ok, либо
+# станет rework/error с конкретной причиной, тем же путём, что и любой
+# новый PR. Идемпотентность — маркер-комментарий в самом PR (тот же приём,
+# что AI_REVIEW_RETRY_MARKER выше): один форс-прогон на PR, не бесконечный
+# повтор, если модель не даст суждения о размере во второй раз тоже (тогда
+# huge_diff_size_gate уже отправит его в ai:failed — тот дальше идёт по
+# обычному циклу автоповтора #196/trigger_ai_review, второй копии здесь не
+# заводим).
+STUCK_LARGE_OK_MARKER = "[авто-пересмотр размера #939]"
+
+
+def stuck_large_ok_pulls(repo: str, pulls: list[dict]) -> tuple[list[str], list[str]]:
+    """PR с ai:ok + review:large, но БЕЗ review:large-ok — суждения о размере
+    ещё не было (вердикт вынесен до #939) — получают ОДИН форсированный
+    прогон ai-review.yml. Возвращает (наблюдения, действия), тот же формат,
+    что и остальные поведения #196 в этом файле."""
+    observations: list[str] = []
+    actions: list[str] = []
+    for pull in pulls:
+        labels = {label["name"] for label in pull["labels"]}
+        if review_labels.AI_OK not in labels or review_labels.REVIEW_LARGE not in labels:
+            continue
+        if review_labels.LARGE_OK in labels:
+            continue
+        marker = f"{STUCK_LARGE_OK_MARKER} #{pull['number']}"
+        already = issue_marker_times(repo, pull["number"], marker)
+        if already:
+            observations.append(
+                f"⏸️ PR #{pull['number']}: авто-пересмотр размера уже запущен, жду свежий вердикт"
+            )
+            continue
+        active = review_labels.other_active_ai_review_runs(
+            repo, pull["number"], exclude_run_id=None, gh_func=gh)
+        if active:
+            observations.append(
+                f"⏳ PR #{pull['number']}: ai-review.yml уже летит — авто-пересмотр размера подождёт"
+            )
+            continue
+        gh(
+            "-X", "POST", f"repos/{repo}/actions/workflows/ai-review.yml/dispatches",
+            "-f", "ref=main", "-f", f"inputs[pr]={pull['number']}", "-f", "inputs[force]=true",
+        )
+        post_issue_comment(
+            repo, pull["number"],
+            f"🤖 {marker} Оркестратор форсирует пересмотр ai-review.yml: вердикт "
+            "ai:ok получен до правки политики размера (#939) — модель тогда не "
+            "судила объём диффа явно, старый ai:ok сам по себе больше не "
+            "подтверждает размер. Новый прогон пройдёт через huge_diff_size_gate "
+            "и поставит review:large-ok, если объём оправдан, либо rework/"
+            "ai:failed с причиной, как у любого нового PR — решения владельца "
+            "не требуется.",
+        )
+        actions.append(
+            f"🤖 PR #{pull['number']}: авто-пересмотр размера запущен (ai:ok без large-ok, #939)"
+        )
+    return observations, actions
+
+
 # ── #196, поведение 2: нездоровый PR — вернуть задачу в пул ──────────────────────
 # Красный обязательный чек ИЛИ ai:changes-requested дольше UNHEALTHY_PR_AFTER_MINUTES
 # (отсчёт — updated_at PR: в отличие от review:ok, здесь нет перелейбловки на
@@ -4218,6 +4293,10 @@ def main() -> int:
     # подтянул за свой цикл, снимок обновлён ВНУТРИ самой функции — второй
     # HTTP-вызов open_pulls(repo) здесь не нужен, closed-номера уже отфильтрованы.
     ai_observations, ai_actions = trigger_ai_review(repo, now, pulls)
+    # Разблокировка уже стоящих ai:ok+review:large без large-ok (#939) — тот
+    # же снимок pulls, независимый триггер (не бюджет автоповторов #196:
+    # у этих PR вердикт УЖЕ есть, обычный trigger_ai_review их не видит вовсе).
+    stuck_large_ok_observations, stuck_large_ok_actions = stuck_large_ok_pulls(repo, pulls)
     # Инвариант issue #269: готовый PR, который так и не слился, кричит — тот же
     # снимок, что уже обслужил trigger_ai_review выше (#443: раньше здесь был
     # ЕЩЁ один открытый open_pulls(repo), хотя между двумя вызовами ничто не
@@ -4287,14 +4366,15 @@ def main() -> int:
         worker_observations, worker_actions = [], []
 
     observations = (
-        lease_observations + merge_observations + ai_observations
+        lease_observations + merge_observations + ai_observations + stuck_large_ok_observations
         + accept_observations + conveyor_observations + conflict_rework_observations
         + wip_observations + worker_observations + failure_watch_observations
         + stalled_observations
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
-        + merge_actions + ai_actions + stale_ready_lines + reopen_lines + accept_actions
+        + merge_actions + ai_actions + stuck_large_ok_actions + stale_ready_lines + reopen_lines
+        + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
         + wip_actions + worker_actions + failure_watch_actions + stalled_actions
     )
