@@ -18,14 +18,19 @@ import assert from 'node:assert/strict';
 
 // Пины фикстур: sha512 скачанных tarball'ов; расхождение — красный тест
 // (подмена или перезапись релиза), не тихое чтение чужого кода.
+// Версии сверены с package.json (dependencies) — issue #806/#507: пин фикстуры
+// обязан идти следом за реальной версией, которую резолвит рантайм (пин
+// dsh-edge/upstream.json), иначе тест зелёный на API, которого в проде уже
+// нет (ровно так «settings namespace … is not registered» тихо проглотило
+// бы регресс ctx.settings.installSection — метода нет в 0.1.1-rc.2).
 const FIXTURES = [
-  ['@deepseek-ai/cordis', '4.0.1', 'sha512-YBdskTU2Po1kru3GgcUWUbkTsPMA9LkSQDAY8rBkFJeajdgcQad3QPJZE26JyK99Xb6HaASvoXg2DSUTeN/0Nw=='],
-  ['@deepseek-ai/dsh-llm', '0.1.1-rc.2', 'sha512-ASJfjIdZbIXvLwi3rGo+eZb/GxMVV/WO5/XVD3B96mT8EIzrlw3+nMR6/CvmJVzcycKQ2XN0wj7jD6TasPRySA=='],
-  ['@deepseek-ai/dsh-llm-deepseek', '0.1.1-rc.2', 'sha512-GH9AukC2kozv6Q8/9DDhACHSe7fpTG7o0iWGUEN/m7/qajCJ8abySOFi3N7otdVmolR6Mvz2GZDTn2HdHqkWWg=='],
-  ['@deepseek-ai/dsh-settings', '0.1.1-rc.2', 'sha512-iGdKEt91Im3gE7xA9CzRfTJsPcFcxDeDOCLhAjzbpjEv7TAjx/EoYP7lPtiy+QmOjKSKy206SEtAKol9PXWbOw=='],
-  ['@deepseek-ai/dsh-credentials', '0.1.1-rc.2', 'sha512-aeVBaH07rox7NuSNbSqbz8g0eNb2IIhNbrZngj/VxUsr/TR9TXOq7lm1CL6SBUDlstGw3vNWeXyhim/DmA5iSQ=='],
-  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.1-rc.2', 'sha512-ZQBsDhI0VuFwoDnq75VT2gPJdMPmBYfWM3EBDmUkwHM0E2dmyr+iLGXxp33a7M64r79x7kN+81KOTEL5LS0E8A=='],
-  ['@deepseek-ai/schemastery', '3.18.1', 'sha512-Qn0FCSwCQnpnj6SB31I6i2sIKgKWnkbJM8O0EU91Gv2UsYVvtZTl6IA0sCwk2e2MZf5S8w5hpq9QkeVvK9qwxg=='],
+  ['@deepseek-ai/cordis', '4.0.2', 'sha512-asOnXP1TzFSFQlHb1iegDZp0z/8WD1c7YNrwJR/Tx2bzNuMXfcekE/I67Iv6SQXeLB4csxqCngzQKANP7gdw0g=='],
+  ['@deepseek-ai/dsh-llm', '0.1.2-rc.1', 'sha512-7VYsha5AXsVLnsAwYJffWXz9bwUbElw8i5N8tlTSdai9Bupk3sMbsotzPf8ZbsuGAxQYErahMwQwgGEu4qZO6g=='],
+  ['@deepseek-ai/dsh-llm-deepseek', '0.1.2-rc.1', 'sha512-FWt7UZ6l0XN2IFIBYVPJUQkFI0knmA3kZiNIhsdQCjJT5zGe1ZzH1EqqpO5Rzc6THIox58VkvLIllU6Mns4dIQ=='],
+  ['@deepseek-ai/dsh-settings', '0.1.2-rc.1', 'sha512-wMmJ2w5S6I7hgmgPppuAVemltEcTmAa8gvii7fk4T2KGVCuBYgig8xPwQ8Lp2ukLZSzzE6ZVCQxhdYZyJX/USA=='],
+  ['@deepseek-ai/dsh-credentials', '0.1.2-rc.1', 'sha512-e7DGpuYQqiD4dOWGQeY/XAWPTjbax/MkrXBwsB8wBtNpoPiAKiLYgd+iFiQc66BGOlutSRFz31IKdbduqPbTxA=='],
+  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.2-rc.1', 'sha512-8skUsMXiGnyKJi+AiRjGoXIl8inJHgeHgoruW8pjPpWN6g3qJSbO8U9JRZtvwymtjJsQuHmKPI28jc4H6jOCOQ=='],
+  ['@deepseek-ai/schemastery', '3.18.2', 'sha512-njDtZsznjYxok7KLLlHOPyuv2efdWVbSflAHgztSfbMsg+CVraEoRe2DjOCgClYv3ZCSm7WXoaUkbB/+RY7tWQ=='],
 ];
 
 const fixtureRoot = join(

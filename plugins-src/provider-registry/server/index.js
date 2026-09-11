@@ -16,20 +16,37 @@
  *    (DO storage, env-фолбэк), значения ключей через namespace не проходят.
  *
  * Контракт cordis-плагина — как у runner-bridge (inject + apply); контракт
- * чтения настроек — как у апстримного dsh-llm-deepseek: installSettingsSection
- * ставит источник-Thunk, каждое изменение раздела перестраивает набор
- * маршрутов (handle.replace / dispose), отказ одного маршрута не мешает
+ * чтения настроек — источник-Thunk, каждое изменение раздела перестраивает
+ * набор маршрутов (handle.replace / dispose), отказ одного маршрута не мешает
  * остальным и не роняет DO (прецедент изоляции патча 0002).
+ *
+ * Установка раздела — issue #806/#507: у апстримного @deepseek-ai/dsh-settings
+ * свободная функция `installSettingsSection(ctx, ns, …)` существовала только
+ * до 0.1.1-rc.2 включительно; в 0.1.2-rc.1 (пин dsh-edge/upstream.json после
+ * #505) она снята из экспортов пакета целиком (сверено скачанным npm-тарболлом
+ * @deepseek-ai/dsh-settings@0.1.2-rc.1, lib/index.js — экспортирует только
+ * SettingsConflictError/SettingsProvider/redactSecrets), а её тело переехало
+ * методом на сам сервис — `ctx.settings.installSection(owner, ns, schema,
+ * entry, hooks)` (тот же README, раздел «Registering a namespace»: «ctx.
+ * settings.installSection(owner, ns, schema, entry, hooks) packages the
+ * optional-service wiring for a consumer plugin»). Сигнатура и порядок
+ * аргументов не изменились — только вызов через `ctx.inject(['settings'],
+ * sctx => sctx.settings.installSection(...))` вместо свободной функции,
+ * которая раньше делала этот `ctx.inject` сама. `settingsNamespace()` был
+ * идентити-валидатором формы (throw при несовпадении с шаблоном, иначе
+ * возврат значения как есть, lib/index.js@0.1.1-rc.2) — README 0.1.2-rc.1
+ * подтверждает ту же валидацию строкового namespace внутри register/
+ * installSection, отдельного экспорта под неё в 0.1.2-rc.1 нет — литерал
+ * ниже уже соответствует шаблону, обёртка не нужна.
  */
 
 import z from '@deepseek-ai/schemastery'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
 import { LlmError, assertUsableApiKey } from '@deepseek-ai/dsh-llm'
 import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 
-const PLUGIN_VERSION = '0.1.1'
-const NS = settingsNamespace('llm-pi-ai')
+const PLUGIN_VERSION = '0.1.2'
+const NS = 'llm-pi-ai'
 /** Маршрут штатного провайдера морды (session-store.ts): в реестре запрещён. */
 const EDGE_PROVIDER = 'deepseek-official'
 /**
@@ -322,12 +339,18 @@ export default {
       }
     }
 
-    installSettingsSection(ctx, NS, Config, { providers: {} }, {
-      validate: assertServiceable,
-      setSource: (source) => {
-        section = source
-      },
-      onChange: sync,
+    // ctx.inject(['settings'], …) — тот же optional-inject, что раньше делала
+    // сама свободная функция installSettingsSection (0.1.1-rc.2); в 0.1.2-rc.1
+    // вызывающий обязан сделать его сам, вызывая installSection методом
+    // сервиса (см. комментарий в начале файла, issue #806/#507).
+    ctx.inject(['settings'], (sctx) => {
+      sctx.settings.installSection(ctx, NS, Config, { providers: {} }, {
+        validate: assertServiceable,
+        setSource: (source) => {
+          section = source
+        },
+        onChange: sync,
+      })
     })
 
     console.info(`edge-plugin:provider-registry installed v${PLUGIN_VERSION} (namespace ${NS})`)

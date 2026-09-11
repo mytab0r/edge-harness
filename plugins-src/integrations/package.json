@@ -18,7 +18,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
   },
   "files": [
     "server/index.js",
