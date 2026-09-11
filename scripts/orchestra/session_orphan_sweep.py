@@ -32,7 +32,13 @@ scheduler.py вне рамок этой задачи). Место будущег
 `session_id_of` пробует `item["sessionId"]`, затем `item["id"]` (тот же
 именной приём, что несёт каждый ДРУГОЙ session.*-метод этого API) — элемент
 без ни одного из двух пропускается с явным предупреждением в отчёте, не
-гадаем и не падаем всем прогоном.
+гадаем и не падаем всем прогоном. Там же — второе непроверенное допущение,
+честно названное (находка ревью PR #944): `fetch_session_list` читает
+ОДНУ страницу `session.list` — контракт пагинации этого метода (есть ли
+курсор/hasMore в ответе, как у `session.history` `beforeSeq`) неизвестен,
+листать «вслепую» не на чем; хвост списка длиннее страницы терялся бы
+молча, поэтому ограничение названо и в докстринге, и в каждой строке
+отчёта прогона — до проверки живым прогоном это пробел, а не факт.
 
 Счётчик (видимость роста сирот, #940 п.2): каждый прогон печатает (сколько
 сессий `harness-*` увидел `session.list`, сколько распознано как сироты,
@@ -169,22 +175,29 @@ def classify_sessions(session_items: list[dict], issue_state) -> dict:
 
 
 def fetch_session_list(opener: urllib.request.OpenerDirector) -> list[dict]:
+    """Первая (и, насколько известно, единственная) страница `session.list`.
+    Контракт пагинации метода НЕ ПОДТВЕРЖДЁН (см. докстринг модуля и
+    docs/research/12) — хвост длиннее страницы был бы потерян молча, поэтому
+    ограничение напечатано в отчёте каждого прогона, а не спрятано здесь."""
     value = _morde_rpc(opener, "session.list", {})
     return value.get("items", []) if isinstance(value, dict) else []
 
 
 def archive_session(opener: urllib.request.OpenerDirector, session_id: str) -> tuple[bool, str]:
-    """(успех, сообщение). `session-not-found`/`already`-подобные отказы —
-    мягкий успех (сессия уже не активна, ровно то, чего мы добивались), тот
-    же приём, что archive_runner_sessions трактует `session-not-found`."""
+    """(успех, сообщение). Мягкий успех — ТОЛЬКО наблюдённый и
+    задокументированный код `session-not-found` (docs/research/12:64,
+    живой вызов 2026-08-31; тот же единственный код трактует
+    `archive_runner_sessions` в scheduler.py): сессия уже не активна —
+    ровно то, чего мы добивались. Любой другой отказ — отказ (находка
+    ревью PR #944: обобщённая подстрока "already" выдавала любую поломку
+    со словом «already» в тексте за успех и обнуляла счётчик ошибок)."""
     try:
         _morde_rpc(opener, "workspace.archiveSession", {"sessionId": session_id})
         return True, "заархивирована"
     except RuntimeError as error:
-        text = str(error)
-        if "session-not-found" in text or "already" in text.lower():
-            return True, f"уже не активна ({text})"
-        return False, text
+        if "session-not-found" in str(error):
+            return True, f"уже не активна ({error})"
+        return False, str(error)
 
 
 def run_sweep(dry_run: bool = False) -> int:
@@ -214,7 +227,8 @@ def run_sweep(dry_run: bool = False) -> int:
         return 1
 
     stats = classify_sessions(items, issue_state)
-    print(f"session.list: {stats['total_items']} элементов, "
+    print(f"session.list (первая страница — пагинация метода НЕ ПОДТВЕРЖДЕНА, "
+          f"см. докстринг): {stats['total_items']} элементов, "
           f"{stats['total_items'] - stats['unparseable'] - stats['not_harness']} узнано как harness-*, "
           f"{stats['unparseable']} нечитаемой формы (см. «НЕ ПОДТВЕРЖДЕНО» в докстринге), "
           f"{len(stats['orphans'])} сирот (задача закрыта)")

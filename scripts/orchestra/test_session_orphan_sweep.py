@@ -14,6 +14,10 @@ scripts/worker/task.sh:472/478, не наш пересказ). Логин/RPC �
     `test_non_harness_session_is_ignored` красный.
   - в `archive_session` убрать ветку "session-not-found считается успехом" —
     `test_archive_session_treats_not_found_as_soft_success` красный.
+  - в `archive_session` вернуть обобщённую подстроку "already" как признак
+    успеха (находка ревью PR #944: мягкий успех маскировал поломку) —
+    `test_archive_session_failure_containing_word_already_is_hard_failure`
+    красный: поломка с "already" в тексте снова считается успехом.
 
 Запуск: python -m pytest scripts/orchestra/test_session_orphan_sweep.py -q
 """
@@ -108,6 +112,19 @@ def test_archive_session_treats_not_found_as_soft_success(monkeypatch):
     ok, message = sweep.archive_session(object(), "harness-1")
     assert ok is True
     assert "не активна" in message
+
+
+def test_archive_session_failure_containing_word_already_is_hard_failure(monkeypatch):
+    # Находка ревью PR #944: мягкий успех по подстроке "already" маскировал
+    # поломку — любой отказ, кроме точного кода session-not-found, обязан
+    # остаться отказом, даже если текст содержит слово "already".
+    def fake_rpc(opener, method, payload):
+        raise RuntimeError("internal-error: session already locked by another operation")
+
+    monkeypatch.setattr(sweep, "_morde_rpc", fake_rpc)
+    ok, message = sweep.archive_session(object(), "harness-1")
+    assert ok is False
+    assert "internal-error" in message
 
 
 def test_archive_session_hard_failure_is_reported(monkeypatch):

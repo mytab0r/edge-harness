@@ -37,7 +37,11 @@
 
 Fail loud: не удалось определить безопасность (сеть недоступна для gh pr
 list, `git rev-parse` не резолвится) — ref остаётся, скрипт печатает причину,
-не гадает.
+не гадает. То же для Самих git-листингов (находка ревью PR #944, второй
+раунд): отказ `git branch`/`git worktree list`/`for-each-ref` — сбой
+инструмента, а не пустой список — GitListingError, причина в stderr,
+код выхода 1, ничего не удалено; молчаливая пустота печатала бы
+«Итого: веток 0 …» с кодом 0, отдавая сбой тем же сигналом, что успех.
 
 Запуск (только вручную, на машине разработчика — не часть CI, эти refs в
 свежем чекауте CI не существуют): `python scripts/git/local-refs-cleanup.py
@@ -67,25 +71,39 @@ _MBC_SPEC.loader.exec_module(merged_branch_cleanup)  # type: ignore[union-attr]
 LOCK_REF_MESSAGE_RE = re.compile(r"^lock: task #\d+ claimed by ")
 
 
+class GitListingError(RuntimeError):
+    """Отказ git-листинга (rc != 0) — сбой инструмента, не пустой список
+    (см. «Fail loud» в докстринге модуля)."""
+
+
 def run_cmd(args: list[str], cwd: Optional[str] = None) -> tuple[str, int]:
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
     return result.stdout.strip(), result.returncode
+
+
+def git_listing(args: list[str], cwd: str) -> str:
+    """git-листинг для КЛАССИФИКАЦИИ (что вообще существует): rc != 0 —
+    GitListingError с командой и stderr; пустой вывод при rc == 0 — честный
+    пустой список. Точечные git-пробы («жив ли origin/<branch>», «предок ли
+    main») остаются на run_cmd: там НЕудачный rc — содержательный ответ
+    («объекта нет»), а не сбой листинга."""
+    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+    if result.returncode != 0:
+        raise GitListingError(
+            f"git {' '.join(args)}: rc={result.returncode}: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 # ── 1. Локальные ветки agent/*, чей PR уже смёржен/закрыт ────────────────────
 
 
 def local_agent_branches(repo_root: str) -> list[str]:
-    out, rc = run_cmd(["git", "branch", "--list", "agent/*", "--format=%(refname:short)"], cwd=repo_root)
-    if rc != 0:
-        return []
+    out = git_listing(["git", "branch", "--list", "agent/*", "--format=%(refname:short)"], cwd=repo_root)
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def worktree_checked_out_branches(repo_root: str) -> set[str]:
-    out, rc = run_cmd(["git", "worktree", "list", "--porcelain"], cwd=repo_root)
-    if rc != 0:
-        return set()
+    out = git_listing(["git", "worktree", "list", "--porcelain"], cwd=repo_root)
     branches = set()
     for line in out.splitlines():
         if line.startswith("branch refs/heads/"):
@@ -119,9 +137,7 @@ def delete_local_branch(repo_root: str, branch: str) -> bool:
 
 def local_pr_cache_refs(repo_root: str) -> dict[int, str]:
     """{номер PR: sha} по refs/remotes/pr/<N>."""
-    out, rc = run_cmd(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/pr/"], cwd=repo_root)
-    if rc != 0:
-        return {}
+    out = git_listing(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/pr/"], cwd=repo_root)
     result = {}
     for line in out.splitlines():
         line = line.strip()
@@ -179,9 +195,7 @@ def delete_pr_cache_ref(repo_root: str, number: int) -> bool:
 
 
 def tmp_lock_refs(repo_root: str) -> list[str]:
-    out, rc = run_cmd(["git", "for-each-ref", "--format=%(refname)", "refs/tmp/"], cwd=repo_root)
-    if rc != 0:
-        return []
+    out = git_listing(["git", "for-each-ref", "--format=%(refname)", "refs/tmp/"], cwd=repo_root)
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
@@ -218,52 +232,59 @@ def main() -> int:
 
     removed = {"branches": 0, "pr_refs": 0, "tmp_refs": 0}
 
-    # 1. Локальные ветки agent/*
-    if pr_status_ok:
-        checked_out = worktree_checked_out_branches(repo_root)
-        local_branches = [b for b in local_agent_branches(repo_root) if b not in checked_out]
-        import datetime
-        now = datetime.datetime.now(datetime.timezone.utc)
-        deletable, _kept = merged_branch_cleanup.branch_deletion_candidates(local_branches, pr_records, now)
-        for branch in deletable:
-            if not branch_content_is_preserved(repo_root, branch):
-                print(f"ОСТАВЛЕНА {branch}: содержимое не доказано сохранённым нигде ещё")
+    try:
+        # 1. Локальные ветки agent/*
+        if pr_status_ok:
+            checked_out = worktree_checked_out_branches(repo_root)
+            local_branches = [b for b in local_agent_branches(repo_root) if b not in checked_out]
+            import datetime
+            now = datetime.datetime.now(datetime.timezone.utc)
+            deletable, _kept = merged_branch_cleanup.branch_deletion_candidates(local_branches, pr_records, now)
+            for branch in deletable:
+                if not branch_content_is_preserved(repo_root, branch):
+                    print(f"ОСТАВЛЕНА {branch}: содержимое не доказано сохранённым нигде ещё")
+                    continue
+                if args.dry_run:
+                    print(f"DRY-RUN: удалил бы локальную ветку {branch}")
+                    removed["branches"] += 1
+                    continue
+                if delete_local_branch(repo_root, branch):
+                    print(f"Удалена локальная ветка: {branch}")
+                    removed["branches"] += 1
+                else:
+                    print(f"ОШИБКА: не удалось удалить ветку {branch}", file=sys.stderr)
+
+            # 2. Кэш-ссылки ревью refs/remotes/pr/<N>
+            pr_status_by_number = {p["number"]: p["state"] for p in pr_records if "number" in p}
+            pr_cache = local_pr_cache_refs(repo_root)
+            deletable_pr_refs, _kept_pr = pr_cache_refs_to_prune(repo_root, pr_cache, pr_status_by_number)
+            for number in deletable_pr_refs:
+                if args.dry_run:
+                    print(f"DRY-RUN: удалил бы refs/remotes/pr/{number}")
+                    removed["pr_refs"] += 1
+                    continue
+                if delete_pr_cache_ref(repo_root, number):
+                    print(f"Удалена refs/remotes/pr/{number}")
+                    removed["pr_refs"] += 1
+
+        # 3. refs/tmp/* — только опознанные lock-огрызки
+        for ref in tmp_lock_refs(repo_root):
+            if not is_stray_lock_ref(repo_root, ref):
+                print(f"ОСТАВЛЕН {ref}: не опознан как lock-огрызок claim_task.py — не трогаем")
                 continue
             if args.dry_run:
-                print(f"DRY-RUN: удалил бы локальную ветку {branch}")
-                removed["branches"] += 1
+                print(f"DRY-RUN: удалил бы {ref}")
+                removed["tmp_refs"] += 1
                 continue
-            if delete_local_branch(repo_root, branch):
-                print(f"Удалена локальная ветка: {branch}")
-                removed["branches"] += 1
-            else:
-                print(f"ОШИБКА: не удалось удалить ветку {branch}", file=sys.stderr)
-
-        # 2. Кэш-ссылки ревью refs/remotes/pr/<N>
-        pr_status_by_number = {p["number"]: p["state"] for p in pr_records if "number" in p}
-        pr_cache = local_pr_cache_refs(repo_root)
-        deletable_pr_refs, _kept_pr = pr_cache_refs_to_prune(repo_root, pr_cache, pr_status_by_number)
-        for number in deletable_pr_refs:
-            if args.dry_run:
-                print(f"DRY-RUN: удалил бы refs/remotes/pr/{number}")
-                removed["pr_refs"] += 1
-                continue
-            if delete_pr_cache_ref(repo_root, number):
-                print(f"Удалена refs/remotes/pr/{number}")
-                removed["pr_refs"] += 1
-
-    # 3. refs/tmp/* — только опознанные lock-огрызки
-    for ref in tmp_lock_refs(repo_root):
-        if not is_stray_lock_ref(repo_root, ref):
-            print(f"ОСТАВЛЕН {ref}: не опознан как lock-огрызок claim_task.py — не трогаем")
-            continue
-        if args.dry_run:
-            print(f"DRY-RUN: удалил бы {ref}")
-            removed["tmp_refs"] += 1
-            continue
-        if delete_ref(repo_root, ref):
-            print(f"Удалён {ref}")
-            removed["tmp_refs"] += 1
+            if delete_ref(repo_root, ref):
+                print(f"Удалён {ref}")
+                removed["tmp_refs"] += 1
+    except GitListingError as error:
+        # Классификация невозможна — «Итого» с нулями было бы ложью (сбой,
+        # отданный сигналом успеха). Причина в stderr, код 1, ничего не удалено.
+        print(f"🚨 git-листинг не удался — классификация невозможна, ничего не удалено (fail loud): {error}",
+              file=sys.stderr)
+        return 1
 
     print(f"Итого: веток {removed['branches']}, pr-кэша {removed['pr_refs']}, tmp-огрызков {removed['tmp_refs']}")
     return 0

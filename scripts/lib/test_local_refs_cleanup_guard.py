@@ -20,13 +20,21 @@
   - в `is_stray_lock_ref` заменить `LOCK_REF_MESSAGE_RE.match(subject)` на
     `True` — `test_unrelated_tmp_ref_is_not_touched` красный: любой чужой
     `refs/tmp/*` начинает считаться lock-огрызком.
+  - в `git_listing`/листингах вернуть молчаливую пустоту при rc != 0
+    (находка ревью PR #944: сбой отдавался сигналом успеха) —
+    `test_git_listing_failure_raises_not_empty` и
+    `test_main_returns_1_when_git_listing_fails` красные: отказ листинга
+    снова пустой список и «Итого: 0» с кодом 0.
 
 Запуск: python -m pytest scripts/lib/test_local_refs_cleanup_guard.py -q
 """
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "git" / "local-refs-cleanup.py"
 _spec = importlib.util.spec_from_file_location("local_refs_cleanup", _SCRIPT_PATH)
@@ -161,6 +169,49 @@ def test_unrelated_tmp_ref_is_not_touched(tmp_path):
     sha = _git(work, "rev-parse", "HEAD").stdout.strip()
     _git(work, "update-ref", "refs/tmp/mystery", sha)
     assert lrc.is_stray_lock_ref(str(work), "refs/tmp/mystery") is False
+
+
+# ── Fail loud: отказ git-листинга — не пустой список ─────────────────────────
+
+
+def test_git_listing_failure_raises_not_empty(tmp_path):
+    # Настоящий git на НЕ-репозитории: rc != 0. Молчаливая пустота (прошлое
+    # поведение листингов) печатала бы «Итого: веток 0 …» и выходила 0.
+    with pytest.raises(lrc.GitListingError, match="not a git repository|rc=128"):
+        lrc.local_agent_branches(str(tmp_path))
+    with pytest.raises(lrc.GitListingError):
+        lrc.tmp_lock_refs(str(tmp_path))
+    with pytest.raises(lrc.GitListingError):
+        lrc.local_pr_cache_refs(str(tmp_path))
+    with pytest.raises(lrc.GitListingError):
+        lrc.worktree_checked_out_branches(str(tmp_path))
+
+
+def test_git_listing_success_with_empty_output_is_honest_empty(tmp_path):
+    # Пустой вывод при rc == 0 — честный пустой список, не сбой: git-репозиторий
+    # без refs/remotes/pr/* и без refs/tmp/*.
+    work = _setup_repo(tmp_path)
+    assert lrc.local_pr_cache_refs(str(work)) == {}
+    assert lrc.tmp_lock_refs(str(work)) == []
+    assert lrc.local_agent_branches(str(work)) == []
+
+
+def test_main_returns_1_when_git_listing_fails(tmp_path, monkeypatch, capsys):
+    # Сквозной контракт main(): отказ листинга — причина в stderr, код 1,
+    # БЕЗ обманчивого «Итого: веток 0 …».
+    work = _setup_repo(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["local-refs-cleanup.py", "--dry-run"])
+    monkeypatch.setattr(lrc.merged_branch_cleanup, "fetch_pr_records", lambda: [])
+    monkeypatch.setattr(
+        lrc, "tmp_lock_refs",
+        lambda root: (_ for _ in ()).throw(
+            lrc.GitListingError("git for-each-ref refs/tmp/: rc=128: fatal: сломан refdb")))
+    rc = lrc.main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "git for-each-ref refs/tmp/" in captured.err
+    assert "Итого" not in captured.out
+    assert "Итого" not in captured.err
 
 
 # ── Поведенческая проверка: удаление реально снимает ref ────────────────────
