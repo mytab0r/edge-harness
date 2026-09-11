@@ -1630,6 +1630,99 @@ def test_trigger_ai_review_mutation_without_gate1_decided_gate_would_fire_on_any
     assert fake.calls == []
 
 
+# ── Разблокировка застрявших ai:ok+review:large без large-ok (#939) ──────────
+# Прод-форма: #870 (+2472), #408 (+3548) — оба несут ai:ok + review:large без
+# review:large-ok, вердикт вынесен ДО правки политики размера.
+
+def test_stuck_large_ok_pulls_dispatches_forced_review(monkeypatch):
+    p = pull(870, labels=["review:large", "ai:ok"])
+    fake = FakeGh({
+        "issues/870/comments": [],  # маркер ещё не публиковался
+        "ai-review.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+
+    dispatch_calls = [c for c in fake.calls if "ai-review.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[pr]=870" in dispatch_calls[0]
+    assert "inputs[force]=true" in dispatch_calls[0]
+    assert any("870" in line for line in actions)
+    assert posted and posted[0][0] == 870
+    assert sch.STUCK_LARGE_OK_MARKER in posted[0][1]
+
+
+def test_stuck_large_ok_pulls_idempotent_second_pulse(monkeypatch):
+    # Маркер уже стоит — второй форс-прогон не заводится (не бесконечный
+    # автоповтор, ровно один шанс на пересмотр).
+    p = pull(408, labels=["review:large", "ai:ok"])
+    marker_comment = {
+        "created_at": "2026-09-11T09:00:00Z",
+        "body": f"🤖 {sch.STUCK_LARGE_OK_MARKER} #408 уже запущен",
+    }
+    fake = FakeGh({"issues/408/comments": [marker_comment]})
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("маркер уже стоит — второй пост не нужен"))
+
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+
+    assert not any("dispatches" in c for c in fake.calls)
+    assert actions == []
+    assert any("408" in line for line in observations)
+
+
+def test_stuck_large_ok_pulls_waits_when_run_already_active(monkeypatch):
+    p = pull(870, labels=["review:large", "ai:ok"])
+    running_title = sch.review_labels.ai_review_run_name(870)
+    fake = FakeGh({
+        "issues/870/comments": [],
+        "actions/workflows/ai-review.yml/runs": {
+            "workflow_runs": [{"id": 1, "display_title": running_title, "status": "in_progress"}],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("прогон уже летит — не дублируем"))
+
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+
+    assert not any("dispatches" in c for c in fake.calls)
+    assert actions == []
+    assert any("870" in line for line in observations)
+
+
+def test_stuck_large_ok_pulls_ignores_pr_already_carrying_large_ok(monkeypatch):
+    p = pull(159, labels=["review:large", "ai:ok", "review:large-ok"])
+    fake = FakeGh({})  # решение обязано быть принято ДО единого сетевого вызова
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+    assert (observations + actions) == []
+    assert fake.calls == []
+
+
+def test_stuck_large_ok_pulls_ignores_pr_without_review_large_label(monkeypatch):
+    # Обычный ai:ok на некрупном диффе — гейт размера тут ни при чём вовсе.
+    p = pull(200, labels=["review:ok", "ai:ok"])
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+    assert (observations + actions) == []
+    assert fake.calls == []
+
+
+def test_stuck_large_ok_pulls_ignores_pr_without_ai_ok(monkeypatch):
+    # review:large без ai:ok — обычный необслуженный/rework случай, не
+    # предмет этого механизма (у него ещё нет застрявшего вердикта).
+    p = pull(201, labels=["review:large"])
+    fake = FakeGh({})
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.stuck_large_ok_pulls(REPO, [p])
+    assert (observations + actions) == []
+    assert fake.calls == []
+
+
 # ── Поведение 2: нездоровый PR — вернуть задачу в пул ─────────────────────────────
 
 
@@ -5448,6 +5541,9 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     live_pulls = [{"marker": "same snapshot merge_loop produced"}]
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, live_pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    # Разблокировка застрявших ai:ok+review:large без large-ok (#939) — не
+    # предмет этого теста: снимок здесь маркер-заглушка без labels[].
+    monkeypatch.setattr(sch, "stuck_large_ok_pulls", lambda repo, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))

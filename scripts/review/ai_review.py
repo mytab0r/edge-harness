@@ -47,10 +47,17 @@ error, неоднозначность никогда не одобряет.
 Тормоз/газ размерного гейта (#204): approve на том же head, что и review:large,
 автоматически ставит review:large-ok (см. apply_large_ok/large_ok_decision) —
 взгляд человека делегирован состоявшемуся вердикту AI, а не факту запуска.
-Диффы длиннее check_pr.LARGE_DIFF_HUGE_LINES автоматика не подтверждает —
-эскалирует владельцу через pulse_guard.escalate. Недоставленная ни одним
-каналом эскалация (#884) — не warning в зелёном job'е: cmd_verdict красит job
-(exit 1), см. apply_large_ok/escalation_fully_failed.
+
+Диффы длиннее check_pr.LARGE_DIFF_HUGE_LINES (мандат владельца 2026-09-11,
+#939, отменяет #204 п.«escalate» и #901): эскалации владельцу больше нет —
+размер не креденшел и не деньги, а разбор диффа модель и так делает. Промпт
+(cmd_gather::size_question_section) задаёт ОТДЕЛЬНЫЙ явный вопрос об объёме;
+ответ несёт СВОЮ машиночитаемую строку РАЗМЕР (huge_diff_size_gate/
+parse_size_verdict), не смешанную с ВЕРДИКТ: «оправдан» ведёт себя как
+обычный large-диапазон (large-ok при approve), «раздут» форсирует verdict в
+rework с находкой (что выкинуть), «нет суждения» (строки нет, их несколько,
+другая форма) — нарушение контракта, тот же класс, что пустой rework (#210):
+verdict -> error, ai:failed, автоповтор подхватит по таймеру (#196).
 
 Среда: runner с gh, GH_TOKEN с правами pull-requests: write (gather/verdict).
 """
@@ -122,15 +129,6 @@ _cp_spec = importlib.util.spec_from_file_location(
 check_pr = importlib.util.module_from_spec(_cp_spec)
 _cp_spec.loader.exec_module(check_pr)
 
-# Канал эскалации владельцу (диффы сверх LARGE_DIFF_HUGE_LINES, #204) — тот же,
-# что у предохранителя конвейера: комментарий в задачу-статус + Telegram
-# (pulse_guard.escalate). Второго канала для класса «нужно решение владельца»
-# не заводим (см. docstring escalate).
-_pg_spec = importlib.util.spec_from_file_location(
-    "pulse_guard", SCRIPT_DIR.parent / "orchestra" / "pulse_guard.py")
-pulse_guard = importlib.util.module_from_spec(_pg_spec)
-_pg_spec.loader.exec_module(pulse_guard)
-
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
 # единственной — двусмысленность это error, а не одобрение. Модель периодически
 # оборачивает машиночитаемую строку в markdown-выделение (**…**/__…__) вопреки
@@ -142,6 +140,14 @@ _pg_spec.loader.exec_module(pulse_guard)
 # approve/rework ВНУТРИ строки прозы сюда не попадает — якоря ^…$ и жёсткая
 # форма это исключают.
 VERDICT_RE = re.compile(r"^(\*\*|__|)ВЕРДИКТ:\s*(approve|rework)\s*\.?\1$")
+# Суждение о размере (#939, мандат владельца 2026-09-11) — ОТДЕЛЬНАЯ от
+# ВЕРДИКТ строка, обязательная для диффов сверх check_pr.LARGE_DIFF_HUGE_LINES
+# (см. huge_diff_size_gate/parse_size_verdict ниже): «оправдан» без деталей,
+# «раздут: <что выкинуть>» с обязательным непустым описанием. Та же терпимость
+# к markdown-обрамлению, что VERDICT_RE — модель оборачивает строки
+# одинаково независимо от того, какую метку они несут.
+SIZE_JUSTIFIED_RE = re.compile(r"^(\*\*|__|)РАЗМЕР:\s*оправдан\.?\s*\1$")
+SIZE_BLOATED_RE = re.compile(r"^(\*\*|__|)РАЗМЕР:\s*раздут:\s*(.+?)\s*\1$")
 # Блок задачи в беклог: ЗАДАЧА: <заголовок> … КОНЕЦ ЗАДАЧИ. Незакрытый блок
 # не принимается — тихо взять половину хуже, чем не взять совсем.
 TASK_OPEN_RE = re.compile(r"^ЗАДАЧА:\s*(\S.*)$")
@@ -247,6 +253,65 @@ def parse_verdict(answer: str) -> str:
     if len(marks) == 1 and lines and VERDICT_RE.match(lines[-1]):
         return marks[0]
     return "error"
+
+
+# ── Размерный гейт: суждение модели вместо эскалации владельцу (#939) ────────
+
+def parse_size_verdict(answer: str) -> tuple[str, str | None]:
+    """('justified', None) | ('bloated', <что выкинуть>) | ('missing', None).
+
+    Тот же принцип единственного сигнала, что у parse_verdict: строка РАЗМЕР
+    ищется по ВСЕМУ ответу (не только последней строке — ВЕРДИКТ уже занимает
+    эту позицию), но матчей обязано быть РОВНО один — ноль (строки нет) или
+    несколько (модель сама себе противоречит) одинаково считаются 'missing':
+    неоднозначность не одобряет размер молча, как и у вердикта."""
+    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
+    justified = [line for line in lines if SIZE_JUSTIFIED_RE.match(line)]
+    bloated = [m for line in lines for m in [SIZE_BLOATED_RE.match(line)] if m]
+    if len(justified) + len(bloated) != 1:
+        return "missing", None
+    if justified:
+        return "justified", None
+    return "bloated", bloated[0].group(2).strip()
+
+
+def huge_diff_size_gate(added: int, answer: str) -> tuple[str, str | None]:
+    """('na', None) — дифф не превышает check_pr.LARGE_DIFF_HUGE_LINES, вопрос
+    о размере не задавался (см. size_question_section), гейт не применяется.
+    Иначе — parse_size_verdict(answer): единственное место, которое решает
+    судьбу диффов сверх второго порога — замена large_ok_decision.'escalate'
+    (#204/#901), отменённого мандатом владельца 2026-09-11: эскалация
+    владельцу по причине размера убрана целиком, решение — суждение модели,
+    прочитанное cmd_verdict ДО выбора вердикта-метки."""
+    if added <= check_pr.LARGE_DIFF_HUGE_LINES:
+        return "na", None
+    return parse_size_verdict(answer)
+
+
+def size_question_section(added: int) -> str:
+    """Текст доп. вопроса про размер для ai_prompt.md ($size_section,
+    cmd_gather ниже) — непустой, только если дифф превышает
+    check_pr.LARGE_DIFF_HUGE_LINES (#939). Контракт ответа — своя строка
+    РАЗМЕР, СИММЕТРИЧНАЯ по строгости строке ВЕРДИКТ (см. huge_diff_size_gate):
+    отсутствие/двусмысленность — нарушение контракта, не молчаливое
+    одобрение."""
+    if added <= check_pr.LARGE_DIFF_HUGE_LINES:
+        return ""
+    return (
+        f"\nОтдельно, размер: дифф этого PR — +{added} строк, больше "
+        f"внутреннего порога {check_pr.LARGE_DIFF_HUGE_LINES} строк. Ответь "
+        "явным суждением: объём диффа оправдан содержанием задачи, или он "
+        "раздут случайно включёнными generated/vendored/lock-файлами, "
+        "мусором сборки, не относящимися к задаче правками? Добавь в ответ "
+        "(в любом месте, до строки ВЕРДИКТ) РОВНО одну из двух строк:\n"
+        "РАЗМЕР: оправдан\n"
+        "РАЗМЕР: раздут: <что именно выкинуть — конкретные файлы и причины>\n"
+        "«Раздут» — блокирующая находка сама по себе: перечисли те же файлы "
+        "среди находок п.1 и поставь ВЕРДИКТ: rework, даже если остальное "
+        "содержимое тебя устраивает. Строка РАЗМЕР ОБЯЗАТЕЛЬНА при таком "
+        "объёме диффа: отсутствие, две сразу или любая другая формулировка — "
+        "нарушение контракта (ревью повторится), как и с ВЕРДИКТ.\n"
+    )
 
 
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
@@ -418,43 +483,28 @@ def rework_without_findings(verdict: str, findings: str, tasks: list[dict],
 # ── Размерный гейт: газ к тормозу review:large (#204) ─────────────────────────
 
 def large_ok_decision(added: int, current_labels, verdict: str) -> str:
-    """«ok» — можно автоматически поставить review:large-ok; «escalate» —
-    дифф крупнее LARGE_DIFF_HUGE_LINES, решение за владельцем; «skip» —
-    ничего не менять (дифф не review:large или AI не одобрил).
+    """«ok» — можно автоматически поставить review:large-ok; «skip» —
+    ничего не менять (дифф не review:large, AI не одобрил содержимое, либо
+    verdict уже переопределён из-за размера — см. ниже).
 
     Требует одобренного AI-вердикта на том же head (verdict == "approve"):
     подтверждение размера обязано опираться на состоявшийся разбор диффа,
     а не на факт запуска ревью (условие из #204, п.1) — иначе rework/error
     молча открывал бы газ тормозу, для которого он не предназначен.
-    """
+
+    Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES эта функция больше не
+    различает (класс «escalate» убран мандатом владельца 2026-09-11, #939):
+    решение по ним принимает huge_diff_size_gate РАНЬШЕ этой функции —
+    cmd_verdict форсирует verdict в "rework" (раздут) или "error" (нет
+    суждения) ДО вызова large_ok_decision, поэтому 'approve' в этой функции
+    к моменту вызова уже означает «содержимое одобрено И (если дифф гигантский)
+    размер признан оправданным явным суждением модели»."""
     names = review_labels._names(current_labels)
     if check_pr.REVIEW_LARGE not in names:
         return "skip"
     if verdict != "approve":
         return "skip"
-    if added > check_pr.LARGE_DIFF_HUGE_LINES:
-        return "escalate"
     return "ok"
-
-
-def huge_diff_escalation_text(pr: int, added: int) -> str:
-    """Текст эскалации гигантского диффа. Обязан заканчиваться разделом
-    «что дальше» (требование владельца от 2026-09-02, #170) — констатация
-    без плана не принимается."""
-    return (
-        f"🚨 edge-harness: PR #{pr} — дифф +{added} строк превышает второй "
-        f"порог review:large-ok ({check_pr.LARGE_DIFF_HUGE_LINES}) — жду решения "
-        "владельца по объёму.\n\n"
-        "Автоматика AI-ревью одобрила дифф (ai:ok), но не подтверждает размер "
-        f"сама: {check_pr.LARGE_DIFF_HUGE_LINES}+ строк — за пределами диапазона, "
-        "который проверен на реальных PR этого репозитория (#204).\n\n"
-        "Что дальше:\n"
-        f"- Исполнитель: владелец репозитория.\n"
-        "- Само по себе ничего не произойдёт — PR останется с review:large "
-        "без review:large-ok, авто-слияние заблокировано.\n"
-        f"- Нужно явное решение: поставить review:large-ok вручную, если объём "
-        "оправдан, либо запросить разбивку PR на части."
-    )
 
 
 def _split_scope(body_lines: list[str]) -> tuple[str | None, list[str]]:
@@ -836,6 +886,7 @@ def cmd_gather(args: argparse.Namespace) -> int:
         author=(pull.get("user") or {}).get("login", ""),
         context_pack=pack,
         task_section=task_section(pull, repo),
+        size_section=size_question_section(added),
     )
     (out / "prompt.md").write_text(prompt, encoding="utf-8")
     # Переходная совместимость: bridge на main (до мержа этого PR) берёт head
@@ -1057,54 +1108,18 @@ def cmd_should_run(args: argparse.Namespace) -> int:
 
 # ── verdict: разбор ответа, комментарий, метка ────────────────────────────────
 
-# Класс «недоставленная эскалация молчит» (#884, живой прогон 34520146758,
-# PR #870): pulse_guard.escalate — best-effort по КАЖДОМУ каналу (issue-
-# комментарий + Telegram), поэтому её отказ сам по себе не красит ничего —
-# ровно то, что запрещает AGENTS.md «fail loud, не silent-wrong». Функция ниже
-# читает СТРОГО тот текст, который escalate() обещает в своём докстринге
-# (scripts/orchestra/pulse_guard.py::escalate, файл вне области этой правки):
-# f"Telegram: {доставлен|НЕ доставлен}; след в #<N>: {оставлен|НЕ оставлен}".
-# Не пересказ формата, а прямое чтение поля результата — синхронность с
-# реальной функцией pulse_guard.escalate проверяет
-# test_ai_review.py::test_escalation_fully_failed_matches_pulse_guard_escalate_format,
-# который вызывает НАСТОЯЩИЙ escalate() с замоканными сетевыми примитивами
-# (тест кормит прод-форму, не наш пересказ).
-def escalation_fully_failed(result: str) -> bool:
-    """True — НИ ОДИН канал эскалации (pulse_guard.escalate) не доставил
-    сигнал: ни issue-комментарий, ни Telegram. Такую эскалацию считать
-    состоявшейся нельзя — владелец физически не узнал о решении, которое
-    от него ждут."""
-    return "НЕ доставлен" in result and "НЕ оставлен" in result
-
-
-def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str) -> bool:
-    """Проводка чистого large_ok_decision: ставит review:large-ok сама, либо
-    эскалирует владельцу по каналу pulse_guard.escalate (#204, п.3). Молчит
-    на «skip» — дифф не review:large или AI не одобрил, ничего не меняется.
-
-    Возвращает False ровно тогда, когда эскалация была НУЖНА (decision ==
-    "escalate") и НЕ ДОСТАВЛЕНА ни одним каналом (#884) — вызывающая сторона
-    (cmd_verdict) обязана превратить это в красный job, а не в ::warning::,
-    который никто не читает без повода."""
-    decision = large_ok_decision(added, current_labels, verdict)
-    if decision == "skip":
-        return True
-    if decision == "ok":
-        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
-               "-f", f"labels[]={review_labels.LARGE_OK}")
-        print(f"large-ok: +{added} строк ≤ {check_pr.LARGE_DIFF_HUGE_LINES} — "
-              f"{review_labels.LARGE_OK} поставлена автоматически")
-        return True
-    text = huge_diff_escalation_text(pr, added)
-    result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
-    if escalation_fully_failed(result):
-        print(f"::error::large-ok: +{added} строк > {check_pr.LARGE_DIFF_HUGE_LINES} — "
-              f"эскалация владельцу НЕ ДОСТАВЛЕНА ни одним каналом ({result}) — "
-              "владелец не узнал, что PR ждёт его решения (AGENTS.md «fail loud»)")
-        return False
-    print(f"::warning::large-ok: +{added} строк > {check_pr.LARGE_DIFF_HUGE_LINES} — "
-          f"эскалация владельцу ({result})")
-    return True
+def apply_large_ok(repo: str, pr: int, added: int, current_labels, verdict: str) -> None:
+    """Проводка чистого large_ok_decision: ставит review:large-ok, когда
+    решение "ok". Молчит на «skip» — дифф не review:large, AI не одобрил
+    содержимое, либо (диффы сверх check_pr.LARGE_DIFF_HUGE_LINES) verdict уже
+    переопределён в cmd_verdict ДО этого вызова из-за суждения модели о
+    размере (huge_diff_size_gate, #939) — эскалации владельцу больше нет,
+    large_ok_decision её никогда не возвращает."""
+    if large_ok_decision(added, current_labels, verdict) != "ok":
+        return
+    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
+           "-f", f"labels[]={review_labels.LARGE_OK}")
+    print(f"large-ok: +{added} строк — {review_labels.LARGE_OK} поставлена автоматически")
 
 
 def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head: str) -> None:
@@ -1200,6 +1215,37 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         notify_head_moved(repo, args.pr, verdict, args.head, pull_after_files["head"]["sha"])
         return 0
 
+    # Газ к тормозу review:large (#204): подтверждение размера опирается на
+    # состоявшийся вердикт AI, а не на факт запуска — added считается по
+    # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
+    # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
+    added = sum(f["additions"] for f in files)
+
+    # Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES: суждение модели о размере
+    # ЗАМЕНЯЕТ эскалацию владельцу (мандат 2026-09-11, #939, отменяет #204
+    # п.«escalate»/#901) — читается ДО выбора вердикт-метки, потому что
+    # 'bloated'/'missing' переопределяют сам verdict, а не только газ
+    # large_ok_decision. 'na' (дифф не гигантский) и 'justified' verdict не
+    # трогают. Уже наступивший verdict == "error" (контракт ВЕРДИКТ нарушен,
+    # или #210 empty_rework) не переклассифицируется второй раз — та причина
+    # точнее и вычислена раньше.
+    size_status, size_detail = huge_diff_size_gate(added, answer)
+    if size_status == "bloated" and verdict != "error":
+        verdict = "rework"
+        bloat_note = (f"Объём диффа (+{added} строк, порог "
+                      f"{check_pr.LARGE_DIFF_HUGE_LINES}) признан раздутым AI-ревьюером: "
+                      f"{size_detail}")
+        findings = f"{bloat_note}\n\n{findings}" if findings.strip() else bloat_note
+    elif size_status == "missing" and verdict != "error":
+        verdict = "error"
+        reason = (f"дифф +{added} строк (порог {check_pr.LARGE_DIFF_HUGE_LINES}) требует "
+                  "явного суждения о размере (строка «РАЗМЕР: оправдан» либо «РАЗМЕР: "
+                  "раздут: …», см. ai_prompt.md), но модель её не дала — строки нет, их "
+                  "несколько, или формулировка не по контракту (тот же класс, что пустой "
+                  "rework без находок, #210)")
+        findings = f"{reason}\n\n{findings}" if findings.strip() else reason
+        reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason)
+
     current = {label["name"] for label in pull["labels"]}
     label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
     # Тот же класс идемпотентности, что вердикт-метка review:* в check_pr.py
@@ -1230,17 +1276,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         review_labels.ai_status_state(verdict), status_description,
         run_gh, review_labels.run_target_url(repo))
 
-    # Газ к тормозу review:large (#204): подтверждение размера опирается на
-    # состоявшийся вердикт AI, а не на факт запуска — added считается по
-    # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
-    # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
-    added = sum(f["additions"] for f in files)
-    # escalation_delivered — считается ДО остальных side-effect'ов ниже
-    # (чеклист, комментарий), но решение по нему принимается в самом конце
-    # функции (#884): недоставленная эскалация не должна стоить владельцу
-    # собственно комментария/чеклиста ревью — те обязаны уйти в любом случае,
-    # красным становится только КОД ВОЗВРАТА (падает job, не теряется вердикт).
-    escalation_delivered = apply_large_ok(repo, args.pr, added, labels_after, verdict)
+    # apply_large_ok сама молчит на "skip" (дифф не review:large, AI не
+    # одобрил содержимое, либо verdict уже переопределён размером выше) —
+    # эскалации владельцу здесь больше нет (#939), решение по размеру уже
+    # принято суждением модели до этой строки.
+    apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
     # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
     # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
@@ -1269,14 +1309,6 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"::error::ответ не соответствует контракту вердикта ({reason}) "
               f"— ai:failed, ревью повторится")
         print(f"хвост ответа:\n{tail}")
-        return 1
-    if not escalation_delivered:
-        # #884: комментарий/метка/чеклист уже ушли (см. код выше) — вердикт
-        # НЕ теряется, но job обязан быть красным: единственный признак, что
-        # PR ждёт решения владельца, который его не получил ни одним каналом.
-        # ::error:: уже напечатан внутри apply_large_ok с деталями каналов.
-        print(f"verdict: {verdict} — {label}, но эскалация large-ok владельцу "
-              "не доставлена ни одним каналом — job красный (AGENTS.md «fail loud»)")
         return 1
     print(f"verdict: {verdict} — {label}")
     return 0
