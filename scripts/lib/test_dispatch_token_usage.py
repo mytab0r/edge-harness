@@ -84,6 +84,14 @@ EXPECTED_WORKFLOWS = frozenset({
     # GH_DISPATCH_TOKEN (значение читает только сам DO как секрет воркера —
     # этот workflow токена НЕ читает, создаёт issue штатным github.token).
     "inbox-issue.yml",
+    # Issue #967: детектор регрессии worker_success_rate, привязанный к
+    # слиянию (часовой cron). Только чтение Actions/Issues/Search API +
+    # создание/комментирование issue штатным github.token (issues: write) и
+    # секреты TELEGRAM_* для эскалации — ни GH_DISPATCH_TOKEN, ни
+    # GH_PIPELINE_PAT не читает (в отличие от orchestra.yml — здесь нет
+    # git push на ветку данных), тот же класс, что branch-protection-watch.yml/
+    # owner-decision.yml выше.
+    "merge-health-watch.yml",
     "orchestra.yml",
     # #254: repository_dispatch от морды (owner-decision), только github.token
     # (issues: write) — тот же класс, что branch-protection-watch.yml выше:

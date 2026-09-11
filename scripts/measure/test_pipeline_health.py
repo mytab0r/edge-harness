@@ -150,6 +150,41 @@ def test_merge_throughput_from_search_missing_key_is_zero_not_crash():
     assert ph.merge_throughput_from_search({}) == 0
 
 
+# ── search_merged_prs ────────────────────────────────────────────────────────
+
+
+def test_search_merged_prs_builds_hour_precision_query():
+    """Квалификатор `merged:` c полным временем, не датой суток (подтверждено
+    живым запросом 2026-09-11) — окно атрибуции меряется часами."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args[0])
+        return {"total_count": 0, "items": []}
+
+    start = utc(2026, 9, 10, 20, 0)
+    end = utc(2026, 9, 11, 5, 0)
+    ph.search_merged_prs("mytab0r/edge-harness", fake_gh, start, end)
+    assert len(calls) == 1
+    assert "merged:2026-09-10T20:00:00..2026-09-11T05:00:00" in calls[0]
+    assert "sort=created&order=asc" in calls[0]
+
+
+def test_search_merged_prs_returns_prod_form_dict():
+    # Прод-форма живого ответа `search/issues` (2026-09-11, PR #903).
+    fixture = {
+        "total_count": 1, "incomplete_results": False,
+        "items": [{
+            "number": 903,
+            "title": "#899: гонка created_at/completion в conveyor_gate",
+            "pull_request": {"merged_at": "2026-09-10T22:00:32Z"},
+        }],
+    }
+    result = ph.search_merged_prs("mytab0r/edge-harness", lambda *_: fixture,
+                                  utc(2026, 9, 10, 20, 0), utc(2026, 9, 10, 23, 0))
+    assert result == fixture
+
+
 # ── build_snapshot ────────────────────────────────────────────────────────
 
 

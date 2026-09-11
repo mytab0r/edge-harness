@@ -210,6 +210,32 @@ def merge_throughput_from_search(search_result: dict) -> int:
     return int(search_result.get("total_count", 0) or 0)
 
 
+def search_merged_prs(repo: str, gh: GhFn, start: datetime, end: datetime) -> dict:
+    """PR'ы, слитые в полуоткрытом окне [start, end) — тот же `search/issues`,
+    что уже читает `collect()` для `merge_throughput`, но с произвольной
+    ISO-меткой времени вместо даты суток. Подтверждено живым запросом
+    (2026-09-11): квалификатор `merged:` GitHub Search API принимает полный
+    ISO8601 с временем в диапазоне (`merged:2026-09-10T20:00:00..2026-09-11T09:00:00`),
+    не только `YYYY-MM-DD` — используется для привязки регрессии к окну
+    атрибуции (`scripts/orchestra/merge_health_watch.py`), где день целиком
+    слишком грубая единица.
+
+    Единственная страница (`per_page=100`, `sort=created&order=asc` — от
+    старых к новым, тот же порядок, что нужен вызывающему для сортировки
+    подозреваемых по времени слияния): окно атрибуции короткое (часы), а не
+    сутки, второй страницы на практике не бывает — то же ограничение уже
+    честно принято `merge_throughput_from_search` (та тоже не листает
+    Search API). `total_count` сверх `len(items)` — не тихая потеря: вызывающая
+    сторона получает оба числа и обязана предупредить, если результат обрезан
+    (см. `merge_health_watch.py::fetch_suspects`)."""
+    query = (
+        f"repo:{repo}+is:pr+is:merged+"
+        f"merged:{start.strftime('%Y-%m-%dT%H:%M:%S')}..{end.strftime('%Y-%m-%dT%H:%M:%S')}"
+    )
+    result = gh(f"search/issues?q={query}&per_page=100&sort=created&order=asc") or {}
+    return result
+
+
 def build_snapshot(
     today: date, *,
     merged_search: dict,
