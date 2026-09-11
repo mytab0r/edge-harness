@@ -12,6 +12,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Диспатч на мерже (#955, следствие #929): мерж PR через GITHUB_TOKEN не
+  # создаёт push-событие — scheduler.py::after_merge (merge_reactions.
+  # react_to_merge, config/merge-reactions.json) запускает этот workflow
+  # явно через Actions API dispatches, для чего нужен именно этот триггер.
+  workflow_dispatch:
 
 permissions:
   contents: read

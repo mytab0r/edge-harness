@@ -290,6 +290,16 @@ _pqs_spec = importlib.util.spec_from_file_location(
 provider_quota_state = importlib.util.module_from_spec(_pqs_spec)
 _pqs_spec.loader.exec_module(provider_quota_state)
 
+# Реестр «слитый путь → workflow, реагирующий на push по main» (#955,
+# следствие #929) — одно место правды, читается ЗДЕСЬ (диспатч) и
+# scripts/orchestra/repo_invariants.py (инвариант 15, проверка, что диспатч
+# реально дал прогон). Заменяет прежний локальный dispatch_deploy_on_merge
+# (subprocess.run(["gh","workflow","run",...]) без дедупа по sha).
+_mr_spec = importlib.util.spec_from_file_location(
+    "merge_reactions", Path(__file__).resolve().parents[1] / "lib" / "merge_reactions.py")
+merge_reactions = importlib.util.module_from_spec(_mr_spec)
+_mr_spec.loader.exec_module(merge_reactions)
+
 STALE_HOURS = 24
 TASK_LABEL = "task"
 # Одно место правды — review_labels.py (см. should_update_branch там же,
@@ -1298,14 +1308,22 @@ def merge_queue(
         if gate_reason:
             skipped.append(f"#{pull['number']} — {gate_reason}")
             continue
-        gh(
+        # Ответ PUT .../merge несёт 'sha' слитого коммита (merge_commit_sha) —
+        # единственный надёжный источник ЗДЕСЬ И СЕЙЧАС: словарь `pull` выше
+        # собран запросом СПИСКА до мержа, GitHub заполняет merge_commit_sha
+        # только после того, как мерж реально произошёл. Нужен сразу же,
+        # синхронно (#955/#929) — react_to_merge внутри after_merge дедупит
+        # диспатч по этому sha, без него дедуп невозможен по построению.
+        merge_result = gh(
             "-X", "PUT", f"repos/{repo}/pulls/{pull['number']}/merge",
             "-f", f"merge_method={MERGE_METHOD}",
         )
         actions.append(f"✅ PR #{pull['number']} слит ({MERGE_METHOD})")
         observations = [f"⏸️ {item}" for item in skipped]
         other_pulls = [p for p in pulls if p["number"] != pull["number"]]
-        after_observations, after_actions, hard_failure = after_merge(repo, pull, other_pulls)
+        merge_sha = (merge_result or {}).get("sha")
+        after_observations, after_actions, hard_failure = after_merge(
+            repo, pull, other_pulls, merge_sha=merge_sha)
         observations += after_observations
         actions += after_actions
         return observations, actions, hard_failure, pull["number"], True  # один за проход: см. merge_loop
@@ -1699,31 +1717,19 @@ def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | Non
             f"(задача #{task_number}; {status})")
 
 
-def dispatch_deploy_on_merge(files: list[dict], prefix: str, workflow: str) -> bool:
-    """Диспатч деплой-воркфлоу, если слитый PR тронул prefix/. Один экземпляр
-    класса «мерж через GITHUB_TOKEN не создаёт push-события» (защита GitHub от
-    рекурсии) на оба деплоя репозитория: канал «мерж PR → деплой» держится
-    явным `gh workflow run`, а не триггером, который в основном пути слияния
-    (orchestra) молча не срабатывает. True — диспатч сделан (check=True:
-    несостоявшийся запуск — красный прогон, а не тихий пропуск канала)."""
-    if not any((f["filename"] or "").startswith(prefix) for f in files):
-        return False
-    subprocess.run(
-        ["gh", "workflow", "run", workflow, "--ref", "main"],
-        capture_output=True, text=True, encoding="utf-8", env={**os.environ, "NO_COLOR": "1"},
-        check=True,
-    )
-    return True
-
-
 def after_merge(
     repo: str, pull: dict, other_pulls: list[dict] | None = None,
+    merge_sha: str | None = None,
 ) -> tuple[list[str], list[str], bool]:
     """Действия после слияния. Merge через GITHUB_TOKEN НЕ создаёт push-события
-    (защита GitHub от рекурсии), поэтому за деплоем и закрытием задач следим явно.
-    other_pulls — открытые PR, кроме только что слитого (#196, поведение 3:
-    подтянуть их из main); по умолчанию пусто — вызывающий код без списка
-    остальных PR просто не подтягивает никого (сохраняет старое поведение).
+    (защита GitHub от рекурсии), поэтому за диспатчем реагирующих workflow и
+    закрытием задач следим явно. other_pulls — открытые PR, кроме только что
+    слитого (#196, поведение 3: подтянуть их из main); по умолчанию пусто —
+    вызывающий код без списка остальных PR просто не подтягивает никого
+    (сохраняет старое поведение). merge_sha — 'sha' из ответа `PUT
+    .../merge` (#955/#929): без него react_to_merge не сможет дедупить
+    диспатч по коммиту и откажет громко (RuntimeError), а не тихо продиспатчит
+    вслепую.
 
     Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_архивации) — #456:
     все строки этой функции сама по себе — действия (мерж уже случился,
@@ -1741,19 +1747,22 @@ def after_merge(
     # первая страница) — PR за сотню файлов, где cf-worker/* стоят за сотой
     # позицией, молча не запускал бы deploy-worker.yml.
     files = review_labels.list_pr_files(repo, number, gh)
-    if dispatch_deploy_on_merge(files, "cf-worker/", "deploy-worker.yml"):
-        actions.append("🚀 deploy-worker запущен (push от GITHUB_TOKEN триггеры не создаёт)")
-    # Канал обновления морды (стройка 3 эпика #77, задача #374) — тот же класс,
-    # что cf-worker выше: правка dsh-edge/** (манифест плагинов plugin-forge,
-    # патч-серия, пин апстрима) обязана доезжать до деплоя сразу после мержа
-    # оркестратором, а не по суточному крону (крон — push-триггер деплоя тоже
-    # не видит мержи через GITHUB_TOKEN). Форж останавливается на built
-    # (design.md dsh-edge-plugin-system, «Канал обновления и статусы»:
-    # deploying/ready — только у деплоя) — без этого диспатча манифест-PR
-    # висел бы в built до крона, канал эпика «морда перезапускается с
-    # плагином» молча терял бы минуты/часы.
-    if dispatch_deploy_on_merge(files, "dsh-edge/", "deploy-dsh-edge.yml"):
-        actions.append("🚀 deploy-dsh-edge запущен (мерж правки dsh-edge/** — канал обновления морды, #77/#374)")
+    # Единая функция диспатча по реестру config/merge-reactions.json (#955,
+    # следствие #929) — заменяет прежние два отдельных вызова
+    # dispatch_deploy_on_merge (cf-worker/→deploy-worker.yml,
+    # dsh-edge/→deploy-dsh-edge.yml) и добавляет repo-ci.yml/codeql.yml/
+    # worker-ci.yml, у которых раньше не было явного диспатча вовсе (замер
+    # #929: обязательный гейт `test` и security-скан не гонялись на слитом
+    # main с 2026-09-10). Дедуп по head_sha внутри react_to_merge закрывает
+    # живой класс дублирования (deploy-worker.yml получал push+dispatch на
+    # один и тот же коммит, #929). RuntimeError (merge_sha пуст — источник
+    # PUT .../merge не отдал 'sha' — или сетевой сбой самого диспатча) не
+    # роняет всю функцию: мерж УЖЕ состоялся, закрытие задач/Telegram/архив
+    # ниже обязаны отработать независимо от судьбы этого одного канала.
+    try:
+        actions.extend(merge_reactions.react_to_merge(gh, repo, files, merge_sha))
+    except RuntimeError as error:
+        observations.append(f"⚠️ реакция на мерж (config/merge-reactions.json) не выполнена: {error}")
     # Закрытие задачи — не здесь и не по ключевым словам: мерж доказывает PR,
     # а не готовность задачи, чей критерий часто живёт после мержа (деплой,
     # канарейка, E2E). Напоминаем исполнителю про реальный пост-мерж прогон,

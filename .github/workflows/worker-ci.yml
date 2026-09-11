@@ -21,6 +21,11 @@ on:
       - "cf-worker/**"
       - ".github/workflows/worker-ci.yml"
   pull_request:
+  # Диспатч на мерже (#955, следствие #929): мерж PR через GITHUB_TOKEN не
+  # создаёт push-событие — scheduler.py::after_merge (merge_reactions.
+  # react_to_merge, config/merge-reactions.json) запускает эти ворота на
+  # слитом дереве явно, для чего нужен именно этот триггер.
+  workflow_dispatch:
 
 permissions:
   contents: read

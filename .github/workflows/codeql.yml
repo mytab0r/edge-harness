@@ -7,6 +7,12 @@ on:
   pull_request:
   schedule:
     - cron: "17 4 * * 1"
+  # Диспатч на мерже (#955, следствие #929): мерж PR через GITHUB_TOKEN не
+  # создаёт push-событие — scheduler.py::after_merge (merge_reactions.
+  # react_to_merge, config/merge-reactions.json) запускает security-скан
+  # слитого дерева явно, для чего нужен именно этот триггер (без него
+  # security-скан слитого main шёл только раз в неделю по schedule).
+  workflow_dispatch:
 
 jobs:
   analyze:
