@@ -1,11 +1,21 @@
 # Форж плагинов dsh-edge: исходники плагина → релиз + PR в plugins.json
 #
-# Вход: workflow_dispatch с путём к исходникам плагина (относительно корня репо).
-# Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR с обновлённым
+# Вход: ветка исходников плагина (относительно корня репо) — тремя путями:
+#   - workflow_dispatch: путь и номер задачи руками (task_issue ОБЯЗАТЕЛЕН —
+#     см. job prepare, #945/#661);
+#   - push по plugins-src/**: состав и задача вычисляются механически из
+#     diff'а пуша (см. job prepare);
+#   - schedule (страховка): сравнение версии исходников с версией,
+#     опубликованной в манифесте, ловит дрейф, который push не поймал —
+#     см. комментарий у триггера ниже, класс тот же, что у deploy-dsh-edge.yml.
+# Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR (из ветки
+# agent/<task_issue>-forge-<id>-<ts> — контракт PR↔задача, #661) с обновлённым
 # dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
 # (design.md «Workers-совместимость») и интеграционном дыме.
 #
-# Форж не деплоит морду — деплой делает deploy-dsh-edge.yml после мержа PR.
+# Форж не деплоит морду — деплой делает deploy-dsh-edge.yml после мержа PR
+# (push по dsh-edge/** ИЛИ явный диспатч scheduler.py::after_merge — мерж
+# через оркестратор не создаёт push-события, см. #945/#946).
 name: plugin-forge
 
 on:
@@ -20,9 +30,28 @@ on:
         required: false
         type: string
       task_issue:
-        description: "Номер issue-задачи (опционально) — ссылкой попадёт в тело авто-PR"
-        required: false
+        description: "Номер issue-задачи — ОБЯЗАТЕЛЕН: ветка авто-PR agent/<task_issue>-forge-<id>-<ts> резолвится контрактом PR↔задача (#661) только по этому номеру, тело PR не читается."
+        required: true
         type: string
+  push:
+    branches: [main]
+    paths:
+      - "plugins-src/**"
+  schedule:
+    # Страховка (тот же паттерн, что deploy-dsh-edge.yml, «Страховка: догоняет
+    # push, который не сработал»): весь путь оркестратора мержит PR под
+    # GITHUB_TOKEN (`orchestra.yml`, шаг scheduler), а GITHUB_TOKEN-мержи НЕ
+    # создают push-событие (защита GitHub от рекурсии — документировано
+    # `scripts/orchestra/scheduler.py::dispatch_deploy_on_merge`, тот же факт
+    # объясняет расхождение push-прогонов деплоя #560/#660). Значит push-
+    # триггер выше НЕ сработает для подавляющего большинства слияний
+    # plugins-src/** — этот крон сравнивает версию исходников с версией,
+    # уже зашитой в dsh-edge/plugins.json, и форжит дрейф сам (job prepare,
+    # ветка schedule). Полноценный фикс — явный диспатч в
+    # scheduler.py::after_merge (по образцу dispatch_deploy_on_merge) —
+    # заведён отдельной задачей (#946), scheduler.py вне территории этой
+    # правки.
+    - cron: "17 * * * *"
 
 permissions:
   contents: write       # для создания релиза и PR
@@ -31,24 +60,161 @@ permissions:
   # scripts/plugins/plugin_status.sh), PR создаётся под GH_PIPELINE_PAT, к
   # GitHub Issues API/CLI этот workflow не обращается (находка AI-ревью PR #273).
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.inputs.plugin_path }}
-  cancel-in-progress: false
-
 jobs:
+  # Единственное место, определяющее СОСТАВ форжа (какие плагины, с каким
+  # task_issue) — не размазано по трём if-веткам job'а forge. Один плагин на
+  # элемент include; forge запускается матрицей по этому списку (#945):
+  # push/schedule могут дать больше одного плагина за раз (несколько
+  # директорий изменились в одном пуше / дрейфуют одновременно).
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      matrix_len: ${{ steps.build.outputs.len }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Определить состав форжа (dispatch/push/schedule)
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PLUGIN_PATH: ${{ inputs.plugin_path }}
+          INPUT_PLUGIN_ID: ${{ inputs.plugin_id }}
+          INPUT_TASK_ISSUE: ${{ inputs.task_issue }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Резолвер «коммит → номер задачи» — ЕДИНСТВЕННЫЙ путь push/schedule
+          # определяют task_issue: PR, ассоциированный с коммитом (GitHub REST
+          # «List pull requests associated with a commit»), его head.ref —
+          # через тот же резолвер, что весь остальной репозиторий
+          # (scripts/lib/task_ref.py::task_from_branch, решение владельца
+          # 2026-09-06 — не второй regex рядом, тот же паттерн вызова, что
+          # scripts/git/pr-create).
+          resolve_task_issue_from_sha() {
+            local sha="$1" context="$2" pulls branch task_issue
+            pulls=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" -H "Accept: application/vnd.github+json") \
+              || { echo "::error::${context}: GitHub не отдал PR, ассоциированные с коммитом $sha — не могу определить задачу-источник" >&2; return 1; }
+            branch=$(jq -r '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last | .head.ref // empty' <<<"$pulls")
+            [ -n "$branch" ] || branch=$(jq -r '.[0].head.ref // empty' <<<"$pulls")
+            task_issue=""
+            if [ -n "$branch" ]; then
+              # Однострочный -c — не многострочный (класс «heredoc без YAML-
+              # отступа обрывает run: |», AGENTS.md): любая строка python-кода
+              # с отступом меньше блока YAML завершила бы block scalar раньше
+              # времени и валила бы разбор всего workflow (PyYAML "while
+              # scanning a simple key").
+              task_issue=$(PYTHONPATH="$GITHUB_WORKSPACE/scripts/lib${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+                'import sys, task_ref; n = task_ref.task_from_branch(sys.argv[1]); print(n if n is not None else "")' \
+                "$branch")
+            fi
+            if [ -z "$task_issue" ]; then
+              echo "::error::${context}: коммит $sha не резолвится в номер задачи (ветка «${branch:-<не найдена>}» не формы agent/<N>-slug) — авто-форж не откроет неслияемый PR (#661); форжи вручную с явным task_issue" >&2
+              return 1
+            fi
+            printf '%s' "$task_issue"
+          }
+
+          items="[]"
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              [ -n "$INPUT_PLUGIN_PATH" ] || { echo "::error::plugin_path обязателен"; exit 1; }
+              [ -n "$INPUT_TASK_ISSUE" ] || { echo "::error::task_issue обязателен: без него авто-PR форжа откроется из ветки не по контракту PR↔задача и никогда не сольётся штатным циклом (#661)"; exit 1; }
+              [[ "$INPUT_TASK_ISSUE" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$INPUT_TASK_ISSUE' должен быть числом (номер issue)"; exit 1; }
+              items=$(jq -n --arg p "$INPUT_PLUGIN_PATH" --arg id "$INPUT_PLUGIN_ID" --arg t "$INPUT_TASK_ISSUE" \
+                '[{plugin_path:$p, plugin_id:$id, task_issue:$t}]')
+              ;;
+
+            push)
+              if [ -z "$BEFORE_SHA" ] || [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+                echo "::error::github.event.before пуст или нулевой — не могу вычислить diff пуша, авто-форж не знает, какой плагин собирать"
+                exit 1
+              fi
+              mapfile -t dirs < <(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'plugins-src/**' \
+                | awk -F/ '{print $1"/"$2}' | sort -u)
+              if [ "${#dirs[@]}" -eq 0 ]; then
+                echo "::error::push задел paths plugins-src/** (иначе job бы не запустился), но diff $BEFORE_SHA..$AFTER_SHA не нашёл ни одного каталога plugins-src/<имя> — несовпадение триггера и вычисления, чинить здесь"
+                exit 1
+              fi
+              task_issue=""
+              for d in "${dirs[@]}"; do
+                if [ ! -f "$d/package.json" ]; then
+                  echo "::notice::$d изменён, но package.json нет — не плагин форжа (например, shared/), пропускаю"
+                  continue
+                fi
+                if [ -z "$task_issue" ]; then
+                  task_issue=$(resolve_task_issue_from_sha "$AFTER_SHA" "push $AFTER_SHA") || exit 1
+                fi
+                items=$(jq -c --arg p "$d" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
+              done
+              ;;
+
+            schedule)
+              while IFS=$'\t' read -r manifest_id manifest_pkg manifest_asset; do
+                src_dir=""
+                for d in plugins-src/*/; do
+                  [ -f "${d}package.json" ] || continue
+                  name=$(jq -r '.name' "${d}package.json")
+                  [ "$name" = "$manifest_pkg" ] || continue
+                  src_dir="${d%/}"
+                  break
+                done
+                # Пакет манифеста без исходников в этом репозитории (иное
+                # происхождение) — не забота этого крона, пропускаем молча.
+                [ -n "$src_dir" ] || continue
+
+                src_version=$(jq -r '.version' "$src_dir/package.json")
+                # Версия зашита в имя asset'а (RELEASE_ASSET, шаг «Собрать
+                # tarball» ниже: "<id>-<version>.tgz") — вырезаем regex'ом
+                # версии (semver + необязательный суффикс), а не префиксом
+                # id: legacy-записи манифеста (напр. hello-world-0.1.1.tgz
+                # при id=hello) не всегда совпадают с текущим id.
+                asset_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*\.tgz$' <<<"$manifest_asset" | sed -E 's/\.tgz$//')
+                [ "$asset_version" != "$src_version" ] || continue
+
+                last_sha=$(git log -1 --format=%H -- "$src_dir/package.json")
+                [ -n "$last_sha" ] || { echo "::error::дрейф найден ($src_dir: исходники v$src_version, манифест v$asset_version), но не нашёл коммит, менявший $src_dir/package.json — резолвить задачу не от чего"; exit 1; }
+                task_issue=$(resolve_task_issue_from_sha "$last_sha" "schedule-дрейф $src_dir") || exit 1
+                items=$(jq -c --arg p "$src_dir" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
+                echo "Дрейф: $src_dir исходники v$src_version ≠ манифест v$asset_version (id $manifest_id) — форжу под задачу #$task_issue"
+              done < <(jq -r '.plugins[] | [.id, .package, .source.asset] | @tsv' dsh-edge/plugins.json)
+              ;;
+
+            *)
+              echo "::error::неизвестный event_name '$EVENT_NAME' — job prepare не умеет его разбирать"
+              exit 1
+              ;;
+          esac
+
+          matrix_json=$(jq -c -n --argjson inc "$items" '{include: $inc}')
+          echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
+          echo "len=$(jq 'length' <<<"$items")" >> "$GITHUB_OUTPUT"
+          echo "Состав форжа ($EVENT_NAME): $(jq -c . <<<"$items")"
+
   forge:
+    needs: prepare
+    if: needs.prepare.outputs.matrix_len != '0'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      # Даёт job'у forge-failed канонический plugin_id (после сверки с
-      # манифестом — не basename каталога), чтобы падение ПОСЛЕ валидации
-      # писало failed в тот же псевдо-задачник, что building/built (форж
-      # эмитит только эти два — deploying/ready постит канал деплоя, см.
-      # шаг «Итог» ниже), а не в plugin:<basename> (находка AI-ревью PR
-      # #273: без этого таймлайн канонического плагина hello/hello-world
-      # вечно висел на building, а failed уходил в соседний, никогда не
-      # начинавшийся id).
-      plugin_id: ${{ steps.validate.outputs.plugin_id }}
+    concurrency:
+      # Ключ по plugin_path (не workflow-уровень, как раньше) — с job prepare
+      # один запуск может дать НЕСКОЛЬКО плагинов одновременно (push/schedule
+      # с несколькими элементами матрицы), их форжи не обязаны сериализоваться
+      # друг с другом, а конкурирующие запуски ЗА ОДИН И ТОТ ЖЕ плагин
+      # (dispatch поверх ещё идущего push-форжа того же плагина) — обязаны.
+      group: ${{ github.workflow }}-${{ matrix.plugin_path }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,9 +233,9 @@ jobs:
       - name: Валидация входа
         id: validate
         env:
-          PLUGIN_PATH: ${{ inputs.plugin_path }}
-          PLUGIN_ID_INPUT: ${{ inputs.plugin_id }}
-          TASK_ISSUE_INPUT: ${{ inputs.task_issue }}
+          PLUGIN_PATH: ${{ matrix.plugin_path }}
+          PLUGIN_ID_INPUT: ${{ matrix.plugin_id }}
+          TASK_ISSUE_INPUT: ${{ matrix.task_issue }}
         run: |
           PLUGIN_PATH="${PLUGIN_PATH}"
           [ -d "$PLUGIN_PATH" ] || { echo "::error::Каталог плагина не найден: $PLUGIN_PATH"; exit 1; }
@@ -95,14 +261,14 @@ jobs:
             || { echo "::error::не удалось прочитать ID_PATTERN_SOURCE из dsh-edge/manifest.mjs"; exit 1; }
           [[ "$PLUGIN_ID" =~ ^($ID_PATTERN_SOURCE)$ ]] || { echo "::error::plugin_id '$PLUGIN_ID' не соответствует паттерну ^$ID_PATTERN_SOURCE\$"; exit 1; }
 
-          # Номер задачи для тела авто-PR — отдельный опциональный числовой
-          # вход, НЕ plugin_id: plugin_id validate пропускает только через
-          # ^[a-z][a-z0-9-]*$, номером задачи он быть не может, и «#$plugin_id»
-          # рендерился нерабочей ссылкой вида «#hello» на каждом PR (находка
-          # AI-ревью PR #273). Пусто — строка со ссылкой в PR просто не пишется.
-          if [ -n "$TASK_ISSUE_INPUT" ]; then
-            [[ "$TASK_ISSUE_INPUT" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$TASK_ISSUE_INPUT' должен быть числом (номер issue)"; exit 1; }
-          fi
+          # Номер задачи для ветки и тела авто-PR — обязателен (#945/#661):
+          # job prepare уже гарантирует непустое числовое значение для ЛЮБОГО
+          # триггера (dispatch/push/schedule), но форж проверяет это ЕЩЁ РАЗ
+          # здесь же — «форж обязан отказать громко, а не открыть неслияемый
+          # PR» держится в двух местах, не в одном, ровно на случай будущей
+          # правки job'а prepare, которая по ошибке пропустит пустое значение.
+          [ -n "$TASK_ISSUE_INPUT" ] || { echo "::error::task_issue не передан — форж не откроет неслияемый PR (контракт PR↔задача резолвит номер только из ветки agent/<N>-*, #661)"; exit 1; }
+          [[ "$TASK_ISSUE_INPUT" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$TASK_ISSUE_INPUT' должен быть числом (номер issue)"; exit 1; }
 
           # Сверка с манифестом: basename каталога — только дефолт, а пакет
           # может уже быть установлен под ДРУГИМ id (канонический
@@ -156,7 +322,7 @@ jobs:
           echo "plugin_path=$PLUGIN_PATH" >> "$GITHUB_OUTPUT"
           echo "task_issue=$TASK_ISSUE_INPUT" >> "$GITHUB_OUTPUT"
 
-          echo "Плагин: $PLUGIN_NAME v$PLUGIN_VERSION (id: $PLUGIN_ID, client: $HAS_CLIENT)"
+          echo "Плагин: $PLUGIN_NAME v$PLUGIN_VERSION (id: $PLUGIN_ID, client: $HAS_CLIENT, задача: #$TASK_ISSUE_INPUT)"
 
       - name: plugin_status → building
         if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
@@ -434,7 +600,14 @@ jobs:
           unset token
           gh auth setup-git
 
-          BRANCH="forge/${PLUGIN_ID}-v${PLUGIN_VERSION}-$(date -u +%Y%m%dT%H%M%S)"
+          # Ветка — agent/<task_issue>-forge-<id>-<ts>, НЕ forge/<id>-v<version>-<ts>
+          # (#661/#945): контракт «PR↔задача» (scripts/lib/task_ref.py::
+          # task_from_branch, решение владельца 2026-09-06) резолвит номер
+          # ТОЛЬКО из имени ветки формы agent/<N>-slug — без этого PR получал
+          # contract:failed и не сливался никогда (живые эпизоды: runner-bridge
+          # #658 CLOSED, plugin-manager #556/#558 CLOSED). TASK_ISSUE к этому
+          # моменту уже гарантированно непустой (шаг «Валидация входа» выше).
+          BRANCH="agent/${TASK_ISSUE}-forge-${PLUGIN_ID}-$(date -u +%Y%m%dT%H%M%S)"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -544,29 +717,28 @@ jobs:
           # времени (PyYAML: "while scanning a simple key" — гвардия «все workflows
           # валидный YAML» в repo-ci красит именно на этом). printf-формат —
           # одна физическая строка YAML, аргументы подставляются как обычно.
-          COMMIT_MSG=$(printf '%s\n\nАвтоматический PR из plugin-forge (run %s).\nПлагин: %s (%s) v%s\nРелиз: %s\nAsset: %s\nSHA256: %s' \
-            "$PR_TITLE" "${{ github.run_id }}" "$PLUGIN_PACKAGE" "$PLUGIN_ID" "$PLUGIN_VERSION" "$RELEASE_TAG" "$ASSET" "$SHA256")
+          COMMIT_MSG=$(printf '%s\n\nАвтоматический PR из plugin-forge (run %s).\nПлагин: %s (%s) v%s\nРелиз: %s\nAsset: %s\nSHA256: %s\nЗадача: #%s' \
+            "$PR_TITLE" "${{ github.run_id }}" "$PLUGIN_PACKAGE" "$PLUGIN_ID" "$PLUGIN_VERSION" "$RELEASE_TAG" "$ASSET" "$SHA256" "$TASK_ISSUE")
           git commit -m "$COMMIT_MSG"
 
           git push -u origin "$BRANCH"
 
-          # Ссылка на задачу — только если task_issue реально передан числом
-          # (см. вход workflow_dispatch и валидацию в шаге «Валидация входа»).
-          # Раньше сюда шёл inputs.plugin_id, который validate пропускает
-          # только через ^[a-z][a-z0-9-]*$ — номером задачи он быть не может,
-          # и строка рендерилась мёртвой ссылкой вида «#hello» на каждом PR
-          # (находка AI-ревью PR #273). Нет task_issue — строки нет вовсе.
-          if [ -n "$TASK_ISSUE" ]; then
-            TASK_LINE=$(printf 'Задача: #%s\n\n' "$TASK_ISSUE")
-          else
-            TASK_LINE=""
-          fi
-          # Ранее тело утверждало «после мержа PR автоматически запустится
-          # deploy-dsh-edge.yml (push-триггер)» — неверно: этот workflow
-          # триггерится только schedule/workflow_dispatch, push в main его не
-          # запускает (находка AI-ревью PR #162). Текст ниже описывает
-          # реальный путь.
-          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n- Финальный статус этого шага в журнале — `built` (design.md «Канал обновления и статусы»: форж не деплоит и не постит `deploying`/`ready`)\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` НЕ триггерится на push в main — только `schedule` (ежедневно) или ручной `workflow_dispatch`. После мержа этого PR:\n1. Либо дождаться ближайшего расписания\n2. Либо запустить `gh workflow run deploy-dsh-edge` вручную\n3. Деплой соберёт морду с обновлённым манифестом, пройдёт канарейку (200 на корне, ingest-шов #119)\n4. `plugin_status: deploying`/`ready` постит канал деплоя, а не этот PR — это отдельная задача (доводка деплоя до ready, остаток #162), сюда ещё не подключена\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
+          # task_issue гарантированно непуст с шага «Валидация входа» — строка
+          # со ссылкой пишется всегда, не условно (#945: раньше task_issue был
+          # опциональным, и мёртвая ссылка «#hello» на plugin_id уже чинилась
+          # находкой AI-ревью PR #273 — теперь второго обхода того же класса
+          # не нужно, значение всегда номер issue).
+          TASK_LINE=$(printf 'Задача: #%s\n\n' "$TASK_ISSUE")
+          # #664: deploy-dsh-edge.yml ИМЕЕТ push-триггер по dsh-edge/** (с #374)
+          # — этот PR меняет dsh-edge/plugins.json, значит push его заденет.
+          # Честная оговорка тут же: мерж идёт через оркестратор (GITHUB_TOKEN),
+          # который push-событие НЕ создаёт (scheduler.py::dispatch_deploy_on_merge,
+          # документированный факт, объясняет расхождение живых прогонов #560/
+          # #660) — на практике деплой чаще всего запускает ЯВНЫЙ диспатч
+          # scheduler.py::after_merge при мерже, push — запасной путь на случай
+          # мержа не через оркестратор. Суточный schedule (04:37) — станет
+          # финальной страховкой, если оба пути промолчат.
+          PR_BODY=$(printf '%s## Что сделано\n- Плагин собран и опубликован в релиз `%s`\n- Интеграционный дым пройден (локальная сборка клона с плагином)\n- Манифест `dsh-edge/plugins.json` обновлён с новым sha256\n- Финальный статус этого шага в журнале — `built` (design.md «Канал обновления и статусы»: форж не деплоит и не постит `deploying`/`ready`)\n\n## Чем доказано\n- Чеклист совместимости Workers Free (запрещённые импорты, нет динамических import) — зелёный\n- Интеграционная сборка dsh-edge с плагином — зелёная\n- Гвардия состава (verify-edge-plugins) — зелёная\n- Контракт и детерминизм артефактов — зелёные\n\n## Пост-мерж проверка\n`deploy-dsh-edge.yml` ИМЕЕТ push-триггер по `dsh-edge/**` (с #374) — этот PR меняет `dsh-edge/plugins.json`. Мерж через оркестратора не создаёт push-событие (GITHUB_TOKEN, защита GitHub от рекурсии) — деплой в таком случае запускает явный диспатч `scheduler.py::after_merge`. Итог один и тот же:\n1. Деплой соберёт морду с обновлённым манифестом (явный диспатч на мерже ИЛИ push, если мерж создал событие) и пройдёт канарейки (ingest-шов #119, реестр провайдеров #378, e2e #502)\n2. Не сработали оба пути — суточный `schedule` (04:37) дособерёт в течение суток; ручной `gh workflow run deploy-dsh-edge` ускоряет ожидание, но не обязателен\n3. `plugin_status: deploying`/`ready` постит канал деплоя, а не этот PR — это отдельная задача (доводка деплоя до ready, остаток #162), сюда ещё не подключена\n\n## Чек-лист\n- [ ] Чеклист совместимости пройден\n- [ ] Интеграционный дым пройден\n- [ ] Релиз создан\n- [ ] Манифест валиден' \
             "$TASK_LINE" "${{ steps.release.outputs.release_tag }}")
           # scripts/git/pr-create (#496) — единственный документированный путь
           # открытия PR, тот же интерфейс, что gh pr create.
@@ -587,52 +759,37 @@ jobs:
           echo ""
           # Форж заканчивается на built (design.md, «Канал обновления и
           # статусы») — deploying/ready принадлежат каналу деплоя, а не
-          # этому job'у. deploy-dsh-edge.yml НЕ триггерится на push в main
-          # (только schedule/workflow_dispatch), поэтому постить ready здесь
-          # было бы silent-wrong: журнал сказал бы «готов» в момент, когда
-          # манифест-PR только создан, морда не пересобрана и плагина в
-          # ростере ещё нет (находка разбора PR #273, устраняющая
-          # расхождение с design.md, введённое в ходе AI-ревью того же PR).
-          # Канал «мерж → деплой → ready» — отдельная задача (см. #268 и
-          # issue из остатка #162 про доводку deploying/ready до деплоя).
-          echo "Следующий шаг: ревью и мёрж PR. Финальный статус этого шага — built. Ready проставит канал деплоя (отдельная задача): либо дождаться ежедневного schedule deploy-dsh-edge.yml, либо запустить его вручную (gh workflow run deploy-dsh-edge)."
+          # этому job'у. Постить ready здесь было бы silent-wrong: журнал
+          # сказал бы «готов» в момент, когда манифест-PR только создан,
+          # морда не пересобрана и плагина в ростере ещё нет (находка разбора
+          # PR #273, устраняющая расхождение с design.md, введённое в ходе
+          # AI-ревью того же PR). deploy-dsh-edge.yml ИМЕЕТ push-триггер по
+          # dsh-edge/** (с #374) и явный диспатч на мерже (scheduler.py::
+          # after_merge, #945) — обычно доедет само; суточный schedule
+          # (04:37) — финальная страховка. Канал «мерж → деплой → ready» —
+          # отдельная задача (см. #268 и issue из остатка #162 про доводку
+          # deploying/ready до деплоя).
+          echo "Следующий шаг: ревью и мёрж PR (ветка agent/<задача>-forge-<id>-<ts>, контракт PR↔задача резолвится штатно, #661). Финальный статус этого шага — built. Ready проставит канал деплоя (отдельная задача) — деплой обычно триггерится сам (push по dsh-edge/** или явный диспатч на мерже), суточный schedule 04:37 — страховка на случай, если оба промолчали."
 
-  # Если форж упал — постим failed статус
-  forge-failed:
-    needs: forge
-    if: failure()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      # Без чекаута scripts/plugins/plugin_status.sh не существует в воркспейсе:
-      # вызов ниже падал бы всегда, а `|| true` эту постоянную ошибку маскировал —
-      # финальный failed-статус молча не доезжал до журнала (находка AI-ревью PR
-      # #273, тот же класс, что #271: silent-wrong под `|| true`).
-      # persist-credentials: false — как во всех остальных checkout'ах репозитория
-      # (main-job, deploy, worker): без него токен с contents:write остаётся в
-      # .git/config воркспейса этого job'а (находка AI-ревью PR #273).
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: plugin_status → failed
-        if: env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+      - name: plugin_status → failed (если форж упал)
+        # Перенесено из отдельного job'а forge-failed (#945): с матрицей
+        # (несколько плагинов за один прогон) выход job'а forge отдал бы ОДИН
+        # неоднозначный plugin_id на все упавшие элементы матрицы разом —
+        # шаг внутри СВОЕГО элемента матрицы знает точный plugin_id/plugin_path
+        # без чужого вывода. `if: failure()` — истина, если хоть один
+        # предыдущий шаг ЭТОГО job'а (этого элемента матрицы) упал.
+        if: failure() && env.HARNESS_URL != '' && env.HANDS_TOKEN != ''
+        continue-on-error: true
         env:
           HARNESS_URL: ${{ vars.HARNESS_URL }}
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          # Канонический id из job forge (steps.validate.outputs.plugin_id —
-          # после сверки с манифестом, см. output `plugin_id` job'а forge) —
-          # не inputs.plugin_id: тот опционален и при обычном запуске пуст,
-          # а даже заданный входом id может быть переопределён валидацией на
-          # id из манифеста (бамп существующего пакета под другим id). Пусто
-          # (validate упала до записи output, т.е. до конца валидации) —
-          # фолбэк на basename(inputs.plugin_path) в BASH ниже (находка
-          # AI-ревью PR #273: без канонического id падение ПОСЛЕ валидации
-          # уезжало в plugin:<basename>, а не в тот id, что уже видел
-          # building/built — таймлайн канонического плагина вечно висел на
-          # building).
-          PLUGIN_ID_INPUT: ${{ needs.forge.outputs.plugin_id }}
-          PLUGIN_PATH: ${{ inputs.plugin_path }}
+          # Канонический id из шага «Валидация входа» (после сверки с
+          # манифестом) — фолбэк на basename(matrix.plugin_path) в BASH ниже,
+          # если validate упала до записи output (находка AI-ревью PR #273:
+          # без канонического id падение ПОСЛЕ валидации уезжало в
+          # plugin:<basename>, а не в тот id, что уже видел building/built).
+          PLUGIN_ID_INPUT: ${{ steps.validate.outputs.plugin_id }}
+          PLUGIN_PATH: ${{ matrix.plugin_path }}
           STATE: failed
           SOURCE: forge
           DETAIL: "форж упал: см. лог job ${{ github.run_id }}"

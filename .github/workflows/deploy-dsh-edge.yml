@@ -782,6 +782,82 @@ jobs:
           # должно заставить канарейку соврать в итоговой строке.
           echo "✅ реестр #378 жив на проде: namespace llm-pi-ai смонтирован, directory содержит $(( $(wc -w <<<"$routes") )) маршрутов (штатный + готовые)"
 
+      # Канарейка runner-bridge (#390/#945): предыдущие две канарейки выше
+      # доказывают, что RPC-поверхность dsh-edge жива («морда жива»), но НЕ
+      # что зарегистрированный ПЛАГИН реально отрабатывает в чате — ровно
+      # тот класс поломки, что #100 однажды уже давал молча (inject-контракт
+      # cordis не объявлен → тулов нет, сборка при этом зелёная). Прямого
+      # детерминированного RPC «вызови тул X» у dsh-edge НЕТ (полный список
+      # методов UNARY_ROUTES — docs/research/12-dsh-edge-session-api.md,
+      # namespace tools.* в нём отсутствует): инструменты вызывает только
+      # модель во время реального хода (session.prompt). Это и есть ПЕРВЫЙ
+      # живой прогон session.prompt/session.history на проде — до этой
+      # канарейки оба помечены в research/12 «не подтверждено живым
+      # прогоном» (честная оговорка, не гарантия).
+      #
+      # Читаем runner_status (не runner_task): запись создаёт РЕАЛЬНУЮ issue
+      # с меткой task и диспетчит worker.yml — на каждый прогон деплоя
+      # (push + суточный schedule + ручной dispatch) это заспамило бы пул
+      # задач фиктивными «канарейками» и жгло минуты воркеров. Целевая
+      # задача — issue #2, которая правилом репозитория («закрытая задача не
+      # переоткрывается никогда», scheduler.py::reject_reopened_tasks)
+      # гарантированно остаётся closed навсегда — стабильная цель без
+      # заведения отдельной canary-задачи под каждый прогон. Заголовок
+      # читается ЖИВЬЁМ у GitHub REST в момент канарейки, не хардкодом:
+      # правка заголовка issue #2 не потребует правки этого шага.
+      - name: Канарейка runner-bridge (#390/#945)
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/dsh-edge-runner-bridge-canary.cookies"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин канарейки runner-bridge не удался (HTTP $code)"; exit 1; }
+          rpc() {
+            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+              -X POST "$base/api/$1" -d "$2"
+          }
+
+          issue_title=$(gh api "repos/${GITHUB_REPOSITORY}/issues/2" --jq '.title') \
+            || { echo "::error::GitHub REST не отдал issue #2 — эталон канарейки runner-bridge недоступен (не вина плагина, чинить здесь)"; exit 1; }
+          expect="Задача #2 «${issue_title}»: закрыта."
+
+          ws=$(rpc workspace.create '{"type":"client-request","rpcId":"canary-rb","method":"workspace.create","payload":{"path":"/workspace/edge-harness"}}' \
+            | jq -r '.result.value.workspace.workspaceId')
+          [ -n "$ws" ] && [ "$ws" != "null" ] \
+            || { echo "::error::Воркспейс edge-harness недоступен (канарейка runner-bridge)"; exit 1; }
+          sid="deploy-rb-canary-$(date -u +%Y%m%dT%H%M%S)"
+          rpc session.create '{"type":"client-request","rpcId":"canary-rb","method":"session.create","payload":{"workspaceId":"'"$ws"'","sessionId":"'"$sid"'"}}' >/dev/null
+
+          prompt_payload=$(jq -n --arg sid "$sid" \
+            '{type:"client-request", rpcId:"canary-rb", method:"session.prompt",
+              payload:{sessionId:$sid, mode:"queue",
+                content:[{type:"text", text:"Вызови сейчас инструмент runner_status с issue=2 и ничего больше не делай — только вызов инструмента, без вопросов и пояснений в чате."}]}}')
+          accepted=$(rpc session.prompt "$prompt_payload" | jq -r '.result.value.accepted')
+          [ "$accepted" = "true" ] \
+            || { echo "::error::Морда не приняла сообщение канарейки runner-bridge (session.prompt: accepted != true) — живой вызов инструмента проверить не удалось"; exit 1; }
+
+          # Опрос с таймаутом: сам тул runner_status несёт timeoutMs 60000 в
+          # dsh-tools, плюс задержка ответа модели до решения вызвать тул —
+          # 24×5с = 120с общего бюджета.
+          found=""
+          for _ in $(seq 1 24); do
+            sleep 5
+            history=$(rpc session.history '{"type":"client-request","rpcId":"canary-rb","method":"session.history","payload":{"sessionId":"'"$sid"'"}}' || true)
+            if grep -qF "$expect" <<<"$history"; then
+              found="1"
+              break
+            fi
+          done
+          rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary-rb","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null || true
+          [ -n "$found" ] \
+            || { echo "::error::За 120с runner_status не отчитался по issue #2 реальным ответом GitHub REST (ожидали фрагмент: $expect) — плагин runner-bridge не работает в чате морды (не HTTP 403 и не «морда жива» — сам инструмент); либо агент не вызвал тул (нельзя исключить нестабильность самого session.prompt/session.history — первый живой прогон)"; exit 1; }
+          echo "✅ runner-bridge жив на проде: runner_status(issue=2) вернул реальные данные GitHub REST («$expect»)"
+
       # e2e generic browser smoke (#502): владелец нашёл руками то, чего не
       # находит ни один прежний тест — раздел Settings → Integrations месяцами
       # показывал «Journal unavailable: HTTP 404» (issue #501, Cloudflare error
