@@ -225,24 +225,51 @@ def test_post_rollback_canary_restores_deps_browser_then_runs():
 # ── PR #617): класс «прод-деплой без concurrency» — два перекрывающихся
 # ── прогона мутируют прод одновременно; после #614 в deploy-worker.yml есть
 # ── третий мутирующий игрок (wrangler rollback при красной канарейке), который
-# ── на гонке может откатить свежую хорошую версию другого прогона. Оба
-# ── прод-деплоя репозитория (wrangler deploy: deploy-worker.yml,
-# ── deploy-dsh-edge.yml) обязаны нести сериализацию с cancel-in-progress: false.
+# ── на гонке может откатить свежую хорошую версию другого прогона.
+#
+# Проверяются ВСЕ прод-деплои, найденные сканом исходников workflow (шаг с
+# `wrangler deploy` в run-блоке), а не захардкоженный список (замечание
+# третьего гейта PR #617): завтрашний новый прод-деплой без сериализации
+# обязан упасть на гвардии сам, без того чтобы кто-то вспомнил дописать
+# его в список. KNOWN_PROD_DEPLOYS ниже — не источник проверки, а пол против
+# ослепления сканера: если сканер перестал находить хотя бы эти два файла,
+# проверка пуста и это ошибка сканера, а не «нарушений нет».
 
-DEPLOY_WORKFLOWS = {
-    "deploy-worker.yml",
-    "deploy-dsh-edge.yml",
-}
+WORKFLOWS_DIR = _DIR.parents[1] / ".github" / "workflows"
+
+# Известные на 2026-09-11 прод-деплои; worker-ci.yml сюда не входит — только
+# `wrangler dev` (локальный дев-сервер, прод не мутирует).
+KNOWN_PROD_DEPLOYS = {"deploy-worker.yml", "deploy-dsh-edge.yml"}
 
 
-def _workflow_doc(name: str) -> dict:
-    path = _DIR.parents[1] / ".github" / "workflows" / name
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+def _prod_deploy_workflow_names() -> list[str]:
+    found = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        runs = []
+        for job in (doc.get("jobs") or {}).values():
+            if not isinstance(job, dict):
+                continue
+            for step in (job.get("steps") or []):
+                if isinstance(step, dict) and isinstance(step.get("run"), str):
+                    runs.append(step["run"])
+        if any("wrangler deploy" in run for run in runs):
+            found.append(path.name)
+    return found
 
 
-@pytest.mark.parametrize("workflow_name", sorted(DEPLOY_WORKFLOWS))
+def test_prod_deploy_scanner_still_sees_the_known_deploys():
+    found = set(_prod_deploy_workflow_names())
+    missing = KNOWN_PROD_DEPLOYS - found
+    assert not missing, (
+        f"сканер прод-деплоев перестал находить {missing} — гвардия сериализации "
+        f"проверяет пустоту, а не состояние (ослепление сканера = ошибка сканера)"
+    )
+
+
+@pytest.mark.parametrize("workflow_name", _prod_deploy_workflow_names())
 def test_prod_deploy_workflows_serialize_with_concurrency(workflow_name):
-    doc = _workflow_doc(workflow_name)
+    doc = yaml.safe_load((WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8"))
     conc = doc.get("concurrency")
     assert isinstance(conc, dict) and conc.get("group"), (
         f"{workflow_name}: прод-деплой без concurrency — два перекрывающихся "
