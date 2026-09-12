@@ -36,6 +36,18 @@ white-spot #824); до его подключения файл правится �
 | `hands` | `default-chain` | 9 | dsh_run_with_provider_chain (scripts/hands/dsh_task.sh) — полный failover (#805) |
 | `morda` | (вне манифеста) | — | 1 слот адаптера через Settings -> Models (plugins-src/provider-registry, #378) — failover туда не помещается, вне манифеста принципиально (docs/runbooks/switch-llm-provider.md, «Морда — вне цепочки принципиально») |
 
+**Честный пробел (#1025).** `config/provider-usage.json` уже несёт
+`usage["self-review"] = "default-chain"` (периодическая саморевизия
+конвейера, `scripts/orchestra/self_review.py`, транспорт —
+`scripts/review/ai_dsh.sh`, без изменений скрипта) — назначение РАБОТАЕТ
+(bash-путь `dsh_load_provider_chain_from_manifest` в `scripts/lib/dsh-ci.sh`
+читает по ключу напрямую, не через список ниже), но потребителя пока нет в
+таблице реестра и в `CONSUMERS` (`scripts/lib/collect_provider_usage.py`):
+этот канонический список совпадает с `check_provider_usage_manifest` в
+`scripts/orchestra/repo_invariants.py`, файлом с параллельными PR на момент
+#1025 — впиши строку туда отдельной мелкой правкой, когда файл освободится,
+не расширяй список молча в обход этой заметки.
+
 С #857 (`openspec/changes/provider-quota-gating`) запись `GLM` переставлена
 из хвоста цепочки (где её держал #848 из-за живой квоты на момент замера
 латентности) в начало, за ней добавлена запись `ZAI` (второй z.ai-аккаунт)

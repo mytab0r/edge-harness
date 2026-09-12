@@ -72,8 +72,9 @@
   "usage": {
     "ai-review": "default-chain",
     "worker": "default-chain",
-    "hands": "default-chain"
+    "hands": "default-chain",
+    "self-review": "default-chain"
   },
-  "generated_at": "2026-09-10T00:00:00Z",
-  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857."
+  "generated_at": "2026-09-12T00:00:00Z",
+  "generated_by": "apply-agent (#1025, openspec/changes/pipeline-self-review): добавлен потребитель self-review (периодическая саморевизия конвейера, scripts/orchestra/self_review.py, транспорт scripts/review/ai_dsh.sh без изменений) — дневная цепочка GLM/ZAI, тот же выбор, что уже сделан для ai-review (#860: недельная квота Claude/anthropic-oauth-pool остаётся уделом worker/hands, сюда не подключается). Остальные записи и их порядок — БЕЗ ИЗМЕНЕНИЙ, унаследованы от #857."
 }
