@@ -176,6 +176,39 @@ def test_dependabot_alert_watch_skips_pulse_when_pool_read_fails(monkeypatch):
                    for c in fake.calls)
 
 
+def test_open_dependabot_alerts_non_list_error_shape_raises(monkeypatch):
+    """Класс #120A: не-list ответ (dict) обязан красить прогон RuntimeError'ом,
+    не читаться как «алертов нет». Тело ниже — реальный dict HTTP 400 из
+    живого прогона 2026-09-12 (run 34681294715), взятый как ФОРМА ответа
+    об ошибке: сам этот запрос (с `&page=1`) новый код уже не шлёт, до
+    функции в таком виде не доходит — проверяется обработка формы, не
+    конкретная причина."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": {
+            "message": "Pagination using the `page` parameter is not supported.",
+            "documentation_url": "https://docs.github.com/rest/dependabot/alerts#list-dependabot-alerts-for-a-repository",
+            "status": "400",
+        },
+    })
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="не-list ответ"):
+        daw.open_dependabot_alerts(REPO)
+
+
+def test_open_dependabot_alerts_full_page_is_loud(monkeypatch):
+    """Класс #308: эндпоинт не листается (page не поддерживается, см. тест
+    выше), поэтому полная страница (100) — хвост недочитан — обязана быть
+    громким сбоем, не тихим усечением списка."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [REAL_SHARP_ALERT] * 100,
+    })
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="полную страницу"):
+        daw.open_dependabot_alerts(REPO)
+
+
 def test_dependabot_alert_watch_creates_task_for_new_alert(monkeypatch):
     created = {"number": 700}
     fake = FakeGh({
@@ -439,13 +472,31 @@ def test_dependabot_alert_watch_propagates_alert_list_read_failure(monkeypatch):
         daw.dependabot_alert_watch(REPO, NOW)
 
 
-def test_main_returns_nonzero_when_alert_list_read_fails(monkeypatch):
+def test_main_returns_nonzero_when_alert_list_read_fails(monkeypatch, capsys):
     fake = FakeGh({"dependabot/alerts?state=open": RuntimeError("gh api dependabot/alerts: HTTP 403")})
     patch_gh(monkeypatch, fake)
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
     assert daw.main() == 1
+    # 403 — подсказка о праве уместна: причина названа данными ошибки
+    assert "право vulnerability-alerts: read" in capsys.readouterr().err
+
+
+def test_main_does_not_guess_right_when_full_page(monkeypatch, capsys):
+    """Находка AI-ревью PR #1013 (класс «Алерт не гадает»): состояние
+    «полная страница» говорит о курсорной пагинации, а не о праве —
+    фикс-гипотеза «право отсутствует» в тексте 🚨 ложна и уводит
+    владельца проверять токен вместо дочитывания хвоста."""
+    fake = FakeGh({"dependabot/alerts?state=open": [REAL_SHARP_ALERT] * 100})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert daw.main() == 1
+    err = capsys.readouterr().err
+    assert "полную страницу" in err
+    assert "право vulnerability-alerts: read" not in err
 
 
 def test_main_returns_zero_on_healthy_run(monkeypatch):
