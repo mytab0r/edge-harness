@@ -235,13 +235,27 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       симптом из названия дефекта, просто не докатившийся до лимита. Оба
       числа — факты одного и того же прогона (маркер + independent
       пересчёт), не гипотезы — «алерт не гадает» не нарушается.
+  18. check_conflict_budget_stuck (#875; номер 17 занят #940 на момент
+      ребейза) — PR помечен `conflict`, бюджет авто-ребейза
+      (scheduler.CONFLICT_REWORK_MAX_ATTEMPTS) исчерпан, эскалация в
+      WATCHDOG_ISSUE уже стоит, а газа (маркер CONFLICT_BUDGET_RESET_MARKER,
+      `[conflict-budget-reset: ...]`, в теле задачи) с момента ЭТОЙ
+      эскалации не было дольше CONFLICT_BUDGET_STUCK_AFTER_HOURS (24ч).
+      Замер на живом репозитории 2026-09-09: 27 эскалаций за 2026-09-06..09,
+      ровно один живой случай ручного сброса (issue #116) — 18 из 19
+      конфликтующих PR стояли молча, и ни один инвариант этого не видел
+      (класс «тормоз без видимого газа»). Наблюдательный, не в CI_GATING
+      (см. блок-комментарий у самой функции): зависит от истории
+      эскалаций/PR, не от диффа текущего пуша.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
-он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
-Дополнительно repo-ci.yml печатает тот же отчёт на каждый push/PR (видимость
-раньше следующего пульса), но НЕ проваливает обязательную проверку `test`:
-пять инвариантов проверяют СОСТОЯНИЕ РЕПОЗИТОРИЯ (issues/PR/openspec), а не
-дифф текущего PR — обвал состояния, накопленный за месяцы, не вина автора
+он же вызывает escalate() для инвариантов 1, 3, 12, 15, 16 и 18 (см. docstring
+escalate_*). Дополнительно repo-ci.yml печатает тот же отчёт на каждый
+push/PR (видимость раньше следующего пульса), но НЕ проваливает обязательную
+проверку `test`: большинство инвариантов проверяют СОСТОЯНИЕ РЕПОЗИТОРИЯ
+(issues/PR/прогоны/openspec), а не дифф текущего PR — гейтят только
+локальные детерминированные сканы (CI_GATING ниже, сейчас 7 и 11): обвал
+состояния, накопленный за месяцы, не вина автора
 этого конкретного пуша, и превращать его в требование «почини чужой бэклог,
 чтобы слить свой PR» было бы третьим по счёту тормозом без объявленного газа
 (AGENTS.md, правило «Тормоз без газа не принимается»). Замер на живом
@@ -2039,6 +2053,228 @@ def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
         trusted_login=pulse_guard.EVENT_ACTOR_LOGIN)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 18 (#875; номер 17 занят #940 на момент ребейза): PR conflict с
+# исчерпанным бюджетом авто-ребейза стоит без движения дольше порога —
+# тормоз без видимого газа
+# ══════════════════════════════════════════════════════════════════════════
+#
+# dispatch_conflict_rework (scheduler.py, #474) даёт PR РОВНО одну засчитанную
+# попытку авто-ребейза (CONFLICT_REWORK_MAX_ATTEMPTS=1, pulse_guard.py) и,
+# исчерпав её, эскалирует ОДИН РАЗ в WATCHDOG_ISSUE (#120) маркером
+# CONFLICT_ESCALATION_MARKER — это правильная, единственная эскалация на
+# эпизод (issue_marker_times не даёт спамить). Единственный назначенный газ
+# ПОСЛЕ эскалации — ручной маркер CONFLICT_BUDGET_RESET_MARKER
+# (`[conflict-budget-reset: <причина>]`) в теле ЗАДАЧИ, сдвигающий границу
+# отсчёта бюджета (см. docstring scheduler.conflict_rework_attempts) — этот
+# газ нигде не задокументирован для человека, кроме комментария в коде: замер
+# 2026-09-09 — 27 эскалаций за 2026-09-06..09, ровно ОДИН живой случай
+# ручного сброса (issue #116). Остальные 18 из 19 конфликтующих PR стоят
+# молча: комментарий-эскалация уже утонул в истории #120 (постоянный канал,
+# десятки записей), а список инвариантов ни разу не смотрел на ЭТО состояние
+# (класс #244, докстринг модуля) — тормоз без видимого газа, запрещённый
+# класс AGENTS.md.
+#
+# Этот инвариант не спорит с самим бюджетом/критерием dirty (мех. ребейз,
+# .github/workflows/repo-ci.yml — источник конфликтов #749, работа другого
+# агента) — он делает уже накопленное состояние ВИДИМЫМ на каждом прогоне
+# build_report (repo-ci.yml на каждый push/PR + периодический пульс
+# orchestra.yml), а не только один раз в истории #120, и называет газ явным
+# текстом в самом алерте.
+#
+# Порог — тот же порядок величины, что уже держит scheduler.STALE_HOURS (24ч,
+# единственный существующий в кодовой базе порог именно для «состояние ждёт
+# ЧЕЛОВЕКА, автоматика больше не пытается сама» — WIP_GATE_STUCK_HOURS=8
+# держит другой класс, где газ автоматический). Сутки не дублируют только что
+# отправленную эскалацию (она и так ушла в Telegram тем же escalate()) и
+# достаточно коротки, чтобы 18 PR не копились неделями незамеченными, как
+# показал живой замер.
+#
+# Наблюдательный, не в CI_GATING: нарушение зависит от истории эскалаций и
+# PR, а не от диффа текущего пуша — гейтить им PR означало бы красить чужой
+# PR за чужой, уже идущий эпизод (тот же класс «тормоз без газа», от которого
+# уже отказались для 1/4/5/9/10, см. докстринг модуля).
+# ══════════════════════════════════════════════════════════════════════════
+
+CONFLICT_BUDGET_STUCK_AFTER_HOURS = 24
+
+
+def check_conflict_budget_stuck(
+    repo: str, now: datetime, open_pulls: list[dict], *,
+    open_task_numbers: set[int],
+) -> list[dict]:
+    """Инвариант 18 (#875): PR помечен `conflict` (review_labels.CONFLICT_LABEL),
+    бюджет авто-ребейза исчерпан (scheduler.conflict_rework_attempts >=
+    pulse_guard.CONFLICT_REWORK_MAX_ATTEMPTS — тот же счётчик, что читает
+    dispatch_conflict_rework, не второе число), эскалация в WATCHDOG_ISSUE УЖЕ
+    стоит (pulse_guard.CONFLICT_ESCALATION_MARKER — иначе dispatch_conflict_
+    rework ещё не дошёл до решения: например worker.yml ещё активен или
+    mergeable_state ещё не подтверждён dirty, см. докстринг
+    dispatch_conflict_rework), и с момента ИМЕННО ЭТОЙ эскалации не было
+    МАРКЕРА СБРОСА (pulse_guard.CONFLICT_BUDGET_RESET_MARKER в задаче — тот
+    же приём, что conflict_rework_attempts уже применяет для сдвига границы:
+    сброс ПОСЛЕ эскалации — это и есть подтверждённое движение, применённый
+    газ) дольше CONFLICT_BUDGET_STUCK_AFTER_HOURS часов.
+
+    open_task_numbers — номера ОТКРЫТЫХ задач (build_report уже читает их
+    для инвариантов 1/5, второй fetch не заводим). Влияет только на ГАЗ в
+    тексте (fact_line): маркер сброса в закрытой задаче диспатч не увидит
+    (пул задач собирается только из открытых, scheduler.main) — обещать ему
+    там «ещё одну попытку» значило бы врать в алерте (AGENTS.md, «Алерт не
+    гадает»), поэтому закрытая задача получает честный ручной путь. На САМО
+    решение «застрял» это не влияет: PR с меткой conflict стоит в любом
+    случае.
+
+    Задача не резолвится по имени ветки (task_ref.resolve_pr_task вернул
+    None) — не наш случай: dispatch_conflict_rework и без нас уже сообщает об
+    этом отдельной строкой («ветка не называет задачу»), считать бюджет не
+    для чего.
+
+    Сбой собственного инструмента — НЕ [] и НЕ крэш (находка ai-review
+    PR #883): каждый сетевой вызов здесь (conflict_rework_attempts,
+    история #120, маркеры задачи) бросает RuntimeError на сети/квоте/EOF, и
+    без обработки он ронял бы весь build_report → exit 1 → красную
+    обязательную проверку `test` в repo-ci на чужом пуше — для
+    наблюдательного инварианта, у которого и так нет действия жёстче
+    наблюдения (та же конвенция, что у инварианта 10). Вместо этого PR с
+    нечитаемой историей даёт элемент {"kind": "unverified", ...} — build_report
+    печатает его отдельной строкой «не подтверждено», в нарушения/эскалацию
+    он не попадает: молчаливый [] и молчаливый крэш — оба запрещены
+    (fail loud + «не знаешь — пиши не подтверждено»).
+
+    История #120 вычитывается ОДИН РАЗ за прогон, не на каждый застрявший PR
+    (находка ревью PR #883: полная пагинированная история самой длинной задачи
+    репозитория × N застрявших PR × каждые 15 минут — ровно класс расходов,
+    от которого репо уже отказывался, #472/rate_guard); фильтрация по маркеру
+    конкретного PR — локальная, через pulse_guard.issue_marker_times_from_
+    comments (та же семантика совпадения, второй копии нет). Сбой чтения #120
+    запоминается — N застрявших PR не порождают N повторных вычитываний
+    заведомо падающего запроса.
+
+    overlap — эвристика пересечения файлов (scheduler.conflict_overlap_hint,
+    тот же вызов, что уже делает dispatch_conflict_rework при эскалации,
+    второй копии не заводим) — только для ФАКТА в тексте (какие файлы
+    столкнулись), не для решения. Пустая строка — определить не удалось,
+    отчёт обязан сказать это честно, не молчать (AGENTS.md, «не знаешь — пиши
+    не подтверждено»). Сама conflict_overlap_hint свой RuntimeError уже ловит
+    (возвращает ""), — в try ниже не нужен."""
+    violations: list[dict] = []
+    watchdog_comments: list[dict] | None = None
+    watchdog_error: str | None = None
+
+    def escalation_times(number: int) -> list[datetime]:
+        """Времена эскалации ИМЕННО этого PR в #120 из ОДНОГО fetch'а истории
+        issue (см. докстринг функции). RuntimeError здесь значит «историю #120
+        прочитать не удалось» — обрабатывается наравне с остальными чтениями
+        PR, отдельного канала ошибки не заводим."""
+        nonlocal watchdog_comments, watchdog_error
+        if watchdog_comments is None and watchdog_error is None:
+            try:
+                watchdog_comments = pulse_guard.all_issue_comments(repo, WATCHDOG_ISSUE)
+            except RuntimeError as error:
+                watchdog_error = str(error)
+        if watchdog_error is not None:
+            raise RuntimeError(watchdog_error)
+        return pulse_guard.issue_marker_times_from_comments(
+            watchdog_comments,
+            f"{pulse_guard.CONFLICT_ESCALATION_MARKER} #{number}",
+        )
+
+    for pull in open_pulls:
+        labels = {label["name"] for label in pull["labels"]}
+        if review_labels.CONFLICT_LABEL not in labels:
+            continue
+        number = pull["number"]
+        task_number = task_ref.resolve_pr_task(pull)
+        if task_number is None:
+            continue
+        try:
+            attempts = scheduler.conflict_rework_attempts(repo, number, task_number)
+            if attempts < pulse_guard.CONFLICT_REWORK_MAX_ATTEMPTS:
+                continue  # бюджет не исчерпан — авто-механизм ещё жив
+            escalated_times = escalation_times(number)
+        except RuntimeError as error:
+            violations.append({
+                "kind": "unverified",
+                "pr": number,
+                "task": task_number,
+                "error": str(error),
+            })
+            continue
+        if not escalated_times:
+            continue  # ещё не эскалировано этим эпизодом — не наш случай
+        escalated_at = max(escalated_times)
+        try:
+            reset_times = pulse_guard.issue_marker_times(
+                repo, task_number, pulse_guard.CONFLICT_BUDGET_RESET_MARKER)
+        except RuntimeError as error:
+            violations.append({
+                "kind": "unverified",
+                "pr": number,
+                "task": task_number,
+                "error": str(error),
+            })
+            continue
+        if any(reset_at > escalated_at for reset_at in reset_times):
+            continue  # газ уже применён ПОСЛЕ этой эскалации — движение есть
+        age_hours = minutes_between(escalated_at, now) / 60
+        if age_hours <= CONFLICT_BUDGET_STUCK_AFTER_HOURS:
+            continue
+        violations.append({
+            "pr": number,
+            "task": task_number,
+            "attempts": attempts,
+            "limit": pulse_guard.CONFLICT_REWORK_MAX_ATTEMPTS,
+            "escalated_at": escalated_at.isoformat(),
+            "age_hours": round(age_hours, 1),
+            "overlap": scheduler.conflict_overlap_hint(repo, pull),
+            "task_open": task_number in open_task_numbers,
+        })
+    return violations
+
+
+def conflict_budget_stuck_fact_line(item: dict) -> str:
+    """Строка факта (AGENTS.md, «Алерт не гадает») — называет: сколько
+    попыток из лимита израсходовано, с какого момента (эскалация, не
+    создание PR/конфликта), какие файлы пересекаются (best-effort, честно
+    помечено при неудаче), и ЧТО ИМЕННО возвращает движение — дословный текст
+    маркера сброса и номер задачи, куда его писать. CONFLICT_BUDGET_RESET_
+    MARKER сам по себе ПРЕФИКС без закрывающей скобки (issue_marker_times
+    ищет его как подстроку, см. докстринг константы в pulse_guard.py) —
+    закрывающую `]` дописываем здесь явно, иначе человек скопировал бы в
+    комментарий синтаксически незакрытую конструкцию.
+
+    task_open=False (задача закрыта — находка ai-review PR #883): маркер
+    сброса в закрытой задаче диспатч не увидит (пул собирается только из
+    открытых задач, scheduler.main), поэтому газом называется реальный
+    ручной путь (ребейз + слить/закрыть PR), а не маркер, который ничего
+    бы не сделал."""
+    overlap_text = item["overlap"] or "не удалось определить (см. PR вручную)"
+    fact = (
+        f"PR #{item['pr']} (задача #{item['task']}) — бюджет авто-ребейза исчерпан "
+        f"({item['attempts']}/{item['limit']}), эскалирован в #{WATCHDOG_ISSUE} "
+        f"{item['escalated_at']} ({item['age_hours']} ч назад), маркера сброса с тех пор "
+        f"не было. Файлы-кандидаты конфликта: {overlap_text}."
+    )
+    if item.get("task_open", True):
+        gas = (
+            f" Газ: опубликуй в задаче #{item['task']} комментарий "
+            f"«{pulse_guard.CONFLICT_BUDGET_RESET_MARKER} <причина>]» — следующий проход "
+            "dispatch_conflict_rework (до 15 мин) даст PR ещё одну попытку "
+            "авто-ребейза; если конфликт содержательный — разреши вручную (git rebase "
+            "origin/main, push) и слей/закрой PR."
+        )
+    else:
+        gas = (
+            f" Газ: задача #{item['task']} ЗАКРЫТА — маркер сброса в ней диспатч не "
+            "увидит (пул задач собирается только из открытых), единственный путь — "
+            f"ручной: git rebase origin/main в ветке PR #{item['pr']} и слей/закрой PR "
+            "(переоткрыть закрытую задачу нельзя — AGENTS.md, «Закрытая задача не "
+            "переоткрывается никогда»)."
+        )
+    return fact + gas
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2331,6 +2567,34 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [16] заявленное и пересчитанное число PR, ждущих доработки, согласованы")
 
+    raw18 = check_conflict_budget_stuck(
+        repo, now, open_pulls, open_task_numbers={t["number"] for t in open_tasks})
+    v18 = [item for item in raw18 if item.get("kind") != "unverified"]
+    unverified18 = [item for item in raw18 if item.get("kind") == "unverified"]
+    findings[18] = v18
+    if v18:
+        lines.append(
+            f"🚨 [18] {len(v18)} PR conflict с исчерпанным бюджетом авто-ребейза стоят "
+            f"без сброса дольше {CONFLICT_BUDGET_STUCK_AFTER_HOURS} ч после эскалации:"
+        )
+        for item in v18:
+            lines.append(f"   — {conflict_budget_stuck_fact_line(item)}")
+    if unverified18:
+        # Честный пробел, не «здорово» и не крэш (находка ai-review PR #883,
+        # докстринг check_conflict_budget_stuck): застрявшие среди этих PR
+        # НЕ ПОДТВЕРЖДЕНЫ — и это не то же самое, что «их нет».
+        reasons = "; ".join(sorted({item["error"] for item in unverified18}))
+        lines.append(
+            f"⚠️ [18] {len(unverified18)} PR с меткой conflict НЕ ПРОВЕРЕНЫ: сбой чтения "
+            f"комментариев ({reasons}) — застрявшие среди них не подтверждены (не "
+            "«здорово»); перепроверится следующим прогоном"
+        )
+    if not v18 and not unverified18:
+        lines.append(
+            f"💚 [18] нет PR conflict с исчерпанным бюджетом, стоящих без сброса "
+            f"дольше {CONFLICT_BUDGET_STUCK_AFTER_HOURS} ч после эскалации"
+        )
+
     return lines, findings
 
 
@@ -2343,7 +2607,7 @@ def summary(lines: list[str]) -> None:
             file.write(text)
 
 
-ESCALATING_INVARIANTS = (1, 3, 12, 15, 16)
+ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 18)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -2445,13 +2709,29 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 16, key, text)
         if result:
             lines.append(f"📣 инвариант 16 эскалирован: {result}")
+    if findings.get(18):
+        v18 = findings[18]
+        # Один АГРЕГИРОВАННЫЙ комментарий на весь список, не по одному на
+        # PR (замечание задачи #875: 27 отдельных эскалаций в #120 по одной
+        # и той же причине уже утопили друг друга в истории issue) — та же
+        # идемпотентность по ключу, что у 1/3 выше: набор PR не изменился —
+        # тишина, изменился — новая (тоже единая) эскалация.
+        key = ",".join(f"#{i['pr']}" for i in v18)
+        text = (
+            "🚨 edge-harness: инвариант 18 (бюджет авто-ребейза конфликта исчерпан, "
+            f"газ не применён) — {len(v18)} PR:\n"
+            + "\n".join(f"— {conflict_budget_stuck_fact_line(item)}" for item in v18)
+        )
+        result = escalate_if_new(repo, 18, key, text)
+        if result:
+            lines.append(f"📣 инвариант 18 эскалирован: {result}")
     return lines
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestra", action="store_true",
-                         help="периодический режим: report + escalate (инварианты 1 и 3)")
+                         help="периодический режим: report + escalate (инварианты 1, 3, 12 и 15)")
     parser.add_argument(
         "--check-branch-protection", action="store_true",
         help="включить инвариант 6 (защита main-ветки, #341) — требует токен "
