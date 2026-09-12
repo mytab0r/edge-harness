@@ -235,7 +235,12 @@ def format_namespace_breakdown(days_summary: list[tuple[date, dict]]) -> str:
         "rows_written (сумма по всем снятым дням)",
         "---|---|---",
     ]
-    for ns, val in sorted(totals.items(), key=lambda kv: -kv[1]["rows_read"]):
+    # Порядок — по rows_written (затем rows_read при равенстве): правка #678
+    # существует ради ЗАПИСЕЙ, и пространство с большими записями и малыми
+    # чтениями — ровно то, кого ищет задача, — обязано быть первой строкой,
+    # а не хвостом таблицы, отсортированной по чтениям.
+    for ns, val in sorted(totals.items(),
+                          key=lambda kv: (-kv[1]["rows_written"], -kv[1]["rows_read"])):
         lines.append(f"{ns} | {val['rows_read']:,} | {val['rows_written']:,}")
     return "\n".join(lines)
 

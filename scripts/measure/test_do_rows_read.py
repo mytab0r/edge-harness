@@ -218,14 +218,27 @@ def test_format_table_shows_percent_of_daily_limit():
     assert "50.0%" in table
 
 
-def test_format_namespace_breakdown_sorted_descending():
+def test_format_namespace_breakdown_sorted_by_rows_written_not_read():
+    # #678 (находка AI-ревью PR #698): правка существует ради rows_written —
+    # сортировка по rows_read ставила пространство с большими ЗАПИСЯМИ и малыми
+    # чтениями (ровно цель задачи) последней строкой таблицы.
     day = date(2026, 9, 3)
     summary_a = {"by_namespace": {
-        "ns-a": {"rows_read": 10, "rows_written": 1},
-        "ns-b": {"rows_read": 999, "rows_written": 2},
+        "ns-writer": {"rows_read": 10, "rows_written": 999},
+        "ns-reader": {"rows_read": 999, "rows_written": 1},
     }}
     text = mod.format_namespace_breakdown([(day, summary_a)])
-    assert text.index("ns-b") < text.index("ns-a")
+    assert text.index("ns-writer") < text.index("ns-reader")
+
+
+def test_format_namespace_breakdown_tie_broken_by_rows_read():
+    day = date(2026, 9, 3)
+    summary_a = {"by_namespace": {
+        "ns-b": {"rows_read": 50, "rows_written": 7},
+        "ns-a": {"rows_read": 500, "rows_written": 7},
+    }}
+    text = mod.format_namespace_breakdown([(day, summary_a)])
+    assert text.index("ns-a") < text.index("ns-b")
 
 
 def test_format_namespace_breakdown_shows_rows_written_column():
