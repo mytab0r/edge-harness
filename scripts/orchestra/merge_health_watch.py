@@ -153,7 +153,6 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
-from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # pulse_guard сосед
 
@@ -384,10 +383,14 @@ def _open_watch_tasks(repo: str) -> list[dict]:
     некодированное `:` в query-параметре `labels=` как URL-синтаксис, не
     байт значения фильтра, и молча отвечает пустым списком, не ошибкой
     (класс #938, живое доказательство: `gh api ".../issues?labels=waiting:owner"`
-    → `[]`, тот же запрос с `%3A` → список задач). `quote(..., safe="")`
-    кодирует ВСЕ символы вне unreserved RFC 3986, включая двоеточие."""
+    → `[]`, тот же запрос с `%3A` → список задач). Кодирование — одно место
+    правды review_labels.label_query_value (внутри тот же
+    `quote(..., safe="")`), не собственный вызов urllib.parse.quote: разброс
+    прямых quote() по вызовам — то, против чего заведено это место правды
+    (#938)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={quote(PROCESS_LABEL, safe='')}&per_page=100",
+        f"repos/{repo}/issues?state=open&labels="
+        f"{review_labels.label_query_value(PROCESS_LABEL)}&per_page=100",
         pulse_guard.gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
@@ -404,7 +407,8 @@ def _tasks_created_since(repo: str, since: datetime) -> int:
     потолок по факту СОЗДАНИЯ (не текущей открытости): закрытая сегодня
     задача этого же механизма всё равно заняла квоту суток."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=all&labels={quote(PROCESS_LABEL, safe='')}&per_page=100",
+        f"repos/{repo}/issues?state=all&labels="
+        f"{review_labels.label_query_value(PROCESS_LABEL)}&per_page=100",
         pulse_guard.gh)
     return sum(
         1 for issue in issues

@@ -10,4 +10,9 @@
 # КАЖДАЯ подстановка переменной после `labels=` в query шла через неё, плюс
 # поведенческий тест на прод-форме (`waiting:owner` -> `waiting%3Aowner`).
 set -euo pipefail
+# pytest гвардия ставит сама (конвенция каталога — 22 скрипта с
+# `pip install --quiet pytest`): порядок алфавитного перебора каталога — не
+# контракт, сосед, ставивший pytest раньше (ci-guard-registration.sh), может
+# уйти или отвалиться, и тогда эта гвардия молча лишилась бы рантайма.
+pip install --quiet pytest
 python -m pytest scripts/lib/test_label_query_encoding_guard.py -q

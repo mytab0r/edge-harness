@@ -2209,7 +2209,11 @@ def after_merge(
             open_titles = {
                 issue["title"]
                 for issue in review_labels.list_pages(
-                    f"repos/{repo}/issues?state=open&labels=task&per_page=100", gh)
+                    # Литерал через место правды кодирования — тот же класс
+                    # #938: двоеточия в `task` сегодня нет, завтрашняя метка
+                    # с двоеточием сломалась бы здесь молча.
+                    f"repos/{repo}/issues?state=open&labels="
+                    f"{review_labels.label_query_value(TASK_LABEL)}&per_page=100", gh)
                 if "pull_request" not in issue
             }
             if tail_title in open_titles:

@@ -355,6 +355,13 @@ def test_waiting_owner_check_resolves_on_decision_comment(monkeypatch, offline_t
     assert lines == ["✅ #500: решение получено (вариант 1), метка снята"]
     deleted = [c for c in calls if c[0] == "-X" and c[1] == "DELETE" and "issues/500/labels" in c[2]]
     assert deleted, "ожидался DELETE issues/500/labels/waiting:owner"
+    # Сегмент метки в пути обязан быть кодированным (класс #938): gh api
+    # разворачивает `:owner` в пути как свой плейсхолдер, сырая форма
+    # `labels/waiting:owner` уходит на сервер как `labels/waitingmytab0r`
+    # и молча отвечает 404. Точный URL, не подстрока `issues/500/labels`,
+    # — иначе сырая форма проходила бы этот тест молча.
+    assert deleted[0][2] == f"repos/{REPO}/issues/500/labels/waiting%3Aowner", (
+        f"сегмент метки в пути DELETE обязан быть URL-кодированным, пришло: {deleted[0][2]}")
     commented = [c for c in calls if c[0] == "-X" and c[1] == "POST" and "issues/500/comments" in c[2]]
     assert commented, "подтверждение обязано быть оставлено в задаче"
 

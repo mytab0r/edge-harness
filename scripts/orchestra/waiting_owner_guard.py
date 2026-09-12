@@ -263,8 +263,12 @@ def waiting_owner_alert_text(repo: str, issue: dict) -> str:
 
 def open_task_issues(repo: str) -> list[dict]:
     """Открытые issues (не PR) с меткой `task` — источник кандидатов авто-метки."""
+    # Литерал тоже идёт через место правды кодирования: у `task` двоеточия
+    # сегодня нет, но завтрашняя метка вида `task:v2` сломалась бы здесь тем
+    # же молчаливым пустым списком, что `waiting:owner` (#938).
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels=task&per_page=100", pulse_guard.gh)
+        f"repos/{repo}/issues?state=open&labels="
+        f"{review_labels.label_query_value('task')}&per_page=100", pulse_guard.gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
@@ -294,8 +298,16 @@ def add_label(repo: str, number: int) -> None:
 
 
 def remove_label(repo: str, number: int) -> None:
+    # Сегмент метки в ПУТИ кодируется тем же местом правды, что и query
+    # (label_query_value — тот же quote(..., safe=""); %3A в пути GitHub
+    # декодирует обратно в ':'). Сырая форма тут ломалась дважды подряд: gh api
+    # разворачивает `:owner`/`:repo` в пути как СВОИ плейсхолдеры —
+    # `labels/waiting:owner` превращался в `labels/waitingmytab0r`, сервер
+    # отвечал 404 молча (живая проверка 2026-09-12: GET repos/.../labels/
+    # waiting%3Aowner → 200 с меткой, тот же путь с сырым `:` → 404).
     pulse_guard.gh("-X", "DELETE",
-                   f"repos/{repo}/issues/{number}/labels/{WAITING_OWNER_LABEL}")
+                   f"repos/{repo}/issues/{number}/labels/"
+                   f"{review_labels.label_query_value(WAITING_OWNER_LABEL)}")
 
 
 def waiting_owner_check(repo: str, now: datetime) -> list[str]:
