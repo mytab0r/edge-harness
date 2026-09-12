@@ -31,12 +31,13 @@ push-триггер по `dsh-edge/**` есть с #374.
      это прямо; push-триггер п.5 НЕ сработает для большинства мержей).
   7. Текст авто-PR (#664) не утверждает, что деплой не триггерится на push —
      `deploy-dsh-edge.yml` имеет push-триггер по `dsh-edge/**` с #374.
-  8. Пригодность task_issue (issue открыта, метка `task`) проверяется тем же
-     контрактом, что `contract_check.py::task_eligibility_problems`, ДО
-     сборки — иначе задача, закрытая приёмкой (`accept_merged_tasks`)
-     быстрее, чем форж успевает собраться (~20-60 минут), навсегда вешает
-     `contract:failed` на авто-PR, а часовой крон плодит новый мёртвый PR
-     каждый час (класс #320/#325, находка ревью PR #952, п.1).
+  8. Пригодность task_issue ДО сборки считает contract_check.py::
+     task_eligibility_problems — ТА ЖЕ функция, которой контракт красит PR
+     (открыта, метка `task`, НЕ `blocked`): вторая bash-копия критерия
+     разошлась с источником при рождении (нога `blocked` отсутствовала) —
+     задача с `blocked` проходила pre-flight, жгла 20-60 минут сборки и
+     открывала мёртвый PR (класс #320/#325, находки ревью PR #952 п.1 и
+     раунд 3 п.2).
   9. Причина отказа машинно-читаема (`SKIP_REASON`): по ней вызывающая
      ветка различает «задача непригодна» от «уже есть открытый PR того же
      дрейфа» — у них РАЗНЫЙ исход (находка ревью PR #952, п.2).
@@ -51,6 +52,12 @@ push-триггер по `dsh-edge/**` есть с #374.
  12. `workflow_dispatch` делает дешёвый pre-flight пригодности задачи до
      сборки — ручной диспатч с закрытым номером не тратит 20-60 минут
      раннера на мёртвый PR (находка ревью PR #952, чеклист).
+ 13. Красный крон форжа имеет ЖИВОГО потребителя: `plugin-forge.yml` в
+     `WATCHED_WORKFLOWS` (`scripts/orchestra/pulse_guard.py::
+     failure_watch`) — громкое падение schedule на ничейном дрейфе не
+     класс #255 («красный прогон, который никто не увидит»), а источник
+     ci-failure задачи = ОТКРЫТАЯ задача-владелец дрейфа, газ замкнут
+     (находка ревью PR #952, раунд 3, п.1).
 
 Запуск: python -m pytest scripts/lib/test_plugin_forge_auto_pr_guard.py -q
 """
@@ -159,7 +166,7 @@ def test_pr_body_deploy_trigger_claim_is_accurate():
 
 
 def test_prepare_checks_task_eligibility_before_build():
-    """Правило 8 (находка ревью PR #952, п.1)."""
+    """Правило 8 (находки ревью PR #952 п.1 и раунд 3 п.2)."""
     text = _text()
     assert "task_issue_usable" in text, (
         "prepare обязан проверять пригодность task_issue (issue открыта, "
@@ -167,12 +174,16 @@ def test_prepare_checks_task_eligibility_before_build():
         "которую приёмка успела закрыть, и авто-PR вешает contract:failed "
         "навсегда (класс #320/#325)"
     )
-    assert re.search(r'\$issue_state"\s*!=\s*"open"', text), (
-        "проверка пригодности обязана отвергать закрытую задачу"
+    assert "contract_check.task_eligibility_problems" in text, (
+        "пригодность задачи prepare обязан считать через contract_check.py::"
+        "task_eligibility_problems — то же место правды, которым контракт "
+        "красит PR (открыта, метка task, НЕ blocked): вторая bash-копия "
+        "критерия разошлась с источником при рождении (без ноги blocked) и "
+        "пропускала blocked-задачи в 20-60 минутную сборку"
     )
-    assert re.search(r'index\("task"\)', text), (
-        "проверка пригодности обязана требовать метку `task` на задаче "
-        "(тот же критерий, что contract_check.py::task_eligibility_problems)"
+    assert not re.search(r'\$issue_state"\s*!=\s*"open"', text), (
+        "bash-копия проверки состояния не должна вернуться — критерий "
+        "пригодности один, в contract_check.py::task_eligibility_problems"
     )
     assert 'auto_forge_allowed "$task_issue" "push $AFTER_SHA"' in text, (
         "push-ветка prepare обязана проверять пригодность задачи и дедуп "
@@ -200,8 +211,8 @@ def test_skip_reason_is_machine_readable():
         "попадает причина ПРЕДЫДУЩЕЙ задачи и следующая ветка решает по "
         "чужой причине"
     )
-    for reason in ("issue-unreadable", "not-an-issue", "task-closed",
-                   "no-task-label", "pr-list-failed", "duplicate-pr"):
+    for reason in ("issue-unreadable", "task-ineligible",
+                   "pr-list-failed", "duplicate-pr"):
         assert f'SKIP_REASON="{reason}"' in text, (
             f"причина «{reason}» обязана иметь своё значение SKIP_REASON — "
             "это носитель различения исходов для вызывающих веток"
@@ -265,6 +276,29 @@ def test_dispatch_preflights_task_eligibility():
     )
 
 
+def test_red_forge_cron_has_a_consumer():
+    """Правило 13 (находка ревью PR #952, раунд 3, п.1): громкое падение
+    schedule-страховки на ничейном дрейфе обязано доходить до живого
+    потребителя — plugin-forge.yml в WATCHED_WORKFLOWS pulse_guard'а;
+    иначе красный крон никем не читается (класс #255) и тормоз остаётся
+    без газа: ci-failure задача от failure_watch и есть та ОТКРЫТАЯ
+    задача-владелец дрейфа, которой не хватало газу."""
+    pulse = REPO_ROOT / "scripts" / "orchestra" / "pulse_guard.py"
+    assert pulse.exists(), (
+        f"{pulse} исчез или переименован — обнови носитель правила "
+        "сознательной правкой, а не молчаливым обходом"
+    )
+    source = pulse.read_text(encoding="utf-8")
+    watched = re.search(r'WATCHED_WORKFLOWS\s*=\s*\((.*?)\n\)', source, re.S)
+    assert watched and '"plugin-forge.yml"' in watched.group(1), (
+        "plugin-forge.yml обязан стоять в WATCHED_WORKFLOWS "
+        "(scripts/orchestra/pulse_guard.py): красный крон ничейного дрейфа "
+        "без failure_watch никто не увидит (класс #255), а ci-failure "
+        "задача от него — та самая ОТКРЫТАЯ задача-владелец дрейфа, которой "
+        "не хватало газу"
+    )
+
+
 def _schedule_branch(text: str) -> str:
     """Тело `schedule)` case-ветки job'а prepare — носитель правила 10."""
     match = re.search(r"\n            schedule\)\n(.*?)\n              ;;", text, re.S)
@@ -307,3 +341,5 @@ def _schedule_branch(text: str) -> str:
 #     test_dedup_checks_gh_exit_code_and_limit.
 #   М12 (правило 12): убрать pre-flight `task_issue_usable … || exit 1` из
 #     ветки workflow_dispatch — красен test_dispatch_preflights_task_eligibility.
+#   М13 (правило 13): убрать "plugin-forge.yml" из WATCHED_WORKFLOWS в
+#     scripts/orchestra/pulse_guard.py — красен test_red_forge_cron_has_a_consumer.

@@ -12,6 +12,9 @@
 #     громко: молча зелёный прогон здесь ровно в штатном случае крона прятал
 #     бы зависший навсегда дрейф (находка ревью PR #952, п.2); тихо
 #     пропускается только дедуп — уже есть открытый PR того же дрейфа.
+#     Красный крон не висит без потребителя: plugin-forge.yml в
+#     WATCHED_WORKFLOWS (pulse_guard.py::failure_watch) — ci-failure задача
+#     с открытым владельцем заводится автоматически, газ замкнут.
 # Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR (из ветки
 # agent/<task_issue>-forge-<id>-<ts> — контракт PR↔задача, #661) с обновлённым
 # dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
@@ -56,9 +59,13 @@ on:
     # заведён отдельной задачей (#946), scheduler.py вне территории этой
     # правки. Ограничение страховки, названное вслух (находка ревью PR
     # #952, п.2): дрейф резолвится в задачу, которую приёмка уже закрыла
-    # (класс #320/#325), — prepare падает ГРОМКО (газ: ручной `gh workflow
-    # run plugin-forge -f task_issue=<открытая задача>`, владеющая дрейфом;
-    # решение класса — #1009), а не пропускает дрейф молча-зелёным.
+    # (класс #320/#325), — prepare падает ГРОМКО, а не пропускает дрейф
+    # молча-зелёным. Газ замкнут автоматикой: красный крон ловит
+    # failure_watch (plugin-forge.yml в WATCHED_WORKFLOWS, pulse_guard.py) и
+    # заводит ci-failure задачу — ОТКРЫТУЮ задачу-владельца дрейфа; взявший
+    # её воркер делает ручной `gh workflow run plugin-forge -f task_issue=<
+    # номер этой задачи>`. Решение класса «какая задача владеет дрейф-PR» —
+    # #1009.
     - cron: "17 * * * *"
 
 permissions:
@@ -151,24 +158,31 @@ jobs:
           # ревью PR #952).
           SKIP_REASON=""
           task_issue_usable() {
-            local task_issue="$1" context="$2" issue_json issue_state
+            local task_issue="$1" context="$2" issue_json out count
             SKIP_REASON=""
             issue_json=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${task_issue}" -H "Accept: application/vnd.github+json") \
               || { SKIP_REASON="issue-unreadable"; echo "::error::${context}: не удалось прочитать issue #$task_issue — пригодность задачи не проверена" >&2; return 1; }
-            if jq -e 'has("pull_request")' <<<"$issue_json" >/dev/null 2>&1; then
-              SKIP_REASON="not-an-issue"
-              echo "::error::${context}: #$task_issue — это PR, а не задача из пула" >&2
-              return 1
-            fi
-            issue_state=$(jq -r '.state' <<<"$issue_json")
-            if [ "$issue_state" != "open" ]; then
-              SKIP_REASON="task-closed"
-              echo "::error::${context}: задача #$task_issue закрыта (приёмка закрывает задачу раньше, чем форж успевает собраться, класс #320/#325)" >&2
-              return 1
-            fi
-            if ! jq -e '[.labels[].name] | index("task") != null' <<<"$issue_json" >/dev/null 2>&1; then
-              SKIP_REASON="no-task-label"
-              echo "::error::${context}: на задаче #$task_issue нет метки \`task\`" >&2
+            # Одно место правды (находка ревью PR #952, раунд 3, п.2):
+            # пригодность задачи считает contract_check.py::
+            # task_eligibility_problems — ТА ЖЕ функция, которой контракт
+            # красит PR (открыта, метка `task`, НЕ `blocked`). Ранняя
+            # bash-копия здесь разошлась с источником при рождении (нога
+            # `blocked` отсутствовала): задача с `blocked` проходила
+            # pre-flight, жгла 20-60 минут сборки и открывала
+            # contract:failed PR. Функция чистая (issue-JSON на stdin,
+            # список проблем на stdout, первая строка — число проблем), тот
+            # же однострочный `python3 -c` через PYTHONPATH, что и резолвер
+            # task_ref выше; gh из python не вызывается — issues:read
+            # хватает.
+            out=$(printf '%s' "$issue_json" \
+              | PYTHONPATH="$GITHUB_WORKSPACE/scripts/orchestra${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+                'import sys, json, contract_check; ps = contract_check.task_eligibility_problems(json.load(sys.stdin), int(sys.argv[1])); print(len(ps)); [print("::error::пригодность задачи: " + p) for p in ps]' \
+                "$task_issue")
+            count=$(head -1 <<<"$out")
+            if [ "$count" != "0" ]; then
+              SKIP_REASON="task-ineligible"
+              tail -n +2 <<<"$out" >&2
+              echo "::error::${context}: задача #$task_issue непригодна по контракту (причины выше — contract_check.py::task_eligibility_problems, то же место правды, что красит PR)" >&2
               return 1
             fi
             return 0
@@ -312,19 +326,32 @@ jobs:
                   # зелёный прогон здесь ровно в штатном случае крона (задача
                   # закрыта приёмкой ~15 мин после мержа, сборка идёт 20-60
                   # минут) прятал бы зависший навсегда дрейф — находка ревью
-                  # PR #952, п.2. Газ: ручной `gh workflow run plugin-forge
-                  # -f plugin_path=<путь> -f task_issue=<ОТКРЫТАЯ задача>`,
-                  # владеющая дрейфом; решение класса (какая задача владеет
-                  # дрейф-PR после закрытия исходной приёмкой) — #1009.
+                  # PR #952, п.2. Газ автоматический: этот красный крон ловит
+                  # failure_watch (plugin-forge.yml в WATCHED_WORKFLOWS) и
+                  # заводит ci-failure задачу — открытую задачу-владельца
+                  # дрейфа; взявший её воркер делает ручной форж с явным
+                  # task_issue этой задачи. Решение класса — #1009.
                   if [ "$SKIP_REASON" = "duplicate-pr" ]; then
                     continue
                   fi
-                  echo "::error::schedule-дрейф $src_dir не форжится: дрейф есть ($src_dir исходники v$src_version, манифест v$asset_version), владельца нет (причина: ${SKIP_REASON}) — прогон валится громко; газ: ручной форж с явным task_issue открытой задачи (#1009 — решение класса)" >&2
+                  echo "::error::schedule-дрейф $src_dir не форжится: дрейф есть ($src_dir исходники v$src_version, манифест v$asset_version), владельца нет (причина: ${SKIP_REASON}) — прогон валится громко; красный крон заведёт ci-failure задачу (WATCHED_WORKFLOWS), её номер и есть task_issue для ручного форжа (#1009 — решение класса)" >&2
                   exit 1
                 fi
                 items=$(jq -c --arg p "$src_dir" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
                 echo "Дрейф: $src_dir исходники v$src_version ≠ манифест v$asset_version (id $manifest_id) — форжу под задачу #$task_issue"
               done < <(jq -r '.plugins[] | [.id, .package, .source.asset] | @tsv' dsh-edge/plugins.json)
+              # Новый плагин (исходники есть, записи в манифесте нет) цикл
+              # выше не посещает вовсе — он идёт по МАНИФЕСТУ (находка ревью
+              # PR #952, чеклист: «выпадает из дрейф-контроля молча»). Не
+              # молча: честный notice. Форжить НОВЫЙ плагин автоматически
+              # крон не может — у исходников нет резолвимой задачи-источника,
+              # новый плагин = осознанный ручной форж с явным task_issue.
+              for d in plugins-src/*/; do
+                [ -f "${d}package.json" ] || continue
+                pkg=$(jq -r '.name' "${d}package.json")
+                jq -e --arg pkg "$pkg" '.plugins[] | select(.package == $pkg)' dsh-edge/plugins.json >/dev/null \
+                  || echo "::notice::schedule: пакет $pkg ($d) есть в plugins-src, но его НЕТ в dsh-edge/plugins.json — крон его не форжит (новый плагин = ручной форж с осознанным task_issue)" >&2
+              done
               ;;
 
             *)
