@@ -1,0 +1,51 @@
+# Детектор регрессии здоровья конвейера, привязанный к слиянию (issue #967,
+# живой корень #878/#937): worker_success_rate «недавнее окно» против
+# АБСОЛЮТНОГО порога (не относительное отклонение от baseline — ревизия 2,
+# см. design.md в openspec/changes/archive/merge-triggered-health-regression)
+# — часы, не сутки, в отличие от суточного снимка `pipeline_health.py`/
+# `health_regression.py`. Отдельный файл, не правка orchestra.yml (та
+# территория занята параллельной работой — см. issue #967) и не правка
+# каденса самого пульса.
+#
+# Ни один шаг этого workflow не пишет в git — только чтение Actions/Issues/
+# Search API и, при регрессии, создание/комментирование issue + Telegram
+# (тот же канал, что и остальной конвейер, pulse_guard.escalate). Поэтому
+# GH_TOKEN — штатный `github.token`, не широкий GH_PIPELINE_PAT: PAT в
+# orchestra.yml нужен ИМЕННО для git push на ветку данных (issue #882),
+# которого здесь нет вовсе.
+name: merge-health-watch
+
+on:
+  schedule:
+    # Часовой каденс — тот же порядок величины, что OBSERVATION_WINDOW_HOURS
+    # (8ч) в merge_health_watch.py: детектор обязан успеть заметить регрессию
+    # в пределах наблюдательного окна, не только на его границе.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: merge-health-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Регрессия worker_success_rate, привязанная к слиянию
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/merge_health_watch.py run
