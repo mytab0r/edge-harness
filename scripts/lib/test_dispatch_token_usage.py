@@ -135,6 +135,13 @@ EXPECTED_WORKFLOWS = frozenset({
     # находки в пул), ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не использует
     # — тот же класс, что branch-protection-watch.yml/owner-decision.yml выше.
     "secret-scan.yml",
+    # #1025: периодическая саморевизия конвейера (scripts/orchestra/
+    # self_review.py). Читает только github.token (issues: read/write) +
+    # LLM-провайдерные секреты (транспорт — тот же scripts/review/ai_dsh.sh,
+    # что и ai-review.yml) + опциональные TELEGRAM_* для эскалации потолка
+    # (pulse_guard.escalate) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
+    # использует, тот же класс, что merge-health-watch.yml выше.
+    "self-review.yml",
     # #490: регистрация вебхука Telegram — только секреты TELEGRAM_BOT_TOKEN/
     # TELEGRAM_WEBHOOK_SECRET, ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
     # читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.

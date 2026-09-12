@@ -58,6 +58,19 @@ CONSUMERS: tuple[str, ...] = ("ai-review", "worker", "hands")
 # все три канала сейчас реально исполняют dsh_run_with_provider_chain
 # (#727/#797/#805, найдено на apply — proposal.md называл hands.yml без
 # failover, это устарело относительно кода, см. tasks.md «Находки»).
+#
+# self-review (#1025, scripts/orchestra/self_review.py) НЕ добавлен сюда
+# сознательно: этот канонический список совпадает с
+# check_provider_usage_manifest в scripts/orchestra/repo_invariants.py —
+# файлом, который параллельно правят другие PR (см. AGENTS.md этого change,
+# «не трогать»). self-review читает свою запись `.usage["self-review"]`
+# НАПРЯМУЮ через dsh_load_provider_chain_from_manifest (scripts/lib/
+# dsh-ci.sh) — bash-путь смотрит в config/provider-usage.json по ключу, не
+# через CONSUMERS: назначение работает и без строки в этом списке.
+# Видимость self-review в реестре docs/agents/LLM-PROVIDER-USAGE.md — из
+# CONSUMERS, поэтому её ЗДЕСЬ пока нет; это честный пробел, не скрытая
+# правка чужого инварианта — впиши, когда repo_invariants.py освободится
+# от параллельных PR (#944/#831/#1020/#811).
 CONSUMER_MECHANISM: dict[str, str] = {
     "ai-review": "dsh_run_with_provider_chain (scripts/review/ai_dsh.sh) — полный failover",
     "worker": "dsh_run_with_provider_chain (scripts/worker/task.sh) — полный failover",
