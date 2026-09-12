@@ -3743,12 +3743,26 @@ def upstream_drift_lines(repo: str) -> list[str]:
 # и не место: это НЕ «взять задачу из пула», а служебный проход планировщика.
 #
 # Виды улики — по составу файлов слитого PR (classify_acceptance):
-#   deploy  — задет cf-worker/: deploy-worker.yml (не PUSH-триггер под
-#             GITHUB_TOKEN — after_merge зовёт его сам) содержит канарейку UI
-#             последним шагом (deploy-worker.yml, «Канарейка UI на проде»),
-#             так что зелёный прогон = зелёная канарейка; вторая улика —
-#             {DSH_EDGE_URL}/api/health отвечает 200 (это публичный health
-#             самой этой морды, cf-worker/src/config.ts:healthUrl).
+#   deploy       — задет cf-worker/ (и НЕ dsh-edge/): deploy-worker.yml (не
+#             PUSH-триггер под GITHUB_TOKEN — after_merge зовёт его сам)
+#             содержит канарейку UI последним шагом (deploy-worker.yml,
+#             «Канарейка UI на проде»), так что зелёный прогон = зелёная
+#             канарейка; вторая улика — {DSH_EDGE_URL}/api/health отвечает 200
+#             (это публичный health самой этой морды, cf-worker/src/config.ts:
+#             healthUrl).
+#   deploy-dsh-edge — задет dsh-edge/ (и НЕ cf-worker/), #494: до этой правки
+#             классифицировался как script — задача закрывалась по зелёным
+#             check-runs PR, не дожидаясь реального деплоя морды (живой случай
+#             #518/#525 — слился PR, решавший коллизию тега релиза, а не сам
+#             блокер деплоя; деплой продолжил падать, задачу закрыла приёмка).
+#             Улика симметрична deploy — зелёный deploy-dsh-edge.yml (несёт
+#             канарейку прода, ingest-канарейку #119 и e2e-смоук #502 как шаги
+#             того же джоба) + {DSH_EDGE_URL}/api/health отвечает 200. См.
+#             dsh_edge_deploy_evidence.
+#   deploy-both — задеты ОБА префикса одним PR: обе улики (deploy-worker.yml
+#             И deploy-dsh-edge.yml) обязаны быть зелёными разом — иначе тот
+#             же класс #494 воспроизводится для смешанных PR: успешный деплой
+#             одной стороны молча закрыл бы задачу, чей PR сломал другую.
 #   script  — обычный код/скрипты/workflow: зелёные check-runs PR — это и есть
 #             прогон с выводом, тот же критерий «красного обязательного чека»,
 #             что уже использует merge_queue/pr_bad_checks.
@@ -3757,6 +3771,13 @@ def upstream_drift_lines(repo: str) -> list[str]:
 #             третий исход, не молчаливое закрытие: закрывается с явным
 #             обоснованием и проверкой, что заявленные файлы физически на
 #             месте в main (единственная проверяемая форма «источник правды»).
+#
+# plugins-src/** намеренно НЕ несёт своей ACCEPT_DEPLOY-ветки (проверено при
+# разборе #494): деплой плагина — не автоматическое следствие мержа кода
+# плагина, а отдельное решение владельца (workflow_dispatch plugin-forge.yml
+# с явным plugin_path). Задача «написать плагин» законно закрывается по
+# зелёным тестам (script) — релиз/деплой оформляется СЛЕДУЮЩИМ PR, который
+# правит dsh-edge/plugins.json и уже покрыт веткой deploy-dsh-edge выше.
 #
 # Три исхода, ни один не тихий (см. ACCEPTANCE_*_MARKER ниже):
 #   ok/docs — комментарий с уликой (или обоснованием для docs) → issue закрыт.
@@ -3783,10 +3804,13 @@ def upstream_drift_lines(repo: str) -> list[str]:
 # маркер-паттерн.
 
 ACCEPT_DEPLOY = "deploy"
+ACCEPT_DEPLOY_DSH_EDGE = "deploy-dsh-edge"
+ACCEPT_DEPLOY_BOTH = "deploy-both"
 ACCEPT_SCRIPT = "script"
 ACCEPT_DOCS = "docs"
 
 CF_WORKER_PREFIX = "cf-worker/"
+DSH_EDGE_PREFIX = "dsh-edge/"
 DOC_PATH_PREFIXES = ("docs/", "openspec/")
 
 ACCEPTANCE_OK_MARKER = "[приёмка: улика]"
@@ -3921,9 +3945,19 @@ def _is_doc_path(path: str) -> bool:
 
 
 def classify_acceptance(filenames: list[str]) -> str:
-    """Вид улики по составу изменённых файлов слитого PR — см. блок выше."""
-    if any(name.startswith(CF_WORKER_PREFIX) for name in filenames):
+    """Вид улики по составу изменённых файлов слитого PR — см. блок выше.
+
+    Порядок проверки намеренный: deploy-префиксы решаются ДО docs (правка,
+    тронувшая cf-worker/ или dsh-edge/ вперемешку с docs/**, всё равно требует
+    деплойной улики — примесь документации не отменяет реального деплоя)."""
+    touches_cf_worker = any(name.startswith(CF_WORKER_PREFIX) for name in filenames)
+    touches_dsh_edge = any(name.startswith(DSH_EDGE_PREFIX) for name in filenames)
+    if touches_cf_worker and touches_dsh_edge:
+        return ACCEPT_DEPLOY_BOTH
+    if touches_cf_worker:
         return ACCEPT_DEPLOY
+    if touches_dsh_edge:
+        return ACCEPT_DEPLOY_DSH_EDGE
     if filenames and all(_is_doc_path(name) for name in filenames):
         return ACCEPT_DOCS
     return ACCEPT_SCRIPT
@@ -3965,28 +3999,62 @@ def merged_pr_map(pulls: list[dict]) -> dict[int, dict]:
     return best
 
 
-def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None) -> tuple[str, str]:
-    """('ok'|'fail'|'pending', детали). Поднимает RuntimeError только на
-    инфраструктурный сбой (DSH_EDGE_URL не задан, /api/health недоступен) —
-    это отличается от 'fail' (улика получена и она красная).
-
-    Улика — прогон deploy-worker.yml ИМЕННО ЭТОГО мержа, а не «самый новый
-    после merged_at»: оркестратор сливает по одному PR каждые 15 минут, и
-    при двух cf-worker-мержах подряд «самый новый» после первого мержа —
-    это прогон ВТОРОГО (список идёт от нового к старому), и задача первого
-    тогда судится по чужому прогону (найдено в разборе AI-ревью PR #253).
-    Точный критерий — head_sha прогона равен merge_commit_sha этого PR (тот
-    же коммит, что и включает push-триггер деплоя). merge_commit_sha не
-    всегда доступен (пул не даёт его сразу после мержа) — тогда резерв:
-    самый РАННИЙ прогон после merged_at (его диспатчит push сразу же после
-    мержа), а не самый новый."""
-    payload = gh(f"repos/{repo}/actions/workflows/deploy-worker.yml/runs?per_page=10") or {}
+def _workflow_run_for_merge(
+    repo: str, workflow: str, merged_at: datetime, merge_commit_sha: str | None,
+) -> dict | None:
+    """Прогон `workflow` ИМЕННО ЭТОГО мержа — общий выбор кандидата для всех
+    deploy-веток приёмки (deploy_evidence/dsh_edge_deploy_evidence, #494 —
+    один код выбора, не копия на каждый workflow). Не «самый новый после
+    merged_at»: оркестратор сливает по одному PR каждые 15 минут, и при двух
+    мержах того же префикса подряд «самый новый» после первого мержа — это
+    прогон ВТОРОГО (список идёт от нового к старому), и задача первого тогда
+    судится по чужому прогону (найдено в разборе AI-ревью PR #253). Точный
+    критерий — head_sha прогона равен merge_commit_sha этого PR (тот же
+    коммит, что включает push-триггер деплоя). merge_commit_sha не всегда
+    доступен (пул не даёт его сразу после мержа) — тогда резерв: самый
+    РАННИЙ прогон после merged_at (его диспатчит push сразу же после мержа),
+    а не самый новый."""
+    payload = gh(f"repos/{repo}/actions/workflows/{workflow}/runs?per_page=10") or {}
     runs = payload.get("workflow_runs", [])
     if merge_commit_sha:
-        candidate = next((r for r in runs if r.get("head_sha") == merge_commit_sha), None)
-    else:
-        after = [r for r in runs if parse_time(r["created_at"]) >= merged_at]
-        candidate = min(after, key=lambda r: parse_time(r["created_at"])) if after else None
+        return next((r for r in runs if r.get("head_sha") == merge_commit_sha), None)
+    after = [r for r in runs if parse_time(r["created_at"]) >= merged_at]
+    return min(after, key=lambda r: parse_time(r["created_at"])) if after else None
+
+
+def _dsh_edge_health_status() -> int:
+    """GET {DSH_EDGE_URL}/api/health — код общий для обеих deploy-веток
+    приёмки (deploy_evidence, dsh_edge_deploy_evidence, #494), не копия.
+    Поднимает RuntimeError на инфраструктурный сбой (DSH_EDGE_URL не задан,
+    /api/health недоступен) — это отличается от 'fail' (улика получена и она
+    красная), тот же класс, что уже различает вызывающий accept_merged_tasks.
+
+    Класс #225 (найдено повторно в разборе AI-ревью PR #253): /api/health
+    публичный (не нужен логин), но всё равно идёт ЧЕРЕЗ МОРДУ Cloudflare —
+    запрос обязан нести явный User-Agent тем же _morde_opener(), которым
+    ходят _morde_login/_morde_rpc, иначе дефолтный `Python-urllib/3.x`
+    получает 403 error code:1010 ДО приложения (доказано живым запросом),
+    и deploy-класс приёмки не закрывается НИКОГДА."""
+    if not DSH_EDGE_URL:
+        raise RuntimeError("DSH_EDGE_URL не задан — /api/health не проверить")
+    req = urllib.request.Request(DSH_EDGE_URL.rstrip("/") + "/api/health")
+    try:
+        opener = _morde_opener()
+        with opener.open(req, timeout=DSH_EDGE_HEALTH_TIMEOUT) as resp:
+            return resp.status
+    except (urllib.error.URLError, OSError) as error:
+        # OSError — не только сетевые ошибки: socket.timeout (= TimeoutError с
+        # 3.10) при чтении ответа НЕ оборачивается urllib в URLError и раньше
+        # пробивал бы голый except RuntimeError вызывающего accept_merged_tasks
+        # (находка AI-ревью PR #253, тот же приём, что уже в archive_runner_sessions).
+        raise RuntimeError(f"/api/health недоступен: {error}") from error
+
+
+def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None) -> tuple[str, str]:
+    """('ok'|'fail'|'pending', детали) для правок cf-worker/** (ACCEPT_DEPLOY).
+    Поднимает RuntimeError только на инфраструктурный сбой — см.
+    _dsh_edge_health_status. Кандидат прогона — _workflow_run_for_merge."""
+    candidate = _workflow_run_for_merge(repo, "deploy-worker.yml", merged_at, merge_commit_sha)
     if candidate is None:
         return "pending", "deploy-worker.yml после мержа ещё не запускался"
     if candidate.get("conclusion") is None:
@@ -3994,28 +4062,61 @@ def deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None
     if candidate["conclusion"] != "success":
         return "fail", (f"deploy-worker.yml={candidate['conclusion']} "
                          f"(канарейка UI — последний шаг этого джоба) — {candidate['html_url']}")
-    if not DSH_EDGE_URL:
-        raise RuntimeError("DSH_EDGE_URL не задан — /api/health не проверить")
-    # Класс #225 (найдено повторно в разборе AI-ревью PR #253): /api/health
-    # публичный (не нужен логин), но всё равно идёт ЧЕРЕЗ МОРДУ Cloudflare —
-    # запрос обязан нести явный User-Agent тем же _morde_opener(), которым
-    # ходят _morde_login/_morde_rpc, иначе дефолтный `Python-urllib/3.x`
-    # получает 403 error code:1010 ДО приложения (доказано живым запросом),
-    # и deploy-класс приёмки не закрывается НИКОГДА.
-    req = urllib.request.Request(DSH_EDGE_URL.rstrip("/") + "/api/health")
-    try:
-        opener = _morde_opener()
-        with opener.open(req, timeout=DSH_EDGE_HEALTH_TIMEOUT) as resp:
-            status = resp.status
-    except (urllib.error.URLError, OSError) as error:
-        # OSError — не только сетевые ошибки: socket.timeout (= TimeoutError с
-        # 3.10) при чтении ответа НЕ оборачивается urllib в URLError и раньше
-        # пробивал бы голый except RuntimeError вызывающего accept_merged_tasks
-        # (находка AI-ревью PR #253, тот же приём, что уже в archive_runner_sessions).
-        raise RuntimeError(f"/api/health недоступен: {error}") from error
+    status = _dsh_edge_health_status()
     if status != 200:
         return "fail", f"деплой зелёный ({candidate['html_url']}), но /api/health вернул {status}"
     return "ok", f"deploy-worker.yml зелёный ({candidate['html_url']}), /api/health=200"
+
+
+def dsh_edge_deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None) -> tuple[str, str]:
+    """('ok'|'fail'|'pending', детали) для правок dsh-edge/** (ACCEPT_DEPLOY_DSH_EDGE,
+    #494) — симметрично deploy_evidence, другой workflow. До этой функции
+    classify_acceptance признавала deploy-улику только для cf-worker/**, и PR,
+    тронувший dsh-edge/** (манифест плагинов, патч-серия, пин апстрима),
+    закрывал задачу по зелёным check-runs головы PR — не дожидаясь реального
+    деплоя морды. Живой случай: PR #525 объявлял задачу #518 («деплой морды
+    падает: плагин требует убранный в апстриме пакет») первой строкой и решал
+    коллизию тега релиза, а не сам блокер — приёмка закрыла #518 по check-runs
+    #525, хотя deploy-dsh-edge.yml продолжал падать и прод остался на 0.8.0.
+
+    deploy-dsh-edge.yml несёт канарейку прода («Канарейка прода»),
+    ingest-канарейку (#119) и e2e-смоук (#502) как обычные шаги ОДНОГО джоба —
+    зелёный прогон целиком уже покрывает все три, тот же приём, что у
+    deploy-worker.yml («Канарейка UI на проде» последним шагом). Вторая
+    улика — тот же {DSH_EDGE_URL}/api/health, общий код с deploy_evidence
+    (_dsh_edge_health_status), не копия: здесь он даже точнее по смыслу — это
+    health самой правленой морды, а не сопутствующая проверка от cf-worker-ветки."""
+    candidate = _workflow_run_for_merge(repo, "deploy-dsh-edge.yml", merged_at, merge_commit_sha)
+    if candidate is None:
+        return "pending", "deploy-dsh-edge.yml после мержа ещё не запускался"
+    if candidate.get("conclusion") is None:
+        return "pending", f"deploy-dsh-edge.yml ещё выполняется — {candidate['html_url']}"
+    if candidate["conclusion"] != "success":
+        return "fail", (f"deploy-dsh-edge.yml={candidate['conclusion']} "
+                         f"(канарейка прода/ingest/e2e — шаги того же джоба) — {candidate['html_url']}")
+    status = _dsh_edge_health_status()
+    if status != 200:
+        return "fail", f"деплой зелёный ({candidate['html_url']}), но /api/health вернул {status}"
+    return "ok", f"deploy-dsh-edge.yml зелёный ({candidate['html_url']}), /api/health=200"
+
+
+def combined_deploy_evidence(repo: str, merged_at: datetime, merge_commit_sha: str | None) -> tuple[str, str]:
+    """('ok'|'fail'|'pending', детали) для PR, тронувшего ОБА префикса разом
+    (ACCEPT_DEPLOY_BOTH, #494) — обе улики обязаны быть 'ok' одновременно,
+    иначе тот же класс #494 воспроизводится для смешанных PR: зелёный деплой
+    одной стороны молча закрыл бы задачу, чей PR сломал другую. Худшее из
+    двух состояний побеждает (fail > pending > ok); детали конкатенируются —
+    видно обе половины, даже если только одна красная. Второй вызов
+    _dsh_edge_health_status внутри dsh_edge_deploy_evidence при обоих 'ok' —
+    осознанно избыточный (лишний HTTP), не общая ошибка: цена простоты
+    переиспользования готовых функций ниже цены отдельной третьей ветки
+    кода ради одного лишнего запроса."""
+    worker_state, worker_detail = deploy_evidence(repo, merged_at, merge_commit_sha)
+    edge_state, edge_detail = dsh_edge_deploy_evidence(repo, merged_at, merge_commit_sha)
+    rank = {"fail": 2, "pending": 1, "ok": 0}
+    state = worker_state if rank[worker_state] >= rank[edge_state] else edge_state
+    detail = f"deploy-worker: {worker_detail}; deploy-dsh-edge: {edge_detail}"
+    return state, detail
 
 
 def script_evidence(repo: str, head_sha: str) -> tuple[str, str]:
@@ -4266,6 +4367,26 @@ def replace_closed_task_prs(repo: str, pulls: list[dict], *, pool: list[dict]) -
     return lines
 
 
+# Столкновение двух тормозов (живой случай, разбор #494): приёмка закрыла
+# #518 по чужой улике (PR #525 решал коллизию тега, не сам блокер деплоя),
+# исполнитель дважды переоткрыл задачу за 6 минут, чтобы доделать (16:25,
+# 16:29), и оба раза reject_reopened_tasks закрыл её обратно молча (16:27,
+# 16:31, комментарий-отказ, которого исполнитель не читает) — работа встала,
+# пока владелец не завёл задачу-замену вручную. Ни приёмка, ни запрет
+# переоткрытия не виноваты каждый сам по себе (у обоих есть законная причина
+# существовать), виновата СВЯЗКА: у запрета нет газа для случая «меня
+# закрывают третий раз подряд, а не подчиняются». Начиная со второй подряд
+# попытки переоткрыть ОДНУ и ту же задачу, отказ несёт эскалацию тем же
+# каналом (WATCHDOG_ISSUE + Telegram), что и жёсткие сбои приёмки — не молчит
+# дальше «решение владельца», а зовёт владельца проверить, не приёмка ли
+# ошиблась. Отдельного маркера-дедупликатора не нужно (см. докстринг
+# reject_reopened_tasks про причину, по которой обычная дедупликация здесь не
+# нужна вовсе): попытка N считается по числу УЖЕ существующих комментариев с
+# REOPEN_REJECTED_MARKER на этой issue — эскалация случается ровно на N-й
+# попытке и не повторяется, пока не случится N+1-я.
+REOPEN_ESCALATION_THRESHOLD = 2
+
+
 def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
     """Закрытая задача не переоткрывается никогда (решение владельца, #369,
     дословно: «если закрыли то всё, создавайте новую»). GitHub не умеет
@@ -4303,7 +4424,16 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
     при этом правиле сценарий, который он защищал, больше не существует).
 
     WATCHDOG_ISSUE — постоянный канал эскалации (#120), не задача из пула,
-    и намеренно исключён (тот же приём, что у accept_merged_tasks)."""
+    и намеренно исключён (тот же приём, что у accept_merged_tasks).
+
+    Столкновение тормоза с приёмкой (#494, живой случай #518): исполнитель,
+    которого закрыла ошибшаяся приёмка, переоткрывает — этот механизм молча
+    закрывает обратно, исполнитель не читает комментарий и переоткрывает
+    снова, круг повторяется, пока не вмешается владелец вручную. Начиная со
+    второй подряд попытки переоткрыть ЭТУ ЖЕ issue (см. REOPEN_ESCALATION_THRESHOLD),
+    отказ несёт эскалацию тем же каналом (WATCHDOG_ISSUE + Telegram), что и
+    жёсткие сбои приёмки — не полагается на то, что переоткрывающий прочитает
+    обычный комментарий-отказ."""
     lines: list[str] = []
     for issue in pool:
         if issue.get("state_reason") != "reopened":
@@ -4311,12 +4441,30 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
         number = issue["number"]
         if number == WATCHDOG_ISSUE:
             continue
+        # Номер попытки — по числу УЖЕ существующих комментариев-отказов на
+        # этой issue (посчитано ДО того, как ниже добавится новый — иначе
+        # каждая попытка видела бы себя же и считала на единицу больше).
+        # Сбой чтения истории не должен блокировать сам отказ переоткрытия
+        # (обязательное поведение #369) — молча считаем «попытка первая»,
+        # эскалация просто не сработает в этот раз, а не откажет в отказе.
+        try:
+            prior_attempts = len(issue_marker_times(repo, number, REOPEN_REJECTED_MARKER))
+        except RuntimeError:
+            prior_attempts = 0
+        attempt = prior_attempts + 1
         text = (
             f"{REOPEN_REJECTED_MARKER} закрытая задача не переоткрывается "
             "никогда (решение владельца). Остаток работы, если он есть, "
             "оформляется НОВОЙ, более узкой задачей со ссылкой на эту "
             f"(#{number}) как related — не переоткрытием этой. Закрываю обратно."
         )
+        if attempt >= REOPEN_ESCALATION_THRESHOLD:
+            text += (
+                f" ⚠️ Это {attempt}-я попытка переоткрыть #{number} подряд — "
+                "похоже, приёмку сбило с толку, и задача закрыта ошибочно "
+                "(мерж PR ≠ достигнутый результат в проде, #494), а не что "
+                "работа лишняя. Эскалирую владельцу отдельно."
+            )
         try:
             post_issue_comment(repo, number, text)
             gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
@@ -4340,6 +4488,15 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
         except RuntimeError as error:
             lines.append(f"⚠️ замок task-{number} не снят: {error}")
         lines.append(f"🚫 #{number}: переоткрытие отклонено, задача закрыта обратно")
+        if attempt >= REOPEN_ESCALATION_THRESHOLD:
+            escalation = escalate(
+                repo, WATCHDOG_ISSUE,
+                f"🚨 #{number}: переоткрытие отклонено {attempt}-й раз подряд — "
+                "вероятно, приёмка закрыла задачу ошибочно (мерж PR доказывает "
+                "PR, не готовность задачи; #494). Нужен ручной разбор: "
+                "проверить, достигнут ли результат в проде, и завести "
+                "задачу-замену, если работа не завершена.")
+            lines.append(f"🚨 #{number}: переоткрытие #{attempt} эскалировано владельцу ({escalation})")
     return lines
 
 
@@ -4514,6 +4671,10 @@ def accept_merged_tasks(
                         state, detail = "docs", "правка — только удаления (архивация), физической проверки нет"
             elif category == ACCEPT_DEPLOY:
                 state, detail = deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
+            elif category == ACCEPT_DEPLOY_DSH_EDGE:
+                state, detail = dsh_edge_deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
+            elif category == ACCEPT_DEPLOY_BOTH:
+                state, detail = combined_deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
             else:
                 state, detail = script_evidence(repo, pull["head"]["sha"])
         except RuntimeError as error:

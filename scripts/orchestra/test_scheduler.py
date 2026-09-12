@@ -6394,6 +6394,48 @@ PR177 = merged_pull(177, PR_177_BODY, "67b23c9fb1bd43984c3a734bed569f0ae01a8d3c"
 PR163 = merged_pull(163, PR_163_BODY, "fc3e8b2ba2422e81ab23a7ebc2948d84d1f71650", "2026-09-02T20:46:31Z",
                      branch="agent/78-dsh-edge")
 
+# Прод-форма живого случая #494 (разбор инцидента #518/#525/#528, снята живым
+# `gh pr view 528`): PR #528 правит РОВНО dsh-edge/plugins.json (релиз
+# plugin-manager 0.1.6/integrations 0.1.2, sha256 в манифесте) — до фикса #494
+# classify_acceptance не признавала здесь ACCEPT_DEPLOY вовсе (файл не под
+# cf-worker/), задача закрылась бы по зелёным check-runs PR, не дожидаясь
+# deploy-dsh-edge.yml.
+PR_528_BODY = (
+    "## Что сделано\nЗадача #518, продолжение #521/#525 (снятие инъекции "
+    "убранного апстримом @deepseek-ai/dsh-client-runtime у plugin-manager/"
+    "integrations).\n\nОпубликованы plugins-manager-v0.1.6, "
+    "plugins-integrations-v0.1.2.\n\n## Дальше\nПосле мержа — "
+    "deploy-dsh-edge.yml (push-триггер на dsh-edge/**), зелёный прогон, "
+    "curl .../api/health → \"version\":\"0.11.1\"."
+)
+PR_528_FILES = ["dsh-edge/plugins.json"]
+PR_528_MERGE_COMMIT_SHA = "28878f63b5fd8db99599bea25b00970508e18f3e"
+PR528 = merged_pull(
+    528, PR_528_BODY, "83fef672ee69c3715e4d99cb387a4d0ccbcae26e",
+    "2026-09-06T16:30:48Z", merge_commit_sha=PR_528_MERGE_COMMIT_SHA,
+    branch="agent/518-plugins-manifest-bump",
+)
+
+# Реальный прогон deploy-dsh-edge.yml на голове ИМЕННО ЭТОГО мержа (снят живым
+# `gh run list --workflow=deploy-dsh-edge.yml`, 2026-09-06): деплой морды на
+# момент разбора #494 фактически ещё красный — задача #518/докрытие #528 не
+# закрылась бы этой уликой, даже если бы всё остальное было сделано верно.
+DEPLOY_DSH_EDGE_RUN_FOR_PR528_RED = {
+    "conclusion": "failure", "created_at": "2026-09-06T16:30:51Z",
+    "head_sha": PR_528_MERGE_COMMIT_SHA,
+    "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34045687070",
+}
+# Гипотетический «если бы деплой прошёл» прогон ТОГО ЖЕ мержа — та же форма
+# ответа API (структура полей снята с реального run выше), только conclusion
+# зелёный: нужен для положительной ветки того же живого случая (реальных
+# зелёных прогонов ИМЕННО этого мержа не существует, деплой на 2026-09-06
+# фактически красный, см. DEPLOY_DSH_EDGE_RUN_FOR_PR528_RED).
+DEPLOY_DSH_EDGE_RUN_FOR_PR528_GREEN = {
+    "conclusion": "success", "created_at": "2026-09-06T16:35:00Z",
+    "head_sha": PR_528_MERGE_COMMIT_SHA,
+    "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34045687070",
+}
+
 
 def test_classify_acceptance_deploy_when_cf_worker_touched():
     assert sch.classify_acceptance(PR_177_FILES) == sch.ACCEPT_DEPLOY
@@ -6405,6 +6447,20 @@ def test_classify_acceptance_script_for_workflow_and_scripts():
 
 def test_classify_acceptance_docs_when_only_openspec_md():
     assert sch.classify_acceptance(PR_163_FILES) == sch.ACCEPT_DOCS
+
+
+def test_classify_acceptance_deploy_dsh_edge_when_dsh_edge_touched():
+    """#494, прод-форма PR #528 (реальный `dsh-edge/plugins.json`): до фикса
+    classify_acceptance не признавала dsh-edge/ вовсе и вернула бы script —
+    ровно тот класс, что закрыл #518 раньше реального деплоя."""
+    assert sch.classify_acceptance(PR_528_FILES) == sch.ACCEPT_DEPLOY_DSH_EDGE
+
+
+def test_classify_acceptance_deploy_both_when_cf_worker_and_dsh_edge_touched():
+    """Смешанный PR (оба префикса разом) — тот же класс #494 воспроизводится
+    для смеси, если судить по одной из двух улик: обязаны обе."""
+    mixed = PR_177_FILES + PR_528_FILES
+    assert sch.classify_acceptance(mixed) == sch.ACCEPT_DEPLOY_BOTH
 
 
 def test_merged_pr_map_uses_branch_not_prose_mention():
@@ -6680,13 +6736,78 @@ def test_reject_reopened_tasks_never_closes_watchdog_issue(monkeypatch):
 def test_reject_reopened_tasks_reports_soft_failure_without_crashing(monkeypatch):
     """Сетевой/API сбой на комментарии или PATCH не должен ронять обход
     остальных задач пула — тот же принцип, что и у accept_merged_tasks."""
-    fake = FakeGh({})
+    fake = FakeGh({
+        # Номер попытки переоткрытия (#494) читает историю комментариев ДО
+        # самого отказа — пустая история обеих issue, не предмет этого теста.
+        "issues/111/comments": [],
+        "issues/114/comments": [],
+    })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(
         monkeypatch, lambda *a: (_ for _ in ()).throw(RuntimeError("HTTP 500")))
     pool = [issue(111, state_reason="reopened"), issue(114, state_reason="reopened")]
     lines = sch.reject_reopened_tasks(REPO, pool)
     assert len([line for line in lines if "не отклонено" in line]) == 2
+
+
+def test_reject_reopened_tasks_first_attempt_does_not_escalate(monkeypatch):
+    """Первая попытка переоткрыть — обычный отказ (решение владельца #369),
+    без эскалации: шум на каждую первую попытку убил бы сигнал у настоящих
+    повторов (#494)."""
+    fake = FakeGh({
+        "issues/518/comments": [],  # пустая история — это первая попытка
+        "issues/518 -f state=closed": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda *a: escalated.append(a) or "не должно вызываться")
+
+    pool = [issue(518, assignees=(), state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+
+    assert escalated == []
+    assert not any("эскалировано" in line for line in lines)
+    assert "⚠️" not in posted[0][1]
+
+
+def test_reject_reopened_tasks_escalates_repeat_attempt_prod_form(monkeypatch):
+    """Прод-форма живого случая #494 (issue #518, разбор инцидента 2026-09-06):
+    приёмка ошибочно закрыла #518 по чужой улике (PR #525 решал коллизию тега,
+    не сам блокер деплоя), исполнитель дважды переоткрыл за 6 минут (16:25,
+    16:29), и оба раза reject_reopened_tasks закрывал обратно молча (16:27,
+    16:31) — работа встала, пока владелец не завёл задачу-замену вручную.
+    Этот тест воспроизводит ВТОРУЮ попытку (issue уже несёт один комментарий
+    REOPEN_REJECTED_MARKER от первого отказа) — начиная с неё, отказ обязан
+    эскалировать владельцу тем же каналом (WATCHDOG_ISSUE + Telegram), что и
+    жёсткие сбои приёмки."""
+    first_rejection_comment = {
+        "created_at": "2026-09-06T16:27:00Z",
+        "body": f"{sch.REOPEN_REJECTED_MARKER} закрытая задача не переоткрывается никогда…",
+    }
+    fake = FakeGh({
+        "issues/518/comments": [first_rejection_comment],
+        "issues/518 -f state=closed": None,
+    })
+    patch_gh(monkeypatch, fake)
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    pool = [issue(518, assignees=(), state_reason="reopened")]
+    lines = sch.reject_reopened_tasks(REPO, pool)
+
+    # Комментарий отказа на самой задаче несёт предупреждение — исполнитель,
+    # который читает СВОЮ issue, видит его прямо там, не только в WATCHDOG.
+    assert posted[0] == (518, posted[0][1]) and "2-я попытка" in posted[0][1]
+    # Эскалация (escalate(), #494) ушла ВТОРЫМ комментарием — в WATCHDOG_ISSUE
+    # (#120), не в саму задачу: post_issue_comment переиспользован тем же
+    # патчем, что и основной комментарий отказа, поэтому виден в том же списке.
+    assert posted[1][0] == sch.WATCHDOG_ISSUE
+    assert "518" in posted[1][1]
+    assert any("518" in line and "эскалировано" in line for line in lines)
 
 
 def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
@@ -6731,9 +6852,13 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
-    # Единственный сырой gh-вызов этого сценария — PATCH закрытия отклонённого
-    # переоткрытия (post_issue_comment/claim_task.release уже замоканы выше).
-    patch_gh(monkeypatch, FakeGh({"issues/131 -f state=closed": None}))
+    # Сырые gh-вызовы этого сценария — номер попытки переоткрытия (#494,
+    # пустая история) и PATCH закрытия отклонённого переоткрытия
+    # (post_issue_comment/claim_task.release уже замоканы выше).
+    patch_gh(monkeypatch, FakeGh({
+        "issues/131/comments": [],
+        "issues/131 -f state=closed": None,
+    }))
     patch_post_issue_comment(monkeypatch, lambda *a: None)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -6941,6 +7066,113 @@ def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
 
     assert hard_failure is False
     assert any("закрыта приёмкой (deploy)" in line and "#21" in line for line in (observations + actions))
+
+
+# ── ACCEPT_DEPLOY_DSH_EDGE (#494): симметричная улика для dsh-edge/** ────────────
+
+
+def test_accept_merged_tasks_does_not_close_on_red_dsh_edge_deploy_prod_form(monkeypatch):
+    """Прод-форма живого случая #518/#525/#528 (реальный `gh pr view 528` +
+    `gh run list --workflow=deploy-dsh-edge.yml`, 2026-09-06): PR #528 правит
+    dsh-edge/plugins.json, деплой на голове этого мержа фактически КРАСНЫЙ.
+    До фикса #494 classify_acceptance вернула бы script — задача закрылась бы
+    зелёными check-runs PR, не заметив красного деплоя. После фикса — deploy
+    красный останавливает закрытие."""
+    fake = FakeGh({
+        "pulls/528/files": files_payload(PR_528_FILES),
+        "issues/518/comments": [],
+        "actions/workflows/deploy-dsh-edge.yml/runs?per_page=10": {
+            "workflow_runs": [DEPLOY_DSH_EDGE_RUN_FOR_PR528_RED]},
+        "-X DELETE repos/mytab0r/edge-harness/issues/518/assignees": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(518, assignees=("mytab0r",))]
+    observations, actions, hard_failure = sch.accept_merged_tasks(
+        REPO, pool, {518: PR528}, open_pulls_list=[])
+
+    assert hard_failure is False
+    assert not any(call.startswith(f"-X PATCH repos/{REPO}/issues/518") for call in fake.calls)
+    assert any("не закрыта" in line and "#518" in line and "deploy-dsh-edge" in line
+               for line in (observations + actions))
+    assert posted and "результат не достигнут" in posted[0][1]
+
+
+def test_accept_merged_tasks_closes_on_green_dsh_edge_deploy_and_health(monkeypatch):
+    """Симметрично cf-worker-ветке: зелёный deploy-dsh-edge.yml (канарейка
+    прода/ingest/e2e — шаги того же джоба) + /api/health=200 → задача
+    закрыта. Прод-форма PR #528 (см. фикстуры выше), только прогон подставлен
+    зелёным (DEPLOY_DSH_EDGE_RUN_FOR_PR528_GREEN), чтобы проверить обратную
+    сторону того же живого случая."""
+    fake = FakeGh({
+        "pulls/528/files": files_payload(PR_528_FILES),
+        "issues/518/comments": [],
+        "issues/518 -f state=closed": None,
+        "actions/workflows/deploy-dsh-edge.yml/runs?per_page=10": {
+            "workflow_runs": [DEPLOY_DSH_EDGE_RUN_FOR_PR528_GREEN]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
+    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    posted = []
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+
+    pool = [issue(518, assignees=("mytab0r",))]
+    observations, actions, hard_failure = sch.accept_merged_tasks(
+        REPO, pool, {518: PR528}, open_pulls_list=[])
+
+    assert hard_failure is False
+    assert any(call.startswith(f"-X PATCH repos/{REPO}/issues/518") for call in fake.calls)
+    assert any("закрыта приёмкой (deploy-dsh-edge)" in line and "#518" in line
+               for line in (observations + actions))
+    assert posted and "улика получена" in posted[0][1]
+
+
+def test_dsh_edge_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
+    """Тот же класс гонки, что и у deploy_evidence (находка AI-ревью PR #253):
+    два dsh-edge-мержа подряд — головной прогон в ответе новее и красный
+    (чужого мержа), собственный прогон этого мержа старше по списку, но
+    зелёный. Правильная улика — head_sha прогона равен merge_commit_sha."""
+    fake = FakeGh({
+        "actions/workflows/deploy-dsh-edge.yml/runs?per_page=10": {"workflow_runs": [
+            {"conclusion": "failure", "created_at": "2026-09-06T16:41:14Z",
+             "head_sha": "4c21bcc47ae8d802e9b8d41e80b0d51765b0f9fd",
+             "html_url": "https://github.com/mytab0r/edge-harness/actions/runs/34046242131"},
+            DEPLOY_DSH_EDGE_RUN_FOR_PR528_RED,
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    state, detail = sch.dsh_edge_deploy_evidence(
+        REPO, sch.parse_time("2026-09-06T16:30:48Z"), PR_528_MERGE_COMMIT_SHA)
+    assert state == "fail"
+    assert "34045687070" in detail
+
+
+def test_combined_deploy_evidence_worst_of_two_when_cf_worker_side_fails(monkeypatch):
+    """ACCEPT_DEPLOY_BOTH (#494): dsh-edge-сторона зелёная, cf-worker-сторона
+    красная — итог обязан быть 'fail' целиком (худшее из двух), а не 'ok' по
+    одной лишь дошедшей улике."""
+    monkeypatch.setattr(sch, "deploy_evidence",
+                         lambda repo, merged_at, sha: ("fail", "deploy-worker.yml=failure"))
+    monkeypatch.setattr(sch, "dsh_edge_deploy_evidence",
+                         lambda repo, merged_at, sha: ("ok", "deploy-dsh-edge.yml зелёный"))
+    state, detail = sch.combined_deploy_evidence(REPO, sch.parse_time("2026-09-06T16:30:48Z"), "sha")
+    assert state == "fail"
+    assert "deploy-worker.yml=failure" in detail and "deploy-dsh-edge.yml зелёный" in detail
+
+
+def test_combined_deploy_evidence_ok_only_when_both_sides_ok(monkeypatch):
+    monkeypatch.setattr(sch, "deploy_evidence",
+                         lambda repo, merged_at, sha: ("ok", "deploy-worker.yml зелёный"))
+    monkeypatch.setattr(sch, "dsh_edge_deploy_evidence",
+                         lambda repo, merged_at, sha: ("ok", "deploy-dsh-edge.yml зелёный"))
+    state, detail = sch.combined_deploy_evidence(REPO, sch.parse_time("2026-09-06T16:30:48Z"), "sha")
+    assert state == "ok"
 
 
 # ── /api/health: находки AI-ревью PR #253 (403 без явного UA, таймаут не громкий) ─
