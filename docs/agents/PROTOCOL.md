@@ -321,7 +321,7 @@ concurrency-группой `orchestra` — два слияния никогда 
   улика — те же категории, что у штатной приёмки, плюс «коммит слияния —
   предок main» (класс #925); потолок закрытий за прогон — газ, обоснован в
   докстринге модуля. Дельта-спека:
-  [`openspec/changes/reference-closure/specs/journal-tasks-hands/spec.md`](../../openspec/changes/reference-closure/specs/journal-tasks-hands/spec.md).
+  [`openspec/changes/archive/reference-closure/specs/journal-tasks-hands/spec.md`](../../openspec/changes/archive/reference-closure/specs/journal-tasks-hands/spec.md).
 - **Запрет переоткрытия (#369)**: закрытая задача не переоткрывается никогда — GitHub
   не отклоняет reopen нативно, поэтому пульс сам находит задачу пула с
   `state_reason == "reopened"` (поле уже в списке `open_task_issues`, без
