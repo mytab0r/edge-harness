@@ -26,9 +26,13 @@
      `uses`/`with`/…) останавливает перенос ВСЕГО набора этого вызова с
      точным сообщением, какой ключ и в каком шаге не разобран
      (`UnsupportedStepError` — «не пропускать молча», AGENTS.md «Fail
-     loud»). Перенос атомарный по вызову: либо переносятся ВСЕ найденные
-     шаги, либо (при первом же неразборе) НИ ОДИН файл не меняется —
-     проще и безопаснее частичного отката на середине записи.
+     loud»). `run:` с выражением GitHub Actions `${{ … }}` тоже не
+     разбирается (находка ревью PR #902): выражение вычисляет Actions при
+     прогоне workflow, в файле каталога оно осталось бы дословным текстом,
+     который shell не вычислит. Перенос атомарный по вызову: либо
+     переносятся ВСЕ найденные шаги, либо (при первом же неразборе) НИ
+     ОДИН файл не меняется — проще и безопаснее частичного отката на
+     середине записи.
   3. Имя файла каталога определяется по файлу, который РЕАЛЬНО исполняет
      `run:` (тот же разбор `_extract_run_targets`, что уже доказал себя в
      `ci_guard_registration_guard.py` для сверки каталог↔рукописный шаг —
@@ -48,14 +52,21 @@
   5. Пишет `scripts/ci/guards/<имя>.sh` (шебанг, `set -euo pipefail`,
      опциональный `cd` при `working-directory:`, дословное тело `run:`,
      исходный комментарий шага дословно, если был) — БЕЗ бита исполнения:
-     живой снимок каталога на дату issue #897 показывает все 14 файлов
-     как режим `100644` (`git ls-tree`), `scripts/ci/run_guards.sh` зовёт
+     весь каталог `scripts/ci/guards/*.sh` несёт режим `100644` (проверено
+     `git ls-tree` и на дату issue #897, и на дату ревью PR #902; каталог
+     растёт, фиксирован режим, а не число файлов — вторую копию замера
+     рядом не заводим, некритичное замечание ревью PR #902),
+     `scripts/ci/run_guards.sh` зовёт
      каждый файл ЧЕРЕЗ интерпретатор (`bash "$script"`), не напрямую —
      бит исполнения этому механизму не нужен (не тот класс, что #510/#516:
      там падал ПРЯМОЙ вызов `run: scripts/foo.sh` без интерпретатора).
   6. Удаляет комментарий и сам шаг из текста `repo-ci.yml` (ALLOWLIST не
-     трогает — новые шаги в неё никогда не попадали) и схлопывает
-     образовавшиеся задвоенные пустые строки.
+     трогает — новые шаги в неё никогда не попадали) и схлопывает пустую
+     строку, задвоившуюся РОВНО на стыке удаления. Схлопывание идёт только
+     в окрестности удалённых диапазонов, не по всему файлу (находка ревью
+     PR #902, второй круг): глобальный проход перекрашивал бы чужие части
+     файла — пустые строки внутри чужого `run: |` (heredoc с двумя пустыми
+     строками) — легальное содержимое другого job'а, терять их молча нельзя.
   7. `_verify_removal` — самопроверка ПЕРЕД записью на диск (находка ревью
      PR #902): пустая строка внутри блока `run: |` (обычный стиль этого
      репозитория) обрывает диапазон удаления раньше конца шага, и хвост
@@ -64,9 +75,13 @@
      эту порчу не ловит. Проверка перепарсивает `new_text` и сверяет
      структурно: (а) ни одно перенесённое имя не осталось в файле — заодно
      закрывает дублирующееся имя шага (переносится только ПЕРВОЕ текстовое
-     вхождение, второе осталось бы видно этой проверкой); (б) множество
-     оставшихся шагов (по содержимому, не только имени) равно «старые шаги
-     минус перенесённые». Расхождение — `UnsupportedStepError` до единой
+     вхождение, второе осталось бы видно этой проверкой); (б) ВЕСЬ
+     разобранный документ после удаления равен «старый документ минус
+     перенесённые шаги» (deep equality, находка ревью PR #902, второй круг)
+     — не только job `test`: пустая строка внутри чужого `run: |` — часть
+     скаляра, deep equality ловит её потерю в ЛЮБОМ job'е, а не только там,
+     куда смотрит структурная сверка шагов. Расхождение любого рода —
+     `UnsupportedStepError` до единой
      записи файла, тот же принцип атомарности, что и остальной модуль.
 
 Возвращает `TranslationResult(migrated=[...], changed_paths=[...])` —
@@ -86,10 +101,10 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import copy
 import re
 import shlex
 import sys
-from collections import Counter
 from dataclasses import dataclass, field
 
 import yaml
@@ -220,6 +235,17 @@ def _comment_lines_from(lines: list[str], start: int, step_start: int) -> list[s
 
 
 def _remove_ranges(lines: list[str], ranges: list[tuple[int, int]]) -> list[str]:
+    """Удаляет диапазоны строк (границы включительно) и схлопывает пустую
+    строку, задвоившуюся РОВНО на стыке удаления (пустая строка
+    непосредственно ПЕРЕД диапазоном при пустой непосредственно ПОСЛЕ).
+    Схлопывание — только в окрестности удалённых диапазонов (находка ревью
+    PR #902, второй круг): глобальный проход «убрать все задвоенные пустые
+    строки по всему файлу» перекрашивал бы чужие части repo-ci.yml — пустые
+    строки внутри чужого `run: |` (например, heredoc с двумя пустыми
+    строками подряд в другом job'е) — легальное содержимое, которое ничья
+    структурная сверка шагов job `test` не защищает; после этой правки
+    содержимое файла ВНЕ окрестности удалённых диапазонов сохраняется байт
+    в байт, а потерю где-либо ещё громко ловит `_verify_removal`."""
     to_skip: set[int] = set()
     for start, end in ranges:
         for i in range(start, end + 1):
@@ -229,7 +255,21 @@ def _remove_ranges(lines: list[str], ranges: list[tuple[int, int]]) -> list[str]
                     "дублирующееся имя шага; перенеси конфликтующие шаги вручную"
                 )
             to_skip.add(i)
-    return [line for i, line in enumerate(lines) if i not in to_skip]
+    drop: set[int] = set()
+    for start, end in sorted(ranges):
+        before = start - 1
+        while before >= 0 and before in to_skip:
+            before -= 1
+        if before < 0 or lines[before].strip() != "":
+            continue
+        after = end + 1
+        while after < len(lines) and after in to_skip:
+            after += 1
+        if after < len(lines) and lines[after].strip() == "":
+            drop.add(before)
+    return [
+        line for i, line in enumerate(lines) if i not in to_skip and i not in drop
+    ]
 
 
 def _step_signature(step: object) -> tuple:
@@ -241,7 +281,46 @@ def _step_signature(step: object) -> tuple:
     return tuple(sorted((key, step.get(key)) for key in step))
 
 
-def _verify_removal(new_text: str, steps: list[dict], plans: list["_StepPlan"]) -> None:
+def _expected_doc_after_removal(doc: dict, plans: list["_StepPlan"]) -> dict:
+    """Ожидаемый разобранный документ ПОСЛЕ переноса: точная глубокая копия
+    исходного, из `jobs.test.steps` которой удалено ровно по одному
+    вхождению каждого перенесённого шага. Сравнивается с перепарсенным
+    новым текстом в `_verify_removal` — deep equality ловит ЛЮБОЕ
+    структурное расхождение в любом job'е (пустая строка внутри чужого
+    `run: |` — часть скаляра, её потеря меняет строку и видна сравнению),
+    не только шаги job `test` (находка ревью PR #902, второй круг)."""
+    expected = copy.deepcopy(doc)
+    test = (expected.get("jobs") or {}).get("test")
+    if not isinstance(test, dict) or not isinstance(test.get("steps"), list):
+        raise UnsupportedStepError(
+            "самопроверка переноса: job `test` без списка steps в исходном "
+            "repo-ci.yml — перенос отменён, перенеси шаги вручную"
+        )
+    steps = test["steps"]
+    for plan in plans:
+        signature = _step_signature(plan.raw_step)
+        for index, step in enumerate(steps):
+            if _step_signature(step) == signature:
+                del steps[index]
+                break
+        else:
+            raise UnsupportedStepError(
+                f"самопроверка переноса: шаг {plan.name!r} не найден в "
+                "исходном документе при построении ожидаемого состояния — "
+                "перенос отменён, перенеси шаги вручную"
+            )
+    if not steps:
+        # Перенесён ПОСЛЕДНИЙ шаг job `test` (синтетические деревья, живому
+        # repo-ci.yml не бывает: там шагов десятки). Пустая блочная
+        # последовательность в YAML-тексте — `steps:` без элементов —
+        # парсится как None, а не как []; приводим ожидание к тому, что
+        # РЕАЛЬНО выдаст разбор нового текста, иначе deep equality ниже
+        # дал бы ложный отказ на честном переносе.
+        test["steps"] = None
+    return expected
+
+
+def _verify_removal(new_text: str, doc: dict, plans: list["_StepPlan"]) -> None:
     """Самопроверка ПЕРЕД записью файлов (issue #897, находка ревью PR #902):
     `_find_step_line_range` режет диапазон удаления «до первой пустой строки
     или отступа ≤ шага» — пустая строка ВНУТРИ блока `run: |` (обычный стиль
@@ -257,11 +336,17 @@ def _verify_removal(new_text: str, steps: list[dict], plans: list["_StepPlan"]) 
          закрывает и порчу, и дублирующееся имя шага (`added` — множество,
          `_find_step_dict`/`_find_step_line_range` берут только ПЕРВОЕ
          текстовое вхождение — второй одноимённый шаг остаётся нетронутым и
-         был бы виден как «имя всё ещё присутствует»);
-      2. множество ОСТАВШИХСЯ шагов (по содержимому, не только имени) равно
-         множеству «старые шаги минус перенесённые» — ловит именно утечку
-         содержимого между соседними шагами, которую проверка (1) сама по
-         себе не видит (имя соседа не совпадает с перенесённым именем).
+         был бы виден как «имя всё ещё присутствует»; deep equality проверки
+         (2) дубликат НЕ видит: в ожидаемом документе тоже остаётся ровно
+         одно вхождение);
+      2. ВЕСЬ новый документ равен «старый документ минус перенесённые
+         шаги» (deep equality по `_expected_doc_after_removal`) — ловит
+         любое изменение ЗА пределами перенесённых шагов, в любом job'е:
+         и утечку содержимого между соседними шагами (проверка (1) её не
+         видит — имя соседа не совпадает с перенесённым), и потерю пустых
+         строк в чужом `run: |` другого job'а (находка ревью PR #902,
+         второй круг: глобальное схлопывание пустых строк портило heredoc
+         чужого шага мимо всякой сверки по job `test`).
     Расхождение любого рода — `UnsupportedStepError` ДО единой записи на
     диск: перенос не может опубликовать порченный repo-ci.yml (то же
     «атомарно по вызову», что и остальной модуль)."""
@@ -285,29 +370,15 @@ def _verify_removal(new_text: str, steps: list[dict], plans: list["_StepPlan"]) 
             "шага или порча удаления) — перенос отменён, перенеси вручную"
         )
 
-    expected_remaining = Counter(_step_signature(s) for s in steps)
-    expected_remaining.subtract(_step_signature(p.raw_step) for p in plans)
-    actual_remaining = Counter(_step_signature(s) for s in new_steps)
-    if +expected_remaining != actual_remaining:
+    if new_doc != _expected_doc_after_removal(doc, plans):
         raise UnsupportedStepError(
-            "самопроверка переноса: множество оставшихся шагов job `test` "
-            "после удаления не равно «старые шаги минус перенесённые» — "
-            "похоже, удаление задело чужой шаг (частая причина — пустая "
-            "строка внутри run: блока перенесённого шага) — перенос "
-            "отменён, перенеси вручную"
+            "самопроверка переноса: repo-ci.yml после удаления не равен "
+            "структурно «старый документ минус перенесённые шаги» — "
+            "изменилось что-то за пределами перенесённых шагов (частая "
+            "причина — пустая строка внутри run: блока перенесённого шага, "
+            "порча соседнего шага или соседнего job) — перенос отменён, "
+            "перенеси вручную"
         )
-
-
-def _collapse_blank_runs(lines: list[str]) -> list[str]:
-    result: list[str] = []
-    prev_blank = False
-    for line in lines:
-        blank = line.strip() == ""
-        if blank and prev_blank:
-            continue
-        result.append(line)
-        prev_blank = blank
-    return result
 
 
 def _render_guard_file(plan: _StepPlan) -> str:
@@ -384,6 +455,23 @@ def translate_repo_ci(
                 f"шаг {name!r}: `run:` не строка — перенеси вручную в "
                 "scripts/ci/guards/<имя>.sh"
             )
+        if "${{" in run_text:
+            # Некритичное замечание ревью PR #902, поднятое до громкого
+            # отказа: выражение `${{ … }}` вычисляет GitHub Actions при
+            # прогоне workflow, в файле каталога оно осталось бы дословным
+            # текстом (shell отдаёт «bad substitution») — причём исходный
+            # шаг к тому моменту уже удалён из repo-ci.yml, чинить было бы
+            # негде. Тот же принцип, что отказ на `env:`/`if:`: не молча
+            # переносить форму, которую этот контекст не может исполнить.
+            raise UnsupportedStepError(
+                f"шаг {name!r}: run: содержит выражение GitHub Actions "
+                "`${{ … }}` — его вычисляет Actions, а не shell, в файле "
+                "каталога оно осталось бы дословным текстом; перенеси "
+                "вручную: заведи scripts/ci/guards/<имя>.sh, заменив "
+                "выражение env-переменной (env: шага → export в теле "
+                "скрипта) или литералом, и удали рукописный шаг из "
+                ".github/workflows/repo-ci.yml"
+            )
         targets = _crg._extract_run_targets(run_text)
         if not targets:
             raise UnsupportedStepError(
@@ -421,9 +509,9 @@ def translate_repo_ci(
         ))
 
     delete_ranges = sorted((p.line_range for p in plans), key=lambda r: r[0])
-    kept_lines = _collapse_blank_runs(_remove_ranges(lines, delete_ranges))
+    kept_lines = _remove_ranges(lines, delete_ranges)
     new_text = "\n".join(kept_lines)
-    _verify_removal(new_text, steps, plans)
+    _verify_removal(new_text, doc, plans)
 
     catalog_dir.mkdir(parents=True, exist_ok=True)
     migrated: list[Migration] = []

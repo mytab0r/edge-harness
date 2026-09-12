@@ -134,8 +134,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
-
 _DIR = Path(__file__).resolve().parent
 if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))  # scheduler.py делает `from pulse_guard import …`
@@ -265,19 +263,25 @@ def migrate_guard_steps_if_needed(repo_dir: Path) -> str | None:
     "resolved" (attempt_rebase уже решил структурный вопрос конфликта).
     Ничего не нашлось — None, тихо (не находка, TranslationResult.migrated
     пуст — не тормоз без газа, это норма для подавляющего большинства PR).
-    Нашёлся неразбираемый шаг ИЛИ транслятор упал на чужом сбое (находка
-    ревью PR #902: `git rebase` мог оставить repo-ci.yml с текстуальным
-    конфликтным маркером/повреждением, транслятор читает файл ДО того, как
-    что-либо это проверило, `yaml.safe_load` в этом случае бросает
-    `yaml.YAMLError`, не `UnsupportedStepError`; шаг записи файла каталога
-    теоретически может упасть `OSError`, например при заполненном диске
-    раннера) — в ОБОИХ случаях предупреждение, не исключение: ловим
-    `Exception` целиком, не только `UnsupportedStepError`, потому что
-    докстринг обещает «перенос не может ухудшить исход "resolved"», а
-    незапойманное исключение здесь убивает ВЕСЬ проход `run()` (остаток
-    очереди не обрабатывается) — то самое ухудшение, которое докстринг
-    отрицает. PR всё равно пушится КАК ЕСТЬ (тот же исход, что и до этой
-    правки), CI после push покажет ту же красную гвардию, но уже с точной
+    Нашёлся неразбираемый шаг ИЛИ упал ЛЮБОЙ этап переноса (находка ревью
+    PR #902 и её вторая итерация на этом же PR): `git rebase` мог оставить
+    repo-ci.yml с текстуальным конфликтным маркером/повреждением (тогда
+    `yaml.safe_load` бросает `yaml.YAMLError`, не `UnsupportedStepError`);
+    запись файла каталога теоретически может упасть `OSError` (заполненный
+    диск раннера); а git-фаза `add`/`commit` может упасть `GitError`
+    (наследник RuntimeError от run_git) — до второй итерации правки она
+    стояла ВНЕ try, и `GitError` от `git commit` вылетал в `process_pull`
+    как RuntimeError: тот возвращал "infra-error", `push_rebased` НЕ
+    вызывался, и УСПЕШНО перебазированная ветка переставала пушиться вовсе
+    — ровно то ухудшение исхода "resolved", которое этот докстринг
+    отрицает. Поэтому ВЕСЬ перенос (трансляция + git add + git commit)
+    стоит под ОДНИМ `try/except Exception`, а не только
+    `UnsupportedStepError`/`yaml.YAMLError`/`OSError`: любое другое
+    исключение здесь тоже убило бы ВЕСЬ проход `run()` (остаток очереди не
+    обрабатывается). PR всё равно пушится КАК ЕСТЬ (тот же исход, что и до
+    этой правки; недозакоммиченные файлы переноса в рабочем дереве в push
+    не попадают и вытираются `ensure_clean_repo` следующего PR очереди),
+    CI после push покажет ту же красную гвардию, но уже с точной
     инструкцией газа (см. ci_guard_registration_guard.py::check_no_undeclared_step)
     — фикс ухудшить исход "resolved" не может, только упростить его для
     человека.
@@ -291,28 +295,29 @@ def migrate_guard_steps_if_needed(repo_dir: Path) -> str | None:
         return None
     try:
         result = guard_step_translator.translate_repo_ci(repo_dir)
+        if not result.migrated:
+            return None
+        rel_paths = [str(p.relative_to(repo_dir)) for p in result.changed_paths]
+        run_git(["add", "--", *rel_paths], repo_dir)
+        names = ", ".join(m.step_name for m in result.migrated)
+        run_git(
+            ["commit", "-m", f"перенос рукописных шагов гвардии в каталог (#897): {names}"],
+            repo_dir,
+        )
     except guard_step_translator.UnsupportedStepError as error:
         return f"перенос рукописных шагов гвардии в каталог не выполнен: {error}"
-    except (yaml.YAMLError, OSError) as error:
-        # Находка ревью PR #902: любой другой сбой транслятора (repo-ci.yml
-        # не парсится как YAML — например, повреждён ребейзом, или сбой
-        # файловой системы при записи каталога) не должен вылетать наружу
-        # process_pull/run() — иначе он убивает весь проход по очереди
-        # (остаток PR не обрабатывается), хотя докстринг обещает, что
-        # перенос не может ухудшить уже решённый исход "resolved".
+    except Exception as error:
+        # Находка ревью PR #902 и её вторая итерация: ЛЮБОЙ сбой переноса —
+        # yaml.YAMLError/OSError от трансляции, GitError от git add/commit —
+        # не должен вылетать наружу process_pull/run(): незапойманное
+        # исключение превращает "resolved" в "infra-error" (push_rebased не
+        # вызван, ветка не запушена) и убивает весь проход по очереди, хотя
+        # докстринг обещает, что перенос не может ухудшить уже решённый
+        # исход "resolved".
         return (
             "перенос рукописных шагов гвардии в каталог упал сбоем ("
             f"{type(error).__name__}), не находкой транслятора: {error}"
         )
-    if not result.migrated:
-        return None
-    rel_paths = [str(p.relative_to(repo_dir)) for p in result.changed_paths]
-    run_git(["add", "--", *rel_paths], repo_dir)
-    names = ", ".join(m.step_name for m in result.migrated)
-    run_git(
-        ["commit", "-m", f"перенос рукописных шагов гвардии в каталог (#897): {names}"],
-        repo_dir,
-    )
     return None
 
 

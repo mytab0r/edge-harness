@@ -401,6 +401,45 @@ def test_migrate_guard_steps_if_needed_returns_warning_without_crashing_on_yaml_
     assert status.strip() == ""  # ничего не изменено — коммитить нечего
 
 
+def test_migrate_guard_steps_if_needed_returns_warning_when_git_commit_fails(tmp_path, monkeypatch):
+    """Находка ревью PR #902 (второй круг): git-фаза `add`/`commit` стояла
+    ВНЕ try — `GitError` от `git commit` вылетал в `process_pull` как
+    RuntimeError, тот возвращал "infra-error", `push_rebased` НЕ вызывался,
+    и УСПЕШНО перебазированная ветка переставала пушиться вовсе (ровно то
+    ухудшение исхода "resolved", которое обещает докстринг). Теперь весь
+    перенос стоит под одним `try/except Exception`.
+
+    Мутация, доказывающая класс: верни git-фазу наружу try (или сузь ловушку
+    до `(yaml.YAMLError, OSError)`) — тест краснеет: GitError вылетает из
+    migrate_guard_steps_if_needed исключением вместо предупреждения."""
+    work = _init_bare_git_repo(tmp_path, "guard_migrate_commit_fails")
+    repo_ci = work / ".github" / "workflows" / "repo-ci.yml"
+    repo_ci.parent.mkdir(parents=True)
+    repo_ci.write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - name: Смоук сбойного коммита переноса (issue #897-test-3)\n"
+        "        run: bash scripts/lib/test/commit-failure-fixture.smoke.sh\n",
+        encoding="utf-8",
+    )
+    git("add", "-A", cwd=work)
+    git("commit", "-m", "fixture: repo-ci.yml, коммит переноса упадёт", cwd=work)
+
+    real_run_git = mr.run_git
+
+    def failing_commit(args, cwd, **kwargs):
+        if args and args[0] == "commit":
+            raise mr.GitError("git commit: прод-форма отклонённого коммита (симуляция сбоя run_git)")
+        return real_run_git(args, cwd, **kwargs)
+
+    monkeypatch.setattr(mr, "run_git", failing_commit)
+
+    warning = mr.migrate_guard_steps_if_needed(work)
+
+    assert warning is not None
+    assert "GitError" in warning
+    assert "не находкой транслятора" in warning
+
+
 def test_migrate_guard_steps_if_needed_is_noop_when_repo_ci_is_absent(tmp_path):
     """Дерево без .github/workflows/repo-ci.yml вовсе (класс, который реально
     ломал этот же тестовый файл до фикса: build_origin() ниже не несёт этот

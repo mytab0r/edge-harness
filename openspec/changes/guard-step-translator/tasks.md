@@ -3,25 +3,46 @@
 - [x] `scripts/lib/guard_step_translator.py` — детерминированный перенос
       рукописного шага гвардии из `repo-ci.yml` в `scripts/ci/guards/<имя>.sh`,
       атомарный по вызову, `UnsupportedStepError` на неразобранной форме.
-- [x] Самопроверка `_verify_removal` (находка ревью PR #902): структурная
-      сверка «старые шаги минус перенесённые» ДО записи файлов на диск —
-      закрывает и порчу соседнего шага (пустая строка внутри `run: |`), и
-      дублирующееся имя шага. Мутационно доказано: без вызова
-      `_verify_removal` `test_translate_repo_ci_raises_when_blank_line_
-      inside_run_corrupts_neighbor` и `test_translate_repo_ci_raises_on_
-      duplicate_step_name` краснеют.
+- [x] Самопроверка `_verify_removal` (находка ревью PR #902, второй круг):
+      (а) ни одно перенесённое имя не осталось; (б) deep equality — ВЕСЬ
+      новый разобранный документ равен «старый документ минус перенесённые
+      шаги», не только шаги job `test`. Закрывает порчу соседнего шага
+      (пустая строка внутри `run: |`), дублирующееся имя шага и изменения в
+      любом другом job'е. Мутационно доказано: без вызова `_verify_removal`
+      краснеют `test_translate_repo_ci_raises_when_blank_line_inside_run_
+      corrupts_neighbor` и `test_translate_repo_ci_raises_on_duplicate_
+      step_name`; без deep-сверки (проверка (б)) краснеет первый из них
+      (порча не видна сверке по именам).
+- [x] Схлопывание задвоенных пустых строк — только в окрестности удалённых
+      диапазонов (второй круг ревью PR #902): содержимое repo-ci.yml вне
+      стыков удаления сохраняется байт в байт. Мутационно доказано на коде
+      до правки: глобальный проход молча терял пустую строку в heredoc
+      чужого job'а (`test_translate_repo_ci_preserves_unrelated_job_with_
+      blank_lines_in_heredoc` краснеет).
+- [x] `run:` с выражением GitHub Actions `${{ … }}` — громкий
+      `UnsupportedStepError` (некритичное замечание ревью PR #902, поднятое
+      до отказа: в файле каталога выражение осталось бы дословным текстом,
+      shell отдаёт «bad substitution», причём исходный шаг уже удалён —
+      чинить негде). Мутационно доказано на коде до правки: шаг мигрирует
+      молча (`test_translate_repo_ci_raises_when_run_contains_actions_
+      expression` краснеет: DID NOT RAISE).
 - [x] `scripts/orchestra/mechanical_rebase.py::migrate_guard_steps_if_needed` —
-      подключение между `attempt_rebase("resolved")` и `push_rebased`; ловит
-      `UnsupportedStepError` И `yaml.YAMLError`/`OSError` (находка ревью
-      PR #902 — докстринг обещает «не может ухудшить исход resolved», а
-      незапойманное исключение убивало весь проход `run()`), в обоих
-      случаях предупреждение, не крах.
+      подключение между `attempt_rebase("resolved")` и `push_rebased`; ВЕСЬ
+      перенос (трансляция + git add + git commit) под одним
+      `try/except Exception` (находка ревью PR #902 и её второй круг:
+      до правки git-фаза стояла вне try, `GitError` от `git commit`
+      превращал "resolved" в "infra-error" без push'а УСПЕШНО
+      перебазированной ветки; до первой правки незапойманное исключение
+      убивало весь проход `run()`), в любом случае предупреждение, не крах.
+      Мутационно доказано: сужение ловушки обратно до частных классов
+      краснит `test_migrate_guard_steps_if_needed_returns_warning_when_git_
+      commit_fails` (GitError вылетает исключением).
 - [x] Газ в `ci_guard_registration_guard.py::check_no_undeclared_step` —
       точное имя файла каталога вместо общей ссылки на #749.
 - [x] Гвардия транслятора в `scripts/ci/guards/guard-step-translator.sh`.
-- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (13),
+- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (15),
       `scripts/lib/test_ci_guard_registration_guard.py` (+2),
-      `scripts/orchestra/test_mechanical_rebase.py` (+4).
+      `scripts/orchestra/test_mechanical_rebase.py` (+5).
 - [x] Отклонение от текста задачи #897 про «бит исполнения» зафиксировано в
       `proposal.md` (файлы каталога — `100644`, вызов через интерпретатор,
       `exec_bit_guard.py` их не проверяет) — правка кода не требуется, факт

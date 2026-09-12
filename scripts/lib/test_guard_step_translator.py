@@ -22,7 +22,17 @@ unhashable type: 'dict'`, не тихая успешная миграция — 
 test_translate_repo_ci_raises_when_no_extractable_target тем же способом.
 Убери `_verify_removal` (issue #897, находка ревью PR #902) — краснеют
 test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor и
-test_translate_repo_ci_raises_on_duplicate_step_name.
+test_translate_repo_ci_raises_on_duplicate_step_name. Убери из
+`_verify_removal` deep-сверку всего документа (проверка (2), находка ревью
+PR #902, второй круг) — краснеет
+test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor
+(имя перенесённого шага при этой порче отсутствует, проверка (1) по именам
+порчу не видит). Верни глобальное схлопывание пустых строк по всему файлу
+(вместо стыка удалённых диапазонов) — краснеет
+test_translate_repo_ci_preserves_unrelated_job_with_blank_lines_in_heredoc
+(чужой job теряет пустую строку в heredoc). Убери проверку `${{` в
+run_text — краснеет
+test_translate_repo_ci_raises_when_run_contains_actions_expression.
 
 Запуск: python -m pytest scripts/lib/test_guard_step_translator.py -q
 """
@@ -375,6 +385,103 @@ def test_translate_repo_ci_raises_on_duplicate_step_name(tmp_path):
     original = repo_ci.read_text(encoding="utf-8")
 
     with pytest.raises(gst.UnsupportedStepError, match="самопроверка"):
+        gst.translate_repo_ci(
+            repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
+        )
+
+    assert repo_ci.read_text(encoding="utf-8") == original
+    assert list(catalog_dir.glob("*.sh")) == []
+
+
+def test_translate_repo_ci_preserves_unrelated_job_with_blank_lines_in_heredoc(tmp_path):
+    """Находка ревью PR #902 (второй круг): схлопывание задвоенных пустых
+    строк шло по ВСЕМУ файлу, а структурная сверка смотрела только на job
+    `test` — чужой job с `run: |`, внутри которого heredoc с ДВУМЯ пустыми
+    строками подряд (легальное содержимое, прод-форма archive-fixup-подобных
+    job), молча терял пустую строку: опубликованный файл отличался от
+    «старые шаги минус перенесённые», и ни одна проверка этого не видела.
+    Схлопывание теперь идёт только в окрестности удалённых диапазонов:
+    содержимое чужого job сохраняется БАЙТ В БАЙТ.
+
+    Мутация, доказывающая класс: верни глобальное схлопывание (проход
+    «убрать все задвоенные пустые строки» по всему файлу после удаления) —
+    тест краснеет: `\n\n\n` в теле heredoc чужого job исчезает.
+
+    Замечание: на дату ревью deep-проверка `_verify_removal` расширена на
+    ВЕСЬ документ, так что глобальное схлопывание ловилось бы и ею (громко,
+    отказом переноса); тест фиксирует более сильный контракт — чужие части
+    файла не перекрашиваются ВООБЩЕ, перенос идёт без ложного отказа."""
+    other_job_body = (
+        "  archive-fixup:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Архивация отчёта\n"
+        "        run: |\n"
+        "          cat > report.txt <<'EOF'\n"
+        "          строка1\n"
+        "\n"
+        "\n"
+        "          строка2\n"
+        "          EOF\n"
+        "          cat report.txt\n"
+    )
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Гвардия рядом с чужим heredoc\n"
+        "        run: |\n"
+        "          pip install --quiet pytest\n"
+        "          python -m pytest scripts/lib/test_near_heredoc.py -q\n"
+        "\n"
+        '      - name: "Хвост"\n'
+        "        run: echo tail\n"
+        f"{other_job_body}"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+
+    result = gst.translate_repo_ci(
+        repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir,
+        allowlist=frozenset({"База", "Хвост"}),
+    )
+
+    assert [m.step_name for m in result.migrated] == ["Гвардия рядом с чужим heredoc"]
+    new_text = repo_ci.read_text(encoding="utf-8")
+    # Задвоенная пустая строка в heredoc ЧУЖОГО job — на месте, байт в байт.
+    assert "строка1\n\n\n          строка2" in new_text
+    assert other_job_body in new_text
+    # Рядом с удалённым шагом задвоения нет — схлопывание работает там, где
+    # оно нужно (стык удаления), и только там.
+    assert "\n\n\n" not in new_text.replace("строка1\n\n\n          строка2", "")
+
+
+def test_translate_repo_ci_raises_when_run_contains_actions_expression(tmp_path):
+    """Некритичное замечание ревью PR #902, поднятое до громкого отказа:
+    `${{ … }}` вычисляет GitHub Actions при прогоне workflow — в файле
+    каталога оно осталось бы дословным текстом («bad substitution» от
+    shell), причём исходный шаг к тому моменту уже удалён из repo-ci.yml,
+    чинить было бы негде. Отказ ДО любых записей, как и остальные
+    UnsupportedStepError."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Гвардия с выражением Actions\n"
+        "        run: |\n"
+        "          pip install --quiet pytest\n"
+        "          python -m pytest scripts/lib/test_expr.py -q --run-id=${{ github.run_id }}\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+    original = repo_ci.read_text(encoding="utf-8")
+
+    with pytest.raises(gst.UnsupportedStepError, match=r"\$\{\{"):
         gst.translate_repo_ci(
             repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
         )
