@@ -5080,9 +5080,14 @@ def test_dispatch_worker_silent_while_worker_queued(monkeypatch):
 def test_run_is_stalled_true_past_threshold_false_within_threshold():
     now = utc(2026, 9, 9, 12, 0)
     old = workflow_run(1, "in_progress")
-    old["run_started_at"] = "2026-09-09T08:00:00Z"  # 240 мин > порог (200)
+    old["run_started_at"] = "2026-09-09T07:00:00Z"  # 300 мин > порог (255)
     fresh = workflow_run(2, "in_progress")
-    fresh["run_started_at"] = "2026-09-09T11:00:00Z"  # 60 мин < порог
+    # 225 мин — внутри легитимного worst case #877 (10×20 мин + 30 мин
+    # RATE_LIMIT = 230 мин + оверхед): такой прогон зависшим не считается.
+    # При прежнем пороге 200 (выведен из замера мира «150 мин на попытку»,
+    # ниже нового легитимного максимума 230) этот же прогон красился бы как
+    # зависший — тест-гвардия блокирующей находки ai-review PR #880.
+    fresh["run_started_at"] = "2026-09-09T08:15:00Z"  # 225 мин < порог (255)
     assert sch._run_is_stalled(old, now) is True
     assert sch._run_is_stalled(fresh, now) is False
 
@@ -5170,9 +5175,11 @@ def test_reap_stalled_worker_run_cancels_and_releases_correlated_task(monkeypatc
     # Прод-форма живого инцидента (#815): run 34339807907 стартовал
     # 2026-09-09T10:21:51Z, задача #815 арендована ЧЕРЕЗ 39с (assigned-событие
     # 10:22:30Z, обычная скорость claim_task.claim в task.sh) — «now» ниже
-    # взят так, чтобы возраст прогона (218 мин) уверенно перевалил порог
-    # (200 мин), без гонки со временем прогона теста.
-    now = utc(2026, 9, 9, 14, 0, 0)
+    # взят так, чтобы возраст прогона (278 мин) уверенно перевалил порог
+    # (255 мин с #877: легитимный worst case цепочки 10×20+30=230 мин + запас;
+    # прежние 218 мин под старый порог 200 остались бы внутри нового
+    # легитимного диапазона), без гонки со временем прогона теста.
+    now = utc(2026, 9, 9, 15, 0, 0)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     task = issue(815, assignees=("mytab0r",))
@@ -5204,7 +5211,7 @@ def test_reap_stalled_worker_run_reports_when_no_task_correlates(monkeypatch):
     # прогон на задачу с уже открытым PR, либо аренда сгорела до следа) —
     # тормоз без газа здесь недопустим: сообщение обязано назвать факт «не
     # определена», не молчать.
-    now = utc(2026, 9, 9, 14, 0, 0)
+    now = utc(2026, 9, 9, 15, 0, 0)  # возраст прогона 278 мин > порог 255 (#877)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     fake = FakeGh({
@@ -5225,7 +5232,7 @@ def test_reap_stalled_worker_run_skips_task_assigned_before_run_started(monkeypa
     # предыдущая, уже нормально идущая задача с открытым PR ещё не появился
     # по другой причине): корреляция обязана смотреть НАЗАД ложно-положительно,
     # не привязывать первую попавшуюся занятую задачу.
-    now = utc(2026, 9, 9, 14, 0, 0)
+    now = utc(2026, 9, 9, 15, 0, 0)  # возраст прогона 278 мин > порог 255 (#877)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     unrelated = issue(700, assignees=("mytab0r",))
