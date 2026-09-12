@@ -385,9 +385,22 @@ def attempt_auto_bump(repo: str, decision: dict, tags: list[dict], *, pin_path: 
     """Одна попытка открыть авто-PR с поднятым пином. Никогда не бросает
     наружу — вызывающий (upstream_drift_check) уже внутри try/except границы
     сверки, но сбой ЗДЕСЬ не имеет права утопить уже отправленный сигнал
-    дрейфа (комментарий/метка/Telegram выше по функции уже сработали)."""
+    дрейфа (комментарий/метка/Telegram выше по функции уже сработали).
+
+    Прод-запись только в CI (находка ai-review PR #950, второй проход):
+    `create_bump_issue` уходит через `pulse_guard.gh` (гейтится сама на
+    `-X POST`, но вне CI молча возвращает None — без проверки здесь это
+    падало `TypeError` на `created["number"]` и топило весь DRY-RUN-прогон
+    пульса), а `git push`/`scripts/git/pr-create` ниже — сырые вызовы В ОБХОД
+    gh() целиком, тот же класс, что `_guard_raw_subprocess_write` уже закрыл
+    в scheduler.py. Гейт здесь один, ДО первой попытки записи (по образцу
+    уже существующего выхода «ORCHESTRA_PAT не задан» строкой ниже) — та же
+    `pulse_guard.prod_writes_allowed()`, второй копии предиката не заводим."""
     if decision["state"] != "drift":
         return "⚠️ авто-бамп не пытается чинить pin-not-tag — это вне его права, доводи вручную"
+    if not pulse_guard.prod_writes_allowed():
+        return (f"⚠️ авто-бамп пропущен: {pulse_guard.ALLOW_PROD_WRITES_ENV} не задан вне "
+                "GitHub Actions (DRY-RUN)")
     pat = os.environ.get("ORCHESTRA_PAT")
     if not pat:
         return "⚠️ авто-бамп пропущен: ORCHESTRA_PAT не задан в окружении пульса"
