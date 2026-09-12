@@ -38,10 +38,13 @@ PR #964. Если предположение неверно, `gh api .../dependa
 ## Устройство (тот же скелет, что pulse_guard.failure_watch, #477)
 
   - Дедуп — по номеру алерта (`alert["number"]`, уникален и не переиспользуется
-    GitHub на репозиторий), не по тексту: маркер `ALERT_FINGERPRINT_MARKER`
-    в теле заведённой задачи, `open_dependabot_alert_numbers_in_pool` читает
-    его назад. Одна задача — один алерт, повторный прогон не плодит вторую
-    (`dependabot_created_since`/`already_tracked`).
+    GitHub на репозиторий), не по тексту, в ДВА слоя над одним уже прочитанным
+    списком задач (тот же приём, что failure_watch #610): маркер
+    `ALERT_FINGERPRINT_MARKER` в теле заведённой задачи И номер из
+    детерминированного заголовка `alert_task_title` (`tracked_alert_numbers`
+    читает оба). Одна задача — один алерт, повторный прогон не плодит вторую
+    (`dependabot_created_since`/`already_tracked`); потеря HTML-комментария
+    правкой тела вторую задачу не заводит.
   - Суточный потолок — `DEPENDABOT_WATCH_DAILY_CAP` новых задач/сутки (по
     факту СОЗДАНИЯ, `state=all`, тот же приём, что `ci_failure_created_since`)
     — массовый bump зависимостей не заливает пул: превышение не тонет
@@ -76,6 +79,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -97,6 +101,14 @@ DEPENDABOT_WATCH_DAILY_CAP = 5
 
 DEPENDABOT_WATCH_CAP_MARKER = "[dependabot-alert-watch: потолок исчерпан"
 ALERT_FINGERPRINT_MARKER = "<!-- dependabot-alert-number: "
+
+# Второй слой дедупа — тот же приём, что точное совпадение заголовка у
+# pulse_guard.failure_watch (#610): заголовок alert_task_title детерминирован
+# по номеру алерта, поэтому номер можно прочитать и из заголовка задачи, чьё
+# тело потеряло HTML-комментарий (правка тела — не повод заводить вторую
+# задачу на тот же алерт; находка ревью PR #964). Синхронность с фактическим
+# шаблоном держит тест, кормящий регулярку результатом самой alert_task_title.
+ALERT_TITLE_RE = re.compile(r"^Dependabot alert #(\d+): ")
 
 
 def open_dependabot_alerts(repo: str) -> list:
@@ -134,22 +146,40 @@ def open_dependabot_task_issues(repo: str) -> list:
     return issues
 
 
+def _alert_number_from_body(body: str):
+    """Номер алерта из маркера в теле, либо None (маркера нет/не число)."""
+    idx = body.find(ALERT_FINGERPRINT_MARKER)
+    if idx == -1:
+        return None
+    rest = body[idx + len(ALERT_FINGERPRINT_MARKER):]
+    num_str = rest.split(" ", 1)[0].split("-->", 1)[0].strip()
+    try:
+        return int(num_str)
+    except ValueError:
+        return None
+
+
+def _alert_number_from_title(title: str):
+    """Номер алерта из детерминированного заголовка alert_task_title, либо
+    None (второй слой дедупа, #610)."""
+    match = ALERT_TITLE_RE.match(title or "")
+    return int(match.group(1)) if match else None
+
+
 def tracked_alert_numbers(issues: list) -> dict:
-    """{номер алерта: issue} — читает ALERT_FINGERPRINT_MARKER из тела уже
-    заведённых задач (тот же приём, что ci_failure_fingerprints в
-    pulse_guard.py)."""
+    """{номер алерта: issue} — два слоя дедупа над ОДНИМ уже прочитанным
+    списком задач (тот же приём, что у failure_watch #610: отпечаток в теле
+    ПЛЮС номер из детерминированного заголовка `alert_task_title`). Маркер
+    в теле единственным слоем быть не должен: правка тела, потерявшая
+    HTML-комментарий, иначе тихо завела бы вторую задачу на тот же алерт
+    (находка ревью PR #964)."""
     found: dict = {}
     for issue in issues:
-        body = issue.get("body") or ""
-        idx = body.find(ALERT_FINGERPRINT_MARKER)
-        if idx == -1:
-            continue
-        rest = body[idx + len(ALERT_FINGERPRINT_MARKER):]
-        num_str = rest.split(" ", 1)[0].split("-->", 1)[0].strip()
-        try:
-            found[int(num_str)] = issue
-        except ValueError:
-            continue
+        number = _alert_number_from_body(issue.get("body") or "")
+        if number is None:
+            number = _alert_number_from_title(issue.get("title") or "")
+        if number is not None:
+            found[number] = issue
     return found
 
 
@@ -229,7 +259,17 @@ def close_resolved_alert_tasks(repo: str, tracked: dict, open_numbers: set) -> t
     """Газ: задача, чей алерт больше не среди open_numbers, закрывается с
     комментарием, называющим новое состояние (перечитан РЕАЛЬНЫЙ алерт по
     номеру — не просто «исчез из списка open», а конкретное состояние:
-    fixed/dismissed/auto_dismissed)."""
+    fixed/dismissed/auto_dismissed).
+
+    Порядок — СНАЧАЛА закрытие, потом комментарий (находка ревью PR #964):
+    обратный порядок на упавшем закрытии оставлял ОТКРЫТУЮ задачу с лгущим
+    комментарием «закрываю задачу», и каждый следующий пульс постил бы его
+    заново. Закрытая задача уходит из open-списка — повторов нет; упавший
+    комментарий после успешного закрытия — мягкое наблюдение, газ уже
+    сработал. Расхождение источников («список сказал не open, точечное
+    чтение говорит open») закрытию не подлежит — ⚠️ и следующий пульс
+    (тот же класс «два источника разошлись», что diff_source_mismatch
+    #687; находка ревью PR #964)."""
     observations: list = []
     actions: list = []
     for number, issue in tracked.items():
@@ -241,14 +281,27 @@ def close_resolved_alert_tasks(repo: str, tracked: dict, open_numbers: set) -> t
             observations.append(f"⚠️ dependabot-alert-watch: алерт #{number} не перечитан ({error})")
             continue
         state = (alert or {}).get("state", "?")
+        if state == "open":
+            observations.append(
+                f"⚠️ dependabot-alert-watch: алерт #{number} исчез из списка открытых, "
+                f"но точечное чтение отвечает `open` — расхождение источников, "
+                f"задача #{issue['number']} остаётся открытой до следующего пульса")
+            continue
         try:
-            gh("-X", "POST", f"repos/{repo}/issues/{issue['number']}/comments",
-               "-f", "body=" + f"Алерт Dependabot #{number} больше не `open` "
-               f"(состояние: `{state}`) — закрываю задачу.")
             gh("-X", "PATCH", f"repos/{repo}/issues/{issue['number']}", "-f", "state=closed")
         except RuntimeError as error:
             observations.append(
-                f"⚠️ dependabot-alert-watch: закрытие #{issue['number']} не удалось ({error})")
+                f"⚠️ dependabot-alert-watch: закрытие #{issue['number']} не удалось ({error}) — "
+                "комментарий не постился, задача остаётся на следующий пульс")
+            continue
+        try:
+            gh("-X", "POST", f"repos/{repo}/issues/{issue['number']}/comments",
+               "-f", "body=" + f"Алерт Dependabot #{number} больше не `open` "
+               f"(состояние: `{state}`) — задача закрыта.")
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ dependabot-alert-watch: #{issue['number']} закрыта, но комментарий "
+                f"о состоянии алерта #{number} не постился ({error})")
             continue
         actions.append(
             f"✅ dependabot-alert-watch: закрыта #{issue['number']} (алерт #{number} → {state})")
@@ -299,6 +352,7 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
     actions += close_actions
 
     created_today = None
+    counter_failed = False
     # Отсечённые потолком в ЭТОМ пульсе — эскалация #120+Telegram уходит
     # РОВНО один раз ПОСЛЕ цикла (тот же приём, что pulse_guard.failure_watch:
     # cap_skipped_this_pulse), а не на каждый отсечённый алерт внутри цикла —
@@ -309,14 +363,28 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
         number = alert.get("number")
         if not isinstance(number, int) or number in tracked:
             continue
+        if counter_failed:
+            # Счётчик этого пульса не читается (ниже) — не знаем, исчерпан ли
+            # потолок, поэтому не заводим ничего до следующего пульса. Нулевой
+            # подменой это не лечится: нечитаемый предохранитель, действующий
+            # как «потолка нет», заводит задачи РОВНО тогда, когда ограничитель
+            # слеп (находка живого AI-ревью PR #964, head 5c9bc3d; тот же
+            # приём, что failure_watch на нечитаемом счётчике — continue).
+            observations.append(
+                f"⏭️ dependabot-alert-watch: алерт #{number} не заведён — счётчик "
+                "потолка не прочитан, задачи в этом пульсе не заводятся")
+            continue
         if created_today is None:
             since = now.replace(hour=0, minute=0, second=0, microsecond=0)
             try:
                 created_today = dependabot_created_since(repo, since)
             except RuntimeError as error:
+                counter_failed = True
                 observations.append(
-                    f"⚠️ dependabot-alert-watch: счётчик потолка не прочитан ({error})")
-                created_today = 0
+                    f"⚠️ dependabot-alert-watch: счётчик потолка не прочитан ({error}) — "
+                    "не знаю, исчерпан ли суточный потолок, алерт "
+                    f"#{number} и следующие в этом пульсе не заводятся")
+                continue
         if cap_exhausted(created_today):
             cap_skipped.append(number)
             observations.append(

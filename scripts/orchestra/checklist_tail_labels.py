@@ -212,6 +212,13 @@ def apply_inherited_labels(repo: str, tail_issue: dict):
     if missing:
         return (f"🏷️ checklist-tail-labels: #{number} унаследовал {missing} "
                 f"у задачи #{task_number} (PR #{pr_number})")
+    if to_inherit:
+        # Различать пустой to_inherit и пустой missing обязан сам отчёт
+        # (находка ревью PR #964): «нет area:*-меток» при уже стоящей области
+        # — ложный факт, читатель уходит с неверной картиной родителя
+        # («Алерт не гадает», AGENTS.md).
+        return (f"ℹ️ checklist-tail-labels: #{number} — область {sorted(to_inherit)} "
+                f"задачи #{task_number} уже стоит на хвосте (PR #{pr_number})")
     return (f"ℹ️ checklist-tail-labels: #{number} — у задачи #{task_number} "
             "нет area:*-меток для наследования")
 

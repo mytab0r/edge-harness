@@ -299,6 +299,134 @@ def test_tracked_alert_numbers_ignores_issue_without_marker():
     assert daw.tracked_alert_numbers([plain]) == {}
 
 
+# ── Второй слой дедупа (#610): номер из детерминированного заголовка ────────
+
+def test_alert_title_re_matches_real_alert_task_title():
+    """Регулярка кормится результатом самой alert_task_title, не переписанной
+    строкой — тот же приём синхронности, что у TAIL_TITLE_RE хвоста чеклиста."""
+    match = daw.ALERT_TITLE_RE.match(daw.alert_task_title(REAL_SHARP_ALERT))
+    assert match is not None
+    assert int(match.group(1)) == 1
+
+
+def test_tracked_alert_numbers_reads_number_from_title_without_body_marker():
+    """Находка ревью PR #964 (некритичное, слой 2): правка тела, потерявшая
+    HTML-комментарий, раньше делала алерт неотслеженным — пульс завёл бы
+    вторую задачу. Заголовок детерминирован по номеру алерта, поэтому второй
+    слой дедупа читает номер и из него."""
+    bodyless = {
+        "number": 502,
+        "title": daw.alert_task_title(REAL_SHARP_ALERT),
+        "body": "тело отредактировали, маркер потерян",
+    }
+    assert daw.tracked_alert_numbers([bodyless]) == {1: bodyless}
+
+
+def test_pulse_does_not_duplicate_alert_tracked_only_by_title(monkeypatch):
+    existing = task_issue(500, alert_number=1)
+    existing["body"] = "тело отредактировали, HTML-комментарий потерян"
+    existing["title"] = daw.alert_task_title(REAL_SHARP_ALERT)
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [REAL_SHARP_ALERT],
+        "issues?state=open&labels=dependabot-alert": [existing],
+        "issues?state=all&labels=dependabot-alert": [existing],
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []
+    assert not any(c.startswith("-X POST repos/mytab0r/edge-harness/issues ") for c in fake.calls)
+
+
+# ── Потолок: сбой чтения счётчика ≠ нулевой (находка ревью head 5c9bc3d) ────
+
+def test_cap_counter_failure_skips_creation_in_this_pulse(monkeypatch):
+    """Живое AI-ревью PR #964 (head 5c9bc3d), блокер 1: сбой чтения счётчика
+    раньше подменялся нулём (`created_today = 0`) — предохранитель в момент
+    собственной слепоты действовал как «потолка нет» и продолжал ЗАВОДИТЬ
+    задачи. Правильное поведение — тот же приём, что pulse_guard.failure_watch
+    на нечитаемом счётчике: этот пульс ничего не заводит, алерт остаётся на
+    следующий пульс; эскалации исчерпания при этом нет — потолок не
+    подтверждён."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [REAL_SHARP_ALERT],  # неотслеженный алерт
+        "issues?state=open&labels=dependabot-alert": [],
+        "issues?state=all&labels=dependabot-alert": RuntimeError("gh api issues: HTTP 503"),
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(daw, "escalate", lambda *a: escalated.append(a) or "posted")
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []
+    assert any("счётчик потолка не прочитан" in o and "503" in o for o in observations)
+    assert not any(c.startswith("-X POST repos/mytab0r/edge-harness/issues ") for c in fake.calls)
+    assert escalated == []  # «потолок исчерпан» не утверждаем — мы его не знаем
+
+
+# ── Газ: порядок закрытия и расхождение источников ──────────────────────────
+
+def test_close_failure_does_not_post_closing_comment(monkeypatch):
+    """Находка ревью PR #964 (некритичное): комментарий постится ПОСЛЕ
+    успешного закрытия — упавшее закрытие раньше оставляло открытую задачу
+    с лгущим комментарием «закрываю задачу», который каждый следующий пульс
+    постил бы заново."""
+    tracked = task_issue(500, alert_number=1)
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [],
+        "issues?state=open&labels=dependabot-alert": [tracked],
+        "dependabot/alerts/1": {"number": 1, "state": "fixed"},
+        "-X PATCH repos/mytab0r/edge-harness/issues/500": RuntimeError("HTTP 503"),
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []
+    assert not any("issues/500/comments" in c for c in fake.calls)
+    assert any("закрытие #500 не удалось" in o for o in observations)
+
+
+def test_comment_failure_after_successful_close_is_reported(monkeypatch):
+    tracked = task_issue(500, alert_number=1)
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [],
+        "issues?state=open&labels=dependabot-alert": [tracked],
+        "dependabot/alerts/1": {"number": 1, "state": "fixed"},
+        "issues/500/comments": RuntimeError("HTTP 502"),
+        "-X PATCH repos/mytab0r/edge-harness/issues/500": None,
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []  # газ сработал, но исход не хоронится молча
+    assert any(c.startswith("-X PATCH") and "state=closed" in c for c in fake.calls)
+    assert any("#500" in o and "502" in o for o in observations)
+
+
+def test_close_skipped_when_individual_read_still_reports_open(monkeypatch):
+    """Находка ревью PR #964 (rework, head 70f8d81): списочный обход сказал
+    «не open», точечное чтение по номеру говорит «open» — источники
+    разошлись. Закрывать по такому нельзя (класс diff_source_mismatch #687):
+    ⚠️ о расхождении, задача остаётся открытой до следующего пульса."""
+    tracked = task_issue(500, alert_number=1)
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [],
+        "issues?state=open&labels=dependabot-alert": [tracked],
+        "dependabot/alerts/1": {"number": 1, "state": "open"},
+    })
+    patch_gh(monkeypatch, fake)
+
+    observations, actions = daw.dependabot_alert_watch(REPO, NOW)
+
+    assert actions == []
+    assert not any(c.startswith("-X PATCH") for c in fake.calls)
+    assert any("расхождение" in o and "#500" in o for o in observations)
+
+
 # ── Право/транспорт: 403 на списке алертов обязан красить прогон ───────────
 # (находка ревью PR #964, критик, блокер 3: main() раньше возвращал 0 всегда,
 # независимо от исхода — 403 тонул тихим ⚠️ в зелёном step summary).

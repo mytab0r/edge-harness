@@ -160,7 +160,11 @@ def test_apply_inherited_labels_does_not_duplicate_already_present_label(monkeyp
 
     line = ctl.apply_inherited_labels(REPO, tail)
 
-    assert "нет area" in line  # нечего добавлять — area:process уже стоит
+    # Отчёт различает пустой to_inherit («у родителя нет области») от пустого
+    # missing («область уже стоит») — находка ревью PR #964: старый текст
+    # отвечал «нет area» и в этом случае, утверждая ложный факт о родителе.
+    assert "уже стоит" in line and "area:process" in line
+    assert "нет area" not in line
     label_calls = [c for c in fake.calls if "issues/901/labels" in c]
     assert len(label_calls) == 1
     assert ("labels[]=" + "area:") not in label_calls[0]  # только маркер, без дубля
