@@ -156,7 +156,7 @@ def open_tail_issues(repo: str) -> list:
     не тянул scheduler.py как зависимость (независимость наблюдателя, тот
     же приём, что stall_detector.py/dependabot_alert_watch.py)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(TASK_LABEL)}&per_page=100", gh)
     return [
         issue for issue in issues
         if "pull_request" not in issue and TAIL_TITLE_RE.match(issue.get("title") or "")

@@ -90,6 +90,10 @@ _PI_SPEC = importlib.util.spec_from_file_location("pool_issue", _LIB / "pool_iss
 pool_issue = importlib.util.module_from_spec(_PI_SPEC)
 _PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 
+_RL_SPEC = importlib.util.spec_from_file_location("review_labels", _LIB / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
+
 DEPENDABOT_ALERT_LABEL = "dependabot-alert"
 
 # Потолок новых задач/сутки — тот же порядок величины, что
@@ -113,37 +117,21 @@ ALERT_TITLE_RE = re.compile(r"^Dependabot alert #(\d+): ")
 
 def open_dependabot_alerts(repo: str) -> list:
     """Открытые алерты Dependabot, постранично (класс #308 — сырая первая
-    страница молча теряет хвост)."""
-    page = 1
-    alerts: list = []
-    while True:
-        chunk = gh(f"repos/{repo}/dependabot/alerts?state=open&per_page=100&page={page}") or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        alerts.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return alerts
+    страница молча теряет хвост) через review_labels.list_pages — не-list
+    ответ страницы (ошибка/пустое тело) красит прогон, не читается как
+    честная короткая страница (класс #120A)."""
+    return review_labels.list_pages(
+        f"repos/{repo}/dependabot/alerts?state=open&per_page=100", gh)
 
 
 def open_dependabot_task_issues(repo: str) -> list:
     """Открытые задачи с меткой DEPENDABOT_ALERT_LABEL, постранично (тот же
-    класс #308, что open_ci_failure_issues в pulse_guard.py)."""
-    page = 1
-    issues: list = []
-    while True:
-        chunk = gh(
-            f"repos/{repo}/issues?state=open&labels={DEPENDABOT_ALERT_LABEL}"
-            f"&per_page=100&page={page}"
-        ) or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        issues.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return issues
+    класс #308, что open_ci_failure_issues в pulse_guard.py) — обход через
+    review_labels.list_pages: не-list ответ страницы — громкий сбой, не
+    «список пуст» (класс #120A, дедуп не обнуляется на сбое чтения)."""
+    return review_labels.list_pages(
+        f"repos/{repo}/issues?state=open"
+        f"&labels={review_labels.label_query_value(DEPENDABOT_ALERT_LABEL)}&per_page=100", gh)
 
 
 def _alert_number_from_body(body: str):
@@ -186,24 +174,16 @@ def tracked_alert_numbers(issues: list) -> dict:
 def dependabot_created_since(repo: str, since: datetime) -> int:
     """Сколько задач DEPENDABOT_ALERT_LABEL заведено не раньше `since` —
     потолок считается по факту создания (`state=all`), не по текущей
-    открытости (тот же приём, что ci_failure_created_since)."""
-    page = 1
-    count = 0
-    while True:
-        chunk = gh(
-            f"repos/{repo}/issues?state=all&labels={DEPENDABOT_ALERT_LABEL}"
-            f"&per_page=100&page={page}"
-        ) or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        count += sum(
-            1 for issue in chunk
-            if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
-        )
-        if len(chunk) < 100:
-            break
-        page += 1
-    return count
+    открытости (тот же приём, что ci_failure_created_since). Обход через
+    review_labels.list_pages: не-list ответ страницы — громкий сбой, не
+    «счётчик ноль» (класс #120A; нечитаемый счётчик не открывает потолок)."""
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=all"
+        f"&labels={review_labels.label_query_value(DEPENDABOT_ALERT_LABEL)}&per_page=100", gh)
+    return sum(
+        1 for issue in issues
+        if "pull_request" not in issue and parse_time(issue["created_at"]) >= since
+    )
 
 
 def cap_exhausted(created_today: int, cap: int = DEPENDABOT_WATCH_DAILY_CAP) -> bool:
