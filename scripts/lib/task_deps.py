@@ -206,6 +206,120 @@ def fetch_pool(
     return issues
 
 
+# ── Транзитивный вес графа (задача #224) ─────────────────────────────────────
+#
+# `blocking_open`, отданный `fetch_pool`, — только ПРЯМОЙ счётчик (сколько
+# открытых задач issue блокирует НАПРЯМУЮ, одна GraphQL-страница `blocking`).
+# Цепочку A→B→C он не видит: A получает вес 1, хотя закрытие A в конечном
+# счёте открывает путь и к C. Функции ниже строят эту цепочку локально, без
+# второго сетевого обхода — целиком из уже прочитанного `blocked_by_open`
+# каждой issue (то же поле, что использует `free_task.py`), поэтому дешёвы
+# (чистый BFS по уже загруженному пулу) и детерминированы на неизменных
+# данных (критерий 2 задачи #224 — два прогона дают одинаковый результат).
+#
+# Живой пример, обнаруживший разницу (замер на 303 открытых задачах пула
+# 2026-09-12): issue #665 («починить 500 на ingest-эндпоинте морды») сама не
+# помечена `ci-failure`, но НАПРЯМУЮ блокирует три открытые задачи класса
+# «CI: worker.yml падает» (#577, #675, #981) — `blocking_open(665) == 4`
+# и `transitive_blocking_counts(...)[665] == 4` совпадают здесь, потому что
+# цепочка у #665 глубиной 1. Разница проявляется на #716 и #770: у обоих
+# `blocking_open == 1`, но оба блокируют задачу, которая сама блокирует ещё
+# одну — `transitive_blocking_counts` даёт им 2, а не 1, и поднимает их выше
+# соседей с тем же прямым счётчиком, но без цепочки дальше.
+
+
+def _forward_edges(issues: list[dict]) -> dict[int, set[int]]:
+    """Рёбра «блокирующий → блокируемый», построенные из `blocked_by_open`
+    КАЖДОЙ issue пула (не из `blocking`/`totalCount` — тот же факт, только
+    прочитанный с другого конца, второго сетевого запроса не требуется).
+    Блокирующий, который сам не входит в `issues` (не несёт метку `task`,
+    которой отфильтрован пул), участвует только как источник ребра — это
+    честная граница: граф считается ВНУТРИ пула с меткой, которым вызван
+    `fetch_pool`, не по всем issues репозитория."""
+    forward: dict[int, set[int]] = {}
+    for issue in issues:
+        target = issue["number"]
+        for blocker in issue.get("blocked_by_open") or []:
+            forward.setdefault(blocker, set()).add(target)
+    return forward
+
+
+def transitive_blocked(issues: list[dict], number: int) -> set[int]:
+    """Множество issue, которые ТРАНЗИТИВНО зависят от `number` (BFS по
+    `_forward_edges`, не только прямые соседи). Используется и для веса
+    приоритета (`transitive_blocking_counts`), и для объяснения «кого именно
+    закрытие этой задачи двигает» (`free_task.py::priority_reason`)."""
+    forward = _forward_edges(issues)
+    seen: set[int] = set()
+    stack = list(forward.get(number, ()))
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(forward.get(node, ()))
+    return seen
+
+
+def transitive_blocking_counts(issues: list[dict]) -> dict[int, int]:
+    """Обобщение `blocking_open` (прямой счётчик из GraphQL) на всю цепочку:
+    для каждой issue — число ТРАНЗИТИВНО блокируемых ею открытых задач этого
+    же пула. Совпадает с `blocking_open`, когда цепочка глубиной 1 (типичный
+    сегодняшний случай — граф пула ещё разрежен, #720); расходится, когда
+    блокируемая сама кого-то блокирует (см. докстринг раздела выше).
+
+    Результат — `max(вес по рёбрам, blocking_open)`, не только вес по рёбрам:
+    `_forward_edges` строится из `blocked_by_open` УЖЕ ПРИСУТСТВУЮЩИХ в
+    `issues` узлов — если блокируемая задача сама не входит в этот список
+    (другая метка, чем фильтровал `fetch_pool`, либо — только в тестовых
+    фикстурах — синтетический номер без собственного узла), ребро до неё
+    невидимо для BFS, а прямое поле `blocking_open` (отдаёт сам GraphQL,
+    независимо от того, есть ли у цели свой узел в ЭТОЙ выборке) всё равно
+    знает о нём. Без `max` транзитивный вес мог бы оказаться МЕНЬШЕ прямого
+    счётчика — тихий регресс относительно #361, а не обобщение поверх него."""
+    via_edges = {
+        issue["number"]: len(transitive_blocked(issues, issue["number"]))
+        for issue in issues
+    }
+    return {
+        issue["number"]: max(
+            via_edges.get(issue["number"], 0), int(issue.get("blocking_open") or 0),
+        )
+        for issue in issues
+    }
+
+
+def blockers_of(issues: list[dict], targets: set[int]) -> set[int]:
+    """Множество issue, которые ТРАНЗИТИВНО блокируют ХОТЯ БЫ ОДНУ задачу из
+    `targets` (обратный обход тех же рёбер — не «кого блокирует N», а «кто
+    блокирует что-то из targets», включая многошаговую цепочку). Не включает
+    сами `targets`.
+
+    Назначение (задача #224, приоритет `free_task.py`): `targets` —
+    множество задач, чинящих СЕЙЧАС красный механизм конвейера (метки
+    `ci-failure`/`self-audit`, `free_task.BROKEN_LABELS`). Их прямые и
+    косвенные блокировщики — тоже часть простоя: закрытие блокировщика
+    приближает закрытие сломанного механизма, хотя сам блокировщик такой
+    меткой не несёт. Живой пример (замер 2026-09-12): #665 и #610 не помечены
+    `ci-failure`, но #665 напрямую блокирует #577/#675/#981 (все —
+    `ci-failure`), а #610 блокирует #629 (`ci-failure`) — оба входят в
+    результат при `targets` = множестве открытых `ci-failure`/`self-audit`."""
+    reverse: dict[int, set[int]] = {}
+    for issue in issues:
+        node = issue["number"]
+        for blocker in issue.get("blocked_by_open") or []:
+            reverse.setdefault(node, set()).add(blocker)
+    seen: set[int] = set()
+    stack = list(targets)
+    while stack:
+        node = stack.pop()
+        for blocker in reverse.get(node, ()):
+            if blocker not in seen:
+                seen.add(blocker)
+                stack.append(blocker)
+    return seen
+
+
 # ── Запись связи (ручной шаг, тот же паттерн, что sub-issues в PROTOCOL.md) ──
 
 _ISSUE_ID_QUERY = """

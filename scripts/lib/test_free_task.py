@@ -80,7 +80,7 @@ PR_181_BODY = (
 PR_181 = {"number": 181, "headRefName": "agent/179-white-spot-in-pool", "body": PR_181_BODY}
 
 
-def issue(number, title="задача", assignees=None, labels=None, blocking_open=0):
+def issue(number, title="задача", assignees=None, labels=None, blocking_open=0, blocked_by_open=None):
     # labels отсутствует в результате, когда не передан явно (не пустой
     # список) — воспроизводит REST-форму без ключа labels вовсе, на которую
     # опирается test_free_candidates_keeps_issue_without_labels_key.
@@ -89,6 +89,7 @@ def issue(number, title="задача", assignees=None, labels=None, blocking_op
         "title": title,
         "assignees": [{"login": a} for a in (assignees or [])],
         "blocking_open": blocking_open,
+        "blocked_by_open": list(blocked_by_open or []),
     }
     if labels is not None:
         result["labels"] = [{"name": name} for name in labels]
@@ -146,6 +147,157 @@ def test_mixed_meta_with_one_blocked_beats_applied_with_ten():
     applied_heavy = issue(10, blocking_open=10)
     result = free_task.prioritized_free([applied_heavy, meta_light])
     assert [i["number"] for i in result] == [300, 10]
+
+
+# ── Тир 0 задачи #224: «сейчас красный» механизм и его блокировщики ─────────
+
+
+def test_tier0_broken_label_beats_meta_with_more_direct_blocking():
+    # Живой случай (замер #224 на 303 открытых задачах): ci-failure задача
+    # без единого блокируемого обгоняет мету с блокируемыми — она чинит
+    # факт «конвейер красный сейчас», это не самооценка.
+    broken = issue(577, labels=["task", "ci-failure"], blocking_open=0)
+    meta_heavy = issue(300, labels=["area:process"], blocking_open=10)
+    result = free_task.prioritized_free([meta_heavy, broken])
+    assert [i["number"] for i in result] == [577, 300]
+
+
+def test_tier0_self_audit_label_also_counts_as_broken():
+    broken = issue(900, labels=["self-audit"])
+    ordinary = issue(901, labels=[])
+    result = free_task.prioritized_free([ordinary, broken])
+    assert [i["number"] for i in result] == [900, 901]
+
+
+def test_tier0_propagates_to_transitive_blocker_of_broken_task():
+    # Живой случай #665/#224: сама #665 не помечена ci-failure, но НАПРЯМУЮ
+    # блокирует #577 (ci-failure) — обязана попасть в тир 0, не в тир 2
+    # («обычная», раз не мета). Мутация: убери проброс через
+    # `task_deps.blockers_of` в `_urgent_numbers` — #665 упадёт в тир 2,
+    # этот тест покраснеет (порядок станет [300, 665] вместо [665, 300]).
+    blocker = issue(665, labels=[])
+    broken = issue(577, labels=["ci-failure"], blocked_by_open=[665])
+    meta = issue(300, labels=["area:process"])
+    result = free_task.prioritized_free([meta, broken, blocker])
+    assert [i["number"] for i in result] == [665, 577, 300]
+
+
+def test_tier0_propagates_through_multi_step_chain():
+    # #610 блокирует #700, #700 блокирует #629 (ci-failure) — #610 обязан
+    # получить тир 0 через ДВУХШАГОВУЮ цепочку, не только прямую.
+    root = issue(610, labels=[])
+    middle = issue(700, labels=[], blocked_by_open=[610])
+    broken = issue(629, labels=["ci-failure"], blocked_by_open=[700])
+    result = free_task.prioritized_free([broken, middle, root])
+    # Все трое в тире 0 (root и middle — через цепочку до broken); порядок
+    # внутри тира решает транзитивный вес: 610 блокирует ОБА (700 и 629)
+    # транзитивно (вес 2), 700 — только 629 (вес 1), 629 (сам broken) — 0.
+    assert [i["number"] for i in result] == [610, 700, 629]
+
+
+def test_ordinary_task_that_blocks_nothing_and_is_not_meta_or_broken_is_tier2():
+    plain = issue(50, labels=[])
+    meta = issue(60, labels=["area:process"])
+    broken = issue(70, labels=["ci-failure"])
+    result = free_task.prioritized_free([plain, meta, broken])
+    assert [i["number"] for i in result] == [70, 60, 50]
+
+
+def test_tier0_mutation_removing_broken_labels_check_breaks_ordering():
+    # Доказательство мутацией (AGENTS.md): подмени BROKEN_LABELS на пустое
+    # множество (эквивалент «снять фикс») — метка ci-failure перестаёт
+    # что-либо значить, порядок ДОЛЖЕН перевернуться относительно теста
+    # test_tier0_broken_label_beats_meta_with_more_direct_blocking.
+    broken = issue(577, labels=["task", "ci-failure"], blocking_open=0)
+    meta_heavy = issue(300, labels=["area:process"], blocking_open=10)
+    urgent = free_task._urgent_numbers([meta_heavy, broken], broken_labels=frozenset())
+    assert urgent == set()  # метка ci-failure больше не даёт urgent
+
+
+# ── priority_reason: объяснимость (критерий 1 задачи #224) ─────────────────
+
+
+def test_priority_reason_names_own_broken_label():
+    pool = [issue(577, labels=["task", "ci-failure"])]
+    text = free_task.priority_reason(pool[0], pool)
+    assert "#577" in text
+    assert "ci-failure" in text
+    assert "тир 0" in text
+
+
+def test_priority_reason_names_transitively_blocked_broken_task():
+    blocker = issue(665, labels=[])
+    broken = issue(577, labels=["ci-failure"], blocked_by_open=[665])
+    pool = [blocker, broken]
+    text = free_task.priority_reason(blocker, pool)
+    assert "#665" in text
+    assert "#577" in text  # называет КОНКРЕТНЫЙ номер, не просто факт «да»
+    assert "тир 0" in text
+
+
+def test_priority_reason_names_meta_label_for_tier1():
+    pool = [issue(300, labels=["area:process"])]
+    text = free_task.priority_reason(pool[0], pool)
+    assert "area:process" in text
+    assert "тир 1" in text
+
+
+def test_priority_reason_reports_blocked_by_open_and_tier2_for_plain_task():
+    pool = [issue(50, labels=[], blocked_by_open=[10])]
+    text = free_task.priority_reason(pool[0], pool)
+    assert "тир 2" in text
+    assert "#10" in text  # чем сама заблокирована — тоже факт, не гадание
+
+
+def test_priority_reason_reports_transitive_weight_number():
+    a = issue(1, labels=[])
+    b = issue(2, labels=[], blocked_by_open=[1])
+    c = issue(3, labels=[], blocked_by_open=[2])
+    text = free_task.priority_reason(a, [a, b, c])
+    assert "2" in text  # транзитивно блокирует 2 открытые задачи (b и c)
+
+
+def test_cli_why_prints_reason_for_known_issue(tmp_path):
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text(json.dumps([issue(577, labels=["ci-failure"])]), encoding="utf-8")
+    result = run_cli(["why", "577", str(issues_file)])
+    assert result.returncode == 0
+    assert "#577" in result.stdout
+    assert "тир 0" in result.stdout
+
+
+def test_cli_why_unknown_issue_is_rc1(tmp_path):
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text(json.dumps([issue(577, labels=[])]), encoding="utf-8")
+    result = run_cli(["why", "999", str(issues_file)])
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_cli_why_rejects_non_integer_number(tmp_path):
+    issues_file = tmp_path / "issues.json"
+    issues_file.write_text("[]", encoding="utf-8")
+    result = run_cli(["why", "не-число", str(issues_file)])
+    assert result.returncode == 2
+
+
+# ── гвардия: BROKEN_LABELS не расходится с orchestra-литералами ────────────
+
+
+def test_broken_labels_mirror_orchestra_literals():
+    """Второй копии литерала не заводим бесконтрольно (AGENTS.md: «одно
+    место правды») — lib не импортирует orchestra (обратная зависимость уже
+    есть: scheduler.py грузит free_task.py, см. докстринг BROKEN_LABELS),
+    поэтому синхронизацию литералов держит эта гвардия по исходнику, не
+    импорт. Мутация: поменяй строку `FAILURE_WATCH_LABEL = "ci-failure"` в
+    pulse_guard.py на другое значение (не трогая free_task.py) — тест
+    покраснеет."""
+    orchestra = Path(__file__).with_name("..") / "orchestra"
+    pulse_guard_src = (orchestra / "pulse_guard.py").resolve().read_text(encoding="utf-8")
+    health_audit_src = (orchestra / "health_audit.py").resolve().read_text(encoding="utf-8")
+    assert 'FAILURE_WATCH_LABEL = "ci-failure"' in pulse_guard_src
+    assert 'SELF_AUDIT_LABEL = "self-audit"' in health_audit_src
+    assert free_task.BROKEN_LABELS == frozenset({"ci-failure", "self-audit"})
 
 
 def test_graph_is_empty_true_when_nobody_blocks_and_nobody_is_meta():
