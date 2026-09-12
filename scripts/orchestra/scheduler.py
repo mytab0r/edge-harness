@@ -210,6 +210,7 @@ from pulse_guard import (
     CONFLICT_ESCALATION_MARKER,
     CONFLICT_REWORK_MARKER,
     CONFLICT_REWORK_MAX_ATTEMPTS,
+    EVENT_ACTOR_LOGIN,
     FAILURE_CONCLUSIONS,
     READY_STALL_MARKER,
     RESUME_MARKER,
@@ -1107,8 +1108,17 @@ def dispatch_ai_review_rework(
     (ai_rework_attempts), не лифтайм на PR: изменившийся отпечаток — это
     новая, ещё не пробованная задача (агент реально что-то поменял), сгоревшая
     попытка на СТАРОМ отпечатке не должна её блокировать. Исчерпание бюджета
-    на текущем отпечатке (диспатч не сдвинул код — тот же класс инфрасбоя,
-    что #588 у conflict) эскалирует, не диспетчит второй раз вслепую.
+    на текущем отпечатке — ТРИ исхода, не один (#1027, живой случай PR #1020,
+    2026-09-11/12): (1) последний прогон worker.yml по этой задаче сам
+    завершился FAILURE_CONCLUSIONS (rc≠0/нет ответившего провайдера/нет
+    новых коммитов, см. scripts/lib/dsh-ci.sh::dsh_worker_run_is_success) —
+    попытка нечестная, budget не в счёт, диспатч повторяется автоматически
+    БЕЗ эскалации; (2) прогон реально отработал (conclusion=='success', код
+    дошёл до ai-review) или атрибуции нет вовсе — законная эскалация
+    владельцу; (3) PR уже закрыт/слит между снимком `pulls` и перепроверкой —
+    эскалация не нужна, предмет исчез сам. Раньше `last_worker_run_conclusion`
+    читался только для ТЕКСТА эскалации — решение эскалировать не зависело от
+    него, хотя conclusion уже нёс факт «инфраструктурный отказ vs находки».
 
     Дедуп «тот же head, тот же отпечаток находок» — ai_rework_dispatched_at:
     неизменный отпечаток при уже висящем маркере не даёт второй, дублирующий
@@ -1179,28 +1189,71 @@ def dispatch_ai_review_rework(
                     f"⏸️ PR #{number}: ai:changes-requested уже снят — эскалация не нужна"
                 )
                 continue
+            if single.get("state") != "open":
+                # Исход 3 (#1027): «прогон не дошёл до задачи» в широком
+                # смысле — PR уже закрыт/слит (кем-то другим, или тем же
+                # прогоном раньше в accept_merged_tasks) между снимком
+                # `pulls` и этой перепроверкой. Эскалировать «застрял»
+                # больше не на чем — это не провал, предмет исчез сам.
+                observations.append(
+                    f"⏸️ PR #{number}: PR закрыт (state={single.get('state')!r}) — "
+                    "эскалация не нужна"
+                )
+                continue
+            # Три исхода вместо одного (#1027, живой случай PR #1020,
+            # 2026-09-12): `run_conclusion` уже читался и раньше, но только
+            # для ТЕКСТА — решение эскалировать было одинаковым независимо
+            # от него, хотя conclusion самого прогона worker.yml УЖЕ несёт
+            # факт (scripts/lib/dsh-ci.sh::dsh_worker_run_is_success решает
+            # ЕГО conclusion по rc/провайдеру/новым коммитам — не второй
+            # классификатор, тот же факт, уже вычисленный воркером).
             run_conclusion = last_worker_run_conclusion(repo, task_number)
-            run_note = (
-                f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
-                if run_conclusion is not None
-                else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?) — см. лог worker.yml вручную"
-            )
-            text = (
-                f"🚨 edge-harness: {marker}\n"
-                f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
-                f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
-                f"worker.yml ({run_note}). Причина отсюда не различается (инфраструктурный "
-                "сбой воркера/квота/таймаут дают тот же итог, что незакрытые находки) — "
-                "нужно решение владельца: посмотреть лог последнего прогона и находки "
-                "ai-review (gh pr view --comments) и разобраться руками."
-            )
-            escalation = escalate(repo, WATCHDOG_ISSUE, text)
-            actions.append(
-                f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
-                f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
-                f"владельцу ({escalation})"
-            )
-            continue
+            if run_conclusion in FAILURE_CONCLUSIONS:
+                # Исход 1: инфраструктурный отказ ЭТОГО прогона (rc≠0/нет
+                # ответившего провайдера/нет новых коммитов — см. gate выше)
+                # — попытка не была честной пробой находок ai-review,
+                # засчитывать её в бюджет эскалации нечестно. Не эскалируем
+                # и не `continue`: падаем сквозь к обычному диспатчу ниже —
+                # тот же путь, что при attempts < AI_REWORK_MAX_ATTEMPTS,
+                # ровно такой повтор, как если бы эта попытка не считалась.
+                # Бюджет не бесконечен на практике: устойчивый инфра-отказ
+                # (квота/окружение) поднимет ОБЩИЙ счётчик красных прогонов
+                # worker.yml и остановит диспатч через conveyor_gate (#120) —
+                # второй тормоз здесь не заводим.
+                observations.append(
+                    f"🔁 PR #{number}: авто-доводка ({attempts}/{AI_REWORK_MAX_ATTEMPTS} "
+                    "на этом отпечатке) не в счёт эскалации — последний прогон worker.yml "
+                    f"сам завершился conclusion={run_conclusion!r} (инфраструктурный отказ "
+                    "прогона, не незакрытые находки ai-review) — автоматический повтор, "
+                    "без эскалации владельцу"
+                )
+            else:
+                # Исход 2 (законная эскалация): либо прогон реально отработал
+                # (conclusion=='success' — новый коммит дошёл до ai-review, и
+                # тот СНОВА нашёл нарушения на нём), либо атрибуции нет вовсе
+                # (аренда сгорела до следа воркера) — ни один из двух не наш
+                # инфра-отказ, дальше без человека не разобраться.
+                reason = (
+                    "worker.yml отработал успешно (rc=0, провайдер ответил, новый коммит "
+                    "дошёл до ai-review), но ai-review снова нашёл нарушения на этом коммите"
+                    if run_conclusion == "success"
+                    else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
+                    "до следа?) — см. лог worker.yml вручную"
+                )
+                text = (
+                    f"🚨 edge-harness: {marker}\n"
+                    f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
+                    f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
+                    f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
+                    "ai-review (gh pr view --comments) и разобраться руками."
+                )
+                escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
+                    f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
+                    f"владельцу ({escalation})"
+                )
+                continue
         issue = pool_by_number.get(task_number)
         if issue is None:
             observations.append(
@@ -2668,8 +2721,22 @@ def wip_gate(
     count = len(rework)
 
     try:
-        open_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_OPEN_MARKER)
-        close_times = issue_marker_times(repo, WATCHDOG_ISSUE, WIP_GATE_CLOSE_MARKER)
+        # trusted_login=EVENT_ACTOR_LOGIN (#1027, watchdog-issue #120,
+        # 2026-09-12): без этого фильтра эпизод читал ЛЮБОЙ комментарий с
+        # маркером как факт состояния гейта — живой случай: маркер «✅ ...
+        # 0 < 12» в #120 оставил не прогон orchestra.yml, а прогон
+        # scheduler.py вне GitHub Actions (SCHEDULER_ALLOW_PROD_WRITES=1,
+        # см. prod_writes_allowed) под личным PAT — REST `comment.user.login`
+        # нёс не EVENT_ACTOR_LOGIN, а логин владельца токена, при этом
+        # честный пересчёт count в ЭТОМ ЖЕ прогоне orchestra.yml дал 22
+        # (см. docstring check_wip_gate_false_zero в repo_invariants.py).
+        # Различение по ТОКЕНУ (job vs личный PAT), не по «человек/агент» —
+        # разрешённый AGENTS.md приём («Атрибуция событий»), тот же, что уже
+        # использует decide_independent_pulse.
+        open_times = issue_marker_times(
+            repo, WATCHDOG_ISSUE, WIP_GATE_OPEN_MARKER, trusted_login=EVENT_ACTOR_LOGIN)
+        close_times = issue_marker_times(
+            repo, WATCHDOG_ISSUE, WIP_GATE_CLOSE_MARKER, trusted_login=EVENT_ACTOR_LOGIN)
     except RuntimeError as error:
         # Маркеры недоступны — решение «разрешён ли диспатч» само по себе не
         # гадает (зависит только от count/WIP_LIMIT, который известен точно),

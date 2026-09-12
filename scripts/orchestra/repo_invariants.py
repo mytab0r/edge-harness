@@ -2024,9 +2024,19 @@ def check_wip_gate_false_zero(now: datetime, wip_markers: list[tuple[datetime, s
 def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
     """(время, тело) всех комментариев #120 с любым из двух маркеров
     WIP-гейта (issue_markers_any, #308-обход внутри) — один обход на оба
-    маркера, не два отдельных запроса."""
+    маркера, не два отдельных запроса.
+
+    `trusted_login=pulse_guard.EVENT_ACTOR_LOGIN` (#1027, живой случай
+    2026-09-12) — то же место правды, что `scheduler.wip_gate` уже читает
+    маркеры под этим фильтром: без него ground truth «заявленное состояние
+    гейта» мог оказаться комментарием, оставленным вне GitHub Actions
+    (личный PAT, SCHEDULER_ALLOW_PROD_WRITES=1), и check_wip_gate_false_zero
+    ловил бы не рецидив дефекта A, а сравнение с посторонней записью того же
+    формата. Различение по токену (job vs личный PAT), не по «человек/
+    агент» — разрешённый AGENTS.md приём («Атрибуция событий»)."""
     return issue_markers_any(
-        repo, WATCHDOG_ISSUE, (scheduler.WIP_GATE_OPEN_MARKER, scheduler.WIP_GATE_CLOSE_MARKER))
+        repo, WATCHDOG_ISSUE, (scheduler.WIP_GATE_OPEN_MARKER, scheduler.WIP_GATE_CLOSE_MARKER),
+        trusted_login=pulse_guard.EVENT_ACTOR_LOGIN)
 
 
 def build_report(repo: str, now: datetime,

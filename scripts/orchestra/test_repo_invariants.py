@@ -2566,8 +2566,10 @@ def test_fetch_wip_gate_markers_reads_both_marker_kinds(monkeypatch):
     limit = ri.scheduler.WIP_LIMIT
     fake = FakeGh({
         "issues/120/comments": [
-            {"created_at": "2026-09-11T10:02:44Z", "body": _open_marker_body(25, limit)},
-            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit)},
+            {"created_at": "2026-09-11T10:02:44Z", "body": _open_marker_body(25, limit),
+             "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN}},
+            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit),
+             "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN}},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -2576,6 +2578,40 @@ def test_fetch_wip_gate_markers_reads_both_marker_kinds(monkeypatch):
     assert {body for _, body in markers} == {
         _open_marker_body(25, limit), _close_marker_body(0, limit),
     }
+
+
+def test_fetch_wip_gate_markers_ignores_comment_not_from_ci_actor(monkeypatch):
+    """Живой случай (#1027, watchdog-issue #120, 2026-09-12): комментарий
+    `[статус конвейера: WIP-лимит снят] ... 0 < 12` дословно взят с живого
+    репозитория (`gh api repos/.../issues/120/comments`) — его REST-форма
+    несёт `user.login == "mytab0r"`, `user.type == "User"` (личный PAT,
+    прогон `scheduler.py` вне GitHub Actions, `SCHEDULER_ALLOW_PROD_WRITES=1`),
+    а не `github-actions[bot]`/`Bot`, как у легитимного маркера orchestra.yml
+    рядом. Независимый пересчёт в ЭТОМ ЖЕ прогоне дал 22 живых PR в доработке
+    (не 0) — инвариант 16 ловит рецидив именно этого симптома. `trusted_login`
+    обязан отсеять чужеродный маркер: без фильтра fetch_wip_gate_markers
+    вернул бы ОБА (open честный + close-самозванец) — мутация ниже это
+    доказывает.
+
+    Мутация: замени `trusted_login=pulse_guard.EVENT_ACTOR_LOGIN` в
+    `fetch_wip_gate_markers` обратно на отсутствие фильтра — этот тест
+    покраснеет (markers будет содержать 2 маркера, не 1)."""
+    limit = ri.scheduler.WIP_LIMIT
+    fake = FakeGh({
+        "issues/120/comments": [
+            {"created_at": "2026-09-12T10:50:32Z", "body": _open_marker_body(23, limit),
+             "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN, "type": "Bot"}},
+            {"created_at": "2026-09-12T12:59:06Z",
+             "body": "✅ [статус конвейера: WIP-лимит снят]\n"
+                     "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
+                     "снова диспетчируются.",
+             "user": {"login": "mytab0r", "type": "User"}},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    markers = ri.fetch_wip_gate_markers("mytab0r/edge-harness")
+    assert len(markers) == 1
+    assert markers[0][1] == _open_marker_body(23, limit)
 
 
 def test_build_report_flags_wip_gate_false_zero_live_incident(monkeypatch):
@@ -2597,7 +2633,8 @@ def test_build_report_flags_wip_gate_false_zero_live_incident(monkeypatch):
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
         "search/issues": {"items": []},
         "issues/120/comments": [
-            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit)},
+            {"created_at": "2026-09-11T10:25:27Z", "body": _close_marker_body(0, limit),
+             "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN}},
         ],
     })
     patch_gh(monkeypatch, fake)

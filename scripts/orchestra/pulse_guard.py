@@ -1291,27 +1291,63 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
-def issue_marker_times(repo: str, issue_number: int, marker: str,
-                       max_pages: int | None = None) -> list[datetime]:
+def issue_marker_times(
+    repo: str, issue_number: int, marker: str, max_pages: int | None = None, *,
+    trusted_login: str | None = None,
+) -> list[datetime]:
+    """`trusted_login` (#1027, живой случай watchdog-issue #120 2026-09-12) —
+    фильтр по логину АВТОРА комментария, не по факту «человек/агент»
+    (см. AGENTS.md, «Атрибуция событий»: логин не различает оркестратор и
+    агента, но различение по ТОКЕНУ — `github-actions[bot]` (GITHUB_TOKEN
+    job'а) против личного PAT — разрешено явной оговоркой правила, тот же
+    приём, что уже применяет `decide_independent_pulse`). По умолчанию
+    (`None`) поведение не меняется — остальные потребители маркеров
+    (conflict/ai-rework/stall/heartbeat) фильтр не запрашивают.
+
+    Найдено на живом репозитории: маркер WIP-гейта (`scheduler.WIP_GATE_
+    CLOSE_MARKER`) в #120 был оставлен НЕ прогоном `orchestra.yml`, а
+    прогоном `scheduler.py` вне GitHub Actions (`SCHEDULER_ALLOW_PROD_
+    WRITES=1`, `pulse_guard.prod_writes_allowed`, — та же лазейка для
+    намеренной локальной отладки) — тело комментария несёт `github-actions
+    [bot]` в легитимных прогонах и логин владельца токена (личный PAT) в
+    таком прогоне (REST `comment.user.login`/`user.type`, не GraphQL-
+    нормализованный `.author.login`, который эту разницу стирает).
+    Читатель маркера (episode-бухгалтерия WIP-гейта, инвариант 16) не
+    различал источник и принимал заявленное число как факт того же класса,
+    что и настоящий CI-тик — вызывающий, которому нужна гарантия «это
+    записал именно job», обязан передать `trusted_login=EVENT_ACTOR_LOGIN`.
+
+    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — вся
+    история), проброшен в `all_issue_comments` (#607): стоимость одного тика
+    читателя не должна расти с историей задачи."""
     payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     return [
         parse_time(comment["created_at"])
         for comment in payload
         if _marker_present(marker, comment.get("body") or "")
+        and (trusted_login is None or (comment.get("user") or {}).get("login") == trusted_login)
     ]
 
 
-def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...],
-                      max_pages: int | None = None) -> list[tuple[datetime, str]]:
+def issue_markers_any(
+    repo: str, issue_number: int, markers: tuple[str, ...],
+    max_pages: int | None = None, *, trusted_login: str | None = None,
+) -> list[tuple[datetime, str]]:
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
     но и от его содержимого (номер попытки пробы, #205). `max_pages` — тот
     же ограничитель свежими страницами, что у all_issue_comments (found:
     ревью PR #607 — последний_state-дедуп quota_alert тикает на каждый
-    прогон сторожа и не обязан обходить всю копящуюся историю #120)."""
+    прогон сторожа и не обязан обходить всю копящуюся историю #120).
+
+    `trusted_login` — тот же фильтр по токену-автору, что у issue_marker_times
+    (#1027), тем же способом (`None` не меняет поведение существующих
+    вызывающих)."""
     payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     result = []
     for comment in payload:
+        if trusted_login is not None and (comment.get("user") or {}).get("login") != trusted_login:
+            continue
         body = comment.get("body") or ""
         if any(_marker_present(marker, body) for marker in markers):
             result.append((parse_time(comment["created_at"]), body))
