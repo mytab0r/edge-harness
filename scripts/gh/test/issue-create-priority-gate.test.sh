@@ -79,9 +79,14 @@ export PRIORITY_TOP_FIXTURE="$TOP_FIXTURE"
 fail=0
 note() { echo "$@"; }
 
+# Валидное тело с объявлением связи (#720) — используется во всех случаях ниже
+VALID_BODY="### Чем блокируется
+ничем
+"
+
 # ── случай 1: --label task, БЕЗ area:process и БЕЗ --not-process-ack — отказ ──
 rm -f "$MARKER"
-if bash "$SCRIPT_SRC" --title "Новая задача про узкое место" --body b --label task \
+if bash "$SCRIPT_SRC" --title "Новая задача про узкое место" --body "$VALID_BODY" --label task \
     >"$WORK/out1" 2>"$WORK/err1"; then
   note "FAIL случай 1: issue-create принял задачу без решения о приоритете"; fail=1
 elif [ -f "$MARKER" ]; then
@@ -96,7 +101,7 @@ fi
 
 # ── случай 2: --label task,area:process — метка сама решение, gh вызван ──────
 rm -f "$MARKER"
-if ! bash "$SCRIPT_SRC" --title "Новая задача про узкое место" --body b \
+if ! bash "$SCRIPT_SRC" --title "Новая задача про узкое место" --body "$VALID_BODY" \
     --label "task,area:process" >"$WORK/out2" 2>"$WORK/err2"; then
   note "FAIL случай 2: --label area:process отклонён"; cat "$WORK/err2"; fail=1
 elif [ ! -f "$MARKER" ]; then
@@ -107,7 +112,7 @@ fi
 
 # ── случай 3: --label task + --not-process-ack "причина" — осознанный пропуск ─
 rm -f "$MARKER"
-if ! bash "$SCRIPT_SRC" --title "Совсем прикладная задача" --body b --label task \
+if ! bash "$SCRIPT_SRC" --title "Совсем прикладная задача" --body "$VALID_BODY" --label task \
     --not-process-ack "чинит только UI-канарейку, не процесс" >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: --not-process-ack отклонён"; cat "$WORK/err3"; fail=1
 elif [ ! -f "$MARKER" ]; then
@@ -120,7 +125,7 @@ fi
 
 # ── случай 4: верх группы приоритета печатается ПЕРЕД созданием ──────────────
 rm -f "$MARKER"
-if ! bash "$SCRIPT_SRC" --title "Совсем прикладная задача 2" --body b --label task \
+if ! bash "$SCRIPT_SRC" --title "Совсем прикладная задача 2" --body "$VALID_BODY" --label task \
     --not-process-ack "тест печати верха приоритета" >"$WORK/out4" 2>"$WORK/err4"; then
   note "FAIL случай 4: вызов отклонён"; cat "$WORK/err4"; fail=1
 elif ! grep -q "194" "$WORK/err4"; then
@@ -145,7 +150,7 @@ fi
 # test_free_task.py) — фикстура здесь намеренно снята.
 rm -f "$MARKER"
 echo "not-a-repo" >"$REPO_VIEW_OUTPUT"
-if ! PRIORITY_TOP_FIXTURE= bash "$SCRIPT_SRC" --title "Совсем прикладная задача 3" --body b --label task \
+if ! PRIORITY_TOP_FIXTURE= bash "$SCRIPT_SRC" --title "Совсем прикладная задача 3" --body "$VALID_BODY" --label task \
     --not-process-ack "тест сбоя печати верха приоритета" >"$WORK/out5" 2>"$WORK/err5"; then
   note "FAIL случай 5: вызов отклонён при сбое priority-top (это не гейт)"; cat "$WORK/err5"; fail=1
 elif [ ! -f "$MARKER" ]; then
