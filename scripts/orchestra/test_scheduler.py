@@ -4056,7 +4056,16 @@ def test_open_task_issues_and_open_pulls_read_through_paginated_helper():
     # scripts/lib/test_review_labels.py::test_list_pages_paginates_over_100_real_open_task_issues_310
     # (мутация доказана там: обход убран — тест краснеет).
     source = SCRIPT.read_text(encoding="utf-8")
-    assert 'review_labels.list_pages(\n        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)' in source
+    # Значение метки идёт через review_labels.label_query_value (#938):
+    # двоеточие в имени метки без кодирования GitHub трактует как синтаксис
+    # URL, не байт значения фильтра — класс инцидента, не свойство именно
+    # TASK_LABEL (см. scripts/lib/test_label_query_encoding_guard.py).
+    assert (
+        'review_labels.list_pages(\n'
+        '        f"repos/{repo}/issues?state=open&labels='
+        '{review_labels.label_query_value(TASK_LABEL)}"\n'
+        '        "&per_page=100", gh)'
+    ) in source
     assert 'review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)' in source
     assert 'gh(f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100")' not in source
     assert 'gh(f"repos/{repo}/pulls?state=open&per_page=100")' not in source

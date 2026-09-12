@@ -106,7 +106,12 @@ def open_pool_issues(repo: str) -> list[dict]:
     отдельный проход только за заголовками, второй проход за номерами
     дублировал бы тот же запрос."""
     return [
-        issue for issue in _pages(f"repos/{repo}/issues?state=open&labels=task")
+        issue for issue in _pages(
+            # Литерал через место правды кодирования — класс #938: у `task`
+            # двоеточия сегодня нет, завтрашняя метка вида `task:v2` сломалась
+            # бы здесь тем же молчаливым пустым списком.
+            f"repos/{repo}/issues?state=open&labels="
+            f"{ai_review.review_labels.label_query_value('task')}")
         if "pull_request" not in issue
     ]
 
