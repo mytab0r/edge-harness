@@ -267,6 +267,104 @@ def test_check_reports_both_directions_at_once(tmp_path):
     assert "Тесты старая" in joined
 
 
+# ── Газ (issue #897): сообщение называет точный файл/шаблон/что удалить ─────
+
+
+def test_check_message_names_exact_guard_filename_when_derivable(tmp_path):
+    """Правило AGENTS.md «Тормоз без газа не принимается»: находка обязана
+    называть, КУДА именно переносить, а не только сам факт нарушения —
+    имя вычислено тем же способом, что реальный перенос
+    (guard_step_translator.py::_slug_from_target), одно место правды."""
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {
+            "name": "Смоук новой находки (#901)",
+            "run": "pip install --quiet pytest\npython -m pytest scripts/lib/test_scratch_thing.py -q\n",
+        },
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    assert len(problems) == 1
+    assert "scripts/ci/guards/scratch-thing-guard.sh" in problems[0]
+    assert "set -euo pipefail" in problems[0]
+    assert "удали из repo-ci.yml сам шаг целиком" in problems[0]
+
+
+def test_check_message_falls_back_to_generic_rule_when_target_not_extractable(tmp_path):
+    """`run:` без распознаваемого файла (grep/echo-проверка, класс шага PR
+    #241 «Тесты DO журнала») — точное имя вычислить нельзя (честная граница,
+    см. guard_step_translator.py), сообщение всё равно называет ПРАВИЛО
+    именования, не молчит про «как переносить»."""
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {"name": "Гвардия новая инлайн-проверка", "run": "grep -rn foo scripts/ || exit 1"},
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    assert len(problems) == 1
+    assert "scripts/ci/guards/<имя>-guard.sh" in problems[0]
+    assert "test_foo.py" in problems[0]  # правило именования объяснено примером
+
+
+def test_check_message_advises_deletion_when_step_invokes_catalog_file(tmp_path):
+    """Находка ревью PR #902 (третий круг): run: шага сам вызывает файл
+    каталога с нестем-`-guard` именем — гвардия уже зарегистрирована,
+    переносить нечего. Общий газ («создай scripts/ci/guards/<имя>-guard.sh»,
+    куда честно падал `_suggest_guard_filename`) здесь советовал бы обёртку,
+    исполняющую гвардию ДВАЖДЫ (класс обхода (б) из #771); газ для этого
+    класса — удаление шага, каталог не трогается вовсе.
+
+    Мутация, доказывающая класс: убери ветку `catalog_invocations` в
+    check_no_undeclared_step — тест краснеет («создай» появляется, совета
+    удалить шаг нет)."""
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {"name": "Проверка окружения", "run": "bash scripts/ci/guards/ci-guard-registration.sh"},
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}), catalog_dir=catalog_dir)
+    assert len(problems) == 1, problems
+    assert "УЖЕ зарегистрирована" in problems[0]
+    assert "ci-guard-registration.sh" in problems[0]
+    assert "удали рукописный шаг целиком" in problems[0]
+    assert "создай" not in problems[0]  # совет завести обёртку недопустим
+
+
+def test_check_message_advises_deletion_when_catalog_already_runs_target(tmp_path):
+    """CONTENT-форма (находка ревью PR #902, четвёртый круг): цель шага не
+    лежит в scripts/ci/guards/ и стем не совпадает, но её уже исполняет
+    существующий файл каталога. Общий газ говорил бы «создай scripts/ci/
+    guards/ci-guard-registration-guard.sh» — а overlap-сверка в том же
+    отчёте говорила «убери рукописный шаг»: противоречивый совет в одном
+    отчёте, и «перенеси под другим именем» ведёт в невидимую двойную
+    регистрацию. Единая ветка газа называет факт и советует удаление.
+
+    Мутация, доказывающая класс: убери `content_overlaps` из условия ветки
+    — тест краснеет («создай» появляется, совета удалить нет)."""
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "ci-guard-registration.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "python scripts/lib/ci_guard_registration_guard.py\n",
+        encoding="utf-8",
+    )
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {"name": "Гвардия регистрации CI-гвардий", "run": "python scripts/lib/ci_guard_registration_guard.py"},
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}), catalog_dir=catalog_dir)
+    # Content-форма видна ДВУМ независимым сверкам (overlap по содержимому
+    # и ветка газа «уже зарегистрирована») — обе в отчёте, ОБЕ советуют
+    # удалить рукописный шаг; недопустимо только противоречие «создай».
+    assert len(problems) == 2, problems
+    assert all("создай" not in p for p in problems), problems
+    assert any("УЖЕ зарегистрирована" in p for p in problems)
+    assert any("ci-guard-registration.sh" in p for p in problems)
+    assert any("scripts/lib/ci_guard_registration_guard.py" in p for p in problems)
+    assert any("удали рукописный шаг целиком" in p for p in problems)
+    assert any("частичный перенос: убери рукописный шаг" in p for p in problems)
+
+
 # ── Живой снимок: сама гвардия на реальном repo-ci.yml ──────────────────────
 
 def test_live_repo_ci_matches_frozen_allowlist():
