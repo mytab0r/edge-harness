@@ -1,0 +1,49 @@
+# Алерты Dependabot → задача пула (сирота B, аудит владельца 2026-09-11):
+# `git grep "dependabot/alerts"` по scripts/ был пуст до scripts/orchestra/
+# dependabot_alert_watch.py — GitHub копил алерты сам, конвейер их не видел.
+#
+# Отдельный workflow (не шаг внутри orchestra.yml — тот же приём
+# независимости, что у остальных сторожей конвейера): свой планировщик не
+# растёт вместе с очередью слияний оркестратора и не занимает его
+# concurrency-группу (два слияния оркестратора не сериализуются с этим
+# наблюдателем — они читают разные метки и не пересекаются по состоянию).
+#
+# permissions: vulnerability-alerts: read — отдельное право GITHUB_TOKEN
+# именно для чтения Dependabot alerts (не security-events, который читает
+# только code scanning): задокументировано GitHub, включено флагом
+# vulnerability-alerts-permission (fpt: '*' — весь github.com, см. докстринг
+# scripts/orchestra/dependabot_alert_watch.py). Без этого права запрос
+# отвечает 403 — 🚨 в отчёте и красный прогон (fail loud), не тихий пропуск
+# и не ⚠️ в зелёном step summary.
+name: dependabot-alert-watch
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  vulnerability-alerts: read
+
+concurrency:
+  group: dependabot-alert-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Наблюдатель алертов Dependabot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Канал эскалации потолка — тот же, что у остальных сторожей
+          # конвейера (#120 + Telegram, pulse_guard.escalate); не заданы —
+          # шаг не падает, escalate просто не доставляет Telegram-часть
+          # (post_issue_comment всё равно уходит).
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/dependabot_alert_watch.py
