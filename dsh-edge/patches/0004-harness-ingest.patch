@@ -76,10 +76,10 @@ index c9b5b95..3ee648d 100644
    MAX_SESSION_CREATE_BODY_BYTES,
    MAX_TURN_BODY_BYTES,
    corsHeaders,
-@@ -366,6 +368,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -396,6 +398,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
          return await this.startTurn(request, route.sessionId)
        } else if (route.action === 'cancel' && request.method === 'POST') {
-         return this.cancelTurn(route.sessionId)
+         return this.cancelTurn(route.sessionId, request)
 +      } else if (route.action === 'ingest' && request.method === 'POST') {
 +        return await this.ingestHarnessEvents(request, route.sessionId)
        }

@@ -28,6 +28,7 @@ import http.server
 import importlib.util
 import io
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -49,6 +50,32 @@ SCRIPT = _DIR / "scheduler.py"
 spec = importlib.util.spec_from_file_location("scheduler", SCRIPT)
 sch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sch)  # type: ignore[union-attr]
+
+import upstream_drift as _upstream_drift_mod  # noqa: E402  (после sys.path.insert выше)
+
+
+def _fresh_upstream_tags() -> list[dict]:
+    """Фикстура тегов апстрима «пин свеж» — прод-форма `repos/{repo}/tags`,
+    построенная вокруг ТЕКУЩЕГО пина dsh-edge/upstream.json (одно место
+    правды — upstream_drift.PIN_PATH/load_pin), а не вокруг версии,
+    захардкоженной на момент написания теста. Класс #810/#811: тест,
+    хардкодящий и sha, и имя тега пина, красится каждым авто-бампом — пин
+    двигается, хардкод — нет, decide_drift получает sha, которого нет среди
+    моканных тегов, и main() пытается сделать доп. вызов вместо холостого
+    хода. Тег с текущим sha здесь всегда старше 0.8.0/0.7.1 (реальные релизы
+    апстрима только растут), так что decide_drift неизменно вернёт "ok"."""
+    pin = _upstream_drift_mod.load_pin(_upstream_drift_mod.PIN_PATH)
+    match = re.search(r"dsh-edge-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", pin.get("note", ""))
+    if match is None:
+        raise AssertionError(
+            f"upstream.json note не называет тег релиза (dsh-edge-vX.Y.Z): {pin.get('note')!r}")
+    return [
+        {"name": match.group(0), "commit": {"sha": pin["sha"], "url": "https://x"}},
+        {"name": "dsh-edge-v0.8.0",
+         "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
+        {"name": "dsh-edge-v0.7.1",
+         "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
+    ]
 
 # Только ради _WIP_GATE_COUNT_RE (замечание ревью PR #950: маркеры WIP-гейта
 # ниже обязаны матчиться ИМЕННО этим regex'ом инварианта 16, не его
@@ -6007,17 +6034,10 @@ def test_main_makes_zero_mutating_calls_on_fully_empty_queue(monkeypatch):
         # тега = текущий пин dsh-edge/upstream.json) и метки задачи #134.
         # Пин свеж → состояние ok → только чтение: гвардия внизу требует,
         # что и здесь не было ни одного POST/PUT/DELETE.
-        "repos/pawaca/dsh-edge/tags?per_page=100": [
-            # sha первого тега = текущий пин dsh-edge/upstream.json (бамп #505,
-            # 2026-09-06): "ok" здесь держится на том, что этот тег — новейший
-            # стабильный в списке, а не на конкретном номере версии.
-            {"name": "dsh-edge-v0.11.1",
-             "commit": {"sha": "e1941bbcb7e2d5693df9fc278362f2c184963024", "url": "https://x"}},
-            {"name": "dsh-edge-v0.8.0",
-             "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
-            {"name": "dsh-edge-v0.7.1",
-             "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
-        ],
+        # Сверка дрейфа пина ходит за реальным dsh-edge/upstream.json — тег
+        # фикстуры строится вокруг ТЕКУЩЕГО пина (_fresh_upstream_tags,
+        # класс #810/#811), а не хардкодит версию, красящуюся каждым бампом.
+        "repos/pawaca/dsh-edge/tags?per_page=100": _fresh_upstream_tags(),
         "issues/134": {"number": 134, "labels": []},
         # Детектор простоя (#201): пустой отчёт => detect_and_act не делает ни
         # одного вызова (см. test_stall_detector.py::test_idle_conveyor_makes_zero_calls);
@@ -6071,17 +6091,10 @@ def test_main_labels_old_unclaimed_task_end_to_end(monkeypatch):
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": []},
         "issues/120/comments?per_page=100": [],
-        "repos/pawaca/dsh-edge/tags?per_page=100": [
-            # sha первого тега = текущий пин dsh-edge/upstream.json (бамп #505,
-            # 2026-09-06): "ok" здесь держится на том, что этот тег — новейший
-            # стабильный в списке, а не на конкретном номере версии.
-            {"name": "dsh-edge-v0.11.1",
-             "commit": {"sha": "e1941bbcb7e2d5693df9fc278362f2c184963024", "url": "https://x"}},
-            {"name": "dsh-edge-v0.8.0",
-             "commit": {"sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1", "url": "https://x"}},
-            {"name": "dsh-edge-v0.7.1",
-             "commit": {"sha": "113a96913c51881993122afbf42e776882c4beb7", "url": "https://x"}},
-        ],
+        # Сверка дрейфа пина ходит за реальным dsh-edge/upstream.json — тег
+        # фикстуры строится вокруг ТЕКУЩЕГО пина (_fresh_upstream_tags,
+        # класс #810/#811), а не хардкодит версию, красящуюся каждым бампом.
+        "repos/pawaca/dsh-edge/tags?per_page=100": _fresh_upstream_tags(),
         "issues/134": {"number": 134, "labels": []},
         "issues/300/labels": None,
         # Пул с одной свободной задачей допускает dispatch воркера (#120) —
