@@ -25,15 +25,29 @@ secret scanning алерты не читаются `security-events`, нужен
 PAT» относится к permission `security-events` (код-сканирование), не к
 отдельному `vulnerability-alerts`, который появился позже именно для этого
 случая. `.github/workflows/dependabot-alert-watch.yml` объявляет это право
-явно на уровне workflow. Живого замера права под `GITHUB_TOKEN` НЕТ (честно, не
-подтверждено): `workflow_dispatch` с ветки PR GitHub не даёт, а прогон с
-default-ветки возможен только ПОСЛЕ мержа — см. пост-мерж проверку в теле
-PR #964. Если предположение неверно, `gh api .../dependabot/alerts` отвечает
-403 — `open_dependabot_alerts` НЕ ловит эту ошибку (см. докстринг
-`dependabot_alert_watch` ниже), она уходит до `main()`, который красит сам
-прогон workflow ненулевым кодом возврата: 403 не может стать тихим ⚠️ в
-зелёном step summary (находка ревью PR #964, критик, блокер 3 — до этой
-правки `main()` возвращал `0` всегда, независимо от исхода).
+явно на уровне workflow. Живой замер права под `GITHUB_TOKEN` ЕСТЬ
+(пост-мерж прогон 2026-09-12, run 34681294715): эндпоинт ответил HTTP 400
+«Pagination using the `page` parameter is not supported» — GitHub проверяет
+право ДО параметров запроса, отказ права выглядит как 403; 400 по параметру
+значит право подтверждено. Если право всё же пропадёт, `gh api
+.../dependabot/alerts` отвечает 403 — `open_dependabot_alerts` НЕ ловит эту
+ошибку (см. докстринг `dependabot_alert_watch` ниже), она уходит до `main()`,
+который красит сам прогон workflow ненулевым кодом возврата: отказ права не
+может стать тихим ⚠️ в зелёном step summary (находка ревью PR #964, критик,
+блокер 3 — до этой правки `main()` возвращал `0` всегда, независимо от
+исхода).
+
+Замер того же прогона о пагинации эндпоинта: `List Dependabot alerts` НЕ
+поддерживает `page`-пагинацию (HTTP 400, docs.github.com/rest/dependabot/
+alerts — курсорная `before`/`after`, не номер страницы), поэтому здесь один
+снимок `per_page=100` с явной проверкой формы ответа (класс #120A), а не
+`review_labels.list_pages`, который листает `&page=N`. Хвост списка за
+100-й алерт этим эндпоинтом в форме REST+токена job'а не дочитывается —
+граница названа, не спрятана; при росте алертов к сотне сигнал один и тот
+же — КРАСНЫЙ ПРОГОН (RuntimeError «полная страница» уходит в `main()` до
+любого отчёта и любой эскалации потолка), текст ошибки говорит сам, без
+приклеенной гипотезы о праве (находка AI-ревью PR #1013); курсорное
+дочитывание — отдельная работа.
 
 ## Устройство (тот же скелет, что pulse_guard.failure_watch, #477)
 
@@ -116,12 +130,29 @@ ALERT_TITLE_RE = re.compile(r"^Dependabot alert #(\d+): ")
 
 
 def open_dependabot_alerts(repo: str) -> list:
-    """Открытые алерты Dependabot, постранично (класс #308 — сырая первая
-    страница молча теряет хвост) через review_labels.list_pages — не-list
-    ответ страницы (ошибка/пустое тело) красит прогон, не читается как
-    честная короткая страница (класс #120A)."""
-    return review_labels.list_pages(
-        f"repos/{repo}/dependabot/alerts?state=open&per_page=100", gh)
+    """Открытые алерты Dependabot ОДНИМ снимком без `page` — эндпоинт
+    `page`-пагинацию не поддерживает (живой замер 2026-09-12, HTTP 400
+    «Pagination using the `page` parameter is not supported»; курсорная
+    `before`/`after` в форме REST+токена job'а здесь не дочитывается),
+    поэтому `review_labels.list_pages` здесь неприменим — он листает
+    `&page=N`. Форма ответа проверяется явно: не-list (dict ошибки,
+    None) — RuntimeError, а не «список пуст» (класс #120A, гвардия
+    test_silent_empty_page_guard.py); честный пустой список — «алертов
+    нет». Полная страница (100) — тоже громкий сбой: хвост недочитан,
+    молча терять нельзя (класс #308, гвардия test_pagination_guard.py,
+    запись в ALLOWED_SINGLE_PAGE_CALLS)."""
+    alerts = gh(f"repos/{repo}/dependabot/alerts?state=open&per_page=100")
+    if not isinstance(alerts, list):
+        raise RuntimeError(
+            f"dependabot alerts: не-list ответ ({type(alerts).__name__}) — "
+            "ошибка транспорта/эндпоинта, не «список пуст» (класс #120A)")
+    if len(alerts) >= 100:
+        raise RuntimeError(
+            "dependabot alerts: ответ вернул полную страницу (100) — хвост "
+            "списка этим запросом недочитан, эндпоинт page-пагинацию не "
+            "поддерживает (замер 2026-09-12); нужна курсорная пагинация, "
+            "молча терять хвост нельзя (класс #308)")
+    return alerts
 
 
 def open_dependabot_task_issues(repo: str) -> list:
@@ -413,11 +444,18 @@ def main() -> int:
     try:
         observations, actions = dependabot_alert_watch(repo, now)
     except RuntimeError as error:
+        # «Алерт не гадает» (AGENTS.md): фиксированная гипотеза «право
+        # отсутствует» здесь ложна для состояний, где причина известна точнее
+        # (не-list ответ эндпоинта, полная страница) — подсказка о праве
+        # добавляется ТОЛЬКО когда текст ошибки её называет (HTTP 403 от gh),
+        # иначе говорит сам {error} (находка AI-ревью PR #1013).
+        hint = ""
+        if "HTTP 403" in str(error):
+            hint = (" — право vulnerability-alerts: read отсутствует или "
+                    "транспорт сломан, см. докстринг dependabot_alert_watch")
         text = (
-            f"🚨 dependabot-alert-watch: список алертов не прочитан ({error}) — "
-            "право vulnerability-alerts: read отсутствует или транспорт "
-            "сломан, прогон красный (fail loud, не тихий пропуск, см. "
-            "докстринг dependabot_alert_watch)."
+            f"🚨 dependabot-alert-watch: список алертов не прочитан ({error})"
+            f"{hint}. Прогон красный (fail loud, не тихий пропуск)."
         )
         print(text, file=sys.stderr)
         if summary_path:
