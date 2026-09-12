@@ -352,7 +352,8 @@ def collect(repo: str, gh: GhFn, now: datetime) -> dict:
     open_pulls = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     task_issues = [
         issue for issue in review_labels.list_pages(
-            f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
+            f"repos/{repo}/issues?state=open&labels="
+            f"{review_labels.label_query_value(TASK_LABEL)}&per_page=100", gh)
         if "pull_request" not in issue
     ]
     worker_runs = pulse_guard.recent_runs(repo, pulse_guard.WORKER_WORKFLOW,

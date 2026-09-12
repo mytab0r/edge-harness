@@ -83,6 +83,10 @@ _PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 # review_labels.list_pages, где его нашли и починили первым. Обход и fail
 # loud на неожиданной форме ответа теперь в одном месте — второй копии не
 # заводим (тот же приём, что уже применили contract_check._all_open_pulls).
+# Кодирование значения метки в query GitHub API — одно место правды
+# (review_labels.label_query_value, issue #938): FAILURE_WATCH_LABEL сегодня
+# без двоеточия, но подстановка переменной метки в query без кодирования —
+# класс инцидента #938 (waiting:owner), не свойство конкретного значения.
 _RL_SPEC = importlib.util.spec_from_file_location(
     "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
@@ -1818,9 +1822,11 @@ def open_ci_failure_issues(repo: str) -> list[dict]:
     ограничен по природе — долгоживущие незакрытые дефекты CI со временем
     накопятся так же, как обычный пул задач, а сырая первая страница молча
     потеряла бы хвост — та же ошибка дедупа, что и без него, просто
-    отложенная во времени."""
+    отложенная во времени. Значение метки в query кодируется
+    review_labels.label_query_value (класс инцидента #938)."""
     return review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={FAILURE_WATCH_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels="
+        f"{review_labels.label_query_value(FAILURE_WATCH_LABEL)}&per_page=100", gh)
 
 
 def ci_failure_fingerprints(issues: list[dict]) -> set[str]:
@@ -1851,9 +1857,11 @@ def ci_failure_created_since(repo: str, since: datetime) -> int:
     страницы через review_labels.list_pages (класс #308, дефект A #120):
     сырая первая страница молча занижала бы потолок после сотни ci-failure
     задач за всё время; не-list ответ раньше давал то же самое молча —
-    теперь падает громко, вместо заниженного потолка."""
+    теперь падает громко, вместо заниженного потолка. Значение метки в
+    query кодируется review_labels.label_query_value (класс #938)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=all&labels={FAILURE_WATCH_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=all&labels="
+        f"{review_labels.label_query_value(FAILURE_WATCH_LABEL)}&per_page=100", gh)
     return sum(
         1 for issue in issues
         if "pull_request" not in issue and parse_time(issue["created_at"]) >= since

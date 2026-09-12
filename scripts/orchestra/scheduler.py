@@ -438,7 +438,8 @@ def open_task_issues(repo: str) -> list[dict]:
     # воркер и планировщик не видели последние 7, без ошибки и без
     # предупреждения.
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={TASK_LABEL}&per_page=100", gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(TASK_LABEL)}"
+        "&per_page=100", gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
@@ -2208,7 +2209,11 @@ def after_merge(
             open_titles = {
                 issue["title"]
                 for issue in review_labels.list_pages(
-                    f"repos/{repo}/issues?state=open&labels=task&per_page=100", gh)
+                    # Литерал через место правды кодирования — тот же класс
+                    # #938: двоеточия в `task` сегодня нет, завтрашняя метка
+                    # с двоеточием сломалась бы здесь молча.
+                    f"repos/{repo}/issues?state=open&labels="
+                    f"{review_labels.label_query_value(TASK_LABEL)}&per_page=100", gh)
                 if "pull_request" not in issue
             }
             if tail_title in open_titles:
