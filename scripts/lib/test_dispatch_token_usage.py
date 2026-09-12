@@ -91,7 +91,7 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
     # #600: e2e-смоук морды dsh-edge на PR, до мержа. Репо-секретов не читает
-    # вовсе (ADR 0016) — сборка и локальный unstable_dev не обращаются к
+    # вовсе (ADR 0017) — сборка и локальный unstable_dev не обращаются к
     # Cloudflare/GitHub ни с одним репо-секретом, `gh release download` идёт
     # публичным github.token (репозиторий публичный); поэтому не входит ни в
     # DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS — тот же класс, что
