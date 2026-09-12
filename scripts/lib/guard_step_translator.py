@@ -59,6 +59,16 @@
      срабатывала бы — ровно тот класс, который `check_catalog_handwritten_
      overlap` не видит (цель обёртки — путь каталога, пересечения с
      рукописными шагами нет), а исходный шаг из repo-ci.yml уже удалён.
+     CONTENT-форма того же класса (четвёртый круг ревью PR #902): цель
+     шага не лежит в каталоге и производный стем не совпадает, но её УЖЕ
+     исполняет существующий файл каталога (`run: python
+     scripts/lib/ci_guard_registration_guard.py` против каталога с
+     `ci-guard-registration.sh`) — сверка целей шага с `_catalog_targets`
+     (один замер на вызов, одно место правды с гвардией #771) даёт тот же
+     громкий отказ: иначе перенос заводил бы ВТОРОЙ файл для той же
+     гвардии, и после удаления рукописного шага ни одна сверка этого не
+     видела бы (`check_catalog_handwritten_overlap` — пересечения нет,
+     `_catalog_targets` со своим setdefault затеняет дубль).
   4. Имя файла уже занято (существующий файл каталога ИЛИ другой шаг того
      же вызова) — `UnsupportedStepError` (коллизия, перенос вручную).
   5. Пишет `scripts/ci/guards/<имя>.sh` (шебанг, `set -euo pipefail`,
@@ -439,6 +449,7 @@ def translate_repo_ci(
     steps = ((doc.get("jobs") or {}).get("test") or {}).get("steps") or []
 
     reserved_slugs = {p.stem for p in catalog_dir.glob("*.sh")} if catalog_dir.is_dir() else set()
+    catalog_targets: dict[str, str] | None = None
     plans: list[_StepPlan] = []
 
     for name in added:
@@ -517,6 +528,36 @@ def translate_repo_ci(
                 "scripts/ci/guards/, переносить нечего, а обёртка вокруг "
                 "файла каталога исполняла бы гвардию дважды; просто удали "
                 "рукописный шаг целиком из .github/workflows/repo-ci.yml"
+            )
+        if catalog_targets is None:
+            # Однократный замер каталога на вызов translate_repo_ci (не на
+            # каждый шаг): отображение «исполняемый файл → имя файла
+            # каталога, его исполняющего», тот же `_catalog_targets`, что
+            # сверяет каталог↔рукописные шаги в гвардии #771 (одно место
+            # правды для «что уже исполняется каталогом»).
+            catalog_targets = _crg._catalog_targets(catalog_dir)
+        content_overlaps = sorted(
+            (t, catalog_targets[t]) for t in sorted(targets) if t in catalog_targets
+        )
+        if content_overlaps:
+            # Находка ревью PR #902 (четвёртый круг): CONTENT-форма того же
+            # класса «гвардия уже зарегистрирована» — цель шага не лежит в
+            # scripts/ci/guards/ и производный стем не совпадает ни с одним
+            # файлом каталога, но эту цель УЖЕ исполняет существующий файл
+            # каталога (живой случай: `run: python
+            # scripts/lib/ci_guard_registration_guard.py` против каталога с
+            # `ci-guard-registration.sh`). Перенос заводил бы ВТОРОЙ файл,
+            # исполняющий ту же гвардию: рукописных шагов после удаления не
+            # остаётся, `check_catalog_handwritten_overlap` не находит
+            # пересечения, а `_catalog_targets` со своим setdefault даже
+            # затеняет дубль — silent-wrong в тяжёлом состоянии объекта.
+            raise UnsupportedStepError(
+                f"шаг {name!r}: цель(и) {content_overlaps} уже исполняются "
+                "существующим файлом каталога — гвардия уже зарегистрирована "
+                "в scripts/ci/guards/, второй файл для той же гвардии "
+                "заводить нельзя (исполнялась бы дважды); просто удали "
+                "рукописный шаг целиком из .github/workflows/repo-ci.yml, "
+                "каталог не трогай"
             )
         slug = _slug_from_target(sorted(targets)[0])
         if slug in reserved_slugs:

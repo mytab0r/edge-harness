@@ -37,7 +37,11 @@ test_translate_repo_ci_raises_when_run_contains_actions_expression. Убери
 находка ревью PR #902, третий круг) — краснеет
 test_translate_repo_ci_raises_when_step_invokes_existing_catalog_file
 (DID NOT RAISE: обёртка вокруг файла каталога заводится молча, гвардия
-стала бы исполняться дважды).
+стала бы исполняться дважды). Убери проверку `content_overlaps` (цель
+шага уже исполняется существующим файлом каталога — находка ревью PR
+#902, четвёртый круг) — краснеет
+test_translate_repo_ci_raises_when_catalog_already_runs_step_target
+(DID NOT RAISE: в каталоге заводится ВТОРОЙ файл для той же гвардии).
 
 Запуск: python -m pytest scripts/lib/test_guard_step_translator.py -q
 """
@@ -545,6 +549,86 @@ def test_translate_repo_ci_raises_when_step_invokes_existing_catalog_file(tmp_pa
     # никакой обёртки не появилось.
     assert repo_ci.read_text(encoding="utf-8") == original
     assert sorted(p.name for p in catalog_dir.glob("*.sh")) == ["ci-guard-registration.sh"]
+
+
+def test_translate_repo_ci_raises_when_catalog_already_runs_step_target(tmp_path):
+    """CONTENT-форма того же класса (находка ревью PR #902, четвёртый круг):
+    цель шага НЕ лежит в scripts/ci/guards/ и производный стем не совпадает
+    ни с одним файлом каталога, но эту цель УЖЕ исполняет существующий файл
+    каталога — `run: python scripts/lib/ci_guard_registration_guard.py`
+    (команда из докстринга самого модуля) против каталога с
+    `ci-guard-registration.sh`. Раньше перенос был «успешен»: заводился
+    ВТОРОЙ файл, исполняющий ту же гвардию (`ci-guard-registration-guard.sh`),
+    шаг удалялся — рукописных шагов после переноса нет,
+    `check_catalog_handwritten_overlap` не находит пересечения, а
+    `_catalog_targets` со своим setdefault даже затеняет дубль: гвардия
+    исполняется дважды, и мутация-критерий #749 не срабатывает ни при каком
+    удалении. Тот же silent-wrong ловится сверкой целей с `_catalog_targets`
+    (один замер на вызов, одно место правды с гвардией #771).
+
+    Мутация, доказывающая класс: убери проверку `content_overlaps` в
+    translate_repo_ci — тест краснеет (DID NOT RAISE), в каталоге
+    появляется второй файл для той же гвардии."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Гвардия регистрации CI-гвардий\n"
+        "        run: python scripts/lib/ci_guard_registration_guard.py\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+    (catalog_dir / "ci-guard-registration.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "python scripts/lib/ci_guard_registration_guard.py\n",
+        encoding="utf-8",
+    )
+    original = repo_ci.read_text(encoding="utf-8")
+
+    with pytest.raises(gst.UnsupportedStepError, match="уже исполняются"):
+        gst.translate_repo_ci(
+            repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
+        )
+
+    # Атомарность: repo-ci.yml не тронут, в каталоге только исходный файл —
+    # второго файла для той же гвардии не появилось.
+    assert repo_ci.read_text(encoding="utf-8") == original
+    assert sorted(p.name for p in catalog_dir.glob("*.sh")) == ["ci-guard-registration.sh"]
+
+
+# ── Рендер working-directory: опциональный cd после set -euo pipefail ───────
+
+
+def test_translate_repo_ci_renders_working_directory_as_cd(tmp_path):
+    """Некритичное замечание ревью PR #902 (четвёртый круг): рендер
+    `working-directory` не был покрыт тестом. Прод-форма — шаги PR #241
+    (#897): `working-directory: cf-worker` + npm/npx-тело не переносится
+    (нет узнаваемой цели), поэтому фикстура берёт переносимую pytest-цель
+    с тем же ключом: рендер обязан дать `cd cf-worker` сразу после
+    `set -euo pipefail`, до тела `run:`."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Тесты в подпапке\n"
+        "        working-directory: cf-worker\n"
+        "        run: python -m pytest scripts/lib/test_sub.py -q\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+
+    result = gst.translate_repo_ci(
+        repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
+    )
+
+    assert len(result.migrated) == 1
+    content = (catalog_dir / "sub-guard.sh").read_text(encoding="utf-8")
+    assert "set -euo pipefail\ncd cf-worker\npython -m pytest scripts/lib/test_sub.py -q" in content
 
 
 # ── _slug_from_target: правило именования детерминировано ───────────────────

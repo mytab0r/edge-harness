@@ -53,9 +53,23 @@
       catalog_file` (DID NOT RAISE), снятие ветки газа краснит
       `test_check_message_advises_deletion_when_step_invokes_catalog_file`
       («создай» появляется, совета удалить нет).
+- [x] Content-форма того же класса (находка ревью PR #902, четвёртый круг):
+      цель шага не лежит в каталоге и стем не совпадает, но её УЖЕ
+      исполняет существующий файл каталога (`run: python
+      scripts/lib/ci_guard_registration_guard.py` против каталога с
+      `ci-guard-registration.sh`) — транслятор заводил ВТОРОЙ файл для той
+      же гвардии, и после удаления рукописного шага ни одна сверка этого
+      не видела. Теперь сверка целей шага с `_catalog_targets(catalog_dir)`
+      (один замер на вызов) — громкий `UnsupportedStepError`; ветка газа
+      расширена той же содержательной сверкой (устранён противоречивый
+      совет «убери рукописный шаг» + «создай <уже существующий файл>» в
+      одном отчёте). Мутационно доказано: снятие `content_overlaps`
+      краснит `test_translate_repo_ci_raises_when_catalog_already_runs_
+      step_target` и `test_check_message_advises_deletion_when_catalog_
+      already_runs_target` (DID NOT RAISE / «создай» появляется).
 - [x] Гвардия транслятора в `scripts/ci/guards/guard-step-translator.sh`.
-- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (16),
-      `scripts/lib/test_ci_guard_registration_guard.py` (+3),
+- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (18),
+      `scripts/lib/test_ci_guard_registration_guard.py` (+4),
       `scripts/orchestra/test_mechanical_rebase.py` (+5).
 - [x] Отклонение от текста задачи #897 про «бит исполнения» зафиксировано в
       `proposal.md` (файлы каталога — `100644`, вызов через интерпретатор,
