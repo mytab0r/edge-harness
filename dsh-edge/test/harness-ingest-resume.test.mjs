@@ -1,0 +1,128 @@
+// Поведенческие тесты #1049: appendHarnessEvents больше не должен делать
+// O(вся история) skanshotEvents()-скан на каждый вызов ingest. Носитель
+// исправления — planHarnessIngestResume/advanceHarnessIngestBaseTurn в
+// dsh-edge/patches/0004-harness-ingest.patch, извлечённые ДОСЛОВНО из
+// текущего патча (dsh-edge/verify-harness-ingest-resume.mjs) и выполненные
+// как настоящий TypeScript-модуль под встроенным type-stripping Node 24 —
+// не пересказ и не проверка «функция существует» (класс дефекта из
+// AGENTS.md, «Поведенческий тест находит то, чего структурный не видит»,
+// #891/#893): тест ловит именно поведение — сколько раз вызывающая сторона
+// обязана платить холодным ресумом (O(N) чтение всего лога) на N батчей той
+// же сессии, а не факт наличия имени функции в файле.
+//
+// Мутация (ручной прогон, зафиксирован в PR): временно заменить тело
+// planHarnessIngestResume на "always entry: undefined" (эквивалент
+// pre-#1049 поведения — cold resume на КАЖДЫЙ вызов) красит
+// «повторный вызов той же сессии переиспользует хэндл» ниже; возврат тела —
+// снова зелёный.
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { extractPatchFunction, loadHarnessIngestResumeModule } from '../verify-harness-ingest-resume.mjs'
+
+const { planHarnessIngestResume, advanceHarnessIngestBaseTurn } = await loadHarnessIngestResumeModule()
+
+/** Fake handle shaped like AgentHandle just enough for planHarnessIngestResume's contract. */
+function fakeHandle(agentId) {
+  let disposed = false
+  return {
+    agent: agentId,
+    disposed: () => disposed,
+    dispose: async () => { disposed = true },
+  }
+}
+
+test('extractPatchFunction бросает громко, если маркер не найден (не тихий ноль)', () => {
+  assert.throws(
+    () => extractPatchFunction('+export function other() {\n+}\n', 'planHarnessIngestResume'),
+    /не найден маркер/,
+  )
+})
+
+test('первый вызов для новой сессии требует холодного ресума (entry === undefined)', () => {
+  const cache = new Map()
+  const plan = planHarnessIngestResume(cache, 's1', () => true, 1_000, 120_000)
+  assert.equal(plan.entry, undefined, 'пустой кэш обязан требовать cold resume')
+  assert.deepEqual(plan.evicted, [])
+})
+
+test('#1049 — ЖИВОЙ КЛАСС ДЕФЕКТА: повторный вызов той же сессии переиспользует уже открытый хэндл, не платит cold resume снова', () => {
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  cache.set('s1', { handle, baseTurn: 3, lastUsedMs: 1_000 })
+
+  // Три последовательных батча ingest для ТОЙ ЖЕ сессии, разнесённые по
+  // времени в пределах idle-окна: до фикса (#1049) КАЖДЫЙ из них требовал
+  // openAgentForTurn -> agents.resume -> полное чтение лога. После фикса —
+  // ни один: entry определён и совпадает с уже открытым хэндлом.
+  let coldResumes = 0
+  for (const nowMs of [2_000, 5_000, 30_000]) {
+    const plan = planHarnessIngestResume(cache, 's1', cached => cached.handle === handle, nowMs, 120_000)
+    if (plan.entry === undefined) coldResumes += 1
+    else assert.equal(plan.entry.handle, handle, 'переиспользованный entry обязан указывать на тот же хэндл')
+  }
+  assert.equal(coldResumes, 0, 'три батча одной сессии не должны требовать ни одного холодного ресума')
+  assert.equal(handle.disposed(), false, 'тёплый хэндл не диспоузится между батчами одной сессии')
+})
+
+test('идле-таймаут вытесняет тёплый хэндл и требует нового холодного ресума', () => {
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  cache.set('s1', { handle, baseTurn: 0, lastUsedMs: 1_000 })
+
+  const idleMs = 120_000
+  const stillWarm = planHarnessIngestResume(cache, 's1', () => true, 1_000 + idleMs - 1, idleMs)
+  assert.notEqual(stillWarm.entry, undefined, 'на грани idle-окна хэндл ещё тёплый')
+
+  const afterIdle = planHarnessIngestResume(cache, 's1', () => true, 1_000 + idleMs + 1, idleMs)
+  assert.equal(afterIdle.entry, undefined, 'после idle-окна кэш обязан требовать cold resume')
+  assert.equal(afterIdle.evicted.length, 1, 'вытесненный хэндл обязан вернуться вызывающей стороне для dispose()')
+  assert.equal(afterIdle.evicted[0].handle, handle)
+})
+
+test('хэндл, переставший быть живым владельцем (архивирован/форкнут/выигран нативным ходом), не переиспользуется', () => {
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  cache.set('s1', { handle, baseTurn: 0, lastUsedMs: 1_000 })
+
+  // isLiveOwner отражает agents.get(id) !== handle.agent — внешняя
+  // диспоузация (архив/форк/выигранный гонкой нативный ход) сделала
+  // закэшированный хэндл более не владельцем живой сессии.
+  const plan = planHarnessIngestResume(cache, 's1', () => false, 1_500, 120_000)
+  assert.equal(plan.entry, undefined, 'протухший (не-live-owner) хэндл не должен переиспользоваться')
+  assert.equal(plan.evicted.length, 1, 'протухший хэндл обязан быть вытеснен и отдан на dispose()')
+  assert.equal(cache.has('s1'), false, 'протухшая запись обязана быть удалена из кэша')
+})
+
+test('вытесняются ТОЛЬКО простроченные записи — соседняя активная сессия не трогается', () => {
+  const cache = new Map()
+  const stale = fakeHandle('STALE')
+  const fresh = fakeHandle('FRESH')
+  cache.set('stale-session', { handle: stale, baseTurn: 0, lastUsedMs: 1_000 })
+  cache.set('fresh-session', { handle: fresh, baseTurn: 0, lastUsedMs: 100_000 })
+
+  const plan = planHarnessIngestResume(cache, 'fresh-session', () => true, 130_000, 120_000)
+  assert.equal(plan.evicted.length, 1)
+  assert.equal(plan.evicted[0].handle, stale)
+  assert.notEqual(plan.entry, undefined, 'соседняя свежая сессия остаётся тёплой')
+  assert.equal(cache.has('fresh-session'), true)
+  assert.equal(cache.has('stale-session'), false)
+})
+
+test('advanceHarnessIngestBaseTurn — ТОЧНЫЙ номер хода: максимум по батчу, никогда не назад', () => {
+  assert.equal(advanceHarnessIngestBaseTurn(0, [0, 0, 1, 1, 2]), 2, 'обычный батч из нескольких ходов')
+  assert.equal(advanceHarnessIngestBaseTurn(5, []), 5, 'батч без событий с полем turn не двигает baseTurn')
+  assert.equal(advanceHarnessIngestBaseTurn(10, [3, 4]), 10, 'defensive max — не откатывается назад на меньших значениях')
+})
+
+test('advanceHarnessIngestBaseTurn — точность через несколько последовательных батчей (без пересчёта истории)', () => {
+  // Симуляция трёх ingest-батчей одной сессии: каждый использует baseTurn,
+  // унаследованный от предыдущего, БЕЗ единого обращения к прошлым событиям —
+  // именно это заменяет O(N) snapshotEvents()-скан на каждый вызов.
+  let baseTurn = 0
+  baseTurn = advanceHarnessIngestBaseTurn(baseTurn, [0, 0, 1]) // batch 1: local turns 0..1
+  assert.equal(baseTurn, 1)
+  baseTurn = advanceHarnessIngestBaseTurn(baseTurn, [2, 2, 3]) // batch 2: continues from offset baseTurn=1
+  assert.equal(baseTurn, 3)
+  baseTurn = advanceHarnessIngestBaseTurn(baseTurn, [4]) // batch 3: single turn
+  assert.equal(baseTurn, 4)
+})
