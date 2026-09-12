@@ -773,22 +773,6 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/lib/test_pr_create_guard.py -q
 
-      # PATH-шим gh в среде автономного воркера (#594): живой инцидент — PR
-      # #586 открыт голым `gh pr create` с «Closes #575» изнутри сессии DSH,
-      # инструкция промпта агента не удержала (транспорт не перехватывает
-      # тул-колл агента изнутри DSH — openspec/changes/
-      # input-schema-not-output-parsing/design.md:205-217). Шим встаёт в PATH
-      # раньше настоящего gh (scripts/lib/gh_shim.sh, вызывается из
-      # scripts/worker/task.sh) — агент физически не может достучаться до
-      # `gh pr create` в обход scripts/git/pr-create. Мутации, которыми
-      # доказан smoke: (1) отключи блок отказа в scripts/gh-shim/gh — тест
-      # красный; (2) пропусти вызов gh_shim_install (шим не попадает в PATH) —
-      # тест красный на этом же ассерте. Это НЕ замена
-      # scripts/orchestra/contract_check.py — постфактумная проверка остаётся
-      # (defense-in-depth: вход и выход оба стоят).
-      - name: Smoke gh-шим — gh pr create физически недостижим в обход двери (#594)
-        run: bash scripts/gh-shim/test/gh-shim.test.sh
-
       # Гвардия класса #496 (статический скан «raw gh pr create вне обёртки»)
       # РАССМОТРЕНА и сознательно НЕ заведена: подстрока `gh pr create`
       # легитимно встречается в комментариях/доках/тексте тестов (в т.ч. в

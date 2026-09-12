@@ -15,6 +15,16 @@
 # себе был устроен так, что блокировка происходит НЕ из-за PATH (например,
 # случайно захардкожен путь к шиму), случай 5 покраснел бы, доказывая, что
 # случай 1 был бы ложно-зелёным без реальной защиты.
+#
+# Остальные мутации:
+# — случай 5a («дверь под шимом»): верни в scripts/git/pr-create голый
+#   `exec gh pr create` (без GH_SHIM_REAL_GH) — дверь под шимом отклонит сама
+#   себя (петля «шим отсылает к двери, дверь отклоняется тем же шимом», живая
+#   находка ревью PR #596), настоящий gh вызван не будет — тест красный.
+# — случай 7 (source-гвардия проводки): выкини из scripts/worker/task.sh
+#   source gh_shim.sh, вызов gh_shim_install или `|| die` при нём — тест
+#   красный. Проводка шима в транспорт закреплена тестом, а не комментарием:
+#   без этого защита исчезает молча при рефакторинге task.sh.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -153,6 +163,49 @@ else
   note "OK случай 5 (мутация): без шима в PATH тот же вызов доходит до настоящего gh — случай 1 доказан честно"
 fi
 
+# ── случай 5a: дверь scripts/git/pr-create ПОД шимом доходит до настоящего gh ──
+# Шим отклоняет голый `gh pr create`; дверь — единственный штатный путь —
+# обязана работать в ТОЙ ЖЕ среде: резолвит настоящий gh через
+# GH_SHIM_REAL_GH (та же переменная, одно место правды), а не голое слово
+# `gh`, которое PATH вернул бы обратно в шим. Без этого ассерта видимый
+# результат задачи — «обход невозможен И дверь работает» — держался бы на
+# рассуждении, а не на тесте (случай 1 дверь не прогоняет).
+if ! gh_shim_install "$WORK/gh-shim" >"$WORK/install5a.log" 2>&1; then
+  note "FAIL случай 5a: повторная установка шима не удалась"; cat "$WORK/install5a.log"; fail=1
+fi
+cat >"$WORK/body-door.md" <<'DOORBODY'
+#594
+
+## Что сделано
+PATH-шим gh в среде воркера: голый gh pr create отклоняется, остальное прозрачно.
+DOORBODY
+rm -f "$MARKER"
+if ! door_out=$("$REPO_ROOT/scripts/git/pr-create" --base main --head agent/594-gh-pr-create-path-shim --title "дверь под шимом" --body-file "$WORK/body-door.md" 2>"$WORK/err5a"); then
+  note "FAIL случай 5a: дверь под шимом не сработала (петля «шим → дверь → шим»?)"; cat "$WORK/err5a"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 5a: дверь под шимом НЕ дошла до настоящего gh:"; cat "$WORK/err5a"; fail=1
+elif ! grep -q "https://github.test/o/r/pull/1" <<<"$door_out"; then
+  note "FAIL случай 5a: в stdout двери нет URL от настоящего gh: [$door_out]"; fail=1
+else
+  note "OK случай 5a: дверь под шимом доходит до настоящего gh — обход невозможен И дверь работает"
+fi
+
+# ── случай 5b: та же дверь под шимом держит свою гвардию тела ДО любого gh ───
+# Дверь — вход защиты: тело с Closes/Fixes/Resolves отклоняется ею самой до
+# сетевого вызова, даже когда шим уже стоит в PATH (тогда PR не создаётся
+# дважды: ни шимом, ни дверью).
+printf '#594\n\nCloses #594.\n' >"$WORK/body-door-closes.md"
+rm -f "$MARKER"
+if out5b=$("$REPO_ROOT/scripts/git/pr-create" --base main --head agent/594-gh-pr-create-path-shim --title "тест" --body-file "$WORK/body-door-closes.md" 2>"$WORK/err5b"); then
+  note "FAIL случай 5b: дверь пропустила тело с Closes #N: $out5b"; fail=1
+elif [ -f "$MARKER" ]; then
+  note "FAIL случай 5b: тело с Closes #N дошло до настоящего gh — гвардия тела двери не сработала"; fail=1
+elif ! grep -q "PR НЕ создан" "$WORK/err5b"; then
+  note "FAIL случай 5b: в stderr нет «PR НЕ создан»"; cat "$WORK/err5b"; fail=1
+else
+  note "OK случай 5b: дверь под шимом отклоняет Closes #N до сети — ничего не создаётся"
+fi
+
 # ── случай 6: сломанная установка (нет GH_SHIM_REAL_GH) — громкий отказ, ────
 # не тихая деградация. Прогон САМОГО файла шима напрямую (не через PATH —
 # здесь мы уже нарочно проверяем именно его встроенный guard).
@@ -163,6 +216,46 @@ elif ! grep -q "GH_SHIM_REAL_GH" "$WORK/err6"; then
   note "FAIL случай 6: сообщение об ошибке не объясняет причину (сломанная установка)"; cat "$WORK/err6"; fail=1
 else
   note "OK случай 6: без GH_SHIM_REAL_GH шим падает громко, а не тихо"
+fi
+
+# ── случай 7 (source-гвардия): проводка шима в scripts/worker/task.sh ────────
+# закреплена тестом, а не комментарием (находка ревью PR #596 — смок раньше
+# звал gh_shim_install сам и в task.sh не заглядывал). Четыре инварианта: (7a)
+# task.sh source'ит scripts/lib/gh_shim.sh; (7b) вызывает gh_shim_install;
+# (7c) вызов стоит ДО запуска DSH (первый реальный запуск агента) — иначе DSH
+# стартует без шима и голый gh pr create вновь физически достижим; (7d) при
+# неудаче установки — `die`, а не тихое продолжение (fail loud). Выкини любое
+# из четырёх — тест красный. Комментарии кода не учитываются: гвардия смотрит
+# на исполняемые строки, правка комментария её не красит и не зеленит.
+#
+# Имя точки входа DSH менялось (dsh_run_with_retry → dsh_run_with_pool_then_chain,
+# #727/#737/#877/#880) — гвардия ищет по alternation нескольких известных имён,
+# а не одно жёстко зашитое, чтобы следующее переименование не роняло тест
+# молча мимо цели (класс, пойманный ребейзом PR #596 на #877/#880: старое имя
+# исчезло из исполняемых строк, дистанцию мерить стало не с чем).
+DSH_ENTRYPOINT_RE='dsh_run_with_pool_then_chain|dsh_run_with_provider_chain|dsh_run_with_retry'
+TASK_SH="$REPO_ROOT/scripts/worker/task.sh"
+code7="$(grep -v '^[[:space:]]*#\|^[[:space:]]*$' "$TASK_SH")" || code7=""
+# `|| true`/`|| var=` обязательны на каждом grep: скрипт под set -euo pipefail,
+# grep без совпадения (ровно случай «вызов выкинули из task.sh») иначе убил бы
+# тест МОЛЧА, без строки FAIL — а красный тест обязан называть причину.
+install_inv="$(grep 'gh_shim_install' <<<"$code7" | head -1)" || install_inv=""
+if ! grep -q 'lib/gh_shim.sh' <<<"$code7"; then
+  note "FAIL случай 7a: task.sh больше не source'ит scripts/lib/gh_shim.sh — шим не ставится, обход вновь возможен"; fail=1
+elif [ -z "$install_inv" ]; then
+  note "FAIL случай 7b: из task.sh пропал вызов gh_shim_install — шим не ставится, обход вновь возможен"; fail=1
+else
+  install_line="$(grep -n 'gh_shim_install' <<<"$code7" | head -1 | cut -d: -f1)" || install_line=""
+  dsh_line="$(grep -nE "$DSH_ENTRYPOINT_RE" <<<"$code7" | head -1 | cut -d: -f1)" || dsh_line=""
+  if [ -z "$dsh_line" ]; then
+    note "FAIL случай 7c: в task.sh не найден ни один известный вызов точки входа DSH ($DSH_ENTRYPOINT_RE) — гвардия порядка сломана, обнови alternation на актуальное имя (это дефект теста, а не транспорта)"; fail=1
+  elif [ "$install_line" -ge "$dsh_line" ]; then
+    note "FAIL случай 7c: gh_shim_install (строка $install_line) стоит НЕ раньше запуска DSH (строка $dsh_line) — DSH стартует без шима"; fail=1
+  elif ! grep -q 'die' <<<"$install_inv"; then
+    note "FAIL случай 7d: вызов gh_shim_install без громкого отказа (|| die) — сломанная установка деградирует тихо: $install_inv"; fail=1
+  else
+    note "OK случай 7: task.sh source'ит шим, ставит его до dsh ($install_line < $dsh_line) и падает громко при неудаче"
+  fi
 fi
 
 exit "$fail"
