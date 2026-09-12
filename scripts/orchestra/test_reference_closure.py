@@ -508,11 +508,17 @@ def test_run_infra_failure_escalates_to_watchdog_with_dedup(monkeypatch):
     assert escalated[0][0] == rc.WATCHDOG_ISSUE
     assert "compare API недоступен" in escalated[0][1]
     assert rc.REFERENCE_CLOSURE_ERROR_MARKER in escalated[0][1]
+    # Новый 🚨-эпизод красит шаг (fail loud, обещание комментария шага в
+    # orchestra.yml; замечание ревью PR #1046 из чеклиста).
+    assert rc.exit_code(lines1) == 1
 
     posted_markers.append(f"{rc.REFERENCE_CLOSURE_ERROR_MARKER} #507 PR #986")
     lines2 = rc.run("mytab0r/edge-harness")
     assert len(escalated) == 1  # повторного алерта нет
     assert any("уже эскалировано" in line for line in lines2)
+    # Повтор (дедуп) — газ: доставленный алерт не краснит каждый следующий
+    # прогон, красный шаг существует только пока эпизод новый.
+    assert rc.exit_code(lines2) == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -602,6 +608,45 @@ def test_run_comment_failure_after_close_is_loud_not_frozen(monkeypatch):
 
     assert 507 in fake.closed
     assert any("⚠️" in line and "ЗАКРЫТА" in line for line in lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Код выхода: ⚠️ и НОВЫЙ 🚨-эпизод красят шаг, повторный 🚨 (дедуп) — нет
+# (замечание ревью PR #1046 из чеклиста: эскалированный сбой улики оставлял
+# шаг зелёным, обещание «красный шаг виден» в orchestra.yml не выполнялось)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_exit_code_quiet_outcomes_are_zero():
+    assert rc.exit_code([]) == 0
+    assert rc.exit_code([
+        "💗 приёмка-по-ссылке: кандидатов не найдено",
+    ]) == 0
+    assert rc.exit_code([
+        "⏭️ #507: не закрываю (PR #986, epic) — эпик",
+        "🛑 #661: потолок 5 закрытий за прогон исчерпан (PR #952) — рассмотрю на следующем прогоне (cap_reached)",
+        "✅ #786: закрыта по ссылке из PR #841 — файлы на месте в main",
+    ]) == 0
+
+
+def test_exit_code_warning_line_is_one():
+    assert rc.exit_code([
+        "✅ #786: закрыта по ссылке из PR #841",
+        "⚠️ #507: закрытие не выполнено, маркер-комментарий не ставился — повтор на следующем прогоне — 403",
+    ]) == 1
+
+
+def test_exit_code_new_escalation_is_one_dedup_is_zero():
+    new_episode = (
+        "🚨 #507: приёмка-по-ссылке PR #986 не смогла проверить улику — "
+        "compare API недоступен (доставлен)")
+    dedup_episode = (
+        "🚨 #507: приёмка-по-ссылке PR #986 не смогла проверить улику — "
+        "compare API недоступен (уже эскалировано, повторно не шлём)")
+    assert rc.exit_code([new_episode]) == 1
+    assert rc.exit_code([dedup_episode]) == 0
+    # ⚠️ среди строк достаточен независимо от порядка.
+    assert rc.exit_code([dedup_episode, "⚠️ #661: комментарии не прочитаны — 429"]) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
