@@ -129,7 +129,13 @@ def main() -> int:
             print(f"::error::plugin-upstream-version-drift: {problem}")
         print(
             f"plugin-upstream-version-drift: {len(problems)} расхождение(й) с пином "
-            f"{repo}@{sha} (класс #507) — обнови версию в plugins-src/*/package.json"
+            f"{repo}@{sha} (класс #507) — обнови версии в plugins-src/*/package.json, "
+            "но ТОЛЬКО бампа версии недостаточно: релизный тарбол плагина собирается "
+            "заранее, старый код остаётся в нём — пересобери и перевыпусти плагин "
+            "конвейером #80 (gh workflow run plugin-forge.yml -f plugin_path="
+            "plugins-src/<плагин> -f task_issue=<номер>) и обнови source записи "
+            "в dsh-edge/plugins.json, иначе гвардия зелёная, а деплой красный "
+            "(живой прецедент: #806, 9 подряд красных прогонов deploy-dsh-edge.yml)"
         )
         return 1
 
