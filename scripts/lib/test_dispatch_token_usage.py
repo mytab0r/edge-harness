@@ -71,11 +71,22 @@ EXPECTED_WORKFLOWS = frozenset({
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
     "cf-inventory.yml",
+    # Сирота A аудита 2026-09-11 (scripts/orchestra/checklist_tail_labels.py):
+    # читает только github.token (issues: write, pull-requests: read) — тот
+    # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни
+    # GH_PIPELINE_PAT не использует.
+    "checklist-tail-triage.yml",
     "codeql.yml",
     # #762: дешёвый механический ребейз PR с меткой conflict, без вызова
     # агента — читает secrets.GH_PIPELINE_PAT для push рёбейзнутой ветки
     # (см. PIPELINE_CONSUMERS).
     "conflict-mechanical-rebase.yml",
+    # Сирота B аудита 2026-09-11 (scripts/orchestra/dependabot_alert_watch.py):
+    # читает только github.token (issues: write, vulnerability-alerts: read)
+    # + опциональные секреты TELEGRAM_* для эскалации — тот же класс, что
+    # branch-protection-watch.yml выше, ни GH_DISPATCH_TOKEN, ни
+    # GH_PIPELINE_PAT не использует.
+    "dependabot-alert-watch.yml",
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
