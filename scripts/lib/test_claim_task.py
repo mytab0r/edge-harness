@@ -264,6 +264,26 @@ def test_race_two_claims_one_wins_other_refused(monkeypatch):
     assert server.existing_refs == {"refs/locks/task-5"}
 
 
+def test_race_two_worker_slots_one_free_task_second_slot_refused(monkeypatch):
+    # #827 (два слота параллельности worker.yml): slot и claim_task — РАЗНЫЕ
+    # понятия, замок не знает о слоте вовсе (lock_ref ключуется только
+    # номером задачи, не слотом, worker.yml не передаёт слот в task.sh/
+    # claim_task.py — grep по обоим файлам это подтверждает). Если task.sh
+    # обоих слотов независимо выбрал одну и ту же свободную задачу (free_task
+    # читает один и тот же пул), claim() арбитрирует так же, как любые два
+    # претендента: побеждает ровно один, второй явно отказан, без второй
+    # аренды и без дублирования работы над той же задачей.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    slot1 = ct.claim("o/r", 5, "worker run 111 (slot 1)", now=utc(12, 0))
+    slot2 = ct.claim("o/r", 5, "worker run 112 (slot 2)", now=utc(12, 0))
+    assert slot1.claimed is True
+    assert slot2.claimed is False and "занята" in slot2.detail
+    # Ровно один POST ref создал замок — второй слот не открыл параллельную
+    # аренду под тем же или другим ключом (единственный ref на задачу #5).
+    assert server.existing_refs == {"refs/locks/task-5"}
+    assert sum(1 for c in server.calls if "git/refs" in c and "-X" in c and "POST" in c) == 2
+
+
 def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):
     # Проверка на входе (не гвардия постфактум): приёмка уже закрыла задачу —
     # воркер/hands не должны снова браться за неё через claim. Отказ обязан
