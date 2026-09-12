@@ -3592,6 +3592,172 @@ def test_dispatch_conflict_rework_processes_oldest_conflict_first(monkeypatch):
     assert task_new["assignees"] != []  # свежий конфликт этим проходом не тронут
 
 
+def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, dispatched_since):
+    """Общая часть фикстуры для трёх тестов ниже (#1027): один PR с
+    ai:changes-requested, бюджет доводки уже исчерпан (одна ЗАСЧИТАННАЯ
+    попытка — WORKER_GIT_STEP_MARKER в комментариях ЗАДАЧИ), последний
+    прогон worker.yml по задаче атрибутирован и несёт `run_conclusion`."""
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    return fingerprint, {
+        "issues/120/comments?per_page=100": [],
+        f"pulls/{pr_number}/files": files,
+        f"issues/{pr_number}/comments": [
+            {"created_at": dispatched_since,
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": run_id, "conclusion": run_conclusion, "created_at": "2026-09-12T11:00:00Z"},
+        ]},
+        f"{REPO}/issues/{task_number}/comments?per_page": [
+            {"created_at": "2026-09-12T11:00:30Z",
+             "body": f"🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-{task_number}` "
+                     f"(TTL 24 ч по коммиту замка). Канал: worker run {run_id}."},
+            {"created_at": "2026-09-12T11:05:00Z",
+             "body": f"🤖 [worker: git-шаг] worker run {run_id}"},
+        ],
+        f"pulls/{pr_number}": {
+            "labels": [label(sch.review_labels.AI_CHANGES)],
+            "state": "open",
+        },
+        f"issues/{task_number}/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+
+
+def test_dispatch_ai_review_rework_retries_instead_of_escalating_after_infra_failure(monkeypatch):
+    """Живой случай PR #1020 (issue #1027, 2026-09-12): единственная
+    засчитанная попытка (WORKER_GIT_STEP_MARKER есть — агент дошёл до
+    git-шага) закончилась conclusion='failure' у самого прогона worker.yml
+    (rc≠0/нет ответившего провайдера/нет новых коммитов, см. scripts/lib/
+    dsh-ci.sh::dsh_worker_run_is_success) — это инфраструктурный отказ ЭТОГО
+    прогона, не незакрытые находки ai-review. Раньше это безусловно
+    эскалировало владельцу («причина не различается»), хотя conclusion уже
+    называл факт. Мутация: убери ветку `run_conclusion in FAILURE_CONCLUSIONS`
+    (вернись к безусловному escalate) — этот тест покраснеет (escalated
+    перестанет быть пустым, dispatched станет False)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000000, "failure", dispatched_since="2026-09-12T10:00:00Z")
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # инфра-сбой прогона не эскалирует
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=782" in dispatch_calls[0]
+    assert posted and posted[0][0] == 1020
+    assert any("не в счёт эскалации" in line and "failure" in line for line in observations)
+    assert task["assignees"] == []
+    # Повтор после инфра-отказа идёт с attempts == AI_REWORK_MAX_ATTEMPTS —
+    # «попытка {attempts+1}/{max}» печатало бы несуществующее «2/1»
+    # (некритичная находка ai-review PR #1030, чеклист): бюджет эта попытка
+    # не расходует. Мутация: верни пост-комментарию/actions безусловную дробь
+    # «(попытка {attempts + 1}/{AI_REWORK_MAX_ATTEMPTS} …)» без ветки
+    # `infra_retry` — тест покраснеет на обоих утверждениях ниже.
+    assert "2/1" not in posted[0][1]
+    assert "повтор после инфра-отказа" in posted[0][1]
+    assert all("2/1" not in line for line in actions)
+    assert any("повтор после инфра-отказа" in line for line in actions)
+
+
+def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_persist(monkeypatch):
+    """Исход 2 (законный): последний прогон worker.yml завершился
+    conclusion='success', но эскалация на ТЕКУЩЕМ отпечатке достижима только
+    если success-прогон не поменял отпечаток диффа — а тогда ai-review на
+    этот коммит не перезапускался (keep-path, should_run_ai_review go=False).
+    Текст обязан называть именно этот факт, не недостижимое «ai-review снова
+    нашёл нарушения на этом коммите» (находка ai-review PR #1030, второй
+    круг: «алерт не гадает» и про success-ветку тоже)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000001, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "conclusion='success'" not in escalated[0][2]  # честная проза факта, не сырой repr
+    assert "отработал успешно" in escalated[0][2]
+    assert "снова нашёл нарушения" not in escalated[0][2]  # недостижимо честно на этой ветке
+    assert "отпечаток диффа не изменился" in escalated[0][2]
+    assert "keep-path" in escalated[0][2]
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
+    assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_conclusion(monkeypatch):
+    """Исход 2, атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
+    (некритичная находка ai-review PR #1030 → блокирующая, «алерт не гадает»
+    #472): worker.yml несёт timeout-minutes: 280 — висяк даёт
+    conclusion='timed_out' у АТРИБУТИРОВАННОГО прогона. Текст эскалации
+    обязан назвать conclusion как есть, а не подменять его утверждением
+    «не атрибутирован (аренда сгорела до следа?)» — факт у кода уже в руках.
+    Решение не трогается: это не наш класс инфра-отказа, эскалация законна.
+    Мутация: верни двухветвный `reason` (всё, что не 'success' → «не
+    атрибутирован»), без ветки `run_conclusion is None` — тест покраснеет
+    на обоих утверждениях ниже."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000003, "timed_out", dispatched_since="2026-09-12T10:00:00Z")
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "не атрибутирован" not in escalated[0][2]  # атрибуция ЕСТЬ — врать о ней нельзя
+    assert "conclusion='timed_out'" in escalated[0][2]  # честный repr факта
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
+
+
+def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monkeypatch):
+    """Исход 3: PR закрылся/слился между снимком `pulls` и перепроверкой
+    (кем-то другим, или accept_merged_tasks этого же прогона) — эскалировать
+    «застрял» больше не на чем, это не провал."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000002, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fixture[f"pulls/1020"] = {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "closed"}
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("PR закрыт — эскалации быть не должно"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("PR закрыт — комментария быть не должно"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("PR закрыт — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert fake.mutating_calls() == []
+    assert any("закрыт" in line and "эскалация не нужна" in line for line in observations)
+
+
 def test_conflict_labeled_at_returns_most_recent_labeling_episode(monkeypatch):
     # Тот же приём, что last_gate1_labeled_at: max(), не min() — метка могла
     # сниматься/ставиться несколькими эпизодами конфликта (mark_conflicts
@@ -5627,7 +5793,8 @@ def test_wip_gate_does_not_repost_open_marker_while_episode_active(monkeypatch):
     # Идемпотентность (тот же приём, что PAUSE_MARKER/RESUME_MARKER): второй
     # пульс подряд с тем же перегруженным пулом не должен слать второй
     # комментарий — маркер уже стоит.
-    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
@@ -5638,7 +5805,8 @@ def test_wip_gate_does_not_repost_open_marker_while_episode_active(monkeypatch):
 
 
 def test_wip_gate_reopens_dispatch_and_posts_close_marker_when_queue_drains(monkeypatch):
-    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
@@ -5674,7 +5842,8 @@ def test_wip_gate_open_marker_body_matches_invariant_16_regex(monkeypatch):
 
 def test_wip_gate_close_marker_body_matches_invariant_16_regex(monkeypatch):
     """Та же гвардия дрейфа, что выше, для CLOSE-маркера (снятие лимита)."""
-    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T06:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
@@ -5691,7 +5860,8 @@ def test_wip_gate_close_marker_body_matches_invariant_16_regex(monkeypatch):
 
 def test_wip_gate_escalates_when_episode_older_than_stuck_threshold(monkeypatch):
     opened_at = utc(2026, 9, 6, 0, 0)  # 9ч назад > WIP_GATE_STUCK_HOURS (8)
-    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -5720,7 +5890,8 @@ def test_wip_gate_stuck_escalation_states_nothing_to_rework_when_no_targets(monk
     сам по данным того же прогона. Мутация: замени ветку `if targets:` в
     wip_gate на безусловный текст «доводить есть что» — тест покраснеет."""
     opened_at = utc(2026, 9, 6, 0, 0)
-    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -5763,7 +5934,8 @@ def test_wip_gate_closes_open_episode_when_fuse_takes_over(monkeypatch):
     только время, когда WIP был действующим тормозом. После снятия
     предохранителя при счётчике ≥ лимита эпизод откроется заново с чистого
     листа (сам, без ручного)."""
-    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({
         "issues/120/comments?per_page=100": comments,
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
@@ -5786,7 +5958,8 @@ def test_wip_gate_stuck_names_conflict_cycle_when_only_conflict_targets(monkeypa
     «доводкой, которая не успевает» (их ведёт авто-расшивка #474: одна
     попытка ребейза, бюджет по маркеру, после исчерпания — своя эскалация)
     и не вправе молчать про них («доводить нечего» — тоже неправда)."""
-    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER}]
+    comments = [{"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+                 "user": {"login": sch.EVENT_ACTOR_LOGIN}}]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -5827,7 +6000,8 @@ def test_dispatch_worker_skips_conflict_declared_task_when_wip_gate_closed(monke
 def test_wip_gate_does_not_escalate_twice_for_the_same_stuck_episode(monkeypatch):
     stuck_marker = f"{sch.WIP_GATE_STUCK_MARKER_PREFIX}{sch.WIP_GATE_STUCK_HOURS}ч]"
     comments = [
-        {"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER},
+        {"created_at": "2026-09-06T00:00:00Z", "body": sch.WIP_GATE_OPEN_MARKER,
+         "user": {"login": sch.EVENT_ACTOR_LOGIN}},
         {"created_at": "2026-09-06T08:10:00Z", "body": f"🚨 edge-harness: {stuck_marker}\nуже кричали"},
     ]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
@@ -5849,7 +6023,7 @@ def test_wip_gate_does_not_escalate_blindly_when_stuck_markers_unreadable(monkey
     этот тест покраснеет (escalate позовётся)."""
     opened_at_iso = "2026-09-06T00:00:00Z"  # 9ч назад > WIP_GATE_STUCK_HOURS (8)
 
-    def fake_issue_marker_times(repo, issue_number, marker):
+    def fake_issue_marker_times(repo, issue_number, marker, *, trusted_login=None):
         if marker == sch.WIP_GATE_STUCK_MARKER_PREFIX:
             raise RuntimeError("gh api repos/o/r/issues/120/comments: HTTP 502")
         if marker == sch.WIP_GATE_OPEN_MARKER:
@@ -5863,6 +6037,40 @@ def test_wip_gate_does_not_escalate_blindly_when_stuck_markers_unreadable(monkey
     observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[], dispatch_allowed=True)
     assert allowed is False
     assert any("не прочитаны" in line for line in actions)
+
+
+def test_wip_gate_ignores_close_marker_not_posted_by_ci_actor(monkeypatch):
+    """Живой случай (#1027, watchdog-issue #120, 2026-09-12): реальный
+    open-маркер от `github-actions[bot]` («23 ≥ 12») и следом
+    close-самозванец, ДОСЛОВНО взятый с живого репозитория
+    (`gh api repos/.../issues/120/comments`), от `user.login == "mytab0r"`
+    (`type == "User"` — личный PAT, прогон scheduler.py вне GitHub Actions).
+    Живой пересчёт REWORK-меток в этом же снимке `pulls` даёт 22 — гейт
+    обязан остаться закрытым (episode не закрылся самозванцем), а не читать
+    его как честное снятие лимита.
+
+    Мутация: убери `trusted_login=EVENT_ACTOR_LOGIN` у обоих вызовов
+    issue_marker_times в wip_gate — этот тест покраснеет (allowed станет
+    True, gate прочитает самозванца как настоящее закрытие эпизода)."""
+    comments = [
+        {"created_at": "2026-09-12T10:50:32Z",
+         "body": f"⏸️ {sch.WIP_GATE_OPEN_MARKER}\nОткрытых PR, ждущих доработки: 23 ≥ лимита 12. "
+                 "Новые задачи не диспетчируются, пока очередь не поредеет.",
+         "user": {"login": sch.EVENT_ACTOR_LOGIN, "type": "Bot"}},
+        {"created_at": "2026-09-12T12:59:06Z",
+         "body": "✅ [статус конвейера: WIP-лимит снят]\n"
+                 "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
+                 "снова диспетчируются.",
+         "user": {"login": "mytab0r", "type": "User"}},
+    ]
+    fake = FakeGh({"issues/120/comments?per_page=100": comments})
+    patch_gh(monkeypatch, fake)
+    pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, 23)]  # 22, живое число инцидента
+    observations, actions, allowed = sch.wip_gate(
+        REPO, utc(2026, 9, 12, 13, 0), pulls, pool=[], dispatch_allowed=True)
+    assert allowed is False
+    assert fake.mutating_calls() == []  # эпизод и так открыт (самозванец не в счёт) — маркер не повторяется
+    assert any("не берутся" in line for line in observations)
 
 
 def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatch):
