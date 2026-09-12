@@ -182,6 +182,11 @@ async function executeRunnerTask(args, exec) {
 
   let issue
   try {
+    // Третья дверь issue-create — Node-плагин dsh-edge не может позвать
+    // ни scripts/gh/issue-create (bash), ни pool_issue.py; инвариант
+    // "labels содержит task" (класс #179/#526) продублирован здесь
+    // константой TASK_LABEL (labels: [TASK_LABEL] ниже), не забыт.
+    // door-exception: третья дверь issue-create, инвариант task продублирован вручную выше
     const response = await githubFetch(`/repos/${repo}/issues`, {
       method: 'POST',
       token,
