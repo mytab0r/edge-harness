@@ -45,6 +45,15 @@ export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$REPO/scripts/lib/dsh-ci.sh"
 
+# Изоляция #140 (замер 5): dsh_run_with_retry запускает dsh ТОЛЬКО через
+# dsh_agent_run (sudo → launcher → timeout → dsh). Предмет ЭТОГО смока —
+# решения цепочки (кого пробовать, когда переключаться), не exec-проводка:
+# её доказывают dsh-clients.smoke.sh (AGENT-EXEC в журнале на заглушках) и
+# agent-isolation.guard.sh (настоящий sudo в repo-ci). Двой dsh_agent_run
+# сохраняет прод-форму вызова (`dsh_agent_run timeout … dsh …`) и передаёт
+# аргументы заглушке dsh() выше.
+dsh_agent_run() { "$@"; }
+
 # ── Заглушки: dsh_install/dsh_patch_profile не нужны сети, но профиль пишется
 # на диск (HOME) — используем временный HOME, чтобы не мусорить и не зависеть
 # от состояния хоста. dsh() — единственная внешняя команда, которую видит

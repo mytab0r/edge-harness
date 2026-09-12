@@ -4,11 +4,15 @@
 # остались (случай hands: SEQ/seq_persist/add_event/flush_events удалены, вызовы
 # живы). Здесь каждый bash-клиент (hands dsh_task.sh, worker task.sh,
 # ревьюер ai_dsh.sh) исполняется ЦЕЛИКОМ дочерним bash на заглушках внешнего мира:
-#   - функции-заглушки curl/gh/dsh/pnpm/timeout экспортируются (export -f) и
+#   - функции-заглушки curl/gh/pnpm/timeout экспортируются (export -f) и
 #     затеняют бинарники из PATH; dsh-ci.sh, который клиент пересорсирует и
 #     который перезатирает dsh_install/dsh_patch_profile, при этом не обманешь —
 #     его сетевые зависимости (npm pack из реестра, openssl-сверка целостности)
 #     застаблены ПУТЁМ: npm, openssl, git — исполняемые заглушки в PATH;
+#   - изоляция адаптера (#140) — sudo/docker исполняемыми заглушками в PATH:
+#     sudo реально исполняет только `bash <launcher>` агента (там exported-
+#     функции dsh/gh живут), всё остальное — журнал вызовов; ассерты доказывают,
+#     что прогон dsh идёт через dsh_agent_run, а не напрямую от транспорта;
 #   - dsh_install честно отрабатывает на заглушках (пустые tgz + константы
 #     integrity из dsh-ci.sh), сетевых вызовов нет.
 # Заглушки пишут журнал вызовов; после прогона — ассерты: код 0, журнал получил
@@ -61,6 +65,9 @@ curl() { # заглушка-диспетчер по URL; поддерживае�
   done
   local body="" code=200
   case "$url" in
+    # Health-check прокси-держателя ключа (#140): прод-форма ответа 200 ok.
+    */dsh-proxy-healthz)
+      body="ok" ;;
     */api/auth/login)
       code=303
       body="" ;;
@@ -180,7 +187,10 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
     _default_pr_list_url='[{"number":9,"state":"OPEN","additions":3,"deletions":1,"changedFiles":1,"url":"https://github.test/mytab0r/edge-harness/pull/9"}]'
     payload="${GH_PR_LIST_URL_JSON:-$_default_pr_list_url}"
   elif [[ "$sig" == *"pr list"* ]]; then
-    payload='[]'
+    # Открытые PR пула (шаг 0 воркера): переопределяемо сценарием доводки
+    # (#245-смоук) — JSON с number/body/headRefName заявляет PR за задачей.
+    _default_pr_list_tasks='[]'
+    payload="${GH_PR_LIST_TASKS_JSON:-$_default_pr_list_tasks}"
   elif [[ "$sig" == *"run list"* ]]; then
     # Гвардия дублей воркера: в smoke нет живых прогонов.
     payload='[]'
@@ -210,96 +220,42 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   fi
 }
 
-dsh() { # прогон пишет спул+ответ; dump-config доказывает монтаж плагина
-  case "${1:-}" in
-    --version)
-      echo "dsh 0.0.0-smoke"
-      return 0 ;;
-    plugin)
-      return 0 ;;
-    --profile)
-      if [ "${3:-}" = "--dump-config" ]; then
-        printf -- '- id: hands-streamer\n'
-        return 0
-      fi
-      # #876: настоящий, НЕ переключаемый отказ (не RATE_LIMIT/HTTP_404/
-      # EMPTY_RESPONSE/пустой stderr) — dsh_chain_should_advance решает
-      # «стоп», цепочка (единственный провайдер фикстуры) останавливается с
-      # ПУСТЫМ DSH_RUN_FAILURE_REASON, не all_providers_exhausted. Нужен
-      # отдельно от SMOKE_RATE_LIMIT_MODE ниже: та ветка либо не финиширует
-      # (transient-then-ok), либо намеренно ПЕРЕКЛЮЧАЕМАЯ (quota/HTTP_404) —
-      # ни один существующий режим не воспроизводит живую форму инцидента
-      # «PR по ветке уже существует + dsh честно отказал в ЭТОМ прогоне»
-      # (worker-false-success-gate ниже).
-      if [ -n "${SMOKE_DSH_STOP_ERROR:-}" ]; then
-        echo "dsh: $SMOKE_DSH_STOP_ERROR" >&2
-        return 1
-      fi
-      # Гвардия «правила репозитория доходят до исполнителя» (#650):
-      # каптурим РЕАЛЬНЫЙ промпт, с которым транспорт зовёт dsh — прод-форма,
-      # не пересказ. DSH_PROMPT_FILE задаётся вызывающим сценарием ниже.
-      [ -n "${DSH_PROMPT_FILE:-}" ] && printf '%s' "${3:-}" >"$DSH_PROMPT_FILE"
-      # Ретрай RATE_LIMIT в ai-review (#419): режим задаёт сценарий через
-      # SMOKE_RATE_LIMIT_MODE, попытки считает переменная процесса — эта
-      # заглушка живёт в одном bash-процессе ai_dsh.sh на весь ретрай-цикл
-      # (несколько вызовов dsh — один процесс, файл состояния не нужен).
-      if [ -n "${SMOKE_RATE_LIMIT_MODE:-}" ]; then
-        _smoke_rl_attempt=$(( ${_smoke_rl_attempt:-0} + 1 ))
-        case "$SMOKE_RATE_LIMIT_MODE" in
-          transient-then-ok)
-            if [ "$_smoke_rl_attempt" -le "${SMOKE_RATE_LIMIT_TRANSIENT_COUNT:-1}" ]; then
-              echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
-              return 1
-            fi
-            # worker/hands (#422, в отличие от ai_dsh.sh) требуют спул стрима
-            # на успехе — та же запись, что и обычный успешный путь ниже.
-            if [ -n "${HANDS_SPOOL:-}" ]; then
-              printf '%s\n' \
-                '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
-                '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
-                '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
-            fi
-            echo "smoke: работа сделана после ретрая"
-            # #876: маркер «в ветке появился новый коммит этой попытки» —
-            # читает git-заглушка (rev-parse HEAD) ниже. Без него
-            # WORKER_BRANCH_START_SHA/END_SHA в worker/task.sh совпали бы
-            # ВСЕГДА (обе точки читают ту же самую константу stub'а) и
-            # dsh_worker_run_is_success отказывал бы каждому «успешному»
-            # сценарию этого smoke — работу симулирует именно ЭТА точка,
-            # там, где заглушка утверждает, что DSH реально что-то сделал.
-            : >"${SMOKE_STATE:?}/git-head-seq"
-            return 0 ;;
-          always-transient)
-            echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
-            return 1 ;;
-          quota-exhausted)
-            echo "dsh: RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10T00:00:00Z" >&2
-            return 1 ;;
-          real-error)
-            echo "dsh: HTTP_404: modelCode does not exist" >&2
-            return 1 ;;
-          *)
-            echo "::error::SMOKE: неизвестный SMOKE_RATE_LIMIT_MODE: $SMOKE_RATE_LIMIT_MODE" >&2
-            return 99 ;;
-        esac
-      fi
-      [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; return 1; }
-      printf '%s\n' \
-        '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
-        '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
-        '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
-      echo "smoke: работа сделана"
-      # #876 — тот же маркер, что у ветки «после ретрая» выше.
-      : >"${SMOKE_STATE:?}/git-head-seq"
-      return 0 ;;
-    *)
-      echo "::error::SMOKE: dsh-заглушка не знает вызов: $*" >&2
-      return 99 ;;
-  esac
-}
+# dsh-ФУНКЦИИ-заглушки больше нет — и это осознанно (#140, ревью #395): прогон
+# dsh идёт через домен агента (`dsh_agent_run timeout … dsh …` → лаунчер →
+# `exec`), а exec не видит exported-функций — в проде dsh находится через PATH
+# как исполняемый файл. Единственная заглушка dsh — ФАЙЛ в PATH ниже: тест
+# кормится прод-формой вызова, а не пересказом. Логика бывшей функции (включая
+# #876: SMOKE_DSH_STOP_ERROR и маркер git-head-seq) перенесена в DSHSTUB без
+# потери сценариев — см. блок «dsh-БИНАРНИК» ниже.
 
 pnpm() { return 0; }
-timeout() { local secs=$1; shift; "$@"; }
+
+# Прод-форма timeout (ревью #395): timeout — бинарь coreutils, bash-функцию он
+# исполнить не может — `timeout N dsh_agent_run …` в проде = rc=127 («failed to
+# run command») до старта модели. Заглушка-трипваер отказывает, если её команда
+# — не исполняемый файл: регрессия к старой сломанной форме краснеет здесь,
+# а не на живом воркере.
+timeout() {
+  local secs="${1:-}" cmd="${2:-}"
+  if [ -z "$cmd" ] || [ "$(type -t "$cmd")" != file ]; then
+    echo "::error::SMOKE: timeout получил '${cmd:-<пусто>}' — это не исполняемый файл: в проде timeout (бинарь) упал бы с rc=127 до старта dsh (ревью #395)" >&2
+    return 127
+  fi
+  shift
+  "$@"
+}
+
+# Мутация трипваера timeout (ревью #395): старая сломанная форма
+# `timeout N <bash-функция>` обязана быть отвергнута ЗДЕСЬ (rc=127 + причина),
+# а не молча работать в смоуке и падать rc=127 только на живом воркере.
+# Позитивный контроль: исполняемый файл трипваер пропускает.
+_tv_err="$(timeout 5 dsh_agent_run 2>&1)" && _tv_rc=0 || _tv_rc=$?
+[ "$_tv_rc" -eq 127 ] || { echo "::error::SMOKE: трипваер timeout пропустил bash-функцию (rc=$_tv_rc) — прод-форма запуска не охраняется (ревью #395)" >&2; exit 1; }
+grep -q 'не исполняемый файл' <<<"$_tv_err" \
+  || { echo "::error::SMOKE: трипваер timeout отказал не по той причине: $_tv_err" >&2; exit 1; }
+timeout 5 bash -c 'exit 0' 2>/dev/null \
+  || { echo "::error::SMOKE: трипваер timeout отверг исполняемый файл — слишком строг (ревью #395)" >&2; exit 1; }
+echo "SMOKE: трипваер timeout жив (функция отвергнута, файл пропущен — ревью #395)"
 
 # ── Заглушки-исполняемые файлы (PATH): их не перезатирает source dsh-ci.sh ───────
 
@@ -340,6 +296,13 @@ case "${1:-}" in
       printf '0000000000000000000000000000000000000000\n'
     fi ;;
   show-ref) exit 1 ;;
+  worktree)
+    # Доводка PR (#245): `git worktree add -B <ветка> <путь> <ref>` обязан
+    # создать каталог — дальше транспорт делает cd и handover именно его
+    # (ревью head c3112d1); no-op-ветка `*) exit 0` каталога не создаёт.
+    shift
+    if [ "${1:-}" = "add" ]; then shift 2; mkdir -p "${2:-}"; fi
+    exit 0 ;;
   *) exit 0 ;;
 esac
 GITSTUB
@@ -349,7 +312,10 @@ GITSTUB
 # (-g и пр.) глотаются: install -g у dsh_install не должен падать на basename.
 cat >"$TMP/bin/npm" <<'NPMSTUB'
 #!/usr/bin/env bash
-[ "${1:-}" = "pack" ] && shift
+# Файлы пишет ТОЛЬКО pack: install (dsh_install и pnpm в prepare #140) —
+# no-op, иначе заглушка сорит tarball'ами в cwd вызывающего клиента.
+[ "${1:-}" = "pack" ] || exit 0
+shift
 dest="."
 specs=()
 prev=""
@@ -395,6 +361,14 @@ chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/openssl"
 # по коду возврата.
 cat >"$TMP/bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
+# gh уровня ПРОЦЕССА для лаунчера агента (#140): exec не видит exported-функций,
+# поэтому `gh auth status` из prepare должен отвечать ЗДЕСЬ и ДО проверки
+# GH_TOKEN — авторизация агента живёт в зеркале hosts.yml, не в env (это ровно
+# та модель, которую проверяет prepare в режиме gh).
+if [[ " $* " == *" auth status "* ]]; then
+  printf '%s\n' '{"github.com":{"user":"mytab0r"}}'
+  exit 0
+fi
 # Прод-форма gh (#121-ревью): без токена реальный gh неавторизован — заглушка
 # обязана падать так же (rc 4 + ::error::), иначе безтокенная ветка канала
 # (например «unset GH_RUN_TOKEN до вызова аренды») зелёная в тесте и красная
@@ -487,6 +461,158 @@ esac
 GHSTUB
 chmod +x "$TMP/bin/gh"
 
+# sudo уровня процесса (#140): изоляция адаптера вызывает useradd/chown/install
+# и запускает лаунчер агент-юзера. Реального sudo в smoke нет и быть не должно:
+# юзеры не создаются, /etc не пишется, chown не выполняется. Реально исполняется
+# только `bash <launcher>` (домен агента): exported-функции dsh/gh/timeout
+# наследуются этим bash, поэтому проводка «dsh стартует через dsh_agent_run»
+# доказывается журналом (AGENT-EXEC), а не правдоподобием заглушки.
+cat >"$TMP/bin/sudo" <<'SUDOSTUB'
+#!/usr/bin/env bash
+rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|-H) shift ;;
+    -u) shift 2 ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+if [ "${rest[0]:-}" = "bash" ]; then
+  # rest = bash <launcher> <PATH> <команда домена агента...>. install в smoke
+  # не исполняется: реальный дом агента не существует (юзер не заводится),
+  # важен факт проводки — он в журнале (AGENT-INSTALL).
+  if [ "${rest[3]:-}" = "install" ]; then
+    printf 'AGENT-INSTALL %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+    exit 0
+  fi
+  printf 'AGENT-EXEC %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+  exec "${rest[@]}"
+fi
+printf 'SUDO %s\n' "${rest[*]}" >>"${CALLLOG:?CALLLOG не задан}"
+exit 0
+SUDOSTUB
+
+# node: прокси-держатель ключа (#140) стартует его в smoke-окружении как
+# процесс-заглушку: печатает прод-форму готовности (PROXY-READY port=N) и
+# засыпает — health-check прокси отвечает curl-заглушка (200), трэп обёртки
+# убивает процесс на выходе. Реальная механика прокси — в гвардии repo-ci
+# (agent-isolation.guard.sh: upstream-заглушка видит реальный ключ).
+cat >"$TMP/bin/node" <<'NODESTUB'
+#!/usr/bin/env bash
+# --version — штатный вызов обёрток (bootstrap-событие рук): отвечаем как node.
+if [ "${1:-}" = "--version" ]; then
+  printf 'v22.0.0-smoke\n'
+  exit 0
+fi
+printf 'PROXY-READY port=47813\n'
+exec sleep 300
+NODESTUB
+
+# docker: агент-юзер ОБЯЗАН получить отказ по правам (эскейп #140 закрыт).
+# Prepare принимает отказ только с "permission denied", любой другой исход — красный.
+cat >"$TMP/bin/docker" <<'DOCKERSTUB'
+#!/usr/bin/env bash
+echo "Got permission denied while trying to connect to the Docker daemon socket at /var/run/docker.sock"
+exit 1
+DOCKERSTUB
+
+# dsh-БИНАРНИК — ЕДИНСТВЕННАЯ заглушка dsh (#140, ревью #395): прогон dsh в
+# проде находится через PATH как файл (exec лаунчера не видит exported-функций),
+# поэтому вся логика сценариев живёт здесь. Логика бывшей функции dsh перенесена
+# сюда без изменений;
+# расхождение «функция для транспорта, файл для агента» теперь невозможно
+# по построению — оба пути разрешения имени ведут в этот один файл.
+cat >"$TMP/bin/dsh" <<'DSHSTUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version)
+    echo "dsh 0.0.0-smoke"
+    exit 0 ;;
+  plugin)
+    exit 0 ;;
+  --profile)
+    if [ "${3:-}" = "--dump-config" ]; then
+      printf -- '- id: hands-streamer\n'
+      exit 0
+    fi
+    # #876: настоящий, НЕ переключаемый отказ (не RATE_LIMIT/HTTP_404/
+    # EMPTY_RESPONSE/пустой stderr) — dsh_chain_should_advance решает
+    # «стоп», цепочка (единственный провайдер фикстуры) останавливается с
+    # ПУСТЫМ DSH_RUN_FAILURE_REASON, не all_providers_exhausted. Нужен
+    # отдельно от SMOKE_RATE_LIMIT_MODE ниже: та ветка либо не финиширует
+    # (transient-then-ok), либо намеренно ПЕРЕКЛЮЧАЕМАЯ (quota/HTTP_404) —
+    # ни один существующий режим не воспроизводит живую форму инцидента
+    # «PR по ветке уже существует + dsh честно отказал в ЭТОМ прогоне»
+    # (worker-false-success-gate ниже).
+    if [ -n "${SMOKE_DSH_STOP_ERROR:-}" ]; then
+      echo "dsh: $SMOKE_DSH_STOP_ERROR" >&2
+      exit 1
+    fi
+    # Гвардия «правила репозитория доходят до исполнителя» (#650):
+    # каптурим РЕАЛЬНЫЙ промпт, с которым транспорт зовёт dsh — прод-форма,
+    # не пересказ. DSH_PROMPT_FILE задаётся вызывающим сценарием.
+    [ -n "${DSH_PROMPT_FILE:-}" ] && printf '%s' "${3:-}" >"$DSH_PROMPT_FILE"
+    # Ретрай RATE_LIMIT (#419/#422): режим задаёт сценарий через
+    # SMOKE_RATE_LIMIT_MODE. Каждая попытка dsh — НОВЫЙ процесс (прод-форма:
+    # exec через лаунчер), попытки считает файл состояния SMOKE_RL_STATE.
+    if [ -n "${SMOKE_RATE_LIMIT_MODE:-}" ]; then
+      state="${SMOKE_RL_STATE:?SMOKE: для RL-сценария обязателен SMOKE_RL_STATE (файл счётчика попыток)}"
+      n=$(( $(cat "$state" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" >"$state"
+      case "$SMOKE_RATE_LIMIT_MODE" in
+        transient-then-ok)
+          if [ "$n" -le "${SMOKE_RATE_LIMIT_TRANSIENT_COUNT:-1}" ]; then
+            echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+            exit 1
+          fi
+          # worker/hands (#422, в отличие от ai_dsh.sh) требуют спул стрима
+          # на успехе — та же запись, что и обычный успешный путь ниже.
+          if [ -n "${HANDS_SPOOL:-}" ]; then
+            printf '%s\n' \
+              '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
+              '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
+              '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+          fi
+          echo "smoke: работа сделана после ретрая"
+          # #876: маркер «в ветке появился новый коммит этой попытки» —
+          # читает git-заглушка (rev-parse HEAD) ниже. Без него
+          # WORKER_BRANCH_START_SHA/END_SHA в worker/task.sh совпали бы
+          # ВСЕГДА (обе точки читают ту же самую константу stub'а) и
+          # dsh_worker_run_is_success отказывал бы каждому «успешному»
+          # сценарию этого smoke — работу симулирует именно ЭТА точка,
+          # там, где заглушка утверждает, что DSH реально что-то сделал.
+          : >"${SMOKE_STATE:?}/git-head-seq"
+          exit 0 ;;
+        always-transient)
+          echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+          exit 1 ;;
+        quota-exhausted)
+          echo "dsh: RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-10T00:00:00Z" >&2
+          exit 1 ;;
+        real-error)
+          echo "dsh: HTTP_404: modelCode does not exist" >&2
+          exit 1 ;;
+        *)
+          echo "::error::SMOKE: неизвестный SMOKE_RATE_LIMIT_MODE: $SMOKE_RATE_LIMIT_MODE" >&2
+          exit 99 ;;
+      esac
+    fi
+    [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; exit 1; }
+    printf '%s\n' \
+      '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
+      '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
+      '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+    echo "smoke: работа сделана"
+    # #876 — тот же маркер, что у ветки «после ретрая» выше.
+    : >"${SMOKE_STATE:?}/git-head-seq"
+    exit 0 ;;
+  *)
+    echo "::error::SMOKE: dsh-заглушка (бинарник) не знает вызов: $*" >&2
+    exit 99 ;;
+esac
+DSHSTUB
+chmod +x "$TMP/bin/sudo" "$TMP/bin/docker" "$TMP/bin/dsh" "$TMP/bin/node"
+
 # ── Окружение клиентов ────────────────────────────────────────────────────────────
 export DSH_EDGE_URL="https://morde.test"
 export DSH_EDGE_ACCESS_KEY="smoke-access-key-at-least-32-bytes-long!!"
@@ -532,10 +658,17 @@ export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
 export DRAIN_INTERVAL_SECS="1"
 export HEARTBEAT_SECS="3600"
 export GITHUB_REPOSITORY="mytab0r/edge-harness"
+# Изоляция #140: подготовка требует gh-конфиг транспорта (режим gh: worker/hands)
+# и каталог воркспейса. HOME уводится в фикстуру, чтобы не трогать реальный.
 export HOME="$TMP/home"
-mkdir -p "$HOME"
+mkdir -p "$HOME/.config/gh" "$TMP/workspace"
+printf 'github.com:\n    users:\n        mytab0r:\n            oauth_token: smoke-fake-pat\n' >"$HOME/.config/gh/hosts.yml"
+printf '[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n' >"$HOME/.gitconfig"
+export GITHUB_WORKSPACE="$TMP/workspace"
 export PATH="$TMP/bin:$PATH"
-export -f curl gh dsh pnpm timeout log_call
+# dsh больше не функция: прод-форма находит его через PATH (файл-заглушку) —
+# см. блок «dsh-БИНАРНИК» ниже.
+export -f curl gh pnpm timeout log_call
 export CALLLOG
 # Гвардия «правила репозитория доходят до исполнителя»: файл, куда заглушка
 # dsh() каптурит РЕАЛЬНЫЙ аргумент-промпт каждого прогона.
@@ -572,6 +705,23 @@ assert_log() { # SUBSTR MESSAGE
 assert_not_log() { # SUBSTR MESSAGE — отрицательный ассерт честен на чистом журнале
   if grep -qF -- "$1" "$CALLLOG"; then
     echo "::error::SMOKE: нежданный вызов «$1» — $2" >&2
+    echo "--- журнал вызовов ---" >&2
+    cat "$CALLLOG" >&2
+    exit 1
+  fi
+}
+
+# Гвардия класса #140: сам ПРОГОН dsh обязан идти через изоляцию (dsh_agent_run
+# → sudo -u агент bash лаунчер), а не напрямую из транспорта. Ищем AGENT-EXEC-
+# строку именно прогона: `dsh --profile headless <текст>` — не plugin add и
+# не --dump-config.
+assert_isolated_launch() { # MESSAGE
+  # Выфильтровка по словам надёжна, потому что тексты задач smoke-фикстур
+  # контролированы (слов «plugin»/«dump-config» в них нет); для произвольного
+  # текста задач матчить пришлось бы по структуре argv, а не по подстроке.
+  if ! grep '^AGENT-EXEC' "$CALLLOG" | grep -F ' dsh --profile headless ' \
+      | grep -vF 'plugin' | grep -vF 'dump-config' | grep -q .; then
+    echo "::error::SMOKE: прогон dsh прошёл мимо изоляции — $1" >&2
     echo "--- журнал вызовов ---" >&2
     cat "$CALLLOG" >&2
     exit 1
@@ -631,6 +781,20 @@ run_client_expect_fail() { # LABEL SCRIPT
     exit 1
   fi
 }
+# Мутация пробника ребра #140 (prepare, шаг 8г): экранирование \$PPID обязано
+# отдавать внутреннему bash pid СВОЕГО родителя-башика (B0 — агент-uid), а не
+# родителя B0. Экранированный вариант: inner-PPID == pid внешнего (пробник жив);
+# неэкранированный: inner получает уже развёрнутый pid родителя внешнего —
+# ровно тот мёртвый вариант, что вернул бы DENIED всегда.
+mut="$(bash -c 'bash -c "echo \$PPID"; echo "self=$$"')"
+escaped_ppid="${mut%%$'\n'*}"; self_pid="${mut##*self=}"
+[ "$escaped_ppid" = "$self_pid" ] \
+  || { echo "::error::SMOKE: экранированный пробник 8г мёртв — читает не того родителя (#140)" >&2; exit 1; }
+mut_raw="$(bash -c 'bash -c "echo $PPID"; echo "self=$$"')"
+raw_ppid="${mut_raw%%$'\n'*}"; raw_self="${mut_raw##*self=}"
+[ "$raw_ppid" != "$raw_self" ] \
+  || { echo "::error::SMOKE: неэкранированный вариант перестал отличаться — мутация не доказана" >&2; exit 1; }
+echo "SMOKE: пробник ребра #140 жив (мутация экранирования доказана)"
 
 # ── Клиент рук ────────────────────────────────────────────────────────────────────
 RUNNER_TEMP="$TMP/rt" \
@@ -643,6 +807,9 @@ assert_log "MORDE-RPC session.create" "hands: сессия морды не со�
 assert_log "MORDE-RPC session.rename" "hands: сессия морды не названа"
 assert_log "MORDE-INGEST" "hands: транскрипт не уехал в морду"
 assert_log "JOURNAL-POST /api/events" "hands: журнал не получил жизненный цикл job"
+# Изоляция #140: профильный патч ставится агентом, прогон идёт под агент-юзером.
+assert_log "AGENT-INSTALL" "hands: патч профиля не поставлен в дом агента"
+assert_isolated_launch "hands: dsh запущен под транспортом"
 # Аренда взята до работы (#121): замок создан, назначение и след — после него.
 assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "hands: аренда issue-123 не взята"
 assert_log "GH-API-ASSIGN issue-123" "hands: задача не назначена при claim"
@@ -690,6 +857,9 @@ grep -qF -- "Smoke задача &amp; для гвардии класса" <<<"$t
   || { echo "::error::SMOKE: worker: заголовок ушёл в Telegram неэкранированным: $tg_line" >&2; exit 1; }
 grep -qF -- "выполнена" <<<"$tg_line" \
   && { echo "::error::SMOKE: worker: «выполнена» в отчёте об открытом PR — класс #170 вернулся: $tg_line" >&2; exit 1; }
+# Изоляция #140: патч в дом агента ставит агент, прогон — под агент-юзером.
+assert_log "AGENT-INSTALL" "worker: патч профиля не поставлен в дом агента"
+assert_isolated_launch "worker: dsh запущен под транспортом"
 assert_rules_delivered "worker"
 assert_session_title "worker" "#123: Smoke задача & для гвардии класса"
 echo "SMOKE: worker — ок"
@@ -806,9 +976,33 @@ GH_ISSUE_JSON='{"number":201,"title":"Свободна для воркера","b
   run_client "worker-auto" "$REPO/scripts/worker/task.sh"
 assert_log "GH-API-LOCK-CREATE refs/locks/task-201" "worker-auto: свободная 201 не взята в аренду"
 assert_not_log "refs/locks/task-200" "worker-auto: задача под живым замком попала в работу"
-assert_log "MORDE-RPC session.create" "worker-auto: сессия морды не создана"
+assert_log "MORDE-RPC session.create" "worker-auto: сессия в морде не создана"
 assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
+assert_isolated_launch "worker-auto: dsh запущен под транспортом"
 echo "SMOKE: worker-auto — ок"
+
+# ── Доводка существующего PR (#245) с изоляцией #140 ─────────────────────────────
+# cwd модели — отдельный git worktree ВНЕ $GITHUB_WORKSPACE: handover обязан
+# уехать агенту ВТОРЫМ деревом (dsh_agent_handover "$PR_WORKTREE"), иначе
+# первая же запись модели (git add / правка файла) падает EACCES на чужом uid
+# (ревью head c3112d1). Ассерт держит ОБА chown в журнале sudo-заглушки.
+scenario_start
+RUNNER_TEMP="$TMP/rt-w-rw" \
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke доводка PR","body":"## Цель\nдоводка\n\n## Критерий готовности\nPR","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+GH_PR_LIST_TASKS_JSON='[{"number":123,"body":"#123","headRefName":"agent/123-smoke","labels":[]}]' \
+  run_client "worker-rework" "$REPO/scripts/worker/task.sh"
+assert_log "GH-API-LOCK-CREATE refs/locks/task-123" "worker-rework: аренда задачи 123 не взята"
+assert_isolated_launch "worker-rework: dsh запущен под транспортом"
+assert_log "SUDO chown -R dsh-agent:dsh-agent $TMP/workspace" \
+  "worker-rework: воркспейс не передан агенту"
+assert_log "SUDO chown -R dsh-agent:dsh-agent $TMP/rt-w-rw/dsh-worker/pr-worktree" \
+  "worker-rework: worktree доводки не передан агенту — первая запись модели была бы EACCES (ревью head c3112d1)"
+echo "SMOKE: worker-rework — ок"
 
 # ── Живая форма инцидента #876: PR по ветке УЖЕ существует (дефолтный
 # GH_PR_LIST_URL_JSON, открыт с диффом), dsh честно отказывает В ЭТОМ
@@ -856,6 +1050,9 @@ grep -q "smoke: работа сделана" "$AI_SMOKE/answer.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt не записан — verdict не сможет отличить ошибку провайдера от плохого формата ответа" >&2; exit 1; }
 grep -qx "0" "$AI_SMOKE/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review: dsh_rc.txt ожидал '0' на успешном прогоне, получено: $(cat "$AI_SMOKE/dsh_rc.txt")" >&2; exit 1; }
+# Изоляция #140 в режиме nogh: зеркало gh-конфига снесено, прогон — под агент-юзером.
+assert_log "SUDO rm -rf" "ai-review: nogh-режим не снёс протухшее зеркало gh-конфига"
+assert_isolated_launch "ai-review: dsh запущен под транспортом"
 echo "SMOKE: ai-review — ок"
 
 # ── Ретрай RATE_LIMIT в ai-review (#419) ──────────────────────────────────────
@@ -878,6 +1075,8 @@ AI_WORK="$AI_RL1" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="transient-then-ok" \
 SMOKE_RATE_LIMIT_TRANSIENT_COUNT="2" \
+SMOKE_RL_STATE="$AI_RL1/attempts" \
+HANDS_SPOOL="$AI_RL1/spool.ndjson" \
 AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
 AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="1" \
   run_client "ai-review-rate-limit-transient" "$REPO/scripts/review/ai_dsh.sh"
@@ -902,6 +1101,7 @@ printf 'Промпт ревью (smoke): квота исчерпана надо�
 AI_WORK="$AI_RL2" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
+SMOKE_RL_STATE="$AI_RL2/attempts" \
   run_client "ai-review-rate-limit-quota" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL2/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-quota: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL2/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
@@ -921,6 +1121,7 @@ printf 'Промпт ревью (smoke): HTTP_404 — переключаемый
 AI_WORK="$AI_RL3" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="real-error" \
+SMOKE_RL_STATE="$AI_RL3/attempts" \
   run_client "ai-review-rate-limit-real-error" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL3/dsh_rc.txt" \
   || { echo "::error::SMOKE: ai-review-real-error: dsh_rc.txt ожидал '1', получено: $(cat "$AI_RL3/dsh_rc.txt" 2>/dev/null)" >&2; exit 1; }
@@ -938,6 +1139,7 @@ printf 'Промпт ревью (smoke): бюджет ретрая исчерп�
 AI_WORK="$AI_RL4" \
 DEEPSEEK_API_KEY="smoke-key" \
 SMOKE_RATE_LIMIT_MODE="always-transient" \
+SMOKE_RL_STATE="$AI_RL4/attempts" \
 AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client "ai-review-rate-limit-budget" "$REPO/scripts/review/ai_dsh.sh"
 grep -qx "1" "$AI_RL4/dsh_rc.txt" \
@@ -964,6 +1166,7 @@ TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke RATE_LIMIT транзит","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_RATE_LIMIT_MODE="transient-then-ok" \
 SMOKE_RATE_LIMIT_TRANSIENT_COUNT="1" \
+SMOKE_RL_STATE="$TMP/state/rl-w1" \
 WORKER_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
 WORKER_RATE_LIMIT_MAX_DELAY_SECS="1" \
   run_client "worker-rate-limit-transient" "$REPO/scripts/worker/task.sh"
@@ -984,6 +1187,7 @@ TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke квота исчерпана","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 GH_PR_LIST_URL_JSON='[]' \
 SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
+SMOKE_RL_STATE="$TMP/state/rl-w2" \
   run_client_expect_fail "worker-rate-limit-quota" "$REPO/scripts/worker/task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-rate-limit-quota: замок не снят при квоте — задача осталась занятой"
 assert_log "GH-API-UNASSIGN issue-123" "worker-rate-limit-quota: назначение не снято при квоте — задача осталась занятой"
@@ -1009,6 +1213,7 @@ TASK_TEXT="Smoke: бюджет ретрая рук исчерпан" \
 RUNNER_TEMP="$TMP/rt-h-rl" \
 GH_RUN_TOKEN="smoke-run-token" \
 SMOKE_RATE_LIMIT_MODE="always-transient" \
+SMOKE_RL_STATE="$TMP/state/rl-h1" \
 HANDS_RATE_LIMIT_MAX_WAIT_SECS="0" \
   run_client_expect_fail "hands-rate-limit-budget" "$REPO/scripts/hands/dsh_task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "hands-rate-limit-budget: замок не снят — задача осталась занятой"

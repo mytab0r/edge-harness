@@ -33,7 +33,11 @@
 # что он может испортить (файлы воркспейса, $GITHUB_ENV, $GITHUB_PATH, PATH),
 # умирает вместе с виртуалкой job'а; права job'а — только чтение. DEEPSEEK_API_KEY
 # нужен вызову модели; DSH вырезает env *TOKEN*/*KEY*/*SECRET* из model-shell
-# вызовов (живой прогон 2026-08-30, см. worker.yml).
+# вызовов (живой прогон 2026-08-30, см. worker.yml) — но «агент ключ не видит»
+# гарантирует не вырезание: ключ читается из environ родителя через
+# docker-эскейп (#140). Гарантия — изоляция uid: dsh идёт через
+# dsh_agent_run под выделенным юзером без docker
+# (docs/research/40-model-shell-key-exposure.md).
 # Job `verdict`: СВЕЖАЯ машина, свой чекаут main, свой GH_TOKEN с
 # pull-requests:write (+ statuses:write — вердикт публикуется вторым каналом,
 # Commit Status API harness/ai-review, параллельно метке, #345). Ответ ревью

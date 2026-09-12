@@ -7,9 +7,12 @@
 # (checkout с persist-credentials: false). Агент физически не может
 # запостить комментарий/метку/пуш: его единственный выход — файл ответа,
 # который разбирает доверенный шаг verdict (ai_review.py verdict).
-# DEEPSEEK_API_KEY нужен самому DSH для вызова модели; DSH вырезает env
-# *TOKEN*/*KEY*/*SECRET* из model-shell вызовов — агент и его не видит
-# (проверено живым прогоном 2026-08-30, см. worker.yml).
+# DEEPSEEK_API_KEY нужен самому DSH для вызова модели. Вырезание env
+# *TOKEN*/*KEY*/*SECRET* из model-shell вызовов само по себе границей не
+# является (#140): ключ читается из environ родителя через docker-эскейп.
+# Здесь та же изоляция, что у worker/hands: dsh идёт под агент-юзером без
+# docker, в режиме nogh — без зеркала gh-конфига, его отсутствие проверяется
+# (docs/research/40-model-shell-key-exposure.md).
 #
 # Ретрай на временный RATE_LIMIT провайдера (#419, механизм теперь общий с
 # worker/hands — #422, вынесен в dsh_run_with_retry в lib/dsh-ci.sh): живой
@@ -82,9 +85,29 @@ AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS="${AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS:-300}
 # каждую попытку внутри dsh_run_with_provider_chain.
 dsh_require_provider_chain "ai-review" || exit 1
 
+# ── Изоляция #140, режим nogh: у ревью-агента не должно быть gh-авторизации
+# (граница #18) — подготовка сносит протухшее зеркало и проверяет отсутствие.
+# Засев DEEPSEEK_* (#727) — до prepare: тот доказывает env_keep-проводку.
+dsh_seed_first_provider
+DSH_AGENT_PATCH_OUT="$AI_WORK/agent-headless.cordis.patch.yml"
+AI_AGENT_DIR="$AI_WORK/agent"
+# Прокси-держатель ключа (#140, замер 5): РЕАЛЬНЫЙ ключ остаётся в домене
+# транспорта, агенту едет 127.0.0.1 и подменный ключ. Обязателен ДО prepare.
+dsh_provider_proxy_start "$AI_WORK"
+trap dsh_provider_proxy_stop EXIT
+dsh_agent_isolation_prepare nogh "$(pwd)" "$AI_AGENT_DIR" "$AI_WORK/dsh-agent-launcher.sh"
+
+# `pnpm add` внутри профиля headless требует явного подтверждения root
+# (иначе ERR_PNPM_ADDING_TO_ROOT — тот же класс #83, что уже закрыт для
+# hands/dsh_task.sh и worker/task.sh, PR #94; здесь пропущен, когда #838
+# добавил dsh_mount_anthropic_pool в этот файл — issue #842, живой прогон
+# PR #837 2026-09-09T20:10:15Z).
+export npm_config_ignore_workspace_root_check=true
+
 : >"$AI_WORK/answer.txt"; : >"$AI_WORK/stderr.txt"; : >"$AI_WORK/failure_reason.txt"
 
 dsh_install "$AI_WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 # Suite ротации учёток (#215, dsh-combo-router+anthropic-oauth-pool) здесь
 # НАМЕРЕННО не подключается: этот шаг всегда идёт через
@@ -113,6 +136,8 @@ dsh --version || true
 
 # cwd = pr-head (дерево PR — ДАННЫЕ агента; доверенный код лежит в main-чекауте
 # воркспейса) и не меняется до конца прогона — контракт dsh.
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$AI_REVIEW_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$AI_REVIEW_RATE_LIMIT_MAX_DELAY_SECS" \

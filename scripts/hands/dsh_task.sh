@@ -83,6 +83,9 @@ CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле веш
 # даёт пустую сессию в UI морды и задачу, помеченную провалом, вместо
 # честного «не сконфигурировано».
 dsh_require_provider_chain "hands" || exit 1
+# Засев DEEPSEEK_* первым провайдером цепочки (#727) — до изоляции (#140):
+# prepare доказывает env_keep-проводку этих переменных и требует модель.
+dsh_seed_first_provider
 # Правила репозитория раньше до этого канала не доходили вообще (агент
 # получал сырой TASK_TEXT, ни одного правила) — впечатываются дословно перед
 # прогоном (не в TASK_TEXT: HARNESS_TITLE ниже берёт первую строку TASK_TEXT
@@ -98,9 +101,25 @@ ANSWER_FILE="$WORK/answer.txt"
 ERR_FILE="$WORK/stderr.txt"
 EVENTS_FILE="$WORK/events.jsonl"
 START_MARK="$WORK/.start-mark"
-SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина dsh-hands-streamer
+AGENT_DIR="$WORK/agent"                       # каталог агента: спул пишет он сам (#140)
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson" # NDJSON-спул плагина dsh-hands-streamer
+# HANDS_SPOOL экспортируется ДО prepare (#140): prepare доказывает проводку
+# каждой заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
+
+# ── Изоляция адаптера модели (#140) — сразу после проверки провайдера и ДО
+# аренды: отказ изоляции не должен оставлять живую аренду задачи. Руки — режим
+# nogh: пуш/PR рукам запрещены по дизайну (GH_RUN_TOKEN снимается до старта
+# DSH), gh-авторизации у агента нет и быть не должно; DSH_AGENT_PNPM=1 —
+# плагин стрима ставится под агентом (dsh plugin add), gh-зеркало не нужно.
+export DSH_AGENT_PNPM=1
+DSH_AGENT_PATCH_OUT="$WORK/agent-headless.cordis.patch.yml"
+# Прокси-держатель ключа (#140, замер 5): РЕАЛЬНЫЙ ключ остаётся в домене
+# транспорта, агенту едет 127.0.0.1 и подменный ключ. Обязателен ДО prepare.
+dsh_provider_proxy_start "$WORK"
+dsh_agent_isolation_prepare nogh "${GITHUB_WORKSPACE:-$REPO_DIR}" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
 
 api() {
   curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
@@ -167,6 +186,7 @@ start_heartbeat() {
   done
 }
 cleanup() {
+  dsh_provider_proxy_stop   # держатель ключа #140 — останавливаем первым
   dsh_edge_stop_drain
   if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
   if [ "$JOB_ENDED" -eq 0 ]; then
@@ -290,6 +310,7 @@ export npm_config_ignore_workspace_root_check=true
 # ── 3. Установка DSH: tarball + сверка целостности (supply-chain пин) ─────────────
 PKGS="$WORK/pkgs"
 dsh_install "$PKGS"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 
 # ── 3a. Suite ротации учёток (#215) — скачивание+проверка ДО патча профиля,
@@ -325,11 +346,8 @@ dsh_import_anthropic_accounts \
 # моменту первого `dsh`, монтаж плагина (отдельный слой bundles) этим не
 # затрагивается.
 _chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
-_chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
-DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
-DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
-DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
-export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+# DEEPSEEK_BASE_URL/MODEL/API_KEY уже засеяны первым провайдером цепочки выше
+# (dsh_seed_first_provider перед prepare, #140) — повторно не засеиваем.
 DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
 
 # ── 3c. Монтаж suite (после патча — тот же порядок, что доказан для
@@ -338,6 +356,9 @@ dsh_mount_plugins_suite headless \
   || { echo "::error::suite ротации учёток не смонтировался (см. ::error:: выше, #215)" >&2; exit 1; }
 dsh_mount_anthropic_pool headless \
   || { echo "::error::быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)" >&2; exit 1; }
+# Изоляция #140: патч (включая возможный мягкий откат suite внутри mount)
+# обязан доехать до домена агента — у транспорта нет прав на запись в /home/<agent>.
+dsh_agent_install_profile_patch
 
 # ── 3d. Плагин стрима: bundle-механизм профиля, факт монтажа доказывается здесь ───
 # (dsh-streaming, проверка допущений 0: `dsh plugin add` + `--dump-config`
@@ -352,8 +373,10 @@ command -v pnpm >/dev/null || { echo "::error::pnpm не найден — dsh pl
 PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
 npm pack "$REPO_DIR/scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
 mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
-dsh plugin --profile headless add "$PLUGIN_TGZ"
-dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+# Монтаж и доказательство конфига — под агент-юзером: профиль живёт в его доме,
+# доказывать надо конфиг ровно того пользователя, с которым стартует dsh (#140).
+dsh_agent_run dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh_agent_run dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
   || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался: --dump-config без его строки; стрим событий невозможен" >&2; exit 1; }
@@ -382,10 +405,16 @@ touch "$START_MARK"
 
 # Спул стрима: путь задаётся плагину через env до старта dsh; чистый прогон не
 # должен дочитывать старьё от предыдущей попытки. Курсор дрена — единственный
-# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от содержимого).
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# владелец границы «принято мордой» (ретрай батча идёт от позиции, не от
+# содержимого). Файлы принадлежат агент-юзеру (#140) — снос тоже под агентом:
+# у транспорта нет права записи в каталог агента. HANDS_SPOOL экспортирован
+# до prepare (выше, #140).
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 dsh_edge_start_drain
+# Передача воркспейса агенту — последний транспортный шаг перед прогоном (#140).
+dsh_agent_handover
 
 DSH_START_TS=$(date -u +%s)
 HANDS_TASK_FAILURE_REASON=""

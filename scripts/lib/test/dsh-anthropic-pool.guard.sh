@@ -20,6 +20,13 @@ fail() { echo "::error::GUARD(anthropic-pool): $*" >&2; exit 1; }
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$REPO/scripts/lib/dsh-ci.sh"
 
+# Изоляция #140 (замер 5): прогон dsh идёт ТОЛЬКО через dsh_agent_run
+# (sudo → launcher → timeout → dsh). Предмет этой гвардии — атрибуция
+# «пул первым, цепочка фоллбэком» (#838), не exec-проводка: её доказывают
+# dsh-clients.smoke.sh (AGENT-EXEC) и agent-isolation.guard.sh (настоящий
+# sudo). Двой сохраняет прод-форму вызова dsh_run_with_retry.
+dsh_agent_run() { "$@"; }
+
 export HOME="$(mktemp -d)"
 WORK="$(mktemp -d)"
 
