@@ -255,6 +255,23 @@ def test_format_namespace_breakdown_shows_rows_written_column():
     assert "7" in text
 
 
+def test_format_namespace_breakdown_keeps_days_apart():
+    # #678 (живой замер 2026-09-12): сумма за N суток смешивает дни с разным
+    # числом прогонов — атрибуция записи нужна по дням. Каждый день обязан
+    # дать собственные строки с той же метрикой, а не раствориться в сумме.
+    d1, d2 = date(2026, 9, 11), date(2026, 9, 12)
+    days = [
+        (d1, {"by_namespace": {"ns-a": {"rows_read": 100, "rows_written": 60}}}),
+        (d2, {"by_namespace": {"ns-a": {"rows_read": 10, "rows_written": 6}}}),
+    ]
+    text = mod.format_namespace_breakdown(days)
+    assert f"{d1.isoformat()} | ns-a | 100 | 60" in text
+    assert f"{d2.isoformat()} | ns-a | 10 | 6" in text
+    # Итог за все дни обязан сходиться с суммой дней — иначе суточная таблица
+    # и разбивка расходятся молча.
+    assert "все дни | ns-a | 110 | 66" in text
+
+
 def test_format_namespace_breakdown_empty_is_explicit():
     day = date(2026, 9, 3)
     text = mod.format_namespace_breakdown([(day, {"by_namespace": {}})])

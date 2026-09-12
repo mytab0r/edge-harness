@@ -221,27 +221,38 @@ def format_table(days_summary: list[tuple[date, dict]]) -> str:
 def format_namespace_breakdown(days_summary: list[tuple[date, dict]]) -> str:
     """Разбивка по namespaceId — и rows_read, и rows_written (#678: раньше
     здесь была только колонка rows_read, rows_written агрегировался лишь
-    суммарно по ВСЕМ пространствам и никогда — по каждому отдельно)."""
+    суммарно по ВСЕМ пространствам и никогда — по каждому отдельно).
+
+    Форма — по дням, а не только сумма (живой замер #678, 2026-09-12):
+    атрибуция записи конкретному namespace нужна ПО ДНЯМ — сумма за N суток
+    смешивает дни с разным числом прогонов и не даёт отделить полный день
+    от частичного. Итог «все дни» сохраняется для сходимости с суточной
+    таблицей выше."""
+    if not any(day_summary["by_namespace"] for _, day_summary in days_summary):
+        return "разбивка по namespaceId недоступна в этом датасете"
+    lines = [
+        "день | namespaceId | rows_read | rows_written",
+        "---|---|---|---",
+    ]
     totals: dict[str, dict[str, int]] = {}
-    for _, summary in days_summary:
-        for ns, val in summary["by_namespace"].items():
+    for day, day_summary in days_summary:
+        # Порядок внутри дня — по rows_written (затем rows_read при равенстве):
+        # правка #678 существует ради ЗАПИСЕЙ, и пространство с большими
+        # записями и малыми чтениями — ровно то, кого ищет задача, — обязано
+        # быть первой строкой дня, а не хвостом, отсортированным по чтениям.
+        for ns, val in sorted(day_summary["by_namespace"].items(),
+                              key=lambda kv: (-kv[1]["rows_written"], -kv[1]["rows_read"])):
             entry = totals.setdefault(ns, {"rows_read": 0, "rows_written": 0})
             entry["rows_read"] += val.get("rows_read", 0)
             entry["rows_written"] += val.get("rows_written", 0)
-    if not totals:
-        return "разбивка по namespaceId недоступна в этом датасете"
-    lines = [
-        "namespaceId | rows_read (сумма по всем снятым дням) | "
-        "rows_written (сумма по всем снятым дням)",
-        "---|---|---",
-    ]
-    # Порядок — по rows_written (затем rows_read при равенстве): правка #678
-    # существует ради ЗАПИСЕЙ, и пространство с большими записями и малыми
-    # чтениями — ровно то, кого ищет задача, — обязано быть первой строкой,
-    # а не хвостом таблицы, отсортированной по чтениям.
+            lines.append(
+                f"{day.isoformat()} | {ns} | {val.get('rows_read', 0):,} | "
+                f"{val.get('rows_written', 0):,}"
+            )
+    lines.append("---|---|---|---")
     for ns, val in sorted(totals.items(),
                           key=lambda kv: (-kv[1]["rows_written"], -kv[1]["rows_read"])):
-        lines.append(f"{ns} | {val['rows_read']:,} | {val['rows_written']:,}")
+        lines.append(f"все дни | {ns} | {val['rows_read']:,} | {val['rows_written']:,}")
     return "\n".join(lines)
 
 
