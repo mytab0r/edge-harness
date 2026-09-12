@@ -23,6 +23,20 @@ DSH_EDGE_CURL="curl -fsS --connect-timeout 5 --max-time 30"
 # патч 0004) с запасом на конверт; ≤256 событий за батч (лимит маршрута).
 DSH_EDGE_BATCH=50
 DSH_EDGE_BATCH_BYTES=700000
+# Интервал фонового дрена (issue #1048) — ЕДИНСТВЕННОЕ место правды на
+# дефолт: цена ОДНОГО вызова POST .../ingest — не число событий в батче, а
+# полный ре-скан истории сессии (`openAgentForTurn` + `snapshotEvents()`
+# ради `baseTurn`, dsh-edge/patches/0004-harness-ingest.patch:260-282) —
+# O(вся история) чтений НА ВЫЗОВ, независимо от размера батча. При старом
+# дефолте 1с и измеренном темпе событий (~1/6,3с, docs/research/
+# 20-cloudflare-free.md) батчи были близки к одному событию — почти каждое
+# событие оплачивало полный ре-скан (≈427 rows_read/событие, замер #678).
+# Увеличение интервала снижает ЧАСТОТУ вызовов (и тем самым суммарные
+# rows_read) ценой задержки появления события в морде; НЕ устраняет
+# причину — та в патче 0004 (issue заведён отдельно, см. коммит). Другие
+# потребители (scripts/hands/dsh_task.sh) ОБЯЗАНЫ читать дефолт отсюда, не
+# заводить свой хардкод — гвардия scripts/lib/test_drain_interval_guard.py.
+DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS=30
 
 dsh_edge_init() { # пути состояния; WORK задаёт вызывающий раннер до любого вызова
   if [ -z "${WORK:-}" ]; then
@@ -253,7 +267,7 @@ dsh_edge_start_drain() { # фоновый мягкий дрен; сбой тик
   printf '0\n' >"$DSH_EDGE_DRAIN_CURSOR"
   (
     while :; do
-      sleep "${DRAIN_INTERVAL_SECS:-1}"
+      sleep "${DRAIN_INTERVAL_SECS:-$DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS}"
       dsh_edge_drain_spool soft || true
     done
   ) &

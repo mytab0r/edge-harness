@@ -67,7 +67,11 @@ DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1500}"
 HANDS_RATE_LIMIT_MAX_WAIT_SECS="${HANDS_RATE_LIMIT_MAX_WAIT_SECS:-600}"
 HANDS_RATE_LIMIT_INITIAL_DELAY_SECS="${HANDS_RATE_LIMIT_INITIAL_DELAY_SECS:-15}"
 HANDS_RATE_LIMIT_MAX_DELAY_SECS="${HANDS_RATE_LIMIT_MAX_DELAY_SECS:-120}"
-DRAIN_INTERVAL_SECS="${DRAIN_INTERVAL_SECS:-1}"
+# Дефолт — ОДНО место правды: DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS в
+# scripts/lib/dsh-edge-session.sh (уже sourced выше, #1048) — здесь только
+# читаем, не хардкодим своё число (это и был класс: два файла с одинаковым
+# литералом `:-1`, дублировали дефолт вместо того, чтобы делить его).
+DRAIN_INTERVAL_SECS="${DRAIN_INTERVAL_SECS:-$DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS}"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле вешал бы клиент до конца job
 
