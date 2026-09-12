@@ -907,6 +907,11 @@ def dispatch_conflict_rework(
     conflict_numbers = {p["number"] for p in conflict_pulls}
     ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in conflict_numbers]
     for pull in ordered_pulls:
+        infra_retry = False  # Исход 1 (#1027, применено к конфликту тем же приёмом,
+        # что #1030 дал dispatch_ai_review_rework): этот диспатч — повтор после
+        # инфра-отказа ЗАСЧИТАННОЙ попытки, лифтайм-бюджет отсюда не считается
+        # исчерпанным для целей ТЕКСТА попытки ниже (сам conflict_rework_attempts
+        # не уменьшается — см. его докстринг, "устойчивый инфра-отказ" там же).
         labels = {label["name"] for label in pull["labels"]}
         if CONFLICT_LABEL not in labels:
             continue
@@ -955,6 +960,16 @@ def dispatch_conflict_rework(
             # факт, а не доверять метке, которая по своей природе может
             # отставать.
             single = gh(f"repos/{repo}/pulls/{number}")
+            if single.get("state") != "open":
+                # Исход 3 (#1027/#1029, тот же приём, что уже даёт
+                # dispatch_ai_review_rework после #1030): PR мог закрыться/
+                # слиться между снимком `pulls` и этой перепроверкой —
+                # предмет эскалации исчез сам, звать владельца не на что.
+                observations.append(
+                    f"⏸️ PR #{number}: PR закрыт (state={single.get('state')!r}) — "
+                    "эскалация не нужна"
+                )
+                continue
             state = single.get("mergeable_state")
             if state != "dirty":
                 observations.append(
@@ -962,40 +977,81 @@ def dispatch_conflict_rework(
                     "эскалация отложена (mark_conflicts разберётся со снятием метки следующим проходом)"
                 )
                 continue
-            overlap = conflict_overlap_hint(repo, pull)
-            overlap_text = overlap or "не удалось определить (см. PR вручную)"
-            # Находка ревью PR #478 ("алерт не гадает", AGENTS.md, тот же
-            # класс, что инвариант 3/#472): единственный ПОДТВЕРЖДЁННЫЙ факт
-            # здесь — mergeable_state=dirty после одной ЗАСЧИТАННОЙ попытки
-            # (conflict_rework_attempts, #588: сбой ДО git-шага сюда уже не
-            # доходит — он не увеличивает attempts, PR получает новый
-            # адресный dispatch вместо эскалации). Причину отсюда всё ещё не
-            # различить: квота провайдера, таймаут 280 минут или неудавшийся
-            # push ПОСЛЕ того, как агент начал работу, дают тот же итог, что
-            # настоящий содержательный конфликт. Текст называет ФАКТ
-            # (conclusion последнего прогона, атрибутированного этой задаче),
-            # не утверждает причину.
+            # Три исхода вместо одного (#1029, живой случай — PR #1029 слит
+            # через 37 минут ПОСЛЕ этой самой эскалации, т.е. ложная тревога
+            # по определению): run_conclusion уже читался и раньше, но только
+            # для ТЕКСТА — решение эскалировать было одинаковым независимо
+            # от него, хотя conclusion самого прогона worker.yml УЖЕ несёт
+            # факт (тот же приём, что #1030 дал dispatch_ai_review_rework —
+            # scripts/lib/dsh-ci.sh::dsh_worker_run_is_success решает ЕГО
+            # conclusion по rc/провайдеру/новым коммитам, не второй
+            # классификатор здесь).
             run_conclusion = last_worker_run_conclusion(repo, task_number)
-            run_note = (
-                f"последний прогон worker.yml по этой задаче завершился с conclusion={run_conclusion!r}"
-                if run_conclusion is not None
-                else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?) — см. лог worker.yml вручную"
-            )
-            text = (
-                f"🚨 edge-harness: {marker}\n"
-                f"PR #{number} (задача #{task_number}) остаётся dirty после {attempts} "
-                f"авто-попытки ребейза worker.yml ({run_note}). Причина отсюда не различается "
-                "(инфраструктурный сбой воркера/квота/таймаут дают тот же итог, что настоящий "
-                "содержательный конфликт) — нужно решение владельца: посмотреть лог последнего "
-                f"прогона и разобраться. Файлы-кандидаты (пересечение изменений PR и main, "
-                f"не точные конфликтующие строки): {overlap_text}."
-            )
-            escalation = escalate(repo, WATCHDOG_ISSUE, text)
-            actions.append(
-                f"🚨 PR #{number}: авто-расшивка конфликта исчерпана ({attempts}/"
-                f"{CONFLICT_REWORK_MAX_ATTEMPTS}) — эскалация владельцу ({escalation})"
-            )
-            continue
+            if run_conclusion in FAILURE_CONCLUSIONS:
+                # Исход 1: инфраструктурный отказ ЭТОГО прогона — попытка не
+                # была честной пробой ребейза (или отработала git-шаг, но
+                # упала после — сеть/push/деплой морды), эскалировать «не
+                # сошлось» по ней нечестно. Падаем сквозь к обычному
+                # диспатчу ниже — ровно такой повтор, как если бы попытка не
+                # засчиталась (conflict_rework_attempts не уменьшаем — второй
+                # тормоз здесь не заводим, устойчивый инфра-отказ поднимет
+                # ОБЩИЙ счётчик красных прогонов и остановит диспатч через
+                # conveyor_gate, #120).
+                infra_retry = True
+                observations.append(
+                    f"🔁 PR #{number}: авто-расшивка конфликта ({attempts}/{CONFLICT_REWORK_MAX_ATTEMPTS}) "
+                    f"не в счёт эскалации — последний прогон worker.yml сам завершился "
+                    f"conclusion={run_conclusion!r} (инфраструктурный отказ прогона, не "
+                    "неразрешённый конфликт) — автоматический повтор, без эскалации владельцу"
+                )
+            else:
+                overlap = conflict_overlap_hint(repo, pull)
+                overlap_text = overlap or "не удалось определить (см. PR вручную)"
+                # Находка ревью PR #478 ("алерт не гадает", AGENTS.md, тот же
+                # класс, что инвариант 3/#472): единственный ПОДТВЕРЖДЁННЫЙ факт
+                # здесь — mergeable_state=dirty после одной ЗАСЧИТАННОЙ попытки,
+                # чей прогон в целом НЕ упал инфраструктурно (ветка выше уже
+                # это исключила). Причину «содержательный конфликт vs что-то
+                # ещё непредвиденное» отсюда всё ещё не различить до конца —
+                # текст называет ФАКТ (conclusion), не утверждает причину, а
+                # overlap — явно названная ОЦЕНКА (пересечение изменённых
+                # файлов PR и main через `compare`, не точные конфликтующие
+                # строки: `git merge-tree --write-tree` дал бы точный список,
+                # но потребовал бы локального fetch ветки PR — scheduler.py
+                # намеренно не заводит git-клон как источник состояния, см.
+                # докстринг модуля, и это тот же самый дорогой job по квоте
+                # GitHub API, что уже ограничивает rate_guard.py, #454).
+                if run_conclusion == "success":
+                    reason = (
+                        f"последний прогон worker.yml по этой задаче завершился с "
+                        f"conclusion={run_conclusion!r} (успешно), но PR остаётся dirty — "
+                        "ребейз не разрешил конфликт"
+                    )
+                elif run_conclusion is None:
+                    reason = (
+                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
+                        "до следа?) — см. лог worker.yml вручную"
+                    )
+                else:
+                    reason = (
+                        f"последний прогон worker.yml по этой задаче завершился с "
+                        f"conclusion={run_conclusion!r} — не success и не известный "
+                        "инфра-отказ, см. лог worker.yml вручную"
+                    )
+                text = (
+                    f"🚨 edge-harness: {marker}\n"
+                    f"PR #{number} (задача #{task_number}) остаётся dirty после {attempts} "
+                    f"авто-попытки ребейза worker.yml — {reason}. Нужно решение владельца: "
+                    "посмотреть лог последнего прогона и разобраться. Файлы-кандидаты "
+                    "(оценка сверху по пересечению изменений PR и main через compare API, "
+                    f"не точные конфликтующие строки): {overlap_text}."
+                )
+                escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 PR #{number}: авто-расшивка конфликта исчерпана ({attempts}/"
+                    f"{CONFLICT_REWORK_MAX_ATTEMPTS}) — эскалация владельцу ({escalation})"
+                )
+                continue
         issue = pool_by_number.get(task_number)
         if issue is None:
             observations.append(
@@ -1023,16 +1079,26 @@ def dispatch_conflict_rework(
             "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[task]={task_number}",
         )
+        # Повтор после инфра-отказа (Исход 1) может застать attempts уже
+        # равным CONFLICT_REWORK_MAX_ATTEMPTS — «попытка {attempts+1}/{max}»
+        # печатало бы несуществующее «2/1» (та же находка ревью, что чинили
+        # у dispatch_ai_review_rework после #1030): эта попытка бюджет не
+        # расходует по-новому, дробь здесь бы соврала.
+        attempt_note = (
+            "повтор после инфра-отказа прогона "
+            f"(попытка {attempts}/{CONFLICT_REWORK_MAX_ATTEMPTS} не в счёт)"
+            if infra_retry
+            else f"попытка {attempts + 1}/{CONFLICT_REWORK_MAX_ATTEMPTS}"
+        )
         post_issue_comment(
             repo, number,
             f"🤖 {CONFLICT_REWORK_MARKER} Оркестратор снял назначение с задачи #{task_number} "
-            f"и запустил worker.yml адресно (попытка {attempts + 1}/{CONFLICT_REWORK_MAX_ATTEMPTS}): "
+            f"и запустил worker.yml адресно ({attempt_note}): "
             "main ушёл вперёд, git rebase origin/main почти всегда решает такой конфликт сам.",
         )
         actions.append(
             f"🔧 PR #{number} в конфликте — задача #{task_number} освобождена ({release_note}), "
-            f"worker.yml запущен адресно на авто-ребейз (попытка {attempts + 1}/"
-            f"{CONFLICT_REWORK_MAX_ATTEMPTS})"
+            f"worker.yml запущен адресно на авто-ребейз ({attempt_note})"
         )
         dispatched = True
     return observations, actions, dispatched
@@ -1900,6 +1966,85 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
         raise RuntimeError(f"HTTP {error.code}: {detail}") from error
 
 
+# ── Факты жёсткого сбоя архива/заметки сессии раннера (#119/#480) — для
+# финального Telegram-алерта в main() ─────────────────────────────────────
+# archive_runner_sessions/append_session_notes уже кладут точный факт (номер
+# задачи, session_id, сырое тело ошибки RPC) строкой в свой собственный
+# результат — она доезжает до отчёта прогона (render_action_report), но
+# раньше не доезжала до самого Telegram-алерта: тот собирал отдельную
+# обобщённую фразу по одному лишь булеву archive_hard_failure и отсылал
+# читателя «см. отчёт этого прогона выше» — лога у читателя алерта нет под
+# рукой («Алерт не гадает», AGENTS.md). Копим здесь ТЕ ЖЕ строки (фильтр по
+# префиксу 🚨 — этот же маркер используют обе функции ниже для жёсткого
+# сбоя, ни одна не метит им норму), не пересобираем текст заново — одно
+# место правды на факт.
+_MERGE_SESSION_HARD_FAILURE_FACTS: list[str] = []
+
+
+def _record_merge_session_hard_failure_facts(lines: list[str]) -> None:
+    """Копит факт-строки жёсткого сбоя (префикс 🚨) за текущий прогон —
+    reset_merge_session_hard_failure_facts() сбрасывает границу (тот же
+    приём, что reset_update_branch_budget для бюджета прохода)."""
+    _MERGE_SESSION_HARD_FAILURE_FACTS.extend(line for line in lines if line.startswith("🚨"))
+
+
+def reset_merge_session_hard_failure_facts() -> None:
+    """Граница между прогонами/тестами — вызывается main() перед merge_loop."""
+    _MERGE_SESSION_HARD_FAILURE_FACTS.clear()
+
+
+def merge_session_hard_failure_alert_text(
+    archive_hard_failure: bool, stall_hard_failure: bool, stall_lines: list[str],
+) -> str:
+    """Текст финального Telegram-алерта main() на жёсткий сбой архива сессии
+    раннера/детектора простоя (#119/#201) — вынесен из main() отдельной
+    функцией ради юнит-теста без прогона всего main() (тот же приём, что уже
+    дают render_action_report/merge_loop — маленькая чистая функция вместо
+    прозы внутри самого main()).
+
+    Прежний текст архива отсылал читателя «см. отчёт этого прогона orchestra
+    выше» — у читателя Telegram-алерта этого отчёта нет под рукой («Алерт не
+    гадает», AGENTS.md). Здесь — дословный факт из
+    _MERGE_SESSION_HARD_FAILURE_FACTS (см. докстринг сбора выше) и НАЗВАННЫЙ
+    газ: периодический sweep осиротевших сессий (issue #940,
+    scripts/orchestra/session_orphan_sweep.py, PR #944) читает статус ЗАДАЧИ
+    и не зависит от причины конкретно ЭТОГО сбоя архива — если #944 уже
+    слит, следующий его прогон уберёт сироту сам; если ещё нет, честно
+    сказано, что автоматической уборки этого класса пока нет (не «тормоз без
+    газа» ложью, а объявленное состояние ожидания слияния)."""
+    broken = []
+    if archive_hard_failure:
+        facts = "\n".join(_MERGE_SESSION_HARD_FAILURE_FACTS) or (
+            "причина не сохранена этим прогоном (см. лог шага orchestra вручную)"
+        )
+        broken.append(
+            "После мержа PR архивация сессии раннера (или дозапись заметки-итога) в "
+            f"морде dsh-edge не удалась. Мерж не откатывается. Факт:\n{facts}\n"
+            "Газ: сессия сама по себе не пропадает из списка активных этим прогоном, но "
+            "периодический sweep осиротевших сессий (issue #940, "
+            "scripts/orchestra/session_orphan_sweep.py, PR #944 — сверь `gh pr view 944 "
+            "--json state,mergedAt`) перечисляет ВСЕ сессии морды и архивирует по статусу "
+            "задачи (закрыта → сирота), не завися от причины ЭТОГО конкретного сбоя — "
+            "если #944 уже слит, следующий его периодический прогон уберёт сироту сам; "
+            "если ещё нет — до слияния автоматической уборки этого класса нет, нужен "
+            "ручной workspace.archiveSession через RPC морды."
+        )
+    if stall_hard_failure:
+        stall_facts = "\n".join(stall_lines) or "причина не сохранена этим прогоном"
+        broken.append(
+            "Детектор устойчивого простоя (#201) не отработал этот пульс. Факт:\n"
+            f"{stall_facts}\nЗаведение автозадачи по свежему отпечатку могло не "
+            "случиться, а известные автозадачи не получили новую улику — газ: "
+            "следующий пульс orchestra (каждые 15 минут) повторяет детектор заново без "
+            "ручного вмешательства."
+        )
+    return "🚨 edge-harness: [статус: " + (
+        "архив сессии раннера сломан" if archive_hard_failure and not stall_hard_failure else
+        "детектор простоя сломан" if stall_hard_failure and not archive_hard_failure else
+        "архив сессии раннера и детектор простоя сломаны"
+    ) + "]\n" + "\n".join(broken)
+
+
 def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR.
 
@@ -2285,8 +2430,10 @@ def after_merge(
         note_lines, note_hard_failure = append_session_notes(
             [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
         actions += note_lines
+        _record_merge_session_hard_failure_facts(note_lines)
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
+        _record_merge_session_hard_failure_facts(archive_lines)
         hard_failure = hard_failure or note_hard_failure
     # Чеклист некритичных замечаний ревью (#462, третья категория находок):
     # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
@@ -4761,6 +4908,13 @@ def main() -> int:
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
     unhealthy_lines = unhealthy_pulls(repo, now, pulls, pool=pool)
+    # Граница фактов жёсткого сбоя архива/заметки сессии раннера этого
+    # прогона (см. докстринг _MERGE_SESSION_HARD_FAILURE_FACTS выше) —
+    # сбрасывается ПЕРЕД единственным местом, которое их копит (after_merge
+    # внутри merge_loop), не после: между вызовами main() список не должен
+    # копить факты чужого прогона (важно для тестов, вызывающих main()
+    # несколько раз в одном процессе).
+    reset_merge_session_hard_failure_facts()
     merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
     # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
@@ -4912,27 +5066,9 @@ def main() -> int:
     # ПОСЛЕ того, как отчёт уже сохранён, и эскалация уходит тем же каналом,
     # что предохранитель конвейера (#120), — не заводим третий канал сигнала.
     if archive_hard_failure or stall_hard_failure:
-        broken = []
-        if archive_hard_failure:
-            broken.append(
-                "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
-                "(возможность есть, но сломана — см. отчёт этого прогона orchestra выше). "
-                "Мерж не откатывается; сессия останется в списке активных до ручного "
-                "разбора или следующего успешного мержа той же задачи."
-            )
-        if stall_hard_failure:
-            broken.append(
-                "Детектор устойчивого простоя (#201) не отработал этот пульс "
-                "(см. отчёт выше) — заведение автозадачи по свежему отпечатку могло "
-                "не случиться, а известные автозадачи не получили новую улику."
-            )
         escalation = escalate(
             repo, WATCHDOG_ISSUE,
-            "🚨 edge-harness: [статус: " + (
-                "архив сессии раннера сломан" if archive_hard_failure and not stall_hard_failure else
-                "детектор простоя сломан" if stall_hard_failure and not archive_hard_failure else
-                "архив сессии раннера и детектор простоя сломаны"
-            ) + "]\n" + "\n".join(broken),
+            merge_session_hard_failure_alert_text(archive_hard_failure, stall_hard_failure, stall_lines),
         )
         lines.append(f"🚨 прогон окрашен красным ({escalation})")
         summary(lines)
