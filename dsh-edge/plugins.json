@@ -16,9 +16,9 @@
       "id": "runner-bridge",
       "package": "@edge-harness/dsh-plugin-runner-bridge",
       "source": {
-        "release": "plugins-runner-bridge-v0.1.2",
-        "asset": "runner-bridge-0.1.2.tgz",
-        "sha256": "a056f22756b713d0c942b41b66204af75a0b11ad0135934709db11a140667b3a"
+        "release": "plugins-runner-bridge-v0.1.3",
+        "asset": "runner-bridge-0.1.3.tgz",
+        "sha256": "fef0c115c2bf29bea4aa58fb19c826677c6c2e05d162e3c6583653ea1df1344a"
       },
       "server": true,
       "client": false
