@@ -3674,9 +3674,12 @@ def test_dispatch_ai_review_rework_retries_instead_of_escalating_after_infra_fai
 
 def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_persist(monkeypatch):
     """Исход 2 (законный): последний прогон worker.yml завершился
-    conclusion='success' (новый коммит реально дошёл до ai-review), и тот
-    СНОВА поставил ai:changes-requested — не инфра-отказ, дальше без
-    владельца не разобраться."""
+    conclusion='success', но эскалация на ТЕКУЩЕМ отпечатке достижима только
+    если success-прогон не поменял отпечаток диффа — а тогда ai-review на
+    этот коммит не перезапускался (keep-path, should_run_ai_review go=False).
+    Текст обязан называть именно этот факт, не недостижимое «ai-review снова
+    нашёл нарушения на этом коммите» (находка ai-review PR #1030, второй
+    круг: «алерт не гадает» и про success-ветку тоже)."""
     task = issue(782, assignees=("mytab0r",))
     p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
     fingerprint, fixture = _ai_rework_base_fixture(
@@ -3695,7 +3698,9 @@ def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
     assert "conclusion='success'" not in escalated[0][2]  # честная проза факта, не сырой repr
     assert "отработал успешно" in escalated[0][2]
-    assert "снова нашёл нарушения" in escalated[0][2]
+    assert "снова нашёл нарушения" not in escalated[0][2]  # недостижимо честно на этой ветке
+    assert "отпечаток диффа не изменился" in escalated[0][2]
+    assert "keep-path" in escalated[0][2]
     assert any("исчерпана" in line and "#1020" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
 
