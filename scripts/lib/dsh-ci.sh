@@ -706,6 +706,11 @@ PATCH
 #   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки dsh
 #   DSH_RUN_FAILURE_REASON  — "" (успех/обычный транспортный отказ) |
 #                             quota_exhausted | rate_limit_retry_budget_exceeded
+#   DSH_RUN_WAITED_SECS     — суммарно проспано в ретрае RATE_LIMIT за ЭТОТ
+#                             вызов (#877): цепочка провайдеров читает его,
+#                             чтобы уменьшать ОБЩИЙ бюджет ожидания на
+#                             следующего провайдера, а не выдавать каждому
+#                             полный бюджет заново (см. dsh_run_with_provider_chain)
 dsh_run_with_retry() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local max_wait="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
@@ -713,15 +718,18 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
   local max_delay="${DSH_RATE_LIMIT_MAX_DELAY_SECS:-300}"
   local timeout_secs="${DSH_TIMEOUT_SECS:-3600}"
   local waited=0 attempt=1 wait_left rc
+  local attempt_start attempt_elapsed
   DSH_RUN_FAILURE_REASON=""
   while :; do
     echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
+    attempt_start=$(date +%s)
     set +e
     timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
       >"$answer_file" 2>"$err_file"
     rc=$?
     set -e
-    echo "dsh завершился с кодом $rc (попытка $attempt)"
+    attempt_elapsed=$(( $(date +%s) - attempt_start ))
+    echo "dsh завершился с кодом $rc (попытка $attempt, длилась ${attempt_elapsed}с)"
 
     [ "$rc" -eq 0 ] && break
 
@@ -752,6 +760,15 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
     attempt=$((attempt + 1))
   done
   DSH_RUN_RC=$rc
+  DSH_RUN_WAITED_SECS=$waited
+  # #877/#880 (некритичная находка ai-review, «rc=124 приписывается нашему
+  # ножу без проверки, что это наш нож»): rc=124 у GNU `timeout` означает и
+  # «убил по таймауту», и «сам ребёнок вышел с 124» — по коду возврата эти
+  # формы неразличимы. Замер elapsed ПОСЛЕДНЕЙ попытки — дешёвое различение:
+  # dsh_chain_should_advance сравнивает его с DSH_TIMEOUT_SECS ПЕРЕД тем, как
+  # утверждать «наш нож» (см. её комментарий).
+  DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS=$attempt_elapsed
+  DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS=$timeout_secs
 }
 
 # ── Цепочка провайдеров (#727): автопереход по классу отказа ────────────────
@@ -892,10 +909,22 @@ dsh_require_provider_chain() { # [consumer_id]
 # провайдера; цена выбора «стоп» — молчать всю оставшуюся цепочку без единой
 # причины, как и случилось. По умолчанию — переключаемся.
 #
+# #877 (живой инцидент — прогон worker.yml 34498185823, задача #140): rc=124
+# (`timeout` в dsh_run_with_retry убил процесс SIGTERM) раньше проходил через
+# ТУ ЖЕ ветку «stderr пуст» выше — `timeout` не пишет в stderr ни строки,
+# поэтому наш собственный нож (DSH_TIMEOUT_SECS истёк) был неотличим от
+# настоящего молчания провайдера (#737). AGENTS.md, «Fail loud, не
+# silent-wrong»: убийство ПО НАШЕМУ таймауту — не отказ провайдера, сообщение
+# обязано называть это прямо, а не растворяться в «класс не установить».
+# Решение «переключаемся» остаётся тем же (следующий провайдер всё равно
+# стоит попробовать) — меняется только текст причины, RC проверяется ДО
+# ветки «stderr пуст», чтобы не спутать эти два разных факта.
+#
 # DSH_CHAIN_CLASS_NOTE (переменная, не возврат) — человекочитаемая причина
 # решения для сообщения вызывающего (правило AGENTS.md «Алерт не гадает»):
-# имя признанной причины, литеральный маркер stderr, факт «stderr пуст» или
-# первая строка нераспознанной диагностики (стоп-класс).
+# имя признанной причины, литеральный маркер stderr, факт «stderr пуст»,
+# факт «наш таймаут» или первая строка нераспознанной диагностики
+# (стоп-класс).
 #
 # Ветка «стоп-класс» ниже — единственная, что кладёт в переменную СЫРОЙ
 # фрагмент stderr клиента модели, а не заранее известную безопасную строку
@@ -906,13 +935,25 @@ dsh_require_provider_chain() { # [consumer_id]
 # раз — оба места печати (::warning:: и ::error:: ниже) читают уже
 # замаскированную переменную, второй копии redact на каждую точку вывода не
 # нужно (то же место правды, что redact() выше в этом файле).
-dsh_chain_should_advance() { # err_file failure_reason
-  local err_file=$1 reason=$2
+dsh_chain_should_advance() { # err_file failure_reason rc
+  local err_file=$1 reason=$2 rc=$3
   case "$reason" in
     quota_exhausted|rate_limit_retry_budget_exceeded)
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
   esac
+  # #880 (некритичная находка ai-review): GNU `timeout` возвращает 124 и
+  # когда САМ убивает процесс по сроку, и когда ребёнок дсш сам вышел с
+  # кодом 124 по собственной причине — по коду возврата эти формы
+  # неразличимы. Замер elapsed последней попытки (dsh_run_with_retry,
+  # DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS/_TIMEOUT_SECS) — дешёвое различение:
+  # «наш нож» утверждается ТОЛЬКО когда попытка реально длилась не меньше
+  # заданного ей таймаута, иначе rc=124 идёт в общую недиагностируемую
+  # ветку ниже (не гадаем, AGENTS.md «Алерт не гадает»).
+  if [ "$rc" = "124" ] && [ "${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS:-0}" -ge "${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS:-999999999}" ]; then
+    DSH_CHAIN_CLASS_NOTE="наш таймаут (${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS}с истекли, попытка длилась ${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS}с) — НЕ отказ провайдера, убит по времени (#877/#880)"
+    return 0
+  fi
   if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
     DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
     return 0
@@ -1025,11 +1066,34 @@ dsh_model_confirmed() { # model_id
 # провайдера — не отменяется, остаётся заботой dsh_run_with_retry; чейн решает
 # только «пробовать ли СЛЕДУЮЩЕГО».
 #
+# #877 (находка ai-review PR #880): DSH_RATE_LIMIT_MAX_WAIT_SECS — ОБЩИЙ
+# бюджет ожидания на ВЕСЬ прогон цепочки, не полный бюджет заново на КАЖДОГО
+# провайдера. Без этого арифметика бюджета таймаута (10 попыток × 20 мин
+# укладываются в 280-минутный job) не учитывала бы, что застрявший в коротком
+# RATE_LIMIT провайдер способен добавить к своему таймауту ещё до
+# DSH_RATE_LIMIT_MAX_WAIT_SECS (по умолчанию 1800с/30 мин) ожидания — 10
+# провайдеров × (20 мин таймаут + 30 мин ретрая) = 500 мин ≫ 280-минутного
+# бюджета. Общий бюджет читается ОДИН раз в начале прогона цепочки (значение
+# вызывающего), дальше расходуется по факту (DSH_RUN_WAITED_SECS от каждой
+# попытки), не восстанавливается для следующего провайдера — «не начинать
+# следующего провайдера с нуля впустую» в терминах ожидания RATE_LIMIT.
+# Собственный таймаут КАЖДОГО провайдера (DSH_TIMEOUT_SECS, зависание) этим
+# общим бюджетом не ограничен — это отдельная, независимая ось отказа.
+#
 # Использование:
-#   dsh_run_with_provider_chain <answer_file> <err_file> <prompt_text>
+#   dsh_run_with_provider_chain <answer_file> <err_file> <prompt_text> [initial_rl_used]
 # (вызывающий обязан вызвать dsh_require_provider_chain раньше и упасть
 # громко, если vars.DSH_PROVIDER_CHAIN не задан — тот же контракт, что у
 # dsh_require_provider_env/dsh_run_with_retry.)
+#
+# initial_rl_used (необязательный, по умолчанию 0) — сколько из общего
+# бюджета RATE_LIMIT УЖЕ потрачено ДО этого вызова (находка ai-review PR
+# #880): dsh_run_with_pool_then_chain пробует anthropic-oauth-pool ОДНИМ
+# вызовом dsh_run_with_retry ДО цепочки, тем же общим DSH_RATE_LIMIT_MAX_WAIT_SECS
+# — без передачи его собственного DSH_RUN_WAITED_SECS сюда цепочка получала
+# бы общий бюджет заново, хотя пул — 1-я из 10 попыток прогона, не отдельная
+# ось. Без этого поля комментарии «расходуется РОВНО один раз на весь
+# прогон» были бы ложью применительно к прогонам с активным пулом (#838).
 #
 # Результат (переменные, вызывающий печатает свой отчёт):
 #   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки (как у dsh_run_with_retry)
@@ -1039,8 +1103,8 @@ dsh_model_confirmed() { # model_id
 #   DSH_CHAIN_TRIED         — имена всех опробованных провайдеров через ", "
 #   DSH_CHAIN_RESET_HINT    — "имя: дата" для каждого провайдера с известной датой
 #                             сброса, через "; " (пусто — ни один не назвал дату)
-dsh_run_with_provider_chain() { # answer_file err_file prompt_text
-  local answer_file=$1 err_file=$2 prompt_text=$3
+dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_used]
+  local answer_file=$1 err_file=$2 prompt_text=$3 initial_rl_used="${4:-0}"
   local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint
   local quota_state_json
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
@@ -1064,6 +1128,11 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
   # вызывается, но не полагаемся на это).
   local _prev_chain_active="${DSH_CHAIN_ACTIVE:-}"
   DSH_CHAIN_ACTIVE=1
+  # #877: общий бюджет ожидания RATE_LIMIT на весь прогон цепочки — см.
+  # комментарий выше у объявления функции. Значение вызывающего читается
+  # РОВНО один раз здесь, до цикла; rl_remaining ниже — то, что осталось.
+  local chain_rl_budget="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+  local chain_rl_used="$initial_rl_used" rl_remaining
   while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
     entry=$(jq -c ".[$i]" <<<"$DSH_PROVIDER_CHAIN")
     name=$(jq -r '.name' <<<"$entry")
@@ -1096,10 +1165,13 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
       i=$((i + 1))
       continue
     fi
-    echo "цепочка провайдеров: пробую $name ($base_url, $model)"
+    rl_remaining=$((chain_rl_budget - chain_rl_used))
+    [ "$rl_remaining" -lt 0 ] && rl_remaining=0
+    echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_remaining}с из ${chain_rl_budget}с (#877)"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
-    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
     if [ "$DSH_RUN_RC" -eq 0 ]; then
       DSH_CHAIN_PROVIDER="$name"
       DSH_RUN_FAILURE_REASON=""
@@ -1108,7 +1180,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
     fi
     reset_hint=$(dsh_extract_reset_hint "$err_file")
     [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
-    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON"; then
+    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
       echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
       i=$((i + 1))
       continue
@@ -1144,6 +1216,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text
 # же переменные, что и раньше, независимо от того, ответил пул или цепочка.
 dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
+  local pool_rl_used=0
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
     _dsh_patch_profile_anthropic_pool headless
@@ -1155,9 +1228,14 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
       DSH_RUN_FAILURE_REASON=""
       return 0
     fi
+    # #877/#880: пул — 1-я из 10 попыток прогона, не отдельная ось бюджета
+    # RATE_LIMIT — потраченное им ожидание обязано вычитаться из общего
+    # бюджета цепочки, иначе она получит полный бюджет заново (находка
+    # ai-review PR #880 на первой версии этого фикса).
+    pool_rl_used="${DSH_RUN_WAITED_SECS:-0}"
     echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC) — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
   fi
-  dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text"
+  dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text" "$pool_rl_used"
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     DSH_CHAIN_TRIED="anthropic-oauth-pool, ${DSH_CHAIN_TRIED}"
   fi
