@@ -1,0 +1,207 @@
+# e2e-смоук морды dsh-edge на PR, ДО мержа (issue #600). Владелец нашёл
+# руками четыре регрессии интерфейса за один апстрим-бамп (issue #518 и
+# смежные: удалённый пакет, изменённый API сессии, коллизия неймспейса
+# локали, коллизия видимой метки вкладки) — три из четырёх поймал
+# dsh-edge/e2e-smoke/smoke.mjs (issue #502), но только ПОСЛЕ деплоя в прод
+# (deploy-dsh-edge.yml), когда сломанное уже отдаёт трафик. Health-check
+# (канарейка корня, HTTP 200) был зелёным во всех четырёх случаях — регрессия
+# видна только реальным браузером на реальных вкладках Settings.
+#
+# Против чего гоняется: ЛОКАЛЬНЫЙ эфемерный воркер (`unstable_dev`), не прод и
+# не отдельный preview-деплой на Cloudflare. Прод общий и живой — трогать его
+# ради проверки PR нельзя; preview-деплой на отдельное имя воркера стоил бы
+# реального ресурса на Free-плане (лишний воркер + его уборка на каждый PR) и
+# реального расхода суточной квоты чтений Durable Objects (сегодня уже была
+# превышена, 149.8%). unstable_dev — тот же приём, что уже доказан в этом
+# репозитории: dsh-edge/ingest-integration/check.mjs и
+# dsh-edge/proxy-integration/check.mjs гоняются в deploy-dsh-edge.yml на
+# каждом деплое, поднимая собранный артефакт локально, без единого обращения
+# к настоящему Cloudflare API. Стоимость одного прогона в чтениях Durable
+# Objects — 0 (ни разу не создаётся и не читается настоящий DO; вся DO SQLite
+# внутри unstable_dev — временный файл на диске раннера).
+#
+# Секреты: не нужны вообще. DSH_EDGE_ACCESS_KEY и HANDS_TOKEN для локального
+# воркера — фиктивные строки, собранные в pr-check.mjs (не настоящие
+# секреты), CLOUDFLARE_API_TOKEN/ACCOUNT_ID не используются ни на одном шаге.
+# Прогон работает и на PR из форка, где секретов репозитория нет — этот
+# workflow ни одного не запрашивает. `gh release download` — публичным
+# GITHUB_TOKEN (репозиторий публичный, ассеты релизов читаются без PAT).
+#
+# Пути триггера: `dsh-edge/**` — манифест (plugins.json), пин апстрима
+# (upstream.json), патч-серия (patches/), кодогенерация/сборка/гвардия и сам
+# e2e-смоук живут здесь; правка любого из них может сломать морду. Патчи,
+# манифест и пин — это подкаталоги dsh-edge/**, отдельно перечислять не
+# нужно. `plugins-src/**` СОЗНАТЕЛЬНО исключён: deploy-dsh-edge.yml по той же
+# причине не триггерится и не читает исходники плагинов на этом пути — сборка
+# берёт плагины готовыми релизами по sha256 из dsh-edge/plugins.json, поэтому
+# правка исходника плагина БЕЗ бампа sha256 в манифесте не меняет то, что
+# реально соберётся; прогон смоука на такой PR тестировал бы старый состав и
+# был бы зелёным холостым прогоном. Правка исходника плагина проверяется на
+# forge-этапе (plugin-forge.yml, smoke-edge-plugins.mjs) и попадает под этот
+# workflow уже вместе с бампом sha256 в dsh-edge/plugins.json.
+#
+# Уборка: ничего не создаётся на Cloudflare — эфемерные workerd-процессы
+# unstable_dev и их tmp-директории живут только на время job'а и стираются
+# вместе с раннером; убирать вручную нечего (см. pr-check.mjs).
+name: dsh-edge-pr-smoke
+
+on:
+  pull_request:
+    paths:
+      - "dsh-edge/**"
+      - ".github/workflows/dsh-edge-pr-smoke.yml"
+
+concurrency:
+  group: dsh-edge-pr-smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/setup@v2
+        with:
+          version: 11
+          install: false
+
+      # Тот же CLI, что деплой — одно место правды по форме манифеста и
+      # маршруту. Пустой манифест (аварийный fallback) не имеет клона и
+      # плагинов для сборки: e2e-браузерный шаг в этом случае честно
+      # пропускается (см. `if` ниже) — жёсткого регресса это не оставляет:
+      # пустой манифест — редкий аварийный путь, не активная конфигурация
+      # морды, а прод-смоук после реального деплоя (deploy-dsh-edge.yml)
+      # всё равно гоняется на любом маршруте.
+      - name: Маршрут по манифесту (валидация CLI)
+        id: route
+        run: |
+          manifest=$(node dsh-edge/manifest.mjs)
+          echo "$manifest"
+          count=$(jq -r '.count' <<<"$manifest")
+          ids=$(jq -r '.ids | join(" ")' <<<"$manifest")
+          sha=$(jq -r '.upstream.sha' <<<"$manifest")
+          repo=$(jq -r '.upstream.repo' <<<"$manifest")
+          echo "plugins=$count" >> "$GITHUB_OUTPUT"
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "Манифест валиден: $count плагин(ов) [$ids]; апстрим $repo@$sha"
+
+      - name: Клон апстрима на пине
+        if: steps.route.outputs.plugins != '0'
+        run: |
+          mkdir clone && cd clone
+          git init -q
+          git remote add origin "https://github.com/${{ steps.route.outputs.repo }}.git"
+          git fetch -q --depth 1 origin "${{ steps.route.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "${{ steps.route.outputs.sha }}" ] || { echo "::error::Клон не на пине: $actual != ${{ steps.route.outputs.sha }}"; exit 1; }
+          echo "Клон на пине $actual"
+
+      - name: Патч-серия
+        if: steps.route.outputs.plugins != '0'
+        working-directory: clone
+        run: |
+          shopt -s nullglob
+          patches=(../dsh-edge/patches/*.patch)
+          [ ${#patches[@]} -gt 0 ] || { echo "::error::Патч-серия пуста, а манифест требует source-build"; exit 1; }
+          for p in "${patches[@]}"; do
+            git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p — апстрим уехал от пина"; exit 1; }
+            echo "применён: $p"
+          done
+
+      # Идентично шагу деплоя (deploy-dsh-edge.yml): скачивает названные
+      # release-ассеты (не весь релиз) публичным GITHUB_TOKEN — работает и на
+      # PR из форка, репозиторий публичный.
+      - name: Скачать плагины и сверить sha256
+        if: steps.route.outputs.plugins != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p plugins-tgz
+          manifest=$(node dsh-edge/manifest.mjs)
+          jq -r '.plugins[] | [.id, .release, .asset, .sha256] | @tsv' <<<"$manifest" > plugins.tsv
+          : > checksums.txt
+          : > plugins-tgz/downloaded.txt
+          while IFS=$'\t' read -r id release asset sha; do
+            echo "плагин $id: релиз $release, asset $asset"
+            gh release download "$release" --repo "$GITHUB_REPOSITORY" \
+              --dir plugins-tgz --pattern "$asset" --clobber \
+              || { echo "::error::Релиз $release недоступен — манифест ссылается на несуществующий источник"; exit 1; }
+            [ -f "plugins-tgz/$asset" ] || { echo "::error::В релизе $release нет asset'а $asset (плагин $id)"; exit 1; }
+            echo "$sha  plugins-tgz/$asset" >> checksums.txt
+            echo "plugins-tgz/$asset" >> plugins-tgz/downloaded.txt
+            # Срезы правды, вшитые в релизный пакет, сверяются с репо (#115) —
+            # тот же гвард, что в deploy-dsh-edge.yml: PR, правящий
+            # dsh-edge/integrations.json или dsh-edge/plugins.json без
+            # пересборки и перевыпуска плагина, обязан краснеть здесь, а не
+            # доехать до деплоя зелёным холостым PR-гейтом.
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/integrations.json$'; then
+              tar -xOf "plugins-tgz/$asset" package/integrations.json \
+                | diff -q - "$GITHUB_WORKSPACE/dsh-edge/integrations.json" >/dev/null \
+                || { echo "::error::Реестр интеграций в релизе $asset разошёлся с dsh-edge/integrations.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1; }
+            fi
+            if tar -tf "plugins-tgz/$asset" | grep -q '^package/manifest.json$'; then
+              if ! diff \
+                <(tar -xOf "plugins-tgz/$asset" package/manifest.json | jq -S '[.plugins[] | {id, server, client}]') \
+                <(jq -S '[.plugins[] | {id, server, client}]' "$GITHUB_WORKSPACE/dsh-edge/plugins.json") >/dev/null; then
+                echo "::error::Ростер манифеста в релизе $asset разошёлся с dsh-edge/plugins.json — пересобери и перевыпусти плагин (конвейер #80)"; exit 1
+              fi
+            fi
+          done < plugins.tsv
+          sha256sum -c checksums.txt || { echo "::error::sha256 артефакта не сошёлся с манифестом — возможна подмена или перезапись релиза"; exit 1; }
+
+      - name: Установить плагины в standalone (pnpm, не npm)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: clone/apps/dsh-edge/standalone
+        run: |
+          args=()
+          while IFS= read -r f; do args+=("$GITHUB_WORKSPACE/$f"); done < "$GITHUB_WORKSPACE/plugins-tgz/downloaded.txt"
+          [ ${#args[@]} -gt 0 ] || { echo "::error::Ни одного tgz из манифеста не скачано — рассинхрон с манифестом"; exit 1; }
+          pnpm add --save-exact "${args[@]}"
+          grep -q "patchedDependencies" pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
+
+      - name: Кодогенерация плагинной композиции
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+
+      - name: Дым инсталла плагинов (cordis + ToolRuntime)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/smoke-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+
+      - name: Сборка морды из исходников
+        if: steps.route.outputs.plugins != '0'
+        run: pnpm --dir clone/apps/dsh-edge/standalone run build
+
+      - name: Гвардия состава (манифест ↔ артефакт)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/verify-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
+
+      - name: Контракт и детерминизм артефактов
+        if: steps.route.outputs.plugins != '0'
+        run: pnpm --dir clone/apps/dsh-edge/standalone run verify
+
+      # e2e generic browser smoke (#502/#600) против ЛОКАЛЬНОГО unstable_dev
+      # (см. заголовок файла) — не против прода, без Cloudflare, без
+      # секретов. pnpm, не npm: та же гвардия класса #43
+      # (test_dsh_edge_pnpm_guard.py), что и у прод-смоука.
+      - name: e2e-смоук PR против локального воркера (#600)
+        if: steps.route.outputs.plugins != '0'
+        working-directory: dsh-edge/e2e-smoke
+        run: |
+          pnpm install --no-frozen-lockfile
+          node pr-check.mjs "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
+
+      - name: Манифест пуст — e2e-смоук пропущен
+        if: steps.route.outputs.plugins == '0'
+        run: echo "::notice::манифест dsh-edge/plugins.json пуст (аварийный npm-префаб маршрут) — не из чего собрать source-build артефакт, e2e-смоук PR пропущен; прод-смоук после реального деплоя всё равно гоняется на любом маршруте"

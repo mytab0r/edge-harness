@@ -78,6 +78,20 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "малое число job'ов конвейера, не растущий список. Сбой запроса — "
         "RuntimeError наверх («сбой» и «пусто» различают вызывающие), не "
         "пустой список.",
+    ("scripts/measure/quota_watch.py", "scan_measurement_history"):
+        "job'ы ОДНОГО прогона workflow (quota-watch.yml) — тот же контракт, что "
+        "pulse_guard.failing_jobs выше: фиксированное малое число job'ов одного "
+        "прогона одного простого workflow (#607), не растущий список; сбой запроса "
+        "уходит в RuntimeError и трактуется вызывающим как «пропустить этот прогон, "
+        "искать дальше в истории», не как пустой список. (Функция раньше звалась "
+        "last_real_measurement_age_minutes — переименована в PR #607, когда один "
+        "скан стал возвращать два возраста, attempt_age и success_age.)",
+    ("scripts/measure/quota_watch.py", "_classify_measurement_absence"):
+        "тот же контракт, что last_real_measurement_age_minutes выше: job'ы "
+        "ОДНОГО (самого свежего) прогона workflow quota-watch.yml — фиксированное "
+        "малое число job'ов, не растущий список (found: ревью PR #607, «Алерт не "
+        "гадает» — эта функция классифицирует ФАКТ причины простоя вместо "
+        "гипотезы, ей нужен ровно один прогон, не страница).",
     ("scripts/orchestra/pulse_guard.py", "failure_watch"):
         "явный `per_page=100` — запрошены последние N ЗАВЕРШЁННЫХ прогонов "
         "ОДНОГО workflow (#477; вывод фильтруется клиентом — "

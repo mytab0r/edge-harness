@@ -1252,7 +1252,7 @@ def last_error_log_line(repo: str, job_id: int) -> str | None:
     return None
 
 
-def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
+def all_issue_comments(repo: str, issue_number: int, max_pages: int | None = None) -> list[dict]:
     """Все комментарии issue постранично, не только первая страница
     `per_page=100` (#276, тот же класс, что review_labels.list_pr_files/
     list_timeline и #294/#303: молчаливая обрезка на самом длинном обсуждении
@@ -1267,8 +1267,15 @@ def all_issue_comments(repo: str, issue_number: int) -> list[dict]:
     Обход — review_labels.list_pages (одно место правды на пагинацию и на
     fail loud при неожиданной форме ответа, класс #308/дефект A #120: см.
     комментарий у импорта review_labels выше — эта функция раньше несла
-    свою копию того же цикла с тем же силент-дефектом)."""
-    return review_labels.list_pages(f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh)
+    свою копию того же цикла с тем же силент-дефектом).
+
+    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — как
+    раньше, вся история); проброшен в `list_pages` (#607: гейт сторожа квот
+    тикает на каждое PR-событие и по cron, а #120 копит сотни комментариев;
+    стоимость одного тика не должна расти с историей задачи)."""
+    return review_labels.list_pages(
+        f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh, max_pages=max_pages,
+    )
 
 
 def _marker_present(marker: str, body: str) -> bool:
@@ -1284,8 +1291,9 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
-def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[datetime]:
-    payload = all_issue_comments(repo, issue_number)
+def issue_marker_times(repo: str, issue_number: int, marker: str,
+                       max_pages: int | None = None) -> list[datetime]:
+    payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     return [
         parse_time(comment["created_at"])
         for comment in payload
@@ -1293,11 +1301,15 @@ def issue_marker_times(repo: str, issue_number: int, marker: str) -> list[dateti
     ]
 
 
-def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...]) -> list[tuple[datetime, str]]:
+def issue_markers_any(repo: str, issue_number: int, markers: tuple[str, ...],
+                      max_pages: int | None = None) -> list[tuple[datetime, str]]:
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
-    но и от его содержимого (номер попытки пробы, #205)."""
-    payload = all_issue_comments(repo, issue_number)
+    но и от его содержимого (номер попытки пробы, #205). `max_pages` — тот
+    же ограничитель свежими страницами, что у all_issue_comments (found:
+    ревью PR #607 — последний_state-дедуп quota_alert тикает на каждый
+    прогон сторожа и не обязан обходить всю копящуюся историю #120)."""
+    payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     result = []
     for comment in payload:
         body = comment.get("body") or ""
@@ -1430,6 +1442,56 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
             f"след в #{issue_number}: {comment_note}")
+
+
+def carrier_write_verdict(issue_number: int, posted: bool, error: str | None = None) -> str:
+    """Вердикт ТИХОЙ записи носителя дедупа — маркер состояния без эскалации
+    (quota_alert.check_and_alert, первое наблюдение ресурса, заставшее его
+    в норме: наружу уходит только маркер, Telegram-плеча нет вовсе, отсюда
+    честное «не требовалось», а не «доставлен/НЕ доставлен»). Той же лексикой,
+    что возвращает escalate выше, и литералы «оставлен»/«НЕ оставлен»
+    рождаются здесь же, рядом с предикатами ниже: вторая копия литералов в
+    вызывающем погасла бы молча при смене формата (тот же класс, found:
+    ревью PR #607 — дубликат разбора в quota_watch._channel_failed).
+    Отказ («НЕ оставлен») обязан быть различим вызывающему предикатом
+    escalation_dedup_carrier_failed ниже, а не только строкой лога."""
+    verdict = (f"Telegram: не требовалось; след в #{issue_number}: "
+               f"{'оставлен' if posted else 'НЕ оставлен'}")
+    return f"{verdict}: {error}" if error else verdict
+
+
+def escalation_channel_failed(result: str) -> bool:
+    """«Оба канала эскалации молчат» — единственное место разбора строки,
+    которую возвращает escalate() выше: оба литерала рождаются там же,
+    соседним return'ом. Вызывающие (quotas.py::main,
+    quota_watch.measure_main) обязаны красить прогон только по этому
+    предикату: вторая независимая копия разбора молча погасла бы при смене
+    формата строки (found: ревью PR #607, некритичное замечание —
+    дубликат в quota_watch._channel_failed и инлайн в quotas.py::main)."""
+    return "НЕ доставлен" in result and "НЕ оставлен" in result
+
+
+def escalation_dedup_carrier_failed(result: str) -> bool:
+    """«Носитель дедупа не записан» — пара к escalation_channel_failed выше:
+    тот ловит «оба канала молчат» (сигнала нет вовсе), этот — «дедупа дальше
+    не будет». Две формы отказа, обе ловятся здесь:
+    1. «Сигнал ушёл, а носитель нет»: Telegram доставлен, но след в задаче
+       НЕ оставлен (return escalate выше) — открывающий маркер эпизода не
+       записан, следующий тик сочтёт эпизод новым и повторит страницу.
+    2. Тихая запись носителя без эскалации не удалась (return
+       carrier_write_verdict выше: «Telegram: не требовалось; …НЕ оставлен»)
+       — носитель дедупа стоит сломанным при зелёных прогонах, увидит это
+       только читатель лога, если вызывающий не краснит предикатом
+       (found: ревью PR #607, head 345a64f — отказ тихой записи маркера в
+       quota_alert.check_and_alert был различим только строкой лога).
+    Третья комбинация, «Telegram НЕ доставлен, след оставлен», отказом не
+    считается: маркер эпизода записан (повторной страницы не будет), а
+    мгновенный пуш продублирован постоянным следом в задаче. Единственное
+    место разбора строк escalate()/carrier_write_verdict() — литералы
+    рождаются соседними return'ами, вторая копия разбора погасла бы молча
+    при смене формата (found: ревью PR #607, head 5824e75 — гейт сторожа
+    квот выбрасывал вердикт доставки)."""
+    return "НЕ оставлен" in result and "НЕ доставлен" not in result
 
 
 # ── Сценарии, вызываемые scheduler.py ────────────────────────────────────────────

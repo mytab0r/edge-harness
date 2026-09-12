@@ -479,11 +479,15 @@ def main() -> int:
         # Находка ревью PR #327: escalate() — best-effort по обоим каналам
         # (Telegram, след в issue), возврат печатался, но не проверялся, и
         # прогон всегда завершался 0. Порог пробит И сигнал не дошёл ни одним
-        # каналом ("НЕ доставлен" + "НЕ оставлен") — прогон обязан красить
+        # каналом — прогон обязан красить
         # список workflow-раннов, а не жить одной строкой в логе, который
         # никто не читает между пультами (тот же принцип, что у
-        # scheduler.py::accept_merged_tasks hard_failure).
-        if "НЕ доставлен" in result and "НЕ оставлен" in result:
+        # scheduler.py::accept_merged_tasks hard_failure). Критерий «оба
+        # канала молчат» — ОДНО место правды
+        # (pulse_guard.escalation_channel_failed рядом с самим escalate;
+        # found: ревью PR #607 — инлайн-литералы здесь были второй копией
+        # разбора строки, молча гаснущей при смене формата escalate).
+        if pulse_guard.escalation_channel_failed(result):
             print(f"::error::квота пробита, но сигнал не дошёл ни одним каналом: {result}")
             exit_code = 1
     else:

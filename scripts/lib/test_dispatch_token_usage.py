@@ -90,6 +90,14 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
+    # #600: e2e-смоук морды dsh-edge на PR, до мержа. Репо-секретов не читает
+    # вовсе (ADR 0017) — сборка и локальный unstable_dev не обращаются к
+    # Cloudflare/GitHub ни с одним репо-секретом, `gh release download` идёт
+    # публичным github.token (репозиторий публичный); поэтому не входит ни в
+    # DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS — тот же класс, что
+    # worker-ci.yml (канарейка против локального wrangler dev тестовым
+    # dev-token, не репо-секретом).
+    "dsh-edge-pr-smoke.yml",
     "hands.yml",
     # Job для директив инбокса (#20, ADR 0015): repository_dispatch из DO под
     # GH_DISPATCH_TOKEN (значение читает только сам DO как секрет воркера —
@@ -116,6 +124,10 @@ EXPECTED_WORKFLOWS = frozenset({
     # LLM-провайдеров) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
     # использует, тот же класс, что secret-scan.yml/worker-ci.yml выше.
     "provider-latency-bench.yml",
+    # #605: непрерывный сторож квот, только github.token (actions:read,
+    # issues:write) + секреты CLOUDFLARE_*/TELEGRAM_* — ни GH_DISPATCH_TOKEN,
+    # ни GH_PIPELINE_PAT не читает, тот же класс, что quotas.yml ниже.
+    "quota-watch.yml",
     "quotas.yml",
     "repo-ci.yml",
     # #634: gitleaks-гейт PR + периодический полный прогон истории. Читает
