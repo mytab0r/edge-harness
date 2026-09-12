@@ -321,6 +321,83 @@ def test_wire_dependencies_deduplicates_input_single_mutation():
     assert calls == [(500, 55), (500, 60)]
 
 
+# ── транзитивный вес графа (задача #224) ─────────────────────────────────────
+# Работают на уже прочитанном пуле (форма fetch_pool: number + blocked_by_open),
+# без сети и без gh — чистые функции над списком словарей.
+
+
+def pooled(number, blocked_by=()):
+    return {"number": number, "blocked_by_open": list(blocked_by)}
+
+
+def test_transitive_blocked_follows_chain_beyond_direct_neighbour():
+    # A блокирует B, B блокирует C — A транзитивно блокирует ОБА, не только B.
+    issues = [pooled(1), pooled(2, blocked_by=[1]), pooled(3, blocked_by=[2])]
+    assert td.transitive_blocked(issues, 1) == {2, 3}
+
+
+def test_transitive_blocked_no_chain_is_empty():
+    issues = [pooled(1), pooled(2)]
+    assert td.transitive_blocked(issues, 1) == set()
+
+
+def test_transitive_blocking_counts_matches_direct_when_chain_depth_one():
+    # Живой случай #665 (замер задачи #224): блокирует три задачи напрямую,
+    # ни одна из них никого не блокирует дальше — transitive == direct.
+    issues = [pooled(665), pooled(577, blocked_by=[665]),
+              pooled(675, blocked_by=[665]), pooled(981, blocked_by=[665])]
+    counts = td.transitive_blocking_counts(issues)
+    assert counts[665] == 3
+
+
+def test_transitive_blocking_counts_exceeds_direct_when_chain_deeper():
+    # Живой случай #716→#736→#735 (замер задачи #224): #716 блокирует #736
+    # напрямую (direct=1), а #736 сам блокирует #735 — транзитивный вес #716
+    # обязан быть 2, не 1.
+    issues = [pooled(716), pooled(736, blocked_by=[716]), pooled(735, blocked_by=[736])]
+    counts = td.transitive_blocking_counts(issues)
+    assert counts[716] == 2
+
+
+def test_transitive_blocking_counts_terminates_on_a_cycle_without_crashing():
+    # Граф в проде — DAG (blockedBy/blocking не допускают цикл нативно), но
+    # функция обязана не зависнуть и не упасть на входных данных, где цикл
+    # возник ошибочно (например, ручная правка фикстуры теста). BFS с
+    # множеством `seen` не даёт бесконечно бегать по циклу — оба узла
+    # обходятся ровно по разу каждый, включая возврат к себе через цикл.
+    issues = [pooled(1, blocked_by=[2]), pooled(2, blocked_by=[1])]
+    counts = td.transitive_blocking_counts(issues)
+    assert counts[1] == 2  # {1, 2} — цикл возвращает узел к самому себе
+    assert counts[2] == 2
+
+
+def test_blockers_of_finds_direct_and_transitive_ancestors_of_targets():
+    # Живой случай #224: #665 и #610 сами не помечены ci-failure, но #665
+    # напрямую блокирует #577 (ci-failure), а #610 блокирует #629
+    # (ci-failure) — оба обязаны попасть в результат для targets={577, 629}.
+    issues = [
+        pooled(665), pooled(577, blocked_by=[665]),
+        pooled(610), pooled(629, blocked_by=[610]),
+        pooled(999),  # не связана — не должна попасть в результат
+    ]
+    assert td.blockers_of(issues, {577, 629}) == {665, 610}
+
+
+def test_blockers_of_follows_multi_step_chain():
+    issues = [pooled(1), pooled(2, blocked_by=[1]), pooled(3, blocked_by=[2])]
+    assert td.blockers_of(issues, {3}) == {1, 2}
+
+
+def test_blockers_of_excludes_targets_themselves():
+    issues = [pooled(1), pooled(2, blocked_by=[1])]
+    assert td.blockers_of(issues, {2}) == {1}
+
+
+def test_blockers_of_empty_targets_is_empty():
+    issues = [pooled(1), pooled(2, blocked_by=[1])]
+    assert td.blockers_of(issues, set()) == set()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
