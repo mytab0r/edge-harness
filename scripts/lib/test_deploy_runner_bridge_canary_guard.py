@@ -32,6 +32,9 @@ docs/research/12-dsh-edge-session-api.md, namespace tools.* отсутствуе
      (класс «алерт не гадает», #472, находка ревью PR #952 п.3).
   7. Сравнение ожидаемого фрагмента идёт по текстовым значениям, извлечённым
      jq из истории, не по сырому JSON (находка ревью PR #952 п.4).
+  8. Сырое событие читается через `(.event // .)` — документированная форма
+     session.history кладёт его на `events[].event`, а не на сам элемент
+     (находка ревью PR #952, блокирующая п.3).
 
 Запуск: python -m pytest scripts/lib/test_deploy_runner_bridge_canary_guard.py -q
 """
@@ -136,6 +139,30 @@ def test_canary_diagnoses_missing_evidence_by_fact_not_by_guessing():
     )
 
 
+def test_canary_reads_history_events_via_documented_shape():
+    """Правило 8 (находка ревью PR #952, блокирующая п.3): session.history
+    отдаёт `{events:[{event, view?}]}` — сырое событие лежит на
+    `events[].event` (docs/research/12-dsh-edge-session-api.md). Чтение
+    `.type` ПРЯМО на элементах `events[]` ложно всегда: различающие причины
+    (assistant/message, tool/call runner_status) не находятся НИКОГДА, и
+    любой реальный отказ алерт называет «модель не сделала ни одного хода».
+    `(.event // .)` читает документированную форму и не ломается на плоской.
+    """
+    branch = _missing_evidence_branch(_text())
+    for typ in ("assistant/message", "tool/call"):
+        assert re.search(
+            r"\| \(\.event // \.\) \| select\(\.type == \"" + re.escape(typ), branch
+        ), (
+            f"диагностика канарейки обязана читать событие {typ} через "
+            "(.event // .) по документированной форме session.history "
+            "({events:[{event, view?}]}, research/12) — select(.type == …) "
+            "прямо на элементах events[] ложно всегда и валит различение "
+            "причин (проверка идёт по jq-строкам, не подсчётом по блоку: "
+            "комментарий с той же подстрокой не должен красить гвардию "
+            "ложно-зелёной, класс #891/#893)"
+        )
+
+
 def test_canary_compares_history_by_extracted_text_not_raw_json():
     """Правило 7 (находка ревью PR #952, п.4): сравнение ожидаемого
     фрагмента идёт по текстовым значениям, извлечённым jq, а не по сырому
@@ -170,3 +197,6 @@ def test_canary_compares_history_by_extracted_text_not_raw_json():
 #     не вызван» — красен test_canary_diagnoses_missing_evidence_by_fact_not_by_guessing.
 #   М7 (правило 7): сравнить `$expect` с `$history` напрямую вместо
 #     `$texts` — красен test_canary_compares_history_by_extracted_text_not_raw_json.
+#   М8 (правило 8): убрать `(.event // .)` из одного из двух jq различения
+#     (вернуть select(.type == …) прямо на элементах events[]) — красен
+#     test_canary_reads_history_events_via_documented_shape.

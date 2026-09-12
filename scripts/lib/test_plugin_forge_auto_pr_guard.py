@@ -31,16 +31,26 @@ push-триггер по `dsh-edge/**` есть с #374.
      это прямо; push-триггер п.5 НЕ сработает для большинства мержей).
   7. Текст авто-PR (#664) не утверждает, что деплой не триггерится на push —
      `deploy-dsh-edge.yml` имеет push-триггер по `dsh-edge/**` с #374.
-  8. push/schedule проверяют пригодность task_issue (issue открыта, метка
-     `task`) тем же контрактом, что `contract_check.py::
-     task_eligibility_problems`, ДО сборки — иначе задача, закрытая приёмкой
-     (`accept_merged_tasks`) быстрее, чем форж успевает собраться (~20-60
-     минут), навсегда вешает `contract:failed` на авто-PR, а часовой крон
-     плодит новый мёртвый PR каждый час (класс #320/#325, находка ревью
-     PR #952, п.1).
-  9. push/schedule пропускают элемент состава, если для той же задачи уже
-     есть открытый PR форжа (`agent/<N>-forge-*`) — дедуп, не второй мёртвый
-     релиз на тот же дрейф (находка ревью PR #952, п.1).
+  8. Пригодность task_issue (issue открыта, метка `task`) проверяется тем же
+     контрактом, что `contract_check.py::task_eligibility_problems`, ДО
+     сборки — иначе задача, закрытая приёмкой (`accept_merged_tasks`)
+     быстрее, чем форж успевает собраться (~20-60 минут), навсегда вешает
+     `contract:failed` на авто-PR, а часовой крон плодит новый мёртвый PR
+     каждый час (класс #320/#325, находка ревью PR #952, п.1).
+  9. Причина отказа машинно-читаема (`SKIP_REASON`): по ней вызывающая
+     ветка различает «задача непригодна» от «уже есть открытый PR того же
+     дрейфа» — у них РАЗНЫЙ исход (находка ревью PR #952, п.2).
+ 10. schedule-страховка валит prepare ГРОМКО на найденном, но ничейном
+     дрейфе (задача закрыта/непригодна, сбой gh): молча зелёный прогон там
+     ровно в штатном случае крона (задача закрыта ~15 мин после мержа,
+     сборка 20-60 мин) прятал бы зависший навсегда дрейф; тихий скип —
+     ТОЛЬКО дедуп (`SKIP_REASON=duplicate-pr`) (находка ревью PR #952, п.2).
+ 11. Дедуп по открытым PR не принимает сбой gh за «дублей нет»: код возврата
+     `gh pr list` разбирается (`SKIP_REASON=pr-list-failed`), `--limit`
+     задан явно (дефолт gh — 30) (находка ревью PR #952, чеклист).
+ 12. `workflow_dispatch` делает дешёвый pre-flight пригодности задачи до
+     сборки — ручной диспатч с закрытым номером не тратит 20-60 минут
+     раннера на мёртвый PR (находка ревью PR #952, чеклист).
 
 Запуск: python -m pytest scripts/lib/test_plugin_forge_auto_pr_guard.py -q
 """
@@ -151,9 +161,9 @@ def test_pr_body_deploy_trigger_claim_is_accurate():
 def test_prepare_checks_task_eligibility_before_build():
     """Правило 8 (находка ревью PR #952, п.1)."""
     text = _text()
-    assert "task_issue_ready" in text, (
+    assert "task_issue_usable" in text, (
         "prepare обязан проверять пригодность task_issue (issue открыта, "
-        "метка task) ДО сборки — без этого push/schedule форжит на задачу, "
+        "метка task) ДО сборки — без этого триггеры форжат на задачу, "
         "которую приёмка успела закрыть, и авто-PR вешает contract:failed "
         "навсегда (класс #320/#325)"
     )
@@ -164,25 +174,105 @@ def test_prepare_checks_task_eligibility_before_build():
         "проверка пригодности обязана требовать метку `task` на задаче "
         "(тот же критерий, что contract_check.py::task_eligibility_problems)"
     )
-    assert "task_issue_ready \"$task_issue\" \"push $AFTER_SHA\"" in text, (
-        "push-ветка prepare обязана вызывать проверку пригодности перед "
-        "тем, как класть элементы состава в матрицу"
+    assert 'auto_forge_allowed "$task_issue" "push $AFTER_SHA"' in text, (
+        "push-ветка prepare обязана проверять пригодность задачи и дедуп "
+        "(auto_forge_allowed) перед тем, как класть элементы состава в "
+        "матрицу"
     )
-    assert 'task_issue_ready "$task_issue" "schedule-дрейф $src_dir" || continue' in text, (
-        "schedule-ветка prepare обязана пропускать (continue) конкретный "
-        "дрейф при непригодной задаче, не валить весь прогон"
+    assert 'auto_forge_allowed "$task_issue" "schedule-дрейф $src_dir"' in text, (
+        "schedule-ветка prepare обязана проверять пригодность задачи и дедуп "
+        "(auto_forge_allowed), прежде чем форжить найденный дрейф"
     )
 
 
-def test_prepare_dedupes_against_open_forge_pr():
-    """Правило 9 (находка ревью PR #952, п.1)."""
+def test_skip_reason_is_machine_readable():
+    """Правило 9 (находка ревью PR #952, п.2): причина отказа в SKIP_REASON,
+    не только в человекочитаемом ::error — вызывающая ветка различает по ней
+    «задача непригодна» (громко) от «дедуп» (тихий скип)."""
     text = _text()
-    assert re.search(r'grep -c "\^agent/\$\{task_issue\}-forge-"', text), (
-        "проверка пригодности обязана искать уже открытый PR форжа этой же "
-        "задачи (agent/<N>-forge-*) и пропускать повтор — иначе схема "
-        "«крон открывает новый PR каждый час, пока предыдущий не слился» "
-        "плодит мёртвые релизы (находка ревью PR #952, п.1)"
+    assert "SKIP_REASON=" in text, (
+        "проверки пригодности/дедупа обязаны писать машинно-читаемую причину "
+        "в SKIP_REASON — без неё вызывающая ветка не различит «задача "
+        "непригодна» от «уже есть открытый PR», а у них разный исход"
     )
+    assert 'SKIP_REASON=""' in text, (
+        "SKIP_REASON обязан сбрасываться на входе проверки — иначе в него "
+        "попадает причина ПРЕДЫДУЩЕЙ задачи и следующая ветка решает по "
+        "чужой причине"
+    )
+    for reason in ("issue-unreadable", "not-an-issue", "task-closed",
+                   "no-task-label", "pr-list-failed", "duplicate-pr"):
+        assert f'SKIP_REASON="{reason}"' in text, (
+            f"причина «{reason}» обязана иметь своё значение SKIP_REASON — "
+            "это носитель различения исходов для вызывающих веток"
+        )
+
+
+def test_schedule_fails_loud_on_ownerless_drift():
+    """Правило 10 (находка ревью PR #952, п.2, блокирующая): в
+    schedule-ветке тихий `continue` допустим ТОЛЬКО для дедупа
+    (SKIP_REASON=duplicate-pr); любой другой отказ на найденном дрейфе —
+    громкое падение prepare. Молча зелёный прогон в её штатном случае
+    (задача закрыта приёмкой к моменту крона) прятал бы зависший навсегда
+    дрейф."""
+    text = _text()
+    branch = _schedule_branch(text)
+    assert 'if [ "$SKIP_REASON" = "duplicate-pr" ]; then' in branch, (
+        "schedule обязана пропускать дрейф молча ТОЛЬКО по явному признаку "
+        "дедупа (SKIP_REASON=duplicate-pr) — не по любому отказу проверки"
+    )
+    assert re.search(
+        r'::error::schedule-дрейф .*(не форжится|владельца нет).*', branch
+    ) and "exit 1" in branch, (
+        "найденный, но ничейный дрейф (закрытая/непригодная задача, сбой "
+        "gh) обязан валить prepare громко (::error:: + exit 1) с названным "
+        "газом (ручной форж с явным task_issue) — молча зелёный прогон "
+        "прячет зависший дрейф (находка ревью PR #952, п.2)"
+    )
+
+
+def test_dedup_checks_gh_exit_code_and_limit():
+    """Правило 11 (находка ревью PR #952, чеклист): сбой `gh pr list` — не
+    «дублей нет»; лимит задан явно, дефолт gh (30) молча видел бы только
+    первые 30 открытых PR."""
+    text = _text()
+    assert re.search(
+        r"gh pr list .*--limit\s+\d+", text
+    ), "gh pr list обязан нести явный --limit — дефолт 30 искажает дедуп"
+    assert 'SKIP_REASON="pr-list-failed"' in text, (
+        "сбой gh pr list обязан попадать в SKIP_REASON=pr-list-failed, а не "
+        "молча считаться «дублей нет»"
+    )
+    assert "grep -c" not in text, (
+        "дедуп не должен считать совпадения через `grep -c … || true` — "
+        "это маскирует код возврата gh за «пустой список»"
+    )
+
+
+def test_dispatch_preflights_task_eligibility():
+    """Правило 12 (находка ревью PR #952, чеклист): ручной диспатч проверяет
+    пригодность задачи ДО сборки — дедуп при этом сознательно не проверяется
+    (человек, назвавший задачу явно, может форжить второй плагин под ту же
+    задачу)."""
+    text = _text()
+    assert re.search(
+        r'task_issue_usable "\$INPUT_TASK_ISSUE" "workflow_dispatch"\s*\|\|\s*exit 1',
+        text,
+    ), (
+        "workflow_dispatch обязан отказывать громко ДО сборки на "
+        "непригодной задаче (task_issue_usable … || exit 1) — иначе "
+        "20-60 минут раннера сгорают на мёртвом contract:failed PR"
+    )
+
+
+def _schedule_branch(text: str) -> str:
+    """Тело `schedule)` case-ветки job'а prepare — носитель правила 10."""
+    match = re.search(r"\n            schedule\)\n(.*?)\n              ;;", text, re.S)
+    assert match, (
+        "case-ветка schedule) в job prepare исчезла или переименована — "
+        "обнови носитель гвардии сознательной правкой, а не обходом"
+    )
+    return match.group(1)
 
 
 # Мутации, которыми доказана гвардия (каждая — красный тест, откат — зелёный):
@@ -203,7 +293,17 @@ def test_prepare_dedupes_against_open_forge_pr():
 #     test_schedule_fallback_present.
 #   М7 (правило 7): вернуть строку «deploy-dsh-edge.yml НЕ триггерится на
 #     push в main» в PR_BODY — красен test_pr_body_deploy_trigger_claim_is_accurate.
-#   М8 (правило 8): убрать вызов `task_issue_ready` из push- или
-#     schedule-ветки prepare — красен test_prepare_checks_task_eligibility_before_build.
-#   М9 (правило 9): убрать блок дедупа (`grep -c "^agent/${task_issue}-forge-"`)
-#     из `task_issue_ready` — красен test_prepare_dedupes_against_open_forge_pr.
+#   М8 (правило 8): убрать проверку `[ "$issue_state" != "open" ]` из
+#     `task_issue_usable` или вызов auto_forge_allowed из push/schedule —
+#     красен test_prepare_checks_task_eligibility_before_build.
+#   М9 (правило 9): стереть присваивания SKIP_REASON (оставить голые return 1)
+#     — красен test_skip_reason_is_machine_readable.
+#   М10 (правило 10): в schedule-ветке заменить
+#     `[ "$SKIP_REASON" = "duplicate-pr" ]` на `[ "$SKIP_REASON" = "never" ]`
+#     (любой отказ снова скипается тихо) или убрать `exit 1` — красен
+#     test_schedule_fails_loud_on_ownerless_drift.
+#   М11 (правило 11): вернуть `grep -c "^agent/${task_issue}-forge-" || true`
+#     без --limit и без разбора кода возврата — красен
+#     test_dedup_checks_gh_exit_code_and_limit.
+#   М12 (правило 12): убрать pre-flight `task_issue_usable … || exit 1` из
+#     ветки workflow_dispatch — красен test_dispatch_preflights_task_eligibility.

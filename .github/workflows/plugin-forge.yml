@@ -8,6 +8,10 @@
 #   - schedule (страховка): сравнение версии исходников с версией,
 #     опубликованной в манифесте, ловит дрейф, который push не поймал —
 #     см. комментарий у триггера ниже, класс тот же, что у deploy-dsh-edge.yml.
+#     Найденный, но ничейный дрейф (задача закрыта/непригодна) ВАЛИТ prepare
+#     громко: молча зелёный прогон здесь ровно в штатном случае крона прятал
+#     бы зависший навсегда дрейф (находка ревью PR #952, п.2); тихо
+#     пропускается только дедуп — уже есть открытый PR того же дрейфа.
 # Выход: релиз plugins-<id>-v<version> с tarball и checksums, PR (из ветки
 # agent/<task_issue>-forge-<id>-<ts> — контракт PR↔задача, #661) с обновлённым
 # dsh-edge/plugins.json (sha256, версия). Вся сила — в чеклисте совместимости
@@ -50,7 +54,11 @@ on:
     # ветка schedule). Полноценный фикс — явный диспатч в
     # scheduler.py::after_merge (по образцу dispatch_deploy_on_merge) —
     # заведён отдельной задачей (#946), scheduler.py вне территории этой
-    # правки.
+    # правки. Ограничение страховки, названное вслух (находка ревью PR
+    # #952, п.2): дрейф резолвится в задачу, которую приёмка уже закрыла
+    # (класс #320/#325), — prepare падает ГРОМКО (газ: ручной `gh workflow
+    # run plugin-forge -f task_issue=<открытая задача>`, владеющая дрейфом;
+    # решение класса — #1009), а не пропускает дрейф молча-зелёным.
     - cron: "17 * * * *"
 
 permissions:
@@ -141,27 +149,46 @@ jobs:
           # же прогона обрабатываются штатно; какой открытой задачей владеет
           # застрявший дрейф — отдельное решение владельца (беклог-задача из
           # ревью PR #952).
-          task_issue_ready() {
-            local task_issue="$1" context="$2" issue_json issue_state existing
+          SKIP_REASON=""
+          task_issue_usable() {
+            local task_issue="$1" context="$2" issue_json issue_state
+            SKIP_REASON=""
             issue_json=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${task_issue}" -H "Accept: application/vnd.github+json") \
-              || { echo "::error::${context}: не удалось прочитать issue #$task_issue — пропускаю, не проверив пригодность задачи" >&2; return 1; }
+              || { SKIP_REASON="issue-unreadable"; echo "::error::${context}: не удалось прочитать issue #$task_issue — пригодность задачи не проверена" >&2; return 1; }
             if jq -e 'has("pull_request")' <<<"$issue_json" >/dev/null 2>&1; then
-              echo "::error::${context}: #$task_issue — это PR, а не задача из пула, пропускаю" >&2
+              SKIP_REASON="not-an-issue"
+              echo "::error::${context}: #$task_issue — это PR, а не задача из пула" >&2
               return 1
             fi
             issue_state=$(jq -r '.state' <<<"$issue_json")
             if [ "$issue_state" != "open" ]; then
-              echo "::error::${context}: задача #$task_issue уже закрыта (приёмка закрывает её раньше, чем форж успевает собраться, класс #320/#325) — пропускаю, не открываю PR на закрытую задачу" >&2
+              SKIP_REASON="task-closed"
+              echo "::error::${context}: задача #$task_issue закрыта (приёмка закрывает задачу раньше, чем форж успевает собраться, класс #320/#325)" >&2
               return 1
             fi
             if ! jq -e '[.labels[].name] | index("task") != null' <<<"$issue_json" >/dev/null 2>&1; then
-              echo "::error::${context}: на задаче #$task_issue нет метки \`task\` — пропускаю" >&2
+              SKIP_REASON="no-task-label"
+              echo "::error::${context}: на задаче #$task_issue нет метки \`task\`" >&2
               return 1
             fi
-            existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json headRefName -q '.[].headRefName' \
-              | grep -c "^agent/${task_issue}-forge-" || true)
-            if [ "${existing:-0}" -gt 0 ]; then
-              echo "::notice::${context}: уже есть открытый PR форжа для задачи #$task_issue (agent/${task_issue}-forge-*) — пропускаю повтор, пока он не закрылся" >&2
+            return 0
+          }
+
+          # Разрешён ли АВТО-триггеру (push/schedule) форж этой задачи:
+          # пригодность + дедуп по уже открытому PR форжа той же задачи —
+          # иначе часовой крон плодит новый релиз каждый час, пока прежний
+          # PR не слился (находка ревью PR #952, п.1). Сбой gh pr list —
+          # НЕ «дублей нет» (находка ревью PR #952, чеклист): код возврата
+          # разбирается явно; --limit 200 — дефолт gh (30) молча видел бы
+          # только первые 30 открытых PR.
+          auto_forge_allowed() {
+            local task_issue="$1" context="$2" pr_heads
+            task_issue_usable "$task_issue" "$context" || return 1
+            pr_heads=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json headRefName -q '.[].headRefName') \
+              || { SKIP_REASON="pr-list-failed"; echo "::error::${context}: gh pr list не отработал — дедуп по открытым форж-PR не выполнен" >&2; return 1; }
+            if grep -q "^agent/${task_issue}-forge-" <<<"$pr_heads"; then
+              SKIP_REASON="duplicate-pr"
+              echo "::notice::${context}: уже есть открытый PR форжа для задачи #$task_issue (agent/${task_issue}-forge-*) — пропуск повтора, пока он не закрылся" >&2
               return 1
             fi
             return 0
@@ -174,6 +201,14 @@ jobs:
               [ -n "$INPUT_PLUGIN_PATH" ] || { echo "::error::plugin_path обязателен"; exit 1; }
               [ -n "$INPUT_TASK_ISSUE" ] || { echo "::error::task_issue обязателен: без него авто-PR форжа откроется из ветки не по контракту PR↔задача и никогда не сольётся штатным циклом (#661)"; exit 1; }
               [[ "$INPUT_TASK_ISSUE" =~ ^[0-9]+$ ]] || { echo "::error::task_issue '$INPUT_TASK_ISSUE' должен быть числом (номер issue)"; exit 1; }
+              # Pre-flight пригодности ДО сборки (находка ревью PR #952,
+              # чеклист): ручной диспатч с закрытым/непригодным номером иначе
+              # собирался бы 20-60 минут и открывал мёртвый contract:failed
+              # PR — ровно тот расход, который правило «форж отказывает ДО
+              # сборки» называет недопустимым. Дедуп здесь сознательно НЕ
+              # проверяется: человек, назвавший задачу явно, может осознанно
+              # форжить второй плагин под ту же задачу.
+              task_issue_usable "$INPUT_TASK_ISSUE" "workflow_dispatch" || exit 1
               items=$(jq -n --arg p "$INPUT_PLUGIN_PATH" --arg id "$INPUT_PLUGIN_ID" --arg t "$INPUT_TASK_ISSUE" \
                 '[{plugin_path:$p, plugin_id:$id, task_issue:$t}]')
               ;;
@@ -202,15 +237,27 @@ jobs:
                 # коммита слияния) — пригодность проверяется РАЗ, не на
                 # каждый каталог: результат одинаков для всех.
                 task_issue=$(resolve_task_issue_from_sha "$AFTER_SHA" "push $AFTER_SHA") || exit 1
-                if task_issue_ready "$task_issue" "push $AFTER_SHA"; then
+                # Скип НЕ молча: причина (непригодная задача / дедуп / сбой
+                # gh) уходит в лог — «задача закрыта» на пушах, задержавшихся
+                # дольше 15-минутного цикла приёмки, остаётся видимой, а
+                # зависший из-за неё дрейф громко ловит schedule-страховка
+                # (она на тот же отказ падает, не скипает).
+                if auto_forge_allowed "$task_issue" "push $AFTER_SHA"; then
                   for d in "${plugin_dirs[@]}"; do
                     items=$(jq -c --arg p "$d" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
                   done
+                else
+                  echo "::notice::push $AFTER_SHA: авто-форж пропущен (причина: ${SKIP_REASON}) — подробности в ::error/::notice выше" >&2
                 fi
               fi
               ;;
 
             schedule)
+              # Битый манифест не даёт молча-пустой матрицы (находка ревью
+              # PR #952, чеклист): внутри `< <(jq …)` отказ jq не роняет шаг —
+              # валидируем до цикла, громко.
+              jq -e '.plugins | type == "array"' dsh-edge/plugins.json >/dev/null \
+                || { echo "::error::dsh-edge/plugins.json не читается как {plugins:[...]} — дрейф-контроль крона слеп, чинить манифест"; exit 1; }
               while IFS=$'\t' read -r manifest_id manifest_pkg manifest_asset; do
                 src_dir=""
                 for d in plugins-src/*/; do
@@ -221,8 +268,13 @@ jobs:
                   break
                 done
                 # Пакет манифеста без исходников в этом репозитории (иное
-                # происхождение) — не забота этого крона, пропускаем молча.
-                [ -n "$src_dir" ] || continue
+                # происхождение) — не забота этого крона, но не молча:
+                # выпадение из дрейф-контроля видно в логе (находка ревью
+                # PR #952, чеклист).
+                if [ -z "$src_dir" ]; then
+                  echo "::notice::schedule: пакет $manifest_pkg (id $manifest_id) есть в манифесте, но исходников plugins-src/ для него нет — вне дрейф-контроля" >&2
+                  continue
+                fi
 
                 src_version=$(jq -r '.version' "$src_dir/package.json")
                 # Версия зашита в имя asset'а (RELEASE_ASSET, шаг «Собрать
@@ -231,12 +283,45 @@ jobs:
                 # id: legacy-записи манифеста (напр. hello-world-0.1.1.tgz
                 # при id=hello) не всегда совпадают с текущим id.
                 asset_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*\.tgz$' <<<"$manifest_asset" | sed -E 's/\.tgz$//')
+                # Пустая версия — «не смог распарсить», НЕ дрейф (находка
+                # ревью PR #952, чеклист): иначе любой asset без semver
+                # («» ≠ версия) форжился бы кроном каждый час вечно.
+                if [ -z "$asset_version" ]; then
+                  echo "::notice::schedule: $manifest_id — в имени asset '$manifest_asset' нет semver-версии, дрейф не констатирую" >&2
+                  continue
+                fi
                 [ "$asset_version" != "$src_version" ] || continue
+
+                # Направление дрейфа (находка ревью PR #952, чеклист): форжим
+                # ТОЛЬКО дрейф «исходники новее манифеста». Манифест новее
+                # исходников — сознательная правка/откат манифеста руками:
+                # авто-PR, откатывающий её обратно, — не страховка, а порча.
+                older=$(printf '%s\n%s\n' "$asset_version" "$src_version" | sort -V | head -1)
+                if [ "$older" = "$src_version" ]; then
+                  echo "::notice::schedule: $manifest_id — манифест (v$asset_version) новее исходников (v$src_version): сознательная правка манифеста, авто-откат не делаем" >&2
+                  continue
+                fi
 
                 last_sha=$(git log -1 --format=%H -- "$src_dir/package.json")
                 [ -n "$last_sha" ] || { echo "::error::дрейф найден ($src_dir: исходники v$src_version, манифест v$asset_version), но не нашёл коммит, менявший $src_dir/package.json — резолвить задачу не от чего"; exit 1; }
                 task_issue=$(resolve_task_issue_from_sha "$last_sha" "schedule-дрейф $src_dir") || exit 1
-                task_issue_ready "$task_issue" "schedule-дрейф $src_dir" || continue
+                if ! auto_forge_allowed "$task_issue" "schedule-дрейф $src_dir"; then
+                  # Дедуп — единственный тихий скип: работа уже идёт (открытый
+                  # PR того же дрейфа), повтор не нужен. ЛЮБОЙ другой отказ —
+                  # дрейф найден, но ничейный: валить prepare ГРОМКО. Молча
+                  # зелёный прогон здесь ровно в штатном случае крона (задача
+                  # закрыта приёмкой ~15 мин после мержа, сборка идёт 20-60
+                  # минут) прятал бы зависший навсегда дрейф — находка ревью
+                  # PR #952, п.2. Газ: ручной `gh workflow run plugin-forge
+                  # -f plugin_path=<путь> -f task_issue=<ОТКРЫТАЯ задача>`,
+                  # владеющая дрейфом; решение класса (какая задача владеет
+                  # дрейф-PR после закрытия исходной приёмкой) — #1009.
+                  if [ "$SKIP_REASON" = "duplicate-pr" ]; then
+                    continue
+                  fi
+                  echo "::error::schedule-дрейф $src_dir не форжится: дрейф есть ($src_dir исходники v$src_version, манифест v$asset_version), владельца нет (причина: ${SKIP_REASON}) — прогон валится громко; газ: ручной форж с явным task_issue открытой задачи (#1009 — решение класса)" >&2
+                  exit 1
+                fi
                 items=$(jq -c --arg p "$src_dir" --arg t "$task_issue" '. + [{plugin_path:$p, plugin_id:"", task_issue:$t}]' <<<"$items")
                 echo "Дрейф: $src_dir исходники v$src_version ≠ манифест v$asset_version (id $manifest_id) — форжу под задачу #$task_issue"
               done < <(jq -r '.plugins[] | [.id, .package, .source.asset] | @tsv' dsh-edge/plugins.json)

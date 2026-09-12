@@ -805,6 +805,15 @@ jobs:
       # заведения отдельной canary-задачи под каждый прогон. Заголовок
       # читается ЖИВЬЁМ у GitHub REST в момент канарейки, не хардкодом:
       # правка заголовка issue #2 не потребует правки этого шага.
+      #
+      # Порядок включения назван явно (находка ревью PR #952, блокирующая
+      # п.1): канарейке нужен на проде runner-bridge ≥ 0.1.3 — фикс
+      # User-Agent (#133/#943, 490ccac) в тарболле 0.1.2 отсутствовал, без
+      # него runner_status получает 403 от GitHub REST и первый же деплой
+      # рождал бы заведомо красный гейт. Публикация 0.1.3 (релиз
+      # plugins-runner-bridge-v0.1.3 + пин в dsh-edge/plugins.json) идёт
+      # ТАНДЕМОМ с этим PR (#952), так что первый деплой после мержа несёт
+      # 0.1.3 и канарейка рождается зелёной, а не известным красным.
       - name: Канарейка runner-bridge (#390/#945)
         if: success() && steps.route.outputs.plugins != '0'
         env:
@@ -871,8 +880,15 @@ jobs:
             # причины различимы по фактам, которые `last_history` и так несёт
             # (raw-события `{type, data}`, research/12 «Форма канонических
             # событий») — не список гипотез читателю.
-            has_assistant=$(jq '[.result.value.events[]? | select(.type == "assistant/message")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
-            has_toolcall=$(jq '[.result.value.events[]? | select(.type == "tool/call" and (.data.name // "") == "runner_status")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
+            # Сырое событие лежит на events[].event (документированная форма
+            # session.history: {events:[{event, view?}]}, research/12),
+            # (.event // .) читает его и не ломается на плоской форме — без
+            # этого select(.type == …) на элементах events[] ложен всегда
+            # (даже когда ход и тул были), и алерт уверенно называл бы
+            # «модель не сделала ни одного хода» при любой реальной причине
+            # (находка ревью PR #952, блокирующая п.3).
+            has_assistant=$(jq '[.result.value.events[]? | (.event // .) | select(.type == "assistant/message")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
+            has_toolcall=$(jq '[.result.value.events[]? | (.event // .) | select(.type == "tool/call" and (.data.name // "") == "runner_status")] | length > 0' <<<"$last_history" 2>/dev/null || echo false)
             if [ "$has_assistant" != "true" ]; then
               cause="за 120с в истории сессии нет ни одного assistant/message — модель не сделала ни одного хода (сбой провайдера/LLM, не плагина)"
             elif [ "$has_toolcall" != "true" ]; then
