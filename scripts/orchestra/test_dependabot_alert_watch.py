@@ -176,6 +176,25 @@ def test_dependabot_alert_watch_skips_pulse_when_pool_read_fails(monkeypatch):
                    for c in fake.calls)
 
 
+def test_open_dependabot_alerts_non_list_error_shape_raises(monkeypatch):
+    """Живой пост-мерж прогон 2026-09-12 (run 34681294715): эндпоинт
+    Dependabot alerts НЕ поддерживает page-пагинацию — реальное тело ответа
+    (HTTP 400, скопировано из прогона как прод-форма); не-list ответ обязан
+    красить прогон (RuntimeError), не читаться как «алертов нет»
+    (класс #120A)."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": {
+            "message": "Pagination using the `page` parameter is not supported.",
+            "documentation_url": "https://docs.github.com/rest/dependabot/alerts#list-dependabot-alerts-for-a-repository",
+            "status": "400",
+        },
+    })
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="не-list ответ"):
+        daw.open_dependabot_alerts(REPO)
+
+
 def test_dependabot_alert_watch_creates_task_for_new_alert(monkeypatch):
     created = {"number": 700}
     fake = FakeGh({
