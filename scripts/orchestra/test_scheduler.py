@@ -533,6 +533,65 @@ def test_after_merge_appends_session_note_before_archiving(monkeypatch):
     assert order == ["note", "archive"]
 
 
+def test_after_merge_records_hard_failure_fact_for_final_alert(monkeypatch):
+    # Дефект живого алерта 2026-09-12 (issue #120, "архив сессии раннера
+    # сломан"): текст отсылал читателя «см. отчёт этого прогона orchestra
+    # выше», хотя факт (номер задачи, session_id, сырое тело ошибки RPC) уже
+    # был посчитан archive_runner_sessions. after_merge обязан скопировать
+    # этот факт в _MERGE_SESHARD..._FACTS (см. merge_session_hard_failure_
+    # alert_text ниже) — не пересобирать текст заново.
+    sch.reset_merge_session_hard_failure_facts()
+    merged = pull(9, ref="agent/91-x", pr_body="#91")
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/9/files?per_page=100&page=1",
+                      "repos/o/r/pulls/9/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/91":
+            return {**issue(91, assignees=("mytab0r",), title="т"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "append_session_notes", lambda notes: ([], False))
+    fact = "🚨 #91: сессия harness-91 не заархивирована (возможность сломана): RPC boom"
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([fact], True))
+
+    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert hard_failure is True
+    assert sch._MERGE_SESSION_HARD_FAILURE_FACTS == [fact]
+
+
+def test_merge_session_hard_failure_alert_text_names_facts_and_gas():
+    # "Алерт не гадает" (AGENTS.md): текст обязан нести дословный факт и
+    # НАЗВАННЫЙ газ (issue #940 / PR #944), не «см. отчёт этого прогона
+    # orchestra выше», на который у получателя Telegram-алерта нет доступа.
+    sch.reset_merge_session_hard_failure_facts()
+    fact = "🚨 #91: сессия harness-91 не заархивирована (возможность сломана): RPC boom"
+    sch._MERGE_SESSION_HARD_FAILURE_FACTS.append(fact)
+
+    text = sch.merge_session_hard_failure_alert_text(True, False, [])
+
+    assert fact in text  # дословный факт, не пересказ
+    assert "см. отчёт этого прогона orchestra выше" not in text  # старая ложь про доступный лог
+    assert "#944" in text and "session_orphan_sweep" in text  # назван газ с адресом
+
+
+def test_merge_session_hard_failure_alert_text_stall_names_own_fact(monkeypatch):
+    sch.reset_merge_session_hard_failure_facts()
+    stall_fact = "🚨 детектор простоя (#201) не отработал (возможность сломана, не отсутствует): auth required"
+
+    text = sch.merge_session_hard_failure_alert_text(False, True, [stall_fact])
+
+    assert stall_fact in text
+    assert "детектор простоя сломан" in text
+
+
 def test_after_merge_skips_session_note_when_no_task_numbers(monkeypatch):
     # Гвардия холостого хода: PR без задач пула (упоминание чужой/несуществующей
     # задачи в прозе) не должен даже пытаться дописать заметку — append_session_notes
@@ -3184,7 +3243,10 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         "compare/basesha...main": {"files": files_payload(["b.py", "c.py"])},
         # Находка ревью PR #478: эскалация перепроверяет актуальный
         # mergeable_state (не доверяет только метке) — здесь он подтверждён.
-        "pulls/560": {"mergeable_state": "dirty"},
+        # state:"open" — иначе исход 3 (#1029) счёл бы PR закрытым и отложил
+        # эскалацию (закрытие между снимком pulls и перепроверкой — предмет
+        # эскалации исчез бы сам).
+        "pulls/560": {"mergeable_state": "dirty", "state": "open"},
         # Единственная попытка уже ЗАВЕРШИЛАСЬ (не в in_progress/queued) —
         # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
@@ -3224,6 +3286,102 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
     assert any("исчерпана" in line and "#560" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_conflict_rework_retries_instead_of_escalating_when_run_failed_after_git_step(monkeypatch):
+    # Живой случай #1029 (задача #224, эскалация 2026-09-12 19:56): единственная
+    # ЗАСЧИТАННАЯ попытка (git-шаг достигнут — attempts=1=CONFLICT_REWORK_MAX_
+    # ATTEMPTS) сама завершилась conclusion='failure' (push/сеть/деплой морды
+    # ПОСЛЕ git-шага, не обязательно неразрешённый конфликт) — старый код
+    # эскалировал безусловно, приложив только conclusion как ТЕКСТ, не как
+    # РЕШЕНИЕ. Ирония живого случая: PR #1029 слился через 37 минут после этой
+    # эскалации — она была ложной тревогой по определению. Тот же приём, что
+    # #1030 дал dispatch_ai_review_rework (issue #1027): классификатор уже
+    # есть (FAILURE_CONCLUSIONS), не второй — используем его и здесь.
+    #
+    # Мутация: убери ветку `run_conclusion in FAILURE_CONCLUSIONS` (вернись к
+    # безусловной эскалации) — этот тест покраснеет (escalated стало бы
+    # непустым, dispatched — False).
+    task = issue(224, assignees=("mytab0r",))
+    p = pull(1029, labels=["conflict"], ref="agent/224-slug", base_sha="basesha")
+    fake = FakeGh({
+        "issues/1029/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-12T18:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/1029": {"mergeable_state": "dirty", "state": "open"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Единственная попытка дошла до git-шага (attempts=1), но САМ прогон
+        # в целом завершился conclusion='failure' — ровно текст живого алерта.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 34090000001, "conclusion": "failure", "created_at": "2026-09-12T19:00:00Z"},
+        ]},
+        f"{REPO}/issues/224/comments?per_page": [
+            {"created_at": "2026-09-12T19:01:00Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-224` "
+                     "(TTL 24 ч по коммиту замка). Канал: worker run 34090000001."},
+            {"created_at": "2026-09-12T19:02:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34090000001"},
+        ],
+        "issues/224/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # живой случай #1029: алерт не должен был уйти вовсе
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=224" in dispatch_calls[0]
+    # Дробь не врёт: attempts уже 1/1, но это НЕ вторая настоящая попытка —
+    # "2/1" была бы ложью (та же находка чеклиста, что PR #1030).
+    assert posted and "2/1" not in posted[0][1] and "не в счёт" in posted[0][1]
+    assert any("не в счёт эскалации" in line for line in observations)
+    assert task["assignees"] == []
+
+
+def test_dispatch_conflict_rework_skips_escalation_when_pr_already_closed(monkeypatch):
+    # Исход 3 (#1027/#1029, тот же приём, что dispatch_ai_review_rework после
+    # #1030): PR закрылся/слился между снимком `pulls` и перепроверкой —
+    # эскалировать «остаётся dirty» больше не на чем, предмет исчез сам.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/560": {"mergeable_state": "dirty", "state": "closed"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "Канал: worker run 34011108934."},
+            {"created_at": "2026-09-06T09:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("PR уже закрыт — эскалировать не на чем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("PR закрыт — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("PR закрыт" in line and "#560" in line for line in observations)
+    # решение принято по одному уже прочитанному объекту `single` — второго
+    # вызова pulls/560 или чтения mergeable_state этим тестом не проверяем,
+    # но файлы PR/main (второй платный запрос) точно не читаем зря.
+    assert not any("pulls/560/files" in c or "compare/" in c for c in fake.calls)
 
 
 def test_dispatch_conflict_rework_dispatches_again_after_budget_reset_marker(monkeypatch):
@@ -3364,7 +3522,7 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
         "issues/120/comments?per_page=100": [],
         "pulls/560/files": files_payload([]),
         "compare/basesha...main": {"files": files_payload([])},
-        "pulls/560": {"mergeable_state": "dirty"},
+        "pulls/560": {"mergeable_state": "dirty", "state": "open"},
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # В окне только чужой прогон 901: попытка (333→900) туда не попала.
@@ -3413,7 +3571,7 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
              "body": "🤖 [worker: git-шаг] worker run 34011108934"},
         ],
         "issues/120/comments?per_page=100": [],
-        "pulls/560": {"mergeable_state": None},
+        "pulls/560": {"mergeable_state": None, "state": "open"},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("mergeable_state не подтверждён — рано эскалировать"))
