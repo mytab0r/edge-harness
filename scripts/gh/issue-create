@@ -181,8 +181,8 @@ if [ "$has_task" -ne 1 ]; then
   fi
 fi
 
-# repo — нужен и приоритетной проверке ниже, и дедупу (#566): один вызов
-# gh repo view, не два (has_task=1 — единственный случай, где обе секции
+# repo — нужен и приоритетной проверке ниже, и дедупу (#566/#570): один вызов
+# gh repo view, не два-три (has_task=1 — единственный случай, где все секции
 # вообще смотрят в сеть; --no-task-ack уже объявил «это не пул»).
 repo=""
 if [ "$has_task" -eq 1 ]; then
@@ -241,27 +241,38 @@ if [ "$has_task" -eq 1 ]; then
   fi
 fi
 
-# Дедупликация по похожести заголовка (#566) — только для реальных задач
-# пула (has_task=1: --no-task-ack явно объявил «это не пул», сравнивать не с
-# чем сравнивать по смыслу) и только если заголовок вообще известен (пустой
-# --title — забота самого gh issue create, здесь просто нечего сравнивать).
-if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
+# Дедупликация — только для реальных задач пула (has_task=1: --no-task-ack
+# явно объявил «это не пул», сравнивать не с чем по смыслу). Два слоя рядом,
+# не два отдельных гейта: заголовок (#566, только ОТКРЫТЫЕ, и только если
+# заголовок вообще известен — пустой --title забота самого gh issue create)
+# и улики в теле (#570 — путь/номер прогона/ссылка/дословная цитата ```,
+# ОТКРЫТЫЕ И ЗАКРЫТЫЕ — см. duplicate_guard.py), результаты объединяются в
+# один `matches` до единственной проверки ниже. $repo уже посчитан выше.
+if [ "$has_task" -eq 1 ]; then
   if [ -z "$repo" ]; then
-    echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести пропущена." >&2
+    echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести/улик пропущена." >&2
   else
+    matches_title=""
+    if [ -n "$title" ]; then
+      dg_err_file="$(mktemp)"
+      matches_title="$(PYTHONIOENCODING=utf-8 python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file" || true)"
+      dg_err="$(cat "$dg_err_file" 2>/dev/null || true)"; rm -f "$dg_err_file"
+      [ -z "$dg_err" ] || echo "$dg_err" >&2
+    fi
     dg_err_file="$(mktemp)"
-    matches="$(python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file" || true)"
+    matches_evidence="$(printf '%s' "$body" | PYTHONIOENCODING=utf-8 python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check-evidence "$repo" 2>"$dg_err_file" || true)"
     dg_err="$(cat "$dg_err_file" 2>/dev/null || true)"; rm -f "$dg_err_file"
     [ -z "$dg_err" ] || echo "$dg_err" >&2
+    matches="$(printf '%s\n%s\n' "$matches_title" "$matches_evidence" | sed '/^$/d')"
     if [ -n "$matches" ]; then
       if [ -n "$confirm_not_duplicate" ]; then
-        listed=$(printf '%s\n' "$matches" | awk -F'\t' '{printf "- #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}')
-        echo "issue-create: похожие открытые задачи найдены, но --confirm-not-duplicate дан:" >&2
+        listed=$(printf '%s\n' "$matches" | awk -F'\t' '{printf "- #%s (score %.2f): %s — %s [%s]\n", $2, $1, $3, $4, $5}')
+        echo "issue-create: похожие/связанные задачи найдены, но --confirm-not-duplicate дан:" >&2
         printf '%s\n' "$listed" >&2
         footer="
 
 ---
-Проверено на дубли перед заведением (--confirm-not-duplicate, #566). Похожие открытые задачи:
+Проверено на дубли перед заведением (--confirm-not-duplicate, #566/#570). Похожие/связанные задачи:
 $listed
 Не дубль, потому что: $confirm_not_duplicate"
         new_body="${body}${footer}"
@@ -287,8 +298,8 @@ $listed
             ;;
         esac
       else
-        echo "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть — вероятно, дефект уже диагностируется (класс #566, живой случай #518/#547/#564):" >&2
-        printf '%s\n' "$matches" | awk -F'\t' '{printf "  #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}' >&2
+        echo "::error::issue-create: похожие/связанные задачи пула уже есть — вероятно, дефект уже диагностируется (заголовок #566, живой случай #518/#547/#564; улики в теле #570, живой случай #518/#548 и #562/#564):" >&2
+        printf '%s\n' "$matches" | awk -F'\t' '{printf "  #%s (score %.2f): %s — %s [%s]\n", $2, $1, $3, $4, $5}' >&2
         echo "Свяжись с существующей задачей (комментарий/assign) вместо новой, либо, если это ДЕЙСТВИТЕЛЬНО не дубль, передай --confirm-not-duplicate \"<почему не дубль>\" — причина попадёт в тело issue." >&2
         echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
         exit 1
