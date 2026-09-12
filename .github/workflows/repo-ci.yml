@@ -809,8 +809,9 @@ jobs:
       # ТЕЛЕ новой issue (путь/номер прогона/ссылка/дословная цитата ```)
       # совпадает с ОТКРЫТОЙ или ЗАКРЫТОЙ задачей пула — отклоняется ДО
       # вызова `gh issue create`; тот же газ `--confirm-not-duplicate`.
-      - name: Smoke issue-create — дедупликация по уликам в теле (#570)
-        run: bash scripts/gh/test/issue-create-evidence-guard.test.sh
+      # Не рукописный шаг здесь (каталог гвардий #749) — зарегистрирована
+      # данными в scripts/ci/guards/issue-create-evidence-guard.sh, перебор
+      # ниже (шаг «Каталог гвардий … — перебор») её исполняет.
 
       # Третий тормоз того же issue-create (#695): решение о приоритете
       # (area:process) обязано быть явным — метка или --not-process-ack,

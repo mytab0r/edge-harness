@@ -22,6 +22,11 @@
 # --confirm-not-duplicate) перестаёт отклоняться, тест краснеет. Верни блок —
 # тест снова зелёный. Дополнительная мутация уровня чистой логики — в
 # scripts/lib/test_duplicate_guard.py (докстринг модуля).
+#
+# --not-process-ack изолирует вызовы от независимого тормоза #695 (решение о
+# приоритете area:process) — этот тест проверяет только слой улик (#570), не
+# приоритет; мок gh обрабатывает и `issue list`, который #695 дёргает через
+# free_task.py::priority_top.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -84,6 +89,10 @@ if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
   echo "o/r"
   exit 0
 fi
+if [ "\$1" = "issue" ] && [ "\$2" = "list" ]; then
+  echo "[]"
+  exit 0
+fi
 if [ "\$1" = "issue" ] && [ "\$2" = "create" ]; then
   echo called >"$MARKER"
   args=("\$@")
@@ -114,6 +123,7 @@ note() { echo "$@"; }
 rm -f "$MARKER" "$CREATED_BODY"
 export DUPLICATE_GUARD_EVIDENCE_FIXTURE="$WORK/pool-562.json"
 if bash "$SCRIPT_SRC" --title "не важно, изолируем слой улик" --body "$BODY_564" --label task \
+    --not-process-ack "тест изолирует слой улик, приоритет не по теме" \
     >"$WORK/out1" 2>"$WORK/err1"; then
   note "FAIL случай 1: улика (цитата #562) принята без --confirm-not-duplicate"; fail=1
 elif [ -f "$MARKER" ]; then
@@ -130,6 +140,7 @@ fi
 rm -f "$MARKER" "$CREATED_BODY"
 export DUPLICATE_GUARD_EVIDENCE_FIXTURE="$WORK/pool-562.json"
 if ! bash "$SCRIPT_SRC" --title "не важно" --body "$BODY_564" --label task \
+    --not-process-ack "тест изолирует слой улик, приоритет не по теме" \
     --confirm-not-duplicate "разные причины отказа, не дубль" >"$WORK/out2" 2>"$WORK/err2"; then
   note "FAIL случай 2: --confirm-not-duplicate отклонён"; cat "$WORK/err2"; fail=1
 elif [ ! -f "$MARKER" ]; then
@@ -149,6 +160,7 @@ fi
 rm -f "$MARKER" "$CREATED_BODY"
 export DUPLICATE_GUARD_EVIDENCE_FIXTURE="$WORK/pool-518.json"
 if bash "$SCRIPT_SRC" --title "не важно, изолируем слой улик" --body "$BODY_548" --label task \
+    --not-process-ack "тест изолирует слой улик, приоритет не по теме" \
     >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: улика (ссылка+самоцитата #518) принята без --confirm-not-duplicate"; fail=1
 elif [ -f "$MARKER" ]; then
@@ -163,6 +175,7 @@ fi
 rm -f "$MARKER" "$CREATED_BODY"
 export DUPLICATE_GUARD_EVIDENCE_FIXTURE="$WORK/pool-518-562.json"
 if ! bash "$SCRIPT_SRC" --title "совсем другая тема, не пересекается" --body "$BODY_UNRELATED" --label task \
+    --not-process-ack "тест изолирует слой улик, приоритет не по теме" \
     >"$WORK/out4" 2>"$WORK/err4"; then
   note "FAIL случай 4: топически не связанная задача (#121) отклонена"; cat "$WORK/err4"; fail=1
 elif [ ! -f "$MARKER" ]; then
