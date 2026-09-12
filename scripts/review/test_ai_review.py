@@ -572,8 +572,10 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
                 "user": {"login": "test-user"},
             }
         if path.startswith("repos/o/r/pulls/1/files"):
-            # list_pr_files — возвращаем пустой список файлов
-            return []
+            # list_pr_files — один файл, непустой (пустой список уводит
+            # cmd_gather в ветку "дифф пуст" ДО построения промпта, #687 —
+            # эта проверка не о ней, а о мэппинге плейсхолдеров).
+            return [{"filename": "file.py", "additions": 1, "deletions": 0}]
         if path.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
             # other_active_ai_review_runs вызывает этот эндпоинт — возвращаем пустой список
             return []
@@ -585,7 +587,7 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
     # diff-пак — мокаем gh pr diff
     import subprocess
 
-    def fake_subprocess_run(cmd, capture_output=True, text=True, env=None):
+    def fake_subprocess_run(cmd, capture_output=True, text=True, env=None, encoding=None):
         if cmd[:2] == ["gh", "pr"] and cmd[2] == "diff":
             class Result:
                 returncode = 0
@@ -593,7 +595,7 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
                 stderr = ""
             return Result()
         # fallback to real subprocess for other calls (e.g., redact)
-        return subprocess.run(cmd, capture_output=capture_output, text=text, env=env)
+        return subprocess.run(cmd, capture_output=capture_output, text=text, env=env, encoding=encoding)
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
 
