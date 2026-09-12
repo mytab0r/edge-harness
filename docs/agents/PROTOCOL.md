@@ -308,6 +308,20 @@ concurrency-группой `orchestra` — два слияния никогда 
   отдельным PR (тот же исход, что и провал улики; подробности и пропуск эпиков —
   дельта-спека [`openspec/changes/acceptance-partial-pr-guard/specs/journal-tasks-hands/spec.md`](../../openspec/changes/acceptance-partial-pr-guard/specs/journal-tasks-hands/spec.md)).
   Исполнитель улику не заявляет и задачу сам не закрывает.
+- **После слияния — второй закрывающий: приёмка по ссылке (#1042)**: тот же
+  прогон оркестратора закрывает и задачи, которые слитый PR заявляет ЧУЖИМИ —
+  не именем ветки, а строгим маркером в теле («закрывает/закрываю/закрыл/
+  закрыт #N», `scripts/lib/task_ref.py::also_closes_targets`; русские слова
+  GitHub как директиву не распознаёт — автозакрытия при мерже нет структурно,
+  запрет Closes/Fixes/Resolves не задет). Шаг «Приёмка по ссылке» в workflow
+  `orchestra` (`scripts/orchestra/reference_closure.py`, после планировщика,
+  гейт квоты и continue-on-error — как у соседних шагов): собственная задача
+  ветки исключена (её закрывает штатная приёмка), эпики/#120/задачи с
+  исполнителем или конкурирующим открытым PR — пропуск с названной причиной;
+  улика — те же категории, что у штатной приёмки, плюс «коммит слияния —
+  предок main» (класс #925); потолок закрытий за прогон — газ, обоснован в
+  докстринге модуля. Дельта-спека:
+  [`openspec/changes/archive/reference-closure/specs/journal-tasks-hands/spec.md`](../../openspec/changes/archive/reference-closure/specs/journal-tasks-hands/spec.md).
 - **Запрет переоткрытия (#369)**: закрытая задача не переоткрывается никогда — GitHub
   не отклоняет reopen нативно, поэтому пульс сам находит задачу пула с
   `state_reason == "reopened"` (поле уже в списке `open_task_issues`, без

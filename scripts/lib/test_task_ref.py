@@ -333,6 +333,98 @@ def test_closing_keyword_mutation_startswith_regresses_on_pr_415_v1():
     )
 
 
+# ── also_closes_targets (#1042) — прод-форма реальных тел трёх слитых PR ──────
+#
+# Все три взяты дословно из тел уже слитых PR этого репозитория (проверено
+# `gh pr view <N> --json body`, 2026-09-12), не пересказаны.
+
+_PR_986_FRAGMENT = (
+    "- Заявленные в issue #507 упоминания `dsh-tools@0.1.1-rc.2` в\n"
+    "  README/body.js сверены отдельно и не относятся к зависимостям,\n"
+    "  правкой; закрываю issue #507 этим PR как полностью покрытый.\n"
+)
+
+_PR_986_FALSE_POSITIVE_FRAGMENT = (
+    "в докстринге roster-гвардии — сейчас цепочка, от которой зависит "
+    "закрытие #806, живёт только в переносе"
+)
+
+_PR_986_NEGATION_FRAGMENT = (
+    "- #806 — причина 2 (ростер), не закрывается автоматически этим PR: "
+    "реальный перенос требует отдельного PR."
+)
+
+_PR_952_FRAGMENT = (
+    "форж отказывает\nгромко ДО сборки, если номер не определён "
+    "(закрывает #661, вариант 1).\n"
+)
+
+_PR_841_FRAGMENT = (
+    "- Закрыт класс #786 по всему `scripts/`: `gh` 2.85 не знает "
+    "`--body-file` у `gh secret set`.\n"
+)
+
+
+def test_also_closes_targets_real_pr_986_declares_issue_507():
+    assert task_ref.also_closes_targets(_PR_986_FRAGMENT) == [507]
+
+
+def test_also_closes_targets_real_pr_952_declares_issue_661():
+    assert task_ref.also_closes_targets(_PR_952_FRAGMENT) == [661]
+
+
+def test_also_closes_targets_real_pr_841_declares_issue_786_with_class_word():
+    assert task_ref.also_closes_targets(_PR_841_FRAGMENT) == [786]
+
+
+def test_also_closes_targets_rejects_noun_form():
+    # Живой ложноположительный случай (тело PR #986, 2026-09-12): «закрытие»
+    # — существительное, не одна из глагольных форм списка. Тот же PR прямо
+    # пишет рядом, что #806 НЕ закрывается им (см. следующий тест) — открытый
+    # корень `закры[а-я]*` (первая попытка регэкспа) матчил бы оба фрагмента
+    # неразличимо; список конкретных форм отклоняет именно этот.
+    assert task_ref.also_closes_targets(_PR_986_FALSE_POSITIVE_FRAGMENT) == []
+
+
+def test_also_closes_targets_ignores_number_before_verb():
+    # «#806 — … не закрывается автоматически этим PR» — номер стоит ДО
+    # глагола, регэксп ищет номер СРАЗУ ПОСЛЕ глагола (см. докстринг
+    # _ALSO_CLOSES_RE) и это отрицание структурно не матчит.
+    assert task_ref.also_closes_targets(_PR_986_NEGATION_FRAGMENT) == []
+
+
+def test_also_closes_targets_mutation_open_root_regresses_on_986():
+    # Мутация: замени явный список форм на открытый корень (первая версия,
+    # отвергнутая экспериментом) — воспроизводим её здесь напрямую, не
+    # полагаясь на то, что кто-то повторит ту же правку в исходнике.
+    import re
+    open_root_re = re.compile(
+        r"(?i)\bзакры[а-яё]*\b(?:\s+(?:issue|класс))?\s*#(\d+)"
+    )
+    matches = [int(m.group(1)) for m in open_root_re.finditer(_PR_986_FALSE_POSITIVE_FRAGMENT)]
+    assert matches == [806], "мутация (открытый корень) обязана воспроизводить ложное срабатывание на #806"
+    # А явный список форм (актуальный код) — нет:
+    assert task_ref.also_closes_targets(_PR_986_FALSE_POSITIVE_FRAGMENT) == []
+
+
+def test_also_closes_targets_empty_text():
+    assert task_ref.also_closes_targets("") == []
+    assert task_ref.also_closes_targets(None) == []
+
+
+def test_also_closes_targets_dedupes_preserving_order():
+    text = "закрывает #10, а также закрывает #20 и снова закрывает #10."
+    assert task_ref.also_closes_targets(text) == [10, 20]
+
+
+def test_also_closes_targets_does_not_match_english_closing_directive():
+    # Русские глагольные формы не входят в список ключевых слов GitHub —
+    # `also_closes_targets` не пересекается с closing_keyword_refs (разные
+    # языки, разный признак), но проверяем явно: английская директива сама
+    # по себе не матчит русский маркер.
+    assert task_ref.also_closes_targets("Closes #413") == []
+
+
 # Мутация, которой доказан resolve_pr_task (#259, #394): временно замени тело
 # функции на `refs = sorted(set(extract_task_refs(pull.get("body") or "")));
 # return refs[0] if refs else None` (старая широкая семантика ai_review.py:353)
