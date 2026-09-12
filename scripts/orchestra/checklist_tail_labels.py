@@ -16,7 +16,8 @@ tail_issue_body`) прямо заявляет:
     «Область и приоритет — как у породившего PR»
 
 но labels, с которыми `create_pool_issue` реально заводит issue
-(scheduler.py:1906-1910), — только `["task"]`. Обещание не выполняется:
+(scheduler.py::after_merge; в main на момент этого PR — строки 2222-2226),
+— только `["task"]`. Обещание не выполняется:
 `scripts/lib/free_task.py::issue_priority_key` знает ровно два рычага
 приоритета — метку `area:process` (уровень 1) и число открытых задач,
 которые issue блокирует (уровень 2, граф `blockedBy`); без обоих хвост
@@ -41,7 +42,8 @@ tail_issue_body`) прямо заявляет:
 нового суждения).
 
 Точное place-to-fix в scheduler.py (для того, у кого нет конфликта с
-параллельными PR): scheduler.py:1906-1910 —
+параллельными PR): scheduler.py::after_merge, вызов `create_pool_issue`
+для хвоста (в main на момент этого PR — строки 2222-2226):
 
     created = pool_issue.create_pool_issue(
         gh, repo, tail_title,

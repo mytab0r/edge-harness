@@ -25,7 +25,7 @@ secret scanning алерты не читаются `security-events`, нужен
 PAT» относится к permission `security-events` (код-сканирование), не к
 отдельному `vulnerability-alerts`, который появился позже именно для этого
 случая. `.github/workflows/dependabot-alert-watch.yml` объявляет это право
-явно на уровне job. Живого замера права под `GITHUB_TOKEN` НЕТ (честно, не
+явно на уровне workflow. Живого замера права под `GITHUB_TOKEN` НЕТ (честно, не
 подтверждено): `workflow_dispatch` с ветки PR GitHub не даёт, а прогон с
 default-ветки возможен только ПОСЛЕ мержа — см. пост-мерж проверку в теле
 PR #964. Если предположение неверно, `gh api .../dependabot/alerts` отвечает
@@ -43,7 +43,7 @@ PR #964. Если предположение неверно, `gh api .../dependa
     `ALERT_FINGERPRINT_MARKER` в теле заведённой задачи И номер из
     детерминированного заголовка `alert_task_title` (`tracked_alert_numbers`
     читает оба). Одна задача — один алерт, повторный прогон не плодит вторую
-    (`dependabot_created_since`/`already_tracked`); потеря HTML-комментария
+    (`dependabot_created_since`/`tracked_alert_numbers`); потеря HTML-комментария
     правкой тела вторую задачу не заводит.
   - Суточный потолок — `DEPENDABOT_WATCH_DAILY_CAP` новых задач/сутки (по
     факту СОЗДАНИЯ, `state=all`, тот же приём, что `ci_failure_created_since`)

@@ -13,7 +13,8 @@
 # только code scanning): задокументировано GitHub, включено флагом
 # vulnerability-alerts-permission (fpt: '*' — весь github.com, см. докстринг
 # scripts/orchestra/dependabot_alert_watch.py). Без этого права запрос
-# отвечает 403 — видимый ⚠️ в отчёте (fail loud), не тихий пропуск.
+# отвечает 403 — 🚨 в отчёте и красный прогон (fail loud), не тихий пропуск
+# и не ⚠️ в зелёном step summary.
 name: dependabot-alert-watch
 
 on:
