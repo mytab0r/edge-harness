@@ -165,6 +165,34 @@ def test_find_candidates_skips_already_labeled():
     assert wog.find_candidates_for_auto_label(issues) == []
 
 
+def test_find_candidates_still_flags_already_resolved_issue():
+    """find_candidates_for_auto_label сама по себе НЕ знает про историю
+    решений (у неё нет комментариев) — фильтрует уже решённую задачу
+    ВЫЗЫВАЮЩИЙ (already_resolved), не эта функция. Живой случай #782."""
+    issues = [issue(782, NEW_FORMAT_BODY)]  # без метки, тело всё ещё несёт блок
+    assert [i["number"] for i in wog.find_candidates_for_auto_label(issues)] == [782]
+
+
+# ── already_resolved ──────────────────────────────────────────────────────
+
+
+def test_already_resolved_true_with_prior_decision_comment():
+    """Класс #782: тело не перестаёт нести блок вариантов после ответа
+    владельца — already_resolved обязана распознать прежнее «РЕШЕНИЕ: N»,
+    иначе find_candidates_for_auto_label переоткрывает решённый вопрос
+    на каждом пульсе (мутация — снять эту проверку, см. тест ниже)."""
+    assert wog.already_resolved(
+        NEW_FORMAT_BODY, ["РЕШЕНИЕ: 1\n\nПервый вариант, обоснование."]) is True
+
+
+def test_already_resolved_false_without_decision_comment():
+    assert wog.already_resolved(NEW_FORMAT_BODY, ["ещё обсуждаем"]) is False
+
+
+def test_already_resolved_false_without_comments():
+    assert wog.already_resolved(NEW_FORMAT_BODY, []) is False
+
+
 # ── decision_marker / find_resolved ─────────────────────────────────────────
 
 
@@ -299,6 +327,8 @@ def test_waiting_owner_check_auto_labels_new_candidate(monkeypatch):
             return [{"number": 500, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return []
+        if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
+            return []
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
     patch_gh(monkeypatch, fake)
@@ -308,6 +338,36 @@ def test_waiting_owner_check_auto_labels_new_candidate(monkeypatch):
     posted = [c for c in calls if c[0] == "-X" and c[1] == "POST" and "issues/500/labels" in c[2]]
     assert posted, "ожидался POST issues/500/labels"
     assert any(a == "labels[]=waiting:owner" for a in posted[0])
+
+
+def test_waiting_owner_check_does_not_relabel_already_resolved_issue(monkeypatch):
+    """Живой случай #782, воспроизведённый прогонами 2026-09-12 02:15Z-10:13Z:
+    задача без метки, тело всё ещё несёт блок вариантов, но комментарии уже
+    содержат «РЕШЕНИЕ: N» из прошлого прогона — POST labels НЕ вызывается,
+    прогон холостой (💗), а не 🏷️→✅ пинг-понг раз в пульс. Мутация: убрать
+    already_resolved-фильтр из waiting_owner_check — тест обязан покраснеть
+    (появится POST labels[]=waiting:owner и строка 🏷️)."""
+    calls = []
+
+    def fake(*args):
+        calls.append(args)
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
+            return [{"number": 782, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
+            return []
+        if url == f"repos/{REPO}/issues/782/comments?per_page=100&page=1":
+            return [{"body": "РЕШЕНИЕ: 1\n\nОбоснование выбора владельца.",
+                     "created_at": "2026-09-09T00:44:21Z"}]
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    lines = wog.waiting_owner_check(REPO, utc(12, 0))
+    assert lines == ["💗 waiting:owner: открытых задач с меткой нет"]
+    posted_label = [c for c in calls if c[0] == "-X" and c[1] == "POST" and "issues/782/labels" in c[2]]
+    assert posted_label == [], "уже решённая задача не должна получать метку заново"
 
 
 def test_waiting_owner_check_reports_failed_auto_label_not_silently(monkeypatch):
@@ -321,6 +381,8 @@ def test_waiting_owner_check_reports_failed_auto_label_not_silently(monkeypatch)
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return [{"number": 500, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
+            return []
+        if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
             return []
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
