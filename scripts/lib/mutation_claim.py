@@ -323,6 +323,32 @@ class MutationProofOutcome:
         return "\n".join(lines)
 
 
+def _git_apply(repo_root: Path, patch_text: str, *extra_args: str) -> PhaseResult:
+    """`git apply` со стабильным вводом патча через stdin.
+
+    Байты, не текст (находка ручного прогона #968 на Windows): `subprocess.
+    run(..., input=<str>, text=True)` пишет в stdin дочернего процесса через
+    `io.TextIOWrapper` с ПЛАТФОРМЕННЫМ переводом строк — на Windows любой
+    `\\n` внутри `patch_text` уходит в pipe как `\\r\\n`, `git apply` не
+    узнаёт контекстные строки и падает `patch does not apply`, хотя тот же
+    патч из ФАЙЛА (`git apply --check file.diff`, без прохода через
+    text-режим pipe) накладывается чисто. Кодируем сами (`errors=
+    "replace"` — тот же класс, что console_utf8.py уже применяет: PR-текст
+    не должен ронять этот вызов побитым непечатным символом), пишем как
+    bytes — перевода строк не происходит."""
+    result = subprocess.run(
+        ["git", "apply", *extra_args, "-"],
+        cwd=repo_root, input=patch_text.encode("utf-8", errors="replace"),
+        capture_output=True,
+    )
+    return PhaseResult(
+        "git apply " + " ".join(extra_args) if extra_args else "git apply",
+        result.returncode,
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
+    )
+
+
 def _run_test(repo_root: Path, target: str) -> PhaseResult:
     # PYTHONDONTWRITEBYTECODE — дочерний pytest не должен оставлять
     # __pycache__/ в дереве, за которым следит вызывающий код через
@@ -372,11 +398,8 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
             phases,
         )
 
-    check = subprocess.run(
-        ["git", "apply", "--check", "-"],
-        cwd=repo_root, input=claim.patch_text, capture_output=True, text=True, encoding="utf-8",
-    )
-    phases.append(PhaseResult("git apply --check", check.returncode, check.stdout, check.stderr))
+    check = _git_apply(repo_root, claim.patch_text, "--check")
+    phases.append(check)
     if check.returncode != 0:
         return MutationProofOutcome(
             "setup_error",
@@ -385,11 +408,8 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
             phases,
         )
 
-    apply_res = subprocess.run(
-        ["git", "apply", "-"],
-        cwd=repo_root, input=claim.patch_text, capture_output=True, text=True, encoding="utf-8",
-    )
-    phases.append(PhaseResult("git apply", apply_res.returncode, apply_res.stdout, apply_res.stderr))
+    apply_res = _git_apply(repo_root, claim.patch_text)
+    phases.append(apply_res)
     if apply_res.returncode != 0:
         return MutationProofOutcome(
             "setup_error",
@@ -402,11 +422,8 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
         mutated = _run_test(repo_root, claim.test_target)
         phases.append(PhaseResult("mutated (после снятия фикса)", mutated.returncode, mutated.stdout, mutated.stderr))
     finally:
-        revert = subprocess.run(
-            ["git", "apply", "-R", "-"],
-            cwd=repo_root, input=claim.patch_text, capture_output=True, text=True, encoding="utf-8",
-        )
-        phases.append(PhaseResult("git apply -R (возврат)", revert.returncode, revert.stdout, revert.stderr))
+        revert = _git_apply(repo_root, claim.patch_text, "-R")
+        phases.append(revert)
 
     if revert.returncode != 0:
         return MutationProofOutcome(
