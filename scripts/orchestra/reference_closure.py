@@ -86,7 +86,24 @@ fix/fixes/fixed/resolve/resolves/resolved — без перевода на др�
 нет исполнителя), и не отклонена ими же (эпик, #120, не task-labeled,
 конкурирующий PR, коммит не на main, улика fail/pending) — закрывается с
 комментарием-уликой; идемпотентность — маркер REFERENCE_CLOSURE_MARKER с
-номером ИМЕННО ЭТОГО PR (как ACCEPTANCE_*-маркеры штатной приёмки).
+номером ИМЕННО ЭТОГО PR (как ACCEPTANCE_*-маркеры штатной приёмки). Порядок
+записи — закрытие ПЕРВЫМ, маркер-комментарий вторым: сбой PATCH оставляет
+задачу открытой без маркера (следующий прогон повторяет попытку), а сбой
+комментария при уже закрытой задаче — громкая ⚠️-строка отчёта (закрытую
+задачу следующий прогон отсекает по state != open) — блокирующая находка
+ревью PR #1046, обратный порядок замораживал кандидата навсегда.
+
+## Носитель вызова (класс «потребитель без вызова — мёртвый код»)
+
+Модуль вызывается живым конвейером: шаг «Приёмка по ссылке» в
+`.github/workflows/orchestra.yml` (job `orchestra`, continue-on-error:
+красный шаг виден, но не гасит зелёный статус job'а, который читает пульс;
+GH_TOKEN + TELEGRAM_* — без них escalate вернёт «НЕ доставлен»; гейт квоты
+`steps.quota.outputs.skip` — тот же, что у scheduler/repo_invariants, шаг
+тяжёлый: пагинированный список слитых PR плюс compare API на кандидата).
+До этого PR модуль был мёртвым кодом — вызывался только руками; тест
+`test_pipeline_wiring_orchestra_yml_calls_reference_closure` краснеет при
+удалении шага (находка AI-ревью PR #1046, закрытие класса).
 
 ## Честная граница — что НЕ передаётся машине этим модулем
 
@@ -406,16 +423,24 @@ def merge_commit_on_main(repo: str, merge_commit_sha: str | None) -> bool:
     """True — merge_commit_sha реально предок (или равен) текущего main
     (#925: живая дыра, «зелёный прогон» цитировался для sha, не входящего в
     main). GitHub compare API: `status` "identical"/"behind" — sha уже в
-    main; "ahead"/"diverged" — нет (или compare недоступен — тоже нет,
-    fail loud вместо доверия)."""
+    main; "ahead"/"diverged" — нет. RuntimeError (сеть/рейт-лимит — класс
+    #454, а также неожиданный ответ API) НЕ гасится в False: «проверка
+    сломана» и «предок не подтверждён» — разные состояния, лечатся по-разному
+    (эскалация против отказа закрывать — AGENTS.md, «Алерт не гадает»);
+    исключение поднимается вызывающему, тот уходит в эскалационную ветку
+    REFERENCE_CLOSURE_ERROR_MARKER (#120), как уже делает для сбоя
+    compute_evidence. False — только пустой merge_commit_sha и ответ
+    "ahead"/"diverged"."""
     if not merge_commit_sha:
         return False
-    try:
-        payload = gh(f"repos/{repo}/compare/main...{merge_commit_sha}")
-    except RuntimeError:
-        return False
+    payload = gh(f"repos/{repo}/compare/main...{merge_commit_sha}")
     status = (payload or {}).get("status")
-    return status in ("identical", "behind")
+    if status in ("identical", "behind"):
+        return True
+    if status in ("ahead", "diverged"):
+        return False
+    raise RuntimeError(
+        f"compare main...{merge_commit_sha}: неожиданный ответ API (status={status!r})")
 
 
 def compute_evidence(repo: str, repo_root: Path, pull: dict) -> tuple[str, str]:
@@ -526,12 +551,31 @@ def run(repo: str) -> list[str]:
             continue
 
         comment = closure_comment(number, pr_number, decision["detail"])
+        # Закрытие ПЕРВЫМ, маркер-комментарий вторым (блокирующая находка
+        # ревью PR #1046). Обратный порядок замораживал кандидата навсегда:
+        # комментарий ушёл, PATCH упал (транзиент/рейт-лимит — класс #454),
+        # следующий прогон видел маркер и отвечал SKIP_ALREADY — задача
+        # оставалась открыта с комментарием «Закрываю.», ни перезапуска
+        # закрытия, ни эскалации (silent-wrong). В прямом порядке сбой
+        # PATCH оставляет задачу открытой и БЕЗ маркера — следующий прогон
+        # повторяет попытку целиком; сбой комментария при уже закрытой
+        # задаче — громкая ⚠️-строка, а не отложенный кандидат: закрытую
+        # задачу следующий прогон отсекает по state != open (SKIP_NOT_OPEN),
+        # перезакрытия и дублей комментария нет.
         try:
-            post_issue_comment(repo, number, comment)
             gh("-X", "PATCH", f"repos/{repo}/issues/{number}", "-f", "state=closed")
         except RuntimeError as error:
-            lines.append(f"⚠️ #{number}: закрытие не завершено — {error}")
+            lines.append(
+                f"⚠️ #{number}: закрытие не выполнено, маркер-комментарий не ставился — "
+                f"повтор на следующем прогоне — {error}")
             continue
+        try:
+            post_issue_comment(repo, number, comment)
+        except RuntimeError as error:
+            lines.append(
+                f"⚠️ #{number}: задача ЗАКРЫТА, но комментарий-улика с маркером "
+                f"не доставлен — доказательство остаётся только в отчёте этого "
+                f"прогона — {error}")
         try:
             lines.append(f"🔓 {claim_task.release(repo, number)}")
         except RuntimeError as error:

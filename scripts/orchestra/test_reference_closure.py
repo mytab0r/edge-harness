@@ -327,14 +327,18 @@ class _FakeIssueGh:
     патчатся отдельно, каждая на своей границе (см. интеграционные тесты
     ниже) — не пытаемся эмулировать пагинацию pulse_guard/review_labels."""
 
-    def __init__(self, issues):
+    def __init__(self, issues, order=None):
         self.issues = issues
         self.closed = []
+        # Общий с патченным post_issue_comment журнал порядка операций —
+        # носитель теста «закрытие раньше маркер-комментария».
+        self.order = order if order is not None else []
 
     def __call__(self, *args):
         if args[0] == "-X" and args[1] == "PATCH":
             number = int(args[2].split("/issues/")[1])
             self.closed.append(number)
+            self.order.append("patch")
             return None
         url = args[0]
         if url.startswith("repos/") and "/issues/" in url:
@@ -411,6 +415,207 @@ def test_run_reports_no_candidates_line_when_nothing_found(monkeypatch):
     monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [])
     lines = rc.run("mytab0r/edge-harness")
     assert len(lines) == 1 and lines[0].startswith("💗")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# merge_commit_on_main — «проверка сломана» не маскируется под «не предок»
+# (находка ревью PR #1046, чеклист) — AGENTS.md, «Алерт не гадает»
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class _FakeCompareGh:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return self.payload
+
+
+def test_merge_commit_on_main_true_for_identical_and_behind(monkeypatch):
+    for status in ("identical", "behind"):
+        fake = _FakeCompareGh(payload={"status": status})
+        monkeypatch.setattr(rc, "gh", fake)
+        assert rc.merge_commit_on_main("o/r", "abc123") is True
+
+
+def test_merge_commit_on_main_false_for_ahead_and_diverged(monkeypatch):
+    for status in ("ahead", "diverged"):
+        fake = _FakeCompareGh(payload={"status": status})
+        monkeypatch.setattr(rc, "gh", fake)
+        assert rc.merge_commit_on_main("o/r", "abc123") is False
+
+
+def test_merge_commit_on_main_false_only_for_empty_sha(monkeypatch):
+    # Пустой sha — проверять нечего, сеть не тратим вовсе.
+    fake = _FakeCompareGh()
+    monkeypatch.setattr(rc, "gh", fake)
+    assert rc.merge_commit_on_main("o/r", None) is False
+    assert fake.calls == []
+
+
+def test_merge_commit_on_main_api_failure_is_not_false(monkeypatch):
+    # RuntimeError (сеть/рейт-лимит — класс #454) НЕ превращается в False:
+    # отчёт не должен называть «коммит не предок main» (класс #925) там, где
+    # реальная причина — сбой вызова; исключение уходит вызывающему в
+    # эскалационную ветку REFERENCE_CLOSURE_ERROR_MARKER, как у
+    # compute_evidence.
+    fake = _FakeCompareGh(error="gh api repos/o/r/compare: HTTP 403 (рейт-лимит исчерпан)")
+    monkeypatch.setattr(rc, "gh", fake)
+    with pytest.raises(RuntimeError, match="403"):
+        rc.merge_commit_on_main("o/r", "abc123")
+
+
+def test_merge_commit_on_main_unexpected_payload_is_not_false(monkeypatch):
+    # Ответ без узнаваемого статуса — тоже «проверка сломана», не False.
+    fake = _FakeCompareGh(payload={"unexpected": True})
+    monkeypatch.setattr(rc, "gh", fake)
+    with pytest.raises(RuntimeError, match="неожиданный"):
+        rc.merge_commit_on_main("o/r", "abc123")
+
+
+def test_run_infra_failure_escalates_to_watchdog_with_dedup(monkeypatch):
+    # Сбой проверки улики (включая compare API после исправления выше) уходит
+    # в эскалацию #120 с дедупом на эпизод, а не в молчаливый/неверный skip.
+    fake = _FakeIssueGh(issues={507: _task_issue()})
+    escalated = []
+    posted_markers = []
+
+    def fake_escalate(repo, number, text, options=None):
+        escalated.append((number, text))
+        return "доставлен"
+
+    def fake_marker_times(repo, number, marker):
+        # Дедуп по факту доставки: маркер уже стоит на #120, если
+        # fake_escalate его уже писал.
+        return [object()] if marker in posted_markers else []
+
+    monkeypatch.setattr(rc, "gh", fake)
+    monkeypatch.setattr(rc, "escalate", fake_escalate)
+    monkeypatch.setattr(rc, "issue_marker_times", fake_marker_times)
+    monkeypatch.setattr(
+        rc, "merge_commit_on_main",
+        lambda repo, sha: (_ for _ in ()).throw(RuntimeError("compare API недоступен")))
+    monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [_PR_986])
+    monkeypatch.setattr(rc.scheduler, "open_pulls", lambda repo: [])
+
+    lines1 = rc.run("mytab0r/edge-harness")
+    assert len(escalated) == 1
+    assert escalated[0][0] == rc.WATCHDOG_ISSUE
+    assert "compare API недоступен" in escalated[0][1]
+    assert rc.REFERENCE_CLOSURE_ERROR_MARKER in escalated[0][1]
+
+    posted_markers.append(f"{rc.REFERENCE_CLOSURE_ERROR_MARKER} #507 PR #986")
+    lines2 = rc.run("mytab0r/edge-harness")
+    assert len(escalated) == 1  # повторного алерта нет
+    assert any("уже эскалировано" in line for line in lines2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Порядок записи: закрытие ПЕРВЫМ, маркер-комментарий вторым (блокирующая
+# находка ревью PR #1046 — обратный порядок замораживал кандидата навсегда)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _happy_run_mocks(monkeypatch, fake, posted, order):
+    monkeypatch.setattr(rc, "gh", fake)
+    monkeypatch.setattr(
+        rc, "post_issue_comment",
+        lambda repo, number, text: (posted.append(number), order.append("comment")))
+    monkeypatch.setattr(rc, "issue_marker_times", lambda repo, number, marker: [])
+    monkeypatch.setattr(rc, "merge_commit_on_main", lambda repo, sha: True)
+    monkeypatch.setattr(rc, "compute_evidence", lambda repo, root, pull: ("docs", "файлы на месте"))
+    monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [_PR_986])
+    monkeypatch.setattr(rc.scheduler, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(rc.claim_task, "release", lambda repo, number: "ok")
+
+
+def test_run_closes_before_posting_marker_comment(monkeypatch):
+    order = []
+    fake = _FakeIssueGh(issues={507: _task_issue()}, order=order)
+    posted = []
+    _happy_run_mocks(monkeypatch, fake, posted, order)
+
+    rc.run("mytab0r/edge-harness")
+
+    assert order == ["patch", "comment"], (
+        "PATCH закрытия обязан идти раньше маркер-комментария: сбой комментария "
+        "при закрытой задаче — громкий ⚠️, а сбой PATCH при стоящем маркере — "
+        "вечный кандидат с комментарием «Закрываю.»")
+
+
+class _FlakyPatchGh(_FakeIssueGh):
+    """PATCH падает первым вызовом (транзиент/рейт-лимит, класс #454),
+    дальше работает."""
+
+    def __init__(self, issues, order):
+        super().__init__(issues, order)
+        self.patch_attempts = 0
+
+    def __call__(self, *args):
+        if args[0] == "-X" and args[1] == "PATCH":
+            self.patch_attempts += 1
+            if self.patch_attempts == 1:
+                raise RuntimeError("HTTP 403: рейтинг-лимит исчерпан")
+        return super().__call__(*args)
+
+
+def test_run_patch_failure_no_marker_no_close_retry_next_run(monkeypatch):
+    # Сбой PATCH: задача остаётся открытой и БЕЗ маркера — следующий прогон
+    # повторяет попытку целиком, не упирается в SKIP_ALREADY (это и есть
+    # отличие от старого порядка, где маркер стоял до закрытия).
+    order = []
+    fake = _FlakyPatchGh(issues={507: _task_issue()}, order=order)
+    posted = []
+    _happy_run_mocks(monkeypatch, fake, posted, order)
+
+    lines1 = rc.run("mytab0r/edge-harness")
+    assert not posted, "комментарий-маркер при несостоявшемся закрытии не ставится"
+    assert not fake.closed
+    assert any("закрытие не выполнено" in line for line in lines1)
+
+    lines2 = rc.run("mytab0r/edge-harness")  # имитация следующего прогона
+    assert 507 in fake.closed
+    assert posted == [507]
+    assert any("✅ #507" in line for line in lines2)
+
+
+def test_run_comment_failure_after_close_is_loud_not_frozen(monkeypatch):
+    # Сбой комментария при уже закрытой задаче: громкая ⚠️-строка, задача
+    # остаётся закрытой, попытка засчитана — следующий прогон отсечёт её по
+    # state != open, вечного кандидата нет.
+    order = []
+    fake = _FakeIssueGh(issues={507: _task_issue()}, order=order)
+    posted = []
+    _happy_run_mocks(monkeypatch, fake, posted, order)
+
+    def failing_comment(repo, number, text):
+        raise RuntimeError("комментарий не доставлен")
+
+    monkeypatch.setattr(rc, "post_issue_comment", failing_comment)
+
+    lines = rc.run("mytab0r/edge-harness")
+
+    assert 507 in fake.closed
+    assert any("⚠️" in line and "ЗАКРЫТА" in line for line in lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Проводка в конвейер: шаг orchestra.yml — носитель вызова (класс
+# «потребитель без вызова — мёртвый код», блокирующая находка ревью PR #1046)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_pipeline_wiring_orchestra_yml_calls_reference_closure():
+    yml_path = _DIR.parent.parent / ".github" / "workflows" / "orchestra.yml"
+    yml = yml_path.read_text(encoding="utf-8")
+    assert "python scripts/orchestra/reference_closure.py" in yml, (
+        "шаг «Приёмка по ссылке» удалён из orchestra.yml — модуль снова "
+        "мёртвый код: класс #507/#661/#786 возвращается к ручной ревизии")
 
 
 # ══════════════════════════════════════════════════════════════════════════

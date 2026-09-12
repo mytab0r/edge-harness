@@ -125,6 +125,33 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/orchestra/repo_invariants.py --orchestra
 
+      # Приёмка по ссылке (#1042) — второй закрывающий рядом со штатной
+      # приёмкой в шаге планировщика выше: accept_merged_tasks закрывает
+      # задачу, названную ИМЕНЕМ ВЕТКИ слитого PR, этот шаг закрывает задачи,
+      # которые слитый PR ЯВНО заявляет ЧУЖИМИ (строгий маркер
+      # «закрывает/закрыл/закрыт #N» в теле — scripts/lib/task_ref.py::
+      # also_closes_targets; русские слова GitHub как директиву не
+      # распознаёт, автозакрытия при мерже нет — запрет Closes/Fixes/Resolves
+      # не задет). Улика — те же категории, что у штатной приёмки
+      # (classify_acceptance/deploy_evidence/script_evidence/docs_missing),
+      # плюс «коммит слияния — предок main» (класс #925); потолок закрытий
+      # за прогон, газ и честная граница — докстринг
+      # scripts/orchestra/reference_closure.py. Гейт квоты — как у соседних
+      # тяжёлых шагов выше (пагинированный список слитых PR + compare API
+      # на кандидата); continue-on-error — тот же приём, что у гвардий ниже:
+      # красный шаг виден (fail loud), но не гасит зелёный статус job'а,
+      # который читает пульс (heartbeat_check, #120).
+      - name: Приёмка по ссылке — чужие задачи слитого PR (#1042)
+        if: steps.quota.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Тот же канал эскалации, что у шагов выше (#120) — без него
+          # pulse_guard.escalate всегда вернёт «НЕ доставлен» (нет токена/чата).
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/reference_closure.py
+
       # Гвардия «протухшей» метки blocked (#334): чисто читающий шаг, ничего
       # не блокирует и не решает вместо владельца (снятие метки — по-прежнему
       # ручное, docs/agents/LABELS.md). continue-on-error нарочно: красный шаг
