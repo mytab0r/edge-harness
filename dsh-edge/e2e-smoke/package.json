@@ -2,7 +2,7 @@
   "name": "dsh-edge-e2e-smoke",
   "private": true,
   "version": "1.0.0",
-  "description": "Generic browser smoke для морды dsh-edge (issue #502): playwright-core под системным Chrome раннера, без загрузки браузерных бинарников Playwright.",
+  "description": "Generic browser smoke для морды dsh-edge: playwright-core под системным Chrome раннера, без загрузки браузерных бинарников Playwright. smoke.mjs — против прода (issue #502), pr-check.mjs — против локального unstable_dev на PR до мержа (issue #600); обход вкладок и сбор находок общие (browser-walk.mjs).",
   "type": "module",
   "dependencies": {
     "playwright-core": "1.63.0"
