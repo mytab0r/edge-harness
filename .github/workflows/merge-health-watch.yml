@@ -1,10 +1,10 @@
 # Детектор регрессии здоровья конвейера, привязанный к слиянию (issue #967,
-# живой корень #878/#937): часовое rolling-сравнение worker_success_rate
-# «недавнее окно» vs «длинный baseline» — часы, не сутки, в отличие от
-# суточного снимка `pipeline_health.py`/`health_regression.py` (тот же класс
-# метрики, другой шаг наблюдения, design.md openspec/changes/
-# merge-triggered-health-regression). Отдельный файл, не правка orchestra.yml
-# (та территория занята параллельной работой — см. issue #967) и не правка
+# живой корень #878/#937): worker_success_rate «недавнее окно» против
+# АБСОЛЮТНОГО порога (не относительное отклонение от baseline — ревизия 2,
+# см. design.md в openspec/changes/archive/merge-triggered-health-regression)
+# — часы, не сутки, в отличие от суточного снимка `pipeline_health.py`/
+# `health_regression.py`. Отдельный файл, не правка orchestra.yml (та
+# территория занята параллельной работой — см. issue #967) и не правка
 # каденса самого пульса.
 #
 # Ни один шаг этого workflow не пишет в git — только чтение Actions/Issues/
@@ -18,7 +18,7 @@ name: merge-health-watch
 on:
   schedule:
     # Часовой каденс — тот же порядок величины, что OBSERVATION_WINDOW_HOURS
-    # (6ч) в merge_health_watch.py: детектор обязан успеть заметить регрессию
+    # (8ч) в merge_health_watch.py: детектор обязан успеть заметить регрессию
     # в пределах наблюдательного окна, не только на его границе.
     - cron: "17 * * * *"
   workflow_dispatch:

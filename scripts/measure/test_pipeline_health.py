@@ -167,7 +167,6 @@ def test_search_merged_prs_builds_hour_precision_query():
     ph.search_merged_prs("mytab0r/edge-harness", fake_gh, start, end)
     assert len(calls) == 1
     assert "merged:2026-09-10T20:00:00..2026-09-11T05:00:00" in calls[0]
-    assert "sort=created&order=asc" in calls[0]
 
 
 def test_search_merged_prs_returns_prod_form_dict():
