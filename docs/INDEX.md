@@ -75,6 +75,7 @@
 - [0015. Инбокс создаёт issues репозиторным dispatch'ем в свой job — без нового секрета](decisions/0015-inbox-dispatch-no-new-secret.md)
 - [0016. Конкуренция за код не устраняется приёмом регистрации: границы параллельной работы](decisions/0016-parallel-work-on-shared-code-boundaries.md)
 - [0017. Второй гейт морды dsh-edge: e2e-смоук на PR против локального воркера](decisions/0017-dsh-edge-pr-smoke-local-worker.md)
+- [0018. Носитель класса «тест зависит от настенных часов» — freezegun, не libfaketime](decisions/0018-clock-shift-freezegun.md)
 
 ## Операционные процедуры
 

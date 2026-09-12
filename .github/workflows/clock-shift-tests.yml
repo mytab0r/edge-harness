@@ -1,0 +1,72 @@
+# Носитель на класс «тест зависит от настенных часов и покраснеет в будущем»
+# (#649). Не статический анализ (grep по `datetime.now(`/`utcnow(`/`time.time()`/
+# `date.today(` не различает опасный паттерн от сдвиго-инвариантного без
+# dataflow) — прогон ВСЕГО набора тестов со сдвинутым системным «сейчас»
+# (scripts/conftest.py, freezegun) на нескольких горизонтах
+# (scripts/measure/clock_shift_suite.py::HORIZON_DAYS, обоснование числами —
+# докстринг того файла). Живой случай, оплативший это решение: #643/#646 —
+# фикстура 2026-08-31 против MAX_CAMPAIGN_DAYS=7 покраснела в проде 2026-09-07
+# и держала обязательный `test` (защита main) без единого алерта.
+#
+# НЕ в обязательном гейте `test` (repo-ci.yml): класс медленный (4 горизонта ×
+# полный прогон scripts/, ~5-6 мин каждый — не цена каждого PR) и не относится
+# к дифу конкретного PR (та же логика, что у периодических инвариантов
+# repo_invariants.py в orchestra.yml). Расписание раз в сутки — самый быстрый
+# известный календарный порог кода (MAX_CAMPAIGN_DAYS=7 = 168ч) даёт минимум
+# неделю запаса на реакцию при ежедневном прогоне; операционные пороги короче
+# суток (UNHEALTHY_PR_AFTER_MINUTES=120, HEARTBEAT_MAX_AGE_MINUTES=45 и т.п. в
+# pulse_guard.py) — не календарные фикстуры, к этому классу не относятся.
+# Минута cron сдвинута с четверти часа (та же причина, что у
+# dispatch-latency-probe.yml — задокументированный пик нагрузки schedule,
+# docs/research/21-github-actions.md).
+#
+# Потребитель красного — failure_watch (scripts/orchestra/pulse_guard.py,
+# WATCHED_WORKFLOWS): падение любого горизонта заводит задачу пула с текстом
+# на языке последствий (clock_shift_suite.py::consequence_message), тем же
+# путём, что уже есть для worker.yml/hands.yml/orchestra.yml/deploy-*.yml —
+# второй канал сигнала не заводим (AGENTS.md «Тормоз без газа не
+# принимается»: газ здесь — обычный цикл починки бомбы агентом, как #643).
+name: clock-shift-tests
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clock-shift:
+    runs-on: ubuntu-latest
+    # Полный прогон горизонта — ~6 мин (замер прогона 2026-09-10); потолок
+    # соседей: worker.yml 280, hands.yml 70. Без потолка зависший pytest жёг бы
+    # 6-часовой лимит job'а молча; таймаут виден failure_watch'у (timed_out у
+    # него в списке исходов) — задача заведётся тем же путём, что и красный
+    # прогон.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Одно место правды горизонтов — scripts/measure/clock_shift_suite.py
+        # (HORIZON_DAYS); здесь буквальный список, потому что GitHub Actions
+        # не умеет читать matrix из внешнего файла на этапе планирования job'ов
+        # (гвардия синхронности — test_clock_shift_suite.py::
+        # test_workflow_matrix_stays_in_sync_with_horizon_days, читает этот
+        # файл через yaml.safe_load и сверяет со списком).
+        horizon_days: [1, 8, 40, 400]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости прогона (pytest + freezegun — сдвиг часов, без него conftest падает громко)
+        run: pip install --quiet pytest pyyaml freezegun
+
+      - name: Юнит-слой носителя — тот же файл гвардии, что в repo-ci (одно место правды списка тестов)
+        run: bash scripts/ci/guards/clock-shift-unit-layer.sh
+
+      - name: Полный набор тестов со сдвигом +${{ matrix.horizon_days }}д
+        run: python scripts/measure/clock_shift_suite.py --horizon-days ${{ matrix.horizon_days }}
