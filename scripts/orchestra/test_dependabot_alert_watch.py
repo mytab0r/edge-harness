@@ -177,11 +177,12 @@ def test_dependabot_alert_watch_skips_pulse_when_pool_read_fails(monkeypatch):
 
 
 def test_open_dependabot_alerts_non_list_error_shape_raises(monkeypatch):
-    """Живой пост-мерж прогон 2026-09-12 (run 34681294715): эндпоинт
-    Dependabot alerts НЕ поддерживает page-пагинацию — реальное тело ответа
-    (HTTP 400, скопировано из прогона как прод-форма); не-list ответ обязан
-    красить прогон (RuntimeError), не читаться как «алертов нет»
-    (класс #120A)."""
+    """Класс #120A: не-list ответ (dict) обязан красить прогон RuntimeError'ом,
+    не читаться как «алертов нет». Тело ниже — реальный dict HTTP 400 из
+    живого прогона 2026-09-12 (run 34681294715), взятый как ФОРМА ответа
+    об ошибке: сам этот запрос (с `&page=1`) новый код уже не шлёт, до
+    функции в таком виде не доходит — проверяется обработка формы, не
+    конкретная причина."""
     fake = FakeGh({
         "dependabot/alerts?state=open": {
             "message": "Pagination using the `page` parameter is not supported.",
@@ -471,13 +472,31 @@ def test_dependabot_alert_watch_propagates_alert_list_read_failure(monkeypatch):
         daw.dependabot_alert_watch(REPO, NOW)
 
 
-def test_main_returns_nonzero_when_alert_list_read_fails(monkeypatch):
+def test_main_returns_nonzero_when_alert_list_read_fails(monkeypatch, capsys):
     fake = FakeGh({"dependabot/alerts?state=open": RuntimeError("gh api dependabot/alerts: HTTP 403")})
     patch_gh(monkeypatch, fake)
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
     assert daw.main() == 1
+    # 403 — подсказка о праве уместна: причина названа данными ошибки
+    assert "право vulnerability-alerts: read" in capsys.readouterr().err
+
+
+def test_main_does_not_guess_right_when_full_page(monkeypatch, capsys):
+    """Находка AI-ревью PR #1013 (класс «Алерт не гадает»): состояние
+    «полная страница» говорит о курсорной пагинации, а не о праве —
+    фикс-гипотеза «право отсутствует» в тексте 🚨 ложна и уводит
+    владельца проверять токен вместо дочитывания хвоста."""
+    fake = FakeGh({"dependabot/alerts?state=open": [REAL_SHARP_ALERT] * 100})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    assert daw.main() == 1
+    err = capsys.readouterr().err
+    assert "полную страницу" in err
+    assert "право vulnerability-alerts: read" not in err
 
 
 def test_main_returns_zero_on_healthy_run(monkeypatch):
