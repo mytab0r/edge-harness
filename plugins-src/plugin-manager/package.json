@@ -1,7 +1,7 @@
 {
   "name": "@edge-harness/dsh-plugin-manager",
-  "version": "0.1.9",
-  "description": "Client plugin: Plugins settings section for the dsh-edge web roster — manifest inventory, journal statuses, orderable catalog and plugin ordering (#102, #113)",
+  "version": "0.1.10",
+  "description": "Client plugin: Plugins settings section for the dsh-edge web roster — manifest inventory, journal statuses, orderable catalog and plugin ordering (#102, #113). Версия поднята issue #806: dsh-edge/plugins.json обзавёлся 6-м плагином (agents-tasks, коммит 0a85ddf5) без пересборки — вшитый MANIFEST релиза plugins-plugin-manager-v0.1.9 несёт старый состав из 5. Форж не может переиздать тот же тег — бамп открывает дорогу конвейеру #80 (пост-мерж сценарий в теле PR).",
   "type": "module",
   "exports": {
     "./client": "./client/client.js",

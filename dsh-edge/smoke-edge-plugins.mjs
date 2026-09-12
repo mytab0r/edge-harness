@@ -165,8 +165,9 @@ import SettingsProvider from '@deepseek-ai/dsh-settings'
 
 // Сервисы, без которых плагины морды не монтируются: LlmRuntime ('llm' —
 // inject плагина реестра провайдеров #378) и провайдер настроек ('settings' —
-// шов installSettingsSection). In-memory SettingsProvider: persist — no-op
-// (write() сам кладёт раздел в this.document), load() отдаёт текущий документ.
+// шов ctx.settings.installSection, метод сервиса с dsh-settings 0.1.2-rc.1,
+// см. issue #806/#507). In-memory SettingsProvider: persist — no-op (write()
+// сам кладёт раздел в this.document), load() отдаёт текущий документ.
 class MemorySettingsProvider extends SettingsProvider {
   writable = true
   async load() { return this.document }
