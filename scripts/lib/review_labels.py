@@ -296,12 +296,23 @@ def list_pr_files(repo: str, pr: int, gh_func) -> list[dict]:
     return list_pages(f"repos/{repo}/pulls/{pr}/files?per_page=100", gh_func)
 
 
-def list_pages(url: str, gh_func) -> list[dict]:
+def list_pages(url: str, gh_func, max_pages: int | None = None) -> list[dict]:
     """Обход постранично любого списочного эндпоинта GitHub API до короткой
     страницы — та же форма, что list_pr_files/list_timeline выше, обобщённая
     на URL целиком (класс #308: место общее для любого списка, а не только
     files/timeline). `url` уже несёт свои query-параметры, включая
     `per_page=100`; листание добавляет `&page=N`.
+
+    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (по умолчанию
+    `None` — вся история, прежнее поведение). Список идёт от новых записей к
+    старым, поэтому самый свежий элемент лежит на первой странице, пока после
+    него не накопилось 100 более новых — ограничение для вызывающих, чья
+    стоимость одного тика не должна расти с историей (found: ревью PR #607 —
+    гейт сторожа квот тикает на каждое PR-событие и по cron, а #120 копит
+    сотни комментариев; бюджет `github.token` — 1000 запросов/час на
+    репозиторий, docs/research/21, «API-лимиты»). Обрезка по `max_pages` —
+    не «элементов больше нет» и не подпадает под fail loud на форме ответа
+    ниже: вызывающий сознательно просит частичный, самый свежий срез.
 
     Найдено на живом репозитории (2026-09-05): `open_task_issues` и
     `open_pulls` в scheduler.py читали сырую первую страницу
@@ -363,6 +374,8 @@ def list_pages(url: str, gh_func) -> list[dict]:
                 "«элементов больше нет» (AGENTS.md fail loud, дефект #120A)")
         items.extend(chunk)
         if len(chunk) < 100:
+            break
+        if max_pages is not None and page >= max_pages:
             break
         page += 1
     return items

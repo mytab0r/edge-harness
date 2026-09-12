@@ -423,6 +423,55 @@ def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch)
     assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
+def test_escalation_channel_failed_is_the_single_verdict_of_both_channels_silent():
+    """«Оба канала молчат» — критерий живёт рядом с escalate (found: ревью
+    PR #607, некритичное замечание: у критерия были вторые копии в
+    quotas.py::main и quota_watch._channel_failed). Мутация: переименуй или
+    измени формат возврата escalate так, что «НЕ доставлен»/«НЕ оставлен»
+    разошлись с предикатом — тест краснеет вместе с вызывающими."""
+    assert pg.escalation_channel_failed("Telegram: НЕ доставлен; след в #120: НЕ оставлен") is True
+    assert pg.escalation_channel_failed("Telegram: доставлен; след в #120: НЕ оставлен") is False
+    assert pg.escalation_channel_failed("Telegram: НЕ доставлен; след в #120: оставлен") is False
+
+
+def test_escalation_dedup_carrier_failed_is_the_single_verdict_of_dedup_carrier_lost():
+    """«Сигнал ушёл, а носитель дедупа нет» — пара к escalation_channel_failed
+    (found: ревью PR #607, head 5824e75: гейт сторожа квот выбрасывал вердикт
+    доставки stale_alert — при живом Telegram и персистентно падающем следе в
+    #120 страница повторялась бы каждый тик, и ни один прогон не краснел).
+    Мутация: переименуй предикат или разойди его с форматом возврата escalate
+    — тест краснеет вместе с вызывающими."""
+    assert pg.escalation_dedup_carrier_failed("Telegram: доставлен; след в #120: НЕ оставлен") is True
+    assert pg.escalation_dedup_carrier_failed("Telegram: НЕ доставлен; след в #120: НЕ оставлен") is False
+    assert pg.escalation_dedup_carrier_failed("Telegram: доставлен; след в #120: оставлен") is False
+    assert pg.escalation_dedup_carrier_failed("Telegram: НЕ доставлен; след в #120: оставлен") is False
+
+
+def test_carrier_write_verdict_and_its_predicate_visibility():
+    """Тихая запись носителя дедупа (первое наблюдение ресурса в норме:
+    маркер без эскалации, quota_alert.check_and_alert) возвращает вердикт
+    той же лексики, что escalate, и литералы рождаются в pulse_guard рядом
+    с предикатами (found: ревью PR #607, head 345a64f — раньше отказ тихой
+    записи возвращался строкой «маркер НЕ записан», которую вызывающий не
+    прогонял ни через один предикат, и носитель дедупа мог стоять сломанным
+    неограниченно долго при зелёных прогонах). Мутации: (1) измени формат
+    carrier_write_verdict так, что «НЕ оставлен» разошёлся с предикатом —
+    тест краснеет вместе с quota_alert; (2) верни в quota_alert
+    немаркированную строку отказа — test_first_observation_marker_write_
+    failure_is_predicate_visible краснеет."""
+    ok = pg.carrier_write_verdict(120, True)
+    assert "не требовалось" in ok          # Telegram-плеча у тихой записи нет вовсе
+    assert "оставлен" in ok and "НЕ оставлен" not in ok
+    assert pg.escalation_dedup_carrier_failed(ok) is False   # успех — зелёный
+    assert pg.escalation_channel_failed(ok) is False
+
+    failed = pg.carrier_write_verdict(120, False, "HTTP 403: закрытая задача")
+    assert "НЕ оставлен" in failed
+    assert "HTTP 403: закрытая задача" in failed  # причина дословно, не гипотеза
+    assert pg.escalation_dedup_carrier_failed(failed) is True
+    assert pg.escalation_channel_failed(failed) is False     # «не требовалось» ≠ «НЕ доставлен»
+
+
 def test_merge_telegram_text_is_short_clickable_and_escaped():
     text = pg.merge_telegram_text("mytab0r/edge-harness", 405, 170,
                                   "Telegram: «задача выполнена» на открытый PR — врёт, а про слияние в main не сообщает")

@@ -116,6 +116,10 @@ EXPECTED_WORKFLOWS = frozenset({
     # LLM-провайдеров) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
     # использует, тот же класс, что secret-scan.yml/worker-ci.yml выше.
     "provider-latency-bench.yml",
+    # #605: непрерывный сторож квот, только github.token (actions:read,
+    # issues:write) + секреты CLOUDFLARE_*/TELEGRAM_* — ни GH_DISPATCH_TOKEN,
+    # ни GH_PIPELINE_PAT не читает, тот же класс, что quotas.yml ниже.
+    "quota-watch.yml",
     "quotas.yml",
     "repo-ci.yml",
     # #634: gitleaks-гейт PR + периодический полный прогон истории. Читает

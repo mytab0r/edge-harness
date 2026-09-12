@@ -302,3 +302,43 @@ def test_build_data_query_limit_matches_check_not_truncated_constant():
     # и то же число — раздельные литералы уже расходились бы незаметно.
     query = mod.build_data_query("durableObjectsPeriodicGroups", "range", ["rowsRead"], ["date"])
     assert f"limit: {mod.GRAPHQL_ROW_LIMIT}" in query
+
+
+# ── today_rows_read: одно число за сегодня (#605, scripts/measure/quota_watch.py) ───
+# Тот же приём, что у остальных тестов этого файла: сеть не трогаем — сами
+# швы (discover_dataset/fetch_rows) уже покрыты своими тестами выше, здесь
+# проверяется только склейка в одно число.
+
+
+def test_today_rows_read_returns_single_number(monkeypatch):
+    monkeypatch.setattr(mod, "discover_dataset", lambda token: {
+        "dataset": "durableObjectsPeriodicGroups",
+        "sum_field_names": {"rowsRead", "rowsWritten"},
+        "dim_field_names": {"date", "datetimeHour"},
+        "filter_field_names": {"date_geq", "date_leq"},
+    })
+    seen = {}
+
+    def fake_fetch_rows(token, account_id, query, shape, day, start, end):
+        seen["args"] = (token, account_id, shape, day, start, end)
+        return [{"sum": {"rowsRead": 123456}, "dimensions": {"date": day.isoformat()}}]
+
+    monkeypatch.setattr(mod, "fetch_rows", fake_fetch_rows)
+    assert mod.today_rows_read("tok", "acct") == 123456
+    # Один день, не диапазон — start == end == day (сегодня), не "days=7" run().
+    _, _, _, day, start, end = seen["args"]
+    assert day == start == end
+
+
+def test_today_rows_read_sums_multiple_rows_of_the_same_day(monkeypatch):
+    monkeypatch.setattr(mod, "discover_dataset", lambda token: {
+        "dataset": "durableObjectsPeriodicGroups",
+        "sum_field_names": {"rowsRead"},
+        "dim_field_names": {"datetimeHour"},
+        "filter_field_names": {"date"},
+    })
+    monkeypatch.setattr(mod, "fetch_rows", lambda *a, **k: [
+        {"sum": {"rowsRead": 100}, "dimensions": {"datetimeHour": "2026-09-06T00:00:00Z"}},
+        {"sum": {"rowsRead": 250}, "dimensions": {"datetimeHour": "2026-09-06T01:00:00Z"}},
+    ])
+    assert mod.today_rows_read("tok", "acct") == 350
