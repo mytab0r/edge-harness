@@ -108,6 +108,10 @@ source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
 # Аренда задачи (#121): claim/release/locks — единственный вход в работу.
 # shellcheck source=scripts/lib/lease.sh
 source "$SCRIPT_DIR/../lib/lease.sh"
+# PATH-шим gh (#594): агент DSH внутри этого воркера физически не может
+# открыть PR голым `gh pr create` в обход scripts/git/pr-create.
+# shellcheck source=scripts/lib/gh_shim.sh
+source "$SCRIPT_DIR/../lib/gh_shim.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-1200}"   # 20 минут за попытку ОДНОГО провайдера (#877, см. обоснование в шапке файла)
@@ -563,6 +567,12 @@ export DSH_EDGE_SESSION_ID="$HARNESS_SID_ACTUAL"
 echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
 
 # ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
+# PATH-шим gh (#594) — ставится ДО первого запуска dsh (шаг 7): dsh наследует
+# PATH этого процесса как обычный subprocess, поэтому агент внутри сессии
+# физически не находит настоящий `gh pr create` раньше шима. Ломается видимо
+# (die), не тихой деградацией до старого поведения — см. gh_shim_install.
+gh_shim_install "$WORK/gh-shim" || die "gh-шим не установился — см. ::error:: выше"
+
 dsh_install "$WORK/pkgs"
 dsh --version || true
 dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
