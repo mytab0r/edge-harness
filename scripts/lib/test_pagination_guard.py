@@ -119,6 +119,15 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "scheduler.worker_runs_active/stalled_worker_run выше (#955): вопрос "
         "«есть ли ХОТЯ БЫ ОДИН прогон на этот head_sha», не список, серверный "
         "фильтр `head_sha=` уже сужает выборку до прогонов одного коммита.",
+    ("scripts/measure/pipeline_health.py", "search_merged_prs"):
+        "окно атрибуции короткое (часы, не сутки — issue #967, "
+        "merge_health_watch.py::fetch_suspects), второй страницы на практике "
+        "не бывает — тот же приём, что уже честно принят "
+        "`merge_throughput_from_search`/суточным merge_throughput этого же "
+        "модуля (не листают Search API). `total_count` сверх `len(items)` — "
+        "не тихая потеря: вызывающая сторона (`suspects_from_search`) "
+        "получает оба числа и обязана предупредить о truncated (см. её "
+        "докстринг и `render_report`), не молчаливо теряет хвост.",
 }
 
 
