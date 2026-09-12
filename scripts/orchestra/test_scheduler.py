@@ -3198,6 +3198,93 @@ def test_dispatch_conflict_rework_uses_free_slot_when_one_worker_slot_busy(monke
     )
 
 
+def test_dispatch_ai_review_rework_uses_free_slot_when_one_worker_slot_busy(monkeypatch):
+    # #827: тот же перевод на free_worker_slot, что уже сделан для
+    # dispatch_conflict_rework выше — один занятый слот не молчит доводку
+    # целиком, dispatch уходит во второй, свободный слот.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["ai:changes-requested"], ref="agent/474-ai-rework")
+    fake = FakeGh({
+        "pulls/560/files?per_page=100": [],
+        "issues/560/comments?per_page=100": [],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [workflow_run_at_slot(33814313381, "in_progress", 1)]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "-X DELETE repos/mytab0r/edge-harness/issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "замок снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert any("#560" in line and "worker.yml запущен адресно" in line for line in actions)
+    assert any(
+        c.startswith(f"-X POST repos/{REPO}/actions/workflows/worker.yml/dispatches")
+        and "inputs[task]=474" in c and "inputs[slot]=2" in c
+        for c in fake.mutating_calls()
+    )
+
+
+def test_dispatch_ai_review_rework_silent_while_both_worker_slots_busy(monkeypatch):
+    # #827: молчание требует ОБА слота занятыми, не «воркер вообще активен».
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["ai:changes-requested"], ref="agent/474-ai-rework")
+    fake = FakeGh({
+        "pulls/560/files?per_page=100": [],
+        "issues/560/comments?per_page=100": [],
+        "workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [
+                workflow_run_at_slot(33814313381, "in_progress", 1),
+                workflow_run_at_slot(33814313382, "in_progress", 2),
+            ]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("оба слота заняты — не пишем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("оба слота заняты — не трогаем задачу"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("заняты" in line and "#560" in line for line in observations)
+    assert task["assignees"] != []  # задача не тронута
+    assert not any(c.startswith("-X DELETE") for c in fake.calls)
+
+
+def test_dispatch_ai_review_rework_observes_blocked_task_instead_of_silent_skip(monkeypatch):
+    # #827, дефект наблюдаемости (живой случай PR #261/#262): задача с меткой
+    # blocked раньше пропадала из рассмотрения без единой строки в логе —
+    # мутация-гвардия: убери observations.append в ветке _issue_is_blocked
+    # (scripts/orchestra/scheduler.py, dispatch_ai_review_rework) — этот тест
+    # покраснеет.
+    task = issue(474, assignees=("mytab0r",), labels=["task", "blocked"])
+    p = pull(560, labels=["ai:changes-requested"], ref="agent/474-ai-rework")
+    fake = FakeGh({
+        "pulls/560/files?per_page=100": [],
+        "issues/560/comments?per_page=100": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("задача заблокирована — не пишем в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("задача заблокирована — не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any(
+        "#560" in line and "#474" in line and "заблокирована" in line
+        for line in observations
+    )
+
+
 def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     # Мутация: убери проверку `attempts >= CONFLICT_REWORK_MAX_ATTEMPTS` в
     # dispatch_conflict_rework — этот тест покраснеет (ушёл бы второй dispatch
@@ -5439,10 +5526,13 @@ def test_reap_stalled_worker_run_handles_both_slots_independently(monkeypatch):
     # правки reap_stalled_worker_run смотрел только на первый в списке
     # (per_page=1) и никогда не увидел бы второй зависший прогон.
     now = utc(2026, 9, 9, 14, 0, 0)
+    # Оба старта — раньше WORKER_STALL_MINUTES (255 мин, #877) от `now`, не
+    # только раньше прежнего порога 200: 6ч38м/7ч возраста, с тем же
+    # интервалом между слотами, что был у фикстуры исходно.
     run1 = workflow_run_at_slot(34339807907, "in_progress", 1)
-    run1["run_started_at"] = "2026-09-09T10:21:51Z"
+    run1["run_started_at"] = "2026-09-09T07:21:51Z"
     run2 = workflow_run_at_slot(34339807999, "in_progress", 2)
-    run2["run_started_at"] = "2026-09-09T10:00:00Z"
+    run2["run_started_at"] = "2026-09-09T07:00:00Z"
     task1 = issue(815, assignees=("mytab0r",))
     task2 = issue(820, assignees=("mytab0r",))
     fake = FakeGh({
@@ -5450,10 +5540,10 @@ def test_reap_stalled_worker_run_handles_both_slots_independently(monkeypatch):
         "actions/runs/34339807907/cancel": None,
         "actions/runs/34339807999/cancel": None,
         "issues/815/timeline?per_page=100": [
-            {"event": "assigned", "created_at": "2026-09-09T10:22:30Z"},
+            {"event": "assigned", "created_at": "2026-09-09T07:22:30Z"},
         ],
         "issues/820/timeline?per_page=100": [
-            {"event": "assigned", "created_at": "2026-09-09T10:01:00Z"},
+            {"event": "assigned", "created_at": "2026-09-09T07:01:00Z"},
         ],
         "issues/815/comments": None,
         "issues/820/comments": None,

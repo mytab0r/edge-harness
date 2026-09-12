@@ -1135,10 +1135,11 @@ def dispatch_ai_review_rework(
     dispatch_conflict_rework уже обслуживает их, второго диспатча на тот же
     PR за пульс это не даёт.
 
-    Идемпотентность — worker_runs_active, тот же гейт, что и у
-    dispatch_conflict_rework/dispatch_worker: воркер один на репозиторий,
-    пока прошлый прогон жив. Третий элемент кортежа (dispatched) — сигнал
-    main() не звать следом dispatch_worker в этом же проходе."""
+    Идемпотентность — free_worker_slot (тот же выбор слота, что dispatch_worker/
+    dispatch_conflict_rework, #827): до WORKER_MAX_CONCURRENCY прогонов
+    одновременно, пока свободен хотя бы один слот, доводка уходит; все заняты —
+    откладывается. Третий элемент кортежа (dispatched) — сигнал main() не звать
+    следом dispatch_worker в этом же проходе."""
     observations: list[str] = []
     actions: list[str] = []
     dispatched = False
@@ -1171,6 +1172,13 @@ def dispatch_ai_review_rework(
             observations.append(f"⚠️ PR #{number}: не удалось сверить бюджет авто-доводки: {error}")
             continue
         if attempts >= AI_REWORK_MAX_ATTEMPTS:
+            # Нарочно worker_runs_active («хотя бы один активен»), не
+            # free_worker_slot (#827, гейт самого dispatch ниже) — тот же
+            # выбор, что уже сделан в dispatch_conflict_rework (см. коммент
+            # там): эскалация обязана ждать, пока жив ЛЮБОЙ прогон воркера,
+            # даже если это сосед в другом слоте, иначе свободный второй слот
+            # сделал бы free_worker_slot неверным прокси для «эта попытка ещё
+            # идёт».
             if dispatched or worker_runs_active(repo):
                 observations.append(
                     f"⏸️ PR #{number}: авто-доводка по находкам ai-review ещё идёт "
@@ -1226,10 +1234,28 @@ def dispatch_ai_review_rework(
             )
             continue
         if _issue_is_blocked(issue):
-            continue  # эскалация playbook уже идёт своим путём — не мешаем ей
-        if dispatched or worker_runs_active(repo):
+            # Тот же класс наблюдаемости, что и у соседних отказов этой
+            # функции выше (например «задача не найдена в открытом пуле») —
+            # PR не должен пропадать из рассмотрения без единой строки в
+            # логе (живой случай: PR #261/#262).
             observations.append(
-                f"⏸️ PR #{number} ждёт доводки по находкам ai-review, но воркер занят — отложено"
+                f"PR #{number}: задача #{task_number} заблокирована — доводка отложена"
+            )
+            continue  # эскалация playbook уже идёт своим путём — не мешаем ей
+        if dispatched:
+            observations.append(
+                f"⏸️ PR #{number} ждёт доводки по находкам ai-review, но воркер занят "
+                "в этом проходе — отложено"
+            )
+            continue
+        # Слот параллельности (#827), не бинарный «занят/свободен»: при одном
+        # занятом слоте доводка уходит во второй, при обоих занятых — как
+        # раньше, откладывается.
+        slot = free_worker_slot(repo)
+        if slot is None:
+            observations.append(
+                f"⏸️ PR #{number} ждёт доводки по находкам ai-review, но все "
+                f"{WORKER_MAX_CONCURRENCY} слота воркера заняты — отложено"
             )
             continue
         if issue["assignees"]:
@@ -1242,7 +1268,7 @@ def dispatch_ai_review_rework(
             release_note = f"замок не снят: {error}"
         gh(
             "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
-            "-f", "ref=main", "-f", f"inputs[task]={task_number}",
+            "-f", "ref=main", "-f", f"inputs[task]={task_number}", "-f", f"inputs[slot]={slot}",
         )
         post_issue_comment(
             repo, number,
