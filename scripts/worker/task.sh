@@ -416,6 +416,28 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# ── Изоляция адаптера модели (#140) — до захвата задачи: отказ изоляции
+# не должен оставлять живую аренду. dsh с ключом в env обязан пойти под
+# выделенным агент-юзером без группы docker, иначе model-shell читает ключ через
+# docker-эскейп (docs/research/40-model-shell-key-exposure.md). Отказ изоляции —
+# громкий красный job, а не запуск без защиты. Ниже dry-run-выхода: самотесту
+# (--dry-run, шаг 3) ни sudo, ни DEEPSEEK_MODEL не нужны — он ничего не запускает
+# (ревью head c3112d1). Засев DEEPSEEK_* цепочкой (#727) — до prepare: тот
+# доказывает env_keep-проводку именно этих переменных.
+dsh_seed_first_provider
+AGENT_DIR="$WORK/agent"   # каталог агента: NDJSON-спул стрим-плагина пишет он сам
+SPOOL_FILE="$AGENT_DIR/session-stream.ndjson"
+# HANDS_SPOOL экспортируется ДО prepare: prepare доказывает проводку каждой
+# заданной env_keep-переменной агенту — включая спул.
+export HANDS_SPOOL="$SPOOL_FILE"
+# Патч профиля транспорт пишет в СВОЙ каталог; в дом агента его доставляет
+# dsh_agent_install_profile_patch (#140).
+DSH_AGENT_PATCH_OUT="$WORK/agent-headless.cordis.patch.yml"
+# Прокси-держатель ключа (#140, замер 5): РЕАЛЬНЫЙ ключ остаётся в домене
+# транспорта, агенту едет 127.0.0.1 и подменный ключ. Обязателен ДО prepare.
+dsh_provider_proxy_start "$WORK"
+dsh_agent_isolation_prepare gh "$GITHUB_WORKSPACE" "$AGENT_DIR" "$WORK/dsh-agent-launcher.sh"
+
 # ── 4. Захват задачи: атомарная аренда через claim_task (#121, ADR 0006) ─────────
 # Единственный вход в работу: замок refs/locks/task-N создаётся серверно
 # атомарно, проигравший гонку каналов (worker auto/manual, hands) получает
@@ -453,7 +475,7 @@ HB_PID=""
 stop_worker_heartbeat() {
   if [ -n "$HB_PID" ]; then kill "$HB_PID" 2>/dev/null || true; fi
 }
-trap stop_worker_heartbeat EXIT
+trap 'dsh_provider_proxy_stop; stop_worker_heartbeat' EXIT
 if [ -n "${HANDS_TOKEN:-}" ] && [ -n "${HARNESS_URL:-}" ]; then
   (
     while :; do
@@ -564,6 +586,7 @@ echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
 
 # ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
 dsh_install "$WORK/pkgs"
+# --version — от транспорта: бинарник только читается, секретов в нём нет (#140).
 dsh --version || true
 dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
 # Быстрый провайдер Claude (#838) — независимо от suite выше, гейт: секреты
@@ -584,14 +607,14 @@ dsh_import_anthropic_accounts || die "импорт аккаунтов Claude н�
 # повторный патч не задевает монтаж плагина (bundles профиля — отдельный
 # слой, `dsh --dump-config`, «Порядок слоёв», research/10-dsh-architecture.md).
 _chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
-_chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
-DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
-DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
-DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
-export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+# DEEPSEEK_BASE_URL/MODEL/API_KEY уже засеяны первым провайдером цепочки выше
+# (dsh_seed_first_provider перед prepare, #140) — повторно не засеиваем.
 DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
 dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 dsh_mount_anthropic_pool headless || die "быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)"
+# Изоляция #140: патч (включая возможный мягкий откат suite внутри mount)
+# обязан доехать до домена агента — у транспорта нет прав на запись в /home/<agent>.
+dsh_agent_install_profile_patch
 
 # ── 6b. Плагин стрима: спул событий сессии для морды (#119) ──────────────────────
 # Тот же dsh-hands-streamer, что у рук: NDJSON-спул канонических событий,
@@ -604,16 +627,20 @@ fi
 PLUGIN_TGZ="$WORK/dsh-hands-streamer.tgz"
 npm pack "$SCRIPT_DIR/../../scripts/dsh-hands-streamer" --pack-destination "$WORK" >/dev/null
 mv "$WORK"/dsh-hands-streamer-*.tgz "$PLUGIN_TGZ"
-dsh plugin --profile headless add "$PLUGIN_TGZ"
-dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
+# Монтаж плагина и проверка конфига — под агент-юзером: профиль живёт в его
+# домашнем каталоге, и доказывать надо конфиг РОВНО того пользователя, с которым
+# стартует dsh (#140).
+dsh_agent_run dsh plugin --profile headless add "$PLUGIN_TGZ"
+dsh_agent_run dsh --profile headless --dump-config >"$WORK/dump-config.txt" 2>&1 \
   || { echo "::error::dsh --dump-config упал — профиль headless не собирается" >&2; exit 1; }
 grep -q '^- id: hands-streamer$' "$WORK/dump-config.txt" \
   || { echo "::error::плагин hands-streamer не смонтировался — транскрипт морды невозможен (#119)" >&2; exit 1; }
 
 # ── 7. Прогон: cwd до старта = корень воркспейса и после не меняется (контракт dsh)
-SPOOL_FILE="$WORK/session-stream.ndjson"   # NDJSON-спул плагина (дрен — lib dsh-edge-session)
-rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
-export HANDS_SPOOL="$SPOOL_FILE"
+# Спул и его stats — файлы агента (каталог агента принадлежит агент-юзеру):
+# снос тоже под агентом, у транспорта там только r-x (#140). HANDS_SPOOL
+# экспортирован до prepare (выше, #140).
+dsh_agent_run rm -f "$SPOOL_FILE" "$SPOOL_FILE.stats.json"
 
 # Отметка «дошли до git-шага» (#588, scheduler.py::conflict_rework_attempts,
 # маркер WORKER_GIT_STEP_MARKER в pulse_guard.py — держи текст в синхроне):
@@ -629,6 +656,16 @@ gh issue comment "$number" \
   || echo "::warning::маркер git-шага не отправлен в задачу #$number — оркестратор увидит эту попытку как инфраструктурный сбой"
 
 dsh_edge_start_drain
+# Передача воркспейса агенту — ПОСЛЕДНИЙ транспортный шаг: git-операции
+# (task-branch/worktree, config) выше исполнены транспортом в своём uid (#140).
+# Режим доводки (#245): cwd модели — отдельный worktree ВНЕ $GITHUB_WORKSPACE,
+# он уезжает агенту вторым деревом — иначе первая же запись модели (git add,
+# правка файла) падает по EACCES на чужом uid (ревью head c3112d1).
+if [ -n "${PR_WORKTREE:-}" ]; then
+  dsh_agent_handover "$PR_WORKTREE"
+else
+  dsh_agent_handover
+fi
 WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \

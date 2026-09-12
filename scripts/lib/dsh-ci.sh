@@ -245,17 +245,20 @@ dsh_mount_plugins_suite() { # $1 — профиль (headless)
   local profile=$1
   [ "${DSH_PLUGINS_SUITE_ACTIVE:-0}" = "1" ] || return 0
   echo "::group::Монтаж suite ротации учёток (профиль $profile)"
-  if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_COMBO_PKG"; then
+  # Все dsh-вызовы — через изоляцию #140: профиль живёт в домене агента,
+  # запуск dsh от транспорта писал бы в чужой дом и лишал бы агента плагина
+  # (класс #93/#94: «прогон dsh мимо изоляции»).
+  if ! dsh_agent_run dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_COMBO_PKG"; then
     echo "::error::dsh plugin add не смонтировал dsh-combo-router — suite не смонтировался (#215)"
     echo "::endgroup::"; return 1
   fi
-  if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_OAUTH_PKG"; then
+  if ! dsh_agent_run dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_OAUTH_PKG"; then
     echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — suite не смонтировался (#215)"
     echo "::endgroup::"; return 1
   fi
 
   local dump
-  if ! dump=$(dsh --profile "$profile" --dump-config 2>&1); then
+  if ! dump=$(dsh_agent_run dsh --profile "$profile" --dump-config 2>&1); then
     echo "::error::dsh --dump-config упал после монтажа suite — монтаж не подтверждён (#215): $dump"
     echo "::endgroup::"; return 1
   fi
@@ -445,12 +448,13 @@ dsh_mount_anthropic_pool() { # $1 — профиль (headless)
   local profile=$1
   [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
   echo "::group::Монтаж быстрого провайдера Claude (профиль $profile, #838)"
-  if ! dsh plugin --profile "$profile" add "$DSH_ANTHROPIC_POOL_PKG"; then
+  # dsh — только через изоляцию #140 (см. dsh_mount_plugins_suite выше).
+  if ! dsh_agent_run dsh plugin --profile "$profile" add "$DSH_ANTHROPIC_POOL_PKG"; then
     echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — быстрый провайдер Claude не подключён (#838)"
     echo "::endgroup::"; return 1
   fi
   local dump
-  if ! dump=$(dsh --profile "$profile" --dump-config 2>&1); then
+  if ! dump=$(dsh_agent_run dsh --profile "$profile" --dump-config 2>&1); then
     echo "::error::dsh --dump-config упал после монтажа anthropic-oauth-pool — монтаж не подтверждён (#838): $dump"
     echo "::endgroup::"; return 1
   fi
@@ -469,7 +473,11 @@ dsh_mount_anthropic_pool() { # $1 — профиль (headless)
 # напрямую нет смысла вне этих двух мест, но и не re-declare внутри каждого.
 _dsh_patch_profile_plain() { # $1 — профиль
   local profile=$1
-  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  # Изоляция #140: транспорт пишет патч в СВОЙ каталог (DSH_AGENT_PATCH_OUT
+  # задают обёртки), а в дом агента его доставляет dsh_agent_install_profile_patch —
+  # транспорт не имеет прав на запись в /home/<agent>. Без переменной — прежнее
+  # поведение (дом транспорта) для локальных запусков без изоляции.
+  local patch="${DSH_AGENT_PATCH_OUT:-$HOME/.dsh/profiles/$profile/cordis.patch.yml}"
   mkdir -p "$(dirname "$patch")"
   cat >"$patch" <<PATCH
 - id: agent-default-model
@@ -495,7 +503,8 @@ PATCH
 # резолва agent-default-model на первом реальном запросе).
 _dsh_patch_profile_anthropic_pool() { # $1 — профиль
   local profile=$1
-  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  # Тот же шов DSH_AGENT_PATCH_OUT, что у _dsh_patch_profile_plain (#140).
+  local patch="${DSH_AGENT_PATCH_OUT:-$HOME/.dsh/profiles/$profile/cordis.patch.yml}"
   mkdir -p "$(dirname "$patch")"
   cat >"$patch" <<PATCH
 - id: agent-default-model
@@ -562,6 +571,9 @@ dsh_model_context_window() { # $1 — id модели
 # vars.PLUGINS_SUITE_URL и vars.DSH_PROVIDER_CHAIN заданы одновременно: молчаливого
 # приоритета одной переменной над другой быть не должно.
 dsh_patch_profile() { # $1 — имя профиля (обычно headless); выставляет DSH_MODEL/DSH_MAX_TOKENS
+  # Изоляция #140: файл патча пишется туда, куда указывает DSH_AGENT_PATCH_OUT
+  # (задают обёртки; в дом агента его доставляет dsh_agent_install_profile_patch).
+  # Без переменной патч пишется в дом транспорта — прежнее поведение.
   local profile=$1
   # Модель обязана прийти из окружения (vars.DEEPSEEK_MODEL, #153) — здесь
   # больше нет зашитого дефолта. Вызывающий обязан вызвать
@@ -569,7 +581,7 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
   : "${DEEPSEEK_MODEL:?DEEPSEEK_MODEL не задан — dsh_require_provider_env должен был отказать раньше}"
   DSH_MODEL="$DEEPSEEK_MODEL"
   DSH_MAX_TOKENS="${DSH_MAX_TOKENS:-131072}"
-  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  local patch="${DSH_AGENT_PATCH_OUT:-$HOME/.dsh/profiles/$profile/cordis.patch.yml}"
   mkdir -p "$(dirname "$patch")"
 
   if [ "${DSH_CHAIN_ACTIVE:-0}" = "1" ] && [ "${DSH_PLUGINS_SUITE_ACTIVE:-0}" = "1" ]; then
@@ -724,7 +736,12 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
     echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
     attempt_start=$(date +%s)
     set +e
-    timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
+    # Запуск dsh — ТОЛЬКО через изоляцию (#140): ключ едет к dsh через
+    # sudoers env_keep под агент-юзером, прямого `timeout … dsh …` из
+    # транспорта быть не должно. timeout — бинарь coreutils: bash-функцию
+    # dsh_agent_run он исполнить не может (rc=127 до старта модели, ревью
+    # #395), поэтому таймаут живёт ВНУТРИ домена агента — как в проверке 8в.
+    dsh_agent_run timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
       >"$answer_file" 2>"$err_file"
     rc=$?
     set -e
@@ -1170,6 +1187,9 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_remaining}с из ${chain_rl_budget}с (#877)"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
+    # Изоляция #140: патч этой попытки обязан доехать до домена агента — иначе
+    # агент отработал бы с патчем ПРЕДЫДУЩЕЙ попытки (молча не тот провайдер).
+    dsh_agent_install_profile_patch
     DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
     chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
     if [ "$DSH_RUN_RC" -eq 0 ]; then
@@ -1220,6 +1240,7 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
     _dsh_patch_profile_anthropic_pool headless
+    dsh_agent_install_profile_patch   # изоляция #140: патч — в домен агента
     dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
     if [ "$DSH_RUN_RC" -eq 0 ]; then
       DSH_CHAIN_PROVIDER="anthropic-oauth-pool"
@@ -1238,6 +1259,494 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text" "$pool_rl_used"
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     DSH_CHAIN_TRIED="anthropic-oauth-pool, ${DSH_CHAIN_TRIED}"
+  fi
+}
+
+# Доставка патча профиля в домен агента (#140). Единственное место правды на
+# этот шаг: транспорт не имеет прав на запись в /home/<agent> — установку
+# делает сам агент из файла, написанного транспортом в СВОЁМ каталоге
+# (DSH_AGENT_PATCH_OUT; writers dsh_patch_profile/_dsh_patch_profile_*)
+# Вызов при НЕактивной изоляции — no-op (локальные запуски без prepare).
+# Файл после установки перезаписывается любым более поздним вызовом патча —
+# вызывающий обязан доставлять ПОСЛЕДНИЙ патч (цепочка зовёт на каждой
+# попытке провайдера).
+dsh_agent_install_profile_patch() {
+  [ -n "${DSH_AGENT_LAUNCHER:-}" ] || return 0
+  local src="${DSH_AGENT_PATCH_OUT:?DSH_AGENT_PATCH_OUT не задан — изоляция активна, некуда доставлять патч}"
+  dsh_agent_run install -D -m 644 "$src" \
+    "$DSH_AGENT_HOME/.dsh/profiles/headless/cordis.patch.yml"
+}
+# ── Изоляция адаптера модели: отдельный uid для dsh (#140) ─────────────────────────
+# Замер 2026-09-05 живым прогоном из model-shell
+# (docs/research/40-model-shell-key-exposure.md): вырезание env (*KEY*/*TOKEN*/
+# *SECRET*) из model-shell вызовов НЕ гарантирует «агент ключ не видит».
+# Измеренные факты:
+#   (1) ПОДТВЕРДИЛСЯ docker-эскейп: доступный model-shell сокет docker даёт
+#       полный обход — контейнер `--pid=host --cap-add SYS_PTRACE
+#       --security-opt apparmor=unconfined` читает environ ЛЮБОГО процесса
+#       хоста. Закрыт uid-барьером (агент-юзер без группы docker).
+#   (2) В старой конфигурации (dsh — потомок job-цепочки) чтение environ
+#       предков из model-shell было DENIED; механизм запрета НЕ
+#       атрибутирован, на свойство среды нельзя опираться (замер 2).
+#   (3) ЗАМЕР 5 (2026-09-10, repo-ci, живой прогон точной пары из названия
+#       задачи в новой конфигурации): в конфигурации sudo-exec (launcher →
+#       timeout → dsh) ребро «same-uid потомок → environ родителя» ЧИТАЕТСЯ,
+#       и env_keep доставляет ключ в этот читаемый environ — READABLE,
+#       DEEPSEEK_API_KEY present-nonempty (bash- и node-образ stand-in).
+#       То есть env_keep-проводка ключа сама открывает вектор из названия
+#       задачи: ключу в env dsh не место.
+#
+# Решение — «передача ключа только адаптеру» (вторая ветка критерия #140) в
+# дополнение к uid-изоляции: РЕАЛЬНЫЙ ключ не покидает домен транспорта.
+# Локальный прокси (dsh_provider_proxy_start, ниже) держит ключ в своём
+# процессе-домене транспорта и подменяет Authorization на настоящий при
+# проксировании на провайдера; dsh получает DEEPSEEK_BASE_URL=127.0.0.1 и
+# подменный ключ. Чтение environ dsh моделью (READABLE, замер 5) теперь
+# отдаёт только подмену; environ самого прокси — другой uid, чтение
+# запрещено ядром (гарантия; доказывается prepare 8б на каждом прогоне).
+# Цепочка провайдеров (#727) меняет реальный base_url/ключ на каждую
+# попытку — dsh_agent_run синхронизирует файл состояния прокси на КАЖДОМ
+# запуске домена агента, так что прокси всегда ходит к текущему провайдеру.
+#
+# Gas (правило «тормоз без газа»): агент-юзер без docker и прокси-порт без
+# авторизации — осознанные тормозы. Первый возвращает задача, которой нужен
+# docker на раннере (эскалация blocked). Второй: модель может ЗВОНИТЬ в
+# прокси напрямую (тратить квоту — штатная работа агента, см.
+# research/40 «Остаточный риск»), но не может ПРОЧИТАТЬ ключ. Снять оба
+# может только вынос ключа с раннера — решение владельца, не воркера.
+
+DSH_AGENT_USER="${DSH_AGENT_USER:-dsh-agent}"
+DSH_AGENT_HOME=""        # заполняет dsh_agent_isolation_prepare
+DSH_AGENT_LAUNCHER=""    # заполняет dsh_agent_isolation_prepare
+DSH_AGENT_WORKSPACE=""   # заполняет dsh_agent_isolation_prepare, читает dsh_agent_handover
+# Один источник правды на каналы «транспорт → агент»: из него собирается
+# sudoers env_keep И проверка проводки в prepare. Расширять — только здесь.
+DSH_AGENT_ENV_KEEP="DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL HANDS_SPOOL GH_REPO"
+
+# ── Локальный держатель ключа: прокси в домене транспорта (#140, замер 5) ──────
+# РЕАЛЬНЫЙ base_url+ключ не покидают домен транспорта: прокси читает их из
+# файла состояния (0600, только транспорт) на каждый запрос и подменяет
+# Authorization; агент получает 127.0.0.1 и подменный ключ через env_keep.
+# Цепочка провайдеров (#727) переписывает реальные значения на каждую попытку —
+# dsh_agent_run синхронизирует файл состояния ПЕРЕД каждым запуском в домене
+# агента, поэтому прокси всегда ходит к текущему провайдеру попытки.
+DSH_PROXY_DUMMY_PREFIX="dsh-via-local-proxy"
+
+dsh_provider_proxy_start() { # $1 — рабочий каталог транспорта (для скрипта/лога/состояния)
+  local dir=$1
+  [ -z "${DSH_PROXY_ACTIVE:-}" ] || return 0   # идемпотентно (повторный вызов обёртки/гвардии)
+  [ -n "${DEEPSEEK_API_KEY:-}" ] || { echo "::error::прокси #140: DEEPSEEK_API_KEY не задан — нечего держать, запуск dsh без ключа бессмыслен" >&2; return 1; }
+  [ -n "${DEEPSEEK_BASE_URL:-}" ] || { echo "::error::прокси #140: DEEPSEEK_BASE_URL не задан — прокси не знает upstream (dsh_require_provider_env/seed должен был отказать раньше)" >&2; return 1; }
+  command -v node >/dev/null || { echo "::error::прокси #140: node не найден — держатель ключа не запустится, запуск dsh с реальным ключом в env запрещён (research/40, замер 5)" >&2; return 1; }
+  DSH_PROXY_REAL_KEY="$DEEPSEEK_API_KEY"
+  DSH_PROXY_REAL_BASE_URL="$DEEPSEEK_BASE_URL"
+  DSH_PROXY_STATE_FILE="$dir/provider-proxy.state"
+  DSH_PROXY_DUMMY_KEY="${DSH_PROXY_DUMMY_PREFIX}-${RANDOM}${RANDOM}"
+  # Экспорт обязателен: node-процесс прокси читает путь из своего env
+  # (неэкспортированная shell-переменная туда не попадает — 502 на каждый
+  # запрос, найдено локальным прогоном механики).
+  export DSH_PROXY_STATE_FILE
+  mkdir -p "$dir"
+  cat >"$dir/provider-proxy.js" <<'PROXY_JS'
+// Держатель ключа провайдера (#140). Ключ и настоящий base_url живут в
+// файле состояния домена транспорта (0600); на каждый запрос читаются заново
+// (цепочка #727 меняет их между попытками). Заголовок Authorization клиента
+// (там подменный ключ агента) заменяется настоящим. SSE пропускается как
+// поток байтов (Readable.fromWeb), тело запроса буферизуется (JSON chat-
+// completions — сотни КБ максимум).
+const http = require('http');
+const fs = require('fs');
+const STATE = process.env.DSH_PROXY_STATE_FILE;
+const PORT = Number(process.env.DSH_PROXY_PORT || 0);
+function readState() {
+  const [base, key] = fs.readFileSync(STATE, 'utf8').split('\n');
+  if (!base || !key) throw new Error('файл состояния прокси пуст/неполон');
+  return { base: base.replace(/\/+$/, ''), key };
+}
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/dsh-proxy-healthz') {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+    return;
+  }
+  let st;
+  try { st = readState(); } catch (e) {
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('dsh-proxy: ' + e.message);
+    return;
+  }
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const body = Buffer.concat(chunks);
+  const headers = { ...req.headers };
+  delete headers.host; delete headers.connection;
+  delete headers['content-length']; delete headers['accept-encoding'];
+  headers.authorization = 'Bearer ' + st.key;
+  try {
+    const up = await fetch(st.base + req.url, {
+      method: req.method,
+      headers,
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : body,
+      redirect: 'manual',
+    });
+    const out = {};
+    up.headers.forEach((v, k) => {
+      if (!['content-encoding', 'content-length', 'transfer-encoding', 'connection'].includes(k)) out[k] = v;
+    });
+    res.writeHead(up.status, out);
+    if (up.body) {
+      const { Readable } = require('stream');
+      Readable.fromWeb(up.body).pipe(res);
+    } else {
+      res.end();
+    }
+  } catch (e) {
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('dsh-proxy: upstream failed: ' + (e && e.message));
+  }
+});
+server.listen(PORT, '127.0.0.1', () => process.stdout.write(`PROXY-READY port=${server.address().port}\n`));
+PROXY_JS
+  # Файл состояния — сразу с реальными значениями, 0600 (домен транспорта).
+  umask 077
+  printf '%s\n%s\n' "$DSH_PROXY_REAL_BASE_URL" "$DSH_PROXY_REAL_KEY" >"$DSH_PROXY_STATE_FILE"
+  umask 022
+  DSH_PROXY_LOG="$dir/provider-proxy.log"
+  node "$dir/provider-proxy.js" >>"$DSH_PROXY_LOG" 2>&1 &
+  DSH_PROXY_PID=$!
+  # Готовность: строка PROXY-READY в логе + живой health-запрос. Любой отказ —
+  # громкий (запуск dsh с РЕАЛЬНЫМ ключом в env вместо подмены запрещён).
+  local waited=0
+  while [ "$waited" -lt 100 ]; do
+    if grep -q '^PROXY-READY port=' "$DSH_PROXY_LOG" 2>/dev/null; then break; fi
+    kill -0 "$DSH_PROXY_PID" 2>/dev/null || { echo "::error::прокси #140: процесс умер при старте — лог: $(cat "$DSH_PROXY_LOG" 2>/dev/null | tail -3)" >&2; return 1; }
+    sleep 0.1; waited=$((waited + 1))
+  done
+  DSH_PROXY_PORT="$(sed -n 's/^PROXY-READY port=//p' "$DSH_PROXY_LOG" | head -1)"
+  [ -n "$DSH_PROXY_PORT" ] || { echo "::error::прокси #140: не дождался PROXY-READY за 10с — лог: $(tail -3 "$DSH_PROXY_LOG" 2>/dev/null)" >&2; return 1; }
+  if ! curl -fsS --max-time 5 "http://127.0.0.1:$DSH_PROXY_PORT/dsh-proxy-healthz" >/dev/null; then
+    echo "::error::прокси #140: health-запрос на 127.0.0.1:$DSH_PROXY_PORT не прошёл — держатель ключа не готов" >&2
+    return 1
+  fi
+  # Переписываем env ОБОЛОЧКИ: дальше по ходу обёртки (prepare 8а, sudo,
+  # env_keep) едут ЛОКАЛЬНЫЕ значения — подмена доказывается проводкой.
+  export DEEPSEEK_BASE_URL="http://127.0.0.1:$DSH_PROXY_PORT"
+  export DEEPSEEK_API_KEY="$DSH_PROXY_DUMMY_KEY"
+  export DSH_PROXY_ACTIVE=1
+  echo "Прокси-держатель ключа #140 запущен: 127.0.0.1:$DSH_PROXY_PORT → ${DSH_PROXY_REAL_BASE_URL} (ключ в домене транспорта, агенту едет подмена)"
+}
+
+dsh_provider_proxy_stop() {
+  # Идемпотентно: вызывается из EXIT-трапа обёртки; всё || true — на выходе
+  # после успешной работы мусор от остановки не нужен.
+  if [ -n "${DSH_PROXY_PID:-}" ]; then
+    kill "$DSH_PROXY_PID" 2>/dev/null || true
+    wait "$DSH_PROXY_PID" 2>/dev/null || true
+    DSH_PROXY_PID=""
+  fi
+  DSH_PROXY_ACTIVE=""
+}
+
+dsh_seed_first_provider() {
+  # Засев DEEPSEEK_* первым провайдером цепочки (chain[0]; #727). Нужен ДО
+  # изоляции (#140): prepare доказывает env_keep-проводку этих переменных и
+  # требует модель раньше захвата задачи, чтобы отказ изоляции не оставлял
+  # живую аренду. Полные данные попытки (max_output_tokens, перезапуск
+  # DEEPSEEK_* на каждого следующего провайдера) — в
+  # dsh_run_with_provider_chain; здесь только первичная затравка.
+  # Требует уже вызванный dsh_require_provider_chain (иначе DSH_PROVIDER_CHAIN
+  # не задан — падаем громко: молчаливая затрава пустотой = прогон без модели).
+  [ -n "${DSH_PROVIDER_CHAIN:-}" ] || {
+    echo "::error::dsh_seed_first_provider: DSH_PROVIDER_CHAIN не задан — сначала dsh_require_provider_chain" >&2
+    return 1
+  }
+  local head secret
+  head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
+  secret=$(jq -r '.secret_env' <<<"$head")
+  DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$head")
+  DEEPSEEK_MODEL=$(jq -r '.model' <<<"$head")
+  DEEPSEEK_API_KEY="${!secret:-}"
+  export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
+}
+
+dsh_agent_isolation_prepare() { # MODE(gh|nogh) WORKSPACE AGENT_DIR LAUNCHER_FILE
+  # MODE=gh — агенту нужен gh/git-push (worker): зеркало gh-конфига.
+  # MODE=nogh — gh-авторизации у агента быть НЕ должно: граница доверия #18
+  # (ai-review) и руки (пуш/PR рукам запрещены по дизайну, GH_RUN_TOKEN
+  # снимается до старта DSH). Протухшее зеркало сносится, отсутствие
+  # проверяется. pnpm для `dsh plugin add` ставится в gh-режиме и при
+  # DSH_AGENT_PNPM=1 (руки: плагин стрима нужен, gh-зеркало — нет).
+  local mode=$1 workspace=$2 agent_dir=$3 launcher=$4
+  case "$mode" in
+    gh|nogh) ;;
+    *) echo "::error::изоляция #140: MODE обязан быть gh или nogh, получено '$mode'" >&2; return 1 ;;
+  esac
+  # Прокси-держатель ключа (#140, замер 5) — ОБЯЗАТЕЛЕН до prepare: без него
+  # env_keep доставил бы РЕАЛЬНЫЙ ключ в читаемый агентом environ (READABLE,
+  # замер 5) — ровно вектор из названия задачи. Отсутствие — громкий отказ.
+  [ "${DSH_PROXY_ACTIVE:-}" = 1 ] || { echo "::error::изоляция #140: прокси-держатель ключа не запущен (dsh_provider_proxy_start) — запуск dsh с реальным ключом в env dsh запрещён (research/40, замер 5: агент читает environ родителя)" >&2; return 1; }
+  DSH_AGENT_HOME="/home/$DSH_AGENT_USER"
+  DSH_AGENT_LAUNCHER=$launcher
+  [ -d "$workspace" ] || { echo "::error::изоляция #140: нет каталога воркспейса $workspace" >&2; return 1; }
+  # Секреты едут к агенту через env_keep, модель обязана быть задана раньше.
+  [ -n "${DEEPSEEK_MODEL:-}" ] || { echo "::error::DEEPSEEK_MODEL не задан — dsh_require_provider_env должен был отказать раньше" >&2; return 1; }
+  if ! sudo -n true 2>/dev/null; then
+    echo "::error::sudo недоступен — изоляция адаптера модели (#140) невозможна, а запуск dsh без неё запрещён: model-shell с доступом к docker читает ключ из environ dsh (docs/research/40-model-shell-key-exposure.md). Газ: вынос ключа с раннера — решение владельца" >&2
+    return 1
+  fi
+
+  # 1. Пользователь: создать или переиспользовать (идемпотентно на живом раннере).
+  if ! id -u "$DSH_AGENT_USER" >/dev/null 2>&1; then
+    sudo useradd -m -s /bin/bash "$DSH_AGENT_USER" \
+      || { echo "::error::не смог создать агент-юзера $DSH_AGENT_USER" >&2; return 1; }
+    local created_uid
+    created_uid="$(id -u "$DSH_AGENT_USER" 2>/dev/null || true)"
+    echo "Агент-юзер $DSH_AGENT_USER создан${created_uid:+ (uid $created_uid)}"
+  fi
+  # 1а. Дом транспорта обязан пропускать «только проход» (x без r): воркспейс,
+  # RUNNER_TEMP и лаунчер лежат под $HOME (/home/runner на GitHub-раннерах,
+  # дефолт 750) — без этого агент физически не дойдёт до своего cwd, спула и
+  # лаунчера. Найдено CI-гвардией #140 на настоящем sudo; Smoke это показать
+  # не может (sudo заглушен — uid-граница отсутствует). Правим только биту
+  # others-execute: уже проходимый дом (x5/x7) не трогаем.
+  if [ "$(stat -c %u "$HOME" 2>/dev/null)" = "$(id -u)" ] \
+      && [ $(( 8#$(stat -c %a "$HOME") & 1 )) -eq 0 ]; then
+    sudo chmod 711 "$HOME"
+    echo "::warning::$HOME был без прохода для других uid — открыт 711: агенту нужен проход до воркспейса, спула и лаунчера (#140)"
+  fi
+  # 2. Группа docker агенту запрещена: на этой машине она равна доступу к ключу
+  # (#140). Чиним сами (самовосстановление на переиспользуемом раннере), не молча.
+  if id -nG "$DSH_AGENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    sudo gpasswd -d "$DSH_AGENT_USER" docker \
+      || { echo "::error::не смог убрать $DSH_AGENT_USER из группы docker — изоляция #140 неполна" >&2; return 1; }
+    echo "::warning::$DSH_AGENT_USER состоял в группе docker — убран (изоляция #140)"
+  fi
+  # 3. pnpm для `dsh plugin add` под агентом: action-setup кладёт его в
+  # /home/runner (750) — агенту туда не пройти. Ставим ту же версию в общий
+  # префикс node (доступен агенту на чтение/исполнение). Нужен gh-режиму
+  # (worker) и рукам (DSH_AGENT_PNPM=1: плагин стрима, gh-зеркало — нет).
+  if [ "$mode" = gh ] || [ "${DSH_AGENT_PNPM:-}" = 1 ]; then
+    command -v pnpm >/dev/null || { echo "::error::pnpm не найден — dsh plugin add без него не работает" >&2; return 1; }
+    npm install -g "pnpm@$(pnpm --version)" >/dev/null \
+      || { echo "::error::не смог поставить pnpm в общий префикс node для агент-юзера" >&2; return 1; }
+  fi
+  # 4. gh-конфиг: зеркало для gh/nogh-снос для nogh. Снос ПЕРЕД копированием:
+  # `cp -r src dst` на существующий dst дал бы вложенный gh/gh без hosts.yml
+  # (ревью #140: идемпотентность на переиспользуемом раннере).
+  if [ "$mode" = gh ]; then
+    [ -f "$HOME/.config/gh/hosts.yml" ] \
+      || { echo "::error::нет $HOME/.config/gh/hosts.yml — агент без gh-авторизации не откроет PR; шаг gh auth login обязан идти раньше" >&2; return 1; }
+    sudo rm -rf "$DSH_AGENT_HOME/.config/gh"
+    sudo mkdir -p "$DSH_AGENT_HOME/.config"
+    sudo cp -r "$HOME/.config/gh" "$DSH_AGENT_HOME/.config/gh"
+    [ -f "$HOME/.gitconfig" ] && sudo cp "$HOME/.gitconfig" "$DSH_AGENT_HOME/.gitconfig"
+  else
+    # Протухшее зеркало на переиспользуемом раннере нарушило бы границу #18.
+    sudo rm -rf "$DSH_AGENT_HOME/.config/gh"
+  fi
+  sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$DSH_AGENT_HOME"
+  # 5. env_keep (память sudo) — канал проводки значений в домен агента.
+  # Список — константа DSH_AGENT_ENV_KEEP (один источник правды: генерация +
+  # проверка 8а). С замером 5 (#140) РЕАЛЬНЫЙ ключ через этот канал не идёт
+  # вовсе: dsh_agent_run подменяет DEEPSEEK_API_KEY/BASE_URL на локальные
+  # (прокси-держатель), 8д доказывает отсутствие реального ключа у агента.
+  # Валидация до установки.
+  local sudoers_file="/etc/sudoers.d/99-$DSH_AGENT_USER-env"
+  local sudoers_tmp; sudoers_tmp="$(mktemp)"
+  cat >"$sudoers_tmp" <<SUDOERS
+# Изоляция адаптера модели (#140): значения агенту едут через env_keep
+# (память sudo), не через argv (читаем всем через /proc/*/cmdline) и не через
+# файлы в домене агента. С замера 5 ключ провайдера через границу не ходит
+# вовсе — прокси-держатель подменяет его локальным эндпоинтом (см.
+# dsh_provider_proxy_start / dsh_agent_run).
+Defaults env_keep += "$DSH_AGENT_ENV_KEEP"
+SUDOERS
+  if ! sudo visudo -cf "$sudoers_tmp" >/dev/null; then
+    rm -f "$sudoers_tmp"
+    echo "::error::sudoers-файл env_keep не валиден — изоляция #140 не установлена" >&2
+    return 1
+  fi
+  sudo install -m 440 "$sudoers_tmp" "$sudoers_file"
+  rm -f "$sudoers_tmp"
+  # 6. Лаунчер: PATH/HOME/флаг pnpm — не секреты, задаются здесь явно. Секреты
+  # через него не идут. umask 022 — детерминированные права файлов агента:
+  # спул пишет агент, читает транспорт-дрен (ревью #140: без фиксации umask
+  # права спула — предположение). Файл в домене транспорта: агент читает,
+  # но не пишет — менять его агенту выгоды нет, он и так исполняется его uid.
+  local node_bin; node_bin="$(dirname "$(command -v node)")"
+  mkdir -p "$agent_dir"
+  cat >"$launcher" <<LAUNCHER
+#!/usr/bin/env bash
+# Мост окружения транспорт → агент-юзер (#140). Секретов здесь нет: они едут
+# через sudoers env_keep. PATH/HOME/флаг pnpm — не секреты.
+set -euo pipefail
+umask 022
+# PATH транспорта первым (заглушки теста обязаны выигрывать у реальных
+# бинарников), каталог node — в хвосте как страховка на минимальный PATH.
+export PATH="\$1:$node_bin"; shift
+export HOME="$DSH_AGENT_HOME" DSH_HOME="$DSH_AGENT_HOME/.dsh"
+export npm_config_ignore_workspace_root_check=true
+exec "\$@"
+LAUNCHER
+  # 7. Каталог агента — во владение агенту: спул пишет он сам, транспорт
+  # читает (644, umask лаунчера зафиксирован). САМ воркспейс сюда НЕ входит:
+  # транспорт после prepare ещё исполняет свои git-команды (task-branch,
+  # git config) — передача воркспейса делается отдельным поздним шагом
+  # dsh_agent_handover перед самым прогоном (ревью #395: chown -R ранним
+  # шагом ломал транспорт «dubious ownership»+EACCES после взятия аренды).
+  DSH_AGENT_WORKSPACE=$workspace
+  sudo chown "$DSH_AGENT_USER:$DSH_AGENT_USER" "$agent_dir"
+  # 8. Доказательства изоляции — до запуска dsh, каждое громкое.
+  # 8а. Позитив: КАЖДАЯ переменная из env_keep-списка, заданная у транспорта,
+  # обязана доехать до агента (ревью #140: проверка одного DEEPSEEK_MODEL
+  # пропускала тихое выпадение DEEPSEEK_BASE_URL — silent-wrong). Переменные,
+  # не заданные у транспорта, пропускаются осознанно (нечего проводить).
+  # shellcheck disable=SC2086
+  local agent_env crossed var want
+  agent_env="$(dsh_agent_run env)"
+  for var in $DSH_AGENT_ENV_KEEP; do
+    want="${!var:-}"
+    if [ -z "$want" ]; then
+      # Вход механизма пуст — это обязано быть видно (ревью #395): при будущем
+      # переносе export'а секрета ниже prepare проводка выпала бы из
+      # доказательства молча.
+      echo "::note::$var не задана у транспорта — env_keep-проводка не доказывалась (нечего проводить)"
+      continue
+    fi
+    # || true обязателен: pipefail при отсутствии строки убил бы присваивание
+    # молча, до нашей диагностики дело не дошло бы (находка ревью #395).
+    crossed="$(grep "^$var=" <<<"$agent_env" | cut -d= -f2- || true)"
+    if [ "$crossed" != "$want" ]; then
+      echo "::error::env_keep не провёл $var агент-юзеру (получено '${crossed:-<пусто>}') — канал sudoers сломан, прогон без секрета/спула молча бы сломался" >&2
+      return 1
+    fi
+  done
+  # 8а-бис. Агент обязан достигать воркспейса (свой cwd): проход по $HOME
+  # и правам на каталоги — иначе dsh стартует в недостижимом каталоге.
+  if ! dsh_agent_run test -d "$workspace"; then
+    echo "::error::агент-юзер не видит воркспейс $workspace (проход по $HOME/каталогам?) — cwd dsh был бы недостижим" >&2
+    return 1
+  fi
+  # 8д. Негатив (замер 5): РЕАЛЬНОГО ключа провайдера в env агента быть не
+  # должно — агент получает локальный эндпоинт и подменный ключ. Проверка
+  # осмыслена только на настоящей смене uid (как 8б): под заглушкой sudo домен
+  # агента неотличим от транспорта, там её накрывает agent-isolation.guard.sh
+  # в repo-ci (настоящий sudo).
+  local agent_uid
+  agent_uid="$(id -u "$DSH_AGENT_USER" 2>/dev/null || true)"
+  if [ -n "$agent_uid" ] && [ "$agent_uid" != "$(id -u)" ]; then
+    # grep -F по фиксированной строке ключа: совпадение = ключ утёк бы в
+    # домен агента; значение НЕ печатается ни в каком исходе.
+    if dsh_agent_run bash -c 'printf %s "$DEEPSEEK_API_KEY$DEEPSEEK_BASE_URL"' | grep -qF -- "$DSH_PROXY_REAL_KEY"; then
+      echo "::error::РЕАЛЬНЫЙ ключ провайдера доехал до агента — прокси-держатель (#140) обойдён, запуск запрещён (research/40, замер 5: агент читает environ родителя)" >&2
+      return 1
+    fi
+    if ! dsh_agent_run bash -c 'printf %s "$DEEPSEEK_API_KEY"' | grep -q "^${DSH_PROXY_DUMMY_PREFIX}-"; then
+      echo "::error::подменный ключ прокси не доехал до агента — env_keep-канал или dsh_agent_run-подмена сломаны (#140)" >&2
+      return 1
+    fi
+  else
+    echo "::note::uid транспорта совпадает с агент-юзером (sudo заглушен?) — 8д (ключ не в env агента) пропущена, её накрывает гвардия CI"
+  fi
+  # 8б. Негатив: environ процессов транспорта агенту не читается. Проверка
+  # осмыслена ТОЛЬКО на настоящей смене uid (ядро запрещает читать environ
+  # процесса другого uid без CAP_SYS_PTRACE). Под заглушкой sudo (smoke) домен
+  # агента неотличим от транспорта по uid — там проверять нечего, и «пропуск»
+  # не считается успехом: прода и CI-гвардия (agent-isolation.guard.sh)
+  # проверяют её на настоящем uid-барьере.
+  if [ -n "$agent_uid" ] && [ "$agent_uid" != "$(id -u)" ]; then
+    sleep 30 & local probe=$!
+    # cat обязан исполниться в домене агента, не в транспорте.
+    # shellcheck disable=SC2016
+    if dsh_agent_run bash -c "cat /proc/$probe/environ" >/dev/null 2>&1; then
+      kill "$probe" 2>/dev/null || true
+      echo "::error::агент-юзер прочитал environ транспорта — изоляция uid не состоялась, запуск запрещён (#140)" >&2
+      return 1
+    fi
+    kill "$probe" 2>/dev/null || true
+  else
+    echo "::note::uid транспорта совпадает с агент-юзером (sudo заглушен?) — негативная проверка environ пропущена, её накрывает гвардия CI"
+  fi
+  # 8в. Негатив: docker недоступен агенту (закрытый эскейп #140). Три исхода:
+  # permission denied — защита доказана; «cannot connect» — демона нет, маршрут
+  # закрыт тем более (uid-барьер держит и при последующем старте демона, сокет
+  # по-прежнему 660 root:docker); иное — неизвестная среда, громкий отказ.
+  if [ -S /var/run/docker.sock ]; then
+    local derr
+    derr="$(dsh_agent_run timeout 10 docker version 2>&1 || true)"
+    if echo "$derr" | grep -qi "permission denied"; then
+      echo "Изоляция #140 доказана: docker у агент-юзера — permission denied"
+    elif echo "$derr" | grep -qi "cannot connect"; then
+      echo "::note::docker-демон не отвечает — эскейп-маршрут закрыт вдвойне; uid-барьер проверит гвардия CI"
+    else
+      echo "::error::docker у агент-юзера упал не по правам доступа — изоляция не доказана: $derr" >&2
+      return 1
+    fi
+  else
+    echo "::note::docker-сокета на раннере нет — негативная проверка docker пропущена"
+  fi
+  # 8г. Пробник ребра «same-uid потомок → environ родителя». Прокси-пара
+  # (свежий sudo-exec-башик) — индикатор свойства СРЕДЫ: ядерной гарантии у
+  # ребра нет. Замер 5 (research/40, repo-ci 2026-09-10) измерил точную пару
+  # model-shell→dsh в этой конфигурации: READABLE — поэтому ключ в env dsh
+  # больше не живёт (прокси-держатель, 8д проверяет подмену). Вердикт
+  # печатается ::note:: без покраски: среда из репо не настраивается
+  # (правило «тормоз без газа»), а ключ ребро прочитать уже не может.
+  local parent_edge
+  # \$PPID экранирован: развернуть его обязан ВНУТРЕННИЙ bash (его родитель —
+  # внешний агент-башик, тот самый same-uid родитель из замера). Без экранирования
+  # $PPID разворачивает внешний башик в pid root-ового sudo — пробник всегда
+  # отвечает DENIED и мёртв (ревью #395).
+  # shellcheck disable=SC2016
+  parent_edge="$(dsh_agent_run bash -c 'bash -c "cat /proc/\$PPID/environ" >/dev/null 2>&1 && echo READABLE || echo DENIED')"
+  echo "::note::Пробник #140 (ребро «дочерний шелл → environ родителя»): $parent_edge. Замер точной пары (research/40, замер 5): READABLE — поэтому ключ в env dsh не живёт (прокси-держатель, проверка 8д)"
+  # 9. Режимные проверки: gh работает у агента (gh) / gh-конфига нет (nogh).
+  if [ "$mode" = gh ]; then
+    dsh_agent_run gh auth status >/dev/null 2>&1 \
+      || { echo "::error::gh под агент-юзером не авторизован — зеркало gh-конфига не сработало" >&2; return 1; }
+  else
+    dsh_agent_run test ! -e "$DSH_AGENT_HOME/.config/gh/hosts.yml" \
+      || { echo "::error::у ревью-агента нашёлся hosts.yml — доверенная граница #18 нарушена" >&2; return 1; }
+  fi
+  local final_uid
+  final_uid="$(id -u "$DSH_AGENT_USER" 2>/dev/null || true)"
+  echo "Изоляция адаптера модели установлена: dsh пойдёт под $DSH_AGENT_USER${final_uid:+ (uid $final_uid)}, docker и environ транспорта ему недоступны (#140)"
+}
+
+dsh_agent_run() { # cmd args... — исполнить команду от агент-юзера (изоляция #140)
+  : "${DSH_AGENT_LAUNCHER:?dsh_agent_isolation_prepare не вызван}"
+  : "${DSH_AGENT_USER:?DSH_AGENT_USER не задан}"
+  if [ "${DSH_PROXY_ACTIVE:-}" = 1 ]; then
+    # Синхронизация держателя ключа (замер 5): цепочка провайдеров (#727)
+    # переписывает РЕАЛЬНЫЕ base_url/ключ в env оболочки на каждую попытку —
+    # прокси обязан ходить к текущему провайдеру попытки. Файл состояния
+    # атомарно перезаписывается (0600: агенту другой uid файл не читает).
+    printf '%s\n%s\n' "${DEEPSEEK_BASE_URL:-}" "${DEEPSEEK_API_KEY:-}" >"${DSH_PROXY_STATE_FILE}.tmp"
+    mv "${DSH_PROXY_STATE_FILE}.tmp" "$DSH_PROXY_STATE_FILE"
+    # Домен агента получает ЛОКАЛЬНЫЕ значения: prefix-присваивание задаёт их
+    # в env sudo, sudoers env_keep проводит именно их. Реальный ключ через
+    # эту границу не идёт — это и проверяет 8д.
+    DEEPSEEK_BASE_URL="http://127.0.0.1:${DSH_PROXY_PORT}" \
+DEEPSEEK_API_KEY="${DSH_PROXY_DUMMY_KEY}" \
+      sudo -n -H -u "$DSH_AGENT_USER" bash "$DSH_AGENT_LAUNCHER" "$PATH" "$@"
+  else
+    sudo -n -H -u "$DSH_AGENT_USER" bash "$DSH_AGENT_LAUNCHER" "$PATH" "$@"
+  fi
+}
+
+dsh_agent_handover() { # [EXTRA_DIR] — передать воркспейс (+extra) агенту — ПОСЛЕДНИЙ шаг перед прогоном
+  # Отдельно от prepare, потому что между ними транспорт ещё работает руками
+  # в воркспейсе (task-branch: fetch/switch -c/hooksPath, git config): chown
+  # ранним шагом отдаёт репо другому uid и валит транспорт «dubious ownership»
+  # + EACCES (ревью #395). После handover транспорт в воркспейсс не пишет.
+  : "${DSH_AGENT_WORKSPACE:?dsh_agent_isolation_prepare не вызван}"
+  sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$DSH_AGENT_WORKSPACE"
+  # EXTRA_DIR — дополнительное дерево cwd модели вне воркспейса (режим доводки
+  # PR #245: cwd = отдельный git worktree). Дерево обязано уехать агенту
+  # ЦЕЛИКОМ: файлы дерева и git-операции в cwd пишет модель своим uid, чужой
+  # владелец = EACCES на первой же записи (ревью head c3112d1).
+  if [ $# -ge 1 ]; then
+    sudo chown -R "$DSH_AGENT_USER:$DSH_AGENT_USER" "$1"
   fi
 }
 
