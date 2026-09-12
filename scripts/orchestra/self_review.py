@@ -86,7 +86,6 @@ from pulse_guard import (  # type: ignore[import-not-found]
     gh,
     parse_time,
     post_issue_comment,
-    recent_runs,
 )
 
 _LIB = Path(__file__).resolve().parents[1] / "lib"
@@ -153,6 +152,99 @@ FINDING_CLASS_LABELS = {
 
 CAP_EXHAUSTED_MARKER = "[self-review: потолок исчерпан"
 
+# ── Пагинация прогонов workflow: адаптивный потолок, не жёсткая одна страница ──
+#
+# Живая проверка 2026-09-12 (доработка по запросу владельца после первой
+# приёмки): агрегат `by_conclusion` в первой версии строился по ОДНОЙ
+# странице (per_page=100) — для высокочастотных workflow (orchestra.yml,
+# ai-review.yml, pr-review.yml) это МЕНЬШЕ, чем число прогонов за
+# SELF_REVIEW_WINDOW_HOURS=72 часа: одна страница физически не может
+# покрыть всё окно, и регрессия, случившаяся раньше самого свежего дня,
+# срезается молча. Замер реальных чисел на этом репозитории (окно 72ч,
+# 2026-09-12): worker.yml — 68 прогонов (1 страница), deploy-dsh-edge.yml —
+# 10 (1), deploy-worker.yml — 7 (1), conflict-mechanical-rebase.yml — 20 (1),
+# hands.yml — 0 (1), НО orchestra.yml — 700 прогонов (нужно 7 страниц),
+# ai-review.yml — 341 (4 страницы), pr-review.yml — 275 (3 страницы).
+# Итого на реальном окне — 19 запросов на восемь workflow, не 8: адаптивная
+# пагинация (останавливается, как только достигнута граница окна ИЛИ
+# страница короче per_page) стоит РОВНО столько, сколько нужно для покрытия
+# окна, не больше и не меньше. Жёсткий верхний потолок WORKFLOW_RUNS_MAX_PAGES
+# — броня на случай аномально высокой частоты (без него один зависший
+# workflow мог бы читать историю без конца, тот же класс, что уже поймала
+# живая попытка на gather_label_churn, см. её докстринг ниже): 8 страниц
+# (800 прогонов) — с запасом выше измеренного максимума (7 у orchestra.yml).
+WORKFLOW_RUNS_MAX_PAGES = 8
+WORKFLOW_RUNS_PER_PAGE = 100
+
+# Самые свежие N прогонов на workflow, попадающие в промпт ЯВНЫМ списком
+# (позиционные timestamp'ы для человека/модели) — по-прежнему меньше полного
+# покрытия: агрегат (`by_conclusion`, теперь честно по ВСЕМУ окну) и
+# `merge_correlation` ниже несут сигнал регрессии, явный список — только
+# витрина последних событий, раздувать промпт полным окном незачем.
+WORKFLOW_RECENT_SAMPLE_CAP = 20
+
+# ── Корреляция слияние → до/после (класс «наше изменение сделало хуже») ──────
+#
+# Открытый вопрос и churn меток ловят аномалию В МОМЕНТЕ (петля на issue,
+# красный workflow россыпью). Регрессия от собственного изменения видна
+# только В СРАВНЕНИИ до/после конкретного события — эталон (а) (регрессия
+# после мержа #878) ИМЕННО этого класса, и агрегата по всему окну для него
+# недостаточно (58% провалов размазаны по 5 суткам, само слияние не названо).
+#
+# Симметричное окно вокруг каждого слияния в периоде — тот же workflow,
+# что уже фигурирует в WATCHED_WORKFLOWS (по умолчанию только worker.yml —
+# запрос владельца «как минимум worker.yml»: это единственный workflow,
+# который слияние может СОДЕРЖАТЕЛЬНО задеть при следующем запуске воркера,
+# в отличие от orchestra.yml/ai-review.yml, чья частота определяется числом
+# открытых PR, не качеством кода main).
+#
+# 8 часов — подобрано ЖИВЫМ замером против известного инцидента #878, не
+# круглым числом «на глаз» (честно, не маскируется под нейтральный выбор —
+# design.md §5 несёт таблицу целиком): прогнано 3/4/6/8/12 часов против
+# реальной истории worker.yml на этом репозитории (2026-09-12).
+#   - 3ч/4ч/6ч — на #878 НЕДОСТАТОЧНО прогонов с одной из сторон
+#     (compute_before_after возвращает None, MIN_RUNS_PER_SIDE не набран) —
+#     слияние в это окно попадает, но сигнала о нём нет вовсе.
+#   - 12ч — сигнал ЕСТЬ, но РАЗМЫТ: after-окно уже захватывает начавшееся
+#     восстановление (13 прогонов «до» при 30.8% успеха, 12 прогонов
+#     «после» при 16.7% — обе стороны почти одинаково нездоровы, дельта
+#     всего -0.141, НИЖЕ MERGE_CORRELATION_THRESHOLD — сигнал теряется).
+#   - 8ч — минимальное окно, набирающее MIN_RUNS_PER_SIDE с обеих сторон
+#     (4 прогона «до», 6 «после») И ловящее именно ОСТРУЮ фазу до начала
+#     восстановления: доля успеха 0.75 -> 0.0, дельта -0.75 — далеко выше
+#     порога, см. design.md §5.3.
+# Число не гарантирует того же для ЛЮБОГО будущего инцидента (честная
+# граница — design.md, «Корреляция ≠ причинность»): это ПОДОБРАННЫЙ, а не
+# теоретически выведенный параметр, годный до тех пор, пока новый живой
+# случай не покажет, что нужен другой.
+MERGE_CORRELATION_WORKFLOWS: tuple[str, ...] = ("worker.yml",)
+BEFORE_AFTER_HOURS = 8
+
+# Меньше этого прогонов с одной из сторон — выборка слишком мала, чтобы
+# делать вывод (шум единичных прогонов не должен претендовать на сигнал).
+MIN_RUNS_PER_SIDE = 3
+
+# Порог заметности расхождения долей успеха (25 процентных пунктов) —
+# комфортно ниже измеренного на #878 перепада (-75 п.п. при 8ч окне, см.
+# BEFORE_AFTER_HOURS выше и design.md §5.3), не притянут к самому числу:
+# порог остаётся отдельным решением от подобранного окна.
+MERGE_CORRELATION_THRESHOLD = 0.25
+
+# Потолок страниц при поиске слитых PR в окне — тот же приём и то же
+# обоснование, что WORKFLOW_RUNS_MAX_PAGES выше: адаптивно (ранняя
+# остановка по границе окна), с бронёй сверху на случай аномального потока
+# слияний.
+MERGE_LOOKUP_MAX_PAGES = 5
+
+# Сколько пар (слияние, workflow) с заметным расхождением попадает в
+# дайджест — потолок витрины, не данных: расхождений может найтись больше
+# (живой замер 2026-09-12: 34 пары прошли порог за одну ночь с высокой
+# активностью мержей — то же «13 подозреваемых за ночь», что уже измерено
+# в PR #970). 20, не 10: #878 на реальных данных занял 13-е место по
+# модулю дельты среди активной ночи слияний — потолок витрины обязан
+# оставлять запас над измеренным рангом, не быть подогнан ровно под него.
+MERGE_CORRELATION_TOP_N = 20
+
 
 # ── Чек-лист (данные) ────────────────────────────────────────────────────────
 
@@ -188,12 +280,71 @@ def _duration_minutes(run: dict) -> float | None:
     return round((parse_time(updated) - parse_time(started)).total_seconds() / 60, 1)
 
 
+def fetch_workflow_runs_window(repo: str, workflow: str, since: datetime,
+                                 max_pages: int = WORKFLOW_RUNS_MAX_PAGES,
+                                 per_page: int = WORKFLOW_RUNS_PER_PAGE) -> list[dict]:
+    """Прогоны workflow, покрывающие окно `since..now` АДАПТИВНО (не жёстко
+    одна страница, см. докстринг WORKFLOW_RUNS_MAX_PAGES выше): читает
+    страницы (новые прогоны первыми, стандартный порядок GitHub Actions API)
+    и останавливается, как только (а) самый старый прогон страницы старше
+    `since` — граница окна достигнута, дальше читать незачем, либо (б)
+    страница короче `per_page` — прогонов больше нет. `max_pages` — броня
+    сверху на случай аномальной частоты (не даёт читать историю без конца,
+    тот же класс защиты, что уже есть у gather_label_churn)."""
+    runs: list[dict] = []
+    for page in range(1, max_pages + 1):
+        payload = gh(
+            f"repos/{repo}/actions/workflows/{workflow}/runs"
+            f"?per_page={per_page}&page={page}") or {}
+        chunk = payload.get("workflow_runs", [])
+        if not chunk:
+            break
+        runs.extend(chunk)
+        oldest_on_page = parse_time(chunk[-1]["created_at"])
+        if oldest_on_page < since or len(chunk) < per_page:
+            break
+    return runs
+
+
+def _summarize_workflow_runs(runs: list[dict], since: datetime,
+                               recent_cap: int = WORKFLOW_RECENT_SAMPLE_CAP) -> dict:
+    """Чистая свёртка уже полученных прогонов в дайджест одного workflow —
+    отделена от сетевого fetch_workflow_runs_window ради теста без мока gh."""
+    in_window = [r for r in runs if parse_time(r["created_at"]) >= since]
+    by_conclusion: dict[str, int] = {}
+    samples = []
+    for run in in_window:
+        conclusion = run.get("conclusion") or f"in_progress:{run.get('status')}"
+        by_conclusion[conclusion] = by_conclusion.get(conclusion, 0) + 1
+        samples.append({
+            "id": run["id"],
+            "event": run.get("event"),
+            "conclusion": run.get("conclusion"),
+            "status": run.get("status"),
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+            "duration_minutes": _duration_minutes(run),
+            "html_url": run.get("html_url"),
+        })
+    return {
+        "total_in_window": len(in_window),
+        "by_conclusion": by_conclusion,
+        "recent": samples[:recent_cap],
+    }
+
+
 def gather_workflow_digest(repo: str, since: datetime,
-                            workflows: tuple[str, ...] = WATCHED_WORKFLOWS) -> dict:
-    """Прогоны отслеживаемых workflow за окно. Один запрос на workflow
-    (per_page=100, тот же приём, что pulse_guard.recent_runs) — окно
-    SELF_REVIEW_WINDOW_HOURS кратно интервалу диспатча каждого workflow,
-    100 прогонов с запасом покрывает период на всех наблюдаемых.
+                            workflows: tuple[str, ...] = WATCHED_WORKFLOWS,
+                            raw_out: dict[str, list[dict]] | None = None) -> dict:
+    """Прогоны отслеживаемых workflow за окно, адаптивно постранично
+    (`fetch_workflow_runs_window` — см. её докстринг и докстринг
+    WORKFLOW_RUNS_MAX_PAGES: одна страница НЕ покрывала окно у
+    высокочастотных workflow, находка живой доработки 2026-09-12).
+
+    `raw_out`, если передан, получает {workflow: [прогоны в окне]} — ТЕ ЖЕ
+    данные, что уже прочитаны для агрегата, без второго сетевого похода:
+    `gather_merge_correlation` ниже переиспользует их для сравнения
+    до/после слияния, а не запрашивает заново.
 
     Каждый workflow, который не прочитался (RuntimeError — 403/сеть/удалён),
     получает запись {"error": "<текст>"} — ВИДНО модели и человеку, не молча
@@ -202,39 +353,132 @@ def gather_workflow_digest(repo: str, since: datetime,
     failures = 0
     for workflow in workflows:
         try:
-            runs = recent_runs(repo, workflow, per_page=100)
+            runs = fetch_workflow_runs_window(repo, workflow, since)
         except RuntimeError as error:
             digest[workflow] = {"error": str(error)}
             failures += 1
             continue
         in_window = [r for r in runs if parse_time(r["created_at"]) >= since]
-        by_conclusion: dict[str, int] = {}
-        samples = []
-        for run in in_window:
-            conclusion = run.get("conclusion") or f"in_progress:{run.get('status')}"
-            by_conclusion[conclusion] = by_conclusion.get(conclusion, 0) + 1
-            samples.append({
-                "id": run["id"],
-                "event": run.get("event"),
-                "conclusion": run.get("conclusion"),
-                "status": run.get("status"),
-                "created_at": run.get("created_at"),
-                "updated_at": run.get("updated_at"),
-                "duration_minutes": _duration_minutes(run),
-                "html_url": run.get("html_url"),
-            })
-        digest[workflow] = {
-            "total_in_window": len(in_window),
-            "by_conclusion": by_conclusion,
-            # Самые свежие 20 — достаточно, чтобы увидеть серию/аномалию
-            # длительности, не раздувая промпт полным списком за 72ч.
-            "recent": samples[:20],
-        }
+        if raw_out is not None:
+            raw_out[workflow] = in_window
+        digest[workflow] = _summarize_workflow_runs(runs, since)
     if failures == len(workflows):
         raise GatherTransportError(
             f"все {len(workflows)} отслеживаемых workflow не прочитались — "
             "похоже на отказ прав/сети GitHub API, не на затишье конвейера")
     return digest
+
+
+# ── Корреляция слияние → до/после (реализация) ───────────────────────────────
+
+
+def fetch_recent_merges(repo: str, since: datetime, now: datetime,
+                          max_pages: int = MERGE_LOOKUP_MAX_PAGES,
+                          per_page: int = 100) -> list[dict]:
+    """Слитые PR в окне — `state=closed&sort=updated&direction=desc`
+    (сортировка по `updated_at`, не `merged_at` — эндпоинт списка PR не
+    поддерживает сортировку по последнему; используется как разумное
+    приближение, граница названа честно в design.md: PR, обновлённый уже
+    ПОСЛЕ мержа поздней меткой/комментарием, может уйти глубже по списку,
+    чем его momento слияния — при заданном `max_pages` это означает
+    возможный, но не гарантированный пропуск немногих старых слияний, не
+    системную потерю). Останавливается по тому же правилу, что
+    `fetch_workflow_runs_window`: страница короче `per_page` или самый
+    старый элемент страницы (`updated_at`) старше `since`."""
+    merges: list[dict] = []
+    for page in range(1, max_pages + 1):
+        chunk = gh(
+            f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc"
+            f"&per_page={per_page}&page={page}") or []
+        if not chunk:
+            break
+        for pull in chunk:
+            merged_at = pull.get("merged_at")
+            if not merged_at:
+                continue
+            merged_time = parse_time(merged_at)
+            if since <= merged_time <= now:
+                merges.append({
+                    "number": pull["number"],
+                    "title": pull.get("title", ""),
+                    "merged_at": merged_at,
+                })
+        oldest_updated = parse_time(chunk[-1]["updated_at"])
+        if oldest_updated < since or len(chunk) < per_page:
+            break
+    return merges
+
+
+def compute_before_after(runs: list[dict], merge_time: datetime,
+                           half_window_hours: float = BEFORE_AFTER_HOURS,
+                           min_runs: int = MIN_RUNS_PER_SIDE) -> dict | None:
+    """Чистая функция (без сети): доля успеха прогонов workflow в двух
+    симметричных окнах вокруг `merge_time` — `[merge_time - half_window,
+    merge_time)` и `[merge_time, merge_time + half_window)`. `runs` —
+    список прогонов (`created_at`/`conclusion`), уже отфильтрованный по
+    большему окну саморевизии (не нужно второго запроса).
+
+    None — недостаточно данных с ОДНОЙ ИЛИ ОБЕИХ сторон (`min_runs`): шум
+    единичных прогонов не должен претендовать на сигнал (design.md,
+    честная граница — «до было и так плохо» не считается голым числом
+    «после хуже», если само «до» посчитано на паре прогонов)."""
+    half_window = timedelta(hours=half_window_hours)
+    before_start, after_end = merge_time - half_window, merge_time + half_window
+    before = [r for r in runs if before_start <= parse_time(r["created_at"]) < merge_time]
+    after = [r for r in runs if merge_time <= parse_time(r["created_at"]) < after_end]
+    if len(before) < min_runs or len(after) < min_runs:
+        return None
+
+    def success_rate(bucket: list[dict]) -> float:
+        successes = sum(1 for r in bucket if r.get("conclusion") == "success")
+        return successes / len(bucket)
+
+    before_rate, after_rate = success_rate(before), success_rate(after)
+    return {
+        "before_total": len(before),
+        "before_success_rate": round(before_rate, 3),
+        "after_total": len(after),
+        "after_success_rate": round(after_rate, 3),
+        "delta": round(after_rate - before_rate, 3),
+    }
+
+
+def gather_merge_correlation(repo: str, since: datetime, now: datetime,
+                               raw_runs_by_workflow: dict[str, list[dict]],
+                               workflows: tuple[str, ...] = MERGE_CORRELATION_WORKFLOWS,
+                               threshold: float = MERGE_CORRELATION_THRESHOLD,
+                               top_n: int = MERGE_CORRELATION_TOP_N) -> list[dict]:
+    """Сырой сигнал «до/после каждого слияния в окне» — НЕ отдельный класс
+    чек-листа и не готовый вывод: открытый вопрос сам решает, аномалия это
+    или нет (design.md, «Корреляция ≠ причинность»). Best-effort:
+    недоступность списка слияний — запись {"error": ...}, не тихий пропуск.
+
+    Только пары (слияние, workflow) с |delta| >= threshold и обеими
+    сторонами не меньше MIN_RUNS_PER_SIDE (см. compute_before_after)
+    попадают в дайджест — иначе список рос бы на КАЖДОЕ слияние периода
+    (их могут быть десятки), большинство из которых не задевает workflow
+    вовсе."""
+    try:
+        merges = fetch_recent_merges(repo, since, now)
+    except RuntimeError as error:
+        return [{"error": str(error)}]
+    entries = []
+    for merge in merges:
+        merge_time = parse_time(merge["merged_at"])
+        for workflow in workflows:
+            runs = raw_runs_by_workflow.get(workflow, [])
+            result = compute_before_after(runs, merge_time)
+            if result is None or abs(result["delta"]) < threshold:
+                continue
+            entries.append({
+                "pr": merge["number"],
+                "title": merge["title"],
+                "merged_at": merge["merged_at"],
+                "workflow": workflow,
+                **result,
+            })
+    entries.sort(key=lambda entry: abs(entry["delta"]), reverse=True)
+    return entries[:top_n]
 
 
 # Потолок числа issue/PR, чьи таймлайны реально запрашиваются (design.md,
@@ -268,7 +512,18 @@ def gather_label_churn(repo: str, since: datetime, min_toggles: int = 4,
     как один пункт дайджеста, не как отдельная находка (решение — за моделью).
 
     Best-effort: недоступность (403/сеть) — пустой список с явной пометкой
-    ошибки первым элементом, не тихий пропуск."""
+    ошибки первым элементом, не тихий пропуск.
+
+    WATCHDOG_ISSUE (#120) исключается из кандидатов ДО применения потолка
+    `max_issues` — живой замер цены прогона (design.md, «Цена одного
+    прогона»): это ЕДИНСТВЕННЫЙ таймлайн этого прогона, потребовавший
+    несколько десятков страниц (сотни комментариев-эскалаций за годы жизни
+    задачи-статуса), потому что timeline несёт ВСЕ события (включая
+    комментарии), не только labeled/unlabeled — 10 дорогих запросов ради
+    фильтра, отбрасывающего почти все события как нерелевантные. Свои
+    комментарии #120 уже несёт `gather_watchdog_comments` (постранично, но
+    ограничено окном публикации, не всей историей задачи) — вторая, ещё
+    более дорогая проекция того же issue не добавляет нового сигнала."""
     since_param = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         touched = gh(
@@ -276,6 +531,7 @@ def gather_label_churn(repo: str, since: datetime, min_toggles: int = 4,
             f"&since={since_param}&per_page=100") or []
     except RuntimeError as error:
         return [{"error": str(error)}]
+    touched = [entry for entry in touched if entry.get("number") != WATCHDOG_ISSUE]
     counters: dict[tuple[int, str], dict] = {}
     for entry_issue in touched[:max_issues]:
         number = entry_issue.get("number")
@@ -359,10 +615,18 @@ def gather_pool_summary(repo: str) -> dict:
 def gather_digest(repo: str, now: datetime,
                     window_hours: int = SELF_REVIEW_WINDOW_HOURS) -> dict:
     since = now - timedelta(hours=window_hours)
+    raw_runs_by_workflow: dict[str, list[dict]] = {}
+    workflow_digest = gather_workflow_digest(repo, since, raw_out=raw_runs_by_workflow)
     digest = {
         "window": {"since": since.isoformat(), "until": now.isoformat(),
                     "hours": window_hours},
-        "workflow_runs": gather_workflow_digest(repo, since),
+        "workflow_runs": workflow_digest,
+        # Сырой сигнал «до/после каждого слияния в окне» (design.md, класс
+        # «наше изменение сделало систему хуже» — петля меток/красный
+        # workflow видны В МОМЕНТЕ, регрессия видна только В СРАВНЕНИИ).
+        # Переиспользует уже прочитанные прогоны раскрытые выше
+        # (raw_runs_by_workflow) — без второго сетевого похода.
+        "merge_correlation": gather_merge_correlation(repo, since, now, raw_runs_by_workflow),
         "label_churn": gather_label_churn(repo, since),
         "watchdog_comments": gather_watchdog_comments(since),
         "health_snapshots": gather_health_snapshots(repo),
@@ -403,7 +667,15 @@ OPEN_QUESTION = (
     "объяснения? Чего мы не ожидали? Смотри на серии (не единичный провал), "
     "на churn меток (одно и то же issue туда-сюда), на снимки здоровья "
     "(тренд, не точка), на комментарии watchdog-issue (что уже названо, а "
-    "что нет)."
+    "что нет), на merge_correlation (доля успеха workflow ДО и ПОСЛЕ "
+    "конкретного слияния в period — заметный перепад может значить, что "
+    "именно это слияние сделало систему хуже). ВАЖНО про merge_correlation: "
+    "это КОРРЕЛЯЦИЯ по времени, не доказанная причинность — в один и тот же "
+    "интервал могло слиться НЕСКОЛЬКО PR (окно до/после общее для всех), "
+    "смениться внешний провайдер, или совпасть с обычным дневным циклом "
+    "нагрузки; называй слияние ПОДОЗРЕВАЕМЫМ, а не виновным, если не видишь "
+    "в сырых данных отдельного прямого подтверждения (например текста ошибки "
+    "в конкретном упавшем прогоне, совпадающего с тем, что менял этот PR)."
 )
 
 

@@ -276,10 +276,17 @@ def test_cap_exhausted_alert_names_gas():
 # ── Транспорт: отказ прав красит прогон, не возвращает 0 ─────────────────────
 
 
+def _run(run_id, created_at, conclusion="success", updated_at=None):
+    return {"id": run_id, "event": "schedule", "conclusion": conclusion,
+            "status": "completed", "created_at": created_at,
+            "updated_at": updated_at or created_at,
+            "run_started_at": created_at, "html_url": "https://x"}
+
+
 def test_gather_workflow_digest_raises_when_every_workflow_fails(monkeypatch):
-    def _boom(repo, workflow, per_page=100):
+    def _boom(url):
         raise RuntimeError("403 Forbidden")
-    monkeypatch.setattr(self_review, "recent_runs", _boom)
+    monkeypatch.setattr(self_review, "gh", _boom)
     try:
         self_review.gather_workflow_digest("owner/repo", datetime.now(timezone.utc),
                                             workflows=("a.yml", "b.yml"))
@@ -289,18 +296,221 @@ def test_gather_workflow_digest_raises_when_every_workflow_fails(monkeypatch):
 
 
 def test_gather_workflow_digest_partial_failure_is_visible_not_silent(monkeypatch):
-    def _mixed(repo, workflow, per_page=100):
-        if workflow == "broken.yml":
+    def _mixed(url):
+        if "broken.yml" in url:
             raise RuntimeError("network unreachable")
-        return [{"id": 1, "event": "schedule", "conclusion": "success",
-                  "status": "completed", "created_at": "2026-09-11T00:00:00Z",
-                  "updated_at": "2026-09-11T00:05:00Z", "html_url": "https://x"}]
-    monkeypatch.setattr(self_review, "recent_runs", _mixed)
+        if "page=1" in url:
+            return {"workflow_runs": [_run(1, "2026-09-11T00:00:00Z")]}
+        return {"workflow_runs": []}
+    monkeypatch.setattr(self_review, "gh", _mixed)
     since = datetime(2026, 9, 10, tzinfo=timezone.utc)
     digest = self_review.gather_workflow_digest("owner/repo", since,
                                                  workflows=("broken.yml", "ok.yml"))
     assert "error" in digest["broken.yml"]
     assert digest["ok.yml"]["total_in_window"] == 1
+
+
+def test_fetch_workflow_runs_window_stops_on_short_page(monkeypatch):
+    """Одна короткая страница (< per_page) — прогонов больше нет, вторая
+    страница не запрашивается."""
+    calls = []
+
+    def _fake(url):
+        calls.append(url)
+        assert "page=1" in url
+        return {"workflow_runs": [_run(1, "2026-09-12T00:00:00Z")]}
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    runs = self_review.fetch_workflow_runs_window("owner/repo", "x.yml", since)
+    assert len(runs) == 1
+    assert len(calls) == 1
+
+
+def test_fetch_workflow_runs_window_stops_when_page_reaches_window_boundary(monkeypatch):
+    """Полная страница (per_page), но самый старый элемент уже старше
+    `since` — граница окна достигнута, вторая страница не читается, хотя
+    страница была полной (иначе адаптивная пагинация читала бы лишнее)."""
+    full_page = [_run(i, "2026-08-01T00:00:00Z") for i in range(100)]
+    calls = []
+
+    def _fake(url):
+        calls.append(url)
+        return {"workflow_runs": full_page}
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    self_review.fetch_workflow_runs_window("owner/repo", "x.yml", since, per_page=100)
+    assert len(calls) == 1
+
+
+def test_fetch_workflow_runs_window_paginates_across_the_window(monkeypatch):
+    """Высокочастотный workflow (окно шире одной страницы) — читает
+    СТОЛЬКО страниц, сколько нужно, чтобы достать до границы окна, не
+    больше и не меньше (живая находка на orchestra.yml, design.md)."""
+    page1 = [_run(i, "2026-09-11T00:00:00Z") for i in range(3)]  # свежее since
+    page2 = [_run(i, "2026-08-01T00:00:00Z") for i in range(2)]  # старше since, короткая
+
+    def _fake(url):
+        if "page=1" in url:
+            return {"workflow_runs": page1}
+        if "page=2" in url:
+            return {"workflow_runs": page2}
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    runs = self_review.fetch_workflow_runs_window(
+        "owner/repo", "x.yml", since, max_pages=5, per_page=3)
+    assert len(runs) == 5  # обе страницы прочитаны и объединены
+
+
+def test_fetch_workflow_runs_window_respects_max_pages_bound(monkeypatch):
+    """Броня: аномально длинная история не читается без конца — потолок
+    max_pages останавливает пагинацию, даже если страницы всё ещё полные
+    и всё ещё внутри окна."""
+    calls = []
+
+    def _fake(url):
+        calls.append(url)
+        return {"workflow_runs": [_run(1, "2026-09-12T00:00:00Z")] * 100}
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2020, 1, 1, tzinfo=timezone.utc)  # окно «всегда внутри»
+    self_review.fetch_workflow_runs_window("owner/repo", "x.yml", since, max_pages=4)
+    assert len(calls) == 4
+
+
+def test_gather_workflow_digest_populates_raw_out_for_reuse(monkeypatch):
+    """raw_out — переиспользование прогонов gather_merge_correlation'ом без
+    второго сетевого похода."""
+    def _fake(url):
+        if "page=1" in url:
+            return {"workflow_runs": [_run(1, "2026-09-11T00:00:00Z")]}
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    raw_out: dict = {}
+    self_review.gather_workflow_digest("owner/repo", since, workflows=("x.yml",),
+                                        raw_out=raw_out)
+    assert raw_out["x.yml"] == [_run(1, "2026-09-11T00:00:00Z")]
+
+
+# ── Корреляция слияние → до/после ────────────────────────────────────────────
+
+
+def test_compute_before_after_none_when_sample_too_small():
+    runs = [_run(1, "2026-09-10T20:00:00Z"), _run(2, "2026-09-10T21:00:00Z")]
+    merge_time = datetime(2026, 9, 10, 22, tzinfo=timezone.utc)
+    assert self_review.compute_before_after(runs, merge_time) is None
+
+
+def test_compute_before_after_detects_regression_like_878():
+    """Форма РЕАЛЬНОГО инцидента #878 (design.md §5.3) — дословные
+    timestamp'ы и conclusion живого прогона worker.yml на этом
+    репозитории, окно 8ч (BEFORE_AFTER_HOURS): до слияния 3 успеха из 4,
+    сразу после — 6 провалов из 6 подряд, прежде чем случился первый
+    успех в 07:58 (уже за пределами этого окна)."""
+    before = [_run(i, t, conclusion=c) for i, (t, c) in enumerate([
+        ("2026-09-10T15:03:21Z", "failure"),
+        ("2026-09-10T15:49:42Z", "success"),
+        ("2026-09-10T21:14:12Z", "success"),
+        ("2026-09-10T21:43:11Z", "success"),
+    ])]
+    after = [_run(100 + i, t, conclusion="failure") for i, t in enumerate([
+        "2026-09-11T00:53:31Z", "2026-09-11T01:23:28Z", "2026-09-11T03:09:01Z",
+        "2026-09-11T03:39:39Z", "2026-09-11T04:04:32Z", "2026-09-11T06:02:36Z",
+    ])]
+    merge_time = datetime(2026, 9, 10, 22, 54, 34, tzinfo=timezone.utc)
+    result = self_review.compute_before_after(before + after, merge_time,
+                                               half_window_hours=self_review.BEFORE_AFTER_HOURS)
+    assert result is not None
+    assert result["before_total"] == 4
+    assert result["after_total"] == 6
+    assert result["before_success_rate"] == 0.75
+    assert result["after_success_rate"] == 0.0
+    assert result["delta"] == -0.75
+
+
+def test_compute_before_after_no_signal_when_stable():
+    before = [_run(i, t) for i, t in enumerate(
+        ["2026-09-10T10:00:00Z", "2026-09-10T11:00:00Z", "2026-09-10T12:00:00Z"])]
+    after = [_run(100 + i, t) for i, t in enumerate(
+        ["2026-09-11T01:00:00Z", "2026-09-11T02:00:00Z", "2026-09-11T03:00:00Z"])]
+    merge_time = datetime(2026, 9, 10, 22, tzinfo=timezone.utc)
+    result = self_review.compute_before_after(before + after, merge_time, half_window_hours=12)
+    assert result["delta"] == 0.0
+
+
+def test_fetch_recent_merges_filters_by_window_and_stops_on_short_page(monkeypatch):
+    def _fake(url):
+        assert "state=closed" in url and "sort=updated" in url
+        return [
+            {"number": 1, "title": "старый", "merged_at": "2026-08-01T00:00:00Z",
+             "updated_at": "2026-08-01T00:00:00Z"},
+            {"number": 2, "title": "в окне", "merged_at": "2026-09-11T00:00:00Z",
+             "updated_at": "2026-09-11T00:00:00Z"},
+            {"number": 3, "title": "не смёржен", "merged_at": None,
+             "updated_at": "2026-09-11T01:00:00Z"},
+        ]
+
+    monkeypatch.setattr(self_review, "gh", _fake)
+    since = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    merges = self_review.fetch_recent_merges("owner/repo", since, now)
+    assert [m["number"] for m in merges] == [2]
+
+
+def test_gather_merge_correlation_reports_error_not_silence(monkeypatch):
+    def _boom(url):
+        raise RuntimeError("403 Forbidden")
+    monkeypatch.setattr(self_review, "gh", _boom)
+    result = self_review.gather_merge_correlation(
+        "owner/repo", datetime.now(timezone.utc), datetime.now(timezone.utc), {})
+    assert result and "error" in result[0]
+
+
+def test_gather_merge_correlation_flags_regression_above_threshold(monkeypatch):
+    merge_time_str = "2026-09-10T22:54:34Z"
+
+    def _fake_gh(url):
+        return [{"number": 878, "title": "мерж, ломающий воркер",
+                  "merged_at": merge_time_str, "updated_at": merge_time_str}]
+
+    monkeypatch.setattr(self_review, "gh", _fake_gh)
+    before = [_run(i, t) for i, t in enumerate(
+        ["2026-09-10T15:00:00Z", "2026-09-10T18:00:00Z", "2026-09-10T21:00:00Z"])]
+    after = [_run(100 + i, t, conclusion="failure") for i, t in enumerate(
+        ["2026-09-11T00:00:00Z", "2026-09-11T01:00:00Z", "2026-09-11T02:00:00Z"])]
+    raw = {"worker.yml": before + after}
+    since = datetime(2026, 9, 9, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    result = self_review.gather_merge_correlation("owner/repo", since, now, raw,
+                                                    workflows=("worker.yml",))
+    assert len(result) == 1
+    assert result[0]["pr"] == 878
+    assert result[0]["delta"] == -1.0
+
+
+def test_gather_merge_correlation_ignores_small_deltas(monkeypatch):
+    merge_time_str = "2026-09-10T22:54:34Z"
+
+    def _fake_gh(url):
+        return [{"number": 1, "title": "безобидный мерж",
+                  "merged_at": merge_time_str, "updated_at": merge_time_str}]
+
+    monkeypatch.setattr(self_review, "gh", _fake_gh)
+    before = [_run(i, t) for i, t in enumerate(
+        ["2026-09-10T15:00:00Z", "2026-09-10T18:00:00Z", "2026-09-10T21:00:00Z"])]
+    after = [_run(100 + i, t) for i, t in enumerate(
+        ["2026-09-11T00:00:00Z", "2026-09-11T01:00:00Z", "2026-09-11T02:00:00Z"])]
+    raw = {"worker.yml": before + after}
+    since = datetime(2026, 9, 9, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    result = self_review.gather_merge_correlation("owner/repo", since, now, raw,
+                                                    workflows=("worker.yml",))
+    assert result == []
 
 
 def test_gather_label_churn_reports_error_not_empty_silence(monkeypatch):
@@ -331,6 +541,30 @@ def test_gather_label_churn_is_bounded_not_full_history(monkeypatch):
     monkeypatch.setattr(self_review.review_labels, "list_timeline", _fake_timeline)
     self_review.gather_label_churn("owner/repo", datetime.now(timezone.utc), max_issues=3)
     assert calls == {"gh": 1, "timeline": 3}
+
+
+def test_gather_label_churn_excludes_watchdog_issue(monkeypatch):
+    """Живой замер цены прогона (design.md, «Цена одного прогона»): таймлайн
+    WATCHDOG_ISSUE (#120) — единственный, потребовавший ДЕСЯТКИ страниц
+    (сотни комментариев-эскалаций), хотя почти ни одно из этих событий не
+    labeled/unlabeled — фильтр «>= min_toggles» отбрасывал их все, а цена
+    (10 запросов) уже потрачена. Исключаем #120 ИЗ КАНДИДАТОВ до применения
+    max_issues — его собственные комментарии несёт gather_watchdog_comments,
+    вторая дорогая проекция того же issue не добавляет сигнала."""
+    timelines_requested = []
+
+    def _fake_gh(url):
+        return [{"number": self_review.WATCHDOG_ISSUE}, {"number": 782}]
+
+    def _fake_timeline(repo, number, gh_func):
+        timelines_requested.append(number)
+        return []
+
+    monkeypatch.setattr(self_review, "gh", _fake_gh)
+    monkeypatch.setattr(self_review.review_labels, "list_timeline", _fake_timeline)
+    self_review.gather_label_churn("owner/repo", datetime.now(timezone.utc), max_issues=40)
+    assert self_review.WATCHDOG_ISSUE not in timelines_requested
+    assert timelines_requested == [782]
 
 
 def test_gather_label_churn_counts_toggles_above_threshold(monkeypatch):
