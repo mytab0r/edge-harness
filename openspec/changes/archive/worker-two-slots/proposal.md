@@ -56,9 +56,10 @@ false}` — ровно один воркер на весь репозитори�
   `worker_runs_active` — семантика НЕ изменилась («хотя бы один активен»,
   используется `mechanical_rebase.py` и эскалацией `dispatch_conflict_rework`
   как консервативный признак «воркер может пушить в любую ветку прямо
-  сейчас», это репо-wide факт, не про конкретный слот). Три диспетчера,
+  сейчас», это репо-wide факт, не про конкретный слот). Четыре диспетчера,
   реально отправляющие `workflow_dispatch` (`dispatch_worker` — 2 точки,
-  `dispatch_conflict_rework` — 1 точка), переведены на `free_worker_slot`:
+  `dispatch_conflict_rework` — 1 точка, `dispatch_ai_review_rework` —
+  1 точка), переведены на `free_worker_slot`:
   свободен хотя бы один слот — dispatch уходит туда (`-f inputs[slot]=N`);
   оба заняты — прежнее поведение (наблюдение, без действия).
   `stalled_worker_runs` (было `stalled_worker_run`, единственное число) и

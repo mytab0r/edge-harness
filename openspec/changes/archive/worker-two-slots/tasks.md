@@ -8,9 +8,11 @@
       консервативно N=2»).
 - [x] `scheduler.py::active_worker_runs`/`free_worker_slot` — единый источник
       занятости слотов и выбора свободного.
-- [x] `scheduler.py::dispatch_worker` (обе точки dispatch) и
-      `dispatch_conflict_rework` (одна точка dispatch) — переведены на
-      `free_worker_slot`, передают `-f inputs[slot]=N`.
+- [x] `scheduler.py::dispatch_worker` (обе точки dispatch),
+      `dispatch_conflict_rework` (одна точка dispatch) и
+      `dispatch_ai_review_rework` (одна точка dispatch) — четыре точки
+      всего, переведены на `free_worker_slot`, передают
+      `-f inputs[slot]=N`.
 - [x] `scheduler.py::worker_runs_active` — семантика сохранена («хотя бы один
       активен»), используется `mechanical_rebase.py` и веткой эскалации
       `dispatch_conflict_rework` без изменений.
