@@ -100,7 +100,8 @@ def open_audit_tasks(repo: str) -> list[dict]:
     """Постранично (класс #308) — сырая первая страница молча теряла бы
     задачи само-аудита за первой сотней открытых issues с меткой self-audit."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=open&labels={SELF_AUDIT_LABEL}&per_page=100", pulse_guard.gh)
+        f"repos/{repo}/issues?state=open&labels={review_labels.label_query_value(SELF_AUDIT_LABEL)}"
+        "&per_page=100", pulse_guard.gh)
     return [issue for issue in issues if "pull_request" not in issue]
 
 
@@ -118,7 +119,8 @@ def audit_tasks_created_since(repo: str, since: datetime) -> int:
     раньше `since` — суточный потолок по факту создания, не по текущей
     открытости (закрытая сегодня задача всё равно заняла квоту суток)."""
     issues = review_labels.list_pages(
-        f"repos/{repo}/issues?state=all&labels={SELF_AUDIT_LABEL}&per_page=100", pulse_guard.gh)
+        f"repos/{repo}/issues?state=all&labels={review_labels.label_query_value(SELF_AUDIT_LABEL)}"
+        "&per_page=100", pulse_guard.gh)
     return sum(
         1 for issue in issues
         if "pull_request" not in issue and pulse_guard.parse_time(issue["created_at"]) >= since

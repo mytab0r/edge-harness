@@ -272,7 +272,7 @@ def test_waiting_owner_check_quiet_when_pool_empty():
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return []
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
@@ -297,7 +297,7 @@ def test_waiting_owner_check_auto_labels_new_candidate(monkeypatch):
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return [{"number": 500, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return []
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
@@ -320,7 +320,7 @@ def test_waiting_owner_check_reports_failed_auto_label_not_silently(monkeypatch)
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return [{"number": 500, "labels": [{"name": "task"}], "body": NEW_FORMAT_BODY}]
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return []
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
@@ -343,7 +343,7 @@ def test_waiting_owner_check_resolves_on_decision_comment(monkeypatch, offline_t
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return [{"number": 500, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
                      "body": NEW_FORMAT_BODY}]
         if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
@@ -355,6 +355,13 @@ def test_waiting_owner_check_resolves_on_decision_comment(monkeypatch, offline_t
     assert lines == ["✅ #500: решение получено (вариант 1), метка снята"]
     deleted = [c for c in calls if c[0] == "-X" and c[1] == "DELETE" and "issues/500/labels" in c[2]]
     assert deleted, "ожидался DELETE issues/500/labels/waiting:owner"
+    # Сегмент метки в пути обязан быть кодированным (класс #938): gh api
+    # разворачивает `:owner` в пути как свой плейсхолдер, сырая форма
+    # `labels/waiting:owner` уходит на сервер как `labels/waitingmytab0r`
+    # и молча отвечает 404. Точный URL, не подстрока `issues/500/labels`,
+    # — иначе сырая форма проходила бы этот тест молча.
+    assert deleted[0][2] == f"repos/{REPO}/issues/500/labels/waiting%3Aowner", (
+        f"сегмент метки в пути DELETE обязан быть URL-кодированным, пришло: {deleted[0][2]}")
     commented = [c for c in calls if c[0] == "-X" and c[1] == "POST" and "issues/500/comments" in c[2]]
     assert commented, "подтверждение обязано быть оставлено в задаче"
 
@@ -371,7 +378,7 @@ def test_waiting_owner_check_escalates_without_prior_marker(monkeypatch, offline
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return [{"number": 500, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
                      "body": NEW_FORMAT_BODY, "title": "Нужно решение"}]
         if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
@@ -400,7 +407,7 @@ def test_waiting_owner_check_passes_variant_labels_as_escalate_options(monkeypat
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return [{"number": 500, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
                      "body": NEW_FORMAT_BODY, "title": "Нужно решение"}]
         if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
@@ -428,7 +435,7 @@ def test_waiting_owner_check_escalates_without_options_when_variants_not_machine
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return [{"number": 370, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
                      "body": ISSUE_370_BODY, "title": "Нужно решение"}]
         if url == f"repos/{REPO}/issues/370/comments?per_page=100&page=1":
@@ -454,7 +461,7 @@ def test_waiting_owner_check_silent_channel_when_already_escalated_recently(monk
         url = args[0]
         if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
             return []
-        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting:owner"):
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
             return [{"number": 500, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
                      "body": NEW_FORMAT_BODY, "title": "Нужно решение"}]
         if url == f"repos/{REPO}/issues/500/comments?per_page=100&page=1":
