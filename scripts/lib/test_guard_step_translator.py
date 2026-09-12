@@ -32,7 +32,12 @@ test_translate_repo_ci_raises_when_blank_line_inside_run_corrupts_neighbor
 test_translate_repo_ci_preserves_unrelated_job_with_blank_lines_in_heredoc
 (чужой job теряет пустую строку в heredoc). Убери проверку `${{` в
 run_text — краснеет
-test_translate_repo_ci_raises_when_run_contains_actions_expression.
+test_translate_repo_ci_raises_when_run_contains_actions_expression. Убери
+проверку `catalog_invocations` (цель `run:` лежит в scripts/ci/guards/ —
+находка ревью PR #902, третий круг) — краснеет
+test_translate_repo_ci_raises_when_step_invokes_existing_catalog_file
+(DID NOT RAISE: обёртка вокруг файла каталога заводится молча, гвардия
+стала бы исполняться дважды).
 
 Запуск: python -m pytest scripts/lib/test_guard_step_translator.py -q
 """
@@ -488,6 +493,58 @@ def test_translate_repo_ci_raises_when_run_contains_actions_expression(tmp_path)
 
     assert repo_ci.read_text(encoding="utf-8") == original
     assert list(catalog_dir.glob("*.sh")) == []
+
+
+# ── Fail loud: run: вызывает уже существующий файл каталога (ревью ──────────
+# ── PR #902, третий круг) ────────────────────────────────────────────────────
+
+
+def test_translate_repo_ci_raises_when_step_invokes_existing_catalog_file(tmp_path):
+    """Рукописный шаг, чей run: вызывает УЖЕ СУЩЕСТВУЮЩИЙ файл каталога с
+    нестем-`-guard` именем (класс обхода (б) из #771 — «Проверка окружения»
+    → `bash scripts/ci/guards/ci-guard-registration.sh`), раньше переносился
+    «успешно»: транслятор заводил в каталоге обёртку
+    `ci-guard-registration-guard.sh` с телом `bash scripts/ci/guards/
+    ci-guard-registration.sh`, шаг из repo-ci.yml удалялся, CI зелёный — а
+    настоящая гвардия отныне исполнялась ДВАЖДЫ
+    (`check_catalog_handwritten_overlap` это не видит: цель обёртки — путь
+    каталога, пересечения с рукописными шагами нет), и мутация-критерий
+    #749 («удали файл каталога → должно покраснеть») молча не срабатывала.
+    На стемах `-guard` тот же класс спасала только проверка коллизии —
+    живые стемы каталога (`ci-guard-registration.sh`,
+    `run-guards-mechanism.sh`) не всегда `-guard`.
+
+    Мутация, доказывающая класс: убери проверку `catalog_invocations` в
+    translate_repo_ci — тест краснеет (DID NOT RAISE), в каталоге
+    появляется обёртка, repo-ci.yml теряет рукописный шаг."""
+    text = (
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        '      - name: "База"\n'
+        "        run: echo base\n"
+        "\n"
+        "      - name: Проверка окружения\n"
+        "        run: bash scripts/ci/guards/ci-guard-registration.sh\n"
+    )
+    repo_root, repo_ci, catalog_dir = _write(tmp_path, text)
+    (catalog_dir / "ci-guard-registration.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "python scripts/lib/ci_guard_registration_guard.py\n",
+        encoding="utf-8",
+    )
+    original = repo_ci.read_text(encoding="utf-8")
+
+    with pytest.raises(gst.UnsupportedStepError, match="уже зарегистрирована"):
+        gst.translate_repo_ci(
+            repo_root, repo_ci=repo_ci, catalog_dir=catalog_dir, allowlist=frozenset({"База"}),
+        )
+
+    # Атомарность: repo-ci.yml не тронут, в каталоге только исходный файл —
+    # никакой обёртки не появилось.
+    assert repo_ci.read_text(encoding="utf-8") == original
+    assert sorted(p.name for p in catalog_dir.glob("*.sh")) == ["ci-guard-registration.sh"]
 
 
 # ── _slug_from_target: правило именования детерминировано ───────────────────

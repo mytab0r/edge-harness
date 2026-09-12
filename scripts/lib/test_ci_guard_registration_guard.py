@@ -304,6 +304,31 @@ def test_check_message_falls_back_to_generic_rule_when_target_not_extractable(tm
     assert "test_foo.py" in problems[0]  # правило именования объяснено примером
 
 
+def test_check_message_advises_deletion_when_step_invokes_catalog_file(tmp_path):
+    """Находка ревью PR #902 (третий круг): run: шага сам вызывает файл
+    каталога с нестем-`-guard` именем — гвардия уже зарегистрирована,
+    переносить нечего. Общий газ («создай scripts/ci/guards/<имя>-guard.sh»,
+    куда честно падал `_suggest_guard_filename`) здесь советовал бы обёртку,
+    исполняющую гвардию ДВАЖДЫ (класс обхода (б) из #771); газ для этого
+    класса — удаление шага, каталог не трогается вовсе.
+
+    Мутация, доказывающая класс: убери ветку `catalog_invocations` в
+    check_no_undeclared_step — тест краснеет («создай» появляется, совета
+    удалить шаг нет)."""
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    path = _write_repo_ci_full(tmp_path, [
+        {"name": "Тесты X", "run": "echo hi"},
+        {"name": "Проверка окружения", "run": "bash scripts/ci/guards/ci-guard-registration.sh"},
+    ])
+    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}), catalog_dir=catalog_dir)
+    assert len(problems) == 1, problems
+    assert "УЖЕ зарегистрирована" in problems[0]
+    assert "ci-guard-registration.sh" in problems[0]
+    assert "удали рукописный шаг целиком" in problems[0]
+    assert "создай" not in problems[0]  # совет завести обёртку недопустим
+
+
 # ── Живой снимок: сама гвардия на реальном repo-ci.yml ──────────────────────
 
 def test_live_repo_ci_matches_frozen_allowlist():

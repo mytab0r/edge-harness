@@ -39,9 +39,23 @@
       commit_fails` (GitError вылетает исключением).
 - [x] Газ в `ci_guard_registration_guard.py::check_no_undeclared_step` —
       точное имя файла каталога вместо общей ссылки на #749.
+- [x] Шаг, чей `run:` сам вызывает файл каталога (класс обхода (б) из #771,
+      находка ревью PR #902, третий круг): стемы живых файлов каталога не
+      всегда кончаются на `-guard` (`ci-guard-registration.sh`), поэтому
+      проверка коллизии этот класс не ловила — транслятор молча заводил
+      обёртку `<имя>-guard.sh` с телом `bash scripts/ci/guards/<файл>.sh`,
+      гвардия исполнялась дважды, мутация-критерий #749 не срабатывала.
+      Теперь громкий `UnsupportedStepError` по тому же критерию
+      `_is_guard_catalog_invocation` (одно место правды), газ гвардии
+      регистрации для этого класса советует удалить шаг, а не создать
+      обёртку. Мутационно доказано: снятие проверки в translate_repo_ci
+      краснит `test_translate_repo_ci_raises_when_step_invokes_existing_
+      catalog_file` (DID NOT RAISE), снятие ветки газа краснит
+      `test_check_message_advises_deletion_when_step_invokes_catalog_file`
+      («создай» появляется, совета удалить нет).
 - [x] Гвардия транслятора в `scripts/ci/guards/guard-step-translator.sh`.
-- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (15),
-      `scripts/lib/test_ci_guard_registration_guard.py` (+2),
+- [x] Тесты: `scripts/lib/test_guard_step_translator.py` (16),
+      `scripts/lib/test_ci_guard_registration_guard.py` (+3),
       `scripts/orchestra/test_mechanical_rebase.py` (+5).
 - [x] Отклонение от текста задачи #897 про «бит исполнения» зафиксировано в
       `proposal.md` (файлы каталога — `100644`, вызов через интерпретатор,
