@@ -226,7 +226,7 @@ def format_namespace_breakdown(days_summary: list[tuple[date, dict]]) -> str:
     Форма — по дням, а не только сумма (живой замер #678, 2026-09-12):
     атрибуция записи конкретному namespace нужна ПО ДНЯМ — сумма за N суток
     смешивает дни с разным числом прогонов и не даёт отделить полный день
-    от частичного. Итог «все дни» сохраняется для сходимости с суточной
+    от частичного. Итоговая таблица сохраняется для сходимости с суточной
     таблицей выше."""
     if not any(day_summary["by_namespace"] for _, day_summary in days_summary):
         return "разбивка по namespaceId недоступна в этом датасете"
@@ -249,10 +249,16 @@ def format_namespace_breakdown(days_summary: list[tuple[date, dict]]) -> str:
                 f"{day.isoformat()} | {ns} | {val.get('rows_read', 0):,} | "
                 f"{val.get('rows_written', 0):,}"
             )
-    lines.append("---|---|---|---")
+    # Итог — ОТДЕЛЬНОЙ таблицей: разделитель «---» внутри таблицы в markdown
+    # неотличим от заголовочного и рендерится второй шапкой (находка ревью
+    # PR #698, раунд 3).
+    lines.append("")
+    lines.append("итог за все снятые дни |")
+    lines.append("namespaceId | rows_read | rows_written")
+    lines.append("---|---|---")
     for ns, val in sorted(totals.items(),
                           key=lambda kv: (-kv[1]["rows_written"], -kv[1]["rows_read"])):
-        lines.append(f"все дни | {ns} | {val['rows_read']:,} | {val['rows_written']:,}")
+        lines.append(f"{ns} | {val['rows_read']:,} | {val['rows_written']:,}")
     return "\n".join(lines)
 
 
