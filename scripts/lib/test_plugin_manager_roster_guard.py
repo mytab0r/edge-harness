@@ -12,6 +12,12 @@ plugin_manager_roster_guard.py делает test_real_incident_0a85ddf5_is_flagg
 регресс).
 
 Запуск: python -m pytest scripts/lib/test_plugin_manager_roster_guard.py -q
+
+Данные живого инцидента — фикстура fixtures_plugin_manifest_incident_0a85ddf5.json
+(прод-форма: реальные dsh-edge/plugins.json до/после 0a85ddf5, снятые `git show`),
+НЕ чтение git-истории из теста: actions/checkout в CI — depth-1, произвольные
+коммиты там отсутствуют, `git show 0a85ddf5^` падает «fatal: invalid object name»
+и красит обязательный чек test (находка ai-review PR #986).
 """
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
@@ -30,23 +36,20 @@ import sys
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 guard = importlib.import_module("plugin_manager_roster_guard")
 
 # Живой инцидент #806/#412: коммит 0a85ddf5 добавил agents-tasks в
-# dsh-edge/plugins.json без пересборки plugin-manager.
-INCIDENT_COMMIT = "0a85ddf5"
+# dsh-edge/plugins.json без пересборки plugin-manager. Оба состояния манифеста
+# (до/после) — фикстура, прод-форма, офлайн, не зависит от глубины чекаута.
+INCIDENT_FIXTURE = Path(__file__).resolve().parent / (
+    "fixtures_plugin_manifest_incident_0a85ddf5.json"
+)
 
 
-def _manifest_at(revision: str) -> dict:
-    """Реальное содержимое dsh-edge/plugins.json на заданной ревизии этого же
-    репозитория (прод-форма, не пересказ) — `git show`, офлайн, без сети."""
-    result = subprocess.run(
-        ["git", "show", f"{revision}:dsh-edge/plugins.json"],
-        cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", check=True,
-    )
-    return json.loads(result.stdout)
+def _incident_manifests():
+    fixture = json.loads(INCIDENT_FIXTURE.read_text(encoding="utf-8"))
+    return fixture["before_0a85ddf5"], fixture["after_0a85ddf5"]
 
 
 def test_roster_projection_keeps_order_and_only_named_fields():
@@ -103,9 +106,16 @@ def test_roster_change_with_manager_bump_is_clean():
 
 def test_real_incident_0a85ddf5_is_flagged():
     """Прод-форма данных: реальный dsh-edge/plugins.json до/после коммита,
-    который и вызвал issue #806 — гвардия обязана была бы покраснеть тогда."""
-    old_manifest = _manifest_at(f"{INCIDENT_COMMIT}^")
-    new_manifest = _manifest_at(INCIDENT_COMMIT)
+    который и вызвал issue #806 (фикстура — прод-форма, снятая `git show`;
+    тест не читает git-историю: checkout в CI depth-1, см. докстринг модуля) —
+    гвардия обязана была бы покраснеть тогда."""
+    old_manifest, new_manifest = _incident_manifests()
+    # Санити фикстуры: она обязана оставаться реальной формой инцидента.
+    assert [p["id"] for p in old_manifest["plugins"]] == [
+        "hello", "runner-bridge", "plugin-manager", "integrations", "provider-registry",
+    ]
+    assert [p["id"] for p in new_manifest["plugins"]][-1] == "agents-tasks"
+    assert guard.plugin_manager_source(old_manifest) == guard.plugin_manager_source(new_manifest)
     assert len(old_manifest["plugins"]) == 5
     assert len(new_manifest["plugins"]) == 6
     violation = guard.roster_bump_violation(old_manifest, new_manifest)
