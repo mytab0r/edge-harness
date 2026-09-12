@@ -157,8 +157,11 @@ Workflow держит concurrency-группу `orchestra`: два запуск�
       заводится), бюджет AI_REWORK_MAX_ATTEMPTS попыток НА ОТПЕЧАТОК диффа
       (review_labels.diff_fingerprint — дедуп «тот же head, тот же
       отпечаток находок», не лифтайм на PR: новый отпечаток — новая, ещё не
-      пробованная задача), исчерпание эскалирует тем же каналом (#120), что
-      и предохранитель конвейера. Порядок в main() — после dispatch_
+      пробованная задача), исчерпание различает ТРИ исхода, не один (#1027):
+      инфра-отказ самого прогона (conclusion в FAILURE_CONCLUSIONS) —
+      автоповтор без эскалации; success/нет атрибуции — эскалация тем же
+      каналом (#120), что и предохранитель конвейера (детали и исход «PR
+      уже закрыт» — в докстринге dispatch_ai_review_rework). Порядок в main() — после dispatch_
       conflict_rework, до wip_gate/dispatch_worker: доводка существующих PR
       обязана иметь приоритет перед взятием НОВЫХ задач (прямая связь с
       п.15 — WIP-гейт душит новые задачи именно потому, что открытых PR,
@@ -1137,6 +1140,7 @@ def dispatch_ai_review_rework(
     dispatched = False
     pool_by_number = {issue["number"]: issue for issue in pool}
     for pull in pulls:
+        infra_retry = False  # Исход 1: этот диспатч — повтор после инфра-отказа, бюджет не тратит
         labels = {label["name"] for label in pull["labels"]}
         if review_labels.AI_CHANGES not in labels:
             continue
@@ -1220,6 +1224,7 @@ def dispatch_ai_review_rework(
                 # (квота/окружение) поднимет ОБЩИЙ счётчик красных прогонов
                 # worker.yml и остановит диспатч через conveyor_gate (#120) —
                 # второй тормоз здесь не заводим.
+                infra_retry = True
                 observations.append(
                     f"🔁 PR #{number}: авто-доводка ({attempts}/{AI_REWORK_MAX_ATTEMPTS} "
                     "на этом отпечатке) не в счёт эскалации — последний прогон worker.yml "
@@ -1233,13 +1238,29 @@ def dispatch_ai_review_rework(
                 # тот СНОВА нашёл нарушения на нём), либо атрибуции нет вовсе
                 # (аренда сгорела до следа воркера) — ни один из двух не наш
                 # инфра-отказ, дальше без человека не разобраться.
-                reason = (
-                    "worker.yml отработал успешно (rc=0, провайдер ответил, новый коммит "
-                    "дошёл до ai-review), но ai-review снова нашёл нарушения на этом коммите"
-                    if run_conclusion == "success"
-                    else "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
-                    "до следа?) — см. лог worker.yml вручную"
-                )
+                if run_conclusion == "success":
+                    reason = (
+                        "worker.yml отработал успешно (rc=0, провайдер ответил, новый коммит "
+                        "дошёл до ai-review), но ai-review снова нашёл нарушения на этом коммите"
+                    )
+                elif run_conclusion is None:
+                    reason = (
+                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
+                        "до следа?) — см. лог worker.yml вручную"
+                    )
+                else:
+                    # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
+                    # — timed_out (worker.yml несёт timeout-minutes: 280, висяк
+                    # даёт именно его) или startup_failure. «Алерт не гадает»
+                    # (#472, находка ai-review PR #1030): факт уже в руках —
+                    # называем conclusion как есть, не подменяем его неверным
+                    # утверждением про атрибуцию. Решение то же (эскалация —
+                    # это не наш класс инфра-отказа), врёт только текст.
+                    reason = (
+                        f"последний прогон worker.yml по этой задаче завершился с "
+                        f"conclusion={run_conclusion!r} — не success и не известный "
+                        "инфра-отказ, см. лог worker.yml вручную"
+                    )
                 text = (
                     f"🚨 edge-harness: {marker}\n"
                     f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
@@ -1280,17 +1301,29 @@ def dispatch_ai_review_rework(
             "-X", "POST", f"repos/{repo}/actions/workflows/worker.yml/dispatches",
             "-f", "ref=main", "-f", f"inputs[task]={task_number}",
         )
+        # Повтор после инфра-отказа (Исход 1) падает сюда с attempts уже
+        # равным AI_REWORK_MAX_ATTEMPTS — «попытка {attempts+1}/{max}» печатало
+        # бы несуществующее «2/1» (некритичная находка ai-review PR #1030,
+        # чеклист): эта попытка бюджет НЕ расходует, дробь здесь врёт.
+        # Повтор после инфра-отказа (Исход 1) падает сюда с attempts уже
+        # равным AI_REWORK_MAX_ATTEMPTS — «попытка {attempts+1}/{max}» печатало
+        # бы несуществующее «2/1» (некритичная находка ai-review PR #1030,
+        # чеклист): эта попытка бюджет НЕ расходует, дробь здесь врёт.
+        attempt_note = (
+            "повтор после инфра-отказа прогона "
+            f"(исчерпанные {attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке не в счёт)"
+            if infra_retry
+            else f"попытка {attempts + 1}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке диффа"
+        )
         post_issue_comment(
             repo, number,
             f"🤖 {AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение с задачи "
-            f"#{task_number} и запустил worker.yml адресно (попытка {attempts + 1}/"
-            f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке диффа) на доводку по находкам "
+            f"#{task_number} и запустил worker.yml адресно ({attempt_note}) на доводку по находкам "
             "ai-review — см. gh pr view --comments.",
         )
         actions.append(
             f"🔧 PR #{number} с ai:changes-requested — задача #{task_number} освобождена "
-            f"({release_note}), worker.yml запущен адресно на доводку (попытка "
-            f"{attempts + 1}/{AI_REWORK_MAX_ATTEMPTS})"
+            f"({release_note}), worker.yml запущен адресно на доводку ({attempt_note})"
         )
         dispatched = True
     return observations, actions, dispatched

@@ -3660,6 +3660,16 @@ def test_dispatch_ai_review_rework_retries_instead_of_escalating_after_infra_fai
     assert posted and posted[0][0] == 1020
     assert any("не в счёт эскалации" in line and "failure" in line for line in observations)
     assert task["assignees"] == []
+    # Повтор после инфра-отказа идёт с attempts == AI_REWORK_MAX_ATTEMPTS —
+    # «попытка {attempts+1}/{max}» печатало бы несуществующее «2/1»
+    # (некритичная находка ai-review PR #1030, чеклист): бюджет эта попытка
+    # не расходует. Мутация: верни пост-комментарию/actions безусловную дробь
+    # «(попытка {attempts + 1}/{AI_REWORK_MAX_ATTEMPTS} …)» без ветки
+    # `infra_retry` — тест покраснеет на обоих утверждениях ниже.
+    assert "2/1" not in posted[0][1]
+    assert "повтор после инфра-отказа" in posted[0][1]
+    assert all("2/1" not in line for line in actions)
+    assert any("повтор после инфра-отказа" in line for line in actions)
 
 
 def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_persist(monkeypatch):
@@ -3688,6 +3698,37 @@ def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_
     assert "снова нашёл нарушения" in escalated[0][2]
     assert any("исчерпана" in line and "#1020" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_conclusion(monkeypatch):
+    """Исход 2, атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
+    (некритичная находка ai-review PR #1030 → блокирующая, «алерт не гадает»
+    #472): worker.yml несёт timeout-minutes: 280 — висяк даёт
+    conclusion='timed_out' у АТРИБУТИРОВАННОГО прогона. Текст эскалации
+    обязан назвать conclusion как есть, а не подменять его утверждением
+    «не атрибутирован (аренда сгорела до следа?)» — факт у кода уже в руках.
+    Решение не трогается: это не наш класс инфра-отказа, эскалация законна.
+    Мутация: верни двухветвный `reason` (всё, что не 'success' → «не
+    атрибутирован»), без ветки `run_conclusion is None` — тест покраснеет
+    на обоих утверждениях ниже."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000003, "timed_out", dispatched_since="2026-09-12T10:00:00Z")
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "не атрибутирован" not in escalated[0][2]  # атрибуция ЕСТЬ — врать о ней нельзя
+    assert "conclusion='timed_out'" in escalated[0][2]  # честный repr факта
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
 
 
 def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monkeypatch):
