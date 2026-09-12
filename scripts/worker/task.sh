@@ -331,9 +331,18 @@ if [ "$pr_rc" -eq 0 ]; then
   echo "На задачу #$number уже открыт PR #$CONTINUE_PR_NUMBER (ветка $CONTINUE_HEAD_REF) — довожу его, новый не открываю"
 fi
 
-# ── 2. Промпт: тело задачи + критерий + playbook + маршрут протокола ──────────────
+# ── 2. Промпт: тело задачи + критерий + AGENTS.md + PROTOCOL.md + playbook ────────
+# Правила репозитория раньше до исполнителя не доходили вообще (только ссылка
+# на них внутри playbook) — здесь они впечатываются дословно, не пересказом:
+# бюджет промпта позволяет с большим запасом (модель канала — переменные
+# репозитория DEEPSEEK_MODEL/DSH_EDGE_MODEL_CATALOG, контекстное окно на
+# порядки больше суммы этих файлов).
 PLAYBOOK_FILE="$SCRIPT_DIR/../../docs/agents/WORKER-PLAYBOOK.md"
 [ -f "$PLAYBOOK_FILE" ] || die "Нет docs/agents/WORKER-PLAYBOOK.md — воркер без playbook не работает"
+AGENTS_FILE="$SCRIPT_DIR/../../AGENTS.md"
+[ -f "$AGENTS_FILE" ] || die "Нет AGENTS.md — воркер без правил репозитория не работает"
+PROTOCOL_FILE="$SCRIPT_DIR/../../docs/agents/PROTOCOL.md"
+[ -f "$PROTOCOL_FILE" ] || die "Нет docs/agents/PROTOCOL.md — воркер без протокола совместной работы не работает"
 criterion=$(awk '
   /^#{1,6}[[:space:]]*Критерий готовности/ {flag = 1; next}
   /^#{1,6}[[:space:]]/ {flag = 0}
@@ -381,7 +390,19 @@ $criterion
 
 PR на задачу (открытый или уже слитый) — обязательный результат: без него запуск считается провалом воркера.
 
-# Правила работы (обязательны; дистилляция живой практики)
+# Правила репозитория (AGENTS.md, дословно; обязательны, не пересказ)
+
+PROMPT
+  cat "$AGENTS_FILE"
+  cat <<PROMPT
+
+# Протокол совместной работы агентов (docs/agents/PROTOCOL.md, дословно; обязателен)
+
+PROMPT
+  cat "$PROTOCOL_FILE"
+  cat <<PROMPT
+
+# Правила работы воркера (playbook — то, чего нет в AGENTS.md)
 
 PROMPT
   cat "$PLAYBOOK_FILE"

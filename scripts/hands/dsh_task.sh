@@ -83,6 +83,14 @@ CURL_MAX_TIMEOUT=30       # зависший curl в api-подшелле веш
 # даёт пустую сессию в UI морды и задачу, помеченную провалом, вместо
 # честного «не сконфигурировано».
 dsh_require_provider_chain "hands" || exit 1
+# Правила репозитория раньше до этого канала не доходили вообще (агент
+# получал сырой TASK_TEXT, ни одного правила) — впечатываются дословно перед
+# прогоном (не в TASK_TEXT: HARNESS_TITLE ниже берёт первую строку TASK_TEXT
+# для названия сессии в морде, подмешивать туда текст правил нельзя).
+AGENTS_FILE="$REPO_DIR/AGENTS.md"
+[ -f "$AGENTS_FILE" ] || { echo "::error::Нет AGENTS.md — руки без правил репозитория не работают" >&2; exit 1; }
+PROTOCOL_FILE="$REPO_DIR/docs/agents/PROTOCOL.md"
+[ -f "$PROTOCOL_FILE" ] || { echo "::error::Нет docs/agents/PROTOCOL.md — руки без протокола совместной работы не работают" >&2; exit 1; }
 JOB_ID="${JOB_ID:-hands-${GITHUB_RUN_ID:-local}-$$}"
 WORK="${RUNNER_TEMP:-/tmp}/dsh-hands"
 mkdir -p "$WORK"
@@ -381,10 +389,28 @@ dsh_edge_start_drain
 
 DSH_START_TS=$(date -u +%s)
 HANDS_TASK_FAILURE_REASON=""
+# Правила впечатываются ЗДЕСЬ, в точке передачи текста агенту — НЕ в саму
+# переменную TASK_TEXT: та уже использована выше (HARNESS_TITLE) как заголовок
+# сессии морды, и подмешивать туда текст правил превратило бы заголовок каждой
+# сессии в первую строку AGENTS.md.
+HANDS_PROMPT=$(cat <<HANDSPROMPT
+# Правила репозитория (AGENTS.md, дословно; обязательны, не пересказ)
+
+$(cat "$AGENTS_FILE")
+
+# Протокол совместной работы агентов (docs/agents/PROTOCOL.md, дословно; обязателен)
+
+$(cat "$PROTOCOL_FILE")
+
+# Задача
+
+$TASK_TEXT
+HANDSPROMPT
+)
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$HANDS_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$HANDS_RATE_LIMIT_INITIAL_DELAY_SECS" \
 DSH_RATE_LIMIT_MAX_DELAY_SECS="$HANDS_RATE_LIMIT_MAX_DELAY_SECS" \
-  dsh_run_with_pool_then_chain "$ANSWER_FILE" "$ERR_FILE" "$TASK_TEXT"
+  dsh_run_with_pool_then_chain "$ANSWER_FILE" "$ERR_FILE" "$HANDS_PROMPT"
 rc=$DSH_RUN_RC
 HANDS_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 HANDS_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"

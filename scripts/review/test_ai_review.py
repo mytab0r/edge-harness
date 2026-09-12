@@ -476,10 +476,146 @@ def test_task_section_bot_pr_has_no_task(monkeypatch):
     assert ai.task_section(pull, "o/r") == ai.NO_TASK_MESSAGE
 
 
+# ── Правила репозитория (AGENTS.md/PROTOCOL.md) доходят до промпта ревьюера,
+# не пересказом (класс: раньше ai_prompt.md не нёс ни байта их содержимого,
+# только собственный короткий список правил ревью). Прод-форма: реальные файлы
+# с диска, реальный ai_prompt.md, реальный string.Template.safe_substitute —
+# тот же вызов, что делает cmd_gather.
+
+def test_rules_section_contains_agents_and_protocol_verbatim():
+    section = ai.rules_section()
+    agents_text = ai.AGENTS_FILE.read_text(encoding="utf-8")
+    protocol_text = ai.PROTOCOL_FILE.read_text(encoding="utf-8")
+    assert agents_text in section
+    assert protocol_text in section
+
+
+def test_gather_prompt_template_delivers_rules_section():
+    # Тот же шаблон и та же подстановка, что cmd_gather — прод-форма файла,
+    # не пересказ его содержимого здесь.
+    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
+    prompt = template.safe_substitute(
+        pr=1, title="t", branch="b", author="a",
+        context_pack="pack.txt",
+        task_section="(без задачи)",
+        rules_section=ai.rules_section(),
+    )
+    assert "# Правила работы в этом репозитории" in prompt, \
+        "содержимое AGENTS.md не дошло до промпта ревьюера"
+    assert "# Протокол мультиагентной работы" in prompt, \
+        "содержимое PROTOCOL.md не дошло до промпта ревьюера"
+
+
+def test_ai_prompt_rules_delivered_as_value_not_embedded():
+    # Класс мутации: если бы кто-то вписал rules_section (или его плейсхолдер)
+    # прямо В ТЕКСТ ШАБЛОНА ai_prompt.md, а не передавал его значением через
+    # safe_substitute, то будущие `$`-паттерны в правилах пересканировались бы
+    # Template как плейсхолдеры шаблона и искажались. Замер по прод-файлу:
+    # сырой ai_prompt.md несёт только плейсхолдер `$rules_section`, а не текст
+    # AGENTS.md — значит правила идут значением подстановки, не текстом шаблона.
+    raw_template = (ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8")
+    assert "$rules_section" in raw_template
+    agents_heading = ai.AGENTS_FILE.read_text(encoding="utf-8").splitlines()[0]
+    assert agents_heading not in raw_template
+
+
+def test_rules_section_dollar_survives_substitution(tmp_path, monkeypatch):
+    # Значения мэппинга в safe_substitute не пересканируются на `$`-плейсхолдеры
+    # (пересканируется только текст самого шаблона) — поэтому будущие `$` внутри
+    # AGENTS.md/PROTOCOL.md (сегодня их там нет, замерено отдельно) доедут до
+    # модели неискажёнными. Сегодняшний текст правил `$` не содержит, поэтому
+    # мутация подставляет синтетические правила с `$`, чтобы доказать именно
+    # свойство safe_substitute, а не текущее содержимое файлов.
+    agents_file = tmp_path / "AGENTS.md"
+    protocol_file = tmp_path / "PROTOCOL.md"
+    agents_file.write_text(
+        "# Правила\n\nСсылается на $GITHUB_REPOSITORY.\n", encoding="utf-8",
+    )
+    protocol_file.write_text(
+        "# Протокол\n\nИспользует ${{ github.token }} в примере.\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(ai, "AGENTS_FILE", agents_file)
+    monkeypatch.setattr(ai, "PROTOCOL_FILE", protocol_file)
+
+    template = ai.string.Template((ai.SCRIPT_DIR / "ai_prompt.md").read_text(encoding="utf-8"))
+    prompt = template.safe_substitute(
+        pr=1, title="t", branch="b", author="a",
+        context_pack="pack.txt",
+        task_section="(без задачи)",
+        rules_section=ai.rules_section(),
+    )
+    assert "$GITHUB_REPOSITORY" in prompt
+    assert "${{ github.token }}" in prompt
+
+
+def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
+    # Гвардия silent-wrong: если cmd_gather не передаёт один из плейсхолдеров
+    # шаблона (опечатка/переименование ключа) — safe_substitute молча оставит
+    # '$placeholder' в промпте. Проверка в cmd_gather должна это ловить.
+    # Создаём временную директорию с поддельным ai_prompt.md и подменяем SCRIPT_DIR.
+    fake_script_dir = tmp_path / "fake_scripts"
+    fake_script_dir.mkdir()
+    fake_prompt = fake_script_dir / "ai_prompt.md"
+    fake_prompt.write_text(
+        "PR #$pr\n$title\n$branch\n$author\n$context_pack\n$task_section\n"
+        "$rules_section\n$MISSING_PLACEHOLDER\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ai, "SCRIPT_DIR", fake_script_dir)
+
+    # Подготавливаем минимальные моки для gh вызовов внутри cmd_gather
+    def fake_gh(path):
+        if path == "repos/o/r/pulls/1":
+            return {
+                "title": "Test PR",
+                "head": {"ref": "agent/1-test"},
+                "user": {"login": "test-user"},
+            }
+        if path.startswith("repos/o/r/pulls/1/files"):
+            # list_pr_files — один файл, непустой (пустой список уводит
+            # cmd_gather в ветку "дифф пуст" ДО построения промпта, #687 —
+            # эта проверка не о ней, а о мэппинге плейсхолдеров).
+            return [{"filename": "file.py", "additions": 1, "deletions": 0}]
+        if path.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
+            # other_active_ai_review_runs вызывает этот эндпоинт — возвращаем пустой список
+            return []
+        raise AssertionError(f"unexpected gh call: {path}")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    # diff-пак — мокаем gh pr diff
+    import subprocess
+
+    def fake_subprocess_run(cmd, capture_output=True, text=True, env=None, encoding=None):
+        if cmd[:2] == ["gh", "pr"] and cmd[2] == "diff":
+            class Result:
+                returncode = 0
+                stdout = "diff --git a/file.py b/file.py\n+line"
+                stderr = ""
+            return Result()
+        # fallback to real subprocess for other calls (e.g., redact)
+        return subprocess.run(cmd, capture_output=capture_output, text=text, env=env, encoding=encoding)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    # task_section — мокаем чтобы не дергать gh для issue
+    def fake_task_section(pull, repo):
+        return "(без задачи)"
+
+    monkeypatch.setattr(ai, "task_section", fake_task_section)
+
+    # rules_section — используем настоящий, он читает файлы с диска
+    # но нам не важно содержимое, главное что он есть
+
+    args = argparse.Namespace(pr=1, out=str(tmp_path / "out"))
+    with pytest.raises(RuntimeError) as exc:
+        ai.cmd_gather(args)
+    assert "MISSING_PLACEHOLDER" in str(exc.value)
+    assert "плейсхолдеры, которых нет в мэппинге" in str(exc.value)
+
+
 # ── Ошибка провайдера/транспорта vs нарушение контракта моделью ──────────────
-# (класс silent-wrong прогона 33572445063, PR #190: dsh упал с HTTP_404,
-# answer.txt остался пустым, verdict написал «строки ВЕРДИКТ нет вообще» —
-# диагноз читался как «модель ошиблась», хотя вызова модели не было вовсе).
 
 @pytest.mark.parametrize("dsh_rc,expected", [
     ("1", True),
@@ -1070,6 +1206,9 @@ def _fake_gh_should_run(labels, comment_body, files, active_runs=None):
             page = url.split("page=")[-1]
             bot = {"login": "github-actions[bot]", "type": "Bot"}
             return [{"user": bot, "body": comment_body}] if page == "1" and comment_body else []
+        if url.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
+            # other_active_ai_review_runs — возвращаем пустой список (нет параллельных прогонов)
+            return []
         raise AssertionError(f"неожиданный вызов gh: {url}")
     return fake_gh
 
