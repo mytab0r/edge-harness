@@ -136,13 +136,20 @@ def open_dependabot_alerts(repo: str) -> list:
     `&page=N`. Форма ответа проверяется явно: не-list (dict ошибки,
     None) — RuntimeError, а не «список пуст» (класс #120A, гвардия
     test_silent_empty_page_guard.py); честный пустой список — «алертов
-    нет». Хвост за per_page=100 — названная граница (см. докстринг
-    модуля)."""
+    нет». Полная страница (100) — тоже громкий сбой: хвост недочитан,
+    молча терять нельзя (класс #308, гвардия test_pagination_guard.py,
+    запись в ALLOWED_SINGLE_PAGE_CALLS)."""
     alerts = gh(f"repos/{repo}/dependabot/alerts?state=open&per_page=100")
     if not isinstance(alerts, list):
         raise RuntimeError(
             f"dependabot alerts: не-list ответ ({type(alerts).__name__}) — "
             "ошибка транспорта/эндпоинта, не «список пуст» (класс #120A)")
+    if len(alerts) >= 100:
+        raise RuntimeError(
+            "dependabot alerts: ответ вернул полную страницу (100) — хвост "
+            "списка этим запросом недочитан, эндпоинт page-пагинацию не "
+            "поддерживает (замер 2026-09-12); нужна курсорная пагинация, "
+            "молча терять хвост нельзя (класс #308)")
     return alerts
 
 

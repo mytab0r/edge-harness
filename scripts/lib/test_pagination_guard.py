@@ -54,6 +54,18 @@ DEF_RE = re.compile(r"^\s*def\s+(\w+)\s*\(")
 # по природе или уже кричит громко на упоре в полную страницу, а не листает.
 # Ключ — (относительный путь от корня репозитория, имя функции).
 ALLOWED_SINGLE_PAGE_CALLS = {
+    ("scripts/orchestra/dependabot_alert_watch.py", "open_dependabot_alerts"):
+        "ЭНДОПИНТ НЕ УМЕЕТ page-пагинацию (живой замер 2026-09-12, #961, "
+        "пост-мерж прогон run 34681294715): GET .../dependabot/alerts с "
+        "&page=1 отвечает HTTP 400 «Pagination using the `page` parameter "
+        "is not supported» — пагинация курсорная before/after, обходчикам "
+        "вида &page=N (review_labels.list_pages) недоступен. Читается один "
+        "снимок per_page=100; форма ответа проверяется явно (не-list — "
+        "RuntimeError, класс #120A), полная страница (100) — тоже RuntimeError "
+        "«хвост недочитан» — громкий сбой на упоре, не молчаливая потеря "
+        "(образец upstream_drift из докстринга самой гвардии). Хвост за сотню "
+        "и курсорное дочитывание — названная граница (докстринг функции, "
+        "docs/research/21-github-actions.md).",
     ("scripts/orchestra/pulse_guard.py", "recent_runs"):
         "per_page — параметр самой функции (вызывающие передают 5/10/100, "
         "PR #318 добавил вызывающего с 100 — сама классификация не изменилась): "

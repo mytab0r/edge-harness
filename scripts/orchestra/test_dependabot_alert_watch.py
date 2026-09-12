@@ -195,6 +195,19 @@ def test_open_dependabot_alerts_non_list_error_shape_raises(monkeypatch):
         daw.open_dependabot_alerts(REPO)
 
 
+def test_open_dependabot_alerts_full_page_is_loud(monkeypatch):
+    """Класс #308: эндпоинт не листается (page не поддерживается, см. тест
+    выше), поэтому полная страница (100) — хвост недочитан — обязана быть
+    громким сбоем, не тихим усечением списка."""
+    fake = FakeGh({
+        "dependabot/alerts?state=open": [REAL_SHARP_ALERT] * 100,
+    })
+    patch_gh(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="полную страницу"):
+        daw.open_dependabot_alerts(REPO)
+
+
 def test_dependabot_alert_watch_creates_task_for_new_alert(monkeypatch):
     created = {"number": 700}
     fake = FakeGh({
