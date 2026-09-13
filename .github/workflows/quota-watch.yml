@@ -110,3 +110,25 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/measure/quota_watch.py measure
+
+      # БЕЗ `if:` — не гейтится CF-троттлингом (#1100): `gh api rate_limit`
+      # не расходует сам лимит, который измеряет (см. докстринг
+      # quota_watch.py::github_rate_limit_main), и она же меряет ТОТ ЖЕ
+      # токен (`github.token`), который исчерпался в живом инциденте #1100
+      # ("API rate limit exceeded for installation"). Точное число лимита
+      # ЭТОГО токена — не подтверждено однозначно: документация GitHub
+      # называет 1000/час/репозиторий, живой замер этого же репозитория
+      # (docs/research/21-github-actions.md, «Live-замер 2026-09-09»,
+      # issue #812) — 5000/час; какое верно для конкретно этого прогона, не
+      # установлено. На механику не влияет: pct считается от РЕАЛЬНОГО
+      # `limit` в ответе `gh api rate_limit`, не от захардкоженного числа.
+      # Часовая каденция full_sweep (см. шаг выше) физически не успевала
+      # поймать переход за 83 минуты инцидента. Своя частота — собственный
+      # троттлинг внутри github_rate_limit_main
+      # (RATE_LIMIT_MIN_INTERVAL_MINUTES), не Jobs API.
+      - name: Замер лимита GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quota_watch.py github-rate-limit
