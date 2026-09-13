@@ -375,8 +375,8 @@ def _guard_raw_subprocess_write(description: str) -> bool:
     if prod_writes_allowed():
         return True
     print(
-        f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
-        f"изменяющий вызов пропущен: {description}",
+        f"::warning::DRY-RUN (вне GitHub Actions — {ALLOW_PROD_WRITES_ENV} больше не снимает "
+        f"этот запрет, issue #1074) — изменяющий вызов пропущен: {description}",
         file=sys.stderr,
     )
     return False

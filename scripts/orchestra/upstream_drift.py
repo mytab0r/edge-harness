@@ -399,8 +399,7 @@ def attempt_auto_bump(repo: str, decision: dict, tags: list[dict], *, pin_path: 
     if decision["state"] != "drift":
         return "⚠️ авто-бамп не пытается чинить pin-not-tag — это вне его права, доводи вручную"
     if not pulse_guard.prod_writes_allowed():
-        return (f"⚠️ авто-бамп пропущен: {pulse_guard.ALLOW_PROD_WRITES_ENV} не задан вне "
-                "GitHub Actions (DRY-RUN)")
+        return "⚠️ авто-бамп пропущен: вне GitHub Actions (DRY-RUN, issue #1074 — безусловно)"
     pat = os.environ.get("ORCHESTRA_PAT")
     if not pat:
         return "⚠️ авто-бамп пропущен: ORCHESTRA_PAT не задан в окружении пульса"
