@@ -284,7 +284,23 @@ def record_reading(repo: str, resource_key: str, pct: float, when: datetime,
     канал эскалации порога/простоя, у которых уже есть свой fail loud), но
     обязан быть ВИДИМ (::warning::), а не тихим — иначе носитель тренда мог
     бы стоять сломанным неограниченно долго при зелёных прогонах, тем же
-    классом, что дедуп состояния уже проходил (см. carrier_write_verdict)."""
+    классом, что дедуп состояния уже проходил (см. carrier_write_verdict).
+
+    Честная деградация (found: ревью PR #1112): PATCH меняет только
+    `updated_at` комментария, GitHub листает `.../comments` по ПОРЯДКУ
+    СОЗДАНИЯ (`created_at`) — редактирование на месте НИКОГДА не двигает
+    позицию носителя в этом порядке. Значит по мере роста #120 носитель,
+    созданный один раз и вечно редактируемый, рано или поздно физически
+    съезжает за окно `MARKER_SCAN_PAGES`, сколько бы раз его ни правили —
+    тот же класс амнезии, что и сам инцидент #1100, только для числового
+    носителя тренда, а не для маркера состояния. Самоисцеление: тик, не
+    нашедший носитель (`last_reading` вернёт None, хотя он существует и
+    просто уехал за страницу), теряет ровно один сэмпл тренда в ЭТОМ тике
+    (classify_state падает на чистый pct>=threshold — та же семантика, что
+    у прежнего двухсостоячного дедупа), но `record_reading` получает
+    comment_id=None и заводит НОВЫЙ носитель у хвоста истории — на
+    следующем тике позиция снова свежая. Проверено
+    test_reading_carrier_falling_off_fresh_page_self_heals_next_tick."""
     text = reading_marker(resource_key, pct, when)
     if comment_id is not None:
         pulse_guard.edit_issue_comment(repo, comment_id, text)
@@ -440,11 +456,15 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
     return None, f"issue-create отказал: {result.stderr.strip()[:400]}"
 
 
+_READING_NOT_GIVEN = object()  # сентинел «вызывающий не передал» ≠ None
+
+
 def check_and_alert(repo: str, resource_key: str, resource_label: str,
                      current: float, limit: float, pct: float,
                      threshold: float = quotas.THRESHOLD_PCT, *,
                      trend_horizon_minutes: float = TREND_HORIZON_MINUTES,
-                     now: datetime | None = None) -> str:
+                     now: datetime | None = None,
+                     prev_reading: object = _READING_NOT_GIVEN) -> str:
     """Единая точка входа обоих вызывающих (см. докстринг модуля). Возвращает
     строку для лога прогона — вызывающий печатает её и решает про exit code
     предикатами pulse_guard (escalation_channel_failed /
@@ -461,6 +481,16 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     минуты, порог пробился в самом конце — состояние всё это время было
     "ok", числовой историей для расчёта скорости роста никто не был).
 
+    `prev_reading` (found: ревью PR #1112, замер «4 из 14 REST-вызовов на
+    замер-тик — чистый дубль») — вызывающий, которому УЖЕ известно последнее
+    показание (`quota_watch.github_rate_limit_main` читает его сам для
+    СВОЕГО троттлинга ДО вызова этой функции), может передать его явно —
+    внутренний повторный `last_reading` не звонит сети во второй раз за тот
+    же самый факт. Сентинел `_READING_NOT_GIVEN`, не `None`, — вызывающий,
+    которому НЕЧЕГО передать (уже знает, что показаний не было), обязан
+    мочь сказать это явно (`prev_reading=None`) без риска, что такой вызов
+    молча включит собственный (лишний) сетевой поход за тем же фактом.
+
     Первое наблюдение ресурса (prev_state is None), заставшее его уже в
     норме, — не переход breach→ok (события восстановления не было, эскалация
     сообщила бы о факте, которого не было), поэтому наружу тихо уходит только
@@ -471,7 +501,8 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     уже существовавшему поведению для breach) и эскалирует как обычно."""
     now = now or datetime.now(timezone.utc)
 
-    prev_reading = last_reading(repo, resource_key)
+    if prev_reading is _READING_NOT_GIVEN:
+        prev_reading = last_reading(repo, resource_key)
     rate = projected_minutes = None
     if prev_reading is not None:
         prev_pct, prev_time, _ = prev_reading
@@ -555,16 +586,30 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
         result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
         return f"{resource_key}: approaching — {result}"
 
-    # new_state == STATE_OK и prev_state не None — настоящий возврат из
-    # approaching/breach в норму (restoration), не первое наблюдение.
-    text = (
-        f"✅ edge-harness: квота «{resource_label}» вернулась ниже {threshold}% "
-        f"({_fmt(current)} / {_fmt(limit)}, {pct}%). "
-        + (f"Задача на разбор по маркеру: #{prev_issue} (текущее её состояние здесь "
-           "не проверялось)." if prev_issue
-           else "Прежней задачи на разбор в маркере не найдено.")
-        + "\n" + state_marker(resource_key, STATE_OK, prev_issue)
-    )
+    # new_state == STATE_OK и prev_state не None — настоящий возврат в норму,
+    # не первое наблюдение. Текст различает, ОТКУДА вышли (found: ревью PR
+    # #1112): из breach — порог реально был пробит, текст так и говорит
+    # («вернулась ниже») и напоминает про задачу на разбор; из approaching —
+    # порог НИКОГДА не пробивался (это был только прогноз тренда), текст
+    # «вернулась ниже» был бы ложным восстановлением НЕСУЩЕСТВОВАВШЕГО
+    # инцидента для читателя #120, пропустившего ⚠️-запись — разворот тренда
+    # говорит явно, что порог не был достигнут.
+    if prev_state == STATE_BREACH:
+        text = (
+            f"✅ edge-harness: квота «{resource_label}» вернулась ниже {threshold}% "
+            f"({_fmt(current)} / {_fmt(limit)}, {pct}%). "
+            + (f"Задача на разбор по маркеру: #{prev_issue} (текущее её состояние здесь "
+               "не проверялось)." if prev_issue
+               else "Прежней задачи на разбор в маркере не найдено.")
+        )
+    else:
+        text = (
+            f"✅ edge-harness: квота «{resource_label}» — рост остановился, порог {threshold}% "
+            f"НЕ был достигнут ({_fmt(current)} / {_fmt(limit)}, {pct}%). Предупреждение "
+            "«приближается к пределу» снято, задачи на разбор не было (approaching не заводит "
+            "задачу, см. докстринг check_and_alert)."
+        )
+    text += "\n" + state_marker(resource_key, STATE_OK, prev_issue)
     result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
     return f"{resource_key}: recovery — {result}"
 

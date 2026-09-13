@@ -505,6 +505,48 @@ def test_record_reading_posts_new_carrier_on_first_reading(monkeypatch):
     assert posted == [(qa.WATCHDOG_ISSUE, qa.reading_marker("gh_rest_rate_limit_hour", 6.1, when))]
 
 
+def test_reading_carrier_falling_off_fresh_page_self_heals_next_tick(monkeypatch):
+    """found: ревью PR #1112, подтверждённая деградация — редактирование НА
+    МЕСТЕ не двигает `created_at` комментария (GitHub меняет только
+    `updated_at`), а `all_issue_comments` листает страницы ПО ПОРЯДКУ
+    СОЗДАНИЯ — значит носитель тренда, созданный один раз и вечно
+    редактируемый, рано или поздно физически съезжает за окно
+    MARKER_SCAN_PAGES по мере роста #120, независимо от того, как недавно
+    его РЕДАКТИРОВАЛИ. Это ТОТ ЖЕ класс, что и сам инцидент #1100 (амнезия
+    дедупа), только для числового носителя, не для маркера состояния.
+
+    Поведение, которое этот тест закрепляет: тик, заставший `last_reading`
+    вернувшим None (носитель уже существовал, но не найден на свежей
+    странице), обрабатывается ТЕМ ЖЕ путём, что «первый тик вообще» —
+    теряет ровно один сэмпл тренда в этом тике (projected_minutes
+    посчитать не из чего, classify_state падает обратно на чистый
+    pct>=threshold), но `record_reading` получает comment_id=None и
+    заводит НОВЫЙ носитель у хвоста истории — на СЛЕДУЮЩЕМ тике позиция
+    снова свежая. Самоисцеление за один тик, не постоянная слепота."""
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_OK, None))
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: None)  # носитель "потерян"
+    monkeypatch.setattr(qa, "record_reading", _REAL_RECORD_READING)  # автоюз-заглушку — назад на реальную
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment",
+                         lambda repo, issue, text: posted.append(text))
+    monkeypatch.setattr(qa.pulse_guard, "edit_issue_comment",
+                         lambda *a: (_ for _ in ()).throw(
+                             AssertionError("comment_id неизвестен — обязан быть POST, не PATCH")))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    # pct=57% растёт быстро, но без прежнего показания тренд не посчитать —
+    # classify_state обязан упасть на чистый порог (57% < 80%), не упасть
+    # с исключением и не притвориться, что видел прошлый тик.
+    result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                 570, 1000, 57.0, threshold=80.0)
+
+    assert "без изменений" in result  # ok→ok по чистому pct, тренд в этот тик недоступен
+    assert escalated == []  # не эскалация, потеря сэмпла тихая (best-effort)
+    assert len(posted) == 1  # новый носитель ушёл к хвосту истории — позиция обновлена
+    assert "57.0%" in posted[0]
+
+
 def test_trend_projection_computes_rate_and_minutes_to_threshold():
     t1 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
     t2 = datetime(2026, 9, 13, 7, 18, 0, tzinfo=timezone.utc)
@@ -584,6 +626,42 @@ def test_approaching_dedup_no_repeat_while_still_approaching(monkeypatch):
     assert "без изменений" in result
 
 
+def test_recovery_from_approaching_does_not_claim_threshold_was_crossed(monkeypatch):
+    """found: ревью PR #1112 — «approaching→ok уходит текстом ложного
+    восстановления». Разворот тренда из approaching (порог НИКОГДА не
+    пробивался) обязан отличаться от разворота из breach: читатель #120,
+    пропустивший ⚠️-запись, не должен увидеть «вернулась ниже порога» о
+    пороге, которого квота не касалась."""
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_APPROACHING, None))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                 300, 1000, 30.0, threshold=80.0)
+
+    assert len(escalated) == 1
+    text = escalated[0]
+    assert "вернулась ниже" not in text  # НЕ текст breach→ok
+    assert "порог 80.0% НЕ был достигнут" in text
+    assert "recovery" in result
+
+
+def test_recovery_from_breach_still_mentions_the_task(monkeypatch):
+    """Контрольный тест к предыдущему: breach→ok НЕ меняет поведение —
+    текст по-прежнему называет задачу на разбор."""
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_BREACH, 4242))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
+
+    assert len(escalated) == 1
+    text = escalated[0]
+    assert "вернулась ниже" in text
+    assert "#4242" in text
+    assert "recovery" in result
+
+
 def test_first_observation_already_approaching_alerts(monkeypatch):
     """Симметрично уже существовавшему поведению для breach (found ревью
     PR #607): первое наблюдение, заставшее ресурс УЖЕ в approaching, — не
@@ -618,9 +696,16 @@ def test_reproduction_1100_trend_fires_before_exhaustion(monkeypatch):
         limit exceeded for installation (HTTP 403)".
       - 08:26Z: акцептанс-критерий issue #1100 называет это моментом
         исчерпания.
-      - Лимит installation-токена — 1000 запросов/час (docs/research/
-        21-github-actions.md; форма ответа `gh api rate_limit` проверена
-        живьём в этом PR: {"resources": {"core": {"limit":.., "used":..}}}).
+      - Точное число лимита installation-токена НЕ ПОДТВЕРЖДЕНО однозначно:
+        документация GitHub называет 1000 запросов/час, а живой замер
+        этого же репозитория (docs/research/21-github-actions.md,
+        «Live-замер 2026-09-09», issue #812) — 5000/час; ниже используется
+        1000 как иллюстративное число для получения тех же `current`,
+        что дают наблюдаемые pct (6.1%, 100%) — сама механика теста работает
+        с ПРОЦЕНТОМ, не с абсолютным числом, поэтому выбор 1000 против 5000
+        не влияет на проверяемый результат. Форма ответа `gh api rate_limit`
+        проверена живьём в этом PR:
+        {"resources": {"core": {"limit":.., "used":..}}}.
 
     Честно про то, что НЕ факт: промежуточные показания (07:18, 07:33, ...)
     нигде не сохранились — сам корень #1100 в том, что `last_reading` до

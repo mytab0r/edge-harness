@@ -631,11 +631,15 @@ def test_github_rate_limit_main_calls_check_and_alert_for_both_resources(monkeyp
     monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: None)
     calls = []
     monkeypatch.setattr(qw.quota_alert, "check_and_alert",
-                         lambda repo, key, label, current, limit, pct, threshold=None, now=None:
-                             calls.append(key) or "ok")
+                         lambda repo, key, label, current, limit, pct, threshold=None, now=None,
+                                prev_reading="unset": calls.append((key, prev_reading)) or "ok")
 
     assert qw.github_rate_limit_main() == 0
-    assert calls == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+    assert [key for key, _ in calls] == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+    # prev_reading=None передан ЯВНО (не забыт как kwarg) — last_reading уже
+    # сказал «показаний не было», повторного похода за тем же фактом внутри
+    # check_and_alert быть не должно (found: ревью PR #1112).
+    assert [pr for _, pr in calls] == [None, None]
 
 
 def test_github_rate_limit_main_throttles_by_own_last_reading(monkeypatch):
@@ -659,15 +663,19 @@ def test_github_rate_limit_main_measures_again_after_interval_elapses(monkeypatc
     monkeypatch.setattr(qw.quotas, "collect_github_rate_limit", lambda: _rate_limit_rows())
     now = datetime(2026, 9, 13, 7, 20, 0, tzinfo=timezone.utc)
     old = now - timedelta(minutes=16)  # старше RATE_LIMIT_MIN_INTERVAL_MINUTES (15)
-    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: (6.0, old, 1))
+    reading = (6.0, old, 1)
+    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: reading)
     monkeypatch.setattr(qw, "datetime", SimpleNamespace(now=lambda tz: now))
     calls = []
     monkeypatch.setattr(qw.quota_alert, "check_and_alert",
-                         lambda repo, key, label, current, limit, pct, threshold=None, now=None:
-                             calls.append(key) or "ok")
+                         lambda repo, key, label, current, limit, pct, threshold=None, now=None,
+                                prev_reading="unset": calls.append((key, prev_reading)) or "ok")
 
     assert qw.github_rate_limit_main() == 0
-    assert calls == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+    assert [key for key, _ in calls] == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+    # То же самое показание, что решило троттлинг, передано В check_and_alert
+    # (не перечитано вторым сетевым походом) — found: ревью PR #1112.
+    assert [pr for _, pr in calls] == [reading, reading]
 
 
 def test_github_rate_limit_main_exits_nonzero_when_rate_limit_unavailable(monkeypatch):
