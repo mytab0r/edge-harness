@@ -15,9 +15,23 @@
 // pre-#1049 поведения — cold resume на КАЖДЫЙ вызов) красит
 // «повторный вызов той же сессии переиспользует хэндл» ниже; возврат тела —
 // снова зелёный.
+//
+// Вторая половина покрытия — СТРУКТУРНАЯ (ревью PR #1057, блокер 2):
+// проводка кэша внутри appendHarnessEvents недостижима поведенческим
+// тестом (метод живёт на классе EdgeSessionStore, не инстанцируется
+// изолированно), а рукописный патч переживает бампы апстрима — потеря
+// проводки при ре-бампе (план вызван, результат выброшен, entry всегда
+// undefined) проходила бы зелёным. assertHarnessIngestWiring ловит именно
+// эту мутацию; сами проверки доказаны мутацией на синтетике ниже (и
+// снятием проводки на реальном патче — прогон зафиксирован в PR).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { extractPatchFunction, loadHarnessIngestResumeModule } from '../verify-harness-ingest-resume.mjs'
+import {
+  assertHarnessIngestWiring,
+  extractPatchFunction,
+  extractPatchMethod,
+  loadHarnessIngestResumeModule,
+} from '../verify-harness-ingest-resume.mjs'
 
 const { planHarnessIngestResume, advanceHarnessIngestBaseTurn } = await loadHarnessIngestResumeModule()
 
@@ -125,4 +139,90 @@ test('advanceHarnessIngestBaseTurn — точность через нескол�
   assert.equal(baseTurn, 3)
   baseTurn = advanceHarnessIngestBaseTurn(baseTurn, [4]) // batch 3: single turn
   assert.equal(baseTurn, 4)
+})
+
+// --- Структурная половина: проводка #1049 внутри appendHarnessEvents ---
+
+/** Wrap method body lines as a minimal fake diff the extractor can read. */
+function fakePatchWithMethod(lines) {
+  return ['\n+  async appendHarnessEvents() {', ...lines.map(l => `+${l}`), '+  }', '+'].join('\n')
+}
+
+const WIRING_OK = [
+  '    const plan = planHarnessIngestResume(this.harnessIngestHandles, id, live, now, idle)',
+  '    const releaseStale = async (stale) => { try { await stale.handle.dispose() } catch (e) {} }',
+  '    for (const stale of plan.evicted) { if (stale === plan.staleForId) continue; void releaseStale(stale) }',
+  '    if (plan.staleForId !== undefined) await releaseStale(plan.staleForId)',
+  '    let entry = plan.entry',
+  '    if (entry === undefined) {',
+  '      entry = { handle: await this.openAgentForTurn(id), baseTurn: 0, lastUsedMs: 0 }',
+  '      this.harnessIngestHandles.set(id, entry)',
+  '    }',
+  '    entry.baseTurn = advanceHarnessIngestBaseTurn(entry.baseTurn, turnsWritten)',
+]
+
+test('assertHarnessIngestWiring — РЕАЛЬНЫЙ патч проходит структурную проверку проводки', () => {
+  const body = assertHarnessIngestWiring()
+  assert.ok(body.includes('async appendHarnessEvents('), 'экстрактор обязан читать именно метод appendHarnessEvents')
+})
+
+test('extractPatchMethod бросает громко на отсутствующем маркере (не тихий ноль)', () => {
+  assert.throws(() => extractPatchMethod('+export function other() {\n+}\n', 'async appendHarnessEvents('), /не найден маркер метода/)
+})
+
+test('МУТАЦИЯ ревью PR #1057: план вызван, результат выброшен — гвардия красная (pre-#1049 не проходит зелёным)', () => {
+  // Точная мутация ревьюера: обе чистые функции нетронуты, проводка
+  // откатена — entry всегда undefined, кэш не наполняется, хэндл
+  // диспоузится после батча. Поведенческая половина здесь зелёная,
+  // структурная обязана упасть.
+  const mutated = fakePatchWithMethod([
+    '    planHarnessIngestResume(this.harnessIngestHandles, id, live, now, idle)',
+    '    const handle = await this.openAgentForTurn(id)',
+    '    let baseTurn = 0',
+    '    for (const event of handle.agent.session.snapshotEvents()) { /* полный скан на каждый вызов */ }',
+    '    try { /* append events */ } finally { handle.dispose() }',
+  ])
+  assert.throws(() => assertHarnessIngestWiring(mutated), /проводка #1049 в appendHarnessEvents сломана/)
+})
+
+test('МУТАЦИЯ: entry не кладётся в harnessIngestHandles — гвардия красная', () => {
+  const withoutSet = fakePatchWithMethod(WIRING_OK.filter(l => !l.includes('harnessIngestHandles.set')))
+  assert.throws(() => assertHarnessIngestWiring(withoutSet), /harnessIngestHandles\.set/)
+})
+
+test('МУТАЦИЯ: baseTurn снова пересканируется (advance выкинут) — гвардия красная', () => {
+  const withoutAdvance = fakePatchWithMethod(WIRING_OK.filter(l => !l.includes('advanceHarnessIngestBaseTurn')))
+  assert.throws(() => assertHarnessIngestWiring(withoutAdvance), /advanceHarnessIngestBaseTurn/)
+})
+
+test('МУТАЦИЯ: вернулся pre-#1049 finally { …dispose() } — гвардия красная', () => {
+  const withFinally = fakePatchWithMethod([...WIRING_OK, '    try { /* append */ } finally { entry.handle.dispose() }'])
+  assert.throws(() => assertHarnessIngestWiring(withFinally), /finally \{ …dispose\(\) \}/)
+})
+
+test('МУТАЦИЯ: await-dispose вытесненной записи текущего id выкинут — гвардия красная (окно BUSY вернулось)', () => {
+  const withoutAwait = fakePatchWithMethod(WIRING_OK.filter(l => !l.includes('await releaseStale(plan.staleForId)')))
+  assert.throws(() => assertHarnessIngestWiring(withoutAwait), /releaseStale\(plan\.staleForId\)/)
+})
+
+test('planHarnessIngestResume возвращает staleForId — вытесненная из-под этого id запись помечена для await-dispose', () => {
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  const entry = { handle, baseTurn: 0, lastUsedMs: 1_000 }
+  cache.set('s1', entry)
+
+  const plan = planHarnessIngestResume(cache, 's1', () => false, 1_500, 120_000)
+  assert.equal(plan.staleForId, entry, 'запись, вытесненная из-под ТЕКУЩЕГО id, обязана попасть в staleForId (её dispose ждут до холодного ресума)')
+  assert.equal(plan.evicted[0], entry)
+})
+
+test('planHarnessIngestResume: idle-вытеснение ЧУЖИХ записей не попадает в staleForId (гонки с этим вызовом нет)', () => {
+  const cache = new Map()
+  const old = fakeHandle('OLD')
+  cache.set('other-session', { handle: old, baseTurn: 0, lastUsedMs: 1_000 })
+
+  const plan = planHarnessIngestResume(cache, 's1', () => true, 200_000, 120_000)
+  assert.equal(plan.evicted.length, 1, 'простроченная чужая запись вытеснена')
+  assert.equal(plan.evicted[0].handle, old)
+  assert.equal(plan.staleForId, undefined, 'чужая idle-запись не в гонке с этим вызовом — dispose fire-and-forget')
 })

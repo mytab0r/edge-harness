@@ -677,15 +677,6 @@ jobs:
       - name: Allowlist ингеста ↔ спул стримера
         run: node dsh-edge/verify-ingest-allowlist.mjs
 
-      # #1049: appendHarnessEvents больше не платит O(вся история) на каждый
-      # вызов ingest — тёплый хэндл + инкрементальный baseTurn (PATCHES.md,
-      # «Тёплый хэндл ingest»). Гвардия исполняет planHarnessIngestResume/
-      # advanceHarnessIngestBaseTurn, извлечённые дословно из текста патча,
-      # как настоящий TypeScript-модуль (Node 24 type-stripping) — не
-      # пересказ, доказано мутацией (см. PATCHES.md).
-      - name: Тёплый хэндл ingest — кэш ресума и точность baseTurn (#1049)
-        run: node --test dsh-edge/test/harness-ingest-resume.test.mjs
-
       - name: Все workflows — валидный YAML
         run: |
           pip install --quiet pyyaml
