@@ -65,12 +65,15 @@ def utc(*args):
 
 
 # Реестр функций repo_invariants.py, мигрированных на CheckResult (issue
-# #1096, шаг 1). Расширяется задачей шага 2 по мере миграции остальных 14
-# инвариантов — не трогать этот файл ради миграции без обновления списка,
-# иначе регресс новой функции эта гвардия не увидит.
+# #1096, шаг 1 — 13/14; issue #1109, шаг 2, пачка 1 — 8/10). Расширяется
+# следующими пачками по мере миграции остальных инвариантов — не трогать этот
+# файл ради миграции без обновления списка, иначе регресс новой функции эта
+# гвардия не увидит.
 MIGRATED_REPO_INVARIANTS_FUNCTIONS = {
     "check_conveyor_gate_phantom_pause",
     "check_worker_false_success_comment",
+    "check_wasted_ai_review_runs",
+    "check_recurring_worker_failure",
 }
 
 
@@ -109,5 +112,24 @@ def test_check_worker_false_success_comment_is_unknown_on_dead_transport(monkeyp
     # именно там.
     monkeypatch.setattr(ri, "gh", DeadTransport())
     result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == cr.STATUS_UNKNOWN
+    assert result.reason
+
+
+def test_check_wasted_ai_review_runs_is_unknown_on_dead_transport(monkeypatch):
+    # check_wasted_ai_review_runs зовёт review_labels.latest_ai_comment(repo,
+    # number, gh) с `gh`, взятым из МОДУЛЯ repo_invariants — подменяем ri.gh.
+    monkeypatch.setattr(ri, "gh", DeadTransport())
+    pull = {"number": 333, "labels": [{"name": "ai:ok"}]}
+    result = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert result.status == cr.STATUS_UNKNOWN
+    assert result.reason
+
+
+def test_check_recurring_worker_failure_is_unknown_on_dead_transport(monkeypatch):
+    # check_recurring_worker_failure зовёт pulse_guard.recent_runs, которая
+    # зовёт pulse_guard.gh изнутри pulse_guard.py — подменяем атрибут МОДУЛЯ.
+    monkeypatch.setattr(ri.pulse_guard, "gh", DeadTransport())
+    result = ri.check_recurring_worker_failure(REPO)
     assert result.status == cr.STATUS_UNKNOWN
     assert result.reason
