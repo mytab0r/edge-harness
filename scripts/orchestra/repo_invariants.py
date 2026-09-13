@@ -236,6 +236,33 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       числа — факты одного и того же прогона (маркер + independent
       пересчёт), не гипотезы — «алерт не гадает» не нарушается.
 
+  18. check_pipeline_status_marker_impersonation (#1101, найдено при доводке
+      #1074/PR #1077, живой инцидент watchdog-issue #120, 2026-09-12/13):
+      комментарий #120, несущий маркер СЕМЕЙСТВА «[статус конвейера: …]»
+      (общий литеральный префикс PAUSE_MARKER/PROBE_MARKER/PAUSE_REMINDER_
+      MARKER/RESUME_MARKER — pulse_guard.py; WIP_GATE_OPEN_MARKER/
+      WIP_GATE_CLOSE_MARKER — scheduler.py), опубликован НЕ через GitHub
+      App/job-токен (`performed_via_github_app is None` — прямой машинный
+      признак, AGENTS.md «Атрибуция событий»: логин не различает
+      исполнителей, а токен различает, и это разрешено явной оговоркой) —
+      нарушение САМО ПО СЕБЕ, независимо от того, что маркер утверждает.
+      Отличие от инварианта 16 одной фразой: 16 сравнивает ЗАЯВЛЕННОЕ ЧИСЛО
+      с независимым пересчётом (расхождение фактов о состоянии), 18
+      проверяет АВТОРА комментария вообще без оглядки на содержимое —
+      маркер без числа вовсе или с ВЕРНЫМ числом при ложном авторстве
+      инварианту 16 не виден (находка прочёса #1096, F2), 18 его ловит.
+      Живой замер на полной истории #120 (2026-09-13, 942 комментария, 10
+      страниц): 171 такой комментарий с 2026-09-06T17:47:24Z по
+      2026-09-13T07:49:24Z — диапазон шире и старше, чем было известно на
+      момент PR #1077 (26 за 2026-09-12/13 — подмножество этих 171, ровно
+      те же close-маркеры «0 < 12», что закрыл #1074). Наблюдательный
+      НАВСЕГДА, не в CI_GATING: правило репозитория запрещает удалять
+      прошлые комментарии (сам PR #1077 это подтверждает — «26 не удалены,
+      помечены опровержением»), долг по прошлому структурно необнуляем —
+      это не «тормоз без газа» (AGENTS.md), а инвариант без действия жёстче
+      наблюдения, тот же класс, что уже применён к 10/12/13/15/16 (см.
+      блок-комментарий у самой функции).
+
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для инвариантов 1 и 3 (см. docstring escalate_*).
 Дополнительно repo-ci.yml печатает тот же отчёт на каждый push/PR (видимость
@@ -2046,6 +2073,71 @@ def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
         repo, WATCHDOG_ISSUE, (scheduler.WIP_GATE_OPEN_MARKER, scheduler.WIP_GATE_CLOSE_MARKER))
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 18 (#1101, доводка #1074/PR #1077): маркер статуса конвейера в
+# #120 оставлен НЕ токеном job'а — нарушение по автору, не по числу
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой инцидент, из-за которого написан именно ЭТОТ инвариант, а не только
+# число в инварианте 16: #1074/PR #1077 закрыл ОДИН известный эпизод — 26
+# ложных close-маркеров «0 < 12» за 2026-09-12/13 — убрав
+# `SCHEDULER_ALLOW_PROD_WRITES` как источник разрешения писать в #120 вне
+# GitHub Actions (`pulse_guard.prod_writes_allowed`, единственный источник —
+# `in_github_actions()`). Но фикс лежит В КОДЕ САМОГО ПИСАТЕЛЯ: любой голый
+# `scheduler.py`, запущенный из checkout'а СТАРШЕ этого коммита (устаревшее
+# рабочее дерево, забытый фоновой процесс), фикса не видит и продолжает
+# писать тем же путём — и любой ДРУГОЙ способ попасть в #120 напрямую
+# (`gh api`/веб-форма личным PAT) фикс #1074 в принципе не покрывает, он
+# закрывал только ОДНУ конкретную лазейку в scheduler.py. Живое доказательство,
+# что класс не закрыт исчерпывающе: PR #1077 слит в 2026-09-13T07:02:13Z,
+# следующий ложный close-маркер («0 < 12» от `mytab0r`) — в 07:49:24Z, 47
+# минут ПОСЛЕ мержа (см. issue #1101).
+#
+# Признак «не токен job'а» — `performed_via_github_app is None`, СЫРОЕ поле
+# REST-ответа `GET .../issues/{n}/comments` (не `user.login`: чужой логин
+# совпадает и у легитимного ручного обсуждения человеком в этом же issue,
+# не только у поддельного маркера — судить нужно о ТОКЕНЕ публикации, не о
+# личности автора, см. AGENTS.md «Атрибуция событий»). Живые прод-формы
+# (сняты 2026-09-13, `gh api repos/mytab0r/edge-harness/issues/120/comments`):
+#   честный маркер: {"performed_via_github_app": {"id": 15368, ...},
+#                     "user": {"login": "github-actions[bot]", "type": "Bot"}}
+#   поддельный:     {"performed_via_github_app": null,
+#                     "user": {"login": "mytab0r", "type": "User"}}
+PIPELINE_STATUS_MARKER_FAMILY_RE = re.compile(r"\[статус конвейера:")
+
+
+def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dict]:
+    """`comments` — прод-форма REST-ответа `GET .../issues/{n}/comments`
+    ЦЕЛИКОМ (сырые dict'ы с полями `id`/`created_at`/`user`/
+    `performed_via_github_app`/`html_url`, без предварительной фильтрации
+    вызывающей стороной) — фильтр по семейству маркера и по автору оба
+    внутри, тем же приёмом, что и другие check_* этого файла (IO снаружи,
+    разбор внутри, см. модульный докстринг).
+
+    Нарушение — ЛЮБОЙ комментарий, чьё тело содержит
+    PIPELINE_STATUS_MARKER_FAMILY_RE, и чей `performed_via_github_app` —
+    `None` (опубликован НЕ через GitHub App/job-токен). Условие абсолютное,
+    без freshness-окна и без сравнения с содержимым маркера (в отличие от
+    инварианта 16) — САМ факт публикации в этом канале не тем токеном есть
+    нарушение, вне зависимости от того, что маркер утверждает (постановка
+    задачи #1101: «независимо от содержимого»)."""
+    violations = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not PIPELINE_STATUS_MARKER_FAMILY_RE.search(body):
+            continue
+        if comment.get("performed_via_github_app") is not None:
+            continue  # опубликовано через GitHub App/job-токен — легитимно
+        violations.append({
+            "id": comment.get("id"),
+            "created_at": comment.get("created_at"),
+            "login": (comment.get("user") or {}).get("login"),
+            "user_type": (comment.get("user") or {}).get("type"),
+            "url": comment.get("html_url"),
+        })
+    return sorted(violations, key=lambda item: item["created_at"] or "")
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2337,6 +2429,31 @@ def build_report(repo: str, now: datetime,
         )
     else:
         lines.append("💚 [16] заявленное и пересчитанное число PR, ждущих доработки, согласованы")
+
+    # Отдельный запрос на всю историю комментариев #120 (не переиспользует
+    # wip_markers выше): fetch_wip_gate_markers отдаёт только (время, тело)
+    # ДВУХ конкретных маркеров WIP-гейта — инварианту 18 нужны СЫРЫЕ поля
+    # (id/user/performed_via_github_app) и ВСЁ семейство «статус конвейера»,
+    # не только WIP-гейт. Двойной обход всей истории #120 за один пульс —
+    # принятая цена (тот же порядок трафика, что уже платят check_worker_
+    # false_success_comment/issue_marker_times рядом в этом же build_report).
+    v18 = check_pipeline_status_marker_impersonation(
+        pulse_guard.all_issue_comments(repo, WATCHDOG_ISSUE))
+    findings[18] = v18
+    if v18:
+        latest = v18[-1]
+        ids = ", ".join(f"#{item['id']}" for item in v18)
+        lines.append(
+            f"🚨 [18] {len(v18)} маркеров статуса конвейера в #{WATCHDOG_ISSUE} "
+            f"опубликованы НЕ токеном job'а (performed_via_github_app=null) — "
+            f"последний {latest['created_at']} от {latest['login']} (id {latest['id']}); "
+            f"id всех: {ids}"
+        )
+    else:
+        lines.append(
+            f"💚 [18] все маркеры статуса конвейера в #{WATCHDOG_ISSUE} "
+            "опубликованы токеном job'а"
+        )
 
     return lines, findings
 

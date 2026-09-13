@@ -2705,4 +2705,168 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
     # зависит от истории маркеров #120, гейтить им PR означало бы красить
     # чужой PR за чужое искажение снимка.
     assert 16 not in ri.CI_GATING
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 18 (#1101): маркер статуса конвейера в #120 не от токена job'а
+# ══════════════════════════════════════════════════════════════════════════
+
+# Живая прод-форма (снята 2026-09-13, `gh api
+# repos/mytab0r/edge-harness/issues/120/comments`) — тот же ложный
+# close-маркер, что уже используют тесты инварианта 16 выше (id 5650994043,
+# 2026-09-13T03:53:03Z), с добавленным `performed_via_github_app` (в живом
+# ответе REST у этого комментария — `null`, у честного маркера рядом —
+# непустой объект GitHub App «github-actions»).
+_IMPOSTOR_WIP_CLOSE_COMMENT = {
+    "id": 5650994043,
+    "created_at": "2026-09-13T03:53:03Z",
+    "body": "✅ [статус конвейера: WIP-лимит снят]\n"
+            "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
+            "снова диспетчируются.",
+    "user": {"login": "mytab0r", "type": "User"},
+    "performed_via_github_app": None,
+    "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5650994043",
+}
+
+# Честный маркер того же семейства, опубликованный job'ом (форма
+# `performed_via_github_app` — реальный объект GitHub App «github-actions»,
+# id 15368, снят тем же живым запросом) — не нарушение.
+_GENUINE_BOT_WIP_OPEN_COMMENT = {
+    "id": 5649763434,
+    "created_at": "2026-09-13T00:47:39Z",
+    "body": "⏸️ [статус конвейера: WIP-лимит закрыл диспатч]\n"
+            "Открытых PR, ждущих доработки: 22 ≥ 12 — новые задачи не диспетчируются.",
+    "user": {"login": "github-actions[bot]", "type": "Bot"},
+    "performed_via_github_app": {"id": 15368, "name": "GitHub Actions",
+                                  "slug": "github-actions"},
+    "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5649763434",
+}
+
+
+def test_check_pipeline_status_marker_impersonation_flags_live_incident():
+    """Живой инцидент #1074/#1077 воспроизведён дословно: смешанные
+    комментарии (честный маркер job'а + поддельный маркер личного PAT) —
+    находит РОВНО поддельный, не оба и не ни одного."""
+    violations = ri.check_pipeline_status_marker_impersonation(
+        [_GENUINE_BOT_WIP_OPEN_COMMENT, _IMPOSTOR_WIP_CLOSE_COMMENT])
+    assert violations == [{
+        "id": 5650994043,
+        "created_at": "2026-09-13T03:53:03Z",
+        "login": "mytab0r",
+        "user_type": "User",
+        "url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5650994043",
+    }]
+
+
+def test_check_pipeline_status_marker_impersonation_silent_on_genuine_bot_only():
+    assert ri.check_pipeline_status_marker_impersonation(
+        [_GENUINE_BOT_WIP_OPEN_COMMENT]) == []
+
+
+def test_check_pipeline_status_marker_impersonation_ignores_unrelated_user_comment():
+    """Комментарий человека БЕЗ маркера семейства «статус конвейера» (обычное
+    обсуждение) не должен считаться нарушением, даже если автор — не job:
+    инвариант проверяет СЕМЬЮ маркера, а не любой комментарий не от бота."""
+    unrelated = {
+        "id": 1,
+        "created_at": "2026-09-13T04:00:00Z",
+        "body": "Проверил вручную — на текущем main пересчёт совпадает с маркером.",
+        "user": {"login": "mytab0r", "type": "User"},
+        "performed_via_github_app": None,
+        "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-1",
+    }
+    assert ri.check_pipeline_status_marker_impersonation([unrelated]) == []
+
+
+def test_check_pipeline_status_marker_impersonation_catches_pause_marker_family():
+    """Семейство — общий префикс «[статус конвейера: …]», не только
+    WIP-гейт: PAUSE_MARKER (pulse_guard) тоже входит, иначе инвариант ловил
+    бы только один из шести маркеров этого семейства."""
+    impostor_pause = {
+        "id": 2,
+        "created_at": "2026-09-13T05:00:00Z",
+        "body": f"🚨 edge-harness: {ri.pulse_guard.PAUSE_MARKER}\nручной прогон вне CI",
+        "user": {"login": "mytab0r", "type": "User"},
+        "performed_via_github_app": None,
+        "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-2",
+    }
+    violations = ri.check_pipeline_status_marker_impersonation([impostor_pause])
+    assert len(violations) == 1
+    assert violations[0]["id"] == 2
+
+
+def test_check_pipeline_status_marker_impersonation_sorted_by_time():
+    later = {**_IMPOSTOR_WIP_CLOSE_COMMENT, "id": 3, "created_at": "2026-09-14T00:00:00Z"}
+    violations = ri.check_pipeline_status_marker_impersonation(
+        [later, _IMPOSTOR_WIP_CLOSE_COMMENT])
+    assert [v["id"] for v in violations] == [5650994043, 3]
+
+
+def test_check_pipeline_status_marker_impersonation_mutation_guard():
+    """Доказательство, что тест реально проверяет ЗАЩИТУ, не пустой список:
+    без проверки `performed_via_github_app` (мутация — как если бы условие
+    было снято) честный маркер job'а тоже попал бы в находки — этот тест
+    ловит именно ту мутацию, дословно применяя её здесь же, без правки
+    исходника."""
+    def naive_check(comments):
+        # Мутация: как check_pipeline_status_marker_impersonation, но БЕЗ
+        # фильтра по performed_via_github_app.
+        return [c for c in comments
+                if ri.PIPELINE_STATUS_MARKER_FAMILY_RE.search(c.get("body") or "")]
+
+    mutated = naive_check([_GENUINE_BOT_WIP_OPEN_COMMENT, _IMPOSTOR_WIP_CLOSE_COMMENT])
+    assert len(mutated) == 2  # мутация красит ОБА — включая честный маркер job'а
+
+    real = ri.check_pipeline_status_marker_impersonation(
+        [_GENUINE_BOT_WIP_OPEN_COMMENT, _IMPOSTOR_WIP_CLOSE_COMMENT])
+    assert len(real) == 1  # настоящая проверка отличает job от личного PAT
+
+
+def test_build_report_wires_invariant_18(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/120/comments": [_GENUINE_BOT_WIP_OPEN_COMMENT, _IMPOSTOR_WIP_CLOSE_COMMENT],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 13, 8, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[18] == [{
+        "id": 5650994043,
+        "created_at": "2026-09-13T03:53:03Z",
+        "login": "mytab0r",
+        "user_type": "User",
+        "url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5650994043",
+    }]
+    assert any("🚨" in line and "[18]" in line and "5650994043" in line for line in lines)
+
+
+def test_build_report_invariant_18_healthy_when_no_impostor(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/120/comments": [_GENUINE_BOT_WIP_OPEN_COMMENT],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 13, 8, 0)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[18] == []
+    assert any("💚" in line and "[18]" in line for line in lines)
+
+
+def test_pipeline_status_marker_impersonation_not_in_ci_gating():
+    # Наблюдательный НАВСЕГДА (см. блок-комментарий у самой функции): долг по
+    # прошлым комментариям #120 структурно необнуляем (правило репозитория
+    # запрещает их удалять) — гейтить им PR означало бы красить main вечно.
+    assert 18 not in ri.CI_GATING
     assert 16 in ri.ESCALATING_INVARIANTS
