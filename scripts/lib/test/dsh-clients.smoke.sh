@@ -256,6 +256,17 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
       # каптурим РЕАЛЬНЫЙ промпт, с которым транспорт зовёт dsh — прод-форма,
       # не пересказ. DSH_PROMPT_FILE задаётся вызывающим сценарием ниже.
       [ -n "${DSH_PROMPT_FILE:-}" ] && printf '%s' "${3:-}" >"$DSH_PROMPT_FILE"
+      # #876: «успех без работы» — dsh отчитался rc=0, но нового коммита не
+      # оставил (маркер git-head-seq НЕ создаётся, см. git-заглушку). После
+      # #1084 это единственная форма, в которой текст гейта
+      # dsh_worker_run_is_success («не доказывает работу этого прогона»)
+      # достижим: rc≠0 перехватывается исчерпанием цепочки раньше гейта
+      # (сценарий worker-chain-refusal-red ниже).
+      if [ -n "${SMOKE_DSH_OK_NO_COMMIT:-}" ]; then
+        smoke_write_spool
+        echo "smoke: работа сделана (без коммита)"
+        return 0
+      fi
       # Ретрай RATE_LIMIT в ai-review (#419): режим задаёт сценарий через
       # SMOKE_RATE_LIMIT_MODE, попытки считает переменная процесса — эта
       # заглушка живёт в одном bash-процессе ai_dsh.sh на весь ретрай-цикл
@@ -659,7 +670,8 @@ run_client() { # LABEL SCRIPT [OUTFILE] — прогон в дочернем bas
 }
 
 # Симметрично run_client, но для сценариев, где красный job — ОЖИДАЕМЫЙ
-# исход (#422: провайдер в лимите/квоте — die/exit 1 по контракту, это не
+# исход (#422: отказ цепочки провайдеров — квота/лимит/исчерпание — die/exit 1
+# по контракту, это не
 # поломка клиента, а честный красный прогон): неожиданный rc=0 здесь и есть
 # провал smoke, не наоборот.
 run_client_expect_fail() { # LABEL SCRIPT
@@ -672,7 +684,7 @@ run_client_expect_fail() { # LABEL SCRIPT
     rc=$?
   fi
   if [ "$rc" -eq 0 ]; then
-    echo "::error::SMOKE: $label завершился ЗЕЛЁНЫМ (0), а обязан был провалиться (провайдер в лимите — #422)" >&2
+    echo "::error::SMOKE: $label завершился ЗЕЛЁНЫМ (0), а обязан был провалиться (отказ цепочки провайдеров — #422)" >&2
     echo "--- журнал вызовов ---" >&2
     cat "$CALLLOG" >&2
     exit 1
@@ -858,11 +870,30 @@ assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
 echo "SMOKE: worker-auto — ок"
 
 # ── Живая форма инцидента #876: PR по ветке УЖЕ существует (дефолтный
-# GH_PR_LIST_URL_JSON, открыт с диффом), dsh честно отказывает В ЭТОМ
-# прогоне — job ОБЯЗАН быть красным, а не «справился» по факту одного
-# существования PR (находка ai-review PR #880: проводка гейта в task.sh не
-# была покрыта мутацией — оба смока оставались зелёными, если бы call-site
-# в task.sh вернули старый критерий «только pr_outcome_rc»).
+# GH_PR_LIST_URL_JSON, открыт с диффом) — job ОБЯЗАН быть красным, а не
+# «справился» по факту одного существования PR (находка ai-review PR #880:
+# проводка гейта в task.sh не была покрыта мутацией — оба смока оставались
+# зелёными, если бы call-site в task.sh вернули старый критерий «только
+# pr_outcome_rc»). После #1084 путь разбивается на два: (а) dsh отказал —
+# исчерпание цепочки возвращает задачу в пул громким красным (гейт успеха не
+# достигается вовсе: rc≠0 перехватывается раньше него); (б) dsh отчитался
+# успехом, но ни одного нового коммита не оставил — единственная форма, в
+# которой текст гейта «не доказывает работу этого прогона» достижим.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-chain-refusal" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke живая форма инцидента #876","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
+  run_client_expect_fail "worker-chain-refusal-red" "$REPO/scripts/worker/task.sh"
+assert_log "цепочка провайдеров исчерпана" "worker-chain-refusal-red: отказ dsh обязан закончиться исчерпанием цепочки с честной причиной"
+assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-chain-refusal-red: задача не возвращена в пул при отказе dsh — осталась занятой"
+assert_not_log "Автономный воркер справился" "worker-chain-refusal-red: живой класс #876 — существование PR не маскирует отказ dsh"
+echo "SMOKE: worker-chain-refusal-red — ок (#876/#1084)"
+
 scenario_start
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
@@ -871,10 +902,10 @@ GH_TOKEN="smoke-pat-token" \
 TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke живая форма инцидента #876","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
-SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
+SMOKE_DSH_OK_NO_COMMIT="1" \
   run_client_expect_fail "worker-false-success-gate" "$REPO/scripts/worker/task.sh"
 assert_log "не доказывает работу этого прогона" "worker-false-success-gate: сообщение обязано назвать причину #876, не «справился»"
-assert_not_log "Автономный воркер справился" "worker-false-success-gate: живой класс #876 — PR-по-ветке-существует не должен маскировать честный отказ dsh"
+assert_not_log "Автономный воркер справился" "worker-false-success-gate: живой класс #876 — PR-по-ветке-существует не должен маскировать отсутствие работы этого прогона"
 echo "SMOKE: worker-false-success-gate — ок (#876)"
 
 # ── Клиент AI-ревью (второй гейт #18) ────────────────────────────────────────
@@ -996,7 +1027,8 @@ echo "SMOKE: ai-review-rate-limit-budget — ок"
 # ── Тот же ретрай у worker/hands (#422 — раньше был только у ai-review) ──────────
 # Общий механизм (dsh_run_with_retry, lib/dsh-ci.sh) теперь общий для трёх
 # каналов; здесь — доказательство, что worker/hands реально его вызывают (а
-# не третья копия цикла) и что провайдер в лимите/квоте возвращает задачу в
+# не третья копия цикла) и что отказ цепочки (квота/лимит/исчерпание)
+# возвращает задачу в
 # пул (release-full: и замок, и назначение), а не оставляет её висеть.
 
 # 1) worker: первая попытка RATE_LIMIT, вторая успешна — мутация класса:
@@ -1015,12 +1047,12 @@ WORKER_RATE_LIMIT_INITIAL_DELAY_SECS="1" \
 WORKER_RATE_LIMIT_MAX_DELAY_SECS="1" \
   run_client "worker-rate-limit-transient" "$REPO/scripts/worker/task.sh"
 assert_log "GH-COMMENT" "worker-rate-limit-transient: нет отчёта в задачу после успешного ретрая"
-assert_not_log "провайдер в лимите" "worker-rate-limit-transient: успешный ретрай не должен звучать как провал провайдера"
+assert_not_log "цепочка провайдеров отказала" "worker-rate-limit-transient: успешный ретрай не должен звучать как провал провайдера"
 echo "SMOKE: worker-rate-limit-transient — ок"
 
 # 2) worker: RATE_LIMIT Weekly/Monthly (квота надолго) — падает СРАЗУ, задача
 # возвращается в пул (снят и замок, и назначение), сообщение различает
-# «провайдер в лимите» от «воркер не справился» (правило AGENTS.md).
+# «цепочка провайдеров отказала» от «воркер не справился» (правило AGENTS.md).
 scenario_start
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
@@ -1034,10 +1066,10 @@ SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
   run_client_expect_fail "worker-rate-limit-quota" "$REPO/scripts/worker/task.sh"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-rate-limit-quota: замок не снят при квоте — задача осталась занятой"
 assert_log "GH-API-UNASSIGN issue-123" "worker-rate-limit-quota: назначение не снято при квоте — задача осталась занятой"
-assert_log "провайдер в лимите" "worker-rate-limit-quota: сообщение не различает провайдера от собственной ошибки"
+assert_log "цепочка провайдеров отказала" "worker-rate-limit-quota: сообщение не различает провайдера от собственной ошибки"
 assert_not_log "Автономный воркер не справился" "worker-rate-limit-quota: сообщение спутало лимит провайдера с ошибкой агента"
 tg_line=$(grep -F "TG-SEND" "$CALLLOG" | tail -1)
-grep -qF -- "провайдер в лимите" <<<"$tg_line" \
+grep -qF -- "цепочка провайдеров отказала" <<<"$tg_line" \
   || { echo "::error::SMOKE: worker-rate-limit-quota: Telegram не различает провайдера от ошибки агента: $tg_line" >&2; exit 1; }
 echo "SMOKE: worker-rate-limit-quota — ок"
 
