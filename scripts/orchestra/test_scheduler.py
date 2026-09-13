@@ -5501,7 +5501,7 @@ def test_worker_runs_active_still_blocks_recent_in_progress_run(monkeypatch):
 
 
 def test_free_worker_slot_returns_second_slot_when_first_busy(monkeypatch):
-    run = workflow_run_at_slot(1, "in_progress", 1)  # прогон без явного тега
+    run = workflow_run_at_slot(1, "in_progress", 1)  # слот 1 занят явным тегом
     run["run_started_at"] = "2026-09-09T11:55:00Z"
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
@@ -5729,6 +5729,49 @@ def test_reap_stalled_worker_run_handles_both_slots_independently(monkeypatch):
     assert len(actions) == 2
     assert any("#815" in a for a in actions)
     assert any("#820" in a for a in actions)
+
+
+def test_reap_stalled_worker_run_sorts_newest_first_to_avoid_misattribution(monkeypatch):
+    # Находка ai-review PR #831: если обрабатывать прогоны в порядке ответа
+    # API (старые первыми), первый (более ранний старт) матчит ЛЮБУЮ задачу
+    # с `assigned >= его_старта` — включая ту, что реально арендована ВТОРЫМ,
+    # более поздним прогоном (её `assigned` тоже >= более раннего порога).
+    # Раньше первый совпадавший в pool побеждал случайно; сортировка новых
+    # первыми делает первый матч самым тесным порогом и отдаёт каждую задачу
+    # её настоящему арендатору. FakeGh намеренно возвращает СТАРЫЙ прогон
+    # первым в списке — porядок ответа API не должен влиять на результат.
+    now = utc(2026, 9, 9, 15, 0, 0)  # оба возраста > порога 255 мин (#877)
+    run_old = workflow_run_at_slot(1, "in_progress", 1)  # старт 10:00 (300 мин)
+    run_old["run_started_at"] = "2026-09-09T10:00:00Z"
+    run_new = workflow_run_at_slot(2, "in_progress", 2)  # старт 10:21 (279 мин)
+    run_new["run_started_at"] = "2026-09-09T10:21:00Z"
+    task_new = issue(815, assignees=("mytab0r",))   # реально арендована run_new
+    task_old = issue(820, assignees=("mytab0r",))   # реально арендована run_old
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run_old, run_new]},
+        "actions/runs/1/cancel": None,
+        "actions/runs/2/cancel": None,
+        "issues/815/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-09T10:21:05Z"},
+        ],
+        "issues/820/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-09T10:00:05Z"},
+        ],
+        "issues/815/comments": None,
+        "issues/820/comments": None,
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch.claim_task, "release_full",
+                         lambda repo, n: f"назначение снято; замок task-{n} снят")
+
+    observations, actions = sch.reap_stalled_worker_run(
+        REPO, now, pool=[task_new, task_old], pulls=[])
+
+    assert observations == []
+    run_new_action = next(a for a in actions if "run 2" in a)
+    run_old_action = next(a for a in actions if "run 1" in a)
+    assert "#815" in run_new_action, run_new_action
+    assert "#820" in run_old_action, run_old_action
 
 
 # ── dispatch_worker при закрытом WIP-гейте (#464, критическая находка ревью

@@ -10,11 +10,15 @@ CONCURRENCY=2`, диапазон слотов 1..2 в `free_worker_slot`). Эт�
 `type: string` прошёл бы тесты сценариев dispatch (они не смотрят исходник
 worker.yml) зелёными.
 
-Требование: `slot` объявлен `type: choice` с опциями РОВНО `["1", "2"]` —
-GitHub Actions отклоняет workflow_dispatch с недопустимым значением choice
-как на ручном запуске, так и на API/CLI dispatch (`gh workflow run -f
-inputs[slot]=`), поэтому невозможного значения не бывает уже на входе, не
-постфактум.
+Требование: `slot` объявлен `type: choice` с опциями РОВНО
+`["1", .., str(WORKER_MAX_CONCURRENCY)]`, число прочитано из `scheduler.py`
+(находка ai-review PR #831, второй раунд: жёстко зашитое `["1", "2"]` в
+самой гвардии заморозило бы N=2 третьей копией — подъём константы до 3
+прошёл бы эту гвардию зелёной, пока worker.yml продолжал бы отклонять
+slot=3). GitHub Actions отклоняет workflow_dispatch с недопустимым
+значением choice как на ручном запуске, так и на API/CLI dispatch
+(`gh workflow run -f inputs[slot]=`), поэтому невозможного значения не
+бывает уже на входе, не постфактум.
 
 Вторая половина контракта слота — `run-name`/`concurrency.group` (находка
 ai-review PR #831, «доделай в этом PR»): оркестратор читает номер слота
@@ -62,6 +66,21 @@ def _slot_pattern() -> re.Pattern:
     return re.compile(pattern_source)
 
 
+def _worker_max_concurrency() -> int:
+    # Читаем константу из исходника (тот же regex-приём, что _slot_pattern
+    # выше), а не импортируем scheduler.py целиком — он тяжёлый модуль с
+    # сетевыми вызовами на верхнем уровне некоторых функций, гвардия должна
+    # оставаться дешёвой и не тянуть эти зависимости в тестовый процесс.
+    text = SCHEDULER_PY.read_text(encoding="utf-8")
+    match = re.search(r"WORKER_MAX_CONCURRENCY\s*=\s*(\d+)", text)
+    assert match, (
+        "scheduler.py обязан объявлять WORKER_MAX_CONCURRENCY — гвардия "
+        "опций `slot` сверить не с чем (находка ai-review PR #831: гвардия "
+        "не должна морозить N=2 хардкодом отдельно от источника правды)"
+    )
+    return int(match.group(1))
+
+
 def test_slot_input_is_choice_type_not_free_string():
     slot = _slot_input()
     assert slot.get("type") == "choice", (
@@ -70,11 +89,15 @@ def test_slot_input_is_choice_type_not_free_string():
     )
 
 
-def test_slot_input_options_are_exactly_the_two_valid_slots():
+def test_slot_input_options_match_worker_max_concurrency():
     slot = _slot_input()
-    assert slot.get("options") == ["1", "2"], (
-        "опции `slot` обязаны быть ровно ['1', '2'] — WORKER_MAX_CONCURRENCY=2 "
-        "в scheduler.py (диапазон слотов 1..2), третьего слота не существует"
+    expected = [str(n) for n in range(1, _worker_max_concurrency() + 1)]
+    assert slot.get("options") == expected, (
+        f"опции `slot` обязаны быть {expected!r} — ровно диапазон "
+        "1..WORKER_MAX_CONCURRENCY из scheduler.py, прочитанный из источника "
+        "правды, а не хардкод: подъём N до 3 обязан требовать options == "
+        "['1','2','3'], иначе гвардия зелёная, а worker.yml продолжает "
+        "отклонять slot=3 (находка ai-review PR #831)"
     )
 
 
@@ -92,7 +115,7 @@ def test_run_name_carries_slot_in_a_form_scheduler_can_parse():
     # Подставляем оба валидных значения слота вместо GitHub-выражения
     # `${{ inputs.slot || '1' }}` — сам YAML этого не вычисляет, но форма
     # `(slot N)` обязана остаться в буквальном тексте вокруг выражения.
-    for candidate_slot in ("1", "2"):
+    for candidate_slot in (str(n) for n in range(1, _worker_max_concurrency() + 1)):
         rendered = re.sub(r"\$\{\{[^}]*\}\}", candidate_slot, run_name, count=1)
         assert pattern.search(rendered), (
             f"run-name {run_name!r} не даёт форму, которую парсит _SLOT_PATTERN "
