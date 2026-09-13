@@ -1194,6 +1194,18 @@ dsh_extract_reset_hint() { # err_file
 # совместимость); задана, но не JSON-объект — ::warning:: и фейл-открыто
 # (работоспособность цепочки важнее гейта квоты, сломанное персистентное
 # состояние не должно ронять прод).
+#
+# #1121/#1127 (разобрано, НЕ чинится здесь): гейт узнаёт о quota_exhausted
+# ТОЛЬКО из reset-at факта в комментарии ai-review на УЖЕ существующем PR
+# (trigger_ai_review в scheduler.py) — если провайдер отказал классом
+# quota_exhausted у ВОРКЕРА/hands ДО того, как для задачи открыт PR (частый
+# случай — отказ на этапе «Задача через DSH headless»), это состояние
+# структурно не может достичь пульса и переменной. Не «сломан» (проверено:
+# ни один ai:failed PR с 2026-09-10 не нёс quota_exhausted/reset-at —
+# staleness согласуется с дизайном, не с поломкой), а УЖЕ спроектированная
+# граница шире того, что покрывает: см. #1127 для канала worker/hands →
+# пульс. Границу доверия (только пульс пишет, см. test_provider_quota_
+# state_guard.py) эта задача не трогает.
 dsh_quota_state_validate() { # -> печатает в stdout валидный JSON-объект или пусто
   local raw="${DSH_PROVIDER_QUOTA_UNTIL:-}"
   [ -n "$raw" ] || return 0
@@ -1284,11 +1296,32 @@ dsh_model_confirmed() { # model_id
 # исчерпание бюджета, а классификатор (см. #1062 в dsh_chain_should_advance
 # ниже), который был чинён отдельно. Общий бюджет остаётся общим.
 #
+# #1121/#1124 (находка 3, живые прогоны worker.yml 34735752165/34739313568,
+# 2026-09-13): подтверждено — OpenRouter-2 (третье звено) тратит ретраем ВЕСЬ
+# общий бюджет (1650-1800с из 1800с) сам, следующему звену (OpenRouter-1)
+# достаётся буквально 0с. Это НЕ то же самое, что #1062 отверг: #1062
+# отверг СБРОС бюджета заново на каждого провайдера (та арифметика остаётся
+# отвергнутой). Здесь — ПОТОЛОК на долю ОДНОГО провайдера ИЗ ТОГО ЖЕ общего
+# пула (provider_wait_cap ниже): сумма по всем провайдерам физически
+# ограничена тем же chain_rl_budget, как и раньше — ни один провайдер
+# больше не может забрать его целиком один. Дефолт 300с (5 мин) — покрывает
+# 4 шага экспоненциального бэкоффа (30+60+120+90=300, `DSH_RATE_LIMIT_INITIAL_
+# DELAY_SECS`/`_MAX_DELAY_SECS` по умолчанию), при 1800с общего бюджета это
+# даёт ДО 6 провайдеров (1800/300) реальный многошаговый шанс вместо одного
+# монополиста и пяти «нулевых» смежников. Сообщение обязано честно называть
+# И общий остаток, И применённый потолок — AGENTS.md «Алерт не гадает»,
+# молчаливое урезание было бы тем же классом дефекта, что немой стоп-класс.
+#
 # Использование:
 #   dsh_run_with_provider_chain <answer_file> <err_file> <prompt_text> [initial_rl_used]
 # (вызывающий обязан вызвать dsh_require_provider_chain раньше и упасть
 # громко, если vars.DSH_PROVIDER_CHAIN не задан — тот же контракт, что у
 # dsh_require_provider_env/dsh_run_with_retry.)
+#
+# DSH_RATE_LIMIT_PROVIDER_CAP_SECS (необязательный, по умолчанию 300 — #1121/
+# #1124) — потолок доли ОДНОГО провайдера из общего chain_rl_budget, см.
+# комментарий выше. Не отдельный бюджет — ограничение сверху на ту же
+# переменную, общий потолок (chain_rl_budget) не меняется.
 #
 # initial_rl_used (необязательный, по умолчанию 0) — сколько из общего
 # бюджета RATE_LIMIT УЖЕ потрачено ДО этого вызова (находка ai-review PR
@@ -1309,7 +1342,7 @@ dsh_model_confirmed() { # model_id
 #                             сброса, через "; " (пусто — ни один не назвал дату)
 dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_used]
   local answer_file=$1 err_file=$2 prompt_text=$3 initial_rl_used="${4:-0}"
-  local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint
+  local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint cap_note
   local quota_state_json
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
@@ -1336,7 +1369,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   # комментарий выше у объявления функции. Значение вызывающего читается
   # РОВНО один раз здесь, до цикла; rl_remaining ниже — то, что осталось.
   local chain_rl_budget="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
-  local chain_rl_used="$initial_rl_used" rl_remaining
+  local chain_rl_used="$initial_rl_used" rl_remaining rl_true_remaining
+  # #1121/#1124: потолок на долю ОДНОГО провайдера из общего пула — см.
+  # комментарий выше у объявления функции. Читается ОДИН раз, как и
+  # chain_rl_budget — не второй, независимый бюджет, а ограничение сверху
+  # НА ТУ ЖЕ самую переменную rl_remaining.
+  local provider_wait_cap="${DSH_RATE_LIMIT_PROVIDER_CAP_SECS:-300}"
   while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
     entry=$(jq -c ".[$i]" <<<"$DSH_PROVIDER_CHAIN")
     name=$(jq -r '.name' <<<"$entry")
@@ -1369,9 +1407,15 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
       i=$((i + 1))
       continue
     fi
-    rl_remaining=$((chain_rl_budget - chain_rl_used))
-    [ "$rl_remaining" -lt 0 ] && rl_remaining=0
-    echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_remaining}с из ${chain_rl_budget}с (#877)"
+    rl_true_remaining=$((chain_rl_budget - chain_rl_used))
+    [ "$rl_true_remaining" -lt 0 ] && rl_true_remaining=0
+    rl_remaining="$rl_true_remaining"
+    cap_note=""
+    if [ "$rl_remaining" -gt "$provider_wait_cap" ]; then
+      rl_remaining="$provider_wait_cap"
+      cap_note=", провайдеру выделено не больше ${rl_remaining}с (потолок ${provider_wait_cap}с на провайдера, #1121)"
+    fi
+    echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_true_remaining}с из ${chain_rl_budget}с (#877)${cap_note}"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
     DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"

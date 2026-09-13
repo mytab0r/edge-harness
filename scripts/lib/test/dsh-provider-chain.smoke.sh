@@ -53,7 +53,8 @@ CONFIRMED_MODELS_FIXTURE="$WORK/confirmed-models.json"
 cat >"$CONFIRMED_MODELS_FIXTURE" <<JSON
 [
   {"name":"PRIMARY","model_sha256":"$(hash_of primary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
-  {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"}
+  {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
+  {"name":"TERTIARY","model_sha256":"$(hash_of tertiary-model)","confirmed_at":"2026-09-13","evidence":"smoke fixture (#1121/#1124)"}
 ]
 JSON
 export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
@@ -517,4 +518,48 @@ OUT="$(cat "$LOG")"
   || fail "18) нераспознанный класс не обязан останавливать цепочку (перевёрнутое умолчание #1084): $OUT"
 echo "SMOKE(chain): 18) нераспознанный класс отказа -> автопереход по умолчанию, не стоп (перевёрнутое умолчание #1084) — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084 зелёная"
+# ── 19) #1121/#1124, живой инцидент — прогоны worker.yml 34735752165/
+# 34739313568: ОДИН провайдер (там — OpenRouter-2) тратит ретраем ВЕСЬ
+# общий бюджет RATE_LIMIT сам, следующему достаётся 0с (см. сценарий 13 —
+# это УЖЕ доказанное, ожидаемое поведение БЕЗ потолка). Здесь — потолок на
+# долю ОДНОГО провайдера (DSH_RATE_LIMIT_PROVIDER_CAP_SECS): три провайдера,
+# первые два в вечном RATE_LIMIT, третий отвечает успехом. Бюджет 60с,
+# потолок 20с, задержка бэкоффа стартует с 30с (больше потолка — потолок
+# обязан урезать её ДО потолка на первом же шаге, не только считать сумму).
+# Без потолка PRIMARY выжег бы все 60с сам (та же арифметика, что сценарий
+# 13), и SECONDARY получил бы 0с — печатался бы «остаток общего бюджета
+# RATE_LIMIT: 0с из 60с» без какой-либо пометки потолка. С потолком PRIMARY
+# обязан остановиться ровно на 20с (потолок), у SECONDARY реально остаётся
+# 40с (60-20), из которых ему тоже выделяется не больше потолка (20с) — то
+# есть SECONDARY обязан получить РЕАЛЬНЫЙ многошаговый шанс, а не 0.
+reset_scenario
+THREE_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","model":"primary-model","secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096},
+  {"name":"TERTIARY","base_url":"https://tertiary.test/v1","model":"tertiary-model","secret_env":"TERTIARY_KEY","max_output_tokens":4096}
+]'
+export TERTIARY_KEY="tertiary-test-key"
+SMOKE_MODE_primary_model="always-rate-limit"
+SMOKE_MODE_secondary_model="always-rate-limit"
+SMOKE_MODE_tertiary_model="ok"
+LOG="$WORK/log19.txt"
+( export DSH_PROVIDER_CHAIN="$THREE_CHAIN"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+  DSH_RATE_LIMIT_INITIAL_DELAY_SECS=30 \
+  DSH_RATE_LIMIT_MAX_DELAY_SECS=30 \
+  DSH_RATE_LIMIT_PROVIDER_CAP_SECS=20 \
+    dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::19) TERTIARY отвечает успехом, ожидался rc=0, получено $DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "TERTIARY" ] || { echo "::error::19) ожидался переход на TERTIARY, получено '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY, TERTIARY" ] || { echo "::error::19) все три провайдера обязаны быть опробованы: '$DSH_CHAIN_TRIED'" >&2; exit 1; }
+  [[ "$OUT" == *"пробую PRIMARY"*"остаток общего бюджета RATE_LIMIT: 60с из 60с"*", провайдеру выделено не больше 20с (потолок 20с на провайдера, #1121)"* ]] \
+    || { echo "::error::19) PRIMARY обязан стартовать с полного общего бюджета (60с), урезанного потолком до 20с: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"пробую SECONDARY"*"остаток общего бюджета RATE_LIMIT: 40с из 60с"*", провайдеру выделено не больше 20с (потолок 20с на провайдера, #1121)"* ]] \
+    || { echo "::error::19) SECONDARY обязан получить РЕАЛЬНЫЙ остаток (40с из 60с), урезанный потолком до 20с — НЕ 0с, как было бы без потолка (мутация: сними cap-логику, эта строка покраснеет): $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"пробую TERTIARY"*"остаток общего бюджета RATE_LIMIT: 20с из 60с"* ]] \
+    || { echo "::error::19) TERTIARY обязан увидеть остаток 20с из 60с (PRIMARY+SECONDARY суммарно потратили ровно 40с, не 60): $OUT" >&2; exit 1; }
+) || fail "19) сценарий с потолком на провайдера провалился"
+echo "SMOKE(chain): 19) потолок доли ОДНОГО провайдера из общего бюджета RATE_LIMIT — второй провайдер получает реальный шанс, не 0с (#1121/#1124) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084/#1121 зелёная"
