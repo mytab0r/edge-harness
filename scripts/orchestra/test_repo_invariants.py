@@ -3184,7 +3184,6 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
     assert 16 in ri.ESCALATING_INVARIANTS
 
 
-# ══════════════════════════════════════════════════════════════════════════
 # Инвариант 17: живая морда dsh-edge отстаёт от main (#1041)
 # ══════════════════════════════════════════════════════════════════════════
 #
@@ -3934,3 +3933,125 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
     assert len(seen_markers) == 2
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
+
+
+# ── Инвариант 19 (#1121): continue-on-error обязан иметь читателя ──────────
+# (номер 17 занят check_frontend_deploy_stale выше, 18 —
+# check_pipeline_status_marker_impersonation выше — доводка ревью PR #1136
+# переехала на первый свободный)
+
+def _write_workflow(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_continue_on_error_without_reader_is_violation(tmp_path):
+    _write_workflow(tmp_path, "some-new.yml", """
+jobs:
+  job1:
+    steps:
+      - name: Быстрый шаг
+        continue-on-error: true
+        run: echo hi
+""")
+    violations = ri.check_continue_on_error_readers(tmp_path)
+    assert violations == [{"kind": "no-reader", "workflow": "some-new.yml",
+                           "job": "job1", "step": "Быстрый шаг"}]
+
+
+def test_continue_on_error_in_digest_workflow_is_covered(tmp_path):
+    """Файл с именем из DIGEST_WORKFLOWS покрыт дайджестом целиком (канал A —
+    аннотации не маскируются continue-on-error, канал B — условные шаги);
+    источник покрытия — импорт soft_failure_digest.DIGEST_WORKFLOWS, не копия."""
+    _write_workflow(tmp_path, "worker.yml", """
+jobs:
+  task:
+    steps:
+      - name: Что угодно
+        continue-on-error: true
+        run: echo hi
+""")
+    assert ri.check_continue_on_error_readers(tmp_path) == []
+
+
+def test_continue_on_error_with_registered_reader_is_covered(tmp_path):
+    _write_workflow(tmp_path, "deploy-worker.yml", """
+jobs:
+  deploy:
+    steps:
+      - name: Автооткат прода при красной канарейке
+        continue-on-error: true
+        run: echo rollback
+      - name: Новый непокрытый шаг
+        continue-on-error: true
+        run: echo boom
+""")
+    violations = ri.check_continue_on_error_readers(tmp_path)
+    assert violations == [{"kind": "no-reader", "workflow": "deploy-worker.yml",
+                           "job": "deploy", "step": "Новый непокрытый шаг"}]
+
+
+def test_job_level_continue_on_error_needs_reader_too(tmp_path):
+    _write_workflow(tmp_path, "other.yml", """
+jobs:
+  whole-job:
+    continue-on-error: true
+    steps:
+      - run: echo hi
+""")
+    violations = ri.check_continue_on_error_readers(tmp_path)
+    assert violations == [{"kind": "no-reader", "workflow": "other.yml",
+                           "job": "whole-job", "step": None}]
+
+
+def test_unreadable_workflow_is_loud_not_healthy(tmp_path):
+    """Неразбираемый workflow — непроверяемое состояние: не имеет права
+    выглядеть здоровым (fail loud), иначе правка с битым YAML гасила бы
+    инвариант молча."""
+    (tmp_path / "broken.yml").write_text("jobs: [broken", encoding="utf-8")
+    violations = ri.check_continue_on_error_readers(tmp_path)
+    assert len(violations) == 1
+    assert violations[0]["kind"] == "unreadable"
+    assert violations[0]["workflow"] == "broken.yml"
+
+
+def test_registered_reader_keys_match_real_workflows():
+    """Реестр не протухает молча: каждый его ключ обязан указывать на ЖИВОЙ
+    шаг с continue-on-error: true в реальном workflow этого репозитория.
+    Переименование шага в YAML без правки реестра красит этот тест тем же
+    ходом, каким инвариант начал бы находить «новое» нарушение."""
+    workflows_dir = ri.REPO_ROOT / ".github" / "workflows"
+    digest = ri._digest_module()
+    real_keys = set()
+    for path in workflows_dir.glob("*.yml"):
+        doc = digest.yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for job in (doc.get("jobs") or {}).values():
+            if not isinstance(job, dict):
+                continue
+            for step in (job.get("steps") or []):
+                if isinstance(step, dict) and step.get("continue-on-error") is True:
+                    real_keys.add((path.name, digest.step_display_name(step)))
+    for key in ri.CONTINUE_ON_ERROR_READERS:
+        assert key in real_keys, (
+            f"{key} в CONTINUE_ON_ERROR_READERS не указывает на живой шаг с "
+            "continue-on-error: true — запись протухла (шаг переименовали/удалили?)")
+
+
+def test_live_debt_snapshot_known_violations():
+    """Замер долга на живом репозитории (момент внедрения #1121): ровно 4
+    нарушения, все — за пределами пяти workflow дайджеста. Новый
+    continue-on-error без читателя в ЛЮБОМ workflow добавит строку и покрасит
+    этот тест — включение инварианта в CI_GATING (GATING_RELEASE_CONDITION[19])
+    сознательная правка, не дрейф."""
+    violations = ri.check_continue_on_error_readers(ri.REPO_ROOT / ".github" / "workflows")
+    found = {(v["workflow"], v["step"]) for v in violations if v["kind"] == "no-reader"}
+    expected = {
+        ("deploy-worker.yml", "Эскалация автооткота (#120/Telegram)"),
+        ("plugin-forge.yml", "plugin_status → building"),
+        ("plugin-forge.yml", "plugin_status → built"),
+        ("plugin-forge.yml", "plugin_status → failed (если форж упал)"),
+    }
+    assert found == expected, (
+        f"замер долга инварианта 19 уехал: {sorted(found ^ expected)} — "
+        "обнови ожидание осознанно (новый шаг без читателя или шаг получил читателя)")

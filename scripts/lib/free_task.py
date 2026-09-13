@@ -74,8 +74,9 @@ silent-wrong.
 #1178 — «вес барьера, не только мета и граф») — ЧЕТЫРЕ уровня, в этом
 порядке:
 
-  (1) «Механизм конвейера сейчас красный» (`BROKEN_LABELS` —
-      `ci-failure`/`self-audit`) ИЛИ задача транзитивно блокирует хотя бы
+  (1) «Механизм конвейера сейчас красный/деградирует» (`BROKEN_LABELS` —
+      `ci-failure`/`self-audit`/`soft-failure`) ИЛИ задача транзитивно
+      блокирует хотя бы
       одну такую (`task_deps.blockers_of`) — факт, не самооценка: конвейер
       измеримо стоит, пока это открыто, и стоимость простоя растёт с каждым
       прогоном, а не с датой заведения. Замер задачи #224 на живом пуле
@@ -202,16 +203,21 @@ META_LABEL = "area:process"
 # LABELS.md`.
 IMPACT_LABEL = "impact:system"
 
-# Метки «механизм конвейера сейчас красный», задача #224 — зеркалят буквальные
-# строки `scripts/orchestra/pulse_guard.py::FAILURE_WATCH_LABEL` ("ci-failure")
-# и `scripts/orchestra/health_audit.py::SELF_AUDIT_LABEL` ("self-audit"), НЕ
-# импортом (lib не должен зависеть от orchestra — обратная зависимость уже
-# есть: `scheduler.py` сам загружает `free_task.py` через importlib, обратный
-# импорт создал бы цикл), а второй копией литерала, синхронизацию которой
-# держит гвардия по исходнику (`test_broken_labels_mirror_orchestra_literals`
-# в test_free_task.py) — тот же приём, что уже применяет `docs/agents/
-# LABELS.md` для меток-вердиктов, не второй source of truth без проверки.
-BROKEN_LABELS = frozenset({"ci-failure", "self-audit"})
+# Метки «механизм конвейера сейчас красный/деградирует», задача #224 —
+# зеркалят буквальные строки `scripts/orchestra/pulse_guard.py::
+# FAILURE_WATCH_LABEL` ("ci-failure"), `scripts/orchestra/health_audit.py::
+# SELF_AUDIT_LABEL` ("self-audit") и `scripts/orchestra/soft_failure_digest.py::
+# SOFT_FAILURE_LABEL` ("soft-failure"), НЕ импортом (lib не должен зависеть от
+# orchestra — обратная зависимость уже есть: `scheduler.py` сам загружает
+# `free_task.py` через importlib, обратный импорт создал бы цикл), а второй
+# копией литерала, синхронизацию которой держит гвардия по исходнику
+# (`test_broken_labels_mirror_orchestra_literals` в test_free_task.py) — тот
+# же приём, что уже применяет `docs/agents/LABELS.md` для меток-вердиктов, не
+# второй source of truth без проверки. "soft-failure" — тот же смысл «конвейер
+# деградирует прямо сейчас», что у соседей (задачи автозаведения дайджеста
+# мягких отказов #1121 раньше тонули на уровне 3 среди ~200 открытых по номеру
+# — находка AI-ревью PR #1136).
+BROKEN_LABELS = frozenset({"ci-failure", "self-audit", "soft-failure"})
 
 
 def _load_sibling(name: str):
