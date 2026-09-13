@@ -5543,8 +5543,13 @@ def test_session_progress_tip_empty_events_is_unavailable(monkeypatch):
 def test_worker_silence_reason_first_observation_posts_baseline_marker(monkeypatch):
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (10, None))
     fake = FakeGh({
-        "issues/120/comments?per_page=100": [],
+        # Порядок важен (FakeGh матчит первый подходящий фрагмент по подстроке):
+        # запись записи (POST) и страница (GET .../comments?per_page=100) — ДО
+        # голого "issues/120" (#1100, метаданные issue), иначе более короткий
+        # голый фрагмент перехватил бы оба более специфичных вызова как подстрока.
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "issues/120/comments?per_page=100": [],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 0},
     })
     patch_gh(monkeypatch, fake)
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
@@ -5556,11 +5561,12 @@ def test_worker_silence_reason_first_observation_posts_baseline_marker(monkeypat
 def test_worker_silence_reason_seq_growth_is_not_stalled_and_updates_marker(monkeypatch):
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (42, None))
     fake = FakeGh({
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-13T05:30:00Z",
              "body": "[прогресс воркера: run 999 seq=10]"},
         ],
-        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
@@ -5576,6 +5582,7 @@ def test_worker_silence_reason_unchanged_seq_under_threshold_is_not_stalled(monk
             {"created_at": "2026-09-13T07:00:00Z",  # 60 мин назад < 150
              "body": "[прогресс воркера: run 999 seq=10]"},
         ],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
@@ -5591,6 +5598,7 @@ def test_worker_silence_reason_unchanged_seq_past_threshold_is_stalled(monkeypat
             {"created_at": "2026-09-13T05:00:00Z",  # 180 мин назад > порог 150
              "body": "[прогресс воркера: run 999 seq=10]"},
         ],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
@@ -5610,8 +5618,10 @@ def test_worker_silence_reason_session_progress_unavailable_degrades_to_observat
 
 
 def test_worker_silence_reason_marker_read_failure_degrades_to_observation(monkeypatch):
+    # #1100: max_pages>0 читает метаданные issue (число комментариев) ДО
+    # страниц — сбой сети падает уже на этом первом вызове.
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (10, None))
-    fake = FakeGh({"issues/120/comments?per_page=100": RuntimeError("gh api ...: HTTP 500")})
+    fake = FakeGh({"repos/mytab0r/edge-harness/issues/120": RuntimeError("gh api ...: HTTP 500")})
     patch_gh(monkeypatch, fake)
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
     assert reason is None
@@ -5638,6 +5648,7 @@ def test_reap_stalled_worker_run_cancels_on_silence_before_age_threshold(monkeyp
             {"created_at": "2026-09-13T05:20:00Z",  # 160 мин назад > порог 150
              "body": "[прогресс воркера: run 34739313568 seq=7]"},
         ],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
         "actions/runs/34739313568/cancel": None,
         "issues/1085/comments": None,
     })
@@ -5669,11 +5680,16 @@ def test_reap_stalled_worker_run_growing_session_is_not_reaped_before_age_thresh
         "issues/1085/timeline?per_page=100": [
             {"event": "assigned", "created_at": "2026-09-13T05:00:30Z"},
         ],
+        # Порядок важен (см. комментарий в test_worker_silence_reason_first_
+        # observation_posts_baseline_marker выше): POST и страница ДО голого
+        # "issues/120" метаданных (#1100), иначе короткий фрагмент перехватит
+        # оба более специфичных вызова как подстроку.
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
         "issues/120/comments?per_page=100": [
             {"created_at": "2026-09-13T05:20:00Z",
              "body": "[прогресс воркера: run 34739313568 seq=7]"},
         ],
-        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (55, None))  # выросло с 7
