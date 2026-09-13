@@ -22,14 +22,26 @@
 // on: `openAgentForTurn` returns the same cached handle object across calls
 // for the same sessionId, and a disposed handle is unusable afterwards.
 //
-// Honest boundary: the exact wording `"is not live in this store"` and the
-// resident-cache internals are NOT verified byte-for-byte against the
-// upstream `session-store.ts` source on the 0.14.0 pin — dsh-edge is not
-// vendored in this repository (PATCHES.md, bump #1138 entry). The stub here
-// is a faithful model of the mechanism as documented in research/11 (a
-// literal upstream docstring quote), sufficient to reproduce the observed
-// symptom (batch 1 OK, batch 2 on the same session fails immediately, no
-// idle delay involved) and to prove the fix by mutation.
+// The exact wording `"is not live in this store"` and the throw site ARE an
+// observed fact, not a guess: `gh run view 34773180930 --log-failed` shows
+// `Error: session "ingest-check" is not live in this store` thrown from
+// `Proxy.liveEntryFor`, called from `Proxy.flush`, called from
+// `EdgeSessionStore.appendHarnessEvents` — batch 2 dies inside
+// `sessions.flush(session)` (the live-downlink publish path), not while
+// opening the handle. Honest boundary: WHY disposing the handle breaks that
+// later flush — the resident-cache mechanism (openAgentForTurn now a
+// @deprecated alias of getOrResumeAgent, which returns the same cached
+// handle per sessionId; dispose() does not remove it from that cache) — is
+// an explanatory model from docs/research/11-dsh-edge.md (a literal upstream
+// docstring quote), NOT verified byte-for-byte against the upstream
+// `session-store.ts` source on the 0.14.0 pin — dsh-edge is not vendored in
+// this repository (PATCHES.md, bump #1138 entry). The stub below reproduces
+// the OBSERVABLE effect (batch 1 OK, batch 2 on the same session fails
+// immediately with the exact real error text, no idle delay involved) via a
+// simplified stand-in (a disposed handle's `.agent` getter throws), not by
+// literally re-implementing `liveEntryFor`/`flush` — sufficient to prove the
+// fix (stop disposing) by mutation, without overclaiming an exact internal
+// call-path match.
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
