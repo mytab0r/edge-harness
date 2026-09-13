@@ -267,12 +267,19 @@ ALLOWLIST = frozenset({
     'DO: агрегат на горячем пути только за кэшем (#320/#321/#575)',
     'pre-commit отклоняет коммит в agent/<N>-* не из своего дерева',
     'task-branch берёт аренду задачи, не арендует дважды за транспортом',
-    'Гвардии check_pr.py — аргумент --tree и размерный гейт (#90)',
-    'Канарейка осиротевших тестов — живой снимок (#583)',
-    'Квота GitHub API — ранняя проверка (инварианты)',
-    'Мутационный тест гвардии литерала namespace',
-    'Провайдер/модель LLM — одно место правды (vars), без зашитых дефолтов',
-    'Рассинхрон тела задачи и графа зависимостей (#371)',
+    # 'Квота GitHub API — ранняя проверка (инварианты)' — ОСТАЁТСЯ рукописным
+    # шагом (#749/design.md, «единственный случай, не обобщаемый без
+    # спекулятивной инфраструктуры»): `id: quota` этого шага несёт OUTPUT
+    # (`outputs.skip`), который читает `if:` СЛЕДУЮЩЕГО рукописного шага
+    # «Инварианты состояния репозитория — живой снимок» — каталог
+    # (`scripts/ci/run_guards.sh`) исполняет файлы независимо друг от друга,
+    # передать межшаговый `if:`/`id:` через него нельзя без нового канала
+    # «shared job state», которого сегодня не использует ни один другой
+    # файл каталога (AGENTS.md, «не строй абстракцию заранее»). Это
+    # НАМЕРЕННОЕ исключение, а не забытый долг — держится в отдельном
+    # множестве ALLOWLIST_JOB_STATE_EXEMPT ниже (не здесь), чтобы
+    # `check_allowlist_entries_are_migratable` не путала его с обычной
+    # ALLOWLIST-записью (#1069).
     'Тесты графа блокировок пула task_deps',
     'Тесты create_pool_issue — отказ до сетевого вызова при отсутствии task',
     'Тесты кампании dispatch-tail',
@@ -280,11 +287,9 @@ ALLOWLIST = frozenset({
     'Тесты предохранителя конвейера orchestra',
     'Тесты гвардии waiting:owner (метка, варианты, эскалация)',
     'Тесты применения решения владельца (owner-decision)',
-    'Гвардия синхронности формата кнопки Telegram (TS ↔ Python)',
     'Тесты инвариантов состояния репозитория',
     'Тесты автофикса архивации openspec/changes (#493/#506)',
     'Тесты гвардии бита исполнения',
-    'Гвардия бита исполнения — живой снимок workflow (#510/#516)',
     'Тесты экономии диспатча wake_orchestra (#456)',
     'Тесты сборщика квот',
     'Тесты планировщика orchestra (логин в морду, архив сессий, петля состояния PR)',
@@ -299,25 +304,14 @@ ALLOWLIST = frozenset({
     'Тесты аренды задачи claim_task',
     'Тесты извлечения номера задачи task_ref',
     'Тесты исхода PR ветки pr_outcome',
-    'Гвардия «резолвер PR → задача, не подстрока прозы»',
-    'Гвардия пагинации — списочный ответ GitHub API без обхода страниц',
-    'Гвардия «сырой stderr клиента модели без redact» (#743)',
-    'Гвардия «газ метки достижим правкой тела PR»',
-    'Гвардия пакетного менеджера standalone dsh-edge (#43)',
     'Тесты выбора свободной задачи free_task',
-    'Гвардия разделения GitHub-токенов',
-    'Гвардия реестра меток — у каждого тормоза-метки объявлен газ',
-    'Гвардия инвентаря INFRA-GH.md — каждый workflow назван в таблице',
     'Тесты канарейки осиротевших тестов',
-    'Гвардия паритета маскирования секретов (bash ↔ TS)',
     # 'Гвардия массовой установки секретов combo-router (#733)' мигрирована
     # в scripts/ci/guards/provider-secrets-import-guard.sh (#749) — не
     # ALLOWLIST-запись, ratchet ниже уменьшен вместе с этим (77 → 76).
     'Тесты AI-ревью (второй гейт)',
-    'Гвардия гейта первого ревью ai-review.yml (#204)',
     'Тесты file_tasks.py — фильтр МАСШТАБ (#426)',
     'Тесты review_checklist.py — категория ЗАМЕЧАНИЕ (#462)',
-    'Гвардия триггеров гейтов ревью (#208)',
     'Юнит-тесты плагина dsh-hands-streamer',
     'Юнит-тесты плагина plugin-manager',
     'Юнит-тесты общего разбора тела ошибки (plugins-src/shared)',
@@ -325,7 +319,6 @@ ALLOWLIST = frozenset({
     'Юнит-тесты логики инструментов интеграций',
     'Юнит-тесты клиентского бандла интеграций',
     'Юнит-тесты плагина provider-registry',
-    'Гвардия «каталог плагинов не отравляет литерал namespace»',
     'Smoke task-branch — проверка на входе и рабочее дерево',
     'Smoke pr-create — Closes/Fixes/Resolves отклоняется до вызова gh (#496)',
     'Тесты паритета scripts/git/pr-create ↔ contract_check.py',
@@ -345,12 +338,8 @@ ALLOWLIST = frozenset({
     # факт, а не подогнано под ожидание.
     'Smoke bash-клиентов на заглушках (класс Б1',
     'Smoke цепочки LLM-провайдеров (#727)',
-    'Гвардия concurrency — не сериализовать разные джобы одной статической группой',
-    'Гвардия «workflow из docs существует»',
     'Тесты гейта квоты rate_guard (#454)',
     'Тесты гвардии полноты карты документации',
-    'Гвардия полноты карты документации — живой снимок (#670)',
-    'Гвардия стыка suite и цепочки провайдеров (#215/#727)',
 })
 
 # Верхняя граница ALLOWLIST — «только вниз» (ревью PR #771, major 5): без
@@ -394,7 +383,32 @@ ALLOWLIST = frozenset({
 # потолок не двигаются. Живая иллюстрация тезиса issue #749: пока PR #771
 # не слит, main продолжает копить рукописные шаги тем же способом, который
 # эта задача закрывает.
-ALLOWLIST_RATCHET_MAX = 77
+#
+# 77 → 53 (issue #1069, живой случай — provider-default.guard.sh уронил
+# PR #1068/#1095 после ЗЕЛЁНОГО локального `run_guards.sh`, потому что
+# гвардия жила в ALLOWLIST, а не в каталоге): 24 записи мигрированы —
+# 20 автоматически (`guard_step_translator.translate_repo_ci` с сужённым
+# `allowlist=`, тот же перенос, что и для новых незарегистрированных
+# шагов, просто на существующий долг вместо свежей находки), 3 вручную
+# (`declared-deps-guard.sh` — исходный шаг нёс `env:`, которого
+# автопереводчик не поддерживает; `workflow-concurrency-guard.sh` и
+# `docs-workflow-exists-guard.sh` — инлайн heredoc-python без отдельного
+# исполняемого файла, автопереводчик не может определить имя каталога
+# детерминированно), и 1 перенесена в ОТДЕЛЬНОЕ множество
+# `ALLOWLIST_JOB_STATE_EXEMPT` (см. выше) — «Квота GitHub API» осталась
+# рукописной по названной причине (межшаговая `id:`/`if:`-связь), не по
+# забывчивости. Критерий отбора мигрированных 24 — самоназвание
+# («Гвардия»/«Гвардии» в начале имени шага) ИЛИ «голый» вызов файла без
+# pytest-обёртки (`bash <файл>.guard.sh`, `python <файл>.py` без
+# `test_`-префикса и без `-m pytest`) — формализован и проверяется
+# `check_allowlist_entries_are_migratable` ниже: он же не даёт остальным
+# 53 записям молча превратиться в гвардию под тем же именем. Остаток —
+# unit-тесты КОНКРЕТНОГО модуля (`pytest test_X.py -q`, где X.py —
+# бизнес-логика, которую разработчик, редактирующий X.py, и так запускает
+# сам) — честная граница issue #1069, не факт «мигрировано всё» (полная
+# ликвидация остатка — та же оговорка design.md #749: «не одним PR», диффа
+# в 24 файла уже достаточно для одного PR).
+ALLOWLIST_RATCHET_MAX = 53
 
 # Инфраструктурные исключения — шаги job `test`, которые НИКОГДА не мигрируют
 # в scripts/ci/guards/, потому что сами не гвардии (перебор каталога — не
@@ -410,6 +424,29 @@ INFRA_EXEMPT_STEP_NAMES = frozenset({
     'Каталог гвардий scripts/ci/guards — перебор (#749)',
 })
 
+# Исключение ПО ПРИЧИНЕ МЕЖШАГОВОЙ ЗАВИСИМОСТИ (#1069, продолжение
+# design.md #749 — «единственный случай, не обобщаемый без спекулятивной
+# инфраструктуры»), НЕ то же самое, что INFRA_EXEMPT_STEP_NAMES выше:
+# в отличие от шага-перебора (который сам не гвардия), «Квота GitHub API —
+# ранняя проверка (инварианты)» — самая настоящая гвардия по содержимому
+# (`python scripts/lib/rate_guard.py --job repo-ci-invariants`), но несёт
+# `id: quota`, чей OUTPUT (`outputs.skip`) читает `if:` СЛЕДУЮЩЕГО
+# рукописного шага «Инварианты состояния репозитория — живой снимок».
+# scripts/ci/run_guards.sh исполняет файлы каталога изолированно
+# (`bash "$script"` в цикле, без общего с workflow канала output→if) —
+# перенос потребовал бы либо (а) нового канала «job-level shared state»
+# для ОДНОГО потребителя, либо (б) параметра каталога «эта гвардия
+# гейтится квотой», оба варианта строятся ради единственного случая
+# (AGENTS.md, «не строй абстракцию заранее»). Держится ОТДЕЛЬНЫМ
+# множеством от ALLOWLIST: ALLOWLIST обязан монотонно убывать к нулю
+# (`check_allowlist_entries_are_migratable` ниже это проверяет), это
+# множество — нет, оно фиксирует НАЗВАННОЕ намеренное исключение, а не
+# забытый долг (см. также #1069: агент, читающий пустой/уменьшившийся
+# ALLOWLIST, не должен решить, что «квота» — забытая находка).
+ALLOWLIST_JOB_STATE_EXEMPT = frozenset({
+    'Квота GitHub API — ранняя проверка (инварианты)',
+})
+
 
 def guard_step_names(repo_ci: Path = REPO_CI) -> set[str]:
     """Имя шага попадает в результат по ЛЮБОМУ из двух признаков — соглашение
@@ -421,7 +458,7 @@ def guard_step_names(repo_ci: Path = REPO_CI) -> set[str]:
     names: set[str] = set()
     for step in job.get("steps") or []:
         name = step.get("name")
-        if name in INFRA_EXEMPT_STEP_NAMES:
+        if name in INFRA_EXEMPT_STEP_NAMES or name in ALLOWLIST_JOB_STATE_EXEMPT:
             continue
         run_text = step.get("run")
         by_name = bool(name) and bool(_GUARD_NAME_RE.match(name))
@@ -502,6 +539,105 @@ def _suggest_guard_filename(repo_ci: Path, name: str) -> str | None:
     return f"{translator._slug_from_target(sorted(targets)[0])}.sh"
 
 
+_ALLOWLIST_GUARD_NAME_RE = re.compile(r"^Гвард", re.IGNORECASE)
+
+
+def _bare_script_violation(run_text: str) -> str | None:
+    """Первая найденная «голая» команда исполнения файла — прямой запуск,
+    не обёрнутый pytest/`node --test` (issue #1069): `python <файл>.py` без
+    `-m pytest` и без префикса `test_` в имени файла, `node <файл>.mjs`/`.js`
+    без `--test` и без `.test.` в пути, `bash`/`sh <файл>.guard.sh` (двойное
+    расширение `.guard.sh` — установленное соглашение репозитория для
+    самостоятельного guard-скрипта, см. `scripts/lib/test/*.guard.sh`,
+    отличное от `.test.sh`/`.smoke.sh` соседних unit-тестов). Такая форма
+    структурно не может быть «unit-тестом логики модуля через pytest» — она
+    ЛИБО живой снимок состояния репозитория (orphan_test_guard.py,
+    docs_index_guard.py, declared_deps.py check), ЛИБО самостоятельный
+    guard-файл (`*.guard.sh`) — оба случая уже мигрированы этим PR (#1069),
+    остаться в ALLOWLIST под этой формой значит незамеченно завести гвардию
+    заново под старым/новым именем. `None`, если ни одна команда `run_text`
+    не подходит под это описание."""
+    for words in _otg.statement_tokens(run_text):
+        if not words:
+            continue
+        head = words[0]
+        if head in ("python", "python3"):
+            if len(words) >= 3 and words[1] == "-m" and words[2] == "pytest":
+                continue
+            for arg in words[1:]:
+                if arg.startswith("-"):
+                    continue
+                path = Path(arg)
+                if path.suffix == ".py" and not path.name.startswith("test_"):
+                    return arg
+        elif head in ("bash", "sh"):
+            for arg in words[1:]:
+                if arg.startswith("-"):
+                    continue
+                if arg.endswith(".guard.sh"):
+                    return arg
+        elif head == "node":
+            if "--test" in words:
+                continue
+            for arg in words[1:]:
+                if arg.startswith("-"):
+                    continue
+                if Path(arg).suffix in (".mjs", ".js") and ".test." not in arg:
+                    return arg
+    return None
+
+
+def check_allowlist_entries_are_migratable(
+    repo_ci: Path = REPO_CI,
+    allowlist: frozenset[str] = ALLOWLIST,
+    job_state_exempt: frozenset[str] = ALLOWLIST_JOB_STATE_EXEMPT,
+) -> list[str]:
+    """Закрывает остаточный класс issue #1069: `ci_guard_registration_guard`
+    и раньше не давал появиться НОВОМУ рукописному шагу гвардии, но НИЧЕГО
+    не мешало существующей ALLOWLIST-записи молча остаться «гвардией не в
+    каталоге» навсегда — именно так `provider-default.guard.sh` (класс
+    #153) дожил в ALLOWLIST до живых падений PR #1068/#1095 при зелёном
+    локальном `run_guards.sh`. Критерий (см. `_bare_script_violation` и
+    `_ALLOWLIST_GUARD_NAME_RE`): запись ALLOWLIST обязана быть unit-тестом
+    КОНКРЕТНОГО модуля (`pytest test_X.py -q`, где X.py — бизнес-логика,
+    которую и так запускает разработчик, редактирующий X.py), а не (а)
+    самоназванной «Гвардия…»/«Гвардии…» (автор сам объявил её инвариантом
+    репозитория) и не (б) «голым» вызовом файла без pytest-обёртки —
+    признак того, что это живой снимок состояния репозитория, а не тест
+    логики модуля. `ALLOWLIST_JOB_STATE_EXEMPT` — единственная НАЗВАННАЯ
+    оговорка (см. её докстринг), проверке не подлежит вовсе."""
+    problems: list[str] = []
+    for name in sorted(allowlist):
+        if name in job_state_exempt:
+            continue
+        if _ALLOWLIST_GUARD_NAME_RE.match(name):
+            problems.append(
+                f"ALLOWLIST несёт запись {name!r}, самоназванную «Гвардия»/"
+                "«Гвардии» — по этому же самоназванию её и распознаёт "
+                "guard_step_names() как гвардию (issue #1069): перенеси в "
+                "scripts/ci/guards/ (guard_step_translator.translate_repo_ci "
+                "с сужённым allowlist= делает перенос атомарно для форм без "
+                "env:/id:/heredoc; иначе — вручную по образцу уже "
+                "мигрированных этим PR файлов) и убери запись из ALLOWLIST"
+            )
+            continue
+        run_text = _step_run_text(repo_ci, name)
+        violation = _bare_script_violation(run_text) if run_text else None
+        if violation:
+            problems.append(
+                f"ALLOWLIST несёт запись {name!r} — run: содержит «голый» "
+                f"вызов {violation!r} (не pytest/`node --test`, не "
+                "test_*-файл) — структурно живой снимок состояния "
+                "репозитория, не unit-тест модуля (issue #1069): перенеси в "
+                "scripts/ci/guards/ и убери запись из ALLOWLIST, либо, если "
+                "перенос невозможен по названной причине (межшаговая "
+                "id:/if:-зависимость и т.п.), добавь имя в "
+                "ALLOWLIST_JOB_STATE_EXEMPT с докстрингом, объясняющим "
+                "причину — не в ALLOWLIST, который обязан монотонно убывать"
+            )
+    return problems
+
+
 def check_no_undeclared_step(
     repo_ci: Path = REPO_CI,
     allowlist: frozenset[str] = ALLOWLIST,
@@ -512,6 +648,7 @@ def check_no_undeclared_step(
     removed = sorted(allowlist - found)
     problems: list[str] = []
     problems.extend(check_catalog_handwritten_overlap(repo_ci, catalog_dir))
+    problems.extend(check_allowlist_entries_are_migratable(repo_ci, allowlist))
     # Замер каталога — только когда есть находки (added непуст — редкий
     # путь): на зелёном пути каталог уже прочитан overlap-сверкой выше,
     # второй полный проход не нужен.

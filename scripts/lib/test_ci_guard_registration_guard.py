@@ -252,8 +252,13 @@ def test_check_flags_stale_allowlist_entry(tmp_path):
 
 
 def test_check_clean_when_in_sync(tmp_path):
-    allowlist = frozenset({"Тесты X", "Гвардия Y"})
-    path = _write_repo_ci(tmp_path, ["Тесты X", "Гвардия Y", "checkout"])
+    # "Гвардия Y" здесь намеренно заменена на "Smoke Y" (issue #1069, см.
+    # test_allowlist_entry_named_guard_is_flagged ниже): ALLOWLIST-запись,
+    # самоназванная «Гвардия», сама по себе теперь не «чистое» состояние —
+    # check_allowlist_entries_are_migratable красит её как долг каталога,
+    # даже если found == allowlist.
+    allowlist = frozenset({"Тесты X", "Smoke Y"})
+    path = _write_repo_ci(tmp_path, ["Тесты X", "Smoke Y", "checkout"])
     assert crg.check_no_undeclared_step(path, allowlist) == []
 
 
@@ -381,3 +386,87 @@ def test_catalog_perebor_step_itself_is_present_in_repo_ci():
         "перебор каталога гвардий (#749) не подключён к repo-ci.yml — "
         "каталог scripts/ci/guards/ никогда не исполняется"
     )
+
+
+# ── check_allowlist_entries_are_migratable: остаточный класс #1069 ──────────
+#
+# ci_guard_registration_guard уже не даёт появиться НОВОМУ рукописному шагу
+# гвардии (found - allowlist), но раньше ничего не мешало СУЩЕСТВУЮЩЕЙ
+# ALLOWLIST-записи молча остаться «гвардией вне каталога» навсегда — именно
+# так provider-default.guard.sh дожил в ALLOWLIST до живых падений PR
+# #1068/#1095 при зелёном локальном run_guards.sh. Мутация: любая из трёх
+# фикстур ниже воспроизводит ЭТОТ класс (запись остаётся в ALLOWLIST,
+# found == allowlist, но проверка обязана покраснеть); удаление проверки
+# (или увеличение фикстуры до `frozenset()`) красит все три теста — то есть
+# check_no_undeclared_step() сам по себе (без этой функции) не ловит
+# находку.
+
+def test_allowlist_entry_named_guard_is_flagged(tmp_path):
+    allowlist = frozenset({"Гвардия литерала X"})
+    path = _write_repo_ci(tmp_path, ["Гвардия литерала X"])
+    problems = crg.check_allowlist_entries_are_migratable(path, allowlist)
+    assert len(problems) == 1
+    assert "Гвардия литерала X" in problems[0]
+    assert "самоназванную" in problems[0]
+    # Мутация: та же фикстура, но через полный check_no_undeclared_step —
+    # found == allowlist (ничего не «добавлено»/«убрано»), но проверка
+    # обязана оставаться красной.
+    assert crg.check_no_undeclared_step(path, allowlist) != []
+
+
+def test_allowlist_entry_with_bare_guard_sh_invocation_is_flagged(tmp_path):
+    allowlist = frozenset({"Провайдер X"})
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Провайдер X", "run": "bash scripts/lib/test/x.guard.sh"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_allowlist_entries_are_migratable(path, allowlist)
+    assert len(problems) == 1
+    assert "x.guard.sh" in problems[0]
+
+
+def test_allowlist_entry_with_bare_python_script_is_flagged(tmp_path):
+    allowlist = frozenset({"Канарейка X"})
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Канарейка X", "run": "python scripts/lib/orphan_test_guard.py"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_allowlist_entries_are_migratable(path, allowlist)
+    assert len(problems) == 1
+    assert "orphan_test_guard.py" in problems[0]
+
+
+def test_allowlist_entry_pytest_of_own_module_is_not_flagged(tmp_path):
+    """Ordinary unit-test suite (pytest test_X.py тестирует X.py) остаётся
+    легальной ALLOWLIST-записью — issue #1069 честно не требует переносить
+    unit-тесты конкретного модуля, только «голые» снимки/самоназванные
+    гвардии (см. докстринг check_allowlist_entries_are_migratable)."""
+    allowlist = frozenset({"Тесты X"})
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Тесты X", "run": "pip install --quiet pytest\npython -m pytest scripts/lib/test_x.py -q"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    assert crg.check_allowlist_entries_are_migratable(path, allowlist) == []
+
+
+def test_allowlist_job_state_exempt_entry_is_not_flagged(tmp_path):
+    """ALLOWLIST_JOB_STATE_EXEMPT — единственная НАЗВАННАЯ оговорка (#1069):
+    «Квота GitHub API» несёт `id:`/`if:`-связь со следующим шагом и не может
+    жить в каталоге без спекулятивной инфраструктуры (design.md #749).
+    Проверке не подлежит — иначе именованное исключение красило бы CI на
+    каждом прогоне без возможности его снять."""
+    allowlist = frozenset({"Квота GitHub API — ранняя проверка (инварианты)"})
+    doc = {"jobs": {"test": {"steps": [
+        {
+            "name": "Квота GitHub API — ранняя проверка (инварианты)",
+            "run": "python scripts/lib/rate_guard.py --job repo-ci-invariants",
+        },
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    assert crg.check_allowlist_entries_are_migratable(
+        path, allowlist, job_state_exempt=allowlist
+    ) == []
