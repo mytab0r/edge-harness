@@ -1807,9 +1807,23 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
       пока эта голова висит — честно «не знаю», не подделанное 💚.
     - check_result.ok() — здоровое состояние (серии нет, реальных провалов
       достаточно, голова не завершена, но моложе порога простоя).
-    - check_result.violation([...]) — маркер держит паузу, объяснить нечем."""
+    - check_result.violation([...]) — маркер держит паузу, объяснить нечем.
+
+    Находка ai-review PR #1110: `pulse_guard.recent_runs` сам глотает форму
+    ответа не по контракту (`payload = gh(...) or {}; return payload.get(
+    "workflow_runs", [])` — F3 из issue #1096, живой класс #120A) и отдаёт
+    голый `[]` НЕРАЗЛИЧИМО и на «прогонов правда нет», и на «ответ странной
+    формы». Раньше `not runs` здесь читался как ok() в обоих случаях — та же
+    слепота, ради которой эта функция и переписана, протекала сквозь границу
+    recent_runs. Правка запрашивает `runs` НАПРЯМУЮ (минуя recent_runs) и
+    валидирует форму САМА — не вторая копия recent_runs целиком (эта функция
+    ничего не знает про `event=`, которого здесь и не было), а точечный
+    байпас ради формы; recent_runs остаётся нетронутым для остальных 6
+    потребителей (issue #1109, шаг 2, F3 — общий `runs_of()` на все места
+    разом)."""
     try:
-        runs = pulse_guard.recent_runs(repo, pulse_guard.WORKER_WORKFLOW, per_page=10)
+        runs_payload = pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10")
         all_markers = pulse_guard.issue_markers_any(
             repo, pulse_guard.WATCHDOG_ISSUE,
             (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
@@ -1817,8 +1831,14 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
         return check_result.unknown(
             f"история прогонов {pulse_guard.WORKER_WORKFLOW} или маркеры "
             f"#{pulse_guard.WATCHDOG_ISSUE} недоступны: {error}")
+    if not isinstance(runs_payload, dict) or "workflow_runs" not in runs_payload:
+        return check_result.unknown(
+            f"ответ истории прогонов {pulse_guard.WORKER_WORKFLOW} неожиданной "
+            f"формы (не dict с ключом workflow_runs — живой класс F3/#120A, "
+            f"issue #1096/#1109): {runs_payload!r}")
+    runs = runs_payload.get("workflow_runs") or []
     if not runs:
-        return check_result.ok()
+        return check_result.ok()  # форма подтверждена, история просто пуста
 
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = pulse_guard.parse_time(last_ok["updated_at"]) if last_ok else None
@@ -1917,7 +1937,14 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
     Второй раунд находки ai-review PR #880: исторический комментарий issue
     #140 (сам инцидент, ДО фикса) остаётся в теле issue навсегда — только
     комментарии позже WORKER_FALSE_SUCCESS_FIX_LANDED_AT считаются
-    нарушением, иначе инвариант красный с рождения (см. её докстринг)."""
+    нарушением, иначе инвариант красный с рождения (см. её докстринг).
+
+    Находка ai-review PR #1110: `items = (result or {}).get("items") or []`
+    молча схлопывал и «Search правда не нашёл кандидатов» (`{"items": []}`),
+    и «ответ неожиданной формы» (нет ключа `items` вовсе — дефект вторичного
+    рейт-лимита/абьюз-детектора, тот же класс F3) в одно и то же
+    check_result.ok(). Различаем форму до чтения `items`: нет ключа —
+    unknown(), пустой список под ключом — настоящее «чисто»."""
     query = f'repo:{repo} in:comments "{WORKER_FALSE_SUCCESS_MARKER}"'
     try:
         result = gh("-X", "GET", "search/issues", "-f", f"q={query}", "-f", "per_page=100")
@@ -1925,7 +1952,11 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
         return check_result.unknown(
             f"GitHub Search (search/issues) недоступен: {error} — ни один "
             "кандидат не проверен в этом прогоне")
-    items = (result or {}).get("items") or []
+    if not isinstance(result, dict) or "items" not in result:
+        return check_result.unknown(
+            f"ответ GitHub Search неожиданной формы (не dict с ключом items "
+            f"— живой класс F3, issue #1096/#1109): {result!r}")
+    items = result.get("items") or []
     violations = []
     unchecked = 0
     for item in items:
@@ -2361,30 +2392,42 @@ def build_report(repo: str, now: datetime,
 
     v13 = check_conveyor_gate_phantom_pause(repo, now)
     findings[13] = v13.violations
+    # Значок — ОДНО место правды check_result.status_emoji (issue #1096,
+    # находка ai-review PR #1110: STATUS_EMOJI был объявлен «местом правды»,
+    # но ни один рендер его не читал — теперь читает).
     if v13.status == check_result.STATUS_UNKNOWN:
-        lines.append(f"❓ [13] не удалось проверить фантомную паузу конвейера: {v13.reason}")
+        lines.append(f"{check_result.status_emoji(v13.status)} [13] не удалось "
+                      f"проверить фантомную паузу конвейера: {v13.reason}")
     elif v13.violations:
         item = v13.violations[0]
         lines.append(
-            f"🚨 [13] конвейер держит паузу диспатча worker.yml при "
+            f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [13] "
+            f"конвейер держит паузу диспатча worker.yml при "
             f"{item['failures']} реальных подряд-провалах (порог "
             f"{item['threshold']}) — маркер серии активен с "
             f"{item['last_marker_at']}, хотя её нечем объяснить (issue #899): "
             f"{item['latest_run_url']}"
         )
     else:
-        lines.append("💚 [13] нет фантомной паузы конвейера "
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [13] "
+                      "нет фантомной паузы конвейера "
                       "(маркер серии без реальных подряд-провалов, issue #899)")
     v14 = check_worker_false_success_comment(repo)
     findings[14] = v14.violations
     if v14.status == check_result.STATUS_UNKNOWN:
-        lines.append(f"❓ [14] не удалось проверить комментарии воркера на противоречие «справился (провайдер: ?)»: {v14.reason}")
+        lines.append(f"{check_result.status_emoji(v14.status)} [14] не удалось "
+                      f"проверить комментарии воркера на противоречие "
+                      f"«справился (провайдер: ?)»: {v14.reason}")
     elif v14.violations:
-        lines.append(f"🚨 [14] {len(v14.violations)} комментариев несут противоречие «справился (провайдер: ?)» (#876):")
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
+                      f"[14] {len(v14.violations)} комментариев несут противоречие "
+                      f"«справился (провайдер: ?)» (#876):")
         for item in v14.violations:
             lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
     else:
-        lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [14] ни "
+                      "один комментарий воркера не несёт противоречия "
+                      "«справился (провайдер: ?)»")
 
     try:
         v15_all = check_merge_reaction_gaps(repo, now, merged_pulls)

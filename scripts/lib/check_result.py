@@ -178,12 +178,17 @@ def _handler_calls_unknown(handler: ast.ExceptHandler) -> bool:
 
 
 def _is_falsy_empty_return(node: ast.Return) -> bool:
-    """True для `return`/`return None`/`return []`/`return ()` — ровно та
-    форма, которую issue #1096 запрещает без сопровождающего unknown():
-    обработчик молча превращает отказ в «нарушений нет». `return
-    check_result.violation(...)`/`return some_variable` — не наш случай,
-    здесь тело обработчика явно решает что-то другое, не просто гасит
-    исключение в пустоту."""
+    """True для `return`/`return None`/`return []`/`return ()`/`return
+    ok(...)`-подобного вызова — ровно та форма, которую issue #1096
+    запрещает без сопровождающего unknown(): обработчик молча превращает
+    отказ в «нарушений нет». `return check_result.violation(...)`/`return
+    some_variable` — не наш случай, здесь тело обработчика явно решает
+    что-то другое, не просто гасит исключение в пустоту.
+
+    `return check_result.ok()` (находка ai-review PR #1110) — тот же класс,
+    что голый `return []`: ok() ЖЁСТКО означает «нарушений нет», не «не
+    знаю» — регресс, который заменяет литерал на конструктор с тем же
+    смыслом, обязан ловиться так же."""
     value = node.value
     if value is None:
         return True  # bare `return`
@@ -191,6 +196,12 @@ def _is_falsy_empty_return(node: ast.Return) -> bool:
         return True  # `return None`
     if isinstance(value, (ast.List, ast.Tuple)) and not value.elts:
         return True  # `return []`/`return ()`
+    if isinstance(value, ast.Call):
+        func = value.func
+        name = func.attr if isinstance(func, ast.Attribute) else (
+            func.id if isinstance(func, ast.Name) else None)
+        if name == "ok":
+            return True  # `return ok()`/`return check_result.ok()`
     return False
 
 

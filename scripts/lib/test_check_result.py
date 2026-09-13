@@ -133,6 +133,22 @@ def test_scan_silent_except_mutation_proof_fix_clears_the_finding():
     assert cr.scan_silent_except(_FIXED_SNIPPET, {"check_something"}) == []
 
 
+def test_scan_silent_except_flags_return_ok_as_silent_discard():
+    # Находка ai-review PR #1110: `return check_result.ok()` внутри except —
+    # тот же регресс, что `return []`, только через конструктор вместо
+    # литерала (ok() ЖЁСТКО означает "нарушений нет", не "не знаю").
+    snippet = """
+def check_something(repo):
+    try:
+        data = gh(repo)
+    except RuntimeError:
+        return check_result.ok()
+    return data
+"""
+    findings = cr.scan_silent_except(snippet, {"check_something"})
+    assert len(findings) == 1
+
+
 def test_scan_silent_except_is_scoped_to_named_functions_only():
     # Функция, не входящая в реестр (ещё не мигрирована — шаг 2), не должна
     # красить гвардию: узкий линт, не общий "чини всё сразу".

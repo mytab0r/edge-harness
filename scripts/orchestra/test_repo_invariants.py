@@ -2258,6 +2258,23 @@ def test_phantom_pause_unknown_on_network_failure(monkeypatch):
     assert "gh api: 502" in result.reason
 
 
+def test_phantom_pause_unknown_on_malformed_run_history_shape(monkeypatch):
+    """Находка ai-review PR #1110 (F3, живой класс #120A): ответ на список
+    прогонов не той формы (dict вторичного рейт-лимита без ключа
+    workflow_runs) раньше молча схлопывался в `[]` внутри `pulse_guard.
+    recent_runs` — check_conveyor_gate_phantom_pause видела `not runs` и
+    отвечала ok(), неотличимо от «прогонов правда нет». Теперь форма
+    проверяется до этого — unknown()."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"message": "secondary rate limit"},
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "неожиданной" in result.reason
+
+
 def test_phantom_pause_not_in_ci_gating():
     """Долг на живом репозитории ещё не измерен (тот же порядок, что у
     1/5/9/10/12) — наблюдательный, не гейтящий."""
@@ -2386,6 +2403,19 @@ def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
     result = ri.check_worker_false_success_comment(REPO)
     assert result.status == ri.check_result.STATUS_UNKNOWN
     assert "rate limited" in result.reason
+
+
+def test_worker_false_success_comment_unknown_on_malformed_search_response(monkeypatch):
+    """Находка ai-review PR #1110 (F3): ответ Search без ключа `items`
+    (dict вторичного рейт-лимита) раньше молча читался как `{"items": []}`
+    (`(result or {}).get("items") or []`) — «Search правда ничего не нашёл»
+    и «ответ неожиданной формы» были неразличимы, оба давали ok(). Теперь
+    форма проверяется до чтения items — unknown()."""
+    fake = FakeGh({"search/issues": {"message": "secondary rate limit"}})
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "неожиданной" in result.reason
 
 
 def test_worker_false_success_comment_unknown_when_a_candidate_sync_fails(monkeypatch):
