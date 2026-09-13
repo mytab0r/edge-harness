@@ -1694,6 +1694,136 @@ def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
     assert not any("actions/runs/3/jobs" in call or "actions/runs/2/jobs" in call for call in fake.calls)
 
 
+# ── Живая серия 2026-09-13 (issue найденный владельцем): голова списка ──────
+# ещё выполняется — прогон-снимок реального `gh api
+# repos/mytab0r/edge-harness/actions/workflows/worker.yml/runs`. IDs, времена
+# и текст ошибок — дословно с живого репозитория (сверено `gh api
+# repos/mytab0r/edge-harness/actions/jobs/<id>/logs`), не пересказ:
+#
+#   34746091297  in_progress (conclusion=None) — воркер ещё выполняется
+#   34739313568  failure — цепочка исчерпана целиком таймаутами (ДРУГОЙ,
+#                отличный от следующих трёх, отпечаток: в этом прогоне
+#                Ollama-2 упёрся в таймаут, а не в max_tokens)
+#   34735752165  failure — Ollama-2 rc=1, max_tokens (131072) exceeds ...
+#                (65536) for model nemotron-3-ultra — класс НЕ переключаемый
+#   34732869856  failure — тот же класс max_tokens (другой ref-UUID)
+#   34730173870  failure — тот же класс max_tokens (другой ref-UUID)
+#   34728868781  success
+#
+# Диагностика владельца («четыре подряд одного класса») не подтвердилась
+# буквально: реальный fingerprint (workflow+job+нормализованная строка)
+# отличает «цепочка исчерпана таймаутами» от «Ollama-2 max_tokens» — это
+# ДЕЙСТВИТЕЛЬНО разные причины, а не шум нормализации (ref-UUID и цифры
+# схлопываются, но сам текст разный). Настоящая серия одной причины — три
+# прогона (34735752165/34732869856/34730173870), и она была НЕВИДИМА
+# инварианту, пока голова списка была in_progress (см. тест ниже,
+# использующий более раннюю живую точку среза — до завершения 34739313568).
+
+OLLAMA2_MAX_TOKENS_ERROR = (
+    "цепочка провайдеров: Ollama-2 — rc=1, класс НЕ переключаемый (stderr: "
+    "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum "
+    "output tokens (65536) for model nemotron-3-ultra (ref: {ref}) ), "
+    "дальше по цепочке не иду (следующие провайдеры не тронуты)"
+)
+CHAIN_EXHAUSTED_TIMEOUT_ERROR = (
+    "цепочка провайдеров исчерпана целиком (GLM, ZAI, OpenRouter-2, "
+    "Ollama-2, Ollama-3, Ollama-1, NVIDIA-NIM-1, OpenRouter-1, NVIDIA-NIM-2)"
+)
+
+
+def test_recurring_worker_failure_pending_head_does_not_hide_streak_behind_it(monkeypatch):
+    # Живая точка среза (примерно 2026-09-13T06:00Z, до того как 34739313568
+    # завершился): голова списка — ещё идущий прогон 34739313568, а сразу за
+    # ним три ЗАВЕРШЁННЫХ прогона одной и той же причины (max_tokens).
+    # Старый код обрывал скан на первом же None и возвращал [] — серия ниже
+    # была НЕВИДИМА. Это и есть мутация, которую полагается доказать: снять
+    # правку (заменить `continue` на `break` для conclusion is None) красит
+    # этот тест.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(34739313568, "2026-09-13T05:02:32Z", "2026-09-13T06:00:00Z", conclusion=None),
+            worker_run(34735752165, "2026-09-13T03:32:44Z", "2026-09-13T04:26:35Z"),
+            worker_run(34732869856, "2026-09-13T02:22:03Z", "2026-09-13T03:16:04Z"),
+            worker_run(34730173870, "2026-09-13T01:17:46Z", "2026-09-13T02:11:55Z"),
+            worker_run(34728868781, "2026-09-13T00:47:21Z", "2026-09-13T01:06:21Z", conclusion="success"),
+        ]},
+        "actions/runs/34735752165/jobs": worker_jobs_payload(103666759504),
+        "actions/runs/34732869856/jobs": worker_jobs_payload(103658813654),
+        "actions/runs/34730173870/jobs": worker_jobs_payload(103651384804),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103666759504: OLLAMA2_MAX_TOKENS_ERROR.format(ref="f5feae9d-e13e-4d1a-90f0-c315e4389e21"),
+        103658813654: OLLAMA2_MAX_TOKENS_ERROR.format(ref="e13e4d1a-90f0-c315-e438-9e21f5feae9d"),
+        103651384804: OLLAMA2_MAX_TOKENS_ERROR.format(ref="bea56f62-51af-47b6-b57d-9b03d8871690"),
+    })))
+    violations = ri.check_recurring_worker_failure(REPO)
+    assert len(violations) == 1
+    assert violations[0]["streak"] == 3
+    assert violations[0]["since"] == "2026-09-13T01:17:46Z"
+    assert violations[0]["until"] == "2026-09-13T04:26:35Z"
+    assert violations[0]["latest_run_url"] == f"https://github.com/{REPO}/actions/runs/34735752165"
+    assert violations[0]["pending_seen"] is True
+
+
+def test_recurring_worker_failure_does_not_bridge_across_different_cause(monkeypatch):
+    # Текущая (2026-09-13T07:47Z) живая точка среза: голова — ещё идущий
+    # 34746091297, за ним завершённый провал 34739313568 с ДРУГИМ отпечатком
+    # (см. блок-комментарий выше), а уже за ним — настоящая серия max_tokens.
+    # Пропуск None не обязан «дотягиваться» через несовпадающий отпечаток:
+    # серия обрывается на первом же расхождении причины, как и раньше —
+    # инвариант молчит (это НЕ серия одной причины длиной 4, а 1 + разрыв + 3).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(34746091297, "2026-09-13T07:47:31Z", "2026-09-13T07:47:35Z", conclusion=None),
+            worker_run(34739313568, "2026-09-13T05:02:32Z", "2026-09-13T07:45:23Z"),
+            worker_run(34735752165, "2026-09-13T03:32:44Z", "2026-09-13T04:26:35Z"),
+            worker_run(34732869856, "2026-09-13T02:22:03Z", "2026-09-13T03:16:04Z"),
+            worker_run(34730173870, "2026-09-13T01:17:46Z", "2026-09-13T02:11:55Z"),
+            worker_run(34728868781, "2026-09-13T00:47:21Z", "2026-09-13T01:06:21Z", conclusion="success"),
+        ]},
+        "actions/runs/34739313568/jobs": worker_jobs_payload(103676181082),
+        "actions/runs/34735752165/jobs": worker_jobs_payload(103666759504),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103676181082: CHAIN_EXHAUSTED_TIMEOUT_ERROR,
+        103666759504: OLLAMA2_MAX_TOKENS_ERROR.format(ref="f5feae9d-e13e-4d1a-90f0-c315e4389e21"),
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == []
+    # Дотягиваться до третьего прогона незачем — расхождение отпечатка уже
+    # обнаружено на втором; проверяем, что скан честно останавливается, а не
+    # молча досматривает весь список без дела.
+    assert not any("actions/runs/34732869856/jobs" in call for call in fake.calls)
+
+
+def test_recurring_worker_failure_skips_multiple_pending_runs_mid_streak(monkeypatch):
+    # Синтетический (не прод-снятый) защитный случай: несколько незавершённых
+    # прогонов подряд (или вперемешку) внутри окна — теоретически возможно при
+    # ручном re-run старого прогона (created_at не меняется, conclusion снова
+    # None). Ни один не обрывает скан, ни один не входит в streak_runs.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(6, "2026-09-13T09:00:00Z", conclusion=None),
+            worker_run(5, "2026-09-13T08:00:00Z", conclusion=None),
+            worker_run(4, "2026-09-13T07:00:00Z"),
+            worker_run(3, "2026-09-13T06:00:00Z"),
+            worker_run(2, "2026-09-13T05:00:00Z"),
+        ]},
+        "actions/runs/4/jobs": worker_jobs_payload(204),
+        "actions/runs/3/jobs": worker_jobs_payload(203),
+        "actions/runs/2/jobs": worker_jobs_payload(202),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        204: SESSION_LACKS_ID_ERROR, 203: SESSION_LACKS_ID_ERROR, 202: SESSION_LACKS_ID_ERROR,
+    })))
+    violations = ri.check_recurring_worker_failure(REPO)
+    assert len(violations) == 1
+    assert violations[0]["streak"] == 3
+    assert violations[0]["pending_seen"] is True
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
