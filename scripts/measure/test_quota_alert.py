@@ -10,6 +10,7 @@ scripts/orchestra/test_pulse_guard.py/scripts/measure/test_quotas.py.
 """
 
 import importlib.util
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -21,52 +22,94 @@ spec.loader.exec_module(qa)  # type: ignore[union-attr]
 
 REPO = "mytab0r/edge-harness"
 
+# Ссылки на РЕАЛЬНЫЕ функции, захваченные ДО того, как автоюз-фикстура ниже
+# подменит qa.last_reading/qa.record_reading на нейтральные заглушки — тесты,
+# которые проверяют last_reading/record_reading НАПРЯМУЮ, зовут именно эти
+# ссылки, а не атрибут qa.last_reading (тот уже не настоящая функция к
+# моменту, когда выполняется тело теста).
+_REAL_LAST_READING = qa.last_reading
+_REAL_RECORD_READING = qa.record_reading
+
 
 def _comment(body: str, created_at: str = "2026-09-06T18:00:00Z") -> dict:
     return {"body": body, "created_at": created_at}
 
 
+@pytest.fixture(autouse=True)
+def _no_trend_bookkeeping_by_default(monkeypatch):
+    """check_and_alert (#1100) теперь ВСЕГДА читает/пишет числовое показание
+    тренда (last_reading/record_reading) — оба бьют по сети без мока. Тесты
+    ниже, которым тренд не важен, получают нейтральный дефолт («показаний
+    ещё не было», запись — успешный no-op); тесты, которым тренд нужен,
+    переопределяют оба явно (тот же monkeypatch-инстанс, override работает)."""
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: None)
+    monkeypatch.setattr(qa, "record_reading", lambda *a, **k: None)
+
+
 # ── last_state: разбор маркера ────────────────────────────────────────────
 
 
-def test_last_state_none_when_no_marker(monkeypatch):
-    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [])
-    assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
+ISSUE_METADATA_URL = f"repos/{REPO}/issues/120"
 
 
-def test_last_state_reads_only_fresh_page_of_watchdog_history(monkeypatch):
-    """Тот же «хвост», что PR закрыл для stale-маркеров простоя (found: ревью
-    PR #607, некритичное замечание): дедуп состояния ресурса тикает на каждый
-    прогон сторожа и читает только СВЕЖУЮ страницу #120 (551+ комментариев и
-    растёт). Гвардия: запрос страницы 2 — громкое падение. Сними
-    `max_pages=` из last_state — тест краснеет."""
+def _fake_gh_over_history(total_comments: int, last_page_body: list[dict]):
+    """Фейковый pulse_guard.gh для истории #120: первый вызов — метаданные
+    issue (число комментариев), второй — СВЕЖАЯ страница (вычисленная от
+    total_comments, не первая), которую all_issue_comments обязан запросить
+    напрямую (found #1100 — см. all_issue_comments)."""
+    last_page = (total_comments + 99) // 100 if total_comments else 0
+    expected_page_url = f"repos/{REPO}/issues/120/comments?per_page=100&page={last_page}"
     requested = []
 
     def fake_gh(*args):
         endpoint = args[0]
-        assert isinstance(endpoint, str) and "/comments?" in endpoint, endpoint
-        page = int(endpoint.split("&page=")[1])
-        requested.append(page)
-        assert page == 1, f"дедуп состояния читает только свежую страницу, запрошена {page}"
-        # Полная страница БЕЗ маркеров состояния — дедуп честно отвечает
-        # «состояние не известно», не обходя всю историю задачи.
-        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
-                for i in range(100)]
+        requested.append(endpoint)
+        if endpoint == ISSUE_METADATA_URL:
+            return {"comments": total_comments}
+        assert endpoint == expected_page_url, (
+            f"ожидалась СВЕЖАЯ (последняя) страница {expected_page_url!r}, "
+            f"запрошено {endpoint!r}"
+        )
+        return last_page_body
 
+    return fake_gh, requested
+
+
+def test_last_state_none_when_no_marker(monkeypatch):
+    fake_gh, _ = _fake_gh_over_history(0, [])
     monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
     assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
-    assert requested == [1]
+
+
+def test_last_state_reads_only_fresh_page_of_watchdog_history(monkeypatch):
+    """Найдено ревью PR #607 некритичным замечанием, затем — корнем #1100
+    (находка F4 прочёса #1096): эндпоинт GitHub «List issue comments» не
+    поддерживает sort/direction — страница 1 растущей истории #120 (900+
+    комментариев) ВСЕГДА самая старая, не самая свежая. last_state обязан
+    прочитать вычисленную ПОСЛЕДНЮЮ страницу (per_page=100), не буквальную
+    page=1. Гвардия: запрос НЕ последней страницы — громкое падение (см.
+    _fake_gh_over_history — assert внутри)."""
+    # 950 комментариев → last_page = 10, полная страница БЕЗ маркеров
+    # состояния — дедуп честно отвечает «состояние не известно».
+    fake_gh, requested = _fake_gh_over_history(
+        950, [{"id": i, "body": f"comment {i}", "created_at": "2026-09-13T00:00:00Z"} for i in range(50)],
+    )
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
+    assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
+    assert requested == [ISSUE_METADATA_URL, f"repos/{REPO}/issues/120/comments?per_page=100&page=10"]
 
 
 def test_last_state_reads_breach_with_issue_number(monkeypatch):
     marker = qa.state_marker("cf_do_rows_read_day", "breach", 999)
-    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [_comment(f"текст\n{marker}")])
+    fake_gh, _ = _fake_gh_over_history(1, [_comment(f"текст\n{marker}")])
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
     assert qa.last_state(REPO, "cf_do_rows_read_day") == ("breach", 999)
 
 
 def test_last_state_reads_ok_without_issue_number(monkeypatch):
     marker = qa.state_marker("cf_do_rows_read_day", "ok", None)
-    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [_comment(f"текст\n{marker}")])
+    fake_gh, _ = _fake_gh_over_history(1, [_comment(f"текст\n{marker}")])
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
     assert qa.last_state(REPO, "cf_do_rows_read_day") == ("ok", None)
 
 
@@ -75,7 +118,8 @@ def test_last_state_picks_the_latest_marker_not_the_first(monkeypatch):
     не первый в списке (порядок ответа GitHub не гарантирован хронологией)."""
     older = _comment(qa.state_marker("cf_do_rows_read_day", "breach", 1), "2026-09-06T10:00:00Z")
     newer = _comment(qa.state_marker("cf_do_rows_read_day", "ok", None), "2026-09-06T20:00:00Z")
-    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [older, newer])
+    fake_gh, _ = _fake_gh_over_history(2, [older, newer])
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
     assert qa.last_state(REPO, "cf_do_rows_read_day") == ("ok", None)
 
 
@@ -84,7 +128,8 @@ def test_last_state_ignores_marker_of_a_different_resource(monkeypatch):
     одного ресурса решалось бы по эскалации совсем другого (независимость
     дедупа по ресурсам, см. докстринг модуля)."""
     other = _comment(qa.state_marker("cf_workers_requests_day", "breach", 1))
-    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: [other])
+    fake_gh, _ = _fake_gh_over_history(1, [other])
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
     assert qa.last_state(REPO, "cf_do_rows_read_day") == (None, None)
 
 
@@ -389,6 +434,255 @@ def test_create_task_other_resource_candidates_confirmed_not_duplicate(monkeypat
     assert "--confirm-not-duplicate" in calls[1]
     assert "DO rows_read/сутки" in calls[1][calls[1].index("--confirm-not-duplicate") + 1]
 
+
+# ── Тренд (#1100): reading-маркер, троттлинг чисел, третье состояние ─────────
+
+
+def test_reading_marker_roundtrip():
+    when = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    marker = qa.reading_marker("gh_rest_rate_limit_hour", 6.1, when)
+    assert marker == "[quota: замер gh_rest_rate_limit_hour = 6.1% at 2026-09-13T07:03:00+00:00]"
+
+
+def test_last_reading_none_when_no_marker(monkeypatch):
+    monkeypatch.setattr(qa.pulse_guard, "gh", lambda *a: {"comments": 0} if a[0].endswith("/120") else [])
+    assert _REAL_LAST_READING(REPO, "gh_rest_rate_limit_hour") is None
+
+
+def test_last_reading_parses_pct_time_and_comment_id(monkeypatch):
+    when = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    marker = qa.reading_marker("gh_rest_rate_limit_hour", 6.1, when)
+
+    def fake_gh(*args):
+        endpoint = args[0]
+        if endpoint.endswith("/issues/120"):
+            return {"comments": 1}
+        return [{"id": 555, "body": marker, "created_at": "2026-09-13T07:03:05Z"}]
+
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
+    pct, ts, comment_id = _REAL_LAST_READING(REPO, "gh_rest_rate_limit_hour")
+    assert pct == 6.1
+    assert ts == when
+    assert comment_id == 555
+
+
+def test_last_reading_ignores_marker_of_a_different_resource(monkeypatch):
+    other = qa.reading_marker("cf_workers_requests_day", 50.0, datetime(2026, 9, 13, tzinfo=timezone.utc))
+
+    def fake_gh(*args):
+        if args[0].endswith("/issues/120"):
+            return {"comments": 1}
+        return [{"id": 1, "body": other, "created_at": "2026-09-13T00:00:00Z"}]
+
+    monkeypatch.setattr(qa.pulse_guard, "gh", fake_gh)
+    assert _REAL_LAST_READING(REPO, "gh_rest_rate_limit_hour") is None
+
+
+def test_record_reading_edits_existing_carrier_not_a_new_comment(monkeypatch):
+    """Второй и далее тик — PATCH на тот же comment_id, НЕ новый POST (иначе
+    ровно тот класс, что дал 114 дублей в инциденте #1100)."""
+    edited = []
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "edit_issue_comment", lambda repo, cid, text: edited.append((cid, text)))
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda repo, issue, text: posted.append(text))
+
+    when = datetime(2026, 9, 13, 7, 18, 0, tzinfo=timezone.utc)
+    _REAL_RECORD_READING(REPO, "gh_rest_rate_limit_hour", 23.07, when, 555)
+
+    assert edited == [(555, qa.reading_marker("gh_rest_rate_limit_hour", 23.07, when))]
+    assert posted == []
+
+
+def test_record_reading_posts_new_carrier_on_first_reading(monkeypatch):
+    posted = []
+    monkeypatch.setattr(qa.pulse_guard, "edit_issue_comment",
+                         lambda *a: (_ for _ in ()).throw(AssertionError("не должно править — носителя ещё нет")))
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda repo, issue, text: posted.append((issue, text)))
+
+    when = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    _REAL_RECORD_READING(REPO, "gh_rest_rate_limit_hour", 6.1, when, None)
+
+    assert posted == [(qa.WATCHDOG_ISSUE, qa.reading_marker("gh_rest_rate_limit_hour", 6.1, when))]
+
+
+def test_trend_projection_computes_rate_and_minutes_to_threshold():
+    t1 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 13, 7, 18, 0, tzinfo=timezone.utc)
+    rate, projected = qa._trend_projection(6.1, t1, 23.07, t2, 80.0)
+    assert rate == pytest.approx(1.1313, abs=1e-3)
+    assert projected == pytest.approx(50.33, abs=0.1)
+
+
+def test_trend_projection_none_when_shrinking():
+    t1 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 13, 7, 18, 0, tzinfo=timezone.utc)
+    rate, projected = qa._trend_projection(50.0, t1, 10.0, t2, 80.0)
+    assert rate < 0
+    assert projected is None
+
+
+def test_trend_projection_none_when_non_positive_time_delta():
+    t1 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    rate, projected = qa._trend_projection(6.1, t1, 23.07, t1, 80.0)
+    assert rate is None and projected is None
+
+
+def test_classify_state_breach_by_pct_alone():
+    assert qa.classify_state(85.0, 80.0, None, 45.0) == qa.STATE_BREACH
+
+
+def test_classify_state_approaching_by_projection_even_when_pct_low():
+    """Ядро #1100: pct всё ещё далеко от порога, но скорость роста такая, что
+    порог будет пробит внутри горизонта — approaching, не ok."""
+    assert qa.classify_state(40.04, 80.0, 35.34, 45.0) == qa.STATE_APPROACHING
+
+
+def test_classify_state_ok_when_projection_beyond_horizon():
+    assert qa.classify_state(23.07, 80.0, 50.33, 45.0) == qa.STATE_OK
+
+
+def test_classify_state_ok_when_no_projection():
+    assert qa.classify_state(6.1, 80.0, None, 45.0) == qa.STATE_OK
+
+
+def test_approaching_transition_escalates_without_creating_task(monkeypatch):
+    """approaching — Telegram + след в #120, БЕЗ автозаведения задачи (см.
+    докстринг check_and_alert): в отличие от breach, тренд может развернуться
+    сам, не дойдя до порога."""
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_OK, None))
+    t1 = datetime(2026, 9, 13, 7, 18, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 13, 7, 33, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: (23.07, t1, 1))
+    create_calls = []
+    monkeypatch.setattr(qa, "create_or_note_task", lambda *a: create_calls.append(1) or (999, "не должно вызываться"))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+
+    result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                 400, 1000, 40.04, threshold=80.0, now=t2)
+
+    assert create_calls == []
+    assert len(escalated) == 1
+    assert "приближается" in escalated[0]
+    assert "порог 80.0% будет пробит через" in escalated[0]
+    assert "approaching" in escalated[0]
+    assert "approaching" in result
+
+
+def test_approaching_dedup_no_repeat_while_still_approaching(monkeypatch):
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_APPROACHING, None))
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: (40.04, datetime(2026, 9, 13, 7, 33, tzinfo=timezone.utc), 1))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                 570, 1000, 57.01, threshold=80.0,
+                                 now=datetime(2026, 9, 13, 7, 48, tzinfo=timezone.utc))
+
+    assert escalated == []
+    assert "без изменений" in result
+
+
+def test_first_observation_already_approaching_alerts(monkeypatch):
+    """Симметрично уже существовавшему поведению для breach (found ревью
+    PR #607): первое наблюдение, заставшее ресурс УЖЕ в approaching, — не
+    «событие без содержания», как первое наблюдение в ok, а настоящая
+    новость, которую стоит увидеть немедленно."""
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: (None, None))
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: (23.07, datetime(2026, 9, 13, 7, 18, tzinfo=timezone.utc), 1))
+    escalated = []
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+
+    result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                 400, 1000, 40.04, threshold=80.0,
+                                 now=datetime(2026, 9, 13, 7, 33, tzinfo=timezone.utc))
+
+    assert len(escalated) == 1
+    assert "approaching" in result
+
+
+# ── Воспроизведение инцидента #1100 ──────────────────────────────────────────
+
+
+def test_reproduction_1100_trend_fires_before_exhaustion(monkeypatch):
+    """Критерий готовности #1100: на исторических данных 2026-09-13 (6.1% в
+    07:03 → исчерпание в 08:26) механизм обязан дать сигнал МЕЖДУ этими
+    точками.
+
+    Реальные факты (дословно из issue #1100, тела маркеров/логов прогонов
+    этого дня):
+      - 07:03Z, прогон 34744247391: "gh_rest_rate_limit_hour: первое
+        наблюдение (ok, 6.1%)".
+      - 08:19Z: первый из шести прогонов orchestra.yml падает "API rate
+        limit exceeded for installation (HTTP 403)".
+      - 08:26Z: акцептанс-критерий issue #1100 называет это моментом
+        исчерпания.
+      - Лимит installation-токена — 1000 запросов/час (docs/research/
+        21-github-actions.md; форма ответа `gh api rate_limit` проверена
+        живьём в этом PR: {"resources": {"core": {"limit":.., "used":..}}}).
+
+    Честно про то, что НЕ факт: промежуточные показания (07:18, 07:33, ...)
+    нигде не сохранились — сам корень #1100 в том, что `last_reading` до
+    фикса возвращал (None, None) всегда, поэтому исторических чисел между
+    07:03 и 08:26 не существует. Здесь они — ЛИНЕЙНАЯ интерполяция между
+    двумя единственными документированными точками (6.1% → 100% за 83
+    минуты, скорость 1.1313 п.п./мин, постоянная) — простейшая модель,
+    не заявленная как факт."""
+    T0 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    EXHAUSTION = datetime(2026, 9, 13, 8, 26, 0, tzinfo=timezone.utc)
+    FIRST_FAILURE = datetime(2026, 9, 13, 8, 19, 0, tzinfo=timezone.utc)
+    LIMIT = 1000.0
+    START_PCT = 6.1
+    total_minutes = (EXHAUSTION - T0).total_seconds() / 60.0
+    rate_real = (100.0 - START_PCT) / total_minutes  # калибровка по двум документированным точкам
+
+    def pct_at(t):
+        minutes = (t - T0).total_seconds() / 60.0
+        return round(min(START_PCT + rate_real * minutes, 100.0), 2)
+
+    carrier = {"reading": None, "state": (None, None)}
+    escalated = []
+
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: carrier["reading"])
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: carrier["state"])
+    monkeypatch.setattr(qa, "record_reading",
+                         lambda repo, key, pct, when, cid: carrier.__setitem__("reading", (pct, when, 1)))
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(qa.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
+    monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (0, "не должно вызываться в approaching"))
+
+    fired_at = None
+    t = T0
+    tick = timedelta(minutes=15)  # CHECK_INTERVAL_MINUTES (quota_watch.py)
+    while t <= EXHAUSTION:
+        pct = pct_at(t)
+        current = round(LIMIT * pct / 100.0)
+        result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour",
+                                     "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                     current, LIMIT, pct, threshold=80.0, now=t)
+        if "approaching —" in result:
+            fired_at = t
+            break
+        # обновляем "персистентное" состояние тем же способом, каким его
+        # обновил бы реальный state_marker в #120 (ok/breach фиксируются
+        # через escalate/post_issue_comment, которые здесь замоканы —
+        # без этого обновления дедуп следующего тика не увидит переход).
+        if "первое наблюдение" in result or "без изменений" in result:
+            carrier["state"] = (qa.STATE_OK, None)
+        t += tick
+
+    assert fired_at is not None, "тренд обязан был сработать до достижения EXHAUSTION"
+    minutes_before_exhaustion = (EXHAUSTION - fired_at).total_seconds() / 60.0
+    minutes_before_first_failure = (FIRST_FAILURE - fired_at).total_seconds() / 60.0
+    assert minutes_before_exhaustion > 0, "сигнал обязан прийти ДО исчерпания"
+    assert minutes_before_first_failure > 0, "сигнал обязан прийти ДО первого реального отказа оркестратора"
+    assert fired_at == datetime(2026, 9, 13, 7, 33, 0, tzinfo=timezone.utc)
+    assert minutes_before_exhaustion == pytest.approx(53.0, abs=0.01)
+    assert minutes_before_first_failure == pytest.approx(46.0, abs=0.01)
+    assert len(escalated) == 1
+    assert "приближается к пределу" in escalated[0][0]
 
 def test_create_task_mixed_candidates_prefers_same_resource(monkeypatch):
     """Среди похожих кандидатов есть задача ТОГО ЖЕ ресурса — улика уходит

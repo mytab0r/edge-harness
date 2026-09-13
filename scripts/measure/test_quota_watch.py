@@ -8,6 +8,7 @@ import importlib.util
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -610,6 +611,99 @@ def test_full_sweep_escalates_github_rest_and_graphql_rate_limit(monkeypatch):
     qw.full_sweep(REPO, "tok", "acct")
 
     assert calls == ["gh_rest_rate_limit_hour", "gh_graphql_rate_limit_hour"]
+
+
+# ── github_rate_limit_main() (#1100): своя частота, свой троттлинг ─────────
+
+
+def _rate_limit_rows(rest_pct: float = 6.1, graphql_pct: float = 1.0):
+    limit = 1000.0
+    return [
+        qw.quotas.Row("GitHub REST rate limit (PAT/GITHUB_TOKEN)", "GitHub REST",
+                      round(limit * rest_pct / 100.0), limit, "requests/час", "2026-09-13T08:00:00+00:00", "ok"),
+        qw.quotas.Row("GitHub GraphQL rate limit", "GitHub REST",
+                      round(limit * graphql_pct / 100.0), limit, "points/час", "2026-09-13T08:00:00+00:00", "ok"),
+    ]
+
+
+def test_github_rate_limit_main_calls_check_and_alert_for_both_resources(monkeypatch):
+    monkeypatch.setattr(qw.quotas, "collect_github_rate_limit", lambda: _rate_limit_rows())
+    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: None)
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda repo, key, label, current, limit, pct, threshold=None, now=None:
+                             calls.append(key) or "ok")
+
+    assert qw.github_rate_limit_main() == 0
+    assert calls == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+
+
+def test_github_rate_limit_main_throttles_by_own_last_reading(monkeypatch):
+    """#1100: своя частота, свой троттлинг — не через Jobs API (не нужен, чтение
+    rate_limit бесплатно), а через собственное последнее показание тренда.
+    Показание младше RATE_LIMIT_MIN_INTERVAL_MINUTES — тик пропускает замер."""
+    monkeypatch.setattr(qw.quotas, "collect_github_rate_limit", lambda: _rate_limit_rows())
+    now = datetime(2026, 9, 13, 7, 10, 0, tzinfo=timezone.utc)
+    recent = now - timedelta(minutes=5)  # моложе RATE_LIMIT_MIN_INTERVAL_MINUTES (15)
+    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: (6.0, recent, 1))
+    monkeypatch.setattr(qw, "datetime", SimpleNamespace(now=lambda tz: now))
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda *a, **k: calls.append(1) or "ok")
+
+    assert qw.github_rate_limit_main() == 0
+    assert calls == []
+
+
+def test_github_rate_limit_main_measures_again_after_interval_elapses(monkeypatch):
+    monkeypatch.setattr(qw.quotas, "collect_github_rate_limit", lambda: _rate_limit_rows())
+    now = datetime(2026, 9, 13, 7, 20, 0, tzinfo=timezone.utc)
+    old = now - timedelta(minutes=16)  # старше RATE_LIMIT_MIN_INTERVAL_MINUTES (15)
+    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: (6.0, old, 1))
+    monkeypatch.setattr(qw, "datetime", SimpleNamespace(now=lambda tz: now))
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda repo, key, label, current, limit, pct, threshold=None, now=None:
+                             calls.append(key) or "ok")
+
+    assert qw.github_rate_limit_main() == 0
+    assert calls == [qw.GH_REST_KEY, qw.GH_GRAPHQL_KEY]
+
+
+def test_github_rate_limit_main_exits_nonzero_when_rate_limit_unavailable(monkeypatch):
+    """«Недоступность замера — это НЕ ok» (#1100): отказ самого чтения
+    rate_limit обязан быть красным шагом, не тихим нулём."""
+    monkeypatch.setattr(
+        qw.quotas, "collect_github_rate_limit",
+        lambda: [qw.quotas.no_data("GitHub REST rate limit (PAT/GITHUB_TOKEN)", "GitHub REST", None,
+                                    "requests/час", "HTTP 401: Bad credentials"),
+                 qw.quotas.no_data("GitHub GraphQL rate limit", "GitHub REST", None,
+                                    "points/час", "HTTP 401: Bad credentials")],
+    )
+    calls = []
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert", lambda *a, **k: calls.append(1) or "ok")
+
+    assert qw.github_rate_limit_main() == 1
+    assert calls == []
+
+
+def test_github_rate_limit_main_exits_nonzero_on_delivery_failure(monkeypatch):
+    monkeypatch.setattr(qw.quotas, "collect_github_rate_limit", lambda: _rate_limit_rows())
+    monkeypatch.setattr(qw.quota_alert, "last_reading", lambda repo, key: None)
+    monkeypatch.setattr(qw.quota_alert, "check_and_alert",
+                         lambda *a, **k: "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+
+    assert qw.github_rate_limit_main() == 1
+
+
+def test_trend_horizon_matches_check_interval(monkeypatch):
+    """Одно место правды (#1100): quota_alert.TREND_HORIZON_MINUTES не
+    импортирован из quota_watch.py (циклический импорт — quota_watch.py уже
+    импортирует quota_alert), поэтому число ПРОДУБЛИРОВАНО — эта гвардия
+    ловит дрейф между двумя копиями, как THRESHOLD_PCT уже подстрахован
+    похожей проверкой рядом. Мутация: поменяй TREND_HORIZON_MINUTES в
+    quota_alert.py на любое другое число — тест краснеет."""
+    assert qw.quota_alert.TREND_HORIZON_MINUTES == qw.CHECK_INTERVAL_MINUTES * 3
 
 
 # ── measure_main(): проводка дешёвой/полной проверки (троттлинг решает gate_main) ──
@@ -1408,44 +1502,75 @@ def test_close_stale_episode_noop_when_no_open_episode(monkeypatch):
 
 
 # ── Стоимость тика гейта не растёт с историей #120: маркеры эпизодного
-# дедупа читаются только со СВЕЖИХ страниц (found: ревью PR #607, «хвост») ──
+# дедупа читаются только со СВЕЖИХ страниц (found: ревью PR #607, «хвост»;
+# «свежая» исправлена #1100 — см. all_issue_comments) ──
+
+
+ISSUE_METADATA_URL = f"repos/{REPO}/issues/120"
+
+
+def _fake_gh_over_history(total_comments: int, last_page_body: list[dict]):
+    """Фейковый pulse_guard.gh для истории #120: первый вызов на каждую
+    all_issue_comments(max_pages=...) — метаданные issue (число
+    комментариев), дальше — СВЕЖИЕ страницы, вычисленные от total_comments
+    (не page=1, found #1100 — см. all_issue_comments)."""
+    last_page = (total_comments + 99) // 100 if total_comments else 0
+    expected_page_url = f"repos/{REPO}/issues/120/comments?per_page=100&page={last_page}"
+    requested = []
+
+    def fake_gh(*args):
+        endpoint = args[0]
+        requested.append(endpoint)
+        if endpoint == ISSUE_METADATA_URL:
+            return {"comments": total_comments}
+        assert endpoint == expected_page_url, (
+            f"ожидалась СВЕЖАЯ (последняя) страница {expected_page_url!r}, запрошено {endpoint!r}"
+        )
+        return last_page_body
+
+    return fake_gh, requested
 
 
 def test_all_issue_comments_max_pages_bounds_traversal(monkeypatch):
     """Прямая мутационная проверка `max_pages`: полная страница (len==100)
     сама по себе обход НЕ останавливает (иначе #276 сломан), останавливает
-    только лимит страниц."""
-    requested = []
-
-    def fake_gh(*args):
-        requested.append(args[0])
-        return [{"id": 1, "body": "x", "created_at": "2026-09-10T00:00:00Z"}] * 100
-
-    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
-    one_page = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=1)
-    assert len(one_page) == 100 and len(requested) == 1
-    two_pages = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=2)
-    assert len(two_pages) == 200 and len(requested) == 3
-
-
-def test_stale_alert_reads_only_fresh_page_of_watchdog_history(monkeypatch):
-    """Тик гейта не обязан обходить ВСЮ историю #120 (замер 2026-09-10:
-    больше 550 комментариев и растёт) — маркеры эпизодного дедупа читаются
-    только со СВЕЖЕЙ страницы (MARKER_SCAN_PAGES). Гвардия: запрос страницы
-    2 — громкое падение. Сними `max_pages=` из stale_alert — тест краснеет."""
+    только лимит страниц. #1100: страницы читаются С КОНЦА (вычисленных от
+    числа комментариев issue), не с начала — гвардия внутри fake_gh."""
+    total_comments = 250  # last_page = ceil(250/100) = 3
     requested = []
 
     def fake_gh(*args):
         endpoint = args[0]
-        assert isinstance(endpoint, str) and "/comments?" in endpoint, endpoint
-        page = int(endpoint.split("&page=")[1])
-        requested.append(page)
-        assert page == 1, f"тик гейта читает только свежую страницу, запрошена {page}"
-        # Полная страница БЕЗ маркеров: дедуп решает «эпизода нет», алерт
-        # уходит — и это ровно один обход свежей страницы на маркер.
-        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
-                for i in range(100)]
+        requested.append(endpoint)
+        if endpoint == ISSUE_METADATA_URL:
+            return {"comments": total_comments}
+        return [{"id": 1, "body": "x", "created_at": "2026-09-10T00:00:00Z"}] * 100
 
+    monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
+    one_page = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=1)
+    assert len(one_page) == 100
+    assert requested == [ISSUE_METADATA_URL, f"repos/{REPO}/issues/120/comments?per_page=100&page=3"]
+
+    requested.clear()
+    two_pages = qw.pulse_guard.all_issue_comments(REPO, 120, max_pages=2)
+    assert len(two_pages) == 200
+    assert requested == [
+        ISSUE_METADATA_URL,
+        f"repos/{REPO}/issues/120/comments?per_page=100&page=2",
+        f"repos/{REPO}/issues/120/comments?per_page=100&page=3",
+    ]
+
+
+def test_stale_alert_reads_only_fresh_page_of_watchdog_history(monkeypatch):
+    """Тик гейта не обязан обходить ВСЮ историю #120 (950+ комментариев и
+    растёт) — маркеры эпизодного дедупа читаются только со СВЕЖЕЙ страницы
+    (MARKER_SCAN_PAGES), вычисленной от числа комментариев issue, а НЕ
+    буквальной page=1 (found #1100 — до этой правки page=1 всегда была
+    самой СТАРОЙ страницей; gh не поддерживает sort/direction для
+    комментариев issue). Гвардия: запрос не той страницы — громкое падение."""
+    fake_gh, requested = _fake_gh_over_history(
+        950, [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"} for i in range(50)],
+    )
     monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
@@ -1454,23 +1579,20 @@ def test_stale_alert_reads_only_fresh_page_of_watchdog_history(monkeypatch):
     result = qw.stale_alert(REPO, datetime.now(timezone.utc), 60.0, "шаг упал (failure)")
 
     assert escalated and "доставлен" in result
-    assert requested == [1, 1]  # открытый и закрывающий маркеры — по одной странице каждый
+    # открытый и закрывающий маркеры — по одному чтению метаданных + одной
+    # свежей странице каждый.
+    assert requested.count(ISSUE_METADATA_URL) == 2
+    assert requested.count(f"repos/{REPO}/issues/120/comments?per_page=100&page=10") == 2
 
 
 def test_close_stale_episode_reads_only_fresh_page(monkeypatch):
-    """Здоровый тик (закрытие эпизода) — ровно ОДИН запрос комментариев:
-    открытого маркера простоя на свежей странице нет — до закрывающих
-    маркеров дело не доходит, никакой второй обход истории не начинается."""
-    requested = []
-
-    def fake_gh(*args):
-        endpoint = args[0]
-        page = int(endpoint.split("&page=")[1])
-        requested.append(page)
-        assert page == 1, f"тик гейта читает только свежую страницу, запрошена {page}"
-        return [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"}
-                for i in range(100)]
-
+    """Здоровый тик (закрытие эпизода) — ровно ОДИН запрос комментариев (плюс
+    метаданные issue): открытого маркера простоя на свежей странице нет —
+    до закрывающих маркеров дело не доходит, никакой второй обход истории не
+    начинается."""
+    fake_gh, requested = _fake_gh_over_history(
+        950, [{"id": i, "body": f"comment {i}", "created_at": "2026-09-10T00:00:00Z"} for i in range(50)],
+    )
     monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
     posted = []
     monkeypatch.setattr(qw.pulse_guard, "post_issue_comment", lambda *a: posted.append(a))
@@ -1478,7 +1600,7 @@ def test_close_stale_episode_reads_only_fresh_page(monkeypatch):
     qw.close_stale_episode_if_needed(REPO)
 
     assert posted == []
-    assert requested == [1]
+    assert requested == [ISSUE_METADATA_URL, f"repos/{REPO}/issues/120/comments?per_page=100&page=10"]
 
 
 # ── main(): CLI-диспетчер gate|measure ──────────────────────────────────────

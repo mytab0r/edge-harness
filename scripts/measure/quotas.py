@@ -322,10 +322,17 @@ def gh_api(*args: str) -> dict | list | None:
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def collect_github(repo: str) -> list[Row]:
+def collect_github_rate_limit() -> list[Row]:
+    """Только `gh api rate_limit` (REST core + GraphQL) — вынесено из
+    collect_github (#1100) в СВОЮ функцию, чтобы quota_watch.py могло звать
+    ровно эту дешёвую часть на каждом тике (rate_limit не расходует сам себя,
+    см. quota_watch.py::RATE_LIMIT_MIN_INTERVAL_MINUTES), не оплачивая заодно
+    dispatch_count/in_progress ниже (те два — самостоятельные list-запросы,
+    расходуют REST-бюджет и не нужны так часто). Одно место правды на текст
+    ресурса ("GitHub REST rate limit (PAT/GITHUB_TOKEN)"/"GitHub GraphQL rate
+    limit") — quota_watch.py больше не несёт вторую копию этих строк."""
     source = "GitHub REST"
     rows: list[Row] = []
-
     try:
         data = gh_api("rate_limit")
         core = data["resources"]["core"]
@@ -339,6 +346,12 @@ def collect_github(repo: str) -> list[Row]:
     except (RuntimeError, KeyError) as error:
         rows.append(no_data("GitHub REST rate limit (PAT/GITHUB_TOKEN)", source, None, "requests/час", str(error)))
         rows.append(no_data("GitHub GraphQL rate limit", source, None, "points/час", str(error)))
+    return rows
+
+
+def collect_github(repo: str) -> list[Row]:
+    source = "GitHub REST"
+    rows: list[Row] = list(collect_github_rate_limit())
 
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")

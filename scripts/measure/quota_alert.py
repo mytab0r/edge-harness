@@ -65,6 +65,33 @@ over_threshold` + `pulse_guard.escalate`), но только по требова
      долго при зелёных прогонах: каждый тик повторял бы страницу/попытку
      действия, и ни один прогон не говорил бы об этом.
 
+## Тренд и третье состояние (#1100)
+
+Живой инцидент 2026-09-13: quota-watch увидел `gh_rest_rate_limit_hour` в
+07:03 (6.1%, "ok") и промолчал 83 минуты подряд до фактического исчерпания
+токена прогонов — состояние всё это время оставалось "ok", порог (80%)
+пробился только в последние минуты. Дедуп по переходу выше видит только
+ДИСКРЕТНОЕ ok/breach одной метрики за раз — он структурно не может
+предупредить о РОСТЕ, если рост не успел пересечь порог. Разбор нашёл и
+второй, независимый дефект того же прогона: `all_issue_comments(max_pages=1)`
+читал ПЕРВУЮ страницу комментариев #120 как «самую свежую» — но у эндпоинта
+GitHub «List issue comments» нет `sort`/`direction`, страница 1 — это САМАЯ
+СТАРАЯ сотня комментариев растущей истории (#120 — 950+ на момент разбора).
+`last_state` поэтому ВСЕГДА видел «маркера нет» и объявлял каждый тик
+«первым наблюдением» — 114 копий одной и той же записи в #120 вместо одного
+перехода (см. `pulse_guard.all_issue_comments`, фикс и разбор там).
+
+Третье состояние — `STATE_APPROACHING` (`classify_state`, `TREND_HORIZON_
+MINUTES`): по ДВУМ последовательным числовым показаниям (`last_reading`/
+`record_reading`, см. ниже) вычисляется скорость роста и проекция «через
+сколько минут при этой скорости будет пробит порог»; если проекция короче
+горизонта — сигнал уходит ДО того, как pct сам пересечёт порог. Показание
+пишется КАЖДЫЙ тик независимо от состояния (в отличие от `state_marker`,
+который пишется только на переходе) — но НЕ новым комментарием: носитель
+редактируется на месте (`pulse_guard.edit_issue_comment`), поэтому счётчик
+комментариев #120 не растёт с частотой тиков (тот же класс, что и сам
+инцидент — 114 дублей).
+
 Запуск тестов: python -m pytest scripts/measure/test_quota_alert.py -q
 """
 
@@ -129,12 +156,25 @@ def _fmt(n: float) -> str:
 
 STATE_MARKER_PREFIX = "[quota: состояние"
 
+# Три состояния, не два (#1100, тот же класс, что #1096): "ok" — норма;
+# "approaching" — тренд показывает, что порог THRESHOLD_PCT будет пробит
+# раньше TREND_HORIZON_MINUTES минут (см. classify_state ниже); "breach" —
+# порог уже пробит (как раньше). "approaching" — предупреждение ДО отказа:
+# инцидент #1100 показал, что сторож видел 6.1% в норме и молчал все 83
+# минуты до фактического исчерпания лимита — состояние держалось "ok" всю
+# дорогу, порог пробился только в самом конце. Без промежуточного состояния,
+# завязанного на СКОРОСТЬ роста, а не только на текущее значение, сигнал
+# физически не мог прийти раньше самого порога.
+STATE_OK = "ok"
+STATE_APPROACHING = "approaching"
+STATE_BREACH = "breach"
+
 
 def _state_marker_prefix(resource_key: str) -> str:
     return f"{STATE_MARKER_PREFIX} {resource_key} = "
 
 
-_STATE_RE = re.compile(r"= (breach|ok)(?: issue=#(\d+))?\]")
+_STATE_RE = re.compile(r"= (breach|approaching|ok)(?: issue=#(\d+))?\]")
 
 # Строка кандидата гвардии дублей в stderr issue-create — буквально
 # `  #<num> (score <s>): <title> — <url>` (scripts/gh/issue-create, awk-строка
@@ -158,12 +198,14 @@ MARKER_SCAN_PAGES = 1
 def last_state(repo: str, resource_key: str) -> tuple[str | None, int | None]:
     """Последнее записанное состояние КОНКРЕТНОГО ресурса и номер связанной
     задачи (если он был в маркере) — по самому свежему из подходящих
-    комментариев #120 СВЕЖЕЙ СТРАНИЦЫ (MARKER_SCAN_PAGES): самый свежий
-    маркер ключа лежит на первой странице, пока после него не накопилось
-    100 более новых комментариев; деградация — тот же самозаживающийся
-    повторный сигнал раз в ~сутки затяжного эпизода, не тишина (первое
-    наблюдение breach тоже алертит). Нет ни одного маркера на странице —
-    состояние не известно (None, None)."""
+    комментариев #120 СВЕЖЕЙ СТРАНИЦЫ (MARKER_SCAN_PAGES — реально
+    вычисленной ПОСЛЕДНЕЙ страницы, см. `pulse_guard.all_issue_comments`,
+    фикс #1100: страница 1 у этого эндпоинта всегда самая СТАРАЯ, не
+    свежая). Самый свежий маркер ключа лежит на свежей странице, пока после
+    него не накопилось 100 более новых комментариев; деградация — тот же
+    самозаживающийся повторный сигнал раз в ~сутки затяжного эпизода, не
+    тишина (первое наблюдение breach тоже алертит). Нет ни одного маркера
+    на странице — состояние не известно (None, None)."""
     prefix = _state_marker_prefix(resource_key)
     matches = pulse_guard.issue_markers_any(repo, WATCHDOG_ISSUE, (prefix,),
                                             max_pages=MARKER_SCAN_PAGES)
@@ -182,6 +224,110 @@ def last_state(repo: str, resource_key: str) -> tuple[str | None, int | None]:
 def state_marker(resource_key: str, state: str, issue_number: int | None) -> str:
     suffix = f" issue=#{issue_number}" if issue_number else ""
     return f"{_state_marker_prefix(resource_key)}{state}{suffix}]"
+
+
+# ── Тренд (#1100): числовое показание последнего тика, не только ok/breach ──
+#
+# state_marker выше несёт ТОЛЬКО дискретное состояние и пишется только на
+# ПЕРЕХОДЕ (дедуп, см. докстринг модуля) — «6.1%, без изменений» никогда не
+# попадает в #120 вообще. Для тренда нужна числовая история: предыдущее
+# показание (pct, когда) НЕЗАВИСИМО от того, поменялось ли состояние. Если
+# копить эту историю обычными POST-комментариями на каждый тик — это ровно
+# тот же класс, что породил инцидент (114 копий одного маркера): комментарий
+# читается редактированием ОДНОГО и того же комментария (edit_issue_comment)
+# — счётчик комментариев issue не растёт с частотой тиков, а данные для
+# тренда переживают между тиками.
+READING_MARKER_PREFIX = "[quota: замер"
+
+
+def _reading_marker_prefix(resource_key: str) -> str:
+    return f"{READING_MARKER_PREFIX} {resource_key} = "
+
+
+_READING_RE = re.compile(r"= ([0-9.]+)% at (\S+)\]")
+
+
+def reading_marker(resource_key: str, pct: float, when: datetime) -> str:
+    return f"{_reading_marker_prefix(resource_key)}{pct}% at {when.isoformat()}]"
+
+
+def last_reading(repo: str, resource_key: str) -> tuple[float, datetime, int] | None:
+    """Последнее числовое показание ресурса (pct, момент, id комментария-
+    носителя) — по самой свежей СТРАНИЦЕ #120 (MARKER_SCAN_PAGES, тот же
+    приём и та же цена деградации, что last_state выше). None — показаний
+    ещё не было (первый тик этого ресурса вообще, либо запись показания
+    раньше не удавалась — см. record_reading)."""
+    prefix = _reading_marker_prefix(resource_key)
+    comments = pulse_guard.all_issue_comments(repo, WATCHDOG_ISSUE, max_pages=MARKER_SCAN_PAGES)
+    candidates = [c for c in comments if prefix in (c.get("body") or "")]
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda c: pulse_guard.parse_time(c["created_at"]))
+    body = newest.get("body") or ""
+    idx = body.find(prefix)
+    m = _READING_RE.search(body, idx)
+    if not m:
+        return None
+    try:
+        when = pulse_guard.parse_time(m.group(2))
+    except ValueError:
+        return None
+    return float(m.group(1)), when, newest["id"]
+
+
+def record_reading(repo: str, resource_key: str, pct: float, when: datetime,
+                    comment_id: int | None) -> None:
+    """Правит существующий носитель (edit_issue_comment) — заводит новый
+    ТОЛЬКО если носителя ещё не было (comment_id is None, первый тик этого
+    ресурса). Best-effort по построению (см. check_and_alert): отказ здесь не
+    должен красить прогон (тренд — предупреждение раньше отказа, не сам
+    канал эскалации порога/простоя, у которых уже есть свой fail loud), но
+    обязан быть ВИДИМ (::warning::), а не тихим — иначе носитель тренда мог
+    бы стоять сломанным неограниченно долго при зелёных прогонах, тем же
+    классом, что дедуп состояния уже проходил (см. carrier_write_verdict)."""
+    text = reading_marker(resource_key, pct, when)
+    if comment_id is not None:
+        pulse_guard.edit_issue_comment(repo, comment_id, text)
+    else:
+        pulse_guard.post_issue_comment(repo, WATCHDOG_ISSUE, text)
+
+
+# Горизонт «приближения к пределу» — 3×CHECK_INTERVAL_MINUTES (=15, см.
+# quota_watch.py) = 45 минут: тот же приём кратности, что уже применён в
+# MEASUREMENT_STALE_MINUTES (quota_watch.py) и в HEARTBEAT_MAX_AGE_MINUTES
+# (pulse_guard.py) — три полных тика цикла проверки, не число «по вкусу».
+# Число здесь ПРОДУБЛИРОВАНО (не импортировано из quota_watch.py), потому
+# что quota_watch.py уже импортирует quota_alert.py — обратный импорт
+# заводил бы цикл; синхронность держит test_quota_watch.py::
+# test_trend_horizon_matches_check_interval (гвардия дрейфа, тот же приём,
+# что уже применён к THRESHOLD_PCT в этом файле).
+TREND_HORIZON_MINUTES = 45.0
+
+
+def _trend_projection(prev_pct: float, prev_time: datetime, current_pct: float,
+                       now: datetime, threshold: float) -> tuple[float | None, float | None]:
+    """(скорость %/мин, минут до порога) по двум последовательным показаниям.
+    Скорость None — время между показаниями не положительное (повтор тика/
+    рассинхрон часов) — тренд посчитать не из чего. Минуты до порога None —
+    порог уже пробит (не это вычисляет approaching, этим занимается
+    classify_state через сам pct) либо скорость не растёт (<=0, порог не
+    приближается ростом; уменьшение — не тревога)."""
+    delta_minutes = (now - prev_time).total_seconds() / 60.0
+    if delta_minutes <= 0:
+        return None, None
+    rate = (current_pct - prev_pct) / delta_minutes
+    if rate <= 0 or current_pct >= threshold:
+        return rate, None
+    return rate, (threshold - current_pct) / rate
+
+
+def classify_state(pct: float, threshold: float, projected_minutes: float | None,
+                    horizon: float) -> str:
+    if pct >= threshold:
+        return STATE_BREACH
+    if projected_minutes is not None and projected_minutes <= horizon:
+        return STATE_APPROACHING
+    return STATE_OK
 
 
 def _same_resource_candidates(stderr: str, resource_label: str) -> list[int]:
@@ -296,7 +442,9 @@ def create_or_note_task(repo: str, resource_label: str, resource_key: str,
 
 def check_and_alert(repo: str, resource_key: str, resource_label: str,
                      current: float, limit: float, pct: float,
-                     threshold: float = quotas.THRESHOLD_PCT) -> str:
+                     threshold: float = quotas.THRESHOLD_PCT, *,
+                     trend_horizon_minutes: float = TREND_HORIZON_MINUTES,
+                     now: datetime | None = None) -> str:
     """Единая точка входа обоих вызывающих (см. докстринг модуля). Возвращает
     строку для лога прогона — вызывающий печатает её и решает про exit code
     предикатами pulse_guard (escalation_channel_failed /
@@ -304,16 +452,45 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     отказ тихой записи маркера (первое наблюдение в норме) приходит вердиктом
     carrier_write_verdict и ловится тем же вторым предикатом.
 
+    Три состояния, не два (#1100): ok / approaching (тренд, см. classify_state
+    и TREND_HORIZON_MINUTES) / breach. Показание (pct, `now`) пишется в
+    носитель тренда (record_reading) НА КАЖДОМ вызове, независимо от того,
+    изменилось состояние или нет — тренду следующего тика нужна числовая
+    история, а не только дискретный ok/breach, который дедуп прежде писал
+    только на переходах (инцидент #1100: сторож видел 6.1%, молчал 83
+    минуты, порог пробился в самом конце — состояние всё это время было
+    "ok", числовой историей для расчёта скорости роста никто не был).
+
     Первое наблюдение ресурса (prev_state is None), заставшее его уже в
     норме, — не переход breach→ok (события восстановления не было, эскалация
     сообщила бы о факте, которого не было), поэтому наружу тихо уходит только
     маркер состояния, без Telegram/следа-эскалации в #120 (найдено ревью
     PR #607 — до этой правки такой прогон слал ложное «квота вернулась ниже
-    порога» на КАЖДЫЙ ресурс, впервые увиденный в норме)."""
-    new_state = "breach" if pct >= threshold else "ok"
+    порога» на КАЖДЫЙ ресурс, впервые увиденный в норме). Первое наблюдение,
+    заставшее ресурс уже в approaching/breach, — НАСТОЯЩАЯ новость (симметрично
+    уже существовавшему поведению для breach) и эскалирует как обычно."""
+    now = now or datetime.now(timezone.utc)
+
+    prev_reading = last_reading(repo, resource_key)
+    rate = projected_minutes = None
+    if prev_reading is not None:
+        prev_pct, prev_time, _ = prev_reading
+        rate, projected_minutes = _trend_projection(prev_pct, prev_time, pct, now, threshold)
+    new_state = classify_state(pct, threshold, projected_minutes, trend_horizon_minutes)
+
     prev_state, prev_issue = last_state(repo, resource_key)
 
-    if prev_state is None and new_state == "ok":
+    # Показание для тренда — ВСЕГДА, best-effort, тихо (это НЕ канал сигнала,
+    # см. докстринг record_reading): отказ здесь не должен красить прогон —
+    # у канала эскалации порога/простоя уже есть свой fail loud ниже — но
+    # обязан быть виден.
+    try:
+        record_reading(repo, resource_key, pct, now, prev_reading[2] if prev_reading else None)
+    except RuntimeError as error:
+        print(f"::warning::quota_alert: показание «{resource_label}» ({pct}%) не записано для "
+              f"тренда: {error} — на следующем тике тренд посчитать не из чего", file=sys.stderr)
+
+    if prev_state is None and new_state == STATE_OK:
         # Носитель дедупа пишется напрямую (post_issue_comment, без
         # эскалации — см. предохранитель 4 в докстринге модуля), поэтому
         # отказ здесь не проходит через вердикт escalate и обязан быть
@@ -327,7 +504,7 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
         # вызывающий (quota_watch.measure_main:: _delivery_exit_failed)
         # краснит по ней прогон.
         try:
-            pulse_guard.post_issue_comment(repo, WATCHDOG_ISSUE, state_marker(resource_key, "ok", None))
+            pulse_guard.post_issue_comment(repo, WATCHDOG_ISSUE, state_marker(resource_key, STATE_OK, None))
             verdict = pulse_guard.carrier_write_verdict(WATCHDOG_ISSUE, True)
         except RuntimeError as error:
             verdict = pulse_guard.carrier_write_verdict(WATCHDOG_ISSUE, False, str(error))
@@ -336,7 +513,7 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
     if prev_state == new_state:
         return f"{resource_key}: без изменений ({new_state}, {pct}%) — сигнал не отправлен (дедуп)"
 
-    if new_state == "breach":
+    if new_state == STATE_BREACH:
         issue_number, note = create_or_note_task(repo, resource_label, resource_key,
                                                    current, limit, pct, threshold)
         action = f"задача: #{issue_number}" if issue_number else f"задача НЕ заведена ({note})"
@@ -352,17 +529,41 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
             result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
             return (f"{resource_key}: breach — {result}; {note}; маркер состояния НЕ записан "
                      "(действие не состоялось) — следующий прогон повторит попытку")
-        text += "\n" + state_marker(resource_key, "breach", issue_number)
+        text += "\n" + state_marker(resource_key, STATE_BREACH, issue_number)
         result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
         return f"{resource_key}: breach — {result}; {note}"
 
+    if new_state == STATE_APPROACHING:
+        # Approaching — предупреждение раньше отказа (#1100), не задача:
+        # заводить issue уже на этом рубеже дублировало бы дедуп-заголовок
+        # breach (create_or_note_task матчит кандидатов по resource_label в
+        # заголовке) и создавало бы задачу на тренд, который может развернуться
+        # сам, не дойдя до порога. Telegram + след в #120 — та же видимость,
+        # что и у breach, без автозаведения.
+        if prev_reading is not None:
+            ago_minutes = (now - prev_reading[1]).total_seconds() / 60.0
+            trend_note = (f"тренд: было {prev_reading[0]}% {ago_minutes:.0f} мин назад, сейчас "
+                          f"{pct}% — при скорости {rate:.2f} п.п./мин порог {threshold}% будет "
+                          f"пробит через {projected_minutes:.0f} мин, если рост не остановится.")
+        else:
+            trend_note = "тренд ещё не накоплен (первое показание уже в зоне приближения)."
+        text = (
+            f"⚠️ edge-harness: квота «{resource_label}» приближается к пределу {threshold}%: "
+            f"{_fmt(current)} / {_fmt(limit)} ({pct}%). {trend_note}\n"
+            + state_marker(resource_key, STATE_APPROACHING, prev_issue)
+        )
+        result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+        return f"{resource_key}: approaching — {result}"
+
+    # new_state == STATE_OK и prev_state не None — настоящий возврат из
+    # approaching/breach в норму (restoration), не первое наблюдение.
     text = (
         f"✅ edge-harness: квота «{resource_label}» вернулась ниже {threshold}% "
         f"({_fmt(current)} / {_fmt(limit)}, {pct}%). "
         + (f"Задача на разбор по маркеру: #{prev_issue} (текущее её состояние здесь "
            "не проверялось)." if prev_issue
            else "Прежней задачи на разбор в маркере не найдено.")
-        + "\n" + state_marker(resource_key, "ok", prev_issue)
+        + "\n" + state_marker(resource_key, STATE_OK, prev_issue)
     )
     result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
     return f"{resource_key}: recovery — {result}"

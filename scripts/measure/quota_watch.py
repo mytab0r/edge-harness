@@ -367,7 +367,7 @@ head 345a64f вскрыла следующую итерацию того же к
 эскалируем), как и при недоступной истории целиком. Раньше такие прогоны
 молча пропускались (`continue`) и могли дать ложное «замера нет».
 
-## Стоимость тика гейта не растёт с историей #120 (found: ревью PR #607, «хвост»)
+## Стоимость тика гейта не растёт с историей #120 (found: ревью PR #607, «хвост»; поправлено #1100)
 
 `stale_alert`/`close_stale_episode_if_needed` читают маркеры эпизодного
 дедупа из #120 на КАЖДОМ тике гейта (каждое PR-событие плюс cron 4 раза
@@ -375,16 +375,31 @@ head 345a64f вскрыла следующую итерацию того же к
 проходил ВСЮ копящуюся историю задачи (замер 2026-09-10: больше 550
 комментариев) по два-четыре раза за тик — при бюджете github.token
 1000 запросов/час на репозиторий (docs/research/21, «API-лимиты»), общем
-со всеми остальными workflow. Правка: `all_issue_comments`/`issue_marker_times`
-получили опциональный `max_pages`, сторож читает только
-`MARKER_SCAN_PAGES = 1` свежую страницу — константное число REST-вызовов
-на тик, не зависящее от истории. Комментарии идут от новых к старым,
-поэтому максимум timestamp любого маркера лежит на первой странице, пока
-после него не накопилось 100 более новых; цена деградации названа честно
-(см. комментарий у `MARKER_SCAN_PAGES`): открытый эпизод старше страницы
-дедуп «не видит» — уйдёт ОДИН повторный сигнал на ~сутки затяжного
-простоя, и каждый алерт сам несёт свежий `STALE_MARKER`, возвращая дедуп
-на первую страницу (самозаживление), а не тишина.
+со всеми остальными workflow. Правка PR #607: `all_issue_comments`/
+`issue_marker_times` получили опциональный `max_pages`, сторож читает
+только `MARKER_SCAN_PAGES = 1` свежую страницу — константное число
+REST-вызовов на тик, не зависящее от истории.
+
+Формулировка «комментарии идут от новых к старым, поэтому максимум
+timestamp любого маркера лежит на первой странице» БЫЛА НЕВЕРНОЙ (found
+#1100, находка F4 прочёса #1096): у эндпоинта GitHub «List issue comments»
+нет `sort`/`direction` — страница 1 ВСЕГДА самая старая сотня растущей
+истории (проверено живьём 2026-09-13: page=1 issue #120 при 952
+комментариях вернул комментарий от 2026-08-31). До фикса #1100
+`max_pages=1` буквально читал page=1 — самую СТАРУЮ, а не свежую страницу:
+маркер, дописанный в конец, никогда не попадал туда, и дедуп ВСЕГДА видел
+«состояния не известно». Фикс: `all_issue_comments` с `max_pages` теперь
+читает метаданные issue (число комментариев, ОДИН дешёвый вызов) и вычисляет
+номер настоящей ПОСЛЕДНЕЙ страницы вместо буквального page=1 (см.
+`pulse_guard.all_issue_comments`) — стоимость выросла на 1 вызов метаданных
+на `max_pages`-чтение (2 вместо 1 при MARKER_SCAN_PAGES=1), но константа
+осталась КОНСТАНТОЙ — не зависящей от истории задачи. Цена деградации
+названа честно (см. комментарий у `MARKER_SCAN_PAGES`): открытый эпизод
+старше страницы дедуп «не видит» — уйдёт ОДИН повторный сигнал на ~сутки
+затяжного простоя, и каждый алерт сам несёт свежий `STALE_MARKER`, возвращая
+дедуп на свежую страницу (самозаживление), а не тишина. Отдельная,
+самостоятельная цена гонки (комментарий добавлен МЕЖДУ вызовом метаданных
+и вызовом страницы) — в докстринге `pulse_guard.all_issue_comments`.
 
 ## Несостоявшийся замер обязан краснеть, не зеленеть (found: ревью PR #607)
 
@@ -837,6 +852,86 @@ def full_sweep(repo: str, token: str, account_id: str) -> list[str]:
         print(f"[полный срез] {result}")
         results.append(result)
     return results
+
+
+# ── Лимит GitHub API — своя частота, не завязана на CF-гейт (#1100) ──────────
+#
+# `gh api rate_limit` не расходует сам лимит, который измеряет — документировано
+# GitHub, и проверено живьём 2026-09-13 (три подряд вызова личным PAT дали
+# used=0/5000 все три раза) — тот же принцип «сторож не приближает то, от чего
+# защищает», что уже применён к CF Analytics выше («Стоимость и троттлинг»).
+# До этой правки REST/GraphQL лимит попадал в наблюдение ТОЛЬКО внутри
+# full_sweep — не чаще раза в час (FULL_SWEEP_MINUTE_WINDOW), хотя сам токен,
+# который он мерит (GH_TOKEN: github.token в quota-watch.yml — тот же общий
+# installation-лимит 1000/час/репозиторий, что исчерпался в инциденте #1100:
+# orchestra.yml падал ровно с "API rate limit exceeded for installation"),
+# способен исчерпаться заметно быстрее часа (инцидент — 83 минуты, 07:03→
+# 08:26). Часовая каденция физически не могла поймать переход внутри такого
+# окна. Раз чтение бесплатно, эта проверка не привязана к CF-гейту
+# (gate_main/scan_measurement_history, тот дорогой механизм существует ради
+# СТОИМОСТИ CF-вызова, которой здесь нет) — у неё свой, самостоятельный и
+# гораздо более дешёвый троттлинг: не через историю прогонов Jobs API (нужен
+# бы отдельный шаг-гейт и сканирование), а через собственное последнее
+# показание тренда (quota_alert.last_reading) — если оно младше
+# RATE_LIMIT_MIN_INTERVAL_MINUTES, тик признаёт себя избыточным. Интервал —
+# тот же CHECK_INTERVAL_MINUTES (15 мин), что и у CF-проверки (обоснование
+# там же, «Повод и числа»): та же плотность сэмплов, которой в разборе
+# инцидента (см. test_quota_alert.py, воспроизведение #1100) хватило дать
+# сигнал за много десятков минут до фактического исчерпания.
+RATE_LIMIT_MIN_INTERVAL_MINUTES = CHECK_INTERVAL_MINUTES
+
+# Ключи ресурса — те же, что resource_key() уже сопоставляет через
+# _RESOURCE_KEY_HINTS для full_sweep (одно место правды на ключ, не второй
+# независимый литерал: quotas.collect_github_rate_limit() несёт эти ЖЕ два
+# label'а, resource_key() резолвит их в ключ дедупа quota_alert).
+GH_REST_KEY = resource_key("GitHub REST rate limit (PAT/GITHUB_TOKEN)")
+GH_GRAPHQL_KEY = resource_key("GitHub GraphQL rate limit")
+assert GH_REST_KEY and GH_GRAPHQL_KEY, (
+    "resource_key() не распознал метки quotas.collect_github_rate_limit() — "
+    "_RESOURCE_KEY_HINTS и текст ресурса разошлись"
+)
+
+
+def github_rate_limit_main() -> int:
+    """Подкоманда `github-rate-limit` (свой шаг workflow, БЕЗ `if:` — в
+    отличие от MEASURE_STEP_NAME, эта проверка ничего не троттлит по Jobs
+    API, см. константу выше). Читает `quotas.collect_github_rate_limit()`
+    (общее место правды на разбор `gh api rate_limit` и текст ресурса,
+    #1100) на каждом тике workflow, но пропускает сам замер (после одного
+    дешёвого чтения) через собственный троттлинг по `last_reading`, если
+    предыдущее показание моложе RATE_LIMIT_MIN_INTERVAL_MINUTES — не через
+    сканирование истории прогонов (это дорого и не нужно: чтение
+    rate_limit бесплатно, троттлить нужно только запись/эскалацию в #120,
+    не сам вызов Cloudflare, которого здесь и нет).
+
+    Отказ САМОГО чтения rate_limit (сеть/права) — красный шаг, тем же
+    принципом, что measure_main: «недоступность замера — это НЕ ok»
+    (#1100), а не тихий 0."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    now = datetime.now(timezone.utc)
+    rows = quotas.collect_github_rate_limit()
+    if any(row.status == "no-data" for row in rows):
+        reasons = "; ".join(row.note for row in rows if row.status == "no-data")
+        print(f"::error::quota_watch: gh api rate_limit не отвечает ({reasons}) — замер лимита "
+              "GitHub API не состоялся в этом тике", file=sys.stderr)
+        return 1
+
+    exit_code = 0
+    for row, key in ((rows[0], GH_REST_KEY), (rows[1], GH_GRAPHQL_KEY)):
+        throttle = quota_alert.last_reading(repo, key)
+        if throttle is not None:
+            _, prev_time, _ = throttle
+            age_minutes = (now - prev_time).total_seconds() / 60.0
+            if age_minutes < RATE_LIMIT_MIN_INTERVAL_MINUTES:
+                print(f"{key}: последнее показание {age_minutes:.1f} мин назад "
+                      f"(порог {RATE_LIMIT_MIN_INTERVAL_MINUTES:.0f} мин) — пропуск (троттлинг)")
+                continue
+        result = quota_alert.check_and_alert(repo, key, row.resource, row.current, row.limit, row.pct,
+                                              threshold=quotas.THRESHOLD_PCT, now=now)
+        print(result)
+        if _delivery_exit_failed(result):
+            exit_code = 1
+    return exit_code
 
 
 def _channel_failed(result: str) -> bool:
@@ -1325,17 +1420,20 @@ def measure_main() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI-диспетчер: `gate` | `measure` — ДВА разных шага одного job'а
-    (quota-watch.yml), см. докстринг модуля. Явные подкоманды, а не дефолт
-    на «измерять» — ошибка вызова обязана быть громкой, а не тихо пропускать
-    гейт троттлинга/простоя."""
+    """CLI-диспетчер: `gate` | `measure` | `github-rate-limit` — ТРИ шага
+    одного job'а (quota-watch.yml), см. докстринг модуля. `github-rate-limit`
+    (#1100) — отдельный шаг, БЕЗ CF-гейта (см. github_rate_limit_main).
+    Явные подкоманды, а не дефолт на «измерять» — ошибка вызова обязана быть
+    громкой, а не тихо пропускать гейт троттлинга/простоя."""
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["gate"]:
         return gate_main()
     if argv == ["measure"]:
         return measure_main()
-    print(f"::error::quota_watch: использование: quota_watch.py gate|measure (получено {argv!r})",
-          file=sys.stderr)
+    if argv == ["github-rate-limit"]:
+        return github_rate_limit_main()
+    print(f"::error::quota_watch: использование: quota_watch.py gate|measure|github-rate-limit "
+          f"(получено {argv!r})", file=sys.stderr)
     return 2
 
 
