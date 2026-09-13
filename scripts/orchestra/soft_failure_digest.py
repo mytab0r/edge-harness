@@ -5,8 +5,8 @@
 Эталон класса (#1097): быстрый провайдер Claude падал `NO_ADAPTER` на КАЖДОМ
 прогоне worker.yml полтора месяца — прогон зелёный (система штатно
 деградировала на медленный GLM), находка — `::warning::`-аннотация, которую
-никто не читал. Прочёс 2026-09-13 (#1121) нашёл ещё шесть живых экземпляров
-того же класса: `rate_limit_retry_budget_exceeded` (провайдер жрёт общий
+никто не читал. Прочёс 2026-09-13 (#1121) нашёл ещё семь работающих экземпляров
+того же класса (пп.1-7 задачи), в том числе: `rate_limit_retry_budget_exceeded` (провайдер жрёт общий
 бюджет ожидания), красный шаг гвардии `blocked` под `continue-on-error`
 (job зелёный, шаг красный), красная e2e-канарейка морды (недетерминированный
 гейт), автооткат прода — no-op, но рапортует успех (шаг «успешен», хотя
@@ -279,6 +279,52 @@ def step_display_name(step: dict) -> str:
     return f"Run {uses}" if uses else "?"
 
 
+def load_workflow_layout(workflow_path: Path) -> dict[str, dict]:
+    """Раскладка исходника workflow для канала B:
+
+    ``{job_key: {"display": имя в Jobs API, "conditional": {имена шагов с `if:`}}}``
+
+    Ключ — YAML-ключ job'а; ``display`` — имя, под которым job виден в
+    Jobs API (`GET /runs/{id}/jobs` → `job.name`): без матрицы это
+    `job.name` из исходника, а без него — сам YAML-ключ; с матрицей GitHub
+    показывает ``"<display> (<значения матрицы через запятую>)"``. Сегодня
+    пять workflow дайджеста не переопределяют `name:` и не несут матрицы —
+    ключ совпадает с именем API; переименование не должно замалчиваться
+    (чеклист ревью PR #1136), поэтому расхождение ловит `match_job_key` и
+    вызывающий код печатает наблюдение."""
+    try:
+        doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    result: dict[str, dict] = {}
+    for job_key, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        steps = [step for step in (job.get("steps") or []) if isinstance(step, dict)]
+        conditional = {
+            step_display_name(step) for step in steps if "if" in step
+        }
+        display = job.get("name") or job_key
+        result[job_key] = {"display": display, "conditional": conditional}
+    return result
+
+
+def match_job_key(layout: dict[str, dict], api_name: str) -> str | None:
+    """YAML-ключ job'а по имени из Jobs API — exact или матричная форма
+    ``"<display> ("`` (см. `load_workflow_layout`). None — имя не сопоставилось
+    НИ С ОДНИМ job'ом исходника; вызывающий код обязан напечатать об этом
+    громкое наблюдение, а не молча пропустить (чеклист ревью PR #1136:
+    сопоставление, молчащее при расхождении, — тот же silent-wrong, против
+    которого построен канал B)."""
+    for job_key, job in layout.items():
+        display = job["display"]
+        if api_name == display or api_name.startswith(f"{display} ("):
+            return job_key
+    return None
+
+
 def load_conditional_steps(workflow_path: Path) -> dict[str, set[str]]:
     """{job_name: {имя шага, ...}} — ТОЛЬКО шаги, несущие явный `if:` в
     исходнике workflow. Канал B обязан ограничиваться этим множеством —
@@ -520,6 +566,7 @@ def collect_window(
     observations: list[str] = []
     step_conclusions: dict[tuple, list] = {}
     workflows_ok = 0
+    workflows_read: list[str] = []
 
     for workflow in workflows:
         # Локальное чтение (0 сетевых вызовов) — какие шаги ЭТОГО workflow
@@ -527,13 +574,21 @@ def collect_window(
         # докстринг load_conditional_steps — иначе безусловный шаг,
         # пропущенный лишь из-за раннего обрыва job'а, ложно считается
         # «условным»).
-        conditional_steps = load_conditional_steps(REPO_ROOT / ".github" / "workflows" / workflow)
+        layout = load_workflow_layout(REPO_ROOT / ".github" / "workflows" / workflow)
+        conditional_steps = {k: job["conditional"] for k, job in layout.items()}
+        # Чеклист ревью PR #1136: у workflow без единого `if:`-шага канал B
+        # выродился бы в вызов fetch_jobs на КАЖДЫЙ прогон с выброшенным
+        # результатом (worker.yml/hands.yml: ~24 лишних вызова за скан только
+        # по worker) — канал B для него отключается, канал A не трогается.
+        channel_b_enabled = any(conditional_steps.values())
         try:
             runs = fetch_runs(repo, workflow, since)
         except RuntimeError as error:
             observations.append(f"⚠️ soft-failure-digest {workflow}: список прогонов не прочитан ({error})")
             continue
         workflows_ok += 1
+        workflows_read.append(workflow)
+        unmatched_jobs: set[str] = set()
         for run in runs:
             run_time = parse_time(run["updated_at"])
             run_url = run.get("html_url", "")
@@ -559,6 +614,8 @@ def collect_window(
                         groups, workflow, job_name, level,
                         annotation.get("message") or "", run_time, run_url)
 
+            if not channel_b_enabled:
+                continue
             try:
                 jobs = fetch_jobs(repo, run)
             except RuntimeError as error:
@@ -566,7 +623,16 @@ def collect_window(
                 continue
             for job in jobs:
                 job_name = job.get("name", "?")
-                allowed_steps = conditional_steps.get(job_name, set())
+                job_key = match_job_key(layout, job_name)
+                if job_key is None:
+                    # Чеклист ревью PR #1136: job из Jobs API, не сопоставленный
+                    # ни с одним job'ом исходника (переименовали, добавили
+                    # `name:` или матрицу), раньше пропускался молча — канал B
+                    # просто «не находил» шаги. Теперь громкое наблюдение
+                    # (одно на workflow за скан), не тишина.
+                    unmatched_jobs.add(job_name)
+                    continue
+                allowed_steps = conditional_steps.get(job_key, set())
                 for step in job.get("steps") or []:
                     step_name = step.get("name", "?")
                     if step_name not in allowed_steps:
@@ -574,12 +640,18 @@ def collect_window(
                     conclusion = step.get("conclusion")
                     if conclusion is None:
                         continue
-                    key = (workflow, job_name, step_name)
+                    key = (workflow, job_key, step_name)
                     step_conclusions.setdefault(key, []).append(
                         {"conclusion": conclusion, "run_time": run_time, "run_url": run_url})
+        for job_name in sorted(unmatched_jobs):
+            observations.append(
+                f"⚠️ soft-failure-digest {workflow}: job «{job_name}» из Jobs API не "
+                "сопоставлен ни с одним job'ом исходника — канал B для него пропущен "
+                "(переименован в YAML? см. match_job_key)")
 
     add_step_occurrences(groups, step_conclusions)
-    stats = {"workflows_total": len(workflows), "workflows_ok": workflows_ok}
+    stats = {"workflows_total": len(workflows), "workflows_ok": workflows_ok,
+             "workflows_read": workflows_read}
     return groups, observations, stats
 
 
@@ -602,11 +674,23 @@ def digest_due(repo: str, now: datetime, interval_hours: float = DIGEST_INTERVAL
     return (now - max(times)).total_seconds() / 60 >= interval_hours * 60
 
 
-def mark_heartbeat(repo: str, now: datetime) -> None:
+def mark_heartbeat(repo: str, now: datetime, unread: list[str] | None = None) -> None:
+    """Чеклист ревью PR #1136: частичный провал (например, вечный 404 на
+    переименованный workflow) раньше закрывал гейт heartbeat'ом, а сам факт
+    выпадения жил одной ⚠️-строкой в step summary, которую механически никто
+    не читает — ровно класс «наблюдатель не смог посмотреть, но молчит
+    зелёным». Теперь непрочитанные workflow НАЗВАНЫ в самом heartbeat'е —
+    единственном месте, которое гейт цикла читает гарантированно."""
+    suffix = ""
+    if unread:
+        suffix = (
+            "\nНепрочитаны в этом скане (сбой чтения; до самозалечивания окном "
+            f"{DIGEST_WINDOW_HOURS}ч классы этих workflow вне покрытия): "
+            + ", ".join(unread))
     post_issue_comment(
         repo, WATCHDOG_ISSUE,
         f"{DIGEST_HEARTBEAT_MARKER} {now.isoformat()}]\n"
-        "soft-failure-digest: очередной полный скан выполнен.")
+        "soft-failure-digest: очередной полный скан выполнен." + suffix)
 
 
 # ── Дедуп/эскалация — по ОТКРЫТЫМ issues SOFT_FAILURE_LABEL, не по #120 ──────
@@ -720,7 +804,8 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
         title = digest_task_title(group)
         body = digest_task_body(group, fp)
         try:
-            created = pool_issue.create_pool_issue(gh, repo, title, body, ["task", SOFT_FAILURE_LABEL])
+            created = pool_issue.create_pool_issue(gh, repo, title, body,
+                                                ["task", SOFT_FAILURE_LABEL, "area:orchestra"])
         except RuntimeError as error:
             observations.append(f"⚠️ soft-failure-digest: класс {fp} не заведён ({error})")
             continue
@@ -807,8 +892,9 @@ def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str],
     esc_obs, actions = escalate_groups(repo, ranked, now)
     observations += esc_obs
 
+    unread = [w for w in DIGEST_WORKFLOWS if w not in stats["workflows_read"]]
     try:
-        mark_heartbeat(repo, now)
+        mark_heartbeat(repo, now, unread=unread)
     except RuntimeError as error:
         observations.append(f"⚠️ soft-failure-digest: heartbeat в #{WATCHDOG_ISSUE} не оставлен ({error})")
 

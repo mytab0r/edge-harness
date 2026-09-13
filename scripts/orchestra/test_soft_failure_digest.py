@@ -415,21 +415,25 @@ def test_collect_window_end_to_end_finds_no_adapter_and_conditional_rollback(mon
         routes.append((f"actions/runs/{200 + i}/jobs", jobs_for(conclusion)))
     routes.append(("check-runs/1/annotations", [REAL_NO_ADAPTER_ANNOTATION]))
 
-    # load_conditional_steps читает РЕАЛЬНЫЙ файл workflow с диска (0 сетевых
+    # load_workflow_layout читает РЕАЛЬНЫЙ файл workflow с диска (0 сетевых
     # вызовов) — в тесте изолируем от содержимого настоящих .github/
     # workflows/*.yml (иначе тест ломается при любой правке реальных
     # workflow-файлов, не относящейся к этому коду): подставляем фиксированный
     # набор условных шагов для тестового workflow.
-    monkeypatch.setattr(
-        sfd, "load_conditional_steps",
-        lambda path: {"deploy": {"Автооткат прода"}} if "deploy-dsh-edge" in str(path) else {})
+    def fake_layout(path):
+        if "deploy-dsh-edge" in str(path):
+            return {"deploy": {"display": "deploy", "conditional": {"Автооткат прода"}}}
+        return {}
+
+    monkeypatch.setattr(sfd, "load_workflow_layout", fake_layout)
 
     fake = FakeGh(routes)
     patch_gh(monkeypatch, fake)
 
     groups, observations, stats = sfd.collect_window(REPO, NOW)
     assert observations == []
-    assert stats == {"workflows_total": 5, "workflows_ok": 5}
+    assert stats == {"workflows_total": 5, "workflows_ok": 5,
+                     "workflows_read": list(sfd.DIGEST_WORKFLOWS)}
     # Канал A (аннотации): 3 прогона worker.yml несут одну и ту же аннотацию
     # NO_ADAPTER — над порогом 3, попадает в эскалацию.
     ranked = sfd.groups_over_threshold(groups, threshold=3)
@@ -598,3 +602,116 @@ def test_soft_failure_digest_total_read_failure_is_not_empty_groups(monkeypatch)
     assert not any(o == "Группы не найдены (окно пусто или без аннотаций/условных шагов)."
                    for o in observations)
     assert not any("-X POST" in c and "issues/120/comments" in c for c in fake.calls)  # heartbeat не писан
+
+
+# ── Чеклист ревью PR #1136: сопоставление job'ов, пропуск пустого канала B ──
+
+
+def test_load_workflow_layout_carries_display_and_conditional(tmp_path):
+    workflow_text = """
+jobs:
+  build:
+    name: Собрать образ
+    steps:
+      - name: Верно
+        if: failure()
+        run: echo hi
+  plain:
+    steps:
+      - run: echo always
+"""
+    path = tmp_path / "w.yml"
+    path.write_text(workflow_text, encoding="utf-8")
+    layout = sfd.load_workflow_layout(path)
+    assert layout["build"]["display"] == "Собрать образ"
+    assert layout["build"]["conditional"] == {"Верно"}
+    assert layout["plain"]["display"] == "plain"
+    assert layout["plain"]["conditional"] == set()
+
+
+def test_match_job_key_exact_display_and_matrix_form():
+    layout = {"build": {"display": "Собрать образ", "conditional": {"x"}},
+              "deploy": {"display": "deploy", "conditional": {"y"}}}
+    assert sfd.match_job_key(layout, "deploy") == "deploy"
+    # Матрица: Jobs API показывает «<display> (<значения>)».
+    assert sfd.match_job_key(layout, "Собрать образ (ubuntu-latest, 3.12)") == "build"
+    assert sfd.match_job_key(layout, "deploy ( Arms )") == "deploy"
+    assert sfd.match_job_key(layout, "никто не знает") is None
+    # «Собрать» не совпадает с «Собрать образ» без матричной скобки.
+    assert sfd.match_job_key(layout, "Собрать") is None
+
+
+def test_collect_window_unmatched_job_is_loud_not_silent(monkeypatch):
+    """Чеклист ревью PR #1136: job из Jobs API, не сопоставленный ни с одним
+    job'ом исходника (переименовали в YAML, добавили `name:`), раньше
+    пропускался молча — канал B просто «не находил» шаги. Теперь это громкое
+    наблюдение (одно на workflow за скан), не тишина."""
+    runs = {"workflow_runs": [make_run(300, "usha", 700, "workflow_dispatch", "success",
+                                       "2026-09-13T05:00:00Z")]}
+    routes = [
+        ("workflows/worker.yml/runs", runs),
+        ("commits/usha/check-runs", {"check_runs": []}),
+        ("actions/runs/300/jobs", {"jobs": [{"name": "Переименованный job", "steps": [
+            {"name": "Условный шаг", "conclusion": "success"}]}]}),
+    ] + [
+        (f"workflows/{w}/runs", {"workflow_runs": []})
+        for w in ("hands.yml", "ai-review.yml", "orchestra.yml", "deploy-dsh-edge.yml")
+    ]
+    monkeypatch.setattr(sfd, "load_workflow_layout",
+                        lambda path: ({"old": {"display": "old", "conditional": {"Условный шаг"}}}
+                                      if "worker" in str(path) else {}))
+    fake = FakeGh(routes)
+    patch_gh(monkeypatch, fake)
+
+    groups, observations, stats = sfd.collect_window(REPO, NOW)
+    assert stats["workflows_ok"] == 5
+    assert groups == {}
+    warnings = [line for line in observations if "не сопоставлен" in line]
+    assert len(warnings) == 1 and "Переименованный job" in warnings[0]
+
+
+def test_collect_window_skips_fetch_jobs_when_no_conditional_steps(monkeypatch):
+    """Чеклист ревью PR #1136: workflow без единого `if:`-шага (worker.yml,
+    hands.yml) не должен тратить вызов jobs на КАЖДЫЙ прогон с выброшенным
+    результатом — канал B для него отключён, канал A работает."""
+    runs = {"workflow_runs": [
+        make_run(400 + i, f"wsha{i}", 600 + i, "workflow_dispatch", "success",
+                 f"2026-09-13T0{i}:30:00Z")
+        for i in range(2)
+    ]}
+    routes = [
+        ("workflows/worker.yml/runs", runs),
+        ("commits/wsha0/check-runs", {"check_runs": []}),
+        ("commits/wsha1/check-runs", {"check_runs": []}),
+        ("actions/runs/400/jobs", {"jobs": [{"name": "task", "steps": []}]}),
+        ("actions/runs/401/jobs", {"jobs": [{"name": "task", "steps": []}]}),
+    ] + [
+        (f"workflows/{w}/runs", {"workflow_runs": []})
+        for w in ("hands.yml", "ai-review.yml", "orchestra.yml", "deploy-dsh-edge.yml")
+    ]
+    monkeypatch.setattr(sfd, "load_workflow_layout", lambda path: {})
+    fake = FakeGh(routes)
+    patch_gh(monkeypatch, fake)
+
+    groups, observations, stats = sfd.collect_window(REPO, NOW)
+    assert stats["workflows_ok"] == 5
+    jobs_calls = [c for c in fake.calls if "/jobs" in c]
+    assert jobs_calls == [], "для workflow без условных шагов fetch_jobs не зовётся"
+
+
+def test_mark_heartbeat_lists_unread_workflows(monkeypatch):
+    """Чеклист ревью PR #1136: при частичном провале непрочитанные workflow
+    названы в САМОМ heartbeat'е, а не только ⚠️-строкой в step summary, —
+    heartbeat читает гейт цикла гарантированно, step summary — никто."""
+    posted: list[str] = []
+
+    def fake_post(repo, issue, body):
+        posted.append(body)
+        return {"id": 1}
+
+    monkeypatch.setattr(sfd, "post_issue_comment", fake_post)
+    sfd.mark_heartbeat(REPO, NOW, unread=["worker.yml"])
+    assert len(posted) == 1
+    assert "Непрочитаны" in posted[0] and "worker.yml" in posted[0]
+    sfd.mark_heartbeat(REPO, NOW)
+    assert "Непрочитаны" not in posted[1]
