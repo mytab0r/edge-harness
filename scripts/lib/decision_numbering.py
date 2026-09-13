@@ -14,8 +14,10 @@ PR #1035 занял номер 0017, уже слитый в main другим AD
 другой носитель (ручные int-константы в одном файле, не каталог
 пронумерованных файлов), уже заведён отдельной задачей.
 
-Устройство (design.md этого change, `openspec/changes/
-decision-doc-numbering-guard/design.md`):
+Устройство (design.md change `decision-doc-numbering-guard` — путь не называем
+дословно: `archive_complete_changes.py` переносит завершённые change в
+`openspec/changes/archive/<id>/`, дословный путь тут же стал бы мёртвым;
+ищи по имени change в `openspec/changes/` или `openspec/changes/archive/`):
 
   - `NUMBERED_ROOTS` — единственное место, знающее оба носителя одного
     класса и ширину номера каждого.
@@ -90,13 +92,24 @@ def numbered_filename_re(width: int) -> "re.Pattern":
     return re.compile(rf"^(\d{{{width}}})-.+\.md$")
 
 
-def parse_numbered_files(paths, root: str, width: int) -> dict[str, str]:
-    """paths — репо-относительные POSIX-пути. Возвращает {номер: имя_файла}
+def parse_numbered_files(paths, root: str, width: int) -> dict[str, list[str]]:
+    """paths — репо-относительные POSIX-пути. Возвращает {номер: [имена_файлов]}
     для файлов ПРЯМО под `root` (docs/research/data/*.md — не «прямо под»,
-    игнорируется: поддиректория не участвует в этой нумерации)."""
+    игнорируется: поддиректория не участвует в этой нумерации).
+
+    Значение — СПИСОК, не строка (находка ai-review PR #1082): прежняя форма
+    `dict[str, str]` схлопывала два файла с ОДНИМ номером внутри одного и
+    того же источника — `result[номер] = имя` вторым присваиванием тихо
+    затирала первое. Живой класс, который это прячет: main САМ может нести
+    два файла под одним номером (после слияния двух PR, независимо занявших
+    один свободный номер разными именами — ни один git-конфликт этого не
+    покажет, пути разные). Раньше `find_number_collisions` в этом случае
+    видел `{'0017': <последний>}` и молчал; список сохраняет оба имени, и
+    `find_number_collisions` (ниже) считает дублей внутри ОДНОГО источника
+    точно так же, как дублей между разными источниками — тот же признак."""
     pattern = numbered_filename_re(width)
     prefix = root.rstrip("/") + "/"
-    result: dict[str, str] = {}
+    result: dict[str, list[str]] = {}
     for path in paths:
         if not path.startswith(prefix):
             continue
@@ -106,7 +119,7 @@ def parse_numbered_files(paths, root: str, width: int) -> dict[str, str]:
         match = pattern.match(rest)
         if not match:
             continue
-        result[match.group(1)] = rest
+        result.setdefault(match.group(1), []).append(rest)
     return result
 
 
@@ -118,11 +131,12 @@ def next_free_number(existing_numbers, width: int) -> str:
     return str(candidate).zfill(width)
 
 
-def find_number_collisions(sources: dict[str, dict[str, str]]) -> list[dict]:
-    """`sources`: {имя_источника: {номер: имя_файла}} — например
+def find_number_collisions(sources: dict[str, dict[str, list[str]]]) -> list[dict]:
+    """`sources`: {имя_источника: {номер: [имена_файлов]}} — например
     {"main": {...}, "PR #1035": {...}, "PR #1040": {...}}.
 
-    Коллизия — номер, под который в разных источниках подставлены РАЗНЫЕ
+    Коллизия — номер, под который (в разных источниках ИЛИ внутри ОДНОГО
+    источника — см. докстринг `parse_numbered_files`) подставлены РАЗНЫЕ
     имена файлов. Тот же номер + то же имя в main и в PR, который лишь
     редактирует существующий файл, — НЕ коллизия (одна запись имени). Два PR
     добавляют файл с ОДИНАКОВЫМ именем под одним номером — тоже НЕ коллизия
@@ -131,8 +145,9 @@ def find_number_collisions(sources: dict[str, dict[str, str]]) -> list[dict]:
     раздел «Устройство»)."""
     by_number: dict[str, dict[str, list[str]]] = {}
     for source_name, mapping in sources.items():
-        for number, filename in mapping.items():
-            by_number.setdefault(number, {}).setdefault(filename, []).append(source_name)
+        for number, filenames in mapping.items():
+            for filename in filenames:
+                by_number.setdefault(number, {}).setdefault(filename, []).append(source_name)
 
     violations = []
     for number, by_filename in sorted(by_number.items()):
@@ -196,7 +211,7 @@ def ls_tree_files_under_root(local_name: str, root: str, cwd=None) -> list[str]:
 
 def added_files_under_root(base_local_name: str, local_name: str, root: str, cwd=None) -> list[str]:
     """Файлы, которые `local_name` ДОБАВИЛ относительно `base_local_name`
-    (git diff --diff-filter=A, тройная точка — против merge-base, не против
+    (git diff --diff-filter=AR, тройная точка — против merge-base, не против
     текущей головы base: PR, отставший от main, не должен казаться
     «удалившим» файлы, которые main добавил ПОСЛЕ того, как PR ответвился).
 
@@ -207,12 +222,22 @@ def added_files_under_root(base_local_name: str, local_name: str, root: str, cwd
     посторонних открытых PR репозитория оказались бы «замешаны» в номере
     0017 только потому, что содержат уже слитый `0017-dsh-edge-pr-smoke-
     local-worker.md`, хотя реальный виновник — ровно один PR (#944),
-    добавивший СВОЙ, другой файл под тем же номером."""
+    добавивший СВОЙ, другой файл под тем же номером.
+
+    `R` (rename) — не только `A` (находка ai-review PR #1082): PR, который
+    ПЕРЕИМЕНОВАЛ унаследованный файл (например, переномеровал его же ADR),
+    у git это `R100 старый\tновый`, не `A новый` — при фильтре `--diff-
+    filter=A` такое переименование было бы НЕВИДИМО для этой функции: сам
+    факт, что PR теперь претендует на новый номер, потерялся бы. `git diff
+    --name-status` отдаёт для рядов `R`/`C` ТРИ поля (статус с процентом
+    схожести, старый путь, новый путь), а не два, как у `A`/`M`/`D` — берём
+    ПОСЛЕДНЕЕ поле (актуальный путь после переименования) независимо от
+    числа полей."""
     out = run_git(
-        "diff", "--name-status", "--diff-filter=A",
+        "diff", "--name-status", "--diff-filter=AR",
         f"{_local_ref(base_local_name)}...{_local_ref(local_name)}", "--", root, cwd=cwd,
     )
-    return [line.split("\t", 1)[1] for line in out.splitlines() if line.strip()]
+    return [line.split("\t")[-1] for line in out.splitlines() if line.strip()]
 
 
 def collect_sources_from_refs(
@@ -308,7 +333,7 @@ def cmd_next(repo: str, root: str, cwd=None) -> str:
     return next_free_number(all_numbers, width)
 
 
-def cmd_check(repo: str, roots: list[str], cwd=None) -> list[str]:
+def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | None]:
     """Красит только тот прогон, чья ВЕТКА реально участвует в найденной
     коллизии (self_source_name) — иначе один зависший PR с чужой коллизией
     (живой случай на 2026-09-13: PR #944 занял номер 0017, уже слитый в main
@@ -318,19 +343,56 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> list[str]:
     принимается»). Прогон, чью ветку определить не удалось (ручной запуск
     вне Actions, `current_branch() is None`) — репортит ВСЕ найденные
     коллизии не сужая (честный дефолт «не знаю → покажи всё», не «не знаю →
-    молчи»)."""
+    молчи»).
+
+    Возвращает `(строки_нарушений, self_name)` — второй элемент нужен ТОЛЬКО
+    вызывающему коду (CLI `main`) для честного сообщения об успехе: «коллизий
+    нет» при пустом `self_name` (проверка не сужалась, значит их нет вообще)
+    — не то же самое, что «коллизий, касающихся ЭТОЙ ветки, нет» при известном
+    `self_name` (у посторонних PR они, возможно, есть — просто не в этом
+    прогоне). Находка ai-review PR #1082: старое сообщение «коллизий номеров
+    нет» одинаково печаталось в обоих случаях — ложь во втором."""
     lines = []
+    refs = build_refs(repo)
+    self_name = self_source_name(refs)
     for root in roots:
         width = NUMBERED_ROOTS[root]
-        refs = build_refs(repo)
         sources = collect_sources_from_refs(refs, root, width, cwd=cwd)
-        self_name = self_source_name(refs)
         for violation in find_number_collisions(sources):
             involved = {src for occ in violation["occurrences"] for src in occ["sources"]}
             if self_name is not None and self_name not in involved:
                 continue
             lines.append(format_violation(root, violation))
-    return lines
+    return lines, self_name
+
+
+def check_decision_doc_number_collisions(repo: str, cwd=None) -> list[dict]:
+    """Обвязка, готовая для `repo_invariants.py` (класс — AGENTS.md,
+    «Инцидент оставляет инвариант, а не только фикс»; находка ai-review
+    PR #1082, блокирующая 2). НЕ подключена туда ЭТИМ PR намеренно: на
+    момент PR #1082 `repo_invariants.py`/`test_repo_invariants.py`
+    параллельно правит PR #1076 (ADR 0016, «конкуренция за код не
+    устраняется приёмом регистрации» — тот же класс, что описывает сама эта
+    функция, только для другого носителя). Подключение — отдельная узкая
+    задача #1090, одна строка
+    `from decision_numbering import check_decision_doc_number_collisions` +
+    один вызов в `build_report()`, после того как #1076 сольётся.
+
+    ГВАРДИЯ каталога (`decision-doc-numbering-guard.sh`) ловит коллизию
+    только на push/PR — вердикт привязан к head; PR, позеленевший, пока
+    номер был свободен, остаётся зелёным, даже если конкурент СЛИЛСЯ и занял
+    номер первым ПОСЛЕ этого прогона (дрейф состояния без нового коммита —
+    ровно класс, под который заведён 15-минутный инвариант `orchestra.yml`).
+
+    Возвращает violations в форме, годной для `escalate_if_new`/`build_report`
+    того файла: `{"root": ..., "number": ..., "occurrences": [...]}` — то же,
+    что `find_number_collisions`, плюс `root`."""
+    violations = []
+    for root, width in NUMBERED_ROOTS.items():
+        sources = collect_sources(repo, root, width, cwd=cwd)
+        for violation in find_number_collisions(sources):
+            violations.append({**violation, "root": root})
+    return violations
 
 
 def _repo_from_env() -> str:
@@ -358,12 +420,18 @@ def main(argv: list[str]) -> int:
         if unknown:
             print(f"неизвестный корень: {unknown}", file=sys.stderr)
             return 2
-        violations = cmd_check(repo, roots)
+        violations, self_name = cmd_check(repo, roots)
         if violations:
             for line in violations:
                 print(f"::error::{line}")
             return 1
-        print("decision_numbering: коллизий номеров нет")
+        if self_name is None:
+            print("decision_numbering: коллизий номеров нет")
+        else:
+            print(
+                f"decision_numbering: коллизий, касающихся {self_name}, нет "
+                "(у других открытых PR они могли не проверяться этим прогоном)"
+            )
         return 0
     print(f"неизвестная команда: {command}", file=sys.stderr)
     return 2

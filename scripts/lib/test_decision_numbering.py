@@ -15,6 +15,13 @@ rebase.py::build_origin` — AGENTS.md, «поведенческий тест н
      refs` — `test_collect_sources_from_refs_reads_real_git_trees` падает
      на `GitError` (локальный реф `refs/decision-numbering/...` не создан
      фетчем, `ls-tree` не находит его).
+  3. Вернуть `parse_numbered_files` к форме `dict[str, str]` (перезапись
+     последним, без списка) — `test_intra_source_duplicate_is_detected_on_
+     real_git` падает: main после «слияния» двух коллидирующих PR теряет
+     один из двух файлов под номером 0017, коллизия не находится.
+  4. Вернуть `added_files_under_root` к `--diff-filter=A` (без `R`) —
+     `test_rename_of_inherited_file_is_visible_as_added` падает: переномерованный
+     файл пропадает из набора источника целиком.
 
 Запуск: python -m pytest scripts/lib/test_decision_numbering.py -q
 """
@@ -48,13 +55,28 @@ def test_parse_numbered_files_matches_files_directly_under_root():
         "docs/research/00-context.md",  # чужой корень — игнор
     ]
     parsed = dn.parse_numbered_files(paths, "docs/decisions", 4)
-    assert parsed == {"0001": "0001-a.md", "0016": "0016-b.md"}
+    assert parsed == {"0001": ["0001-a.md"], "0016": ["0016-b.md"]}
 
 
 def test_parse_numbered_files_ignores_files_in_subdirectory():
     paths = ["docs/research/data/33-not-directly-under-root.md"]
     parsed = dn.parse_numbered_files(paths, "docs/research", 2)
     assert parsed == {}
+
+
+def test_parse_numbered_files_keeps_both_names_for_duplicate_number():
+    """Находка ai-review PR #1082, блокирующая 1: раньше второе присваивание
+    тихо затирало первое (`dict[str, str]`) — список сохраняет оба имени,
+    ничего не теряется молча."""
+    paths = [
+        "docs/decisions/0017-dsh-edge-pr-smoke-local-worker.md",
+        "docs/decisions/0017-delayed-branch-deletion-not-delete-on-merge.md",
+    ]
+    parsed = dn.parse_numbered_files(paths, "docs/decisions", 4)
+    assert parsed == {"0017": [
+        "0017-dsh-edge-pr-smoke-local-worker.md",
+        "0017-delayed-branch-deletion-not-delete-on-merge.md",
+    ]}
 
 
 def test_next_free_number_empty_set_starts_at_one():
@@ -67,8 +89,8 @@ def test_next_free_number_is_max_plus_one():
 
 def test_find_number_collisions_same_number_same_file_across_sources_is_fine():
     sources = {
-        "main": {"0016": "0016-parallel-work.md"},
-        "PR #900": {"0016": "0016-parallel-work.md"},  # PR лишь редактирует существующий
+        "main": {"0016": ["0016-parallel-work.md"]},
+        "PR #900": {"0016": ["0016-parallel-work.md"]},  # PR лишь редактирует существующий
     }
     assert dn.find_number_collisions(sources) == []
 
@@ -77,9 +99,9 @@ def test_two_open_prs_claiming_the_same_number_is_a_collision():
     """Живой класс #1078: два независимых PR берут один и тот же свободный
     номер под РАЗНЫЕ имена файлов."""
     sources = {
-        "main": {"0016": "0016-parallel-work-on-shared-code-boundaries.md"},
-        "PR #1035": {"0017": "0017-stalled-pr-merge-conflict-triage.md"},
-        "PR #1040": {"0017": "0017-something-else-entirely.md"},
+        "main": {"0016": ["0016-parallel-work-on-shared-code-boundaries.md"]},
+        "PR #1035": {"0017": ["0017-stalled-pr-merge-conflict-triage.md"]},
+        "PR #1040": {"0017": ["0017-something-else-entirely.md"]},
     }
     violations = dn.find_number_collisions(sources)
     assert violations != []
@@ -95,10 +117,31 @@ def test_two_prs_adding_identical_filename_is_not_flagged_here():
     """Тот же путь в двух PR — add/add-конфликт, который решит git при
     ребейзе; эта гвардия про РАЗНЫЕ имена под одним номером, не про это."""
     sources = {
-        "PR #1": {"0020": "0020-same-name.md"},
-        "PR #2": {"0020": "0020-same-name.md"},
+        "PR #1": {"0020": ["0020-same-name.md"]},
+        "PR #2": {"0020": ["0020-same-name.md"]},
     }
     assert dn.find_number_collisions(sources) == []
+
+
+def test_find_number_collisions_flags_duplicate_within_a_single_source():
+    """Находка ai-review PR #1082, блокирующая 1: коллизия ВНУТРИ одного
+    источника (main САМ несёт два файла под одним номером — ровно то, что
+    получится в main сразу после слияния двух независимо коллидирующих PR)
+    обязана находиться тем же механизмом, что и коллизия между источниками."""
+    sources = {
+        "main": {"0017": [
+            "0017-dsh-edge-pr-smoke-local-worker.md",
+            "0017-delayed-branch-deletion-not-delete-on-merge.md",
+        ]},
+    }
+    violations = dn.find_number_collisions(sources)
+    assert len(violations) == 1
+    assert violations[0]["number"] == "0017"
+    filenames = {occ["filename"] for occ in violations[0]["occurrences"]}
+    assert filenames == {
+        "0017-dsh-edge-pr-smoke-local-worker.md",
+        "0017-delayed-branch-deletion-not-delete-on-merge.md",
+    }
 
 
 # ── Реальный git: bare "origin" + рабочий клон, как actions/checkout@v7 ─────
@@ -145,7 +188,7 @@ def build_origin_with_number_collision(tmp_path) -> Path:
     return origin
 
 
-def clone_workdir(origin: Path, tmp_path: Path) -> Path:
+def clone_workdir(origin: Path, tmp_path: Path, branch: str = "agent/1035-pr-conflict-triage") -> Path:
     # Однобранчевый неглубокий клон — тот же профиль, что actions/checkout@v7
     # на PR-прогоне (только текущая ветка). Остальные ссылки (main, чужие PR)
     # ДОЛЖНЫ прийти явным fetch_refs — если бы тест клонировал все ветки
@@ -153,7 +196,7 @@ def clone_workdir(origin: Path, tmp_path: Path) -> Path:
     # фетчит» от «данные и так были локально».
     work = tmp_path / "work"
     subprocess.run(
-        ["git", "clone", "--branch", "agent/1035-pr-conflict-triage", "--single-branch", "--depth", "1",
+        ["git", "clone", "--branch", branch, "--single-branch", "--depth", "1",
          str(origin), str(work)],
         check=True, capture_output=True,
     )
@@ -174,10 +217,10 @@ def test_collect_sources_from_refs_reads_real_git_trees(tmp_path):
     }
     sources = dn.collect_sources_from_refs(refs, "docs/decisions", 4, cwd=work)
 
-    assert sources["main"] == {"0016": "0016-parallel-work.md", "0017": "0017-dsh-edge.md"}
-    assert sources["PR #1035"]["0019"] == "0019-stalled-pr-triage.md"
-    assert sources["PR #1040"]["0019"] == "0019-something-else.md"
-    assert sources["PR #1050"]["0020"] == "0020-clean.md"
+    assert sources["main"] == {"0016": ["0016-parallel-work.md"], "0017": ["0017-dsh-edge.md"]}
+    assert sources["PR #1035"]["0019"] == ["0019-stalled-pr-triage.md"]
+    assert sources["PR #1040"]["0019"] == ["0019-something-else.md"]
+    assert sources["PR #1050"]["0020"] == ["0020-clean.md"]
 
 
 def test_end_to_end_detects_live_1078_collision_on_real_git(tmp_path):
@@ -214,6 +257,82 @@ def test_collect_sources_from_refs_raises_git_error_on_unknown_branch(tmp_path):
 
     with pytest.raises(dn.GitError):
         dn.collect_sources_from_refs({"main": "does-not-exist"}, "docs/decisions", 4, cwd=work)
+
+
+def build_origin_with_intra_main_duplicate(tmp_path) -> Path:
+    """`main` САМ несёт два файла под одним номером — ровно состояние ПОСЛЕ
+    того, как два независимо коллидирующих PR оба слились (пути разные, git
+    не видит конфликта, слияние проходит тихо). Живой класс #1078 (третий
+    случай, PR #944 vs main), симулированный напрямую в main для теста
+    intra-source коллизии (ai-review PR #1082, блокирующая 1)."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=seed)
+    git("config", "user.name", "test", cwd=seed)
+    commit_file(
+        seed, "docs/decisions/0017-dsh-edge-pr-smoke-local-worker.md",
+        "# ADR 0017 (оригинал)\n", "main: adr 0017 оригинал",
+    )
+    commit_file(
+        seed, "docs/decisions/0017-delayed-branch-deletion-not-delete-on-merge.md",
+        "# ADR 0017 (чужой PR, слился без конфликта)\n", "main: слияние коллидирующего PR",
+    )
+    git("push", "-u", "origin", "main", cwd=seed)
+    return origin
+
+
+def test_intra_source_duplicate_is_detected_on_real_git(tmp_path):
+    origin = build_origin_with_intra_main_duplicate(tmp_path)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", str(origin), str(work)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=work)
+    git("config", "user.name", "test", cwd=work)
+
+    sources = dn.collect_sources_from_refs({"main": "main"}, "docs/decisions", 4, cwd=work)
+    violations = dn.find_number_collisions(sources)
+
+    assert len(violations) == 1
+    assert violations[0]["number"] == "0017"
+    filenames = {occ["filename"] for occ in violations[0]["occurrences"]}
+    assert filenames == {
+        "0017-dsh-edge-pr-smoke-local-worker.md",
+        "0017-delayed-branch-deletion-not-delete-on-merge.md",
+    }
+
+
+def build_origin_with_renamed_file(tmp_path) -> Path:
+    """main несёт 0016-*.md; PR-ветка ПЕРЕНОМЕРОВЫВАЕТ (git mv) унаследованный
+    файл в 0022-*.md, не создавая новый с нуля. Против `main` это `git diff
+    --name-status` статус `R100 старый\tновый`, не `A новый`."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=seed)
+    git("config", "user.name", "test", cwd=seed)
+    commit_file(seed, "docs/decisions/0016-old-name.md", "# ADR 0016, довольно длинный текст для схожести\n" * 5, "main: adr 0016")
+    git("push", "-u", "origin", "main", cwd=seed)
+
+    git("checkout", "-b", "agent/1060-renumber", cwd=seed)
+    git("mv", "docs/decisions/0016-old-name.md", "docs/decisions/0022-renumbered.md", cwd=seed)
+    git("commit", "-m", "agent/1060-renumber: renumber 0016 -> 0022", cwd=seed)
+    git("push", "-u", "origin", "agent/1060-renumber", cwd=seed)
+    return origin
+
+
+def test_rename_of_inherited_file_is_visible_as_added(tmp_path):
+    origin = build_origin_with_renamed_file(tmp_path)
+    work = clone_workdir(origin, tmp_path, branch="agent/1060-renumber")
+
+    sources = dn.collect_sources_from_refs(
+        {"main": "main", "PR #1060": "agent/1060-renumber"}, "docs/decisions", 4, cwd=work,
+    )
+
+    assert sources["PR #1060"] == {"0022": ["0022-renumbered.md"]}
+    # 0016 не должен всплыть у PR как «его собственный источник» — это main.
+    assert "0016" not in sources["PR #1060"]
 
 
 # ── collect_sources: тонкая обвязка gh (метаданные, не git) ─────────────────
@@ -258,9 +377,9 @@ def test_collect_sources_translates_open_pulls_into_refs(monkeypatch):
 def test_cmd_check_only_flags_violation_involving_current_branch(monkeypatch):
     refs = {"main": "main", "PR #944": "agent/940-artifact-retention", "PR #1035": "agent/1035-pr-conflict-triage"}
     sources = {
-        "main": {"0017": "0017-dsh-edge.md"},
-        "PR #944": {"0017": "0017-delayed-branch-deletion.md"},  # коллизия с main
-        "PR #1035": {"0019": "0019-triage.md"},  # ни с кем не конфликтует
+        "main": {"0017": ["0017-dsh-edge.md"]},
+        "PR #944": {"0017": ["0017-delayed-branch-deletion.md"]},  # коллизия с main
+        "PR #1035": {"0019": ["0019-triage.md"]},  # ни с кем не конфликтует
     }
     monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
     monkeypatch.setattr(dn, "collect_sources_from_refs", lambda r, root, width, cwd=None: sources)
@@ -268,26 +387,55 @@ def test_cmd_check_only_flags_violation_involving_current_branch(monkeypatch):
     # Прогон CI самого PR #1035 (не участвует в коллизии 0017) — обязан быть чист.
     monkeypatch.setenv("GITHUB_HEAD_REF", "agent/1035-pr-conflict-triage")
     monkeypatch.delenv("GITHUB_REF_NAME", raising=False)
-    assert dn.cmd_check("owner/repo", ["docs/decisions"]) == []
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
+    assert lines == []
+    assert self_name == "PR #1035"
 
     # Прогон CI виновника (PR #944) — обязан покраснеть.
     monkeypatch.setenv("GITHUB_HEAD_REF", "agent/940-artifact-retention")
-    lines = dn.cmd_check("owner/repo", ["docs/decisions"])
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
     assert len(lines) == 1
     assert "0017" in lines[0]
+    assert self_name == "PR #944"
 
 
 def test_cmd_check_reports_everything_when_branch_unknown(monkeypatch):
     refs = {"main": "main", "PR #944": "agent/940-artifact-retention"}
     sources = {
-        "main": {"0017": "0017-dsh-edge.md"},
-        "PR #944": {"0017": "0017-delayed-branch-deletion.md"},
+        "main": {"0017": ["0017-dsh-edge.md"]},
+        "PR #944": {"0017": ["0017-delayed-branch-deletion.md"]},
     }
     monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
     monkeypatch.setattr(dn, "collect_sources_from_refs", lambda r, root, width, cwd=None: sources)
     monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
     monkeypatch.delenv("GITHUB_REF_NAME", raising=False)
 
-    lines = dn.cmd_check("owner/repo", ["docs/decisions"])
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
 
     assert len(lines) == 1  # честный дефолт «не знаю → покажи всё», не «не знаю → молчи»
+    assert self_name is None
+
+
+# ── check_decision_doc_number_collisions: обвязка для repo_invariants.py ────
+#
+# НЕ подключена в repo_invariants.py этим PR (см. докстринг функции —
+# PR #1076 параллельно правит тот файл, класс ADR 0016). Тест проверяет
+# только саму обвязку — форму возврата, готовую для будущего подключения.
+
+
+def test_check_decision_doc_number_collisions_adds_root_to_each_violation(monkeypatch):
+    def fake_collect_sources(repo, root, width, cwd=None):
+        if root == "docs/decisions":
+            return {
+                "main": {"0017": ["0017-a.md"]},
+                "PR #944": {"0017": ["0017-b.md"]},
+            }
+        return {}
+
+    monkeypatch.setattr(dn, "collect_sources", fake_collect_sources)
+
+    violations = dn.check_decision_doc_number_collisions("owner/repo")
+
+    assert len(violations) == 1
+    assert violations[0]["root"] == "docs/decisions"
+    assert violations[0]["number"] == "0017"
