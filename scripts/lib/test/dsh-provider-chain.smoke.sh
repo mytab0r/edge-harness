@@ -108,6 +108,12 @@ dsh() {
           # переопределённой в проходной no-op (см. заголовок файла) — здесь
           # эмулируется РЕЗУЛЬТАТ настоящего таймаута напрямую кодом возврата.
           return 124 ;;
+        invalid-request-maxtokens)
+          # #1062, живой случай — прогон worker.yml 34730173870: наш
+          # config/provider-usage.json нёс неверный max_output_tokens для
+          # ЭТОЙ записи — дословная прод-форма Ollama Cloud.
+          echo "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra" >&2
+          return 1 ;;
         *)
           echo "::error::SMOKE: неизвестный режим $mode для $mode_var" >&2
           return 99 ;;
@@ -398,4 +404,26 @@ OUT="$(cat "$LOG")"
   || fail "15) недоказанный rc=124 обязан остаться в общей недиагностируемой ветке: $OUT"
 echo "SMOKE(chain): 15) rc=124 без подтверждения elapsed>=timeout -> не приписывается «нашему ножу» без доказательства (#880) — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880 зелёная"
+# ── 16) #1062, живой случай — прогон worker.yml 34730173870: наш собственный
+# конфиг (max_output_tokens в config/provider-usage.json) неверен для ОДНОЙ
+# записи — провайдер отвечает INVALID_REQUEST про max_tokens/лимит модели.
+# Это ошибка ПАРАМЕТРОВ ЗАПРОСА этой конкретной записи, не признак «дальше
+# пробовать бессмысленно» — цепочка обязана переключиться на следующего
+# (у него свой max_output_tokens), а сообщение обязано прямо назвать
+# «конфиг этого провайдера неверен», не раствориться в стоп-классе.
+reset_scenario
+SMOKE_MODE_primary_model="invalid-request-maxtokens"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log16.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "16) ожидался успех после INVALID_REQUEST/max_tokens у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "16) ожидался переход на SECONDARY при ошибке конфига PRIMARY, получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "16) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы"
+[[ "$OUT" == *"конфиг ЭТОГО провайдера неверен"* ]] \
+  || fail "16) сообщение обязано прямо назвать «конфиг этого провайдера неверен» (AGENTS.md, «возможность есть, но сломана»): $OUT"
+[[ "$OUT" != *"класс НЕ переключаемый"* ]] \
+  || fail "16) ошибка параметров запроса ОДНОГО провайдера не обязана останавливать цепочку: $OUT"
+echo "SMOKE(chain): 16) INVALID_REQUEST/max_tokens (наш конфиг неверен для этой записи) -> автопереход, не стоп-класс (#1062) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062 зелёная"
