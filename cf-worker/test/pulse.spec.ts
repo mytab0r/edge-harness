@@ -4,6 +4,7 @@ import {
   confirmPreviousRun,
   dshEdgeUpdateDecision,
   fetchLatestOrchestraRunId,
+  pulseAlertText,
   pulseDetailForRecord,
   pulseHealthy,
   pulseNeedsRecoveryDispatch,
@@ -393,6 +394,49 @@ describe("пульс оркестрации: pulseDetailForRecord — detail н�
     expect(pulseDetailForRecord({ ok: false, detail: "dispatch отклонён: 403" }, false)).toBe(
       "dispatch отклонён: 403",
     );
+  });
+});
+
+// Прямой юнит-тест содержимого алерта (находка ревью PR #1104): pulseAlertText
+// — экспортированная чистая функция, несущая ВЕСЬ смысл текста, который уходит
+// владельцу, но до этого места не была покрыта ни одним ассертом на само
+// содержимое (только на факт «sendMessage случился», см. pulse-alert.spec.ts).
+// Докажи мутацией: замени `lastPulse.detail ?? "причина не записана"` на
+// голое `lastPulse.detail` — тест «detail null → фраза-заглушка, не буквальный
+// null» ниже покраснеет.
+describe("пульс оркестрации: pulseAlertText — текст алерта живости (issue #1103)", () => {
+  it("называет конкретную причину этого тика (detail), не общую фразу", () => {
+    const text = pulseAlertText({ ts: NOW, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null });
+    expect(text).toContain("dispatch отклонён: 403");
+  });
+
+  it("detail null (теоретический вход — в проде недостижим, см. докстринг) — фраза-заглушка, не буквальный null", () => {
+    const text = pulseAlertText({ ts: NOW, dispatch_ok: true, detail: null, run_confirmed: null });
+    expect(text).not.toContain("null");
+    expect(text).toContain("причина не записана");
+  });
+
+  it("называет план: газ (частота повтора alarm) и порог эскалации на ручную проверку", () => {
+    const text = pulseAlertText({ ts: NOW, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null });
+    expect(text).toContain(`${HEARTBEAT.selfOrchestrationMs / 60_000}`);
+    expect(text).toContain("GH_DISPATCH_TOKEN");
+    expect(text).toMatch(/час/);
+  });
+
+  // Находка ревью PR #1104: раньше функция ветвилась по pulseStale(now, lastPulse)
+  // — недостижимая в проде ветка, потому что #tickPulseAlert всегда вызывает её
+  // на пульсе, который #recordPulse только что записал этим же тиком (ts: now).
+  // Символьная проверка того же факта: при ЛЮБОМ возрасте (в т.ч. заведомо
+  // «stale») текст определяется исключительно detail'ом, не возрастом.
+  it("не зависит от возраста пульса — определяется только detail'ом (пример недостижимости pulseStale-ветки)", () => {
+    const fresh = pulseAlertText({ ts: NOW, dispatch_ok: false, detail: "dispatch отклонён: 403", run_confirmed: null });
+    const stale = pulseAlertText({
+      ts: NOW - HEARTBEAT.selfOrchestrationMs * 10,
+      dispatch_ok: false,
+      detail: "dispatch отклонён: 403",
+      run_confirmed: null,
+    });
+    expect(fresh).toBe(stale);
   });
 });
 

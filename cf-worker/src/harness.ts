@@ -582,32 +582,31 @@ export function pulseNeedsRecoveryDispatch(now: number, lastPulse: PulseStatus |
  * тик, который его шлёт (#dispatchOrchestraTick, общий для alarm() и
  * scheduledTick()), сам вызывается Cloudflare-инфраструктурой (DO alarm,
  * Cron Trigger), а не GitHub Actions — он звонит и тогда, когда любой workflow
- * (включая orchestra.yml целиком) не запускается вовсе. Причина в тексте —
- * ФАКТ из уже вычисленного pulseHealthy()/pulseStale() (правило AGENTS.md
- * «алерт не гадает»), не гипотеза: pulseStale() — единственная ветка
- * unhealthy, где lastPulse.detail остаётся честным null (см. её докстринг),
- * поэтому для неё отдельный самодостаточный текст без подстановки detail
- * (тот же приём, что PULSE_STALE_TEMPLATE у фронта, app.js/ru.js); для
- * остальных причин detail уже человекочитаем (pulseDetailForRecord).
- * Каждый текст называет и газ (что уже делает самовосстановление, #689/#693/
- * #713) и план (когда считать это неполадкой, требующей ручной проверки) —
+ * (включая orchestra.yml целиком) не запускается вовсе.
+ *
+ * НЕ ветвится по pulseStale() (находка ревью PR #1104): #tickPulseAlert
+ * вызывает pulseHealthy()/эту функцию на пульсе, который #recordPulse ТОЛЬКО
+ * ЧТО записал этим же тиком (`ts: now`) — при `now - ts === 0` возрастная
+ * ветка pulseStale() («тик давно не обновлялся») по построению никогда не
+ * истинна, добавлять под неё отдельный текст означало бы обещать
+ * недостижимое поведение (сама она остаётся источником правды для бейджа
+ * /api/status, где сравнивается СОХРАНЁННЫЙ пульс с текущим моментом, а не
+ * пульс этого же тика). detail здесь поэтому ВСЕГДА человекочитаем
+ * (pulseDetailForRecord подставляет HEARTBEAT.runNotConfirmedDetail именно
+ * на той ветке, где иначе остался бы null) — правило AGENTS.md «алерт не
+ * гадает». Случай «пульс молчал N минут и внезапно самовосстановился ещё до
+ * первого замеченного алерта» — честно названный, но не закрытый здесь
+ * потолок наблюдаемости, issue #1143.
+ *
+ * Текст называет и газ (что уже делает самовосстановление, #689/#693/#713)
+ * и план (когда считать это неполадкой, требующей ручной проверки) —
  * правило «алерт обязан кончаться планом».
  */
-export function pulseAlertText(now: number, lastPulse: PulseStatus): string {
-  const minutes = Math.round((now - lastPulse.ts) / 60_000);
+export function pulseAlertText(lastPulse: PulseStatus): string {
   const retryMinutes = HEARTBEAT.selfOrchestrationMs / 60_000;
-  if (pulseStale(now, lastPulse)) {
-    return (
-      `🚨 edge-harness: пульс оркестратора не бьётся — тик не обновлялся ${minutes} мин ` +
-      `(порог ${(HEARTBEAT.selfOrchestrationMs * 2) / 60_000} мин). Самовосстановление уже в работе: ` +
-      `Cron Trigger (issue #693) проверяет каждые 5 мин и сам дёрнет dispatch. Если в течение часа не ` +
-      `придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit), а также ` +
-      `rows_written DO (/api/status).`
-    );
-  }
   return (
-    `🚨 edge-harness: пульс оркестратора не бьётся: ${lastPulse.detail ?? "причина не записана"} ` +
-    `(${minutes} мин назад). alarm() пробует снова каждые ${retryMinutes} мин без ручного вмешательства. ` +
+    `🚨 edge-harness: пульс оркестратора не бьётся: ${lastPulse.detail ?? "причина не записана"}. ` +
+    `alarm() пробует снова каждые ${retryMinutes} мин без ручного вмешательства. ` +
     `Если в течение часа не придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit).`
   );
 }
@@ -1878,6 +1877,14 @@ export class Harness extends DurableObject<Env> {
    * один recovery при первом снова здоровом. Дедуп — по итогу ЗАПИСИ флага
    * pulse_alert.alerted, тем же доводом, что у #tickStorageReadyAlert (чтение
    * прошлого исхода падает вместе с самой аварией на исчерпании rows_read).
+   *
+   * Честная граница (issue #1143, найдено ревью PR #1104): `lastPulse` здесь
+   * — пульс, который #recordPulse ТОЛЬКО ЧТО записал этим же тиком (`ts:
+   * now`), не хранившееся ДО тика состояние. Если резервный dispatch
+   * scheduledTick() успевает восстановиться в ТОМ ЖЕ тике, где обнаружил
+   * подвисший alarm (pulseNeedsRecoveryDispatch), pulseHealthy() увидит уже
+   * исправленное (свежее, успешное) состояние — incident не пишется вовсе,
+   * хотя пульс реально молчал 20+ минут до этого. Не закрыто этим change'ом.
    */
   #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
     const healthy = pulseHealthy(now, lastPulse);
@@ -1897,7 +1904,7 @@ export class Harness extends DurableObject<Env> {
     if (decision === "incident") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: pulseAlertText(now, lastPulse),
+        text: pulseAlertText(lastPulse),
       });
     } else if (decision === "recovery") {
       void this.#telegramApi("sendMessage", {

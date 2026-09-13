@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { HEARTBEAT } from "../src/config";
+import { DSH_EDGE_UPDATE, HEARTBEAT } from "../src/config";
 
 // Живость пульса владельцу (issue #1103): конвейер простоял 40+ минут
 // 2026-09-13 и не ожил сам — движение вернул ручной workflow_dispatch. Ни
@@ -41,6 +41,23 @@ function isGitHubDispatchCall(input: string | URL | Request): boolean {
   } catch {
     return false;
   }
+}
+
+// alarm() дёргает и #checkDshEdgeUpdate (issue #73) на каждом тике — тот же
+// приём, что harness.spec.ts (мок по точному URL, не реальная сеть): версии
+// совпадают ("quiet", dshEdgeUpdateDecision) — самообновление dsh-edge не
+// участвует в сценарии этого файла и не должно делать реальных исходящих
+// вызовов в тестах (недетерминированная сеть — источник таймаутов, не
+// относящийся к тому, что здесь проверяется).
+function stubDshEdgeUpdate(input: string | URL | Request): Response | null {
+  const href = String(input);
+  if (href === DSH_EDGE_UPDATE.healthUrl) {
+    return new Response(JSON.stringify({ version: "0.1.0" }), { status: 200 });
+  }
+  if (href === DSH_EDGE_UPDATE.registryUrl) {
+    return new Response(JSON.stringify({ version: "0.1.0" }), { status: 200 });
+  }
+  return null;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -94,16 +111,23 @@ describe("живость пульса владельцу: серия падаю�
     // dispatch НЕ заводит run.
     let runId = 100;
     const telegramCalls: string[] = [];
+    const telegramTexts: string[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
       const tgMethod = telegramApiMethod(input);
       if (tgMethod) {
         telegramCalls.push(tgMethod);
+        if (typeof init?.body === "string") telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
         return new Response(JSON.stringify({ ok: true, result: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
       if (isGitHubRunsCall(input)) {
+        // Находка ревью PR #1104: живой инцидент 2026-09-13 валил КАЖДЫЙ
+        // вызов GitHub API, включая /runs — не только /dispatches. 403 без
+        // JSON-тела здесь тоже, пока квота исчерпана; fetchLatestOrchestraRunId
+        // честно отдаёт null на не-2xx (не бросает), поведение теста не меняет.
+        if (rateLimited) return new Response(null, { status: 403 });
         return new Response(JSON.stringify({ workflow_runs: [{ id: runId }] }), { status: 200 });
       }
       if (isGitHubDispatchCall(input)) {
@@ -113,6 +137,8 @@ describe("живость пульса владельцу: серия падаю�
         runId++;
         return new Response(null, { status: 204 });
       }
+      const dshEdge = stubDshEdgeUpdate(input);
+      if (dshEdge) return dshEdge;
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
@@ -130,6 +156,13 @@ describe("живость пульса владельцу: серия падаю�
       );
       expect(status.last_pulse?.dispatch_ok).toBe(false);
       expect(status.last_pulse?.detail).toContain("403");
+      // Содержание алерта, не только факт «что-то ушло» (находка ревью PR
+      // #1104): называет конкретную причину этого тика (не «null», не
+      // общая фраза) и план — когда считать неполадку требующей ручной
+      // проверки.
+      expect(telegramTexts[0]).toContain("403");
+      expect(telegramTexts[0]).not.toContain("null");
+      expect(telegramTexts[0]).toContain("GH_DISPATCH_TOKEN");
 
       // Квота сброшена (живой инцидент: восстановилась в течение часа) —
       // следующий тик снова успешен, ровно один recovery-алерт.
@@ -164,10 +197,12 @@ describe("живость пульса владельцу: серия падаю�
     env.GH_DISPATCH_TOKEN = "test-dispatch-token";
     env.TELEGRAM_BOT_TOKEN = "test-bot-token";
     const telegramCalls: string[] = [];
+    const telegramTexts: string[] = [];
     vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
       const tgMethod = telegramApiMethod(input);
       if (tgMethod) {
         telegramCalls.push(tgMethod);
+        if (typeof init?.body === "string") telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
         return new Response(JSON.stringify({ ok: true, result: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -177,15 +212,22 @@ describe("живость пульса владельцу: серия падаю�
         return new Response(JSON.stringify({ workflow_runs: [{ id: 101 }] }), { status: 200 });
       }
       if (isGitHubDispatchCall(input)) return new Response(null, { status: 403 });
+      const dshEdge = stubDshEdgeUpdate(input);
+      if (dshEdge) return dshEdge;
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
       await runInDurableObject(stub, async (instance) => {
         await instance.scheduledTick();
       });
-      // pulseStale (тик просто давно не приходил) — самодостаточный текст без
-      // подстановки detail; сам факт «алерт ушёл» — главное доказательство.
+      // Резервный dispatch, который scheduledTick() выполнила, сам провалился
+      // (403) — #tickPulseAlert видит СВЕЖУЮ (ts: now) неудачную попытку, а
+      // не «тик давно не обновлялся» (pulseStale здесь не участвует, см.
+      // докстринг pulseAlertText, находка ревью PR #1104): текст несёт
+      // причину ИМЕННО этого тика, не общую фразу.
       expect(telegramCalls).toEqual(["sendMessage"]);
+      expect(telegramTexts[0]).toContain("403");
+      expect(telegramTexts[0]).not.toContain("null");
     } finally {
       vi.unstubAllGlobals();
       env.GH_DISPATCH_TOKEN = "";
@@ -205,6 +247,8 @@ describe("живость пульса владельцу: серия падаю�
       if (telegramApiMethod(input)) throw new Error("Telegram не должен звониться без TELEGRAM_CHAT_ID");
       if (isGitHubRunsCall(input)) return new Response(JSON.stringify({ workflow_runs: [] }), { status: 200 });
       if (isGitHubDispatchCall(input)) return new Response(null, { status: 403 });
+      const dshEdge = stubDshEdgeUpdate(input);
+      if (dshEdge) return dshEdge;
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
@@ -242,6 +286,8 @@ describe("живость пульса владельцу: серия падаю�
       }
       if (isGitHubRunsCall(input)) return new Response(JSON.stringify({ workflow_runs: [{ id: 1 }] }), { status: 200 });
       if (isGitHubDispatchCall(input)) return new Response(null, { status: 403 });
+      const dshEdge = stubDshEdgeUpdate(input);
+      if (dshEdge) return dshEdge;
       return realFetch(input as RequestInfo, init);
     }) as typeof fetch);
     try {
