@@ -1,0 +1,97 @@
+# Дешёвый механический ребейз конфликтных PR (issue #762). PR с меткой `conflict`
+# почти всегда просто отстал от main (докстринг dispatch_conflict_rework,
+# scripts/orchestra/scheduler.py) — `git rebase origin/main` решает это без модели
+# вовсе. Раньше ЕДИНСТВЕННЫМ путём расшивки был LLM-агент worker.yml
+# (dispatch_conflict_rework, #474) — один агентский проход на PR, а воркер один на
+# репозиторий («ровно один workflow_dispatch за пульс»): 25 конфликтных PR (живой
+# замер 2026-09-08) означали 25 запусков LLM ради операции, для которой модель не
+# нужна. Этот workflow берёт ВСЕ конфликтные PR за один проход, механически, без
+# вызова агента — сошедшиеся больше не попадают под dispatch_conflict_rework (метка
+# `conflict` снята mark_conflicts следующим тактом orchestra.yml), НЕ сошедшиеся —
+# расшиваются агентом как раньше, БЕЗ изменений в самом dispatch_conflict_rework.
+#
+# Последовательный цикл в одном job'е, не matrix — обоснование числом:
+# openspec/changes/mechanical-conflict-rebase/design.md (Free-план даёт 20
+# одновременных job'ов, matrix на 25 PR уже не помещается в один батч и
+# конкурирует за тот же лимит с contract/pr-review/ai-review/worker/orchestra).
+#
+# ОТДЕЛЬНЫЙ workflow-файл, не job внутри orchestra.yml — намеренно: heartbeat_check
+# (pulse_guard.py) читает conclusion ВСЕГО ЗАПУСКА orchestra.yml
+# (`orchestra_tick_runs` → `run["conclusion"] == "success"`), GitHub аггрегирует
+# conclusion запуска по ВСЕМ job'ам файла. Job внутри orchestra.yml, упавший по
+# инфраструктуре (сеть/квота — не содержательная ошибка планировщика), красил бы
+# ВЕСЬ запуск orchestra.yml как failure, даже если сам job orchestra отработал
+# успешно — heartbeat увидел бы «пульса нет», хотя мерж-очередь жива. Ровно тот
+# класс маскировки, что уже ловили #303/#318 для другого разреза той же проблемы
+# (см. постмортем в pulse_guard.py::real_orchestra_ticks) — не заводить его снова
+# было решено раньше, чем писать код.
+name: conflict-mechanical-rebase
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conflict-mechanical-rebase
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Полная история: механический ребейз идёт локальным git'ом (fetch +
+          # rebase + push) — на shallow-клоне это ломается, тот же довод, что у
+          # worker.yml.
+          fetch-depth: 0
+          # Учётные данные GITHUB_TOKEN не годятся для push — git-авторизацию
+          # выдаёт `gh auth setup-git` под PAT ниже (тот же приём, что worker.yml).
+          persist-credentials: false
+
+      - name: Квота GitHub API — ранняя проверка
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job conflict-mechanical-rebase
+
+      - name: Git-авторизация под PAT владельца
+        if: steps.quota.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: |
+          # Тот же приём, что worker.yml («Git-авторизация под PAT владельца»):
+          # git push веток идёт под PAT, не под GITHUB_TOKEN — обновления
+          # GITHUB_TOKEN не зажигают downstream-проверки (pr-review/ai-review).
+          token="$GH_TOKEN"
+          unset GH_TOKEN
+          printf '%s' "$token" | gh auth login --with-token
+          unset token
+          gh auth setup-git
+          # Identity для committer'а git rebase (issue #764, находка ревью
+          # гейта, требование 1): `actions/checkout` не ставит user.name/
+          # user.email, `gh auth setup-git` ставит только credential helper
+          # (push-авторизацию), не identity — без неё `git commit` внутри
+          # `git rebase` падает rc=128 «unable to auto-detect email address»,
+          # оставляя `.git/rebase-merge` НЕ через содержательный конфликт
+          # (живой прогон в прод-форме: mechanical_rebase.py::attempt_rebase
+          # возвращал бы "conflict" вместо "resolved" на чисто отставшей
+          # ветке без единого конфликтующего файла). Коммиты рёбейза не
+          # меняют содержимое — `git rebase` сохраняет АВТОРА исходных
+          # коммитов, меняется только committer — поэтому committer'а
+          # атрибутируем боту, не владельцу (та же пара значений, что уже
+          # использует .github/workflows/plugin-forge.yml для своих
+          # автоматических коммитов): это чисто механическая, не
+          # содержательная операция.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Механический ребейз конфликтных PR (issue #762)
+        if: steps.quota.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: python scripts/orchestra/mechanical_rebase.py

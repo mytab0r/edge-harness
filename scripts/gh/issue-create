@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# Единственный документированный путь заводить issue — что через gh CLI, что
+# из промпта агента (docs/agents/PROTOCOL.md, docs/agents/LABELS.md). Обёртка
+# над `gh issue create`, аргументы проксируются как есть. Отказывает ДО
+# вызова gh issue create (ничего не создаётся, сеть не тратится), если среди
+# --label не нашлось `task` — класс #179: issue заведена агентом напрямую
+# (`gh issue create --label white-spot`) мимо шаблона (шаблон применяется
+# только к веб-форме, не к API/CLI-созданию), без task она физически не
+# видна пулу воркера (scheduler.py читает только label=task). Живой случай —
+# issue #523 (метка white-spot без task) и #425 (без единой метки).
+#
+# Если issue заведомо НЕ для пула (сейчас в репозитории таких шаблонов нет —
+# оба существующих, task.yml и white-spot.yml, требуют task) — явное
+# подтверждение --no-task-ack "<причина>" пропускает проверку и печатает
+# причину в лог, чтобы пропуск был осознанным решением, а не забытой меткой.
+#
+# Второй тормоз (#566): заголовок сверяется с уже ОТКРЫТЫМИ задачами пула
+# (scripts/lib/duplicate_guard.py, токенная схожесть заголовка) — измеренный
+# случай 2026-09-06: три агента одной сессии независимо диагностировали один
+# и тот же дефект и завели под него отдельные issue (#518/#547/#564), #548 и
+# #564 закрыты как дубликат УЖЕ ПОСЛЕ того, как под ними были открыты PR.
+# Единственная защита сегодня (аренда claim_task.py, #121) привязана к
+# номеру задачи — здесь номера ещё нет, диагностика начинается без него.
+# Совпадение выше порога — отказ ДО создания issue со списком кандидатов;
+# газ — явный `--confirm-not-duplicate "<почему не дубль>"`, причина попадает
+# в тело issue (не тонет в одном терминале). Совпадений нет — флаг не нужен.
+#
+# Третий тормоз (#695): решение о приоритете (`area:process`,
+# `scripts/lib/free_task.py::META_LABEL`) обязано быть явным — умолчание
+# «просто не поставил» запрещено. Живой случай 2026-09-07: #684/#685/#689
+# заведены с `area:orchestra` вместо `area:process` и встали в хвост очереди
+# из 200 задач как обычные новые, хотя #194/#168/#226 в приоритетной группе
+# уже несли ту же проблему другими словами — дедуп по схожести заголовка
+# (первый тормоз) её не поймал, потому что сравнивает СЛОВА заголовка, а
+# слова были разные (честный потолок метода, docstring duplicate_guard.py).
+# Метка `area:process` среди `--label` — сама по себе решение; если задача
+# НЕ про процесс — явно распишись `--not-process-ack "<причина>"`. Перед
+# созданием печатается текущий верх группы приоритета (открытые
+# `area:process`, тот же ключ сортировки, что `free_task.py::
+# issue_priority_key`, переиспользован, не продублирован) — случай «та же
+# проблема другими словами» ловится глазами в момент заведения.
+#
+# Использование: то же самое, что `gh issue create` — все аргументы
+# проксируются без изменений (--title, --body/--body-file, --label, …),
+# плюс свои --no-task-ack "<причина>", --confirm-not-duplicate "<причина>"
+# и --not-process-ack "<причина>" (в gh не уходят).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+labels=()
+args=()
+no_task_ack=""
+confirm_not_duplicate=""
+not_process_ack=""
+title=""
+body=""
+# body_slot_kind/body_slot_index — где в args лежит тело, чтобы позже (если
+# нашлись похожие задачи И дан --confirm-not-duplicate) переписать РОВНО этот
+# слот сноской с причиной, не трогая остальные аргументы. kind:
+#   value        — args[index] это САМО значение (после отдельного --body)
+#   value_inline — args[index] это "--body=значение" одной строкой
+#   file         — args[index] это ПУТЬ к файлу (после отдельного --body-file)
+#   file_inline  — args[index] это "--body-file=путь" одной строкой
+body_slot_kind=""
+body_slot_index=""
+tmp_body_file=""
+tmp_footer_file=""
+cleanup() { [ -z "$tmp_body_file" ] || rm -f "$tmp_body_file"; [ -z "$tmp_footer_file" ] || rm -f "$tmp_footer_file"; }
+trap cleanup EXIT
+
+n=$#
+i=1
+while [ "$i" -le "$n" ]; do
+  arg="${!i}"
+  case "$arg" in
+    --label)
+      i=$((i + 1))
+      val="${!i}"
+      labels+=("$val")
+      args+=("--label" "$val")
+      ;;
+    --label=*)
+      val="${arg#--label=}"
+      labels+=("$val")
+      args+=("$arg")
+      ;;
+    --no-task-ack)
+      i=$((i + 1))
+      no_task_ack="${!i}"
+      ;;
+    --no-task-ack=*)
+      no_task_ack="${arg#--no-task-ack=}"
+      ;;
+    --confirm-not-duplicate)
+      i=$((i + 1))
+      confirm_not_duplicate="${!i}"
+      ;;
+    --confirm-not-duplicate=*)
+      confirm_not_duplicate="${arg#--confirm-not-duplicate=}"
+      ;;
+    --not-process-ack)
+      i=$((i + 1))
+      not_process_ack="${!i}"
+      ;;
+    --not-process-ack=*)
+      not_process_ack="${arg#--not-process-ack=}"
+      ;;
+    --title)
+      i=$((i + 1))
+      title="${!i}"
+      args+=("--title" "$title")
+      ;;
+    --title=*)
+      title="${arg#--title=}"
+      args+=("$arg")
+      ;;
+    --body)
+      i=$((i + 1))
+      body="${!i}"
+      args+=("--body")
+      body_slot_kind="value"; body_slot_index=${#args[@]}
+      args+=("$body")
+      ;;
+    --body=*)
+      body="${arg#--body=}"
+      body_slot_kind="value_inline"; body_slot_index=${#args[@]}
+      args+=("$arg")
+      ;;
+    --body-file)
+      i=$((i + 1))
+      body_file="${!i}"
+      if [ "$body_file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body_file="$tmp_body_file"
+      fi
+      body="$(cat "$body_file")"
+      args+=("--body-file")
+      body_slot_kind="file"; body_slot_index=${#args[@]}
+      args+=("$body_file")
+      ;;
+    --body-file=*)
+      body_file="${arg#--body-file=}"
+      if [ "$body_file" = "-" ]; then
+        tmp_body_file="$(mktemp)"
+        cat >"$tmp_body_file"
+        body_file="$tmp_body_file"
+      fi
+      body="$(cat "$body_file")"
+      body_slot_kind="file_inline"; body_slot_index=${#args[@]}
+      args+=("--body-file=$body_file")
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+# --label поддерживает одно значение вида "a,b,c" (форма gh issue create) —
+# разворачиваем перед проверкой, иначе "--label white-spot,task" молча
+# проходит мимо has_task.
+has_task=0
+for l in "${labels[@]+"${labels[@]}"}"; do
+  IFS=',' read -ra parts <<<"$l"
+  for p in "${parts[@]}"; do
+    if [ "$p" = "task" ]; then
+      has_task=1
+    fi
+  done
+done
+
+if [ "$has_task" -ne 1 ]; then
+  if [ -n "$no_task_ack" ]; then
+    echo "issue-create: заведено БЕЗ task, осознанно (--no-task-ack): $no_task_ack" >&2
+  else
+    echo "::error::issue заводится без метки task — пул воркера её не увидит (scheduler.py, класс #179, живые случаи #523/#425). Добавь --label task, либо явно распишись --no-task-ack \"причина\", если это НЕ задача пула." >&2
+    echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+    exit 1
+  fi
+fi
+
+# repo — нужен и приоритетной проверке ниже, и дедупу (#566): один вызов
+# gh repo view, не два (has_task=1 — единственный случай, где обе секции
+# вообще смотрят в сеть; --no-task-ack уже объявил «это не пул»).
+repo=""
+if [ "$has_task" -eq 1 ]; then
+  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+
+# Третий тормоз (#695): решение о приоритете обязано быть явным — метка
+# area:process среди --label САМА является решением (позитивным); её нет —
+# нужен явный --not-process-ack "<причина>". Только для реальных задач пула
+# (has_task=1) — --no-task-ack уже вывел issue из-под пула, приоритет внутри
+# пула к ней неприменим.
+if [ "$has_task" -eq 1 ]; then
+  meta_label="$(python3 "$SCRIPT_DIR/../lib/free_task.py" meta-label)"
+  has_meta=0
+  for l in "${labels[@]+"${labels[@]}"}"; do
+    IFS=',' read -ra parts <<<"$l"
+    for p in "${parts[@]}"; do
+      if [ "$p" = "$meta_label" ]; then
+        has_meta=1
+      fi
+    done
+  done
+
+  if [ "$has_meta" -ne 1 ] && [ -z "$not_process_ack" ]; then
+    echo "::error::issue-create: приоритет не объявлен явно — нет метки $meta_label среди --label и нет --not-process-ack. Добавь --label $meta_label, если задача про сам процесс работы (протокол/гвардии/CI-ворота), либо распишись --not-process-ack \"причина\", если нет (живой случай 2026-09-07: #684/#685/#689 без этого решения встали в хвост очереди из 200 задач, класс #695)." >&2
+    echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+    exit 1
+  fi
+  if [ -n "$not_process_ack" ]; then
+    echo "issue-create: заведено НЕ как $meta_label, осознанно (--not-process-ack): $not_process_ack" >&2
+  fi
+
+  # Верх группы приоритета ПЕРЕД созданием (#695) — случай «та же проблема
+  # другими словами» ловится глазами: дедуп по схожести заголовка (ниже)
+  # сравнивает слова заголовка и может не совпасть при разных формулировках
+  # одного и того же дефекта (см. duplicate_guard.py, честный потолок метода).
+  if [ -z "$repo" ]; then
+    echo "::warning::issue-create: не смог определить repo (gh repo view) — верх группы приоритета не показан." >&2
+  else
+    echo "issue-create: текущий верх группы приоритета ($meta_label) — сверься глазами, нет ли уже той же проблемы другими словами:" >&2
+    top_err_file="$(mktemp)"
+    top="$(python3 "$SCRIPT_DIR/../lib/free_task.py" priority-top "$repo" 2>"$top_err_file" || true)"
+    top_err="$(cat "$top_err_file" 2>/dev/null || true)"; rm -f "$top_err_file"
+    [ -z "$top_err" ] || echo "$top_err" >&2
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top" | awk -F'\t' '{printf "  #%s: %s\n", $1, $2}' >&2
+    elif [ -z "$top_err" ]; then
+      # "Пусто" — легитимный факт, только когда сам инструмент не пожаловался
+      # (top_err пуст). Если top_err не пуст, priority-top уже предупредил
+      # «верх приоритета не показан» — печатать следом «пусто» означало бы
+      # утверждать факт, который не установлен: ровно класс «сломано против
+      # пусто», который запрещает docstring free_task.py (#247), и он бьёт по
+      # цели #695 — агент, увидевший «пусто», пропускает сверку глазами.
+      echo "  (пусто — открытых задач с $meta_label нет)" >&2
+    fi
+  fi
+fi
+
+# Дедупликация по похожести заголовка (#566) — только для реальных задач
+# пула (has_task=1: --no-task-ack явно объявил «это не пул», сравнивать не с
+# чем сравнивать по смыслу) и только если заголовок вообще известен (пустой
+# --title — забота самого gh issue create, здесь просто нечего сравнивать).
+if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
+  if [ -z "$repo" ]; then
+    echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести пропущена." >&2
+  else
+    dg_err_file="$(mktemp)"
+    matches="$(python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file" || true)"
+    dg_err="$(cat "$dg_err_file" 2>/dev/null || true)"; rm -f "$dg_err_file"
+    [ -z "$dg_err" ] || echo "$dg_err" >&2
+    if [ -n "$matches" ]; then
+      if [ -n "$confirm_not_duplicate" ]; then
+        listed=$(printf '%s\n' "$matches" | awk -F'\t' '{printf "- #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}')
+        echo "issue-create: похожие открытые задачи найдены, но --confirm-not-duplicate дан:" >&2
+        printf '%s\n' "$listed" >&2
+        footer="
+
+---
+Проверено на дубли перед заведением (--confirm-not-duplicate, #566). Похожие открытые задачи:
+$listed
+Не дубль, потому что: $confirm_not_duplicate"
+        new_body="${body}${footer}"
+        case "$body_slot_kind" in
+          value)
+            args[$body_slot_index]="$new_body"
+            ;;
+          value_inline)
+            args[$body_slot_index]="--body=$new_body"
+            ;;
+          file)
+            tmp_footer_file="$(mktemp)"
+            printf '%s' "$new_body" >"$tmp_footer_file"
+            args[$body_slot_index]="$tmp_footer_file"
+            ;;
+          file_inline)
+            tmp_footer_file="$(mktemp)"
+            printf '%s' "$new_body" >"$tmp_footer_file"
+            args[$body_slot_index]="--body-file=$tmp_footer_file"
+            ;;
+          *)
+            echo "::warning::issue-create: --confirm-not-duplicate дан, но тело (--body/--body-file) не передано — причина не записана в issue, видна только в этом логе." >&2
+            ;;
+        esac
+      else
+        echo "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть — вероятно, дефект уже диагностируется (класс #566, живой случай #518/#547/#564):" >&2
+        printf '%s\n' "$matches" | awk -F'\t' '{printf "  #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}' >&2
+        echo "Свяжись с существующей задачей (комментарий/assign) вместо новой, либо, если это ДЕЙСТВИТЕЛЬНО не дубль, передай --confirm-not-duplicate \"<почему не дубль>\" — причина попадёт в тело issue." >&2
+        echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+exec gh issue create "${args[@]}"

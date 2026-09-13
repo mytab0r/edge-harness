@@ -1,0 +1,39 @@
+# Хвост чеклиста ревью наследует область родившего PR (сирота A, аудит
+# владельца 2026-09-11): 46 задач «Хвост чеклиста ревью PR #N» заведены за
+# 5 дней, закрыто — 0, потому что тело каждой обещает «Область и приоритет
+# — как у породившего PR», а create_pool_issue заводит их только с меткой
+# task (scheduler.py:1906-1910 — правка отложена, файл занят параллельными
+# PR, см. докстринг scripts/orchestra/checklist_tail_labels.py). Этот
+# workflow — периодический потребитель ДО того, как правка scheduler.py
+# сделает наследование частью самого создания: докручивает labels уже
+# заведённых задач, а не оценивает их ценность заново.
+#
+# Отдельный workflow (не шаг orchestra.yml) — та же независимость, что у
+# dependabot-alert-watch.yml рядом: свой планировщик, не занимает
+# concurrency-группу очереди слияний.
+name: checklist-tail-triage
+
+on:
+  schedule:
+    - cron: "23,53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: checklist-tail-triage
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Наследование области хвостом чеклиста ревью
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/orchestra/checklist_tail_labels.py

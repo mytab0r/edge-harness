@@ -1,0 +1,11 @@
+# Нормализация переводов строк: LF везде для текстовых файлов.
+# Причина — не вкус: workerd падает (crash-loop) на JSON-модулях с CRLF, которые git
+# раздаёт на Windows-машинах без этого файла. Подробности — docs/research/22-cf-testing-toolchain.md
+* text=auto eol=lf
+
+# Бинарные файлы — не трогать.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

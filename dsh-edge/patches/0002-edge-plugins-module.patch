@@ -1,0 +1,49 @@
+diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
+index e1bb2e8..e5e0f88 100644
+--- a/apps/dsh-edge/src/session-store.ts
++++ b/apps/dsh-edge/src/session-store.ts
+@@ -5,6 +5,7 @@ import Storage from '@deepseek-ai/dsh-storage'
+ import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+ import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
+ import { DurableObjectStorageBackend } from './do-storage-backend.ts'
++import { edgePlugins } from './edge-plugins.generated.ts'
+ import AgentRegistry, {
+   installModelSelection,
+   type Agent,
+@@ -326,6 +327,36 @@ export class EdgeSessionStore {
+         projectionCallback(session.id, key, value, seq)
+       })
+     }
++    await this.installEdgePlugins(storage)
++  }
++
++  /**
++   * Install the owner plugins declared by the generated composition module
++   * (edge-plugins.generated.ts, produced from the edge-harness plugin
++   * manifest). Isolation follows the upstream precedent of the LLM provider
++   * plugin above: a failing plugin must not take the Durable Object down —
++   * it fails loudly (console + DO storage status) and the loop continues in
++   * manifest order.
++   */
++  private async installEdgePlugins(storage: DurableObjectStorage): Promise<void> {
++    for (const entry of edgePlugins) {
++      try {
++        await this.context.plugin(entry.plugin as never)
++        await storage.put(`dsh-edge-plugins:${entry.id}`, { status: 'ready' })
++        console.info(`edge-plugin:${entry.id} installed`)
++      } catch (error) {
++        console.error(`edge-plugin:${entry.id} failed to install; it stays disabled for this deployment.`, error)
++        try {
++          await storage.put(`dsh-edge-plugins:${entry.id}`, {
++            status: 'failed',
++            detail: error instanceof Error ? error.message : String(error),
++          })
++        } catch (storageError) {
++          // Статус — метаданные; их запись не должна пробить изоляцию плагина.
++          console.error(`edge-plugin:${entry.id} failed to record its install status.`, storageError)
++        }
++      }
++    }
+   }
+ 
+   /** Resolve the upstream workspace registry after initialization. */

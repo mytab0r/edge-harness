@@ -1,0 +1,112 @@
+# Непрерывный сторож квот харнеса (#605) — обоснование интервала, стоимости
+# и подстраховки ненадёжного `schedule` целиком в докстринге
+# scripts/measure/quota_watch.py, здесь — только проводка.
+#
+# Триггеры: `pull_request` — основной и надёжный носитель каденции (обычный
+# webhook, не `schedule`; в этом репозитории с его многоагентной работой
+# срабатывает практически постоянно — десятки открытых PR, синхронизация на
+# каждый пуш). `schedule` — только страховка «тихих часов», когда в
+# репозитории вообще нет активности (`*/15`, измеренная доставка на этом
+# репозитории ~6.7% — см. docs/research/21-github-actions.md, «Замер
+# schedule» — троттлинг внутри quota_watch.py всё равно ограничивает частоту
+# дорогого CF-запроса, лишние срабатывания cron не удваивают стоимость).
+#
+# permissions.actions:read — гейт (`scan_measurement_history`, gate_main
+# ниже) читает историю ПРОШЛЫХ прогонов этого же workflow И их шаги (jobs API),
+# чтобы отличить прогон, реально запустивший шаг замера, от завершённого
+# прогона, который замер не делал (упал раньше, холостой — гейт сам решил не
+# измерять): любой completed-прогон одинаково открывал троттлинг ДО этой
+# правки, слепя сторож именно в активные часы (found: ревью PR #607,
+# докстринг scripts/measure/quota_watch.py, «Троттлинг: только реальный
+# замер»). permissions.issues:write — эскалация (Telegram + след в #120) и
+# заведение задачи через scripts/gh/issue-create при пробитии порога (см.
+# quota_alert.py), а также сигнал «успешный замер не выполнялся дольше
+# порога» (quota_watch.py::stale_alert; возраст простоя считается по
+# последнему УСПЕШНОМУ замеру — свежие failure-прогоны его не гасят,
+# found: ревью PR #607, head eae35fc). permissions.contents:read — тем же
+# токеном `workflow_version_check` читает Contents API (`.../contents/
+# .github/workflows/quota-watch.yml?ref=main`), чтобы сверить исполняемую
+# копию этого файла с версией на main ПЕРЕД эскалацией простоя (found:
+# ревью PR #607, живой инцидент — прогон из ещё не слитой ветки этого же PR
+# разбудил владельца в Telegram; см. докстринг scripts/measure/
+# quota_watch.py, «Простой vs холодный старт»).
+name: quota-watch
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # Сдвинуто с четвертей часа — та же рекомендация GitHub на случай пиков
+    # нагрузки, что уже применена в dispatch-latency-probe.yml.
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+# Одна группа на workflow, без отмены (та же конвенция, что
+# dispatch-latency-probe: group + cancel-in-progress: false): до группы два
+# перекрывшихся pull_request-прогона — а активность репозитория даёт их
+# практически постоянно — каждый проходил троттлинг целиком (гейт видит
+# только ЗАВЕРШЁННЫЕ прогоны) и оба звали Cloudflare, а на переходе
+# ok→breach оба успевали прочитать «ok» до чужого маркера (двойной Telegram
+# ровно на событии, ради которого заведён дедуп; found: ревью PR #607,
+# некритичное замечание «параллельные прогоны проходят троттлинг целиком»).
+# Честная цена сериализации по документации GitHub: в группе держится
+# максимум один выполняющийся и один ожидающий прогон, новый ожидающий
+# вытесняет более старый — перекрытых прогонов не бывает по построению
+# (ожидающий стартует только после завершения предыдущего и читает его
+# маркер), НО тики при шторме событий ТЕРЯЮТСЯ, а не копятся в очередь;
+# каденцию это не ломает (основной носитель — поток PR-событий), терять
+# безопасно: троттлинг всё равно ограничивает частоту CF-замеров 15
+# минутами. Формулировка платформенного поведения — из документации GitHub,
+# локальным замером на этом репозитории не подтверждена.
+concurrency:
+  group: quota-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Тесты сторожа квот
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py -q
+
+      # Гейт против шага замера ниже (found: ревью PR #607) — ИМЕНА шагов
+      # («id: gate» + `steps.gate.outputs.proceed`, и точный текст этого
+      # name:) читает scripts/measure/quota_watch.py::GATE_STEP_NAME/
+      # MEASURE_STEP_NAME при разборе jobs/steps API прошлых прогонов;
+      # синхронность имён с константами проверяет
+      # test_quota_watch.py::test_workflow_step_names_match_constants.
+      - name: "Гейт: нужен ли реальный замер"
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quota_watch.py gate
+
+      # `if:` условие — единственный способ получить conclusion=skipped в
+      # jobs/steps API, когда гейт решил не измерять (см. коммент выше):
+      # без него шаг всегда «success» и следующий тик снова не отличит
+      # «замерили» от «пропустили» (ровно дефект, который правит этот PR).
+      - name: Замер квоты (Cloudflare)
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/measure/quota_watch.py measure

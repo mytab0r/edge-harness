@@ -1,0 +1,1128 @@
+# Обязательная проверка test из защиты main. Предыдущий поставщик — job `test`
+# в worker-ci.yml — удалён cleanup-коммитом 09ef969 вместе с каркасом, после чего
+# каждый PR блокировался вечным ожиданием несуществующей проверки (задача #44).
+# Job id обязан быть ровно `test` и без `name:` — иначе контекст проверки не
+# совпадёт с требованием защиты ветки.
+# worker-ci.yml восстановлен (#72) с job'ами `worker-test` и `canary`: имя `test`
+# осталось за этим файлом, чтобы обязательный контекст проверки был однозначным.
+
+name: repo-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Диспатч на мерже (#955, следствие #929): мерж PR через GITHUB_TOKEN не
+  # создаёт push-событие — scheduler.py::after_merge (merge_reactions.
+  # react_to_merge, config/merge-reactions.json) запускает этот workflow
+  # явно через Actions API dispatches, для чего нужен именно этот триггер.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Инварианты состояния репозитория (#244, scripts/orchestra/repo_invariants.py)
+  # читают открытые issues/PR живым gh api — read достаточно, шаг ниже не пишет.
+  issues: read
+  pull-requests: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Переопределяет permissions ФАЙЛА (issues: read) точечно для этой job:
+    # шаг «Автоперенос поля «Чем блокируется»…» ниже пишет в граф зависимостей
+    # (addBlockedBy), остальным шагам job (белые пятна, рассинхрон-детектор,
+    # инварианты) хватало read — задача #529. Сама запись всё равно выполняется
+    # ТОЛЬКО на push в main (см. `if:` шага) — на pull_request-прогонах токен
+    # формально несёт issues: write, но пишущий шаг не исполняется вовсе,
+    # почему это приемлемо: см. комментарий у самого шага.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Python-скрипты компилируются
+        run: python -m compileall -q scripts
+
+      # Гвардия класса #179: white-spot без метки task физически не попадает
+      # в пул воркера (scripts/orchestra/scheduler.py читает только `task`).
+      # Шаблон теперь заводит обе метки сразу — эта проверка ловит рецидив
+      # (кто-то навесил white-spot вручную без task, или снял task не тронув
+      # white-spot) и красит CI, а не молчит до случайной находки человеком.
+      # Газ (правило «тормоз без газа», AGENTS.md): владелец/агент навешивает
+      # `task` на осиротевший issue (`gh issue edit <N> --add-label task`) или
+      # закрывает его — следующий прогон repo-ci перечитывает список и красный
+      # уходит сам, снимать вручную нечего.
+      - name: Белые пятна без метки task (класс #179)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          orphans=$(gh issue list --repo "$GITHUB_REPOSITORY" --label white-spot --state open --limit 100 \
+            --json number,labels --jq '[.[] | select(.labels | map(.name) | index("task") | not) | .number]')
+          count=$(echo "$orphans" | python -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          if [ "$count" != "0" ]; then
+            echo "::error::white-spot issues без метки task (класс #179): $orphans"
+            exit 1
+          fi
+          echo "white-spot: сирот без task нет"
+
+      # Рассинхрон «тело задачи называет блокирующую issue — нативный граф
+      # blockedBy её не знает» (#371, продолжение #361/task_deps.py). Здесь,
+      # а не в пульсе orchestra: пульс тратит квоту rows_read DO (5 млн/сутки,
+      # уже исчерпана 2026-09-03, #320) на каждый тик расписания, а эта
+      # проверка вообще не трогает DO — только GitHub GraphQL, и достаточно
+      # одного прохода на push/PR, не периодического. Предупреждение
+      # (`::warning::`), не отказ: детектор — эвристика по прозе (см.
+      # docstring declared_deps.py), ложные срабатывания на нём ожидаемы,
+      # жёсткий отказ обязательной проверки на эвристике — тормоз без
+      # предсказуемого газа для владельца текста, который написал корректно,
+      # но не по одной из шести распознаваемых формулировок.
+      - name: Рассинхрон тела задачи и графа зависимостей (#371)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_declared_deps.py -q
+          python scripts/lib/declared_deps.py check "$GITHUB_REPOSITORY"
+
+      # Граф блокировок пула (#361), который declared_deps.py сверяет с прозой
+      # выше — сам модуль scripts/lib/task_deps.py (разбор/сборка GraphQL-запроса
+      # addBlockedBy/removeBlockedBy) остался без единого шага CI (находка
+      # канарейки осиротевших тестов, #583) — класс тот же, что и у
+      # test_duplicate_guard.py ниже: файл лежал, но не запускался.
+      - name: Тесты графа блокировок пула task_deps
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_deps.py -q
+
+      # Гвардия класса #179/#526: программное заведение issue пула (POST
+      # repos/{repo}/issues) обязано идти через ЕДИНУЮ точку
+      # scripts/lib/pool_issue.py::create_pool_issue — она физически не даёт
+      # создать issue без метки `task` (RuntimeError до сетевого вызова).
+      # Живой случай, который это закрывает: до #526 три места
+      # (file_tasks.py/scheduler.py/stall_detector.py) собирали
+      # `-f labels[]=task` каждое само по себе — расхождение было лишь
+      # вопросом времени для следующего добавленного места (upstream_drift.py
+      # оказалось четвёртым при сплошном прочёсе, тоже мигрировано). Сырой
+      # POST на этот эндпоинт вне pool_issue.py — рецидив, красит CI.
+      - name: Заведение issue пула — только через pool_issue.create_pool_issue (класс #179/#526)
+        run: |
+          if grep -rn 'repos/{repo}/issues"' scripts/orchestra/ scripts/lib/ scripts/review/ --include=*.py | grep -v 'scripts/lib/pool_issue.py'; then
+            echo "::error::сырой POST repos/{repo}/issues вне pool_issue.py (класс #179/#526) — используй pool_issue.create_pool_issue, иначе task можно забыть"
+            exit 1
+          fi
+          echo "orchestra+lib+review: заведение issue пула только через pool_issue.create_pool_issue"
+
+      # Единственная точка правды create_pool_issue, которую гвардия выше
+      # защищает статическим грепом, сама осталась без юнит-теста в CI
+      # (находка канарейки осиротевших тестов, #583): test_pool_issue.py
+      # доказывает мутацией, что RuntimeError бросается ДО сетевого вызова gh.
+      - name: Тесты create_pool_issue — отказ до сетевого вызова при отсутствии task
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_pool_issue.py -q
+
+      # Автоперенос обязательного структурного поля формы «Чем блокируется»
+      # (.github/ISSUE_TEMPLATE/task.yml/white-spot.yml, #387) в нативный
+      # blockedBy — задача #529, продолжение #371: до этой задачи перенос для
+      # человеческого/шаблонного пути был ручной командой `task_deps.py block`
+      # (design.md #361/#371 сознательно оставлял его ручным — «форма не
+      # структурная для программных создателей»; здесь читается уже
+      # ОТРЕНДЕРЕННЫЙ GitHub'ом текст, а не форма на входе, поэтому решение
+      # пересмотрено). Разбор структурный (по заголовку секции), не по
+      # любому #N в теле — см. declared_deps.py::form_field_numbers.
+      #
+      # Только `push` (после мержа в main), не на каждый `pull_request`:
+      # состояние графа зависимостей — общерепозиторное, не относится к
+      # конкретному PR, запись на каждый параллельный PR-прогон умножала бы
+      # мутирующие вызовы без выгоды (идемпотентность есть, но каждый лишний
+      # вызов — это ещё один расход общей квоты GITHUB_TOKEN, #454). Здесь же,
+      # а не в пульсе orchestra: то же обоснование по цене, что у детектора
+      # рассинхрона выше (пульс уже самый дорогой потребитель квоты, #454).
+      - name: Автоперенос поля «Чем блокируется» в граф (#529)
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/declared_deps.py wire "$GITHUB_REPOSITORY"
+
+      # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
+      # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
+      # пока краш не заметил человек. Правильная форма: значение "-f", "body=…".
+      # scripts/lib включён с появления claim_task (#121): там свой gh-обёрточный
+      # скрипт — класс закрывается во всех точках входа, а не только в orchestra.
+      # scripts/review — с появления gh-обёрток ai_review/file_tasks (#18).
+      - name: Оркестрация без keyword-аргументов gh()
+        run: |
+          if grep -rnE ',\s*body=' scripts/orchestra/ scripts/lib/ scripts/review/; then
+            echo "::error::keyword body= в вызове gh() — роняет прогон оркестратора (класс #124)"
+            exit 1
+          fi
+          echo "orchestra+lib+review: keyword-аргументов нет"
+
+      # Гвардия класса #153: провайдер/модель LLM — ровно одно место правды
+      # (vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL репозитория). Вынесена в
+      # scripts/lib/test/provider-default.guard.sh (находка 9): два паттерна
+      # (свойство + литерал), исключение только файла гвардии — теперь и
+      # repo-ci.yml сам под проверкой.
+      - name: Провайдер/модель LLM — одно место правды (vars), без зашитых дефолтов
+        run: bash scripts/lib/test/provider-default.guard.sh
+
+      # Гвардия «дерево == задача» (#332): .githooks/pre-commit отклоняет коммит
+      # в agent/<N>-* не из своего рабочего дерева — прогоняет РЕАЛЬНЫЙ файл
+      # гвардии на синтетических git-worktree, не пересказ поведения.
+      - name: pre-commit отклоняет коммит в agent/<N>-* не из своего дерева
+        run: bash scripts/git/test/worktree-guard.test.sh
+
+      # Кампания замера хвоста dispatch (задача #4): чистая логика — метрики,
+      # критерий покрытия, сводка, вставка в доку — кормится прод-формой данных.
+      - name: Тесты кампании dispatch-tail
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_dispatch_tail.py -q
+
+      # Замер факта rows_read Durable Objects (задача #320): арифметика суточного
+      # итога, разбор GraphQL introspection, выбор формы запроса по факту схемы —
+      # кормится прод-формой ответов Cloudflare, сеть не трогаем.
+      - name: Тесты замера rows_read
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_do_rows_read.py -q
+
+      # Гвардия класса «неограниченный агрегат на горячем пути DO» (#320/#321/
+      # #575): #status() зовётся на каждый heartbeat/батч событий/сообщение
+      # инбокса/callback — GROUP BY по всей таблице там обязан идти только
+      # через кэш-геттер (#taskCounts/#msgCounts). Статический разбор
+      # cf-worker/src/harness.ts, не vitest — ловит регрессию до того, как она
+      # снова начнёт жечь rows_read на проде.
+      - name: "DO: агрегат на горячем пути только за кэшем (#320/#321/#575)"
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_do_hotpath_aggregate_guard.py -q
+
+      # Предохранитель конвейера и пульс orchestra (#120): серия красных → пауза
+      # диспатча, пропавший пульс → сигнал. Чистые решения + проводка на моке gh.
+      - name: Тесты предохранителя конвейера orchestra
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_pulse_guard.py -q
+
+      # Гвардия «waiting:owner» (#470/#471) — метка, машиночитаемый блок
+      # вариантов, эскалация с инлайн-кнопками (#254, PR #486). Находка
+      # AI-ревью PR #486 (четвёртый заход): файл существовал, но не был
+      # подключён ни к одному workflow — тот же класс, что уже находили у
+      # test_stale_blocked_guard.py (PR #336, третий раунд) этим же приёмом.
+      - name: Тесты гвардии waiting:owner (метка, варианты, эскалация)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_waiting_owner_guard.py -q
+
+      # Применение решения владельца по нажатию кнопки (#254, PR #486):
+      # apply_owner_decision.py пишет «РЕШЕНИЕ: N» тем же способом, что
+      # ручной ответ. Не был подключён к CI (находка того же ревью, тот же
+      # заход, что и гвардия waiting:owner выше).
+      - name: Тесты применения решения владельца (owner-decision)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_apply_owner_decision.py -q
+
+      # Синхронность формата кнопки между TS и Python, и внутри самого
+      # Python (#254, PR #486, находка того же ревью): без этого шага
+      # гвардия ловит рассинхрон так же плохо, как ловили его комментарии
+      # без гвардии — тестом, который никто не запускает.
+      - name: Гвардия синхронности формата кнопки Telegram (TS ↔ Python)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_telegram_callback_format_sync.py -q
+
+      # Инварианты состояния репозитория (#244): «такого состояния быть не
+      # должно» — открытая задача с уже слитым PR, застрявший review:ok без
+      # ai:*, полностью отмеченный незаархивированный openspec/changes, две
+      # открытые задачи с пересекающейся уликой file:line. Четыре чистых
+      # decide_*/check_* функции (инвариант 2 выведен из состава ревью PR
+      # #249 — класс, который он ловил, закрыл #247), каждая доказана
+      # мутацией на прод-форме фикстур (реальные тела issue #202/#213/#204/
+      # #217). Мета-течь, которую это закрывает: 2026-09-02/03 из ~15
+      # найденных дефектов конвейера НИ ОДИН не нашла система.
+      - name: Тесты инвариантов состояния репозитория
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_repo_invariants.py -q
+
+      # Автофикс инварианта 4 (#493, job archive-fixup ниже): чистая часть
+      # rewrite_inbound_links (переписывание входящих markdown-ссылок при
+      # переносе openspec/changes/<id> в archive/) плюс регресс #506
+      # (REPO_ROOT из cwd вызова, не из расположения файла). Лежал без
+      # единого шага CI (находка канарейки осиротевших тестов, #583) — сам
+      # скрипт зовётся отдельным job'ом archive-fixup, но его чистая логика
+      # юнит-тестом не проверялась вовсе.
+      - name: Тесты автофикса архивации openspec/changes (#493/#506)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/orchestra/test_archive_complete_changes.py -q
+
+      # Гвардия класса #510/#516: скрипт под scripts/, вызванный из workflow
+      # НАПРЯМУЮ (run: scripts/foo.sh, без bash/python/node перед путём), без
+      # бита исполнения падает Permission denied на КАЖДОМ прогоне — и падение
+      # невидимо (шаг часто continue-on-error, красным не светится). Образцовый
+      # случай: scripts/gh/wake_orchestra.sh два часа не будил оркестратор.
+      # Живой прогон ниже — required-гейт сразу (0 запросов к GitHub API,
+      # только локальный git ls-tree — цена не аргумент против включения).
+      - name: Тесты гвардии бита исполнения
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_exec_bit_guard.py -q
+      - name: Гвардия бита исполнения — живой снимок workflow (#510/#516)
+        run: python scripts/lib/exec_bit_guard.py
+
+      # Сам scripts/gh/wake_orchestra.sh (#456), тот самый «образцовый случай»
+      # выше — экономит диспатч orchestra.yml, только когда он заведомо
+      # избыточен. Юнит-тест лежал без единого шага CI (находка канарейки
+      # осиротевших тестов, #583): фейковый `gh` на PATH, сеть не нужна.
+      - name: Тесты экономии диспатча wake_orchestra (#456)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/gh/test_wake_orchestra.py -q
+
+      # Гвардия протухшей метки blocked (#334) мигрирована в каталог гвардий
+      # (#749, класс «repo-ci.yml — генератор конфликтов»): шаг больше не
+      # рукописный здесь, тестируется через scripts/ci/guards/
+      # stale-blocked-guard.sh, который перебирает шаг «Каталог гвардий»
+      # ниже по файлу.
+
+      # Уборка мёртвых worktree'ов (#891) мигрирована в каталог гвардий
+      # (#749, класс «repo-ci.yml — генератор конфликтов», находка ревью
+      # PR #893, второй раунд): шаг не рукописный здесь, тестируется через
+      # scripts/ci/guards/worktree-cleanup-guard.sh, который перебирает
+      # шаг «Каталог гвардий» ниже по файлу.
+
+      # Сборщик квот харнеса (#324): Cloudflare/GitHub/LLM в одну таблицу.
+      # Кормится реальными фикстурами (gh api rate_limit, пример из доков CF).
+      - name: Тесты сборщика квот
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/measure/test_quotas.py -q
+
+      # Непрерывный сторож квот (#605) переехал в каталог гвардий:
+      # scripts/ci/guards/quota-watch-tests.sh — регистрация гвардии данными
+      # (#749), рукописный шаг здесь краснил
+      # test_ci_guard_registration_guard::test_live_repo_ci_matches_frozen_allowlist.
+
+      # Логин в морду dsh-edge и архив сессий раннера после мержа (#119/#174):
+      # 303 — успех логина (не редирект-переход, urllib.HTTPRedirectHandler
+      # ловил 403 на автослежении), сбой архивации — жёсткий и эскалируется
+      # тем же каналом, что предохранитель, а не тонет тихим warning'ом.
+      # Петля состояния открытого PR (#196): review:ok без вердикта AI дольше
+      # порога → авто-повтор ai-review.yml с ограничением попыток; нездоровый
+      # PR (красный чек/ai:changes-requested) дольше порога → задача в пул;
+      # после слияния — update-branch остальным открытым PR. Отдельная гвардия
+      # холостого хода: пустая очередь не делает ни одного мутирующего вызова.
+      - name: Тесты планировщика orchestra (логин в морду, архив сессий, петля состояния PR)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_scheduler.py -q
+
+      # Механический git rebase PR с меткой conflict без LLM-агента (#762) —
+      # прод-форма: настоящий git (bare-репозиторий), FakeGh для GitHub API.
+      - name: Тесты механического ребейза конфликтных PR
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_mechanical_rebase.py -q
+
+      # Контракт PR ↔ задача (#394, находка при первом заходе на
+      # pr_task_candidates: у этого теста не было ни одного шага в CI —
+      # «файл гвардии лежал» не значило «красит CI», тот же класс, что уже
+      # чинили для test_task_ref_usage_guard.py при #259). Резолвер задачи
+      # PR (единственный источник — имя agent-ветки, решение владельца
+      # 2026-09-06), гвардия «нарушение записано → изменяющий вызов всё
+      # равно выполнен».
+      - name: Тесты контракта PR ↔ задача
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_contract_check.py -q
+
+      # Детектор устойчивого простоя (#201): читает уже готовый отчёт пульса,
+      # заводит задачу пула по незнакомому структурированному отпечатку
+      # причины после порога устойчивости; дедупликация по отпечатку, повтор —
+      # комментарий с новой уликой, не вторая задача; суточный потолок и
+      # эскалация зависших автозадач владельцу. Проводка на моке gh.
+      - name: Тесты детектора устойчивого простоя
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_stall_detector.py -q
+
+      # Сигнал дрейфа пина апстрима (#134): релиз апстрима новее пина
+      # source-build морды кричит в задачу #134 + метка update-available +
+      # Telegram, один раз на релиз, газ метки — авто-снятие при догнавшем
+      # пине. Семвер по прод-форме тегов repos/tags (настоящие sha апстрима),
+      # проводка на моке pulse_guard.gh: свежий пин и повторный эпизод —
+      # ноль мутирующих вызовов.
+      - name: Тесты сигнала дрейфа пина апстрима (#134)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_upstream_drift.py -q
+
+      # Сигнал ослабления защиты main событием branch_protection_rule (#370,
+      # #341): инвариант 6 не может опрашивать protection (GET требует
+      # administration, которого нет у GITHUB_TOKEN) — сигнал приходит вместе
+      # с самим фактом изменения через payload события, читать API не нужно.
+      # Прод-форма фикстур — вербатим примеры payload'ов GitHub (octokit/webhooks),
+      # проводка на моке pulse_guard.gh: согласованное состояние — ноль мутаций.
+      - name: Тесты сигнала ослабления защиты main (#370)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/orchestra/test_branch_protection_watch.py -q
+
+      # Гвардия «PR не заводится на эпик» (#376): task-branch отказывает на
+      # номере эпика ДО git switch -c — признак эпика (is_epic_issue,
+      # scripts/orchestra/scheduler.py) не дублируется вторым определением,
+      # scripts/lib/epic_guard.py импортирует его. Мутация «убрать вызов
+      # is_epic_issue» краснит check_epic_by_title/check_epic_by_open_sub_issues.
+      - name: Тесты гвардии «PR не заводится на эпик»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_epic_guard.py -q
+
+      # Проводка той же гвардии в task-branch целиком (не только логика
+      # epic_guard.py выше): номер эпика падает ДО создания ветки, ветка не
+      # остаётся созданной; обычная задача заводится штатно. python3
+      # застаблен в PATH тем же CLI-контрактом, что epic_guard.py — сеть/gh
+      # не нужны (класс воспроизведён живьём: PR #162, 44 раунда ревью на
+      # ветку, привязанную к эпику #77).
+      - name: Smoke «task-branch отказывает на эпике»
+        run: bash scripts/git/test/task-branch-epic-guard.smoke.sh
+
+      # Гейт слияния и выборочное подтягивание веток (#252): одно место
+      # правды review_labels.should_update_branch — подтягивать только PR с
+      # обоими зелёными вердиктами или уже в конфликте, не всех открытых
+      # подряд (иначе синхронизация pr-review.yml/ai-review.yml на каждое
+      # слияние). Прод-форма: фикстура — реальный снимок открытых PR этого
+      # репозитория.
+      - name: Тесты меток-вердиктов ревью и выборочного подтягивания веток
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_review_labels.py -q
+
+      # Атомарная аренда задачи (#121): гонка двух claim (замок существует →
+      # второй отказ), TTL по дате коммита замка, release. Без сети — gh на
+      # уровне subprocess-мока с прод-формой ответов.
+      - name: Тесты аренды задачи claim_task
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_claim_task.py -q
+
+      # Номер задачи из текста PR/issue — одно место правды (#187): границы
+      # числа с обеих сторон, не подстрока (#18 не должен матчить #180/#5180;
+      # регресс живого прогона orchestra 33570081734).
+      - name: Тесты извлечения номера задачи task_ref
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_ref.py -q
+
+      # Исход PR ветки задачи — один классификатор на все случаи (#413,
+      # живой случай PR #402/прогон 34002439672): слитый PR (даже уже
+      # закрытый к моменту проверки) — успех, не «нет открытого PR».
+      # Мутация «merged — это провал» красит гвардию.
+      - name: Тесты исхода PR ветки pr_outcome
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_outcome.py -q
+
+      # Резолвер «PR → задача» (#259, #394): task_section обязан резолвить
+      # задачу PR через resolve_pr_task (единственный источник — имя ветки,
+      # тело PR не читается вовсе), а не «первое попавшееся число» из прозы
+      # описания — этот класс путал #253 с #120, #248 с #119, #247 с #43,
+      # #263 с #4.
+      # Гвардия сканирует вызовы task_ref.extract_task_refs/TASK_REF_RE вне
+      # ALLOWED_WIDE_USAGE и красит CI, если узкий контекст «эта задача
+      # закрыта/занята» вновь тронут широкой семантикой.
+      - name: Гвардия «резолвер PR → задача, не подстрока прозы»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_task_ref_usage_guard.py -q
+
+      # Класс «страница GitHub API без обхода молча теряет хвост» (#308): за
+      # сутки чинили точечно семь раз (check_pr.py, ai_review.py, scheduler.py,
+      # review_labels, таймлайн), каждый раз находилось следующее место.
+      # Гвардия сканирует scripts/ на сырые gh(...per_page=...) без параметра
+      # page= вне ALLOWED_SINGLE_PAGE_CALLS (список ограничен по природе или
+      # уже кричит громко на упоре) — новое такое место красит CI.
+      - name: Гвардия пагинации — списочный ответ GitHub API без обхода страниц
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pagination_guard.py -q
+
+      # Утечка секрета (#743, живой случай — DSH_CHAIN_CLASS_NOTE,
+      # scripts/lib/dsh-ci.sh, до фикса): сырой stderr клиента модели уходил
+      # в публичный лог без redact() — GitHub маскирует только точное
+      # совпадение секрета, производное (эхо заголовка Authorization) не
+      # маскируется. Гвардия сканирует scripts/**/*.sh на команды-извлечения
+      # содержимого файла (cat/tr/cut/head/tail/sed/…), применённые к
+      # err_file/stderr.txt/answer_file/answer.txt, без redact в том же
+      # pipe-конвейере — новое такое место красит CI.
+      - name: Гвардия «сырой stderr клиента модели без redact» (#743)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dsh_stderr_redact_guard.py -q
+
+      # Класс «метку ставит событие A, снимает только событие B, не
+      # покрывающее способ реального исправления» (#599, живой случай PR
+      # #586: contract:failed висел вечно, потому что правка ТЕЛА PR не
+      # входила в pull_request.types job'а contract). Гвардия сканирует
+      # .github/workflows/*.yml на job'ы, читающие тело PR и удаляющие метку,
+      # без edited в pull_request.types — новый такой job красит CI, если не
+      # назван явно в ALLOWLIST с номером задачи.
+      - name: Гвардия «газ метки достижим правкой тела PR»
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_body_label_release_reachable.py -q
+
+      # Белое пятно #43 «второй пакетный менеджер поверх pnpm-дерева
+      # standalone»: npm install поверх дерева с семью обязательными для
+      # Workers pnpm-патчами пересобирает node_modules без патчей — зелёная
+      # сборка с молча неверным составом; --legacy-peer-deps маскирует то же
+      # место зелёным шагом. Гвардия: deploy-dsh-edge.yml не ставит пакеты
+      # npm'ом (npm pack префаба легален — дерево не трогает), флаг запрещён
+      # во всех workflow и scripts/*.sh, pnpm-маршрут плагинов (pnpm add
+      # --save-exact + проверка patchedDependencies) обязан оставаться.
+      - name: Гвардия пакетного менеджера standalone dsh-edge (#43)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dsh_edge_pnpm_guard.py -q
+
+      # Выбор свободной задачи воркером (#245): открытый PR без исполнителя
+      # больше не исключает задачу из пула навсегда (scheduler.py::unhealthy_pulls
+      # снимает исполнителя намеренно, чтобы её довели) — и «занятость» решает
+      # ТОЛЬКО task_ref.task_from_branch (имя agent-ветки, #394, решение
+      # владельца 2026-09-06: тело PR не читается вовсе), не любое упоминание
+      # номера в прозе PR (класс #187/#195). Кормится реальным телом PR #181.
+      - name: Тесты выбора свободной задачи free_task
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_free_task.py -q
+
+      # Разделение GitHub-токенов (задача #6, ADR 0008): узкий GH_DISPATCH_TOKEN
+      # (fine-grained, морда) упоминает только deploy-worker.yml и синх
+      # сохранён; широкие потребители (worker/orchestra/deploy-dsh-edge/probe)
+      # — на GH_PIPELINE_PAT. Регресс «подсел на dispatch-токен» красит CI,
+      # а не молча ломает конвейер следующим сужением. Доказана мутацией:
+      # каждое из трёх правил красится своей правкой.
+      - name: Гвардия разделения GitHub-токенов
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_dispatch_token_usage.py -q
+
+      # Реестр меток «тормоз → газ» (задача #207): docs/agents/LABELS.md не
+      # хардкодит список меток — scripts/lib/collect_labels.py собирает их
+      # сканированием scripts/, .github/workflows/, .github/ISSUE_TEMPLATE/.
+      # Три мутации краснят гвардию по отдельности: новая метка без строки в
+      # реестре, пустая колонка «Газ», мёртвая строка на метку, которой в
+      # коде больше нет (сплошной прочёс 2026-09-02 нашёл пять тормозов из
+      # шести без объявленного газа — #205, #204, #196).
+      - name: Гвардия реестра меток — у каждого тормоза-метки объявлен газ
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_label_registry.py -q
+
+      # Инвентарь workflow docs/agents/INFRA-GH.md (находка ревью PR #326/#333):
+      # worker-ci.yml был удалён и восстановлен (#72/#331) уже ПОСЛЕ прошлой
+      # сверки таблицы — строка не добавилась, заголовок продолжал утверждать
+      # «прочитаны все». Две мутации краснят по отдельности: новый/восстановленный
+      # .yml без строки в таблице; мёртвая строка на удалённый .yml.
+      - name: Гвардия инвентаря INFRA-GH.md — каждый workflow назван в таблице
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_infra_gh_inventory.py -q
+
+      # Канарейка класса «осиротевший тест» (#583): PR #568 слил
+      # scripts/lib/test_duplicate_guard.py (семь тестов гвардии дублей issue)
+      # — файл НЕ БЫЛ подключён ни к одному workflow, ни разу не выполнялся.
+      # Вскрылось не проверкой, а ручным чтением. scripts/lib/orphan_test_guard.py
+      # сканирует файловую систему на все виды тестов (python/bash/node/vitest),
+      # разбирает РЕАЛЬНЫЕ run:-команды .github/workflows/*.yml (не греп по
+      # имени файла — pytest на директорию покрывает всё под ней) и красит CI
+      # точным текстом «какой файл — что сделать», если тест не покрыт ни
+      # одной командой. Легальный газ — маркер `ORPHAN-TEST-OK: <причина>`
+      # внутри самого файла теста (docstring модуля — вся механика). Живой
+      # снимок ниже — сама канарейка обязана проверять состояние репозитория,
+      # а не только доказывать логику мутацией юнит-тестов.
+      - name: Тесты канарейки осиротевших тестов
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_orphan_test_guard.py -q
+      - name: Канарейка осиротевших тестов — живой снимок (#583)
+        run: python scripts/lib/orphan_test_guard.py
+
+      # Паритет маскирования (ревью PR #173): инбокс морды пишет фриформ-текст
+      # владельца в публичный issue — паттерны секретов cf-worker/src/redact.ts
+      # обязаны совпадать один к одному с dsh-ci.sh::redact. Две мутации
+      # краснят: форма добавлена только в bash; число форм разъехалось.
+      - name: Гвардия паритета маскирования секретов (bash ↔ TS)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_redact_parity.py -q
+
+      # AI-ревью — второй гейт (#18): контракт вердикта (последняя строка
+      # «ВЕРДИКТ: …», неоднозначность = error), блоки задач в беклог,
+      # канонический комментарий (шапка-факты + фенсы) и гейт слияния по
+      # меткам review:ok И ai:ok. Чистая логика, без сети.
+      - name: Тесты AI-ревью (второй гейт)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_ai_review.py -q
+
+      # Гейт первого ревью в ai-review.yml (#204, второй заход): шаг `facts`
+      # решает `go=true/false` bash-логикой ВНУТРИ самого workflow — тест
+      # исполняет РЕАЛЬНЫЙ `run:`-скрипт этого шага, не пересказ на python.
+      # Лежал без единого шага CI (находка канарейки осиротевших тестов,
+      # #583) — тот же класс, что закрывали test_waiting_owner_guard.py и
+      # test_apply_owner_decision.py выше по этому же файлу.
+      - name: Гвардия гейта первого ревью ai-review.yml (#204)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_ai_review_gate.py -q
+
+      # Масштаб находки (#426): file_tasks.py заводит issue только для
+      # МАСШТАБ: отдельно — фильтр защиты в глубину (build_comment уже не
+      # фенсит хвост/без-поля, но искажённый/ручной комментарий проверяется
+      # ещё раз здесь).
+      - name: Тесты file_tasks.py — фильтр МАСШТАБ (#426)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/review/test_file_tasks.py -q
+
+      # Третья категория находок ревью (#462): блок ЗАМЕЧАНИЕ, слияние с
+      # чеклистом тела PR, незакрытые пункты при слиянии. Лежал без единого
+      # шага CI (находка канарейки осиротевших тестов, #583).
+      - name: Тесты review_checklist.py — категория ЗАМЕЧАНИЕ (#462)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_review_checklist.py -q
+
+      # Гвардии check_pr.py. Одна — аргумент --tree (bootstrap PR #138):
+      # check_pr.py исполняется доверенным чекаутом main, а не деревом
+      # проверяемого PR (см. комментарий в pr-review.yml); регресс сигнатуры
+      # вернёт bootstrap-тупик «unrecognized arguments: --tree» на первом же
+      # PR, который его зовёт. Вторая — размерный гейт (#90): условие жило
+      # инлайном в main() без тестов, и там стоял NameError (задача #90,
+      # дошёл с #85) — обязательная проверка review молча падала только на
+      # диффах > LARGE_DIFF_LINES, где её нельзя не заметить.
+      - name: Гвардии check_pr.py — аргумент --tree и размерный гейт (#90)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/review/test_check_pr.py -q
+
+      # Триггерная проводка обоих гейтов (#208): класс «ботовский update-branch
+      # снёс свежий ai:ok, а второй гейт сам не перезапустился» закрыт связкой
+      # pr-review: synchronize → workflow_run(pr-review, completed) → ai-review.
+      # Эти блоки YAML не читает ни один скрипт — их читает только GitHub, поэтому
+      # снять любое звено можно молча для всех юнит-тестов; гвардия краснеет при
+      # правке триггеров, а не при первом живом инциденте.
+      - name: Гвардия триггеров гейтов ревью (#208)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/review/test_gate_triggers.py -q
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Юнит-контракт спула (tasks.md dsh-streaming §1): фикстура — настоящий
+      # Session.append над @deepseek-ai/dsh-session (tarball ставится с пином
+      # целостности прямо в тесте), обрыв строки читается как torn tail.
+      - name: Юнит-тесты плагина dsh-hands-streamer
+        run: node --test scripts/dsh-hands-streamer/test/streamer.test.mjs
+
+      # Сборка и поведение клиентского плагина plugin-manager (#102):
+      # build.mjs (валидация манифеста, seed-require, обёртка бандла) + рендер
+      # секции на прод-форме ответа журнала.
+      - name: Юнит-тесты плагина plugin-manager
+        run: node --test plugins-src/plugin-manager/test/client.test.mjs
+
+      # Общий разбор тела ошибки хранилища (#575, PR #587): ОДНО место правды
+      # для интеграций и plugin-manager — юнит-тест исполняет реальный текст
+      # файла в vm, поэтому гоняется прямо по исходнику, без установки
+      # (осиротевший тест #583: файл теста без workflow-шага — дефект).
+      - name: Юнит-тесты общего разбора тела ошибки (plugins-src/shared)
+        run: node --test plugins-src/shared/test/describe-response-error.test.mjs
+
+      # Инструменты runner_task/runner_status серверного плагина runner-bridge
+      # (#95): схема, конфигурационные и сетевые ошибки, формы ответов GitHub
+      # (201/204/404/4xx/5xx) — на моке fetch, без сети. Находка ревью PR #411:
+      # тест импортировал server/index.js, который тянет peer-зависимость
+      # `@deepseek-ai/dsh-tools` (не установлена нигде) — падал на загрузке
+      # модуля и никогда не запускался в CI (все тесты гнили молча). Логика
+      # вынесена в server/core.js без этой зависимости (по образцу
+      # integrations, #115) — тест импортирует оттуда напрямую.
+      - name: Юнит-тесты плагина runner-bridge
+        run: node --test plugins-src/runner-bridge/test/server.test.mjs
+
+      # Интеграции внешних систем (#115): форма реестра + гвардия проводки
+      # (каждый секрет реестра обязан быть упомянут в workflow'е своей
+      # проводки — иначе интеграция молча вечно not_configured), чистая логика
+      # инструментов на прод-форме ответов API (маскирование секретов и их
+      # base64-производных) и клиентский бандл раздела «Интеграции».
+      - name: Реестр интеграций — форма и проводка секретов
+        run: node dsh-edge/integrations.mjs
+      - name: Юнит-тесты логики инструментов интеграций
+        run: node --test plugins-src/integrations/test/core.test.mjs
+      - name: Юнит-тесты клиентского бандла интеграций
+        run: node --test plugins-src/integrations/test/client.test.mjs
+
+      # Гвардия совместимости плагинов (design.md «Workers-совместимость») +
+      # схема инструментов (#314): дефект схемы confluence_page (required:
+      # false вместо true/отсутствия ключа) уходил дальше codegen'а и
+      # ловился только рантайм-дымом deploy-dsh-edge.yml ПОСЛЕ мержа — сломанный
+      # контент плагина сутками красил ежедневный деплой по расписанию.
+      # check-plugin-compat.mjs запускается форжем перед сборкой tarball'а
+      # (plugin-forge.yml ещё не смёржен, #268) — здесь та же проверка на
+      # каждый PR, до публикации, а не только на деплое.
+      - name: Совместимость плагинов (Workers + схема инструментов)
+        run: |
+          for dir in plugins-src/*/; do
+            node dsh-edge/check-plugin-compat.mjs "$dir"
+          done
+
+      # Форма манифеста плагинов — та же валидация, что первый шаг
+      # deploy-dsh-edge.yml, но здесь она гоняется на КАЖДЫЙ PR, до мержа
+      # (класс #659: имя релиза, не совпадающее с тегом форжа
+      # «plugins-<id>-v<версия>», ловилось только красным деплоем на main
+      # после мержа с ежедневной перекраской кроном; parseManifest теперь
+      # проверяет связку release/asset/id — гвардия без вызова не гвардия,
+      # находка ревью PR #660).
+      - name: Форма манифеста плагинов (dsh-edge/plugins.json)
+        run: node dsh-edge/manifest.mjs > /dev/null
+
+      # Коллизия имён с апстримом (issue #518/#547/#551, класс PR #521): та же
+      # проверка, что и в deploy-dsh-edge.yml, но здесь она гоняется на КАЖДЫЙ
+      # PR (repo-ci.yml без path-фильтра) — включая PR авто-бампа пина
+      # (upstream_drift.py::attempt_auto_bump), который deploy-dsh-edge.yml не
+      # проверяет вовсе (деплой не гоняется на pull_request). Проверка читает
+      # реальный апстримный артефакт на пине из dsh-edge/upstream.json, а не
+      # захардкоженный список — так она не протухнет к следующему бампу.
+      - name: Коллизия имён с апстримом (namespace/label/inject/slot)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node dsh-edge/check-upstream-namespace-collision.mjs
+
+      # Реестр провайдеров морды (#378): плагин инсталлируется в настоящий
+      # cordis с LlmRuntime + SettingsProvider (фикстура — tarball'ы
+      # @deepseek-ai с пином целостности): namespace, directory, добавление,
+      # рестарт DO, негатив при записи, MISSING_CREDENTIAL без сети.
+      - name: Юнит-тесты плагина provider-registry
+        run: node --test plugins-src/provider-registry/test/registry.test.mjs
+
+      # Гвардия литерала llm-pi-ai (#378) доказана мутацией: зелёная на живом
+      # литерале, красная с ожидаемым сообщением на переименованном (это и
+      # есть симуляция апстримного релиза, убившего кнопку создания).
+      - name: Мутационный тест гвардии литерала namespace
+        run: node --test dsh-edge/verify-provider-namespace.test.mjs
+
+      # Находка ревью PR #453, п.2: dsh-edge/plugins.json и
+      # dsh-edge/plugins-catalog.json рендерятся в клиентский бандл плагином
+      # plugin-manager (client:true) — брифы каталога попадают в dist
+      # буквально. Случайное совпадение с приватным литералом NS$1 апстрима
+      # молча отравляет гвардию выше (живой прецедент — plugin-manager 0.1.4,
+      # бамп на 0.1.5 в этом же PR). Проверяет и сам каталог репозитория, и
+      # мутацию (просочившийся литерал красит гвардию).
+      - name: Гвардия «каталог плагинов не отравляет литерал namespace»
+        run: node --test dsh-edge/verify-catalog-namespace-literal.test.mjs
+
+      # Преграда бренд-замены морды (#109): замещающий бандл brand-official
+      # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
+      # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
+      - name: Бренд-бандл морды валиден
+        run: node --check dsh-edge/brand-official.client.js
+
+      # Синтаксис клиента рук: bash -n ловит поломку до ревью.
+      - name: Bash-скрипты валидны
+        run: |
+          shopt -s nullglob
+          for f in scripts/*.sh scripts/hands/*.sh scripts/worker/*.sh scripts/worker/test/*.sh scripts/lib/*.sh scripts/lib/test/*.sh scripts/plugins/*.sh scripts/plugins/test/*.sh scripts/review/*.sh scripts/git/task-branch scripts/git/pr-create scripts/git/test/*.sh scripts/ci/*.sh scripts/ci/guards/*.sh scripts/ci/test/*.sh .githooks/* scripts/cf/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+          done
+          echo "bash ok"
+
+      # Проверка на входе в task-branch (не гвардия постфактум): задача обязана
+      # существовать/быть открытой/нести task/не нести blocked до создания
+      # ветки — прогон на реальном git с фейковым gh, сеть не нужна. Тот же
+      # файл проверяет и рабочее дерево (#332): вне CI заводит/переиспользует
+      # .claude/worktrees/<task>, в CI (GITHUB_ACTIONS=true) старое поведение
+      # не меняется.
+      - name: Smoke task-branch — проверка на входе и рабочее дерево
+        run: bash scripts/git/test/task-branch.test.sh
+
+      # Проверка на входе в scripts/git/pr-create (не гвардия постфактум,
+      # issue #496): тело PR с Closes/Fixes/Resolves отклоняется ДО вызова
+      # `gh pr create` — реальный gh не вызывается вовсе (фейковый gh в
+      # PATH), а не только позже краснеет контракт.
+      - name: Smoke pr-create — Closes/Fixes/Resolves отклоняется до вызова gh (#496)
+        run: bash scripts/git/test/pr-create-guard.test.sh
+
+      # Паритет слов между scripts/git/pr-create и scripts/orchestra/
+      # contract_check.py (#496) — копия намеренная (contract_check.py
+      # дорабатывается параллельно, PR #423/#429, не общий импорт), расхождение
+      # списка слов красит CI, а не тихо теряется.
+      - name: Тесты паритета scripts/git/pr-create ↔ contract_check.py
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_pr_create_guard.py -q
+
+      # Гвардия класса #496 (статический скан «raw gh pr create вне обёртки»)
+      # РАССМОТРЕНА и сознательно НЕ заведена: подстрока `gh pr create`
+      # легитимно встречается в комментариях/доках/тексте тестов (в т.ч. в
+      # этом же PR — комментарии выше, промпт-строка scripts/worker/task.sh,
+      # сама обёртка), различить «упоминание» от «настоящий вызов» без
+      # полноценного парсера — та же неразрешимая в общем виде граница, что
+      # уже честно признана для #219 (AGENTS.md: «статически не выразим»).
+      # Два реальных места вызова (scripts/worker/task.sh, plugin-forge.yml)
+      # уже переведены на scripts/git/pr-create этим PR; страховка для новых
+      # мест — ревью, не статический греп (честная граница, issue #496).
+
+      # Проверка на входе в scripts/gh/issue-create (#526, живые случаи —
+      # issue #523 заведена агентом `gh issue create --label white-spot` мимо
+      # шаблона, #425 — без единой метки): отказ ДО вызова `gh issue create`,
+      # если среди --label нет task и не дан явный --no-task-ack.
+      - name: Smoke issue-create — issue без task отклоняется до вызова gh (#526)
+        run: bash scripts/gh/test/issue-create.test.sh
+
+      # Второй тормоз того же issue-create (#566): заголовок сверяется с уже
+      # открытыми задачами пула (scripts/lib/duplicate_guard.py) ДО вызова
+      # `gh issue create`. Оба файла — чистая логика duplicate_guard.py и
+      # smoke самой обёртки — лежали в репозитории без единого шага CI
+      # (находка канарейки осиротевших тестов, #583): реальный измеренный
+      # случай #562/#564, который они ловят, не был бы пойман повторно, если
+      # бы порог/regex в самом duplicate_guard.py тихо сломался.
+      - name: Тесты чистой логики duplicate_guard (#566)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_duplicate_guard.py -q
+      - name: Smoke issue-create — похожий заголовок отклоняется до вызова gh (#566)
+        run: bash scripts/gh/test/issue-create-duplicate-guard.test.sh
+
+      # Третий тормоз того же issue-create (#695): решение о приоритете
+      # (area:process) обязано быть явным — метка или --not-process-ack,
+      # иначе отказ ДО вызова `gh issue create`; верх группы приоритета
+      # печатается перед созданием. Живой случай — #684/#685/#689 заведены с
+      # area:orchestra вместо area:process и встали в хвост очереди из 200
+      # задач, хотя #194/#168/#226 уже несли ту же проблему другими словами.
+      - name: Smoke issue-create — приоритет не объявлен явно отклоняется до вызова gh (#695)
+        run: bash scripts/gh/test/issue-create-priority-gate.test.sh
+
+      # Гвардия класса #526 (статический скан «сырой gh issue create вне
+      # обёртки») РАССМОТРЕНА и сознательно НЕ заведена по ТОЙ ЖЕ причине,
+      # что и класс #496 выше: подстрока `gh issue create` легитимно
+      # встречается в комментариях/доках/тексте тестов (в т.ч. в этом же PR —
+      # комментарии выше, докстринг scripts/lib/pool_issue.py, сама обёртка,
+      # её тест), различить «упоминание» от «настоящий вызов» без
+      # полноценного парсера — та же неразрешимая в общем виде граница
+      # (AGENTS.md: «статически не выразим»). На момент этого PR ни одного
+      # реального вызова `gh issue create` мимо scripts/gh/issue-create в
+      # scripts//.github/workflows/ нет; страховка для новых мест — ревью, не
+      # статический греп (честная граница, issue #526). Канал промптов
+      # агентов («заведи issue» в задании, вне committed-кода репозитория)
+      # этой гвардией тоже не покрыт — это СОГЛАШЕНИЕ, зафиксированное в
+      # docs/agents/PROTOCOL.md, не механизм: ни один хук/CI не видит команду
+      # до того, как issue уже создана.
+
+      # Гвардия класса #476 (живой прогон worker.yml 34027035455, PR #408):
+      # доводка уже открытого PR обязана исполнять scripts/* (по пути, включая
+      # scripts/gh/infra_digest.sh) из main-дерева job'а, а не из ветки PR —
+      # инструментарий, добавленный в main ПОСЛЕ ответвления ветки PR, не
+      # должен пропадать. Прогон настоящего блока «5. Ветка» из
+      # scripts/worker/task.sh на реальном git, сеть не нужна.
+      - name: Smoke доводки PR — инструментарий из main, ветка PR отдельным worktree (#476)
+        run: bash scripts/worker/test/continue-pr-worktree.smoke.sh
+
+      # Аренда задачи в task-branch (#356): внешний/ручной канал теперь тоже
+      # берёт claim при создании ветки, не только облачный воркер — иначе
+      # free_task() в scripts/worker/task.sh считал бы такую задачу свободной,
+      # пока над ней прямо сейчас работает внешний агент. Локальный bare-репо +
+      # заглушки gh/python3 (без сети), мутационно доказано (см. заголовок
+      # файла): без вызова claim в task-branch сценарий «занятая задача»
+      # красный.
+      - name: task-branch берёт аренду задачи, не арендует дважды за транспортом
+        run: bash scripts/git/test/task-branch-lease.test.sh
+
+      # Обёртки статусов журнала исполняются целиком на заглушках: bash -n не
+      # ловит «удалил определение при живом вызове» (класс Б1 #119), а сломанная
+      # проводка scripts/lib/journal_status.sh — тихий пропуск статуса на деплое.
+      - name: Smoke обёрток статусов журнала
+        run: bash scripts/plugins/test/status-scripts.smoke.sh
+
+      # Рендер транскрипта в морде (#131): владелец видел провайдер/модель-
+      # заглушку и «unavailable» в деталях тула на демо — воспроизведено формой
+      # батча (assistant/message без content-блока tool-call), не сетью;
+      # scripts/lib/verify_transcript.py проверяет оба инварианта структурно
+      # на событиях, прочитанных обратно из морды (dsh_edge_verify_transcript).
+      - name: Тесты проверки рендера транскрипта (#131)
+        run: |
+          pip install --quiet pytest pyyaml
+          python -m pytest scripts/lib/test_verify_transcript.py -q
+      # Гвардия фильтров cf-inventory (#322) — в каталоге scripts/ci/guards/
+      # (cf-inventory-guard.sh), не рукописным шагом здесь: механизм #749.
+
+      # Гвардия класса «удалил определение при живом вызове» (ревью #128, Б1):
+      # bash -n тело не исполняет. Полный прогон обоих bash-клиентов на
+      # заглушках (curl/gh/dsh/pnpm/timeout — функции, git/npm/openssl — PATH):
+      # журнал получил job_start/job_end, морда — begin и ingest, воркер
+      # доложил в задачу. Сломанный клиент = красный smoke.
+      - name: Smoke bash-клиентов на заглушках (класс Б1 #119)
+        run: bash scripts/lib/test/dsh-clients.smoke.sh
+
+      # Гвардия класса #727: цепочка провайдеров переключается по классу
+      # отказа (quota_exhausted/HTTP_404), а не по любой ошибке — настоящее
+      # исполнение dsh_run_with_provider_chain (не bash -n) на заглушке dsh,
+      # роутящей ответ по модели.
+      - name: Smoke цепочки LLM-провайдеров (#727)
+        run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
+
+      # Гвардия критерия успеха воркера (#876) — в каталоге гвардий (#749):
+      # scripts/ci/guards/worker-success-gate-guard.sh, не рукописный шаг
+      # здесь (ALLOWLIST-ratchet ci_guard_registration_guard.py не даёт
+      # новым шагам попадать в этот файл).
+
+      # Гвардия стыка suite ротации учёток (#215) и цепочки провайдеров
+      # (#727/#737) — design.md dsh-in-job «Стык suite и цепочки
+      # провайдеров»: обе переменные разом — fail loud, не молчаливый
+      # приоритет; внутри цикла цепочки suite всегда глушится плоским патчем.
+      - name: Гвардия стыка suite и цепочки провайдеров (#215/#727)
+        run: bash scripts/lib/test/dsh-suite-chain-conflict.guard.sh
+
+      # Allowlist ingest-маршрута морды (патч 0004) ↔ спул стримера (ревью
+      # #128, М3): два списка без единого места правды — расхождение красит CI,
+      # а не живой job 400-м или мёртвой поверхностью.
+      - name: Allowlist ингеста ↔ спул стримера
+        run: node dsh-edge/verify-ingest-allowlist.mjs
+
+      - name: Все workflows — валидный YAML
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          bad = []
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              try:
+                  yaml.safe_load(open(path, encoding='utf-8'))
+              except Exception as error:
+                  bad.append(f'{path}: {error}')
+          if bad:
+              sys.exit('\n'.join(bad))
+          print(f'workflows ok: {len(glob.glob(".github/workflows/*.yml"))} files')
+          PY
+
+      # Гвардия класса #189: concurrency-группа на уровне ФАЙЛА, если она не
+      # параметризована по PR/ref/task (статическая строка), сериализует ВСЕ
+      # джобы файла между собой. При двух и более джобах с разной семантикой
+      # (например обязательная PR-проверка + периодическая очередь) это
+      # вытесняет проверку чужими прогонами — все PR молча теряют статус
+      # (было в orchestra.yml: contract пропадал у каждого PR). Concurrency в
+      # таком файле обязана быть объявлена на уровне каждого джоба отдельно.
+      - name: Гвардия concurrency — не сериализовать разные джобы одной статической группой
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          bad = []
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              doc = yaml.safe_load(open(path, encoding='utf-8'))
+              conc = doc.get('concurrency')
+              jobs = doc.get('jobs', {}) or {}
+              if conc is None or len(jobs) < 2:
+                  continue
+              group = str(conc.get('group', '')) if isinstance(conc, dict) else str(conc)
+              expr_marker = '$' + '{{'
+              is_static = expr_marker not in group
+              if is_static:
+                  bad.append(
+                      f'{path}: concurrency.group="{group}" статична и объявлена на '
+                      f'уровне файла с {len(jobs)} джобами ({", ".join(jobs)}) — '
+                      'перенеси concurrency на уровень каждого джоба (класс #189)'
+                  )
+          if bad:
+              sys.exit('\n'.join(bad))
+          print('concurrency: ни один многоджобовый workflow не сериализован статической файловой группой')
+          PY
+
+      # Гвардия класса #72: docs обещают ворота, которых нет. ADR 0004 обещал job
+      # `canary` в `worker-ci`, workflow снесён cleanup-коммитом 09ef969 — ADR молча
+      # продолжал обещать проверки на PR, и класс инцидента ADR (сломанная страница
+      # при зелёном CI) снова доезжал до прода. Ссылки на .github/workflows/*.yml
+      # в docs/ обязаны указывать на существующий файл. docs/research/ исключён:
+      # там чужие системы, их CI живёт в их репозиториях; openspec/changes/ —
+      # планируемое будущее, а не установленный факт.
+      - name: Гвардия «workflow из docs существует»
+        run: |
+          python - <<'PY'
+          import re, sys
+          from pathlib import Path
+
+          pattern = re.compile(r"\.github/workflows/([A-Za-z0-9._/-]+\.ya?ml)")
+          missing, total = [], 0
+          for path in sorted(Path("docs").rglob("*.md")):
+              if path.as_posix().startswith("docs/research/"):
+                  continue
+              for match in pattern.finditer(path.read_text(encoding="utf-8")):
+                  total += 1
+                  ref = match.group(0)
+                  if not Path(".github/workflows", match.group(1)).is_file():
+                      missing.append(f"{path.as_posix()}: ссылка на несуществующий workflow {ref}")
+          if missing:
+              sys.exit("\n".join(missing))
+          print(f"docs: все {total} ссылок на .github/workflows/ существуют")
+          PY
+
+      # rate_guard.py (#454) — гейт квоты, который шаг ниже вызывает напрямую —
+      # лежал без единого шага CI своего юнит-теста (находка канарейки
+      # осиротевших тестов, #583): фикстура REAL_RATE_LIMIT_RESPONSE — дословный
+      # вывод `gh api rate_limit`, захваченный живым вызовом 2026-09-06.
+      - name: Тесты гейта квоты rate_guard (#454)
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_rate_guard.py -q
+
+      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
+      # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
+      # живого падения, что у PR #428 (оба обязательных гейта, `test` в том
+      # числе, упали с `API rate limit exceeded for installation`). Мало
+      # квоты → шаг инвариантов пропускается (условие ниже) и job `test`
+      # остаётся зелёным вместо случайного красного по чужой причине;
+      # предупреждение печатается здесь же, до пропуска. Порог и обоснование —
+      # scripts/lib/rate_guard.py.
+      - name: Квота GitHub API — ранняя проверка (инварианты)
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job repo-ci-invariants
+
+      # Живой снимок инвариантов состояния репозитория (#244) — на каждый
+      # push/PR, раньше следующего пульса orchestra (см. также periodic-шаг
+      # в orchestra.yml с эскалацией). Все инварианты проверяют СОСТОЯНИЕ
+      # репозитория (issues/PR/openspec), а не дифф текущего PR — обвал
+      # состояния, накопленный за месяцы, не вина автора конкретного пуша,
+      # поэтому required-гейт включается точечно через CI_GATING
+      # (scripts/orchestra/repo_invariants.py), а не разом для всех.
+      # Решение владельца (PR #249, 2026-09-03) было включить 3 и 4 сразу —
+      # оба сужены обратно до наблюдательного той же процедурой (внешняя
+      # находка ПОСЛЕ решения владельца, не пересмотр самого решения): у
+      # газа инварианта 3 (trigger_ai_review) обнаружилась зависимость от
+      # такта оркестратора, а такт ненадёжен (#269) — включится обратно
+      # после закрытия #269; у инварианта 4 живой замер 2026-09-07 нашёл
+      # backlog — 23 каталога, удовлетворяющих второму пути завершённости
+      # (docs/agents/OPENSPEC-PROTOCOL.md), не перенесённых в archive/.
+      # Фактически required сейчас только 7. См. CI_GATING в
+      # repo_invariants.py для условия и GATING_RELEASE_CONDITION для газа
+      # каждого инварианта (для 4 — backlog разобран отдельными PR до нуля
+      # нарушений по обоим путям, план в OPENSPEC-PROTOCOL.md, затем 4
+      # возвращается в CI_GATING той же правкой константы). 1/2/5 —
+      # наблюдательные, пока не обнулён накопленный долг (17/20 из 66/7
+      # нарушений на замер). Инвариант 7 (#219, двусмысленная формула
+      # принадлежности плагина) включён required сразу при создании: ноль
+      # нарушений на момент включения — фраза вычищена тем же PR.
+      - name: Инварианты состояния репозитория — живой снимок (7 — required)
+        if: steps.quota.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/orchestra/repo_invariants.py
+
+      # Гвардия «карта документации полна» (#670): AGENTS.md первым действием
+      # предписывает читать docs/INDEX.md — «карта всего, что уже исследовано».
+      # Документ может физически лежать в docs/{decisions,research,runbooks,agents}
+      # и не быть достижим с карты — живой случай: ADR 0015 (PR #667) не попал
+      # в индекс, и ни одна проверка этого не заметила. Две мутации краснят
+      # по отдельности: файл документации без ссылки из индекса; ссылка индекса
+      # на файл, которого больше нет на диске (битая карта хуже неполной).
+      - name: Тесты гвардии полноты карты документации
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/lib/test_docs_index_guard.py -q
+      - name: Гвардия полноты карты документации — живой снимок (#670)
+        run: python scripts/lib/docs_index_guard.py
+
+      # Каталог гвардий (#749): регистрация гвардии — данные (файл
+      # scripts/ci/guards/<имя>.sh), не рукописный шаг здесь. Этот ОДИН шаг
+      # перебирает каталог и исполняет каждый файл целиком (свои
+      # pip/pytest/node внутри) — добавление новой гвардии = новый файл в
+      # scripts/ci/guards/, без единой правки этого workflow. Стоит
+      # последним шагом job `test`, после setup-python и setup-node выше —
+      # каталог может нести как python/pytest-, так и node/bash-гвардии без
+      # дополнительного setup. Имя шага НЕ начинается с
+      # Тест/Гвардия/Smoke/Юнит-тест намеренно — scripts/lib/
+      # ci_guard_registration_guard.py не должен путать этот перебор с
+      # рукописной регистрацией, которую он же и запрещает.
+      #
+      # GH_TOKEN — на уровне ЭТОГО шага, не job (ревью PR #771, minor 6):
+      # ни одна гвардия каталога на момент этого PR не читает `gh api`, и
+      # job-level `env:` расширял бы радиус до всех 94 шагов job (каждый
+      # pytest-прогон) без единого потребителя. `bash "$script"` внутри
+      # scripts/ci/run_guards.sh — дочерний процесс ЭТОГО шага, поэтому
+      # переменная окружения step-уровня доходит до любого файла каталога
+      # без per-файловой проводки — то же обоснование, что design.md
+      # называл для job-level, просто на меньшем радиусе.
+      - name: Каталог гвардий scripts/ci/guards — перебор (#749)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/run_guards.sh
+
+  # Инвариант 4 (#244) — автофикс НА ВХОДЕ, не гейт постфактум (issue #493).
+  # Замер 2026-09-06 06:00-12:00 UTC: 5 падений job `test` подряд красили
+  # ЧУЖИЕ PR состоянием main (openspec/changes/<id> с полностью отмеченным
+  # tasks.md, не перенесённый в archive/ — ручной шаг, забытый агентом).
+  # Только pull_request: прямой пуш в main отклоняется защитой (AGENTS.md,
+  # «Прямой пуш в main не проходит обязательные проверки») — эта job чинит
+  # ветку PR, где чекбоксы дозакрылись, ДО того как состояние долетит до
+  # main. github.token не подходит: пуш от github-actions[bot] не зажигает
+  # новый workflow-run (антирекурсия GitHub) — ветка осталась бы с фиксом, но
+  # БЕЗ статуса test/contract на новом коммите, required checks зависли бы в
+  # Expected. secrets.GH_PIPELINE_PAT (широкий PAT владельца — тот же, что
+  # worker.yml/orchestra.yml, реестр PIPELINE_CONSUMERS,
+  # scripts/lib/test_dispatch_token_usage.py) пушит реальным аккаунтом —
+  # required-проверки перезапускаются на свежем коммите штатно.
+  archive-fixup:
+    # Гвардия класса #476/#506 (живой факт: прогон 34036104522, сразу после
+    # мержа #493, — «No such file or directory» на ветке PR старше появления
+    # archive_complete_changes.py): чекаут ЭТОГО job'а — main (инструментарий
+    # гарантированно свежий), ветка PR — отдельный linked git worktree, куда
+    # cd'аемся ПЕРЕД вызовом скрипта; сам скрипт вызывается по абсолютному
+    # пути из main-дерева ($GITHUB_WORKSPACE), а правит REPO_ROOT = cwd
+    # (см. докстринг archive_complete_changes.py) — дерево ветки PR.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GH_PIPELINE_PAT }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Автоархивация openspec/changes с полностью выполненным tasks.md (#493)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
+        run: |
+          # checkout@v7 без fetch-depth: 0 (строка выше) не создаёт
+          # refs/remotes/origin/main — .githooks/pre-commit (core.hooksPath
+          # ниже) требует именно этот ref для проверки свежести базы и
+          # падает «нет refs/remotes/origin/main», как только archive_
+          # complete_changes.py реально доходит до git commit (живой случай:
+          # PR #711, первый прогон job'а, чей change оказался полностью
+          # отмечен). worker.yml для той же доводки PR фетчит fetch-depth: 0
+          # целиком; здесь дешевле явный фетч одной ветки.
+          git fetch origin main
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          git fetch origin "$BRANCH"
+          PR_WORKTREE="$RUNNER_TEMP/pr-worktree"
+          rm -rf "$PR_WORKTREE"
+          git worktree add -B "$BRANCH" "$PR_WORKTREE" "origin/$BRANCH"
+          git -C "$PR_WORKTREE" branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
+          git config core.hooksPath .githooks
+          cd "$PR_WORKTREE"
+          python "$GITHUB_WORKSPACE/scripts/orchestra/archive_complete_changes.py"

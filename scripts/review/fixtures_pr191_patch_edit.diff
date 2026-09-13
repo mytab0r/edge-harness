@@ -1,0 +1,185 @@
+diff --git a/.github/workflows/deploy-dsh-edge.yml b/.github/workflows/deploy-dsh-edge.yml
+index d664d934..0c140962 100644
+--- a/.github/workflows/deploy-dsh-edge.yml
++++ b/.github/workflows/deploy-dsh-edge.yml
+@@ -328,8 +328,10 @@ jobs:
+       # файлы, не декодировавшиеся как UTF-8), а число «mytab0r Harness» обязано
+       # сойтись с числом замен. Шаг стоит на общей части обоих путей сборки,
+       # после патча каталога (тот брендовых строк не трогает). Форма проверена
+-      # на артефакте dsh-edge 0.7.1 (пин из dsh-edge/upstream.json) и на живом
+-      # проде: 16 вхождений, все — внутри человекочитаемых литералов.
++      # на артефакте dsh-edge 0.7.1 (пин из dsh-edge/upstream.json на момент
++      # проверки; #134 подняла пин до 0.8.0) и на живом проде: 16 вхождений,
++      # все — внутри человекочитаемых литералов. Гвардия ниже (>0 до замены,
++      # 0 после) перепроверяет форму на каждом деплое, а не полагается на число.
+       - name: Бренд морды (DeepSeek Harness → mytab0r Harness)
+         working-directory: ${{ github.workspace }}/deploy
+         run: |
+diff --git a/docs/research/11-dsh-edge.md b/docs/research/11-dsh-edge.md
+index 69817375..e3f154d7 100644
+--- a/docs/research/11-dsh-edge.md
++++ b/docs/research/11-dsh-edge.md
+@@ -51,7 +51,7 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
+ 
+ Семь пакетов пропатчены через `pnpm patch`, патчи лежат в `apps/dsh-edge/standalone/patches/`. Рядом — `patches/audit.json`, который называет причину каждого патча и **условие его снятия**. Это самый ценный один файл во всём репозитории для нас: он перечисляет, обо что именно Harness спотыкается в Workers.
+ 
+-Уточнение при реализации #80 (пин `113a969` = release 0.7.1): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
++Уточнение при реализации #80 (пин `113a969` = release 0.7.1, поднят задачей #134 до `b9a8ddd` = release 0.8.0): в списке **семь** патчей, не пять — добавились `dsh-api-gateway` (AbortController нельзя конструировать в глобальном скоупе Workers — отложен до первого использования) и `dsh-sandbox` (убраны `node:fs` realpathSync и `node:os` tmpdir). Остальное — как в таблице.
+ 
+ | Пакет | Что чинит |
+ |---|---|
+@@ -172,7 +172,7 @@ const MAX_REPLAY_RESPONSE_BYTES = 1_048_576
+ 
+ - **Нативные бинари, фоновые процессы, PTY, произвольное Linux-поведение — недоступны** (README:117). Это же заявлено модели в системном промпте: `agent.ts:8-12` — "The shell is just-bash, not Linux".
+ - **Сеть из команд** — "no network command" в direct-режиме (README:201).
+-- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184). Портирован только Web Search с 30-секундным таймаутом tool-call.
++- **`web_fetch` отключён** — "no arbitrary-URL network policy" (README:184), верно на пине 0.7.1. Release 0.8.0 (бамп #134) добавил ограниченный `web_fetch` (bounded public fetching: запрет встроенных credentials, IP-литералов и local-скоупов, лимиты на длину URL/байты ответа/редиректы/время) — не проверялось живьём после бампа, факт из release notes апстрима. Портирован также Web Search с 30-секундным таймаутом tool-call — тот же лимит теперь общий для обоих инструментов.
+ - **Не портированы**: filesystem editor tools, MCP, skills, workflows, jobs, **subagents** (README:125).
+ - Нет HMR и локального boot-профиля (README:121); нет session-log export и локальных host-плагинов (README:26).
+ - Нет регистрации, базы пользователей, ролей, мультитенантного роутинга (README:127) — жёстко один DO с именем `owner`, вход по одному высокоэнтропийному секрету воркера, обмениваемому на подписанную 30-дневную HttpOnly `SameSite=Strict` куку.
+diff --git a/docs/research/12-dsh-edge-session-api.md b/docs/research/12-dsh-edge-session-api.md
+index eab718be..1f759849 100644
+--- a/docs/research/12-dsh-edge-session-api.md
++++ b/docs/research/12-dsh-edge-session-api.md
+@@ -1,7 +1,10 @@
+ # dsh-edge: session API и шов импорта транскрипта
+ 
+ > Исследовано 2026-08-30/31 в рамках #119; нативные вызовы выверены на живом
+-> проде (dsh-edge.mytab0r.workers.dev, release 0.7.1 = пин 113a969). Смежное:
++> проде (dsh-edge.mytab0r.workers.dev, release 0.7.1 = пин 113a969). Пин
++> поднят задачей #134 до release 0.8.0 (`b9a8ddd`) — API, описанный ниже, не
++> менялся между релизами (патч 0004-harness-ingest применился без правок
++> в затронутых им местах session-store.ts). Смежное:
+ > [архитектура dsh-edge](11-dsh-edge.md).
+ 
+ ## Auth: кука владельца, не Bearer
+diff --git a/dsh-edge/PATCHES.md b/dsh-edge/PATCHES.md
+index 179beb1d..1a746515 100644
+--- a/dsh-edge/PATCHES.md
++++ b/dsh-edge/PATCHES.md
+@@ -21,6 +21,25 @@
+ Патч 0004 — у порога «>100 содержательных строк»; при первом же расширении шва —
+ выносить нормализацию в отдельный модуль или пересматривать «серия против форка».
+ 
++Бамп пина #134 (0.7.1 → 0.8.0, `dsh-edge/upstream.json`): патчи 0001–0003
++наложились без изменений. Патч 0004 (`0004-harness-ingest.patch`) конфликтовал
++ровно в одном месте — апстрим 0.8.0 добавил независимую фичу message feedback
++(`MAX_MESSAGE_FEEDBACK_BODY_BYTES`, маршрут `/api/messageFeedback/put`) в тот
++же импорт-блок и тот же тернарник выбора лимита тела запроса в `src/index.ts`,
++где наш патч вставляет ветку `/ingest`. Конфликт структурный (соседняя строка
++диффа), не смысловой — обе фичи независимы. Перебазировано вручную: ветка
++`/ingest` проверяется первой в тернарнике, дальше — ветка апстрима без
++изменений. Файлы `http.ts`, `instance.ts`, `session-store.ts` патча 0004
++наложились без правок. Доказательство: полная серия 0001–0004 применена
++`git apply` подряд на чистом клоне пина 0.8.0 без единого хунка мимо.
++
++Дополнительный факт для риска UI-контракта (`plugins-src/plugin-manager`,
++seed-карта `staticModules` снята с бандла 0.7.1): `apps/dsh-edge/standalone/
++package.json` пиннует `@deepseek-ai/dsh-web-app` и `@deepseek-ai/dsh-web-frontend`
++на `0.1.1-rc.2` **одинаково** в 0.7.1 и в 0.8.0 — минорный скачок dsh-edge не
++трогает версию UI-пакетов апстрима, значит boot-граф и seed-карта из
++`plugins-src/plugin-manager/build.mjs` не изменились.
++
+ ## Гвардия состава
+ 
+ [`verify-edge-plugins.mjs`](verify-edge-plugins.mjs) — проверка «манифест ↔
+diff --git a/dsh-edge/patches/0004-harness-ingest.patch b/dsh-edge/patches/0004-harness-ingest.patch
+index 3dd7a926..bb576264 100644
+--- a/dsh-edge/patches/0004-harness-ingest.patch
++++ b/dsh-edge/patches/0004-harness-ingest.patch
+@@ -1,8 +1,8 @@
+ diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
+-index 7e64c79..64566fa 100644
++index 30c8dda..edbf612 100644
+ --- a/apps/dsh-edge/src/http.ts
+ +++ b/apps/dsh-edge/src/http.ts
+-@@ -10,6 +10,10 @@ export const MAX_SESSION_CREATE_BODY_BYTES = 8_192
++@@ -12,6 +12,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
+  // Four projected image uploads fit after base64 expansion plus the RPC envelope.
+  export const MAX_TURN_BODY_BYTES = 10 * 1_024 * 1_024
+  export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
+@@ -14,7 +14,7 @@ index 7e64c79..64566fa 100644
+  /** Invalid caller input with an explicit HTTP response status. */
+  export class EdgeHttpError extends Error {
+ diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
+-index 4a23ef9..51bfc93 100644
++index a7749d5..bf1b380 100644
+ --- a/apps/dsh-edge/src/index.ts
+ +++ b/apps/dsh-edge/src/index.ts
+ @@ -10,6 +10,7 @@ import {
+@@ -22,25 +22,29 @@ index 4a23ef9..51bfc93 100644
+  import {
+    EdgeHttpError,
+ +  MAX_HARNESS_INGEST_BODY_BYTES,
++   MAX_MESSAGE_FEEDBACK_BODY_BYTES,
+    MAX_SESSION_CREATE_BODY_BYTES,
+    MAX_TURN_BODY_BYTES,
+-   MAX_WORKSPACE_EXEC_BODY_BYTES,
+-@@ -166,11 +167,13 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
++@@ -167,13 +168,15 @@ async function requestForInstance(request: Request, ownerSessionExpiresAt: numbe
+    headers.set(OWNER_SESSION_EXPIRY_HEADER, String(ownerSessionExpiresAt))
+    if (request.body === null) return new Request(request, { headers })
+    const url = new URL(request.url)
+--  const maxBytes = url.pathname.endsWith('/turn')
+--    || url.pathname === '/api/session.prompt'
+--    || url.pathname === '/api/session.updateQueue'
+--    ? MAX_TURN_BODY_BYTES
+--    : MAX_SESSION_CREATE_BODY_BYTES
++-  const maxBytes = url.pathname === '/api/messageFeedback/put'
++-    ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
++-    : url.pathname.endsWith('/turn')
++-      || url.pathname === '/api/session.prompt'
++-      || url.pathname === '/api/session.updateQueue'
++-      ? MAX_TURN_BODY_BYTES
++-      : MAX_SESSION_CREATE_BODY_BYTES
+ +  const maxBytes = url.pathname.endsWith('/ingest')
+ +    ? MAX_HARNESS_INGEST_BODY_BYTES
+-+    : url.pathname.endsWith('/turn')
+-+      || url.pathname === '/api/session.prompt'
+-+      || url.pathname === '/api/session.updateQueue'
+-+      ? MAX_TURN_BODY_BYTES
+-+      : MAX_SESSION_CREATE_BODY_BYTES
+++    : url.pathname === '/api/messageFeedback/put'
+++      ? MAX_MESSAGE_FEEDBACK_BODY_BYTES
+++      : url.pathname.endsWith('/turn')
+++        || url.pathname === '/api/session.prompt'
+++        || url.pathname === '/api/session.updateQueue'
+++        ? MAX_TURN_BODY_BYTES
+++        : MAX_SESSION_CREATE_BODY_BYTES
+    const body = await readBoundedBody(
+      request,
+      maxBytes,
+@@ -121,10 +125,10 @@ index 9b15245..43f172f 100644
+    }
+    return { sessionId: id, action }
+ diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
+-index e5e0f88..e4e80e5 100644
++index d408d3f..02fb4f0 100644
+ --- a/apps/dsh-edge/src/session-store.ts
+ +++ b/apps/dsh-edge/src/session-store.ts
+-@@ -1084,6 +1084,59 @@ export class EdgeSessionStore {
++@@ -1096,6 +1096,59 @@ export class EdgeSessionStore {
+      }
+    }
+  
+@@ -184,7 +188,7 @@ index e5e0f88..e4e80e5 100644
+    /** Count live Agent owners for host.describe. */
+    async attachedSessionCount(): Promise<number> {
+      const { agents } = await this.services()
+-@@ -1287,6 +1340,72 @@ export class EdgeSessionStore {
++@@ -1299,6 +1352,72 @@ export class EdgeSessionStore {
+    }
+  }
+  
+diff --git a/dsh-edge/upstream.json b/dsh-edge/upstream.json
+index b3889927..8d320bc7 100644
+--- a/dsh-edge/upstream.json
++++ b/dsh-edge/upstream.json
+@@ -1,5 +1,5 @@
+ {
+   "repo": "pawaca/dsh-edge",
+-  "sha": "113a96913c51881993122afbf42e776882c4beb7",
+-  "note": "Пин апстрима для source-build морды. Обновление — ручной PR с полным прогоном деплоя (design.md, «Манифест»). sha — main на момент пина, commit 113a969 = release dsh-edge 0.7.1."
++  "sha": "b9a8ddd6cd11bc0db94d3f67bbc7de4d674e69a1",
++  "note": "Пин апстрима для source-build морды. Обновление — ручной PR с полным прогоном деплоя (design.md, «Манифест»). sha — тег dsh-edge-v0.8.0 (git rev-parse refs/tags/dsh-edge-v0.8.0), commit b9a8ddd = release dsh-edge 0.8.0. Бамп #134: предыдущий пин 113a969 = release 0.7.1 (тег dsh-edge-v0.7.1), тот же способ выбора."
+ }

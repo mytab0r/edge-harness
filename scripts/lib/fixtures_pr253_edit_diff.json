@@ -1,0 +1,81 @@
+{
+  "rev1": [
+    {
+      "filename": "docs/agents/LABELS.md",
+      "status": "modified",
+      "sha": "cbd3969bdb4a064f3efefcfbc9ea591cc284a076"
+    },
+    {
+      "filename": "docs/agents/PROTOCOL.md",
+      "status": "modified",
+      "sha": "61714586dc5a403deafe478ff1d47e7cdbc17b0c"
+    },
+    {
+      "filename": "docs/agents/WORKER-PLAYBOOK.md",
+      "status": "modified",
+      "sha": "f603b028b26558d6d29e313a4f4cdb7362f2af43"
+    },
+    {
+      "filename": "openspec/changes/task-closure-after-proof/proposal.md",
+      "status": "modified",
+      "sha": "a372d1ab01033ca2d503be5c68c22c64f47f230f"
+    },
+    {
+      "filename": "openspec/changes/task-closure-after-proof/specs/journal-tasks-hands/spec.md",
+      "status": "added",
+      "sha": "c3537c477bceef1f8921201d88f3ba16aba6877c"
+    },
+    {
+      "filename": "openspec/specs/journal-tasks-hands.md",
+      "status": "modified",
+      "sha": "f7efc13ae7b01e47dbfbb57a3a9f1dd9978e0d44"
+    },
+    {
+      "filename": "scripts/orchestra/scheduler.py",
+      "status": "modified",
+      "sha": "4423336136c43626aa4ae91857c70f261c342762"
+    },
+    {
+      "filename": "scripts/orchestra/test_scheduler.py",
+      "status": "modified",
+      "sha": "a0ae1cbbd69eb396bc892d2516a38a11d1a032f7"
+    }
+  ],
+  "rev2": [
+    {
+      "filename": "docs/agents/LABELS.md",
+      "status": "modified",
+      "sha": "e621f807b7e0ecf4f1ab982495816827f3747c45"
+    },
+    {
+      "filename": "docs/agents/PROTOCOL.md",
+      "status": "modified",
+      "sha": "fef898121d1d0e551aa2014ffae05117fa4bdb75"
+    },
+    {
+      "filename": "docs/agents/WORKER-PLAYBOOK.md",
+      "status": "modified",
+      "sha": "f603b028b26558d6d29e313a4f4cdb7362f2af43"
+    },
+    {
+      "filename": "openspec/changes/task-closure-after-proof/proposal.md",
+      "status": "modified",
+      "sha": "a372d1ab01033ca2d503be5c68c22c64f47f230f"
+    },
+    {
+      "filename": "openspec/changes/task-closure-after-proof/specs/journal-tasks-hands/spec.md",
+      "status": "added",
+      "sha": "389bb88467cf963f5cc0e8abfe158d2e86f68f89"
+    },
+    {
+      "filename": "scripts/orchestra/scheduler.py",
+      "status": "modified",
+      "sha": "e434caf546434cbcd2ae72bbe9b1cc5754c2e968"
+    },
+    {
+      "filename": "scripts/orchestra/test_scheduler.py",
+      "status": "modified",
+      "sha": "bfe93932810102161db9a97e5df2e4bcf3e583b1"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@edge-harness/dsh-agents-tasks",
+  "version": "0.1.3",
+  "description": "Client plugin: Agents & Tasks dashboard — GitHub Issues pool, journal event log as chat, live updates (#111)",
+  "type": "module",
+  "exports": {
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "files": [
+    "client/client.js",
+    "manifest.json"
+  ],
+  "license": "MIT"
+}

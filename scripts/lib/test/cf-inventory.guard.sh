@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# Гвардия класса «инцидент 2026-09-05» (#322, ревью PR #328 находка 3):
+# scripts/cf/lib.sh фильтрует account-wide листинги (чужие воркеры/DO
+# namespace/bindings-значения не печатаются), но единственным гейтом на
+# сам файл был `bash -n` — он не исполняет тело функций и не ловит, если
+# кто-то заменит jq-фильтр на `.result` целиком (регресс молча вернул бы
+# утечку чужих id/значений в публичный лог). Здесь `cf_get` заглушается
+# консервным прод-JSON (9 воркеров в аккаунте, из них 2 наших; 3 DO
+# namespace, из них 2 наших — те же числа, что в docs/agents/INFRA-CF.md),
+# и проверяется и позитив (свои проходят), и негатив (чужие id/имена/
+# значения bindings в stdout не попадают). Снять фикс из lib.sh — тест
+# краснеет (проверено: возврат `jq '.'` вместо фильтра ломает assert 2/4/6).
+set -euo pipefail
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../cf" && pwd)"
+# shellcheck source=scripts/cf/lib.sh
+source "$dir/lib.sh"
+
+export CLOUDFLARE_ACCOUNT_ID="test-acct"
+export CLOUDFLARE_API_TOKEN="test-token"
+
+FOREIGN_NAMES="foo-1 foo-2 foo-3 foo-4 foo-5 foo-6 foo-7"
+SECRET_TEXT="do-not-print-me"
+
+fail=0
+
+# ── 0: cf_get (реальная функция lib.sh, до заглушки ниже) — HTTP 200 с
+# success:false в конверте v4 — отказ, не молчаливая подмена ошибки нулём
+# (находка ревью PR #328, находка 3). curl застаблен ЛОКАЛЬНО (function
+# перекрывает бинарь только в этом шелле), реальная сеть не нужна.
+curl() {
+  local out_file="" prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then out_file="$arg"; fi
+    prev="$arg"
+  done
+  printf '{"success": false, "errors": [{"message": "test failure"}]}' > "$out_file"
+  printf '200'
+}
+set +e
+out=$(cf_get "/user/tokens/verify" 2>/tmp/cf_guard_stderr_success)
+rc=$?
+set -e
+if [ "$rc" = 0 ]; then
+  echo "::error::cf_get вернул успех (rc=0) на HTTP 200 с success:false в конверте — должен отказать"
+  fail=1
+fi
+if [ -n "$out" ]; then
+  echo "::error::cf_get напечатал тело в stdout при success:false — должен молчать в stdout и писать причину в stderr (получено: $out)"
+  fail=1
+fi
+if ! grep -q "success:false" /tmp/cf_guard_stderr_success; then
+  echo "::error::cf_get не назвал причину «success:false» в stderr"
+  fail=1
+fi
+rm -f /tmp/cf_guard_stderr_success
+unset -f curl
+
+# cf_get заглушен: возвращает консервный статический JSON по path, не делает
+# сетевых запросов. Экспортируется через `export -f`, чтобы функции lib.sh
+# (которые вызывают cf_get по имени, не по ссылке) увидели заглушку.
+cf_get() {
+  case "$1" in
+    */workers/scripts)
+      cat <<'JSON'
+{"result": [
+  {"id":"edge-harness"}, {"id":"dsh-edge"},
+  {"id":"foo-1"}, {"id":"foo-2"}, {"id":"foo-3"}, {"id":"foo-4"},
+  {"id":"foo-5"}, {"id":"foo-6"}, {"id":"foo-7"}
+]}
+JSON
+      ;;
+    */workers/durable_objects/namespaces)
+      cat <<'JSON'
+{"result": [
+  {"id":"ns-edge-harness","script":"edge-harness"},
+  {"id":"ns-dsh-edge","script":"dsh-edge"},
+  {"id":"ns-foreign","script":"foo-1"}
+]}
+JSON
+      ;;
+    */workers/scripts/edge-harness/settings)
+      printf '{"result": {"bindings": [{"name":"GH_REPO","type":"plain_text","text":"%s"},{"name":"GH_DISPATCH_TOKEN","type":"secret_text"}]}}\n' "$SECRET_TEXT"
+      ;;
+    */storage/kv/namespaces)
+      echo '{"result": [{"id":"kv-1"},{"id":"kv-2"},{"id":"kv-3"}]}'
+      ;;
+    *)
+      echo "cf-inventory.guard.sh: незаглушенный путь $1" >&2
+      return 1
+      ;;
+  esac
+}
+export -f cf_get
+
+# ── 1/2: cf_workers_own — чужие имена не в stdout, счётчик совпадает ──────
+out=$(cf_workers_own 2>/tmp/cf_guard_stderr)
+for name in $FOREIGN_NAMES; do
+  if grep -q "$name" <<<"$out"; then
+    echo "::error::cf_workers_own напечатал чужое имя '$name' в stdout — фильтр CF_OWN_WORKERS сломан"
+    fail=1
+  fi
+done
+if ! grep -q '"всего_в_аккаунте": 9' <<<"$out"; then
+  echo "::error::cf_workers_own: ожидался счётчик 'всего_в_аккаунте': 9, получено: $out"
+  fail=1
+fi
+if [ -s /tmp/cf_guard_stderr ] && grep -q "ПРЕДУПРЕЖДЕНИЕ" /tmp/cf_guard_stderr; then
+  echo "::error::cf_workers_own: allowlist совпадает с фикстурой (2 своих), предупреждения о дрейфе быть не должно"
+  fail=1
+fi
+# Позитив (некритичное замечание ревью PR #328): наши воркеры РЕАЛЬНО в выводе.
+# Негатив выше ловит утечку чужих, но не вымывание наших: регресс «фильтр
+# печатает пустой "свои"» проходит чужие-ассерты зелёно.
+for own_name in edge-harness dsh-edge; do
+  if ! grep -q "\"id\": *\"$own_name\"" <<<"$out"; then
+    echo "::error::cf_workers_own: свой воркер '$own_name' пропал из вывода — фильтр вымывает своих (не только чужих)"
+    fail=1
+  fi
+done
+
+# ── 3/4: cf_do_namespaces_own — чужой id/script не в stdout ───────────────
+out=$(cf_do_namespaces_own 2>/dev/null)
+if grep -q "ns-foreign\|foo-1" <<<"$out"; then
+  echo "::error::cf_do_namespaces_own напечатал чужой DO namespace в stdout"
+  fail=1
+fi
+if ! grep -q '"всего_в_аккаунте": 3' <<<"$out"; then
+  echo "::error::cf_do_namespaces_own: ожидался счётчик 'всего_в_аккаунте': 3, получено: $out"
+  fail=1
+fi
+# Позитив (некритичное замечание ревью PR #328): оба своих namespace в выводе.
+for own_script in edge-harness dsh-edge; do
+  if ! grep -q "\"script\": *\"$own_script\"" <<<"$out"; then
+    echo "::error::cf_do_namespaces_own: свой namespace '$own_script' пропал из вывода — фильтр вымывает своих (не только чужих)"
+    fail=1
+  fi
+done
+
+# ── 5: cf_bindings_names — значение plain_text не в stdout, только имя/тип ─
+out=$(cf_bindings_names "/accounts/test-acct/workers/scripts/edge-harness/settings" 2>/dev/null)
+if grep -q "$SECRET_TEXT" <<<"$out"; then
+  echo "::error::cf_bindings_names напечатал значение plain_text binding в stdout — класс инцидента 2026-09-05 регрессировал"
+  fail=1
+fi
+if ! grep -q '"name": *"GH_REPO"' <<<"$out"; then
+  echo "::error::cf_bindings_names: имя biding'а GH_REPO пропало из вывода"
+  fail=1
+fi
+
+# ── 6: cf_count_only — сырые id account-wide списка не в stdout ──────────
+out=$(cf_count_only "/accounts/test-acct/storage/kv/namespaces" 2>/dev/null)
+if grep -q "kv-1\|kv-2\|kv-3" <<<"$out"; then
+  echo "::error::cf_count_only напечатал сырые id — должен печатать только count"
+  fail=1
+fi
+if ! grep -q '"count": *3' <<<"$out"; then
+  echo "::error::cf_count_only: ожидался count 3, получено: $out"
+  fail=1
+fi
+
+rm -f /tmp/cf_guard_stderr
+
+# ── 7/8: api.sh — отказ по умолчанию вне allowlist, без сети (находка ревью
+# PR #328, находка 1). Подставной curl в PATH (не function — api.sh запускается
+# отдельным процессом) на случай, если путь всё же дойдёт до cf_get: если
+# гвардия регрессирует в блок-лист/пропускает лишнее, тест должен упасть на
+# конкретном отказавшем пути, а не тихо съесть реальный сетевой вызов.
+api_sh="$dir/api.sh"
+curl_stub_dir=$(mktemp -d)
+cat >"$curl_stub_dir/curl" <<'CURL_STUB'
+#!/usr/bin/env bash
+out_file="" prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out_file="$arg"; fi
+  prev="$arg"
+done
+printf '{"success": true, "result": {}}' > "$out_file"
+printf '200'
+CURL_STUB
+chmod +x "$curl_stub_dir/curl"
+
+# 7: путь вне allowlist (account-wide, чужой класс инцидента 2026-09-05) —
+# отказ ДО сети, без CF_API_SH_ALLOW_RAW.
+if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "/accounts/test-acct/workers/scripts" 2>&1); then
+  echo "::error::api.sh пропустил account-wide путь вне allowlist (должен отказать по умолчанию): $out"
+  fail=1
+elif ! grep -q "ОТКАЗ" <<<"$out"; then
+  echo "::error::api.sh отказал без внятной причины «ОТКАЗ»: $out"
+  fail=1
+fi
+
+# 8: путь по нашему воркеру (allowlist) — не блокируется гейтом (сеть
+# застаблена, дальше curl_stub отвечает success:true пустым result).
+if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "/accounts/test-acct/workers/scripts/edge-harness/deployments" 2>&1); then
+  :
+else
+  if grep -q "ОТКАЗ" <<<"$out"; then
+    echo "::error::api.sh отказал на пути по нашему воркеру (должен быть в allowlist): $out"
+    fail=1
+  fi
+fi
+
+# 10: обход allowlist через dot-сегменты — отказ ДО сети (ревью PR #328:
+# curl схлопывает `../`, гейт по литеральной строке матчит наш воркер, а по
+# сети путь уходит account-wide, класс инцидента 2026-09-05). Команда здесь
+# может упасть только на гейте: дальше curl-стаб отвечает success:true, т.е.
+# дойди путь до cf_get — код возврата был бы нулевым.
+for traversal in \
+  "/accounts/test-acct/workers/scripts/edge-harness/../../zones" \
+  "/accounts/test-acct/workers/scripts/edge-harness//settings"; do
+  if out=$(PATH="$curl_stub_dir:$PATH" bash "$api_sh" "$traversal" 2>&1); then
+    echo "::error::api.sh пропустил путь с dot-сегментами/двойным слешем (обход allowlist): $traversal"
+    fail=1
+  elif ! grep -q "ОТКАЗ" <<<"$out"; then
+    echo "::error::api.sh отказал на $traversal без внятной причины «ОТКАЗ»: $out"
+    fail=1
+  fi
+done
+
+rm -rf "$curl_stub_dir"
+
+# 9: status.sh не хардкодит имена воркеров вне цикла по $CF_OWN_WORKERS —
+# третий воркер в allowlist иначе молча не попал бы в деплои/bindings
+# (находка ревью PR #328, п.2). Ищем литеральный путь .../workers/scripts/
+# /<имя>/(deployments|settings) вне переменной $worker — секции ниже
+# токена "for worker in $CF_OWN_WORKERS" в исходнике не считаются.
+status_sh="$dir/status.sh"
+hardcoded=$(awk '
+  /for worker in \$CF_OWN_WORKERS/ { in_loop = 1 }
+  /^done/ { in_loop = 0 }
+  !in_loop && /workers\/scripts\/[a-z-]+\/(deployments|settings)/ { print }
+' "$status_sh")
+if [ -n "$hardcoded" ]; then
+  echo "::error::status.sh хардкодит путь воркера вне цикла CF_OWN_WORKERS: $hardcoded"
+  fail=1
+fi
+
+# 11: CF_OWN_WORKERS ↔ деплой-источники — сверка МНОЖЕСТВ в обе стороны
+# (ревью PR #328, раунд head 6423e5b: односторонний grep «имя где-то
+# встречается» пропускал и третий свой воркер, добавленный в источник, и
+# переименование в одном файле — имя оставалось во втором). Канонические
+# объявления имён воркеров проекта: верхнеуровневый "name" cf-worker/
+# wrangler.jsonc (2-пробельный отступ — вложенные bindings глубже) и
+# "name": "<slug>" в deploy-dsh-edge.yml (DO-binding DSH_EDGE_INSTANCE
+# отсекается классом [a-z0-9-]). Расхождение множеств в любую сторону —
+# красное: и забытый в allowlist новый свой воркер, и мёртвое имя.
+jsonc="$dir/../../cf-worker/wrangler.jsonc"
+yml="$dir/../../.github/workflows/deploy-dsh-edge.yml"
+declared="$( { grep -hE '^  "name": *"[a-z0-9-]+"' "$jsonc" || true; grep -ohE '"name": *"[a-z0-9-]+"' "$yml" || true; } \
+  | sed -E 's/.*"name": *"([a-z0-9-]+)".*/\1/' | sort -u)"
+allow_sorted="$(printf '%s\n' $CF_OWN_WORKERS | sort -u)"
+if [ "$declared" != "$allow_sorted" ]; then
+  echo "::error::CF_OWN_WORKERS [$(echo "$allow_sorted" | tr '\n' ' ')] разошёлся с объявлениями воркеров в cf-worker/wrangler.jsonc и deploy-dsh-edge.yml [$(echo "$declared" | tr '\n' ' ')] — обнови CF_OWN_WORKERS в scripts/cf/lib.sh или объявления имён, иначе свой воркер молча числится «чужим, не показано»"
+  fail=1
+fi
+
+if [ "$fail" = 0 ]; then
+  echo "cf-inventory: фильтры account-wide листингов/bindings, success:false-конверт, allowlist api.sh и отказ на dot-сегментах — чужие id/значения в stdout не попадают, счётчики верны, отказ по умолчанию держится"
+fi
+exit "$fail"

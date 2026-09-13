@@ -1,0 +1,175 @@
+diff --git a/.github/workflows/repo-ci.yml b/.github/workflows/repo-ci.yml
+index fb952798..6cc74794 100644
+--- a/.github/workflows/repo-ci.yml
++++ b/.github/workflows/repo-ci.yml
+@@ -245,6 +245,20 @@ jobs:
+       - name: Юнит-тесты клиентского бандла интеграций
+         run: node --test plugins-src/integrations/test/client.test.mjs
+ 
++      # Гвардия совместимости плагинов (design.md «Workers-совместимость») +
++      # схема инструментов (#314): дефект схемы confluence_page (required:
++      # false вместо true/отсутствия ключа) уходил дальше codegen'а и
++      # ловился только рантайм-дымом deploy-dsh-edge.yml ПОСЛЕ мержа — сломанный
++      # контент плагина сутками красил ежедневный деплой по расписанию.
++      # check-plugin-compat.mjs запускается форжем перед сборкой tarball'а
++      # (plugin-forge.yml ещё не смёржен, #268) — здесь та же проверка на
++      # каждый PR, до публикации, а не только на деплое.
++      - name: Совместимость плагинов (Workers + схема инструментов)
++        run: |
++          for dir in plugins-src/*/; do
++            node dsh-edge/check-plugin-compat.mjs "$dir"
++          done
++
+       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
+       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им
+       # собранный пакет и сам упадёт на невалидном, но дешевле ловить здесь.
+diff --git a/dsh-edge/check-plugin-compat.mjs b/dsh-edge/check-plugin-compat.mjs
+index ce4bfef3..03ec6eeb 100644
+--- a/dsh-edge/check-plugin-compat.mjs
++++ b/dsh-edge/check-plugin-compat.mjs
+@@ -60,6 +60,9 @@ async function main() {
+   // 6. Синтаксическая проверка всех JS файлов
+   await checkSyntax()
+ 
++  // 7. Схемы инструментов не нарушают контракт cordis (required: false)
++  await checkToolSchemas()
++
+   console.log('plugin-compat: ЗЕЛЁНЫЙ — все проверки совместимости пройдены')
+ }
+ 
+@@ -277,6 +280,64 @@ async function checkNoSyncFsInApply() {
+   console.log('  ✓ синхронные fs вызовы: не найдено')
+ }
+ 
++// Красный прогон deploy-dsh-edge.yml дважды (2026-09-04, 2026-09-05, задача
++// #314): плагин integrations объявлял опциональный параметр инструмента
++// через `required: false`, схема-компилятор cordis 4 (@deepseek-ai/dsh-tools)
++// принимает только `required: true` либо ПОЛНОЕ ОТСУТСТВИЕ ключа —
++// `required: false` бросает `JsonSchemaError: unsupported JSON schema:
++// parameters.<field>.required must be true when present` уже во время
++// apply(), то есть в проде на каждом инсталле плагина. Раньше это ловил
++// только dsh-edge/smoke-edge-plugins.mjs — рантайм-дым внутри
++// deploy-dsh-edge.yml, ПОСЛЕ мержа PR и после сборки клона: контент плагина
++// с этим дефектом мог висеть в main сутками, роняя каждый деплой по
++// расписанию. Эта проверка — то же самое правило, но статически и до
++// публикации/деплоя (форж вызывает check-plugin-compat.mjs перед сборкой
++// tarball'а), чтобы дефектная схема не доезжала до рантайма вовсе.
++//
++// Проверка текстовая (regex), не AST: в этом файле уже так устроены
++// checkForbiddenImports/checkNoDynamicImports/checkNoSyncFsInApply — общий
++// стиль чекера. `required: false` не встречается ни в одном легальном месте
++// схемы инструмента ни у одного плагина этого репозитория (hello-world,
++// runner-bridge, plugin-manager): опциональное свойство параметров/output
++// всегда объявляется отсутствием ключа required, а не false-значением,
++// поэтому точное совпадение — не эвристика, а прямой признак дефекта этого
++// класса. Комментарии вырезаются перед матчингом (см. stripComments): при
++// починке этого самого дефекта пояснительный комментарий рядом с фиксом
++// сам содержал искомую строку и красил чекер на собственном тексте —
++// мутация поймана вживую, не гипотетически.
++function stripComments(source) {
++  // Черновой, не JS-парсер: строковые литералы с `//`/`/*` внутри (например,
++  // URL в строке) теоретически могут исказить границу комментария, но для
++  // цели чекера (не дать `required: false` просочиться в КОД) это приемлемо —
++  // тот же компромисс, что и у соседних regex-проверок этого файла.
++  return source
++    .replace(/\/\*[\s\S]*?\*\//g, '')
++    .replace(/\/\/.*$/gm, '')
++}
++
++async function checkToolSchemas() {
++  const files = await collectJsFiles(absPluginDir)
++  let violations = []
++
++  for (const file of files) {
++    const content = stripComments(await readFile(file, 'utf8'))
++    const relPath = relative(absPluginDir, file)
++
++    const matches = [...content.matchAll(/required\s*:\s*false/g)]
++    if (matches.length > 0) {
++      violations.push(`${relPath}: required: false (${matches.length} вхождений) — контракт cordis 4 требует true либо отсутствие ключа`)
++    }
++  }
++
++  if (violations.length > 0) {
++    throw new Error(
++      'Схема инструментов нарушает контракт cordis (UNSUPPORTED_SCHEMA в рантайме):\n'
++      + violations.map(v => `  - ${v}`).join('\n'),
++    )
++  }
++  console.log('  ✓ схемы инструментов: required: false не найдено')
++}
++
+ async function checkClientBundle() {
+   const pkgPath = join(absPluginDir, 'package.json')
+   const pkg = JSON.parse(await readFile(pkgPath, 'utf8'))
+diff --git a/dsh-edge/plugins.json b/dsh-edge/plugins.json
+index 510d2e51..0decef86 100644
+--- a/dsh-edge/plugins.json
++++ b/dsh-edge/plugins.json
+@@ -38,9 +38,9 @@
+       "id": "integrations",
+       "package": "@edge-harness/dsh-plugin-integrations",
+       "source": {
+-        "release": "plugins-integrations-v0.1.0",
+-        "asset": "integrations-0.1.0.tgz",
+-        "sha256": "d989acd970751f5c593c1b1f5d19bdb6c0dbbac84e9987686d05bcf4fd67f785"
++        "release": "plugins-integrations-v0.1.1",
++        "asset": "integrations-0.1.1.tgz",
++        "sha256": "700e0ee9822b5e635278c113cd520f8282c6b1039e83590bc0292977711df605"
+       },
+       "server": true,
+       "client": true
+diff --git a/plugins-src/integrations/package.json b/plugins-src/integrations/package.json
+index 9f77be0e..04076ee9 100644
+--- a/plugins-src/integrations/package.json
++++ b/plugins-src/integrations/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@edge-harness/dsh-plugin-integrations",
+-  "version": "0.1.0",
++  "version": "0.1.1",
+   "description": "Edge plugin: external-system integrations (#115) — agent tools (jira_issue, confluence_page, bitbucket_pr, slack_post) plus the morde settings section «Интеграции» driven by dsh-edge/integrations.json and journal statuses",
+   "type": "module",
+   "main": "server/index.js",
+diff --git a/plugins-src/integrations/server/index.js b/plugins-src/integrations/server/index.js
+index 4dd101f3..ad034eb2 100644
+--- a/plugins-src/integrations/server/index.js
++++ b/plugins-src/integrations/server/index.js
+@@ -58,7 +58,7 @@ import {
+   SLACK_API,
+ } from './core.js'
+ 
+-const PLUGIN_VERSION = '0.1.0'
++const PLUGIN_VERSION = '0.1.1'
+ const TOOL_TIMEOUT_MS = 15_000
+ // Первый же комментарий-лимит: fields=comment отдаёт первую страницу
+ // (максимум из настроек задачи), latest добирается отдельным вызовом.
+@@ -208,12 +208,15 @@ function defineConfluencePageTool() {
+     parameters: {
+       query: {
+         type: 'string',
+-        required: false,
++        // Опциональный параметр объявляется ОТСУТСТВИЕМ ключа required —
++        // ставить его со значением "false" контракт схем cordis 4 отклоняет
++        // (UNSUPPORTED_SCHEMA: «parameters.query.required must be true when
++        // present»), см. дым dsh-edge/smoke-edge-plugins.mjs и гвардию
++        // check-plugin-compat.mjs (класс #314).
+         description: 'CQL-поиск, например type=page AND text~"runbook". Найдёт до 5 страниц.',
+       },
+       page_id: {
+         type: 'string',
+-        required: false,
+         description: 'Id страницы (из результата поиска) — тогда вернётся содержимое.',
+       },
+     },
+@@ -290,7 +293,9 @@ function defineBitbucketPrTool() {
+       title: { type: 'string', required: true, description: 'Заголовок PR.' },
+       source: { type: 'string', required: true, description: 'Ветка-источник (существующая).' },
+       destination: { type: 'string', required: true, description: 'Ветка-приёмник (существующая).' },
+-      description: { type: 'string', required: false, description: 'Описание PR (markdown Bitbucket).' },
++      // required не объявлен: опциональный параметр — отсутствием ключа, не
++      // значением "false" (класс #314, см. комментарий у confluence_page выше).
++      description: { type: 'string', description: 'Описание PR (markdown Bitbucket).' },
+     },
+     output: { schema: outputSchema(), render: textRender() },
+     timeoutMs: 45_000,

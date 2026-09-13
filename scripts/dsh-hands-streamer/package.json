@@ -1,0 +1,23 @@
+{
+  "name": "dsh-hands-streamer",
+  "description": "edge-harness hands: live session-event streamer — observe-only firehose consumer writing an NDJSON spool for the bash drain (no network inside the plugin)",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/core.js",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

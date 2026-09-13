@@ -1,0 +1,22 @@
+diff --git a/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs b/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
+index 171e0ca..c05d8ab 100644
+--- a/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
++++ b/apps/dsh-edge/standalone/scripts/bundle-standalone.mjs
+@@ -81,7 +81,7 @@ async function publishedPackageAliases() {
+   for (const path of await sourceFiles(join(appDirectory, 'src'))) {
+     const source = await readFile(path, 'utf8')
+     for (const match of source.matchAll(
+-      /['"]((?:@deepseek-ai|@cloudflare)\/[^'"]+|(?:just-bash|fast-png|jpeg-js)(?:\/[^'"]*)?)['"]/g,
++      /['"]((?:@deepseek-ai|@cloudflare|@edge-harness)\/[^'"]+|(?:just-bash|fast-png|jpeg-js)(?:\/[^'"]*)?)['"]/g,
+     )) {
+       specifiers.add(match[1])
+     }
+@@ -215,6 +215,8 @@ async function requirePublishedDependencyInputs(metafilePath) {
+     const isPinnedRuntimeDependency = path.includes('@deepseek-ai')
+       || path.includes('@deepseek-ai+')
+       || path.includes('@cloudflare+computer')
++      || path.includes('@edge-harness')
++      || path.includes('@edge-harness+')
+       || path.includes('just-bash')
+       || path.includes('fast-png')
+       || path.includes('jpeg-js')

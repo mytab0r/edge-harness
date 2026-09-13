@@ -1,0 +1,32 @@
+# CodeQL: статический анализ JS/TS на PR и main. Результаты — в Security → Code scanning.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  # Диспатч на мерже (#955, следствие #929): мерж PR через GITHUB_TOKEN не
+  # создаёт push-событие — scheduler.py::after_merge (merge_reactions.
+  # react_to_merge, config/merge-reactions.json) запускает security-скан
+  # слитого дерева явно, для чего нужен именно этот триггер (без него
+  # security-скан слитого main шёл только раз в неделю по schedule).
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+
+      - uses: github/codeql-action/autobuild@v4
+
+      - uses: github/codeql-action/analyze@v4

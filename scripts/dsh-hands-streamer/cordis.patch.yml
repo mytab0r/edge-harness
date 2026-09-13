@@ -1,0 +1,9 @@
+# dsh-hands-streamer: живой стрим событий сессии в журнал морды edge-harness.
+# Подписки observe-only по канону PersistenceCoordinator.installWritePath()
+# (dsh-session-persistence): session/created, session/event, session/flush,
+# session/disposed. Слой бандла профиля — ставится штатным
+# `dsh plugin --profile headless add <tgz>`, факт монтажа доказывается
+# `dsh --profile headless --dump-config`.
+- insert:
+    - id: hands-streamer
+      name: dsh-hands-streamer

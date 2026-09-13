@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""Тесты сборщика квот (scripts/measure/quotas.py, #324).
+
+Кормятся прод-формой, не пересказом: fixtures/github_rate_limit.json —
+дословный `gh api rate_limit` этого репозитория (live, 2026-09-05);
+fixtures/github_actions_runs_in_progress.json — реальный (урезан от
+повторяющихся actor/urls) `gh api .../actions/runs?per_page=1`, `total_count` —
+то самое поле, что читает collect_github; fixtures/cf_workers_invocations_doc_example.json —
+вербатимный пример ответа GraphQL Analytics API из документации Cloudflare
+(developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/).
+
+Сетевые вызовы (cf_query, gh_api) подменяются monkeypatch — как в
+scripts/orchestra/test_pulse_guard.py.
+
+Запуск: python -m pytest scripts/measure/test_quotas.py -q
+"""
+
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).with_name("quotas.py")
+spec = importlib.util.spec_from_file_location("quotas", SCRIPT)
+qz = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(qz)  # type: ignore[union-attr]
+
+FIXTURES = Path(__file__).with_name("fixtures")
+
+
+def load(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def query_limit(query: str) -> int:
+    """Достаёт число из `limit: N` в тексте GraphQL-запроса — используется
+    fake'ами, которые обязаны УВАЖАТЬ limit (находка 1, ревью PR #327), а не
+    игнорировать его и отдавать все группы независимо от запрошенного среза."""
+    match = re.search(r"limit:\s*(\d+)", query)
+    assert match, "запрос обязан явно указывать limit"
+    return int(match.group(1))
+
+
+# ── Row: процент и порог ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("row", [
+    qz.no_data("x", "y", 100, "u", "причина"),          # нет данных вовсе
+    qz.Row("x", "y", 50, None, "u", "-", "ok"),          # лимит неизвестен
+])
+def test_pct_none_when_unmeasurable(row):
+    assert row.pct is None
+
+
+def test_pct_computed_and_rounded():
+    row = qz.Row("x", "y", 4_800_000, 5_000_000, "rows", "-", "ok")
+    assert row.pct == 96.0
+
+
+def test_over_threshold_picks_only_breached():
+    rows = [
+        qz.Row("a", "s", 90, 100, "u", "-", "ok"),   # 90%
+        qz.Row("b", "s", 10, 100, "u", "-", "ok"),   # 10%
+        qz.no_data("c", "s", 100, "u", "нет данных — не считается порогом"),
+    ]
+    breached = qz.over_threshold(rows, threshold=80.0)
+    assert [r.resource for r in breached] == ["a"]
+
+
+def test_over_threshold_mutation_guard_boundary_is_inclusive():
+    """Мутационная проверка: >= а не >, ровно на границе 80% сигнал обязан
+    сработать — тест красится, если оператор ослабить до строгого >."""
+    row = qz.Row("edge", "s", 80, 100, "u", "-", "ok")
+    assert qz.over_threshold([row], threshold=80.0) == [row]
+
+
+# ── format_table: недоступный источник виден, а не пропущен ─────────────────
+
+
+def test_format_table_shows_no_data_reason_not_silently_dropped():
+    rows = [qz.no_data("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                        5_000_000, "rows", "секрет не задан")]
+    table = qz.format_table(rows)
+    assert "нет данных" in table
+    assert "секрет не задан" in table
+    assert "DO rows_read/сутки" in table
+
+
+# ── GitHub: rate_limit — реальная форма ответа ────────────────────────────────
+
+
+def test_collect_github_rate_limit_reads_real_payload(monkeypatch):
+    payload = load("github_rate_limit.json")
+
+    def fake_gh_api(*args):
+        if args == ("rate_limit",):
+            return payload
+        return {"total_count": 0}
+
+    monkeypatch.setattr(qz, "gh_api", fake_gh_api)
+    rows = qz.collect_github("mytab0r/edge-harness")
+    core_row = next(r for r in rows if "REST rate limit" in r.resource)
+    assert core_row.status == "ok"
+    assert core_row.current == payload["resources"]["core"]["used"]
+    assert core_row.limit == payload["resources"]["core"]["limit"]
+    graphql_row = next(r for r in rows if "GraphQL rate limit" in r.resource)
+    assert graphql_row.limit == payload["resources"]["graphql"]["limit"]
+
+
+def test_collect_github_mutation_guard_wrong_key_is_no_data(monkeypatch):
+    """Мутация класса: если бы код читал resources['core']['limit'] из
+    несуществующего ключа — no_data, а не падение и не выдумка числа."""
+    monkeypatch.setattr(qz, "gh_api", lambda *a: {"resources": {}})
+    rows = qz.collect_github("mytab0r/edge-harness")
+    core_row = next(r for r in rows if "REST rate limit" in r.resource)
+    assert core_row.status == "no-data"
+    assert core_row.current is None
+
+
+def test_collect_github_in_progress_reads_real_payload(monkeypatch):
+    payload = load("github_actions_runs_in_progress.json")
+
+    def fake_gh_api(*args):
+        if "status=in_progress" in args:
+            return payload
+        if args == ("rate_limit",):
+            return {"resources": {"core": {}, "graphql": {}}}
+        return {"total_count": 0}
+
+    monkeypatch.setattr(qz, "gh_api", fake_gh_api)
+    rows = qz.collect_github("mytab0r/edge-harness")
+    row = next(r for r in rows if "In-progress" in r.resource)
+    assert row.current == payload["total_count"] == 1
+    assert row.limit == qz.LIMITS["gh_concurrent_jobs"]
+
+
+def test_collect_github_runs_lookups_force_method_get(monkeypatch):
+    """Живой баг 2026-09-05: `gh api` молча уходит в POST при `-f` без
+    `--method` — actions/runs отвечает 404 вместо числа, не осмысленно."""
+    seen_args = []
+
+    def fake_gh_api(*args):
+        seen_args.append(args)
+        return {"total_count": 0, "resources": {"core": {}, "graphql": {}}}
+
+    monkeypatch.setattr(qz, "gh_api", fake_gh_api)
+    qz.collect_github("mytab0r/edge-harness")
+    runs_calls = [a for a in seen_args if "actions/runs" in " ".join(a)]
+    assert len(runs_calls) == 3  # 2 события диспатча + in-progress
+    assert all(a[:2] == ("--method", "GET") for a in runs_calls)
+
+
+def test_collect_github_reports_actions_minutes_not_applicable(monkeypatch):
+    monkeypatch.setattr(qz, "gh_api", lambda *a: {"total_count": 0, "resources": {"core": {}, "graphql": {}}})
+    rows = qz.collect_github("mytab0r/edge-harness")
+    minutes_row = next(r for r in rows if "Actions минуты" in r.resource)
+    assert minutes_row.status == "no-data"
+    assert "безлимитно" in minutes_row.note
+
+
+def test_gh_api_raises_loud_on_failure(monkeypatch):
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "HTTP 403: Forbidden"
+
+    monkeypatch.setattr(qz.subprocess, "run", lambda *a, **k: FakeResult())
+    with pytest.raises(RuntimeError, match="403"):
+        qz.gh_api("rate_limit")
+
+
+# ── Cloudflare: разбор реального примера из документации ────────────────────
+
+
+def test_cf_workers_invocations_doc_example_sums_requests(monkeypatch):
+    """Пример из доков Cloudflare даёт 3 события с sum.requests 1/1/4 = 6 —
+    ровно то, что должна вернуть агрегация в collect_cloudflare."""
+    doc = load("cf_workers_invocations_doc_example.json")
+
+    def fake_cf_query(token, query, variables=None):
+        if "workersInvocationsAdaptive" in query:
+            return doc["data"]
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "ok"
+    assert workers_row.current == 6
+    assert workers_row.limit == qz.LIMITS["cf_workers_requests_day"]
+
+
+def test_cf_workers_invocations_limit_covers_all_groups_not_one(monkeypatch):
+    """Находка 1 (ревью PR #327): workersInvocationsAdaptive — adaptive-groups
+    датасет, каждая строка ответа — ОДНА группа измерений (дата/минута,
+    scriptName, status); limit режет именно группы. limit: 1 брал бы запросы
+    одной случайной группы вместо всех суток — тихий undercount. Fake уважает
+    limit из текста запроса, чтобы обрезка красила тест мутационно: откати
+    limit на 1 в quotas.py — этот тест покраснеет (30 != 10)."""
+    groups = [{"sum": {"requests": 10}} for _ in range(3)]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "workersInvocationsAdaptive" in query:
+            limit = query_limit(query)
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": groups[:limit]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.current == 30
+
+
+def test_cf_storage_sums_stored_bytes_of_latest_date_across_namespaces(monkeypatch):
+    """Находка 1: DO storage разбит по namespaceId, на аккаунте их несколько
+    (#322) — сумма storedBytes ПОСЛЕДНЕЙ даты по всем namespace, не max одной
+    произвольной группы. limit: 1 брал бы один случайный namespace вместо
+    аккаунта целиком. Fake уважает limit — откати его на 1 в quotas.py, тест
+    покраснеет (350 != 100)."""
+    groups = [
+        {"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 100}},
+        {"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 250}},
+        {"dimensions": {"date": "2026-09-04"}, "max": {"storedBytes": 999}},  # старая дата — не считается
+    ]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "durableObjectsStorageGroups" in query:
+            limit = query_limit(query)
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": groups[:limit]}]}}
+        return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    storage_row = next(r for r in rows if r.resource == "DO storage/аккаунт")
+    assert storage_row.current == 350
+
+
+def test_cf_empty_accounts_is_no_data_not_silent_zero(monkeypatch):
+    """Находка AI-ревью PR #327 (четвёртый раунд): `viewer.accounts` пустой
+    значит «токен не видит этот аккаунт» (accountTag не совпадает, или у
+    токена нет доступа) — не «метрика равна нулю». Без гвардии sum/max по
+    пустому списку молча дают 0, и все три блока (workers requests, DO
+    storage, DO rows_read/written) рапортовали бы status="ok" с current=0 —
+    0% никогда не пробьёт порог 80%, эскалация не уйдёт именно в момент
+    инцидента с недоступным аккаунтом. Мутация: убери
+    do_rows_read.require_accounts из любого блока collect_cloudflare — тот
+    блок вернёт "ok"/0 вместо "no-data" на этой фикстуре."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [
+                {"name": "DurableObjectsInvocationsAdaptiveGroupsSum"},
+            ]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        return {"viewer": {"accounts": []}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    by_resource = {r.resource: r for r in rows}
+    assert by_resource["Workers requests/сутки"].status == "no-data"
+    assert by_resource["DO storage/аккаунт"].status == "no-data"
+    assert "accounts пуст" in by_resource["Workers requests/сутки"].note
+    assert "accounts пуст" in by_resource["DO storage/аккаунт"].note
+
+
+def test_cf_workers_invocations_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): CF режет group-ответы на
+    limit БЕЗ маркера обрезки (research/20) — ровно limit=10000 строк
+    неотличимо от «ровно столько и было». Мутация: убери
+    do_rows_read.check_not_truncated из этого блока в quotas.py — тест
+    покраснеет (status станет "ok" с заниженной суммой вместо "no-data")."""
+    groups = [{"sum": {"requests": 1}} for _ in range(10000)]  # ровно limit
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": groups}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "no-data"
+    assert "обрезк" in workers_row.note
+
+
+def test_cf_storage_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    groups = [{"dimensions": {"date": "2026-09-05"}, "max": {"storedBytes": 1}} for _ in range(10000)]
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": []}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": groups}]}}
+        return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    storage_row = next(r for r in rows if r.resource == "DO storage/аккаунт")
+    assert storage_row.status == "no-data"
+    assert "обрезк" in storage_row.note
+
+
+def test_cf_rows_metric_truncation_is_no_data_not_silent_undercount(monkeypatch):
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        # DO rows_read data query: ровно limit=1000 строк.
+        rows_data = [{"sum": {"rowsRead": 1}} for _ in range(1000)]
+        return {"viewer": {"accounts": [{"durableObjectsPeriodicGroups": rows_data}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "обрезк" in rows_read_row.note
+
+
+def test_cf_rows_metric_query_uses_date_type_not_string(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): доказанный живым прогоном
+    do_rows_read.py шлёт `$start: Date`, не `$start: string` — тип
+    переменной здесь не был проверен ни разу. Мутация: верни `$start: string`
+    в quotas.py — этот тест покраснеет."""
+    seen = {"query": None}
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        seen["query"] = query
+        return {"viewer": {"accounts": [{"durableObjectsPeriodicGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    qz.collect_cloudflare("acct", "tok")
+    assert seen["query"] is not None
+    assert "$start: Date" in seen["query"]
+
+
+def test_cf_rows_metric_not_found_is_no_data_not_guess(monkeypatch):
+    """Если интроспекция не находит поле rowsRead/rowsWritten ни в одном
+    Sum/Max-типе Durable Objects — «нет данных», а не нулевая выдумка."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "cpuTime"}]}}  # rowsRead отсутствует
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "не найдено" in rows_read_row.note
+
+
+def test_cf_rows_metric_found_via_introspection_real_field_names(monkeypatch):
+    """Имена полей rowsRead/rowsWritten — реальные, задокументированные
+    дословно Cloudflare для D1 (таблица «GraphQL Field Name» в
+    developers.cloudflare.com/d1/observability/metrics-analytics/); для
+    Durable Objects точное имя не опубликовано, поэтому find_row_metric ищет
+    его интроспекцией по любому Sum/Max-типу датасетов DO — здесь схема
+    отвечает, что поле нашлось в одном из них."""
+    calls = {"data_query": None}
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [
+                {"name": "AccountDurableObjectsPeriodicGroupsSum"},
+                {"name": "AccountDurableObjectsStorageGroupsMax"},
+            ]}}
+        if "__type" in query and "PeriodicGroupsSum" in query:
+            return {"__type": {"fields": [{"name": "cpuTime"}, {"name": "rowsRead"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "storedBytes"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "durableObjectsStorageGroups" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        calls["data_query"] = query
+        return {"viewer": {"accounts": [{"durableObjectsPeriodicGroups": [{"sum": {"rowsRead": 4_800_000}}]}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "ok"
+    assert rows_read_row.current == 4_800_000
+    assert rows_read_row.pct == 96.0
+    assert calls["data_query"] is not None
+
+
+def test_cf_rows_metric_search_failure_is_no_data_not_crash(monkeypatch):
+    """Находка 1 (ревью PR #327): интроспекция полей (cf_type_fields внутри
+    find_row_metric) может упасть транзиентно ПОСЛЕ успешной cf_type_names —
+    один упавший __type-запрос не должен ронять весь collect_cloudflare и
+    терять уже собранные Workers/storage строки."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsPeriodicGroupsSum"}]}}
+        if "__type" in query:
+            raise RuntimeError("HTTP 500: transient")
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": [{"sum": {"requests": 5}}]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "ok"  # строка выше по коду не потеряна
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "упали" in rows_read_row.note
+
+
+def test_cf_rows_metric_unknown_fifth_dataset_is_no_data_not_crash(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): find_row_metric находит поле
+    rowsRead в Sum/Max-типе, чьё имя содержит 'durableobjects' (проходит
+    фильтр find_row_metric), но НЕ содержит ни одно из четырёх захардкоженных
+    имён групп-датасетов, которые collect_cloudflare перечисляет для выбора
+    group_field — ровно момент, когда CF заведёт пятый DO-датасет. Раньше
+    `next()` без дефолта бросал StopIteration, не пойманную ни одним except,
+    и ронял collect_cloudflare целиком (доказано мутацией: убери StopIteration
+    из кортежа except — этот тест краснеет TypeError/StopIteration наружу)."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsFooBarGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": [{"sum": {"requests": 5}}]}]}}
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")  # не должно бросить наружу
+    workers_row = next(r for r in rows if r.resource == "Workers requests/сутки")
+    assert workers_row.status == "ok"  # строка выше по коду не потеряна
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "no-data"
+    assert "упали" in rows_read_row.note
+
+
+def test_cf_rows_metric_aggregation_picked_by_type_suffix(monkeypatch):
+    """Находка 1: агрегация — по суффиксу типа (Sum→sum, Max→max), не
+    захардкожена как "sum" — найденное в Max-типе поле иначе не пройдёт
+    валидацию GraphQL-схемы (запрос попросил бы sum{field} у Max-типа)."""
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [{"name": "AccountDurableObjectsStorageGroupsMax"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsReadMax"}]}}
+        if "workersInvocationsAdaptive" in query:
+            return {"viewer": {"accounts": [{"workersInvocationsAdaptive": []}]}}
+        if "storedBytes" in query:
+            return {"viewer": {"accounts": [{"durableObjectsStorageGroups": []}]}}
+        assert "max { rowsReadMax }" in query.replace("\n", " ")
+        return {"viewer": {"accounts": [{"durableObjectsStorageGroups": [{"max": {"rowsReadMax": 42}}]}]}}
+
+    monkeypatch.setattr(qz, "cf_query", fake_cf_query)
+    rows = qz.collect_cloudflare("acct", "tok")
+    rows_read_row = next(r for r in rows if r.resource == "DO rows_read/сутки")
+    assert rows_read_row.status == "ok"
+    assert rows_read_row.current == 42
+
+
+def test_cf_schema_introspection_failure_is_no_data_for_all_cf_rows(monkeypatch):
+    def broken(token, query, variables=None):
+        raise RuntimeError("HTTP 401: invalid token")
+
+    monkeypatch.setattr(qz, "cf_query", broken)
+    rows = qz.collect_cloudflare("acct", "tok")
+    assert len(rows) == 4
+    assert all(r.status == "no-data" for r in rows)
+    assert all("интроспекция" in r.note for r in rows)
+
+
+# ── LLM-провайдер: честное «нет данных» ───────────────────────────────────────
+
+
+def test_provider_reports_no_quota_api_with_reason():
+    rows = qz.collect_provider()
+    assert len(rows) == 1
+    assert rows[0].status == "no-data"
+    assert "RATE_LIMIT" in rows[0].note
+
+
+def test_provider_reason_handles_empty_string_var_not_just_missing_key(monkeypatch):
+    """Находка AI-ревью PR #327 (третий раунд): GitHub Actions кладёт в env
+    ПУСТУЮ СТРОКУ для незаданного `vars.*` (`DEEPSEEK_BASE_URL: ${{ vars.
+    DEEPSEEK_BASE_URL }}` в quotas.yml), а не отсутствие ключа —
+    `os.environ.get(key, default)` в этом случае возвращает "", не default.
+    Мутация: верни `.get("DEEPSEEK_BASE_URL", "не задан в окружении")` без
+    `or` — этот тест покраснеет (в note появятся пустые скобки)."""
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "")
+    reason = qz.provider_no_quota_api_reason()
+    assert "не задан в окружении" in reason
+    assert "()" not in reason
+
+
+# ── main(): связка «порог → эскалация» (находка 3, ревью PR #327) ───────────
+# Собственно громкий сигнал, ради которого затевался инструмент, — вызов
+# pulse_guard.escalate из main() при превышении порога. over_threshold()
+# тестировался отдельно, а сама проводка main→escalate не была покрыта.
+
+
+def _patch_collectors(monkeypatch, cf_row):
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [cf_row])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [])
+    monkeypatch.setattr(qz, "collect_provider", lambda: [])
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+
+def test_main_calls_escalate_when_threshold_breached(monkeypatch, capsys):
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")  # 96%
+    _patch_collectors(monkeypatch, breached_row)
+
+    calls = []
+    monkeypatch.setattr(qz.pulse_guard, "escalate",
+                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+
+    assert qz.main() == 0
+    assert len(calls) == 1
+    repo, issue, text = calls[0]
+    assert repo == "mytab0r/edge-harness"
+    assert issue == qz.pulse_guard.WATCHDOG_ISSUE
+    assert "DO rows_read/сутки" in text
+
+
+def test_main_does_not_call_escalate_below_threshold(monkeypatch, capsys):
+    safe_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                       10, 5_000_000, "rows", "00:00 UTC", "ok")  # ~0%
+    _patch_collectors(monkeypatch, safe_row)
+
+    calls = []
+    monkeypatch.setattr(qz.pulse_guard, "escalate",
+                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+
+    assert qz.main() == 0
+    assert calls == []
+
+
+def test_main_exits_nonzero_when_escalation_reaches_no_channel(monkeypatch, capsys):
+    """Находка ревью PR #327: escalate() best-effort по двум каналам (Telegram,
+    след в issue) — раньше возврат печатался, но не проверялся, main() всегда
+    отдавал 0. Порог пробит И оба канала молчат ("НЕ доставлен" + "НЕ оставлен")
+    обязаны красить прогон — иначе пробитый порог с умершим сигналом виден
+    только тому, кто читает лог."""
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")
+    _patch_collectors(monkeypatch, breached_row)
+    monkeypatch.setattr(
+        qz.pulse_guard, "escalate",
+        lambda repo, issue, text: "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+
+    assert qz.main() == 1
+    assert "::error::" in capsys.readouterr().out
+
+
+def test_main_stays_green_when_escalation_reaches_at_least_one_channel(monkeypatch, capsys):
+    """Мутационная пара к тесту выше: хотя бы один канал дошёл — прогон зелёный,
+    сигнал состоялся (частичная доставка — не отказ)."""
+    breached_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                           4_800_000, 5_000_000, "rows", "00:00 UTC", "ok")
+    _patch_collectors(monkeypatch, breached_row)
+    monkeypatch.setattr(
+        qz.pulse_guard, "escalate",
+        lambda repo, issue, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+
+    assert qz.main() == 0
+
+
+def test_main_no_warning_when_only_by_design_no_data(monkeypatch, capsys):
+    """Находка AI-ревью PR #327 (третий раунд): «Actions минуты» и
+    «LLM-провайдер квота» — «нет данных» ПО ЗАМЫСЛУ на каждом прогоне, не
+    находка. Предупреждение, горящее всегда, перестаёт быть сигналом и
+    маскирует реальный «CF недоступен». Мутация: убери фильтр
+    BY_DESIGN_NO_DATA в main() — этот тест покраснеет."""
+    ok_row = qz.Row("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                     10, 5_000_000, "rows", "00:00 UTC", "ok")
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [ok_row])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [
+        qz.no_data("Actions минуты (billing)", "GitHub REST", None, "минут/мес", "безлимитно на public repo"),
+    ])
+    # collect_provider реальный — тоже by-design no-data («LLM-провайдер квота»).
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+    assert qz.main() == 0
+    captured = capsys.readouterr()
+    assert "источник(ов) без данных" not in captured.out
+
+
+def test_main_warns_on_unexpected_no_data_not_by_design(monkeypatch, capsys):
+    """Зеркало предыдущего теста: НЕОЖИДАННЫЙ no-data (например, CF схема
+    не отдала метрику) по-прежнему красит предупреждение — фильтр узкий,
+    не глушит реальные пропуски."""
+    unexpected_no_data = qz.no_data("DO rows_read/сутки", "Cloudflare GraphQL Analytics",
+                                     5_000_000, "rows", "интроспекция не удалась")
+    monkeypatch.setattr(qz, "collect_cloudflare", lambda *a: [unexpected_no_data])
+    monkeypatch.setattr(qz, "collect_github", lambda *a: [
+        qz.no_data("Actions минуты (billing)", "GitHub REST", None, "минут/мес", "безлимитно на public repo"),
+    ])
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+
+    assert qz.main() == 0
+    captured = capsys.readouterr()
+    assert "1 источник(ов) без данных" in captured.out

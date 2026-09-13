@@ -1,0 +1,699 @@
+# DeepSeek Harness: архитектура и точки расширения
+
+> Исследовано 2026-08-28. Источники — код и официальные доки, ссылки по тексту.
+> Смежное: [dsh-edge](11-dsh-edge.md), [Cloudflare Free](20-cloudflare-free.md), [отвергнутые варианты](30-rejected-alternatives.md)
+
+## TL;DR
+
+- DSH построен на [Cordis](https://github.com/cordiverse/cordis) под слоганом «Everything is a Plugin»: 247 пакетов в 51 группе, всё сменяемое через YAML-патчи над деревом плагинов — **форк не нужен ни для одной подмены, о которых мы думаем**.
+- Ключевая абстракция — **шов (seam)**: определение сервиса + провайдер + потребитель. Нужные нам швы: `ctx.subprocess` + `ctx.fs` (удалённое исполнение, ставятся ТОЛЬКО парой), `ctx.sessionPersistence` и `ctx.storage` (удалённое состояние), `ctx.llm` (провайдеры моделей), `ctx.shell`.
+- Официальный образец удалённого исполнения уже существует — `packages/e2b/*` (`dsh-subprocess-e2b` + `dsh-fs-e2b`), но README прямо помечает его: «It is an experimental POC, and no shipped composition enables it by default». Это шаблон для нашего провайдера, а не готовый продукт.
+- Ядро почти не зависит от Node: из 45 `.ts`-файлов `packages/core/*/src/` только **три** трогают `node:*` (`crypto`, `async_hooks` + `util/types`, `path`) — все доступны в Workers с `nodejs_compat`. Node жёстко нужен ПРОВАЙДЕРАМ (`subprocess-local`, `sandbox-local`, `fs-local`, `terminal-bash`, persistence, storage), не ядру. Репозиторий сам это доказывает пакетом `packages/experimental/webworker-runtime`.
+- UI — полноценный сетевой клиент, не вшитый в процесс: унарка по HTTP `POST /api/<namespace>/<method>`, стримы и события по одному WebSocket-мультиплексору `/api/remote.mux`. Токены ассистента идут по WebSocket, **не по SSE** — прокси обязан уметь full-duplex апгрейд.
+- Наш вход — профиль `sdk` (JSON-RPC поверх stdio) и/или подмена швов через `cordis.patch.yml`. Ниша удалённого исполнения в экосистеме перекошена в SSH; удалённое хранение сессий (Redis/D1/KV/HTTP-sync) — **пусто, конкурентов нет**.
+
+---
+
+## 1. Что это за проект
+
+| Поле | Значение |
+| --- | --- |
+| Репозиторий | [`deepseek-ai/deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness) |
+| Ветка по умолчанию | `master` |
+| Язык / сборка | TypeScript, pnpm-монорепо |
+| Лицензия | MIT |
+| Звёзды | ~201 400 (201 387 на 2026-08-28) |
+| Создан | 2026-08-13 |
+| Активность | живой, последний push 2026-08-27 |
+| npm | `@deepseek-ai/dsh` |
+| Доки | [deepseek-harness.github.io/deepseek-harness/](https://deepseek-harness.github.io/deepseek-harness/) |
+
+Ядро композиции — [Cordis](https://github.com/cordiverse/cordis) (проект `cordiverse`), IoC-контейнер с контекстами, сервисами и событиями. Статус проекта — **developer preview**; авторы явно предупреждают о ломающих изменениях. Планируя интеграцию, закладывайся на pin-версию и регулярный передиф.
+
+Проверено: `gh api repos/deepseek-ai/deepseek-harness` (2026-08-28).
+
+## 2. Карта монорепо
+
+`pnpm-workspace.yaml` глобит НЕ только `packages/*/*`. Полный список:
+
+```yaml
+packages:
+  - vendor/*
+  - packages/*/*
+  - native/landlock-run
+  - native/landlock-run/packages/*
+  - apps/*
+  - website
+  - python/sdk-runtime
+```
+
+Форма `packages/<группа>/<пакет>` — двухуровневая, поэтому «пакет `fs`» и «группа `fs`» это разные вещи, и путать их дорого (см. ловушку про `fs-e2b` ниже).
+
+**Приложения:**
+- `apps/cli` — `@deepseek-ai/dsh`, **единственная точка входа** для всех профилей;
+- `apps/web` — `@deepseek-ai/dsh-web-frontend`, Vite/React 18 SPA;
+- `website` — VitePress-сайт документации.
+
+**Счёт (проверено обходом git tree на `master`):** 247 пакетов в 51 группе.
+
+- `packages/client/*` — 43 пакета: транспорт и оболочка (`web`, `connection`, `store`, `hmr`, `locale`, `modules`) плюс **37** фич-пакетов `ui-*`: `ui-primitives`, `ui-chat`, `ui-session`, `ui-approval`, `ui-plan`, `ui-subagent`, `ui-trajectory`, `ui-workflow-run`, `ui-settings-*` и т.д. UI нарезан по фичам — вырезать/заменить кусок интерфейса не значит трогать ядро.
+- `packages/core/*` — ровно 8: `scope`, `session`, `system-prompt`, `tools`, `agent`, `agent-loop`, `agent-default-model`, `agent-tool-presentation`.
+
+Ключи контекста, которые составляют «ядро агента»:
+
+| Ключ | Что это |
+| --- | --- |
+| `ctx.sessions` | append-only лог `SessionEvent` |
+| `ctx.systemPrompt` | сборка системного промпта |
+| `ctx.tools` | реестр инструментов |
+| `ctx.agents` | интерфейс `Agent` (создание, resume, инициаторы) |
+| `ctx.agentLoop` | дефолтный драйвер цикла |
+
+## 3. Шов (seam) — главная абстракция
+
+`docs/architecture.md:111`, дословно:
+
+> A **seam** is a swappable capability with three roles: a **Service Definition** declaring the interface, a **Service Provider** implementing it, and a **Consumer** using it, commonly a model-facing tool.
+
+Реестр швов — машинно-генерируемый `docs/capability-seams.md`; роли размечены как `seam` / `core` / `bundle`. Практический смысл: если возможность объявлена швом, её МОЖНО заменить строчкой конфига, не форкая потребителей.
+
+### 3.1 Швы, которые нам важны
+
+**1. `ctx.shell` — `packages/shell/shell`**
+
+`abstract class ShellExecutor extends Service`, методы `resolve()`, `run()`, `start()`. Из `docs/capability-seams.md`:
+
+> sandboxed, **remote**, or PowerShell executors replace bash-local without touching them
+
+Реализации в дереве: `bash-local`, `bash-sandbox`, `pwsh-local`, `pwsh-sandbox` (npm-имена `@deepseek-ai/dsh-bash-local` и т.д.). Ограничение: **один executor на контекст** — второй бросает.
+
+**2. `ctx.subprocess` — `packages/subprocess/subprocess`**
+
+`abstract class SubprocessRuntime extends Service`: `resolveExecutable()`, `spawn()`, `spawnTerminal()`. Из `docs/architecture.md:113`:
+
+> Filesystem and subprocess providers share one execution world, so pointing them at a remote sandbox moves Bash, PTY, and LSP with them, with no provider forks.
+
+**Это правильная точка врезки для удалённого исполнения.** Не `ctx.shell` — врезавшись ниже, в subprocess, ты бесплатно уносишь Bash, PTY и LSP разом. Но **обязательно парой с `ctx.fs`**: подменить один и оставить другой = агент читает файлы на одной машине, а запускает процессы на другой. Это класс ошибки, а не мелочь.
+
+**3. `ctx.fs` — `packages/fs/*`**
+
+Шов `fs` + провайдеры `fs-local`, `fs-sandbox` (плюс `fs-observation-policy` и инструменты `tool-fs`, `tool-fs-search`, `tool-str-replace-editor` в той же группе).
+
+> **Поправка к раннему тезису.** `fs-e2b` живёт НЕ в `packages/fs/`, а в `packages/e2b/fs-e2b` — вместе с остальной семьёй E2B. Искать провайдеры удалённого fs в группе `fs` бесполезно; провайдеры группируются по СРЕДЕ, а не по шву. Проверено обходом git tree.
+
+**4. `ctx.sessionPersistence` — `packages/session/session-persistence`**
+
+`abstract class SessionPersistence`, под ним интерфейс `PersistenceBackend<TornMarker>` и переиспользуемый `PersistenceCoordinator` — то есть новый бэкенд не переписывает координацию, а только I/O. Реализации в дереве **только локальные**: `session-persistence-jsonl` (дефолт) и `session-persistence-sqlite`.
+
+**5. `ctx.storage` — `packages/storage/*`**
+
+Интерфейсы `StorageBackend` / `KvFacet` / `KvUnit`, узкий контракт: `open` / `loadAll` / `putRecord` / `deleteRecord` / `setGlobal` / `close`. Есть conformance-набор `tests/contract.ts` — свой бэкенд можно доказать чужими тестами, не выдумывая свои. Реализации: `storage-json`, `storage-sqlite` (+ `storage-domain`).
+
+**6. `ctx.llm` — `packages/llm/llm`**
+
+В отличие от `shell`, это **реестр, а не одиночка**: `ctx.llm.registerAdapter(providers: string[], adapter: LlmAdapter)`, адаптер — подкласс `abstract class LlmAdapter` с `abstract stream()`. Реализации: `llm-deepseek`, `llm-pi-ai`, `llm-retry`.
+
+Разница «одиночка vs реестр» — прикладная: shell-провайдер ты ЗАМЕНЯЕШЬ, llm-адаптер ты ДОБАВЛЯЕШЬ.
+
+## 4. Официальный образец удалённого исполнения: `packages/e2b/*`
+
+Три пакета: `dsh-e2b` (сервис `ctx.e2b`), `dsh-subprocess-e2b`, `dsh-fs-e2b`. Форма провайдера — ровно та, что нам нужна:
+
+```ts
+class E2BSubprocessRuntime extends SubprocessRuntime {
+  static inject = ['e2b']
+  // ...
+}
+```
+
+Из README `packages/e2b/subprocess-e2b`: агент выполняет Bash, открывает интерактивные терминалы и читает их вывод
+
+> exactly as with local execution
+
+при том, что на хосте не выполняется ничего.
+
+**Три вещи, которые надо знать до того, как копировать:**
+
+1. **Это POC.** README группы, дословно: «It is an experimental POC, and no shipped composition enables it by default.» Ни одна поставляемая композиция его не включает. Читать как референс-реализацию, не как продакшн.
+2. **Объём работы измерим.** `subprocess-local` — 1966 строк src, `subprocess-e2b` — 1835, `fs-e2b` — 612. То есть удалённый subprocess-провайдер стоит примерно столько же, сколько локальный: интерфейс широкий, дешёвой обёртки не выйдет.
+3. **Ловушка синхронного pid.** Из README: «Tooling that needs a process id immediately — for example the ACP child backend — cannot use this package.» Удалённый spawn не может отдать pid синхронно. Любой потребитель, которому pid нужен сразу, отваливается — проверяй это ДО выбора архитектуры, а не после.
+
+## 5. Agent loop
+
+`packages/core/agent-loop/src/agent.ts`, класс `ReactLoopAgent implements Agent` — 543 строки (проверено).
+
+**Форма — машина состояний, а не резидентный цикл.** Фазы: `idle | maintenance | running`. Драйвер `kick()` крутит `while (await this.turn()) {}`, но запускается **только** из `wakeDriver()`, когда в инбокс что-то положили. Никакого `while (true)`: агент, которому нечего делать, не потребляет ничего. Для edge/serverless это принципиально — цикл естественно ложится на модель «разбудили → отработали → уснули».
+
+Драйвер тоже сменяемый. Из `packages/README.md`:
+
+> `dsh-agent-loop` is swappable; UI, hook, and tool plugins use `dsh-agent`
+
+То есть UI и инструменты завязаны на интерфейс `Agent`, а не на конкретный ReAct-цикл.
+
+**Поток одного хода:**
+
+```
+turn/start
+  → сборка промпта
+  → agent/pre-step
+  → step/start
+      → agent/request
+      → llm/stream
+      → assistant/chunk*
+      → assistant/message
+      → tool/call*
+          → tools/pre-execute
+          → tools/execute
+          → tools/post-execute
+      → tool/result*
+  → step/end
+  → agent/turn-stopping
+turn/end
+```
+
+**Словарь (не путать):**
+- **turn** — один слив допущенного ввода;
+- **step** — один запрос к модели плюс вызванные им инструменты.
+
+Один turn содержит N шагов.
+
+## 6. Персистентность
+
+**Раскладка на диске:**
+
+```
+$DSH_HOME/sessions/--<нормализованный-cwd>--/<session-id>/session.jsonl.zstd
+```
+
+Первая строка — `SessionHeader`, дальше по одному `SessionEvent` на строку.
+
+`DSH_HOME` резолвится в `packages/util/home-paths` с приоритетом: **явный конфиг → `$DSH_HOME` → `~/.dsh`**. Сам путь задан конфигом, не хардкодом — `packages/bundle/base/cordis.patch.yml` (проверено):
+
+```yaml
+- id: session-persistence-jsonl
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js dshHomePath('sessions')
+```
+
+**Инвариант «Model-visible means logged».** Всё, что дошло до модели, реконструируется из лога; проверяется рантайм-инвариантом, а не соглашением. Практическое следствие: лог — достаточное состояние для восстановления разговора.
+
+**Что из этого следует:**
+- `ctx.agents.resume(ownerCtx, { resumeSessionId })` — возобновление;
+- `ctx.sessions.fork()` — ветвление;
+- после краха незакрытый `turn/start` дописывается синтетическим `turn/end { reason: { kind: 'interrupted' } }` — лог самолечится, а не остаётся полубитым;
+- компакция **не удаляет** события: surface-replacement `{ op: 'replace', start, end }` кладётся поверх. История неразрушима.
+
+**КРИТИЧНО — переносится только ЛОГ.** Состояние драйвера (инбокс, фаза) не сериализуется: новый процесс стартует с фазой `idle` и пустым инбоксом. Значит «перенести живого агента между машинами» = перенести лог и заново разбудить, а не мигрировать процесс. Всё, что было в инбоксе на момент обрыва, теряется — если это неприемлемо, очередь ввода надо держать снаружи харнеса.
+
+## 7. События (Cordis)
+
+**Режимы диспетчеризации:**
+
+| API | Семантика |
+| --- | --- |
+| `ctx.emit` | broadcast, без ожидания |
+| `ctx.parallel` | все листенеры, ждём всех |
+| `ctx.serial` | по очереди; первое non-null останавливает |
+| `ctx.bail` | синхронный вариант serial |
+| `ctx.waterfall` | around-middleware с `next()` |
+
+`ctx.on(name, listener, options?)` возвращает disposer — отписка обязательна и предусмотрена.
+
+**Waterfall — механизм вето.** Листенер получает `(...args, next)`. Вызвал `next()` — цепочка идёт дальше; вернул значение без `next()` — короткое замыкание, то есть вето/подмена. Это и есть штатный способ вклиниться в чужую операцию, не патча её.
+
+**Режимы реальных событий:**
+
+| Событие | Режим |
+| --- | --- |
+| `agent/pre-step` | waterfall |
+| `agent/request` | waterfall |
+| `tools/pre-execute`, `tools/execute`, `tools/post-execute` | waterfall |
+| `llm/stream` | waterfall |
+| `approval/request` | waterfall |
+| `agent/turn-stopping` | serial |
+| `session/event` | emit (~30 подписчиков) |
+
+**События уже ходят по сети.** `packages/api/remotes/src/remote-events.ts` держит allowlist `API_REMOTE_FORWARDED_EVENTS` (~15 записей, проверено). Среди них в режиме `waterfall` — `approval/request` и `user-questions/request`: **браузер по сети ветирует операцию на хосте**. Прецедент распределённого waterfall уже в проде, изобретать транспорт для вето не нужно.
+
+Но: `turn/*`, `step/*`, `tool/*` наружу как Cordis-события **не идут**. Это durable session events; до UI они доезжают через `session/event`. Не ищи их в allowlist — их там нет по устройству.
+
+## 8. Граница UI ↔ ядро
+
+Это полноценный сетевой клиент, а не UI, вшитый в процесс. Для нас (отделяем UI) — главный раздел.
+
+**Унарные вызовы: HTTP.** `POST /api/<namespace>/<method>`. Префикс объявлен ровно одной константой — `packages/client/connection/src/api-path.ts` (проверено):
+
+```ts
+/** Route prefix owning every api request (`/api` and `/api/<anything>`). */
+export const API_PATH = '/api'
+```
+
+Конверт валидируется Zod (`rpc-schema.ts`): запрос `clientRequestSchema { type: 'client-request', rpcId, method, payload }`, ответ — дискриминированный юнион `{ ok: true, value } | { ok: false, error }`.
+
+**Стримы и события: один WebSocket-мультиплексор.** `packages/api/gateway/src/stream-protocol.ts` (проверено):
+
+```ts
+REMOTE_STREAM_MUX_PATH      = '/api/remote.mux'
+REMOTE_EVENT_STREAM_ENDPOINT = '$events'
+```
+
+Кадры: клиент→хост `{ type: 'open' | 'cancel', streamId, endpoint, payload }`; хост→клиент `{ type: 'item' | 'error' | 'end' }`, плюс служебные `ready`, `emit`, `waterfall`.
+
+> **Токены ассистента идут по WebSocket, НЕ по SSE.** Любой прокси между браузером и хостом обязан уметь full-duplex апгрейд. Прокси, умеющий только HTTP-стриминг, тихо сломает вывод модели — а «тихо» тут значит «сессия висит без ошибки».
+
+**Typert** — генерируемый типобезопасный RPC (группа `packages/typert/*`): декоратор `@Remote('namespace/method')`, `@Remote({ mode: 'stream' })` отдаёт async-итератор. Последний параметр `AbortSignal` = отмена по проводу. Контракт клиент↔хост выводится из типов, руками не пишется.
+
+**Аутентификация и доверие — поправлено 2026-08-29 по tarball'у 0.1.1-rc.2.** Ранний тезис про «токенизированный startup URL и session cookie» кодом не подтвердился (в `dsh-client-connection` 0.1.1-rc.2, 588 строк, ни одного упоминания cookie/session-логина) и снят. Как устроено на самом деле: своей аутентификации у web-профиля **нет** — защита = bind на loopback плюс **Host/Origin-fence** на каждый `/api`-запрос и WS-апгрейд (`dsh-client-connection/lib/index.js`, «Browser-trust fence for every /api request»): Host обязан быть loopback или входить в `trustedHosts`, `sec-fetch-site: cross-site` отклоняется, присутствующий Origin обязан совпасть с Host. Граница шва названа им самим дословно: «Network reachability and authentication stay out of scope: binding policy belongs to the webserver config, and this fence is not an auth layer». Легальные не-loopback авторитеты добавляются флагом `dsh web --trusted-host <host[:port]>` (repeatable; запись без порта = любой порт). По умолчанию слушает `127.0.0.1:3080` (ряд `webserver` бандл-патча `dsh-web-app/cordis.patch.yml`); `--host 0.0.0.0` **намеренно запрещён** CLI: «intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead». Выставлять наружу нужно туннелем/прокси, а не флагом — авторы закрыли эту дверь сознательно. Оговорка: доки апстрима (`docs/subsystems/web-server.md`) приписывают shipped `dsh web` ещё и «browser-session authentication» — в опубликованном коде rc.2 её нет, противоречие живое, при смене пина перепроверять.
+
+**In-process carrier без сокета.** `packages/api/gateway/src/client/index.ts` содержит ветку `if (connection.rpc.open === undefined) this.streams.start()` — тот же клиентский код работает без транспорта, вызывая хост напрямую. Значит граница UI↔ядро формальна и уже проверена в обоих режимах: это не «теоретически отделяемо», это отделено.
+
+## 9. Профили — готовые топологии
+
+Профиль — **упорядоченный стек YAML-патчей** над деревом плагинов. Посмотреть своё собранное дерево: `dsh --profile web --dump-config`. Все профили, кроме `sdk-minimal`, стоят на слое `dsh-base`.
+
+| Профиль | Что делает |
+| --- | --- |
+| `web` | `npx @deepseek-ai/dsh web` → 127.0.0.1:3080, SPA + WS |
+| `headless` | `dsh --profile headless "задача"` — одна персистентная сессия, печатает финальный ответ, выходит |
+| `sdk` | JSON-RPC поверх stdio |
+| `sdk-minimal` | то же без слоя `dsh-base` |
+| `acp` | ACP-сервер, тоже JSON-RPC по stdio |
+
+**`headless` и политика аппрувов.** Политика `'never'` **детерминированно резолвит всё в `rejected`** — fail-closed. Это не «аппрувы отключены», это «любой запрос на аппрув отклонён». Автоматизация, рассчитывающая на молчаливое разрешение, сломается — и это правильное поведение.
+
+### 9.1 Профиль `sdk` — наш вход
+
+`packages/sdk/*` — три пакета: `protocol`, `server`, `client`. Транспорт — JSON-RPC поверх stdio, то есть интеграция не требует ни порта, ни HTTP-стека, ни авторизации: поднял подпроцесс, говоришь по трубам.
+
+Python-SDK **есть в самом репозитории**: `python/sdk-runtime` — отдельный workspace-член с `pyproject.toml`, `hatch_build.py` и `platforms.json`; он запускает `dsh --profile sdk` подпроцессом.
+
+> **Поправка.** Ранее наличие Python-SDK числилось неподтверждённым (знали о нём из обзорной статьи). Подтверждено первоисточником: `python/sdk-runtime` перечислен в `pnpm-workspace.yaml` и присутствует в дереве `master`. Убрано из «не подтверждено».
+
+## 10. Мультипровайдерность LLM (`llm-pi-ai`)
+
+Пакет `packages/llm/llm-pi-ai` стоит поверх `@earendil-works/pi-ai` и представляет собой **один плагин-пул**, а не набор плагинов на провайдера.
+
+- Конфиг: `$DSH_HOME/settings.yaml`, ключи `llm-pi-ai.providers.<id>`.
+- Креды **отдельно**: `$DSH_HOME/.credentials.yaml` (по ссылкам `apiKeyEnv`), в основной конфиг не попадают.
+- Каталожные провайдеры: DeepSeek, Anthropic, OpenAI, Bedrock, Vertex, Azure, Codex.
+- Протоколы: `openai-completions`, `openai-responses`, `anthropic-messages`.
+- Свой gateway = строчка конфига, кода писать не нужно.
+
+**Полная схема конфигурации — проверено по tarball `@deepseek-ai/dsh-llm-pi-ai@0.1.2-alpha.3` (lib/types/config.d.ts, lib/types/provider.d.ts, lib/types/catalog.d.ts).**
+
+Путь в конфиге: `llm-pi-ai.providers.<route-id>` (где `<route-id>` — уникальный идентификатор провайдера). Поля объекта провайдера:
+- `displayName` — видимое имя в UI (обязательно)
+- `api` — wire-протокол провайдера (обязательно); для OpenAI-совместимых = `"openai-completions"`
+- `baseURL` — API endpoint (заглавные буквы: `baseURL`, а не `base_url`) (обязательно)
+- `apiKeyEnv` — **название env-переменной**, где хранится ключ (не сам ключ). Резолвится per-request через `ctx.credentials` (обязательно)
+- `models[]` — массив поддерживаемых моделей; каждый элемент содержит:
+  - `id` — идентификатор модели (обязательно)
+  - `name?` — опциональное видимое имя в UI
+  - `contextWindow?` — размер окна контекста
+  - `maxTokens?` — максимум выходных токенов
+
+**Пример валидного конфига** (поля отвечают структуре `config.d.ts:54-65`):
+
+```yaml
+llm-pi-ai:
+  providers:
+    custom-openai:
+      displayName: My OpenAI Gateway
+      api: openai-completions
+      baseURL: https://api.example.com/v1
+      apiKeyEnv: CUSTOM_OPENAI_KEY
+      models:
+        - id: gpt-4o
+          name: GPT-4 Omni
+          contextWindow: 128000
+          maxTokens: 4096
+```
+
+**Контраст с `dsh-llm-deepseek`.** В адаптере `dsh-llm-deepseek` (единственный, смонтированный в морде dsh-edge, см. [research/11](11-dsh-edge.md)) выбор модели пинится ОДНОЙ константой в cordis-патче (`agent-default-model`), а base URL и ключ идут из env. В `llm-pi-ai` провайдер и модель объявляются в settings namespace `llm-pi-ai.providers`, то есть переконфигурируются без пересборки. Это две разные архитектуры: single-provider по переменным окружения против multi-provider через settings. Не путать их схемы полей: у `llm-pi-ai` это `api`/`baseURL`/`apiKeyEnv`, у `llm-deepseek` — env `DEEPSEEK_BASE_URL`/`DEEPSEEK_API_KEY` плюс патч профиля.
+
+**Связь с `agent-default-model`.** Глобальный выбор модели живёт в `agent-default-model` namespace (`$DSH_HOME/settings.yaml`):
+
+```yaml
+agent-default-model:
+  provider: <route-id>  # идентификатор провайдера из llm-pi-ai (например, "custom-openai")
+  model: <model-id>     # одно из значений llm-pi-ai.providers.<route-id>.models[].id
+  reasoningEffort: low
+```
+
+Пакет смонтирован **дремлющим**: комментарий в `packages/bundle/base/cordis.patch.yml` (проверено дословно) описывает это как «zero routes (and no extra models in the picker) until a `llm-pi-ai:` settings section supplies provider profiles» — маршруты регистрируются, когда появились профили, и снимаются, когда секция опустела. Ровно это делает страница Models в веб-морде.
+
+> **КРИТИЧНАЯ ПОПРАВКА.** Это пул **ВЫБОРА** — все модели сваливаются в один picker, пользователь выбирает. Это **НЕ роутер**. Автоматического fallback при ошибке, балансировки нагрузки и ротации нескольких учёток одного провайдера в документации **нет**. Если нужна отказоустойчивость или размазывание по ключам — это наша работа (свой `LlmAdapter` либо gateway снаружи), и планировать её надо явно. Единственный намёк на устойчивость в дереве — отдельный пакет `llm-retry`, то есть ретраи, а не маршрутизация.
+
+Уточнение по провайдеру `anthropic` конкретно: `llm-pi-ai` умеет напрямую принимать Claude OAuth
+access-токен в `apiKeyEnv` (детект `sk-ant-oat`, автопереключение на `Authorization: Bearer` +
+нужные беты) — без loopback-прокси. Подробности, минимальный конфиг и граница с плагином
+`dsh-anthropic-oauth-pool` (ротация нескольких аккаунтов) — [research/32](32-claude-oauth-provider.md).
+
+### 10.2 Каталоги моделей конкретных провайдеров
+
+**Z.AI: семейство GLM — подтверждено по официальным докам.**
+
+| модель | context window | max output | API-id |
+| --- | --- | --- | --- |
+| glm-5 | 200K (200 000) | 128K (131 072) | `glm-5` |
+| glm-5.3 | 1M (1 000 000) | 128K (131 072) | `glm-5.3` |
+| glm-5.3-flash | 1M (1 000 000) | 128K (131 072) | `glm-5.3-flash` |
+| glm-4.7 | 200K (200 000) | 128K (131 072) | `glm-4.7` |
+
+**Источник:** [docs.z.ai/guides/llm/glm-5](https://docs.z.ai/guides/llm/glm-5), [docs.z.ai/guides/llm/glm-5.3](https://docs.z.ai/guides/llm/glm-5.3), [docs.z.ai/guides/vlm/glm-5.3-flash](https://docs.z.ai/guides/vlm/glm-5.3-flash), [docs.z.ai/guides/llm/glm-4.7](https://docs.z.ai/guides/llm/glm-4.7), [docs.z.ai/api-reference/llm/chat-completion](https://docs.z.ai/api-reference/llm/chat-completion).
+
+**OpenAI-compatible endpoint:** `https://api.z.ai/api/coding/paas/v4`
+
+**Практическое значение:** `docs.z.ai/api-reference/llm/chat-completion` задаёт для параметра `max_tokens` диапазон 1…131072. Это прямое подтверждение констант `DEEPSEEK_MAX_OUTPUT_TOKENS=131072` (деплой морды) и `DSH_MAX_TOKENS=131072` (раннер), и объясняет, почему дефолтный `maxTokens` адаптера 256 000 отвергается с `INVALID_REQUEST` — API не принимает значения свыше лимита провайдера.
+
+**Рантайм-источник этих чисел** в репозитории — переменная `vars.DSH_EDGE_MODEL_CATALOG` (актуальны на 2026-09-01). Документация объясняет ПОЧЕМУ такие числа, конфиг содержит ЧТО их использует. При обновлении параметров одного провайдера правятся оба места одновременно: документация и конфиг не должны расходиться.
+
+---
+
+**NVIDIA Nemotron-3: семейство MoE-моделей, managed API.**
+
+| вариант | параметры | context | API-id |
+| --- | --- | --- | --- |
+| Nano | 30B общ. / 3B активных (MoE) | не подтверждено | не подтверждено |
+| Super | 120B общ. / 12B активных (MoE) | не подтверждено | `nvidia/nemotron-3-super-120b-a12b` |
+| Ultra | 550B общ. / 55B активных (MoE) | 1M (Long Context Ruler @1M) | `nvidia/nemotron-3-ultra-550b-a55b` (экстраполяция) |
+
+**Источник:** блоги developer.nvidia.com про Nemotron-3 Ultra и Nemotron-3 Nano; архитектура Ultra описана как Hybrid Mamba-Attention (LatentMoE: Mamba-2 + MoE + Attention, Multi-Token Prediction).
+
+**OpenAI-compatible endpoint:** `https://integrate.api.nvidia.com/v1`
+
+**Важные замечания:**
+- Архитектура Ultra не чистый transformer (Mamba-2 + MoE-гибрид), поэтому лимиты, адаптированные для GLM, переносить на этот провайдер нельзя — нужна независимая проверка.
+- **Llama-3.1-Nemotron-Ultra-253B** — другая, более старая линейка моделей. Не путать с Nemotron-3-Ultra-550B: это разные модели с разными характеристиками.
+- API-id Super подтверждён (зашит в репозитории с #51); API-id Ultra образован по образцу и требует проверки при наличии ключа доступа.
+
+## 11. Что требует Node-рантайма
+
+Вывод, ради которого делалась вся проверка: **ядро почти чистое, Node нужен провайдерам.**
+
+**Ядро.** Прогон по всем 45 `.ts`-файлам `packages/core/*/src/` дал ровно **три** файла с node-импортами (проверено обходом содержимого):
+
+| Файл | Импорт | Зачем |
+| --- | --- | --- |
+| `agent-loop/src/index.ts` | `node:crypto` | `randomUUID` |
+| `agent/src/index.ts` | `node:async_hooks`, `node:util/types` | `AsyncLocalStorage` (инициаторы), `isPromise` |
+| `session/src/index.ts` | `node:path` | `isAbsolute` |
+
+`core/tools`, `core/system-prompt`, `core/scope` — чисты полностью. Все четыре модуля доступны в Workers с `nodejs_compat`.
+
+**Швы тоже почти чисты.** Ноль node-импортов: `shell/shell`, `fs/fs`, `session/session-persistence`. Исключения (точечные, но их надо знать):
+
+- `subprocess/subprocess/src/types.ts` → `node:stream`
+- `sandbox/sandbox/src/roots.ts` → `node:fs`, `node:os`
+- `llm/llm/src/attribution.ts` → `node:module`
+
+**Node ЖЁСТКО нужен:** `subprocess-local` (node-pty, koffi), `sandbox-local` (`@deepseek-ai/node-addon-landlock-run`; bwrap+Landlock / Seatbelt / Windows restricted token), `fs-local`, `terminal-bash` (node-pty/ConPTY), `session-persistence-jsonl|sqlite`, `storage-json|sqlite`, `workflow-worker-thread` (`node:worker_threads`), `apps/cli/src/bin.ts`.
+
+**Node НЕ нужен:** `subprocess-e2b`, `fs-e2b` — они ходят HTTP'ом в удалённую песочницу. Это и есть доказательство, что удалённый провайдер снимает зависимость от Node, а не переносит её.
+
+**Репозиторий сам объявляет браузерное подмножество:** `tsconfig.base.client.json` (lib ES2024 + DOM, **без** `types: ["node"]`) против `tsconfig.base.json` / `tsconfig.host.json` (с `types: ["node"]`). Граница «что живёт без Node» проведена авторами, а не нами.
+
+### 11.1 Главная улика — `packages/experimental/webworker-runtime`
+
+Из описания пакета: «The browser worker host: the whole harness plugin tree runs inside one dedicated Web Worker… Use it when a preview must run the packaged harness without a Node host».
+
+То есть **весь плагин-tree харнеса уже запускается в браузерном Web Worker**. Устройство:
+
+- `module-proxies.ts` — **единственная платформенная развилка**, подменяет `node:*` на VFS / tunnel / браузерные примитивы. Одно место правды, а не размазанные `if (isBrowser)`.
+- Даже `node:child_process` там не заглушка, а реализация: `spawn` поднимает команду в отдельном Web Worker.
+- Честный список **не вытянутого**: `node:dns/promises`, `node:vm`, `node:net`, `node:sqlite`, `node:worker_threads` — структурные заглушки, каждый вызов **громко падает** (fail loud, не silent-wrong).
+
+**Чего этот путь не даёт:** изоляция — граница VFS, а не kernel Landlock; шелл не bash; нет git и сетевых утилит. Это «превью харнеса без Node-хоста», а не замена песочнице.
+
+## 12. Как подменить провайдера без форка
+
+**Механизм.** Пакет объявляет свой слой через `package.json`:
+
+```json
+{ "dsh": { "bundle": { "patch": "./cordis.patch.yml" } } }
+```
+
+**Порядок слоёв** (позже = сильнее): бандлы профиля → `cordis.patch.yml` профиля → `$DSH_HOME/cordis.patch.yml` → `--patch` из argv.
+
+Правило слияния, дословно из доков:
+
+> Later layers win per row, and a patch replaces a row's entire config value rather than deep-merging keys.
+
+**Важное следствие:** патч заменяет `config` строки **целиком**, а не домердживает ключи. Хочешь поменять один ключ — переписываешь весь `config` этой строки. Ожидание deep-merge здесь тихо не сбудется.
+
+**Подмена = переписать строку с нужным `id`:**
+
+```yaml
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'   # ← заменить на своё
+```
+
+`id` — это идентичность строки; `name` — что в неё подставлено. Меняем `name`, `id` держим.
+
+**Установка плагина:**
+
+```bash
+dsh plugin --profile demo add ./hello-plugin
+dsh plugin --profile demo add github:you/repo
+```
+
+**Минимальный плагин:**
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+
+export const name = 'hello'
+
+export function apply(ctx: Context) {
+  console.log('hello')
+}
+```
+
+**Сервис** — класс плюс declaration merging в `interface Context`, чтобы `ctx.<твой-сервис>` был типизирован у потребителей.
+
+## 13. Экосистема сторонних плагинов
+
+Официального каталога **нет**. Есть GitHub topic [`dsh-plugin`](https://github.com/topics/dsh-plugin) и community-списки: `awesome-dsh-plugin` (13.3k★), `dsh-market` (2.7k★).
+
+**Удалённое исполнение — ниша перекошена в SSH.** `dsh-ssh`, `dsh-ssh-remote`, `dsh-remote-ssh`, `dsh-winrm` — около десятка конкурентов, канон не выбран. Остальное почти пусто: Docker — `frozo-ai/dsh-worlds` (2★); облако — `NeevCloudAI/dsh-neev-sandbox` (1★), `pawaca/dsh-edge` (11★).
+
+**Совсем пусто:** Modal, Daytona, Firecracker, devcontainer, GitHub Actions как среда исполнения агента.
+
+**Удалённое хранение сессий — почти пусто:** `weisanju/dsh-postgres-backends` (0★), `tancheng33/dsh-spill-s3` (1★). Redis / D1 / Cloudflare KV / HTTP-sync как бэкенд session persistence — **не найдено ничего**. Это самая свободная ниша из просмотренных.
+
+> **Ловушка при поиске.** Рубрика «Remote & Mobile» в awesome-списке (~60 плагинов) выглядит как конкуренты, но это в основном удалённый **ДОСТУП** к локально работающему харнесу: телефон, Tailscale, Telegram-мосты. Исполнение остаётся на машине пользователя. Не считать их занятой нишей — они решают другую задачу.
+
+---
+
+## Дистрибуция в npm: подтверждено замером 2026-08-28/29
+
+- Пакеты `@deepseek-ai/dsh-*` есть в публичном npm, лицензия MIT. `npm view` и
+  `npm pack` работают.
+- **`npm install @deepseek-ai/dsh@0.1.1-rc.2` даёт 404** при работающих
+  `view`/`pack`. Установка — только через скачанный tarball
+  (`npm pack` → `npm install ./файл.tgz`). Не подтверждено: резолвит ли npm
+  транзитивные зависимости ставимого tarball'а из реестра — проверить первым
+  прогоном в job'е; фолбэк — полная распаковка dependency-closure.
+- **`dsh-headless` 0.0.1-rc.1 — контракт по README пакета:** one-shot, без
+  listening-портов и Host/HTTP-сервера; создаёт одного персистентного агента,
+  подаёт задачу (позиционный аргумент `dsh --profile headless "<task>"`) как
+  обычное пользовательское сообщение, ждёт затишья, **флашит сессию перед
+  выходом**, печатает последний непустой текст ассистента в stdout; код 0 —
+  только при завершённом `turn/end`, терминальная ошибка уходит в stderr.
+  Boot вне `dsh`-лаунчера падает громко (`ctx.headlessIo` — хук лаунчера).
+- Профили (web/headless/tui) авто-инициализируются из шаблонов лаунчера.
+
+### Запуск headless с внешним OpenAI-compat провайдером — подтверждено живым прогоном 2026-08-30
+
+- Адаптер `dsh-llm-deepseek` читает из env **только** `DEEPSEEK_BASE_URL` и
+  `DEEPSEEK_API_KEY` (плюс `DEEPSEEK_REASONING`); переменная `DEEPSEEK_MODEL`
+  в Node-лаунчере **не читается** — это механика dsh-edge, не dsh.
+- Выбор модели — settings namespace `agent-default-model`
+  (`{provider, model, reasoningEffort}`), дефолт `deepseek-official` +
+  `deepseek-v4-flash`. Переопределяется патчем профиля
+  `~/.dsh/profiles/headless/cordis.patch.yml`:
+
+  ```yaml
+  - id: agent-default-model
+    config:
+      provider: deepseek-official
+      model: <модель провайдера>
+  ```
+
+- `maxTokens` адаптера по умолчанию **256 000**; провайдеры с меньшим потолком
+  (GLM: 131 072) отвечают `INVALID_REQUEST` на параметр max_tokens. Лечится тем
+  же патчем: `- id: llm-deepseek / config: { maxTokens: 131072 }`.
+- GLM (Z.AI): у ключа Coding Plan квота есть **только** на
+  `https://api.z.ai/api/coding/paas/v4`; стандартный `api/paas/v4` на те же
+  модели отвечает `QUOTA: Insufficient balance` даже для flash-моделей.
+  Рабочая связка: coding-эндпоинт + `glm-5` + maxTokens 131072 — агент ответил
+  корректно. Список моделей: `GET <base>/models` (glm-4.5…glm-5.3-flash).
+
+## Что не подтверждено
+
+- **Детали протокола E2B за пределами README.** Формат запросов к песочнице, семантика таймаутов, поведение при обрыве — читались только по README пакетов. Перед реализацией собственного удалённого провайдера по этому образцу надо читать `packages/e2b/*/src`.
+- **Глубокая часть документации недоступна на сайте.** `docs/cordis-api/*`, `docs/subsystems/*`, `docs/capability-seams.md` на [deepseek-harness.github.io](https://deepseek-harness.github.io/deepseek-harness/) отдают 404 и живут **только в репозитории**. Ссылаться на сайт для этих разделов нельзя — только на `raw.githubusercontent.com`. (Из-за этого же реестр швов и часть цитат в этом документе взяты из репозитория, а не с сайта.)
+- **Точные звёзды сторонних плагинов** — снимок на 2026-08-28, метрика подвижная; отсутствие плагина в списке значит «не нашли», а не «не существует».
+- **Публичный листинг моделей Z.AI:** `GET https://api.z.ai/api/coding/paas/v4/models` без ключа отдаёт 401 — доки z.ai остаются единственным источником окон контекста и лимитов вывода.
+- **Публичный листинг моделей NVIDIA NIM:** `GET https://integrate.api.nvidia.com/v1/models` без ключа отдаёт 451, `build.nvidia.com` — 403. Соответствие HuggingFace-slug → managed API id проверяется только авторизованным запросом; точный API-id Nemotron-3 Ultra до такой проверки считается неподтверждённым.
+- **Максимум output-токенов для Nemotron-3 Ultra** публично не задокументирован нигде.
+
+### Снято с этого списка
+
+- ~~Наличие Python-SDK~~ — **подтверждено первоисточником**: `python/sdk-runtime` перечислен в `pnpm-workspace.yaml` и присутствует в дереве `master` (`pyproject.toml`, `hatch_build.py`, `platforms.json`, `src`). Раньше знали только из обзорной статьи.
+
+### Поправки к более ранним тезисам
+
+| Было | Стало | Как проверено |
+| --- | --- | --- |
+| 247 пакетов в **50** группах | 247 пакетов в **51** группе | обход `git/trees/master?recursive=1` |
+| «~30 фич-пакетов `ui-*`» | **37** пакетов `ui-*` (из 43 в `packages/client/*`) | там же |
+| `fs-e2b` в `packages/fs/*` | `fs-e2b` в **`packages/e2b/fs-e2b`** | там же |
+| workspace глобит `packages/*/*` | глобит также `apps/*`, `website`, `vendor/*`, `native/landlock-run{,/packages/*}`, **`python/sdk-runtime`** | `pnpm-workspace.yaml` |
+| Определение шва кончается на «a Consumer using it» | у цитаты есть хвост: «…**, commonly a model-facing tool**» | `docs/architecture.md` |
+| Из forwarded-событий waterfall — `approval/request` | waterfall также у **`user-questions/request`** | `packages/api/remotes/src/remote-events.ts` |
+| Аутентификация web: «токенизированный startup URL → подписанная session cookie» | своей аутентификации **нет**: bind loopback + Host/Origin-fence («this fence is not an auth layer»), легальные авторитеты — флаг `--trusted-host` | tarball `dsh-client-connection` 0.1.1-rc.2 (`lib/index.js`: 0 упоминаний cookie/session-логина), `dsh-web-app` (`lib/startup.js:40`, `cordis.patch.yml`) |
+
+## Источники
+
+**Проверено напрямую 2026-08-28:**
+
+- [`deepseek-ai/deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness) — метаданные через GitHub API: `master`, TypeScript, MIT, 201 387★, создан 2026-08-13, push 2026-08-27, не архивирован
+- [`pnpm-workspace.yaml`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/pnpm-workspace.yaml) — глобы workspace
+- [`docs/architecture.md`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/docs/architecture.md) — определение шва (:111), «one execution world» (:113)
+- [`packages/e2b/README.md`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/e2b/README.md) — «experimental POC… no shipped composition enables it by default»
+- [`packages/e2b/subprocess-e2b/README.md`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/e2b/subprocess-e2b/README.md) — «exactly as with local execution», ловушка pid / ACP
+- [`packages/client/connection/src/api-path.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/client/connection/src/api-path.ts) — `API_PATH = '/api'`
+- [`packages/api/gateway/src/stream-protocol.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/api/gateway/src/stream-protocol.ts) — `/api/remote.mux`, `$events`, кадры
+- [`packages/api/remotes/src/remote-events.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/api/remotes/src/remote-events.ts) — allowlist `API_REMOTE_FORWARDED_EVENTS`
+- [`packages/bundle/base/cordis.patch.yml`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/bundle/base/cordis.patch.yml) — `root: !!js dshHomePath('sessions')`, дремлющий `llm-pi-ai`
+- [`packages/core/agent-loop/src/agent.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/core/agent-loop/src/agent.ts) — `ReactLoopAgent`, 543 строки, фазы `idle|maintenance|running`, `wakeDriver`/`kick`
+- [`packages/core/agent/src/index.ts`](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/core/agent/src/index.ts) — `node:async_hooks`, `node:util/types`
+- обход всех 45 `.ts` в `packages/core/*/src/` на предмет `node:*`
+
+**Тарбол-исследование tarball `@deepseek-ai/dsh-llm-pi-ai@0.1.2-alpha.3` — 2026-08 :**
+- `lib/types/config.d.ts` — структура `LlmPiAiConfig`, ключи `providers.<id>`, поля провайдера
+- `lib/types/provider.d.ts` — интерфейс провайдера с `api`, `baseURL`, `apiKeyEnv`, `models`
+- `lib/types/catalog.d.ts` — структура каталога моделей с полями `id`, `name`, `contextWindow`, `maxTokens`
+- `README.md` (строка 113) — требование непустого `models` для кастомных route'ов
+
+**Прочитано, но не перепроверено построчно:** `docs/capability-seams.md`, `packages/README.md`, README пакетов `shell`, `subprocess`, `fs`, `storage`, `session-persistence`, `llm`, `webworker-runtime`, документация по профилям и `dsh plugin`.
+
+**Внешнее:** [Cordis](https://github.com/cordiverse/cordis), [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai), GitHub topic [`dsh-plugin`](https://github.com/topics/dsh-plugin), community-списки `awesome-dsh-plugin`, `dsh-market`.
+
+### Каталог моделей в морде dsh-edge — подтверждено на проде 2026-08-30
+
+- Селектор моделей UI строится из серверного каталога: `llm` → `listProviders()`
+  → `listModels(provider.id)` → группы, отдаётся клиенту методами
+  `llm.providers` / `llm.models` / `session.models` (RPC-конверт
+  `{type:"client-request", rpcId, method, payload}`, авторизация кукой владельца).
+- Каталог по умолчанию — три зашитых DeepSeek-модели. Адаптер поддерживает
+  кастомный `models` в конфиге, но dsh-edge его не прокидывает
+  (`EdgeDeploymentConfigSource` несёт только один `DEEPSEEK_MODEL`).
+- Решение edge-harness: каталог и имя группы (`providerInfo`, `displayName`)
+  патчатся в `worker.js` на деплое из `vars.DSH_EDGE_MODEL_CATALOG` /
+  `vars.DSH_EDGE_PROVIDER_NAME`; патч скобочно-сбалансированный, после него
+  обязателен `node --check`, смена формы upstream = громкое падение деплоя.
+- Секреты воркера `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` синхронизируются деплоем
+  из `vars` — морда и руки (hands-job) читают провайдера из одного места правды
+  (GLM coding-эндпоинт + glm-5; NIM — запасной `NVIDIA_API_KEY`).
+- Вход владельца: `POST /api/auth/login` — строго form-encoded
+  (`accessKey=...`, same-origin), иначе «Login requires a form-encoded request».
+
+### Шов подписки на события сессии — tarball-исследование 0.1.1-rc.2, 2026-08-30
+
+Tarball'ы `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-headless`,
+`@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session-persistence`,
+`@deepseek-ai/dsh-session-persistence-jsonl`, `@deepseek-ai/dsh` (все
+0.1.1-rc.2) скачаны `npm pack` и прочитаны (`lib/*.js`, `lib/types/*.d.ts`).
+
+**Словарь durable-событий сессии** — `SessionEventMap` в
+`dsh-session/lib/types/types.d.ts` (merge-extensible; `dsh-agent` добавляет
+`agent/inbox/spliced` декларацией в своём `lib/types/types.d.ts`):
+`turn/start {turn}`, `turn/end {turn, reason}`, `step/start {turn, step}`,
+`step/end {turn, step}`, `user/message`, `assistant/chunk {turn, step, chunk}`,
+`assistant/message {turn, step, message, usage?, interrupted?}`,
+`tool/call {turn, step, callId, name, arguments}` (arguments — сырая JSON-строка
+как её выдала модель), `tool/result {turn, step, message, error?, meta?}`,
+`todo/write`, `request/header`, `request/context`, `session/end-seed`.
+Конверт события: `{type, seq, time, data, ignorable?}`; `seq` непрерывен с 0
+(`seq = log.length` в `Session.append`, `dsh-session/lib/index.js:1457-1459`),
+`time` — epoch ms. Полный реестр типов сборки — `KNOWN_SESSION_EVENT_TYPES`
+(`dsh-session/lib/index.js:1054`, сгенерирован; включает также `llm/retry`,
+`approval/*`, `compaction/*`, `session/title`, `subagent/descriptor`).
+
+**Канонический паттерн подписки** — сам upstream-плагин персистенции,
+`PersistenceCoordinator.installWritePath()`
+(`dsh-session-persistence/lib/index.js:1132-1163`):
+
+```js
+ctx.on("session/created", (session) => { ... });
+ctx.on("session/event",  (session, event) => { this.initFor(session).writes.enqueue(event); });
+ctx.on("session/flush",  (session) => this.flush(session));
+ctx.on("session/disposed", (session) => { ... });
+```
+
+Свойства шва, подтверждённые кодом:
+
+- `session/event` — observe-only firehose (emit): «the hot path never blocks
+  on I/O — persistence plugins buffer asynchronously»; сбои листенера
+  изолированы per-listener и гасятся в `ctx.logger.warn`, на append не влияют
+  (`dsh-session/lib/index.js:1411-1415, 1287-1296`).
+- Конструкторные сиды (resume/fork/replay) на firehose **не выходят**:
+  «constructor seeds do not emit»; потребитель живых событий начинает с
+  `firstLiveSeq` (`dsh-session/lib/index.js:1329-1350`). Для fresh-сессии
+  dsh-headless вся сессия живая — ограничение не стреляет.
+- `SessionStore.flush(session)` — единственная точка барьера долговечности
+  (`dsh-session/lib/index.js:1791-1808`): ждёт всех `session/flush`-листенеров,
+  возвращает факт участия, бросает первую ошибку после завершения остальных.
+  `dsh-headless` зовёт `sessions.flush()` перед выходом
+  (`dsh-headless/lib/index.js:94`) — leafener стримера попадает в этот барьер,
+  поэтому бросать из него сетевые ошибки нельзя (уронит завершённый прогон).
+- Leafener `session/flush` может возвращать промис и ждать I/O — так работает
+  персистенция (`dsh-session-persistence/lib/index.js:1158`).
+
+**Контракт dsh-headless по коду** (`dsh-headless/lib/index.js:63-99`):
+`agents.create({sessionId: SessionId(\`session-${randomUUID()}\`), meta:
+{cwd}, agentOptions: {provider, model}, setup})` → `agent.whenIdle()` →
+`firstSeq = agent.session.seq` → `agent.followup(createUserMessage(...))` →
+`await agent.whenIdle()` → `await sessions.flush(agent.session)` →
+`summarize(agent.session.events, firstSeq)` → stdout последнего непустого
+текста ассистента → `io.exit(reason.kind === "completed" ? 0 : 1)`.
+Плагин-раннер монтируется строкой `headless-runner` бандл-патча
+(`dsh-headless/cordis.patch.yml`, синтаксис `- insert:`).
+
+**Живые agent-события** (не durable; `dsh-agent/lib/types/runtime-types.d.ts`,
+Cordis `Events`): `agent/created`, `agent/disposed`, `agent/status
+(idle|running)`, `agent/inbox/inserted|claimed|discarded`,
+`agent/session-start {source: startup|resume|clear|compact}` — emit;
+`agent/pre-step`, `agent/request`, `agent/request-error` — waterfall;
+`agent/turn-stopping` — serial; `agent/error` — emit.
+
+**Монтаж плагина в профиль headless** (CLI `@deepseek-ai/dsh` 0.1.1-rc.2,
+`lib/bin.js`, `lib/plugin-9h8shc4d.js`):
+
+- `dsh plugin --profile <name> add <spec>` — форвардер в `pnpm add` внутри
+  каталога профиля; spec может быть path/tarball/git; после установки
+  зависимости, чей манифест объявляет `dsh.bundle`, добавляются в слой стека
+  `dsh.profile.bundles` (reconcile по факту установки, не по диффу зависимостей).
+- Объявление бандла в манифесте плагина:
+  `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`.
+- `dsh --profile headless --patch <path>` (repeatable) — оверлей поверх слоя
+  профиля; `dsh --profile headless --dump-config` печатает собранное дерево —
+  факт монтажа проверяется командой, не догадкой.
+
+**Живой монтаж плагина — подтверждено прогоном 2026-08-30** (dsh 0.1.1-rc.2,
+Node 24, pnpm 10.34.5): tarball плагина без зависимостей (`dsh.bundle.patch`
+в манифесте, ESM `lib/index.js` с экспортами `name`/`apply`) поставлен
+`dsh plugin --profile headless add <tgz>` — pnpm-форвардер создал профиль
+(`initProfile` пишет `package.json`/`cordis.patch.yml`/`pnpm-workspace.yaml`
+только при отсутствии, ничего не перезаписывает), reconcile добавил бандл в
+`dsh.profile.bundles`; `--dump-config` показывает слой `# == dsh-hands-streamer`.
+Живой прогон headless с плагином: root-level подписки на `session/created` /
+`session/event` / `session/flush` / `session/disposed` получают события сессии,
+созданной `headless-runner` (другой слой дерева) — scope-фильтрация не мешает;
+конверт `{type, seq, time, data}` доходит дословно, `session/event` — firehose
+с дырками seq по отброшенным типам. Установка через реестр (`npm install
+@deepseek-ai/dsh-session@версия`) при этом работает — 404 из замера выше
+касается только пакета `dsh`/`dsh-headless`; peers резолвятся из реестра.

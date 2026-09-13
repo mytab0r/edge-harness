@@ -1,0 +1,610 @@
+diff --git a/.github/workflows/deploy-dsh-edge.yml b/.github/workflows/deploy-dsh-edge.yml
+index c5a7cedb..3f2be298 100644
+--- a/.github/workflows/deploy-dsh-edge.yml
++++ b/.github/workflows/deploy-dsh-edge.yml
+@@ -262,6 +262,9 @@ jobs:
+             "compatibility_date": "2026-08-14",
+             "compatibility_flags": ["nodejs_compat"],
+             "no_bundle": true,
++            "vars": {
++              "GH_RUNNER_REPO": "mytab0r/edge-harness"
++            },
+             "assets": {
+               "binding": "ASSETS",
+               "directory": "./dist",
+@@ -296,6 +299,21 @@ jobs:
+           printf '%s' "$DEEPSEEK_BASE_URL" | npx wrangler secret put DEEPSEEK_BASE_URL
+           printf '%s' "$DEEPSEEK_MODEL" | npx wrangler secret put DEEPSEEK_MODEL
+ 
++      # runner-bridge (#95) диспетчит воркера из чата морды: тот же PAT, что у
++      # рук и оркестратора — права на issues + workflow dispatch у него уже
++      # доказаны (scheduler.py диспетчит worker.yml этим токеном). Секрет
++      # воркера получает своё имя (GH_RUNNER_TOKEN), чтобы морда не знала
++      # слов рук; put идемпотентен, значение в лог не печатается.
++      - name: Секрет раннера морды (GH_RUNNER_TOKEN)
++        working-directory: ${{ github.workspace }}/deploy
++        env:
++          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
++          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
++          GH_RUNNER_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
++        run: |
++          [ -n "$GH_RUNNER_TOKEN" ] || { echo "::error::GH_DISPATCH_TOKEN не задан — runner_task не сможет диспетчить воркера"; exit 1; }
++          printf '%s' "$GH_RUNNER_TOKEN" | npx wrangler secret put GH_RUNNER_TOKEN
++
+       - name: plugin_status → deploying
+         if: steps.route.outputs.plugins != '0'
+         # Промежуточный статус — best-effort: лежащий журнал не имеет права
+diff --git a/docs/research/20-cloudflare-free.md b/docs/research/20-cloudflare-free.md
+index 715dc034..8be84bc6 100644
+--- a/docs/research/20-cloudflare-free.md
++++ b/docs/research/20-cloudflare-free.md
+@@ -253,6 +253,22 @@ Sandbox SDK: *«Available on Workers Paid plan»*, *«Built on Containers»*; DO
+ 
+ Отсюда прямое следствие: любая работа, требующая процессов и настоящего диска (git, сборки, тесты), физически невозможна внутри Worker/DO — только Containers (Paid) или внешний раннер.
+ 
++### process.env воркера: секреты и vars доступны из бандла (проверено по докам 2026-08-29)
++
++При включённом `nodejs_compat` воркер заполняет `process.env` всеми
++переменными окружения, секретами и version metadata; флаг
++`nodejs_compat_populate_process_env` включён **по умолчанию** для
++compatibility date ≥ 2025-04-01 (у морды dsh-edge — 2026-08-14, то есть
++включён без дополнительных флагов). `process.env` — изолят-глобал: читается
++из любого места бандла, включая Durable Object; это канал, по которому
++плагин морды (runner-bridge, #95) получает токен GitHub без прокидывания
++env через инсталл-цикл. Нюансы: значения коэрцируются в строки;
++`process.env.NODE_ENV` wrangler статически заменяет на этапе сборки (не
++рантайм-значение); альтернатива — `import { env } from 'cloudflare:workers'`.
++Источник: developers.cloudflare.com/workers/runtime-apis/nodejs/process/.
++На живом деплое #95 подтверждается тем, что инструмент отвечает не
++«токена нет», а осмысленным ответом GitHub.
++
+ ---
+ 
+ ## Workflows (для справки)
+diff --git a/dsh-edge/plugins.json b/dsh-edge/plugins.json
+index 975f40e6..d93dbb87 100644
+--- a/dsh-edge/plugins.json
++++ b/dsh-edge/plugins.json
+@@ -11,6 +11,17 @@
+       },
+       "server": true,
+       "client": true
++    },
++    {
++      "id": "runner-bridge",
++      "package": "@edge-harness/dsh-plugin-runner-bridge",
++      "source": {
++        "release": "plugins-runner-v0.1.0",
++        "asset": "runner-bridge-0.1.0.tgz",
++        "sha256": "84f4a779c73ec25331ba6f2a0eab7c075da89b6afe31ace93de8a11f1eaf1328"
++      },
++      "server": true,
++      "client": false
+     }
+   ]
+ }
+diff --git a/openspec/changes/dsh-edge-plugin-system/design.md b/openspec/changes/dsh-edge-plugin-system/design.md
+index 9bbf1c3f..f7e581d4 100644
+--- a/openspec/changes/dsh-edge-plugin-system/design.md
++++ b/openspec/changes/dsh-edge-plugin-system/design.md
+@@ -355,6 +355,25 @@ durable-улейкой конвейера в журнале этого репо.
+ 7. **Идентификаторы импорта плагинов получают префикс `p_`** в
+    сгенерированном модуле — id формально может совпасть с зарезервированным
+    словом JS (`class`, `default`).
++8. **Первый настоящий плагин (#95, runner-bridge) — факты первого применения
++   конвейера вне PoC.** Форжа ещё нет (п.3 задач), чеклист
++   Workers-совместимости прогонялся руками: плагин ходит в GitHub API через
++   `fetch` (запрещённых импортов нет, единственный импорт — апстримный
++   `defineTool`; tarball 6.8 KiB против бюджета 900 KiB). Токен GitHub
++   секреты-плагинам не «выдаётся» (см. «Безопасность») — плагин читает env
++   воркера сам через `process.env` (заполнение секретами включено по
++   умолчанию с compat date ≥ 2025-04-01;
++   [research/20](../../docs/research/20-cloudflare-free.md)); деплой
++   синхронизирует секрет `GH_RUNNER_TOKEN` из `GH_DISPATCH_TOKEN` и задаёт
++   переменную `GH_RUNNER_REPO`. Это осознанное расширение контракта
++   («чтение env воркера плагином — вне контракта» писалось про
++   инсталл-цикл, не про рантайм инструмента): инструмент — код владельца в
++   воркере владельца, секрет не покидает воркер и не попадает в вывод
++   инструментов. Сервер-only запись (`client: false`) не попадает в
++   клиентский ростер и не задевает гвард патча 0003. Каждый fetch — под
++   `AbortSignal.timeout(15с)` и отменой хода агента: зависший вызов не
++   держит turn; ошибки инструментов — громкие тексты агенту (он их
++   озвучит), не сырые исключения.
+ 
+ ## Отвергнутые варианты
+ 
+diff --git a/openspec/changes/dsh-edge-plugin-system/tasks.md b/openspec/changes/dsh-edge-plugin-system/tasks.md
+index f3d8b7e2..2b299290 100644
+--- a/openspec/changes/dsh-edge-plugin-system/tasks.md
++++ b/openspec/changes/dsh-edge-plugin-system/tasks.md
+@@ -103,6 +103,42 @@
+ - [ ] Отрицательный канал: манифест с чужим URL/битым sha256 → красная сборка
+       на валидаторе, а не деплой.
+ 
++## 5. Первый настоящий плагин: runner-bridge (#95, PR без форжа — руками)
++
++Конвейер из пп. 1–2 в первый раз использован по назначению: плагин написан,
++собран и опубликован вне форжа (форж из п.3 всё ещё впереди — чеклист
++совместимости прогонялся вручную, факты в design «Девиации» п.8).
++
++- [x] `plugins-src/runner-bridge/` (сервер-only): инструменты `runner_task`
++      (issue с меткой `task` → dispatch `worker.yml` `{ref:main,
++      inputs:{task}}`) и `runner_status` (state issue + метка blocked + PR по
++      cross-references таймлайна), оба через апстримный `defineTool`.
++      Маршрутизация («умный принцип») — в description `runner_task`:
++      серверная работа (сборка/тесты/плагины/git/долгие >5 мин) — звать
++      раннер, остальное — чат.
++- [x] Токен из env воркера: секрет `GH_RUNNER_TOKEN` синхронизируется
++      `deploy-dsh-edge.yml` из секрета репозитория `GH_DISPATCH_TOKEN`
++      (тот же PAT; права issues+workflow dispatch доказаны оркестратором),
++      репозиторий пула — переменная воркера `GH_RUNNER_REPO` в конфиге
++      деплоя. Чтение — `process.env` воркера (заполнение секретами включено
++      с compat date ≥ 2025-04-01 — [research/20](../../docs/research/20-cloudflare-free.md)).
++- [x] Таймауты: каждый fetch под `AbortSignal.timeout(15с)` + отмена хода
++      агента (`AbortSignal.any`); ошибки инструментов — громкие тексты агенту
++      (конфигурация/HTTP-статус/сеть), значение токена в вывод не попадает.
++- [x] Релиз `plugins-runner-v0.1.0` с asset'ом `runner-bridge-0.1.0.tgz`;
++      sha256 скачанного с релиза asset'а сверён с локальным tarball'ом и
++      вписан в `dsh-edge/plugins.json` (`server: true, client: false`).
++- [x] Негатив на настоящем dsh-tools 0.1.1-rc.2 (пир из публичного npm):
++      нет токена / нет `GH_RUNNER_REPO` → внятный конфигурационный текст;
++      битый токен против живого GitHub → `HTTP 401: Bad credentials` текстом
++      агенту; утечки токена в выводе нет; скомпилированные схемы параметров
++      корректны (`required`: title/body; issue: integer).
++- [ ] Пост-мерж: деплой по новой манифестной записи прошёл (гвардия состава
++      видит `runner-bridge` в обоих бандлах), секрет `GH_RUNNER_TOKEN`
++      появился у воркера, живой чат-тест: серверный запрос → агент сам зовёт
++      `runner_task`, задача создаётся, воркер поднимается; лёгкий запрос —
++      без инструмента.
++
+ ## Границы
+ 
+ - Транспорт «исходник из чата в форж» и UI-поверхность статусов в dsh-edge —
+diff --git a/plugins-src/runner-bridge/README.md b/plugins-src/runner-bridge/README.md
+new file mode 100644
+index 00000000..1600199e
+--- /dev/null
++++ b/plugins-src/runner-bridge/README.md
+@@ -0,0 +1,50 @@
++# runner-bridge — первый настоящий плагин dsh-edge
++
++Исходники плагина `@edge-harness/dsh-plugin-runner-bridge` (задача #95,
++конвейер — [`openspec/changes/dsh-edge-plugin-system/`](../../openspec/changes/dsh-edge-plugin-system/design.md),
++образец — [`plugins-src/hello-world`](../hello-world/README.md)). Серверный
++плагин без клиентской части: эффект живёт в чате как два инструмента.
++
++## Что делает
++
++- `runner_task {title, body}` — создаёт issue с меткой `task` в репозитории
++  пула и диспетчит `worker.yml` (`{ref: main, inputs: {task: "<номер>"}}`).
++  Агент в чате получает номер задачи, ссылку и статус диспетча. Описание
++  инструмента несёт правило маршрутизации («умный принцип»): звать при
++  серверной работе (сборка/тесты/плагины/git/долгие задачи), лёгкое — в чате.
++- `runner_status {issue}` — состояние задачи (open/closed), исполнитель,
++  метка `blocked` и связанные PR (открыт / смержен / закрыт) через
++  cross-references таймлайна issue.
++
++## Конфигурация (env воркера)
++
++| Переменная | Откуда | Смысл |
++|---|---|---|
++| `GH_RUNNER_TOKEN` | секрет воркера; деплой синхронизирует из секрета репозитория `GH_DISPATCH_TOKEN` (тот же PAT: issues + workflow dispatch у него уже есть — доказано оркестратором) | вызовы GitHub API из инструментов |
++| `GH_RUNNER_REPO` | переменная воркера (`owner/repo`), задаётся в `deploy-dsh-edge.yml` | репозиторий пула задач |
++
++Чтение — через `process.env` воркера (заполнение секретами включено по
++умолчанию для compatibility date ≥ 2025-04-01; у морды 2026-08-14). Отсутствие
++или нечитаемость конфигурации — громкий текст агенту (он озвучит пользователю),
++не исключение. Значение токена в вывод инструментов никогда не попадает:
++ошибки несут только HTTP-статус и сообщение GitHub.
++
++Каждый fetch ограничен `AbortSignal.timeout(15с)` и отменой хода агента —
++зависший вызов GitHub не держит turn.
++
++## Пересборка tarball
++
++```bash
++cd plugins-src/runner-bridge
++node --check server/index.js            # синтаксис
++npm pack                                # edge-harness-dsh-plugin-runner-bridge-0.1.0.tgz
++sha256sum edge-harness-dsh-plugin-runner-bridge-0.1.0.tgz
++```
++
++Публикация: релиз **этого** репозитория с тегом `plugins-runner-v0.1.0` и
++asset'ом `runner-bridge-0.1.0.tgz` (то же содержимое, имя asset'а фиксирует
++манифест). Новый sha256 вписывается в `dsh-edge/plugins.json` — только PR,
++merge = аппрув владельца.
++
++Плагин зависимостей не имеет, кроме peer-зависимости `@deepseek-ai/dsh-tools`
++(инструменты объявляются апстримным `defineTool`).
+diff --git a/plugins-src/runner-bridge/package.json b/plugins-src/runner-bridge/package.json
+new file mode 100644
+index 00000000..eaedaae8
+--- /dev/null
++++ b/plugins-src/runner-bridge/package.json
+@@ -0,0 +1,18 @@
++{
++  "name": "@edge-harness/dsh-plugin-runner-bridge",
++  "version": "0.1.0",
++  "description": "dsh-edge edge plugin: runner_task and runner_status tools that delegate server-side work to the edge-harness runner (GitHub Actions worker) and report its progress back to the chat",
++  "type": "module",
++  "main": "server/index.js",
++  "exports": {
++    ".": "./server/index.js",
++    "./package.json": "./package.json"
++  },
++  "peerDependencies": {
++    "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
++  },
++  "files": [
++    "server/index.js"
++  ],
++  "license": "MIT"
++}
+diff --git a/plugins-src/runner-bridge/server/index.js b/plugins-src/runner-bridge/server/index.js
+new file mode 100644
+index 00000000..c854dd34
+--- /dev/null
++++ b/plugins-src/runner-bridge/server/index.js
+@@ -0,0 +1,340 @@
++/**
++ * runner-bridge: server half of the first real edge plugin (#95).
++ *
++ * A cordis plugin that gives the chat agent of dsh-edge two tools:
++ *   - runner_task  — create a task in the edge-harness pool (issue with the
++ *     `task` label) and dispatch the worker (GitHub Actions `worker.yml`).
++ *     The runner-side DSH does the work with the full toolset and opens a PR;
++ *     the chat agent reports the issue number and link back to the user.
++ *   - runner_status — short status of a pooled task: issue state, assignee,
++ *     `blocked` label and the PRs referencing it (open / merged / closed).
++ *
++ * The GitHub token is read from the worker env (`process.env.GH_RUNNER_TOKEN`,
++ * synced by deploy-dsh-edge.yml from the repository secret GH_DISPATCH_TOKEN —
++ * the same PAT the hands and the orchestrator already use). The token value
++ * never appears in tool output: errors carry only HTTP status and GitHub's
++ * own message. Every fetch is time-boxed (AbortSignal.timeout), so a hung
++ * GitHub call cannot hold the agent turn.
++ */
++
++import { defineTool } from '@deepseek-ai/dsh-tools'
++
++const PLUGIN_VERSION = '0.1.0'
++const GITHUB_API = 'https://api.github.com'
++const GITHUB_TIMEOUT_MS = 15_000
++const GITHUB_API_VERSION = '2022-11-28'
++const TASK_LABEL = 'task'
++const WORKER_WORKFLOW = 'worker.yml'
++const WORKER_REF = 'main'
++// Подробный статус запрашивается максимум для двух PR: обычно он один, две
++// ссылки — уже нетипичный случай. Верхняя граница держит worst-case время
++// инструмента под его timeoutMs.
++const PR_DETAIL_LIMIT = 2
++
++const REPO_PATTERN = /^[^/\s]+\/[^/\s]+$/
++
++export default {
++  name: 'edge-plugins:runner-bridge',
++  inject: [],
++  apply(ctx) {
++    ctx.effect(() => ctx.tools.register(defineRunnerTaskTool()), 'edge-plugins:runner-bridge runner_task tool')
++    ctx.effect(() => ctx.tools.register(defineRunnerStatusTool()), 'edge-plugins:runner-bridge runner_status tool')
++    console.info(`edge-plugin:runner-bridge installed v${PLUGIN_VERSION} (runner_task, runner_status tools registered)`)
++  },
++}
++
++/** Валидированный `owner/repo` из env воркера; undefined — конфигурации нет. */
++function readRepo() {
++  const value = process.env.GH_RUNNER_REPO
++  if (typeof value !== 'string' || !REPO_PATTERN.test(value.trim())) return undefined
++  return value.trim()
++}
++
++/** Токен из env воркера; undefined — секрета нет. Значение наружу не выходит. */
++function readToken() {
++  const value = process.env.GH_RUNNER_TOKEN
++  if (typeof value !== 'string' || value.trim() === '') return undefined
++  return value.trim()
++}
++
++/**
++ * Один вызов GitHub API с таймаутом и отменой от агентного цикла.
++ * Возвращает response; тело не читается здесь — читает вызывающий.
++ */
++function githubFetch(path, { method = 'GET', body, token, signal }) {
++  return fetch(`${GITHUB_API}${path}`, {
++    method,
++    headers: {
++      Accept: 'application/vnd.github+json',
++      'X-GitHub-Api-Version': GITHUB_API_VERSION,
++      Authorization: `Bearer ${token}`,
++      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
++    },
++    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
++    signal,
++  })
++}
++
++/** Сигнал вызова: отмена хода агента + жёсткий таймаут на каждый fetch. */
++function callSignal(exec) {
++  const timeout = AbortSignal.timeout(GITHUB_TIMEOUT_MS)
++  return exec?.signal ? AbortSignal.any([exec.signal, timeout]) : timeout
++}
++
++/** Человекочитательная причина отказа GitHub: статус + сообщение, без заголовков. */
++async function describeFailure(response) {
++  let detail = ''
++  try {
++    const data = await response.json()
++    if (data !== null && typeof data === 'object' && typeof data.message === 'string') {
++      detail = data.message
++    }
++  } catch {
++    // Тело не JSON — остаётся один статус; это не ошибка чтения.
++  }
++  return detail === '' ? `HTTP ${response.status}` : `HTTP ${response.status}: ${detail}`
++}
++
++/** Громкий отказ конфигурации — агент озвучит это пользователю дословно. */
++function configError(tool, what) {
++  return {
++    ok: false,
++    message: `${tool} не настроен в воркере: ${what}. `
++      + 'Починить может только владелец: секрет GH_RUNNER_TOKEN (в deploy-dsh-edge.yml '
++      + 'он синхронизируется из секрета репозитория GH_DISPATCH_TOKEN) и переменная '
++      + 'воркера GH_RUNNER_REPO (owner/repo). Задачу создать не удалось.',
++  }
++}
++
++function networkError(tool, error) {
++  const timedOut = error instanceof Error && error.name === 'TimeoutError'
++  const reason = timedOut
++    ? `GitHub не ответил за ${GITHUB_TIMEOUT_MS / 1000} с (таймаут)`
++    : `сеть недоступна: ${error instanceof Error ? error.message : String(error)}`
++  return { ok: false, message: `${tool}: ${reason}. Попробуй ещё раз или проверь статус GitHub.` }
++}
++
++// ── runner_task ───────────────────────────────────────────────────────────────
++
++function defineRunnerTaskTool() {
++  return defineTool({
++    name: 'runner_task',
++    description: 'Делегирует работу серверному раннеру: создаёт задачу в пуле edge-harness '
++      + '(issue с меткой task) и поднимает воркера (GitHub Actions) — раннерский агент выполнит '
++      + 'работу полным набором тулов (git, сборка, тесты) и откроет PR. ЗОВАТЬ ЕГО НАДО, когда '
++      + 'запросу нужны СЕРВЕРНЫЕ РЕСУРСЫ: сборка и тесты, написание плагинов, git-операции над '
++      + 'репозиторием, долгие (>5 минут) задачи. Всё остальное — вопросы, объяснения, короткие '
++      + 'ответы — делай в чате без инструмента. В body пиши полное ТЗ с критерием готовности: '
++      + 'раннерский агент видит только его, тебя — нет. Вызов вернёт номер задачи и ссылку — '
++      + 'передай их пользователю; результат придёт в задачу и в чат.',
++    parameters: {
++      title: {
++        type: 'string',
++        required: true,
++        description: 'Короткий заголовок задачи (как заголовок коммита): что сделать.',
++      },
++      body: {
++        type: 'string',
++        required: true,
++        description: 'Полное тело задачи: цель, шаги, критерий готовности, ограничения. '
++          + 'Раннерский агент работает только по этому тексту.',
++      },
++    },
++    output: {
++      schema: {
++        type: 'object',
++        additionalProperties: false,
++        properties: {
++          ok: { type: 'boolean', required: true },
++          message: { type: 'string', required: true },
++          issue: { type: 'integer' },
++          url: { type: 'string' },
++          dispatched: { type: 'boolean' },
++        },
++      },
++      render: (_args, value) => [{ type: 'text', text: value.message }],
++    },
++    timeoutMs: 45_000,
++    async execute(args, exec) {
++      const token = readToken()
++      if (token === undefined) return configError('runner_task', 'секрета GH_RUNNER_TOKEN нет в env воркера')
++      const repo = readRepo()
++      if (repo === undefined) return configError('runner_task', 'в env воркера нет валидного GH_RUNNER_REPO (owner/repo)')
++      const signal = callSignal(exec)
++
++      let issue
++      try {
++        const response = await githubFetch(`/repos/${repo}/issues`, {
++          method: 'POST',
++          token,
++          signal,
++          body: { title: args.title, body: args.body, labels: [TASK_LABEL] },
++        })
++        if (response.status !== 201) {
++          const reason = await describeFailure(response)
++          return {
++            ok: false,
++            message: `runner_task: GitHub не создал задачу (${reason}). `
++              + 'Пользователю это надо озвучить; повторная попытка уместна, если причина временная.',
++          }
++        }
++        issue = await response.json()
++      } catch (error) {
++        return networkError('runner_task', error)
++      }
++
++      const number = issue.number
++      const url = issue.html_url
++      try {
++        const response = await githubFetch(`/repos/${repo}/actions/workflows/${WORKER_WORKFLOW}/dispatches`, {
++          method: 'POST',
++          token,
++          signal: callSignal(exec),
++          body: { ref: WORKER_REF, inputs: { task: String(number) } },
++        })
++        if (response.status === 204) {
++          return {
++            ok: true,
++            dispatched: true,
++            issue: number,
++            url,
++            message: `Задача #${number} создана: ${url}. Раннер запущен — результат (PR или комментарий) `
++              + 'придёт в задачу. Скажи пользователю номер, ссылку и что работа идёт на раннере.',
++          }
++        }
++        const reason = await describeFailure(response)
++        return {
++          ok: true,
++          dispatched: false,
++          issue: number,
++          url,
++          message: `Задача #${number} создана: ${url}. Диспетч воркера не прошёл (${reason}) — `
++            + 'оркестратор сам поднимет воркера по пульсу (до 15 минут). Скажи пользователю номер и ссылку.',
++        }
++      } catch (error) {
++        return {
++          ok: true,
++          dispatched: false,
++          issue: number,
++          url,
++          message: `Задача #${number} создана: ${url}. Диспетч воркера упал (${networkReason(error)}) — `
++            + 'оркестратор сам поднимет воркера по пульсу (до 15 минут). Скажи пользователю номер и ссылку.',
++        }
++      }
++    },
++  })
++}
++
++function networkReason(error) {
++  return error instanceof Error && error.name === 'TimeoutError'
++    ? `таймаут ${GITHUB_TIMEOUT_MS / 1000} с`
++    : error instanceof Error ? error.message : String(error)
++}
++
++// ── runner_status ─────────────────────────────────────────────────────────────
++
++function defineRunnerStatusTool() {
++  return defineTool({
++    name: 'runner_status',
++    description: 'Короткий статус задачи из пула edge-harness, отданной раннеру: состояние issue '
++      + '(open/closed), исполнитель, метка blocked (ждёт владельца) и связанные PR (открыт / '
++      + 'смержен / закрыт). Зови, когда пользователь спрашивает о прогрессе задачи, созданной '
++      + 'через runner_task.',
++    parameters: {
++      issue: {
++        type: 'integer',
++        required: true,
++        description: 'Номер задачи (issue number), например 95.',
++      },
++    },
++    output: {
++      schema: {
++        type: 'object',
++        additionalProperties: false,
++        properties: {
++          ok: { type: 'boolean', required: true },
++          message: { type: 'string', required: true },
++        },
++      },
++      render: (_args, value) => [{ type: 'text', text: value.message }],
++    },
++    timeoutMs: 60_000,
++    async execute(args, exec) {
++      const token = readToken()
++      if (token === undefined) return configError('runner_status', 'секрета GH_RUNNER_TOKEN нет в env воркера')
++      const repo = readRepo()
++      if (repo === undefined) return configError('runner_status', 'в env воркера нет валидного GH_RUNNER_REPO (owner/repo)')
++      const signal = callSignal(exec)
++
++      let data
++      try {
++        const response = await githubFetch(`/repos/${repo}/issues/${args.issue}`, { token, signal })
++        if (response.status === 404) {
++          return { ok: false, message: `runner_status: задачи #${args.issue} в ${repo} нет.` }
++        }
++        if (response.status !== 200) {
++          return { ok: false, message: `runner_status: GitHub не отдал задачу #${args.issue} (${await describeFailure(response)}).` }
++        }
++        data = await response.json()
++      } catch (error) {
++        return networkError('runner_status', error)
++      }
++
++      if (data.pull_request !== undefined) {
++        return { ok: true, message: `#${args.issue} — это pull request, а не задача пула: ${data.html_url}` }
++      }
++
++      const labels = Array.isArray(data.labels) ? data.labels.map(label => label.name) : []
++      const assignees = Array.isArray(data.assignees) ? data.assignees.map(person => person.login) : []
++      const lines = []
++      lines.push(`Задача #${data.number} «${data.title}»: ${data.state === 'closed' ? 'закрыта' : 'открыта'}.`)
++      if (assignees.length > 0) lines.push(`Исполнитель: ${assignees.join(', ')}.`)
++      if (labels.length > 0) lines.push(`Метки: ${labels.join(', ')}.`)
++      if (labels.includes('blocked')) lines.push('Ждёт владельца (метка blocked) — подробности в комментариях задачи.')
++
++      const prLines = await collectPullRequests(repo, token, exec, data.number)
++      if (prLines.length > 0) {
++        lines.push(...prLines)
++      } else if (data.state !== 'closed') {
++        lines.push('PR ещё нет: задача либо ждёт воркера, либо в работе (подробности — в комментариях задачи).')
++      }
++      lines.push(`Задача: ${data.html_url}`)
++      return { ok: true, message: lines.join(' ') }
++    },
++  })
++}
++
++/** Ссылки на задачу в открытых PR (первая строка тела — `#N`) и их состояния. */
++async function collectPullRequests(repo, token, exec, issueNumber) {
++  let refs
++  try {
++    const response = await githubFetch(
++      `/repos/${repo}/issues/${issueNumber}/timeline?per_page=100`,
++      { token, signal: callSignal(exec) },
++    )
++    if (response.status !== 200) return []
++    const timeline = await response.json()
++    if (!Array.isArray(timeline)) return []
++    refs = timeline
++      .filter(event => event?.event === 'cross-referenced' && event?.source?.issue?.pull_request !== undefined)
++      .map(event => event.source.issue.number)
++  } catch {
++    // Таймлайн — украшение статуса, не его суть: не доехал — статус без PR-строк.
++    return []
++  }
++  const lines = []
++  for (const number of refs.slice(0, PR_DETAIL_LIMIT)) {
++    try {
++      const response = await githubFetch(`/repos/${repo}/pulls/${number}`, { token, signal: callSignal(exec) })
++      if (response.status !== 200) continue
++      const pull = await response.json()
++      const state = pull.merged === true
++        ? `смержен в main (${pull.merge_commit_sha?.slice(0, 7) ?? 'sha не читается'})`
++        : pull.state === 'open' ? 'открыт, ждёт ревью/слияния' : 'закрыт без слияния'
++      lines.push(`PR #${number} «${pull.title}» — ${state}: ${pull.html_url}`)
++    } catch {
++      // Один недоехавший PR не отменяет остального статуса.
++    }
++  }
++  return lines
++}
+diff --git a/scripts/lib/dsh-ci.sh b/scripts/lib/dsh-ci.sh
+index 39b8c885..6d746a56 100644
+--- a/scripts/lib/dsh-ci.sh
++++ b/scripts/lib/dsh-ci.sh
+@@ -20,10 +20,15 @@ DSH_HEADLESS_VERSION="0.1.1-rc.2"
+ DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
+ 
+ # GH маскирует секреты только в своих логах; всё, что уходит наружу (журнал DO,
+-# комментарии в задачах, Telegram), надо затирать до отправки.
++# комментарии в задачах, Telegram), надо затирать до отправки. GitHub PAT
++# (#95: токен теперь живёт и в морде — GH_RUNNER_TOKEN) маскируется
++# производным паттерном формы токена: точное совпадение секрета GH покрывает
++# только внутри своих логов.
+ redact() {
+   sed -E -e 's/nvapi-[A-Za-z0-9_-]{4,}/nvapi-[REDACTED]/g' \
+-         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g'
++         -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}/\1sk-[REDACTED]/g' \
++         -e 's/(^|[^A-Za-z0-9_])ghp_[A-Za-z0-9]{20,}/\1ghp_[REDACTED]/g' \
++         -e 's/(^|[^A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}/\1github_pat_[REDACTED]/g'
+ }
+ 
+ dsh_verify_integrity() { # file expected-integrity

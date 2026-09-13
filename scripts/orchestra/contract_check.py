@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Контракт PR с пулом задач. Запускается workflow'ом orchestra на каждый PR.
+
+Правила (нарушение = проверка красная, такой PR не слить):
+  1. PR с меткой `orchestra:skip` — явный обход контракта (мелочи вне пула).
+  2. У PR определена задача пула. Источник — единственный, `task_ref.resolve_pr_task`
+     (#394, решение владельца 2026-09-06): имя agent-ветки (`agent/<N>-<slug>`,
+     ставит только `scripts/git/task-branch`, подделать нельзя). Тело PR для
+     этого вопроса не читается вовсе — ни первой строкой, ни любым другим
+     упоминанием `#N` (класс #187/#195).
+  3. Задача #N существует как issue (не PR), открыта, помечена меткой `task`
+     и не помечена `blocked` — см. task_eligibility_problems, одно место
+     правды. Задача НЕПРИГОДНА хотя бы по одной из этих причин — контракт
+     не выполняет над ней ни одного изменяющего вызова (не назначает
+     исполнителя, не сверяет дубликаты PR): нарушение только докладывается.
+     Ветка, называющая закрытую задачу, не переориентируется на другой номер
+     неявным чтением тела — заводится новая ветка на новый номер.
+  4. Задача назначена ровно одному исполнителю (проверяется/чинится только
+     для пригодной задачи, см. правило 3).
+  5. У этой задачи нет ДРУГОГО открытого PR — второй PR на ту же задачу закрывается
+     оркестратором, брать задачу надо через назначение, а не через гонку веток
+     (тоже только для пригодной задачи). «Другой PR» — тот, у которого та же
+     задача выходит из `task_ref.resolve_pr_task` (та же ветка), симметрично
+     правилу 2.
+
+Среда: runner с `gh`, GH_TOKEN с правами issues/pull-requests.
+"""
+
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
+import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Номер задачи из текста PR/issue — одно место правды (#187): границы числа
+# с обеих сторон, не подстрока (`#18` не должен матчить `#180`/`#5180`).
+_TR_SPEC = importlib.util.spec_from_file_location(
+    "task_ref", Path(__file__).resolve().parents[1] / "lib" / "task_ref.py")
+task_ref = importlib.util.module_from_spec(_TR_SPEC)
+_TR_SPEC.loader.exec_module(task_ref)
+
+# CONTRACT_FAILED_LABEL — одно место правды (review_labels.py, тот же приём,
+# что уже применён к CONFLICT_LABEL): раньше литерал "contract:failed" был
+# задублирован здесь дважды и ещё дважды в scheduler.py. Оттуда же —
+# идемпотентность комментария провала и константа заголовка (#203):
+# доверенный автор (_is_trusted_verdict_author), постраничный обход
+# (list_pages) и решение post/patch/none. contract_check уже читает общие
+# lib-модули (task_ref выше); scheduler.py ради одного имени сюда
+# по-прежнему не тащится.
+_RL_SPEC = importlib.util.spec_from_file_location(
+    "review_labels", Path(__file__).resolve().parents[1] / "lib" / "review_labels.py")
+review_labels = importlib.util.module_from_spec(_RL_SPEC)
+_RL_SPEC.loader.exec_module(review_labels)
+
+SKIP_LABEL = "orchestra:skip"
+TASK_LABEL = "task"
+# Эскалация playbook (scheduler.py: BLOCKED_LABEL) — «ждёт владельца», не
+# кандидат на авто-назначение. Строка та же, что и в scheduler.py, но
+# отдельная константа: тащить сюда модуль scheduler.py ради одного имени —
+# лишняя связка (contract_check и scheduler уже читают общие lib-модули, но
+# не друг друга).
+BLOCKED_LABEL = "blocked"
+
+
+def run_gh(*args: str) -> None:
+    result = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8",
+                            env={**os.environ, "NO_COLOR": "1"})
+    if result.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])}: {result.stderr.strip()}")
+
+
+def gh(*args: str) -> dict | list:
+    result = subprocess.run(
+        ["gh", "api", *args],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def _all_open_pulls(repo: str) -> list[dict]:
+    """Все открытые PR постранично, не только первая страница `per_page=100`
+    (класс #294/#303/#308: сырой `pulls?state=open&per_page=100` без обхода
+    молча теряет хвост — на репозитории за сотню открытых PR второй PR на ту
+    же задачу за первой сотней не находился бы, и контракт «одна задача — один
+    PR» тихо переставал бы работать именно там, где список самый длинный).
+
+    Обход — review_labels.list_pages (класс #308, дефект A watchdog-issue
+    #120): раньше здесь жила СВОЯ копия того же цикла с тем же дефектом
+    (`if not isinstance(chunk, list) or not chunk: break` — не-list ответ,
+    например тело вторичного рейт-лимита GitHub, тратился как честная
+    короткая страница, контракт тихо проверял бы неполный список открытых
+    PR). Одно место правды на пагинацию + на fail loud при неожиданной форме
+    ответа — вторая копия здесь не заводится."""
+    return review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
+
+
+def task_eligibility_problems(issue: dict, issue_number: int) -> list[str]:
+    """Единое место правды «можно ли вообще действовать над этой задачей» —
+    существует ли она как issue (не PR), открыта, несёт метку `task`, не
+    `blocked`. Пока этот список непуст, main() не имеет права выполнить НИ
+    ОДНОГО изменяющего вызова над issue_number (назначение, метки, комментарии
+    от её имени) — только копить причины отказа.
+
+    Живой случай, который эта функция закрывает (лог прогона 2026-09-06,
+    контракт PR #359): «contract: авто-назначение mytab0r на #131» сразу
+    следом за «Задача #131 закрыта — возьми открытую». Раньше проверка
+    состояния и авто-назначение стояли рядом в одной ветке if/else, и ничего
+    не мешало назначению выполниться уже ПОСЛЕ того, как о непригодности было
+    известно — правило есть, действие ему не подчинялось. Здесь пригодность
+    считается один раз, до всех действующих вызовов, и других мест, где эти
+    условия проверяются заново, в контракте больше нет."""
+    problems: list[str] = []
+    if "pull_request" in issue:
+        # Это PR, а не issue — остальные поля (state/labels исполнителя)
+        # созданы для issue и не значат то же самое на PR; дальше нечего
+        # проверять.
+        problems.append(f"#{issue_number} — это PR, а не задача из пула.")
+        return problems
+    if issue["state"] != "open":
+        problems.append(f"Задача #{issue_number} закрыта — возьми открытую или заведи новую.")
+    labels_issue = {label["name"] for label in issue["labels"]}
+    if TASK_LABEL not in labels_issue:
+        problems.append(f"На задаче #{issue_number} нет метки `{TASK_LABEL}`.")
+    if BLOCKED_LABEL in labels_issue:
+        problems.append(
+            f"Задача #{issue_number} помечена `{BLOCKED_LABEL}` — ждёт решения владельца, "
+            "бери свободную из пула."
+        )
+    return problems
+
+
+def fail(messages: list[str], repo: str, pr_number: int) -> None:
+    # Провал громкий на самом PR: метка + комментарий, а не только строка в логах CI.
+    try:
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/labels",
+               "-f", f"labels[]={review_labels.CONTRACT_FAILED_LABEL}")
+        body = review_labels.CONTRACT_FAIL_HEADER + "".join(f"\n- {m}" for m in messages)
+        # Идемпотентность (#203): первый прогон с нарушением публикует
+        # комментарий, повторный с ТЕМ ЖЕ текстом — молчит (критерий
+        # приёмки: второго одинакового комментария не появляется),
+        # изменившийся текст нарушения — обновляет существующий комментарий,
+        # а не плодит цепочку дубликатов (#162 — 9, #173/#191 — по 3).
+        # Свой комментарий ищется только среди доверенных (github-actions[bot]
+        # — оба workflow с этим скриптом ходят под github.token): чужой
+        # комментарий с тем же текстом заглушкой не служит — публикуем свой.
+        existing = review_labels.latest_comment_by_header(
+            repo, pr_number, gh, review_labels.CONTRACT_FAIL_HEADER)
+        action = review_labels.comment_update_action(existing, body)
+        if action == "post":
+            run_gh("api", "-X", "POST", f"repos/{repo}/issues/{pr_number}/comments",
+                   "-f", f"body={body}")
+        elif action == "patch":
+            run_gh("api", "-X", "PATCH",
+                   f"repos/{repo}/issues/{pr_number}/comments/{existing['id']}",
+                   "-f", f"body={body}")
+    except RuntimeError as error:
+        print(f"contract: не смог оставить комментарий на PR: {error}")
+    for message in messages:
+        print(f"::error::{message}")
+    print(f"contract: FAIL ({len(messages)} нарушений)")
+    sys.exit(1)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pr", type=int, required=True)
+    args = parser.parse_args()
+    repo = os.environ["GITHUB_REPOSITORY"]
+
+    pull = gh(f"repos/{repo}/pulls/{args.pr}")
+
+    labels = {label["name"] for label in pull["labels"]}
+    if SKIP_LABEL in labels:
+        print(f"contract: SKIP (метка {SKIP_LABEL})")
+        return 0
+
+    # Dependabot и другие боты-поставщики зависимостей — вне пула задач по природе:
+    # их судят проверки (test/canary/review), а не контракт «PR ↔ задача».
+    if pull["user"]["login"] in ("dependabot[bot]",):
+        print("contract: SKIP (dependabot)")
+        return 0
+
+    problems: list[str] = []
+    body = pull["body"] or ""
+    # Закрытие задачи — действие исполнителя ПОСЛЕ пост-мерж проверки, с уликами:
+    # мерж доказывает PR, а не готовность задачи (кейс #56/#57: Closes закрыл
+    # задачу до зелёной канарейки). GitHub сам авто-закрывает issue по ключевым
+    # словам при слиянии, поэтому единственная преграда — контракт на входе.
+    #
+    # Директива — только там, где её реально распознаёт GitHub (#423, живой
+    # ложноположительный случай PR #415: объяснение правила в теле красило
+    # PR так же, как настоящая директива). task_ref.closing_keyword_refs —
+    # одно место правды рядом с extract_task_refs (#398: declared_tasks/
+    # declares_task удалены, номер задачи — только из имени ветки): вырезает
+    # inline-код/fenced-код/HTML-комментарии, не привязано к началу строки
+    # (директива работает где угодно в теле).
+    close_refs = task_ref.closing_keyword_refs(body)
+    if close_refs:
+        problems.append(
+            "Не пиши Closes/Fixes/Resolves рядом с #N (нашёл: "
+            f"«{close_refs[0]}»): задачу закрывает исполнитель ПОСЛЕ "
+            "пост-мерж проверки (деплой/канарейка/E2E), приложив улики. "
+            "Ссылайся на задачу просто #N."
+        )
+    # Задача PR — task_ref.resolve_pr_task (#394, решение владельца
+    # 2026-09-06): единственный источник — имя agent-ветки. Тело PR здесь
+    # не читается вовсе, ни первой строкой, ни любым другим способом.
+    issue_number = task_ref.resolve_pr_task(pull)
+    if issue_number is None:
+        problems.append(
+            "Не удалось определить задачу PR: ветка должна называться "
+            "agent/<N>-<slug>. Заведи её скриптом scripts/git/task-branch "
+            "<N>-<slug> — номер задачи берётся только из имени ветки, тело "
+            "PR не читается."
+        )
+
+    if issue_number is not None:
+        issue = gh(f"repos/{repo}/issues/{issue_number}")
+        # Пригодность считается ОДИН раз, ДО единого изменяющего вызова над
+        # этой issue (см. task_eligibility_problems) — непригодна, дальше не
+        # действуем вовсе, только докладываем причину.
+        eligibility = task_eligibility_problems(issue, issue_number)
+        if eligibility:
+            problems.extend(eligibility)
+        else:
+            assignees = [a["login"] for a in issue["assignees"]]
+            author = pull["user"]["login"]
+            if not assignees:
+                # Забыли назначиться — назначаем автора PR автоматически: первый PR
+                # по свободной задаче её занимает. Не на памяти, а в контракте.
+                gh("-X", "POST", f"repos/{repo}/issues/{issue_number}/assignees",
+                   "-f", f"assignees[]={author}")
+                print(f"contract: авто-назначение {author} на #{issue_number}")
+                assignees = [author]
+            if assignees != [author]:
+                problems.append(
+                    f"Задача #{issue_number} занята не тобой "
+                    f"(назначено: {', '.join(assignees)}). Бери свободную из пула."
+                )
+            # Чужие открытые PR на ту же задачу — гонка веток; она разрешается здесь.
+            # Симметрично своему PR (#394): конфликт, если ветка чужого PR
+            # называет ту же задачу (task_ref.resolve_pr_task), а не просто
+            # любое упоминание её номера в прозе описания (#195 — второй
+            # экземпляр асимметрии #187: своя декларация уже была узкой,
+            # чужая гонялась по всему тексту).
+            others = []
+            pulls = _all_open_pulls(repo)
+            for other in pulls:
+                if other["number"] == args.pr:
+                    continue
+                if task_ref.resolve_pr_task(other) == issue_number:
+                    others.append(other["number"])
+            if others:
+                problems.append(
+                    f"На задачу #{issue_number} уже есть открытый PR #{others[0]}. "
+                    "Второй PR на ту же задачу не проходит контракт."
+                )
+
+    if problems:
+        fail(problems, repo, args.pr)
+    # Прошёл — снимаем метку провала, если была.
+    try:
+        run_gh("api", "-X", "DELETE",
+               f"repos/{repo}/issues/{args.pr}/labels/{review_labels.CONTRACT_FAILED_LABEL}")
+    except Exception:
+        pass
+    print("contract: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

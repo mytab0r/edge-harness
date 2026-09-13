@@ -1,0 +1,134 @@
+{
+  "comment": "Реальное dsh-edge/plugins.json ДО (0a85ddf5^) и ПОСЛЕ (0a85ddf5) коммита — живой инцидент #806/#412: agents-tasks добавлен в ростер, @edge-harness/dsh-plugin-manager не пересобран. Прод-форма, снята командой `git show <rev>:dsh-edge/plugins.json` из этого же репозитория 2026-09-13. Тест обязан читать ЭТОТ файл, а не git-историю: actions/checkout в CI — depth-1, произвольная история там отсутствует, `git show 0a85ddf5^` падает «fatal: invalid object name» и красит обязательный чек test (находка ai-review PR #986).",
+  "before_0a85ddf5": {
+    "version": 1,
+    "plugins": [
+      {
+        "id": "hello",
+        "package": "@edge-harness/dsh-plugin-hello",
+        "source": {
+          "release": "plugins-hello-v0.1.1",
+          "asset": "hello-world-0.1.1.tgz",
+          "sha256": "f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"
+        },
+        "server": true,
+        "client": true
+      },
+      {
+        "id": "runner-bridge",
+        "package": "@edge-harness/dsh-plugin-runner-bridge",
+        "source": {
+          "release": "plugins-runner-bridge-v0.1.2",
+          "asset": "runner-bridge-0.1.2.tgz",
+          "sha256": "a056f22756b713d0c942b41b66204af75a0b11ad0135934709db11a140667b3a"
+        },
+        "server": true,
+        "client": false
+      },
+      {
+        "id": "plugin-manager",
+        "package": "@edge-harness/dsh-plugin-manager",
+        "source": {
+          "release": "plugins-plugin-manager-v0.1.9",
+          "asset": "plugin-manager-0.1.9.tgz",
+          "sha256": "487d415b51decd7664c18738e6277bc8b136d9d4458da58e6c35e4e6956e2244"
+        },
+        "server": false,
+        "client": true
+      },
+      {
+        "id": "integrations",
+        "package": "@edge-harness/dsh-plugin-integrations",
+        "source": {
+          "release": "plugins-integrations-v0.1.2",
+          "asset": "integrations-0.1.2.tgz",
+          "sha256": "2f35150d41f4903472bf3a2d2c035412e6e074fab23afff386e2b2bda1645dc6"
+        },
+        "server": true,
+        "client": true
+      },
+      {
+        "id": "provider-registry",
+        "package": "@edge-harness/dsh-plugin-provider-registry",
+        "source": {
+          "release": "plugins-provider-registry-v0.1.1",
+          "asset": "provider-registry-0.1.1.tgz",
+          "sha256": "2ad628c62b61168783d288c4d7cc74b0aefb4a1601344f51d6263fd73059d5a9"
+        },
+        "server": true,
+        "client": false
+      }
+    ]
+  },
+  "after_0a85ddf5": {
+    "version": 1,
+    "plugins": [
+      {
+        "id": "hello",
+        "package": "@edge-harness/dsh-plugin-hello",
+        "source": {
+          "release": "plugins-hello-v0.1.1",
+          "asset": "hello-world-0.1.1.tgz",
+          "sha256": "f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"
+        },
+        "server": true,
+        "client": true
+      },
+      {
+        "id": "runner-bridge",
+        "package": "@edge-harness/dsh-plugin-runner-bridge",
+        "source": {
+          "release": "plugins-runner-bridge-v0.1.2",
+          "asset": "runner-bridge-0.1.2.tgz",
+          "sha256": "a056f22756b713d0c942b41b66204af75a0b11ad0135934709db11a140667b3a"
+        },
+        "server": true,
+        "client": false
+      },
+      {
+        "id": "plugin-manager",
+        "package": "@edge-harness/dsh-plugin-manager",
+        "source": {
+          "release": "plugins-plugin-manager-v0.1.9",
+          "asset": "plugin-manager-0.1.9.tgz",
+          "sha256": "487d415b51decd7664c18738e6277bc8b136d9d4458da58e6c35e4e6956e2244"
+        },
+        "server": false,
+        "client": true
+      },
+      {
+        "id": "integrations",
+        "package": "@edge-harness/dsh-plugin-integrations",
+        "source": {
+          "release": "plugins-integrations-v0.1.2",
+          "asset": "integrations-0.1.2.tgz",
+          "sha256": "2f35150d41f4903472bf3a2d2c035412e6e074fab23afff386e2b2bda1645dc6"
+        },
+        "server": true,
+        "client": true
+      },
+      {
+        "id": "provider-registry",
+        "package": "@edge-harness/dsh-plugin-provider-registry",
+        "source": {
+          "release": "plugins-provider-registry-v0.1.1",
+          "asset": "provider-registry-0.1.1.tgz",
+          "sha256": "2ad628c62b61168783d288c4d7cc74b0aefb4a1601344f51d6263fd73059d5a9"
+        },
+        "server": true,
+        "client": false
+      },
+      {
+        "id": "agents-tasks",
+        "package": "@edge-harness/dsh-agents-tasks",
+        "source": {
+          "release": "plugins-agents-tasks-v0.1.3",
+          "asset": "edge-harness-dsh-agents-tasks-0.1.3.tgz",
+          "sha256": "433c1cfcce4f39e2826084969e79c179a7e9a53468e86b63df7505501116b87d"
+        },
+        "server": false,
+        "client": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+# Регистрация вебхука Telegram (issue #490): setWebhook + проверка видимого
+# результата через getWebhookInfo (см. scripts/telegram/register_webhook.py),
+# а не одного «ok: true» от setWebhook.
+#
+# Порядок относительно #254 (PR #486): скрипт сам зондирует маршрут
+# /api/messages/ingest синтетическим запросом ПЕРЕД регистрацией — если
+# морда ещё не принимает секретный заголовок (PR #486 не задеплоен), вебхук
+# не регистрируется. При ручном запуске (workflow_dispatch) это громкая
+# ошибка — владелец явно попросил регистрацию сейчас. При автозапуске после
+# deploy-worker это ожидаемое переходное состояние (пока #486 не слит) —
+# предупреждение и зелёный выход, а не красный прогон на каждый последующий
+# деплой морды, не имеющий отношения к вебхуку.
+#
+# Идемпотентно: если getWebhookInfo уже показывает нужный url без
+# last_error_message, setWebhook повторно не вызывается.
+name: telegram-webhook
+
+on:
+  workflow_dispatch:
+  # Смена HARNESS_URL или ротация TELEGRAM_WEBHOOK_SECRET требуют
+  # перерегистрации — deploy-worker уже синхронизирует секрет в воркер
+  # (#254), здесь синхронизируем его же в Telegram тем же поводом.
+  workflow_run:
+    workflows: ["deploy-worker"]
+    types: [completed]
+
+jobs:
+  register:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Тесты скрипта регистрации
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/telegram/test_register_webhook.py -q
+
+      - name: Регистрация вебхука
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
+          FAIL_ON_NOT_READY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+        run: python scripts/telegram/register_webhook.py
