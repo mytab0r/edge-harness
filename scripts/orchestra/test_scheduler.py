@@ -3429,7 +3429,7 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
 
 def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(monkeypatch):
     # Живая находка #474 (PR #408, прогон 34027474271): маркер попытки
-    # ставится СРАЗУ на dispatch, а worker.yml идёт до 280 мин — без этой
+    # ставится СРАЗУ на dispatch, а worker.yml идёт до 340 мин (#1067) — без этой
     # гвардии следующий тик планировщика (каждые 15 мин) эскалировал бы
     # «не сошлось», пока единственная попытка ещё физически не завершилась.
     task = issue(474, assignees=())  # уже освобождена предыдущим dispatch
@@ -3441,7 +3441,7 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(34027474271, "in_progress")]},
         # Отметка git-шага ставится РАНО в прогоне (перед dsh_run_with_retry,
-        # scripts/worker/task.sh) — задолго до конца 280-минутного job'а,
+        # scripts/worker/task.sh) — задолго до конца 340-минутного job'а (#1067),
         # поэтому attempts может стать 1 ещё ПОКА прогон "in_progress" (тот
         # самый гоночный случай #474/PR #408, ради которого и нужен
         # worker_runs_active ниже как отдельная гвардия).
@@ -3708,7 +3708,7 @@ def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_
 def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_conclusion(monkeypatch):
     """Исход 2, атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
     (некритичная находка ai-review PR #1030 → блокирующая, «алерт не гадает»
-    #472): worker.yml несёт timeout-minutes: 280 — висяк даёт
+    #472): worker.yml несёт timeout-minutes: 340 (#1067, было 280) — висяк даёт
     conclusion='timed_out' у АТРИБУТИРОВАННОГО прогона. Текст эскалации
     обязан назвать conclusion как есть, а не подменять его утверждением
     «не атрибутирован (аренда сгорела до следа?)» — факт у кода уже в руках.
@@ -3889,7 +3889,7 @@ def test_conflict_rework_attempts_counts_run_that_fell_out_of_recent_runs_window
     # recent_runs(per_page=10) — топ-10 свежих прогонов worker.yml, а живой
     # репозиторий выдаёт прогон на каждое слияние/ретрай/доводку (~3.3/час),
     # так что засчитанная попытка выпадала из окна уже через ~2–3 часа, сама
-    # оставаясь легитимной (прогон идёт до 280 минут). attempts возвращался
+    # оставаясь легитимной (прогон идёт до 340 минут, #1067). attempts возвращался
     # к 0, PR с несошедшейся попыткой получал адресный диспатч бесконечно и
     # никогда не доходил до эскалации — голодание #588 перестраивалось.
     # Здесь прогон 333 дошёл до git-шага (комментарий в задаче — ПОСТОЯННЫЙ
@@ -5273,14 +5273,15 @@ def test_dispatch_worker_silent_while_worker_queued(monkeypatch):
 def test_run_is_stalled_true_past_threshold_false_within_threshold():
     now = utc(2026, 9, 9, 12, 0)
     old = workflow_run(1, "in_progress")
-    old["run_started_at"] = "2026-09-09T07:00:00Z"  # 300 мин > порог (255)
+    old["run_started_at"] = "2026-09-09T07:00:00Z"  # 300 мин > порог (295)
     fresh = workflow_run(2, "in_progress")
-    # 225 мин — внутри легитимного worst case #877 (10×20 мин + 30 мин
-    # RATE_LIMIT = 230 мин + оверхед): такой прогон зависшим не считается.
-    # При прежнем пороге 200 (выведен из замера мира «150 мин на попытку»,
-    # ниже нового легитимного максимума 230) этот же прогон красился бы как
-    # зависший — тест-гвардия блокирующей находки ai-review PR #880.
-    fresh["run_started_at"] = "2026-09-09T08:15:00Z"  # 225 мин < порог (255)
+    # 265 мин — внутри легитимного worst case #1067 (2×120 мин + 30 мин
+    # RATE_LIMIT = 270 мин + оверхед): такой прогон зависшим не считается.
+    # При прежнем пороге 255 (выведен из модели #877/#880 «10×20 мин»,
+    # ниже нового легитимного максимума 270 после отказа #1067 от этой
+    # модели) этот же прогон красился бы как зависший — тест-гвардия
+    # блокирующей находки, что старый порог не переживает пересчёт бюджета.
+    fresh["run_started_at"] = "2026-09-09T07:35:00Z"  # 265 мин < порог (295)
     assert sch._run_is_stalled(old, now) is True
     assert sch._run_is_stalled(fresh, now) is False
 
@@ -5368,11 +5369,10 @@ def test_reap_stalled_worker_run_cancels_and_releases_correlated_task(monkeypatc
     # Прод-форма живого инцидента (#815): run 34339807907 стартовал
     # 2026-09-09T10:21:51Z, задача #815 арендована ЧЕРЕЗ 39с (assigned-событие
     # 10:22:30Z, обычная скорость claim_task.claim в task.sh) — «now» ниже
-    # взят так, чтобы возраст прогона (278 мин) уверенно перевалил порог
-    # (255 мин с #877: легитимный worst case цепочки 10×20+30=230 мин + запас;
-    # прежние 218 мин под старый порог 200 остались бы внутри нового
-    # легитимного диапазона), без гонки со временем прогона теста.
-    now = utc(2026, 9, 9, 15, 0, 0)
+    # взят так, чтобы возраст прогона (298 мин) уверенно перевалил порог
+    # (295 мин с #877/#1067: легитимный worst case цепочки 2×120+30=270 мин +
+    # запас), без гонки со временем прогона теста.
+    now = utc(2026, 9, 9, 15, 20, 0)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     task = issue(815, assignees=("mytab0r",))
@@ -5404,7 +5404,7 @@ def test_reap_stalled_worker_run_reports_when_no_task_correlates(monkeypatch):
     # прогон на задачу с уже открытым PR, либо аренда сгорела до следа) —
     # тормоз без газа здесь недопустим: сообщение обязано назвать факт «не
     # определена», не молчать.
-    now = utc(2026, 9, 9, 15, 0, 0)  # возраст прогона 278 мин > порог 255 (#877)
+    now = utc(2026, 9, 9, 15, 20, 0)  # возраст прогона 298 мин > порог 295 (#877/#1067)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     fake = FakeGh({
@@ -5425,7 +5425,7 @@ def test_reap_stalled_worker_run_skips_task_assigned_before_run_started(monkeypa
     # предыдущая, уже нормально идущая задача с открытым PR ещё не появился
     # по другой причине): корреляция обязана смотреть НАЗАД ложно-положительно,
     # не привязывать первую попавшуюся занятую задачу.
-    now = utc(2026, 9, 9, 15, 0, 0)  # возраст прогона 278 мин > порог 255 (#877)
+    now = utc(2026, 9, 9, 15, 20, 0)  # возраст прогона 298 мин > порог 295 (#877/#1067)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
     unrelated = issue(700, assignees=("mytab0r",))
