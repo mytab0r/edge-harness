@@ -371,6 +371,54 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
   echo "::endgroup::"
 }
 
+# Нейтрализация self-регистрации плагина в llm-pi-ai (#1097 второй заход,
+# #1130, живой прогон worker.yml 34753001158). ensureProvider() плагина
+# (lib/index.js) пишет провайдера в llm-pi-ai через ctx.get('settings') —
+# сервис settings ДЕЙСТВИТЕЛЬНО смонтирован в headless (проверено живым
+# `dsh --dump-config`: `@deepseek-ai/dsh-settings-file` — прежнее
+# утверждение обратного в design.md было неверным, см.
+# docs/research/32-claude-oauth-provider.md, «Дополнение»), поэтому эта
+# self-регистрация РАБОТАЕТ и гонится с нашей статической регистрацией
+# llm-pi-ai.providers.anthropic-pool (_dsh_patch_profile_anthropic_pool
+# ниже): если discoverModels() плагина успевает получить РЕАЛЬНЫЙ каталог
+# моделей аккаунта раньше первого запроса агента, settings.update() (MERGE
+# по объектам, но ЗАМЕНА массивов целиком, dsh-settings::mergeLayers)
+# перезаписывает наш models статическим — при отсутствии в реальном
+# каталоге буквального id "claude-sonnet-4-5" результат — UNKNOWN_MODEL.
+#
+# Фикс — вырезать саму self-регистрацию: наша статическая регистрация
+# полная и единственная, плагину незачем писать в settings вовсе. Патч
+# точный (exact string match в scripts/lib/patch_anthropic_pool_plugin.py,
+# fail loud при несовпадении формы — апстрим сменился), применяется к УЖЕ
+# распакованному и sha256-проверенному каталогу
+# (DSH_ANTHROPIC_POOL_EXTRACTED, после dsh_install_anthropic_pool),
+# результат репакуется в НОВЫЙ tgz — DSH_ANTHROPIC_POOL_PKG после этой
+# функции указывает на патченный архив, dsh_mount_anthropic_pool монтирует
+# именно его.
+dsh_patch_anthropic_pool_plugin() {
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации в settings (#1097/#1130)"
+  local script_dir index_js patched_tgz
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  index_js="$DSH_ANTHROPIC_POOL_EXTRACTED/lib/index.js"
+  if [ ! -f "$index_js" ]; then
+    echo "::error::$index_js не найден — dsh_install_anthropic_pool не отработал раньше (#1130)"
+    echo "::endgroup::"; return 1
+  fi
+  if ! python3 "$script_dir/patch_anthropic_pool_plugin.py" "$index_js"; then
+    echo "::error::патч ensureProvider() не применился (см. вывод выше) — self-регистрация НЕ нейтрализована, гонка с нашей статической регистрацией остаётся возможной (#1097/#1130)"
+    echo "::endgroup::"; return 1
+  fi
+  patched_tgz="$(dirname "$DSH_ANTHROPIC_POOL_EXTRACTED")/dsh-anthropic-oauth-pool-patched.tgz"
+  if ! tar -czf "$patched_tgz" -C "$(dirname "$DSH_ANTHROPIC_POOL_EXTRACTED")" "$(basename "$DSH_ANTHROPIC_POOL_EXTRACTED")"; then
+    echo "::error::репак патченного плагина в $patched_tgz не удался (#1130)"
+    echo "::endgroup::"; return 1
+  fi
+  DSH_ANTHROPIC_POOL_PKG="$patched_tgz"
+  echo "плагин патчен и репакован: $patched_tgz (dsh_mount_anthropic_pool смонтирует его вместо оригинального ассета)"
+  echo "::endgroup::"
+}
+
 # Импорт аккаунтов из секретов (#838) — вызывать ПОСЛЕ dsh_install_anthropic_pool
 # (нужен DSH_ANTHROPIC_POOL_EXTRACTED), в любой момент до первого прогона dsh:
 # bin/dsh-anthropic-pool.js пишет напрямую в ~/.dsh/anthropic-accounts (lib/

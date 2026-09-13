@@ -365,4 +365,91 @@ echo "GUARD(anthropic-pool): 9) ai-review не потребляет пул ни 
 ) || fail "10) статическая регистрация anthropic-pool в cordis.patch.yml сломана (регресс #1097)"
 echo "GUARD(anthropic-pool): 10) llm-pi-ai.providers.anthropic-pool зарегистрирован статически, порт/apiKeyEnv согласованы — ок (#1097)"
 
+# ── 11) #1097/#1130 (живой инцидент, второй заход): структурная секция 10
+#      выше была ЗЕЛЁНОЙ и при NO_ADAPTER (до первого фикса), и при
+#      UNKNOWN_MODEL (после первого фикса, гонка с self-регистрацией плагина
+#      через ctx.get('settings')) — она проверяет ТОЛЬКО НАШ статический
+#      патч, не то, что плагин продолжает писать в тот же settings-namespace
+#      и способен перезаписать models живым дискавери-каталогом. Эта секция
+#      доказывает, что `dsh_patch_anthropic_pool_plugin` РЕАЛЬНО вырезает
+#      self-регистрацию из ПРОД-ФОРМЫ плагина (точная копия ensureProvider()
+#      из released dsh-anthropic-oauth-pool-0.1.0.tgz, не пересказ) —
+#      патченный код внутри репакованного tgz БОЛЬШЕ НЕ содержит
+#      `ctx.get('settings')`. Мутация (искажение формы ensureProvider в
+#      фикстуре) красит патч именно там, где он обязан упасть — на
+#      несовпадении маркера, не молча пропуститьself-регистрацию. ──────────
+ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK='const name = "dsh-anthropic-oauth-pool"
+
+function apply(ctx) {
+  let port = 47291
+  let models = [{ id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", contextWindow: 200000, maxTokens: 64000 }]
+
+  async function discoverModels() {}
+
+  async function ensureProvider() {
+    await discoverModels()
+    try { await ctx.get('"'"'credentials'"'"').set(CREDS_REF, '"'"'managed-by-anthropic-pool'"'"') } catch {}
+    const provider = { displayName: '"'"'Anthropic OAuth Pool'"'"', apiKeyEnv: CREDS_REF, api: '"'"'anthropic-messages'"'"', baseURL: `http://127.0.0.1:${port}`, models }
+    const settings = ctx.get('"'"'settings'"'"')
+    if (typeof settings.update === '"'"'function'"'"') await settings.update('"'"'llm-pi-ai'"'"', { providers: { [PROVIDER_KEY]: provider } })
+    else if (typeof settings.mutate === '"'"'function'"'"') await settings.mutate('"'"'llm-pi-ai'"'"', [{ op: '"'"'add'"'"', path: ['"'"'providers'"'"', PROVIDER_KEY], value: provider }])
+    else throw new Error('"'"'DSH settings service cannot install the Anthropic pool provider'"'"')
+  }
+}
+
+export { name, apply }
+'
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  mkdir -p "$FIXTURE_DIR/lib"
+  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$FIXTURE_DIR/lib/index.js"
+  # Не пересказ: строка ensureProvider ниже — ТОЧНАЯ копия
+  # dsh-anthropic-oauth-pool-0.1.0.tgz (релиз dsh-plugins-suite-v1),
+  # инспектирована живьём при разборе #1097/#1130. Сверяем байт-в-байт с
+  # тем, что реально проверяет патч-скрипт (OLD-константа), не с нашим
+  # пересказом её содержимого.
+  grep -q "const settings = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) фикстура сама не содержит ожидаемую строку — тест сломан до патча" >&2; exit 1; }
+  if ! python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR/lib/index.js" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::11) патч не применился к прод-форме фикстуры: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1
+  fi
+  # Ищем именно ЖИВОЙ вызов (`const settings = ctx.get(...)`), не подстроку
+  # "ctx.get('settings')" целиком — наш же поясняющий комментарий в патче
+  # ЗАКОННО упоминает эту фразу текстом (находка при первом прогоне этой
+  # секции: голый grep по подстроке ловил СОБСТВЕННЫЙ комментарий патча как
+  # ложное срабатывание).
+  grep -q "const settings = ctx.get(" "$FIXTURE_DIR/lib/index.js" && { echo "::error::11) после патча живой вызов 'const settings = ctx.get(...)' всё ещё присутствует — self-регистрация НЕ нейтрализована" >&2; exit 1; }
+  grep -q "settings.update(" "$FIXTURE_DIR/lib/index.js" && { echo "::error::11) после патча settings.update(...) всё ещё вызывается" >&2; exit 1; }
+  grep -q "async function ensureProvider" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) патч удалил саму функцию ensureProvider вместо нейтрализации тела" >&2; exit 1; }
+) || fail "11) патч плагина (happy path) не нейтрализует self-регистрацию в прод-форме"
+echo "GUARD(anthropic-pool): 11a) патч нейтрализует ctx.get('settings') в прод-форме ensureProvider — ок (#1130)"
+
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  mkdir -p "$FIXTURE_DIR/lib"
+  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$FIXTURE_DIR/lib/index.js"
+  # Мутация: форма ensureProvider изменилась (как если бы апстрим переписал
+  # плагин) — точное совпадение обязано провалиться, а не тихо пропустить.
+  # python3 (не bash `${var/pattern/repl}` — та ломается на кавычках внутри
+  # паттерна, живая находка при первом прогоне этой секции: подстановка
+  # молча не срабатывала, MUTATED оставался равен оригиналу).
+  python3 -c "
+import sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as f:
+    content = f.read()
+marker = \"const settings = ctx.get('settings')\"
+assert marker in content, 'fixture setup broken'
+content = content.replace(marker, \"const settingsService = ctx.get('settings')\")
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+" "$FIXTURE_DIR/lib/index.js"
+  grep -q "const settingsService = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) мутация фикстуры не применилась — тест сломан до патча" >&2; exit 1; }
+  if python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR/lib/index.js" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::11) патч ОБЯЗАН был отказать на изменённой форме ensureProvider, но применился молча" >&2; exit 1
+  fi
+  grep -qi "PATCH_MARKER_NOT_FOUND" "$FIXTURE_DIR/patch.log" || { echo "::error::11) отказ патча не назвал причину PATCH_MARKER_NOT_FOUND: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1; }
+  grep -q "const settingsService = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) файл фикстуры не должен был измениться при отказе патча" >&2; exit 1; }
+) || fail "11) патч не падает громко на изменённой форме ensureProvider (мутация #1130)"
+echo "GUARD(anthropic-pool): 11b) мутация формы ensureProvider -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), файл не тронут — ок (#1130)"
+
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
