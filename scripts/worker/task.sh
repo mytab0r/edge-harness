@@ -658,8 +658,9 @@ gh issue comment "$number" \
   || echo "::warning::маркер git-шага не отправлен в задачу #$number — оркестратор увидит эту попытку как инфраструктурный сбой"
 
 # Фоновый дрен имеет смысл только при живой сессии морды (#572): без неё
-# каждый тик всё равно бил бы по /ingest без куки и логировал ::error:: раз в
-# секунду до конца прогона (DRAIN_INTERVAL_SECS) — шум без цели, а не сигнал.
+# каждый тик всё равно бил бы по /ingest без куки и логировал ::error:: раз
+# в тик DRAIN_INTERVAL_SECS (30с с #1048, DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS
+# в dsh-edge-session.sh) до конца прогона — шум без цели, а не сигнал.
 [ -n "$DSH_EDGE_MORDA_AVAILABLE" ] && dsh_edge_start_drain
 WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \

@@ -270,12 +270,7 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
             fi
             # worker/hands (#422, в отличие от ai_dsh.sh) требуют спул стрима
             # на успехе — та же запись, что и обычный успешный путь ниже.
-            if [ -n "${HANDS_SPOOL:-}" ]; then
-              printf '%s\n' \
-                '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
-                '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
-                '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
-            fi
+            smoke_write_spool
             echo "smoke: работа сделана после ретрая"
             # #876: маркер «в ветке появился новый коммит этой попытки» —
             # читает git-заглушка (rev-parse HEAD) ниже. Без него
@@ -301,10 +296,7 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
         esac
       fi
       [ -n "${HANDS_SPOOL:-}" ] || { echo "SMOKE: HANDS_SPOOL не задан" >&2; return 1; }
-      printf '%s\n' \
-        '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
-        '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
-        '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+      smoke_write_spool
       echo "smoke: работа сделана"
       # #876 — тот же маркер, что у ветки «после ретрая» выше.
       : >"${SMOKE_STATE:?}/git-head-seq"
@@ -317,6 +309,21 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
 
 pnpm() { return 0; }
 timeout() { local secs=$1; shift; "$@"; }
+
+smoke_write_spool() { # три канонических события в спул клиента — одно место правды для обоих успешных путей dsh()
+  # Пишет только когда есть куда (HANDS_SPOOL может быть не задан — у ai-review
+  # его нет) и когда сценарий не отключил запись: SMOKE_DSH_NO_SPOOL (чеклист
+  # PR #1058) нужен сценарию «worker-morda-down» ниже — он доказывает им, что
+  # чек здоровья плагина стрима в task.sh ([ -f "$SPOOL_FILE" ] → ::warning::)
+  # срабатывает и при ЛЕЖАЩЕЙ морде — диагноз местной поломки плагина не
+  # гейтится DSH_EDGE_MORDA_AVAILABLE.
+  if [ -n "${HANDS_SPOOL:-}" ] && [ -z "${SMOKE_DSH_NO_SPOOL:-}" ]; then
+    printf '%s\n' \
+      '{"v":1,"session_id":"smoke","seq":0,"time":0,"type":"turn/start","data":{"turn":1}}' \
+      '{"v":1,"session_id":"smoke","seq":1,"time":0,"type":"user/message","data":{"id":"m1","role":"user","content":[{"type":"text","text":"smoke"}],"source":{"kind":"user"}}}' \
+      '{"v":1,"session_id":"smoke","seq":2,"time":0,"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' >>"$HANDS_SPOOL"
+  fi
+}
 
 # ── Заглушки-исполняемые файлы (PATH): их не перезатирает source dsh-ci.sh ───────
 
@@ -552,7 +559,13 @@ export GITHUB_REPOSITORY="mytab0r/edge-harness"
 export HOME="$TMP/home"
 mkdir -p "$HOME"
 export PATH="$TMP/bin:$PATH"
-export -f curl gh dsh pnpm timeout log_call
+# Изоляция от внешнего окружения раннера: HANDS_SPOOL — рабочая переменная
+# транспорта (спул его собственного стриминга) и может прийти в smoke извне;
+# тогда сценарии без своего спула (ai-review RL) молча писали бы в чужой файл.
+# Кому спул нужен — задают его сами (worker/hands внутри клиента, первый
+# ai-review-сценарий префиксом), остальным он не нужен по построению.
+unset HANDS_SPOOL
+export -f curl gh dsh pnpm timeout log_call smoke_write_spool
 export CALLLOG
 # Гвардия «правила репозитория доходят до исполнителя»: файл, куда заглушка
 # dsh() каптурит РЕАЛЬНЫЙ аргумент-промпт каждого прогона.
@@ -609,41 +622,36 @@ scenario_start() { # [SEED_REF...] — замки, живые ДО запуск�
   for ref in "$@"; do printf '%s\n' "$ref" >>"$SMOKE_STATE/locks"; done
 }
 
-run_client() { # LABEL SCRIPT — прогон в дочернем bash; exit клиента не убивает smoke
+run_client() { # LABEL SCRIPT [OUTFILE] — прогон в дочернем bash; exit клиента не убивает smoke
+  # Третий аргумент (OUTFILE) — необязательный режим «каптурни stdout+stderr в
+  # файл» (чеклист PR #1058: режим, а не отдельный раннер), нужен сценариям
+  # #572, которые доказывают, что ::warning:: (а не ::error::/exit 1) реально
+  # ушёл в лог job'а, не только что rc=0.
   local label=$1 script=$2 rc=0
+  local outfile=${3:-}
   # Счётчик openssl-заглушки — на клиента: у каждого своя пара сверок целостности
   # (первая base64-подмена — dsh, вторая — dsh-headless).
   rm -f "$SMOKE_STATE/openssl-n"
-  echo "SMOKE: прогон $label"
-  if ( bash "$script" </dev/null ); then
-    rc=0
+  echo "SMOKE: прогон $label${outfile:+ (с каптуркой вывода)}"
+  if [ -n "$outfile" ]; then
+    if ( bash "$script" >"$outfile" 2>&1 </dev/null ); then
+      rc=0
+    else
+      rc=$?
+    fi
   else
-    rc=$?
+    if ( bash "$script" </dev/null ); then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
   if [ "$rc" -ne 0 ]; then
     echo "::error::SMOKE: $label завершился с кодом $rc" >&2
-    echo "--- журнал вызовов ---" >&2
-    cat "$CALLLOG" >&2
-    exit 1
-  fi
-}
-
-# Тот же прогон, что run_client, но каптурит stdout+stderr клиента в OUTFILE —
-# нужен сценариям #572, которые доказывают, что ::warning:: (а не ::error::/
-# exit 1) реально ушёл в лог job'а, не только что rc=0.
-run_client_capture() { # LABEL SCRIPT OUTFILE
-  local label=$1 script=$2 outfile=$3 rc=0
-  rm -f "$SMOKE_STATE/openssl-n"
-  echo "SMOKE: прогон $label (с каптуркой вывода)"
-  if ( bash "$script" >"$outfile" 2>&1 </dev/null ); then
-    rc=0
-  else
-    rc=$?
-  fi
-  if [ "$rc" -ne 0 ]; then
-    echo "::error::SMOKE: $label завершился с кодом $rc" >&2
-    echo "--- вывод клиента ---" >&2
-    cat "$outfile" >&2
+    if [ -n "$outfile" ]; then
+      echo "--- вывод клиента ---" >&2
+      cat "$outfile" >&2
+    fi
     echo "--- журнал вызовов ---" >&2
     cat "$CALLLOG" >&2
     exit 1
@@ -1072,7 +1080,10 @@ echo "SMOKE: hands-rate-limit-budget — ок"
 # прод-форма живого отказа: квота/500/сеть, прогон 34719189444). До этой
 # точки — ни session.create, ни session.rename, ни ingest не вызываются
 # вовсе (DSH_EDGE_MORDA_AVAILABLE пуст с самого логина) — работа продолжается
-# независимо, PR/отчёт доходят.
+# независимо, PR/отчёт доходят. SMOKE_DSH_NO_SPOOL к тому же лишает прогон
+# спула стрима: чек здоровья плагина ([ -f "$SPOOL_FILE" ]) от морды НЕ
+# зависит (чеклист PR #1058) и обязан сработать при лежащей морде тоже —
+# регрессия «вернули гейт под DSH_EDGE_MORDA_AVAILABLE» ловится ассертом ниже.
 scenario_start
 WORKER_MORDA_DOWN_OUT="$TMP/worker-morda-down.out"
 WORKER_LOGIN="mytab0r" \
@@ -1083,15 +1094,22 @@ TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke: морда недоступна целиком","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_MORDA_LOGIN_FAIL="1" \
-  run_client_capture "worker-morda-down" "$REPO/scripts/worker/task.sh" "$WORKER_MORDA_DOWN_OUT"
+SMOKE_DSH_NO_SPOOL="1" \
+  run_client "worker-morda-down" "$REPO/scripts/worker/task.sh" "$WORKER_MORDA_DOWN_OUT"
 assert_not_log "MORDE-RPC" "worker-morda-down: RPC морды вызван, хотя логин обязан был отказать первым"
 assert_not_log "MORDE-INGEST" "worker-morda-down: транскрипт уехал в морду при недоступном логине"
 assert_log "GH-COMMENT" "worker-morda-down: нет отчёта в задачу — недоступная морда не должна топить работу (#572)"
 grep -qF -- "::warning::Нет доступа к морде dsh-edge" "$WORKER_MORDA_DOWN_OUT" \
   || { echo "::error::SMOKE: worker-morda-down: нет ::warning:: об отказе логина — отказ морды стал тихим" >&2
        cat "$WORKER_MORDA_DOWN_OUT" >&2; exit 1; }
+# Чек здоровья плагина при лежащей морде (чеклист PR #1058): успех прогона +
+# отсутствие спула + морда не при чём — «Спул стрима не создан…» обязан
+# прозвучать, иначе диагноз поломки плагина спрятан под флаг доступности морды.
+grep -qF -- "::warning::Спул стрима не создан при успешном прогоне — плагин не работал" "$WORKER_MORDA_DOWN_OUT" \
+  || { echo "::error::SMOKE: worker-morda-down: чек здоровья плагина не сработал при лежащей морде — гейт вернулся под DSH_EDGE_MORDA_AVAILABLE?" >&2
+       cat "$WORKER_MORDA_DOWN_OUT" >&2; exit 1; }
 # Мутация «вернули exit 1» ловится не грепом текста, а самим rc:
-# run_client_capture уже потребовал бы rc=0 выше — здесь дополнительно
+# run_client с каптуркой уже потребовал бы rc=0 выше — здесь дополнительно
 # убеждаемся, что СТАРАЯ формулировка фатального выхода (#119, «job
 # красный») из живого прогона 34719189444 не воспроизводится дословно.
 grep -qF -- "не создана в морде — ход работы останется невидимым" "$WORKER_MORDA_DOWN_OUT" \
@@ -1117,7 +1135,7 @@ TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":124,"title":"Smoke: морда есть, приём транскрипта сломан","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_MORDA_INGEST_FAIL="1" \
-  run_client_capture "worker-morda-ingest-fail" "$REPO/scripts/worker/task.sh" "$WORKER_MORDA_INGEST_FAIL_OUT"
+  run_client "worker-morda-ingest-fail" "$REPO/scripts/worker/task.sh" "$WORKER_MORDA_INGEST_FAIL_OUT"
 assert_log "MORDE-RPC session.create" "worker-morda-ingest-fail: сессия морды не создана — логин/сессия обязаны были пройти"
 assert_log "MORDE-RPC session.rename" "worker-morda-ingest-fail: сессия морды не названа"
 assert_not_log "MORDE-INGEST" "worker-morda-ingest-fail: заглушка приняла ingest, хотя обязана была отказать (500)"
