@@ -1,0 +1,24 @@
+diff --git a/apps/dsh-edge/standalone/pnpm-workspace.yaml b/apps/dsh-edge/standalone/pnpm-workspace.yaml
+index 0c9151a..3f2ccf4 100644
+--- a/apps/dsh-edge/standalone/pnpm-workspace.yaml
++++ b/apps/dsh-edge/standalone/pnpm-workspace.yaml
+@@ -1,5 +1,19 @@
+ packages: []
+ 
++# Пин react-dom к уже доминирующему в дереве react@18.3.1 (issue #1041,
++# PATCHES.md 0006-standalone-react-dom-pin): без этого override committed
++# pnpm-lock.yaml даёт `react-dom@19.2.8(react@18.3.1)` —
++# @deepseek-ai/dsh-client-ui-trajectory тянет react-dom через
++# @tanstack/react-virtual без собственного пина, и pnpm подставляет ему
++# НЕСОВМЕСТИМУЮ MAJOR-версию (react-dom@19.2.8 требует react ^19.2.8, а
++# получает 18.3.1) — верный признак того же класса бага, что и React error
++# #130 ("Element type is invalid") на слоте 'settings.section'.
++# @tanstack/react-virtual@3.14.10 сам объявляет диапазон
++# `react-dom: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0` — 18.3.1 в него
++# входит, override ничего не ломает и не сужает совместимость.
++overrides:
++  react-dom: 18.3.1
++
+ allowBuilds:
+   '@deepseek-ai/dsh-subprocess-local': false
+   '@google/genai': false

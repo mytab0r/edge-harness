@@ -171,6 +171,13 @@ jobs:
           pnpm add --save-exact "${args[@]}"
           grep -q "patchedDependencies" pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
 
+      # Тот же гвард, что и deploy-dsh-edge.yml (issue #1041) — одно место
+      # правды, оба пути ставят плагины одинаково и одинаково рискуют
+      # несовместимой peer-парой major-версии.
+      - name: Гвардия консистентности peer-зависимостей (#1041)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/verify-peer-consistency.mjs "$GITHUB_WORKSPACE/clone"
+
       - name: Кодогенерация плагинной композиции
         if: steps.route.outputs.plugins != '0'
         run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
