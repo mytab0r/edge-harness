@@ -23,49 +23,56 @@
         "base_url": "https://openrouter.ai/api/v1",
         "model": "nvidia/nemotron-3-super-120b-a12b:free",
         "secret_env": "OPENROUTER_2_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 131072,
+        "$comment": "#1062: проверено — https://openrouter.ai/api/v1/models (публичный, без ключа, live-запрос 2026-09-13) отдаёт для id 'nvidia/nemotron-3-super-120b-a12b:free' top_provider.max_completion_tokens=235929 — 131072 ниже этого предела, значение безопасно, не менялось."
       },
       {
         "name": "Ollama-2",
         "base_url": "https://ollama.com/v1",
         "model": "nemotron-3-ultra",
         "secret_env": "OLLAMA_CLOUD_2_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 65536,
+        "$comment": "#1062: живая ошибка провайдера (прогон worker.yml 34730173870) — 'dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra'. 65536 подтверждено этим фактом, не документацией (Ollama Cloud не публикует предел для nemotron-3-ultra отдельно)."
       },
       {
         "name": "Ollama-3",
         "base_url": "https://ollama.com/v1",
         "model": "nemotron-3-ultra",
         "secret_env": "OLLAMA_CLOUD_3_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 65536,
+        "$comment": "#1062: тот же id модели, что Ollama-2 (nemotron-3-ultra через ollama.com) — тот же подтверждённый предел 65536, см. её комментарий."
       },
       {
         "name": "Ollama-1",
         "base_url": "https://ollama.com/v1",
         "model": "nemotron-3-ultra",
         "secret_env": "OLLAMA_CLOUD_1_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 65536,
+        "$comment": "#1062: тот же id модели, что Ollama-2 (nemotron-3-ultra через ollama.com) — тот же подтверждённый предел 65536, см. её комментарий."
       },
       {
         "name": "NVIDIA-NIM-1",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": "deepseek-ai/deepseek-v4-pro-0813",
         "secret_env": "NVIDIA_NIM_1_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 16384,
+        "$comment": "#1062: 131072 не был подтверждён ничем (discovery #848 проверял этот id живым chat/completions с max_tokens=16, не 131072, scripts/measure/provider_latency.py:266) — реальный предел взят из OpenAPI-схемы build.nvidia.com/deepseek-ai/deepseek-v4-pro-0813 этой же модели: '\"max_tokens\":{\"default\":16384,...,\"maximum\":16384,...}' (проверено live-запросом 2026-09-13, схема playground'а NVIDIA для DeepSeek V4 Pro, поле reasoning_effort в том же объекте называет модель прямо)."
       },
       {
         "name": "OpenRouter-1",
         "base_url": "https://openrouter.ai/api/v1",
         "model": "nvidia/nemotron-3-super-120b-a12b:free",
         "secret_env": "OPENROUTER_1_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 131072,
+        "$comment": "#1062: проверено — https://openrouter.ai/api/v1/models (публичный, без ключа, live-запрос 2026-09-13) отдаёт для id 'nvidia/nemotron-3-super-120b-a12b:free' top_provider.max_completion_tokens=235929 — 131072 ниже этого предела, значение безопасно, не менялось."
       },
       {
         "name": "NVIDIA-NIM-2",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": "deepseek-ai/deepseek-v4-pro-0813",
         "secret_env": "NVIDIA_NIM_2_API_KEY",
-        "max_output_tokens": 131072
+        "max_output_tokens": 16384,
+        "$comment": "#1062: тот же id модели, что NVIDIA-NIM-1 — тот же подтверждённый предел 16384, см. её комментарий."
       }
     ]
   },
@@ -74,6 +81,6 @@
     "worker": "default-chain",
     "hands": "default-chain"
   },
-  "generated_at": "2026-09-10T00:00:00Z",
-  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857."
+  "generated_at": "2026-09-13T00:00:00Z",
+  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857. #1062: все девять записей несли один и тот же непроверенный max_output_tokens=131072 — живой инцидент (прогон worker.yml 34730173870) показал, что для Ollama-* (nemotron-3-ultra, реальный предел 65536) это заведомо невалидный запрос; аудит по факту (live-ответ /v1/models, OpenAPI-схема build.nvidia.com) поправил Ollama-1/2/3 на 65536 и NVIDIA-NIM-1/2 на 16384, GLM/ZAI/OpenRouter-1/2 подтверждены как безопасные без изменений — см. $comment каждой записи."
 }

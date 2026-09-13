@@ -150,6 +150,14 @@ while IFS= read -r f; do
           *'"glm-5"'*|*'"glm-4"'*) continue ;; \
         esac
       fi
+      if [ "$f" = "scripts/lib/test/dsh-provider-chain.smoke.sh" ]; then
+        # #1062: фикстура заглушки dsh() воспроизводит ДОСЛОВНУЮ прод-форму
+        # живой ошибки Ollama Cloud (прогон worker.yml 34730173870) — AGENTS.md,
+        # «Тест кормит прод-форму данных, а не пересказ» — не дефолт-провайдер
+        # класса #153 (DEEPSEEK_MODEL здесь всегда primary-model/secondary-model,
+        # см. CHAIN выше в этом же файле).
+        case "$content" in *"for model nemotron-3-ultra"*) continue ;; esac
+      fi
       literal_hits="$literal_hits$f:$line
 "
     fi
