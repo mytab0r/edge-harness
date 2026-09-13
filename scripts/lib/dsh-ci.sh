@@ -53,22 +53,36 @@ ANTHROPIC_OAUTH_ACCOUNT_SECRETS=(ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2)
 # инцидент: прогон worker.yml 34746091297, `TypeError: Cannot read
 # properties of undefined (reading 'update')`). Причина: плагин
 # self-регистрирует свой провайдер в llm-pi-ai через `ctx.get('settings')`
-# (lib/index.js::ensureProvider) — сервис settings НИКОГДА не смонтирован в
-# профиле headless (`@deepseek-ai/dsh-headless/cordis.patch.yml` не грузит
-# `@deepseek-ai/dsh-settings` — тот идёт только devDependency'ей
-# `@deepseek-ai/dsh` и peerDependency `dsh-agent-default-model`, обе
-# бездействуют без явной composition-строки), поэтому `ctx.get('settings')`
-# всегда `undefined`, а обращение к `.update` бросает TypeError ДО
-# регистрации — `agent-default-model` резолвит несуществующего провайдера
-# "anthropic-pool" → `NO_ADAPTER`. HTTP-прокси плагина (аутентификация,
-# failover между аккаунтами) при этом стартует и работает нормально —
-# отказ ensureProvider() пойман `.catch()` внутри плагина и не роняет
-# процесс. Фикс — статическая регистрация провайдера в cordis.patch.yml
-# (_dsh_patch_profile_anthropic_pool ниже), тем же путём, что уже работает у
-# combo-router (dsh_patch_profile выше) — в обход settings. Порт должен
-# быть известен ДО старта dsh (баз-URL пишется в патч заранее), поэтому
-# фиксирован, а не выбирается ОС: один job — один процесс dsh за раз, порт
-# свободен (своя ВМ раннера).
+# (lib/index.js::ensureProvider) — обращение к `.update` бросает TypeError
+# ДО регистрации, `agent-default-model` резолвит несуществующего провайдера
+# "anthropic-pool" → `NO_ADAPTER`.
+#
+# ОПРОВЕРГНУТО #1130: предыдущая версия этого комментария утверждала, что
+# сервис settings НИКОГДА не смонтирован в headless. Живой прогон worker.yml
+# 34753001158 (уже с фиксом #1097, ниже) сменил ошибку на `UNKNOWN_MODEL` —
+# факт, невозможный при недоступном settings (провайдер не мог бы
+# зарегистрироваться вовсе). Реальная причина: settings
+# (`@deepseek-ai/dsh-settings-file`) смонтирован через `dsh-base` (общий
+# нижний слой всех профилей) — `@deepseek-ai/dsh-headless` сам его не
+# тянет, но это не то же самое, что «сервис недоступен вовсе». Разбор —
+# docs/research/32-claude-oauth-provider.md, «Поправка 2026-09-13».
+#
+# Раз settings реально доступен, self-регистрация плагина продолжает
+# работать ПАРАЛЛЕЛЬНО нашей статической регистрации (ниже) и гонится с
+# ней: живой `discoverModels()` плагина (реальный `/v1/models` с реальными
+# аккаунтами) способен перезаписать models settings-записью плагина позже
+# нашей — см. `dsh_patch_anthropic_pool_plugin` (#1130), которая нейтрализует
+# саму self-регистрацию, чтобы гонки не было вовсе, а не полагается на
+# совпадение id моделей.
+#
+# HTTP-прокси плагина (аутентификация, failover между аккаунтами) при этом
+# стартует и работает нормально — отказ ensureProvider() пойман `.catch()`
+# внутри плагина и не роняет процесс. Фикс #1097 — статическая регистрация
+# провайдера в cordis.patch.yml (_dsh_patch_profile_anthropic_pool ниже),
+# тем же путём, что уже работает у combo-router (dsh_patch_profile выше) —
+# в обход settings. Порт должен быть известен ДО старта dsh (баз-URL
+# пишется в патч заранее), поэтому фиксирован, а не выбирается ОС: один
+# job — один процесс dsh за раз, порт свободен (своя ВМ раннера).
 ANTHROPIC_OAUTH_POOL_PORT=47291
 
 # Имя apiKeyEnv-переменной провайдера llm-pi-ai.providers.anthropic-pool —
@@ -78,8 +92,11 @@ ANTHROPIC_OAUTH_POOL_PORT=47291
 # входящий authorization/x-api-key и подставляет свой Bearer), это поле лишь
 # обязано быть непустым, чтобы адаптер llm-pi-ai согласился загрузить
 # провайдер (сам плагин пытался прописать сюда то же самое через
-# ctx.get('credentials').set(...) — тоже недоступно в headless, но там уже
-# обёрнуто в try/catch и не роняет процесс).
+# ctx.get('credentials').set(...) — сервис credentials, как и settings выше,
+# реально смонтирован в headless через dsh-base (ОПРОВЕРГНУТО #1130: «тоже
+# недоступно» было неверно), но это уже не важно — self-регистрация плагина
+# нейтрализована патчем dsh_patch_anthropic_pool_plugin, эта строка кода
+# внутри плагина больше не исполняется вовсе).
 ANTHROPIC_OAUTH_POOL_APIKEY_ENV="ANTHROPIC_OAUTH_POOL_TOKEN"
 
 # vars.PLUGINS_SUITE_URL — имя переменной унаследовано от design.md/tasks.md
@@ -282,9 +299,26 @@ dsh_mount_plugins_suite() { # $1 — профиль (headless)
     echo "::error::dsh plugin add не смонтировал dsh-combo-router — suite не смонтировался (#215)"
     echo "::endgroup::"; return 1
   fi
-  if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_OAUTH_PKG"; then
-    echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — suite не смонтировался (#215)"
-    echo "::endgroup::"; return 1
+  # #1130 (находка ai-review PR #1132): свой собственный ассет suite —
+  # ТОТ ЖЕ дистрибутив dsh-anthropic-oauth-pool, что и standalone-путь
+  # (комментарий у PLUGINS_SUITE_OAUTH_ASSET выше), но НЕ пропущен через
+  # dsh_patch_anthropic_pool_plugin (#1097/#1130) — self-регистрация в нём
+  # активна и гонится со статической. Если standalone-путь УЖЕ активен
+  # (DSH_ANTHROPIC_POOL_ACTIVE=1, значит секреты аккаунтов заданы и
+  # dsh_patch_anthropic_pool_plugin уже отработал раньше по порядку вызовов
+  # в worker/task.sh и hands/dsh_task.sh), suite НЕ монтирует свою
+  # непатченную копию вовсе — dsh_mount_anthropic_pool (следующий шаг у
+  # обоих вызывающих) смонтирует ЕДИНСТВЕННУЮ, уже патченную. Без секретов
+  # (DSH_ANTHROPIC_POOL_ACTIVE=0) suite продолжает монтировать свою копию
+  # как раньше — сегодня этот путь целиком дремлет (vars.PLUGINS_SUITE_URL
+  # снята, #790), но останется корректным, когда suite вернут.
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" != "1" ]; then
+    if ! dsh plugin --profile "$profile" add "$DSH_PLUGINS_SUITE_OAUTH_PKG"; then
+      echo "::error::dsh plugin add не смонтировал dsh-anthropic-oauth-pool — suite не смонтировался (#215)"
+      echo "::endgroup::"; return 1
+    fi
+  else
+    echo "standalone-путь (#838/#1097/#1130) уже активен — suite пропускает свой (непатченный) oauth-add, dsh_mount_anthropic_pool смонтирует патченную копию следующим шагом"
   fi
 
   local dump
@@ -296,7 +330,7 @@ dsh_mount_plugins_suite() { # $1 — профиль (headless)
     echo "::error::combo-router не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#215)"
     echo "::endgroup::"; return 1
   fi
-  if ! grep -q '^- id: anthropic-oauth-pool$' <<<"$dump"; then
+  if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" != "1" ] && ! grep -q '^- id: anthropic-oauth-pool$' <<<"$dump"; then
     echo "::error::anthropic-oauth-pool не найден в собранной композиции (dsh --dump-config) после dsh plugin add — монтаж не подтверждён (#215)"
     echo "::endgroup::"; return 1
   fi
@@ -377,7 +411,7 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 # сервис settings ДЕЙСТВИТЕЛЬНО смонтирован в headless (проверено живым
 # `dsh --dump-config`: `@deepseek-ai/dsh-settings-file` — прежнее
 # утверждение обратного в design.md было неверным, см.
-# docs/research/32-claude-oauth-provider.md, «Дополнение»), поэтому эта
+# docs/research/32-claude-oauth-provider.md, «Поправка 2026-09-13»), поэтому эта
 # self-регистрация РАБОТАЕТ и гонится с нашей статической регистрацией
 # llm-pi-ai.providers.anthropic-pool (_dsh_patch_profile_anthropic_pool
 # ниже): если discoverModels() плагина успевает получить РЕАЛЬНЫЙ каталог
@@ -569,40 +603,47 @@ PATCH
 # живёт как отдельный провайдер llm-pi-ai.providers.anthropic-pool,
 # api: 'anthropic-messages' — другой протокольный путь, не openai-completions
 # llm-deepseek. "claude-sonnet-4-5" — статический дефолт из models плагина
-# (lib/index.js), используется как id модели для agent-default-model; живым
-# прогоном с реальными аккаунтами не подтверждено (design.md, «Не
-# подтверждено» — гонка discoverModels() плагина относительно первого
-# реального запроса, каталог моделей внутри самого прокси может обновиться
-# позже, но agent-default-model уже резолвит по этому статическому id).
+# (lib/index.js), используется как id модели для agent-default-model; после
+# #1130 (нейтрализация self-регистрации, см. dsh_patch_anthropic_pool_plugin
+# ниже) с этим id больше некому конкурировать — он остаётся единственным
+# источником каталога моделей провайдера, а не гонится с живым discoverModels().
 #
 # #1097 (живой инцидент, прогон worker.yml 34746091297): раньше эта функция
 # писала ТОЛЬКО agent-default-model и полагалась на то, что сам плагин
 # пропишет llm-pi-ai.providers.anthropic-pool через
 # ctx.get('settings').update(...) в своём ensureProvider() (lib/index.js
-# плагина). Это НИКОГДА не работает в профиле headless: cordis.patch.yml
-# headless-бандла (@deepseek-ai/dsh-headless, «монтирует no Host, HTTP
-# server, Web runtime, or browser plugin») не включает ни одного
-# settings-провайдера — ни один из пакетов, фактически идущих в headless
-# (@deepseek-ai/dsh, dsh-headless, dsh-code-runtime-worker-thread), не тянет
-# @deepseek-ai/dsh-settings как РАНТАЙМ-зависимость (только devDependency
-# @deepseek-ai/dsh и peerDependency dsh-agent-default-model, обе бездействуют
-# без явной composition-строки, которой в headless-бандле нет) —
-# `ctx.get('settings')` в headless всегда `undefined`, `settings.update`
-# бросает TypeError ДО регистрации провайдера, и agent-default-model
-# резолвит несуществующего "anthropic-pool" → NO_ADAPTER. Сам HTTP-прокси
-# плагина (server.listen, аутентификация/failover между аккаунтами) при этом
-# стартует и работает нормально — ensureProvider() вызывается АСИНХРОННО
-# после listen, её отказ ловится .catch() плагина и не роняет процесс.
+# плагина) — та запись падала TypeError ДО регистрации провайдера, и
+# agent-default-model резолвил несуществующего "anthropic-pool" → NO_ADAPTER.
 #
-# Фикс — статическая регистрация провайдера ЗДЕСЬ, тем же путём, что уже
-# использует dsh_patch_profile для combo-router (llm-pi-ai.config.providers
-# напрямую в cordis.patch.yml), в обход сломанного settings-сервиса. Порт
-# прокси ФИКСИРОВАН (ANTHROPIC_OAUTH_POOL_PORT, объявлен у констант выше) —
-# иначе baseURL нельзя узнать ДО старта процесса dsh (сервер сам выбирает
-# порт в момент listen, а патч пишется ДО того, как этот процесс стартовал).
-# apiKeyEnv — переменная с заведомо непустым значением (ANTHROPIC_OAUTH_POOL_APIKEY_ENV),
+# ОПРОВЕРГНУТО #1130: первая версия этого разбора утверждала, что сервис
+# settings НИКОГДА не смонтирован в headless (якобы ни dsh-headless, ни
+# что-либо ещё, реально идущее в headless-бандл, не тянет dsh-settings как
+# рантайм-зависимость). Живой прогон worker.yml 34753001158 (уже с фиксом
+# ниже) сменил ошибку на UNKNOWN_MODEL — факт, недостижимый при недоступном
+# settings. Реальная причина: settings (@deepseek-ai/dsh-settings-file)
+# смонтирован через dsh-base (общий нижний слой всех профилей, не через
+# dsh-headless) — разбор: docs/research/32-claude-oauth-provider.md,
+# «Поправка 2026-09-13». Сам HTTP-прокси плагина (server.listen,
+# аутентификация/failover между аккаунтами) при этом всегда стартовал и
+# работал нормально — ensureProvider() вызывается АСИНХРОННО после listen,
+# её отказ ловится .catch() плагина и не роняет процесс.
+#
+# Фикс #1097 — статическая регистрация провайдера ЗДЕСЬ, тем же путём, что
+# уже использует dsh_patch_profile для combo-router (llm-pi-ai.config.providers
+# напрямую в cordis.patch.yml). Порт прокси ФИКСИРОВАН
+# (ANTHROPIC_OAUTH_POOL_PORT, объявлен у констант выше) — иначе baseURL
+# нельзя узнать ДО старта процесса dsh (сервер сам выбирает порт в момент
+# listen, а патч пишется ДО того, как этот процесс стартовал). apiKeyEnv —
+# переменная с заведомо непустым значением (ANTHROPIC_OAUTH_POOL_APIKEY_ENV),
 # реальная авторизация решается прокси-сервером плагина, не этим полем (см.
 # комментарий у константы).
+#
+# Фикс #1130 — раз settings реально доступен (см. «ОПРОВЕРГНУТО» выше),
+# self-регистрация плагина продолжала работать ПАРАЛЛЕЛЬНО этой статической
+# и гналась с ней (settings.update — merge по объектам, но models как
+# массив заменяется ЦЕЛИКОМ): dsh_patch_anthropic_pool_plugin нейтрализует
+# ensureProvider() плагина целиком, эта функция остаётся ЕДИНСТВЕННЫМ
+# источником регистрации.
 _dsh_patch_profile_anthropic_pool() { # $1 — профиль
   local profile=$1
   local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"

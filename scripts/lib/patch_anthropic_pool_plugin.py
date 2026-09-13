@@ -59,7 +59,7 @@ NEW = """  async function ensureProvider() {
     // _dsh_patch_profile_anthropic_pool) перезаписывала models ЖИВЫМ
     // каталогом discoverModels() и роняла запрошенную модель в
     // UNKNOWN_MODEL. Регистрация теперь исключительно статическая — см.
-    // docs/research/32-claude-oauth-provider.md, «Дополнение».
+    // docs/research/32-claude-oauth-provider.md, «Поправка 2026-09-13».
     return
   }"""
 

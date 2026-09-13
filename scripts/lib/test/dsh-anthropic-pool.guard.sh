@@ -331,7 +331,7 @@ AI_DSH="$REPO/scripts/review/ai_dsh.sh"
 AI_REVIEW_WF="$REPO/.github/workflows/ai-review.yml"
 [ -f "$AI_DSH" ] || fail "9) не найден $AI_DSH"
 [ -f "$AI_REVIEW_WF" ] || fail "9) не найден $AI_REVIEW_WF"
-POOL_CALL_RE='dsh_install_anthropic_pool|dsh_import_anthropic_accounts|dsh_mount_anthropic_pool|dsh_run_with_pool_then_chain'
+POOL_CALL_RE='dsh_install_anthropic_pool|dsh_import_anthropic_accounts|dsh_patch_anthropic_pool_plugin|dsh_mount_anthropic_pool|dsh_run_with_pool_then_chain'
 if sed -e 's/#.*$//' "$AI_DSH" | grep -En "$POOL_CALL_RE"; then
   fail "9) scripts/review/ai_dsh.sh вне комментариев зовёт пул (#860: ревью идёт ТОЛЬКО цепочкой GLM/ZAI, напрямую dsh_run_with_provider_chain) — строки выше"
 fi
@@ -343,8 +343,12 @@ echo "GUARD(anthropic-pool): 9) ai-review не потребляет пул ни 
 # ── 10) #1097 (живой инцидент): _dsh_patch_profile_anthropic_pool ОБЯЗАНА
 #       сама прописывать llm-pi-ai.providers.anthropic-pool статически, а не
 #       полагаться на самопрописку плагина через ctx.get('settings') — та
-#       структурно недоступна в headless (см. комментарий у функции).
-#       baseURL патча обязан указывать на ТОТ ЖЕ порт, что экспортируется в
+#       падала TypeError (settings не был готов на момент вызова) и, даже
+#       когда settings реально доступен (#1130: сервис ДЕЙСТВИТЕЛЬНО
+#       смонтирован в headless через dsh-base — см. комментарий у функции),
+#       гонится с нашей статической регистрацией и способна перезаписать
+#       models живым каталогом discoverModels(). baseURL патча обязан
+#       указывать на ТОТ ЖЕ порт, что экспортируется в
 #       DSH_ANTHROPIC_POOL_PORT (сервер плагина слушает именно эту
 #       переменную), apiKeyEnv обязан резолвиться в НЕПУСТОЕ значение той же
 #       переменной окружения. Мутация (снять provider-блок из фикса) красит
@@ -354,7 +358,7 @@ echo "GUARD(anthropic-pool): 9) ai-review не потребляет пул ни 
   _dsh_patch_profile_anthropic_pool headless
   PATCH_FILE="$HOME/.dsh/profiles/headless/cordis.patch.yml"
   [ -f "$PATCH_FILE" ] || { echo "::error::10) $PATCH_FILE не создан" >&2; exit 1; }
-  grep -q '^- id: llm-pi-ai$' "$PATCH_FILE" || { echo "::error::10) патч не содержит секцию llm-pi-ai — провайдер anthropic-pool не зарегистрирован статически (регресс #1097, ctx.get('settings') недоступен в headless): $(cat "$PATCH_FILE")" >&2; exit 1; }
+  grep -q '^- id: llm-pi-ai$' "$PATCH_FILE" || { echo "::error::10) патч не содержит секцию llm-pi-ai — провайдер anthropic-pool не зарегистрирован статически (регресс #1097/#1130, self-регистрация плагина ненадёжна/гонится с нашей): $(cat "$PATCH_FILE")" >&2; exit 1; }
   grep -q '^      anthropic-pool:$' "$PATCH_FILE" || { echo "::error::10) провайдер anthropic-pool не найден внутри llm-pi-ai.providers: $(cat "$PATCH_FILE")" >&2; exit 1; }
   grep -q "^        baseURL: http://127.0.0.1:${ANTHROPIC_OAUTH_POOL_PORT}\$" "$PATCH_FILE" || { echo "::error::10) baseURL патча не указывает на фиксированный порт \$ANTHROPIC_OAUTH_POOL_PORT=${ANTHROPIC_OAUTH_POOL_PORT}: $(cat "$PATCH_FILE")" >&2; exit 1; }
   [ "${DSH_ANTHROPIC_POOL_PORT:-}" = "$ANTHROPIC_OAUTH_POOL_PORT" ] || { echo "::error::10) DSH_ANTHROPIC_POOL_PORT не экспортирован (получено '${DSH_ANTHROPIC_POOL_PORT:-}', ожидался ${ANTHROPIC_OAUTH_POOL_PORT}) — плагин слушает именно эту переменную, без неё порт сервера не совпадёт с baseURL патча" >&2; exit 1; }
@@ -417,8 +421,18 @@ export { name, apply }
   # ЗАКОННО упоминает эту фразу текстом (находка при первом прогоне этой
   # секции: голый grep по подстроке ловил СОБСТВЕННЫЙ комментарий патча как
   # ложное срабатывание).
-  grep -q "const settings = ctx.get(" "$FIXTURE_DIR/lib/index.js" && { echo "::error::11) после патча живой вызов 'const settings = ctx.get(...)' всё ещё присутствует — self-регистрация НЕ нейтрализована" >&2; exit 1; }
-  grep -q "settings.update(" "$FIXTURE_DIR/lib/index.js" && { echo "::error::11) после патча settings.update(...) всё ещё вызывается" >&2; exit 1; }
+  # if/then, не `grep ... && { ...; exit 1; }` — живая находка при первой
+  # версии этой секции: когда такая проверка оказывается ПОСЛЕДНЕЙ командой
+  # подоболочки, POSIX-семантика AND-OR списка под `set -e` делает НЕсовпадение
+  # (grep вернул 1, ожидаемый/верный исход) кодом возврата ВСЕЙ подоболочки —
+  # `|| fail` снаружи ложно красит секцию (класс воспроизведён в секции 13
+  # этого же файла, см. её комментарий).
+  if grep -q "const settings = ctx.get(" "$FIXTURE_DIR/lib/index.js"; then
+    echo "::error::11) после патча живой вызов 'const settings = ctx.get(...)' всё ещё присутствует — self-регистрация НЕ нейтрализована" >&2; exit 1
+  fi
+  if grep -q "settings.update(" "$FIXTURE_DIR/lib/index.js"; then
+    echo "::error::11) после патча settings.update(...) всё ещё вызывается" >&2; exit 1
+  fi
   grep -q "async function ensureProvider" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) патч удалил саму функцию ensureProvider вместо нейтрализации тела" >&2; exit 1; }
 ) || fail "11) патч плагина (happy path) не нейтрализует self-регистрацию в прод-форме"
 echo "GUARD(anthropic-pool): 11a) патч нейтрализует ctx.get('settings') в прод-форме ensureProvider — ок (#1130)"
@@ -451,5 +465,80 @@ with open(path, 'w', encoding='utf-8') as f:
   grep -q "const settingsService = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) файл фикстуры не должен был измениться при отказе патча" >&2; exit 1; }
 ) || fail "11) патч не падает громко на изменённой форме ensureProvider (мутация #1130)"
 echo "GUARD(anthropic-pool): 11b) мутация формы ensureProvider -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), файл не тронут — ок (#1130)"
+
+# ── 12) #1130 (находка ai-review PR #1132): suite-путь (dsh_mount_plugins_suite)
+#       НЕ монтирует свою (непатченную) копию dsh-anthropic-oauth-pool, когда
+#       standalone-путь уже активен — иначе смонтировались бы ДВЕ копии
+#       плагина, одна из них без патча #1130, и self-регистрация снова
+#       гонилась бы со статической регистрацией. Мокаем `dsh`, чтобы
+#       доказать: аргумент `$DSH_PLUGINS_SUITE_OAUTH_PKG` НИКОГДА не доходит
+#       до `dsh plugin add`, когда DSH_ANTHROPIC_POOL_ACTIVE=1. ─────────────
+(
+  export HOME="$(mktemp -d)"
+  export DSH_PLUGINS_SUITE_ACTIVE=1
+  export DSH_PLUGINS_SUITE_COMBO_PKG="$WORK/combo.tgz"
+  export DSH_PLUGINS_SUITE_OAUTH_PKG="$WORK/suite-oauth-unpatched.tgz"
+  : >"$DSH_PLUGINS_SUITE_COMBO_PKG"; : >"$DSH_PLUGINS_SUITE_OAUTH_PKG"
+  SUITE_OAUTH_MOUNTED_MARK="$WORK/suite-oauth-mounted.mark"
+  rm -f "$SUITE_OAUTH_MOUNTED_MARK"
+  dsh() {
+    case "${1:-}" in
+      plugin)
+        # dsh plugin --profile <profile> add <pkg>: $1=plugin $2=--profile
+        # $3=<profile> $4=add $5=<pkg>.
+        case "${5:-}" in
+          "$DSH_PLUGINS_SUITE_OAUTH_PKG") touch "$SUITE_OAUTH_MOUNTED_MARK" ;;
+        esac
+        return 0 ;;
+      --profile)
+        # --dump-config: combo-router + provider:combo/model:auto (активация
+        # подтверждена, чтобы не задеть отдельную ветку отката
+        # _dsh_patch_profile_plain — та не тема этой секции и требует
+        # DSH_MODEL/DSH_MAX_TOKENS, которых эта минимальная фикстура не
+        # ставит). anthropic-oauth-pool сюда НЕ входит — наш путь сам
+        # подтверждает его следующим шагом, не эта функция.
+        printf '%s\n' "- id: combo-router" "  config:" "    provider: combo" "    model: auto"
+        return 0 ;;
+      *) echo "::error::SMOKE(12): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  (
+    export DSH_ANTHROPIC_POOL_ACTIVE=1
+    dsh_mount_plugins_suite headless || { echo "::error::12) dsh_mount_plugins_suite отказал при активном standalone-пуле" >&2; exit 1; }
+  )
+  [ ! -f "$SUITE_OAUTH_MOUNTED_MARK" ] || { echo "::error::12) suite смонтировал СВОЮ (непатченную) копию dsh-anthropic-oauth-pool, хотя standalone-путь уже активен — двойной монтаж, self-регистрация снова гонится со статической (регресс #1130)" >&2; exit 1; }
+) || fail "12) suite-путь монтирует непатченную копию плагина при активном standalone-пуле"
+echo "GUARD(anthropic-pool): 12) suite пропускает свой oauth-add при активном standalone-пуле — двойной монтаж исключён (#1130)"
+
+# ── 13) #1130 (некритичное замечание ai-review PR #1132): сама обёртка
+#      dsh_patch_anthropic_pool_plugin (репак + перепривязка PKG) — секции
+#      11a/11b проверяют только вызываемый ею python-скрипт напрямую.
+#      Здесь — сквозной вызов ЧЕРЕЗ функцию dsh-ci.sh: DSH_ANTHROPIC_POOL_PKG
+#      обязан после вызова указывать на НОВЫЙ существующий tgz (репак), а
+#      распакованный из НЕГО lib/index.js обязан НЕ содержать живой вызов
+#      settings (тот же признак, что 11a, но через полный путь функции). ──
+(
+  FIXTURE_ROOT="$(mktemp -d)"
+  EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
+  mkdir -p "$EXTRACT_DIR/lib"
+  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$EXTRACT_DIR/lib/index.js"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT_DIR"
+  ORIGINAL_PKG="$FIXTURE_ROOT/original.tgz"
+  : >"$ORIGINAL_PKG"
+  export DSH_ANTHROPIC_POOL_PKG="$ORIGINAL_PKG"
+  dsh_patch_anthropic_pool_plugin || { echo "::error::13) dsh_patch_anthropic_pool_plugin отказала на валидной фикстуре" >&2; exit 1; }
+  [ "$DSH_ANTHROPIC_POOL_PKG" != "$ORIGINAL_PKG" ] || { echo "::error::13) DSH_ANTHROPIC_POOL_PKG не перепривязан на патченный tgz — dsh_mount_anthropic_pool смонтирует оригинал без патча" >&2; exit 1; }
+  [ -f "$DSH_ANTHROPIC_POOL_PKG" ] || { echo "::error::13) $DSH_ANTHROPIC_POOL_PKG (репак) не создан" >&2; exit 1; }
+  REPACK_CHECK_DIR="$FIXTURE_ROOT/repack-check"
+  mkdir -p "$REPACK_CHECK_DIR"
+  tar -xzf "$DSH_ANTHROPIC_POOL_PKG" -C "$REPACK_CHECK_DIR" || { echo "::error::13) репак нечитаем tar'ом" >&2; exit 1; }
+  [ -f "$REPACK_CHECK_DIR/package/lib/index.js" ] || { echo "::error::13) репак не сохранил структуру package/lib/index.js" >&2; exit 1; }
+  if grep -q "const settings = ctx.get(" "$REPACK_CHECK_DIR/package/lib/index.js"; then
+    echo "::error::13) внутри репака живой вызов ctx.get('settings') остался — обёртка не патчит реальный монтируемый архив" >&2; exit 1
+  fi
+) || fail "13) обёртка dsh_patch_anthropic_pool_plugin (репак + перепривязка PKG) сломана"
+echo "GUARD(anthropic-pool): 13) dsh_patch_anthropic_pool_plugin сквозным вызовом: PKG перепривязан, репак читаем, settings-вызов вырезан — ок (#1130)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
