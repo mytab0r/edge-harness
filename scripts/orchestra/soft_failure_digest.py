@@ -150,6 +150,7 @@ import yaml
 
 from pulse_guard import (
     WATCHDOG_ISSUE,
+    classify_failure_cause,
     escalate,
     gh,
     issue_marker_times,
@@ -165,6 +166,18 @@ _PI_SPEC.loader.exec_module(pool_issue)  # type: ignore[union-attr]
 _RL_SPEC = importlib.util.spec_from_file_location("review_labels", _LIB / "review_labels.py")
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
+
+# rate_guard.fetch_core/should_skip — то же место правды, что уже читает
+# шаг «Квота GitHub API — ранняя проверка» в orchestra.yml (#454): `gh api
+# rate_limit` не тратит собственную квоту (докстринг rate_guard.py,
+# подтверждено замером), второй копии этого вызова не заводим. Порог здесь
+# СВОЙ (см. SOFT_FAILURE_QUOTA_THRESHOLD ниже) — общий DEFAULT_THRESHOLD=300
+# калиброван под orchestra (150-250 вызовов/прогон), а полный скан дайджеста
+# стоит ~700-750 (замер живого прогона, находка ревью PR #1136, блокер 2):
+# порог соседей его не защищает, здесь нужен собственный, больше.
+_RG_SPEC = importlib.util.spec_from_file_location("rate_guard", _LIB / "rate_guard.py")
+rate_guard = importlib.util.module_from_spec(_RG_SPEC)
+_RG_SPEC.loader.exec_module(rate_guard)  # type: ignore[union-attr]
 
 
 # ── Одно место правды на конфигурацию дайджеста ──────────────────────────────
@@ -204,6 +217,15 @@ DIGEST_REPEAT_THRESHOLD = 3
 DIGEST_INTERVAL_HOURS = 12.0
 
 DIGEST_HEARTBEAT_MARKER = "[soft-failure-digest: heartbeat"
+
+# Свой порог квоты (находка ревью PR #1136, блокер 2): общий
+# rate_guard.DEFAULT_THRESHOLD=300 калиброван под orchestra САМ (150-250
+# вызовов/прогон) и оставляет ~700 запросов/час другим потребителям того же
+# часа — полный скан дайджеста (~700-750 вызовов, см. «Стоимость по API»)
+# сжирает этот остаток целиком и рискует упасть 403 посреди себя же. Порог
+# здесь — с запасом сверху сметы скана: 750 (смета) + 20% (тот же запас,
+# что у DEFAULT_THRESHOLD) ≈ 900.
+SOFT_FAILURE_QUOTA_THRESHOLD = 900
 
 SOFT_FAILURE_LABEL = "soft-failure"
 SOFT_FAILURE_DAILY_CAP = 5
@@ -361,22 +383,47 @@ def groups_over_threshold(groups: dict, threshold: int = DIGEST_REPEAT_THRESHOLD
     )
 
 
+_CLASS_LABELS = {
+    "infra": "инфраструктура",
+    "stale_base": "устаревшая база",
+    "defect": "дефект/наблюдение",
+}
+
+
+def group_class(group: dict) -> str:
+    """Эвристика (не факт): переиспользует ЕДИНСТВЕННОЕ место правды
+    (`pulse_guard.classify_failure_cause`, #1115 — тот же класс «чек не
+    различает провал инфраструктуры и настоящий дефект», только источник
+    здесь другой — зелёные прогоны, не красные чеки). Список сигнатур
+    закрытый и консервативный НАРОЧНО (докстринг pulse_guard.py) —
+    нераспознанное классифицируется как `defect` по умолчанию, не
+    прощается молча; новые сигнатуры (например «job was not started
+    because it repeatedly failed to be acquired», найденные расследованием
+    #1115) — правка ОДНОГО общего списка в pulse_guard.py, не второй копии
+    здесь (файл занят параллельными PR на момент этой правки — см. отчёт
+    PR #1136)."""
+    return _CLASS_LABELS[classify_failure_cause(group.get("sample") or "")]
+
+
 def render_digest_table(groups: dict) -> str:
     """Печатается ЦЕЛИКОМ (не только группы над порогом) — требование #1121
     п.1: «печатается таблица» — видимость всей картины, эскалация (заведение
-    задачи) отдельно ограничена порогом."""
+    задачи) отдельно ограничена порогом. Столбец «класс» — см. group_class:
+    эвристика, не приговор, отличить инфраструктурный шум от вероятного
+    дефекта на глаз, не гадая по одному тексту руками (находка координатора,
+    #1115)."""
     if not groups:
         return "Группы не найдены (окно пусто или без аннотаций/условных шагов)."
     rows = sorted(groups.values(), key=lambda g: -g["count"])
     lines = [
-        "| workflow | job/step | count | first seen (UTC) | last seen (UTC) | образец |",
-        "|---|---|---|---|---|---|",
+        "| workflow | job/step | count | класс | first seen (UTC) | last seen (UTC) | образец |",
+        "|---|---|---|---|---|---|---|",
     ]
     for group in rows:
         loc = group["job"] if group["kind"] == "annotation" else f"{group['job']} → {group['step']}"
         sample = (group["sample"] or "").replace("\n", " ")[:120]
         lines.append(
-            f"| {group['workflow']} | {loc} | {group['count']} | "
+            f"| {group['workflow']} | {loc} | {group['count']} | {group_class(group)} | "
             f"{group['first_seen'].isoformat()} | {group['last_seen'].isoformat()} | {sample} |"
         )
     return "\n".join(lines)
@@ -457,14 +504,22 @@ def fetch_jobs(repo: str, run: dict) -> list[dict]:
 def collect_window(
     repo: str, now: datetime,
     workflows: tuple = DIGEST_WORKFLOWS, window_hours: float = DIGEST_WINDOW_HOURS,
-) -> tuple[dict, list[str]]:
+) -> tuple[dict, list[str], dict]:
     """Полный скан окна: канал A (аннотации) + канал B (условные шаги).
     Сбой чтения одного прогона/workflow — наблюдение, не остановка всего
-    скана (тот же приём, что pulse_guard.failure_watch: continue, не raise)."""
+    скана (тот же приём, что pulse_guard.failure_watch: continue, не raise).
+
+    Третий элемент — `{"workflows_total": N, "workflows_ok": M}` (находка
+    ревью PR #1136, блокер 3): «список прогонов НЕ прочитан ни для одного
+    workflow» и «прочитан, групп просто нет» — разные факты, вызывающий
+    (`soft_failure_digest`) обязан различать их, а не печатать одинаковое
+    «группы не найдены» на оба (AGENTS.md, «алерт не гадает» — здесь тот же
+    класс: пустой результат должен нести причину пустоты)."""
     since = now - timedelta(hours=window_hours)
     groups: dict[str, dict] = {}
     observations: list[str] = []
     step_conclusions: dict[tuple, list] = {}
+    workflows_ok = 0
 
     for workflow in workflows:
         # Локальное чтение (0 сетевых вызовов) — какие шаги ЭТОГО workflow
@@ -478,6 +533,7 @@ def collect_window(
         except RuntimeError as error:
             observations.append(f"⚠️ soft-failure-digest {workflow}: список прогонов не прочитан ({error})")
             continue
+        workflows_ok += 1
         for run in runs:
             run_time = parse_time(run["updated_at"])
             run_url = run.get("html_url", "")
@@ -523,7 +579,8 @@ def collect_window(
                         {"conclusion": conclusion, "run_time": run_time, "run_url": run_url})
 
     add_step_occurrences(groups, step_conclusions)
-    return groups, observations
+    stats = {"workflows_total": len(workflows), "workflows_ok": workflows_ok}
+    return groups, observations, stats
 
 
 # ── Гейт цикла (не каждый тик — см. докстринг, «Стоимость по API») ──────────
@@ -607,6 +664,7 @@ def digest_task_body(group: dict, fp: str) -> str:
         "## Факт\n"
         f"Повторов в окне: {group['count']} за {DIGEST_WINDOW_HOURS}ч, "
         f"с {group['first_seen'].isoformat()} по {group['last_seen'].isoformat()}.\n"
+        f"Класс (эвристика classify_failure_cause, #1115): {group_class(group)}.\n"
         f"Текст образца: {group['sample']}\n\n"
         f"Живые прогоны:\n{urls}\n\n"
         f"{SOFT_FAILURE_FINGERPRINT_MARKER}{fp} -->\n"
@@ -691,13 +749,57 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
     return observations, actions
 
 
-def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str]]:
-    """Один полный цикл: гейт → скан → таблица (в наблюдения, печатается
-    caller'ом целиком) → эскалация над порогом → heartbeat."""
-    if not digest_due(repo, now):
-        return ["⏭️ soft-failure-digest: рано — предыдущий полный скан моложе интервала"], []
+def quota_sufficient(threshold: int = SOFT_FAILURE_QUOTA_THRESHOLD) -> tuple[bool, str]:
+    """True — квоты GitHub API хватает НА ВЕСЬ полный скан (не только на
+    гейт-проверку) — см. SOFT_FAILURE_QUOTA_THRESHOLD (находка ревью PR
+    #1136, блокер 2: общий rate_guard.DEFAULT_THRESHOLD=300 калиброван под
+    сам orchestra, не под смету этого скана в ~700-750 вызовов). Сбой
+    ЧТЕНИЯ квоты — консервативно считается «недостаточно»: не начинать
+    дорогой скан, не зная бюджета, лучше отложить до следующего тика."""
+    try:
+        core = rate_guard.fetch_core()
+    except rate_guard.QuotaCheckFailed as error:
+        return False, f"квота GitHub API не прочитана ({error}) — скан отложен консервативно"
+    remaining, limit = core["remaining"], core["limit"]
+    if rate_guard.should_skip(core, threshold):
+        return False, (
+            f"квота {remaining}/{limit} ниже порога {threshold} для полного "
+            "скана — отложено до следующего тика (гейт digest_due не тронут "
+            "heartbeat'ом, следующий тик попробует снова)")
+    return True, f"квота {remaining}/{limit} — скан идёт"
 
-    groups, observations = collect_window(repo, now)
+
+def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str], bool]:
+    """Один полный цикл: гейт → квота → скан → таблица (в наблюдения,
+    печатается caller'ом целиком) → эскалация над порогом → heartbeat.
+
+    Третий элемент возврата — `ok`: False ТОЛЬКО на полном провале чтения
+    (ни один из пяти workflow не прочитан, `collect_window`'s
+    `workflows_ok == 0`) — находка ревью PR #1136, блокер 3: «скан не
+    удался» и «скан удался, групп просто нет» раньше давали ОДИНАКОВЫЙ
+    текст «Группы не найдены» и ОДИНАКОВЫЙ heartbeat, закрывающий гейт на
+    `DIGEST_INTERVAL_HOURS` — ложь маскировала себя на 12 часов, именно
+    тогда, когда #1100 (исчерпание квоты) делает такой провал вероятнее.
+    Heartbeat при `ok=False` НЕ пишется — гейт остаётся открытым, следующий
+    обычный тик (~15 мин) повторит попытку, пока падение дешёвое (один
+    вызов метаданных #120 на несостоявшийся скан)."""
+    if not digest_due(repo, now):
+        return ["⏭️ soft-failure-digest: рано — предыдущий полный скан моложе интервала"], [], True
+
+    quota_ok, quota_text = quota_sufficient()
+    if not quota_ok:
+        return [f"⏭️ soft-failure-digest: {quota_text}"], [], True
+
+    groups, observations, stats = collect_window(repo, now)
+    if stats["workflows_ok"] == 0:
+        observations.append(
+            f"🚨 soft-failure-digest: скан НЕ удался — прочитано "
+            f"0/{stats['workflows_total']} workflow. Окно НЕ проверено — "
+            "это не «группы не найдены» (группы не найдены значит «прочитано, "
+            "пусто»; здесь — «не прочитано вовсе»). Heartbeat не пишется, "
+            "следующий тик повторит попытку.")
+        return observations, [], False
+
     table = render_digest_table(groups)
     observations = observations + [table]
 
@@ -710,21 +812,25 @@ def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str]]
     except RuntimeError as error:
         observations.append(f"⚠️ soft-failure-digest: heartbeat в #{WATCHDOG_ISSUE} не оставлен ({error})")
 
-    return observations, actions
+    return observations, actions, True
 
 
 def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    observations, actions = soft_failure_digest(repo, now)
+    observations, actions, ok = soft_failure_digest(repo, now)
     lines = ["## Дайджест мягких отказов (#1121)", ""] + observations + actions
     text = "\n".join(lines) + "\n"
     print(text)
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write(text)
-    return 0
+    # continue-on-error в orchestra.yml удержит job зелёным (находка ревью
+    # PR #887/#896: аннотация Checks API переживает маскировку, канал A
+    # этого же дайджеста поймает такой красный шаг на следующем скане —
+    # ok=False не должно быть тихим (AGENTS.md, «fail loud, не silent-wrong»).
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -306,6 +306,31 @@ def test_render_digest_table_lists_all_groups_not_only_over_threshold():
     assert "worker.yml" in table and "редкая штука" in table
 
 
+def test_group_class_distinguishes_infra_from_defect():
+    # Тот же приём, что #1115 просит для чеков PR — переиспользуем ЕДИНОЕ
+    # место правды (pulse_guard.classify_failure_cause), не гадаем заново.
+    # Живая находка (см. отчёт PR #1136): дословный текст `gh` CLI «API rate
+    # limit exceeded for installation» НЕ совпадает ни с одной сигнатурой
+    # INFRA_ERROR_SIGNATURES (список ждёт «rate limit reached»/«rate_limit:» —
+    # другую форму) — сигнатура ниже подобрана РЕАЛЬНО совпадающей
+    # (`quota_exhausted`), не той, что дайджест реально видел в проде;
+    # разрыв между реальным текстом `gh` и списком сигнатур — находка для
+    # #1115, не фикс этим PR (pulse_guard.py занят параллельными PR).
+    infra_group = {"sample": "ai_dsh.sh: RATE_LIMIT: Weekly Limit quota_exhausted, retry later"}
+    defect_group = {"sample": "быстрый провайдер отказал: NO_ADAPTER"}
+    assert sfd.group_class(infra_group) == "инфраструктура"
+    assert sfd.group_class(defect_group) == "дефект/наблюдение"
+
+
+def test_render_digest_table_shows_class_column():
+    groups = {"a": {"count": 5, "kind": "annotation", "workflow": "orchestra.yml", "job": "orchestra",
+                    "step": None, "sample": "502 Bad Gateway от GitHub API",
+                    "first_seen": NOW, "last_seen": NOW, "run_urls": [], "level": "failure"}}
+    table = sfd.render_digest_table(groups)
+    assert "класс" in table
+    assert "инфраструктура" in table
+
+
 # ── Сетевые читатели (FakeGh) ─────────────────────────────────────────────
 
 
@@ -402,8 +427,9 @@ def test_collect_window_end_to_end_finds_no_adapter_and_conditional_rollback(mon
     fake = FakeGh(routes)
     patch_gh(monkeypatch, fake)
 
-    groups, observations = sfd.collect_window(REPO, NOW)
+    groups, observations, stats = sfd.collect_window(REPO, NOW)
     assert observations == []
+    assert stats == {"workflows_total": 5, "workflows_ok": 5}
     # Канал A (аннотации): 3 прогона worker.yml несут одну и ту же аннотацию
     # NO_ADAPTER — над порогом 3, попадает в эскалацию.
     ranked = sfd.groups_over_threshold(groups, threshold=3)
@@ -514,3 +540,61 @@ def test_escalate_groups_cap_exhausted_skips_and_escalates_once(monkeypatch):
     assert actions == []
     assert any("отсечён потолком" in o for o in observations)
     assert any("-X POST" in c and "issues/120/comments" in c for c in fake.calls)
+
+
+# ── Квота (находка ревью PR #1136, блокер 2) ─────────────────────────────
+
+
+def test_quota_sufficient_true_above_threshold(monkeypatch):
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", lambda: {"remaining": 950, "limit": 1000})
+    ok, text = sfd.quota_sufficient()
+    assert ok is True
+    assert "950/1000" in text
+
+
+def test_quota_sufficient_false_below_threshold(monkeypatch):
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", lambda: {"remaining": 500, "limit": 1000})
+    ok, text = sfd.quota_sufficient()
+    assert ok is False
+    assert "500/1000" in text
+
+
+def test_quota_sufficient_false_when_read_fails(monkeypatch):
+    def boom():
+        raise sfd.rate_guard.QuotaCheckFailed("сеть легла")
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", boom)
+    ok, text = sfd.quota_sufficient()
+    assert ok is False
+    assert "не прочитана" in text
+
+
+# ── Полный провал скана ≠ «группы не найдены» (находка ревью PR #1136, блокер 3) ──
+
+
+def test_soft_failure_digest_skips_when_quota_low_without_touching_workflows(monkeypatch):
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", lambda: {"remaining": 100, "limit": 1000})
+    fake = FakeGh([("repos/mytab0r/edge-harness/issues/120", {"comments": 0})])
+    patch_gh(monkeypatch, fake)
+    observations, actions, ok = sfd.soft_failure_digest(REPO, NOW)
+    assert ok is True  # квоты мало — не провал, штатный перенос
+    assert actions == []
+    assert any("квота" in o.lower() for o in observations)
+    assert not any("actions/workflows" in c for c in fake.calls)  # до collect_window не дошли
+
+
+def test_soft_failure_digest_total_read_failure_is_not_empty_groups(monkeypatch):
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", lambda: {"remaining": 950, "limit": 1000})
+    fake = FakeGh([
+        ("repos/mytab0r/edge-harness/issues/120", {"comments": 0}),
+        ("actions/workflows", RuntimeError("сеть легла")),  # матчит ЛЮБОЙ .../runs? — все 5 workflow
+    ])
+    patch_gh(monkeypatch, fake)
+    observations, actions, ok = sfd.soft_failure_digest(REPO, NOW)
+    assert ok is False
+    assert actions == []
+    assert any("скан НЕ удался" in o for o in observations)
+    # Не подменяем провал ложным «пусто» — render_digest_table на пустой
+    # таблице печатает именно эту строку, её не должно быть в выводе провала.
+    assert not any(o == "Группы не найдены (окно пусто или без аннотаций/условных шагов)."
+                   for o in observations)
+    assert not any("-X POST" in c and "issues/120/comments" in c for c in fake.calls)  # heartbeat не писан
