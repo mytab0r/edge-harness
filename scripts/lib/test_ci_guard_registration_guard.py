@@ -707,3 +707,41 @@ def test_quota_invariants_job_state_pair_is_present_in_repo_ci():
         "межшаговая зависимость пары ALLOWLIST_JOB_STATE_EXEMPT оборвана, "
         "основание исключения больше не действует"
     )
+
+
+def test_step_with_mixed_bare_invocations_reports_only_uncovered(tmp_path):
+    """Носитель сверки — СПИСОК всех «голых» вызовов шага, не первый
+    попадание (ревью второго агента PR #1117): шаг «учтённая каталогом цель
+    + неучтённая цель» при первом-попадании уходил бы мимо сверки целиком.
+    Сообщение называет только НЕПОКРЫТЫЕ вызовы; полностью покрытый шаг
+    чист."""
+    doc = {"jobs": {"test": {"steps": [
+        {
+            "name": "Смешанный шаг",
+            "run": "node dsh-edge/covered.mjs\nnode dsh-edge/uncovered.mjs",
+        },
+        {
+            "name": "Полностью покрытый шаг",
+            "run": "node dsh-edge/covered.mjs",
+        },
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "covered-guard.sh").write_text(
+        "#!/usr/bin/env bash\nnode dsh-edge/covered.mjs\n", encoding="utf-8"
+    )
+    problems = crg.check_bare_invocations_are_accounted(
+        path, catalog_dir=catalog_dir,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(),
+        debt=frozenset(), allowlist=frozenset(),
+    )
+    assert len(problems) == 1
+    assert "Смешанный шаг" in problems[0]
+    assert "uncovered.mjs" in problems[0]
+    head = problems[0].split("«голый» вызов ")[1].split(" — ")[0]
+    assert "dsh-edge/covered.mjs" not in head  # покрытая цель в находке не названа
+    assert head == "['dsh-edge/uncovered.mjs']"
+    # Мутация: переведи носитель обратно на «первое попадание» — краснеет
+    # («Полностью покрытый шаг» и mixed-шаг становятся чистыми мимо сверки).

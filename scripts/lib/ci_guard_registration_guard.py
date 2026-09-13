@@ -639,9 +639,9 @@ def _suggest_guard_filename(repo_ci: Path, name: str) -> str | None:
 _ALLOWLIST_GUARD_NAME_RE = re.compile(r"^Гвард", re.IGNORECASE)
 
 
-def _bare_script_violation(run_text: str) -> str | None:
-    """Первая найденная «голая» команда исполнения файла — прямой запуск,
-    не обёрнутый pytest/`node --test` (issue #1069): `python <файл>.py` без
+def _bare_script_violations(run_text: str) -> list[str]:
+    """ВСЕ «голые» команды исполнения файла в `run_text` — прямые запуски,
+    не обёрнутые pytest/`node --test` (issue #1069): `python <файл>.py` без
     `-m pytest` и без префикса `test_` в имени файла, `node <файл>.mjs`/`.js`
     без `--test` и без `.test.` в пути, `bash`/`sh <файл>.guard.sh` (двойное
     расширение `.guard.sh` — установленное соглашение репозитория для
@@ -656,12 +656,17 @@ def _bare_script_violation(run_text: str) -> str | None:
     именем. Тот же критерий, применённый ко ВСЕМ шагам job `test`
     (check_bare_invocations_are_accounted — ревью PR #1117), не даёт
     «голой» гвардии появиться мимо ALLOWLIST под нейтральным именем.
-    `None`, если ни одна команда `run_text`
-    не подходит под это описание."""
+    Список, а не первый попадание (ревью второго агента PR #1117): шаг
+    «учтённая цель + неучтённая цель» при первом-попадании уходил бы мимо
+    сверки ЦЕЛИКОМ — покрытость обязана проверяться по каждому вызову
+    отдельно. Пустой список, если ни одна команда `run_text` не подходит
+    под это описание; порядок — порядок появления в `run_text`, без дублей."""
+    violations: list[str] = []
     for words in _otg.statement_tokens(run_text):
         if not words:
             continue
         head = words[0]
+        found: str | None = None
         if head in ("python", "python3"):
             if len(words) >= 3 and words[1] == "-m" and words[2] == "pytest":
                 continue
@@ -670,13 +675,15 @@ def _bare_script_violation(run_text: str) -> str | None:
                     continue
                 path = Path(arg)
                 if path.suffix == ".py" and not path.name.startswith("test_"):
-                    return arg
+                    found = arg
+                    break
         elif head in ("bash", "sh"):
             for arg in words[1:]:
                 if arg.startswith("-"):
                     continue
                 if arg.endswith(".guard.sh"):
-                    return arg
+                    found = arg
+                    break
         elif head == "node":
             if "--test" in words:
                 continue
@@ -684,8 +691,11 @@ def _bare_script_violation(run_text: str) -> str | None:
                 if arg.startswith("-"):
                     continue
                 if Path(arg).suffix in (".mjs", ".js") and ".test." not in arg:
-                    return arg
-    return None
+                    found = arg
+                    break
+        if found and found not in violations:
+            violations.append(found)
+    return violations
 
 
 def check_allowlist_entries_are_migratable(
@@ -698,7 +708,7 @@ def check_allowlist_entries_are_migratable(
     не мешало существующей ALLOWLIST-записи молча остаться «гвардией не в
     каталоге» навсегда — именно так `provider-default.guard.sh` (класс
     #153) дожил в ALLOWLIST до живых падений PR #1068/#1095 при зелёном
-    локальном `run_guards.sh`. Критерий (см. `_bare_script_violation` и
+    локальном `run_guards.sh`. Критерий (см. `_bare_script_violations` и
     `_ALLOWLIST_GUARD_NAME_RE`): запись ALLOWLIST обязана быть unit-тестом
     КОНКРЕТНОГО модуля (`pytest test_X.py -q`, где X.py — бизнес-логика,
     которую и так запускает разработчик, редактирующий X.py), а не (а)
@@ -723,11 +733,11 @@ def check_allowlist_entries_are_migratable(
             )
             continue
         run_text = _step_run_text(repo_ci, name)
-        violation = _bare_script_violation(run_text) if run_text else None
-        if violation:
+        violations = _bare_script_violations(run_text) if run_text else []
+        if violations:
             problems.append(
                 f"ALLOWLIST несёт запись {name!r} — run: содержит «голый» "
-                f"вызов {violation!r} (не pytest/`node --test`, не "
+                f"вызов {violations!r} (не pytest/`node --test`, не "
                 "test_*-файл) — структурно живой снимок состояния "
                 "репозитория, не unit-тест модуля (issue #1069): перенеси в "
                 "scripts/ci/guards/ и убери запись из ALLOWLIST, либо, если "
@@ -775,7 +785,7 @@ def check_bare_invocations_are_accounted(
     manifest.mjs`, `python scripts/orchestra/repo_invariants.py`) не виден
     НИКОГДА: ни детекции, ни ALLOWLIST (туда и не попадал), ни этой гвардии
     до этого PR. Сверка идёт по ВСЕМ шагам job `test`, не только по
-    ALLOWLIST-записям: каждое «голое» попадание (`_bare_script_violation`)
+    ALLOWLIST-записям: каждое «голое» попадание (`_bare_script_violations`)
     обязано быть учтённым —
       (а) исполняться каталогом (`_catalog_targets`): локальный
           `run_guards.sh` цель покрывает, рукописный шаг — дубль, который
@@ -799,8 +809,8 @@ def check_bare_invocations_are_accounted(
         seen_steps.add(name)
         if not run_text or name in allowlist:
             continue
-        violation = _bare_script_violation(run_text)
-        if violation is None:
+        violations = _bare_script_violations(run_text)
+        if not violations:
             continue
         if name in accounted:
             continue
@@ -809,11 +819,12 @@ def check_bare_invocations_are_accounted(
             # (редкий путь): на зелёном пути overlap-сверка в
             # check_no_undeclared_step уже прочитала его сама.
             catalog_map = _catalog_targets(catalog_dir)
-        if violation in catalog_map:
+        uncovered = [v for v in violations if v not in catalog_map]
+        if not uncovered:
             continue
         problems.append(
             f"шаг {name!r} job `test` .github/workflows/repo-ci.yml исполняет "
-            f"«голый» вызов {violation!r} — живой снимок состояния репозитория "
+            f"«голый» вызов {uncovered!r} — живой снимок состояния репозитория "
             "или самостоятельный guard-скрипт, который локальный run_guards.sh "
             "не исполняет (класс #1069, ревью PR #1117): перенеси в "
             "scripts/ci/guards/ (bash-файл с дословным телом run: этого шага); "
