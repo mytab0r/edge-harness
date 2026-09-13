@@ -2705,6 +2705,7 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
     # зависит от истории маркеров #120, гейтить им PR означало бы красить
     # чужой PR за чужое искажение снимка.
     assert 16 not in ri.CI_GATING
+    assert 16 in ri.ESCALATING_INVARIANTS
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2864,9 +2865,74 @@ def test_build_report_invariant_18_healthy_when_no_impostor(monkeypatch):
     assert any("💚" in line and "[18]" in line for line in lines)
 
 
+def test_check_pipeline_status_marker_impersonation_ignores_prose_quoting_marker():
+    """Находка ревью PR #1102 (живые id 5641698169/5651719035, 2026-09-13):
+    два реальных комментария #120 упоминают дословный текст маркера СРЕДИ
+    ПРОЗЫ (ревизия пула, цитирующая `pulse_guard.py:100-102`; сам разбор
+    инцидента #1074, дословно приводящий текст ложных маркеров как улику) —
+    оба от `mytab0r`/`User`/`performed_via_github_app: null`, то есть по
+    голому совпадению подстроки оба стали бы ложным нарушением. Первая
+    строка обоих комментариев маркера НЕ содержит — инвариант обязан
+    смотреть только на первую строку и промолчать."""
+    revision_excerpt = {
+        "id": 5641698169,
+        "created_at": "2026-09-11T23:12:59Z",
+        "body": (
+            "🧹 Ревизия пула (проход PM 2026-09-12): **задачу НЕ закрываю. "
+            "Снимаю метки `task` и `stale-unclaimed` — #120 переоформляется "
+            "из задачи пула в постоянный служебный канал эскалации.**\n\n"
+            "**Почему не закрытие.** Механизм, ради которого задача заводилась, "
+            "реализован — `scripts/orchestra/pulse_guard.py:100-102`: "
+            "`WATCHDOG_ISSUE = 120`, `PAUSE_MARKER = \"[статус конвейера: "
+            "пауза]\"`, плюс `conveyor_gate` (пауза диспатча после серии "
+            "красных `worker.yml`)."
+        ),
+        "user": {"login": "mytab0r", "type": "User"},
+        "performed_via_github_app": None,
+        "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5641698169",
+    }
+    refutation_excerpt = {
+        "id": 5651719035,
+        "created_at": "2026-09-13T06:40:52Z",
+        "body": (
+            "⚠️ [опровержение] 26 ложных маркеров «WIP-лимит снят» ниже — "
+            "недостоверны\n\n"
+            "Аудит 2026-09-13 (issue #1074): между **2026-09-12T17:21:47Z** "
+            "и **2026-09-13T03:53:03Z**\nв этот канал попали 26 комментариев "
+            "`✅ [статус конвейера: WIP-лимит снят] Открытых PR,\nждущих "
+            "доработки: 0 < 12` от логина `mytab0r` (`user.type=User`, "
+            "`performed_via_github_app=none` — личный PAT вне GitHub Actions)."
+        ),
+        "user": {"login": "mytab0r", "type": "User"},
+        "performed_via_github_app": None,
+        "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5651719035",
+    }
+    assert ri.check_pipeline_status_marker_impersonation(
+        [revision_excerpt, refutation_excerpt]) == []
+
+
+def test_check_pipeline_status_marker_impersonation_mutation_guard_first_line():
+    """Мутация: если бы проверка смотрела на ВСЁ тело, а не на первую строку
+    (как это и было в первой версии этого инварианта, найдено ревью #1102),
+    оба комментария из предыдущего теста стали бы ложными нарушениями."""
+    def whole_body_check(comments):
+        return [c for c in comments
+                if ri.PIPELINE_STATUS_MARKER_FAMILY_RE.search(c.get("body") or "")
+                and c.get("performed_via_github_app") is None]
+
+    prose_only = [{
+        "id": 1, "created_at": "2026-09-11T23:12:59Z",
+        "body": "Ревизия:\n`PAUSE_MARKER = \"[статус конвейера: пауза]\"` — просто цитата, не маркер.",
+        "user": {"login": "mytab0r", "type": "User"},
+        "performed_via_github_app": None,
+        "html_url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-1",
+    }]
+    assert len(whole_body_check(prose_only)) == 1  # мутация красит прозу
+    assert ri.check_pipeline_status_marker_impersonation(prose_only) == []  # фикс молчит
+
+
 def test_pipeline_status_marker_impersonation_not_in_ci_gating():
     # Наблюдательный НАВСЕГДА (см. блок-комментарий у самой функции): долг по
     # прошлым комментариям #120 структурно необнуляем (правило репозитория
     # запрещает их удалять) — гейтить им PR означало бы красить main вечно.
     assert 18 not in ri.CI_GATING
-    assert 16 in ri.ESCALATING_INVARIANTS
