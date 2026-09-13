@@ -115,12 +115,13 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "тот же check-runs, что pr_check_runs — тело инлайн внутри merge_queue.",
     ("scripts/orchestra/scheduler.py", "worker_runs_active"):
         "явный `per_page=1` — запрошен только последний прогон, не список.",
-    ("scripts/orchestra/scheduler.py", "stalled_worker_run"):
+    ("scripts/orchestra/scheduler.py", "_active_worker_run"):
         "тот же контракт, что worker_runs_active выше (#815, тот же запрос "
-        "`?status=in_progress&per_page=1`, вынесенный в отдельную функцию, "
-        "чтобы reap_stalled_worker_run мог переиспользовать решение "
-        "«зависший ли этот прогон» без второго обхода) — явный `per_page=1`, "
-        "запрошен только последний прогон, не список.",
+        "`?status=in_progress&per_page=1` — вынесенный из stalled_worker_run в "
+        "отдельную функцию #1085, чтобы и возрастной, и тишинный признак "
+        "(reap_stalled_worker_run) переиспользовали ОДИН сетевой вызов, не "
+        "заводили по обходу каждый) — явный `per_page=1`, запрошен только "
+        "последний прогон, не список.",
     # Появились с #253 (стадия приёмки, слито после этой гвардии, #308/#309) —
     # не находка PR #311, добавлены здесь только чтобы гвардия оставалась
     # зелёной после ребейза на main; классификация та же, что у соседних

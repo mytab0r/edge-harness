@@ -230,6 +230,7 @@ from pulse_guard import (
     heartbeat_check,
     independent_pulse_check,
     issue_marker_times,
+    issue_markers_any,
     merge_telegram_text,
     minutes_between,
     parse_time,
@@ -2491,6 +2492,171 @@ def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict
 # рипер сработает позже, ближе к стене, а не раньше отчёта.
 WORKER_STALL_MINUTES = 295
 
+# ── Признак тишины: seq сессии harness-<N> не растёт, не только возраст (#1085) ──
+# Возраст (WORKER_STALL_MINUTES выше) — единственный признак зависания сегодня,
+# и он же признаёт это честно (докстринг stalled_worker_run ниже): «отличить
+# зависший прогон от легитимно медленного, оставаясь ниже стены job'а,
+# невозможно» — потому что признак один. Воркер уже пишет построчный
+# транскрипт хода работы в сессию harness-<N> морды dsh-edge (#119,
+# scripts/lib/dsh-edge-session.sh) — той же ценой (drain каждые
+# DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS=30с, ~98% rows_written/rows_read DO уже
+# уходит на это по живому замеру 2026-09-13, docs/research/20-cloudflare-free.md).
+# Сессия, чей seq растёт, — жива, сколько бы прогон ни шёл; сессия, чей seq не
+# растёт WORKER_SILENCE_MINUTES подряд, — завис, независимо от возраста.
+#
+# Порог обоснован ТЕКУЩЕЙ (не устаревшей) арифметикой task.sh (#1067,
+# DSH_TIMEOUT_SECS=7200с=120 мин за попытку ОДНОГО провайдера — поднято с
+# 1200с/20 мин тем же инцидентом, что поднял WORKER_STALL_MINUTES до 295):
+# легитимный ОДИНОЧНЫЙ провайдер-попытка вправе не оставить ни одного видимого
+# события сессии весь свой таймаут (worst case — попытка виснет на сетевом
+# вызове до самого rc=124, ни одного tool/turn события до этого момента; живой
+# замер 14 успешных завершений GLM в шапке task.sh — от 700с до 8345с/139 мин
+# НА ЗАВЕРШЁННУЮ работу, не на тишину между событиями — прямых данных о
+# промежутках МЕЖДУ событиями сессии в этом репозитории нет: креденшлы
+# DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY недоступны вне GitHub Actions, замерить
+# живьём с рабочего места нечем). Честная граница: НЕ подтверждено, что смена
+# провайдера внутри цепочки (dsh_run_with_provider_chain, lib/dsh-ci.sh) сама
+# пишет в сессию видимый маркер немедленно по старту новой попытки (что
+# обнулило бы часы тишины раньше, чем истечёт вся попытка) — принята
+# консервативная (не оптимистичная) оценка: одна попытка МОЖЕТ легитимно
+# промолчать все 120 минут целиком.
+# WORKER_SILENCE_MINUTES = 150 = 120 (легитимный потолок ОДНОЙ попытки,
+# DSH_TIMEOUT_SECS/60) + 30 мин запаса — заметно выше единичного легитимного
+# максимума, заметно ниже возрастного потолка (295): в худшем случае снижает
+# цену зависания почти вдвое (295 → 150 мин), не убивая ни одну попытку,
+# уложившуюся в свой собственный таймаут. Не подтверждённый остаточный риск
+# (тот же класс, что уже принят у WORKER_STALL_MINUTES выше): ВТОРАЯ попытка
+# подряд, тоже молчащая все 120 минут БЕЗ маркера смены провайдера между ними,
+# читалась бы как непрерывная тишина ≥150 мин и была бы убита раньше своего
+# естественного финала — сценарий не отличим от истинного зависания текущими
+# данными, и если он живой, это факт для пересчёта порога, не повод считать
+# признак сломанным заранее.
+WORKER_SILENCE_MINUTES = 150
+
+# Маркер-носитель состояния «последний увиденный seq сессии по этому run_id»
+# между пульсами (#1085) — комментарий в WATCHDOG_ISSUE, тот же приём, что
+# WIP_GATE_*/AI_REVIEW_*/CONFLICT_* маркеры уже используют (планировщик не
+# хранит файлового состояния между запусками). Пишется ТОЛЬКО когда seq
+# реально вырос или когда маркера для этого run_id ещё не было вовсе —
+# застрявший прогон не плодит комментарий на каждый пульс (#1085 п.3,
+# «цена чтения»), только сравнение с уже существующей записью.
+WORKER_PROGRESS_MARKER_PREFIX = "[прогресс воркера: run "
+
+
+def _session_progress_tip(session_id: str) -> tuple[int | None, str | None]:
+    """Максимальный `seq` хвоста сессии `harness-<N>` в морде dsh-edge
+    (`session.history {sessionId, maxMessages:1}`, docs/research/
+    12-dsh-edge-session-api.md) — тот же транспорт (_morde_opener/
+    _morde_login/_morde_rpc), что archive_runner_sessions/append_session_notes
+    уже используют теми же креденшлами (DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY,
+    уже прокинуты в orchestra.yml) — ни нового секрета, ни нового провода.
+
+    Возвращает (seq, None) при успехе; (None, причина) при ЛЮБОЙ деградации —
+    конфигурации нет, логин не прошёл, сессии ещё нет (`session-not-found` —
+    воркер мог не дойти до dsh_edge_session_begin), события ещё не пришли,
+    сеть. Вызывающий обязан трактовать (None, причина) как «признак
+    недоступен», ни как «зависания нет», ни как «зависание есть» (AGENTS.md,
+    «алерт не гадает») — и падать обратно на возрастной порог
+    WORKER_STALL_MINUTES, называя деградацию, а не молча.
+
+    Решение строится на `seq` (простое целое, контракт подтверждён живым
+    продом дважды — `session.rename` → `{title, seq}` и ответ ingest →
+    `{appended, lastSeq}`), не на поле `time` сырого события: формат `time`
+    нигде в этом репозитории не подтверждён (`dsh_edge_ingest`,
+    scripts/lib/dsh-edge-session.sh, пересылает событию только `type`/`data`,
+    само поле не читает и не полагается на него)."""
+    if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
+        return None, "DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY не заданы"
+    try:
+        opener = _morde_opener()
+        _morde_login(opener)
+        value = _morde_rpc(opener, "session.history", {"sessionId": session_id, "maxMessages": 1})
+    except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
+        return None, str(error)
+    events = value.get("events") if isinstance(value, dict) else None
+    seqs = []
+    for item in (events or []):
+        event = item.get("event") if isinstance(item, dict) else None
+        seq = event.get("seq") if isinstance(event, dict) else None
+        if isinstance(seq, int):
+            seqs.append(seq)
+    if not seqs:
+        return None, "события сессии пока пусты"
+    return max(seqs), None
+
+
+def _worker_silence_reason(
+    repo: str, run_id: int, task_number: int, now: datetime,
+) -> tuple[str | None, str | None]:
+    """Признак тишины (#1085) для ОДНОГО прогона/задачи: сессия
+    `harness-<task_number>` не пишет новых событий WORKER_SILENCE_MINUTES
+    подряд. Возвращает (reason, observation):
+      - `reason` не None → прогон признан зависшим по тишине (текст для
+        комментария/действия вызывающего);
+      - `observation` не None → признак недоступен в этом пульсе (сеть,
+        логин, маркеры) — строка для отчёта, решение остаётся за возрастным
+        порогом (см. reap_stalled_worker_run).
+    Оба None — сессия жива (seq вырос либо это первое наблюдение за этим
+    run_id — базовая точка, сравнивать пока не с чем)."""
+    session_id = f"harness-{task_number}"
+    seq, error = _session_progress_tip(session_id)
+    if error is not None:
+        return None, (
+            f"⚠️ признак тишины сессии {session_id} недоступен ({error}) — "
+            "решение по прогону остаётся на возрастном пороге"
+        )
+    marker_prefix = f"{WORKER_PROGRESS_MARKER_PREFIX}{run_id} "
+    try:
+        markers = issue_markers_any(repo, WATCHDOG_ISSUE, (WORKER_PROGRESS_MARKER_PREFIX,), max_pages=3)
+    except RuntimeError as error:
+        return None, (
+            f"⚠️ маркеры прогресса воркера в #{WATCHDOG_ISSUE} не прочитаны ({error}) — "
+            "решение по прогону остаётся на возрастном пороге"
+        )
+    own = []
+    for ts, body in markers:
+        if not body.startswith(marker_prefix):
+            continue
+        match = re.search(r"seq=(\d+)\]", body)
+        if match is not None:
+            own.append((ts, int(match.group(1))))
+    if not own or seq > max(own, key=lambda pair: pair[0])[1]:
+        try:
+            post_issue_comment(repo, WATCHDOG_ISSUE, f"{marker_prefix}seq={seq}]")
+        except RuntimeError as error:
+            return None, f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} не оставлен: {error}"
+        return None, None
+    last_ts, _ = max(own, key=lambda pair: pair[0])
+    silence_minutes = minutes_between(last_ts, now)
+    if silence_minutes < WORKER_SILENCE_MINUTES:
+        return None, None
+    return (
+        f"сессия {session_id} не пишет новых событий {int(silence_minutes)} мин "
+        f"(seq={seq} без изменений, порог {WORKER_SILENCE_MINUTES} мин, тишина)",
+        None,
+    )
+
+
+def _stalled_run_task_number(
+    repo: str, pool: list[dict], pulls: list[dict], start: datetime,
+) -> int | None:
+    """Задача, арендованная прогоном, начавшимся в `start` — структурный
+    признак (событие timeline `assigned` не старше `start`, тот же приём, что
+    reap_stale уже применяет), вынесенный из reap_stalled_worker_run (#1085):
+    и возрастному, и тишинному признаку нужен один и тот же номер задачи (для
+    session_id=harness-<N> и для последующего release), второй независимый
+    обход pool не заводим."""
+    for issue in pool:
+        if not issue["assignees"] or _issue_is_blocked(issue):
+            continue
+        number = issue["number"]
+        if any(pr_references_issue(pull, number) for pull in pulls):
+            continue
+        last = last_assigned_at(repo, number)
+        if last is not None and last >= start:
+            return number
+    return None
+
 
 def _run_age_minutes(run: dict, now: datetime) -> float | None:
     """Возраст прогона в минутах от `run_started_at` (когда GitHub его знает)
@@ -2514,6 +2680,18 @@ def _run_is_stalled(run: dict, now: datetime,
     return age is not None and age >= threshold_minutes
 
 
+def _active_worker_run(repo: str) -> dict | None:
+    """Прогон worker.yml, который GitHub числит `in_progress`, — сырой снимок
+    без учёта возраста (#1085): вынесен из stalled_worker_run, чтобы и
+    возрастному, и тишинному признаку (reap_stalled_worker_run) хватало
+    ОДНОГО сетевого вызова, не двух независимых обходов одного эндпоинта."""
+    payload = gh(
+        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=in_progress&per_page=1"
+    ) or {}
+    runs = payload.get("workflow_runs") or []
+    return runs[0] if runs else None
+
+
 def stalled_worker_run(repo: str, now: datetime) -> dict | None:
     """Прогон worker.yml, который GitHub всё ещё числит `in_progress`, но
     который идёт дольше WORKER_STALL_MINUTES — выше арифметического максимума
@@ -2524,19 +2702,18 @@ def stalled_worker_run(repo: str, now: datetime) -> dict | None:
     не получает эти секреты/vars в своём окружении — добавление живого
     сетевого вызова в этот гейт (используется несколькими диспетчерами за
     пульс, см. вызовы ниже) вне рамок этого фикса, отдельное решение
-    владельца. Деградация честная и единственный сигнал сегодня —
-    длительность `in_progress`, признак грубее heartbeat (не отличает
-    «завис» от «просто редкая долгая легитимная работа за порогом»), но не
-    молчит: сообщение действия ниже (main()) прямо называет длительность и
-    порог, а не гадает."""
-    payload = gh(
-        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=in_progress&per_page=1"
-    ) or {}
-    runs = payload.get("workflow_runs") or []
-    if not runs:
-        return None
-    run = runs[0]
-    return run if _run_is_stalled(run, now) else None
+    владельца. Деградация честная и единственный сигнал здесь (возраст) —
+    признак грубее heartbeat (не отличает «завис» от «просто редкая долгая
+    легитимная работа за порогом»), но не молчит: сообщение действия ниже
+    (main()) прямо называет длительность и порог, а не гадает. Более быстрый
+    (и точнее отличающий «завис» от «медленный») нож — тишина сессии
+    harness-<N>, см. WORKER_SILENCE_MINUTES/_worker_silence_reason выше и
+    reap_stalled_worker_run ниже — не подключён СЮДА (worker_runs_active
+    читается тремя диспетчерами за пульс, см. её докстринг): решение «блокирует
+    ли прогон новый диспатч» остаётся чисто возрастным, тишина — отдельный,
+    более дешёвый путь РИПА (отмена+релиз), не путь блокировки диспатча."""
+    run = _active_worker_run(repo)
+    return run if run is not None and _run_is_stalled(run, now) else None
 
 
 def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
@@ -2570,46 +2747,74 @@ def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
 def reap_stalled_worker_run(
     repo: str, now: datetime, pool: list[dict], pulls: list[dict],
 ) -> tuple[list[str], list[str]]:
-    """Разряжает находку stalled_worker_run (#815): отменяет зависший прогон
-    (best-effort — сам гейт worker_runs_active уже не блокирует диспатч
-    независимо от исхода отмены) и освобождает его задачу СРАЗУ, не дожидаясь
-    обычных 24ч reap_stale/claim_task.collect_stale — иначе задача осталась бы
-    занятой почти сутки после того, как сам факт зависания уже установлен.
+    """Разряжает находку stalled_worker_run (#815) — теперь ДВУМЯ признаками
+    (#1085), не только возрастом: отменяет зависший прогон (best-effort — сам
+    гейт worker_runs_active уже не блокирует диспатч независимо от исхода
+    отмены) и освобождает его задачу СРАЗУ, не дожидаясь обычных 24ч
+    reap_stale/claim_task.collect_stale — иначе задача осталась бы занятой
+    почти сутки после того, как сам факт зависания уже установлен.
 
-    Задача, арендованная зависшим прогоном, определяется структурным
-    признаком (не парсингом прозы, класс которого запрещён AGENTS.md): среди
-    открытых незаблокированных назначенных задач без открытого PR (тот же
-    критерий, что уже применяет reap_stale) берётся та, чьё событие timeline
-    `assigned` не старше момента старта прогона — task.sh берёт аренду в
-    первые секунды job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы.
-    Совпадений может не быть (адресный прогон на задачу с уже открытым PR —
-    её reap_stale не тронул бы; либо аренда не найдена вовсе) — тогда отмена
-    прогона всё равно происходит, задача остаётся на обычном пути."""
+    Два независимых ножа, оба ведут к одному действию (отмена+релиз):
+      1. Возраст (WORKER_STALL_MINUTES) — прежний, честный, но медленный
+         потолок: не отличает «завис» от «редкая легитимная долгая работа»,
+         только гарантирует остановку ДО стены job'а.
+      2. Тишина сессии harness-<N> (WORKER_SILENCE_MINUTES, заметно ниже) —
+         быстрее и точнее: растущий seq — прогон жив сколько угодно долго,
+         неизменный seq WORKER_SILENCE_MINUTES подряд — завис независимо от
+         возраста. Проверяется ТОЛЬКО когда прогон уже старше
+         WORKER_SILENCE_MINUTES (моложе — тишина такой длины физически
+         невозможна, сетевой RPC и обход pool не нужны вовсе) и ТОЛЬКО когда
+         возрастной нож ещё не сработал сам (он дешевле — уже полученный
+         `run`, ни одного дополнительного вызова). Отказ признака тишины
+         (морда недоступна, конфигурации нет, маркеры не читаются) —
+         честная деградация: наблюдение в отчёте, решение остаётся на
+         возрастном пороге (AGENTS.md, «алерт не гадает»), не «завис»/не
+         «жив» вслепую.
+
+    Задача, арендованная прогоном, определяется структурным признаком (не
+    парсингом прозы, класс которого запрещён AGENTS.md): среди открытых
+    незаблокированных назначенных задач без открытого PR (тот же критерий,
+    что уже применяет reap_stale) берётся та, чьё событие timeline `assigned`
+    не старше момента старта прогона — task.sh берёт аренду в первые секунды
+    job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы (_stalled_run_
+    task_number, общая для обоих ножей — сессии harness-<N> нужен тот же
+    номер, что и релизу). Совпадений может не быть (адресный прогон на
+    задачу с уже открытым PR — её reap_stale не тронул бы; либо аренда не
+    найдена вовсе) — тогда отмена прогона всё равно происходит (по
+    возрастному ножу), задача остаётся на обычном пути; по тишинному ножу
+    без task_number сессию проверить нечем — решение остаётся на
+    возрастном пороге."""
     observations: list[str] = []
     actions: list[str] = []
-    run = stalled_worker_run(repo, now)
+    run = _active_worker_run(repo)
     if run is None:
         return observations, actions
     run_id = run["id"]
     started = run.get("run_started_at") or run.get("created_at")
     start = parse_time(started)
     age_minutes = minutes_between(start, now)
+
+    reason = (
+        f"{int(age_minutes)} мин без завершения, возраст, порог {WORKER_STALL_MINUTES} мин"
+        if _run_is_stalled(run, now) else None
+    )
+    task_number = None
+    if reason is not None or age_minutes >= WORKER_SILENCE_MINUTES:
+        task_number = _stalled_run_task_number(repo, pool, pulls, start)
+    if reason is None and task_number is not None:
+        silence_reason, observation = _worker_silence_reason(repo, run_id, task_number, now)
+        if observation is not None:
+            observations.append(observation)
+        if silence_reason is not None:
+            reason = silence_reason
+    if reason is None:
+        return observations, actions
+
     try:
         gh("-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
         cancel_note = "отменён"
     except RuntimeError as error:
         cancel_note = f"отменить не удалось: {error}"
-    task_number = None
-    for issue in pool:
-        if not issue["assignees"] or _issue_is_blocked(issue):
-            continue
-        number = issue["number"]
-        if any(pr_references_issue(pull, number) for pull in pulls):
-            continue
-        last = last_assigned_at(repo, number)
-        if last is not None and last >= start:
-            task_number = number
-            break
     if task_number is not None:
         release_note = claim_task.release_full(repo, task_number)
         pool_issue = next((i for i in pool if i["number"] == task_number), None)
@@ -2619,26 +2824,23 @@ def reap_stalled_worker_run(
             gh(
                 "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
                 "-f", "body=" + (
-                    f"♻️ Прогон worker.yml (run {run_id}) завис {int(age_minutes)} мин "
-                    f"без завершения (порог {WORKER_STALL_MINUTES} мин) — оркестратор счёл его "
+                    f"♻️ Прогон worker.yml (run {run_id}) завис ({reason}) — оркестратор счёл его "
                     f"зависшим, отменил ({cancel_note}) и снял аренду ({release_note}). Задача "
                     "возвращена в пул: python3 scripts/lib/claim_task.py claim "
-                    f"{task_number} (#121, #815)."
+                    f"{task_number} (#121, #815, #1085)."
                 ),
             )
         except RuntimeError as error:
             print(f"::warning::след о снятии аренды #{task_number} не оставлен: {error}",
                   file=sys.stderr)
         actions.append(
-            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
-            f"{WORKER_STALL_MINUTES}) — {cancel_note}; задача #{task_number} освобождена "
-            f"({release_note})"
+            f"🧟 worker run {run_id} завис ({reason}) — {cancel_note}; задача #{task_number} "
+            f"освобождена ({release_note})"
         )
     else:
         actions.append(
-            f"🧟 worker run {run_id} завис ({int(age_minutes)} мин, порог "
-            f"{WORKER_STALL_MINUTES}) — {cancel_note}; арендованная им задача не определена "
-            "(см. лог прогона вручную)"
+            f"🧟 worker run {run_id} завис ({reason}) — {cancel_note}; арендованная им задача "
+            "не определена (см. лог прогона вручную)"
         )
     return observations, actions
 
