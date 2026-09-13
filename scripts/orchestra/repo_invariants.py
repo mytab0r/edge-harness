@@ -335,6 +335,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import re
@@ -2573,6 +2574,23 @@ def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) ->
     return escalate(repo, WATCHDOG_ISSUE, f"{marker}\n{text}")
 
 
+def pipeline_status_marker_key(violations: list[dict]) -> str:
+    """Компактный дедуп-ключ эскалации инварианта 18: хэш сортированного
+    множества id нарушителей. Полный перечень id в маркере (первая версия)
+    умирал о Telegram-плечо: лимит Bot API — 4096 символов на сообщение,
+    нарезки длинных текстов в send_telegram нет, переполнение — «НЕ
+    доставлен» при зелёном прогоне (блокирующая находка ревью PR #1102,
+    третий раунд: при 174 нарушителях текст уже 2569 символов, темп
+    писателя ~25/сутки — лимит через дни). Хэш ловит ЛЮБОЕ изменение
+    состава (новая подделка, правка старого комментария под маркер),
+    «новый ключ = новая эскалация» сохраняется; множество физически может
+    только расти (правило репозитория запрещает удалять комментарии).
+    Полный перечень id остаётся в строке отчёта build_report, туда ему и
+    место; тело эскалации ограничено счётчиком и последним нарушителем."""
+    ids = ",".join(str(i) for i in sorted(v["id"] for v in violations))
+    return hashlib.sha1(ids.encode("utf-8")).hexdigest()[:16]
+
+
 def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
     lines = []
     if findings.get(1):
@@ -2658,12 +2676,12 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
     if findings.get(18):
         v18 = findings[18]
         latest = v18[-1]  # check_* возвращает список, отсортированный по created_at
-        # key — множество id нарушителей (escalate_if_new дедуплицирует по
-        # нему): вечный долг из 174 даёт одну эскалацию, каждая новая
-        # подделка меняет множество и даёт новую — ровно сигнал, ради которого
-        # инвариант заведён (#1101). id-комментария неизменяем, множество
-        # может только расти (правило запрещает удалять комментарии).
-        key = ",".join(str(i["id"]) for i in v18)
+        # key — компактный дедуп-ключ по множеству id нарушителей
+        # (pipeline_status_marker_key): вечный долг даёт одну эскалацию,
+        # каждая новая подделка меняет множество и даёт новую — ровно
+        # сигнал, ради которого инвариант заведён (#1101). Полный перечень
+        # id в ключ не попадает (лимит Telegram 4096, см. докстринг ключа).
+        key = pipeline_status_marker_key(v18)
         text = (
             "🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 "
             "опубликован НЕ токеном job'а — performed_via_github_app=null, "

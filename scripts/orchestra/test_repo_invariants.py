@@ -2959,10 +2959,14 @@ def test_run_escalations_invariant_18_dedupes_by_id_set(monkeypatch):
     набор — новая эскалация, и её текст несёт факты (счётчик, последний по
     времени, различение по токену), а не гадание, кто писатель."""
     calls = []
+    markers_seen = []
 
     def fake_issue_marker_times(repo, issue, marker):
-        # Точный маркер уже эскалированного состояния — ключ это множество id.
-        return [utc(2026, 9, 13, 0, 0)] if marker == "[инвариант 18: 5650994043]" else []
+        markers_seen.append(marker)
+        # Точный маркер уже эскалированного состояния — ключ это хэш
+        # множества id (ri.pipeline_status_marker_key — то же место правды).
+        expected = f"[инвариант 18: {ri.pipeline_status_marker_key([known])}]"
+        return [utc(2026, 9, 13, 0, 0)] if marker == expected else []
 
     def fake_escalate(repo, issue, text):
         calls.append((issue, text))
@@ -2993,3 +2997,43 @@ def test_run_escalations_invariant_18_dedupes_by_id_set(monkeypatch):
     assert "performed_via_github_app" in text  # признак — токен, не логин
     assert "не подтверждено" in text  # алерт не гадает: авторство не установлено
     assert any("📣 инвариант 18 эскалирован" in line for line in lines)
+
+
+def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
+    """Гвардия класса «вход, растущий со временем» (блокирующая находка
+    ревью PR #1102, третий раунд): полный перечень id в дедуп-ключе умирал о
+    лимит Bot API 4096 символов (при 174 нарушителях текст уже 2569
+    символов, темп писателя ~25/сутки). Ключ — хэш множества: даже при 500
+    нарушителях маркер остаётся коротким, а смена состава (новая подделка)
+    всё ещё даёт НОВЫЙ ключ."""
+    seen_markers = []
+
+    def fake_issue_marker_times(repo, issue, marker):
+        seen_markers.append(marker)
+        return []
+
+    sent = []
+
+    def fake_escalate(repo, issue, text):
+        sent.append((repo, issue, text))
+        return "отправлено"
+
+    monkeypatch.setattr(ri, "issue_marker_times", fake_issue_marker_times)
+    monkeypatch.setattr(ri, "escalate", fake_escalate)
+
+    base = {
+        "created_at": "2026-09-13T03:53:03Z",
+        "login": "mytab0r",
+        "user_type": "User",
+        "url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-x",
+    }
+    many = [{**base, "id": 5560000000 + n} for n in range(500)]
+    ri.run_escalations("mytab0r/edge-harness", {18: many})
+    assert len(seen_markers) == 1
+    assert seen_markers[0].startswith("[инвариант 18: ")
+    assert len(seen_markers[0]) < 80  # при 174 id старый ключ был ~2000 символов
+
+    many_plus_one = many + [{**base, "id": 9999999999, "created_at": "2026-09-14T00:00:00Z"}]
+    ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
+    assert len(seen_markers) == 2
+    assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
