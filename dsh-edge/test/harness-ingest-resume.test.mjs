@@ -154,10 +154,12 @@ const WIRING_OK = [
   '    for (const stale of plan.evicted) { if (stale === plan.staleForId) continue; void releaseStale(stale) }',
   '    if (plan.staleForId !== undefined) await releaseStale(plan.staleForId)',
   '    let entry = plan.entry',
+  '    if (entry !== undefined && entry.inFlight) { throw new EdgeSessionStoreError("BUSY", "busy") }',
   '    if (entry === undefined) {',
-  '      entry = { handle: await this.openAgentForTurn(id), baseTurn: 0, lastUsedMs: 0 }',
+  '      entry = { handle: await this.openAgentForTurn(id), baseTurn: 0, lastUsedMs: 0, inFlight: false }',
   '      this.harnessIngestHandles.set(id, entry)',
   '    }',
+  '    entry.inFlight = true',
   '    try {',
   '      entry.baseTurn = advanceHarnessIngestBaseTurn(entry.baseTurn, turnsWritten)',
   '      await sessions.flush(session)',
@@ -217,6 +219,18 @@ test('МУТАЦИЯ: сбой между append и flush не выселяет 
     WIRING_OK.filter(l => !l.includes('harnessIngestHandles.delete(id)')),
   )
   assert.throws(() => assertHarnessIngestWiring(withoutEviction), /harnessIngestHandles\.delete\(id\)/)
+})
+
+test('МУТАЦИЯ: in-flight-охрана выкинута целиком (и проверка, и выставление) — гвардия красная (блокер 1, ревью PR #1057, третий раунд)', () => {
+  const withoutInFlight = fakePatchWithMethod(WIRING_OK.filter(l => !l.includes('entry.inFlight')))
+  assert.throws(() => assertHarnessIngestWiring(withoutInFlight), /entry\.inFlight/)
+})
+
+test('МУТАЦИЯ: ТОЛЬКО проверка in-flight выкинута, entry.inFlight = true осталась — гвардия красная (живая находка: снятие только throw-ветки не ловится проверкой на голое вхождение подстроки)', () => {
+  const withoutCheckOnly = fakePatchWithMethod(
+    WIRING_OK.filter(l => !l.includes('entry !== undefined && entry.inFlight')),
+  )
+  assert.throws(() => assertHarnessIngestWiring(withoutCheckOnly), /проверен ПЕРЕД использованием/)
 })
 
 test('planHarnessIngestResume возвращает staleForId — вытесненная из-под этого id запись помечена для await-dispose', () => {

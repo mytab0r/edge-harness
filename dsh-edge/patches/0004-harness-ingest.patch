@@ -139,7 +139,7 @@ diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-stor
 index 516b977..7ca355c 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -22,7 +22,7 @@ import type {
+@@ -22,7 +22,7 @@
    ImageAttachmentRef,
  } from '@deepseek-ai/dsh-attachment'
  import { credentialRef, type CredentialInfo } from '@deepseek-ai/dsh-credentials'
@@ -148,7 +148,7 @@ index 516b977..7ca355c 100644
  import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
  import MessageFeedbackService from '@deepseek-ai/dsh-message-feedback'
  import {
-@@ -200,7 +200,18 @@ export type EdgeAgentPromptAdmitter = (input: EdgeAgentPromptAdmission) => Promi
+@@ -200,7 +200,18 @@
  
  export class EdgeSessionStoreError extends Error {
    constructor(
@@ -168,7 +168,7 @@ index 516b977..7ca355c 100644
      message: string,
    ) {
      super(message)
-@@ -260,6 +271,10 @@ export class EdgeSessionStore {
+@@ -260,6 +271,10 @@
    private readonly modelSelections: EdgeModelSelectionBridge
    private readonly turnPublishedAgents = new WeakSet<Agent>()
    private readonly ready: Promise<void>
@@ -179,7 +179,7 @@ index 516b977..7ca355c 100644
  
    constructor(
      storage: DurableObjectStorage,
-@@ -1360,6 +1375,134 @@ export class EdgeSessionStore {
+@@ -1360,6 +1375,153 @@
      }
    }
  
@@ -240,6 +240,22 @@ index 516b977..7ca355c 100644
 +    }
 +    if (plan.staleForId !== undefined) await releaseStale(plan.staleForId)
 +    let entry = plan.entry
++    // #1049 (ревью PR #1057, третий раунд, блокер 1): the warm-handle reuse
++    // path below skips openAgentForTurn entirely for a repeat batch on the
++    // same session, so the natural BUSY that agents.resume() used to throw
++    // for a concurrent second call never fires on this path anymore — both
++    // calls would otherwise read the same entry.baseTurn, append past each
++    // other's turn numbers, and race sessions.flush(session) on the same
++    // in-memory session. Explicit in-flight guard restores the pre-#1049
++    // serialization (second concurrent call gets BUSY, same as a concurrent
++    // native resume always did) instead of silently corrupting the stored
++    // log.
++    if (entry !== undefined && entry.inFlight) {
++      throw new EdgeSessionStoreError(
++        'BUSY',
++        'Harness ingest is already in flight for this session.',
++      )
++    }
 +    if (entry === undefined) {
 +      // #572 (PATCHES.md, patch 0004): the second argument is the deployment's
 +      // real default model, not the stale upstream literal DEFAULT_EDGE_MODEL —
@@ -267,9 +283,10 @@ index 516b977..7ca355c 100644
 +        const turn = (event.data as { turn?: unknown }).turn
 +        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
 +      }
-+      entry = { handle, baseTurn, lastUsedMs: Date.now() }
++      entry = { handle, baseTurn, lastUsedMs: Date.now(), inFlight: false }
 +      this.harnessIngestHandles.set(id, entry)
 +    }
++    entry.inFlight = true
 +    entry.lastUsedMs = Date.now()
 +    const session = entry.handle.agent.session
 +    const batchBaseTurn = entry.baseTurn
@@ -293,6 +310,7 @@ index 516b977..7ca355c 100644
 +      }
 +      entry.baseTurn = advanceHarnessIngestBaseTurn(batchBaseTurn, turnsWritten)
 +      await sessions.flush(session)
++      entry.inFlight = false
 +      return { appended, lastSeq: session.seq - 1 }
 +    } catch (error) {
 +      // #1049 (ревью PR #1057, второй раунд): pre-#1049 code disposed the
@@ -305,6 +323,7 @@ index 516b977..7ca355c 100644
 +      // same batch (dsh_edge_drain_spool: cursor only advances on an ACCEPTED
 +      // batch) replays it into the same in-memory session a second time, and
 +      // the next successful flush persists both copies silently.
++      entry.inFlight = false
 +      if (this.harnessIngestHandles.get(id) === entry) this.harnessIngestHandles.delete(id)
 +      await releaseStale(entry)
 +      throw error
@@ -314,7 +333,7 @@ index 516b977..7ca355c 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1599,6 +1742,179 @@ export class EdgeSessionStore {
+@@ -1599,6 +1761,184 @@
    }
  }
  
@@ -324,6 +343,11 @@ index 516b977..7ca355c 100644
 +  /** Highest turn number written into the stored log so far by ingest. */
 +  baseTurn: number
 +  lastUsedMs: number
++  /** True while a batch is being appended/flushed for this entry (#1049,
++   *  ревью PR #1057, третий раунд, блокер 1) — a concurrent second call for
++   *  the same session while this is true gets BUSY instead of silently
++   *  reusing the same entry.baseTurn and racing sessions.flush(session). */
++  inFlight: boolean
 +}
 +/** Idle window before a warm ingest handle is released (#1049): comfortably
 + *  above the runner drain interval (30s, #1048) so a normally-active job never

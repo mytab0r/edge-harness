@@ -140,6 +140,8 @@ export function assertHarnessIngestWiring(patch = readFileSync(patchPath, 'utf8'
     [`entry.baseTurn = advanceHarnessIngestBaseTurn(`, 'baseTurn двинут инкрементально (advanceHarnessIngestBaseTurn), а не пересканирован по истории'],
     [`await releaseStale(plan.staleForId)`, 'вытесненная запись ТЕКУЩЕЙ сессии диспоузится ДО холодного ресума (await releaseStale(plan.staleForId)) — иначе reopen того же id может получить BUSY на цикл (ревью PR #1057, чеклист)'],
     [`this.harnessIngestHandles.delete(id)`, 'сбой между append и flush выселяет тёплый хэндл из кэша (catch { … harnessIngestHandles.delete(id) }) — иначе ретрай дрена того же батча дописывает его в ту же in-memory сессию второй раз, и следующий успешный flush персистит обе копии (ревью PR #1057, второй раунд, блокер 2)'],
+    [`entry !== undefined && entry.inFlight`, 'in-flight-охрана против конкурентного вызова той же сессии на тёплом пути (entry.inFlight проверен ПЕРЕД использованием, не только выставлен) — без неё второй параллельный ingest той же сессии переиспользует тот же entry.baseTurn и гонит sessions.flush(session) параллельно с первым, вместо честного BUSY (ревью PR #1057, третий раунд, блокер 1)'],
+    [`entry.inFlight = true`, 'entry.inFlight выставлен перед использованием тёплого/свежесозданного хэндла — иначе следующий параллельный вызов не увидит занятость (ревью PR #1057, третий раунд, блокер 1)'],
   ]
   for (const [needle, message] of requirements) {
     if (!body.includes(needle)) {
