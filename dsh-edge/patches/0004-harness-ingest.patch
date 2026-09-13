@@ -172,7 +172,7 @@ index cfff36a..be11683 100644
      message: string,
    ) {
      super(message)
-@@ -1265,6 +1276,117 @@ export class EdgeSessionStore {
+@@ -1265,6 +1276,131 @@ export class EdgeSessionStore {
      }
    }
  
@@ -257,40 +257,54 @@ index cfff36a..be11683 100644
 +        `Harness ingest could not open the target session (agent bootstrap failed): ${detail}`,
 +      )
 +    }
-+    try {
-+      const session = handle.agent.session
-+      let baseTurn = 0
-+      for (const event of session.snapshotEvents()) {
-+        const turn = (event.data as { turn?: unknown }).turn
-+        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
-+      }
-+      let appended = 0
-+      for (const raw of events) {
-+        const normalized = normalizeHarnessIngestEvent(raw, baseTurn)
-+        // Runtime-dynamic event type: the generic append overload cannot express
-+        // it, so the call site carries the narrow cast (opts only for surface).
-+        // bind() обязателен: append читает приватное состояние сессии через this.
-+        const append = session.append.bind(session) as unknown as (
-+          type: string,
-+          data: unknown,
-+          opts?: { surfaceOp: 'append' },
-+        ) => SessionEvent
-+        append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
-+        appended += 1
-+      }
-+      await sessions.flush(session)
-+      return { appended, lastSeq: session.seq - 1 }
-+    } finally {
-+      await handle.dispose().catch((disposeError: unknown) => {
-+        console.error('dsh-edge failed to release the ingested session.', disposeError)
-+      })
++    const session = handle.agent.session
++    // #1163: dsh-edge 0.14.0 rebuilt agent lifetime around a resident cache
++    // (docs/research/11-dsh-edge.md, "resident agents": `residentAgents: Map<
++    // SessionId, AgentHandle>`, upstream docstring "The agent stays alive
++    // across turns in idle phase; only session deletion or DO shutdown
++    // disposes it"). `openAgentForTurn` is now only a `@deprecated` alias for
++    // `getOrResumeAgent`, which hands back that SAME cached handle on every
++    // call for a given sessionId (`cached !== undefined -> return cached`).
++    // Disposing the handle here on every batch, as this patch did before
++    // 0.14.0, does not remove it from that cache — only the upstream
++    // `disposeResidentAgent(id)` does — so it left a dead resident behind for
++    // the NEXT call on this sessionId to receive from cache. That is exactly
++    // what broke the first source-build deploy on the 0.14.0 pin: ingest batch
++    // 1 opens and uses a fresh resident fine, batch 2 gets the same handle
++    // back already disposed by batch 1's own `finally` and fails immediately
++    // (not after any idle delay) using it. Upstream's own renameSession/
++    // dispatchDueSchedules already stopped disposing after use for the same
++    // reason (research/11) — this patch now matches that instead of fighting
++    // it, which also removes the O(full stored log) cold-resume cost #1049
++    // was written against (upstream's own resident cache now pays that at
++    // most once per session per DO activation, not once per ingest call).
++    let baseTurn = 0
++    for (const event of session.snapshotEvents()) {
++      const turn = (event.data as { turn?: unknown }).turn
++      if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
 +    }
++    let appended = 0
++    for (const raw of events) {
++      const normalized = normalizeHarnessIngestEvent(raw, baseTurn)
++      // Runtime-dynamic event type: the generic append overload cannot express
++      // it, so the call site carries the narrow cast (opts only for surface).
++      // bind() обязателен: append читает приватное состояние сессии через this.
++      const append = session.append.bind(session) as unknown as (
++        type: string,
++        data: unknown,
++        opts?: { surfaceOp: 'append' },
++      ) => SessionEvent
++      append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
++      appended += 1
++    }
++    await sessions.flush(session)
++    return { appended, lastSeq: session.seq - 1 }
 +  }
 +
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1618,107 @@ export class EdgeSessionStore {
+@@ -1496,6 +1632,107 @@ export class EdgeSessionStore {
    }
  }
  
