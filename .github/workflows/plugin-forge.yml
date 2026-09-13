@@ -608,6 +608,19 @@ jobs:
           git fetch -q --depth 1 origin "$SHA"
           git checkout -q FETCH_HEAD
 
+          # Зависимости standalone — ДО патчей (находка ревью PR #1088):
+          # патч 0006-standalone-react-dom-pin.patch (dsh-edge/patches) добавляет
+          # `overrides:` в pnpm-workspace.yaml, которого committed
+          # pnpm-lock.yaml апстрима не знает — `--frozen-lockfile` ПОСЛЕ
+          # применения патчей отказывал бы ERR_PNPM_LOCKFILE_CONFIG_MISMATCH
+          # («overrides» не совпадает с записью в lockfile) до всякой сети,
+          # детерминированно на каждом релизном прогоне форжа. Здесь этот шаг
+          # по-прежнему валидирует НЕТРОНУТЫЙ committed lockfile апстрима
+          # (тот же смысл, что и раньше — поймать дрейф самого lockfile'а);
+          # `pnpm add` ниже (не frozen) перерезолвит уже с overrides из
+          # патча, когда они появятся.
+          pnpm --dir apps/dsh-edge/standalone install --frozen-lockfile
+
           # Патчи. Гвардия на пустую серию — то же место правды о поведении,
           # что и deploy-dsh-edge.yml, шаг «Патч-серия»: без неё опустевшая
           # серия молча даёт tarball, собранный и опубликованный против
@@ -618,9 +631,6 @@ jobs:
           for p in "${patches[@]}"; do
             git apply --whitespace=nowarn "$p" || { echo "::error::Патч не применился: $p"; exit 1; }
           done
-
-          # Зависимости standalone
-          pnpm --dir apps/dsh-edge/standalone install --frozen-lockfile
 
           # Остальные плагины манифеста (кроме бампимого — для него уже есть
           # свежий tarball из шага «Собрать tarball»). Кодогенерация эмитит
@@ -655,6 +665,14 @@ jobs:
           # без неё дым проходит зелёным на уже запатченных node_modules от
           # --frozen-lockfile, пока прод соберёт другой состав).
           grep -q "patchedDependencies" apps/dsh-edge/standalone/pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
+
+          # Гвардия консистентности peer-зависимостей (#1041/#1087) — тот же
+          # риск, что и в deploy-dsh-edge.yml/dsh-edge-pr-smoke.yml: этот шаг
+          # ставит плагины тем же способом (`pnpm add`, не frozen) и одинаково
+          # рискует несовместимой MAJOR-парой peer'а (находка ревью PR #1088:
+          # forge — третий потребитель патч-серии, без гвардии оставался
+          # непроверенным).
+          node "$GITHUB_WORKSPACE/dsh-edge/verify-peer-consistency.mjs" "$GITHUB_WORKSPACE/forge-clone"
 
           # Кодогенерация
           node "$GITHUB_WORKSPACE/dsh-edge/codegen-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
