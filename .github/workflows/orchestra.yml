@@ -198,3 +198,23 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: python scripts/orchestra/health_audit.py run
+
+      # Дайджест мягких отказов (#1121): деградация, оформленная как штатная
+      # работа (::warning:: в зелёном прогоне, best-effort continue-on-error,
+      # редкий условный шаг), не видна ничем месяцами — эталон #1097
+      # (NO_ADAPTER на КАЖДОМ прогоне worker.yml полтора месяца при зелёной
+      # системе). Гейт внутри самого скрипта (digest_due, DIGEST_INTERVAL_HOURS)
+      # — полный скан не на каждый тик оркестратора, а раз в несколько часов
+      # (см. докстринг scripts/orchestra/soft_failure_digest.py, «Стоимость по
+      # API»); на тиках без полного скана — один дешёвый вызов и выход.
+      # continue-on-error — тот же приём, что у гвардий выше: находка видна в
+      # step summary (fail loud), но не гасит зелёный статус job'а, который
+      # читает пульс (heartbeat_check, #120).
+      - name: Дайджест мягких отказов (#1121)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/soft_failure_digest.py
