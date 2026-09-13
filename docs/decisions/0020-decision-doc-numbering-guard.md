@@ -98,7 +98,7 @@ int-константы в одном файле, не каталог прону�
 - Задача #1078 (этот ADR).
 - `scripts/lib/decision_numbering.py`, `scripts/lib/test_decision_numbering.py`,
   `scripts/ci/guards/decision-doc-numbering-guard.sh`.
-- `openspec/changes/decision-doc-numbering-guard/` (proposal/design/tasks).
+- `openspec/changes/archive/decision-doc-numbering-guard/` (proposal/design/tasks).
 - Живой третий случай коллизии (PR #944 vs main, номер 0017) — найден этим механизмом,
   не зафиксирован отдельной задачей этим PR: чинит сам PR #944 (не в объёме #1078, разные
   авторы веток).
