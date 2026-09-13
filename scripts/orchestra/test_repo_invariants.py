@@ -2134,7 +2134,10 @@ def test_phantom_pause_flags_active_marker_with_zero_real_failures(monkeypatch):
         "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_conveyor_gate_phantom_pause(REPO)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    violations = result.violations
     assert len(violations) == 1
     assert violations[0]["failures"] == 0
     assert violations[0]["threshold"] == ri.pulse_guard.WORKER_FAILURE_PAUSE_AFTER
@@ -2151,7 +2154,8 @@ def test_phantom_pause_silent_when_no_marker(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
 def test_phantom_pause_silent_when_real_failures_meet_threshold(monkeypatch):
@@ -2166,12 +2170,15 @@ def test_phantom_pause_silent_when_real_failures_meet_threshold(monkeypatch):
         "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
 def test_phantom_pause_silent_when_head_run_still_in_progress(monkeypatch):
     """Здоровое состояние (issue #899, п.2): голова списка ещё выполняется
-    (conclusion=None) — законное объяснение неопределённости, не фантом."""
+    (conclusion=None), но моложе scheduler.WORKER_STALL_MINUTES — законное
+    объяснение неопределённости, не фантом (issue #1096: старше порога это
+    уже НЕ ok(), см. следующий тест)."""
     fake = FakeGh({
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
             worker_run(4, "2026-09-10T11:55:00Z", conclusion=None),
@@ -2184,7 +2191,36 @@ def test_phantom_pause_silent_when_head_run_still_in_progress(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)  # +5 мин от создания головы — далеко внутри WORKER_STALL_MINUTES
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
+
+
+def test_phantom_pause_unknown_when_head_run_stalled_past_threshold(monkeypatch):
+    """issue #1096, F1 (живой замер: голова списка не завершена ≈63%
+    календарного времени — «прогон ещё идёт» это ОБЫЧНОЕ состояние, а не
+    редкий край). Та же фикстура, что у предыдущего теста, но `now` дальше
+    scheduler.WORKER_STALL_MINUTES (295 мин) от создания головы — «прогон
+    ещё идёт» перестаёт быть правдоподобным объяснением, но подряд-провалы
+    после якоря пересчитать всё равно нельзя, пока эта голова висит:
+    check_result.unknown(), НЕ check_result.ok() (раньше — тихий [])."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-10T11:55:00Z", conclusion=None),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            pause_marker_comment("2026-09-10T11:45:00Z"),
+            probe_marker_comment("2026-09-10T11:55:00Z", 1),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.scheduler.WORKER_STALL_MINUTES == 295
+    now = utc(2026, 9, 10, 17, 0)  # +305 мин от создания головы — за порогом
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "305" in result.reason
+    assert "WORKER_STALL_MINUTES" in result.reason
 
 
 def test_phantom_pause_completion_time_anchor_clears_stale_marker(monkeypatch):
@@ -2204,18 +2240,22 @@ def test_phantom_pause_completion_time_anchor_clears_stale_marker(monkeypatch):
         "issues/120/comments": [probe_marker_comment("2026-09-10T17:09:00Z", 4)],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 19, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
-def test_phantom_pause_best_effort_on_network_failure(monkeypatch):
-    """Сеть недоступна — best-effort [] (тот же принцип, что у 10/12): отказ
-    инфраструктуры не должен ронять весь build_report ради инварианта, у
-    которого и так нет действия жёстче наблюдения."""
+def test_phantom_pause_unknown_on_network_failure(monkeypatch):
+    """issue #1096, F1: сеть недоступна — раньше тихий [] (то же самое 💚,
+    что и доказанное «нарушений нет»); теперь check_result.unknown() с
+    названной причиной (AGENTS.md «Алерт не гадает»)."""
     fake = FakeGh({
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": RuntimeError("gh api: 502"),
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "gh api: 502" in result.reason
 
 
 def test_phantom_pause_not_in_ci_gating():
@@ -2253,7 +2293,7 @@ def test_build_report_wires_invariant_13(monkeypatch):
 def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
     fake = FakeGh({"search/issues": {"items": []}})
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeypatch):
@@ -2271,8 +2311,9 @@ def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeyp
         ],
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_worker_false_success_comment(REPO)
-    assert violations == [{
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
         "issue": 900,
         "url": "https://github.com/mytab0r/edge-harness/issues/900",
         "title": "какая-то задача",
@@ -2296,7 +2337,7 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
@@ -2318,7 +2359,7 @@ def test_worker_false_success_comment_search_false_positive_not_reported(monkeyp
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):
@@ -2336,10 +2377,61 @@ def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(
     )
 
 
-def test_worker_false_success_comment_best_effort_on_network_failure(monkeypatch):
+def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
+    # issue #1096, F6: Search недоступен целиком — раньше тихий [] (то же
+    # 💚, что у доказанного «нарушений нет»); теперь check_result.unknown()
+    # с названной причиной.
     fake = FakeGh({"search/issues": RuntimeError("gh api: rate limited")})
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "rate limited" in result.reason
+
+
+def test_worker_false_success_comment_unknown_when_a_candidate_sync_fails(monkeypatch):
+    # issue #1096, F6, второй путь: Search нашёл кандидата, но локальная
+    # сверка ЭТОГО issue упала (сеть/квота) — раньше молчаливый `continue`
+    # читался как «этот кандидат чист», и при отсутствии других находок
+    # весь инвариант отдавал 💚. Теперь — check_result.unknown(): «чисто»
+    # здесь недоказанное утверждение, не факт.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 777, "html_url": "https://github.com/mytab0r/edge-harness/issues/777",
+             "title": "не сверенный кандидат"},
+        ]},
+        "issues/777/comments": RuntimeError("gh api: 502"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "1" in result.reason and "777" not in result.reason  # число, не конкретный issue
+
+
+def test_worker_false_success_comment_confirmed_violation_beats_unchecked_sibling(monkeypatch):
+    # issue #1096, F6: подтверждённое нарушение у ОДНОГО кандидата не должно
+    # прятаться за тем, что СОСЕДНИЙ кандидат не удалось сверить — реальная
+    # находка важнее чужой неопределённости (иначе это была бы потеря сигнала).
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 900, "html_url": "https://github.com/mytab0r/edge-harness/issues/900",
+             "title": "настоящий регресс"},
+            {"number": 777, "html_url": "https://github.com/mytab0r/edge-harness/issues/777",
+             "title": "не сверенный кандидат"},
+        ]},
+        "issues/900/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+        ],
+        "issues/777/comments": RuntimeError("gh api: 502"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
+        "issue": 900,
+        "url": "https://github.com/mytab0r/edge-harness/issues/900",
+        "title": "настоящий регресс",
+    }]
 
 
 def test_worker_false_success_comment_not_in_ci_gating():
