@@ -99,5 +99,30 @@ loud при несовпадении формы), применяемым к ра
 источником правды — плагину больше нечего писать в settings, гонка снята у
 корня, а не подавлена совпадением id.
 
+## Дополнение 2026-09-13 (#1130): превентивный рефреш путает «срок неизвестен» со «срок истёк»
+
+Вопрос владельца: «Какой опус он там пытается рефрешить, если мы поставили
+долгоживущие OAuth токены, которые не надо рефрешить?» Разбор
+`lib/pool.js::createRefreshCoordinator` (тот же релиз плагина): условие
+пропуска превентивного рефреша — `if (oauth.expiresAt && oauth.expiresAt -
+Date.now() > REFRESH_SKEW_MS) return account` (`REFRESH_SKEW_MS = 5 * 60 *
+1000`). Условие ложно и когда `expiresAt` ОТСУТСТВУЕТ, и когда оно в
+прошлом — плагин не различает «поле не задано» (долгоживущий accessToken
+без явного срока) и «поле задано и истекло». Проверяется на КАЖДЫЙ запрос
+через прокси (`lib/index.js::forward`/`discoverModels`), не один раз при
+старте.
+
+Плагин НЕ имел ветки «получили 401/403 от Anthropic → рефрешим и повторяем
+тот же запрос» (`forward()`, ветка `if ([401, 403].includes(response.status))`
+— только `cooldownUntil` + переход к следующему аккаунту) — это означает,
+что отключение превентивного рефреша БЕЗ добавления реактивного сломало бы
+восстановление реально истёкшего токена без `expiresAt`. Фикс #1130 —
+патч в двух местах разом (см. `openspec/changes/anthropic-oauth-pool-standalone/design.md`,
+раздел «Превентивный рефреш долгоживущих токенов»): `pool.js` перестаёт
+считать отсутствие `expiresAt` признаком истечения, `index.js` получает
+реактивный рефреш-и-повтор на реальный 401/403 (метит аккаунт на диске как
+просроченный и зовёт `ensureFresh()` снова — переиспользует существующую
+логику рефреша, не дублирует её).
+
 ## Источники
-`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158.
+`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14).

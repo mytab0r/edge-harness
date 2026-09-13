@@ -406,12 +406,14 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 }
 
 # Нейтрализация self-регистрации плагина в llm-pi-ai (#1097 второй заход,
-# #1130, живой прогон worker.yml 34753001158). ensureProvider() плагина
-# (lib/index.js) пишет провайдера в llm-pi-ai через ctx.get('settings') —
-# сервис settings ДЕЙСТВИТЕЛЬНО смонтирован в headless (проверено живым
-# `dsh --dump-config`: `@deepseek-ai/dsh-settings-file` — прежнее
-# утверждение обратного в design.md было неверным, см.
-# docs/research/32-claude-oauth-provider.md, «Поправка 2026-09-13»), поэтому эта
+# #1130, живой прогон worker.yml 34753001158) + фикс превентивного рефреша
+# долгоживущих токенов (#1130, доработка по решению владельца).
+#
+# Патч 1 (ensureProvider, lib/index.js): плагин пишет провайдера в llm-pi-ai
+# через ctx.get('settings') — сервис settings ДЕЙСТВИТЕЛЬНО смонтирован в
+# headless (проверено живым `dsh --dump-config`: `@deepseek-ai/dsh-settings-file`
+# — прежнее утверждение обратного в design.md было неверным, см.
+# docs/research/32-claude-oauth-provider.md, «Поправка 2026-09-13»), поэтому
 # self-регистрация РАБОТАЕТ и гонится с нашей статической регистрацией
 # llm-pi-ai.providers.anthropic-pool (_dsh_patch_profile_anthropic_pool
 # ниже): если discoverModels() плагина успевает получить РЕАЛЬНЫЙ каталог
@@ -419,28 +421,36 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 # по объектам, но ЗАМЕНА массивов целиком, dsh-settings::mergeLayers)
 # перезаписывает наш models статическим — при отсутствии в реальном
 # каталоге буквального id "claude-sonnet-4-5" результат — UNKNOWN_MODEL.
-#
 # Фикс — вырезать саму self-регистрацию: наша статическая регистрация
-# полная и единственная, плагину незачем писать в settings вовсе. Патч
-# точный (exact string match в scripts/lib/patch_anthropic_pool_plugin.py,
-# fail loud при несовпадении формы — апстрим сменился), применяется к УЖЕ
-# распакованному и sha256-проверенному каталогу
-# (DSH_ANTHROPIC_POOL_EXTRACTED, после dsh_install_anthropic_pool),
-# результат репакуется в НОВЫЙ tgz — DSH_ANTHROPIC_POOL_PKG после этой
-# функции указывает на патченный архив, dsh_mount_anthropic_pool монтирует
-# именно его.
+# полная и единственная, плагину незачем писать в settings вовсе.
+#
+# Патчи 2+3 (lib/pool.js + lib/index.js): плагин трактовал ОТСУТСТВИЕ
+# `oauth.expiresAt` как «токен истёк» (`createRefreshCoordinator`,
+# pool.js) — превентивный рефреш на КАЖДЫЙ запрос для любого аккаунта без
+# явного expiresAt, в том числе для долгоживущего accessToken владельца,
+# которому вообще не нужен рефреш. Патч 2 переворачивает условие: нет
+# expiresAt → токен считается валидным, короткоживущие токены (expiresAt
+# задан) ведут себя как раньше. Патч 3 — обязательная пара: реактивный
+# рефреш на РЕАЛЬНЫЙ 401/403 (без него патч 2 убрал бы единственный путь
+# восстановления по-настоящему протухшего токена без expiresAt).
+#
+# Все патчи — exact string match в scripts/lib/patch_anthropic_pool_plugin.py,
+# fail loud при несовпадении формы — апстрим сменился, применяются к УЖЕ
+# распакованному и sha256-проверенному каталогу (DSH_ANTHROPIC_POOL_EXTRACTED,
+# после dsh_install_anthropic_pool), результат репакуется в НОВЫЙ tgz —
+# DSH_ANTHROPIC_POOL_PKG после этой функции указывает на патченный архив,
+# dsh_mount_anthropic_pool монтирует именно его.
 dsh_patch_anthropic_pool_plugin() {
   [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
-  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации в settings (#1097/#1130)"
-  local script_dir index_js patched_tgz
+  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации + фикс рефреша долгоживущих токенов (#1097/#1130)"
+  local script_dir patched_tgz
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  index_js="$DSH_ANTHROPIC_POOL_EXTRACTED/lib/index.js"
-  if [ ! -f "$index_js" ]; then
-    echo "::error::$index_js не найден — dsh_install_anthropic_pool не отработал раньше (#1130)"
+  if [ ! -d "$DSH_ANTHROPIC_POOL_EXTRACTED" ]; then
+    echo "::error::$DSH_ANTHROPIC_POOL_EXTRACTED не найден — dsh_install_anthropic_pool не отработал раньше (#1130)"
     echo "::endgroup::"; return 1
   fi
-  if ! python3 "$script_dir/patch_anthropic_pool_plugin.py" "$index_js"; then
-    echo "::error::патч ensureProvider() не применился (см. вывод выше) — self-регистрация НЕ нейтрализована, гонка с нашей статической регистрацией остаётся возможной (#1097/#1130)"
+  if ! python3 "$script_dir/patch_anthropic_pool_plugin.py" "$DSH_ANTHROPIC_POOL_EXTRACTED"; then
+    echo "::error::патч плагина не применился (см. вывод выше) — self-регистрация и/или превентивный рефреш долгоживущих токенов НЕ пофиксены (#1097/#1130)"
     echo "::endgroup::"; return 1
   fi
   patched_tgz="$(dirname "$DSH_ANTHROPIC_POOL_EXTRACTED")/dsh-anthropic-oauth-pool-patched.tgz"

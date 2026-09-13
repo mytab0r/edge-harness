@@ -382,7 +382,20 @@ echo "GUARD(anthropic-pool): 10) llm-pi-ai.providers.anthropic-pool зареги
 #      `ctx.get('settings')`. Мутация (искажение формы ensureProvider в
 #      фикстуре) красит патч именно там, где он обязан упасть — на
 #      несовпадении маркера, не молча пропуститьself-регистрацию. ──────────
-ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK='const name = "dsh-anthropic-oauth-pool"
+# $1 — каталог, куда положить обе прод-формы (lib/index.js + lib/pool.js);
+# патч-скрипт принимает КАТАЛОГ пакета (#1130 доработка — три патча в двух
+# файлах), не путь к одному index.js. Heredoc с закавыченным делимитером
+# (не '%s' + одинарные кавычки) — тот же приём, что уже применяют фикстуры
+# accounts.js/bin.js выше в этом файле: реальный JS-текст без экранирования
+# каждой одинарной кавычки.
+write_fixture_package() {
+  local dir=$1
+  mkdir -p "$dir/lib"
+  # index.js — ensureProvider() и окружающий forward()/401-403-ветка —
+  # ТОЧНАЯ копия dsh-anthropic-oauth-pool-0.1.0.tgz (релиз
+  # dsh-plugins-suite-v1), инспектирована живьём при разборе #1097/#1130.
+  cat >"$dir/lib/index.js" <<'INDEX_JS'
+const name = "dsh-anthropic-oauth-pool"
 
 function apply(ctx) {
   let port = 47291
@@ -392,28 +405,109 @@ function apply(ctx) {
 
   async function ensureProvider() {
     await discoverModels()
-    try { await ctx.get('"'"'credentials'"'"').set(CREDS_REF, '"'"'managed-by-anthropic-pool'"'"') } catch {}
-    const provider = { displayName: '"'"'Anthropic OAuth Pool'"'"', apiKeyEnv: CREDS_REF, api: '"'"'anthropic-messages'"'"', baseURL: `http://127.0.0.1:${port}`, models }
-    const settings = ctx.get('"'"'settings'"'"')
-    if (typeof settings.update === '"'"'function'"'"') await settings.update('"'"'llm-pi-ai'"'"', { providers: { [PROVIDER_KEY]: provider } })
-    else if (typeof settings.mutate === '"'"'function'"'"') await settings.mutate('"'"'llm-pi-ai'"'"', [{ op: '"'"'add'"'"', path: ['"'"'providers'"'"', PROVIDER_KEY], value: provider }])
-    else throw new Error('"'"'DSH settings service cannot install the Anthropic pool provider'"'"')
+    try { await ctx.get('credentials').set(CREDS_REF, 'managed-by-anthropic-pool') } catch {}
+    const provider = { displayName: 'Anthropic OAuth Pool', apiKeyEnv: CREDS_REF, api: 'anthropic-messages', baseURL: `http://127.0.0.1:${port}`, models }
+    const settings = ctx.get('settings')
+    if (typeof settings.update === 'function') await settings.update('llm-pi-ai', { providers: { [PROVIDER_KEY]: provider } })
+    else if (typeof settings.mutate === 'function') await settings.mutate('llm-pi-ai', [{ op: 'add', path: ['providers', PROVIDER_KEY], value: provider }])
+    else throw new Error('DSH settings service cannot install the Anthropic pool provider')
+  }
+
+  async function forward(req, res) {
+    let body
+    try { body = await readBody(req) } catch (error) { res.writeHead(413); res.end(error.message); return }
+    const config = reload()
+    const attempted = new Set()
+    let lastResponse
+    let lastResponseBody
+    let lastError
+    while (attempted.size < runtime.size) {
+      const candidates = [...runtime.values()].filter((a) => !attempted.has(a.id))
+      const account = selectAccount(candidates, config.strategy, cursor++)
+      if (!account) break
+      attempted.add(account.id)
+      account.lastUsedAt = Date.now()
+      account.requests = (account.requests || 0) + 1
+      try {
+        const stored = await ensureFresh(account.id)
+        const response = await fetch(new URL(req.url || '/', API_BASE), {
+          method: req.method, headers: oauthHeaders(stored.oauth.accessToken, req.headers),
+          body: ['GET', 'HEAD'].includes(req.method) ? undefined : body,
+          redirect: 'manual', signal: AbortSignal.timeout(10 * 60 * 1000),
+        })
+        updateQuotaFromHeaders(account, response.headers, response.status)
+        account.lastStatus = response.status
+        if ([401, 403].includes(response.status)) {
+          account.cooldownUntil = Date.now() + 60_000; lastResponse = response; lastResponseBody = Buffer.from(await response.arrayBuffer()); continue
+        }
+        if (response.status === 429) { lastResponse = response; lastResponseBody = Buffer.from(await response.arrayBuffer()); continue }
+        res.statusCode = response.status
+        for (const [key, value] of response.headers) {
+          if (!['content-encoding', 'content-length', 'transfer-encoding', 'connection'].includes(key.toLowerCase())) res.setHeader(key, value)
+        }
+        res.setHeader('x-dsh-anthropic-account', account.id)
+        if (response.body) Readable.fromWeb(response.body).pipe(res); else res.end()
+        return
+      } catch (error) {
+        account.errors = (account.errors || 0) + 1
+        account.lastError = String(error?.message || error).slice(0, 300)
+        account.cooldownUntil = Date.now() + 15_000
+        lastError = error
+      }
+    }
+    if (lastResponse) {
+      res.statusCode = lastResponse.status
+      res.setHeader('content-type', lastResponse.headers.get('content-type') || 'application/json')
+      res.end(lastResponseBody)
+    } else {
+      res.statusCode = 503; res.setHeader('content-type', 'application/json')
+      const next = [...runtime.values()].filter((a) => a.cooldownUntil).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0]
+      res.end(JSON.stringify({ type: 'error', error: { type: 'pool_unavailable', message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null } }))
+    }
   }
 }
 
 export { name, apply }
-'
+INDEX_JS
+  # pool.js — createRefreshCoordinator — ТОЧНАЯ копия того же релиза.
+  cat >"$dir/lib/pool.js" <<'POOL_JS'
+const REFRESH_SKEW_MS = 5 * 60 * 1000
+
+export function createRefreshCoordinator({ readAccount, writeAccount, refreshToken }) {
+  const pending = new Map()
+  return async function ensureFresh(id) {
+    if (pending.has(id)) return pending.get(id)
+    const work = (async () => {
+      const account = await readAccount(id)
+      const oauth = account.oauth
+      if (!oauth?.accessToken || !oauth?.refreshToken) throw new Error(`Account ${id} has no Claude OAuth credentials`)
+      if (oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account
+      const next = await refreshToken(oauth.refreshToken)
+      account.oauth = {
+        ...oauth,
+        accessToken: next.access_token,
+        refreshToken: next.refresh_token || oauth.refreshToken,
+        expiresAt: Date.now() + (Number(next.expires_in) || 3600) * 1000,
+      }
+      await writeAccount(id, account)
+      return account
+    })().finally(() => pending.delete(id))
+    pending.set(id, work)
+    return work
+  }
+}
+POOL_JS
+}
+
 (
   FIXTURE_DIR="$(mktemp -d)"
-  mkdir -p "$FIXTURE_DIR/lib"
-  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$FIXTURE_DIR/lib/index.js"
-  # Не пересказ: строка ensureProvider ниже — ТОЧНАЯ копия
-  # dsh-anthropic-oauth-pool-0.1.0.tgz (релиз dsh-plugins-suite-v1),
-  # инспектирована живьём при разборе #1097/#1130. Сверяем байт-в-байт с
-  # тем, что реально проверяет патч-скрипт (OLD-константа), не с нашим
-  # пересказом её содержимого.
-  grep -q "const settings = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) фикстура сама не содержит ожидаемую строку — тест сломан до патча" >&2; exit 1; }
-  if ! python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR/lib/index.js" >"$FIXTURE_DIR/patch.log" 2>&1; then
+  write_fixture_package "$FIXTURE_DIR"
+  # Сверяем байт-в-байт с тем, что реально проверяет патч-скрипт
+  # (OLD-константы), не с нашим пересказом их содержимого.
+  grep -q "const settings = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) фикстура index.js сама не содержит ожидаемую строку ensureProvider — тест сломан до патча" >&2; exit 1; }
+  grep -q "\[401, 403\].includes(response.status)" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) фикстура index.js сама не содержит ожидаемую 401/403-ветку — тест сломан до патча" >&2; exit 1; }
+  grep -q "oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS" "$FIXTURE_DIR/lib/pool.js" || { echo "::error::11) фикстура pool.js сама не содержит ожидаемое условие пропуска рефреша — тест сломан до патча" >&2; exit 1; }
+  if ! python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
     echo "::error::11) патч не применился к прод-форме фикстуры: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1
   fi
   # Ищем именно ЖИВОЙ вызов (`const settings = ctx.get(...)`), не подстроку
@@ -434,13 +528,21 @@ export { name, apply }
     echo "::error::11) после патча settings.update(...) всё ещё вызывается" >&2; exit 1
   fi
   grep -q "async function ensureProvider" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) патч удалил саму функцию ensureProvider вместо нейтрализации тела" >&2; exit 1; }
-) || fail "11) патч плагина (happy path) не нейтрализует self-регистрацию в прод-форме"
-echo "GUARD(anthropic-pool): 11a) патч нейтрализует ctx.get('settings') в прод-форме ensureProvider — ок (#1130)"
+  # Патч 3 (реактивный рефреш на 401/403): старая ветка (cooldown+continue
+  # без единой попытки рефреша) заменена на try-рефреш-и-повтор.
+  grep -q "await ensureFresh(account.id)" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) 401/403-ветка не содержит реактивный вызов ensureFresh — патч 3 не применился" >&2; exit 1; }
+  grep -q "expiresAt: Date.now() - 1" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) 401/403-ветка не помечает аккаунт как просроченный перед повторным ensureFresh — патч 3 не применился" >&2; exit 1; }
+  # Патч 2 (pool.js): условие пропуска обязано пропускать И при отсутствии expiresAt.
+  if grep -q "if (oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account" "$FIXTURE_DIR/lib/pool.js"; then
+    echo "::error::11) pool.js всё ещё трактует отсутствующий expiresAt как «истёк» — патч 2 не применился" >&2; exit 1
+  fi
+  grep -q "if (!oauth.expiresAt || oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account" "$FIXTURE_DIR/lib/pool.js" || { echo "::error::11) pool.js не содержит новое условие пропуска рефреша — патч 2 не применился корректно" >&2; exit 1; }
+) || fail "11) патч плагина (happy path) не нейтрализует self-регистрацию и не чинит рефреш долгоживущих токенов в прод-форме"
+echo "GUARD(anthropic-pool): 11a) все три патча (ensureProvider, reactive-refresh, pool-skip-condition) применились к прод-форме — ок (#1097/#1130)"
 
 (
   FIXTURE_DIR="$(mktemp -d)"
-  mkdir -p "$FIXTURE_DIR/lib"
-  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$FIXTURE_DIR/lib/index.js"
+  write_fixture_package "$FIXTURE_DIR"
   # Мутация: форма ensureProvider изменилась (как если бы апстрим переписал
   # плагин) — точное совпадение обязано провалиться, а не тихо пропустить.
   # python3 (не bash `${var/pattern/repl}` — та ломается на кавычках внутри
@@ -458,13 +560,16 @@ with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
 " "$FIXTURE_DIR/lib/index.js"
   grep -q "const settingsService = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) мутация фикстуры не применилась — тест сломан до патча" >&2; exit 1; }
-  if python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR/lib/index.js" >"$FIXTURE_DIR/patch.log" 2>&1; then
+  if python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
     echo "::error::11) патч ОБЯЗАН был отказать на изменённой форме ensureProvider, но применился молча" >&2; exit 1
   fi
   grep -qi "PATCH_MARKER_NOT_FOUND" "$FIXTURE_DIR/patch.log" || { echo "::error::11) отказ патча не назвал причину PATCH_MARKER_NOT_FOUND: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1; }
   grep -q "const settingsService = ctx.get('settings')" "$FIXTURE_DIR/lib/index.js" || { echo "::error::11) файл фикстуры не должен был измениться при отказе патча" >&2; exit 1; }
+  # Атомарность: ensure_provider не совпал первым — pool.js (третий по счёту
+  # патч) обязан остаться НЕТРОНУТЫМ, а не частично пропатченным.
+  grep -q "if (oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account" "$FIXTURE_DIR/lib/pool.js" || { echo "::error::11) pool.js изменился, хотя патч должен был отказать ДО записи любого файла (нарушена атомарность)" >&2; exit 1; }
 ) || fail "11) патч не падает громко на изменённой форме ensureProvider (мутация #1130)"
-echo "GUARD(anthropic-pool): 11b) мутация формы ensureProvider -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), файл не тронут — ок (#1130)"
+echo "GUARD(anthropic-pool): 11b) мутация формы ensureProvider -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), ОБА файла не тронуты (атомарность) — ок (#1130)"
 
 # ── 12) #1130 (находка ai-review PR #1132): suite-путь (dsh_mount_plugins_suite)
 #       НЕ монтирует свою (непатченную) копию dsh-anthropic-oauth-pool, когда
@@ -521,8 +626,7 @@ echo "GUARD(anthropic-pool): 12) suite пропускает свой oauth-add �
 (
   FIXTURE_ROOT="$(mktemp -d)"
   EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
-  mkdir -p "$EXTRACT_DIR/lib"
-  printf '%s' "$ANTHROPIC_POOL_INDEX_JS_FIXTURE_OK" >"$EXTRACT_DIR/lib/index.js"
+  write_fixture_package "$EXTRACT_DIR"
   export DSH_ANTHROPIC_POOL_ACTIVE=1
   export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT_DIR"
   ORIGINAL_PKG="$FIXTURE_ROOT/original.tgz"
@@ -535,10 +639,66 @@ echo "GUARD(anthropic-pool): 12) suite пропускает свой oauth-add �
   mkdir -p "$REPACK_CHECK_DIR"
   tar -xzf "$DSH_ANTHROPIC_POOL_PKG" -C "$REPACK_CHECK_DIR" || { echo "::error::13) репак нечитаем tar'ом" >&2; exit 1; }
   [ -f "$REPACK_CHECK_DIR/package/lib/index.js" ] || { echo "::error::13) репак не сохранил структуру package/lib/index.js" >&2; exit 1; }
+  [ -f "$REPACK_CHECK_DIR/package/lib/pool.js" ] || { echo "::error::13) репак не сохранил package/lib/pool.js" >&2; exit 1; }
   if grep -q "const settings = ctx.get(" "$REPACK_CHECK_DIR/package/lib/index.js"; then
     echo "::error::13) внутри репака живой вызов ctx.get('settings') остался — обёртка не патчит реальный монтируемый архив" >&2; exit 1
   fi
+  if grep -q "if (oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account" "$REPACK_CHECK_DIR/package/lib/pool.js"; then
+    echo "::error::13) внутри репака pool.js всё ещё трактует отсутствующий expiresAt как «истёк»" >&2; exit 1
+  fi
 ) || fail "13) обёртка dsh_patch_anthropic_pool_plugin (репак + перепривязка PKG) сломана"
 echo "GUARD(anthropic-pool): 13) dsh_patch_anthropic_pool_plugin сквозным вызовом: PKG перепривязан, репак читаем, settings-вызов вырезан — ок (#1130)"
+
+# ── 14) #1130 (доработка, решение владельца): ПОВЕДЕНЧЕСКОЕ доказательство
+#      фикса превентивного рефреша долгоживущих токенов — не текстовый grep
+#      по условию (уже сделан в 11a/13), а РЕАЛЬНЫЙ вызов патченного pool.js
+#      (`createRefreshCoordinator`) в node с синтетическими
+#      readAccount/writeAccount/refreshToken. Доказывает ОБА направления:
+#      без expiresAt рефреша НЕТ (главная цель фикса — долгоживущий токен
+#      без явного срока не считается протухшим), с expiresAt в прошлом
+#      рефреш ЕСТЬ (короткоживущие токены продолжают рефрешиться как
+#      раньше — фикс не сломал этот путь, требование владельца п.3). ──────
+(
+  FIXTURE_ROOT="$(mktemp -d)"
+  EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
+  write_fixture_package "$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_PKG="$FIXTURE_ROOT/original.tgz"
+  : >"$DSH_ANTHROPIC_POOL_PKG"
+  dsh_patch_anthropic_pool_plugin || { echo "::error::14) dsh_patch_anthropic_pool_plugin отказала на валидной фикстуре" >&2; exit 1; }
+
+  cat >"$EXTRACT_DIR/lib/behavior-check.mjs" <<'BEHAVIOR_MJS'
+import { createRefreshCoordinator } from './pool.js'
+
+async function refreshCalledFor(expiresAtOverride) {
+  let refreshCalled = false
+  const oauth = { accessToken: 'atok', refreshToken: 'rtok', ...(expiresAtOverride === undefined ? {} : { expiresAt: expiresAtOverride }) }
+  const coordinator = createRefreshCoordinator({
+    readAccount: async (id) => ({ id, oauth }),
+    writeAccount: async () => {},
+    refreshToken: async () => { refreshCalled = true; return { access_token: 'NEW', refresh_token: 'NEW_R', expires_in: 3600 } },
+  })
+  await coordinator('acc')
+  return refreshCalled
+}
+
+const noExpiresAt = await refreshCalledFor(undefined)
+const expiresInPast = await refreshCalledFor(Date.now() - 1000)
+const expiresFarFuture = await refreshCalledFor(Date.now() + 999999999)
+console.log(`no_expires_at=${noExpiresAt} expires_in_past=${expiresInPast} expires_far_future=${expiresFarFuture}`)
+if (noExpiresAt) { console.error('FAIL: без expiresAt рефреш всё равно случился — долгоживущий токен считается протухшим'); process.exit(1) }
+if (!expiresInPast) { console.error('FAIL: с expiresAt в прошлом рефреш НЕ произошёл — реально истёкший токен не восстановится'); process.exit(1) }
+if (expiresFarFuture) { console.error('FAIL: с expiresAt далеко в будущем рефреш произошёл — короткоживущие токены сломаны'); process.exit(1) }
+console.log('OK: без expiresAt рефреша нет, с expiresAt в прошлом рефреш есть, с expiresAt в будущем рефреша нет')
+BEHAVIOR_MJS
+  BEHAVIOR_LOG="$FIXTURE_ROOT/behavior.log"
+  if ! node "$EXTRACT_DIR/lib/behavior-check.mjs" >"$BEHAVIOR_LOG" 2>&1; then
+    { echo "::error::14) поведенческая проверка патченного pool.js провалилась:"; cat "$BEHAVIOR_LOG"; } >&2
+    exit 1
+  fi
+  cat "$BEHAVIOR_LOG"
+) || fail "14) патч превентивного рефреша долгоживущих токенов не подтверждён поведенчески"
+echo "GUARD(anthropic-pool): 14) патченный pool.js — без expiresAt рефреша нет, с expiresAt в прошлом рефреш есть, короткоживущие токены не задеты — ок (#1130)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
