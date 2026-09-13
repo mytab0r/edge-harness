@@ -370,8 +370,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # gh()/parse_time()/minutes_between()/escalate()/WATCHDOG_ISSUE — одно место
@@ -2415,7 +2413,23 @@ def _frontend_deploy_watched_paths(
     не гадает» (AGENTS.md): нераспознанная форма глоба — не тихий пропуск, а
     RuntimeError здесь, при загрузке (build_report превращает его в честное
     «недоступна», НЕ «здорово», симметрично отказу пустого on.push.paths
-    выше)."""
+    выше).
+
+    Находка ревью PR #1076 (второй проход, блокирующая): `import yaml` НЕ
+    на уровне модуля — живые потребители этого файла (`orchestra.yml`,
+    каждые 15 минут, и `repo-ci.yml`, на каждый push/PR) не ставят PyYAML
+    явно, полагаясь на то, что он предустановлен в образе GitHub-раннера
+    (тот же факт, на который уже опирается `exec_bit_guard.py`); локальный
+    голый Python (класс #723) или смена образа раннера дали бы `ImportError`
+    на уровне модуля — это убило бы ВСЕ 17 инвариантов и канал эскалаций
+    целиком, а не только этот. Импорт — внутри функции, `ImportError`
+    превращается в тот же `RuntimeError`, что и пустой/нераспознанный
+    `on.push.paths` выше: радиус отказа остаётся внутри инварианта 17,
+    `build_report` уже умеет отличить «недоступна» от «здорово»."""
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError(f"PyYAML недоступна: {error} — инвариант 17 не может прочитать {FRONTEND_DEPLOY_WORKFLOW}") from error
     path = workflow_path or (REPO_ROOT / ".github" / "workflows" / FRONTEND_DEPLOY_WORKFLOW)
     doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     on_value = doc.get("on", doc.get(True))
