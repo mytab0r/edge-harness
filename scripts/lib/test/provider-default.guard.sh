@@ -31,9 +31,30 @@
 #       (в .md комментариев как таких нет, но правило применяется к каждой
 #       строке файла без исключений).
 #
-# Allowlist (после сужения находкой 7 в deploy-dsh-edge.yml их стало меньше):
-#   - scripts/lib/test/dsh-clients.smoke.sh — фикстура смоука (непустая
-#     строка для dsh_require_provider_env, не источник правды);
+# Allowlist (после сужения находкой 7 в deploy-dsh-edge.yml их стало меньше).
+#
+# Путевое правило (#1111): ЛИТЕРАЛЬНЫЙ паттерн (б) целиком пропускает файлы,
+# распознанные проектным соглашением как тестовая фикстура — `is_fixture_path`
+# ниже (basename `test_*.py`/`*_test.py`/`*.smoke.sh`, либо путь через
+# директорию `test/`). Это ТОТ ЖЕ признак, которым до находки #1111 вручную,
+# по одному разу на файл, размечались dsh-clients.smoke.sh/
+# test_provider_latency.py/test_provider_model_discovery.py — здесь он снят с
+# ручного режима и обобщён: новый тест с тем же именем/расположением, кормящий
+# ДОСЛОВНУЮ прод-форму (AGENTS.md, «Тест кормит прод-форму данных, а не
+# пересказ» — живой замер #1111: одна и та же строка ошибки Ollama Cloud
+# потребовала двух РУЧНЫХ allowlist-блоков за неделю, #1062 и #1094), больше
+# не требует отдельной правки этого файла.
+#
+# От чего это НЕ снимает защиту: property-паттерн (а) выше по-прежнему
+# сканирует ЛЮБОЙ файл без исключения по пути, включая фикстуры — ловит
+# именно РИСК гвардии класса #153 (прод-код берёт зашитый дефолт вместо
+# vars.DEEPSEEK_BASE_URL/DEEPSEEK_MODEL), а этот риск от расположения файла
+# не зависит. Литеральный паттерн (б) — эвристика по СТЕЙЛ-прозе (см. выше),
+# и её смысл для файла, чьё НАЗНАЧЕНИЕ — нести чужой литерал байт-в-байт,
+# обратный: там литерал обязан быть, а не запрещён.
+#
+# Оставшиеся allowlist-записи — по СОДЕРЖИМОМУ конкретного НЕ-тестового
+# (прод) файла, где путевое правило не применяется:
 #   - .github/workflows/deploy-dsh-edge.yml — patch каталога моделей МОРДЫ:
 #     "deepseek-v4-flash" в regex-паттерне — upstream-маркер бандла dsh-edge
 #     для замены, не наш CI-дефолт вызова LLM. Исключается ТОЧЕЧНО (по этой
@@ -47,12 +68,6 @@
 #     только если задан секрет соответствующей учётки — молчаливый дефолт
 #     здесь невозможен по построению самого combo-router (пустой routes при
 #     enabled:true падает конструктором роутера).
-#   - scripts/lib/test_provider_secrets_import.py, фикстура DSH_CI_FIXTURE
-#     (#733): синтетический клон формата PLUGINS_SUITE_CANDIDATE_ROUTES с
-#     заменёнными на "model-a/b/c" именами моделей — но реальные URL
-#     (integrate.api.nvidia.com, api.z.ai) в фикстуре остаются буквальными,
-#     потому что тест разбирает реальный формат строки, не придуманный;
-#     это не фолбэк-дефолт, а тестовые данные.
 #   - scripts/measure/provider_latency.py, таблица PROVIDER_LATENCY_CANDIDATES
 #     (#836): тот же приём, что PLUGINS_SUITE_CANDIDATE_ROUTES выше — явная
 #     таблица провайдеров-кандидатов для ЖИВОГО замера латентности, не
@@ -60,10 +75,21 @@
 #     обязательный провайдер по-прежнему только vars.DEEPSEEK_BASE_URL/MODEL).
 #     Литералы взяты буквально из постановки задачи #836; каждая строка
 #     списка отличима именем провайдера ("NVIDIA-nano" и т.д.).
-#   - scripts/measure/test_provider_latency.py — файл целиком (тот же приём,
-#     что у смоук-фикстуры dsh-clients.smoke.sh выше): существует ради
-#     разбора прод-формы URL/модели этих же провайдеров, не источник правды.
+#   - scripts/measure/provider_model_discovery.py, CODING_RANK_KEYWORDS (#848):
+#     эвристика ранжирования СРЕДИ УЖЕ ПОЛУЧЕННОГО живым /v1/models каталога,
+#     не дефолт-провайдер класса #153.
+#   - scripts/lib/confirmed-provider-models.json — реестр ПОДТВЕРЖДЁННЫХ живым
+#     запросом id (#737, #848): значение читается только через sha256-хэш
+#     (dsh_model_confirmed в dsh-ci.sh), сама строка id — только в комментарии
+#     evidence для человека, не дефолт-провайдер класса #153.
 #   - этот файл (regex-литералы самой гвардии).
+#
+# Что БОЛЬШЕ не нужно как ручная запись (снято находкой #1111, покрыто
+# путевым правилом is_fixture_path выше): scripts/lib/test/
+# dsh-clients.smoke.sh, scripts/lib/test/dsh-provider-chain.smoke.sh (#1062),
+# scripts/measure/test_provider_latency.py, scripts/measure/
+# test_provider_model_discovery.py, scripts/lib/test_provider_secrets_import.py,
+# scripts/orchestra/test_repo_invariants.py (#1094).
 set -euo pipefail
 
 SCOPE=".github/workflows scripts docs/agents"
@@ -83,6 +109,23 @@ files() {
       done
 }
 
+# Путевое правило #1111 (см. блок Allowlist выше): признак «это тестовая
+# фикстура» — тот же, которым уже неявно пользовался человек-автор гвардии
+# для трёх ручных записей (dsh-clients.smoke.sh — */test/*.sh, test_provider_
+# latency.py/test_provider_model_discovery.py — test_*.py). Применяется ТОЛЬКО
+# к литеральному паттерну (б) — property-паттерн (а) сканирует такие файлы
+# наравне со всеми остальными (см. обоснование в блоке Allowlist).
+is_fixture_path() {
+  local f="$1" base="${f##*/}"
+  case "$base" in
+    test_*.py|*_test.py|*.smoke.sh) return 0 ;;
+  esac
+  case "$f" in
+    */test/*) return 0 ;;
+  esac
+  return 1
+}
+
 fail=0
 
 # ── (а) property-паттерн: фолбэк рядом с нашими переменными ──────────────────
@@ -97,6 +140,7 @@ fi
 LITERAL_RE='api\.z\.ai|integrate\.api\.nvidia\.com|glm-[0-9]|nemotron|deepseek-v[0-9]'
 literal_hits=""
 while IFS= read -r f; do
+  if is_fixture_path "$f"; then continue; fi
   is_docs_agents=0
   case "$f" in docs/agents/*) is_docs_agents=1 ;; esac
   hit=$(grep -nE "$LITERAL_RE" "$f" 2>/dev/null || true)
@@ -111,15 +155,6 @@ while IFS= read -r f; do
     if [ "$is_docs_agents" = 1 ] || [ "$is_comment" = 0 ]; then
       # allowlist точечных легитимных не-комментарийных литералов
       case "$f:$lineno" in
-        "scripts/lib/test/dsh-clients.smoke.sh:"*) continue ;;
-        # Тестовые данные бенчмарка латентности (#836) — тот же приём, что
-        # у смоук-фикстуры выше: файл целиком существует ради разбора
-        # прод-формы URL/модели этих же провайдеров, не источник правды.
-        "scripts/measure/test_provider_latency.py:"*) continue ;;
-        # Тесты discovery живых model id (#848) — та же причина, что у
-        # test_provider_latency.py выше: разбирают прод-форму URL/id этих же
-        # провайдеров, не источник правды.
-        "scripts/measure/test_provider_model_discovery.py:"*) continue ;;
         # Реестр ПОДТВЕРЖДЁННЫХ живым запросом id (#737, #848) — по смыслу
         # ФАЙЛА он обязан нести литеральные id прежних И текущих провайдеров
         # (sha256 + прозовое evidence с id для читаемости), это не дефолт-
@@ -130,9 +165,6 @@ while IFS= read -r f; do
       esac
       if [ "$f" = "scripts/lib/dsh-ci.sh" ]; then
         case "$content" in *PLUGINS_SUITE_CANDIDATE_ROUTES*|*'"nvidia-nim-'*|*'"zai-'*|*'"ollama-cloud-'*|*'"openrouter-'*) continue ;; esac
-      fi
-      if [ "$f" = "scripts/lib/test_provider_secrets_import.py" ]; then
-        case "$content" in *'"nvidia-nim-'*|*'"zai-'*) continue ;; esac
       fi
       if [ "$f" = ".github/workflows/deploy-dsh-edge.yml" ]; then
         case "$content" in *'deepseek-v4-flash"'*) continue ;; esac
@@ -149,24 +181,6 @@ while IFS= read -r f; do
           *'"nemotron-3-ultra"'*|*'"nemotron-ultra"'*|*'"nemotron-3-super"'*|*'"nemotron-super"'*| \
           *'"glm-5"'*|*'"glm-4"'*) continue ;; \
         esac
-      fi
-      if [ "$f" = "scripts/lib/test/dsh-provider-chain.smoke.sh" ]; then
-        # #1062: фикстура заглушки dsh() воспроизводит ДОСЛОВНУЮ прод-форму
-        # живой ошибки Ollama Cloud (прогон worker.yml 34730173870) — AGENTS.md,
-        # «Тест кормит прод-форму данных, а не пересказ» — не дефолт-провайдер
-        # класса #153 (DEEPSEEK_MODEL здесь всегда primary-model/secondary-model,
-        # см. CHAIN выше в этом же файле).
-        case "$content" in *"for model nemotron-3-ultra"*) continue ;; esac
-      fi
-      if [ "$f" = "scripts/orchestra/test_repo_invariants.py" ]; then
-        # #1094: фикстура инварианта 10 (check_recurring_worker_failure)
-        # воспроизводит ДОСЛОВНУЮ прод-форму той же живой серии Ollama Cloud
-        # (прогоны worker.yml 34735752165/34732869856/34730173870, error_text
-        # снят gh api .../jobs/<id>/logs 2026-09-13) — тот же приём и та же
-        # причина исключения, что у dsh-provider-chain.smoke.sh (#1062) выше:
-        # не дефолт-провайдер класса #153, а тестовые данные для разбора
-        # last_error_log_line/failure_fingerprint.
-        case "$content" in *"for model nemotron-3-ultra"*) continue ;; esac
       fi
       literal_hits="$literal_hits$f:$line
 "
