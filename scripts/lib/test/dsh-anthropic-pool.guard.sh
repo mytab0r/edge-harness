@@ -340,4 +340,29 @@ if sed -e 's/#.*$//' "$AI_REVIEW_WF" | grep -En 'ANTHROPIC_OAUTH'; then
 fi
 echo "GUARD(anthropic-pool): 9) ai-review не потребляет пул ни кодом, ни env-проводкой (#860) — ок"
 
+# ── 10) #1097 (живой инцидент): _dsh_patch_profile_anthropic_pool ОБЯЗАНА
+#       сама прописывать llm-pi-ai.providers.anthropic-pool статически, а не
+#       полагаться на самопрописку плагина через ctx.get('settings') — та
+#       структурно недоступна в headless (см. комментарий у функции).
+#       baseURL патча обязан указывать на ТОТ ЖЕ порт, что экспортируется в
+#       DSH_ANTHROPIC_POOL_PORT (сервер плагина слушает именно эту
+#       переменную), apiKeyEnv обязан резолвиться в НЕПУСТОЕ значение той же
+#       переменной окружения. Мутация (снять provider-блок из фикса) красит
+#       эту секцию — доказательство приложено в PR текстом обоих прогонов. ──
+(
+  export HOME="$(mktemp -d)"
+  _dsh_patch_profile_anthropic_pool headless
+  PATCH_FILE="$HOME/.dsh/profiles/headless/cordis.patch.yml"
+  [ -f "$PATCH_FILE" ] || { echo "::error::10) $PATCH_FILE не создан" >&2; exit 1; }
+  grep -q '^- id: llm-pi-ai$' "$PATCH_FILE" || { echo "::error::10) патч не содержит секцию llm-pi-ai — провайдер anthropic-pool не зарегистрирован статически (регресс #1097, ctx.get('settings') недоступен в headless): $(cat "$PATCH_FILE")" >&2; exit 1; }
+  grep -q '^      anthropic-pool:$' "$PATCH_FILE" || { echo "::error::10) провайдер anthropic-pool не найден внутри llm-pi-ai.providers: $(cat "$PATCH_FILE")" >&2; exit 1; }
+  grep -q "^        baseURL: http://127.0.0.1:${ANTHROPIC_OAUTH_POOL_PORT}\$" "$PATCH_FILE" || { echo "::error::10) baseURL патча не указывает на фиксированный порт \$ANTHROPIC_OAUTH_POOL_PORT=${ANTHROPIC_OAUTH_POOL_PORT}: $(cat "$PATCH_FILE")" >&2; exit 1; }
+  [ "${DSH_ANTHROPIC_POOL_PORT:-}" = "$ANTHROPIC_OAUTH_POOL_PORT" ] || { echo "::error::10) DSH_ANTHROPIC_POOL_PORT не экспортирован (получено '${DSH_ANTHROPIC_POOL_PORT:-}', ожидался ${ANTHROPIC_OAUTH_POOL_PORT}) — плагин слушает именно эту переменную, без неё порт сервера не совпадёт с baseURL патча" >&2; exit 1; }
+  APIKEY_LINE=$(grep '^        apiKeyEnv: ' "$PATCH_FILE" || true)
+  APIKEY_VARNAME=${APIKEY_LINE#*apiKeyEnv: }
+  [ -n "$APIKEY_VARNAME" ] || { echo "::error::10) apiKeyEnv отсутствует в патче: $(cat "$PATCH_FILE")" >&2; exit 1; }
+  [ -n "${!APIKEY_VARNAME:-}" ] || { echo "::error::10) переменная apiKeyEnv '$APIKEY_VARNAME' пуста в окружении — llm-pi-ai откажется резолвить провайдер" >&2; exit 1; }
+) || fail "10) статическая регистрация anthropic-pool в cordis.patch.yml сломана (регресс #1097)"
+echo "GUARD(anthropic-pool): 10) llm-pi-ai.providers.anthropic-pool зарегистрирован статически, порт/apiKeyEnv согласованы — ок (#1097)"
+
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"

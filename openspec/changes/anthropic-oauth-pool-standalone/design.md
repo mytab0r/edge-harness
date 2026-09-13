@@ -74,8 +74,11 @@ Anthropic Messages — это не «ещё один OpenAI-совместимы
 
 1. Если `DSH_ANTHROPIC_POOL_ACTIVE=1` (аккаунты импортированы) — патчит
    профиль под пул (`agent-default-model: {provider: anthropic-pool, model:
-   claude-sonnet-4-5}`, СВОЯ функция `_dsh_patch_profile_anthropic_pool`, не
-   трогает `_dsh_patch_profile_plain`) и делает ОДИН прогон через
+   claude-sonnet-4-5}` + статическая регистрация
+   `llm-pi-ai.providers.anthropic-pool` на фиксированном порту прокси —
+   фикс #1097, см. «Не подтверждено» ниже, СВОЯ функция
+   `_dsh_patch_profile_anthropic_pool`, не трогает `_dsh_patch_profile_plain`)
+   и делает ОДИН прогон через
    `dsh_run_with_retry` (не `dsh_run_with_provider_chain` — пул уже несёт
    собственный многоаккаунтный failover ВНУТРИ вызова, `lib/index.js::
    forward`: перебирает все непопробованные аккаунты на 401/403/429 прежде
@@ -173,25 +176,32 @@ job'е, порядок вызова (импорт до/после монтажа
 
 ## Не подтверждено
 
-- **Гонка регистрации провайдера при первом реальном запросе.**
-  `ensureProvider()` (`lib/index.js`) вызывает `discoverModels()` — сетевой
-  запрос к Anthropic `/v1/models` — ПЕРЕД тем, как зарегистрировать
-  провайдера в `llm-pi-ai.providers` через `settings.update`. Оба вызова
-  асинхронны относительно `server.listen()`, который сам по себе не
-  блокирует загрузку остальных плагинов хоста. Успеет ли эта регистрация
-  завершиться раньше, чем `agent-default-model` попробует резолвить
-  `provider: anthropic-pool` в РЕАЛЬНОМ (не `--dump-config`) прогоне
-  `dsh --profile headless "<текст>"` — не проверено без живых аккаунтов
-  (закрывающая проверка, tasks.md). Структурная проверка монтажа
-  (`dsh --dump-config` на id-строку из `cordis.patch.yml`) от этой гонки не
-  зависит — та строка приходит из статического bundle-патча, не из
-  асинхронной регистрации в `llm-pi-ai.providers`.
+- **(РЕШЕНО #1097, 2026-09-13, была неверная гипотеза «гонка».** Раздел ниже
+  оставлен как история: предыдущая версия этого документа предполагала гонку
+  между `discoverModels()`/`settings.update` и первым реальным резолвом
+  `agent-default-model`. Живой прогон `worker.yml` 34746091297 показал, что
+  дело не в гонке вовсе: `ctx.get('settings')` в профиле `headless`
+  ВСЕГДА возвращает `undefined` — сервис `@deepseek-ai/dsh-settings` не
+  входит ни в одну рантайм-зависимость пакетов, реально идущих в headless
+  (`@deepseek-ai/dsh`, `dsh-headless`, `dsh-code-runtime-worker-thread`),
+  `@deepseek-ai/dsh-headless/cordis.patch.yml` не монтирует settings-сервис
+  вовсе («no Host, HTTP server, Web runtime, or browser plugin»).
+  `ensureProvider()` бросает `TypeError` на строке `settings.update` ДО
+  всякого обращения к `discoverModels()`-таймингу — детерминированно, на
+  КАЖДОМ прогоне headless, а не иногда. Разбор — `docs/research/32-claude-oauth-provider.md`,
+  раздел «Дополнение 2026-09-13».
+  Фикс: `_dsh_patch_profile_anthropic_pool` (`scripts/lib/dsh-ci.sh`) теперь
+  САМА статически прописывает `llm-pi-ai.providers.anthropic-pool` в
+  `cordis.patch.yml` (порт прокси фиксирован `DSH_ANTHROPIC_POOL_PORT`,
+  известен ДО старта dsh) — регистрация больше не зависит от
+  `ctx.get('settings')` вовсе, вопрос гонки снят как неприменимый.**
 - Точный набор `id` моделей, которые реально отдаёт `/v1/models` живых
   аккаунтов владельца — статический дефолт плагина `claude-sonnet-4-5`
-  используется как id для `agent-default-model.model`; если `discoverModels()`
-  успеет подменить список ДО резолва модели и в нём не окажется этого id —
-  запрос отклонится с «модель не найдена». Проверяется только живым
-  прогоном.
+  используется как id для `agent-default-model.model` И теперь также как
+  единственная запись в статическом `llm-pi-ai.providers.anthropic-pool.models`
+  (см. фикс #1097 выше) — если у аккаунта владельца этого id нет в живом
+  каталоге, запрос отклонится с «модель не найдена». Проверяется только
+  живым прогоном.
 - Поведение `dsh plugin add` при повторном монтаже ОБОИХ независимых
   плагинов (suite позже включат снова, #790 решат) в один профиль — два
   разных `dsh plugin add` на разные tgz одного плагина `anthropic-oauth-pool`
