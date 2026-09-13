@@ -1549,11 +1549,41 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
     (pulse_guard.FAILURE_CONCLUSIONS) с ОДНИМ И ТЕМ ЖЕ классифицированным
     отпечатком причины (pulse_guard.failure_fingerprint по первому упавшему
     job'у, pulse_guard.last_error_log_line — тот же факт, не гипотеза, что уже
-    несёт last_failure_error). Первый success, первый незавершённый прогон
-    ИЛИ смена отпечатка обрывают серию — считаем именно «сколько подряд с
-    ОДНОЙ причиной», не просто «сколько подряд красных» (это число уже
-    отдельно считает pulse_guard.count_consecutive_failures для паузы
-    диспатча).
+    несёт last_failure_error). Success ИЛИ смена отпечатка обрывают серию —
+    считаем именно «сколько подряд с ОДНОЙ причиной», не просто «сколько
+    подряд красных» (это число уже отдельно считает
+    pulse_guard.count_consecutive_failures для паузы диспатча).
+
+    Незавершённый прогон (conclusion=None — in_progress/queued) НЕ success и
+    НЕ провал: его исход ещё не известен, а не «хорошо». worker.yml — один
+    прогон на репозиторий (concurrency: group: worker) и работает часами
+    (DSH_TIMEOUT_SECS=7200) — «прогон ещё идёт» это ОБЫЧНОЕ состояние
+    здорового конвейера, не редкая развилка, и застаёт его почти каждый
+    периодический пульс. Раньше (#794, до находки живой серии 2026-09-13:
+    9 из 11 прогонов подряд упали классом «max_tokens exceeds» — инвариант
+    молчал все эти часы) None обрывал скан наравне с success — это склеивало
+    «серии нет» с «серия ещё не кончилась считаться», и любой пульс, заставший
+    воркер за работой, видел пустую серию независимо от того, что было
+    ДО текущего прогона. Правильно: None пропускается (continue, не break) —
+    сканирование идёт дальше вглубь списка, к уже завершённым более старым
+    прогонам, а не останавливается на первом же неизвестном исходе.
+
+    Несколько незавершённых подряд (или вперемешку с провалами — теоретически
+    возможно при ручном re-run старого прогона, хотя concurrency-группа делает
+    это редкостью) обрабатываются тем же правилом: каждый пропускается, ни
+    один не входит в streak_runs и не сбрасывает уже накопленный отпечаток.
+    Ложной серии это не создаёт: сравниваются только РЕАЛЬНО завершённые
+    прогоны, success по-прежнему обрывает скан безусловно — если между двумя
+    группами провалов найдётся настоящий success (уже известный, не
+    гипотетический), серия обрывается на нём, как и раньше. То, что где-то
+    среди уже пропущенных None прогон ПОЗЖЕ окажется success, этот скан не
+    предвидит и не обязан: это снимок текущего пульса («N провалов подряд
+    случились ДО прогона, чей исход сейчас не известен») — факт, который
+    неверным не станет, что бы ни решил ещё не завершённый прогон; когда он
+    завершится, следующий пульс перечитает список заново со свежим
+    conclusion на его месте (success на голове списка снова обрывает скан на
+    первом шаге, как в здоровом случае). Флаг pending_seen в результате
+    называет это честно, не гадая об исходе.
 
     Дешёвый путь в здоровом состоянии: один запрос списка прогонов; если
     первый же прогон не упал (обычный случай), функция возвращает [] без
@@ -1571,9 +1601,14 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
     streak_job_name: str | None = None
     streak_error_text: str | None = None
     streak_runs: list[dict] = []
+    pending_seen = False
     for run in runs:
-        if run.get("conclusion") not in pulse_guard.FAILURE_CONCLUSIONS:
-            break  # success/None — серия «подряд» обрывается здесь, не позже
+        conclusion = run.get("conclusion")
+        if conclusion is None:
+            pending_seen = True
+            continue  # исход неизвестен — пропускаем, не обрываем (см. докстринг)
+        if conclusion not in pulse_guard.FAILURE_CONCLUSIONS:
+            break  # success — серия обрывается здесь, старше уже не в счёт
         try:
             bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
         except RuntimeError:
@@ -1605,6 +1640,7 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
         "since": streak_runs[-1].get("created_at"),
         "until": streak_runs[0].get("updated_at"),
         "latest_run_url": streak_runs[0].get("html_url"),
+        "pending_seen": pending_seen,
     }]
 
 
@@ -2215,11 +2251,16 @@ def build_report(repo: str, now: datetime,
     findings[10] = v10
     if v10:
         for item in v10:
+            pending_note = (
+                " (есть ещё не завершённый прогон в этом же окне — его исход "
+                "пока не известен, серия посчитана по уже завершённым)"
+                if item.get("pending_seen") else ""
+            )
             lines.append(
                 f"🚨 [10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
                 f"одной причиной, с {item['since']} по {item['until']} (job "
                 f"«{item['job_name']}»): {item['error_text']} — последний прогон "
-                f"{item['latest_run_url']}"
+                f"{item['latest_run_url']}{pending_note}"
             )
     else:
         lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
