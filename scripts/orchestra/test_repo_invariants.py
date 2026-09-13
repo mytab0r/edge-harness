@@ -1379,10 +1379,11 @@ def test_wasted_ai_review_flags_run_after_verdict_with_unchanged_fingerprint(mon
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    violations = ri.check_wasted_ai_review_runs(REPO, [pull])
-    assert len(violations) == 1
-    assert violations[0]["pr"] == 333
-    assert violations[0]["wasted_runs"][0]["run_id"] == 34193569472
+    result = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["pr"] == 333
+    assert result.violations[0]["wasted_runs"][0]["run_id"] == 34193569472
 
 
 def test_wasted_ai_review_silent_when_no_run_after_verdict(monkeypatch):
@@ -1399,7 +1400,7 @@ def test_wasted_ai_review_silent_when_no_run_after_verdict(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_silent_when_fingerprint_actually_changed(monkeypatch):
@@ -1416,7 +1417,7 @@ def test_wasted_ai_review_silent_when_fingerprint_actually_changed(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_silent_without_final_verdict_label():
@@ -1425,7 +1426,7 @@ def test_wasted_ai_review_silent_without_final_verdict_label():
     # код полезет в comments без нужды).
     fake = FakeGh({})
     pull = open_pr(333, labels=["review:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
     assert fake.calls == []
 
 
@@ -1434,7 +1435,7 @@ def test_wasted_ai_review_silent_when_ai_failed_not_final(monkeypatch):
     # трогает такой PR вовсе, даже если отпечаток совпал бы.
     fake = FakeGh({})
     pull = open_pr(333, labels=["review:ok", "ai:failed"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
     assert fake.calls == []
 
 
@@ -1442,7 +1443,7 @@ def test_wasted_ai_review_silent_without_verdict_comment(monkeypatch):
     fake = FakeGh({"issues/333/comments": []})
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
@@ -1459,6 +1460,75 @@ def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
     fake = FakeGh({"actions/workflows/ai-review.yml/runs": runs_response})
     found = ri.ai_review_runs_after(REPO, 333, "2026-09-08T06:30:00Z", fake)
     assert [r["run_id"] for r in found] == [2]
+
+
+def test_ai_review_runs_after_raises_on_unexpected_form():
+    # Находка issue #1096/#1109 (F7): раньше форма не по контракту (не dict,
+    # без ключа workflow_runs, значение под ключом не список) молча читалась
+    # как "прогонов нет" — теперь RuntimeError, вызывающая сторона
+    # (check_wasted_ai_review_runs) решает третий исход, не эта функция.
+    fake = FakeGh({"actions/workflows/ai-review.yml/runs": {"message": "rate limited"}})
+    with pytest.raises(RuntimeError):
+        ri.ai_review_runs_after(REPO, 333, "2026-09-08T06:30:00Z", fake)
+
+
+def test_runs_of_rejects_key_present_but_not_list():
+    # Ключ ПРИСУТСТВУЕТ, но значение не список — `{}`-дефолт или
+    # `"workflow_runs" in dict`-проверка пропустили бы это с ложным
+    # «форма подтверждена» (доводка ai-review PR #1110). runs_of — единая
+    # точка разбора формы (F3 в границах repo_invariants.py, PR #1140):
+    # обе ошибки формы живут в одном месте.
+    with pytest.raises(RuntimeError):
+        ri.runs_of({"workflow_runs": None}, "worker.yml")
+    with pytest.raises(RuntimeError):
+        ri.runs_of({"workflow_runs": {"count": 3}}, "worker.yml")
+    with pytest.raises(RuntimeError):
+        ri.runs_of({"message": "secondary rate limit"}, "worker.yml")
+    assert ri.runs_of({"workflow_runs": []}, "worker.yml") == []
+
+
+def test_wasted_ai_review_unknown_reason_names_pr_step_and_denominator(monkeypatch):
+    # Чеклист ai-review PR #1140: знаменатель причины — только PR с финальным
+    # ai-вердиктом (не все открытые), а сам факт — «какой PR, какой шаг,
+    # какая ошибка» (текст RuntimeError его уже называет), не перечень всех
+    # трёх шагов разом (AGENTS.md «Алерт не гадает»: данные для факта есть —
+    # пойманное исключение).
+    files = pr_files()
+    fp = ri.review_labels.diff_fingerprint(files)
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": files,
+        "actions/workflows/ai-review.yml/runs": RuntimeError("gh api: HTTP 502: Bad Gateway"),
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    plain = open_pr(334, labels=["review:ok"])  # без ai-вердикта — не в знаменателе
+    result = ri.check_wasted_ai_review_runs(REPO, [pull, plain])
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "1 из 1" in result.reason
+    assert "#333" in result.reason
+    assert "история прогонов" in result.reason
+    assert "gh api: HTTP 502: Bad Gateway" in result.reason
+
+
+def test_wasted_ai_review_unknown_when_runs_history_unavailable(monkeypatch):
+    # Третий исход (issue #1096/#1109, F7): комментарий-вердикт и файлы PR
+    # прочитаны, но история прогонов ai-review.yml недоступна — раньше это
+    # молча читалось как "растраты нет" (ai_review_runs_after съедала форму
+    # ответа), теперь check_wasted_ai_review_runs обязан вернуть unknown(),
+    # не ok(), раз хоть один проверяемый PR не досмотрен до конца.
+    files = pr_files()
+    fp = ri.review_labels.diff_fingerprint(files)
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": files,
+        "actions/workflows/ai-review.yml/runs": RuntimeError("gh api: HTTP 502: Bad Gateway"),
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    result = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert result.reason
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1628,12 +1698,13 @@ def test_recurring_worker_failure_flags_streak_with_same_cause(monkeypatch):
     monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
         103: SESSION_LACKS_ID_ERROR, 102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
     })))
-    violations = ri.check_recurring_worker_failure(REPO)
-    assert len(violations) == 1
-    assert violations[0]["streak"] == 3
-    assert violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
-    assert violations[0]["since"] == "2026-09-08T08:45:00Z"
-    assert violations[0]["until"] == "2026-09-09T00:00:00Z"
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
+    assert result.violations[0]["since"] == "2026-09-08T08:45:00Z"
+    assert result.violations[0]["until"] == "2026-09-09T00:00:00Z"
 
 
 def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
@@ -1652,7 +1723,7 @@ def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
     monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
         102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
     })))
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
 
 
 def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypatch):
@@ -1675,7 +1746,7 @@ def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypat
         102: SESSION_LACKS_ID_ERROR,
         101: "No such file or directory",  # другая, старая причина — обрывает серию
     })))
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
 
 
 def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
@@ -1690,8 +1761,246 @@ def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
     assert not any("actions/runs/3/jobs" in call or "actions/runs/2/jobs" in call for call in fake.calls)
+
+
+def test_recurring_worker_failure_unknown_when_runs_history_unavailable(monkeypatch):
+    # Третий исход (issue #1096/#1109): история прогонов worker.yml
+    # недоступна целиком (транспорт/квота) — раньше молча читалась как
+    # "серии нет" (`except RuntimeError: return []`), теперь unknown().
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": RuntimeError(
+            "gh api: HTTP 503: Service Unavailable"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert result.reason
+
+
+def test_recurring_worker_failure_unknown_on_malformed_run_history_shape(monkeypatch):
+    # Находка ai-review PR #1140 (находка 2, F3): докстринг обещал unknown()
+    # на форму ответа не по контракту, а код шёл через pulse_guard.recent_runs,
+    # который молча схлопывает такой ответ (вторичный рейт-лимит — dict без
+    # ключа workflow_runs, живой класс #120A) в [] — инвариант отвечал тем же
+    # 💚, что и здоровое состояние. Теперь форма разбирает runs_of() — ответ
+    # не по контракту даёт unknown(), а не ok().
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"message": "secondary rate limit"},
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "неожиданной" in result.reason
+    # Ключ есть, но значение не список — та же слепота, та же граница.
+    fake2 = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": None},
+    })
+    patch_gh(monkeypatch, fake2)
+    result2 = ri.check_recurring_worker_failure(REPO)
+    assert result2.status == ri.check_result.STATUS_UNKNOWN
+    assert "не список" in result2.reason
+
+
+def test_recurring_worker_failure_unknown_when_jobs_lookup_fails_mid_scan(monkeypatch):
+    # Находка ai-review PR #1140 (находка 1): список прогонов получен, но
+    # job'ы упавшего прогона недоступны (failing_jobs кидает RuntimeError —
+    # по запросу на прогон, типичный способ поймать вторичную квоту посреди
+    # скана при живом списке). Раньше `except RuntimeError: break` с пустым
+    # streak_runs возвращал ok() — то же 💚 при «классифицировать не удалось
+    # вовсе». Теперь — unknown() с фактом: какой прогон, какая ошибка.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/2/jobs": RuntimeError("gh api: HTTP 403: secondary rate limit"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "не удалось досмотреть" in result.reason
+    assert "прогона 2" in result.reason
+    assert "gh api: HTTP 403: secondary rate limit" in result.reason
+    # Сколько прогонов осталось неклассифицированным — тоже факт, не гипотеза.
+    assert "0 из 2" in result.reason
+
+
+def test_recurring_worker_failure_violation_survives_jobs_lookup_failure_deeper(monkeypatch):
+    # Дополнение к находке 1: накопленная серия ≥ порога ПОБЕЖДАЕТ
+    # неопределённость по недосмотренному хвосту — доказанное нарушение
+    # не прячется за чужим «не знаю» (тот же принцип, что у инвариантов 8/14).
+    # Здесь серия из трёх классифицирована, четвёртый (старейший) — обрыв
+    # транспортом: всё равно violation().
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-09T06:00:00Z"),
+            worker_run(3, "2026-09-09T00:00:00Z"),
+            worker_run(2, "2026-09-08T18:00:00Z"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/4/jobs": worker_jobs_payload(104),
+        "actions/runs/3/jobs": worker_jobs_payload(103),
+        "actions/runs/2/jobs": worker_jobs_payload(102),
+        "actions/runs/1/jobs": RuntimeError("gh api: HTTP 502: Bad Gateway"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        104: SESSION_LACKS_ID_ERROR, 103: SESSION_LACKS_ID_ERROR, 102: SESSION_LACKS_ID_ERROR,
+    })))
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations[0]["streak"] == 3
+
+
+def test_recurring_worker_failure_jobs_lookup_failure_after_success_is_still_ok(monkeypatch):
+    # Обрыв скана по ДАННЫМ (success обрывает серию безусловно) остаётся
+    # честным ok(): недосмотренного хвоста за success нет по определению
+    # серии — это факт о прогоне, не транспортная деградация; RuntimeError
+    # на job'ах СТАРШЕ success вообще не должен быть запрошен.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(2, "2026-09-09T00:00:00Z", conclusion="success"),
+            worker_run(1, "2026-09-08T08:45:00Z"),
+        ]},
+        "actions/runs/1/jobs": RuntimeError("gh api: HTTP 403: secondary rate limit"),
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
+    assert not any("actions/runs/1/jobs" in call for call in fake.calls)
+
+
+# ── Живая серия 2026-09-13 (issue найденный владельцем): голова списка ──────
+# ещё выполняется — прогон-снимок реального `gh api
+# repos/mytab0r/edge-harness/actions/workflows/worker.yml/runs`. IDs, времена
+# и текст ошибок — дословно с живого репозитория (сверено `gh api
+# repos/mytab0r/edge-harness/actions/jobs/<id>/logs`), не пересказ:
+#
+#   34746091297  in_progress (conclusion=None) — воркер ещё выполняется
+#   34739313568  failure — цепочка исчерпана целиком таймаутами (ДРУГОЙ,
+#                отличный от следующих трёх, отпечаток: в этом прогоне
+#                Ollama-2 упёрся в таймаут, а не в max_tokens)
+#   34735752165  failure — Ollama-2 rc=1, max_tokens (131072) exceeds ...
+#                (65536) for model nemotron-3-ultra — класс НЕ переключаемый
+#   34732869856  failure — тот же класс max_tokens (другой ref-UUID)
+#   34730173870  failure — тот же класс max_tokens (другой ref-UUID)
+#   34728868781  success
+#
+# Диагностика владельца («четыре подряд одного класса») не подтвердилась
+# буквально: реальный fingerprint (workflow+job+нормализованная строка)
+# отличает «цепочка исчерпана таймаутами» от «Ollama-2 max_tokens» — это
+# ДЕЙСТВИТЕЛЬНО разные причины, а не шум нормализации (ref-UUID и цифры
+# схлопываются, но сам текст разный). Настоящая серия одной причины — три
+# прогона (34735752165/34732869856/34730173870), и она была НЕВИДИМА
+# инварианту, пока голова списка была in_progress (см. тест ниже,
+# использующий более раннюю живую точку среза — до завершения 34739313568).
+
+OLLAMA2_MAX_TOKENS_ERROR = (
+    "цепочка провайдеров: Ollama-2 — rc=1, класс НЕ переключаемый (stderr: "
+    "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum "
+    "output tokens (65536) for model nemotron-3-ultra (ref: {ref}) ), "
+    "дальше по цепочке не иду (следующие провайдеры не тронуты)"
+)
+CHAIN_EXHAUSTED_TIMEOUT_ERROR = (
+    "цепочка провайдеров исчерпана целиком (GLM, ZAI, OpenRouter-2, "
+    "Ollama-2, Ollama-3, Ollama-1, NVIDIA-NIM-1, OpenRouter-1, NVIDIA-NIM-2)"
+)
+
+
+def test_recurring_worker_failure_pending_head_does_not_hide_streak_behind_it(monkeypatch):
+    # Живая точка среза (примерно 2026-09-13T06:00Z, до того как 34739313568
+    # завершился): голова списка — ещё идущий прогон 34739313568, а сразу за
+    # ним три ЗАВЕРШЁННЫХ прогона одной и той же причины (max_tokens).
+    # Старый код обрывал скан на первом же None и возвращал [] — серия ниже
+    # была НЕВИДИМА. Это и есть мутация, которую полагается доказать: снять
+    # правку (заменить `continue` на `break` для conclusion is None) красит
+    # этот тест.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(34739313568, "2026-09-13T05:02:32Z", "2026-09-13T06:00:00Z", conclusion=None),
+            worker_run(34735752165, "2026-09-13T03:32:44Z", "2026-09-13T04:26:35Z"),
+            worker_run(34732869856, "2026-09-13T02:22:03Z", "2026-09-13T03:16:04Z"),
+            worker_run(34730173870, "2026-09-13T01:17:46Z", "2026-09-13T02:11:55Z"),
+            worker_run(34728868781, "2026-09-13T00:47:21Z", "2026-09-13T01:06:21Z", conclusion="success"),
+        ]},
+        "actions/runs/34735752165/jobs": worker_jobs_payload(103666759504),
+        "actions/runs/34732869856/jobs": worker_jobs_payload(103658813654),
+        "actions/runs/34730173870/jobs": worker_jobs_payload(103651384804),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103666759504: OLLAMA2_MAX_TOKENS_ERROR.format(ref="f5feae9d-e13e-4d1a-90f0-c315e4389e21"),
+        103658813654: OLLAMA2_MAX_TOKENS_ERROR.format(ref="e13e4d1a-90f0-c315-e438-9e21f5feae9d"),
+        103651384804: OLLAMA2_MAX_TOKENS_ERROR.format(ref="bea56f62-51af-47b6-b57d-9b03d8871690"),
+    })))
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["since"] == "2026-09-13T01:17:46Z"
+    assert result.violations[0]["until"] == "2026-09-13T04:26:35Z"
+    assert result.violations[0]["latest_run_url"] == f"https://github.com/{REPO}/actions/runs/34735752165"
+    assert result.violations[0]["pending_seen"] is True
+
+
+def test_recurring_worker_failure_does_not_bridge_across_different_cause(monkeypatch):
+    # Текущая (2026-09-13T07:47Z) живая точка среза: голова — ещё идущий
+    # 34746091297, за ним завершённый провал 34739313568 с ДРУГИМ отпечатком
+    # (см. блок-комментарий выше), а уже за ним — настоящая серия max_tokens.
+    # Пропуск None не обязан «дотягиваться» через несовпадающий отпечаток:
+    # серия обрывается на первом же расхождении причины, как и раньше —
+    # инвариант молчит (это НЕ серия одной причины длиной 4, а 1 + разрыв + 3).
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(34746091297, "2026-09-13T07:47:31Z", "2026-09-13T07:47:35Z", conclusion=None),
+            worker_run(34739313568, "2026-09-13T05:02:32Z", "2026-09-13T07:45:23Z"),
+            worker_run(34735752165, "2026-09-13T03:32:44Z", "2026-09-13T04:26:35Z"),
+            worker_run(34732869856, "2026-09-13T02:22:03Z", "2026-09-13T03:16:04Z"),
+            worker_run(34730173870, "2026-09-13T01:17:46Z", "2026-09-13T02:11:55Z"),
+            worker_run(34728868781, "2026-09-13T00:47:21Z", "2026-09-13T01:06:21Z", conclusion="success"),
+        ]},
+        "actions/runs/34739313568/jobs": worker_jobs_payload(103676181082),
+        "actions/runs/34735752165/jobs": worker_jobs_payload(103666759504),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        103676181082: CHAIN_EXHAUSTED_TIMEOUT_ERROR,
+        103666759504: OLLAMA2_MAX_TOKENS_ERROR.format(ref="f5feae9d-e13e-4d1a-90f0-c315e4389e21"),
+    })))
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
+    # Дотягиваться до третьего прогона незачем — расхождение отпечатка уже
+    # обнаружено на втором; проверяем, что скан честно останавливается, а не
+    # молча досматривает весь список без дела.
+    assert not any("actions/runs/34732869856/jobs" in call for call in fake.calls)
+
+
+def test_recurring_worker_failure_skips_multiple_pending_runs_mid_streak(monkeypatch):
+    # Синтетический (не прод-снятый) защитный случай: несколько незавершённых
+    # прогонов подряд (или вперемешку) внутри окна — теоретически возможно при
+    # ручном re-run старого прогона (created_at не меняется, conclusion снова
+    # None). Ни один не обрывает скан, ни один не входит в streak_runs.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(6, "2026-09-13T09:00:00Z", conclusion=None),
+            worker_run(5, "2026-09-13T08:00:00Z", conclusion=None),
+            worker_run(4, "2026-09-13T07:00:00Z"),
+            worker_run(3, "2026-09-13T06:00:00Z"),
+            worker_run(2, "2026-09-13T05:00:00Z"),
+        ]},
+        "actions/runs/4/jobs": worker_jobs_payload(204),
+        "actions/runs/3/jobs": worker_jobs_payload(203),
+        "actions/runs/2/jobs": worker_jobs_payload(202),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
+        204: SESSION_LACKS_ID_ERROR, 203: SESSION_LACKS_ID_ERROR, 202: SESSION_LACKS_ID_ERROR,
+    })))
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["pending_seen"] is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2004,7 +2313,10 @@ def test_phantom_pause_flags_active_marker_with_zero_real_failures(monkeypatch):
         "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_conveyor_gate_phantom_pause(REPO)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    violations = result.violations
     assert len(violations) == 1
     assert violations[0]["failures"] == 0
     assert violations[0]["threshold"] == ri.pulse_guard.WORKER_FAILURE_PAUSE_AFTER
@@ -2021,7 +2333,8 @@ def test_phantom_pause_silent_when_no_marker(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
 def test_phantom_pause_silent_when_real_failures_meet_threshold(monkeypatch):
@@ -2036,12 +2349,15 @@ def test_phantom_pause_silent_when_real_failures_meet_threshold(monkeypatch):
         "issues/120/comments": [pause_marker_comment("2026-09-10T11:45:00Z")],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
 def test_phantom_pause_silent_when_head_run_still_in_progress(monkeypatch):
     """Здоровое состояние (issue #899, п.2): голова списка ещё выполняется
-    (conclusion=None) — законное объяснение неопределённости, не фантом."""
+    (conclusion=None), но моложе scheduler.WORKER_STALL_MINUTES — законное
+    объяснение неопределённости, не фантом (issue #1096: старше порога это
+    уже НЕ ok(), см. следующий тест)."""
     fake = FakeGh({
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
             worker_run(4, "2026-09-10T11:55:00Z", conclusion=None),
@@ -2054,7 +2370,36 @@ def test_phantom_pause_silent_when_head_run_still_in_progress(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)  # +5 мин от создания головы — далеко внутри WORKER_STALL_MINUTES
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
+
+
+def test_phantom_pause_unknown_when_head_run_stalled_past_threshold(monkeypatch):
+    """issue #1096, F1 (живой замер: голова списка не завершена ≈63%
+    календарного времени — «прогон ещё идёт» это ОБЫЧНОЕ состояние, а не
+    редкий край). Та же фикстура, что у предыдущего теста, но `now` дальше
+    scheduler.WORKER_STALL_MINUTES (295 мин) от создания головы — «прогон
+    ещё идёт» перестаёт быть правдоподобным объяснением, но подряд-провалы
+    после якоря пересчитать всё равно нельзя, пока эта голова висит:
+    check_result.unknown(), НЕ check_result.ok() (раньше — тихий [])."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(4, "2026-09-10T11:55:00Z", conclusion=None),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            pause_marker_comment("2026-09-10T11:45:00Z"),
+            probe_marker_comment("2026-09-10T11:55:00Z", 1),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.scheduler.WORKER_STALL_MINUTES == 295
+    now = utc(2026, 9, 10, 17, 0)  # +305 мин от создания головы — за порогом
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "305" in result.reason
+    assert "WORKER_STALL_MINUTES" in result.reason
 
 
 def test_phantom_pause_completion_time_anchor_clears_stale_marker(monkeypatch):
@@ -2074,24 +2419,53 @@ def test_phantom_pause_completion_time_anchor_clears_stale_marker(monkeypatch):
         "issues/120/comments": [probe_marker_comment("2026-09-10T17:09:00Z", 4)],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 19, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok()
 
 
-def test_phantom_pause_best_effort_on_network_failure(monkeypatch):
-    """Сеть недоступна — best-effort [] (тот же принцип, что у 10/12): отказ
-    инфраструктуры не должен ронять весь build_report ради инварианта, у
-    которого и так нет действия жёстче наблюдения."""
+def test_phantom_pause_unknown_on_network_failure(monkeypatch):
+    """issue #1096, F1: сеть недоступна — раньше тихий [] (то же самое 💚,
+    что и доказанное «нарушений нет»); теперь check_result.unknown() с
+    названной причиной (AGENTS.md «Алерт не гадает»)."""
     fake = FakeGh({
         f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": RuntimeError("gh api: 502"),
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_conveyor_gate_phantom_pause(REPO) == []
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "gh api: 502" in result.reason
+
+
+def test_phantom_pause_unknown_on_malformed_run_history_shape(monkeypatch):
+    """Находка ai-review PR #1110 (F3, живой класс #120A): ответ на список
+    прогонов не той формы (dict вторичного рейт-лимита без ключа
+    workflow_runs) раньше молча схлопывался в `[]` внутри `pulse_guard.
+    recent_runs` — check_conveyor_gate_phantom_pause видела `not runs` и
+    отвечала ok(), неотличимо от «прогонов правда нет». Теперь форма
+    проверяется до этого — unknown()."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"message": "secondary rate limit"},
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "неожиданной" in result.reason
 
 
 def test_phantom_pause_not_in_ci_gating():
     """Долг на живом репозитории ещё не измерен (тот же порядок, что у
     1/5/9/10/12) — наблюдательный, не гейтящий."""
     assert 13 not in ri.CI_GATING
+
+
+def test_phantom_pause_not_escalating():
+    # issue #1096, ai-review PR #1110, некритичное замечание 2: 13 несёт
+    # CheckResult — findings[13] коллапсирует unknown() в [], эскалация по
+    # findings не должна на него полагаться, пока нет отдельного канала.
+    assert 13 not in ri.ESCALATING_INVARIANTS
+    assert 13 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
 
 
 def test_build_report_wires_invariant_13(monkeypatch):
@@ -2123,7 +2497,7 @@ def test_build_report_wires_invariant_13(monkeypatch):
 def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
     fake = FakeGh({"search/issues": {"items": []}})
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeypatch):
@@ -2141,8 +2515,9 @@ def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeyp
         ],
     })
     patch_gh(monkeypatch, fake)
-    violations = ri.check_worker_false_success_comment(REPO)
-    assert violations == [{
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
         "issue": 900,
         "url": "https://github.com/mytab0r/edge-harness/issues/900",
         "title": "какая-то задача",
@@ -2166,7 +2541,7 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
@@ -2188,7 +2563,7 @@ def test_worker_false_success_comment_search_false_positive_not_reported(monkeyp
         ],
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
 
 
 def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):
@@ -2206,16 +2581,104 @@ def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(
     )
 
 
-def test_worker_false_success_comment_best_effort_on_network_failure(monkeypatch):
+def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
+    # issue #1096, F6: Search недоступен целиком — раньше тихий [] (то же
+    # 💚, что у доказанного «нарушений нет»); теперь check_result.unknown()
+    # с названной причиной.
     fake = FakeGh({"search/issues": RuntimeError("gh api: rate limited")})
     patch_gh(monkeypatch, fake)
-    assert ri.check_worker_false_success_comment(REPO) == []
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "rate limited" in result.reason
+
+
+def test_worker_false_success_comment_unknown_on_malformed_search_response(monkeypatch):
+    """Находка ai-review PR #1110 (F3): ответ Search без ключа `items`
+    (dict вторичного рейт-лимита) раньше молча читался как `{"items": []}`
+    (`(result or {}).get("items") or []`) — «Search правда ничего не нашёл»
+    и «ответ неожиданной формы» были неразличимы, оба давали ok(). Теперь
+    форма проверяется до чтения items — unknown()."""
+    fake = FakeGh({"search/issues": {"message": "secondary rate limit"}})
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "неожиданной" in result.reason
+
+
+def test_worker_false_success_comment_unknown_when_a_candidate_sync_fails(monkeypatch):
+    # issue #1096, F6, второй путь: Search нашёл кандидата, но локальная
+    # сверка ЭТОГО issue упала (сеть/квота) — раньше молчаливый `continue`
+    # читался как «этот кандидат чист», и при отсутствии других находок
+    # весь инвариант отдавал 💚. Теперь — check_result.unknown(): «чисто»
+    # здесь недоказанное утверждение, не факт.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 777, "html_url": "https://github.com/mytab0r/edge-harness/issues/777",
+             "title": "не сверенный кандидат"},
+        ]},
+        "issues/777/comments": RuntimeError("gh api: 502"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "1" in result.reason and "777" not in result.reason  # число, не конкретный issue
+
+
+def test_worker_false_success_comment_confirmed_violation_beats_unchecked_sibling(monkeypatch):
+    # issue #1096, F6: подтверждённое нарушение у ОДНОГО кандидата не должно
+    # прятаться за тем, что СОСЕДНИЙ кандидат не удалось сверить — реальная
+    # находка важнее чужой неопределённости (иначе это была бы потеря сигнала).
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 900, "html_url": "https://github.com/mytab0r/edge-harness/issues/900",
+             "title": "настоящий регресс"},
+            {"number": 777, "html_url": "https://github.com/mytab0r/edge-harness/issues/777",
+             "title": "не сверенный кандидат"},
+        ]},
+        "issues/900/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+        ],
+        "issues/777/comments": RuntimeError("gh api: 502"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
+        "issue": 900,
+        "url": "https://github.com/mytab0r/edge-harness/issues/900",
+        "title": "настоящий регресс",
+    }]
 
 
 def test_worker_false_success_comment_not_in_ci_gating():
     # Наблюдательный: доступность стороннего Search API не должна красить
     # обязательную проверку `test` (см. докстринг check_worker_false_success_comment).
     assert 14 not in ri.CI_GATING
+
+
+def test_worker_false_success_comment_not_escalating():
+    # issue #1096, ai-review PR #1110, некритичное замечание 2: то же, что у
+    # инварианта 13 — CheckResult не должен гейтить/эскалировать по findings.
+    assert 14 not in ri.ESCALATING_INVARIANTS
+    assert 14 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+
+
+def test_assert_check_result_invariants_not_gated_or_escalated_passes_on_real_constants():
+    # Регресс-доказательство на ЖИВЫХ константах модуля — не только на
+    # синтетике ниже: сегодняшние CI_GATING/ESCALATING_INVARIANTS обязаны
+    # проходить эту проверку молча.
+    ri.assert_check_result_invariants_not_gated_or_escalated(ri.CI_GATING, ri.ESCALATING_INVARIANTS)
+
+
+def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_ci_gating():
+    with pytest.raises(RuntimeError, match="13"):
+        ri.assert_check_result_invariants_not_gated_or_escalated(frozenset({7, 11, 13}), ())
+
+
+def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_escalating():
+    with pytest.raises(RuntimeError, match="14"):
+        ri.assert_check_result_invariants_not_gated_or_escalated(frozenset(), (1, 3, 14))
 
 
 # ══════════════════════════════════════════════════════════════════════════

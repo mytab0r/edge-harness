@@ -378,6 +378,43 @@ def test_gh_explicit_get_method_is_not_a_write(monkeypatch):
     assert pg._gh_call_is_write(("repos/o/r/pulls",)) is False
 
 
+def test_edit_issue_comment_sends_patch_to_comment_endpoint(monkeypatch):
+    """#1100 (quota_alert.record_reading): правит существующий комментарий на
+    месте — PATCH .../issues/comments/{id}, не новый POST на .../comments."""
+    calls = []
+    monkeypatch.setattr(pg, "gh", lambda *a: calls.append(a))
+    pg.edit_issue_comment("o/r", 555, "новый текст")
+    assert calls == [("-X", "PATCH", "repos/o/r/issues/comments/555", "-f", "body=новый текст")]
+
+
+def test_edit_issue_comment_is_gated_outside_ci(monkeypatch):
+    """PATCH — тот же класс изменяющего вызова, что POST (GH_WRITE_METHODS) —
+    вне CI не должен реально дойти до сети (тот же гейт, что post_issue_comment)."""
+    _clear_ci_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
+            returncode=0, stdout="{}", stderr="")))
+    with pytest.raises(pg.WriteGateSkipped):
+        pg.edit_issue_comment("o/r", 555, "текст")
+    assert calls == []
+
+
+def test_all_issue_comments_without_max_pages_ignores_issue_metadata(monkeypatch):
+    """Без max_pages поведение НЕ меняется (#1100 трогает только частичный
+    срез) — весь обход идёт старым list_pages, метаданные issue не читаются."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args[0])
+        return []
+
+    monkeypatch.setattr(pg, "gh", fake_gh)
+    assert pg.all_issue_comments("o/r", 120) == []
+    assert calls == ["repos/o/r/issues/120/comments?per_page=100&page=1"]
+
+
 def test_announce_write_mode_ignores_local_override_env(monkeypatch):
     """Issue #1074: раньше (до правки) третье состояние объявляло «ЯВНЫМ
     решением локального прогона разрешены» — этого состояния больше нет,

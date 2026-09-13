@@ -195,6 +195,18 @@ jobs:
           # (класс silent-wrong #43). Дальнейшую сверку делает verify и гвардия.
           grep -q "patchedDependencies" pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
 
+      # Гвардия консистентности peer-зависимостей (issue #1041): `pnpm add`
+      # выше не роняет установку на несовместимой peer-паре (только
+      # предупреждает) — расхождение MAJOR-версии (живой случай:
+      # react-dom@19.2.8 подставлен с react@18.3.1) тихо доезжает до
+      # собранного бандла и падает только на реальном браузерном рендере
+      # конкретного слота (e2e-смоук ниже, 'settings.section', React error
+      # #130), далеко от места и момента решения. Дёшево: сразу после
+      # `pnpm add`, до кодогенерации/сборки/e2e.
+      - name: Гвардия консистентности peer-зависимостей (#1041)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/verify-peer-consistency.mjs "$GITHUB_WORKSPACE/clone"
+
       - name: Кодогенерация плагинной композиции
         if: steps.route.outputs.plugins != '0'
         run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
@@ -539,6 +551,60 @@ jobs:
           for id in ${{ steps.route.outputs.ids }}; do
             PLUGIN_ID=$id bash scripts/plugins/plugin_status.sh
           done
+
+      # Снимок последней ИЗВЕСТНО-ХОРОШЕЙ версии — ДО того, как этот прогон
+      # что-либо задеплоит (issue #1123, находка 1 из #1121). `wrangler
+      # rollback` без явного version-id (апстрим,
+      # packages/wrangler/src/versions/rollback/index.ts::fetchDefaultRollbackVersionId,
+      # проверено в исходнике самого пакета) сортирует ВСЕ деплои по
+      # created_on, отбрасывает самый свежий и берёт первый оставшийся с
+      # percentage:100 — «предыдущий по времени», не «прошлый стабильный
+      # релиз». `wrangler secret put` (девять вызовов ниже, ПОСЛЕ `wrangler
+      # deploy`) создаёт по новой 100%-версии на каждый секрет, поэтому после
+      # красной канарейки «предыдущая версия» в этом списке — версия ЭТОГО ЖЕ
+      # прогона, на пару секунд старше созданной деплоем, а не прошлый релиз.
+      # Живая улика (run 34750000094): `wrangler deploy` создал версию
+      # 4fe52372 в 09:42:19; секрет GH_RUNNER_TOKEN — версию ffcfd8b4 в
+      # 09:42:28; откат (09:44:44) уехал именно на ffcfd8b4 — версию этого же
+      # прогона, не на прошлый релиз. Шаг при этом печатал «deployed to 100%
+      # of traffic» и «прод откачен» — ложное подтверждение восстановления.
+      #
+      # Фикс: спрашиваем Cloudflare API напрямую, ПОКА этот job ещё ничего не
+      # задеплоил, — единственный момент, когда «активная 100%-версия»
+      # железно означает «версия, обслуживавшая прод до этого прогона», без
+      # предположений о том, что создаст дальше сам прогон. ID передаётся
+      # `wrangler rollback` явным аргументом ниже — эвристика апстрима вообще
+      # не участвует в выборе. continue-on-error: сбой ЭТОГО шага (сеть/квота
+      # CF API) не должен блокировать сам деплой — если версия не захвачена,
+      # откат ниже откажется явно, а не откатится не туда (см. следующий шаг).
+      - name: Снимок версии прода до деплоя (для возможного отката)
+        id: pre_deploy_version
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          http_code=$(curl -sS -o /tmp/pre-deploy-deployments.json -w '%{http_code}' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/dsh-edge/deployments")
+          if [ "$http_code" != "200" ]; then
+            echo "::warning::Снимок версии до деплоя не удался (HTTP $http_code) — если канарейка дальше покраснеет, автооткат явно откажется, а не откатится не туда"
+            exit 0
+          fi
+          version_id=$(jq -r '
+            (.result.deployments // [])
+            | sort_by(.created_on) | reverse
+            | map(select(any(.versions[]?; .percentage == 100)))
+            | (.[0].versions // [])
+            | map(select(.percentage == 100)) | (.[0].version_id // empty)
+          ' /tmp/pre-deploy-deployments.json)
+          if [ -z "$version_id" ]; then
+            echo "::warning::Ни одной прежней 100%-версии не найдено (первый деплой воркера?) — автооткат при необходимости откажется явно"
+            exit 0
+          fi
+          echo "version_id=$version_id" >> "$GITHUB_OUTPUT"
+          echo "Снимок: активная прод-версия до этого прогона — $version_id"
 
       # Деплой — ПЕРЕД синком секретов (issue #549, находка живого прогона
       # 34049854919: `wrangler secret put` отказал «the latest version of
@@ -935,22 +1001,25 @@ jobs:
       # разворачивали, если упал сам `wrangler deploy`) → откатываемся на
       # прошлую 100%-версию.
       #
-      # `wrangler rollback` без явного version-id сам находит нужную версию —
-      # прочитано в реализации апстрима (cloudflare/workers-sdk,
-      # packages/wrangler/src/versions/rollback/index.ts::
-      # fetchDefaultRollbackVersionId): сортирует деплои по created_on,
-      # убирает текущий (только что раскатанный сломанный) и берёт первый с
-      # percentage:100 — «прошлый стабильный деплой», не «предыдущий по
-      # хронологии вообще». Наш путь деплоя всегда 100% (без gradual-сплита),
-      # так что «прошлая 100%-версия» = «прошлый деплой». `--message`
-      # заполняет и confirm(), и prompt() дефолтом без интерактива на
-      # не-TTY раннере — тот же паттерн, каким этот файл уже гоняет
-      # `wrangler secret put`/`wrangler deploy` без зависаний.
+      # `wrangler rollback` БЕЗ явного version-id сам находит «нужную»
+      # версию по своей эвристике (created_on минус самая свежая) — и это
+      # ровно та эвристика, которая на живых прогонах откатывала прод на
+      # версию ЭТОГО ЖЕ прогона (issue #1123, находка 1 из #1121: run
+      # 34750000094 — откат на версию секрета GH_RUNNER_TOKEN, созданную
+      # 2 секунды после деплоя, а не на прошлый релиз). Поэтому version-id
+      # передаётся ЯВНО: `steps.pre_deploy_version.outputs.version_id`,
+      # захваченный ДО того, как этот прогон вообще начал деплоить (шаг
+      # «Снимок версии прода до деплоя» выше) — единственный признак
+      # «известно хорошая версия», не зависящий от того, сколько версий
+      # создаст сам прогон дальше. `--message` заполняет confirm()/prompt()
+      # дефолтом без интерактива на не-TTY раннере — тот же паттерн, каким
+      # этот файл уже гоняет `wrangler secret put`/`wrangler deploy`.
       #
-      # Первый деплой воркера вообще (нет ни одной прежней 100%-версии,
-      # апстрим бросает «Could not find stable Worker Version») — этот шаг
-      # сам упадёт с понятной ошибкой апстрима; continue-on-error не даёт
-      # этому отказу потеряться поверх уже красной канарейки/смоука (исходный
+      # Нет захваченной версии (шаг снимка не смог/первый деплой воркера
+      # вообще) — откат ОТКАЗЫВАЕТСЯ явно, не откатывается на что попало и
+      # не рапортует успех (AGENTS.md «Проверяй видимый результат, а не
+      # шаг», «Fail loud, не silent-wrong»); continue-on-error не даёт этому
+      # отказу потеряться поверх уже красной канарейки/смоука (исходный
       # сигнал остаётся видимым, а не маскируется вторичным).
       - name: Автооткат прода при красной канарейке/смоуке
         id: auto_rollback
@@ -968,15 +1037,38 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TARGET_VERSION_ID: ${{ steps.pre_deploy_version.outputs.version_id }}
         run: |
           set -o pipefail
-          npx wrangler rollback --yes \
+          if [ -z "$TARGET_VERSION_ID" ]; then
+            echo "::error::Нет захваченной прежней версии (см. шаг «Снимок версии прода до деплоя») — автоматический откат ОТМЕНЁН, чтобы не откатиться на версию ЭТОГО ЖЕ прогона (issue #1123). Нужно ручное вмешательство: 'npx wrangler deployments list' и явный 'npx wrangler rollback <version-id>'."
+            exit 1
+          fi
+          npx wrangler rollback "$TARGET_VERSION_ID" --yes \
             --message "auto-rollback: канарейка/e2e-смоук красные, run ${{ github.run_id }}" \
             2>&1 | tee rollback.log
-          grep -qi "has been deployed to 100% of traffic" rollback.log \
-            || { echo "::error::Автооткат не подтвердил успех — см. лог шага, прод может остаться на сломанной версии"; exit 1; }
+          # Не верим одному только "deployed to 100% of traffic" — эта
+          # строка печаталась и при откате не туда (живая улика находки 1).
+          # Вытаскиваем ID версии, которую wrangler реально раскатал, и
+          # сверяем его с тем, что просили, — иначе шаг обязан упасть, а не
+          # рапортовать успех.
+          # Не верим одному только "deployed to 100% of traffic" — эта
+          # строка печаталась и при откате не туда (живая улика находки 1).
+          # Вытаскиваем ID версии, которую wrangler реально раскатал, и
+          # сверяем его с тем, что просили, — иначе шаг обязан упасть, а не
+          # рапортовать успех.
+          deployed_id=$(grep -oiE "Worker Version [0-9a-fA-F-]+ has been deployed to 100% of traffic" rollback.log \
+            | grep -oiE "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+          if [ -z "$deployed_id" ]; then
+            echo "::error::Автооткат не подтвердил успех — в логе нет строки о раскатке версии на 100% трафика, прод может остаться на сломанной версии"
+            exit 1
+          fi
+          if [ "$deployed_id" != "$TARGET_VERSION_ID" ]; then
+            echo "::error::Автооткат раскатал версию $deployed_id, а просили $TARGET_VERSION_ID — прод откатился не на ту версию, это сам по себе баг отката, не подтверждаю"
+            exit 1
+          fi
           echo "rolled_back=true" >> "$GITHUB_OUTPUT"
-          echo "🔙 Прод автоматически откачен на предыдущую 100%-версию"
+          echo "🔙 Прод автоматически откачен на известно-хорошую версию $TARGET_VERSION_ID (снята до этого прогона)"
 
       # Газ обязан быть доказан, не заявлен: после отката корень снова обязан
       # отвечать 200 — иначе «откатили» не значит «работает», и владелец

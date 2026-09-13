@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Гвардия класса «цепочка провайдеров переключается по классу отказа, а не
-# по любой ошибке» (#727). Прогоняет dsh_run_with_provider_chain (lib/
+# по факту отказа» (#727). Прогоняет dsh_run_with_provider_chain (lib/
 # dsh-ci.sh) ЦЕЛИКОМ — не bash -n, настоящее исполнение с заглушкой `dsh`,
 # роутящей ответ по модели (DEEPSEEK_MODEL, который chain выставляет на
 # каждую попытку) — тот же приём, что dsh-clients.smoke.sh уже применяет для
 # RATE_LIMIT (SMOKE_RATE_LIMIT_MODE), здесь на два провайдера сразу.
+#
+# #1084: с этого PR умолчание перевёрнуто — раньше НЕ распознанный явно
+# текст стопорил цепочку целиком (заголовок этого файла так и назывался:
+# «а не по любой ошибке»), теперь такой текст тоже переключает, и в функции
+# `dsh_chain_should_advance` сейчас НЕТ ни одной именованной ветки со
+# `stop`/`return 1` вовсе — единственный прежний кандидат (`INVALID_API_KEY`)
+# снят как неподтверждённый прод-формой (см. комментарий над функцией в
+# dsh-ci.sh, «Не подтверждено»). Сценарии 3/8/18 ниже это доказывают.
 #
 # Прод-форма отказов — дословно:
 #   RATE_LIMIT: Weekly/Monthly Limit Exhausted... run 34176910458
@@ -17,6 +25,14 @@
 #     провайдера — сценарий 12 ниже доказывает, что это отличается от
 #     "silent" (#737, rc=1, тоже пустой stderr, но другая причина) текстом
 #     сообщения, не только решением «переключаемся».
+#   STREAM_CLOSED: SSE stream ended without [DONE]... прогон worker.yml
+#     2026-09-13T09:39Z (задача #1055/#1087, #1084) — GLM оборвал SSE-поток;
+#     тот же текст видели у OpenRouter-2 той же ночью (00:07Z) — не привязан
+#     к одному провайдеру, сценарий 17 ниже доказывает автопереход (#1084).
+#     Сценарий 18 доказывает перевёрнутое умолчание: НЕИЗВЕСТНЫЙ класс отказа
+#     (никакой явный признак не совпал) отныне тоже переключает, не стопорит
+#     цепочку (#1084) — в функции сейчас нет ни одной ветки stop вовсе
+#     (сценарии 3/8 — та же мутация на других литералах stderr).
 #
 # Запуск: bash scripts/lib/test/dsh-provider-chain.smoke.sh  (jq обязателен)
 set -euo pipefail
@@ -37,7 +53,8 @@ CONFIRMED_MODELS_FIXTURE="$WORK/confirmed-models.json"
 cat >"$CONFIRMED_MODELS_FIXTURE" <<JSON
 [
   {"name":"PRIMARY","model_sha256":"$(hash_of primary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
-  {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"}
+  {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
+  {"name":"TERTIARY","model_sha256":"$(hash_of tertiary-model)","confirmed_at":"2026-09-13","evidence":"smoke fixture (#1121/#1124)"}
 ]
 JSON
 export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
@@ -114,6 +131,18 @@ dsh() {
           # ЭТОЙ записи — дословная прод-форма Ollama Cloud.
           echo "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra" >&2
           return 1 ;;
+        stream-closed)
+          # #1084, живой случай — прогон worker.yml 2026-09-13T09:39Z: GLM
+          # оборвал SSE-поток без терминального [DONE] — дословная прод-форма.
+          echo "dsh: STREAM_CLOSED: SSE stream ended without [DONE]" >&2
+          return 1 ;;
+        unknown-error)
+          # #1084: НИКАКОЙ явный признак не совпадает — представитель класса
+          # «новый провайдер, свой текст ошибки, которого ещё не видели».
+          # Раньше это стопорило цепочку целиком (общий стоп-класс), теперь —
+          # автопереход (перевёрнутое умолчание, см. dsh-ci.sh).
+          echo "dsh: TRANSPORT_HICCUP: upstream reset the connection mid-response" >&2
+          return 1 ;;
         *)
           echo "::error::SMOKE: неизвестный режим $mode для $mode_var" >&2
           return 99 ;;
@@ -169,9 +198,18 @@ dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke"
 [ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "2) ожидался переход на SECONDARY при HTTP_404, получено '$DSH_CHAIN_PROVIDER'"
 echo "SMOKE(chain): 2) HTTP_404 -> автопереход — ок"
 
-# ── 3) Настоящая ошибка (ключ битый и т.п.) — цепочка НЕ идёт дальше ──────────
-# Мутация ключевого требования (#727, п.4): не любой отказ переключает.
-# #737: сообщение обязано называть код возврата даже на остановке (Дефект 1).
+# ── 3) #1084 (пересмотр #727, п.4): «настоящая ошибка» (нераспознанный,
+# непустой stderr) теперь ТОЖЕ переключает — до этого PR здесь проверялся
+# ОБРАТНЫЙ факт («не любой отказ переключает», единственным примером был
+# синтетический INVALID_API_KEY). Находка ai-review при доводке: тот литерал
+# ни разу не встречался ни в одном живом прогоне — держать единственный
+# стоп-класс на непроверенной строке значило бы одновременно (а) не ловить
+# реальный отказ credentials с ДРУГИМ текстом и (б) кормить гвардию
+# пересказом, а не прод-формой (AGENTS.md, «Тест кормит прод-форму, а не
+# пересказ»). Решение #1084 — снять стоп-класс целиком, пока не найдётся
+# живая цитата. `real-error` остаётся представителем «непустой, но
+# нераспознанный текст» — используется теперь как ЕЩЁ один пример общего
+# перевёрнутого умолчания (см. также сценарий 18).
 # ВАЖНО: вывод перехватывается редиректом в файл, НЕ через $(...) вокруг
 # самого вызова — command substitution породила бы subshell, и
 # DSH_RUN_RC/DSH_CHAIN_* из dsh_run_with_provider_chain потерялись бы
@@ -182,12 +220,11 @@ SMOKE_MODE_secondary_model="ok"
 LOG="$WORK/log.txt"
 dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
 OUT="$(cat "$LOG")"
-[ "$DSH_RUN_RC" != "0" ] || fail "3) настоящая ошибка не должна была дать успех"
-[ "$DSH_CHAIN_PROVIDER" = "" ] || fail "3) успешного провайдера быть не должно, получено '$DSH_CHAIN_PROVIDER'"
-[ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "3) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — SECONDARY не должен был тронуться (не переключаемый класс)"
-[ "$DSH_RUN_FAILURE_REASON" != "all_providers_exhausted" ] || fail "3) причина не обязана звучать как 'все исчерпаны' — это НЕ переключаемый класс"
-[[ "$OUT" == *"rc="* ]] || fail "3) сообщение об остановке обязано называть код возврата: $OUT"
-echo "SMOKE(chain): 3) настоящая ошибка -> цепочка остановлена, второй провайдер не тронут, сообщение честное — ок"
+[ "$DSH_RUN_RC" = "0" ] || fail "3) ожидался успех после нераспознанной ошибки у первого (перевёрнутое умолчание #1084), получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "3) ожидался переход на SECONDARY, получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "3) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы (нет стоп-класса, #1084)"
+[[ "$OUT" == *"класс не распознан"* ]] || fail "3) сообщение обязано честно назвать «класс не распознан»: $OUT"
+echo "SMOKE(chain): 3) нераспознанная ошибка -> автопереход, стоп-класс снят как неподтверждённый (#1084) — ок"
 
 # ── 4) Оба провайдера исчерпаны — честное 'все исчерпаны' + обе даты сброса ──
 reset_scenario
@@ -248,11 +285,16 @@ UNCONFIRMED_CHAIN='[
 ) || fail "7) сценарий с неподтверждённым id модели провалился"
 echo "SMOKE(chain): 7) неподтверждённый id модели -> пропуск с честным сообщением, время/квота не потрачены — ок"
 
-# ── 8) Класс #743: стоп-класс кладёт сырой stderr в DSH_CHAIN_CLASS_NOTE —
-# маркер, похожий на эхо заголовка Authorization, ОБЯЗАН уйти замаскированным
-# и в переменную, и в лог (::error:: печатает её же). GITHUB_STEP_SUMMARY
-# этот путь не трогает вовсе (dsh-ci.sh нигде его не пишет — проверено
-# grep'ом по scripts/lib/dsh-ci.sh), поэтому здесь не проверяется отдельно.
+# ── 8) Класс #743: сырой stderr нераспознанного класса кладётся в
+# DSH_CHAIN_CLASS_NOTE — маркер, похожий на эхо заголовка Authorization,
+# ОБЯЗАН уйти замаскированным и в переменную, и в лог (::warning:: печатает
+# её же). До #1084 этот путь был стоп-классом (цепочка не шла дальше) —
+# теперь та же самая непустая нераспознанная строка переключает
+# (DSH_CHAIN_PROVIDER=SECONDARY), redact-дисциплина #743 при этом не
+# зависит от решения переключаемости и обязана держаться так же.
+# GITHUB_STEP_SUMMARY этот путь не трогает вовсе (dsh-ci.sh нигде его не
+# пишет — проверено grep'ом по scripts/lib/dsh-ci.sh), поэтому здесь не
+# проверяется отдельно.
 reset_scenario
 MARKER="sk-SMOKE1EEDEDBEEFCAFEBABE1234567890abcdef"
 SMOKE_MODE_primary_model="leaky-error"
@@ -260,11 +302,12 @@ SMOKE_MODE_secondary_model="ok"
 LOG="$WORK/log8.txt"
 dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
 OUT="$(cat "$LOG")"
-[ "$DSH_RUN_RC" != "0" ] || fail "8) leaky-error не должен был дать успех"
+[ "$DSH_RUN_RC" = "0" ] || fail "8) ожидался успех после leaky-error у первого (перевёрнутое умолчание #1084), получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "8) ожидался переход на SECONDARY, получено '$DSH_CHAIN_PROVIDER'"
 [[ "$OUT" != *"$MARKER"* ]] || fail "8) сырой маркер секрета уехал в лог (stdout/stderr шага): $OUT"
 [[ "$DSH_CHAIN_CLASS_NOTE" != *"$MARKER"* ]] || fail "8) сырой маркер секрета остался в DSH_CHAIN_CLASS_NOTE после формирования: $DSH_CHAIN_CLASS_NOTE"
 [[ "$OUT" == *"sk-[REDACTED]"* ]] || fail "8) redact() не отработал — в логе нет ожидаемой замены sk-[REDACTED]: $OUT"
-echo "SMOKE(chain): 8) сырой stderr стоп-класса маскируется redact() до печати и до записи в переменную — ок"
+echo "SMOKE(chain): 8) сырой stderr нераспознанного класса маскируется redact() до печати и до записи в переменную (класс переключаем, #1084) — ок"
 
 # ── 9) #857: персистентная квота — провайдер с БУДУЩИМ reset_iso пропущен
 # ДО попытки, реальный dsh() для него не вызывается. Доказательство: режим
@@ -426,4 +469,97 @@ OUT="$(cat "$LOG")"
   || fail "16) ошибка параметров запроса ОДНОГО провайдера не обязана останавливать цепочку: $OUT"
 echo "SMOKE(chain): 16) INVALID_REQUEST/max_tokens (наш конфиг неверен для этой записи) -> автопереход, не стоп-класс (#1062) — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062 зелёная"
+# ── 17) #1084, живой инцидент — прогон worker.yml 2026-09-13T09:39Z (задача
+# #1055/#1087): GLM (единственный реально отвечавший провайдер) оборвал
+# SSE-поток без терминального [DONE]. Раньше это НЕ совпадало ни с одним
+# явным признаком и падало в стоп-класс — цепочка останавливалась целиком.
+# STREAM_CLOSED теперь явный переключаемый класс, симметричный HTTP_404/
+# EMPTY_RESPONSE (сценарий 2 выше).
+reset_scenario
+SMOKE_MODE_primary_model="stream-closed"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log17.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "17) ожидался успех после STREAM_CLOSED у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "17) ожидался переход на SECONDARY при STREAM_CLOSED PRIMARY, получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "17) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы"
+[[ "$OUT" != *"класс НЕ переключаемый"* ]] \
+  || fail "17) STREAM_CLOSED — transient-обрыв SSE, не обязан останавливать цепочку: $OUT"
+# ai-review (доводка #1084): без явной ветки `grep -qE 'STREAM_CLOSED:'` в
+# dsh-ci.sh этот сценарий всё равно зеленел бы — перевёрнутое умолчание само
+# переключает ЛЮБОЙ нераспознанный текст, включая STREAM_CLOSED, и печатало
+# бы «класс не распознан (…)». Явную ветку доказывает ИМЕННО текст причины:
+# только она пишет «класс отказа: STREAM_CLOSED (…)» (::warning:: печатает
+# «класс отказа: $DSH_CHAIN_CLASS_NOTE»); «класс не распознан» — другой текст.
+[[ "$OUT" == *"класс отказа: STREAM_CLOSED"* ]] \
+  || fail "17) явная ветка STREAM_CLOSED обязана дать СВОЙ текст причины, не «класс не распознан»: $OUT"
+echo "SMOKE(chain): 17) STREAM_CLOSED (обрыв SSE без [DONE]) -> автопереход по ЯВНОЙ ветке, не по умолчанию — ок"
+
+# ── 18) #1084: перевёрнутое умолчание — НЕИЗВЕСТНЫЙ класс отказа (никакой
+# явный признак не совпал) отныне ТОЖЕ переключает — в этой функции сейчас
+# НЕТ ни одной ветки, возвращающей стоп (см. «Не подтверждено» в dsh-ci.sh:
+# бывший именованный стоп-класс INVALID_API_KEY снят как неподтверждённый
+# прод-формой, #1084). До этой правки этот же сценарий стопорил бы цепочку
+# (общий стоп-класс по умолчанию) — именно эта мутация и доказывает
+# переворот: с прежним кодом (return 1 в общем catch-all) DSH_CHAIN_PROVIDER
+# остался бы пустым, а DSH_CHAIN_TRIED — только "PRIMARY".
+reset_scenario
+SMOKE_MODE_primary_model="unknown-error"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log18.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "18) ожидался успех после нераспознанного класса у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "18) ожидался переход на SECONDARY при нераспознанном классе PRIMARY (перевёрнутое умолчание #1084), получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "18) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы"
+[[ "$OUT" == *"класс не распознан"* ]] || fail "18) сообщение обязано честно назвать «класс не распознан»: $OUT"
+[[ "$OUT" != *"класс НЕ переключаемый"* ]] \
+  || fail "18) нераспознанный класс не обязан останавливать цепочку (перевёрнутое умолчание #1084): $OUT"
+echo "SMOKE(chain): 18) нераспознанный класс отказа -> автопереход по умолчанию, не стоп (перевёрнутое умолчание #1084) — ок"
+
+# ── 19) #1121/#1124, живой инцидент — прогоны worker.yml 34735752165/
+# 34739313568: ОДИН провайдер (там — OpenRouter-2) тратит ретраем ВЕСЬ
+# общий бюджет RATE_LIMIT сам, следующему достаётся 0с (см. сценарий 13 —
+# это УЖЕ доказанное, ожидаемое поведение БЕЗ потолка). Здесь — потолок на
+# долю ОДНОГО провайдера (DSH_RATE_LIMIT_PROVIDER_CAP_SECS): три провайдера,
+# первые два в вечном RATE_LIMIT, третий отвечает успехом. Бюджет 60с,
+# потолок 20с, задержка бэкоффа стартует с 30с (больше потолка — потолок
+# обязан урезать её ДО потолка на первом же шаге, не только считать сумму).
+# Без потолка PRIMARY выжег бы все 60с сам (та же арифметика, что сценарий
+# 13), и SECONDARY получил бы 0с — печатался бы «остаток общего бюджета
+# RATE_LIMIT: 0с из 60с» без какой-либо пометки потолка. С потолком PRIMARY
+# обязан остановиться ровно на 20с (потолок), у SECONDARY реально остаётся
+# 40с (60-20), из которых ему тоже выделяется не больше потолка (20с) — то
+# есть SECONDARY обязан получить РЕАЛЬНЫЙ многошаговый шанс, а не 0.
+reset_scenario
+THREE_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","model":"primary-model","secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096},
+  {"name":"TERTIARY","base_url":"https://tertiary.test/v1","model":"tertiary-model","secret_env":"TERTIARY_KEY","max_output_tokens":4096}
+]'
+export TERTIARY_KEY="tertiary-test-key"
+SMOKE_MODE_primary_model="always-rate-limit"
+SMOKE_MODE_secondary_model="always-rate-limit"
+SMOKE_MODE_tertiary_model="ok"
+LOG="$WORK/log19.txt"
+( export DSH_PROVIDER_CHAIN="$THREE_CHAIN"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+  DSH_RATE_LIMIT_INITIAL_DELAY_SECS=30 \
+  DSH_RATE_LIMIT_MAX_DELAY_SECS=30 \
+  DSH_RATE_LIMIT_PROVIDER_CAP_SECS=20 \
+    dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::19) TERTIARY отвечает успехом, ожидался rc=0, получено $DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "TERTIARY" ] || { echo "::error::19) ожидался переход на TERTIARY, получено '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY, TERTIARY" ] || { echo "::error::19) все три провайдера обязаны быть опробованы: '$DSH_CHAIN_TRIED'" >&2; exit 1; }
+  [[ "$OUT" == *"пробую PRIMARY"*"остаток общего бюджета RATE_LIMIT: 60с из 60с"*", провайдеру выделено не больше 20с (потолок 20с на провайдера, #1121)"* ]] \
+    || { echo "::error::19) PRIMARY обязан стартовать с полного общего бюджета (60с), урезанного потолком до 20с: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"пробую SECONDARY"*"остаток общего бюджета RATE_LIMIT: 40с из 60с"*", провайдеру выделено не больше 20с (потолок 20с на провайдера, #1121)"* ]] \
+    || { echo "::error::19) SECONDARY обязан получить РЕАЛЬНЫЙ остаток (40с из 60с), урезанный потолком до 20с — НЕ 0с, как было бы без потолка (мутация: сними cap-логику, эта строка покраснеет): $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"пробую TERTIARY"*"остаток общего бюджета RATE_LIMIT: 20с из 60с"* ]] \
+    || { echo "::error::19) TERTIARY обязан увидеть остаток 20с из 60с (PRIMARY+SECONDARY суммарно потратили ровно 40с, не 60): $OUT" >&2; exit 1; }
+) || fail "19) сценарий с потолком на провайдера провалился"
+echo "SMOKE(chain): 19) потолок доли ОДНОГО провайдера из общего бюджета RATE_LIMIT — второй провайдер получает реальный шанс, не 0с (#1121/#1124) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084/#1121 зелёная"

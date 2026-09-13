@@ -84,7 +84,10 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
      2026-09-08 (см. блок-комментарий у самой функции). Наблюдательный, не в
      CI_GATING: измерение на живом репозитории до нуля нарушений ещё не
      сделано (тот же порядок, что у 1/5 — включение отдельной правкой
-     константы после замера).
+     константы после замера). CheckResult (issue #1096/#1109, F7): сеть/квота
+     на комментарии-вердикте/файлах PR/истории прогонов ai-review.yml на
+     ЛЮБОМ проверяемом PR раньше молчала как «растраты нет» — теперь ❓, если
+     хоть один PR не удалось проверить и находок среди проверенных нет.
   9. check_declared_deps_mismatch (#710, продолжение #371/#529) — расхождение
      между структурно объявленной связью в теле задачи («Чем блокируется»/
      «Что блокирует»/инлайн «БЛОКИРУЕТСЯ: …», разбор
@@ -114,7 +117,9 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       живой случай: 9 прогонов подряд на сессии harness-257 за 18 часов
       (порча записи журнала без message.id, #480/#794). Наблюдательный, не
       гейтящий: нарушение зависит от истории прогонов workflow, не от диффа
-      PR (см. блок-комментарий у самой функции).
+      PR (см. блок-комментарий у самой функции). CheckResult (issue
+      #1096/#1109): история прогонов worker.yml недоступна целиком (транспорт/
+      квота) раньше молчала как «серии нет» — теперь ❓, не 💚.
   11. check_provider_usage_manifest (#823, openspec/changes/
       llm-provider-usage-manifest) — канонический список потребителей
       LLM-провайдеров (ai-review/worker/hands) обязан иметь в
@@ -401,6 +406,15 @@ _SCH_SPEC = importlib.util.spec_from_file_location(
     "scheduler", REPO_ROOT / "scripts" / "orchestra" / "scheduler.py")
 scheduler = importlib.util.module_from_spec(_SCH_SPEC)
 _SCH_SPEC.loader.exec_module(scheduler)  # type: ignore[union-attr]
+
+# Носитель третьего состояния (issue #1096): «не смог посмотреть» обязан
+# быть отдельным исходом от «нарушений нет», не сливаться в одно и то же
+# 💚. Пока переведены только инварианты 13 и 14 (issue #1096, шаг 1) —
+# остальные мигрирует отдельная задача (issue #1096, шаг 2).
+_CHR_SPEC = importlib.util.spec_from_file_location(
+    "check_result", REPO_ROOT / "scripts" / "lib" / "check_result.py")
+check_result = importlib.util.module_from_spec(_CHR_SPEC)
+_CHR_SPEC.loader.exec_module(check_result)  # type: ignore[union-attr]
 
 # task_deps.fetch_pool(..., include_body=True) — тот же единственный источник
 # графа блокировок, что уже читает declared_deps.py (#361/#371); declared_deps
@@ -914,6 +928,37 @@ def stuck_gate_fact_line(item: dict) -> str:
 # отпечатке), поэтому ловит и любой БУДУЩИЙ регресс того же класса, не
 # только повтор буквально этого бага.
 
+def runs_of(runs_payload: object, workflow: str) -> list[dict]:
+    """Единая точка разбора формы ответа «список прогонов» GitHub Actions
+    (issue #1096, F3) — в границах repo_invariants.py: потребители
+    `pulse_guard.recent_runs` в pulse_guard/scheduler/review_labels остаются
+    до отдельного прохода F3 (тот не умещается в одну пачку, файлы вне
+    repo_invariants.py). Форма не по контракту — не dict, нет ключа
+    workflow_runs, значение под ключом не список — RuntimeError с текстом,
+    называющим факт (живой класс #120A: ответ вторичного рейт-лимита
+    `{"message": ...}` без ключа раньше молча читался как «прогонов нет»),
+    не молчаливый []. Выбор третьего исхода (ok/violation/unknown) остаётся
+    за вызывающей стороной: эта функция не знает, наблюдатель ли это с
+    третьим состоянием или фоновый сборщик, которому громкое падение
+    честнее unknown()."""
+    if not isinstance(runs_payload, dict) or "workflow_runs" not in runs_payload:
+        raise RuntimeError(
+            f"ответ истории прогонов {workflow} неожиданной формы (не dict "
+            f"с ключом workflow_runs — живой класс F3, issue #1096/#1109): "
+            f"{runs_payload!r}")
+    runs = runs_payload.get("workflow_runs")
+    # Ключ ПРИСУТСТВУЕТ, но значение под ним не список (None/dict/строка) —
+    # проверка только на наличие ключа пропустила бы `{"workflow_runs": None}`
+    # с ложным «форма подтверждена». isinstance(list) — тот же приём, что
+    # запись dependabot в pagination-гвардии (не-list — громкий сигнал, не
+    # молчаливое усечение).
+    if not isinstance(runs, list):
+        raise RuntimeError(
+            f"ответ истории прогонов {workflow}: ключ workflow_runs есть, "
+            f"но значение не список (не по контракту): {runs!r}")
+    return runs
+
+
 def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
     """Прогоны `ai-review.yml` для PR #pr, СТАРТОВАВШИЕ ПОСЛЕ `since` (ISO,
     момент публикации вердикта) — признак «этот прогон про PR N» тот же, что
@@ -922,12 +967,21 @@ def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
     (queued/in_progress), этот — уже случившийся дорогой прогон постфактум
     (включая давно завершённые). Одна страница `per_page=100` — тот же
     компромисс, что у other_active_ai_review_runs (единицы прогонов одного
-    PR, не сотни)."""
+    PR, не сотни).
+
+    Находка issue #1096/#1109 (F7): раньше `chunk.get("workflow_runs", [])
+    if isinstance(chunk, dict) else []` молча читал ЛЮБУЮ форму ответа не по
+    контракту (не dict, нет ключа, значение под ключом не список) как «прогонов
+    после вердикта нет» — то же самое 💚, что и настоящее отсутствие растраты.
+    Теперь форма проверяется явно (runs_of — единая точка разбора формы в
+    этом модуле, не вторая копия) и RuntimeError поднимается вызывающей
+    стороне (check_wasted_ai_review_runs) — та решает третий исход, эта
+    функция сама не молчит о нарушении контракта."""
     since_dt = pulse_guard.parse_time(since)
     chunk = gh_func(
         f"repos/{repo}/actions/workflows/{review_labels.AI_REVIEW_WORKFLOW_FILE}/runs"
         f"?per_page=100")
-    runs = chunk.get("workflow_runs", []) if isinstance(chunk, dict) else []
+    runs = runs_of(chunk, review_labels.AI_REVIEW_WORKFLOW_FILE)
     target = review_labels.ai_review_run_name(pr)
     found = []
     for run in runs:
@@ -945,11 +999,11 @@ def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
     return found
 
 
-def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]:
-    """PR несёт ФИНАЛЬНЫЙ вердикт (ai:ok/ai:changes-requested) — и хотя
-    актуальный `diff_fingerprint` (review_labels, #740) совпадает с тем, что
-    записан в шапке `diff:` этого самого вердикта (`diff_unchanged`), нашёлся
-    прогон `ai-review.yml` того же PR, стартовавший ПОСЛЕ публикации
+def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> check_result.CheckResult:
+    """Инвариант 8 (#740): PR несёт ФИНАЛЬНЫЙ вердикт (ai:ok/ai:changes-requested)
+    — и хотя актуальный `diff_fingerprint` (review_labels, #740) совпадает с
+    тем, что записан в шапке `diff:` этого самого вердикта (`diff_unchanged`),
+    нашёлся прогон `ai-review.yml` того же PR, стартовавший ПОСЛЕ публикации
     вердикта. По контракту `should_run_ai_review` такого прогона быть не
     должно (совпавший отпечаток при финальном вердикте — `go=false` до
     чекаута/DSH) — сам факт его существования и есть нарушение, дороже
@@ -962,6 +1016,17 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]
     Нет вердикта, нет сохранённого отпечатка в шапке, отпечаток разошёлся —
     молчим: сравнивать не с чем или прогон обоснован реальной правкой.
 
+    Три исхода, не два (issue #1096/#1109, F7): раньше сеть/квота, упавшая на
+    ЛЮБОМ из трёх шагов на конкретном PR (комментарий-вердикт, список файлов
+    PR, история прогонов ai-review.yml — ai_review_runs_after), не ловилась
+    здесь вовсе — RuntimeError пришлось бы либо ронять весь build_report
+    (единственный необработанный PR обрывает проверку остальных), либо
+    (реальный баг F7, уже пофикшенный выше в ai_review_runs_after) молча
+    читаться как «растраты нет». Тот же принцип, что уже несёт инвариант 14
+    (check_worker_false_success_comment): нарушение среди ПРОВЕРЕННЫХ PR
+    всегда побеждает неопределённость по ДРУГОМУ PR, а «чисто» — недоказанное
+    утверждение, если хоть один PR не удалось проверить.
+
     Сеть — через модульный глобальный `gh` (не параметр по умолчанию!):
     `gh_func=gh` защёлкнул бы РЕАЛЬНУЮ pulse_guard.gh на момент импорта
     модуля — `monkeypatch.setattr(ri, "gh", fake)` в тестах меняет атрибут
@@ -972,12 +1037,24 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]
     при каждом вызове), не берут его параметром со значением по умолчанию."""
     ai_final = {review_labels.AI_OK, review_labels.AI_CHANGES}
     violations = []
+    # Неопределённость — ФАКТ на PR/шаг/ошибку, не счётчик с перечнем гипотез
+    # (находка ai-review PR #1140, чеклист: знаменатель — только PR с
+    # финальным ai-вердиктом, а не все открытые; упавший шаг называет сам
+    # текст RuntimeError — повторять все три варианта в причине значило бы
+    # гадать там, где данные уже есть).
+    unchecked: list[dict] = []
+    ai_final_total = 0
     for pull in open_pulls:
         number = pull["number"]
         labels = {label["name"] for label in pull["labels"]}
         if not (labels & ai_final):
             continue
-        comment = review_labels.latest_ai_comment(repo, number, gh)
+        ai_final_total += 1
+        try:
+            comment = review_labels.latest_ai_comment(repo, number, gh)
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "комментарий-вердикт", "error": str(error)})
+            continue
         if comment is None:
             continue
         facts = review_labels.header_facts(comment.get("body") or "")
@@ -985,11 +1062,19 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]
         comment_at = comment.get("created_at")
         if not stored_fp or not comment_at:
             continue
-        files = review_labels.list_pr_files(repo, number, gh)
-        current_fp = review_labels.diff_fingerprint(files)
+        try:
+            files = review_labels.list_pr_files(repo, number, gh)
+            current_fp = review_labels.diff_fingerprint(files)
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "файлы PR", "error": str(error)})
+            continue
         if not review_labels.diff_unchanged(stored_fp, current_fp):
             continue
-        wasted_runs = ai_review_runs_after(repo, number, comment_at, gh)
+        try:
+            wasted_runs = ai_review_runs_after(repo, number, comment_at, gh)
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "история прогонов", "error": str(error)})
+            continue
         if wasted_runs:
             violations.append({
                 "pr": number,
@@ -997,7 +1082,17 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> list[dict]
                 "diff_fingerprint": current_fp,
                 "wasted_runs": wasted_runs,
             })
-    return violations
+    if violations:
+        return check_result.violation(violations)
+    if unchecked:
+        detail = "; ".join(
+            f"#{item['pr']} ({item['step']}): {item['error']}" for item in unchecked)
+        return check_result.unknown(
+            f"{len(unchecked)} из {ai_final_total} PR с финальным ai:*-вердиктом "
+            f"не удалось проверить на растрату дорогого прогона ai-review — "
+            f"{detail} — нарушений среди проверенных нет, но статус "
+            "непроверенных неизвестен")
+    return check_result.ok()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1586,41 +1681,116 @@ RECURRING_FAILURE_STREAK_THRESHOLD = pulse_guard.WORKER_FAILURE_PAUSE_AFTER
 RECURRING_FAILURE_RUNS_TO_SCAN = 20
 
 
-def check_recurring_worker_failure(repo: str) -> list[dict]:
-    """Нарушение — RECURRING_FAILURE_STREAK_THRESHOLD или больше самых свежих
-    завершённых прогонов RECURRING_FAILURE_WORKFLOW подряд провалились
+def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
+    """Инвариант 10 (#794). Нарушение — RECURRING_FAILURE_STREAK_THRESHOLD или
+    больше самых свежих завершённых прогонов RECURRING_FAILURE_WORKFLOW подряд провалились
     (pulse_guard.FAILURE_CONCLUSIONS) с ОДНИМ И ТЕМ ЖЕ классифицированным
     отпечатком причины (pulse_guard.failure_fingerprint по первому упавшему
     job'у, pulse_guard.last_error_log_line — тот же факт, не гипотеза, что уже
-    несёт last_failure_error). Первый success, первый незавершённый прогон
-    ИЛИ смена отпечатка обрывают серию — считаем именно «сколько подряд с
-    ОДНОЙ причиной», не просто «сколько подряд красных» (это число уже
-    отдельно считает pulse_guard.count_consecutive_failures для паузы
-    диспатча).
+    несёт last_failure_error). Success ИЛИ смена отпечатка обрывают серию —
+    считаем именно «сколько подряд с ОДНОЙ причиной», не просто «сколько
+    подряд красных» (это число уже отдельно считает
+    pulse_guard.count_consecutive_failures для паузы диспатча).
+
+    Незавершённый прогон (conclusion=None — in_progress/queued) НЕ success и
+    НЕ провал: его исход ещё не известен, а не «хорошо». worker.yml — один
+    прогон на репозиторий (concurrency: group: worker) и работает часами
+    (DSH_TIMEOUT_SECS=7200) — «прогон ещё идёт» это ОБЫЧНОЕ состояние
+    здорового конвейера, не редкая развилка, и застаёт его почти каждый
+    периодический пульс. Раньше (#794, до находки живой серии 2026-09-13:
+    9 из 11 прогонов подряд упали классом «max_tokens exceeds» — инвариант
+    молчал все эти часы) None обрывал скан наравне с success — это склеивало
+    «серии нет» с «серия ещё не кончилась считаться», и любой пульс, заставший
+    воркер за работой, видел пустую серию независимо от того, что было
+    ДО текущего прогона. Правильно: None пропускается (continue, не break) —
+    сканирование идёт дальше вглубь списка, к уже завершённым более старым
+    прогонам, а не останавливается на первом же неизвестном исходе.
+
+    Несколько незавершённых подряд (или вперемешку с провалами — теоретически
+    возможно при ручном re-run старого прогона, хотя concurrency-группа делает
+    это редкостью) обрабатываются тем же правилом: каждый пропускается, ни
+    один не входит в streak_runs и не сбрасывает уже накопленный отпечаток.
+    Ложной серии это не создаёт: сравниваются только РЕАЛЬНО завершённые
+    прогоны, success по-прежнему обрывает скан безусловно — если между двумя
+    группами провалов найдётся настоящий success (уже известный, не
+    гипотетический), серия обрывается на нём, как и раньше. То, что где-то
+    среди уже пропущенных None прогон ПОЗЖЕ окажется success, этот скан не
+    предвидит и не обязан: это снимок текущего пульса («N провалов подряд
+    случились ДО прогона, чей исход сейчас не известен») — факт, который
+    неверным не станет, что бы ни решил ещё не завершённый прогон; когда он
+    завершится, следующий пульс перечитает список заново со свежим
+    conclusion на его месте (success на голове списка снова обрывает скан на
+    первом шаге, как в здоровом случае). Флаг pending_seen в результате
+    называет это честно, не гадая об исходе.
 
     Дешёвый путь в здоровом состоянии: один запрос списка прогонов; если
-    первый же прогон не упал (обычный случай), функция возвращает [] без
-    единого запроса лога/job'а. Сеть недоступна/квота — best-effort: [] (тот
-    же принцип, что last_failure_error/last_error_log_line — отсутствие
-    детали не должно ронять весь build_report ради инварианта, у которого и
-    так нет действия ЖЁСТЧЕ наблюдения)."""
+    первый же прогон не упал (обычный случай), функция возвращает ok() без
+    единого запроса лога/job'а.
+
+    Три исхода, не два (issue #1096/#1109):
+
+    - Список прогонов RECURRING_FAILURE_WORKFLOW недоступен целиком
+      (транспорт/квота) ИЛИ его форма не по контракту — check_result.
+      unknown(): не удалось посмотреть вовсе, не «нет нарушения». Форму
+      разбирает runs_of() (единая точка этого модуля): раньше
+      `pulse_guard.recent_runs` молча схлопывал ответ без ключа
+      workflow_runs (живой класс #120A — вторичный рейт-лимит) в [] и
+      инвариант отвечал тем же 💚, что и здоровое состояние (F3 из issue
+      #1096; находка ai-review PR #1140 — докстринг обещал unknown(),
+      а код через recent_runs давал ok()).
+    - Недосмотренная серия ВНУТРИ уже полученного списка: job'ы конкретного
+      упавшего прогона недоступны посреди скана (`pulse_guard.failing_jobs`
+      кидает RuntimeError — по запросу НА прогон, а скан ходит до 20
+      прогонов, так что вторичная квота/503 на середине списка — обычный
+      путь). Находка ai-review PR #1140: раньше `except RuntimeError: break`
+      с пустым streak_runs возвращал ok() — то же 💚 при «классифицировать
+      не удалось вовсе», ровно класс #1096. Теперь обрыв по RuntimeError
+      при streak ниже порога — check_result.unknown() с именем прогона и
+      текстом ошибки (что НЕ досмотрено — фактом, не гипотезой об их
+      причине). Обрыв по ДАННЫМ, а не транспорту — success, смена
+      отпечатка, «нет упавших job'ов», пустая строка лога — остаётся
+      честным ok(): это прочитанный факт о прогоне, не недоступность
+      (last_error_log_line best-effort по контракту и не различает «лог
+      недоступен» от «строки нет», там ok() честнее unknown).
+      ЛЮБОЙ уже накопленный streak_runs длиной ≥ порога всё равно
+      превращается в настоящую violation()."""
     try:
-        runs = pulse_guard.recent_runs(repo, RECURRING_FAILURE_WORKFLOW, per_page=RECURRING_FAILURE_RUNS_TO_SCAN)
-    except RuntimeError:
-        return []
+        runs_payload = pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{RECURRING_FAILURE_WORKFLOW}/runs?per_page={RECURRING_FAILURE_RUNS_TO_SCAN}")
+        runs = runs_of(runs_payload, RECURRING_FAILURE_WORKFLOW)
+    except RuntimeError as error:
+        return check_result.unknown(
+            f"история прогонов {RECURRING_FAILURE_WORKFLOW} недоступна: {error}")
     runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
 
     streak_fingerprint: str | None = None
     streak_job_name: str | None = None
     streak_error_text: str | None = None
     streak_runs: list[dict] = []
+    pending_seen = False
+    # Факт «скан оборван транспортом на неклассифицируемом прогоне» — не
+    # silent-break: при streak ниже порога превращается в unknown() ниже,
+    # не в 💚 (находка ai-review PR #1140).
+    scan_interrupted: str | None = None
     for run in runs:
-        if run.get("conclusion") not in pulse_guard.FAILURE_CONCLUSIONS:
-            break  # success/None — серия «подряд» обрывается здесь, не позже
+        conclusion = run.get("conclusion")
+        if conclusion is None:
+            pending_seen = True
+            continue  # исход неизвестен — пропускаем, не обрываем (см. докстринг)
+        if conclusion not in pulse_guard.FAILURE_CONCLUSIONS:
+            break  # success — серия обрывается здесь, старше уже не в счёт
         try:
             bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
-        except RuntimeError:
-            break  # деталь недоступна — честнее оборвать серию, чем гадать
+        except RuntimeError as error:
+            # Транспорт отказал на середине скана — причина прогонов СТАРШЕ
+            # этого не классифицировать вовсе. Фиксируем факт (какой прогон,
+            # какая ошибка) и решаем после цикла: streak ниже порога —
+            # unknown(), накопленный streak ≥ порога — violation() (нарушение
+            # среди доказанного важнее неопределённости по остатку).
+            scan_interrupted = (
+                f"job'ы прогона {run.get('id')} (created_at "
+                f"{run.get('created_at')}) недоступны: {error}")
+            break  # деталь недоступна — дальше вглубь смысла нет
         if not bad_jobs:
             break
         job = bad_jobs[0]
@@ -1639,8 +1809,15 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
         streak_runs.append(run)
 
     if len(streak_runs) < RECURRING_FAILURE_STREAK_THRESHOLD:
-        return []
-    return [{
+        if scan_interrupted is not None:
+            return check_result.unknown(
+                f"серию провалов {RECURRING_FAILURE_WORKFLOW} не удалось "
+                f"досмотреть: {scan_interrupted} — досмотренная часть "
+                f"({len(streak_runs)} из {len(runs)} прогонов) серии порога "
+                f"({RECURRING_FAILURE_STREAK_THRESHOLD}) не даёт, но статус "
+                "недосмотренных прогонов неизвестен, не «нарушений нет»")
+        return check_result.ok()
+    return check_result.violation([{
         "workflow": RECURRING_FAILURE_WORKFLOW,
         "job_name": streak_job_name,
         "error_text": streak_error_text,
@@ -1648,7 +1825,8 @@ def check_recurring_worker_failure(repo: str) -> list[dict]:
         "since": streak_runs[-1].get("created_at"),
         "until": streak_runs[0].get("updated_at"),
         "latest_run_url": streak_runs[0].get("html_url"),
-    }]
+        "pending_seen": pending_seen,
+    }])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1782,28 +1960,56 @@ def fetch_pipeline_health_history(repo: str) -> list[dict]:
 # (series_anchor/runs_after/count_consecutive_failures), которые
 # conveyor_gate и так использует внутри себя — единственный общий источник
 # правды на сам алгоритм, не вторая копия.
-def check_conveyor_gate_phantom_pause(repo: str) -> list[dict]:
+def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.CheckResult:
     """Нарушение: маркер серии (PAUSE_MARKER/PROBE_MARKER) активен (новее
     якоря серии), голова списка прогонов ЗАВЕРШЕНА (conclusion не None — у
     ещё идущего прогона есть законное объяснение неопределённости, issue
-    #899 п.2), но реально пересчитанные подряд-провалы ПОСЛЕ якоря — меньше
-    WORKER_FAILURE_PAUSE_AFTER. Держать паузу в этом случае нечем: она может
-    существовать только за счёт эффекта, который в conveyor_gate объясняет
-    незавершённый прогон (issue #899, докстринг conveyor_gate,
+    #899 п.2, но только пока оно не старше `scheduler.WORKER_STALL_MINUTES`
+    — см. ниже), но реально пересчитанные подряд-провалы ПОСЛЕ якоря —
+    меньше WORKER_FAILURE_PAUSE_AFTER. Держать паузу в этом случае нечем:
+    она может существовать только за счёт эффекта, который в conveyor_gate
+    объясняет незавершённый прогон (issue #899, докстринг conveyor_gate,
     `effective_failures`), а голова списка завершена.
 
-    Best-effort: сеть недоступна/квота — [] (тот же принцип, что у 10/12 —
-    отсутствие данных не должно ронять весь build_report ради инварианта, у
-    которого и так нет действия жёстче наблюдения)."""
+    Три исхода, не два (issue #1096, F1 — живой замер: голова списка не
+    завершена ≈63% календарного времени, воркер один и работает часами —
+    «прогон ещё идёт» это ОБЫЧНОЕ состояние, не редкий край):
+
+    - check_result.unknown() — сеть/квота недоступна (было: тихий []) ИЛИ
+      голова списка не завершилась дольше `scheduler.WORKER_STALL_MINUTES`
+      (295 мин — тот же порог, что использует scheduler для «воркер завис»,
+      не второе число): объяснение «прогон ещё идёт» дольше правдоподобия
+      не работает, но подряд-провалы после якоря пересчитать тоже нельзя,
+      пока эта голова висит — честно «не знаю», не подделанное 💚.
+    - check_result.ok() — здоровое состояние (серии нет, реальных провалов
+      достаточно, голова не завершена, но моложе порога простоя).
+    - check_result.violation([...]) — маркер держит паузу, объяснить нечем.
+
+    Находка ai-review PR #1110: `pulse_guard.recent_runs` сам глотает форму
+    ответа не по контракту (`payload = gh(...) or {}; return payload.get(
+    "workflow_runs", [])` — F3 из issue #1096, живой класс #120A) и отдаёт
+    голый `[]` НЕРАЗЛИЧИМО и на «прогонов правда нет», и на «ответ странной
+    формы». Раньше `not runs` здесь читался как ok() в обоих случаях — та же
+    слепота, ради которой эта функция и переписана, протекала сквозь границу
+    recent_runs. Правка запрашивает `runs` НАПРЯМУЮ (минуя recent_runs — эта
+    функция ничего не знает про `event=`, которого здесь и не было) и
+    валидирует форму через runs_of() — единая точка разбора формы в этом
+    модуле (доводка ai-review PR #1140: вторая инлайн-копия сведена туда же);
+    recent_runs остаётся нетронутым для потребителей в других файлах (issue
+    #1109, шаг 2, F3 — общий хелпер на все места разом, отдельный проход)."""
     try:
-        runs = pulse_guard.recent_runs(repo, pulse_guard.WORKER_WORKFLOW, per_page=10)
+        runs = runs_of(pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10"),
+            pulse_guard.WORKER_WORKFLOW)
         all_markers = pulse_guard.issue_markers_any(
             repo, pulse_guard.WATCHDOG_ISSUE,
             (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
-    except RuntimeError:
-        return []
+    except RuntimeError as error:
+        return check_result.unknown(
+            f"история прогонов {pulse_guard.WORKER_WORKFLOW} или маркеры "
+            f"#{pulse_guard.WATCHDOG_ISSUE} недоступны: {error}")
     if not runs:
-        return []
+        return check_result.ok()  # форма подтверждена, история просто пуста
 
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = pulse_guard.parse_time(last_ok["updated_at"]) if last_ok else None
@@ -1812,22 +2018,31 @@ def check_conveyor_gate_phantom_pause(repo: str) -> list[dict]:
     anchor = pulse_guard.series_anchor(last_ok_at, resume_at)
     markers = [(t, body) for t, body in all_markers if anchor is None or t > anchor]
     if not markers:
-        return []  # серии нет — паузе неоткуда взяться, здоровое состояние
+        return check_result.ok()  # серии нет — паузе неоткуда взяться, здоровое состояние
 
     if runs[0].get("conclusion") is None:
-        return []  # прогон ещё идёт — законное объяснение (issue #899, п.2)
+        head_age = minutes_between(pulse_guard.parse_time(runs[0]["created_at"]), now)
+        if head_age < scheduler.WORKER_STALL_MINUTES:
+            return check_result.ok()  # прогон ещё идёт — законное объяснение (issue #899, п.2)
+        return check_result.unknown(
+            f"голова списка прогонов {pulse_guard.WORKER_WORKFLOW} (run "
+            f"{runs[0].get('id')}) не завершилась {int(head_age)} мин "
+            f"(порог scheduler.WORKER_STALL_MINUTES={scheduler.WORKER_STALL_MINUTES}) "
+            "— объяснение «прогон ещё идёт» дольше правдоподобия не "
+            "работает, но реальные подряд-провалы после якоря пересчитать "
+            "нельзя, пока эта голова висит")
 
     failures = pulse_guard.count_consecutive_failures(
         [r.get("conclusion") for r in pulse_guard.runs_after(runs, anchor)])
     if failures >= pulse_guard.WORKER_FAILURE_PAUSE_AFTER:
-        return []  # реальных провалов достаточно — пауза оправдана
+        return check_result.ok()  # реальных провалов достаточно — пауза оправдана
 
-    return [{
+    return check_result.violation([{
         "failures": failures,
         "threshold": pulse_guard.WORKER_FAILURE_PAUSE_AFTER,
         "last_marker_at": max(t for t, _ in markers).isoformat(),
         "latest_run_url": runs[0].get("html_url"),
-    }]
+    }])
 # Инвариант 14: воркер не рапортует успех при пустом провайдере (#876)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1854,7 +2069,7 @@ WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
 WORKER_FALSE_SUCCESS_FIX_LANDED_AT = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
 
-def check_worker_false_success_comment(repo: str) -> list[dict]:
+def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
     """Инвариант 14 (issue #876, живой инцидент — прогон worker.yml
     34498185823, задача #140, 2026-09-10): комментарий «Автономный воркер
     справился (провайдер: ?)» — противоречие само себе, после фикса #876
@@ -1873,23 +2088,55 @@ def check_worker_false_success_comment(repo: str) -> list[dict]:
     предохранитель/пульс) — репортится только issue, где локальная сверка
     ПОДТВЕРДИЛА буквальный текст.
 
-    Best-effort, как и check_recurring_worker_failure выше: сеть/квота
-    недоступна -> [] на любом из двух шагов (поиск кандидатов, сверка
-    конкретного кандидата) — у наблюдательного инварианта нет действия
-    жёстче наблюдения, а состояние перепроверится на следующем прогоне;
-    несверенный кандидат просто пропускается, не гадаем за него.
+    Три исхода, не два (issue #1096, F6): сеть/квота недоступна на ЛЮБОМ из
+    двух шагов (поиск кандидатов, сверка конкретного кандидата) раньше
+    молча давала тот же [], что и «нарушений нет» — то же самое 💚, что и
+    полностью подтверждённое здоровое состояние.
 
-    Второй раунд той же находки (PR #880): исторический комментарий issue
+    - Search (`search/issues`) недоступен целиком — check_result.unknown():
+      ни один кандидат не проверен вовсе, судить не о чем.
+    - Найденные подтверждённые нарушения ВСЕГДА побеждают неопределённость
+      (check_result.violation): реальная находка важнее того факта, что
+      КАКОЙ-ТО другой кандидат не удалось сверить — прятать доказанное
+      нарушение за чужой неопределённостью значило бы терять сигнал.
+    - Нарушений среди проверенных нет, но часть кандидатов НЕ УДАЛОСЬ
+      сверить локально (сеть/квота на отдельном issue) — check_result.
+      unknown(): «чисто» здесь было бы недоказанным утверждением, а не
+      фактом (AGENTS.md «Алерт не гадает»).
+    - Все кандидаты сверены, нарушений нет — check_result.ok().
+
+    Второй раунд находки ai-review PR #880: исторический комментарий issue
     #140 (сам инцидент, ДО фикса) остаётся в теле issue навсегда — только
     комментарии позже WORKER_FALSE_SUCCESS_FIX_LANDED_AT считаются
-    нарушением, иначе инвариант красный с рождения (см. её докстринг)."""
+    нарушением, иначе инвариант красный с рождения (см. её докстринг).
+
+    Находка ai-review PR #1110: `items = (result or {}).get("items") or []`
+    молча схлопывал и «Search правда не нашёл кандидатов» (`{"items": []}`),
+    и «ответ неожиданной формы» (нет ключа `items` вовсе — дефект вторичного
+    рейт-лимита/абьюз-детектора, тот же класс F3) в одно и то же
+    check_result.ok(). Различаем форму до чтения `items`: нет ключа —
+    unknown(), пустой список под ключом — настоящее «чисто»."""
     query = f'repo:{repo} in:comments "{WORKER_FALSE_SUCCESS_MARKER}"'
     try:
         result = gh("-X", "GET", "search/issues", "-f", f"q={query}", "-f", "per_page=100")
-    except RuntimeError:
-        return []
-    items = (result or {}).get("items") or []
+    except RuntimeError as error:
+        return check_result.unknown(
+            f"GitHub Search (search/issues) недоступен: {error} — ни один "
+            "кандидат не проверен в этом прогоне")
+    if not isinstance(result, dict) or "items" not in result:
+        return check_result.unknown(
+            f"ответ GitHub Search неожиданной формы (не dict с ключом items "
+            f"— живой класс F3, issue #1096/#1109): {result!r}")
+    items = result.get("items")
+    # Находка ai-review PR #1110 (доводка 2, тот же класс, что у инварианта
+    # 13 выше): ключ ПРИСУТСТВУЕТ, но значение не список — предыдущая
+    # проверка смотрела только на наличие ключа.
+    if not isinstance(items, list):
+        return check_result.unknown(
+            f"ответ GitHub Search: ключ items есть, но значение не список "
+            f"(не по контракту): {items!r}")
     violations = []
+    unchecked = 0
     for item in items:
         number = item.get("number")
         if number is None:
@@ -1897,12 +2144,20 @@ def check_worker_false_success_comment(repo: str) -> list[dict]:
         try:
             confirmed = issue_marker_times(repo, number, WORKER_FALSE_SUCCESS_MARKER)
         except RuntimeError:
+            unchecked += 1
             continue
         recent = [t for t in confirmed if t > WORKER_FALSE_SUCCESS_FIX_LANDED_AT]
         if recent:
             violations.append(
                 {"issue": number, "url": item.get("html_url"), "title": item.get("title")})
-    return violations
+    if violations:
+        return check_result.violation(violations)
+    if unchecked:
+        return check_result.unknown(
+            f"{unchecked} из {len(items)} кандидатов Search не удалось "
+            "сверить локально (сеть/квота) — статус этих issue неизвестен, "
+            "остальные кандидаты нарушения не несут")
+    return check_result.ok()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2331,17 +2586,25 @@ def build_report(repo: str, now: datetime,
         lines.append("💚 [7] двусмысленной формулы принадлежности плагина нет")
 
     v8 = check_wasted_ai_review_runs(repo, open_pulls)
-    findings[8] = v8
-    if v8:
-        lines.append(f"🚨 [8] {len(v8)} PR получили дорогой прогон ai-review после вердикта при неизменном диффе (#740):")
-        for item in v8:
+    findings[8] = v8.violations
+    if v8.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v8.status)} [8] не удалось "
+                      f"проверить растрату дорогого прогона ai-review после "
+                      f"вердикта: {v8.reason}")
+    elif v8.violations:
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
+                      f"[8] {len(v8.violations)} PR получили дорогой прогон "
+                      "ai-review после вердикта при неизменном диффе (#740):")
+        for item in v8.violations:
             run_ids = ", ".join(f"#{r['run_id']}" for r in item["wasted_runs"])
             lines.append(
                 f"   — PR #{item['pr']} — вердикт {item['verdict_at']}, "
                 f"отпечаток не менялся, но прогон(ы) {run_ids} стартовали позже"
             )
     else:
-        lines.append("💚 [8] нет дорогих прогонов ai-review после вердикта при неизменном диффе")
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [8] "
+                      "нет дорогих прогонов ai-review после вердикта при "
+                      "неизменном диффе")
 
     if check_declared_deps:
         try:
@@ -2381,17 +2644,28 @@ def build_report(repo: str, now: datetime,
                       "прижат к push/PR, где уже стоят declared_deps wire/check — #454/#711)")
 
     v10 = check_recurring_worker_failure(repo)
-    findings[10] = v10
-    if v10:
-        for item in v10:
+    findings[10] = v10.violations
+    if v10.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v10.status)} [10] не удалось "
+                      f"проверить серию подряд-провалов {RECURRING_FAILURE_WORKFLOW}: "
+                      f"{v10.reason}")
+    elif v10.violations:
+        for item in v10.violations:
+            pending_note = (
+                " (есть ещё не завершённый прогон в этом же окне — его исход "
+                "пока не известен, серия посчитана по уже завершённым)"
+                if item.get("pending_seen") else ""
+            )
             lines.append(
-                f"🚨 [10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
+                f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
+                f"[10] {item['workflow']} — {item['streak']} прогонов подряд упали с "
                 f"одной причиной, с {item['since']} по {item['until']} (job "
                 f"«{item['job_name']}»): {item['error_text']} — последний прогон "
-                f"{item['latest_run_url']}"
+                f"{item['latest_run_url']}{pending_note}"
             )
     else:
-        lines.append(f"💚 [10] нет серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [10] нет "
+                      f"серии из {RECURRING_FAILURE_STREAK_THRESHOLD}+ подряд "
                       f"провалов {RECURRING_FAILURE_WORKFLOW} с одной причиной")
 
     v11 = check_provider_usage_manifest()
@@ -2434,28 +2708,44 @@ def build_report(repo: str, now: datetime,
             lines.append(f"💚 [12] снимок здоровья конвейера на {pipeline_health.DATA_BRANCH} "
                           f"не старше {PIPELINE_HEALTH_STALE_AFTER_DAYS} суток")
 
-    v13 = check_conveyor_gate_phantom_pause(repo)
-    findings[13] = v13
-    if v13:
-        item = v13[0]
+    v13 = check_conveyor_gate_phantom_pause(repo, now)
+    findings[13] = v13.violations
+    # Значок — ОДНО место правды check_result.status_emoji (issue #1096,
+    # находка ai-review PR #1110: STATUS_EMOJI был объявлен «местом правды»,
+    # но ни один рендер его не читал — теперь читает).
+    if v13.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v13.status)} [13] не удалось "
+                      f"проверить фантомную паузу конвейера: {v13.reason}")
+    elif v13.violations:
+        item = v13.violations[0]
         lines.append(
-            f"🚨 [13] конвейер держит паузу диспатча worker.yml при "
+            f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [13] "
+            f"конвейер держит паузу диспатча worker.yml при "
             f"{item['failures']} реальных подряд-провалах (порог "
             f"{item['threshold']}) — маркер серии активен с "
             f"{item['last_marker_at']}, хотя её нечем объяснить (issue #899): "
             f"{item['latest_run_url']}"
         )
     else:
-        lines.append("💚 [13] нет фантомной паузы конвейера "
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [13] "
+                      "нет фантомной паузы конвейера "
                       "(маркер серии без реальных подряд-провалов, issue #899)")
     v14 = check_worker_false_success_comment(repo)
-    findings[14] = v14
-    if v14:
-        lines.append(f"🚨 [14] {len(v14)} комментариев несут противоречие «справился (провайдер: ?)» (#876):")
-        for item in v14:
+    findings[14] = v14.violations
+    if v14.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v14.status)} [14] не удалось "
+                      f"проверить комментарии воркера на противоречие "
+                      f"«справился (провайдер: ?)»: {v14.reason}")
+    elif v14.violations:
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
+                      f"[14] {len(v14.violations)} комментариев несут противоречие "
+                      f"«справился (провайдер: ?)» (#876):")
+        for item in v14.violations:
             lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
     else:
-        lines.append("💚 [14] ни один комментарий воркера не несёт противоречия «справился (провайдер: ?)»")
+        lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [14] ни "
+                      "один комментарий воркера не несёт противоречия "
+                      "«справился (провайдер: ?)»")
 
     try:
         v15_all = check_merge_reaction_gaps(repo, now, merged_pulls)
@@ -2533,6 +2823,41 @@ def build_report(repo: str, now: datetime,
         )
 
     return lines, findings
+
+
+# Инварианты, чей v_N — check_result.CheckResult, не голый список (issue
+# #1096): findings[N] = v_N.violations коллапсирует STATUS_UNKNOWN в тот же
+# пустой список, что и STATUS_OK — CI_GATING/ESCALATING_INVARIANTS читают
+# findings по факту истинности списка, и ❓ молча стал бы 💚 ещё одним слоем
+# ниже отчёта, ровно тот класс, который эта задача закрывает (находка
+# ai-review PR #1110, некритичное замечание 2). Сегодня 13/14 не гейтят и не
+# эскалируют — этот реестр и проверка ниже (assert_check_result_invariants_
+# not_gated_or_escalated) делают невозможным молчаливый регресс, если кто-то
+# добавит один из них в CI_GATING/ESCALATING_INVARIANTS ДО того, как появится
+# отдельный канал для unknown (issue #1109, шаг 2). Инварианты 8 и 10
+# (issue #1109, F7 и класс «transport dead -> return []») мигрированы в этой
+# же задаче — оба уже не входят в CI_GATING/ESCALATING_INVARIANTS, коллизии
+# не возникает.
+CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14})
+
+
+def assert_check_result_invariants_not_gated_or_escalated(
+        ci_gating: frozenset[int], escalating_invariants: tuple[int, ...]) -> None:
+    """Падает громко, если инвариант, несущий CheckResult (issue #1096),
+    попал в CI_GATING или ESCALATING_INVARIANTS — оба читают `findings[N]`
+    по факту истинности списка, и unknown() там неотличим от «нарушений
+    нет». Вызывается из main() тем же приёмом, что и проверка `missing_gas`
+    рядом (AGENTS.md «Тормоз без газа не принимается» — падать ДО того, как
+    непроверенное состояние покрасит main, а не после)."""
+    collision = (ci_gating | set(escalating_invariants)) & CHECK_RESULT_MIGRATED_INVARIANTS
+    if collision:
+        raise RuntimeError(
+            f"инварианты {sorted(collision)} несут check_result.CheckResult "
+            "(issue #1096) и не могут гейтить/эскалировать по findings — "
+            "unknown() коллапсирует в findings[N]=[] неотличимо от ok() (см. "
+            "ai-review PR #1110); нужен отдельный канал для unknown ДО "
+            "добавления в CI_GATING/ESCALATING_INVARIANTS"
+        )
 
 
 def summary(lines: list[str]) -> None:
@@ -2710,6 +3035,11 @@ def main() -> int:
              "с правом administration (GITHUB_TOKEN его структурно не имеет, "
              "запускать вручную с admin-токеном владельца, не из CI)")
     args = parser.parse_args()
+
+    # Статическая проверка констант — не нужны ни repo, ни сеть (issue #1096,
+    # ai-review PR #1110, некритичное замечание 2): падаем громко ДО отчёта,
+    # если инвариант с CheckResult попал в CI_GATING/ESCALATING_INVARIANTS.
+    assert_check_result_invariants_not_gated_or_escalated(CI_GATING, ESCALATING_INVARIANTS)
 
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)

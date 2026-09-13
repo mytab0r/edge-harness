@@ -19,5 +19,38 @@ LiteLLM — нет обработки `sk-ant-oat` (и отвергнут отд
 ## Не подтверждено
 TTL токена; нужен ли `x-anthropic-billing-header` (плагин ставит, pi-ai нет; живой Bearer+betas без него давал 200 на /messages,/models, но стриминг/tool-calls отдельно не проверялись); полнота обзора внешних решений; валидация формата в `assertUsableApiKey()`.
 
+## Дополнение 2026-09-13 (#1097): почему self-регистрация плагина никогда не работала в headless
+
+Живой инцидент — плагин `dsh-anthropic-oauth-pool` отказывал на КАЖДОМ прогоне
+`worker.yml`/`hands.yml` за ~1с: `TypeError: Cannot read properties of undefined
+(reading 'update')` в `lib/index.js::ensureProvider`. Причина установлена
+разборкой `dsh-anthropic-oauth-pool-0.1.0.tgz` (релиз `dsh-plugins-suite-v1`) —
+`ensureProvider()` пытается прописать себя в `llm-pi-ai` через
+`ctx.get('settings').update('llm-pi-ai', {...})` (Cordis service `settings`,
+пакет `@deepseek-ai/dsh-settings`). Этот сервис **никогда не смонтирован в
+профиле `headless`**: `@deepseek-ai/dsh-headless/cordis.patch.yml` явно
+описывает себя как «no Host, HTTP server, Web runtime, or browser plugin», и
+ни один пакет, реально идущий в headless-профиль (`@deepseek-ai/dsh`,
+`dsh-headless`, `dsh-code-runtime-worker-thread`), не тянет
+`@deepseek-ai/dsh-settings` как рантайм-зависимость — только как devDependency
+`@deepseek-ai/dsh` и peerDependency `dsh-agent-default-model`, обе бездействуют
+без явной composition-строки. `ctx.get('settings')` в headless возвращает
+`undefined` детерминированно, а не по версии/дрейфу зависимостей: `DSH_VERSION`
+(`0.1.1-rc.2`) не менялся с 2026-08-30, integrity-хэши `@deepseek-ai/dsh` и
+`@deepseek-ai/dsh-headless` совпали байт-в-байт с закреплёнными в
+`scripts/lib/dsh-ci.sh` при повторном `npm pack` 2026-09-13.
+
+HTTP-прокси плагина (аутентификация, ротация аккаунтов, failover — сама ценность
+плагина сверх голого нативного моста из TL;DR выше) при этом стартует и
+работает нормально: `ensureProvider()` вызывается АСИНХРОННО после
+`server.listen`, её отказ ловится `.catch()` внутри плагина и не роняет процесс
+— ломается только регистрация в `llm-pi-ai`.
+
+Фикс (`scripts/lib/dsh-ci.sh::_dsh_patch_profile_anthropic_pool`) — статическая
+регистрация `llm-pi-ai.providers.anthropic-pool` в `cordis.patch.yml`, тем же
+путём, что уже работает у combo-router (`dsh_patch_profile`), в обход
+сломанного settings-сервиса; порт прокси зафиксирован (`DSH_ANTHROPIC_POOL_PORT`)
+— иначе `baseURL` нельзя узнать до старта процесса, выбирающего порт сам.
+
 ## Источники
-`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10).
+`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097).
