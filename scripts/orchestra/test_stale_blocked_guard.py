@@ -336,9 +336,11 @@ def offline_telegram(monkeypatch):
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
 
-def test_stale_blocked_check_reports_268_on_live_shaped_responses(monkeypatch, offline_telegram):
-    """Полная проводка на прод-форме: listing → comments → issues/265 (closed)
-    → эскалация (комментарий в #268 + Telegram, находка ревью #333/#336)."""
+def test_stale_blocked_check_removes_label_and_leaves_trail_on_268_prod_form(monkeypatch, offline_telegram):
+    """Полная проводка на прод-форме (#1157): listing → comments → issues/265
+    (closed) → DELETE labels/blocked + POST комментарий-след В САМ #268 (не
+    отдельная задача-статус, не Telegram — снятие успешно, эскалировать
+    нечего)."""
     calls: list[tuple] = []
 
     def fake(*args):
@@ -355,30 +357,117 @@ def test_stale_blocked_check_reports_268_on_live_shaped_responses(monkeypatch, o
         if url == "repos/mytab0r/edge-harness/issues/268/comments?per_page=100&page=1":
             return [{"body": ISSUE_268_ESCALATION_COMMENT}]
         if url == "repos/mytab0r/edge-harness/issues/265":
-            return {"state": "closed"}
+            return {"state": "closed", "closed_at": "2026-09-05T13:33:09Z"}
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    lines = sbg.stale_blocked_check(REPO)
+    assert len(lines) == 1
+    assert lines[0].startswith("✅")
+    assert "#268" in lines[0] and "#265" in lines[0]
+
+    deletes = [c for c in calls if c[0] == "-X" and c[1] == "DELETE"]
+    label_deletes = [c for c in deletes if "issues/268/labels/blocked" in c[2]]
+    assert label_deletes, "метка blocked обязана быть снята с #268 запросом DELETE"
+
+    posted = [c for c in calls if c[0] == "-X" and c[1] == "POST"]
+    comment_calls = [c for c in posted if "issues/268/comments" in c[2]]
+    assert comment_calls, "снятие обязано оставить след прямо в #268 (не в отдельной задаче-статус)"
+    body_arg = next(a for a in comment_calls[0] if a.startswith("body="))
+    assert "#265" in body_arg and "2026-09-05T13:33:09Z" in body_arg, (
+        "след обязан называть закрытую задачу и когда она закрылась")
+
+
+def test_stale_blocked_check_removes_label_on_215_prod_form_with_809_closed(monkeypatch, offline_telegram):
+    """Живой случай #215/#258 (issue #938/#1157), маркер «Причина блокировки:
+    #809», прод-форма комментария снята дословно выше. #809 закрыт
+    2026-09-10T11:12:44Z (`gh issue view 809 --json closedAt`, снято при
+    разборе этой задачи) — гвардия обязана снять метку сама, не только
+    доложить о протухании."""
+    calls: list[tuple] = []
+
+    def fake(*args):
+        calls.append(args)
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith("repos/mytab0r/edge-harness/issues?state=open&labels=blocked"):
+            return [{
+                "number": 215,
+                "labels": [{"name": "task"}, {"name": "white-spot"}, {"name": "blocked"},
+                           {"name": "stale-unclaimed"}],
+                "body": "тело #215 не участвует в этом тесте",
+            }]
+        if url == "repos/mytab0r/edge-harness/issues/215/comments?per_page=100&page=1":
+            return [{"body": ISSUE_215_ESCALATION_COMMENT}]
+        if url == "repos/mytab0r/edge-harness/issues/809":
+            return {"state": "closed", "closed_at": "2026-09-10T11:12:44Z"}
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    lines = sbg.stale_blocked_check(REPO)
+    assert len(lines) == 1
+    assert lines[0].startswith("✅")
+    assert "#215" in lines[0] and "#809" in lines[0]
+
+    deletes = [c for c in calls if c[0] == "-X" and c[1] == "DELETE"]
+    assert any("issues/215/labels/blocked" in c[2] for c in deletes), (
+        "метка blocked обязана быть снята с #215")
+    posted = [c for c in calls if c[0] == "-X" and c[1] == "POST"]
+    comment_calls = [c for c in posted if "issues/215/comments" in c[2]]
+    assert comment_calls
+    body_arg = next(a for a in comment_calls[0] if a.startswith("body="))
+    assert "#809" in body_arg and "2026-09-10T11:12:44Z" in body_arg
+
+
+def test_stale_blocked_check_escalates_when_label_removal_fails(monkeypatch, offline_telegram):
+    """Газ у газа наоборот: снятие само провалилось (сеть/права) — метка
+    остаётся, но провал не должен тонуть молча. Эскалация тем же каналом,
+    что раньше несла само протухание (комментарий в #268 + Telegram)."""
+    calls: list[tuple] = []
+
+    def fake(*args):
+        calls.append(args)
+        if args[0] == "-X" and args[1] == "DELETE":
+            raise RuntimeError("gh api: 403 Forbidden")
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith("repos/mytab0r/edge-harness/issues?state=open&labels=blocked"):
+            return [{
+                "number": 268,
+                "labels": [{"name": "task"}, {"name": "area:worker"}, {"name": "blocked"}],
+                "body": ISSUE_268_BODY,
+            }]
+        if url == "repos/mytab0r/edge-harness/issues/268/comments?per_page=100&page=1":
+            return [{"body": ISSUE_268_ESCALATION_COMMENT}]
+        if url == "repos/mytab0r/edge-harness/issues/265":
+            return {"state": "closed", "closed_at": "2026-09-05T13:33:09Z"}
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
     patch_gh(monkeypatch, fake)
     lines = sbg.stale_blocked_check(REPO)
     assert len(lines) == 1
     assert lines[0].startswith("🚨")
-    assert "#268" in lines[0] and "#265" in lines[0]
+    assert "#268" in lines[0] and "#265" in lines[0] and "НЕ снята" in lines[0]
 
     posted = [c for c in calls if c[0] == "-X" and c[1] == "POST"]
     comment_calls = [c for c in posted if "issues/268/comments" in c[2]]
-    assert comment_calls, "эскалация обязана оставить след прямо в #268 (не в отдельной задаче-статус)"
+    assert comment_calls, "провал снятия обязан оставить след эскалации в #268"
     body_arg = next(a for a in comment_calls[0] if a.startswith("body="))
-    assert "[протухшая блокировка: #265]" in body_arg, "маркер эпизода — в теле комментария"
+    assert "[протухшая блокировка: #265]" in body_arg
 
 
-def test_stale_blocked_check_silent_channel_when_episode_already_escalated(monkeypatch, offline_telegram):
-    """Тот же набор протухших ссылок уже сигналился в #268 (маркер найден в
-    уже прочитанных комментариях) — второй прогон не шлёт повтор в канал
-    (иначе 15-минутный крон заспамит), но нарушение остаётся в отчёте
-    (не 💗) — CI-шаг не должен выглядеть холостым."""
+def test_stale_blocked_check_silent_channel_when_removal_failure_already_escalated(monkeypatch, offline_telegram):
+    """Тот же провал снятия повторяется каждый пульс (403 не лечится само) —
+    второй прогон не шлёт повтор в канал (иначе 15-минутный крон заспамит),
+    но нарушение остаётся в отчёте (не 💗) — CI-шаг не должен выглядеть
+    холостым."""
     prior_escalation = "🚨 [протухшая блокировка: #265]\nуже сигналили раньше"
 
     def fake(*args):
+        if args[0] == "-X" and args[1] == "DELETE":
+            raise RuntimeError("gh api: 403 Forbidden")
         if args[0] == "-X":
             raise AssertionError(f"мутирующий вызов не ожидался — эпизод уже сигналился: {args}")
         url = args[0]
@@ -391,7 +480,7 @@ def test_stale_blocked_check_silent_channel_when_episode_already_escalated(monke
         if url == "repos/mytab0r/edge-harness/issues/268/comments?per_page=100&page=1":
             return [{"body": ISSUE_268_ESCALATION_COMMENT}, {"body": prior_escalation}]
         if url == "repos/mytab0r/edge-harness/issues/265":
-            return {"state": "closed"}
+            return {"state": "closed", "closed_at": "2026-09-05T13:33:09Z"}
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
     patch_gh(monkeypatch, fake)
@@ -399,6 +488,24 @@ def test_stale_blocked_check_silent_channel_when_episode_already_escalated(monke
     assert len(lines) == 1
     assert lines[0].startswith("🔇")
     assert "#268" in lines[0] and "#265" in lines[0]
+
+
+def test_stale_blocked_check_quiet_once_label_already_gone():
+    """Идемпотентность (#1157): после успешного снятия следующий прогон уже
+    не видит issue в списке `labels=blocked` вовсе (метка снята) — холостой
+    ход, без бесконечного цикла снятие→находка→снятие."""
+    def fake(*args):
+        if args[0].startswith("repos/mytab0r/edge-harness/issues?state=open&labels=blocked"):
+            return []
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    original = pg.gh
+    pg.gh = fake
+    try:
+        lines = sbg.stale_blocked_check(REPO)
+    finally:
+        pg.gh = original
+    assert lines == ["💗 blocked: протухших меток не найдено (0 issue с меткой blocked проверено)"]
 
 
 def test_stale_blocked_check_silent_on_216_live_shaped_responses(monkeypatch):
@@ -429,9 +536,17 @@ def test_main_exit_code_reflects_violations(monkeypatch):
     assert sbg.main() == 0
 
 
+def test_main_exit_code_treats_automatic_removal_as_green(monkeypatch):
+    """#1157: находка, УЖЕ ПОЧИНЕННАЯ этим же прогоном (метка снята
+    автоматически) — не считается нарушением, шаг остаётся зелёным."""
+    monkeypatch.setattr(sbg, "stale_blocked_check", lambda repo: ["✅ метка `blocked` снята автоматически"])
+    assert sbg.main() == 0
+
+
 def test_main_exit_code_treats_silent_channel_as_violation_too(monkeypatch):
-    """Находка ревью #333/#336: «уже эскалировано, повтор не шлём» — это всё
-    ещё нарушение (метка не снята), а не холостой ход. Молчит только канал
-    эскалации, CI-шаг остаётся красным."""
+    """Находка ревью #333/#336 (сохраняется для отказа снятия): «уже
+    эскалировано, повтор не шлём» — это всё ещё нарушение (метка не снята),
+    а не холостой ход. Молчит только канал эскалации, CI-шаг остаётся
+    красным."""
     monkeypatch.setattr(sbg, "stale_blocked_check", lambda repo: ["🔇 нарушение, но эпизод уже сигналился"])
     assert sbg.main() == 1

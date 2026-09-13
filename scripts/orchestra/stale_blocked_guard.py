@@ -45,24 +45,43 @@ upstream_drift: «[дрейф пина: …]», PAUSE_MARKER) — называе
 неполнота, а не скрытая: новый маркер добавляется правкой STALE_MARKER_RE,
 одно место.
 
-Эта гвардия НЕ снимает метку сама и не решает вместо владельца (LABELS.md:
-газ `blocked` — «вручную: владелец», это решение здесь не пересматривается).
-Она делает протухание ВИДИМЫМ: issue с меткой `blocked`, чей текст называет
-маркером ровно один блокирующий issue/PR `#N`, а тот `#N` уже CLOSED —
-попадает в отчёт как нарушение.
+Пересмотрено #1111/#1157 (класс «тормоз ставится автоматически, снимается
+только руками», живой случай: #215/#258 несут «Причина блокировки: #809»,
+#809 закрыт 2026-09-09/10, метка не снята никем ни автоматикой (её не было),
+ни владельцем — снял бы только сплошной прочёс). Прежнее решение («не снимает
+метку сама») держалось на прозе «не решает вместо владельца» — эта причина
+НЕ выдерживает проверки для УЗКОГО признака этого модуля: закрытость issue,
+названного маркером «Блокирована: #N»/«Причина блокировки: #N», —
+факт (`state == "closed"` по живому GET), а не суждение. Суждение (трактовка
+находки, выбор приоритета) — то, что AGENTS.md прямо оставляет человеку;
+«закрыт ли номер X» им не является. Поэтому для ЭТОГО узкого признака гвардия
+теперь снимает метку сама и оставляет след — комментарий, называющий закрытую
+задачу и когда она закрылась (см. `removal_comment_text`).
 
-Находка ревью #333/#336: печать строки в лог шага с `continue-on-error: true`
+Учтён риск (не совпадает с прежним классом честного потолка выше): блокировка
+может быть поставлена БЕЗ ссылки на другой issue («упёрся в то, что есть
+только у владельца — секрет/доступ/деньги», LABELS.md, живой пример в тестах
+ниже — issue без единого маркера). `find_stale_blocked` такие не находит
+вовсе (нет маркера — нет `current_stale_marker_target`) — они остаются
+ручными в точности как раньше, это не задевается правкой ни строкой кода.
+
+Газ у этого газа (если снятие ошиблось — например, `#N` закрыт как
+`not_planned`, а реальная причина блокировки жива): снятие метки тривиально
+обратимо тем же путём, что и раньше — `gh issue edit <N> --add-label blocked`
+плюс новый маркер «Блокирована: #M»/«Причина блокировки: #M» переустанавливает
+легитимную блокировку; `current_stale_marker_target` уже учитывает только
+ПОСЛЕДНИЙ по порядку маркер (переустановка не путается со старым эпизодом).
+Комментарий снятия называет закрытый номер и время — у того, кто заметит
+ошибку, есть все данные без раскопок истории.
+
+Находка ревью #333/#336 (сохраняется для оставшихся ручных случаев и для
+провала самого снятия): печать строки в лог шага с `continue-on-error: true`
 (.github/workflows/orchestra.yml) — тот же класс, что «Тормоз без газа» из
 AGENTS.md: механизм проверки есть, а носитель доставки сигнала до владельца —
 нет (лог этого job'а уже однажды никто не читал, #268 висел незамеченным).
-Поэтому здесь тот же канал, что у upstream_drift/pulse_guard: эскалация —
-комментарий В САМ протухший issue (не в отдельную задачу-статус, у каждого
-`#N` своя) + Telegram (pulse_guard.escalate), один раз на эпизод. Эпизод —
-маркер `STALE_ESCALATE_MARKER` с целью «набор протухших ссылок»: та же цель
-уже сигналилась в этом issue — молчим (иначе 15-минутный крон заспамил бы
-канал), набор изменился (новая ссылка протухла, старая ушла) — сигналим
-заново. Комментарии для проверки маркера уже собраны выше
-(`fetch_comments_text`) — второго сетевого похода за тем же issue не нужно.
+Провал самого снятия (сеть/права) эскалируется тем же каналом, что раньше
+эскалировалось само протухание: комментарий В САМ issue + Telegram
+(`pulse_guard.escalate`), один раз на эпизод, маркер `STALE_ESCALATE_MARKER`.
 
 Признак — свой, узкий регэксп STALE_MARKER_RE, не task_ref.extract_task_refs
 (широкая семантика «любое упоминание #N» — ровно то, от чего этот модуль
@@ -207,9 +226,31 @@ def find_stale_blocked(issues: list[dict], closed_numbers: set[int]) -> list[dic
 def violation_text(violation: dict) -> str:
     refs = ", ".join(f"#{n}" for n in violation["stale_refs"])
     return (
-        f"#{violation['number']}: метка `blocked` стоит, но названная маркером "
-        f"«Блокирована: {refs}» причина уже закрыта — газ объявлен, но не "
-        "проверен; владелец: снять метку или назвать актуальную причину (#334)"
+        f"#{violation['number']}: метка `blocked` стояла из-за {refs} — "
+        "уже закрыт(ы), условие снятия наступило"
+    )
+
+
+def removal_comment_text(violation: dict, states: dict[int, dict]) -> str:
+    """Текст следа снятия (#1157): называет закрытую задачу и когда она
+    закрылась — «какая задача закрыта, когда», как требует правило
+    репозитория «Решение — это механизм, а не текст». `closed_by` (кем)
+    добавляется, только если GitHub его вернул (полный ответ single-issue
+    несёт это поле, список — нет; здесь всегда полный ответ, см. `issue_state`)."""
+    parts = []
+    for number in violation["stale_refs"]:
+        data = states.get(number) or {}
+        closed_at = data.get("closed_at") or "момент неизвестен (поле не вернулось)"
+        closed_by = (data.get("closed_by") or {}).get("login")
+        by_suffix = f", закрыл `{closed_by}`" if closed_by else ""
+        parts.append(f"#{number} закрыт {closed_at}{by_suffix}")
+    refs_text = "; ".join(parts)
+    return (
+        f"✅ метка `blocked` снята автоматически (stale_blocked_guard, #1157): "
+        f"причина блокировки — {refs_text}. Если снятие ошибочно (блокировка "
+        "действует по другой причине) — верните метку `gh issue edit "
+        f"{violation['number']} --add-label blocked` с новым маркером "
+        "«Блокирована: #M» / «Причина блокировки: #M»."
     )
 
 
@@ -262,16 +303,35 @@ def fetch_comments_text(repo: str, number: int) -> list[str]:
     return [comment.get("body") or "" for comment in comments]
 
 
-def is_closed(repo: str, number: int) -> bool:
-    """Состояние issue ИЛИ PR по общему issues-эндпоинту (PR доступен через
-    него же) — нам важно только open/closed, не merged отдельно."""
+def issue_state(repo: str, number: int) -> dict:
+    """Полное состояние issue ИЛИ PR по общему issues-эндпоинту (PR доступен
+    через него же) — не только `state`, но и `closed_at`/`closed_by` (полный
+    single-issue ответ несёт оба поля, список-эндпоинт — нет), нужные для
+    следа снятия метки (`removal_comment_text`, #1157). Пустой словарь —
+    честный признак «ответа не было» (не путать с открытым issue)."""
     data = pulse_guard.gh(f"repos/{repo}/issues/{number}")
-    return bool(data) and data.get("state") == "closed"
+    return data if isinstance(data, dict) else {}
+
+
+def remove_label(repo: str, number: int) -> None:
+    # label_query_value — то же место кодирования, что уже применяет
+    # waiting_owner_guard.remove_label (issue #938: сырое двоеточие в пути
+    # ломает gh api на плейсхолдерах `:owner`/`:repo`); у `blocked` спецсимволов
+    # нет, но кодирование — не второе место правды, а то же самое, что и у
+    # значения query выше (open_blocked_issues).
+    pulse_guard.gh("-X", "DELETE",
+                   f"repos/{repo}/issues/{number}/labels/"
+                   f"{review_labels.label_query_value(BLOCKED_LABEL)}")
 
 
 def stale_blocked_check(repo: str) -> list[str]:
     """Проводка: один живой прогон. Возвращает строки отчёта (пустой список —
-    холостой ход, ни одной протухшей блокировки не найдено)."""
+    холостой ход, ни одной протухшей блокировки не найдено).
+
+    С #1157: найденная протухшая блокировка (маркер + закрытая цель) больше
+    не только эскалируется — метка снимается сама, след оставляется
+    комментарием (`removal_comment_text`). Провал самого снятия (сеть/права)
+    — единственный путь, оставшийся у эскалации `escalate()` в этом модуле."""
     issues = open_blocked_issues(repo)
     for issue in issues:
         issue["comments_text"] = fetch_comments_text(repo, issue["number"])
@@ -281,7 +341,8 @@ def stale_blocked_check(repo: str) -> list[str]:
         texts = [issue.get("body") or ""] + issue["comments_text"]
         referenced.update(stale_marker_targets(issue["number"], texts))
 
-    closed_numbers = {number for number in referenced if is_closed(repo, number)}
+    states = {number: issue_state(repo, number) for number in referenced}
+    closed_numbers = {number for number, data in states.items() if data.get("state") == "closed"}
     violations = find_stale_blocked(issues, closed_numbers)
     if not violations:
         return [f"💗 blocked: протухших меток не найдено ({len(issues)} issue с меткой blocked проверено)"]
@@ -289,16 +350,34 @@ def stale_blocked_check(repo: str) -> list[str]:
     by_number = {issue["number"]: issue for issue in issues}
     lines = []
     for violation in violations:
-        issue = by_number[violation["number"]]
-        texts = [issue.get("body") or ""] + issue["comments_text"]
-        target = escalation_target(violation)
-        if already_escalated(texts, target):
-            # Тот же набор протухших ссылок уже сигналился в этом issue —
-            # молчим (иначе 15-минутный крон заспамил бы канал).
-            lines.append(f"🔇 {violation_text(violation)} (уже эскалировано в этом эпизоде)")
+        number = violation["number"]
+        try:
+            remove_label(repo, number)
+        except RuntimeError as error:
+            # Снятие не удалось (сеть/права) — тот же класс, что провал
+            # remove_label в waiting_owner_guard.py: не тонем молча, красная
+            # строка отчёта плюс эскалация тем же каналом, что раньше несла
+            # само протухание (метка так и осталась висеть без газа). Дедуп
+            # эскалации на эпизод (already_escalated) сохранён здесь ЖЕ:
+            # повторяющийся сетевой отказ не должен слать Telegram каждые
+            # 15 минут (тот же приём, что был у всего модуля до #1157).
+            print(f"::warning::метка blocked не снята с #{number}: {error}", file=sys.stderr)
+            issue = by_number[number]
+            texts = [issue.get("body") or ""] + issue["comments_text"]
+            target = escalation_target(violation)
+            if already_escalated(texts, target):
+                lines.append(f"🔇 {violation_text(violation)} — метка НЕ снята "
+                             f"автоматически ({error}); уже эскалировано в этом эпизоде")
+            else:
+                delivered = escalate(repo, number, escalation_text(violation))
+                lines.append(f"🚨 {violation_text(violation)} — метка НЕ снята "
+                             f"автоматически ({error}); эскалировано (сигнал: {delivered})")
             continue
-        delivered = escalate(repo, violation["number"], escalation_text(violation))
-        lines.append(f"🚨 {violation_text(violation)} (сигнал: {delivered})")
+        try:
+            pulse_guard.post_issue_comment(repo, number, removal_comment_text(violation, states))
+        except RuntimeError as error:
+            print(f"::warning::след снятия не оставлен в #{number}: {error}", file=sys.stderr)
+        lines.append(f"✅ метка `blocked` снята автоматически — {violation_text(violation)}")
     return lines
 
 
@@ -307,12 +386,12 @@ def main() -> int:
     lines = stale_blocked_check(repo)
     for line in lines:
         print(line)
-    # 🔇 (тот же эпизод уже эскалирован, повтор не шлём) — тоже нарушение, не
-    # холостой ход: молчим только каналом эскалации, не CI-статусом. Красный
-    # шаг остаётся видимым при continue-on-error (находка ревью #333/#336) —
-    # ровно тот второй способ («видно красным шагом»), которым LABELS.md
-    # теперь и описывает поведение.
-    return 0 if all(line.startswith("💗") for line in lines) else 1
+    # 💗 — холостой ход, ✅ — протухшая блокировка найдена и УЖЕ ПОЧИНЕНА этим
+    # же прогоном (метка снята, след оставлен, #1157) — оба зелёные. 🚨 — само
+    # снятие не удалось (сеть/права) — красный шаг остаётся видимым при
+    # continue-on-error (находка ревью #333/#336), это и есть газ для отказа
+    # газа: провал автоматики виден так же, как раньше было видно протухание.
+    return 0 if all(line.startswith("💗") or line.startswith("✅") for line in lines) else 1
 
 
 if __name__ == "__main__":
