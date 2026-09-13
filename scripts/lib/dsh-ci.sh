@@ -1256,7 +1256,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # же переменные, что и раньше, независимо от того, ответил пул или цепочка.
 dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
-  local pool_rl_used=0
+  local pool_rl_used=0 pool_err_note
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
     _dsh_patch_profile_anthropic_pool headless
@@ -1273,7 +1273,18 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
     # бюджета цепочки, иначе она получит полный бюджет заново (находка
     # ai-review PR #880 на первой версии этого фикса).
     pool_rl_used="${DSH_RUN_WAITED_SECS:-0}"
-    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC) — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+    # #1067 (живой инцидент, прогон worker.yml 34735752165): раньше это
+    # сообщение называло только rc — сам stderr пула читался бы из ТОГО ЖЕ
+    # $err_file, что цепочка ниже перезаписывает на своей первой попытке
+    # (dsh_run_with_retry всегда открывает err_file `>`, не дописывает) —
+    # причина отказа пула терялась НАВСЕГДА, ни в одном логе прогона её не
+    # найти (AGENTS.md, «Алерт не гадает»: rc=1 без единого слова причины —
+    # то же самое гадание, только без вопросительного знака). Хвост читаем
+    # ЗДЕСЬ, до перезаписи, тем же приёмом, что dsh_chain_should_advance уже
+    # применяет к провайдерам цепочки (200 символов, redact).
+    pool_err_note=$(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)
+    [ -n "$pool_err_note" ] || pool_err_note="stderr пуст — диагностику дать не может"
+    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
   fi
   dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text" "$pool_rl_used"
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then

@@ -2439,7 +2439,7 @@ def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
 def test_failure_watch_window_anchor_is_failure_moment_not_queue_time(monkeypatch):
     # Находка ревью PR #488 (раунд 3, блокирующая): created_at у GitHub —
     # момент ПОСТАНОВКИ В ОЧЕРЕДЬ, не провала. Воркер по замыслу пашет десятки
-    # минут (worker.yml — timeout-minutes: 280): прогон, поставленный в
+    # минут (worker.yml — timeout-minutes: 340, #1067, было 280): прогон, поставленный в
     # очередь 200 минут назад и УПАВШИЙ 10 минут назад, по created_at лежал бы
     # вне окна на каждом пульсе — ни задачи, ни наблюдения, навсегда. Якорь
     # окна — updated_at (у завершённого красного прогона это момент провала).
@@ -2708,7 +2708,7 @@ def test_failure_watch_parses_jobs_up_to_cap_and_names_the_rest(monkeypatch):
 def test_failure_watch_single_page_100_for_every_watched_workflow(monkeypatch):
     # Находка ревью PR #488 (раунды 4–5): страница считается безотносительно
     # окна, а провал с самым старым created_at — timed_out долгого воркера
-    # (кап 280 мин: создан ЗА ЧАСЫ до провала) — вытеснялся бы за страницу 20
+    # (кап 340 мин, #1067: создан ЗА ЧАСЫ до провала) — вытеснялся бы за страницу 20
     # молча. Размер ЕДИНЫЙ для всех отслеживаемых (FAILURE_WATCH_PER_PAGE=100,
     # прецедент — heartbeat_check), тот же ОДИН запрос на workflow.
     routes = dict(FAILURE_WATCH_QUIET_ROUTES)
