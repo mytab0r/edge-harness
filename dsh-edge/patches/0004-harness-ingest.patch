@@ -1,8 +1,8 @@
 diff --git a/apps/dsh-edge/src/http.ts b/apps/dsh-edge/src/http.ts
-index 972d344..83b1c33 100644
+index 316fbbf..9551414 100644
 --- a/apps/dsh-edge/src/http.ts
 +++ b/apps/dsh-edge/src/http.ts
-@@ -12,6 +12,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
+@@ -13,6 +13,10 @@ export const MAX_MESSAGE_FEEDBACK_BODY_BYTES = 64 * 1_024
  // Four projected image uploads fit after base64 expansion plus the RPC envelope.
  export const MAX_TURN_BODY_BYTES = 10 * 1_024 * 1_024
  export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
@@ -13,7 +13,7 @@ index 972d344..83b1c33 100644
  
  /**
   * Body limit for one Durable Object API request, selected before the entry
-@@ -21,6 +25,7 @@ export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
+@@ -22,6 +26,7 @@ export const MAX_WORKSPACE_EXEC_BODY_BYTES = 131_072
   * data gets the turn budget whichever path the client uses.
   */
  export function instanceRequestBodyLimit(pathname: string): number {
@@ -21,14 +21,14 @@ index 972d344..83b1c33 100644
    if (pathname.endsWith('/turn') || pathname === '/api/skills') return MAX_TURN_BODY_BYTES
    const route = /^\/api\/([a-zA-Z0-9_$-]+)[./]([a-zA-Z0-9_$-]+)$/.exec(pathname)
    if (route === null) return MAX_SESSION_CREATE_BODY_BYTES
-@@ -187,7 +192,13 @@ export function errorResponse(error: unknown): Response {
+@@ -191,7 +196,13 @@ export function errorResponse(error: unknown): Response {
      return jsonResponse({ ok: false, error: error.message }, error.status)
    }
    if (error instanceof EdgeSessionStoreError) {
 -    const status = error.code === 'NOT_FOUND' ? 404 : error.code === 'BUSY' ? 409 : 500
-+    // AGENT_UNAVAILABLE (#572): agent/provider bootstrap failed for a call that
-+    // does not need the model itself (e.g. harness ingest, session-store.ts
-+    // appendHarnessEvents) — retryable, distinct from a genuine data error.
++    // AGENT_UNAVAILABLE (#572, PATCHES.md): agent/provider bootstrap failed for
++    // a call that does not need the model itself (harness ingest) — retryable,
++    // distinct from a genuine data error.
 +    const status = error.code === 'NOT_FOUND' ? 404
 +      : error.code === 'BUSY' ? 409
 +      : error.code === 'AGENT_UNAVAILABLE' ? 503
@@ -36,20 +36,16 @@ index 972d344..83b1c33 100644
      return jsonResponse({ ok: false, error: error.message, code: error.code }, status)
    }
    if (error instanceof LlmError) {
-@@ -207,7 +218,25 @@ export function errorResponse(error: unknown): Response {
+@@ -211,7 +222,21 @@ export function errorResponse(error: unknown): Response {
      return jsonResponse({ ok: false, error: 'Workspace entry not found.' }, 404)
    }
    console.error(error)
 -  return jsonResponse({ ok: false, error: 'Internal runtime error.' }, 500)
-+  // #572: this fallback used to return the bare string below with no way to
-+  // tell "which class of internal error" apart — the incident that hid a
-+  // production-only agent-bootstrap failure behind "Internal runtime error."
-+  // for 21h across every /ingest call (scheduler.py, task.sh both read this
-+  // exact body). The literal `error` string stays byte-for-byte the same so
-+  // existing fingerprint/dedup text keeps matching; `detail` is new and adds
-+  // the one thing that was missing — a name+message a human or a dedup key
-+  // can actually act on, still bounded so a runaway message can't blow up
-+  // the response or leak more than upstream already put in `error.message`.
++  // #572 (PATCHES.md): this fallback used to return the bare string below with
++  // no way to tell "which class of internal error" apart, hiding a
++  // production-only agent-bootstrap failure for 21h. `error` stays
++  // byte-for-byte the same so existing fingerprint/dedup text keeps matching;
++  // `detail` adds a bounded name+message a human or a dedup key can act on.
 +  const detail = error instanceof Error
 +    ? `${error.name}: ${truncateDetail(error.message)}`
 +    : 'non-Error value thrown'
@@ -64,10 +60,10 @@ index 972d344..83b1c33 100644
  
  function llmHttpStatus(code: string): number {
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index c9b5b95..3ee648d 100644
+index ce247c2..ab86d9d 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
-@@ -38,6 +38,8 @@ import {
+@@ -41,6 +41,8 @@ import {
  } from './deployment.ts'
  import {
    EdgeHttpError,
@@ -85,7 +81,7 @@ index c9b5b95..3ee648d 100644
        }
  
        throw new EdgeHttpError(404, 'Session route not found.')
-@@ -961,6 +965,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -1179,6 +1183,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
      })
    }
  
@@ -121,7 +117,7 @@ index c9b5b95..3ee648d 100644
    private async startTurn(request: Request, sessionId: SessionId): Promise<Response> {
      const body = await readJsonObject(request, MAX_TURN_BODY_BYTES)
      const message = requireBoundedUtf8String(body.message, 'message', MAX_MESSAGE_TEXT_BYTES)
-@@ -1319,7 +1352,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
+@@ -1545,7 +1578,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
  
  interface ParsedSessionRoute {
    sessionId?: SessionId
@@ -130,7 +126,7 @@ index c9b5b95..3ee648d 100644
  }
  
  function parseSessionRoute(pathname: string): ParsedSessionRoute {
-@@ -1340,7 +1373,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
+@@ -1566,7 +1599,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
    const id = SessionId(sessionId)
    if (parts.length === 3) return { sessionId: id }
    const action = parts[3]
@@ -140,10 +136,10 @@ index c9b5b95..3ee648d 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index cfff36a..be11683 100644
+index 516b977..4cd78ed 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -19,7 +19,7 @@ import type {
+@@ -22,7 +22,7 @@ import type {
    ImageAttachmentRef,
  } from '@deepseek-ai/dsh-attachment'
  import { credentialRef, type CredentialInfo } from '@deepseek-ai/dsh-credentials'
@@ -152,7 +148,7 @@ index cfff36a..be11683 100644
  import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
  import MessageFeedbackService from '@deepseek-ai/dsh-message-feedback'
  import {
-@@ -195,7 +195,18 @@ export type EdgeAgentPromptAdmitter = (input: EdgeAgentPromptAdmission) => Promi
+@@ -200,7 +200,18 @@ export type EdgeAgentPromptAdmitter = (input: EdgeAgentPromptAdmission) => Promi
  
  export class EdgeSessionStoreError extends Error {
    constructor(
@@ -172,7 +168,18 @@ index cfff36a..be11683 100644
      message: string,
    ) {
      super(message)
-@@ -1265,6 +1276,117 @@ export class EdgeSessionStore {
+@@ -260,6 +271,10 @@ export class EdgeSessionStore {
+   private readonly modelSelections: EdgeModelSelectionBridge
+   private readonly turnPublishedAgents = new WeakSet<Agent>()
+   private readonly ready: Promise<void>
++  // #1049: handles kept warm across harness-ingest batches for the same
++  // session so a repeat batch skips the cold resume (full stored-log read —
++  // see appendHarnessEvents/planHarnessIngestResume below, PATCHES.md).
++  private readonly harnessIngestHandles = new Map<SessionId, HarnessIngestHandle>()
+ 
+   constructor(
+     storage: DurableObjectStorage,
+@@ -1360,6 +1375,157 @@ export class EdgeSessionStore {
      }
    }
  
@@ -186,87 +193,112 @@ index cfff36a..be11683 100644
 +   * tail — and the whole batch flushes before this returns, so a batch reported
 +   * as stored is stored. Publication reuses the store's late-event path: live
 +   * downlinks see ingested events exactly like native ones.
++   *
++   * #1049: a cold resume (openAgentForTurn -> agents.resume -> upstream
++   * persistence.prepare -> loadStored) reads the WHOLE stored log every time it
++   * runs — do-session-persistence.ts::eventRows issues an unconditional
++   * `SELECT ... WHERE session_id = ? ORDER BY seq` with no LIMIT — so disposing
++   * the handle after every batch (this method's pre-#1049 shape) forced that
++   * full read on every single call, growing with total session length. Handles
++   * are now kept warm in `harnessIngestHandles` across batches for the same
++   * session (`planHarnessIngestResume`); see PATCHES.md for the measurement and
++   * the accepted trade-off this creates (a native turn on the same session
++   * races BUSY while the handle is warm — nominally the idle window, in
++   * reality until lazy eviction actually runs: see PATCHES.md
++   * «Принятый компромисс» for the honest boundary).
 +   */
 +  async appendHarnessEvents(
 +    id: SessionId,
 +    events: readonly unknown[],
 +  ): Promise<{ appended: number; lastSeq: number }> {
-+    const { persistence, sessions } = await this.services()
++    const { persistence, sessions, agents } = await this.services()
 +    if (!(persistence instanceof DurableObjectSessionPersistence)) {
 +      throw new EdgeSessionStoreError('INVALID_DATA', 'Edge persistence backend is unavailable.')
 +    }
 +    if (!persistence.hasSession(id) && persistence.readBlankSession(id) === undefined) {
 +      throw new EdgeSessionStoreError('NOT_FOUND', 'Session not found.')
 +    }
-+    // #572: upstream has no lower-level "just append to the log" primitive —
-+    // createSession/createBlankSession/renameSession above all go through the
-+    // same agents.create/resume; docs/research/12-dsh-edge-session-api.md
-+    // ("Чего в dsh-edge НЕТ") already found this. openAgentForTurn cannot be
-+    // dropped here. What CAN be fixed: the second argument here is not a
-+    // fallback that only matters "if nothing else resolves" — for the common
-+    // ingest case (a runner/harness-N session created fresh for this batch,
-+    // never resumed for a native turn) modelSelection()'s own chain
-+    // (agentPending → bridge → live-agent request/header → persisted log)
-+    // finds nothing, because ingest never runs `selectModel` or a native turn
-+    // that would populate any of those; it falls straight through to
-+    // `persistence.readBlankSession(id) !== undefined` and returns
-+    // `defaultModelSelection(defaultModel)` — this argument, verbatim. Passing
-+    // the upstream literal DEFAULT_EDGE_MODEL ('deepseek-v4-flash') here was a
-+    // no-op fix: it is byte-for-byte the same id the unpatched code already
-+    // passed down this exact branch. CONFIRMED stale in this deployment:
-+    // deploy-dsh-edge.yml ("Патч каталога моделей под реального провайдера")
-+    // rewrites the compiled @deepseek-ai/dsh-llm-deepseek DEFAULT_MODELS array
-+    // (source: that package's own catalog literal, `[{id:"deepseek-v4-flash",
-+    // ...}]`) to the deployment's real glm-* catalog AFTER build —
-+    // DEFAULT_EDGE_MODEL is a source-level TypeScript constant, untouched by
-+    // that step, so it never names a model id present in the catalog actually
-+    // registered at runtime, for ANY ingest session, blank or not. Use the
-+    // deployment's real default instead: `agentDefaultModel` (registered a few
-+    // hundred lines up in `initialize()`) already resolves it once at startup
-+    // via `resolveEdgeModel(config.model)` off the deployed `DEEPSEEK_MODEL`
-+    // (or a persisted settings override) — the same source upstream's own
-+    // SessionController reads. NOT confirmed: whether the stale-catalog
-+    // mismatch is what throws during agents.resume — dsh-llm-deepseek's own
-+    // modelInfoFor (checked directly, npm 0.1.2-rc.1, the version actually
-+    // pinned in apps/dsh-edge/package.json) tolerates an unknown id by
-+    // synthesizing a fallback ModelInfo instead of throwing, so the mismatch
-+    // alone may not be sufficient; the actual bootstrap factory
-+    // (@deepseek-ai/dsh-agent-loop, registered onto AgentRegistry) is not
-+    // vendored anywhere in this repo and was not available to inspect. Either
-+    // way this mismatch was real and is worth not shipping regardless of
-+    // whether it is THE trigger: an id absent from the deployed catalog has no
-+    // business being the thing ingest bootstraps with when a correct default
-+    // is one property read away.
-+    const selection = await this.modelSelection(id, this.context.agentDefaultModel.currentSelection().model)
-+    let handle: AgentHandle
-+    try {
-+      handle = await this.openAgentForTurn(id, selection.model)
-+    } catch (error) {
-+      // LlmError and EdgeSessionStoreError are already classified correctly by
-+      // http.ts::errorResponse (provider auth/quota, NOT_FOUND/BUSY/...) —
-+      // rethrow those as-is so that classification is not lost. Anything else
-+      // — cordis DI/tool-runtime/plan-mode bootstrap throwing a bare Error, a
-+      // workerd runtime limit — is exactly what used to surface to callers as
-+      // the opaque `{"ok":false,"error":"Internal runtime error."}` that hid
-+      // this incident for 21h (scheduler.py::append_session_notes, task.sh
-+      // both read that exact body). Classify it instead of masking it.
-+      if (error instanceof LlmError || error instanceof EdgeSessionStoreError) throw error
-+      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
++    const plan = planHarnessIngestResume(
++      this.harnessIngestHandles,
++      id,
++      cached => agents.get(id) === cached.handle.agent,
++      Date.now(),
++      HARNESS_INGEST_IDLE_MS,
++    )
++    const releaseStale = async (stale: HarnessIngestHandle, reason: string): Promise<void> => {
++      try {
++        await stale.handle.dispose()
++      } catch (disposeError: unknown) {
++        console.error(`dsh-edge failed to release an ingested session (${reason}).`, disposeError)
++      }
++    }
++    // Idle-expired entries of OTHER sessions release fire-and-forget — they
++    // are not in this call's race. The entry evicted from under THIS id must
++    // finish releasing before the cold resume below reopens the same session,
++    // else the reopen can hit BUSY for one drain cycle (ревью PR #1057).
++    for (const stale of plan.evicted) {
++      if (stale === plan.staleForId) continue
++      void releaseStale(stale, 'idle')
++    }
++    if (plan.staleForId !== undefined) {
++      await releaseStale(plan.staleForId, plan.staleForIdReason ?? 'unknown')
++    }
++    let entry = plan.entry
++    // #1049 (ревью PR #1057, третий раунд, блокер 1): the warm-handle reuse
++    // path below skips openAgentForTurn entirely for a repeat batch on the
++    // same session, so the natural BUSY that agents.resume() used to throw
++    // for a concurrent second call never fires on this path anymore — both
++    // calls would otherwise read the same entry.baseTurn, append past each
++    // other's turn numbers, and race sessions.flush(session) on the same
++    // in-memory session. Explicit in-flight guard restores the pre-#1049
++    // serialization (second concurrent call gets BUSY, same as a concurrent
++    // native resume always did) instead of silently corrupting the stored
++    // log.
++    if (entry !== undefined && entry.inFlight) {
 +      throw new EdgeSessionStoreError(
-+        'AGENT_UNAVAILABLE',
-+        `Harness ingest could not open the target session (agent bootstrap failed): ${detail}`,
++        'BUSY',
++        'Harness ingest is already in flight for this session.',
 +      )
 +    }
-+    try {
-+      const session = handle.agent.session
++    if (entry === undefined) {
++      // #572 (PATCHES.md, patch 0004): the second argument is the deployment's
++      // real default model, not the stale upstream literal DEFAULT_EDGE_MODEL —
++      // ingest never runs a native turn, so modelSelection() falls through to
++      // this fallback on every cold resume.
++      const selection = await this.modelSelection(id, this.context.agentDefaultModel.currentSelection().model)
++      let handle: AgentHandle
++      try {
++        handle = await this.openAgentForTurn(id, selection.model)
++      } catch (error) {
++        // #572 (PATCHES.md): LlmError/EdgeSessionStoreError are already
++        // classified by http.ts::errorResponse; anything else used to surface
++        // as a blind "Internal runtime error." for 21h — classify it instead.
++        if (error instanceof LlmError || error instanceof EdgeSessionStoreError) throw error
++        const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
++        throw new EdgeSessionStoreError(
++          'AGENT_UNAVAILABLE',
++          `Harness ingest could not open the target session (agent bootstrap failed): ${detail}`,
++        )
++      }
++      // The cold resume above just paid the one full read this session needs;
++      // walk the already-in-memory events once here, not on every future batch.
 +      let baseTurn = 0
-+      for (const event of session.snapshotEvents()) {
++      for (const event of handle.agent.session.snapshotEvents()) {
 +        const turn = (event.data as { turn?: unknown }).turn
 +        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
 +      }
++      entry = { handle, baseTurn, lastUsedMs: Date.now(), inFlight: false }
++      this.harnessIngestHandles.set(id, entry)
++    }
++    entry.inFlight = true
++    entry.lastUsedMs = Date.now()
++    const session = entry.handle.agent.session
++    const batchBaseTurn = entry.baseTurn
++    try {
 +      let appended = 0
++      const turnsWritten: number[] = []
 +      for (const raw of events) {
-+        const normalized = normalizeHarnessIngestEvent(raw, baseTurn)
++        const normalized = normalizeHarnessIngestEvent(raw, batchBaseTurn)
 +        // Runtime-dynamic event type: the generic append overload cannot express
 +        // it, so the call site carries the narrow cast (opts only for surface).
 +        // bind() обязателен: append читает приватное состояние сессии через this.
@@ -277,23 +309,130 @@ index cfff36a..be11683 100644
 +        ) => SessionEvent
 +        append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
 +        appended += 1
++        const turn = (normalized.data as { turn?: unknown }).turn
++        if (typeof turn === 'number') turnsWritten.push(turn)
 +      }
++      entry.baseTurn = advanceHarnessIngestBaseTurn(batchBaseTurn, turnsWritten)
 +      await sessions.flush(session)
++      entry.inFlight = false
 +      return { appended, lastSeq: session.seq - 1 }
-+    } finally {
-+      await handle.dispose().catch((disposeError: unknown) => {
-+        console.error('dsh-edge failed to release the ingested session.', disposeError)
-+      })
++    } catch (error) {
++      // #1049 (ревью PR #1057, второй раунд): pre-#1049 code disposed the
++      // handle unconditionally after every single batch, so a failed batch
++      // left no trace — the next cold resume rebuilt everything from the durably
++      // stored truth. The handle now survives warm across batches, so a
++      // failure here (a `rows_written`-capped flush, a malformed event mid
++      // batch) must evict this entry from the cache and dispose it before
++      // rethrowing — otherwise the runner's guaranteed retry of the exact
++      // same batch (dsh_edge_drain_spool: cursor only advances on an ACCEPTED
++      // batch) replays it into the same in-memory session a second time, and
++      // the next successful flush persists both copies silently.
++      entry.inFlight = false
++      if (this.harnessIngestHandles.get(id) === entry) this.harnessIngestHandles.delete(id)
++      await releaseStale(entry, 'failed batch')
++      throw error
 +    }
 +  }
 +
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1618,107 @@ export class EdgeSessionStore {
+@@ -1599,6 +1765,199 @@ export class EdgeSessionStore {
    }
  }
  
++/** appendHarnessEvents' warm-handle cache entry (#1049) — see its doc comment. */
++interface HarnessIngestHandle {
++  handle: AgentHandle
++  /** Highest turn number written into the stored log so far by ingest. */
++  baseTurn: number
++  lastUsedMs: number
++  /** True while a batch is being appended/flushed for this entry (#1049,
++   *  ревью PR #1057, третий раунд, блокер 1) — a concurrent second call for
++   *  the same session while this is true gets BUSY instead of silently
++   *  reusing the same entry.baseTurn and racing sessions.flush(session). */
++  inFlight: boolean
++}
++/** Idle window before a warm ingest handle is released (#1049): comfortably
++ *  above the runner drain interval (30s, #1048) so a normally-active job never
++ *  gets evicted mid-stream, while bounding memory and — once lazy eviction
++ *  actually runs — the BUSY window a native turn on the same session would
++ *  race against (honest boundary: PATCHES.md, «Принятый компромисс»). */
++const HARNESS_INGEST_IDLE_MS = 120_000
++
++/** planHarnessIngestResume's result — named (not inline) so the function's
++ *  signature carries no type-level braces; dsh-edge/verify-harness-ingest-resume.mjs
++ *  extracts the function body by brace-depth counting and relies on that. */
++interface HarnessIngestResumePlan {
++  entry: HarnessIngestHandle | undefined
++  evicted: HarnessIngestHandle[]
++  /** The entry evicted from under THIS id — by idle timeout OR because
++   *  isLiveOwner rejected it: race membership is decided by id match, not by
++   *  the eviction REASON (ревью PR #1057, второй раунд — the first cut only
++   *  set this for the isLiveOwner branch, leaving the idle branch's own-id
++   *  eviction unmarked). Its dispose must COMPLETE before the caller
++   *  cold-resumes the same id, else the reopen races the not-yet-released
++   *  agent and gets BUSY for one drain cycle. Idle-expired entries of OTHER
++   *  sessions are not in this race. */
++  staleForId: HarnessIngestHandle | undefined
++  /** Why staleForId left the cache — the dispose-failure log names the real
++   *  cause instead of calling every eviction "idle" (алерт не гадает,
++   *  ревью PR #1057, чеклист). */
++  staleForIdReason: 'idle' | 'not-live-owner' | undefined
++}
++
++/**
++ * Decide whether an ingest batch can reuse an already-resumed handle or must
++ * cold-resume (#1049) — the one decision that determines whether a batch pays
++ * the full stored-log read. Evicts entries idle for at least idleMs (checked
++ * once per incoming call, no separate timer) and any entry `isLiveOwner`
++ * rejects (the cached handle stopped being the live session owner — archived,
++ * forked, or a native turn raced in and won). Entries with a batch in flight
++ * are never idle-evicted: lastUsedMs is stamped at batch START, so a batch
++ * running longer than idleMs would look evictable by age while its handle is
++ * mid-append/flush (ревью PR #1057, четвёртый раунд, блокер).
++ */
++export function planHarnessIngestResume(
++  cache: Map<SessionId, HarnessIngestHandle>,
++  id: SessionId,
++  isLiveOwner: (entry: HarnessIngestHandle) => boolean,
++  nowMs: number,
++  idleMs: number,
++): HarnessIngestResumePlan {
++  const evicted: HarnessIngestHandle[] = []
++  let staleForId: HarnessIngestHandle | undefined
++  let staleForIdReason: 'idle' | 'not-live-owner' | undefined
++  for (const [cachedId, cached] of cache) {
++    if (nowMs - cached.lastUsedMs < idleMs) continue
++    // A batch in flight is never "expired": lastUsedMs is stamped once at the
++    // START of its batch, so a batch running longer than idleMs looks evictable
++    // by age alone — disposing its handle here would land under that batch's
++    // still-running append/flush (ревью PR #1057, четвёртый раунд, блокер).
++    if (cached.inFlight) continue
++    cache.delete(cachedId)
++    evicted.push(cached)
++    // Idle eviction of THIS id's own entry is the same race as the
++    // isLiveOwner rejection below — same fix (ревью PR #1057, второй раунд).
++    if (cachedId === id) { staleForId = cached; staleForIdReason = 'idle' }
++  }
++  let entry = cache.get(id)
++  if (entry !== undefined && !isLiveOwner(entry)) {
++    cache.delete(id)
++    evicted.push(entry)
++    staleForId = entry
++    staleForIdReason = 'not-live-owner'
++    entry = undefined
++  }
++  return { entry, evicted, staleForId, staleForIdReason }
++}
++
++/** Advance the cached baseTurn by the highest turn written this batch — no rescan of any prior event (#1049). */
++export function advanceHarnessIngestBaseTurn(baseTurnBefore: number, turnsWritten: readonly number[]): number {
++  let next = baseTurnBefore
++  for (const turn of turnsWritten) if (turn > next) next = turn
++  return next
++}
++
 +/** Canonical event types harness ingest accepts — the runner spool allowlist. */
 +const HARNESS_INGEST_EVENT_TYPES = new Set([
 +  'turn/start', 'turn/end', 'step/start', 'step/end',

@@ -122,6 +122,35 @@ time, type, data}`) с allowlist из 8 типов — то есть ранне�
   агентов (конфиг `onLateSessionEvent`), поэтому маршруту достаточно append+flush.
 - Бренд-нейтрально: `session.rename` живого прода корректно хранит UTF-8
   заголовки (кириллица проверена round-trip'ом).
+- **Дописывание события в чужую сессию без резюма Agent — недостижимо, и
+  почему это важно для стоимости (#1049).** У `SessionPersistence`
+  (`@deepseek-ai/dsh-session-persistence`, читано напрямую из npm-пакета
+  0.1.2-rc.1, `lib/index.js`) ЕСТЬ более низкоуровневый `append(id, events)`
+  в обход `agents.resume()` — но использовать его для ingest нельзя: он не
+  публикует `session/event` (эмитится только методом `Session.append()` на
+  живом, зарегистрированном объекте), а именно на `session/event` подписан
+  `onLateSessionEvent` (`session-store.ts:567`), которым патч 0004 доставляет
+  события живым подписчикам морды. Значит единственный путь дописать
+  событие с сохранением live-публикации — через `openAgentForTurn`/
+  `agents.resume()`, и это, в свою очередь, ВСЕГДА платит полное чтение
+  хранимого лога: `agents.resume()` → `AgentLoop.resumeWith()`
+  (`@deepseek-ai/dsh-agent-loop`) → `persistence.prepare()` →
+  `PersistenceCoordinator.prepareCore()` (`@deepseek-ai/dsh-session-persistence`)
+  → `backend.loadStored(id)` — в `do-session-persistence.ts::loadStored` это
+  `eventRows(id, 0)`, а `eventRows` при `fromSeq === 0` строит
+  `SELECT ... FROM dsh_session_events WHERE session_id = ? AND seq >= 0
+  ORDER BY seq` — **безусловно, без LIMIT, на каждый вызов `resume()`,
+  независимо от того, что вызывающий код делает с результатом**. Дальнейший
+  `session.snapshotEvents()` (использовался для `baseTurn` в патче 0004) сам
+  по себе БЕСПЛАТЕН — тип пакета `dsh-session` (`lib/types/index.d.ts:168`)
+  называет его «Cached immutable full snapshot», то есть чтение уже
+  материализованного в памяти массива, не второе обращение к SQL. Вывод:
+  цена ingest-вызова определяется тем, СКОЛЬКО РАЗ вызывается
+  `agents.resume()` для одной и той же сессии, а не тем, сколько кода
+  вызывающая сторона выполняет после него — единственный работающий рычаг
+  снижения `rows_read` — реже резюмировать (держать хэндл тёплым между
+  батчами), не «меньше сканировать после резюма». Фикс #1049
+  (`dsh-edge/PATCHES.md`, «Тёплый хэндл ingest») использует именно это.
 
 ## Память сессии: раннер vs облако
 

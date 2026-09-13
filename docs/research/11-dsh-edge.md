@@ -65,6 +65,20 @@ jsonc-parser ^3.3.1, wrangler 4.123.0
 
 **Прочитайте `audit.json` целиком** — у каждой записи есть поле `removeWhen`, то есть точное условие, при котором патч перестанет быть нужен. Это карта того, что upstream должен изменить у себя, и одновременно карта того, что придётся патчить нам.
 
+## 0.14.0: resident agents — апстрим сам держит агента тёплым
+
+Уточнение 2026-09-13 (доводка PR #1057, после авто-бампа #1138 до dsh-edge-v0.14.0 = `0b2c6cc`, `dsh-edge/upstream.json`): релиз 0.14.0 перестроил жизненный цикл агентов в `apps/dsh-edge/src/session-store.ts` — resumed-агент больше не диспоузится после хода:
+
+- новый кэш `residentAgents: Map<SessionId, AgentHandle>`; `getOrResumeAgent(id, model)` возвращает резидента, а при первом доступе ресумит с регистрацией; докстринг апстрима: «The agent stays alive across turns in idle phase; only session deletion or DO shutdown disposes it»;
+- `openAgentForTurn` сохранён как `@deprecated`-алиас с телом `return this.getOrResumeAgent(id, model)`;
+- `renameSession`/`dispatchDueSchedules` больше не диспоузят хэндл после использования; появился `disposeResidentAgent(id)` — штатный способ снять резидента;
+- дрейф между пинами по файлам нашей патч-серии (сравнение `6540061` ↔ `0b2c6cc`): `session-store.ts` ±74 строки, `instance.ts` ±52; `http.ts`, `src/index.ts`, `standalone/scripts/*`, `standalone/pnpm-workspace.yaml` — без изменений.
+
+Следствия:
+
+- цена, на которую жаловался #1049 (холодный `agents.resume()` читает весь лог — `do-session-persistence.ts::eventRows(id, 0)` без LIMIT), на 0.14.0 платится один раз на сессию за активацию DO ещё до всяких наших кэшей: резидент живёт до выгрузки DO. Посмертный замер `rows_read`/событие из [`dsh-edge/PATCHES.md`](../../dsh-edge/PATCHES.md) («Тёплый хэндл ingest») после переезда на 0.14.0 нужно читать с учётом этого слагаемого;
+- патч-серия этого репозитория в текущем виде на 0.14.0 молча ломается: тёплый хэндл #1049 (`harnessIngestHandles`, idle-эвикция через `handle.dispose()`) диспоузит хэндл, который апстрим считает резидентным, — `getOrResumeAgent` вернёт мёртвого резидента из своего кэша (`cached !== undefined → return cached`). Развилка решения (опираться на резидентов и вырезать свою машинерию / вести эвикцию через `disposeResidentAgent`) и критерий готовности — задача [#1149](https://github.com/mytab0r/edge-harness/issues/1149).
+
 ## Что заменено: разделительная линия проходит не там, где ждёшь
 
 ФС и sandbox **не написаны с нуля** — отданы продукту Cloudflare `@cloudflare/computer` 0.2.0.
