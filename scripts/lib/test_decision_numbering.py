@@ -22,6 +22,18 @@ rebase.py::build_origin` — AGENTS.md, «поведенческий тест н
   4. Вернуть `added_files_under_root` к `--diff-filter=A` (без `R`) —
      `test_rename_of_inherited_file_is_visible_as_added` падает: переномерованный
      файл пропадает из набора источника целиком.
+  5. Вернуть `added_files_under_root` к тройной точке (`f"{base}...{ref}"`
+     вместо двух отдельных аргументов) — `test_added_files_under_root_works_
+     on_a_shallow_pr_clone` падает `GitError: ... no merge base` (находка
+     ai-review PR #1082: `actions/checkout@v7` без `fetch-depth: 0` даёт
+     shallow-клон, а тройная точка требует merge-base в истории).
+
+Клон одной ветки в тестах — ОБЯЗАТЕЛЬНО через `file://`-URL
+(`Path.as_uri()`), не голый путь: git молча ИГНОРИРУЕТ `--depth` при клоне
+по локальному пути («warning: --depth is ignored in local clones; use
+file:// instead.», проглоченный `capture_output=True`) — так тест до этой
+правки гонял ПОЛНУЮ историю и не видел падение на настоящем shallow-клоне
+(находка ai-review PR #1082, воспроизведена end-to-end).
 
 Запуск: python -m pytest scripts/lib/test_decision_numbering.py -q
 """
@@ -189,19 +201,32 @@ def build_origin_with_number_collision(tmp_path) -> Path:
 
 
 def clone_workdir(origin: Path, tmp_path: Path, branch: str = "agent/1035-pr-conflict-triage") -> Path:
-    # Однобранчевый неглубокий клон — тот же профиль, что actions/checkout@v7
-    # на PR-прогоне (только текущая ветка). Остальные ссылки (main, чужие PR)
-    # ДОЛЖНЫ прийти явным fetch_refs — если бы тест клонировал все ветки
-    # сразу (обычный `git clone`), он не различил бы «функция реально
-    # фетчит» от «данные и так были локально».
+    """Однобранчевый НАСТОЯЩИЙ shallow-клон (глубина 1) — тот же профиль, что
+    `actions/checkout@v7` на PR-прогоне без `fetch-depth: 0`. `file://`-URL —
+    ОБЯЗАТЕЛЬНО (находка ai-review PR #1082, блокирующая): git молча
+    ИГНОРИРУЕТ `--depth` при клоне по обычному локальному пути (только
+    предупреждение в stderr, которое `capture_output=True` проглатывает) —
+    клон получается ПОЛНЫМ, и тест на нём не видит поломку `git diff A...B`
+    (`no merge base`), которую реальный CI ловит на каждом PR. Assert ниже —
+    гвардия этого же факта: если clone однажды перестанет быть shallow
+    (другая версия git, другое поведение платформы), тест упадёт здесь
+    явно, а не молча продолжит гонять нерепрезентативный полный клон.
+
+    Остальные ссылки (main, чужие PR) ДОЛЖНЫ прийти явным `fetch_refs` — если
+    бы тест клонировал все ветки сразу (обычный `git clone`), он не различил
+    бы «функция реально фетчит» от «данные и так были локально»."""
     work = tmp_path / "work"
     subprocess.run(
         ["git", "clone", "--branch", branch, "--single-branch", "--depth", "1",
-         str(origin), str(work)],
+         origin.as_uri(), str(work)],
         check=True, capture_output=True,
     )
     git("config", "user.email", "test@example.com", cwd=work)
     git("config", "user.name", "test", cwd=work)
+    assert (work / ".git" / "shallow").exists(), (
+        "клон не получился shallow — file://+--depth не сработал на этой "
+        "платформе/версии git, тест перестал воспроизводить профиль CI"
+    )
     return work
 
 
@@ -221,6 +246,25 @@ def test_collect_sources_from_refs_reads_real_git_trees(tmp_path):
     assert sources["PR #1035"]["0019"] == ["0019-stalled-pr-triage.md"]
     assert sources["PR #1040"]["0019"] == ["0019-something-else.md"]
     assert sources["PR #1050"]["0020"] == ["0020-clean.md"]
+
+
+def test_added_files_under_root_works_on_a_shallow_pr_clone(tmp_path):
+    """Находка ai-review PR #1082, единственная блокирующая: `actions/
+    checkout@v7` без `fetch-depth: 0` (реальный профиль job'а `test` в
+    repo-ci.yml) даёт shallow-клон PR-ветки — `fetch_refs` приносит main с
+    полной историей отдельно, но общего предка между shallow PR-веткой и
+    main взять неоткуда. Тройная точка (`git diff A...B`) требует его и
+    падает `no merge base`, exit 128 → `GitError` — гвардия красила бы
+    `test` НА КАЖДОМ PR репозитория, не только у виновника. Прямая проверка
+    именно этого пути, отдельно от общего сценария выше."""
+    origin = build_origin_with_number_collision(tmp_path)
+    work = clone_workdir(origin, tmp_path, branch="agent/1035-pr-conflict-triage")
+
+    dn.fetch_refs({"main": "main", "PR #1035": "agent/1035-pr-conflict-triage"}, cwd=work)
+
+    added = dn.added_files_under_root("main", "PR #1035", "docs/decisions", cwd=work)
+
+    assert added == ["docs/decisions/0019-stalled-pr-triage.md"]
 
 
 def test_end_to_end_detects_live_1078_collision_on_real_git(tmp_path):
@@ -434,8 +478,30 @@ def test_check_decision_doc_number_collisions_adds_root_to_each_violation(monkey
 
     monkeypatch.setattr(dn, "collect_sources", fake_collect_sources)
 
-    violations = dn.check_decision_doc_number_collisions("owner/repo")
+    result = dn.check_decision_doc_number_collisions("owner/repo")
 
-    assert len(violations) == 1
-    assert violations[0]["root"] == "docs/decisions"
-    assert violations[0]["number"] == "0017"
+    assert result.status == dn.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["root"] == "docs/decisions"
+    assert result.violations[0]["number"] == "0017"
+
+
+def test_check_decision_doc_number_collisions_ok_when_no_collisions(monkeypatch):
+    monkeypatch.setattr(dn, "collect_sources", lambda repo, root, width, cwd=None: {})
+
+    result = dn.check_decision_doc_number_collisions("owner/repo")
+
+    assert result == dn.check_result.ok()
+
+
+def test_check_decision_doc_number_collisions_unknown_on_transport_failure(monkeypatch):
+    def fake_collect_sources(repo, root, width, cwd=None):
+        raise dn.GhError("HTTP 502")
+
+    monkeypatch.setattr(dn, "collect_sources", fake_collect_sources)
+
+    result = dn.check_decision_doc_number_collisions("owner/repo")
+
+    assert result.status == dn.check_result.STATUS_UNKNOWN
+    assert result.reason  # честная причина, не пустая строка
+    assert result.violations == []

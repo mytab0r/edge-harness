@@ -74,9 +74,25 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 _review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(_review_labels)  # type: ignore[union-attr]
 
+# check_result (issue #1096/#1110) — три исхода проверки, не два: см.
+# check_decision_doc_number_collisions ниже, готовит #1090 в целевой форме.
+_CR_SPEC = importlib.util.spec_from_file_location(
+    "check_result", Path(__file__).resolve().parent / "check_result.py")
+check_result = importlib.util.module_from_spec(_CR_SPEC)
+_CR_SPEC.loader.exec_module(check_result)  # type: ignore[union-attr]
+
 # Корень → ширина номера (кол-во цифр с ведущими нулями). Единственное место
 # правды: любой новый носитель того же класса «сквозная нумерация markdown
 # под общим каталогом» регистрируется здесь, а не отдельной копией регэкспа.
+#
+# Честная граница (backlog, найдено ai-review PR #1082, не блокирует мерж):
+# `numbered_filename_re` матчит РОВНО `width` цифр — файл с числом цифр
+# БОЛЬШЕ ширины (например "100-x.md" при width=2) не совпадает с regex
+# вовсе и молча выпадает из поля зрения гвардии, вместо явной ошибки.
+# Не подтверждено, что это стоит чинить сейчас: на 2026-09-13 `docs/
+# decisions` — 19 файлов (нужно 10000, чтобы переполнить ширину 4), `docs/
+# research` — 13 (нужно 100, чтобы переполнить ширину 2) — оба на порядки
+# дальше переполнения, чем текущий разговор о доводке.
 NUMBERED_ROOTS: dict[str, int] = {
     "docs/decisions": 4,
     "docs/research": 2,
@@ -190,13 +206,22 @@ def fetch_refs(refs: dict[str, str], cwd=None) -> None:
     """`refs`: {локальное_имя: удалённая_ветка} — например {"main": "main",
     "PR #1035": "agent/1035-pr-conflict-triage"}. Один вызов `git fetch`,
     каждая ветка приземляется под `_FETCH_NAMESPACE/<локальное_имя>`
-    (санитизировано — # и пробелы недопустимы в имени рефа)."""
+    (санитизировано — # и пробелы недопустимы в имени рефа).
+
+    `--depth 1` (находка ai-review PR #1082, backlog): вся логика этого
+    модуля с тех пор, как `added_files_under_root` перестал использовать
+    тройную точку (та же правка, что убрала зависимость от merge-base),
+    сравнивает ДВА ДЕРЕВА напрямую (`git diff A B`/`git ls-tree`) — история
+    коммитов ей не нужна вообще, нужен только снимок на кончике ветки.
+    Раньше каждый прогон тянул ПОЛНУЮ историю main и каждого открытого PR —
+    неоправданная сетевая/CPU-цена на каждый CI-прогон при живом бюджете
+    репозитория (AGENTS.md, «всё работает на бесплатных планах»)."""
     if not refs:
         return
     refspecs = [
         f"{remote}:{_local_ref(local)}" for local, remote in refs.items()
     ]
-    run_git("fetch", "--quiet", "--force", "origin", *refspecs, cwd=cwd)
+    run_git("fetch", "--quiet", "--force", "--depth", "1", "origin", *refspecs, cwd=cwd)
 
 
 def _local_ref(name: str) -> str:
@@ -211,9 +236,26 @@ def ls_tree_files_under_root(local_name: str, root: str, cwd=None) -> list[str]:
 
 def added_files_under_root(base_local_name: str, local_name: str, root: str, cwd=None) -> list[str]:
     """Файлы, которые `local_name` ДОБАВИЛ относительно `base_local_name`
-    (git diff --diff-filter=AR, тройная точка — против merge-base, не против
-    текущей головы base: PR, отставший от main, не должен казаться
-    «удалившим» файлы, которые main добавил ПОСЛЕ того, как PR ответвился).
+    (git diff --diff-filter=AR).
+
+    ДВА отдельных рефа, БЕЗ тройной точки (находка ai-review PR #1082,
+    блокирующая: воспроизведена end-to-end на настоящем shallow-клоне) —
+    тройная точка (`A...B`) требует существующего merge-base в истории
+    (`git merge-base A B`), а `actions/checkout@v7` в `repo-ci.yml` без
+    `fetch-depth: 0` даёт shallow-клон глубины 1: PR-ветка после `fetch_refs`
+    остаётся shallow (объекты головы есть, история дальше — нет), у нашего
+    `main`, зафетченного отдельно, полная история — но ОБЩЕГО предка между
+    ними взять неоткуда, `git diff A...B` падает `fatal: ... no merge base`,
+    exit 128 → `GitError` → гвардия красит `test` на КАЖДОМ PR репозитория,
+    не только виновника (ровно тот тормоз без газа, которого дизайн обещал
+    не допускать, только для другого случая, чем self_source_name решает).
+    Простой `git diff A B` (без диапазона) — прямое сравнение ДВУХ ДЕРЕВЬЕВ,
+    не историй: не требует общего предка вообще, работает на несвязанных
+    графах коммитов, и результат при `--diff-filter=A` тот же самый, что и
+    был нужен — статус `D` (файл есть в main, отсутствует в `local_name`,
+    потому что main добавил его ПОСЛЕ того, как PR ответвился) этим фильтром
+    и так отбрасывается, а именно от него защищала тройная точка; для
+    `--diff-filter=A/R` разницы между `A...B` и `A B` нет никогда.
 
     Зачем это, а не просто ls-tree головы `local_name` целиком (находка
     живого прогона на mytab0r/edge-harness, 2026-09-13): PR, который просто
@@ -235,7 +277,7 @@ def added_files_under_root(base_local_name: str, local_name: str, root: str, cwd
     числа полей."""
     out = run_git(
         "diff", "--name-status", "--diff-filter=AR",
-        f"{_local_ref(base_local_name)}...{_local_ref(local_name)}", "--", root, cwd=cwd,
+        _local_ref(base_local_name), _local_ref(local_name), "--", root, cwd=cwd,
     )
     return [line.split("\t")[-1] for line in out.splitlines() if line.strip()]
 
@@ -366,7 +408,7 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | N
     return lines, self_name
 
 
-def check_decision_doc_number_collisions(repo: str, cwd=None) -> list[dict]:
+def check_decision_doc_number_collisions(repo: str, cwd=None) -> "check_result.CheckResult":
     """Обвязка, готовая для `repo_invariants.py` (класс — AGENTS.md,
     «Инцидент оставляет инвариант, а не только фикс»; находка ai-review
     PR #1082, блокирующая 2). НЕ подключена туда ЭТИМ PR намеренно: на
@@ -384,15 +426,28 @@ def check_decision_doc_number_collisions(repo: str, cwd=None) -> list[dict]:
     номер первым ПОСЛЕ этого прогона (дрейф состояния без нового коммита —
     ровно класс, под который заведён 15-минутный инвариант `orchestra.yml`).
 
-    Возвращает violations в форме, годной для `escalate_if_new`/`build_report`
-    того файла: `{"root": ..., "number": ..., "occurrences": [...]}` — то же,
-    что `find_number_collisions`, плюс `root`."""
+    Возвращает `check_result.CheckResult` (issue #1096/#1110, третье
+    состояние — репозиторий мигрирует существующие инварианты на этот тип,
+    новый инвариант подключается уже в целевой форме, не в старой
+    `list[dict]`, которую пришлось бы мигрировать вторым проходом):
+    `unknown()`, если `git`/`gh` внутри `collect_sources` реально отказали
+    (транспорт, а не «коллизий нет» — тот же класс F1/F3 issue #1096,
+    который мигрировал инварианты 13/14); `violation([...])` с находками в
+    форме `{"root": ..., "number": ..., "occurrences": [...]}` — то же, что
+    `find_number_collisions`, плюс `root`; иначе `ok()`."""
     violations = []
     for root, width in NUMBERED_ROOTS.items():
-        sources = collect_sources(repo, root, width, cwd=cwd)
-        for violation in find_number_collisions(sources):
-            violations.append({**violation, "root": root})
-    return violations
+        try:
+            sources = collect_sources(repo, root, width, cwd=cwd)
+        except (GhError, GitError) as error:
+            return check_result.unknown(
+                f"decision_doc_number_collisions: сбор данных для {root} не удался ({error})"
+            )
+        for found in find_number_collisions(sources):
+            violations.append({**found, "root": root})
+    if violations:
+        return check_result.violation(violations)
+    return check_result.ok()
 
 
 def _repo_from_env() -> str:
