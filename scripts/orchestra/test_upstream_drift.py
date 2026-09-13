@@ -287,16 +287,21 @@ def wired_fake(*, labels=(), comments=(), tags=TAGS):
 
 @pytest.fixture(autouse=True)
 def _allow_prod_writes_in_tests(monkeypatch):
-    """Прод-запись только в CI (находка ai-review PR #950, второй проход):
-    attempt_auto_bump теперь гейтится pulse_guard.prod_writes_allowed(), тем
-    же приёмом, что и scheduler.py (test_scheduler.py::
+    """Прод-запись только в CI (находка ai-review PR #950, второй проход;
+    локальный обход ключом закрыт БЕЗУСЛОВНО issue #1074, 2026-09-13):
+    attempt_auto_bump гейтится pulse_guard.prod_writes_allowed(), тем же
+    приёмом, что и scheduler.py (test_scheduler.py::
     _allow_prod_writes_in_tests). Этот файл тестирует ЛОГИКУ авто-бампа
     (issue/branch/commit/PR), а не сам режим записи — без автофикстуры
-    happy-path тесты ниже наблюдали бы DRY-RUN вместо своего предмета. Сам
-    DRY-RUN тестируется отдельно и явно (см.
+    happy-path тесты ниже наблюдали бы DRY-RUN вместо своего предмета.
+
+    Симулирует НАСТОЯЩИЙ CI-прогон (GITHUB_ACTIONS+GITHUB_RUN_ID), а не
+    ALLOW_PROD_WRITES_ENV=1 — после #1074 этот ключ вне CI ничего не
+    разрешает. Сам DRY-RUN тестируется отдельно и явно (см.
     test_attempt_auto_bump_dry_run_outside_ci_never_calls_gh_or_git ниже) —
     там же фикстура переопределяется delenv."""
-    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999999999")
 
 
 @pytest.fixture()
@@ -454,13 +459,14 @@ def test_attempt_auto_bump_skips_pin_not_tag(monkeypatch, tmp_path):
 
 def test_attempt_auto_bump_dry_run_outside_ci_never_calls_gh_or_git(monkeypatch, tmp_path):
     """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (класс «прод-запись только в GitHub Actions»,
-    находка ai-review PR #950 вторым проходом): вне CI, без
-    SCHEDULER_ALLOW_PROD_WRITES, ORCHESTRA_PAT сам по себе не должен
-    доводить авто-бамп до gh()/git — иначе `created["number"]` на честном
-    DRY-RUN None из pulse_guard.gh рвётся TypeError'ом (живой баг до фикса)."""
+    находка ai-review PR #950 вторым проходом): вне CI ORCHESTRA_PAT сам по
+    себе не должен доводить авто-бамп до gh()/git — иначе `created["number"]`
+    на честном DRY-RUN None из pulse_guard.gh рвётся TypeError'ом (живой баг
+    до фикса). SCHEDULER_ALLOW_PROD_WRITES=1 больше не меняет исход (issue
+    #1074) — тест это тоже проверяет, не только отсутствие ключа."""
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
-    monkeypatch.delenv(pg.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setenv(pg.ALLOW_PROD_WRITES_ENV, "1")  # игнорируется вне CI после #1074
     monkeypatch.setenv("ORCHESTRA_PAT", "test-pat-token")
     decision = ud.decide_drift(pin(PIN_071), TAGS)
 
@@ -471,7 +477,6 @@ def test_attempt_auto_bump_dry_run_outside_ci_never_calls_gh_or_git(monkeypatch,
 
     result = ud.attempt_auto_bump("mytab0r/edge-harness", decision, TAGS, pin_path=tmp_path / "upstream.json")
     assert "DRY-RUN" in result
-    assert pg.ALLOW_PROD_WRITES_ENV in result
 
 
 def test_attempt_auto_bump_skips_without_pat(monkeypatch, offline_telegram, tmp_path):
