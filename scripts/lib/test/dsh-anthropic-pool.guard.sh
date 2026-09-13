@@ -261,13 +261,22 @@ echo "GUARD(anthropic-pool): 3) пул отвечает первым успех�
   export SMOKE_POOL_MODE=fail
   export SMOKE_MODE_primary_model=ok
   rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
-  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke"
-  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::4) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC" >&2; exit 1; }
+  POOL_LOG="$WORK/pool-warning.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::4) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG")" >&2; exit 1; }
   [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::4) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY (цепочка)" >&2; exit 1; }
   [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::4) цепочка обязана была запуститься после отказа пула" >&2; exit 1; }
   [[ "$DSH_CHAIN_TRIED" == "anthropic-oauth-pool, PRIMARY" ]] || { echo "::error::4) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — обязан называть и пул, и PRIMARY по порядку" >&2; exit 1; }
+  # #1067 (живой инцидент — прогон worker.yml 34735752165): раньше
+  # предупреждение об отказе пула называло только rc, сам stderr терялся
+  # НАВСЕГДА (тот же $ERR перезаписывается первой попыткой цепочки строкой
+  # выше) — причина отказа была невидима ни в одном логе прогона. Мок пула
+  # (SMOKE_POOL_MODE=fail) пишет прод-форму реального отказа
+  # (`dsh: HTTP_503: pool_unavailable — no Anthropic account is available`,
+  # см. dsh() выше) — сообщение обязано процитировать её, не только код.
+  grep -q "pool_unavailable" "$POOL_LOG" || { echo "::error::4) предупреждение об отказе пула не называет причину (stderr потерян) — регрессия #1067: $(cat "$POOL_LOG")" >&2; exit 1; }
 ) || fail "4) отказ пула не откатывается на цепочку честно"
-echo "GUARD(anthropic-pool): 4) пул отказывает -> честный откат на цепочку, атрибуция называет обоих — ок"
+echo "GUARD(anthropic-pool): 4) пул отказывает -> честный откат на цепочку, атрибуция называет обоих и НАЗЫВАЕТ ПРИЧИНУ — ок"
 
 # ── 5) Пул неактивен (нет секретов) -> поведение идентично состоянию ДО
 #      этого change: сразу цепочка, DSH_CHAIN_TRIED без упоминания пула. ────
