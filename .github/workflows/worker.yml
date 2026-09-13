@@ -13,6 +13,17 @@ on:
         description: "Номер задачи из пула (пусто = воркер выберет свободную сам)"
         required: false
         type: string
+      slot:
+        description: >-
+          Слот параллельности (1 или 2, #827) — назначает scheduler.py
+          (free_worker_slot), ручной запуск без этого входа занимает слот 1
+          по умолчанию (тот же слот, что раньше был единственным).
+        required: false
+        type: choice
+        options:
+          - "1"
+          - "2"
+        default: "1"
 
 permissions:
   # actions:write — playbook-операции агента (rerun orchestra, workflow run);
@@ -23,9 +34,21 @@ permissions:
   issues: write
   pull-requests: write
 
-# Один воркер на репозиторий: два прогона соперничали бы за одни свободные задачи.
+# run-name несёт номер слота открытым текстом (не только вход) — scheduler.py
+# читает его из display_title прогона (REST не отдаёт workflow_dispatch inputs
+# нигде в объекте run), чтобы посчитать, какие слоты сейчас заняты (#827).
+run-name: >-
+  worker (slot ${{ inputs.slot || '1' }})${{ inputs.task && format(': задача #{0}', inputs.task) || '' }}
+
+# До двух воркеров параллельно (#827, WORKER_MAX_CONCURRENCY в scheduler.py):
+# NVIDIA/GLM-квота цепочки провайдеров не даёт точных данных о лимите
+# запросов в минуту (docs/runbooks/switch-llm-provider.md фиксирует только
+# форму отказа, не число) — N=2 взят консервативно, не 3+. Каждый слот —
+# своя concurrency-группа (мьютекс внутри слота, как раньше был один на весь
+# репозиторий); прогон без распознанного слота (ручной запуск без inputs.slot)
+# попадает в группу slot-1.
 concurrency:
-  group: worker
+  group: worker-${{ inputs.slot || '1' }}
   cancel-in-progress: false
 
 jobs:
