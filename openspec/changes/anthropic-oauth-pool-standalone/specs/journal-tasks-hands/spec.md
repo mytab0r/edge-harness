@@ -1,9 +1,15 @@
 # Дельта-спека: быстрый провайдер Claude anthropic-oauth-pool (#838)
 
 Дополняет suite ротации учёток (`dsh-in-job`, «ADDED: Suite ротации учёток
-combo-router + anthropic-oauth-pool») НЕЗАВИСИМЫМ путём монтажа того же
-плагина `dsh-anthropic-oauth-pool`, не затрагивая `dsh-combo-router` (#216,
+combo-router + anthropic-oauth-pool») путём монтажа того же плагина
+`dsh-anthropic-oauth-pool`, не затрагивая `dsh-combo-router` (#216,
 заблокирован) и не реанимируя `vars.PLUGINS_SUITE_URL` (снята при #790).
+Пути монтажа независимы В ЧАСТИ СКАЧИВАНИЯ/ПРОВЕРКИ (#838) — но НЕ в части
+самого монтажа: с #1130 `dsh_mount_plugins_suite` спрашивает состояние
+standalone-пути (`DSH_ANTHROPIC_POOL_ACTIVE`) перед своим `dsh plugin add`
+для того же плагина (см. «ADDED (#1130): Патч плагина перед монтажом»
+ниже) — иначе смонтировались бы две копии одного плагина, одна из них в
+обход патча #1130.
 
 ## ADDED: Монтаж anthropic-oauth-pool независимо от suite
 
@@ -15,10 +21,69 @@ combo-router + anthropic-oauth-pool») НЕЗАВИСИМЫМ путём мон�
 `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2`; ни один не задан → скачивание не
 происходит, `DSH_ANTHROPIC_POOL_ACTIVE=0`, поведение не меняется.
 
-Требование: `dsh_mount_anthropic_pool` монтирует плагин (`dsh plugin add`)
-и структурно подтверждает монтаж строкой `- id: anthropic-oauth-pool` в
-`dsh --dump-config` — тем же способом, что уже доказан для suite
-(`dsh_mount_plugins_suite`). Сбой скачивания/sha256/монтажа — fail loud.
+Требование (MODIFIED, #1130): `dsh_mount_anthropic_pool` монтирует НЕ
+оригинальный скачанный ассет, а РЕЗУЛЬТАТ обязательного патч-шага
+(`dsh_patch_anthropic_pool_plugin`, следующая секция) — репак патченного
+`package/`. sha256-проверка из `dsh_install_anthropic_pool` остаётся
+привязана к ОРИГИНАЛЬНОМУ (ещё не патченному) скачанному файлу — это якорь
+целостности загрузки, а не якорь монтируемого артефакта; монтируемый
+артефакт — локально пересобранный tgz, у которого своей sha256-проверки
+нет и не может быть (содержимое меняется патчем намеренно). Структурное
+подтверждение монтажа — строка `- id: anthropic-oauth-pool` в
+`dsh --dump-config`, тем же способом, что уже доказан для suite
+(`dsh_mount_plugins_suite`). Сбой скачивания/sha256 оригинала, сбой
+патч-шага или сбой монтажа — fail loud, в каждом случае с разным
+сообщением, называющим именно тот шаг.
+
+## ADDED (#1130): Патч плагина перед монтажом — self-регистрация и рефреш долгоживущих токенов
+
+Требование: `dsh_patch_anthropic_pool_plugin` (`scripts/lib/dsh-ci.sh`)
+вызывается МЕЖДУ `dsh_install_anthropic_pool`/`dsh_import_anthropic_accounts`
+и монтажом (`dsh_mount_plugins_suite`/`dsh_mount_anthropic_pool`) в ОБОИХ
+потребителях (`scripts/worker/task.sh`, `scripts/hands/dsh_task.sh`).
+Применяет `scripts/lib/patch_anthropic_pool_plugin.py` к уже скачанному и
+sha256-проверенному каталогу (`DSH_ANTHROPIC_POOL_EXTRACTED`), результат
+репакует в новый tgz и перепривязывает `DSH_ANTHROPIC_POOL_PKG` на него —
+именно этот репак монтирует `dsh_mount_anthropic_pool` следующим шагом (см.
+MODIFIED выше). Функция — no-op (`return 0`), если пул неактивен
+(`DSH_ANTHROPIC_POOL_ACTIVE` не `1`).
+
+Требование: патч-скрипт правит ДВА файла плагина ТРЕМЯ точечными правками,
+все — exact string match с fail loud при несовпадении формы (апстрим
+плагина сменился), все три проверяются на исходном содержимом ДО записи
+ЛЮБОГО файла (частичное применение невозможно):
+1. `lib/index.js::ensureProvider` — тело нейтрализуется целиком (`return`
+   без действий). Плагин пытался зарегистрировать себя в `llm-pi-ai` через
+   `ctx.get('settings').update(...)`; сервис `settings` реально смонтирован
+   в headless (через `dsh-base`), поэтому эта self-регистрация гонится с
+   нашей статической (`_dsh_patch_profile_anthropic_pool`) и способна
+   перезаписать `models` живым каталогом `discoverModels()` —
+   нейтрализация убирает гонку у корня.
+2. `lib/pool.js::createRefreshCoordinator` — условие пропуска превентивного
+   рефреша меняется с `if (oauth.expiresAt && ...) return account` на
+   `if (!oauth.expiresAt || ...) return account`: отсутствие поля
+   `expiresAt` трактуется как «токен валиден», не «токен истёк». Токены с
+   явным `expiresAt` (короткоживущие) продолжают рефрешиться по сроку без
+   изменений — правится только ветка «поля нет».
+3. `lib/index.js::forward`, 401/403-ветка — добавляется реактивный
+   рефреш-и-повтор: помечает аккаунт на диске как просроченный
+   (`expiresAt = Date.now() - 1`) и вызывает `ensureFresh()` ещё раз (та же
+   функция, что патч 2 правит) перед единственным повтором того же
+   запроса; неудача — прежнее поведение (`cooldownUntil` + следующий
+   аккаунт). Обязательная пара к патчу 2: без неё РЕАЛЬНО истёкший токен
+   без `expiresAt` не восстановился бы вовсе.
+
+Требование (MODIFIED, суть суперсети из ADDED «Монтаж независимо от suite»
+и `dsh-in-job::ADDED: Suite ротации учёток`): `dsh_mount_plugins_suite`
+пропускает СВОЙ собственный `dsh plugin add` для оригинального (непатченного)
+ассета `dsh-anthropic-oauth-pool`, если `DSH_ANTHROPIC_POOL_ACTIVE=1` —
+единственную, уже патченную копию монтирует `dsh_mount_anthropic_pool`
+следующим шагом. Без этого правила при одновременной активации suite и
+standalone-пути смонтировались бы ДВЕ копии плагина, одна из них
+непатченная, и self-регистрация из патча 1 выше снова гонится со
+статической регистрацией. При `DSH_ANTHROPIC_POOL_ACTIVE=0` (обычный
+случай без секретов пула) suite продолжает монтировать свою копию как
+раньше — путь независимых плагинов из #215 не меняется.
 
 ## ADDED: Импорт аккаунтов из секретов
 

@@ -52,5 +52,81 @@ HTTP-прокси плагина (аутентификация, ротация �
 сломанного settings-сервиса; порт прокси зафиксирован (`DSH_ANTHROPIC_POOL_PORT`)
 — иначе `baseURL` нельзя узнать до старта процесса, выбирающего порт сам.
 
+## Поправка 2026-09-13 (#1130): предыдущее дополнение (#1097) ошибочно утверждало отсутствие settings в headless
+
+Живой прогон worker.yml **34753001158** (после мержа фикса #1097/#1099) сменил
+ошибку с `NO_ADAPTER` на `dsh: UNKNOWN_MODEL: pi-ai provider "anthropic-pool"
+has no configured model "claude-sonnet-4-5"`. Это доказывает: провайдер
+регистрируется (фикс #1097 работает), но что-то ПЕРЕЗАПИСЫВАЕТ список
+моделей.
+
+Разбор нашёл ошибку в предыдущем дополнении: **сервис `settings`
+(`@deepseek-ai/dsh-settings-file`) ДЕЙСТВИТЕЛЬНО смонтирован в headless** —
+живой `dsh --profile headless --dump-config` (те же `@deepseek-ai/dsh@0.1.1-rc.2`
++ `@deepseek-ai/dsh-headless@0.1.1-rc.2`, установлены СПОСОБОМ `dsh_install`)
+показывает строку `- id: settings / name: '@deepseek-ai/dsh-settings-file'` в
+композиции `dsh-base`, на которой стоят все профили кроме `sdk-minimal`
+(research/10, §9). Предыдущий вывод («settings никогда не монтируется в
+headless») был неполным: он верно описал, что `@deepseek-ai/dsh-headless`
+САМ не тянет `dsh-settings`, но не учёл, что `dsh-base` (нижний, разделяемый
+слой) тянет `dsh-settings-file` через СВОЮ собственную цепочку зависимостей
+— настоящую причину исходного `TypeError` (первого захода #1097) это делает
+скорее гонкой (`ensureProvider()` вызывается асинхронно из
+`server.listen()`, до того как фибер settings успел стать готовым), чем
+структурным отсутствием сервиса — но само это уже не важно для второго
+инцидента: раз `settings` реально доступен, self-регистрация плагина
+(`ensureProvider()`) продолжает выполняться ПАРАЛЛЕЛЬНО нашей статической
+регистрации (#1097), и её `settings.update('llm-pi-ai', {providers: {...}})`
+— MERGE-патч (`@deepseek-ai/dsh-settings::mergeLayers`): объекты сливаются
+рекурсивно, но МАССИВЫ заменяются ЦЕЛИКОМ. `ensureProvider()` СНАЧАЛА зовёт
+`discoverModels()` — реальный `GET /v1/models` с реальными аккаунтами (в CI
+секреты `ANTHROPIC_OAUTH_1/2` настоящие) — и если этот каталог не содержит
+буквального id `claude-sonnet-4-5` (наш статический дефолт, он же дефолт
+самого плагина), поздняя запись плагина стирает наш массив `models`, и
+следующий резолв модели агентом получает `UNKNOWN_MODEL`.
+
+Подтверждено локально (та же версия `0.1.1-rc.2`, DSH_HOME изолирован от
+реального `$HOME` — Node's `os.homedir()` на Windows читает `USERPROFILE`,
+не `HOME`, поэтому нужен именно `DSH_HOME`): с СИНТЕТИЧЕСКИМ (пустым) пулом
+аккаунтов `discoverModels()` возвращает рано (`if (!account) return`) —
+self-запись плагина никогда не происходит, гонка не воспроизводится (это и
+объясняет, почему первый локальный прогон #1097/#1099 её не поймал). Фикс
+#1130 — нейтрализация `ensureProvider()` целиком точечным патчем
+(`scripts/lib/patch_anthropic_pool_plugin.py`, exact string match, fail
+loud при несовпадении формы), применяемым к распакованному плагину ПОСЛЕ
+проверки sha256; результат репакуется и монтируется вместо оригинального
+ассета. Наша статическая регистрация (#1097) остаётся ЕДИНСТВЕННЫМ
+источником правды — плагину больше нечего писать в settings, гонка снята у
+корня, а не подавлена совпадением id.
+
+## Дополнение 2026-09-13 (#1130): превентивный рефреш путает «срок неизвестен» со «срок истёк»
+
+Вопрос, процитированный оркестратором как вопрос владельца (атрибуция — см.
+`openspec/changes/anthropic-oauth-pool-standalone/design.md`, раздел
+«Превентивный рефреш долгоживущих токенов», честная оговорка про
+отсутствие машиночитаемого артефакта решения): «Какой опус он там пытается
+рефрешить, если мы поставили долгоживущие OAuth токены, которые не надо
+рефрешить?» Разбор
+`lib/pool.js::createRefreshCoordinator` (тот же релиз плагина): условие
+пропуска превентивного рефреша — `if (oauth.expiresAt && oauth.expiresAt -
+Date.now() > REFRESH_SKEW_MS) return account` (`REFRESH_SKEW_MS = 5 * 60 *
+1000`). Условие ложно и когда `expiresAt` ОТСУТСТВУЕТ, и когда оно в
+прошлом — плагин не различает «поле не задано» (долгоживущий accessToken
+без явного срока) и «поле задано и истекло». Проверяется на КАЖДЫЙ запрос
+через прокси (`lib/index.js::forward`/`discoverModels`), не один раз при
+старте.
+
+Плагин НЕ имел ветки «получили 401/403 от Anthropic → рефрешим и повторяем
+тот же запрос» (`forward()`, ветка `if ([401, 403].includes(response.status))`
+— только `cooldownUntil` + переход к следующему аккаунту) — это означает,
+что отключение превентивного рефреша БЕЗ добавления реактивного сломало бы
+восстановление реально истёкшего токена без `expiresAt`. Фикс #1130 —
+патч в двух местах разом (см. `openspec/changes/anthropic-oauth-pool-standalone/design.md`,
+раздел «Превентивный рефреш долгоживущих токенов»): `pool.js` перестаёт
+считать отсутствие `expiresAt` признаком истечения, `index.js` получает
+реактивный рефреш-и-повтор на реальный 401/403 (метит аккаунт на диске как
+просроченный и зовёт `ensureFresh()` снова — переиспользует существующую
+логику рефреша, не дублирует её).
+
 ## Источники
-`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097).
+`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14).

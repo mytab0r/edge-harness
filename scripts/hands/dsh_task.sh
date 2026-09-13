@@ -308,6 +308,10 @@ dsh_install_anthropic_pool "$WORK/anthropic-pool" \
   || { echo "::error::быстрый провайдер Claude не установился (см. ::error:: выше, #838)" >&2; exit 1; }
 dsh_import_anthropic_accounts \
   || { echo "::error::импорт аккаунтов Claude не удался (см. ::error:: выше, #838)" >&2; exit 1; }
+# Нейтрализация self-регистрации плагина в settings — гонка с нашей
+# статической регистрацией (#1097/#1130), см. dsh-ci.sh для причины.
+dsh_patch_anthropic_pool_plugin \
+  || { echo "::error::патч плагина anthropic-oauth-pool не применился (см. ::error:: выше, #1130)" >&2; exit 1; }
 
 # ── 3b. Модель и лимит ответа — settings-слой профиля, ДО монтажа плагина ─────────
 # Порядок важен: --dump-config в 3d обязан доказывать монтаж плагина поверх
