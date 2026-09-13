@@ -2936,3 +2936,60 @@ def test_pipeline_status_marker_impersonation_not_in_ci_gating():
     # прошлым комментариям #120 структурно необнуляем (правило репозитория
     # запрещает их удалять) — гейтить им PR означало бы красить main вечно.
     assert 18 not in ri.CI_GATING
+
+
+def test_pipeline_status_marker_impersonation_is_escalating():
+    """Находка не живёт только строкой отчёта прогона (блокирующая находка
+    ревью PR #1102): инвариант 18 входит в ESCALATING_INVARIANTS, у
+    run_escalations есть его ветка. Основание весомее, чем у соседнего 16:
+    поддельный PAUSE/RESUME не только сигнализирует, он РЕАЛЬНО двигает
+    решение (conveyor_gate читает маркеры #120 без trusted_login,
+    поддельный RESUME работает виртуальным success) — владелец обязан
+    узнавать о каждой новой подделке из канала (#120 + Telegram), а не
+    из лога CI, который никто не читает."""
+    assert 18 in ri.ESCALATING_INVARIANTS
+    # Структурная привязка номера к ветке эскалации — поведенческим тестом
+    # ниже (test_run_escalations_invariant_18_*), здесь только реестр.
+
+
+def test_run_escalations_invariant_18_dedupes_by_id_set(monkeypatch):
+    """Эскалация «раз на состояние» (тот же приём, что у 12/15/16): тот же
+    набор id не эскалируется второй раз — вечный долг из 174 комментариев
+    даёт ОДНУ эскалацию, не спам каждые 15 минут; новая подделка меняет
+    набор — новая эскалация, и её текст несёт факты (счётчик, последний по
+    времени, различение по токену), а не гадание, кто писатель."""
+    calls = []
+
+    def fake_issue_marker_times(repo, issue, marker):
+        # Точный маркер уже эскалированного состояния — ключ это множество id.
+        return [utc(2026, 9, 13, 0, 0)] if marker == "[инвариант 18: 5650994043]" else []
+
+    def fake_escalate(repo, issue, text):
+        calls.append((issue, text))
+        return "отправлено"
+
+    monkeypatch.setattr(ri, "issue_marker_times", fake_issue_marker_times)
+    monkeypatch.setattr(ri, "escalate", fake_escalate)
+
+    known = {
+        "id": 5650994043,
+        "created_at": "2026-09-13T03:53:03Z",
+        "login": "mytab0r",
+        "user_type": "User",
+        "url": "https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5650994043",
+    }
+    # Тот же набор, что уже эскалирован — тишина, конвейер не спамит.
+    assert ri.run_escalations("mytab0r/edge-harness", {18: [known]}) == []
+    assert calls == []
+
+    # Новая подделка меняет множество — одна новая эскалация с фактами.
+    newer = {**known, "id": 5652329765, "created_at": "2026-09-13T08:57:10Z"}
+    lines = ri.run_escalations("mytab0r/edge-harness", {18: [known, newer]})
+    assert len(calls) == 1
+    issue, text = calls[0]
+    assert issue == ri.WATCHDOG_ISSUE
+    assert "2 таких комментариев" in text  # счётчик, не «либо/либо»
+    assert "2026-09-13T08:57:10Z" in text  # последний по времени
+    assert "performed_via_github_app" in text  # признак — токен, не логин
+    assert "не подтверждено" in text  # алерт не гадает: авторство не установлено
+    assert any("📣 инвариант 18 эскалирован" in line for line in lines)
