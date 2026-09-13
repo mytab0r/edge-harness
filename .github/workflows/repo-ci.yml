@@ -722,6 +722,14 @@ jobs:
       - name: Мутационный тест гвардии литерала namespace
         run: node --test dsh-edge/verify-provider-namespace.test.mjs
 
+      # Гвардия MAJOR-консистентности peer-зависимостей (#1041) доказана
+      # мутацией: зелёная на lockfile'е с допустимым major (в т.ч. с
+      # отставанием patch/minor — намеренно не находка), красная с точным
+      # сообщением на симуляции живого случая (react-dom@19.2.8 подставлен
+      # react@18.3.1).
+      - name: Мутационный тест гвардии peer-консистентности
+        run: node --test dsh-edge/verify-peer-consistency.test.mjs
+
       # Находка ревью PR #453, п.2: dsh-edge/plugins.json и
       # dsh-edge/plugins-catalog.json рендерятся в клиентский бандл плагином
       # plugin-manager (client:true) — брифы каталога попадают в dist

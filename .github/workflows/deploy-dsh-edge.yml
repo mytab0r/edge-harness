@@ -195,6 +195,18 @@ jobs:
           # (класс silent-wrong #43). Дальнейшую сверку делает verify и гвардия.
           grep -q "patchedDependencies" pnpm-workspace.yaml || { echo "::error::pnpm add потерял patchedDependencies — план Б из design.md"; exit 1; }
 
+      # Гвардия консистентности peer-зависимостей (issue #1041): `pnpm add`
+      # выше не роняет установку на несовместимой peer-паре (только
+      # предупреждает) — расхождение MAJOR-версии (живой случай:
+      # react-dom@19.2.8 подставлен с react@18.3.1) тихо доезжает до
+      # собранного бандла и падает только на реальном браузерном рендере
+      # конкретного слота (e2e-смоук ниже, 'settings.section', React error
+      # #130), далеко от места и момента решения. Дёшево: сразу после
+      # `pnpm add`, до кодогенерации/сборки/e2e.
+      - name: Гвардия консистентности peer-зависимостей (#1041)
+        if: steps.route.outputs.plugins != '0'
+        run: node dsh-edge/verify-peer-consistency.mjs "$GITHUB_WORKSPACE/clone"
+
       - name: Кодогенерация плагинной композиции
         if: steps.route.outputs.plugins != '0'
         run: node dsh-edge/codegen-edge-plugins.mjs "$GITHUB_WORKSPACE/clone"
