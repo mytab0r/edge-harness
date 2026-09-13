@@ -191,6 +191,7 @@ def test_build_snapshot_assembles_all_fields():
     now = utc(2026, 9, 9, 12, 0)
     snapshot = ph.build_snapshot(
         now.date(),
+        window_day=now.date() - timedelta(days=1),
         merged_search={"total_count": 5},
         open_pulls=[{"created_at": "2026-09-08T12:00:00Z"}],
         task_issues=[_issue(1)],
@@ -201,6 +202,7 @@ def test_build_snapshot_assembles_all_fields():
         now=now,
     )
     assert snapshot["date"] == "2026-09-09"
+    assert snapshot["window_day"] == "2026-09-08"
     assert snapshot["merge_throughput"] == 5
     assert snapshot["pr_age_p50_hours"] == 24.0
     assert snapshot["backlog_total"] == 1
@@ -384,3 +386,107 @@ def test_orchestra_health_audit_step_authorizes_git_before_push():
         "GH_PIPELINE_PAT (тем же секретом, что читает pipeline_health.py для push), "
         f"а не {auth_env.get('GH_TOKEN')!r}"
     )
+
+
+# ── Критерий 5 #1121: суточные метрики считаются по ЗАВЕРШЁННЫМ суткам ──────
+
+
+def test_daily_metrics_at_first_tick_after_midnight_use_completed_day(monkeypatch):
+    """Гвардия окна (#1121, критерий 5): снимок берётся первым тиком пульса
+    после полуночи (фикстура: now = 00:06 UTC 2026-09-14). Фикстура-«сервер»
+    ЧЕСТНА по форме: search/issues возвращает total_count=9 ТОЛЬКО для диапазона
+    завершённых суток 2026-09-13..2026-09-13, на любое другое окно — 0 (как
+    реальный GitHub); DO-метрика несёт живой пробой квоты накануне. Обе
+    суточные метрики обязаны быть НЕнулевыми. Мутация: вернуть окно «сегодня»
+    в pipeline_health.collect (merged:{today}..{today}) и/или в
+    quotas.collect_cloudflare ($start=сегодня) — сервер честно ответит 0/пусто,
+    тест покраснеет (проверено мутационным прогоном, текст в PR)."""
+    # Дата — навсегда в прошлом (реальное «сегодня» уже 2026-09-13+): мутация
+    # «вернуть окно сегодня» обязана краснить детерминированно, а не только в
+    # те сутки, когда реальный календарь совпадает с фикстурой.
+    now = utc(2026, 1, 10, 0, 6)
+    repo = "mytab0r/edge-harness"
+    completed_day = "2026-01-09"
+    captured: dict = {}
+
+    class ServerHonestGh:
+        """search/issues отвечает как реальный GitHub: число слияний ЗАПРОШАЕМОГО
+        окна, не фикс-константа — иначе тест не ловит мутацию окна."""
+
+        def __call__(self, *args):
+            joined = " ".join(args)
+            if "search/issues" in joined:
+                if f"merged:{completed_day}..{completed_day}" in joined:
+                    return {"total_count": 9, "items": []}
+                return {"total_count": 0, "items": []}
+            if "pulls?state=open" in joined:
+                return [{"number": 1, "created_at": "2026-09-13T10:00:00Z"}]
+            if "issues?state=open&labels=task" in joined:
+                return [_issue(1)]
+            if "actions/workflows/worker.yml/runs" in joined:
+                return {"workflow_runs": [{"conclusion": "success"}]}
+            if "actions/workflows/orchestra.yml/runs" in joined:
+                return {"workflow_runs": []}
+            if "rate_limit" in joined:
+                return {"resources": {"core": {"limit": 1000, "remaining": 900}}}
+            raise AssertionError(f"нет маршрута для: {joined}")
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [
+                {"name": "DurableObjectsInvocationsAdaptiveGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "date_geq" in query:
+            captured["start"] = (variables or {}).get("start")
+            captured["end"] = (variables or {}).get("end")
+            # Живой пробой квоты НАКАНУНЕ (2026-09-13): удвоенный лимит → 200%.
+            return {"viewer": {"accounts": [{
+                "durableObjectsInvocationsAdaptiveGroups": [
+                    {"sum": {"rowsRead": ph.quotas.LIMITS["cf_do_rows_read_day"] * 2}}]}]}}
+        return {"viewer": {"accounts": [{
+            "workersInvocationsAdaptive": [], "durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(ph.pulse_guard, "gh", ServerHonestGh())
+    monkeypatch.setattr(ph.quotas, "cf_query", fake_cf_query)
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+
+    snapshot = ph.collect(repo, ServerHonestGh(), now)
+    assert snapshot["window_day"] == completed_day
+    assert snapshot["merge_throughput"] == 9, (
+        "merge_throughput обязан считать ЗАВЕРШЁННЫЕ сутки: первый тик после "
+        "полуночи с окном «сегодня» меряет первые шесть минут суток (#1121)")
+    assert snapshot["do_rows_read_pct"] is not None and snapshot["do_rows_read_pct"] > 100.0, (
+        "do_rows_read_pct обязан нести пробой квоты завершённых суток, не ноль "
+        "первых минут нового дня (#1121)")
+    assert captured == {"start": completed_day, "end": completed_day}
+
+
+def test_do_rows_read_window_completed_day_reaches_cloudflare_query(monkeypatch):
+    """Тот же инвариант на стыке модулей: pipeline_health._do_rows_read_pct
+    обязан передать окно завершённых суток ВНУТРЬ Cloudflare-запроса, а не
+    надеяться на дефолт collect_cloudflare (тот живёт для отчёта квот и
+    остаётся «сегодня»)."""
+    now = utc(2026, 1, 10, 0, 6)  # завершённые сутки фикстуры: 2026-01-09
+    captured: dict = {}
+
+    def fake_cf_query(token, query, variables=None):
+        if "__schema" in query:
+            return {"__schema": {"types": [
+                {"name": "DurableObjectsInvocationsAdaptiveGroupsSum"}]}}
+        if "__type" in query:
+            return {"__type": {"fields": [{"name": "rowsRead"}]}}
+        if "date_geq" in query:
+            captured.update(variables or {})
+            return {"viewer": {"accounts": [{
+                "durableObjectsInvocationsAdaptiveGroups": [
+                    {"sum": {"rowsRead": ph.quotas.LIMITS["cf_do_rows_read_day"] // 2}}]}]}}
+        return {"viewer": {"accounts": [{
+            "workersInvocationsAdaptive": [], "durableObjectsStorageGroups": []}]}}
+
+    monkeypatch.setattr(ph.quotas, "cf_query", fake_cf_query)
+    pct = ph._do_rows_read_pct("acct", "tok", now)
+    assert pct is not None and pct > 0.0  # 50.0% — ноль первых минут нового дня был бы 0.0
+    assert captured["start"] == "2026-01-09"
+    assert captured["end"] == "2026-01-09"
