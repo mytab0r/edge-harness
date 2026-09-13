@@ -640,6 +640,14 @@ def ensure_draft_pr(gh: Github) -> None:
         "(workflow, скрипт, доки) едут этим же PR: отдельный инфраструктурный PR — "
         "второй претендент на задачу #4, контракт его отклонит."
     )
+    # Единственный идемпотентный черновик-PR кампании #4, тело фиксировано
+    # этой функцией (не свободный текст агента) и не несёт Closes/Fixes/
+    # Resolves — риск, от которого закрывает scripts/git/pr-create, здесь
+    # структурно не возникает. maintainer_can_modify=False недостижимо через
+    # `gh pr create` (нет такого флага CLI) — миграция на bash-дверь
+    # потребовала бы либо тащить сюда gh CLI из Python подпроцессом с
+    # переносом GH_PIPELINE_PAT в GH_TOKEN, либо расширять дверь новым флагом.
+    # door-exception: известный, поименованный обход двери pr-create (issue #611), не тихий
     gh.request("POST", f"/repos/{gh.repo}/pulls", {
         "title": PR_TITLE, "head": DATA_BRANCH, "base": "main",
         "body": body, "draft": True, "maintainer_can_modify": False,
