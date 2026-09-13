@@ -93,7 +93,10 @@
 # blocked) → зелёный; провайдер в лимите/квоте надолго → job красный, но
 # задача честно возвращена в пул (не «воркер не справился» — вина не его);
 # иначе (PR нет, закрыт без слияния или пуст без диффа, реальный сбой) →
-# job красный. Нет свободных задач → зелёный без действий.
+# job красный. Нет свободных задач → зелёный без действий. Недоступность
+# морды dsh-edge (сессия/дрен транскрипта, #119) в этот список не входит: с
+# #572 это ::warning:: и деградация видимости, а не условие красного — морда
+# вторична относительно самой задачи, см. секцию 5b.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -549,18 +552,44 @@ WORKER_BRANCH_ORIGIN_START_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut
   || die "не смог снять снимок головы ветки $BRANCH на origin (git/сеть)"
 
 # ── 5b. Сессия раннера в морде (#119): создать/переиспользовать и назвать ────────
-# Имя сессии = «#N: название задачи», воркспейс edge-harness. Отказ громкий:
-# без сессии ход работы владельцу не виден — job красный (критерий #119).
+# Имя сессии = «#N: название задачи», воркспейс edge-harness. Отказ понижен до
+# warning (#572, было exit 1 = «job красный»): контракт исхода запуска в шапке
+# файла (см. «Итог запуска» выше) морды как условие красного не называет, а
+# связка «морда легла → красный» этому контракту противоречила де-факто.
+# Живая улика #572: 500 «Internal runtime error.» из dsh-edge
+# `appendHarnessEvents` (dsh-edge/patches/0004-harness-ingest.patch —
+# `openAgentForTurn` внутри дописывания в чужую сессию тянет полный
+# агент/провайдера ради текстовой строки) не про задачу воркера, а про
+# недоступность ВТОРИЧНОЙ витрины — но роняла ПЕРВИЧНЫЙ результат (PR так и не
+# пытались открыть, если ложились тут). DSH_EDGE_MORDA_AVAILABLE — единственный
+# флаг, которым весь остальной блок узнаёт, включать ли шаги морды дальше;
+# работа над задачей идёт независимо.
 HARNESS_SID="harness-$number"
 HARNESS_TITLE="#$number: $title"
-dsh_edge_login || { echo "::error::Нет доступа к морде dsh-edge — job красный (#119)" >&2; exit 1; }
-# Реально использованный id может отличаться от HARNESS_SID (#809: фоллбэк
-# на испорченной холодной загрузке) — читаем возврат функции, не подставляем
-# исходный HARNESS_SID вручную.
-HARNESS_SID_ACTUAL=$(dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE") \
-  || { echo "::error::Сессия $HARNESS_SID не создана в морде — ход работы останется невидимым (#119)" >&2; exit 1; }
+DSH_EDGE_MORDA_AVAILABLE=1
+# Реально использованный id может отличаться от HARNESS_SID (#809: фоллбэк на
+# испорченной холодной загрузке, session.create ИЛИ session.rename, #871) —
+# читаем возврат функции, не подставляем исходный HARNESS_SID вручную (находка
+# ревью PR #638, второй раунд: >/dev/null здесь уже один раз возвращал именно
+# этот антипаттерн — на испорченной сессии успешный фоллбэк на новый id тихо
+# адресовал бы дальнейший дрен транскрипта на несуществующий/исходный id).
+# Отказ морды не путается с отказом чтения ответа: при DSH_EDGE_MORDA_AVAILABLE
+# пустом ниже id не используется вовсе (дрен/verify пропускаются целиком).
+HARNESS_SID_ACTUAL="$HARNESS_SID"
+if ! dsh_edge_login; then
+  echo "::warning::Нет доступа к морде dsh-edge — ход работы не будет виден в UI, задача выполняется дальше (#572)" >&2
+  DSH_EDGE_MORDA_AVAILABLE=""
+elif ! HARNESS_SID_ACTUAL=$(dsh_edge_session_begin "$HARNESS_SID" "$HARNESS_TITLE"); then
+  echo "::warning::Сессия $HARNESS_SID не создана в морде — ход работы не будет виден в UI, задача выполняется дальше (#572)" >&2
+  DSH_EDGE_MORDA_AVAILABLE=""
+  HARNESS_SID_ACTUAL="$HARNESS_SID"
+fi
 export DSH_EDGE_SESSION_ID="$HARNESS_SID_ACTUAL"
-echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
+if [ -n "$DSH_EDGE_MORDA_AVAILABLE" ]; then
+  echo "Сессия морды: $DSH_EDGE_SESSION_ID — «$HARNESS_TITLE»"
+else
+  echo "Морда недоступна — сессия $HARNESS_SID не создана, транскрипт отправляться не будет (#572)"
+fi
 
 # ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
 dsh_install "$WORK/pkgs"
@@ -628,7 +657,11 @@ gh issue comment "$number" \
   --body "🤖 [worker: git-шаг] worker run ${GITHUB_RUN_ID:-local}" >/dev/null \
   || echo "::warning::маркер git-шага не отправлен в задачу #$number — оркестратор увидит эту попытку как инфраструктурный сбой"
 
-dsh_edge_start_drain
+# Фоновый дрен имеет смысл только при живой сессии морды (#572): без неё
+# каждый тик всё равно бил бы по /ingest без куки и логировал ::error:: раз
+# в тик DRAIN_INTERVAL_SECS (30с с #1048, DSH_EDGE_DRAIN_INTERVAL_DEFAULT_SECS
+# в dsh-edge-session.sh) до конца прогона — шум без цели, а не сигнал.
+[ -n "$DSH_EDGE_MORDA_AVAILABLE" ] && dsh_edge_start_drain
 WORKER_TASK_FAILURE_REASON=""
 DSH_RATE_LIMIT_MAX_WAIT_SECS="$WORKER_RATE_LIMIT_MAX_WAIT_SECS" \
 DSH_RATE_LIMIT_INITIAL_DELAY_SECS="$WORKER_RATE_LIMIT_INITIAL_DELAY_SECS" \
@@ -645,14 +678,36 @@ echo "dsh завершился с кодом $rc (провайдер: ${WORKER_C
 WORKER_BRANCH_END_SHA=$(git rev-parse HEAD)
 
 # Транскрипт — до пост-обработки: ход работы в морде обгоняет отчёт в задаче.
-dsh_edge_stop_drain
-dsh_edge_drain_spool hard \
-  || { echo "::error::Транскрипт не принят мордой — ход работы останется невидимым (#119)" >&2; exit 1; }
-drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
-echo "Событий транскрипта в морде: $drained_lines"
+# Отказ морды здесь тоже понижен до warning (#572, было exit 1): к этой строке
+# реальная работа (dsh_run_with_pool_then_chain выше) уже отработала — топить
+# успешный результат из-за витрины было бы ровно тем самым «морда роняет
+# исполнителя», ради чего и заведена эта правка (см. обоснование в разделе 5b
+# выше). Диагноз плагина стрима ([ -f "$SPOOL_FILE" ]) — от доступности морды
+# НЕ зависит (находка ревью PR #638): плагин мог не сработать даже при живой
+# морде, и это отдельная, местная поломка (dsh-hands-streamer), не витрина —
+# гейтить её на DSH_EDGE_MORDA_AVAILABLE значило бы прятать поломку плагина
+# именно тогда, когда морда и так недоступна.
 if [ "$rc" -eq 0 ]; then
-  [ -f "$SPOOL_FILE" ] || { echo "::error::Спул стрима не создан при успешном прогоне — плагин не работал" >&2; exit 1; }
-  [ "$drained_lines" -gt 0 ] || { echo "::error::Ноль событий в сессии морды при успешном прогоне (#119)" >&2; exit 1; }
+  [ -f "$SPOOL_FILE" ] || echo "::warning::Спул стрима не создан при успешном прогоне — плагин не работал (#572)" >&2
+fi
+drained_lines=0
+if [ -n "$DSH_EDGE_MORDA_AVAILABLE" ]; then
+  dsh_edge_stop_drain
+  if dsh_edge_drain_spool hard; then
+    drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
+  else
+    echo "::warning::Транскрипт не принят мордой — ход работы не будет виден в UI (#572)" >&2
+    DSH_EDGE_MORDA_AVAILABLE=""
+  fi
+  echo "Событий транскрипта в морде: $drained_lines"
+  # «Ноль событий при успешном прогоне» различает «морда есть, приём сломан»
+  # от «морды нет вовсе» (см. AGENTS.md, «Алерт не гадает») — при недоступной
+  # морде ноль событий ожидаем и не диагностичен, гейт имеет смысл только
+  # когда сама доставка отработала (DSH_EDGE_MORDA_AVAILABLE ещё не сброшен
+  # веткой else выше).
+  if [ "$rc" -eq 0 ] && [ -n "$DSH_EDGE_MORDA_AVAILABLE" ]; then
+    [ "$drained_lines" -gt 0 ] || echo "::warning::Ноль событий в сессии морды при успешном прогоне (#572)" >&2
+  fi
 fi
 
 # Рендер транскрипта (#131): доставка в морду не значит, что владелец увидит
