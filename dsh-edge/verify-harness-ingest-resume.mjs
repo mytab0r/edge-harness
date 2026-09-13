@@ -138,7 +138,7 @@ export function assertHarnessIngestWiring(patch = readFileSync(patchPath, 'utf8'
     [`let entry = plan.entry`, 'результат плана ПОТРЕБЛЁН (let entry = plan.entry) — «вызвал и выбросил» = cold resume на каждый вызов, pre-#1049'],
     [`this.harnessIngestHandles.set(id, entry)`, 'entry положен в кэш тёплых хэндлов (harnessIngestHandles.set)'],
     [`entry.baseTurn = advanceHarnessIngestBaseTurn(`, 'baseTurn двинут инкрементально (advanceHarnessIngestBaseTurn), а не пересканирован по истории'],
-    [`await releaseStale(plan.staleForId)`, 'вытесненная запись ТЕКУЩЕЙ сессии диспоузится ДО холодного ресума (await releaseStale(plan.staleForId)) — иначе reopen того же id может получить BUSY на цикл (ревью PR #1057, чеклист)'],
+    [`await releaseStale(plan.staleForId,`, 'вытесненная запись ТЕКУЩЕЙ сессии диспоузится ДО холодного ресума (await releaseStale(plan.staleForId, …) — вторым аргументом названа причина вытеснения) — иначе reopen того же id может получить BUSY на цикл (ревью PR #1057, чеклист)'],
     [`this.harnessIngestHandles.delete(id)`, 'сбой между append и flush выселяет тёплый хэндл из кэша (catch { … harnessIngestHandles.delete(id) }) — иначе ретрай дрена того же батча дописывает его в ту же in-memory сессию второй раз, и следующий успешный flush персистит обе копии (ревью PR #1057, второй раунд, блокер 2)'],
     [`entry !== undefined && entry.inFlight`, 'in-flight-охрана против конкурентного вызова той же сессии на тёплом пути (entry.inFlight проверен ПЕРЕД использованием, не только выставлен) — без неё второй параллельный ingest той же сессии переиспользует тот же entry.baseTurn и гонит sessions.flush(session) параллельно с первым, вместо честного BUSY (ревью PR #1057, третий раунд, блокер 1)'],
     [`entry.inFlight = true`, 'entry.inFlight выставлен перед использованием тёплого/свежесозданного хэндла — иначе следующий параллельный вызов не увидит занятость (ревью PR #1057, третий раунд, блокер 1)'],
@@ -150,6 +150,19 @@ export function assertHarnessIngestWiring(patch = readFileSync(patchPath, 'utf8'
   }
   if (body.includes('finally')) {
     throw new Error('патч 0004: проводка #1049 в appendHarnessEvents сломана — в методе снова finally { …dispose() } (pre-#1049 shape: хэндл диспоузится после каждого батча)')
+  }
+  // planHarnessIngestResume несёт само решение idle-вытеснения; его in-flight
+  // охрана — фикс блокера четвёртого раунда ревью PR #1057: lastUsedMs ставится
+  // ОДИН раз в начале батча, поэтому батч, живущий дольше idleMs, выглядит
+  // «простроченным» по возрасту — и без этой строки первый же ingest ЛЮБОЙ
+  // другой сессии диспоузит хэндл под живым append/flush первой. Вторая
+  // половина той же пары, что поведенческие тесты (они исполняют извлечённый
+  // код и ловят ту же мутацию), не третья копия: эта проверка — читаемое
+  // требование в списке проводки, срабатывающее и в структурном прогоне
+  // гвардии без node --test.
+  const planFn = extractPatchFunction(patch, 'planHarnessIngestResume')
+  if (!planFn.includes('cached.inFlight')) {
+    throw new Error('патч 0004: проводка #1049 в planHarnessIngestResume сломана — idle-вытеснение обязано пропускать in-flight записи (if (cached.inFlight) continue): батч, живущий дольше idleMs, выглядит простроченным, его dispose попадёт под живой append/flush (ревью PR #1057, четвёртый раунд, блокер)')
   }
   return body
 }

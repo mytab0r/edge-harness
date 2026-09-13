@@ -143,16 +143,52 @@ test('advanceHarnessIngestBaseTurn — точность через нескол�
 
 // --- Структурная половина: проводка #1049 внутри appendHarnessEvents ---
 
-/** Wrap method body lines as a minimal fake diff the extractor can read. */
+/** Wrap method body lines as a minimal fake diff the extractor can read.
+ *  Несёт и фейковый planHarnessIngestResume: структурная половина гвардии
+ *  проверяет проводку и в план-функции (in-flight-охрана idle-вытеснения),
+ *  экстрактор обязан найти её маркер в любом синтетическом патче. */
+const FAKE_PLAN_SOURCE = [
+  // Ведущий \n обязателен: extractPatchFunction ищет маркер «\n+export function …».
+  '\n+export function planHarnessIngestResume(cache, id, isLiveOwner, nowMs, idleMs) {',
+  '+  const evicted = []',
+  '+  let staleForId',
+  '+  let staleForIdReason',
+  '+  for (const [cachedId, cached] of cache) {',
+  '+    if (nowMs - cached.lastUsedMs < idleMs) continue',
+  '+    if (cached.inFlight) continue',
+  '+    cache.delete(cachedId)',
+  '+    evicted.push(cached)',
+  '+    if (cachedId === id) { staleForId = cached; staleForIdReason = "idle" }',
+  '+  }',
+  '+  let entry = cache.get(id)',
+  '+  if (entry !== undefined && !isLiveOwner(entry)) {',
+  '+    cache.delete(id)',
+  '+    evicted.push(entry)',
+  '+    staleForId = entry',
+  '+    staleForIdReason = "not-live-owner"',
+  '+    entry = undefined',
+  '+  }',
+  '+  return { entry, evicted, staleForId, staleForIdReason }',
+  '+}',
+].join('\n')
+
 function fakePatchWithMethod(lines) {
-  return ['\n+  async appendHarnessEvents() {', ...lines.map(l => `+${l}`), '+  }', '+'].join('\n')
+  return [
+    FAKE_PLAN_SOURCE,
+    '\n+  async appendHarnessEvents() {',
+    ...lines.map(l => `+${l}`),
+    '+  }',
+    '+',
+  ].join('\n')
 }
 
 const WIRING_OK = [
   '    const plan = planHarnessIngestResume(this.harnessIngestHandles, id, live, now, idle)',
   '    const releaseStale = async (stale) => { try { await stale.handle.dispose() } catch (e) {} }',
   '    for (const stale of plan.evicted) { if (stale === plan.staleForId) continue; void releaseStale(stale) }',
-  '    if (plan.staleForId !== undefined) await releaseStale(plan.staleForId)',
+  '    if (plan.staleForId !== undefined) {',
+  '      await releaseStale(plan.staleForId, plan.staleForIdReason ?? "unknown")',
+  '    }',
   '    let entry = plan.entry',
   '    if (entry !== undefined && entry.inFlight) { throw new EdgeSessionStoreError("BUSY", "busy") }',
   '    if (entry === undefined) {',
@@ -210,8 +246,10 @@ test('МУТАЦИЯ: вернулся pre-#1049 finally { …dispose() } — г
 })
 
 test('МУТАЦИЯ: await-dispose вытесненной записи текущего id выкинут — гвардия красная (окно BUSY вернулось)', () => {
-  const withoutAwait = fakePatchWithMethod(WIRING_OK.filter(l => !l.includes('await releaseStale(plan.staleForId)')))
-  assert.throws(() => assertHarnessIngestWiring(withoutAwait), /releaseStale\(plan\.staleForId\)/)
+  const withoutAwait = fakePatchWithMethod(
+    WIRING_OK.filter(l => !l.includes('await releaseStale(plan.staleForId')),
+  )
+  assert.throws(() => assertHarnessIngestWiring(withoutAwait), /releaseStale\(plan\.staleForId[,)]/)
 })
 
 test('МУТАЦИЯ: сбой между append и flush не выселяет тёплый хэндл из кэша — гвардия красная (блокер 2, ревью PR #1057, второй раунд)', () => {
@@ -231,6 +269,20 @@ test('МУТАЦИЯ: ТОЛЬКО проверка in-flight выкинута, 
     WIRING_OK.filter(l => !l.includes('entry !== undefined && entry.inFlight')),
   )
   assert.throws(() => assertHarnessIngestWiring(withoutCheckOnly), /проверен ПЕРЕД использованием/)
+})
+
+test('МУТАЦИЯ: idle-цикл снова вытесняет in-flight записи — гвардия красная (блокер, ревью PR #1057, четвёртый раунд)', () => {
+  // Точная мутация ревьюера: из planHarnessIngestResume удалена строка
+  // if (cached.inFlight) continue — idle-вытеснение снова смотрит только
+  // на возраст, и dispose уходит под живой append/flush долгого батча.
+  const withoutInFlightGuard = fakePatchWithMethod(WIRING_OK).replace(
+    '+    if (cached.inFlight) continue\n',
+    '',
+  )
+  assert.throws(
+    () => assertHarnessIngestWiring(withoutInFlightGuard),
+    /idle-вытеснение обязано пропускать in-flight записи/,
+  )
 })
 
 test('planHarnessIngestResume возвращает staleForId — вытесненная из-под этого id запись помечена для await-dispose', () => {
@@ -276,4 +328,54 @@ test('planHarnessIngestResume: idle-вытеснение СВОЕЙ записи
     plan.staleForId, entry,
     'idle-вытеснение СВОЕЙ записи обязано попасть в staleForId так же, как isLiveOwner-отказ',
   )
+  assert.equal(
+    plan.staleForIdReason, 'idle',
+    'причина вытеснения названа фактом, не угадана (алерт не гадает)',
+  )
+})
+
+test('planHarnessIngestResume: isLiveOwner-отказ называет причину not-live-owner (не idle)', () => {
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  const entry = { handle, baseTurn: 0, lastUsedMs: 1_000 }
+  cache.set('s1', entry)
+
+  const plan = planHarnessIngestResume(cache, 's1', () => false, 1_500, 120_000)
+  assert.equal(plan.staleForId, entry)
+  assert.equal(plan.staleForIdReason, 'not-live-owner', 'isLiveOwner-ветка не маскируется под idle')
+})
+
+test('ЖИВОЙ КЛАСС ДЕФЕКТА (блокер, ревью PR #1057, четвёртый раунд): батч в полёте НЕ вытесняется по idle, даже если живёт дольше idleMs', () => {
+  // lastUsedMs ставится ОДИН раз в НАЧАЛЕ батча (appendHarnessEvents), поэтому
+  // батч, исполняющийся дольше idle-окна, «прострочен» по возрасту — но его
+  // хэндл прямо сейчас гонит append/flush: dispose под живым батчем — тот же
+  // класс «тихая гонка тёплого хэндла», что блокеры двух предыдущих раундов.
+  // До фикса первый же входящий ingest ЛЮБОЙ другой сессии вытеснял такую
+  // запись и диспоузил её хэндл (в лучшем случае спорный 5xx и пустой ретрай
+  // дрена, в худшем — частичный батч сохранён и ретрай дописывает его второй
+  // раз: silent-wrong в хранимом логе).
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  const busy = { handle, baseTurn: 0, lastUsedMs: 1_000, inFlight: true }
+  cache.set('busy-session', busy)
+  // Соседняя простроченная запись без in-flight вытесняется как раньше —
+  // фикс не замораживает кэш целиком.
+  const idle = fakeHandle('IDLE')
+  cache.set('idle-session', { handle: idle, baseTurn: 0, lastUsedMs: 1_000, inFlight: false })
+
+  const idleMs = 120_000
+  const plan = planHarnessIngestResume(cache, 'third-party', () => true, 1_000 + idleMs + 1_000, idleMs)
+  assert.equal(plan.evicted.length, 1, 'вытеснена только простроченная НЕ in-flight запись')
+  assert.equal(plan.evicted[0].handle, idle)
+  assert.equal(cache.has('busy-session'), true, 'in-flight запись остаётся в кэше')
+  assert.equal(handle.disposed(), false, 'хэндл живого батча не диспоузится')
+
+  // Флаг — дискриминатор, не возраст: как только батч завершился
+  // (inFlight = false), та же запись по тому же возрасту вытесняется
+  // обычным порядком.
+  busy.inFlight = false
+  const after = planHarnessIngestResume(cache, 'third-party', () => true, 1_000 + idleMs + 2_000, idleMs)
+  assert.equal(after.evicted.length, 1)
+  assert.equal(after.evicted[0].handle, handle)
+  assert.equal(cache.has('busy-session'), false)
 })

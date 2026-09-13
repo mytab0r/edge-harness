@@ -136,10 +136,10 @@ index ce247c2..ab86d9d 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index 516b977..7ca355c 100644
+index 516b977..4cd78ed 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -22,7 +22,7 @@
+@@ -22,7 +22,7 @@ import type {
    ImageAttachmentRef,
  } from '@deepseek-ai/dsh-attachment'
  import { credentialRef, type CredentialInfo } from '@deepseek-ai/dsh-credentials'
@@ -148,7 +148,7 @@ index 516b977..7ca355c 100644
  import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
  import MessageFeedbackService from '@deepseek-ai/dsh-message-feedback'
  import {
-@@ -200,7 +200,18 @@
+@@ -200,7 +200,18 @@ export type EdgeAgentPromptAdmitter = (input: EdgeAgentPromptAdmission) => Promi
  
  export class EdgeSessionStoreError extends Error {
    constructor(
@@ -168,7 +168,7 @@ index 516b977..7ca355c 100644
      message: string,
    ) {
      super(message)
-@@ -260,6 +271,10 @@
+@@ -260,6 +271,10 @@ export class EdgeSessionStore {
    private readonly modelSelections: EdgeModelSelectionBridge
    private readonly turnPublishedAgents = new WeakSet<Agent>()
    private readonly ready: Promise<void>
@@ -179,7 +179,7 @@ index 516b977..7ca355c 100644
  
    constructor(
      storage: DurableObjectStorage,
-@@ -1360,6 +1375,153 @@
+@@ -1360,6 +1375,157 @@ export class EdgeSessionStore {
      }
    }
  
@@ -203,7 +203,9 @@ index 516b977..7ca355c 100644
 +   * are now kept warm in `harnessIngestHandles` across batches for the same
 +   * session (`planHarnessIngestResume`); see PATCHES.md for the measurement and
 +   * the accepted trade-off this creates (a native turn on the same session
-+   * races BUSY for up to the idle window, not just one batch's duration).
++   * races BUSY while the handle is warm — nominally the idle window, in
++   * reality until lazy eviction actually runs: see PATCHES.md
++   * «Принятый компромисс» for the honest boundary).
 +   */
 +  async appendHarnessEvents(
 +    id: SessionId,
@@ -223,11 +225,11 @@ index 516b977..7ca355c 100644
 +      Date.now(),
 +      HARNESS_INGEST_IDLE_MS,
 +    )
-+    const releaseStale = async (stale: HarnessIngestHandle): Promise<void> => {
++    const releaseStale = async (stale: HarnessIngestHandle, reason: string): Promise<void> => {
 +      try {
 +        await stale.handle.dispose()
 +      } catch (disposeError: unknown) {
-+        console.error('dsh-edge failed to release an idle ingested session.', disposeError)
++        console.error(`dsh-edge failed to release an ingested session (${reason}).`, disposeError)
 +      }
 +    }
 +    // Idle-expired entries of OTHER sessions release fire-and-forget — they
@@ -236,9 +238,11 @@ index 516b977..7ca355c 100644
 +    // else the reopen can hit BUSY for one drain cycle (ревью PR #1057).
 +    for (const stale of plan.evicted) {
 +      if (stale === plan.staleForId) continue
-+      void releaseStale(stale)
++      void releaseStale(stale, 'idle')
 +    }
-+    if (plan.staleForId !== undefined) await releaseStale(plan.staleForId)
++    if (plan.staleForId !== undefined) {
++      await releaseStale(plan.staleForId, plan.staleForIdReason ?? 'unknown')
++    }
 +    let entry = plan.entry
 +    // #1049 (ревью PR #1057, третий раунд, блокер 1): the warm-handle reuse
 +    // path below skips openAgentForTurn entirely for a repeat batch on the
@@ -325,7 +329,7 @@ index 516b977..7ca355c 100644
 +      // the next successful flush persists both copies silently.
 +      entry.inFlight = false
 +      if (this.harnessIngestHandles.get(id) === entry) this.harnessIngestHandles.delete(id)
-+      await releaseStale(entry)
++      await releaseStale(entry, 'failed batch')
 +      throw error
 +    }
 +  }
@@ -333,7 +337,7 @@ index 516b977..7ca355c 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1599,6 +1761,184 @@
+@@ -1599,6 +1765,199 @@ export class EdgeSessionStore {
    }
  }
  
@@ -351,8 +355,9 @@ index 516b977..7ca355c 100644
 +}
 +/** Idle window before a warm ingest handle is released (#1049): comfortably
 + *  above the runner drain interval (30s, #1048) so a normally-active job never
-+ *  gets evicted mid-stream, while bounding memory and the BUSY window a native
-+ *  turn on the same session would race against once the runner goes quiet. */
++ *  gets evicted mid-stream, while bounding memory and — once lazy eviction
++ *  actually runs — the BUSY window a native turn on the same session would
++ *  race against (honest boundary: PATCHES.md, «Принятый компромисс»). */
 +const HARNESS_INGEST_IDLE_MS = 120_000
 +
 +/** planHarnessIngestResume's result — named (not inline) so the function's
@@ -370,6 +375,10 @@ index 516b977..7ca355c 100644
 +   *  agent and gets BUSY for one drain cycle. Idle-expired entries of OTHER
 +   *  sessions are not in this race. */
 +  staleForId: HarnessIngestHandle | undefined
++  /** Why staleForId left the cache — the dispose-failure log names the real
++   *  cause instead of calling every eviction "idle" (алерт не гадает,
++   *  ревью PR #1057, чеклист). */
++  staleForIdReason: 'idle' | 'not-live-owner' | undefined
 +}
 +
 +/**
@@ -378,7 +387,10 @@ index 516b977..7ca355c 100644
 + * the full stored-log read. Evicts entries idle for at least idleMs (checked
 + * once per incoming call, no separate timer) and any entry `isLiveOwner`
 + * rejects (the cached handle stopped being the live session owner — archived,
-+ * forked, or a native turn raced in and won).
++ * forked, or a native turn raced in and won). Entries with a batch in flight
++ * are never idle-evicted: lastUsedMs is stamped at batch START, so a batch
++ * running longer than idleMs would look evictable by age while its handle is
++ * mid-append/flush (ревью PR #1057, четвёртый раунд, блокер).
 + */
 +export function planHarnessIngestResume(
 +  cache: Map<SessionId, HarnessIngestHandle>,
@@ -389,22 +401,29 @@ index 516b977..7ca355c 100644
 +): HarnessIngestResumePlan {
 +  const evicted: HarnessIngestHandle[] = []
 +  let staleForId: HarnessIngestHandle | undefined
++  let staleForIdReason: 'idle' | 'not-live-owner' | undefined
 +  for (const [cachedId, cached] of cache) {
 +    if (nowMs - cached.lastUsedMs < idleMs) continue
++    // A batch in flight is never "expired": lastUsedMs is stamped once at the
++    // START of its batch, so a batch running longer than idleMs looks evictable
++    // by age alone — disposing its handle here would land under that batch's
++    // still-running append/flush (ревью PR #1057, четвёртый раунд, блокер).
++    if (cached.inFlight) continue
 +    cache.delete(cachedId)
 +    evicted.push(cached)
 +    // Idle eviction of THIS id's own entry is the same race as the
 +    // isLiveOwner rejection below — same fix (ревью PR #1057, второй раунд).
-+    if (cachedId === id) staleForId = cached
++    if (cachedId === id) { staleForId = cached; staleForIdReason = 'idle' }
 +  }
 +  let entry = cache.get(id)
 +  if (entry !== undefined && !isLiveOwner(entry)) {
 +    cache.delete(id)
 +    evicted.push(entry)
 +    staleForId = entry
++    staleForIdReason = 'not-live-owner'
 +    entry = undefined
 +  }
-+  return { entry, evicted, staleForId }
++  return { entry, evicted, staleForId, staleForIdReason }
 +}
 +
 +/** Advance the cached baseTurn by the highest turn written this batch — no rescan of any prior event (#1049). */
