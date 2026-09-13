@@ -139,6 +139,7 @@ export function assertHarnessIngestWiring(patch = readFileSync(patchPath, 'utf8'
     [`this.harnessIngestHandles.set(id, entry)`, 'entry положен в кэш тёплых хэндлов (harnessIngestHandles.set)'],
     [`entry.baseTurn = advanceHarnessIngestBaseTurn(`, 'baseTurn двинут инкрементально (advanceHarnessIngestBaseTurn), а не пересканирован по истории'],
     [`await releaseStale(plan.staleForId)`, 'вытесненная запись ТЕКУЩЕЙ сессии диспоузится ДО холодного ресума (await releaseStale(plan.staleForId)) — иначе reopen того же id может получить BUSY на цикл (ревью PR #1057, чеклист)'],
+    [`this.harnessIngestHandles.delete(id)`, 'сбой между append и flush выселяет тёплый хэндл из кэша (catch { … harnessIngestHandles.delete(id) }) — иначе ретрай дрена того же батча дописывает его в ту же in-memory сессию второй раз, и следующий успешный flush персистит обе копии (ревью PR #1057, второй раунд, блокер 2)'],
   ]
   for (const [needle, message] of requirements) {
     if (!body.includes(needle)) {

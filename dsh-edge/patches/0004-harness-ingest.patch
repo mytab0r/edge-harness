@@ -136,7 +136,7 @@ index ce247c2..ab86d9d 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index 516b977..3cccaa1 100644
+index 516b977..7ca355c 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
 @@ -22,7 +22,7 @@ import type {
@@ -179,7 +179,7 @@ index 516b977..3cccaa1 100644
  
    constructor(
      storage: DurableObjectStorage,
-@@ -1360,6 +1375,118 @@ export class EdgeSessionStore {
+@@ -1360,6 +1375,134 @@ export class EdgeSessionStore {
      }
    }
  
@@ -273,32 +273,48 @@ index 516b977..3cccaa1 100644
 +    entry.lastUsedMs = Date.now()
 +    const session = entry.handle.agent.session
 +    const batchBaseTurn = entry.baseTurn
-+    let appended = 0
-+    const turnsWritten: number[] = []
-+    for (const raw of events) {
-+      const normalized = normalizeHarnessIngestEvent(raw, batchBaseTurn)
-+      // Runtime-dynamic event type: the generic append overload cannot express
-+      // it, so the call site carries the narrow cast (opts only for surface).
-+      // bind() обязателен: append читает приватное состояние сессии через this.
-+      const append = session.append.bind(session) as unknown as (
-+        type: string,
-+        data: unknown,
-+        opts?: { surfaceOp: 'append' },
-+      ) => SessionEvent
-+      append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
-+      appended += 1
-+      const turn = (normalized.data as { turn?: unknown }).turn
-+      if (typeof turn === 'number') turnsWritten.push(turn)
++    try {
++      let appended = 0
++      const turnsWritten: number[] = []
++      for (const raw of events) {
++        const normalized = normalizeHarnessIngestEvent(raw, batchBaseTurn)
++        // Runtime-dynamic event type: the generic append overload cannot express
++        // it, so the call site carries the narrow cast (opts only for surface).
++        // bind() обязателен: append читает приватное состояние сессии через this.
++        const append = session.append.bind(session) as unknown as (
++          type: string,
++          data: unknown,
++          opts?: { surfaceOp: 'append' },
++        ) => SessionEvent
++        append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
++        appended += 1
++        const turn = (normalized.data as { turn?: unknown }).turn
++        if (typeof turn === 'number') turnsWritten.push(turn)
++      }
++      entry.baseTurn = advanceHarnessIngestBaseTurn(batchBaseTurn, turnsWritten)
++      await sessions.flush(session)
++      return { appended, lastSeq: session.seq - 1 }
++    } catch (error) {
++      // #1049 (ревью PR #1057, второй раунд): pre-#1049 code disposed the
++      // handle unconditionally after every single batch, so a failed batch
++      // left no trace — the next cold resume rebuilt everything from the durably
++      // stored truth. The handle now survives warm across batches, so a
++      // failure here (a `rows_written`-capped flush, a malformed event mid
++      // batch) must evict this entry from the cache and dispose it before
++      // rethrowing — otherwise the runner's guaranteed retry of the exact
++      // same batch (dsh_edge_drain_spool: cursor only advances on an ACCEPTED
++      // batch) replays it into the same in-memory session a second time, and
++      // the next successful flush persists both copies silently.
++      if (this.harnessIngestHandles.get(id) === entry) this.harnessIngestHandles.delete(id)
++      await releaseStale(entry)
++      throw error
 +    }
-+    entry.baseTurn = advanceHarnessIngestBaseTurn(batchBaseTurn, turnsWritten)
-+    await sessions.flush(session)
-+    return { appended, lastSeq: session.seq - 1 }
 +  }
 +
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1599,6 +1726,169 @@ export class EdgeSessionStore {
+@@ -1599,6 +1742,179 @@ export class EdgeSessionStore {
    }
  }
  
@@ -321,7 +337,14 @@ index 516b977..3cccaa1 100644
 +interface HarnessIngestResumePlan {
 +  entry: HarnessIngestHandle | undefined
 +  evicted: HarnessIngestHandle[]
-+  /** The entry evicted from under THIS id (isLiveOwner rejected it): its dispose must COMPLETE before the caller cold-resumes the same id, else the reopen races the not-yet-released agent and gets BUSY for one drain cycle (ревью PR #1057). Idle-expired entries of other sessions are not in this race. */
++  /** The entry evicted from under THIS id — by idle timeout OR because
++   *  isLiveOwner rejected it: race membership is decided by id match, not by
++   *  the eviction REASON (ревью PR #1057, второй раунд — the first cut only
++   *  set this for the isLiveOwner branch, leaving the idle branch's own-id
++   *  eviction unmarked). Its dispose must COMPLETE before the caller
++   *  cold-resumes the same id, else the reopen races the not-yet-released
++   *  agent and gets BUSY for one drain cycle. Idle-expired entries of OTHER
++   *  sessions are not in this race. */
 +  staleForId: HarnessIngestHandle | undefined
 +}
 +
@@ -341,13 +364,16 @@ index 516b977..3cccaa1 100644
 +  idleMs: number,
 +): HarnessIngestResumePlan {
 +  const evicted: HarnessIngestHandle[] = []
++  let staleForId: HarnessIngestHandle | undefined
 +  for (const [cachedId, cached] of cache) {
 +    if (nowMs - cached.lastUsedMs < idleMs) continue
 +    cache.delete(cachedId)
 +    evicted.push(cached)
++    // Idle eviction of THIS id's own entry is the same race as the
++    // isLiveOwner rejection below — same fix (ревью PR #1057, второй раунд).
++    if (cachedId === id) staleForId = cached
 +  }
 +  let entry = cache.get(id)
-+  let staleForId: HarnessIngestHandle | undefined
 +  if (entry !== undefined && !isLiveOwner(entry)) {
 +    cache.delete(id)
 +    evicted.push(entry)

@@ -158,7 +158,14 @@ const WIRING_OK = [
   '      entry = { handle: await this.openAgentForTurn(id), baseTurn: 0, lastUsedMs: 0 }',
   '      this.harnessIngestHandles.set(id, entry)',
   '    }',
-  '    entry.baseTurn = advanceHarnessIngestBaseTurn(entry.baseTurn, turnsWritten)',
+  '    try {',
+  '      entry.baseTurn = advanceHarnessIngestBaseTurn(entry.baseTurn, turnsWritten)',
+  '      await sessions.flush(session)',
+  '    } catch (error) {',
+  '      if (this.harnessIngestHandles.get(id) === entry) this.harnessIngestHandles.delete(id)',
+  '      await releaseStale(entry)',
+  '      throw error',
+  '    }',
 ]
 
 test('assertHarnessIngestWiring — РЕАЛЬНЫЙ патч проходит структурную проверку проводки', () => {
@@ -205,6 +212,13 @@ test('МУТАЦИЯ: await-dispose вытесненной записи теку
   assert.throws(() => assertHarnessIngestWiring(withoutAwait), /releaseStale\(plan\.staleForId\)/)
 })
 
+test('МУТАЦИЯ: сбой между append и flush не выселяет тёплый хэндл из кэша — гвардия красная (блокер 2, ревью PR #1057, второй раунд)', () => {
+  const withoutEviction = fakePatchWithMethod(
+    WIRING_OK.filter(l => !l.includes('harnessIngestHandles.delete(id)')),
+  )
+  assert.throws(() => assertHarnessIngestWiring(withoutEviction), /harnessIngestHandles\.delete\(id\)/)
+})
+
 test('planHarnessIngestResume возвращает staleForId — вытесненная из-под этого id запись помечена для await-dispose', () => {
   const cache = new Map()
   const handle = fakeHandle('AGENT-1')
@@ -225,4 +239,27 @@ test('planHarnessIngestResume: idle-вытеснение ЧУЖИХ записе
   assert.equal(plan.evicted.length, 1, 'простроченная чужая запись вытеснена')
   assert.equal(plan.evicted[0].handle, old)
   assert.equal(plan.staleForId, undefined, 'чужая idle-запись не в гонке с этим вызовом — dispose fire-and-forget')
+})
+
+test('planHarnessIngestResume: idle-вытеснение СВОЕЙ записи попадает в staleForId (блокер 1, ревью PR #1057, второй раунд)', () => {
+  // До фикса staleForId выставлялся ТОЛЬКО в ветке isLiveOwner (тест выше,
+  // «вытесненная из-под этого id»); симметричный случай — та же запись
+  // вытеснена idle-таймаутом, не отказом isLiveOwner, — оставался
+  // непокрытым, и staleForId для него молча оставался undefined: caller
+  // диспоузил бы её fire-and-forget и тут же холодно ресумился тем же id,
+  // получая BUSY на цикл (ровно найденная ревьюером гонка).
+  const cache = new Map()
+  const handle = fakeHandle('AGENT-1')
+  const entry = { handle, baseTurn: 0, lastUsedMs: 1_000 }
+  cache.set('s1', entry)
+
+  const idleMs = 120_000
+  // isLiveOwner всегда true — единственная причина вытеснения здесь именно
+  // idle-таймаут, не протухшее владение (та ветка покрыта тестом выше).
+  const plan = planHarnessIngestResume(cache, 's1', () => true, 1_000 + idleMs + 1, idleMs)
+  assert.equal(plan.entry, undefined, 'простроченная запись этого же id не переиспользуется')
+  assert.equal(
+    plan.staleForId, entry,
+    'idle-вытеснение СВОЕЙ записи обязано попасть в staleForId так же, как isLiveOwner-отказ',
+  )
 })
