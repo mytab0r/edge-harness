@@ -1379,10 +1379,11 @@ def test_wasted_ai_review_flags_run_after_verdict_with_unchanged_fingerprint(mon
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    violations = ri.check_wasted_ai_review_runs(REPO, [pull])
-    assert len(violations) == 1
-    assert violations[0]["pr"] == 333
-    assert violations[0]["wasted_runs"][0]["run_id"] == 34193569472
+    result = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["pr"] == 333
+    assert result.violations[0]["wasted_runs"][0]["run_id"] == 34193569472
 
 
 def test_wasted_ai_review_silent_when_no_run_after_verdict(monkeypatch):
@@ -1399,7 +1400,7 @@ def test_wasted_ai_review_silent_when_no_run_after_verdict(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_silent_when_fingerprint_actually_changed(monkeypatch):
@@ -1416,7 +1417,7 @@ def test_wasted_ai_review_silent_when_fingerprint_actually_changed(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["review:ok", "ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_silent_without_final_verdict_label():
@@ -1425,7 +1426,7 @@ def test_wasted_ai_review_silent_without_final_verdict_label():
     # код полезет в comments без нужды).
     fake = FakeGh({})
     pull = open_pr(333, labels=["review:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
     assert fake.calls == []
 
 
@@ -1434,7 +1435,7 @@ def test_wasted_ai_review_silent_when_ai_failed_not_final(monkeypatch):
     # трогает такой PR вовсе, даже если отпечаток совпал бы.
     fake = FakeGh({})
     pull = open_pr(333, labels=["review:ok", "ai:failed"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
     assert fake.calls == []
 
 
@@ -1442,7 +1443,7 @@ def test_wasted_ai_review_silent_without_verdict_comment(monkeypatch):
     fake = FakeGh({"issues/333/comments": []})
     patch_gh(monkeypatch, fake)
     pull = open_pr(333, labels=["ai:ok"])
-    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == []
+    assert ri.check_wasted_ai_review_runs(REPO, [pull]) == ri.check_result.ok()
 
 
 def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
@@ -1459,6 +1460,36 @@ def test_wasted_ai_review_mutation_guard_missing_run_after_filter(monkeypatch):
     fake = FakeGh({"actions/workflows/ai-review.yml/runs": runs_response})
     found = ri.ai_review_runs_after(REPO, 333, "2026-09-08T06:30:00Z", fake)
     assert [r["run_id"] for r in found] == [2]
+
+
+def test_ai_review_runs_after_raises_on_unexpected_form():
+    # Находка issue #1096/#1109 (F7): раньше форма не по контракту (не dict,
+    # без ключа workflow_runs, значение под ключом не список) молча читалась
+    # как "прогонов нет" — теперь RuntimeError, вызывающая сторона
+    # (check_wasted_ai_review_runs) решает третий исход, не эта функция.
+    fake = FakeGh({"actions/workflows/ai-review.yml/runs": {"message": "rate limited"}})
+    with pytest.raises(RuntimeError):
+        ri.ai_review_runs_after(REPO, 333, "2026-09-08T06:30:00Z", fake)
+
+
+def test_wasted_ai_review_unknown_when_runs_history_unavailable(monkeypatch):
+    # Третий исход (issue #1096/#1109, F7): комментарий-вердикт и файлы PR
+    # прочитаны, но история прогонов ai-review.yml недоступна — раньше это
+    # молча читалось как "растраты нет" (ai_review_runs_after съедала форму
+    # ответа), теперь check_wasted_ai_review_runs обязан вернуть unknown(),
+    # не ok(), раз хоть один проверяемый PR не досмотрен до конца.
+    files = pr_files()
+    fp = ri.review_labels.diff_fingerprint(files)
+    fake = FakeGh({
+        "issues/333/comments": [ai_verdict_comment(333, fp, "2026-09-08T06:08:55Z")],
+        "pulls/333/files": files,
+        "actions/workflows/ai-review.yml/runs": RuntimeError("gh api: HTTP 502: Bad Gateway"),
+    })
+    patch_gh(monkeypatch, fake)
+    pull = open_pr(333, labels=["review:ok", "ai:ok"])
+    result = ri.check_wasted_ai_review_runs(REPO, [pull])
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert result.reason
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1628,12 +1659,13 @@ def test_recurring_worker_failure_flags_streak_with_same_cause(monkeypatch):
     monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
         103: SESSION_LACKS_ID_ERROR, 102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
     })))
-    violations = ri.check_recurring_worker_failure(REPO)
-    assert len(violations) == 1
-    assert violations[0]["streak"] == 3
-    assert violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
-    assert violations[0]["since"] == "2026-09-08T08:45:00Z"
-    assert violations[0]["until"] == "2026-09-09T00:00:00Z"
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["error_text"] == f"##[error]{SESSION_LACKS_ID_ERROR}"
+    assert result.violations[0]["since"] == "2026-09-08T08:45:00Z"
+    assert result.violations[0]["until"] == "2026-09-09T00:00:00Z"
 
 
 def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
@@ -1652,7 +1684,7 @@ def test_recurring_worker_failure_silent_below_threshold(monkeypatch):
     monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
         102: SESSION_LACKS_ID_ERROR, 101: SESSION_LACKS_ID_ERROR,
     })))
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
 
 
 def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypatch):
@@ -1675,7 +1707,7 @@ def test_recurring_worker_failure_silent_when_cause_changes_mid_streak(monkeypat
         102: SESSION_LACKS_ID_ERROR,
         101: "No such file or directory",  # другая, старая причина — обрывает серию
     })))
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
 
 
 def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
@@ -1690,8 +1722,22 @@ def test_recurring_worker_failure_silent_when_latest_run_is_green(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
     assert not any("actions/runs/3/jobs" in call or "actions/runs/2/jobs" in call for call in fake.calls)
+
+
+def test_recurring_worker_failure_unknown_when_runs_history_unavailable(monkeypatch):
+    # Третий исход (issue #1096/#1109): история прогонов worker.yml
+    # недоступна целиком (транспорт/квота) — раньше молча читалась как
+    # "серии нет" (`except RuntimeError: return []`), теперь unknown().
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": RuntimeError(
+            "gh api: HTTP 503: Service Unavailable"),
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert result.reason
 
 
 # ── Живая серия 2026-09-13 (issue найденный владельцем): голова списка ──────
@@ -1757,13 +1803,14 @@ def test_recurring_worker_failure_pending_head_does_not_hide_streak_behind_it(mo
         103658813654: OLLAMA2_MAX_TOKENS_ERROR.format(ref="e13e4d1a-90f0-c315-e438-9e21f5feae9d"),
         103651384804: OLLAMA2_MAX_TOKENS_ERROR.format(ref="bea56f62-51af-47b6-b57d-9b03d8871690"),
     })))
-    violations = ri.check_recurring_worker_failure(REPO)
-    assert len(violations) == 1
-    assert violations[0]["streak"] == 3
-    assert violations[0]["since"] == "2026-09-13T01:17:46Z"
-    assert violations[0]["until"] == "2026-09-13T04:26:35Z"
-    assert violations[0]["latest_run_url"] == f"https://github.com/{REPO}/actions/runs/34735752165"
-    assert violations[0]["pending_seen"] is True
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["since"] == "2026-09-13T01:17:46Z"
+    assert result.violations[0]["until"] == "2026-09-13T04:26:35Z"
+    assert result.violations[0]["latest_run_url"] == f"https://github.com/{REPO}/actions/runs/34735752165"
+    assert result.violations[0]["pending_seen"] is True
 
 
 def test_recurring_worker_failure_does_not_bridge_across_different_cause(monkeypatch):
@@ -1790,7 +1837,7 @@ def test_recurring_worker_failure_does_not_bridge_across_different_cause(monkeyp
         103676181082: CHAIN_EXHAUSTED_TIMEOUT_ERROR,
         103666759504: OLLAMA2_MAX_TOKENS_ERROR.format(ref="f5feae9d-e13e-4d1a-90f0-c315e4389e21"),
     })))
-    assert ri.check_recurring_worker_failure(REPO) == []
+    assert ri.check_recurring_worker_failure(REPO) == ri.check_result.ok()
     # Дотягиваться до третьего прогона незачем — расхождение отпечатка уже
     # обнаружено на втором; проверяем, что скан честно останавливается, а не
     # молча досматривает весь список без дела.
@@ -1818,10 +1865,11 @@ def test_recurring_worker_failure_skips_multiple_pending_runs_mid_streak(monkeyp
     monkeypatch.setattr(ri.pulse_guard, "subprocess", SimpleNamespace(run=fake_log_subprocess({
         204: SESSION_LACKS_ID_ERROR, 203: SESSION_LACKS_ID_ERROR, 202: SESSION_LACKS_ID_ERROR,
     })))
-    violations = ri.check_recurring_worker_failure(REPO)
-    assert len(violations) == 1
-    assert violations[0]["streak"] == 3
-    assert violations[0]["pending_seen"] is True
+    result = ri.check_recurring_worker_failure(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["streak"] == 3
+    assert result.violations[0]["pending_seen"] is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
