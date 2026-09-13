@@ -158,6 +158,16 @@ while IFS= read -r f; do
         # см. CHAIN выше в этом же файле).
         case "$content" in *"for model nemotron-3-ultra"*) continue ;; esac
       fi
+      if [ "$f" = "scripts/orchestra/test_repo_invariants.py" ]; then
+        # #1094: фикстура инварианта 10 (check_recurring_worker_failure)
+        # воспроизводит ДОСЛОВНУЮ прод-форму той же живой серии Ollama Cloud
+        # (прогоны worker.yml 34735752165/34732869856/34730173870, error_text
+        # снят gh api .../jobs/<id>/logs 2026-09-13) — тот же приём и та же
+        # причина исключения, что у dsh-provider-chain.smoke.sh (#1062) выше:
+        # не дефолт-провайдер класса #153, а тестовые данные для разбора
+        # last_error_log_line/failure_fingerprint.
+        case "$content" in *"for model nemotron-3-ultra"*) continue ;; esac
+      fi
       literal_hits="$literal_hits$f:$line
 "
     fi
