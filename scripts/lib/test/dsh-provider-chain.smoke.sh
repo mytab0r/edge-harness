@@ -17,6 +17,13 @@
 #     провайдера — сценарий 12 ниже доказывает, что это отличается от
 #     "silent" (#737, rc=1, тоже пустой stderr, но другая причина) текстом
 #     сообщения, не только решением «переключаемся».
+#   STREAM_CLOSED: SSE stream ended without [DONE]... прогон worker.yml
+#     2026-09-13T09:39Z (задача #1055/#1087, #1084) — GLM оборвал SSE-поток;
+#     тот же текст видели у OpenRouter-2 той же ночью (00:07Z) — не привязан
+#     к одному провайдеру, сценарий 17 ниже доказывает автопереход (#1084).
+#     Сценарий 18 доказывает перевёрнутое умолчание: НЕИЗВЕСТНЫЙ класс отказа
+#     (никакой явный признак не совпал) отныне тоже переключает, не стопорит
+#     цепочку (#1084) — стоп остаётся только за INVALID_API_KEY (сценарии 3/8).
 #
 # Запуск: bash scripts/lib/test/dsh-provider-chain.smoke.sh  (jq обязателен)
 set -euo pipefail
@@ -113,6 +120,18 @@ dsh() {
           # config/provider-usage.json нёс неверный max_output_tokens для
           # ЭТОЙ записи — дословная прод-форма Ollama Cloud.
           echo "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra" >&2
+          return 1 ;;
+        stream-closed)
+          # #1084, живой случай — прогон worker.yml 2026-09-13T09:39Z: GLM
+          # оборвал SSE-поток без терминального [DONE] — дословная прод-форма.
+          echo "dsh: STREAM_CLOSED: SSE stream ended without [DONE]" >&2
+          return 1 ;;
+        unknown-error)
+          # #1084: НИКАКОЙ явный признак не совпадает — представитель класса
+          # «новый провайдер, свой текст ошибки, которого ещё не видели».
+          # Раньше это стопорило цепочку целиком (общий стоп-класс), теперь —
+          # автопереход (перевёрнутое умолчание, см. dsh-ci.sh).
+          echo "dsh: TRANSPORT_HICCUP: upstream reset the connection mid-response" >&2
           return 1 ;;
         *)
           echo "::error::SMOKE: неизвестный режим $mode для $mode_var" >&2
@@ -426,4 +445,59 @@ OUT="$(cat "$LOG")"
   || fail "16) ошибка параметров запроса ОДНОГО провайдера не обязана останавливать цепочку: $OUT"
 echo "SMOKE(chain): 16) INVALID_REQUEST/max_tokens (наш конфиг неверен для этой записи) -> автопереход, не стоп-класс (#1062) — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062 зелёная"
+# ── 17) #1084, живой инцидент — прогон worker.yml 2026-09-13T09:39Z (задача
+# #1055/#1087): GLM (единственный реально отвечавший провайдер) оборвал
+# SSE-поток без терминального [DONE]. Раньше это НЕ совпадало ни с одним
+# явным признаком и падало в стоп-класс — цепочка останавливалась целиком.
+# STREAM_CLOSED теперь явный переключаемый класс, симметричный HTTP_404/
+# EMPTY_RESPONSE (сценарий 2 выше).
+reset_scenario
+SMOKE_MODE_primary_model="stream-closed"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log17.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "17) ожидался успех после STREAM_CLOSED у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "17) ожидался переход на SECONDARY при STREAM_CLOSED PRIMARY, получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "17) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы"
+[[ "$OUT" != *"класс НЕ переключаемый"* ]] \
+  || fail "17) STREAM_CLOSED — transient-обрыв SSE, не обязан останавливать цепочку: $OUT"
+echo "SMOKE(chain): 17) STREAM_CLOSED (обрыв SSE без [DONE]) -> автопереход, не стоп-класс (#1084) — ок"
+
+# ── 18) #1084: перевёрнутое умолчание — НЕИЗВЕСТНЫЙ класс отказа (никакой
+# явный признак не совпал, текст не INVALID_API_KEY) отныне ТОЖЕ переключает.
+# До этой правки этот же сценарий стопорил бы цепочку (общий стоп-класс по
+# умолчанию) — именно эта мутация и доказывает переворот: с прежним кодом
+# (return 1 в общем catch-all) DSH_CHAIN_PROVIDER остался бы пустым, а
+# DSH_CHAIN_TRIED — только "PRIMARY".
+reset_scenario
+SMOKE_MODE_primary_model="unknown-error"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log18.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" = "0" ] || fail "18) ожидался успех после нераспознанного класса у первого, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || fail "18) ожидался переход на SECONDARY при нераспознанном классе PRIMARY (перевёрнутое умолчание #1084), получено '$DSH_CHAIN_PROVIDER'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY, SECONDARY" ] || fail "18) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — оба провайдера обязаны быть опробованы"
+[[ "$OUT" == *"класс не распознан"* ]] || fail "18) сообщение обязано честно назвать «класс не распознан»: $OUT"
+[[ "$OUT" != *"класс НЕ переключаемый"* ]] \
+  || fail "18) нераспознанный класс не обязан останавливать цепочку (перевёрнутое умолчание #1084): $OUT"
+echo "SMOKE(chain): 18) нераспознанный класс отказа -> автопереход по умолчанию, не стоп (перевёрнутое умолчание #1084) — ок"
+
+# ── 19) Мутация обратного случая для сценария 18: INVALID_API_KEY остаётся
+# ЕДИНСТВЕННЫМ именованным стоп-классом даже после переворота умолчания —
+# доказывает, что переворот НЕ означает «переключаемся вообще всегда»
+# (сценарии 3/8 выше это же самое проверяют, дублируется здесь ради явной
+# смежности с 17/18 в отчёте прогона).
+reset_scenario
+SMOKE_MODE_primary_model="real-error"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log19.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" != "0" ] || fail "19) INVALID_API_KEY не должен был дать успех даже после переворота умолчания #1084"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "19) DSH_CHAIN_TRIED='$DSH_CHAIN_TRIED' — SECONDARY не должен был тронуться, INVALID_API_KEY остаётся стоп-классом"
+[[ "$OUT" == *"класс НЕ переключаемый"* ]] || fail "19) INVALID_API_KEY обязан остаться именованным стоп-классом после переворота умолчания (#1084): $OUT"
+echo "SMOKE(chain): 19) INVALID_API_KEY остаётся стоп-классом после переворота умолчания (#1084) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084 зелёная"
