@@ -224,13 +224,13 @@ from pulse_guard import (
     all_issue_comments,
     announce_write_mode,
     conveyor_gate,
+    edit_issue_comment,
     escalate,
     failure_watch,
     gh,
     heartbeat_check,
     independent_pulse_check,
     issue_marker_times,
-    issue_markers_any,
     merge_telegram_text,
     minutes_between,
     parse_time,
@@ -1848,14 +1848,28 @@ def _morde_login(opener: urllib.request.OpenerDirector) -> None:
         raise RuntimeError(f"логин в морду не удался: ожидали HTTP 303, получили {status}")
 
 
-def _morde_rpc(opener: urllib.request.OpenerDirector, method: str, payload: dict) -> dict:
-    """Мутирующий RPC морды (workspace.archiveSession и т.п.) — третий,
-    отдельный от gh()/subprocess транспорт, тот же класс прод-записи вне
-    GitHub Actions (2026-09-11): гейтится ТОЙ ЖЕ prod_writes_allowed, что и
-    gh()/send_telegram/_guard_raw_subprocess_write — второй копии решения не
-    заводим. Оба вызывающих (archive_runner_sessions) игнорируют возвращаемое
-    значение — `{}` безопасен как заглушка dry-run."""
-    if not _guard_raw_subprocess_write(f"POST /api/{method} (морда dsh-edge) payload={payload}"):
+def _morde_rpc(
+    opener: urllib.request.OpenerDirector, method: str, payload: dict, *, mutating: bool = True,
+) -> dict:
+    """RPC-конверт морды — третий, отдельный от gh()/subprocess транспорт.
+
+    `mutating=True` (умолчание, все вызывающие ДО #1085 — workspace.
+    archiveSession) — тот же класс прод-записи вне GitHub Actions
+    (2026-09-11): гейтится ТОЙ ЖЕ prod_writes_allowed, что и gh()/
+    send_telegram/_guard_raw_subprocess_write — второй копии решения не
+    заводим. Вызывающий (archive_runner_sessions) игнорирует возвращаемое
+    значение — `{}` безопасен как заглушка dry-run.
+
+    `mutating=False` (#1085, session.history — первый READ через этот
+    транспорт): гейт НЕ применяется вовсе — чтение не меняет состояние
+    морды, гейтить его тем же классом, что архивацию сессии, было бы
+    категориальной ошибкой. Находка ai-review PR #1089 (некритичное
+    замечание): _session_progress_tip раньше звал этот RPC с умолчанием
+    `mutating=True`, и вне CI получал `{}` из гейта — интерпретировал это
+    как «события сессии пусты» (чужая причина: путал «читать не пытались»
+    с «прочитали и там пусто»). READ обязан реально уйти в сеть везде, где
+    есть конфигурация, вне зависимости от CI/не-CI."""
+    if mutating and not _guard_raw_subprocess_write(f"POST /api/{method} (морда dsh-edge) payload={payload}"):
         return {}
     body = json.dumps({
         "type": "client-request",
@@ -2522,24 +2536,51 @@ WORKER_STALL_MINUTES = 295
 # промолчать все 120 минут целиком.
 # WORKER_SILENCE_MINUTES = 150 = 120 (легитимный потолок ОДНОЙ попытки,
 # DSH_TIMEOUT_SECS/60) + 30 мин запаса — заметно выше единичного легитимного
-# максимума, заметно ниже возрастного потолка (295): в худшем случае снижает
-# цену зависания почти вдвое (295 → 150 мин), не убивая ни одну попытку,
-# уложившуюся в свой собственный таймаут. Не подтверждённый остаточный риск
-# (тот же класс, что уже принят у WORKER_STALL_MINUTES выше): ВТОРАЯ попытка
-# подряд, тоже молчащая все 120 минут БЕЗ маркера смены провайдера между ними,
-# читалась бы как непрерывная тишина ≥150 мин и была бы убита раньше своего
-# естественного финала — сценарий не отличим от истинного зависания текущими
-# данными, и если он живой, это факт для пересчёта порога, не повод считать
-# признак сломанным заранее.
+# максимума, заметно ниже возрастного потолка (295). Не подтверждённый
+# остаточный риск (тот же класс, что уже принят у WORKER_STALL_MINUTES выше):
+# ВТОРАЯ попытка подряд, тоже молчащая все 120 минут БЕЗ маркера смены
+# провайдера между ними, читалась бы как непрерывная тишина ≥150 мин и была
+# бы убита раньше своего естественного финала — сценарий не отличим от
+# истинного зависания текущими данными, и если он живой, это факт для
+# пересчёта порога, не повод считать признак сломанным заранее.
+#
+# КРИТИЧНО (находка ai-review PR #1089, дважды): базовое наблюдение (первый
+# маркер по run_id) обязано появляться СРАЗУ, как только прогону есть с чем
+# сравнить (коррелированная задача найдена) — НЕ только начиная с возраста
+# WORKER_SILENCE_MINUTES. Ранняя версия гейтила саму ПРОВЕРКУ тишины
+# (`reap_stalled_worker_run`) возрастом ≥150 — значит первый маркер физически
+# не мог появиться раньше 150-й минуты, а тишина (маркер+150) не могла
+# сработать раньше 300-й — то есть НИКОГДА раньше возрастного потолка (295).
+# Симуляция ревьюера это подтвердила: возрастной нож бил на 295-й минуте в
+# каждом достижимом состоянии, тишинный — ни разу. Фикс: `reap_stalled_worker_
+# run` резолвит task_number и опрашивает сессию КАЖДЫЙ пульс с первого,
+# без возрастного гейта на саму проверку (гейт остаётся только на решение
+# «что считать признаком тишины» — сама разница seq между пульсами).
+#
+# Второе следствие того же разбора: приоритет между двумя ножами перевёрнут.
+# Раньше возраст вычислялся БЕЗУСЛОВНО первым и убивал прогон на 295-й минуте
+# даже при растущей сессии — прямое противоречие тексту задачи («растущий seq
+# — прогон жив, сколько бы он ни шёл, возраст не важен до стены GitHub»).
+# Теперь: пока признак тишины ДОСТУПЕН (сессия коррелирована и морда
+# отвечает) — решение принимает ОН один (растёт — жив без всякого потолка по
+# возрасту; не растёт WORKER_SILENCE_MINUTES — завис); возрастной потолок
+# применяется ТОЛЬКО когда признак тишины НЕДОСТУПЕН (задача не
+# коррелирована, морда/сеть/маркеры отказали) — честный фоллбэк на
+# WORKER_STALL_MINUTES, а не вторая, перебивающая первую проверка.
 WORKER_SILENCE_MINUTES = 150
 
 # Маркер-носитель состояния «последний увиденный seq сессии по этому run_id»
-# между пульсами (#1085) — комментарий в WATCHDOG_ISSUE, тот же приём, что
-# WIP_GATE_*/AI_REVIEW_*/CONFLICT_* маркеры уже используют (планировщик не
-# хранит файлового состояния между запусками). Пишется ТОЛЬКО когда seq
-# реально вырос или когда маркера для этого run_id ещё не было вовсе —
-# застрявший прогон не плодит комментарий на каждый пульс (#1085 п.3,
-# «цена чтения»), только сравнение с уже существующей записью.
+# между пульсами (#1085) — РОВНО ОДИН комментарий в WATCHDOG_ISSUE на run_id,
+# редактируемый на месте (edit_issue_comment/PATCH, тот же приём, что #1100
+# уже применяет для quota_alert.record_reading — без этого приёма каждый
+# растущий пульс писал бы НОВЫЙ комментарий, а с фиксом выше (проверка с
+# первого пульса, не с 150-й минуты) это означало бы комментарий в #120
+# каждые 15 минут всю жизнь КАЖДОГО активного прогона). Момент «последний
+# раз видели рост» — поле `updated_at` этого же комментария (GitHub меняет
+# его при PATCH; `created_at` при редактировании на месте не сдвигается —
+# использовать его для отсчёта тишины после первого же PATCH было бы
+# неверно, тишина считалась бы от рождения комментария, а не от последнего
+# подтверждённого роста).
 WORKER_PROGRESS_MARKER_PREFIX = "[прогресс воркера: run "
 
 
@@ -2570,7 +2611,9 @@ def _session_progress_tip(session_id: str) -> tuple[int | None, str | None]:
     try:
         opener = _morde_opener()
         _morde_login(opener)
-        value = _morde_rpc(opener, "session.history", {"sessionId": session_id, "maxMessages": 1})
+        value = _morde_rpc(
+            opener, "session.history", {"sessionId": session_id, "maxMessages": 1}, mutating=False,
+        )
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
         return None, str(error)
     events = value.get("events") if isinstance(value, dict) else None
@@ -2590,14 +2633,22 @@ def _worker_silence_reason(
 ) -> tuple[str | None, str | None]:
     """Признак тишины (#1085) для ОДНОГО прогона/задачи: сессия
     `harness-<task_number>` не пишет новых событий WORKER_SILENCE_MINUTES
-    подряд. Возвращает (reason, observation):
-      - `reason` не None → прогон признан зависшим по тишине (текст для
-        комментария/действия вызывающего);
+    подряд. Вызывается КАЖДЫЙ пульс с первого, где у прогона уже есть
+    коррелированная задача (см. reap_stalled_worker_run, находка ai-review
+    PR #1089) — без этого база появлялась бы только к возрасту
+    WORKER_SILENCE_MINUTES, и тишина не могла бы сработать раньше 2×порога,
+    то есть позже возрастного потолка.
+
+    Возвращает (reason, observation):
+      - `reason` не None → прогон признан зависшим по тишине;
       - `observation` не None → признак недоступен в этом пульсе (сеть,
-        логин, маркеры) — строка для отчёта, решение остаётся за возрастным
-        порогом (см. reap_stalled_worker_run).
-    Оба None — сессия жива (seq вырос либо это первое наблюдение за этим
-    run_id — базовая точка, сравнивать пока не с чем)."""
+        логин, маркеры, повреждённый маркер) — строка для отчёта, решение
+        остаётся за возрастным порогом (см. reap_stalled_worker_run).
+    Оба None → сессия ПОДТВЕРЖДЁННО жива (seq вырос либо это первое
+    наблюдение за этим run_id — базовая точка, сравнивать пока не с чем):
+    вызывающий обязан НЕ применять возрастной потолок в этом случае — растёт
+    сессия, растёт и допустимый возраст (до жёсткой стены GitHub, которую
+    контролирует не этот код, а timeout-minutes самого job'а)."""
     session_id = f"harness-{task_number}"
     seq, error = _session_progress_tip(session_id)
     if error is not None:
@@ -2607,27 +2658,40 @@ def _worker_silence_reason(
         )
     marker_prefix = f"{WORKER_PROGRESS_MARKER_PREFIX}{run_id} "
     try:
-        markers = issue_markers_any(repo, WATCHDOG_ISSUE, (WORKER_PROGRESS_MARKER_PREFIX,), max_pages=3)
+        comments = all_issue_comments(repo, WATCHDOG_ISSUE, max_pages=3)
     except RuntimeError as error:
         return None, (
             f"⚠️ маркеры прогресса воркера в #{WATCHDOG_ISSUE} не прочитаны ({error}) — "
             "решение по прогону остаётся на возрастном пороге"
         )
-    own = []
-    for ts, body in markers:
-        if not body.startswith(marker_prefix):
-            continue
-        match = re.search(r"seq=(\d+)\]", body)
-        if match is not None:
-            own.append((ts, int(match.group(1))))
-    if not own or seq > max(own, key=lambda pair: pair[0])[1]:
+    own = [comment for comment in comments if (comment.get("body") or "").startswith(marker_prefix)]
+    if not own:
         try:
             post_issue_comment(repo, WATCHDOG_ISSUE, f"{marker_prefix}seq={seq}]")
         except RuntimeError as error:
             return None, f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} не оставлен: {error}"
         return None, None
-    last_ts, _ = max(own, key=lambda pair: pair[0])
-    silence_minutes = minutes_between(last_ts, now)
+    # Один комментарий на run_id по конструкции (редактируется на месте, не
+    # плодится) — если их всё же несколько (гонка двух пульсов), берём
+    # СТАРШИЙ id как каноничный, не гадаем какой «правильный».
+    marker = max(own, key=lambda comment: comment.get("id", 0))
+    match = re.search(r"seq=(\d+)\]", marker.get("body") or "")
+    if match is None:
+        return None, (
+            f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} повреждён "
+            f"(seq не разобран из {marker.get('body')!r})"
+        )
+    marker_seq = int(match.group(1))
+    if seq > marker_seq:
+        try:
+            edit_issue_comment(repo, marker["id"], f"{marker_prefix}seq={seq}]")
+        except RuntimeError as error:
+            return None, f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} не обновлён: {error}"
+        return None, None
+    updated_raw = marker.get("updated_at") or marker.get("created_at")
+    if not updated_raw:
+        return None, f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} без updated_at/created_at"
+    silence_minutes = minutes_between(parse_time(updated_raw), now)
     if silence_minutes < WORKER_SILENCE_MINUTES:
         return None, None
     return (
@@ -2754,36 +2818,34 @@ def reap_stalled_worker_run(
     reap_stale/claim_task.collect_stale — иначе задача осталась бы занятой
     почти сутки после того, как сам факт зависания уже установлен.
 
-    Два независимых ножа, оба ведут к одному действию (отмена+релиз):
-      1. Возраст (WORKER_STALL_MINUTES) — прежний, честный, но медленный
-         потолок: не отличает «завис» от «редкая легитимная долгая работа»,
-         только гарантирует остановку ДО стены job'а.
-      2. Тишина сессии harness-<N> (WORKER_SILENCE_MINUTES, заметно ниже) —
-         быстрее и точнее: растущий seq — прогон жив сколько угодно долго,
-         неизменный seq WORKER_SILENCE_MINUTES подряд — завис независимо от
-         возраста. Проверяется ТОЛЬКО когда прогон уже старше
-         WORKER_SILENCE_MINUTES (моложе — тишина такой длины физически
-         невозможна, сетевой RPC и обход pool не нужны вовсе) и ТОЛЬКО когда
-         возрастной нож ещё не сработал сам (он дешевле — уже полученный
-         `run`, ни одного дополнительного вызова). Отказ признака тишины
-         (морда недоступна, конфигурации нет, маркеры не читаются) —
-         честная деградация: наблюдение в отчёте, решение остаётся на
-         возрастном пороге (AGENTS.md, «алерт не гадает»), не «завис»/не
-         «жив» вслепую.
+    Приоритет между двумя ножами (находка ai-review PR #1089, дважды —
+    первая разводка гейтила саму проверку тишины возрастом ≥150, из-за чего
+    тишина физически не могла сработать раньше 2×порога=300-й минуты, то
+    есть НИКОГДА раньше возрастного потолка 295; см. разбор у
+    WORKER_SILENCE_MINUTES выше):
+      1. Тишина сессии harness-<N> — ГЛАВНЫЙ нож, когда доступен. Задача
+         резолвится (_stalled_run_task_number) КАЖДЫЙ пульс с первого, не с
+         возраста ≥150: без коррелированной задачи проверять нечего, но сама
+         попытка коррелировать не гейтится возрастом. Пока признак доступен:
+         сессия растёт (или это первое наблюдение) → прогон жив, возрастной
+         потолок НЕ применяется вовсе, сколько бы прогон ни шёл (до жёсткой
+         стены GitHub, timeout-minutes самого job'а — её этот код не
+         контролирует и не обязан); сессия не растёт WORKER_SILENCE_MINUTES
+         подряд → завис, решение принято раньше возрастного потолка.
+      2. Возраст (WORKER_STALL_MINUTES) — ФОЛЛБЭК на случай, когда признак
+         тишины НЕДОСТУПЕН: задача не коррелирована (адресный прогон на PR
+         с уже открытым PR, либо аренда сгорела до следа), морда/сеть/
+         маркеры отказали. Честная деградация (AGENTS.md, «алерт не
+         гадает») — решение остаётся на прежнем, медленном, но надёжном
+         пороге, названном явно в тексте действия, а не молчаливым
+         предположением «жив».
 
     Задача, арендованная прогоном, определяется структурным признаком (не
     парсингом прозы, класс которого запрещён AGENTS.md): среди открытых
     незаблокированных назначенных задач без открытого PR (тот же критерий,
     что уже применяет reap_stale) берётся та, чьё событие timeline `assigned`
     не старше момента старта прогона — task.sh берёт аренду в первые секунды
-    job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы (_stalled_run_
-    task_number, общая для обоих ножей — сессии harness-<N> нужен тот же
-    номер, что и релизу). Совпадений может не быть (адресный прогон на
-    задачу с уже открытым PR — её reap_stale не тронул бы; либо аренда не
-    найдена вовсе) — тогда отмена прогона всё равно происходит (по
-    возрастному ножу), задача остаётся на обычном пути; по тишинному ножу
-    без task_number сессию проверить нечем — решение остаётся на
-    возрастном пороге."""
+    job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы."""
     observations: list[str] = []
     actions: list[str] = []
     run = _active_worker_run(repo)
@@ -2794,19 +2856,26 @@ def reap_stalled_worker_run(
     start = parse_time(started)
     age_minutes = minutes_between(start, now)
 
-    reason = (
-        f"{int(age_minutes)} мин без завершения, возраст, порог {WORKER_STALL_MINUTES} мин"
-        if _run_is_stalled(run, now) else None
-    )
-    task_number = None
-    if reason is not None or age_minutes >= WORKER_SILENCE_MINUTES:
-        task_number = _stalled_run_task_number(repo, pool, pulls, start)
-    if reason is None and task_number is not None:
+    task_number = _stalled_run_task_number(repo, pool, pulls, start)
+    reason = None
+    if task_number is not None:
         silence_reason, observation = _worker_silence_reason(repo, run_id, task_number, now)
         if observation is not None:
             observations.append(observation)
-        if silence_reason is not None:
+            if _run_is_stalled(run, now):
+                reason = (
+                    f"{int(age_minutes)} мин без завершения, возраст, порог "
+                    f"{WORKER_STALL_MINUTES} мин (признак тишины недоступен: {observation})"
+                )
+        elif silence_reason is not None:
             reason = silence_reason
+        # else: оба None — сессия подтверждённо жива, возрастной потолок не
+        # применяется (см. докстринг и WORKER_SILENCE_MINUTES выше).
+    elif _run_is_stalled(run, now):
+        reason = (
+            f"{int(age_minutes)} мин без завершения, возраст, порог {WORKER_STALL_MINUTES} мин "
+            "(задача не определена — тишину проверить нечем)"
+        )
     if reason is None:
         return observations, actions
 

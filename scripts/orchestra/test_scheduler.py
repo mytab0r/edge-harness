@@ -469,6 +469,41 @@ def test_morde_rpc_dry_run_outside_ci_never_opens_connection(monkeypatch):
     assert result == {}
 
 
+def test_morde_rpc_non_mutating_reads_even_outside_ci(monkeypatch):
+    # Некритичное замечание ai-review PR #1089: session.history — ЧТЕНИЕ, не
+    # мутация, и не обязано подчиняться тому же гейту, что workspace.
+    # archiveSession, иначе _session_progress_tip вне CI получал бы `{}` и
+    # трактовал бы «читать не пытались» как «события сессии пусты» — чужую
+    # причину. `mutating=False` обязан реально уйти в сеть даже вне CI.
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv(sch.ALLOW_PROD_WRITES_ENV, raising=False)
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"type":"server-response","rpcId":"x","result":{"ok":true,"value":{"events":[]}}}'
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            captured["called"] = True
+            return _FakeResp()
+
+    result = sch._morde_rpc(
+        _FakeOpener(), "session.history", {"sessionId": "harness-5", "maxMessages": 1}, mutating=False,
+    )
+    assert captured.get("called") is True
+    assert result == {"events": []}
+
+
 # ── after_merge/accept_merged_tasks/unhealthy_pulls: проводка заметок (#480) ─────
 
 
@@ -5379,6 +5414,13 @@ def test_reap_stalled_worker_run_cancels_and_releases_correlated_task(monkeypatc
     # взят так, чтобы возраст прогона (298 мин) уверенно перевалил порог
     # (295 мин с #877/#1067: легитимный worst case цепочки 2×120+30=270 мин +
     # запас), без гонки со временем прогона теста.
+    #
+    # DSH_EDGE_URL пуст (#1085): признак тишины недоступен без конфигурации —
+    # решение падает на возрастной порог (фоллбэк), см. докстринг
+    # reap_stalled_worker_run. Явный monkeypatch, не ambient-окружение —
+    # детерминированно независимо от того, что реально экспортировано в CI.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "")
     now = utc(2026, 9, 9, 15, 20, 0)
     run = workflow_run(34339807907, "in_progress")
     run["run_started_at"] = "2026-09-09T10:21:51Z"
@@ -5397,7 +5439,7 @@ def test_reap_stalled_worker_run_cancels_and_releases_correlated_task(monkeypatc
 
     observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[task], pulls=[])
 
-    assert observations == []
+    assert len(observations) == 1 and "недоступен" in observations[0]  # признак тишины: нет конфигурации
     assert task["assignees"] == []  # мутация pool сразу, тот же приём, что reap_stale
     assert any(c.startswith("-X POST") and "runs/34339807907/cancel" in c for c in fake.calls)
     assert any(c.startswith("-X POST") and "issues/815/comments" in c for c in fake.calls)
@@ -5481,9 +5523,10 @@ def test_session_progress_tip_reads_max_seq_from_session_history(monkeypatch):
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     captured = {}
 
-    def fake_rpc(opener, method, payload):
+    def fake_rpc(opener, method, payload, *, mutating=True):
         captured["method"] = method
         captured["payload"] = payload
+        captured["mutating"] = mutating
         return _session_history_response([40, 42, 41])  # не по возрастанию — max, не последний
 
     monkeypatch.setattr(sch, "_morde_rpc", fake_rpc)
@@ -5492,6 +5535,7 @@ def test_session_progress_tip_reads_max_seq_from_session_history(monkeypatch):
     assert seq == 42
     assert captured["method"] == "session.history"
     assert captured["payload"] == {"sessionId": "harness-1085", "maxMessages": 1}
+    assert captured["mutating"] is False  # чтение, не гейтится write-guard'ом (#1085)
 
 
 def test_session_progress_tip_no_config_is_unavailable(monkeypatch):
@@ -5524,7 +5568,8 @@ def test_session_progress_tip_session_not_found_is_unavailable(monkeypatch):
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
-        lambda opener, method, payload: (_ for _ in ()).throw(RuntimeError("session-not-found: нет такой сессии")))
+        lambda opener, method, payload, **kw: (_ for _ in ()).throw(
+            RuntimeError("session-not-found: нет такой сессии")))
     seq, error = sch._session_progress_tip("harness-1085")
     assert seq is None
     assert "session-not-found" in error
@@ -5534,7 +5579,7 @@ def test_session_progress_tip_empty_events_is_unavailable(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
-    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: {"events": [], "hasMore": False})
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload, **kw: {"events": [], "hasMore": False})
     seq, error = sch._session_progress_tip("harness-1085")
     assert seq is None
     assert "пусты" in error
@@ -5559,11 +5604,15 @@ def test_worker_silence_reason_first_observation_posts_baseline_marker(monkeypat
 
 
 def test_worker_silence_reason_seq_growth_is_not_stalled_and_updates_marker(monkeypatch):
+    # Рост seq редактирует ОДИН существующий маркер-комментарий на месте
+    # (edit_issue_comment/PATCH, тот же приём, что #1100 уже применяет для
+    # quota_alert — не плодит новую историю в WATCHDOG_ISSUE на каждый пульс
+    # растущей сессии, находка ai-review PR #1089, некритичное замечание).
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (42, None))
     fake = FakeGh({
-        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "-X PATCH repos/mytab0r/edge-harness/issues/comments/555": None,
         "issues/120/comments?per_page=100": [
-            {"created_at": "2026-09-13T05:30:00Z",
+            {"id": 555, "created_at": "2026-09-13T05:30:00Z", "updated_at": "2026-09-13T05:30:00Z",
              "body": "[прогресс воркера: run 999 seq=10]"},
         ],
         "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
@@ -5572,7 +5621,8 @@ def test_worker_silence_reason_seq_growth_is_not_stalled_and_updates_marker(monk
     reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
     assert reason is None
     assert observation is None
-    assert any(c.startswith("-X POST") and "issues/120/comments" in c for c in fake.calls)
+    assert any(c.startswith("-X PATCH") and "issues/comments/555" in c for c in fake.calls)
+    assert not any(c.startswith("-X POST") and "issues/120/comments" in c for c in fake.calls)
 
 
 def test_worker_silence_reason_unchanged_seq_under_threshold_is_not_stalled(monkeypatch):
@@ -5680,13 +5730,9 @@ def test_reap_stalled_worker_run_growing_session_is_not_reaped_before_age_thresh
         "issues/1085/timeline?per_page=100": [
             {"event": "assigned", "created_at": "2026-09-13T05:00:30Z"},
         ],
-        # Порядок важен (см. комментарий в test_worker_silence_reason_first_
-        # observation_posts_baseline_marker выше): POST и страница ДО голого
-        # "issues/120" метаданных (#1100), иначе короткий фрагмент перехватит
-        # оба более специфичных вызова как подстроку.
-        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "-X PATCH repos/mytab0r/edge-harness/issues/comments/777": None,
         "issues/120/comments?per_page=100": [
-            {"created_at": "2026-09-13T05:20:00Z",
+            {"id": 777, "created_at": "2026-09-13T05:20:00Z", "updated_at": "2026-09-13T05:20:00Z",
              "body": "[прогресс воркера: run 34739313568 seq=7]"},
         ],
         "repos/mytab0r/edge-harness/issues/120": {"comments": 1},
@@ -5701,6 +5747,78 @@ def test_reap_stalled_worker_run_growing_session_is_not_reaped_before_age_thresh
     assert actions == []
     assert task["assignees"] != []
     assert not any("cancel" in c for c in fake.calls)
+
+
+def test_reap_stalled_worker_run_growing_session_survives_past_age_ceiling(monkeypatch):
+    # Находка ai-review PR #1089 (блокер №2): в старой разводке возрастной
+    # `reason` вычислялся БЕЗУСЛОВНО до всякого обращения к сессии, поэтому
+    # растущая сессия НЕ спасала прогон старше WORKER_STALL_MINUTES (295) —
+    # прямое противоречие тексту задачи («растёт seq — жив, сколько бы ни
+    # шёл, возраст не важен до стены GitHub»). Возраст здесь — 310 мин,
+    # ЗАВЕДОМО старше возрастного потолка: старая разводка убила бы прогон
+    # здесь безусловно; мутация (верни `reason = ... if _run_is_stalled(...)
+    # else None` вычисленным ДО ветки по task_number) красит этот тест.
+    now = utc(2026, 9, 13, 8, 0, 0)
+    run = workflow_run(34739313568, "in_progress")
+    run["run_started_at"] = "2026-09-13T02:50:00Z"  # возраст 310 мин > порог 295
+    task = issue(1085, assignees=("mytab0r",))
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "issues/1085/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-13T02:50:30Z"},
+        ],
+        "-X PATCH repos/mytab0r/edge-harness/issues/comments/888": None,
+        "issues/120/comments?per_page=100": [
+            {"id": 888, "created_at": "2026-09-13T07:55:00Z", "updated_at": "2026-09-13T07:55:00Z",
+             "body": "[прогресс воркера: run 34739313568 seq=100]"},
+        ],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 1},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (140, None))  # выросло с 100
+    monkeypatch.setattr(sch.claim_task, "release_full",
+                         lambda *a: pytest.fail("сессия жива (seq вырос) — релиз не должен вызываться "
+                                                 "даже при возрасте выше возрастного потолка"))
+
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[task], pulls=[])
+
+    assert actions == []
+    assert task["assignees"] != []
+    assert not any("cancel" in c for c in fake.calls)
+
+
+def test_reap_stalled_worker_run_writes_baseline_marker_from_early_pulse(monkeypatch):
+    # Находка ai-review PR #1089 (блокер №1): база (первый маркер) обязана
+    # появляться СРАЗУ, как только есть коррелированная задача — НЕ только
+    # с возраста WORKER_SILENCE_MINUTES (150). Возраст здесь — 5 минут,
+    # заведомо ниже старого возрастного гейта на саму проверку; старая
+    # разводка вообще не пыталась бы коррелировать задачу и писать маркер
+    # на этом возрасте (см. снятый гейт `age_minutes >= WORKER_SILENCE_
+    # MINUTES` в реап-функции) — мутация (верни этот гейт) красит тест.
+    now = utc(2026, 9, 13, 8, 0, 0)
+    run = workflow_run(34739313568, "in_progress")
+    run["run_started_at"] = "2026-09-13T07:55:00Z"  # возраст 5 мин
+    task = issue(1085, assignees=("mytab0r",))
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "issues/1085/timeline?per_page=100": [
+            {"event": "assigned", "created_at": "2026-09-13T07:55:05Z"},
+        ],
+        "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
+        "issues/120/comments?per_page=100": [],
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 0},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (1, None))
+
+    observations, actions = sch.reap_stalled_worker_run(REPO, now, pool=[task], pulls=[])
+
+    assert actions == []  # прогону 5 минут — не завис, но база уже записана
+    assert task["assignees"] != []
+    assert any(
+        c.startswith("-X POST") and "issues/120/comments" in c and "seq=1" in c
+        for c in fake.calls
+    ), "базовый маркер обязан появиться уже на 5-й минуте, не ждать 150-й"
 
 
 # ── dispatch_worker при закрытом WIP-гейте (#464, критическая находка ревью
