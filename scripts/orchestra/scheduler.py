@@ -828,6 +828,14 @@ def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int
     dispatch_conflict_rework — ниже эта же величина участвует в решении на
     равных с worker_runs_active).
 
+    Инфра-отказ засчитанного прогона («устойчивый инфра-отказ») попытку НЕ
+    выкидывает и этот счётчик не гасит: отметка git-шага уже стоит, прогон
+    честно потратил попытку, даже если упал ПОСЛЕ git-шага (сеть/push/деплой
+    морды). Повтор после такого отказа нового бюджета не тратит
+    (dispatch_conflict_rework, ветка FAILURE_CONCLUSIONS), а устойчиво гибнущий
+    на инфраструктуре диспатч останавливает ОБЩИЙ счётчик красных прогонов —
+    conveyor_gate (#120), не здесь: второй тормоз того же класса не заводится.
+
     Сброс бюджета (issue #822, авария #794): CONFLICT_BUDGET_RESET_MARKER в
     комментариях той же ЗАДАЧИ (второй канал чтения не заводится — тот же
     all_issue_comments(task_number), что уже читается ниже) сдвигает границу
@@ -1053,10 +1061,21 @@ def dispatch_conflict_rework(
                 # докстринг модуля, и это тот же самый дорогой job по квоте
                 # GitHub API, что уже ограничивает rate_guard.py, #454).
                 if run_conclusion == "success":
+                    # Второй заход этого же правила (находка ai-ревью #1053 к
+                    # этому же PR): первая формулировка «ребейз не разрешил
+                    # конфликт» снова выдавала диагноз за факт. Из двух
+                    # известных фактов (прогон успешен = ребейз дошёл до новых
+                    # коммитов; mergeable_state всё ещё dirty) причина НЕ
+                    # выводится: конфликт мог остаться, а мог быть разрешён —
+                    # и main снова уйти вперёд уже после прогона (~55 мержей/
+                    # сутки), либо mergeable просто ещё не пересчитан после
+                    # пуша. Честный пробел назван прямо, а не угадайкой.
                     reason = (
                         f"последний прогон worker.yml по этой задаче завершился с "
-                        f"conclusion={run_conclusion!r} (успешно), но PR остаётся dirty — "
-                        "ребейз не разрешил конфликт"
+                        f"conclusion={run_conclusion!r} (успешно), но mergeable_state "
+                        "всё ещё dirty — почему, отсюда не различить: ребейз мог не "
+                        "разрешить конфликт, а мог разрешить, и main снова уйти "
+                        "вперёд уже после него"
                     )
                 elif run_conclusion is None:
                     reason = (
@@ -2106,8 +2125,44 @@ def _record_merge_session_hard_failure_facts(lines: list[str]) -> None:
 
 
 def reset_merge_session_hard_failure_facts() -> None:
-    """Граница между прогонами/тестами — вызывается main() перед merge_loop."""
+    """Граница между прогонами/тестами — вызывается main() перед ПЕРВЫМ
+    накопителем фактов этого прогона (unhealthy_pulls, затем after_merge
+    внутри merge_loop)."""
     _MERGE_SESSION_HARD_FAILURE_FACTS.clear()
+
+
+# Адрес sweep-скрипта в дереве ЭТОГО прогона — модульная константа ради
+# теста (monkeypatch на несуществующий путь проверяет обе ветки газа).
+_SESSION_ORPHAN_SWEEP_PATH = Path(__file__).resolve().parent / "session_orphan_sweep.py"
+
+
+def _orphan_sweep_gas_text() -> str:
+    """Газ алерта жёсткого сбоя архива/заметок — периодический sweep
+    осиротевших сессий (issue #940). Его статус («слит или нет») код
+    определяет САМ по дереву ЭТОГО прогона, не перекладывая сверку на
+    получателя Telegram-алерта (находка ai-ревью #1053: у того нет `gh` под
+    рукой — «Алерт не гадает», AGENTS.md). orchestra гоняет scheduler.py из
+    чекаута main; скрипт sweep и его шаг в orchestra.yml приезжают одним PR
+    (#944), поэтому наличие скрипта рядом с scheduler.py — факт «sweep в
+    main». Обе ветки называют газ с адресом; ветка «ещё нет» честно называет
+    и условие, при котором газ появится (слияние #944), — не тормоз без
+    газа, а объявленное состояние ожидания слияния."""
+    if _SESSION_ORPHAN_SWEEP_PATH.exists():
+        return (
+            "Газ: периодический sweep осиротевших сессий (issue #940, "
+            "scripts/orchestra/session_orphan_sweep.py) уже в коде этого прогона — "
+            "перечисляет ВСЕ сессии морды и архивирует по статусу задачи (закрыта → "
+            "сирота), не завися от причины ЭТОГО конкретного сбоя; следующий его "
+            "периодический прогон уберёт сироту сам."
+        )
+    return (
+        "Газ: сессия-сирота сама из списка активных не исчезнет, а автоматической "
+        "уборки осиротевших сессий сейчас НЕТ — периодический sweep (issue #940, "
+        "scripts/orchestra/session_orphan_sweep.py, PR #944) ещё не в main. До его "
+        "слияния сироту убирает только ручной workspace.archiveSession через RPC "
+        "морды; после слияния газ включается сам — sweep убирает сироту по статусу "
+        "задачи (закрыта → сирота), не завися от причины ЭТОГО конкретного сбоя."
+    )
 
 
 def merge_session_hard_failure_alert_text(
@@ -2125,10 +2180,9 @@ def merge_session_hard_failure_alert_text(
     _MERGE_SESSION_HARD_FAILURE_FACTS (см. докстринг сбора выше) и НАЗВАННЫЙ
     газ: периодический sweep осиротевших сессий (issue #940,
     scripts/orchestra/session_orphan_sweep.py, PR #944) читает статус ЗАДАЧИ
-    и не зависит от причины конкретно ЭТОГО сбоя архива — если #944 уже
-    слит, следующий его прогон уберёт сироту сам; если ещё нет, честно
-    сказано, что автоматической уборки этого класса пока нет (не «тормоз без
-    газа» ложью, а объявленное состояние ожидания слияния)."""
+    и не зависит от причины конкретно ЭТОГО сбоя архива — статус sweep
+    («слит или нет») код определяет сам (_orphan_sweep_gas_text), а не
+    предлагает получателю сверить что-то вручную."""
     broken = []
     if archive_hard_failure:
         facts = "\n".join(_MERGE_SESSION_HARD_FAILURE_FACTS) or (
@@ -2137,14 +2191,7 @@ def merge_session_hard_failure_alert_text(
         broken.append(
             "После мержа PR архивация сессии раннера (или дозапись заметки-итога) в "
             f"морде dsh-edge не удалась. Мерж не откатывается. Факт:\n{facts}\n"
-            "Газ: сессия сама по себе не пропадает из списка активных этим прогоном, но "
-            "периодический sweep осиротевших сессий (issue #940, "
-            "scripts/orchestra/session_orphan_sweep.py, PR #944 — сверь `gh pr view 944 "
-            "--json state,mergedAt`) перечисляет ВСЕ сессии морды и архивирует по статусу "
-            "задачи (закрыта → сирота), не завися от причины ЭТОГО конкретного сбоя — "
-            "если #944 уже слит, следующий его периодический прогон уберёт сироту сам; "
-            "если ещё нет — до слияния автоматической уборки этого класса нет, нужен "
-            "ручной workspace.archiveSession через RPC морды."
+            + _orphan_sweep_gas_text()
         )
     if stall_hard_failure:
         stall_facts = "\n".join(stall_lines) or "причина не сохранена этим прогоном"
@@ -4122,7 +4169,7 @@ def pr_is_unhealthy(repo: str, pull: dict) -> str | None:
     return None
 
 
-def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[dict]) -> list[str]:
+def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[dict]) -> tuple[list[str], bool]:
     """pool — тот же снимок open_task_issues(repo), что уже прочитан для
     reap_stale выше (#443, см. её докстринг о причинах одного снимка на
     прогон): reap_stale к этому моменту уже могла обнулить assignees части
@@ -4138,7 +4185,17 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
     случай 2026-09-04: тело PR #181 упомянуло #90, и #90 дважды лишилась
     аренды — PR #181 при этом был чужой, его собственная задача из имени
     ветки была #179). Здесь шире — вреднее: PR без agent-ветки нужной формы
-    не сопоставляется ни с одной задачей вовсе, «наверное эта» не выбираем."""
+    не сопоставляется ни с одной задачей вовсе, «наверное эта» не выбираем.
+
+    Возвращает (строки отчёта, был_ли_жёсткий_сбой заметок) — тот же контракт,
+    что archive_runner_sessions/append_session_notes. Жёсткий сбой дозаписи
+    заметок на этом пути раньше ВЫБРАСЫВАЛСЯ: 🚨-строка жила только в отчёте
+    прогона (зелёного), Telegram молчал — «сигнал есть, но его никто не
+    увидит» (находка ai-ревью #1053, тот же класс, что этот PR закрывает для
+    after_merge/accept_merged_tasks). Теперь факт копится в
+    _MERGE_SESSION_HARD_FAILURE_FACTS (тот же список, не второй), а флаг
+    main() OR-ит в archive_hard_failure — общий финальный алерт и красный код,
+    второй механизм не заводится."""
     lines = []
     # Заметки-итоги в сессии раннера (#480) — один логин на весь обход, см.
     # append_session_notes.
@@ -4186,9 +4243,12 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
             session_notes.append(
                 (number, f"♻️ Задача #{number} возвращена в пул: PR #{pull['number']} нездоров ({reason})."))
             break  # одной причины на задачу достаточно — не дублируем комментарии
-    note_lines, _note_hard_failure = append_session_notes(session_notes)
+    note_lines, note_hard_failure = append_session_notes(session_notes)
+    # Факт — в общий список финального алерта (см. докстринг выше); строки —
+    # в отчёт прогона, как и раньше.
+    _record_merge_session_hard_failure_facts(note_lines)
     lines += note_lines
-    return lines
+    return lines, note_hard_failure
 
 
 # ── issue #269: PR полностью готов, а слияния не произошло — газ обязан гореть ──
@@ -5511,18 +5571,26 @@ def main() -> int:
     # повторное чтение open_pulls(repo) здесь было чистой тратой: состояние
     # PR не могло измениться со времени снимка выше.
     conflict_lines = mark_conflicts(repo, pulls)
+    # Граница фактов жёсткого сбоя архива/заметки сессии раннера этого
+    # прогона (см. докстринг _MERGE_SESSION_HARD_FAILURE_FACTS выше) —
+    # сбрасывается ПЕРЕД накопителями этого прогона (unhealthy_pulls ниже и
+    # after_merge внутри merge_loop), не между ними: между вызовами main()
+    # список не должен копить факты чужого прогона (важно для тестов,
+    # вызывающих main() несколько раз в одном процессе). Раньше сброс стоял
+    # после unhealthy_pulls — с появлением у неё собственных фактов (находка
+    # ai-ревью #1053) он обязан идти раньше ПЕРВОГО из них.
+    reset_merge_session_hard_failure_facts()
     # #196, поведение 2: нездоровый PR возвращает задачу в пул ДО очереди
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
-    unhealthy_lines = unhealthy_pulls(repo, now, pulls, pool=pool)
-    # Граница фактов жёсткого сбоя архива/заметки сессии раннера этого
-    # прогона (см. докстринг _MERGE_SESSION_HARD_FAILURE_FACTS выше) —
-    # сбрасывается ПЕРЕД единственным местом, которое их копит (after_merge
-    # внутри merge_loop), не после: между вызовами main() список не должен
-    # копить факты чужого прогона (важно для тестов, вызывающих main()
-    # несколько раз в одном процессе).
-    reset_merge_session_hard_failure_facts()
+    unhealthy_lines, unhealthy_note_hard_failure = unhealthy_pulls(repo, now, pulls, pool=pool)
     merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
+    # Жёсткий сбой заметок из unhealthy_pulls — тот же класс («дозапись
+    # заметки-итога сломана»), тот же канал: OR-ится в archive_hard_failure
+    # ровно как after_merge OR-ит свой note_hard_failure, — общий финальный
+    # Telegram-алерт и красный код, второй механизм не заводится (находка
+    # ai-ревью #1053).
+    archive_hard_failure = archive_hard_failure or unhealthy_note_hard_failure
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
     # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
     # вернул актуальный список открытых PR (#443): если он что-то слил или

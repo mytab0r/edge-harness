@@ -602,19 +602,37 @@ def test_after_merge_records_hard_failure_fact_for_final_alert(monkeypatch):
     assert sch._MERGE_SESSION_HARD_FAILURE_FACTS == [fact]
 
 
-def test_merge_session_hard_failure_alert_text_names_facts_and_gas():
+def test_merge_session_hard_failure_alert_text_names_facts_and_gas(monkeypatch, tmp_path):
     # "Алерт не гадает" (AGENTS.md): текст обязан нести дословный факт и
     # НАЗВАННЫЙ газ (issue #940 / PR #944), не «см. отчёт этого прогона
     # orchestra выше», на который у получателя Telegram-алерта нет доступа.
+    # Статус sweep («слит или нет») код определяет САМ (находка ai-ревью
+    # #1053: «сверь `gh pr view 944`» перекладывала работу на получателя, у
+    # которого нет gh под рукой) — проверяем ОБЕ ветки мутацией пути.
     sch.reset_merge_session_hard_failure_facts()
     fact = "🚨 #91: сессия harness-91 не заархивирована (возможность сломана): RPC boom"
     sch._MERGE_SESSION_HARD_FAILURE_FACTS.append(fact)
 
-    text = sch.merge_session_hard_failure_alert_text(True, False, [])
+    # Ветка «sweep ещё не в main»: газ назван с адресом и условием появления.
+    monkeypatch.setattr(sch, "_SESSION_ORPHAN_SWEEP_PATH", tmp_path / "session_orphan_sweep.py")
+    text_absent = sch.merge_session_hard_failure_alert_text(True, False, [])
+    assert fact in text_absent  # дословный факт, не пересказ
+    assert "см. отчёт этого прогона orchestra выше" not in text_absent  # старая ложь про доступный лог
+    assert "#944" in text_absent and "session_orphan_sweep" in text_absent  # назван газ с адресом
+    assert "сверь" not in text_absent  # сверка не перекладывается на получателя
+    assert "workspace.archiveSession" in text_absent  # назван газ ДО слияния #944
 
-    assert fact in text  # дословный факт, не пересказ
-    assert "см. отчёт этого прогона orchestra выше" not in text  # старая ложь про доступный лог
-    assert "#944" in text and "session_orphan_sweep" in text  # назван газ с адресом
+    # Ветка «sweep уже в main» (#944 слит): факт определён кодом, не просьба.
+    sweep_file = tmp_path / "session_orphan_sweep.py"
+    sweep_file.write_text("# sweep\n", encoding="utf-8")
+    monkeypatch.setattr(sch, "_SESSION_ORPHAN_SWEEP_PATH", sweep_file)
+    text_present = sch.merge_session_hard_failure_alert_text(True, False, [])
+    assert fact in text_present
+    assert "session_orphan_sweep" in text_present
+    assert "уже в коде этого прогона" in text_present  # факт, а не «сверь сам»
+    assert "сверь" not in text_present
+    # Мутация: верни в текст «сверь `gh pr view 944 …`» — оба assert'а про
+    # «сверь» выше покраснеют.
 
 
 def test_merge_session_hard_failure_alert_text_stall_names_own_fact(monkeypatch):
@@ -716,7 +734,7 @@ def test_unhealthy_pulls_appends_session_note(monkeypatch):
         "-X POST repos/o/r/issues/50/comments": {},
         "task-50": "🔓 замок task-50 снят",
     }))
-    lines = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert any("возвращена в пул" in line for line in lines)
     assert captured["notes"] == [(50, f"♻️ Задача #50 возвращена в пул: PR #9 нездоров (метка {sch.review_labels.AI_CHANGES}).")]
 
@@ -730,7 +748,7 @@ def test_unhealthy_pulls_calls_append_session_notes_with_empty_list_when_queue_e
         sch, "append_session_notes",
         lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
     )
-    lines = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [], pool=[])
+    lines, _hard = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [], pool=[])
     assert lines == []
     assert captured["notes"] == []
 
@@ -753,7 +771,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], True, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
@@ -793,7 +811,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
@@ -828,6 +846,79 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     assert any("✅ PR #1 слит" in line for line in saved[0]), (
         "отчёт о слиянии, посчитанном ДО сбоя детектора, потерян"
     )
+
+
+def test_main_exits_nonzero_and_alerts_fact_when_unhealthy_pulls_notes_hard_fail(monkeypatch):
+    # Хвост ai-ревью #1053: unhealthy_pulls брала append_session_notes и
+    # ВЫБРАСЫВАЛА её жёсткий сбой — 🚨-строка жила только в отчёте прогона
+    # (зелёного), Telegram молчал; тот же класс «сигнал есть, но его никто
+    # не увидит», что этот PR закрывает для after_merge/accept_merged_tasks.
+    # Здесь ВСЁ по-настоящему на этом пути: настоящий unhealthy_pulls,
+    # настоящий append_session_notes, RPC морды падает НЕ по «сессии нет»
+    # (прод-форма ошибки доезжает в алерт дословно). Мутация: выбрось флаг
+    # в unhealthy_pulls или убери OR в main() — тест краснеет (code == 0,
+    # escalated пуст).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
+    task = issue(50)
+    p = pull(9, labels=(sch.review_labels.AI_CHANGES,), updated_at="2026-09-02T00:00:00Z",
+             pr_body="#50", ref="agent/50-x")
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [p])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [task])
+    # Морда сломана на дозаписи заметок: логин ОК, ingest падает жёстким сбоем.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    def boom_ingest(opener, session_id, events):
+        raise RuntimeError("HTTP 500: morde backend down")
+
+    monkeypatch.setattr(sch, "_morde_ingest", boom_ingest)
+    patch_gh(monkeypatch, FakeGh({
+        "-X DELETE repos/o/r/issues/50/assignees": {},
+        "-X POST repos/o/r/issues/50/comments": {},
+        "task-50": "🔓 замок task-50 снят",
+    }))
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    monkeypatch.setattr(sch, "stuck_large_ok_pulls", lambda repo, pulls: ([], []))
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
+    monkeypatch.setattr(
+        sch, "accept_merged_tasks",
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    # Диспатч закрыт — расшивка/доводка/воркер в этом тесте не предмет.
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], False))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], False))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    saved = []
+    monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
+
+    code = sch.main()
+
+    assert code == 1  # жёсткий сбой заметок на пути unhealthy_pulls красит прогон
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    alert = escalated[0][2]
+    assert "#50" in alert and "harness-50" in alert  # факт: номер задачи и session_id
+    assert "HTTP 500: morde backend down" in alert  # дословное тело ошибки RPC
+    assert "Газ:" in alert  # газ назван, не «до ручного разбора» без газа
+    # 🚨-строка дошла и до отчёта прогона (видимый результат, не только алерт).
+    assert saved and any("harness-50" in line for line in saved[0])
 
 
 def test_main_stays_green_when_archive_ok(monkeypatch):
@@ -1931,7 +2022,7 @@ def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
 
     assert any("assignees" in c and "-X DELETE" in c for c in fake.calls)
     assert any("возвращена в пул" in line and "201" in line for line in lines)
@@ -1954,7 +2045,7 @@ def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
 
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
     assert any("ai:changes-requested" in line for line in lines)
 
 
@@ -1974,7 +2065,7 @@ def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
 
     assert any("возвращена в пул" in line and "221" in line for line in lines)
 
@@ -1990,7 +2081,7 @@ def test_unhealthy_pulls_silent_before_threshold(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
 
     now = utc(2026, 9, 2, 12, 0)  # 30 мин < порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
     assert lines == []
     assert not any("-X DELETE" in c for c in fake.calls)
 
@@ -2004,7 +2095,7 @@ def test_unhealthy_pulls_silent_when_pr_green(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("PR здоров — не пишем"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
 
 
@@ -2017,7 +2108,7 @@ def test_unhealthy_pulls_idempotent_after_release_no_assignee(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не назначена — не трогаем"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     # issue без assignees отфильтрован ДО чтения check-runs/мутирующих вызовов —
     # снимок пула дан параметром (#443), ни одного HTTP-вызова не требуется.
@@ -2032,7 +2123,7 @@ def test_unhealthy_pulls_skips_conflict_labeled_pr(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("conflict — не наш класс"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
 
@@ -2049,7 +2140,7 @@ def test_unhealthy_pulls_skips_blocked_labeled_issue(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("blocked — газ только у владельца"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
 
@@ -2089,7 +2180,7 @@ def test_unhealthy_pulls_does_not_release_foreign_task_mentioned_in_prod_pr_body
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
         "#90 чужая для PR #181 (собственная задача — #179 по ветке) — трогать нельзя"))
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120 — было бы «нездоров достаточно долго»
-    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_90])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_90])
     assert lines == []
     assert not any("-X DELETE" in c for c in fake.calls)
     assert task_90["assignees"] == [{"login": "mytab0r"}]  # аренда цела
@@ -2108,7 +2199,7 @@ def test_unhealthy_pulls_releases_own_task_of_same_prod_pr_via_branch(monkeypatc
     patch_post_issue_comment(monkeypatch, lambda *a: None)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_179])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_179])
     assert any("возвращена в пул" in line and "179" in line for line in lines)
     assert task_179["assignees"] == []
 
@@ -2128,7 +2219,7 @@ def test_unhealthy_pulls_ignores_pr_without_agent_branch_even_with_prose_mention
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
         "PR без agent-ветки не сопоставлен ни с какой задачей — трогать нечего"))
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [pr_no_branch], pool=[task_90])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_no_branch], pool=[task_90])
     assert lines == []
     assert task_90["assignees"] == [{"login": "mytab0r"}]
 
@@ -3326,6 +3417,13 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert "conclusion='success'" in escalated[0][2]  # факт, не диагноз
     # больше не утверждаем диагноз как решённый факт — только гипотеза наравне с другими
     assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
+    # Второй заход того же правила (находка ai-ревью #1053): success-ветка не
+    # утверждает «ребейз не разрешил конфликт» — причину из двух фактов
+    # (прогон успешен + mergeable_state dirty) отсюда не вывести, честный
+    # пробел назван прямо. Мутация: верни старую формулировку — оба assert'а
+    # ниже краснеют (диагноз снова в тексте, пробел снова не назван).
+    assert "не разрешил конфликт" not in escalated[0][2]
+    assert "не различить" in escalated[0][2]
     assert any("исчерпана" in line and "#560" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
 
@@ -5490,7 +5588,7 @@ def test_unhealthy_pulls_noop_on_empty_queue(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("пустая очередь — писать некуда"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [], pool=[])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [], pool=[])
     assert lines == []
     assert fake.mutating_calls() == []
     assert fake.calls == []
@@ -7614,7 +7712,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     # open_task_issues сама) — стаб оставлен просто чтобы не тянуть в тест её
     # внутреннюю логику (pulls тут всегда пуст, реальная реализация тоже
     # вернула бы []); сигнатура обязана принимать pool, иначе main() упадёт.
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
     monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
