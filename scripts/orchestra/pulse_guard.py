@@ -550,6 +550,26 @@ FAILURE_WATCH_CAP_SKIP_MARKER_PREFIX = "[failure-watch: потолок — пр�
 # в GitHub Actions (тот же job orchestra.yml, тот же `github.token` внутри
 # процесса) — in_github_actions() ниже смотрит только «где физически
 # исполняется код», не «кто нажал кнопку», поэтому не путает эти два случая.
+#
+# ALLOW_PROD_WRITES_ENV задуман 2026-09-11 как явный локальный обход для
+# отладки планировщика человеком. Ретроспектива #1074 (доводка #1027/#948):
+# ВСЕ изменяющие вызовы, которые видит этот гейт, пишут в каналы, которые
+# ЧИТАЮТ МЕХАНИЗМЫ репозитория — комментарии-маркеры watchdog-issue #120
+# (conveyor_gate/wip_gate/heartbeat_check читают их как факт состояния),
+# метки гейтов (WIP/ai-review/conflict), назначения и замки задач
+# (claim_task, читает scheduler при выборе следующей задачи), git-ветки
+# (update_branch), диспатч воркера. Нешаренной поверхности для «локальной
+# записи, которую никто, кроме автора прогона, не читает» в кодовой базе НЕТ
+# — обходной ключ поэтому не сужается по каналам, а снимается целиком:
+# в 2026-09-12/13 голый `python scheduler.py` с этим ключом оставил 26 ложных
+# маркеров закрытия WIP-эпизода («0 < 12») в #120 ПОСЛЕ того, как #1027 уже
+# научил `wip_gate`/`fetch_wip_gate_markers` не доверять чужому логину при
+# ПРИНЯТИИ решения — фильтр по автору сделал наблюдательный инвариант 16
+# слепым именно к этой записи (см. репозиторий #1074), не помешав самой
+# записи появиться. Если когда-нибудь понадобится намеренная локальная
+# запись для отладки — она обязана идти в ОТДЕЛЬНОЕ место (свой issue/файл/
+# лог), не через этот гейт: этот гейт защищает КАНАЛЫ, которые читают
+# механизмы, а не запись вообще.
 ALLOW_PROD_WRITES_ENV = "SCHEDULER_ALLOW_PROD_WRITES"
 
 
@@ -575,12 +595,14 @@ def prod_writes_allowed() -> bool:
     больше не отдельная поверхность — #956 перевёл его на `gh()` -X POST
     .../dispatches внутри scripts/lib/merge_reactions.py, снятый ранее
     `gh workflow run` через голый subprocess.run был последней такой точкой)
-    разрешено реально уйти в сеть. В GitHub Actions (in_github_actions()) —
-    всегда True. Вне CI — только по явному ALLOW_PROD_WRITES_ENV=1
-    (намеренный локальный прогон человеком, отлаживающим планировщик) —
-    announce_write_mode ниже обязан быть напечатан ДО первого решения, тормоз
-    не молчит о своём режиме."""
-    return in_github_actions() or os.environ.get(ALLOW_PROD_WRITES_ENV) == "1"
+    разрешено реально уйти в сеть. Единственный источник разрешения —
+    in_github_actions() (issue #1074, см. блок-комментарий у
+    ALLOW_PROD_WRITES_ENV выше): раньше этот же ключ=1 снимал запрет и вне
+    CI — тот путь и породил 26 ложных маркеров в #120 2026-09-12/13. Ключ
+    больше НИЧЕГО не разрешает (оставлен как константа/имя переменной
+    окружения только для error-сообщений ниже — печатать пользователю, чем
+    он больше не является)."""
+    return in_github_actions()
 
 
 def announce_write_mode() -> str:
@@ -589,11 +611,12 @@ def announce_write_mode() -> str:
     по факту молчания."""
     if in_github_actions():
         return "режим записи: GitHub Actions — изменяющие вызовы разрешены"
-    if os.environ.get(ALLOW_PROD_WRITES_ENV) == "1":
-        return (f"⚠️ режим записи: ВНЕ GitHub Actions, {ALLOW_PROD_WRITES_ENV}=1 — "
-                "изменяющие вызовы разрешены ЯВНЫМ решением локального прогона")
     return (f"режим записи: ВНЕ GitHub Actions — DRY-RUN, изменяющие вызовы "
-            f"пропускаются (задай {ALLOW_PROD_WRITES_ENV}=1 для намеренного прод-прогона)")
+            f"пропускаются БЕЗУСЛОВНО (issue #1074: локальный обход через "
+            f"{ALLOW_PROD_WRITES_ENV} закрыт — писал ложные маркеры в "
+            f"#{WATCHDOG_ISSUE}, каналы состояния не заменяются локальной "
+            "записью; нужна намеренная отладочная запись — веди её в "
+            "отдельное место, не через этот гейт)")
 
 
 # Признак изменяющего вызова `gh api` — одно место правды (review_labels.
@@ -617,8 +640,9 @@ class WriteGateSkipped(RuntimeError):
 def gh(*args: str) -> dict | list | None:
     if _gh_call_is_write(args) and not prod_writes_allowed():
         print(
-            f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
-            f"изменяющий вызов пропущен: gh api {' '.join(args)}",
+            f"::warning::DRY-RUN (вне GitHub Actions — {ALLOW_PROD_WRITES_ENV} больше не "
+            f"снимает этот запрет, issue #1074) — изменяющий вызов пропущен: "
+            f"gh api {' '.join(args)}",
             file=sys.stderr,
         )
         raise WriteGateSkipped(f"DRY-RUN: gh api {' '.join(args)} пропущен")
@@ -1376,12 +1400,12 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     build_decision_keyboard); необязательна, обычные алерты её не передают —
     сигнатура обратно совместима, поведение существующих вызовов не меняется."""
     if not prod_writes_allowed():
-        # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11): вне
-        # GitHub Actions без явного ALLOW_PROD_WRITES_ENV=1 реальный алерт
-        # владельцу молчит — дублирующий локальный прогон не должен слать
-        # ложные срабатывания в тот же чат, что и настоящий пульс.
-        print(f"::warning::DRY-RUN (вне GitHub Actions, {ALLOW_PROD_WRITES_ENV} не задан) — "
-              "Telegram-сигнал пропущен", file=sys.stderr)
+        # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11, закрыт
+        # безусловно issue #1074): вне GitHub Actions реальный алерт владельцу
+        # молчит — дублирующий локальный прогон не должен слать ложные
+        # срабатывания в тот же чат, что и настоящий пульс.
+        print(f"::warning::DRY-RUN (вне GitHub Actions — {ALLOW_PROD_WRITES_ENV} больше не "
+              "снимает этот запрет) — Telegram-сигнал пропущен", file=sys.stderr)
         return False
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")

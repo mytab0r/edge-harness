@@ -2580,28 +2580,34 @@ def test_fetch_wip_gate_markers_reads_both_marker_kinds(monkeypatch):
     }
 
 
-def test_fetch_wip_gate_markers_ignores_comment_not_from_ci_actor(monkeypatch):
-    """Живой случай (#1027, watchdog-issue #120, 2026-09-12): комментарий
-    `[статус конвейера: WIP-лимит снят] ... 0 < 12` дословно взят с живого
-    репозитория (`gh api repos/.../issues/120/comments`) — его REST-форма
-    несёт `user.login == "mytab0r"`, `user.type == "User"` (личный PAT,
-    прогон `scheduler.py` вне GitHub Actions, `SCHEDULER_ALLOW_PROD_WRITES=1`),
-    а не `github-actions[bot]`/`Bot`, как у легитимного маркера orchestra.yml
-    рядом. Независимый пересчёт в ЭТОМ ЖЕ прогоне дал 22 живых PR в доработке
-    (не 0) — инвариант 16 ловит рецидив именно этого симптома. `trusted_login`
-    обязан отсеять чужеродный маркер: без фильтра fetch_wip_gate_markers
-    вернул бы ОБА (open честный + close-самозванец) — мутация ниже это
-    доказывает.
+def test_fetch_wip_gate_markers_includes_comment_not_from_ci_actor(monkeypatch):
+    """Доводка #1027 находкой #1074 (живой случай watchdog-issue #120,
+    2026-09-12/13): комментарий `[статус конвейера: WIP-лимит снят] ...
+    0 < 12` дословно взят с живого репозитория (`gh api
+    repos/mytab0r/edge-harness/issues/120/comments`, id 5650994043,
+    2026-09-13T03:53:03Z) — его REST-форма несёт `user.login == "mytab0r"`,
+    `user.type == "User"` (личный PAT, прогон `scheduler.py` вне GitHub
+    Actions), а не `github-actions[bot]`/`Bot`, как у честного маркера
+    orchestra.yml рядом (id 5649763434, «22 ≥ 12»).
 
-    Мутация: замени `trusted_login=pulse_guard.EVENT_ACTOR_LOGIN` в
-    `fetch_wip_gate_markers` обратно на отсутствие фильтра — этот тест
-    покраснеет (markers будет содержать 2 маркера, не 1)."""
+    #1027 подключил `trusted_login=pulse_guard.EVENT_ACTOR_LOGIN` именно
+    сюда — и тем самым сделал инвариант 16 СЛЕПЫМ к 26 таким маркерам подряд
+    (репозиторий #1074): фильтр защищает РЕШЕНИЕ `scheduler.wip_gate` (см.
+    test_scheduler.py::test_wip_gate_ignores_close_marker_not_posted_by_ci_
+    actor — тот фильтр остаётся), но применённый здесь же он не даёт
+    НАБЛЮДАТЕЛЬНОМУ инварианту увидеть чужеродную запись вовсе, до всякого
+    сравнения claimed/actual. fetch_wip_gate_markers обязан вернуть ОБА
+    маркера — фильтрация по автору здесь не нужна и не тестовому предмету.
+
+    Мутация: верни `trusted_login=pulse_guard.EVENT_ACTOR_LOGIN` в
+    `fetch_wip_gate_markers` — этот тест покраснеет (markers будет содержать
+    1 маркер, не 2 — самозванец отфильтрован молча)."""
     limit = ri.scheduler.WIP_LIMIT
     fake = FakeGh({
         "issues/120/comments": [
-            {"created_at": "2026-09-12T10:50:32Z", "body": _open_marker_body(23, limit),
+            {"created_at": "2026-09-13T00:47:39Z", "body": _open_marker_body(22, limit),
              "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN, "type": "Bot"}},
-            {"created_at": "2026-09-12T12:59:06Z",
+            {"created_at": "2026-09-13T03:53:03Z",
              "body": "✅ [статус конвейера: WIP-лимит снят]\n"
                      "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
                      "снова диспетчируются.",
@@ -2610,8 +2616,53 @@ def test_fetch_wip_gate_markers_ignores_comment_not_from_ci_actor(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     markers = ri.fetch_wip_gate_markers("mytab0r/edge-harness")
-    assert len(markers) == 1
-    assert markers[0][1] == _open_marker_body(23, limit)
+    assert len(markers) == 2
+    assert {body for _, body in markers} == {
+        _open_marker_body(22, limit),
+        "✅ [статус конвейера: WIP-лимит снят]\n"
+        "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
+        "снова диспетчируются.",
+    }
+
+
+def test_build_report_flags_wip_gate_false_zero_from_impostor_marker(monkeypatch):
+    """Сквозная проверка — воспроизводит инцидент #1074 целиком через
+    build_report: тело ложного маркера дословно взято с живого репозитория
+    (issue #120, комментарий id 5650994043, 2026-09-13T03:53:03Z, автор
+    `mytab0r`/`User`, не `github-actions[bot]`). До этой правки инвариант 16
+    молчал бы (fetch_wip_gate_markers отфильтровывал такой комментарий по
+    trusted_login ДО сравнения) — теперь он обязан найти расхождение
+    claimed=0 / actual>0 независимо от автора маркера."""
+    limit = ri.scheduler.WIP_LIMIT
+    now = utc(2026, 9, 13, 3, 55)  # 2 минуты после ложного маркера — внутри окна
+    pulls = [open_pr(1000 + n, labels=["conflict"]) for n in range(23)]  # прод-число той ночи
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": pulls,
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/120/comments": [
+            {"created_at": "2026-09-13T00:47:39Z", "body": _open_marker_body(22, limit),
+             "user": {"login": ri.pulse_guard.EVENT_ACTOR_LOGIN, "type": "Bot"}},
+            {"created_at": "2026-09-13T03:53:03Z",
+             "body": "✅ [статус конвейера: WIP-лимит снят]\n"
+                     "Открытых PR, ждущих доработки: 0 < 12 — WIP-лимит снят, новые задачи "
+                     "снова диспетчируются.",
+             "user": {"login": "mytab0r", "type": "User"}},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert findings[16] == [{
+        "marker_at": "2026-09-13T03:53:03+00:00",
+        "claimed_count": 0,
+        "actual_count": 23,
+        "limit": limit,
+    }]
+    assert any("🚨" in line and "[16]" in line and "23" in line for line in lines)
 
 
 def test_build_report_flags_wip_gate_false_zero_live_incident(monkeypatch):

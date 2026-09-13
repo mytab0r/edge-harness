@@ -854,17 +854,24 @@ def _no_telegram_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _allow_prod_writes_in_tests(monkeypatch):
-    """Прод-запись только внутри GitHub Actions (2026-09-11): по умолчанию вне
-    CI изменяющие вызовы (gh() -X POST/PUT/PATCH/DELETE, ORCHESTRA_PAT-путь
-    update_branch, `gh workflow run`, RPC морды) — DRY-RUN. Этот файл тестирует
-    ЛОГИКУ решений (что и когда диспетчится), а не сам режим записи — почти
-    все тесты уже подменяют транспорт (FakeGh/monkeypatch subprocess.run) и
-    ожидают, что вызов реально дойдёт до их фейка. Без этой автофикстуры 17
-    тестов, exercising update_branch/dispatch_deploy_on_merge/_morde_ingest
-    напрямую (не через FakeGh), стали бы наблюдать DRY-RUN вместо своего
-    предмета. Сам режим DRY-RUN тестируется отдельно и явно (см.
-    test_prod_writes_gate_* ниже) — там же фикстура переопределяется delenv."""
-    monkeypatch.setenv(sch.ALLOW_PROD_WRITES_ENV, "1")
+    """Прод-запись только внутри GitHub Actions (2026-09-11; локальный обход
+    ключом закрыт БЕЗУСЛОВНО issue #1074, 2026-09-13 — см. pulse_guard.
+    prod_writes_allowed). По умолчанию вне CI изменяющие вызовы (gh() -X
+    POST/PUT/PATCH/DELETE, ORCHESTRA_PAT-путь update_branch, `gh workflow
+    run`, RPC морды) — DRY-RUN. Этот файл тестирует ЛОГИКУ решений (что и
+    когда диспетчится), а не сам режим записи — почти все тесты уже подменяют
+    транспорт (FakeGh/monkeypatch subprocess.run) и ожидают, что вызов
+    реально дойдёт до их фейка. Без этой автофикстуры 17 тестов, exercising
+    update_branch/dispatch_deploy_on_merge/_morde_ingest напрямую (не через
+    FakeGh), стали бы наблюдать DRY-RUN вместо своего предмета.
+
+    Симулирует НАСТОЯЩИЙ CI-прогон (GITHUB_ACTIONS+GITHUB_RUN_ID), а не
+    ALLOW_PROD_WRITES_ENV=1 — после #1074 этот ключ вне CI ничего не
+    разрешает, только in_github_actions() разрешает запись. Сам режим DRY-RUN
+    тестируется отдельно и явно (см. test_*_dry_run_* ниже) — там же
+    фикстура переопределяется delenv."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999999999")
 
 
 def utc(*args):
