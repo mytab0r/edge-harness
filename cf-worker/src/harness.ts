@@ -149,6 +149,17 @@ const SCHEMA = [
      detail  TEXT,
      alerted INTEGER NOT NULL DEFAULT 0
    )`,
+  // Живость пульса (issue #1103): единственный дедуп-флаг «владелец уже
+  // оповещён о неживом пульсе». Отдельная таблица, а не колонка в pulse
+  // (id=1): у pulse нет прецедента добавления колонки в уже развёрнутую
+  // таблицу через CREATE TABLE IF NOT EXISTS (не ALTER TABLE — на проде
+  // строка уже существует, и «IF NOT EXISTS» такую правку не применит).
+  // Новая таблица безопасна при любом состоянии прод-DO. ts/detail не
+  // дублируются — их несёт pulse (#getStoredPulse), здесь только флаг.
+  `CREATE TABLE IF NOT EXISTS pulse_alert (
+     id      INTEGER PRIMARY KEY CHECK (id = 1),
+     alerted INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 /**
@@ -564,6 +575,42 @@ export function pulseNeedsRecoveryDispatch(now: number, lastPulse: PulseStatus |
   if (pulseNotConfigured(lastPulse)) return false;
   return now - lastPulse.ts >= HEARTBEAT.selfOrchestrationMs * 2;
 }
+
+/**
+ * Текст алерта живости пульса владельцу (issue #1103). Единственный наблюдатель
+ * пульса, который не зависит вообще ни от одного workflow этого репозитория:
+ * тик, который его шлёт (#dispatchOrchestraTick, общий для alarm() и
+ * scheduledTick()), сам вызывается Cloudflare-инфраструктурой (DO alarm,
+ * Cron Trigger), а не GitHub Actions — он звонит и тогда, когда любой workflow
+ * (включая orchestra.yml целиком) не запускается вовсе.
+ *
+ * НЕ ветвится по pulseStale() (находка ревью PR #1104): #tickPulseAlert
+ * вызывает pulseHealthy()/эту функцию на пульсе, который #recordPulse ТОЛЬКО
+ * ЧТО записал этим же тиком (`ts: now`) — при `now - ts === 0` возрастная
+ * ветка pulseStale() («тик давно не обновлялся») по построению никогда не
+ * истинна, добавлять под неё отдельный текст означало бы обещать
+ * недостижимое поведение (сама она остаётся источником правды для бейджа
+ * /api/status, где сравнивается СОХРАНЁННЫЙ пульс с текущим моментом, а не
+ * пульс этого же тика). detail здесь поэтому ВСЕГДА человекочитаем
+ * (pulseDetailForRecord подставляет HEARTBEAT.runNotConfirmedDetail именно
+ * на той ветке, где иначе остался бы null) — правило AGENTS.md «алерт не
+ * гадает». Случай «пульс молчал N минут и внезапно самовосстановился ещё до
+ * первого замеченного алерта» — честно названный, но не закрытый здесь
+ * потолок наблюдаемости, issue #1143.
+ *
+ * Текст называет и газ (что уже делает самовосстановление, #689/#693/#713)
+ * и план (когда считать это неполадкой, требующей ручной проверки) —
+ * правило «алерт обязан кончаться планом».
+ */
+export function pulseAlertText(lastPulse: PulseStatus): string {
+  const retryMinutes = HEARTBEAT.selfOrchestrationMs / 60_000;
+  return (
+    `🚨 edge-harness: пульс оркестратора не бьётся: ${lastPulse.detail ?? "причина не записана"}. ` +
+    `alarm() пробует снова каждые ${retryMinutes} мин без ручного вмешательства. ` +
+    `Если в течение часа не придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit).`
+  );
+}
+
 /** Чистое решение ватчдога инбокса: сообщение висит в processing дольше порога —
  *  изолят умер посреди внешнего вызова, пульс вернёт его в new. */
 export function messageStuck(processingTs: number | null, now: number): boolean {
@@ -1312,6 +1359,7 @@ export class Harness extends DurableObject<Env> {
     // #303, находка ревью: detail, а не result.detail — иначе «принят, но не
     // подтвердилось» пишет в хранилище null (см. docstring pulseDetailForRecord).
     const detail = pulseDetailForRecord(result, runConfirmed);
+    const now = Date.now();
     this.#recordPulse(result.ok, detail, latestRunId, runConfirmed);
     if (!result.ok || runConfirmed === false) {
       // Пульс не роняет объект: тик уже перезаложен (alarm()) либо вообще не
@@ -1320,6 +1368,12 @@ export class Harness extends DurableObject<Env> {
       // не смотрит между дедами (fail loud, issue #269).
       console.log(`heartbeat dispatch: accepted=${result.ok} detail=${detail} run_confirmed=${runConfirmed}`);
     }
+    // Живость пульса владельцу (issue #1103) — общий код для alarm() и
+    // scheduledTick() тем же приёмом, что и всё выше: одно место правды на
+    // тик, а не вторая копия у каждого вызывающего. lastPulse строим из уже
+    // посчитанных значений ЭТОГО тика (не второй SQL-раундтрип через
+    // #getStoredPulse — #recordPulse выше уже записала ровно это).
+    this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
   }
 
   /**
@@ -1786,6 +1840,76 @@ export class Harness extends DurableObject<Env> {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
         text: "✅ Хранилище журнала снова отвечает",
+      });
+    }
+  }
+
+  /** Дедуп-флаг живости пульса (issue #1103) — тот же приём, что
+   *  #recordStorageProbe: rowsWritten условного UPDATE (не чтение прошлого
+   *  состояния) означает «флаг перевернулся именно сейчас», переживает
+   *  выгрузку DO из памяти между тиками. */
+  #recordPulseAlertFlag(healthy: boolean): number {
+    this.#sql.exec(`INSERT INTO pulse_alert (id, alerted) VALUES (1, 0) ON CONFLICT(id) DO NOTHING`);
+    const cursor = healthy
+      ? this.#sql.exec("UPDATE pulse_alert SET alerted = 0 WHERE id = 1 AND alerted = 1")
+      : this.#sql.exec("UPDATE pulse_alert SET alerted = 1 WHERE id = 1 AND alerted = 0");
+    return cursor.rowsWritten;
+  }
+
+  /**
+   * Живость пульса владельцу (issue #1103): единственный алерт, независимый
+   * от ЛЮБОГО workflow этого репозитория — тик, который его шлёт
+   * (#dispatchOrchestraTick), вызывается из alarm()/scheduledTick(),
+   * оба живут в Cloudflare-инфраструктуре (DO alarm, Cron Trigger), не в
+   * GitHub Actions. Существующий Python-сторож (pulse_guard.py::
+   * independent_pulse_check, issue #689) видит только СРАВНЕНИЕ независимого
+   * и событийного каналов и по построению не может сработать, если оба
+   * канала (и, значит, scheduler.py) не запускаются вовсе — ровно тот класс
+   * простоя, что случился 2026-09-13 (issue #1103). Этот алерт не читает
+   * GitHub API вообще (0 дополнительных вызовов/час — не может усугубить
+   * причину падения, если она в исчерпании квоты #1100), решение целиком
+   * из уже вычисленного pulseHealthy() (единственное место правды на
+   * «здоров ли пульс», не вторая копия порога).
+   *
+   * Переход, не каждый тик (storageReadyAlertDecision — прямое переиспользование
+   * решения перехода healthy↔unhealthy, семантика идентична, отдельной
+   * копии функции не заводим): один incident при первом нездоровом тике,
+   * один recovery при первом снова здоровом. Дедуп — по итогу ЗАПИСИ флага
+   * pulse_alert.alerted, тем же доводом, что у #tickStorageReadyAlert (чтение
+   * прошлого исхода падает вместе с самой аварией на исчерпании rows_read).
+   *
+   * Честная граница (issue #1143, найдено ревью PR #1104): `lastPulse` здесь
+   * — пульс, который #recordPulse ТОЛЬКО ЧТО записал этим же тиком (`ts:
+   * now`), не хранившееся ДО тика состояние. Если резервный dispatch
+   * scheduledTick() успевает восстановиться в ТОМ ЖЕ тике, где обнаружил
+   * подвисший alarm (pulseNeedsRecoveryDispatch), pulseHealthy() увидит уже
+   * исправленное (свежее, успешное) состояние — incident не пишется вовсе,
+   * хотя пульс реально молчал 20+ минут до этого. Не закрыто этим change'ом.
+   */
+  #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
+    const healthy = pulseHealthy(now, lastPulse);
+    let dedupRowsWritten: number | null = null;
+    try {
+      dedupRowsWritten = this.#recordPulseAlertFlag(healthy);
+    } catch (error) {
+      console.error(
+        `pulse alert: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
+      return;
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    const decision = storageReadyAlertDecision(healthy, dedupRowsWritten);
+    if (decision === "incident") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: pulseAlertText(lastPulse),
+      });
+    } else if (decision === "recovery") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ edge-harness: пульс оркестратора снова в норме",
       });
     }
   }
