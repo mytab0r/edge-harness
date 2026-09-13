@@ -241,6 +241,28 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       числа — факты одного и того же прогона (маркер + independent
       пересчёт), не гипотезы — «алерт не гадает» не нарушается.
 
+  17. check_frontend_deploy_stale (issue #1041, живой случай 2026-09-12/13):
+      живая морда dsh-edge молча отстаёт от main. deploy-dsh-edge.yml упал
+      на e2e-смоуке (React error #130, вкладка «DSH Edge»), канарейка
+      откатила прод на прошлую версию — но следующий прогон не наступил ни
+      разу за сутки, и единственным видимым признаком была красная вкладка
+      Actions: ни issue #1041, ни отчёт этого файла не называли факт «прод-
+      морда не соответствует main» явно. Сравнивает head_sha последнего
+      ЗЕЛЁНОГО прогона FRONTEND_DEPLOY_WORKFLOW с текущим main ПО ПУТЯМ,
+      которые тот же workflow объявляет своими (`on.push.paths`, читается из
+      файла — одно место правды, не задублирован литералом); нарушение —
+      только если main реально ушёл дальше по watched_paths (AGENTS.md,
+      «Алерт не гадает» — дрейф вне них деплою безразличен). Незавершённый
+      прогон текущего main не эскалируется как «устарела» (находка ревью
+      PR #1076) — деплой уже в полёте, следующий пульс либо застанет success,
+      либо ту же устарелость, если прогон упадёт. Наблюдательный, не в
+      CI_GATING (симметрично 10/12/15/16 — состояние деплоя не вина текущего
+      PR). Практическое следствие красного pr-smoke/канарейки шире, чем
+      просто устаревшая витрина: `scheduler.py::bad_check_names` считает
+      плохим ЛЮБОЙ красный check-run, даже необязательный, — красный смоук
+      морды молча держит `mergeStateStatus=UNSTABLE` и на ГОТОВЫХ PR (живой
+      случай #1066: оба вердикта зелёные, единственная причина —
+      `pr-smoke=FAILURE`), не только на деплое морды.
   18. check_pipeline_status_marker_impersonation (#1101, найдено при доводке
       #1074/PR #1077, живой инцидент watchdog-issue #120, 2026-09-12/13):
       комментарий #120, несущий маркер СЕМЕЙСТВА «[статус конвейера: …]»
@@ -2384,7 +2406,16 @@ def _frontend_deploy_watched_paths(
     YAML 1.1: незакавыченный ключ `on:` парсится PyYAML как булево `True`,
     не строка `'on'` — тот же гоч, что уже описан и обойдён в
     `scripts/lib/merge_reactions_registry_guard.py` (issue #955),
-    `doc.get("on", doc.get(True))` переиспользует тот же приём."""
+    `doc.get("on", doc.get(True))` переиспользует тот же приём.
+
+    Находка ревью PR #1076 (блокирующая 1): `_path_is_watched` понимает
+    только точное имя и `<префикс>/**`; узкая звезда вида `cf-worker/src/
+    *.cjs` молча матчилась бы как «не покрыто» — реальный дрейф по такому
+    пути читался бы 💚 «морда свежая», хотя деплой этот путь СЛУШАЕТ. «Алерт
+    не гадает» (AGENTS.md): нераспознанная форма глоба — не тихий пропуск, а
+    RuntimeError здесь, при загрузке (build_report превращает его в честное
+    «недоступна», НЕ «здорово», симметрично отказу пустого on.push.paths
+    выше)."""
     path = workflow_path or (REPO_ROOT / ".github" / "workflows" / FRONTEND_DEPLOY_WORKFLOW)
     doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     on_value = doc.get("on", doc.get(True))
@@ -2398,16 +2429,28 @@ def _frontend_deploy_watched_paths(
             f"{path}: on.push.paths пуст или не найден — инвариант 17 не может "
             "определить, какие пути обязаны триггерить свежий деплой"
         )
+    for pattern in paths:
+        if pattern.startswith("!"):
+            continue  # исключение — _path_is_watched его не видит вовсе, отдельно не гейтим
+        if pattern.endswith("/**") and not any(ch in pattern[:-3] for ch in "*?["):
+            continue  # единственная распознаваемая форма глоба (см. _path_is_watched)
+        if not any(ch in pattern for ch in "*?[]"):
+            continue  # точное имя файла — без метасимволов глоба вовсе
+        raise RuntimeError(
+            f"{path}: on.push.paths содержит паттерн {pattern!r} — форма глоба, "
+            "которую _path_is_watched не умеет сопоставлять честно (не точное имя "
+            "и не '<префикс>/**') — падаю, а не тихо считаю его непокрытым"
+        )
     return paths
 
 
 def _path_is_watched(filename: str, watched_paths: list[str]) -> bool:
     """Совпадение с одним из `on.push.paths` — точное имя файла
     (`.github/workflows/deploy-dsh-edge.yml`) либо префикс `dsh-edge/**`
-    (единственная форма глоба в этом списке на момент написания). Встретится
-    иная форма глоба — считаем НЕ покрытым и полагаемся на то, что список
-    watched_paths вообще не пуст (RuntimeError выше уже проверил это) —
-    ложноотрицательный матч честнее тихого ложноположительного."""
+    (единственная форма глоба, которую эта функция понимает). Любая иная
+    форма глоба уже отсеяна на загрузке (`_frontend_deploy_watched_paths`
+    падает RuntimeError на неизвестной форме, находка ревью PR #1076) — сюда
+    попадают только эти два вида, ложноотрицательного молчания больше нет."""
     for pattern in watched_paths:
         if pattern.endswith("/**"):
             if filename.startswith(pattern[: -len("**")]):
@@ -2444,7 +2487,18 @@ def decide_frontend_deploy_stale(
     watched_paths (реально триггерит деплой); дрейф ТОЛЬКО вне watched_paths
     (например, правка README вне dsh-edge/**) деплою безразличен и не
     считается staleness — иначе алерт гадал бы тревогу там, где её нет
-    (AGENTS.md, «Алерт не гадает»)."""
+    (AGENTS.md, «Алерт не гадает»).
+
+    Находка ревью PR #1076 (блокирующая 2): незавершённый прогон (`conclusion`
+    ещё пуст) с `head_sha == main_sha` — деплой ЭТОГО САМОГО main уже в
+    полёте, не «морда устарела». Молчим (`None`), не эскалируем: следующий
+    пульс либо увидит success (last_good_sha сравняется с main_sha — здорово),
+    либо, если прогон упадёт, застанет ТУ ЖЕ устарелость и поднимет её тогда
+    — сигнал не теряется, просто не дублируется алармом на середине
+    деплоя, окно которого (до ~30 мин) больше интервала пульса (15 мин)."""
+    if any(r.get("head_sha") == main_sha and not r.get("conclusion") for r in runs):
+        return None
+
     completed = [r for r in runs if r.get("conclusion")]
     if not completed:
         return {
@@ -3206,8 +3260,11 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
                 f"путям деплоя: {', '.join(item['stale_paths'][:10])}"
                 f"{' …' if len(item['stale_paths']) > 10 else ''}. Прод-морда не "
                 "соответствует main — проверь причину падения деплоя (Actions → "
-                f"{FRONTEND_DEPLOY_WORKFLOW}). Снимается следующим зелёным прогоном на "
-                "текущем (или более новом) main."
+                f"{FRONTEND_DEPLOY_WORKFLOW}). Тот же красный check-run молча держит "
+                "mergeStateStatus=UNSTABLE и на готовых PR (scheduler.py::bad_check_names "
+                "считает плохим любой красный check, необязательный в том числе — живой "
+                "случай #1066), не только устаревшую витрину. Снимается следующим зелёным "
+                "прогоном на текущем (или более новом) main."
             )
         result = escalate_if_new(repo, 17, key, text)
         if result:
